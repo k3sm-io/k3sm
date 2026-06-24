@@ -26,7 +26,7 @@ Darwin (XNU/BSD) has **none** of the Linux container primitives, so the upstream
 | iptables/ipvs | kube-proxy | ⚠️ **userspace Service proxy** (VIP-owning sockets) |
 | VXLAN/flannel | cross-node net | ✅ **wireguard-go** userspace mesh (root-gated utun; Tailscale-proven on 26.2) |
 | systemd/OpenRC | supervision | ✅ **launchd** LaunchDaemons (in an app-bundle wrapper) |
-| etcd | datastore | ✅ **kine** → pure-Go SQLite (`modernc.org/sqlite`) |
+| etcd | datastore | ✅ **kine** → SQLite **via cgo** (`mattn/go-sqlite3`; kine needs CGO — see §5c) |
 
 ## 3. Red-team verdict & the pivots it forced
 
@@ -47,10 +47,10 @@ Four hostile personas attacked the v1 design on a macOS 26.5.1 machine (SIP **on
 
 ## 4. Architecture
 
-Two load-bearing reuses make this feasible: **Virtual Kubelet** (CNCF) reimplements the kubelet's API-facing half in portable Go and delegates execution to a provider (prior art: **agoda/macOS-vz-kubelet** runs native-macOS workloads on K8s this way); and the **control plane builds from source for darwin/arm64** with **kine**'s no-cgo SQLite enabling a `CGO_ENABLED=0` static binary.
+Two load-bearing reuses make this feasible: **Virtual Kubelet** (CNCF) reimplements the kubelet's API-facing half in portable Go and delegates execution to a provider (prior art: **agoda/macOS-vz-kubelet** runs native-macOS workloads on K8s this way); and the **control plane builds from source for darwin/arm64** with **kine** providing the SQLite datastore. (✅ M0-spike finding: kine's SQLite **requires CGO** — `mattn/go-sqlite3`; the no-cgo build *disables* SQLite. So k3sm builds **`CGO_ENABLED=1`** on darwin — fine, since macOS has no fully-static binaries anyway and cgo+sqlite notarizes normally. See `docs/M0-spike.md`.)
 
 ```
-k3sm server (control-plane Mac; also a worker)            ── one CGO_ENABLED=0 static binary, app-bundle-wrapped
+k3sm server (control-plane Mac; also a worker)            ── one app-bundle-wrapped binary (CGO=1: kine sqlite)
   ├─ kine (goroutine) → unix socket (SQLite ≥0.15, WAL)   ConsistentListFromCache=false until soak-validated
   ├─ kube-apiserver / kube-scheduler / kube-controller-manager (goroutines via New*Command, KCM --controllers scoped)
   ├─ supervisor HTTP (/v1-k3sm/*: token + node-password + HTTP-CSR + mesh-enroll)
@@ -91,7 +91,7 @@ k3sm agent (worker Mac) = join client + VK provider + Service proxy + wireguard-
 - **Privilege:** one root **`k3sm-netd`** owns lo0 aliases, the `pf` `k3sm` sub-anchor, utun, wireguard; needs **only root** (no restricted NE entitlement).
 
 ### 5c. Control plane, bootstrap, packaging (`k3sm`)
-- **Single binary, in-process goroutines** (k3s `pkg/executor/embed` pattern), `CGO_ENABLED=0 GOOS=darwin GOARCH=arm64` static (cadvisor cgo is `//go:build linux`-gated; kine no-cgo sqlite). **Scope KCM `--controllers=…`** to disable node-side controllers (attach/detach, cloud-node-lifecycle) that assume real kubelets — KCM is the riskiest binary.
+- **Single binary, in-process goroutines** (k3s `pkg/executor/embed` pattern), **`CGO_ENABLED=1` `GOOS=darwin GOARCH=arm64`** (✅ M0-spike: kine's SQLite needs cgo via `mattn/go-sqlite3`; the no-cgo build disables SQLite. "Fully static" isn't a macOS concept anyway — cgo links libSystem + compiled sqlite3 and notarizes fine. Future: a pure-Go `modernc.org/sqlite` kine driver would regain CGO_ENABLED=0). **Scope KCM `--controllers=…`** to disable node-side controllers (attach/detach, cloud-node-lifecycle) that assume real kubelets — KCM is the riskiest binary.
 - **Datastore:** kine + SQLite (WAL, busy-timeout) at `/var/lib/k3sm/server/db/state.db`; **pin kine ≥0.15** (≥0.14.9 floor) and run with **`--feature-gates=ConsistentListFromCache=false`** until a multi-day watch-staleness soak passes (kine#577); HA via kine→Postgres (pure-Go pgx) for >2 servers.
 - **Node verbs:** `kubectl logs/exec/top/port-forward` are **implemented in the Darwin provider** (not inherited). Define the apiserver→node serving-cert trust: kubelet-serving CSR + `--kubelet-certificate-authority` (prod) or `--kubelet-insecure-tls` (dev).
 - **Admission guardrail:** since `Pod.spec.os.name: darwin` is invalid in k8s, ship a **ValidatingAdmissionPolicy** requiring `nodeSelector: kubernetes.io/os=darwin` on workloads + keep the VK provider taint, so stray Linux pods can't land on Macs.
