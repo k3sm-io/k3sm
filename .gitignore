@@ -1,0 +1,15 @@
+# Build output
+/dist/
+/bin/
+/k3sm
+*.test
+*.out
+
+# Go workspace (local, spans sibling repos — lives in the parent dir)
+go.work
+go.work.sum
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
