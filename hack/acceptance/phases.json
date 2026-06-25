@@ -1,0 +1,8 @@
+{
+  "_comment": "Machine-readable gate manifest for /orchestrate. Each milestone maps to the single command that PROVES it (exit 0 = met). tier: which test tier the gate runs at. requires: host capabilities. manual: true gates run only under K3SM_LAB=1 (else reported 'pending lab', never auto-greened). Gates for unstarted milestones (m1.sh, ...) are authored as that milestone's work runs.",
+  "M0": { "gate": "hack/acceptance/m0.sh", "tier": "e2e",         "requires": ["dev-mac"],                "manual": false },
+  "M1": { "gate": "hack/acceptance/m1.sh", "tier": "e2e",         "requires": ["dev-mac"],                "manual": false },
+  "M2": { "gate": "hack/acceptance/m2.sh", "tier": "integration", "requires": ["dev-mac", "root"],        "manual": false },
+  "M3": { "gate": "hack/lab/m3.sh",        "tier": "lab",         "requires": ["two-macs"],               "manual": true },
+  "M4": { "gate": "hack/lab/m4.sh",        "tier": "lab",         "requires": ["macos-runner", "reboot"], "manual": true }
+}
