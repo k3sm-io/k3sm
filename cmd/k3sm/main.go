@@ -14,10 +14,10 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("node" is implemented; others are planned):
-  server      run the control plane + a node on this Mac
+Commands ("server" and "node" are implemented; others are planned):
+  server      run the control plane + a node on this Mac (M1)
   agent       join this Mac to an existing cluster as a node
-  node        run a Virtual Kubelet node here (M0: HostProcess runtime)
+  node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
   install     install the launchd service (run as root)
   uninstall   remove the launchd service
   token       manage cluster join tokens
@@ -38,6 +38,11 @@ func main() {
 		fmt.Printf("k3sm %s\n", version)
 	case "-h", "--help", "help":
 		fmt.Printf(usage, version)
+	case "server":
+		if err := runServer(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm server:", err)
+			os.Exit(1)
+		}
 	case "node":
 		if err := runNode(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm node:", err)

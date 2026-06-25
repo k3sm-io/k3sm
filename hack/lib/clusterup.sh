@@ -19,6 +19,10 @@ BIN="$K3SM_WORKDIR/bin"
 export KUBECONFIG="${KUBECONFIG:-$K3SM_WORKDIR/cluster.kubeconfig}"
 CP_TOKEN="acceptance-secret-token"
 NODE_PID=""
+SERVER_PID=""
+# From M1 the gates can bring the whole control plane + node up via `k3sm server`
+# (the embedded-by-supervision executor). It manages its own workdir/kubeconfig.
+: "${SERVER_WORKDIR:=$K3SM_WORKDIR/server}"
 # repo root = this file's dir /../.. (hack/lib -> repo), resolved regardless of caller cwd.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -31,8 +35,13 @@ wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sl
 # cluster_down stops the node and every control-plane process.
 cluster_down() {
 	[ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null || true
+	[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
 	for p in k3sm kube-controller-manager kube-scheduler kube-apiserver kine; do
 		pkill -f "$BIN/$p" 2>/dev/null && echo "stopped $p" || true
+	done
+	# `k3sm server` supervises the CP binaries under $SERVER_WORKDIR/bin; clean those too.
+	[ -n "$SERVER_WORKDIR" ] && for p in kube-controller-manager kube-scheduler kube-apiserver kine; do
+		pkill -f "$SERVER_WORKDIR/bin/$p" 2>/dev/null || true
 	done
 }
 
@@ -89,5 +98,41 @@ node_up() {
 	local n=0
 	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
 		sleep 0.5; n=$((n+1)); [ $n -gt 60 ] && { echo "node $node_name not Ready within 30s" >&2; return 1; }
+	done
+}
+
+# server_up brings the FULL stack up via `go run ./cmd/k3sm server`: the
+# child-process control-plane executor (kine+apiserver+scheduler+CM) AND the
+# Virtual Kubelet node, in one process. It is the M1 replacement for
+# cluster_up+node_up. It points $KUBECONFIG + $CP_TOKEN at the server's own
+# kubeconfig/token, then waits for healthz and the node Ready.
+#   server_up [node-name] [runtime]    runtime = hostprocess (default) | runtimed
+server_up() {
+	local node_name="${1:-k3sm-m1}" runtime="${2:-hostprocess}"
+	mkdir -p "$BIN" "$SERVER_WORKDIR"
+	( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/kubectl-dl" ./cmd/k3sm >/dev/null 2>&1 ) || true
+	# The server downloads/ad-hoc-signs the CP binaries + kubectl into its workdir.
+	nohup env CGO_ENABLED=1 go run "$REPO_ROOT/cmd/k3sm" server \
+		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
+		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" \
+		> "$K3SM_WORKDIR/server.log" 2>&1 &
+	SERVER_PID=$!
+
+	export KUBECONFIG="$SERVER_WORKDIR/k3sm.kubeconfig"
+	# Reuse the server's kubectl + read its token for the kc() helper.
+	[ -x "$SERVER_WORKDIR/bin/kubectl" ] || true
+	local n=0
+	until [ -f "$KUBECONFIG" ] && [ -x "$SERVER_WORKDIR/bin/kubectl" ]; do
+		sleep 1; n=$((n+1)); [ $n -gt 180 ] && { echo "k3sm server did not provision within 180s" >&2; tail -40 "$K3SM_WORKDIR/server.log" >&2; return 1; }
+	done
+	CP_TOKEN="$(awk -F'token: ' '/token: /{print $2}' "$KUBECONFIG" | tr -d '\r')"
+	BIN="$SERVER_WORKDIR/bin"   # kc() uses $BIN/kubectl
+	n=0
+	until [ "$(kc get --raw /healthz 2>/dev/null)" = "ok" ]; do
+		sleep 1; n=$((n+1)); [ $n -gt 180 ] && { echo "apiserver healthz not ok within 180s" >&2; tail -40 "$K3SM_WORKDIR/server.log" >&2; return 1; }
+	done
+	n=0
+	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
+		sleep 1; n=$((n+1)); [ $n -gt 120 ] && { echo "node $node_name not Ready within 120s" >&2; return 1; }
 	done
 }

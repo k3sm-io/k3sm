@@ -57,10 +57,11 @@ func NewHostProcess(nodeName, podRoot, nodeIP string) *HostProcess {
 	return &HostProcess{nodeName: nodeName, podRoot: podRoot, nodeIP: nodeIP, pods: map[string]*podRec{}}
 }
 
-// Compile-time checks that we satisfy the VK contracts.
+// Compile-time checks that we satisfy the VK contracts and the Runtime seam.
 var (
 	_ vknode.PodLifecycleHandler = (*HostProcess)(nil)
 	_ vknode.PodNotifier         = (*HostProcess)(nil)
+	_ Runtime                    = (*HostProcess)(nil)
 )
 
 // CreatePod launches every container of the pod as a native process.
@@ -220,6 +221,14 @@ func (p *HostProcess) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	p.mu.Lock()
 	p.notify = cb
 	p.mu.Unlock()
+}
+
+// Watch registers cb as the status-change callback so HostProcess satisfies the
+// Runtime seam. For the in-process HostProcess there is no stream to break, so
+// Watch is just NotifyPods under the Runtime name; dispatch already runs cb
+// outside the provider lock.
+func (p *HostProcess) Watch(ctx context.Context, cb func(*corev1.Pod)) {
+	p.NotifyPods(ctx, cb)
 }
 
 // dispatch pushes a status update to VK. Called under p.mu; runs the callback
