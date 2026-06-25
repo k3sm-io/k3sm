@@ -5,6 +5,7 @@ install | token | build | …), `pkg/provider` (the Virtual Kubelet Darwin provi
 runtime), control-plane embedding (M1), launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 
 > Product design: `docs/DESIGN.md`. Milestones: `docs/M0-spike.md`, `docs/M0-node.md`. Spike: `hack/spike/run.sh`.
+> Roadmap & current phase: `docs/PHASES.md` (workspace matrix: `../ROADMAP.md`). Acceptance gates: `hack/acceptance/`.
 
 ## Build / test
 ```sh
