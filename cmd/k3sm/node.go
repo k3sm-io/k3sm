@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,33 +17,63 @@ import (
 	"syscall"
 
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/provider"
 )
 
-// compile-time check that the provider satisfies the full VK provider contract.
-var _ nodeutil.Provider = (*provider.HostProcess)(nil)
+// compile-time check that the VK adapter satisfies the full VK provider contract.
+var _ nodeutil.Provider = (*provider.VKProvider)(nil)
 
-// runNode registers this Mac as a Virtual Kubelet node and runs pods as native
-// macOS processes via the HostProcess provider (M0 walking skeleton).
+// nodeOptions configures a Virtual Kubelet node bring-up. It is shared by the
+// standalone `k3sm node` command and the in-process node `k3sm server` runs.
+type nodeOptions struct {
+	kubeconfig string
+	nodeName   string
+	listen     string
+	podRoot    string
+	nodeIP     string
+	runtime    string // "hostprocess" (default) or "runtimed"
+	dnsShim    string // getaddrinfo DNS shim dylib path (runtimed only)
+	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
+}
+
+// runNode registers this Mac as a Virtual Kubelet node and runs pods via the
+// selected runtime (M0 walking skeleton + M1 runtimed image runtime).
 func runNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
-	kubeconfig := fs.String("kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
-	nodeName := fs.String("node-name", defaultNodeName(), "node name to register")
-	listen := fs.String("listen", "127.0.0.1:10250", "address for the kubelet HTTP API (logs/exec)")
-	podRoot := fs.String("pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
-	nodeIP := fs.String("node-ip", "127.0.0.1", "node/pod IP to advertise")
+	opts := nodeOptions{}
+	fs.StringVar(&opts.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
+	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
+	fs.StringVar(&opts.listen, "listen", "127.0.0.1:10250", "address for the kubelet HTTP API (logs/exec)")
+	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
+	fs.StringVar(&opts.runtime, "runtime", "hostprocess", "pod runtime: hostprocess (native processes) or runtimed (image runtime)")
+	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
+	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
 	_ = fs.Parse(args)
 
-	if *kubeconfig == "" {
+	if opts.kubeconfig == "" {
 		return fmt.Errorf("--kubeconfig (or $KUBECONFIG) is required")
 	}
-	restCfg, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return startNode(ctx, opts)
+}
+
+// startNode builds the client, selects the runtime, registers the VK node, and
+// blocks until ctx ends or the node exits. The server calls it directly with an
+// already-built kubeconfig.
+func startNode(ctx context.Context, opts nodeOptions) error {
+	restCfg, err := clientcmd.BuildConfigFromFlags("", opts.kubeconfig)
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
@@ -49,21 +82,45 @@ func runNode(args []string) error {
 		return fmt.Errorf("build client: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	prov, runtimeLabel, err := buildProvider(opts)
+	if err != nil {
+		return err
+	}
 
-	hp := provider.NewHostProcess(*nodeName, *podRoot, *nodeIP)
-	n, err := nodeutil.NewNode(*nodeName,
-		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, vknode.NodeProvider, error) {
-			configureNode(pc.Node, *nodeName, *nodeIP)
-			return hp, nil, nil // nil NodeProvider -> NewNaiveNodeProvider (auto-Ready + lease heartbeat)
-		},
+	var servingTLS *tls.Config
+	if opts.serveTLS {
+		servingTLS, err = kubeletServingTLS(opts.nodeName, opts.nodeIP)
+		if err != nil {
+			return fmt.Errorf("kubelet serving tls: %w", err)
+		}
+	}
+
+	// The kubelet HTTP API (logs/exec) only serves when BOTH a TLS config and a
+	// handler are set. Wire a mux with the provider routes attached so the
+	// apiserver→node proxy reaches /containerLogs (M1.2).
+	mux := http.NewServeMux()
+	nodeOpts := []nodeutil.NodeOpt{
 		func(c *nodeutil.NodeConfig) error {
 			c.Client = cs
-			c.HTTPListenAddr = *listen
+			c.HTTPListenAddr = opts.listen
 			c.NumWorkers = 4
+			c.TLSConfig = servingTLS // nil = plain HTTP (M0 path); set = kubelet-serving TLS
+			if servingTLS != nil {
+				c.Handler = api.InstrumentHandler(nodeutil.WithAuth(nodeutil.NoAuth(), mux))
+			}
 			return nil
 		},
+	}
+	if servingTLS != nil {
+		nodeOpts = append(nodeOpts, nodeutil.AttachProviderRoutes(mux))
+	}
+
+	n, err := nodeutil.NewNode(opts.nodeName,
+		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, vknode.NodeProvider, error) {
+			configureNode(pc.Node, opts.nodeName, opts.nodeIP)
+			return prov, nil, nil // nil NodeProvider -> NewNaiveNodeProvider (auto-Ready + lease heartbeat)
+		},
+		nodeOpts...,
 	)
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
@@ -74,7 +131,7 @@ func runNode(args []string) error {
 
 	select {
 	case <-n.Ready():
-		log.Printf("k3sm node %q ready (runtime=hostprocess listen=%s pod-root=%s)", *nodeName, *listen, *podRoot)
+		log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot)
 	case err := <-errc:
 		return fmt.Errorf("node exited during startup: %w", err)
 	case <-ctx.Done():
@@ -89,7 +146,33 @@ func runNode(args []string) error {
 	}
 }
 
-// configureNode stamps the registering Node object with darwin identity + capacity.
+// buildProvider selects and constructs the VK provider for the requested
+// runtime. HostProcess is the default (M0 native processes, no isolation);
+// runtimed is the M1 image runtime (OCI pull → clonefile → ad-hoc-sign →
+// Seatbelt confine), wrapped in the VK adapter.
+func buildProvider(opts nodeOptions) (nodeutil.Provider, string, error) {
+	switch opts.runtime {
+	case "", "hostprocess":
+		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP), "hostprocess", nil
+	case "runtimed":
+		rt, err := provider.NewRuntimed(provider.RuntimedConfig{
+			NodeName: opts.nodeName,
+			NodeIP:   opts.nodeIP,
+			Root:     opts.podRoot,
+			DyldShim: opts.dnsShim,
+		})
+		if err != nil {
+			return nil, "", fmt.Errorf("build runtimed provider: %w", err)
+		}
+		return provider.NewVKProvider(rt, opts.nodeName), "runtimed", nil
+	default:
+		return nil, "", fmt.Errorf("unknown --runtime %q (want hostprocess or runtimed)", opts.runtime)
+	}
+}
+
+// configureNode stamps the registering Node object with darwin identity,
+// capacity, and the provider taint (the load-bearing placement guard) so stray
+// non-darwin pods cannot land here.
 func configureNode(n *corev1.Node, name, ip string) {
 	if n.Labels == nil {
 		n.Labels = map[string]string{}
@@ -102,7 +185,7 @@ func configureNode(n *corev1.Node, name, ip string) {
 
 	n.Status.NodeInfo.OperatingSystem = "darwin"
 	n.Status.NodeInfo.Architecture = "arm64"
-	n.Status.NodeInfo.KubeletVersion = "k3sm-m0"
+	n.Status.NodeInfo.KubeletVersion = "k3sm-m1"
 
 	n.Status.Capacity = corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(strconv.Itoa(runtime.NumCPU())),
@@ -115,10 +198,50 @@ func configureNode(n *corev1.Node, name, ip string) {
 		{Type: corev1.NodeHostName, Address: name},
 	}
 	n.Status.DaemonEndpoints.KubeletEndpoint.Port = 10250
-	// NOTE: production adds a provider taint (k3sm.io/provider:NoSchedule) + a
-	// ValidatingAdmissionPolicy requiring nodeSelector kubernetes.io/os=darwin so
-	// stray Linux pods can't land here. Left off for the M0 demo so a plain
-	// `kubectl run` schedules onto the only node.
+
+	// Provider taint: the load-bearing placement guard. Only pods that tolerate
+	// k3sm.io/provider:NoSchedule (the darwin workloads the server provisions a
+	// toleration for) schedule here, so stray Linux pods cannot land on this node.
+	// The os=darwin ValidatingAdmissionPolicy is the intent guard on top of it.
+	n.Spec.Taints = upsertTaint(n.Spec.Taints, corev1.Taint{
+		Key:    providerTaintKey,
+		Effect: corev1.TaintEffectNoSchedule,
+	})
+}
+
+// providerTaintKey is the k3sm provider taint placed on every k3sm node.
+const providerTaintKey = "k3sm.io/provider"
+
+// upsertTaint adds t to taints if a taint with the same key+effect is not
+// already present.
+func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
+	for _, existing := range taints {
+		if existing.Key == t.Key && existing.Effect == t.Effect {
+			return taints
+		}
+	}
+	return append(taints, t)
+}
+
+// kubeletServingTLS builds the TLS config the VK node serves on :10250. The
+// cert's SANs include the node InternalIP (so the apiserver, started with
+// --kubelet-preferred-address-types=InternalIP, dials by IP and verifies), the
+// node name, and loopback. ClientAuth is left at NoClientCert: M1 keeps the
+// apiserver's AlwaysAllow posture, so the proxy connects without a client cert.
+func kubeletServingTLS(nodeName, nodeIP string) (*tls.Config, error) {
+	ips := []net.IP{net.ParseIP("127.0.0.1")}
+	if ip := net.ParseIP(nodeIP); ip != nil && !ip.Equal(net.ParseIP("127.0.0.1")) {
+		ips = append(ips, ip)
+	}
+	cert, err := certs.SelfSignedServing([]string{nodeName, "localhost"}, ips)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.NoClientCert,
+	}, nil
 }
 
 func defaultNodeName() string {
