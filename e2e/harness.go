@@ -44,6 +44,17 @@ func Up(t *testing.T) *Cluster {
 	return &Cluster{Client: cs}
 }
 
+// Healthz returns the apiserver /healthz body (e.g. "ok"), proving the control
+// plane is serving — the M1.1 exit check.
+func (c *Cluster) Healthz(t *testing.T) string {
+	t.Helper()
+	body, err := c.Client.Discovery().RESTClient().Get().AbsPath("/healthz").DoRaw(context.Background())
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	return string(body)
+}
+
 // WaitPodPhase polls until the pod reaches want, or fails the test at the timeout.
 func (c *Cluster) WaitPodPhase(t *testing.T, ns, name string, want corev1.PodPhase, timeout time.Duration) *corev1.Pod {
 	t.Helper()
