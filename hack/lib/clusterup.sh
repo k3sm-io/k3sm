@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# k3sm cluster bring-up library — sourced by every hack/acceptance/m<n>.sh gate.
+# Adapted from the validated M0 spike (hack/spike/run.sh), which remains the M0 reference.
+#
+# Pre-M1 cluster_up uses prebuilt darwin/arm64 control-plane binaries (kwok-ci/k8s) + kine,
+# exactly like the spike. From M1, the acceptance gates swap cluster_up's CP bring-up for
+# `go run ./cmd/k3sm server` (the embedded control plane from source) — the kc()/wait_*/
+# node_up helpers and the e2e asserts stay identical.
+#
+# Requires: macOS 26+ arm64, Go, Xcode CLT (clang), gh, curl, openssl, nc.
+
+: "${KUBE_VERSION:=v1.36.2}"          # latest darwin-arm64 on kwok-ci/k8s
+: "${KINE_VERSION:=v1.14.2}"
+: "${K3SM_WORKDIR:=/tmp/k3sm-cluster}"
+: "${APISERVER_PORT:=6444}"           # NOT 6443 — Docker Desktop's k8s squats there
+: "${KINE_PORT:=2379}"
+
+BIN="$K3SM_WORKDIR/bin"
+export KUBECONFIG="${KUBECONFIG:-$K3SM_WORKDIR/cluster.kubeconfig}"
+CP_TOKEN="acceptance-secret-token"
+NODE_PID=""
+# repo root = this file's dir /../.. (hack/lib -> repo), resolved regardless of caller cwd.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# kc runs kubectl against the acceptance cluster.
+kc() { "$BIN/kubectl" --server="https://127.0.0.1:$APISERVER_PORT" --insecure-skip-tls-verify=true --token="$CP_TOKEN" "$@"; }
+
+# wait_tcp blocks until 127.0.0.1:<port> accepts a connection (or times out).
+wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sleep 0.3; n=$((n+1)); [ $n -gt 100 ] && { echo "timeout :$port" >&2; return 1; }; done; }
+
+# cluster_down stops the node and every control-plane process.
+cluster_down() {
+	[ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null || true
+	for p in k3sm kube-controller-manager kube-scheduler kube-apiserver kine; do
+		pkill -f "$BIN/$p" 2>/dev/null && echo "stopped $p" || true
+	done
+}
+
+# cluster_up brings up kine + apiserver + scheduler + controller-manager and writes $KUBECONFIG.
+cluster_up() {
+	mkdir -p "$BIN"
+	( cd "$K3SM_WORKDIR"
+	  # 1. prebuilt control-plane binaries (upstream won't ship darwin/arm64: k/k#118359)
+	  if [ ! -x "$BIN/kube-apiserver" ]; then
+		gh release download "${KUBE_VERSION}-kwok.0-darwin-arm64" --repo kwok-ci/k8s --dir "$BIN" --clobber
+		chmod +x "$BIN"/*
+	  fi
+	  for b in kube-apiserver kube-scheduler kube-controller-manager kubectl; do codesign -s - -f "$BIN/$b" >/dev/null 2>&1 || true; done
+	  # 2. kine — REQUIRES cgo (mattn/go-sqlite3); the no-cgo build disables sqlite
+	  if [ ! -x "$BIN/kine" ]; then CGO_ENABLED=1 GOWORK=off GOBIN="$BIN" go install "github.com/k3s-io/kine@${KINE_VERSION}"; codesign -s - -f "$BIN/kine" >/dev/null 2>&1 || true; fi
+	  # 3. SA keypair, static token, kubeconfig
+	  [ -f sa.key ] || { openssl genrsa -out sa.key 2048 2>/dev/null; openssl rsa -in sa.key -pubout -out sa.pub 2>/dev/null; }
+	  printf '%s,admin,admin-uid,"system:masters"\n' "$CP_TOKEN" > tokens.csv; chmod 600 tokens.csv
+	  mkdir -p apiserver-certs
+	  cat > "$KUBECONFIG" <<EOF
+apiVersion: v1
+kind: Config
+clusters: [{name: k3sm, cluster: {server: "https://127.0.0.1:$APISERVER_PORT", insecure-skip-tls-verify: true}}]
+contexts: [{name: k3sm, context: {cluster: k3sm, user: admin}}]
+current-context: k3sm
+users: [{name: admin, user: {token: $CP_TOKEN}}]
+EOF
+	  # 4. kine (etcd shim over sqlite)
+	  nohup "$BIN/kine" --listen-address "127.0.0.1:$KINE_PORT" > kine.log 2>&1 & wait_tcp "$KINE_PORT"
+	  # 5. apiserver (AlwaysAllow auto-disables anonymous -> static token auth)
+	  nohup "$BIN/kube-apiserver" \
+		--etcd-servers="http://127.0.0.1:$KINE_PORT" --service-cluster-ip-range=10.43.0.0/16 \
+		--service-account-key-file="$K3SM_WORKDIR/sa.pub" --service-account-signing-key-file="$K3SM_WORKDIR/sa.key" \
+		--service-account-issuer=https://kubernetes.default.svc.cluster.local \
+		--token-auth-file="$K3SM_WORKDIR/tokens.csv" --authorization-mode=AlwaysAllow \
+		--bind-address=127.0.0.1 --advertise-address=127.0.0.1 \
+		--secure-port="$APISERVER_PORT" --cert-dir="$K3SM_WORKDIR/apiserver-certs" --allow-privileged=true > apiserver.log 2>&1 &
+	  until [ "$(kc get --raw /healthz 2>/dev/null)" = "ok" ]; do sleep 0.5; done
+	  # 6. scheduler + controller-manager
+	  nohup "$BIN/kube-scheduler" --kubeconfig="$KUBECONFIG" --authentication-kubeconfig="$KUBECONFIG" --authorization-kubeconfig="$KUBECONFIG" --leader-elect=false --bind-address=127.0.0.1 --secure-port=10259 > scheduler.log 2>&1 &
+	  nohup "$BIN/kube-controller-manager" --kubeconfig="$KUBECONFIG" --authentication-kubeconfig="$KUBECONFIG" --authorization-kubeconfig="$KUBECONFIG" --leader-elect=false --service-account-private-key-file="$K3SM_WORKDIR/sa.key" --root-ca-file="$K3SM_WORKDIR/apiserver-certs/apiserver.crt" --bind-address=127.0.0.1 --secure-port=10257 --controllers=serviceaccount,serviceaccount-token,namespace,garbagecollector > cm.log 2>&1 &
+	)
+}
+
+# node_up builds and starts a k3sm Virtual Kubelet node, then waits for it Ready.
+#   node_up [node-name] [pod-root]
+node_up() {
+	local node_name="${1:-k3sm-m0}" pod_root="${2:-$K3SM_WORKDIR/pods}"
+	( cd "$REPO_ROOT" && CGO_ENABLED=0 go build -o "$BIN/k3sm" ./cmd/k3sm )
+	codesign -s - -f "$BIN/k3sm" >/dev/null 2>&1 || true
+	rm -rf "$pod_root"; mkdir -p "$pod_root"
+	nohup "$BIN/k3sm" node --kubeconfig "$KUBECONFIG" --node-name "$node_name" --pod-root "$pod_root" --node-ip 127.0.0.1 > "$K3SM_WORKDIR/node.log" 2>&1 &
+	NODE_PID=$!
+	local n=0
+	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
+		sleep 0.5; n=$((n+1)); [ $n -gt 60 ] && { echo "node $node_name not Ready within 30s" >&2; return 1; }
+	done
+}
