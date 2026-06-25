@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
-CGO=0   # k3sm is pure Go TODAY. M1.1 flips this to 1 (embeds kine -> mattn/go-sqlite3).
+CGO=1   # M1: k3sm is CGO_ENABLED=1 — it imports runtimed (cgo syscall shims) and kine (mattn/go-sqlite3).
 
 echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
