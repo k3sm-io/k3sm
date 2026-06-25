@@ -33,6 +33,15 @@ func tokenFilePath(workDir string) string { return filepath.Join(workDir, "token
 func saKeyPath(workDir string) string { return filepath.Join(workDir, "sa.key") }
 func saPubPath(workDir string) string { return filepath.Join(workDir, "sa.pub") }
 
+// KubeconfigPath returns the admin kubeconfig path the executor writes for a
+// given work dir. Exported so the `k3sm kubectl`/`kubeconfig` subcommands resolve
+// the same path the server emits, single-sourcing the layout.
+func KubeconfigPath(workDir string) string { return kubeconfigPath(workDir) }
+
+// KubectlPath returns the bundled kubectl binary path for a given work dir
+// (downloaded alongside the control-plane binaries by ensureControlPlaneBinaries).
+func KubectlPath(workDir string) string { return filepath.Join(binDir(workDir), "kubectl") }
+
 // apiServerURL is the loopback HTTPS URL clients use to reach the apiserver.
 func apiServerURL(port int) string {
 	return "https://127.0.0.1:" + strconv.Itoa(port)
