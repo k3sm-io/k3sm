@@ -1,9 +1,9 @@
 ---
 repo: k3sm
 schema: phases/v1
-current_phase: M1
-updated: 2026-06-24
-updated_by: human
+current_phase: M2
+updated: 2026-06-25
+updated_by: claude
 
 phases:
   - id: M0
@@ -27,7 +27,8 @@ phases:
 
   - id: M1
     title: k3sm server + images + Services + DNS (single node)
-    status: in-progress
+    status: done
+    completed: 2026-06-25
     strategy: hard cut
     depends_on:
       - apis:M1.1
@@ -65,7 +66,7 @@ phases:
         deliverables:
           - id: M1.3-d1
             done: true
-            desc: "pkg/provider grows a consumer-side Runtime interface; HostProcess refactored to satisfy it; a runtimedRuntime impl wraps runtimed's in-process runtime.New (runtimev1.RuntimeServer) — translates corev1.Pod→PodBox (FILLS SandboxProfile+SignaturePolicy so the fail-closed gate passes) and runtimev1.PodStatus→corev1.PodStatus DERIVING the lossy fields (4 Conditions; phase=Running when any container runs & none failed; STABLE StartTime from CreatePod; container Started; terminated Reason/ExitCode/Signal verbatim; HostIP from node IP). NotifyPods is driven off the streaming WatchPodStatus with resync-on-stream-break + a periodic GetPodStatus backstop. Provider impl selected via --runtime flag (hostprocess default; runtimed opt-in). This import makes k3sm CGO_ENABLED=1."
+            desc: "pkg/provider grows a consumer-side Runtime interface; HostProcess refactored to satisfy it; a runtimedRuntime impl wraps runtimed's in-process runtime.New (runtimev1.RuntimeServer) — translates corev1.Pod→PodBox (FILLS SandboxProfile+SignaturePolicy so the fail-closed gate passes) and runtimev1.PodStatus→corev1.PodStatus DERIVING the lossy fields. Provider impl selected via --runtime flag (hostprocess default; runtimed opt-in). This import makes k3sm CGO_ENABLED=1."
         acceptance:
           - id: M1.3-a1
             met: true
@@ -77,29 +78,151 @@ phases:
         deliverables:
           - id: M1.4-d1
             done: true
-            desc: "pkg/netserve hosts darwin-net's userspace Service proxy (proxy.NewWatcher(client, proxy, log).Run(ctx)) as a goroutine and renders the CoreDNS Corefile (dns.CorefileOptions) + the pod DNSConfig (dns.PodDNSConfig) for the getaddrinfo shim — consuming the seams, NOT reimplementing Service/VIP translation or ndots/search."
+            desc: "pkg/netserve hosts darwin-net's userspace Service proxy (proxy.NewWatcher) as a goroutine and renders the CoreDNS Corefile + the pod DNSConfig for the getaddrinfo shim — consuming the seams, NOT reimplementing Service/VIP translation or ndots/search."
         acceptance:
           - id: M1.4-a1
             met: true
-            check: kubectl expose → ClusterIP allocated + EndpointSlice populated (kept controller) + reconciled by the Service proxy; CoreDNS Corefile rendered for the shim (data-path reachability asserted by hack/acceptance/m1.sh on a capable host)
+            check: kubectl expose → ClusterIP allocated + EndpointSlice populated + reconciled by the Service proxy; CoreDNS Corefile rendered for the shim (data-path reachability asserted by hack/acceptance/m1.sh on a capable host)
             method: e2e
 
   - id: M2
-    title: Isolation + resources + daemon split (integration side)
+    title: Isolation, resources & pod-spec fidelity (integration side)
     status: todo
+    strategy: hard cut
     depends_on:
       - apis:M2.1
       - runtimed:M2
       - darwin-net:M2
-    subphases: []
+    subphases:
+      - id: M2.0
+        title: kubectl ergonomics — k3sm kubectl + k3sm kubeconfig
+        status: done
+        deliverables:
+          - id: M2.0-d1
+            done: true
+            desc: "cmd/k3sm/kubectl.go — `k3sm kubectl <args>` execs the bundled kubectl (or one on PATH) with KUBECONFIG preset to the executor's admin kubeconfig and forwards the child exit code (mirrors `k3s kubectl`); work dir honors K3SM_WORK_DIR. cmd/k3sm/kubeconfig.go — `k3sm kubeconfig` prints the admin kubeconfig, or --write MERGES the k3sm cluster/user/context into ~/.kube/config (atomic write + .bak backup, --context-name to avoid collisions); --server retargets the endpoint and REFUSES to persist an insecure (skip-TLS-verify) context off loopback unless --certificate-authority embeds a CA. Exported executor.KubeconfigPath/KubectlPath single-source the layout."
+        acceptance:
+          - id: M2.0-a1
+            met: true
+            check: mergeKubeconfig (into empty / preserves existing / custom-name) + retarget (refuses insecure off-loopback, keeps loopback) + isLoopbackServer unit tests pass; `go test ./cmd/...` green under CGO_ENABLED=1
+            method: unit
+      - id: M2.1
+        title: Provider pod-spec fidelity — volumes, env, securityContext, grace
+        status: todo
+        deliverables:
+          - id: M2.1-d1
+            done: false
+            desc: "pkg/provider translates the apis:M2.1 corev1 surface → runtime PodBox: volumes + volume_mounts (configMap/secret/emptyDir/downwardAPI/projected incl. serviceAccountToken), downward-API env (spec.nodeName/status.podIP/metadata.name) + envFrom (configMapRef/secretRef), securityContext (runAsUser/runAsGroup/fsGroup), terminationGracePeriodSeconds; derives the PAIRED ContainerStatus fields so kubectl Pod state stays a lossless mirror."
+        acceptance:
+          - id: M2.1-a1
+            met: false
+            check: a pod with configMap+secret+emptyDir+downwardAPI mounts + downward-API env runs; kubectl describe shows the mounts/resources (status round-trip)
+            method: e2e
+      - id: M2.2
+        title: Provider-served probes
+        status: todo
+        deliverables:
+          - id: M2.2-d1
+            done: false
+            desc: "the provider executes httpGet/tcp/exec liveness/readiness/startup probes and maps results to the Ready/ContainersReady conditions (endpoint membership) and to container restart on liveness failure — kubelet-inherited behavior the VK provider must reproduce."
+        acceptance:
+          - id: M2.2-a1
+            met: false
+            check: a readiness-probe failure removes the pod from its Service EndpointSlice; a liveness-probe failure increments restart_count (transition cases, not just eventually-Ready)
+            method: e2e
+      - id: M2.3
+        title: Resources → Summary API (kubectl top) + OOMKilled
+        status: todo
+        deliverables:
+          - id: M2.3-d1
+            done: false
+            desc: "surface runtimed:M2's proc_pid_rusage(ri_phys_footprint) metering to the kubelet Summary API so kubectl top reports a real footprint, and translate a userspace memory-limit kill to the OOMKilled reason. CPU limits are documented best-effort QoS (taskpolicy/setpriority), NOT CFS millicores."
+        acceptance:
+          - id: M2.3-a1
+            met: false
+            check: kubectl top pod shows a non-zero footprint; a memory-limit breach yields phase=Failed reason=OOMKilled
+            method: e2e
+      - id: M2.4
+        title: In-cluster API access — kubernetes.default.svc reachable + SA-token projection
+        status: todo
+        deliverables:
+          - id: M2.4-d1
+            done: false
+            desc: "make the apiserver-auto-created kubernetes.default.svc endpoint reachable from a bound pod IP (advertise/proxy address discipline); project the default-SA BOUND token (audience + expirationSeconds + rotation) and mount the apiserver SERVING CA at the canonical in-pod path so a stock client-go in-cluster config validates end-to-end. In-pod DNS requires the exec-shim backend (sandbox-exec strips DYLD_*). Authorization is exercised under RBAC at M4 (M2 runs AlwaysAllow)."
+        acceptance:
+          - id: M2.4-a1
+            met: false
+            check: a pod with its projected SA token + CA reaches the apiserver via kubernetes.default.svc and lists pods (authn/routing/CA; authz deferred to M4)
+            method: e2e
+      - id: M2.5
+        title: Implement Exec/Attach/PortForward provider verbs
+        status: todo
+        deliverables:
+          - id: M2.5-d1
+            done: false
+            desc: "wire the provider's RunInContainer/AttachToContainer/PortForward (NotFound in M1) to the already-existing runtime/v1 Exec/Attach/PortForward RPCs — a provider-implementation gap against a frozen apis contract, not an apis change."
+        acceptance:
+          - id: M2.5-a1
+            met: false
+            check: kubectl exec and kubectl port-forward work against a confined pod
+            method: e2e
 
   - id: M3
-    title: Multi-node join + mesh (control side)
+    title: Multi-node, mesh, NodePort & persistent storage (control side)
     status: todo
     depends_on:
       - apis:M3.1
+      - runtimed:M3
       - darwin-net:M3
-    subphases: []
+    subphases:
+      - id: M3.0
+        title: Multi-node bootstrap (token / node-password / HTTP-CSR / join)
+        status: todo
+        deliverables:
+          - id: M3.0-d1
+            done: false
+            desc: "supervisor HTTP bootstrap — k3sm token create, node-password (anti-impersonation), HTTP-CSR cert issuance, AES-256-GCM bootstrap bundle; k3sm agent --server --token join client; mesh-enroll (wg pubkey + podCIDR) writes the MeshPeer CRD (apis:M3.1) and drives darwin-net:M3 mesh bring-up."
+        acceptance:
+          - id: M3.0-a1
+            met: false
+            check: a second Mac joins; cross-node pod-to-pod + ClusterIP work (two-Mac lab)
+            method: e2e
+      - id: M3.1
+        title: Wire NodePort Services
+        status: todo
+        deliverables:
+          - id: M3.1-d1
+            done: false
+            desc: "surface darwin-net:M3's NodePort listener (*:nodePort, TCP) through the server so a NodePort Service is reachable on the host port — no apis change (ServicePort.NodePort already exists). UDP NodePort deferred with darwin-net's UDP relay."
+        acceptance:
+          - id: M3.1-a1
+            met: false
+            check: a Deployment behind a NodePort Service is reachable on *:nodePort
+            method: e2e
+      - id: M3.2
+        title: APFS local-path provisioner + StatefulSet
+        status: todo
+        deliverables:
+          - id: M3.2-d1
+            done: false
+            desc: "a local-path provisioner controller watches PVCs and provisions a PV via runtimed:M3 (stable per-PVC dir on the same APFS volume as /var/lib/k3sm, empty-create, lifecycle decoupled from the pod dir, honors ReclaimPolicy); StatefulSet support — stable STORAGE + NAME identity on the hostprocess runtime; stable NETWORK identity requires per-pod IPs (runtimed M2 path)."
+        acceptance:
+          - id: M3.2-a1
+            met: false
+            check: a StatefulSet + PVC writes data, the pod restarts, and the SAME data is present (persistence across restart)
+            method: e2e
+      - id: M3.3
+        title: Per-node CoreDNS + node-local kubernetes endpoint (infra-VIP mesh exemption)
+        status: todo
+        deliverables:
+          - id: M3.3-d1
+            done: false
+            desc: "run CoreDNS per-node bound to the DNS VIP and resolve the kubernetes endpoint to a node-local apiserver/proxy address (with darwin-net:M3.3) so infra VIPs (10.43.0.1/10.43.0.10) are never steered over the wireguard mesh where no peer's AllowedIPs covers them."
+        acceptance:
+          - id: M3.3-a1
+            met: false
+            check: on a 2-node cluster, in-pod kubectl and cluster DNS work from a pod on the joined (non-control-plane) node
+            method: e2e
 
   - id: M4
     title: Install/launchd, packaging, Homebrew, HA, hardening
@@ -108,80 +231,135 @@ phases:
       - apis:M4.1
       - runtimed:M4
       - darwin-net:M4
-    subphases: []
+    subphases:
+      - id: M4.0
+        title: Packaging + launchd + HA
+        status: todo
+        deliverables:
+          - id: M4.0-d1
+            done: false
+            desc: "app-bundle-wrapped root LaunchDaemon + k3sm install/uninstall (launchctl bootstrap/kickstart); codesign + notarize + .pkg (raw root utun/pf, no NE); goreleaser → k3sm-io/homebrew-tap; kine→Postgres HA (pgx) for >2 servers; admin kubeconfig dropped to ~/.kube/config on install (k3sm kubeconfig --write)."
+        acceptance:
+          - id: M4.0-a1
+            met: false
+            check: brew install → sudo k3sm install server → cluster; survives reboot (launchd); HA with 2 servers on Postgres (lab)
+            method: e2e
+      - id: M4.1
+        title: RBAC enforcement (AlwaysAllow → Node,RBAC)
+        status: todo
+        deliverables:
+          - id: M4.1-d1
+            done: false
+            desc: "provision the RBAC graph BEFORE flipping the authorizer — system ClusterRoles/bindings, the VK node's system:node:<name> identity (via the M3 node-password/HTTP-CSR path), NodeRestriction admission, and per-ServiceAccount RoleBindings — idempotently at server start; then set --authorization-mode=Node,RBAC and --anonymous-auth=false. On multi-node the kickstart rolls node-by-node, control-plane Mac last, bindings pre-existing so no node is denied mid-roll."
+        acceptance:
+          - id: M4.1-a1
+            met: false
+            check: a restricted SA is denied a verb; the admin + the control-plane/node SAs remain authorized (node Ready, controllers reconciling) across the flip
+            method: integration
+      - id: M4.2
+        title: Synthetic conformance gate in CI
+        status: todo
+        deliverables:
+          - id: M4.2-d1
+            done: false
+            desc: "the stockkitty-driven synthetic conformance set (hack/acceptance/conformance/, build-tagged Go tests named per criterion, invoked by m<n>.sh) runs green in CI: the M2 + M3 slices at the integration tier (CGO_ENABLED=1), the M5 slice lab-tiered (K3SM_LAB=1). See docs/stockkitty-readiness.md for the assertion→feature mapping."
+        acceptance:
+          - id: M4.2-a1
+            met: false
+            check: hack/acceptance/m2.sh and m3.sh exit 0 in CI (feature-class coverage); the conformance assertions map to stockkitty features
+            method: integration
+
+  - id: M5
+    title: vm RuntimeClass — Virtualization.framework Linux micro-VM (committed)
+    status: todo
+    depends_on:
+      - apis:M5.1
+      - runtimed:M5
+      - darwin-net:M5
+    subphases:
+      - id: M5.1
+        title: runtimeClassName=vm dispatch + Linux image + vmnet assembly
+        status: todo
+        deliverables:
+          - id: M5.1-d1
+            done: false
+            desc: "the provider dispatches a pod with runtimeClassName=vm to runtimed:M5's VZ backend via the apis:M5.1 runtime.k3sm.io handler-config (runtimeClassName → SANDBOX_BACKEND_VM; the upstream node.k8s.io/RuntimeClass object is consumed, not forked); Linux guest images are digest-pinned (not Mach-O ⇒ codesign/notarization N/A inside the VM; the guest kernel/initramfs is the notarized host asset); networking via darwin-net:M5 vmnet + a guest-side resolver. Confirm the com.apple.security.virtualization entitlement against DESIGN §5c. This is what runs stockkitty's Linux-only Postgres/pgvector."
+        acceptance:
+          - id: M5.1-a1
+            met: false
+            check: a Linux image runs under runtimeClassName=vm, is reachable via a ClusterIP Service + cluster DNS, and coexists with native arm64 pods (two-Mac/VZ lab)
+            method: e2e
 ---
 
 # k3sm — Phase roadmap
 
 > Per-repo slice of the k3sm milestones (workspace matrix: `../../ROADMAP.md`; product design:
-> `docs/DESIGN.md` §5c/§7/§9). The YAML frontmatter above is **authoritative**; this prose mirrors
-> it. Status: ✅ done · 🟡 in-progress · ⛔ blocked · ⬜ todo.
+> `docs/DESIGN.md` §5c/§7/§9; reference-workload readiness: `../../docs/stockkitty-readiness.md`). The YAML
+> frontmatter above is **authoritative**; this prose mirrors it. Status: ✅ done · 🟡 in-progress · ⛔ blocked · ⬜ todo.
 
-`k3sm` is **Wave 3**: it imports all of `apis`, `runtimed`, `darwin-net` and assembles the
-distribution, so it lands last in every wave and owns the end-to-end exit demos. **CGO flips to
-`CGO_ENABLED=1` at M1** (embeds kine → `mattn/go-sqlite3`); keep the `replace google.golang.org/genproto`
-in `go.mod`.
+`k3sm` is **Wave 3**: it imports all of `apis`, `runtimed`, `darwin-net` and assembles the distribution, so it
+lands last in every wave and owns the end-to-end exit demos. **CGO is `CGO_ENABLED=1` from M1** (embeds kine →
+`mattn/go-sqlite3`); keep the `replace google.golang.org/genproto` in `go.mod`.
 
 ## M0 — Walking skeleton ✅
-Validated 2026-06-24 (`docs/M0-spike.md`, `docs/M0-node.md`): a native control plane runs on
-macOS/arm64 (apiserver+scheduler+CM+kine, prebuilt spike binaries), `k3sm node` registers a darwin
-Virtual Kubelet node, and the `pkg/provider` HostProcess runtime executes a `kubectl`-applied Pod as
-a real native process — zero Linux. Code: `cmd/k3sm/{main,node}.go`, `pkg/provider/hostprocess.go`.
+Validated 2026-06-24: a native control plane runs on macOS/arm64, `k3sm node` registers a darwin Virtual
+Kubelet node, and the `pkg/provider` HostProcess runtime executes a `kubectl`-applied Pod as a real native
+process — zero Linux. Code: `cmd/k3sm/{main,node}.go`, `pkg/provider/hostprocess.go`.
 
-## M1 — k3sm server + images + Services + DNS (single node) ⬜
+## M1 — k3sm server + images + Services + DNS (single node) ✅
+Landed 2026-06-25 (PR #1). As-built (correcting the original "in-process embed" design): M1.1 ships a
+**child-process `Supervised` executor** (`pkg/executor`) — apiserver + scheduler + KCM + kine as supervised
+child processes, prebuilt darwin/arm64 binaries + cgo-built kine, ad-hoc-signed, kine→SQLite WAL, scoped KCM
+`--controllers`. The from-source in-process `Embedded` path is a deferred stub (`ErrEmbeddedNotImplemented`).
+M1.2 provisions the `os=darwin` ValidatingAdmissionPolicy + the provider taint + kubelet-serving TLS. M1.3 wires
+the runtimed image runtime behind a consumer-side `Runtime` interface (`--runtime` selects hostprocess|runtimed).
+M1.4 hosts darwin-net's Service proxy + CoreDNS config via `pkg/netserve`. Note: `ConsistentListFromCache` is
+GA-locked `true` on the pinned k8s v1.36.2; the lo0/DNS data-path leg is root-gated (asserted by
+`hack/acceptance/m1.sh` on a capable host). Gate: `hack/acceptance/m1.sh`.
 
-**Cross-repo deps:** `apis:M1.1`+`M1.2`, `runtimed:M1`, `darwin-net:M1`. k3sm is the integrator; it
-lands last in the wave. The M1 spike used **prebuilt** CP binaries; M1.1 rebuilds them **from source
-in-process** (the embedding that "rolled into M1" per DESIGN §7).
+## M2 — Isolation, resources & pod-spec fidelity ⬜
+The runtime-independent pod surface a real workload needs (see `../../docs/stockkitty-readiness.md`), on top of
+the runtimed daemon split + isolation + resources work. Sub-phases:
+- ✅ **M2.0** — kubectl ergonomics: `k3sm kubectl` passthrough + `k3sm kubeconfig` print/`--write` merge into
+  `~/.kube/config` (atomic + backup; refuses insecure-skip off loopback, embeds a CA via
+  `--certificate-authority`). *Implemented + unit-tested on this branch; lands with it.*
+- ⬜ **M2.1** — provider translates volumes/mounts (configMap/secret/emptyDir/downwardAPI/projected-SA-token),
+  downward-API env + `envFrom`, `securityContext`, `terminationGracePeriodSeconds` (apis:M2.1) + the paired
+  `ContainerStatus` (lossless mirror).
+- ⬜ **M2.2** — provider-served liveness/readiness/startup probes → conditions + endpoints + restart.
+- ⬜ **M2.3** — runtimed `proc_pid_rusage` → Summary API (`kubectl top`) + `OOMKilled` (CPU = best-effort QoS).
+- ⬜ **M2.4** — make `kubernetes.default.svc` reachable from a bound pod IP + project the bound SA token + mount
+  the apiserver serving CA ⇒ in-pod kubectl (authz validated under RBAC at M4; in-pod DNS needs the exec-shim).
+- ⬜ **M2.5** — implement the provider `Exec`/`Attach`/`PortForward` verbs against the existing runtime/v1 RPCs.
 
-### M1.1 — embed control plane from source ⬜
-**Deliverables**
-- ⬜ `M1.1-d1` `pkg/executor/embed`: apiserver + scheduler + CM + **kine** as in-process goroutines; kine→SQLite WAL; scoped KCM `--controllers`. **CGO=1 flip.**
-
-**Acceptance (exit gate)**
-- ⬜ `M1.1-a1` `k3sm server` boots; `kubectl get --raw=/healthz` ok; KCM scoped — *method: integration*
-
-### M1.2 — admission guardrail + provider placement ⬜
-**Deliverables**
-- ⬜ `M1.2-d1` `os=darwin` `ValidatingAdmissionPolicy` + provider taint; kubelet-serving TLS (M0.3 follow-up) so `kubectl logs/exec` work via the proxy.
-
-**Acceptance (exit gate)**
-- ⬜ `M1.2-a1` non-`os=darwin` pod rejected by admission; `kubectl logs`/`exec` work — *method: integration*
-
-### M1.3 — wire runtimed image runtime ⬜
-**Deliverables**
-- ⬜ `M1.3-d1` provider delegates pod execution to `runtimed:M1` (library import) via `apis runtime/v1`.
-
-**Acceptance (exit gate)**
-- ⬜ `M1.3-a1` `kubectl run` a **pulled native image** → Running and confined — *method: e2e*
-
-### M1.4 — wire darwin-net Services + DNS ⬜
-**Deliverables**
-- ⬜ `M1.4-d1` server hosts the `darwin-net:M1` Service proxy + CoreDNS + DNS shim as goroutines.
-
-**Acceptance (exit gate)**
-- ⬜ `M1.4-a1` `kubectl expose` → ClusterIP reachable; CoreDNS resolves via the shim — *method: e2e*
-
-**M1 milestone exit demo (= DESIGN §9):** pull a native image, run it, `kubectl expose` ClusterIP,
-DNS resolves. Gate: `hack/acceptance/m1.sh`. Evidence recorded in `docs/M1-*.md` when it passes.
-
-## M2 — Isolation + resources + daemon split ⬜
-Decomposed when M1 closes. Headline: provider talks to the now-split root `k3sm-runtimed` over
-unix-socket gRPC (`apis:M2.1`); surface `runtimed`'s `proc_pid_rusage` metrics to the Summary API
-(`kubectl top`) + `OOMKilled` reason; drive `darwin-net:M2`'s `PodNetwork` for pod IPs. Exit (§9 M2):
-pods confined (no `/Users`), memory breach → `OOMKilled`, `kubectl top` real, same-node pod-to-pod.
-
-## M3 — Multi-node join + mesh (control side) ⬜
-Headline: supervisor HTTP bootstrap — `k3sm token create`, node-password, HTTP-CSR cert issuance,
-AES-256-GCM bootstrap bundle; `k3sm agent --server --token` join client; mesh-enroll (wg pubkey +
-podCIDR) writes the `MeshPeer` CRD (`apis:M3.1`); drive `darwin-net:M3` mesh bring-up. Exit (§9 M3):
-two Macs, one cluster, cross-node pod-to-pod + ClusterIP (second Mac required).
+## M3 — Multi-node, mesh, NodePort & persistent storage ⬜
+- ⬜ **M3.0** — multi-node bootstrap (`k3sm token create`, node-password, HTTP-CSR, AES-GCM bundle, `k3sm agent`
+  join) + mesh-enroll (`MeshPeer` CRD, apis:M3.1) driving darwin-net:M3.
+- ⬜ **M3.1** — wire darwin-net's NodePort (`*:nodePort`, TCP) — no apis change (NodePort already in `net/v1`).
+- ⬜ **M3.2** — APFS local-path provisioner (PVC→PV via runtimed:M3, same-volume, decoupled lifecycle) +
+  StatefulSet (stable storage+name; network identity needs per-pod IPs).
+- ⬜ **M3.3** — per-node CoreDNS bound to the DNS VIP + node-local `kubernetes` endpoint so infra VIPs aren't
+  blackholed over the mesh (with darwin-net:M3.3).
+Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a NodePort + a persistent StatefulSet.
 
 ## M4 — Install/launchd, packaging, Homebrew, HA, hardening ⬜
-Headline: app-bundle-wrapped root LaunchDaemon + `k3sm install/uninstall`; codesign/notarize + `.pkg`
-(raw root utun/pf, no NE); goreleaser → `k3sm-io/homebrew-tap`; kine→Postgres HA; probes; NodePort/LB;
-macOS-arm64 CI; watch-staleness soak; Darwin-subset node conformance; flip core repos public. Exit
-(§9 M4): `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server` → cluster; survives reboot; HA.
+- ⬜ **M4.0** — app-bundle root LaunchDaemon + `k3sm install/uninstall`; codesign/notarize + `.pkg`; goreleaser →
+  `k3sm-io/homebrew-tap`; kine→Postgres HA.
+- ⬜ **M4.1** — RBAC enforcement: provision system roles + the VK node `system:node` identity (M3 CSR path) +
+  NodeRestriction + per-SA bindings + `anonymous-auth=false` **before** flipping `--authorization-mode=Node,RBAC`;
+  multi-node rolls control-plane-Mac-last with bindings pre-existing.
+- ⬜ **M4.2** — the synthetic conformance gate (M2/M3 slices integration-tier; M5 slice lab-tier) green in CI.
+
+## M5 — vm RuntimeClass (committed) ⬜
+Promoted from a stretch goal to a committed milestone to run stockkitty's **Linux-only** Postgres/pgvector
+(the HYBRID decision — native arm64 for everything else). `runtimeClassName: vm` dispatches to runtimed:M5's
+Virtualization.framework Linux micro-VM via the apis:M5.1 `runtime.k3sm.io` handler-config (mapping the value
+to the existing `SANDBOX_BACKEND_VM`; the upstream `node.k8s.io/RuntimeClass` is consumed, not forked). Linux
+guest images are digest-pinned (codesign/notarization is meaningless inside the VM); networking is vmnet/bridged
+with a guest-side resolver (darwin-net:M5). Confirm the `com.apple.security.virtualization` entitlement against
+DESIGN §5c. Exit (§9 M5): a Linux image runs under `runtimeClassName: vm`, Service/DNS-reachable, beside native
+pods.
 
 ## Next
-M1.1 — `pkg/executor/embed` (control plane from source, the CGO=1 flip), after `apis:M1.1` lands.
+M2 — drive via `/orchestrate M2` (apis:M2.1 contract is wave 1). M2.0 (kubectl ergonomics) is already
+implemented on `roadmap/stockkitty-features`.
