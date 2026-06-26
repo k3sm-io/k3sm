@@ -88,7 +88,7 @@ phases:
   - id: M2
     title: Isolation, resources & pod-spec fidelity (integration side)
     status: in-progress
-    note: "All k3sm sub-phases M2.0–M2.5 are done (proven by named unit tests at the seam, -race clean); only the workspace-root e2e gate hack/acceptance/m2.sh (single-node confinement/OOMKill/pod-to-pod/in-pod-kubectl/exec, needs root on a Mac) remains for the milestone."
+    note: "All k3sm sub-phases M2.0–M2.6 are done (proven by named unit tests at the seam, -race clean); only the workspace-root e2e gate hack/acceptance/m2.sh (single-node confinement/OOMKill/pod-to-pod/in-pod-kubectl/exec, needs root on a Mac) remains for the milestone."
     strategy: hard cut
     depends_on:
       - apis:M2.1
@@ -167,6 +167,18 @@ phases:
             met: true
             check: "RunInContainer streams stdin/stdout to/from the runtime Exec RPC and returns its exit status; PortForward proxies bytes both ways; AttachToContainer attaches; exec/port-forward error + not-found paths surface (no panic). Proven by TestM2_Exec / TestM2_Attach / TestM2_PortForward (+ error/not-found cases) with a fake runtime stream; -race clean. Live kubectl exec/port-forward against a confined pod is the m2.sh e2e leg."
             method: e2e
+      - id: M2.6
+        title: Consume the apis:M2.2 typed contract (the k3sm half of the swap)
+        status: done
+        deliverables:
+          - id: M2.6-d1
+            done: true
+            desc: "pkg/provider consumes apis:M2.2's typed resource/metrics surface in place of the M2.2/M2.3 interim seams. (1) translate.go sets the TYPED PodBox.memory_limit_bytes (from resources.limits.memory) + qos_class (computePodQOS reproduces the kubelet Guaranteed/Burstable/BestEffort classification over init+regular containers, mapped to the apis QOSClass enum) — the k3sm.io/memory-limit-bytes annotation stays as a transitional belt-and-suspenders fallback runtimed bridges. (2) the probe runner's restartFunc seam (nil pre-swap, bookkeeping-only) is wired to runtimedRuntime.restartContainer → the runtime RestartContainer RPC, so a committed liveness failure re-execs the container in place, not just increments restart_count. (3) GetStatsSummary/StatsSummary consumes the typed ListPodStats RPC (per-container PodStats/ContainerStats/MemoryStats; footprint→working-set) in place of the in-proc PodMetrics path — the podMetricsSource seam is retired for the wire contract. A provider-side consume of a frozen apis contract, no apis/runtimed change."
+        acceptance:
+          - id: M2.6-a1
+            met: true
+            check: "a pod with resources.limits.memory sets PodBox.memory_limit_bytes + the right qos_class; a liveness failure (failureThreshold reached) calls the runtime RestartContainer RPC and increments restart_count; GetStatsSummary builds the kubelet Summary from a ListPodStats response (footprint→working-set). Proven by TestTypedMemoryLimitWritten / TestProbeRestartInvokesRPC / TestStatsSummaryFromListPodStats (fake runtime + apiserver client, no root; -race clean)."
+            method: unit
 
   - id: M3
     title: Multi-node, mesh, NodePort & persistent storage (control side)
@@ -320,7 +332,7 @@ GA-locked `true` on the pinned k8s v1.36.2; the lo0/DNS data-path leg is root-ga
 
 ## M2 — Isolation, resources & pod-spec fidelity 🟡
 The runtime-independent pod surface a real workload needs (see `../../docs/stockkitty-readiness.md`), on top of
-the runtimed daemon split + isolation + resources work. **All k3sm sub-phases M2.0–M2.5 are done** (proven by
+the runtimed daemon split + isolation + resources work. **All k3sm sub-phases M2.0–M2.6 are done** (proven by
 named unit tests at the seam, `-race` clean); only the workspace-root e2e gate `hack/acceptance/m2.sh`
 (single-node confinement/OOMKill/pod-to-pod/in-pod-kubectl/exec, needs root on a Mac) remains for the
 milestone. Sub-phases:
@@ -337,13 +349,13 @@ milestone. Sub-phases:
   startup-gates-liveness, overlays committed readiness onto the `Ready`/`ContainersReady` conditions (a NotReady
   pod drops from the EndpointSlice) and adds the liveness-driven restart count. Handlers: httpGet/tcpSocket/exec
   (named ports resolve via the `ports` table; dial host = bound pod IP). The provider owns the restart
-  decision + count; the literal per-container re-exec rides a future runtime `RestartContainer` RPC (restartFunc
-  seam). Proven by `TestM2_{ReadinessGatesEndpoints,LivenessRestarts,StartupGatesLiveness,ProbeHandlers,ProbeThresholds}`.
+  decision + count; the literal per-container re-exec rides the runtime `RestartContainer` RPC — the `restartFunc`
+  seam, nil here, is wired at **M2.6**. Proven by `TestM2_{ReadinessGatesEndpoints,LivenessRestarts,StartupGatesLiveness,ProbeHandlers,ProbeThresholds}`.
 - ✅ **M2.3** — runtimed `proc_pid_rusage` (`ri_phys_footprint`) → Summary API (`kubectl top`) via the optional
-  `StatsSource` capability; memory limit rides the `k3sm.io/memory-limit-bytes` PodBox annotation (interim seam
-  until apis:M2.2 typed fields); `terminationGracePeriodSeconds` → `DeletePodRequest.grace_period_seconds`
-  (k8s 30s default applied when unset); `OOMKilled` surfaces verbatim. CPU = best-effort QoS, NOT CFS
-  millicores.
+  `StatsSource` capability; memory limit rides the `k3sm.io/memory-limit-bytes` PodBox annotation (interim seam,
+  superseded by the typed `PodBox.memory_limit_bytes` at **M2.6**); `terminationGracePeriodSeconds` →
+  `DeletePodRequest.grace_period_seconds` (k8s 30s default applied when unset); `OOMKilled` surfaces verbatim.
+  CPU = best-effort QoS, NOT CFS millicores.
 - ✅ **M2.4** — in-cluster API access: the shared `kubeResolver` mints the projected SA token for the pod's
   **own** `spec.serviceAccountName` (was always `default`), bound per-CreatePod via the request context the
   provider threads to `mount.Materialize` in-process — no runtimed/apis seam change. The apiserver serving CA
@@ -357,6 +369,14 @@ milestone. Sub-phases:
   mapping a non-zero exec exit to a `CodeExitError`. Frozen apis contract — no apis change. (runtimed's server verbs
   still return Unimplemented — runtimed:M2 — which the provider surfaces, not panics.) Proven by
   `TestM2_Exec`/`TestM2_Attach`/`TestM2_PortForward`.
+- ✅ **M2.6** — consume the **apis:M2.2 typed contract** (the k3sm half of the swap): `translate.go` sets the typed
+  `PodBox.memory_limit_bytes` + `qos_class` (`computePodQOS` reproduces the kubelet Guaranteed/Burstable/BestEffort
+  classification → the apis `QOSClass` enum; the `k3sm.io/memory-limit-bytes` annotation stays as a transitional
+  fallback); the probe runner's `restartFunc` seam is wired to `runtimedRuntime.restartContainer` → the
+  `RestartContainer` RPC (a committed liveness failure re-execs the container, not just bookkeeping); and
+  `GetStatsSummary` consumes the typed `ListPodStats` RPC (per-container `PodStats`/`MemoryStats`,
+  footprint→working-set) in place of the in-proc `PodMetrics` path. Provider-side consume of a frozen apis contract
+  — no apis/runtimed change. Proven by `TestTypedMemoryLimitWritten`/`TestProbeRestartInvokesRPC`/`TestStatsSummaryFromListPodStats`.
 
 ## M3 — Multi-node, mesh, NodePort & persistent storage ⬜
 - ⬜ **M3.0** — multi-node bootstrap (`k3sm token create`, node-password, HTTP-CSR, AES-GCM bundle, `k3sm agent`
@@ -387,5 +407,6 @@ DESIGN §5c. Exit (§9 M5): a Linux image runs under `runtimeClassName: vm`, Ser
 pods.
 
 ## Next
-M2 — all k3sm sub-phases (M2.0–M2.5) are done; the remaining milestone work is the workspace-root e2e gate
-`hack/acceptance/m2.sh` (single-node, root on a Mac), then M3 (multi-node, mesh, NodePort, persistent storage).
+M2 — all k3sm sub-phases (M2.0–M2.6, incl. the apis:M2.2 typed-contract swap) are done; the remaining milestone
+work is the workspace-root e2e gate `hack/acceptance/m2.sh` (single-node, root on a Mac), then M3 (multi-node,
+mesh, NodePort, persistent storage).

@@ -50,9 +50,6 @@ type runtimedRuntime struct {
 	// literal env). It is the SAME resolver wired into runtimed's Deps for volume
 	// materialization. nil ⇒ data-backed env/volumes fail closed.
 	resolver mount.Resolver
-	// metrics, when the wrapped runtime exposes it, is the source of the
-	// proc_pid_rusage footprint surfaced to the Summary API (M2.3).
-	metrics podMetricsSource
 
 	// clk, dial, and probeTransport are the provider-served probe seams (M2.2):
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
@@ -65,13 +62,6 @@ type runtimedRuntime struct {
 	track   map[string]*podTrack  // pod id -> bookkeeping
 	probers map[string]*podProber // pod id -> provider-served probe runner (M2.2)
 	notify  func(*corev1.Pod)
-}
-
-// podMetricsSource is the optional capability of the wrapped runtime that reports
-// a per-pod memory footprint (runtimed's *runtime.Runtime satisfies it). The
-// provider type-asserts the runtime to this at construction.
-type podMetricsSource interface {
-	PodMetrics(podID string) (runtimed.PodMetrics, bool)
 }
 
 // podTrack is the provider-side bookkeeping the runtime does not retain: a stable
@@ -136,13 +126,13 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 }
 
 // newRuntimedWith wraps an existing runtime server (tests inject a fake) with the
-// volume/env Resolver. If rt exposes per-pod metrics (the real *runtime.Runtime
-// does), it is captured for the Summary API.
+// volume/env Resolver. The Summary API (kubectl top) is served off the runtime's
+// typed ListPodStats RPC, so no per-pod-metrics capability is captured here.
 func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mount.Resolver, log *slog.Logger) *runtimedRuntime {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	r := &runtimedRuntime{
+	return &runtimedRuntime{
 		rt:             rt,
 		nodeName:       cfg.NodeName,
 		nodeIP:         cfg.NodeIP,
@@ -156,10 +146,6 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		track:          map[string]*podTrack{},
 		probers:        map[string]*podProber{},
 	}
-	if m, ok := rt.(podMetricsSource); ok {
-		r.metrics = m
-	}
-	return r
 }
 
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the
@@ -459,53 +445,98 @@ func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, b
 	return "", metav1.Time{}, false
 }
 
-// StatsSummary builds the kubelet Summary API snapshot kubectl top reads (M2.3):
-// per tracked pod, the proc_pid_rusage working-set footprint runtimed's sampler
-// reports (ri_phys_footprint, NOT RSS). A pod with no sampler (no memory limit ⇒
-// no metering in M2) reports no sample and is omitted. runtimed reports a single
-// pod-level footprint (summed across container PIDs), so it is attributed to the
-// first container — a container-summing consumer (metrics-server) then computes
-// the correct pod total without double counting; per-container metering awaits a
-// runtimed per-container sampler.
+// StatsSummary builds the kubelet Summary API snapshot kubectl top reads (M2.3),
+// consuming the runtime's typed ListPodStats RPC (apis:M2.2). Each PodStats sample
+// carries the proc_pid_rusage working-set footprint runtimed meters
+// (ri_phys_footprint, NOT RSS), per-container; the provider maps it to the kubelet
+// Summary shape and fills the stable per-pod StartTime from its own bookkeeping
+// (the runtime sample carries only the sample timestamp). A pod runtimed does not
+// sample (no memory limit ⇒ no metering in M2) is absent from the response and so
+// from the summary.
 func (r *runtimedRuntime) StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	summary := &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: r.nodeName}}
-	if r.metrics == nil {
-		return summary, nil
+	resp, err := r.rt.ListPodStats(ctx, &runtimev1.ListPodStatsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("runtimed list pod stats: %w", err)
 	}
-
-	r.mu.Lock()
-	tracks := make([]*podTrack, 0, len(r.track))
-	for _, t := range r.track {
-		tracks = append(tracks, t)
-	}
-	r.mu.Unlock()
-
-	for _, t := range tracks {
-		m, ok := r.metrics.PodMetrics(string(t.pod.UID))
-		if !ok {
+	for _, ps := range resp.GetPodStats() {
+		if ps == nil {
 			continue
 		}
-		ws := m.WorkingSetBytes
-		ts := metav1.NewTime(m.Timestamp)
-		ps := statsv1alpha1.PodStats{
-			PodRef:    statsv1alpha1.PodReference{Name: t.pod.Name, Namespace: t.pod.Namespace, UID: string(t.pod.UID)},
-			StartTime: t.startTime,
-			Memory:    &statsv1alpha1.MemoryStats{Time: ts, WorkingSetBytes: &ws},
-		}
-		for i := range t.pod.Spec.Containers {
-			cws := uint64(0)
-			if i == 0 {
-				cws = ws
-			}
-			ps.Containers = append(ps.Containers, statsv1alpha1.ContainerStats{
-				Name:      t.pod.Spec.Containers[i].Name,
-				StartTime: t.startTime,
-				Memory:    &statsv1alpha1.MemoryStats{Time: ts, WorkingSetBytes: &cws},
-			})
-		}
-		summary.Pods = append(summary.Pods, ps)
+		summary.Pods = append(summary.Pods, toPodStats(ps, r.startTimeFor(ps.GetPodId())))
 	}
 	return summary, nil
+}
+
+// startTimeFor returns the stable StartTime the provider recorded for the pod id
+// at CreatePod, or the zero time for an untracked pod (the runtime does not retain
+// it). The Summary API reports the pod start, not the per-sample timestamp.
+func (r *runtimedRuntime) startTimeFor(id string) metav1.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t, ok := r.track[id]; ok {
+		return t.startTime
+	}
+	return metav1.Time{}
+}
+
+// toPodStats maps a runtime PodStats sample (the ListPodStats wire form) to the
+// kubelet Summary API PodStats the VK summary handler serves. startTime is the
+// provider's stable per-pod value; the working-set footprint flows through verbatim.
+func toPodStats(ps *runtimev1.PodStats, startTime metav1.Time) statsv1alpha1.PodStats {
+	out := statsv1alpha1.PodStats{
+		PodRef:    statsv1alpha1.PodReference{Name: ps.GetName(), Namespace: ps.GetNamespace(), UID: ps.GetPodId()},
+		StartTime: startTime,
+		CPU:       toCPUStats(ps.GetCpu()),
+		Memory:    toMemoryStats(ps.GetMemory()),
+	}
+	for _, c := range ps.GetContainers() {
+		if c == nil {
+			continue
+		}
+		out.Containers = append(out.Containers, statsv1alpha1.ContainerStats{
+			Name:      c.GetName(),
+			StartTime: startTime,
+			CPU:       toCPUStats(c.GetCpu()),
+			Memory:    toMemoryStats(c.GetMemory()),
+		})
+	}
+	return out
+}
+
+// toMemoryStats maps a runtime MemoryStats to the kubelet Summary MemoryStats.
+// working_set_bytes (ri_phys_footprint) is what kubectl top reports; usage/rss are
+// carried when non-zero. A nil sample maps to nil so the field stays absent rather
+// than reporting a spurious zero working set.
+func toMemoryStats(m *runtimev1.MemoryStats) *statsv1alpha1.MemoryStats {
+	if m == nil {
+		return nil
+	}
+	ws := m.GetWorkingSetBytes()
+	out := &statsv1alpha1.MemoryStats{Time: protoTime(m.GetTimestamp()), WorkingSetBytes: &ws}
+	if u := m.GetUsageBytes(); u != 0 {
+		out.UsageBytes = &u
+	}
+	if rss := m.GetRssBytes(); rss != 0 {
+		out.RSSBytes = &rss
+	}
+	return out
+}
+
+// toCPUStats maps a runtime CPUStats to the kubelet Summary CPUStats (best-effort
+// CPU accounting; k3sm enforces no CFS millicores). A nil sample maps to nil.
+func toCPUStats(c *runtimev1.CPUStats) *statsv1alpha1.CPUStats {
+	if c == nil {
+		return nil
+	}
+	out := &statsv1alpha1.CPUStats{Time: protoTime(c.GetTimestamp())}
+	if n := c.GetUsageNanoCores(); n != 0 {
+		out.UsageNanoCores = &n
+	}
+	if t := c.GetUsageCoreNanoSeconds(); t != 0 {
+		out.UsageCoreNanoSeconds = &t
+	}
+	return out
 }
 
 // podRoot returns the per-pod rootfs parent passed to the PodBox sandbox profile.

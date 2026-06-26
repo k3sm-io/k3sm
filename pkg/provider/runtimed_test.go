@@ -15,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
-	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // fakeRuntimeServer is an in-memory runtimev1.RuntimeServer for provider tests:
@@ -26,29 +25,73 @@ import (
 type fakeRuntimeServer struct {
 	runtimev1.UnimplementedRuntimeServer
 
-	mu        sync.Mutex
-	created   map[string]*runtimev1.PodBox
-	started   time.Time
-	footprint map[string]uint64 // pod id -> working-set bytes (M2.3 metrics)
-	lastGrace int64             // grace_period_seconds of the last DeletePod (M2.3)
-	gotSA     string            // ServiceAccount bound on the last CreatePod ctx (M2.4)
+	mu           sync.Mutex
+	created      map[string]*runtimev1.PodBox
+	started      time.Time
+	footprint    map[string]uint64 // pod id -> working-set bytes (M2.3 metrics)
+	lastGrace    int64             // grace_period_seconds of the last DeletePod (M2.3)
+	gotSA        string            // ServiceAccount bound on the last CreatePod ctx (M2.4)
+	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
+	lastRestart  restartRecord     // args of the last RestartContainer RPC
+}
+
+// restartRecord captures the arguments of a RestartContainer RPC so the probe
+// runner's wiring to the runtime action is observable at the seam (M2.2 swap).
+type restartRecord struct {
+	podID     string
+	container string
+	reason    string
 }
 
 func newFakeRuntimeServer() *fakeRuntimeServer {
 	return &fakeRuntimeServer{created: map[string]*runtimev1.PodBox{}, footprint: map[string]uint64{}, started: time.Unix(5000, 0)}
 }
 
-// PodMetrics satisfies the provider's podMetricsSource so StatsSummary is testable
-// without a real proc_pid_rusage sampler. A pod with no recorded footprint reports
-// ok=false (no sampler — the unlimited-pod case).
-func (f *fakeRuntimeServer) PodMetrics(podID string) (runtimed.PodMetrics, bool) {
+// ListPodStats serves the typed kubectl-top metrics path (apis:M2.2): it renders a
+// PodStats per created pod that has a recorded footprint, attributing the
+// working-set to both the pod and each of its containers. A pod with no footprint
+// (the unlimited-pod / no-sampler case) is omitted, mirroring runtimed.
+func (f *fakeRuntimeServer) ListPodStats(_ context.Context, req *runtimev1.ListPodStatsRequest) (*runtimev1.ListPodStatsResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ws, ok := f.footprint[podID]
-	if !ok {
-		return runtimed.PodMetrics{}, false
+	ts := timestamppb.New(time.Unix(6000, 0))
+	resp := &runtimev1.ListPodStatsResponse{}
+	for id, box := range f.created {
+		if req.GetPodId() != "" && req.GetPodId() != id {
+			continue
+		}
+		ws, ok := f.footprint[id]
+		if !ok {
+			continue
+		}
+		ps := &runtimev1.PodStats{
+			PodId:     id,
+			Namespace: box.GetNamespace(),
+			Name:      box.GetName(),
+			Timestamp: ts,
+			Memory:    &runtimev1.MemoryStats{Timestamp: ts, WorkingSetBytes: ws},
+		}
+		for _, c := range box.GetContainers() {
+			ps.Containers = append(ps.Containers, &runtimev1.ContainerStats{
+				Name:      c.GetName(),
+				Timestamp: ts,
+				Memory:    &runtimev1.MemoryStats{Timestamp: ts, WorkingSetBytes: ws},
+			})
+		}
+		resp.PodStats = append(resp.PodStats, ps)
 	}
-	return runtimed.PodMetrics{PodID: podID, WorkingSetBytes: ws, Timestamp: time.Unix(6000, 0)}, true
+	return resp, nil
+}
+
+// RestartContainer records the in-place container restart the provider's probe
+// runner drives on a committed liveness failure (apis:M2.2 swap), returning a
+// successful response with the restarted container's status.
+func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restartCalls++
+	f.lastRestart = restartRecord{podID: req.GetPodId(), container: req.GetContainer(), reason: req.GetReason()}
+	return &runtimev1.RestartContainerResponse{Status: &runtimev1.ContainerStatus{Name: req.GetContainer()}}, nil
 }
 
 func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
@@ -288,6 +331,51 @@ func TestRuntimedStatsSummaryUnsampled(t *testing.T) {
 	}
 	if len(summary.Pods) != 0 {
 		t.Errorf("want no pod stats for an unsampled pod, got %d", len(summary.Pods))
+	}
+}
+
+// TestStatsSummaryFromListPodStats is the M2.2-swap proof that GetStatsSummary
+// builds the kubelet Summary from the typed ListPodStats RPC (not the in-proc
+// PodMetrics path): a fake ListPodStats footprint flows through the wire contract
+// into the Summary's working-set (pod + per-container), and the stable per-pod
+// StartTime comes from the provider's own bookkeeping. Driven through the
+// VKProvider.GetStatsSummary entrypoint kubectl top hits.
+func TestStatsSummaryFromListPodStats(t *testing.T) {
+	r, f := newRuntimedFake(t)
+	pod := runtimedPod("default", "web")
+	if err := r.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	f.mu.Lock()
+	f.footprint["uid-web"] = 256 << 20 // 256 MiB
+	f.mu.Unlock()
+
+	v := NewVKProvider(r, "n")
+	summary, err := v.GetStatsSummary(context.Background())
+	if err != nil {
+		t.Fatalf("GetStatsSummary: %v", err)
+	}
+	if summary.Node.NodeName != "n" {
+		t.Errorf("node name = %q, want n", summary.Node.NodeName)
+	}
+	if len(summary.Pods) != 1 {
+		t.Fatalf("want 1 pod stat from ListPodStats, got %d", len(summary.Pods))
+	}
+	ps := summary.Pods[0]
+	if ps.PodRef.Name != "web" || ps.PodRef.Namespace != "default" || ps.PodRef.UID != "uid-web" {
+		t.Errorf("podRef = %+v, want web/default/uid-web", ps.PodRef)
+	}
+	// footprint → working-set: the ri_phys_footprint the RPC carries is the kubectl
+	// top working set, at the pod level and attributed per container.
+	if ps.Memory == nil || ps.Memory.WorkingSetBytes == nil || *ps.Memory.WorkingSetBytes != 256<<20 {
+		t.Fatalf("pod working-set = %v, want %d (footprint→working-set)", ps.Memory, 256<<20)
+	}
+	if len(ps.Containers) != 1 || ps.Containers[0].Memory == nil || ps.Containers[0].Memory.WorkingSetBytes == nil || *ps.Containers[0].Memory.WorkingSetBytes != 256<<20 {
+		t.Errorf("container working-set not built from ListPodStats: %+v", ps.Containers)
+	}
+	// StartTime comes from the provider's stable bookkeeping, not the sample.
+	if ps.StartTime.IsZero() {
+		t.Error("pod StartTime should come from the provider's stable bookkeeping")
 	}
 }
 

@@ -90,10 +90,10 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	pr.cancel = cancel
 	pr.onTransition = func() { r.publishProbeUpdate(ctx, id) }
-	// restartFunc is intentionally nil in M2: the provider owns the restart
-	// DECISION, count, and gate reset (the observable contract the acceptance gate
-	// checks); the literal per-container process re-exec needs a runtime
-	// RestartContainer RPC (an apis addition), wired here when it lands.
+	// restartFunc connects the restart DECISION (the provider owns the count + gate
+	// reset) to the runtime action: a committed liveness failure re-execs the
+	// container in place via the apis:M2.2 RestartContainer RPC runtimed now serves.
+	pr.restartFunc = r.restartContainer
 
 	r.mu.Lock()
 	if _, exists := r.probers[id]; exists {
@@ -104,6 +104,28 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	r.probers[id] = pr
 	r.mu.Unlock()
 	pr.start(ctx)
+}
+
+// restartContainer re-execs a container in place via the runtime RestartContainer
+// RPC (apis:M2.2) — the action a committed liveness-probe failure drives. The
+// probe runner owns the restart DECISION, count, and gate reset (the observable
+// contract); this is the side effect that actually re-spawns the process.
+// grace_period_seconds is left 0 so runtimed applies its own default window. A
+// typed failure in the response (e.g. the pod is gone) surfaces as an error the
+// runner logs without aborting the probe loop.
+func (r *runtimedRuntime) restartContainer(ctx context.Context, podID, container string) error {
+	resp, err := r.rt.RestartContainer(ctx, &runtimev1.RestartContainerRequest{
+		PodId:     podID,
+		Container: container,
+		Reason:    "liveness probe failed",
+	})
+	if err != nil {
+		return fmt.Errorf("runtimed restart container %s/%s: %w", podID, container, err)
+	}
+	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		return fmt.Errorf("runtimed restart container %s/%s rejected: %s", podID, container, e.GetMessage())
+	}
+	return nil
 }
 
 // stopProber detaches and stops the pod's prober. It removes the entry under the
