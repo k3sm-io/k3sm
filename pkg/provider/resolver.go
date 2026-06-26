@@ -69,13 +69,17 @@ func (k *kubeResolver) Secret(ctx context.Context, namespace, name string) (map[
 	return out, nil
 }
 
-// ServiceAccountToken mints a bound token via the TokenRequest API. This is the
-// M2.4 in-pod-API surface; the mount.Resolver signature carries only the
-// namespace, so the token is minted for the namespace's "default" ServiceAccount.
-// Per-pod ServiceAccount selection needs a richer signature (a runtimed seam
-// follow-up) — see the M2.4 sub-phase. An empty audience defaults to the
-// apiserver's audiences.
+// ServiceAccountToken mints a bound token via the TokenRequest API (audience +
+// expirationSeconds, rotated each materialize) for the POD's ServiceAccount — the
+// M2.4 in-pod-API surface. The mount.Resolver signature carries only the
+// namespace (it is the single runtimed seam every pod shares), so the per-pod
+// spec.serviceAccountName is bound to the call by the provider via the request
+// context (serviceAccountFromContext) — runtimed threads that ctx from CreatePod
+// through mount.Materialize to here in-process. A context with no bound
+// ServiceAccount falls back to the namespace "default" SA (the apiserver's own
+// default). An empty audience defaults to the apiserver's audiences.
 func (k *kubeResolver) ServiceAccountToken(ctx context.Context, namespace, audience string, expirationSeconds int64) (string, error) {
+	sa := serviceAccountFromContext(ctx)
 	spec := authnv1.TokenRequestSpec{}
 	if audience != "" {
 		spec.Audiences = []string{audience}
@@ -83,11 +87,51 @@ func (k *kubeResolver) ServiceAccountToken(ctx context.Context, namespace, audie
 	if expirationSeconds > 0 {
 		spec.ExpirationSeconds = &expirationSeconds
 	}
-	tr, err := k.cs.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, "default", &authnv1.TokenRequest{Spec: spec}, metav1.CreateOptions{})
+	tr, err := k.cs.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, sa, &authnv1.TokenRequest{Spec: spec}, metav1.CreateOptions{})
 	if err != nil {
-		return "", fmt.Errorf("mint token for default SA in %s: %w", namespace, err)
+		return "", fmt.Errorf("mint token for serviceaccount %s/%s: %w", namespace, sa, err)
 	}
 	return tr.Status.Token, nil
+}
+
+// defaultServiceAccount is the ServiceAccount a pod runs as when it sets none —
+// the apiserver's ServiceAccount admission default.
+const defaultServiceAccount = "default"
+
+// serviceAccountKey is the context key under which the provider binds a pod's
+// ServiceAccount name for the duration of a CreatePod, so the shared kubeResolver
+// mints the pod's bound token against the right SA. The mount.Resolver seam's
+// ServiceAccountToken(ctx, namespace, audience, exp) signature carries no SA name,
+// so the per-pod SA rides the request context that runtimed threads from
+// CreatePod → mount.Materialize → ServiceAccountToken in-process. This needs no
+// runtimed/apis change. The M2 daemon split (a real gRPC boundary between provider
+// and runtime) cannot carry a context value across the wire, so it will bind the
+// SA in the materialization RPC instead — tracked with that split.
+type serviceAccountKey struct{}
+
+// withServiceAccount returns ctx carrying the pod's ServiceAccount name (sa) so
+// the kubeResolver mints its bound token against the right SA.
+func withServiceAccount(ctx context.Context, sa string) context.Context {
+	return context.WithValue(ctx, serviceAccountKey{}, sa)
+}
+
+// serviceAccountFromContext returns the ServiceAccount name bound by
+// withServiceAccount, or "default" when none is bound.
+func serviceAccountFromContext(ctx context.Context) string {
+	if sa, ok := ctx.Value(serviceAccountKey{}).(string); ok && sa != "" {
+		return sa
+	}
+	return defaultServiceAccount
+}
+
+// podServiceAccount returns the pod's effective ServiceAccount name. The
+// apiserver's ServiceAccount admission stamps spec.serviceAccountName, but the
+// provider defaults defensively for a pod that reaches it unset.
+func podServiceAccount(pod *corev1.Pod) string {
+	if sa := pod.Spec.ServiceAccountName; sa != "" {
+		return sa
+	}
+	return defaultServiceAccount
 }
 
 // notFoundAware maps an apiserver NotFound to os.ErrNotExist (the sentinel the

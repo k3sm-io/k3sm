@@ -54,3 +54,21 @@ type StatsSource interface {
 	// pods this runtime tracks.
 	StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error)
 }
+
+// StreamingRuntime is an OPTIONAL Runtime capability: a Runtime that serves the
+// container streaming verbs — exec, attach, and port-forward — by wiring the VK
+// AttachIO/byte stream to the runtime/v1 Exec/Attach/PortForward RPCs (M2.5).
+// VKProvider delegates to it via a type assertion, returning NotFound when the
+// backing Runtime lacks it. The runtimed runtime implements it; HostProcess (the
+// M0 native-process runtime) does not — it has no confined exec channel.
+// Defining it here (consumer-side) keeps the core Runtime interface small, the
+// same pattern as StatsSource.
+type StreamingRuntime interface {
+	// RunInContainer runs cmd in a container, streaming stdio/resize over attach
+	// and returning the command's exit status (`kubectl exec`).
+	RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach api.AttachIO) error
+	// AttachToContainer attaches to a running container's stdio (`kubectl attach`).
+	AttachToContainer(ctx context.Context, namespace, podName, container string, attach api.AttachIO) error
+	// PortForward proxies a byte stream to a pod TCP port (`kubectl port-forward`).
+	PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error
+}

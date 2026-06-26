@@ -31,6 +31,7 @@ type fakeRuntimeServer struct {
 	started   time.Time
 	footprint map[string]uint64 // pod id -> working-set bytes (M2.3 metrics)
 	lastGrace int64             // grace_period_seconds of the last DeletePod (M2.3)
+	gotSA     string            // ServiceAccount bound on the last CreatePod ctx (M2.4)
 }
 
 func newFakeRuntimeServer() *fakeRuntimeServer {
@@ -50,11 +51,14 @@ func (f *fakeRuntimeServer) PodMetrics(podID string) (runtimed.PodMetrics, bool)
 	return runtimed.PodMetrics{PodID: podID, WorkingSetBytes: ws, Timestamp: time.Unix(6000, 0)}, true
 }
 
-func (f *fakeRuntimeServer) CreatePod(_ context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
+func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	box := req.GetPod()
 	f.created[box.GetPodId()] = box
+	// Record the ServiceAccount the provider bound to the ctx so the M2.4
+	// per-pod SA-token binding is observable at the runtime seam.
+	f.gotSA = serviceAccountFromContext(ctx)
 	return &runtimev1.CreatePodResponse{Status: f.statusLocked(box.GetPodId())}, nil
 }
 

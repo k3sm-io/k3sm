@@ -186,6 +186,22 @@ func (s *Supervised) startKine(ctx context.Context) error {
 // registers) and sets --kubelet-preferred-address-types=InternalIP so kubectl
 // logs/exec reach the node by IP (closing the M0.3 gap).
 //
+// In-pod API reachability (M2.4): the apiserver binds 127.0.0.1 and the
+// auto-created kubernetes.default.svc endpoint advertises --advertise-address,
+// which is NodeIP — defaulting to 127.0.0.1 for a single node (see cmd/k3sm
+// --node-ip). So on a single node the endpoint resolves to the loopback the
+// apiserver actually listens on, and the in-process Service proxy (same host)
+// reaches it; a pod's projected SA token + the kube-root-ca.crt CA then complete
+// a working in-cluster config. When NodeIP is a routable address (multi-node),
+// the kubernetes endpoint must be rewritten to a node-local address per node so
+// infra VIPs are not blackholed over the mesh — that is M3.3, not here.
+//
+// The ServiceAccount admission plugin (in the default enabled set — no
+// --enable/disable-admission-plugins is passed) stamps spec.serviceAccountName
+// and injects the projected SA volume (token + kube-root-ca.crt + namespace) the
+// provider materializes; the root-ca-cert-publisher controller (kept by the
+// scoped --controllers "*") publishes kube-root-ca.crt to every namespace.
+//
 // NOTE: the DESIGN's --feature-gates=ConsistentListFromCache=false (the kine#577
 // watch-staleness mitigation) is NOT passed: in the pinned kwok-ci/k8s build
 // (k8s v1.36.2) that gate is GA-LOCKED to true and the apiserver refuses to

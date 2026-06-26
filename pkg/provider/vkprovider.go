@@ -85,20 +85,35 @@ func (v *VKProvider) GetContainerLogs(ctx context.Context, namespace, podName, c
 	return v.rt.GetContainerLogs(ctx, namespace, podName, containerName, opts)
 }
 
-// RunInContainer is not implemented for M1 (exec lands with the M2 daemon
-// split); kubectl logs is the supported diagnostic path.
+// RunInContainer serves `kubectl exec`, delegating to the backing Runtime's
+// StreamingRuntime capability (the runtimed runtime drives the runtime/v1 Exec
+// RPC). A Runtime without it (HostProcess) reports NotFound (M2.5).
 func (v *VKProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
-	return errdefs.NotFound("exec is not implemented in M1")
+	s, ok := v.rt.(StreamingRuntime)
+	if !ok {
+		return errdefs.NotFound("exec is not supported by this runtime")
+	}
+	return s.RunInContainer(ctx, namespace, podName, containerName, cmd, attach)
 }
 
-// AttachToContainer is not implemented for M1.
+// AttachToContainer serves `kubectl attach`, delegating to the StreamingRuntime
+// capability; NotFound when the backing Runtime lacks it (M2.5).
 func (v *VKProvider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach api.AttachIO) error {
-	return errdefs.NotFound("attach is not implemented in M1")
+	s, ok := v.rt.(StreamingRuntime)
+	if !ok {
+		return errdefs.NotFound("attach is not supported by this runtime")
+	}
+	return s.AttachToContainer(ctx, namespace, podName, containerName, attach)
 }
 
-// PortForward is not implemented for M1.
+// PortForward serves `kubectl port-forward`, delegating to the StreamingRuntime
+// capability; NotFound when the backing Runtime lacks it (M2.5).
 func (v *VKProvider) PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error {
-	return errdefs.NotFound("port-forward is not implemented in M1")
+	s, ok := v.rt.(StreamingRuntime)
+	if !ok {
+		return errdefs.NotFound("port-forward is not supported by this runtime")
+	}
+	return s.PortForward(ctx, namespace, podName, port, stream)
 }
 
 // GetStatsSummary returns the kubelet Summary API snapshot kubectl top reads.
