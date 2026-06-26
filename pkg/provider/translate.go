@@ -25,10 +25,11 @@ func protoTime(ts *timestamppb.Timestamp) metav1.Time {
 // path is configured.
 const dyldInsertAnnotation = "k3sm.io/dyld-insert-libraries"
 
-// memoryLimitAnnotation carries the pod's memory limit in BYTES — the interim
-// seam runtimed's OOM sampler + kubectl-top metering reads until apis:M2.2 defines
-// a typed PodBox memory-limit field. It matches runtimed/pkg/runtime's constant
-// (exactly as the DNS shim rides dyldInsertAnnotation). The value is in
+// memoryLimitAnnotation carries the pod's memory limit in BYTES. apis:M2.2 now
+// defines the typed PodBox.memory_limit_bytes field (which toPodBox sets and
+// runtimed reads first); this annotation is kept as a transitional fallback
+// runtimed bridges when the typed field is unset. It matches runtimed/pkg/runtime's
+// constant (exactly as the DNS shim rides dyldInsertAnnotation). The value is in
 // ri_phys_footprint units, NOT RSS.
 const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 
@@ -70,11 +71,17 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) *runtimev1.Po
 	if dyldShim != "" {
 		box.Annotations[dyldInsertAnnotation] = dyldShim
 	}
-	// The provider is the trusted producer of the memory-limit annotation: set it
-	// from the pod's resource limits AFTER copying user annotations so it wins.
+	// The provider is the trusted producer of the resource-limit inputs. Set the
+	// TYPED apis:M2.2 PodBox fields: memory_limit_bytes (the OOM ceiling runtimed
+	// compares ri_phys_footprint against) and qos_class (runtimed's best-effort CPU
+	// policy). The k3sm.io/memory-limit-bytes annotation is also written AFTER the
+	// user annotations as a transitional fallback (runtimed bridges it when the
+	// typed field is unset); the typed field is authoritative.
 	if lim := podMemoryLimitBytes(pod); lim > 0 {
+		box.MemoryLimitBytes = lim
 		box.Annotations[memoryLimitAnnotation] = strconv.FormatInt(lim, 10)
 	}
+	box.QosClass = podQOSClass(pod)
 
 	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers)
 	box.Containers = toRuntimeContainers(pod.Spec.Containers)
@@ -121,6 +128,96 @@ func podMemoryLimitBytes(pod *corev1.Pod) int64 {
 		sum += q.Value()
 	}
 	return sum
+}
+
+// podQOSClass computes the pod's Quality-of-Service class and maps it to the apis
+// runtime QOSClass enum runtimed uses for best-effort CPU scheduling policy (k3sm
+// has no CFS millicore enforcement — see ../../docs/stockkitty-readiness.md). The
+// VK provider REPLACES the kubelet, which is where Status.QOSClass is normally
+// derived, so the provider computes it from the spec here rather than trusting a
+// possibly-unset status field.
+func podQOSClass(pod *corev1.Pod) runtimev1.QOSClass {
+	switch computePodQOS(pod) {
+	case corev1.PodQOSGuaranteed:
+		return runtimev1.QOSClass_QOS_CLASS_GUARANTEED
+	case corev1.PodQOSBurstable:
+		return runtimev1.QOSClass_QOS_CLASS_BURSTABLE
+	case corev1.PodQOSBestEffort:
+		return runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT
+	default:
+		return runtimev1.QOSClass_QOS_CLASS_UNSPECIFIED
+	}
+}
+
+// computePodQOS reproduces the kubelet's v1qos.GetPodQOS classification over the
+// pod's init + regular containers, considering only the CPU and memory resources:
+//   - Guaranteed: every container sets non-zero CPU AND memory limits, and every
+//     resource's summed request equals its summed limit;
+//   - BestEffort: no container sets any CPU/memory request or limit;
+//   - Burstable: anything in between.
+func computePodQOS(pod *corev1.Pod) corev1.PodQOSClass {
+	requests := corev1.ResourceList{}
+	limits := corev1.ResourceList{}
+	isGuaranteed := true
+
+	accumulate := func(c *corev1.Container) {
+		for name, q := range c.Resources.Requests {
+			if !isQOSComputeResource(name) || q.CmpInt64(0) <= 0 {
+				continue
+			}
+			delta := q.DeepCopy()
+			if existing, ok := requests[name]; ok {
+				delta.Add(existing)
+			}
+			requests[name] = delta
+		}
+		limitedResources := 0
+		for name, q := range c.Resources.Limits {
+			if !isQOSComputeResource(name) || q.CmpInt64(0) <= 0 {
+				continue
+			}
+			limitedResources++
+			delta := q.DeepCopy()
+			if existing, ok := limits[name]; ok {
+				delta.Add(existing)
+			}
+			limits[name] = delta
+		}
+		// Guaranteed requires BOTH cpu and memory to carry a non-zero limit on
+		// every container; fewer than the two compute resources breaks it.
+		if limitedResources < 2 {
+			isGuaranteed = false
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		accumulate(&pod.Spec.InitContainers[i])
+	}
+	for i := range pod.Spec.Containers {
+		accumulate(&pod.Spec.Containers[i])
+	}
+
+	if len(requests) == 0 && len(limits) == 0 {
+		return corev1.PodQOSBestEffort
+	}
+	if isGuaranteed {
+		for name, req := range requests {
+			lim, ok := limits[name]
+			if !ok || lim.Cmp(req) != 0 {
+				isGuaranteed = false
+				break
+			}
+		}
+	}
+	if isGuaranteed && len(requests) == len(limits) {
+		return corev1.PodQOSGuaranteed
+	}
+	return corev1.PodQOSBurstable
+}
+
+// isQOSComputeResource reports whether name participates in QoS classification —
+// only CPU and memory, matching the kubelet's supported QoS-compute resources.
+func isQOSComputeResource(name corev1.ResourceName) bool {
+	return name == corev1.ResourceCPU || name == corev1.ResourceMemory
 }
 
 // graceSeconds is the SIGTERM→SIGKILL window the provider passes as
