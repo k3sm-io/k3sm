@@ -13,8 +13,11 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -33,14 +36,31 @@ const resyncInterval = 10 * time.Second
 // concurrency-safe. The status callback set by Watch runs OUTSIDE mu.
 type runtimedRuntime struct {
 	rt       runtimev1.RuntimeServer
+	nodeName string
 	nodeIP   string
 	rootfs   string
 	dyldShim string
 	log      *slog.Logger
 
+	// resolver supplies ConfigMap/Secret data for the M2.1 env resolution the
+	// provider performs before sending the box to runtimed (runtimed reads only
+	// literal env). It is the SAME resolver wired into runtimed's Deps for volume
+	// materialization. nil ⇒ data-backed env/volumes fail closed.
+	resolver mount.Resolver
+	// metrics, when the wrapped runtime exposes it, is the source of the
+	// proc_pid_rusage footprint surfaced to the Summary API (M2.3).
+	metrics podMetricsSource
+
 	mu     sync.Mutex
 	track  map[string]*podTrack // pod id -> bookkeeping
 	notify func(*corev1.Pod)
+}
+
+// podMetricsSource is the optional capability of the wrapped runtime that reports
+// a per-pod memory footprint (runtimed's *runtime.Runtime satisfies it). The
+// provider type-asserts the runtime to this at construction.
+type podMetricsSource interface {
+	PodMetrics(podID string) (runtimed.PodMetrics, bool)
 }
 
 // podTrack is the provider-side bookkeeping the runtime does not retain: a stable
@@ -63,6 +83,11 @@ type RuntimedConfig struct {
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES.
 	DyldShim string
+	// Client is the apiserver client the provider resolves ConfigMap/Secret data,
+	// SA tokens (M2.1 volumes/env), and imagePullSecret credentials (M2.6) with —
+	// runtimed never talks to the apiserver. nil disables data-backed
+	// volumes/env/credentials (they fail closed / pull anonymously).
+	Client kubernetes.Interface
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -76,34 +101,70 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	// runtimed never talks to the apiserver: the provider (which holds the client)
+	// supplies the volume Resolver + imagePullSecret CredentialResolver. nil client
+	// ⇒ nil seams ⇒ data-backed volumes fail closed, pulls are anonymous.
+	var resolver mount.Resolver
+	var creds runtimed.CredentialResolver
+	if cfg.Client != nil {
+		resolver = newKubeResolver(cfg.Client)
+		creds = newKubeCredentials(cfg.Client)
+	}
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",
 		Logger:         log,
-	}, runtimed.Deps{})
+	}, runtimed.Deps{
+		Resolver:    resolver,
+		Credentials: creds,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
-	return newRuntimedWith(rt, cfg, log), nil
+	return newRuntimedWith(rt, cfg, resolver, log), nil
 }
 
-// newRuntimedWith wraps an existing runtime server (tests inject a fake).
-func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, log *slog.Logger) *runtimedRuntime {
+// newRuntimedWith wraps an existing runtime server (tests inject a fake) with the
+// volume/env Resolver. If rt exposes per-pod metrics (the real *runtime.Runtime
+// does), it is captured for the Summary API.
+func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mount.Resolver, log *slog.Logger) *runtimedRuntime {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &runtimedRuntime{
+	r := &runtimedRuntime{
 		rt:       rt,
+		nodeName: cfg.NodeName,
 		nodeIP:   cfg.NodeIP,
 		rootfs:   cfg.Root,
 		dyldShim: cfg.DyldShim,
+		resolver: resolver,
 		log:      log,
 		track:    map[string]*podTrack{},
 	}
+	if m, ok := rt.(podMetricsSource); ok {
+		r.metrics = m
+	}
+	return r
 }
 
-// Compile-time check that runtimedRuntime satisfies the Runtime seam.
-var _ Runtime = (*runtimedRuntime)(nil)
+// Compile-time check that runtimedRuntime satisfies the Runtime seam and the
+// optional StatsSource capability (the Summary API surface, M2.3).
+var (
+	_ Runtime     = (*runtimedRuntime)(nil)
+	_ StatsSource = (*runtimedRuntime)(nil)
+)
+
+// buildBox translates pod to a PodBox and resolves its env into LITERAL values —
+// runtimed reads only EnvVar.value and never talks to the apiserver, so the
+// provider resolves configMap/secret/envFrom (via its Resolver) and downward-API
+// (via the node identity) here, before the box crosses the runtime boundary.
+func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runtimev1.PodBox, error) {
+	box := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim)
+	if err := resolvePodBoxEnv(ctx, box, r.nodeName, r.nodeIP, r.resolver); err != nil {
+		return nil, err
+	}
+	return box, nil
+}
 
 // CreatePod translates the pod to a PodBox and asks the runtime to start it. The
 // runtime returns a typed failure inside the response (the RPC itself returns
@@ -112,7 +173,10 @@ var _ Runtime = (*runtimedRuntime)(nil)
 func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
 	start := metav1.Now()
-	box := toPodBox(pod, r.nodeIP, r.podRoot(id), r.dyldShim)
+	box, err := r.buildBox(ctx, pod)
+	if err != nil {
+		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
 
 	r.mu.Lock()
 	if t, ok := r.track[id]; ok {
@@ -143,7 +207,10 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 	r.mu.Unlock()
 
-	box := toPodBox(pod, r.nodeIP, r.podRoot(id), r.dyldShim)
+	box, err := r.buildBox(ctx, pod)
+	if err != nil {
+		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
 	resp, err := r.rt.UpdatePod(ctx, &runtimev1.UpdatePodRequest{Pod: box})
 	if err != nil {
 		return fmt.Errorf("runtimed update pod %s/%s: %w", pod.Namespace, pod.Name, err)
@@ -155,10 +222,12 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	return nil
 }
 
-// DeletePod stops the pod's processes and forgets the bookkeeping. Idempotent.
+// DeletePod stops the pod's processes and forgets the bookkeeping. Idempotent. The
+// SIGTERM→SIGKILL grace window is derived from the pod (deletion/termination grace,
+// k8s 30s default), since runtimed treats a 0 grace as immediate-kill (M2.3).
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
-	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id})
+	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: graceSeconds(pod)})
 	if err != nil {
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
@@ -354,6 +423,55 @@ func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, b
 		}
 	}
 	return "", metav1.Time{}, false
+}
+
+// StatsSummary builds the kubelet Summary API snapshot kubectl top reads (M2.3):
+// per tracked pod, the proc_pid_rusage working-set footprint runtimed's sampler
+// reports (ri_phys_footprint, NOT RSS). A pod with no sampler (no memory limit ⇒
+// no metering in M2) reports no sample and is omitted. runtimed reports a single
+// pod-level footprint (summed across container PIDs), so it is attributed to the
+// first container — a container-summing consumer (metrics-server) then computes
+// the correct pod total without double counting; per-container metering awaits a
+// runtimed per-container sampler.
+func (r *runtimedRuntime) StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
+	summary := &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: r.nodeName}}
+	if r.metrics == nil {
+		return summary, nil
+	}
+
+	r.mu.Lock()
+	tracks := make([]*podTrack, 0, len(r.track))
+	for _, t := range r.track {
+		tracks = append(tracks, t)
+	}
+	r.mu.Unlock()
+
+	for _, t := range tracks {
+		m, ok := r.metrics.PodMetrics(string(t.pod.UID))
+		if !ok {
+			continue
+		}
+		ws := m.WorkingSetBytes
+		ts := metav1.NewTime(m.Timestamp)
+		ps := statsv1alpha1.PodStats{
+			PodRef:    statsv1alpha1.PodReference{Name: t.pod.Name, Namespace: t.pod.Namespace, UID: string(t.pod.UID)},
+			StartTime: t.startTime,
+			Memory:    &statsv1alpha1.MemoryStats{Time: ts, WorkingSetBytes: &ws},
+		}
+		for i := range t.pod.Spec.Containers {
+			cws := uint64(0)
+			if i == 0 {
+				cws = ws
+			}
+			ps.Containers = append(ps.Containers, statsv1alpha1.ContainerStats{
+				Name:      t.pod.Spec.Containers[i].Name,
+				StartTime: t.startTime,
+				Memory:    &statsv1alpha1.MemoryStats{Time: ts, WorkingSetBytes: &cws},
+			})
+		}
+		summary.Pods = append(summary.Pods, ps)
+	}
+	return summary, nil
 }
 
 // podRoot returns the per-pod rootfs parent passed to the PodBox sandbox profile.

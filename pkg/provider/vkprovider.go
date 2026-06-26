@@ -101,9 +101,14 @@ func (v *VKProvider) PortForward(ctx context.Context, namespace, podName string,
 	return errdefs.NotFound("port-forward is not implemented in M1")
 }
 
-// GetStatsSummary returns an empty node stats summary (the Summary API lands in
-// M2 with runtimed's proc_pid_rusage metrics).
+// GetStatsSummary returns the kubelet Summary API snapshot kubectl top reads.
+// When the backing Runtime implements StatsSource (the runtimed runtime does, via
+// runtimed's proc_pid_rusage footprint), it produces real per-pod memory stats;
+// otherwise (HostProcess) the node-only summary is returned.
 func (v *VKProvider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
+	if s, ok := v.rt.(StatsSource); ok {
+		return s.StatsSummary(ctx)
+	}
 	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: v.nodeName}}, nil
 }
 

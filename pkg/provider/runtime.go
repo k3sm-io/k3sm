@@ -6,6 +6,7 @@ import (
 
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
+	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 )
 
 // Runtime is the consumer-side seam between the Virtual Kubelet provider and a
@@ -40,4 +41,16 @@ type Runtime interface {
 	// VK re-entrancy rule) and resyncs the current state when its underlying
 	// stream breaks, so a missed event is always recovered.
 	Watch(ctx context.Context, cb func(*corev1.Pod))
+}
+
+// StatsSource is an OPTIONAL Runtime capability: a Runtime that can report a
+// kubelet Summary API snapshot (the source kubectl top reads). VKProvider's
+// GetStatsSummary uses it via a type assertion when the backing Runtime
+// implements it — the runtimed runtime does (it surfaces runtimed's
+// proc_pid_rusage footprint); HostProcess does not, and keeps its empty summary.
+// Defining it here (consumer-side) keeps the core Runtime interface small.
+type StatsSource interface {
+	// StatsSummary returns the node + per-pod stats (memory working set) for the
+	// pods this runtime tracks.
+	StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error)
 }
