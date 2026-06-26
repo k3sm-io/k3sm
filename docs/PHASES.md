@@ -120,15 +120,15 @@ phases:
             method: e2e
       - id: M2.2
         title: Provider-served probes
-        status: todo
+        status: done
         deliverables:
           - id: M2.2-d1
-            done: false
-            desc: "the provider executes httpGet/tcp/exec liveness/readiness/startup probes and maps results to the Ready/ContainersReady conditions (endpoint membership) and to container restart on liveness failure — kubelet-inherited behavior the VK provider must reproduce."
+            done: true
+            desc: "the provider executes httpGet/tcp/exec liveness/readiness/startup probes and maps results to the Ready/ContainersReady conditions (endpoint membership) and to container restart on liveness failure — kubelet-inherited behavior the VK provider must reproduce. pkg/provider/probe.go runs one goroutine per (container,probe) bounded by the pod ctx (started at CreatePod, stopped at DeletePod via stopProber; status callbacks run OUTSIDE locks), applying k8s success/failureThreshold counting, startup-gates-liveness, and committed-readiness→Ready overlay (applyProbeOverlay in toPodStatus, so a NotReady container drops from the EndpointSlice). Handlers (probe_handlers.go): httpGet (2xx-3xx=ok, injectable RoundTripper), tcpSocket (injectable dialer), exec (in-process bidi adapter over the runtime Exec RPC); named probe ports resolve via the Container.ports table; dial host = bound pod IP. Liveness failure owns the restart DECISION + restart_count + gate reset; the literal per-container process re-exec awaits a runtime RestartContainer RPC (apis follow-up) wired via the restartFunc seam."
         acceptance:
           - id: M2.2-a1
-            met: false
-            check: a readiness-probe failure removes the pod from its Service EndpointSlice; a liveness-probe failure increments restart_count (transition cases, not just eventually-Ready)
+            met: true
+            check: a readiness-probe failure removes the pod from its Service EndpointSlice; a liveness-probe failure increments restart_count (transition cases, not just eventually-Ready). Proven by named unit tests TestM2_ReadinessGatesEndpoints / TestM2_LivenessRestarts / TestM2_StartupGatesLiveness / TestM2_ProbeHandlers / TestM2_ProbeThresholds (fakes for targets + clock; -race clean)
             method: e2e
       - id: M2.3
         title: Resources → Summary API (kubectl top) + OOMKilled
@@ -328,7 +328,13 @@ the runtimed daemon split + isolation + resources work. Sub-phases:
   `ContainerStatus` (lossless mirror). Env is resolved provider-side into literal values (runtimed reads only
   `EnvVar.value`); ConfigMap/Secret/SA-token + imagePullSecret data flow through the apiserver-backed
   `mount.Resolver`/`CredentialResolver` runtimed seams.
-- ⬜ **M2.2** — provider-served liveness/readiness/startup probes → conditions + endpoints + restart.
+- ✅ **M2.2** — provider-served liveness/readiness/startup probes → conditions + endpoints + restart. `pkg/provider`
+  runs a goroutine per (container, probe) bounded by the pod ctx, applies k8s threshold counting +
+  startup-gates-liveness, overlays committed readiness onto the `Ready`/`ContainersReady` conditions (a NotReady
+  pod drops from the EndpointSlice) and adds the liveness-driven restart count. Handlers: httpGet/tcpSocket/exec
+  (named ports resolve via the `ports` table; dial host = bound pod IP). The provider owns the restart
+  decision + count; the literal per-container re-exec rides a future runtime `RestartContainer` RPC (restartFunc
+  seam). Proven by `TestM2_{ReadinessGatesEndpoints,LivenessRestarts,StartupGatesLiveness,ProbeHandlers,ProbeThresholds}`.
 - ✅ **M2.3** — runtimed `proc_pid_rusage` (`ri_phys_footprint`) → Summary API (`kubectl top`) via the optional
   `StatsSource` capability; memory limit rides the `k3sm.io/memory-limit-bytes` PodBox annotation (interim seam
   until apis:M2.2 typed fields); `terminationGracePeriodSeconds` → `DeletePodRequest.grace_period_seconds`

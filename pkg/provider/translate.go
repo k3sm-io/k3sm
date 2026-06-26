@@ -472,9 +472,17 @@ func derefInt64(p *int64) int64 {
 //     heuristic) — this is the path the runtimed OOMKilled reason surfaces on,
 //   - the M2.1 ContainerStatus mirror (volume_mounts, user),
 //   - HostIP/HostIPs from the node IP.
-func toPodStatus(rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time) *corev1.PodStatus {
+//
+// probes, when non-nil, overlays the provider-served probe verdicts (M2.2):
+// readiness drives each container's Ready (and thus the pod Ready/ContainersReady
+// conditions → Service EndpointSlice membership), startup drives Started, and the
+// probe-driven restart count is added — applied BEFORE the conditions are derived
+// so the readiness signal propagates. A nil probes leaves the runtime status
+// untouched (a pod with no probes).
+func toPodStatus(rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState) *corev1.PodStatus {
 	cs := toContainerStatuses(rs.GetContainerStatuses())
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
+	applyProbeOverlay(cs, probes)
 
 	anyRunning, anyFailed, allReady := false, false, true
 	for i := range cs {
@@ -524,6 +532,35 @@ func toPodStatus(rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time) 
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 	}
 	return out
+}
+
+// applyProbeOverlay merges the provider-served probe verdicts into the container
+// statuses (M2.2): the probe-driven restart count is always added; for a RUNNING
+// container, a readiness/startup probe overrides Ready (so a failing readiness
+// probe removes the pod from its Service EndpointSlice) and a startup probe
+// overrides Started. Non-running containers keep the runtime's verdict (the prober
+// only governs a live container). A nil probes is a no-op.
+func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
+	if probes == nil {
+		return
+	}
+	for i := range cs {
+		v, ok := probes.verdict(cs[i].Name)
+		if !ok {
+			continue
+		}
+		cs[i].RestartCount += v.restarts
+		if cs[i].State.Running == nil {
+			continue
+		}
+		if v.hasReadiness || v.hasStartup {
+			cs[i].Ready = v.ready
+		}
+		if v.hasStartup {
+			started := v.started
+			cs[i].Started = &started
+		}
+	}
 }
 
 // derivePhase maps the runtime phase to a corev1 phase, honoring the rule "phase
