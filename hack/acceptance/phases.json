@@ -5,5 +5,6 @@
   "M2": { "gate": "hack/acceptance/m2.sh", "tier": "integration", "requires": ["dev-mac", "root"],        "manual": false },
   "M3": { "gate": "hack/lab/m3.sh",        "tier": "lab",         "requires": ["two-macs"],               "manual": true },
   "M4": { "gate": "hack/lab/m4.sh",        "tier": "lab",         "requires": ["macos-runner", "reboot"], "manual": true },
-  "M5": { "gate": "hack/lab/m5.sh",        "tier": "lab",         "requires": ["vz"],                     "manual": true }
+  "M5": { "gate": "hack/lab/m5.sh",        "tier": "lab",         "requires": ["vz"],                     "manual": true },
+  "M6": { "gate": "hack/lab/m6.sh",        "tier": "lab",         "requires": ["two-macs", "postgres"],   "manual": true }
 }

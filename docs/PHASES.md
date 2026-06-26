@@ -194,7 +194,7 @@ phases:
         deliverables:
           - id: M3.0-d1
             done: false
-            desc: "supervisor HTTP bootstrap — k3sm token create, node-password (anti-impersonation), HTTP-CSR cert issuance, AES-256-GCM bootstrap bundle; k3sm agent --server --token join client; mesh-enroll (wg pubkey + podCIDR) writes the MeshPeer CRD (apis:M3.1) and drives darwin-net:M3 mesh bring-up."
+            desc: "supervisor HTTP bootstrap for WORKER join — k3sm token create (TTL-bounded, distinct from system:masters), node-password (anti-impersonation, hashed in kine), HTTP-CSR issuing system:node:<name> certs; k3sm agent --server --token join client; mesh-enroll (wg pubkey + podCIDR) writes the MeshPeer CRD (apis:M3.2) and drives darwin-net:M3 mesh bring-up. The AES-256-GCM identical-CA bundle (HA-server CA reconstruction) is M6, not here."
         acceptance:
           - id: M3.0-a1
             met: false
@@ -238,7 +238,7 @@ phases:
             method: e2e
 
   - id: M4
-    title: Install/launchd, packaging, Homebrew, HA, hardening
+    title: Install/launchd, packaging, Homebrew, hardening
     status: todo
     depends_on:
       - apis:M4.1
@@ -246,16 +246,16 @@ phases:
       - darwin-net:M4
     subphases:
       - id: M4.0
-        title: Packaging + launchd + HA
+        title: Packaging + launchd + install (single-server)
         status: todo
         deliverables:
           - id: M4.0-d1
             done: false
-            desc: "app-bundle-wrapped root LaunchDaemon + k3sm install/uninstall (launchctl bootstrap/kickstart); codesign + notarize + .pkg (raw root utun/pf, no NE); goreleaser → k3sm-io/homebrew-tap; kine→Postgres HA (pgx) for >2 servers; admin kubeconfig dropped to ~/.kube/config on install (k3sm kubeconfig --write)."
+            desc: "app-bundle-wrapped root LaunchDaemon + k3sm install/uninstall (launchctl bootstrap/kickstart); codesign + notarize + .pkg (raw root utun/pf, no NE); goreleaser → k3sm-io/homebrew-tap; admin kubeconfig dropped to ~/.kube/config on install (k3sm kubeconfig --write). Single-server datastore (kine→SQLite); multi-server HA is M6 (last phase)."
         acceptance:
           - id: M4.0-a1
             met: false
-            check: brew install → sudo k3sm install server → cluster; survives reboot (launchd); HA with 2 servers on Postgres (lab)
+            check: brew install → sudo k3sm install server → cluster; survives reboot (launchd)
             method: e2e
       - id: M4.1
         title: RBAC enforcement (AlwaysAllow → Node,RBAC)
@@ -301,6 +301,38 @@ phases:
           - id: M5.1-a1
             met: false
             check: a Linux image runs under runtimeClassName=vm, is reachable via a ClusterIP Service + cluster DNS, and coexists with native arm64 pods (two-Mac/VZ lab)
+            method: e2e
+
+  - id: M6
+    title: HA — multi-server control plane (kine→Postgres, server-join, identical-CA bundle)
+    status: todo
+    depends_on:
+      - apis:M4.1
+      - darwin-net:M3
+    subphases:
+      - id: M6.0
+        title: kine→Postgres datastore for multi-writer HA
+        status: todo
+        deliverables:
+          - id: M6.0-d1
+            done: false
+            desc: "swap the single-writer kine→SQLite datastore for kine→Postgres (pure-Go pgx) so >1 control-plane server can share one consistent datastore (SQLite is single-host single-writer; two servers each on their own SQLite = split-brain). The kine→SQLite→Postgres change is the named kine/SQLite datastore-migration exception (additive cycle, verify forward-safe, plan the forward fix — rollback may be impossible)."
+        acceptance:
+          - id: M6.0-a1
+            met: false
+            check: two control-plane servers run against one Postgres; a write on server A is read on server B; killing A leaves the cluster serving via B (lab — postgres + 2 servers)
+            method: e2e
+      - id: M6.1
+        title: HA server-join + identical-CA bootstrap bundle
+        status: todo
+        deliverables:
+          - id: M6.1-d1
+            done: false
+            desc: "the M3 worker-join path extended to a SECOND CONTROL-PLANE SERVER: the AES-256-GCM bootstrap bundle so joining servers reconstruct IDENTICAL cluster + signing CAs (DESIGN §5c); the bundle endpoint is authorized to the server-bootstrap identity ONLY (never an agent), keyed by a strong KDF (PBKDF2/scrypt) over a high-entropy secret with a unique GCM nonce per seal (security Wave-0 CRIT5). Joining servers share the M6.0 Postgres datastore."
+        acceptance:
+          - id: M6.1-a1
+            met: false
+            check: a second Mac joins as a control-plane server, reconstructs the identical CAs from the bundle, and serves the apiserver against the shared Postgres (lab — 2 macs + postgres)
             method: e2e
 ---
 
@@ -379,8 +411,9 @@ milestone. Sub-phases:
   — no apis/runtimed change. Proven by `TestTypedMemoryLimitWritten`/`TestProbeRestartInvokesRPC`/`TestStatsSummaryFromListPodStats`.
 
 ## M3 — Multi-node, mesh, NodePort & persistent storage ⬜
-- ⬜ **M3.0** — multi-node bootstrap (`k3sm token create`, node-password, HTTP-CSR, AES-GCM bundle, `k3sm agent`
-  join) + mesh-enroll (`MeshPeer` CRD, apis:M3.1) driving darwin-net:M3.
+- ⬜ **M3.0** — multi-node **worker** bootstrap (`k3sm token create`, node-password, HTTP-CSR → `system:node:<name>`,
+  `k3sm agent` join) + mesh-enroll (`MeshPeer` CRD, apis:M3.2) driving darwin-net:M3. (HA server-join + the
+  identical-CA bundle are **M6**.)
 - ⬜ **M3.1** — wire darwin-net's NodePort (`*:nodePort`, TCP) — no apis change (NodePort already in `net/v1`).
 - ⬜ **M3.2** — APFS local-path provisioner (PVC→PV via runtimed:M3, same-volume, decoupled lifecycle) +
   StatefulSet (stable storage+name; network identity needs per-pod IPs).
@@ -388,9 +421,9 @@ milestone. Sub-phases:
   blackholed over the mesh (with darwin-net:M3.3).
 Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a NodePort + a persistent StatefulSet.
 
-## M4 — Install/launchd, packaging, Homebrew, HA, hardening ⬜
+## M4 — Install/launchd, packaging, Homebrew, hardening ⬜
 - ⬜ **M4.0** — app-bundle root LaunchDaemon + `k3sm install/uninstall`; codesign/notarize + `.pkg`; goreleaser →
-  `k3sm-io/homebrew-tap`; kine→Postgres HA.
+  `k3sm-io/homebrew-tap`; admin kubeconfig → `~/.kube/config`. **Single-server** (kine→SQLite); multi-server HA is M6.
 - ⬜ **M4.1** — RBAC enforcement: provision system roles + the VK node `system:node` identity (M3 CSR path) +
   NodeRestriction + per-SA bindings + `anonymous-auth=false` **before** flipping `--authorization-mode=Node,RBAC`;
   multi-node rolls control-plane-Mac-last with bindings pre-existing.
@@ -406,7 +439,19 @@ with a guest-side resolver (darwin-net:M5). Confirm the `com.apple.security.virt
 DESIGN §5c. Exit (§9 M5): a Linux image runs under `runtimeClassName: vm`, Service/DNS-reachable, beside native
 pods.
 
+## M6 — HA: multi-server control plane (last phase) ⬜
+Moved here from M4 so HA is the **final** milestone (single-server is sufficient through M5; HA is the last,
+most complex ops capability). Two sub-phases:
+- ⬜ **M6.0** — kine→**Postgres** (pure-Go pgx) so >1 control-plane server shares one consistent datastore
+  (SQLite is single-host single-writer; two servers each on their own SQLite = split-brain). The kine→SQLite→
+  Postgres change is the named **kine/SQLite datastore-migration** exception (additive cycle; verify forward-safe;
+  plan the forward fix — rollback may be impossible).
+- ⬜ **M6.1** — HA **server-join**: the M3 worker-join path extended to a second control-plane server + the
+  **AES-256-GCM identical-CA bundle** (DESIGN §5c) so joining servers reconstruct identical cluster+signing CAs;
+  the bundle endpoint is server-bootstrap-identity-only (never an agent), strong-KDF'd, unique GCM nonce per seal
+  (security Wave-0 CRIT5). Exit: 2 servers on shared Postgres; kill one → the cluster keeps serving (lab).
+
 ## Next
-M2 — all k3sm sub-phases (M2.0–M2.6, incl. the apis:M2.2 typed-contract swap) are done; the remaining milestone
-work is the workspace-root e2e gate `hack/acceptance/m2.sh` (single-node, root on a Mac), then M3 (multi-node,
-mesh, NodePort, persistent storage).
+M3 (multi-node, mesh, NodePort, persistent storage) — Wave 1 (`apis` storage + the M3.2 mesh contract) is in
+flight; see `../../docs/m3-plan.md` for the 5-persona re-plan. M2's only remaining item is the root e2e gate
+`hack/acceptance/m2.sh` (needs root on a Mac). **HA is now M6 (last phase).**
