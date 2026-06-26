@@ -85,7 +85,7 @@ func TestToPodStatusRunning(t *testing.T) {
 	stable := metav1.NewTime(time.Unix(1000, 0))
 	rs := runningRS("uid-web", time.Unix(2000, 0))
 
-	st := toPodStatus(rs, "192.168.1.10", stable)
+	st := toPodStatus(rs, "192.168.1.10", stable, nil)
 
 	if st.Phase != corev1.PodRunning {
 		t.Errorf("phase = %s, want Running", st.Phase)
@@ -142,7 +142,7 @@ func TestToPodStatusTerminatedVerbatim(t *testing.T) {
 			},
 		}},
 	}
-	st := toPodStatus(rs, "10.0.0.1", metav1.Now())
+	st := toPodStatus(rs, "10.0.0.1", metav1.Now(), nil)
 
 	if st.Phase != corev1.PodFailed {
 		t.Errorf("phase = %s, want Failed", st.Phase)
@@ -339,7 +339,7 @@ func TestToContainerStatusMirror(t *testing.T) {
 			User: &runtimev1.ContainerUser{Linux: &runtimev1.LinuxContainerUser{Uid: 1000, Gid: 2000, SupplementalGroups: []int64{999}}},
 		}},
 	}
-	st := toPodStatus(rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)))
+	st := toPodStatus(rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
 
 	cs := st.ContainerStatuses[0]
 	if len(cs.VolumeMounts) != 2 {
@@ -375,7 +375,7 @@ func TestToPodStatusOOMKilled(t *testing.T) {
 			}},
 		}},
 	}
-	st := toPodStatus(rs, "10.0.0.1", metav1.Now())
+	st := toPodStatus(rs, "10.0.0.1", metav1.Now(), nil)
 
 	if st.Phase != corev1.PodFailed {
 		t.Errorf("phase = %s, want Failed", st.Phase)
