@@ -320,6 +320,73 @@ func TestToPodBoxMemoryLimitAnnotation(t *testing.T) {
 	}
 }
 
+// TestTypedMemoryLimitWritten is the M2.2-swap proof that the translation writes
+// the TYPED apis:M2.2 PodBox fields, not just the interim annotation: a pod with
+// resources.limits.memory sets PodBox.memory_limit_bytes, and every pod carries the
+// correct qos_class enum (Guaranteed/Burstable/BestEffort) mapped from the kubelet
+// QoS classification.
+func TestTypedMemoryLimitWritten(t *testing.T) {
+	q := func(s string) resource.Quantity { return resource.MustParse(s) }
+	tests := []struct {
+		name       string
+		containers []corev1.Container
+		wantBytes  int64
+		wantQOS    runtimev1.QOSClass
+	}{
+		{
+			name: "guaranteed: equal cpu+memory requests and limits",
+			containers: []corev1.Container{{
+				Name: "c0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: q("500m"), corev1.ResourceMemory: q("256Mi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: q("500m"), corev1.ResourceMemory: q("256Mi")},
+				},
+			}},
+			wantBytes: 268435456,
+			wantQOS:   runtimev1.QOSClass_QOS_CLASS_GUARANTEED,
+		},
+		{
+			name: "burstable: only a memory limit set",
+			containers: []corev1.Container{{
+				Name:      "c0",
+				Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: q("256Mi")}},
+			}},
+			wantBytes: 268435456,
+			wantQOS:   runtimev1.QOSClass_QOS_CLASS_BURSTABLE,
+		},
+		{
+			name:       "besteffort: no requests or limits ⇒ no memory ceiling",
+			containers: []corev1.Container{{Name: "c0"}},
+			wantBytes:  0,
+			wantQOS:    runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT,
+		},
+		{
+			name: "burstable with an unbounded container ⇒ no enforceable pod ceiling",
+			containers: []corev1.Container{
+				{Name: "c0", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: q("256Mi")}}},
+				{Name: "c1"},
+			},
+			wantBytes: 0,
+			wantQOS:   runtimev1.QOSClass_QOS_CLASS_BURSTABLE,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
+				Spec:       corev1.PodSpec{Containers: tt.containers},
+			}
+			box := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "")
+			if box.GetMemoryLimitBytes() != tt.wantBytes {
+				t.Errorf("memory_limit_bytes = %d, want %d", box.GetMemoryLimitBytes(), tt.wantBytes)
+			}
+			if box.GetQosClass() != tt.wantQOS {
+				t.Errorf("qos_class = %v, want %v", box.GetQosClass(), tt.wantQOS)
+			}
+		})
+	}
+}
+
 // TestToContainerStatusMirror is the M2.1-a1 proof that the new ContainerStatus
 // mirror fields (volume_mounts + user) round-trip from the runtime status into
 // corev1.PodStatus so kubectl describe / get -o yaml stays lossless.
