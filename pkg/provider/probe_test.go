@@ -310,6 +310,69 @@ func TestM2_LivenessRestarts(t *testing.T) {
 	}
 }
 
+// --- TestProbeRestartInvokesRPC ----------------------------------------------
+
+// TestProbeRestartInvokesRPC is the M2.2-swap proof that a committed liveness
+// failure does not just bump bookkeeping but invokes the runtime RestartContainer
+// RPC (the restartFunc seam, previously nil, now wired by startProber). It drives
+// failureThreshold consecutive liveness failures through the real prober the
+// runtimed runtime starts at CreatePod and asserts the RPC fired exactly once for
+// the right (pod, container) while the probe-driven restart count incremented.
+func TestProbeRestartInvokesRPC(t *testing.T) {
+	r, f := newRuntimedFake(t)
+	r.clk = testclock.NewFakeClock(time.Unix(0, 0))
+	// A dialer that always refuses, so the tcpSocket liveness check fails each tick.
+	r.dial = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("connection refused")
+	}
+	ctx := context.Background()
+
+	pod := probePod("live", corev1.Container{
+		Name:    "c0",
+		Command: []string{"/web"},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler:        tcpHandler(8080),
+			InitialDelaySeconds: 3600, // park the live loop; the test drives ticks itself
+			FailureThreshold:    3,
+		},
+	})
+	if err := r.CreatePod(ctx, pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+
+	pp, ok := r.proberFor("uid-live").(*podProber)
+	if !ok {
+		t.Fatal("a probed pod must have a prober after CreatePod")
+	}
+	m := pp.monitors["c0"]
+
+	// failureThreshold (3) consecutive liveness failures: the 3rd crosses the
+	// threshold and must invoke RestartContainer exactly once (not per failure).
+	for i := 0; i < 3; i++ {
+		pp.tick(ctx, m, probeLiveness, m.liveness)
+	}
+
+	if got := m.verdict().restarts; got != 1 {
+		t.Fatalf("probe-driven restarts = %d, want 1", got)
+	}
+	f.mu.Lock()
+	calls, last := f.restartCalls, f.lastRestart
+	f.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("RestartContainer RPC calls = %d, want 1 (action wired to the seam)", calls)
+	}
+	if last.podID != "uid-live" || last.container != "c0" {
+		t.Errorf("RestartContainer called with (%q,%q), want (uid-live,c0)", last.podID, last.container)
+	}
+
+	// The probe-driven restart surfaces in the published status (restart_count).
+	st := toPodStatus(runningProto("uid-live", "c0"), r.nodeIP, metav1.Now(), pp)
+	if st.ContainerStatuses[0].RestartCount != 1 {
+		t.Errorf("status RestartCount = %d, want 1", st.ContainerStatuses[0].RestartCount)
+	}
+}
+
 // --- TestM2_ReadinessGatesEndpoints ------------------------------------------
 
 // TestM2_ReadinessGatesEndpoints proves a readiness probe drives the container
