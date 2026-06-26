@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/utils/clock"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/mount"
@@ -51,9 +54,17 @@ type runtimedRuntime struct {
 	// proc_pid_rusage footprint surfaced to the Summary API (M2.3).
 	metrics podMetricsSource
 
-	mu     sync.Mutex
-	track  map[string]*podTrack // pod id -> bookkeeping
-	notify func(*corev1.Pod)
+	// clk, dial, and probeTransport are the provider-served probe seams (M2.2):
+	// the clock that schedules probe loops and the http/tcp I/O the checks use.
+	// Production defaults are wired in newRuntimedWith; tests inject fakes.
+	clk            clock.Clock
+	dial           dialFunc
+	probeTransport http.RoundTripper
+
+	mu      sync.Mutex
+	track   map[string]*podTrack  // pod id -> bookkeeping
+	probers map[string]*podProber // pod id -> provider-served probe runner (M2.2)
+	notify  func(*corev1.Pod)
 }
 
 // podMetricsSource is the optional capability of the wrapped runtime that reports
@@ -132,14 +143,18 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		log = slog.New(slog.DiscardHandler)
 	}
 	r := &runtimedRuntime{
-		rt:       rt,
-		nodeName: cfg.NodeName,
-		nodeIP:   cfg.NodeIP,
-		rootfs:   cfg.Root,
-		dyldShim: cfg.DyldShim,
-		resolver: resolver,
-		log:      log,
-		track:    map[string]*podTrack{},
+		rt:             rt,
+		nodeName:       cfg.NodeName,
+		nodeIP:         cfg.NodeIP,
+		rootfs:         cfg.Root,
+		dyldShim:       cfg.DyldShim,
+		resolver:       resolver,
+		log:            log,
+		clk:            clock.RealClock{},
+		dial:           (&net.Dialer{}).DialContext,
+		probeTransport: newProbeTransport(),
+		track:          map[string]*podTrack{},
+		probers:        map[string]*podProber{},
 	}
 	if m, ok := rt.(podMetricsSource); ok {
 		r.metrics = m
@@ -192,6 +207,10 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
+	// Start the provider-served probe runner (M2.2): the VK provider replaces the
+	// kubelet, so it must execute the pod's probes itself. No-op for a probe-free
+	// pod; idempotent for a repeated CreatePod.
+	r.startProber(pod, resp.GetStatus().GetPodIp())
 	r.dispatch(id, resp.GetStatus())
 	return nil
 }
@@ -231,6 +250,9 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	if err != nil {
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
+	// Stop the probe runner before forgetting the pod (stopProber waits for the
+	// loops outside the lock, so no probe goroutine outlives the pod).
+	r.stopProber(id)
 	r.mu.Lock()
 	delete(r.track, id)
 	r.mu.Unlock()
@@ -250,7 +272,7 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
 		return nil, errdefs.NotFoundf("pod %q not found in runtime", namespace+"/"+name)
 	}
-	return toPodStatus(resp.GetStatus(), r.nodeIP, start), nil
+	return toPodStatus(resp.GetStatus(), r.nodeIP, start, r.proberFor(id)), nil
 }
 
 // GetPods returns every tracked pod with its current status applied.
@@ -267,7 +289,7 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 		pod := t.pod.DeepCopy()
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 		if err == nil && (resp.GetError() == nil || resp.GetError().GetCode() == 0) {
-			pod.Status = *toPodStatus(resp.GetStatus(), r.nodeIP, t.startTime)
+			pod.Status = *toPodStatus(resp.GetStatus(), r.nodeIP, t.startTime, r.proberFor(string(pod.UID)))
 		}
 		out = append(out, pod)
 	}
@@ -383,6 +405,7 @@ func (r *runtimedRuntime) emit(rs *runtimev1.PodStatus) {
 	r.mu.Lock()
 	t, ok := r.track[id]
 	cb := r.notify
+	pr := r.probers[id]
 	var pod *corev1.Pod
 	var start metav1.Time
 	if ok {
@@ -393,7 +416,11 @@ func (r *runtimedRuntime) emit(rs *runtimev1.PodStatus) {
 	if !ok || cb == nil {
 		return
 	}
-	pod.Status = *toPodStatus(rs, r.nodeIP, start)
+	var ps probeState
+	if pr != nil {
+		ps = pr
+	}
+	pod.Status = *toPodStatus(rs, r.nodeIP, start, ps)
 	cb(pod)
 }
 
