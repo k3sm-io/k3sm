@@ -1,8 +1,8 @@
 ---
 repo: k3sm
 schema: phases/v1
-current_phase: M2
-updated: 2026-06-25
+current_phase: M3
+updated: 2026-06-26
 updated_by: claude
 
 phases:
@@ -182,7 +182,9 @@ phases:
 
   - id: M3
     title: Multi-node, mesh, NodePort & persistent storage (control side)
-    status: todo
+    status: in-progress
+    note: "M3.0 (the security-critical multi-node bootstrap + trust core) is done — CA hierarchy, CA-pinned join, node-password, HTTP-CSR → system:node, mesh write-guard, mesh-bound apiserver flags — proven by named unit tests (-race clean). M3.1 (NodePort), M3.2 (provisioner+StatefulSet), M3.3 (kubernetes endpoint rewrite) remain todo. The live two-Mac join (+ MeshPeer CRD install, mesh utun bring-up, the apiserver secure-cutover boot) is the K3SM_LAB e2e leg."
+    strategy: hard cut
     depends_on:
       - apis:M3.1
       - runtimed:M3
@@ -190,15 +192,15 @@ phases:
     subphases:
       - id: M3.0
         title: Multi-node bootstrap (token / node-password / HTTP-CSR / join)
-        status: todo
+        status: done
         deliverables:
           - id: M3.0-d1
-            done: false
-            desc: "supervisor HTTP bootstrap for WORKER join — k3sm token create (TTL-bounded, distinct from system:masters), node-password (anti-impersonation, hashed in kine), HTTP-CSR issuing system:node:<name> certs; k3sm agent --server --token join client; mesh-enroll (wg pubkey + podCIDR) writes the MeshPeer CRD (apis:M3.2) and drives darwin-net:M3 mesh bring-up. The AES-256-GCM identical-CA bundle (HA-server CA reconstruction) is M6, not here."
+            done: true
+            desc: "WORKER-join bootstrap + trust, the security Wave-0 core. pkg/certs grows a real two-CA PKI: a CLUSTER CA (the pinned serving anchor + issuer of kubelet-serving certs) and a SIGNING CA (issues system:node client certs); VerifyPinnedChain implements CA-hash-pinned join WITHOUT insecure-skip-tls-verify (the live dialer disables only default verification, then re-imposes pinned verification against the token anchor). pkg/bootstrap: K10<sha256(cluster-CA)>::<user>:<secret> tokens minted by `k3sm token create` (TTL-bounded, hashed/bcrypt, identity system:k3sm-bootstrap — NEVER system:masters); node-password anti-impersonation (bcrypt-hashed, constant-time compare, first-write-wins name binding, local copy 0600); HTTP-CSR approver minting CN=system:node:<name>, O=system:nodes bound to the authenticated node + InternalIP (rejects a cross-node SAN); kubelet-serving certs from the cluster CA; the MeshPeer write-guard (a node writes only its own MeshPeer; enroll is controller-mediated); the supervisor-side Server + the agent-side Join client over a pinned-CA TLS exchange. `k3sm agent --server --token` runs the join → writes a system:node kubeconfig (0600, cluster-CA-verified — NOT the admin token) → mesh-enrolls (writes THIS node's MeshPeer; apis net/v1) → drives darwin-net mesh.New/NewWatcher. pkg/executor binds the apiserver to the wireguard mesh interface ONLY + --anonymous-auth=false + --client-ca-file (so M4's Node,RBAC flip is a pure authorizer switch) + --kubelet-certificate-authority + a cluster-CA-signed serving cert (gated on `k3sm server --mesh-ip`; single-node loopback/self-signed path unchanged). The AES-256-GCM identical-CA bundle (HA-server CA reconstruction) is M6, not here."
         acceptance:
           - id: M3.0-a1
-            met: false
-            check: a second Mac joins; cross-node pod-to-pod + ClusterIP work (two-Mac lab)
+            met: true
+            check: "the trust core is proven by named unit tests (fakes/in-proc, -race clean): TestCAHierarchyAndPinnedJoin (token embeds sha256(cluster-CA); a join client verifies a chain rooted in it and REJECTS a different root, no insecure-skip), TestNodePasswordHashedConstantTime (hashed + constant-time + first-write-wins), TestCSRIssuesSystemNodeIdentity (CN=system:node:<name>,O=system:nodes; cross-node SAN rejected), TestJoinTokenTTLAndNotAdmin (TTL-bounded, not system:masters), TestMeshPeerWriteGuardOwnNodeOnly, TestApiserverFlagsMeshBindAnonOff (mesh bind not 0.0.0.0 + anon-off + client-ca + kubelet-ca). The live two-Mac join — cross-node pod-to-pod + ClusterIP, the MeshPeer CRD install, the mesh utun bring-up, the apiserver secure-cutover boot — is the K3SM_LAB e2e leg."
             method: e2e
       - id: M3.1
         title: Wire NodePort Services
@@ -410,10 +412,26 @@ milestone. Sub-phases:
   footprint→working-set) in place of the in-proc `PodMetrics` path. Provider-side consume of a frozen apis contract
   — no apis/runtimed change. Proven by `TestTypedMemoryLimitWritten`/`TestProbeRestartInvokesRPC`/`TestStatsSummaryFromListPodStats`.
 
-## M3 — Multi-node, mesh, NodePort & persistent storage ⬜
-- ⬜ **M3.0** — multi-node **worker** bootstrap (`k3sm token create`, node-password, HTTP-CSR → `system:node:<name>`,
-  `k3sm agent` join) + mesh-enroll (`MeshPeer` CRD, apis:M3.2) driving darwin-net:M3. (HA server-join + the
-  identical-CA bundle are **M6**.)
+## M3 — Multi-node, mesh, NodePort & persistent storage 🟡
+- ✅ **M3.0** — multi-node **worker** bootstrap + trust (the security Wave-0 core). `pkg/certs` stands up a real
+  two-CA PKI — a **cluster CA** (the pinned serving anchor + kubelet-serving issuer) and a **signing CA**
+  (system:node client-cert issuer) — with `VerifyPinnedChain` doing CA-hash-pinned join **without**
+  `insecure-skip-tls-verify`. `pkg/bootstrap`: `k3sm token create` mints `K10<sha256(cluster-CA)>::<user>:<secret>`
+  TTL-bounded tokens (bcrypt-hashed, identity `system:k3sm-bootstrap`, **never** `system:masters`); the
+  anti-impersonation node-password is bcrypt-hashed + constant-time-compared + first-write-wins (local copy
+  `0600`); the HTTP-CSR approver mints `CN=system:node:<name>, O=system:nodes` bound to the authenticated node +
+  InternalIP (rejects a cross-node SAN); kubelet-serving certs are issued from the cluster CA; the MeshPeer
+  write-guard lets a node write only its own peer (controller-mediated enroll). `k3sm agent --server --token`
+  runs the pinned-CA join → writes a `system:node` kubeconfig (`0600`, cluster-CA-verified — **off** the admin
+  token) → mesh-enrolls (writes its `MeshPeer`, apis net/v1) → drives darwin-net `mesh.New`/`NewWatcher`.
+  `pkg/executor` binds the apiserver to the **wireguard mesh interface only** + `--anonymous-auth=false` +
+  `--client-ca-file` (so M4's `Node,RBAC` flip is a pure authorizer switch) + `--kubelet-certificate-authority`
+  + a cluster-CA-signed serving cert (gated on `k3sm server --mesh-ip`; single-node loopback/self-signed path
+  unchanged). Proven by `TestCAHierarchyAndPinnedJoin`/`TestNodePasswordHashedConstantTime`/
+  `TestCSRIssuesSystemNodeIdentity`/`TestJoinTokenTTLAndNotAdmin`/`TestMeshPeerWriteGuardOwnNodeOnly`/
+  `TestApiserverFlagsMeshBindAnonOff` (`-race` clean). The live two-Mac join (+ MeshPeer CRD install, mesh utun
+  bring-up, the apiserver secure-cutover boot) is the **K3SM_LAB** e2e leg. (HA server-join + the identical-CA
+  bundle are **M6**.)
 - ⬜ **M3.1** — wire darwin-net's NodePort (`*:nodePort`, TCP) — no apis change (NodePort already in `net/v1`).
 - ⬜ **M3.2** — APFS local-path provisioner (PVC→PV via runtimed:M3, same-volume, decoupled lifecycle) +
   StatefulSet (stable storage+name; network identity needs per-pod IPs).
@@ -452,6 +470,9 @@ most complex ops capability). Two sub-phases:
   (security Wave-0 CRIT5). Exit: 2 servers on shared Postgres; kill one → the cluster keeps serving (lab).
 
 ## Next
-M3 (multi-node, mesh, NodePort, persistent storage) — Wave 1 (`apis` storage + the M3.2 mesh contract) is in
-flight; see `../../docs/m3-plan.md` for the 5-persona re-plan. M2's only remaining item is the root e2e gate
-`hack/acceptance/m2.sh` (needs root on a Mac). **HA is now M6 (last phase).**
+M3.0 (the multi-node bootstrap + trust core) is **done** (named unit tests, `-race` clean). Remaining M3:
+**M3.1** wire darwin-net's NodePort, **M3.2** the local-path provisioner + StatefulSet, **M3.3** the per-node
+CoreDNS + node-local `kubernetes` endpoint rewrite — see `../../docs/m3-plan.md` for the 5-persona re-plan. The
+live two-Mac join is the `K3SM_LAB` e2e leg (it also needs the MeshPeer CRD installed in the apiserver). M2's
+only remaining item is the root e2e gate `hack/acceptance/m2.sh` (needs root on a Mac). **HA is now M6 (last
+phase).**

@@ -209,22 +209,52 @@ func (s *Supervised) startKine(ctx context.Context) error {
 // locked default; the soak is revisited if k3sm ever pins a kube version where
 // the gate is still settable.
 func (s *Supervised) startAPIServer(ctx context.Context) error {
-	wd := s.cfg.WorkDir
-	return s.spawn(ctx, "kube-apiserver",
-		"--etcd-servers", "http://127.0.0.1:"+strconv.Itoa(s.cfg.KinePort),
+	return s.spawn(ctx, "kube-apiserver", apiServerArgs(s.cfg)...)
+}
+
+// apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
+// the M3 trust posture is table-tested without booting the apiserver: the mesh
+// BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (so M4's
+// Node,RBAC flip is a pure authorizer switch), and --kubelet-certificate-authority
+// are all asserted here. The M1/M2 single-node path leaves the new fields zero, so
+// the binding falls back to NodeIP (loopback) and the new flags are omitted.
+func apiServerArgs(cfg Config) []string {
+	wd := cfg.WorkDir
+	bind := cfg.BindAddress
+	if bind == "" {
+		bind = cfg.NodeIP
+	}
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	args := []string{
+		"--etcd-servers", "http://127.0.0.1:" + strconv.Itoa(cfg.KinePort),
 		"--service-cluster-ip-range", "10.43.0.0/16",
 		"--service-account-key-file", saPubPath(wd),
 		"--service-account-signing-key-file", saKeyPath(wd),
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",
 		"--token-auth-file", tokenFilePath(wd),
 		"--authorization-mode", "AlwaysAllow",
-		"--bind-address", "127.0.0.1",
-		"--advertise-address", s.cfg.NodeIP,
-		"--secure-port", strconv.Itoa(s.cfg.APIServerPort),
+		"--bind-address", bind,
+		"--advertise-address", cfg.NodeIP,
+		"--secure-port", strconv.Itoa(cfg.APIServerPort),
 		"--cert-dir", certDir(wd),
 		"--kubelet-preferred-address-types", "InternalIP",
 		"--allow-privileged",
-	)
+	}
+	if cfg.ClientCAFile != "" {
+		args = append(args, "--client-ca-file", cfg.ClientCAFile)
+	}
+	if cfg.KubeletCAFile != "" {
+		args = append(args, "--kubelet-certificate-authority", cfg.KubeletCAFile)
+	}
+	if cfg.AnonymousAuth != nil {
+		args = append(args, fmt.Sprintf("--anonymous-auth=%t", *cfg.AnonymousAuth))
+	}
+	if cfg.ServingCertFile != "" && cfg.ServingKeyFile != "" {
+		args = append(args, "--tls-cert-file", cfg.ServingCertFile, "--tls-private-key-file", cfg.ServingKeyFile)
+	}
+	return args
 }
 
 // startScheduler launches kube-scheduler against the admin kubeconfig.

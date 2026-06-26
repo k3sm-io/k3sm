@@ -1,0 +1,150 @@
+package bootstrap
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+// BootstrapTokensFile is the JSON file (under the server work dir) the file-backed
+// token store persists to, so `k3sm token create` (a separate process) and the
+// running supervisor share bootstrap-token records on a single control-plane Mac.
+const BootstrapTokensFile = "bootstrap-tokens.json"
+
+// TokensPath returns the bootstrap-token store path for a work dir.
+func TokensPath(workDir string) string { return filepath.Join(workDir, BootstrapTokensFile) }
+
+// fileToken is one persisted bootstrap-token record. The secret is stored ONLY as a
+// bcrypt hash; the expiry bounds the TTL.
+type fileToken struct {
+	User       string    `json:"user"`
+	SecretHash string    `json:"secretHash"`
+	Expiry     time.Time `json:"expiry"`
+}
+
+// FileTokenStore is a file-backed TokenStore. Create appends a record and rewrites
+// the file (0600); VerifyToken reloads the file each call (the file is tiny and joins
+// are infrequent), so a token minted after the server started is honored. It
+// satisfies TokenVerifier.
+//
+// Locking discipline: mu serializes the read-modify-write in Create so two
+// concurrent `token create` invocations don't clobber each other within one process;
+// cross-process safety on a single Mac relies on the rewrite being atomic (temp +
+// rename).
+type FileTokenStore struct {
+	path string
+	now  func() time.Time
+	mu   sync.Mutex
+}
+
+// NewFileTokenStore returns a file-backed token store at path. now defaults to
+// time.Now.
+func NewFileTokenStore(path string, now func() time.Time) *FileTokenStore {
+	if now == nil {
+		now = time.Now
+	}
+	return &FileTokenStore{path: path, now: now}
+}
+
+// Create mints a TTL-bounded bootstrap token, appends its (hashed) record, and
+// returns the cleartext credential once. ttl must be positive.
+func (s *FileTokenStore) Create(ttl time.Duration) (user, secret string, expiry time.Time, err error) {
+	if ttl <= 0 {
+		return "", "", time.Time{}, fmt.Errorf("bootstrap: token ttl must be positive, got %s", ttl)
+	}
+	u, err := randHex(6)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	sec, err := randHex(32)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(sec), bcrypt.DefaultCost)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("hash token secret: %w", err)
+	}
+	user = "boot-" + u
+	expiry = s.now().Add(ttl)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs, err := s.load()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	recs = append(recs, fileToken{User: user, SecretHash: string(hash), Expiry: expiry})
+	if err := s.save(recs); err != nil {
+		return "", "", time.Time{}, err
+	}
+	return user, sec, expiry, nil
+}
+
+// VerifyToken parses tok and verifies its credential against an unexpired persisted
+// record (constant-time bcrypt compare).
+func (s *FileTokenStore) VerifyToken(tok string) error {
+	t, err := ParseToken(tok)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	recs, err := s.load()
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, r := range recs {
+		if r.User != t.User {
+			continue
+		}
+		if !s.now().Before(r.Expiry) {
+			return ErrTokenExpired
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(r.SecretHash), []byte(t.Secret)); err != nil {
+			return ErrTokenMismatch
+		}
+		return nil
+	}
+	return ErrTokenUnknown
+}
+
+// load reads the persisted records, treating a missing file as empty.
+func (s *FileTokenStore) load() ([]fileToken, error) {
+	b, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read token store: %w", err)
+	}
+	var recs []fileToken
+	if len(b) == 0 {
+		return nil, nil
+	}
+	if err := json.Unmarshal(b, &recs); err != nil {
+		return nil, fmt.Errorf("decode token store: %w", err)
+	}
+	return recs, nil
+}
+
+// save atomically rewrites the records (temp file + rename) at 0600.
+func (s *FileTokenStore) save(recs []fileToken) error {
+	b, err := json.MarshalIndent(recs, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode token store: %w", err)
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return fmt.Errorf("write token store: %w", err)
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return fmt.Errorf("commit token store: %w", err)
+	}
+	return nil
+}
