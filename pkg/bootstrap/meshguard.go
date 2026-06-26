@@ -1,0 +1,57 @@
+package bootstrap
+
+import (
+	"errors"
+	"fmt"
+
+	netv1 "k3sm.io/apis/net/v1"
+)
+
+// ErrForbiddenPeer is returned by AuthorizeMeshPeerWrite when a node attempts to
+// write a MeshPeer it does not own. Compare with errors.Is.
+var ErrForbiddenPeer = errors.New("bootstrap: a node may write only its own MeshPeer")
+
+// AuthorizeMeshPeerWrite reports whether the authenticated node (system:node:<nodeName>)
+// may write the MeshPeer named peerName. Under M3's AlwaysAllow authorizer the
+// mesh-enroll is controller-mediated, and a node may write ONLY its own MeshPeer
+// (peerName == nodeName). A forged peer — an attacker advertising AllowedIPs over a
+// victim's podCIDR with an attacker-controlled endpoint — would hijack all cross-node
+// traffic to that podCIDR, so this guard is the load-bearing routing-integrity check
+// until NodeRestriction proper lands in M4. It returns ErrForbiddenPeer otherwise.
+func AuthorizeMeshPeerWrite(nodeName, peerName string) error {
+	if nodeName == "" || peerName == "" {
+		return fmt.Errorf("%w: empty node %q or peer %q", ErrForbiddenPeer, nodeName, peerName)
+	}
+	if nodeName != peerName {
+		return fmt.Errorf("%w: node %q may not write MeshPeer %q", ErrForbiddenPeer, nodeName, peerName)
+	}
+	return nil
+}
+
+// BuildMeshPeer assembles the MeshPeer the server writes on a node's behalf
+// (controller-mediated enroll), binding the object's name to nodeName so the
+// write-guard holds. The peer carries the node's PUBLIC wireguard key + endpoint
+// from req, the server-assigned podCIDR (which is also the sole AllowedIPs entry —
+// the node /24 single source of truth), and the reserved mesh-egress /32. It returns
+// an error if the resulting spec is not Validate-able.
+func BuildMeshPeer(nodeName, podCIDR, meshIP string, req netv1.MeshEnrollRequest) (*netv1.MeshPeer, error) {
+	if err := AuthorizeMeshPeerWrite(nodeName, req.NodeName); err != nil {
+		return nil, err
+	}
+	spec := netv1.MeshPeerSpec{
+		NodeName:   nodeName,
+		PublicKey:  req.PublicKey,
+		Endpoint:   req.Endpoint,
+		PodCIDR:    podCIDR,
+		AllowedIPs: []string{podCIDR},
+		MeshIP:     meshIP,
+	}.WithDefaults()
+	if err := spec.Validate(); err != nil {
+		return nil, fmt.Errorf("build mesh peer for %q: %w", nodeName, err)
+	}
+	peer := &netv1.MeshPeer{Spec: spec}
+	peer.Name = nodeName
+	peer.Kind = "MeshPeer"
+	peer.APIVersion = netv1.SchemeGroupVersion.String()
+	return peer, nil
+}

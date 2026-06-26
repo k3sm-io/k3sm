@@ -1,6 +1,11 @@
-// Package certs mints the self-signed TLS material k3sm components serve in M1
-// (before the M3/M4 issued-cert PKI lands). Today that is the kubelet-serving
-// certificate the Virtual Kubelet node presents on :10250.
+// Package certs is k3sm's certificate authority and TLS material.
+//
+// M3 stands up a real PKI (ca.go): a CLUSTER CA (the serving anchor a K10 join
+// token pins) and a SIGNING CA (issues the system:node client certs handed to
+// joining nodes), with VerifyPinnedChain implementing CA-hash-pinned join WITHOUT
+// insecure-skip-tls-verify. SelfSignedServing (below) remains the dev/loopback,
+// single-node path: a CA-less self-signed serving cert for the Virtual Kubelet
+// node's :10250 endpoint when there is no cluster CA to issue from.
 package certs
 
 import (
