@@ -186,6 +186,10 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runti
 // nil) when the fail-closed gate rejects the pod; CreatePod surfaces that as an
 // error so VK marks the pod failed.
 func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	// Bind the pod's ServiceAccount to the request context so the shared volume
+	// Resolver mints the in-pod-API token (projected SA-token volume) against the
+	// RIGHT SA — runtimed threads this ctx to mount.Materialize in-process (M2.4).
+	ctx = withServiceAccount(ctx, podServiceAccount(pod))
 	id := string(pod.UID)
 	start := metav1.Now()
 	box, err := r.buildBox(ctx, pod)
@@ -219,6 +223,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 // updates in place); other changes need a recreate and are reported by the
 // runtime as a typed precondition failure, surfaced here as an error.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
+	// Same SA binding as CreatePod, in case the runtime re-materializes volumes on
+	// an in-place update (M2.4).
+	ctx = withServiceAccount(ctx, podServiceAccount(pod))
 	id := string(pod.UID)
 	r.mu.Lock()
 	if t, ok := r.track[id]; ok {

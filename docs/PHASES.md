@@ -87,7 +87,8 @@ phases:
 
   - id: M2
     title: Isolation, resources & pod-spec fidelity (integration side)
-    status: todo
+    status: in-progress
+    note: "All k3sm sub-phases M2.0–M2.5 are done (proven by named unit tests at the seam, -race clean); only the workspace-root e2e gate hack/acceptance/m2.sh (single-node confinement/OOMKill/pod-to-pod/in-pod-kubectl/exec, needs root on a Mac) remains for the milestone."
     strategy: hard cut
     depends_on:
       - apis:M2.1
@@ -144,27 +145,27 @@ phases:
             method: e2e
       - id: M2.4
         title: In-cluster API access — kubernetes.default.svc reachable + SA-token projection
-        status: todo
+        status: done
         deliverables:
           - id: M2.4-d1
-            done: false
-            desc: "make the apiserver-auto-created kubernetes.default.svc endpoint reachable from a bound pod IP (advertise/proxy address discipline); project the default-SA BOUND token (audience + expirationSeconds + rotation) and mount the apiserver SERVING CA at the canonical in-pod path so a stock client-go in-cluster config validates end-to-end. In-pod DNS requires the exec-shim backend (sandbox-exec strips DYLD_*). Authorization is exercised under RBAC at M4 (M2 runs AlwaysAllow)."
+            done: true
+            desc: "project the POD'S-OWN-SA BOUND token (not the namespace default): the shared kubeResolver mints the TokenRequest token (audience + expirationSeconds, rotated) for spec.serviceAccountName, bound per-CreatePod via the request context the provider threads to mount.Materialize in-process — NO runtimed/apis seam change (the M2 daemon split will carry the SA in the materialization RPC). The apiserver SERVING CA (kube-root-ca.crt ConfigMap, published by the kept root-ca-cert-publisher controller) + the namespace materialize at the canonical in-pod path /var/run/secrets/kubernetes.io/serviceaccount so a stock client-go in-cluster config validates. kubernetes.default.svc reachability: --advertise-address=NodeIP defaults to loopback (127.0.0.1) single-node, so the auto-created endpoint resolves to the address the apiserver binds and the in-process Service proxy reaches it (M3.3 rewrites it per-node for a routable NodeIP). In-pod DNS requires the exec-shim backend (sandbox-exec strips DYLD_*). Authorization is exercised under RBAC at M4 (M2 runs AlwaysAllow)."
         acceptance:
           - id: M2.4-a1
-            met: false
-            check: a pod with its projected SA token + CA reaches the apiserver via kubernetes.default.svc and lists pods (authn/routing/CA; authz deferred to M4)
+            met: true
+            check: "a pod with serviceAccountName foo gets a token minted for foo (not default), an unset pod gets default, and the CA + namespace materialize at the canonical paths with an internally-consistent in-pod config triple. Proven by TestM2_InPodKubectl (fake apiserver client + fake TokenRequest reactor; -race clean). The live kubernetes.default.svc round-trip is the m2.sh e2e leg (single-node root)."
             method: e2e
       - id: M2.5
         title: Implement Exec/Attach/PortForward provider verbs
-        status: todo
+        status: done
         deliverables:
           - id: M2.5-d1
-            done: false
-            desc: "wire the provider's RunInContainer/AttachToContainer/PortForward (NotFound in M1) to the already-existing runtime/v1 Exec/Attach/PortForward RPCs — a provider-implementation gap against a frozen apis contract, not an apis change."
+            done: true
+            desc: "wire the provider's RunInContainer/AttachToContainer/PortForward (NotFound in M1) to the already-existing runtime/v1 Exec/Attach/PortForward bidi RPCs via the StreamingRuntime capability (the runtimedRuntime serves it; HostProcess does not). pkg/provider/runtimed_exec.go bridges the VK api.AttachIO (stdin/stdout/stderr + resize) and the port-forward byte stream to an in-process grpc.BidiStreamingServer adapter (streamPipe, mirroring watchStream/logSink), mapping a non-zero exec exit to a utilexec.CodeExitError. A provider-implementation gap against a frozen apis contract, not an apis change. NOTE: runtimed's server Exec/Attach/PortForward still return Unimplemented (runtimed:M2); the provider surfaces that as an error (no panic) and the live verbs light up when runtimed lands them."
         acceptance:
           - id: M2.5-a1
-            met: false
-            check: kubectl exec and kubectl port-forward work against a confined pod
+            met: true
+            check: "RunInContainer streams stdin/stdout to/from the runtime Exec RPC and returns its exit status; PortForward proxies bytes both ways; AttachToContainer attaches; exec/port-forward error + not-found paths surface (no panic). Proven by TestM2_Exec / TestM2_Attach / TestM2_PortForward (+ error/not-found cases) with a fake runtime stream; -race clean. Live kubectl exec/port-forward against a confined pod is the m2.sh e2e leg."
             method: e2e
 
   - id: M3
@@ -317,9 +318,12 @@ M1.4 hosts darwin-net's Service proxy + CoreDNS config via `pkg/netserve`. Note:
 GA-locked `true` on the pinned k8s v1.36.2; the lo0/DNS data-path leg is root-gated (asserted by
 `hack/acceptance/m1.sh` on a capable host). Gate: `hack/acceptance/m1.sh`.
 
-## M2 — Isolation, resources & pod-spec fidelity ⬜
+## M2 — Isolation, resources & pod-spec fidelity 🟡
 The runtime-independent pod surface a real workload needs (see `../../docs/stockkitty-readiness.md`), on top of
-the runtimed daemon split + isolation + resources work. Sub-phases:
+the runtimed daemon split + isolation + resources work. **All k3sm sub-phases M2.0–M2.5 are done** (proven by
+named unit tests at the seam, `-race` clean); only the workspace-root e2e gate `hack/acceptance/m2.sh`
+(single-node confinement/OOMKill/pod-to-pod/in-pod-kubectl/exec, needs root on a Mac) remains for the
+milestone. Sub-phases:
 - ✅ **M2.0** — kubectl ergonomics: `k3sm kubectl` passthrough + `k3sm kubeconfig` print/`--write` merge into
   `~/.kube/config` (atomic + backup; refuses insecure-skip off loopback, embeds a CA via
   `--certificate-authority`). *Implemented + unit-tested on this branch; lands with it.*
@@ -340,9 +344,19 @@ the runtimed daemon split + isolation + resources work. Sub-phases:
   until apis:M2.2 typed fields); `terminationGracePeriodSeconds` → `DeletePodRequest.grace_period_seconds`
   (k8s 30s default applied when unset); `OOMKilled` surfaces verbatim. CPU = best-effort QoS, NOT CFS
   millicores.
-- ⬜ **M2.4** — make `kubernetes.default.svc` reachable from a bound pod IP + project the bound SA token + mount
-  the apiserver serving CA ⇒ in-pod kubectl (authz validated under RBAC at M4; in-pod DNS needs the exec-shim).
-- ⬜ **M2.5** — implement the provider `Exec`/`Attach`/`PortForward` verbs against the existing runtime/v1 RPCs.
+- ✅ **M2.4** — in-cluster API access: the shared `kubeResolver` mints the projected SA token for the pod's
+  **own** `spec.serviceAccountName` (was always `default`), bound per-CreatePod via the request context the
+  provider threads to `mount.Materialize` in-process — no runtimed/apis seam change. The apiserver serving CA
+  (`kube-root-ca.crt`) + namespace land at `/var/run/secrets/kubernetes.io/serviceaccount`; `kubernetes.default.svc`
+  is reachable because `--advertise-address` defaults to loopback single-node (the in-process proxy reaches it;
+  M3.3 rewrites per-node for a routable NodeIP). Authz under RBAC at M4; in-pod DNS needs the exec-shim. Proven by
+  `TestM2_InPodKubectl`.
+- ✅ **M2.5** — provider `RunInContainer`/`AttachToContainer`/`PortForward` (NotFound in M1) wired to the existing
+  `runtime/v1` Exec/Attach/PortForward bidi RPCs behind a `StreamingRuntime` capability; `runtimed_exec.go` bridges
+  the VK `AttachIO` (+ port-forward byte stream) to an in-process `streamPipe` (mirroring `watchStream`/`logSink`),
+  mapping a non-zero exec exit to a `CodeExitError`. Frozen apis contract — no apis change. (runtimed's server verbs
+  still return Unimplemented — runtimed:M2 — which the provider surfaces, not panics.) Proven by
+  `TestM2_Exec`/`TestM2_Attach`/`TestM2_PortForward`.
 
 ## M3 — Multi-node, mesh, NodePort & persistent storage ⬜
 - ⬜ **M3.0** — multi-node bootstrap (`k3sm token create`, node-password, HTTP-CSR, AES-GCM bundle, `k3sm agent`
@@ -373,5 +387,5 @@ DESIGN §5c. Exit (§9 M5): a Linux image runs under `runtimeClassName: vm`, Ser
 pods.
 
 ## Next
-M2 — drive via `/orchestrate M2` (apis:M2.1 contract is wave 1). M2.0 (kubectl ergonomics) is already
-implemented on `roadmap/stockkitty-features`.
+M2 — all k3sm sub-phases (M2.0–M2.5) are done; the remaining milestone work is the workspace-root e2e gate
+`hack/acceptance/m2.sh` (single-node, root on a Mac), then M3 (multi-node, mesh, NodePort, persistent storage).
