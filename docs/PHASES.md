@@ -108,14 +108,14 @@ phases:
             method: unit
       - id: M2.1
         title: Provider pod-spec fidelity — volumes, env, securityContext, grace
-        status: todo
+        status: done
         deliverables:
           - id: M2.1-d1
-            done: false
+            done: true
             desc: "pkg/provider translates the apis:M2.1 corev1 surface → runtime PodBox: volumes + volume_mounts (configMap/secret/emptyDir/downwardAPI/projected incl. serviceAccountToken), downward-API env (spec.nodeName/status.podIP/metadata.name) + envFrom (configMapRef/secretRef), securityContext (runAsUser/runAsGroup/fsGroup), terminationGracePeriodSeconds; derives the PAIRED ContainerStatus fields so kubectl Pod state stays a lossless mirror."
         acceptance:
           - id: M2.1-a1
-            met: false
+            met: true
             check: a pod with configMap+secret+emptyDir+downwardAPI mounts + downward-API env runs; kubectl describe shows the mounts/resources (status round-trip)
             method: e2e
       - id: M2.2
@@ -132,14 +132,14 @@ phases:
             method: e2e
       - id: M2.3
         title: Resources → Summary API (kubectl top) + OOMKilled
-        status: todo
+        status: done
         deliverables:
           - id: M2.3-d1
-            done: false
+            done: true
             desc: "surface runtimed:M2's proc_pid_rusage(ri_phys_footprint) metering to the kubelet Summary API so kubectl top reports a real footprint, and translate a userspace memory-limit kill to the OOMKilled reason. CPU limits are documented best-effort QoS (taskpolicy/setpriority), NOT CFS millicores."
         acceptance:
           - id: M2.3-a1
-            met: false
+            met: true
             check: kubectl top pod shows a non-zero footprint; a memory-limit breach yields phase=Failed reason=OOMKilled
             method: e2e
       - id: M2.4
@@ -323,11 +323,17 @@ the runtimed daemon split + isolation + resources work. Sub-phases:
 - ✅ **M2.0** — kubectl ergonomics: `k3sm kubectl` passthrough + `k3sm kubeconfig` print/`--write` merge into
   `~/.kube/config` (atomic + backup; refuses insecure-skip off loopback, embeds a CA via
   `--certificate-authority`). *Implemented + unit-tested on this branch; lands with it.*
-- ⬜ **M2.1** — provider translates volumes/mounts (configMap/secret/emptyDir/downwardAPI/projected-SA-token),
+- ✅ **M2.1** — provider translates volumes/mounts (configMap/secret/emptyDir/downwardAPI/projected-SA-token),
   downward-API env + `envFrom`, `securityContext`, `terminationGracePeriodSeconds` (apis:M2.1) + the paired
-  `ContainerStatus` (lossless mirror).
+  `ContainerStatus` (lossless mirror). Env is resolved provider-side into literal values (runtimed reads only
+  `EnvVar.value`); ConfigMap/Secret/SA-token + imagePullSecret data flow through the apiserver-backed
+  `mount.Resolver`/`CredentialResolver` runtimed seams.
 - ⬜ **M2.2** — provider-served liveness/readiness/startup probes → conditions + endpoints + restart.
-- ⬜ **M2.3** — runtimed `proc_pid_rusage` → Summary API (`kubectl top`) + `OOMKilled` (CPU = best-effort QoS).
+- ✅ **M2.3** — runtimed `proc_pid_rusage` (`ri_phys_footprint`) → Summary API (`kubectl top`) via the optional
+  `StatsSource` capability; memory limit rides the `k3sm.io/memory-limit-bytes` PodBox annotation (interim seam
+  until apis:M2.2 typed fields); `terminationGracePeriodSeconds` → `DeletePodRequest.grace_period_seconds`
+  (k8s 30s default applied when unset); `OOMKilled` surfaces verbatim. CPU = best-effort QoS, NOT CFS
+  millicores.
 - ⬜ **M2.4** — make `kubernetes.default.svc` reachable from a bound pod IP + project the bound SA token + mount
   the apiserver serving CA ⇒ in-pod kubectl (authz validated under RBAC at M4; in-pod DNS needs the exec-shim).
 - ⬜ **M2.5** — implement the provider `Exec`/`Attach`/`PortForward` verbs against the existing runtime/v1 RPCs.

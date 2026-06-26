@@ -82,7 +82,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		return fmt.Errorf("build client: %w", err)
 	}
 
-	prov, runtimeLabel, err := buildProvider(opts)
+	prov, runtimeLabel, err := buildProvider(opts, cs)
 	if err != nil {
 		return err
 	}
@@ -149,8 +149,9 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // buildProvider selects and constructs the VK provider for the requested
 // runtime. HostProcess is the default (M0 native processes, no isolation);
 // runtimed is the M1 image runtime (OCI pull → clonefile → ad-hoc-sign →
-// Seatbelt confine), wrapped in the VK adapter.
-func buildProvider(opts nodeOptions) (nodeutil.Provider, string, error) {
+// Seatbelt confine), wrapped in the VK adapter. cs is the apiserver client the
+// runtimed provider resolves volumes/env/imagePullSecrets with (M2.1/M2.6).
+func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider, string, error) {
 	switch opts.runtime {
 	case "", "hostprocess":
 		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP), "hostprocess", nil
@@ -160,6 +161,7 @@ func buildProvider(opts nodeOptions) (nodeutil.Provider, string, error) {
 			NodeIP:   opts.nodeIP,
 			Root:     opts.podRoot,
 			DyldShim: opts.dnsShim,
+			Client:   cs,
 		})
 		if err != nil {
 			return nil, "", fmt.Errorf("build runtimed provider: %w", err)
