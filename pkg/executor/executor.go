@@ -56,6 +56,31 @@ type Config struct {
 	// NodeIP is the node InternalIP; the apiserver advertises it and the kubelet
 	// preferred-address-types is set to InternalIP so logs/exec reach the node.
 	NodeIP string
+	// BindAddress is the address the apiserver binds. For a MULTI-NODE cluster it is
+	// the node's wireguard mesh IP so a joining node can reach the apiserver and the
+	// AlwaysAllow+token surface is NOT exposed on 0.0.0.0 or the LAN (docs/m3-plan.md
+	// — bind the mesh interface ONLY). Empty falls back to NodeIP (loopback for the
+	// single-node dev path), so M1/M2 are unchanged.
+	BindAddress string
+	// ClientCAFile, when set, is passed as --client-ca-file so node client certs
+	// (CN=system:node:<name>, signed by the signing CA) authenticate. Wired in M3
+	// even though the authorizer stays AlwaysAllow, so M4's Node,RBAC flip is a pure
+	// authorizer switch — not a node re-bootstrap.
+	ClientCAFile string
+	// KubeletCAFile, when set, is passed as --kubelet-certificate-authority so the
+	// apiserver verifies the kubelet-serving cert and remote exec/logs are not
+	// MITM-able.
+	KubeletCAFile string
+	// AnonymousAuth, when non-nil, sets --anonymous-auth explicitly. M3 multi-node
+	// sets it false; a nil pointer keeps the apiserver default (the M1/M2 path).
+	AnonymousAuth *bool
+	// ServingCertFile / ServingKeyFile, when both set, are passed as
+	// --tls-cert-file / --tls-private-key-file so the apiserver presents a cluster-CA
+	// -signed serving cert (instead of self-signing into --cert-dir). A joining node
+	// that pinned the cluster CA then verifies the apiserver via its kubeconfig
+	// certificate-authority-data. Empty keeps the M1/M2 self-signed path.
+	ServingCertFile string
+	ServingKeyFile  string
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
