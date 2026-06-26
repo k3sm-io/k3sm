@@ -1,0 +1,211 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"flag"
+	"fmt"
+	"log"
+	"log/slog"
+	"net/netip"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+
+	"k8s.io/client-go/tools/clientcmd"
+
+	"k3sm.io/darwin-net/pkg/mesh"
+
+	"k3sm.io/k3sm/pkg/bootstrap"
+)
+
+// agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
+// WORKER node.
+type agentOptions struct {
+	server   string // control-plane mesh host (the join + apiserver target)
+	token    string // K10<caHash>::<user>:<secret>
+	nodeName string
+	nodeIP   string // this node's mesh InternalIP (bound into the issued certs)
+	workDir  string
+	podRoot  string
+	rtName   string
+	dnsShim  string
+	apiPort  int
+	meshPort int
+}
+
+// runAgent joins this Mac to an existing cluster: it CA-pins the server (via the
+// token's cluster-CA hash), submits a node-password + CSRs, receives a node-scoped
+// system:node credential (NOT the admin kubeconfig), enrolls into the wireguard mesh,
+// and registers as a Virtual Kubelet node off its node cert. The mesh bring-up (root
+// utun) and the live two-Mac round-trip are the K3SM_LAB gate.
+func runAgent(args []string) error {
+	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+	opts := agentOptions{}
+	fs.StringVar(&opts.server, "server", "", "control-plane mesh host (e.g. 100.64.0.1) to join")
+	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN)")
+	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
+	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
+	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	fs.StringVar(&opts.rtName, "runtime", "hostprocess", "pod runtime: hostprocess or runtimed")
+	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
+	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
+	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
+	_ = fs.Parse(args)
+
+	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {
+		return fmt.Errorf("--server, --token, and --node-ip are required")
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := os.MkdirAll(opts.workDir, 0o755); err != nil {
+		return fmt.Errorf("create agent work dir: %w", err)
+	}
+
+	// node-password: mint once, persist 0600, reuse across restarts so the
+	// first-write-wins binding keeps matching.
+	password, err := loadOrCreateNodePassword(opts.workDir)
+	if err != nil {
+		return err
+	}
+
+	bootstrapURL := fmt.Sprintf("https://%s:%d", opts.server, bootstrapPort)
+	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName, "nodeIP", opts.nodeIP)
+	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
+		Server:       bootstrapURL,
+		Token:        opts.token,
+		NodeName:     opts.nodeName,
+		NodeIP:       opts.nodeIP,
+		NodePassword: password,
+		MeshEndpoint: fmt.Sprintf("%s:%d", opts.nodeIP, opts.meshPort),
+	})
+	if err != nil {
+		return fmt.Errorf("join: %w", err)
+	}
+	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
+
+	apiserverURL := fmt.Sprintf("https://%s:%d", opts.server, opts.apiPort)
+	kubeconfigPath := filepath.Join(opts.workDir, "node.kubeconfig")
+	if err := writeNodeKubeconfig(kubeconfigPath, apiserverURL, opts.nodeName, res); err != nil {
+		return err
+	}
+
+	// Bring up the wireguard mesh (Start is the root utun leg) and keep it converging
+	// via the MeshPeer watch.
+	if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, logger); err != nil {
+		return fmt.Errorf("mesh bring-up: %w", err)
+	}
+
+	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
+	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
+	return startNode(ctx, nodeOptions{
+		kubeconfig: kubeconfigPath,
+		nodeName:   opts.nodeName,
+		listen:     ":10250",
+		podRoot:    opts.podRoot,
+		nodeIP:     opts.nodeIP,
+		runtime:    opts.rtName,
+		dnsShim:    opts.dnsShim,
+		serveTLS:   true,
+	})
+}
+
+// bringUpMesh constructs the node's wireguard mesh for its assigned pod /24, brings
+// the device up (root utun), programs the initial peer snapshot, and starts the
+// MeshPeer watch so endpoint/key changes reconverge. The device Up/Apply calls are
+// the privileged legs exercised live (the two-Mac lab gate).
+func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, kubeconfigPath string, logger *slog.Logger) error {
+	self, err := netip.ParsePrefix(res.PodCIDR)
+	if err != nil {
+		return fmt.Errorf("parse assigned podCIDR %q: %w", res.PodCIDR, err)
+	}
+	m, err := mesh.New(self,
+		mesh.WithPrivateKey(res.WGPrivateKeyB64),
+		mesh.WithListenPort(meshPort),
+		mesh.WithLogger(logger))
+	if err != nil {
+		return fmt.Errorf("build mesh: %w", err)
+	}
+	if err := m.Start(ctx); err != nil {
+		return fmt.Errorf("start mesh device: %w", err)
+	}
+	if err := m.Reconcile(ctx, res.Peers); err != nil {
+		logger.Error("initial mesh reconcile", "err", err)
+	}
+
+	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("load node kubeconfig for mesh watch: %w", err)
+	}
+	watcher, err := mesh.NewWatcher(restCfg, m, logger)
+	if err != nil {
+		return fmt.Errorf("build mesh watcher: %w", err)
+	}
+	go func() {
+		if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("mesh watcher", "err", err)
+		}
+		_ = m.Close(context.WithoutCancel(ctx))
+	}()
+	return nil
+}
+
+// loadOrCreateNodePassword reads the node's persisted node-password (0600), minting
+// and persisting a fresh one on first run. Reusing it across restarts keeps the
+// server's first-write-wins binding matching.
+func loadOrCreateNodePassword(workDir string) (string, error) {
+	path := filepath.Join(workDir, "node-password")
+	if b, err := os.ReadFile(path); err == nil {
+		return string(b), nil
+	}
+	pw, err := bootstrap.GenerateNodePassword()
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(pw), 0o600); err != nil {
+		return "", fmt.Errorf("persist node-password: %w", err)
+	}
+	return pw, nil
+}
+
+// writeNodeKubeconfig writes a 0600 kubeconfig that authenticates as the issued
+// system:node identity (client cert + key) and verifies the apiserver against the
+// cluster CA the join returned — NOT an insecure-skip-tls-verify admin token.
+func writeNodeKubeconfig(path, server, nodeName string, res *bootstrap.JoinResult) error {
+	b64 := base64.StdEncoding.EncodeToString
+	content := fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: k3sm
+  cluster:
+    server: %q
+    certificate-authority-data: %s
+contexts:
+- name: k3sm
+  context:
+    cluster: k3sm
+    user: %s
+current-context: k3sm
+users:
+- name: %s
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+`,
+		server,
+		b64(res.ClusterCAPEM),
+		"system:node:"+nodeName,
+		"system:node:"+nodeName,
+		b64(res.NodeClientCertPEM),
+		b64(res.NodeClientKeyPEM),
+	)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("write node kubeconfig: %w", err)
+	}
+	return nil
+}
