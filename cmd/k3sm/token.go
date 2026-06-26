@@ -32,7 +32,13 @@ func runToken(args []string) error {
 // credential. It is stored hashed (bcrypt) in the work dir's bootstrap-token store.
 func runTokenCreate(args []string) error {
 	fs := flag.NewFlagSet("token create", flag.ExitOnError)
-	workDir := fs.String("work-dir", executor.DefaultWorkDir, "control-plane state root (the cluster CA + token store live here)")
+	// Posture-aware default (the _k3sm control plane writes <home>/server, not the
+	// root-only const); a resolve failure falls back to the const, overridable.
+	defaultWorkDir, err := executor.ResolveWorkDir()
+	if err != nil {
+		defaultWorkDir = executor.DefaultWorkDir
+	}
+	workDir := fs.String("work-dir", defaultWorkDir, "control-plane state root (the cluster CA + token store live here)")
 	ttl := fs.Duration("ttl", 24*time.Hour, "token time-to-live (must be positive)")
 	_ = fs.Parse(args)
 

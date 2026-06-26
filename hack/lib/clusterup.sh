@@ -112,9 +112,15 @@ server_up() {
 	mkdir -p "$BIN" "$SERVER_WORKDIR"
 	( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/kubectl-dl" ./cmd/k3sm >/dev/null 2>&1 ) || true
 	# The server downloads/ad-hoc-signs the CP binaries + kubectl into its workdir.
+	# --network none: this is the NON-ROOT CI/dev bring-up, so run the control plane
+	# + node WITHOUT the privileged host-network datapath (no lo0/utun plumbing) and
+	# WITHOUT the helper probe — an explicit control-plane-only backend (the network
+	# analog of a noop CNI), NOT a production fallback. Real networking is the
+	# acceptance/lab tier via `sudo k3sm install` (hack/acceptance/m2.sh). The lo0/
+	# DNS data-path leg was always root-gated, so this preserves M1's assertions.
 	nohup env CGO_ENABLED=1 go run "$REPO_ROOT/cmd/k3sm" server \
 		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
-		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" \
+		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network none \
 		> "$K3SM_WORKDIR/server.log" 2>&1 &
 	SERVER_PID=$!
 
