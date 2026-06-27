@@ -31,6 +31,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/provider"
+	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
 // compile-time check that the VK adapter satisfies the full VK provider contract.
@@ -229,6 +230,14 @@ func configureNode(n *corev1.Node, name, ip string) {
 	n.Labels["k3sm.io/native"] = "true"
 	n.Labels["type"] = "k3sm"
 
+	// vm RuntimeClass node-capability gate (M5.1): advertise the
+	// Virtualization.framework backend via the k3sm.io/virtualization label ONLY when
+	// this node can run it, so the vm RuntimeClass nodeSelector pins vm pods to a
+	// capable node. nodeVMCapable is false today (k3sm has no per-backend availability
+	// signal — see its doc), so the label is absent and a vm pod stays Unschedulable —
+	// the fail-closed posture for a non-VZ cluster.
+	applyVirtualizationLabel(n, nodeVMCapable())
+
 	n.Status.NodeInfo.OperatingSystem = "darwin"
 	n.Status.NodeInfo.Architecture = "arm64"
 	n.Status.NodeInfo.KubeletVersion = "k3sm-m1"
@@ -254,6 +263,39 @@ func configureNode(n *corev1.Node, name, ip string) {
 		Effect: corev1.TaintEffectNoSchedule,
 	})
 }
+
+// applyVirtualizationLabel sets (vmCapable) or clears (!vmCapable) the
+// k3sm.io/virtualization node label the vm RuntimeClass pins its nodeSelector to.
+// The label is present (value "true") only when the node can run the
+// Virtualization.framework backend; otherwise it is removed, so a vm pod has no node
+// to land on and stays Unschedulable — the fail-closed posture for a non-VZ cluster.
+// Clearing (not merely omitting) handles a node that loses VZ capability across a
+// restart.
+func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
+	if n.Labels == nil {
+		n.Labels = map[string]string{}
+	}
+	if vmCapable {
+		n.Labels[runtimeclass.LabelVirtualization] = runtimeclass.LabelTrue
+		return
+	}
+	delete(n.Labels, runtimeclass.LabelVirtualization)
+}
+
+// nodeVMCapable reports whether this node can run the vm RuntimeClass backend
+// (Virtualization.framework + the com.apple.security.virtualization entitlement) —
+// the source of truth for the k3sm.io/virtualization node label.
+//
+// It returns false TODAY, by design: runtimed's GetRuntimeInfo RPC reports only the
+// SELECTED host-process backend's health (one "SandboxBackend" condition), NOT
+// per-backend (VZ) availability, so k3sm has no truthful signal to set the label
+// from — and the foundation must not FAKE it. Defaulting the label ABSENT is
+// fail-closed: no VZ node ⇒ a vm pod stays Pending/Unschedulable, complementing
+// runtimed's runtime-refusal backstop (sandbox.ErrBackendUnavailable on a vm
+// CreatePod). Lighting this up needs a runtimed GetRuntimeInfo per-backend
+// availability extension (a reported M5.1 cross-repo need); the provider would query
+// it once at node bring-up and thread the result here.
+func nodeVMCapable() bool { return false }
 
 // providerTaintKey is the k3sm provider taint placed on every k3sm node.
 const providerTaintKey = "k3sm.io/provider"

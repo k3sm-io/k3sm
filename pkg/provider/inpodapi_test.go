@@ -148,7 +148,10 @@ func TestM2_InPodKubectl(t *testing.T) {
 
 		// Build the PodBox and bind the pod's SA exactly as the provider's
 		// CreatePod does, then run the runtimed materializer at the seam.
-		box := toPodBox(pod, "10.0.0.9", dataVol, "")
+		box, err := toPodBox(pod, "10.0.0.9", dataVol, "")
+		if err != nil {
+			t.Fatalf("toPodBox: %v", err)
+		}
 		ctx := withServiceAccount(context.Background(), podServiceAccount(pod))
 		layout, err := mount.Materialize(ctx, box, dataVol, "10.0.0.9", newKubeResolver(cs))
 		if err != nil {
