@@ -153,6 +153,7 @@ func runAgent(args []string) error {
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
+		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		serveTLS:   true,
 	})
 }

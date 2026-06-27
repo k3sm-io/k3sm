@@ -89,6 +89,17 @@ type RuntimedConfig struct {
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES.
 	DyldShim string
+	// ResolverVIP is the cluster DNS Service VIP (10.43.0.10) the per-pod Seatbelt
+	// egress allow-list is scoped to (threaded into runtimed's sandbox.Posture), so
+	// a confined pod's DNS reaches the node-local resolver. Empty leaves runtimed's
+	// built-in default (sandbox.DefaultResolverVIP), which is NOT the k3sm VIP — the
+	// commands always set it from the cluster DNS VIP.
+	ResolverVIP string
+	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the kubernetes
+	// ClusterIP, 10.43.0.1) the per-pod Seatbelt egress is ADDITIONALLY scoped to,
+	// so a confined pod's in-cluster client-go (in-pod kubectl) can reach the API
+	// VIP. Empty emits no API-server egress rule.
+	APIServerVIP string
 	// DeniedUnixSocketPaths are AF_UNIX socket paths every pod's SBPL denies
 	// connect() to (the root k3sm-netd helper socket): pods run as the same _k3sm
 	// uid as the legitimate helper client, so the socket must be denied at the
@@ -126,6 +137,11 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",
 		Logger:         log,
+		// Scope each pod's Seatbelt egress to the cluster DNS + API VIPs so a
+		// confined pod's DNS and in-pod client-go reach the node-local resolver /
+		// API VIP (M3.3). runtimed threads these into its per-pod sandbox.Posture.
+		ResolverVIP:  cfg.ResolverVIP,
+		APIServerVIP: cfg.APIServerVIP,
 	}, runtimed.Deps{
 		Resolver:    resolver,
 		Credentials: creds,

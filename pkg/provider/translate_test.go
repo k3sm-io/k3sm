@@ -13,6 +13,24 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
+// TestM3_3_ToPodBoxAllowsClusterNetwork confirms the provider sets
+// SandboxProfile.AllowNetwork=true for an ordinary pod — the precondition for
+// runtimed's per-pod Seatbelt egress rules (the cluster DNS + API VIPs) to be
+// emitted at all (those rules are gated on AllowNetwork). Cluster networking is
+// the normal case; a no-network pod would be the exception. Maps to M3.3-a1.
+func TestM3_3_ToPodBoxAllowsClusterNetwork(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web", UID: types.UID("uid-web")},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "c0", Image: "registry/web:latest"}},
+		},
+	}
+	box := toPodBox(pod, "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "")
+	if !box.GetSandboxProfile().GetAllowNetwork() {
+		t.Error("AllowNetwork must be true so the cluster DNS + API-server Seatbelt egress rules are emitted (in-pod DNS + kubectl)")
+	}
+}
+
 // TestToPodBoxFillsGate verifies the corev1.Pod→PodBox translation fills the
 // fail-closed gate fields (SandboxProfile + a non-UNSPECIFIED SignaturePolicy)
 // and carries the DNS shim annotation, so runtimed's CreatePod does not refuse

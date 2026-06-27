@@ -269,7 +269,8 @@ func runServer(args []string) error {
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
-		serveTLS:   true, // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
+		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
 	})
 }
 
