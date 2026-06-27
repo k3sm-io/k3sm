@@ -181,9 +181,10 @@ func (s *Supervised) startKine(ctx context.Context) error {
 	)
 }
 
-// startAPIServer launches kube-apiserver against kine on the secure port. It
-// keeps the spike's AlwaysAllow + static-token posture (so the M0 node still
-// registers) and sets --kubelet-preferred-address-types=InternalIP so kubectl
+// startAPIServer launches kube-apiserver against kine on the secure port. From M4.1
+// it enforces --authorization-mode=Node,RBAC + the NodeRestriction admission plugin
+// (the static admin token stays system:masters so the in-process components are
+// RBAC-exempt) and sets --kubelet-preferred-address-types=InternalIP so kubectl
 // logs/exec reach the node by IP (closing the M0.3 gap).
 //
 // In-pod API reachability (M2.4): the apiserver binds 127.0.0.1 and the
@@ -196,11 +197,12 @@ func (s *Supervised) startKine(ctx context.Context) error {
 // the kubernetes endpoint must be rewritten to a node-local address per node so
 // infra VIPs are not blackholed over the mesh — that is M3.3, not here.
 //
-// The ServiceAccount admission plugin (in the default enabled set — no
-// --enable/disable-admission-plugins is passed) stamps spec.serviceAccountName
-// and injects the projected SA volume (token + kube-root-ca.crt + namespace) the
-// provider materializes; the root-ca-cert-publisher controller (kept by the
-// scoped --controllers "*") publishes kube-root-ca.crt to every namespace.
+// The ServiceAccount admission plugin (in the default enabled set — the M4.1
+// --enable-admission-plugins=NodeRestriction is ADDITIVE, so ServiceAccount stays
+// on) stamps spec.serviceAccountName and injects the projected SA volume (token +
+// kube-root-ca.crt + namespace) the provider materializes; the root-ca-cert-publisher
+// controller (kept by the scoped --controllers "*") publishes kube-root-ca.crt to
+// every namespace.
 //
 // NOTE: the DESIGN's --feature-gates=ConsistentListFromCache=false (the kine#577
 // watch-staleness mitigation) is NOT passed: in the pinned kwok-ci/k8s build
@@ -213,11 +215,14 @@ func (s *Supervised) startAPIServer(ctx context.Context) error {
 }
 
 // apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
-// the M3 trust posture is table-tested without booting the apiserver: the mesh
-// BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (so M4's
-// Node,RBAC flip is a pure authorizer switch), and --kubelet-certificate-authority
-// are all asserted here. The M1/M2 single-node path leaves the new fields zero, so
-// the binding falls back to NodeIP (loopback) and the new flags are omitted.
+// the M3/M4 trust posture is table-tested without booting the apiserver: the mesh
+// BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (so the flip
+// is a pure authorizer switch), --kubelet-certificate-authority, the
+// --authorization-mode (Node,RBAC by default, M4.1), and the NodeRestriction
+// admission plugin are all asserted here. It self-defaults the bind address and the
+// authorization mode (so a raw Config in a test renders the production posture); the
+// M1/M2 single-node path leaves the M3 fields zero, so the binding falls back to
+// NodeIP (loopback) and those flags are omitted.
 func apiServerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
 	bind := cfg.BindAddress
@@ -226,6 +231,10 @@ func apiServerArgs(cfg Config) []string {
 	}
 	if bind == "" {
 		bind = "127.0.0.1"
+	}
+	authzMode := cfg.AuthorizationMode
+	if authzMode == "" {
+		authzMode = DefaultAuthorizationMode
 	}
 	args := []string{
 		"--etcd-servers", "http://127.0.0.1:" + strconv.Itoa(cfg.KinePort),
@@ -242,7 +251,18 @@ func apiServerArgs(cfg Config) []string {
 		"--service-account-signing-key-file", saKeyPath(wd),
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",
 		"--token-auth-file", tokenFilePath(wd),
-		"--authorization-mode", "AlwaysAllow",
+		// M4.1: enforce the Node authorizer + RBAC (default-deny) instead of
+		// AlwaysAllow. The flip is pure — the in-process components carry the static
+		// admin token (system:masters, RBAC-exempt) and joined workers' system:node
+		// identities get a pre-provisioned datapath grant (pkg/rbac.Provision) before
+		// the VK node / join supervisor start.
+		"--authorization-mode", authzMode,
+		// Add NodeRestriction to the default-enabled admission set (--enable-admission-
+		// plugins is ADDITIVE, so the ServiceAccount plugin M2.4 relies on stays on).
+		// It confines a system:node:<name> identity to mutating only its OWN Node/Pod
+		// objects — the admission half of the Node authorizer. It does NOT cover CRDs,
+		// so the net.k3sm.io/MeshPeer write stays guarded by bootstrap.AuthorizeMeshPeerWrite.
+		"--enable-admission-plugins=NodeRestriction",
 		"--bind-address", bind,
 		"--advertise-address", cfg.NodeIP,
 		"--secure-port", strconv.Itoa(cfg.APIServerPort),

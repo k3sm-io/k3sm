@@ -12,12 +12,18 @@ import (
 var ErrForbiddenPeer = errors.New("bootstrap: a node may write only its own MeshPeer")
 
 // AuthorizeMeshPeerWrite reports whether the authenticated node (system:node:<nodeName>)
-// may write the MeshPeer named peerName. Under M3's AlwaysAllow authorizer the
-// mesh-enroll is controller-mediated, and a node may write ONLY its own MeshPeer
-// (peerName == nodeName). A forged peer — an attacker advertising AllowedIPs over a
-// victim's podCIDR with an attacker-controlled endpoint — would hijack all cross-node
-// traffic to that podCIDR, so this guard is the load-bearing routing-integrity check
-// until NodeRestriction proper lands in M4. It returns ErrForbiddenPeer otherwise.
+// may write the MeshPeer named peerName. The mesh-enroll is controller-mediated: a
+// node may write ONLY its own MeshPeer (peerName == nodeName). A forged peer — an
+// attacker advertising AllowedIPs over a victim's podCIDR with an attacker-controlled
+// endpoint — would hijack all cross-node traffic to that podCIDR.
+//
+// This guard is PERMANENT, not an interim stand-in. M4.1's NodeRestriction admission
+// plugin covers only the core node-owned resources (Node/Pod and their status); it
+// never covers a CRD, so it does not — and will not — constrain a node's write to the
+// net.k3sm.io/MeshPeer object. Under the M4.1 Node,RBAC authorizer the node identity
+// gets meshpeers READ (via pkg/rbac's node-datapath ClusterRole) but no write verb, so
+// the WRITE stays server-mediated through this check. It returns ErrForbiddenPeer
+// otherwise.
 func AuthorizeMeshPeerWrite(nodeName, peerName string) error {
 	if nodeName == "" || peerName == "" {
 		return fmt.Errorf("%w: empty node %q or peer %q", ErrForbiddenPeer, nodeName, peerName)

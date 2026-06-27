@@ -92,6 +92,39 @@ func TestApiserverNodePortRangeUnprivileged(t *testing.T) {
 	}
 }
 
+// TestApiserverArgsNodeRBAC is the M4.1 flip guard: the apiserver defaults to
+// --authorization-mode=Node,RBAC (NOT the old AlwaysAllow) and additively enables
+// the NodeRestriction admission plugin — even for a RAW Config (the pure function
+// self-defaults the mode, as it does the bind address). An explicit AuthorizationMode
+// (a deliberate diagnostic bring-up) is honored verbatim.
+func TestApiserverArgsNodeRBAC(t *testing.T) {
+	// Raw single-node Config (NOT run through withDefaults): the flip is the default.
+	cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+	args := apiServerArgs(cfg)
+
+	if got := flagValue(args, "--authorization-mode"); got != "Node,RBAC" {
+		t.Errorf("--authorization-mode = %q, want Node,RBAC (the M4.1 default flip)", got)
+	}
+	if got := flagValue(args, "--authorization-mode"); got == "AlwaysAllow" {
+		t.Errorf("--authorization-mode must no longer be AlwaysAllow")
+	}
+	if !hasArg(args, "--enable-admission-plugins=NodeRestriction") {
+		t.Errorf("--enable-admission-plugins=NodeRestriction must be set (additive), args=%v", args)
+	}
+
+	// withDefaults fills the same value (so the running executor matches the args).
+	if got := flagValue(apiServerArgs(cfg.withDefaults()), "--authorization-mode"); got != "Node,RBAC" {
+		t.Errorf("withDefaults --authorization-mode = %q, want Node,RBAC", got)
+	}
+
+	// An explicit mode is honored (e.g. a diagnostic AlwaysAllow bring-up).
+	diag := cfg
+	diag.AuthorizationMode = "AlwaysAllow"
+	if got := flagValue(apiServerArgs(diag), "--authorization-mode"); got != "AlwaysAllow" {
+		t.Errorf("explicit --authorization-mode = %q, want AlwaysAllow (honored verbatim)", got)
+	}
+}
+
 // TestApiserverArgsSingleNodeDefault confirms the M1/M2 single-node path is
 // unchanged: with the new fields zero, the apiserver binds loopback (via NodeIP) and
 // the new M3 flags are omitted.

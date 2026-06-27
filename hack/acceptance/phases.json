@@ -1,10 +1,12 @@
 {
-  "_comment": "Machine-readable gate manifest for /orchestrate. Each milestone maps to the single command that PROVES it (exit 0 = met). tier: which test tier the gate runs at. requires: host capabilities. manual: true gates run only under K3SM_LAB=1 (else reported 'pending lab', never auto-greened). Gates for unstarted milestones (m1.sh, ...) are authored as that milestone's work runs.",
+  "_comment": "Machine-readable gate manifest for /orchestrate. Each milestone maps to the single command that PROVES it (exit 0 = met). tier: which test tier the gate runs at. requires: host capabilities. manual: true gates run only under K3SM_LAB=1 (else reported 'pending lab', never auto-greened). Gates for unstarted milestones are authored as that milestone's work runs. STRUCTURE: a milestone with BOTH a CI-runnable integration slice and a lab-only slice has two rows — the canonical M<n> key is the integration gate that runs in CI; the M<n>-lab key is the lab gate (two-macs/vz, manual). M3 splits this way (single-node NodePort+PVC integration vs cross-node mesh/DNS lab); M4 splits this way (RBAC/conformance integration vs packaging/launchd lab).",
   "M0": { "gate": "hack/acceptance/m0.sh", "tier": "e2e",         "requires": ["dev-mac"],                "manual": false },
   "M1": { "gate": "hack/acceptance/m1.sh", "tier": "e2e",         "requires": ["dev-mac"],                "manual": false },
   "M2": { "gate": "hack/acceptance/m2.sh", "tier": "integration", "requires": ["dev-mac", "root"],        "manual": false },
-  "M3": { "gate": "hack/lab/m3.sh",        "tier": "lab",         "requires": ["two-macs"],               "manual": true },
-  "M4": { "gate": "hack/lab/m4.sh",        "tier": "lab",         "requires": ["macos-runner", "reboot"], "manual": true },
+  "M3": { "gate": "hack/acceptance/m3.sh", "tier": "integration", "requires": ["dev-mac", "root"],        "manual": false },
+  "M3-lab": { "gate": "hack/lab/m3.sh",    "tier": "lab",         "requires": ["two-macs"],               "manual": true },
+  "M4": { "gate": "hack/acceptance/m4.sh", "tier": "integration", "requires": ["dev-mac"],                "manual": false },
+  "M4-lab": { "gate": "hack/lab/m4.sh",    "tier": "lab",         "requires": ["macos-runner", "reboot"], "manual": true },
   "M5": { "gate": "hack/lab/m5.sh",        "tier": "lab",         "requires": ["vz"],                     "manual": true },
   "M6": { "gate": "hack/lab/m6.sh",        "tier": "lab",         "requires": ["two-macs", "postgres"],   "manual": true }
 }

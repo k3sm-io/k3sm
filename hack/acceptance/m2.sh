@@ -17,6 +17,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+. "$HERE/../lib/conformance.sh"
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -87,19 +88,32 @@ ladder "$([ "$healthy" = yes ] && echo ok || echo no)" "m2.3  control plane heal
 kube_owner="$(stat -f '%Su' "$KUBECONFIG_PATH" 2>/dev/null || echo '')"
 ladder "$([ "$kube_owner" = "$INVOKING_USER" ] && echo ok || echo no)" "m2.3  admin kubeconfig owned by $INVOKING_USER (NOT root)"
 
-# m2.A — the typed M2 fidelity + helper-protocol suite (pod-to-pod over real pod
-# IPs, ClusterIP VIP, Seatbelt /Users-denied, OOMKilled, kubectl top, peer-auth
-# rejection, out-of-policy-request rejection). Run user-space against the running
-# cluster. GUARD the vacuous green: an absent/empty TestM2 (no tests matched)
-# must FAIL the gate, never false-green.
-e2e_out="$(cd "$REPO_ROOT" && CGO_ENABLED=1 go test -tags e2e -run TestM2 -timeout 600s -v ./e2e/... 2>&1)" && e2e_rc=0 || e2e_rc=1
-echo "$e2e_out" | sed 's/^/    /'
-if echo "$e2e_out" | grep -qE 'no tests to run|warning: no tests to run'; then
-	ladder no "m2.A  TestM2 fidelity suite ran (VACUOUS: -run TestM2 matched no tests — author e2e/m2_test.go)"
-elif [ "$e2e_rc" -eq 0 ] && echo "$e2e_out" | grep -qE '^(ok|PASS|--- PASS: TestM2)'; then
-	ladder ok "m2.A  TestM2 fidelity + helper-protocol suite (pod-to-pod, ClusterIP, Seatbelt, OOMKilled, top, peer-auth, out-of-policy)"
+# m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
+# named per its stockkitty-readiness feature class. The NON-VACUOUS guard
+# (hack/lib/conformance.sh) enumerates the REQUIRED criterion set below and turns
+# the gate RED on any criterion that is missing, failed, OR skipped — closing the
+# old guard's PARTIAL-coverage and ALL-SKIP false-greens. Deferred criteria
+# (TestM2_ImagePullSecrets / _DaemonSet) are t.Skip'd TODOs absent from this list,
+# so their skip is allowed and visible. The full TestM2 set is run (so deferred
+# skips print) but only the required list gates.
+#
+# The conformance helper binaries (e2e/testdata/cmd) are built+ad-hoc-signed by the
+# suite's TestMain into $K3SM_CONFORMANCE_BIN; that dir must be world-readable and
+# on a path the default-deny Seatbelt profile admits for exec by the _k3sm pods.
+# OPEN INTEGRATION ITEM: the exact profile-admitted path is validated on a dev Mac;
+# /tmp here is the conventional world-accessible default. ($KUBECONFIG was exported
+# to the human's ~/.kube/config in the m2.3 step above.)
+export K3SM_CONFORMANCE_BIN="/tmp/k3sm-conformance-bin"
+mkdir -p "$K3SM_CONFORMANCE_BIN"; chmod 755 "$K3SM_CONFORMANCE_BIN"
+M2_CRITERIA=(
+	M2_ConfigMapMount M2_SecretMount M2_EmptyDir M2_DownwardAPIEnv M2_EnvFrom
+	M2_Probes M2_FsGroup M2_GracefulStop M2_ResourceLimitsOOMKilled M2_KubectlTop
+	M2_InPodKubectl M2_InPodDNS M2_DenyUsers
+)
+if run_conformance_slice "$REPO_ROOT" "TestM2" 600s "${M2_CRITERIA[@]}"; then
+	ladder ok "m2.A  M2 conformance suite (all ${#M2_CRITERIA[@]} required criteria PASS, none skipped)"
 else
-	ladder no "m2.A  TestM2 fidelity + helper-protocol suite"
+	ladder no "m2.A  M2 conformance suite (a required criterion missing, failed, or skipped)"
 fi
 
 # m2.4 — uninstall cleanliness: both daemons booted out, install dir removed,
