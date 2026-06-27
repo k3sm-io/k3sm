@@ -37,6 +37,23 @@ func TestPodDNSConfigUsesDarwinNetSeam(t *testing.T) {
 	}
 }
 
+// TestNetdSocketConstructs proves the unprivileged posture (a non-empty
+// NetdSocket) constructs the proxy with the netd-helper backend without panic —
+// the construction-time selection of the helper alias/binder over the direct
+// root path. The helper-vs-direct decision itself is table-tested in pkg/hostnet.
+func TestNetdSocketConstructs(t *testing.T) {
+	s := New(Config{
+		Client:        fake.NewClientset(),
+		WorkDir:       t.TempDir(),
+		DNSVIP:        "10.43.0.10",
+		ClusterDomain: "cluster.local",
+		NetdSocket:    "/var/lib/k3sm/run/netd.sock",
+	})
+	if s == nil || s.proxy == nil {
+		t.Fatal("New with a NetdSocket must build a proxy routed through the helper")
+	}
+}
+
 // TestWriteCorefile checks the rendered CoreDNS config binds the DNS VIP and
 // serves the cluster domain via the kubernetes plugin.
 func TestWriteCorefile(t *testing.T) {

@@ -51,10 +51,16 @@ func resolveKubectl(workDir string) (string, error) {
 }
 
 // workDirFromEnv resolves the control-plane work dir, honoring K3SM_WORK_DIR so
-// the kubectl/kubeconfig verbs agree with `k3sm server --work-dir`.
+// the kubectl/kubeconfig verbs agree with `k3sm server --work-dir`. With no
+// override it uses the posture-aware default (the _k3sm control plane writes
+// <home>/server, not the root-only const), falling back to the const on a
+// resolve failure.
 func workDirFromEnv() string {
 	if d := os.Getenv("K3SM_WORK_DIR"); d != "" {
 		return d
+	}
+	if wd, err := executor.ResolveWorkDir(); err == nil {
+		return wd
 	}
 	return executor.DefaultWorkDir
 }

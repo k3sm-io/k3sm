@@ -69,3 +69,53 @@ func TestEnsureDarwinAdmissionIdempotent(t *testing.T) {
 		t.Fatalf("second provision (idempotent): %v", err)
 	}
 }
+
+// TestEnsureNoForeignUserAdmission verifies the foreign-user policy is created
+// with a Deny binding and a CEL expression that pins runAsUser/fsGroup to the
+// allowed (_k3sm) uid across the pod and container security contexts — so a pod
+// requesting a foreign uid is rejected, not silently coerced.
+func TestEnsureNoForeignUserAdmission(t *testing.T) {
+	cs := fake.NewClientset()
+	ctx := context.Background()
+
+	const allowedUID int64 = 271
+	if err := EnsureNoForeignUserAdmission(ctx, cs, allowedUID); err != nil {
+		t.Fatalf("EnsureNoForeignUserAdmission: %v", err)
+	}
+
+	pol, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, foreignUserPolicyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if len(pol.Spec.Validations) == 0 {
+		t.Fatal("policy has no validations")
+	}
+	expr := pol.Spec.Validations[0].Expression
+	for _, want := range []string{"runAsUser", "fsGroup", "271", "containers.all", "initContainers"} {
+		if !strings.Contains(expr, want) {
+			t.Errorf("CEL expression missing %q: %q", want, expr)
+		}
+	}
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionregistrationv1.Fail {
+		t.Error("failure policy must be Fail")
+	}
+
+	bind, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Get(ctx, foreignUserBindingName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	foundDeny := false
+	for _, a := range bind.Spec.ValidationActions {
+		if a == admissionregistrationv1.Deny {
+			foundDeny = true
+		}
+	}
+	if !foundDeny {
+		t.Error("binding must Deny a foreign-user pod")
+	}
+
+	// Idempotent on server restart.
+	if err := EnsureNoForeignUserAdmission(ctx, cs, allowedUID); err != nil {
+		t.Errorf("second provision must be idempotent: %v", err)
+	}
+}

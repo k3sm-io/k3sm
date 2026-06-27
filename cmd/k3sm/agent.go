@@ -18,7 +18,14 @@ import (
 	"k3sm.io/darwin-net/pkg/mesh"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 )
+
+// meshKeyRef is the conventional file name (under the root-only mesh key dir)
+// the netd helper resolves to this node's wireguard private key in helper mode;
+// the key itself never crosses the socket.
+const meshKeyRef = "node.key"
 
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.
@@ -33,6 +40,7 @@ type agentOptions struct {
 	dnsShim  string
 	apiPort  int
 	meshPort int
+	network  string // host-network backend: auto (default) | none | direct | helper
 }
 
 // runAgent joins this Mac to an existing cluster: it CA-pins the server (via the
@@ -53,6 +61,7 @@ func runAgent(args []string) error {
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
+	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	_ = fs.Parse(args)
 
 	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {
@@ -62,6 +71,19 @@ func runAgent(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// ONE construction-time decision (the `--network` backend): auto routes the mesh
+	// datapath through the root netd helper when unprivileged / uses the direct utun
+	// device as root; none skips the mesh datapath (and the probe) entirely. Fail
+	// fast if the helper is selected but unreachable.
+	mode, err := hostnet.Resolve(opts.network)
+	if err != nil {
+		return err
+	}
+	logger.Info("host-network backend", "network", opts.network, "backend", mode.Backend.String())
+	if err := mode.Probe(ctx); err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(opts.workDir, 0o755); err != nil {
 		return fmt.Errorf("create agent work dir: %w", err)
@@ -95,10 +117,15 @@ func runAgent(args []string) error {
 		return err
 	}
 
-	// Bring up the wireguard mesh (Start is the root utun leg) and keep it converging
-	// via the MeshPeer watch.
-	if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, logger); err != nil {
-		return fmt.Errorf("mesh bring-up: %w", err)
+	// Bring up the wireguard mesh (the root utun leg, direct or via the helper) and
+	// keep it converging via the MeshPeer watch. `--network none` skips the mesh
+	// datapath (control-plane-only / CI join); the node still registers below.
+	if mode.DataPath() {
+		if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, mode, logger); err != nil {
+			return fmt.Errorf("mesh bring-up: %w", err)
+		}
+	} else {
+		logger.Info("network datapath disabled (--network none): skipping wireguard mesh bring-up")
 	}
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
@@ -119,15 +146,26 @@ func runAgent(args []string) error {
 // the device up (root utun), programs the initial peer snapshot, and starts the
 // MeshPeer watch so endpoint/key changes reconverge. The device Up/Apply calls are
 // the privileged legs exercised live (the two-Mac lab gate).
-func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, kubeconfigPath string, logger *slog.Logger) error {
+func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, kubeconfigPath string, mode hostnet.Mode, logger *slog.Logger) error {
 	self, err := netip.ParsePrefix(res.PodCIDR)
 	if err != nil {
 		return fmt.Errorf("parse assigned podCIDR %q: %w", res.PodCIDR, err)
 	}
-	m, err := mesh.New(self,
-		mesh.WithPrivateKey(res.WGPrivateKeyB64),
-		mesh.WithListenPort(meshPort),
-		mesh.WithLogger(logger))
+	meshOpts := []mesh.Option{mesh.WithListenPort(meshPort), mesh.WithLogger(logger)}
+	if mode.UsesHelper() {
+		// Helper mode: the root netd daemon owns the utun/wireguard datapath and
+		// resolves the private key from a root-only path (the key never crosses the
+		// socket). Provision the key to that path (best-effort: in the pure _k3sm
+		// posture the root-only dir is privileged, so a privileged install/netd step
+		// owns provisioning — the agent passes only the ref).
+		if err := os.WriteFile(filepath.Join(install.MeshKeyDir, meshKeyRef), []byte(res.WGPrivateKeyB64), 0o600); err != nil {
+			logger.Warn("could not provision mesh private key to the root-only path (provision it via the privileged install step)", "path", filepath.Join(install.MeshKeyDir, meshKeyRef), "err", err)
+		}
+		meshOpts = append(meshOpts, mode.MeshOptions(meshKeyRef)...)
+	} else {
+		meshOpts = append(meshOpts, mesh.WithPrivateKey(res.WGPrivateKeyB64))
+	}
+	m, err := mesh.New(self, meshOpts...)
 	if err != nil {
 		return fmt.Errorf("build mesh: %w", err)
 	}
