@@ -23,6 +23,7 @@ import (
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provisioner"
+	"k3sm.io/k3sm/pkg/rbac"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -188,6 +189,20 @@ func runServer(args []string) error {
 			logger.Error("provision foreign-user admission policy", "err", err)
 		}
 	}
+
+	// 3b. M4.1 — provision the RBAC graph BEFORE the VK node (step 5) and the
+	// worker-join supervisor (step 4b) start, so a joining worker's system:node
+	// datapath bindings already exist when the Node,RBAC authorizer (the apiserver
+	// default since M4.1) evaluates its first request. FAIL-CLOSED: unlike the
+	// advisory admission policies above (log-and-continue), a provisioning failure
+	// HALTS bring-up — a half-applied graph under an enforcing authorizer silently
+	// locks workers out of services/endpointslices/meshpeers. It runs under the
+	// retained system:masters admin client (RBAC-exempt) with a bounded retry, so it
+	// succeeds even though the authorizer is already on (no two-phase restart).
+	if err := rbac.Provision(ctx, cs); err != nil {
+		return fmt.Errorf("provision rbac graph: %w", err)
+	}
+	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader); authorizer is Node,RBAC")
 
 	// 4. M1.4/M3.3 — host the node-local datapath: darwin-net's Service proxy
 	// (exempted from the DNS VIP, which the per-node resolver below owns) + the

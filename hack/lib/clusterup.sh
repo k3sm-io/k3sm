@@ -106,21 +106,30 @@ node_up() {
 # Virtual Kubelet node, in one process. It is the M1 replacement for
 # cluster_up+node_up. It points $KUBECONFIG + $CP_TOKEN at the server's own
 # kubeconfig/token, then waits for healthz and the node Ready.
-#   server_up [node-name] [runtime]    runtime = hostprocess (default) | runtimed
+#   server_up [node-name] [runtime] [network]
+#     runtime = hostprocess (default) | runtimed
+#     network = none (default) | direct | helper | auto
+#
+# network=none is the NON-ROOT CI/dev bring-up: run the control plane + node
+# WITHOUT the privileged host-network datapath (no lo0/utun plumbing) and WITHOUT
+# the helper probe — an explicit control-plane-only backend (the network analog of
+# a noop CNI), NOT a production fallback. M1's lo0/DNS data-path leg was always
+# root-gated, so none preserves M1's assertions.
+#
+# network=direct is the ROOT integration bring-up that DOES serve a datapath: the
+# Service proxy binds the wildcard *:nodePort listener directly and (with the
+# runtimed runtime) pods get routable lo0 IPs, so NodePort is reachable and
+# EndpointSlices populate. hack/acceptance/m3.sh uses `server_up <n> runtimed
+# direct` under root. NOTE: under sudo, `go run` compiles into root's GOCACHE (a
+# cold first build); that is expected for the integration tier.
 server_up() {
-	local node_name="${1:-k3sm-m1}" runtime="${2:-hostprocess}"
+	local node_name="${1:-k3sm-m1}" runtime="${2:-hostprocess}" network="${3:-none}"
 	mkdir -p "$BIN" "$SERVER_WORKDIR"
 	( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/kubectl-dl" ./cmd/k3sm >/dev/null 2>&1 ) || true
 	# The server downloads/ad-hoc-signs the CP binaries + kubectl into its workdir.
-	# --network none: this is the NON-ROOT CI/dev bring-up, so run the control plane
-	# + node WITHOUT the privileged host-network datapath (no lo0/utun plumbing) and
-	# WITHOUT the helper probe — an explicit control-plane-only backend (the network
-	# analog of a noop CNI), NOT a production fallback. Real networking is the
-	# acceptance/lab tier via `sudo k3sm install` (hack/acceptance/m2.sh). The lo0/
-	# DNS data-path leg was always root-gated, so this preserves M1's assertions.
 	nohup env CGO_ENABLED=1 go run "$REPO_ROOT/cmd/k3sm" server \
 		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
-		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network none \
+		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network "$network" \
 		> "$K3SM_WORKDIR/server.log" 2>&1 &
 	SERVER_PID=$!
 
