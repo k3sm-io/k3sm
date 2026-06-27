@@ -67,22 +67,22 @@ type Config struct {
 	BindAddress string
 	// ClientCAFile, when set, is passed as --client-ca-file so node client certs
 	// (CN=system:node:<name>, signed by the signing CA) authenticate. Wired in M3
-	// even though the authorizer stays AlwaysAllow, so M4's Node,RBAC flip is a pure
-	// authorizer switch — not a node re-bootstrap.
+	// (while the authorizer was still AlwaysAllow) precisely so M4.1's Node,RBAC flip
+	// is a pure authorizer switch — not a node re-bootstrap.
 	ClientCAFile string
 	// KubeletCAFile, when set, is passed as --kubelet-certificate-authority so the
 	// apiserver verifies the kubelet-serving cert and remote exec/logs are not
 	// MITM-able.
 	KubeletCAFile string
 	// AnonymousAuth, when non-nil, sets --anonymous-auth explicitly. withDefaults
-	// fills a nil pointer with FALSE: the user-space control plane runs as the
-	// unprivileged _k3sm user behind an AlwaysAllow authorizer, so an open
-	// anonymous surface would hand cluster-admin to any local process that can
-	// reach the apiserver port. The static bearer token (scheduler/CM/kubectl/
-	// healthz all carry it) is unaffected; only credential-less requests are
-	// rejected. The pure apiServerArgs still omits the flag for a nil pointer, so
-	// the M3 multi-node path (explicit false) and the arg-rendering tests are
-	// unchanged.
+	// fills a nil pointer with FALSE: under Node,RBAC (M4.1) anonymous requests map to
+	// system:anonymous and RBAC default-denies them, but closing the surface outright
+	// is defense-in-depth — it keeps an unauthenticated caller from probing the
+	// apiserver at all (and pre-M4.1, under AlwaysAllow, it was the only thing stopping
+	// anonymous cluster-admin). The static bearer token (scheduler/CM/kubectl/healthz
+	// all carry it) is unaffected; only credential-less requests are rejected. The pure
+	// apiServerArgs still omits the flag for a nil pointer, so the M3 multi-node path
+	// (explicit false) and the arg-rendering tests are unchanged.
 	AnonymousAuth *bool
 	// ServingCertFile / ServingKeyFile, when both set, are passed as
 	// --tls-cert-file / --tls-private-key-file so the apiserver presents a cluster-CA
@@ -91,6 +91,13 @@ type Config struct {
 	// certificate-authority-data. Empty keeps the M1/M2 self-signed path.
 	ServingCertFile string
 	ServingKeyFile  string
+	// AuthorizationMode is the apiserver --authorization-mode. Empty defaults to
+	// DefaultAuthorizationMode (Node,RBAC) — the M4.1 hard-cut flip from AlwaysAllow.
+	// The flip is pure because the in-process components authenticate with the static
+	// admin token (mapped to system:masters, which bypasses RBAC) and joined workers'
+	// system:node identities get a pre-provisioned datapath grant (pkg/rbac); set it
+	// to "AlwaysAllow" only for a deliberate diagnostic bring-up.
+	AuthorizationMode string
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -105,6 +112,10 @@ const (
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.
 	DefaultKinePort = 2379
+	// DefaultAuthorizationMode is the apiserver authorizer chain from M4.1 onward:
+	// the Node authorizer (scopes a kubelet/VK-node to its own objects) plus RBAC
+	// (default-deny). It replaces the M0–M3 AlwaysAllow posture.
+	DefaultAuthorizationMode = "Node,RBAC"
 	// DefaultWorkDir is the control-plane state root for the ROOT posture
 	// (explicit run-as-root mode). It is root-owned; the unprivileged _k3sm
 	// control plane cannot write here and uses ResolveWorkDir instead.
@@ -194,10 +205,14 @@ func (c Config) withDefaults() Config {
 	if c.NodeIP == "" {
 		c.NodeIP = "127.0.0.1"
 	}
+	if c.AuthorizationMode == "" {
+		c.AuthorizationMode = DefaultAuthorizationMode
+	}
 	if c.AnonymousAuth == nil {
-		// The user-space posture: close the anonymous surface by default so the
-		// AlwaysAllow authorizer cannot grant cluster-admin to a credential-less
-		// caller. Explicit settings (the M3 multi-node path) are preserved.
+		// Close the anonymous surface by default (defense-in-depth on top of the
+		// Node,RBAC default-deny): an unauthenticated caller is rejected outright
+		// rather than reaching the authorizer as system:anonymous. Explicit settings
+		// (the M3 multi-node path) are preserved.
 		anonOff := false
 		c.AnonymousAuth = &anonOff
 	}
