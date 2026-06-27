@@ -35,6 +35,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+. "$HERE/../lib/conformance.sh"
 
 # ── Lab guard: only run under K3SM_LAB=1 (a real two-Mac rig). ────────────────
 if [ "${K3SM_LAB:-}" != "1" ]; then
@@ -81,20 +82,25 @@ else
 fi
 export K3SM_WORKER="$WORKER"
 
-# m3.A — the typed M3 fidelity suite, pinned to the joined worker via $K3SM_WORKER:
-#   TestM3_NodePort                  (a) Deployment behind a NodePort reachable on *:nodePort
-#   TestM3_StatefulSetPVCPersistence (b) StatefulSet+PVC: write -> restart -> same data
-#   TestM3_InPodKubectlAndDNSOnWorker(c) on the WORKER: cluster DNS + in-pod kubectl to the node-local API VIP
-# GUARD the vacuous green: an absent/empty TestM3 (no tests matched) FAILS, never
-# false-greens (e2e/m3_test.go is authored on the two-Mac rig).
-e2e_out="$(cd "$REPO_ROOT" && CGO_ENABLED=1 go test -tags e2e -run TestM3 -timeout 900s -v ./e2e/... 2>&1)" && e2e_rc=0 || e2e_rc=1
-echo "$e2e_out" | sed 's/^/    /'
-if echo "$e2e_out" | grep -qE 'no tests to run|warning: no tests to run'; then
-	ladder no "m3.A  TestM3 fidelity suite ran (VACUOUS: -run TestM3 matched no tests — author e2e/m3_test.go on the rig)"
-elif [ "$e2e_rc" -eq 0 ] && echo "$e2e_out" | grep -qE '^(ok|PASS|--- PASS: TestM3)'; then
-	ladder ok "m3.A  TestM3 fidelity suite (NodePort, StatefulSet+PVC persistence, in-pod kubectl + cluster DNS on the joined worker)"
+# m3.A — the full M3 conformance suite, pinned to the joined worker via $K3SM_WORKER.
+# REQUIRED criteria (the non-vacuous guard turns a missing/failed/skipped one RED):
+#   TestM3_NodePort                   (a) Deployment behind a NodePort reachable on *:nodePort
+#   TestM3_PVCPersistsAcrossRestart   (b) StatefulSet+PVC: write -> restart -> same data
+#   TestM3_InPodKubectlAndDNSOnWorker (c) on the WORKER: cluster DNS + in-pod kubectl to the node-local API VIP
+# (a)+(b) also run single-node in hack/acceptance/m3.sh; (c) is two-Mac-only here.
+#
+# The conformance helper binaries (e2e/testdata/cmd) are built+ad-hoc-signed by the
+# suite's TestMain into $K3SM_CONFORMANCE_BIN on THIS host. NOTE: native pods exec a
+# host binary path, so the WORKER criterion requires the SAME helper binary to be
+# pre-staged on the worker Mac at the same $K3SM_CONFORMANCE_BIN path (there is no
+# image distribution); stage it before running this gate.
+export K3SM_CONFORMANCE_BIN="${K3SM_CONFORMANCE_BIN:-/tmp/k3sm-conformance-bin}"
+mkdir -p "$K3SM_CONFORMANCE_BIN"; chmod 755 "$K3SM_CONFORMANCE_BIN"
+M3_CRITERIA=(M3_NodePort M3_PVCPersistsAcrossRestart M3_InPodKubectlAndDNSOnWorker)
+if run_conformance_slice "$REPO_ROOT" "TestM3" 900s "${M3_CRITERIA[@]}"; then
+	ladder ok "m3.A  M3 conformance suite (NodePort, PVC persistence, in-pod kubectl + cluster DNS on the joined worker)"
 else
-	ladder no "m3.A  TestM3 fidelity suite"
+	ladder no "m3.A  M3 conformance suite (a required criterion missing, failed, or skipped)"
 fi
 
 echo "----------------------------------------"
