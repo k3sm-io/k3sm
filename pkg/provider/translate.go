@@ -1,10 +1,12 @@
 package provider
 
 import (
+	"fmt"
 	"strconv"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -41,7 +43,13 @@ const defaultGraceSeconds int64 = 30
 
 // toPodBox translates a corev1.Pod into the runtime PodBox runtimed consumes. It
 // FILLS sandbox_profile and signature_policy so runtimed's fail-closed gate
-// passes: an empty profile or UNSPECIFIED policy makes CreatePod refuse the pod.
+// passes: a nil profile or an UNSPECIFIED signature policy makes CreatePod refuse
+// the pod. (The sandbox BACKEND may be UNSPECIFIED — that is the host-process
+// default; see podSandboxBackend.)
+//
+// It returns an error — failing closed — when the pod names a RuntimeClass with no
+// backend mapping (runtimev1.ErrUnknownHandler), so a pod that asked for an
+// isolation class k3sm cannot satisfy is refused rather than silently downgraded.
 //
 // rootfsRoot is the per-pod-dir parent; dyldShim, when non-empty, is wired into
 // the annotation runtimed copies to DYLD_INSERT_LIBRARIES (the DNS shim).
@@ -49,7 +57,7 @@ const defaultGraceSeconds int64 = 30
 // Container env is carried STRUCTURALLY here (literal value, valueFrom, envFrom);
 // resolvePodBoxEnv flattens it into literal values before the box is sent to
 // runtimed, which reads only EnvVar.value (it never talks to the apiserver).
-func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) *runtimev1.PodBox {
+func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
 		Namespace:   pod.Namespace,
@@ -98,15 +106,108 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) *runtimev1.Po
 		box.TerminationGracePeriodSeconds = *g
 	}
 
+	// Resolve the pod's RuntimeClass to its isolation backend (M5.1). A pod with no
+	// runtimeClassName resolves to SANDBOX_BACKEND_UNSPECIFIED — NOT a hardcoded
+	// Seatbelt rung — so runtimed's SelectBackend(UNSPECIFIED,…) walks the
+	// host-OS-version-gated Seatbelt ladder and picks the correct rung for the host
+	// (SEATBELT_INPROC where libsandbox is present); runtimeClassName: vm resolves to
+	// SANDBOX_BACKEND_VM (the Virtualization.framework micro-VM); an unknown handler
+	// FAILS CLOSED here rather than downgrading a pod that requested stronger
+	// isolation onto the host-process path.
+	backend, err := podSandboxBackend(pod)
+	if err != nil {
+		return nil, err
+	}
 	// data_volume_path is the only path the pod may write; default-deny otherwise.
 	// allow_network is true so the pod can reach the Service proxy + CoreDNS VIP
-	// (runtime scopes it to the pod IP). Seatbelt exec is the M1 backend.
+	// (runtime scopes it to the pod IP).
 	box.SandboxProfile = &runtimev1.SandboxProfile{
-		Backend:        runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_EXEC,
+		Backend:        backend,
 		DataVolumePath: rootfsRoot,
 		AllowNetwork:   true,
 	}
-	return box
+	// For a vm pod, size the guest from the pod's cpu/memory (the VZ vCPU count +
+	// RAM; 0 leaves the runtimed/VZ default). The Seatbelt rungs ignore these.
+	if backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		box.SandboxProfile.VmVcpus = podVMVCPUs(pod)
+		box.SandboxProfile.VmMemoryBytes = podVMMemoryBytes(pod)
+	}
+	return box, nil
+}
+
+// podSandboxBackend resolves the pod's RuntimeClass (spec.runtimeClassName) to the
+// SandboxBackend runtimed must confine it with, via the apis built-in
+// handler→backend table (runtimev1.DefaultHandlerConfig). The empty/absent
+// RuntimeClass resolves to SANDBOX_BACKEND_UNSPECIFIED — the host-process default
+// that defers the rung choice to runtimed's host-OS-version-gated SelectBackend —
+// and "vm" resolves to SANDBOX_BACKEND_VM. A non-empty handler with no mapping
+// returns an error wrapping runtimev1.ErrUnknownHandler: k3sm fails closed (the
+// pod's CreatePod is refused) rather than running a pod that requested stronger
+// isolation on a weaker backend.
+func podSandboxBackend(pod *corev1.Pod) (runtimev1.SandboxBackend, error) {
+	var handler runtimev1.HandlerName
+	if pod.Spec.RuntimeClassName != nil {
+		handler = runtimev1.HandlerName(*pod.Spec.RuntimeClassName)
+	}
+	backend, err := runtimev1.DefaultHandlerConfig().Backend(handler)
+	if err != nil {
+		return runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED,
+			fmt.Errorf("resolve runtimeClassName %q: %w", handler, err)
+	}
+	return backend, nil
+}
+
+// podVMMemoryBytes returns the RAM (bytes) to provision a vm-RuntimeClass pod's
+// guest with, summed across the regular containers: each container's effective
+// memory is its limit when set, else its request (the "requests-or-limits" sizing).
+// Init containers run sequentially BEFORE the regular set, so they add nothing to
+// the concurrent guest budget. 0 ("nothing set") leaves runtimed/VZ to pick a
+// default. This is the VM's RAM allocation, NOT an OOM ceiling (that is
+// memory_limit_bytes, which the host-process path enforces).
+func podVMMemoryBytes(pod *corev1.Pod) int64 {
+	var sum int64
+	for i := range pod.Spec.Containers {
+		sum += effectiveResource(&pod.Spec.Containers[i], corev1.ResourceMemory)
+	}
+	return sum
+}
+
+// podVMVCPUs returns the vCPU count to provision a vm-RuntimeClass pod's guest with:
+// the regular containers' effective CPU (limit when set, else request) summed in
+// milli-CPU and rounded UP to whole vCPUs (a fractional CPU still gets one vCPU). 0
+// ("no cpu set") leaves runtimed/VZ to pick a default.
+func podVMVCPUs(pod *corev1.Pod) uint32 {
+	var milli int64
+	for i := range pod.Spec.Containers {
+		milli += effectiveResource(&pod.Spec.Containers[i], corev1.ResourceCPU)
+	}
+	if milli <= 0 {
+		return 0
+	}
+	return uint32((milli + 999) / 1000) // ceil to whole cores
+}
+
+// effectiveResource returns container c's effective quantity for resource name in
+// its canonical scalar unit (bytes for memory, milli-CPU for cpu): the limit when
+// set, otherwise the request, otherwise 0. It is the per-container input to the vm
+// guest sizing (podVMVCPUs / podVMMemoryBytes).
+func effectiveResource(c *corev1.Container, name corev1.ResourceName) int64 {
+	if q, ok := c.Resources.Limits[name]; ok {
+		return scalarQuantity(name, q)
+	}
+	if q, ok := c.Resources.Requests[name]; ok {
+		return scalarQuantity(name, q)
+	}
+	return 0
+}
+
+// scalarQuantity reduces a resource.Quantity to the int64 scalar the vm sizing
+// uses: MilliValue for cpu (so 500m → 500, 2 → 2000) and Value (bytes) for memory.
+func scalarQuantity(name corev1.ResourceName, q resource.Quantity) int64 {
+	if name == corev1.ResourceCPU {
+		return q.MilliValue()
+	}
+	return q.Value()
 }
 
 // podMemoryLimitBytes returns the pod's effective memory limit in bytes, or 0 for
