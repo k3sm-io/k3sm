@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -60,6 +61,34 @@ func TestApiserverFlagsMeshBindAnonOff(t *testing.T) {
 	}
 	if got := flagValue(args, "--kubelet-certificate-authority"); got != cfg.KubeletCAFile {
 		t.Errorf("--kubelet-certificate-authority = %q, want %q", got, cfg.KubeletCAFile)
+	}
+}
+
+// TestApiserverNodePortRangeUnprivileged is the M3.1 wiring guard: the apiserver
+// pins --service-node-port-range and both bounds stay >=1024, because k3sm's
+// userspace Service proxy binds *:NodePort directly as the unprivileged _k3sm
+// user (a <1024 bind would EACCES). It pins the contract the design relies on so
+// an upstream default change cannot silently allocate an unbindable NodePort.
+func TestApiserverNodePortRangeUnprivileged(t *testing.T) {
+	cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+	args := apiServerArgs(cfg)
+
+	rng := flagValue(args, "--service-node-port-range")
+	if rng == "" {
+		t.Fatalf("--service-node-port-range must be pinned, args=%v", args)
+	}
+	lo, hi, ok := strings.Cut(rng, "-")
+	if !ok {
+		t.Fatalf("--service-node-port-range = %q, want lo-hi form", rng)
+	}
+	for _, bound := range []string{lo, hi} {
+		n, err := strconv.Atoi(bound)
+		if err != nil {
+			t.Fatalf("node-port-range bound %q not an int: %v", bound, err)
+		}
+		if n < 1024 {
+			t.Errorf("node-port-range bound %d < 1024: the unprivileged _k3sm proxy cannot bind it", n)
+		}
 	}
 }
 
