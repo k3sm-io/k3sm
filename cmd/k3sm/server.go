@@ -189,10 +189,19 @@ func runServer(args []string) error {
 		}
 	}
 
-	// 4. M1.4 — host darwin-net's Service proxy + CoreDNS config + DNS shim. The
-	// NetdSocket routes the proxy's privileged lo0/port ops through the root helper
-	// when unprivileged (empty in root mode → direct ops); Disabled (--network none)
-	// writes the Corefile but runs no proxy datapath (control-plane-only / CI).
+	// 4. M1.4/M3.3 — host the node-local datapath: darwin-net's Service proxy
+	// (exempted from the DNS VIP, which the per-node resolver below owns) + the
+	// per-node cluster DNS resolver bound to the DNS VIP + the pod DNSConfig the
+	// shim consumes. The NetdSocket routes the proxy/resolver privileged lo0/port
+	// ops through the root helper when unprivileged (empty in root mode → direct
+	// ops); Disabled (--network none) writes the Corefile but runs no datapath.
+	//
+	// MeshEgressIP is intentionally left empty on the server: `k3sm server` does not
+	// bring up its own wireguard mesh device yet (that is the M3.0 two-Mac lab leg),
+	// so there is no mesh-egress /32 lo0 alias to source from. Because the proxy's
+	// backend dialer binds the mesh-egress source UNCONDITIONALLY (every dial,
+	// including same-node loopback), setting a non-local value here would break ALL
+	// backend dials. It is wired the moment the server-side mesh bring-up lands.
 	net := netserve.New(netserve.Config{
 		Client:        cs,
 		WorkDir:       opts.workDir,
