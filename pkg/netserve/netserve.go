@@ -34,6 +34,19 @@ type Config struct {
 	NodeIP string
 	// PodCIDR is the node pod CIDR; empty uses defaultPodCIDR.
 	PodCIDR string
+	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
+	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
+	// k3sm-netd helper at this socket, so the proxy runs unprivileged (the _k3sm
+	// control plane). Empty keeps the direct ifconfig/net.Listen path (the explicit
+	// run-as-root mode). It is the single construction-time backend selection — set
+	// it from hostnet.Mode.Socket.
+	NetdSocket string
+	// Disabled, when true, runs NO Service-proxy datapath: Run writes the Corefile
+	// (DNS config artifact) and then blocks until ctx, but never starts the proxy
+	// or its Service/EndpointSlice watcher, so no lo0 VIP plumbing is attempted.
+	// It is the netserve side of `--network none` (control-plane-only / CI), set
+	// from !hostnet.Mode.DataPath() — an explicit backend, not a silent fallback.
+	Disabled bool
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -63,17 +76,31 @@ func New(cfg Config) *Server {
 		cidr = netip.Prefix{} // LocalityUnknown; non-fatal
 	}
 	table := proxy.NewRoutingTable(cidr)
-	p := proxy.New(table, proxy.WithLogger(log))
+	opts := []proxy.Option{proxy.WithLogger(log)}
+	if cfg.NetdSocket != "" {
+		// Unprivileged posture: route the lo0 VIP alias + privileged-port binds
+		// through the root netd helper rather than running them directly as root.
+		opts = append(opts, proxy.WithNetdHelper(cfg.NetdSocket))
+	}
+	p := proxy.New(table, opts...)
 	w := proxy.NewWatcher(cfg.Client, p, log)
 	return &Server{cfg: cfg, proxy: p, watch: w, log: log}
 }
 
 // Run renders the CoreDNS Corefile to the workdir, then runs the Service proxy
 // and its watcher until ctx is cancelled. Both the proxy's worker-supervision
-// loop and the watcher's informers honor ctx; Run returns when they stop.
+// loop and the watcher's informers honor ctx; Run returns when they stop. When
+// the Config is Disabled (`--network none`), it writes the Corefile and blocks
+// until ctx WITHOUT starting the proxy/watcher (no lo0 VIP plumbing attempted).
 func (s *Server) Run(ctx context.Context) error {
 	if err := s.writeCorefile(); err != nil {
 		s.log.Error("write corefile", "err", err)
+	}
+
+	if s.cfg.Disabled {
+		s.log.Info("network datapath disabled (--network none): control-plane-only, no Service proxy")
+		<-ctx.Done()
+		return nil
 	}
 
 	g, gctx := errgroup.WithContext(ctx)

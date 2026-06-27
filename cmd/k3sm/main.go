@@ -14,12 +14,13 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "token", "kubectl", "kubeconfig" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "kubectl", "kubeconfig" are implemented; others are planned):
   server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node (M3)
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
-  install     install the launchd service (run as root)
-  uninstall   remove the launchd service
+  netd        run the root privileged-network helper (launched by the io.k3sm.netd LaunchDaemon)
+  install     install the netd + server launchd daemons (run as root via sudo)
+  uninstall   remove the netd + server launchd daemons (run as root via sudo)
   token       mint cluster join tokens (token create)
   build       build a native-macOS (OCI artifact) image
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
@@ -52,6 +53,21 @@ func main() {
 	case "agent":
 		if err := runAgent(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm agent:", err)
+			os.Exit(1)
+		}
+	case "netd":
+		if err := runNetd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm netd:", err)
+			os.Exit(1)
+		}
+	case "install":
+		if err := runInstall(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm install:", err)
+			os.Exit(1)
+		}
+	case "uninstall":
+		if err := runUninstall(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm uninstall:", err)
 			os.Exit(1)
 		}
 	case "token":
