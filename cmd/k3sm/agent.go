@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/darwin-net/pkg/mesh"
@@ -20,6 +21,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/netserve"
 )
 
 // meshKeyRef is the conventional file name (under the root-only mesh key dir)
@@ -30,17 +32,19 @@ const meshKeyRef = "node.key"
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.
 type agentOptions struct {
-	server   string // control-plane mesh host (the join + apiserver target)
-	token    string // K10<caHash>::<user>:<secret>
-	nodeName string
-	nodeIP   string // this node's mesh InternalIP (bound into the issued certs)
-	workDir  string
-	podRoot  string
-	rtName   string
-	dnsShim  string
-	apiPort  int
-	meshPort int
-	network  string // host-network backend: auto (default) | none | direct | helper
+	server    string // control-plane mesh host (the join + apiserver target)
+	token     string // K10<caHash>::<user>:<secret>
+	nodeName  string
+	nodeIP    string // this node's mesh InternalIP (bound into the issued certs)
+	workDir   string
+	podRoot   string
+	rtName    string
+	dnsShim   string
+	apiPort   int
+	meshPort  int
+	network   string // host-network backend: auto (default) | none | direct | helper
+	clusterIP string // DNS VIP the per-node resolver binds + pods resolve against
+	domain    string // cluster DNS domain
 }
 
 // runAgent joins this Mac to an existing cluster: it CA-pins the server (via the
@@ -62,6 +66,8 @@ func runAgent(args []string) error {
 	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
+	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
+	fs.StringVar(&opts.domain, "cluster-domain", "cluster.local", "cluster DNS domain")
 	_ = fs.Parse(args)
 
 	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {
@@ -118,14 +124,23 @@ func runAgent(args []string) error {
 	}
 
 	// Bring up the wireguard mesh (the root utun leg, direct or via the helper) and
-	// keep it converging via the MeshPeer watch. `--network none` skips the mesh
-	// datapath (control-plane-only / CI join); the node still registers below.
+	// keep it converging via the MeshPeer watch, THEN the node-local datapath (the
+	// Service proxy + per-node cluster DNS resolver). `--network none` skips both
+	// (control-plane-only / CI join); the node still registers below.
 	if mode.DataPath() {
 		if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, mode, logger); err != nil {
 			return fmt.Errorf("mesh bring-up: %w", err)
 		}
+		// Built AFTER join+mesh: the proxy's mesh-egress source is this node's
+		// assigned /32 (res.MeshIP, now an lo0 alias plumbed by mesh.Start) and the
+		// routing-table locality is its assigned pod /24 (res.PodCIDR) — neither is
+		// known before enroll. Without this a joined worker has no Service proxy and
+		// no DNS, so a pod on it can't resolve names or reach the API VIP (M3.3).
+		if err := startWorkerNetserve(ctx, opts, res, mode, kubeconfigPath, logger); err != nil {
+			return err
+		}
 	} else {
-		logger.Info("network datapath disabled (--network none): skipping wireguard mesh bring-up")
+		logger.Info("network datapath disabled (--network none): skipping wireguard mesh + node-local datapath")
 	}
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
@@ -138,6 +153,7 @@ func runAgent(args []string) error {
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
+		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		serveTLS:   true,
 	})
 }
@@ -191,6 +207,53 @@ func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, k
 		_ = m.Close(context.WithoutCancel(ctx))
 	}()
 	return nil
+}
+
+// startWorkerNetserve brings up the joined worker's node-local datapath — the
+// userspace Service proxy (ClusterIP + NodePort, sourced from this node's
+// mesh-egress /32) and the per-node cluster DNS resolver bound to the DNS VIP — as
+// a goroutine that runs until ctx. It is launched after join+mesh so the
+// mesh-egress source and pod /24 are known. A client build failure is fatal (a
+// worker with no datapath cannot run pods usefully); a runtime error is logged.
+func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, kubeconfigPath string, logger *slog.Logger) error {
+	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("load node kubeconfig for node-local datapath: %w", err)
+	}
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("build client for node-local datapath: %w", err)
+	}
+	cfg := workerNetserveConfig(opts, res, mode, logger)
+	cfg.Client = cs
+	srv := netserve.New(cfg)
+	go func() {
+		if err := srv.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("node-local datapath (Service proxy + cluster DNS)", "err", err)
+		}
+	}()
+	return nil
+}
+
+// workerNetserveConfig builds the node-local datapath config for a joined worker
+// from the join result + resolved backend. The mesh-egress source is this node's
+// assigned /32 (res.MeshIP) so cross-node backend dials are not blackholed by
+// wireguard; the routing-table locality is its assigned pod /24 (res.PodCIDR); the
+// proxy/resolver privileged ops route through the netd helper when unprivileged
+// (mode.Socket). The caller sets Client. It is pure (no I/O) so the worker wiring
+// is unit-tested without a live join.
+func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, logger *slog.Logger) netserve.Config {
+	return netserve.Config{
+		WorkDir:       opts.workDir,
+		DNSVIP:        opts.clusterIP,
+		ClusterDomain: opts.domain,
+		NodeIP:        opts.nodeIP,
+		PodCIDR:       res.PodCIDR,
+		MeshEgressIP:  res.MeshIP,
+		NetdSocket:    mode.Socket,
+		Disabled:      !mode.DataPath(),
+		Logger:        logger,
+	}
 }
 
 // loadOrCreateNodePassword reads the node's persisted node-password (0600), minting

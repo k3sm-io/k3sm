@@ -7,8 +7,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -34,6 +36,15 @@ type Config struct {
 	NodeIP string
 	// PodCIDR is the node pod CIDR; empty uses defaultPodCIDR.
 	PodCIDR string
+	// MeshEgressIP, when set, is the node's reserved mesh-egress /32
+	// (podnet.MeshEgressIP) the Service proxy's backend dialer sources cross-node
+	// dials from, so a dial that egresses the wireguard utun carries a source
+	// inside this node's AllowedIPs and wireguard does not blackhole the return
+	// path (proxy.WithMeshEgressSource). REQUIRED on a multi-node worker (set from
+	// the join result); MUST be empty on a single node and on a node whose
+	// mesh-egress lo0 alias is not yet plumbed (the dialer binds this address
+	// unconditionally, so a non-local value would break every backend dial).
+	MeshEgressIP string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
 	// k3sm-netd helper at this socket, so the proxy runs unprivileged (the _k3sm
@@ -51,17 +62,30 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Server hosts the userspace Service proxy + CoreDNS config wiring as goroutines.
+// Server hosts the userspace Service proxy + the per-node cluster DNS resolver as
+// goroutines (the macOS-native kube-proxy + node-local CoreDNS analog).
 type Server struct {
 	cfg   Config
 	proxy *proxy.Proxy
 	watch *proxy.Watcher
 	log   *slog.Logger
+	// dnsVIP is the infra DNS VIP the per-node resolver owns and the proxy is
+	// exempted from (proxy.WithInfraVIPExemptions). Zero (invalid) when cfg.DNSVIP
+	// did not parse: the resolver does not run and the proxy is not exempted.
+	dnsVIP netip.Addr
+	// meshEgress is the mesh-egress /32 the proxy's backend dialer is sourced from
+	// (proxy.WithMeshEgressSource); the zero Addr leaves the kernel's default
+	// source selection (single-node / no mesh-egress alias).
+	meshEgress netip.Addr
+	// binder plumbs the DNS VIP alias + binds 53/UDP+TCP through the selected
+	// host-network backend (netd helper when unprivileged, direct as root).
+	binder dnsBinder
 }
 
 // New builds the network Server: a proxy.Proxy over a routing table keyed by the
-// node pod CIDR, plus the Service/EndpointSlice watcher that drives it. It does
-// not start anything; call Run.
+// node pod CIDR (exempted from the infra DNS VIP, sourced from the mesh-egress /32
+// when set), the Service/EndpointSlice watcher that drives it, and the per-node
+// cluster DNS resolver bound to the DNS VIP. It does not start anything; call Run.
 func New(cfg Config) *Server {
 	log := cfg.Logger
 	if log == nil {
@@ -82,9 +106,30 @@ func New(cfg Config) *Server {
 		// through the root netd helper rather than running them directly as root.
 		opts = append(opts, proxy.WithNetdHelper(cfg.NetdSocket))
 	}
-	p := proxy.New(table, opts...)
-	w := proxy.NewWatcher(cfg.Client, p, log)
-	return &Server{cfg: cfg, proxy: p, watch: w, log: log}
+
+	// Infra DNS VIP (10.43.0.10): the per-node resolver owns it (53/UDP+TCP), so
+	// the proxy must step aside or its kube-dns Service reconcile races the
+	// resolver for the socket (EADDRINUSE). The API VIP (10.43.0.1) is deliberately
+	// NOT exempted — the proxy owns it as a normal ClusterIP Service and L4-forwards
+	// to the apiserver endpoint (node-local by each node's proxy owning the VIP).
+	s := &Server{cfg: cfg, log: log, binder: newDNSBinder(cfg.NetdSocket)}
+	if vip, err := netip.ParseAddr(cfg.DNSVIP); err == nil {
+		s.dnsVIP = vip
+		opts = append(opts, proxy.WithInfraVIPExemptions(vip))
+	} else if cfg.DNSVIP != "" {
+		log.Warn("DNS VIP did not parse; per-node resolver disabled and proxy not exempted", "dns-vip", cfg.DNSVIP, "err", err)
+	}
+	// Cross-node backend dials must egress the utun from this node's mesh-egress
+	// /32 or wireguard drops the return packet; an invalid/empty value leaves the
+	// dialer on default source selection (single node).
+	if egress, err := netip.ParseAddr(cfg.MeshEgressIP); err == nil {
+		s.meshEgress = egress
+		opts = append(opts, proxy.WithMeshEgressSource(egress))
+	}
+
+	s.proxy = proxy.New(table, opts...)
+	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log)
+	return s
 }
 
 // Run renders the CoreDNS Corefile to the workdir, then runs the Service proxy
@@ -106,12 +151,65 @@ func (s *Server) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return s.proxy.Run(gctx) })
 	g.Go(func() error { return s.watch.Run(gctx) })
+	// The per-node cluster DNS resolver. It is best-effort: a bind/serve failure is
+	// logged and the goroutine returns nil so it never tears the Service proxy down
+	// (a node with a degraded resolver still serves ClusterIP/NodePort traffic).
+	g.Go(func() error { s.runResolver(gctx); return nil })
 
 	err := g.Wait()
 	if ctx.Err() != nil {
 		return nil // clean shutdown
 	}
 	return err
+}
+
+// runResolver brings up the per-node cluster DNS resolver: it ensures the DNS VIP
+// lo0 alias and binds 53/UDP+53/TCP through the selected backend (the netd helper
+// when unprivileged), then serves cluster Service A records (the kubernetes VIP
+// among them, so in-pod client-go resolves the API VIP node-locally) and forwards
+// off-cluster names upstream. It runs until ctx is cancelled. Any failure is
+// logged and returns (the caller treats it as non-fatal); it never propagates an
+// error that would stop the Service proxy.
+func (s *Server) runResolver(ctx context.Context) {
+	if !s.dnsVIP.IsValid() {
+		return // DNS VIP did not parse (logged in New)
+	}
+
+	// The cluster Service zone, read from an informer cache (no apiserver round-trip
+	// per query). Started here so it tracks ctx; warm the cache before serving.
+	factory := informers.NewSharedInformerFactory(s.cfg.Client, 30*time.Second)
+	lister := factory.Core().V1().Services().Lister()
+	factory.Start(ctx.Done())
+	factory.WaitForCacheSync(ctx.Done())
+	if ctx.Err() != nil {
+		return
+	}
+	resolver := newClusterResolver(s.dnsVIP, s.cfg.ClusterDomain, serviceZone{lister: lister}, systemForwarder{}, s.log)
+
+	if err := s.binder.ensureAlias(ctx, s.dnsVIP); err != nil {
+		s.log.Error("ensure DNS VIP lo0 alias; per-node resolver disabled", "vip", s.dnsVIP.String(), "err", err)
+		return
+	}
+	ap := netip.AddrPortFrom(s.dnsVIP, dns.DefaultDNSPort)
+	udp, err := s.binder.listenUDP(ctx, ap)
+	if err != nil {
+		s.log.Error("bind DNS VIP 53/UDP; per-node resolver disabled", "addr", ap.String(), "err", err)
+		return
+	}
+	tcp, err := s.binder.listenTCP(ctx, ap)
+	if err != nil {
+		_ = udp.Close()
+		s.log.Error("bind DNS VIP 53/TCP; per-node resolver disabled", "addr", ap.String(), "err", err)
+		return
+	}
+	s.log.Info("per-node cluster DNS resolver listening", "vip", ap.String(), "domain", resolver.domain)
+
+	rg, rctx := errgroup.WithContext(ctx)
+	rg.Go(func() error { return resolver.serveUDP(rctx, udp) })
+	rg.Go(func() error { return resolver.serveTCP(rctx, tcp) })
+	if err := rg.Wait(); err != nil && ctx.Err() == nil {
+		s.log.Error("per-node cluster DNS resolver stopped", "err", err)
+	}
 }
 
 // CorefilePath is where Run writes the rendered CoreDNS configuration.

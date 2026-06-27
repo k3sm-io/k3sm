@@ -1,12 +1,61 @@
 package netserve
 
 import (
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
 )
+
+// TestM3_3_InfraVIPExemptionAndMeshEgressPassed proves netserve.New passes the
+// right node-local-datapath config to the Service proxy for M3.3: the DNS VIP is
+// recorded as the infra-VIP exemption (the proxy steps aside so the per-node
+// resolver owns 10.43.0.10:53 — no EADDRINUSE) and the node's mesh-egress /32 is
+// recorded as the proxy's backend-dial source (so cross-node dials are not
+// blackholed by wireguard). darwin-net's proxy exempt_test.go / meshegress_test.go
+// prove the proxy HONORS these; this proves k3sm SUPPLIES the right values, and
+// selects the netd-helper binder when unprivileged. Maps to M3.3-a1.
+func TestM3_3_InfraVIPExemptionAndMeshEgressPassed(t *testing.T) {
+	t.Parallel()
+
+	s := New(Config{
+		Client:        fake.NewClientset(),
+		WorkDir:       t.TempDir(),
+		DNSVIP:        "10.43.0.10",
+		ClusterDomain: "cluster.local",
+		PodCIDR:       "100.64.1.0/24",
+		MeshEgressIP:  "100.64.1.1",
+		NetdSocket:    "/var/lib/k3sm/run/netd.sock",
+	})
+	if s.dnsVIP != netip.MustParseAddr("10.43.0.10") {
+		t.Errorf("exempted DNS VIP = %v, want 10.43.0.10 (only the DNS VIP is exempted; the API VIP stays proxy-owned)", s.dnsVIP)
+	}
+	if s.meshEgress != netip.MustParseAddr("100.64.1.1") {
+		t.Errorf("proxy mesh-egress source = %v, want 100.64.1.1 (the node's reserved /32)", s.meshEgress)
+	}
+	if _, ok := s.binder.(*helperDNSBinder); !ok {
+		t.Errorf("resolver binder = %T, want *helperDNSBinder (NetdSocket set ⇒ unprivileged posture)", s.binder)
+	}
+}
+
+// TestMeshEgressEmptyKeepsDefaultSource proves a single node (no mesh-egress IP)
+// leaves the proxy's dialer on the kernel's default source selection — setting a
+// non-local source would break every backend dial (the dialer binds it
+// unconditionally), so an empty value must stay zero.
+func TestMeshEgressEmptyKeepsDefaultSource(t *testing.T) {
+	t.Parallel()
+	s := New(Config{
+		Client:        fake.NewClientset(),
+		WorkDir:       t.TempDir(),
+		DNSVIP:        "10.43.0.10",
+		ClusterDomain: "cluster.local",
+	})
+	if s.meshEgress.IsValid() {
+		t.Errorf("mesh-egress source = %v, want invalid/zero on a single node", s.meshEgress)
+	}
+}
 
 // TestPodDNSConfigUsesDarwinNetSeam verifies netserve hands pods darwin-net's
 // PodDNSConfig (cluster DNS VIP + domain + search list) rather than
