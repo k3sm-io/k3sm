@@ -173,6 +173,30 @@ func newRuntimedFake(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer) {
 	return r, f
 }
 
+// TestRuntimedDeniesHelperSocket proves the provider stamps the configured
+// denied unix-socket paths (the root k3sm-netd helper) onto every pod's
+// SandboxProfile, so a same-uid (_k3sm) pod cannot connect() the privileged
+// daemon socket.
+func TestRuntimedDeniesHelperSocket(t *testing.T) {
+	const sock = "/var/lib/k3sm/run/netd.sock"
+	f := newFakeRuntimeServer()
+	r := newRuntimedWith(f, RuntimedConfig{
+		NodeName:              "n",
+		NodeIP:                "192.168.1.10",
+		Root:                  t.TempDir(),
+		DeniedUnixSocketPaths: []string{sock},
+	}, nil, nil)
+
+	box, err := r.buildBox(context.Background(), runtimedPod("default", "web"))
+	if err != nil {
+		t.Fatalf("buildBox: %v", err)
+	}
+	got := box.GetSandboxProfile().GetDeniedUnixSocketPaths()
+	if len(got) != 1 || got[0] != sock {
+		t.Errorf("DeniedUnixSocketPaths = %v, want [%q]", got, sock)
+	}
+}
+
 func runtimedPod(ns, name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("uid-" + name)},

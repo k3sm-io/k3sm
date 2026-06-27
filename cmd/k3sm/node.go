@@ -24,6 +24,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"k3sm.io/darwin-net/pkg/netd"
+
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/provider"
 )
@@ -162,6 +164,11 @@ func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider
 			Root:     opts.podRoot,
 			DyldShim: opts.dnsShim,
 			Client:   cs,
+			// Fence every pod off the root helper socket at the sandbox: pods share
+			// the _k3sm uid with the legitimate helper client, so the SBPL must deny
+			// connect() to the privileged daemon. Denied regardless of run-as-root vs
+			// helper mode (a pod must never drive netd).
+			DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
 		})
 		if err != nil {
 			return nil, "", fmt.Errorf("build runtimed provider: %w", err)

@@ -43,7 +43,12 @@ type runtimedRuntime struct {
 	nodeIP   string
 	rootfs   string
 	dyldShim string
-	log      *slog.Logger
+	// deniedSocks are AF_UNIX socket paths every pod's SBPL must deny connect()
+	// to — notably the root k3sm-netd helper socket, so a same-uid (_k3sm) pod
+	// cannot drive the privileged helper. Threaded onto each PodBox's
+	// SandboxProfile (apis SandboxProfile.denied_unix_socket_paths).
+	deniedSocks []string
+	log         *slog.Logger
 
 	// resolver supplies ConfigMap/Secret data for the M2.1 env resolution the
 	// provider performs before sending the box to runtimed (runtimed reads only
@@ -84,6 +89,12 @@ type RuntimedConfig struct {
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES.
 	DyldShim string
+	// DeniedUnixSocketPaths are AF_UNIX socket paths every pod's SBPL denies
+	// connect() to (the root k3sm-netd helper socket): pods run as the same _k3sm
+	// uid as the legitimate helper client, so the socket must be denied at the
+	// sandbox so a pod cannot drive the privileged daemon. Threaded as data
+	// because runtimed cannot import darwin-net.
+	DeniedUnixSocketPaths []string
 	// Client is the apiserver client the provider resolves ConfigMap/Secret data,
 	// SA tokens (M2.1 volumes/env), and imagePullSecret credentials (M2.6) with —
 	// runtimed never talks to the apiserver. nil disables data-backed
@@ -138,6 +149,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		nodeIP:         cfg.NodeIP,
 		rootfs:         cfg.Root,
 		dyldShim:       cfg.DyldShim,
+		deniedSocks:    cfg.DeniedUnixSocketPaths,
 		resolver:       resolver,
 		log:            log,
 		clk:            clock.RealClock{},
@@ -161,6 +173,12 @@ var (
 // (via the node identity) here, before the box crosses the runtime boundary.
 func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runtimev1.PodBox, error) {
 	box := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim)
+	// Deny every pod the root helper socket: pods share the _k3sm uid with the
+	// legitimate helper client, so the sandbox is where the privileged daemon is
+	// fenced off from the workload.
+	if len(r.deniedSocks) > 0 && box.SandboxProfile != nil {
+		box.SandboxProfile.DeniedUnixSocketPaths = r.deniedSocks
+	}
 	if err := resolvePodBoxEnv(ctx, box, r.nodeName, r.nodeIP, r.resolver); err != nil {
 		return nil, err
 	}

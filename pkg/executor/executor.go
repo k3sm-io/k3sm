@@ -3,7 +3,10 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 )
 
 // Executor brings up and tears down the k3sm control plane. Start blocks until
@@ -71,8 +74,15 @@ type Config struct {
 	// apiserver verifies the kubelet-serving cert and remote exec/logs are not
 	// MITM-able.
 	KubeletCAFile string
-	// AnonymousAuth, when non-nil, sets --anonymous-auth explicitly. M3 multi-node
-	// sets it false; a nil pointer keeps the apiserver default (the M1/M2 path).
+	// AnonymousAuth, when non-nil, sets --anonymous-auth explicitly. withDefaults
+	// fills a nil pointer with FALSE: the user-space control plane runs as the
+	// unprivileged _k3sm user behind an AlwaysAllow authorizer, so an open
+	// anonymous surface would hand cluster-admin to any local process that can
+	// reach the apiserver port. The static bearer token (scheduler/CM/kubectl/
+	// healthz all carry it) is unaffected; only credential-less requests are
+	// rejected. The pure apiServerArgs still omits the flag for a nil pointer, so
+	// the M3 multi-node path (explicit false) and the arg-rendering tests are
+	// unchanged.
 	AnonymousAuth *bool
 	// ServingCertFile / ServingKeyFile, when both set, are passed as
 	// --tls-cert-file / --tls-private-key-file so the apiserver presents a cluster-CA
@@ -95,9 +105,73 @@ const (
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.
 	DefaultKinePort = 2379
-	// DefaultWorkDir is the control-plane state root.
+	// DefaultWorkDir is the control-plane state root for the ROOT posture
+	// (explicit run-as-root mode). It is root-owned; the unprivileged _k3sm
+	// control plane cannot write here and uses ResolveWorkDir instead.
 	DefaultWorkDir = "/var/lib/k3sm/server"
+	// workDirLeaf is the control-plane state-root directory name appended under
+	// the service user's home for the unprivileged posture (so the _k3sm home
+	// /var/lib/k3sm yields /var/lib/k3sm/server, mirroring DefaultWorkDir).
+	workDirLeaf = "server"
 )
+
+// ErrNoServiceUserHome is returned by ResolveWorkDir when the process is
+// unprivileged (euid != 0) but no home directory is set, so there is no
+// _k3sm-owned location for the control-plane state root and DefaultWorkDir
+// (root-owned) would EACCES.
+var ErrNoServiceUserHome = errors.New("executor: unprivileged posture has no home dir for the control-plane work-dir")
+
+// ResolveWorkDir computes the control-plane work-dir for the CURRENT process
+// posture, decoupled from the DefaultWorkDir const. As root (the explicit
+// run-as-root mode) it returns DefaultWorkDir (root-owned /var/lib/k3sm/server).
+// Unprivileged (the _k3sm control plane, euid != 0) DefaultWorkDir is not
+// writable, so it returns <home>/server under the service user's home. It is a
+// pure path choice (no I/O); EnsureWorkDirWritable performs the fail-fast
+// writability check once the final work-dir (default or --work-dir override) is
+// known.
+func ResolveWorkDir() (string, error) {
+	home, _ := os.UserHomeDir()
+	return resolveWorkDir(os.Geteuid(), home)
+}
+
+// resolveWorkDir is the testable core of ResolveWorkDir: euid 0 → DefaultWorkDir;
+// euid != 0 → <home>/server, or ErrNoServiceUserHome when home is empty.
+func resolveWorkDir(euid int, home string) (string, error) {
+	if euid == 0 {
+		return DefaultWorkDir, nil
+	}
+	if home == "" {
+		return "", ErrNoServiceUserHome
+	}
+	return filepath.Join(home, workDirLeaf), nil
+}
+
+// RuntimeRoot returns the runtimed on-disk root (image cache + pod dirs + PV
+// storage) for a given control-plane work-dir: the work-dir's PARENT, so the
+// root posture's /var/lib/k3sm/server yields /var/lib/k3sm and the unprivileged
+// <home>/server yields <home>. Threaded into the runtime config (RuntimedConfig
+// .Root) so runtimed's SBPL Posture.WorkDir resides under the daemon home and
+// its pods-root containment check (sandbox.Posture.Home) is active.
+func RuntimeRoot(workDir string) string {
+	return filepath.Dir(filepath.Clean(workDir))
+}
+
+// EnsureWorkDirWritable fails fast if dir cannot be created or written: it
+// MkdirAll's dir (idempotent) and probes with a temp file it immediately
+// removes. Called on the FINAL work-dir (ResolveWorkDir's result or a
+// --work-dir override) so the unprivileged control plane reports a clear error
+// up front instead of EACCES-ing mid-bring-up against the root-owned default.
+func EnsureWorkDirWritable(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create work-dir %s: %w", dir, err)
+	}
+	probe := filepath.Join(dir, ".k3sm-writable-probe")
+	if err := os.WriteFile(probe, []byte("k3sm"), 0o600); err != nil {
+		return fmt.Errorf("work-dir %s is not writable: %w", dir, err)
+	}
+	_ = os.Remove(probe)
+	return nil
+}
 
 // withDefaults returns a copy of cfg with empty fields filled from the pinned
 // defaults.
@@ -119,6 +193,13 @@ func (c Config) withDefaults() Config {
 	}
 	if c.NodeIP == "" {
 		c.NodeIP = "127.0.0.1"
+	}
+	if c.AnonymousAuth == nil {
+		// The user-space posture: close the anonymous surface by default so the
+		// AlwaysAllow authorizer cannot grant cluster-admin to a credential-less
+		// caller. Explicit settings (the M3 multi-node path) are preserved.
+		anonOff := false
+		c.AnonymousAuth = &anonOff
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
