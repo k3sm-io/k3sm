@@ -41,6 +41,38 @@ func TestControllersFlagScoping(t *testing.T) {
 	}
 }
 
+// TestPersistentVolumeControllersKept asserts the controllers the M3.2 local-path
+// provisioner + StatefulSet binding depend on stay ENABLED in the scoped KCM
+// --controllers set: the in-tree persistentvolume-binder (binds the PVC to the
+// PV the provisioner creates), the statefulset controller (creates the
+// per-replica PVCs + pods), and pvc/pv-protection (the in-use finalizers). The
+// external-provisioner pattern + the scheduler VolumeBinding plugin rely on the
+// in-tree binder, so a future tightening of kcmDisabledControllers that drops one
+// would silently break binding — this is the tripwire.
+func TestPersistentVolumeControllersKept(t *testing.T) {
+	flag := controllersFlag()
+	tokens := strings.Split(flag, ",")
+	if tokens[0] != "*" {
+		t.Fatalf("controllers flag must start with * (enable on-by-default), got %q", tokens[0])
+	}
+	disabled := map[string]bool{}
+	for _, tok := range tokens[1:] {
+		if strings.HasPrefix(tok, "-") {
+			disabled[strings.TrimPrefix(tok, "-")] = true
+		}
+	}
+	for _, keep := range []string{
+		"persistentvolume-binder-controller",
+		"statefulset-controller",
+		"pvc-protection-controller",
+		"pv-protection-controller",
+	} {
+		if disabled[keep] {
+			t.Errorf("controller %q must stay ENABLED (M3.2 provisioner + StatefulSet binding needs it), found disabled in %q", keep, flag)
+		}
+	}
+}
+
 // TestShutdownOrderKineLast verifies kine is stopped LAST (so no component loses
 // its datastore mid-shutdown) and the apiserver drains before the controllers.
 func TestShutdownOrderKineLast(t *testing.T) {

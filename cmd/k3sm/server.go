@@ -22,6 +22,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
+	"k3sm.io/k3sm/pkg/provisioner"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -223,6 +224,31 @@ func runServer(args []string) error {
 			}
 		}()
 	}
+
+	// 4c. M3.2 — the APFS local-path provisioner: a pure API-object controller that
+	// registers the local-path StorageClass and creates a Retain, node-affinity-pinned
+	// PV for each PVC the scheduler has placed. It does NO filesystem I/O — runtimed
+	// empty-creates the per-(namespace, claim) dir on the consuming node. The class
+	// BasePath is the RESOLVED runtime root (opts.podRoot — the same root runtimed
+	// derives per-PVC dirs against), NOT the root-only storagev1.DefaultBasePath.
+	// Started now (the apiserver is healthy) and drained BEFORE exec.Stop tears the
+	// control plane down: the drain defer below is registered AFTER exec.Stop's defer,
+	// so LIFO runs it FIRST — the provisioner never writes a PV against a draining
+	// apiserver. provCtx lets the drain cancel it even if startNode returns an error
+	// (ctx not yet cancelled), avoiding a shutdown hang.
+	prov := provisioner.New(cs, provisioner.ClassForRoot(opts.podRoot), logger)
+	provCtx, provCancel := context.WithCancel(ctx)
+	provDone := make(chan struct{})
+	go func() {
+		defer close(provDone)
+		if err := prov.Run(provCtx); err != nil && provCtx.Err() == nil {
+			logger.Error("local-path provisioner", "err", err)
+		}
+	}()
+	defer func() {
+		provCancel()
+		<-provDone
+	}()
 
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
