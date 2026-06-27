@@ -40,6 +40,9 @@ type serverOptions struct {
 	clusterIP string // DNS VIP CoreDNS binds + pods resolve against
 	domain    string
 	network   string // host-network backend: auto (default) | none | direct | helper
+
+	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite (M6.0)
+	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
 }
 
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
@@ -66,6 +69,11 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", "cluster.local", "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
+	// M6.0 HA datastore. The DSN may carry a password; prefer the env so it stays off
+	// k3sm's own argv (mirrors --token/$K3SM_TOKEN). k3sm relocates the password off
+	// the kine child's argv too (a 0600 PGPASSFILE), so `ps` never sees the secret.
+	fs.StringVar(&opts.datastoreEndpoint, "datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "kine datastore DSN (postgres://user:pass@host:port/db?sslmode=…) for HA multi-writer; empty = single-node kine→SQLite (or $K3SM_DATASTORE_ENDPOINT)")
+	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard). The identical-CA join bootstrap is M6.1; for M6.0 it sets the HA leader-election + datastore guard")
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -111,6 +119,15 @@ func runServer(args []string) error {
 		APIServerPort: opts.apiPort,
 		NodeIP:        opts.nodeIP,
 		Logger:        logger,
+	}
+	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
+	// Postgres (DefaultKineVersionHA) and turns on scheduler/KCM leader election so only
+	// one server is active. The executor fail-closes (ErrHARequiresDatastore) if HA is
+	// requested without the endpoint — never a silent per-server SQLite (split-brain).
+	cfg.DatastoreEndpoint = opts.datastoreEndpoint
+	cfg.ServerJoin = opts.serverJoin
+	if opts.datastoreEndpoint != "" || opts.serverJoin {
+		logger.Info("HA datastore mode: kine→Postgres (shared multi-writer datastore); scheduler/KCM leader-elected", "server-join", opts.serverJoin)
 	}
 	// M3.0 multi-node: bind the apiserver + the worker-join supervisor on the mesh
 	// interface ONLY, serve a cluster-CA-signed cert, wire --client-ca-file +
