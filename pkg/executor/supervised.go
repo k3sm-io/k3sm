@@ -230,6 +230,14 @@ func apiServerArgs(cfg Config) []string {
 	args := []string{
 		"--etcd-servers", "http://127.0.0.1:" + strconv.Itoa(cfg.KinePort),
 		"--service-cluster-ip-range", "10.43.0.0/16",
+		// Pin the NodePort range to the standard 30000-32767 (the kube-apiserver
+		// default). k3sm's userspace Service proxy binds *:NodePort directly and
+		// in-process as the unprivileged _k3sm user (NOT via the root netd helper,
+		// which rejects wildcards), so every allocated NodePort MUST stay >=1024 or
+		// the bind fails with EACCES. Pinning the range makes that contract explicit
+		// rather than depending on the upstream default never changing; a <1024
+		// NodePort is unsupported by design.
+		"--service-node-port-range", "30000-32767",
 		"--service-account-key-file", saPubPath(wd),
 		"--service-account-signing-key-file", saKeyPath(wd),
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",

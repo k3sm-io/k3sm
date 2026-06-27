@@ -165,6 +165,17 @@ func runServer(args []string) error {
 	if err := policy.EnsureDarwinAdmission(ctx, cs); err != nil {
 		logger.Error("provision admission policy", "err", err)
 	}
+	// M3.1 — honest-gap Warn advisories on Services: externalTrafficPolicy: Local
+	// is not honored (the userspace splice does not preserve client source IP) and
+	// UDP ports have no datapath yet (the proxy opens no UDP listener). They warn at
+	// the API (never reject) so the divergence is visible in kubectl. Provisioned
+	// unconditionally — these are inherent Service-model limits, not mode-specific.
+	if err := policy.EnsureExternalTrafficPolicyLocalWarn(ctx, cs); err != nil {
+		logger.Error("provision externalTrafficPolicy=Local warn policy", "err", err)
+	}
+	if err := policy.EnsureUDPServiceWarn(ctx, cs); err != nil {
+		logger.Error("provision UDP-service warn policy", "err", err)
+	}
 	// Unprivileged posture: every pod runs as the single _k3sm uid (no per-pod uid
 	// isolation), so REJECT a pod requesting a foreign runAsUser/fsGroup at
 	// admission rather than letting it wedge at runtime (a privilege drop needs
