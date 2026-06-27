@@ -24,6 +24,7 @@ import (
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
+	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -188,6 +189,16 @@ func runServer(args []string) error {
 		if err := policy.EnsureNoForeignUserAdmission(ctx, cs, int64(os.Geteuid())); err != nil {
 			logger.Error("provision foreign-user admission policy", "err", err)
 		}
+	}
+	// M5.1 — provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
+	// scheduling.nodeSelector pinning it to VZ-capable nodes via
+	// k3sm.io/virtualization). Log-and-continue (NOT fail-closed like rbac): a missing
+	// RuntimeClass cannot lock workers out — it only makes a vm pod unschedulable / a
+	// vm-pod admission rejected — so it never halts bring-up. No node advertises the
+	// VZ label today (runtimed reports no per-backend availability), so a vm pod stays
+	// Pending — the correct posture for this non-VZ foundation.
+	if err := runtimeclass.Provision(ctx, cs); err != nil {
+		logger.Error("provision vm runtime class", "err", err)
 	}
 
 	// 3b. M4.1 — provision the RBAC graph BEFORE the VK node (step 5) and the

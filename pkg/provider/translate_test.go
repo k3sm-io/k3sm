@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -25,7 +26,10 @@ func TestM3_3_ToPodBoxAllowsClusterNetwork(t *testing.T) {
 			Containers: []corev1.Container{{Name: "c0", Image: "registry/web:latest"}},
 		},
 	}
-	box := toPodBox(pod, "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "")
+	box, err := toPodBox(pod, "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "")
+	if err != nil {
+		t.Fatalf("toPodBox: %v", err)
+	}
 	if !box.GetSandboxProfile().GetAllowNetwork() {
 		t.Error("AllowNetwork must be true so the cluster DNS + API-server Seatbelt egress rules are emitted (in-pod DNS + kubectl)")
 	}
@@ -48,7 +52,10 @@ func TestToPodBoxFillsGate(t *testing.T) {
 			}},
 		},
 	}
-	box := toPodBox(pod, "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib")
+	box, err := toPodBox(pod, "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "/lib/shim.dylib")
+	if err != nil {
+		t.Fatalf("toPodBox: %v", err)
+	}
 
 	if box.GetPodId() != "uid-web" {
 		t.Errorf("pod id = %q, want uid-web", box.GetPodId())
@@ -56,8 +63,8 @@ func TestToPodBoxFillsGate(t *testing.T) {
 	if box.GetSandboxProfile() == nil {
 		t.Fatal("sandbox_profile must be set so runtimed's fail-closed gate passes")
 	}
-	if box.GetSandboxProfile().GetBackend() == runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED {
-		t.Error("sandbox backend must not be UNSPECIFIED")
+	if box.GetSandboxProfile().GetBackend() != runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED {
+		t.Errorf("default (no RuntimeClass) backend = %v, want UNSPECIFIED — runtimed's SelectBackend picks the host-process rung (TestToPodBoxDefaultBackendUnspecified covers the EXEC-mismatch fix)", box.GetSandboxProfile().GetBackend())
 	}
 	if box.GetSandboxProfile().GetDataVolumePath() == "" {
 		t.Error("data_volume_path must be set (the only writable path)")
@@ -77,6 +84,141 @@ func TestToPodBoxFillsGate(t *testing.T) {
 	}
 	if len(c.GetEnv()) != 1 || c.GetEnv()[0].GetName() != "FOO" {
 		t.Errorf("env not carried: %v", c.GetEnv())
+	}
+}
+
+// TestToPodBoxDefaultBackendUnspecified is the M5.1 proof that a pod with NO
+// runtimeClassName stamps SANDBOX_BACKEND_UNSPECIFIED — NOT the old hardcoded
+// SEATBELT_EXEC(=1) rung. Stamping UNSPECIFIED lets runtimed's reworked
+// SelectBackend(UNSPECIFIED,…) walk the host-OS-version-gated Seatbelt ladder and
+// pick the correct rung (SEATBELT_INPROC=2 where libsandbox is present), fixing the
+// EXEC-vs-INPROC mismatch the provider previously forced. The pod must still pass
+// runtimed's fail-closed gate (non-nil profile + non-UNSPECIFIED signature policy),
+// and a non-vm pod must carry no vm sizing.
+func TestToPodBoxDefaultBackendUnspecified(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "native", UID: types.UID("uid-native")},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "c0", Image: "registry/web:latest"}},
+		},
+	}
+	box, err := toPodBox(pod, "10.0.0.5", "/var/lib/k3sm/pods/uid-native", "")
+	if err != nil {
+		t.Fatalf("toPodBox: %v", err)
+	}
+	sp := box.GetSandboxProfile()
+	if got := sp.GetBackend(); got != runtimev1.SandboxBackend_SANDBOX_BACKEND_UNSPECIFIED {
+		t.Errorf("default backend = %v, want UNSPECIFIED (not the old hardcoded SEATBELT_EXEC)", got)
+	}
+	if sp.GetBackend() == runtimev1.SandboxBackend_SANDBOX_BACKEND_SEATBELT_EXEC {
+		t.Error("default backend must NOT be SEATBELT_EXEC — that is the architect-flagged mismatch this fixes")
+	}
+	if sp.GetVmVcpus() != 0 || sp.GetVmMemoryBytes() != 0 {
+		t.Errorf("non-vm pod must carry no vm sizing: vcpus=%d mem=%d", sp.GetVmVcpus(), sp.GetVmMemoryBytes())
+	}
+	if box.GetSignaturePolicy() == runtimev1.SignaturePolicy_SIGNATURE_POLICY_UNSPECIFIED {
+		t.Error("signature_policy must still be set (the fail-closed gate is unchanged)")
+	}
+}
+
+// TestToPodBoxVMRuntimeClass is the M5.1 proof that runtimeClassName: vm resolves to
+// SANDBOX_BACKEND_VM and that the guest is sized from the pod's cpu/memory: vCPUs
+// rounded UP from summed milli-CPU, memory summed in bytes, each container's
+// effective value being its limit when set, else its request; nothing set ⇒ 0 (the
+// VZ default).
+func TestToPodBoxVMRuntimeClass(t *testing.T) {
+	vm := string(runtimev1.HandlerVM)
+	q := func(s string) resource.Quantity { return resource.MustParse(s) }
+	tests := []struct {
+		name       string
+		containers []corev1.Container
+		wantVCPUs  uint32
+		wantMem    int64
+	}{
+		{
+			name: "limit wins over request",
+			containers: []corev1.Container{{
+				Name: "c0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: q("500m"), corev1.ResourceMemory: q("512Mi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: q("1500m"), corev1.ResourceMemory: q("1Gi")},
+				},
+			}},
+			wantVCPUs: 2,          // ceil(1500m / 1000)
+			wantMem:   1073741824, // 1Gi
+		},
+		{
+			name: "request when no limit",
+			containers: []corev1.Container{{
+				Name:      "c0",
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: q("2"), corev1.ResourceMemory: q("256Mi")}},
+			}},
+			wantVCPUs: 2,
+			wantMem:   268435456,
+		},
+		{
+			name: "summed across regular containers",
+			containers: []corev1.Container{
+				{Name: "c0", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: q("1"), corev1.ResourceMemory: q("256Mi")}}},
+				{Name: "c1", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: q("1"), corev1.ResourceMemory: q("256Mi")}}},
+			},
+			wantVCPUs: 2,
+			wantMem:   536870912,
+		},
+		{
+			name:       "no resources ⇒ VZ defaults (0)",
+			containers: []corev1.Container{{Name: "c0"}},
+			wantVCPUs:  0,
+			wantMem:    0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "pg", UID: types.UID("uid-pg")},
+				Spec:       corev1.PodSpec{RuntimeClassName: &vm, Containers: tt.containers},
+			}
+			box, err := toPodBox(pod, "10.0.0.9", "/var/lib/k3sm/pods/uid-pg", "")
+			if err != nil {
+				t.Fatalf("toPodBox: %v", err)
+			}
+			sp := box.GetSandboxProfile()
+			if sp.GetBackend() != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+				t.Errorf("backend = %v, want SANDBOX_BACKEND_VM", sp.GetBackend())
+			}
+			if sp.GetVmVcpus() != tt.wantVCPUs {
+				t.Errorf("vm_vcpus = %d, want %d", sp.GetVmVcpus(), tt.wantVCPUs)
+			}
+			if sp.GetVmMemoryBytes() != tt.wantMem {
+				t.Errorf("vm_memory_bytes = %d, want %d", sp.GetVmMemoryBytes(), tt.wantMem)
+			}
+		})
+	}
+}
+
+// TestToPodBoxUnknownRuntimeClassFailsClosed is the M5.1 proof that a pod naming a
+// RuntimeClass with no backend mapping is REFUSED at translation (an error wrapping
+// runtimev1.ErrUnknownHandler, nil box) rather than silently running on the
+// host-process path — k3sm never downgrades a pod that asked for an isolation class
+// it cannot satisfy.
+func TestToPodBoxUnknownRuntimeClassFailsClosed(t *testing.T) {
+	unknown := "kata-qemu"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "x", UID: types.UID("uid-x")},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &unknown,
+			Containers:       []corev1.Container{{Name: "c0", Image: "img"}},
+		},
+	}
+	box, err := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-x", "")
+	if err == nil {
+		t.Fatal("toPodBox must FAIL CLOSED on an unknown RuntimeClass, got nil (would silently downgrade to host-process)")
+	}
+	if !errors.Is(err, runtimev1.ErrUnknownHandler) {
+		t.Errorf("error = %v, want one wrapping runtimev1.ErrUnknownHandler", err)
+	}
+	if box != nil {
+		t.Error("box must be nil on a fail-closed translation")
 	}
 }
 
@@ -223,7 +365,10 @@ func TestToPodBoxM2Fields(t *testing.T) {
 			}},
 		},
 	}
-	box := toPodBox(pod, "10.0.0.7", "/var/lib/k3sm/pods/uid-api", "")
+	box, err := toPodBox(pod, "10.0.0.7", "/var/lib/k3sm/pods/uid-api", "")
+	if err != nil {
+		t.Fatalf("toPodBox: %v", err)
+	}
 
 	if got := len(box.GetVolumes()); got != 5 {
 		t.Fatalf("volumes = %d, want 5", got)
@@ -323,7 +468,10 @@ func TestToPodBoxMemoryLimitAnnotation(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
 				Spec:       corev1.PodSpec{Containers: tt.containers},
 			}
-			box := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "")
+			box, err := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "")
+			if err != nil {
+				t.Fatalf("toPodBox: %v", err)
+			}
 			got, present := box.GetAnnotations()["k3sm.io/memory-limit-bytes"]
 			if tt.wantAnno == "" {
 				if present {
@@ -394,7 +542,10 @@ func TestTypedMemoryLimitWritten(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
 				Spec:       corev1.PodSpec{Containers: tt.containers},
 			}
-			box := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "")
+			box, err := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "")
+			if err != nil {
+				t.Fatalf("toPodBox: %v", err)
+			}
 			if box.GetMemoryLimitBytes() != tt.wantBytes {
 				t.Errorf("memory_limit_bytes = %d, want %d", box.GetMemoryLimitBytes(), tt.wantBytes)
 			}
