@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,9 +25,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/provider"
 )
 
@@ -43,6 +46,7 @@ type nodeOptions struct {
 	nodeIP     string
 	runtime    string // "hostprocess" (default) or "runtimed"
 	dnsShim    string // getaddrinfo DNS shim dylib path (runtimed only)
+	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
 	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
 }
 
@@ -58,6 +62,7 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
 	fs.StringVar(&opts.runtime, "runtime", "hostprocess", "pod runtime: hostprocess (native processes) or runtimed (image runtime)")
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
+	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
 	_ = fs.Parse(args)
 
@@ -158,18 +163,7 @@ func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider
 	case "", "hostprocess":
 		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP), "hostprocess", nil
 	case "runtimed":
-		rt, err := provider.NewRuntimed(provider.RuntimedConfig{
-			NodeName: opts.nodeName,
-			NodeIP:   opts.nodeIP,
-			Root:     opts.podRoot,
-			DyldShim: opts.dnsShim,
-			Client:   cs,
-			// Fence every pod off the root helper socket at the sandbox: pods share
-			// the _k3sm uid with the legitimate helper client, so the SBPL must deny
-			// connect() to the privileged daemon. Denied regardless of run-as-root vs
-			// helper mode (a pod must never drive netd).
-			DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
-		})
+		rt, err := provider.NewRuntimed(runtimedConfig(opts, cs))
 		if err != nil {
 			return nil, "", fmt.Errorf("build runtimed provider: %w", err)
 		}
@@ -177,6 +171,49 @@ func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider
 	default:
 		return nil, "", fmt.Errorf("unknown --runtime %q (want hostprocess or runtimed)", opts.runtime)
 	}
+}
+
+// runtimedConfig builds the runtimed runtime configuration from the node options:
+// the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
+// and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
+// --dns-vip flag, defaulting to the cluster DNS VIP — never runtimed's legacy
+// 10.96.0.10) and APIServerVIP is the kubernetes Service ClusterIP derived from
+// the cluster service CIDR; runtimed threads both into its per-pod sandbox.Posture
+// so a confined pod's DNS + in-pod client-go reach the node-local resolver / API
+// VIP (M3.3). It is pure (no I/O) so the VIP wiring is unit-tested directly.
+func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
+	resolverVIP := opts.dnsVIP
+	if resolverVIP == "" {
+		resolverVIP = dns.DefaultDNSVIP
+	}
+	return provider.RuntimedConfig{
+		NodeName:     opts.nodeName,
+		NodeIP:       opts.nodeIP,
+		Root:         opts.podRoot,
+		DyldShim:     opts.dnsShim,
+		ResolverVIP:  resolverVIP,
+		APIServerVIP: apiServerVIP(),
+		Client:       cs,
+		// Fence every pod off the root helper socket at the sandbox: pods share the
+		// _k3sm uid with the legitimate helper client, so the SBPL must deny
+		// connect() to the privileged daemon. Denied regardless of run-as-root vs
+		// helper mode (a pod must never drive netd).
+		DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
+	}
+}
+
+// apiServerVIP returns the in-cluster kubernetes Service ClusterIP — the FIRST
+// host of the cluster service CIDR (10.43.0.1 for 10.43.0.0/16), which the
+// apiserver assigns to the default/kubernetes Service (it serves
+// --service-cluster-ip-range over that CIDR). A confined pod's in-cluster
+// client-go dials it, so the per-pod Seatbelt egress must allow it. Derived from
+// the single service-CIDR const, falling back to the documented VIP if it ever
+// fails to parse.
+func apiServerVIP() string {
+	if p, err := netip.ParsePrefix(install.DefaultServiceCIDR); err == nil {
+		return p.Masked().Addr().Next().String()
+	}
+	return "10.43.0.1"
 }
 
 // configureNode stamps the registering Node object with darwin identity,

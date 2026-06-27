@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M3
-updated: 2026-06-26
-updated_by: claude
+updated: 2026-06-27
+updated_by: orchestrator
 
 phases:
   - id: M0
@@ -183,7 +183,7 @@ phases:
   - id: M3
     title: Multi-node, mesh, NodePort & persistent storage (control side)
     status: in-progress
-    note: "M3.0 (the security-critical multi-node bootstrap + trust core) is done — CA hierarchy, CA-pinned join, node-password, HTTP-CSR → system:node, mesh write-guard, mesh-bound apiserver flags — proven by named unit tests (-race clean). M3.1 (NodePort), M3.2 (provisioner+StatefulSet), M3.3 (kubernetes endpoint rewrite) remain todo. The live two-Mac join (+ MeshPeer CRD install, mesh utun bring-up, the apiserver secure-cutover boot) is the K3SM_LAB e2e leg."
+    note: "M3.0 (multi-node bootstrap + trust core) done. M3.1/M3.2/M3.3 are now CODE-COMPLETE + unit-proven + workspace-integration-green (hack/ci.sh), under the user-space netd-helper posture: M3.1 NodePort (direct wildcard *:nodePort >=1024 in-process — NOT via the helper; +honest-gap Warn admission for externalTrafficPolicy:Local & UDP) ; M3.2 local-path provisioner (pure API-object controller, Retain SC, UID-named PV + nodeAffinity) + StatefulSet (storage+name identity; network identity gapped — needs per-pod IPs) ; M3.3 worker netserve bringup + per-node DNS resolver on the DNS VIP + infra-VIP exemption + mesh-egress source + Seatbelt egress VIPs threaded. DIVERGENCE (open, documented): the per-node resolver is an IN-PROCESS A-record+forward server, NOT CoreDNS-the-binary (darwin-net has no embeddable DNS and CoreDNS can't inherit the helper-passed fd under launchd) — no SRV/PTR/headless, IPv4-only; full CoreDNS parity is a follow-up tied to the per-pod-IP gap. The SOLE remaining acceptance is the live two-Mac K3SM_LAB e2e (hack/lab/m3.sh: NodePort reachable, StatefulSet persistence, in-pod kubectl+DNS on the joined node) — never auto-greened. Open production-trust gate: the kine bump-vs-soak decision before PV/PVC under load."
     strategy: hard cut
     depends_on:
       - apis:M3.1
@@ -204,11 +204,11 @@ phases:
             method: e2e
       - id: M3.1
         title: Wire NodePort Services
-        status: todo
+        status: in-progress
         deliverables:
           - id: M3.1-d1
-            done: false
-            desc: "surface darwin-net:M3's NodePort listener (*:nodePort, TCP) through the server so a NodePort Service is reachable on the host port — no apis change (ServicePort.NodePort already exists). UDP NodePort deferred with darwin-net's UDP relay."
+            done: true
+            desc: "surface darwin-net:M3's NodePort listener (*:nodePort, TCP) through the server so a NodePort Service is reachable on the host port — no apis change (ServicePort.NodePort already exists). Bound as a DIRECT wildcard *:nodePort in-process (>=1024; NOT via the netd helper, which rejects wildcards); apiserver pins --service-node-port-range 30000-32767 so the unprivileged _k3sm proxy binds it; <1024 NodePort unsupported. Honest-gap Warn VAPs added: externalTrafficPolicy:Local (userspace splice doesn't preserve client src IP) and UDP Service ports (no UDP datapath yet); foreign-user Deny VAP extended to runAsGroup/supplementalGroups/ephemeralContainers. UDP NodePort deferred with darwin-net's UDP relay. CODE-COMPLETE + unit-proven; live reachability is the lab e2e."
         acceptance:
           - id: M3.1-a1
             met: false
@@ -216,10 +216,10 @@ phases:
             method: e2e
       - id: M3.2
         title: APFS local-path provisioner + StatefulSet
-        status: todo
+        status: in-progress
         deliverables:
           - id: M3.2-d1
-            done: false
+            done: true
             desc: "a local-path provisioner controller watches PVCs and provisions a PV via runtimed:M3 (stable per-PVC dir on the same APFS volume as /var/lib/k3sm, empty-create, lifecycle decoupled from the pod dir, honors ReclaimPolicy); StatefulSet support — stable STORAGE + NAME identity on the hostprocess runtime; stable NETWORK identity requires per-pod IPs (runtimed M2 path)."
         acceptance:
           - id: M3.2-a1
@@ -228,11 +228,11 @@ phases:
             method: e2e
       - id: M3.3
         title: Per-node CoreDNS + node-local kubernetes endpoint (infra-VIP mesh exemption)
-        status: todo
+        status: in-progress
         deliverables:
           - id: M3.3-d1
-            done: false
-            desc: "run CoreDNS per-node bound to the DNS VIP and resolve the kubernetes endpoint to a node-local apiserver/proxy address (with darwin-net:M3.3) so infra VIPs (10.43.0.1/10.43.0.10) are never steered over the wireguard mesh where no peer's AllowedIPs covers them."
+            done: true
+            desc: "per-node DNS resolver bound to the DNS VIP + node-local kubernetes endpoint (with darwin-net:M3.3) so infra VIPs (10.43.0.1/10.43.0.10) are never steered over the wireguard mesh where no peer's AllowedIPs covers them. Implemented: worker netserve bringup (runAgent now builds the proxy+resolver post-enroll so the mesh-egress source is known); the proxy steps aside for the DNS VIP via WithInfraVIPExemptions while OWNING the API VIP 10.43.0.1:443 (L4-forward to the apiserver endpoint over the mesh with WithMeshEgressSource — pod keeps dialing 10.43.0.1 so the serving-cert SAN holds; default/kubernetes is NOT mutated — the lease reconciler owns it); the <1024 DNS/API VIP binds go through the netd helper BindPort (specific address); per-pod Seatbelt egress scoped to the real DNS VIP (10.43.0.10) + API VIP (10.43.0.1:443) via runtimed Posture. DIVERGENCE: the resolver is IN-PROCESS (A-record + upstream forward, IPv4-only, no SRV/PTR/headless), NOT CoreDNS-the-binary — darwin-net exposes no embeddable DNS server and CoreDNS can't inherit the helper-passed socket fd under launchd; documented in pkg/netserve. CODE-COMPLETE + unit-proven; the cross-node in-pod kubectl+DNS is the lab e2e."
         acceptance:
           - id: M3.3-a1
             met: false
