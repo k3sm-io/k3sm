@@ -188,7 +188,10 @@ var (
 // provider resolves configMap/secret/envFrom (via its Resolver) and downward-API
 // (via the node identity) here, before the box crosses the runtime boundary.
 func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runtimev1.PodBox, error) {
-	box := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim)
+	box, err := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim)
+	if err != nil {
+		return nil, err
+	}
 	// Deny every pod the root helper socket: pods share the _k3sm uid with the
 	// legitimate helper client, so the sandbox is where the privileged daemon is
 	// fenced off from the workload.
