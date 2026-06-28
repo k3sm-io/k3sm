@@ -84,8 +84,22 @@
 // true in HA, so exactly one server's scheduler/KCM is active (two active schedulers
 // would double-bind pods; two KCMs would double-reconcile). The leader-election Leases
 // (coordination.k8s.io, kube-system/kube-scheduler + kube-controller-manager) are
-// authorized by the components' static admin token (system:masters, RBAC-exempt) plus
-// the apiserver's auto-created system:kube-scheduler / system:kube-controller-manager
-// bootstrap RBAC — no pkg/rbac object is needed (the documented M4.1 component-identity
-// divergence still holds: the in-process components carry the admin token).
+// authorized by the apiserver's auto-created system:kube-scheduler /
+// system:kube-controller-manager bootstrap RBAC, which binds the components' OWN
+// per-component identities — no pkg/rbac object is needed.
+//
+// # Component identities (k3s alignment)
+//
+// The scheduler and controller-manager authenticate with their OWN signing-CA-issued
+// client certs (CN=system:kube-scheduler / system:kube-controller-manager) via
+// per-component kubeconfigs (provisionComponentCerts), NOT the shared system:masters
+// admin token — so the apiserver's bootstrap RBAC actually constrains them (the k3s
+// model; this closes the M4.1 component-identity divergence). The KCM additionally runs
+// with --use-service-account-credentials=true, so each controller authenticates as its
+// own system:controller:<name> service account. --client-ca-file is set unconditionally
+// (single-node included) so those client certs authenticate. The in-process VK node, the
+// post-bring-up provisioning client, and the healthz probe still carry the system:masters
+// admin token: the embedded node cannot move to a system:node identity until the
+// Virtual-Kubelet secret/configmap informers are scoped (they LIST/WATCH cluster-wide,
+// which the Node authorizer does not grant).
 package executor

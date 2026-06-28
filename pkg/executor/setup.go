@@ -3,13 +3,23 @@ package executor
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"time"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
+
+// componentCertValidity is the lifetime of a per-component client cert (the scheduler /
+// controller-manager identities). One year matches the admin client cert; the certs are
+// re-minted on every server boot (provisionComponentCerts), so the control plane never
+// runs near expiry.
+const componentCertValidity = 365 * 24 * time.Hour
 
 // cpBinaries are the prebuilt control-plane binaries downloaded from kwok-ci/k8s.
 var cpBinaries = []string{"kube-apiserver", "kube-scheduler", "kube-controller-manager", "kubectl"}
@@ -25,6 +35,16 @@ func certDir(workDir string) string { return filepath.Join(workDir, "apiserver-c
 
 // kubeconfigPath is the admin kubeconfig the executor writes.
 func kubeconfigPath(workDir string) string { return filepath.Join(workDir, "k3sm.kubeconfig") }
+
+// schedulerKubeconfigPath / controllerManagerKubeconfigPath are the per-component
+// client-cert kubeconfigs the scheduler and controller-manager authenticate with (their
+// OWN system: identities, not the shared system:masters admin kubeconfig).
+func schedulerKubeconfigPath(workDir string) string {
+	return filepath.Join(workDir, "kube-scheduler.kubeconfig")
+}
+func controllerManagerKubeconfigPath(workDir string) string {
+	return filepath.Join(workDir, "kube-controller-manager.kubeconfig")
+}
 
 // tokenFilePath is the static token-auth CSV.
 func tokenFilePath(workDir string) string { return filepath.Join(workDir, "tokens.csv") }
@@ -180,6 +200,55 @@ users:
 `, apiServerURL(port), token)
 	if err := os.WriteFile(kubeconfigPath(workDir), []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write kubeconfig: %w", err)
+	}
+	return nil
+}
+
+// writeComponentKubeconfig mints a client cert (CommonName cn, no Organization)
+// from the SIGNING CA — which the apiserver's unconditional --client-ca-file trusts —
+// and writes a 0600 client-cert kubeconfig at path pointing at the loopback apiserver.
+// The component (kube-scheduler / kube-controller-manager) then authenticates as cn, so
+// the apiserver's auto-created bootstrap RBAC (the system:kube-scheduler /
+// system:kube-controller-manager ClusterRoleBindings) constrains it — the k3s
+// per-component-identity model, replacing the shared system:masters admin token.
+//
+// verifyClusterCA selects the server-trust posture: when the apiserver presents a
+// cluster-CA-signed serving cert (the mesh path) the kubeconfig pins
+// certificate-authority-data to the cluster CA; single-node the apiserver self-signs, so
+// the co-located loopback component skips verification (insecure-skip-tls-verify, the
+// same posture the single-node admin kubeconfig uses) while still presenting its
+// client-cert identity.
+func writeComponentKubeconfig(path string, port int, cn string, h *certs.Hierarchy, verifyClusterCA bool) error {
+	certPEM, keyPEM, err := h.Signing.IssueClient(cn, nil, componentCertValidity)
+	if err != nil {
+		return fmt.Errorf("issue %s client cert: %w", cn, err)
+	}
+	b64 := base64.StdEncoding.EncodeToString
+	clusterTLS := "    insecure-skip-tls-verify: true"
+	if verifyClusterCA {
+		clusterTLS = "    certificate-authority-data: " + b64(h.Cluster.CertPEM)
+	}
+	content := fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: k3sm
+  cluster:
+    server: %q
+%s
+contexts:
+- name: k3sm
+  context:
+    cluster: k3sm
+    user: %s
+current-context: k3sm
+users:
+- name: %s
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+`, apiServerURL(port), clusterTLS, cn, cn, b64(certPEM), b64(keyPEM))
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("write %s kubeconfig: %w", cn, err)
 	}
 	return nil
 }
