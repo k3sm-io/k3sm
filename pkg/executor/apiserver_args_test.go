@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // flagValue returns the value following the first occurrence of name in args
@@ -125,9 +127,11 @@ func TestApiserverArgsNodeRBAC(t *testing.T) {
 	}
 }
 
-// TestApiserverArgsSingleNodeDefault confirms the M1/M2 single-node path is
-// unchanged: with the new fields zero, the apiserver binds loopback (via NodeIP) and
-// the new M3 flags are omitted.
+// TestApiserverArgsSingleNodeDefault confirms the M1/M2 single-node path: with the new
+// fields zero, the apiserver binds loopback (via NodeIP) and the kubelet-CA /
+// anonymous-auth flags are omitted. --client-ca-file is NO LONGER omitted single-node —
+// it is unconditional now (TestClientCAFileAlwaysSet covers it) so the per-component +
+// system:node client certs authenticate.
 func TestApiserverArgsSingleNodeDefault(t *testing.T) {
 	cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
 	args := apiServerArgs(cfg)
@@ -135,9 +139,29 @@ func TestApiserverArgsSingleNodeDefault(t *testing.T) {
 		t.Errorf("single-node --bind-address = %q, want 127.0.0.1", got)
 	}
 	joined := strings.Join(args, " ")
-	for _, absent := range []string{"--client-ca-file", "--kubelet-certificate-authority", "--anonymous-auth"} {
+	for _, absent := range []string{"--kubelet-certificate-authority", "--anonymous-auth"} {
 		if strings.Contains(joined, absent) {
 			t.Errorf("single-node path must not set %s, args=%v", absent, args)
 		}
+	}
+}
+
+// TestClientCAFileAlwaysSet is the deliverable-3 guard: --client-ca-file is wired in
+// BOTH postures so the per-component (system:kube-scheduler / system:kube-controller-
+// manager) and system:node client certs authenticate. Single-node (no explicit
+// ClientCAFile) defaults to the signing CA under the work-dir PKI dir; the mesh path's
+// explicit ClientCAFile is honored verbatim. The M4.1 review flagged the prior
+// mesh-only gating.
+func TestClientCAFileAlwaysSet(t *testing.T) {
+	single := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+	wantDefault := certs.SigningCACertPath("/wd")
+	if got := flagValue(apiServerArgs(single), "--client-ca-file"); got != wantDefault {
+		t.Errorf("single-node --client-ca-file = %q, want the defaulted signing CA %q", got, wantDefault)
+	}
+
+	mesh := single
+	mesh.ClientCAFile = "/var/lib/k3sm/server/tls/signing-ca.crt"
+	if got := flagValue(apiServerArgs(mesh), "--client-ca-file"); got != mesh.ClientCAFile {
+		t.Errorf("mesh --client-ca-file = %q, want the explicit %q (honored verbatim)", got, mesh.ClientCAFile)
 	}
 }

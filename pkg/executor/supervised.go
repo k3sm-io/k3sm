@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,7 +14,18 @@ import (
 	"syscall"
 	"time"
 
-	"crypto/tls"
+	"k3sm.io/k3sm/pkg/certs"
+)
+
+// schedulerCN / controllerManagerCN are the CommonNames of the per-component client
+// certs the scheduler and controller-manager authenticate with — their OWN system:
+// identities (the k3s model), which the apiserver's auto-created bootstrap RBAC
+// (ClusterRoleBindings system:kube-scheduler / system:kube-controller-manager) binds
+// to the matching ClusterRoles. They replace the shared system:masters admin token the
+// child components carried through M6.
+const (
+	schedulerCN         = "system:kube-scheduler"
+	controllerManagerCN = "system:kube-controller-manager"
 )
 
 // kcmDisabledControllers are the node-side controllers k3sm DROPS because they
@@ -151,6 +163,41 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := writeKubeconfig(s.cfg.WorkDir, s.cfg.APIServerPort, s.token); err != nil {
 		return err
 	}
+	if err := s.provisionComponentCerts(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// provisionComponentCerts ensures the cluster + signing CA hierarchy exists (so the
+// apiserver's unconditional --client-ca-file has a CA to trust) and writes the
+// per-component client-cert kubeconfigs the scheduler and controller-manager
+// authenticate with — each its OWN system: identity instead of the shared system:masters
+// admin token (the k3s model; closes the M4.1 component-identity divergence). The certs
+// are signed by the SIGNING CA (= --client-ca-file). EnsureHierarchy is idempotent — it
+// LOADS an existing hierarchy (the mesh path in cmd/k3sm/server.go creates it before
+// Start), so single-node mints a fresh hierarchy and both paths re-issue the component
+// kubeconfigs against the same CA on every boot. It runs in provision() (before bringUp
+// starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
+// components — and the apiserver — start.
+func (s *Supervised) provisionComponentCerts() error {
+	h, err := certs.EnsureHierarchy(s.cfg.WorkDir)
+	if err != nil {
+		return fmt.Errorf("ensure CA hierarchy: %w", err)
+	}
+	// The apiserver presents a cluster-CA-signed serving cert only when one was supplied
+	// (the mesh path sets ServingCertFile); single-node it self-signs into --cert-dir, so
+	// the co-located loopback components skip server verification (matching the admin
+	// kubeconfig's single-node insecure-skip posture) while still presenting their
+	// client-cert identity. The identity — not the loopback server-auth — is the
+	// load-bearing change.
+	verifyClusterCA := s.cfg.ServingCertFile != "" && s.cfg.ServingKeyFile != ""
+	if err := writeComponentKubeconfig(schedulerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, schedulerCN, h, verifyClusterCA); err != nil {
+		return err
+	}
+	if err := writeComponentKubeconfig(controllerManagerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, controllerManagerCN, h, verifyClusterCA); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -221,9 +268,12 @@ func (s *Supervised) kineSecretEnv() ([]string, error) {
 
 // startAPIServer launches kube-apiserver against kine on the secure port. From M4.1
 // it enforces --authorization-mode=Node,RBAC + the NodeRestriction admission plugin
-// (the static admin token stays system:masters so the in-process components are
-// RBAC-exempt) and sets --kubelet-preferred-address-types=InternalIP so kubectl
-// logs/exec reach the node by IP (closing the M0.3 gap).
+// (the scheduler + controller-manager authenticate with their OWN per-component client
+// certs — system:kube-scheduler / system:kube-controller-manager, bound by the
+// apiserver's bootstrap RBAC; only the in-process VK node + post-bring-up provisioning
+// + the healthz probe still carry the system:masters admin token) and sets
+// --kubelet-preferred-address-types=InternalIP so kubectl logs/exec reach the node by
+// IP (closing the M0.3 gap).
 //
 // In-pod API reachability (M2.4): the apiserver binds 127.0.0.1 and the
 // auto-created kubernetes.default.svc endpoint advertises --advertise-address,
@@ -254,13 +304,14 @@ func (s *Supervised) startAPIServer(ctx context.Context) error {
 
 // apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
 // the M3/M4 trust posture is table-tested without booting the apiserver: the mesh
-// BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (so the flip
-// is a pure authorizer switch), --kubelet-certificate-authority, the
+// BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (always set —
+// defaulting to the signing CA so the per-component + system:node client certs
+// authenticate single-node too), --kubelet-certificate-authority, the
 // --authorization-mode (Node,RBAC by default, M4.1), and the NodeRestriction
 // admission plugin are all asserted here. It self-defaults the bind address and the
 // authorization mode (so a raw Config in a test renders the production posture); the
 // M1/M2 single-node path leaves the M3 fields zero, so the binding falls back to
-// NodeIP (loopback) and those flags are omitted.
+// NodeIP (loopback) and the kubelet-CA / anonymous-auth flags are omitted.
 func apiServerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
 	bind := cfg.BindAddress
@@ -308,9 +359,18 @@ func apiServerArgs(cfg Config) []string {
 		"--kubelet-preferred-address-types", "InternalIP",
 		"--allow-privileged",
 	}
-	if cfg.ClientCAFile != "" {
-		args = append(args, "--client-ca-file", cfg.ClientCAFile)
+	// --client-ca-file is UNCONDITIONAL (the M4.1 review flagged the mesh-gating): the
+	// apiserver must trust the cluster client-CA so the per-component client certs
+	// (system:kube-scheduler / system:kube-controller-manager) AND joined workers'
+	// system:node certs authenticate — single-node included. It defaults to the signing
+	// CA under the work-dir PKI dir (which provision ensures exists); an explicit mesh
+	// ClientCAFile is honored verbatim. Adding x509 client-cert auth is additive — the
+	// static token auth (admin/healthz) is unaffected.
+	clientCA := cfg.ClientCAFile
+	if clientCA == "" {
+		clientCA = certs.SigningCACertPath(wd)
 	}
+	args = append(args, "--client-ca-file", clientCA)
 	if cfg.KubeletCAFile != "" {
 		args = append(args, "--kubelet-certificate-authority", cfg.KubeletCAFile)
 	}
@@ -323,18 +383,22 @@ func apiServerArgs(cfg Config) []string {
 	return args
 }
 
-// startScheduler launches kube-scheduler against the admin kubeconfig.
+// startScheduler launches kube-scheduler against its OWN per-component kubeconfig.
 func (s *Supervised) startScheduler(ctx context.Context) error {
 	return s.spawn(ctx, "kube-scheduler", schedulerArgs(s.cfg)...)
 }
 
-// schedulerArgs renders the kube-scheduler argv from cfg. Pure so the M6.0
-// leader-election posture is table-tested: --leader-elect is false single-node (one
-// candidate, no lease churn — the M1–M5 default, byte-unchanged) and true in HA
-// (Postgres multi-writer) so only ONE server's scheduler is active (two active
-// schedulers double-bind pods).
+// schedulerArgs renders the kube-scheduler argv from cfg. The --kubeconfig /
+// --authentication-kubeconfig / --authorization-kubeconfig point at the scheduler's
+// OWN client-cert kubeconfig (CN=system:kube-scheduler, provisioned by
+// provisionComponentCerts), NOT the system:masters admin kubeconfig — so the
+// apiserver's bootstrap system:kube-scheduler ClusterRoleBinding actually constrains
+// it (the k3s model). Pure so the M6.0 leader-election posture is table-tested:
+// --leader-elect is false single-node (one candidate, no lease churn — the M1–M5
+// default, byte-unchanged) and true in HA (Postgres multi-writer) so only ONE server's
+// scheduler is active (two active schedulers double-bind pods).
 func schedulerArgs(cfg Config) []string {
-	kc := kubeconfigPath(cfg.WorkDir)
+	kc := schedulerKubeconfigPath(cfg.WorkDir)
 	return []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
@@ -351,18 +415,28 @@ func (s *Supervised) startControllerManager(ctx context.Context) error {
 	return s.spawn(ctx, "kube-controller-manager", controllerManagerArgs(s.cfg)...)
 }
 
-// controllerManagerArgs renders the kube-controller-manager argv from cfg. Pure so the
-// M6.0 leader-election posture is table-tested alongside the scoped --controllers set:
-// --leader-elect is false single-node and true in HA so only ONE server's KCM is active
-// (two active KCMs double-reconcile every object).
+// controllerManagerArgs renders the kube-controller-manager argv from cfg. The three
+// kubeconfig flags point at the KCM's OWN client-cert kubeconfig
+// (CN=system:kube-controller-manager, provisioned by provisionComponentCerts), NOT the
+// system:masters admin kubeconfig. Because the system:kube-controller-manager
+// ClusterRole is NOT a superset of the per-controller roles, the move REQUIRES
+// --use-service-account-credentials=true so each controller authenticates as its own
+// service account (system:controller:<name>, bound by the apiserver's bootstrap RBAC) —
+// without it the deployment/endpointslice/etc. controllers would be RBAC-denied. The
+// KCM signs those SA tokens locally with --service-account-private-key-file (no
+// TokenRequest round-trip), so --service-account-private-key-file + --root-ca-file stay
+// as-is. Pure so the M6.0 leader-election posture is table-tested alongside the scoped
+// --controllers set: --leader-elect is false single-node and true in HA so only ONE
+// server's KCM is active (two active KCMs double-reconcile every object).
 func controllerManagerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
-	kc := kubeconfigPath(wd)
+	kc := controllerManagerKubeconfigPath(wd)
 	return []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
 		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
+		"--use-service-account-credentials=true",
 		"--service-account-private-key-file", saKeyPath(wd),
 		"--root-ca-file", filepath.Join(certDir(wd), "apiserver.crt"),
 		"--bind-address", "127.0.0.1",
