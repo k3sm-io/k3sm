@@ -29,13 +29,24 @@
 //     each node's proxy owning the VIP locally. The apiserver serving cert SANs
 //     10.43.0.1, so in-cluster TLS still validates.
 //
-// # Why an in-process resolver, not CoreDNS-the-binary
+// # Why an in-process resolver, not CoreDNS-the-binary (and the native-binary follow-up)
 //
-// darwin-net supplies only Corefile rendering (for an external CoreDNS deployment)
-// and a client-side dns.Resolver — no embeddable DNS server. CoreDNS-the-binary
-// cannot inherit the netd-helper-passed socket fd under launchd, and the
-// unprivileged posture binds the <1024 DNS VIP only via that fd; embedding
-// CoreDNS-the-library over a passed fd is intractable. So k3sm runs a minimal
-// authoritative resolver (clusterResolver) instead — see resolver.go for the
-// deliberate, documented divergence (no SRV/PTR/pod/headless records, IPv4 only).
+// CoreDNS is pure Go, so a native darwin/arm64 binary builds cleanly (GOOS=darwin
+// GOARCH=arm64, the way pkg/executor builds kine from source + ad-hoc-signs it).
+// Running the REAL CoreDNS natively — full SRV/PTR/headless records, no Linux, no
+// OCI artifact — is the faithful k3s realization and the intended FOLLOW-UP. It is
+// BLOCKED today by the <1024 VIP bind in the unprivileged _k3sm posture: binding
+// 10.43.0.10:53 needs root, so the netd helper binds it (root) and passes the socket
+// back over SCM_RIGHTS — but CoreDNS-the-binary creates its OWN sockets (mainline
+// CoreDNS has no systemd socket-activation / LISTEN_FDS), so it cannot adopt the
+// helper-passed fd, and darwin-net exposes no embeddable DNS server to bind it
+// in-process. (In root/direct mode CoreDNS could bind the VIP itself, but the
+// production posture is unprivileged, and a root-only resolver would be a SECOND DNS
+// code path.) So k3sm runs a minimal authoritative resolver (clusterResolver), which
+// DOES adopt the helper-passed fd (net.FileListener / net.FilePacketConn) — see
+// resolver.go. Its divergence (no SRV/PTR/pod/headless, IPv4 only) is MOOT on the
+// native hostprocess path — every pod reports podIP == nodeIP, so there are no
+// per-pod / headless addresses to serve — and becomes material only on the
+// per-pod-IP vm path, which is exactly where the native-CoreDNS-binary follow-up
+// (a supervised native process owning the VIP) pays off.
 package netserve
