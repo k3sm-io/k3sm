@@ -12,6 +12,11 @@ const (
 	CACertPath = "/v1-k3sm/cacert"
 	// JoinPath is the worker-join exchange (token + node-password + CSRs + mesh-enroll).
 	JoinPath = "/v1-k3sm/join"
+	// BundlePath serves the AES-256-GCM-sealed CA bootstrap bundle to a joining
+	// control-plane SERVER (server-token-authorized via the Authorization bearer header;
+	// never a worker). The joining server decrypts it to reconstruct the IDENTICAL
+	// cluster + signing CAs (M6.1, DESIGN §5c).
+	BundlePath = "/v1-k3sm/server-bootstrap"
 )
 
 // JoinSchemaVersion stamps the k3sm-internal join exchange payloads (JoinRequest /
@@ -76,6 +81,11 @@ type JoinResponse struct {
 	// KubeletServingCertPEM is the issued kubelet-serving cert (cluster CA); may be
 	// empty if no serving CSR was submitted.
 	KubeletServingCertPEM string `json:"kubeletServingCertPEM,omitempty"`
+	// APIServers are the control-plane apiserver endpoints (host:port) the joining
+	// node's client-side load-balancer health-checks + targets, so a server death fails
+	// over without re-pointing the kubeconfig (M6.1). A single-server cluster carries
+	// that one server; the live cross-node failover is the lab leg.
+	APIServers []string `json:"apiServers,omitempty"`
 	// Mesh is the mesh-enroll response (assigned podCIDR + mesh-egress IP + peer
 	// snapshot).
 	Mesh netv1.MeshEnrollResponse `json:"mesh"`
@@ -87,6 +97,16 @@ type TokenVerifier interface {
 	// VerifyToken parses and verifies tok, returning nil iff it is a minted,
 	// unexpired bootstrap token.
 	VerifyToken(tok string) error
+}
+
+// BundleSource yields the AES-256-GCM-sealed CA bootstrap bundle the server-bootstrap
+// endpoint returns (the envelope a joining server decrypts to reconstruct the identical
+// CAs). It is a seam so the production impl (seal the live hierarchy, or read the
+// datastore bootstrap key) stays out of this package — keeping bootstrap free of an
+// apiserver-client dependency.
+type BundleSource interface {
+	// SealedBundle returns the current sealed CA bundle envelope.
+	SealedBundle(ctx context.Context) ([]byte, error)
 }
 
 // Enroller performs the controller-mediated mesh enroll: it assigns the node's

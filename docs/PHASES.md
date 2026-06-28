@@ -1,7 +1,7 @@
 ---
 repo: k3sm
 schema: phases/v1
-current_phase: M4
+current_phase: M6
 updated: 2026-06-27
 updated_by: orchestrator
 
@@ -314,18 +314,20 @@ phases:
 
   - id: M6
     title: HA — multi-server control plane (kine→Postgres, server-join, identical-CA bundle)
-    status: todo
+    status: in-progress
+    note: "M6.0 (kine→Postgres multi-writer datastore + HA leader-election) AND M6.1 (HA server-join + the AES-256-GCM identical-CA bundle) are CODE-COMPLETE + unit-proven; the live 2-server-on-Postgres acceptance + the watch-staleness soak + the second-server-join/failover are lab (hack/lab/m6.sh, K3SM_LAB=1 + 2 servers + Postgres — never auto-greened). FRAMING: HA is Postgres-FROM-INIT (greenfield) — the single-node kine→SQLite default is byte-unchanged, so there is NO live SQLite→Postgres data conversion (an operator kine dump/restore is the only path; in-place conversion is out of scope). M6.1 reconstructs identical CAs via a server-token-derived AES-256-GCM bundle (PBKDF2/600k + per-seal salt+nonce, AAD-bound), fail-closed import-then-load, datastore-backed node-password sharing, and a built-but-lab-failover client-side apiserver LB + signing-CA admin client cert."
     depends_on:
       - apis:M4.1
       - darwin-net:M3
     subphases:
       - id: M6.0
         title: kine→Postgres datastore for multi-writer HA
-        status: todo
+        status: in-progress
+        strategy: phased (named exception: kine/SQLite datastore migration)
         deliverables:
           - id: M6.0-d1
-            done: false
-            desc: "swap the single-writer kine→SQLite datastore for kine→Postgres (pure-Go pgx) so >1 control-plane server can share one consistent datastore (SQLite is single-host single-writer; two servers each on their own SQLite = split-brain). The kine→SQLite→Postgres change is the named kine/SQLite datastore-migration exception (additive cycle, verify forward-safe, plan the forward fix — rollback may be impossible)."
+            done: true
+            desc: "kine→Postgres multi-writer datastore + HA leader-election (mimicking k3s's external-datastore HA — 2+ servers share ONE Postgres, the single source of truth, NO etcd quorum; the single-node default stays SQLite). pkg/executor: ADDITIVE Config.DatastoreEndpoint (a Postgres DSN) — empty (zero value) keeps the kine→SQLite WAL default BYTE-UNCHANGED (single-node M1–M5 untouched), non-empty points kine at Postgres via pgx; the apiserver still talks to the LOCAL kine (--etcd-servers 127.0.0.1:<KinePort>), each server runs its own kine against the shared Postgres (the k3s topology). SECRET HANDLING: the DSN password never lands on argv or a log — it is relocated to a 0600 PGPASSFILE handed out-of-band to the kine child (pgx reads it via the libpq env fallback), only the password-stripped DSN reaches kine's --endpoint, and component logs are tightened to 0600. POSTURE-AWARE kine version (the deferred bump-vs-soak decision, resolved via k3s): SQLite stays DefaultKineVersion=v1.14.2 (UNCHANGED, zero migration risk for the installed base), Postgres-HA pins DefaultKineVersionHA=v0.16.3 — a real, go-install-verified ≥0.15 release carrying the kine#577 watch-progress-notify fix (defaults --watch-progress-notify-interval=5s + --emulated-etcd-version=3.6.11; greenfield-from-init, so no SQLite→newer-kine upgrade). SPLIT-BRAIN GUARD (fail-closed): Config.Validate rejects an HA server (ServerJoin) without a DatastoreEndpoint (ErrHARequiresDatastore) — a 2nd server can NEVER silently fall back to its own SQLite. LEADER ELECTION: scheduler + KCM --leader-elect is Config-gated (false single-node — unchanged; true in HA so only one server's scheduler/KCM is active — two would double-bind/double-reconcile); only the apiserver is active/active; the leader-election Leases are authorized by the components' system:masters admin token + the apiserver's auto-created system:* bootstrap RBAC (no new pkg/rbac object). pgx POOL BOUNDS pinned (kine's default is UNLIMITED): 32 max-open/server so 2×32 ≤ Postgres default max_connections (100) + idle/lifetime; doc.go documents Postgres as the operator-managed datastore SPOF (pg_dump/PITR runbook, no _busy_timeout analog → operator statement/lock timeouts, local-WAL-sub-ms→network-RTT write tradeoff; HA buys process redundancy, not datastore redundancy). cmd/k3sm server grows --datastore-endpoint (or $K3SM_DATASTORE_ENDPOINT, off k3sm's own argv) + --server-join. Proven by TestDatastoreEndpointSQLiteDefault / TestDatastoreEndpointPostgres / TestDatastorePasswordRelocation / TestKineVersionPostureAware / TestHARequiresDatastoreEndpoint / TestLeaderElectHAvsSingleNode (pkg/executor, -race clean). The live 2-server-on-Postgres + the kine#577 watch-staleness soak are the lab production-trust gate (hack/lab/m6.sh + e2e/TestM6_*)."
         acceptance:
           - id: M6.0-a1
             met: false
@@ -333,11 +335,13 @@ phases:
             method: e2e
       - id: M6.1
         title: HA server-join + identical-CA bootstrap bundle
-        status: todo
+        status: in-progress
+        strategy: phased (named exception: kine/SQLite datastore migration)
+        note: "CODE-COMPLETE + unit-proven; the live 2-Mac + Postgres server-join/failover is the lab acceptance (M6.1-a1 met:false). The crypto core + the fail-closed server-join are the must-haves and are done; the client-side apiserver LB is BUILT (pkg/loadbalancer: server-set + health-check + pick-healthy + TCP-forward, unit-proven) with APIServers plumbed through the join result — the live cross-Mac kubeconfig-retarget/failover is the lab leg."
         deliverables:
           - id: M6.1-d1
-            done: false
-            desc: "the M3 worker-join path extended to a SECOND CONTROL-PLANE SERVER: the AES-256-GCM bootstrap bundle so joining servers reconstruct IDENTICAL cluster + signing CAs (DESIGN §5c); the bundle endpoint is authorized to the server-bootstrap identity ONLY (never an agent), keyed by a strong KDF (PBKDF2/scrypt) over a high-entropy secret with a unique GCM nonce per seal (security Wave-0 CRIT5). Joining servers share the M6.0 Postgres datastore."
+            done: true
+            desc: "the M3 worker-join path extended to a SECOND CONTROL-PLANE SERVER reconstructing IDENTICAL cluster + signing CAs (DESIGN §5c), mimicking k3s's datastore-bootstrap-key model. CRYPTO CORE: certs.Hierarchy.Marshal/Unmarshal serialize the 4 CA PEMs (certs owns them); pkg/bootstrap SealBundle/OpenBundle AES-256-GCM-seal the opaque bytes (the seal stays in bootstrap, NOT certs — the bootstrap→certs edge would cycle). Key derived via PBKDF2-HMAC-SHA256 (pinned 600k iters + a crypto/rand 128-bit salt in a versioned envelope) from a MACHINE-GENERATED ≥256-bit server-bootstrap secret (NOT a passphrase, NOT a worker token); a FRESH 12-byte crypto/rand nonce per seal (never a counter — launchctl kickstart resets state); a versioned AAD-bound envelope (magic+version+kdf-id+iters+salt+nonce as GCM AAD); gcm.Open failure is FATAL (tag verified before any plaintext). The sealed envelope is also published to the shared Postgres as a kube-system Secret (the k3s bootstrap-key model); decrypted keys written 0600, never logged. SERVER-CLASS IDENTITY: a server token K10<caHash>::server:<secret> (ServerBootstrapUser system:k3sm-server-bootstrap) DISTINCT from the M3 worker token (system:k3sm-bootstrap); the CA-bundle endpoint (/v1-k3sm/server-bootstrap, Authorization bearer) authorizes the server class ONLY — a leaked worker token can NEVER reconstruct the signing CA. SERVER-JOIN: k3sm server --server-join --server <url> --token reuses the M3 PinnedClient (pinned-CA TLS, no insecure-skip) to fetch the bundle, then IMPORT-THEN-LOAD: decrypt → certs.WriteHierarchy the 4 PEMs into PKIDir → THEN EnsureHierarchy loads them. FAIL CLOSED on any fetch/decrypt/tag failure — never falls through to ensureCA minting divergent CAs (k3sm token create --server mints the server token). DATASTORE-BACKED STORES: the HA node-password store is a kube-system Secret (shared across servers — a name bound on A is enforced on B; the per-process MemoryNodePasswords is kept single-node). CLIENT-LB + ADMIN CERT: pkg/loadbalancer tracks the apiserver set, health-checks, picks a healthy one, and TCP-forwards (the join result carries APIServers); the HA admin kubeconfig (admin.kubeconfig) uses a signing-CA-issued system:masters CLIENT CERT (reconstructible on every server) + cluster-CA verification, so kubectl works against any server. Proven by TestCABundleSealUnsealRoundTrip/TestCABundleWrongSecretFailsClosed/TestCABundleNonceUniquePerSeal/TestCABundleTamperedAADRejected (crypto), TestServerTokenDistinctFromWorker/TestLoadOrCreateServerSecret + TestCABundleEndpointRejectsWorkerIdentity (server identity), TestServerJoinImportsBundleBeforeEnsureHierarchy/TestServerJoinFailsClosedOnAbsentBundle (fail-closed join), TestHierarchyMarshalUnmarshalRoundTrip/TestWriteHierarchyThenEnsureLoads (certs), TestNodePasswordSharedAcrossServersInHA (datastore store), TestApiserverLBPicksHealthy/TestLoadBalancerForwardsToHealthy + TestAdminKubeconfigUsesClientCert (LB + admin cert), all -race clean. The live 2-Mac + Postgres server-join/failover is the lab leg (e2e/TestM6_SecondServerJoinsReconstructsCAs + hack/lab/m6.sh)."
         acceptance:
           - id: M6.1-a1
             met: false
@@ -504,17 +508,50 @@ DESIGN §5c.
   separate-binary virtualization-entitlement signing (M4.0 packaging).
 Exit (§9 M5): a Linux image runs under `runtimeClassName: vm`, Service/DNS-reachable, beside native pods.
 
-## M6 — HA: multi-server control plane (last phase) ⬜
+## M6 — HA: multi-server control plane (last phase) 🟡
 Moved here from M4 so HA is the **final** milestone (single-server is sufficient through M5; HA is the last,
 most complex ops capability). Two sub-phases:
-- ⬜ **M6.0** — kine→**Postgres** (pure-Go pgx) so >1 control-plane server shares one consistent datastore
-  (SQLite is single-host single-writer; two servers each on their own SQLite = split-brain). The kine→SQLite→
-  Postgres change is the named **kine/SQLite datastore-migration** exception (additive cycle; verify forward-safe;
-  plan the forward fix — rollback may be impossible).
-- ⬜ **M6.1** — HA **server-join**: the M3 worker-join path extended to a second control-plane server + the
-  **AES-256-GCM identical-CA bundle** (DESIGN §5c) so joining servers reconstruct identical cluster+signing CAs;
-  the bundle endpoint is server-bootstrap-identity-only (never an agent), strong-KDF'd, unique GCM nonce per seal
-  (security Wave-0 CRIT5). Exit: 2 servers on shared Postgres; kill one → the cluster keeps serving (lab).
+- 🟡 **M6.0** — kine→**Postgres** multi-writer datastore + HA **leader-election**, **CODE-COMPLETE + unit-proven**
+  (live 2-server + soak are lab). **Strategy: phased (named exception: kine/SQLite datastore migration)** — but HA is
+  **Postgres-from-init** (greenfield): the single-node kine→SQLite default is **byte-unchanged**, so there is **no
+  live SQLite→Postgres data conversion** (an operator kine dump/restore is the only path; in-place conversion is out
+  of scope). As-built: additive `Config.DatastoreEndpoint` (Postgres DSN; empty ⇒ the unchanged SQLite WAL default),
+  the DSN **password kept off argv/logs** (relocated to a 0600 `PGPASSFILE` for the kine child, password-stripped DSN
+  on `--endpoint`, 0600 component logs), a **posture-aware kine version** (`DefaultKineVersion` v1.14.2 stays for
+  SQLite; `DefaultKineVersionHA` **v0.16.3** — a go-install-verified ≥0.15 release with the kine#577
+  watch-progress-notify fix — for Postgres), a **fail-closed split-brain guard** (`Config.Validate` ⇒
+  `ErrHARequiresDatastore` if an HA server has no datastore — never a per-server SQLite fallback), **leader election**
+  (scheduler/KCM `--leader-elect` true only in HA so one server is active; only the apiserver is active/active), and
+  **pinned pgx pool bounds** (kine's default is unlimited ⇒ 2×32 ≤ Postgres `max_connections` 100) + the
+  **Postgres-SPOF** docs (operator-managed: pg_dump/PITR; write-latency tradeoff; HA = process redundancy, not
+  datastore redundancy). Proven by `TestDatastoreEndpointSQLiteDefault`/`TestDatastoreEndpointPostgres`/
+  `TestDatastorePasswordRelocation`/`TestKineVersionPostureAware`/`TestHARequiresDatastoreEndpoint`/
+  `TestLeaderElectHAvsSingleNode`. The live two-server-on-Postgres write-A-read-B, the single-active-leader, the
+  kill-A→serve-via-B failover, and the **kine#577 watch-staleness soak** (the production-trust gate) are
+  `hack/lab/m6.sh` + `e2e/TestM6_*` (`K3SM_LAB=1`, 2 servers + Postgres).
+- 🟡 **M6.1** — HA **server-join** + the **AES-256-GCM identical-CA bundle** (DESIGN §5c), **CODE-COMPLETE +
+  unit-proven** (the live 2-Mac + Postgres join/failover is lab). **Strategy: phased (named exception: kine/SQLite
+  datastore migration)** — same exception family as M6.0 (HA). Mimics k3s's datastore-bootstrap-key model.
+  **Crypto core:** `certs.Hierarchy.Marshal/Unmarshal` serialize the four CA PEMs; `bootstrap.SealBundle/OpenBundle`
+  AES-256-GCM-seal the opaque bytes (the seal stays in `bootstrap`, not `certs` — the `bootstrap→certs` edge would
+  cycle). The key is **PBKDF2-HMAC-SHA256** (pinned 600k iters + a `crypto/rand` 128-bit salt) over a
+  **machine-generated ≥256-bit server-bootstrap secret** (not a passphrase, not a worker token); a **fresh 12-byte
+  `crypto/rand` nonce per seal** (never a counter); a **versioned, AAD-bound envelope** (magic+version+kdf-id+iters+
+  salt+nonce as GCM AAD); a `gcm.Open` failure is **fatal** (tag verified before any plaintext). The sealed envelope is
+  published to Postgres as a kube-system Secret (the k3s bootstrap-key model). **Server-class identity:** a server token
+  `K10<caHash>::server:<secret>` (`system:k3sm-server-bootstrap`) **distinct** from the worker token; the CA-bundle
+  endpoint (`/v1-k3sm/server-bootstrap`) authorizes the **server class only** — a leaked worker token can never
+  reconstruct the signing CA. **Fail-closed server-join:** `k3sm server --server-join --server <url> --token` reuses
+  the M3 `PinnedClient` to fetch the bundle, then **import-then-load** (decrypt → `WriteHierarchy` the PEMs into
+  `PKIDir` → **then** `EnsureHierarchy` loads them); any fetch/decrypt/tag failure halts bring-up — it **never** mints
+  divergent CAs. **Datastore-backed node-password store** (a kube-system Secret) shares the anti-impersonation binding
+  across HA servers. **Client-side apiserver LB** (`pkg/loadbalancer`: server-set + health-check + pick-healthy + TCP
+  forward, with `JoinResult.APIServers` plumbed) + an **admin kubeconfig using a signing-CA-issued `system:masters`
+  client cert** (usable against any server). Proven by `TestCABundle{SealUnsealRoundTrip,WrongSecretFailsClosed,
+  NonceUniquePerSeal,TamperedAADRejected}`, `TestServerTokenDistinctFromWorker`, `TestCABundleEndpointRejectsWorkerIdentity`,
+  `TestServerJoin{ImportsBundleBeforeEnsureHierarchy,FailsClosedOnAbsentBundle}`, `TestNodePasswordSharedAcrossServersInHA`,
+  `TestApiserverLBPicksHealthy`, `TestAdminKubeconfigUsesClientCert` (`-race` clean). Exit: 2 servers on shared Postgres;
+  a second Mac joins reconstructing identical CAs; kill one → the cluster keeps serving (**lab** — `e2e/TestM6_SecondServerJoinsReconstructsCAs` + `hack/lab/m6.sh`, **M6.1-a1 `met:false`**).
 
 ## Next
 M3.0 (the multi-node bootstrap + trust core) is **done** (named unit tests, `-race` clean). Remaining M3:
@@ -525,4 +562,7 @@ only remaining item is the root e2e gate `hack/acceptance/m2.sh` (needs root on 
 enforcement) is now **code-complete + unit-proven** (`pkg/rbac` + the `Node,RBAC`+`NodeRestriction` apiserver
 default); its sole remaining item is the live authz flip — the integration-tier `e2e/TestM4_RBACEnforced` on a
 dev Mac (**M4.1-a1 `met:false`, integration-pending**). M4 still owes **M4.0** (packaging/launchd) and **M4.2**
-(the conformance gate green in CI). **HA is now M6 (last phase).**
+(the conformance gate green in CI). **HA is M6 (last phase): M6.0 (kine→Postgres + leader-election) and M6.1 (HA
+server-join + the AES-256-GCM identical-CA bundle) are both code-complete + unit-proven; the live 2-Mac + Postgres
+write-A-read-B, single-active-leader, watch-staleness soak, second-server-join (identical CAs), and kill-A→serve-via-B
+failover are the `hack/lab/m6.sh` / `e2e/TestM6_*` lab legs (`K3SM_LAB=1`, never auto-greened).**

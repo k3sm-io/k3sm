@@ -141,6 +141,31 @@ func (c *CA) IssueServing(cn string, dnsNames []string, ipAddrs []net.IP, validF
 	return certPEM, keyPEM, nil
 }
 
+// IssueClient mints a fresh CLIENT keypair (ExtKeyUsageClientAuth) signed by this CA,
+// for a client identity the CA owns the key material of. cn becomes the certificate's
+// CommonName (the authenticated user) and org its Organization (the RBAC groups). It is
+// how the HA path issues the admin kubeconfig's CN=k3sm-admin, O=system:masters client
+// cert from the SIGNING CA — every server reconstructs the identical signing CA, so the
+// one cert authenticates kubectl against ANY apiserver (unlike a per-server static
+// token). The cert carries no SANs (a client cert is identified by subject, not SAN).
+func (c *CA) IssueClient(cn string, org []string, validFor time.Duration) (certPEM, keyPEM []byte, err error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate client key: %w", err)
+	}
+	der, err := c.signLeaf(&key.PublicKey, pkix.Name{CommonName: cn, Organization: org}, nil, nil, x509.ExtKeyUsageClientAuth, validFor)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal client key: %w", err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM, nil
+}
+
 // ServingChainTLS builds a tls.Certificate that PRESENTS the full chain
 // [serving-leaf, CA] so a pinning client (VerifyPinnedChain) sees this CA in the
 // peer certificates and can verify the leaf against the pinned anchor without first

@@ -40,6 +40,11 @@ type serverOptions struct {
 	clusterIP string // DNS VIP CoreDNS binds + pods resolve against
 	domain    string
 	network   string // host-network backend: auto (default) | none | direct | helper
+
+	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite (M6.0)
+	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
+	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (M6.1 HA server-join)
+	token             string // server-class join token (K10<caHash>::server:<secret>) for the HA server-join (M6.1)
 }
 
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
@@ -66,6 +71,16 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", "cluster.local", "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
+	// M6.0 HA datastore. The DSN may carry a password; prefer the env so it stays off
+	// k3sm's own argv (mirrors --token/$K3SM_TOKEN). k3sm relocates the password off
+	// the kine child's argv too (a 0600 PGPASSFILE), so `ps` never sees the secret.
+	fs.StringVar(&opts.datastoreEndpoint, "datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "kine datastore DSN (postgres://user:pass@host:port/db?sslmode=…) for HA multi-writer; empty = single-node kine→SQLite (or $K3SM_DATASTORE_ENDPOINT)")
+	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard) and sets the HA leader-election. With --server it also fetches the identical-CA bundle from an existing server (M6.1)")
+	// M6.1 HA server-join: a SECOND control-plane server reconstructs the identical
+	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
+	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
+	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join, M6.1; requires --server-join --mesh-ip --token)")
+	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -112,17 +127,64 @@ func runServer(args []string) error {
 		NodeIP:        opts.nodeIP,
 		Logger:        logger,
 	}
+	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
+	// Postgres (DefaultKineVersionHA) and turns on scheduler/KCM leader election so only
+	// one server is active. The executor fail-closes (ErrHARequiresDatastore) if HA is
+	// requested without the endpoint — never a silent per-server SQLite (split-brain).
+	cfg.DatastoreEndpoint = opts.datastoreEndpoint
+	cfg.ServerJoin = opts.serverJoin
+	if opts.datastoreEndpoint != "" || opts.serverJoin {
+		logger.Info("HA datastore mode: kine→Postgres (shared multi-writer datastore); scheduler/KCM leader-elected", "server-join", opts.serverJoin)
+	}
+	// M6.1 HA server-join: a SECOND control-plane server reconstructs the IDENTICAL
+	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
+	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
+	// bring-up; we never fall through to minting fresh, divergent CAs (cluster trust
+	// split). Requires --mesh-ip (the joining server binds its own apiserver +
+	// supervisor on the mesh) + --token (the server-class token).
+	if opts.serverJoin && opts.joinServer != "" {
+		if opts.meshIP == "" {
+			return fmt.Errorf("--server-join with --server requires --mesh-ip (the joining server binds its apiserver + supervisor on the mesh)")
+		}
+		if opts.token == "" {
+			return fmt.Errorf("--server-join with --server requires --token (the server-class join token)")
+		}
+		if err := importServerCABundle(ctx, opts, logger); err != nil {
+			return fmt.Errorf("HA server-join: %w", err)
+		}
+	}
+
 	// M3.0 multi-node: bind the apiserver + the worker-join supervisor on the mesh
 	// interface ONLY, serve a cluster-CA-signed cert, wire --client-ca-file +
 	// --kubelet-certificate-authority + --anonymous-auth=false. Empty --mesh-ip keeps
 	// the single-node loopback/self-signed path (M1/M2) unchanged.
 	var hierarchy *certs.Hierarchy
+	var serverSecret string
 	if opts.meshIP != "" {
 		h, err := certs.EnsureHierarchy(opts.workDir)
 		if err != nil {
 			return fmt.Errorf("ensure CA hierarchy: %w", err)
 		}
 		hierarchy = h
+		// M6.1: the server-bootstrap secret (machine-generated ≥256-bit) — minted +
+		// persisted on the first server, already saved by importServerCABundle on a
+		// joining server. It is the CA-bundle endpoint credential AND the bundle's KDF
+		// passphrase.
+		serverSecret, err = bootstrap.LoadOrCreateServerSecret(serverSecretPath(opts.workDir))
+		if err != nil {
+			return fmt.Errorf("server-bootstrap secret: %w", err)
+		}
+		// M6.1 deliverable 5b: an admin kubeconfig authenticated by a signing-CA-issued
+		// system:masters CLIENT CERT (reconstructible on every server from the shared
+		// signing CA) + cluster-CA server verification — so kubectl works against ANY HA
+		// server. Written beside the executor's loopback token kubeconfig (which the
+		// in-process components keep). Log-and-continue: it is an operator convenience,
+		// not a bring-up dependency.
+		if err := writeAdminClientCertKubeconfig(adminKubeconfigPath(opts.workDir), fmt.Sprintf("https://%s:%d", opts.meshIP, opts.apiPort), h); err != nil {
+			logger.Error("write HA admin kubeconfig", "err", err)
+		} else {
+			logger.Info("wrote HA admin kubeconfig (signing-CA client cert; usable against any server)", "path", adminKubeconfigPath(opts.workDir))
+		}
 		if opts.nodeIP == "127.0.0.1" {
 			opts.nodeIP = opts.meshIP
 		}
@@ -244,17 +306,48 @@ func runServer(args []string) error {
 		}
 	}()
 
-	// 4b. M3.0 — the worker-join supervisor (mesh-bound; mints node certs + enrolls
-	// peers). Only when multi-node is enabled; the live two-Mac join is the K3SM_LAB
-	// gate (the MeshPeer CRD must be installed for the enroller's write to land).
+	// 4b. M3.0/M6.1 — the worker-join supervisor (mesh-bound; mints node certs + enrolls
+	// peers), plus the M6.1 CA-bundle endpoint in the HA posture. Only when multi-node is
+	// enabled; the live two-Mac join is the K3SM_LAB gate (the MeshPeer CRD must be
+	// installed for the enroller's write to land).
 	if opts.meshIP != "" && hierarchy != nil {
 		tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
 		enroller, err := newMeshEnroller(restCfg, logger)
 		if err != nil {
 			return fmt.Errorf("build mesh enroller: %w", err)
 		}
+		// M6.1 deliverable 4: in HA the node-password binding must be SHARED across
+		// servers (a name bound on A is enforced on B), so it is datastore-backed (a
+		// kube-system Secret on the shared Postgres). A single multi-node server keeps
+		// the in-memory store.
+		ha := opts.datastoreEndpoint != "" || opts.serverJoin
+		var nodePasswords bootstrap.NodePasswordStore = bootstrap.NewMemoryNodePasswords()
+		if ha {
+			nodePasswords = newSecretNodePasswords(cs)
+		}
+		deps := bootstrapServerDeps{
+			hierarchy:     hierarchy,
+			meshIP:        opts.meshIP,
+			tokens:        tokens,
+			nodePasswords: nodePasswords,
+			enroller:      enroller,
+			apiServers:    []string{fmt.Sprintf("%s:%d", opts.meshIP, opts.apiPort)},
+		}
+		// M6.1 deliverables 1+2: serve the AES-256-GCM CA bundle authorized by the
+		// SERVER-class token ONLY (never a worker), sealing the live hierarchy; publish
+		// the sealed envelope to the shared datastore (the k3s bootstrap-key model).
+		if ha {
+			bundle := &liveBundleSource{hierarchy: hierarchy, secret: serverSecret}
+			deps.bundle = bundle
+			deps.serverAuth = bootstrap.NewStaticServerSecret(serverSecret)
+			if sealed, err := bundle.SealedBundle(ctx); err != nil {
+				logger.Error("seal bootstrap bundle for datastore", "err", err)
+			} else if err := publishBootstrapBundle(ctx, cs, sealed); err != nil {
+				logger.Warn("publish bootstrap bundle to datastore", "err", err)
+			}
+		}
 		go func() {
-			if err := startBootstrapServer(ctx, hierarchy, opts.meshIP, tokens, enroller, logger); err != nil && ctx.Err() == nil {
+			if err := startBootstrapServer(ctx, deps, logger); err != nil && ctx.Err() == nil {
 				logger.Error("worker-join supervisor", "err", err)
 			}
 		}()
