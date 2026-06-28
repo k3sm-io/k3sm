@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -33,6 +34,15 @@ type ServerConfig struct {
 	Enroller Enroller
 	// NodeCertTTL is the issued-cert validity; DefaultNodeCertTTL when zero.
 	NodeCertTTL time.Duration
+	// APIServers are the control-plane apiserver endpoints advertised to a joining node
+	// in the JoinResponse (for its client-side load-balancer). Optional.
+	APIServers []string
+	// ServerAuth authorizes the M6.1 CA-bundle endpoint (BundlePath) to the SERVER-class
+	// token only. When nil (single-node / non-HA), the bundle endpoint is not served.
+	ServerAuth ServerAuthorizer
+	// Bundle yields the sealed CA bundle the bundle endpoint returns. When nil, the
+	// bundle endpoint is not served. Both ServerAuth and Bundle must be set to enable it.
+	Bundle BundleSource
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -71,11 +81,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return &Server{cfg: cfg}, nil
 }
 
-// Handler returns the bootstrap HTTP mux (CACertPath + JoinPath).
+// Handler returns the bootstrap HTTP mux (CACertPath + JoinPath, plus the M6.1
+// server-bootstrap CA-bundle endpoint when ServerAuth + Bundle are configured).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(CACertPath, s.handleCACert)
 	mux.HandleFunc(JoinPath, s.handleJoin)
+	if s.cfg.ServerAuth != nil && s.cfg.Bundle != nil {
+		mux.HandleFunc(BundlePath, s.handleBundle)
+	}
 	return mux
 }
 
@@ -174,6 +188,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		ClusterCAPEM:          string(s.cfg.ClusterCA.CertPEM),
 		NodeClientCertPEM:     string(clientCert),
 		KubeletServingCertPEM: string(servingCert),
+		APIServers:            s.cfg.APIServers,
 		Mesh:                  meshResp,
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -182,6 +197,51 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Logger.Info("node joined", "node", req.NodeName, "nodeIP", req.NodeIP, "podCIDR", meshResp.PodCIDR)
+}
+
+// handleBundle serves the AES-256-GCM-sealed CA bootstrap bundle to a joining
+// control-plane SERVER (M6.1). It authorizes the SERVER-class token ONLY (a worker
+// token is rejected at AuthorizeServerToken — ErrNotServerToken), then returns the
+// sealed envelope. A leaked worker token can therefore never reconstruct the signing
+// CA. Registered only when ServerAuth + Bundle are configured (the HA supervisor).
+func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := bearerToken(r)
+	if token == "" {
+		http.Error(w, "missing server bootstrap token", http.StatusUnauthorized)
+		return
+	}
+	if err := s.cfg.ServerAuth.AuthorizeServerToken(token); err != nil {
+		s.cfg.Logger.Warn("server-bootstrap rejected", "reason", "server-token", "err", err)
+		http.Error(w, "server bootstrap token rejected", http.StatusForbidden)
+		return
+	}
+	sealed, err := s.cfg.Bundle.SealedBundle(r.Context())
+	if err != nil {
+		s.cfg.Logger.Error("server-bootstrap seal", "err", err)
+		http.Error(w, "seal bundle failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(sealed)
+	s.cfg.Logger.Info("served CA bootstrap bundle to a joining server")
+}
+
+// bearerToken extracts the credential from the Authorization header, tolerating a bare
+// value or a "Bearer " prefix.
+func bearerToken(r *http.Request) string {
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	if h == "" {
+		return ""
+	}
+	const prefix = "Bearer "
+	if strings.HasPrefix(h, prefix) {
+		return strings.TrimSpace(strings.TrimPrefix(h, prefix))
+	}
+	return h
 }
 
 // parseCSR decodes a PEM CERTIFICATE REQUEST and parses it.

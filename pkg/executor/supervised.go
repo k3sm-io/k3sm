@@ -95,6 +95,12 @@ func (s *Supervised) RESTConfigToken() (string, string) {
 // scheduler → controller-manager) and blocks until the apiserver reports healthz
 // ok. On any failure it tears down whatever started.
 func (s *Supervised) Start(ctx context.Context) error {
+	// Split-brain guard (M6.0): fail closed if HA was requested without a shared
+	// datastore — never let a 2nd server quietly form its own SQLite.
+	if err := s.cfg.Validate(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
@@ -172,13 +178,45 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	return nil
 }
 
-// startKine launches the kine etcd shim over the workdir SQLite DB (WAL).
+// startKine launches the kine etcd shim. The datastore is the single-node SQLite WAL
+// DB (the M1–M5 default, byte-unchanged) unless cfg.DatastoreEndpoint names a Postgres
+// DSN (M6.0 HA multi-writer), in which case the password is relocated off argv into a
+// 0600 PGPASSFILE the kine child reads via PGPASSFILE (kineSecretEnv) and only the
+// password-stripped DSN reaches --endpoint.
 func (s *Supervised) startKine(ctx context.Context) error {
-	endpoint := "sqlite://" + filepath.Join(dbDir(s.cfg.WorkDir), "state.db") + "?_journal=WAL&_busy_timeout=30000"
-	return s.spawn(ctx, "kine",
-		"--listen-address", "127.0.0.1:"+strconv.Itoa(s.cfg.KinePort),
-		"--endpoint", endpoint,
-	)
+	args, err := kineArgs(s.cfg)
+	if err != nil {
+		return err
+	}
+	env, err := s.kineSecretEnv()
+	if err != nil {
+		return err
+	}
+	return s.spawnEnv(ctx, "kine", env, args...)
+}
+
+// kineSecretEnv relocates a Postgres DSN password OFF argv. For a datastore endpoint
+// carrying a password it writes a 0600 PGPASSFILE in the work-dir and returns the
+// PGPASSFILE env var for the kine child; kine's pgx driver (pgx.ParseConfig) reads the
+// password from it as the libpq env fallback when the DSN omits it. It returns nil for
+// the SQLite path or a password-less DSN. Writing here (not in the pure kineArgs) keeps
+// the secret out of both argv AND the args the tests inspect.
+func (s *Supervised) kineSecretEnv() ([]string, error) {
+	if s.cfg.DatastoreEndpoint == "" {
+		return nil, nil
+	}
+	_, password, err := splitDatastorePassword(s.cfg.DatastoreEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	if password == "" {
+		return nil, nil
+	}
+	path := pgPassPath(s.cfg.WorkDir)
+	if err := os.WriteFile(path, []byte(pgPassLine(password)), 0o600); err != nil {
+		return nil, fmt.Errorf("write datastore PGPASSFILE: %w", err)
+	}
+	return []string{"PGPASSFILE=" + path}, nil
 }
 
 // startAPIServer launches kube-apiserver against kine on the secure port. From M4.1
@@ -287,34 +325,50 @@ func apiServerArgs(cfg Config) []string {
 
 // startScheduler launches kube-scheduler against the admin kubeconfig.
 func (s *Supervised) startScheduler(ctx context.Context) error {
-	kc := kubeconfigPath(s.cfg.WorkDir)
-	return s.spawn(ctx, "kube-scheduler",
+	return s.spawn(ctx, "kube-scheduler", schedulerArgs(s.cfg)...)
+}
+
+// schedulerArgs renders the kube-scheduler argv from cfg. Pure so the M6.0
+// leader-election posture is table-tested: --leader-elect is false single-node (one
+// candidate, no lease churn — the M1–M5 default, byte-unchanged) and true in HA
+// (Postgres multi-writer) so only ONE server's scheduler is active (two active
+// schedulers double-bind pods).
+func schedulerArgs(cfg Config) []string {
+	kc := kubeconfigPath(cfg.WorkDir)
+	return []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
-		"--leader-elect=false",
+		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
 		"--bind-address", "127.0.0.1",
 		"--secure-port", "10259",
-	)
+	}
 }
 
 // startControllerManager launches kube-controller-manager with the SCOPED
 // controller set (node-side controllers dropped; endpointslice kept).
 func (s *Supervised) startControllerManager(ctx context.Context) error {
-	wd := s.cfg.WorkDir
+	return s.spawn(ctx, "kube-controller-manager", controllerManagerArgs(s.cfg)...)
+}
+
+// controllerManagerArgs renders the kube-controller-manager argv from cfg. Pure so the
+// M6.0 leader-election posture is table-tested alongside the scoped --controllers set:
+// --leader-elect is false single-node and true in HA so only ONE server's KCM is active
+// (two active KCMs double-reconcile every object).
+func controllerManagerArgs(cfg Config) []string {
+	wd := cfg.WorkDir
 	kc := kubeconfigPath(wd)
-	args := []string{
+	return []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
-		"--leader-elect=false",
+		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
 		"--service-account-private-key-file", saKeyPath(wd),
 		"--root-ca-file", filepath.Join(certDir(wd), "apiserver.crt"),
 		"--bind-address", "127.0.0.1",
 		"--secure-port", "10257",
 		"--controllers", controllersFlag(),
 	}
-	return s.spawn(ctx, "kube-controller-manager", args...)
 }
 
 // controllersFlag renders the scoped --controllers value: "*" (all on-by-default
@@ -327,19 +381,32 @@ func controllersFlag() string {
 	return out
 }
 
-// spawn starts a control-plane binary from the workdir bin as a child process in
-// its own process group, redirecting its output to a per-component log file, and
-// records it for teardown. It does NOT wait — components run until Stop.
+// spawn starts a control-plane binary with no extra environment (the common case).
 func (s *Supervised) spawn(ctx context.Context, name string, args ...string) error {
+	return s.spawnEnv(ctx, name, nil, args...)
+}
+
+// spawnEnv starts a control-plane binary from the workdir bin as a child process in
+// its own process group, redirecting its output to a per-component log file, and
+// records it for teardown. extraEnv is appended to the inherited environment (used to
+// pass the kine child its PGPASSFILE out-of-band, keeping the Postgres secret off
+// argv). It does NOT wait — components run until Stop.
+//
+// The log file is mode 0600 (not the umask default 0644): a component log can carry
+// bearer tokens and the kine datastore endpoint, so it must not be world-readable.
+func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) error {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
-	lf, err := os.Create(logPath)
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("create %s log: %w", name, err)
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	if err := cmd.Start(); err != nil {
 		_ = lf.Close()
 		return fmt.Errorf("start %s: %w", name, err)

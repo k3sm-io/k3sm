@@ -98,6 +98,33 @@ type Config struct {
 	// system:node identities get a pre-provisioned datapath grant (pkg/rbac); set it
 	// to "AlwaysAllow" only for a deliberate diagnostic bring-up.
 	AuthorizationMode string
+	// DatastoreEndpoint, when non-empty, is the kine datastore endpoint — a Postgres
+	// connection URL (postgres://user[:password]@host:port/dbname?sslmode=...) for the
+	// HA multi-writer posture (M6.0): 2+ control-plane servers share ONE Postgres, the
+	// single source of truth (no etcd quorum). Empty keeps the single-node kine->SQLite
+	// WAL default (M1–M5), byte-unchanged. The apiserver always talks to the LOCAL kine
+	// (--etcd-servers 127.0.0.1:<KinePort>); each server runs its own kine against the
+	// shared Postgres (the k3s topology). The DSN PASSWORD is kept off argv and out of
+	// the logs — it is relocated to a 0600 PGPASSFILE handed to the kine child, and only
+	// the password-stripped DSN reaches kine's --endpoint. Setting this also moves kine
+	// to DefaultKineVersionHA (see KineVersion) and turns on leader election.
+	DatastoreEndpoint string
+	// ServerJoin marks this control-plane server as joining/forming an HA control plane
+	// (a 2nd+ apiserver). It is the split-brain guard's trigger: an HA server MUST carry
+	// a DatastoreEndpoint — Validate fails closed otherwise, so a 2nd server can NEVER
+	// silently fall back to its own SQLite (two servers each on their own SQLite is
+	// split-brain — divergent state, no single source of truth). The full HA server-join
+	// bootstrap (the identical-CA bundle, DESIGN §5c) is M6.1; M6.0 consumes this only
+	// for the guard + the leader-election posture.
+	ServerJoin bool
+	// LeaderElect, when non-nil, forces the scheduler + controller-manager --leader-elect
+	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (a Postgres
+	// multi-writer datastore — so only one server's scheduler/KCM is active; two active
+	// schedulers double-bind pods, two KCMs double-reconcile) and OFF single-node (one
+	// candidate, no lease churn — the M1–M5 default). Only the apiserver is active/active
+	// in HA. The leader-election Leases are authorized by the components' static admin
+	// token (system:masters, RBAC-exempt) plus the apiserver's auto-created system:* RBAC.
+	LeaderElect *bool
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -106,8 +133,22 @@ type Config struct {
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
 	DefaultKubeVersion = "v1.36.2"
-	// DefaultKineVersion is the kine module version (built CGO_ENABLED=1).
+	// DefaultKineVersion is the kine module version for the SINGLE-NODE kine->SQLite
+	// path (built CGO_ENABLED=1). It stays pinned at the M0-validated v1.14.2 —
+	// UNCHANGED — so the single-node M1–M5 installed base carries zero datastore-
+	// migration risk. (Per docs/m3-plan.md this pin predates the DESIGN's >=0.15
+	// kine#577 watch-progress fix; that fix is only needed on the multi-writer path.)
 	DefaultKineVersion = "v1.14.2"
+	// DefaultKineVersionHA is the kine version for the Postgres-HA datastore path
+	// (M6.0). It is a real, go-install-verified >=0.15 release (the DESIGN floor) that
+	// carries the kine#577 watch-progress-notify fix: v0.16.x defaults
+	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11, so
+	// the apiserver's watch cache stays fresh under multi-writer churn (the kine half
+	// of the consistent-list-from-cache posture). HA is Postgres-FROM-INIT (greenfield),
+	// so there is no SQLite->newer-kine upgrade of an existing cluster — the version
+	// split is by datastore posture, not an in-place bump. The multi-writer
+	// watch-staleness soak on this version is the lab production-trust gate (hack/lab/m6.sh).
+	DefaultKineVersionHA = "v0.16.3"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.
@@ -184,6 +225,51 @@ func EnsureWorkDirWritable(dir string) error {
 	return nil
 }
 
+// ErrHARequiresDatastore is returned by Validate when an HA control-plane server
+// (ServerJoin) is requested without a shared datastore endpoint. A 2nd server must
+// NEVER fall back to its own SQLite — two servers each on their own single-writer
+// SQLite is split-brain (divergent state, no single source of truth). The guard is
+// fail-closed: bring-up halts rather than silently diverging.
+var ErrHARequiresDatastore = errors.New("executor: HA server-join requires a shared datastore endpoint (a Postgres DSN); refusing to start a second server on its own SQLite (split-brain)")
+
+// Validate checks cfg is internally consistent before bring-up. The load-bearing
+// check is the split-brain guard: an HA server (ServerJoin) MUST carry a
+// DatastoreEndpoint. It is called at the top of Start so a misconfigured HA server
+// fails fast with a clear error instead of quietly forming a divergent cluster.
+func (c Config) Validate() error {
+	if c.ServerJoin && c.DatastoreEndpoint == "" {
+		return ErrHARequiresDatastore
+	}
+	return nil
+}
+
+// isHA reports whether this server runs the HA multi-writer posture: it has a shared
+// datastore endpoint, or it was told to join/form an HA control plane.
+func (c Config) isHA() bool {
+	return c.DatastoreEndpoint != "" || c.ServerJoin
+}
+
+// leaderElect reports the scheduler + controller-manager --leader-elect setting for
+// this posture (see Config.LeaderElect): an explicit pointer wins, else it derives
+// from isHA — ON in HA, OFF single-node.
+func (c Config) leaderElect() bool {
+	if c.LeaderElect != nil {
+		return *c.LeaderElect
+	}
+	return c.isHA()
+}
+
+// defaultKineVersion picks the kine version for the datastore posture: the
+// Postgres-HA path pins DefaultKineVersionHA (a >=0.15 release with the kine#577
+// watch-progress fix), the SQLite single-node path stays on the M0-validated
+// DefaultKineVersion (zero migration risk for the installed base).
+func defaultKineVersion(datastoreEndpoint string) string {
+	if datastoreEndpoint != "" {
+		return DefaultKineVersionHA
+	}
+	return DefaultKineVersion
+}
+
 // withDefaults returns a copy of cfg with empty fields filled from the pinned
 // defaults.
 func (c Config) withDefaults() Config {
@@ -200,7 +286,7 @@ func (c Config) withDefaults() Config {
 		c.KubeVersion = DefaultKubeVersion
 	}
 	if c.KineVersion == "" {
-		c.KineVersion = DefaultKineVersion
+		c.KineVersion = defaultKineVersion(c.DatastoreEndpoint)
 	}
 	if c.NodeIP == "" {
 		c.NodeIP = "127.0.0.1"

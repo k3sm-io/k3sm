@@ -156,18 +156,39 @@ func meshPeerRESTClient(cfg *rest.Config) (rest.Interface, error) {
 // on the mesh interface (separate from the apiserver secure port).
 const bootstrapPort = 9345
 
-// startBootstrapServer serves the worker-join endpoint on meshIP:bootstrapPort over a
-// TLS listener presenting [serving-leaf, cluster-CA] so a joining node's CA-hash pin
-// verifies. It blocks until ctx is cancelled, then shuts down. This is the live,
-// mesh-bound supervisor — its end-to-end exercise is the two-Mac K3SM_LAB gate (the
-// MeshPeer CRD must be installed for the enroller's write to land).
-func startBootstrapServer(ctx context.Context, h *certs.Hierarchy, meshIP string, tokens bootstrap.TokenVerifier, enroller bootstrap.Enroller, log *slog.Logger) error {
+// bootstrapServerDeps are the supervisor's wired dependencies. The worker-join deps
+// (CAs, tokens, node-passwords, enroller) are always set; the M6.1 server-join deps
+// (ServerAuth + Bundle + APIServers) are set only in the HA posture, where they light up
+// the CA-bundle endpoint.
+type bootstrapServerDeps struct {
+	hierarchy     *certs.Hierarchy
+	meshIP        string
+	tokens        bootstrap.TokenVerifier
+	nodePasswords bootstrap.NodePasswordStore
+	enroller      bootstrap.Enroller
+	serverAuth    bootstrap.ServerAuthorizer
+	bundle        bootstrap.BundleSource
+	apiServers    []string
+}
+
+// startBootstrapServer serves the worker-join endpoint (and, in HA, the M6.1 CA-bundle
+// endpoint) on meshIP:bootstrapPort over a TLS listener presenting [serving-leaf,
+// cluster-CA] so a joining node's CA-hash pin verifies. It blocks until ctx is
+// cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
+// exercise is the two-Mac K3SM_LAB gate (the MeshPeer CRD must be installed for the
+// enroller's write to land).
+func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *slog.Logger) error {
+	h := deps.hierarchy
+	meshIP := deps.meshIP
 	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
 		ClusterCA:     h.Cluster,
 		SigningCA:     h.Signing,
-		Tokens:        tokens,
-		NodePasswords: bootstrap.NewMemoryNodePasswords(),
-		Enroller:      enroller,
+		Tokens:        deps.tokens,
+		NodePasswords: deps.nodePasswords,
+		Enroller:      deps.enroller,
+		APIServers:    deps.apiServers,
+		ServerAuth:    deps.serverAuth,
+		Bundle:        deps.bundle,
 		Logger:        log,
 	})
 	if err != nil {
