@@ -65,10 +65,14 @@ type Config struct {
 	// — bind the mesh interface ONLY). Empty falls back to NodeIP (loopback for the
 	// single-node dev path), so M1/M2 are unchanged.
 	BindAddress string
-	// ClientCAFile, when set, is passed as --client-ca-file so node client certs
-	// (CN=system:node:<name>, signed by the signing CA) authenticate. Wired in M3
-	// (while the authorizer was still AlwaysAllow) precisely so M4.1's Node,RBAC flip
-	// is a pure authorizer switch — not a node re-bootstrap.
+	// ClientCAFile is the apiserver --client-ca-file: the client-CA the apiserver trusts
+	// so client certs authenticate (node certs CN=system:node:<name> and the per-component
+	// certs CN=system:kube-scheduler / system:kube-controller-manager, all signed by the
+	// signing CA). It is now wired UNCONDITIONALLY — when empty, apiServerArgs defaults it
+	// to the signing CA under the work-dir PKI dir (certs.SigningCACertPath), so the
+	// single-node path gets it too (the M4.1 review flagged the prior mesh-gating). An
+	// explicit value (the mesh path) is honored verbatim. Originally wired in M3 (while the
+	// authorizer was still AlwaysAllow) so M4.1's Node,RBAC flip is a pure authorizer switch.
 	ClientCAFile string
 	// KubeletCAFile, when set, is passed as --kubelet-certificate-authority so the
 	// apiserver verifies the kubelet-serving cert and remote exec/logs are not
