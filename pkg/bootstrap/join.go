@@ -66,6 +66,9 @@ type JoinResult struct {
 	Peers                 []netv1.MeshPeerSpec
 	WGPrivateKeyB64       string
 	WGPublicKeyB64        string
+	// APIServers are the control-plane apiserver endpoints (host:port) for this node's
+	// client-side load-balancer (M6.1); empty for a single-server cluster.
+	APIServers []string
 }
 
 // PinnedClient returns an http.Client whose TLS verification is REPLACED by a
@@ -164,6 +167,7 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 		Peers:                 resp.Mesh.Peers,
 		WGPrivateKeyB64:       wgPriv,
 		WGPublicKeyB64:        wgPub,
+		APIServers:            resp.APIServers,
 	}, nil
 }
 

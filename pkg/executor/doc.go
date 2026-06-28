@@ -35,4 +35,57 @@
 // M1 keeps the spike's AlwaysAllow authorization + a static bearer token so the
 // existing M0 Virtual Kubelet node still registers unchanged. Real RBAC + issued
 // node certs are an M3/M4 concern.
+//
+// # HA datastore (M6.0)
+//
+// Strategy: phased (named exception: kine/SQLite datastore migration). The default
+// stays single-node kine->SQLite (WAL), byte-unchanged from M1. Setting
+// Config.DatastoreEndpoint to a Postgres DSN switches kine to Postgres (pure-Go
+// jackc/pgx/v5) so 2+ control-plane servers can share ONE datastore — the single
+// source of truth, no etcd quorum (the k3s external-datastore-HA topology). The
+// apiserver still points at the LOCAL kine on 127.0.0.1; each server runs its own
+// kine against the shared Postgres.
+//
+// HA is Postgres-FROM-INIT (greenfield): there is NO live SQLite->Postgres data
+// conversion — the single-node SQLite default is untouched, and the only path from an
+// existing SQLite cluster to Postgres is an operator kine dump/restore (in-place
+// conversion is out of scope). Because the paths never coexist on one datastore, the
+// kine version is split by posture: SQLite stays on DefaultKineVersion (v1.14.2,
+// zero migration risk for the installed base) and Postgres pins DefaultKineVersionHA
+// (>=0.15, carrying the kine#577 watch-progress-notify fix). The multi-writer
+// watch-staleness soak (a consistent LIST on server B immediately after server A's
+// committed write, under sustained churn — the kine#577 failure mode) is the LAB
+// production-trust gate (hack/lab/m6.sh), not a unit-provable property.
+//
+// Secret handling: the operator's DSN may carry a password, but it must never land
+// on argv (world-readable via ps) or in a 0644 log. startKine relocates it to a 0600
+// PGPASSFILE handed to the kine child (kineSecretEnv); only the password-stripped DSN
+// reaches kine's --endpoint. pgx reads the password from PGPASSFILE as the libpq env
+// fallback. Component logs are mode 0600 for the same reason.
+//
+// Connection pool / Postgres SPOF: kine's --datastore-max-open-connections defaults
+// to 0 (UNLIMITED), so N servers against one Postgres could exhaust its
+// max_connections; kineArgs pins per-server bounds (see datastore.go) so 2*pool stays
+// within the Postgres default max_connections (100). SQLite's _busy_timeout has no
+// Postgres analog — under contention Postgres relies on its own statement/lock
+// timeouts (an operator postgresql.conf concern: set statement_timeout /
+// idle_in_transaction_session_timeout / lock_timeout). The write-latency tradeoff is
+// explicit: SQLite WAL is a local sub-millisecond fsync; Postgres adds a network
+// round-trip per write. HA buys control-plane PROCESS redundancy (kill one server,
+// the other serves), NOT datastore redundancy — Postgres becomes the operator-managed
+// datastore SPOF; its own HA/backup (a pg_dump/PITR runbook, streaming replication,
+// or a managed Postgres) is the operator's responsibility, as in k3s.
+//
+// # Leader election (M6.0)
+//
+// Only the apiserver is active/active in HA. The scheduler and controller-manager run
+// with --leader-elect, derived from the posture (Config.leaderElect): false
+// single-node (one candidate, no lease churn — the M1–M5 default, byte-unchanged) and
+// true in HA, so exactly one server's scheduler/KCM is active (two active schedulers
+// would double-bind pods; two KCMs would double-reconcile). The leader-election Leases
+// (coordination.k8s.io, kube-system/kube-scheduler + kube-controller-manager) are
+// authorized by the components' static admin token (system:masters, RBAC-exempt) plus
+// the apiserver's auto-created system:kube-scheduler / system:kube-controller-manager
+// bootstrap RBAC — no pkg/rbac object is needed (the documented M4.1 component-identity
+// divergence still holds: the in-process components carry the admin token).
 package executor

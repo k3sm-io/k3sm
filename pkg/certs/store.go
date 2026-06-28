@@ -55,6 +55,43 @@ func EnsureHierarchy(workDir string) (*Hierarchy, error) {
 	return &Hierarchy{Cluster: cluster, Signing: signing}, nil
 }
 
+// WriteHierarchy writes h's four CA PEMs into the work dir's PKI directory (certs
+// 0644, keys 0600) — the inverse of EnsureHierarchy's load. The HA server-join path
+// calls it AFTER decrypting the AES-256-GCM bootstrap bundle and BEFORE EnsureHierarchy,
+// so EnsureHierarchy then LOADS the IDENTICAL cluster + signing CAs instead of minting
+// fresh, divergent ones (which would split cluster trust). It REFUSES to overwrite any
+// existing CA file: a server that already has a hierarchy must never be silently
+// re-based onto another's — the import is a first-write, not a replace.
+func WriteHierarchy(workDir string, h *Hierarchy) error {
+	if h == nil || h.Cluster == nil || h.Signing == nil {
+		return fmt.Errorf("certs: write hierarchy: cluster and signing CA are required")
+	}
+	dir := PKIDir(workDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create PKI dir: %w", err)
+	}
+	files := []struct {
+		name string
+		data []byte
+		mode os.FileMode
+	}{
+		{clusterCACert, h.Cluster.CertPEM, 0o644},
+		{clusterCAKey, h.Cluster.KeyPEM, 0o600},
+		{signingCACert, h.Signing.CertPEM, 0o644},
+		{signingCAKey, h.Signing.KeyPEM, 0o600},
+	}
+	for _, f := range files {
+		p := filepath.Join(dir, f.name)
+		if _, err := os.Stat(p); err == nil {
+			return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA)", f.name)
+		}
+		if err := os.WriteFile(p, f.data, f.mode); err != nil {
+			return fmt.Errorf("write %s: %w", f.name, err)
+		}
+	}
+	return nil
+}
+
 // ensureCA loads the CA at dir/<certFile>+<keyFile>, or creates + persists a new one
 // with the given common name when neither exists. A half-present pair is an error.
 func ensureCA(dir, certFile, keyFile, commonName string) (*CA, error) {
