@@ -39,10 +39,11 @@ func runTokenCreate(args []string) error {
 		defaultWorkDir = executor.DefaultWorkDir
 	}
 	workDir := fs.String("work-dir", defaultWorkDir, "control-plane state root (the cluster CA + token store live here)")
-	ttl := fs.Duration("ttl", 24*time.Hour, "token time-to-live (must be positive)")
+	ttl := fs.Duration("ttl", 24*time.Hour, "token time-to-live (must be positive; ignored for --server)")
+	serverTok := fs.Bool("server", false, "mint a SERVER-class join token (to add an HA control-plane server, M6.1) instead of a worker token")
 	_ = fs.Parse(args)
 
-	if *ttl <= 0 {
+	if !*serverTok && *ttl <= 0 {
 		return fmt.Errorf("--ttl must be positive, got %s", *ttl)
 	}
 
@@ -50,6 +51,20 @@ func runTokenCreate(args []string) error {
 	h, err := certs.EnsureHierarchy(*workDir)
 	if err != nil {
 		return fmt.Errorf("ensure CA hierarchy: %w", err)
+	}
+
+	// M6.1: a SERVER token reconstructs the cluster CAs (it authorizes the CA-bundle
+	// endpoint and its secret is the bundle's KDF passphrase). It is stable (not
+	// TTL-bounded) and DISTINCT from a worker token — give it only to a trusted
+	// control-plane Mac. A leaked WORKER token can never reconstruct the signing CA.
+	if *serverTok {
+		secret, err := bootstrap.LoadOrCreateServerSecret(serverSecretPath(*workDir))
+		if err != nil {
+			return fmt.Errorf("server-bootstrap secret: %w", err)
+		}
+		fmt.Println(bootstrap.FormatServerToken(h.Cluster.PinHash(), secret))
+		fmt.Fprintln(os.Stderr, "# k3sm SERVER join token — authorizes reconstructing the cluster CAs; give ONLY to a trusted control-plane Mac")
+		return nil
 	}
 
 	store := bootstrap.NewFileTokenStore(bootstrap.TokensPath(*workDir), nil)

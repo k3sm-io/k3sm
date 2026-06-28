@@ -14,6 +14,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -119,6 +120,44 @@ func TestM6_LeaderElectionSingleActive(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestM6_SecondServerJoinsReconstructsCAs is the M6.1 acceptance (lab-tier): the second
+// control-plane server reconstructed the IDENTICAL cluster CA from the first server's
+// AES-256-GCM bootstrap bundle. Both servers' admin kubeconfigs (the signing-CA-issued
+// client-cert kubeconfigs the HA path writes) must embed the SAME cluster
+// certificate-authority-data — direct evidence the joining server rebuilt the identical
+// CA hierarchy rather than minting its own divergent one. It needs both kubeconfigs
+// ($KUBECONFIG = server A, $K3SM_KUBECONFIG_B = server B), each CA-bearing (the HA admin
+// kubeconfig, not the loopback token kubeconfig). The live failover is the m6.sh
+// kill-A→serve-via-B leg.
+func TestM6_SecondServerJoinsReconstructsCAs(t *testing.T) {
+	_ = Up(t)            // skips if $KUBECONFIG unset
+	_ = serverBClient(t) // skips if $K3SM_KUBECONFIG_B unset
+	caA := clusterCAData(t, os.Getenv("KUBECONFIG"))
+	caB := clusterCAData(t, os.Getenv("K3SM_KUBECONFIG_B"))
+	if len(caA) == 0 || len(caB) == 0 {
+		t.Skip("M6.1: both kubeconfigs must embed the cluster CA (use the HA admin kubeconfig, not the loopback token kubeconfig)")
+	}
+	if !bytes.Equal(caA, caB) {
+		t.Fatalf("server A and server B embed DIFFERENT cluster CAs — the second server did not reconstruct the identical CA from the bundle")
+	}
+}
+
+// clusterCAData returns the cluster certificate-authority-data the kubeconfig at path
+// embeds (empty when it uses insecure-skip / a CA file path).
+func clusterCAData(t *testing.T, path string) []byte {
+	t.Helper()
+	cfg, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("load kubeconfig %s: %v", path, err)
+	}
+	for _, cl := range cfg.Clusters {
+		if len(cl.CertificateAuthorityData) > 0 {
+			return cl.CertificateAuthorityData
+		}
+	}
+	return nil
 }
 
 // TestM6_WatchStalenessSoak is the PRODUCTION-TRUST gate (the kine#577 failure mode):
