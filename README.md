@@ -37,3 +37,9 @@ pkg/deploy/          embedded addons (CoreDNS, CRDs, RBAC)
 # from the workspace root /Users/operator/Code/k3sm-io
 go build ./k3sm/cmd/k3sm   # builds the (stub) binary
 ```
+
+## License
+
+[Apache License 2.0](LICENSE) — © The k3sm Authors. Contributions require a Developer Certificate of
+Origin sign-off (`git commit -s`); see [CONTRIBUTING.md](CONTRIBUTING.md),
+[GOVERNANCE.md](GOVERNANCE.md), and [SECURITY.md](SECURITY.md).

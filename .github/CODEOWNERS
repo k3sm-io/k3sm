@@ -1,0 +1,4 @@
+# Default owner for everything in this repository.
+# Per-path ownership for privileged surfaces (networking helper, sandbox,
+# packaging/signing) is added per-repo as the maintainer set grows.
+* @kitsumiko

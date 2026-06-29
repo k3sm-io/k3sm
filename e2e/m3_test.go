@@ -1,5 +1,21 @@
 //go:build e2e
 
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // M3 synthetic conformance criteria (DESIGN §9 M3). The SINGLE-NODE-testable
 // criteria — TestM3_NodePort and TestM3_PVCPersistsAcrossRestart — run at the
 // integration tier in hack/acceptance/m3.sh (which brings up a single-node

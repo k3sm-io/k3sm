@@ -11,6 +11,9 @@ echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
 [ -z "$fmt" ] || { echo "gofmt -w needed:"; echo "$fmt"; exit 1; }
 
+echo "==> [k3sm] license headers"
+hack/verify-boilerplate.sh
+
 if [ -n "$(CGO_ENABLED=$CGO go list ./... 2>/dev/null)" ]; then
 	echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [k3sm] go build"; CGO_ENABLED=$CGO go build ./...
