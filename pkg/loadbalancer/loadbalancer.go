@@ -1,3 +1,19 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Package loadbalancer is the client-side apiserver load-balancer for HA (M6.1). A
 // joined node — and the admin kubeconfig — targets a LOCAL endpoint that health-checks
 // the set of control-plane apiservers and forwards each connection to a healthy one, so

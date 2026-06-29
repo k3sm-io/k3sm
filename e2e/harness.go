@@ -1,5 +1,21 @@
 //go:build e2e
 
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // Package e2e holds k3sm's build-tagged end-to-end acceptance suites — one per
 // milestone (m0_test.go, m1_test.go, …). Each drives a real cluster via client-go and
 // asserts that milestone's capability gate (DESIGN §9). They are run by the matching

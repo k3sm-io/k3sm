@@ -1,0 +1,10 @@
+k3sm
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+The `k3sm` binary links third-party dependencies obtained via Go modules; no
+vendored third-party source is checked in. The attribution notices and license
+texts those dependencies require (Apache-2.0 §4(d), and the MIT/BSD notice
+clauses) are generated from this module's dependency graph with `go-licenses`
+and bundled with the released binary, archive, and Homebrew bottle.

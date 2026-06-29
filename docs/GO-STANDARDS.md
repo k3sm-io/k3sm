@@ -80,11 +80,15 @@ Targets **darwin/arm64, macOS 26+**. Go **1.25.x** across all modules.
 
 ## Commit gates (run before every commit)
 ```sh
-gofmt -l .            # must print nothing
-go vet ./...          # clean
-go build ./...        # builds
-go test ./...         # passes (CI adds -race)
-go mod tidy           # no diff
+gofmt -l .                  # must print nothing
+go vet ./...                # clean
+go build ./...              # builds
+go test ./...               # passes (CI adds -race)
+hack/verify-boilerplate.sh  # every .go file carries the Apache-2.0 header
+go mod tidy                 # no diff
 ```
-Keep commits small and focused. End commit messages with the
-`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` trailer. Don't push unless asked.
+Keep commits small and focused. **Sign off every commit** for the Developer Certificate of Origin (see
+`DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line. End commit messages
+with the `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` trailer — that trailer is
+authorship attribution, **not** the DCO sign-off (the committer's `Signed-off-by` certifies the DCO).
+Don't push unless asked.
