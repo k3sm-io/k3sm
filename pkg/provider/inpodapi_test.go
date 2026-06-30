@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/runtimed/pkg/mount"
 )
 
@@ -164,7 +165,7 @@ func TestM2_InPodKubectl(t *testing.T) {
 
 		// Build the PodBox and bind the pod's SA exactly as the provider's
 		// CreatePod does, then run the runtimed materializer at the seam.
-		box, err := toPodBox(pod, "10.0.0.9", dataVol, "")
+		box, err := toPodBox(pod, "10.0.0.9", dataVol, "", netv1.DNSConfig{})
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}

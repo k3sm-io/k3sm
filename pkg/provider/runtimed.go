@@ -36,6 +36,7 @@ import (
 	"k8s.io/utils/clock"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
@@ -59,6 +60,13 @@ type runtimedRuntime struct {
 	nodeIP   string
 	rootfs   string
 	dyldShim string
+	// resolverVIP and clusterDomain are the cluster DNS inputs buildBox feeds
+	// dns.PodDNSConfig (per-pod namespace) to derive the K3SM_DNS_* env the DYLD
+	// getaddrinfo shim reads — so an in-pod unqualified Service lookup expands and
+	// resolves against the cluster DNS VIP. They mirror RuntimedConfig.ResolverVIP /
+	// .ClusterDomain.
+	resolverVIP   string
+	clusterDomain string
 	// deniedSocks are AF_UNIX socket paths every pod's SBPL must deny connect()
 	// to — notably the root k3sm-netd helper socket, so a same-uid (_k3sm) pod
 	// cannot drive the privileged helper. Threaded onto each PodBox's
@@ -111,6 +119,12 @@ type RuntimedConfig struct {
 	// built-in default (sandbox.DefaultResolverVIP), which is NOT the k3sm VIP — the
 	// commands always set it from the cluster DNS VIP.
 	ResolverVIP string
+	// ClusterDomain is the cluster DNS suffix (e.g. "cluster.local") buildBox feeds
+	// dns.PodDNSConfig to build the in-pod shim search list. It MUST match the served
+	// zone the per-node resolver answers for (the same --cluster-domain the CoreDNS
+	// Corefile binds): a mismatch makes every unqualified Service lookup NXDOMAIN.
+	// Empty defaults to the apis cluster domain ("cluster.local") inside PodDNSConfig.
+	ClusterDomain string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the kubernetes
 	// ClusterIP, 10.43.0.1) the per-pod Seatbelt egress is ADDITIONALLY scoped to,
 	// so a confined pod's in-cluster client-go (in-pod kubectl) can reach the API
@@ -181,6 +195,8 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		nodeIP:         cfg.NodeIP,
 		rootfs:         cfg.Root,
 		dyldShim:       cfg.DyldShim,
+		resolverVIP:    cfg.ResolverVIP,
+		clusterDomain:  cfg.ClusterDomain,
 		deniedSocks:    cfg.DeniedUnixSocketPaths,
 		resolver:       resolver,
 		log:            log,
@@ -204,7 +220,11 @@ var (
 // provider resolves configMap/secret/envFrom (via its Resolver) and downward-API
 // (via the node identity) here, before the box crosses the runtime boundary.
 func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runtimev1.PodBox, error) {
-	box, err := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim)
+	// Per-pod cluster DNS config: the search list is namespace-scoped
+	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
+	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
+	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
+	box, err := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg)
 	if err != nil {
 		return nil, err
 	}
