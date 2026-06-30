@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
@@ -117,11 +118,12 @@ func TestNodeVirtualizationLabel(t *testing.T) {
 }
 
 // TestNodeCapacityFromHostMemory is the B13 proof that the node advertises REAL
-// host memory (hw.memsize) in its Capacity/Allocatable instead of the prior
-// hardcoded 8Gi. nodeCapacity is exercised directly (pure, hermetic, no syscall),
-// and the configureNode wiring is exercised through an injected hostMemBytes
-// reader — including the documented 8Gi fallback on a failed or implausible
-// host-fact read (which must never advertise a negative/garbage quantity).
+// host memory (hw.memsize) in its Capacity instead of the prior hardcoded 8Gi (with
+// B41's system-reserved Allocatable carve-out layered on top). nodeCapacity is
+// exercised directly (pure, hermetic, no syscall), and the configureNode wiring is
+// exercised through an injected hostMemBytes reader — including the documented 8Gi
+// fallback on a failed or implausible host-fact read (which must never advertise a
+// negative/garbage quantity).
 //
 // It is intentionally NOT t.Parallel: its subtests swap the hostMemBytes package
 // var, and TestNodeVirtualizationLabel (which IS t.Parallel) calls configureNode,
@@ -167,10 +169,12 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		}
 	})
 
-	// configureNode advertises the injected host memory and pins Allocatable ==
-	// Capacity. B15's system-reserved carve-out (Allocatable < Capacity) must be a
-	// deliberate future diff, not introduced here.
-	t.Run("configureNode advertises host memory; Allocatable == Capacity", func(t *testing.T) {
+	// configureNode advertises the injected host memory as Capacity, and B41 holds back
+	// a system-reserved memory carve-out so Allocatable memory < Capacity memory (cpu
+	// and pods pass through unchanged & present). This INVERTS B13's prior Allocatable
+	// == Capacity: the scheduler must not be able to commit 100% of RAM to pod requests
+	// and starve the co-located control plane.
+	t.Run("configureNode advertises host memory; Allocatable = Capacity - reserve (B41)", func(t *testing.T) {
 		thirtyTwo := 32 * gib
 		restore := hostMemBytes
 		hostMemBytes = func() (uint64, error) { return uint64(thirtyTwo), nil }
@@ -179,22 +183,38 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		n := &corev1.Node{}
 		configureNode(n, "k3sm-node", "10.0.0.1")
 
-		mem := n.Status.Capacity[corev1.ResourceMemory]
-		if mem.Value() != thirtyTwo {
-			t.Errorf("Capacity memory = %d, want %d (32GiB from the injected host read)", mem.Value(), thirtyTwo)
+		capMem := n.Status.Capacity[corev1.ResourceMemory]
+		if capMem.Value() != thirtyTwo {
+			t.Errorf("Capacity memory = %d, want %d (32GiB from the injected host read; Capacity stays the true hw.memsize)", capMem.Value(), thirtyTwo)
 		}
 
+		// Allocatable carries every Capacity resource — the memory-only carve-out drops none.
 		if len(n.Status.Allocatable) != len(n.Status.Capacity) {
 			t.Fatalf("Allocatable has %d resources, Capacity has %d", len(n.Status.Allocatable), len(n.Status.Capacity))
 		}
-		for name, capQ := range n.Status.Capacity {
+
+		// Memory is held back by exactly the computed reserve: Allocatable == Capacity −
+		// reserve, strictly LESS than Capacity (the B41 inversion of Allocatable == Capacity).
+		wantReserve := memReserveBytes(thirtyTwo)
+		allocMem := n.Status.Allocatable[corev1.ResourceMemory]
+		if got, want := allocMem.Value(), thirtyTwo-wantReserve; got != want {
+			t.Errorf("Allocatable memory = %d, want %d (Capacity %d − reserve %d)", got, want, thirtyTwo, wantReserve)
+		}
+		if allocMem.Value() >= capMem.Value() {
+			t.Errorf("Allocatable memory (%d) must be strictly < Capacity memory (%d) after the B41 reserve", allocMem.Value(), capMem.Value())
+		}
+
+		// cpu and pods pass through unchanged: present in Allocatable AND == Capacity
+		// (the reserve is memory-only).
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourcePods} {
 			allocQ, ok := n.Status.Allocatable[name]
 			if !ok {
-				t.Errorf("Allocatable is missing %s present in Capacity", name)
+				t.Errorf("Allocatable is missing %s present in Capacity (memory-only reserve must not drop it)", name)
 				continue
 			}
+			capQ := n.Status.Capacity[name]
 			if capQ.Cmp(allocQ) != 0 {
-				t.Errorf("Allocatable[%s] = %s, want == Capacity[%s] = %s (B15 reserve deferred)", name, allocQ.String(), name, capQ.String())
+				t.Errorf("Allocatable[%s] = %s, want == Capacity[%s] = %s (memory-only reserve)", name, allocQ.String(), name, capQ.String())
 			}
 		}
 	})
@@ -279,4 +299,118 @@ func TestConfigureNodeTopologyLabels(t *testing.T) {
 	if got := node.Labels[corev1.LabelTopologyRegion]; got != defaultNodeRegion {
 		t.Errorf("%s = %q, want %q (defaultNodeRegion)", corev1.LabelTopologyRegion, got, defaultNodeRegion)
 	}
+}
+
+// TestNodeAllocatableReserve is the B41 proof of the node system-reserved memory
+// carve-out. nodeAllocatable holds back a memory reserve from Allocatable for the
+// CO-LOCATED control plane (so the scheduler cannot commit 100% of RAM to pod requests
+// and starve apiserver/scheduler/KCM/kine/runtimed), and memReserveBytes sizes that
+// reserve as max(2Gi, 10% of capacity). It is pure and hermetic (no syscall, no
+// configureNode, no hostMemBytes swap) so it — and its subtests — run parallel: the
+// FLOOR assertion, the DeepCopy-not-alias guard, and the positive clamp are the resolved
+// CRITICALs (under-reserving re-admits jetsam killing the control plane; a zero/negative
+// Allocatable would strand every pod Pending).
+func TestNodeAllocatableReserve(t *testing.T) {
+	t.Parallel()
+
+	const (
+		gib  = int64(1024 * 1024 * 1024)
+		twoG = 2 * gib // == defaultMemReserveBytes, the floor
+	)
+
+	// nodeAllocatable math: memory == Capacity − reserve, cpu/pods unchanged & present,
+	// Allocatable < Capacity, and the input capacity map is NOT mutated (DeepCopy guard).
+	t.Run("nodeAllocatable holds back memory only and never mutates capacity", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name      string
+			capMemB   int64
+			cpu       int64
+			pods      int64
+			reserveB  int64
+			wantAlloc int64
+		}{
+			{"64Gi cap, 6Gi reserve", 64 * gib, 10, 110, 6 * gib, 64*gib - 6*gib},
+			{"16Gi cap, 2Gi reserve", 16 * gib, 8, 110, twoG, 16*gib - twoG},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				capacity := corev1.ResourceList{
+					corev1.ResourceCPU:    *resource.NewQuantity(tc.cpu, resource.DecimalSI),
+					corev1.ResourceMemory: *resource.NewQuantity(tc.capMemB, resource.BinarySI),
+					corev1.ResourcePods:   *resource.NewQuantity(tc.pods, resource.DecimalSI),
+				}
+				alloc := nodeAllocatable(capacity, tc.reserveB)
+
+				if am := alloc[corev1.ResourceMemory]; am.Value() != tc.wantAlloc {
+					t.Errorf("Allocatable memory = %d, want %d (Capacity %d − reserve %d)", am.Value(), tc.wantAlloc, tc.capMemB, tc.reserveB)
+				}
+				if am := alloc[corev1.ResourceMemory]; am.Value() >= tc.capMemB {
+					t.Errorf("Allocatable memory (%d) must be strictly < Capacity memory (%d)", am.Value(), tc.capMemB)
+				}
+				// cpu and pods pass through unchanged: present AND equal to Capacity.
+				if ac, ok := alloc[corev1.ResourceCPU]; !ok {
+					t.Error("Allocatable missing cpu (memory-only reserve must not drop it)")
+				} else if ac.Value() != tc.cpu {
+					t.Errorf("Allocatable cpu = %d, want %d (unchanged)", ac.Value(), tc.cpu)
+				}
+				if ap, ok := alloc[corev1.ResourcePods]; !ok {
+					t.Error("Allocatable missing pods (memory-only reserve must not drop it)")
+				} else if ap.Value() != tc.pods {
+					t.Errorf("Allocatable pods = %d, want %d (unchanged)", ap.Value(), tc.pods)
+				}
+				// every Capacity key survives in Allocatable.
+				if len(alloc) != len(capacity) {
+					t.Errorf("Allocatable has %d resources, want %d (every Capacity key must survive)", len(alloc), len(capacity))
+				}
+				// the input capacity map MUST be unmodified: nodeAllocatable writes
+				// out[memory], which would clobber capacity[memory] if out aliased the
+				// same backing map instead of DeepCopy-ing it.
+				if cm := capacity[corev1.ResourceMemory]; cm.Value() != tc.capMemB {
+					t.Errorf("input capacity memory mutated to %d, want %d (nodeAllocatable must DeepCopy, not alias)", cm.Value(), tc.capMemB)
+				}
+			})
+		}
+	})
+
+	// memReserveBytes sizing — assert the FLOOR (the conformance/sre CRITICAL), not just
+	// the arithmetic: a too-small reserve re-admits jetsam killing the co-located control plane.
+	t.Run("memReserveBytes = max(2Gi, 10%): floor wins small, pct wins large", func(t *testing.T) {
+		t.Parallel()
+		// 8Gi host: 10% = 0.8Gi < 2Gi ⇒ the 2Gi floor dominates.
+		if got, want := memReserveBytes(8*gib), twoG; got != want {
+			t.Errorf("memReserveBytes(8Gi) = %d, want %d (the 2Gi floor dominates: 10%% of 8Gi = 0.8Gi < 2Gi)", got, want)
+		}
+		// 64Gi host: 10% = 6.4Gi > 2Gi ⇒ the 10% term dominates.
+		if got, want := memReserveBytes(64*gib), (64*gib)/10; got != want {
+			t.Errorf("memReserveBytes(64Gi) = %d, want %d (10%% of 64Gi = 6.4Gi > the 2Gi floor)", got, want)
+		}
+		// The floor is NEVER undercut, on any host size.
+		for _, capB := range []int64{gib, 8 * gib, 16 * gib, 64 * gib} {
+			if got := memReserveBytes(capB); got < defaultMemReserveBytes {
+				t.Errorf("memReserveBytes(%d) = %d, must be >= the 2Gi floor %d (never under-reserve)", capB, got, defaultMemReserveBytes)
+			}
+		}
+	})
+
+	// Positive clamp: a reserve >= capacity on a pathologically tiny host must floor
+	// Allocatable at minAllocatableMemBytes (512Mi), strictly > 0 — never zero/negative
+	// (which would strand every pod Pending forever).
+	t.Run("tiny capacity clamps Allocatable to the positive floor, never <= 0", func(t *testing.T) {
+		t.Parallel()
+		capacity := corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewQuantity(4, resource.DecimalSI),
+			corev1.ResourceMemory: *resource.NewQuantity(gib, resource.BinarySI), // 1Gi
+			corev1.ResourcePods:   *resource.NewQuantity(110, resource.DecimalSI),
+		}
+		alloc := nodeAllocatable(capacity, twoG) // reserve 2Gi > 1Gi capacity
+		am := alloc[corev1.ResourceMemory]
+		if am.Value() != minAllocatableMemBytes {
+			t.Errorf("Allocatable memory = %d, want the %d floor (reserve 2Gi >= 1Gi capacity)", am.Value(), minAllocatableMemBytes)
+		}
+		if am.Value() <= 0 {
+			t.Errorf("clamp failed: Allocatable memory = %d, must be strictly > 0 (a zero/negative Allocatable strands every pod Pending)", am.Value())
+		}
+	})
 }

@@ -82,8 +82,9 @@ type hostStats struct {
 	MemAvailableBytes int64
 	// MemCapacityBytes is total physical memory (hw.memsize). It does not gate
 	// MemoryPressure (the upstream default is an absolute <100Mi floor, not a
-	// percentage); it is carried for the Allocatable reserve (item B41) and for
-	// surfacing node Capacity.
+	// percentage); it is carried for surfacing node Capacity on the B27 live
+	// node-status loop. (B41's Allocatable reserve is computed independently in
+	// cmd/k3sm configureNode from n.Status.Capacity — NOT from this field.)
 	MemCapacityBytes int64
 	// DiskAvailableBytes is free bytes on the single shared APFS volume backing
 	// the node — the image store, the writable pod layers, and the co-located
