@@ -122,6 +122,8 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
+// Pin genproto to one revision: resolves the monolith-vs-split ambiguous import
+// (the split googleapis modules vs the legacy monolith) that otherwise breaks the build.
 replace google.golang.org/genproto => google.golang.org/genproto v0.0.0-20260622175928-b703f567277d
 
 // Sibling repos are not published; resolve them from the workspace checkout.
