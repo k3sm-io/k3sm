@@ -23,18 +23,28 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
-// mapZone is a fake cluster Service zone (key "ns/name" → ClusterIP).
-type mapZone map[string]netip.Addr
+// mapZone is a fake cluster Service zone (key "ns/name" → serviceTarget). A missing
+// key is ok==false (NXDOMAIN), modeling an absent Service, a headless "None", or an
+// IPv6-only Service — exactly the cases the production serviceZone collapses to
+// ok==false (its real Type-branching is proven in TestServiceZoneBranchesOnType).
+type mapZone map[string]serviceTarget
 
-func (z mapZone) LookupService(namespace, name string) (netip.Addr, bool) {
-	a, ok := z[namespace+"/"+name]
-	return a, ok
+func (z mapZone) LookupService(namespace, name string) (serviceTarget, bool) {
+	t, ok := z[namespace+"/"+name]
+	return t, ok
 }
 
 // mapForwarder is a fake upstream forwarder (host → IPv4 addrs); a miss returns a
@@ -47,6 +57,45 @@ func (f mapForwarder) LookupIP4(_ context.Context, host string) ([]netip.Addr, e
 		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	}
 	return a, nil
+}
+
+// recordingForwarder is a fake dnsForwarder that records every host it is asked to
+// resolve (so a test can prove the ExternalName chase forwards the TARGET, not the
+// queried cluster name) and answers from a fixed host→addrs map. A host absent from
+// the map returns a not-found net.DNSError (→ NXDOMAIN); when failWith is set, every
+// lookup returns it instead (a transient, non-not-found error → SERVFAIL).
+type recordingForwarder struct {
+	mu       sync.Mutex
+	answers  map[string][]netip.Addr
+	failWith error
+	calls    []string
+}
+
+func (f *recordingForwarder) LookupIP4(_ context.Context, host string) ([]netip.Addr, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, host)
+	f.mu.Unlock()
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	if a, ok := f.answers[host]; ok {
+		return a, nil
+	}
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+}
+
+// called reports whether the forwarder was ever asked to resolve host.
+func (f *recordingForwarder) called(host string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Contains(f.calls, host)
+}
+
+// callCount returns how many times the forwarder was invoked.
+func (f *recordingForwarder) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
@@ -62,8 +111,8 @@ func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
 	t.Parallel()
 
 	zone := mapZone{
-		"default/kubernetes": netip.MustParseAddr("10.43.0.1"),  // the API VIP, node-local
-		"default/web":        netip.MustParseAddr("10.43.0.55"), // a normal ClusterIP
+		"default/kubernetes": {IP: netip.MustParseAddr("10.43.0.1")},  // the API VIP, node-local
+		"default/web":        {IP: netip.MustParseAddr("10.43.0.55")}, // a normal ClusterIP
 	}
 	fwd := mapForwarder{
 		"example.com": {netip.MustParseAddr("93.184.216.34")},
@@ -229,6 +278,12 @@ func queryTCP(t *testing.T, server, name string) (dnsmessage.RCode, []netip.Addr
 // buildAQuery packs an A-record query for name (FQDN-normalized).
 func buildAQuery(t *testing.T, name string) []byte {
 	t.Helper()
+	return buildTypedQuery(t, name, dnsmessage.TypeA)
+}
+
+// buildTypedQuery packs a query of the given record type for name (FQDN-normalized).
+func buildTypedQuery(t *testing.T, name string, qtype dnsmessage.Type) []byte {
+	t.Helper()
 	if name == "" || name[len(name)-1] != '.' {
 		name += "."
 	}
@@ -238,7 +293,7 @@ func buildAQuery(t *testing.T, name string) []byte {
 	}
 	if err := b.Question(dnsmessage.Question{
 		Name:  dnsmessage.MustNewName(name),
-		Type:  dnsmessage.TypeA,
+		Type:  qtype,
 		Class: dnsmessage.ClassINET,
 	}); err != nil {
 		t.Fatalf("question: %v", err)
@@ -293,4 +348,276 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestExternalNameResolvesViaForwarder is the B19 unit proof: the per-node resolver
+// resolves an ExternalName Service by chasing spec.externalName through the upstream
+// forwarder and FLATTENING CNAME→A — the target's A records are stamped under the
+// QUERIED cluster name, with no CNAME RR. It pins the load-bearing correctness points
+// the pre-build critiques converged on: only a Type==ExternalName Service is chased
+// (an absent/headless one still NXDOMAINs), an ExternalName target inside the cluster
+// domain is NOT forwarded (anti-leak → NXDOMAIN), and a transient forward failure is
+// SERVFAIL, never a cacheable NXDOMAIN.
+func TestExternalNameResolvesViaForwarder(t *testing.T) {
+	t.Parallel()
+	const domain = "cluster.local"
+	vip := netip.MustParseAddr("10.43.0.10")
+
+	// (a)+(b)+(c): an ExternalName Service is chased; the forwarder is asked for the
+	// TARGET (not the cluster qname), and the target's A records are stamped under the
+	// QUERIED name with no CNAME RR (the flatten contract).
+	t.Run("chase flattens target A under queried name", func(t *testing.T) {
+		fwd := &recordingForwarder{answers: map[string][]netip.Addr{
+			"db.example.com": {netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("203.0.113.8")},
+		}}
+		zone := mapZone{"prod/db": {ExternalName: "db.example.com"}}
+		r := newClusterResolver(vip, domain, zone, fwd, testLogger())
+
+		rcode, addrs, aNames, cnames := respondQuery(t, r, "db.prod.svc.cluster.local", dnsmessage.TypeA)
+		// (a) NOERROR + the target's A records.
+		if rcode != dnsmessage.RCodeSuccess {
+			t.Fatalf("rcode = %v, want NOERROR", rcode)
+		}
+		if got := addrStrings(addrs); !equalStrings(got, []string{"203.0.113.7", "203.0.113.8"}) {
+			t.Fatalf("addrs = %v, want the target's A records", got)
+		}
+		// (a) stamped under the QUERIED cluster name (the flatten), not the target.
+		for _, n := range aNames {
+			if normalizeDNSName(n) != "db.prod.svc.cluster.local" {
+				t.Fatalf("A record owner = %q, want the queried name db.prod.svc.cluster.local", n)
+			}
+		}
+		// (b) the forwarder was asked for the TARGET, and the cluster qname never leaked.
+		if !fwd.called("db.example.com") {
+			t.Fatalf("forwarder was not asked for the ExternalName target db.example.com")
+		}
+		if fwd.called("db.prod.svc.cluster.local") {
+			t.Fatalf("forwarder was asked for the cluster qname (qname leak)")
+		}
+		// (c) no CNAME RR — the resolver flattens to A only.
+		if cnames != 0 {
+			t.Fatalf("answer carried %d CNAME RRs, want 0 (CNAME→A flatten)", cnames)
+		}
+	})
+
+	// (d): only a Type==ExternalName Service is chased. A lookup that yields ok==false
+	// — an ABSENT Service and a headless "None" Service (serviceZone collapses both to
+	// ok==false; TestServiceZoneBranchesOnType proves the None branch) — is NXDOMAIN
+	// and is NEVER forwarded.
+	t.Run("absent and headless None NXDOMAIN never chased", func(t *testing.T) {
+		fwd := &recordingForwarder{}
+		zone := mapZone{} // no entry → ok==false (absent / headless None / IPv6-only)
+		r := newClusterResolver(vip, domain, zone, fwd, testLogger())
+
+		for _, q := range []string{
+			"absent.prod.svc.cluster.local",   // a Service that does not exist
+			"headless.prod.svc.cluster.local", // a ClusterIP "None" Service (ok==false)
+		} {
+			rcode, addrs, _, _ := respondQuery(t, r, q, dnsmessage.TypeA)
+			if rcode != dnsmessage.RCodeNameError {
+				t.Fatalf("%s: rcode = %v, want NXDOMAIN", q, rcode)
+			}
+			if len(addrs) != 0 {
+				t.Fatalf("%s: got addrs %v, want none", q, addrs)
+			}
+		}
+		if fwd.callCount() != 0 {
+			t.Fatalf("forwarder was invoked %d times for ok==false lookups, want 0 (only Type==ExternalName chases)", fwd.callCount())
+		}
+	})
+
+	// (e) anti-leak: an ExternalName target INSIDE the cluster domain is NOT forwarded
+	// — it is NXDOMAIN, and the forwarder is never asked for it.
+	t.Run("in-cluster target NXDOMAIN not forwarded", func(t *testing.T) {
+		fwd := &recordingForwarder{}
+		zone := mapZone{"prod/loop": {ExternalName: "other.ns2.svc.cluster.local"}}
+		r := newClusterResolver(vip, domain, zone, fwd, testLogger())
+
+		rcode, addrs, _, _ := respondQuery(t, r, "loop.prod.svc.cluster.local", dnsmessage.TypeA)
+		if rcode != dnsmessage.RCodeNameError {
+			t.Fatalf("rcode = %v, want NXDOMAIN for an in-cluster-domain ExternalName target", rcode)
+		}
+		if len(addrs) != 0 {
+			t.Fatalf("got addrs %v, want none", addrs)
+		}
+		if fwd.called("other.ns2.svc.cluster.local") {
+			t.Fatalf("forwarder was asked for the in-cluster target (cluster-name leak)")
+		}
+		if fwd.callCount() != 0 {
+			t.Fatalf("forwarder was invoked %d times for an in-cluster target, want 0", fwd.callCount())
+		}
+	})
+
+	// (f): a TRANSIENT forward error (not a not-found) is SERVFAIL, never a cacheable
+	// NXDOMAIN — the shared forward() helper preserves the distinction for the chase.
+	t.Run("transient forward error is SERVFAIL", func(t *testing.T) {
+		fwd := &recordingForwarder{failWith: &net.DNSError{Err: "server misbehaving", Name: "db.example.com", IsTemporary: true}}
+		zone := mapZone{"prod/db": {ExternalName: "db.example.com"}}
+		r := newClusterResolver(vip, domain, zone, fwd, testLogger())
+
+		rcode, _, _, _ := respondQuery(t, r, "db.prod.svc.cluster.local", dnsmessage.TypeA)
+		if rcode != dnsmessage.RCodeServerFailure {
+			t.Fatalf("rcode = %v, want SERVFAIL for a transient forward error", rcode)
+		}
+	})
+
+	// guard: an AAAA query for an ExternalName Service is NODATA (empty NOERROR), never
+	// NXDOMAIN — the chase lives inside the A-only guard, and no forward fires.
+	t.Run("AAAA ExternalName is NODATA not NXDOMAIN", func(t *testing.T) {
+		fwd := &recordingForwarder{answers: map[string][]netip.Addr{
+			"db.example.com": {netip.MustParseAddr("203.0.113.7")},
+		}}
+		zone := mapZone{"prod/db": {ExternalName: "db.example.com"}}
+		r := newClusterResolver(vip, domain, zone, fwd, testLogger())
+
+		rcode, addrs, _, _ := respondQuery(t, r, "db.prod.svc.cluster.local", dnsmessage.TypeAAAA)
+		if rcode != dnsmessage.RCodeSuccess {
+			t.Fatalf("rcode = %v, want NOERROR (NODATA) for an AAAA ExternalName query", rcode)
+		}
+		if len(addrs) != 0 {
+			t.Fatalf("got A addrs %v for an AAAA query, want none", addrs)
+		}
+		if fwd.callCount() != 0 {
+			t.Fatalf("forwarder fired %d times for an AAAA query, want 0 (chase is A-only)", fwd.callCount())
+		}
+	})
+}
+
+// TestServiceZoneBranchesOnType pins the production serviceZone's load-bearing
+// branch: it keys off Service TYPE, not an empty ClusterIP (which is overloaded with
+// a headless "None" and a pending ClusterIP). An ExternalName Service yields its
+// target (trailing dot trimmed); a headless "None", an IPv6 ClusterIP, an empty
+// ExternalName, and an absent Service all yield ok==false (NXDOMAIN) — so none is
+// mistaken for a forwardable target.
+func TestServiceZoneBranchesOnType(t *testing.T) {
+	t.Parallel()
+
+	svc := func(name string, spec corev1.ServiceSpec) *corev1.Service {
+		return &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: name}, Spec: spec}
+	}
+	zone := newServiceZone(t, fake.NewClientset(
+		svc("ext", corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: "db.example.com"}),
+		svc("ext-dot", corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: "db.example.com."}),
+		svc("ext-empty", corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: ""}),
+		svc("clusterip", corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "10.43.0.55"}),
+		svc("headless", corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "None"}),
+		svc("ipv6", corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, ClusterIP: "fd00::1"}),
+	))
+
+	cases := []struct {
+		name        string
+		svc         string
+		wantOK      bool
+		wantIP      string
+		wantExtName string
+	}{
+		{"ExternalName yields target", "ext", true, "", "db.example.com"},
+		{"ExternalName trailing dot trimmed", "ext-dot", true, "", "db.example.com"},
+		{"ExternalName empty is NXDOMAIN", "ext-empty", false, "", ""},
+		{"ClusterIP yields IP", "clusterip", true, "10.43.0.55", ""},
+		{"headless None is NXDOMAIN", "headless", false, "", ""},
+		{"IPv6 ClusterIP is NXDOMAIN", "ipv6", false, "", ""},
+		{"absent is NXDOMAIN", "ghost", false, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target, ok := zone.LookupService("prod", tc.svc)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if tc.wantExtName != "" {
+				if target.ExternalName != tc.wantExtName || target.IP.IsValid() {
+					t.Fatalf("target = %+v, want ExternalName %q and no IP", target, tc.wantExtName)
+				}
+				return
+			}
+			if got := target.IP.String(); got != tc.wantIP || target.ExternalName != "" {
+				t.Fatalf("target = %+v, want IP %q and no ExternalName", target, tc.wantIP)
+			}
+		})
+	}
+}
+
+// newServiceZone builds a production serviceZone over a Services lister fed by the
+// fake clientset's objects (an informer cache, warmed before return), so the real
+// Type-branching LookupService is exercised end to end.
+func newServiceZone(t *testing.T, cs *fake.Clientset) serviceZone {
+	t.Helper()
+	factory := informers.NewSharedInformerFactory(cs, 0)
+	z := serviceZone{lister: factory.Core().V1().Services().Lister()}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	factory.Start(ctx.Done())
+	factory.WaitForCacheSync(ctx.Done())
+	return z
+}
+
+// respondQuery drives the resolver's pure core (r.respond) for a single query of the
+// given type and returns the rcode, the A-record addresses, the owner names those A
+// records were stamped under, and the count of CNAME RRs in the answer (to pin the
+// CNAME→A flatten: zero).
+func respondQuery(t *testing.T, r *clusterResolver, name string, qtype dnsmessage.Type) (dnsmessage.RCode, []netip.Addr, []string, int) {
+	t.Helper()
+	resp, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
+	if err != nil {
+		t.Fatalf("respond(%q): %v", name, err)
+	}
+	return parseFullResponse(t, resp)
+}
+
+// parseFullResponse decodes a DNS response into its rcode, A addresses, the owner
+// names of those A records, and the number of CNAME RRs in the answer section.
+func parseFullResponse(t *testing.T, resp []byte) (dnsmessage.RCode, []netip.Addr, []string, int) {
+	t.Helper()
+	var p dnsmessage.Parser
+	hdr, err := p.Start(resp)
+	if err != nil {
+		t.Fatalf("parse response header: %v", err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("skip questions: %v", err)
+	}
+	var addrs []netip.Addr
+	var aNames []string
+	cnames := 0
+	for {
+		ah, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			t.Fatalf("answer header: %v", err)
+		}
+		switch ah.Type {
+		case dnsmessage.TypeA:
+			ar, err := p.AResource()
+			if err != nil {
+				t.Fatalf("a resource: %v", err)
+			}
+			addrs = append(addrs, netip.AddrFrom4(ar.A))
+			aNames = append(aNames, ah.Name.String())
+		case dnsmessage.TypeCNAME:
+			cnames++
+			if err := p.SkipAnswer(); err != nil {
+				t.Fatalf("skip cname: %v", err)
+			}
+		default:
+			if err := p.SkipAnswer(); err != nil {
+				t.Fatalf("skip answer: %v", err)
+			}
+		}
+	}
+	return hdr.RCode, addrs, aNames, cnames
+}
+
+// addrStrings renders addrs as their string forms for comparison.
+func addrStrings(addrs []netip.Addr) []string {
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = a.String()
+	}
+	return out
 }

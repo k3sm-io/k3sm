@@ -60,9 +60,12 @@ limitations under the License.
 // production posture is unprivileged, and a root-only resolver would be a SECOND DNS
 // code path.) So k3sm runs a minimal authoritative resolver (clusterResolver), which
 // DOES adopt the helper-passed fd (net.FileListener / net.FilePacketConn) — see
-// resolver.go. Its divergence (no SRV/PTR/pod/headless, IPv4 only) is MOOT on the
-// native hostprocess path — every pod reports podIP == nodeIP, so there are no
-// per-pod / headless addresses to serve — and becomes material only on the
-// per-pod-IP vm path, which is exactly where the native-CoreDNS-binary follow-up
-// (a supervised native process owning the VIP) pays off.
+// resolver.go. ExternalName Services are resolved by chasing the target through the
+// upstream forwarder, FLATTENED CNAME→A (the resolver is A-only — no upstream CNAME
+// RR is returned, and an ExternalName target inside the cluster domain is unsupported
+// → NXDOMAIN, never forwarded). Its other divergence (no SRV/PTR/pod/headless, IPv4
+// only) is MOOT on the native hostprocess path — every pod reports podIP == nodeIP,
+// so there are no per-pod / headless addresses to serve — and becomes material only
+// on the per-pod-IP vm path, which is exactly where the native-CoreDNS-binary
+// follow-up (a supervised native process owning the VIP) pays off.
 package netserve
