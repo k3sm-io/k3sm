@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -368,6 +369,153 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 			t.Errorf("%s = %q, want the cluster VIP %q (infra wins; the workload 1.2.3.4 must not override)", dns.EnvDNSServer, got, wantServer)
 		}
 	})
+}
+
+// TestToPodBoxClusterFirstMergesDNSConfig is the B20a gate: buildBox merges a
+// ClusterFirst pod's spec.dnsConfig (extra searches appended+deduped, ndots
+// override) into the cluster DNS base BEFORE toPodBox injects the K3SM_DNS_* env the
+// DYLD getaddrinfo shim reads — so it asserts on the LIVE box env (every container,
+// init + regular), not the pure dns.MergeDNSConfig primitive. The merge is gated
+// structurally in buildBox on the cluster-DNS policy, so a None/Default pod gets the
+// UNMERGED base and (per B18) NO injection at all — pinning the B20a/B20b seam.
+// Fails-before (buildBox ignored spec.dnsConfig → the plain cluster defaults),
+// passes-after.
+func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
+	const (
+		ns       = "ns1"
+		vip      = "10.43.0.10"
+		domain   = "cluster.local"
+		cluster0 = "ns1.svc.cluster.local"
+		cluster1 = "svc.cluster.local"
+		cluster2 = "cluster.local"
+	)
+	// newR builds a runtimed-backed provider with the cluster DNS inputs buildBox
+	// feeds dns.PodDNSConfig; the fake runtime server is never driven (buildBox is a
+	// pure translation that does not call the runtime).
+	newR := func(t *testing.T) *runtimedRuntime {
+		t.Helper()
+		return newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
+			NodeName:      "n",
+			NodeIP:        "10.0.0.5",
+			Root:          t.TempDir(),
+			ResolverVIP:   vip,
+			ClusterDomain: domain,
+		}, nil, nil)
+	}
+	// dnsPod builds a pod (namespace ns, 1 init + 1 regular container) under policy
+	// carrying cfg as spec.dnsConfig.
+	dnsPod := func(policy corev1.DNSPolicy, cfg *corev1.PodDNSConfig) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "web", UID: types.UID("uid-web")},
+			Spec: corev1.PodSpec{
+				DNSPolicy:      policy,
+				DNSConfig:      cfg,
+				InitContainers: []corev1.Container{{Name: "init0", Image: "img"}},
+				Containers:     []corev1.Container{{Name: "c0", Image: "img"}},
+			},
+		}
+	}
+
+	// Case 1 — ClusterFirst + dnsConfig: the pod's extra search is appended AFTER the
+	// cluster three and its ndots overrides the cluster default, on EVERY container
+	// (init + regular).
+	t.Run("ClusterFirst appends searches and overrides ndots", func(t *testing.T) {
+		pod := dnsPod(corev1.DNSClusterFirst, &corev1.PodDNSConfig{
+			Searches: []string{"corp.internal"},
+			Options:  []corev1.PodDNSConfigOption{{Name: "ndots", Value: ptr("2")}},
+		})
+		box, err := newR(t).buildBox(context.Background(), pod)
+		if err != nil {
+			t.Fatalf("buildBox: %v", err)
+		}
+		const wantSearch = "ns1.svc.cluster.local svc.cluster.local cluster.local corp.internal"
+		cs := allContainers(box)
+		if len(cs) != 2 {
+			t.Fatalf("want 2 containers (1 init + 1 regular), got %d", len(cs))
+		}
+		for _, c := range cs {
+			env := containerEnv(c)
+			if got := env[dns.EnvDNSSearch]; got != wantSearch {
+				t.Errorf("container %s: %s = %q, want %q (cluster-first + appended pod search)", c.GetName(), dns.EnvDNSSearch, got, wantSearch)
+			}
+			if got := env[dns.EnvDNSNdots]; got != "2" {
+				t.Errorf("container %s: %s = %q, want %q (pod ndots override)", c.GetName(), dns.EnvDNSNdots, got, "2")
+			}
+		}
+	})
+
+	// Case 2 — the conformance boundary: an over-cap pod search list with a cross-list
+	// duplicate (a pod search == a cluster search) is deduped (cluster wins) and capped
+	// at MaxSearchDomains, cluster-first. With 3 cluster + 6 pod searches (one a
+	// duplicate) the merge yields the 3 cluster leads + the 5 unique pod searches = 8.
+	t.Run("over-cap + cross-list duplicate dedupes and caps", func(t *testing.T) {
+		pod := dnsPod(corev1.DNSClusterFirst, &corev1.PodDNSConfig{
+			Searches: []string{"a", "b", "cluster.local", "c", "d", "e"},
+		})
+		box, err := newR(t).buildBox(context.Background(), pod)
+		if err != nil {
+			t.Fatalf("buildBox: %v", err)
+		}
+		for _, c := range allContainers(box) {
+			tokens := strings.Fields(containerEnv(c)[dns.EnvDNSSearch])
+			if len(tokens) > dns.MaxSearchDomains {
+				t.Errorf("container %s: search has %d tokens, want <= %d (cap)", c.GetName(), len(tokens), dns.MaxSearchDomains)
+			}
+			// The cluster three lead the list, in order (a pod search never preempts).
+			if len(tokens) < 3 || tokens[0] != cluster0 || tokens[1] != cluster1 || tokens[2] != cluster2 {
+				t.Errorf("container %s: search = %v, want the cluster three (%q %q %q) leading", c.GetName(), tokens, cluster0, cluster1, cluster2)
+			}
+			// cluster.local appears exactly once — the pod's cross-list duplicate dropped.
+			if n := countToken(tokens, cluster2); n != 1 {
+				t.Errorf("container %s: %q appears %d times, want 1 (cross-list dedupe)", c.GetName(), cluster2, n)
+			}
+			// Every unique pod search survived the merge (proves the merge ran at all —
+			// fails-before, where the box carries only the 3 cluster defaults).
+			for _, want := range []string{"a", "b", "c", "d", "e"} {
+				if countToken(tokens, want) != 1 {
+					t.Errorf("container %s: merged search %v missing pod search %q", c.GetName(), tokens, want)
+				}
+			}
+		}
+	})
+
+	// Case 3 — NEGATIVE: None and Default get the UNMERGED base and NO injection at
+	// all (unchanged from B18) even WITH a dnsConfig. This pins the B20a/B20b seam: a
+	// None pod's own dnsConfig is NOT merged into a cluster base here — B20b owns None.
+	t.Run("None and Default inject nothing even with dnsConfig", func(t *testing.T) {
+		cfg := &corev1.PodDNSConfig{
+			Searches: []string{"corp.internal"},
+			Options:  []corev1.PodDNSConfigOption{{Name: "ndots", Value: ptr("2")}},
+		}
+		for _, policy := range []corev1.DNSPolicy{corev1.DNSNone, corev1.DNSDefault} {
+			t.Run(string(policy), func(t *testing.T) {
+				box, err := newR(t).buildBox(context.Background(), dnsPod(policy, cfg))
+				if err != nil {
+					t.Fatalf("buildBox: %v", err)
+				}
+				for _, c := range allContainers(box) {
+					for _, e := range c.GetEnv() {
+						switch e.GetName() {
+						case dns.EnvDNSServer, dns.EnvDNSDomain, dns.EnvDNSSearch, dns.EnvDNSNdots, dns.EnvDNSPort:
+							t.Errorf("policy %s container %s: unexpected cluster DNS env %s=%q (None/Default opt out — no merge, no injection)", policy, c.GetName(), e.GetName(), e.GetValue())
+						}
+					}
+				}
+			})
+		}
+	})
+}
+
+// countToken counts how many times tok appears in toks (a test helper for the
+// dedupe/cap assertions).
+func countToken(toks []string, tok string) int {
+	n := 0
+	for _, t := range toks {
+		if t == tok {
+			n++
+		}
+	}
+	return n
 }
 
 // allContainers returns the box's init + regular containers in one slice without

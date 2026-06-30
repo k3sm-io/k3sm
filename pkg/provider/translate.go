@@ -85,10 +85,15 @@ const defaultGraceSeconds int64 = 30
 // loads the shim, which then defers every lookup to the host resolver until these
 // env are present.
 //
-// Deferred (successor B19/B20): dnsPolicy: None (a pod's own spec.dnsConfig
-// nameservers) and the additive spec.dnsConfig merge are NOT handled — a None pod
-// currently falls back to the host resolver rather than its declared nameservers.
-// Only the ClusterFirst cluster-DNS injection ships in B18.
+// B20a augments the ClusterFirst path: a cluster-first pod's spec.dnsConfig is
+// additively merged into the cluster base (extra search domains appended+deduped,
+// ndots override) by buildBox before this injection — the merge is gated on the
+// cluster-DNS policy there, so a None/Default pod keeps the UNMERGED base. Still
+// DEFERRED to B20b (the apis wave): dnsPolicy: None (a pod's own spec.dnsConfig
+// nameservers — a None pod falls back to the host resolver, not its declared
+// nameservers), an explicit ndots: 0 (the int32 path cannot tell it from unset),
+// spec.dnsConfig.nameservers under ClusterFirst (the single-server shim ABI), and
+// non-ndots options.
 func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.DNSConfig) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
@@ -182,7 +187,7 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 // It is DNSPolicy-gated to the cluster-first policies (clusterDNSPolicy): Default and
 // None inject NOTHING. A Default pod opted out of cluster DNS, and injecting no env
 // makes the shim fall back to the host resolver — exactly Default semantics; None
-// (custom spec.dnsConfig nameservers) is deferred to B19/B20 and likewise falls back
+// (custom spec.dnsConfig nameservers) is deferred to B20b and likewise falls back
 // to the host for now rather than its declared nameservers.
 //
 // Scope parity: the env is appended to BOTH InitContainers and Containers, matching
@@ -231,6 +236,46 @@ func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
 	return policy == "" ||
 		policy == corev1.DNSClusterFirst ||
 		policy == corev1.DNSClusterFirstWithHostNet
+}
+
+// dnsConfigOverride reduces a pod's corev1 spec.dnsConfig to the DISCRETE
+// search/ndots inputs darwin-net's netv1-only dns.MergeDNSConfig consumes. k3sm is
+// the corev1-aware layer, so this corev1→params extraction lives HERE (never in
+// darwin-net/pkg/dns). buildBox calls it for a ClusterFirst pod and feeds the result
+// to dns.MergeDNSConfig, which can only ADD to the cluster search list / override
+// ndots — never preempt the cluster server VIP.
+//
+// A nil c yields (nil, 0): no extra searches, "keep the cluster base ndots". searches
+// is the pod's spec.dnsConfig.searches verbatim. ndots scans c.Options for the first
+// "ndots" entry: a non-negative integer value (strconv.Atoi) becomes the override;
+// anything else — absent, nil/empty, unparseable, or negative — yields 0, which
+// dns.MergeDNSConfig reads as "keep base".
+//
+// DEFERRED to B20b (the apis wave): c.Nameservers (the single-server shim ABI carries
+// exactly one server — the cluster VIP), an explicit `ndots: 0` (the int32 path cannot
+// distinguish it from unset), and every non-"ndots" option (no shim consumer). They
+// are intentionally dropped so a ClusterFirst pod can only ADD to its cluster
+// search/ndots, never repoint the cluster resolver.
+func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) {
+	if c == nil {
+		return nil, 0
+	}
+	searches = c.Searches
+	for i := range c.Options {
+		if c.Options[i].Name != "ndots" {
+			continue
+		}
+		// The first "ndots" option decides: a non-negative integer overrides the
+		// cluster ndots; a nil/unparseable/negative value keeps base (0). An explicit
+		// `ndots: 0` is indistinguishable from unset in this int32 path — deferred to B20b.
+		if v := c.Options[i].Value; v != nil {
+			if n, err := strconv.Atoi(*v); err == nil && n >= 0 {
+				ndots = int32(n)
+			}
+		}
+		break
+	}
+	return searches, ndots
 }
 
 // podSandboxBackend resolves the pod's RuntimeClass (spec.runtimeClassName) to the
