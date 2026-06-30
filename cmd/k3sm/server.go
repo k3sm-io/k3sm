@@ -257,6 +257,14 @@ func runServer(args []string) error {
 	if err := policy.EnsureUDPServiceWarn(ctx, cs); err != nil {
 		logger.Error("provision UDP-service warn policy", "err", err)
 	}
+	// B17 — honest-gap Warn advisory on Pods: a pod with no toleration for the
+	// provider taint (k3sm.io/provider:NoSchedule, on EVERY node) is left
+	// Unschedulable by the scheduler. Warn at the API (never reject — a non-tolerating
+	// pod is valid k8s) so a directly-created pod's omission is visible in kubectl.
+	// Provisioned UNCONDITIONALLY (not mode-gated): the taint is on every node.
+	if err := policy.EnsureProviderTolerationWarn(ctx, cs); err != nil {
+		logger.Error("provision provider-toleration warn policy", "err", err)
+	}
 	// Unprivileged posture: every pod runs as the single _k3sm uid (no per-pod uid
 	// isolation), so REJECT a pod requesting a foreign runAsUser/fsGroup at
 	// admission rather than letting it wedge at runtime (a privilege drop needs
