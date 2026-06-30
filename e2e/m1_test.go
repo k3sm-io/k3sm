@@ -34,8 +34,8 @@ import (
 // by `k3sm server`, a Pod runs natively (image→Running), `kubectl expose` yields
 // a reachable ClusterIP Service (its EndpointSlice is populated by the KEPT
 // endpointslice controller and reconciled by the Service proxy), and the cluster
-// DNS Service is provisioned for CoreDNS to resolve. The data-path reachability
-// (lo0 alias + CoreDNS resolution) is root-gated and asserted by hack/acceptance/
+// DNS Service is provisioned for the in-process resolver to answer. The data-path
+// reachability (lo0 alias + cluster-DNS resolution) is root-gated and asserted by hack/acceptance/
 // m1.sh on a capable host; this typed suite asserts the control-plane-observable
 // facts that gate them.
 func TestM1(t *testing.T) {
@@ -78,7 +78,7 @@ func TestM1(t *testing.T) {
 	t.Logf("Service %s/%s ClusterIP=%s", ns, name, svc.Spec.ClusterIP)
 	requireEndpointSliceController(t, c, ns, name, 60*time.Second)
 
-	// M1.4 — the cluster DNS Service exists for CoreDNS to resolve against.
+	// M1.4 — the cluster DNS Service exists for the in-process resolver to answer against.
 	if !kubeDNSPresentOrSkipped(t, c) {
 		t.Log("kube-dns Service not present; DNS data-path asserted by hack/acceptance/m1.sh")
 	}

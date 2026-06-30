@@ -44,7 +44,8 @@ type Config struct {
 	Client kubernetes.Interface
 	// WorkDir is where the rendered Corefile is written.
 	WorkDir string
-	// DNSVIP is the cluster DNS VIP CoreDNS binds and pods resolve against.
+	// DNSVIP is the cluster DNS VIP the in-process resolver binds and pods resolve
+	// against (the rendered Corefile is the unconsumed native-CoreDNS export).
 	DNSVIP string
 	// ClusterDomain is the cluster DNS domain (e.g. cluster.local).
 	ClusterDomain string
@@ -148,7 +149,7 @@ func New(cfg Config) *Server {
 	return s
 }
 
-// Run renders the CoreDNS Corefile to the workdir, then runs the Service proxy
+// Run renders the (currently unconsumed) CoreDNS Corefile to the workdir, then runs the Service proxy
 // and its watcher until ctx is cancelled. Both the proxy's worker-supervision
 // loop and the watcher's informers honor ctx; Run returns when they stop. When
 // the Config is Disabled (`--network none`), it writes the Corefile and blocks
@@ -228,7 +229,9 @@ func (s *Server) runResolver(ctx context.Context) {
 	}
 }
 
-// CorefilePath is where Run writes the rendered CoreDNS configuration.
+// CorefilePath is where Run writes the rendered CoreDNS configuration (an
+// unconsumed native-CoreDNS export — the in-process resolver, not a CoreDNS
+// binary, serves cluster DNS today; see doc.go).
 func (s *Server) CorefilePath() string {
 	return filepath.Join(s.cfg.WorkDir, "Corefile")
 }
@@ -242,7 +245,9 @@ func (s *Server) PodDNSConfig(namespace string) netv1.DNSConfig {
 }
 
 // writeCorefile renders the CoreDNS configuration (bound to the DNS VIP, serving
-// the cluster domain) and writes it to the workdir for CoreDNS to load.
+// the cluster domain) and writes it to the workdir as the native-CoreDNS export.
+// NOTE: nothing currently loads it — the in-process resolver (resolver.go) serves
+// cluster DNS; the Corefile is kept for the deferred native-CoreDNS follow-up.
 func (s *Server) writeCorefile() error {
 	opts := dns.CorefileOptions{
 		ClusterDomain: s.cfg.ClusterDomain,
