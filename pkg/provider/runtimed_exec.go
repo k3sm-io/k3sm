@@ -102,7 +102,7 @@ func (s *streamPipe[Req, Resp]) feed(r *Req) bool {
 // the pod, then streams the VK AttachIO over the runtime Exec RPC, returning the
 // command's exit status (StreamingRuntime).
 func (r *runtimedRuntime) RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach api.AttachIO) error {
-	id, _, ok := r.lookup(namespace, podName)
+	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
 		return errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
@@ -132,7 +132,7 @@ func (r *runtimedRuntime) RunInContainer(ctx context.Context, namespace, podName
 // streams the VK AttachIO over the runtime Attach RPC (a running container's
 // stdio, no command), returning the exit status (StreamingRuntime).
 func (r *runtimedRuntime) AttachToContainer(ctx context.Context, namespace, podName, container string, attach api.AttachIO) error {
-	id, _, ok := r.lookup(namespace, podName)
+	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
 		return errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
@@ -163,7 +163,7 @@ func (r *runtimedRuntime) AttachToContainer(ctx context.Context, namespace, podN
 // connection (connection_id 1) is used; an establishing frame is sent first so
 // the runtime can dial the pod port before the client speaks (StreamingRuntime).
 func (r *runtimedRuntime) PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error {
-	id, _, ok := r.lookup(namespace, podName)
+	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
 		return errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}

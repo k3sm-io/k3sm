@@ -199,6 +199,6 @@ func (r *runtimedRuntime) publishProbeUpdate(ctx context.Context, id string) {
 	if pr != nil {
 		ps = pr
 	}
-	pod.Status = *toPodStatus(resp.GetStatus(), r.nodeIP, start, ps)
+	pod.Status = *toPodStatus(pod, resp.GetStatus(), r.nodeIP, start, ps)
 	cb(pod)
 }

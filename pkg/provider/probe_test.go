@@ -310,7 +310,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 	}
 
 	// The restart count surfaces in the published status.
-	st := toPodStatus(runningProto("uid-liveness", "c0"), "192.168.1.10", metav1.Now(), pp)
+	st := toPodStatus(nil, runningProto("uid-liveness", "c0"), "192.168.1.10", metav1.Now(), pp)
 	if st.ContainerStatuses[0].RestartCount != 1 {
 		t.Fatalf("status RestartCount=%d, want 1", st.ContainerStatuses[0].RestartCount)
 	}
@@ -383,7 +383,7 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 	}
 
 	// The probe-driven restart surfaces in the published status (restart_count).
-	st := toPodStatus(runningProto("uid-live", "c0"), r.nodeIP, metav1.Now(), pp)
+	st := toPodStatus(nil, runningProto("uid-live", "c0"), r.nodeIP, metav1.Now(), pp)
 	if st.ContainerStatuses[0].RestartCount != 1 {
 		t.Errorf("status RestartCount = %d, want 1", st.ContainerStatuses[0].RestartCount)
 	}
@@ -405,10 +405,10 @@ func TestM2_ReadinessGatesEndpoints(t *testing.T) {
 	m := pp.monitors["c0"]
 
 	ready := func() corev1.ConditionStatus {
-		return condStatus(toPodStatus(runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.PodReady)
+		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.PodReady)
 	}
 	containersReady := func() corev1.ConditionStatus {
-		return condStatus(toPodStatus(runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.ContainersReady)
+		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.ContainersReady)
 	}
 
 	// Until the readiness probe first succeeds, the container is NOT ready (so it
