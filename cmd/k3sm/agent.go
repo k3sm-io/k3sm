@@ -83,7 +83,7 @@ func runAgent(args []string) error {
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
-	fs.StringVar(&opts.domain, "cluster-domain", "cluster.local", "cluster DNS domain")
+	fs.StringVar(&opts.domain, "cluster-domain", defaultClusterDomain, "cluster DNS domain")
 	_ = fs.Parse(args)
 
 	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {
@@ -170,6 +170,7 @@ func runAgent(args []string) error {
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
 		serveTLS:   true,
 	})
 }

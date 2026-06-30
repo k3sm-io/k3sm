@@ -18,6 +18,7 @@ package provider
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -25,7 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/dns"
 )
 
 // protoTime converts a proto timestamp to a metav1.Time, returning the zero
@@ -73,7 +76,20 @@ const defaultGraceSeconds int64 = 30
 // Container env is carried STRUCTURALLY here (literal value, valueFrom, envFrom);
 // resolvePodBoxEnv flattens it into literal values before the box is sent to
 // runtimed, which reads only EnvVar.value (it never talks to the apiserver).
-func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) (*runtimev1.PodBox, error) {
+//
+// dnsCfg is the pod's cluster DNS configuration; when the pod uses a cluster-first
+// DNSPolicy, toPodBox injects the K3SM_DNS_* env the DYLD getaddrinfo shim reads
+// (via dns.ConfigToEnv) into every container so in-pod cluster Service names
+// resolve against the cluster DNS VIP — see injectClusterDNSEnv (B18). The
+// injection is the keystone for in-pod cluster DNS: the shim annotation alone only
+// loads the shim, which then defers every lookup to the host resolver until these
+// env are present.
+//
+// Deferred (successor B19/B20): dnsPolicy: None (a pod's own spec.dnsConfig
+// nameservers) and the additive spec.dnsConfig merge are NOT handled — a None pod
+// currently falls back to the host resolver rather than its declared nameservers.
+// Only the ClusterFirst cluster-DNS injection ships in B18.
+func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.DNSConfig) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
 		Namespace:   pod.Namespace,
@@ -109,6 +125,13 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) (*runtimev1.P
 
 	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers)
 	box.Containers = toRuntimeContainers(pod.Spec.Containers)
+
+	// Inject the cluster DNS env the DYLD getaddrinfo shim reads, gated on the pod's
+	// DNSPolicy. Appended AFTER the user env (infra-wins) and to BOTH the init and
+	// regular containers — see injectClusterDNSEnv. This is the B18 DNS keystone: the
+	// shim annotation only loads the shim; without these env in-pod cluster Service
+	// names do not resolve (the shim defers to the host resolver).
+	injectClusterDNSEnv(box, pod.Spec.DNSPolicy, dnsCfg)
 
 	box.Volumes = toVolumes(pod.Spec.Volumes)
 	box.PodSecurityContext = toPodSecurityContext(pod.Spec.SecurityContext)
@@ -149,6 +172,65 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string) (*runtimev1.P
 		box.SandboxProfile.VmMemoryBytes = podVMMemoryBytes(pod)
 	}
 	return box, nil
+}
+
+// injectClusterDNSEnv appends the K3SM_DNS_* environment the DYLD getaddrinfo shim
+// reads (serialized by the single pinned dns.ConfigToEnv encoder — NEVER hand-rolled
+// here, a wrong separator would silently break ALL in-pod cluster DNS) to every
+// container so a pod's unqualified Service lookups expand against the cluster DNS VIP.
+//
+// It is DNSPolicy-gated to the cluster-first policies (clusterDNSPolicy): Default and
+// None inject NOTHING. A Default pod opted out of cluster DNS, and injecting no env
+// makes the shim fall back to the host resolver — exactly Default semantics; None
+// (custom spec.dnsConfig nameservers) is deferred to B19/B20 and likewise falls back
+// to the host for now rather than its declared nameservers.
+//
+// Scope parity: the env is appended to BOTH InitContainers and Containers, matching
+// the box-wide DYLD shim annotation — an init container that resolves a Service needs
+// cluster DNS too.
+//
+// Precedence (infra-wins): the env is appended AFTER each container's user env, so
+// resolveContainerEnv's later-wins upsert makes the cluster value authoritative — a
+// workload that set its own K3SM_DNS_SERVER cannot override cluster DNS (ClusterFirst
+// means cluster DNS). The keys are sorted for deterministic output.
+//
+// When dnsCfg is not usable (no cluster DNS VIP / invalid), dns.ConfigToEnv returns
+// nil and nothing is injected — the shim then defers to the host resolver.
+func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg netv1.DNSConfig) {
+	if !clusterDNSPolicy(policy) {
+		return
+	}
+	env := dns.ConfigToEnv(dnsCfg)
+	if env == nil {
+		return
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	appendEnv := func(c *runtimev1.Container) {
+		for _, k := range keys {
+			c.Env = append(c.Env, &runtimev1.EnvVar{Name: k, Value: env[k]})
+		}
+	}
+	for _, c := range box.GetInitContainers() {
+		appendEnv(c)
+	}
+	for _, c := range box.GetContainers() {
+		appendEnv(c)
+	}
+}
+
+// clusterDNSPolicy reports whether the pod's DNSPolicy selects cluster DNS. An empty
+// policy is the upstream default (ClusterFirst). ClusterFirstWithHostNet MUST match
+// too: k3sm pods share the host network by construction, so that value is reachable —
+// matching only DNSClusterFirst would silently drop cluster DNS for those pods.
+// Default and None do NOT select cluster DNS (no injection).
+func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
+	return policy == "" ||
+		policy == corev1.DNSClusterFirst ||
+		policy == corev1.DNSClusterFirstWithHostNet
 }
 
 // podSandboxBackend resolves the pod's RuntimeClass (spec.runtimeClassName) to the

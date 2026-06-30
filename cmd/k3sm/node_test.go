@@ -37,12 +37,14 @@ import (
 func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	t.Parallel()
 
-	// server/agent pass the resolved --dns-vip value as the resolver VIP.
+	// server/agent pass the resolved --dns-vip + --cluster-domain values as the
+	// resolver VIP and the in-pod shim search domain.
 	cfg := runtimedConfig(nodeOptions{
 		nodeName: "k3sm-worker",
 		nodeIP:   "100.64.2.1",
 		podRoot:  "/var/lib/k3sm/pods",
 		dnsVIP:   "10.43.0.10",
+		domain:   "corp.internal",
 	}, nil)
 	if cfg.ResolverVIP != "10.43.0.10" {
 		t.Errorf("ResolverVIP = %q, want 10.43.0.10 (the cluster DNS VIP, not runtimed's 10.96.0.10 default)", cfg.ResolverVIP)
@@ -50,11 +52,21 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	if cfg.APIServerVIP != "10.43.0.1" {
 		t.Errorf("APIServerVIP = %q, want 10.43.0.1 (the kubernetes Service ClusterIP, first host of the service CIDR)", cfg.APIServerVIP)
 	}
+	// ClusterDomain PREFERS the threaded --cluster-domain (B18): a hardcoded
+	// cluster.local under a custom domain would make every unqualified Service lookup
+	// NXDOMAIN (the shim search list must match the resolver's served zone).
+	if cfg.ClusterDomain != "corp.internal" {
+		t.Errorf("ClusterDomain = %q, want corp.internal (the threaded --cluster-domain, not a hardcoded cluster.local)", cfg.ClusterDomain)
+	}
 
 	// An unset --dns-vip falls back to the cluster DNS VIP default, never to
 	// runtimed's built-in 10.96.0.10 (which would scope pod DNS to the wrong VIP).
 	if got := runtimedConfig(nodeOptions{}, nil).ResolverVIP; got != "10.43.0.10" {
 		t.Errorf("ResolverVIP with no --dns-vip = %q, want the cluster DNS VIP default 10.43.0.10", got)
+	}
+	// An unset --cluster-domain falls back to the canonical cluster.local default.
+	if got := runtimedConfig(nodeOptions{}, nil).ClusterDomain; got != "cluster.local" {
+		t.Errorf("ClusterDomain with no --cluster-domain = %q, want the cluster.local default", got)
 	}
 
 	// The API VIP is derived from the single service-CIDR const (10.43.0.0/16 ⇒
