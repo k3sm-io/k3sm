@@ -46,20 +46,7 @@ import (
 func (r *runtimedRuntime) buildCheck(podID, podIP string, c *corev1.Container, p *corev1.Probe) checkFunc {
 	switch {
 	case p.HTTPGet != nil:
-		h := p.HTTPGet
-		host := podIP
-		if h.Host != "" {
-			host = h.Host
-		}
-		port, ok := resolvePort(h.Port, c.Ports)
-		if !ok {
-			return unresolvedCheck("httpGet", c.Name)
-		}
-		scheme := string(h.Scheme)
-		if scheme == "" {
-			scheme = "HTTP"
-		}
-		return httpProbe(r.probeTransport, scheme, host, port, h.Path, h.HTTPHeaders)
+		return r.httpGetCheck(podIP, c.Name, c.Ports, p.HTTPGet)
 	case p.TCPSocket != nil:
 		t := p.TCPSocket
 		host := podIP
@@ -96,6 +83,28 @@ func (r *runtimedRuntime) buildCheck(podID, podIP string, c *corev1.Container, p
 		// falsely healthy, and the runner never invokes a nil check.
 		return unhandledProbeCheck(c.Name)
 	}
+}
+
+// httpGetCheck resolves an httpGet target — default host = the bound pod IP, default
+// scheme = HTTP, the port resolved (a named port via the container's port table) —
+// into the check the probe runner and the lifecycle-hook dispatcher (lifecycle.go)
+// both execute, so a probe and a hook httpGet resolve IDENTICALLY. An unresolvable
+// named port yields an always-failing check (the misconfiguration surfaces rather
+// than masking as success); a hook caller treats that failure as best-effort.
+func (r *runtimedRuntime) httpGetCheck(podIP, container string, ports []corev1.ContainerPort, h *corev1.HTTPGetAction) checkFunc {
+	host := podIP
+	if h.Host != "" {
+		host = h.Host
+	}
+	port, ok := resolvePort(h.Port, ports)
+	if !ok {
+		return unresolvedCheck("httpGet", container)
+	}
+	scheme := string(h.Scheme)
+	if scheme == "" {
+		scheme = "HTTP"
+	}
+	return httpProbe(r.probeTransport, scheme, host, port, h.Path, h.HTTPHeaders)
 }
 
 // unresolvedCheck is a check that always fails: used when a supported handler's

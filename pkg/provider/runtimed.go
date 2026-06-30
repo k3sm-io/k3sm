@@ -254,6 +254,10 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// kubelet, so it must execute the pod's probes itself. No-op for a probe-free
 	// pod; idempotent for a repeated CreatePod.
 	r.startProber(pod, resp.GetStatus().GetPodIp())
+	// Dispatch each container's postStart hook (B10). Fire-and-forget in a bounded
+	// goroutine so CreatePod and the reconcile loop never block on it; a failure is
+	// logged (readiness-gating + terminal-fail fidelity is deferred to B39).
+	r.runPostStart(pod, resp.GetStatus().GetPodIp())
 	r.dispatch(id, resp.GetStatus())
 	return nil
 }
@@ -287,12 +291,18 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	return nil
 }
 
-// DeletePod stops the pod's processes and forgets the bookkeeping. Idempotent. The
-// SIGTERM→SIGKILL grace window is derived from the pod (deletion/termination grace,
-// k8s 30s default), since runtimed treats a 0 grace as immediate-kill (M2.3).
+// DeletePod runs the pod's preStop hooks (B10), then stops the pod's processes and
+// forgets the bookkeeping. Idempotent. The SIGTERM→SIGKILL grace window is the pod's
+// termination budget (deletion/termination grace, k8s 30s default) MINUS the preStop
+// wall-time (floored at 1s), since runtimed treats a 0 grace as immediate-kill (M2.3).
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
-	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: graceSeconds(pod)})
+	// Serve preStop hooks BEFORE termination (B10): runtimed sends SIGTERM
+	// synchronously inside DeletePod, so the provider runs preStop first and passes
+	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at 1s).
+	// best-effort — a failed hook is logged inside runPreStop, the delete proceeds.
+	grace := r.runPreStop(ctx, pod)
+	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	if err != nil {
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
