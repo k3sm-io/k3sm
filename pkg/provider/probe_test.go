@@ -17,9 +17,11 @@ limitations under the License.
 package provider
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -28,6 +30,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -649,4 +654,130 @@ func TestProbeRunnerStopsCleanly(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("stop() did not return — probe goroutine leak")
 	}
+}
+
+// --- TestBuildCheckGRPCProbeNoPanic ------------------------------------------
+
+// TestBuildCheckGRPCProbeNoPanic is the B9 regression gate: a gRPC-handler probe
+// (a GA-valid manifest) and a handler-less probe must both build a NON-nil check,
+// and a panicking check must be recovered rather than crash the single k3sm
+// process. Before B9, buildCheck returned nil for the gRPC/default case while the
+// runner still built a probeSpec for the non-nil Probe and invoked the nil check
+// with no recover() — an unrecovered panic that took down the whole node. It
+// proves four things: gRPC health is now SERVED (over the dial seam), the default
+// is fail-CLOSED with a surfaced reason, and a panicking check is contained.
+func TestBuildCheckGRPCProbeNoPanic(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("grpc health SERVING passes / NOT_SERVING fails over the dial seam", func(t *testing.T) {
+		// A real grpc.health.v1 server over an in-memory bufconn (no real network):
+		// the dial seam connects the provider's health client to it.
+		lis := bufconn.Listen(1 << 20)
+		gs := grpc.NewServer()
+		hsrv := health.NewServer()
+		grpc_health_v1.RegisterHealthServer(gs, hsrv)
+		go func() { _ = gs.Serve(lis) }()
+		t.Cleanup(gs.Stop)
+
+		r, _ := newRuntimedFake(t)
+		r.dial = func(c context.Context, _, _ string) (net.Conn, error) { return lis.DialContext(c) }
+
+		const svc = "grpc.example.Svc"
+		c := &corev1.Container{Name: "c0"}
+		p := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 50051, Service: ptr(svc)}}}
+		check := r.buildCheck("uid", "10.0.0.5", c, p)
+		if check == nil {
+			t.Fatal("gRPC probe must build a NON-nil check (nil → runner invokes nil → node-DoS panic)")
+		}
+
+		hsrv.SetServingStatus(svc, grpc_health_v1.HealthCheckResponse_SERVING)
+		if err := check(ctx, 2*time.Second); err != nil {
+			t.Fatalf("SERVING gRPC health → check should pass: %v", err)
+		}
+		hsrv.SetServingStatus(svc, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+		if err := check(ctx, 2*time.Second); err == nil {
+			t.Fatal("NOT_SERVING gRPC health → check must fail (fail closed)")
+		}
+	})
+
+	t.Run("grpc dial error is a failure", func(t *testing.T) {
+		r, _ := newRuntimedFake(t)
+		r.dial = func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("connection refused")
+		}
+		c := &corev1.Container{Name: "c0"}
+		p := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 50051}}}
+		check := r.buildCheck("uid", "10.0.0.5", c, p)
+		if check == nil {
+			t.Fatal("gRPC probe must build a NON-nil check")
+		}
+		if err := check(ctx, 2*time.Second); err == nil {
+			t.Fatal("dial error → gRPC check must fail (fail closed)")
+		}
+	})
+
+	t.Run("handler-less probe builds a fail-closed check with a surfaced reason", func(t *testing.T) {
+		r, _ := newRuntimedFake(t)
+		c := &corev1.Container{Name: "c0"}
+		check := r.buildCheck("uid", "10.0.0.5", c, &corev1.Probe{}) // zero Probe: no handler
+		if check == nil {
+			t.Fatal("handler-less probe must build a NON-nil check (nil → spec built → nil-check panic)")
+		}
+		err := check(ctx, time.Second)
+		if err == nil {
+			t.Fatal("handler-less probe check must FAIL closed, not silently pass")
+		}
+		if err.Error() == "" {
+			t.Fatal("fail-closed check must surface a non-empty reason")
+		}
+	})
+
+	t.Run("panicking check is recovered and treated as a failed probe", func(t *testing.T) {
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		pod := probePod("panic", corev1.Container{
+			Name:          "c0",
+			LivenessProbe: &corev1.Probe{ProbeHandler: tcpHandler(8080), FailureThreshold: 1},
+		})
+		mk := func(*corev1.Container, *corev1.Probe) checkFunc {
+			return func(context.Context, time.Duration) error { panic("boom in check") }
+		}
+		pp := newPodProber(pod, testclock.NewFakeClock(time.Unix(0, 0)), mk, log)
+		m := pp.monitors["c0"]
+		// Direct tick: were the panic NOT recovered, this call would crash the test
+		// binary. Reaching the assertions at all proves recovery; restarts==1 proves
+		// the panic was committed as a failed liveness probe (not swallowed as pass).
+		pp.tick(ctx, m, probeLiveness, m.liveness)
+		if got := m.verdict().restarts; got != 1 {
+			t.Fatalf("panicking liveness check → restarts=%d, want 1 (panic must be a failed probe)", got)
+		}
+		if !strings.Contains(buf.String(), "panicked") {
+			t.Errorf("recovered panic must be logged (diagnosable cause); log=%q", buf.String())
+		}
+	})
+
+	t.Run("panicking check does not kill the probe loop goroutine", func(t *testing.T) {
+		clk := testclock.NewFakeClock(time.Unix(0, 0))
+		var calls atomic.Int32
+		mk := func(*corev1.Container, *corev1.Probe) checkFunc {
+			return func(context.Context, time.Duration) error {
+				calls.Add(1)
+				panic("boom every tick")
+			}
+		}
+		pod := probePod("loop", corev1.Container{
+			Name:           "c0",
+			ReadinessProbe: &corev1.Probe{ProbeHandler: tcpHandler(8080), PeriodSeconds: 1, FailureThreshold: 5},
+		})
+		pp := newPodProber(pod, clk, mk, nil)
+		pctx, cancel := context.WithCancel(context.Background())
+		pp.cancel = cancel
+		pp.start(pctx)
+		defer pp.stop()
+
+		waitAtLeast(t, &calls, 1) // first tick fired (panicked, recovered)
+		waitWaiters(t, clk, 1)    // the loop PARKED on its period timer → it survived the panic
+		clk.Step(1 * time.Second)
+		waitAtLeast(t, &calls, 2) // second tick fired → the goroutine is still alive
+	})
 }
