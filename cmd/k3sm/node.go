@@ -46,6 +46,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
@@ -275,7 +276,7 @@ func configureNode(n *corev1.Node, name, ip string) {
 	// toleration for) schedule here, so stray Linux pods cannot land on this node.
 	// The os=darwin ValidatingAdmissionPolicy is the intent guard on top of it.
 	n.Spec.Taints = upsertTaint(n.Spec.Taints, corev1.Taint{
-		Key:    providerTaintKey,
+		Key:    policy.ProviderTaintKey,
 		Effect: corev1.TaintEffectNoSchedule,
 	})
 }
@@ -312,9 +313,6 @@ func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 // availability extension (a reported M5.1 cross-repo need); the provider would query
 // it once at node bring-up and thread the result here.
 func nodeVMCapable() bool { return false }
-
-// providerTaintKey is the k3sm provider taint placed on every k3sm node.
-const providerTaintKey = "k3sm.io/provider"
 
 // upsertTaint adds t to taints if a taint with the same key+effect is not
 // already present.
