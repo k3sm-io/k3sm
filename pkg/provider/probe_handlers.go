@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -123,6 +125,44 @@ func tcpProbe(dial dialFunc, host string, port int32) checkFunc {
 			return err
 		}
 		return conn.Close()
+	}
+}
+
+// grpcProbe returns a checkFunc that performs a gRPC health check against
+// host:port using the standard grpc.health.v1 Health/Check RPC (kubelet parity):
+// a SERVING response is success; any other serving status, an unknown service
+// (the server's NOT_FOUND), or a dial/RPC error is failure (fail closed). It
+// dials over the injected dialFunc seam — the same seam the tcp probe uses — with
+// a fresh, unpooled ClientConn per attempt (no PKI: probe targets are pod-local,
+// like the http/tcp checks), and names service in the request (empty = the
+// server's overall health). The per-attempt timeout bounds the whole exchange.
+func grpcProbe(dial dialFunc, host string, port int32, service string) checkFunc {
+	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	return func(ctx context.Context, timeout time.Duration) error {
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		// passthrough:/// skips name resolution so the context dialer is handed the
+		// endpoint verbatim; the dial seam (not gRPC) owns the connect, mirroring
+		// the tcp probe. The conn is lazy — the Check RPC below triggers the dial.
+		conn, err := grpc.NewClient(
+			"passthrough:///"+addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(func(c context.Context, _ string) (net.Conn, error) {
+				return dial(c, "tcp", addr)
+			}),
+		)
+		if err != nil {
+			return fmt.Errorf("grpc probe to %s: %w", addr, err)
+		}
+		defer func() { _ = conn.Close() }()
+		resp, err := grpc_health_v1.NewHealthClient(conn).Check(cctx, &grpc_health_v1.HealthCheckRequest{Service: service})
+		if err != nil {
+			return fmt.Errorf("grpc probe to %s: %w", addr, err)
+		}
+		if s := resp.GetStatus(); s != grpc_health_v1.HealthCheckResponse_SERVING {
+			return fmt.Errorf("grpc probe to %s: status %s", addr, s)
+		}
+		return nil
 	}
 }
 

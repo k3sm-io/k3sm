@@ -35,10 +35,14 @@ import (
 
 // buildCheck resolves one container probe into the concrete check the runner
 // executes: it resolves the target port (a named port via the container's port
-// table) and defaults the dial host to the bound pod IP. It returns nil for an
-// unsupported handler (e.g. a gRPC probe — not modeled by apis in M2) so the
-// runner simply does not serve that probe rather than failing the container
-// forever.
+// table) and defaults the dial host to the bound pod IP. Every branch returns a
+// NON-nil check, INCLUDING the default: an unrecognized or handler-less probe
+// yields a fail-CLOSED check that always errors, so an unverifiable container is
+// reported NotReady (and any liveness/startup gate stays shut) rather than being
+// silently treated as healthy. Returning nil here would be a latent node-DoS: the
+// runner still builds a probeSpec for the non-nil Probe and would invoke a nil
+// check, panicking the single k3sm process (control plane + every pod) — so this
+// function MUST never return nil.
 func (r *runtimedRuntime) buildCheck(podID, podIP string, c *corev1.Container, p *corev1.Probe) checkFunc {
 	switch {
 	case p.HTTPGet != nil:
@@ -67,20 +71,52 @@ func (r *runtimedRuntime) buildCheck(podID, podIP string, c *corev1.Container, p
 			return unresolvedCheck("tcpSocket", c.Name)
 		}
 		return tcpProbe(r.dial, host, port)
+	case p.GRPC != nil:
+		// gRPC health probe (the standard grpc.health.v1 Health/Check RPC).
+		// GRPCAction.Port is a plain int32 — gRPC has no named-port form — so it
+		// is validated directly (a non-positive port is unresolvable → fail
+		// closed) instead of via resolvePort, and the dial host is always the
+		// bound pod IP (GRPCAction carries no Host). It dials over the SAME r.dial
+		// seam the tcp/http checks use: a provider-side client dial, so no
+		// runtimed/apis change is needed.
+		if p.GRPC.Port <= 0 {
+			return unresolvedCheck("grpc", c.Name)
+		}
+		var service string
+		if p.GRPC.Service != nil {
+			service = *p.GRPC.Service
+		}
+		return grpcProbe(r.dial, podIP, p.GRPC.Port, service)
 	case p.Exec != nil:
 		return execCheck(r.rt, podID, c.Name, p.Exec.Command)
 	default:
-		return nil // unsupported handler (e.g. gRPC) — not served in M2
+		// No recognized handler (a zero/empty Probe, or a future handler this
+		// provider does not yet serve). Fail CLOSED — never nil, never a silent
+		// pass — so an unverifiable container is reported NotReady rather than
+		// falsely healthy, and the runner never invokes a nil check.
+		return unhandledProbeCheck(c.Name)
 	}
 }
 
 // unresolvedCheck is a check that always fails: used when a supported handler's
-// port cannot be resolved (a named port with no matching ContainerPort). The
-// container reports NotReady, surfacing the misconfiguration rather than masking
-// it as healthy.
+// port cannot be resolved (a named port with no matching ContainerPort, or a
+// non-positive gRPC port). The container reports NotReady, surfacing the
+// misconfiguration rather than masking it as healthy.
 func unresolvedCheck(handler, container string) checkFunc {
 	return func(context.Context, time.Duration) error {
 		return fmt.Errorf("%s probe for container %q: unresolved port", handler, container)
+	}
+}
+
+// unhandledProbeCheck is the fail-closed check buildCheck returns for a probe
+// with no recognized handler (an empty/zero Probe, or a handler this provider
+// does not serve). It ALWAYS fails so the container reports NotReady — never nil
+// (which would panic the runner's nil-check invocation) and never a silent pass
+// (which would make an unverified container Ready and take Service traffic). The
+// error names the container so the never-Ready cause is diagnosable.
+func unhandledProbeCheck(container string) checkFunc {
+	return func(context.Context, time.Duration) error {
+		return fmt.Errorf("probe for container %q: no supported handler (httpGet/tcpSocket/grpc/exec)", container)
 	}
 }
 

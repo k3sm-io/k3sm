@@ -50,6 +50,21 @@ const (
 	probeStartup
 )
 
+// String renders the probe kind for structured logs (the diagnosable cause of a
+// never-Ready or restarting pod).
+func (k probeKind) String() string {
+	switch k {
+	case probeLiveness:
+		return "liveness"
+	case probeReadiness:
+		return "readiness"
+	case probeStartup:
+		return "startup"
+	default:
+		return "unknown"
+	}
+}
+
 // probeOutcome is one probe attempt's raw result, or a gauge's committed result.
 // The zero value (outcomeUnknown) is the startup gauge's initial committed value
 // — "not started", which gates liveness/readiness.
@@ -402,6 +417,18 @@ func (pp *podProber) start(ctx context.Context) {
 			pp.wg.Add(1)
 			go func() {
 				defer pp.wg.Done()
+				// Backstop recover: runCheck already converts a panicking check into
+				// a failed probe per tick, but a panic ANYWHERE in the loop must still
+				// never crash the single k3sm process (it co-hosts the embedded
+				// control plane, kine, and every other pod). Recover at the goroutine
+				// boundary — mirroring the kubelet's runtime.HandleCrash — so the
+				// worst case is one dead probe loop, not a node-wide DoS.
+				defer func() {
+					if r := recover(); r != nil {
+						pp.log.Error("probe loop panicked; recovered to protect the process",
+							"pod", pp.podID, "container", m.name, "kind", kind, "panic", r)
+					}
+				}()
 				pp.loop(ctx, m, kind, s)
 			}()
 		})
@@ -452,11 +479,7 @@ func (pp *podProber) tick(ctx context.Context, m *containerMonitor, kind probeKi
 	if !m.shouldProbe(kind) {
 		return
 	}
-	raw := outcomeSuccess
-	if err := s.check(ctx, s.sched.timeout); err != nil {
-		raw = outcomeFailure
-	}
-	switch m.observe(kind, raw) {
+	switch m.observe(kind, pp.runCheck(ctx, m.name, kind, s)) {
 	case reactPublish:
 		pp.fire()
 	case reactRestart:
@@ -464,6 +487,39 @@ func (pp *podProber) tick(ctx context.Context, m *containerMonitor, kind probeKi
 		pp.doRestart(ctx, m.name)
 		pp.fire()
 	}
+}
+
+// runCheck runs one probe attempt and maps it to a committable outcome, failing
+// CLOSED on every abnormal path: a nil check, a check that returns an error, or a
+// check that PANICS all yield outcomeFailure (so an unverifiable container is
+// never falsely committed healthy). The panic recovery is mandatory and not
+// defensive paranoia — the prober runs inside the one k3sm binary that co-hosts
+// the embedded control plane, kine, and every other pod, so a panic in a single
+// container's check (mirroring the kubelet's runtime.HandleCrash) must be
+// contained here rather than crash the process. A check error is surfaced to the
+// logger — the diagnosable cause of a never-Ready/restarting pod — instead of
+// being reduced to a silent boolean as it was before.
+func (pp *podProber) runCheck(ctx context.Context, container string, kind probeKind, s *probeSpec) (outcome probeOutcome) {
+	if s.check == nil {
+		// Defense in depth: buildCheck now never returns nil, but a nil check must
+		// fail closed, never be invoked (a nil call would panic the process).
+		pp.log.Error("probe has no runnable check; failing closed",
+			"pod", pp.podID, "container", container, "kind", kind)
+		return outcomeFailure
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			outcome = outcomeFailure
+			pp.log.Error("probe check panicked; recovered and treating as a failed probe",
+				"pod", pp.podID, "container", container, "kind", kind, "panic", r)
+		}
+	}()
+	if err := s.check(ctx, s.sched.timeout); err != nil {
+		pp.log.Warn("probe failed",
+			"pod", pp.podID, "container", container, "kind", kind, "err", err)
+		return outcomeFailure
+	}
+	return outcomeSuccess
 }
 
 // fire signals a status change to the owner (runs outside all monitor locks).
