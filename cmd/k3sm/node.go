@@ -64,6 +64,7 @@ type nodeOptions struct {
 	runtime    string // "hostprocess" (default) or "runtimed"
 	dnsShim    string // getaddrinfo DNS shim dylib path (runtimed only)
 	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
+	domain     string // cluster DNS domain the in-pod shim search list is built from (runtimed)
 	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
 }
 
@@ -80,6 +81,7 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.runtime, "runtime", "hostprocess", "pod runtime: hostprocess (native processes) or runtimed (image runtime)")
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only)")
+	fs.StringVar(&opts.domain, "cluster-domain", defaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
 	_ = fs.Parse(args)
 
@@ -190,6 +192,12 @@ func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider
 	}
 }
 
+// defaultClusterDomain is the canonical Kubernetes cluster DNS domain used when
+// --cluster-domain is unset. It matches dns.PodDNSConfig's own empty-domain default
+// (apis has no exported const yet — a candidate follow-up to mirror dns.DefaultDNSVIP
+// / netv1.DefaultNDots) and the server/agent --cluster-domain flag default.
+const defaultClusterDomain = "cluster.local"
+
 // runtimedConfig builds the runtimed runtime configuration from the node options:
 // the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
 // and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
@@ -197,20 +205,32 @@ func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider
 // 10.96.0.10) and APIServerVIP is the kubernetes Service ClusterIP derived from
 // the cluster service CIDR; runtimed threads both into its per-pod sandbox.Posture
 // so a confined pod's DNS + in-pod client-go reach the node-local resolver / API
-// VIP (M3.3). It is pure (no I/O) so the VIP wiring is unit-tested directly.
+// VIP (M3.3). ClusterDomain (the --cluster-domain flag) is the in-pod shim search
+// suffix the provider injects as K3SM_DNS_* env so cluster Service names resolve
+// (B18); it MUST match the resolver's served zone. It is pure (no I/O) so the VIP +
+// domain wiring is unit-tested directly.
 func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
 	resolverVIP := opts.dnsVIP
 	if resolverVIP == "" {
 		resolverVIP = dns.DefaultDNSVIP
 	}
+	// Cluster DNS domain the in-pod shim search list is built from. PREFER the
+	// threaded --cluster-domain (the SAME value the per-node resolver's CoreDNS
+	// serves) so a custom domain's unqualified Service lookups are not NXDOMAIN;
+	// fall back to the canonical default only when unset.
+	clusterDomain := opts.domain
+	if clusterDomain == "" {
+		clusterDomain = defaultClusterDomain
+	}
 	return provider.RuntimedConfig{
-		NodeName:     opts.nodeName,
-		NodeIP:       opts.nodeIP,
-		Root:         opts.podRoot,
-		DyldShim:     opts.dnsShim,
-		ResolverVIP:  resolverVIP,
-		APIServerVIP: apiServerVIP(),
-		Client:       cs,
+		NodeName:      opts.nodeName,
+		NodeIP:        opts.nodeIP,
+		Root:          opts.podRoot,
+		DyldShim:      opts.dnsShim,
+		ResolverVIP:   resolverVIP,
+		ClusterDomain: clusterDomain,
+		APIServerVIP:  apiServerVIP(),
+		Client:        cs,
 		// Fence every pod off the root helper socket at the sandbox: pods share the
 		// _k3sm uid with the legitimate helper client, so the SBPL must deny
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs

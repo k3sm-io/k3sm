@@ -85,7 +85,7 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", executor.DefaultAPIServerPort, "apiserver secure port")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
-	fs.StringVar(&opts.domain, "cluster-domain", "cluster.local", "cluster DNS domain")
+	fs.StringVar(&opts.domain, "cluster-domain", defaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
 	// M6.0 HA datastore. The DSN may carry a password; prefer the env so it stays off
 	// k3sm's own argv (mirrors --token/$K3SM_TOKEN). k3sm relocates the password off
@@ -405,6 +405,7 @@ func runServer(args []string) error {
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
 		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
 	})
 }
