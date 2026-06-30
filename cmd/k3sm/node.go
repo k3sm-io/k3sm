@@ -22,6 +22,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -29,13 +31,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 
 	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
@@ -233,8 +235,36 @@ func apiServerVIP() string {
 	return "10.43.0.1"
 }
 
+// defaultMemBytes is the memory capacity advertised when the host memory read
+// fails or returns an implausible value. It preserves the prior hardcoded 8 GiB
+// so the node still registers on a sysctl hiccup: a failed HOST-FACT read falls
+// back, it does not fail the node (a logged fallback, not a missing-config abort).
+const defaultMemBytes uint64 = 8 * 1024 * 1024 * 1024
+
+// hostMemBytes reports the host's total physical RAM in bytes from the hw.memsize
+// sysctl (a uint64 — the full physical memory size, NOT the 32-bit-truncated
+// hw.physmem nor the carveout-subtracted hw.memsize_usable). It is a package var
+// so tests inject a fake host value without hitting a real syscall, keeping
+// nodeCapacity hermetic; production reads the live sysctl via golang.org/x/sys/unix.
+var hostMemBytes = func() (uint64, error) { return unix.SysctlUint64("hw.memsize") }
+
+// nodeCapacity builds the node Capacity ResourceList from real host facts: numCPU
+// logical CPUs, memBytes total physical RAM (hw.memsize), and maxPods. It is pure
+// and side-effect-free (no syscall) so it is unit-tested directly. Memory uses
+// BinarySI so it renders as e.g. "64Gi". The caller validates memBytes (rejecting
+// an implausible 0 or > math.MaxInt64 read, which would convert to a negative
+// quantity) and supplies the documented fallback before calling.
+func nodeCapacity(numCPU int, memBytes uint64, maxPods int64) corev1.ResourceList {
+	return corev1.ResourceList{
+		corev1.ResourceCPU:    *resource.NewQuantity(int64(numCPU), resource.DecimalSI),
+		corev1.ResourceMemory: *resource.NewQuantity(int64(memBytes), resource.BinarySI),
+		corev1.ResourcePods:   *resource.NewQuantity(maxPods, resource.DecimalSI),
+	}
+}
+
 // configureNode stamps the registering Node object with darwin identity,
-// capacity, and the provider taint (the load-bearing placement guard) so stray
+// capacity (real host CPU count and hw.memsize memory, with a documented
+// fallback), and the provider taint (the load-bearing placement guard) so stray
 // non-darwin pods cannot land here.
 func configureNode(n *corev1.Node, name, ip string) {
 	if n.Labels == nil {
@@ -258,11 +288,19 @@ func configureNode(n *corev1.Node, name, ip string) {
 	n.Status.NodeInfo.Architecture = "arm64"
 	n.Status.NodeInfo.KubeletVersion = "k3sm-m1"
 
-	n.Status.Capacity = corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(strconv.Itoa(runtime.NumCPU())),
-		corev1.ResourceMemory: resource.MustParse("8Gi"),
-		corev1.ResourcePods:   resource.MustParse("110"),
+	// Advertise REAL host memory (hw.memsize) as node capacity. A failed read, or
+	// an implausible value (0, or one above math.MaxInt64 that would convert to a
+	// negative quantity), is a host-fact hiccup — not a misconfiguration: log it
+	// and fall back to the documented default so the node still registers.
+	memBytes, err := hostMemBytes()
+	if err != nil || memBytes == 0 || memBytes > math.MaxInt64 {
+		slog.Warn("host memory read failed or implausible; advertising default node memory capacity",
+			"error", err, "raw_bytes", memBytes, "default_bytes", defaultMemBytes)
+		memBytes = defaultMemBytes
 	}
+	n.Status.Capacity = nodeCapacity(runtime.NumCPU(), memBytes, 110)
+	// Allocatable == Capacity today; a system-reserved carve-out (Allocatable <
+	// Capacity) is B15's node-pressure/eviction scope, a deliberate future diff.
 	n.Status.Allocatable = n.Status.Capacity.DeepCopy()
 	n.Status.Addresses = []corev1.NodeAddress{
 		{Type: corev1.NodeInternalIP, Address: ip},

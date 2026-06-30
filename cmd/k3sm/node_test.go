@@ -17,6 +17,8 @@ limitations under the License.
 package main
 
 import (
+	"errors"
+	"math"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -100,4 +102,139 @@ func TestNodeVirtualizationLabel(t *testing.T) {
 	if _, present := node.Labels[runtimeclass.LabelVirtualization]; present {
 		t.Errorf("configureNode must NOT stamp the virtualization label while nodeVMCapable() is false, got present: %v", node.Labels)
 	}
+}
+
+// TestNodeCapacityFromHostMemory is the B13 proof that the node advertises REAL
+// host memory (hw.memsize) in its Capacity/Allocatable instead of the prior
+// hardcoded 8Gi. nodeCapacity is exercised directly (pure, hermetic, no syscall),
+// and the configureNode wiring is exercised through an injected hostMemBytes
+// reader — including the documented 8Gi fallback on a failed or implausible
+// host-fact read (which must never advertise a negative/garbage quantity).
+//
+// It is intentionally NOT t.Parallel: its subtests swap the hostMemBytes package
+// var, and TestNodeVirtualizationLabel (which IS t.Parallel) calls configureNode,
+// which reads that var. A non-parallel test runs entirely in the sequential phase,
+// before the parked parallel tests resume, so the swap can never race their read.
+func TestNodeCapacityFromHostMemory(t *testing.T) {
+	const (
+		gib      = int64(1024 * 1024 * 1024)
+		eightGiB = 8 * gib // the documented fallback / the old hardcode
+	)
+
+	// nodeCapacity is pure: a non-8Gi value flows straight through. This is the
+	// real red vs the old hardcode, which advertised 8Gi for every host.
+	t.Run("nodeCapacity reflects the injected host memory (64GiB)", func(t *testing.T) {
+		sixtyFour := 64 * gib
+		got := nodeCapacity(8, uint64(sixtyFour), 110)
+
+		cpu := got[corev1.ResourceCPU]
+		if cpu.Value() != 8 {
+			t.Errorf("cpu = %d, want 8", cpu.Value())
+		}
+		mem := got[corev1.ResourceMemory]
+		if mem.Value() != sixtyFour {
+			t.Errorf("memory = %d bytes, want %d (64GiB, not the 8Gi hardcode)", mem.Value(), sixtyFour)
+		}
+		if mem.Value() == eightGiB {
+			t.Errorf("memory regressed to the 8Gi hardcode (%d); nodeCapacity ignored its memBytes argument", mem.Value())
+		}
+		pods := got[corev1.ResourcePods]
+		if pods.Value() != 110 {
+			t.Errorf("pods = %d, want 110", pods.Value())
+		}
+	})
+
+	// A second, distinct non-8Gi value (16GiB) confirms the value is genuinely
+	// threaded through rather than coincidentally matching one constant.
+	t.Run("nodeCapacity threads a second distinct value (16GiB)", func(t *testing.T) {
+		sixteen := 16 * gib
+		got := nodeCapacity(4, uint64(sixteen), 110)
+		mem := got[corev1.ResourceMemory]
+		if mem.Value() != sixteen {
+			t.Errorf("memory = %d bytes, want %d (16GiB)", mem.Value(), sixteen)
+		}
+	})
+
+	// configureNode advertises the injected host memory and pins Allocatable ==
+	// Capacity. B15's system-reserved carve-out (Allocatable < Capacity) must be a
+	// deliberate future diff, not introduced here.
+	t.Run("configureNode advertises host memory; Allocatable == Capacity", func(t *testing.T) {
+		thirtyTwo := 32 * gib
+		restore := hostMemBytes
+		hostMemBytes = func() (uint64, error) { return uint64(thirtyTwo), nil }
+		t.Cleanup(func() { hostMemBytes = restore })
+
+		n := &corev1.Node{}
+		configureNode(n, "k3sm-node", "10.0.0.1")
+
+		mem := n.Status.Capacity[corev1.ResourceMemory]
+		if mem.Value() != thirtyTwo {
+			t.Errorf("Capacity memory = %d, want %d (32GiB from the injected host read)", mem.Value(), thirtyTwo)
+		}
+
+		if len(n.Status.Allocatable) != len(n.Status.Capacity) {
+			t.Fatalf("Allocatable has %d resources, Capacity has %d", len(n.Status.Allocatable), len(n.Status.Capacity))
+		}
+		for name, capQ := range n.Status.Capacity {
+			allocQ, ok := n.Status.Allocatable[name]
+			if !ok {
+				t.Errorf("Allocatable is missing %s present in Capacity", name)
+				continue
+			}
+			if capQ.Cmp(allocQ) != 0 {
+				t.Errorf("Allocatable[%s] = %s, want == Capacity[%s] = %s (B15 reserve deferred)", name, allocQ.String(), name, capQ.String())
+			}
+		}
+	})
+
+	// The fallback path: a failed host-fact read (sysctl error) must not fail the
+	// node — configureNode logs and advertises the documented 8Gi default.
+	t.Run("read error falls back to the 8Gi default", func(t *testing.T) {
+		restore := hostMemBytes
+		hostMemBytes = func() (uint64, error) { return 0, errors.New("sysctl hw.memsize: boom") }
+		t.Cleanup(func() { hostMemBytes = restore })
+
+		n := &corev1.Node{}
+		configureNode(n, "k3sm-node", "10.0.0.1")
+
+		mem := n.Status.Capacity[corev1.ResourceMemory]
+		if mem.Value() != eightGiB {
+			t.Errorf("on read error, Capacity memory = %d, want %d (8Gi fallback)", mem.Value(), eightGiB)
+		}
+	})
+
+	// A garbage read larger than math.MaxInt64 would convert to a NEGATIVE int64
+	// quantity; the guard must reject it and fall back to 8Gi rather than advertise
+	// a non-positive capacity.
+	t.Run("implausible (>maxInt64) read falls back, never a negative quantity", func(t *testing.T) {
+		restore := hostMemBytes
+		hostMemBytes = func() (uint64, error) { return math.MaxUint64, nil }
+		t.Cleanup(func() { hostMemBytes = restore })
+
+		n := &corev1.Node{}
+		configureNode(n, "k3sm-node", "10.0.0.1")
+
+		mem := n.Status.Capacity[corev1.ResourceMemory]
+		if mem.Value() <= 0 {
+			t.Errorf("guard failed: built a non-positive memory quantity (%d) from a >maxInt64 read", mem.Value())
+		}
+		if mem.Value() != eightGiB {
+			t.Errorf("on implausible read, Capacity memory = %d, want %d (8Gi fallback)", mem.Value(), eightGiB)
+		}
+	})
+
+	// A zero read (another implausible host fact) also falls back.
+	t.Run("zero read falls back to the 8Gi default", func(t *testing.T) {
+		restore := hostMemBytes
+		hostMemBytes = func() (uint64, error) { return 0, nil }
+		t.Cleanup(func() { hostMemBytes = restore })
+
+		n := &corev1.Node{}
+		configureNode(n, "k3sm-node", "10.0.0.1")
+
+		mem := n.Status.Capacity[corev1.ResourceMemory]
+		if mem.Value() != eightGiB {
+			t.Errorf("on zero read, Capacity memory = %d, want %d (8Gi fallback)", mem.Value(), eightGiB)
+		}
+	})
 }
