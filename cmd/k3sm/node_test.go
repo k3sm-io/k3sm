@@ -250,3 +250,33 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		}
 	})
 }
+
+// TestConfigureNodeTopologyLabels proves configureNode advertises the well-known GA
+// topology labels (B16): topology.kubernetes.io/zone and .../region. The load-bearing
+// assertion is that zone is set to THIS node's name — byte-identical to
+// kubernetes.io/hostname by construction — so it is a per-node failure domain, not a
+// shared static zone (which would FALSELY claim co-located Macs are co-failing, and
+// would make a whenUnsatisfiable: DoNotSchedule zone-spread strand pods Pending instead
+// of degrading to host-spread). region is the single static value all nodes agree on.
+func TestConfigureNodeTopologyLabels(t *testing.T) {
+	t.Parallel()
+
+	const host = "k3sm-node"
+	node := &corev1.Node{}
+	configureNode(node, host, "10.0.0.1")
+
+	// zone == the node name AND == the hostname label, by construction: this locks the
+	// per-node zone==hostname coupling. A shared-static-zone regression fails here.
+	if got := node.Labels[corev1.LabelTopologyZone]; got != host {
+		t.Errorf("%s = %q, want %q (the node name — a per-node failure domain)", corev1.LabelTopologyZone, got, host)
+	}
+	if zone, hostname := node.Labels[corev1.LabelTopologyZone], node.Labels[corev1.LabelHostname]; zone != hostname {
+		t.Errorf("zone (%s=%q) must equal hostname (%s=%q) by construction; a shared static zone would falsely claim co-located Macs share a failure domain",
+			corev1.LabelTopologyZone, zone, corev1.LabelHostname, hostname)
+	}
+
+	// region is the single static value (k3sm has no cloud-region concept).
+	if got := node.Labels[corev1.LabelTopologyRegion]; got != defaultNodeRegion {
+		t.Errorf("%s = %q, want %q (defaultNodeRegion)", corev1.LabelTopologyRegion, got, defaultNodeRegion)
+	}
+}

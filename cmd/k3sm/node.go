@@ -297,6 +297,17 @@ func configureNode(n *corev1.Node, name, ip string) {
 	n.Labels["k3sm.io/native"] = "true"
 	n.Labels["type"] = "k3sm"
 
+	// Well-known topology labels, GA keys only (the v1.36.2 scheduler reads these; the
+	// deprecated failure-domain.beta.kubernetes.io aliases are cruft). zone is set to THIS
+	// node's name — == kubernetes.io/hostname by construction (same `name`): a DELIBERATE
+	// per-node failure domain, since each Mac is a genuine independent one. A zone
+	// topologySpread with whenUnsatisfiable: DoNotSchedule thus degrades to host-spread
+	// (fail-open) instead of stranding pods Pending on a missing label, and never FALSELY
+	// claims co-located Macs share a failure domain (which a shared static zone would).
+	// region is one static value all nodes agree on — k3sm has no cloud-region concept.
+	n.Labels[corev1.LabelTopologyZone] = name
+	n.Labels[corev1.LabelTopologyRegion] = defaultNodeRegion
+
 	// vm RuntimeClass node-capability gate (M5.1): advertise the
 	// Virtualization.framework backend via the k3sm.io/virtualization label ONLY when
 	// this node can run it, so the vm RuntimeClass nodeSelector pins vm pods to a
@@ -371,6 +382,11 @@ func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 // availability extension (a reported M5.1 cross-repo need); the provider would query
 // it once at node bring-up and thread the result here.
 func nodeVMCapable() bool { return false }
+
+// defaultNodeRegion is the single static topology.kubernetes.io/region every k3sm
+// node advertises. k3sm has no cloud-region concept, so all nodes agree on one
+// region; zone, by contrast, is per-node (== the node name — see configureNode).
+const defaultNodeRegion = "k3sm"
 
 // upsertTaint adds t to taints if a taint with the same key+effect is not
 // already present.
