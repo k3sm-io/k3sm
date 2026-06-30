@@ -34,6 +34,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"k3sm.io/darwin-net/pkg/dns"
 )
 
 // mapZone is a fake cluster Service zone (key "ns/name" → serviceTarget). A missing
@@ -180,6 +182,53 @@ func TestM3_3_ResolverAnswersClusterAndForwards(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestNewClusterResolverDefaultsDomain pins the B42 consolidation on the netserve
+// side: newClusterResolver with an EMPTY cluster domain falls back to the
+// single-sourced dns.DefaultClusterDomain — the SAME const cmd/k3sm's runtimedConfig
+// fallback and the --cluster-domain flag defaults now resolve to (closing the B18
+// desync between the served zone and the pod-search suffix). It proves both the stored
+// domain field and that the empty-domain resolver actually SERVES that default zone: a
+// cluster Service under *.svc.<dns.DefaultClusterDomain> resolves node-locally.
+func TestNewClusterResolverDefaultsDomain(t *testing.T) {
+	t.Parallel()
+
+	zone := mapZone{
+		"default/web": serviceTarget{IP: netip.MustParseAddr("10.43.0.55")},
+	}
+	r := newClusterResolver(netip.MustParseAddr("10.43.0.10"), "", zone, mapForwarder{}, testLogger())
+	if r.domain != dns.DefaultClusterDomain {
+		t.Fatalf("newClusterResolver(domain=\"\").domain = %q, want dns.DefaultClusterDomain (%q)", r.domain, dns.DefaultClusterDomain)
+	}
+
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	udpDone := make(chan error, 1)
+	go func() { udpDone <- r.serveUDP(ctx, udp) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-udpDone; err != nil {
+			t.Errorf("serveUDP returned %v, want nil on clean shutdown", err)
+		}
+	})
+
+	// A cluster Service under the DEFAULT zone resolves to its ClusterIP, proving the
+	// empty-domain resolver serves *.svc.<dns.DefaultClusterDomain> (not some other suffix).
+	rcode, addrs := queryUDP(t, udp.LocalAddr().String(), "web.default.svc."+dns.DefaultClusterDomain)
+	if rcode != dnsmessage.RCodeSuccess {
+		t.Fatalf("rcode = %v, want success for a Service under the default zone", rcode)
+	}
+	got := make([]string, len(addrs))
+	for i, a := range addrs {
+		got[i] = a.String()
+	}
+	if !equalStrings(got, []string{"10.43.0.55"}) {
+		t.Fatalf("addrs = %v, want [10.43.0.55] (the cluster Service VIP under the default zone)", got)
 	}
 }
 

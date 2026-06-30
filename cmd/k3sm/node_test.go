@@ -24,6 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"k3sm.io/darwin-net/pkg/dns"
+
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
@@ -65,9 +67,13 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	if got := runtimedConfig(nodeOptions{}, nil).ResolverVIP; got != "10.43.0.10" {
 		t.Errorf("ResolverVIP with no --dns-vip = %q, want the cluster DNS VIP default 10.43.0.10", got)
 	}
-	// An unset --cluster-domain falls back to the canonical cluster.local default.
-	if got := runtimedConfig(nodeOptions{}, nil).ClusterDomain; got != "cluster.local" {
-		t.Errorf("ClusterDomain with no --cluster-domain = %q, want the cluster.local default", got)
+	// An unset --cluster-domain falls back to the single-sourced dns.DefaultClusterDomain
+	// (B42 wave 2): the SAME const the per-node resolver's empty-domain fallback resolves to,
+	// so this k3sm-side fallback can never silently diverge from the served zone (the B18
+	// desync the consolidation closes). A regression that re-hardcoded a different literal here
+	// fails against the const, not a copy of it.
+	if got := runtimedConfig(nodeOptions{}, nil).ClusterDomain; got != dns.DefaultClusterDomain {
+		t.Errorf("ClusterDomain with no --cluster-domain = %q, want dns.DefaultClusterDomain (%q)", got, dns.DefaultClusterDomain)
 	}
 
 	// The API VIP is derived from the single service-CIDR const (10.43.0.0/16 ⇒

@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
+	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd/wire"
 )
 
@@ -135,7 +136,7 @@ type clusterResolver struct {
 // the given zone and upstream forwarder.
 func newClusterResolver(vip netip.Addr, domain string, zone dnsZone, fwd dnsForwarder, log *slog.Logger) *clusterResolver {
 	if domain == "" {
-		domain = "cluster.local"
+		domain = dns.DefaultClusterDomain
 	}
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
