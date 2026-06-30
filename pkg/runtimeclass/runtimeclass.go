@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -98,12 +99,20 @@ var vmMemoryOverhead = resource.MustParse("256Mi")
 // true and a watch-cache LIST can read stale). On AlreadyExists it RECONCILES the
 // Overhead: the "vm" RuntimeClass persists in kine across restarts, so a cluster first
 // provisioned WITHOUT the overhead (pre-B24, or by an operator) would otherwise
-// oversubscribe forever. It does a direct, consistent Get (never a stale-prone LIST)
-// and Updates ONLY when the host-side floor is missing or below vmMemoryOverhead,
-// preserving handler/scheduling; an already-current Overhead makes NO Update call (no
-// churn on every restart). A missing or stale RuntimeClass is itself fail-closed — a vm
-// pod naming an absent class is rejected at admission, and zero accounted overhead only
-// oversubscribes — so unlike pkg/rbac the caller treats an error as log-and-continue.
+// oversubscribe forever. The reconcile does a direct, consistent Get (never a
+// stale-prone LIST) and a per-key FLOOR-merge (reconcileOverhead): each desired
+// PodFixed key that is missing or below its floor is raised, a key already at/above its
+// floor is left untouched (an operator who RAISED a term stays raised), and unrelated
+// keys are preserved — so an already-current Overhead makes NO Update call (no churn on
+// every restart). The Get→reconcile→Update runs inside a bounded retry.RetryOnConflict
+// so a simultaneous multi-server (HA) upgrade converges the floor in-call instead of
+// leaving the optimistic-concurrency loser to wait for its next restart; if the class is
+// DELETED between the Create and the Get (TOCTOU), it re-lays the FULL desired shape
+// (handler + nodeSelector + Overhead — a partial re-create would break fail-closed VZ
+// scheduling), tolerating a concurrent re-creator. A missing or stale RuntimeClass is
+// itself fail-closed — a vm pod naming an absent class is rejected at admission, and zero
+// accounted overhead only oversubscribes — so unlike pkg/rbac the caller treats an error
+// as log-and-continue.
 func Provision(ctx context.Context, cs kubernetes.Interface) error {
 	_, err := cs.NodeV1().RuntimeClasses().Create(ctx, desiredRuntimeClass(), metav1.CreateOptions{})
 	if err == nil {
@@ -112,23 +121,43 @@ func Provision(ctx context.Context, cs kubernetes.Interface) error {
 	if !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create vm runtime class: %w", err)
 	}
-	// The class already exists — reconcile its host-side Overhead onto the existing
-	// object. Get is direct and consistent (a watch-cache LIST can read stale under the
-	// pinned kine); Update only when the floor is missing or below desired.
-	existing, err := cs.NodeV1().RuntimeClasses().Get(ctx, Name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get vm runtime class for overhead reconcile: %w", err)
-	}
-	if overheadCurrent(existing) {
-		slog.DebugContext(ctx, "vm runtime class overhead already current", "name", Name)
+	// The class already exists — reconcile its host-side Overhead floor onto it. Retry on
+	// the optimistic-concurrency conflict a simultaneous multi-server (HA) upgrade produces:
+	// re-Get consistently, re-evaluate the floor, re-Update, so the floor converges in-call
+	// rather than waiting for the loser's next restart. A consistent Get (never a stale-prone
+	// LIST) is required under the pinned kine (ConsistentListFromCache GA-locked true).
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existing, err := cs.NodeV1().RuntimeClasses().Get(ctx, Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			// Deleted between Create and Get (TOCTOU) — re-lay the FULL desired shape
+			// (handler + nodeSelector + Overhead; a partial re-create would break the
+			// fail-closed VZ-node scheduling), tolerating a concurrent re-creator.
+			_, cerr := cs.NodeV1().RuntimeClasses().Create(ctx, desiredRuntimeClass(), metav1.CreateOptions{})
+			// A concurrent re-creator (an HA peer) racing this re-Create wrote the full
+			// desired shape first — accept it as-is. Raising the Overhead floor on that
+			// object then defers to the next Provision (next server start); the floor's
+			// only failure mode is oversubscription, never a correctness break.
+			if cerr == nil || apierrors.IsAlreadyExists(cerr) {
+				return nil
+			}
+			return fmt.Errorf("re-create vm runtime class: %w", cerr)
+		}
+		if err != nil {
+			return fmt.Errorf("get vm runtime class for overhead reconcile: %w", err)
+		}
+		if !reconcileOverhead(existing, desiredOverhead()) {
+			slog.DebugContext(ctx, "vm runtime class overhead already current", "name", Name)
+			return nil
+		}
+		if _, err := cs.NodeV1().RuntimeClasses().Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+			return err // a Conflict is retried by RetryOnConflict; other errors propagate
+		}
+		slog.InfoContext(ctx, "reconciled vm runtime class overhead onto pre-existing class",
+			"name", Name, "podFixedMemory", vmMemoryOverhead.String())
 		return nil
-	}
-	existing.Overhead = desiredOverhead()
-	if _, err := cs.NodeV1().RuntimeClasses().Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+	}); err != nil {
 		return fmt.Errorf("reconcile vm runtime class overhead: %w", err)
 	}
-	slog.InfoContext(ctx, "reconciled vm runtime class overhead onto pre-existing class",
-		"name", Name, "podFixedMemory", vmMemoryOverhead.String())
 	return nil
 }
 
@@ -157,20 +186,28 @@ func desiredOverhead() *nodev1.Overhead {
 	return &nodev1.Overhead{PodFixed: corev1.ResourceList{corev1.ResourceMemory: vmMemoryOverhead}}
 }
 
-// overheadCurrent reports whether rc already carries at least the desired host-side
-// memory Overhead floor: Overhead.PodFixed[memory] present and >= vmMemoryOverhead. A
-// nil Overhead, an absent memory entry, or a value below the floor is stale and must be
-// reconciled. It is a FLOOR comparison (Cmp >= 0), never exact equality, so a fresh
-// create is idempotent (256Mi vs 256Mi ⇒ no Update), an operator who RAISED the
-// overhead above the k3sm floor is left untouched, and a future lab-refined increase
-// still reconciles upward.
-func overheadCurrent(rc *nodev1.RuntimeClass) bool {
-	if rc.Overhead == nil {
-		return false
+// reconcileOverhead raises rc's host-side Overhead.PodFixed to the desired floor, per
+// key: for each key in desired.PodFixed, if rc lacks it OR carries less than desired, it
+// is set to desired (allocating Overhead/PodFixed as needed). Keys NOT in desired are
+// preserved, and a key already at or above its floor is left untouched (an operator who
+// raised it stays raised; Cmp >= 0). The single desiredOverhead() key set thus drives
+// both the staleness check and the set, so a future cpu term auto-extends this with no
+// other edit. It returns whether it changed rc (false => already current => no Update).
+func reconcileOverhead(rc *nodev1.RuntimeClass, desired *nodev1.Overhead) (changed bool) {
+	for name, want := range desired.PodFixed {
+		if rc.Overhead != nil {
+			if cur, ok := rc.Overhead.PodFixed[name]; ok && cur.Cmp(want) >= 0 {
+				continue // already at/above floor — preserve (operator may have raised it)
+			}
+		}
+		if rc.Overhead == nil {
+			rc.Overhead = &nodev1.Overhead{}
+		}
+		if rc.Overhead.PodFixed == nil {
+			rc.Overhead.PodFixed = corev1.ResourceList{}
+		}
+		rc.Overhead.PodFixed[name] = want
+		changed = true
 	}
-	q, ok := rc.Overhead.PodFixed[corev1.ResourceMemory]
-	if !ok {
-		return false
-	}
-	return q.Cmp(vmMemoryOverhead) >= 0
+	return changed
 }

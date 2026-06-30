@@ -216,6 +216,50 @@ func TestToPodBoxVMRuntimeClass(t *testing.T) {
 	}
 }
 
+// TestPodVMMemoryBytesExcludesOverhead is the B45 provider-side invariant guarding the
+// three-figures decoupling documented at pkg/runtimeclass vmMemoryOverhead's "THREE
+// DISTINCT memory figures" doc: the vm RuntimeClass's
+// host-side scheduler-ACCOUNTING Overhead (256Mi, owned by pkg/runtimeclass) must NEVER be
+// folded into the GUEST RAM podVMMemoryBytes hands to VZ. The guest allocation is EXACTLY
+// the regular containers' effective memory sum (limit-else-request; here limit==request so
+// the rule is unambiguous), and an init container — which runs sequentially BEFORE the
+// regular set — is NOT in the concurrent budget. Exact equality pins that no overhead term
+// is added; pkg/provider keeps ZERO import of pkg/runtimeclass (the 256Mi literal lives in
+// exactly one place — asserting != sum+256Mi here would re-encode it and be vacuous given
+// the exact ==).
+func TestPodVMMemoryBytesExcludesOverhead(t *testing.T) {
+	q := func(s string) resource.Quantity { return resource.MustParse(s) }
+	// limitEqRequest sets memory limit == request so effectiveResource's limit-else-request
+	// rule resolves to one unambiguous value.
+	limitEqRequest := func(mem string) corev1.ResourceRequirements {
+		return corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: q(mem)},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: q(mem)},
+		}
+	}
+	vm := string(runtimev1.HandlerVM)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "pg", UID: types.UID("uid-pg")},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &vm,
+			// A 1Gi init container — must NOT be summed into the guest RAM (it runs before
+			// the regular set, so it is not part of the concurrent footprint).
+			InitContainers: []corev1.Container{{Name: "init0", Resources: limitEqRequest("1Gi")}},
+			Containers: []corev1.Container{
+				{Name: "c0", Resources: limitEqRequest("200Mi")},
+				{Name: "c1", Resources: limitEqRequest("300Mi")},
+			},
+		},
+	}
+	// The exact regular-container sum — nothing else. Computed from the fixtures so the
+	// assertion can't silently desync, and so the 256Mi overhead value never appears here.
+	c0Mem, c1Mem := q("200Mi"), q("300Mi")
+	want := c0Mem.Value() + c1Mem.Value()
+	if got := podVMMemoryBytes(pod); got != want {
+		t.Errorf("podVMMemoryBytes = %d, want exactly %d (the regular-container memory sum; the host-side Overhead must NOT be folded into guest RAM, and the 1Gi init container must NOT be summed)", got, want)
+	}
+}
+
 // TestToPodBoxUnknownRuntimeClassFailsClosed is the M5.1 proof that a pod naming a
 // RuntimeClass with no backend mapping is REFUSED at translation (an error wrapping
 // runtimev1.ErrUnknownHandler, nil box) rather than silently running on the
