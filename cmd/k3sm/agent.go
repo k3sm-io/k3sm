@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/mesh"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -83,7 +84,7 @@ func runAgent(args []string) error {
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
-	fs.StringVar(&opts.domain, "cluster-domain", defaultClusterDomain, "cluster DNS domain")
+	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	_ = fs.Parse(args)
 
 	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {

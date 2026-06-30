@@ -84,7 +84,7 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.runtime, "runtime", "hostprocess", "pod runtime: hostprocess (native processes) or runtimed (image runtime)")
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only)")
-	fs.StringVar(&opts.domain, "cluster-domain", defaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
+	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
 	_ = fs.Parse(args)
 
@@ -195,12 +195,6 @@ func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider
 	}
 }
 
-// defaultClusterDomain is the canonical Kubernetes cluster DNS domain used when
-// --cluster-domain is unset. It matches dns.PodDNSConfig's own empty-domain default
-// (apis has no exported const yet — a candidate follow-up to mirror dns.DefaultDNSVIP
-// / netv1.DefaultNDots) and the server/agent --cluster-domain flag default.
-const defaultClusterDomain = "cluster.local"
-
 // runtimedConfig builds the runtimed runtime configuration from the node options:
 // the on-disk root, the DNS shim, the apiserver client, the helper-socket deny,
 // and the per-pod Seatbelt egress VIPs. ResolverVIP is the cluster DNS VIP (the
@@ -223,7 +217,7 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 	// fall back to the canonical default only when unset.
 	clusterDomain := opts.domain
 	if clusterDomain == "" {
-		clusterDomain = defaultClusterDomain
+		clusterDomain = dns.DefaultClusterDomain
 	}
 	return provider.RuntimedConfig{
 		NodeName:      opts.nodeName,
