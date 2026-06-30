@@ -142,11 +142,14 @@ func TestEnsureNoForeignUserAdmission(t *testing.T) {
 	}
 }
 
-// assertServiceWarnPolicy is the shared check for the M3.1 advisory Service
-// policies: the policy matches Services on CREATE+UPDATE, fails OPEN
+// assertWarnPolicy is the shared check for an advisory Warn
+// ValidatingAdmissionPolicy: the policy matches resource on EXACTLY ops, fails OPEN
 // (failurePolicy Ignore, so a CEL error can never reject), the binding action is
-// Warn and never Deny (advisory only), and provisioning is idempotent.
-func assertServiceWarnPolicy(t *testing.T, policyName, bindingName string, wantInExpr []string, ensure func(kubernetes.Interface) error) {
+// Warn and never Deny (advisory only), the CEL contains every wantInExpr fragment,
+// and provisioning is idempotent. Parameterizing resource+ops keeps the Service
+// advisories (services, CREATE+UPDATE) and the pod-toleration advisory (pods, CREATE
+// only) on the SAME structural contract — the Ignore/Warn invariant is asserted once.
+func assertWarnPolicy(t *testing.T, policyName, bindingName string, wantInExpr []string, resource string, ops []admissionregistrationv1.OperationType, ensure func(kubernetes.Interface) error) {
 	t.Helper()
 	cs := fake.NewClientset()
 	ctx := context.Background()
@@ -178,12 +181,13 @@ func assertServiceWarnPolicy(t *testing.T, policyName, bindingName string, wantI
 		t.Fatal("policy must match a resource")
 	}
 	rule := pol.Spec.MatchConstraints.ResourceRules[0]
-	if !containsStr(rule.Resources, "services") {
-		t.Errorf("policy must match services, got %v", rule.Resources)
+	if !containsStr(rule.Resources, resource) {
+		t.Errorf("policy must match %q, got %v", resource, rule.Resources)
 	}
-	// CREATE + UPDATE so a `kubectl edit` that introduces the divergence also warns.
-	if !containsOp(rule.Operations, admissionregistrationv1.Create) || !containsOp(rule.Operations, admissionregistrationv1.Update) {
-		t.Errorf("policy must match CREATE and UPDATE, got %v", rule.Operations)
+	// Operations must match EXACTLY — e.g. the pod-toleration advisory is CREATE-only
+	// (an UPDATE warn would re-fire on every unrelated pod status patch).
+	if !sameOps(rule.Operations, ops) {
+		t.Errorf("policy operations = %v, want exactly %v", rule.Operations, ops)
 	}
 
 	bind, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Get(ctx, bindingName, metav1.GetOptions{})
@@ -196,7 +200,7 @@ func assertServiceWarnPolicy(t *testing.T, policyName, bindingName string, wantI
 	foundWarn := false
 	for _, a := range bind.Spec.ValidationActions {
 		if a == admissionregistrationv1.Deny {
-			t.Error("advisory binding must NOT Deny (the field/Service stays valid)")
+			t.Error("advisory binding must NOT Deny (the field/Service/Pod stays valid)")
 		}
 		if a == admissionregistrationv1.Warn {
 			foundWarn = true
@@ -210,6 +214,30 @@ func assertServiceWarnPolicy(t *testing.T, policyName, bindingName string, wantI
 	if err := ensure(cs); err != nil {
 		t.Errorf("second provision must be idempotent: %v", err)
 	}
+}
+
+// assertServiceWarnPolicy is the shared check for the M3.1 advisory Service
+// policies: Services matched on CREATE+UPDATE (so a `kubectl edit` that introduces
+// the divergence also warns), routed through assertWarnPolicy.
+func assertServiceWarnPolicy(t *testing.T, policyName, bindingName string, wantInExpr []string, ensure func(kubernetes.Interface) error) {
+	t.Helper()
+	assertWarnPolicy(t, policyName, bindingName, wantInExpr, "services",
+		[]admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update}, ensure)
+}
+
+// sameOps reports whether got and want hold exactly the same operation types
+// (order-independent, no extras) — so a CREATE-only policy that also matched UPDATE
+// would fail the check.
+func sameOps(got, want []admissionregistrationv1.OperationType) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !containsOp(got, w) {
+			return false
+		}
+	}
+	return true
 }
 
 func containsStr(xs []string, want string) bool {
@@ -249,4 +277,44 @@ func TestUDPServiceWarns(t *testing.T) {
 	assertServiceWarnPolicy(t, udpServicePolicyName, udpServiceBindingName,
 		[]string{"protocol", "UDP", "ports.all"},
 		func(cs kubernetes.Interface) error { return EnsureUDPServiceWarn(context.Background(), cs) })
+}
+
+// TestProviderTolerationWarn verifies the advisory that surfaces a pod missing a
+// toleration for the provider taint (k3sm.io/provider:NoSchedule, on every node) —
+// the scheduler would leave such a pod Unschedulable. It Warns (never Denies), fails
+// open, and matches pods on CREATE ONLY (NOT Update). It also pins the CEL to the
+// full-match exists() form — the conformance CRITICAL made mechanical: the naive
+// !has(object.spec.tolerations)-only / size(...)==0 shortcut would NEVER warn,
+// because the default-on DefaultTolerationSeconds plugin auto-injects NoExecute
+// tolerations into nearly every Pod (a pod is then non-empty yet still does not
+// tolerate THIS NoSchedule taint), and a different-key toleration leaves the pod
+// Unschedulable all the same.
+func TestProviderTolerationWarn(t *testing.T) {
+	// Structure + the three positive semantics pins (exists() full-match form, the
+	// ProviderTaintKey value, and the NoSchedule effect), plus pods/CREATE-only.
+	assertWarnPolicy(t, providerTolerationPolicyName, providerTolerationBindingName,
+		[]string{"exists(", ProviderTaintKey, "NoSchedule"},
+		"pods", []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+		func(cs kubernetes.Interface) error {
+			return EnsureProviderTolerationWarn(context.Background(), cs)
+		})
+
+	// ProviderTaintKey is the single source the taint (placement) and the VAP
+	// (admission) both read — assert its value is what the placement guard stamps.
+	if ProviderTaintKey != "k3sm.io/provider" {
+		t.Errorf("ProviderTaintKey = %q, want k3sm.io/provider", ProviderTaintKey)
+	}
+
+	// Negative pins: the CEL must NOT degrade to the naive shortcut. A
+	// !has(object.spec.tolerations)-only predicate or a size(...)==0 emptiness test
+	// would be defeated by the auto-injected NoExecute tolerations and would miss a
+	// different-key toleration. (The expr legitimately contains the POSITIVE
+	// has(object.spec.tolerations) guard as the exists() precondition; the banned
+	// substring is the NEGATED form used as the whole predicate.)
+	if strings.Contains(providerTolerationExpr, "!has(object.spec.tolerations)") {
+		t.Errorf("CEL must not use the naive !has(object.spec.tolerations) shortcut: %q", providerTolerationExpr)
+	}
+	if strings.Contains(providerTolerationExpr, "size(") {
+		t.Errorf("CEL must not use the naive size() emptiness shortcut: %q", providerTolerationExpr)
+	}
 }

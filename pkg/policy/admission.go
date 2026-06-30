@@ -27,11 +27,26 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+// ProviderTaintKey is the key of the NoSchedule taint k3sm places on every node
+// (the load-bearing placement guard — see cmd/k3sm configureNode) AND the key the
+// provider-toleration Warn VAP keys its CEL on. It is exported and single-sourced
+// here so the taint (placement) and the advisory (admission) cannot desync: a rename
+// is one edit, not two literals in two packages drifting apart.
+const ProviderTaintKey = "k3sm.io/provider"
+
 // darwinPolicyName / darwinBindingName are the cluster-scoped names of the
 // os=darwin admission policy and its binding.
 const (
 	darwinPolicyName  = "k3sm-require-os-darwin"
 	darwinBindingName = "k3sm-require-os-darwin-binding"
+)
+
+// providerTolerationPolicyName / providerTolerationBindingName name the Warn policy
+// that surfaces a pod with no toleration for the provider taint (the scheduler would
+// leave it Unschedulable).
+const (
+	providerTolerationPolicyName  = "k3sm-warn-pod-missing-provider-toleration"
+	providerTolerationBindingName = "k3sm-warn-pod-missing-provider-toleration-binding"
 )
 
 // foreignUserPolicyName / foreignUserBindingName name the policy that rejects a
@@ -81,6 +96,30 @@ const udpServiceExpr = `object.spec.ports.all(p, !has(p.protocol) || p.protocol 
 const darwinSelectorExpr = `has(object.spec.nodeSelector) && ` +
 	`'kubernetes.io/os' in object.spec.nodeSelector && ` +
 	`object.spec.nodeSelector['kubernetes.io/os'] == 'darwin'`
+
+// providerTolerationExpr is the CEL the provider-toleration Warn policy enforces on
+// Pod CREATE. It evaluates TRUE when the pod TOLERATES the provider taint
+// (ProviderTaintKey:NoSchedule, value "") — no warning — and FALSE otherwise, when
+// the scheduler would leave the pod Unschedulable and the binding warns.
+//
+// It is the faithful CEL transcription of Kubernetes' Toleration.ToleratesTaint
+// (k8s.io/api/core/v1): a toleration tolerates the taint iff its effect matches (or
+// is empty), its key matches (or is empty), and EITHER operator==Exists (any value)
+// OR operator is Equal/empty AND its value equals the taint's (empty) value. The
+// exists() requires SOME toleration to satisfy all three.
+//
+// CRITICAL — this is the full-match exists() form, NOT the naive
+// `!has(object.spec.tolerations)` / `size(...)==0` emptiness shortcut. The default-on
+// DefaultTolerationSeconds admission plugin auto-injects NoExecute tolerations
+// (node.kubernetes.io/not-ready, …) into nearly every Pod, so an emptiness test would
+// see a non-empty list and NEVER warn; and a pod carrying a DIFFERENT-key toleration
+// is still Unschedulable here. ProviderTaintKey is interpolated (a const concat) so
+// the taint key lives in exactly one place.
+const providerTolerationExpr = `has(object.spec.tolerations) && object.spec.tolerations.exists(t, ` +
+	`(!has(t.effect) || t.effect == 'NoSchedule') && ` +
+	`(!has(t.key) || t.key == '` + ProviderTaintKey + `') && ` +
+	`((has(t.operator) && t.operator == 'Exists') || ` +
+	`((!has(t.operator) || t.operator == 'Equal') && (!has(t.value) || t.value == ''))))`
 
 // EnsureDarwinAdmission idempotently provisions the os=darwin
 // ValidatingAdmissionPolicy and its binding so non-darwin Pods are rejected at
@@ -247,8 +286,9 @@ func EnsureNoForeignUserAdmission(ctx context.Context, cs kubernetes.Interface, 
 // surfaces that divergence to kubectl WITHOUT rejecting the Service (the field
 // stays valid). Safe to call on every server start (AlreadyExists is success).
 func EnsureExternalTrafficPolicyLocalWarn(ctx context.Context, cs kubernetes.Interface) error {
-	return ensureServiceWarnPolicy(ctx, cs, etpLocalPolicyName, etpLocalBindingName, etpLocalExpr,
-		"k3sm: Service externalTrafficPolicy: Local is not honored — the userspace proxy does not preserve client source IP (only Cluster); the field is accepted but treated as Cluster")
+	return ensureWarnPolicy(ctx, cs, etpLocalPolicyName, etpLocalBindingName, etpLocalExpr,
+		"k3sm: Service externalTrafficPolicy: Local is not honored — the userspace proxy does not preserve client source IP (only Cluster); the field is accepted but treated as Cluster",
+		"services", admissionregistrationv1.Create, admissionregistrationv1.Update)
 }
 
 // EnsureUDPServiceWarn idempotently provisions a Warn-action
@@ -258,22 +298,47 @@ func EnsureExternalTrafficPolicyLocalWarn(ctx context.Context, cs kubernetes.Int
 // deferred datapath addition, not an invalid request). Safe to call on every
 // server start (AlreadyExists is success).
 func EnsureUDPServiceWarn(ctx context.Context, cs kubernetes.Interface) error {
-	return ensureServiceWarnPolicy(ctx, cs, udpServicePolicyName, udpServiceBindingName, udpServiceExpr,
-		"k3sm: UDP Service ports have no datapath yet — the proxy opens no UDP listener, so a UDP Service silently blackholes")
+	return ensureWarnPolicy(ctx, cs, udpServicePolicyName, udpServiceBindingName, udpServiceExpr,
+		"k3sm: UDP Service ports have no datapath yet — the proxy opens no UDP listener, so a UDP Service silently blackholes",
+		"services", admissionregistrationv1.Create, admissionregistrationv1.Update)
 }
 
-// ensureServiceWarnPolicy idempotently provisions a Warn-action
-// ValidatingAdmissionPolicy on Services (CREATE + UPDATE, so a `kubectl edit` that
-// introduces the divergence also warns) whose CEL expr, when it evaluates false,
-// surfaces message to the client as an HTTP-299 warning WITHOUT rejecting the
-// request.
+// EnsureProviderTolerationWarn idempotently provisions a Warn-action
+// ValidatingAdmissionPolicy on Pod CREATE that surfaces a pod with NO toleration for
+// the provider taint (ProviderTaintKey:NoSchedule, on every k3sm node). Such a pod is
+// perfectly valid Kubernetes — it is just left Unschedulable by the scheduler — so
+// this is advisory (Warn), NOT Deny: the policy says so at the API rather than leaving
+// the operator to discover a silently-Pending pod. The CEL is the faithful
+// ToleratesTaint encoding (see providerTolerationExpr), not the emptiness shortcut
+// that DefaultTolerationSeconds would defeat. Matched on CREATE ONLY (an UPDATE warn
+// would re-fire on every unrelated pod status patch).
+//
+// Coverage limit (honest): the warning reaches only DIRECTLY-created pods — for a
+// Deployment/Job/StatefulSet/etc. the Pod CREATE is issued by the
+// kube-controller-manager, so the HTTP-warning header lands on the KCM's API client,
+// not the user's kubectl. A bare `kubectl run`/`kubectl apply` of a Pod does surface
+// it. Safe to call on every server start (AlreadyExists is success).
+func EnsureProviderTolerationWarn(ctx context.Context, cs kubernetes.Interface) error {
+	msg := fmt.Sprintf("k3sm: pod has no toleration for the provider taint %[1]s:NoSchedule — "+
+		"the scheduler will leave it Unschedulable; add a toleration "+
+		"(operator: Exists, or key: %[1]s effect: NoSchedule)", ProviderTaintKey)
+	return ensureWarnPolicy(ctx, cs, providerTolerationPolicyName, providerTolerationBindingName,
+		providerTolerationExpr, msg, "pods", admissionregistrationv1.Create)
+}
+
+// ensureWarnPolicy idempotently provisions a Warn-action ValidatingAdmissionPolicy on
+// resource for the given ops whose CEL expr, when it evaluates false, surfaces message
+// to the client as an HTTP-299 warning WITHOUT rejecting the request. It is the SINGLE
+// source of the advisory invariant for every k3sm Warn VAP (Service divergences and
+// the pod-toleration advisory), parameterized only by resource + ops.
 //
 // FailurePolicy is Ignore — NOT Fail — precisely because the action is advisory: a
 // Fail policy rejects the request when its CEL hits a runtime/typecheck error,
 // REGARDLESS of the binding action (admissionregistration/v1 types.go: "If
 // failurePolicy=Fail, reject the request"), which would turn an informational
-// warning into a hard failure. Ignore guarantees the advisory can only ever warn.
-func ensureServiceWarnPolicy(ctx context.Context, cs kubernetes.Interface, policyName, bindingName, expr, message string) error {
+// warning into a hard failure. Ignore guarantees the advisory can only ever warn —
+// keeping that invariant here, in one place, stops it drifting to Fail per-callsite.
+func ensureWarnPolicy(ctx context.Context, cs kubernetes.Interface, policyName, bindingName, expr, message, resource string, ops ...admissionregistrationv1.OperationType) error {
 	api := cs.AdmissionregistrationV1()
 
 	ignore := admissionregistrationv1.Ignore
@@ -287,11 +352,11 @@ func ensureServiceWarnPolicy(ctx context.Context, cs kubernetes.Interface, polic
 			MatchConstraints: &admissionregistrationv1.MatchResources{
 				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
 					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
-						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create, admissionregistrationv1.Update},
+						Operations: ops,
 						Rule: admissionregistrationv1.Rule{
 							APIGroups:   []string{""},
 							APIVersions: []string{"v1"},
-							Resources:   []string{"services"},
+							Resources:   []string{resource},
 						},
 					},
 				}},
@@ -303,7 +368,7 @@ func ensureServiceWarnPolicy(ctx context.Context, cs kubernetes.Interface, polic
 		},
 	}
 	if _, err := api.ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create service warn policy %s: %w", policyName, err)
+		return fmt.Errorf("create warn policy %s: %w", policyName, err)
 	}
 
 	warn := admissionregistrationv1.Warn
@@ -318,7 +383,7 @@ func ensureServiceWarnPolicy(ctx context.Context, cs kubernetes.Interface, polic
 		},
 	}
 	if _, err := api.ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create service warn binding %s: %w", bindingName, err)
+		return fmt.Errorf("create warn binding %s: %w", bindingName, err)
 	}
 	return nil
 }
