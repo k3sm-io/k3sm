@@ -283,6 +283,53 @@ func nodeCapacity(numCPU int, memBytes uint64, maxPods int64) corev1.ResourceLis
 	}
 }
 
+// defaultMemReserveBytes is the FLOOR of the node memory hold-back: 2Gi of
+// system-reserved headroom for the CO-LOCATED control plane. apiserver, scheduler,
+// KCM, kine/SQLite, runtimed, and the node-agent all run in the single io.k3sm.server
+// launchd job, with a combined real working set of roughly 1.2-2.3Gi — so 2Gi is a
+// conservative, lab-refinable floor (the M5 lab measures the true RSS). It DOMINATES
+// the 10% term on small/8Gi hosts (10% of 8Gi = 800Mi < 2Gi); the 10% term scales the
+// apiserver watch-cache up on larger Macs. See memReserveBytes.
+const defaultMemReserveBytes int64 = 2 * 1024 * 1024 * 1024
+
+// minAllocatableMemBytes is the positive floor nodeAllocatable clamps post-reserve
+// memory to. On a pathologically tiny host a reserve >= capacity would otherwise
+// advertise a zero/negative Allocatable, stranding every pod Pending forever; clamping
+// to 512Mi keeps the node schedulable. The carve-out is a best-effort SCHEDULING
+// hold-back, not a hard guarantee, so flooring (rather than refusing to register) is
+// the correct degradation.
+const minAllocatableMemBytes int64 = 512 * 1024 * 1024
+
+// memReserveBytes sizes the node memory system-reserved hold-back as
+// max(defaultMemReserveBytes, 10% of capacity): a 2Gi floor that dominates on small/
+// 8Gi hosts, scaling to 10% of capacity on larger Macs (where the apiserver watch-cache
+// grows). The reserve is what nodeAllocatable holds back from Allocatable so the
+// scheduler cannot commit 100% of RAM to pod requests and starve the co-located control
+// plane. It is pure (no I/O) so it is unit-tested directly.
+func memReserveBytes(capacityMemBytes int64) int64 {
+	return max(defaultMemReserveBytes, capacityMemBytes/10)
+}
+
+// nodeAllocatable derives the node Allocatable ResourceList from capacity by holding
+// back memReserveBytes of MEMORY for the co-located control plane; cpu and pods pass
+// through unchanged (the reserve is memory-only — CPU is best-effort QoS on darwin, not
+// CFS millicores). It DeepCopies capacity first and is NOT an alias: corev1.ResourceList
+// is a Go map (a reference), so out := capacity would share the backing map and the
+// out[memory] write below — like any resource.Quantity mutation — would shrink the
+// caller's n.Status.Capacity too. Post-reserve memory is clamped to minAllocatableMemBytes
+// so a reserve >= capacity on a tiny host never advertises a zero/negative Allocatable
+// (which would strand every pod Pending). It is pure and side-effect-free (the input
+// capacity is left unmodified) so it is unit-tested directly.
+func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1.ResourceList {
+	out := capacity.DeepCopy()
+	allocMem := capacity.Memory().Value() - memReserveBytes
+	if allocMem < minAllocatableMemBytes {
+		allocMem = minAllocatableMemBytes
+	}
+	out[corev1.ResourceMemory] = *resource.NewQuantity(allocMem, resource.BinarySI)
+	return out
+}
+
 // configureNode stamps the registering Node object with darwin identity,
 // capacity (real host CPU count and hw.memsize memory, with a documented
 // fallback), and the provider taint (the load-bearing placement guard) so stray
@@ -331,9 +378,26 @@ func configureNode(n *corev1.Node, name, ip string) {
 		memBytes = defaultMemBytes
 	}
 	n.Status.Capacity = nodeCapacity(runtime.NumCPU(), memBytes, 110)
-	// Allocatable == Capacity today; a system-reserved carve-out (Allocatable <
-	// Capacity) is B15's node-pressure/eviction scope, a deliberate future diff.
-	n.Status.Allocatable = n.Status.Capacity.DeepCopy()
+	// System-reserved memory carve-out (B41): hold back max(2Gi, 10% of capacity) from
+	// Allocatable for the CO-LOCATED control plane, so the scheduler cannot commit 100%
+	// of RAM to pod requests and starve apiserver/scheduler/KCM/kine/runtimed/node-agent
+	// (all in the one io.k3sm.server job). Capacity stays the true hw.memsize; cpu/pods
+	// pass through unchanged. This is a SCHEDULING-ONLY hold-back — no kubepods cgroup
+	// enforces it at runtime, so it lowers (not eliminates) the chance macOS jetsam kills
+	// the largest process (the control plane); the runtime fix (a jetsam-priority band)
+	// is B46. See nodeAllocatable / DESIGN §5a.
+	capMem := n.Status.Capacity.Memory().Value()
+	reserve := memReserveBytes(capMem)
+	n.Status.Allocatable = nodeAllocatable(n.Status.Capacity, reserve)
+	reserveTerm := "floor" // the 2Gi default dominated (small host)
+	if reserve > defaultMemReserveBytes {
+		reserveTerm = "pct" // 10% of capacity dominated (large host)
+	}
+	slog.Info("node memory system-reserved carve-out for the co-located control plane",
+		"capacity_mem_bytes", capMem,
+		"reserve_bytes", reserve,
+		"allocatable_mem_bytes", n.Status.Allocatable.Memory().Value(),
+		"reserve_term", reserveTerm)
 	n.Status.Addresses = []corev1.NodeAddress{
 		{Type: corev1.NodeInternalIP, Address: ip},
 		{Type: corev1.NodeHostName, Address: name},
