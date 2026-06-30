@@ -224,6 +224,18 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runti
 	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
 	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
 	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
+	// B20a: a ClusterFirst pod's spec.dnsConfig additively augments the cluster base
+	// (extra search domains appended+deduped, ndots override). The merge is GATED here
+	// on the cluster-DNS policy — NOT left to injectClusterDNSEnv's downstream gate —
+	// so the B20a/B20b seam is structural: a None/Default pod gets the UNMERGED base,
+	// so when B20b makes None inject its own config it can't inherit a cluster-base
+	// merge. dnsConfigOverride does the corev1→discrete-params extraction (k3sm is the
+	// corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots, never repoint
+	// the cluster server VIP.
+	if clusterDNSPolicy(pod.Spec.DNSPolicy) && pod.Spec.DNSConfig != nil {
+		searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
+		dnsCfg = dns.MergeDNSConfig(dnsCfg, searches, ndots)
+	}
 	box, err := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg)
 	if err != nil {
 		return nil, err
