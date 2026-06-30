@@ -17,6 +17,7 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -261,7 +262,7 @@ func TestToPodStatusRunning(t *testing.T) {
 	stable := metav1.NewTime(time.Unix(1000, 0))
 	rs := runningRS("uid-web", time.Unix(2000, 0))
 
-	st := toPodStatus(rs, "192.168.1.10", stable, nil)
+	st := toPodStatus(nil, rs, "192.168.1.10", stable, nil)
 
 	if st.Phase != corev1.PodRunning {
 		t.Errorf("phase = %s, want Running", st.Phase)
@@ -318,7 +319,7 @@ func TestToPodStatusTerminatedVerbatim(t *testing.T) {
 			},
 		}},
 	}
-	st := toPodStatus(rs, "10.0.0.1", metav1.Now(), nil)
+	st := toPodStatus(nil, rs, "10.0.0.1", metav1.Now(), nil)
 
 	if st.Phase != corev1.PodFailed {
 		t.Errorf("phase = %s, want Failed", st.Phase)
@@ -591,7 +592,7 @@ func TestToContainerStatusMirror(t *testing.T) {
 			User: &runtimev1.ContainerUser{Linux: &runtimev1.LinuxContainerUser{Uid: 1000, Gid: 2000, SupplementalGroups: []int64{999}}},
 		}},
 	}
-	st := toPodStatus(rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+	st := toPodStatus(nil, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
 
 	cs := st.ContainerStatuses[0]
 	if len(cs.VolumeMounts) != 2 {
@@ -627,7 +628,7 @@ func TestToPodStatusOOMKilled(t *testing.T) {
 			}},
 		}},
 	}
-	st := toPodStatus(rs, "10.0.0.1", metav1.Now(), nil)
+	st := toPodStatus(nil, rs, "10.0.0.1", metav1.Now(), nil)
 
 	if st.Phase != corev1.PodFailed {
 		t.Errorf("phase = %s, want Failed", st.Phase)
@@ -661,4 +662,141 @@ func TestDerivePhase(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPodStatusQOSClass is the B12 gate: toPodStatus is the SINGLE authority that
+// sets Status.QOSClass across all four publish paths (kubelet parity). It proves
+// (1) the kubelet-parity derivation Guaranteed/Burstable/BestEffort, (2) that an
+// init container is counted (it can flip a Guaranteed pod to Burstable), (3) that
+// the apiserver's value is carried forward verbatim and beats re-derivation, (4)
+// the blank-status derive fallback, and (5) that BOTH the pod-bearing GetPods path
+// and the formerly pod-less GetPodStatus path (runtimed.go:321) now emit the class.
+//
+// It FAILS before B12 (toPodStatus emitted no QOSClass → blank) and PASSES after.
+func TestPodStatusQOSClass(t *testing.T) {
+	q := func(s string) resource.Quantity { return resource.MustParse(s) }
+	cpuMem := func(cpu, mem string) corev1.ResourceList {
+		return corev1.ResourceList{corev1.ResourceCPU: q(cpu), corev1.ResourceMemory: q(mem)}
+	}
+	// guaranteedContainer sets cpu AND memory with requests == limits, both EXPLICIT
+	// — the only shape that classifies Guaranteed in a unit test (there is no
+	// apiserver request-from-limit defaulting here; cf. the limits-only Burstable
+	// precedent at TestTypedMemoryLimitWritten).
+	guaranteedContainer := func(name string) corev1.Container {
+		return corev1.Container{
+			Name:    name,
+			Command: []string{"/app"},
+			Resources: corev1.ResourceRequirements{
+				Requests: cpuMem("500m", "256Mi"),
+				Limits:   cpuMem("500m", "256Mi"),
+			},
+		}
+	}
+	podWith := func(name string, status corev1.PodQOSClass, init, regular []corev1.Container) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, UID: types.UID("uid-" + name)},
+			Spec:       corev1.PodSpec{InitContainers: init, Containers: regular},
+			Status:     corev1.PodStatus{QOSClass: status},
+		}
+	}
+
+	t.Run("derive Guaranteed: cpu+memory, requests==limits, both explicit", func(t *testing.T) {
+		pod := podWith("g", "", nil, []corev1.Container{guaranteedContainer("c0")})
+		st := toPodStatus(pod, runningRS("uid-g", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		if st.QOSClass != corev1.PodQOSGuaranteed {
+			t.Errorf("QOSClass = %q, want Guaranteed", st.QOSClass)
+		}
+	})
+
+	t.Run("derive Burstable: partial/unequal resources", func(t *testing.T) {
+		pod := podWith("b", "", nil, []corev1.Container{{
+			Name:      "c0",
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: q("128Mi")}},
+		}})
+		st := toPodStatus(pod, runningRS("uid-b", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		if st.QOSClass != corev1.PodQOSBurstable {
+			t.Errorf("QOSClass = %q, want Burstable", st.QOSClass)
+		}
+	})
+
+	t.Run("derive BestEffort: no resources at all", func(t *testing.T) {
+		pod := podWith("be", "", nil, []corev1.Container{{Name: "c0"}})
+		st := toPodStatus(pod, runningRS("uid-be", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		if st.QOSClass != corev1.PodQOSBestEffort {
+			t.Errorf("QOSClass = %q, want BestEffort", st.QOSClass)
+		}
+	})
+
+	t.Run("init container flips Guaranteed to Burstable (init containers are counted)", func(t *testing.T) {
+		// The regular set is Guaranteed, but an init container with only a cpu limit
+		// (no memory limit) breaks the pod's Guaranteed — proving the derivation
+		// counts init containers, not just the regular set.
+		init := []corev1.Container{{
+			Name:      "init0",
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: q("250m")}},
+		}}
+		pod := podWith("i", "", init, []corev1.Container{guaranteedContainer("c0")})
+		st := toPodStatus(pod, runningRS("uid-i", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		if st.QOSClass != corev1.PodQOSBurstable {
+			t.Errorf("QOSClass = %q, want Burstable (the init container must count)", st.QOSClass)
+		}
+	})
+
+	t.Run("carry-forward beats re-derive: apiserver value preserved verbatim", func(t *testing.T) {
+		// The spec ALONE derives Burstable (limits-only, no requests), but the
+		// apiserver already stamped Guaranteed — carry-forward must win.
+		pod := podWith("cf", corev1.PodQOSGuaranteed, nil, []corev1.Container{{
+			Name:      "c0",
+			Resources: corev1.ResourceRequirements{Limits: cpuMem("500m", "256Mi")},
+		}})
+		// Non-vacuous: the spec really derives a DIFFERENT class, so carry-forward is
+		// observably distinct from re-derivation.
+		if got := computePodQOS(pod); got != corev1.PodQOSBurstable {
+			t.Fatalf("precondition: spec derives %q, want Burstable (so carry-forward differs)", got)
+		}
+		st := toPodStatus(pod, runningRS("uid-cf", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		if st.QOSClass != corev1.PodQOSGuaranteed {
+			t.Errorf("QOSClass = %q, want Guaranteed (apiserver value carried forward, not re-derived)", st.QOSClass)
+		}
+	})
+
+	t.Run("derive fallback when the apiserver value is blank", func(t *testing.T) {
+		pod := podWith("fb", "", nil, []corev1.Container{guaranteedContainer("c0")})
+		st := toPodStatus(pod, runningRS("uid-fb", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		if st.QOSClass != corev1.PodQOSGuaranteed {
+			t.Errorf("QOSClass = %q, want Guaranteed (derived because the apiserver value was blank)", st.QOSClass)
+		}
+	})
+
+	t.Run("both publish paths emit it (GetPodStatus and GetPods cover the pod-less :321 site)", func(t *testing.T) {
+		r, _ := newRuntimedFake(t)
+		ctx := context.Background()
+		pod := podWith("pp", "", nil, []corev1.Container{guaranteedContainer("c0")})
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+
+		// GetPodStatus is the path that used to lack the pod (runtimed.go:321); the
+		// lookup-threaded pod must now make it emit the class.
+		got, err := r.GetPodStatus(ctx, "default", "pp")
+		if err != nil {
+			t.Fatalf("GetPodStatus: %v", err)
+		}
+		if got.QOSClass != corev1.PodQOSGuaranteed {
+			t.Errorf("GetPodStatus QOSClass = %q, want Guaranteed (the pod-less :321 site must now carry it)", got.QOSClass)
+		}
+
+		// GetPods is the watch-shaped, pod-bearing path.
+		pods, err := r.GetPods(ctx)
+		if err != nil {
+			t.Fatalf("GetPods: %v", err)
+		}
+		if len(pods) != 1 {
+			t.Fatalf("GetPods returned %d pods, want 1", len(pods))
+		}
+		if pods[0].Status.QOSClass != corev1.PodQOSGuaranteed {
+			t.Errorf("GetPods QOSClass = %q, want Guaranteed", pods[0].Status.QOSClass)
+		}
+	})
 }

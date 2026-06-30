@@ -272,6 +272,13 @@ func podQOSClass(pod *corev1.Pod) runtimev1.QOSClass {
 //     resource's summed request equals its summed limit;
 //   - BestEffort: no container sets any CPU/memory request or limit;
 //   - Burstable: anything in between.
+//
+// This is a HAND REPRODUCTION of a server-side computation and MUST track upstream
+// k8s.io/component-helpers/scheduling/corev1/v1qos.GetPodQOS — k3sm replaces the
+// kubelet, so when the apiserver has not yet stamped Status.QOSClass this is the
+// only source of the class. It is the FALLBACK only: toPodStatus carries forward
+// the apiserver's value when present (immune to any drift here);
+// TestPodStatusQOSClass pins this reproduction.
 func computePodQOS(pod *corev1.Pod) corev1.PodQOSClass {
 	requests := corev1.ResourceList{}
 	limits := corev1.ResourceList{}
@@ -685,7 +692,13 @@ func derefInt64(p *int64) int64 {
 //   - terminated Reason/ExitCode/Signal carried VERBATIM (not the M0 "Error"
 //     heuristic) — this is the path the runtimed OOMKilled reason surfaces on,
 //   - the M2.1 ContainerStatus mirror (volume_mounts, user),
-//   - HostIP/HostIPs from the node IP.
+//   - HostIP/HostIPs from the node IP,
+//   - Status.QOSClass (B12): toPodStatus is the SINGLE place QOSClass is set, so
+//     all four publish paths (GetPodStatus, GetPods, the watch-stream cb, the
+//     probe-driven cb) emit a consistent value instead of blanking it on every
+//     full-status replace. The apiserver-set value is carried forward
+//     (authoritative + immutable); computePodQOS derives it only when unset (the
+//     Pending pre-status window) or when pod is nil (the pod-less path).
 //
 // probes, when non-nil, overlays the provider-served probe verdicts (M2.2):
 // readiness drives each container's Ready (and thus the pod Ready/ContainersReady
@@ -693,7 +706,7 @@ func derefInt64(p *int64) int64 {
 // probe-driven restart count is added — applied BEFORE the conditions are derived
 // so the readiness signal propagates. A nil probes leaves the runtime status
 // untouched (a pod with no probes).
-func toPodStatus(rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState) *corev1.PodStatus {
+func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState) *corev1.PodStatus {
 	cs := toContainerStatuses(rs.GetContainerStatuses())
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
 	applyProbeOverlay(cs, probes)
@@ -729,6 +742,19 @@ func toPodStatus(rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, 
 	}
 	if ip := rs.GetPodIp(); ip != "" {
 		out.PodIPs = []corev1.PodIP{{IP: ip}}
+	}
+
+	// QOSClass is set HERE and nowhere else (B12): every publish path does a full
+	// pod.Status = *toPodStatus(...) replace, so deriving it elsewhere would let the
+	// field flap blank vs real across reconcile-vs-probe ticks. Carry forward the
+	// apiserver's authoritative value (immutable, and immune to any drift between
+	// computePodQOS and upstream GetPodQOS); fall back to the hand-rolled derivation
+	// only when the apiserver has not stamped it yet, or when no pod is in scope.
+	if pod != nil {
+		out.QOSClass = pod.Status.QOSClass
+		if out.QOSClass == "" {
+			out.QOSClass = computePodQOS(pod)
+		}
 	}
 
 	ready := corev1.ConditionFalse

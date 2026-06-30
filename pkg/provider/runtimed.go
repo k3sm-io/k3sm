@@ -317,7 +317,7 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 
 // GetPodStatus returns the named pod's status, NotFound if it is unknown.
 func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name string) (*corev1.PodStatus, error) {
-	id, start, ok := r.lookup(namespace, name)
+	id, start, pod, ok := r.lookup(namespace, name)
 	if !ok {
 		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
@@ -328,7 +328,7 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
 		return nil, errdefs.NotFoundf("pod %q not found in runtime", namespace+"/"+name)
 	}
-	return toPodStatus(resp.GetStatus(), r.nodeIP, start, r.proberFor(id)), nil
+	return toPodStatus(pod, resp.GetStatus(), r.nodeIP, start, r.proberFor(id)), nil
 }
 
 // GetPods returns every tracked pod with its current status applied.
@@ -345,7 +345,7 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 		pod := t.pod.DeepCopy()
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 		if err == nil && (resp.GetError() == nil || resp.GetError().GetCode() == 0) {
-			pod.Status = *toPodStatus(resp.GetStatus(), r.nodeIP, t.startTime, r.proberFor(string(pod.UID)))
+			pod.Status = *toPodStatus(pod, resp.GetStatus(), r.nodeIP, t.startTime, r.proberFor(string(pod.UID)))
 		}
 		out = append(out, pod)
 	}
@@ -357,7 +357,7 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // only for the non-follow path in M1 (the gate scopes kubectl logs to
 // non-follow); a follow request returns the current buffer and closes.
 func (r *runtimedRuntime) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	id, _, ok := r.lookup(namespace, podName)
+	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
 		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
@@ -476,7 +476,7 @@ func (r *runtimedRuntime) emit(rs *runtimev1.PodStatus) {
 	if pr != nil {
 		ps = pr
 	}
-	pod.Status = *toPodStatus(rs, r.nodeIP, start, ps)
+	pod.Status = *toPodStatus(pod, rs, r.nodeIP, start, ps)
 	cb(pod)
 }
 
@@ -496,16 +496,21 @@ func (r *runtimedRuntime) callback() func(*corev1.Pod) {
 	return r.notify
 }
 
-// lookup resolves a (namespace, name) to a pod id and stable start time.
-func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, bool) {
+// lookup resolves a (namespace, name) to a pod id, its stable start time, and the
+// tracked Pod object. The Pod is returned so the pod-less GetPodStatus path can
+// carry forward / derive Status.QOSClass in toPodStatus (B12); callers that need
+// only the id discard it. The returned *corev1.Pod is the tracked object, which is
+// immutable once stored (CreatePod/UpdatePod replace the pointer under r.mu, never
+// mutate the object in place), so reading it after the lock is released is safe.
+func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, *corev1.Pod, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for id, t := range r.track {
 		if t.pod.Namespace == namespace && t.pod.Name == name {
-			return id, t.startTime, true
+			return id, t.startTime, t.pod, true
 		}
 	}
-	return "", metav1.Time{}, false
+	return "", metav1.Time{}, nil, false
 }
 
 // StatsSummary builds the kubelet Summary API snapshot kubectl top reads (M2.3),
