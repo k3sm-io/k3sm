@@ -33,6 +33,7 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 
+	corev1 "k8s.io/api/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	"k3sm.io/darwin-net/pkg/netd/wire"
@@ -53,14 +54,28 @@ const resolverQueryTimeout = 5 * time.Second
 // connection goroutine open.
 const tcpIdleTimeout = 10 * time.Second
 
-// dnsZone resolves an in-cluster Service A record. It is the consumer-side seam
-// the resolver reads the cluster zone through; the production impl is backed by a
-// Services lister, tests inject a map.
+// serviceTarget is the discriminated result of a cluster Service lookup: exactly
+// one of IP / ExternalName is set. A normal Service yields IP (its IPv4 ClusterIP,
+// answered as an A record directly); an ExternalName Service yields ExternalName
+// (chased through the upstream forwarder and flattened CNAME→A — see respond).
+type serviceTarget struct {
+	// IP is the Service's IPv4 ClusterIP, set for a normal (non-ExternalName) Service.
+	IP netip.Addr
+	// ExternalName is the trailing-dot-trimmed Spec.ExternalName, set for an
+	// ExternalName Service (mutually exclusive with IP).
+	ExternalName string
+}
+
+// dnsZone resolves an in-cluster Service to its A-record target. It is the
+// consumer-side seam the resolver reads the cluster zone through; the production
+// impl is backed by a Services lister, tests inject a map.
 type dnsZone interface {
-	// LookupService returns the IPv4 ClusterIP of the namespace/name Service, with
-	// ok==false when no such Service exists or its ClusterIP is not a routable IPv4
-	// (a headless "None" or an IPv6-only Service yields ok==false → NXDOMAIN).
-	LookupService(namespace, name string) (netip.Addr, bool)
+	// LookupService resolves the namespace/name Service to its target. A normal
+	// Service yields a serviceTarget with IP set (its IPv4 ClusterIP); an
+	// ExternalName Service yields one with ExternalName set. ok==false → NXDOMAIN
+	// when no such Service exists, it is headless ("None") or IPv6-only, or it is an
+	// ExternalName with an empty Spec.ExternalName.
+	LookupService(namespace, name string) (serviceTarget, bool)
 }
 
 // dnsForwarder resolves a non-cluster name to IPv4 addresses upstream. It is the
@@ -96,6 +111,15 @@ type dnsForwarder interface {
 // DNS need. It does NOT implement SRV, PTR, headless per-pod A records, pod A
 // records (<ip>.<ns>.pod.<domain>), or AAAA (k3sm's service CIDR is IPv4); those
 // are the documented gaps a future darwin-net dns.Server seam would close.
+//
+// ExternalName Services ARE resolved (B19): the target is chased through the
+// upstream forwarder and FLATTENED CNAME→A — the resolver is A-only, so a client
+// gets the target's A records under the queried name, never the upstream CNAME RR (a
+// TypeCNAME / ai_canonname query gets NODATA, the same rule the off-cluster forward
+// already applies). One gap: an ExternalName whose target is itself inside the
+// cluster domain is unsupported (NXDOMAIN) — it is deliberately not re-resolved
+// in-cluster (that would risk a resolver loop) and must never leak to the host
+// upstream.
 //
 // Concurrency: clusterResolver holds no mutable state after construction (zone and
 // fwd are themselves concurrency-safe), so respond is safe for concurrent callers.
@@ -221,10 +245,12 @@ func (r *clusterResolver) handleTCPConn(ctx context.Context, conn net.Conn) {
 
 // respond decodes a single query and renders the DNS response. It is the pure core
 // of the resolver (zone + forwarder are injectable), so it is unit-tested directly.
-// A cluster Service name resolves from the zone (NXDOMAIN when absent); a name in
-// the cluster domain that is not a Service A name is NXDOMAIN (pod/SRV records are
-// the documented gap); any other name is forwarded upstream. Only A is answered
-// with addresses — AAAA and other types get an empty NOERROR (NODATA).
+// A cluster Service name resolves from the zone — a normal Service answers its
+// ClusterIP, an ExternalName Service is chased through the forwarder (flattened
+// CNAME→A), and an absent/headless one is NXDOMAIN; a name in the cluster domain
+// that is not a Service A name is NXDOMAIN (pod/SRV records are the documented gap);
+// any other name is forwarded upstream. Only A is answered with addresses — AAAA and
+// other types get an empty NOERROR (NODATA).
 func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, error) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(query)
@@ -242,12 +268,29 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, er
 
 	switch svc, ns, isService := parseClusterServiceName(qname, r.domain); {
 	case isService:
-		// In-cluster Service: answer A from the cluster zone, else NXDOMAIN.
+		// In-cluster Service. Only A is answered (an AAAA/other query falls through to
+		// an empty NOERROR — NODATA, never NXDOMAIN). A normal Service answers its
+		// ClusterIP; an ExternalName Service is chased through the upstream forwarder
+		// (flattened CNAME→A); ok==false (absent/headless/IPv6) is NXDOMAIN.
 		if q.Type == dnsmessage.TypeA {
-			if addr, ok := r.zone.LookupService(ns, svc); ok {
-				answers = []netip.Addr{addr}
-			} else {
+			switch target, ok := r.zone.LookupService(ns, svc); {
+			case !ok:
 				rcode = dnsmessage.RCodeNameError
+			case target.ExternalName != "":
+				// ExternalName: resolve the target upstream and stamp its A records
+				// under the QUERIED name (buildResponse owns that flatten). A target
+				// inside the cluster domain is NOT forwarded — that would both leak the
+				// cluster name to the host upstream and fail to resolve there — so it is
+				// NXDOMAIN. Deliberately NOT recursive in-cluster re-resolution, which
+				// would risk a resolver loop; the in-cluster-target case is a documented
+				// gap.
+				if inClusterDomain(target.ExternalName, r.domain) {
+					rcode = dnsmessage.RCodeNameError
+				} else {
+					answers, rcode = r.forward(ctx, target.ExternalName)
+				}
+			default:
+				answers = []netip.Addr{target.IP}
 			}
 		}
 	case inClusterDomain(qname, r.domain):
@@ -258,20 +301,30 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, er
 	default:
 		// Off-cluster: forward to the host upstream (A only; k3sm is IPv4).
 		if q.Type == dnsmessage.TypeA {
-			addrs, ferr := r.fwd.LookupIP4(ctx, strings.TrimSuffix(qname, "."))
-			switch {
-			case ferr == nil:
-				answers = addrs
-			case isNotFound(ferr):
-				rcode = dnsmessage.RCodeNameError
-			default:
-				r.log.Debug("dns forward", "name", qname, "err", ferr)
-				rcode = dnsmessage.RCodeServerFailure
-			}
+			answers, rcode = r.forward(ctx, qname)
 		}
 	}
 
 	return buildResponse(hdr.ID, q, answers, rcode)
+}
+
+// forward resolves an off-cluster host through the upstream forwarder, mapping its
+// three outcomes to (addrs, rcode): a successful lookup → (addrs, RCodeSuccess); an
+// upstream not-found → (nil, RCodeNameError), i.e. NXDOMAIN; any other (transient)
+// error → (nil, RCodeServerFailure), i.e. SERVFAIL, with a debug log. Both the
+// off-cluster default path and the ExternalName chase route through it, so a
+// transient SERVFAIL is never collapsed into a cacheable NXDOMAIN.
+func (r *clusterResolver) forward(ctx context.Context, host string) ([]netip.Addr, dnsmessage.RCode) {
+	addrs, err := r.fwd.LookupIP4(ctx, host)
+	switch {
+	case err == nil:
+		return addrs, dnsmessage.RCodeSuccess
+	case isNotFound(err):
+		return nil, dnsmessage.RCodeNameError
+	default:
+		r.log.Debug("dns forward", "name", host, "err", err)
+		return nil, dnsmessage.RCodeServerFailure
+	}
 }
 
 // buildResponse renders a response carrying the question, any A answers, and the
@@ -355,18 +408,26 @@ type serviceZone struct {
 	lister corev1listers.ServiceLister
 }
 
-// LookupService returns the namespace/name Service's IPv4 ClusterIP, with
-// ok==false for an absent Service or a non-IPv4 ClusterIP (headless "None"/IPv6).
-func (z serviceZone) LookupService(namespace, name string) (netip.Addr, bool) {
+// LookupService resolves the namespace/name Service to its target. It branches on
+// the Service TYPE, not on an empty ClusterIP — that is overloaded with a headless
+// "None" and a still-pending ClusterIP, both of which must yield NXDOMAIN, not a
+// forward. An ExternalName Service with a non-empty Spec.ExternalName yields that
+// name (trailing dot trimmed) for the upstream chase; every other Service yields its
+// IPv4 ClusterIP. ok==false (→ NXDOMAIN) for an absent Service, an ExternalName with
+// an empty Spec.ExternalName, or a non-IPv4 ClusterIP (headless "None"/IPv6/pending).
+func (z serviceZone) LookupService(namespace, name string) (serviceTarget, bool) {
 	svc, err := z.lister.Services(namespace).Get(name)
 	if err != nil {
-		return netip.Addr{}, false
+		return serviceTarget{}, false
+	}
+	if svc.Spec.Type == corev1.ServiceTypeExternalName && svc.Spec.ExternalName != "" {
+		return serviceTarget{ExternalName: strings.TrimSuffix(svc.Spec.ExternalName, ".")}, true
 	}
 	addr, err := netip.ParseAddr(svc.Spec.ClusterIP)
 	if err != nil || !addr.Is4() {
-		return netip.Addr{}, false
+		return serviceTarget{}, false
 	}
-	return addr, true
+	return serviceTarget{IP: addr}, true
 }
 
 // systemForwarder is the production dnsForwarder: it forwards off-cluster names to
