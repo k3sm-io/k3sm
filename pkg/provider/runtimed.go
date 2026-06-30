@@ -123,7 +123,7 @@ type RuntimedConfig struct {
 	// dns.PodDNSConfig to build the in-pod shim search list. It MUST match the served
 	// zone the per-node resolver answers for (the same --cluster-domain the CoreDNS
 	// Corefile binds): a mismatch makes every unqualified Service lookup NXDOMAIN.
-	// Empty defaults to the apis cluster domain ("cluster.local") inside PodDNSConfig.
+	// Empty defaults to dns.DefaultClusterDomain ("cluster.local", darwin-net) inside PodDNSConfig.
 	ClusterDomain string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the kubernetes
 	// ClusterIP, 10.43.0.1) the per-pod Seatbelt egress is ADDITIONALLY scoped to,
