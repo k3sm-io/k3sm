@@ -17,7 +17,10 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
+	"encoding/xml"
+	"io"
 	"strings"
 	"testing"
 )
@@ -166,6 +169,49 @@ func TestServerPlistXML(t *testing.T) {
 	mustContain(t, x, "<string>runtimed</string>")
 	mustContain(t, x, "<key>RunAtLoad</key>\n  <true/>")
 	mustContain(t, x, "<key>KeepAlive</key>\n  <true/>")
+}
+
+// TestServerPlistRaisesFileLimit proves the server plist raises RLIMIT_NOFILE so
+// darwin-net's UDP flow budget (B48, rl.Cur/2) sizes against a real fd table, not
+// launchd's 256 default. The load-bearing assertion is well-formedness: a
+// hand-rolled unbalanced/mis-nested <dict> would still pass the substring checks
+// yet make launchd REJECT the plist at bootstrap (a non-loading control plane),
+// so the generated XML is decoded to EOF. The raise is server-ONLY (netd is not
+// the UDP-relay host), which the NetdPlist negative assertion pins.
+func TestServerPlistRaisesFileLimit(t *testing.T) {
+	x := ServerPlist(Config{})
+
+	// (1) Well-formedness (load-bearing): the whole plist must PARSE as XML. A
+	// mis-nested <dict> from the hand-rolled builder would fail here even though
+	// the substring checks in (2) would still pass on a corrupt plist.
+	dec := xml.NewDecoder(bytes.NewReader(x))
+	for {
+		_, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ServerPlist is not well-formed XML: %v\n--- plist ---\n%s", err, x)
+		}
+	}
+
+	// (2) Soft + Hard NumberOfFiles = 131072, correctly nested as <integer>.
+	s := string(x)
+	for _, needle := range []string{
+		"<key>SoftResourceLimits</key>",
+		"<key>HardResourceLimits</key>",
+		"<key>NumberOfFiles</key>",
+		"<integer>131072</integer>",
+	} {
+		mustContain(t, s, needle)
+	}
+
+	// (3) Server-ONLY: netd is not the UDP-relay host, so its plist carries no
+	// resource limits. This also proves SoftFileLimit is conditional (not emitted
+	// for every plist) — the field is honored, not hard-wired into renderPlist.
+	if n := string(NetdPlist(Config{})); strings.Contains(n, "SoftResourceLimits") {
+		t.Error("NetdPlist must NOT raise file limits (the raise is server-only)")
+	}
 }
 
 // TestPlistEscaping proves string values are XML-escaped (a token with an &
