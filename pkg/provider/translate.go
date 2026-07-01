@@ -248,8 +248,8 @@ func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
 // A nil c yields (nil, 0): no extra searches, "keep the cluster base ndots". searches
 // is the pod's spec.dnsConfig.searches verbatim. ndots scans c.Options for the first
 // "ndots" entry: a non-negative integer value (strconv.Atoi) becomes the override,
-// CLAMPED to [0,15] (the resolv.conf RES_MAXNDOTS ceiling) BEFORE the int32 narrowing
-// so an absurd value (>=2^31) cannot wrap negative and be silently dropped as
+// CLAMPED to [0, dns.MaxNDots] (the resolv.conf RES_MAXNDOTS ceiling) BEFORE the int32
+// narrowing so an absurd value (>=2^31) cannot wrap negative and be silently dropped as
 // keep-base; anything else — absent, nil/empty, unparseable, or negative — yields 0,
 // which dns.MergeDNSConfig reads as "keep base".
 //
@@ -272,13 +272,15 @@ func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) 
 		// `ndots: 0` is indistinguishable from unset in this int32 path — deferred to B20b.
 		if v := c.Options[i].Value; v != nil {
 			if n, err := strconv.Atoi(*v); err == nil && n >= 0 {
-				// Clamp to the resolv.conf ndots ceiling (15, RES_MAXNDOTS) BEFORE the
-				// int32 narrowing: an absurd value (>=2^31) would otherwise wrap negative
-				// and be silently dropped by MergeDNSConfig as keep-base, masking the
-				// misconfig. Clamping the int first fails predictably (→ 15). strconv.Atoi
-				// already returns ErrRange for values beyond int64, so those keep base.
-				if n > 15 {
-					n = 15
+				// Clamp to the shared resolv.conf ndots ceiling (dns.MaxNDots ==
+				// RES_MAXNDOTS) BEFORE the int32 narrowing: an absurd value (>=2^31)
+				// would otherwise wrap negative and be silently dropped by
+				// MergeDNSConfig as keep-base, masking the misconfig. Clamping the int
+				// first fails predictably (→ dns.MaxNDots). dns.MaxNDots is untyped so it
+				// compares against int n with no cast. strconv.Atoi already returns
+				// ErrRange for values beyond int64, so those keep base.
+				if n > dns.MaxNDots {
+					n = dns.MaxNDots
 				}
 				ndots = int32(n)
 			}
