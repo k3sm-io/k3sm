@@ -97,22 +97,46 @@ var vmMemoryOverhead = resource.MustParse("256Mi")
 // It is Create-tolerate-AlreadyExists and never LISTs to decide what to provision
 // (matching pkg/rbac under the pinned kine, where ConsistentListFromCache is GA-locked
 // true and a watch-cache LIST can read stale). On AlreadyExists it RECONCILES the
-// Overhead: the "vm" RuntimeClass persists in kine across restarts, so a cluster first
-// provisioned WITHOUT the overhead (pre-B24, or by an operator) would otherwise
-// oversubscribe forever. The reconcile does a direct, consistent Get (never a
-// stale-prone LIST) and a per-key FLOOR-merge (reconcileOverhead): each desired
-// PodFixed key that is missing or below its floor is raised, a key already at/above its
-// floor is left untouched (an operator who RAISED a term stays raised), and unrelated
-// keys are preserved — so an already-current Overhead makes NO Update call (no churn on
-// every restart). The Get→reconcile→Update runs inside a bounded retry.RetryOnConflict
-// so a simultaneous multi-server (HA) upgrade converges the floor in-call instead of
-// leaving the optimistic-concurrency loser to wait for its next restart; if the class is
-// DELETED between the Create and the Get (TOCTOU), it re-lays the FULL desired shape
-// (handler + nodeSelector + Overhead — a partial re-create would break fail-closed VZ
-// scheduling), tolerating a concurrent re-creator. A missing or stale RuntimeClass is
-// itself fail-closed — a vm pod naming an absent class is rejected at admission, and zero
-// accounted overhead only oversubscribes — so unlike pkg/rbac the caller treats an error
-// as log-and-continue.
+// k3sm-owned MANAGED SHAPE onto the persisted object — the "vm" RuntimeClass lives in
+// kine across restarts, so a cluster first provisioned by an older k3sm (pre-B24 had no
+// Overhead; pre-B49 never re-pinned the nodeSelector) or hand-edited by an operator is
+// repaired in place. The reconcile does a direct, consistent Get (never a stale-prone
+// LIST) and repairs two MUTABLE dimensions with a per-key FLOOR-merge, never a wholesale
+// clobber:
+//
+//   - scheduling.nodeSelector (reconcileManagedShape) — each k3sm-owned key that is
+//     missing or wrong is (re)set; operator-added keys are PRESERVED (a wholesale replace
+//     with {virtualization:true} would strip an operator key and WIDEN vm placement,
+//     relaxing the confinement the selector exists to enforce).
+//   - Overhead.PodFixed (reconcileOverhead) — each term below its floor is raised; an
+//     operator who RAISED a term stays raised; unrelated keys are preserved.
+//
+// The two repairs COMPOSE by call-then-accumulate (each is evaluated into its own bool,
+// then OR-ed — never reconcileManagedShape(...) || reconcileOverhead(...), whose Go
+// short-circuit would SKIP the second repair whenever the first fired, persisting a
+// half-repaired object). An already-current object makes NO Update (no churn / HA-churn on
+// restart).
+//
+// The RuntimeClass handler is IMMUTABLE at the apiserver, so a wrong handler is
+// COMPARE-and-WARNED, never Update-repaired: an Update carrying a handler change is
+// rejected Invalid (not a Conflict — RetryOnConflict does not retry it) and would reject
+// the WHOLE Update, including the security-critical nodeSelector repair. A wrong handler is
+// already fail-closed at runtime — runtimed resolves the POD's own handler through the
+// compile-time apis table (an unknown handler is runtimev1.ErrUnknownHandler, a refusal),
+// not through this object — so k3sm logs the anomaly and repairs what it legally can.
+//
+// The Get→reconcile→Update runs inside a bounded retry.RetryOnConflict so a simultaneous
+// multi-server (HA) upgrade converges in-call rather than leaving the optimistic-concurrency
+// loser to wait for its next restart. If the class is DELETED between the Create and the
+// Get (TOCTOU), it re-lays the FULL desired shape (handler + nodeSelector + Overhead — a
+// partial re-create would break fail-closed VZ scheduling); a self-authored full-shape
+// re-create is already correct and needs no follow-on reconcile. If a concurrent creator
+// won that re-create (AlreadyExists), it does ONE bounded, consistent re-Get and reconciles
+// that object's shape — never an unbounded create→AlreadyExists→re-Get loop (RetryOnConflict
+// bounds only Conflict, not a create/delete race, which would otherwise livelock). A missing
+// or stale RuntimeClass is itself fail-closed — a vm pod naming an absent class is rejected
+// at admission, and zero accounted overhead only oversubscribes — so unlike pkg/rbac the
+// caller treats an error as log-and-continue.
 func Provision(ctx context.Context, cs kubernetes.Interface) error {
 	_, err := cs.NodeV1().RuntimeClasses().Create(ctx, desiredRuntimeClass(), metav1.CreateOptions{})
 	if err == nil {
@@ -121,43 +145,80 @@ func Provision(ctx context.Context, cs kubernetes.Interface) error {
 	if !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create vm runtime class: %w", err)
 	}
-	// The class already exists — reconcile its host-side Overhead floor onto it. Retry on
-	// the optimistic-concurrency conflict a simultaneous multi-server (HA) upgrade produces:
-	// re-Get consistently, re-evaluate the floor, re-Update, so the floor converges in-call
-	// rather than waiting for the loser's next restart. A consistent Get (never a stale-prone
-	// LIST) is required under the pinned kine (ConsistentListFromCache GA-locked true).
+	// The class already exists — reconcile the k3sm-owned managed shape (nodeSelector) and
+	// the Overhead floor onto it. Retry on the optimistic-concurrency conflict a simultaneous
+	// multi-server (HA) upgrade produces: re-Get consistently, re-evaluate, re-Update, so the
+	// repair converges in-call rather than waiting for the loser's next restart. A consistent
+	// Get (never a stale-prone LIST) is required under the pinned kine (ConsistentListFromCache
+	// GA-locked true).
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		existing, err := cs.NodeV1().RuntimeClasses().Get(ctx, Name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			// Deleted between Create and Get (TOCTOU) — re-lay the FULL desired shape
 			// (handler + nodeSelector + Overhead; a partial re-create would break the
-			// fail-closed VZ-node scheduling), tolerating a concurrent re-creator.
+			// fail-closed VZ-node scheduling).
 			_, cerr := cs.NodeV1().RuntimeClasses().Create(ctx, desiredRuntimeClass(), metav1.CreateOptions{})
-			// A concurrent re-creator (an HA peer) racing this re-Create wrote the full
-			// desired shape first — accept it as-is. Raising the Overhead floor on that
-			// object then defers to the next Provision (next server start); the floor's
-			// only failure mode is oversubscription, never a correctness break.
-			if cerr == nil || apierrors.IsAlreadyExists(cerr) {
+			if cerr == nil {
+				// A self-authored full-shape Create is already correct — no reconcile.
 				return nil
 			}
-			return fmt.Errorf("re-create vm runtime class: %w", cerr)
+			if !apierrors.IsAlreadyExists(cerr) {
+				return fmt.Errorf("re-create vm runtime class: %w", cerr)
+			}
+			// A concurrent creator (an HA peer) won the re-create race: the object was
+			// deleted and relaid concurrently. Do ONE bounded, consistent re-Get and heal
+			// THAT object's shape — never loop the create→AlreadyExists→re-Get dance
+			// (RetryOnConflict bounds only Conflict, not a create/delete race, so an
+			// unbounded re-Get retry would livelock).
+			slog.InfoContext(ctx, "vm runtime class was deleted and re-created concurrently; reconciling the concurrent object", "name", Name)
+			concurrent, gerr := cs.NodeV1().RuntimeClasses().Get(ctx, Name, metav1.GetOptions{})
+			if apierrors.IsNotFound(gerr) {
+				// Deleted AGAIN before the re-Get — a missing class is itself fail-closed
+				// at admission, so leave it to the next Provision rather than spin.
+				slog.InfoContext(ctx, "vm runtime class vanished again after a concurrent re-create; leaving it to the next Provision", "name", Name)
+				return nil
+			}
+			if gerr != nil {
+				return fmt.Errorf("re-get vm runtime class after concurrent re-create: %w", gerr)
+			}
+			return reconcileExisting(ctx, cs, concurrent)
 		}
 		if err != nil {
-			return fmt.Errorf("get vm runtime class for overhead reconcile: %w", err)
+			return fmt.Errorf("get vm runtime class for reconcile: %w", err)
 		}
-		if !reconcileOverhead(existing, desiredOverhead()) {
-			slog.DebugContext(ctx, "vm runtime class overhead already current", "name", Name)
-			return nil
-		}
-		if _, err := cs.NodeV1().RuntimeClasses().Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
-			return err // a Conflict is retried by RetryOnConflict; other errors propagate
-		}
-		slog.InfoContext(ctx, "reconciled vm runtime class overhead onto pre-existing class",
-			"name", Name, "podFixedMemory", vmMemoryOverhead.String())
-		return nil
+		return reconcileExisting(ctx, cs, existing)
 	}); err != nil {
-		return fmt.Errorf("reconcile vm runtime class overhead: %w", err)
+		return fmt.Errorf("reconcile vm runtime class: %w", err)
 	}
+	return nil
+}
+
+// reconcileExisting repairs an already-existing "vm" RuntimeClass toward the k3sm-owned
+// managed shape (scheduling.nodeSelector, via reconcileManagedShape) and the host-side
+// Overhead floor (reconcileOverhead), issuing at MOST ONE Update. The two repairs COMPOSE
+// by call-then-accumulate: each is evaluated into its own bool BEFORE they are OR-ed, so
+// neither is skipped by a `||` short-circuit when the other already reported a change (which
+// would persist a half-repaired object). It returns the RAW Update error so a Conflict stays
+// visible to the enclosing retry.RetryOnConflict; an already-current object makes no Update.
+func reconcileExisting(ctx context.Context, cs kubernetes.Interface, existing *nodev1.RuntimeClass) error {
+	desired := desiredRuntimeClass()
+	shapeChanged := reconcileManagedShape(ctx, existing, desired)
+	overheadChanged := reconcileOverhead(existing, desired.Overhead)
+	if !shapeChanged && !overheadChanged {
+		slog.DebugContext(ctx, "vm runtime class already current", "name", Name)
+		return nil
+	}
+	// existing.Handler is deliberately NEVER assigned (reconcileManagedShape compare-and-warns it —
+	// RuntimeClass.Handler is immutable at the apiserver), so this Update carries the stored handler
+	// UNCHANGED. That is load-bearing: a wrong-handler class's nodeSelector/Overhead repair still
+	// lands, because the apiserver's immutable-field check rejects only a handler CHANGE. Do NOT add
+	// existing.Handler = desired.Handler here or in reconcileManagedShape.
+	if _, err := cs.NodeV1().RuntimeClasses().Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+		return err // a Conflict is retried by the enclosing RetryOnConflict; other errors propagate
+	}
+	slog.InfoContext(ctx, "reconciled vm runtime class managed shape onto pre-existing class",
+		"name", Name, "nodeSelectorRepaired", shapeChanged, "overheadRepaired", overheadChanged,
+		"podFixedMemory", vmMemoryOverhead.String())
 	return nil
 }
 
@@ -208,6 +269,53 @@ func reconcileOverhead(rc *nodev1.RuntimeClass, desired *nodev1.Overhead) (chang
 		}
 		rc.Overhead.PodFixed[name] = want
 		changed = true
+	}
+	return changed
+}
+
+// reconcileManagedShape repairs the k3sm-OWNED, MUTABLE managed shape of rc toward desired
+// — today the scheduling.nodeSelector — and COMPARE-and-WARNS the IMMUTABLE handler without
+// ever mutating it. It returns whether it changed rc's mutable shape; a handler mismatch is
+// logged but NEVER counted as a change, so it can never trigger an Update.
+//
+// nodeSelector is a per-key FLOOR-merge (mirrors reconcileOverhead, NOT a wholesale clobber):
+// for each k3sm-owned key in desired.Scheduling.NodeSelector (today just
+// LabelVirtualization=LabelTrue), a key rc is missing or carries a WRONG value for is (re)set
+// — allocating Scheduling/NodeSelector as needed — while a key already correct is left
+// untouched (idempotent: no Update, no HA-churn on restart) and operator-added keys are
+// PRESERVED. A wholesale replace with exactly {virtualization:true} would strip an
+// operator-added key and WIDEN vm placement, relaxing the confinement this selector exists to
+// enforce. Iterating desired's map (the single source of k3sm-owned keys) auto-extends this if
+// a k3sm-owned key is added later.
+//
+// The handler is IMMUTABLE at the apiserver (validated on update): an Update carrying a
+// changed handler is rejected Invalid — NOT a Conflict, so NOT retried by RetryOnConflict —
+// and would reject the WHOLE Update, including the security-critical nodeSelector repair. So a
+// wrong handler is logged as an operator anomaly, never repaired here; it is already
+// fail-closed at runtime because runtimed resolves the POD's own handler through the
+// compile-time apis table (an unknown handler is runtimev1.ErrUnknownHandler, a refusal — not
+// this object). An operator changes a handler by deleting and recreating the class.
+func reconcileManagedShape(ctx context.Context, rc, desired *nodev1.RuntimeClass) (changed bool) {
+	if desired.Scheduling != nil {
+		for key, want := range desired.Scheduling.NodeSelector {
+			if rc.Scheduling != nil && rc.Scheduling.NodeSelector[key] == want {
+				continue // already correct — preserve (idempotent, no churn)
+			}
+			if rc.Scheduling == nil {
+				rc.Scheduling = &nodev1.Scheduling{}
+			}
+			if rc.Scheduling.NodeSelector == nil {
+				rc.Scheduling.NodeSelector = map[string]string{}
+			}
+			rc.Scheduling.NodeSelector[key] = want
+			changed = true
+		}
+	}
+	if rc.Handler != desired.Handler {
+		// Immutable at the apiserver — compare-and-warn ONLY, never Update-repair (an Update
+		// carrying the change is rejected Invalid and would block the nodeSelector repair).
+		slog.WarnContext(ctx, "vm runtime class has an unexpected immutable handler; NOT repairing it (RuntimeClass.Handler is immutable at the apiserver, an Update would be rejected Invalid and block the nodeSelector repair). Runtime dispatch is already fail-closed on an unknown handler (runtimev1.ErrUnknownHandler); an operator must delete and recreate the class to change its handler",
+			"name", Name, "handler", rc.Handler, "wantHandler", desired.Handler)
 	}
 	return changed
 }

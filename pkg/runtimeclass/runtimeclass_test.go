@@ -17,8 +17,11 @@ limitations under the License.
 package runtimeclass
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -359,6 +363,262 @@ func TestProvisionReconcileSurgicalAndConflictBenign(t *testing.T) {
 		}
 		if mem, ok := rc.Overhead.PodFixed[corev1.ResourceMemory]; !ok || mem.Cmp(vmMemoryOverhead) < 0 {
 			t.Errorf("PodFixed[memory] = %v (present=%t) after re-create, want >= %s", mem, ok, vmMemoryOverhead.String())
+		}
+	})
+}
+
+// captureLogs redirects the default slog logger to an in-memory buffer for the duration of
+// the test (restored on t.Cleanup) so a subtest can assert an anomaly was logged. Tests in
+// this package run sequentially (no t.Parallel), so swapping the process-global default
+// logger is safe.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// TestProvisionReconcilesNodeSelectorAndHandler is the B49 gate: the vm-RuntimeClass reconcile
+// repairs the k3sm-owned MANAGED SHAPE (scheduling.nodeSelector VZ pin), not just Overhead. It
+// proves the four load-bearing properties the pre-build critiques converged on:
+//
+//   - nodeSelector is a per-key FLOOR-merge that PRESERVES operator-added keys (never a
+//     wholesale clobber that would strip an operator key and widen vm placement);
+//   - the IMMUTABLE handler is COMPARE-and-WARNED, NEVER Update-repaired (an Update carrying a
+//     handler change is rejected Invalid at the apiserver and would block the whole repair);
+//   - the two repairs COMPOSE by call-then-accumulate — a single Update fixes BOTH dimensions
+//     (a `||` short-circuit would leave one unrepaired);
+//   - the TOCTOU concurrent-re-create path does a SINGLE bounded re-Get and heals (no livelock).
+func TestProvisionReconcilesNodeSelectorAndHandler(t *testing.T) {
+	ctx := context.Background()
+
+	getClass := func(t *testing.T, cs *fake.Clientset) *nodev1.RuntimeClass {
+		t.Helper()
+		rc, err := cs.NodeV1().RuntimeClasses().Get(ctx, Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get vm runtime class: %v", err)
+		}
+		return rc
+	}
+
+	// missing-nodeSelector repaired: a "vm" class whose nodeSelector carries a WRONG
+	// virtualization value (otherwise a current shape) is repaired to LabelTrue in exactly one
+	// Update — proving compare-and-set on the k3sm-owned key.
+	t.Run("missing-nodeSelector repaired", func(t *testing.T) {
+		rc := desiredRuntimeClass()
+		rc.Scheduling = &nodev1.Scheduling{NodeSelector: map[string]string{LabelVirtualization: "false"}}
+		cs := fake.NewClientset(rc)
+		var updates int
+		countUpdates(cs, &updates)
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision: %v", err)
+		}
+		if updates != 1 {
+			t.Errorf("reconcile issued %d Update(s), want exactly 1 (the wrong nodeSelector value must be repaired)", updates)
+		}
+		got := getClass(t, cs)
+		if got.Scheduling == nil || got.Scheduling.NodeSelector[LabelVirtualization] != LabelTrue {
+			t.Errorf("nodeSelector[%s] = %+v, want %q restored", LabelVirtualization, got.Scheduling, LabelTrue)
+		}
+		if len(got.Scheduling.NodeSelector) != 1 {
+			t.Errorf("nodeSelector = %v, want exactly the single virtualization key (no key added)", got.Scheduling.NodeSelector)
+		}
+	})
+
+	// operator-key PRESERVED: the floor-merge proof. A class whose nodeSelector is MISSING the
+	// k3sm key but carries an operator-added key must have the k3sm key restored while the
+	// operator key SURVIVES — a wholesale replace with {virtualization:true} would strip it and
+	// WIDEN vm placement, relaxing confinement (the key security assertion).
+	t.Run("operator-key preserved", func(t *testing.T) {
+		rc := desiredRuntimeClass()
+		rc.Scheduling = &nodev1.Scheduling{NodeSelector: map[string]string{"example.com/zone": "z1"}}
+		cs := fake.NewClientset(rc)
+		var updates int
+		countUpdates(cs, &updates)
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision: %v", err)
+		}
+		if updates != 1 {
+			t.Errorf("reconcile issued %d Update(s), want exactly 1 (the absent k3sm key must be re-pinned)", updates)
+		}
+		got := getClass(t, cs)
+		if got.Scheduling == nil || got.Scheduling.NodeSelector[LabelVirtualization] != LabelTrue {
+			t.Errorf("nodeSelector[%s] = %+v, want %q re-pinned", LabelVirtualization, got.Scheduling, LabelTrue)
+		}
+		if got.Scheduling.NodeSelector["example.com/zone"] != "z1" {
+			t.Errorf("operator key example.com/zone lost: %v — a floor-merge must NOT wipe operator-added keys (a wholesale clobber would widen vm placement)", got.Scheduling.NodeSelector)
+		}
+	})
+
+	// wrong-Handler → Warn, NEVER Updated: the CRITICAL proof. RuntimeClass.Handler is immutable
+	// at the apiserver, so it must be compare-and-warned, never Update-repaired. The seeded class
+	// has a WRONG handler but a CORRECT nodeSelector + Overhead, so the shape is otherwise current
+	// — a correct implementation issues NO Update at all. A tripwire "update" reactor emulates the
+	// apiserver's immutable-field rejection (NewInvalid) if any Update carries a changed handler:
+	// it must never fire, and Provision must return nil and log the anomaly.
+	t.Run("wrong-handler warns, never updated", func(t *testing.T) {
+		const storedHandler = "operator-bogus"
+		seeded := desiredRuntimeClass()
+		seeded.Handler = storedHandler
+		cs := fake.NewClientset(seeded)
+
+		var updates, handlerChangingUpdates int
+		cs.PrependReactor("update", "runtimeclasses", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			updates++
+			obj := a.(k8stesting.UpdateAction).GetObject().(*nodev1.RuntimeClass)
+			if obj.Handler != storedHandler {
+				// Emulate the apiserver rejecting a change to the immutable handler field —
+				// the fake tracker otherwise applies any Update blindly.
+				handlerChangingUpdates++
+				return true, nil, apierrors.NewInvalid(
+					nodev1.SchemeGroupVersion.WithKind("RuntimeClass").GroupKind(), Name,
+					field.ErrorList{field.Forbidden(field.NewPath("handler"), "field is immutable")})
+			}
+			return false, nil, nil
+		})
+
+		logs := captureLogs(t)
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision must be nil for a wrong-handler-only class (handler is compare-and-warn, not Update-repaired), got %v", err)
+		}
+		if updates != 0 {
+			t.Errorf("Provision issued %d Update(s) for a wrong-handler-only, otherwise-current class, want 0 (handler is never Update-repaired; nodeSelector + Overhead are already correct)", updates)
+		}
+		if handlerChangingUpdates != 0 {
+			t.Errorf("Provision issued %d Update(s) carrying a handler CHANGE, want 0 — RuntimeClass.Handler is immutable and must NEVER be Update-repaired", handlerChangingUpdates)
+		}
+		if got := getClass(t, cs); got.Handler != storedHandler {
+			t.Errorf("stored handler = %q, want %q untouched (the immutable handler must never be mutated)", got.Handler, storedHandler)
+		}
+		if !strings.Contains(logs.String(), "immutable handler") {
+			t.Errorf("expected a WarnContext about the unexpected immutable handler; logs:\n%s", logs.String())
+		}
+	})
+
+	// wrong-handler WITH a stale nodeSelector → the repair Update FIRES and MUST carry the stored
+	// (unchanged) handler: the regression-fence for the CRITICAL invariant. Unlike the
+	// wrong-handler-only case (0 Updates, tripwire never fires), the missing VZ key here forces an
+	// Update — and it must carry existing.Handler UNCHANGED, or the apiserver's immutable-field check
+	// rejects the whole write and the security-critical nodeSelector repair is LOST. A future
+	// `existing.Handler = desired.Handler` edit makes the tripwire fire → this subtest goes red.
+	t.Run("wrong-handler with stale nodeSelector: repair Update carries the stored handler", func(t *testing.T) {
+		const storedHandler = "operator-bogus"
+		seeded := desiredRuntimeClass()
+		seeded.Handler = storedHandler
+		seeded.Scheduling = &nodev1.Scheduling{NodeSelector: map[string]string{}} // VZ key MISSING → forces a repair Update
+		cs := fake.NewClientset(seeded)
+
+		var updates, handlerChangingUpdates int
+		cs.PrependReactor("update", "runtimeclasses", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			updates++
+			obj := a.(k8stesting.UpdateAction).GetObject().(*nodev1.RuntimeClass)
+			if obj.Handler != storedHandler {
+				handlerChangingUpdates++
+				return true, nil, apierrors.NewInvalid(
+					nodev1.SchemeGroupVersion.WithKind("RuntimeClass").GroupKind(), Name,
+					field.ErrorList{field.Forbidden(field.NewPath("handler"), "field is immutable")})
+			}
+			return false, nil, nil
+		})
+
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision must land the nodeSelector repair despite the wrong immutable handler, got %v", err)
+		}
+		if handlerChangingUpdates != 0 {
+			t.Errorf("the repair Update carried a handler CHANGE (%d) — the apiserver would reject it Invalid and DROP the nodeSelector repair; the Update must carry the stored handler unchanged", handlerChangingUpdates)
+		}
+		if updates != 1 {
+			t.Errorf("Provision issued %d Update(s), want exactly 1 (the nodeSelector repair)", updates)
+		}
+		got := getClass(t, cs)
+		if got.Scheduling == nil || got.Scheduling.NodeSelector[LabelVirtualization] != LabelTrue {
+			t.Errorf("nodeSelector[%s] not repaired: %+v — the security-critical repair must land even with a wrong immutable handler", LabelVirtualization, got.Scheduling)
+		}
+		if got.Handler != storedHandler {
+			t.Errorf("stored handler = %q, want %q untouched", got.Handler, storedHandler)
+		}
+	})
+
+	// both-stale → exactly ONE Update, both repaired: the short-circuit proof. A class with BOTH
+	// a missing nodeSelector key AND a below-floor Overhead must be repaired in a SINGLE Update
+	// with both dimensions fixed. A `reconcileManagedShape(...) || reconcileOverhead(...)` would
+	// short-circuit and leave the second dimension unrepaired — asserting both are fixed catches
+	// the bug regardless of the operands' order.
+	t.Run("both-stale repaired in one update", func(t *testing.T) {
+		rc := desiredRuntimeClass()
+		rc.Scheduling = &nodev1.Scheduling{NodeSelector: map[string]string{}}
+		rc.Overhead = &nodev1.Overhead{PodFixed: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("100Mi")}}
+		cs := fake.NewClientset(rc)
+		var updates int
+		countUpdates(cs, &updates)
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision: %v", err)
+		}
+		if updates != 1 {
+			t.Errorf("Provision issued %d Update(s), want exactly 1 — call-then-accumulate repairs BOTH dimensions in one Update", updates)
+		}
+		got := getClass(t, cs)
+		if got.Scheduling == nil || got.Scheduling.NodeSelector[LabelVirtualization] != LabelTrue {
+			t.Errorf("nodeSelector[%s] not repaired: %+v (a || short-circuit on overhead-first would skip the shape repair)", LabelVirtualization, got.Scheduling)
+		}
+		if mem := got.Overhead.PodFixed[corev1.ResourceMemory]; mem.Cmp(vmMemoryOverhead) < 0 {
+			t.Errorf("Overhead.PodFixed[memory] = %s, want >= %s (a || short-circuit on shape-first would skip the overhead repair)", mem.String(), vmMemoryOverhead.String())
+		}
+	})
+
+	// idempotent → 0 Updates: a fully-current managed shape (nodeSelector + Overhead) makes no
+	// Update — no churn / HA-churn on restart.
+	t.Run("idempotent makes no update", func(t *testing.T) {
+		cs := fake.NewClientset(desiredRuntimeClass())
+		var updates int
+		countUpdates(cs, &updates)
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision: %v", err)
+		}
+		if updates != 0 {
+			t.Errorf("Provision issued %d Update(s) on an already-current class, want 0 (no churn)", updates)
+		}
+	})
+
+	// TOCTOU re-create-AlreadyExists → heal: the class is deleted between the initial Create
+	// (AlreadyExists) and the Get (NotFound); the re-Create also loses to a concurrent creator
+	// (AlreadyExists); the SINGLE bounded re-Get then finds a MALFORMED concurrent object (missing
+	// nodeSelector), which Provision heals. Reactors drive the race: Create always AlreadyExists,
+	// Get is NotFound on the first call then passes through to the seeded malformed object. The
+	// re-Get must be single (gets == 2 during Provision) — no unbounded create→AlreadyExists→re-Get
+	// livelock.
+	t.Run("toctou concurrent re-create healed", func(t *testing.T) {
+		malformed := desiredRuntimeClass()
+		malformed.Scheduling = &nodev1.Scheduling{NodeSelector: map[string]string{}} // the concurrent object lost the VZ pin
+		cs := fake.NewClientset(malformed)
+
+		var creates, gets int
+		cs.PrependReactor("create", "runtimeclasses", func(k8stesting.Action) (bool, runtime.Object, error) {
+			creates++
+			return true, nil, apierrors.NewAlreadyExists(nodev1.Resource("runtimeclasses"), Name)
+		})
+		cs.PrependReactor("get", "runtimeclasses", func(k8stesting.Action) (bool, runtime.Object, error) {
+			gets++
+			if gets == 1 {
+				return true, nil, apierrors.NewNotFound(nodev1.Resource("runtimeclasses"), Name)
+			}
+			return false, nil, nil // the re-Get (and later reads) pass through to the tracker
+		})
+
+		if err := Provision(ctx, cs); err != nil {
+			t.Fatalf("Provision must heal the concurrent object and return nil, got %v", err)
+		}
+		if creates != 2 {
+			t.Errorf("Create called %d time(s) during Provision, want exactly 2 (initial + a single re-create) — the TOCTOU path must be bounded", creates)
+		}
+		if gets != 2 {
+			t.Errorf("Get called %d time(s) during Provision, want exactly 2 (initial NotFound + a SINGLE bounded re-Get) — no create→AlreadyExists→re-Get livelock", gets)
+		}
+		got := getClass(t, cs)
+		if got.Scheduling == nil || got.Scheduling.NodeSelector[LabelVirtualization] != LabelTrue {
+			t.Errorf("concurrent object not healed: nodeSelector = %+v, want %s=%s repaired", got.Scheduling, LabelVirtualization, LabelTrue)
 		}
 	})
 }
