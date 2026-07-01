@@ -45,6 +45,34 @@ limitations under the License.
 // fail-closed by absence: a vm pod naming an unprovisioned RuntimeClass is rejected
 // at admission.
 //
+// # Two-guard defense-in-depth (what B49's reconcile self-heals)
+//
+// The vm confinement is defended at TWO independent layers; B49's reconcile
+// (Provision → reconcileManagedShape) self-heals the FIRST:
+//
+//   - Guard #1 — SCHEDULING: the vm RuntimeClass's scheduling.nodeSelector VZ pin
+//     (LabelVirtualization=LabelTrue). The kube RuntimeClass admission plugin merges it
+//     into every spec.runtimeClassName: vm pod, confining the pod to VZ-capable nodes.
+//     This is a k3sm-owned, MUTABLE shape, so Provision reconciles it in place: a class
+//     hand-edited or laid down by an older k3sm that lost the pin is repaired via a
+//     per-key floor-merge that PRESERVES operator-added keys (a wholesale clobber would
+//     strip an operator key and WIDEN placement, relaxing confinement).
+//   - Guard #2 — RUNTIME: runtimed's sandbox.SelectBackend, keyed on the POD's own
+//     runtimeClassName (through the compile-time apis handler→backend table, NOT the
+//     RuntimeClass object), REFUSES a vm-stamped pod on a non-VZ node with
+//     sandbox.ErrBackendUnavailable rather than downgrade to a weaker rung.
+//
+// Honest severity framing: because guard #2 is keyed on the pod, a MALFORMED guard #1
+// (a "vm" class that lost its nodeSelector) can at worst let a vm pod SCHEDULE onto a
+// non-VZ node, where runtimed then REFUSES it — an AVAILABILITY failure, NOT an isolation
+// escape (the pod never runs unconfined). B49 is defense-in-depth robustness of guard #1,
+// with guard #2 as the fail-closed backstop. (Today all vm pods are Unschedulable — no
+// node is VZ-labelled yet — so B49 protects the FUTURE VZ mechanism.) The class's handler
+// half is IMMUTABLE at the apiserver, so Provision compares and WARNS on a wrong handler
+// but never Update-repairs it (an Update carrying a handler change is rejected Invalid and
+// would block the nodeSelector repair); a wrong handler is itself fail-closed via guard
+// #2's runtimev1.ErrUnknownHandler.
+//
 // # Provisioning lifecycle (mirrors pkg/policy / pkg/rbac)
 //
 // Provision runs in cmd/k3sm/server.go's provisioning slot after the apiserver is
