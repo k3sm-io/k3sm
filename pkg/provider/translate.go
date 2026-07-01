@@ -247,9 +247,11 @@ func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
 //
 // A nil c yields (nil, 0): no extra searches, "keep the cluster base ndots". searches
 // is the pod's spec.dnsConfig.searches verbatim. ndots scans c.Options for the first
-// "ndots" entry: a non-negative integer value (strconv.Atoi) becomes the override;
-// anything else — absent, nil/empty, unparseable, or negative — yields 0, which
-// dns.MergeDNSConfig reads as "keep base".
+// "ndots" entry: a non-negative integer value (strconv.Atoi) becomes the override,
+// CLAMPED to [0,15] (the resolv.conf RES_MAXNDOTS ceiling) BEFORE the int32 narrowing
+// so an absurd value (>=2^31) cannot wrap negative and be silently dropped as
+// keep-base; anything else — absent, nil/empty, unparseable, or negative — yields 0,
+// which dns.MergeDNSConfig reads as "keep base".
 //
 // DEFERRED to B20b (the apis wave): c.Nameservers (the single-server shim ABI carries
 // exactly one server — the cluster VIP), an explicit `ndots: 0` (the int32 path cannot
@@ -270,6 +272,14 @@ func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) 
 		// `ndots: 0` is indistinguishable from unset in this int32 path — deferred to B20b.
 		if v := c.Options[i].Value; v != nil {
 			if n, err := strconv.Atoi(*v); err == nil && n >= 0 {
+				// Clamp to the resolv.conf ndots ceiling (15, RES_MAXNDOTS) BEFORE the
+				// int32 narrowing: an absurd value (>=2^31) would otherwise wrap negative
+				// and be silently dropped by MergeDNSConfig as keep-base, masking the
+				// misconfig. Clamping the int first fails predictably (→ 15). strconv.Atoi
+				// already returns ErrRange for values beyond int64, so those keep base.
+				if n > 15 {
+					n = 15
+				}
 				ndots = int32(n)
 			}
 		}

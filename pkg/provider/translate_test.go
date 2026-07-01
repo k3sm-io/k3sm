@@ -506,6 +506,43 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 	})
 }
 
+// TestDNSConfigOverrideClampsNdots is the k3sm-side B47 gate: dnsConfigOverride
+// clamps a pod's spec.dnsConfig ndots to [0,15] (the resolv.conf RES_MAXNDOTS
+// ceiling) BEFORE the int32 narrowing, so an absurd value in the overflow band
+// (>=2^31) cannot wrap negative and be silently discarded by dns.MergeDNSConfig as
+// keep-base — which would mask the misconfig. The darwin-net gate covers only
+// ConfigToEnv, so this is the sole gate on the k3sm pre-cast clamp. The 2147483648
+// case is the regression pin: on main int32(2147483648) == -2147483648 (fails-before),
+// the pre-cast clamp yields 15 (passes-after).
+func TestDNSConfigOverrideClampsNdots(t *testing.T) {
+	ndotsCfg := func(v string) *corev1.PodDNSConfig {
+		return &corev1.PodDNSConfig{
+			Options: []corev1.PodDNSConfigOption{{Name: "ndots", Value: ptr(v)}},
+		}
+	}
+	tests := []struct {
+		name string
+		cfg  *corev1.PodDNSConfig
+		want int32
+	}{
+		{name: "in-range unchanged", cfg: ndotsCfg("2"), want: 2},
+		{name: "boundary 15 unchanged", cfg: ndotsCfg("15"), want: 15},
+		{name: "over-ceiling clamps down", cfg: ndotsCfg("1000"), want: 15},
+		{name: "overflow band clamps to 15 not negative", cfg: ndotsCfg("2147483648"), want: 15},
+		{name: "negative keeps base", cfg: ndotsCfg("-1"), want: 0},
+		{name: "unparseable keeps base", cfg: ndotsCfg("abc"), want: 0},
+		{name: "nil config keeps base", cfg: nil, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ndots := dnsConfigOverride(tt.cfg)
+			if ndots != tt.want {
+				t.Errorf("dnsConfigOverride ndots = %d, want %d (pre-cast clamp to [0,15])", ndots, tt.want)
+			}
+		})
+	}
+}
+
 // countToken counts how many times tok appears in toks (a test helper for the
 // dedupe/cap assertions).
 func countToken(toks []string, tok string) int {
