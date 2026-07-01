@@ -234,7 +234,16 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runti
 	// the cluster server VIP.
 	if clusterDNSPolicy(pod.Spec.DNSPolicy) && pod.Spec.DNSConfig != nil {
 		searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
-		dnsCfg = dns.MergeDNSConfig(dnsCfg, searches, ndots)
+		var dropped int
+		dnsCfg, dropped = dns.MergeDNSConfig(dnsCfg, searches, ndots)
+		if dropped > 0 {
+			// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
+			// deliberate divergence from upstream's 32); the tail was truncated. Log once
+			// here at the corev1-aware boundary WITH pod identity — the darwin-net merge
+			// primitive stays pure and returns the count rather than logging blind.
+			r.log.WarnContext(ctx, "pod dnsConfig search list truncated to the in-pod cap",
+				"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
+		}
 	}
 	box, err := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg)
 	if err != nil {
