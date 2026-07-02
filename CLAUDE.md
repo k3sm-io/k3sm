@@ -6,6 +6,7 @@ runtime), control-plane embedding (M1), launchd/packaging. Imports `k3sm.io/{api
 
 > Product design: `docs/DESIGN.md`. Milestones: `docs/M0-spike.md`, `docs/M0-node.md`. Spike: `hack/spike/run.sh`.
 > Roadmap & current phase: `docs/PHASES.md` (workspace matrix: `../ROADMAP.md`). Acceptance gates: `hack/acceptance/`.
+> Public roadmap narrative: `ROADMAP.md` (hand-written; the workspace `../ROADMAP.md` is the machine matrix).
 
 ## Build / test
 ```sh
