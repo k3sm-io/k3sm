@@ -6,7 +6,7 @@ Mach-O processes, **zero Linux, no VM in the default path** — using macOS's ow
 (Seatbelt, `lo0`/vmnet, wireguard-go, launchd, APFS) instead of Linux's (cgroups, namespaces,
 iptables, systemd, OverlayFS).
 
-> Target install UX: `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server`.
+> Target install UX (landing in M7): `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server`.
 
 ## Repositories (one Go workspace under `k3sm-io/`)
 | Repo | Module | Role (k3s analog) |
@@ -17,25 +17,42 @@ iptables, systemd, OverlayFS).
 | [apis](https://github.com/k3sm-io/apis) | `k3sm.io/apis` | shared gRPC / CRD / Go contracts |
 
 ## Status
-**Pre-M0 scaffold.** The full architecture, the macOS-26 adversarial red-team findings that shaped
-it, and the milestone roadmap live in **[docs/DESIGN.md](docs/DESIGN.md)**.
 
-## Planned layout
+**Pre-release.** The engine (**M0–M6**) is code-complete and workspace-integration-green: native
+Seatbelt-isolated pods, a single `k3sm server` embedding the upstream control plane over kine, lo0
+IP-per-pod + a userspace Service proxy, a wireguard mesh for multi-node, local-path storage, and
+RBAC. M0/M1 are validated end-to-end; the remaining live-hardware and two-Mac acceptance gates, the
+packaging/signing pipeline, and the `vm` RuntimeClass / HA lab validation are burned down in **M7
+(public release)** and **M8 (MLX — native Apple-Silicon ML serving)**.
+
+See the hand-written [**ROADMAP.md**](ROADMAP.md) for the Shipped / Next / Future narrative, and
+[**docs/DESIGN.md**](docs/DESIGN.md) for the full architecture and the macOS-26 red-team findings
+that shaped it.
+
+## Layout
 ```
-cmd/k3sm/            single-binary entrypoint (server | agent | install | token | build | …)
-pkg/executor/embed/  in-process apiserver/scheduler/controller-manager (k3s pattern)
-pkg/datastore/       kine + SQLite
-pkg/bootstrap/ cert/ token, node-password, HTTP-CSR, cluster CA
-pkg/provider/        Virtual Kubelet Darwin provider (logs/exec/top)
-pkg/launchd/         LaunchDaemon + app-bundle packaging
-pkg/image/           OCI artifact build/pull (oras)
-pkg/deploy/          embedded addons (CoreDNS, CRDs, RBAC)
+cmd/k3sm/         single-binary entrypoint (server | agent | node | install | uninstall | token | kubectl | kubeconfig | netd)
+pkg/executor/     in-process apiserver/scheduler/controller-manager + kine datastore
+pkg/provider/     Virtual Kubelet Darwin provider (logs/exec/top/port-forward)
+pkg/bootstrap/    token / node-password / HTTP-CSR / cluster CA
+pkg/certs/        certificate authorities and issuance
+pkg/netserve/     worker-node network bringup
+pkg/netdsvc/      the root k3sm-netd helper client (lo0 / utun / pf / <1024 bind)
+pkg/hostnet/      host networking primitives
+pkg/policy/       admission (darwin nodeSelector, Warn policies)
+pkg/rbac/         fail-closed RBAC provisioner (node-datapath ClusterRole)
+pkg/provisioner/  local-path storage provisioner
+pkg/runtimeclass/ RuntimeClass provisioning (incl. the vm class)
+pkg/install/      LaunchDaemon install/uninstall
+pkg/loadbalancer/ client-side apiserver load balancer (HA)
 ```
 
 ## Develop
 ```sh
-# from the workspace root /Users/operator/Code/k3sm-io
-go build ./k3sm/cmd/k3sm   # builds the (stub) binary
+# from the workspace root /Users/operator/Code/k3sm-io (go.work spans all four modules)
+go build ./...
+go test ./...
+cd k3sm && CGO_ENABLED=1 go build ./...   # k3sm embeds kine → cgo
 ```
 
 ## License

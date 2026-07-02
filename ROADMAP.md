@@ -1,0 +1,77 @@
+# k3sm roadmap
+
+> **Hand-written public roadmap narrative.** The machine-derived engineering matrix is the
+> workspace [`ROADMAP.md`](../ROADMAP.md); the per-repo `docs/PHASES.md` are the source of truth.
+> **Never regenerated — edit by hand.** (Do not run `/roadmap-sync` into this file.)
+
+k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/arm64 analog of
+[k3s](https://github.com/k3s-io/k3s). Pods run as **native Darwin processes: zero Linux, no VM in
+the default path**, isolated with macOS's own primitives (Seatbelt, `lo0`/vmnet, wireguard-go,
+launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS).
+
+This is a k3s-style three-horizon roadmap. Honesty is a feature: where a capability is
+code-complete but not yet proven on real hardware, this page says so. The forthcoming
+`docs/user/limitations.md` (landing in M7) is the canonical honest-tradeoffs page.
+
+## Shipped
+
+The engine. Milestones **M0–M6** are code-complete and workspace-integration-green (`hack/ci.sh`);
+M0/M1 are validated end-to-end by their acceptance gates, and the remaining live-hardware and
+two-Mac gates are burned down in M7 (see [`docs/m7-plan.md`](../docs/m7-plan.md)). What works:
+
+- **Native Darwin-process pods, zero Linux.** OCI images ship an arm64 Mach-O payload (never
+  `/System`); the runtime `posix_spawn`s them **in place at host paths** — no chroot, SIP-compatible.
+  *(validated on macOS 26.5.1)*
+- **Seatbelt isolation.** A generated **default-deny SBPL profile** per pod (read `/System`+the pod
+  dir, write only the pod's APFS data volume, network scoped to the pod IP). *(validated)*
+- **One `k3sm server`.** A single binary embeds the upstream apiserver / scheduler /
+  controller-manager (built from source for darwin/arm64) over **kine → SQLite**, plus the Virtual
+  Kubelet Darwin node, a userspace Service proxy, and DNS.
+- **Pod networking.** IP-per-pod on `lo0` aliases (XNU preserves the bound source IP — no NAT),
+  a userspace ClusterIP/NodePort Service proxy, and a per-node DNS resolver.
+- **Multi-node mesh.** A **wireguard-go** userspace mesh over root utun; peers join with one token;
+  public keys distributed via a `MeshPeer` CRD. *(code-complete; the two-Mac e2e is a lab gate)*
+- **Local-path storage.** A local-path provisioner with node-affinity PVs + StatefulSet identity.
+- **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
+  (workloads must select `kubernetes.io/os=darwin`). *(code-complete; the live RBAC flip is a
+  dev-mac gate)*
+- **`vm` RuntimeClass (EXPERIMENTAL).** A fail-closed dispatch to a Virtualization.framework Linux
+  micro-VM for Linux-only images (e.g. Postgres). *(foundation code-complete; the live VM boot needs
+  a VZ Mac + entitlement — ships EXPERIMENTAL)*
+- **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
+  with an identical-CA bundle. *(code-complete; the live 2-Mac+Postgres failover is a lab gate)*
+
+## Next — v0.1.0 (the public release, with MLX)
+
+The first public release. Two tracks, both launch-blocking:
+
+- **Ship it.** `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server`: a signed, notarized
+  binary via goreleaser, GitHub Actions CI across all repos, user docs (`docs/user/`, including
+  `limitations.md`), and the website. See [`docs/m7-plan.md`](../docs/m7-plan.md).
+- **MLX — the differentiator.** Native Apple-Silicon ML serving: schedule and serve ML models on
+  Apple GPUs / unified memory with first-class Kubernetes semantics. An **`MLXModel` CRD**
+  (`mlx.k3sm.io/v1alpha1`) + an `mlx.k3sm.io/gpu` **extended resource** + an in-binary operator that
+  reconciles a model to a StatefulSet + Service serving an OpenAI-compatible API. This is the
+  **NVIDIA-GPU-Operator analog for Mac** — running LLMs on a Mac mini as a k3sm pod is the launch
+  story. See [`docs/m8-plan.md`](../docs/m8-plan.md).
+
+Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook,
+[`docs/m9-plan.md`](../docs/m9-plan.md).
+
+## Future — post-v0.1.0
+
+- **De-EXPERIMENTAL the `vm` RuntimeClass and HA** — the v0.2 / v0.3 headlines, once lab-validated
+  on real hardware (VZ Mac; two Macs + Postgres).
+- **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
+- **DRA** — Dynamic Resource Allocation for GPUs, once extended resources have shipped.
+- **JACCL / distributed inference** — multi-Mac model sharding (the reserved `MLXModel.Distributed`
+  seam + the already-rendered headless governing Service).
+- **Autoscaling** — scale-to-zero / activator-fronted model serving.
+
+### Non-goals (deliberate)
+
+- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images route to the
+  EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack), never the default path.
+- **A single node is one trust domain.** Same-node pods share `lo0` and a uid — Seatbelt bounds
+  filesystem/network *reach*, but there are no per-pod network namespaces or uid isolation.
+  Untrusted multi-tenancy is out of scope for the native path; use the `vm` RuntimeClass.
