@@ -21,10 +21,9 @@ package main
 import (
 	"fmt"
 	"os"
-)
 
-// version is overridden at build time via -ldflags "-X main.version=...".
-var version = "0.0.0-dev"
+	"k3sm.io/k3sm/pkg/version"
+)
 
 const usage = `k3sm %s — Kubernetes for macOS, natively
 
@@ -47,15 +46,16 @@ See docs/DESIGN.md for the roadmap.
 `
 
 func main() {
+	ver := version.Get()
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, usage, version)
+		fmt.Fprintf(os.Stderr, usage, ver.Version)
 		os.Exit(2)
 	}
 	switch os.Args[1] {
 	case "version", "-v", "--version":
-		fmt.Printf("k3sm %s\n", version)
+		fmt.Print(ver)
 	case "-h", "--help", "help":
-		fmt.Printf(usage, version)
+		fmt.Printf(usage, ver.Version)
 	case "server":
 		if err := runServer(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm server:", err)
@@ -103,7 +103,7 @@ func main() {
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "k3sm: unknown command %q (pre-M0 scaffold)\n\n", os.Args[1])
-		fmt.Fprintf(os.Stderr, usage, version)
+		fmt.Fprintf(os.Stderr, usage, ver.Version)
 		os.Exit(2)
 	}
 }
