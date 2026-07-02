@@ -60,6 +60,14 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook,
 
 ## Future — post-v0.1.0
 
+- **Kubernetes conformance hardening (M10)** — get as close to standard k8s as the Darwin substrate
+  honestly allows. k3sm already embeds the real apiserver/scheduler/controller-manager, so the whole
+  control-plane API surface is genuine; M10 closes the achievable gaps at the node/network/storage
+  edge: per-pod IPs (unblocking headless/SRV/StatefulSet DNS), an in-process Ingress controller +
+  LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
+  logging, node lifecycle Events. The honest "where we are vs upstream k8s" register lives at
+  `docs/UPSTREAM-ALIGNMENT.md`; the self-assessment (k3sm cannot pass Sonobuoy `[Conformance]` — it
+  has no Linux containers — but targets a documented subset) at `docs/conformance-profile.md`.
 - **De-EXPERIMENTAL the `vm` RuntimeClass and HA** — the v0.2 / v0.3 headlines, once lab-validated
   on real hardware (VZ Mac; two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
