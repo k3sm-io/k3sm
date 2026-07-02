@@ -502,6 +502,28 @@ phases:
             met: false
             check: "hack/acceptance/m8.sh green on an apple-gpu dev-mac: MLXModel → Ready → an OpenAI completion via the ClusterIP returns tokens → delete → every operator-owned object gone + PVC disposition exactly per whenDeleted:Delete."
             method: e2e
+
+  - id: M9
+    title: Public launch — the flip, the gates, the announcement (WITH MLX v1)
+    status: todo
+    strategy: hard cut
+    note: "LEDGER STUB (authoritative runbook: docs/m9-plan.md — its Phase B resolutions bind). No new product code — M9 is the launch checklist. IRREVERSIBLE: repos-public + tagged module versions are forever (sumdb pins tags). Gate hack/acceptance/m9.sh is a manual:true phases.json row (a launch is a human act; /orchestrate never auto-greens it) that machine-enumerates the launch-blocking ledger (m2/m3/m4 dev-mac, lab/m3 two-Mac, m7 umbrella + lab/m7 reboot-via-real-brew-artifact, m7/{ci,docs,hygiene}, verify-vanity, m8.sh MLX e2e, B28 disposition). M5 (vm) + M6 (HA) ship documented EXPERIMENTAL — NOT launch-blocking, the v0.2/v0.3 headlines. Degraded brew-only profile is the only sanctioned Apple-enrollment fallback (security-engineer co-signed)."
+    depends_on:
+      - k3sm:M7
+      - k3sm:M8
+    subphases:
+      - id: M9.1
+        title: launch checklist — pre-flight, flip, tag v0.1.0, verify, announce
+        status: todo
+        deliverables:
+          - id: M9.1-d1
+            done: false
+            desc: "STUB (docs/m9-plan.md). The 8-step flip runbook: rc dry-run (v0.1.0-rc.1, cross-repo GitHub App read credential, brews.skip_upload:auto, lab/m7.sh rc-mode local-formula install) → same-day m9.sh pre-flight (rotation verified-complete before flip) → repos public apis→runtimed+darwin-net→k3sm one sitting (repo-settings.sh per flip incl. v* tag protection + release-env) → GHCR mlx-serve public → site deploy at commit (re-deploy after tag) → tag v0.1.0 ×4 same SHA set → outside-world verify (clean-Mac brew install + MLXModel demo + proxy.golang.org ×4 modules post-tag) → announce after a settle window. Announcement assets (blog 'Kubernetes with zero Linux', MLX demo asciinema, comparison table, limitations.md linked) staged in M7.3/M8."
+        acceptance:
+          - id: M9.1-a1
+            met: false
+            check: "K3SM_LAB=1 hack/acceptance/m9.sh green (every launch-blocking ledger row green or its disposition satisfied); then the outside-world verify on a clean Mac (brew install → cluster Ready → MLXModel Ready → chat completion) succeeds and go mod download of all four modules @v0.1.0 resolves via proxy.golang.org."
+            method: e2e
 ---
 
 # k3sm — Phase roadmap
