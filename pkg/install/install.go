@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 )
 
 // Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
@@ -264,6 +265,26 @@ func NetdPlist(cfg Config) []byte {
 	})
 }
 
+// serverFileLimit is the soft+hard RLIMIT_NOFILE (launchd NumberOfFiles) the
+// server LaunchDaemon requests. The server process hosts the Service proxy / UDP
+// relay, whose flow budget darwin-net sizes as max(8192, rl.Cur/2) (B48's
+// defaultUDPFlowBudget) — so the fd table it reads must be raised above launchd's
+// 256 default, which floors the budget at 8192 with NO headroom for the
+// co-resident apiserver/kine.
+//
+// 131072 is deliberate: it is ≤ kern.maxfilesperproc (245760 on Apple Silicon) so
+// it BINDS. The k3s Linux value (1048576) EXCEEDS the macOS per-process ceiling
+// and would be clamped by the kernel, voiding the budget's half-for-UDP /
+// half-for-control-plane split. 131072 yields a UDP flow budget of 65536
+// (rl.Cur/2), ~8× the 8192 floor, leaving the control plane the other half.
+//
+// RELOAD CONTRACT: launchd applies *ResourceLimits at process SPAWN from the job
+// definition captured at bootstrap — so this raised limit binds on a FRESH
+// install or an uninstall→install (bootout→bootstrap), NOT on
+// `launchctl kickstart -k`, which respawns the existing in-memory job with the
+// OLD limit. Existing installs need a reinstall for the new limit to bind.
+const serverFileLimit = 131072
+
 // ServerPlist renders the io.k3sm.server LaunchDaemon plist. It runs as the
 // unprivileged _k3sm user (UserName) execing `k3sm server` (the control plane +
 // VK node), which reaches the root helper over the netd socket. KeepAlive +
@@ -284,6 +305,10 @@ func ServerPlist(cfg Config) []byte {
 		StdoutPath:       filepath.Join(LogDir, "server.log"),
 		StderrPath:       filepath.Join(LogDir, "server.log"),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
+		// Server-only: raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes
+		// against a real fd table, not launchd's 256 default. Binds at bootstrap,
+		// not on kickstart -k — see the serverFileLimit reload contract above.
+		SoftFileLimit: serverFileLimit,
 	})
 }
 
@@ -325,6 +350,9 @@ type launchdPlist struct {
 	StdoutPath       string
 	StderrPath       string
 	EnvironmentVars  map[string]string
+	// SoftFileLimit, when > 0, emits SoftResourceLimits + HardResourceLimits with
+	// NumberOfFiles (RLIMIT_NOFILE) at this value. 0 (netd) omits both.
+	SoftFileLimit int
 }
 
 // renderPlist serializes p to a launchd XML property list. String values are
@@ -351,6 +379,17 @@ func renderPlist(p launchdPlist) []byte {
 
 	writeKeyBool(&b, "RunAtLoad", p.RunAtLoad)
 	writeKeyBool(&b, "KeepAlive", p.KeepAlive)
+	if p.SoftFileLimit > 0 {
+		// Emit BOTH Soft and Hard NumberOfFiles: a soft limit may never exceed the
+		// hard one, and an MDM-managed Mac may set a finite launchd hard limit that
+		// would clamp a soft-only raise — launchd (PID 1) can raise the hard limit
+		// up to the kernel ceiling, so we set both to the requested value.
+		for _, key := range []string{"SoftResourceLimits", "HardResourceLimits"} {
+			b.WriteString("  <key>" + key + "</key>\n  <dict>\n    ")
+			writeKeyInt(&b, "NumberOfFiles", p.SoftFileLimit)
+			b.WriteString("  </dict>\n")
+		}
+	}
 	if p.WorkingDirectory != "" {
 		writeKeyString(&b, "WorkingDirectory", p.WorkingDirectory)
 	}
@@ -389,6 +428,14 @@ func writeKeyBool(b *bytes.Buffer, key string, val bool) {
 	} else {
 		b.WriteString("</key>\n  <false/>\n")
 	}
+}
+
+func writeKeyInt(b *bytes.Buffer, key string, val int) {
+	b.WriteString("  <key>")
+	xmlEscape(b, key)
+	b.WriteString("</key>\n  <integer>")
+	b.WriteString(strconv.Itoa(val))
+	b.WriteString("</integer>\n")
 }
 
 func xmlEscape(b *bytes.Buffer, s string) {
