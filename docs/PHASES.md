@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-06-27
-updated_by: orchestrator
+updated: 2026-07-02
+updated_by: roadmap-encoder
 
 phases:
   - id: M0
@@ -249,16 +249,17 @@ phases:
       - darwin-net:M4
     subphases:
       - id: M4.0
-        title: Packaging + launchd + install (single-server)
-        status: todo
+        title: Packaging + launchd + install (single-server) — DESCOPED → k3sm:M7.1
+        status: descoped
+        note: "TOMBSTONE (2026-07): M4.0 is absorbed into M7.1 (release-engineering pipeline). No M4-scope work remains here; the deliverable + acceptance transferred verbatim to M7.1, which carries phases_ref: k3sm M4.0. M4.0-a1 stays met:false and flips ONLY via the M7.1 phases_ref write-through when hack/lab/m7.sh greens in the M7 tail — NOT on any M4-local completion — so M4 does not falsely flip done. Records the transfer per the NodeNetwork no-op convention (apis:M3.2-d3)."
         deliverables:
           - id: M4.0-d1
             done: false
-            desc: "app-bundle-wrapped root LaunchDaemon + k3sm install/uninstall (launchctl bootstrap/kickstart); codesign + notarize + .pkg (raw root utun/pf, no NE); goreleaser → k3sm-io/homebrew-tap; admin kubeconfig dropped to ~/.kube/config on install (k3sm kubeconfig --write). Single-server datastore (kine→SQLite); multi-server HA is M6 (last phase)."
+            desc: "DESCOPED 2026-07 → k3sm:M7.1; deliverable + acceptance transferred verbatim; no M4-scope work remains. The single-server packaging/launchd/install (launchctl bootstrap/kickstart) + codesign/notarize/.pkg + goreleaser → k3sm-io/homebrew-tap + admin-kubeconfig-to-~/.kube/config work now lives in M7.1 (which carries phases_ref: k3sm M4.0). The retired 'app-bundle-wrapped' SHAPE is deliberately NOT transferred (retired by the DESIGN §5c/§8 app-bundle-retirement amendment — M7.1 is authoritative for the shape: raw-utun/pf posture, no app bundle, two signed artifacts k3sm + k3sm-netd). Only the scope + acceptance transfer."
         acceptance:
           - id: M4.0-a1
             met: false
-            check: brew install → sudo k3sm install server → cluster; survives reboot (launchd)
+            check: "brew install → sudo k3sm install server → cluster; survives reboot (launchd). TRANSFERRED verbatim to k3sm:M7.1 — flips met:true ONLY via the M7.1 phases_ref write-through when hack/lab/m7.sh greens in the M7 tail, NOT on any M4-local completion."
             method: e2e
       - id: M4.1
         title: RBAC enforcement (AlwaysAllow → Node,RBAC)
@@ -346,6 +347,160 @@ phases:
           - id: M6.1-a1
             met: false
             check: a second Mac joins as a control-plane server, reconstructs the identical CAs from the bundle, and serves the apiserver against the shared Postgres (lab — 2 macs + postgres)
+            method: e2e
+
+  - id: M7
+    title: Release engineering for the public open-source launch
+    status: todo
+    strategy: hard cut
+    note: "LEDGER STUB (authoritative design: docs/m7-plan.md — the Phase B resolutions bind). k3sm is M7-primary (all six sub-phases M7.0–M7.5); apis/runtimed/darwin-net carry small M7 entries (their ci.yml + K3SM_CI_REQUIRE SkipUnless conversions). Gate machinery: hack/acceptance/m7.sh is the single umbrella gate execing hack/acceptance/m7/{ci,docs,hygiene}.sh (a directory OUTSIDE the m[0-9]*.sh orphan glob); manual:false skeletons exit non-zero unconditionally (Res. 2); the M4-lab row re-points to hack/lab/m7.sh (hack/lab/m4.sh deleted, B35 tombstoned — Res. 3). The kine single-pin (≥0.16.x, CGO_ENABLED=0 pure-Go sqlite) is a hard cut ONLY after datastore compat is verified, else it escapes to the named kine/SQLite datastore-migration exception. Launch itself is M9."
+    depends_on:
+      - apis:M7
+      - runtimed:M7
+      - darwin-net:M7
+    subphases:
+      - id: M7.0
+        title: Validation-debt burn-down
+        status: todo
+        deliverables:
+          - id: M7.0-d1
+            done: false
+            desc: "STUB. Human-at-hardware burn-down of the M2–M6 validation debt (never /go): run m2.sh root demo + m3.sh + m4.sh on the dev Mac (flips the met:false integration-pending acceptances M2-root-e2e / M4.1-a1 live RBAC / M4.2-a1 conformance), the hack/lab/m3.sh two-Mac gate (multi-node is the headline claim), and the B28 dev-mac churn soak (hack/acceptance/m7/soak.sh) against the M7.1 kine ≥0.16.x pin. Nightly GH-runner greens are macOS-15 evidence only, never the dev-mac burn-down (A20). On completion M4 flips done on validation runs alone (M4.0 absorbed into M7.1); M5/M6 lab gates ship documented EXPERIMENTAL (not launch-blocking)."
+        acceptance:
+          - id: M7.0-a1
+            met: false
+            check: "the existing m2/m3/m4 + hack/lab/m3.sh gates run for real (green) on dev-mac/lab hardware; the B28 soak (hack/acceptance/m7/soak.sh) is green against the M7.1 kine pin OR the accepted-with-known-issue disposition is recorded in limitations.md."
+            method: e2e
+      - id: M7.1
+        title: Release-engineering pipeline (absorbs M4.0-d1/a1)
+        status: todo
+        note: "phases_ref: k3sm M4.0 — completion writes through to flip M4.0-d1 done / M4.0-a1 met when hack/lab/m7.sh greens in the M7 tail."
+        deliverables:
+          - id: M7.1-d1
+            done: false
+            desc: "STUB (docs/m7-plan.md §M7.1-d1). setup.go verify-then-use rewrite: build kube-apiserver/scheduler/KCM/kubectl from upstream k/k source at a pinned ref (hack/release/build-cp.sh) → ship under libexec/ → root-owned /Library/k3sm/bin (a NAMED pkg/install payload-tree copy, root:wheel, uninstall manifest extended — Res. 6). Runtime becomes verify-then-use (codesign --verify in place; NO ad-hoc re-sign of the Developer-ID payload); fails fast on a missing bundle (the digest-pinned HTTPS fallback is dev-context-only, never under launchd). Drop runtime gh + go toolchain. kine collapses to ONE modern pin ≥0.16.x built CGO_ENABLED=0 (modernc.org/sqlite) — retires B31/B38; a dep-lint asserts no mattn/go-sqlite3 in the shipped artifact; the bundled kine Mach-O is Developer-ID signed + enumerated (Res. 7). B69 is this slice, orchestrate-driven (Res. 10)."
+          - id: M7.1-d2
+            done: false
+            desc: "STUB. goreleaser (k3sm/.goreleaser.yaml): darwin/arm64 only, CGO=1, -X main.version, archive = k3sm + k3sm-netd + cp payload + kine + LICENSE/NOTICE; brews: → Formula/k3sm.rb in the public k3sm-io/homebrew-tap with a head build-from-source path that clones the four-repo sibling layout (a lone k3sm clone cannot build). k3sm-netd is a renamed copy of the same k3sm Mach-O (Res. 9)."
+          - id: M7.1-d3
+            done: false
+            desc: "STUB. Signing + the two-artifact netd split (hack/release/{sign,notarize,pkg}.sh + entitlements/{server,netd}.plist). Two signed artifacts: k3sm (io.k3sm.server, runs as _k3sm — entitlement trio allow-jit / allow-unsigned-executable-memory / disable-library-validation, each naming its consumer in sign.sh comments or dropped) and k3sm-netd (io.k3sm.netd, NO entitlements). Bare Mach-Os → notarized tarball (online ticket) + signed+stapled .pkg. NetdPlist.ProgramArguments execs a startable helper (`netd` subcommand token preserved). App-bundle retirement = a named DESIGN §5c/§8-risk-5 + privilege-model edit (A14). m7.sh asserts entitlements bidirectionally."
+          - id: M7.1-d4
+            done: false
+            desc: "STUB. Release workflow + reproducibility (.github/workflows/release.yml): tag-triggered, macos arm64 runner, release environment with a required reviewer + ephemeral keychain; release-environment-scoped secrets (DEVELOPER_ID_APP_P12 / DEVELOPER_ID_INSTALLER_P12 / ASC_* / HOMEBREW_TAP_TOKEN + a cross-repo-checkout GitHub App — Res. 13). Checks out all four repos as siblings at the identical tag (fail if any missing), records the four SHAs in release notes + k3sm version; -trimpath, pinned Go toolchain, pinned k/k ref."
+          - id: M7.1-d5
+            done: false
+            desc: "STUB. Versioning: SemVer v0.x.y (NOT +k3sm1 — k3sm.io/apis must stay go-gettable), same tag across all four repos, four SHAs recorded; k8s alignment via k3sm version + docs/user/versions.md (states the DefaultKubeVersion v1.36.2 vs client-libs v0.35 skew). CHANGELOG.md Keep-a-Changelog. Apple Developer enrollment + certs + ASC key + tap bootstrap are human-only, START IMMEDIATELY (calendar critical path)."
+        acceptance:
+          - id: M7.1-a1
+            met: false
+            check: "hack/acceptance/m7.sh green (goreleaser snapshot build + bidirectional codesign entitlement asserts + formula render + four-repo layout assert + kine-nocgo dep-lint) AND hack/lab/m7.sh green (real certs: spctl/stapler validate; clean-Mac brew install → cluster Ready → reboot → Ready) — the lab run greens the transferred M4.0 acceptance + the ex-M4-lab reboot debt in one pass (writes through M4.0-a1)."
+            method: e2e
+      - id: M7.2
+        title: GitHub Actions CI
+        status: todo
+        deliverables:
+          - id: M7.2-d1
+            done: false
+            desc: "STUB. Thin per-repo ci.yml on macos arm64 runners calling the existing hack/ci.sh (no logic duplication): unit + -race + symbol-canary on every image; a workspace ci.yml checks out all five repos. A nightly sudo-integration workflow attempts m2/m3/m4.sh under K3SM_CI_REQUIRE (self-skips turn red, not silent — A10) with an out-of-band stale-last-run detector + an auto-filed issue to @kitsumiko (Res. 17). Self-hosted lab-only workflows carry ONLY {schedule, workflow_dispatch, push@main} triggers (allowlist — Res. 14); zizmor beside actionlint; trufflehog is a required status check; DCO promoted to a required check. The spicanary soft-fail in hack/ci.sh is deleted (canary failure becomes fatal)."
+        acceptance:
+          - id: M7.2-a1
+            met: false
+            check: "hack/acceptance/m7/ci.sh green: actionlint/zizmor + workflow-manifest assert (a required workflow missing = red) + the self-hosted-trigger allowlist assert + symbol-canary liveness assert + a post-merge run-green check bound to the flip SHA."
+            method: integration
+      - id: M7.3
+        title: User docs
+        status: todo
+        deliverables:
+          - id: M7.3-d1
+            done: false
+            desc: "STUB. Canonical home k3sm/docs/user/: the machine-asserted page manifest (quickstart/install/upgrade/backup-restore/concepts/limitations/images/multi-node/vm-runtimeclass[EXPERIMENTAL]/ha[EXPERIMENTAL]/storage/kubectl-access/troubleshooting/faq/versions). limitations.md cites UPSTREAM-ALIGNMENT.md + privilege-model.md (not restated) and carries the MLX-trusted-workload-only paragraph. mlx-quickstart.md is authored here but gated by m8.sh, NOT m7/docs.sh (A20). New examples/ (nodeport/statefulset/vm-linux/probes); README refresh across all repos (the k3sm README becomes the front door)."
+        acceptance:
+          - id: M7.3-a1
+            met: false
+            check: "hack/acceptance/m7/docs.sh green: page-manifest assert + hermetic link-check + yaml-applies + a stale-string denylist seeded from the known offenders ('Pre-M0', 'private development'); the network-tier external-link job is split out of the hermetic gate. The quickstart-smoke runs on the clean-Mac hack/lab/m7.sh run."
+            method: integration
+      - id: M7.4
+        title: Website
+        status: todo
+        deliverables:
+          - id: M7.4-d1
+            done: false
+            desc: "STUB. Hugo (single binary, no node) on k3sm-io.github.io: the stealth vanity dirs move BYTE-IDENTICAL to static/{apis,k3sm,runtimed,darwin-net}/index.html (Hugo copies static/ verbatim — the go-import metas never change). Docs are NOT committed to the site repo: the deploy workflow checks out k3sm at the latest tag and copies docs/user/ → content/docs/ (single-sourced); the site roadmap page is the deploy-time copy of k3sm/ROADMAP.md. /land never touches k3sm-io.github.io — the site repo lands manually; the real deploy is an M9 step."
+        acceptance:
+          - id: M7.4-a1
+            met: false
+            check: "hack/verify-vanity.sh green (deploy-blocking): the four go-import metas match the fixtures byte-for-byte. hack/verify-live.sh (curl production + go mod download) runs at M9."
+            method: integration
+      - id: M7.5
+        title: Public-flip hygiene & security scrub
+        status: todo
+        deliverables:
+          - id: M7.5-d1
+            done: false
+            desc: "STUB. Full-history secret sweep × 6 repos BEFORE the flip (trufflehog primary, gitleaks second opinion); rotate-not-scrub (any finding rotated/revoked first; a history rewrite flips via a fresh-repo push — A18). .claude/ ships in the public repos (scrubbed). MAINTAINERS.md goes real (@kitsumiko); SECURITY.md → GitHub Private Vulnerability Reporting; repo-settings.sh (gh api, idempotent: branch protection, squash-only, topics, discussions, native secret-scanning + push-protection); go-licenses NOTICE verification per repo."
+        acceptance:
+          - id: M7.5-a1
+            met: false
+            check: "hack/acceptance/m7/hygiene.sh green: scan-clean = zero unresolved trufflehog --only-verified findings against the reviewed rotated-credentials baseline (Res. 15) + MAINTAINERS/SECURITY content asserts + repo-settings drift check + NOTICE verification."
+            method: integration
+
+  - id: M8
+    title: MLX — native Apple-Silicon ML serving (the NVIDIA-GPU-Operator analog for Mac)
+    status: todo
+    strategy: hard cut
+    note: "LEDGER STUB (authoritative design: docs/m8-plan.md — the Phase B resolutions bind). Launch-blocking (user decision: launch WITH MLX v1; m8.sh joins the launch-gate set — the public flip is M9). k3sm owns M8.3 (node extended-resource + labels), M8.4 (mlx-serve uv image under hack/images/), M8.5 (pkg/mlx operator), M8.6 (the m8.sh gate). apis owns M8.1 (mlx.k3sm.io/v1alpha1 CRD + reserved-band proto carve — orchestrate-only); runtimed owns M8.0 spikes + M8.2 (Metal SBPL + egress + AdHocSignTree + GPUFacts, incl. the d0 OCI-layer unpacker prerequisite). NO M8-lab row — a GPU dev-mac covers it (Res. 15). All wire/API change is additive (new CRD group, reserved-band proto fields default-false)."
+    depends_on:
+      - apis:M8.1
+      - runtimed:M8.2
+    subphases:
+      - id: M8.3
+        title: k3sm node — extended resource + translate + Warn VAP
+        status: todo
+        deliverables:
+          - id: M8.3-d1
+            done: false
+            desc: "STUB (docs/m8-plan.md §M8.3). configureNode (cmd/k3sm/node.go) advertises mlx.k3sm.io/gpu: 1 in Capacity/Allocatable + labels (mlx.k3sm.io/gpu.present=true, /chip [normalized slug per Res. 4], /chip-family, /memory-gb), FAIL-CLOSED off runtimed GPUFacts (facts absent / metal_available=false / VZ-paravirtual discrimination trips → remove the resource + clear the labels, mirroring applyVirtualizationLabel). B63 ships the same plumbing against a stubbed fact source (blocked-on-M8.1 per Res. 8); this flips it to real GPUFacts. translate.go reads the GPU request from LIMITS → SandboxProfile.AllowGpu, the egress annotation (apis constant) → AllowInternetEgress (allow_internet_egress implies allow_network — Res. 12). A Warn VAP (pkg/policy/admission.go) surfaces a hand-set egress annotation on a non-operator pod (single-trust-domain posture; FailurePolicy: Ignore)."
+        acceptance:
+          - id: M8.3-a1
+            met: false
+            check: "translate table test (limits-not-requests, annotation present/absent, constant-not-literal) + node-advertisement fail-closed unit test (fake GPUFacts, both skew directions) + the Warn VAP test pass. The live GPU advertisement is exercised by m8.sh on an apple-gpu dev-mac."
+            method: unit
+      - id: M8.4
+        title: k3sm runtime image — mlx-serve (parallel with M8.2/M8.3)
+        status: todo
+        deliverables:
+          - id: M8.4-d1
+            done: false
+            desc: "STUB (docs/m8-plan.md §M8.4). k3sm/hack/images/mlx-serve/: a build script + uv toolchain (uv python install + uv pip install --require-hashes against a checked-in hash-pinned lockfile) assembling python-build-standalone (darwin-arm64) + the spike-S5-winner engine wheels (working hypothesis vllm-mlx) into ghcr.io/k3sm-io/mlx-serve. Entrypoint is the python3 Mach-O directly (argv[0] must be gateSignature-verifiable — never a shell script); process model per S3 (process-group sampling verified or the image pinned single-process). A dedicated versioned GHCR publish workflow (mlx-serve-image.yml); the operator's default Runtime.Image is digest-pinned (tag display-only); pre-M9 the image is private GHCR (stealth). Weights are NEVER in the image (PVC via HF_HOME)."
+        acceptance:
+          - id: M8.4-a1
+            met: false
+            check: "the image builds reproducibly from the lockfile (--require-hashes), fits the S4 size budget, and a walk-verify asserts every Mach-O in the payload is signed or linker-ad-hoc-signed (S2 evidence, mechanized)."
+            method: integration
+      - id: M8.5
+        title: k3sm operator — pkg/mlx
+        status: todo
+        deliverables:
+          - id: M8.5-d1
+            done: false
+            desc: "STUB (docs/m8-plan.md §M8.5). NEW k3sm/pkg/mlx in-binary controller mirroring pkg/provisioner (informer + single workqueue worker, no stored Context, resync re-delivery; started in the server.go step-4c pattern, drained LIFO before control-plane teardown). Render: MLXModel → StatefulSet (volumeClaimTemplates → per-replica node-pinned local-path cache PVC) + a headless governing Service + a stable ClusterIP Service; persistentVolumeClaimRetentionPolicy whenDeleted:Delete; controller ownerReferences stamped (Res. 2 — else kubectl delete cascades nothing); readiness-only probes, NO liveness/startup until Ready once (Res. 3); fixed guardrail stanzas (kubernetes.io/os:darwin nodeSelector + k3sm.io/provider:NoSchedule toleration + the GPU resource in requests AND limits) else k3sm's own Deny VAP rejects the STS pods; imagePullSecrets for the private GHCR digest (Res. 16). Conditions-first status (+ observedGeneration, subresource; Phase is a derived printer column; ResolvedRevision recorded at Downloading). CRD ensure via SSA in a NEUTRAL package k3sm/pkg/crdensure (applies mlxmodels ONLY from the embedded k3sm.io/apis/config/crd, field manager k3sm, waits for Established). Pre-render validation: spec.Memory vs GPUFacts wired-limit/working-set → Failed/Degraded WITHOUT creating pods; request=limit from spec.Memory."
+        acceptance:
+          - id: M8.5-a1
+            met: false
+            check: "render golden (placement stanza + retention policy + requests==limits + headless/ClusterIP pair + ownerReferences + readiness-only probe) + ensure SSA-convergence test (fake apiserver: schema drift converges, Established awaited) + pre-render validation table test + conditions/observedGeneration contract test + the CEL spec.distributed-rejected test (beside pkg/crdensure, Res. 9) pass."
+            method: unit
+      - id: M8.6
+        title: gate — k3sm/hack/acceptance/m8.sh
+        status: todo
+        deliverables:
+          - id: M8.6-d1
+            done: false
+            desc: "STUB (docs/m8-plan.md §M8.6). hack/acceptance/m8.sh, requires [dev-mac, apple-gpu, network] (dev-mac is a phases.json requires-token, NOT a K3SM_CI_REQUIRE taxonomy member — Res. 19); no M8-lab row. Pinned small model repo+revision (e.g. mlx-community/Qwen3-0.6B-4bit at a pinned HF commit), cache pre-seeded. Sequence: apply examples/mlxmodel.yaml → status Ready (conditions, not just Phase) → OpenAI chat completion via the ClusterIP returns tokens → records TTFT + tokens/sec through the ClusterIP path vs the direct backend → delete → GC-clean per the whenDeleted:Delete deletion contract (poll-to-absent, bounded timeout — Res. 2). m8.sh also gates mlx-quickstart.md."
+        acceptance:
+          - id: M8.6-a1
+            met: false
+            check: "hack/acceptance/m8.sh green on an apple-gpu dev-mac: MLXModel → Ready → an OpenAI completion via the ClusterIP returns tokens → delete → every operator-owned object gone + PVC disposition exactly per whenDeleted:Delete."
             method: e2e
 ---
 
@@ -451,8 +606,13 @@ milestone. Sub-phases:
 Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a NodePort + a persistent StatefulSet.
 
 ## M4 — Install/launchd, packaging, Homebrew, hardening 🟡
-- ⬜ **M4.0** — app-bundle root LaunchDaemon + `k3sm install/uninstall`; codesign/notarize + `.pkg`; goreleaser →
-  `k3sm-io/homebrew-tap`; admin kubeconfig → `~/.kube/config`. **Single-server** (kine→SQLite); multi-server HA is M6.
+- 🪦 **M4.0** — **DESCOPED 2026-07 → k3sm:M7.1** (release-engineering pipeline). The single-server packaging/launchd/
+  install + codesign/notarize/`.pkg` + goreleaser → `k3sm-io/homebrew-tap` + admin-kubeconfig-to-`~/.kube/config`
+  deliverable **and its reboot-survival acceptance transferred verbatim** to M7.1 (which carries `phases_ref: k3sm M4.0`);
+  **no M4-scope work remains**. The retired "app-bundle-wrapped" **shape is NOT carried over** (retired by the DESIGN
+  §5c/§8 app-bundle-retirement amendment — M7.1 is authoritative: raw-utun/pf, no app bundle, two signed artifacts
+  `k3sm` + `k3sm-netd`). `M4.0-a1` stays `met:false` and flips **only** via the M7.1 `phases_ref` write-through when
+  `hack/lab/m7.sh` greens in the M7 tail — so M4 does not falsely flip `done`. (NodeNetwork no-op recording convention.)
 - 🟡 **M4.1** — RBAC enforcement (**hard cut**), CODE-COMPLETE + unit-proven. The apiserver default authorizer flips
   `AlwaysAllow → Node,RBAC` + the additive `NodeRestriction` admission plugin (`pkg/executor`); the flip is a **pure
   authorizer switch** because the in-process components keep the static admin token (`system:masters`, RBAC-exempt) — a
@@ -552,6 +712,54 @@ most complex ops capability). Two sub-phases:
   `TestServerJoin{ImportsBundleBeforeEnsureHierarchy,FailsClosedOnAbsentBundle}`, `TestNodePasswordSharedAcrossServersInHA`,
   `TestApiserverLBPicksHealthy`, `TestAdminKubeconfigUsesClientCert` (`-race` clean). Exit: 2 servers on shared Postgres;
   a second Mac joins reconstructing identical CAs; kill one → the cluster keeps serving (**lab** — `e2e/TestM6_SecondServerJoinsReconstructsCAs` + `hack/lab/m6.sh`, **M6.1-a1 `met:false`**).
+
+## M7 — Release engineering for the public open-source launch ⬜
+Ledger stub — authoritative design in `../../docs/m7-plan.md` (the Phase B resolutions bind; encode only from it).
+`k3sm` is **M7-primary** (all six sub-phases); `apis`/`runtimed`/`darwin-net` carry small M7 entries (their `ci.yml`
++ `K3SM_CI_REQUIRE` `SkipUnless` conversions). **Strategy: hard cut** (release infra is additive) — the one
+watchpoint is the **kine single-pin** (both pins → one modern ≥0.16.x, `CGO_ENABLED=0` pure-Go sqlite), a hard cut
+only after datastore-compat is verified, else it escapes to the named kine/SQLite datastore-migration exception.
+- ⬜ **M7.0** — validation-debt burn-down (human-at-hardware: m2/m3/m4.sh + `hack/lab/m3.sh` two-Mac + the B28
+  dev-mac churn soak `hack/acceptance/m7/soak.sh` against the M7.1 kine pin). On completion M4 flips `done` on
+  validation runs alone; M5/M6 lab gates ship documented **EXPERIMENTAL**.
+- ⬜ **M7.1** — release-engineering pipeline (**absorbs M4.0**, `phases_ref: k3sm M4.0`): `setup.go` verify-then-use
+  (build cp binaries from pinned k/k, ship under `libexec/` → root-owned `/Library/k3sm/bin` via a named `pkg/install`
+  payload copy; fail-fast on a missing bundle); the kine single-pin + nocgo dep-lint; goreleaser + the two signed
+  artifacts (`k3sm` `io.k3sm.server` entitlement trio / `k3sm-netd` `io.k3sm.netd` none); the tag-triggered release
+  workflow (four sibling repos at one tag, four SHAs); SemVer `v0.x.y`. App-bundle retirement is a named DESIGN
+  §5c/§8 + privilege-model edit.
+- ⬜ **M7.2** — GitHub Actions CI: thin per-repo `ci.yml` wrapping `hack/ci.sh`; a nightly sudo-integration run under
+  `K3SM_CI_REQUIRE` (self-skips turn red); self-hosted trigger allowlist; trufflehog + DCO required checks; the
+  spicanary soft-fail deleted (canary failure fatal).
+- ⬜ **M7.3** — user docs (`docs/user/` page manifest + `limitations.md` citing UPSTREAM-ALIGNMENT/privilege-model;
+  `mlx-quickstart.md` authored here but gated by `m8.sh`); README refresh across all repos.
+- ⬜ **M7.4** — website (Hugo on `k3sm-io.github.io`; stealth vanity dirs move byte-identical; docs single-sourced
+  from k3sm at the latest tag; `/land` never touches the site repo).
+- ⬜ **M7.5** — public-flip hygiene & security scrub (full-history secret sweep × 6, rotate-not-scrub; MAINTAINERS/
+  SECURITY go real; `repo-settings.sh`; NOTICE verification).
+Gate machinery: `hack/acceptance/m7.sh` is the single umbrella gate execing `hack/acceptance/m7/{ci,docs,hygiene}.sh`
+(a directory **outside** the `m[0-9]*.sh` orphan glob); manual:false skeletons exit non-zero unconditionally; the
+`M4-lab` row **re-points to `hack/lab/m7.sh`** (`hack/lab/m4.sh` deleted, B35 tombstoned). Launch itself is **M9**.
+
+## M8 — MLX: native Apple-Silicon ML serving ⬜
+Ledger stub — authoritative design in `../../docs/m8-plan.md` (Phase B resolutions bind). **Launch-blocking** (launch
+WITH MLX v1; `m8.sh` joins the launch-gate set — the public flip is M9). **Strategy: hard cut** (a NEW CRD group
+`mlx.k3sm.io/v1alpha1` + reserved-band proto fields default-false). k3sm owns:
+- ⬜ **M8.3** — node extended resource + translate + Warn VAP: `configureNode` advertises `mlx.k3sm.io/gpu: 1` +
+  labels **fail-closed** off runtimed GPUFacts (VZ-paravirtual discriminated); `translate.go` reads the GPU request
+  from **limits** → `AllowGpu` and the egress annotation → `AllowInternetEgress`; a Warn VAP surfaces a hand-set
+  egress annotation (single-trust-domain posture).
+- ⬜ **M8.4** — the `mlx-serve` runtime image (`hack/images/mlx-serve/`, uv-built `--require-hashes`,
+  python-build-standalone + the S5-winner engine; `python3` Mach-O entrypoint; digest-pinned GHCR publish; weights
+  never in-image).
+- ⬜ **M8.5** — the `pkg/mlx` in-binary operator (MLXModel → StatefulSet + headless + ClusterIP Services, ownerRefs,
+  `whenDeleted:Delete`, readiness-only probes, fixed guardrail stanzas, conditions-first status, SSA CRD ensure via a
+  neutral `pkg/crdensure`, pre-render validation vs GPUFacts).
+- ⬜ **M8.6** — the `hack/acceptance/m8.sh` gate (`requires [dev-mac, apple-gpu, network]`; **no M8-lab row** — a GPU
+  dev-mac covers it): pinned small model → Ready → OpenAI completion via ClusterIP → GC-clean per the deletion
+  contract; also gates `mlx-quickstart.md`.
+Prerequisite (runtimed M8.2-d0): the OCI-layer unpacker — the whole M8 product path is blocked on it; k3sm's M8.3
+consumes GPUFacts once M8.2 lands (B63 ships the plumbing against a stubbed fact source first).
 
 ## Next
 M3.0 (the multi-node bootstrap + trust core) is **done** (named unit tests, `-race` clean). Remaining M3:

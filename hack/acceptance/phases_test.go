@@ -33,15 +33,17 @@ import (
 
 // gateRow is one milestone row in hack/acceptance/phases.json: the single command
 // that PROVES the milestone (Gate), the test Tier it runs at, the host capabilities
-// it Requires, and whether it is lab-only (Manual). Only Gate is asserted by the
-// test; the remaining fields document the schema and force every row to decode as a
-// JSON object (a malformed bare-string row fails the unmarshal rather than passing
-// silently).
+// it Requires, whether it is lab-only (Manual), and whether its gate is not yet the
+// real proof (Skeleton — an honesty-contract placeholder). Only Gate is asserted by
+// TestPhasesGatePathsResolve; Manual+Skeleton drive the honesty tests; the remaining
+// fields document the schema and force every row to decode as a JSON object (a
+// malformed bare-string row fails the unmarshal rather than passing silently).
 type gateRow struct {
 	Gate     string   `json:"gate"`
 	Tier     string   `json:"tier"`
 	Requires []string `json:"requires"`
 	Manual   bool     `json:"manual"`
+	Skeleton bool     `json:"skeleton"`
 }
 
 // thisFileDir returns the directory containing this test's source file
@@ -180,25 +182,94 @@ func TestPhasesGatePathsResolve(t *testing.T) {
 	})
 }
 
-// TestLabSkeletonHonesty pins the load-bearing honesty contract of the B25 lab
-// skeletons (hack/lab/m4.sh, hack/lab/m5.sh): with K3SM_LAB unset they SKIP and
-// exit 0 ("PENDING — not a pass"); under K3SM_LAB=1 they report not-yet-implemented
-// and exit NON-ZERO. /orchestrate runs a manual lab gate under K3SM_LAB=1 and trusts
-// exit 0 as "milestone proven", so a placeholder that exited 0 there would fake-green
-// M4-lab/M5 whose real proof is owned by B35/B34. This test makes that contract a
-// CI invariant — notably across the eventual B34/B35 handoff that replaces these
-// files. Scoped to the SKELETONS only: hack/lab/{m3,m6}.sh run real conformance
-// slices under K3SM_LAB=1 (not hermetic), so they are deliberately out of scope.
+// TestLabSkeletonHonesty pins the load-bearing honesty contract of the lab
+// skeletons: with K3SM_LAB unset they SKIP and exit 0 ("PENDING — not a pass");
+// under K3SM_LAB=1 they report not-yet-implemented and exit NON-ZERO. /orchestrate
+// runs a manual lab gate under K3SM_LAB=1 and trusts exit 0 as "milestone proven",
+// so a placeholder that exited 0 there would fake-green a milestone whose real proof
+// is still owed.
+//
+// The skeleton set is DERIVED from phases.json — every row that is BOTH manual:true
+// AND skeleton:true (Res. 1). Keying on manual:true alone would wrongly select the
+// real hardware gates hack/lab/{m3,m6}.sh (manual:true WITHOUT skeleton — they run
+// real conformance slices under K3SM_LAB=1, not hermetic) and, once it lands green,
+// the M9 launch pre-flight; the skeleton:true discriminator keeps those out. DISTINCT
+// gate paths are iterated (M4-lab and M7-lab share hack/lab/m7.sh), so a shared
+// skeleton is exercised once.
 func TestLabSkeletonHonesty(t *testing.T) {
 	root := repoRoot(t)
-	for _, rel := range []string{"hack/lab/m4.sh", "hack/lab/m5.sh"} {
+	rows := loadGateRows(t)
+
+	// Derive the distinct manual+skeleton gate paths.
+	seen := make(map[string]bool)
+	var skeletons []string
+	for _, row := range rows {
+		if !(row.Manual && row.Skeleton) {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(row.Gate))
+		if seen[rel] {
+			continue
+		}
+		seen[rel] = true
+		skeletons = append(skeletons, rel)
+	}
+	sort.Strings(skeletons)
+	if len(skeletons) == 0 {
+		t.Fatal("no manual+skeleton rows found in phases.json — the honesty contract has nothing to pin (did a schema field get dropped?)")
+	}
+
+	for _, rel := range skeletons {
 		path := filepath.Join(root, filepath.FromSlash(rel))
 		t.Run(rel, func(t *testing.T) {
 			if code := runGate(t, path, ""); code != 0 {
 				t.Errorf("%s with K3SM_LAB unset: exit %d, want 0 (a skip — PENDING, NOT a pass)", rel, code)
 			}
 			if code := runGate(t, path, "1"); code == 0 {
-				t.Errorf("%s with K3SM_LAB=1: exit 0 — a placeholder must NOT report the milestone proven (the real gate is B34/B35)", rel)
+				t.Errorf("%s with K3SM_LAB=1: exit 0 — a placeholder must NOT report the milestone proven (the real gate is still owed)", rel)
+			}
+		})
+	}
+}
+
+// TestNonManualSkeletonsAlwaysRed pins the complementary honesty contract for
+// manual:false skeleton gates (Res. 2). A CI-runnable gate (e.g. the M7 umbrella +
+// M8) is run DIRECTLY by /orchestrate, which trusts exit 0 as "milestone proven" —
+// so a not-yet-real skeleton for such a row must exit NON-ZERO UNCONDITIONALLY (the
+// hack/lab/*.sh K3SM_LAB-unset→exit-0 pattern would fake-green a non-manual row).
+// Each such gate carries a greppable "# K3SM-SKELETON" sentinel so the always-red
+// intent is auditable; this test asserts both the sentinel's presence and the
+// non-zero exit under BOTH K3SM_LAB unset and K3SM_LAB=1.
+func TestNonManualSkeletonsAlwaysRed(t *testing.T) {
+	root := repoRoot(t)
+	rows := loadGateRows(t)
+
+	var reds []string
+	for _, row := range rows {
+		if row.Manual || !row.Skeleton {
+			continue
+		}
+		reds = append(reds, filepath.ToSlash(filepath.Clean(row.Gate)))
+	}
+	sort.Strings(reds)
+	if len(reds) == 0 {
+		t.Fatal("no manual:false skeleton rows found in phases.json — expected the M7/M8 umbrella skeletons")
+	}
+
+	for _, rel := range reds {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		t.Run(rel, func(t *testing.T) {
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", rel, err)
+			}
+			if !strings.Contains(string(body), "# K3SM-SKELETON") {
+				t.Errorf("%s is a manual:false skeleton row but its script carries no `# K3SM-SKELETON` sentinel", rel)
+			}
+			for _, lab := range []string{"", "1"} {
+				if code := runGate(t, path, lab); code == 0 {
+					t.Errorf("%s (K3SM_LAB=%q): exit 0 — a manual:false skeleton must exit non-zero UNCONDITIONALLY until real (Res. 2), or /orchestrate fake-greens the milestone", rel, lab)
+				}
 			}
 		})
 	}
