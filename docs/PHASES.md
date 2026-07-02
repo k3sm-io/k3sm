@@ -524,6 +524,83 @@ phases:
             met: false
             check: "K3SM_LAB=1 hack/acceptance/m9.sh green (every launch-blocking ledger row green or its disposition satisfied); then the outside-world verify on a clean Mac (brew install → cluster Ready → MLXModel Ready → chat completion) succeeds and go mod download of all four modules @v0.1.0 resolves via proxy.golang.org."
             method: e2e
+
+  - id: M10
+    title: Kubernetes conformance hardening (register + apiserver config + per-pod IP + workload fidelity)
+    status: todo
+    strategy: hard cut
+    note: "LEDGER STUB (authoritative design: ../../docs/m10-plan.md — the BINDING Phase B resolutions Res.1–Res.12 bind; encode ONLY from that document, never the master-plan draft). Conformance HARDENING, not a certification: k3sm CANNOT pass Sonobuoy [Conformance] (it assumes Linux containers/cgroups/CNI/netns); M10 raises honest fidelity where the Darwin substrate allows and documents every ceiling. Corrected framing: admission plugins are ALREADY ON (supervised.go additively adds NodeRestriction on top of upstream's default-on set), so the real P0 is audit logging + the PSA cluster-default level + memory-only default objects, NOT 'enable plugins'; per-pod IP is achievable-as-wiring (NodeNetwork{} no-op seam today, both paths report podIP≈nodeIP) not a platform ceiling. Routing: every sub-phase M10.0–M10.4 is /orchestrate-driven (apiserver-argv/admission-config are a deploy-strategy change a unit gate can't prove; sidecars need an apis proto field). Pull-forward M10.0/M10.1 (interleave with M7/M8, v0.1.1); M10.2/M10.3/M10.4 are the post-launch v0.2 headline. Gate machinery: hack/acceptance/m10.sh (manual:false integration skeleton, always-red # K3SM-SKELETON until real — its eventual non-skeleton form is a COMPOSITE execing the M10 criteria) + hack/lab/m10.sh (manual:true lab skeleton, the cross-node per-pod-IP / in-pod SRV/PTR slice). New conformance criteria are authored as t.Skip TODOs (e2e/, TestM10_*-tagged — NOT TestM2_*/TestM4_*) and promoted into the required M2_CRITERIA/M4_CRITERIA sets ONLY in the PR that lands them green (Res.9). Backlog: B70–B81 (+ P3) under docs/BACKLOG.md's Kubernetes-conformance push."
+    depends_on:
+      - apis:M10.2
+    subphases:
+      - id: M10.0
+        title: apiserver conformance config — audit + PSA-warn-first + memory-only LimitRange + config-in-provision + boot-smoke
+        status: todo
+        strategy: hard cut (binary) + PSA-enforce cutover (Res.2)
+        deliverables:
+          - id: M10.0-d1
+            done: false
+            desc: "STUB (docs/m10-plan.md §M10.0; Res.2/3/4/5/6/11). AUDIT LOGGING (Res.4): a shipped audit policy with level: Metadata (or None) for secrets/configmaps as an ordered first-match rule (never Request/RequestResponse → no Secret cleartext at rest); the gate asserts the LEVEL, not just that --audit-* is wired. The audit log lands at a root/_k3sm-owned 0600 path in a Seatbelt-denied (non-pod-reachable) dir with bounded rotation (--audit-log-maxsize/maxbackup/maxage), OFF the datastore volume so it cannot ENOSPC the kine WAL (joint acceptance with the SBPL deny-set). PSA baseline-WARN first → enforce after pre-flight (Res.2): ship baseline-warn + restricted-warn as the immediate default via --admission-control-config-file + PodSecurityConfiguration (audit-observable, zero rejection); flip baseline to enforce only after a pre-flight scan proves the single-node cluster clean — a documented, argv-reversible cutover. PSA is conformance-surface + defense-in-depth, NOT the privilege boundary (the foreign-uid VAP + Seatbelt stay that); baseline does not collide with the foreign-uid VAP (only restricted would). MEMORY-ONLY default objects (Res.5): a LimitRange with memory defaults ONLY (memory IS enforced via the rusage sampler→OOMKill; CPU is best-effort so a CPU LimitRange/quota over-claims a CFS guarantee k3sm can't keep); NO rejecting ResourceQuota by default (generous/opt-in). CONFIG-IN-PROVISION (Res.3): the audit-policy, --admission-control-config-file, and PSA PodSecurityConfiguration are written idempotently in provision() (beside provisionComponentCerts, before startAPIServer/bringUp), apiVersion pinned to the vendored k8s v1.36.2; a provision unit test pins the write (else the argv references a missing file and bring-up wedges opaquely for the 90s healthz timeout). VERIFY+DOCUMENT webhooks & preemption are free (Res.6): verify webhook DELIVERY (a real Service-backed mutating+validating webhook admits through the proxy; document the failurePolicy: Fail reachability wedge), not just plugin-on. BOOT SMOKE-TEST + rollback (Res.11): the gate asserts the apiserver STARTS (not just argv shape) with prior-notarized-binary preservation as the runbooked rollback. Orthogonality (Res.11): M10.0 shares no file / acceptance-precondition with the unbuilt M7/M8. Backlog: B70 (audit, orchestrate — refused by /go), B71 (PSA baseline-enforce, orchestrate + human_gate), B72 (memory-only LimitRange + webhook verify, orchestrate)."
+        acceptance:
+          - id: M10.0-a1
+            met: false
+            check: "INTEGRATION-PENDING (needs a dev Mac; boots only `k3sm server`, no root/GPU/reboot, so it runs in hack/ci.sh --integration). The M10.0 §-gate enforcement e2e is the MILESTONE PROOF (Res.6/9), not the B70 argv unit test: apply a privileged pod → expect 403; grep the audit file for the event at the asserted LEVEL; a negative control asserts k3sm system pods + a baseline reference workload are still ADMITTED; the apiserver boot smoke-test asserts it starts. The supplementary build checks are pkg/executor::TestApiserverArgs_AuditPolicyWired (asserting the level) + pkg/policy::TestPSADefaultLevel + pkg/policy::TestDefaultLimitRangeMemoryOnly."
+            method: integration
+      - id: M10.1
+        title: per-pod IP + DNS/StatefulSet identity — podnet adapter, converge on runtimed, default-runtime-flip decision
+        status: todo
+        strategy: phased — VK provider ↔ runtimed gRPC contract (Res.1)
+        deliverables:
+          - id: M10.1-d1
+            done: false
+            desc: "STUB (docs/m10-plan.md §M10.1; Res.1/7/12). PODNET ADAPTER: replace supervisor.NodeNetwork{} (runtime.go:280 — a no-op seam that returns the node IP) with an adapter over darwin-net/pkg/podnet.Network (253/node distinct /32s), bridging the two PodNetwork interfaces (supervisor returns string ↔ podnet returns netip.Addr) through a NAMED seam, so translate.go:877 reads back a distinct /32 (today BOTH paths report podIP≈nodeIP; hostprocess.go:126-128 hardcodes PodIP: p.nodeIP). IPAM OWNERSHIP: darwin-net stays the SOLE node-/24 allocator; runtimed's seam is a pass-through (no second allocator). CONVERGE ON RUNTIMED: the HostProcess os/exec path is REJECTED for per-pod IP (INADDR_ANY, no bind discipline → a cosmetic /32 the server never binds, two same-node pods collide on shared lo0); the runtimed path already scopes a pod to its /32 via the SBPL bind-discipline (sbpl.go:290 (allow network-bind (local ip \"<PodIP>:*\"))). This LIKELY FLIPS the default runtime to runtimed (HostProcess → an explicit rootless-dev opt-in) — the DEFAULT-RUNTIME-FLIP decision this sub-phase settles (Open question 1: in M10.1, or a prerequisite to sequence first). RESOLVER RECORD SYNTHESIS: extend the netserve resolver for per-pod-A / headless (all-backends) / SRV / PTR; SPLIT the gate — server-side synthesis is CI-provable (TestHeadlessServiceReturnsAllPodIPs), in-pod SRV/PTR consumption needs a getaddrinfo-shim res_query extension (a follow-on integration gate, not this slice). REGISTER RECLASSIFICATION (Res.7): re-verdict + close B5 in the SAME change (per-pod-IP / headless / SRV / PTR rows move off 'honest-limitation (ceiling)' — verified-in-code, so leaving 'ceiling' ships a known lie). CAUSAL LINK (Res.12): per-pod /32 removes the last L4 chokepoint → NetworkPolicy (M10.4) can then only hint on Service-VIP-mediated ingress; isolation routes to vm. Backlog: B81 (per-pod-A/headless/SRV/PTR resolver records, /go-able half, status: blocked — unblocked by hand once this podnet wiring lands)."
+        acceptance:
+          - id: M10.1-a1
+            met: false
+            check: "the server-side per-pod-IP + record synthesis is CI-provable — TestCreatePodAssignsDistinctPodIP + TestHeadlessServiceReturnsAllPodIPs (server-side). The in-pod SRV/PTR consumption is a FOLLOW-ON integration gate (getaddrinfo-shim res_query), split out per Res.12; the cross-node per-pod-IP leg is the hack/lab/m10.sh lab slice (two-macs, never auto-greened)."
+            method: integration
+      - id: M10.2
+        title: workload-execution fidelity — native sidecars (apis:M10.2) + live restartPolicy (B26) + Job (B8) + DaemonSet toleration
+        status: todo
+        strategy: phased — apis proto change (consumer-first) for the sidecar field; hard cut for the rest (Res.8)
+        depends_on:
+          - apis:M10.2
+          - k3sm:B8
+        deliverables:
+          - id: M10.2-d1
+            done: false
+            desc: "STUB (docs/m10-plan.md §M10.2; Res.7/8). NATIVE SIDECARS (apis-first, Res.8): verified — the Container proto (runtime.proto:367) has NO restart_policy field and translate.go:507 drops it, so the initContainer restartPolicy:Always signal cannot cross the provider↔runtimed gRPC contract. Add a PodBox/Container proto FIELD (wave 1, named-exception: apis proto change, consumer-first: dependents ship tolerant readers first), NEVER a k3sm.io/* annotation. Init restartPolicy:Always stays-running + reverse-order teardown (B73, driver: orchestrate — NOT /go). LIVE restartPolicy + CrashLoopBackOff: wire the EXISTING B26 (do not duplicate; the pure decision logic already lives at restartpolicy.go shouldRestartOnExit, regular containers only). JOB/CronJob completions/parallelism/backoffLimit fidelity: depends B8 (B74). DAEMONSET TOLERATION-ONLY (Res.7): a mutating policy injects the k3sm.io/provider toleration for DS-owned pods; NEVER the kubernetes.io/os=darwin nodeSelector — the register row is 'controller conformant / scheduling divergent,' not blanket-free (B76, /go). Plus init-container ordering. Backlog: B73 (sidecars, apis-first/orchestrate), B74 (Job, depends B8), B75 (node lifecycle Events — Pulled/Created/Started/Killing/BackOff, /go), B76 (DaemonSet toleration, /go), B77 (subPath, /go), B78 (kubectl cp exec-tar, /go)."
+        acceptance:
+          - id: M10.2-a1
+            met: false
+            check: "pkg/provider::TestNativeSidecarStaysRunning (an initContainer restartPolicy:Always stays Running + reverse-order teardown, over the new apis proto field) + TestJobBackoffAndCompletionAccounting (depends B8) + TestDaemonSetLandsOnDarwinNode (toleration-injection ONLY, never the os=darwin nodeSelector) + pkg/provider::TestProviderEmitsLifecycleEvents. Live exercise is the M10 composite gate once these land green."
+            method: unit
+      - id: M10.3
+        title: Ingress + IngressClass + klipper-lite LoadBalancer
+        status: todo
+        strategy: hard cut (additive pkg/ingress)
+        deliverables:
+          - id: M10.3-d1
+            done: false
+            desc: "STUB (docs/m10-plan.md §M10.3; Res.10/12). IN-PROCESS userspace L7 reverse-proxy in its OWN darwin-net/pkg/ingress (or l7) package — NOT accreting onto the L4 proxy: host/path routing, default backend, TLS-from-Secret fronting ClusterIP VIPs; :80/:443 via the netd VerbBindPort fd-passing seam. REJECT a bundled Traefik binary (it forks the single-binary model). SPECIFIC-NODE BIND (Res.12): the Ingress binds a SPECIFIC node address (netd rejects *:80). TLS-KEY DISCIPLINE (Res.10/12): TLS keys stay in-process-memory-only; the IngressClass controller's Secret grant is SCOPED to the referenced tls[].secretName. KLIPPER-LITE LoadBalancer: status.loadBalancer.ingress = node IP (closes B32). Plus a k3sm IngressClass controller."
+        acceptance:
+          - id: M10.3-a1
+            met: false
+            check: "hack/acceptance/m10-ingress.sh: a host/path route resolves through the L7 proxy + TLS-from-Secret terminates + status.loadBalancer.ingress is populated with the node IP (klipper-lite). Post-launch v0.2 headline."
+            method: e2e
+      - id: M10.4
+        title: NetworkPolicy (L4 subset) + honest-limit doc
+        status: todo
+        strategy: hard cut (additive)
+        deliverables:
+          - id: M10.4-d1
+            done: false
+            desc: "STUB (docs/m10-plan.md §M10.4; Res.12). A userspace-proxy dst-VIP allow/deny SUBSET explicitly documented as POLICY HINT, not tenant isolation (pod-to-pod over pod IPs bypasses the proxy; shared _k3sm uid → isolation routes to vm). Draws the M10.1→M10.4 CAUSAL LINK (Res.12): once each pod has its own /32, the proxy is no longer the only path, so the policy can only hint on Service-VIP-mediated ingress. A limitations.md line-assert states the ceiling honestly."
+        acceptance:
+          - id: M10.4-a1
+            met: false
+            check: "darwin-net/pkg/proxy::TestNetworkPolicyL4AllowDeny (a dst-VIP L4 allow/deny subset) + a limitations.md line-assert documenting NetworkPolicy as a hint, not tenant isolation. Post-launch v0.2."
+            method: unit
 ---
 
 # k3sm — Phase roadmap
@@ -782,6 +859,60 @@ WITH MLX v1; `m8.sh` joins the launch-gate set — the public flip is M9). **Str
   contract; also gates `mlx-quickstart.md`.
 Prerequisite (runtimed M8.2-d0): the OCI-layer unpacker — the whole M8 product path is blocked on it; k3sm's M8.3
 consumes GPUFacts once M8.2 lands (B63 ships the plumbing against a stubbed fact source first).
+
+## M10 — Kubernetes conformance hardening ⬜
+Ledger stub — authoritative design in `../../docs/m10-plan.md` (the BINDING Phase B resolutions **Res.1–Res.12**
+bind; encode only from that document). **Conformance HARDENING, not a certification:** k3sm **cannot** pass
+Sonobuoy `[Conformance]` (it assumes Linux containers/cgroups/CNI/netns); M10 raises honest fidelity where the
+Darwin substrate allows and documents every ceiling. **Corrected framing:** admission plugins are **already on**
+(`supervised.go` additively adds `NodeRestriction` on top of upstream's default-on set), so the real P0 is audit
+logging + the PSA cluster-default level + memory-only default objects, **not** "enable plugins"; per-pod IP is
+**achievable-as-wiring** (the `NodeNetwork{}` no-op seam today, both paths report `podIP≈nodeIP`), not a platform
+ceiling. **Strategy: hard cut** for the docs/ledger encoding; each runtime sub-phase carries its own anchor.
+Every sub-phase is **/orchestrate**-driven. Pull-forward M10.0/M10.1 (interleave with M7/M8, v0.1.1);
+M10.2/M10.3/M10.4 are the post-launch **v0.2** headline.
+- ⬜ **M10.0** — apiserver conformance config (**hard cut (binary) + a PSA-enforce cutover**, Res.2): audit logging
+  (a shipped policy at `level: Metadata`, `secrets`/`configmaps` pinned to Metadata/None as an ordered first-match
+  rule → no Secret cleartext at rest; the gate asserts the LEVEL; 0600 + Seatbelt-denied + off the datastore
+  volume, Res.4); PSA **baseline-warn first → enforce after a clean pre-flight scan** (argv-reversible cutover;
+  conformance-surface + defense-in-depth, NOT the privilege boundary — the foreign-uid VAP + Seatbelt stay that,
+  Res.2); a **memory-only** default LimitRange (memory IS enforced via the rusage sampler→OOMKill; no rejecting
+  ResourceQuota, Res.5); the config files written idempotently in `provision()` **before** bring-up, apiVersion
+  pinned to v1.36.2 (Res.3); verify webhook **delivery** through the proxy (Res.6). Proof = the M10.0 §-gate
+  enforcement e2e (privileged pod → 403 + audit-event at the asserted level + a negative control; boot smoke-test),
+  CI-integration-tier — the argv unit test is a supplementary build check (Res.6/9). Backlog B70/B71/B72.
+- ⬜ **M10.1** — per-pod IP + DNS/StatefulSet identity (**phased — VK provider ↔ runtimed gRPC contract**, Res.1):
+  replace `supervisor.NodeNetwork{}` with a **named-seam adapter** over `darwin-net/pkg/podnet.Network`, bridging
+  the two `PodNetwork` interfaces (`string` ↔ `netip.Addr`), so `translate.go` reads back a distinct `/32`;
+  darwin-net stays the sole node-`/24` allocator; **converge on the runtimed path** (the HostProcess `os/exec`
+  path is REJECTED — no bind discipline → a cosmetic `/32`), which **likely flips the default runtime to
+  runtimed** (HostProcess → a rootless-dev opt-in — the default-runtime-flip decision this sub-phase settles).
+  Resolver record synthesis for per-pod-A / headless / SRV / PTR (split gate: server-side is CI-provable, in-pod
+  SRV/PTR is a follow-on integration gate). Re-verdict + close **B5** in the same change (Res.7). Causal link
+  (Res.12): per-pod `/32` removes the last L4 chokepoint → M10.4 can then only hint. Backlog B81 (`status:
+  blocked`, unblocked by hand once this lands).
+- ⬜ **M10.2** — workload-execution fidelity (**phased — apis proto change (consumer-first)** for the sidecar
+  field, Res.8): native sidecars need a **`PodBox`/`Container` proto field** (the proto has no `restart_policy`
+  field, `translate.go:507` drops it) — **apis-first / orchestrate**, never a `k3sm.io/*` annotation; live
+  restartPolicy + CrashLoopBackOff wires the existing **B26**; Job/CronJob fidelity depends **B8**; DaemonSet is
+  **toleration-injection ONLY** (never the `os=darwin` nodeSelector — "controller conformant / scheduling
+  divergent", Res.7). Backlog B73/B74/B75/B76/B77/B78.
+- ⬜ **M10.3** — Ingress + IngressClass + klipper-lite LoadBalancer (**hard cut**, additive `darwin-net/pkg/ingress`):
+  an in-process userspace L7 reverse-proxy in its OWN package (reject a bundled Traefik), host/path routing +
+  TLS-from-Secret fronting ClusterIP VIPs via the netd fd-passing seam; **specific-node bind** (netd rejects
+  `*:80`); TLS keys **in-process-memory-only**, the IngressClass controller's Secret grant scoped to the
+  referenced `tls[].secretName` (Res.10/12); `status.loadBalancer.ingress` = node IP (closes **B32**). Gate
+  `hack/acceptance/m10-ingress.sh`. Post-launch v0.2 headline.
+- ⬜ **M10.4** — NetworkPolicy (L4 subset) + honest-limit doc (**hard cut**, additive): a userspace-proxy dst-VIP
+  allow/deny subset documented as **policy hint, not tenant isolation** (pod-to-pod over pod IPs bypasses the
+  proxy; shared uid → isolation routes to `vm`); draws the M10.1→M10.4 causal link (Res.12).
+Gate machinery: `hack/acceptance/m10.sh` (manual:false integration **skeleton**, always-red `# K3SM-SKELETON`
+until real — its eventual non-skeleton form is a **composite** execing the M10 criteria) + `hack/lab/m10.sh`
+(manual:true lab **skeleton**, the cross-node per-pod-IP / in-pod SRV/PTR slice). New conformance criteria are
+authored as `t.Skip` TODOs (`e2e/`, **`TestM10_*`**-tagged, not `TestM2_*`/`TestM4_*`) and promoted into the
+required `M2_CRITERIA`/`M4_CRITERIA` sets **only in the PR that lands them green** (Res.9). Register: elevate
+`docs/UPSTREAM-ALIGNMENT.md` to a full-surface register (keep the 7-verdict legend verbatim, add only `🟡
+planned+B#`, pin v1.36.2) + a new `docs/conformance-profile.md` (Res.7/10). Backlog B70–B81 (+ P3).
 
 ## Next
 M3.0 (the multi-node bootstrap + trust core) is **done** (named unit tests, `-race` clean). Remaining M3:

@@ -12,5 +12,7 @@
   "M7": { "gate": "hack/acceptance/m7.sh", "tier": "integration", "requires": ["dev-mac", "network"],                  "manual": false, "skeleton": true },
   "M7-lab": { "gate": "hack/lab/m7.sh",    "tier": "lab",         "requires": ["macos-runner", "reboot", "signing"],   "manual": true,  "skeleton": true },
   "M8": { "gate": "hack/acceptance/m8.sh", "tier": "integration", "requires": ["dev-mac", "apple-gpu", "network"],     "manual": false, "skeleton": true },
-  "M9": { "gate": "hack/acceptance/m9.sh", "tier": "lab",         "requires": ["dev-mac"],                             "manual": true,  "skeleton": true }
+  "M9": { "gate": "hack/acceptance/m9.sh", "tier": "lab",         "requires": ["dev-mac"],                             "manual": true,  "skeleton": true },
+  "M10": { "gate": "hack/acceptance/m10.sh", "tier": "integration", "requires": ["dev-mac"],                           "manual": false, "skeleton": true },
+  "M10-lab": { "gate": "hack/lab/m10.sh",  "tier": "lab",         "requires": ["dev-mac", "network"],                  "manual": true,  "skeleton": true }
 }
