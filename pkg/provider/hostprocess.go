@@ -29,12 +29,11 @@ import (
 	"syscall"
 
 	dto "github.com/prometheus/client_model/go"
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // HostProcess is the k3sm M0 "HostProcess" Virtual Kubelet provider: it runs each
@@ -75,9 +74,9 @@ func NewHostProcess(nodeName, podRoot, nodeIP string) *HostProcess {
 
 // Compile-time checks that we satisfy the VK contracts and the Runtime seam.
 var (
-	_ vknode.PodLifecycleHandler = (*HostProcess)(nil)
-	_ vknode.PodNotifier         = (*HostProcess)(nil)
-	_ Runtime                    = (*HostProcess)(nil)
+	_ vkadapter.PodLifecycleHandler = (*HostProcess)(nil)
+	_ vkadapter.PodNotifier         = (*HostProcess)(nil)
+	_ Runtime                       = (*HostProcess)(nil)
 )
 
 // CreatePod launches every container of the pod as a native process.
@@ -209,7 +208,7 @@ func (p *HostProcess) GetPod(ctx context.Context, ns, name string) (*corev1.Pod,
 	defer p.mu.Unlock()
 	rec, ok := p.pods[podKey(ns, name)]
 	if !ok {
-		return nil, errdefs.NotFoundf("pod %q not found", podKey(ns, name))
+		return nil, vkadapter.NotFoundf("pod %q not found", podKey(ns, name))
 	}
 	return rec.pod.DeepCopy(), nil
 }
@@ -257,30 +256,30 @@ func (p *HostProcess) dispatch(pod *corev1.Pod) {
 }
 
 // GetContainerLogs returns the container's combined stdout/stderr log file.
-func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
 	p.mu.Lock()
 	rec, ok := p.pods[podKey(ns, podName)]
 	p.mu.Unlock()
 	if !ok {
-		return nil, errdefs.NotFoundf("pod %q not found", podKey(ns, podName))
+		return nil, vkadapter.NotFoundf("pod %q not found", podKey(ns, podName))
 	}
 	pr, ok := rec.procs[containerName]
 	if !ok {
-		return nil, errdefs.NotFoundf("container %q not found", containerName)
+		return nil, vkadapter.NotFoundf("container %q not found", containerName)
 	}
 	return os.Open(pr.logPath)
 }
 
 // --- not implemented in M0 ---
 
-func (p *HostProcess) RunInContainer(ctx context.Context, ns, podName, c string, cmd []string, a api.AttachIO) error {
-	return errdefs.NotFound("exec is not implemented in the M0 HostProcess provider")
+func (p *HostProcess) RunInContainer(ctx context.Context, ns, podName, c string, cmd []string, a vkadapter.AttachIO) error {
+	return vkadapter.NotFound("exec is not implemented in the M0 HostProcess provider")
 }
-func (p *HostProcess) AttachToContainer(ctx context.Context, ns, podName, c string, a api.AttachIO) error {
-	return errdefs.NotFound("attach is not implemented in the M0 HostProcess provider")
+func (p *HostProcess) AttachToContainer(ctx context.Context, ns, podName, c string, a vkadapter.AttachIO) error {
+	return vkadapter.NotFound("attach is not implemented in the M0 HostProcess provider")
 }
 func (p *HostProcess) PortForward(ctx context.Context, ns, podName string, port int32, s io.ReadWriteCloser) error {
-	return errdefs.NotFound("port-forward is not implemented in the M0 HostProcess provider")
+	return vkadapter.NotFound("port-forward is not implemented in the M0 HostProcess provider")
 }
 func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil

@@ -27,13 +27,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	utilexec "k8s.io/utils/exec"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // M2.5 — provider-served exec/attach/port-forward. These prove the provider wires
@@ -179,14 +179,14 @@ type fakeAttachIO struct {
 	stdout *syncBuffer
 	stderr *syncBuffer
 	tty    bool
-	resize chan api.TermSize
+	resize chan vkadapter.TermSize
 }
 
-func (f *fakeAttachIO) Stdin() io.Reader            { return f.stdin }
-func (f *fakeAttachIO) Stdout() io.WriteCloser      { return f.stdout }
-func (f *fakeAttachIO) Stderr() io.WriteCloser      { return f.stderr }
-func (f *fakeAttachIO) TTY() bool                   { return f.tty }
-func (f *fakeAttachIO) Resize() <-chan api.TermSize { return f.resize }
+func (f *fakeAttachIO) Stdin() io.Reader                  { return f.stdin }
+func (f *fakeAttachIO) Stdout() io.WriteCloser            { return f.stdout }
+func (f *fakeAttachIO) Stderr() io.WriteCloser            { return f.stderr }
+func (f *fakeAttachIO) TTY() bool                         { return f.tty }
+func (f *fakeAttachIO) Resize() <-chan vkadapter.TermSize { return f.resize }
 
 // newStreamProvider builds a runtimedRuntime over f with one tracked pod ("web"
 // in "default") so the streaming verbs resolve it.

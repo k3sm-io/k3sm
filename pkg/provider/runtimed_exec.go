@@ -23,12 +23,11 @@ import (
 	"io"
 	"sync"
 
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"google.golang.org/grpc"
 	utilexec "k8s.io/utils/exec"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // M2.5 — provider-served exec/attach/port-forward. The Virtual Kubelet provider
@@ -101,10 +100,10 @@ func (s *streamPipe[Req, Resp]) feed(r *Req) bool {
 // RunInContainer implements `kubectl exec` for the runtimed runtime: it resolves
 // the pod, then streams the VK AttachIO over the runtime Exec RPC, returning the
 // command's exit status (StreamingRuntime).
-func (r *runtimedRuntime) RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach api.AttachIO) error {
+func (r *runtimedRuntime) RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach vkadapter.AttachIO) error {
 	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
-		return errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
+		return vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
 	tty := attach.TTY()
 	initial := &runtimev1.ExecRequest{
@@ -131,10 +130,10 @@ func (r *runtimedRuntime) RunInContainer(ctx context.Context, namespace, podName
 // AttachToContainer implements `kubectl attach` for the runtimed runtime: it
 // streams the VK AttachIO over the runtime Attach RPC (a running container's
 // stdio, no command), returning the exit status (StreamingRuntime).
-func (r *runtimedRuntime) AttachToContainer(ctx context.Context, namespace, podName, container string, attach api.AttachIO) error {
+func (r *runtimedRuntime) AttachToContainer(ctx context.Context, namespace, podName, container string, attach vkadapter.AttachIO) error {
 	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
-		return errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
+		return vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
 	tty := attach.TTY()
 	initial := &runtimev1.AttachRequest{
@@ -165,7 +164,7 @@ func (r *runtimedRuntime) AttachToContainer(ctx context.Context, namespace, podN
 func (r *runtimedRuntime) PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error {
 	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
-		return errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
+		return vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -234,7 +233,7 @@ func (r *runtimedRuntime) PortForward(ctx context.Context, namespace, podName st
 // runs the RPC with the assembled stream (rt.Exec / rt.Attach).
 func streamAttachIO[Req, Resp any](
 	ctx context.Context,
-	attach api.AttachIO,
+	attach vkadapter.AttachIO,
 	initial *Req,
 	mkStdin func([]byte) *Req,
 	mkResize func(width, height uint32) *Req,
@@ -291,7 +290,7 @@ func streamAttachIO[Req, Resp any](
 // is cancelled (the RPC finished). stdin's blocking Read runs in a sub-goroutine
 // so it can be multiplexed with the resize channel; frames are sent under a
 // ctx-guarded select so a finished RPC never blocks the pump.
-func pumpClientStreams[Req, Resp any](ctx context.Context, attach api.AttachIO, pipe *streamPipe[Req, Resp], mkStdin func([]byte) *Req, mkResize func(width, height uint32) *Req) {
+func pumpClientStreams[Req, Resp any](ctx context.Context, attach vkadapter.AttachIO, pipe *streamPipe[Req, Resp], mkStdin func([]byte) *Req, mkResize func(width, height uint32) *Req) {
 	stdinFrames := make(chan *Req)
 	go func() {
 		defer close(stdinFrames)

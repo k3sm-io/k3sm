@@ -25,7 +25,6 @@ import (
 	"log/slog"
 	"math"
 	"net"
-	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -34,9 +33,6 @@ import (
 	"strings"
 	"syscall"
 
-	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -50,11 +46,12 @@ import (
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provider"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
 // compile-time check that the VK adapter satisfies the full VK provider contract.
-var _ nodeutil.Provider = (*provider.VKProvider)(nil)
+var _ vkadapter.Provider = (*provider.VKProvider)(nil)
 
 // nodeOptions configures a Virtual Kubelet node bring-up. It is shared by the
 // standalone `k3sm node` command and the in-process node `k3sm server` runs.
@@ -124,33 +121,18 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		}
 	}
 
-	// The kubelet HTTP API (logs/exec) only serves when BOTH a TLS config and a
-	// handler are set. Wire a mux with the provider routes attached so the
-	// apiserver→node proxy reaches /containerLogs (M1.2).
-	mux := http.NewServeMux()
-	nodeOpts := []nodeutil.NodeOpt{
-		func(c *nodeutil.NodeConfig) error {
-			c.Client = cs
-			c.HTTPListenAddr = opts.listen
-			c.NumWorkers = 4
-			c.TLSConfig = servingTLS // nil = plain HTTP (M0 path); set = kubelet-serving TLS
-			if servingTLS != nil {
-				c.Handler = api.InstrumentHandler(nodeutil.WithAuth(nodeutil.NoAuth(), mux))
-			}
-			return nil
-		},
-	}
-	if servingTLS != nil {
-		nodeOpts = append(nodeOpts, nodeutil.AttachProviderRoutes(mux))
-	}
-
-	n, err := nodeutil.NewNode(opts.nodeName,
-		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, vknode.NodeProvider, error) {
-			configureNode(pc.Node, opts.nodeName, opts.nodeIP)
-			return prov, nil, nil // nil NodeProvider -> NewNaiveNodeProvider (auto-Ready + lease heartbeat)
-		},
-		nodeOpts...,
-	)
+	// Build the VK node through the adapter: it encapsulates the kubelet HTTP API
+	// wiring (logs/exec only serve when BOTH a TLS config and a handler are set, so
+	// the apiserver→node proxy reaches /containerLogs — M1.2) and the
+	// nil-NodeProvider → NaiveNodeProvider (auto-Ready + lease heartbeat) path.
+	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
+		Client:         cs,
+		Provider:       prov,
+		HTTPListenAddr: opts.listen,
+		NumWorkers:     4,
+		TLSConfig:      servingTLS, // nil = plain HTTP (M0 path); set = kubelet-serving TLS
+		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, opts.nodeIP) },
+	})
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
 	}
@@ -180,7 +162,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // runtimed is the M1 image runtime (OCI pull → clonefile → ad-hoc-sign →
 // Seatbelt confine), wrapped in the VK adapter. cs is the apiserver client the
 // runtimed provider resolves volumes/env/imagePullSecrets with (M2.1/M2.6).
-func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider, string, error) {
+func buildProvider(opts nodeOptions, cs kubernetes.Interface) (vkadapter.Provider, string, error) {
 	switch opts.runtime {
 	case "", "hostprocess":
 		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP), "hostprocess", nil
