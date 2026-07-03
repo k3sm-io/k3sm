@@ -276,6 +276,17 @@ func streamAttachIO[Req, Resp any](
 
 	go pumpClientStreams(ctx, attach, pipe, mkStdin, mkResize)
 
+	// Drain-before-return invariant (kubectl cp / tar-stream no-truncation):
+	// streamPipe.Send runs the inline `send` synchronously, so every server→client
+	// stdout byte is written to attach.Stdout() BEFORE invoke returns — no stdout is
+	// left buffered past this call. That is exactly why a `tar cf -` stream (kubectl
+	// cp pod:src → local) is never truncated: the terminal ExecResult cannot be
+	// observed until all preceding stdout Sends have completed. The M2 daemon split
+	// (which swaps the in-process streamPipe transport — see the streamPipe type
+	// comment — for a real gRPC client stream) MUST preserve this by BLOCKING on an
+	// explicit read-to-close drain of the server stream before RunInContainer
+	// returns — a fire-and-forget reader would let the final tar bytes race past the
+	// return and truncate the copied archive.
 	err := invoke(pipe)
 	cancel() // stop the client pump
 
