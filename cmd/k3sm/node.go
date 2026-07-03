@@ -41,7 +41,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
@@ -111,7 +114,16 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		return fmt.Errorf("build client: %w", err)
 	}
 
-	prov, runtimeLabel, err := buildProvider(opts, cs)
+	// Event sink for node-emitted pod lifecycle Events (Pulled/Created/Started/
+	// Killing) so `kubectl describe pod` shows them. The broadcaster starts a
+	// goroutine that drains to the apiserver Events API; defer its Shutdown to node
+	// teardown so it does not leak.
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: cs.CoreV1().Events("")})
+	defer eventBroadcaster.Shutdown()
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
+
+	prov, runtimeLabel, err := buildProvider(opts, cs, recorder)
 	if err != nil {
 		return err
 	}
@@ -180,10 +192,12 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // runtimed is the M1 image runtime (OCI pull → clonefile → ad-hoc-sign →
 // Seatbelt confine), wrapped in the VK adapter. cs is the apiserver client the
 // runtimed provider resolves volumes/env/imagePullSecrets with (M2.1/M2.6).
-func buildProvider(opts nodeOptions, cs kubernetes.Interface) (nodeutil.Provider, string, error) {
+// recorder is the EventRecorder the HostProcess provider emits pod lifecycle
+// Events to (the runtimed VK-provider-path emit is a deferred follow-up).
+func buildProvider(opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (nodeutil.Provider, string, error) {
 	switch opts.runtime {
 	case "", "hostprocess":
-		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP), "hostprocess", nil
+		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), "hostprocess", nil
 	case "runtimed":
 		rt, err := provider.NewRuntimed(runtimedConfig(opts, cs))
 		if err != nil {

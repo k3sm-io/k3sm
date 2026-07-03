@@ -138,7 +138,7 @@ func TestPodKey(t *testing.T) {
 }
 
 func TestCreatePodRunsToCompletion(t *testing.T) {
-	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1")
+	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
 	pod := newPod("default", "ok", "/usr/bin/true")
 	if err := p.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -147,7 +147,7 @@ func TestCreatePodRunsToCompletion(t *testing.T) {
 }
 
 func TestCreatePodFailureExitCode(t *testing.T) {
-	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1")
+	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
 	pod := newPod("default", "fail", "/bin/sh", "-c", "exit 3")
 	if err := p.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -165,7 +165,7 @@ func TestCreatePodFailureExitCode(t *testing.T) {
 }
 
 func TestCreatePodIdempotent(t *testing.T) {
-	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1")
+	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
 	pod := newPod("default", "long", "/bin/sh", "-c", "sleep 60")
 	t.Cleanup(func() { _ = p.DeletePod(context.Background(), pod) })
 
@@ -185,7 +185,7 @@ func TestCreatePodIdempotent(t *testing.T) {
 }
 
 func TestDeletePodIdempotent(t *testing.T) {
-	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1")
+	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
 	pod := newPod("default", "del", "/bin/sh", "-c", "sleep 60")
 	if err := p.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -202,7 +202,7 @@ func TestDeletePodIdempotent(t *testing.T) {
 }
 
 func TestGetPodNotFound(t *testing.T) {
-	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1")
+	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
 	if _, err := p.GetPod(context.Background(), "default", "nope"); !errdefs.IsNotFound(err) {
 		t.Fatalf("want NotFound, got %v", err)
 	}
@@ -211,7 +211,7 @@ func TestGetPodNotFound(t *testing.T) {
 // TestNotifyPodsCallbackFires verifies the PodNotifier callback runs (asynchronously,
 // outside the provider lock — the re-entrancy rule in the standards).
 func TestNotifyPodsCallbackFires(t *testing.T) {
-	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1")
+	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
 	got := make(chan *corev1.Pod, 4)
 	p.NotifyPods(context.Background(), func(pod *corev1.Pod) { got <- pod })
 
