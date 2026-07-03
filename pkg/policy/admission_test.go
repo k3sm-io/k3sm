@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -316,5 +317,112 @@ func TestProviderTolerationWarn(t *testing.T) {
 	}
 	if strings.Contains(providerTolerationExpr, "size(") {
 		t.Errorf("CEL must not use the naive size() emptiness shortcut: %q", providerTolerationExpr)
+	}
+}
+
+// TestDaemonSetTolerationInjectedNotNodeSelector is the B76 gate: the MUTATING policy
+// EnsureDaemonSetTolerationMutation provisions injects the provider TOLERATION into
+// DaemonSet-owned pods and NEVER the os=darwin nodeSelector (Res.7 — a DaemonSet's own
+// placement intent must not be overridden). It asserts the concrete
+// MutatingAdmissionPolicy object: (a) the JSONPatch mutation injects the provider
+// toleration keyed to ProviderTaintKey (Exists/NoSchedule on the tolerations list); (b)
+// the NEGATIVE pin — no nodeSelector / no darwin anywhere in the policy; (c) DS-only —
+// the matchCondition is group-qualified so a ReplicaSet/Job/StatefulSet owner (or a CRD
+// DaemonSet in another group) does not match.
+func TestDaemonSetTolerationInjectedNotNodeSelector(t *testing.T) {
+	cs := fake.NewClientset()
+	ctx := context.Background()
+
+	if err := EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
+		t.Fatalf("EnsureDaemonSetTolerationMutation: %v", err)
+	}
+
+	pol, err := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicies().Get(ctx, dsTolerationPolicyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get mutating policy: %v", err)
+	}
+
+	// It must match Pods on CREATE (a mutation of an existing pod's placement makes no
+	// sense — the DS pod is unschedulable from birth).
+	if len(pol.Spec.MatchConstraints.ResourceRules) == 0 {
+		t.Fatal("policy must match a resource")
+	}
+	rule := pol.Spec.MatchConstraints.ResourceRules[0]
+	if !containsStr(rule.Resources, "pods") {
+		t.Errorf("policy must match pods, got %v", rule.Resources)
+	}
+	if !sameOps(rule.Operations, []admissionregistrationv1beta1.OperationType{admissionregistrationv1beta1.Create}) {
+		t.Errorf("policy operations = %v, want exactly [CREATE]", rule.Operations)
+	}
+	if pol.Spec.ReinvocationPolicy != admissionregistrationv1beta1.IfNeededReinvocationPolicy {
+		t.Errorf("reinvocationPolicy = %q, want IfNeeded", pol.Spec.ReinvocationPolicy)
+	}
+	// A convenience injector must fail OPEN: with an all-Pods/CREATE MatchConstraints,
+	// FailurePolicy Fail would turn any CEL error into a cluster-wide Pod-CREATE denial.
+	// Ignore degrades to Unschedulable (no guard bypass — the Deny VAP + taint hold).
+	if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionregistrationv1beta1.Ignore {
+		t.Errorf("failurePolicy = %v, want Ignore (fail open — this is a convenience injector, not a guard)", pol.Spec.FailurePolicy)
+	}
+
+	// (a) The mutation injects the provider TOLERATION — keyed to the const, not a bare
+	// Exists — via a JSONPatch (NOT an ApplyConfiguration, which would clobber the atomic
+	// list). Assert the patch CEL carries ProviderTaintKey + Exists + NoSchedule +
+	// tolerations.
+	if len(pol.Spec.Mutations) != 1 {
+		t.Fatalf("want exactly one mutation, got %d", len(pol.Spec.Mutations))
+	}
+	mut := pol.Spec.Mutations[0]
+	if mut.PatchType != admissionregistrationv1beta1.PatchTypeJSONPatch {
+		t.Errorf("patchType = %q, want JSONPatch (ApplyConfiguration would replace the atomic tolerations list)", mut.PatchType)
+	}
+	if mut.JSONPatch == nil {
+		t.Fatal("mutation must carry a JSONPatch (not an ApplyConfiguration)")
+	}
+	patch := mut.JSONPatch.Expression
+	for _, want := range []string{ProviderTaintKey, "Exists", "NoSchedule", "tolerations"} {
+		if !strings.Contains(patch, want) {
+			t.Errorf("JSONPatch mutation missing %q: %q", want, patch)
+		}
+	}
+
+	// (b) NEGATIVE PIN (Res.7): the mutation injects ONLY the toleration — the policy
+	// references NEITHER a nodeSelector NOR darwin anywhere (patch, matchConditions, or
+	// anything else). Injecting the os=darwin selector would override the DS's own
+	// placement intent.
+	blob := patch
+	for _, mc := range pol.Spec.MatchConditions {
+		blob += " " + mc.Expression
+	}
+	for _, banned := range []string{"nodeSelector", "darwin"} {
+		if strings.Contains(blob, banned) {
+			t.Errorf("Res.7 violated: policy must NOT reference %q (toleration only), got %q", banned, blob)
+		}
+	}
+
+	// (c) DS-ONLY, group-qualified: the matchCondition requires kind == 'DaemonSet' AND
+	// controller == true AND apiVersion.startsWith('apps/') — so a ReplicaSet/Job/
+	// StatefulSet owner, or a CRD kind: DaemonSet in some other group, does NOT match.
+	var conds string
+	for _, mc := range pol.Spec.MatchConditions {
+		conds += " " + mc.Expression
+	}
+	for _, want := range []string{"kind == 'DaemonSet'", "controller == true", "apiVersion.startsWith('apps/')"} {
+		if !strings.Contains(conds, want) {
+			t.Errorf("matchConditions missing DS-only guard %q: %q", want, conds)
+		}
+	}
+
+	// The binding points at the policy (mutations are not validated, so no ValidationActions).
+	bind, err := cs.AdmissionregistrationV1beta1().MutatingAdmissionPolicyBindings().Get(ctx, dsTolerationBindingName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get mutating binding: %v", err)
+	}
+	if bind.Spec.PolicyName != dsTolerationPolicyName {
+		t.Errorf("binding points at %q, want %q", bind.Spec.PolicyName, dsTolerationPolicyName)
+	}
+
+	// Idempotent on server restart.
+	if err := EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
+		t.Errorf("second provision must be idempotent: %v", err)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -54,6 +55,13 @@ const (
 const (
 	foreignUserPolicyName  = "k3sm-reject-foreign-user"
 	foreignUserBindingName = "k3sm-reject-foreign-user-binding"
+)
+
+// dsTolerationPolicyName / dsTolerationBindingName name the MUTATING policy (B76)
+// that injects the provider toleration into DaemonSet-owned pods so they schedule.
+const (
+	dsTolerationPolicyName  = "k3sm-inject-daemonset-provider-toleration"
+	dsTolerationBindingName = "k3sm-inject-daemonset-provider-toleration-binding"
 )
 
 // etpLocalPolicyName / etpLocalBindingName name the Warn policy that surfaces the
@@ -120,6 +128,108 @@ const providerTolerationExpr = `has(object.spec.tolerations) && object.spec.tole
 	`(!has(t.key) || t.key == '` + ProviderTaintKey + `') && ` +
 	`((has(t.operator) && t.operator == 'Exists') || ` +
 	`((!has(t.operator) || t.operator == 'Equal') && (!has(t.value) || t.value == ''))))`
+
+// daemonSetOwnedExpr is the matchCondition CEL that fires the B76 mutating policy
+// ONLY for a pod created by the DaemonSet controller. It is GROUP-QUALIFIED
+// (o.apiVersion.startsWith('apps/')) so a CRD `kind: DaemonSet` in some other API
+// group cannot masquerade as a real apps/v1 DaemonSet and steal the injection; and
+// it requires o.controller == true so only the managing (controller) ownerReference —
+// not a bare owner cross-reference — matches. A ReplicaSet/Job/StatefulSet-owned pod
+// (the KCM's other controllers) does NOT match, so it never receives the toleration.
+const daemonSetOwnedExpr = `object.metadata.ownerReferences.exists(o, ` +
+	`o.kind == 'DaemonSet' && o.controller == true && o.apiVersion.startsWith('apps/'))`
+
+// daemonSetTolerationPatchExpr is the JSONPatch-mutation CEL that APPENDS exactly one
+// toleration for the provider taint to a DS-owned pod. A JSONPatch (append to
+// /spec/tolerations/-) is used deliberately INSTEAD of an ApplyConfiguration: the
+// tolerations list is an ATOMIC list, so an apply-config would REPLACE the whole list
+// and clobber the NoExecute tolerations the default-on DefaultTolerationSeconds plugin
+// injects (node.kubernetes.io/not-ready, …). The append is idempotent because the
+// not-already-tolerating matchCondition (the negation of providerTolerationExpr) only
+// lets the mutation run when the pod does not already tolerate the taint. ONLY the
+// toleration is injected — never the kubernetes.io/os=darwin nodeSelector: a DaemonSet
+// declares its own placement intent, and overriding it here would defeat the DS's
+// nodeSelector/affinity (B76 Res.7). ProviderTaintKey is interpolated so the taint key
+// lives in exactly one place (single-sourced with the taint the node stamps).
+const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerations/-", ` +
+	`value: Object.spec.tolerations{key: "` + ProviderTaintKey + `", operator: "Exists", effect: "NoSchedule"}}]`
+
+// EnsureDaemonSetTolerationMutation idempotently provisions the B76
+// MutatingAdmissionPolicy (+ binding) that injects the provider toleration into
+// DaemonSet-owned pods. A DS pod is created by the DaemonSet controller in the
+// kube-controller-manager, so the B17 CREATE-Warn advisory never reaches its author and
+// the pod would sit Unschedulable against the k3sm.io/provider:NoSchedule taint; this
+// policy MUTATES the pod to tolerate it. UNLIKE the Deny/Warn ValidatingAdmissionPolicies
+// it CHANGES the stored object. Both matchConditions must hold (DS-owned AND not already
+// tolerating); the mutation appends exactly one toleration and NEVER a nodeSelector
+// (Res.7). Safe to call on every server start (AlreadyExists is success).
+//
+// This provisions objects for a BETA API (admissionregistration.k8s.io/v1beta1,
+// MutatingAdmissionPolicy) — the executor must enable the v1beta1 runtime-config AND the
+// MutatingAdmissionPolicy feature gate on the apiserver (see executor.apiServerArgs) or
+// this policy is a runtime no-op.
+func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interface) error {
+	api := cs.AdmissionregistrationV1beta1()
+
+	// Ignore — NOT Fail — because this is a scheduling-CONVENIENCE injector, not a
+	// guard: MatchConstraints is all Pods/CREATE, so a Fail policy would turn any
+	// CEL/beta-machinery evaluation error into a cluster-wide denial of Pod CREATE.
+	// Failing open instead degrades to the pre-B76 status quo (the DS pod is created
+	// without the toleration and stays Unschedulable — visible and recoverable, no
+	// guard bypass: the os=darwin Deny VAP and the provider taint still hold). Mirrors
+	// the advisory Warn VAP's deliberate Ignore.
+	ignore := admissionregistrationv1beta1.Ignore
+	policy := &admissionregistrationv1beta1.MutatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   dsTolerationPolicyName,
+			Labels: map[string]string{"k3sm.io/managed": "true"},
+		},
+		Spec: admissionregistrationv1beta1.MutatingAdmissionPolicySpec{
+			FailurePolicy: &ignore,
+			MatchConstraints: &admissionregistrationv1beta1.MatchResources{
+				ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+						Operations: []admissionregistrationv1beta1.OperationType{admissionregistrationv1beta1.Create},
+						Rule: admissionregistrationv1beta1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"pods"},
+						},
+					},
+				}},
+			},
+			// BOTH conditions must hold: the pod is DS-owned (group-qualified) AND it does
+			// not already tolerate the taint (the negation of the single-sourced
+			// providerTolerationExpr — never a second, drifting ToleratesTaint CEL).
+			MatchConditions: []admissionregistrationv1beta1.MatchCondition{
+				{Name: "is-daemonset-pod", Expression: daemonSetOwnedExpr},
+				{Name: "not-already-tolerating", Expression: "!(" + providerTolerationExpr + ")"},
+			},
+			Mutations: []admissionregistrationv1beta1.Mutation{{
+				PatchType: admissionregistrationv1beta1.PatchTypeJSONPatch,
+				JSONPatch: &admissionregistrationv1beta1.JSONPatch{Expression: daemonSetTolerationPatchExpr},
+			}},
+			ReinvocationPolicy: admissionregistrationv1beta1.IfNeededReinvocationPolicy,
+		},
+	}
+	if _, err := api.MutatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create daemonset-toleration mutating policy: %w", err)
+	}
+
+	binding := &admissionregistrationv1beta1.MutatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   dsTolerationBindingName,
+			Labels: map[string]string{"k3sm.io/managed": "true"},
+		},
+		Spec: admissionregistrationv1beta1.MutatingAdmissionPolicyBindingSpec{
+			PolicyName: dsTolerationPolicyName,
+		},
+	}
+	if _, err := api.MutatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create daemonset-toleration mutating binding: %w", err)
+	}
+	return nil
+}
 
 // EnsureDarwinAdmission idempotently provisions the os=darwin
 // ValidatingAdmissionPolicy and its binding so non-darwin Pods are rejected at

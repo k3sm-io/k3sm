@@ -368,6 +368,16 @@ func apiServerArgs(cfg Config) []string {
 		// objects — the admission half of the Node authorizer. It does NOT cover CRDs,
 		// so the net.k3sm.io/MeshPeer write stays guarded by bootstrap.AuthorizeMeshPeerWrite.
 		"--enable-admission-plugins=NodeRestriction",
+		// B76: enable the BETA MutatingAdmissionPolicy API + feature gate so the
+		// EnsureDaemonSetTolerationMutation policy (which injects the provider toleration
+		// into DaemonSet-owned pods) is actually evaluated. MutatingAdmissionPolicy is
+		// BETA and OFF by default at the pinned k8s (v1.36.2); without BOTH of these the
+		// policy is provisioned but a runtime no-op. CAUTION: an invalid feature-gate name
+		// or a v1beta1 group that the pinned apiserver does not serve makes kube-apiserver
+		// REFUSE to start — the gate name + v1beta1 serving MUST be lab-verified against
+		// the kwok-ci v1.36.2 apiserver before a real rollout.
+		"--runtime-config=admissionregistration.k8s.io/v1beta1=true",
+		"--feature-gates=MutatingAdmissionPolicy=true",
 		"--bind-address", bind,
 		"--advertise-address", cfg.NodeIP,
 		"--secure-port", strconv.Itoa(cfg.APIServerPort),
