@@ -850,7 +850,14 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
 	applyProbeOverlay(cs, probes)
 
-	anyRunning, anyFailed, allReady := false, false, true
+	anyRunning, anyFailed := false, false
+	// containersReady is the AND of every container's Ready over the statuses this
+	// path built — NOT a hardcoded True. (M0/HostProcess has no readiness probes: a
+	// container is Ready when Running; applyProbeOverlay refines it when a readiness
+	// probe is served. This is the probe-less reduction.) It gates PodReady via the
+	// shared computeReadiness seam, which then honors spec.readinessGates. An empty
+	// container set is not ready.
+	containersReady := len(cs) > 0
 	for i := range cs {
 		st := &cs[i]
 		if st.State.Running != nil {
@@ -860,11 +867,8 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 			anyFailed = true
 		}
 		if !st.Ready {
-			allReady = false
+			containersReady = false
 		}
-	}
-	if len(cs) == 0 {
-		allReady = false
 	}
 
 	phase := derivePhase(rs.GetPhase(), anyRunning, anyFailed)
@@ -896,19 +900,125 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 		}
 	}
 
-	ready := corev1.ConditionFalse
-	if (phase == corev1.PodRunning || phase == corev1.PodSucceeded) && allReady {
-		ready = corev1.ConditionTrue
+	crStatus := corev1.ConditionFalse
+	if containersReady {
+		crStatus = corev1.ConditionTrue
 	}
-	containersReady := corev1.ConditionFalse
-	if allReady && anyRunning {
-		containersReady = corev1.ConditionTrue
-	}
+	// Merge-not-replace (mirrors the QOSClass carry-forward above): emit the four
+	// provider-owned conditions — PodReady via the shared computeReadiness seam so
+	// spec.readinessGates are honored — then carry FORWARD any external condition on
+	// the input pod (e.g. a readinessGate condition a controller patched) so it
+	// survives this status write and stays observable to computeReadiness.
 	out.Conditions = []corev1.PodCondition{
 		{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
-		{Type: corev1.PodReady, Status: ready},
-		{Type: corev1.ContainersReady, Status: containersReady},
+		computeReadiness(pod, containersReady),
+		{Type: corev1.ContainersReady, Status: crStatus},
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+	}
+	out.Conditions = append(out.Conditions, carryForwardExternalConditions(pod)...)
+	return out
+}
+
+// computeReadiness derives the PodReady condition, honoring spec.readinessGates. It
+// is the single pure authority every status-build path (toPodStatus, and
+// CreatePod/reap via hostprocess.go) routes through, so PodReady never diverges
+// between the live runtimed path and the M0 host-process path.
+//
+// The rule (mirrors the kubelet's GeneratePodReadyCondition):
+//   - containersReady is the precondition: when the containers are not ready the
+//     gates are short-circuited and PodReady is False/"ContainersNotReady" (the
+//     kubelet short-circuits gates behind ContainersReady).
+//   - otherwise PodReady = ContainersReady AND (every readinessGate whose condition
+//     is PRESENT on the pod is True): a gate present-and-True is satisfied; a gate
+//     present-and-not-True (False/Unknown) blocks with "ReadinessGatesNotReady"
+//     naming the gate.
+//
+// CEILING — the absent-gate anti-stall safety rule (do NOT change without reading
+// this): a readinessGate whose condition is ABSENT from pod.Status.Conditions does
+// NOT block PodReady — it is treated as not-yet-observable, as-if-satisfied. This is
+// deliberate and load-bearing. The k3sm VK provider CANNOT observe an
+// externally-patched gate condition today (VK's podsEqual ignores status, UpdatePod
+// is a no-op, and VK blind-overwrites pod status), so if an ABSENT gate blocked
+// PodReady, every pod carrying an external readinessGate would stall NotReady FOREVER
+// — strictly worse than advancing a rolling update too early. k3sm therefore honors
+// OBSERVABLE gates only; the informer feedback loop that would let the provider react
+// to external gate patches is a DEFERRED follow-up, not shipped here.
+func computeReadiness(pod *corev1.Pod, containersReady bool) corev1.PodCondition {
+	cond := corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}
+	switch {
+	case !containersReady:
+		cond.Status = corev1.ConditionFalse
+		cond.Reason = "ContainersNotReady"
+		cond.Message = "containers are not ready"
+	case pod != nil:
+		for i := range pod.Spec.ReadinessGates {
+			gate := pod.Spec.ReadinessGates[i].ConditionType
+			c := findPodCondition(pod.Status.Conditions, gate)
+			if c == nil {
+				continue // ABSENT → not-yet-observable → do NOT block (anti-stall ceiling)
+			}
+			if c.Status != corev1.ConditionTrue {
+				cond.Status = corev1.ConditionFalse
+				cond.Reason = "ReadinessGatesNotReady"
+				cond.Message = fmt.Sprintf("the status of readiness gate %q is %q, want %q",
+					gate, c.Status, corev1.ConditionTrue)
+				break
+			}
+		}
+	}
+	cond.LastTransitionTime = readyTransitionTime(pod, cond.Status)
+	return cond
+}
+
+// findPodCondition returns a pointer to the condition of type t within conds, or nil
+// when absent. The returned pointer aliases the slice element (read-only use).
+func findPodCondition(conds []corev1.PodCondition, t corev1.PodConditionType) *corev1.PodCondition {
+	for i := range conds {
+		if conds[i].Type == t {
+			return &conds[i]
+		}
+	}
+	return nil
+}
+
+// readyTransitionTime returns the LastTransitionTime for a PodReady condition
+// flipping to newStatus: the pod's existing PodReady LastTransitionTime when the
+// status is unchanged, else metav1.Now() (the flip instant).
+func readyTransitionTime(pod *corev1.Pod, newStatus corev1.ConditionStatus) metav1.Time {
+	if pod != nil {
+		if cur := findPodCondition(pod.Status.Conditions, corev1.PodReady); cur != nil && cur.Status == newStatus {
+			return cur.LastTransitionTime
+		}
+	}
+	return metav1.Now()
+}
+
+// isProviderOwnedCondition reports whether t is one of the four Pod conditions the
+// provider computes on every status write (Initialized/Ready/ContainersReady/
+// PodScheduled). Any OTHER condition is external (e.g. a readinessGate condition)
+// and is carried forward by carryForwardExternalConditions.
+func isProviderOwnedCondition(t corev1.PodConditionType) bool {
+	switch t {
+	case corev1.PodInitialized, corev1.PodReady, corev1.ContainersReady, corev1.PodScheduled:
+		return true
+	default:
+		return false
+	}
+}
+
+// carryForwardExternalConditions returns the pod's existing conditions MINUS the
+// four provider-owned types, so external/readinessGate conditions survive a provider
+// status rebuild (merge-not-replace, mirroring the QOSClass carry-forward in
+// toPodStatus). A nil pod yields nil.
+func carryForwardExternalConditions(pod *corev1.Pod) []corev1.PodCondition {
+	if pod == nil {
+		return nil
+	}
+	var out []corev1.PodCondition
+	for i := range pod.Status.Conditions {
+		if !isProviderOwnedCondition(pod.Status.Conditions[i].Type) {
+			out = append(out, pod.Status.Conditions[i])
+		}
 	}
 	return out
 }
