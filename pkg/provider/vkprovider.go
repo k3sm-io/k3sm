@@ -21,15 +21,14 @@ import (
 	"io"
 
 	dto "github.com/prometheus/client_model/go"
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
-	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // VKProvider adapts any Runtime into the full Virtual Kubelet provider contract
-// (nodeutil.Provider). It is the single seam the VK node talks to, so swapping
+// (vkadapter.Provider). It is the single seam the VK node talks to, so swapping
 // the pod-execution backend (HostProcess vs runtimed) is a one-line choice at
 // startup with no change to the node wiring.
 //
@@ -50,7 +49,7 @@ func NewVKProvider(rt Runtime, nodeName string) *VKProvider {
 }
 
 // Compile-time check that the adapter satisfies the full VK provider contract.
-var _ nodeutil.Provider = (*VKProvider)(nil)
+var _ vkadapter.Provider = (*VKProvider)(nil)
 
 // CreatePod delegates to the Runtime.
 func (v *VKProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
@@ -78,7 +77,7 @@ func (v *VKProvider) GetPod(ctx context.Context, namespace, name string) (*corev
 			return p, nil
 		}
 	}
-	return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+name)
+	return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 }
 
 // GetPodStatus delegates to the Runtime.
@@ -97,27 +96,27 @@ func (v *VKProvider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 }
 
 // GetContainerLogs delegates to the Runtime.
-func (v *VKProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+func (v *VKProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
 	return v.rt.GetContainerLogs(ctx, namespace, podName, containerName, opts)
 }
 
 // RunInContainer serves `kubectl exec`, delegating to the backing Runtime's
 // StreamingRuntime capability (the runtimed runtime drives the runtime/v1 Exec
 // RPC). A Runtime without it (HostProcess) reports NotFound (M2.5).
-func (v *VKProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
+func (v *VKProvider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach vkadapter.AttachIO) error {
 	s, ok := v.rt.(StreamingRuntime)
 	if !ok {
-		return errdefs.NotFound("exec is not supported by this runtime")
+		return vkadapter.NotFound("exec is not supported by this runtime")
 	}
 	return s.RunInContainer(ctx, namespace, podName, containerName, cmd, attach)
 }
 
 // AttachToContainer serves `kubectl attach`, delegating to the StreamingRuntime
 // capability; NotFound when the backing Runtime lacks it (M2.5).
-func (v *VKProvider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach api.AttachIO) error {
+func (v *VKProvider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach vkadapter.AttachIO) error {
 	s, ok := v.rt.(StreamingRuntime)
 	if !ok {
-		return errdefs.NotFound("attach is not supported by this runtime")
+		return vkadapter.NotFound("attach is not supported by this runtime")
 	}
 	return s.AttachToContainer(ctx, namespace, podName, containerName, attach)
 }
@@ -127,7 +126,7 @@ func (v *VKProvider) AttachToContainer(ctx context.Context, namespace, podName, 
 func (v *VKProvider) PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error {
 	s, ok := v.rt.(StreamingRuntime)
 	if !ok {
-		return errdefs.NotFound("port-forward is not supported by this runtime")
+		return vkadapter.NotFound("port-forward is not supported by this runtime")
 	}
 	return s.PortForward(ctx, namespace, podName, port, stream)
 }

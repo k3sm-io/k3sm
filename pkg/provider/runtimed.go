@@ -27,8 +27,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -37,6 +35,7 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
@@ -360,14 +359,14 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name string) (*corev1.PodStatus, error) {
 	id, start, pod, ok := r.lookup(namespace, name)
 	if !ok {
-		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+name)
+		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
 		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, name, err)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		return nil, errdefs.NotFoundf("pod %q not found in runtime", namespace+"/"+name)
+		return nil, vkadapter.NotFoundf("pod %q not found in runtime", namespace+"/"+name)
 	}
 	return toPodStatus(pod, resp.GetStatus(), r.nodeIP, start, r.proberFor(id)), nil
 }
@@ -397,10 +396,10 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // runtime into a ReadCloser the VK logs HTTP handler serves. Follow is honored
 // only for the non-follow path in M1 (the gate scopes kubectl logs to
 // non-follow); a follow request returns the current buffer and closes.
-func (r *runtimedRuntime) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+func (r *runtimedRuntime) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
 	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
-		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+podName)
+		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
 	}
 	sink := newLogSink(ctx)
 	req := &runtimev1.GetLogsRequest{
