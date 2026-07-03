@@ -36,4 +36,23 @@ limitations under the License.
 //   - externalTrafficPolicy: Local is not honored (the userspace splice does not
 //     preserve client source IP — only Cluster).
 //   - UDP Service ports have no datapath yet (the proxy opens no UDP listener).
+//
+// One is a MUTATING policy (B76) — a MutatingAdmissionPolicy (beta,
+// admissionregistration.k8s.io/v1beta1), which unlike the Deny/Warn VAPs above CHANGES
+// the stored object:
+//   - daemonset-provider-toleration: a DaemonSet-owned pod is created by the DS
+//     controller (in the kube-controller-manager), so the CREATE-Warn advisory never
+//     reaches its author and the pod sits Unschedulable against the
+//     k3sm.io/provider:NoSchedule taint. The policy appends the provider toleration
+//     (JSONPatch on the atomic /spec/tolerations list — not an ApplyConfiguration that
+//     would clobber the DefaultTolerationSeconds-injected NoExecute tolerations) so DS
+//     pods schedule. It injects ONLY the toleration, NEVER the
+//     kubernetes.io/os=darwin nodeSelector — a DaemonSet declares its own placement
+//     intent and overriding it would defeat the DS's selector/affinity (Res.7).
+//
+// CONFORMANCE requirement: a k3sm DaemonSet MUST declare
+// nodeSelector: kubernetes.io/os=darwin in its OWN pod template. The os=darwin Deny VAP
+// (the intent guard) still requires that selector on every pod; B76 injects only the
+// toleration and deliberately does not supply the selector (injecting it would override
+// the DS's placement, Res.7).
 package policy

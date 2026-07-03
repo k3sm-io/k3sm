@@ -267,6 +267,15 @@ func runServer(args []string) error {
 	if err := policy.EnsureProviderTolerationWarn(ctx, cs); err != nil {
 		logger.Error("provision provider-toleration warn policy", "err", err)
 	}
+	// B76 — MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
+	// controller (KCM), so the B17 CREATE-Warn advisory never reaches its author and
+	// the pod sits Unschedulable against the provider taint. Inject the provider
+	// toleration (never the os=darwin nodeSelector — Res.7) so DS pods schedule.
+	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; requires
+	// the executor's v1beta1 runtime-config + MutatingAdmissionPolicy feature gate.
+	if err := policy.EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
+		logger.Error("provision daemonset-toleration mutating policy", "err", err)
+	}
 	// Unprivileged posture: every pod runs as the single _k3sm uid (no per-pod uid
 	// isolation), so REJECT a pod requesting a foreign runAsUser/fsGroup at
 	// admission rather than letting it wedge at runtime (a privilege drop needs
