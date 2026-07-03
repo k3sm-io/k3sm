@@ -74,6 +74,12 @@ func saPubPath(workDir string) string { return filepath.Join(workDir, "sa.pub") 
 // the same path the server emits, single-sourcing the layout.
 func KubeconfigPath(workDir string) string { return kubeconfigPath(workDir) }
 
+// StateDBPath returns the kine SQLite state.db path for a given work dir
+// (<workDir>/db/state.db). Exported so preflight tooling (`k3sm doctor`) probes
+// the SAME file the datastore writes — single-sourcing the layout so a duplicated
+// path join in package main can never silently probe the wrong file.
+func StateDBPath(workDir string) string { return filepath.Join(dbDir(workDir), "state.db") }
+
 // KubectlPath returns the bundled kubectl binary path for a given work dir
 // (downloaded alongside the control-plane binaries by ensureControlPlaneBinaries).
 func KubectlPath(workDir string) string { return filepath.Join(binDir(workDir), "kubectl") }

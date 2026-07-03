@@ -47,9 +47,11 @@ const (
 
 // sqliteEndpoint is the single-node kine->SQLite WAL DSN. It is BYTE-UNCHANGED from
 // M1 (the single-node installed base depends on this exact string); do not reorder
-// or reformat the query parameters.
+// or reformat the query parameters. The path segment composes on StateDBPath so the
+// writer and the `k3sm doctor` probe share one source of the state.db layout — the
+// emitted string is byte-identical to the prior hand-joined form.
 func sqliteEndpoint(workDir string) string {
-	return "sqlite://" + filepath.Join(dbDir(workDir), "state.db") + "?_journal=WAL&_busy_timeout=30000"
+	return "sqlite://" + StateDBPath(workDir) + "?_journal=WAL&_busy_timeout=30000"
 }
 
 // kineArgs renders kine's argv from cfg. It is a pure function (no I/O) so the
