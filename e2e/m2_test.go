@@ -366,14 +366,15 @@ func TestM2_DenyUsers(t *testing.T) {
 	applyAndWaitSucceeded(t, c, pod, 90*time.Second)
 }
 
-// TestM2_ImagePullSecrets is a DEFERRED criterion: private-registry image pull via
-// imagePullSecrets is not in the M2/M3 native-runtime feature set (native pods exec
-// host/notarized binaries, not registry-pulled images; registry pull arrives with
-// the M5 vm path / a future native-image story). Kept in the criterion set as the
-// checklist of record, skipped with rationale rather than silently omitted.
+// TestM2_ImagePullSecrets is a DEFERRED criterion whose canonical home is now
+// TestM10_ImagePullSecret (B80): the imagePullSecrets private-registry pull-auth
+// criterion moved to the M10 conformance set once the pull path landed (resolver.go +
+// runtimed/pkg/image/pull.go, M2.6). This stub is retained only as the M2 checklist-of-
+// record reference (hack/acceptance/conformance/README.md, hack/acceptance/m2.sh);
+// the single owning criterion lives in e2e/m10_test.go.
 func TestM2_ImagePullSecrets(t *testing.T) {
 	Up(t)
-	t.Skip("DEFERRED: imagePullSecrets / private-registry pull is not an M2/M3 feature class (see docs/stockkitty-readiness.md); tracked, not yet implemented")
+	t.Skip("superseded by TestM10_ImagePullSecret — B80 (imagePullSecrets pull-auth criterion; see e2e/m10_test.go)")
 }
 
 // TestM2_DaemonSet is a DEFERRED criterion: DaemonSet scheduling is not yet a k3sm
