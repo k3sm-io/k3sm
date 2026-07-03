@@ -145,6 +145,34 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 		}
 	})
 
+	// LastTransitionTime flips ONLY on a real status change (flip-only), not every
+	// call — the invariant the runtimed buildStatus seam relies on (it threads the
+	// track's last PodReady as the prior). Without it PodReady.LTT would churn to
+	// Now() every resync tick, resetting minReadySeconds windows and stalling rollouts.
+	t.Run("LastTransitionTime flips only on status change", func(t *testing.T) {
+		past := metav1.NewTime(time.Unix(1000, 0))
+		pod := newPod("default", "p")
+		pod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: past},
+		}
+		// unchanged status → LTT preserved (no per-tick churn).
+		same := computeReadiness(pod, true)
+		if same.Status != corev1.ConditionTrue {
+			t.Fatalf("status = %s, want True", same.Status)
+		}
+		if !same.LastTransitionTime.Equal(&past) {
+			t.Errorf("unchanged status churned LTT: %v, want preserved %v", same.LastTransitionTime, past)
+		}
+		// real flip → LTT advances off the prior value.
+		flip := computeReadiness(pod, false)
+		if flip.Status != corev1.ConditionFalse {
+			t.Fatalf("status = %s, want False", flip.Status)
+		}
+		if flip.LastTransitionTime.Equal(&past) {
+			t.Error("status flip should advance LastTransitionTime off the prior value")
+		}
+	})
+
 	// (g) THE CEILING: a readinessGate whose condition is ABSENT does NOT stall the
 	// pod — PodReady stays True when the containers are ready (the anti-permanent-
 	// stall safety rule; the provider cannot observe external gate patches).

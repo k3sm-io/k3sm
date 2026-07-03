@@ -850,14 +850,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
 	applyProbeOverlay(cs, probes)
 
-	anyRunning, anyFailed := false, false
-	// containersReady is the AND of every container's Ready over the statuses this
-	// path built — NOT a hardcoded True. (M0/HostProcess has no readiness probes: a
-	// container is Ready when Running; applyProbeOverlay refines it when a readiness
-	// probe is served. This is the probe-less reduction.) It gates PodReady via the
-	// shared computeReadiness seam, which then honors spec.readinessGates. An empty
-	// container set is not ready.
-	containersReady := len(cs) > 0
+	anyRunning, anyFailed, allReady := false, false, len(cs) > 0
 	for i := range cs {
 		st := &cs[i]
 		if st.State.Running != nil {
@@ -867,9 +860,17 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 			anyFailed = true
 		}
 		if !st.Ready {
-			containersReady = false
+			allReady = false
 		}
 	}
+	// containersReady is the AND of every container's Ready AND at least one running
+	// container — NOT a hardcoded True. The anyRunning term matches the kubelet's
+	// running-gate and the pre-B79 behavior: a non-running container carrying a stale
+	// Ready=true must not publish ContainersReady=True. (M0/HostProcess has no
+	// readiness probes: a container is Ready when Running; applyProbeOverlay refines
+	// it when a readiness probe is served — the probe-less reduction.) It gates
+	// PodReady via the shared computeReadiness seam, which honors spec.readinessGates.
+	containersReady := allReady && anyRunning
 
 	phase := derivePhase(rs.GetPhase(), anyRunning, anyFailed)
 	out := &corev1.PodStatus{
@@ -1010,6 +1011,15 @@ func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 // four provider-owned types, so external/readinessGate conditions survive a provider
 // status rebuild (merge-not-replace, mirroring the QOSClass carry-forward in
 // toPodStatus). A nil pod yields nil.
+//
+// DEFERRED: this carry-forward is a safe no-op in PRODUCTION today — the k3sm VK
+// provider cannot yet OBSERVE an externally-patched gate condition (VK's podsEqual
+// ignores status, UpdatePod is a no-op, and VK blind-overwrites pod status), so the
+// input pod carries no external condition to preserve. It is wired now so that when
+// the external-gate feedback loop lands (an informer feeding external gate patches
+// back to the provider, with no-clobber + a kine watch-staleness review — the
+// deferred B79 follow-up), present gates are already observable to computeReadiness.
+// Do NOT mistake this for an already-live external-gate path.
 func carryForwardExternalConditions(pod *corev1.Pod) []corev1.PodCondition {
 	if pod == nil {
 		return nil

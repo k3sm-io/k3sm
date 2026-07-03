@@ -99,6 +99,15 @@ type runtimedRuntime struct {
 type podTrack struct {
 	pod       *corev1.Pod
 	startTime metav1.Time
+
+	// readyMu guards lastReady, the last PodReady condition buildStatus computed for
+	// this pod. It is a STABLE prior for readyTransitionTime so PodReady's
+	// LastTransitionTime flips only on a real status change — pod (the desired-spec
+	// object) never carries the computed PodReady, so without this the LTT would reset
+	// to Now() every resync tick (see buildStatus). readyMu is separate from r.mu
+	// because GetPods reconstructs status OUTSIDE r.mu.
+	readyMu   sync.Mutex
+	lastReady corev1.PodCondition
 }
 
 // RuntimedConfig configures a runtimedRuntime.
@@ -358,7 +367,7 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 
 // GetPodStatus returns the named pod's status, NotFound if it is unknown.
 func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name string) (*corev1.PodStatus, error) {
-	id, start, pod, ok := r.lookup(namespace, name)
+	id, _, pod, ok := r.lookup(namespace, name)
 	if !ok {
 		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
@@ -369,7 +378,12 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
 		return nil, errdefs.NotFoundf("pod %q not found in runtime", namespace+"/"+name)
 	}
-	return toPodStatus(pod, resp.GetStatus(), r.nodeIP, start, r.proberFor(id)), nil
+	t := r.trackByID(id)
+	if t == nil {
+		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+name)
+	}
+	st := r.buildStatus(pod.DeepCopy(), t, resp.GetStatus(), r.proberFor(id))
+	return &st, nil
 }
 
 // GetPods returns every tracked pod with its current status applied.
@@ -386,11 +400,54 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 		pod := t.pod.DeepCopy()
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 		if err == nil && (resp.GetError() == nil || resp.GetError().GetCode() == 0) {
-			pod.Status = *toPodStatus(pod, resp.GetStatus(), r.nodeIP, t.startTime, r.proberFor(string(pod.UID)))
+			pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
 		}
 		out = append(out, pod)
 	}
 	return out, nil
+}
+
+// buildStatus reconstructs the pod's corev1 status via toPodStatus, threading the
+// track's last computed PodReady so PodReady.LastTransitionTime flips ONLY on a real
+// status change — not every resync tick.
+//
+// pod here is a DeepCopy of t.pod, the IMMUTABLE desired-spec object (CreatePod /
+// UpdatePod replace the pointer, and it never carries the computed PodReady). Without
+// this seed, readyTransitionTime would never find a prior PodReady on the runtimed
+// path and would reset LastTransitionTime to Now() on every backstop/watch tick —
+// churning pod status (a kine write per resync per pod) and, worse, resetting the
+// minReadySeconds availability window every ~10s so a Deployment never marks the pod
+// available: a rolling-update stall, the very failure B79 fixes. The M0 HostProcess
+// path is exempt (it persists computed status back onto rec.pod, a stable prior).
+//
+// Locking: t.readyMu guards lastReady because GetPods reconstructs status OUTSIDE
+// r.mu (it snapshots tracks under the lock, then builds each unlocked), so concurrent
+// GetPods/emit for the same track must not race on lastReady. The lock is held ONLY
+// around the lastReady read and write — never across toPodStatus or the prober.
+func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
+	t.readyMu.Lock()
+	prior := t.lastReady
+	t.readyMu.Unlock()
+	if prior.Type == corev1.PodReady {
+		// Seed the desired-spec copy's conditions with the last PodReady so
+		// readyTransitionTime finds its prior status+LTT. PodReady is provider-owned,
+		// so toPodStatus's carry-forward excludes it — no duplication.
+		pod.Status.Conditions = append(pod.Status.Conditions, prior)
+	}
+	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps)
+	if c := findPodCondition(st.Conditions, corev1.PodReady); c != nil {
+		t.readyMu.Lock()
+		t.lastReady = *c
+		t.readyMu.Unlock()
+	}
+	return *st
+}
+
+// trackByID returns the track for pod id under r.mu, or nil if the pod was deleted.
+func (r *runtimedRuntime) trackByID(id string) *podTrack {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.track[id]
 }
 
 // GetContainerLogs streams the container's buffered combined output from the
@@ -504,10 +561,8 @@ func (r *runtimedRuntime) emit(rs *runtimev1.PodStatus) {
 	cb := r.notify
 	pr := r.probers[id]
 	var pod *corev1.Pod
-	var start metav1.Time
 	if ok {
 		pod = t.pod.DeepCopy()
-		start = t.startTime
 	}
 	r.mu.Unlock()
 	if !ok || cb == nil {
@@ -517,7 +572,7 @@ func (r *runtimedRuntime) emit(rs *runtimev1.PodStatus) {
 	if pr != nil {
 		ps = pr
 	}
-	pod.Status = *toPodStatus(pod, rs, r.nodeIP, start, ps)
+	pod.Status = r.buildStatus(pod, t, rs, ps)
 	cb(pod)
 }
 
