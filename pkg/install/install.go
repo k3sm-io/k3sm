@@ -37,6 +37,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
@@ -159,6 +160,118 @@ func (c Config) plistPath(label string) string {
 	return filepath.Join(c.LaunchDaemonDir, label+".plist")
 }
 
+// artifactKind classifies a manifest entry so install/uninstall can perform the
+// right operation (a launchd daemon tears down differently from a plain file).
+type artifactKind int
+
+const (
+	// kindFile is a single root-owned file (e.g. the k3sm binary).
+	kindFile artifactKind = iota
+	// kindDir is a directory tree (e.g. the InstallDir sweep, DataRoot, LogDir).
+	kindDir
+	// kindDaemon is a launchd job: a compound of a Label AND its plistPath, torn
+	// down as Bootout(label) THEN RemoveAll(plistPath) so the two never diverge.
+	kindDaemon
+	// kindServiceUser is the _k3sm no-login system user.
+	kindServiceUser
+	// kindKubeconfig is the admin kubeconfig written into the human's ~/.kube/config.
+	kindKubeconfig
+)
+
+// disposition is what uninstall does with an artifact install laid down.
+type disposition int
+
+const (
+	// dispRemove is torn down on uninstall (the two plists; the InstallDir tree).
+	dispRemove disposition = iota
+	// dispInstallDirCovered lives under InstallDir and is removed by the single
+	// RemoveAll(InstallDir) sweep — never individually (that would double-remove).
+	dispInstallDirCovered
+	// dispPreserve is installed but DELIBERATELY kept on uninstall: DataRoot (kine
+	// state.db + mesh keys — nuking it loses data on reinstall), the human
+	// kubeconfig (may hold other clusters), the _k3sm user, LogDir.
+	dispPreserve
+)
+
+// artifact is one thing install lays down. Every path is derived from a Config
+// accessor/const — NEVER a re-hardcoded /Library/... literal (a third copy of a
+// path is the same divergence bug B62 fixes). A daemon binds its Label and
+// plistPath into one entry so a booted-out label can never leave a leaked
+// KeepAlive plist (the original leak).
+type artifact struct {
+	kind  artifactKind
+	disp  disposition
+	path  string // file/dir/plist path; empty for kindServiceUser/kindKubeconfig
+	label string // launchd label for kindDaemon; empty otherwise
+	user  string // user name for kindServiceUser/kindKubeconfig; empty otherwise
+	// assertExists records whether the path is expected on disk TODAY. It is
+	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
+	// + relocated k3sm-netd): M7.1-d1/d3 own moving cp/kine off DataRoot into
+	// InstallDir, so those paths do not exist yet. The manifest proves the
+	// DISPOSITION (InstallDir-covered), not on-disk presence — d1/d3 light them up
+	// with no manifest change.
+	assertExists bool
+}
+
+// artifactManifest is the SINGLE source of truth for what install lays down and
+// how uninstall tears it down. It is a pure func(Config) — hermetic and testable
+// — deriving every path from the existing Config accessors/consts. Both Install
+// (lay-down order + plist paths) and Uninstall (reverse-order teardown) consume
+// it, closing the divergence between the two hardcoded lists that leaked the
+// plists. Order is install order; uninstall walks it in reverse.
+func artifactManifest(cfg Config) []artifact {
+	cfg = cfg.withDefaults()
+	return []artifact{
+		// The _k3sm service user — created before the server daemon can resolve it.
+		// PRESERVED: its home IS DataRoot; removing it orphans the data root.
+		{kind: kindServiceUser, disp: dispPreserve, user: cfg.ServiceUser},
+
+		// The InstallDir tree — the single RemoveAll(InstallDir) sweep on uninstall.
+		{kind: kindDir, disp: dispRemove, path: cfg.InstallDir, assertExists: true},
+		// The k3sm binary copied into InstallDir — covered by the sweep, not
+		// removed individually.
+		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedBinary(), assertExists: true},
+		// FORWARD-DECLARED (M7.1-d1/d3): the cp-payload bin tree + relocated
+		// k3sm-netd land under InstallDir once d1/d3 move them off DataRoot. They
+		// do NOT exist on disk today (cp/kine land under DataRoot at runtime), so
+		// existence is NOT asserted; the InstallDir sweep already covers them.
+		{kind: kindDir, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin"), assertExists: false},
+		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "k3sm-netd"), assertExists: false},
+
+		// The two LaunchDaemons — netd BEFORE server (install order: netd is
+		// bootstrapped first, the server depends on it). Each REMOVED on uninstall:
+		// Bootout(label) THEN RemoveAll(plistPath). Removing the plist is the B62
+		// fix — previously the label was booted out but the plist LEAKED, leaving a
+		// phantom KeepAlive respawn-throttle root job pointing at a deleted binary.
+		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
+		{kind: kindDaemon, disp: dispRemove, label: ServerLabel, path: cfg.plistPath(ServerLabel), assertExists: true},
+
+		// The admin kubeconfig in the human's home — PRESERVED (it may hold other
+		// clusters; k3sm never owns the whole file).
+		{kind: kindKubeconfig, disp: dispPreserve, user: cfg.TargetUser},
+
+		// PRESERVED privileged state: DataRoot (kine state.db + mesh keys) and the
+		// daemon LogDir. Both survive an uninstall→reinstall.
+		{kind: kindDir, disp: dispPreserve, path: cfg.DataRoot, assertExists: false},
+		{kind: kindDir, disp: dispPreserve, path: LogDir, assertExists: false},
+	}
+}
+
+// plistContent renders the launchd plist for a daemon label, so Install can drive
+// the writes from the manifest's daemon entries rather than a second hardcoded
+// list. An unknown label is a programmer error (a daemon in the manifest with no
+// renderer) surfaced as an error, never a panic.
+func plistContent(label string, cfg Config) ([]byte, error) {
+	switch label {
+	case NetdLabel:
+		return NetdPlist(cfg), nil
+	case ServerLabel:
+		return ServerPlist(cfg), nil
+	default:
+		return nil, fmt.Errorf("no plist renderer for daemon %s", label)
+	}
+}
+
 // Install lays down both daemons in dependency order. It is the single root step
 // (run via sudo): ensure _k3sm, copy the binary root-owned, write the two
 // plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
@@ -179,6 +292,11 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		cfg.AdminToken = tok
 	}
 
+	// The manifest is the single source of truth for the artifacts laid down (and,
+	// on uninstall, torn down): daemon plist paths + install order come from it, so
+	// there is no second hardcoded list to diverge from the teardown.
+	m := artifactManifest(cfg)
+
 	// 1. The service user must exist before the server LaunchDaemon (UserName=_k3sm)
 	//    can resolve it and before its _k3sm-owned data root is usable.
 	uid, err := sys.EnsureServiceUser(cfg.ServiceUser)
@@ -188,24 +306,34 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	cfg.Logger.Info("ensured service user", "user", cfg.ServiceUser, "uid", uid)
 
 	// 2. Copy the binary into the root-owned install dir (both daemons exec it).
+	//    It lands under InstallDir, so the InstallDir sweep covers it on uninstall.
 	if _, err := sys.CopyToRootOwned(cfg.BinarySource, cfg.InstallDir); err != nil {
 		return fmt.Errorf("install: copy binary to %s: %w", cfg.InstallDir, err)
 	}
 
-	// 3. Render + write both plists.
-	if err := sys.WriteLaunchDaemon(cfg.plistPath(NetdLabel), NetdPlist(cfg)); err != nil {
-		return fmt.Errorf("install: write %s plist: %w", NetdLabel, err)
-	}
-	if err := sys.WriteLaunchDaemon(cfg.plistPath(ServerLabel), ServerPlist(cfg)); err != nil {
-		return fmt.Errorf("install: write %s plist: %w", ServerLabel, err)
+	// 3. Render + write both plists, in manifest (install) order.
+	for _, a := range m {
+		if a.kind != kindDaemon {
+			continue
+		}
+		content, err := plistContent(a.label, cfg)
+		if err != nil {
+			return fmt.Errorf("install: %w", err)
+		}
+		if err := sys.WriteLaunchDaemon(a.path, content); err != nil {
+			return fmt.Errorf("install: write %s plist: %w", a.label, err)
+		}
 	}
 
-	// 4. Bootstrap netd FIRST (root helper), then the server (depends on it).
-	if err := sys.LaunchctlBootstrap(NetdLabel); err != nil {
-		return fmt.Errorf("install: bootstrap %s: %w", NetdLabel, err)
-	}
-	if err := sys.LaunchctlBootstrap(ServerLabel); err != nil {
-		return fmt.Errorf("install: bootstrap %s: %w", ServerLabel, err)
+	// 4. Bootstrap in manifest order: netd FIRST (root helper), then the server
+	//    (depends on it) — the manifest lists netd before server.
+	for _, a := range m {
+		if a.kind != kindDaemon {
+			continue
+		}
+		if err := sys.LaunchctlBootstrap(a.label); err != nil {
+			return fmt.Errorf("install: bootstrap %s: %w", a.label, err)
+		}
 	}
 
 	// 5. Write the admin kubeconfig to the HUMAN's home (owned by them, not root).
@@ -216,12 +344,18 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	return nil
 }
 
-// Uninstall tears both daemons down and removes the install dir. It is
-// idempotent: a bootout of a not-loaded label is a no-op, so re-running after a
-// partial install (or twice) is safe. The server is booted out FIRST (so it
-// stops issuing privileged requests), then netd (which flushes lo0/pf/utun on
-// SIGTERM). Privileged STATE (the data root) is intentionally left in place; the
-// operator removes it explicitly.
+// Uninstall tears down every artifact install laid down, driven by the SAME
+// manifest install consumes — so nothing install creates can be left behind
+// (the B62 leak was the two plists, which the old hardcoded uninstall never
+// removed). It walks the manifest in REVERSE install order: the server daemon
+// before netd (server first stops driving the helper; netd's SIGTERM handler
+// then flushes lo0/pf/utun), each daemon torn down as Bootout(label) THEN
+// RemoveAll(plistPath) so the label and its plist never diverge. InstallDir-
+// covered artifacts are swept by the single RemoveAll(InstallDir); dispPreserve
+// artifacts (DataRoot's kine state.db + mesh keys, the human kubeconfig, the
+// _k3sm user, LogDir) are DELIBERATELY left in place. It is idempotent: a
+// bootout of a not-loaded label and a RemoveAll of an absent path are both
+// no-op successes, so re-running after a partial install (or twice) is safe.
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
 	var firstErr error
@@ -230,11 +364,47 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			firstErr = err
 		}
 	}
-	// Server first (stops driving the helper), then netd (its SIGTERM handler
-	// tears down lo0 aliases / pf anchor / utun).
-	note(sys.LaunchctlBootout(ServerLabel))
-	note(sys.LaunchctlBootout(NetdLabel))
-	note(sys.RemoveAll(cfg.InstallDir))
+	// safeRemove guards every ROOT RemoveAll: it refuses a non-absolute path or one
+	// fewer than two segments deep, so an operator fat-finger (e.g. a Config with
+	// InstallDir="/" or "/Library") can never hand "/" or a filesystem root to a
+	// root-privileged RemoveAll. The normal targets (/Library/k3sm, the two
+	// /Library/LaunchDaemons/io.k3sm.*.plist files) pass unchanged.
+	safeRemove := func(path string) error {
+		cleaned := filepath.Clean(path)
+		if !filepath.IsAbs(cleaned) || strings.Count(cleaned, "/") < 2 {
+			return fmt.Errorf("refusing root RemoveAll of unsafe path %q", path)
+		}
+		return sys.RemoveAll(cleaned)
+	}
+	m := artifactManifest(cfg)
+	for i := len(m) - 1; i >= 0; i-- {
+		a := m[i]
+		switch a.disp {
+		case dispPreserve:
+			// Deliberately kept — DataRoot, the human kubeconfig, the _k3sm user, LogDir.
+			continue
+		case dispInstallDirCovered:
+			// Removed by the single RemoveAll(InstallDir) sweep below; skip to avoid
+			// a redundant double-remove.
+			continue
+		case dispRemove:
+			if a.kind == kindDaemon {
+				// Bootout THEN remove the plist — binding them so a booted-out label
+				// can never leave a leaked KeepAlive plist (the B62 leak). But if
+				// bootout returns a REAL error (not the idempotent not-loaded case,
+				// which returns nil), the root job may still be LOADED — do NOT delete
+				// its plist definition (that would orphan a live root job until reboot,
+				// a variant of the same leak). Record the error and leave the plist.
+				if err := sys.LaunchctlBootout(a.label); err != nil {
+					note(err)
+					continue
+				}
+				note(safeRemove(a.path))
+			} else {
+				note(safeRemove(a.path))
+			}
+		}
+	}
 	if firstErr != nil {
 		return fmt.Errorf("uninstall: %w", firstErr)
 	}
