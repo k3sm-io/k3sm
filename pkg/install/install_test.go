@@ -129,13 +129,20 @@ func TestInstallRequiresInputs(t *testing.T) {
 }
 
 // TestUninstallIdempotent proves uninstall boots out BOTH daemons (server first,
-// then netd) and removes the install dir, and that re-running is safe.
+// then netd), REMOVES both leaked plists (the B62 fix), and sweeps the install
+// dir — in reverse install order — and that re-running is safe.
 func TestUninstallIdempotent(t *testing.T) {
 	f := &fakeSystem{}
 	if err := Uninstall(context.Background(), f, Config{}); err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
-	want := []string{"Bootout:io.k3sm.server", "Bootout:io.k3sm.netd", "RemoveAll:/Library/k3sm"}
+	want := []string{
+		"Bootout:io.k3sm.server",
+		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
+		"Bootout:io.k3sm.netd",
+		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		"RemoveAll:/Library/k3sm",
+	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
 	}
@@ -222,6 +229,223 @@ func TestPlistEscaping(t *testing.T) {
 		t.Error("plist string values must be XML-escaped")
 	}
 	mustContain(t, x, "a&amp;b&lt;c")
+}
+
+// recorded returns the arguments of every fake seam call whose "Op:arg" string
+// carries prefix (e.g. "RemoveAll:").
+func recorded(calls []string, prefix string) []string {
+	var out []string
+	for _, c := range calls {
+		if rest, ok := strings.CutPrefix(c, prefix); ok {
+			out = append(out, rest)
+		}
+	}
+	return out
+}
+
+func toSet(xs []string) map[string]bool {
+	s := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		s[x] = true
+	}
+	return s
+}
+
+func daemonByPath(m []artifact, path string) (artifact, bool) {
+	for _, a := range m {
+		if a.kind == kindDaemon && a.path == path {
+			return a, true
+		}
+	}
+	return artifact{}, false
+}
+
+func fileDispByPath(m []artifact, path string) (disposition, bool) {
+	for _, a := range m {
+		if (a.kind == kindFile || a.kind == kindDir) && a.path == path {
+			return a.disp, true
+		}
+	}
+	return 0, false
+}
+
+// uninstallGaps returns, for a REAL Install run (installCalls) and a REAL
+// Uninstall run (uninstallCalls) recorded by the fake, the install-created
+// artifacts the uninstall FAILS to tear down — classified through the manifest.
+// An install artifact absent from the manifest is itself a gap: an off-manifest
+// lay-down line is the exact future regression the gate must catch, which a
+// manifest-vs-manifest tautology never would.
+func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
+	cfg = cfg.withDefaults()
+	m := artifactManifest(cfg)
+	removed := toSet(recorded(uninstallCalls, "RemoveAll:"))
+	bootedOut := toSet(recorded(uninstallCalls, "Bootout:"))
+	installDirSwept := removed[cfg.InstallDir]
+
+	var gaps []string
+
+	// Files copied in by CopyToRootOwned (the binary → InstallDir/k3sm).
+	for _, dstDir := range recorded(installCalls, "CopyToRootOwned:") {
+		path := dstDir + "/k3sm" // the fake's installed path
+		disp, known := fileDispByPath(m, path)
+		if !known {
+			gaps = append(gaps, "off-manifest install: "+path)
+			continue
+		}
+		switch disp {
+		case dispInstallDirCovered:
+			if !installDirSwept && !removed[path] {
+				gaps = append(gaps, "installDir artifact not swept: "+path)
+			}
+		case dispRemove:
+			if !removed[path] {
+				gaps = append(gaps, "artifact not removed: "+path)
+			}
+		}
+	}
+
+	// Daemons written by WriteLaunchDaemon (each: Bootout(label) + RemoveAll(plist)).
+	for _, plist := range recorded(installCalls, "WriteLaunchDaemon:") {
+		a, known := daemonByPath(m, plist)
+		if !known {
+			gaps = append(gaps, "off-manifest plist: "+plist)
+			continue
+		}
+		if a.disp != dispRemove {
+			continue
+		}
+		if !bootedOut[a.label] {
+			gaps = append(gaps, "daemon not booted out: "+a.label)
+		}
+		if !removed[a.path] {
+			gaps = append(gaps, "plist leaked: "+a.path)
+		}
+	}
+	return gaps
+}
+
+// TestUninstallManifestCoversInstall is the B62 gate. It asserts over the seam
+// calls RECORDED from a REAL Install run + a REAL Uninstall run against the fake
+// (never the manifest against itself — that tautology would never catch a future
+// off-manifest install line, the exact bug): forward coverage, bidirectional
+// no-over-broad-removal, the preserve set untouched, and idempotency.
+func TestUninstallManifestCoversInstall(t *testing.T) {
+	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	dc := cfg.withDefaults()
+
+	inst := &fakeSystem{}
+	if err := Install(context.Background(), inst, cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	uninst := &fakeSystem{}
+	if err := Uninstall(context.Background(), uninst, cfg); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	installCalls := inst.calls
+	uninstallCalls := uninst.calls
+	removed := toSet(recorded(uninstallCalls, "RemoveAll:"))
+	bootedOut := toSet(recorded(uninstallCalls, "Bootout:"))
+
+	t.Run("coverage: uninstall tears down everything install laid down", func(t *testing.T) {
+		if gaps := uninstallGaps(cfg, installCalls, uninstallCalls); len(gaps) != 0 {
+			t.Errorf("uninstall leaves install artifacts behind: %v", gaps)
+		}
+	})
+
+	t.Run("both leaked plists are now removed (the B62 fix)", func(t *testing.T) {
+		for _, label := range []string{ServerLabel, NetdLabel} {
+			plist := dc.plistPath(label)
+			if !bootedOut[label] {
+				t.Errorf("daemon %s not booted out", label)
+			}
+			if !removed[plist] {
+				t.Errorf("plist LEAKED (not removed on uninstall): %s", plist)
+			}
+		}
+	})
+
+	t.Run("RED: an off-manifest install line is caught", func(t *testing.T) {
+		// Simulate a future regression: an install laying a binary into a path the
+		// manifest does not know. The gate MUST flag it — proving non-vacuity (a
+		// manifest-vs-manifest check would silently pass).
+		rogue := append(append([]string{}, installCalls...), "CopyToRootOwned:/Library/rogue")
+		gaps := uninstallGaps(cfg, rogue, uninstallCalls)
+		if len(gaps) == 0 {
+			t.Fatal("expected an off-manifest install to be flagged, got none")
+		}
+		found := false
+		for _, g := range gaps {
+			if strings.Contains(g, "/Library/rogue") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("gaps %v do not name the rogue artifact", gaps)
+		}
+	})
+
+	t.Run("bidirectional: uninstall removes only install-created paths", func(t *testing.T) {
+		// Every path uninstall RemoveAll's must be one install created: a written
+		// plist, or the InstallDir tree (the CopyToRootOwned dst). Catches a
+		// RemoveAll reaching into /Library or a home dir for a path k3sm never made.
+		created := toSet(recorded(installCalls, "WriteLaunchDaemon:"))
+		for _, dstDir := range recorded(installCalls, "CopyToRootOwned:") {
+			created[dstDir] = true // the InstallDir tree (the sweep root)
+		}
+		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
+			if !created[p] {
+				t.Errorf("uninstall removed %q, which install never created (over-broad removal)", p)
+			}
+		}
+		bootstrapped := toSet(recorded(installCalls, "Bootstrap:"))
+		for _, l := range recorded(uninstallCalls, "Bootout:") {
+			if !bootstrapped[l] {
+				t.Errorf("uninstall booted out %q, which install never bootstrapped", l)
+			}
+		}
+	})
+
+	t.Run("preserve set untouched: DataRoot, LogDir, kubeconfig, _k3sm home", func(t *testing.T) {
+		// Table-driven over the manifest's dispPreserve entries: none may be removed.
+		for _, a := range artifactManifest(dc) {
+			if a.disp != dispPreserve || a.path == "" {
+				continue
+			}
+			if removed[a.path] {
+				t.Errorf("uninstall removed PRESERVED artifact %q", a.path)
+			}
+		}
+		// The admin kubeconfig (preserve; its ~/.kube/config path is resolved in the
+		// darwin impl) — no removal may touch a kube path.
+		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
+			if strings.Contains(p, "/.kube/") {
+				t.Errorf("uninstall removed a kubeconfig path %q (may hold other clusters)", p)
+			}
+		}
+		// The _k3sm user's home IS DataRoot; asserting DataRoot survives keeps the
+		// service user's state intact (there is no user-removal seam to invoke).
+		if removed[dc.DataRoot] {
+			t.Error("the _k3sm user's home (DataRoot) must be preserved")
+		}
+	})
+
+	t.Run("idempotency: a second uninstall over removed state returns nil", func(t *testing.T) {
+		second := &fakeSystem{}
+		if err := Uninstall(context.Background(), second, cfg); err != nil {
+			t.Errorf("second Uninstall must be a no-op success (partial-install recovery), got %v", err)
+		}
+	})
+
+	t.Run("forward-declared cp-payload items are InstallDir-covered, existence not asserted", func(t *testing.T) {
+		for _, a := range artifactManifest(dc) {
+			if a.assertExists || a.disp != dispInstallDirCovered {
+				continue
+			}
+			if !strings.HasPrefix(a.path, dc.InstallDir+"/") {
+				t.Errorf("forward-declared artifact %q must live under InstallDir %q", a.path, dc.InstallDir)
+			}
+		}
+	})
 }
 
 func idx(calls []string, want string) int {
