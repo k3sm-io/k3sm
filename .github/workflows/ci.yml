@@ -9,7 +9,10 @@
 # self-hosted on a PR trigger), every action pinned by commit SHA.
 name: CI
 on:
-  pull_request:
+  # CI DISABLED — no auto-run. macOS runners are billable and we are not spending
+  # on CI for now (operator directive 2026-07-02). Manual-only via workflow_dispatch;
+  # re-enable by restoring `pull_request:`. See docs/BACKLOG.md CI-disabled note.
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
