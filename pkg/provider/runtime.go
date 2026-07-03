@@ -20,9 +20,10 @@ import (
 	"context"
 	"io"
 
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // Runtime is the consumer-side seam between the Virtual Kubelet provider and a
@@ -51,7 +52,7 @@ type Runtime interface {
 	// GetPods returns the pods this runtime is tracking.
 	GetPods(ctx context.Context) ([]*corev1.Pod, error)
 	// GetContainerLogs returns a container's combined stdout/stderr.
-	GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error)
+	GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error)
 	// Watch delivers a full corev1.Pod (with .Status) on every status change for
 	// the lifetime of ctx. The implementation runs cb OUTSIDE any held lock (the
 	// VK re-entrancy rule) and resyncs the current state when its underlying
@@ -82,9 +83,9 @@ type StatsSource interface {
 type StreamingRuntime interface {
 	// RunInContainer runs cmd in a container, streaming stdio/resize over attach
 	// and returning the command's exit status (`kubectl exec`).
-	RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach api.AttachIO) error
+	RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach vkadapter.AttachIO) error
 	// AttachToContainer attaches to a running container's stdio (`kubectl attach`).
-	AttachToContainer(ctx context.Context, namespace, podName, container string, attach api.AttachIO) error
+	AttachToContainer(ctx context.Context, namespace, podName, container string, attach vkadapter.AttachIO) error
 	// PortForward proxies a byte stream to a pod TCP port (`kubectl port-forward`).
 	PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error
 }
