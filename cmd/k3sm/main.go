@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "kubectl", "kubeconfig" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "kubectl", "kubeconfig", "doctor" are implemented; others are planned):
   server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node (M3)
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -40,6 +40,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "k
   build       build a native-macOS (OCI artifact) image
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
+  doctor      run preflight environment + datastore-posture checks
   version     print version
 
 See docs/DESIGN.md for the roadmap.
@@ -99,6 +100,11 @@ func main() {
 	case "kubeconfig":
 		if err := runKubeconfig(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm kubeconfig:", err)
+			os.Exit(1)
+		}
+	case "doctor":
+		if err := runDoctor(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm doctor:", err)
 			os.Exit(1)
 		}
 	default:

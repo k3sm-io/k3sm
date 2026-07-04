@@ -74,3 +74,18 @@ func TestM10_ProviderEvents(t *testing.T) {
 func TestM10_PerPodIP(t *testing.T) {
 	t.Skip("TODO(M10.1): assert two same-node pods get distinct podnet /32s + a headless Service returns all pod IPs — B81 (blocked on M10.1 podnet wiring)")
 }
+
+// TestM10_ImagePullSecret is the M10.2 imagePullSecrets pull-auth criterion (Res.9):
+// a pod carrying imagePullSecrets pulls a private image from an auth-gated (rejects-
+// anonymous) IN-PROCESS loopback registry via a standard .dockerconfigjson Secret,
+// WITH a mandatory negative control (the same image WITHOUT the secret + a cold cache
+// → ImagePullBackOff, proving the secret was the enabler not an anonymous/cached pull)
+// and the M2.6 confidentiality invariant (the resolved cred never lands in the pod
+// fs/env, container logs, or Events). The pull path already exists (resolver.go +
+// runtimed/pkg/image/pull.go); this criterion is LAB-PENDING on the e2e harness gaining
+// an in-process authed-registry + native-exec OCI-image fixture (a separate prerequisite),
+// so it ships as a structured placeholder rather than a fake body that falls back to
+// Image:"native" (which would prove nothing).
+func TestM10_ImagePullSecret(t *testing.T) {
+	t.Skip("TODO(M10.2): assert a pod with imagePullSecrets pulls a private image from an auth-gated in-process registry (ggcr + httptest basic-auth, rejects anonymous) via a programmatically-built .dockerconfigjson Secret (fake testuser/testpass, no real cred); NEGATIVE CONTROL (mandatory) — the same image WITHOUT the secret + imagePullPolicy:Always (cache-cold) → container status waiting.reason ImagePullBackOff/ErrImagePull, proving the secret enabled the pull; CONFIDENTIALITY — after a successful pull assert the resolved credential is absent from the pod fs/env, container logs, and Events (the M2.6 cred-never-written-to-disk invariant) — B80 (blocked on an in-process authed-registry + native-exec OCI-image e2e harness fixture)")
+}

@@ -29,13 +29,12 @@ import (
 	"syscall"
 
 	dto "github.com/prometheus/client_model/go"
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
-	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // HostProcess is the k3sm M0 "HostProcess" Virtual Kubelet provider: it runs each
@@ -88,9 +87,9 @@ func NewHostProcess(nodeName, podRoot, nodeIP string, recorder record.EventRecor
 
 // Compile-time checks that we satisfy the VK contracts and the Runtime seam.
 var (
-	_ vknode.PodLifecycleHandler = (*HostProcess)(nil)
-	_ vknode.PodNotifier         = (*HostProcess)(nil)
-	_ Runtime                    = (*HostProcess)(nil)
+	_ vkadapter.PodLifecycleHandler = (*HostProcess)(nil)
+	_ vkadapter.PodNotifier         = (*HostProcess)(nil)
+	_ Runtime                       = (*HostProcess)(nil)
 )
 
 // podEvent is a lifecycle Event buffered under p.mu and emitted after the lock is
@@ -166,18 +165,37 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 		go p.reap(k, c.Name, cmd, lf)
 	}
 
+	// containersReady is the AND of every container's Ready over the statuses just
+	// built (a StartError container is not Ready) — NOT a hardcoded True. It gates
+	// PodReady through the shared computeReadiness seam so spec.readinessGates are
+	// honored (M0/HostProcess is probe-less: a container is Ready when Running).
+	containersReady := len(cstats) > 0
+	for i := range cstats {
+		if !cstats[i].Ready {
+			containersReady = false
+		}
+	}
+	crStatus := corev1.ConditionFalse
+	if containersReady {
+		crStatus = corev1.ConditionTrue
+	}
+	// Merge-not-replace: the four provider-owned conditions (PodReady via the same
+	// computeReadiness authority as toPodStatus), then carry FORWARD any external
+	// condition on the incoming pod so a readinessGate condition survives this write.
+	conds := []corev1.PodCondition{
+		{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
+		computeReadiness(rec.pod, containersReady),
+		{Type: corev1.ContainersReady, Status: crStatus},
+		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+	}
+	conds = append(conds, carryForwardExternalConditions(rec.pod)...)
 	rec.pod.Status = corev1.PodStatus{
-		Phase:     corev1.PodRunning,
-		HostIP:    p.nodeIP,
-		PodIP:     p.nodeIP,
-		PodIPs:    []corev1.PodIP{{IP: p.nodeIP}},
-		StartTime: &now,
-		Conditions: []corev1.PodCondition{
-			{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
-			{Type: corev1.PodReady, Status: corev1.ConditionTrue},
-			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
-			{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
-		},
+		Phase:             corev1.PodRunning,
+		HostIP:            p.nodeIP,
+		PodIP:             p.nodeIP,
+		PodIPs:            []corev1.PodIP{{IP: p.nodeIP}},
+		StartTime:         &now,
+		Conditions:        conds,
 		ContainerStatuses: cstats,
 	}
 	p.pods[k] = rec
@@ -221,7 +239,11 @@ func (p *HostProcess) reap(k, cname string, cmd *exec.Cmd, lf *os.File) {
 		cs.Started = ptr(false)
 	}
 	rec.pod.Status.Phase = aggregatePhase(rec.pod.Status.ContainerStatuses)
-	setCond(&rec.pod.Status, corev1.PodReady, corev1.ConditionFalse)
+	// Route the failure PodReady through the shared computeReadiness seam
+	// (containersReady=false ⇒ False/"ContainersNotReady") so CreatePod, reap, and
+	// toPodStatus have a single readiness authority; setPodCondition carries the
+	// reason so it surfaces in kubectl describe.
+	setPodCondition(&rec.pod.Status, computeReadiness(rec.pod, false))
 	setCond(&rec.pod.Status, corev1.ContainersReady, corev1.ConditionFalse)
 	p.dispatch(rec.pod)
 }
@@ -268,7 +290,7 @@ func (p *HostProcess) GetPod(ctx context.Context, ns, name string) (*corev1.Pod,
 	defer p.mu.Unlock()
 	rec, ok := p.pods[podKey(ns, name)]
 	if !ok {
-		return nil, errdefs.NotFoundf("pod %q not found", podKey(ns, name))
+		return nil, vkadapter.NotFoundf("pod %q not found", podKey(ns, name))
 	}
 	return rec.pod.DeepCopy(), nil
 }
@@ -316,30 +338,30 @@ func (p *HostProcess) dispatch(pod *corev1.Pod) {
 }
 
 // GetContainerLogs returns the container's combined stdout/stderr log file.
-func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
 	p.mu.Lock()
 	rec, ok := p.pods[podKey(ns, podName)]
 	p.mu.Unlock()
 	if !ok {
-		return nil, errdefs.NotFoundf("pod %q not found", podKey(ns, podName))
+		return nil, vkadapter.NotFoundf("pod %q not found", podKey(ns, podName))
 	}
 	pr, ok := rec.procs[containerName]
 	if !ok {
-		return nil, errdefs.NotFoundf("container %q not found", containerName)
+		return nil, vkadapter.NotFoundf("container %q not found", containerName)
 	}
 	return os.Open(pr.logPath)
 }
 
 // --- not implemented in M0 ---
 
-func (p *HostProcess) RunInContainer(ctx context.Context, ns, podName, c string, cmd []string, a api.AttachIO) error {
-	return errdefs.NotFound("exec is not implemented in the M0 HostProcess provider")
+func (p *HostProcess) RunInContainer(ctx context.Context, ns, podName, c string, cmd []string, a vkadapter.AttachIO) error {
+	return vkadapter.NotFound("exec is not implemented in the M0 HostProcess provider")
 }
-func (p *HostProcess) AttachToContainer(ctx context.Context, ns, podName, c string, a api.AttachIO) error {
-	return errdefs.NotFound("attach is not implemented in the M0 HostProcess provider")
+func (p *HostProcess) AttachToContainer(ctx context.Context, ns, podName, c string, a vkadapter.AttachIO) error {
+	return vkadapter.NotFound("attach is not implemented in the M0 HostProcess provider")
 }
 func (p *HostProcess) PortForward(ctx context.Context, ns, podName string, port int32, s io.ReadWriteCloser) error {
-	return errdefs.NotFound("port-forward is not implemented in the M0 HostProcess provider")
+	return vkadapter.NotFound("port-forward is not implemented in the M0 HostProcess provider")
 }
 func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil
@@ -400,6 +422,20 @@ func setCond(s *corev1.PodStatus, t corev1.PodConditionType, st corev1.Condition
 		}
 	}
 	s.Conditions = append(s.Conditions, corev1.PodCondition{Type: t, Status: st})
+}
+
+// setPodCondition upserts a FULL PodCondition by Type — replacing Status, Reason,
+// Message, and LastTransitionTime (setCond carries only Status). This is how a
+// blocked PodReady's "ReadinessGatesNotReady"/"ContainersNotReady" reason surfaces
+// in kubectl describe. An absent Type is appended.
+func setPodCondition(s *corev1.PodStatus, cond corev1.PodCondition) {
+	for i := range s.Conditions {
+		if s.Conditions[i].Type == cond.Type {
+			s.Conditions[i] = cond
+			return
+		}
+	}
+	s.Conditions = append(s.Conditions, cond)
 }
 
 func ptr[T any](v T) *T { return &v }

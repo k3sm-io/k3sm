@@ -1,0 +1,123 @@
+# k3sm goreleaser config — UNSIGNED SNAPSHOT (build shape only).
+#
+# This config proves the RELEASE ARTIFACT SHAPE for the single k3sm binary. It is
+# deliberately an unsigned snapshot: codesigning/notarization and the Homebrew-tap
+# push are the HUMAN M7.1 slice and are stubbed-disabled below (goreleaser
+# schema-validates live `signs:`/`notarize:`/`brews:` stanzas against certs/tokens
+# that are absent in this repo, so they are kept as commented reference blocks).
+#
+# The live archive proof runs in CI (goreleaser is not installed in the lab); the
+# local acceptance gate hack/acceptance/B58.sh reports PENDING when the tool is
+# absent and exits non-zero so red-at-main stays provable.
+version: 2
+
+project_name: k3sm
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  # ONE build entry: the single k3sm Mach-O (DESIGN §6, one-Mach-O doctrine).
+  # k3sm-netd is NOT a second build — there is no cmd/k3sm-netd package; netd is
+  # the `k3sm netd` subcommand (the launchd plist execs `k3sm netd`, see
+  # pkg/install/install.go). It ships as a renamed COPY of this same binary,
+  # staged by the post-build hook below.
+  - id: k3sm
+    main: ./cmd/k3sm
+    binary: k3sm
+    goos: [darwin]
+    goarch: [arm64]
+    env:
+      # CGO=1 is required by runtimed's darwin-SPI imports (the durable reason);
+      # it is NOT for kine — kine goes pure-Go under the modern-stack reset.
+      - CGO_ENABLED=1
+    # Target the pkg/version vars (B57). goreleaser's default -X main.version
+    # no-ops here (there is no main.version symbol → it would render "dev").
+    ldflags:
+      - -s -w
+      - -X k3sm.io/k3sm/pkg/version.Version={{.Version}}
+      - -X k3sm.io/k3sm/pkg/version.Commit={{.Commit}}
+      - -X k3sm.io/k3sm/pkg/version.Date={{.Date}}
+    hooks:
+      # Stage k3sm-netd as a renamed copy of the built single Mach-O so the
+      # archive can include it without a second (non-existent) build.
+      post:
+        - cp "{{ .Path }}" "{{ dir .Path }}/k3sm-netd"
+
+archives:
+  - id: k3sm
+    ids: [k3sm]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      # The k3sm binary is auto-included from the build; stage the netd copy and
+      # the legal files. This is the honestly-stageable SNAPSHOT set — only what
+      # an in-tree producer exists for.
+      # k3sm-netd is a byte-identical copy of the single k3sm Mach-O (one-Mach-O
+      # doctrine, m7-plan Res.7). NOTE: the installed launchd plist execs `k3sm
+      # netd` (the subcommand of the primary binary — pkg/install/install.go), so
+      # this copy is not the root-executed path today; it is shipped to satisfy
+      # the Res.7 archive manifest. Whether the live M7.1 slice installs it as a
+      # distinct helper or drops it is a human decision recorded there.
+      # strip_parent flattens the nested dist/... source path to the archive root
+      # so the tar member is `k3sm-netd`, not `dist/.../k3sm-netd`.
+      - src: "dist/k3sm_darwin_arm64*/k3sm-netd"
+        strip_parent: true
+        info:
+          mode: 0755
+      - LICENSE
+      - NOTICE
+      # --- DEFERRED to the live M7.1 d1 payload-staging slice + B69 pure-Go kine
+      # --- pin. These members have NO in-tree producer today: the control-plane
+      # --- cp-payload (kube-apiserver / kube-scheduler / kube-controller-manager)
+      # --- is fetched at runtime (pkg/executor/setup.go), and kine is built at
+      # --- runtime (the bundled pure-Go kine pin is post-B69, not landed). They
+      # --- are listed here so the FULL manifest shape is reviewable, but they are
+      # --- commented out so this snapshot only stages what actually exists.
+      # - src: "dist/cp-payload/kube-apiserver"
+      # - src: "dist/cp-payload/kube-scheduler"
+      # - src: "dist/cp-payload/kube-controller-manager"
+      # - src: "dist/cp-payload/kine"
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  # Keep snapshot versions from colliding with real tags.
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+# --- STUBBED HUMAN M7.1 SLICE (signing / notarization / Homebrew tap) ---------
+# Kept as commented reference so the full release contract is reviewable without
+# failing schema validation against certs/tokens that are absent in this repo.
+# Secrets are referenced ONLY via {{ .Env.* }} templates — never literals.
+#
+# signs:
+#   - id: k3sm-codesign
+#     ids: [k3sm]
+#     cmd: codesign
+#     args: ["--sign", "{{ .Env.CODESIGN_IDENTITY }}", "--options", "runtime", "${artifact}"]
+#     artifacts: binary
+#
+# notarize:
+#   macos:
+#     - enabled: true
+#       ids: [k3sm]
+#       sign:
+#         certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+#         password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+#       notarize:
+#         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+#         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+#         key: "{{ .Env.MACOS_NOTARY_KEY }}"
+#
+# brews:
+#   - name: k3sm
+#     repository:
+#       owner: k3sm-io
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     homepage: "https://k3sm.io"
+#     description: "macOS-native Kubernetes distribution for Apple Silicon"
+#     license: "Apache-2.0"

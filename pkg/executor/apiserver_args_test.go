@@ -129,6 +129,15 @@ func TestApiserverArgsNodeRBAC(t *testing.T) {
 	if !hasArg(args, "--enable-admission-plugins=NodeRestriction") {
 		t.Errorf("--enable-admission-plugins=NodeRestriction must be set (additive), args=%v", args)
 	}
+	// B76: the MutatingAdmissionPolicy that injects the provider toleration into DS pods
+	// is BETA + off by default at the pin, so the apiserver must enable BOTH the v1beta1
+	// runtime-config AND the feature gate or the policy is a runtime no-op.
+	if !hasArg(args, "--runtime-config=admissionregistration.k8s.io/v1beta1=true") {
+		t.Errorf("--runtime-config for admissionregistration v1beta1 must be set (B76), args=%v", args)
+	}
+	if !hasArg(args, "--feature-gates=MutatingAdmissionPolicy=true") {
+		t.Errorf("--feature-gates=MutatingAdmissionPolicy=true must be set (B76), args=%v", args)
+	}
 
 	// withDefaults fills the same value (so the running executor matches the args).
 	if got := flagValue(apiServerArgs(cfg.withDefaults()), "--authorization-mode"); got != "Node,RBAC" {

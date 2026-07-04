@@ -21,10 +21,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
 // These are the M0 "Tier-1" unit tests: pure helpers plus VK-contract behavior of the
@@ -196,14 +197,14 @@ func TestDeletePodIdempotent(t *testing.T) {
 	if err := p.DeletePod(context.Background(), pod); err != nil {
 		t.Fatalf("DeletePod #2 (idempotent): %v", err)
 	}
-	if _, err := p.GetPod(context.Background(), "default", "del"); !errdefs.IsNotFound(err) {
+	if _, err := p.GetPod(context.Background(), "default", "del"); !vkadapter.IsNotFound(err) {
 		t.Fatalf("want NotFound after delete, got %v", err)
 	}
 }
 
 func TestGetPodNotFound(t *testing.T) {
 	p := NewHostProcess("test-node", t.TempDir(), "127.0.0.1", nil)
-	if _, err := p.GetPod(context.Background(), "default", "nope"); !errdefs.IsNotFound(err) {
+	if _, err := p.GetPod(context.Background(), "default", "nope"); !vkadapter.IsNotFound(err) {
 		t.Fatalf("want NotFound, got %v", err)
 	}
 }
