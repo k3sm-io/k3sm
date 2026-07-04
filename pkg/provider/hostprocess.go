@@ -31,6 +31,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
@@ -50,6 +51,12 @@ type HostProcess struct {
 	podRoot  string // dir for per-pod logs/state
 	nodeIP   string
 
+	// recorder emits pod lifecycle Events (Pulled/Created/Started/Killing) so
+	// `kubectl describe pod` shows them. Injected once at construction and never
+	// mutated (set before any goroutine starts → race-free without a lock); a nil
+	// injection is replaced with a no-op so the hot pod path never nil-panics.
+	recorder record.EventRecorder
+
 	mu     sync.Mutex
 	pods   map[string]*podRec
 	notify func(*corev1.Pod)
@@ -68,8 +75,14 @@ type procRec struct {
 func podKey(ns, name string) string { return ns + "/" + name }
 
 // NewHostProcess returns a HostProcess provider. podRoot is created on demand.
-func NewHostProcess(nodeName, podRoot, nodeIP string) *HostProcess {
-	return &HostProcess{nodeName: nodeName, podRoot: podRoot, nodeIP: nodeIP, pods: map[string]*podRec{}}
+// recorder receives pod lifecycle Events; a nil recorder is replaced with a
+// no-op so callers that do not wire an EventRecorder (tests, degraded bring-up)
+// never nil-panic on the pod path.
+func NewHostProcess(nodeName, podRoot, nodeIP string, recorder record.EventRecorder) *HostProcess {
+	if recorder == nil {
+		recorder = nopRecorder{}
+	}
+	return &HostProcess{nodeName: nodeName, podRoot: podRoot, nodeIP: nodeIP, recorder: recorder, pods: map[string]*podRec{}}
 }
 
 // Compile-time checks that we satisfy the VK contracts and the Runtime seam.
@@ -79,21 +92,47 @@ var (
 	_ Runtime                       = (*HostProcess)(nil)
 )
 
-// CreatePod launches every container of the pod as a native process.
+// podEvent is a lifecycle Event buffered under p.mu and emitted after the lock is
+// released — mirroring dispatch's off-lock callback discipline so a slow/blocking
+// EventRecorder sink can never stall a caller holding the provider lock.
+type podEvent struct {
+	eventtype string
+	reason    string
+	message   string
+}
+
+// CreatePod launches every container of the pod as a native process, then emits
+// the Pulled/Created/Started (and, on a start failure, Failed) lifecycle Events
+// outside the provider lock.
 func (p *HostProcess) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	events, err := p.startPod(pod)
+	// Emit outside p.mu (startPod has returned, releasing the lock). The Event's
+	// involved object is the Pod, so client-go derives the Pod ObjectReference; the
+	// container name is carried in the message.
+	for _, ev := range events {
+		p.recorder.Event(pod, ev.eventtype, ev.reason, ev.message)
+	}
+	return err
+}
+
+// startPod is the locked body of CreatePod: it launches each container process,
+// records status, and returns the lifecycle Events for CreatePod to emit after
+// the lock is released.
+func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	k := podKey(pod.Namespace, pod.Name)
 	if _, ok := p.pods[k]; ok {
-		return nil // idempotent
+		return nil, nil // idempotent
 	}
 	dir := filepath.Join(p.podRoot, string(pod.UID))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("pod dir: %w", err)
+		return nil, fmt.Errorf("pod dir: %w", err)
 	}
 	rec := &podRec{pod: pod.DeepCopy(), procs: map[string]*procRec{}}
 	now := metav1.Now()
 	var cstats []corev1.ContainerStatus
+	var events []podEvent
 
 	for i := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[i]
@@ -101,20 +140,26 @@ func (p *HostProcess) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		if len(argv) == 0 {
 			argv = []string{c.Image} // M0 convention: image ref == binary path
 		}
+		// M0 has no registry pull (image == already-present native binary), so the
+		// Pulled event uses the kubelet's "already present" phrasing.
+		events = append(events, podEvent{corev1.EventTypeNormal, reasonPulled, msgImageAlreadyPresent(c.Image)})
 		logPath := filepath.Join(dir, c.Name+".log")
 		lf, err := os.Create(logPath)
 		if err != nil {
-			return fmt.Errorf("log file: %w", err)
+			return events, fmt.Errorf("log file: %w", err)
 		}
 		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Stdout, cmd.Stderr = lf, lf
 		cmd.Env = envSlice(c.Env)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group → clean teardown
+		events = append(events, podEvent{corev1.EventTypeNormal, reasonCreated, msgCreatedContainer(c.Name)})
 		if err := cmd.Start(); err != nil {
 			_ = lf.Close()
+			events = append(events, podEvent{corev1.EventTypeWarning, reasonFailed, msgFailedStart(c.Name)})
 			cstats = append(cstats, waitingStatus(c, "StartError", err.Error()))
 			continue
 		}
+		events = append(events, podEvent{corev1.EventTypeNormal, reasonStarted, msgStartedContainer(c.Name)})
 		rec.procs[c.Name] = &procRec{cmd: cmd, logPath: logPath}
 		cstats = append(cstats, runningStatus(c, now))
 		go p.reap(k, c.Name, cmd, lf)
@@ -155,7 +200,7 @@ func (p *HostProcess) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	p.pods[k] = rec
 	p.dispatch(rec.pod)
-	return nil
+	return events, nil
 }
 
 // reap waits for a container process to exit and records its terminal status.
@@ -206,8 +251,20 @@ func (p *HostProcess) reap(k, cname string, cmd *exec.Cmd, lf *os.File) {
 // UpdatePod is a no-op for M0 (we don't restart on spec changes yet).
 func (p *HostProcess) UpdatePod(ctx context.Context, pod *corev1.Pod) error { return nil }
 
-// DeletePod kills every container process group and forgets the pod.
+// DeletePod kills every container process group and forgets the pod, then emits a
+// Killing lifecycle Event per container outside the provider lock.
 func (p *HostProcess) DeletePod(ctx context.Context, pod *corev1.Pod) error {
+	events := p.stopPod(pod)
+	for _, ev := range events {
+		p.recorder.Event(pod, ev.eventtype, ev.reason, ev.message)
+	}
+	return nil
+}
+
+// stopPod is the locked body of DeletePod: it kills each container process group,
+// marks the pod Succeeded, and returns the Killing Events for DeletePod to emit
+// after the lock is released.
+func (p *HostProcess) stopPod(pod *corev1.Pod) []podEvent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	k := podKey(pod.Namespace, pod.Name)
@@ -215,7 +272,9 @@ func (p *HostProcess) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	if !ok {
 		return nil // already gone; DeletePod may be called repeatedly
 	}
-	for _, pr := range rec.procs {
+	var events []podEvent
+	for name, pr := range rec.procs {
+		events = append(events, podEvent{corev1.EventTypeNormal, reasonKilling, msgStoppingContainer(name)})
 		if pr.cmd.Process != nil {
 			_ = syscall.Kill(-pr.cmd.Process.Pid, syscall.SIGKILL) // whole process group
 		}
@@ -223,7 +282,7 @@ func (p *HostProcess) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	rec.pod.Status.Phase = corev1.PodSucceeded
 	p.dispatch(rec.pod)
 	delete(p.pods, k)
-	return nil
+	return events
 }
 
 func (p *HostProcess) GetPod(ctx context.Context, ns, name string) (*corev1.Pod, error) {

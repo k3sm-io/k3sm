@@ -449,11 +449,11 @@ type cpAttachIO struct {
 	stderr io.WriteCloser
 }
 
-func (f *cpAttachIO) Stdin() io.Reader            { return f.stdin }
-func (f *cpAttachIO) Stdout() io.WriteCloser      { return f.stdout }
-func (f *cpAttachIO) Stderr() io.WriteCloser      { return f.stderr }
-func (f *cpAttachIO) TTY() bool                   { return false }
-func (f *cpAttachIO) Resize() <-chan api.TermSize { return nil }
+func (f *cpAttachIO) Stdin() io.Reader                  { return f.stdin }
+func (f *cpAttachIO) Stdout() io.WriteCloser            { return f.stdout }
+func (f *cpAttachIO) Stderr() io.WriteCloser            { return f.stderr }
+func (f *cpAttachIO) TTY() bool                         { return false }
+func (f *cpAttachIO) Resize() <-chan vkadapter.TermSize { return nil }
 
 // buildCpTarFixture builds a REAL archive/tar stream (>512KB) of a small tree whose
 // binary member is filled with a deterministic full-byte-range payload (containing NUL

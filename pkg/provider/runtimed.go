@@ -379,7 +379,7 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	}
 	t := r.trackByID(id)
 	if t == nil {
-		return nil, errdefs.NotFoundf("pod %q not found", namespace+"/"+name)
+		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
 	st := r.buildStatus(pod.DeepCopy(), t, resp.GetStatus(), r.proberFor(id))
 	return &st, nil
