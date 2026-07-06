@@ -85,7 +85,7 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home")
-	fs.StringVar(&opts.rtName, "runtime", "hostprocess", "pod runtime: hostprocess or runtimed")
+	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", executor.DefaultAPIServerPort, "apiserver secure port")
 	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
@@ -346,12 +346,18 @@ func runServer(args []string) error {
 	// backend dialer binds the mesh-egress source UNCONDITIONALLY (every dial,
 	// including same-node loopback), setting a non-local value here would break ALL
 	// backend dials. It is wired the moment the server-side mesh bring-up lands.
+	// The control-plane node's pod /24: the reserved index-0 carve of the cluster
+	// pod CIDR — the ONE value both the routing-table locality below and the
+	// node's podnet adapter (step 5) allocate against (M10.1; the mesh enroller
+	// reserves index 0 for this node, workers enroll 1+).
+	serverPodCIDR := defaultNodePodCIDR()
 	net := netserve.New(netserve.Config{
 		Client:        cs,
 		WorkDir:       opts.workDir,
 		DNSVIP:        opts.clusterIP,
 		ClusterDomain: opts.domain,
 		NodeIP:        opts.nodeIP,
+		PodCIDR:       serverPodCIDR,
 		NetdSocket:    mode.Socket,
 		Disabled:      !mode.DataPath(),
 		Logger:        logger,
@@ -446,6 +452,8 @@ func runServer(args []string) error {
 		dnsShim:    opts.dnsShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
+		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)
+		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
 	})
 }

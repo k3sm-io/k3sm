@@ -468,7 +468,7 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 			Searches: []string{"corp.internal"},
 			Options:  []corev1.PodDNSConfigOption{{Name: "ndots", Value: ptr("2")}},
 		})
-		box, err := newR(t).buildBox(context.Background(), pod)
+		box, err := newR(t).buildBox(context.Background(), pod, "10.0.0.5")
 		if err != nil {
 			t.Fatalf("buildBox: %v", err)
 		}
@@ -496,7 +496,7 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 		pod := dnsPod(corev1.DNSClusterFirst, &corev1.PodDNSConfig{
 			Searches: []string{"a", "b", "cluster.local", "c", "d", "e"},
 		})
-		box, err := newR(t).buildBox(context.Background(), pod)
+		box, err := newR(t).buildBox(context.Background(), pod, "10.0.0.5")
 		if err != nil {
 			t.Fatalf("buildBox: %v", err)
 		}
@@ -533,7 +533,7 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 		}
 		for _, policy := range []corev1.DNSPolicy{corev1.DNSNone, corev1.DNSDefault} {
 			t.Run(string(policy), func(t *testing.T) {
-				box, err := newR(t).buildBox(context.Background(), dnsPod(policy, cfg))
+				box, err := newR(t).buildBox(context.Background(), dnsPod(policy, cfg), "10.0.0.5")
 				if err != nil {
 					t.Fatalf("buildBox: %v", err)
 				}

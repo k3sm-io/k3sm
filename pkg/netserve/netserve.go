@@ -192,16 +192,25 @@ func (s *Server) runResolver(ctx context.Context) {
 		return // DNS VIP did not parse (logged in New)
 	}
 
-	// The cluster Service zone, read from an informer cache (no apiserver round-trip
-	// per query). Started here so it tracks ctx; warm the cache before serving.
+	// The cluster Service zone, read from informer caches (no apiserver round-trip
+	// per query): Services for the A/VIP answers, EndpointSlices for the M10.1
+	// identity records (headless all-backends A, StatefulSet hostname identity,
+	// SRV, PTR). Both listers are created BEFORE Start so both informers run;
+	// warm the caches before serving.
+	domain := s.cfg.ClusterDomain
+	if domain == "" {
+		domain = dns.DefaultClusterDomain
+	}
 	factory := informers.NewSharedInformerFactory(s.cfg.Client, 30*time.Second)
 	lister := factory.Core().V1().Services().Lister()
+	sliceLister := factory.Discovery().V1().EndpointSlices().Lister()
 	factory.Start(ctx.Done())
 	factory.WaitForCacheSync(ctx.Done())
 	if ctx.Err() != nil {
 		return
 	}
-	resolver := newClusterResolver(s.dnsVIP, s.cfg.ClusterDomain, serviceZone{lister: lister}, systemForwarder{}, s.log)
+	zone := serviceZone{services: lister, slices: sliceLister, domain: domain}
+	resolver := newClusterResolver(s.dnsVIP, domain, zone, systemForwarder{}, s.log)
 
 	if err := s.binder.ensureAlias(ctx, s.dnsVIP); err != nil {
 		s.log.Error("ensure DNS VIP lo0 alias; per-node resolver disabled", "vip", s.dnsVIP.String(), "err", err)

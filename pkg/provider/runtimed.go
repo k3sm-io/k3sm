@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,9 +36,11 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // resyncInterval is the period of the GetPodStatus backstop poll that recovers
@@ -78,6 +81,13 @@ type runtimedRuntime struct {
 	// literal env). It is the SAME resolver wired into runtimed's Deps for volume
 	// materialization. nil ⇒ data-backed env/volumes fail closed.
 	resolver mount.Resolver
+
+	// network is the per-node pod-IP seam (the podnet adapter, M10.1) — the SAME
+	// instance wired into runtimed's Deps.Network, so the provider's
+	// allocate-before-translate Setup and the runtimed-side seam Setup are one
+	// idempotent authority. nil ⇒ podIP ≈ nodeIP (the --network none / no-datapath
+	// posture; runtimed then keeps its single-node NodeNetwork).
+	network PodNetwork
 
 	// clk, dial, and probeTransport are the provider-served probe seams (M2.2):
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
@@ -144,6 +154,16 @@ type RuntimedConfig struct {
 	// sandbox so a pod cannot drive the privileged daemon. Threaded as data
 	// because runtimed cannot import darwin-net.
 	DeniedUnixSocketPaths []string
+	// Network is the pod-IP seam (the podnet adapter over darwin-net's IPAM,
+	// M10.1), shared verbatim with the embedded runtimed daemon (Deps.Network) so
+	// there is exactly ONE allocator: the provider's CreatePod resolves the pod's
+	// /32 through it BEFORE translation (box.PodIp + the downward-API status.podIP
+	// env carry it), and runtimed's later seam Setup — idempotent per podID —
+	// returns the SAME address. nil keeps runtimed's single-node NodeNetwork
+	// (podIP ≈ NodeIP): the explicit --network none / no-datapath posture, never a
+	// silent production fallback (the commands fail fast via the runtimed
+	// preflight instead).
+	Network PodNetwork
 	// Client is the apiserver client the provider resolves ConfigMap/Secret data,
 	// SA tokens (M2.1 volumes/env), and imagePullSecret credentials (M2.6) with —
 	// runtimed never talks to the apiserver. nil disables data-backed
@@ -171,6 +191,14 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		resolver = newKubeResolver(cfg.Client)
 		creds = newKubeCredentials(cfg.Client)
 	}
+	// The pod network runtimed drives: the injected podnet adapter (per-pod /32
+	// lo0 aliases + the startup stale-alias reconcile) when configured, else the
+	// single-node NodeNetwork pinned to this node's IP (podIP ≈ nodeIP — the
+	// documented --network none posture).
+	var network supervisor.PodNetwork = supervisor.NodeNetwork{IP: cfg.NodeIP}
+	if cfg.Network != nil {
+		network = cfg.Network
+	}
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",
@@ -183,6 +211,7 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	}, runtimed.Deps{
 		Resolver:    resolver,
 		Credentials: creds,
+		Network:     network,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
@@ -207,6 +236,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		clusterDomain:  cfg.ClusterDomain,
 		deniedSocks:    cfg.DeniedUnixSocketPaths,
 		resolver:       resolver,
+		network:        cfg.Network,
 		log:            log,
 		clk:            clock.RealClock{},
 		dial:           (&net.Dialer{}).DialContext,
@@ -223,11 +253,69 @@ var (
 	_ StatsSource = (*runtimedRuntime)(nil)
 )
 
+// podIP resolves the pod's IP BEFORE translation — the M10.1 ordering fix: the
+// /32 must exist before toPodBox so box.PodIp, the downward-API status.podIP
+// env fieldRefs (resolvePodBoxEnv reads box.GetPodIp()), the SBPL bind
+// discipline, and pod status all carry ONE authority. The runtimed-side seam's
+// later Setup for the same podID is idempotent and returns the SAME address.
+//
+// Branches (each documented, never a silent fallback):
+//   - no adapter (nil network — the --network none posture): podIP ≈ nodeIP.
+//   - spec.hostNetwork: the pod shares the node's addresses — no /32. The pod is
+//     marked on the adapter so the runtimed-side seam Setup (which the
+//     host-process spine calls unconditionally) also resolves it to the node IP.
+//   - vm RuntimeClass: the guest owns its address inside its own netstack;
+//     runtimed routes it to SetupGuest, never the host-process Setup — no lo0
+//     /32 (which would make the host answer for the guest and blackhole it).
+//   - otherwise: the podnet /32. Pool exhaustion surfaces as a distinguishable
+//     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap).
+func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, error) {
+	if r.network == nil {
+		return r.nodeIP, nil
+	}
+	id := string(pod.UID)
+	if pod.Spec.HostNetwork {
+		r.network.MarkHostNetwork(id)
+		return r.nodeIP, nil
+	}
+	if backend, err := podSandboxBackend(pod); err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		// An unknown RuntimeClass error is NOT handled here — toPodBox owns that
+		// fail-closed rejection; this branch only routes a resolved vm pod away
+		// from the host-process /32.
+		return r.nodeIP, nil
+	}
+	ip, err := r.network.Setup(ctx, id)
+	if err != nil {
+		if errors.Is(err, podnet.ErrPoolExhausted) {
+			return "", fmt.Errorf("pod ip pool exhausted on node %s (253 pods/node): allocate pod ip for %s/%s: %w", r.nodeName, pod.Namespace, pod.Name, err)
+		}
+		return "", fmt.Errorf("allocate pod ip for %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	return ip, nil
+}
+
+// releasePodNetwork tears down the pod's network allocation, log-and-continue —
+// a teardown error never blocks pod deletion. runtimed's DeletePod RPC already
+// tears the seam down on its side; this provider-side call (idempotent no-op
+// then) covers the paths where the RPC failed or the pod never reached the
+// runtime (a translate failure after allocation), so a churned pod cannot leak
+// one of the 253 node addresses. The adapter's startup sweep is the backstop.
+func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
+	if r.network == nil {
+		return
+	}
+	if err := r.network.Teardown(string(pod.UID)); err != nil {
+		r.log.Warn("pod network teardown", "namespace", pod.Namespace, "name", pod.Name, "err", err)
+	}
+}
+
 // buildBox translates pod to a PodBox and resolves its env into LITERAL values —
 // runtimed reads only EnvVar.value and never talks to the apiserver, so the
 // provider resolves configMap/secret/envFrom (via its Resolver) and downward-API
 // (via the node identity) here, before the box crosses the runtime boundary.
-func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runtimev1.PodBox, error) {
+// podIP is the pod's already-resolved IP (see podIP — allocated BEFORE this
+// translation so the box and its resolved env carry the real /32).
+func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP string) (*runtimev1.PodBox, error) {
 	// Per-pod cluster DNS config: the search list is namespace-scoped
 	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
 	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
@@ -253,7 +341,7 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod) (*runti
 				"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
 		}
 	}
-	box, err := toPodBox(pod, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg)
+	box, err := toPodBox(pod, podIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +368,16 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	ctx = withServiceAccount(ctx, podServiceAccount(pod))
 	id := string(pod.UID)
 	start := metav1.Now()
-	box, err := r.buildBox(ctx, pod)
+	// M10.1 ordering (BINDING): allocate the pod's /32 BEFORE translation/env
+	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
+	// translate failure below does NOT release it here (an idempotent retry or
+	// the eventual DeletePod → releasePodNetwork reclaims it; auto-releasing
+	// would also rip a live pod's alias away on an UpdatePod translate error).
+	podIP, err := r.podIP(ctx, pod)
+	if err != nil {
+		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
@@ -325,7 +422,13 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 	r.mu.Unlock()
 
-	box, err := r.buildBox(ctx, pod)
+	// Same allocate-before-translate ordering as CreatePod; Setup is idempotent
+	// per podID, so an update re-reads the pod's existing /32 (one authority).
+	podIP, err := r.podIP(ctx, pod)
+	if err != nil {
+		return fmt.Errorf("update pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
@@ -358,6 +461,9 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
 	// loops outside the lock, so no probe goroutine outlives the pod).
 	r.stopProber(id)
+	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
+	// delete-path teardown) so pod churn never leaks a node pool address.
+	r.releasePodNetwork(pod)
 	r.mu.Lock()
 	delete(r.track, id)
 	r.mu.Unlock()
