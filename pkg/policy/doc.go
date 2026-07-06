@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package policy provisions k3sm's admission guardrails as
-// ValidatingAdmissionPolicies (GA since 1.30, so no webhook server is needed — the
-// apiserver evaluates the CEL in-process), idempotently at server start.
+// Package policy provisions k3sm's cluster policy objects idempotently at server
+// start: the admission guardrails — ValidatingAdmissionPolicies (GA since 1.30,
+// so no webhook server is needed; the apiserver evaluates the CEL in-process)
+// plus one MutatingAdmissionPolicy — and the plain (non-admission) default
+// policy objects, today the M10.0 memory-only LimitRange.
 //
 // Two are Deny guards:
 //   - os=darwin (the INTENT guard): every Pod must target k3sm's darwin nodes via
@@ -49,6 +51,15 @@ limitations under the License.
 //     pods schedule. It injects ONLY the toleration, NEVER the
 //     kubernetes.io/os=darwin nodeSelector — a DaemonSet declares its own placement
 //     intent and overriding it would defeat the DS's selector/affinity (Res.7).
+//
+// One is a plain policy OBJECT, not an admission policy (M10.0, Res.5):
+//   - the memory-only default LimitRange in the `default` namespace
+//     (EnsureDefaultLimitRange): default/defaultRequest MEMORY per container —
+//     memory is enforced by the runtime (rusage sampler → OOMKill) — and
+//     deliberately NO cpu key anywhere (CPU is best-effort; a CPU default would
+//     over-claim a guarantee k3sm cannot keep). Create-if-absent, never update:
+//     in-cluster objects are operator-space, unlike the executor's
+//     overwrite-on-boot binary-space config files.
 //
 // CONFORMANCE requirement: a k3sm DaemonSet MUST declare
 // nodeSelector: kubernetes.io/os=darwin in its OWN pod template. The os=darwin Deny VAP

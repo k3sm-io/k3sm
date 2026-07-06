@@ -171,6 +171,47 @@ func TestApiserverArgsSingleNodeDefault(t *testing.T) {
 	}
 }
 
+// TestApiserverArgs_AuditPolicyWired is the M10.0 argv guard (B70 supplementary
+// build check — the milestone proof is the enforcement e2e): the apiserver loads
+// the provisioned audit policy + admission-control config, the audit log lands at
+// the single-sourced AuditLogPath with bounded rotation, --audit-log-mode is
+// ABSENT (the upstream blocking default — a write failure drops events, never
+// stalls serving; blocking-strict is deliberately not used), and the SHIPPED
+// policy content is structurally Metadata/None-only (asserting the LEVEL, not
+// just that --audit-* is wired).
+func TestApiserverArgs_AuditPolicyWired(t *testing.T) {
+	cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+	args := apiServerArgs(cfg)
+
+	if got := flagValue(args, "--audit-policy-file"); got != auditPolicyPath("/wd") {
+		t.Errorf("--audit-policy-file = %q, want %q", got, auditPolicyPath("/wd"))
+	}
+	if got := flagValue(args, "--audit-log-path"); got != AuditLogPath("/wd") {
+		t.Errorf("--audit-log-path = %q, want the single-sourced %q", got, AuditLogPath("/wd"))
+	}
+	for _, want := range []string{"--audit-log-maxsize=100", "--audit-log-maxbackup=3", "--audit-log-maxage=30"} {
+		if !hasArg(args, want) {
+			t.Errorf("bounded rotation token %s missing, args=%v", want, args)
+		}
+	}
+	if got := flagValue(args, "--admission-control-config-file"); got != admissionConfigPath("/wd") {
+		t.Errorf("--admission-control-config-file = %q, want %q", got, admissionConfigPath("/wd"))
+	}
+	for _, a := range args {
+		if strings.HasPrefix(a, "--audit-log-mode") {
+			t.Errorf("--audit-log-mode must be ABSENT (upstream blocking default; blocking-strict deliberately unused), got %q", a)
+		}
+	}
+
+	// The LEVEL: the shipped policy document itself is Metadata/None-only.
+	if strings.Contains(auditPolicyDoc, "Request") {
+		t.Errorf("shipped audit policy must never contain a Request/RequestResponse level:\n%s", auditPolicyDoc)
+	}
+	if !strings.Contains(auditPolicyDoc, "level: Metadata") {
+		t.Errorf("shipped audit policy must pin level: Metadata:\n%s", auditPolicyDoc)
+	}
+}
+
 // TestClientCAFileAlwaysSet is the deliverable-3 guard: --client-ca-file is wired in
 // BOTH postures so the per-component (system:kube-scheduler / system:kube-controller-
 // manager) and system:node client certs authenticate. Single-node (no explicit

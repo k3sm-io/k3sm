@@ -18,12 +18,33 @@ limitations under the License.
 
 package e2e
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
 
-// M10 conformance criterion stubs (docs/m10-plan.md §"Gate machinery", Res.9).
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"k3sm.io/k3sm/pkg/executor"
+)
+
+// M10 conformance criteria (docs/m10-plan.md §"Gate machinery", Res.9).
 //
-// These are authored as t.Skip'd TODO tests so the criterion set is VISIBLE and
-// each criterion has a named home to grow into, WITHOUT yet being required. Per
+// The M10.0 criteria (TestM10_AuditLogLevel, TestM10_PSADefaultWarn) now carry
+// REAL bodies — they run under -tags e2e against a booted `k3sm server`
+// (integration tier, hack/ci.sh --integration; never unit CI). The remaining
+// M10.1/M10.2 criteria are still t.Skip'd TODO stubs so the criterion set is
+// VISIBLE and each criterion has a named home to grow into, WITHOUT yet being
+// required. Per
 // Res.9 a new conformance criterion is promoted into the required M2_CRITERIA/
 // M4_CRITERIA sets (in hack/acceptance/m<n>.sh, enforced by the non-vacuous guard
 // hack/lib/conformance.sh) ONLY in the PR that lands it green — never before, so a
@@ -35,21 +56,315 @@ import "testing"
 // Criterion names carry the M10 tag (Res.9 — native sidecars / node Events are M10.x,
 // NOT TestM2_*/TestM4_*).
 
+// psaWarningCollector captures the HTTP-299 warning headers the apiserver
+// attaches to a response (client-go delivers them per-request). Concurrency: mu
+// guards warnings (client-go may deliver warnings from concurrent requests).
+type psaWarningCollector struct {
+	mu       sync.Mutex
+	warnings []string
+}
+
+// HandleWarningHeader implements rest.WarningHandler.
+func (w *psaWarningCollector) HandleWarningHeader(code int, _ string, text string) {
+	if code != 299 || text == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.warnings = append(w.warnings, text)
+}
+
+// psaWarnings returns the captured warnings that came from Pod Security
+// Admission (the `would violate PodSecurity "<level>:<version>"` shape),
+// filtering out unrelated advisories (e.g. the k3sm provider-toleration Warn VAP).
+func (w *psaWarningCollector) psaWarnings() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	for _, s := range w.warnings {
+		if strings.Contains(s, "PodSecurity") {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (w *psaWarningCollector) reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.warnings = nil
+}
+
+// warnClient builds a clientset from $KUBECONFIG (the harness contract, see Up)
+// whose rest.Config routes warning headers into the returned collector.
+func warnClient(t *testing.T) (kubernetes.Interface, *psaWarningCollector) {
+	t.Helper()
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		t.Skip("e2e: $KUBECONFIG unset — run via hack/acceptance/m<n>.sh, not `go test` directly")
+	}
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		t.Fatalf("load kubeconfig %s: %v", kubeconfig, err)
+	}
+	col := &psaWarningCollector{}
+	cfg.WarningHandler = col
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Fatalf("build client: %v", err)
+	}
+	return cs, col
+}
+
+// m10Pod is the M10.0 pod fixture: darwin-targeted (satisfying the os=darwin
+// Deny VAP) and provider-taint-tolerating (so the B17 toleration Warn VAP stays
+// quiet — the PSA-warning assertions must not depend on filtering it out).
+// violating=true adds hostNetwork: true — a `baseline` violation (host
+// namespaces) that is meaningful on Darwin (the hostPath/hostNet axis), while
+// staying admitted under the shipped enforce=privileged default.
+func m10Pod(name string, violating bool) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{"app": name}},
+		Spec: corev1.PodSpec{
+			NodeSelector:  map[string]string{"kubernetes.io/os": "darwin"},
+			RestartPolicy: corev1.RestartPolicyNever,
+			Tolerations:   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
+			HostNetwork:   violating,
+			Containers: []corev1.Container{{
+				Name:    "c",
+				Image:   "native",
+				Command: []string{"/bin/sh", "-c", "sleep 5"},
+			}},
+		},
+	}
+}
+
+// deletePod best-effort removes a test pod (background, immediate).
+func deletePod(ctx context.Context, cs kubernetes.Interface, name string) {
+	zero := int64(0)
+	_ = cs.CoreV1().Pods("default").Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+}
+
+// serverWorkDir resolves the running server's control-plane work dir:
+// $K3SM_WORK_DIR, else the root-posture executor default (mirrors m4_test.go).
+func serverWorkDir() string {
+	if wd := os.Getenv("K3SM_WORK_DIR"); wd != "" {
+		return wd
+	}
+	return executor.DefaultWorkDir
+}
+
+// auditEvent is the audit.k8s.io/v1 Event subset the M10.0 audit criterion
+// asserts on (one JSON object per audit-log line).
+type auditEvent struct {
+	Level     string `json:"level"`
+	ObjectRef struct {
+		Resource string `json:"resource"`
+	} `json:"objectRef"`
+	RequestObject  json.RawMessage   `json:"requestObject"`
+	ResponseObject json.RawMessage   `json:"responseObject"`
+	Annotations    map[string]string `json:"annotations"`
+}
+
 // TestM10_AuditLogLevel is the M10.0 audit-logging criterion (Res.4): apply an object
 // touching secrets/configmaps and assert the shipped audit policy records it at
 // level: Metadata (or None) — NEVER Request/RequestResponse (no Secret cleartext at
 // rest), with the audit file at a 0600, Seatbelt-denied, off-datastore-volume path.
+// Integration-tier (runs under -tags e2e against a booted `k3sm server`); NOT yet a
+// required criterion (Res.9 — promotion happens only in the PR that runs it green).
 func TestM10_AuditLogLevel(t *testing.T) {
-	t.Skip("TODO(M10.0): assert the shipped audit policy records secrets/configmaps at level Metadata/None (never Request/RequestResponse) — B70")
+	cs, _ := warnClient(t)
+	ctx := context.Background()
+
+	// Touch a Secret (create + get + delete) so the audit log carries fresh
+	// secret events with a known payload marker, then create a baseline-violating
+	// pod so a PSA audit annotation is recorded (audit=restricted).
+	const secretName = "m10-audit-probe"
+	const marker = "m10-cleartext-marker"
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: "default"},
+		StringData: map[string]string{"probe": marker},
+	}
+	if _, err := cs.CoreV1().Secrets("default").Create(ctx, sec, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create probe secret: %v", err)
+	}
+	defer func() { _ = cs.CoreV1().Secrets("default").Delete(ctx, secretName, metav1.DeleteOptions{}) }()
+	if _, err := cs.CoreV1().Secrets("default").Get(ctx, secretName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("get probe secret: %v", err)
+	}
+
+	const violatingPod = "m10-audit-psa-violating"
+	if _, err := cs.CoreV1().Pods("default").Create(ctx, m10Pod(violatingPod, true), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create baseline-violating pod (must be ADMITTED under enforce=privileged): %v", err)
+	}
+	defer deletePod(ctx, cs, violatingPod)
+
+	auditPath := executor.AuditLogPath(serverWorkDir())
+	// The default --audit-log-mode is blocking (events are written before the
+	// response returns), but give the filesystem a short retry window.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		secretEvents, psaAnnotated, err := scanAuditLog(auditPath)
+		if err == nil && secretEvents > 0 && psaAnnotated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("audit log %s: err=%v secretEvents=%d psaAuditAnnotation=%v — want secret events at level Metadata + the PSA audit-violations annotation", auditPath, err, secretEvents, psaAnnotated)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Now the LEVEL assertions over the whole file.
+	b, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit log %s (set K3SM_WORK_DIR to the server work dir): %v", auditPath, err)
+	}
+	if strings.Contains(string(b), marker) {
+		t.Errorf("audit log contains the Secret PAYLOAD %q — secrets must be recorded at Metadata (no requestObject/responseObject cleartext at rest)", marker)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var ev auditEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue // tolerate partial trailing writes
+		}
+		if ev.ObjectRef.Resource != "secrets" {
+			continue
+		}
+		if ev.Level != "Metadata" {
+			t.Errorf("secret audit event at level %q, want Metadata (the ordered first-match rule)", ev.Level)
+		}
+		if len(ev.RequestObject) != 0 || len(ev.ResponseObject) != 0 {
+			t.Errorf("secret audit event carries requestObject/responseObject — Metadata must strip the payload")
+		}
+	}
+}
+
+// scanAuditLog counts secret-touching events and reports whether any event
+// carries the PSA audit-violations annotation.
+func scanAuditLog(path string) (secretEvents int, psaAnnotated bool, err error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		var ev auditEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		if ev.ObjectRef.Resource == "secrets" {
+			secretEvents++
+		}
+		for k := range ev.Annotations {
+			if strings.HasPrefix(k, "pod-security.kubernetes.io/audit-violations") {
+				psaAnnotated = true
+			}
+		}
+	}
+	return secretEvents, psaAnnotated, nil
 }
 
 // TestM10_PSADefaultWarn is the M10.0 Pod Security Admission criterion (Res.2): with
 // the shipped --admission-control-config-file + PodSecurityConfiguration default, a
-// baseline-violating pod is WARNED (audit-observable, zero rejection) pre-enforce;
-// post-preflight the baseline-enforce cutover turns it into a 403. Carries a negative
-// control — k3sm system pods + a baseline reference workload stay ADMITTED (Res.6).
+// baseline-violating pod is ADMITTED but WARNED (audit-observable, zero rejection)
+// pre-enforce. Carries the negative control (Res.6): a baseline-clean reference pod
+// applies with ZERO PSA warnings. Also asserts upstream template-level PSA — a
+// Deployment with a violating template warns at apply. Integration-tier; NOT yet a
+// required criterion (Res.9).
 func TestM10_PSADefaultWarn(t *testing.T) {
-	t.Skip("TODO(M10.0): assert the PSA cluster-default (baseline-warn → enforce cutover) with a negative control — B71")
+	cs, warns := warnClient(t)
+	ctx := context.Background()
+
+	t.Run("baseline-violating pod is admitted WITH a PSA warning", func(t *testing.T) {
+		warns.reset()
+		const name = "m10-psa-violating"
+		if _, err := cs.CoreV1().Pods("default").Create(ctx, m10Pod(name, true), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("violating pod must be ADMITTED under the shipped enforce=privileged default: %v", err)
+		}
+		defer deletePod(ctx, cs, name)
+		got := warns.psaWarnings()
+		if len(got) == 0 {
+			t.Fatal("want a PSA warning on the baseline-violating pod (warn=baseline), got none")
+		}
+		found := false
+		for _, w := range got {
+			if strings.Contains(w, `PodSecurity "baseline:`) && strings.Contains(w, "violate") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("PSA warnings %q must name the baseline level violation", got)
+		}
+	})
+
+	t.Run("negative control: baseline-clean reference pod warns nothing", func(t *testing.T) {
+		warns.reset()
+		const name = "m10-psa-clean"
+		if _, err := cs.CoreV1().Pods("default").Create(ctx, m10Pod(name, false), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("baseline-clean reference pod must be ADMITTED: %v", err)
+		}
+		defer deletePod(ctx, cs, name)
+		if got := warns.psaWarnings(); len(got) != 0 {
+			t.Errorf("baseline-clean pod must produce ZERO PSA warnings, got %q", got)
+		}
+	})
+
+	t.Run("Deployment with a violating template warns at apply", func(t *testing.T) {
+		warns.reset()
+		const name = "m10-psa-violating-deploy"
+		zero := int32(0)
+		pod := m10Pod(name, true)
+		dep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &zero, // template-level PSA fires at apply; no pods are actually created
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+					Spec:       pod.Spec,
+				},
+			},
+		}
+		if _, err := cs.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("violating-template Deployment must be ADMITTED: %v", err)
+		}
+		defer func() { _ = cs.AppsV1().Deployments("default").Delete(ctx, name, metav1.DeleteOptions{}) }()
+		if got := warns.psaWarnings(); len(got) == 0 {
+			t.Error("want an upstream template-level PSA warning on the Deployment apply, got none")
+		}
+	})
+}
+
+// TestM10_PSAEnforceCutover is the --psa-enforce-baseline 403 leg (Res.2/B71).
+// The harness does NOT support a per-test server boot with extra flags (Up
+// attaches to ONE externally booted `k3sm server` via $KUBECONFIG), so this
+// runs only when the acceptance script signals the ambient server was booted
+// WITH the flag: export K3SM_PSA_ENFORCE=1 after starting
+// `k3sm server --psa-enforce-baseline` (fresh or existing work dir — the
+// admission config is overwritten on boot). Otherwise it skips with this spec
+// rather than hacking a boot path into the harness.
+func TestM10_PSAEnforceCutover(t *testing.T) {
+	if os.Getenv("K3SM_PSA_ENFORCE") != "1" {
+		t.Skip("SKIP-SPEC (harness has no per-test server boot with extra flags): boot `k3sm server --psa-enforce-baseline`, export K3SM_PSA_ENFORCE=1 (+ KUBECONFIG), and re-run — then a hostNetwork pod must be REJECTED 403 naming PodSecurity baseline, while the clean reference pod stays admitted")
+	}
+	cs, _ := warnClient(t)
+	ctx := context.Background()
+
+	// The violating pod is now REJECTED (403 Forbidden naming the baseline level).
+	_, err := cs.CoreV1().Pods("default").Create(ctx, m10Pod("m10-psa-enforced", true), metav1.CreateOptions{})
+	if !apierrors.IsForbidden(err) {
+		deletePod(ctx, cs, "m10-psa-enforced")
+		t.Fatalf("under --psa-enforce-baseline the violating pod must be 403 Forbidden, got err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "PodSecurity") {
+		t.Errorf("the 403 must name PodSecurity, got %q", err)
+	}
+
+	// Negative control: the baseline-clean reference pod is still admitted.
+	const clean = "m10-psa-enforced-clean"
+	if _, err := cs.CoreV1().Pods("default").Create(ctx, m10Pod(clean, false), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("baseline-clean pod must stay ADMITTED under enforce=baseline: %v", err)
+	}
+	deletePod(ctx, cs, clean)
 }
 
 // TestM10_NativeSidecar is the M10.2 native-sidecar criterion (Res.8): an initContainer

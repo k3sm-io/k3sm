@@ -137,6 +137,17 @@ type Config struct {
 	// bootstrap (the identical-CA bundle, DESIGN §5c) is M6.1; M6.0 consumes this only
 	// for the guard + the leader-election posture.
 	ServerJoin bool
+	// PSAEnforceBaseline, when true, flips the cluster-wide Pod Security Admission
+	// default ENFORCE level from privileged to baseline in the provisioned
+	// PodSecurityConfiguration (see admissionConfigYAML — the SINGLE authority for
+	// the PSA level tuple). The SHIPPED default is false — baseline-WARN only
+	// (warn=baseline + audit=restricted, zero rejection; docs/m10-plan.md Res.2).
+	// This field is the documented, reversible B71 cutover MECHANISM: flip it (via
+	// `k3sm server --psa-enforce-baseline`) only after a pre-flight scan proves the
+	// cluster clean; reverting the flag reverts the posture on the next boot. PSA
+	// here is conformance-surface + defense-in-depth, NOT the privilege boundary
+	// (the foreign-uid VAP + Seatbelt stay that).
+	PSAEnforceBaseline bool
 	// LeaderElect, when non-nil, forces the scheduler + controller-manager --leader-elect
 	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (a Postgres
 	// multi-writer datastore — so only one server's scheduler/KCM is active; two active

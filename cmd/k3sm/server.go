@@ -63,6 +63,8 @@ type serverOptions struct {
 	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
 	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (M6.1 HA server-join)
 	token             string // server-class join token (K10<caHash>::server:<secret>) for the HA server-join (M6.1)
+
+	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the B71 cutover; default = warn-only, M10.0)
 }
 
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
@@ -86,6 +88,14 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.rtName, "runtime", "hostprocess", "pod runtime: hostprocess or runtimed")
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", executor.DefaultAPIServerPort, "apiserver secure port")
+	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
+	// privileged; warn=baseline + audit=restricted — audit-observable, zero
+	// rejection). This flag is the documented, REVERSIBLE cutover MECHANISM for the
+	// B71 baseline-enforce flip: set it only after a pre-flight scan proves the
+	// cluster clean (B71 owns flipping it); dropping the flag reverts the posture on
+	// the next boot. It is an operator argv toggle of a single apiserver config
+	// value, not a runtime feature-flag code path.
+	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the B71 cutover; the shipped default is baseline-warn only)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
@@ -143,7 +153,10 @@ func runServer(args []string) error {
 		WorkDir:       opts.workDir,
 		APIServerPort: opts.apiPort,
 		NodeIP:        opts.nodeIP,
-		Logger:        logger,
+		// M10.0/B71: false ships baseline-WARN; true is the enforce cutover (see the
+		// flag comment above — executor.Config.PSAEnforceBaseline is the single seam).
+		PSAEnforceBaseline: opts.psaEnforceBaseline,
+		Logger:             logger,
 	}
 	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
 	// Postgres (DefaultKineVersionHA) and turns on scheduler/KCM leader election so only
@@ -286,6 +299,14 @@ func runServer(args []string) error {
 		if err := policy.EnsureNoForeignUserAdmission(ctx, cs, int64(os.Geteuid())); err != nil {
 			logger.Error("provision foreign-user admission policy", "err", err)
 		}
+	}
+	// M10.0 (Res.5) — the memory-only default LimitRange in the `default` namespace:
+	// containers that omit resources get honest memory defaults (memory IS enforced
+	// via the rusage sampler→OOMKill); deliberately NO cpu key (best-effort only).
+	// Create-if-absent (operator-space — a tuned object is never clobbered);
+	// log-and-continue like the sibling advisories.
+	if err := policy.EnsureDefaultLimitRange(ctx, cs); err != nil {
+		logger.Error("provision default memory limitrange", "err", err)
 	}
 	// M5.1 — provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
 	// scheduling.nodeSelector pinning it to VZ-capable nodes via
