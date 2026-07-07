@@ -32,8 +32,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/mesh"
+	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
@@ -264,16 +266,46 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 // is unit-tested without a live join.
 func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, logger *slog.Logger) netserve.Config {
 	return netserve.Config{
-		WorkDir:       opts.workDir,
-		DNSVIP:        opts.clusterIP,
-		ClusterDomain: opts.domain,
-		NodeIP:        opts.nodeIP,
-		PodCIDR:       res.PodCIDR,
-		MeshEgressIP:  res.MeshIP,
-		NetdSocket:    mode.Socket,
-		Disabled:      !mode.DataPath(),
-		Logger:        logger,
+		WorkDir:           opts.workDir,
+		DNSVIP:            opts.clusterIP,
+		ClusterDomain:     opts.domain,
+		NodeIP:            opts.nodeIP,
+		PodCIDR:           res.PodCIDR,
+		MeshEgressIP:      res.MeshIP,
+		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),
+		NetdSocket:        mode.Socket,
+		Disabled:          !mode.DataPath(),
+		Logger:            logger,
 	}
+}
+
+// peerMeshEgressIPs extracts each join-snapshot peer's mesh-egress /32: the
+// declared Spec.MeshIP, falling back to the canonical .1-of-the-pod-/24
+// derivation (podnet.MeshEgressIP — the one derivation the mesh and proxy share)
+// when unset. These seed the NetworkPolicy table's always-allow source set
+// (M10.4): a peer's Service proxy re-originates cross-node traffic from its
+// mesh-egress /32, and those node-origin dials must never be denied by a pod
+// policy. A peer that enrolls AFTER this snapshot is the documented fail-open
+// gap (netserve.Config.PeerMeshEgressIPs); an unparsable peer is skipped — its
+// dials fail open at the table, never mis-deny.
+func peerMeshEgressIPs(peers []netv1.MeshPeerSpec) []string {
+	out := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if p.MeshIP != "" {
+			out = append(out, p.MeshIP)
+			continue
+		}
+		pfx, err := netip.ParsePrefix(p.PodCIDR)
+		if err != nil {
+			continue
+		}
+		a, err := podnet.MeshEgressIP(pfx)
+		if err != nil {
+			continue
+		}
+		out = append(out, a.String())
+	}
+	return out
 }
 
 // loadOrCreateNodePassword reads the node's persisted node-password (0600), minting

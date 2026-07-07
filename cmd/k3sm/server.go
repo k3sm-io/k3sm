@@ -372,6 +372,15 @@ func runServer(args []string) error {
 	// pod CIDR — the ONE value both the routing-table locality below and the
 	// node's podnet adapter (step 5) allocate against (M10.1; the mesh enroller
 	// reserves index 0 for this node, workers enroll 1+).
+	//
+	// M10.4: the NetworkPolicy table's always-allow set is seeded from this config
+	// (NodeIP only here — MeshEgressIP is empty for the no-server-mesh reason
+	// above, and no peer mesh-egress /32s are known at construction: workers
+	// enroll DYNAMICALLY via the MeshPeer path after netserve is built). That is
+	// the documented dynamic-peer gap (netserve.Config.PeerMeshEgressIPs): an
+	// unseeded peer's node-origin dials are unattributable at this proxy and FAIL
+	// OPEN with a throttled Warn — widen-only, never a wrong deny. Seeding peers
+	// here rides the same follow-up as the server-side mesh bring-up.
 	serverPodCIDR := defaultNodePodCIDR()
 	net := netserve.New(netserve.Config{
 		Client:        cs,

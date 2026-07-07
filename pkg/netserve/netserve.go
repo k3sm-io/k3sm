@@ -62,6 +62,17 @@ type Config struct {
 	// mesh-egress lo0 alias is not yet plumbed (the dialer binds this address
 	// unconditionally, so a non-local value would break every backend dial).
 	MeshEgressIP string
+	// PeerMeshEgressIPs are the peer nodes' reserved mesh-egress /32s known at
+	// construction (a worker seeds them from the join snapshot). Together with
+	// NodeIP and MeshEgressIP they seed the NetworkPolicy table's ALWAYS-ALLOW
+	// source set (M10.4): a peer's Service proxy re-originates cross-node traffic
+	// from its mesh-egress /32, and such node-origin dialers must never be locked
+	// out by a pod policy. Dynamic-peer gap (documented follow-up): a peer that
+	// enrolls AFTER construction is not re-seeded — no MeshPeer-event plumbing
+	// feeds the policy table — so its dials are unattributable and FAIL OPEN with
+	// a throttled Warn (proxy.PolicyTable's unknown-source contract). The gap can
+	// only widen allows, never manufacture a deny.
+	PeerMeshEgressIPs []string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
 	// k3sm-netd helper at this socket, so the proxy runs unprivileged (the _k3sm
@@ -86,6 +97,13 @@ type Server struct {
 	proxy *proxy.Proxy
 	watch *proxy.Watcher
 	log   *slog.Logger
+	// policy is the NetworkPolicy L4-subset verdict table (M10.4), seeded with the
+	// always-allow node-origin /32s (NodeIP, MeshEgressIP, PeerMeshEgressIPs) and
+	// wired into the proxy's accept paths via proxy.WithPolicyTable.
+	policy *proxy.PolicyTable
+	// policyWatch resolves NetworkPolicies+Pods+Namespaces into policy's verdict
+	// state; Run hosts it beside the Service watcher (same client, same errgroup).
+	policyWatch *proxy.PolicyWatcher
 	// dnsVIP is the infra DNS VIP the per-node resolver owns and the proxy is
 	// exempted from (proxy.WithInfraVIPExemptions). Zero (invalid) when cfg.DNSVIP
 	// did not parse: the resolver does not run and the proxy is not exempted.
@@ -101,8 +119,10 @@ type Server struct {
 
 // New builds the network Server: a proxy.Proxy over a routing table keyed by the
 // node pod CIDR (exempted from the infra DNS VIP, sourced from the mesh-egress /32
-// when set), the Service/EndpointSlice watcher that drives it, and the per-node
-// cluster DNS resolver bound to the DNS VIP. It does not start anything; call Run.
+// when set, policy-gated by the seeded NetworkPolicy table), the Service/
+// EndpointSlice watcher that drives it, the NetworkPolicy watcher that resolves
+// policies into table verdicts, and the per-node cluster DNS resolver bound to
+// the DNS VIP. It does not start anything; call Run.
 func New(cfg Config) *Server {
 	log := cfg.Logger
 	if log == nil {
@@ -144,8 +164,26 @@ func New(cfg Config) *Server {
 		opts = append(opts, proxy.WithMeshEgressSource(egress))
 	}
 
+	// M10.4 — NetworkPolicy hosting, unconditional when the datapath runs (the
+	// nil-table proxy default is the off-switch upstream of this assembler). The
+	// verdict table is seeded with the always-allow node-origin sources — the
+	// node's InternalIP, this node's mesh-egress /32, and the peer mesh-egress
+	// /32s known at construction — so a pod policy can never lock out node-origin
+	// dialers (the in-process Ingress, apiserver webhooks, peer Service proxies).
+	// NewPolicyTable skips invalid (zero) addrs, so unset values pass through.
+	seeds := make([]netip.Addr, 0, 2+len(cfg.PeerMeshEgressIPs))
+	nodeIP, _ := netip.ParseAddr(cfg.NodeIP) // zero on parse failure → skipped by NewPolicyTable
+	seeds = append(seeds, nodeIP, s.meshEgress)
+	for _, p := range cfg.PeerMeshEgressIPs {
+		a, _ := netip.ParseAddr(p) // zero on parse failure → skipped by NewPolicyTable
+		seeds = append(seeds, a)
+	}
+	s.policy = proxy.NewPolicyTable(seeds...)
+	opts = append(opts, proxy.WithPolicyTable(s.policy))
+
 	s.proxy = proxy.New(table, opts...)
 	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log)
+	s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log)
 	return s
 }
 
@@ -168,6 +206,10 @@ func (s *Server) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return s.proxy.Run(gctx) })
 	g.Go(func() error { return s.watch.Run(gctx) })
+	// The NetworkPolicy watcher (M10.4) runs beside the Service watcher: same
+	// client, same lifecycle. The table stays empty (allow-everything) until its
+	// informers sync — the documented fail-open — so it never gates bring-up.
+	g.Go(func() error { return s.policyWatch.Run(gctx) })
 	// The per-node cluster DNS resolver. It is best-effort: a bind/serve failure is
 	// logged and the goroutine returns nil so it never tears the Service proxy down
 	// (a node with a degraded resolver still serves ClusterIP/NodePort traffic).
