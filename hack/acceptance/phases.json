@@ -14,5 +14,6 @@
   "M8": { "gate": "hack/acceptance/m8.sh", "tier": "integration", "requires": ["dev-mac", "apple-gpu", "network"],     "manual": false, "skeleton": true },
   "M9": { "gate": "hack/acceptance/m9.sh", "tier": "lab",         "requires": ["dev-mac"],                             "manual": true,  "skeleton": true },
   "M10": { "gate": "hack/acceptance/m10.sh", "tier": "integration", "requires": ["dev-mac"],                           "manual": false, "skeleton": true },
+  "M10.3-ingress": { "_comment": "M10.3 sub-gate: Ingress hosting + IngressClass + svclb LB status. It asserts against a RUNNING cluster ($KUBECONFIG + the high-port --ingress-http-port listener) and boots NOTHING itself, so it is manual (the operator/orchestrator supplies the cluster); the privileged :80/:443 netd-authorized leg is the M10-lab slice.", "gate": "hack/acceptance/m10-ingress.sh", "tier": "integration", "requires": ["dev-mac"], "manual": true },
   "M10-lab": { "gate": "hack/lab/m10.sh",  "tier": "lab",         "requires": ["dev-mac", "network"],                  "manual": true,  "skeleton": true }
 }
