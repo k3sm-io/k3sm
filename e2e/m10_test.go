@@ -313,6 +313,11 @@ func TestM10_PSADefaultWarn(t *testing.T) {
 		const name = "m10-psa-violating-deploy"
 		zero := int32(0)
 		pod := m10Pod(name, true)
+		// A Deployment pod template requires restartPolicy Always (Deployment
+		// validation rejects Never/OnFailure BEFORE PSA runs); the baseline
+		// violation the PSA template check must warn on is HostNetwork: true.
+		tmplSpec := *pod.Spec.DeepCopy()
+		tmplSpec.RestartPolicy = corev1.RestartPolicyAlways
 		dep := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 			Spec: appsv1.DeploymentSpec{
@@ -320,7 +325,7 @@ func TestM10_PSADefaultWarn(t *testing.T) {
 				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
-					Spec:       pod.Spec,
+					Spec:       tmplSpec,
 				},
 			},
 		}
