@@ -24,42 +24,53 @@ import (
 	testclock "k8s.io/utils/clock/testing"
 )
 
-// TestRestartPolicyOnExit is item B8's gate: it pins the pure restart-decision
-// helpers — the RestartPolicy-on-exit truth table (including the Signal check
-// that distinguishes an OOMKilled/SIGKILL termination from a clean exit) and the
+// TestRestartPolicyOnExit is item B8's gate (extended by M10.2/B26): it pins the
+// pure restart-decision helpers — the effective-policy truth table (the pod-level
+// RestartPolicy-on-exit rules, including the Signal check that distinguishes an
+// OOMKilled/SIGKILL termination from a clean exit, plus the container-level
+// KEP-753 sidecar override: Always regardless of the pod policy) and the
 // CrashLoopBackOff doubling/cap/reset schedule.
 func TestRestartPolicyOnExit(t *testing.T) {
-	t.Run("policy truth table", func(t *testing.T) {
+	t.Run("effective policy truth table", func(t *testing.T) {
 		exit0 := &corev1.ContainerStateTerminated{ExitCode: 0}
 		exitNonzero := &corev1.ContainerStateTerminated{ExitCode: 1}
 		// OOMKilled / SIGKILL: the runtime reports Signal=9 with ExitCode 0;
 		// OnFailure must still treat this as a failure (mirrors translate.go:707).
 		signalKill := &corev1.ContainerStateTerminated{ExitCode: 0, Signal: 9}
+		sidecar := corev1.ContainerRestartPolicyAlways
 
 		cases := []struct {
-			name       string
-			policy     corev1.RestartPolicy
-			terminated *corev1.ContainerStateTerminated
-			want       bool
+			name            string
+			podPolicy       corev1.RestartPolicy
+			containerPolicy *corev1.ContainerRestartPolicy
+			terminated      *corev1.ContainerStateTerminated
+			want            bool
 		}{
-			{"Always + exit0 restarts a completed container", corev1.RestartPolicyAlways, exit0, true},
-			{"Always + exit nonzero restarts", corev1.RestartPolicyAlways, exitNonzero, true},
-			{"Always + signal kill restarts", corev1.RestartPolicyAlways, signalKill, true},
+			{"Always + exit0 restarts a completed container", corev1.RestartPolicyAlways, nil, exit0, true},
+			{"Always + exit nonzero restarts", corev1.RestartPolicyAlways, nil, exitNonzero, true},
+			{"Always + signal kill restarts", corev1.RestartPolicyAlways, nil, signalKill, true},
 
-			{"OnFailure + exit0 does not restart", corev1.RestartPolicyOnFailure, exit0, false},
-			{"OnFailure + exit nonzero restarts", corev1.RestartPolicyOnFailure, exitNonzero, true},
-			{"OnFailure + signal kill restarts despite exit0", corev1.RestartPolicyOnFailure, signalKill, true},
+			{"OnFailure + exit0 does not restart", corev1.RestartPolicyOnFailure, nil, exit0, false},
+			{"OnFailure + exit nonzero restarts", corev1.RestartPolicyOnFailure, nil, exitNonzero, true},
+			{"OnFailure + signal kill restarts despite exit0", corev1.RestartPolicyOnFailure, nil, signalKill, true},
 
-			{"Never + exit0 never restarts", corev1.RestartPolicyNever, exit0, false},
-			{"Never + exit nonzero never restarts", corev1.RestartPolicyNever, exitNonzero, false},
-			{"Never + signal kill never restarts", corev1.RestartPolicyNever, signalKill, false},
+			{"Never + exit0 never restarts", corev1.RestartPolicyNever, nil, exit0, false},
+			{"Never + exit nonzero never restarts", corev1.RestartPolicyNever, nil, exitNonzero, false},
+			{"Never + signal kill never restarts", corev1.RestartPolicyNever, nil, signalKill, false},
 
-			{"nil terminated never restarts", corev1.RestartPolicyAlways, nil, false},
+			{"nil terminated never restarts", corev1.RestartPolicyAlways, nil, nil, false},
+
+			// KEP-753 native sidecars: the container-level Always overrides the
+			// pod policy — a Job pod (Never) still restarts its exited sidecar.
+			{"sidecar Always overrides pod Never on exit0", corev1.RestartPolicyNever, &sidecar, exit0, true},
+			{"sidecar Always overrides pod Never on failure", corev1.RestartPolicyNever, &sidecar, exitNonzero, true},
+			{"sidecar Always overrides pod OnFailure on exit0", corev1.RestartPolicyOnFailure, &sidecar, exit0, true},
+			{"sidecar + nil terminated never restarts", corev1.RestartPolicyNever, &sidecar, nil, false},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				if got := shouldRestartOnExit(tc.policy, tc.terminated); got != tc.want {
-					t.Errorf("shouldRestartOnExit(%q, %+v) = %v, want %v", tc.policy, tc.terminated, got, tc.want)
+				if got := shouldRestartOnExit(tc.podPolicy, tc.containerPolicy, tc.terminated); got != tc.want {
+					t.Errorf("shouldRestartOnExit(%q, %v, %+v) = %v, want %v", tc.podPolicy, tc.containerPolicy, tc.terminated, got, tc.want)
 				}
 			})
 		}

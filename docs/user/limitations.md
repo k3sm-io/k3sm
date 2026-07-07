@@ -46,6 +46,28 @@ workloads must use the **`vm` RuntimeClass** (Virtualization.framework), which g
 boundary. See [vm-runtimeclass.md](vm-runtimeclass.md) for how to opt in, and `docs/privilege-model.md`
 for the full trust-domain rationale. The same framing appears in [concepts.md](concepts.md).
 
+### NetworkPolicy is a policy hint, not a security boundary
+
+NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with
+per-pod source fidelity for same-node clients. Any direct pod-IP connection — including **all
+headless-Service and StatefulSet traffic** — bypasses it completely; **egress rules and `ipBlock`
+are never enforced**; and policies against `kube-dns` or the `kubernetes` VIP are unenforceable
+(those VIPs bypass the proxy). It is a policy hint, NOT a security boundary — isolate untrusted
+workloads with the vm RuntimeClass ([vm-runtimeclass.md](vm-runtimeclass.md)).
+
+### Per-pod IP is addressing and identity, not isolation
+
+A pod's per-pod IP is **addressing/identity only**: binds are port-scoped on shared interfaces, and
+Seatbelt cannot express per-IP network filters on macOS 26. A per-pod IP is therefore **never
+network isolation** — any same-node process can dial any pod IP. Untrusted workloads need the vm
+RuntimeClass, same as above.
+
+### Ingress TLS keys and Secrets at rest
+
+Ingress TLS private keys are held **in-memory by the server process**, and Secrets are
+**plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods). There is
+no KMS/envelope encryption: treat read access to the host disk as read access to every Secret.
+
 ### DNS — what works vs what is unwired/planned
 
 The in-process resolver and the `getaddrinfo` shim implement the **search-list / ndots / A-record**

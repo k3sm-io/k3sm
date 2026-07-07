@@ -51,9 +51,19 @@ type Options struct {
 	// (the only client allowed to drive privileged ops).
 	ServiceUID uint32
 	// Declares reports whether some Service in the authoritative set declares
-	// port — the backing for the privileged-port authorizer. nil denies every
-	// <1024 bind (fail safe).
+	// port — the backing for the Service-CIDR-VIP branch of the privileged-port
+	// authorizer. nil denies every <1024 VIP bind (fail safe).
 	Declares func(port int) bool
+	// DeclaresLB reports whether a Service of type LoadBalancer in the
+	// authoritative set declares port — the backing for the node-own-address
+	// branch of the privileged-port authorizer (the M10.3 ingress/svclb
+	// listener). nil denies every <1024 node-address bind (fail safe).
+	DeclaresLB func(port int) bool
+	// NodeIP is this node's own InternalIP — the ONLY address outside the
+	// Service CIDR a privileged bind can ever be authorized on, and only when a
+	// LoadBalancer Service declares the port. The zero Addr disables the
+	// node-address branch entirely (deny).
+	NodeIP netip.Addr
 	// MeshKeyDir is the root-only directory the MeshKeyResolver reads the node's
 	// wireguard private key from. Empty disables ConfigureMesh (a nil resolver,
 	// which fails fast — there is no embedded key).
@@ -76,11 +86,16 @@ func BuildConfig(opts Options) (netd.Config, error) {
 		return netd.Config{}, fmt.Errorf("netdsvc: service CIDR is required (else the proxy's ClusterIP VIP aliases are denied), got %q", opts.ServiceCIDR)
 	}
 	cfg := netd.Config{
-		NodePodCIDR:    opts.NodePodCIDR,
-		ServiceCIDR:    opts.ServiceCIDR,
-		ServiceUID:     opts.ServiceUID,
-		PortAuthorizer: PortAuthorizer(opts.Declares),
-		Logger:         opts.Logger,
+		NodePodCIDR: opts.NodePodCIDR,
+		ServiceCIDR: opts.ServiceCIDR,
+		ServiceUID:  opts.ServiceUID,
+		PortAuthorizer: PortAuthorizer(PortPolicy{
+			ServiceCIDR: opts.ServiceCIDR,
+			Declares:    opts.Declares,
+			NodeIP:      opts.NodeIP,
+			DeclaresLB:  opts.DeclaresLB,
+		}),
+		Logger: opts.Logger,
 	}
 	if opts.MeshKeyDir != "" {
 		cfg.MeshKeyResolver = MeshKeyResolver(opts.MeshKeyDir)
@@ -88,30 +103,71 @@ func BuildConfig(opts Options) (netd.Config, error) {
 	return cfg, nil
 }
 
+// PortPolicy is the DENY-BY-DEFAULT privileged-port (<1024) bind policy the
+// authorizer applies. A bind is authorized iff the requested address falls in
+// exactly one of two explicitly named classes (M10.3 — an explicit policy
+// decision, never allowed-by-coincidence):
+//
+//   - a Service-CIDR VIP whose port some Service in the authoritative set
+//     declares (the proxy's infra VIPs, e.g. 10.43.0.10:53), or
+//   - this node's OWN InternalIP when a Service of type LoadBalancer declares
+//     the port (the ingress/svclb listener; kube-system/k3sm-ingress is the
+//     canonical declaring subject for 80/443).
+//
+// Every other address class, an undeclared port, and a nil predicate are all
+// denied — the daemon never trusts the client's self-assertion.
+type PortPolicy struct {
+	// ServiceCIDR classifies the VIP address class. Invalid disables it (deny).
+	ServiceCIDR netip.Prefix
+	// Declares reports whether some Service declares port. nil denies VIP binds.
+	Declares func(port int) bool
+	// NodeIP is this node's own InternalIP. Invalid disables the node-address
+	// class (deny).
+	NodeIP netip.Addr
+	// DeclaresLB reports whether a Service of type LoadBalancer declares port.
+	// nil denies node-address binds.
+	DeclaresLB func(port int) bool
+}
+
 // servicePortAuthorizer confirms a privileged (<1024) bind against the
-// authoritative Service set via the declares seam. A nil declares denies every
-// such bind (fail safe — the daemon never trusts the client to self-assert that
-// a Service declares the port).
+// authoritative Service set per PortPolicy.
 type servicePortAuthorizer struct {
-	declares func(port int) bool
+	policy PortPolicy
 }
 
-// PortAuthorizer returns a netd.PortAuthorizer that authorizes a privileged-port
-// bind only when declares reports a Service declares that port. A nil declares
-// yields an authorizer that denies every bind it is asked about.
-func PortAuthorizer(declares func(port int) bool) netd.PortAuthorizer {
-	return servicePortAuthorizer{declares: declares}
+// PortAuthorizer returns the netd.PortAuthorizer enforcing policy. The zero
+// PortPolicy denies every bind it is asked about (fail safe).
+func PortAuthorizer(policy PortPolicy) netd.PortAuthorizer {
+	return servicePortAuthorizer{policy: policy}
 }
 
-// Authorize rejects port unless a Service in the authoritative set declares it.
+// Authorize rejects binding port on nodeAddr unless one of PortPolicy's two
+// address classes admits it. See PortPolicy for the deny-by-default contract.
 func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr string) error {
-	if a.declares == nil {
-		return fmt.Errorf("no service set available to authorize port %d on %s", port, nodeAddr)
+	addr, err := netip.ParseAddr(nodeAddr)
+	if err != nil {
+		return fmt.Errorf("parse bind address %q for port %d: %w", nodeAddr, port, err)
 	}
-	if !a.declares(port) {
-		return fmt.Errorf("no service declares port %d (requested on %s)", port, nodeAddr)
+	addr = addr.Unmap()
+	switch {
+	case a.policy.ServiceCIDR.IsValid() && a.policy.ServiceCIDR.Contains(addr):
+		if a.policy.Declares == nil {
+			return fmt.Errorf("no service set available to authorize port %d on %s", port, nodeAddr)
+		}
+		if !a.policy.Declares(port) {
+			return fmt.Errorf("no service declares port %d (requested on %s)", port, nodeAddr)
+		}
+		return nil
+	case a.policy.NodeIP.IsValid() && addr == a.policy.NodeIP:
+		if a.policy.DeclaresLB == nil {
+			return fmt.Errorf("no service set available to authorize port %d on node address %s", port, nodeAddr)
+		}
+		if !a.policy.DeclaresLB(port) {
+			return fmt.Errorf("no LoadBalancer service declares port %d (requested on node address %s)", port, nodeAddr)
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("bind address %s is neither a service-CIDR VIP nor this node's own address (port %d denied)", nodeAddr, port)
 }
 
 // fileMeshKeyResolver resolves a ConfigureMesh key reference to the node's

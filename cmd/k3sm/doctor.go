@@ -149,17 +149,19 @@ func checkSIP(env doctorEnv) checkResult {
 }
 
 // checkHelper reports the k3sm-netd root helper's launchd state. Installed and
-// running is PASS; installed-but-stopped or not-installed are WARN — datapath
-// features need it, but a control-plane-only node works, so it is not a hard fail.
+// running is PASS; installed-but-stopped or not-installed are WARN — the
+// DEFAULT runtimed runtime refuses to start unprivileged without it (the M10.1
+// preflight), but root, `--runtime hostprocess` (rootless dev), and
+// `--network none` (control-plane-only) all work, so it is not a hard fail.
 func checkHelper(env doctorEnv) checkResult {
 	installed, running := env.helperState()
 	switch {
 	case installed && running:
 		return checkResult{"netd-helper", statusPass, install.NetdLabel + " installed and running"}
 	case installed:
-		return checkResult{"netd-helper", statusWarn, install.NetdLabel + " installed but not running — datapath features need it (sudo launchctl kickstart -k system/" + install.NetdLabel + ")"}
+		return checkResult{"netd-helper", statusWarn, install.NetdLabel + " installed but not running — the default runtimed runtime and the datapath need it (sudo launchctl kickstart -k system/" + install.NetdLabel + ")"}
 	default:
-		return checkResult{"netd-helper", statusWarn, install.NetdLabel + " not detected — either not installed, or not readable without privilege (a system-domain launchctl print may need root); datapath features need it, control-plane-only works. Re-run doctor with sudo to confirm, then `sudo k3sm install` if it is truly absent"}
+		return checkResult{"netd-helper", statusWarn, install.NetdLabel + " not detected — either not installed, or not readable without privilege (a system-domain launchctl print may need root); the default runtimed runtime (unprivileged) and the datapath need it — an unprivileged node without it refuses to start (run `sudo k3sm install`, or pass --runtime hostprocess for rootless dev). Re-run doctor with sudo to confirm it is truly absent"}
 	}
 }
 

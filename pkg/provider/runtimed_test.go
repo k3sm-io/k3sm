@@ -203,7 +203,7 @@ func TestRuntimedDeniesHelperSocket(t *testing.T) {
 		DeniedUnixSocketPaths: []string{sock},
 	}, nil, nil)
 
-	box, err := r.buildBox(context.Background(), runtimedPod("default", "web"))
+	box, err := r.buildBox(context.Background(), runtimedPod("default", "web"), "192.168.1.10")
 	if err != nil {
 		t.Fatalf("buildBox: %v", err)
 	}

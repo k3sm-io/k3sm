@@ -88,12 +88,15 @@ EOF
 
 # node_up builds and starts a k3sm Virtual Kubelet node, then waits for it Ready.
 #   node_up [node-name] [pod-root]
+# --runtime hostprocess is PINNED: the M0 gate's posture is deliberately rootless
+# (no netd helper, no root) and the binary's default flipped to runtimed in M10.1,
+# so relying on the default would refuse to start via the runtimed preflight.
 node_up() {
 	local node_name="${1:-k3sm-m0}" pod_root="${2:-$K3SM_WORKDIR/pods}"
 	( cd "$REPO_ROOT" && CGO_ENABLED=0 go build -o "$BIN/k3sm" ./cmd/k3sm )
 	codesign -s - -f "$BIN/k3sm" >/dev/null 2>&1 || true
 	rm -rf "$pod_root"; mkdir -p "$pod_root"
-	nohup "$BIN/k3sm" node --kubeconfig "$KUBECONFIG" --node-name "$node_name" --pod-root "$pod_root" --node-ip 127.0.0.1 > "$K3SM_WORKDIR/node.log" 2>&1 &
+	nohup "$BIN/k3sm" node --kubeconfig "$KUBECONFIG" --node-name "$node_name" --pod-root "$pod_root" --node-ip 127.0.0.1 --runtime hostprocess > "$K3SM_WORKDIR/node.log" 2>&1 &
 	NODE_PID=$!
 	local n=0
 	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
@@ -107,8 +110,12 @@ node_up() {
 # cluster_up+node_up. It points $KUBECONFIG + $CP_TOKEN at the server's own
 # kubeconfig/token, then waits for healthz and the node Ready.
 #   server_up [node-name] [runtime] [network]
-#     runtime = hostprocess (default) | runtimed
+#     runtime = hostprocess (helper default) | runtimed
 #     network = none (default) | direct | helper | auto
+#
+# The runtime is ALWAYS passed explicitly on the argv (an explicit pin): the
+# k3sm binary's own default flipped to runtimed in M10.1, but the gates that use
+# this helper without root keep the deliberately rootless hostprocess posture.
 #
 # network=none is the NON-ROOT CI/dev bring-up: run the control plane + node
 # WITHOUT the privileged host-network datapath (no lo0/utun plumbing) and WITHOUT

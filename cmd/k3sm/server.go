@@ -23,6 +23,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,16 +34,20 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/netbind"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/runtimeclass"
+	"k3sm.io/k3sm/pkg/svclb"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -63,6 +68,11 @@ type serverOptions struct {
 	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
 	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (M6.1 HA server-join)
 	token             string // server-class join token (K10<caHash>::server:<secret>) for the HA server-join (M6.1)
+
+	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the B71 cutover; default = warn-only, M10.0)
+
+	ingressHTTPPort  int // ingress HTTP listener port on the node IP (M10.3; 0 disables; 80 = production, an explicit high port = integration tier)
+	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
 }
 
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
@@ -83,9 +93,25 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home")
-	fs.StringVar(&opts.rtName, "runtime", "hostprocess", "pod runtime: hostprocess or runtimed")
+	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", executor.DefaultAPIServerPort, "apiserver secure port")
+	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
+	// privileged; warn=baseline + audit=restricted — audit-observable, zero
+	// rejection). This flag is the documented, REVERSIBLE cutover MECHANISM for the
+	// B71 baseline-enforce flip: set it only after a pre-flight scan proves the
+	// cluster clean (B71 owns flipping it); dropping the flag reverts the posture on
+	// the next boot. It is an operator argv toggle of a single apiserver config
+	// value, not a runtime feature-flag code path.
+	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the B71 cutover; the shipped default is baseline-warn only)")
+	// M10.3 ingress listener ports. 80/443 is the production posture (the netd
+	// helper authorizes the privileged node-address bind because the canonical
+	// kube-system/k3sm-ingress LoadBalancer Service declares those ports); an
+	// EXPLICIT high-port pair (e.g. 8080/8443) is the integration-tier mode.
+	// There is deliberately NO silent fallback between the two — a failed
+	// privileged bind is logged and boundedly retried, never re-ported.
+	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port on the node InternalIP (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
+	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port on the node InternalIP (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
@@ -103,6 +129,12 @@ func runServer(args []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	if opts.ingressHTTPPort < 0 || opts.ingressHTTPPort > 65535 {
+		return fmt.Errorf("--ingress-http-port %d out of range 0-65535", opts.ingressHTTPPort)
+	}
+	if opts.ingressHTTPSPort < 0 || opts.ingressHTTPSPort > 65535 {
+		return fmt.Errorf("--ingress-https-port %d out of range 0-65535", opts.ingressHTTPSPort)
+	}
 	if opts.workDir == "" {
 		if workDirErr != nil {
 			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
@@ -143,7 +175,10 @@ func runServer(args []string) error {
 		WorkDir:       opts.workDir,
 		APIServerPort: opts.apiPort,
 		NodeIP:        opts.nodeIP,
-		Logger:        logger,
+		// M10.0/B71: false ships baseline-WARN; true is the enforce cutover (see the
+		// flag comment above — executor.Config.PSAEnforceBaseline is the single seam).
+		PSAEnforceBaseline: opts.psaEnforceBaseline,
+		Logger:             logger,
 	}
 	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
 	// Postgres (DefaultKineVersionHA) and turns on scheduler/KCM leader election so only
@@ -287,6 +322,14 @@ func runServer(args []string) error {
 			logger.Error("provision foreign-user admission policy", "err", err)
 		}
 	}
+	// M10.0 (Res.5) — the memory-only default LimitRange in the `default` namespace:
+	// containers that omit resources get honest memory defaults (memory IS enforced
+	// via the rusage sampler→OOMKill); deliberately NO cpu key (best-effort only).
+	// Create-if-absent (operator-space — a tuned object is never clobbered);
+	// log-and-continue like the sibling advisories.
+	if err := policy.EnsureDefaultLimitRange(ctx, cs); err != nil {
+		logger.Error("provision default memory limitrange", "err", err)
+	}
 	// M5.1 — provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
 	// scheduling.nodeSelector pinning it to VZ-capable nodes via
 	// k3sm.io/virtualization). Log-and-continue (NOT fail-closed like rbac): a missing
@@ -325,12 +368,27 @@ func runServer(args []string) error {
 	// backend dialer binds the mesh-egress source UNCONDITIONALLY (every dial,
 	// including same-node loopback), setting a non-local value here would break ALL
 	// backend dials. It is wired the moment the server-side mesh bring-up lands.
+	// The control-plane node's pod /24: the reserved index-0 carve of the cluster
+	// pod CIDR — the ONE value both the routing-table locality below and the
+	// node's podnet adapter (step 5) allocate against (M10.1; the mesh enroller
+	// reserves index 0 for this node, workers enroll 1+).
+	//
+	// M10.4: the NetworkPolicy table's always-allow set is seeded from this config
+	// (NodeIP only here — MeshEgressIP is empty for the no-server-mesh reason
+	// above, and no peer mesh-egress /32s are known at construction: workers
+	// enroll DYNAMICALLY via the MeshPeer path after netserve is built). That is
+	// the documented dynamic-peer gap (netserve.Config.PeerMeshEgressIPs): an
+	// unseeded peer's node-origin dials are unattributable at this proxy and FAIL
+	// OPEN with a throttled Warn — widen-only, never a wrong deny. Seeding peers
+	// here rides the same follow-up as the server-side mesh bring-up.
+	serverPodCIDR := defaultNodePodCIDR()
 	net := netserve.New(netserve.Config{
 		Client:        cs,
 		WorkDir:       opts.workDir,
 		DNSVIP:        opts.clusterIP,
 		ClusterDomain: opts.domain,
 		NodeIP:        opts.nodeIP,
+		PodCIDR:       serverPodCIDR,
 		NetdSocket:    mode.Socket,
 		Disabled:      !mode.DataPath(),
 		Logger:        logger,
@@ -413,6 +471,74 @@ func runServer(args []string) error {
 		<-provDone
 	}()
 
+	// 4d/4e. M10.3 — ingress hosting + svclb, beside the netserve datapath
+	// (step 4) and like it skipped under --network none (they splice/route to
+	// ClusterIP VIPs, which need the proxy's datapath).
+	//
+	// 4d: darwin-net's L7 ingress (RouteTable + SNI CertStore + class-filtered
+	// Watcher + Server) runs IN THIS PROCESS (SERVER-PROCESS-ONLY — multi-node
+	// ingress is a named follow-up), fed by the same in-process ADMIN client:
+	// referenced TLS Secrets are fetched by name under it, so key bytes only
+	// ever live in the control-plane process and no RBAC is widened. The
+	// listeners bind the node's own InternalIP through the shared netbind seam:
+	// privileged 80/443 go through the netd helper when unprivileged —
+	// authorized because kube-system/k3sm-ingress (the canonical LoadBalancer
+	// Service ingresshost provisions) declares those ports — or directly as
+	// root; --ingress-http-port/--ingress-https-port select the explicit
+	// high-port integration mode (never a silent fallback).
+	//
+	// 4e: svclb (klipper-lite, B32) binds nodeIP:port listeners for every
+	// LoadBalancer Service and splices them to the Service's ClusterIP VIP,
+	// advertising status.loadBalancer ONLY once a listener is actually bound.
+	if mode.DataPath() {
+		if nodeAddr, err := netip.ParseAddr(opts.nodeIP); err != nil {
+			logger.Error("ingress + svclb hosting disabled: node IP does not parse", "node-ip", opts.nodeIP, "err", err)
+		} else {
+			// One privileged-bind backend selection, mirroring netserve's: the
+			// netd helper when unprivileged, the direct in-process bind as root.
+			var privBinder netbind.Binder = netbind.Direct{}
+			if mode.UsesHelper() {
+				privBinder = &netbind.Netd{Client: wire.NewClient(mode.Socket)}
+			}
+			if opts.ingressHTTPPort != 0 || opts.ingressHTTPSPort != 0 {
+				ih, err := ingresshost.New(ingresshost.Config{
+					Client:    cs,
+					NodeIP:    nodeAddr,
+					HTTPPort:  uint16(opts.ingressHTTPPort),
+					HTTPSPort: uint16(opts.ingressHTTPSPort),
+					Binder:    privBinder, // helper mode: EVERY ingress bind goes through the daemon (darwin-net's documented contract)
+					Logger:    logger,
+				})
+				if err != nil {
+					logger.Error("ingress hosting disabled", "err", err)
+				} else {
+					go func() {
+						if err := ih.Run(ctx); err != nil && ctx.Err() == nil {
+							logger.Error("ingress hosting", "err", err)
+						}
+					}()
+				}
+			} else {
+				logger.Info("ingress hosting disabled (--ingress-http-port 0 --ingress-https-port 0)")
+			}
+			lb, err := svclb.New(svclb.Config{
+				Client:           cs,
+				NodeIP:           nodeAddr,
+				PrivilegedBinder: privBinder,
+				Logger:           logger,
+			})
+			if err != nil {
+				logger.Error("svclb disabled", "err", err)
+			} else {
+				go func() {
+					if err := lb.Run(ctx); err != nil && ctx.Err() == nil {
+						logger.Error("svclb loadbalancer controller", "err", err)
+					}
+				}()
+			}
+		}
+	}
+
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
 	return startNode(ctx, nodeOptions{
@@ -425,6 +551,8 @@ func runServer(args []string) error {
 		dnsShim:    opts.dnsShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
+		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)
+		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
 	})
 }

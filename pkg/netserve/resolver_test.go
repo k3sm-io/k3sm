@@ -590,13 +590,18 @@ func TestServiceZoneBranchesOnType(t *testing.T) {
 	}
 }
 
-// newServiceZone builds a production serviceZone over a Services lister fed by the
-// fake clientset's objects (an informer cache, warmed before return), so the real
-// Type-branching LookupService is exercised end to end.
+// newServiceZone builds a production serviceZone over Services + EndpointSlices
+// listers fed by the fake clientset's objects (informer caches, warmed before
+// return), so the real Type-branching LookupService AND the M10.1 record
+// synthesis are exercised end to end.
 func newServiceZone(t *testing.T, cs *fake.Clientset) serviceZone {
 	t.Helper()
 	factory := informers.NewSharedInformerFactory(cs, 0)
-	z := serviceZone{lister: factory.Core().V1().Services().Lister()}
+	z := serviceZone{
+		services: factory.Core().V1().Services().Lister(),
+		slices:   factory.Discovery().V1().EndpointSlices().Lister(),
+		domain:   "cluster.local",
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	factory.Start(ctx.Done())

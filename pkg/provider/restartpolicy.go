@@ -24,35 +24,42 @@ import (
 )
 
 // Restart-decision helpers: pure, side-effect-free functions that decide
-// WHETHER and WHEN a terminated regular container should be restarted under its
-// Pod's RestartPolicy. They encode the upstream kubelet truth table and the
-// CrashLoopBackOff schedule WITHOUT touching the live status/restart path.
+// WHETHER and WHEN a terminated container should be restarted under its
+// effective restart policy. They encode the upstream kubelet truth table and
+// the CrashLoopBackOff schedule.
 //
-// Currently unwired by design. The live status path (derivePhase/toPodStatus)
-// still surfaces a crashed container as PodFailed; item B26 is the consumer that
-// wires shouldRestartOnExit + crashLoopBackoff into the reaper to compose the
-// live behavior — the phase, the Waiting{Reason: CrashLoopBackOff} state, and
-// the restartCount surface. Landing the decision logic here, pure and tested,
-// lets B26 add the re-exec and the status transitions atomically: flipping the
-// phase to "Running while restarting" WITHOUT the actual re-exec would mask a
-// permanently-dead pod as Running, a regression worse than today's honest
-// PodFailed.
+// Wired (M10.2, B26) on the RUNTIMED path only: runtimed_restart.go's
+// observeExits is the single exit-driven restart authority — it consumes this
+// resolver + crashLoopBackoff, schedules the re-exec via the RestartContainer
+// RPC, and synthesizes the Waiting{Reason: CrashLoopBackOff} overlay while
+// holding the pod phase at Running. The phase is held ONLY while a re-exec is
+// actually scheduled: flipping the phase without the re-exec would mask a
+// permanently-dead pod as Running, worse than an honest PodFailed.
 //
-// Scope — regular containers only. Init containers are deliberately NOT routed
-// through shouldRestartOnExit: a SUCCEEDED init container never restarts (even
-// under RestartPolicyAlways), and a FAILED init container under Always/OnFailure
-// restarts with the Pod held PENDING (Init:CrashLoopBackOff), not Running. That
-// init subset is a known gap for B26 to handle on its own path; it is documented
-// here, not implemented.
+// NOT wired on the HostProcess provider (the M0 opt-in runtime): a HostProcess
+// pod's exited container is reaped once and never re-exec'd, whatever its
+// restartPolicy — the conformance register handles that row at write-back.
 //
-// restartCount authority — the provider owns the single exit-driven restart
-// count, mirroring the probe monitor's onRestart bookkeeping (probe.go:228-241).
-// Once a process has exited, the reaper is the EXCLUSIVE restart trigger, so it
-// never races the liveness path on an already-dead container. B8 introduces no
-// competing live counter; B26 enforces the single-authority rule at wiring time.
+// Scope — regular containers resolve under the POD policy; NATIVE SIDECARS
+// (init containers with restartPolicy: Always, KEP-753) resolve under an
+// effective per-container Always regardless of the pod policy — the sidecar
+// half of the former "init containers deliberately NOT routed" gap is
+// DISCHARGED. Plain init containers remain unrouted: a SUCCEEDED init
+// container never restarts, and a FAILED one under Always/OnFailure would
+// restart with the Pod held PENDING (Init:CrashLoopBackOff) — that subset is
+// still documented, not implemented.
+//
+// restartCount authority — runtimed's ContainerStatus.restart_count is the
+// single count (the RestartContainer RPC bumps it); the provider surfaces it
+// verbatim and keeps no competing exit-driven counter.
 
-// shouldRestartOnExit reports whether a terminated regular container should be
-// restarted under policy, applying the upstream kubelet truth table:
+// shouldRestartOnExit reports whether a terminated container should be
+// restarted. It is the ONE effective-policy truth table: containerPolicy is
+// the container-level restartPolicy (KEP-753; non-nil Always marks a native
+// sidecar, whose effective policy is Always REGARDLESS of the pod policy — a
+// Job pod with restartPolicy: Never still restarts its sidecar); a nil
+// containerPolicy resolves under podPolicy, applying the upstream kubelet
+// table:
 //
 //   - RestartPolicyAlways restarts on ANY exit, including a clean exit-0 (a
 //     Completed container under Always still restarts).
@@ -63,13 +70,17 @@ import (
 //     when ExitCode is reported as 0.
 //   - RestartPolicyNever never restarts.
 //
-// A nil terminated state (the container has not terminated) yields false. Apply
-// this only to regular containers; see the init-container gap documented above.
-func shouldRestartOnExit(policy corev1.RestartPolicy, terminated *corev1.ContainerStateTerminated) bool {
+// A nil terminated state (the container has not terminated) yields false. Do
+// not route a PLAIN init container (nil containerPolicy) through this — see
+// the scope note above.
+func shouldRestartOnExit(podPolicy corev1.RestartPolicy, containerPolicy *corev1.ContainerRestartPolicy, terminated *corev1.ContainerStateTerminated) bool {
 	if terminated == nil {
 		return false
 	}
-	switch policy {
+	if containerPolicy != nil && *containerPolicy == corev1.ContainerRestartPolicyAlways {
+		return true // native sidecar: effective Always regardless of the pod policy
+	}
+	switch podPolicy {
 	case corev1.RestartPolicyAlways:
 		return true
 	case corev1.RestartPolicyOnFailure:
@@ -97,7 +108,8 @@ const (
 // has no wall-clock side effects: it never sleeps; it reads the injected clock
 // only to detect the stabilization reset. The zero value is not usable —
 // construct it with newCrashLoopBackoff. It is not safe for concurrent use; B26
-// owns one per container under the reaper's existing serialization.
+// owns one per container inside containerRestart, serialized by
+// podTrack.restartMu (runtimed_restart.go).
 type crashLoopBackoff struct {
 	clk  clock.Clock
 	cur  time.Duration // most recent delay returned; 0 means "reset / not yet started"
@@ -137,8 +149,9 @@ func (b *crashLoopBackoff) Next() time.Duration {
 }
 
 // Reset returns the schedule to its base delay, so the next Next call returns the
-// base. B26 calls it when a container reaches a stable Running state — the
-// explicit counterpart to Next's clock-driven stabilization reset.
+// base — the explicit counterpart to Next's clock-driven stabilization reset
+// (which is what the B26 trigger relies on: a container that stays up past the
+// stabilization window resets on its next crash without an explicit call).
 func (b *crashLoopBackoff) Reset() {
 	b.cur = 0
 	b.last = time.Time{}

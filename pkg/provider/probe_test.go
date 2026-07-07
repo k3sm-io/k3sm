@@ -284,8 +284,10 @@ func TestM2_StartupGatesLiveness(t *testing.T) {
 // --- TestM2_LivenessRestarts -------------------------------------------------
 
 // TestM2_LivenessRestarts proves failureThreshold consecutive liveness failures
-// restart the container (restart_count increments and surfaces in the status),
-// while a passing liveness probe never restarts it.
+// restart the container (the monitor's restart tally increments; the published
+// status surfaces runtimed's restart_count VERBATIM — the single count
+// authority, never the tally added on top), while a passing liveness probe
+// never restarts it.
 func TestM2_LivenessRestarts(t *testing.T) {
 	pod := probePod("liveness", corev1.Container{
 		Name:          "c0",
@@ -314,10 +316,14 @@ func TestM2_LivenessRestarts(t *testing.T) {
 		t.Fatalf("restarts=%d, want 1", got)
 	}
 
-	// The restart count surfaces in the published status.
-	st := toPodStatus(nil, runningProto("uid-liveness", "c0"), "192.168.1.10", metav1.Now(), pp)
+	// The published status surfaces the RUNTIME's restart_count verbatim — the
+	// monitor's tally is bookkeeping, never added on top (runtimed bumps the
+	// count on the RestartContainer RPC; adding here would double-count).
+	proto := runningProto("uid-liveness", "c0")
+	proto.ContainerStatuses[0].RestartCount = 1 // runtimed's count after the re-exec
+	st := toPodStatus(nil, proto, "192.168.1.10", metav1.Now(), pp)
 	if st.ContainerStatuses[0].RestartCount != 1 {
-		t.Fatalf("status RestartCount=%d, want 1", st.ContainerStatuses[0].RestartCount)
+		t.Fatalf("status RestartCount=%d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
 
 	// After the gauge resets, another 3 failures restart again (no storm per fail).
@@ -387,10 +393,14 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 		t.Errorf("RestartContainer called with (%q,%q), want (uid-live,c0)", last.podID, last.container)
 	}
 
-	// The probe-driven restart surfaces in the published status (restart_count).
-	st := toPodStatus(nil, runningProto("uid-live", "c0"), r.nodeIP, metav1.Now(), pp)
+	// The restart surfaces via the RUNTIME's restart_count (bumped by the
+	// RestartContainer RPC the runner just drove), surfaced verbatim — the
+	// monitor's tally is never added on top (the single-count-authority rule).
+	proto := runningProto("uid-live", "c0")
+	proto.ContainerStatuses[0].RestartCount = 1 // what runtimed reports after the RPC
+	st := toPodStatus(nil, proto, r.nodeIP, metav1.Now(), pp)
 	if st.ContainerStatuses[0].RestartCount != 1 {
-		t.Errorf("status RestartCount = %d, want 1", st.ContainerStatuses[0].RestartCount)
+		t.Errorf("status RestartCount = %d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
 }
 

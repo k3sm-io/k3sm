@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -69,11 +70,30 @@ const healthTimeout = 90 * time.Second
 // escalating to SIGKILL.
 const drainGrace = 5 * time.Second
 
-// component is one supervised control-plane child process.
+// exitLogTailLines is how many trailing log lines an early-exit error carries —
+// enough to name the fatal apiserver/kine flag or config error without dumping
+// the whole (token-bearing) log into the returned error.
+const exitLogTailLines = 20
+
+// component is one supervised control-plane child process. exited is closed by
+// the reaper goroutine spawnEnv starts the moment the child exits; waitErr is
+// the cmd.Wait result, written strictly before exited closes and read only
+// after <-exited (the channel close is the happens-before edge).
 type component struct {
-	name string
-	cmd  *exec.Cmd
-	log  *os.File
+	name    string
+	cmd     *exec.Cmd
+	log     *os.File
+	logPath string
+	exited  chan struct{}
+	waitErr error
+}
+
+// exitDetail describes an early child exit for the fail-fast bring-up error:
+// the Wait error (exit status) plus the last ~20 lines of the component's 0600
+// log file, so the operator sees the fatal flag/config error immediately
+// instead of an opaque healthz timeout. Call only after <-c.exited.
+func (c *component) exitDetail() string {
+	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, tailFile(c.logPath, exitLogTailLines))
 }
 
 // Supervised is the child-process control-plane executor: it os/exec-supervises
@@ -179,6 +199,13 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := writeKubeconfig(s.cfg.WorkDir, s.cfg.APIServerPort, s.token); err != nil {
 		return err
 	}
+	// M10.0 (Res.3): the audit policy + admission-control config the apiserver argv
+	// references MUST exist before startAPIServer — a missing file would wedge
+	// bring-up opaquely until the healthz timeout. Overwritten every boot (the
+	// files track the binary).
+	if err := writeConformanceConfig(s.cfg.WorkDir, s.cfg.PSAEnforceBaseline); err != nil {
+		return err
+	}
 	if err := s.provisionComponentCerts(); err != nil {
 		return err
 	}
@@ -218,24 +245,29 @@ func (s *Supervised) provisionComponentCerts() error {
 }
 
 // bringUp starts the components in order and waits for the apiserver to be
-// healthy before starting scheduler + controller-manager.
+// healthy before starting scheduler + controller-manager. Each bring-up wait
+// SELECTS on child-exit as well as readiness (M10.0, SRE fail-fast): a kine or
+// apiserver that dies on a bad flag/config surfaces immediately — with its log
+// tail — instead of wedging opaquely until the healthz timeout.
 func (s *Supervised) bringUp(ctx context.Context) error {
-	if err := s.startKine(ctx); err != nil {
+	kine, err := s.startKine(ctx)
+	if err != nil {
 		return fmt.Errorf("start kine: %w", err)
 	}
-	if err := waitTCP(ctx, s.cfg.KinePort, 30*time.Second); err != nil {
+	if err := awaitHealthy(ctx, kine.name, kine.exited, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
-	if err := s.startAPIServer(ctx); err != nil {
+	api, err := s.startAPIServer(ctx)
+	if err != nil {
 		return fmt.Errorf("start apiserver: %w", err)
 	}
-	if err := s.waitHealthz(ctx); err != nil {
+	if err := s.waitHealthz(ctx, api); err != nil {
 		return fmt.Errorf("apiserver not healthy: %w", err)
 	}
-	if err := s.startScheduler(ctx); err != nil {
+	if _, err := s.startScheduler(ctx); err != nil {
 		return fmt.Errorf("start scheduler: %w", err)
 	}
-	if err := s.startControllerManager(ctx); err != nil {
+	if _, err := s.startControllerManager(ctx); err != nil {
 		return fmt.Errorf("start controller-manager: %w", err)
 	}
 	return nil
@@ -246,14 +278,14 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 // DSN (M6.0 HA multi-writer), in which case the password is relocated off argv into a
 // 0600 PGPASSFILE the kine child reads via PGPASSFILE (kineSecretEnv) and only the
 // password-stripped DSN reaches --endpoint.
-func (s *Supervised) startKine(ctx context.Context) error {
+func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	args, err := kineArgs(s.cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	env, err := s.kineSecretEnv()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return s.spawnEnv(ctx, "kine", env, args...)
 }
@@ -314,7 +346,7 @@ func (s *Supervised) kineSecretEnv() ([]string, error) {
 // start if it is set false ("feature is locked to true"). It is left at its
 // locked default; the soak is revisited if k3sm ever pins a kube version where
 // the gate is still settable.
-func (s *Supervised) startAPIServer(ctx context.Context) error {
+func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-apiserver", apiServerArgs(s.cfg)...)
 }
 
@@ -378,6 +410,24 @@ func apiServerArgs(cfg Config) []string {
 		// the kwok-ci v1.36.2 apiserver before a real rollout.
 		"--runtime-config=admissionregistration.k8s.io/v1beta1=true",
 		"--feature-gates=MutatingAdmissionPolicy=true",
+		// M10.0 audit logging (Res.4): the shipped policy is structurally
+		// Metadata/None-only (see auditPolicyDoc — no Secret cleartext at rest),
+		// the log lands in the 0700 <workDir>/audit dir, and rotation is bounded
+		// (100MiB × (3 backups + 1 live) ≈ 400MB worst case — the honest ENOSPC
+		// bound, off the datastore's db/ subtree). --audit-log-mode is deliberately
+		// NOT set: the upstream default is "blocking" (each event is written before
+		// the response returns), and the stricter blocking-strict — which FAILS the
+		// request when the audit write fails — is deliberately not used: a full
+		// audit volume must degrade to dropped events, never stall serving.
+		"--audit-policy-file", auditPolicyPath(wd),
+		"--audit-log-path", AuditLogPath(wd),
+		"--audit-log-maxsize=100",
+		"--audit-log-maxbackup=3",
+		"--audit-log-maxage=30",
+		// M10.0 PSA cluster defaults (Res.2): the AdmissionConfiguration embedding
+		// the PodSecurityConfiguration (warn=baseline + audit=restricted; enforce
+		// stays privileged unless Config.PSAEnforceBaseline flips the B71 cutover).
+		"--admission-control-config-file", admissionConfigPath(wd),
 		"--bind-address", bind,
 		"--advertise-address", cfg.NodeIP,
 		"--secure-port", strconv.Itoa(cfg.APIServerPort),
@@ -410,7 +460,7 @@ func apiServerArgs(cfg Config) []string {
 }
 
 // startScheduler launches kube-scheduler against its OWN per-component kubeconfig.
-func (s *Supervised) startScheduler(ctx context.Context) error {
+func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-scheduler", schedulerArgs(s.cfg)...)
 }
 
@@ -437,7 +487,7 @@ func schedulerArgs(cfg Config) []string {
 
 // startControllerManager launches kube-controller-manager with the SCOPED
 // controller set (node-side controllers dropped; endpointslice kept).
-func (s *Supervised) startControllerManager(ctx context.Context) error {
+func (s *Supervised) startControllerManager(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-controller-manager", controllerManagerArgs(s.cfg)...)
 }
 
@@ -482,7 +532,7 @@ func controllersFlag() string {
 }
 
 // spawn starts a control-plane binary with no extra environment (the common case).
-func (s *Supervised) spawn(ctx context.Context, name string, args ...string) error {
+func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*component, error) {
 	return s.spawnEnv(ctx, name, nil, args...)
 }
 
@@ -490,16 +540,21 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) err
 // its own process group, redirecting its output to a per-component log file, and
 // records it for teardown. extraEnv is appended to the inherited environment (used to
 // pass the kine child its PGPASSFILE out-of-band, keeping the Postgres secret off
-// argv). It does NOT wait — components run until Stop.
+// argv). It does NOT block on the child — components run until Stop — but it DOES
+// start a reaper goroutine (`go cmd.Wait()`) that closes the component's exited
+// channel the moment the child dies, so the bring-up waits (awaitHealthy) and
+// stopComponent can select on child-exit. That goroutine's lifetime is the child's
+// lifetime — typically the whole process life for a healthy component — which is
+// deliberate and leak-free: it parks in wait4 and ends exactly when the child does.
 //
 // The log file is mode 0600 (not the umask default 0644): a component log can carry
 // bearer tokens and the kine datastore endpoint, so it must not be world-readable.
-func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) error {
+func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) (*component, error) {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("create %s log: %w", name, err)
+		return nil, fmt.Errorf("create %s log: %w", name, err)
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout, cmd.Stderr = lf, lf
@@ -509,33 +564,75 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	}
 	if err := cmd.Start(); err != nil {
 		_ = lf.Close()
-		return fmt.Errorf("start %s: %w", name, err)
+		return nil, fmt.Errorf("start %s: %w", name, err)
 	}
 	s.cfg.Logger.Info("started control-plane component", "component", name, "pid", cmd.Process.Pid, "log", logPath)
 
+	c := &component{name: name, cmd: cmd, log: lf, logPath: logPath, exited: make(chan struct{})}
+	// The single reaper: the ONLY cmd.Wait for this child (stopComponent selects on
+	// exited instead of racing a second Wait). waitErr is written before the close,
+	// so a reader that has observed <-exited reads it race-free.
+	go func() {
+		c.waitErr = cmd.Wait()
+		close(c.exited)
+	}()
+
 	s.mu.Lock()
-	s.comps = append(s.comps, &component{name: name, cmd: cmd, log: lf})
+	s.comps = append(s.comps, c)
 	s.mu.Unlock()
-	return nil
+	return c, nil
 }
 
-// waitHealthz polls the apiserver /healthz endpoint until it returns ok or the
-// timeout/ctx elapses.
-func (s *Supervised) waitHealthz(ctx context.Context) error {
-	deadline := time.Now().Add(healthTimeout)
+// waitHealthz waits for the apiserver to report healthz ok, failing fast (with
+// the log tail) if the apiserver child exits first. The 90s healthTimeout is
+// unchanged — fail-fast only ever SHORTENS the wedge, never lengthens it.
+func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
+	return awaitHealthy(ctx, api.name, api.exited, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
+}
+
+// awaitHealthy is the bring-up wait: it polls ready() every poll until it
+// reports true, SELECTING against child-exit the whole time. It returns nil on
+// ready; an early-exit error (naming the component + exitDetail's log tail) the
+// moment exited closes; a timeout error after timeout; or ctx.Err(). It is a
+// pure function over channels + funcs so the fail-fast contract is table-tested
+// without spawning real control-plane binaries. A closed exited wins over a
+// concurrently-true ready (a dead child is never "healthy").
+func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, ready func(context.Context) bool, timeout, poll time.Duration, exitDetail func() string) error {
+	deadline := time.Now().Add(timeout)
 	for {
-		if s.Ready(ctx) {
+		select {
+		case <-exited:
+			return fmt.Errorf("%s exited during bring-up: %s", name, exitDetail())
+		default:
+		}
+		if ready(ctx) {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("healthz not ok within %s", healthTimeout)
+			return fmt.Errorf("%s not healthy within %s", name, timeout)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-exited:
+			return fmt.Errorf("%s exited during bring-up: %s", name, exitDetail())
+		case <-time.After(poll):
 		}
 	}
+}
+
+// tailFile returns the last n lines of the file at path (best-effort: an
+// unreadable file yields a placeholder so the caller's error stays actionable).
+func tailFile(path string, n int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("<unreadable log: %v>", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Ready reports whether the apiserver /healthz returns "ok".
@@ -597,8 +694,11 @@ func shutdownOrder(comps []*component) []*component {
 	return out
 }
 
-// stopComponent SIGTERMs a component's process group, waits drainGrace, then
-// SIGKILLs if it has not exited, and closes its log file.
+// stopComponent SIGTERMs a component's process group, waits drainGrace for the
+// reaper goroutine (the single cmd.Wait, started by spawnEnv) to observe the
+// exit, then SIGKILLs if it has not, and closes its log file. An
+// already-exited child (the fail-fast path) makes this a no-op signal + an
+// immediate return on the closed exited channel.
 func (s *Supervised) stopComponent(c *component) {
 	if c == nil || c.cmd == nil || c.cmd.Process == nil {
 		return
@@ -606,13 +706,11 @@ func (s *Supervised) stopComponent(c *component) {
 	pid := c.cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 
-	done := make(chan struct{})
-	go func() { _, _ = c.cmd.Process.Wait(); close(done) }()
 	select {
-	case <-done:
+	case <-c.exited:
 	case <-time.After(drainGrace):
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		<-done
+		<-c.exited
 	}
 	if c.log != nil {
 		_ = c.log.Close()
@@ -620,25 +718,17 @@ func (s *Supervised) stopComponent(c *component) {
 	s.cfg.Logger.Info("stopped control-plane component", "component", c.name)
 }
 
-// waitTCP blocks until 127.0.0.1:port accepts a connection or the timeout/ctx
-// elapses.
-func waitTCP(ctx context.Context, port int, timeout time.Duration) error {
+// tcpReady returns a bring-up ready func (for awaitHealthy) reporting whether
+// 127.0.0.1:port currently accepts a TCP connection.
+func tcpReady(port int) func(context.Context) bool {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	deadline := time.Now().Add(timeout)
 	d := &net.Dialer{Timeout: time.Second}
-	for {
+	return func(ctx context.Context) bool {
 		conn, err := d.DialContext(ctx, "tcp", addr)
-		if err == nil {
-			_ = conn.Close()
-			return nil
+		if err != nil {
+			return false
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("%s not accepting connections within %s", addr, timeout)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(300 * time.Millisecond):
-		}
+		_ = conn.Close()
+		return true
 	}
 }

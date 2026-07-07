@@ -32,8 +32,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/mesh"
+	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
@@ -78,7 +80,7 @@ func runAgent(args []string) error {
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
 	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
-	fs.StringVar(&opts.rtName, "runtime", "hostprocess", "pod runtime: hostprocess or runtimed")
+	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
@@ -172,6 +174,8 @@ func runAgent(args []string) error {
 		dnsShim:    opts.dnsShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
+		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source, M10.1)
+		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,
 	})
 }
@@ -262,16 +266,46 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 // is unit-tested without a live join.
 func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, logger *slog.Logger) netserve.Config {
 	return netserve.Config{
-		WorkDir:       opts.workDir,
-		DNSVIP:        opts.clusterIP,
-		ClusterDomain: opts.domain,
-		NodeIP:        opts.nodeIP,
-		PodCIDR:       res.PodCIDR,
-		MeshEgressIP:  res.MeshIP,
-		NetdSocket:    mode.Socket,
-		Disabled:      !mode.DataPath(),
-		Logger:        logger,
+		WorkDir:           opts.workDir,
+		DNSVIP:            opts.clusterIP,
+		ClusterDomain:     opts.domain,
+		NodeIP:            opts.nodeIP,
+		PodCIDR:           res.PodCIDR,
+		MeshEgressIP:      res.MeshIP,
+		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),
+		NetdSocket:        mode.Socket,
+		Disabled:          !mode.DataPath(),
+		Logger:            logger,
 	}
+}
+
+// peerMeshEgressIPs extracts each join-snapshot peer's mesh-egress /32: the
+// declared Spec.MeshIP, falling back to the canonical .1-of-the-pod-/24
+// derivation (podnet.MeshEgressIP — the one derivation the mesh and proxy share)
+// when unset. These seed the NetworkPolicy table's always-allow source set
+// (M10.4): a peer's Service proxy re-originates cross-node traffic from its
+// mesh-egress /32, and those node-origin dials must never be denied by a pod
+// policy. A peer that enrolls AFTER this snapshot is the documented fail-open
+// gap (netserve.Config.PeerMeshEgressIPs); an unparsable peer is skipped — its
+// dials fail open at the table, never mis-deny.
+func peerMeshEgressIPs(peers []netv1.MeshPeerSpec) []string {
+	out := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if p.MeshIP != "" {
+			out = append(out, p.MeshIP)
+			continue
+		}
+		pfx, err := netip.ParsePrefix(p.PodCIDR)
+		if err != nil {
+			continue
+		}
+		a, err := podnet.MeshEgressIP(pfx)
+		if err != nil {
+			continue
+		}
+		out = append(out, a.String())
+	}
+	return out
 }
 
 // loadOrCreateNodePassword reads the node's persisted node-password (0600), minting

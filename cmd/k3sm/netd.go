@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -51,6 +52,7 @@ type netdOptions struct {
 	serviceUID  int
 	meshKeyDir  string
 	kubeconfig  string
+	nodeIP      string
 }
 
 // runNetd runs the root k3sm-netd helper: it serves the only irreducibly-root
@@ -67,6 +69,7 @@ func runNetd(args []string) error {
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses (empty denies every <1024 bind)")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when a LoadBalancer Service declares the port (the M10.3 ingress/svclb listener); empty denies every node-address bind")
 	_ = fs.Parse(args)
 
 	if os.Geteuid() != 0 {
@@ -91,13 +94,26 @@ func runNetd(args []string) error {
 		return err
 	}
 
-	declares, gid := buildServiceSet(ctx, opts.kubeconfig, logger)
+	// The node's own InternalIP for the node-address LB branch of the port
+	// authorizer (M10.3). Empty is a valid posture — the branch simply denies —
+	// so only a NON-empty value that fails to parse is a config error.
+	var nodeIP netip.Addr
+	if opts.nodeIP != "" {
+		nodeIP, err = netip.ParseAddr(opts.nodeIP)
+		if err != nil {
+			return fmt.Errorf("parse --node-ip %q: %w", opts.nodeIP, err)
+		}
+	}
+
+	declares, declaresLB, gid := buildServiceSet(ctx, opts.kubeconfig, logger)
 
 	cfg, err := netdsvc.BuildConfig(netdsvc.Options{
 		NodePodCIDR: nodeCIDR,
 		ServiceCIDR: svcCIDR,
 		ServiceUID:  uint32(uid),
 		Declares:    declares,
+		DeclaresLB:  declaresLB,
+		NodeIP:      nodeIP,
 		MeshKeyDir:  opts.meshKeyDir,
 		Logger:      logger,
 	})
@@ -109,7 +125,7 @@ func runNetd(args []string) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid)
+	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid, "node-ip", opts.nodeIP)
 
 	srv := netd.NewServer(cfg)
 	if err := srv.Serve(ctx, l); err != nil && ctx.Err() == nil {
@@ -136,45 +152,52 @@ func resolveServiceUID(flagUID int) (int, error) {
 	return uid, nil
 }
 
-// buildServiceSet returns the privileged-port authorizer's declares predicate
-// (a Service declares a given port) backed by a Services informer, plus the
-// _k3sm gid for the socket group. With no kubeconfig the predicate is nil, so
-// the daemon denies every <1024 bind (fail safe). The informer runs until ctx
-// ends; the predicate reads its synced cache.
-func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger) (func(int) bool, int) {
-	gid := serviceGID()
+// buildServiceSet returns the privileged-port authorizer's two predicates —
+// declares (some Service declares a given port; the Service-CIDR-VIP branch)
+// and declaresLB (a Service of TYPE LoadBalancer declares it; the
+// node-own-address branch, M10.3) — backed by one Services informer, plus the
+// _k3sm gid for the socket group. With no kubeconfig both predicates are nil,
+// so the daemon denies every <1024 bind (fail safe). The informer runs until
+// ctx ends; the predicates read its synced cache.
+func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger) (declares, declaresLB func(int) bool, gid int) {
+	gid = serviceGID()
 	if kubeconfig == "" {
 		logger.Warn("no --kubeconfig: privileged-port (<1024) binds will be denied (no authoritative Service set)")
-		return nil, gid
+		return nil, nil, gid
 	}
 	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		logger.Error("load kubeconfig for Service authorizer; <1024 binds will be denied", "err", err)
-		return nil, gid
+		return nil, nil, gid
 	}
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		logger.Error("build client for Service authorizer; <1024 binds will be denied", "err", err)
-		return nil, gid
+		return nil, nil, gid
 	}
 	factory := informers.NewSharedInformerFactory(cs, 30*time.Second)
 	lister := factory.Core().V1().Services().Lister()
 	factory.Start(ctx.Done())
 	factory.WaitForCacheSync(ctx.Done())
 
-	declares := func(port int) bool { return serviceDeclaresPort(lister, port) }
-	return declares, gid
+	declares = func(port int) bool { return serviceDeclaresPort(lister, port, false) }
+	declaresLB = func(port int) bool { return serviceDeclaresPort(lister, port, true) }
+	return declares, declaresLB, gid
 }
 
-// serviceDeclaresPort reports whether any Service in the cache declares port (a
-// ClusterIP/NodePort/targetPort match), the authoritative check that gates a
-// privileged-port bind.
-func serviceDeclaresPort(lister corev1listers.ServiceLister, port int) bool {
+// serviceDeclaresPort reports whether a Service in the cache declares port —
+// the authoritative check that gates a privileged-port bind. With lbOnly it
+// counts only Services of type LoadBalancer (the node-own-address branch: a
+// ClusterIP Service declaring :80 must NOT authorize a node-address listener).
+func serviceDeclaresPort(lister corev1listers.ServiceLister, port int, lbOnly bool) bool {
 	svcs, err := lister.List(labels.Everything())
 	if err != nil {
 		return false
 	}
 	for _, s := range svcs {
+		if lbOnly && s.Spec.Type != corev1.ServiceTypeLoadBalancer {
+			continue
+		}
 		for _, p := range s.Spec.Ports {
 			if int(p.Port) == port {
 				return true
