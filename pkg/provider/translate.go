@@ -128,8 +128,8 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 	}
 	box.QosClass = podQOSClass(pod)
 
-	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers)
-	box.Containers = toRuntimeContainers(pod.Spec.Containers)
+	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers, true)
+	box.Containers = toRuntimeContainers(pod.Spec.Containers, false)
 
 	// Inject the cluster DNS env the DYLD getaddrinfo shim reads, gated on the pod's
 	// DNSPolicy. Appended AFTER the user env (infra-wins) and to BOTH the init and
@@ -504,7 +504,16 @@ func graceSeconds(pod *corev1.Pod) int64 {
 // command+args; the M2.1 volume_mounts/ports/security_context/env_from surface;
 // env carried structurally for resolvePodBoxEnv; image is the pull reference or,
 // when command/args are empty, the host binary path per the M0/M1 convention).
-func toRuntimeContainers(cs []corev1.Container) []*runtimev1.Container {
+//
+// init selects the M10.2 restart_policy mapping: on an INIT container,
+// restartPolicy: Always (KEP-753) maps to
+// CONTAINER_RESTART_POLICY_ALWAYS — the proto marker runtimed reads to run it
+// as a NATIVE SIDECAR (spawned-not-waited, tracked long-lived, torn down in
+// reverse after the mains). Regular containers always carry UNSPECIFIED:
+// per-container policy on regular containers is out of scope, and the proto
+// field is meaningful only on init containers today (see
+// apis runtime.proto Container.restart_policy — the contract).
+func toRuntimeContainers(cs []corev1.Container, init bool) []*runtimev1.Container {
 	if len(cs) == 0 {
 		return nil
 	}
@@ -524,6 +533,9 @@ func toRuntimeContainers(cs []corev1.Container) []*runtimev1.Container {
 			SecurityContext: toSecurityContext(c.SecurityContext),
 			EnvFrom:         toEnvFrom(c.EnvFrom),
 			Env:             toEnvVars(c.Env),
+		}
+		if init && c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			rc.RestartPolicy = runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS
 		}
 		out = append(out, rc)
 	}
@@ -1034,11 +1046,16 @@ func carryForwardExternalConditions(pod *corev1.Pod) []corev1.PodCondition {
 }
 
 // applyProbeOverlay merges the provider-served probe verdicts into the container
-// statuses (M2.2): the probe-driven restart count is always added; for a RUNNING
-// container, a readiness/startup probe overrides Ready (so a failing readiness
-// probe removes the pod from its Service EndpointSlice) and a startup probe
-// overrides Started. Non-running containers keep the runtime's verdict (the prober
-// only governs a live container). A nil probes is a no-op.
+// statuses (M2.2): for a RUNNING container, a readiness/startup probe overrides
+// Ready (so a failing readiness probe removes the pod from its Service
+// EndpointSlice) and a startup probe overrides Started. Non-running containers
+// keep the runtime's verdict (the prober only governs a live container).
+//
+// RestartCount is NOT touched (M10.2/B26 single-count-authority): runtimed bumps
+// ContainerStatus.restart_count on the RestartContainer RPC — the same RPC the
+// probe runner's doRestart drives — so the runtime count already includes every
+// liveness-driven restart; adding the monitor's tally on top would double-count.
+// A nil probes is a no-op.
 func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 	if probes == nil {
 		return
@@ -1048,7 +1065,6 @@ func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 		if !ok {
 			continue
 		}
-		cs[i].RestartCount += v.restarts
 		if cs[i].State.Running == nil {
 			continue
 		}

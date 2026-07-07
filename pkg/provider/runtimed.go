@@ -117,6 +117,15 @@ type podTrack struct {
 	// because GetPods reconstructs status OUTSIDE r.mu.
 	readyMu   sync.Mutex
 	lastReady corev1.PodCondition
+
+	// restartMu guards restarts — the per-container exit-driven restart
+	// bookkeeping of the B26 authority (runtimed_restart.go): the termination
+	// idempotency latch, the CrashLoopBackOff schedule, and the pending-re-exec
+	// state the status overlay renders. Separate from r.mu for the same reason
+	// as readyMu (buildStatus runs outside r.mu); lock order is r.mu →
+	// restartMu, never the reverse.
+	restartMu sync.Mutex
+	restarts  map[string]*containerRestart // container name -> restart bookkeeping
 }
 
 // RuntimedConfig configures a runtimedRuntime.
@@ -383,11 +392,18 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 
 	r.mu.Lock()
-	if t, ok := r.track[id]; ok {
-		start = t.startTime // idempotent: keep the original start time
+	old := r.track[id]
+	if old != nil {
+		start = old.startTime // idempotent: keep the original start time
 	}
 	r.track[id] = &podTrack{pod: pod.DeepCopy(), startTime: start}
 	r.mu.Unlock()
+	if old != nil {
+		// The replaced track's pending re-execs must not fire against the new
+		// track's bookkeeping (their goroutines would clear nothing and could
+		// double-restart a container the fresh CreatePod just spawned).
+		old.cancelRestarts()
+	}
 
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
@@ -465,8 +481,14 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// delete-path teardown) so pod churn never leaks a node pool address.
 	r.releasePodNetwork(pod)
 	r.mu.Lock()
+	t := r.track[id]
 	delete(r.track, id)
 	r.mu.Unlock()
+	if t != nil {
+		// Abort any pending exit-driven re-exec (B26): no restart goroutine may
+		// outlive the pod, and a deleted pod must never be re-spawned.
+		t.cancelRestarts()
+	}
 	return nil
 }
 
@@ -529,7 +551,15 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // r.mu (it snapshots tracks under the lock, then builds each unlocked), so concurrent
 // GetPods/emit for the same track must not race on lastReady. The lock is held ONLY
 // around the lastReady read and write — never across toPodStatus or the prober.
+//
+// buildStatus is also the B26 convergence point: every runtime status
+// observation (stream emit, backstop GetPods, direct GetPodStatus, probe-driven
+// publish) flows through here, so observeExits sees each container termination
+// regardless of which path delivered it (idempotent per termination), and
+// applyRestartOverlay renders the CrashLoopBackOff surface + Running phase hold
+// on every published status while a re-exec is pending.
 func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
+	r.observeExits(pod, t, rs)
 	t.readyMu.Lock()
 	prior := t.lastReady
 	t.readyMu.Unlock()
@@ -540,6 +570,7 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 		pod.Status.Conditions = append(pod.Status.Conditions, prior)
 	}
 	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps)
+	r.applyRestartOverlay(pod, t, st)
 	if c := findPodCondition(st.Conditions, corev1.PodReady); c != nil {
 		t.readyMu.Lock()
 		t.lastReady = *c

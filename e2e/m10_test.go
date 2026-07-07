@@ -375,6 +375,24 @@ func TestM10_NativeSidecar(t *testing.T) {
 	t.Skip("TODO(M10.2): assert an initContainer restartPolicy:Always sidecar stays Running + reverse-order teardown over the apis proto field — B73")
 }
 
+// TestM10_CrashLoopBackOff is the M10.2/B26 live-restart criterion: the provider is
+// the SINGLE exit-driven restart authority on the runtimed path (runtimed performs no
+// exit-driven restarts), re-execing a crashed container in place under the effective
+// restart policy with the upstream CrashLoopBackOff schedule. The unit-level contract
+// is pinned by pkg/provider TestNativeSidecarStaysRunning / TestRestartTriggerIdempotent.
+func TestM10_CrashLoopBackOff(t *testing.T) {
+	t.Skip("TODO(M10.2): assert a restartPolicy:Always pod whose container exits nonzero is re-exec'd in place via RestartContainer (provider-decided; runtimed does no exit restarts): between attempts the container status shows waiting.reason=CrashLoopBackOff with the 10s-base doubling back-off message and lastState.terminated carrying the prior exit; restartCount increments monotonically per re-exec (runtimed's restart_count, never double-counted by the provider); the pod PHASE stays Running for the whole crash loop; and a container that stays up past the stabilization window resets the back-off to base on its next crash — B26")
+}
+
+// TestM10_JobCompletion is the M10.2/B74 Job terminal-phase criterion: the controller
+// composition of the per-pod contract pinned by pkg/provider
+// TestJobBackoffAndCompletionAccounting (Never/exit≠0 → Failed terminal; OnFailure/
+// exit≠0 → restart-in-place; mains 0 → Succeeded) against the REAL embedded
+// kube-controller-manager Job controller.
+func TestM10_JobCompletion(t *testing.T) {
+	t.Skip("TODO(M10.2): assert a live batch/v1 Job end-to-end: (1) completions=2 exit-0 pods run to phase Succeeded and the Job reports condition Complete with status.succeeded=2; (2) a restartPolicy:Never Job whose pod exits nonzero surfaces phase Failed TERMINAL (no in-place restart, no CrashLoopBackOff overlay) and the Job controller creates replacement pods until backoffLimit is exhausted → condition Failed reason BackoffLimitExceeded; (3) a restartPolicy:OnFailure Job restarts the SAME pod in place (restartCount++ from runtimed's count, phase stays Running, NO replacement pod) until exit 0 → Succeeded; (4) a sidecar-bearing Job pod (initContainer restartPolicy:Always) goes terminal on its MAINS with the sidecar torn down by runtimed — B74")
+}
+
 // TestM10_ProviderEvents is the M10.2 node-lifecycle-Events criterion: the provider's
 // EventRecorder emits Pulled/Created/Started/Killing/BackOff so `kubectl describe pod`
 // shows the container lifecycle (today the provider has no EventRecorder).
