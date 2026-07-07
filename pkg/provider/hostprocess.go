@@ -46,6 +46,12 @@ import (
 // Container argv = container.Command + container.Args; if both are empty the image
 // reference is treated as the binary path (M0 convention, since native macOS
 // workloads have no image ecosystem yet).
+//
+// restartPolicy is NOT honored on this provider (M10.2): an exited container is
+// reaped once and never re-exec'd, whatever the pod or container restartPolicy
+// says. The B26 exit-driven restart authority (restartpolicy.go +
+// runtimed_restart.go) is wired only on the runtimed path; the conformance
+// register carries this HostProcess ceiling at write-back.
 type HostProcess struct {
 	nodeName string
 	podRoot  string // dir for per-pod logs/state

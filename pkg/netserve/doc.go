@@ -22,7 +22,11 @@ limitations under the License.
 //   - the userspace Service proxy: a proxy.Proxy driven by proxy.NewWatcher off
 //     the cluster's Services + EndpointSlices, owning one lo0-alias socket per
 //     ClusterIP:port (the macOS-native kube-proxy analog), sourced from the node's
-//     mesh-egress /32 for cross-node backend dials (proxy.WithMeshEgressSource);
+//     mesh-egress /32 for cross-node backend dials (proxy.WithMeshEgressSource),
+//     with the NetworkPolicy L4-subset verdict table wired into its accept paths
+//     (proxy.WithPolicyTable, driven by proxy.PolicyWatcher — VIP-mediated
+//     ingress only; the always-allow set is seeded from the node/mesh /32s so
+//     node-origin dialers are never policy-denied);
 //   - the per-node cluster DNS resolver (resolver.go): an in-process authoritative
 //     server bound to the DNS VIP (53/UDP+TCP) answering Service A records and
 //     forwarding off-cluster names upstream. It also renders the reference Corefile

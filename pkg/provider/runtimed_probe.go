@@ -22,7 +22,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -169,16 +168,25 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 
 // restartContainer re-execs a container in place via the runtime RestartContainer
 // RPC (apis:M2.2) — the action a committed liveness-probe failure drives. The
-// probe runner owns the restart DECISION, count, and gate reset (the observable
+// probe runner owns the restart DECISION and gate reset (the observable
 // contract); this is the side effect that actually re-spawns the process.
+func (r *runtimedRuntime) restartContainer(ctx context.Context, podID, container string) error {
+	return r.restartContainerReason(ctx, podID, container, "liveness probe failed")
+}
+
+// restartContainerReason is the shared RestartContainer RPC call both restart
+// authorities use — the liveness path (restartContainer) and the B26
+// exit-driven path (runtimed_restart.go), each with its own recorded reason.
+// runtimed bumps ContainerStatus.restart_count on this RPC: that count is the
+// single restart authority the provider surfaces verbatim.
 // grace_period_seconds is left 0 so runtimed applies its own default window. A
 // typed failure in the response (e.g. the pod is gone) surfaces as an error the
-// runner logs without aborting the probe loop.
-func (r *runtimedRuntime) restartContainer(ctx context.Context, podID, container string) error {
+// caller logs without aborting its loop.
+func (r *runtimedRuntime) restartContainerReason(ctx context.Context, podID, container, reason string) error {
 	resp, err := r.rt.RestartContainer(ctx, &runtimev1.RestartContainerRequest{
 		PodId:     podID,
 		Container: container,
-		Reason:    "liveness probe failed",
+		Reason:    reason,
 	})
 	if err != nil {
 		return fmt.Errorf("runtimed restart container %s/%s: %w", podID, container, err)
@@ -217,17 +225,18 @@ func (r *runtimedRuntime) proberFor(id string) probeState {
 // publishProbeUpdate re-renders the pod's status (with the prober overlay) and
 // runs the VK callback, after a probe-driven change. It reads the callback under
 // the lock but invokes it OUTSIDE the lock (the VK NotifyPods re-entrancy rule),
-// and no-ops if the pod was deleted concurrently.
+// and no-ops if the pod was deleted concurrently. It renders via buildStatus —
+// the single status assembly point — so a probe-driven publish carries the B79
+// stable PodReady prior and the B26 CrashLoopBackOff overlay (a probe tick
+// while a re-exec is pending must not flash the pod Failed).
 func (r *runtimedRuntime) publishProbeUpdate(ctx context.Context, id string) {
 	r.mu.Lock()
 	t, tracked := r.track[id]
 	cb := r.notify
 	pr := r.probers[id]
 	var pod *corev1.Pod
-	var start metav1.Time
 	if tracked {
 		pod = t.pod.DeepCopy()
-		start = t.startTime
 	}
 	r.mu.Unlock()
 	if !tracked || cb == nil {
@@ -244,6 +253,6 @@ func (r *runtimedRuntime) publishProbeUpdate(ctx context.Context, id string) {
 	if pr != nil {
 		ps = pr
 	}
-	pod.Status = *toPodStatus(pod, resp.GetStatus(), r.nodeIP, start, ps)
+	pod.Status = r.buildStatus(pod, t, resp.GetStatus(), ps)
 	cb(pod)
 }

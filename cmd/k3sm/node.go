@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -44,14 +45,50 @@ import (
 
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
+	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
+
+// The pod runtime selector values (`--runtime`).
+const (
+	// runtimeHostProcess is the M0 native-process runtime: rootless dev, no
+	// image pull, no Seatbelt isolation, podIP ≈ nodeIP (its documented shape).
+	runtimeHostProcess = "hostprocess"
+	// runtimeRuntimed is the image runtime (OCI pull → clonefile → ad-hoc-sign →
+	// Seatbelt confine) with per-pod /32 pod IPs via the podnet adapter.
+	runtimeRuntimed = "runtimed"
+)
+
+// defaultRuntime is the pod runtime every k3sm command selects when --runtime
+// is not given: runtimed — THE M10.1 default-runtime flip (the HostProcess
+// os/exec path is rejected for per-pod IP: no bind discipline, two same-node
+// pods collide on shared lo0). It requires the runtimed posture (root, or the
+// one-time `sudo k3sm install` netd helper); a posture miss REFUSES to start
+// (runtimePreflight) — never a silent degrade. `--runtime hostprocess` is the
+// explicit rootless-dev opt-out.
+const defaultRuntime = runtimeRuntimed
+
+// addRuntimeFlag registers the shared --runtime flag: the ONE place the default
+// pod runtime is declared, used by `k3sm node`, `k3sm agent`, and `k3sm server`.
+func addRuntimeFlag(fs *flag.FlagSet, p *string) {
+	fs.StringVar(p, "runtime", defaultRuntime,
+		"pod runtime: runtimed (image runtime; the default — needs root or the one-time 'sudo k3sm install' netd helper) or hostprocess (explicit rootless-dev opt-out: native processes, podIP≈nodeIP)")
+}
+
+// resolveRuntime maps an empty --runtime to the shared default.
+func resolveRuntime(name string) string {
+	if name == "" {
+		return defaultRuntime
+	}
+	return name
+}
 
 // compile-time check that the VK adapter satisfies the full VK provider contract.
 var _ vkadapter.Provider = (*provider.VKProvider)(nil)
@@ -64,11 +101,22 @@ type nodeOptions struct {
 	listen     string
 	podRoot    string
 	nodeIP     string
-	runtime    string // "hostprocess" (default) or "runtimed"
+	runtime    string // "runtimed" (default) or "hostprocess" — see defaultRuntime
 	dnsShim    string // getaddrinfo DNS shim dylib path (runtimed only)
 	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
 	domain     string // cluster DNS domain the in-pod shim search list is built from (runtimed)
 	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
+
+	// podCIDR is this node's pod /24 the runtimed podnet adapter allocates /32s
+	// from — the SAME CIDR the mesh AllowedIPs carry: an enrolled worker's
+	// assigned res.PodCIDR, the reserved index-0 /24 on the control-plane/
+	// single node (defaultNodePodCIDR). Never a second IPAM source.
+	podCIDR string
+	// netMode is the resolved host-network backend the podnet adapter's lo0
+	// alias plumbing and the runtimed preflight follow (helper vs direct vs
+	// none). The zero value is BackendNone (no datapath — no adapter, podIP ≈
+	// nodeIP); the commands always set it from their resolved --network mode.
+	netMode hostnet.Mode
 }
 
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
@@ -81,7 +129,7 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.listen, "listen", "127.0.0.1:10250", "address for the kubelet HTTP API (logs/exec)")
 	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
-	fs.StringVar(&opts.runtime, "runtime", "hostprocess", "pod runtime: hostprocess (native processes) or runtimed (image runtime)")
+	addRuntimeFlag(fs, &opts.runtime)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
@@ -92,16 +140,85 @@ func runNode(args []string) error {
 		return fmt.Errorf("--kubeconfig (or $KUBECONFIG) is required")
 	}
 
+	// The standalone node has no --network flag: resolve the auto posture (root
+	// → direct lo0 ops, unprivileged → the netd helper). Whether that posture is
+	// actually usable is checked by the runtimed preflight in startNode — an
+	// unprivileged dev box without the helper is told to `sudo k3sm install` or
+	// pass --runtime hostprocess.
+	mode, err := hostnet.Resolve(hostnet.NetworkAuto)
+	if err != nil {
+		return err
+	}
+	opts.netMode = mode
+	// Single/standalone node: the reserved index-0 /24 (the same value the mesh
+	// enroller reserves for the control-plane node).
+	opts.podCIDR = defaultNodePodCIDR()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	return startNode(ctx, opts)
 }
 
+// defaultNodePodCIDR is the control-plane/single-node pod /24: node index 0 of
+// the cluster pod CIDR (100.64.0.0/24) — the SAME derivation the mesh enroller
+// uses (enroll.go reserves index 0 for the control-plane node; workers get
+// index 1+) and the same value netserve's routing-table locality defaults to.
+// An enrolled worker overrides it with its assigned res.PodCIDR; there is
+// deliberately no second IPAM source.
+func defaultNodePodCIDR() string {
+	cidr, err := podnet.NodeCIDR(podnet.ClusterPodCIDR, 0)
+	if err != nil {
+		// Unreachable with the pinned package constants; returning "" makes the
+		// adapter construction fail fast rather than inventing a literal here.
+		return ""
+	}
+	return cidr.String()
+}
+
+// errRuntimedPosture is the NAMED refuse-to-start error of the M10.1
+// default-runtime flip: the runtimed runtime's pod network needs root or the
+// netd helper, and neither is present. k3sm never silently degrades to
+// hostprocess — the operator either installs the posture or opts out.
+var errRuntimedPosture = errors.New("runtimed runtime posture missing")
+
+// probeNetdHelper is the runtimed-preflight probe seam (the same reachability
+// probe `--network auto` uses: a bounded dial of the netd helper socket when
+// the helper backend is selected; a no-op for direct/root). A package var so
+// the preflight is unit-tested with a fake.
+var probeNetdHelper = func(ctx context.Context, mode hostnet.Mode) error { return mode.Probe(ctx) }
+
+// runtimePreflight fail-fasts BEFORE the node registers when the selected
+// runtime is runtimed but the posture its pod network needs is absent — an
+// unprivileged process with no reachable netd helper. It NEVER auto-degrades:
+// the named error tells the operator to run `sudo k3sm install` or pass
+// `--runtime hostprocess` (the explicit rootless-dev opt-out). hostprocess
+// bypasses it entirely; `--network none` (an explicit control-plane-only/CI
+// backend) needs no helper — the runtimed runtime then runs without a per-pod
+// datapath (podIP ≈ nodeIP).
+func runtimePreflight(ctx context.Context, opts nodeOptions) error {
+	if resolveRuntime(opts.runtime) != runtimeRuntimed {
+		return nil
+	}
+	if !opts.netMode.DataPath() {
+		return nil
+	}
+	if err := probeNetdHelper(ctx, opts.netMode); err != nil {
+		return fmt.Errorf("%w: %v — run 'sudo k3sm install' (the one-time privileged step that lays down the io.k3sm.netd helper), or pass --runtime hostprocess for an explicit rootless dev node", errRuntimedPosture, err)
+	}
+	return nil
+}
+
 // startNode builds the client, selects the runtime, registers the VK node, and
 // blocks until ctx ends or the node exits. The server calls it directly with an
 // already-built kubeconfig.
 func startNode(ctx context.Context, opts nodeOptions) error {
+	// M10.1 flip guard: refuse to start (named error, actionable message) when
+	// the default runtimed runtime's posture is missing — BEFORE anything
+	// registers against the cluster. Never a silent hostprocess fallback.
+	if err := runtimePreflight(ctx, opts); err != nil {
+		return err
+	}
 	restCfg, err := clientcmd.BuildConfigFromFlags("", opts.kubeconfig)
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
@@ -170,25 +287,66 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 }
 
 // buildProvider selects and constructs the VK provider for the requested
-// runtime. HostProcess is the default (M0 native processes, no isolation);
-// runtimed is the M1 image runtime (OCI pull → clonefile → ad-hoc-sign →
-// Seatbelt confine), wrapped in the VK adapter. cs is the apiserver client the
-// runtimed provider resolves volumes/env/imagePullSecrets with (M2.1/M2.6).
-// recorder is the EventRecorder the HostProcess provider emits pod lifecycle
-// Events to (the runtimed VK-provider-path emit is a deferred follow-up).
+// runtime. runtimed is the default (defaultRuntime — the M1 image runtime: OCI
+// pull → clonefile → ad-hoc-sign → Seatbelt confine, per-pod /32 pod IPs via
+// the injected podnet adapter), wrapped in the VK adapter; hostprocess is the
+// explicit rootless-dev opt-out (M0 native processes, no isolation, podIP ≈
+// nodeIP — its documented shape, untouched by M10.1). cs is the apiserver
+// client the runtimed provider resolves volumes/env/imagePullSecrets with
+// (M2.1/M2.6). recorder is the EventRecorder the HostProcess provider emits pod
+// lifecycle Events to (the runtimed VK-provider-path emit is a deferred
+// follow-up).
 func buildProvider(opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, string, error) {
-	switch opts.runtime {
-	case "", "hostprocess":
-		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), "hostprocess", nil
-	case "runtimed":
-		rt, err := provider.NewRuntimed(runtimedConfig(opts, cs))
+	switch resolveRuntime(opts.runtime) {
+	case runtimeHostProcess:
+		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), runtimeHostProcess, nil
+	case runtimeRuntimed:
+		cfg := runtimedConfig(opts, cs)
+		adapter, err := buildPodNetAdapter(opts)
+		if err != nil {
+			return nil, "", err
+		}
+		if adapter != nil {
+			cfg.Network = adapter
+		}
+		rt, err := provider.NewRuntimed(cfg)
 		if err != nil {
 			return nil, "", fmt.Errorf("build runtimed provider: %w", err)
 		}
-		return provider.NewVKProvider(rt, opts.nodeName), "runtimed", nil
+		return provider.NewVKProvider(rt, opts.nodeName), runtimeRuntimed, nil
 	default:
-		return nil, "", fmt.Errorf("unknown --runtime %q (want hostprocess or runtimed)", opts.runtime)
+		return nil, "", fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
 	}
+}
+
+// buildPodNetAdapter constructs the node's ONE podnet.Network (darwin-net stays
+// the sole node-/24 allocator) and wraps it in the provider adapter that
+// bridges it into runtimed's PodNetwork + startup-reconcile seams (M10.1). The
+// lo0 alias plumbing follows the resolved host-network backend: the netd helper
+// when unprivileged, the direct root-gated manager otherwise. It returns nil
+// (no adapter — runtimed keeps podIP ≈ nodeIP) only for the EXPLICIT
+// no-datapath backend (`--network none`, control-plane-only/CI); a missing
+// podCIDR with a datapath is a fail-fast error, never a fallback.
+func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
+	if !opts.netMode.DataPath() {
+		return nil, nil
+	}
+	if opts.podCIDR == "" {
+		return nil, fmt.Errorf("runtimed pod network needs the node podCIDR (the enrolled /24) and none was configured")
+	}
+	prefix, err := netip.ParsePrefix(opts.podCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("parse node podCIDR %q: %w", opts.podCIDR, err)
+	}
+	var popts []podnet.Option
+	if opts.netMode.UsesHelper() {
+		popts = append(popts, podnet.WithNetdHelper(opts.netMode.Socket))
+	}
+	nw, err := podnet.New(prefix, popts...)
+	if err != nil {
+		return nil, fmt.Errorf("build pod network for %s: %w", opts.podCIDR, err)
+	}
+	return provider.NewPodNetAdapter(nw, opts.nodeIP, slog.Default()), nil
 }
 
 // runtimedConfig builds the runtimed runtime configuration from the node options:

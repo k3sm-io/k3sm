@@ -34,10 +34,16 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd/wire"
+	"k3sm.io/darwin-net/pkg/podnet"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // recordTTL is the TTL (seconds) stamped on the A records the resolver answers.
@@ -79,6 +85,23 @@ type dnsZone interface {
 	LookupService(namespace, name string) (serviceTarget, bool)
 }
 
+// identitySource is the OPTIONAL record-synthesis capability of a dnsZone
+// (M10.1): headless all-backends A sets, per-endpoint identity A records
+// (StatefulSet hostname / dashed-IP), SRV per named port, and the authoritative
+// PTR reverse zone. The resolver detects it with a type assertion (the same
+// optional-capability pattern as provider.StatsSource): the production
+// serviceZone implements it off the Services + EndpointSlices listers; a zone
+// without it keeps the pre-M10.1 A/VIP-only behavior.
+type identitySource interface {
+	// SynthRecords synthesizes the namespace/name Service's full record set
+	// (dns.Synthesize semantics). ok==false for an absent or ExternalName
+	// Service (the latter stays on the LookupService CNAME-flatten chase path).
+	SynthRecords(namespace, name string) (dns.RecordSet, bool)
+	// LookupPTR resolves an in-addr.arpa owner name (lower-case, no trailing
+	// dot) to its target name across the whole cluster Service set.
+	LookupPTR(reverseName string) (string, bool)
+}
+
 // dnsForwarder resolves a non-cluster name to IPv4 addresses upstream. It is the
 // seam for off-cluster names (the per-node resolver is authoritative only for the
 // cluster domain); the production impl wraps net.Resolver, tests inject a fake.
@@ -107,11 +130,16 @@ type dnsForwarder interface {
 // its own socket creation) over a passed fd is intractable. So k3sm runs this
 // minimal authoritative resolver over the helper/direct-bound sockets instead.
 //
-// The divergence is scope, not behavior for the M3.3 acceptance: this resolver
-// answers Service A records + forwards, which is what in-pod kubectl and cluster
-// DNS need. It does NOT implement SRV, PTR, headless per-pod A records, pod A
-// records (<ip>.<ns>.pod.<domain>), or AAAA (k3sm's service CIDR is IPv4); those
-// are the documented gaps a future darwin-net dns.Server seam would close.
+// The divergence is scope, not behavior: this resolver answers cluster Service
+// A records + forwards off-cluster names — and, since M10.1, the DNS identity
+// surface synthesized by darwin-net's dns.Synthesize (consumed, never
+// reimplemented): headless all-backends A sets, per-endpoint identity A records
+// (<hostname>.<svc>... for StatefulSet pods, dashed-IP otherwise), SRV per
+// named port, stateless pod A names (<dashed-ip>.<ns>.pod.<domain> via
+// dns.PodAddrFromName), and an AUTHORITATIVE reverse zone — in-addr.arpa names
+// inside the cluster pod CIDR + service CIDR answer locally (PTR hit or
+// NXDOMAIN) and are NEVER forwarded upstream. AAAA stays unanswered (k3sm's
+// CIDRs are IPv4).
 //
 // ExternalName Services ARE resolved (B19): the target is chased through the
 // upstream forwarder and FLATTENED CNAME→A — the resolver is A-only, so a client
@@ -128,12 +156,23 @@ type clusterResolver struct {
 	vip    netip.Addr
 	domain string
 	zone   dnsZone
-	fwd    dnsForwarder
-	log    *slog.Logger
+	// ident is the zone's optional record-synthesis capability (type-asserted
+	// from zone at construction); nil keeps the A/VIP-only behavior.
+	ident identitySource
+	fwd   dnsForwarder
+	log   *slog.Logger
+	// podCIDR and serviceCIDR bound the AUTHORITATIVE reverse zones: an
+	// in-addr.arpa name for an address inside either answers locally (PTR hit
+	// or NXDOMAIN) and never leaks upstream. podCIDR is the CLUSTER pod CIDR
+	// (100.64.0.0/10 — every node's /24, not just this one's), serviceCIDR the
+	// pinned cluster Service CIDR.
+	podCIDR     netip.Prefix
+	serviceCIDR netip.Prefix
 }
 
 // newClusterResolver builds the resolver for the DNS VIP and cluster domain over
-// the given zone and upstream forwarder.
+// the given zone and upstream forwarder. The zone's identitySource capability
+// (record synthesis + PTR) is detected by type assertion.
 func newClusterResolver(vip netip.Addr, domain string, zone dnsZone, fwd dnsForwarder, log *slog.Logger) *clusterResolver {
 	if domain == "" {
 		domain = dns.DefaultClusterDomain
@@ -141,7 +180,16 @@ func newClusterResolver(vip netip.Addr, domain string, zone dnsZone, fwd dnsForw
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &clusterResolver{vip: vip, domain: domain, zone: zone, fwd: fwd, log: log}
+	r := &clusterResolver{vip: vip, domain: domain, zone: zone, fwd: fwd, log: log, podCIDR: podnet.ClusterPodCIDR}
+	r.ident, _ = zone.(identitySource)
+	// The pinned Service CIDR (the same install.DefaultServiceCIDR the netd
+	// daemon admits VIP aliases from). A parse failure leaves the zero Prefix —
+	// authoritativeReverse then simply excludes it — but the constant is pinned
+	// and covered by tests, so this is defensive, not a fallback code path.
+	if p, err := netip.ParsePrefix(install.DefaultServiceCIDR); err == nil {
+		r.serviceCIDR = p.Masked()
+	}
+	return r
 }
 
 // serveUDP answers datagram queries on pc until ctx is cancelled. Each datagram is
@@ -244,14 +292,30 @@ func (r *clusterResolver) handleTCPConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// dnsAnswer carries the typed answers respond renders: A addresses, SRV
+// records, and/or a single PTR target (exactly the record types this resolver
+// is authoritative for). The zero value is an empty answer section.
+type dnsAnswer struct {
+	a   []netip.Addr
+	srv []dns.SRVRecord
+	ptr string
+}
+
 // respond decodes a single query and renders the DNS response. It is the pure core
 // of the resolver (zone + forwarder are injectable), so it is unit-tested directly.
-// A cluster Service name resolves from the zone — a normal Service answers its
-// ClusterIP, an ExternalName Service is chased through the forwarder (flattened
-// CNAME→A), and an absent/headless one is NXDOMAIN; a name in the cluster domain
-// that is not a Service A name is NXDOMAIN (pod/SRV records are the documented gap);
-// any other name is forwarded upstream. Only A is answered with addresses — AAAA and
-// other types get an empty NOERROR (NODATA).
+//
+//   - <svc>.<ns>.svc.<domain> A: a normal Service answers its ClusterIP, an
+//     ExternalName Service is chased through the forwarder (flattened CNAME→A),
+//     a headless Service answers every included backend pod IP (synthesis), and
+//     an absent one is NXDOMAIN.
+//   - deeper names under .svc.<domain> (per-endpoint identity A records,
+//     _<port>._<proto> SRV owner names) answer from the synthesized record set.
+//   - <dashed-ip>.<ns>.pod.<domain> A decodes statelessly (dns.PodAddrFromName).
+//   - in-addr.arpa PTR inside the cluster pod/service CIDRs is AUTHORITATIVE:
+//     a PTR hit or NXDOMAIN, never an upstream forward.
+//   - any other cluster-domain name is NXDOMAIN (never leaked upstream); any
+//     off-cluster name forwards (A only; k3sm is IPv4). Unanswered types get an
+//     empty NOERROR (NODATA).
 func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, error) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(query)
@@ -265,18 +329,22 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, er
 
 	qname := normalizeDNSName(q.Name.String())
 	rcode := dnsmessage.RCodeSuccess
-	var answers []netip.Addr
+	var ans dnsAnswer
 
-	switch svc, ns, isService := parseClusterServiceName(qname, r.domain); {
-	case isService:
-		// In-cluster Service. Only A is answered (an AAAA/other query falls through to
-		// an empty NOERROR — NODATA, never NXDOMAIN). A normal Service answers its
-		// ClusterIP; an ExternalName Service is chased through the upstream forwarder
-		// (flattened CNAME→A); ok==false (absent/headless/IPv6) is NXDOMAIN.
+	switch extra, svc, ns, inSvcZone := parseClusterZoneName(qname, r.domain); {
+	case strings.HasSuffix(qname, ".in-addr.arpa"):
+		ans, rcode = r.respondReverse(q.Type, qname)
+	case inSvcZone && len(extra) == 0:
+		// The exact <svc>.<ns> Service name. A answers ClusterIP / ExternalName
+		// chase / headless synthesis; SRV on the bare service name is NODATA when
+		// the service exists (SRV owner names are the _port._proto forms below).
 		if q.Type == dnsmessage.TypeA {
 			switch target, ok := r.zone.LookupService(ns, svc); {
 			case !ok:
-				rcode = dnsmessage.RCodeNameError
+				// Not a VIP-answerable Service: a headless (ClusterIP None) Service
+				// synthesizes its all-backends A set; an absent/pending/IPv6 one is
+				// NXDOMAIN (synthesis also declines those).
+				ans.a, rcode = r.synthA(ns, svc, qname)
 			case target.ExternalName != "":
 				// ExternalName: resolve the target upstream and stamp its A records
 				// under the QUERIED name (buildResponse owns that flatten). A target
@@ -288,25 +356,139 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, er
 				if inClusterDomain(target.ExternalName, r.domain) {
 					rcode = dnsmessage.RCodeNameError
 				} else {
-					answers, rcode = r.forward(ctx, target.ExternalName)
+					ans.a, rcode = r.forward(ctx, target.ExternalName)
 				}
 			default:
-				answers = []netip.Addr{target.IP}
+				ans.a = []netip.Addr{target.IP}
+			}
+		} else if q.Type == dnsmessage.TypeSRV {
+			ans.srv, rcode = r.synthSRV(ns, svc, qname)
+		}
+	case inSvcZone:
+		// A deeper name under <svc>.<ns>.svc.<domain>: a per-endpoint identity A
+		// record (<hostname>.<svc>... / <dashed-ip>.<svc>...) or an SRV owner name
+		// (_<port>._<proto>.<svc>...). Answered from the synthesized set; a miss
+		// is NXDOMAIN (never forwarded).
+		switch q.Type {
+		case dnsmessage.TypeA:
+			ans.a, rcode = r.synthA(ns, svc, qname)
+		case dnsmessage.TypeSRV:
+			ans.srv, rcode = r.synthSRV(ns, svc, qname)
+		}
+	case strings.HasSuffix(qname, ".pod."+r.domain):
+		// Stateless pod A name: <dashed-ip>.<ns>.pod.<domain> decodes to its
+		// address (upstream kube-dns semantics — no existence check); a malformed
+		// pod name is NXDOMAIN.
+		if q.Type == dnsmessage.TypeA {
+			if addr, _, err := dns.PodAddrFromName(qname, r.domain); err == nil {
+				ans.a = []netip.Addr{addr}
+			} else {
+				rcode = dnsmessage.RCodeNameError
 			}
 		}
 	case inClusterDomain(qname, r.domain):
-		// In the cluster domain but not a Service A name (a pod/SRV/headless name).
-		// Unsupported here (the documented divergence) — answer NXDOMAIN rather than
+		// In the cluster domain but not an answerable name. NXDOMAIN rather than
 		// forward, so a cluster name never leaks to the upstream resolver.
 		rcode = dnsmessage.RCodeNameError
 	default:
 		// Off-cluster: forward to the host upstream (A only; k3sm is IPv4).
 		if q.Type == dnsmessage.TypeA {
-			answers, rcode = r.forward(ctx, qname)
+			ans.a, rcode = r.forward(ctx, qname)
 		}
 	}
 
-	return buildResponse(hdr.ID, q, answers, rcode)
+	return buildResponse(hdr.ID, q, ans, rcode)
+}
+
+// synthA answers an A query for owner qname from the (ns, svc) Service's
+// synthesized record set: the headless all-backends set for the bare service
+// name, a per-endpoint identity record for the deeper names. A missing zone
+// capability, absent Service, or unknown owner name is NXDOMAIN — except an
+// owner that exists only as an SRV name, which is NODATA (the name exists).
+func (r *clusterResolver) synthA(ns, svc, qname string) ([]netip.Addr, dnsmessage.RCode) {
+	if r.ident == nil {
+		return nil, dnsmessage.RCodeNameError
+	}
+	rs, ok := r.ident.SynthRecords(ns, svc)
+	if !ok {
+		return nil, dnsmessage.RCodeNameError
+	}
+	if a := rs.A[qname]; len(a) > 0 {
+		return a, dnsmessage.RCodeSuccess
+	}
+	if len(rs.SRV[qname]) > 0 {
+		return nil, dnsmessage.RCodeSuccess // the name exists as an SRV owner: NODATA
+	}
+	return nil, dnsmessage.RCodeNameError
+}
+
+// synthSRV answers an SRV query for owner qname from the (ns, svc) Service's
+// synthesized record set. An owner that exists only as an A name (the bare
+// service / an identity record) is NODATA; an unknown owner is NXDOMAIN.
+func (r *clusterResolver) synthSRV(ns, svc, qname string) ([]dns.SRVRecord, dnsmessage.RCode) {
+	if r.ident == nil {
+		return nil, dnsmessage.RCodeNameError
+	}
+	rs, ok := r.ident.SynthRecords(ns, svc)
+	if !ok {
+		return nil, dnsmessage.RCodeNameError
+	}
+	if srv := rs.SRV[qname]; len(srv) > 0 {
+		return srv, dnsmessage.RCodeSuccess
+	}
+	if len(rs.A[qname]) > 0 {
+		return nil, dnsmessage.RCodeSuccess // the name exists as an A owner: NODATA
+	}
+	return nil, dnsmessage.RCodeNameError
+}
+
+// respondReverse answers an in-addr.arpa query. The resolver is AUTHORITATIVE
+// for the cluster pod CIDR + service CIDR reverse zones: a PTR query for an
+// address inside them answers locally — the synthesized PTR target on a hit,
+// NXDOMAIN on a miss — and is NEVER forwarded upstream (a cluster address must
+// not leak to the host resolver). A reverse name outside those CIDRs (or a
+// non-PTR type) is an empty NOERROR: the forwarder is A-only by design, so no
+// reverse name is ever sent upstream either way.
+func (r *clusterResolver) respondReverse(qtype dnsmessage.Type, qname string) (dnsAnswer, dnsmessage.RCode) {
+	if qtype != dnsmessage.TypePTR {
+		return dnsAnswer{}, dnsmessage.RCodeSuccess
+	}
+	ip, ok := addrFromReverseName(qname)
+	if !ok || !r.authoritativeReverse(ip) {
+		return dnsAnswer{}, dnsmessage.RCodeSuccess
+	}
+	if r.ident != nil {
+		if target, ok := r.ident.LookupPTR(qname); ok {
+			return dnsAnswer{ptr: target}, dnsmessage.RCodeSuccess
+		}
+	}
+	return dnsAnswer{}, dnsmessage.RCodeNameError
+}
+
+// authoritativeReverse reports whether ip falls inside a reverse zone this
+// resolver owns (the cluster pod CIDR or the pinned Service CIDR).
+func (r *clusterResolver) authoritativeReverse(ip netip.Addr) bool {
+	return (r.podCIDR.IsValid() && r.podCIDR.Contains(ip)) ||
+		(r.serviceCIDR.IsValid() && r.serviceCIDR.Contains(ip))
+}
+
+// addrFromReverseName decodes a <d>.<c>.<b>.<a>.in-addr.arpa owner name into
+// the IPv4 address a.b.c.d. ok==false for anything else.
+func addrFromReverseName(qname string) (netip.Addr, bool) {
+	rev, found := strings.CutSuffix(qname, ".in-addr.arpa")
+	if !found {
+		return netip.Addr{}, false
+	}
+	octets := strings.Split(rev, ".")
+	if len(octets) != 4 {
+		return netip.Addr{}, false
+	}
+	// Reverse-name octet order is least-significant first.
+	addr, err := netip.ParseAddr(octets[3] + "." + octets[2] + "." + octets[1] + "." + octets[0])
+	if err != nil || !addr.Is4() {
+		return netip.Addr{}, false
+	}
+	return addr, true
 }
 
 // forward resolves an off-cluster host through the upstream forwarder, mapping its
@@ -328,10 +510,10 @@ func (r *clusterResolver) forward(ctx context.Context, host string) ([]netip.Add
 	}
 }
 
-// buildResponse renders a response carrying the question, any A answers, and the
-// rcode. RecursionAvailable is set so a resolver client does not treat the answer
-// as refusing recursion.
-func buildResponse(id uint16, q dnsmessage.Question, answers []netip.Addr, rcode dnsmessage.RCode) ([]byte, error) {
+// buildResponse renders a response carrying the question, the typed answers
+// (A / SRV / PTR), and the rcode. RecursionAvailable is set so a resolver
+// client does not treat the answer as refusing recursion.
+func buildResponse(id uint16, q dnsmessage.Question, ans dnsAnswer, rcode dnsmessage.RCode) ([]byte, error) {
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		ID:                 id,
 		Response:           true,
@@ -346,18 +528,43 @@ func buildResponse(id uint16, q dnsmessage.Question, answers []netip.Addr, rcode
 	if err := b.Question(q); err != nil {
 		return nil, fmt.Errorf("write question: %w", err)
 	}
-	if len(answers) > 0 {
+	if len(ans.a) > 0 || len(ans.srv) > 0 || ans.ptr != "" {
 		if err := b.StartAnswers(); err != nil {
 			return nil, fmt.Errorf("start answers: %w", err)
 		}
-		for _, a := range answers {
-			if !a.Is4() {
-				continue
-			}
-			rh := dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: recordTTL}
-			if err := b.AResource(rh, dnsmessage.AResource{A: a.As4()}); err != nil {
-				return nil, fmt.Errorf("write A answer: %w", err)
-			}
+	}
+	for _, a := range ans.a {
+		if !a.Is4() {
+			continue
+		}
+		rh := dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: recordTTL}
+		if err := b.AResource(rh, dnsmessage.AResource{A: a.As4()}); err != nil {
+			return nil, fmt.Errorf("write A answer: %w", err)
+		}
+	}
+	for _, s := range ans.srv {
+		target, err := dnsmessage.NewName(s.Target + ".")
+		if err != nil {
+			return nil, fmt.Errorf("srv target %q: %w", s.Target, err)
+		}
+		rh := dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET, TTL: recordTTL}
+		if err := b.SRVResource(rh, dnsmessage.SRVResource{
+			Priority: s.Priority,
+			Weight:   s.Weight,
+			Port:     s.Port,
+			Target:   target,
+		}); err != nil {
+			return nil, fmt.Errorf("write SRV answer: %w", err)
+		}
+	}
+	if ans.ptr != "" {
+		target, err := dnsmessage.NewName(ans.ptr + ".")
+		if err != nil {
+			return nil, fmt.Errorf("ptr target %q: %w", ans.ptr, err)
+		}
+		rh := dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypePTR, Class: dnsmessage.ClassINET, TTL: recordTTL}
+		if err := b.PTRResource(rh, dnsmessage.PTRResource{PTR: target}); err != nil {
+			return nil, fmt.Errorf("write PTR answer: %w", err)
 		}
 	}
 	return b.Finish()
@@ -368,15 +575,34 @@ func buildResponse(id uint16, q dnsmessage.Question, answers []netip.Addr, rcode
 // name is not a two-label Service name under .svc.<domain>. qname must already be
 // normalized (lowercased, no trailing dot).
 func parseClusterServiceName(qname, domain string) (svc, ns string, ok bool) {
+	extra, svc, ns, ok := parseClusterZoneName(qname, domain)
+	if !ok || len(extra) != 0 {
+		return "", "", false
+	}
+	return svc, ns, true
+}
+
+// parseClusterZoneName splits any name under .svc.<domain> into its owning
+// service and namespace (the two labels immediately before the suffix) plus the
+// extra leading labels: a per-endpoint identity name yields one extra label
+// (the hostname / dashed IP), an SRV owner name two (_port, _proto), the bare
+// service name none. ok==false when the name is not under .svc.<domain> or
+// lacks the two service labels. qname must already be normalized.
+func parseClusterZoneName(qname, domain string) (extra []string, svc, ns string, ok bool) {
 	host, found := strings.CutSuffix(qname, ".svc."+domain)
 	if !found {
-		return "", "", false
+		return nil, "", "", false
 	}
 	parts := strings.Split(host, ".")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
+	if len(parts) < 2 {
+		return nil, "", "", false
 	}
-	return parts[0], parts[1], true
+	for _, p := range parts {
+		if p == "" {
+			return nil, "", "", false
+		}
+	}
+	return parts[:len(parts)-2], parts[len(parts)-2], parts[len(parts)-1], true
 }
 
 // inClusterDomain reports whether qname falls under the cluster domain (so it must
@@ -403,11 +629,25 @@ func isNotFound(err error) bool {
 }
 
 // serviceZone is the production dnsZone: it reads the cluster Service set from a
-// Services lister (an informer cache), so a lookup is in-memory with no apiserver
-// round-trip per query.
+// Services lister and the backend endpoints from an EndpointSlices lister (both
+// informer caches), so a lookup is in-memory with no apiserver round-trip per
+// query. It also implements identitySource (M10.1): the record-synthesis inputs
+// are extracted from those listers and handed to darwin-net's dns.Synthesize —
+// consumed, never reimplemented.
 type serviceZone struct {
-	lister corev1listers.ServiceLister
+	services corev1listers.ServiceLister
+	// slices supplies the EndpointSlice endpoints (pod IPs + hostname + ready)
+	// synthesis consumes. nil disables the identitySource capability (tests /
+	// legacy construction), keeping the A/VIP-only behavior.
+	slices discoverylisters.EndpointSliceLister
+	// domain is the cluster DNS domain the synthesized owner names are rooted
+	// at — the SAME domain the resolver serves (a mismatch would synthesize
+	// names no query ever matches).
+	domain string
 }
+
+// Compile-time check: the production zone carries the synthesis capability.
+var _ identitySource = serviceZone{}
 
 // LookupService resolves the namespace/name Service to its target. It branches on
 // the Service TYPE, not on an empty ClusterIP — that is overloaded with a headless
@@ -417,7 +657,7 @@ type serviceZone struct {
 // IPv4 ClusterIP. ok==false (→ NXDOMAIN) for an absent Service, an ExternalName with
 // an empty Spec.ExternalName, or a non-IPv4 ClusterIP (headless "None"/IPv6/pending).
 func (z serviceZone) LookupService(namespace, name string) (serviceTarget, bool) {
-	svc, err := z.lister.Services(namespace).Get(name)
+	svc, err := z.services.Services(namespace).Get(name)
 	if err != nil {
 		return serviceTarget{}, false
 	}
@@ -429,6 +669,146 @@ func (z serviceZone) LookupService(namespace, name string) (serviceTarget, bool)
 		return serviceTarget{}, false
 	}
 	return serviceTarget{IP: addr}, true
+}
+
+// SynthRecords implements identitySource: it synthesizes the namespace/name
+// Service's record set (headless all-backends A, per-endpoint identity A, SRV
+// per named port, PTR) via dns.Synthesize. ok==false for an absent or
+// ExternalName Service, a non-IPv4/pending ClusterIP, a nil slices lister, or a
+// synthesis input error — all of which the caller answers as NXDOMAIN.
+func (z serviceZone) SynthRecords(namespace, name string) (dns.RecordSet, bool) {
+	if z.slices == nil {
+		return dns.RecordSet{}, false
+	}
+	svc, err := z.services.Services(namespace).Get(name)
+	if err != nil {
+		return dns.RecordSet{}, false
+	}
+	return z.synthesize(svc)
+}
+
+// LookupPTR implements identitySource: it resolves an in-addr.arpa owner name
+// to its target by scanning the cluster Service set (a service ClusterIP → the
+// service name; a headless backend pod IP → its endpoint identity name). PTR
+// queries are rare and the Service set is dev-scale, so the scan synthesizes on
+// demand rather than maintaining a reverse index.
+func (z serviceZone) LookupPTR(reverseName string) (string, bool) {
+	if z.slices == nil {
+		return "", false
+	}
+	svcs, err := z.services.List(labels.Everything())
+	if err != nil {
+		return "", false
+	}
+	for _, svc := range svcs {
+		rs, ok := z.synthesize(svc)
+		if !ok {
+			continue
+		}
+		if target, ok := rs.PTR[reverseName]; ok {
+			return target, true
+		}
+	}
+	return "", false
+}
+
+// synthesize builds the record set for one Service from its EndpointSlices.
+func (z serviceZone) synthesize(svc *corev1.Service) (dns.RecordSet, bool) {
+	if svc.Spec.Type == corev1.ServiceTypeExternalName {
+		return dns.RecordSet{}, false // chased through the forwarder, never synthesized
+	}
+	endpoints, slicePorts := z.endpointsFor(svc.Namespace, svc.Name)
+	in, ok := synthServiceInput(svc, slicePorts)
+	if !ok {
+		return dns.RecordSet{}, false
+	}
+	rs, err := dns.Synthesize(z.domain, in, endpoints)
+	if err != nil {
+		return dns.RecordSet{}, false // malformed inputs → no records (NXDOMAIN), never a partial set
+	}
+	return rs, true
+}
+
+// endpointsFor extracts the synthesis endpoints + the deduped endpoint (target)
+// ports from the Service's IPv4 EndpointSlices (matched by the standard
+// kubernetes.io/service-name label).
+func (z serviceZone) endpointsFor(namespace, name string) ([]dns.SynthEndpoint, []dns.SynthPort) {
+	sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: name})
+	slices, err := z.slices.EndpointSlices(namespace).List(sel)
+	if err != nil {
+		return nil, nil
+	}
+	var endpoints []dns.SynthEndpoint
+	var ports []dns.SynthPort
+	seenPorts := map[string]struct{}{}
+	for _, slice := range slices {
+		if slice.AddressType != discoveryv1.AddressTypeIPv4 {
+			continue
+		}
+		for _, ep := range slice.Endpoints {
+			if len(ep.Addresses) == 0 {
+				continue
+			}
+			addr, err := netip.ParseAddr(ep.Addresses[0])
+			if err != nil || !addr.Is4() {
+				continue
+			}
+			e := dns.SynthEndpoint{IP: addr.Unmap()}
+			if ep.Hostname != nil {
+				e.Hostname = *ep.Hostname
+			}
+			// A nil Ready condition means "unknown — consumers should treat it as
+			// serving" (the EndpointConditions contract), so only an explicit false
+			// excludes.
+			e.Ready = ep.Conditions.Ready == nil || *ep.Conditions.Ready
+			endpoints = append(endpoints, e)
+		}
+		for _, p := range slice.Ports {
+			if p.Port == nil {
+				continue
+			}
+			sp := dns.SynthPort{Port: uint16(*p.Port)}
+			if p.Name != nil {
+				sp.Name = *p.Name
+			}
+			if p.Protocol != nil {
+				sp.Protocol = string(*p.Protocol)
+			}
+			key := sp.Name + "/" + sp.Protocol
+			if _, seen := seenPorts[key]; seen {
+				continue
+			}
+			seenPorts[key] = struct{}{}
+			ports = append(ports, sp)
+		}
+	}
+	return endpoints, ports
+}
+
+// synthServiceInput maps a corev1.Service to the dns.SynthService synthesis
+// input. A headless service carries the EndpointSlice (target) ports; a normal
+// one its spec ports + ClusterIP. ok==false when a normal service has no
+// answerable IPv4 ClusterIP (pending/IPv6) — those must stay NXDOMAIN.
+func synthServiceInput(svc *corev1.Service, slicePorts []dns.SynthPort) (dns.SynthService, bool) {
+	in := dns.SynthService{
+		Name:                     svc.Name,
+		Namespace:                svc.Namespace,
+		Headless:                 svc.Spec.ClusterIP == corev1.ClusterIPNone,
+		PublishNotReadyAddresses: svc.Spec.PublishNotReadyAddresses,
+	}
+	if in.Headless {
+		in.Ports = slicePorts
+		return in, true
+	}
+	addr, err := netip.ParseAddr(svc.Spec.ClusterIP)
+	if err != nil || !addr.Is4() {
+		return dns.SynthService{}, false
+	}
+	in.ClusterIP = addr.Unmap()
+	for _, p := range svc.Spec.Ports {
+		in.Ports = append(in.Ports, dns.SynthPort{Name: p.Name, Port: uint16(p.Port), Protocol: string(p.Protocol)})
+	}
+	return in, true
 }
 
 // systemForwarder is the production dnsForwarder: it forwards off-cluster names to

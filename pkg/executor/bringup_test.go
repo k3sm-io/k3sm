@@ -1,0 +1,140 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package executor
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestAwaitHealthyFailFast table-tests the pure bring-up select loop (M10.0
+// SRE fail-fast): child-exit beats the timeout (killing the opaque 90s wedge),
+// readiness returns nil, the timeout still fires when nothing happens, and ctx
+// cancellation propagates. Pure channels + funcs — no real control-plane
+// binaries are spawned.
+func TestAwaitHealthyFailFast(t *testing.T) {
+	never := func(context.Context) bool { return false }
+	always := func(context.Context) bool { return true }
+	detail := func() string { return "exit status 1; last log lines:\nboom" }
+	closed := func() chan struct{} {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+
+	t.Run("ready returns nil", func(t *testing.T) {
+		if err := awaitHealthy(context.Background(), "c", make(chan struct{}), always, time.Second, 10*time.Millisecond, detail); err != nil {
+			t.Fatalf("ready component: err = %v, want nil", err)
+		}
+	})
+
+	t.Run("pre-exited child fails fast with detail", func(t *testing.T) {
+		start := time.Now()
+		err := awaitHealthy(context.Background(), "kube-apiserver", closed(), never, time.Minute, 10*time.Millisecond, detail)
+		if err == nil {
+			t.Fatal("exited child: want error, got nil")
+		}
+		for _, want := range []string{"kube-apiserver", "exited during bring-up", "boom"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q must contain %q (component name + log tail)", err, want)
+			}
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("fail-fast took %s — must not wait out the timeout", elapsed)
+		}
+	})
+
+	t.Run("exit during the poll wait fails fast", func(t *testing.T) {
+		exited := make(chan struct{})
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			close(exited)
+		}()
+		start := time.Now()
+		err := awaitHealthy(context.Background(), "kine", exited, never, time.Minute, 10*time.Second, detail)
+		if err == nil || !strings.Contains(err.Error(), "kine exited during bring-up") {
+			t.Fatalf("err = %v, want the kine early-exit error", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("fail-fast took %s — must preempt the poll sleep", elapsed)
+		}
+	})
+
+	t.Run("exited wins over ready", func(t *testing.T) {
+		err := awaitHealthy(context.Background(), "c", closed(), always, time.Second, 10*time.Millisecond, detail)
+		if err == nil || !strings.Contains(err.Error(), "exited during bring-up") {
+			t.Fatalf("err = %v, want the early-exit error (a dead child is never healthy)", err)
+		}
+	})
+
+	t.Run("timeout still fires", func(t *testing.T) {
+		err := awaitHealthy(context.Background(), "c", make(chan struct{}), never, 50*time.Millisecond, 10*time.Millisecond, detail)
+		if err == nil || !strings.Contains(err.Error(), "not healthy within") {
+			t.Fatalf("err = %v, want the timeout error", err)
+		}
+	})
+
+	t.Run("ctx cancellation propagates", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := awaitHealthy(ctx, "c", make(chan struct{}), never, time.Minute, 10*time.Millisecond, detail)
+		if err != context.Canceled {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// TestSpawnChildExitSurfacesLog proves the whole fail-fast seam end-to-end with
+// a fake child (a shell script that prints and exits nonzero — NOT a real
+// control-plane binary): spawnEnv's reaper closes exited, and the bring-up wait
+// returns an error naming the component, its exit status, and the last log
+// lines from its 0600 log file.
+func TestSpawnChildExitSurfacesLog(t *testing.T) {
+	wd := t.TempDir()
+	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho fatal-flag-error-detail\nexit 3\n"
+	if err := os.WriteFile(filepath.Join(binDir(wd), "failer"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewSupervised(Config{WorkDir: wd})
+	c, err := s.spawnEnv(context.Background(), "failer", nil)
+	if err != nil {
+		t.Fatalf("spawnEnv: %v", err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	never := func(context.Context) bool { return false }
+	waitErr := awaitHealthy(context.Background(), c.name, c.exited, never, 10*time.Second, 10*time.Millisecond, c.exitDetail)
+	if waitErr == nil {
+		t.Fatal("want an early-exit error, got nil")
+	}
+	for _, want := range []string{"failer", "exited during bring-up", "exit status 3", "fatal-flag-error-detail"} {
+		if !strings.Contains(waitErr.Error(), want) {
+			t.Errorf("error %q must contain %q", waitErr, want)
+		}
+	}
+	if fi, err := os.Stat(filepath.Join(wd, "failer.log")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("component log must exist with mode 0600, got %v (err=%v)", fi, err)
+	}
+}

@@ -237,7 +237,8 @@ func (m *containerMonitor) observe(kind probeKind, raw probeOutcome) probeReacti
 	return reactNone
 }
 
-// onRestart applies a container restart: it bumps the restart count and resets
+// onRestart applies a container restart: it bumps the monitor's restart tally
+// (internal bookkeeping — the surfaced RestartCount is runtimed's) and resets
 // every gauge so the startup gate must re-open (and liveness/readiness
 // re-accumulate) for the fresh container instance.
 func (m *containerMonitor) onRestart() {
@@ -283,8 +284,11 @@ func (m *containerMonitor) eachSpec(fn func(kind probeKind, s *probeSpec)) {
 
 // probeVerdict is one container's probe state, merged into the published status
 // by applyProbeOverlay: readiness drives Ready (→ endpoints), startup drives
-// Started (and gates Ready), and restarts is the probe-driven restart delta added
-// to the runtime's own restart_count.
+// Started (and gates Ready). restarts is the monitor's own liveness-restart
+// tally — internal gauge-reset bookkeeping observable at this seam, NEVER added
+// to the surfaced RestartCount: runtimed's restart_count is the single count
+// authority (the RestartContainer RPC bumps it — M10.2/B26), so adding the
+// tally would double-count every liveness-driven restart.
 type probeVerdict struct {
 	hasReadiness bool
 	hasStartup   bool
@@ -529,10 +533,11 @@ func (pp *podProber) fire() {
 	}
 }
 
-// doRestart performs the container-restart side effect after the count has
-// already been bumped (onRestart). The restart count and the gate reset are the
-// observable contract the provider owns; restartFunc is the optional process
-// re-exec seam (the runtime has no per-container restart RPC yet).
+// doRestart performs the container-restart side effect after the monitor's
+// bookkeeping was applied (onRestart: tally bump + gate reset). restartFunc is
+// the process re-exec seam — on the runtimed path it drives the RestartContainer
+// RPC, which bumps runtimed's restart_count, the single count authority the
+// published status surfaces verbatim.
 func (pp *podProber) doRestart(ctx context.Context, container string) {
 	pp.log.Info("liveness probe failed failureThreshold times; restarting container", "pod", pp.podID, "container", container)
 	if pp.restartFunc == nil {

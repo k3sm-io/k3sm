@@ -84,6 +84,12 @@ func StateDBPath(workDir string) string { return filepath.Join(dbDir(workDir), "
 // (downloaded alongside the control-plane binaries by ensureControlPlaneBinaries).
 func KubectlPath(workDir string) string { return filepath.Join(binDir(workDir), "kubectl") }
 
+// AuditLogPath returns the apiserver audit-log path for a given work dir
+// (<workDir>/audit/audit.log — the 0700 dir writeConformanceConfig creates).
+// Exported so argv, the tests, and the M10 audit e2e all probe the SAME file
+// the apiserver writes — single-sourcing the layout (mirrors StateDBPath).
+func AuditLogPath(workDir string) string { return filepath.Join(auditDir(workDir), "audit.log") }
+
 // apiServerURL is the loopback HTTPS URL clients use to reach the apiserver.
 func apiServerURL(port int) string {
 	return "https://127.0.0.1:" + strconv.Itoa(port)
