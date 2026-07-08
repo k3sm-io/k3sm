@@ -32,6 +32,11 @@ DEV_NAME="${SIT_DEV_NAME:-sit}"
 # The single k3sm binary the SIT drives (built once, CGO for kine).
 BIN="$REPO_ROOT/k3sm-sit"
 
+# A THROWAWAY kubeconfig for the `k3sm dev up` context merge, so the SIT never
+# touches an operator's real ~/.kube/config. The e2e run itself targets the
+# instance's own internal kubeconfig (set per-tier below), not this file.
+SIT_KUBECONFIG="${SIT_KUBECONFIG:-$(mktemp -t k3sm-sit-kube.XXXXXX)}"
+
 # ── criteria.env parsing ────────────────────────────────────────────────────
 # crit_field <criterion> <field>  → the value of tier=/root_reason=/fidelity= .
 crit_field() { awk -v c="$1" -v f="$2" '$1==c { for(i=2;i<=NF;i++){ split($i,kv,"="); if(kv[1]==f){print kv[2]} } }' "$CRITERIA_ENV"; }
@@ -63,7 +68,7 @@ cleanup() {
 	# Belt-and-braces lo0 flush (the dev tool already flushes per-instance; this
 	# catches any orphan) — root only.
 	[ "$(id -u)" -eq 0 ] && lo0_flush 10.43.0.0/16 100.64.0.0/10 >/dev/null 2>&1 || true
-	rm -f "$BIN" >/dev/null 2>&1 || true
+	rm -f "$BIN" "$SIT_KUBECONFIG" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -83,8 +88,8 @@ export K3SM_CONFORMANCE_BIN="${K3SM_CONFORMANCE_BIN:-/tmp/k3sm-conformance-bin}"
 mkdir -p "$K3SM_CONFORMANCE_BIN"; chmod 755 "$K3SM_CONFORMANCE_BIN"
 
 # Collect the tier buckets that DON'T run here so they are reported, not silent.
-mapfile -t MULTINODE_DEFERRED < <(crits_for_tier multinode)
-mapfile -t UNBUILT_DEFERRED   < <(crits_for_tier unbuilt)
+MULTINODE_DEFERRED=(); while IFS= read -r __l; do [ -n "$__l" ] && MULTINODE_DEFERRED+=("$__l"); done < <(crits_for_tier multinode)
+UNBUILT_DEFERRED=(); while IFS= read -r __l; do [ -n "$__l" ] && UNBUILT_DEFERRED+=("$__l"); done < <(crits_for_tier unbuilt)
 
 # run_tier <label> <up-flags> <required-crit...>
 #   Boots `k3sm dev up`, points $KUBECONFIG + $K3SM_WORK_DIR at the instance, runs
@@ -97,8 +102,9 @@ run_tier() {
 	echo ""
 	echo "── $label ─────────────────────────────────────────────────────────"
 
+	# --kubeconfig points the context merge at a throwaway file (never ~/.kube/config).
 	# shellcheck disable=SC2086
-	"$BIN" dev up --name "$DEV_NAME" $up_flags
+	"$BIN" dev up --name "$DEV_NAME" --kubeconfig "$SIT_KUBECONFIG" $up_flags
 	# The instance's kubeconfig + workdir live under the durable registry root
 	# (~/.k3sm/dev/<name>/server — the path pkg/dev's Manager.workDir encodes).
 	local work_dir="${HOME}/.k3sm/dev/$DEV_NAME/server"
@@ -122,15 +128,15 @@ run_tier() {
 }
 
 # ── T0 rootless ─────────────────────────────────────────────────────────────
-mapfile -t T0_CRITS < <(crits_for_tier rootless)
+T0_CRITS=(); while IFS= read -r __l; do [ -n "$__l" ] && T0_CRITS+=("$__l"); done < <(crits_for_tier rootless)
 run_tier "T0 rootless (k3sm dev up · runtimed none)" "" "${T0_CRITS[@]}"
 
 # The root-tier criteria are deferred at T0; recorded so they're never silent.
-mapfile -t ROOT_DEFERRED < <(crits_for_tier root)
+ROOT_DEFERRED=(); while IFS= read -r __l; do [ -n "$__l" ] && ROOT_DEFERRED+=("$__l"); done < <(crits_for_tier root)
 
 # ── T1 root (only under sudo) ───────────────────────────────────────────────
 if [ "$(id -u)" -eq 0 ]; then
-	mapfile -t T1_CRITS < <(crits_for_tier root)
+	T1_CRITS=(); while IFS= read -r __l; do [ -n "$__l" ] && T1_CRITS+=("$__l"); done < <(crits_for_tier root)
 	run_tier "T1 root (sudo k3sm dev up --datapath · runtimed direct)" "--datapath" "${T1_CRITS[@]}"
 	# Under sudo the root tier is PROVEN, so it is no longer deferred.
 	ROOT_DEFERRED=()
