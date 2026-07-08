@@ -25,11 +25,13 @@ import (
 // prints so the fidelity axis (docs/UPSTREAM-ALIGNMENT.md, docs/conformance-
 // profile.md) is surfaced at the entry point, not buried. The datapath argument
 // is DatapathNone (rootless — datapath INERT) or DatapathDirect (root — datapath
-// live). The text is golden-tested (banner_test.go) so its warnings cannot
-// silently regress. It is deliberately verbatim between tiers except the leading
-// posture line — the SAFE/UNFAITHFUL classes are the same on both tiers (they are
-// properties of k3sm, not of the privilege posture).
-func FidelityBanner(datapath string) string {
+// live); the runtime argument (runtimeRuntimed / runtimeHostProcess) drives the
+// isolation line so a hostprocess (execshim-unavailable) fallback reports pods run
+// UNCONFINED honestly. The text is golden-tested (banner_test.go) so its warnings
+// cannot silently regress. The SAFE/UNFAITHFUL classes are the same on both tiers
+// (they are properties of k3sm, not of the privilege posture); only the leading
+// posture + isolation lines vary.
+func FidelityBanner(datapath, runtime string) string {
 	var b strings.Builder
 	b.WriteString("k3sm dev — more than envtest: a REAL control plane (kube-apiserver + KCM + scheduler) + a REAL single node.\n")
 	b.WriteString("This is NOT kind — k3sm is deliberately non-conformant. Develop against the SAFE surface; the rest is documented.\n\n")
@@ -39,6 +41,11 @@ func FidelityBanner(datapath string) string {
 		b.WriteString("posture: --datapath (root, network=direct) — Service/ClusterIP/DNS/pod-IP datapath is LIVE.\n")
 	default:
 		b.WriteString("posture: rootless (network=none) — datapath INERT (rootless): Service traffic needs --datapath.\n")
+	}
+	if runtime == runtimeHostProcess {
+		b.WriteString("isolation: hostprocess — pods run UNCONFINED (no Seatbelt; dev-only, k3sm-execshim helper unavailable).\n")
+	} else {
+		b.WriteString("isolation: runtimed — pods are Seatbelt-confined via the k3sm-execshim helper.\n")
 	}
 	b.WriteString("\n")
 

@@ -2,6 +2,7 @@ k3sm dev — more than envtest: a REAL control plane (kube-apiserver + KCM + sch
 This is NOT kind — k3sm is deliberately non-conformant. Develop against the SAFE surface; the rest is documented.
 
 posture: --datapath (root, network=direct) — Service/ClusterIP/DNS/pod-IP datapath is LIVE.
+isolation: runtimed — pods are Seatbelt-confined via the k3sm-execshim helper.
 
 SAFE — faithful, develop freely (real upstream apiserver):
   CRD structural schemas · SSA field-managers · CEL validation · admission registration ·

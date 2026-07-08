@@ -68,6 +68,13 @@ type Instance struct {
 	PID int `json:"pid"`
 	// Tier is the privilege tier: "rootless" (network=none) or "root" (--datapath).
 	Tier string `json:"tier"`
+	// Runtime is the EFFECTIVE pod runtime the detached server booted with:
+	// "runtimed" (Seatbelt-confined, the default) or "hostprocess" (UNCONFINED, the
+	// honest fallback taken when the k3sm-execshim helper could not be provisioned).
+	// Recorded so `list` and the fidelity banner report confined-vs-unconfined
+	// isolation honestly. An empty value on an older manifest reads as runtimed
+	// (the pre-fallback default).
+	Runtime string `json:"runtime"`
 	// Datapath is the network backend the instance booted with (DatapathNone or
 	// DatapathDirect) — the teardown lo0-flush + the fidelity banner key off it.
 	Datapath string `json:"datapath"`

@@ -30,10 +30,12 @@ func TestFidelityBannerGolden(t *testing.T) {
 	cases := []struct {
 		name     string
 		datapath string
+		runtime  string
 		golden   string
 	}{
-		{"rootless", DatapathNone, "banner_rootless.txt"},
-		{"datapath", DatapathDirect, "banner_datapath.txt"},
+		{"rootless", DatapathNone, runtimeRuntimed, "banner_rootless.txt"},
+		{"datapath", DatapathDirect, runtimeRuntimed, "banner_datapath.txt"},
+		{"rootless-hostprocess", DatapathNone, runtimeHostProcess, "banner_rootless_hostprocess.txt"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,7 +43,7 @@ func TestFidelityBannerGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read golden: %v", err)
 			}
-			got := FidelityBanner(tc.datapath)
+			got := FidelityBanner(tc.datapath, tc.runtime)
 			if got != string(want) {
 				t.Errorf("banner mismatch for %s:\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, want)
 			}
@@ -53,13 +55,14 @@ func TestFidelityBannerGolden(t *testing.T) {
 // regardless of the golden bytes — a belt-and-braces guard so a golden re-gen
 // can't drop a critical line unnoticed.
 func TestFidelityBannerContent(t *testing.T) {
-	rootless := FidelityBanner(DatapathNone)
+	rootless := FidelityBanner(DatapathNone, runtimeRuntimed)
 	for _, must := range []string{
 		"datapath INERT (rootless)",
 		"Service traffic needs --datapath",
 		"NOT kind",
 		"SAFE",
 		"UNFAITHFUL",
+		"Seatbelt-confined",
 		"docs/UPSTREAM-ALIGNMENT.md",
 		"docs/conformance-profile.md",
 	} {
@@ -67,12 +70,20 @@ func TestFidelityBannerContent(t *testing.T) {
 			t.Errorf("rootless banner missing %q", must)
 		}
 	}
-	direct := FidelityBanner(DatapathDirect)
+	direct := FidelityBanner(DatapathDirect, runtimeRuntimed)
 	if !strings.Contains(direct, "datapath is LIVE") {
 		t.Errorf("datapath banner missing the LIVE posture line")
 	}
 	if strings.Contains(direct, "datapath INERT") {
 		t.Errorf("datapath banner must not claim INERT")
+	}
+	// The hostprocess fallback must report pods run UNCONFINED honestly.
+	hp := FidelityBanner(DatapathNone, runtimeHostProcess)
+	if !strings.Contains(hp, "UNCONFINED") {
+		t.Errorf("hostprocess banner missing the UNCONFINED isolation warning")
+	}
+	if strings.Contains(hp, "Seatbelt-confined via the k3sm-execshim") {
+		t.Errorf("hostprocess banner must not claim Seatbelt confinement")
 	}
 }
 

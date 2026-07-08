@@ -160,15 +160,21 @@ func runDevList(args []string) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tTIER\tDATAPATH\tAPI\tPID\tSTATUS\tAGE\tCONTEXT")
+	fmt.Fprintln(w, "NAME\tTIER\tRUNTIME\tDATAPATH\tAPI\tPID\tSTATUS\tAGE\tCONTEXT")
 	for _, s := range statuses {
 		status := "stale"
 		if s.Alive {
 			status = "running"
 		}
+		// An empty Runtime on a pre-fallback manifest reads as runtimed (the default
+		// before the hostprocess-fallback field existed).
+		rt := s.Runtime
+		if rt == "" {
+			rt = "runtimed"
+		}
 		age := time.Since(s.CreatedAt).Round(time.Second)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
-			s.Name, s.Tier, s.Datapath, s.APIPort, s.PID, status, age, s.KubeContext)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
+			s.Name, s.Tier, rt, s.Datapath, s.APIPort, s.PID, status, age, s.KubeContext)
 	}
 	return w.Flush()
 }

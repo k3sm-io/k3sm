@@ -34,8 +34,13 @@ limitations under the License.
 //
 // Root posture: rootless up = runtimed + network=none (Seatbelt self-confines,
 // no root); --datapath = euid 0 + network=direct (real Service/DNS/pod-IP). The
-// runtime is ALWAYS runtimed — never hostprocess, which has no Seatbelt and
-// cannot materialize volumes, so a green there is vacuous.
+// runtime is runtimed (Seatbelt-confined) by default; the lifecycle provisions the
+// k3sm-execshim helper (build+sign into a shared dev-bin cache, prepended to the
+// detached server's PATH) so runtimed's sandbox backend can init. If the helper
+// cannot be built (an installed k3sm with no workspace source) it falls back to
+// hostprocess with a loud UNCONFINED notice rather than crashing — honest, never a
+// silent degrade; the effective runtime is recorded in the manifest and shown by
+// `list`.
 //
 // Testability: every syscall the lifecycle needs (ifconfig lo0 alias listing,
 // flushing an alias, process-liveness/kill, flock) is behind the System

@@ -58,6 +58,17 @@ const (
 	tierRoot     = "root"
 )
 
+// runtimeRuntimed / runtimeHostProcess are the effective pod runtimes recorded in
+// the manifest. They MIRROR cmd/k3sm's --runtime values. runtimed (Seatbelt-
+// confined) is the DEFAULT whenever the k3sm-execshim helper is provisionable;
+// hostprocess (UNCONFINED — no Seatbelt) is the honest fallback used only when the
+// helper cannot be built, so the dev loop stays up instead of dying at runtimed
+// init sandbox-backend setup.
+const (
+	runtimeRuntimed    = "runtimed"
+	runtimeHostProcess = "hostprocess"
+)
+
 // ErrDatapathRequiresRoot is returned by Up when --datapath is requested but the
 // process is not root. It carries the exact sudo line the operator must run.
 var ErrDatapathRequiresRoot = errors.New("dev: --datapath needs root (euid 0)")
@@ -97,12 +108,13 @@ type DownOptions struct {
 // share one construction. Out is where banners/notices are written (os.Stdout for
 // the CLI).
 type Manager struct {
-	reg    *Registry
-	sys    System
-	self   string // absolute path to THIS k3sm binary (re-exec'd as `k3sm server`)
-	euid   int
-	out    io.Writer
-	kubeMg *kubeMerger
+	reg     *Registry
+	sys     System
+	builder ExecShimBuilder
+	self    string // absolute path to THIS k3sm binary (re-exec'd as `k3sm server`)
+	euid    int
+	out     io.Writer
+	kubeMg  *kubeMerger
 }
 
 // ManagerConfig constructs a Manager.
@@ -111,6 +123,11 @@ type ManagerConfig struct {
 	Registry *Registry
 	// System is the syscall seam (required).
 	System System
+	// Builder provisions the k3sm-execshim Seatbelt helper (build+sign) the
+	// detached runtimed server needs on its PATH. Optional — nil defaults to the
+	// production NewExecShimBuilder (go build + codesign); tests inject a fake so
+	// no real toolchain runs.
+	Builder ExecShimBuilder
 	// Self is the absolute path to the running k3sm binary, re-exec'd as
 	// `k3sm server` for the detached control plane (required).
 	Self string
@@ -134,13 +151,18 @@ func NewManager(cfg ManagerConfig) *Manager {
 	} else {
 		km.chownUID, km.chownGID = -1, -1
 	}
+	builder := cfg.Builder
+	if builder == nil {
+		builder = NewExecShimBuilder()
+	}
 	return &Manager{
-		reg:    cfg.Registry,
-		sys:    cfg.System,
-		self:   cfg.Self,
-		euid:   cfg.EUID,
-		out:    out,
-		kubeMg: km,
+		reg:     cfg.Registry,
+		sys:     cfg.System,
+		builder: builder,
+		self:    cfg.Self,
+		euid:    cfg.EUID,
+		out:     out,
+		kubeMg:  km,
 	}
 }
 
@@ -203,12 +225,30 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		return Instance{}, err
 	}
 
+	// Provision the k3sm-execshim Seatbelt helper into the shared dev-bin cache and
+	// prepend it to the detached server's PATH — without it runtimed's FindExecShim
+	// fails and the server dies at `init sandbox backend`. If the helper cannot be
+	// built (an installed k3sm with no workspace source) we fall back to
+	// hostprocess (UNCONFINED, dev-only) with a loud notice rather than crashing —
+	// runtimed stays the default whenever the helper IS provisionable.
+	runtimeName := runtimeRuntimed
+	binDir, provisioned, err := m.provisionExecShim(ctx)
+	if err != nil {
+		return Instance{}, err
+	}
+	if !provisioned {
+		runtimeName = runtimeHostProcess
+		binDir = ""
+		fmt.Fprint(m.out, "NOTE: Seatbelt confinement unavailable (no buildable k3sm-execshim helper) — pods run UNCONFINED (dev-only). Run k3sm dev from the workspace, or install, for real isolation.\n")
+	}
+
 	// Boot the config-superset via a detached `k3sm server`: --psa-enforce-baseline
 	// (so the M10 PSA cutover criterion works) + K3SM_WORK_DIR exported (so the
-	// audit/PSA e2e read the SAME workdir). runtimed is the ONLY runtime (never
-	// hostprocess — it has no Seatbelt). The rootless tier is network=none
-	// (runtimePreflight returns nil — no root); --datapath is network=direct.
-	pid, err := m.spawnServer(ctx, name, workDir, apiPort, network)
+	// audit/PSA e2e read the SAME workdir). runtimed (Seatbelt-confined) is the
+	// default; hostprocess is only the honest execshim-unavailable fallback. The
+	// rootless tier is network=none (runtimePreflight returns nil — no root);
+	// --datapath is network=direct.
+	pid, err := m.spawnServer(ctx, name, workDir, apiPort, network, runtimeName, binDir)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -230,6 +270,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		KinePort:    kinePort,
 		PID:         pid,
 		Tier:        tier,
+		Runtime:     runtimeName,
 		Datapath:    datapath,
 		ServiceCIDR: ServiceCIDR,
 		PodCIDR:     PodCIDR,
@@ -268,7 +309,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		_ = chownTree(m.reg.dir(name), m.kubeMg.chownUID, m.kubeMg.chownGID)
 	}
 
-	fmt.Fprint(m.out, FidelityBanner(datapath))
+	fmt.Fprint(m.out, FidelityBanner(datapath, runtimeName))
 	fmt.Fprintf(m.out, "\ninstance %q up — apiserver 127.0.0.1:%d · context %s · kubeconfig %s\n", name, apiPort, inst.KubeContext, kubePath)
 	return inst, nil
 }
@@ -434,7 +475,7 @@ func (m *Manager) preflightReclaim(name string) error {
 // <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
 // until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
 // read the same workdir.
-func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort int, network string) (int, error) {
+func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort int, network, runtimeName, execShimDir string) (int, error) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return 0, fmt.Errorf("create workdir %s: %w", workDir, err)
 	}
@@ -450,7 +491,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort
 		"--work-dir", workDir,
 		"--node-name", "k3sm-dev-" + name,
 		"--node-ip", "127.0.0.1",
-		"--runtime", "runtimed",
+		"--runtime", runtimeName,
 		"--network", network,
 		"--api-port", strconv.Itoa(apiPort),
 		"--psa-enforce-baseline",
@@ -466,7 +507,11 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort
 	// outlives the `k3sm dev up` CLI invocation.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return nil } // ctx cancel must NOT kill the detached server
-	cmd.Env = append(os.Environ(), "K3SM_WORK_DIR="+workDir)
+	// Prepend the dev-bin cache (holding k3sm-execshim) to PATH so runtimed's
+	// FindExecShim → exec.LookPath("k3sm-execshim") resolves the provisioned helper
+	// in the detached server. execShimDir is empty on the hostprocess fallback (no
+	// helper), which leaves PATH untouched.
+	cmd.Env = append(withExecShimPath(os.Environ(), execShimDir), "K3SM_WORK_DIR="+workDir)
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("start k3sm server: %w", err)
 	}
