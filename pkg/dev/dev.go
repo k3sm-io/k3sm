@@ -74,6 +74,10 @@ type UpOptions struct {
 	// Datapath requests the root datapath tier (network=direct); the default is
 	// the rootless tier (network=none). --datapath requires euid 0.
 	Datapath bool
+	// Kubeconfig, when non-empty, is the file the dev context is merged into and
+	// selected in. Empty falls back to $KUBECONFIG (first entry) then ~/.kube/config
+	// (kind-parity). Set it to keep an existing ~/.kube/config untouched.
+	Kubeconfig string
 }
 
 // DownOptions configures `k3sm dev down`.
@@ -83,6 +87,9 @@ type DownOptions struct {
 	// All tears down EVERY registered instance + sweeps residual lo0 aliases and
 	// stale kubeconfig contexts (the reboot-orphan reclaim path).
 	All bool
+	// Kubeconfig mirrors UpOptions.Kubeconfig — the file the dev context is removed
+	// from (must match the path used at `up`). Empty resolves the same way.
+	Kubeconfig string
 }
 
 // Manager is the `k3sm dev` lifecycle. It owns the durable registry and the
@@ -206,6 +213,15 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		return Instance{}, err
 	}
 
+	// Resolve where the dev context is merged (--kubeconfig / $KUBECONFIG /
+	// ~/.kube/config) and record it so `down` removes from the same file.
+	m.kubeMg.path = opts.Kubeconfig
+	kubePath, err := m.kubeMg.dest()
+	if err != nil {
+		_ = m.sys.TerminateProcess(pid, terminateGrace)
+		return Instance{}, err
+	}
+
 	inst := Instance{
 		Version:     registryVersion,
 		Name:        name,
@@ -219,6 +235,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		PodCIDR:     PodCIDR,
 		EUID:        m.euid,
 		KubeContext: kubeContextName(name),
+		Kubeconfig:  kubePath,
 		CreatedAt:   time.Now().UTC(),
 	}
 
@@ -252,7 +269,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	}
 
 	fmt.Fprint(m.out, FidelityBanner(datapath))
-	fmt.Fprintf(m.out, "\ninstance %q up — apiserver 127.0.0.1:%d · context %s · kubeconfig %s\n", name, apiPort, inst.KubeContext, kc)
+	fmt.Fprintf(m.out, "\ninstance %q up — apiserver 127.0.0.1:%d · context %s · kubeconfig %s\n", name, apiPort, inst.KubeContext, kubePath)
 	return inst, nil
 }
 
@@ -271,6 +288,9 @@ func (m *Manager) Down(ctx context.Context, opts DownOptions) error {
 	inst, err := m.reg.Load(name)
 	if err != nil {
 		return err
+	}
+	if opts.Kubeconfig != "" { // explicit override of the recorded merge target
+		inst.Kubeconfig = opts.Kubeconfig
 	}
 	return m.teardown(inst)
 }
@@ -322,6 +342,7 @@ func (m *Manager) teardown(inst Instance) error {
 			fmt.Fprintf(m.out, "flushed lo0 alias(es) for %q: %v\n", inst.Name, removed)
 		}
 	}
+	m.kubeMg.path = inst.Kubeconfig // remove from the file this instance merged into
 	if err := m.kubeMg.remove(inst.KubeContext); err != nil {
 		fmt.Fprintf(m.out, "warning: remove kubeconfig context %q: %v\n", inst.KubeContext, err)
 	}

@@ -113,6 +113,7 @@ func runDevUp(args []string) error {
 	var opts dev.UpOptions
 	fs.StringVar(&opts.Name, "name", "dev", "instance name")
 	fs.BoolVar(&opts.Datapath, "datapath", false, "boot the root datapath tier (network=direct; requires sudo/euid 0) for real Service/DNS/pod-IP")
+	fs.StringVar(&opts.Kubeconfig, "kubeconfig", "", "file to merge+select the dev context into (default $KUBECONFIG, else ~/.kube/config)")
 	_ = fs.Parse(args)
 
 	mgr, err := newDevManager()
@@ -130,6 +131,7 @@ func runDevDown(args []string) error {
 	var opts dev.DownOptions
 	fs.StringVar(&opts.Name, "name", "dev", "instance name to tear down")
 	fs.BoolVar(&opts.All, "all", false, "tear down every instance + reclaim residual aliases/contexts")
+	fs.StringVar(&opts.Kubeconfig, "kubeconfig", "", "override the kubeconfig to clean the context from (default: the file recorded at up)")
 	_ = fs.Parse(args)
 
 	mgr, err := newDevManager()

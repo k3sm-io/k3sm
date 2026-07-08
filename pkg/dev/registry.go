@@ -80,9 +80,13 @@ type Instance struct {
 	// (name × euid) identity so a root datapath instance and a rootless one never
 	// share a workdir.
 	EUID int `json:"euid"`
-	// KubeContext is the ~/.kube/config context name merged on `up` (removed on
+	// KubeContext is the kubeconfig context name merged on `up` (removed on
 	// `down`).
 	KubeContext string `json:"kubeContext"`
+	// Kubeconfig is the resolved file the context was merged into (--kubeconfig /
+	// $KUBECONFIG / ~/.kube/config), recorded so `down` (and `down --all` after a
+	// reboot) removes it from the same file without needing the flag again.
+	Kubeconfig string `json:"kubeconfig"`
 	// CreatedAt is when `up` wrote the manifest (informational; `list` shows age).
 	CreatedAt time.Time `json:"createdAt"`
 }

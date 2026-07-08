@@ -133,3 +133,48 @@ func TestKubeMergerRemoveMissingConfigNoop(t *testing.T) {
 		t.Errorf("remove on a missing ~/.kube/config = %v, want nil (no-op)", err)
 	}
 }
+
+func TestKubeMergerDestPrecedence(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	def := filepath.Join(home, ".kube", "config")
+
+	t.Run("default is ~/.kube/config when no override or env", func(t *testing.T) {
+		t.Setenv("KUBECONFIG", "")
+		km := &kubeMerger{chownUID: -1, chownGID: -1}
+		got, err := km.dest()
+		if err != nil {
+			t.Fatalf("dest: %v", err)
+		}
+		if got != def {
+			t.Errorf("dest = %q, want %q", got, def)
+		}
+	})
+
+	t.Run("$KUBECONFIG first entry wins over the default", func(t *testing.T) {
+		want := filepath.Join(home, "envkube.yaml")
+		other := filepath.Join(home, "second.yaml")
+		t.Setenv("KUBECONFIG", want+string(os.PathListSeparator)+other)
+		km := &kubeMerger{chownUID: -1, chownGID: -1}
+		got, err := km.dest()
+		if err != nil {
+			t.Fatalf("dest: %v", err)
+		}
+		if got != want {
+			t.Errorf("dest = %q, want first $KUBECONFIG entry %q", got, want)
+		}
+	})
+
+	t.Run("explicit override wins over $KUBECONFIG and the default", func(t *testing.T) {
+		t.Setenv("KUBECONFIG", filepath.Join(home, "envkube.yaml"))
+		want := filepath.Join(home, "explicit.yaml")
+		km := &kubeMerger{chownUID: -1, chownGID: -1, path: want}
+		got, err := km.dest()
+		if err != nil {
+			t.Fatalf("dest: %v", err)
+		}
+		if got != want {
+			t.Errorf("dest = %q, want explicit override %q", got, want)
+		}
+	})
+}

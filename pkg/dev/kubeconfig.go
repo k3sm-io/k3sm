@@ -34,16 +34,39 @@ type kubeMerger struct {
 	chownUser string
 	chownUID  int
 	chownGID  int
+	// path, when non-empty, overrides the default destination — set from
+	// `--kubeconfig` / UpOptions.Kubeconfig so an existing ~/.kube/config is left
+	// untouched.
+	path string
 }
 
-// dest resolves ~/.kube/config for the target user (the SUDO_USER human under
-// sudo, else the current user).
+// dest resolves the kubeconfig to merge into, in precedence order: an explicit
+// override (--kubeconfig), then $KUBECONFIG (first entry, kubectl convention),
+// then ~/.kube/config for the target user (the SUDO_USER human under sudo, else
+// the current user).
 func (k *kubeMerger) dest() (string, error) {
+	if k.path != "" {
+		return k.path, nil
+	}
+	if env := firstPathEntry(os.Getenv("KUBECONFIG")); env != "" {
+		return env, nil
+	}
 	home, err := userHomeFor(k.chownUser)
 	if err != nil {
 		return "", fmt.Errorf("resolve ~/.kube/config home: %w", err)
 	}
 	return filepath.Join(home, ".kube", "config"), nil
+}
+
+// firstPathEntry returns the first non-empty entry of an os.PathListSeparator-
+// joined list (KUBECONFIG is a colon-separated list; writes target its head).
+func firstPathEntry(list string) string {
+	for _, p := range filepath.SplitList(list) {
+		if p != "" {
+			return p
+		}
+	}
+	return ""
 }
 
 // merge copies the sole cluster/user/context out of the instance kubeconfig at
