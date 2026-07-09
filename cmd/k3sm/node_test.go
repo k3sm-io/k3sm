@@ -87,9 +87,9 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 // node-capability gate: the k3sm.io/virtualization label is present (value "true")
 // iff the node can run the Virtualization.framework backend, and ABSENT otherwise —
 // so the vm RuntimeClass nodeSelector keeps a vm pod off a non-VZ node. It also pins
-// the foundation's fail-closed default: nodeVMCapable() is false here (k3sm has no
-// per-backend availability signal from runtimed yet), so a freshly configured node
-// carries NO virtualization label and a vm pod stays Unschedulable.
+// the fail-closed default: configureNode with vmCapable=false (the runtimed
+// VMBackendAvailable probe absent/false — B1) stamps NO virtualization label, so a vm
+// pod stays Unschedulable.
 func TestNodeVirtualizationLabel(t *testing.T) {
 	t.Parallel()
 
@@ -111,15 +111,18 @@ func TestNodeVirtualizationLabel(t *testing.T) {
 		t.Error("clearing the virtualization label must not disturb other node labels")
 	}
 
-	// The foundation default is ABSENT: nodeVMCapable() is false, so configureNode
-	// stamps no virtualization label (no VZ node ⇒ vm pods stay Unschedulable).
-	if nodeVMCapable() {
-		t.Error("nodeVMCapable() must be false on this foundation (no runtimed per-backend availability signal); the label is sourced truthfully, never faked")
+	// configureNode threads the runtimed vm-capability probe (B1): vmCapable=false ⇒
+	// the label is ABSENT (no VZ node ⇒ vm pods stay Unschedulable, fail-closed);
+	// vmCapable=true ⇒ present, so the vm RuntimeClass nodeSelector can bind.
+	incapableNode := &corev1.Node{}
+	configureNode(incapableNode, "k3sm-node", "10.0.0.1", false)
+	if _, present := incapableNode.Labels[runtimeclass.LabelVirtualization]; present {
+		t.Errorf("configureNode(vmCapable=false) must NOT stamp the virtualization label, got present: %v", incapableNode.Labels)
 	}
-	node := &corev1.Node{}
-	configureNode(node, "k3sm-node", "10.0.0.1")
-	if _, present := node.Labels[runtimeclass.LabelVirtualization]; present {
-		t.Errorf("configureNode must NOT stamp the virtualization label while nodeVMCapable() is false, got present: %v", node.Labels)
+	capableNode := &corev1.Node{}
+	configureNode(capableNode, "k3sm-node", "10.0.0.1", true)
+	if got := capableNode.Labels[runtimeclass.LabelVirtualization]; got != runtimeclass.LabelTrue {
+		t.Errorf("configureNode(vmCapable=true): label %s = %q, want %q", runtimeclass.LabelVirtualization, got, runtimeclass.LabelTrue)
 	}
 }
 
@@ -187,7 +190,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1")
+		configureNode(n, "k3sm-node", "10.0.0.1", false)
 
 		capMem := n.Status.Capacity[corev1.ResourceMemory]
 		if capMem.Value() != thirtyTwo {
@@ -233,7 +236,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1")
+		configureNode(n, "k3sm-node", "10.0.0.1", false)
 
 		mem := n.Status.Capacity[corev1.ResourceMemory]
 		if mem.Value() != eightGiB {
@@ -250,7 +253,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1")
+		configureNode(n, "k3sm-node", "10.0.0.1", false)
 
 		mem := n.Status.Capacity[corev1.ResourceMemory]
 		if mem.Value() <= 0 {
@@ -268,7 +271,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1")
+		configureNode(n, "k3sm-node", "10.0.0.1", false)
 
 		mem := n.Status.Capacity[corev1.ResourceMemory]
 		if mem.Value() != eightGiB {
@@ -289,7 +292,7 @@ func TestConfigureNodeTopologyLabels(t *testing.T) {
 
 	const host = "k3sm-node"
 	node := &corev1.Node{}
-	configureNode(node, host, "10.0.0.1")
+	configureNode(node, host, "10.0.0.1", false)
 
 	// zone == the node name AND == the hostname label, by construction: this locks the
 	// per-node zone==hostname coupling. A shared-static-zone regression fails here.
