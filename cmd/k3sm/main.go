@@ -29,10 +29,11 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "kubectl", "kubeconfig", "doctor" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node (M3)
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
+  dev         disposable single-node dev cluster (up|down|list|load) — internal dev tooling
   netd        run the root privileged-network helper (launched by the io.k3sm.netd LaunchDaemon)
   install     install the netd + server launchd daemons (run as root via sudo)
   uninstall   remove the netd + server launchd daemons (run as root via sudo)
@@ -105,6 +106,11 @@ func main() {
 	case "doctor":
 		if err := runDoctor(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm doctor:", err)
+			os.Exit(1)
+		}
+	case "dev":
+		if err := runDev(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm dev:", err)
 			os.Exit(1)
 		}
 	default:
