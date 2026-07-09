@@ -45,6 +45,46 @@ cluster_down() {
 	done
 }
 
+# lo0_flush sweeps lo0 of every /32 alias inside the given service + pod CIDRs —
+# the datapath teardown/pre-flight step cluster_down does NOT do (it reaps
+# PROCESSES but not kernel-global lo0 aliases, which outlive the process; see the
+# m2.sh:~127 residual-alias assertion this satisfies). Requires root to remove an
+# alias; a rootless caller allocates none, so it is a no-op over an empty set.
+# It mirrors pkg/dev's lo0FlushCIDRs so the SIT (hack/sit/run.sh) and `k3sm dev`
+# share one flush contract.
+#   lo0_flush <svc-cidr> <pod-cidr>
+lo0_flush() {
+	local svc="${1:-10.43.0.0/16}" pod="${2:-100.64.0.0/10}" ip
+	# `ifconfig lo0` inet lines → the IPv4 aliases; keep only those in a target CIDR.
+	for ip in $(ifconfig lo0 2>/dev/null | awk '/inet /{print $2}'); do
+		if _ip_in_cidr "$ip" "$svc" || _ip_in_cidr "$ip" "$pod"; then
+			ifconfig lo0 -alias "$ip" 2>/dev/null && echo "flushed lo0 alias $ip" || true
+		fi
+	done
+}
+
+# _ip_in_cidr reports whether an IPv4 dotted-quad is inside a CIDR (pure bash
+# integer math — no python/ipcalc dependency). Handles the /8,/10,/16 masks the
+# cluster CIDRs use.
+_ip_in_cidr() {
+	local ip="$1" cidr="$2" net bits
+	net="${cidr%/*}"; bits="${cidr#*/}"
+	[ "$net" = "$cidr" ] && return 1   # not a CIDR
+	local ipn netn mask
+	ipn=$(_ip_to_int "$ip") || return 1
+	netn=$(_ip_to_int "$net") || return 1
+	if [ "$bits" -eq 0 ]; then mask=0; else mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF )); fi
+	[ $(( ipn & mask )) -eq $(( netn & mask )) ]
+}
+
+# _ip_to_int converts a dotted-quad to a 32-bit integer.
+_ip_to_int() {
+	local a b c d IFS=.
+	read -r a b c d <<<"$1"
+	[ -n "$d" ] || return 1
+	echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
 # cluster_up brings up kine + apiserver + scheduler + controller-manager and writes $KUBECONFIG.
 cluster_up() {
 	mkdir -p "$BIN"

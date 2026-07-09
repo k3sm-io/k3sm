@@ -1,0 +1,20 @@
+k3sm dev — more than envtest: a REAL control plane (kube-apiserver + KCM + scheduler) + a REAL single node.
+This is NOT kind — k3sm is deliberately non-conformant. Develop against the SAFE surface; the rest is documented.
+
+posture: --datapath (root, network=direct) — Service/ClusterIP/DNS/pod-IP datapath is LIVE.
+isolation: runtimed — pods are Seatbelt-confined via the k3sm-execshim helper.
+
+SAFE — faithful, develop freely (real upstream apiserver):
+  CRD structural schemas · SSA field-managers · CEL validation · admission registration ·
+  RBAC/Node authz · scheduling · GC/finalizers/ownerReferences · conditions-driven reconcile up to Ready;
+  plus macOS-native single-process workloads (Seatbelt-confined via runtimed).
+
+NEEDS --datapath (root) — anything that routes:
+  Service/ClusterIP reachability · cluster DNS · Service-backed admission webhooks ·
+  the operator's terminal Ready/Endpoint. (url+host-port webhooks work rootless.)
+
+UNFAITHFUL — won't reproduce on real k8s regardless of tier (documented ceilings):
+  no SRV/PTR/headless DNS (A-only resolver) · NetworkPolicy is a hint, not isolation ·
+  no cgroup CPU limits / HPA-on-cpu · no EventRecorder (kubectl describe shows no events) ·
+  no metrics.k8s.io · native-process pods (Linux images need the vm RuntimeClass).
+  See docs/UPSTREAM-ALIGNMENT.md and docs/conformance-profile.md for the full register.
