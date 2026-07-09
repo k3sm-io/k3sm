@@ -237,7 +237,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	defer eventBroadcaster.Shutdown()
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
 
-	prov, runtimeLabel, err := buildProvider(opts, cs, recorder)
+	prov, runtimeLabel, vmCapable, err := buildProvider(ctx, opts, cs, recorder)
 	if err != nil {
 		return err
 	}
@@ -260,7 +260,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		HTTPListenAddr: opts.listen,
 		NumWorkers:     4,
 		TLSConfig:      servingTLS, // nil = plain HTTP (M0 path); set = kubelet-serving TLS
-		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, opts.nodeIP) },
+		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, opts.nodeIP, vmCapable) },
 	})
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
@@ -296,26 +296,31 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // (M2.1/M2.6). recorder is the EventRecorder the HostProcess provider emits pod
 // lifecycle Events to (the runtimed VK-provider-path emit is a deferred
 // follow-up).
-func buildProvider(opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, string, error) {
+// buildProvider constructs the VK provider for the selected runtime and reports
+// whether the node is vm-capable (the k3sm.io/virtualization label source, B1). The
+// in-process host-process runtime has no vm backend, so a node running it is never
+// vm-capable; the runtimed runtime probes GetRuntimeInfo's VMBackendAvailable
+// condition ONCE at bring-up (fail-closed inside VMBackendAvailable).
+func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, string, bool, error) {
 	switch resolveRuntime(opts.runtime) {
 	case runtimeHostProcess:
-		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), runtimeHostProcess, nil
+		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), runtimeHostProcess, false, nil
 	case runtimeRuntimed:
 		cfg := runtimedConfig(opts, cs)
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
 		if adapter != nil {
 			cfg.Network = adapter
 		}
 		rt, err := provider.NewRuntimed(cfg)
 		if err != nil {
-			return nil, "", fmt.Errorf("build runtimed provider: %w", err)
+			return nil, "", false, fmt.Errorf("build runtimed provider: %w", err)
 		}
-		return provider.NewVKProvider(rt, opts.nodeName), runtimeRuntimed, nil
+		return provider.NewVKProvider(rt, opts.nodeName), runtimeRuntimed, rt.VMBackendAvailable(ctx), nil
 	default:
-		return nil, "", fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
+		return nil, "", false, fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
 	}
 }
 
@@ -482,7 +487,7 @@ func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1
 // capacity (real host CPU count and hw.memsize memory, with a documented
 // fallback), and the provider taint (the load-bearing placement guard) so stray
 // non-darwin pods cannot land here.
-func configureNode(n *corev1.Node, name, ip string) {
+func configureNode(n *corev1.Node, name, ip string, vmCapable bool) {
 	if n.Labels == nil {
 		n.Labels = map[string]string{}
 	}
@@ -503,13 +508,13 @@ func configureNode(n *corev1.Node, name, ip string) {
 	n.Labels[corev1.LabelTopologyZone] = name
 	n.Labels[corev1.LabelTopologyRegion] = defaultNodeRegion
 
-	// vm RuntimeClass node-capability gate (M5.1): advertise the
+	// vm RuntimeClass node-capability gate (M5.1/B1): advertise the
 	// Virtualization.framework backend via the k3sm.io/virtualization label ONLY when
 	// this node can run it, so the vm RuntimeClass nodeSelector pins vm pods to a
-	// capable node. nodeVMCapable is false today (k3sm has no per-backend availability
-	// signal — see its doc), so the label is absent and a vm pod stays Unschedulable —
-	// the fail-closed posture for a non-VZ cluster.
-	applyVirtualizationLabel(n, nodeVMCapable())
+	// capable node. vmCapable is the runtimed VMBackendAvailable probe (buildProvider,
+	// fail-closed on any error); a false value leaves the label absent so a vm pod
+	// stays Unschedulable — the fail-closed posture for a non-VZ cluster.
+	applyVirtualizationLabel(n, vmCapable)
 
 	n.Status.NodeInfo.OperatingSystem = "darwin"
 	n.Status.NodeInfo.Architecture = "arm64"
@@ -579,21 +584,6 @@ func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 	}
 	delete(n.Labels, runtimeclass.LabelVirtualization)
 }
-
-// nodeVMCapable reports whether this node can run the vm RuntimeClass backend
-// (Virtualization.framework + the com.apple.security.virtualization entitlement) —
-// the source of truth for the k3sm.io/virtualization node label.
-//
-// It returns false TODAY, by design: runtimed's GetRuntimeInfo RPC reports only the
-// SELECTED host-process backend's health (one "SandboxBackend" condition), NOT
-// per-backend (VZ) availability, so k3sm has no truthful signal to set the label
-// from — and the foundation must not FAKE it. Defaulting the label ABSENT is
-// fail-closed: no VZ node ⇒ a vm pod stays Pending/Unschedulable, complementing
-// runtimed's runtime-refusal backstop (sandbox.ErrBackendUnavailable on a vm
-// CreatePod). Lighting this up needs a runtimed GetRuntimeInfo per-backend
-// availability extension (a reported M5.1 cross-repo need); the provider would query
-// it once at node bring-up and thread the result here.
-func nodeVMCapable() bool { return false }
 
 // defaultNodeRegion is the single static topology.kubernetes.io/region every k3sm
 // node advertises. k3sm has no cloud-region concept, so all nodes agree on one

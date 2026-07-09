@@ -255,6 +255,37 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 	}
 }
 
+// VMBackendAvailable reports whether runtimed advertises the vm backend as usable
+// on this host — the VMBackendAvailable RuntimeCondition GetRuntimeInfo carries
+// (Virtualization.framework isSupported + the com.apple.security.virtualization
+// entitlement). The node queries it ONCE at bring-up to set the
+// k3sm.io/virtualization label truthfully (B1). It fails CLOSED (false) on any RPC
+// error or a missing/false condition, matching the no-VZ default so a labeling
+// probe failure never FALSELY advertises a node as vm-schedulable.
+func (r *runtimedRuntime) VMBackendAvailable(ctx context.Context) bool {
+	info, err := r.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
+	if err != nil {
+		r.log.Warn("vm-capability probe failed; labeling node vm-incapable (fail-closed)", "err", err)
+		return false
+	}
+	return vmBackendAvailableFromInfo(info)
+}
+
+// vmBackendAvailableFromInfo reports whether a GetRuntimeInfo response advertises
+// the vm backend as available (its VMBackendAvailable condition is TRUE). Pure — so
+// the node's truthful-labeling mapping is unit-tested without a live runtimed (B1).
+func vmBackendAvailableFromInfo(info *runtimev1.GetRuntimeInfoResponse) bool {
+	if info == nil {
+		return false
+	}
+	for _, c := range info.GetConditions() {
+		if c.GetType() == "VMBackendAvailable" {
+			return c.GetStatus() == runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+		}
+	}
+	return false
+}
+
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the
 // optional StatsSource capability (the Summary API surface, M2.3).
 var (
