@@ -452,3 +452,38 @@ func TestRuntimedDeleteGrace(t *testing.T) {
 		})
 	}
 }
+
+// TestVMBackendAvailableFromInfo covers the pure GetRuntimeInfo->vm-capability
+// mapping the node uses to set the k3sm.io/virtualization label (B1): the
+// VMBackendAvailable condition TRUE => capable; FALSE, a missing condition (an
+// older runtimed that predates B1), or a nil response => NOT capable (fail-closed,
+// so a probe/skew miss never FALSELY advertises a node as vm-schedulable).
+func TestVMBackendAvailableFromInfo(t *testing.T) {
+	cond := func(typ string, st runtimev1.ConditionStatus) *runtimev1.RuntimeCondition {
+		return &runtimev1.RuntimeCondition{Type: typ, Status: st}
+	}
+	cases := []struct {
+		name string
+		info *runtimev1.GetRuntimeInfoResponse
+		want bool
+	}{
+		{"vm available", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
+			cond("SandboxBackend", runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
+			cond("VMBackendAvailable", runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
+		}}, true},
+		{"vm unavailable", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
+			cond("VMBackendAvailable", runtimev1.ConditionStatus_CONDITION_STATUS_FALSE),
+		}}, false},
+		{"condition missing (older runtimed, pre-B1)", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
+			cond("SandboxBackend", runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
+		}}, false},
+		{"nil response", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := vmBackendAvailableFromInfo(tc.info); got != tc.want {
+				t.Errorf("vmBackendAvailableFromInfo = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
