@@ -25,7 +25,9 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,21 +73,71 @@ func (c *Cluster) Healthz(t *testing.T) string {
 	return string(body)
 }
 
-// WaitPodPhase polls until the pod reaches want, or fails the test at the timeout.
+// terminalPhase reports whether a pod phase is a settled end-state the pod will not
+// leave (Succeeded/Failed). Waiting for one terminal phase while the pod has already
+// reached the other is hopeless, so WaitPodPhase fails fast instead of burning the
+// whole timeout (which, summed across the suite, blows the go-test binary timeout and
+// panics — truncating every later criterion into a false RED).
+func terminalPhase(p corev1.PodPhase) bool {
+	return p == corev1.PodSucceeded || p == corev1.PodFailed
+}
+
+// podFailureDetail summarizes why a pod is not in the wanted phase: the pod-level
+// reason/message plus each container's terminated (exit code + reason) or waiting
+// state. This is the diagnostic a criterion prints on failure, since the kubelet-
+// proxied logs subresource is not reliably available for a crashed native pod.
+func podFailureDetail(pod *corev1.Pod) string {
+	if pod == nil {
+		return "<no pod>"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "phase=%s", pod.Status.Phase)
+	if pod.Status.Reason != "" || pod.Status.Message != "" {
+		fmt.Fprintf(&b, " reason=%q message=%q", pod.Status.Reason, pod.Status.Message)
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		switch {
+		case cs.State.Terminated != nil:
+			tm := cs.State.Terminated
+			fmt.Fprintf(&b, "; container %q terminated exitCode=%d signal=%d reason=%q message=%q",
+				cs.Name, tm.ExitCode, tm.Signal, tm.Reason, tm.Message)
+		case cs.State.Waiting != nil:
+			fmt.Fprintf(&b, "; container %q waiting reason=%q message=%q",
+				cs.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
+		case cs.State.Running != nil:
+			fmt.Fprintf(&b, "; container %q running", cs.Name)
+		}
+	}
+	return b.String()
+}
+
+// WaitPodPhase polls until the pod reaches want; it fails FAST if the pod settles
+// into a DIFFERENT terminal phase (a Failed pod never becomes Succeeded), and fails
+// at the timeout otherwise. Failures carry podFailureDetail (container exit code /
+// reason) so a criterion's cause is visible even when the logs subresource errors.
 func (c *Cluster) WaitPodPhase(t *testing.T, ns, name string, want corev1.PodPhase, timeout time.Duration) *corev1.Pod {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		pod, err := c.Client.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
-		if err == nil && pod.Status.Phase == want {
-			return pod
+		if err == nil {
+			if pod.Status.Phase == want {
+				return pod
+			}
+			// The pod reached the OTHER terminal state; it will never transition to
+			// want, so stop now with the failure detail rather than polling to the
+			// deadline (and cascading into a whole-binary timeout panic).
+			if terminalPhase(pod.Status.Phase) && pod.Status.Phase != want {
+				t.Fatalf("pod %s/%s: want phase %s, reached terminal %s — %s",
+					ns, name, want, pod.Status.Phase, podFailureDetail(pod))
+			}
 		}
 		if time.Now().After(deadline) {
-			last := "<get failed>"
-			if err == nil {
-				last = string(pod.Status.Phase)
+			if err != nil {
+				t.Fatalf("pod %s/%s: want phase %s, last get failed: %v", ns, name, want, err)
 			}
-			t.Fatalf("pod %s/%s: want phase %s, last %s (err=%v)", ns, name, want, last, err)
+			t.Fatalf("pod %s/%s: want phase %s, last %s — %s",
+				ns, name, want, pod.Status.Phase, podFailureDetail(pod))
 		}
 		time.Sleep(time.Second)
 	}
