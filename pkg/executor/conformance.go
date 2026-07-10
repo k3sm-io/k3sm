@@ -22,7 +22,7 @@ import (
 	"path/filepath"
 )
 
-// M10.0 apiserver conformance config (docs/m10-plan.md §M10.0, Res.2/3/4): the
+// M10.0 apiserver conformance config: the
 // audit policy and the admission-control config (PSA PodSecurityConfiguration)
 // the apiserver argv references. Both files TRACK THE BINARY — they are
 // overwritten on every boot (mirroring writeTokenFile, NOT the Stat-guarded

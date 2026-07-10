@@ -33,14 +33,6 @@ The sign-off certifies that you wrote the patch, or otherwise have the right to
 submit it under the project's license. It is required on **every** commit; a PR
 with unsigned commits will not be merged.
 
-> **`Signed-off-by` vs `Co-Authored-By`.** k3sm is developed with AI agent
-> assistance, and agent-authored commits additionally carry a
-> `Co-Authored-By: Claude ...` trailer. That trailer is an **authorship
-> attribution** convention — it is **not** the DCO sign-off and does not certify
-> the DCO. The DCO is certified solely by the human committer's `Signed-off-by`
-> line. Human contributors should add `Signed-off-by` (via `git commit -s`) and
-> should **not** add a `Co-Authored-By: Claude` line.
-
 ## Pull requests
 
 1. Fork (or branch off `main`) and make your change with signed-off commits.

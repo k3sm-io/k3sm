@@ -388,7 +388,7 @@ func podMemoryLimitBytes(pod *corev1.Pod) int64 {
 
 // podQOSClass computes the pod's Quality-of-Service class and maps it to the apis
 // runtime QOSClass enum runtimed uses for best-effort CPU scheduling policy (k3sm
-// has no CFS millicore enforcement — see ../../docs/stockkitty-readiness.md). The
+// has no CFS millicore enforcement). The
 // VK provider REPLACES the kubelet, which is where Status.QOSClass is normally
 // derived, so the provider computes it from the spec here rather than trusting a
 // possibly-unset status field.

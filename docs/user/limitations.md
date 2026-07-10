@@ -7,17 +7,15 @@ rely on k3sm for anything real.
 
 ## Where the full truth lives (cite, don't trust this page alone)
 
-The authoritative, maintainer-facing sources of "what k3sm cannot conform to and why" are two
-registers in the workspace docs directory:
+The authoritative source of "what k3sm cannot conform to and why" is
+[**`docs/conformance-profile.md`**](../conformance-profile.md) — the honest self-assessment mapping
+targeted feature classes to a green synthetic-conformance criterion **or** a documented ceiling. It is
+backed by a maintainer-facing full-surface conformance register (one row per standard Kubernetes
+feature × verdict, with a canonical §By-design non-conformance summary) kept internal to the project.
 
-- **`docs/UPSTREAM-ALIGNMENT.md`** — the full-surface conformance register (one row per standard
-  Kubernetes feature × verdict) and the canonical **§By-design non-conformance summary**.
-- **`docs/conformance-profile.md`** — the honest self-assessment mapping targeted feature classes to
-  a green synthetic-conformance criterion **or** a documented ceiling.
-
-Those two files are the single source of truth; the summaries below restate the user-visible
-consequences so this page stands on its own, but they are deliberately **not** more optimistic than
-the registers. When in doubt, the register wins.
+That profile is the single source of truth; the summaries below restate the user-visible consequences
+so this page stands on its own, but they are deliberately **not** more optimistic than the profile.
+When in doubt, the profile wins.
 
 ## Headline divergences
 
@@ -34,7 +32,7 @@ the registers. When in doubt, the register wins.
   image model (see [images.md](images.md)), not arbitrary OCI Linux images.
 - **k3sm cannot pass CNCF `[Conformance]` / Sonobuoy.** That suite assumes Linux containers, cgroups,
   CNI, and netns; k3sm has none of them. No amount of hardening changes this, and k3sm does not claim a
-  Certified-Kubernetes badge. See `docs/conformance-profile.md`.
+  Certified-Kubernetes badge. See [`conformance-profile.md`](../conformance-profile.md).
 
 ## The honest-gaps matrix
 
@@ -43,8 +41,8 @@ the registers. When in doubt, the register wins.
 All Pods on a node run as the **same unprivileged `_k3sm` OS user**, Seatbelt-confined. There is **no
 per-pod uid isolation**, so same-node Pods share a single OS trust domain. Untrusted or multi-tenant
 workloads must use the **`vm` RuntimeClass** (Virtualization.framework), which gives a real isolation
-boundary. See [vm-runtimeclass.md](vm-runtimeclass.md) for how to opt in, and `docs/privilege-model.md`
-for the full trust-domain rationale. The same framing appears in [concepts.md](concepts.md).
+boundary. See [vm-runtimeclass.md](vm-runtimeclass.md) for how to opt in. The same framing appears in
+[concepts.md](concepts.md).
 
 ### NetworkPolicy is a policy hint, not a security boundary
 

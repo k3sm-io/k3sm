@@ -77,8 +77,8 @@ type Config struct {
 	NodeIP string
 	// BindAddress is the address the apiserver binds. For a MULTI-NODE cluster it is
 	// the node's wireguard mesh IP so a joining node can reach the apiserver and the
-	// AlwaysAllow+token surface is NOT exposed on 0.0.0.0 or the LAN (docs/m3-plan.md
-	// — bind the mesh interface ONLY). Empty falls back to NodeIP (loopback for the
+	// AlwaysAllow+token surface is NOT exposed on 0.0.0.0 or the LAN (bind the mesh
+	// interface ONLY). Empty falls back to NodeIP (loopback for the
 	// single-node dev path), so M1/M2 are unchanged.
 	BindAddress string
 	// ClientCAFile is the apiserver --client-ca-file: the client-CA the apiserver trusts
@@ -141,7 +141,7 @@ type Config struct {
 	// default ENFORCE level from privileged to baseline in the provisioned
 	// PodSecurityConfiguration (see admissionConfigYAML — the SINGLE authority for
 	// the PSA level tuple). The SHIPPED default is false — baseline-WARN only
-	// (warn=baseline + audit=restricted, zero rejection; docs/m10-plan.md Res.2).
+	// (warn=baseline + audit=restricted, zero rejection).
 	// This field is the documented, reversible B71 cutover MECHANISM: flip it (via
 	// `k3sm server --psa-enforce-baseline`) only after a pre-flight scan proves the
 	// cluster clean; reverting the flag reverts the posture on the next boot. PSA
@@ -167,8 +167,8 @@ const (
 	// DefaultKineVersion is the kine module version for the SINGLE-NODE kine->SQLite
 	// path (built CGO_ENABLED=1). It stays pinned at the M0-validated v1.14.2 —
 	// UNCHANGED — so the single-node M1–M5 installed base carries zero datastore-
-	// migration risk. (Per docs/m3-plan.md this pin predates the DESIGN's >=0.15
-	// kine#577 watch-progress fix; that fix is only needed on the multi-writer path.)
+	// migration risk. (This pin predates the DESIGN's >=0.15 kine#577 watch-progress
+	// fix; that fix is only needed on the multi-writer path.)
 	DefaultKineVersion = "v1.14.2"
 	// DefaultKineVersionHA is the kine version for the Postgres-HA datastore path
 	// (M6.0). It is a real, go-install-verified >=0.15 release (the DESIGN floor) that

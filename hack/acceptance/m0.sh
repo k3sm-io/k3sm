@@ -2,7 +2,7 @@
 # k3sm M0 acceptance gate — the runnable proof of the walking skeleton (DESIGN §9 M0,
 # docs/M0-node.md): a kubectl-applied Pod runs as a native macOS process on a real
 # Virtual Kubelet node, and `kubectl delete` kills the process group. Exit 0 iff every
-# check passes. This is what /orchestrate runs to confirm M0 (already done — re-greens it).
+# check passes. This is the gate that confirms M0 (already done — re-greens it).
 #
 # Usage: hack/acceptance/m0.sh
 set -euo pipefail

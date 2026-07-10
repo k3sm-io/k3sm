@@ -67,8 +67,8 @@ const managedLabel = "k3sm.io/managed"
 // Containers' 160–256Mi defaults).
 //
 // MEMORY-ONLY by design — there is deliberately no PodFixed[cpu]. k3sm CPU is
-// best-effort QoS, not CFS-enforced (see ../provider/translate.go podQOSClass and
-// ../../docs/stockkitty-readiness.md), so a cpu Overhead term would misrepresent a
+// best-effort QoS, not CFS-enforced (see ../provider/translate.go podQOSClass),
+// so a cpu Overhead term would misrepresent a
 // reservation k3sm cannot enforce; a cpu term is additive later only if the lab
 // justifies it.
 //

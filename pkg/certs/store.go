@@ -22,7 +22,7 @@ import (
 	"path/filepath"
 )
 
-// Hierarchy is k3sm's two-CA PKI (DESIGN §5c, docs/m3-plan.md): the CLUSTER CA — the
+// Hierarchy is k3sm's two-CA PKI (DESIGN §5c): the CLUSTER CA — the
 // serving anchor a join token pins and the issuer of kubelet-serving certs — and the
 // SIGNING CA that issues system:node client certs. They are independent self-signed
 // roots (the k3s server-ca / client-ca split): a compromised serving key cannot mint

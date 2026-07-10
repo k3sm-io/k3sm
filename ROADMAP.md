@@ -1,8 +1,7 @@
 # k3sm roadmap
 
-> **Hand-written public roadmap narrative.** The machine-derived engineering matrix is the
-> workspace [`ROADMAP.md`](../ROADMAP.md); the per-repo `docs/PHASES.md` are the source of truth.
-> **Never regenerated — edit by hand.** (Do not run `/roadmap-sync` into this file.)
+> **Hand-written public roadmap narrative.** The per-repo `docs/PHASES.md` are the engineering
+> source of truth. **Edit by hand.**
 
 k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/arm64 analog of
 [k3s](https://github.com/k3s-io/k3s). Pods run as **native Darwin processes: zero Linux, no VM in
@@ -17,7 +16,7 @@ code-complete but not yet proven on real hardware, this page says so. The forthc
 
 The engine. Milestones **M0–M6** are code-complete and workspace-integration-green (`hack/ci.sh`);
 M0/M1 are validated end-to-end by their acceptance gates, and the remaining live-hardware and
-two-Mac gates are burned down in M7 (see [`docs/m7-plan.md`](../docs/m7-plan.md)). What works:
+two-Mac gates are burned down in M7. What works:
 
 - **Native Darwin-process pods, zero Linux.** OCI images ship an arm64 Mach-O payload (never
   `/System`); the runtime `posix_spawn`s them **in place at host paths** — no chroot, SIP-compatible.
@@ -47,16 +46,15 @@ The first public release. Two tracks, both launch-blocking:
 
 - **Ship it.** `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server`: a signed, notarized
   binary via goreleaser, GitHub Actions CI across all repos, user docs (`docs/user/`, including
-  `limitations.md`), and the website. See [`docs/m7-plan.md`](../docs/m7-plan.md).
+  `limitations.md`), and the website.
 - **MLX — the differentiator.** Native Apple-Silicon ML serving: schedule and serve ML models on
   Apple GPUs / unified memory with first-class Kubernetes semantics. An **`MLXModel` CRD**
   (`mlx.k3sm.io/v1alpha1`) + an `mlx.k3sm.io/gpu` **extended resource** + an in-binary operator that
   reconciles a model to a StatefulSet + Service serving an OpenAI-compatible API. This is the
   **NVIDIA-GPU-Operator analog for Mac** — running LLMs on a Mac mini as a k3sm pod is the launch
-  story. See [`docs/m8-plan.md`](../docs/m8-plan.md).
+  story.
 
-Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook,
-[`docs/m9-plan.md`](../docs/m9-plan.md).
+Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
 ## Future — post-v0.1.0
 

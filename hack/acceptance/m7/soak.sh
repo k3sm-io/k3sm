@@ -12,7 +12,7 @@
 # would trip the orphan glob — so it needs no phases.json row of its own and is
 # invoked out-of-band in M7.0 (M4's `done` flip excludes it).
 #
-# The REAL soak (per docs/m7-plan.md §M7.0 + the validation-debt table) drives a
+# The REAL soak drives a
 # single-node cluster under object churn and asserts consistent-LIST staleness stays
 # bounded across the new kine pin. NONE of that exists yet.
 #
