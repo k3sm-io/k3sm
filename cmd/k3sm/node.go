@@ -436,6 +436,10 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs
 		// helper mode (a pod must never drive netd).
 		DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
+		// Wire the process default logger so the runtimed provider is not SILENT: it
+		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
+		// wiring logs the operator needs (server.log had no provider lines at all).
+		Logger: slog.Default(),
 	}
 }
 
