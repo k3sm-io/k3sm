@@ -105,6 +105,24 @@ func ensureOwnedDir(dir string, uid int) error {
 	return nil
 }
 
+// EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
+// staff, mode 0755 — so launchd, opening the UserName=_k3sm server job's
+// StandardOut/ErrorPath AS _k3sm, can create/append server.log (the root netd
+// job is unaffected by perms). Owner+mode are re-applied even when the dir
+// already exists, repairing one auto-created root-only by a prior netd spawn.
+func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create log dir %s: %w", dir, err)
+	}
+	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
+		return fmt.Errorf("chown log dir %s to %d:staff: %w", dir, uid, err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // repair a mis-created mode (MkdirAll skips existing)
+		return fmt.Errorf("chmod log dir %s 0755: %w", dir, err)
+	}
+	return nil
+}
+
 // CopyToRootOwned copies src to exactly dst (parent dir created root:wheel 0755)
 // using ditto (preserves the signature/extended attributes the notarized binary
 // needs). dst is the caller's contract — never derived from src's basename, so a
