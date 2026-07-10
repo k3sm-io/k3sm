@@ -27,6 +27,7 @@ INSTALL_DIR="/Library/k3sm"
 BIN="$REPO_ROOT/k3sm-m2"
 EXECSHIM="$REPO_ROOT/k3sm-execshim"
 PATHSHIM="$REPO_ROOT/libk3sm_pathrebase_shim.dylib"
+DNSSHIM="$REPO_ROOT/libk3sm_getaddrinfo_shim.dylib"
 PAYLOAD_DIR="$REPO_ROOT/cp-payload"
 INVOKING_USER="${SUDO_USER:-$(id -un)}"
 KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
@@ -39,7 +40,7 @@ cleanup() {
 	# now does the reap too, but a build/install-failed run never reaches it).
 	pkill -9 -f '/var/lib/k3sm/server/bin/' >/dev/null 2>&1 || true
 	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
-	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" >/dev/null 2>&1 || true
+	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" "$DNSSHIM" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -71,6 +72,11 @@ codesign -s - -f "$EXECSHIM" >/dev/null 2>&1 || true
 # volume mount resolves under the pod data volume (no chroot). Plain clang C dylib.
 "$REPO_ROOT/../runtimed/hack/build-pathshim.sh" "$REPO_ROOT" >/dev/null
 codesign -s - -f "$PATHSHIM" >/dev/null 2>&1 || true
+# Build the getaddrinfo DNS shim BESIDE it — `k3sm install` stages it next to the
+# binary, where the provider resolves it and injects it into each pod so in-pod
+# cluster DNS reaches the per-node resolver on the DNS VIP. Plain clang C dylib.
+"$REPO_ROOT/../darwin-net/hack/build-shim.sh" "$REPO_ROOT" >/dev/null
+codesign -s - -f "$DNSSHIM" >/dev/null 2>&1 || true
 
 # Stage the control-plane payload BESIDE it (cp-payload/: kube-apiserver etc. +
 # kine) — `k3sm install` copies it to /Library/k3sm/bin, from which the _k3sm
