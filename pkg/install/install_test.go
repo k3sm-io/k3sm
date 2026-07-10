@@ -47,6 +47,11 @@ func (f *fakeSystem) EnsureLogDir(dir string, uid uint32) error {
 	return nil
 }
 
+func (f *fakeSystem) ReapOrphans(binPrefix string) error {
+	f.calls = append(f.calls, "ReapOrphans:"+binPrefix)
+	return nil
+}
+
 func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
 	// Record the EXACT dst the installer requested — the contract under test: the
 	// destination must be the fixed installedBinary() path, never src's basename
@@ -203,6 +208,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"RemoveAll:/Library/k3sm",
+		"ReapOrphans:/var/lib/k3sm/server/bin",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
@@ -237,6 +243,12 @@ func TestServerPlistXML(t *testing.T) {
 	mustContain(t, x, "<string>runtimed</string>")
 	mustContain(t, x, "<key>RunAtLoad</key>\n  <true/>")
 	mustContain(t, x, "<key>KeepAlive</key>\n  <true/>")
+	// ExitTimeOut > launchd's 20s default so Stop()'s serial control-plane
+	// teardown finishes before SIGKILL (else the stragglers orphan).
+	mustContain(t, x, "<key>ExitTimeOut</key>\n  <integer>45</integer>")
+	if strings.Contains(string(NetdPlist(Config{})), "ExitTimeOut") {
+		t.Error("netd plist should NOT set ExitTimeOut (it has no child processes to reap)")
+	}
 }
 
 // TestServerPlistRaisesFileLimit proves the server plist raises RLIMIT_NOFILE so

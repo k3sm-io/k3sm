@@ -251,6 +251,23 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 	return nil
 }
 
+// ReapOrphans SIGKILLs any process whose command line references binPrefix — the
+// control-plane children (kine/kube-apiserver/…) left behind when the server
+// daemon died before Stop() reaped them. `pkill -9 -f` matches the absolute
+// <DataRoot>/server/bin/ path, which is specific to this install's spawned
+// children and never a bystander. Exit code 1 (no match) is the common no-op and
+// is NOT an error; only a real failure (>1) is.
+func (darwinSystem) ReapOrphans(binPrefix string) error {
+	cmd := exec.Command("pkill", "-9", "-f", binPrefix)
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return nil // no matching process — nothing to reap
+		}
+		return fmt.Errorf("pkill orphaned control-plane children (%s): %w", binPrefix, err)
+	}
+	return nil
+}
+
 // RemoveAll removes a path tree.
 func (darwinSystem) RemoveAll(path string) error {
 	if err := os.RemoveAll(path); err != nil {

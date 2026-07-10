@@ -33,6 +33,11 @@ KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
 cleanup() {
 	# Always attempt uninstall so a failed run leaves no daemons/aliases behind.
 	"$BIN" uninstall >/dev/null 2>&1 || true
+	# Belt-and-suspenders: reap any control-plane children that outlived the daemon
+	# and flush the DNS VIP, so a mid-run failure can't poison a re-run (uninstall
+	# now does the reap too, but a build/install-failed run never reaches it).
+	pkill -9 -f '/var/lib/k3sm/server/bin/' >/dev/null 2>&1 || true
+	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
 	rm -f "$BIN" "$EXECSHIM" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
 }

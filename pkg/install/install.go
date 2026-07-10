@@ -114,6 +114,13 @@ type System interface {
 	WriteUserKubeconfig(targetUser string, contents []byte) error
 	// RemoveAll removes a path tree (the install dir on uninstall).
 	RemoveAll(path string) error
+	// ReapOrphans SIGKILLs any lingering process whose executable path is under
+	// binPrefix (the control-plane children the server spawns at <DataRoot>/
+	// server/bin) — the uninstall backstop for children that outlived the daemon
+	// (a Stop() that didn't finish before launchd's SIGKILL, or a server crash;
+	// each child is in its own process group so launchd's job-kill misses it).
+	// A no-op when nothing matches.
+	ReapOrphans(binPrefix string) error
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -486,6 +493,11 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			}
 		}
 	}
+	// Backstop: reap any control-plane children that outlived the booted-out
+	// server daemon (a Stop() cut short by launchd's SIGKILL, or a crash). They
+	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
+	// kine ports + the SQLite DB, breaking the next install.
+	note(sys.ReapOrphans(filepath.Join(cfg.DataRoot, "server", "bin")))
 	if firstErr != nil {
 		return fmt.Errorf("uninstall: %w", firstErr)
 	}
@@ -556,6 +568,10 @@ func ServerPlist(cfg Config) []byte {
 		StdoutPath:       filepath.Join(LogDir, "server.log"),
 		StderrPath:       filepath.Join(LogDir, "server.log"),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
+		// Give Stop() room to reap the serial control-plane teardown before launchd
+		// SIGKILLs the job (default 20s ≈ the worst-case 4×drainGrace, which orphans
+		// the not-yet-reaped children). 45s clears it with margin.
+		ExitTimeOut: 45,
 		// Server-only: raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes
 		// against a real fd table, not launchd's 256 default. Binds at bootstrap,
 		// not on kickstart -k — see the serverFileLimit reload contract above.
@@ -604,6 +620,13 @@ type launchdPlist struct {
 	// SoftFileLimit, when > 0, emits SoftResourceLimits + HardResourceLimits with
 	// NumberOfFiles (RLIMIT_NOFILE) at this value. 0 (netd) omits both.
 	SoftFileLimit int
+	// ExitTimeOut, when > 0, is the launchd ExitTimeOut (seconds) — how long
+	// bootout waits after SIGTERM before SIGKILL. The server needs longer than
+	// launchd's 20s default: its Stop() tears the control-plane children down
+	// SERIALLY (apiserver→scheduler→KCM→kine, up to 4×drainGrace), and a SIGKILL
+	// mid-teardown orphans the not-yet-reaped children (own process groups). 0
+	// omits the key (launchd default).
+	ExitTimeOut int
 }
 
 // renderPlist serializes p to a launchd XML property list. String values are
@@ -630,6 +653,9 @@ func renderPlist(p launchdPlist) []byte {
 
 	writeKeyBool(&b, "RunAtLoad", p.RunAtLoad)
 	writeKeyBool(&b, "KeepAlive", p.KeepAlive)
+	if p.ExitTimeOut > 0 {
+		writeKeyInt(&b, "ExitTimeOut", p.ExitTimeOut)
+	}
 	if p.SoftFileLimit > 0 {
 		// Emit BOTH Soft and Hard NumberOfFiles: a soft limit may never exceed the
 		// hard one, and an MDM-managed Mac may set a finite launchd hard limit that
