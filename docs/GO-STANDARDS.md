@@ -1,8 +1,7 @@
 # k3sm Go standards
 
-The shared coding standards for every `k3sm.io/*` repo. This file is the **canonical
-source** (in the `workspace` repo); `/sync-standards` copies it verbatim into each repo's
-`docs/GO-STANDARDS.md`, which that repo's `CLAUDE.md` imports. Edit it here, then re-sync.
+The shared coding standards for every `k3sm.io/*` repo, kept identical across the four
+modules.
 
 Targets **darwin/arm64, macOS 26+**. Go **1.25.x** across all modules.
 
@@ -88,7 +87,5 @@ hack/verify-boilerplate.sh  # every .go file carries the Apache-2.0 header
 go mod tidy                 # no diff
 ```
 Keep commits small and focused. **Sign off every commit** for the Developer Certificate of Origin (see
-`DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line. End commit messages
-with the `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` trailer — that trailer is
-authorship attribution, **not** the DCO sign-off (the committer's `Signed-off-by` certifies the DCO).
+`DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line certifying the DCO.
 Don't push unless asked.

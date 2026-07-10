@@ -36,7 +36,7 @@ const tokenPrefix = "K10"
 // BootstrapUser / BootstrapGroup are the identity a join token authenticates as on
 // the bootstrap endpoint. It is DELIBERATELY NOT admin / system:masters: a join
 // token grants only the right to submit a node-password + CSR and receive a
-// node-scoped credential, never the cluster-admin kubeconfig (docs/m3-plan.md).
+// node-scoped credential, never the cluster-admin kubeconfig.
 const (
 	BootstrapUser  = "system:k3sm-bootstrap"
 	BootstrapGroup = "system:k3sm-bootstrappers"

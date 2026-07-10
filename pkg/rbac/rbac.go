@@ -46,8 +46,8 @@ const (
 const systemNodesGroup = "system:nodes"
 
 // ConformanceNamespace / ConformanceServiceAccount name the ServiceAccount the
-// in-pod-kubectl reference path runs as (docs/stockkitty-readiness.md →
-// TestM2_InPodKubectl, the snapshotManager workload). Provision binds it to the
+// in-pod-kubectl reference path runs as (TestM2_InPodKubectl, the snapshotManager
+// workload). Provision binds it to the
 // minimal in-pod reader Role so that path keeps working once the authorizer is
 // Node,RBAC (default-deny). They are EXPORTED so the M2 e2e / in-pod test binds the
 // SAME names — one source of truth, not two hard-coded copies that can drift.

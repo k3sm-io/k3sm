@@ -16,8 +16,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// M2 synthetic conformance criteria (DESIGN §9 M2; docs/stockkitty-readiness.md →
-// the assertion→feature map). Each TestM2_<Criterion> is a fails-before/passes-
+// M2 synthetic conformance criteria (DESIGN §9 M2). Each TestM2_<Criterion> is a
+// fails-before/passes-
 // after unit named so a red test points to exactly one stockkitty feature class;
 // the integration gate hack/acceptance/m2.sh enumerates this set and turns a
 // missing OR skipped required criterion RED (the non-vacuous guard). These assert
@@ -382,7 +382,7 @@ func TestM2_ImagePullSecrets(t *testing.T) {
 // is untested under the VK provider). Kept visible as a checklist item.
 func TestM2_DaemonSet(t *testing.T) {
 	Up(t)
-	t.Skip("DEFERRED: DaemonSet scheduling is not yet a k3sm feature class (see docs/stockkitty-readiness.md); tracked, not yet implemented")
+	t.Skip("DEFERRED: DaemonSet scheduling is not yet a k3sm feature class; tracked, not yet implemented")
 }
 
 // --- M2 helpers ---------------------------------------------------------------

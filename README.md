@@ -49,7 +49,7 @@ pkg/loadbalancer/ client-side apiserver load balancer (HA)
 
 ## Develop
 ```sh
-# from the workspace root /Users/operator/Code/k3sm-io (go.work spans all four modules)
+# from the workspace root where the four repos are cloned as siblings (go.work spans all four modules)
 go build ./...
 go test ./...
 cd k3sm && CGO_ENABLED=1 go build ./...   # k3sm embeds kine → cgo

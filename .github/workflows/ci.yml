@@ -11,7 +11,7 @@ name: CI
 on:
   # CI DISABLED — no auto-run. macOS runners are billable and we are not spending
   # on CI for now (operator directive 2026-07-02). Manual-only via workflow_dispatch;
-  # re-enable by restoring `pull_request:`. See docs/BACKLOG.md CI-disabled note.
+  # re-enable by restoring `pull_request:`.
   workflow_dispatch:
 permissions:
   contents: read

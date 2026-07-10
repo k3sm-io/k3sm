@@ -1,10 +1,9 @@
 # Synthetic conformance gate
 
-The **stockkitty-driven** acceptance spec: assertions that exercise every Kubernetes feature class the
-`~/stockkitty` reference workload needs, built from tiny native test binaries with **no dependency on
-stockkitty's proprietary images**. It proves *feature-class coverage* (deterministic, CI-able) — **not**
-image-level stockkitty compatibility (the amd64-Linux images are handled only by the M5 `vm` path). Rationale +
-the full feature-gap matrix: `../../../../docs/stockkitty-readiness.md`.
+The **reference-workload-driven** acceptance spec: assertions that exercise every Kubernetes feature class a
+representative reference workload needs, built from tiny native test binaries with **no dependency on any
+proprietary images**. It proves *feature-class coverage* (deterministic, CI-able) — **not** image-level
+compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
 
 ## How it wires in (no parallel gate family)
 
@@ -13,7 +12,7 @@ the full feature-gap matrix: `../../../../docs/stockkitty-readiness.md`.
   and the one cluster harness is `e2e/harness.go` (`Up()` / `Cluster`). The per-criterion funcs are
   `TestM<n>_<Criterion>` in `e2e/m2_test.go` / `e2e/m3_test.go`; `e2e/main_test.go` builds the helper binaries.
 - The milestone gate stays **`hack/acceptance/m<n>.sh`**, registered in `hack/acceptance/phases.json` — the
-  manifest `/orchestrate` reads. `m<n>.sh` brings the cluster up (reuse `hack/lib/clusterup.sh` `server_up`,
+  manifest the release process reads. `m<n>.sh` brings the cluster up (reuse `hack/lib/clusterup.sh` `server_up`,
   already `CGO_ENABLED=1`) and runs the conformance assertions for that milestone via the shared guard in
   `hack/lib/conformance.sh` (mirrors how `m1.sh` delegates to `go test -tags e2e -run TestM1`).
 - Assertions are **build-tagged Go test functions named per criterion** — each is the
@@ -37,9 +36,9 @@ the full feature-gap matrix: `../../../../docs/stockkitty-readiness.md`.
   Succeeded/Failed). The `vm`-slice Linux image is **digest-pinned**. The golden ConfigMap payload is
   `e2e/testdata/nats.conf`.
 
-## Assertion → stockkitty feature (the contract)
+## Assertion → reference-workload feature (the contract)
 
-| test (named per criterion) | proves | stockkitty feature | milestone / tier |
+| test (named per criterion) | proves | reference-workload feature | milestone / tier |
 |---|---|---|---|
 | `TestM2_ConfigMapMount` | configMap mounted as a file (content intact) | `nats.conf` ConfigMap | M2 / integration |
 | `TestM2_SecretMount` | secret mounted read-only, **mode 0400** | `git-ssh-key` Secret | M2 / integration |

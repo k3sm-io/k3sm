@@ -24,7 +24,7 @@ limitations under the License.
 //
 // The Homebrew formula / goreleaser config / brew post_install kickstart hook /
 // notarization + designated-requirement entitlements that DRIVE these commands
-// are the M4 packaging follow-up (DESIGN §5c) — out of scope here.
+// are the packaging follow-up (DESIGN §5c) — out of scope here.
 package install
 
 import (
@@ -206,10 +206,10 @@ type artifact struct {
 	user  string // user name for kindServiceUser/kindKubeconfig; empty otherwise
 	// assertExists records whether the path is expected on disk TODAY. It is
 	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
-	// + relocated k3sm-netd): M7.1-d1/d3 own moving cp/kine off DataRoot into
-	// InstallDir, so those paths do not exist yet. The manifest proves the
-	// DISPOSITION (InstallDir-covered), not on-disk presence — d1/d3 light them up
-	// with no manifest change.
+	// + relocated k3sm-netd): the packaging follow-up owns moving cp/kine off
+	// DataRoot into InstallDir, so those paths do not exist yet. The manifest
+	// proves the DISPOSITION (InstallDir-covered), not on-disk presence — that
+	// follow-up lights them up with no manifest change.
 	assertExists bool
 }
 
@@ -231,8 +231,8 @@ func artifactManifest(cfg Config) []artifact {
 		// The k3sm binary copied into InstallDir — covered by the sweep, not
 		// removed individually.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedBinary(), assertExists: true},
-		// FORWARD-DECLARED (M7.1-d1/d3): the cp-payload bin tree + relocated
-		// k3sm-netd land under InstallDir once d1/d3 move them off DataRoot. They
+		// FORWARD-DECLARED: the cp-payload bin tree + relocated k3sm-netd land
+		// under InstallDir once the packaging follow-up moves them off DataRoot. They
 		// do NOT exist on disk today (cp/kine land under DataRoot at runtime), so
 		// existence is NOT asserted; the InstallDir sweep already covers them.
 		{kind: kindDir, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin"), assertExists: false},

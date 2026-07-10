@@ -121,7 +121,7 @@ func (s *Server) handleCACert(w http.ResponseWriter, r *http.Request) {
 
 // handleJoin runs the worker-join exchange. Every rejection is logged at its boundary
 // with the failure category (token / node-password / csr / enroll) — the four join
-// failures otherwise present identically as "node never Ready" (docs/m3-plan.md).
+// failures otherwise present identically as "node never Ready".
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -110,7 +110,7 @@ func TestM3_NodePort(t *testing.T) {
 // marker to its PVC on first start; after the pod is deleted and the StatefulSet
 // recreates it (same PVC, Retain), the marker is unchanged.
 //
-// Canonical criterion name (synced across docs/stockkitty-readiness.md,
+// Canonical criterion name (synced across
 // hack/acceptance/conformance/README.md, hack/acceptance/m3.sh, hack/lab/m3.sh).
 func TestM3_PVCPersistsAcrossRestart(t *testing.T) {
 	c := Up(t)

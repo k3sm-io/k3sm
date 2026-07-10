@@ -37,7 +37,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-// M10 conformance criteria (docs/m10-plan.md §"Gate machinery", Res.9).
+// M10 conformance criteria.
 //
 // The M10.0 criteria (TestM10_AuditLogLevel, TestM10_PSADefaultWarn) now carry
 // REAL bodies — they run under -tags e2e against a booted `k3sm server`
