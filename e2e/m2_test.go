@@ -44,8 +44,10 @@ import (
 )
 
 // TestM2_ConfigMapMount proves a ConfigMap is mounted as a file with its content
-// intact — the nats-server-config (nats.conf) stockkitty feature. The pod checks a
-// sentinel line of the golden testdata/nats.conf payload at the mount path.
+// intact — the nats-server-config (nats.conf) stockkitty feature. A native workload
+// helper (conftool) reads the mount at its absolute container path; the path-rebase
+// DYLD shim resolves it to the materialized copy under the pod data volume (a
+// compiled helper, NOT /bin/sh — a SIP platform binary cannot load the shim).
 func TestM2_ConfigMapMount(t *testing.T) {
 	c := Up(t)
 	ctx := context.Background()
@@ -61,8 +63,8 @@ func TestM2_ConfigMapMount(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Client.CoreV1().ConfigMaps(conformanceNS).Delete(ctx, cmName, metav1.DeleteOptions{}) })
 
-	pod := shellPod("m2-configmap-mount",
-		fmt.Sprintf(`f=%s/nats.conf; test -f "$f" || { echo "missing $f"; exit 1; }; grep -q 'port: 4222' "$f" || { echo "content mismatch"; cat "$f"; exit 1; }; echo configmap-ok`, mountPath))
+	pod := nativePod("m2-configmap-mount",
+		helperBin(t, "conftool"), "readfile", "-path", mountPath+"/nats.conf", "-contains", "port: 4222")
 	pod.Spec.Volumes = []corev1.Volume{{
 		Name:         "config",
 		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: cmName}}},
@@ -90,8 +92,8 @@ func TestM2_SecretMount(t *testing.T) {
 	t.Cleanup(func() { _ = c.Client.CoreV1().Secrets(conformanceNS).Delete(ctx, secName, metav1.DeleteOptions{}) })
 
 	mode := int32(0o400)
-	pod := shellPod("m2-secret-mount",
-		fmt.Sprintf(`f=%s/id_rsa; m=$(stat -f %%Lp "$f"); [ "$m" = "400" ] || { echo "mode $m, want 400"; exit 1; }; grep -q SENTINEL "$f" || { echo "content mismatch"; exit 1; }; echo secret-ok`, mountPath))
+	pod := nativePod("m2-secret-mount",
+		helperBin(t, "conftool"), "readfile", "-path", mountPath+"/id_rsa", "-contains", "SENTINEL", "-mode", "0400")
 	pod.Spec.Volumes = []corev1.Volume{{
 		Name:         "git",
 		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secName, DefaultMode: &mode}},
@@ -105,8 +107,8 @@ func TestM2_SecretMount(t *testing.T) {
 // /dev/shm (snapshot gRPC) stockkitty feature.
 func TestM2_EmptyDir(t *testing.T) {
 	c := Up(t)
-	pod := shellPod("m2-emptydir",
-		`d=/scratch; echo conformance > "$d/probe" || exit 1; [ "$(cat "$d/probe")" = conformance ] || exit 1; echo emptydir-ok`)
+	pod := nativePod("m2-emptydir",
+		helperBin(t, "conftool"), "writeread", "-path", "/scratch/probe")
 	pod.Spec.Volumes = []corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch"}}
 	applyAndWaitSucceeded(t, c, pod, 90*time.Second)

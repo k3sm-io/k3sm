@@ -109,6 +109,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureLogDir:/var/log/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
+		"CopyToRootOwned:/Library/k3sm/libk3sm_pathrebase_shim.dylib",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-scheduler",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-controller-manager",
@@ -170,16 +171,18 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 			dsts = append(dsts, strings.TrimPrefix(c, "CopyToRootOwned:"))
 		}
 	}
-	if len(dsts) < 2 || dsts[0] != "/Library/k3sm/k3sm" || dsts[1] != "/Library/k3sm/k3sm-execshim" {
-		t.Errorf("copies landed at %v, want the fixed paths [/Library/k3sm/k3sm /Library/k3sm/k3sm-execshim ...] (never the source basename)", dsts)
+	fixedHead := []string{"/Library/k3sm/k3sm", "/Library/k3sm/k3sm-execshim", "/Library/k3sm/" + PathShimName}
+	if len(dsts) < len(fixedHead) || dsts[0] != fixedHead[0] || dsts[1] != fixedHead[1] || dsts[2] != fixedHead[2] {
+		t.Errorf("copies landed at %v, want the fixed head %v (never the source basename)", dsts, fixedHead)
 	}
 	// The payload set lands at InstallDir/bin/<name> — one copy per
-	// executor.PayloadBinaries entry, in order, after the binary + shim.
-	if want := 2 + len(executor.PayloadBinaries()); len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + shim + the payload set)", len(dsts), want)
+	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + path-shim.
+	head := len(fixedHead)
+	if want := head + len(executor.PayloadBinaries()); len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + the payload set)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
-		if got, want := dsts[2+i], "/Library/k3sm/bin/"+name; got != want {
+		if got, want := dsts[head+i], "/Library/k3sm/bin/"+name; got != want {
 			t.Errorf("payload copy %d landed at %q, want %q", i, got, want)
 		}
 	}
@@ -190,6 +193,9 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	}
 	if got := cfg.withDefaults().PayloadSource; got != "/tmp/build/cp-payload" {
 		t.Errorf("PayloadSource default = %q, want the BinarySource sibling dir /tmp/build/cp-payload", got)
+	}
+	if got := cfg.withDefaults().PathShimSource; got != "/tmp/build/"+PathShimName {
+		t.Errorf("PathShimSource default = %q, want the BinarySource sibling /tmp/build/%s", got, PathShimName)
 	}
 }
 

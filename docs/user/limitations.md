@@ -44,6 +44,17 @@ workloads must use the **`vm` RuntimeClass** (Virtualization.framework), which g
 boundary. See [vm-runtimeclass.md](vm-runtimeclass.md) for how to opt in. The same framing appears in
 [concepts.md](concepts.md).
 
+### Volume mounts resolve for native workloads, not `/bin/sh`
+
+k3sm pods run at real host paths with **no chroot / mount namespace**, so a volume mounted at an
+absolute container path (e.g. `/etc/nats`) is materialized under the pod data volume and made to
+resolve there by a **`DYLD_INSERT_LIBRARIES` path-rebase shim** that rewrites the mounted prefixes.
+The shim loads into ordinary **native workloads** (Go/C binaries — your app, `nats`, `postgres`), so
+their absolute volume mounts work as expected. It **cannot** load into a **SIP platform binary**
+(`/bin/sh`, `/usr/bin/*`) — macOS strips `DYLD_INSERT_LIBRARIES` from those — so a shell script that
+reads a mounted file at its absolute path won't see it. Ship your workload as a compiled binary (the
+native k3sm model), not a `/bin/sh`-driven image, for mounted config/secret/scratch volumes.
+
 ### NetworkPolicy is a policy hint, not a security boundary
 
 NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with

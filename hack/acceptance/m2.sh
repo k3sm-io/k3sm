@@ -26,6 +26,7 @@ NETD_SOCK="/var/lib/k3sm/run/netd.sock"
 INSTALL_DIR="/Library/k3sm"
 BIN="$REPO_ROOT/k3sm-m2"
 EXECSHIM="$REPO_ROOT/k3sm-execshim"
+PATHSHIM="$REPO_ROOT/libk3sm_pathrebase_shim.dylib"
 PAYLOAD_DIR="$REPO_ROOT/cp-payload"
 INVOKING_USER="${SUDO_USER:-$(id -un)}"
 KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
@@ -38,7 +39,7 @@ cleanup() {
 	# now does the reap too, but a build/install-failed run never reaches it).
 	pkill -9 -f '/var/lib/k3sm/server/bin/' >/dev/null 2>&1 || true
 	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
-	rm -f "$BIN" "$EXECSHIM" >/dev/null 2>&1 || true
+	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -59,6 +60,12 @@ codesign -s - -f "$BIN" >/dev/null 2>&1 || true
 # the workspace root (go.work spans the runtimed module).
 ( cd "$REPO_ROOT/.." && CGO_ENABLED=1 go build -o "$EXECSHIM" k3sm.io/runtimed/cmd/k3sm-execshim )
 codesign -s - -f "$EXECSHIM" >/dev/null 2>&1 || true
+# Build the path-rebase DYLD shim BESIDE it — `k3sm install` stages the
+# BinarySource's libk3sm_pathrebase_shim.dylib sibling next to the installed binary,
+# where runtimed resolves it and injects it into a mounting pod so an absolute
+# volume mount resolves under the pod data volume (no chroot). Plain clang C dylib.
+"$REPO_ROOT/../runtimed/hack/build-pathshim.sh" "$REPO_ROOT" >/dev/null
+codesign -s - -f "$PATHSHIM" >/dev/null 2>&1 || true
 
 # Stage the control-plane payload BESIDE it (cp-payload/: kube-apiserver etc. +
 # kine) — `k3sm install` copies it to /Library/k3sm/bin, from which the _k3sm
