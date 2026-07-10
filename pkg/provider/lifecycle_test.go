@@ -319,3 +319,39 @@ func TestLifecycleHooksExecHTTP(t *testing.T) {
 		}
 	})
 }
+
+// TestDeletePodReportsTerminatedForPromptForceDelete proves DeletePod fires the VK
+// status callback with every container Terminated. VK's PodController force-deletes
+// a deleted pod from the API IMMEDIATELY only when running(status)==false (all
+// container states Terminated); otherwise it falls back to waiting the FULL
+// deletionGracePeriodSeconds. Without the terminal emit the pod lingers the entire
+// grace even though runtimed already stopped it — the M2 GracefulStop failure.
+func TestDeletePodReportsTerminatedForPromptForceDelete(t *testing.T) {
+	r, _ := newLifecycleFake(t, nil)
+	var mu sync.Mutex
+	var emitted []*corev1.Pod
+	r.notify = func(p *corev1.Pod) { mu.Lock(); emitted = append(emitted, p); mu.Unlock() }
+
+	pod := lifecyclePod("del", 30, corev1.Container{Name: "c0", Command: []string{"/web"}})
+	if err := r.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if err := r.DeletePod(context.Background(), pod); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(emitted) == 0 {
+		t.Fatal("DeletePod fired no status callback — VK can't force-delete promptly and waits the full grace")
+	}
+	last := emitted[len(emitted)-1]
+	if len(last.Status.ContainerStatuses) == 0 {
+		t.Fatal("final DeletePod status carries no container statuses — VK running() stays true (delayed force-delete)")
+	}
+	for _, cs := range last.Status.ContainerStatuses {
+		if cs.State.Terminated == nil {
+			t.Errorf("container %q not Terminated in the final status — VK running() stays true, force-delete waits the grace", cs.Name)
+		}
+	}
+}
