@@ -116,7 +116,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm/bin/kine",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
+		"Bootout:io.k3sm.netd",
 		"Bootstrap:io.k3sm.netd",
+		"Bootout:io.k3sm.server",
 		"Bootstrap:io.k3sm.server",
 		"WriteUserKubeconfig:alice",
 	}
@@ -132,6 +134,14 @@ func TestInstallOrchestration(t *testing.T) {
 	// netd must be bootstrapped BEFORE the server (the server depends on the helper).
 	if idx(f.calls, "Bootstrap:io.k3sm.netd") >= idx(f.calls, "Bootstrap:io.k3sm.server") {
 		t.Error("netd must be bootstrapped before the server")
+	}
+	// Each daemon is BOOTED OUT before it is (re)bootstrapped, so a reinstall/upgrade
+	// always restarts the FRESH on-disk binary instead of leaving a stale daemon
+	// (launchctl bootstrap does not re-exec an updated binary on an already-loaded job).
+	for _, label := range []string{"io.k3sm.netd", "io.k3sm.server"} {
+		if idx(f.calls, "Bootout:"+label) >= idx(f.calls, "Bootstrap:"+label) {
+			t.Errorf("%s must be booted out before it is bootstrapped (fresh-binary restart)", label)
+		}
 	}
 	// The kubeconfig is owned by the human, never root.
 	if f.kubeUser != "alice" || f.kubeUser == "root" {

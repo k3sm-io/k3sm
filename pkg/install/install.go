@@ -413,11 +413,20 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 
-	// 4. Bootstrap in manifest order: netd FIRST (root helper), then the server
-	//    (depends on it) — the manifest lists netd before server.
+	// 4. (Re)start in manifest order: netd FIRST (root helper), then the server
+	//    (depends on it) — the manifest lists netd before server. Each label is
+	//    BOOTED OUT first (idempotent — a not-loaded label is a no-op), then
+	//    bootstrapped: `launchctl bootstrap` on an ALREADY-loaded label does NOT
+	//    re-exec an updated on-disk binary — the stale daemon keeps running the old
+	//    code, so a reinstall/upgrade (or a live rebuild between acceptance runs)
+	//    would silently serve the superseded binary. bootout blocks until the old
+	//    job unloads, so the following bootstrap always (re)starts the FRESH binary.
 	for _, a := range m {
 		if a.kind != kindDaemon {
 			continue
+		}
+		if err := sys.LaunchctlBootout(a.label); err != nil {
+			return fmt.Errorf("install: bootout stale %s before (re)bootstrap: %w", a.label, err)
 		}
 		if err := sys.LaunchctlBootstrap(a.label); err != nil {
 			return fmt.Errorf("install: bootstrap %s: %w", a.label, err)
