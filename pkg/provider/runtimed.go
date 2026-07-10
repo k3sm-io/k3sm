@@ -549,7 +549,40 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 		// outlive the pod, and a deleted pod must never be re-spawned.
 		t.cancelRestarts()
 	}
+	// Report the pod's containers as terminated to the VK callback so the
+	// PodController force-deletes it from the API IMMEDIATELY. VK's
+	// syncPodInProvider force-deletes at once only when running(status)==false (all
+	// container states Terminated); otherwise it waits the FULL
+	// deletionGracePeriodSeconds (its delayed-delete fallback, podcontroller.go).
+	// runtimed already stopped the containers (r.rt.DeletePod is synchronous), so
+	// this is accurate, not optimistic. Fired AFTER the track-forget (above) so the
+	// status stream can't race a stale "running" event back in — emitTerminated
+	// calls the callback directly, independent of the tracked set.
+	r.emitTerminated(pod)
 	return nil
+}
+
+// emitTerminated fires the VK status callback with pod marked fully terminated —
+// every container State.Terminated — so VK's running() predicate returns false and
+// its PodController force-deletes the pod from the API without waiting the grace.
+// Direct-to-callback (not emit) because the pod is already forgotten by DeletePod.
+func (r *runtimedRuntime) emitTerminated(pod *corev1.Pod) {
+	cb := r.callback()
+	if cb == nil {
+		return
+	}
+	p := pod.DeepCopy()
+	p.Status.Phase = corev1.PodSucceeded
+	now := metav1.Now()
+	cs := make([]corev1.ContainerStatus, 0, len(p.Spec.Containers))
+	for _, c := range p.Spec.Containers {
+		cs = append(cs, corev1.ContainerStatus{
+			Name:  c.Name,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{FinishedAt: now, Reason: "Completed"}},
+		})
+	}
+	p.Status.ContainerStatuses = cs
+	cb(p)
 }
 
 // GetPodStatus returns the named pod's status, NotFound if it is unknown.
