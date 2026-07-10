@@ -82,9 +82,14 @@ type System interface {
 	// EnsureServiceUser idempotently creates name as a no-login system user
 	// (home = DefaultDataRoot, owned by it) and returns its uid.
 	EnsureServiceUser(name string) (uid uint32, err error)
-	// CopyToRootOwned copies src into dstDir as root:wheel 0755 and returns the
-	// installed path (dstDir/base(src)).
-	CopyToRootOwned(src, dstDir string) (dst string, err error)
+	// CopyToRootOwned copies src to EXACTLY dst (creating dst's parent dir
+	// root:wheel 0755), leaving dst root:wheel 0755 with signature/xattrs
+	// preserved. dst is the full installed path — NEVER derived from src's
+	// basename: the LaunchDaemon plists exec the fixed installedBinary() path, so
+	// a build artifact named e.g. `k3sm-m2` must still land at InstallDir/k3sm (a
+	// basename-derived dst bricks both daemons with launchd's unrecoverable
+	// "Missing executable" — the live M2-gate failure this contract fixes).
+	CopyToRootOwned(src, dst string) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
@@ -305,10 +310,11 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	}
 	cfg.Logger.Info("ensured service user", "user", cfg.ServiceUser, "uid", uid)
 
-	// 2. Copy the binary into the root-owned install dir (both daemons exec it).
-	//    It lands under InstallDir, so the InstallDir sweep covers it on uninstall.
-	if _, err := sys.CopyToRootOwned(cfg.BinarySource, cfg.InstallDir); err != nil {
-		return fmt.Errorf("install: copy binary to %s: %w", cfg.InstallDir, err)
+	// 2. Copy the binary to the EXACT path the plists exec (installedBinary()),
+	//    regardless of the source artifact's name. It lands under InstallDir, so
+	//    the InstallDir sweep covers it on uninstall.
+	if err := sys.CopyToRootOwned(cfg.BinarySource, cfg.installedBinary()); err != nil {
+		return fmt.Errorf("install: copy binary to %s: %w", cfg.installedBinary(), err)
 	}
 
 	// 3. Render + write both plists, in manifest (install) order.

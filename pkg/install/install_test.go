@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -39,9 +40,14 @@ func (f *fakeSystem) EnsureServiceUser(name string) (uint32, error) {
 	return 271, nil
 }
 
-func (f *fakeSystem) CopyToRootOwned(src, dstDir string) (string, error) {
-	f.calls = append(f.calls, "CopyToRootOwned:"+dstDir)
-	return dstDir + "/k3sm", nil
+func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
+	// Record the EXACT dst the installer requested — the contract under test: the
+	// destination must be the fixed installedBinary() path, never src's basename
+	// (the live M2-gate failure: a `k3sm-m2` artifact landed at
+	// /Library/k3sm/k3sm-m2 while the plists exec'd /Library/k3sm/k3sm, and
+	// launchd invalidated both daemons with "Missing executable").
+	f.calls = append(f.calls, "CopyToRootOwned:"+dst)
+	return nil
 }
 
 func (f *fakeSystem) WriteLaunchDaemon(plistPath string, _ []byte) error {
@@ -88,7 +94,7 @@ func TestInstallOrchestration(t *testing.T) {
 
 	want := []string{
 		"EnsureServiceUser:_k3sm",
-		"CopyToRootOwned:/Library/k3sm",
+		"CopyToRootOwned:/Library/k3sm/k3sm",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootstrap:io.k3sm.netd",
@@ -114,6 +120,29 @@ func TestInstallOrchestration(t *testing.T) {
 	}
 	if !strings.Contains(f.kubeContent, "token:") {
 		t.Error("admin kubeconfig must carry the shared bearer token")
+	}
+}
+
+// TestInstallBinaryLandsAtFixedPath is the regression for the live M2-gate
+// failure: the gate builds the binary as `k3sm-m2`, and the old CopyToRootOwned
+// derived the destination from the SOURCE basename — landing /Library/k3sm/k3sm-m2
+// while both plists exec /Library/k3sm/k3sm, so launchd invalidated both daemons
+// with the unrecoverable "Missing executable". The installer must request the
+// EXACT installedBinary() destination regardless of the artifact's name.
+func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
+	f := &fakeSystem{}
+	cfg := Config{BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	found := ""
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "CopyToRootOwned:") {
+			found = strings.TrimPrefix(c, "CopyToRootOwned:")
+		}
+	}
+	if found != "/Library/k3sm/k3sm" {
+		t.Errorf("binary copied to %q, want the fixed plist-exec path /Library/k3sm/k3sm (never the source basename)", found)
 	}
 }
 
@@ -284,9 +313,8 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 
 	var gaps []string
 
-	// Files copied in by CopyToRootOwned (the binary → InstallDir/k3sm).
-	for _, dstDir := range recorded(installCalls, "CopyToRootOwned:") {
-		path := dstDir + "/k3sm" // the fake's installed path
+	// Files copied in by CopyToRootOwned (the recorded value IS the installed path).
+	for _, path := range recorded(installCalls, "CopyToRootOwned:") {
 		disp, known := fileDispByPath(m, path)
 		if !known {
 			gaps = append(gaps, "off-manifest install: "+path)
@@ -389,8 +417,8 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// plist, or the InstallDir tree (the CopyToRootOwned dst). Catches a
 		// RemoveAll reaching into /Library or a home dir for a path k3sm never made.
 		created := toSet(recorded(installCalls, "WriteLaunchDaemon:"))
-		for _, dstDir := range recorded(installCalls, "CopyToRootOwned:") {
-			created[dstDir] = true // the InstallDir tree (the sweep root)
+		for _, path := range recorded(installCalls, "CopyToRootOwned:") {
+			created[filepath.Dir(path)] = true // the InstallDir tree (the sweep root)
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {

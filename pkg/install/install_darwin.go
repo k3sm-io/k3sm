@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // darwinSystem is the production System: it performs the privileged operations
@@ -103,27 +105,34 @@ func ensureOwnedDir(dir string, uid int) error {
 	return nil
 }
 
-// CopyToRootOwned copies src into dstDir (created root:wheel 0755) using ditto
-// (preserves the signature/extended attributes the notarized binary needs) and
-// returns the installed path.
-func (darwinSystem) CopyToRootOwned(src, dstDir string) (string, error) {
+// CopyToRootOwned copies src to exactly dst (parent dir created root:wheel 0755)
+// using ditto (preserves the signature/extended attributes the notarized binary
+// needs). dst is the caller's contract — never derived from src's basename, so a
+// build artifact named `k3sm-m2` still lands at the installedBinary() path the
+// LaunchDaemon plists exec. A final X_OK access check fails the install fast if
+// the copy somehow left dst non-executable (the alternative is launchd's
+// unrecoverable "Missing executable" job invalidation at bootstrap).
+func (darwinSystem) CopyToRootOwned(src, dst string) error {
+	dstDir := filepath.Dir(dst)
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return "", fmt.Errorf("create install dir %s: %w", dstDir, err)
+		return fmt.Errorf("create install dir %s: %w", dstDir, err)
 	}
 	if err := os.Chown(dstDir, 0, 0); err != nil {
-		return "", fmt.Errorf("chown install dir %s root:wheel: %w", dstDir, err)
+		return fmt.Errorf("chown install dir %s root:wheel: %w", dstDir, err)
 	}
-	dst := filepath.Join(dstDir, filepath.Base(src))
 	if out, err := exec.Command("ditto", src, dst).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("ditto %s -> %s: %w: %s", src, dst, err, out)
+		return fmt.Errorf("ditto %s -> %s: %w: %s", src, dst, err, out)
 	}
 	if err := os.Chown(dst, 0, 0); err != nil {
-		return "", fmt.Errorf("chown %s root:wheel: %w", dst, err)
+		return fmt.Errorf("chown %s root:wheel: %w", dst, err)
 	}
 	if err := os.Chmod(dst, 0o755); err != nil {
-		return "", fmt.Errorf("chmod %s 0755: %w", dst, err)
+		return fmt.Errorf("chmod %s 0755: %w", dst, err)
 	}
-	return dst, nil
+	if err := unix.Access(dst, unix.X_OK); err != nil {
+		return fmt.Errorf("installed binary %s is not executable (launchd would invalidate the daemons): %w", dst, err)
+	}
+	return nil
 }
 
 // WriteLaunchDaemon writes the plist root:wheel 0644.
