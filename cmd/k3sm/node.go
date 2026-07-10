@@ -370,11 +370,35 @@ func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
 // absent — so a from-source/dev run without the staged shim leaves absolute mount
 // paths reaching the host (the pre-shim behavior) rather than failing to inject.
 func resolvePathShim() string {
+	return resolveSiblingDylib(install.PathShimName)
+}
+
+// resolveDNSShim returns the getaddrinfo DNS shim dylib installed beside the k3sm
+// binary, or "" when absent (a from-source/dev run without it leaves pods on the
+// system resolver — cluster names NXDOMAIN, but bring-up proceeds).
+func resolveDNSShim() string {
+	return resolveSiblingDylib(install.DNSShimName)
+}
+
+// firstNonEmpty returns the first non-empty string, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// resolveSiblingDylib returns the absolute path of name next to the running k3sm
+// executable when it exists as a file, else "" (graceful: a missing pod-support
+// dylib disables its feature rather than failing the node).
+func resolveSiblingDylib(name string) string {
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
 	}
-	p := filepath.Join(filepath.Dir(exe), install.PathShimName)
+	p := filepath.Join(filepath.Dir(exe), name)
 	if fi, err := os.Stat(p); err != nil || fi.IsDir() {
 		return ""
 	}
@@ -395,10 +419,13 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		clusterDomain = dns.DefaultClusterDomain
 	}
 	return provider.RuntimedConfig{
-		NodeName:      opts.nodeName,
-		NodeIP:        opts.nodeIP,
-		Root:          opts.podRoot,
-		DyldShim:      opts.dnsShim,
+		NodeName: opts.nodeName,
+		NodeIP:   opts.nodeIP,
+		Root:     opts.podRoot,
+		// Prefer an explicit --dns-shim; else resolve the staged shim next to the
+		// binary (the packaged server plist passes no --dns-shim). Empty leaves pods
+		// on the system resolver.
+		DyldShim:      firstNonEmpty(opts.dnsShim, resolveDNSShim()),
 		PathShim:      resolvePathShim(),
 		ResolverVIP:   resolverVIP,
 		ClusterDomain: clusterDomain,
