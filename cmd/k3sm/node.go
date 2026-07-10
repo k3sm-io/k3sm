@@ -365,6 +365,22 @@ func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
 // suffix the provider injects as K3SM_DNS_* env so cluster Service names resolve
 // (B18); it MUST match the resolver's served zone. It is pure (no I/O) so the VIP +
 // domain wiring is unit-tested directly.
+// resolvePathShim returns the path-rebase DYLD shim dylib installed beside the
+// k3sm binary (/Library/k3sm/<PathShimName> in the packaged layout), or "" when
+// absent — so a from-source/dev run without the staged shim leaves absolute mount
+// paths reaching the host (the pre-shim behavior) rather than failing to inject.
+func resolvePathShim() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	p := filepath.Join(filepath.Dir(exe), install.PathShimName)
+	if fi, err := os.Stat(p); err != nil || fi.IsDir() {
+		return ""
+	}
+	return p
+}
+
 func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
 	resolverVIP := opts.dnsVIP
 	if resolverVIP == "" {
@@ -383,6 +399,7 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		NodeIP:        opts.nodeIP,
 		Root:          opts.podRoot,
 		DyldShim:      opts.dnsShim,
+		PathShim:      resolvePathShim(),
 		ResolverVIP:   resolverVIP,
 		ClusterDomain: clusterDomain,
 		APIServerVIP:  apiServerVIP(),
