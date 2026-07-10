@@ -28,6 +28,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/darwin-net/pkg/netd"
@@ -165,24 +167,98 @@ func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger
 		logger.Warn("no --kubeconfig: privileged-port (<1024) binds will be denied (no authoritative Service set)")
 		return nil, nil, gid
 	}
+
+	// The Service authorizer is populated ASYNCHRONOUSLY. netd is bootstrapped by
+	// launchd BEFORE the unprivileged _k3sm server writes its kubeconfig and brings
+	// up the apiserver, so the Services informer cannot sync at startup. Building it
+	// synchronously here (the previous behavior) failed on the not-yet-present
+	// kubeconfig and left the authorizer nil for the daemon's whole life — so every
+	// <1024 infra-VIP bind (the apiserver ClusterIP :443, the DNS VIP :53) was
+	// denied and cluster DNS never came up. Instead the authorizer starts deny-all
+	// and a background goroutine swaps in the live Service lister once the kubeconfig
+	// exists and its cache syncs (both happen seconds after boot). The netd socket
+	// does NOT wait on this, so a privileged bind attempted before the swap is denied
+	// fail-safe and the caller (netserve/ingresshost) retries it once netd is ready.
+	var mu sync.RWMutex
+	var lister corev1listers.ServiceLister // nil until ready → deny (fail-safe)
+
+	authorize := func(port int, lbOnly bool) bool {
+		mu.RLock()
+		l := lister
+		mu.RUnlock()
+		if l == nil {
+			return false
+		}
+		return serviceDeclaresPort(l, port, lbOnly)
+	}
+	declares = func(port int) bool { return authorize(port, false) }
+	declaresLB = func(port int) bool { return authorize(port, true) }
+
+	go activateServiceAuthorizer(ctx, kubeconfig, logger, func(l corev1listers.ServiceLister) {
+		mu.Lock()
+		lister = l
+		mu.Unlock()
+	})
+
+	return declares, declaresLB, gid
+}
+
+// activateServiceAuthorizer waits for the server's kubeconfig to appear and its
+// apiserver to serve, builds a synced Services informer, then hands the live lister
+// to install so netd can authorize <1024 infra-VIP binds against the real Service
+// set. It RETRIES until the informer syncs (the kubeconfig may be absent, or the
+// apiserver not yet up) or ctx is cancelled — netd must self-heal after the boot
+// race, never permanently deny.
+func activateServiceAuthorizer(ctx context.Context, kubeconfig string, logger *slog.Logger, install func(corev1listers.ServiceLister)) {
+	const retry = 2 * time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		lister, err := startServiceInformer(ctx, kubeconfig)
+		if err != nil {
+			logger.Debug("Service authorizer not ready; <1024 binds denied until the server's kubeconfig + apiserver are up",
+				"kubeconfig", kubeconfig, "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retry):
+				continue
+			}
+		}
+		install(lister)
+		logger.Info("Service authorizer ready: privileged (<1024) infra-VIP binds now authorized against the live Service set",
+			"kubeconfig", kubeconfig)
+		return
+	}
+}
+
+// startServiceInformer loads kubeconfig, builds a Services informer, and blocks on
+// the initial cache sync (bounded, so a not-yet-serving apiserver is a retryable
+// error rather than a hang). It returns a retryable error if the kubeconfig is
+// absent/unreadable, the client can't be built, or the cache doesn't sync in time.
+func startServiceInformer(ctx context.Context, kubeconfig string) (corev1listers.ServiceLister, error) {
+	if _, err := os.Stat(kubeconfig); err != nil {
+		return nil, fmt.Errorf("stat kubeconfig: %w", err)
+	}
 	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		logger.Error("load kubeconfig for Service authorizer; <1024 binds will be denied", "err", err)
-		return nil, nil, gid
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
-		logger.Error("build client for Service authorizer; <1024 binds will be denied", "err", err)
-		return nil, nil, gid
+		return nil, fmt.Errorf("build client: %w", err)
 	}
 	factory := informers.NewSharedInformerFactory(cs, 30*time.Second)
+	svcInformer := factory.Core().V1().Services().Informer()
 	lister := factory.Core().V1().Services().Lister()
 	factory.Start(ctx.Done())
-	factory.WaitForCacheSync(ctx.Done())
-
-	declares = func(port int) bool { return serviceDeclaresPort(lister, port, false) }
-	declaresLB = func(port int) bool { return serviceDeclaresPort(lister, port, true) }
-	return declares, declaresLB, gid
+	syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if !cache.WaitForCacheSync(syncCtx.Done(), svcInformer.HasSynced) {
+		return nil, fmt.Errorf("service cache did not sync before timeout")
+	}
+	return lister, nil
 }
 
 // serviceDeclaresPort reports whether a Service in the cache declares port —
