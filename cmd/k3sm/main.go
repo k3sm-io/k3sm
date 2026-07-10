@@ -83,6 +83,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "k3sm install:", err)
 			os.Exit(1)
 		}
+	case "payload":
+		if err := runPayload(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm payload:", err)
+			os.Exit(1)
+		}
 	case "uninstall":
 		if err := runUninstall(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm uninstall:", err)

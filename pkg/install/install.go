@@ -38,6 +38,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 // Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
@@ -124,6 +126,13 @@ type Config struct {
 	// (sandbox.FindExecShim) — without it the server dies at boot in a KeepAlive
 	// crash-loop. Defaults to the k3sm-execshim sibling of BinarySource.
 	ExecShimSource string
+	// PayloadSource is a directory holding the control-plane payload
+	// (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/
+	// kubectl + kine) staged by `k3sm payload <dir>`. Install copies it to
+	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
+	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
+	// Defaults to the cp-payload sibling dir of BinarySource.
+	PayloadSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
@@ -160,6 +169,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ExecShimSource == "" && c.BinarySource != "" {
 		c.ExecShimSource = filepath.Join(filepath.Dir(c.BinarySource), "k3sm-execshim")
+	}
+	if c.PayloadSource == "" && c.BinarySource != "" {
+		c.PayloadSource = filepath.Join(filepath.Dir(c.BinarySource), "cp-payload")
 	}
 	return c
 }
@@ -255,6 +267,13 @@ func artifactManifest(cfg Config) []artifact {
 		// first probe) — the runtimed backend the server plist hardcodes cannot
 		// boot without it. Covered by the InstallDir sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedExecShim(), assertExists: true},
+		// The control-plane payload staged into InstallDir/bin (the daemon boot
+		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
+		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-apiserver"), assertExists: true},
+		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-scheduler"), assertExists: true},
+		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-controller-manager"), assertExists: true},
+		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kubectl"), assertExists: true},
+		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kine"), assertExists: true},
 		// FORWARD-DECLARED: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
 		// do NOT exist on disk today (cp/kine land under DataRoot at runtime), so
@@ -342,6 +361,18 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     M2-gate failure mode), so a missing shim is an install-time error.
 	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.installedExecShim()); err != nil {
 		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.installedExecShim(), err)
+	}
+	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
+	//     payload binary is absent: the daemon boot otherwise falls back to
+	//     `gh`/`go` acquisition, which cannot exist under launchd as _k3sm (the
+	//     second live M2-gate failure mode). Produce the payload with
+	//     `k3sm payload <dir>` in a shell that has gh + go.
+	for _, name := range executor.PayloadBinaries() {
+		src := filepath.Join(cfg.PayloadSource, name)
+		dst := filepath.Join(cfg.InstallDir, "bin", name)
+		if err := sys.CopyToRootOwned(src, dst); err != nil {
+			return fmt.Errorf("install: stage control-plane payload %s: %w (run `k3sm payload %s` first — the launchd daemon cannot acquire binaries itself)", name, err, cfg.PayloadSource)
+		}
 	}
 
 	// 3. Render + write both plists, in manifest (install) order.
