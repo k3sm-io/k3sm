@@ -170,8 +170,11 @@ func (darwinSystem) LaunchctlKickstart(label string) error {
 	return nil
 }
 
-// WriteUserKubeconfig writes contents to targetUser's ~/.kube/config, owned by
-// targetUser (NOT root) so the human can kubectl without sudo.
+// WriteUserKubeconfig MERGES the k3sm admin context (contents) into targetUser's
+// ~/.kube/config, owned by targetUser (NOT root) so the human can kubectl without
+// sudo. Any pre-existing clusters/contexts are preserved — install must never
+// clobber a developer's other kubeconfigs (uninstall likewise leaves the file).
+// The write is atomic (temp + rename) so a crash mid-write can't corrupt the file.
 func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
 	u, err := user.Lookup(targetUser)
 	if err != nil {
@@ -185,8 +188,35 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 	}
 	_ = os.Chown(kubeDir, uid, gid)
 	path := filepath.Join(kubeDir, "config")
-	if err := os.WriteFile(path, contents, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+
+	existing, rerr := os.ReadFile(path)
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return fmt.Errorf("read existing kubeconfig %s: %w", path, rerr)
+	}
+	merged, err := mergeAdminKubeconfig(existing, contents, adminContextName)
+	if err != nil {
+		return fmt.Errorf("merge admin kubeconfig into %s: %w", path, err)
+	}
+
+	tmp, err := os.CreateTemp(kubeDir, ".k3sm-kubeconfig-*")
+	if err != nil {
+		return fmt.Errorf("create temp kubeconfig: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp kubeconfig: %w", err)
+	}
+	if _, err := tmp.Write(merged); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp kubeconfig: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp kubeconfig: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename kubeconfig into place: %w", err)
 	}
 	if err := os.Chown(path, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %s: %w", path, targetUser, err)
