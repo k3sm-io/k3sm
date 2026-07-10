@@ -56,12 +56,17 @@ fi
 
 # m2.1 — the root helper is up: socket present, 0660, root-owned (peer-auth posture:
 # the SCM_CREDS uid verifier admits ONLY the _k3sm uid on top of these perms).
+# Bounded retry: launchd spawns the daemon asynchronously after bootstrap, so the
+# socket appears moments after install returns — checking once would race it.
 sock_ok=no
-if [ -S "$NETD_SOCK" ]; then
-	mode="$(stat -f '%Lp' "$NETD_SOCK" 2>/dev/null || echo '')"
-	owner="$(stat -f '%Su' "$NETD_SOCK" 2>/dev/null || echo '')"
-	[ "$mode" = "660" ] && [ "$owner" = "root" ] && sock_ok=yes
-fi
+for _ in $(seq 1 30); do
+	if [ -S "$NETD_SOCK" ]; then
+		mode="$(stat -f '%Lp' "$NETD_SOCK" 2>/dev/null || echo '')"
+		owner="$(stat -f '%Su' "$NETD_SOCK" 2>/dev/null || echo '')"
+		[ "$mode" = "660" ] && [ "$owner" = "root" ] && sock_ok=yes && break
+	fi
+	sleep 1
+done
 ladder "$([ "$sock_ok" = yes ] && echo ok || echo no)" "m2.1  netd socket present, 0660, root-owned"
 
 # m2.2 — both daemons loaded into the system launchd domain.
