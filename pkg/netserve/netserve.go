@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -254,20 +255,21 @@ func (s *Server) runResolver(ctx context.Context) {
 	zone := serviceZone{services: lister, slices: sliceLister, domain: domain}
 	resolver := newClusterResolver(s.dnsVIP, domain, zone, systemForwarder{}, s.log)
 
-	if err := s.binder.ensureAlias(ctx, s.dnsVIP); err != nil {
-		s.log.Error("ensure DNS VIP lo0 alias; per-node resolver disabled", "vip", s.dnsVIP.String(), "err", err)
-		return
-	}
+	// The DNS VIP is a privileged (:53 < 1024) bind that goes through the netd
+	// helper, whose Service authorizer is populated ASYNCHRONOUSLY after boot (it
+	// authorizes :53 only once the kube-dns Service is in its cache — see
+	// cmd/k3sm/netd.go buildServiceSet). netd and this server are separate launchd
+	// daemons racing at startup, so the first bind attempt is routinely denied. A
+	// one-shot bind (the previous behavior) permanently disabled cluster DNS on that
+	// transient denial; retry with backoff so the resolver comes up as soon as netd
+	// self-heals, rather than staying dark for the daemon's life.
 	ap := netip.AddrPortFrom(s.dnsVIP, dns.DefaultDNSPort)
-	udp, err := s.binder.listenUDP(ctx, ap)
+	udp, tcp, err := s.bindDNSVIP(ctx, ap)
 	if err != nil {
-		s.log.Error("bind DNS VIP 53/UDP; per-node resolver disabled", "addr", ap.String(), "err", err)
-		return
-	}
-	tcp, err := s.binder.listenTCP(ctx, ap)
-	if err != nil {
-		_ = udp.Close()
-		s.log.Error("bind DNS VIP 53/TCP; per-node resolver disabled", "addr", ap.String(), "err", err)
+		if ctx.Err() == nil {
+			s.log.Error("bind DNS VIP; per-node resolver disabled after retries (check the netd helper's Service authorizer + the kube-dns Service)",
+				"addr", ap.String(), "err", err)
+		}
 		return
 	}
 	s.log.Info("per-node cluster DNS resolver listening", "vip", ap.String(), "domain", resolver.domain)
@@ -278,6 +280,64 @@ func (s *Server) runResolver(ctx context.Context) {
 	if err := rg.Wait(); err != nil && ctx.Err() == nil {
 		s.log.Error("per-node cluster DNS resolver stopped", "err", err)
 	}
+}
+
+// dnsBindRetrySchedule backs off the DNS-VIP bind while the netd helper's Service
+// authorizer catches up after boot (netd is a separate launchd daemon whose <1024
+// authorizer syncs seconds after this server starts). The cumulative window
+// (~2.5 min) comfortably spans the kubeconfig-write + apiserver-up + kube-dns
+// Service-create sequence netd must observe before it authorizes :53.
+var dnsBindRetrySchedule = []time.Duration{
+	2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second,
+}
+
+// bindDNSVIP ensures the DNS VIP lo0 alias and binds 53/UDP+53/TCP, retrying the
+// whole sequence with backoff (dnsBindRetrySchedule) until it succeeds or ctx is
+// cancelled. The <1024 bind flows through the netd helper, which denies it until
+// its Service authorizer syncs — so a transient denial is expected at boot and must
+// not permanently disable the resolver. On success it returns both listeners; on
+// ctx cancellation or exhausted retries it returns the last error (both closed).
+func (s *Server) bindDNSVIP(ctx context.Context, ap netip.AddrPort) (net.PacketConn, net.Listener, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		udp, tcp, err := s.bindDNSVIPOnce(ctx, ap)
+		if err == nil {
+			return udp, tcp, nil
+		}
+		lastErr = err
+		if attempt >= len(dnsBindRetrySchedule) {
+			return nil, nil, lastErr
+		}
+		delay := dnsBindRetrySchedule[attempt]
+		s.log.Warn("DNS VIP bind failed (netd authorizer likely not yet synced); retrying",
+			"addr", ap.String(), "attempt", attempt+1, "retry-in", delay, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
+// bindDNSVIPOnce performs a single alias+bind attempt, closing any partial listener
+// so a failed attempt leaks nothing before the caller retries.
+func (s *Server) bindDNSVIPOnce(ctx context.Context, ap netip.AddrPort) (net.PacketConn, net.Listener, error) {
+	if err := s.binder.ensureAlias(ctx, s.dnsVIP); err != nil {
+		return nil, nil, fmt.Errorf("ensure DNS VIP lo0 alias: %w", err)
+	}
+	udp, err := s.binder.listenUDP(ctx, ap)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind 53/UDP: %w", err)
+	}
+	tcp, err := s.binder.listenTCP(ctx, ap)
+	if err != nil {
+		_ = udp.Close()
+		return nil, nil, fmt.Errorf("bind 53/TCP: %w", err)
+	}
+	return udp, tcp, nil
 }
 
 // CorefilePath is where Run writes the rendered CoreDNS configuration (an
