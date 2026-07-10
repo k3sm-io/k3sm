@@ -118,6 +118,12 @@ type Config struct {
 	// BinarySource is the k3sm binary to install (typically the running
 	// executable). Required.
 	BinarySource string
+	// ExecShimSource is the k3sm-execshim helper binary to install NEXT TO the
+	// k3sm binary. The server plist hardcodes --runtime runtimed, whose Seatbelt
+	// backend resolves the shim beside the running executable
+	// (sandbox.FindExecShim) — without it the server dies at boot in a KeepAlive
+	// crash-loop. Defaults to the k3sm-execshim sibling of BinarySource.
+	ExecShimSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
@@ -152,12 +158,21 @@ func (c Config) withDefaults() Config {
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
 	}
+	if c.ExecShimSource == "" && c.BinarySource != "" {
+		c.ExecShimSource = filepath.Join(filepath.Dir(c.BinarySource), "k3sm-execshim")
+	}
 	return c
 }
 
 // installedBinary is the path the k3sm binary is copied to.
 func (c Config) installedBinary() string {
 	return filepath.Join(c.InstallDir, "k3sm")
+}
+
+// installedExecShim is the path the k3sm-execshim helper is copied to — beside
+// the binary, the first place sandbox.FindExecShim probes.
+func (c Config) installedExecShim() string {
+	return filepath.Join(c.InstallDir, "k3sm-execshim")
 }
 
 // plistPath is the LaunchDaemon plist path for a label.
@@ -236,6 +251,10 @@ func artifactManifest(cfg Config) []artifact {
 		// The k3sm binary copied into InstallDir — covered by the sweep, not
 		// removed individually.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedBinary(), assertExists: true},
+		// The k3sm-execshim Seatbelt helper beside it (sandbox.FindExecShim's
+		// first probe) — the runtimed backend the server plist hardcodes cannot
+		// boot without it. Covered by the InstallDir sweep.
+		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedExecShim(), assertExists: true},
 		// FORWARD-DECLARED: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
 		// do NOT exist on disk today (cp/kine land under DataRoot at runtime), so
@@ -315,6 +334,14 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//    the InstallDir sweep covers it on uninstall.
 	if err := sys.CopyToRootOwned(cfg.BinarySource, cfg.installedBinary()); err != nil {
 		return fmt.Errorf("install: copy binary to %s: %w", cfg.installedBinary(), err)
+	}
+	// 2b. Copy the k3sm-execshim Seatbelt helper beside it. Fail fast when the
+	//     source shim is absent: the server plist hardcodes --runtime runtimed,
+	//     whose backend resolves the shim next to the executable — without it the
+	//     server dies at boot in an invisible KeepAlive crash-loop (the live
+	//     M2-gate failure mode), so a missing shim is an install-time error.
+	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.installedExecShim()); err != nil {
+		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.installedExecShim(), err)
 	}
 
 	// 3. Render + write both plists, in manifest (install) order.
