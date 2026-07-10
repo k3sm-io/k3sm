@@ -42,6 +42,11 @@ func (f *fakeSystem) EnsureServiceUser(name string) (uint32, error) {
 	return 271, nil
 }
 
+func (f *fakeSystem) EnsureLogDir(dir string, uid uint32) error {
+	f.calls = append(f.calls, "EnsureLogDir:"+dir)
+	return nil
+}
+
 func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
 	// Record the EXACT dst the installer requested — the contract under test: the
 	// destination must be the fixed installedBinary() path, never src's basename
@@ -96,6 +101,7 @@ func TestInstallOrchestration(t *testing.T) {
 
 	want := []string{
 		"EnsureServiceUser:_k3sm",
+		"EnsureLogDir:/var/log/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
