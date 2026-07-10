@@ -2,9 +2,10 @@
 #
 # This config proves the RELEASE ARTIFACT SHAPE for the single k3sm binary. It is
 # deliberately an unsigned snapshot: codesigning/notarization and the Homebrew-tap
-# push are the HUMAN M7.1 slice and are stubbed-disabled below (goreleaser
-# schema-validates live `signs:`/`notarize:`/`brews:` stanzas against certs/tokens
-# that are absent in this repo, so they are kept as commented reference blocks).
+# push require signing credentials held outside this repo and are stubbed-disabled
+# below (goreleaser schema-validates live `signs:`/`notarize:`/`brews:` stanzas
+# against certs/tokens that are absent in this repo, so they are kept as commented
+# reference blocks).
 #
 # The live archive proof runs in CI (goreleaser is not installed in the lab); the
 # local acceptance gate hack/acceptance/B58.sh reports PENDING when the tool is
@@ -55,11 +56,11 @@ archives:
       # the legal files. This is the honestly-stageable SNAPSHOT set — only what
       # an in-tree producer exists for.
       # k3sm-netd is a byte-identical copy of the single k3sm Mach-O (one-Mach-O
-      # doctrine, m7-plan Res.7). NOTE: the installed launchd plist execs `k3sm
-      # netd` (the subcommand of the primary binary — pkg/install/install.go), so
-      # this copy is not the root-executed path today; it is shipped to satisfy
-      # the Res.7 archive manifest. Whether the live M7.1 slice installs it as a
-      # distinct helper or drops it is a human decision recorded there.
+      # doctrine). NOTE: the installed launchd plist execs `k3sm netd` (the
+      # subcommand of the primary binary — pkg/install/install.go), so this copy
+      # is not the root-executed path today; it is shipped to satisfy the archive
+      # manifest. Whether the signing/notarization slice installs it as a distinct
+      # helper or drops it is a human decision recorded with that work.
       # strip_parent flattens the nested dist/... source path to the archive root
       # so the tar member is `k3sm-netd`, not `dist/.../k3sm-netd`.
       - src: "dist/k3sm_darwin_arm64*/k3sm-netd"

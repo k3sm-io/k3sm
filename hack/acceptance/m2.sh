@@ -89,7 +89,7 @@ kube_owner="$(stat -f '%Su' "$KUBECONFIG_PATH" 2>/dev/null || echo '')"
 ladder "$([ "$kube_owner" = "$INVOKING_USER" ] && echo ok || echo no)" "m2.3  admin kubeconfig owned by $INVOKING_USER (NOT root)"
 
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
-# named per its stockkitty-readiness feature class. The NON-VACUOUS guard
+# named per its reference-workload feature class. The NON-VACUOUS guard
 # (hack/lib/conformance.sh) enumerates the REQUIRED criterion set below and turns
 # the gate RED on any criterion that is missing, failed, OR skipped — closing the
 # old guard's PARTIAL-coverage and ALL-SKIP false-greens. Deferred criteria

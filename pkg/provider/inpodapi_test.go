@@ -37,7 +37,7 @@ import (
 )
 
 // M2.4 in-cluster API access. The driving reference is the snapshot-manager's
-// in-pod kubectl (docs/stockkitty-readiness.md → TestM2_InPodKubectl): a pod must
+// in-pod kubectl (TestM2_InPodKubectl): a pod must
 // reach kubernetes.default.svc with a projected SA token minted for ITS OWN
 // ServiceAccount, the apiserver serving CA, and the namespace, all at the
 // canonical in-pod paths. These unit tests fake the apiserver client (the

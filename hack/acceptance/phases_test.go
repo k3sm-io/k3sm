@@ -184,10 +184,10 @@ func TestPhasesGatePathsResolve(t *testing.T) {
 
 // TestLabSkeletonHonesty pins the load-bearing honesty contract of the lab
 // skeletons: with K3SM_LAB unset they SKIP and exit 0 ("PENDING — not a pass");
-// under K3SM_LAB=1 they report not-yet-implemented and exit NON-ZERO. /orchestrate
-// runs a manual lab gate under K3SM_LAB=1 and trusts exit 0 as "milestone proven",
-// so a placeholder that exited 0 there would fake-green a milestone whose real proof
-// is still owed.
+// under K3SM_LAB=1 they report not-yet-implemented and exit NON-ZERO. The release
+// process runs a manual lab gate under K3SM_LAB=1 and trusts exit 0 as "milestone
+// proven", so a placeholder that exited 0 there would falsely pass a milestone whose
+// real proof is still owed.
 //
 // The skeleton set is DERIVED from phases.json — every row that is BOTH manual:true
 // AND skeleton:true (Res. 1). Keying on manual:true alone would wrongly select the
@@ -234,9 +234,10 @@ func TestLabSkeletonHonesty(t *testing.T) {
 
 // TestNonManualSkeletonsAlwaysRed pins the complementary honesty contract for
 // manual:false skeleton gates (Res. 2). A CI-runnable gate (e.g. the M7 umbrella +
-// M8) is run DIRECTLY by /orchestrate, which trusts exit 0 as "milestone proven" —
-// so a not-yet-real skeleton for such a row must exit NON-ZERO UNCONDITIONALLY (the
-// hack/lab/*.sh K3SM_LAB-unset→exit-0 pattern would fake-green a non-manual row).
+// M8) is run DIRECTLY by the release process, which trusts exit 0 as "milestone
+// proven" — so a not-yet-real skeleton for such a row must exit NON-ZERO
+// UNCONDITIONALLY (the hack/lab/*.sh K3SM_LAB-unset→exit-0 pattern would falsely
+// pass a non-manual row).
 // Each such gate carries a greppable "# K3SM-SKELETON" sentinel so the always-red
 // intent is auditable; this test asserts both the sentinel's presence and the
 // non-zero exit under BOTH K3SM_LAB unset and K3SM_LAB=1.
@@ -268,7 +269,7 @@ func TestNonManualSkeletonsAlwaysRed(t *testing.T) {
 			}
 			for _, lab := range []string{"", "1"} {
 				if code := runGate(t, path, lab); code == 0 {
-					t.Errorf("%s (K3SM_LAB=%q): exit 0 — a manual:false skeleton must exit non-zero UNCONDITIONALLY until real (Res. 2), or /orchestrate fake-greens the milestone", rel, lab)
+					t.Errorf("%s (K3SM_LAB=%q): exit 0 — a manual:false skeleton must exit non-zero UNCONDITIONALLY until real (Res. 2), or the release process falsely passes the milestone", rel, lab)
 				}
 			}
 		})

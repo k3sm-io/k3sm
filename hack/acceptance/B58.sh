@@ -8,7 +8,7 @@
 #
 # This is an integration-tier, lab-pending gate: goreleaser is not installed in
 # the lab. When absent the gate reports PENDING and exits NON-ZERO (it must never
-# fake-green, or red-at-main becomes unprovable). In CI (${CI} set) goreleaser
+# falsely pass, or red-at-main becomes unprovable). In CI (${CI} set) goreleaser
 # MUST be present — its absence is a hard FAIL.
 #
 # Usage: hack/acceptance/B58.sh
@@ -51,7 +51,7 @@ if ! command -v goreleaser >/dev/null 2>&1; then
 	fi
 	echo "PENDING (lab-tier): goreleaser not installed — the archive proof runs in CI." >&2
 	echo "B58: build-shape checks passed ($PASS ok); the live snapshot/archive proof is deferred to CI." >&2
-	# Non-zero so an un-run archive proof never fake-greens the gate.
+	# Non-zero so an un-run archive proof never falsely passes the gate.
 	exit 3
 fi
 

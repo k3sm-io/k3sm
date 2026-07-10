@@ -35,10 +35,9 @@ Service-backed webhook delivery, needs the `--datapath` tier (a `url`+host-port
 webhook works rootless).
 
 This is a **capability register, not a restatement**: it cites, and does not
-duplicate, [`docs/UPSTREAM-ALIGNMENT.md`](../../docs/UPSTREAM-ALIGNMENT.md) (the
-full-surface conformance register + the canonical §By-design "why k3sm cannot
-pass `[Conformance]`") and [`docs/conformance-profile.md`](../../docs/conformance-profile.md)
-(the honest self-assessment). This is **not** a CNCF `[Conformance]`/Sonobuoy
+duplicate, the repo's `docs/conformance-profile.md` (the honest self-assessment)
+and the internal full-surface conformance register (the canonical "why k3sm cannot
+pass `[Conformance]`" summary). This is **not** a CNCF `[Conformance]`/Sonobuoy
 pass.
 
 ## The two tiers & the root dependency

@@ -19,7 +19,7 @@
 #                                      it. The gate runs a representative smoke-soak
 #                                      (K3SM_M6_SOAK_DURATION, default 20s); the real
 #                                      production-trust decision sets it long (e.g.
-#                                      K3SM_M6_SOAK_DURATION=24h) per docs/m3-plan.md.
+#                                      K3SM_M6_SOAK_DURATION=24h) for a production-trust run.
 #   (e) M6_SecondServerJoinsReconstructsCAs — the M6.1 acceptance: server B reconstructed
 #                                      the IDENTICAL cluster CA from server A's
 #                                      AES-256-GCM bootstrap bundle (both admin

@@ -8,7 +8,7 @@
 # hack/acceptance/m7/ outside the m[0-9]*.sh orphan glob (Res. 5), so it carries no
 # phases.json row of its own.
 #
-# The REAL M7.3 gate (per docs/m7-plan.md §M7.3) asserts: the docs/user/ page
+# The REAL M7.3 gate asserts: the docs/user/ page
 # manifest, a hermetic link-check, yaml-applies (every examples/ manifest applies
 # against a schema check), and a stale-string denylist seeded from the known
 # offenders ("Pre-M0", "private development"). The network-tier external-link job is

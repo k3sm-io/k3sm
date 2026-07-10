@@ -8,7 +8,7 @@
 # under hack/acceptance/m7/ deliberately OUTSIDE the m[0-9]*.sh orphan glob in
 # phases_test.go, so it needs no phases.json row of its own (Res. 5).
 #
-# The REAL M7.2 gate (per docs/m7-plan.md §M7.2) asserts: actionlint + zizmor over
+# The REAL M7.2 gate asserts: actionlint + zizmor over
 # every workflow, a workflow-manifest assert (a required workflow file missing = RED),
 # the self-hosted-trigger allowlist ({schedule, workflow_dispatch, push@main} only),
 # trufflehog registered as a required status check, a symbol-canary liveness assert,
@@ -16,8 +16,8 @@
 #
 # Honesty contract: a manual:false CI-runnable gate skeleton MUST exit non-zero
 # UNCONDITIONALLY (Res. 2) — it is NOT the hack/lab/*.sh K3SM_LAB-unset→exit-0
-# pattern, which would fake-green a non-manual row that /orchestrate runs directly
-# and trusts on exit 0. This stays RED until the real M7.2 CI gate replaces it.
+# pattern, which would falsely pass a non-manual row that is run directly and trusted
+# on exit 0. This stays RED until the real M7.2 CI gate replaces it.
 set -euo pipefail
 echo "M7.2 ci.sh gate: NOT YET IMPLEMENTED — the real GitHub Actions CI gate (actionlint/zizmor + workflow manifest + self-hosted allowlist + trufflehog + canary liveness) is unbuilt; this skeleton is always RED (Res. 2)." >&2
 exit 1

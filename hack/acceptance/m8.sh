@@ -7,10 +7,9 @@
 #
 # This is the M8 row in hack/acceptance/phases.json (gate hack/acceptance/m8.sh, tier
 # integration, requires dev-mac + apple-gpu + network, manual: false, skeleton: true).
-# There is deliberately NO M8-lab row — a GPU dev-mac covers it (docs/m8-plan.md §M8.6,
-# Res. 15).
+# There is deliberately NO M8-lab row — a GPU dev-mac covers it (Res. 15).
 #
-# The REAL M8 proof (per docs/m8-plan.md §M8.6) applies examples/mlxmodel.yaml against
+# The REAL M8 proof applies examples/mlxmodel.yaml against
 # a pinned model repo+revision, waits for status Ready (conditions, not just Phase),
 # gets an OpenAI chat completion via the ClusterIP returning tokens, records TTFT +
 # tokens/sec through the ClusterIP path vs the direct backend, deletes, and asserts

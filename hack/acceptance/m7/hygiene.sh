@@ -9,7 +9,7 @@
 # hack/acceptance/m7/ outside the m[0-9]*.sh orphan glob (Res. 5), so it carries no
 # phases.json row of its own.
 #
-# The REAL M7.5 gate (per docs/m7-plan.md §M7.5) asserts: a scan-clean result (zero
+# The REAL M7.5 gate asserts: a scan-clean result (zero
 # unresolved trufflehog --only-verified findings against the reviewed rotated-
 # credentials baseline — Res. 15), MAINTAINERS/SECURITY content asserts, a
 # repo-settings drift check, and per-repo NOTICE verification. NONE of that exists
