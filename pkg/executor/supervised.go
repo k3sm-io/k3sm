@@ -184,6 +184,12 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := ensureWorkDirs(s.cfg.WorkDir); err != nil {
 		return err
 	}
+	// Seed the workdir bin from a staged install payload FIRST, so the ensure*
+	// steps below find the binaries present and only re-sign — a launchd _k3sm
+	// daemon has neither gh nor a Go toolchain to fall back on.
+	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir); err != nil {
+		return err
+	}
 	if err := ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion); err != nil {
 		return err
 	}
