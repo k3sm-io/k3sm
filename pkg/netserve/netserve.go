@@ -27,6 +27,9 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 
@@ -211,6 +214,17 @@ func (s *Server) Run(ctx context.Context) error {
 	// client, same lifecycle. The table stays empty (allow-everything) until its
 	// informers sync — the documented fail-open — so it never gates bring-up.
 	g.Go(func() error { return s.policyWatch.Run(gctx) })
+	// Provision the canonical kube-system/kube-dns Service BEFORE the resolver binds:
+	// it is the DECLARING SUBJECT the netd port authorizer confirms the privileged
+	// DNS-VIP :53 bind against (exactly as k3sm-ingress is for :80/:443). Without it
+	// netd denies the bind ("no service declares port 53") and the per-node resolver
+	// stays dark — in-pod cluster DNS fails. Best-effort: a failure is logged, not
+	// fatal (the resolver's bind retry outlasts a transient apiserver).
+	if s.dnsVIP.IsValid() {
+		if err := s.ensureDNSService(ctx); err != nil {
+			s.log.Warn("ensure kube-dns Service; netd may deny the DNS VIP bind", "err", err)
+		}
+	}
 	// The per-node cluster DNS resolver. It is best-effort: a bind/serve failure is
 	// logged and the goroutine returns nil so it never tears the Service proxy down
 	// (a node with a degraded resolver still serves ClusterIP/NodePort traffic).
@@ -221,6 +235,42 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil // clean shutdown
 	}
 	return err
+}
+
+// ensureDNSService idempotently provisions kube-system/kube-dns: a selector-less
+// ClusterIP Service pinned to the DNS VIP that declares 53/UDP+TCP. The per-node
+// in-process resolver IS the implementation (there are no endpoints), so the
+// Service exists for two reasons: the netd port authorizer confirms the resolver's
+// privileged :53 VIP bind against a DECLARING Service (an explicit policy chain,
+// never allowed-by-coincidence — like k3sm-ingress for :80/:443), and in-cluster
+// `kube-dns`/`kubernetes.io/name: CoreDNS` discovery resolves. The proxy is
+// exempted from this VIP (WithInfraVIPExemptions) so it never races the resolver
+// for the socket.
+func (s *Server) ensureDNSService(ctx context.Context) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kube-dns",
+			Namespace: "kube-system",
+			Labels: map[string]string{
+				"k3sm.io/managed":               "true",
+				"k8s-app":                       "kube-dns",
+				"kubernetes.io/name":            "CoreDNS",
+				"kubernetes.io/cluster-service": "true",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: s.dnsVIP.String(),
+			Ports: []corev1.ServicePort{
+				{Name: "dns", Port: 53, Protocol: corev1.ProtocolUDP},
+				{Name: "dns-tcp", Port: 53, Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+	if _, err := s.cfg.Client.CoreV1().Services("kube-system").Create(ctx, svc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create kube-dns service %s: %w", s.dnsVIP, err)
+	}
+	return nil
 }
 
 // runResolver brings up the per-node cluster DNS resolver: it ensures the DNS VIP
