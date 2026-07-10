@@ -140,6 +140,76 @@ ladder "$([ "$kube_owner" = "$INVOKING_USER" ] && echo ok || echo no)" "m2.3  ad
 echo "==> [diagnostic] cluster Services (the netd authorizer's Service set):"
 "$INSTALL_DIR/k3sm" kubectl get svc -A -o wide 2>&1 | head -20 || true
 
+# [diagnostic] In-pod DNS path, reproduced from the shell so a red InPodDNS/InPodKubectl
+# pinpoints the broken LAYER without reading server.log. Three independent probes:
+#   (1) STAGING   — is the getaddrinfo shim dylib actually on disk beside the binary?
+#   (2) RESOLVER  — does a raw UDP query to the DNS VIP get answered? (shim-independent)
+#   (3) SHIM E2E  — does a getaddrinfo call with the shim injected + K3SM_DNS_* set
+#                   resolve an unqualified cluster name, exactly as a pod does?
+# If (3) works but the pods don't → injection (env/annotation not reaching the pod);
+# if (2) fails → the resolver; if (1) is missing → staging. Informational, never gates.
+echo "==> [diagnostic] in-pod DNS path (staging / resolver / shim):"
+echo "--- (1) staged pod-support dylibs in $INSTALL_DIR:"
+ls -la "$INSTALL_DIR"/*.dylib 2>&1 || echo "    (no .dylib staged — DNS/path shims absent)"
+DNS_VIP="${K3SM_DNS_VIP:-10.43.0.10}"
+DNS_PROBE_DIR="$(mktemp -d)"
+cat > "$DNS_PROBE_DIR/probe.go" <<'PROBE'
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"time"
+)
+
+// probe direct <vip> <fqdn>  — raw UDP DNS query straight at the VIP (no shim).
+// probe shim <name>          — plain getaddrinfo path (the injected shim, if any, resolves it).
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	switch os.Args[1] {
+	case "direct":
+		vip, fqdn := os.Args[2], os.Args[3]
+		r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "udp", net.JoinHostPort(vip, "53"))
+		}}
+		ips, err := r.LookupHost(ctx, fqdn)
+		if err != nil {
+			fmt.Printf("    RESOLVER FAIL: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("    RESOLVER OK: %s -> %v\n", fqdn, ips)
+	case "shim":
+		ips, err := net.DefaultResolver.LookupHost(ctx, os.Args[2])
+		if err != nil {
+			fmt.Printf("    SHIM FAIL: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("    SHIM OK: %s -> %v\n", os.Args[2], ips)
+	}
+}
+PROBE
+if ( cd "$DNS_PROBE_DIR" && go build -o probe probe.go ) 2>/dev/null; then
+	codesign -s - -f "$DNS_PROBE_DIR/probe" >/dev/null 2>&1 || true
+	echo "--- (2) resolver: raw UDP query to $DNS_VIP:53 for kubernetes.default.svc.cluster.local:"
+	"$DNS_PROBE_DIR/probe" direct "$DNS_VIP" kubernetes.default.svc.cluster.local 2>&1 || true
+	echo "--- (3) shim e2e: getaddrinfo('kubernetes.default.svc') with the staged shim injected:"
+	DNS_SHIM="$INSTALL_DIR/libk3sm_getaddrinfo_shim.dylib"
+	if [ -f "$DNS_SHIM" ]; then
+		DYLD_INSERT_LIBRARIES="$DNS_SHIM" \
+			K3SM_DNS_SERVER="$DNS_VIP" K3SM_DNS_PORT=53 K3SM_DNS_DOMAIN=cluster.local \
+			K3SM_DNS_SEARCH="default.svc.cluster.local svc.cluster.local cluster.local" K3SM_DNS_NDOTS=5 \
+			"$DNS_PROBE_DIR/probe" shim kubernetes.default.svc 2>&1 || true
+	else
+		echo "    (shim not staged at $DNS_SHIM — cannot probe the injected path)"
+	fi
+else
+	echo "    (probe build failed — skipping resolver/shim probes)"
+fi
+rm -rf "$DNS_PROBE_DIR"
+
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
 # named per its reference-workload feature class. The NON-VACUOUS guard
 # (hack/lib/conformance.sh) enumerates the REQUIRED criterion set below and turns
