@@ -50,6 +50,11 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "==> k3sm M2 acceptance (user-space: sudo k3sm install once, then fidelity checks)"
+# RUN-STAMP: a unique wall-clock time + the two repos' git SHAs, so a reader can tell
+# a FRESH run from stale/re-pasted output and see exactly which code version ran (a
+# recurring source of confusion on this live gate). Dirty tree → "+dirty".
+_sha() { local d="$1" s; s="$(git -C "$d" rev-parse --short HEAD 2>/dev/null || echo '?')"; git -C "$d" diff --quiet 2>/dev/null || s="$s+dirty"; printf '%s' "$s"; }
+echo "==> RUN $(date '+%Y-%m-%dT%H:%M:%S%z')  code: k3sm@$(_sha "$REPO_ROOT") runtimed@$(_sha "$REPO_ROOT/../runtimed")"
 
 # Build the single binary CGO_ENABLED=1 (kine sqlite), runtime pinned to runtimed.
 ( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN" ./cmd/k3sm )
