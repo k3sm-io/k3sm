@@ -114,6 +114,14 @@ ladder "$([ "$healthy" = yes ] && echo ok || echo no)" "m2.3  control plane heal
 kube_owner="$(stat -f '%Su' "$KUBECONFIG_PATH" 2>/dev/null || echo '')"
 ladder "$([ "$kube_owner" = "$INVOKING_USER" ] && echo ok || echo no)" "m2.3  admin kubeconfig owned by $INVOKING_USER (NOT root)"
 
+# [diagnostic] The cluster Service set the netd port-authorizer confirms <1024
+# infra-VIP binds against (cmd/k3sm/netd.go): default/kubernetes must declare 443
+# (the API VIP 10.43.0.1) and kube-dns must declare 53 (the DNS VIP 10.43.0.10), or
+# netd denies those binds. Informational only (never gates); it pinpoints an empty /
+# missing Service set behind a DNS/API-VIP bind denial in server.log/netd.log.
+echo "==> [diagnostic] cluster Services (the netd authorizer's Service set):"
+"$INSTALL_DIR/k3sm" kubectl get svc -A -o wide 2>&1 | head -20 || true
+
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
 # named per its reference-workload feature class. The NON-VACUOUS guard
 # (hack/lib/conformance.sh) enumerates the REQUIRED criterion set below and turns

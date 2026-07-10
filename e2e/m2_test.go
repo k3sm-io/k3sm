@@ -35,6 +35,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -240,17 +241,26 @@ func TestM2_Probes(t *testing.T) {
 	})
 }
 
-// TestM2_FsGroup proves securityContext.fsGroup owns the writable mount — the
-// postgres fsGroup feature. The pod asserts the mount's group gid equals fsGroup.
+// TestM2_FsGroup proves the HONEST LIMITATION, not a feature: k3sm has no per-pod
+// uid/gid isolation — every pod runs as the single _k3sm service user
+// (docs/privilege-model.md) — so a foreign securityContext.fsGroup cannot own a
+// mount. The shipped k3sm-reject-foreign-user ValidatingAdmissionPolicy therefore
+// REJECTS such a pod at admission (fail-closed) rather than silently ignoring the
+// fsGroup. The postgres-style "fsGroup owns the volume" workload is a documented
+// ceiling (→ the vm RuntimeClass for real per-pod ownership); this criterion asserts
+// the policy denies it. (Supersedes the earlier expects-fsGroup-works form, which
+// predated the ratified policy and could never pass without removing the VAP.)
 func TestM2_FsGroup(t *testing.T) {
 	c := Up(t)
 	const fsGroup = int64(2000)
-	pod := shellPod("m2-fsgroup",
-		fmt.Sprintf(`g=$(stat -f %%g /data); [ "$g" = "%d" ] || { echo "gid $g, want %d"; exit 1; }; echo fsgroup-ok`, fsGroup, fsGroup))
+	pod := shellPod("m2-fsgroup", "echo fsgroup-should-be-denied-at-admission")
 	pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: ptr(fsGroup)}
-	pod.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
-	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	applyAndWaitSucceeded(t, c, pod, 90*time.Second)
+
+	_ = c.Client.CoreV1().Pods(conformanceNS).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+	_, err := c.Client.CoreV1().Pods(conformanceNS).Create(context.Background(), pod, metav1.CreateOptions{})
+	if !apierrors.IsForbidden(err) {
+		t.Fatalf("pod requesting foreign fsGroup: err = %v, want Forbidden (k3sm-reject-foreign-user VAP — no per-pod uid/gid isolation)", err)
+	}
 }
 
 // TestM2_GracefulStop proves SIGTERM is honored within the grace period — the
