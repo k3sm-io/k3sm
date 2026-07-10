@@ -26,6 +26,7 @@ NETD_SOCK="/var/lib/k3sm/run/netd.sock"
 INSTALL_DIR="/Library/k3sm"
 BIN="$REPO_ROOT/k3sm-m2"
 EXECSHIM="$REPO_ROOT/k3sm-execshim"
+PAYLOAD_DIR="$REPO_ROOT/cp-payload"
 INVOKING_USER="${SUDO_USER:-$(id -un)}"
 KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
 
@@ -33,6 +34,7 @@ cleanup() {
 	# Always attempt uninstall so a failed run leaves no daemons/aliases behind.
 	"$BIN" uninstall >/dev/null 2>&1 || true
 	rm -f "$BIN" "$EXECSHIM" >/dev/null 2>&1 || true
+	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -52,6 +54,13 @@ codesign -s - -f "$BIN" >/dev/null 2>&1 || true
 # the workspace root (go.work spans the runtimed module).
 ( cd "$REPO_ROOT/.." && CGO_ENABLED=1 go build -o "$EXECSHIM" k3sm.io/runtimed/cmd/k3sm-execshim )
 codesign -s - -f "$EXECSHIM" >/dev/null 2>&1 || true
+
+# Stage the control-plane payload BESIDE it (cp-payload/: kube-apiserver etc. +
+# kine) — `k3sm install` copies it to /Library/k3sm/bin, from which the _k3sm
+# daemon's boot seeds its workdir. The daemon has neither gh nor go; staging runs
+# HERE, as the invoking human (whose shell has both — PATH passed through — and
+# whose Go caches stay theirs via -H). Reuses the executor's pinned versions.
+sudo -H -u "$INVOKING_USER" env PATH="$PATH" "$BIN" payload "$PAYLOAD_DIR"
 
 # ── The ONE root step: install both LaunchDaemons. ───────────────────────────
 if "$BIN" install --user "$INVOKING_USER" >/dev/null 2>&1; then

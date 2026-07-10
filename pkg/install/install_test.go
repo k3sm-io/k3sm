@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 // fakeSystem records every privileged seam call in order so a test can assert
@@ -96,6 +98,11 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureServiceUser:_k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
+		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
+		"CopyToRootOwned:/Library/k3sm/bin/kube-scheduler",
+		"CopyToRootOwned:/Library/k3sm/bin/kube-controller-manager",
+		"CopyToRootOwned:/Library/k3sm/bin/kubectl",
+		"CopyToRootOwned:/Library/k3sm/bin/kine",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootstrap:io.k3sm.netd",
@@ -142,13 +149,26 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 			dsts = append(dsts, strings.TrimPrefix(c, "CopyToRootOwned:"))
 		}
 	}
-	if len(dsts) != 2 || dsts[0] != "/Library/k3sm/k3sm" || dsts[1] != "/Library/k3sm/k3sm-execshim" {
-		t.Errorf("copies landed at %v, want the fixed paths [/Library/k3sm/k3sm /Library/k3sm/k3sm-execshim] (never the source basename)", dsts)
+	if len(dsts) < 2 || dsts[0] != "/Library/k3sm/k3sm" || dsts[1] != "/Library/k3sm/k3sm-execshim" {
+		t.Errorf("copies landed at %v, want the fixed paths [/Library/k3sm/k3sm /Library/k3sm/k3sm-execshim ...] (never the source basename)", dsts)
 	}
-	// The shim source defaults to the k3sm-execshim SIBLING of BinarySource — the
-	// gate/goreleaser stage both artifacts side by side.
+	// The payload set lands at InstallDir/bin/<name> — one copy per
+	// executor.PayloadBinaries entry, in order, after the binary + shim.
+	if want := 2 + len(executor.PayloadBinaries()); len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + shim + the payload set)", len(dsts), want)
+	}
+	for i, name := range executor.PayloadBinaries() {
+		if got, want := dsts[2+i], "/Library/k3sm/bin/"+name; got != want {
+			t.Errorf("payload copy %d landed at %q, want %q", i, got, want)
+		}
+	}
+	// The shim/payload sources default to SIBLINGS of BinarySource — the
+	// gate/goreleaser stage all artifacts side by side.
 	if got := cfg.withDefaults().ExecShimSource; got != "/tmp/build/k3sm-execshim" {
 		t.Errorf("ExecShimSource default = %q, want the BinarySource sibling /tmp/build/k3sm-execshim", got)
+	}
+	if got := cfg.withDefaults().PayloadSource; got != "/tmp/build/cp-payload" {
+		t.Errorf("PayloadSource default = %q, want the BinarySource sibling dir /tmp/build/cp-payload", got)
 	}
 }
 

@@ -180,6 +180,15 @@ func runServer(args []string) error {
 		PSAEnforceBaseline: opts.psaEnforceBaseline,
 		Logger:             logger,
 	}
+	// Packaged install: `k3sm install` stages the control-plane payload at
+	// <install-dir>/bin beside the daemon binary; boot seeds the workdir from it
+	// so it never shells out to gh/go (absent under launchd as _k3sm). Dev shells
+	// (no bin/ sibling) keep the acquisition fallbacks.
+	if exe, err := os.Executable(); err == nil {
+		if fi, serr := os.Stat(filepath.Join(filepath.Dir(exe), "bin")); serr == nil && fi.IsDir() {
+			cfg.PayloadBinDir = filepath.Join(filepath.Dir(exe), "bin")
+		}
+	}
 	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
 	// Postgres (DefaultKineVersionHA) and turns on scheduler/KCM leader election so only
 	// one server is active. The executor fail-closes (ErrHARequiresDatastore) if HA is

@@ -69,6 +69,13 @@ type Config struct {
 	// KineVersion is the kine module version to go install. Defaults to
 	// DefaultKineVersion.
 	KineVersion string
+	// PayloadBinDir, when non-empty, is a directory of pre-staged control-plane
+	// binaries (PayloadBinaries: kube-apiserver/scheduler/controller-manager/
+	// kubectl + kine) the boot seeds the workdir bin from BEFORE the gh/go
+	// acquisition fallbacks — the packaged-install path (`k3sm install` stages it
+	// beside the daemon), where a launchd _k3sm daemon has neither gh nor a Go
+	// toolchain. Empty (dev shells) keeps the acquisition fallbacks.
+	PayloadBinDir string
 	// Token is the static bearer token written to the token file + kubeconfig.
 	// Defaults to a generated token when empty.
 	Token string

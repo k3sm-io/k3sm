@@ -110,7 +110,13 @@ func ensureWorkDirs(workDir string) error {
 // ad-hoc signs each so arm64 Mach-O can exec. It is a no-op if they already
 // exist. Mirrors clusterup.sh step 1.
 func ensureControlPlaneBinaries(ctx context.Context, workDir, kubeVersion string) error {
-	bd := binDir(workDir)
+	return ensureControlPlaneBinariesInto(ctx, binDir(workDir), kubeVersion)
+}
+
+// ensureControlPlaneBinariesInto is ensureControlPlaneBinaries against an
+// explicit bin dir — shared by the boot path (the workdir bin) and StagePayload
+// (an install payload dir).
+func ensureControlPlaneBinariesInto(ctx context.Context, bd, kubeVersion string) error {
 	if _, err := os.Stat(filepath.Join(bd, "kube-apiserver")); err == nil {
 		return signBinaries(ctx, bd, cpBinaries) // already downloaded; ensure signed
 	}
@@ -130,7 +136,12 @@ func ensureControlPlaneBinaries(ctx context.Context, workDir, kubeVersion string
 // build disables SQLite, a validated M0 finding) into the workdir bin and ad-hoc
 // signs it. No-op if already present. Mirrors clusterup.sh step 2.
 func ensureKine(ctx context.Context, workDir, kineVersion string) error {
-	bd := binDir(workDir)
+	return ensureKineInto(ctx, binDir(workDir), kineVersion)
+}
+
+// ensureKineInto is ensureKine against an explicit bin dir — shared by the boot
+// path and StagePayload.
+func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	kine := filepath.Join(bd, "kine")
 	if _, err := os.Stat(kine); err == nil {
 		return signBinaries(ctx, bd, []string{"kine"})
@@ -141,6 +152,64 @@ func ensureKine(ctx context.Context, workDir, kineVersion string) error {
 		return fmt.Errorf("build kine %s (CGO_ENABLED=1): %w: %s", kineVersion, err, out)
 	}
 	return signBinaries(ctx, bd, []string{"kine"})
+}
+
+// PayloadBinaries is the full control-plane payload set a packaged install must
+// stage beside the daemon (the boot path otherwise acquires them with gh/go —
+// dev-shell tools a launchd daemon does not have): the kwok-ci/k8s prebuilt
+// binaries plus kine. The single source for `k3sm payload`, `k3sm install`, and
+// the boot-time seed, so the three can never disagree on the set.
+func PayloadBinaries() []string { return append(append([]string{}, cpBinaries...), "kine") }
+
+// StagePayload acquires the full control-plane payload into destDir using the
+// executor's own pinned versions (DefaultKubeVersion via `gh release download`,
+// DefaultKineVersion via `go install`). It is the packaging-side producer: run
+// it where the dev tools exist (a human shell, goreleaser), then hand destDir to
+// `k3sm install`, which stages it beside the daemon; the daemon boot seeds its
+// workdir from the staged copy and never needs gh/go (a launchd _k3sm daemon
+// has neither — the live M2-gate failure this closes).
+func StagePayload(ctx context.Context, destDir string) error {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create payload dir %s: %w", destDir, err)
+	}
+	if err := ensureControlPlaneBinariesInto(ctx, destDir, DefaultKubeVersion); err != nil {
+		return err
+	}
+	return ensureKineInto(ctx, destDir, DefaultKineVersion)
+}
+
+// seedBinDir copies every payload binary present in payloadDir and absent from
+// the workdir bin into it (0755), so the subsequent ensure* steps find them
+// present and only re-sign — never shelling out to gh/go. A missing payloadDir
+// or missing individual binary is NOT an error here: the ensure* fallbacks
+// still run and fail with their own actionable errors (dev shells keep working
+// with no payload at all).
+func seedBinDir(workDir, payloadDir string) error {
+	if payloadDir == "" {
+		return nil
+	}
+	bd := binDir(workDir)
+	if err := os.MkdirAll(bd, 0o755); err != nil {
+		return fmt.Errorf("create bin dir %s: %w", bd, err)
+	}
+	for _, name := range PayloadBinaries() {
+		dst := filepath.Join(bd, name)
+		if _, err := os.Stat(dst); err == nil {
+			continue // already present (a prior boot seeded/acquired it)
+		}
+		src := filepath.Join(payloadDir, name)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // not staged; the ensure* fallback owns the error
+			}
+			return fmt.Errorf("read payload %s: %w", src, err)
+		}
+		if err := os.WriteFile(dst, data, 0o755); err != nil {
+			return fmt.Errorf("seed %s from payload: %w", dst, err)
+		}
+	}
+	return nil
 }
 
 // chmodExec makes every file in dir executable.
