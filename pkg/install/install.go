@@ -92,6 +92,14 @@ type System interface {
 	// basename-derived dst bricks both daemons with launchd's unrecoverable
 	// "Missing executable" — the live M2-gate failure this contract fixes).
 	CopyToRootOwned(src, dst string) error
+	// EnsureLogDir creates (or repairs) the daemons' log directory owned by the
+	// service uid (group staff, 0755) so launchd can open the UserName=_k3sm
+	// server job's StandardOut/ErrorPath AS _k3sm. launchd auto-creates a missing
+	// log dir with root-only perms when the ROOT netd job spawns first — the
+	// _k3sm server job then fails "Service could not initialize" and NEVER
+	// spawns (the live M2-gate failure this fixes). Idempotent: perms/owner are
+	// re-applied on every install, repairing a previously mis-created dir.
+	EnsureLogDir(dir string, uid uint32) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
@@ -347,6 +355,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("install: ensure service user %s: %w", cfg.ServiceUser, err)
 	}
 	cfg.Logger.Info("ensured service user", "user", cfg.ServiceUser, "uid", uid)
+
+	// 1b. The log dir must be writable by the SERVICE user before either daemon
+	//     bootstraps: launchd opens a UserName job's StandardOut/ErrorPath as
+	//     that user, and if the root netd job's spawn auto-creates the dir first
+	//     (root-only perms), the _k3sm server job fails "Service could not
+	//     initialize" and never spawns. Created/repaired idempotently.
+	if err := sys.EnsureLogDir(LogDir, uid); err != nil {
+		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
+	}
 
 	// 2. Copy the binary to the EXACT path the plists exec (installedBinary()),
 	//    regardless of the source artifact's name. It lands under InstallDir, so
