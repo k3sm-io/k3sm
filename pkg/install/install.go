@@ -64,6 +64,12 @@ const (
 	// next to the executable and injects it into a mounting pod so an absolute
 	// volume mount resolves under the pod data volume (no chroot).
 	PathShimName = "libk3sm_pathrebase_shim.dylib"
+	// DNSShimName is the basename of the getaddrinfo DNS shim (darwin-net's
+	// shim/getaddrinfo_shim.c) installed beside the binary. The provider resolves it
+	// next to the executable and injects it into each pod (DYLD_INSERT_LIBRARIES) so
+	// an in-pod cluster-name lookup goes to the per-node resolver on the DNS VIP;
+	// without it a pod uses the system resolver and cluster names are NXDOMAIN.
+	DNSShimName = "libk3sm_getaddrinfo_shim.dylib"
 	// DefaultLaunchDaemonDir is where the two .plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
 	// DefaultDataRoot is the _k3sm-owned data root (the _k3sm home): the
@@ -158,6 +164,11 @@ type Config struct {
 	// and injects it into a mounting pod for absolute-mount-path rebasing. Defaults
 	// to the PathShimName sibling of BinarySource.
 	PathShimSource string
+	// DNSShimSource is the getaddrinfo DNS shim dylib (DNSShimName) to install beside
+	// the binary, from which the provider resolves it and injects it into each pod so
+	// in-pod cluster DNS reaches the per-node resolver. Defaults to the DNSShimName
+	// sibling of BinarySource.
+	DNSShimSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
@@ -201,6 +212,9 @@ func (c Config) withDefaults() Config {
 	if c.PathShimSource == "" && c.BinarySource != "" {
 		c.PathShimSource = filepath.Join(filepath.Dir(c.BinarySource), PathShimName)
 	}
+	if c.DNSShimSource == "" && c.BinarySource != "" {
+		c.DNSShimSource = filepath.Join(filepath.Dir(c.BinarySource), DNSShimName)
+	}
 	return c
 }
 
@@ -219,6 +233,12 @@ func (c Config) installedExecShim() string {
 // the binary, where runtimedConfig resolves it next to the executable.
 func (c Config) installedPathShim() string {
 	return filepath.Join(c.InstallDir, PathShimName)
+}
+
+// installedDNSShim is the path the getaddrinfo DNS shim is copied to — beside the
+// binary, where runtimedConfig resolves it next to the executable.
+func (c Config) installedDNSShim() string {
+	return filepath.Join(c.InstallDir, DNSShimName)
 }
 
 // plistPath is the LaunchDaemon plist path for a label.
@@ -305,6 +325,9 @@ func artifactManifest(cfg Config) []artifact {
 		// next to the executable) — injected into a mounting pod so an absolute
 		// volume mount resolves under the pod data volume. Covered by the sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedPathShim(), assertExists: true},
+		// The getaddrinfo DNS shim beside the binary — injected into each pod so an
+		// in-pod cluster-name lookup reaches the per-node resolver. Covered by the sweep.
+		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedDNSShim(), assertExists: true},
 		// The control-plane payload staged into InstallDir/bin (the daemon boot
 		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-apiserver"), assertExists: true},
@@ -415,6 +438,12 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      runtimed/hack/build-pathshim.sh and ad-hoc sign it).
 	if err := sys.CopyToRootOwned(cfg.PathShimSource, cfg.installedPathShim()); err != nil {
 		return fmt.Errorf("install: copy path-rebase shim to %s: %w (build it with runtimed/hack/build-pathshim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedPathShim(), err)
+	}
+	// 2b″. Copy the getaddrinfo DNS shim beside the binary. The provider resolves it
+	//      next to the executable and injects it into each pod so in-pod cluster DNS
+	//      reaches the per-node resolver (build it with darwin-net/hack/build-shim.sh).
+	if err := sys.CopyToRootOwned(cfg.DNSShimSource, cfg.installedDNSShim()); err != nil {
+		return fmt.Errorf("install: copy getaddrinfo DNS shim to %s: %w (build it with darwin-net/hack/build-shim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedDNSShim(), err)
 	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to
