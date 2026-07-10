@@ -59,6 +59,11 @@ const (
 	// DefaultInstallDir is the root-owned (root:wheel 0755) directory the binary
 	// and supporting files are copied into.
 	DefaultInstallDir = "/Library/k3sm"
+	// PathShimName is the basename of the path-rebase DYLD shim (runtimed's
+	// shim/pathrebase_shim.c) installed beside the binary. runtimed resolves it
+	// next to the executable and injects it into a mounting pod so an absolute
+	// volume mount resolves under the pod data volume (no chroot).
+	PathShimName = "libk3sm_pathrebase_shim.dylib"
 	// DefaultLaunchDaemonDir is where the two .plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
 	// DefaultDataRoot is the _k3sm-owned data root (the _k3sm home): the
@@ -148,6 +153,11 @@ type Config struct {
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
 	PayloadSource string
+	// PathShimSource is the path-rebase DYLD shim dylib (PathShimName) to install
+	// beside the binary, from which runtimed resolves it (next to the executable)
+	// and injects it into a mounting pod for absolute-mount-path rebasing. Defaults
+	// to the PathShimName sibling of BinarySource.
+	PathShimSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
@@ -188,6 +198,9 @@ func (c Config) withDefaults() Config {
 	if c.PayloadSource == "" && c.BinarySource != "" {
 		c.PayloadSource = filepath.Join(filepath.Dir(c.BinarySource), "cp-payload")
 	}
+	if c.PathShimSource == "" && c.BinarySource != "" {
+		c.PathShimSource = filepath.Join(filepath.Dir(c.BinarySource), PathShimName)
+	}
 	return c
 }
 
@@ -200,6 +213,12 @@ func (c Config) installedBinary() string {
 // the binary, the first place sandbox.FindExecShim probes.
 func (c Config) installedExecShim() string {
 	return filepath.Join(c.InstallDir, "k3sm-execshim")
+}
+
+// installedPathShim is the path the path-rebase DYLD shim is copied to — beside
+// the binary, where runtimedConfig resolves it next to the executable.
+func (c Config) installedPathShim() string {
+	return filepath.Join(c.InstallDir, PathShimName)
 }
 
 // plistPath is the LaunchDaemon plist path for a label.
@@ -282,6 +301,10 @@ func artifactManifest(cfg Config) []artifact {
 		// first probe) — the runtimed backend the server plist hardcodes cannot
 		// boot without it. Covered by the InstallDir sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedExecShim(), assertExists: true},
+		// The path-rebase DYLD shim beside the binary (runtimedConfig resolves it
+		// next to the executable) — injected into a mounting pod so an absolute
+		// volume mount resolves under the pod data volume. Covered by the sweep.
+		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedPathShim(), assertExists: true},
 		// The control-plane payload staged into InstallDir/bin (the daemon boot
 		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-apiserver"), assertExists: true},
@@ -385,6 +408,13 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     M2-gate failure mode), so a missing shim is an install-time error.
 	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.installedExecShim()); err != nil {
 		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.installedExecShim(), err)
+	}
+	// 2b′. Copy the path-rebase DYLD shim beside the binary. runtimed resolves it
+	//      next to the executable and injects it into a mounting pod so an absolute
+	//      volume mount resolves under the pod data volume (build it with
+	//      runtimed/hack/build-pathshim.sh and ad-hoc sign it).
+	if err := sys.CopyToRootOwned(cfg.PathShimSource, cfg.installedPathShim()); err != nil {
+		return fmt.Errorf("install: copy path-rebase shim to %s: %w (build it with runtimed/hack/build-pathshim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedPathShim(), err)
 	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to

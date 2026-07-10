@@ -140,6 +140,10 @@ type RuntimedConfig struct {
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES.
 	DyldShim string
+	// PathShim, when set, is the path-rebase DYLD shim dylib runtimed injects into a
+	// mounting container so an absolute volume mount resolves under the pod data
+	// volume (no chroot). Empty leaves a pod's absolute mount path reaching the host.
+	PathShim string
 	// ResolverVIP is the cluster DNS Service VIP (10.43.0.10) the per-pod Seatbelt
 	// egress allow-list is scoped to (threaded into runtimed's sandbox.Posture), so
 	// a confined pod's DNS reaches the node-local resolver. Empty leaves runtimed's
@@ -217,6 +221,7 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		// API VIP (M3.3). runtimed threads these into its per-pod sandbox.Posture.
 		ResolverVIP:  cfg.ResolverVIP,
 		APIServerVIP: cfg.APIServerVIP,
+		PathShimPath: cfg.PathShim,
 	}, runtimed.Deps{
 		Resolver:    resolver,
 		Credentials: creds,

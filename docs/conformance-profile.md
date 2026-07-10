@@ -57,6 +57,9 @@ Per the internal §By-design summary — summarized, not restated:
 
 - No Linux containers / cgroups / CNI / netns / device-plugins / hugepages (`not-applicable`).
 - No per-pod uid isolation — same-node pods share one `_k3sm` trust domain; untrusted tenancy → `vm`.
+- Absolute-path volume mounts resolve for **native workloads** (a `DYLD_INSERT` path-rebase shim; no
+  chroot), **not** SIP platform binaries — a `/bin/sh` script can't read a mounted file at its
+  absolute path (macOS strips `DYLD_INSERT_LIBRARIES` from platform binaries).
 - `externalTrafficPolicy: Local`, CFS millicore CPU *limits*, HPA-on-CPU-limit, `hostPath` /
   `terminationMessagePath` bind mounts, node-pressure eviction as a hard guarantee, NetworkPolicy as a
   tenant boundary.
