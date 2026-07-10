@@ -258,8 +258,11 @@ func TestM2_FsGroup(t *testing.T) {
 
 	_ = c.Client.CoreV1().Pods(conformanceNS).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
 	_, err := c.Client.CoreV1().Pods(conformanceNS).Create(context.Background(), pod, metav1.CreateOptions{})
-	if !apierrors.IsForbidden(err) {
-		t.Fatalf("pod requesting foreign fsGroup: err = %v, want Forbidden (k3sm-reject-foreign-user VAP — no per-pod uid/gid isolation)", err)
+	// The k3sm-reject-foreign-user ValidatingAdmissionPolicy denies with
+	// Reason=Invalid (pkg/policy/admission.go reasonInvalid()), so the rejection is
+	// a 422 Invalid, NOT a 403 Forbidden — IsInvalid is the correct matcher.
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("pod requesting foreign fsGroup: err = %v, want Invalid (k3sm-reject-foreign-user VAP — no per-pod uid/gid isolation)", err)
 	}
 }
 
