@@ -29,7 +29,11 @@ run_conformance_slice() {
 	shift 3
 	local crits=("$@")
 	local out rc=0
-	out="$(cd "$repo_root" && CGO_ENABLED=1 go test -tags e2e -run "$run_regex" -timeout "$timeout" -v ./e2e/... 2>&1)" || rc=1
+	# -count=1 DISABLES go's test-result cache: these e2e criteria talk to a live
+	# cluster (state go cannot track), so a cached result would silently replay a
+	# STALE run — greening (or reddening) against code + a cluster that no longer
+	# exist. Every conformance slice MUST re-run against the running cluster.
+	out="$(cd "$repo_root" && CGO_ENABLED=1 go test -tags e2e -count=1 -run "$run_regex" -timeout "$timeout" -v ./e2e/... 2>&1)" || rc=1
 	printf '%s\n' "$out" | sed 's/^/    /'
 
 	# A vacuous run (the -run pattern matched nothing) is RED, never green.

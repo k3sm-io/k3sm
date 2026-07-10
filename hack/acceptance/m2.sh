@@ -145,6 +145,10 @@ echo "==> [diagnostic] cluster Services (the netd authorizer's Service set):"
 # /tmp here is the conventional world-accessible default. ($KUBECONFIG was exported
 # to the human's ~/.kube/config in the m2.3 step above.)
 export K3SM_CONFORMANCE_BIN="/tmp/k3sm-conformance-bin"
+# Clean any stale helper binaries so TestMain rebuilds them from the CURRENT source
+# (a prior run left them here; a stale conftool lacking a new subcommand would fail
+# the criteria that use it). Recreated world-readable for the _k3sm pods' exec.
+rm -rf "$K3SM_CONFORMANCE_BIN"
 mkdir -p "$K3SM_CONFORMANCE_BIN"; chmod 755 "$K3SM_CONFORMANCE_BIN"
 M2_CRITERIA=(
 	M2_ConfigMapMount M2_SecretMount M2_EmptyDir M2_DownwardAPIEnv M2_EnvFrom
