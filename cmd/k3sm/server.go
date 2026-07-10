@@ -198,6 +198,17 @@ func runServer(args []string) error {
 	if opts.datastoreEndpoint != "" || opts.serverJoin {
 		logger.Info("HA datastore mode: kine→Postgres (shared multi-writer datastore); scheduler/KCM leader-elected", "server-join", opts.serverJoin)
 	}
+	// Standalone (non-HA-join): --token is the STATIC ADMIN bearer token — it must be
+	// BOTH what the apiserver loads into its token-auth-file (system:masters) AND what
+	// `k3sm install` wrote into the admin kubeconfig, or every admin request is
+	// Unauthorized (the live M2-gate failure). Empty (a bare `k3sm server`) lets the
+	// executor generate one + write its own kubeconfig. In the HA server-join path
+	// --token is instead the JOIN token (consumed above to fetch the CA bundle); the
+	// executor generates its own static token and HA admin auth is a client cert, so
+	// the join token must NOT become the apiserver's static credential.
+	if !opts.serverJoin {
+		cfg.Token = opts.token
+	}
 	// M6.1 HA server-join: a SECOND control-plane server reconstructs the IDENTICAL
 	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
 	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
