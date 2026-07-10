@@ -95,6 +95,7 @@ func TestInstallOrchestration(t *testing.T) {
 	want := []string{
 		"EnsureServiceUser:_k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
+		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootstrap:io.k3sm.netd",
@@ -135,14 +136,19 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	found := ""
+	var dsts []string
 	for _, c := range f.calls {
 		if strings.HasPrefix(c, "CopyToRootOwned:") {
-			found = strings.TrimPrefix(c, "CopyToRootOwned:")
+			dsts = append(dsts, strings.TrimPrefix(c, "CopyToRootOwned:"))
 		}
 	}
-	if found != "/Library/k3sm/k3sm" {
-		t.Errorf("binary copied to %q, want the fixed plist-exec path /Library/k3sm/k3sm (never the source basename)", found)
+	if len(dsts) != 2 || dsts[0] != "/Library/k3sm/k3sm" || dsts[1] != "/Library/k3sm/k3sm-execshim" {
+		t.Errorf("copies landed at %v, want the fixed paths [/Library/k3sm/k3sm /Library/k3sm/k3sm-execshim] (never the source basename)", dsts)
+	}
+	// The shim source defaults to the k3sm-execshim SIBLING of BinarySource — the
+	// gate/goreleaser stage both artifacts side by side.
+	if got := cfg.withDefaults().ExecShimSource; got != "/tmp/build/k3sm-execshim" {
+		t.Errorf("ExecShimSource default = %q, want the BinarySource sibling /tmp/build/k3sm-execshim", got)
 	}
 }
 

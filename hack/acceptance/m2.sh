@@ -25,13 +25,14 @@ ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "
 NETD_SOCK="/var/lib/k3sm/run/netd.sock"
 INSTALL_DIR="/Library/k3sm"
 BIN="$REPO_ROOT/k3sm-m2"
+EXECSHIM="$REPO_ROOT/k3sm-execshim"
 INVOKING_USER="${SUDO_USER:-$(id -un)}"
 KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
 
 cleanup() {
 	# Always attempt uninstall so a failed run leaves no daemons/aliases behind.
 	"$BIN" uninstall >/dev/null 2>&1 || true
-	rm -f "$BIN" >/dev/null 2>&1 || true
+	rm -f "$BIN" "$EXECSHIM" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -45,6 +46,12 @@ echo "==> k3sm M2 acceptance (user-space: sudo k3sm install once, then fidelity 
 # Build the single binary CGO_ENABLED=1 (kine sqlite), runtime pinned to runtimed.
 ( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN" ./cmd/k3sm )
 codesign -s - -f "$BIN" >/dev/null 2>&1 || true
+# Build the k3sm-execshim Seatbelt helper BESIDE it — `k3sm install` stages the
+# BinarySource's k3sm-execshim sibling next to the installed binary, where the
+# runtimed backend resolves it; without it the server dies at boot. Built from
+# the workspace root (go.work spans the runtimed module).
+( cd "$REPO_ROOT/.." && CGO_ENABLED=1 go build -o "$EXECSHIM" k3sm.io/runtimed/cmd/k3sm-execshim )
+codesign -s - -f "$EXECSHIM" >/dev/null 2>&1 || true
 
 # ── The ONE root step: install both LaunchDaemons. ───────────────────────────
 if "$BIN" install --user "$INVOKING_USER" >/dev/null 2>&1; then
@@ -123,14 +130,22 @@ fi
 
 # m2.4 — uninstall cleanliness: both daemons booted out, install dir removed,
 # socket gone, and the helper flushed its lo0 pod/Service aliases on SIGTERM.
+# Bounded retry: bootout delivers SIGTERM and returns; the daemons' shutdown
+# handlers (socket unlink, lo0 flush) complete asynchronously — a single
+# immediate check races a still-exiting netd.
 "$BIN" uninstall >/dev/null 2>&1 || true
-clean=yes
-launchctl print system/io.k3sm.server >/dev/null 2>&1 && clean=no
-launchctl print system/io.k3sm.netd   >/dev/null 2>&1 && clean=no
-[ -e "$INSTALL_DIR" ] && clean=no
-[ -S "$NETD_SOCK" ] && clean=no
-# No 100.64.* (pod) or service-VIP aliases should remain on lo0 after teardown.
-ifconfig lo0 2>/dev/null | grep -qE 'inet (100\.64\.|10\.43\.)' && clean=no
+clean=no
+for _ in $(seq 1 15); do
+	ok=yes
+	launchctl print system/io.k3sm.server >/dev/null 2>&1 && ok=no
+	launchctl print system/io.k3sm.netd   >/dev/null 2>&1 && ok=no
+	[ -e "$INSTALL_DIR" ] && ok=no
+	[ -S "$NETD_SOCK" ] && ok=no
+	# No 100.64.* (pod) or service-VIP aliases should remain on lo0 after teardown.
+	ifconfig lo0 2>/dev/null | grep -qE 'inet (100\.64\.|10\.43\.)' && ok=no
+	[ "$ok" = yes ] && clean=yes && break
+	sleep 1
+done
 ladder "$([ "$clean" = yes ] && echo ok || echo no)" "m2.4  uninstall clean (daemons out, $INSTALL_DIR gone, socket gone, lo0 aliases flushed)"
 
 echo "----------------------------------------"
