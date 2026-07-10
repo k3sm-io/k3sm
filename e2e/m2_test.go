@@ -347,6 +347,8 @@ func TestM2_InPodKubectl(t *testing.T) {
 		pod := nativePod("m2-inpod-kubectl", bin, "apicall",
 			"-path", "/api/v1/namespaces/"+ns+"/pods", "-expect-status", "200")
 		pod.Spec.ServiceAccountName = sa
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+			corev1.EnvVar{Name: "K3SM_DNS_DEBUG", Value: "1"}) // DIAGNOSTIC: trace the in-pod DNS shim
 		applyAndWaitSucceeded(t, c, pod, 90*time.Second)
 	})
 
@@ -365,6 +367,10 @@ func TestM2_InPodDNS(t *testing.T) {
 	c := Up(t)
 	pod := nativePod("m2-inpod-dns", helperBin(t, "conftool"), "resolve",
 		"-name", "kubernetes.default.svc", "-name", "kubernetes.default.svc.cluster.local")
+	// DIAGNOSTIC: trace the in-pod getaddrinfo shim (whether K3SM_DNS_SERVER is seen
+	// in-pod + each cluster-query outcome) into the pod logs on a DNS failure.
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "K3SM_DNS_DEBUG", Value: "1"})
 	applyAndWaitSucceeded(t, c, pod, 90*time.Second)
 }
 
