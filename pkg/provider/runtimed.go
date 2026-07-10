@@ -240,6 +240,13 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	// Startup visibility for the in-pod cluster-DNS path: an empty dyld_shim (the
+	// getaddrinfo shim was not resolved beside the binary) or a wrong resolver_vip
+	// silently leaves pods on the system resolver (cluster names NXDOMAIN).
+	log.Info("runtimed provider configured",
+		"dyld_shim", cfg.DyldShim,
+		"resolver_vip", cfg.ResolverVIP,
+		"cluster_domain", cfg.ClusterDomain)
 	return &runtimedRuntime{
 		rt:             rt,
 		nodeName:       cfg.NodeName,
@@ -398,6 +405,23 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	}
 	if err := resolvePodBoxEnv(ctx, box, r.nodeName, r.nodeIP, r.resolver); err != nil {
 		return nil, err
+	}
+	// In-pod cluster-DNS visibility: log the FINAL injected state (after
+	// resolvePodBoxEnv) so a "no such host" failure shows whether the getaddrinfo
+	// shim (dyld annotation) and its K3SM_DNS_SERVER env actually landed on the box.
+	if cs := box.GetContainers(); len(cs) > 0 {
+		var dnsServer string
+		for _, e := range cs[0].GetEnv() {
+			if e.GetName() == "K3SM_DNS_SERVER" {
+				dnsServer = e.GetValue()
+				break
+			}
+		}
+		r.log.Info("pod box cluster-DNS wiring",
+			"pod", pod.Name,
+			"dyld_annotation", box.GetAnnotations()[dyldInsertAnnotation],
+			"k3sm_dns_server", dnsServer,
+			"dns_policy", string(pod.Spec.DNSPolicy))
 	}
 	return box, nil
 }

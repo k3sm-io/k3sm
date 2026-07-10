@@ -209,6 +209,11 @@ else
 	echo "    (probe build failed — skipping resolver/shim probes)"
 fi
 rm -rf "$DNS_PROBE_DIR"
+# (4) The provider's own view: the resolved DNS config at startup + the per-pod
+# injection outcome (dyld annotation + K3SM_DNS_SERVER landing on the box). An empty
+# dyld_shim / k3sm_dns_server here is the injection break the shell probes can't see.
+echo "--- (4) server.log: provider DNS config + per-pod injection outcome:"
+grep -E 'runtimed provider configured|pod box cluster-DNS wiring' /var/log/k3sm/server.log 2>/dev/null | tail -8 || echo "    (no DNS-wiring log lines — server predates this diagnostic)"
 
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
 # named per its reference-workload feature class. The NON-VACUOUS guard
