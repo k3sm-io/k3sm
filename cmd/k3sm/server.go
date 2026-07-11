@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -407,11 +408,15 @@ func runServer(args []string) error {
 		WorkDir:       opts.workDir,
 		DNSVIP:        opts.clusterIP,
 		ClusterDomain: opts.domain,
-		NodeIP:        opts.nodeIP,
-		PodCIDR:       serverPodCIDR,
-		NetdSocket:    mode.Socket,
-		Disabled:      !mode.DataPath(),
-		Logger:        logger,
+		// The apiserver's real loopback listen address, so netserve provisions the
+		// default/kubernetes EndpointSlice the Service proxy needs for the API VIP (the
+		// single-node apiserver advertises 127.0.0.1, which its reconciler won't publish).
+		APIServerEndpoint: "127.0.0.1:" + strconv.Itoa(opts.apiPort),
+		NodeIP:            opts.nodeIP,
+		PodCIDR:           serverPodCIDR,
+		NetdSocket:        mode.Socket,
+		Disabled:          !mode.DataPath(),
+		Logger:            logger,
 	})
 	go func() {
 		if err := net.Run(ctx); err != nil && ctx.Err() == nil {
