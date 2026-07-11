@@ -37,9 +37,10 @@ import (
 type fakeIPAM struct {
 	alloc *podnet.Allocator
 
-	mu     sync.Mutex
-	byPod  map[string]netip.Addr
-	sweeps []map[string]netip.Addr // recorded SweepStale known-sets
+	mu          sync.Mutex
+	byPod       map[string]netip.Addr
+	sweeps      []map[string]netip.Addr // recorded SweepStale known-sets
+	nodeAliases []netip.Addr            // recorded EnsureNodeAlias addresses
 }
 
 func newFakeIPAM(t *testing.T, cidr string) *fakeIPAM {
@@ -80,6 +81,13 @@ func (f *fakeIPAM) SweepStale(_ context.Context, known map[string]netip.Addr) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sweeps = append(f.sweeps, known)
+	return nil
+}
+
+func (f *fakeIPAM) EnsureNodeAlias(_ context.Context, ip netip.Addr) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nodeAliases = append(f.nodeAliases, ip)
 	return nil
 }
 
@@ -281,7 +289,9 @@ func TestCreatePodAssignsDistinctPodIP(t *testing.T) {
 // TestPodNetAdapterReconcileStartup pins the adapter's runtime.NetworkReconciler
 // leg: ReconcileStartup performs exactly one FULL stale-alias sweep (empty known
 // set — nothing survives a daemon restart to reattach), the fail-closed
-// crash-recovery contract runtimed invokes once before serving CreatePod.
+// crash-recovery contract runtimed invokes once before serving CreatePod, AND
+// plumbs the node's OWN lo0 alias so the apiserver node-proxy can reach :10250
+// for kubectl top node (the globally-unicast NodeInternalIP case).
 func TestPodNetAdapterReconcileStartup(t *testing.T) {
 	ipam := newFakeIPAM(t, "100.64.0.0/24")
 	adapter := NewPodNetAdapter(ipam, testNodeIP, nil)
@@ -295,6 +305,35 @@ func TestPodNetAdapterReconcileStartup(t *testing.T) {
 	}
 	if len(ipam.sweeps[0]) != 0 {
 		t.Errorf("SweepStale known set = %v, want empty (full sweep)", ipam.sweeps[0])
+	}
+	// The node's OWN globally-unicast address is aliased on lo0 so the apiserver
+	// node-proxy's dial to NodeInternalIP:10250 loops back to the local listener.
+	if len(ipam.nodeAliases) != 1 {
+		t.Fatalf("EnsureNodeAlias called %d times, want 1", len(ipam.nodeAliases))
+	}
+	if got, want := ipam.nodeAliases[0], netip.MustParseAddr(testNodeIP); got != want {
+		t.Errorf("EnsureNodeAlias(%s), want %s (the advertised NodeInternalIP)", got, want)
+	}
+}
+
+// TestPodNetAdapterReconcileStartupLoopbackSkipsNodeAlias pins that a loopback
+// NodeInternalIP is NOT aliased (127.0.0.1 already lives on lo0): the datapath
+// derives a globally-unicast node IP, so a residual loopback address (control-
+// plane-only / explicit --node-ip 127.0.0.1) must skip the redundant alias rather
+// than error. The stale-alias sweep still runs.
+func TestPodNetAdapterReconcileStartupLoopbackSkipsNodeAlias(t *testing.T) {
+	ipam := newFakeIPAM(t, "100.64.0.0/24")
+	adapter := NewPodNetAdapter(ipam, "127.0.0.1", nil)
+	if err := adapter.ReconcileStartup(context.Background()); err != nil {
+		t.Fatalf("ReconcileStartup: %v", err)
+	}
+	ipam.mu.Lock()
+	defer ipam.mu.Unlock()
+	if len(ipam.sweeps) != 1 {
+		t.Errorf("SweepStale called %d times, want 1 (the sweep runs regardless)", len(ipam.sweeps))
+	}
+	if len(ipam.nodeAliases) != 0 {
+		t.Errorf("EnsureNodeAlias called %d times for a loopback node IP, want 0", len(ipam.nodeAliases))
 	}
 }
 

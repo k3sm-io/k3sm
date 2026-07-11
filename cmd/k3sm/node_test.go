@@ -29,6 +29,32 @@ import (
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
+// TestNodeInternalIP pins the globally-unicast NodeInternalIP derivation the VK
+// node advertises so the apiserver node-proxy accepts `kubectl top node`
+// (isProxyableHostname → IsGlobalUnicast rejects a loopback InternalIP): the
+// node's reserved mesh-egress .1 for a valid /24, and "" (keep the loopback
+// default, never invent an address) for a malformed or non-/24 podCIDR.
+func TestNodeInternalIP(t *testing.T) {
+	tests := []struct {
+		name    string
+		podCIDR string
+		want    string
+	}{
+		{"index-0 /24", "100.64.0.0/24", "100.64.0.1"},
+		{"index-2 /24", "100.64.2.0/24", "100.64.2.1"},
+		{"empty", "", ""},
+		{"malformed", "not-a-cidr", ""},
+		{"not a /24 (MeshEgressIP requires /24)", "100.64.0.0/16", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodeInternalIP(tt.podCIDR); got != tt.want {
+				t.Errorf("nodeInternalIP(%q) = %q, want %q", tt.podCIDR, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRuntimedConfiguresPostureVIPs proves the runtimed runtime is configured with
 // the correct per-pod Seatbelt egress VIPs (the k3sm half of M3.3 deliverable 5):
 // ResolverVIP is the cluster DNS VIP (10.43.0.10) — the same VIP the per-node
