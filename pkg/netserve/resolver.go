@@ -61,6 +61,13 @@ const resolverQueryTimeout = 5 * time.Second
 // connection goroutine open.
 const tcpIdleTimeout = 10 * time.Second
 
+// maxUDPResponse is the largest DNS response sent over UDP. The resolver
+// neither advertises nor honors EDNS0, so RFC 1035 §4.2.1 fixes the payload
+// limit at 512 bytes; a larger response is replaced by header+question with the
+// TC bit set and the client re-asks over TCP, where the full set is served. No
+// partial answer set is ever sent (RFC 2181 §9 forbids relying on one).
+const maxUDPResponse = 512
+
 // serviceTarget is the discriminated result of a cluster Service lookup: exactly
 // one of IP / ExternalName is set. A normal Service yields IP (its IPv4 ClusterIP,
 // answered as an A record directly); an ExternalName Service yields ExternalName
@@ -222,6 +229,13 @@ func (r *clusterResolver) serveUDP(ctx context.Context, pc net.PacketConn) error
 			if err != nil {
 				r.log.Debug("dns udp respond", "err", err)
 				return
+			}
+			if len(resp) > maxUDPResponse {
+				resp, err = truncateResponse(resp)
+				if err != nil {
+					r.log.Debug("dns udp truncate", "err", err)
+					return
+				}
 			}
 			if _, err := pc.WriteTo(resp, addr); err != nil {
 				r.log.Debug("dns udp write", "err", err)
@@ -566,6 +580,37 @@ func buildResponse(id uint16, q dnsmessage.Question, ans dnsAnswer, rcode dnsmes
 		if err := b.PTRResource(rh, dnsmessage.PTRResource{PTR: target}); err != nil {
 			return nil, fmt.Errorf("write PTR answer: %w", err)
 		}
+	}
+	return b.Finish()
+}
+
+// truncateResponse rebuilds an oversized UDP response as header+question with
+// the TC bit set. The answers are dropped entirely rather than partially
+// packed: a client seeing TC discards the sections and re-asks over TCP
+// (RFC 1035 §4.2.2), and RFC 2181 §9 forbids using a truncated set anyway.
+func truncateResponse(resp []byte) ([]byte, error) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(resp)
+	if err != nil {
+		return nil, fmt.Errorf("parse response header: %w", err)
+	}
+	q, err := p.Question()
+	if err != nil {
+		return nil, fmt.Errorf("parse response question: %w", err)
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 hdr.ID,
+		Response:           true,
+		Authoritative:      hdr.Authoritative,
+		RecursionAvailable: hdr.RecursionAvailable,
+		RCode:              hdr.RCode,
+		Truncated:          true,
+	})
+	if err := b.StartQuestions(); err != nil {
+		return nil, fmt.Errorf("start questions: %w", err)
+	}
+	if err := b.Question(q); err != nil {
+		return nil, fmt.Errorf("write question: %w", err)
 	}
 	return b.Finish()
 }
