@@ -270,10 +270,12 @@ else
 fi
 
 # m2.4 — uninstall cleanliness: both daemons booted out, install dir removed,
-# socket gone, and the helper flushed its lo0 pod/Service aliases on SIGTERM.
-# Bounded retry: bootout delivers SIGTERM and returns; the daemons' shutdown
-# handlers (socket unlink, lo0 flush) complete asynchronously — a single
-# immediate check races a still-exiting netd.
+# socket gone, and every k3sm lo0 alias flushed (`k3sm uninstall` sweeps the pod
+# aggregate + Service CIDR itself — pod /32s, the API/DNS VIPs, and the node
+# mesh-egress .1 the pod stale-sweep deliberately spares).
+# Bounded retry: bootout delivers SIGTERM and returns; the daemons' exits (and
+# the launchctl job-table removal) complete asynchronously — a single immediate
+# check races a still-exiting daemon.
 "$BIN" uninstall >/dev/null 2>&1 || true
 clean=no
 for _ in $(seq 1 15); do
@@ -282,11 +284,20 @@ for _ in $(seq 1 15); do
 	launchctl print system/io.k3sm.netd   >/dev/null 2>&1 && ok=no
 	[ -e "$INSTALL_DIR" ] && ok=no
 	[ -S "$NETD_SOCK" ] && ok=no
-	# No 100.64.* (pod) or service-VIP aliases should remain on lo0 after teardown.
+	# No 100.64.* (pod/node) or service-VIP aliases should remain on lo0 after teardown.
 	ifconfig lo0 2>/dev/null | grep -qE 'inet (100\.64\.|10\.43\.)' && ok=no
 	[ "$ok" = yes ] && clean=yes && break
 	sleep 1
 done
+if [ "$clean" != yes ]; then
+	# Name the still-failing sub-checks — a bare FAIL hides which teardown leg leaked.
+	echo "--- m2.4 detail: still failing after 15s:"
+	launchctl print system/io.k3sm.server >/dev/null 2>&1 && echo "    io.k3sm.server still loaded"
+	launchctl print system/io.k3sm.netd   >/dev/null 2>&1 && echo "    io.k3sm.netd still loaded"
+	[ -e "$INSTALL_DIR" ] && echo "    $INSTALL_DIR still present"
+	[ -S "$NETD_SOCK" ] && echo "    $NETD_SOCK still present"
+	ifconfig lo0 2>/dev/null | grep -E 'inet (100\.64\.|10\.43\.)' | sed 's/^[[:space:]]*/    lingering alias: /'
+fi
 ladder "$([ "$clean" = yes ] && echo ok || echo no)" "m2.4  uninstall clean (daemons out, $INSTALL_DIR gone, socket gone, lo0 aliases flushed)"
 
 echo "----------------------------------------"

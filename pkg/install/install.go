@@ -35,10 +35,12 @@ import (
 	"encoding/xml"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -132,6 +134,14 @@ type System interface {
 	// each child is in its own process group so launchd's job-kill misses it).
 	// A no-op when nothing matches.
 	ReapOrphans(binPrefix string) error
+	// FlushLo0Aliases removes every lo0 inet alias that falls inside one of the
+	// given prefixes — the uninstall backstop for the k3sm-owned durable kernel
+	// state NO daemon flushes on the way out: pod /32s a mid-run failure leaked,
+	// the Service VIP aliases (the API + DNS VIPs), and the node's own
+	// mesh-egress .1 (which the pod-range stale sweep deliberately never touches).
+	// It inspects the live interface (ifconfig) rather than walking ranges, so it
+	// removes exactly what exists. A no-op when nothing matches.
+	FlushLo0Aliases(prefixes []netip.Prefix) error
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -566,6 +576,19 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
 	note(sys.ReapOrphans(filepath.Join(cfg.DataRoot, "server", "bin")))
+	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
+	// no daemon removes on the way out — netd tracks per-connection alias caps
+	// (not cleanup), the server's pod teardown misses anything a failed run
+	// leaked, the Service VIP aliases (API + DNS VIPs) live for the daemon's
+	// lifetime, and the node's own mesh-egress .1 is deliberately OUTSIDE the pod
+	// stale-sweep range. Scope: the pinned cluster pod aggregate + the Service
+	// CIDR — exactly the address space k3sm ever aliases (never the host's own
+	// addresses). Uninstall runs as root, so this is direct ifconfig, no helper.
+	flush := []netip.Prefix{podnet.ClusterPodCIDR}
+	if svc, err := netip.ParsePrefix(cfg.ServiceCIDR); err == nil {
+		flush = append(flush, svc)
+	}
+	note(sys.FlushLo0Aliases(flush))
 	if firstErr != nil {
 		return fmt.Errorf("uninstall: %w", firstErr)
 	}
