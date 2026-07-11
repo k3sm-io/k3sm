@@ -318,7 +318,13 @@ func (s *Server) ensureKubernetesEndpointSlice(ctx context.Context) error {
 			Namespace: "default",
 			Labels: map[string]string{
 				discoveryv1.LabelServiceName: "kubernetes",
-				"k3sm.io/managed":            "true",
+				// A NON-controller managed-by, so the KCM endpointslice-controller does
+				// not claim this slice — it reaps any service-name=kubernetes slice
+				// lacking managed-by=endpointslice-controller.k8s.io as an orphan
+				// (deleting our slice moments after we create it). The proxy matches on
+				// service-name only, so managed-by is invisible to the datapath.
+				discoveryv1.LabelManagedBy: "k3sm.io/netserve",
+				"k3sm.io/managed":          "true",
 			},
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,

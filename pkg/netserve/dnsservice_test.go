@@ -102,6 +102,10 @@ func TestEnsureKubernetesEndpointSlice(t *testing.T) {
 	if got := sl.Labels[discoveryv1.LabelServiceName]; got != "kubernetes" {
 		t.Errorf("service-name label = %q, want kubernetes (the proxy keys on it)", got)
 	}
+	// managed-by must NOT be the endpointslice-controller's value, or KCM GCs the slice.
+	if got := sl.Labels[discoveryv1.LabelManagedBy]; got == "" || got == "endpointslice-controller.k8s.io" {
+		t.Errorf("managed-by = %q, want a non-controller sentinel (else the endpointslice-controller reaps it)", got)
+	}
 	if sl.AddressType != discoveryv1.AddressTypeIPv4 {
 		t.Errorf("AddressType = %q, want IPv4", sl.AddressType)
 	}
