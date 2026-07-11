@@ -403,15 +403,23 @@ func runServer(args []string) error {
 	// OPEN with a throttled Warn — widen-only, never a wrong deny. Seeding peers
 	// here rides the same follow-up as the server-side mesh bring-up.
 	serverPodCIDR := defaultNodePodCIDR()
+	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
+	// node) pins the static proxy backend at the apiserver's real loopback listen
+	// address — upstream validation rejects loopback endpoint addresses, so no
+	// kubernetes EndpointSlice can exist there. A mesh apiserver binds/advertises
+	// the mesh IP, publishes its OWN valid endpoints, and the proxy must follow
+	// that real slice (a static loopback pin would route the VIP at a
+	// non-listening address).
+	apiServerEndpoint := ""
+	if opts.nodeIP == loopbackNodeIP {
+		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
+	}
 	net := netserve.New(netserve.Config{
-		Client:        cs,
-		WorkDir:       opts.workDir,
-		DNSVIP:        opts.clusterIP,
-		ClusterDomain: opts.domain,
-		// The apiserver's real loopback listen address, so netserve provisions the
-		// default/kubernetes EndpointSlice the Service proxy needs for the API VIP (the
-		// single-node apiserver advertises 127.0.0.1, which its reconciler won't publish).
-		APIServerEndpoint: "127.0.0.1:" + strconv.Itoa(opts.apiPort),
+		Client:            cs,
+		WorkDir:           opts.workDir,
+		DNSVIP:            opts.clusterIP,
+		ClusterDomain:     opts.domain,
+		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
 		PodCIDR:           serverPodCIDR,
 		NetdSocket:        mode.Socket,

@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -76,52 +75,51 @@ func TestEnsureDNSService(t *testing.T) {
 	}
 }
 
-// TestEnsureKubernetesEndpointSlice proves netserve provisions the
-// default/kubernetes EndpointSlice the Service proxy needs for the API VIP. The
-// single-node apiserver advertises 127.0.0.1 and its reconciler won't publish that
-// loopback endpoint, so without this the slice is absent and the proxy resets in-pod
-// HTTPS to 10.43.0.1:443 (EOF). The slice must carry the service-name label, an
-// IPv4 Ready endpoint at the apiserver's loopback address, and the https/6444 port.
-func TestEnsureKubernetesEndpointSlice(t *testing.T) {
-	cs := fake.NewClientset()
-	s := New(Config{
-		Client:            cs,
-		WorkDir:           t.TempDir(),
-		APIServerEndpoint: "127.0.0.1:6444",
-	})
-	ctx := context.Background()
-	if err := s.ensureKubernetesEndpointSlice(ctx); err != nil {
-		t.Fatalf("ensureKubernetesEndpointSlice: %v", err)
+// TestStaticAPIServerBackends pins the kubernetes-VIP static-backend derivation
+// (the replacement for the withdrawn EndpointSlice provisioning: upstream
+// validation hard-rejects loopback endpoint addresses on CREATE — the k8s.io
+// "may not be in the loopback range" rule — so no slice can ever carry the
+// single-node apiserver's 127.0.0.1:6444; the proxy carries it statically
+// instead). A valid endpoint yields one always-Ready default/kubernetes backend;
+// a malformed one errors so New degrades loudly rather than routing nowhere.
+func TestStaticAPIServerBackends(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantErr  bool
+		wantIP   string
+		wantPort int32
+	}{
+		{"loopback apiserver", "127.0.0.1:6444", false, "127.0.0.1", 6444},
+		{"custom port", "127.0.0.1:7443", false, "127.0.0.1", 7443},
+		{"missing port", "127.0.0.1", true, "", 0},
+		{"not host:port", "nonsense", true, "", 0},
+		{"port out of range", "127.0.0.1:70000", true, "", 0},
+		{"empty", "", true, "", 0},
 	}
-
-	sl, err := cs.DiscoveryV1().EndpointSlices("default").Get(ctx, "kubernetes-k3sm", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("kubernetes EndpointSlice not created: %v", err)
-	}
-	// The proxy maps a slice to its Service via this label — not the slice name.
-	if got := sl.Labels[discoveryv1.LabelServiceName]; got != "kubernetes" {
-		t.Errorf("service-name label = %q, want kubernetes (the proxy keys on it)", got)
-	}
-	// managed-by must NOT be the endpointslice-controller's value, or KCM GCs the slice.
-	if got := sl.Labels[discoveryv1.LabelManagedBy]; got == "" || got == "endpointslice-controller.k8s.io" {
-		t.Errorf("managed-by = %q, want a non-controller sentinel (else the endpointslice-controller reaps it)", got)
-	}
-	if sl.AddressType != discoveryv1.AddressTypeIPv4 {
-		t.Errorf("AddressType = %q, want IPv4", sl.AddressType)
-	}
-	if len(sl.Endpoints) != 1 || len(sl.Endpoints[0].Addresses) != 1 || sl.Endpoints[0].Addresses[0] != "127.0.0.1" {
-		t.Fatalf("endpoint addresses = %+v, want [127.0.0.1] (the apiserver's reachable loopback)", sl.Endpoints)
-	}
-	// The proxy drops non-Ready endpoints; the API backend must be Ready.
-	if r := sl.Endpoints[0].Conditions.Ready; r == nil || !*r {
-		t.Errorf("endpoint Ready = %v, want true (else the proxy has no backend)", r)
-	}
-	if len(sl.Ports) != 1 || sl.Ports[0].Port == nil || *sl.Ports[0].Port != 6444 || sl.Ports[0].Name == nil || *sl.Ports[0].Name != "https" {
-		t.Fatalf("ports = %+v, want [https/6444] (must match the kubernetes Service port name)", sl.Ports)
-	}
-
-	// Idempotent: a second call (slice already exists) must not error.
-	if err := s.ensureKubernetesEndpointSlice(ctx); err != nil {
-		t.Fatalf("ensureKubernetesEndpointSlice not idempotent: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			static, err := staticAPIServerBackends(tt.endpoint)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("staticAPIServerBackends(%q) = %v, want error", tt.endpoint, static)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("staticAPIServerBackends(%q): %v", tt.endpoint, err)
+			}
+			eps := static["default/kubernetes"]
+			if len(eps) != 1 {
+				t.Fatalf("default/kubernetes backends = %+v, want exactly one", eps)
+			}
+			if eps[0].IP != tt.wantIP || eps[0].Port != tt.wantPort {
+				t.Errorf("backend = %s:%d, want %s:%d", eps[0].IP, eps[0].Port, tt.wantIP, tt.wantPort)
+			}
+			// The proxy drops non-Ready endpoints; the API backend must be Ready.
+			if !eps[0].Ready {
+				t.Errorf("backend Ready = false, want true (else the proxy has no backend)")
+			}
+		})
 	}
 }

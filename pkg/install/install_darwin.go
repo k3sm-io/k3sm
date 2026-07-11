@@ -17,7 +17,9 @@ limitations under the License.
 package install
 
 import (
+	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
@@ -274,4 +276,43 @@ func (darwinSystem) RemoveAll(path string) error {
 		return fmt.Errorf("remove %s: %w", path, err)
 	}
 	return nil
+}
+
+// FlushLo0Aliases lists lo0's live inet aliases (`ifconfig lo0`) and removes
+// every one inside the given prefixes with `ifconfig lo0 -alias <ip>` — the
+// root-privileged uninstall backstop for k3sm's durable alias state (pod /32s,
+// Service VIPs, the node mesh-egress .1). Removal failures are collected and
+// the flush continues, so one stuck alias never strands the rest; removing an
+// address that vanished between list and remove is tolerated.
+func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
+	out, err := exec.Command("ifconfig", "lo0").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ifconfig lo0: %w\n%s", err, out)
+	}
+	var errs []error
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		// A v4 alias line reads "inet A.B.C.D netmask 0xffffffff".
+		if len(fields) < 2 || fields[0] != "inet" {
+			continue
+		}
+		ip, err := netip.ParseAddr(fields[1])
+		if err != nil {
+			continue
+		}
+		owned := false
+		for _, p := range prefixes {
+			if p.Contains(ip) {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			continue
+		}
+		if rmOut, err := exec.Command("ifconfig", "lo0", "-alias", ip.String()).CombinedOutput(); err != nil {
+			errs = append(errs, fmt.Errorf("ifconfig lo0 -alias %s: %w\n%s", ip, err, rmOut))
+		}
+	}
+	return errors.Join(errs...)
 }
