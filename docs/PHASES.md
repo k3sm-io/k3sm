@@ -603,6 +603,60 @@ phases:
             met: true
             check: "darwin-net/pkg/proxy::TestNetworkPolicyL4AllowDeny (a dst-VIP L4 allow/deny subset) + a limitations.md line-assert documenting NetworkPolicy as a hint, not tenant isolation. Post-launch v0.2."
             method: unit
+
+  - id: M11
+    title: Linux containers & multi-arch (k3sm slice — capability labels, platform annotation, wiring, admission note, gate)
+    status: todo
+    depends_on: []
+    notes: >-
+      docs/m11-plan.md is authoritative (Phase C encoded from it). M11 de-EXPERIMENTALs
+      the vm RuntimeClass — SHARES the post-launch v0.2 headline with M10.2–M10.4.
+      Hard cut. The de-EXPERIMENTAL flip is STRUCTURALLY lab-gated: B109 (hack/lab/m11.sh
+      green on an entitled VZ Mac) + B110 (vmhost release signing, human-gated) — never
+      unit-green-only. The foreign-user VAP exemption for vm pods is human-gated B112
+      (admission-model change, the B71 precedent) — WITHOUT it the headline fsGroup
+      workload is rejected 422 at admission; this wave cites pkg/policy/admission.go by
+      name so nobody relaxes it ad hoc. Guest hostPath stays fail-closed pending
+      human-gated B98 — M11's stockkitty acceptance uses PVC-backed PGDATA.
+    subphases:
+      - id: M11.4
+        title: capability labels + image-platform annotation + B6 wiring + admission/docs
+        status: todo
+        depends_on: [apis:M11.1, runtimed:M11.2, darwin-net:M11.3]
+        deliverables:
+          - id: M11.4-d1
+            done: false
+            desc: "Capability labels off runtimed conditions (the B1 pattern + the B94 fail-closed delete() discipline): k3sm.io/rosetta (host) and k3sm.io/rosetta-linux = VMBackendAvailable ∧ RosettaGuestAvailable (a Rosetta-installed but VZ-incapable node must NOT carry rosetta-linux). Delete-on-loss has its OWN named k3sm test (B103's second gate — B1's runtimed-only gate under-proved exactly this half). Runbook line: host Rosetta probe is once-cached — install Rosetta then `launchctl kickstart -k io.k3sm.server` (fail-closed direction is safe)."
+          - id: M11.4-d2
+            done: false
+            desc: "kubernetes.io/arch + NodeInfo.Architecture truthfulness via an injected goarch/machine seam (B104; retires the TWO hardcoded arm64 sites, node.go label + NodeInfo). Gate table carries BOTH arm64 and amd64 legs (red-at-main by VALUE). The k3sm binary stays darwin/arm64-only — B105 ships POD PAYLOADS under host Rosetta, never an Intel k3sm binary; doctor keeps its arch check."
+          - id: M11.4-d3
+            done: false
+            desc: "k3sm.io/image-platform annotation → per-container Container.image_platform stamp (parsed once, provider-side; pod-level annotation applies to every container). PRE-PULL fail-closed when the node cannot serve the annotated platform (legible event naming the missing capability label; docs pair the annotation with a nodeSelector for true Unschedulable semantics multi-node). Un-annotated mismatches surface at pull as container-waiting ErrImagePull→ImagePullBackOff (pod PENDING — upstream pull-failure semantics; NEVER terminal Failed, which churns ReplicaSets and burns Job backoffLimit)."
+          - id: M11.4-d4
+            done: false
+            desc: "B6 producer wiring per the decided carrier (m11-plan Resolution 3): podnet.SetupGuest + dns.GuestResolvConf run BEFORE toPodBox (the M10.1 one-authority ordering — downward-API status.podIP env resolves pre-translate) through the in-process runtimed.Deps shared podnet adapter; teardown symmetry via the existing releasePodNetwork; NO SandboxProfile proto field."
+          - id: M11.4-d5
+            done: false
+            desc: "Admission + docs: vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in stockkitty-readiness + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave. docs/user/limitations.md vm-section rewrite: de-EXPERIMENTAL criteria named (B109+B110), published figures (S1 boot latency = restart cost, S2 non-TSO ratio, S3 virtiofs IO), ceilings (hostPath-pending-B98, Service-backend posture, network-trust segment, rootfs-writes-are-RAM-bounded, Rosetta translation-cache margin)."
+        acceptance:
+          - id: M11.4-a1
+            met: false
+            check: "label composition + delete-on-loss tables (fake runtimed conditions); arch-truthfulness both-legs table; annotation→stamp + pre-pull-reject + ImagePullBackOff-surface tables; B6 wiring gate (k3sm/pkg/provider::TestGuestNetworkWiredToRuntimed — the B6 item's own gate) green; all -race"
+            method: unit
+      - id: M11.5
+        title: gate — hack/lab/m11.sh + m5.sh graduation
+        status: todo
+        depends_on: [k3sm:M11.4]
+        deliverables:
+          - id: M11.5-d1
+            done: false
+            desc: "Gate machinery (lands with M11's FIRST wave, deliberately not the roadmap encoding): hack/acceptance/m11.sh + hack/lab/m11.sh skeletons + the phases.json two-row shape — M11 (integration, skeleton:true, manual:false, always-red K3SM-SKELETON sentinel) + M11-lab (lab, manual:true, requires vz+signing). Lab legs (docs/m11-plan.md §M11.5): nats under vm (exec exit-code, logs -f, top); pgvector with PVC-backed PGDATA + fsGroup(B112) + dshm tmpfs, WAL-recovers a SIGKILL; the Service-consumed leg (client pod → postgres-in-VM via ClusterIP + Service DNS); the amd64 legs (Rosetta run + legible ImagePullBackOff fail-closed on a non-Rosetta node); measured per-VM host footprint → the B24 overhead reconcile. m5.sh GRADUATES per the M4-lab precedent (re-point + skeleton flip + old-script delete + B34 tombstone in ONE change)."
+        acceptance:
+          - id: M11.5-a1
+            met: false
+            check: "hack/lab/m11.sh green on an entitled VZ Mac (K3SM_LAB=1, human-run — the milestone-done predicate; structurally lab-gated, never unit-green-only) + B110 signing recorded; hack/acceptance/m11.sh carries the CI-provable slice"
+            method: lab
 ---
 
 # k3sm — Phase roadmap
@@ -926,3 +980,31 @@ dev Mac (**M4.1-a1 `met:false`, integration-pending**). M4 still owes **M4.0** (
 server-join + the AES-256-GCM identical-CA bundle) are both code-complete + unit-proven; the live 2-Mac + Postgres
 write-A-read-B, single-active-leader, watch-staleness soak, second-server-join (identical CAs), and kill-A→serve-via-B
 failover are the `hack/lab/m6.sh` / `e2e/TestM6_*` lab legs (`K3SM_LAB=1`, never auto-greened).**
+
+## M11 — Linux containers & multi-arch (k3sm slice) ⬜
+`docs/m11-plan.md` is authoritative (encoded 2026-07-10). M11 **de-EXPERIMENTALs the `vm`
+RuntimeClass** — it shares the post-launch v0.2 headline with M10.2–M10.4. **Hard cut.** The
+de-EXPERIMENTAL flip is **structurally lab-gated** (B109 `hack/lab/m11.sh` green on an entitled VZ
+Mac + human-gated B110 vmhost release signing) — never unit-green-only.
+
+### M11.4 — capability labels + image-platform annotation + B6 wiring + admission/docs ⬜
+**Cross-repo dep:** `apis:M11.1` + `runtimed:M11.2` + `darwin-net:M11.3`.
+**Deliverables** — frontmatter `M11.4-d1…d5`: d1 `k3sm.io/rosetta{,-linux}` labels (B1 pattern,
+B94 delete-on-loss with its **own named k3sm test** — B103); d2 arch truthfulness via an injected
+seam, both-legs table (B104; the k3sm binary stays darwin/arm64 — B105 is pod payloads, never an
+Intel binary); d3 `k3sm.io/image-platform` → per-container stamp, pre-pull fail-closed for
+annotated pods, **`ImagePullBackOff`/Pending** (never terminal Failed) for un-annotated mismatches;
+d4 B6 producer wiring (`SetupGuest` **before** `toPodBox`, in-process `runtimed.Deps` carrier — no
+proto field); d5 admission + docs (os=darwin incantation; the fsGroup VAP exemption is
+**human-gated B112**, cited by name so no wave relaxes `pkg/policy/admission.go` ad hoc;
+`limitations.md` vm rewrite with the published S1/S2/S3 figures and the honest ceilings).
+Guest hostPath stays fail-closed pending human-gated B98 — stockkitty acceptance is
+**PVC-backed PGDATA**.
+
+### M11.5 — gate ⬜
+`hack/lab/m11.sh` + `hack/acceptance/m11.sh` + the phases.json two-row shape (`M11`
+integration-skeleton + `M11-lab` manual, requires vz+signing) land with M11's **first wave** (kept
+out of the docs-only roadmap encoding). Lab legs per `docs/m11-plan.md` §M11.5 — incl. the
+Service-consumed guest leg and the amd64 fail-closed leg; measured per-VM footprint files the B24
+overhead reconcile. `hack/lab/m5.sh` graduates per the M4-lab precedent (re-point + skeleton flip +
+old-script delete + B34 tombstone in one change).
