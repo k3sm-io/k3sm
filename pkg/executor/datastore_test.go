@@ -22,10 +22,13 @@ import (
 	"testing"
 )
 
-// TestDatastoreEndpointSQLiteDefault proves the single-node path is BYTE-UNCHANGED
-// (the M1–M5 golden behavior): an empty Config.DatastoreEndpoint renders kine's argv
-// as exactly [--listen-address 127.0.0.1:<port> --endpoint sqlite://…WAL…], with NO
-// connection-pool flags and NO out-of-band secret env.
+// TestDatastoreEndpointSQLiteDefault proves the single-node path renders kine's argv
+// as exactly [--listen-address 127.0.0.1:<port> --metrics-bind-address 0 --endpoint
+// sqlite://…WAL…], with NO connection-pool flags and NO out-of-band secret env. The
+// --metrics-bind-address 0 DISABLES kine's Prometheus endpoint (kine's default is
+// :8080 on ALL interfaces); pods share the host network, so that listener would
+// collide with any workload binding :8080 (a readiness server) — "address already
+// in use". k3sm does not scrape kine's metrics.
 func TestDatastoreEndpointSQLiteDefault(t *testing.T) {
 	cfg := Config{WorkDir: "/var/lib/k3sm/server", KinePort: 2379}
 	args, err := kineArgs(cfg)
@@ -33,9 +36,13 @@ func TestDatastoreEndpointSQLiteDefault(t *testing.T) {
 		t.Fatalf("kineArgs: %v", err)
 	}
 	wantEndpoint := "sqlite:///var/lib/k3sm/server/db/state.db?_journal=WAL&_busy_timeout=30000"
-	want := []string{"--listen-address", "127.0.0.1:2379", "--endpoint", wantEndpoint}
+	want := []string{"--listen-address", "127.0.0.1:2379", "--metrics-bind-address", "0", "--endpoint", wantEndpoint}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
-		t.Errorf("SQLite kine argv must be byte-unchanged.\n got %v\nwant %v", args, want)
+		t.Errorf("SQLite kine argv mismatch.\n got %v\nwant %v", args, want)
+	}
+	// kine's :8080 metrics endpoint must be disabled so it can't squat a pod's port.
+	if got := flagValue(args, "--metrics-bind-address"); got != "0" {
+		t.Errorf("--metrics-bind-address = %q, want \"0\" (disabled — else kine binds *:8080 and collides with pods)", got)
 	}
 	// No Postgres pool flags leak onto the single-node path.
 	for _, absent := range []string{"--datastore-max-open-connections", "--datastore-max-idle-connections", "--datastore-connection-max-lifetime"} {
@@ -89,6 +96,10 @@ func TestDatastoreEndpointPostgres(t *testing.T) {
 	}
 	if got := flagValue(args, "--datastore-connection-max-lifetime"); got != datastoreConnMaxLifetime {
 		t.Errorf("--datastore-connection-max-lifetime = %q, want %q", got, datastoreConnMaxLifetime)
+	}
+	// The HA path disables kine's :8080 metrics endpoint too (same pod-port-collision reason).
+	if got := flagValue(args, "--metrics-bind-address"); got != "0" {
+		t.Errorf("--metrics-bind-address = %q, want \"0\" (disabled)", got)
 	}
 	// 2*maxOpen must fit a documented Postgres max_connections (default 100) so two HA
 	// servers do not exhaust it.

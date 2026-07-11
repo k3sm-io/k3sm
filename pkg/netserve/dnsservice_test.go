@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -72,5 +73,51 @@ func TestEnsureDNSService(t *testing.T) {
 	// Idempotent: a second call (Service already exists) must not error.
 	if err := s.ensureDNSService(ctx); err != nil {
 		t.Fatalf("ensureDNSService not idempotent: %v", err)
+	}
+}
+
+// TestEnsureKubernetesEndpointSlice proves netserve provisions the
+// default/kubernetes EndpointSlice the Service proxy needs for the API VIP. The
+// single-node apiserver advertises 127.0.0.1 and its reconciler won't publish that
+// loopback endpoint, so without this the slice is absent and the proxy resets in-pod
+// HTTPS to 10.43.0.1:443 (EOF). The slice must carry the service-name label, an
+// IPv4 Ready endpoint at the apiserver's loopback address, and the https/6444 port.
+func TestEnsureKubernetesEndpointSlice(t *testing.T) {
+	cs := fake.NewClientset()
+	s := New(Config{
+		Client:            cs,
+		WorkDir:           t.TempDir(),
+		APIServerEndpoint: "127.0.0.1:6444",
+	})
+	ctx := context.Background()
+	if err := s.ensureKubernetesEndpointSlice(ctx); err != nil {
+		t.Fatalf("ensureKubernetesEndpointSlice: %v", err)
+	}
+
+	sl, err := cs.DiscoveryV1().EndpointSlices("default").Get(ctx, "kubernetes-k3sm", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("kubernetes EndpointSlice not created: %v", err)
+	}
+	// The proxy maps a slice to its Service via this label — not the slice name.
+	if got := sl.Labels[discoveryv1.LabelServiceName]; got != "kubernetes" {
+		t.Errorf("service-name label = %q, want kubernetes (the proxy keys on it)", got)
+	}
+	if sl.AddressType != discoveryv1.AddressTypeIPv4 {
+		t.Errorf("AddressType = %q, want IPv4", sl.AddressType)
+	}
+	if len(sl.Endpoints) != 1 || len(sl.Endpoints[0].Addresses) != 1 || sl.Endpoints[0].Addresses[0] != "127.0.0.1" {
+		t.Fatalf("endpoint addresses = %+v, want [127.0.0.1] (the apiserver's reachable loopback)", sl.Endpoints)
+	}
+	// The proxy drops non-Ready endpoints; the API backend must be Ready.
+	if r := sl.Endpoints[0].Conditions.Ready; r == nil || !*r {
+		t.Errorf("endpoint Ready = %v, want true (else the proxy has no backend)", r)
+	}
+	if len(sl.Ports) != 1 || sl.Ports[0].Port == nil || *sl.Ports[0].Port != 6444 || sl.Ports[0].Name == nil || *sl.Ports[0].Name != "https" {
+		t.Fatalf("ports = %+v, want [https/6444] (must match the kubernetes Service port name)", sl.Ports)
+	}
+
+	// Idempotent: a second call (slice already exists) must not error.
+	if err := s.ensureKubernetesEndpointSlice(ctx); err != nil {
+		t.Fatalf("ensureKubernetesEndpointSlice not idempotent: %v", err)
 	}
 }
