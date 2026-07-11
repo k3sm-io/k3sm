@@ -66,8 +66,14 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   logging, node lifecycle Events. The honest "where we are vs upstream k8s" register lives at
   `docs/UPSTREAM-ALIGNMENT.md`; the self-assessment (k3sm cannot pass Sonobuoy `[Conformance]` — it
   has no Linux containers — but targets a documented subset) at `docs/conformance-profile.md`.
-- **De-EXPERIMENTAL the `vm` RuntimeClass and HA** — the v0.2 / v0.3 headlines, once lab-validated
-  on real hardware (VZ Mac; two Macs + Postgres).
+- **Product-grade Linux workloads & multi-arch — de-EXPERIMENTAL the `vm` RuntimeClass (M11)** —
+  sharing the v0.2 headline with the conformance-hardening tail, once lab-validated on a VZ Mac:
+  multi-arch image selection (an OCI manifest list resolves to the right platform, fail-closed),
+  standard **linux/arm64** images as `vm` pods with working `kubectl exec/logs/top`, volumes, and
+  Service/DNS reachability, and **linux/amd64 images via Rosetta** (the Docker-Desktop-class path —
+  Rosetta-for-Linux inside a per-pod micro-VM, no qemu); plus darwin/amd64 pod payloads under host
+  Rosetta on the native path. Engineering plan: `docs/m11-plan.md` (workspace).
+- **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA** — Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **JACCL / distributed inference** — multi-Mac model sharding (the reserved `MLXModel.Distributed`
