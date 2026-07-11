@@ -450,6 +450,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	ctx = withServiceAccount(ctx, podServiceAccount(pod))
 	id := string(pod.UID)
 	start := metav1.Now()
+	r.log.Info("CreatePod", "namespace", pod.Namespace, "name", pod.Name)
 	// M10.1 ordering (BINDING): allocate the pod's /32 BEFORE translation/env
 	// resolution so box.PodIp and the status.podIP downward-API env carry it. A
 	// translate failure below does NOT release it here (an idempotent retry or
@@ -457,10 +458,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// would also rip a live pod's alias away on an UpdatePod translate error).
 	podIP, err := r.podIP(ctx, pod)
 	if err != nil {
+		// Log here (not just return) so the failure reaches server.log — VK's own
+		// create-error log does not, so a pod stuck Pending is otherwise invisible.
+		r.log.Error("CreatePod: allocate podIP", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	box, err := r.buildBox(ctx, pod, podIP)
 	if err != nil {
+		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 
@@ -480,9 +485,12 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
+		r.log.Error("CreatePod: runtimed RPC", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		r.log.Error("CreatePod: runtimed rejected the pod", "namespace", pod.Namespace, "name", pod.Name,
+			"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
 	// Start the provider-served probe runner (M2.2): the VK provider replaces the
