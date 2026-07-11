@@ -13,3 +13,11 @@ go.work.sum
 .DS_Store
 .idea/
 .vscode/
+
+# hack/acceptance/m2.sh stages the gate's control-plane payload, binary, exec-shim
+# and DYLD shims into the repo root; they are build outputs, never committed.
+/cp-payload/
+/k3sm-m2
+/k3sm-execshim
+/libk3sm_getaddrinfo_shim.dylib
+/libk3sm_pathrebase_shim.dylib
