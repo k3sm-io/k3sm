@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-07-02
-updated_by: roadmap-encoder
+updated: 2026-07-11
+updated_by: orchestrator
 
 phases:
   - id: M0
@@ -87,8 +87,9 @@ phases:
 
   - id: M2
     title: Isolation, resources & pod-spec fidelity (integration side)
-    status: in-progress
-    note: "All k3sm sub-phases M2.0–M2.6 are done (proven by named unit tests at the seam, -race clean); only the workspace-root e2e gate hack/acceptance/m2.sh (single-node confinement/OOMKill/pod-to-pod/in-pod-kubectl/exec, needs root on a Mac) remains for the milestone."
+    status: done
+    completed: 2026-07-11
+    note: "All k3sm sub-phases M2.0–M2.6 done (named unit tests at the seam, -race clean), and the workspace-root e2e gate hack/acceptance/m2.sh run GREEN on Apple-Silicon hardware (macOS 26.5, root install lifecycle): all 13 required conformance criteria PASS plus the install/uninstall cleanliness checks — the first live-hardware proof of the packaged single-node path."
     strategy: hard cut
     depends_on:
       - apis:M2.1
