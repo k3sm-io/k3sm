@@ -25,7 +25,10 @@ import (
 
 	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/clock"
 	testclock "k8s.io/utils/clock/testing"
 
@@ -320,19 +323,17 @@ func TestLifecycleHooksExecHTTP(t *testing.T) {
 	})
 }
 
-// TestDeletePodReportsTerminatedForPromptForceDelete proves DeletePod fires the VK
-// status callback with every container Terminated. VK's PodController force-deletes
-// a deleted pod from the API IMMEDIATELY only when running(status)==false (all
-// container states Terminated); otherwise it falls back to waiting the FULL
-// deletionGracePeriodSeconds. Without the terminal emit the pod lingers the entire
-// grace even though runtimed already stopped it — the M2 GracefulStop failure.
-func TestDeletePodReportsTerminatedForPromptForceDelete(t *testing.T) {
+// TestDeletePodForceDeletesFromAPIForPromptRemoval proves DeletePod force-deletes
+// the pod from the apiserver (grace 0) once runtimed has torn it down, so it does
+// not linger the full deletionGracePeriodSeconds under Virtual Kubelet's
+// delayed-delete fallback (VK's prompt path is unreachable via status —
+// podShouldEnqueue->podsEqual ignores .status). This is the M2 GracefulStop fix.
+func TestDeletePodForceDeletesFromAPIForPromptRemoval(t *testing.T) {
 	r, _ := newLifecycleFake(t, nil)
-	var mu sync.Mutex
-	var emitted []*corev1.Pod
-	r.notify = func(p *corev1.Pod) { mu.Lock(); emitted = append(emitted, p); mu.Unlock() }
-
 	pod := lifecyclePod("del", 30, corev1.Container{Name: "c0", Command: []string{"/web"}})
+	client := fake.NewSimpleClientset(pod)
+	r.client = client
+
 	if err := r.CreatePod(context.Background(), pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
@@ -340,18 +341,8 @@ func TestDeletePodReportsTerminatedForPromptForceDelete(t *testing.T) {
 		t.Fatalf("DeletePod: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(emitted) == 0 {
-		t.Fatal("DeletePod fired no status callback — VK can't force-delete promptly and waits the full grace")
-	}
-	last := emitted[len(emitted)-1]
-	if len(last.Status.ContainerStatuses) == 0 {
-		t.Fatal("final DeletePod status carries no container statuses — VK running() stays true (delayed force-delete)")
-	}
-	for _, cs := range last.Status.ContainerStatuses {
-		if cs.State.Terminated == nil {
-			t.Errorf("container %q not Terminated in the final status — VK running() stays true, force-delete waits the grace", cs.Name)
-		}
+	_, err := client.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("pod still in the apiserver after DeletePod (get err=%v) — it lingers the full deletionGracePeriodSeconds", err)
 	}
 }

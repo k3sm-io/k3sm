@@ -29,6 +29,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
@@ -95,6 +96,17 @@ type runtimedRuntime struct {
 	clk            clock.Clock
 	dial           dialFunc
 	probeTransport http.RoundTripper
+
+	// client force-deletes a pod from the apiserver the instant its containers are
+	// torn down. Virtual Kubelet's PodController (v1.12.0) otherwise delays the
+	// API-side delete of a running-then-deleted pod by the FULL
+	// deletionGracePeriodSeconds: its prompt path (syncPodInProvider force-deleting
+	// on !running) is reachable only via the informer, whose podShouldEnqueue →
+	// podsEqual ignores .status, so a terminal NotifyPods report can't trigger it.
+	// runtimed already stopped the pod synchronously in DeletePod, so a grace-0
+	// delete here is correct and safe (VK's later delayed delete no-ops on NotFound).
+	// nil in unit tests that don't exercise the API removal.
+	client kubernetes.Interface
 
 	mu      sync.Mutex
 	track   map[string]*podTrack  // pod id -> bookkeeping
@@ -258,6 +270,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		deniedSocks:    cfg.DeniedUnixSocketPaths,
 		resolver:       resolver,
 		network:        cfg.Network,
+		client:         cfg.Client,
 		log:            log,
 		clk:            clock.RealClock{},
 		dial:           (&net.Dialer{}).DialContext,
@@ -549,40 +562,31 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 		// outlive the pod, and a deleted pod must never be re-spawned.
 		t.cancelRestarts()
 	}
-	// Report the pod's containers as terminated to the VK callback so the
-	// PodController force-deletes it from the API IMMEDIATELY. VK's
-	// syncPodInProvider force-deletes at once only when running(status)==false (all
-	// container states Terminated); otherwise it waits the FULL
-	// deletionGracePeriodSeconds (its delayed-delete fallback, podcontroller.go).
-	// runtimed already stopped the containers (r.rt.DeletePod is synchronous), so
-	// this is accurate, not optimistic. Fired AFTER the track-forget (above) so the
-	// status stream can't race a stale "running" event back in — emitTerminated
-	// calls the callback directly, independent of the tracked set.
-	r.emitTerminated(pod)
+	// Force-delete the pod from the apiserver now that runtimed has torn its
+	// containers down (r.rt.DeletePod is synchronous). Virtual Kubelet would
+	// otherwise leave a running-then-deleted pod in the API for the FULL
+	// deletionGracePeriodSeconds — see the r.client field doc for why its prompt
+	// path is unreachable via status. grace 0 = immediate; best-effort and
+	// NotFound-tolerant (VK may have force-deleted it first; either order is fine).
+	r.forceDeleteFromAPI(ctx, pod)
 	return nil
 }
 
-// emitTerminated fires the VK status callback with pod marked fully terminated —
-// every container State.Terminated — so VK's running() predicate returns false and
-// its PodController force-deletes the pod from the API without waiting the grace.
-// Direct-to-callback (not emit) because the pod is already forgotten by DeletePod.
-func (r *runtimedRuntime) emitTerminated(pod *corev1.Pod) {
-	cb := r.callback()
-	if cb == nil {
+// forceDeleteFromAPI removes pod from the apiserver with grace 0 so a
+// terminated-then-deleted pod disappears promptly instead of lingering the whole
+// deletionGracePeriodSeconds under VK's delayed-delete fallback. Best-effort: a nil
+// client (unit tests) or a NotFound (already gone) is a no-op; any other error is
+// logged and swallowed so the delete path never blocks on the API.
+func (r *runtimedRuntime) forceDeleteFromAPI(ctx context.Context, pod *corev1.Pod) {
+	if r.client == nil {
 		return
 	}
-	p := pod.DeepCopy()
-	p.Status.Phase = corev1.PodSucceeded
-	now := metav1.Now()
-	cs := make([]corev1.ContainerStatus, 0, len(p.Spec.Containers))
-	for _, c := range p.Spec.Containers {
-		cs = append(cs, corev1.ContainerStatus{
-			Name:  c.Name,
-			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{FinishedAt: now, Reason: "Completed"}},
-		})
+	zero := int64(0)
+	err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	if err != nil && !apierrors.IsNotFound(err) {
+		r.log.Warn("force-delete pod from apiserver after teardown",
+			"namespace", pod.Namespace, "name", pod.Name, "err", err)
 	}
-	p.Status.ContainerStatuses = cs
-	cb(p)
 }
 
 // GetPodStatus returns the named pod's status, NotFound if it is unknown.
