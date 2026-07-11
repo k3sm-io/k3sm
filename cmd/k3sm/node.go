@@ -283,9 +283,23 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	defer eventBroadcaster.Shutdown()
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
 
-	prov, runtimeLabel, vmCapable, err := buildProvider(ctx, opts, cs, recorder)
+	prov, netAdapter, runtimeLabel, vmCapable, err := buildProvider(ctx, opts, cs, recorder)
 	if err != nil {
 		return err
+	}
+
+	// M10.1 startup reconcile — MUST run here, in-process, before the node serves.
+	// The embedded runtimed runtime is driven by direct RPC (provider.NewRuntimed),
+	// never runtime.Server.Serve, so runtimed's own once-before-serve reconcile never
+	// fires on this path. Run the adapter's reconcile directly: it sweeps stale lo0
+	// aliases a prior `launchctl kickstart -k` left behind AND plumbs the node's own
+	// mesh-egress /32 on lo0 so the apiserver node-proxy dial to NodeInternalIP:10250
+	// (kubectl top node / logs / exec) reaches the :10250 listener. Fail closed,
+	// matching runtimed's sticky-once contract. nil for hostprocess / --network none.
+	if netAdapter != nil {
+		if err := netAdapter.ReconcileStartup(ctx); err != nil {
+			return fmt.Errorf("pod network startup reconcile: %w", err)
+		}
 	}
 
 	var servingTLS *tls.Config
@@ -347,26 +361,31 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // in-process host-process runtime has no vm backend, so a node running it is never
 // vm-capable; the runtimed runtime probes GetRuntimeInfo's VMBackendAvailable
 // condition ONCE at bring-up (fail-closed inside VMBackendAvailable).
-func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, string, bool, error) {
+func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, *provider.PodNetAdapter, string, bool, error) {
 	switch resolveRuntime(opts.runtime) {
 	case runtimeHostProcess:
-		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), runtimeHostProcess, false, nil
+		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), nil, runtimeHostProcess, false, nil
 	case runtimeRuntimed:
 		cfg := runtimedConfig(opts, cs)
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
-			return nil, "", false, err
+			return nil, nil, "", false, err
 		}
 		if adapter != nil {
 			cfg.Network = adapter
 		}
 		rt, err := provider.NewRuntimed(cfg)
 		if err != nil {
-			return nil, "", false, fmt.Errorf("build runtimed provider: %w", err)
+			return nil, nil, "", false, fmt.Errorf("build runtimed provider: %w", err)
 		}
-		return provider.NewVKProvider(rt, opts.nodeName), runtimeRuntimed, rt.VMBackendAvailable(ctx), nil
+		// Return the adapter so startNode can run its startup reconcile IN-PROCESS:
+		// the embedded runtimed runtime is driven by direct RPC (NewRuntimed), never
+		// runtime.Server.Serve, so runtimed's once-before-serve reconcileNetworkStartup
+		// never fires on this path. Dropping the adapter here would strand both the
+		// stale-alias sweep and the node's own lo0 alias (kubectl top node / node-proxy).
+		return provider.NewVKProvider(rt, opts.nodeName), adapter, runtimeRuntimed, rt.VMBackendAvailable(ctx), nil
 	default:
-		return nil, "", false, fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
+		return nil, nil, "", false, fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
 	}
 }
 
