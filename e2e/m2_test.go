@@ -312,13 +312,21 @@ func TestM2_ResourceLimitsOOMKilled(t *testing.T) {
 }
 
 // TestM2_KubectlTop proves the kubelet Summary API reports a real footprint for a
-// running pod (the M2.3 ri_phys_footprint → working-set surface that `kubectl top`
-// reads). It queries the node's /stats/summary via the apiserver proxy and asserts
-// a non-zero working-set for the pod.
+// running pod (the M2.3 ri_phys_footprint → working-set surface `kubectl top` reads).
+// k3sm meters LIMIT-carrying pods in M2: the per-pod memory sampler is limit-driven
+// (the same sampler enforces OOM and feeds Summary), so an unlimited pod is not
+// sampled and is absent from Summary — a documented M2 posture (broadening metering
+// to every pod is deferred). The probe therefore carries a memory limit and holds a
+// resident allocation, then asserts a non-zero working-set via /stats/summary.
 func TestM2_KubectlTop(t *testing.T) {
 	c := Up(t)
 	const name = "m2-top"
-	pod := nativePod(name, "/usr/bin/tail", "-f", "/dev/null")
+	// memhog allocates+touches 128 MiB (resident) then idles; the 512Mi limit spins
+	// up the sampler (so the pod enters Summary) without OOM-killing it.
+	pod := nativePod(name, helperBin(t, "conftool"), "memhog", "-mb", "128")
+	pod.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+	}
 	applyAndWaitPhase(t, c, pod, corev1.PodRunning, 90*time.Second)
 	node := darwinNode(t, c).Name
 

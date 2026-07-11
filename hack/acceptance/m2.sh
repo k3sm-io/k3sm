@@ -39,6 +39,13 @@ cleanup() {
 	# and flush the DNS VIP, so a mid-run failure can't poison a re-run (uninstall
 	# now does the reap too, but a build/install-failed run never reaches it).
 	pkill -9 -f '/var/lib/k3sm/server/bin/' >/dev/null 2>&1 || true
+	# Reap leaked POD processes too: pods spawn with POSIX_SPAWN_SETSID and reparent to
+	# launchd when the daemon exits, so a native test pod (hello-http/conftool from the
+	# conformance bin) or a rootfs pod can outlive its daemon and squat a host port
+	# (e.g. :8080) or block a clean uninstall. runtimed has no startup pod reaper yet
+	# (tracked in the backlog); the gate reaps its own test pods here.
+	pkill -9 -f 'k3sm-conformance-bin' >/dev/null 2>&1 || true
+	pkill -9 -f '/var/lib/k3sm/pods/' >/dev/null 2>&1 || true
 	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
 	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" "$DNSSHIM" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
@@ -214,6 +221,21 @@ rm -rf "$DNS_PROBE_DIR"
 # dyld_shim / k3sm_dns_server here is the injection break the shell probes can't see.
 echo "--- (4) server.log: provider DNS config + per-pod injection outcome:"
 grep -E 'runtimed provider configured|pod box cluster-DNS wiring' /var/log/k3sm/server.log 2>/dev/null | tail -8 || echo "    (no DNS-wiring log lines — server predates this diagnostic)"
+
+# [diagnostic] Reap leaked test pods so a PRIOR run's SETSID-detached hello-http can't
+# squat host :8080 before this run's readiness pod binds it (TestM2_Probes), then probe
+# the API-VIP path so an InPodKubectl EOF localizes to backend vs proxy vs backend-presence.
+echo "==> [diagnostic] reap leaked pods (:8080) + probe the API VIP path (10.43.0.1:443):"
+pkill -9 -f 'k3sm-conformance-bin' >/dev/null 2>&1 || true
+pkill -9 -f '/var/lib/k3sm/pods/' >/dev/null 2>&1 || true
+echo "--- host :8080 holder after reap (want free — else a leak the reap missed):"
+lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | head -3 || true
+echo "--- default/kubernetes EndpointSlice (the API-VIP backend the proxy dials):"
+"$INSTALL_DIR/k3sm" kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide 2>&1 | head -4 || true
+echo "--- TLS to the apiserver backend 127.0.0.1:6444 (clean 'Verify'/subject = backend OK):"
+echo | openssl s_client -connect 127.0.0.1:6444 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | head -4 || true
+echo "--- TLS to the API VIP 10.43.0.1:443 (the proxy path — EOF/reset HERE, not on 6444, isolates the proxy):"
+echo | openssl s_client -connect 10.43.0.1:443 -servername kubernetes.default.svc 2>&1 | grep -E 'CONNECTED|Verify return|subject=|errno|no peer|closed' | head -4 || true
 
 # m2.A — the per-criterion M2 conformance suite (e2e/m2_test.go), each criterion
 # named per its reference-workload feature class. The NON-VACUOUS guard
