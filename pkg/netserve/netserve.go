@@ -29,7 +29,6 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -55,13 +54,16 @@ type Config struct {
 	DNSVIP string
 	// ClusterDomain is the cluster DNS domain (e.g. cluster.local).
 	ClusterDomain string
-	// APIServerEndpoint is the apiserver's reachable host:port (e.g. 127.0.0.1:6444).
-	// The Service proxy is EndpointSlice-only and needs a backend for the kubernetes
-	// Service VIP (10.43.0.1:443); single-node the apiserver advertises 127.0.0.1,
-	// which its endpoint reconciler refuses to publish, so NO default/kubernetes
-	// EndpointSlice exists and the proxy resets in-pod HTTPS to the API VIP (EOF).
-	// Run provisions a slice pointing here (the address the proxy dials from the
-	// host) when set; empty skips it (the apiserver owns the singleton on a routable node).
+	// APIServerEndpoint is the apiserver's reachable host:port (e.g. 127.0.0.1:6444),
+	// set ONLY when the apiserver advertises loopback (the single-node posture).
+	// The kubernetes Service VIP (10.43.0.1:443) then routes to it via a STATIC
+	// proxy backend (proxy.WithStaticBackends) — no EndpointSlice is involved,
+	// because none can exist: upstream EndpointSlice/Endpoints validation
+	// hard-rejects loopback endpoint addresses on create, which blocks both the
+	// apiserver's own endpoint reconciler AND any slice provisioned on its behalf
+	// (the k8s.io "may not be in the loopback range" rule). Empty on a
+	// routable-advertise node (mesh), where the apiserver publishes its own valid
+	// kubernetes endpoints and the proxy follows the real slice.
 	APIServerEndpoint string
 	// NodeIP is the node InternalIP (reserved for future mesh wiring).
 	NodeIP string
@@ -196,9 +198,39 @@ func New(cfg Config) *Server {
 	opts = append(opts, proxy.WithPolicyTable(s.policy))
 
 	s.proxy = proxy.New(table, opts...)
-	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log)
+	// Loopback-advertising apiserver (single node): pin the kubernetes VIP to the
+	// static backend — the one Service whose endpoints upstream validation forbids
+	// publishing (loopback endpoint addresses are rejected on create), so the
+	// EndpointSlice-driven watcher could never learn it. See Config.APIServerEndpoint.
+	var watchOpts []proxy.WatcherOption
+	if s.cfg.APIServerEndpoint != "" {
+		static, err := staticAPIServerBackends(s.cfg.APIServerEndpoint)
+		if err != nil {
+			log.Warn("api-server endpoint did not parse; kubernetes VIP has no backend (in-pod kubectl degraded)", "endpoint", s.cfg.APIServerEndpoint, "err", err)
+		} else {
+			watchOpts = append(watchOpts, proxy.WithStaticBackends(static))
+		}
+	}
+	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log, watchOpts...)
 	s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log)
 	return s
+}
+
+// staticAPIServerBackends renders the proxy static-backend map for the
+// kubernetes Service from the apiserver's host:port: one always-Ready endpoint
+// every kubernetes-VIP port routes to. Pure so the parse is table-tested.
+func staticAPIServerBackends(endpoint string) (map[string][]netv1.Endpoint, error) {
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parse api-server endpoint %q: %w", endpoint, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("parse api-server port %q: not a valid port", portStr)
+	}
+	return map[string][]netv1.Endpoint{
+		"default/kubernetes": {{IP: host, Port: int32(port), Ready: true}},
+	}, nil
 }
 
 // Run renders the (currently unconsumed) CoreDNS Corefile to the workdir, then runs the Service proxy
@@ -233,13 +265,6 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.dnsVIP.IsValid() {
 		if err := s.ensureDNSService(ctx); err != nil {
 			s.log.Warn("ensure kube-dns Service; netd may deny the DNS VIP bind", "err", err)
-		}
-	}
-	// Provision the default/kubernetes EndpointSlice so the Service proxy has a
-	// backend for the API VIP (in-pod client-go). See Config.APIServerEndpoint.
-	if s.cfg.APIServerEndpoint != "" {
-		if err := s.ensureKubernetesEndpointSlice(ctx); err != nil {
-			s.log.Warn("ensure default/kubernetes EndpointSlice; in-pod API VIP has no backend", "err", err)
 		}
 	}
 	// The per-node cluster DNS resolver. It is best-effort: a bind/serve failure is
@@ -286,60 +311,6 @@ func (s *Server) ensureDNSService(ctx context.Context) error {
 	}
 	if _, err := s.cfg.Client.CoreV1().Services("kube-system").Create(ctx, svc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create kube-dns service %s: %w", s.dnsVIP, err)
-	}
-	return nil
-}
-
-// ensureKubernetesEndpointSlice idempotently provisions a default/kubernetes
-// EndpointSlice pointing at the apiserver (Config.APIServerEndpoint), so the
-// EndpointSlice-only Service proxy has a backend for the kubernetes Service VIP
-// (10.43.0.1:443). Single-node the apiserver advertises 127.0.0.1 and its endpoint
-// reconciler refuses to publish that loopback endpoint, so it creates neither the
-// Endpoints nor the slice — leaving the proxy to reset in-pod HTTPS to the API VIP
-// (EOF). The slice carries the kubernetes.io/service-name=kubernetes label (how the
-// proxy maps it to the Service) with a DISTINCT name so a future routable-node
-// apiserver reconciler (which owns the "kubernetes"-named slice) never collides.
-func (s *Server) ensureKubernetesEndpointSlice(ctx context.Context) error {
-	host, portStr, err := net.SplitHostPort(s.cfg.APIServerEndpoint)
-	if err != nil {
-		return fmt.Errorf("parse api-server endpoint %q: %w", s.cfg.APIServerEndpoint, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("parse api-server port %q: %w", portStr, err)
-	}
-	p := int32(port)
-	name := "https"
-	proto := corev1.ProtocolTCP
-	ready := true
-	slice := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes-k3sm",
-			Namespace: "default",
-			Labels: map[string]string{
-				discoveryv1.LabelServiceName: "kubernetes",
-				// A NON-controller managed-by, so the KCM endpointslice-controller does
-				// not claim this slice — it reaps any service-name=kubernetes slice
-				// lacking managed-by=endpointslice-controller.k8s.io as an orphan
-				// (deleting our slice moments after we create it). The proxy matches on
-				// service-name only, so managed-by is invisible to the datapath.
-				discoveryv1.LabelManagedBy: "k3sm.io/netserve",
-				"k3sm.io/managed":          "true",
-			},
-		},
-		AddressType: discoveryv1.AddressTypeIPv4,
-		Endpoints: []discoveryv1.Endpoint{{
-			Addresses:  []string{host},
-			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
-		}},
-		Ports: []discoveryv1.EndpointPort{{
-			Name:     &name,
-			Port:     &p,
-			Protocol: &proto,
-		}},
-	}
-	if _, err := s.cfg.Client.DiscoveryV1().EndpointSlices("default").Create(ctx, slice, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create default/kubernetes EndpointSlice -> %s: %w", s.cfg.APIServerEndpoint, err)
 	}
 	return nil
 }

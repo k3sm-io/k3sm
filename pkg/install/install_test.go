@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -91,6 +92,15 @@ func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) err
 
 func (f *fakeSystem) RemoveAll(path string) error {
 	f.calls = append(f.calls, "RemoveAll:"+path)
+	return nil
+}
+
+func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
+	strs := make([]string, len(prefixes))
+	for i, p := range prefixes {
+		strs[i] = p.String()
+	}
+	f.calls = append(f.calls, "FlushLo0Aliases:"+strings.Join(strs, ","))
 	return nil
 }
 
@@ -234,6 +244,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"RemoveAll:/Library/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
+		// The lo0 flush covers the pinned pod aggregate + the Service CIDR — the
+		// pod /32s, the API/DNS VIPs, and the node mesh-egress .1 (which the pod
+		// stale-sweep deliberately never touches) all fall inside these two.
+		"FlushLo0Aliases:100.64.0.0/10,10.43.0.0/16",
 	}
 	if strings.Join(f.calls, ",") != strings.Join(want, ",") {
 		t.Fatalf("uninstall calls = %v, want %v", f.calls, want)
