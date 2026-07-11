@@ -67,7 +67,16 @@ func sqliteEndpoint(workDir string) string {
 // translates); the scheme of the DSN selects the driver (sqlite:// vs postgres://,
 // the latter via jackc/pgx/v5).
 func kineArgs(cfg Config) ([]string, error) {
-	args := []string{"--listen-address", "127.0.0.1:" + strconv.Itoa(cfg.KinePort)}
+	// Disable kine's Prometheus metrics endpoint. It defaults to :8080 on ALL
+	// interfaces (kine v1.14.2 app.go: "set 0 to disable metrics serving"), and
+	// because k3sm pods share the host network (no netns), that listener collides
+	// with any workload binding :8080 — e.g. a readiness probe server — failing it
+	// with "bind: address already in use". k3sm does not scrape kine's metrics; a
+	// later need would bind them to a chosen localhost port, never all-interfaces :8080.
+	args := []string{
+		"--listen-address", "127.0.0.1:" + strconv.Itoa(cfg.KinePort),
+		"--metrics-bind-address", "0",
+	}
 	if cfg.DatastoreEndpoint == "" {
 		return append(args, "--endpoint", sqliteEndpoint(cfg.WorkDir)), nil
 	}

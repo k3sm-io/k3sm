@@ -331,7 +331,32 @@ func TestM2_KubectlTop(t *testing.T) {
 	node := darwinNode(t, c).Name
 
 	if !pollUntil(60*time.Second, func() bool { return podWorkingSet(t, c, node, conformanceNS, name) > 0 }) {
-		t.Fatalf("kubelet Summary API never reported a non-zero working-set for %s/%s on node %s", conformanceNS, name, node)
+		// podWorkingSet collapses proxy-error / absent-pod / present-with-zero all to 0.
+		// On failure, query once more and report WHICH so the cause is localized: an
+		// apiserver→node proxy failure, the pod ABSENT (sampler never created — the
+		// limit didn't reach runtimed's box), or PRESENT-with-zero (sampler ran but the
+		// footprint is 0 — the metering read the wrong/dead PID).
+		raw, err := c.Client.CoreV1().RESTClient().Get().
+			AbsPath(fmt.Sprintf("/api/v1/nodes/%s/proxy/stats/summary", node)).DoRaw(context.Background())
+		if err != nil {
+			t.Fatalf("KubectlTop: /stats/summary GET failed: %v — apiserver→node proxy, not metering", err)
+		}
+		var s summary
+		if err := json.Unmarshal(raw, &s); err != nil {
+			t.Fatalf("KubectlTop: /stats/summary did not parse (%d bytes): %v", len(raw), err)
+		}
+		names := make([]string, 0, len(s.Pods))
+		present := false
+		for _, p := range s.Pods {
+			names = append(names, p.PodRef.Namespace+"/"+p.PodRef.Name)
+			if p.PodRef.Namespace == conformanceNS && p.PodRef.Name == name {
+				present = true
+			}
+		}
+		if present {
+			t.Fatalf("KubectlTop: %s/%s PRESENT in Summary but working-set stayed 0 — sampler ran, footprint 0 (wrong/dead PID). summary pods=%v", conformanceNS, name, names)
+		}
+		t.Fatalf("KubectlTop: %s/%s ABSENT from Summary — sampler never created (limit didn't reach the box, or pod untracked). %d summary pods=%v", conformanceNS, name, len(s.Pods), names)
 	}
 }
 
