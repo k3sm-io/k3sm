@@ -130,6 +130,13 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 			c.HTTPListenAddr = cfg.HTTPListenAddr
 			c.NumWorkers = cfg.NumWorkers
 			c.TLSConfig = cfg.TLSConfig // nil = plain HTTP (M0 path); set = kubelet-serving TLS
+			// k3sm resolves downward-API env in the provider itself (env.go
+			// resolveDownwardEnv), AFTER the pod's /32 is allocated so status.podIP
+			// carries the real IP. VK v1.12.0's own PopulateEnvironmentVariables runs
+			// BEFORE CreatePod and hard-errors on status.podIP ("unsupported
+			// fieldPath"), stranding such a pod Pending before it ever reaches the
+			// provider — so skip VK's resolution and let the provider own it.
+			c.SkipDownwardAPIResolution = true
 			if routes {
 				c.Handler = api.InstrumentHandler(nodeutil.WithAuth(nodeutil.NoAuth(), mux))
 			}
