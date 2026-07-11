@@ -176,6 +176,35 @@ func defaultNodePodCIDR() string {
 	return cidr.String()
 }
 
+// loopbackNodeIP is the --node-ip default. On the runtimed datapath it is
+// rewritten to a globally-unicast address (see nodeInternalIP) because the
+// apiserver node-proxy rejects a loopback NodeInternalIP — its isProxyableHostname
+// runs net.IP.IsGlobalUnicast(), which loopback fails — with HTTP 400, breaking
+// `kubectl top node` (GET /nodes/<n>/proxy/stats/summary).
+const loopbackNodeIP = "127.0.0.1"
+
+// nodeInternalIP derives the globally-unicast address the VK node advertises as
+// its NodeInternalIP from the node's pod /24: the reserved mesh-egress /32 (.1,
+// podnet.MeshEgressIP). That address is RFC-6598 unicast (IsGlobalUnicast()==true
+// → passes the apiserver node-proxy's isProxyableHostname), deterministic across
+// restarts, never handed to a pod, and reachable on the same Mac once aliased on
+// lo0 (the podnet adapter's ReconcileStartup plumbs that alias). It is DECOUPLED
+// from the apiserver bind/advertise-address (executor.Config.NodeIP stays
+// loopback, so the in-pod kubernetes endpoint is unaffected). Returns "" on a bad
+// podCIDR so the caller keeps the loopback default rather than inventing an
+// address.
+func nodeInternalIP(podCIDR string) string {
+	prefix, err := netip.ParsePrefix(podCIDR)
+	if err != nil {
+		return ""
+	}
+	ip, err := podnet.MeshEgressIP(prefix)
+	if err != nil {
+		return ""
+	}
+	return ip.String()
+}
+
 // errRuntimedPosture is the NAMED refuse-to-start error of the M10.1
 // default-runtime flip: the runtimed runtime's pod network needs root or the
 // netd helper, and neither is present. k3sm never silently degrades to
@@ -219,6 +248,23 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	if err := runtimePreflight(ctx, opts); err != nil {
 		return err
 	}
+
+	// Advertise a globally-unicast NodeInternalIP on the runtimed datapath so the
+	// apiserver node-proxy accepts /nodes/<n>/proxy/stats/summary (kubectl top
+	// node): a loopback InternalIP fails isProxyableHostname (IsGlobalUnicast) →
+	// HTTP 400. Derive the node's reserved mesh-egress .1 (never a pod IP); the
+	// podnet adapter's startup reconcile aliases it on lo0 so the same-host proxy
+	// dial reaches the :10250 listener. This mutates only the by-value node opts —
+	// executor.Config.NodeIP (the apiserver bind) stays loopback, so the in-pod
+	// kubernetes endpoint is unaffected — and flows to the node's advertised
+	// address, its kubelet serving-cert SANs, and the adapter's node alias. An
+	// explicit --node-ip (e.g. --mesh-ip, already globally-unicast) is honored.
+	if opts.netMode.DataPath() && opts.nodeIP == loopbackNodeIP {
+		if ip := nodeInternalIP(opts.podCIDR); ip != "" {
+			opts.nodeIP = ip
+		}
+	}
+
 	restCfg, err := clientcmd.BuildConfigFromFlags("", opts.kubeconfig)
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)

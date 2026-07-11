@@ -63,6 +63,11 @@ type PodIPAM interface {
 	// SweepStale removes every k3sm-owned lo0 alias in the node podCIDR not in
 	// the known podID->IP set (the crash-recovery orphan sweep).
 	SweepStale(ctx context.Context, known map[string]netip.Addr) error
+	// EnsureNodeAlias plumbs the lo0 /32 alias for the node's OWN advertised
+	// address (the mesh-egress .1) so the apiserver node-proxy can dial
+	// NodeInternalIP:10250 on the same host (kubectl top node). It is outside the
+	// pod range the sweep touches, and idempotent.
+	EnsureNodeAlias(ctx context.Context, ip netip.Addr) error
 }
 
 // podnetTeardownTimeout bounds the ctx-less Teardown leg (the
@@ -169,6 +174,20 @@ func (a *PodNetAdapter) MarkHostNetwork(podID string) {
 func (a *PodNetAdapter) ReconcileStartup(ctx context.Context) error {
 	if err := a.ipam.SweepStale(ctx, nil); err != nil {
 		return fmt.Errorf("podnet startup stale-alias sweep: %w", err)
+	}
+	// Plumb the node's OWN lo0 alias so the apiserver node-proxy can dial the
+	// advertised NodeInternalIP:10250 on the same host — a globally-unicast
+	// mesh-egress .1 loops back to the local :10250 listener only once aliased.
+	// This unblocks `kubectl top node` (the apiserver's isProxyableHostname rejects
+	// a loopback InternalIP with HTTP 400). A loopback nodeIP needs no alias
+	// (already on lo0) and is skipped. Fail closed on error, consistent with the
+	// sweep above: an advertised address the host cannot answer for is an
+	// inconsistency (top-node AND hostNetwork-pod binds would both break).
+	if ip, err := netip.ParseAddr(a.nodeIP); err == nil && !ip.IsLoopback() {
+		if err := a.ipam.EnsureNodeAlias(ctx, ip); err != nil {
+			return fmt.Errorf("podnet ensure node lo0 alias %s: %w", ip, err)
+		}
+		a.log.Info("node lo0 alias ensured for apiserver node-proxy reachability", "node_ip", a.nodeIP)
 	}
 	a.log.Info("pod network startup reconcile complete (full stale-alias sweep)")
 	return nil
