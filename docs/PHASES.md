@@ -735,10 +735,10 @@ phases:
         deliverables:
           - id: M12.4-d1
             done: false
-            desc: "k3sm builder up|down manages a buildkitd vm pod (Linux arm64 + Rosetta amd64, PVC-backed cache); buildkitd runs guest-root inside its dedicated micro-VM (the VM boundary IS the isolation; the pod spec declares no foreign securityContext). The buildkitd image is UPSTREAM DIGEST-PINNED in code (human-merged bumps; availability/rate limits documented; airgap = pre-seed via k3sm image load). k3sm build (full path) drives the BUNDLED buildx over the NAT-dial path proven by the vm networking spike (a Service/pod-IP dial — never a new vmhost socket forward); COPY-only Dockerfiles auto-route to the M12.3 native fast-path."
+            desc: "k3sm builder up|down manages a buildkitd vm pod (Linux arm64 + Rosetta amd64, PVC-backed cache); buildkitd runs guest-root inside its dedicated micro-VM (the VM boundary IS the isolation; the pod spec declares no foreign securityContext). The buildkitd image is consumed ONLY from the k3sm GHCR mirror, digest-pinned in code (ghcr.io/k3sm-io/mirror/buildkit@sha256:… via pkg/images; populated per Res. 12 by the committed hack/images/mirror.yaml manifest + digest-verified copy workflow, B121/B122; human-merged bumps; airgap = pre-seed via k3sm image load). k3sm build (full path) drives the BUNDLED buildx over the NAT-dial path proven by the vm networking spike (a Service/pod-IP dial — never a new vmhost socket forward); COPY-only Dockerfiles auto-route to the M12.3 native fast-path."
           - id: M12.4-d2
             done: false
-            desc: "Packaging (named, never assumed): buildx SOURCE-BUILT at a pinned upstream tag (the control-plane-payload provenance precedent — never re-sign a prebuilt); committed pin file (version+sha256); release workflow fifth-checkout + sibling assert; archive-manifest + nested-code enumeration + bidirectional entitlement row (buildx carries NONE); brew source-build leg; install path + uninstall-manifest coverage; k3sm doctor builder probe; legible-absence contract (builder stack absent ⇒ the full path errors naming the install step; the COPY-only fast-path is unaffected). Third-party attribution: license tooling run AGAINST the buildx checkout at its pinned ref + its LICENSE shipped (the module-graph generator cannot see a separately-compiled binary); hygiene gate extended to verify."
+            desc: "Packaging (named, never assumed): buildx SOURCE-BUILT at a pinned upstream tag (the control-plane-payload provenance precedent — never re-sign a prebuilt); committed pin file (version+sha256); release workflow fifth-checkout + sibling assert; archive-manifest + nested-code enumeration + bidirectional entitlement row (buildx carries NONE); brew source-build leg; install path + uninstall-manifest coverage; k3sm doctor builder probe; release image-pin gate: hack/verify-image-pins.sh --live proves every pkg/images pin exists on GHCR at its recorded digest with linux/arm64+linux/amd64, anonymously, wired into release.yml before the first tagged release consuming images.Buildkitd; legible-absence contract (builder stack absent ⇒ the full path errors naming the install step; the COPY-only fast-path is unaffected). Third-party attribution: license tooling run AGAINST the buildx checkout at its pinned ref + its LICENSE shipped (the module-graph generator cannot see a separately-compiled binary); hygiene gate extended to verify."
         acceptance:
           - id: M12.4-a1
             met: false
@@ -747,6 +747,10 @@ phases:
           - id: M12.4-a2
             met: false
             check: "vmhost release signing (B110) + the guest kernel artifact (B111) are RECORDED facts before this sub-phase merges — the acceptance-clause pattern for human-gated preconditions (queue-item ids are not depends_on vocabulary)"
+            method: build
+          - id: M12.4-a3
+            met: false
+            check: "the GHCR mirror infra (B121 mirror manifest + workflow, B122 pkg/images pins + verify) is MERGED with gates green — recorded facts per the M12.4-a2 pattern (Res. 12; queue-item ids are not depends_on vocabulary)"
             method: build
 ---
 
