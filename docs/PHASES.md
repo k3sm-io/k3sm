@@ -450,7 +450,7 @@ phases:
     title: MLX — native Apple-Silicon ML serving (the NVIDIA-GPU-Operator analog for Mac)
     status: todo
     strategy: hard cut
-    note: "LEDGER STUB. Launch-blocking (user decision: launch WITH MLX v1; m8.sh joins the launch-gate set — the public flip is M9). k3sm owns M8.3 (node extended-resource + labels), M8.4 (mlx-serve uv image under hack/images/), M8.5 (pkg/mlx operator), M8.6 (the m8.sh gate). apis owns M8.1 (mlx.k3sm.io/v1alpha1 CRD + reserved-band proto carve); runtimed owns M8.0 spikes + M8.2 (Metal SBPL + egress + AdHocSignTree + GPUFacts, incl. the d0 OCI-layer unpacker prerequisite). NO M8-lab row — a GPU dev-mac covers it (Res. 15). All wire/API change is additive (new CRD group, reserved-band proto fields default-false)."
+    note: "LEDGER STUB. Launch-blocking (user decision: launch WITH MLX v1; m8.sh joins the launch-gate set — the public flip is M9). k3sm owns M8.3 (node extended-resource + labels), M8.4 (mlx-serve uv image under hack/images/), M8.5 (pkg/mlx operator), M8.6 (the m8.sh gate). apis owns M8.1 (mlx.k3sm.io/v1alpha1 CRD + reserved-band proto carve); runtimed owns M8.0 spikes + M8.2 (Metal SBPL + egress + AdHocSignTree + GPUFacts — it CONSUMES the OCI-layer unpacker, re-homed 2026-07-11 to the runtimed M11.2 wave as M11.2-d7, via its depends edge; M8 is sequenced after that wave in the amended launch chain). NO M8-lab row — a GPU dev-mac covers it (Res. 15). All wire/API change is additive (new CRD group, reserved-band proto fields default-false)."
     depends_on:
       - apis:M8.1
       - runtimed:M8.2
@@ -508,7 +508,7 @@ phases:
     title: Public launch — the flip, the gates, the announcement (WITH MLX v1)
     status: todo
     strategy: hard cut
-    note: "LEDGER STUB. No new product code — M9 is the launch checklist. IRREVERSIBLE: repos-public + tagged module versions are forever (sumdb pins tags). Gate hack/acceptance/m9.sh is a manual:true phases.json row (a launch is a human act; the release process never auto-greens it) that machine-enumerates the launch-blocking ledger (m2/m3/m4 dev-mac, lab/m3 two-Mac, m7 umbrella + lab/m7 reboot-via-real-brew-artifact, m7/{ci,docs,hygiene}, verify-vanity, m8.sh MLX e2e, B28 disposition). M5 (vm) + M6 (HA) ship documented EXPERIMENTAL — NOT launch-blocking, the v0.2/v0.3 headlines. Degraded brew-only profile is the only sanctioned Apple-enrollment fallback (security-engineer co-signed)."
+    note: "LEDGER STUB. No new product code — M9 is the launch checklist. IRREVERSIBLE: repos-public + tagged module versions are forever (sumdb pins tags). Gate hack/acceptance/m9.sh is a manual:true phases.json row (a launch is a human act; the release process never auto-greens it) that machine-enumerates the launch-blocking ledger (m2/m3/m4 dev-mac, lab/m3 two-Mac, m7 umbrella + lab/m7 reboot-via-real-brew-artifact, m7/{ci,docs,hygiene}, verify-vanity, m8.sh MLX e2e, B28 disposition, AND — re-sequenced 2026-07-11 — the m11-core row: lab/m11.sh --core, the Linux-images-under-vm functional slice, rc-artifact-sha-bound like the other lab rows, with named conditional dispositions for spike/enrollment contingencies). The vm path ships functional-EXPERIMENTAL AT launch; the de-EXPERIMENTAL flip stays the v0.2 headline; M6 (HA) ships documented EXPERIMENTAL — NOT launch-blocking, the v0.3 headline. Degraded brew-only profile is the only sanctioned Apple-enrollment fallback (security-engineer co-signed; under it the vm headline drops to conditional by default)."
     depends_on:
       - k3sm:M7
       - k3sm:M8
@@ -519,7 +519,7 @@ phases:
         deliverables:
           - id: M9.1-d1
             done: false
-            desc: "STUB. The 8-step flip runbook: rc dry-run (v0.1.0-rc.1, cross-repo GitHub App read credential, brews.skip_upload:auto, lab/m7.sh rc-mode local-formula install) → same-day m9.sh pre-flight (rotation verified-complete before flip) → repos public apis→runtimed+darwin-net→k3sm one sitting (repo-settings.sh per flip incl. v* tag protection + release-env) → GHCR mlx-serve public → site deploy at commit (re-deploy after tag) → tag v0.1.0 ×4 same SHA set → outside-world verify (clean-Mac brew install + MLXModel demo + proxy.golang.org ×4 modules post-tag) → announce after a settle window. Announcement assets (blog 'Kubernetes with zero Linux', MLX demo asciinema, comparison table, limitations.md linked) staged in M7.3/M8."
+            desc: "STUB. The 8-step flip runbook: rc dry-run (v0.1.0-rc.1, cross-repo GitHub App read credential, brews.skip_upload:auto, lab/m7.sh rc-mode local-formula install) → same-day m9.sh pre-flight (rotation verified-complete before flip; the m11-core row re-run against the rc artifact) → repos public apis→runtimed+darwin-net→k3sm one sitting (repo-settings.sh per flip incl. v* tag protection + release-env) → GHCR mlx-serve public → site deploy at commit (re-deploy after tag) → tag v0.1.0 ×4 same SHA set → outside-world verify (clean-Mac brew install + MLXModel demo + proxy.golang.org ×4 modules post-tag) → announce after a settle window. Announcement assets (blog 'Kubernetes with zero Linux' + the linux-images-under-vm EXPERIMENTAL story conditional on the m11-core row, MLX demo asciinema, comparison table, limitations.md linked) staged in M7.3/M8."
         acceptance:
           - id: M9.1-a1
             met: false
@@ -610,15 +610,20 @@ phases:
     status: todo
     depends_on: []
     notes: >-
-      docs/m11-plan.md is authoritative (Phase C encoded from it). M11 de-EXPERIMENTALs
-      the vm RuntimeClass — SHARES the post-launch v0.2 headline with M10.2–M10.4.
-      Hard cut. The de-EXPERIMENTAL flip is STRUCTURALLY lab-gated: B109 (hack/lab/m11.sh
-      green on an entitled VZ Mac) + B110 (vmhost release signing, human-gated) — never
-      unit-green-only. The foreign-user VAP exemption for vm pods is human-gated B112
-      (admission-model change, the B71 precedent) — WITHOUT it the headline fsGroup
-      workload is rejected 422 at admission; this wave cites pkg/policy/admission.go by
-      name so nobody relaxes it ad hoc. Guest hostPath stays fail-closed pending
-      human-gated B98 — M11's stockkitty acceptance uses PVC-backed PGDATA.
+      docs/m11-plan.md is authoritative (Phase C encoded from it). RE-SEQUENCED PRE-LAUNCH
+      (2026-07-11, its R16): the build waves ship the vm path FUNCTIONAL-EXPERIMENTAL at
+      v0.1 (both arches — linux/arm64 + linux/amd64-via-Rosetta), proven by the m11-core
+      launch ledger row; the de-EXPERIMENTAL flip alone stays the post-launch v0.2 headline
+      SHARED with M10.2–M10.4. Run out of ledger order with recorded rationale — the M10
+      remainder is hardware-gated and not a dependency. Hard cut. The de-EXPERIMENTAL flip
+      is STRUCTURALLY lab-gated: B109 (the FULL hack/lab/m11.sh ledger + published figures
+      on an entitled VZ Mac) + B110 (vmhost release signing, human-gated — now load-bearing
+      for the v0.1 headline) — never unit-green-only. The foreign-user VAP exemption for vm
+      pods is human-gated B112 (admission-model change, the B71 precedent) — WITHOUT it the
+      headline fsGroup workload is rejected 422 at admission; this wave cites
+      pkg/policy/admission.go by name so nobody relaxes it ad hoc. Guest hostPath stays
+      fail-closed pending human-gated B98 — the launch slice is PVC-only (PGDATA rides a
+      PVC); no hostPath leg exists in the m11-core legs.
     subphases:
       - id: M11.4
         title: capability labels + image-platform annotation + B6 wiring + admission/docs
@@ -639,7 +644,7 @@ phases:
             desc: "B6 producer wiring per the decided carrier (m11-plan Resolution 3): podnet.SetupGuest + dns.GuestResolvConf run BEFORE toPodBox (the M10.1 one-authority ordering — downward-API status.podIP env resolves pre-translate) through the in-process runtimed.Deps shared podnet adapter; teardown symmetry via the existing releasePodNetwork; NO SandboxProfile proto field."
           - id: M11.4-d5
             done: false
-            desc: "Admission + docs: vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in the reference-workload readiness notes (internal) + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave. docs/user/limitations.md vm-section rewrite: de-EXPERIMENTAL criteria named (B109+B110), published figures (S1 boot latency = restart cost, S2 non-TSO ratio, S3 virtiofs IO), ceilings (hostPath-pending-B98, Service-backend posture, network-trust segment, rootfs-writes-are-RAM-bounded, Rosetta translation-cache margin)."
+            desc: "Admission + docs: vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in the reference-workload readiness notes (internal) + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave; MERGE-PRECONDITIONS (re-sequencing, plan R21): only after the S3(2) idmap answer records YES and the volume/fsGroup mechanism deliverable has landed; its gate asserts the triple (vm+fsGroup admitted / native+fsGroup still 422 / vm-on-non-VZ-node fails closed) + update-or-recreate semantics for the stored VAP (the Ensure* AlreadyExists path never updates). USER-DOC COPY FLIP (owned here, v0.1 framing — the launch pre-flight denylist blocks the stale strings): faq.md's Linux-images answer, vm-runtimeclass.md's not-launch-blocking line, limitations.md's native-images-only + v0.2-headlines lines, the public ROADMAP Shipped/Non-goals bullets; the rewrite states what EXPERIMENTAL promises (the m11-core-proven behaviors incl. PVC durability) and denies (figures pending; vm-surface changes allowed until the flip; the NETWORK-AXIS ceiling: same-node vm pods share one NAT segment NetworkPolicy cannot segment; the vmhost confinement posture per the S1(4) outcome) — mirrored into the privilege-model doc. Rosetta posture: directory share only, no cross-VM translation-cache socket at v0.1."
         acceptance:
           - id: M11.4-a1
             met: false
@@ -664,13 +669,15 @@ phases:
     status: todo
     depends_on: []
     notes: >-
-      docs/m12-plan.md is authoritative (Phase C encoded from it). Positioning: M12.2/M12.3
-      are the pre-launch DX slices (queue items B117/B118 — independent, unit-gated);
-      M12.1 lands with/after M8 (it consumes M8.2-d0 + B99 + B100 — B100 owns the
-      OCI-ref discriminator/MergeRunSpec, never re-filed here); M12.4 is post-launch and
-      depends on M11 done (transitively the lab gate + the human-gated vmhost release
-      signing + the kernel artifact). Hard cut throughout; the one proto carve rides
-      apis M12.1.
+      docs/m12-plan.md is authoritative (Phase C encoded from it; its Resolution 11 carries
+      the 2026-07-11 re-sequencing retarget). Positioning: M12.2/M12.3 are the pre-launch DX
+      slices (queue items B117/B118 — independent, unit-gated); M12.1 lands with/after M8
+      (it consumes the runtimed M11.2-d7 unpacker — re-homed with the Linux-layer
+      re-sequencing — + B99 + B100; B100 owns the OCI-ref discriminator/MergeRunSpec, never
+      re-filed here); M12.4 lands EARLY-POST-LAUNCH (v0.1.x): it depends on the k3sm M11.4
+      wave + the recorded vmhost-signing and kernel-artifact facts (both pre-launch under
+      the re-sequencing) — no longer on the v0.2 de-EXPERIMENTAL flip. Hard cut throughout;
+      the one proto carve rides apis M12.1.
     subphases:
       - id: M12.1
         title: kubelet pull semantics at the provider (verbatim translate + failure taxonomy + imageID)
@@ -724,7 +731,7 @@ phases:
       - id: M12.4
         title: buildx engine — managed buildkitd-in-vm builder + bundled buildx
         status: todo
-        depends_on: [k3sm:M11.5]
+        depends_on: [k3sm:M11.4]
         deliverables:
           - id: M12.4-d1
             done: false
@@ -737,6 +744,10 @@ phases:
             met: false
             check: "a Dockerfile WITH RUN steps builds green against the managed builder on a vm-capable Mac (K3SM_LAB=1, human-run); the COPY-only fast-path routes natively; builder-absent degrades legibly"
             method: lab
+          - id: M12.4-a2
+            met: false
+            check: "vmhost release signing (B110) + the guest kernel artifact (B111) are RECORDED facts before this sub-phase merges — the acceptance-clause pattern for human-gated preconditions (queue-item ids are not depends_on vocabulary)"
+            method: build
 ---
 
 # k3sm — Phase roadmap
@@ -991,7 +1002,9 @@ WITH MLX v1; `m8.sh` joins the launch-gate set — the public flip is M9). **Str
 - ⬜ **M8.6** — the `hack/acceptance/m8.sh` gate (`requires [dev-mac, apple-gpu, network]`; **no M8-lab row** — a GPU
   dev-mac covers it): pinned small model → Ready → OpenAI completion via ClusterIP → GC-clean per the deletion
   contract; also gates `mlx-quickstart.md`.
-Prerequisite (runtimed M8.2-d0): the OCI-layer unpacker — the whole M8 product path is blocked on it; k3sm's M8.3
+Prerequisite (runtimed M11.2-d7 — the OCI-layer unpacker, re-homed 2026-07-11 from M8.2-d0 with the
+Linux-layer re-sequencing): the whole M8 product path is blocked on it; the MLX runtimed slice consumes it
+via its depends edge on the M11.2 wave. k3sm's M8.3
 consumes GPUFacts once M8.2 lands (B63 ships the plumbing against a stubbed fact source first).
 
 ## M10 — Kubernetes conformance hardening ⬜
