@@ -32,8 +32,10 @@ rationale lives in `docs/privilege-model.md`. This is the same framing you will 
 
 ## Images
 
-k3sm images are **native process bundles**, built with `k3sm build`, not OCI Linux images. See
-[images.md](images.md).
+k3sm workloads are **native Darwin executables**, not OCI Linux images: today you reference a
+binary directly in the Pod spec (`image: native` plus an absolute `command`, or `image: /abs/path`).
+An OCI-based image path — registry pull, `k3sm image load`, a `k3sm build` command — is on the
+roadmap. See [images.md](images.md).
 
 ## Networking
 

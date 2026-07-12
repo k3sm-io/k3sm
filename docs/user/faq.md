@@ -14,8 +14,11 @@ only for the optional [`vm` RuntimeClass](vm-runtimeclass.md) used to isolate un
 
 ## Can I run my existing Docker/OCI Linux images?
 
-No — those carry a Linux userland. Workloads must be **adapted** to the native image model
-(`k3sm build`). See [images.md](images.md) and [limitations.md](limitations.md).
+No — those carry a Linux userland. Workloads must be **adapted** to the native model: build a
+darwin/arm64 binary and reference it directly in the Pod spec (an OCI-based load/build path is on
+the roadmap). Unmodified Linux images are the province of the EXPERIMENTAL
+[`vm` RuntimeClass](vm-runtimeclass.md). See [images.md](images.md) and
+[limitations.md](limitations.md).
 
 ## Why did my container exit and not restart?
 

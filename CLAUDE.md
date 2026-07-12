@@ -1,8 +1,9 @@
 # k3sm — distribution & assembly
 
 Module **`k3sm.io/k3sm`** (≈ k3s): the single-binary distribution. `cmd/k3sm` (server | agent | node |
-install | token | build | …), `pkg/provider` (the Virtual Kubelet Darwin provider — the M0 HostProcess
-runtime), control-plane embedding (M1), launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
+install | token | kubectl | doctor | dev | …; `build`/`image` are planned — see docs/user/images.md),
+`pkg/provider` (the Virtual Kubelet Darwin provider — the M0 HostProcess runtime), control-plane
+embedding (M1), launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 
 > Product design: `docs/DESIGN.md`. Milestones: `docs/M0-spike.md`, `docs/M0-node.md`. Spike: `hack/spike/run.sh`.
 > Roadmap & current phase: `docs/PHASES.md`. Acceptance gates: `hack/acceptance/`.
