@@ -13,7 +13,7 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 2. [Install](install.md) — what `k3sm install` does, the one-time admin step, the `_k3sm` posture.
 3. [Concepts](concepts.md) — how k3sm maps Kubernetes onto native Darwin processes.
 4. [kubectl access](kubectl-access.md) — getting a kubeconfig and talking to the cluster.
-5. [Images](images.md) — the native image model (`k3sm build`), how it differs from OCI.
+5. [Images](images.md) — how native workloads are referenced today, and the OCI image/build path on the roadmap.
 6. [Storage](storage.md) — local-path PVs, node affinity, what is and isn't supported.
 7. [Versions](versions.md) — the Kubernetes version k3sm tracks and how to read the live pin.
 8. [Upgrade](upgrade.md) — upgrading a node or cluster, the launchd restart model.
