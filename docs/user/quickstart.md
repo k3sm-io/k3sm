@@ -34,15 +34,20 @@ k3sm kubectl get nodes
 See [kubectl-access.md](kubectl-access.md) for using a standalone `kubectl` with the generated
 kubeconfig.
 
-## 4. Build a native image and run it
+## 4. Run a native binary as a Pod
 
-k3sm images are native Darwin process bundles, not OCI Linux images — see [images.md](images.md).
+k3sm workloads are native Darwin executables, not OCI Linux images — see [images.md](images.md).
+The `image: native` sentinel runs an absolute host binary as a confined pod:
 
 ```sh
-k3sm build -t hello .
-k3sm kubectl run hello --image=hello --restart=Never
+k3sm kubectl run hello --image=native --restart=Never \
+  --command -- /bin/sh -c 'echo hello from a native pod'
 k3sm kubectl get pods
+k3sm kubectl logs hello
 ```
+
+For your own workload, build a darwin/arm64 binary with your normal toolchain and point
+`command[0]` at its absolute path (or set `image: /abs/path` with no command).
 
 ## Before you go further
 

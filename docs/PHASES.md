@@ -3,7 +3,7 @@ repo: k3sm
 schema: phases/v1
 current_phase: M6
 updated: 2026-07-11
-updated_by: orchestrator
+updated_by: roadmap-encoder
 
 phases:
   - id: M0
@@ -639,7 +639,7 @@ phases:
             desc: "B6 producer wiring per the decided carrier (m11-plan Resolution 3): podnet.SetupGuest + dns.GuestResolvConf run BEFORE toPodBox (the M10.1 one-authority ordering — downward-API status.podIP env resolves pre-translate) through the in-process runtimed.Deps shared podnet adapter; teardown symmetry via the existing releasePodNetwork; NO SandboxProfile proto field."
           - id: M11.4-d5
             done: false
-            desc: "Admission + docs: vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in stockkitty-readiness + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave. docs/user/limitations.md vm-section rewrite: de-EXPERIMENTAL criteria named (B109+B110), published figures (S1 boot latency = restart cost, S2 non-TSO ratio, S3 virtiofs IO), ceilings (hostPath-pending-B98, Service-backend posture, network-trust segment, rootfs-writes-are-RAM-bounded, Rosetta translation-cache margin)."
+            desc: "Admission + docs: vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in the reference-workload readiness notes (internal) + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave. docs/user/limitations.md vm-section rewrite: de-EXPERIMENTAL criteria named (B109+B110), published figures (S1 boot latency = restart cost, S2 non-TSO ratio, S3 virtiofs IO), ceilings (hostPath-pending-B98, Service-backend posture, network-trust segment, rootfs-writes-are-RAM-bounded, Rosetta translation-cache margin)."
         acceptance:
           - id: M11.4-a1
             met: false
@@ -657,6 +657,85 @@ phases:
           - id: M11.5-a1
             met: false
             check: "hack/lab/m11.sh green on an entitled VZ Mac (K3SM_LAB=1, human-run — the milestone-done predicate; structurally lab-gated, never unit-green-only) + B110 signing recorded; hack/acceptance/m11.sh carries the CI-provable slice"
+            method: lab
+
+  - id: M12
+    title: Images & build engine (k3sm slice — provider pull semantics, image CLI, build v1, buildx engine)
+    status: todo
+    depends_on: []
+    notes: >-
+      docs/m12-plan.md is authoritative (Phase C encoded from it). Positioning: M12.2/M12.3
+      are the pre-launch DX slices (queue items B117/B118 — independent, unit-gated);
+      M12.1 lands with/after M8 (it consumes M8.2-d0 + B99 + B100 — B100 owns the
+      OCI-ref discriminator/MergeRunSpec, never re-filed here); M12.4 is post-launch and
+      depends on M11 done (transitively the lab gate + the human-gated vmhost release
+      signing + the kernel artifact). Hard cut throughout; the one proto carve rides
+      apis M12.1.
+    subphases:
+      - id: M12.1
+        title: kubelet pull semantics at the provider (verbatim translate + failure taxonomy + imageID)
+        status: todo
+        depends_on: [apis:M12.1, runtimed:M12.1]
+        deliverables:
+          - id: M12.1-d1
+            done: false
+            desc: "Provider translates the apiserver-defaulted imagePullPolicy VERBATIM (defaulting — :latest/untagged → Always — is the embedded apiserver's; the provider never re-derives). Consumers slice is queue item B120."
+          - id: M12.1-d2
+            done: false
+            desc: "Pull-failure taxonomy kubelet-verbatim (queue item B119): ErrImagePull ↔ ImagePullBackOff alternation (per-image exponential 10s→300s cap), ErrImageNeverPull (policy Never: no backoff, no attempt), InvalidImageName (terminal). Invariants: pod phase stays Pending; restartCount untouched; a pull failure never fails CreatePod wholesale (no ReplicaSet churn / registry hammering). Rides the existing ContainerStateWaiting.reason — zero new proto surface. Lifecycle events (Pulling/Pulled/Failed/BackOff) coordinate with the B75 EventRecorder work — cite, never duplicate."
+          - id: M12.1-d3
+            done: false
+            desc: "status.containerStatuses[].imageID = the resolved repo digest. Image-config USER: ACCEPTED with documented divergence (the workload runs as the service user — non-root by construction; register cross-cite to the no-per-pod-uid ceiling); the vm path stays kubelet-verbatim in-guest. Offline/warm-cache posture + the :latest→Always trap documented in docs/user/limitations.md + images.md; image preload (B117) named as the airgap/outage mitigation."
+        acceptance:
+          - id: M12.1-a1
+            met: false
+            check: "TestPullFailureWaitingStates: all four waiting reasons, the platform-mismatch row, phase-Pending + restartCount-untouched invariants (fake runtime; -race clean)"
+            method: unit
+          - id: M12.1-a2
+            met: false
+            check: "warm-cache offline start: IfNotPresent + blackholed network ⇒ Running (a registry outage must not strand cached pods)"
+            method: integration
+      - id: M12.2
+        title: k3sm image CLI — docker interop (load / import / ls / push)
+        status: todo
+        depends_on: []
+        deliverables:
+          - id: M12.2-d1
+            done: false
+            desc: "k3sm image load <docker-save.tar> / import <oci-layout> (the buildx OCI output) / ls / push, in ONE plumbing home pkg/oci (shared with M12.3). Store topology: links runtimed's exported store package IN-PROCESS (the one-binary assembly; staged+rename commits are concurrent-writer-safe) — never a second store implementation. Ingest is SELF-AUTHENTICATING: every blob re-hashed against its claimed digest before commit; a digest-mismatched blob and a quarantined-source tarball are REJECTED. Loaded images are provenance-free by design (operator-CLI-only surface, documented). push authenticates as the INVOKING USER (docker config/keychain), never the cluster imagePullSecret resolver. Queue item B117."
+        acceptance:
+          - id: M12.2-a1
+            met: false
+            check: "TestImageLoadDockerSaveAndOCILayout: golden docker-save + OCI-layout fixtures ingest; digest-mismatched blob rejected; quarantined-source tarball rejected; ls round-trips the index"
+            method: unit
+      - id: M12.3
+        title: k3sm build v1 — COPY-only native Dockerfile builder
+        status: todo
+        depends_on: []
+        deliverables:
+          - id: M12.3-d1
+            done: false
+            desc: "Dockerfile SUBSET builder (crane-append, pkg/oci): FROM scratch|<ref>, COPY/ADD, ENV/ENTRYPOINT/CMD/WORKDIR/LABEL/EXPOSE; RUN is REJECTED with a legible error naming the M12.4 vm builder as the RUN-capable path. darwin/arm64 default (--platform for metadata targets); output → local store / tarball / OCI layout / --push. Ships the command the user docs describe — the docs become true. Queue item B118."
+        acceptance:
+          - id: M12.3-a1
+            met: false
+            check: "TestCopyOnlyDockerfileBuild: subset parse table (accepted verbs + RUN rejection + unknown-verb rejection); deterministic layer digests for a golden context; entrypoint/env/workdir metadata round-trip"
+            method: unit
+      - id: M12.4
+        title: buildx engine — managed buildkitd-in-vm builder + bundled buildx
+        status: todo
+        depends_on: [k3sm:M11.5]
+        deliverables:
+          - id: M12.4-d1
+            done: false
+            desc: "k3sm builder up|down manages a buildkitd vm pod (Linux arm64 + Rosetta amd64, PVC-backed cache); buildkitd runs guest-root inside its dedicated micro-VM (the VM boundary IS the isolation; the pod spec declares no foreign securityContext). The buildkitd image is UPSTREAM DIGEST-PINNED in code (human-merged bumps; availability/rate limits documented; airgap = pre-seed via k3sm image load). k3sm build (full path) drives the BUNDLED buildx over the NAT-dial path proven by the vm networking spike (a Service/pod-IP dial — never a new vmhost socket forward); COPY-only Dockerfiles auto-route to the M12.3 native fast-path."
+          - id: M12.4-d2
+            done: false
+            desc: "Packaging (named, never assumed): buildx SOURCE-BUILT at a pinned upstream tag (the control-plane-payload provenance precedent — never re-sign a prebuilt); committed pin file (version+sha256); release workflow fifth-checkout + sibling assert; archive-manifest + nested-code enumeration + bidirectional entitlement row (buildx carries NONE); brew source-build leg; install path + uninstall-manifest coverage; k3sm doctor builder probe; legible-absence contract (builder stack absent ⇒ the full path errors naming the install step; the COPY-only fast-path is unaffected). Third-party attribution: license tooling run AGAINST the buildx checkout at its pinned ref + its LICENSE shipped (the module-graph generator cannot see a separately-compiled binary); hygiene gate extended to verify."
+        acceptance:
+          - id: M12.4-a1
+            met: false
+            check: "a Dockerfile WITH RUN steps builds green against the managed builder on a vm-capable Mac (K3SM_LAB=1, human-run); the COPY-only fast-path routes natively; builder-absent degrades legibly"
             method: lab
 ---
 

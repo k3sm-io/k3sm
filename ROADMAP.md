@@ -53,6 +53,11 @@ The first public release. Two tracks, both launch-blocking:
   reconciles a model to a StatefulSet + Service serving an OpenAI-compatible API. This is the
   **NVIDIA-GPU-Operator analog for Mac** — running LLMs on a Mac mini as a k3sm pod is the launch
   story.
+- **Bring your images (targeted).** `k3sm image load` / `k3sm image import` ingest docker-save
+  tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and a
+  first `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
+  (`RUN` arrives with the vm-backed builder, below). *(targeted at v0.1.0; included in the release
+  announcement only if merged and green by the pre-flight)*
 
 Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
@@ -73,6 +78,13 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   Service/DNS reachability, and **linux/amd64 images via Rosetta** (the Docker-Desktop-class path —
   Rosetta-for-Linux inside a per-pod micro-VM, no qemu); plus darwin/amd64 pod payloads under host
   Rosetta on the native path. Engineering plan: `docs/m11-plan.md` (workspace).
+- **A built-in image build engine** — `k3sm build` grows full Dockerfile support (`RUN` included)
+  by managing a BuildKit builder inside a `vm`-RuntimeClass micro-VM (linux/arm64 natively,
+  linux/amd64 via Rosetta) behind a bundled buildx front-end — install only k3sm, build and run
+  containers with no Docker Desktop. Lands **once the vm path is de-EXPERIMENTAL'd and the builder
+  is lab-validated**. Kubelet-faithful registry semantics on the native path (imagePullPolicy,
+  pull-failure backoff, multi-arch selection, offline warm-cache starts) land alongside.
+  Engineering plan: `docs/m12-plan.md` (workspace).
 - **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA** — Dynamic Resource Allocation for GPUs, once extended resources have shipped.
