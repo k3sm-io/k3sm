@@ -58,6 +58,15 @@ The first public release. Two tracks, both launch-blocking:
   first `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
   (`RUN` arrives with the vm-backed builder, below). *(targeted at v0.1.0; included in the release
   announcement only if merged and green by the pre-flight)*
+- **Run your Linux images (targeted, EXPERIMENTAL).** Standard **linux/arm64 AND linux/amd64
+  images** run as `vm`-RuntimeClass pods — one lightweight micro-VM per pod (amd64 via
+  Rosetta-for-Linux, the Docker-Desktop-class path; no qemu) — with `kubectl exec/logs/top`,
+  PVC-backed persistence, Service/DNS reachability in both directions, readiness probes, and
+  private-registry pulls. A whole multi-part app's containers, unmodified images with a
+  three-line manifest adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
+  *(targeted at v0.1.0 as EXPERIMENTAL — launch-gated by a live lab proof against the release
+  artifact; included in the announcement only if that gate is green; the de-EXPERIMENTAL
+  graduation with published performance figures is the v0.2 milestone below)*
 
 Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
@@ -71,18 +80,19 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   logging, node lifecycle Events. The honest "where we are vs upstream k8s" register lives at
   `docs/UPSTREAM-ALIGNMENT.md`; the self-assessment (k3sm cannot pass Sonobuoy `[Conformance]` — it
   has no Linux containers — but targets a documented subset) at `docs/conformance-profile.md`.
-- **Product-grade Linux workloads & multi-arch — de-EXPERIMENTAL the `vm` RuntimeClass (M11)** —
-  sharing the v0.2 headline with the conformance-hardening tail, once lab-validated on a VZ Mac:
-  multi-arch image selection (an OCI manifest list resolves to the right platform, fail-closed),
-  standard **linux/arm64** images as `vm` pods with working `kubectl exec/logs/top`, volumes, and
-  Service/DNS reachability, and **linux/amd64 images via Rosetta** (the Docker-Desktop-class path —
-  Rosetta-for-Linux inside a per-pod micro-VM, no qemu); plus darwin/amd64 pod payloads under host
-  Rosetta on the native path. Engineering plan: `docs/m11-plan.md` (workspace).
+- **De-EXPERIMENTAL the Linux `vm` path (the graduation)** — the Linux-image capability ships at
+  v0.1 (EXPERIMENTAL, above); the v0.2 milestone is its **graduation**: the full lab ledger green
+  with **published performance figures** (VM boot latency = restart cost, the Rosetta non-TSO
+  ratio, virtiofs I/O vs native APFS), the branding removed, and the remaining ceilings either
+  closed or documented (per-pod network segmentation between micro-VMs, host-path sharing).
+  Plus darwin/amd64 pod payloads under host Rosetta on the native path. Engineering plan:
+  `docs/m11-plan.md` (workspace).
 - **A built-in image build engine** — `k3sm build` grows full Dockerfile support (`RUN` included)
   by managing a BuildKit builder inside a `vm`-RuntimeClass micro-VM (linux/arm64 natively,
   linux/amd64 via Rosetta) behind a bundled buildx front-end — install only k3sm, build and run
-  containers with no Docker Desktop. Lands **once the vm path is de-EXPERIMENTAL'd and the builder
-  is lab-validated**. Kubelet-faithful registry semantics on the native path (imagePullPolicy,
+  containers with no Docker Desktop. Lands **shortly after v0.1** (the builder needs the vm path
+  live plus the signed vmhost and kernel artifacts that ship with it, then its own lab
+  validation). Kubelet-faithful registry semantics on the native path (imagePullPolicy,
   pull-failure backoff, multi-arch selection, offline warm-cache starts) land alongside.
   Engineering plan: `docs/m12-plan.md` (workspace).
 - **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
