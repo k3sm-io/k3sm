@@ -616,7 +616,7 @@ func newServiceZone(t *testing.T, cs *fake.Clientset) serviceZone {
 // CNAME→A flatten: zero).
 func respondQuery(t *testing.T, r *clusterResolver, name string, qtype dnsmessage.Type) (dnsmessage.RCode, []netip.Addr, []string, int) {
 	t.Helper()
-	resp, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
+	resp, _, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
 	if err != nil {
 		t.Fatalf("respond(%q): %v", name, err)
 	}
@@ -677,12 +677,15 @@ func addrStrings(addrs []netip.Addr) []string {
 	return out
 }
 
-// TestOversizedUDPResponseTruncatesToTCP asserts the RFC 1035 UDP behavior: an
-// answer set too large for a 512-byte plain-UDP response is served as
-// header+question with TC set (never a partial answer set), while the same
-// query over TCP returns the full set. This is the server half of the
-// headless-Service/large-answer path; the client half (TCP refetch on TC) lives
-// in darwin-net's resolver and getaddrinfo shim.
+// TestOversizedUDPResponseTruncatesToTCP asserts the RFC 1035 UDP behavior for a
+// non-EDNS (plain, no OPT) query: an answer set too large for a 512-byte plain-UDP
+// response is served as header+question with TC set — the whole answer set is
+// dropped, never partially packed. RFC 2181 §9 PERMITS partial data, so this
+// drop-all is a legal DIVERGENCE from CoreDNS's partial-packing, not a correctness
+// edge (registered as an owed alignment row — see the truncateResponse TODO). The
+// same query over TCP returns the full set. The client half (TCP refetch on TC)
+// lives in darwin-net's resolver and getaddrinfo shim — a CROSS-PR dependency that
+// holds only once darwin-net #38 merges, not a present in-tree fact.
 func TestOversizedUDPResponseTruncatesToTCP(t *testing.T) {
 	t.Parallel()
 
