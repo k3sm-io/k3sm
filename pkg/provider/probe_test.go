@@ -383,9 +383,15 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 	if got := m.verdict().restarts; got != 1 {
 		t.Fatalf("probe-driven restarts = %d, want 1", got)
 	}
-	f.mu.Lock()
-	calls, last := f.restartCalls, f.lastRestart
-	f.mu.Unlock()
+	// Since B26 the seam schedules through the SHARED restart authority's worker
+	// rather than calling the RPC inline, so the call is asynchronous — a
+	// non-crash-looping container's liveness kill is still immediate (delay 0,
+	// kubelet parity), but it lands on the worker goroutine.
+	waitRestart(t, "the liveness RestartContainer call", func() bool {
+		n, _ := f.restartState()
+		return n == 1
+	})
+	calls, last := f.restartState()
 	if calls != 1 {
 		t.Fatalf("RestartContainer RPC calls = %d, want 1 (action wired to the seam)", calls)
 	}

@@ -1019,25 +1019,57 @@ func TestToPodStatusOOMKilled(t *testing.T) {
 	}
 }
 
-// TestDerivePhase covers the phase-derivation rule directly.
+// TestDerivePhase covers the phase-derivation rule directly, INCLUDING the B26
+// restart-policy awareness: upstream's getPhase branches on RestartPolicy before
+// it can ever return Failed, so a restartable termination keeps the pod Running
+// and a running container always beats a failed sibling. A nil pod (the pod-less
+// status path) has no policy to honor and falls back to the runtime's verdict.
 func TestDerivePhase(t *testing.T) {
+	policyPod := func(p corev1.RestartPolicy) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: p}}
+	}
+	running := corev1.ContainerStatus{
+		Name:  "c-run",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}
+	exited := func(code int32) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:  "c-term",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
+		}
+	}
+	crashLooping := corev1.ContainerStatus{
+		Name:  "c-loop",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}},
+	}
+
 	tests := []struct {
-		name       string
-		rp         runtimev1.PodPhase
-		anyRunning bool
-		anyFailed  bool
-		want       corev1.PodPhase
+		name string
+		pod  *corev1.Pod
+		rp   runtimev1.PodPhase
+		cs   []corev1.ContainerStatus
+		want corev1.PodPhase
 	}{
-		{"running when any runs and none failed", runtimev1.PodPhase_POD_PHASE_RUNNING, true, false, corev1.PodRunning},
-		{"failed honored from runtime", runtimev1.PodPhase_POD_PHASE_FAILED, false, true, corev1.PodFailed},
-		{"succeeded honored from runtime", runtimev1.PodPhase_POD_PHASE_SUCCEEDED, false, false, corev1.PodSucceeded},
-		{"pending honored from runtime", runtimev1.PodPhase_POD_PHASE_PENDING, false, false, corev1.PodPending},
-		{"unspecified + running derives Running", runtimev1.PodPhase_POD_PHASE_UNSPECIFIED, true, false, corev1.PodRunning},
-		{"unspecified + failed derives Failed", runtimev1.PodPhase_POD_PHASE_UNSPECIFIED, false, true, corev1.PodFailed},
+		{"running when any runs", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_RUNNING, []corev1.ContainerStatus{running}, corev1.PodRunning},
+		{"pending honored from runtime", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_PENDING, nil, corev1.PodPending},
+		{"Never + failed is Failed", policyPod(corev1.RestartPolicyNever), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodFailed},
+		{"Never + all exit 0 is Succeeded", policyPod(corev1.RestartPolicyNever), runtimev1.PodPhase_POD_PHASE_SUCCEEDED, []corev1.ContainerStatus{exited(0)}, corev1.PodSucceeded},
+		{"OnFailure + failed is Running (a retry is due)", policyPod(corev1.RestartPolicyOnFailure), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodRunning},
+		{"OnFailure + exit 0 is Succeeded (no retry due)", policyPod(corev1.RestartPolicyOnFailure), runtimev1.PodPhase_POD_PHASE_SUCCEEDED, []corev1.ContainerStatus{exited(0)}, corev1.PodSucceeded},
+		{"Always + failed is Running", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodRunning},
+		{"Always + exit 0 is Running (Always restarts a clean exit too)", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_SUCCEEDED, []corev1.ContainerStatus{exited(0)}, corev1.PodRunning},
+		{"empty policy defaults to Always", policyPod(""), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodRunning},
+		{"a running main beats a failed sibling under Never", policyPod(corev1.RestartPolicyNever), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1), running}, corev1.PodRunning},
+		{"a synthesized CrashLoopBackOff holds Running", policyPod(corev1.RestartPolicyNever), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{crashLooping}, corev1.PodRunning},
+		{"nil pod: runtime Failed is authoritative", nil, runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodFailed},
+		{"nil pod: runtime Succeeded is authoritative", nil, runtimev1.PodPhase_POD_PHASE_SUCCEEDED, nil, corev1.PodSucceeded},
+		{"nil pod: unspecified + failed derives Failed", nil, runtimev1.PodPhase_POD_PHASE_UNSPECIFIED, []corev1.ContainerStatus{exited(1)}, corev1.PodFailed},
+		{"unspecified + running derives Running", nil, runtimev1.PodPhase_POD_PHASE_UNSPECIFIED, []corev1.ContainerStatus{running}, corev1.PodRunning},
+		{"unspecified + nothing derives Pending", nil, runtimev1.PodPhase_POD_PHASE_UNSPECIFIED, nil, corev1.PodPending},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := derivePhase(tt.rp, tt.anyRunning, tt.anyFailed); got != tt.want {
+			if got := derivePhase(tt.pod, tt.rp, tt.cs); got != tt.want {
 				t.Errorf("derivePhase = %s, want %s", got, tt.want)
 			}
 		})
@@ -1401,6 +1433,84 @@ func TestRlimitSourceAndQoSClass(t *testing.T) {
 			}
 			if box.GetQosClass() != tt.want {
 				t.Errorf("qos_class = %v, want %v", box.GetQosClass(), tt.want)
+			}
+		})
+	}
+}
+
+// TestComputeInitialized pins the B26 conformance fix: PodInitialized was
+// stamped ConditionTrue unconditionally, so a pod whose native sidecar was
+// crash-looping before it ever started still reported "the init phase is done".
+// The condition is now derived from the init-container statuses, with the
+// kubelet's two satisfaction rules — a PLAIN init container completes (exit 0), a
+// NATIVE SIDECAR merely has to have STARTED (it is long-running by design).
+func TestComputeInitialized(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	initPod := func(specs ...corev1.Container) *corev1.Pod {
+		return &corev1.Pod{Spec: corev1.PodSpec{InitContainers: specs}}
+	}
+	plain := corev1.Container{Name: "setup"}
+	sidecar := corev1.Container{Name: "proxy", RestartPolicy: &always}
+
+	terminated := func(name string, code int32) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:  name,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
+		}
+	}
+	started := func(name string, up bool) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:    name,
+			Started: &up,
+			State:   corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}
+	}
+	crashLooping := func(name string) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:  name,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		pod    *corev1.Pod
+		initCS []corev1.ContainerStatus
+		want   corev1.ConditionStatus
+	}{
+		{"nil pod is Initialized", nil, nil, corev1.ConditionTrue},
+		{"no init containers is Initialized", initPod(), nil, corev1.ConditionTrue},
+		{"completed plain init container", initPod(plain), []corev1.ContainerStatus{terminated("setup", 0)}, corev1.ConditionTrue},
+		{"failed plain init container", initPod(plain), []corev1.ContainerStatus{terminated("setup", 1)}, corev1.ConditionFalse},
+		{"plain init container still running", initPod(plain), []corev1.ContainerStatus{started("setup", true)}, corev1.ConditionFalse},
+		{"declared init container with no status yet", initPod(plain), nil, corev1.ConditionFalse},
+		{"started sidecar satisfies it", initPod(sidecar), []corev1.ContainerStatus{started("proxy", true)}, corev1.ConditionTrue},
+		{"sidecar not yet started", initPod(sidecar), []corev1.ContainerStatus{started("proxy", false)}, corev1.ConditionFalse},
+		{"sidecar crash-looping before it ever started", initPod(sidecar), []corev1.ContainerStatus{crashLooping("proxy")}, corev1.ConditionFalse},
+		{
+			"all of a mixed init set satisfied",
+			initPod(plain, sidecar),
+			[]corev1.ContainerStatus{terminated("setup", 0), started("proxy", true)},
+			corev1.ConditionTrue,
+		},
+		{
+			"one unsatisfied member blocks the whole set",
+			initPod(plain, sidecar),
+			[]corev1.ContainerStatus{terminated("setup", 0), crashLooping("proxy")},
+			corev1.ConditionFalse,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := computeInitialized(tt.pod, tt.initCS)
+			if got.Type != corev1.PodInitialized {
+				t.Fatalf("condition type = %s, want PodInitialized", got.Type)
+			}
+			if got.Status != tt.want {
+				t.Errorf("PodInitialized = %s, want %s", got.Status, tt.want)
+			}
+			if tt.want == corev1.ConditionFalse && got.Reason != "ContainersNotInitialized" {
+				t.Errorf("reason = %q, want ContainersNotInitialized", got.Reason)
 			}
 		})
 	}

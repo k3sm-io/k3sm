@@ -992,14 +992,11 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
 	applyProbeOverlay(cs, probes)
 
-	anyRunning, anyFailed, allReady := false, false, len(cs) > 0
+	anyRunning, allReady := false, len(cs) > 0
 	for i := range cs {
 		st := &cs[i]
 		if st.State.Running != nil {
 			anyRunning = true
-		}
-		if t := st.State.Terminated; t != nil && (t.ExitCode != 0 || t.Signal != 0) {
-			anyFailed = true
 		}
 		if !st.Ready {
 			allReady = false
@@ -1014,7 +1011,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	// PodReady via the shared computeReadiness seam, which honors spec.readinessGates.
 	containersReady := allReady && anyRunning
 
-	phase := derivePhase(rs.GetPhase(), anyRunning, anyFailed)
+	phase := derivePhase(pod, rs.GetPhase(), cs)
 	out := &corev1.PodStatus{
 		Phase:                 phase,
 		Reason:                rs.GetReason(),
@@ -1053,7 +1050,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	// the input pod (e.g. a readinessGate condition a controller patched) so it
 	// survives this status write and stays observable to computeReadiness.
 	out.Conditions = []corev1.PodCondition{
-		{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
+		computeInitialized(pod, initCS),
 		computeReadiness(pod, containersReady),
 		{Type: corev1.ContainersReady, Status: crStatus},
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
@@ -1208,26 +1205,116 @@ func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 	}
 }
 
-// derivePhase maps the runtime phase to a corev1 phase, honoring the rule "phase
-// = Running when any container runs and none has failed" (the runtime's own
-// phase is authoritative for terminal states).
-func derivePhase(rp runtimev1.PodPhase, anyRunning, anyFailed bool) corev1.PodPhase {
-	switch rp {
-	case runtimev1.PodPhase_POD_PHASE_FAILED:
-		return corev1.PodFailed
-	case runtimev1.PodPhase_POD_PHASE_SUCCEEDED:
-		return corev1.PodSucceeded
-	case runtimev1.PodPhase_POD_PHASE_PENDING:
+// derivePhase maps the runtime phase + the MAIN container states to a corev1
+// phase, honoring the pod's effective restart policy (B26).
+//
+// The policy is load-bearing, not decoration. Upstream's kubelet getPhase
+// branches on RestartPolicy BEFORE it can ever return Failed: a pod only reaches
+// Failed under Never (and only once every container is terminal), while under
+// Always/OnFailure a terminated-but-restartable container keeps the pod Running.
+// This function previously took a policy-blind (anyRunning, anyFailed) pair and
+// returned PodFailed whenever anyFailed was set — even alongside a running
+// container — so a crash-looping restartPolicy:Always pod reported Failed and
+// upstream reacted as if it were dead (a ReplicaSet delete/replace, a podgc
+// reap, a Job backoffLimit strike). It now consumes the SAME effective-policy
+// resolver the restart decision uses (shouldRestartOnExit), so the phase and the
+// restart decision can never disagree.
+//
+// Rules, in order:
+//   - the runtime's PENDING is authoritative (the pod has not started);
+//   - ANY running main ⇒ Running — upstream never reports a terminal phase while
+//     a container runs, whatever a sibling did;
+//   - a main that WILL be restarted (its termination resolves restartable, or it
+//     already carries the synthesized CrashLoopBackOff waiting state) ⇒ Running;
+//   - otherwise the runtime's own terminal verdict stands (mains-only, per the
+//     B74 Job contract).
+//
+// pod may be nil (the pod-less status path): with no spec there is no policy to
+// honor, so the runtime's verdict is taken as authoritative and the legacy
+// any-failed derivation applies. Production callers always pass the pod.
+func derivePhase(pod *corev1.Pod, rp runtimev1.PodPhase, cs []corev1.ContainerStatus) corev1.PodPhase {
+	if rp == runtimev1.PodPhase_POD_PHASE_PENDING {
 		return corev1.PodPending
 	}
+	anyRunning, anyFailed, restartable := false, false, false
+	policy := effectivePodRestartPolicy(pod)
+	for i := range cs {
+		st := &cs[i]
+		if st.State.Running != nil {
+			anyRunning = true
+		}
+		if t := st.State.Terminated; t != nil {
+			if t.ExitCode != 0 || t.Signal != 0 {
+				anyFailed = true
+			}
+			if pod != nil && shouldRestartOnExit(policy, nil, t) {
+				restartable = true
+			}
+		}
+		if w := st.State.Waiting; w != nil && w.Reason == reasonCrashLoopBackOff {
+			restartable = true
+		}
+	}
 	switch {
-	case anyRunning && !anyFailed:
+	case anyRunning:
 		return corev1.PodRunning
+	case restartable:
+		return corev1.PodRunning
+	case rp == runtimev1.PodPhase_POD_PHASE_FAILED:
+		return corev1.PodFailed
+	case rp == runtimev1.PodPhase_POD_PHASE_SUCCEEDED:
+		return corev1.PodSucceeded
 	case anyFailed:
 		return corev1.PodFailed
 	default:
 		return corev1.PodPending
 	}
+}
+
+// computeInitialized derives the PodInitialized condition from the init-container
+// statuses, replacing the unconditional ConditionTrue the provider used to stamp
+// (B26 conformance fix): a pod whose native sidecar is crash-looping before it
+// ever started, or whose plain init container has not yet completed, must NOT
+// report Initialized=True — controllers and `kubectl describe` read that
+// condition as "the init phase is done".
+//
+// The rule mirrors the kubelet:
+//   - a pod with no init containers is Initialized (nothing to wait for);
+//   - a PLAIN init container satisfies it by terminating with exit code 0;
+//   - a NATIVE SIDECAR (init container with restartPolicy: Always, KEP-753)
+//     satisfies it by having STARTED — it is long-running by design and never
+//     terminates before the mains;
+//   - a declared init container with no status yet does not satisfy it.
+//
+// A nil pod yields True: with no spec there are no declared init containers to
+// verify (the pod-less status path).
+func computeInitialized(pod *corev1.Pod, initCS []corev1.ContainerStatus) corev1.PodCondition {
+	cond := corev1.PodCondition{Type: corev1.PodInitialized, Status: corev1.ConditionTrue}
+	if pod == nil || len(pod.Spec.InitContainers) == 0 {
+		return cond
+	}
+	byName := make(map[string]*corev1.ContainerStatus, len(initCS))
+	for i := range initCS {
+		byName[initCS[i].Name] = &initCS[i]
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		st := byName[c.Name]
+		sidecar := c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+		switch {
+		case st == nil:
+			// no status yet
+		case sidecar && st.Started != nil && *st.Started:
+			continue
+		case !sidecar && st.State.Terminated != nil && st.State.Terminated.ExitCode == 0:
+			continue
+		}
+		cond.Status = corev1.ConditionFalse
+		cond.Reason = "ContainersNotInitialized"
+		cond.Message = fmt.Sprintf("containers with incomplete status: [%s]", c.Name)
+		return cond
+	}
+	return cond
 }
 
 // toContainerStatuses maps runtime container statuses to corev1, carrying the
