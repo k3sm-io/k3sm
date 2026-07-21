@@ -19,6 +19,7 @@ package netserve
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -615,7 +616,7 @@ func newServiceZone(t *testing.T, cs *fake.Clientset) serviceZone {
 // CNAME→A flatten: zero).
 func respondQuery(t *testing.T, r *clusterResolver, name string, qtype dnsmessage.Type) (dnsmessage.RCode, []netip.Addr, []string, int) {
 	t.Helper()
-	resp, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
+	resp, _, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
 	if err != nil {
 		t.Fatalf("respond(%q): %v", name, err)
 	}
@@ -674,4 +675,93 @@ func addrStrings(addrs []netip.Addr) []string {
 		out[i] = a.String()
 	}
 	return out
+}
+
+// TestOversizedUDPResponseTruncatesToTCP asserts the RFC 1035 UDP behavior for a
+// non-EDNS (plain, no OPT) query: an answer set too large for a 512-byte plain-UDP
+// response is served as header+question with TC set — the whole answer set is
+// dropped, never partially packed. RFC 2181 §9 PERMITS partial data, so this
+// drop-all is a legal DIVERGENCE from CoreDNS's partial-packing, not a correctness
+// edge (registered as an owed alignment row — see the truncateResponse TODO). The
+// same query over TCP returns the full set. The client half (TCP refetch on TC)
+// lives in darwin-net's resolver and getaddrinfo shim — a CROSS-PR dependency that
+// holds only once darwin-net #38 merges, not a present in-tree fact.
+func TestOversizedUDPResponseTruncatesToTCP(t *testing.T) {
+	t.Parallel()
+
+	// 40 A records ≈ 40×16B of answer sections — comfortably past 512 bytes.
+	big := make([]netip.Addr, 0, 40)
+	for i := range 40 {
+		big = append(big, netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)}))
+	}
+	fwd := mapForwarder{"big.example.com": big}
+	r := newClusterResolver(netip.MustParseAddr("10.43.0.10"), "cluster.local", mapZone{}, fwd, testLogger())
+
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	udpDone := make(chan error, 1)
+	tcpDone := make(chan error, 1)
+	go func() { udpDone <- r.serveUDP(ctx, udp) }()
+	go func() { tcpDone <- r.serveTCP(ctx, ln) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-udpDone; err != nil {
+			t.Errorf("serveUDP returned %v, want nil on clean shutdown", err)
+		}
+		if err := <-tcpDone; err != nil {
+			t.Errorf("serveTCP returned %v, want nil on clean shutdown", err)
+		}
+	})
+
+	// UDP: TC set, SUCCESS rcode, no answers — never a partial set.
+	conn, err := net.Dial("udp", udp.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("dial udp: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(buildAQuery(t, "big.example.com")); err != nil {
+		t.Fatalf("write udp query: %v", err)
+	}
+	buf := make([]byte, 1500)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read udp response: %v", err)
+	}
+	if n > maxUDPResponse {
+		t.Fatalf("UDP response is %d bytes, want <= %d", n, maxUDPResponse)
+	}
+	var p dnsmessage.Parser
+	hdr, err := p.Start(buf[:n])
+	if err != nil {
+		t.Fatalf("parse udp response: %v", err)
+	}
+	if !hdr.Truncated {
+		t.Fatalf("oversized UDP response has TC unset")
+	}
+	if hdr.RCode != dnsmessage.RCodeSuccess {
+		t.Fatalf("truncated response rcode = %v, want success", hdr.RCode)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("skip questions: %v", err)
+	}
+	if _, err := p.AnswerHeader(); !errors.Is(err, dnsmessage.ErrSectionDone) {
+		t.Fatalf("truncated response carries answers (err=%v), want none", err)
+	}
+
+	// TCP: the full 40-record set.
+	rcode, addrs := queryTCP(t, ln.Addr().String(), "big.example.com")
+	if rcode != dnsmessage.RCodeSuccess {
+		t.Fatalf("tcp rcode = %v, want success", rcode)
+	}
+	if len(addrs) != len(big) {
+		t.Fatalf("tcp answers = %d records, want %d", len(addrs), len(big))
+	}
 }

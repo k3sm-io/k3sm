@@ -98,7 +98,7 @@ type srvAnswer struct {
 // PTR answers.
 func respondTyped(t *testing.T, r *clusterResolver, name string, qtype dnsmessage.Type) (dnsmessage.RCode, []netip.Addr, []srvAnswer, []string) {
 	t.Helper()
-	resp, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
+	resp, _, err := r.respond(context.Background(), buildTypedQuery(t, name, qtype))
 	if err != nil {
 		t.Fatalf("respond(%q): %v", name, err)
 	}
