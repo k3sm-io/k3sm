@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/utils/clock"
 
@@ -108,6 +109,9 @@ type runtimedRuntime struct {
 	// nil in unit tests that don't exercise the API removal.
 	client kubernetes.Interface
 
+	// recorder emits the pod lifecycle Events the runtimed path owns.
+	recorder record.EventRecorder
+
 	mu      sync.Mutex
 	track   map[string]*podTrack  // pod id -> bookkeeping
 	probers map[string]*podProber // pod id -> provider-served probe runner (M2.2)
@@ -144,6 +148,8 @@ type podTrack struct {
 type RuntimedConfig struct {
 	// NodeName is the registering node's name.
 	NodeName string
+	// Recorder receives the pod lifecycle Events the provider emits.
+	Recorder record.EventRecorder
 	// NodeIP is the node InternalIP stamped as HostIP on every pod status.
 	NodeIP string
 	// Root is runtimed's on-disk root (image cache + pod dirs); empty uses the
@@ -255,6 +261,10 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 	// Startup visibility for the in-pod cluster-DNS path: an empty dyld_shim (the
 	// getaddrinfo shim was not resolved beside the binary) or a wrong resolver_vip
 	// silently leaves pods on the system resolver (cluster names NXDOMAIN).
+	recorder := cfg.Recorder
+	if recorder == nil {
+		recorder = nopRecorder{}
+	}
 	log.Info("runtimed provider configured",
 		"dyld_shim", cfg.DyldShim,
 		"resolver_vip", cfg.ResolverVIP,
@@ -272,6 +282,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		network:        cfg.Network,
 		client:         cfg.Client,
 		log:            log,
+		recorder:       recorder,
 		clk:            clock.RealClock{},
 		dial:           (&net.Dialer{}).DialContext,
 		probeTransport: newProbeTransport(),

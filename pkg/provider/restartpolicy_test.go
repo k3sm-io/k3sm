@@ -98,20 +98,6 @@ func TestRestartPolicyOnExit(t *testing.T) {
 		}
 	})
 
-	t.Run("Reset returns to base", func(t *testing.T) {
-		clk := testclock.NewFakeClock(time.Unix(0, 0))
-		b := newCrashLoopBackoff(clk)
-		b.Next() // 10s
-		b.Next() // 20s
-		if got := b.Next(); got != 40*time.Second {
-			t.Fatalf("setup: third Next() = %s, want 40s", got)
-		}
-		b.Reset()
-		if got := b.Next(); got != 10*time.Second {
-			t.Errorf("after Reset(), Next() = %s, want 10s (base)", got)
-		}
-	})
-
 	t.Run("stabilization window resets to base", func(t *testing.T) {
 		clk := testclock.NewFakeClock(time.Unix(0, 0))
 		b := newCrashLoopBackoff(clk)
@@ -121,11 +107,75 @@ func TestRestartPolicyOnExit(t *testing.T) {
 			t.Fatalf("setup: third Next() = %s, want 40s", got)
 		}
 		// The container stays up past the stabilization window before crashing
-		// again, so the next delay resets to base (B26's stable-Running reset,
-		// driven here by the clock instead of an explicit Reset()).
+		// again, so the next delay resets to base. This clock-driven reset is the
+		// SINGLE reset authority (B26): there is deliberately no explicit Reset()
+		// that a second caller could drive with different semantics.
 		clk.Step(crashLoopStableWindow + time.Second)
 		if got := b.Next(); got != 10*time.Second {
 			t.Errorf("after staying up %s, Next() = %s, want reset to 10s", crashLoopStableWindow+time.Second, got)
 		}
 	})
+}
+
+// TestEffectivePodRestartPolicy pins the ONE place the corev1 Always default is
+// resolved (B26): the restart decision and the phase derivation both read it, so
+// a divergent default here would let a pod be restarted while reporting Failed.
+func TestEffectivePodRestartPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want corev1.RestartPolicy
+	}{
+		{"nil pod defaults to Always", nil, corev1.RestartPolicyAlways},
+		{"empty policy defaults to Always", &corev1.Pod{}, corev1.RestartPolicyAlways},
+		{"Never is preserved", &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}}, corev1.RestartPolicyNever},
+		{"OnFailure is preserved", &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyOnFailure}}, corev1.RestartPolicyOnFailure},
+		{"Always is preserved", &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyAlways}}, corev1.RestartPolicyAlways},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectivePodRestartPolicy(tt.pod); got != tt.want {
+				t.Errorf("effectivePodRestartPolicy = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCrashLoopBackoffHot covers the predicate the LIVENESS trigger reads to
+// decide whether to restart at once (kubelet parity) or wait out the schedule.
+// Hot must never advance the schedule — a predicate that consumed a step would
+// silently double every subsequent back-off.
+func TestCrashLoopBackoffHot(t *testing.T) {
+	tests := []struct {
+		name  string
+		drive func(clk *testclock.FakeClock, b *crashLoopBackoff)
+		want  bool
+	}{
+		{"a fresh schedule is cold", func(*testclock.FakeClock, *crashLoopBackoff) {}, false},
+		{"a schedule that just fired is hot", func(_ *testclock.FakeClock, b *crashLoopBackoff) { b.Next() }, true},
+		{"still hot inside the stabilization window", func(clk *testclock.FakeClock, b *crashLoopBackoff) {
+			b.Next()
+			clk.Step(crashLoopStableWindow - time.Second)
+		}, true},
+		{"cold again once the container outlasted the window", func(clk *testclock.FakeClock, b *crashLoopBackoff) {
+			b.Next()
+			clk.Step(crashLoopStableWindow + time.Second)
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clk := testclock.NewFakeClock(time.Unix(0, 0))
+			b := newCrashLoopBackoff(clk)
+			tt.drive(clk, b)
+			if got := b.Hot(); got != tt.want {
+				t.Errorf("Hot() = %v, want %v", got, tt.want)
+			}
+			// Hot is a PURE predicate: calling it must not consume a step.
+			before := b.cur
+			_ = b.Hot()
+			if b.cur != before {
+				t.Errorf("Hot() advanced the schedule: cur %s -> %s", before, b.cur)
+			}
+		})
+	}
 }

@@ -353,9 +353,9 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // explicit rootless-dev opt-out (M0 native processes, no isolation, podIP ≈
 // nodeIP — its documented shape, untouched by M10.1). cs is the apiserver
 // client the runtimed provider resolves volumes/env/imagePullSecrets with
-// (M2.1/M2.6). recorder is the EventRecorder the HostProcess provider emits pod
-// lifecycle Events to (the runtimed VK-provider-path emit is a deferred
-// follow-up).
+// (M2.1/M2.6). recorder is the EventRecorder both provider paths emit pod
+// lifecycle Events to: the HostProcess path emits Pulled/Created/Started/Killing,
+// the runtimed path emits the BackOff crash-loop Event (B26).
 // buildProvider constructs the VK provider for the selected runtime and reports
 // whether the node is vm-capable (the k3sm.io/virtualization label source, B1). The
 // in-process host-process runtime has no vm backend, so a node running it is never
@@ -367,6 +367,10 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), nil, runtimeHostProcess, false, nil
 	case runtimeRuntimed:
 		cfg := runtimedConfig(opts, cs)
+		// The runtimed path emits the Warning BackOff Event for a throttled
+		// container re-exec (B26), so `kubectl describe pod` on a crash-looping pod
+		// shows the crash loop in its Events table.
+		cfg.Recorder = recorder
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
 			return nil, nil, "", false, err

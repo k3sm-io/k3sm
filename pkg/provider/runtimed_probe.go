@@ -150,10 +150,14 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	pr.cancel = cancel
 	pr.onTransition = func() { r.publishProbeUpdate(ctx, id) }
-	// restartFunc connects the restart DECISION (the provider owns the count + gate
-	// reset) to the runtime action: a committed liveness failure re-execs the
-	// container in place via the apis:M2.2 RestartContainer RPC runtimed now serves.
-	pr.restartFunc = r.restartContainer
+	// restartFunc connects the restart DECISION (the prober owns the gate reset) to
+	// the SHARED restart authority: a committed liveness failure routes through the
+	// SAME per-container containerRestart bookkeeping and the SAME CrashLoopBackOff
+	// schedule the exit-driven path uses (B26), which then drives the apis:M2.2
+	// RestartContainer RPC. It deliberately does NOT call the RPC directly — that
+	// bypass left the liveness restart invisible to the exit-driven bookkeeping and
+	// let two authorities issue competing re-execs for one container.
+	pr.restartFunc = r.restartForLiveness
 
 	r.mu.Lock()
 	if _, exists := r.probers[id]; exists {
@@ -166,19 +170,11 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	pr.start(ctx)
 }
 
-// restartContainer re-execs a container in place via the runtime RestartContainer
-// RPC (apis:M2.2) — the action a committed liveness-probe failure drives. The
-// probe runner owns the restart DECISION and gate reset (the observable
-// contract); this is the side effect that actually re-spawns the process.
-func (r *runtimedRuntime) restartContainer(ctx context.Context, podID, container string) error {
-	return r.restartContainerReason(ctx, podID, container, "liveness probe failed")
-}
-
-// restartContainerReason is the shared RestartContainer RPC call both restart
-// authorities use — the liveness path (restartContainer) and the B26
-// exit-driven path (runtimed_restart.go), each with its own recorded reason.
-// runtimed bumps ContainerStatus.restart_count on this RPC: that count is the
-// single restart authority the provider surfaces verbatim.
+// restartContainerReason is the shared RestartContainer RPC call — the ONE call
+// site of the runtime re-exec action, reached only from the single restart
+// authority's worker (runtimed_restart.go's runRestart), whichever TRIGGER
+// scheduled it. runtimed bumps ContainerStatus.restart_count on this RPC: that
+// count is the single restart authority the provider surfaces verbatim.
 // grace_period_seconds is left 0 so runtimed applies its own default window. A
 // typed failure in the response (e.g. the pod is gone) surfaces as an error the
 // caller logs without aborting its loop.

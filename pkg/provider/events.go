@@ -19,6 +19,7 @@ package provider
 import (
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 )
@@ -28,17 +29,28 @@ import (
 // consumers keying off the reason behave the same. Shared (unexported) here so a
 // future runtimed-path emit reuses the identical reasons and messages.
 //
-// NOTE: BackOff is deliberately absent — the M0 HostProcess has no live
-// restart/backoff loop (reap never re-execs, UpdatePod is a no-op), so a BackOff
-// event would fabricate a control-loop state that does not exist. It arrives with
-// container restart (B26/B39).
+// SCOPE: BackOff is emitted on the RUNTIMED path ONLY (B26 — the exit-driven
+// re-exec + CrashLoopBackOff loop lives there). The M0 HostProcess provider has
+// no live restart/backoff loop (reap never re-execs, UpdatePod is a no-op), so
+// emitting it there would fabricate a control-loop state that does not exist.
 const (
 	reasonPulled  = "Pulled"  // image (M0: binary) resolved for the container
 	reasonCreated = "Created" // container object created, before process start
 	reasonStarted = "Started" // container process started successfully
 	reasonKilling = "Killing" // container process is being stopped (DeletePod)
 	reasonFailed  = "Failed"  // container process failed to start
+	reasonBackOff = "BackOff" // container re-exec is throttled by CrashLoopBackOff
 )
+
+// msgBackOffRestarting is the BackOff-event message for a container whose re-exec
+// is being throttled by the CrashLoopBackOff schedule. It reproduces the
+// kubelet's phrasing (and its "name_namespace(uid)" pod rendering) verbatim, so
+// `kubectl describe pod` on a crash-looping k3sm pod reads identically to
+// upstream and event consumers keying off the text behave the same.
+func msgBackOffRestarting(container string, pod *corev1.Pod) string {
+	return fmt.Sprintf("Back-off restarting failed container %s in pod %s_%s(%s)",
+		container, pod.Name, pod.Namespace, pod.UID)
+}
 
 // msgImageAlreadyPresent is the Pulled-event message. M0 treats the image
 // reference as an already-present native binary path (there is no registry pull),

@@ -49,6 +49,15 @@ type fakeRuntimeServer struct {
 	gotSA        string            // ServiceAccount bound on the last CreatePod ctx (M2.4)
 	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
+	restartErr   error             // when set, RestartContainer fails (the B26 retry path)
+}
+
+// setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
+// restores success), so the B26 re-exec-failure retry loop is testable.
+func (f *fakeRuntimeServer) setRestartErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restartErr = err
 }
 
 // restartRecord captures the arguments of a RestartContainer RPC so the probe
@@ -107,6 +116,9 @@ func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.R
 	defer f.mu.Unlock()
 	f.restartCalls++
 	f.lastRestart = restartRecord{podID: req.GetPodId(), container: req.GetContainer(), reason: req.GetReason()}
+	if f.restartErr != nil {
+		return nil, f.restartErr
+	}
 	return &runtimev1.RestartContainerResponse{Status: &runtimev1.ContainerStatus{Name: req.GetContainer()}}, nil
 }
 
