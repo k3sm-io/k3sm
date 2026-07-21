@@ -61,6 +61,31 @@ const resolverQueryTimeout = 5 * time.Second
 // connection goroutine open.
 const tcpIdleTimeout = 10 * time.Second
 
+// maxUDPResponse is the non-EDNS UDP response floor (RFC 1035 §4.2.1): a plain
+// query carrying no OPT pseudo-record is answered in at most 512 bytes. It is no
+// longer a hard ceiling — an EDNS0 client advertises a larger UDP payload size in
+// its OPT, which the resolver honors up to dns.EDNSUDPPayloadSize (see serveUDP
+// and negotiatedUDPSize). A response over the negotiated size is replaced by
+// header+question (plus the response OPT) with the TC bit set, and the client
+// re-asks over TCP where the full set is served. No partial answer set is ever
+// sent: RFC 2181 §9 permits dropping all answers on truncation, so this drop-all
+// is a legal divergence from CoreDNS's partial-packing (see truncateResponse).
+//
+// The EDNS ceiling itself is dns.EDNSUDPPayloadSize (1232), single-sourced with
+// darwin-net's shim + client resolver so all three negotiate the same size.
+const maxUDPResponse = 512
+
+// maxDNSMessage is the largest DNS message a length-prefixed TCP frame can carry:
+// RFC 1035 §4.2.2 prefixes each DNS-over-TCP message with a uint16 length. A
+// response larger than this is answered with SERVFAIL rather than wrapping the
+// prefix into a corrupt frame.
+const maxDNSMessage = 65535
+
+// ednsBADVERS is the EDNS0 BADVERS extended RCODE (16, RFC 6891 §9): returned
+// when a query advertises an EDNS version the resolver does not implement. Its
+// low nibble lands in the header RCODE (0), its high bits in the response OPT TTL.
+const ednsBADVERS dnsmessage.RCode = 16
+
 // serviceTarget is the discriminated result of a cluster Service lookup: exactly
 // one of IP / ExternalName is set. A normal Service yields IP (its IPv4 ClusterIP,
 // answered as an A record directly); an ExternalName Service yields ExternalName
@@ -218,10 +243,21 @@ func (r *clusterResolver) serveUDP(ctx context.Context, pc net.PacketConn) error
 			defer wg.Done()
 			qctx, cancel := context.WithTimeout(ctx, resolverQueryTimeout)
 			defer cancel()
-			resp, err := r.respond(qctx, query)
+			resp, negotiated, err := r.respond(qctx, query)
 			if err != nil {
 				r.log.Debug("dns udp respond", "err", err)
 				return
+			}
+			// resp already carries the response OPT (buildResponse adds it before
+			// this comparison), so the negotiated budget counts the OPT and an EDNS
+			// client near the boundary never receives a datagram over its advertised
+			// size (RFC 6891 §6.2.3).
+			if len(resp) > negotiated {
+				resp, err = truncateResponse(resp)
+				if err != nil {
+					r.log.Debug("dns udp truncate", "err", err)
+					return
+				}
 			}
 			if _, err := pc.WriteTo(resp, addr); err != nil {
 				r.log.Debug("dns udp write", "err", err)
@@ -276,11 +312,22 @@ func (r *clusterResolver) handleTCPConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		qctx, qcancel := context.WithTimeout(connCtx, resolverQueryTimeout)
-		resp, err := r.respond(qctx, msg)
+		resp, _, err := r.respond(qctx, msg)
 		qcancel()
 		if err != nil {
 			r.log.Debug("dns tcp respond", "err", err)
 			return
+		}
+		// TCP is this resolver's designated UDP-overflow path, so the uint16 length
+		// prefix is load-bearing: a response that would overflow it is replaced by a
+		// minimal SERVFAIL rather than silently wrapping into a corrupt frame (RFC
+		// 1035 §4.2.2).
+		if len(resp) > maxDNSMessage {
+			resp, err = servfailResponse(msg)
+			if err != nil {
+				r.log.Debug("dns tcp servfail", "err", err)
+				return
+			}
 		}
 		out := make([]byte, 2+len(resp))
 		binary.BigEndian.PutUint16(out[:2], uint16(len(resp)))
@@ -316,15 +363,36 @@ type dnsAnswer struct {
 //   - any other cluster-domain name is NXDOMAIN (never leaked upstream); any
 //     off-cluster name forwards (A only; k3sm is IPv4). Unanswered types get an
 //     empty NOERROR (NODATA).
-func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, error) {
+func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, int, error) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(query)
 	if err != nil {
-		return nil, fmt.Errorf("parse query header: %w", err)
+		return nil, maxUDPResponse, fmt.Errorf("parse query header: %w", err)
 	}
 	q, err := p.Question()
 	if err != nil {
-		return nil, fmt.Errorf("parse question: %w", err)
+		return nil, maxUDPResponse, fmt.Errorf("parse question: %w", err)
+	}
+
+	// EDNS(0) negotiation: a client OPT lifts the UDP truncation budget from the
+	// 512 floor up to ednsUDPPayloadSize; a non-EDNS query stays at 512 (unchanged).
+	edns := parseEDNS(query)
+	negotiated := negotiatedUDPSize(edns)
+
+	// OpCode guard: this resolver implements only the standard QUERY opcode (RFC
+	// 1035 §4.1.1). A non-Query request (IQUERY/STATUS/UPDATE/…) is answered with
+	// NOTIMP and the opcode echoed — never Query answers stamped under a foreign
+	// opcode (a self-inconsistent OpCode=UPDATE, RCODE=NOERROR with A records).
+	if hdr.OpCode != 0 {
+		resp, err := buildResponse(hdr, q, dnsAnswer{}, dnsmessage.RCodeNotImplemented, edns)
+		return resp, negotiated, err
+	}
+	// EDNS version guard: the resolver implements EDNS version 0 only. A higher
+	// version gets BADVERS (extended RCODE 16) with our OPT, not a plain NOERROR
+	// (RFC 6891 §6.1.3).
+	if edns.present && edns.version > 0 {
+		resp, err := buildResponse(hdr, q, dnsAnswer{}, ednsBADVERS, edns)
+		return resp, negotiated, err
 	}
 
 	qname := normalizeDNSName(q.Name.String())
@@ -397,7 +465,103 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, er
 		}
 	}
 
-	return buildResponse(hdr.ID, q, ans, rcode)
+	resp, err := buildResponse(hdr, q, ans, rcode, edns)
+	return resp, negotiated, err
+}
+
+// ednsRequest captures the EDNS(0) parameters a query advertised in its OPT
+// pseudo-record (RFC 6891 §6.1.2): the client's UDP payload size, the EDNS
+// version, and the DO bit. present is false for a plain, non-EDNS query (no OPT).
+type ednsRequest struct {
+	present bool
+	udpSize uint16
+	version uint8
+	do      bool
+}
+
+// parseEDNS extracts the EDNS(0) parameters from a query's OPT pseudo-record. A
+// query with no OPT — or a malformed one — yields present==false, so respond
+// serves plain DNS rather than erroring.
+func parseEDNS(query []byte) ednsRequest {
+	opt, ok := findOPT(query)
+	if !ok {
+		return ednsRequest{}
+	}
+	// The OPT ResourceHeader overloads its fields (RFC 6891 §6.1.3): Class carries
+	// the advertised UDP payload size, the TTL's second byte the EDNS version, and
+	// the DO bit lives in the TTL flags.
+	return ednsRequest{
+		present: true,
+		udpSize: uint16(opt.Class),
+		version: uint8(opt.TTL >> 16),
+		do:      opt.DNSSECAllowed(),
+	}
+}
+
+// findOPT walks a DNS message's Additional section and returns the first OPT
+// pseudo-record's ResourceHeader. ok==false when the message has no OPT or does
+// not parse. It is shared by the request path (parseEDNS) and the truncation path
+// (truncateResponse re-adds the response OPT it finds).
+func findOPT(msg []byte) (dnsmessage.ResourceHeader, bool) {
+	var p dnsmessage.Parser
+	if _, err := p.Start(msg); err != nil {
+		return dnsmessage.ResourceHeader{}, false
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return dnsmessage.ResourceHeader{}, false
+	}
+	if err := p.SkipAllAnswers(); err != nil {
+		return dnsmessage.ResourceHeader{}, false
+	}
+	if err := p.SkipAllAuthorities(); err != nil {
+		return dnsmessage.ResourceHeader{}, false
+	}
+	for {
+		ah, err := p.AdditionalHeader()
+		if err != nil {
+			return dnsmessage.ResourceHeader{}, false // ErrSectionDone or malformed: no OPT
+		}
+		if ah.Type == dnsmessage.TypeOPT {
+			return ah, true
+		}
+		if err := p.SkipAdditional(); err != nil {
+			return dnsmessage.ResourceHeader{}, false
+		}
+	}
+}
+
+// negotiatedUDPSize is the UDP response budget for a query: the 512 floor for a
+// non-EDNS client (unchanged behavior), else the client's advertised OPT size
+// clamped to [512, dns.EDNSUDPPayloadSize] (RFC 6891 — never below 512, never
+// above what the resolver single-buffers).
+func negotiatedUDPSize(e ednsRequest) int {
+	if !e.present {
+		return maxUDPResponse
+	}
+	size := int(e.udpSize)
+	if size < maxUDPResponse {
+		size = maxUDPResponse
+	}
+	if size > dns.EDNSUDPPayloadSize {
+		size = dns.EDNSUDPPayloadSize
+	}
+	return size
+}
+
+// servfailResponse rebuilds a query as a minimal SERVFAIL response (header +
+// question, no answers), echoing RD/OpCode and the request OPT. It is the TCP
+// overflow reply for a response too large to length-prefix (see handleTCPConn).
+func servfailResponse(query []byte) ([]byte, error) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(query)
+	if err != nil {
+		return nil, fmt.Errorf("parse query header: %w", err)
+	}
+	q, err := p.Question()
+	if err != nil {
+		return nil, fmt.Errorf("parse question: %w", err)
+	}
+	return buildResponse(hdr, q, dnsAnswer{}, dnsmessage.RCodeServerFailure, parseEDNS(query))
 }
 
 // synthA answers an A query for owner qname from the (ns, svc) Service's
@@ -511,15 +675,21 @@ func (r *clusterResolver) forward(ctx context.Context, host string) ([]netip.Add
 }
 
 // buildResponse renders a response carrying the question, the typed answers
-// (A / SRV / PTR), and the rcode. RecursionAvailable is set so a resolver
-// client does not treat the answer as refusing recursion.
-func buildResponse(id uint16, q dnsmessage.Question, ans dnsAnswer, rcode dnsmessage.RCode) ([]byte, error) {
+// (A / SRV / PTR), and the rcode. It echoes the request's RecursionDesired and
+// OpCode (RFC 1035 §4.1.1) from reqHdr; RecursionAvailable is set so a resolver
+// client does not treat the answer as refusing recursion. When the request
+// carried an OPT (edns.present), a well-formed response OPT is appended,
+// advertising ednsUDPPayloadSize and folding any extended RCODE into its TTL. The
+// rcode's low nibble goes in the header, its high bits into the OPT (BADVERS).
+func buildResponse(reqHdr dnsmessage.Header, q dnsmessage.Question, ans dnsAnswer, rcode dnsmessage.RCode, edns ednsRequest) ([]byte, error) {
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
-		ID:                 id,
+		ID:                 reqHdr.ID,
 		Response:           true,
+		OpCode:             reqHdr.OpCode,
 		Authoritative:      true,
+		RecursionDesired:   reqHdr.RecursionDesired,
 		RecursionAvailable: true,
-		RCode:              rcode,
+		RCode:              rcode & 0x0f,
 	})
 	b.EnableCompression()
 	if err := b.StartQuestions(); err != nil {
@@ -565,6 +735,84 @@ func buildResponse(id uint16, q dnsmessage.Question, ans dnsAnswer, rcode dnsmes
 		rh := dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypePTR, Class: dnsmessage.ClassINET, TTL: recordTTL}
 		if err := b.PTRResource(rh, dnsmessage.PTRResource{PTR: target}); err != nil {
 			return nil, fmt.Errorf("write PTR answer: %w", err)
+		}
+	}
+	if err := appendResponseOPT(&b, edns, rcode); err != nil {
+		return nil, err
+	}
+	return b.Finish()
+}
+
+// appendResponseOPT adds the response OPT pseudo-record (RFC 6891 §6.1.1) when
+// the query carried one: it advertises dns.EDNSUDPPayloadSize as the resolver's
+// own receive size, echoes the DO bit only if the query set it, and folds the
+// extended RCODE (e.g. BADVERS) into the OPT TTL. A non-EDNS query gets no
+// additionals — plain DNS, unchanged.
+func appendResponseOPT(b *dnsmessage.Builder, edns ednsRequest, rcode dnsmessage.RCode) error {
+	if !edns.present {
+		return nil
+	}
+	if err := b.StartAdditionals(); err != nil {
+		return fmt.Errorf("start additionals: %w", err)
+	}
+	var opt dnsmessage.ResourceHeader
+	if err := opt.SetEDNS0(dns.EDNSUDPPayloadSize, rcode, edns.do); err != nil {
+		return fmt.Errorf("set response OPT: %w", err)
+	}
+	if err := b.OPTResource(opt, dnsmessage.OPTResource{}); err != nil {
+		return fmt.Errorf("write response OPT: %w", err)
+	}
+	return nil
+}
+
+// truncateResponse rebuilds an oversized UDP response as header+question with
+// the TC bit set. The answers are dropped entirely rather than partially packed:
+// a client seeing TC discards the sections and re-asks over TCP (RFC 1035
+// §4.2.2), and RFC 2181 §9 permits (this resolver relies on) dropping the whole
+// set. It re-parses the built response, so the RD/OpCode buildResponse echoed
+// survive the rebuild, and re-adds the response OPT it finds so a TC'd datagram
+// to an EDNS client still carries a well-formed OPT and never exceeds the size
+// that client advertised (RFC 6891 §6.2.3).
+//
+// TODO(backlog): the drop-all (vs CoreDNS's partial-packing) is a legal RFC 2181
+// §9 divergence and belongs in the tracked surface, not only this comment — file
+// a backlog item in the workspace docs/BACKLOG.md naming the owed
+// docs/UPSTREAM-ALIGNMENT.md / docs/conformance-profile.md row (drop-all is
+// acceptable because k3sm's own in-pod shim + glibc both TCP-refetch on TC;
+// residual risk is a minimal-musl client that ignores TC). This repo has no
+// BACKLOG.md, so the item is filed at the workspace root.
+func truncateResponse(resp []byte) ([]byte, error) {
+	var p dnsmessage.Parser
+	hdr, err := p.Start(resp)
+	if err != nil {
+		return nil, fmt.Errorf("parse response header: %w", err)
+	}
+	q, err := p.Question()
+	if err != nil {
+		return nil, fmt.Errorf("parse response question: %w", err)
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID:                 hdr.ID,
+		Response:           true,
+		OpCode:             hdr.OpCode,
+		Authoritative:      hdr.Authoritative,
+		RecursionDesired:   hdr.RecursionDesired,
+		RecursionAvailable: hdr.RecursionAvailable,
+		RCode:              hdr.RCode,
+		Truncated:          true,
+	})
+	if err := b.StartQuestions(); err != nil {
+		return nil, fmt.Errorf("start questions: %w", err)
+	}
+	if err := b.Question(q); err != nil {
+		return nil, fmt.Errorf("write question: %w", err)
+	}
+	if opt, ok := findOPT(resp); ok {
+		if err := b.StartAdditionals(); err != nil {
+			return nil, fmt.Errorf("start additionals: %w", err)
+		}
+		if err := b.OPTResource(opt, dnsmessage.OPTResource{}); err != nil {
+			return nil, fmt.Errorf("write response OPT: %w", err)
 		}
 	}
 	return b.Finish()
