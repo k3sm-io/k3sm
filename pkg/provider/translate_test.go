@@ -1180,3 +1180,228 @@ func TestPodStatusQOSClass(t *testing.T) {
 		}
 	})
 }
+
+// TestRlimitSourceAndQoSClass is the B7 named gate: the provider is the SOURCE
+// of PodBox.rlimits (field 102), fed exclusively by pod-scoped
+// k3sm.io/rlimit-<resource> annotations. It proves:
+//   - the mechanical suffix→"RLIMIT_"+ToUpper(suffix) transform, forwarded
+//     VERBATIM into ResourceLimit.type (runtimed's rlimitResource map stays the
+//     single semantic authority — an unknown-but-well-formed name like
+//     "frobnicate" is forwarded, not filtered here);
+//   - the <soft> / <soft>:<hard> / "unlimited" value grammar (single value ⇒
+//     soft=hard; unlimited ⇒ ^uint64(0), runtimed's RLIM_INFINITY sentinel);
+//   - fail-fast SYNTAX validation: a malformed value or soft>hard (unlimited
+//     counts as max) is a toPodBox ERROR naming the exact annotation key — never
+//     a silent skip (producer-skip + consumer-skip would compose into a
+//     silently-unconstrained pod);
+//   - deterministic output: entries sorted by type name (exact-slice equality);
+//   - the no-synthesis discipline mirrored at the producer: resources.limits
+//     (memory/cpu) with zero rlimit annotations ⇒ box.Rlimits EMPTY (no
+//     RLIMIT_AS from memory, no RLIMIT_CPU from cpu — see runtimed's
+//     resolveRlimitPlan for why synthesis is forbidden).
+func TestRlimitSourceAndQoSClass(t *testing.T) {
+	q := func(s string) resource.Quantity { return resource.MustParse(s) }
+	unlimited := ^uint64(0)
+
+	tests := []struct {
+		name            string
+		annotations     map[string]string
+		containers      []corev1.Container
+		wantRlimits     []*runtimev1.ResourceLimit
+		wantErrContains string
+	}{
+		{
+			name:        "single annotation single value ⇒ soft=hard",
+			annotations: map[string]string{"k3sm.io/rlimit-nofile": "1024"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 1024},
+			},
+		},
+		{
+			name:        "soft:hard form carried exactly",
+			annotations: map[string]string{"k3sm.io/rlimit-nofile": "1024:4096"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: 4096},
+			},
+		},
+		{
+			name:        "unlimited single value ⇒ both positions RLIM_INFINITY sentinel",
+			annotations: map[string]string{"k3sm.io/rlimit-core": "unlimited"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_CORE", Soft: unlimited, Hard: unlimited},
+			},
+		},
+		{
+			name:        "numeric soft with unlimited hard",
+			annotations: map[string]string{"k3sm.io/rlimit-nofile": "1024:unlimited"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_NOFILE", Soft: 1024, Hard: unlimited},
+			},
+		},
+		{
+			name: "multiple annotations sorted by type name",
+			annotations: map[string]string{
+				"k3sm.io/rlimit-nproc":  "64",
+				"k3sm.io/rlimit-core":   "0",
+				"k3sm.io/rlimit-nofile": "256:512",
+			},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_CORE", Soft: 0, Hard: 0},
+				{Type: "RLIMIT_NOFILE", Soft: 256, Hard: 512},
+				{Type: "RLIMIT_NPROC", Soft: 64, Hard: 64},
+			},
+		},
+		{
+			name:            "malformed value errors naming the annotation key",
+			annotations:     map[string]string{"k3sm.io/rlimit-nofile": "banana"},
+			wantErrContains: "k3sm.io/rlimit-nofile",
+		},
+		{
+			name:            "soft greater than hard errors",
+			annotations:     map[string]string{"k3sm.io/rlimit-nofile": "4096:1024"},
+			wantErrContains: "k3sm.io/rlimit-nofile",
+		},
+		{
+			name:            "unlimited soft with numeric hard errors (unlimited counts as max)",
+			annotations:     map[string]string{"k3sm.io/rlimit-nproc": "unlimited:64"},
+			wantErrContains: "k3sm.io/rlimit-nproc",
+		},
+		{
+			name:        "unknown-but-well-formed resource name forwarded verbatim",
+			annotations: map[string]string{"k3sm.io/rlimit-frobnicate": "7"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_FROBNICATE", Soft: 7, Hard: 7},
+			},
+		},
+		{
+			// 2^63-1 is the largest expressible magnitude (== darwin RLIM_INFINITY's
+			// bit pattern, which runtimed collapses to RLIM_INFINITY — identical).
+			name:        "2^63-1 maximum magnitude accepted",
+			annotations: map[string]string{"k3sm.io/rlimit-fsize": "9223372036854775807"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_FSIZE", Soft: 9223372036854775807, Hard: 9223372036854775807},
+			},
+		},
+		{
+			// The sentinel-seam guard: a magnitude in (2^63-1, 2^64-1) would pass a
+			// naive uint64 check here but runtimed's rlimitValue collapses only true
+			// sentinels to RLIM_INFINITY (=2^63-1), so setrlimit would see Cur > Max
+			// → an EINVAL launch abort naming no annotation. Reject it at the source.
+			name:            "2^63 rejected naming the key (above-RLIM_INFINITY seam)",
+			annotations:     map[string]string{"k3sm.io/rlimit-fsize": "9223372036854775808"},
+			wantErrContains: "k3sm.io/rlimit-fsize",
+		},
+		{
+			name:            "huge soft with unlimited hard rejected (would EINVAL as Cur>Max)",
+			annotations:     map[string]string{"k3sm.io/rlimit-fsize": "9223372036854775808:unlimited"},
+			wantErrContains: "k3sm.io/rlimit-fsize",
+		},
+		{
+			// The no-synthesis discipline, producer side: k8s resources.limits
+			// NEVER synthesize an rlimit (no RLIMIT_AS from memory, no RLIMIT_CPU
+			// from cpu) — memory is enforced by runtimed's footprint sampler and
+			// RLIMIT_CPU is cumulative seconds, not a rate.
+			name: "no synthesis: resources.limits alone yield zero rlimits",
+			containers: []corev1.Container{{
+				Name: "c0",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceCPU: q("500m"), corev1.ResourceMemory: q("256Mi")},
+				},
+			}},
+			wantRlimits: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			containers := tt.containers
+			if containers == nil {
+				containers = []corev1.Container{{Name: "c0", Image: "registry/app:1"}}
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "default",
+					Name:        "p",
+					UID:         types.UID("uid-p"),
+					Annotations: tt.annotations,
+				},
+				Spec: corev1.PodSpec{Containers: containers},
+			}
+			box, err := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", netv1.DNSConfig{})
+			if tt.wantErrContains != "" {
+				if err == nil {
+					t.Fatalf("toPodBox = nil error, want an error naming annotation %q (fail-fast reject, not silent skip)", tt.wantErrContains)
+				}
+				if !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Fatalf("toPodBox error %q does not name the annotation key %q", err, tt.wantErrContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("toPodBox: %v", err)
+			}
+			got := box.GetRlimits()
+			if len(got) != len(tt.wantRlimits) {
+				t.Fatalf("rlimits = %v (len %d), want %v (len %d)", got, len(got), tt.wantRlimits, len(tt.wantRlimits))
+			}
+			// Exact-slice equality IN ORDER: the sorted order is part of the
+			// contract (deterministic proto slice + deterministic apply order).
+			for i := range got {
+				g, w := got[i], tt.wantRlimits[i]
+				if g.GetType() != w.GetType() || g.GetSoft() != w.GetSoft() || g.GetHard() != w.GetHard() {
+					t.Errorf("rlimits[%d] = {%s %d %d}, want {%s %d %d}",
+						i, g.GetType(), g.GetSoft(), g.GetHard(), w.GetType(), w.GetSoft(), w.GetHard())
+				}
+			}
+		})
+	}
+
+	// REGRESSION GUARD (not new B7 behavior): qos_class translation already ships
+	// green on main (translate.go podQOSClass; TestTypedMemoryLimitWritten). These
+	// subtests only pin that the rlimit source does not disturb it — qos
+	// APPLICATION evidence lives in runtimed's slices, not here.
+	qosTests := []struct {
+		name       string
+		containers []corev1.Container
+		want       runtimev1.QOSClass
+	}{
+		{
+			name:       "qos regression guard: besteffort",
+			containers: []corev1.Container{{Name: "c0"}},
+			want:       runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT,
+		},
+		{
+			name: "qos regression guard: burstable",
+			containers: []corev1.Container{{
+				Name:      "c0",
+				Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: q("128Mi")}},
+			}},
+			want: runtimev1.QOSClass_QOS_CLASS_BURSTABLE,
+		},
+		{
+			name: "qos regression guard: guaranteed",
+			containers: []corev1.Container{{
+				Name: "c0",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: q("1"), corev1.ResourceMemory: q("128Mi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: q("1"), corev1.ResourceMemory: q("128Mi")},
+				},
+			}},
+			want: runtimev1.QOSClass_QOS_CLASS_GUARANTEED,
+		},
+	}
+	for _, tt := range qosTests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "p", UID: types.UID("uid-p")},
+				Spec:       corev1.PodSpec{Containers: tt.containers},
+			}
+			box, err := toPodBox(pod, "10.0.0.1", "/var/lib/k3sm/pods/uid-p", "", netv1.DNSConfig{})
+			if err != nil {
+				t.Fatalf("toPodBox: %v", err)
+			}
+			if box.GetQosClass() != tt.want {
+				t.Errorf("qos_class = %v, want %v", box.GetQosClass(), tt.want)
+			}
+		})
+	}
+}
