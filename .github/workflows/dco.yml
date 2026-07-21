@@ -1,44 +1,48 @@
-# DCO sign-off check (advisory).
-#
-# Verifies every commit in a PR carries a `Signed-off-by:` line matching its
-# author — the Developer Certificate of Origin (see /DCO, /CONTRIBUTING.md).
-# `Co-Authored-By` trailers (e.g. AI assistants) are NOT required to sign off;
-# the human author/committer certifies the DCO via `git commit -s`.
-#
-# This workflow is ADVISORY until it is made a required status check via branch
-# protection (deferred to the pre-public/M4 step, after the agent commit tooling
-# signs off — see the licensing rollout plan). Read-only token; pull_request
-# trigger (never pull_request_target); third-party action pinned by commit SHA.
-name: DCO
-on:
-  pull_request:
-permissions:
-  contents: read
-jobs:
-  dco:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-      - name: Verify Signed-off-by
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          fail=0
-          for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
-            email="$(git show -s --format='%ae' "$sha")"
-            if ! git show -s --format='%B' "$sha" \
-                 | grep -qiE "^Signed-off-by: .+ <${email}>$"; then
-              author="$(git show -s --format='%an <%ae>' "$sha")"
-              echo "::error::commit ${sha} is not signed off by its author (${author}). Run: git commit -s --amend"
-              fail=1
-            fi
-          done
-          if [ "$fail" -ne 0 ]; then
-            echo "One or more commits are missing a DCO Signed-off-by. See CONTRIBUTING.md."
-            exit 1
-          fi
-          echo "All commits are signed off."
+# WORKFLOWS DISABLED 2026-07-20 — operator directive (see workspace docs/BACKLOG.md run log).
+# Every line below is commented out; uncomment to re-enable.
+# # DCO sign-off check (advisory).
+# #
+# # Verifies every commit in a PR carries a `Signed-off-by:` line matching its
+# # author — the Developer Certificate of Origin (see /DCO, /CONTRIBUTING.md).
+# # `Co-Authored-By` trailers (e.g. AI assistants) are NOT required to sign off;
+# # the human author/committer certifies the DCO via `git commit -s`.
+# #
+# # This workflow is ADVISORY until it is made a required status check via branch
+# # protection (deferred to the pre-public/M4 step, after the agent commit tooling
+# # signs off — see the licensing rollout plan). Read-only token; pull_request
+# # trigger (never pull_request_target); third-party action pinned by commit SHA.
+# name: DCO
+# on:
+#   pull_request:
+# permissions:
+#   contents: read
+# jobs:
+#   dco:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+#         with:
+#           fetch-depth: 0
+#       - name: Verify Signed-off-by
+#         env:
+#           BASE: ${{ github.event.pull_request.base.sha }}
+#           HEAD: ${{ github.event.pull_request.head.sha }}
+#         run: |
+#           set -euo pipefail
+#           fail=0
+#           for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
+#             email="$(git show -s --format='%ae' "$sha")"
+#             # Match the email as a FIXED string (-F): interpolating it into an ERE
+#             # broke on GitHub id+user@users.noreply addresses ('+' = quantifier).
+#             if ! git show -s --format='%B' "$sha" \
+#                  | grep -iE '^Signed-off-by: ' | grep -qiF "<${email}>"; then
+#               author="$(git show -s --format='%an <%ae>' "$sha")"
+#               echo "::error::commit ${sha} is not signed off by its author (${author}). Run: git commit -s --amend"
+#               fail=1
+#             fi
+#           done
+#           if [ "$fail" -ne 0 ]; then
+#             echo "One or more commits are missing a DCO Signed-off-by. See CONTRIBUTING.md."
+#             exit 1
+#           fi
+#           echo "All commits are signed off."

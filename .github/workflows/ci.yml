@@ -1,57 +1,59 @@
-# INTERIM M7-bootstrap public CI for the k3sm repo. This is the per-repo build/test
-# gate that runs hack/ci.sh (CGO_ENABLED=1) plus a -race pass. It is deliberately
-# minimal; the workspace-level M7.2 gate subsumes it later (that gate owns the
-# cross-repo checks — notably the DefaultKubeVersion symbol-canary, which reads the
-# workspace docs/UPSTREAM-ALIGNMENT.md and so is out of scope here — see below).
-#
-# Security posture mirrors dco.yml: read-only token, `pull_request` trigger
-# (NEVER pull_request_target), GitHub-hosted ephemeral arm64 runner (NEVER
-# self-hosted on a PR trigger), every action pinned by commit SHA.
-name: CI
-on:
-  # CI DISABLED — no auto-run. macOS runners are billable and we are not spending
-  # on CI for now (operator directive 2026-07-02). Manual-only via workflow_dispatch;
-  # re-enable by restoring `pull_request:`.
-  workflow_dispatch:
-permissions:
-  contents: read
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-jobs:
-  ci:
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          path: k3sm
-      # k3sm is CGO_ENABLED=1 and imports all three siblings via go.mod replaces
-      # (../apis, ../runtimed, ../darwin-net) — CI must check them out as siblings
-      # so those relative replaces resolve. From k3sm/ the ../apis|../runtimed|
-      # ../darwin-net paths point at these checkouts; no go.work is needed.
-      # Siblings are checked out at their default branch — acceptable for a
-      # workflow-only change (this repo's PR does not depend on unmerged sibling work).
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: k3sm-io/apis
-          path: apis
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: k3sm-io/runtimed
-          path: runtimed
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: k3sm-io/darwin-net
-          path: darwin-net
-      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
-        with:
-          go-version-file: k3sm/go.mod
-      # hack/ci.sh owns the CGO posture (CGO=1 for k3sm) — do NOT set CGO_ENABLED
-      # at the job level.
-      - name: gate
-        working-directory: k3sm
-        run: hack/ci.sh
-      - name: race
-        working-directory: k3sm
-        run: CGO_ENABLED=1 go test -race ./...
+# WORKFLOWS DISABLED 2026-07-20 — operator directive (see workspace docs/BACKLOG.md run log).
+# Every line below is commented out; uncomment to re-enable.
+# # INTERIM M7-bootstrap public CI for the k3sm repo. This is the per-repo build/test
+# # gate that runs hack/ci.sh (CGO_ENABLED=1) plus a -race pass. It is deliberately
+# # minimal; the workspace-level M7.2 gate subsumes it later (that gate owns the
+# # cross-repo checks — notably the DefaultKubeVersion symbol-canary, which reads the
+# # workspace docs/UPSTREAM-ALIGNMENT.md and so is out of scope here — see below).
+# #
+# # Security posture mirrors dco.yml: read-only token, `pull_request` trigger
+# # (NEVER pull_request_target), GitHub-hosted ephemeral arm64 runner (NEVER
+# # self-hosted on a PR trigger), every action pinned by commit SHA.
+# name: CI
+# on:
+#   # CI DISABLED — no auto-run. macOS runners are billable and we are not spending
+#   # on CI for now (operator directive 2026-07-02). Manual-only via workflow_dispatch;
+#   # re-enable by restoring `pull_request:`.
+#   workflow_dispatch:
+# permissions:
+#   contents: read
+# concurrency:
+#   group: ci-${{ github.ref }}
+#   cancel-in-progress: true
+# jobs:
+#   ci:
+#     runs-on: macos-15
+#     timeout-minutes: 30
+#     steps:
+#       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+#         with:
+#           path: k3sm
+#       # k3sm is CGO_ENABLED=1 and imports all three siblings via go.mod replaces
+#       # (../apis, ../runtimed, ../darwin-net) — CI must check them out as siblings
+#       # so those relative replaces resolve. From k3sm/ the ../apis|../runtimed|
+#       # ../darwin-net paths point at these checkouts; no go.work is needed.
+#       # Siblings are checked out at their default branch — acceptable for a
+#       # workflow-only change (this repo's PR does not depend on unmerged sibling work).
+#       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+#         with:
+#           repository: k3sm-io/apis
+#           path: apis
+#       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+#         with:
+#           repository: k3sm-io/runtimed
+#           path: runtimed
+#       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+#         with:
+#           repository: k3sm-io/darwin-net
+#           path: darwin-net
+#       - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+#         with:
+#           go-version-file: k3sm/go.mod
+#       # hack/ci.sh owns the CGO posture (CGO=1 for k3sm) — do NOT set CGO_ENABLED
+#       # at the job level.
+#       - name: gate
+#         working-directory: k3sm
+#         run: hack/ci.sh
+#       - name: race
+#         working-directory: k3sm
+#         run: CGO_ENABLED=1 go test -race ./...
