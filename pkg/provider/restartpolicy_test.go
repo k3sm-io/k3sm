@@ -98,20 +98,6 @@ func TestRestartPolicyOnExit(t *testing.T) {
 		}
 	})
 
-	t.Run("Reset returns to base", func(t *testing.T) {
-		clk := testclock.NewFakeClock(time.Unix(0, 0))
-		b := newCrashLoopBackoff(clk)
-		b.Next() // 10s
-		b.Next() // 20s
-		if got := b.Next(); got != 40*time.Second {
-			t.Fatalf("setup: third Next() = %s, want 40s", got)
-		}
-		b.Reset()
-		if got := b.Next(); got != 10*time.Second {
-			t.Errorf("after Reset(), Next() = %s, want 10s (base)", got)
-		}
-	})
-
 	t.Run("stabilization window resets to base", func(t *testing.T) {
 		clk := testclock.NewFakeClock(time.Unix(0, 0))
 		b := newCrashLoopBackoff(clk)
@@ -121,8 +107,9 @@ func TestRestartPolicyOnExit(t *testing.T) {
 			t.Fatalf("setup: third Next() = %s, want 40s", got)
 		}
 		// The container stays up past the stabilization window before crashing
-		// again, so the next delay resets to base (B26's stable-Running reset,
-		// driven here by the clock instead of an explicit Reset()).
+		// again, so the next delay resets to base. This clock-driven reset is the
+		// SINGLE reset authority (B26): there is deliberately no explicit Reset()
+		// that a second caller could drive with different semantics.
 		clk.Step(crashLoopStableWindow + time.Second)
 		if got := b.Next(); got != 10*time.Second {
 			t.Errorf("after staying up %s, Next() = %s, want reset to 10s", crashLoopStableWindow+time.Second, got)
@@ -173,10 +160,6 @@ func TestCrashLoopBackoffHot(t *testing.T) {
 		{"cold again once the container outlasted the window", func(clk *testclock.FakeClock, b *crashLoopBackoff) {
 			b.Next()
 			clk.Step(crashLoopStableWindow + time.Second)
-		}, false},
-		{"an explicit Reset goes cold", func(_ *testclock.FakeClock, b *crashLoopBackoff) {
-			b.Next()
-			b.Reset()
 		}, false},
 	}
 	for _, tt := range tests {

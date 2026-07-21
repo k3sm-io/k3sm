@@ -337,6 +337,60 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 		}
 	})
 
+	// The other half of the BackOff contract: a liveness kill on a container that
+	// is NOT already looping is immediate (kubelet parity), so nothing backed off.
+	// Upstream surfaces that as Unhealthy + Killing and reserves BackOff for
+	// genuine throttling — emitting it here would fire an operator's
+	// `reason=BackOff` alert on a single probe blip against a healthy container,
+	// and the overlay would render the self-contradicting "back-off 0s".
+	t.Run("an immediate liveness restart is neither a BackOff event nor a CrashLoopBackOff", func(t *testing.T) {
+		pod := crashPod("liveness-immediate", corev1.RestartPolicyAlways)
+		r, f, _, tr, rec := newCrashFake(t, pod)
+
+		if err := r.restartForLiveness(context.Background(), string(pod.UID), "c0"); err != nil {
+			t.Fatalf("liveness restart: %v", err)
+		}
+		waitRestart(t, "the liveness RestartContainer call", func() bool { n, _ := f.restartState(); return n == 1 })
+
+		tr.restartMu.Lock()
+		cr := tr.restarts["c0"]
+		delay, inFlight := cr.delay, cr.restartInFlight()
+		tr.restartMu.Unlock()
+		if delay != 0 {
+			t.Fatalf("liveness delay = %s, want 0 (an idle container's kill is immediate)", delay)
+		}
+		if !inFlight {
+			t.Fatal("the restart window must be open across the swap")
+		}
+
+		// The container is restarting, so it reads not-Ready — but it is NOT in a
+		// crash loop and must not be rendered as one.
+		st := &corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "c0", Ready: true,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}},
+		}
+		r.applyRestartOverlay(pod, tr, st)
+		got := st.ContainerStatuses[0]
+		if w := got.State.Waiting; w != nil && w.Reason == reasonCrashLoopBackOff {
+			t.Errorf("state = %+v, want no CrashLoopBackOff (nothing backed off)", got.State)
+		}
+		if w := got.State.Waiting; w != nil && strings.Contains(w.Message, "back-off 0s") {
+			t.Errorf("rendered %q — a zero back-off must never be reported as one", w.Message)
+		}
+		if got.Ready {
+			t.Error("a container being restarted must not be Ready")
+		}
+
+		select {
+		case ev := <-rec.Events:
+			t.Errorf("recorded %q, want NO BackOff event for an un-throttled liveness restart", ev)
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
 	t.Run("a Warning BackOff event is recorded for the throttled re-exec", func(t *testing.T) {
 		pod := crashPod("backoff-event", corev1.RestartPolicyAlways)
 		r, f, clk, tr, rec := newCrashFake(t, pod)
@@ -391,20 +445,87 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 		}
 	})
 
-	t.Run("PodInitialized is False while a sidecar crash-loops before it ever started", func(t *testing.T) {
-		pod := sidecarJobPod()
-		rs := &runtimev1.PodStatus{
-			PodId:                 string(pod.UID),
-			Phase:                 runtimev1.PodPhase_POD_PHASE_PENDING,
-			InitContainerStatuses: []*runtimev1.ContainerStatus{rtTerminatedFull("proxy", 1, 2, startedAt, finishedAt)},
+	// PodInitialized is DERIVED, not stamped True unconditionally. Every
+	// controller reads this condition on every pod with init containers, so the
+	// gate proves the derivation end to end through toPodStatus — not just the
+	// crash-looping sidecar that motivated it, but each arm of the rule, so a
+	// regression that over-corrects (holding a legitimately-initialized pod at
+	// False, wedging its controller) is caught here too.
+	t.Run("PodInitialized is derived from the init-container statuses", func(t *testing.T) {
+		startedSidecar := func() *runtimev1.ContainerStatus {
+			cs := rtRunning("proxy")
+			cs.Started, cs.StartedSet = true, true
+			return cs
 		}
-		st := toPodStatus(pod, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
-		c := findPodCondition(st.Conditions, corev1.PodInitialized)
-		if c == nil {
-			t.Fatal("no PodInitialized condition")
+		// A plain (non-sidecar) init container: same pod shape, no container-level
+		// restartPolicy, so it satisfies Initialized only by exiting 0.
+		plainInitPod := func() *corev1.Pod {
+			pod := sidecarJobPod()
+			pod.Spec.InitContainers[0].RestartPolicy = nil
+			return pod
 		}
-		if c.Status != corev1.ConditionFalse {
-			t.Errorf("PodInitialized = %s, want False (the sidecar never started)", c.Status)
+
+		for _, tc := range []struct {
+			name   string
+			pod    *corev1.Pod
+			initCS []*runtimev1.ContainerStatus
+			want   corev1.ConditionStatus
+		}{
+			{
+				name:   "a sidecar crash-looping before it ever started is NOT initialized",
+				pod:    sidecarJobPod(),
+				initCS: []*runtimev1.ContainerStatus{rtTerminatedFull("proxy", 1, 2, startedAt, finishedAt)},
+				want:   corev1.ConditionFalse,
+			},
+			{
+				name:   "a STARTED sidecar initializes the pod (it never terminates first)",
+				pod:    sidecarJobPod(),
+				initCS: []*runtimev1.ContainerStatus{startedSidecar()},
+				want:   corev1.ConditionTrue,
+			},
+			{
+				name:   "a declared init container with no status yet is NOT initialized",
+				pod:    sidecarJobPod(),
+				initCS: nil,
+				want:   corev1.ConditionFalse,
+			},
+			{
+				name:   "a plain init container that exited 0 initializes the pod",
+				pod:    plainInitPod(),
+				initCS: []*runtimev1.ContainerStatus{rtTerminatedFull("proxy", 0, 0, startedAt, finishedAt)},
+				want:   corev1.ConditionTrue,
+			},
+			{
+				name:   "a plain init container that FAILED does NOT initialize the pod",
+				pod:    plainInitPod(),
+				initCS: []*runtimev1.ContainerStatus{rtTerminatedFull("proxy", 1, 0, startedAt, finishedAt)},
+				want:   corev1.ConditionFalse,
+			},
+			{
+				name:   "a pod with no init containers is initialized",
+				pod:    crashPod("no-init", corev1.RestartPolicyAlways),
+				initCS: nil,
+				want:   corev1.ConditionTrue,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rs := &runtimev1.PodStatus{
+					PodId:                 string(tc.pod.UID),
+					Phase:                 runtimev1.PodPhase_POD_PHASE_PENDING,
+					InitContainerStatuses: tc.initCS,
+				}
+				st := toPodStatus(tc.pod, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+				c := findPodCondition(st.Conditions, corev1.PodInitialized)
+				if c == nil {
+					t.Fatal("no PodInitialized condition")
+				}
+				if c.Status != tc.want {
+					t.Errorf("PodInitialized = %s, want %s", c.Status, tc.want)
+				}
+				if tc.want == corev1.ConditionFalse && c.Reason != "ContainersNotInitialized" {
+					t.Errorf("reason = %q, want ContainersNotInitialized (what kubectl describe prints)", c.Reason)
+				}
+			})
 		}
 	})
 }
@@ -440,9 +561,9 @@ func TestContainerRestartStateMachine(t *testing.T) {
 		{
 			name: "endAttempt releases the worker but HOLDS the window",
 			drive: func(cr *containerRestart, cancel context.CancelFunc) {
-				cr.beginAttempt(cancel)
+				gen, _ := cr.beginAttempt(cancel)
 				cr.hasLastTerm = true
-				cr.endAttempt()
+				cr.endAttempt(gen)
 			},
 			wantInFlight:    true, // the surface survives until the container is up
 			wantHasLastTerm: true,
@@ -450,9 +571,9 @@ func TestContainerRestartStateMachine(t *testing.T) {
 		{
 			name: "observeRunning closes the window and drops the stale termination",
 			drive: func(cr *containerRestart, cancel context.CancelFunc) {
-				cr.beginAttempt(cancel)
+				gen, _ := cr.beginAttempt(cancel)
 				cr.hasLastTerm = true
-				cr.endAttempt()
+				cr.endAttempt(gen)
 				cr.observeRunning()
 			},
 		},
@@ -488,10 +609,10 @@ func TestContainerRestartStateMachine(t *testing.T) {
 
 	t.Run("beginAttempt refuses a second worker", func(t *testing.T) {
 		cr := &containerRestart{backoff: newCrashLoopBackoff(nil)}
-		if !cr.beginAttempt(func() {}) {
+		if _, ok := cr.beginAttempt(func() {}); !ok {
 			t.Fatal("the first beginAttempt must claim the slot")
 		}
-		if cr.beginAttempt(func() {}) {
+		if _, ok := cr.beginAttempt(func() {}); ok {
 			t.Error("a second beginAttempt claimed the slot — two workers could race one container")
 		}
 	})
@@ -508,6 +629,97 @@ func TestContainerRestartStateMachine(t *testing.T) {
 			t.Error("abort left the entry non-idle")
 		}
 	})
+
+	// The claim is releasable ONLY by its holder. Worker A is aborted mid-RPC
+	// (cancelRestarts on an idempotent CreatePod, or the terminal gate), a fresh
+	// status starts worker B, and only THEN does A's blocked RestartContainer
+	// return and run its deferred release. If that release landed, B's container
+	// would read `attempt == false` while B is still running, and
+	// scheduleRestartLocked — which gates solely on `attempt` — would start a
+	// THIRD worker: two concurrent RestartContainer RPCs and two backoff.Next()
+	// advances against one schedule.
+	t.Run("a stale worker cannot release its successor's claim", func(t *testing.T) {
+		cr := &containerRestart{backoff: newCrashLoopBackoff(nil)}
+		genA, ok := cr.beginAttempt(func() {})
+		if !ok {
+			t.Fatal("setup: worker A must claim the slot")
+		}
+		cr.abort() // the track was replaced / the pod went terminal
+
+		genB, ok := cr.beginAttempt(func() {})
+		if !ok {
+			t.Fatal("setup: worker B must claim the freed slot")
+		}
+		if genA == genB {
+			t.Fatal("the successor reused the aborted claim's generation")
+		}
+
+		cr.endAttempt(genA) // worker A's RPC finally returns
+		if !cr.attempt {
+			t.Error("the stale worker released its successor's claim — a second worker could now be scheduled")
+		}
+		if !cr.holdsAttempt(genB) {
+			t.Error("worker B no longer holds the claim it was granted")
+		}
+
+		cr.endAttempt(genB) // the real holder releases
+		if cr.attempt {
+			t.Error("the claim holder's release was ignored")
+		}
+	})
+
+	// An aborted claim that was never superseded is also not releasable: abort
+	// already cleared it, so a late release must not resurrect any state.
+	t.Run("an aborted worker's release is a no-op", func(t *testing.T) {
+		cr := &containerRestart{backoff: newCrashLoopBackoff(nil)}
+		gen, _ := cr.beginAttempt(func() {})
+		cr.abort()
+		cr.endAttempt(gen)
+		if cr.attempt || cr.restartInFlight() {
+			t.Error("a late release reopened an aborted claim")
+		}
+	})
+}
+
+// TestCreatePodReplaceIsolatesTheOldRestartWorker proves a replaced track's
+// worker cannot reach its successor's bookkeeping. An idempotent CreatePod for
+// the same pod.UID installs a NEW podTrack (runtimed.go) and cancels the old
+// one's workers — but a worker blocked inside RestartContainer at that instant
+// still has to unwind. Because the worker is handed the track and entry it was
+// STARTED against (never a podID it re-resolves), and releases its claim only by
+// generation, that unwinding touches nothing live: no RPC fires against the
+// successor and its bookkeeping stays pristine.
+func TestCreatePodReplaceIsolatesTheOldRestartWorker(t *testing.T) {
+	pod := crashPod("replaced", corev1.RestartPolicyAlways)
+	r, f, clk, oldTrack, _ := newCrashFake(t, pod)
+
+	r.buildStatus(pod.DeepCopy(), oldTrack, &runtimev1.PodStatus{
+		PodId:             string(pod.UID),
+		Phase:             runtimev1.PodPhase_POD_PHASE_FAILED,
+		ContainerStatuses: []*runtimev1.ContainerStatus{rtTerminated("c0", 1, 0, time.Unix(6000, 0))},
+	}, nil)
+	waitRestart(t, "backoff timer armed", clk.HasWaiters)
+
+	if err := r.CreatePod(context.Background(), pod); err != nil {
+		t.Fatalf("idempotent CreatePod: %v", err)
+	}
+	newTrack := r.trackByID(string(pod.UID))
+	if newTrack == nil {
+		t.Fatal("pod not tracked after the replacing CreatePod")
+	}
+	if newTrack == oldTrack {
+		t.Fatal("setup: CreatePod did not replace the track, so the race is not exercised")
+	}
+
+	clk.Step(600 * time.Second) // long past every back-off step
+	settleRestartCalls(t, f, 0)
+
+	newTrack.restartMu.Lock()
+	n := len(newTrack.restarts)
+	newTrack.restartMu.Unlock()
+	if n != 0 {
+		t.Errorf("the replaced track's worker wrote %d entries into the successor's bookkeeping, want 0", n)
+	}
 }
 
 // TestDeletePodCancelsRestartWorker proves the re-exec worker never outlives its

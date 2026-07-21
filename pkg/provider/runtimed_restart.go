@@ -46,11 +46,19 @@ import (
 // Concurrency: podTrack.restartMu guards the per-container bookkeeping
 // (t.restarts), separate from r.mu for the same reason as readyMu — buildStatus
 // runs OUTSIDE r.mu (GetPods snapshots tracks under r.mu, then builds each
-// unlocked). Lock order where both are held is always r.mu → restartMu
-// (runRestart's trackByID), never the reverse. Each pending re-exec is one
-// ctx-bounded goroutine (a pod-lifetime context, cancelled by DeletePod /
-// pod-terminal / CreatePod-replace via cancelRestarts), so a backoff wait
-// never blocks the watch goroutine and never leaks past the pod.
+// unlocked). Lock order where both are held is always r.mu → restartMu, never
+// the reverse. Each pending re-exec is one ctx-bounded goroutine (a pod-lifetime
+// context, cancelled by DeletePod / pod-terminal / CreatePod-replace via
+// cancelRestarts), so a backoff wait never blocks the watch goroutine and never
+// leaks past the pod.
+//
+// Worker identity (BINDING): a re-exec worker is handed the *podTrack and
+// *containerRestart it was STARTED against, plus its claim generation — it never
+// re-resolves them from podID. An idempotent CreatePod for the same pod.UID
+// installs a NEW podTrack while a worker may be blocked inside RestartContainer,
+// so a worker that looked its track up on return would mutate the REPLACEMENT's
+// bookkeeping and could release a claim it does not hold — reintroducing the two
+// competing restart authorities B26 exists to collapse.
 
 // reasonCrashLoopBackOff is the corev1 waiting reason the provider synthesizes
 // while a container sits between its exit and the scheduled re-exec.
@@ -111,6 +119,17 @@ type containerRestart struct {
 	// scheduling so two workers can never race the same container; it is NOT the
 	// observable window.
 	attempt bool
+	// attemptGen is the monotone id of the CURRENT worker claim, minted by
+	// beginAttempt and presented back by the worker that holds it. A claim can
+	// therefore only ever be released by ITS HOLDER: a worker whose claim was
+	// aborted mid-RPC (cancelRestarts on an idempotent CreatePod / the terminal
+	// gate) and then superseded by a fresh worker presents a stale generation and
+	// is ignored. Without this, the stale worker's release would hand a container
+	// that already has a worker back to scheduleRestartLocked, which gates solely
+	// on `attempt` — two concurrent RestartContainer RPCs and two independent
+	// backoff.Next() advances against one schedule, exactly the
+	// two-competing-authorities condition B26 exists to eliminate.
+	attemptGen uint64
 	// delay is the backoff wait of the in-flight (or most recent) re-exec — the
 	// value the CrashLoopBackOff message reports.
 	delay time.Duration
@@ -130,22 +149,36 @@ type containerRestart struct {
 func (cr *containerRestart) restartInFlight() bool { return cr.restarting }
 
 // beginAttempt claims the container's single re-exec worker slot and opens the
-// restart window, reporting false when a worker already holds it. Caller holds
-// t.restartMu.
-func (cr *containerRestart) beginAttempt(cancel context.CancelFunc) bool {
+// restart window, returning the claim's generation. It reports false when a
+// worker already holds the slot. Caller holds t.restartMu.
+func (cr *containerRestart) beginAttempt(cancel context.CancelFunc) (uint64, bool) {
 	if cr.attempt {
-		return false
+		return 0, false
 	}
 	cr.attempt = true
 	cr.restarting = true
 	cr.cancel = cancel
-	return true
+	cr.attemptGen++
+	return cr.attemptGen, true
 }
 
-// endAttempt releases the worker slot once the re-exec RPC has succeeded. The
-// restart WINDOW stays open — only observeRunning closes it. Caller holds
+// holdsAttempt reports whether the claim identified by gen is the LIVE one — the
+// worker presenting it still owns the container's re-exec slot. A worker whose
+// claim was aborted (attempt cleared) or superseded by a newer one (generation
+// bumped) does not hold it and must touch no shared bookkeeping. Caller holds
 // t.restartMu.
-func (cr *containerRestart) endAttempt() {
+func (cr *containerRestart) holdsAttempt(gen uint64) bool {
+	return cr.attempt && cr.attemptGen == gen
+}
+
+// endAttempt releases the worker slot held by gen once its re-exec RPC has
+// succeeded (or the worker is giving up). It is a NO-OP for a stale claim, so a
+// worker can never release a successor's slot. The restart WINDOW stays open —
+// only observeRunning closes it. Caller holds t.restartMu.
+func (cr *containerRestart) endAttempt(gen uint64) {
+	if !cr.holdsAttempt(gen) {
+		return
+	}
 	cr.attempt = false
 	cr.cancel = nil
 }
@@ -300,7 +333,7 @@ func (r *runtimedRuntime) scheduleRestartLocked(t *podTrack, podID, name string,
 	cr.seen, cr.seenSet = key, true
 	cr.lastTerm, cr.hasLastTerm = term, true
 	cr.delay = cr.backoff.Next()
-	r.startRestartWorkerLocked(cr, podID, name, restartReasonBackOff, cr.delay)
+	r.startRestartWorkerLocked(t, cr, podID, name, restartReasonBackOff, cr.delay)
 }
 
 // restartForLiveness is the LIVENESS half of the single restart authority: the
@@ -338,7 +371,7 @@ func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, contain
 	if !hot {
 		cr.delay = 0 // kubelet parity: an idle container's liveness kill is immediate
 	}
-	r.startRestartWorkerLocked(cr, podID, container, restartReasonLiveness, cr.delay)
+	r.startRestartWorkerLocked(t, cr, podID, container, restartReasonLiveness, cr.delay)
 	return nil
 }
 
@@ -347,13 +380,21 @@ func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, contain
 // triggers. The worker's lifetime is the pod's, not any single RPC's, so it
 // roots a fresh cancelable context (cancelled by cancelRestarts on DeletePod /
 // terminal / CreatePod-replace), mirroring the prober's lifetime pattern.
-func (r *runtimedRuntime) startRestartWorkerLocked(cr *containerRestart, podID, name, reason string, delay time.Duration) {
+//
+// The worker is handed the track and the bookkeeping entry it was started
+// AGAINST, plus its claim generation — never a podID to re-resolve. An
+// idempotent CreatePod for the same pod.UID installs a NEW podTrack
+// (runtimed.go) while a worker may be blocked inside RestartContainer; a worker
+// that re-resolved r.track[podID] on return would operate on the REPLACEMENT
+// track's bookkeeping. Identity is passed, never looked up.
+func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRestart, podID, name, reason string, delay time.Duration) {
 	ctx, cancel := context.WithCancel(context.Background())
-	if !cr.beginAttempt(cancel) {
+	gen, ok := cr.beginAttempt(cancel)
+	if !ok {
 		cancel()
 		return
 	}
-	go r.runRestart(ctx, podID, name, reason, delay)
+	go r.runRestart(ctx, t, cr, gen, podID, name, reason, delay)
 }
 
 // runRestart is the container's SINGLE re-exec worker. It waits out the
@@ -374,8 +415,15 @@ func (r *runtimedRuntime) startRestartWorkerLocked(cr *containerRestart, podID, 
 // container is observed running (observeExits → observeRunning), which is what
 // keeps the CrashLoopBackOff surface and the Running phase hold stable across
 // the swap.
-func (r *runtimedRuntime) runRestart(ctx context.Context, podID, name, reason string, delay time.Duration) {
-	defer r.finishAttempt(podID, name)
+//
+// The Warning BackOff Event is emitted ONLY when the attempt actually waited
+// (delay > 0). A liveness kill on a container that is not already looping is
+// immediate by kubelet parity (restartForLiveness), and upstream surfaces that
+// as Unhealthy + Killing — it reserves BackOff for genuine throttling, so
+// emitting it here would fire an operator's `reason=BackOff` alert on a single
+// probe blip against a healthy container.
+func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *containerRestart, gen uint64, podID, name, reason string, delay time.Duration) {
+	defer r.finishAttempt(t, cr, gen)
 	for {
 		if delay > 0 {
 			select {
@@ -383,10 +431,10 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, podID, name, reason st
 				return
 			case <-r.clk.After(delay):
 			}
+			r.emitBackOff(podID, name)
 		} else if ctx.Err() != nil {
 			return
 		}
-		r.emitBackOff(podID, name)
 		err := r.restartContainerReason(ctx, podID, name, reason)
 		if err == nil {
 			return
@@ -396,53 +444,45 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, podID, name, reason st
 		}
 		r.log.Warn("container re-exec failed; retrying under the CrashLoopBackOff schedule",
 			"pod", podID, "container", name, "err", err)
-		next, ok := r.advanceBackoff(podID, name)
+		next, ok := r.advanceBackoff(t, cr, gen)
 		if !ok {
-			return // the pod (or its bookkeeping) is gone
+			return // the claim was aborted or superseded; this worker is stale
 		}
 		delay = next
 	}
 }
 
-// finishAttempt releases the container's worker slot when the worker exits. The
-// restart window is untouched — it closes only on the evidence that the
-// container is running again.
-func (r *runtimedRuntime) finishAttempt(podID, name string) {
-	t := r.trackByID(podID)
-	if t == nil {
-		return
-	}
+// finishAttempt releases the worker slot on the bookkeeping entry the worker was
+// STARTED against, and only if it still holds claim gen — a stale worker
+// releases nothing. The restart window is untouched: it closes only on the
+// evidence that the container is running again.
+func (r *runtimedRuntime) finishAttempt(t *podTrack, cr *containerRestart, gen uint64) {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if cr := t.restarts[name]; cr != nil {
-		cr.endAttempt()
-	}
+	cr.endAttempt(gen)
 }
 
 // advanceBackoff advances the container's SHARED CrashLoopBackOff schedule after
 // a failed re-exec and publishes the new delay onto the bookkeeping the status
 // overlay renders, so a retried attempt surfaces its true back-off. It reports
-// false when the pod or its bookkeeping is gone (the worker then stops).
-func (r *runtimedRuntime) advanceBackoff(podID, name string) (time.Duration, bool) {
-	t := r.trackByID(podID)
-	if t == nil {
-		return 0, false
-	}
+// false when the calling worker no longer holds the claim (aborted by DeletePod
+// / the terminal gate / a CreatePod replace, or superseded) — the worker then
+// stops rather than advancing a schedule it does not own.
+func (r *runtimedRuntime) advanceBackoff(t *podTrack, cr *containerRestart, gen uint64) (time.Duration, bool) {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	cr := t.restarts[name]
-	if cr == nil {
+	if !cr.holdsAttempt(gen) {
 		return 0, false
 	}
 	cr.delay = cr.backoff.Next()
 	return cr.delay, true
 }
 
-// emitBackOff records the kubelet's Warning BackOff Event for a throttled
-// container re-exec, so `kubectl describe pod` on a crash-looping pod shows the
-// crash loop in its Events table (it previously showed no evidence at all). It
-// runs OUTSIDE restartMu and outside r.mu — an EventRecorder sink must never be
-// driven while a provider lock is held.
+// emitBackOff records the kubelet's Warning BackOff Event for a THROTTLED
+// container re-exec (callers gate on a non-zero back-off), so `kubectl describe
+// pod` on a crash-looping pod shows the crash loop in its Events table (it
+// previously showed no evidence at all). It runs OUTSIDE restartMu and outside
+// r.mu — an EventRecorder sink must never be driven while a provider lock is held.
 func (r *runtimedRuntime) emitBackOff(podID, container string) {
 	pod := r.podByID(podID)
 	if pod == nil {
@@ -491,8 +531,19 @@ func (r *runtimedRuntime) applyRestartOverlay(pod *corev1.Pod, t *podTrack, st *
 	}
 }
 
-// overlayCrashLoop rewrites the statuses of restarting containers to the
-// CrashLoopBackOff waiting shape, reporting whether any rewrite happened.
+// overlayCrashLoop marks every restarting container not-Ready and, for a
+// container that is actually being THROTTLED (delay > 0), rewrites its state to
+// the CrashLoopBackOff waiting shape. It reports whether any container was in
+// its restart window (which is what holds the pod phase at Running).
+//
+// The delay > 0 gate is the honesty condition: a liveness kill on a container
+// that is not already looping restarts it AT ONCE (kubelet parity), so there is
+// no back-off to report — rendering CrashLoopBackOff there would both claim a
+// crash loop that is not happening and print the self-contradicting "back-off
+// 0s". Such a container keeps the runtime's own state and simply reads
+// not-Ready, which is exactly upstream's surface for a container failing its
+// liveness probe.
+//
 // Caller holds t.restartMu.
 func overlayCrashLoop(pod *corev1.Pod, cs []corev1.ContainerStatus, restarts map[string]*containerRestart) bool {
 	restarting := false
@@ -508,11 +559,13 @@ func overlayCrashLoop(pod *corev1.Pod, cs []corev1.ContainerStatus, restarts map
 			term := cr.lastTerm
 			cs[i].LastTerminationState = corev1.ContainerState{Terminated: &term}
 		}
-		cs[i].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
-			Reason: reasonCrashLoopBackOff,
-			Message: fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)",
-				cr.delay, cs[i].Name, pod.Name, pod.Namespace, pod.UID),
-		}}
+		if cr.delay > 0 {
+			cs[i].State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason: reasonCrashLoopBackOff,
+				Message: fmt.Sprintf("back-off %s restarting failed container=%s pod=%s_%s(%s)",
+					cr.delay, cs[i].Name, pod.Name, pod.Namespace, pod.UID),
+			}}
+		}
 		cs[i].Ready = false
 		cs[i].Started = ptr(false)
 	}

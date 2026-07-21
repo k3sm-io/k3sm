@@ -173,12 +173,3 @@ func (b *crashLoopBackoff) Next() time.Duration {
 func (b *crashLoopBackoff) Hot() bool {
 	return b.cur != 0 && b.clk.Now().Sub(b.last) < crashLoopStableWindow
 }
-
-// Reset returns the schedule to its base delay, so the next Next call returns the
-// base — the explicit counterpart to Next's clock-driven stabilization reset
-// (which is what the B26 trigger relies on: a container that stays up past the
-// stabilization window resets on its next crash without an explicit call).
-func (b *crashLoopBackoff) Reset() {
-	b.cur = 0
-	b.last = time.Time{}
-}
