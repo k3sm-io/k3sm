@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
@@ -53,6 +54,31 @@ const dyldInsertAnnotation = "k3sm.io/dyld-insert-libraries"
 // constant (exactly as the DNS shim rides dyldInsertAnnotation). The value is in
 // ri_phys_footprint units, NOT RSS.
 const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
+
+// rlimitAnnotationPrefix prefixes the pod annotations that source
+// PodBox.rlimits[] (field 102): `k3sm.io/rlimit-<resource>` (e.g.
+// k3sm.io/rlimit-nofile, k3sm.io/rlimit-nproc), value `<soft>` or
+// `<soft>:<hard>` where each part is a decimal uint64 or "unlimited" (a single
+// value means soft=hard). The suffix is transformed MECHANICALLY —
+// "RLIMIT_"+strings.ToUpper(suffix) — and forwarded VERBATIM into
+// ResourceLimit.type: the provider keeps NO rlimit-name allowlist, runtimed's
+// rlimitResource map is the single semantic authority (an unknown name is its
+// skip-with-warning). The provider validates SYNTAX only, and a malformed
+// annotation fails CreatePod naming the key — a producer-side skip would
+// compose with the consumer-side skip into a silently-unconstrained pod.
+//
+// POD-SCOPED BY CONSTRUCTION (mirroring memoryLimitAnnotation): PodBox.rlimits
+// is a pod-level field, so these limits apply to init/sidecar/main containers
+// alike; per-container rlimits would need an apis change — out of B7 scope.
+// Darwin semantics live with the consumer: runtimed clamps an unlimited
+// RLIMIT_NOFILE to the kernel ceiling, and RLIMIT_NPROC counts per-uid (the
+// shared _k3sm user) — see runtimed/docs/resources.md.
+const rlimitAnnotationPrefix = "k3sm.io/rlimit-"
+
+// rlimitUnlimited is the annotation value token for "no limit". It is encoded
+// as all-ones (^uint64(0)), the sentinel runtimed's rlimitValue maps to
+// unix.RLIM_INFINITY.
+const rlimitUnlimited = "unlimited"
 
 // defaultGraceSeconds is the Kubernetes default SIGTERM→SIGKILL window applied
 // when a pod sets no terminationGracePeriodSeconds. proto3 int64 cannot represent
@@ -127,6 +153,16 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 		box.Annotations[memoryLimitAnnotation] = strconv.FormatInt(lim, 10)
 	}
 	box.QosClass = podQOSClass(pod)
+
+	// The rlimit SOURCE (B7): explicit k3sm.io/rlimit-* annotations and ONLY
+	// those — the producer mirrors runtimed's no-synthesis discipline (no
+	// RLIMIT_AS from resources.limits.memory, no RLIMIT_CPU from cpu; see
+	// resolveRlimitPlan for why). A malformed annotation fails the pod here.
+	rlimits, err := podRlimits(pod)
+	if err != nil {
+		return nil, err
+	}
+	box.Rlimits = rlimits
 
 	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers, true)
 	box.Containers = toRuntimeContainers(pod.Spec.Containers, false)
@@ -384,6 +420,81 @@ func podMemoryLimitBytes(pod *corev1.Pod) int64 {
 		sum += q.Value()
 	}
 	return sum
+}
+
+// podRlimits builds PodBox.rlimits[] from the pod's k3sm.io/rlimit-<resource>
+// annotations (see rlimitAnnotationPrefix for the grammar and the pod-scoped
+// contract). The annotation suffix becomes ResourceLimit.type mechanically
+// ("RLIMIT_"+ToUpper), with no name allowlist — semantic validity is runtimed's
+// (rlimitResource). Validation here is SYNTAX only, and it fails fast naming
+// the offending annotation key: unparseable values, soft>hard (unlimited counts
+// as max), and two keys colliding onto one type (their apply order would be
+// map-iteration random) all reject the pod. The result is sorted by type name
+// so the proto slice — and the daemon's apply order — is deterministic.
+func podRlimits(pod *corev1.Pod) ([]*runtimev1.ResourceLimit, error) {
+	var keys []string
+	for k := range pod.Annotations {
+		if strings.HasPrefix(k, rlimitAnnotationPrefix) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	sort.Strings(keys) // deterministic parse order ⇒ deterministic first error
+	out := make([]*runtimev1.ResourceLimit, 0, len(keys))
+	byType := make(map[string]string, len(keys)) // type → source annotation key
+	for _, k := range keys {
+		typ := "RLIMIT_" + strings.ToUpper(strings.TrimPrefix(k, rlimitAnnotationPrefix))
+		if prev, dup := byType[typ]; dup {
+			return nil, fmt.Errorf("rlimit annotations %s and %s both map to type %s", prev, k, typ)
+		}
+		byType[typ] = k
+		soft, hard, err := parseRlimitValue(pod.Annotations[k])
+		if err != nil {
+			return nil, fmt.Errorf("rlimit annotation %s: %w", k, err)
+		}
+		out = append(out, &runtimev1.ResourceLimit{Type: typ, Soft: soft, Hard: hard})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Type < out[j].Type })
+	return out, nil
+}
+
+// parseRlimitValue parses one rlimit annotation value: `<soft>` or
+// `<soft>:<hard>`, each a decimal uint64 or the "unlimited" token; a single
+// value means soft=hard. soft must not exceed hard, with unlimited counting as
+// the maximum (its ^uint64(0) encoding makes that a plain compare).
+func parseRlimitValue(v string) (soft, hard uint64, err error) {
+	softStr, hardStr, hasHard := strings.Cut(v, ":")
+	soft, err = parseRlimitMagnitude(softStr)
+	if err != nil {
+		return 0, 0, err
+	}
+	hard = soft
+	if hasHard {
+		hard, err = parseRlimitMagnitude(hardStr)
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if soft > hard {
+		return 0, 0, fmt.Errorf("soft limit %s exceeds hard limit %s", softStr, hardStr)
+	}
+	return soft, hard, nil
+}
+
+// parseRlimitMagnitude parses one limit magnitude: a decimal uint64, or the
+// "unlimited" token encoded as ^uint64(0) (the all-ones sentinel runtimed's
+// rlimitValue maps to unix.RLIM_INFINITY).
+func parseRlimitMagnitude(s string) (uint64, error) {
+	if s == rlimitUnlimited {
+		return ^uint64(0), nil
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("limit %q is not a decimal uint64 or %q", s, rlimitUnlimited)
+	}
+	return n, nil
 }
 
 // podQOSClass computes the pod's Quality-of-Service class and maps it to the apis
