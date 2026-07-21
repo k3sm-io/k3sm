@@ -53,6 +53,18 @@ import (
 // single count (the RestartContainer RPC bumps it); the provider surfaces it
 // verbatim and keeps no competing exit-driven counter.
 
+// effectivePodRestartPolicy returns the pod-level restart policy with the corev1
+// default (Always) applied to the empty value. It is the ONE place that default
+// is resolved, so the restart decision (observeExits) and the phase derivation
+// (derivePhase) can never disagree about an unset policy. A nil pod yields the
+// default too; callers that must distinguish "no spec" check pod themselves.
+func effectivePodRestartPolicy(pod *corev1.Pod) corev1.RestartPolicy {
+	if pod == nil || pod.Spec.RestartPolicy == "" {
+		return corev1.RestartPolicyAlways
+	}
+	return pod.Spec.RestartPolicy
+}
+
 // shouldRestartOnExit reports whether a terminated container should be
 // restarted. It is the ONE effective-policy truth table: containerPolicy is
 // the container-level restartPolicy (KEP-753; non-nil Always marks a native
@@ -146,6 +158,20 @@ func (b *crashLoopBackoff) Next() time.Duration {
 	}
 	b.last = now
 	return b.cur
+}
+
+// Hot reports whether the schedule is currently IN backoff — Next has been called
+// for a crash within the stabilization window, so the container is actively
+// crash-looping. A cold schedule (never used, or reset by a run that outlasted
+// the window) means a restart may proceed immediately.
+//
+// It exists for kubelet parity on the LIVENESS trigger (B26): upstream kills a
+// container whose liveness probe committed failure AT ONCE and only throttles a
+// container that is already looping. The exit-driven trigger always waits — an
+// exit IS the crash the schedule exists to pace — so only restartForLiveness
+// reads this. Hot never advances the schedule; it is a pure predicate.
+func (b *crashLoopBackoff) Hot() bool {
+	return b.cur != 0 && b.clk.Now().Sub(b.last) < crashLoopStableWindow
 }
 
 // Reset returns the schedule to its base delay, so the next Next call returns the

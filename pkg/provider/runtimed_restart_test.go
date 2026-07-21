@@ -385,7 +385,7 @@ func TestRestartTriggerIdempotent(t *testing.T) {
 		tr.restartMu.Lock()
 		defer tr.restartMu.Unlock()
 		cr := tr.restarts["c0"]
-		return cr != nil && !cr.pending
+		return cr != nil && !cr.attempt
 	})
 
 	// A STALE re-delivery of the already-handled termination stays latched.

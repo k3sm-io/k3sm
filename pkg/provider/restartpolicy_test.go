@@ -129,3 +129,70 @@ func TestRestartPolicyOnExit(t *testing.T) {
 		}
 	})
 }
+
+// TestEffectivePodRestartPolicy pins the ONE place the corev1 Always default is
+// resolved (B26): the restart decision and the phase derivation both read it, so
+// a divergent default here would let a pod be restarted while reporting Failed.
+func TestEffectivePodRestartPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want corev1.RestartPolicy
+	}{
+		{"nil pod defaults to Always", nil, corev1.RestartPolicyAlways},
+		{"empty policy defaults to Always", &corev1.Pod{}, corev1.RestartPolicyAlways},
+		{"Never is preserved", &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}}, corev1.RestartPolicyNever},
+		{"OnFailure is preserved", &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyOnFailure}}, corev1.RestartPolicyOnFailure},
+		{"Always is preserved", &corev1.Pod{Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyAlways}}, corev1.RestartPolicyAlways},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectivePodRestartPolicy(tt.pod); got != tt.want {
+				t.Errorf("effectivePodRestartPolicy = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCrashLoopBackoffHot covers the predicate the LIVENESS trigger reads to
+// decide whether to restart at once (kubelet parity) or wait out the schedule.
+// Hot must never advance the schedule — a predicate that consumed a step would
+// silently double every subsequent back-off.
+func TestCrashLoopBackoffHot(t *testing.T) {
+	tests := []struct {
+		name  string
+		drive func(clk *testclock.FakeClock, b *crashLoopBackoff)
+		want  bool
+	}{
+		{"a fresh schedule is cold", func(*testclock.FakeClock, *crashLoopBackoff) {}, false},
+		{"a schedule that just fired is hot", func(_ *testclock.FakeClock, b *crashLoopBackoff) { b.Next() }, true},
+		{"still hot inside the stabilization window", func(clk *testclock.FakeClock, b *crashLoopBackoff) {
+			b.Next()
+			clk.Step(crashLoopStableWindow - time.Second)
+		}, true},
+		{"cold again once the container outlasted the window", func(clk *testclock.FakeClock, b *crashLoopBackoff) {
+			b.Next()
+			clk.Step(crashLoopStableWindow + time.Second)
+		}, false},
+		{"an explicit Reset goes cold", func(_ *testclock.FakeClock, b *crashLoopBackoff) {
+			b.Next()
+			b.Reset()
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clk := testclock.NewFakeClock(time.Unix(0, 0))
+			b := newCrashLoopBackoff(clk)
+			tt.drive(clk, b)
+			if got := b.Hot(); got != tt.want {
+				t.Errorf("Hot() = %v, want %v", got, tt.want)
+			}
+			// Hot is a PURE predicate: calling it must not consume a step.
+			before := b.cur
+			_ = b.Hot()
+			if b.cur != before {
+				t.Errorf("Hot() advanced the schedule: cur %s -> %s", before, b.cur)
+			}
+		})
+	}
+}
