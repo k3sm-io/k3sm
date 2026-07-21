@@ -1,4 +1,4 @@
-# WORKFLOWS DISABLED 2026-07-20 — operator directive (see workspace docs/BACKLOG.md run log).
+# WORKFLOWS DISABLED 2026-07-20 — CI is intentionally inactive for this repository.
 # Every line below is commented out; uncomment to re-enable.
 # # INTERIM M7-bootstrap public CI for the k3sm repo. This is the per-repo build/test
 # # gate that runs hack/ci.sh (CGO_ENABLED=1) plus a -race pass. It is deliberately
