@@ -18,6 +18,7 @@ package provider
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,8 +59,9 @@ const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 // rlimitAnnotationPrefix prefixes the pod annotations that source
 // PodBox.rlimits[] (field 102): `k3sm.io/rlimit-<resource>` (e.g.
 // k3sm.io/rlimit-nofile, k3sm.io/rlimit-nproc), value `<soft>` or
-// `<soft>:<hard>` where each part is a decimal uint64 or "unlimited" (a single
-// value means soft=hard). The suffix is transformed MECHANICALLY —
+// `<soft>:<hard>` where each part is a decimal integer up to 2^63-1 or
+// "unlimited" (a single value means soft=hard; see parseRlimitMagnitude for
+// why larger magnitudes are rejected). The suffix is transformed MECHANICALLY —
 // "RLIMIT_"+strings.ToUpper(suffix) — and forwarded VERBATIM into
 // ResourceLimit.type: the provider keeps NO rlimit-name allowlist, runtimed's
 // rlimitResource map is the single semantic authority (an unknown name is its
@@ -446,6 +448,11 @@ func podRlimits(pod *corev1.Pod) ([]*runtimev1.ResourceLimit, error) {
 	byType := make(map[string]string, len(keys)) // type → source annotation key
 	for _, k := range keys {
 		typ := "RLIMIT_" + strings.ToUpper(strings.TrimPrefix(k, rlimitAnnotationPrefix))
+		// Critique-ratified syntax contract: the duplicate-type reject (here) and
+		// the soft≤hard reject (parseRlimitValue) are value/shape checks, NOT name
+		// semantics — they need no rlimit-name knowledge and preserve the
+		// deterministic-apply-order and fail-fast guarantees. Do not strip them
+		// as provider-side scope creep.
 		if prev, dup := byType[typ]; dup {
 			return nil, fmt.Errorf("rlimit annotations %s and %s both map to type %s", prev, k, typ)
 		}
@@ -461,9 +468,11 @@ func podRlimits(pod *corev1.Pod) ([]*runtimev1.ResourceLimit, error) {
 }
 
 // parseRlimitValue parses one rlimit annotation value: `<soft>` or
-// `<soft>:<hard>`, each a decimal uint64 or the "unlimited" token; a single
-// value means soft=hard. soft must not exceed hard, with unlimited counting as
-// the maximum (its ^uint64(0) encoding makes that a plain compare).
+// `<soft>:<hard>`, each a decimal integer up to 2^63-1 or the "unlimited"
+// token; a single value means soft=hard. soft must not exceed hard, with
+// unlimited counting as the maximum (its ^uint64(0) encoding makes that a
+// plain compare). The soft≤hard reject is part of the critique-ratified
+// syntax contract (a value-shape check, not name semantics — see podRlimits).
 func parseRlimitValue(v string) (soft, hard uint64, err error) {
 	softStr, hardStr, hasHard := strings.Cut(v, ":")
 	soft, err = parseRlimitMagnitude(softStr)
@@ -483,16 +492,26 @@ func parseRlimitValue(v string) (soft, hard uint64, err error) {
 	return soft, hard, nil
 }
 
-// parseRlimitMagnitude parses one limit magnitude: a decimal uint64, or the
-// "unlimited" token encoded as ^uint64(0) (the all-ones sentinel runtimed's
-// rlimitValue maps to unix.RLIM_INFINITY).
+// parseRlimitMagnitude parses one limit magnitude: a decimal integer up to
+// 2^63-1 (math.MaxInt64), or the "unlimited" token encoded as ^uint64(0) (the
+// all-ones sentinel runtimed's rlimitValue maps to unix.RLIM_INFINITY).
+//
+// Magnitudes ABOVE 2^63-1 are rejected, not carried: darwin's RLIM_INFINITY is
+// 2^63-1, and runtimed collapses only the true sentinels (^uint64(0) /
+// RLIM_INFINITY's own bit pattern) — a value in (2^63-1, 2^64-1) would ride
+// through verbatim and make setrlimit see Cur > Max (e.g. huge soft with an
+// unlimited hard), an EINVAL launch abort that names no annotation. Fail-fast
+// here instead, where the error can name the key.
 func parseRlimitMagnitude(s string) (uint64, error) {
 	if s == rlimitUnlimited {
 		return ^uint64(0), nil
 	}
 	n, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("limit %q is not a decimal uint64 or %q", s, rlimitUnlimited)
+		return 0, fmt.Errorf("limit %q is not a decimal integer or %q", s, rlimitUnlimited)
+	}
+	if n > math.MaxInt64 {
+		return 0, fmt.Errorf("limit %q exceeds the 2^63-1 maximum (darwin RLIM_INFINITY); use %q for no limit", s, rlimitUnlimited)
 	}
 	return n, nil
 }

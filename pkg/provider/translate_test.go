@@ -1274,6 +1274,29 @@ func TestRlimitSourceAndQoSClass(t *testing.T) {
 			},
 		},
 		{
+			// 2^63-1 is the largest expressible magnitude (== darwin RLIM_INFINITY's
+			// bit pattern, which runtimed collapses to RLIM_INFINITY — identical).
+			name:        "2^63-1 maximum magnitude accepted",
+			annotations: map[string]string{"k3sm.io/rlimit-fsize": "9223372036854775807"},
+			wantRlimits: []*runtimev1.ResourceLimit{
+				{Type: "RLIMIT_FSIZE", Soft: 9223372036854775807, Hard: 9223372036854775807},
+			},
+		},
+		{
+			// The sentinel-seam guard: a magnitude in (2^63-1, 2^64-1) would pass a
+			// naive uint64 check here but runtimed's rlimitValue collapses only true
+			// sentinels to RLIM_INFINITY (=2^63-1), so setrlimit would see Cur > Max
+			// → an EINVAL launch abort naming no annotation. Reject it at the source.
+			name:            "2^63 rejected naming the key (above-RLIM_INFINITY seam)",
+			annotations:     map[string]string{"k3sm.io/rlimit-fsize": "9223372036854775808"},
+			wantErrContains: "k3sm.io/rlimit-fsize",
+		},
+		{
+			name:            "huge soft with unlimited hard rejected (would EINVAL as Cur>Max)",
+			annotations:     map[string]string{"k3sm.io/rlimit-fsize": "9223372036854775808:unlimited"},
+			wantErrContains: "k3sm.io/rlimit-fsize",
+		},
+		{
 			// The no-synthesis discipline, producer side: k8s resources.limits
 			// NEVER synthesize an rlimit (no RLIMIT_AS from memory, no RLIMIT_CPU
 			// from cpu) — memory is enforced by runtimed's footprint sampler and
