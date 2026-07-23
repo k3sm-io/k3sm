@@ -31,11 +31,13 @@ import (
 func TestLoadCAPins(t *testing.T) {
 	t.Parallel()
 
-	// damage names a file the case removes after the hierarchy is seeded.
+	// damage names a file the case removes after the hierarchy is seeded; mutate is
+	// an arbitrary post-seed mutation (the symlink plants).
 	cases := []struct {
 		name      string
 		seed      bool
 		damage    func(dir string) string
+		mutate    func(t *testing.T, dir string)
 		wantErrIs error
 	}{
 		{name: "intact hierarchy", seed: true},
@@ -67,6 +69,28 @@ func TestLoadCAPins(t *testing.T) {
 			damage:    certs.SigningCAKeyPath,
 			wantErrIs: certs.ErrIncompleteHierarchy,
 		},
+		{
+			// A CA certificate replaced by a SYMLINK is refused, not followed. Under
+			// os.Stat the link would be followed and the pin computed from whatever it
+			// points at — a planted link redirecting a root read at an arbitrary file.
+			name: "cluster CA certificate replaced by a symlink",
+			seed: true,
+			mutate: func(t *testing.T, dir string) {
+				plantSymlink(t, certs.ClusterCACertPath(dir), certs.SigningCACertPath(dir))
+			},
+			wantErrIs: certs.ErrIncompleteHierarchy,
+		},
+		{
+			// Same for a CA KEY: a link to any existing file would satisfy a plain
+			// stat and make ErrIncompleteHierarchy unreachable for a hierarchy that is
+			// in fact half-present.
+			name: "signing CA key replaced by a symlink",
+			seed: true,
+			mutate: func(t *testing.T, dir string) {
+				plantSymlink(t, certs.SigningCAKeyPath(dir), certs.SigningCACertPath(dir))
+			},
+			wantErrIs: certs.ErrIncompleteHierarchy,
+		},
 	}
 
 	for _, tc := range cases {
@@ -85,6 +109,9 @@ func TestLoadCAPins(t *testing.T) {
 				if err := os.Remove(tc.damage(dir)); err != nil {
 					t.Fatalf("damage: %v", err)
 				}
+			}
+			if tc.mutate != nil {
+				tc.mutate(t, dir)
 			}
 			before := listTree(t, dir)
 
@@ -138,6 +165,18 @@ func TestLoadCAPinsNeverOpensCAKeys(t *testing.T) {
 	}
 	if cluster != h.Cluster.PinHash() || signing != h.Signing.PinHash() {
 		t.Errorf("pins = %s/%s, want %s/%s", cluster, signing, h.Cluster.PinHash(), h.Signing.PinHash())
+	}
+}
+
+// plantSymlink replaces path with a symlink to target — the planted link a
+// stat-and-follow implementation would obey.
+func plantSymlink(t *testing.T, path, target string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove %s: %v", path, err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("symlink %s -> %s: %v", path, target, err)
 	}
 }
 
