@@ -90,6 +90,11 @@ const (
 	LogDir = "/var/log/k3sm"
 )
 
+// ServerLogPath returns the control-plane daemon's combined stdout/stderr log path.
+// The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
+// message) name it, so the two can never drift apart.
+func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
+
 // System is the privileged-operation seam install/uninstall drive. The real
 // darwin implementation performs the root syscalls/tools; tests inject a fake so
 // the orchestration runs without privilege.
@@ -656,8 +661,8 @@ func ServerPlist(cfg Config) []byte {
 		RunAtLoad:        true,
 		KeepAlive:        true,
 		WorkingDirectory: cfg.DataRoot,
-		StdoutPath:       filepath.Join(LogDir, "server.log"),
-		StderrPath:       filepath.Join(LogDir, "server.log"),
+		StdoutPath:       ServerLogPath(),
+		StderrPath:       ServerLogPath(),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
 		// Give Stop() room to reap the serial control-plane teardown before launchd
 		// SIGKILLs the job (default 20s ≈ the worst-case 4×drainGrace, which orphans

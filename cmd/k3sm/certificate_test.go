@@ -336,6 +336,14 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			pre := snapshotTree(t, dir)
 			if tc.lock != nil {
 				tc.lock(t, dir)
+				// The lock step is the TEST's own mutation (a chmod, or the removal
+				// that seeds a half-present hierarchy). Drop anything it removed from
+				// the baseline so the diff below measures only what ROTATION did.
+				for p := range pre {
+					if _, err := os.Lstat(p); errors.Is(err, os.ErrNotExist) {
+						delete(pre, p)
+					}
+				}
 			}
 
 			// Independent pin computation (never via the code under test).
@@ -421,6 +429,14 @@ func TestCertificateRotatePreservesCAPin(t *testing.T) {
 			}
 
 			// --- report expectations -------------------------------------------------
+			// A failed rotation must never claim success, whatever it got through.
+			if lastErr != nil {
+				for _, out := range outputs {
+					if strings.Contains(out, "serving again") {
+						t.Errorf("a failed rotation reported success:\n%s", out)
+					}
+				}
+			}
 			if lastErr == nil {
 				out := outputs[len(outputs)-1]
 				if !strings.Contains(out, preClusterPin) {

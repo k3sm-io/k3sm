@@ -191,10 +191,13 @@ func (darwinSystem) LaunchctlBootout(label string) error {
 	return nil
 }
 
-// LaunchctlKickstart force-restarts the daemon.
+// LaunchctlKickstart force-restarts the daemon. An unloaded/absent label is an
+// ERROR here (unlike Bootout's idempotent no-op): a caller asking for a restart must
+// never be told a daemon that is not there was restarted. launchctl's output is
+// trimmed because this error is surfaced verbatim in a CLI message.
 func (darwinSystem) LaunchctlKickstart(label string) error {
 	if out, err := exec.Command("launchctl", "kickstart", "-k", "system/"+label).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl kickstart %s: %w: %s", label, err, out)
+		return fmt.Errorf("launchctl kickstart %s: %w: %s", label, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

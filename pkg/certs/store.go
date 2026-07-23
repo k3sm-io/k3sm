@@ -17,6 +17,11 @@ limitations under the License.
 package certs
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,12 +39,15 @@ type Hierarchy struct {
 	Signing *CA
 }
 
-// Cluster/Signing CA on-disk filenames within the PKI dir.
+// On-disk filenames within the PKI dir: the two CA keypairs, plus the multi-node
+// apiserver serving keypair the mesh path issues from the cluster CA.
 const (
 	clusterCACert = "cluster-ca.crt"
 	clusterCAKey  = "cluster-ca.key"
 	signingCACert = "signing-ca.crt"
 	signingCAKey  = "signing-ca.key"
+	apiServerCert = "apiserver.crt"
+	apiServerKey  = "apiserver.key"
 )
 
 // PKIDir returns the directory under the server work dir that holds the CA
@@ -50,6 +58,103 @@ func PKIDir(workDir string) string { return filepath.Join(workDir, "tls") }
 // --kubelet-certificate-authority / --client-ca-file flags point at.
 func ClusterCACertPath(workDir string) string { return filepath.Join(PKIDir(workDir), clusterCACert) }
 func SigningCACertPath(workDir string) string { return filepath.Join(PKIDir(workDir), signingCACert) }
+
+// ClusterCAKeyPath / SigningCAKeyPath are the CA PRIVATE KEY paths (0600). They are
+// exported so a caller can NAME a key file — to os.Stat it, or to report on it —
+// without re-joining the layout. Nothing outside EnsureHierarchy / WriteHierarchy
+// should ever OPEN them: pin verification needs only the certificate.
+func ClusterCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), clusterCAKey) }
+func SigningCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), signingCAKey) }
+
+// APIServerServingCertPath / APIServerServingKeyPath are the multi-node apiserver's
+// cluster-CA-signed serving keypair under the PKI dir (--tls-cert-file /
+// --tls-private-key-file). The mesh server re-issues them on every boot; a
+// single-node server self-signs into its own cert dir instead, so these need not exist.
+func APIServerServingCertPath(workDir string) string {
+	return filepath.Join(PKIDir(workDir), apiServerCert)
+}
+func APIServerServingKeyPath(workDir string) string {
+	return filepath.Join(PKIDir(workDir), apiServerKey)
+}
+
+// ErrNoHierarchy reports that a CA CERTIFICATE is absent from the work dir's PKI
+// directory — there is no hierarchy to read. It is deliberately a hard, typed failure
+// rather than a mint: EnsureHierarchy CREATES and persists a fresh CA when both files
+// are absent, so a read-only caller that fell through to it against the wrong work dir
+// (a forgotten sudo resolves <home>/server, not /var/lib/k3sm/server) would leave a
+// stray CA behind and report a pin no node trusts. Compare with errors.Is.
+var ErrNoHierarchy = errors.New("certs: no CA hierarchy in the work dir's PKI directory")
+
+// ErrIncompleteHierarchy reports that a CA certificate is present but its private key
+// is not — the half-present hierarchy ensureCA also refuses. Distinct from
+// ErrNoHierarchy so a caller can tell "nothing here" (wrong work dir / missing
+// privilege) from "the PKI on this host is damaged". Compare with errors.Is.
+var ErrIncompleteHierarchy = errors.New("certs: incomplete CA hierarchy (a CA certificate has no private key)")
+
+// LoadCAPins reads ONLY the two CA CERTIFICATES from workDir's PKI directory and
+// returns their PinHash values (the lowercase-hex SHA-256 of the certificate DER that
+// a K10 join token pins). It is the read-only counterpart of EnsureHierarchy:
+//
+//   - it CREATES NOTHING — an absent hierarchy is ErrNoHierarchy, never a freshly
+//     minted CA, and no directory is made;
+//   - it never OPENS a CA private key — the keys are os.Stat'ed only, solely to reject
+//     a half-present hierarchy (ErrIncompleteHierarchy), so it works against keys the
+//     caller cannot read.
+//
+// It is what `k3sm certificate rotate` verifies the hierarchy with before and after a
+// control-plane restart.
+func LoadCAPins(workDir string) (cluster, signing string, err error) {
+	cluster, err = caPin(ClusterCACertPath(workDir), ClusterCAKeyPath(workDir))
+	if err != nil {
+		return "", "", fmt.Errorf("cluster CA: %w", err)
+	}
+	signing, err = caPin(SigningCACertPath(workDir), SigningCAKeyPath(workDir))
+	if err != nil {
+		return "", "", fmt.Errorf("signing CA: %w", err)
+	}
+	return cluster, signing, nil
+}
+
+// caPin returns the pin of the certificate at certPath, having first confirmed its key
+// exists at keyPath. The key is STATTED ONLY — never opened, never parsed.
+func caPin(certPath, keyPath string) (string, error) {
+	if _, err := os.Stat(certPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%w: %s is absent", ErrNoHierarchy, certPath)
+		}
+		return "", fmt.Errorf("stat %s: %w", certPath, err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%w: %s is absent", ErrIncompleteHierarchy, keyPath)
+		}
+		return "", fmt.Errorf("stat %s: %w", keyPath, err)
+	}
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", certPath, err)
+	}
+	pin, err := certPin(certPEM)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", certPath, err)
+	}
+	return pin, nil
+}
+
+// certPin returns the lowercase-hex SHA-256 of a PEM-encoded certificate's DER — the
+// same value CA.PinHash returns, computed without the private key.
+func certPin(certPEM []byte) (string, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", errors.New("certs: no CERTIFICATE PEM block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse certificate: %w", err)
+	}
+	sum := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(sum[:]), nil
+}
 
 // EnsureHierarchy loads the cluster + signing CAs from the work dir's PKI directory,
 // creating and persisting them on first call (idempotent across restarts). CA keys
