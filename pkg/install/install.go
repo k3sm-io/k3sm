@@ -90,6 +90,11 @@ const (
 	LogDir = "/var/log/k3sm"
 )
 
+// ServerLogPath returns the control-plane daemon's combined stdout/stderr log path.
+// The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
+// message) name it, so the two can never drift apart.
+func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
+
 // System is the privileged-operation seam install/uninstall drive. The real
 // darwin implementation performs the root syscalls/tools; tests inject a fake so
 // the orchestration runs without privilege.
@@ -121,7 +126,15 @@ type System interface {
 	// label is a no-op success).
 	LaunchctlBootout(label string) error
 	// LaunchctlKickstart (re)starts the labelled daemon (launchctl kickstart -k).
+	// It returns as soon as the restart is REQUESTED — not when the old instance
+	// is gone — so a caller that must observe the new instance pairs it with
+	// LaunchctlServicePID.
 	LaunchctlKickstart(label string) error
+	// LaunchctlServicePID returns the pid launchd currently reports for the
+	// labelled job, or 0 when the job is LOADED but not running (the respawn
+	// window, or a job that has exited and not yet been relaunched). A label that
+	// is not loaded at all is an error. It is read-only.
+	LaunchctlServicePID(label string) (int, error)
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
 	// ~/.kube/config, owned by targetUser (NOT root).
 	WriteUserKubeconfig(targetUser string, contents []byte) error
@@ -656,8 +669,8 @@ func ServerPlist(cfg Config) []byte {
 		RunAtLoad:        true,
 		KeepAlive:        true,
 		WorkingDirectory: cfg.DataRoot,
-		StdoutPath:       filepath.Join(LogDir, "server.log"),
-		StderrPath:       filepath.Join(LogDir, "server.log"),
+		StdoutPath:       ServerLogPath(),
+		StderrPath:       ServerLogPath(),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
 		// Give Stop() room to reap the serial control-plane teardown before launchd
 		// SIGKILLs the job (default 20s ≈ the worst-case 4×drainGrace, which orphans

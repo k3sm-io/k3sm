@@ -42,9 +42,16 @@ See [limitations.md](limitations.md).
 k3sm ships no metrics-server and has no CPU accounting; install a metrics-server operator if you need the
 `metrics.k8s.io` verb. See [kubectl-access.md](kubectl-access.md) and [limitations.md](limitations.md).
 
+## A control-plane certificate is close to expiry
+
+Component certificates are re-issued on every control-plane boot, so a restart renews them.
+`sudo k3sm certificate rotate` reports what a restart would re-issue (and both CA pins, which
+never change); `--restart` performs it. Rotation does **not** revoke anything and does not cover
+worker-node certs — see [certificates.md](certificates.md) before you rely on it.
+
 ## Multi-node join fails
 
-- Re-mint the token (`k3sm token create`) — tokens expire.
+- Re-mint the token (`sudo k3sm token create`) — tokens expire.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
   [multi-node.md](multi-node.md).
 
@@ -53,3 +60,4 @@ k3sm ships no metrics-server and has no CPU accounting; install a metrics-server
 - [faq.md](faq.md) — quick answers.
 - [limitations.md](limitations.md) — is this a bug or a documented gap?
 - [backup-restore.md](backup-restore.md) — recover the datastore.
+- [certificates.md](certificates.md) — the PKI, rotation, and its limits.

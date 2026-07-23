@@ -17,13 +17,14 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 6. [Storage](storage.md) — local-path PVs, node affinity, what is and isn't supported.
 7. [Versions](versions.md) — the Kubernetes version k3sm tracks and how to read the live pin.
 8. [Upgrade](upgrade.md) — upgrading a node or cluster, the launchd restart model.
-9. [Backup & restore](backup-restore.md) — the kine/SQLite datastore, snapshot and restore.
-10. [Multi-node](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
-11. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
-12. [The `vm` RuntimeClass](vm-runtimeclass.md) — isolation for untrusted workloads, EXPERIMENTAL.
-13. [Limitations](limitations.md) — **the honest gaps** — read this before you rely on k3sm.
-14. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
-15. [FAQ](faq.md) — short answers to the common questions.
+9. [Certificates](certificates.md) — the two CAs, `k3sm certificate rotate`, and what it does not do.
+10. [Backup & restore](backup-restore.md) — the kine/SQLite datastore, snapshot and restore.
+11. [Multi-node](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
+12. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
+13. [The `vm` RuntimeClass](vm-runtimeclass.md) — isolation for untrusted workloads, EXPERIMENTAL.
+14. [Limitations](limitations.md) — **the honest gaps** — read this before you rely on k3sm.
+15. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
+16. [FAQ](faq.md) — short answers to the common questions.
 
 ## Before you build anything real
 

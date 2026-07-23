@@ -191,12 +191,50 @@ func (darwinSystem) LaunchctlBootout(label string) error {
 	return nil
 }
 
-// LaunchctlKickstart force-restarts the daemon.
+// LaunchctlKickstart force-restarts the daemon. An unloaded/absent label is an
+// ERROR here (unlike Bootout's idempotent no-op): a caller asking for a restart must
+// never be told a daemon that is not there was restarted. launchctl's output is
+// trimmed because this error is surfaced verbatim in a CLI message.
+//
+// It returns once launchd has ACCEPTED the restart request. The old instance is
+// still draining at that point (the control plane tears its components down
+// serially, within the plist's ExitTimeOut), so anything that must observe the NEW
+// instance polls LaunchctlServicePID for a changed pid.
 func (darwinSystem) LaunchctlKickstart(label string) error {
 	if out, err := exec.Command("launchctl", "kickstart", "-k", "system/"+label).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl kickstart %s: %w: %s", label, err, out)
+		return fmt.Errorf("launchctl kickstart %s: %w: %s", label, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// LaunchctlServicePID reads the pid launchd reports for the job out of
+// `launchctl print system/<label>`'s "pid = N" field. A loaded-but-not-running job
+// has no such field and yields 0 (not an error — it is the normal respawn window);
+// a label that is not loaded fails, because "no job" must never be reported as "no
+// pid yet". Read-only: it starts, stops and changes nothing.
+//
+// Unlike the other launchctl wrappers this one does NOT put the command's output in
+// its error. `launchctl print` dumps the whole job on success — including the
+// daemon's argv, which carries the apiserver's static admin token — and this error
+// string is surfaced verbatim in a CLI message. Only the exit status is reported;
+// the operator is pointed at the command instead.
+func (darwinSystem) LaunchctlServicePID(label string) (int, error) {
+	out, err := exec.Command("launchctl", "print", "system/"+label).Output()
+	if err != nil {
+		return 0, fmt.Errorf("launchctl print system/%s (is the daemon loaded?): %w", label, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "pid = ")
+		if !ok {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(rest))
+		if err != nil {
+			return 0, fmt.Errorf("launchctl print system/%s: unparsable pid field %q: %w", label, rest, err)
+		}
+		return pid, nil
+	}
+	return 0, nil
 }
 
 // WriteUserKubeconfig MERGES the k3sm admin context (contents) into targetUser's

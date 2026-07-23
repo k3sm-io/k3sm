@@ -16,8 +16,12 @@ can be reached across machines.
 On the server, mint a join token:
 
 ```sh
-k3sm token create
+sudo k3sm token create
 ```
+
+Run it with `sudo`: the cluster CA whose hash the token pins lives in the control-plane state root,
+which belongs to the `_k3sm` service user. Without `sudo` the work dir resolves to your own home and
+the command exits non-zero rather than inventing a CA there.
 
 On the agent Mac:
 
