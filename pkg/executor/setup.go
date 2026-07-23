@@ -90,6 +90,40 @@ func KubectlPath(workDir string) string { return filepath.Join(binDir(workDir), 
 // the apiserver writes — single-sourcing the layout (mirrors StateDBPath).
 func AuditLogPath(workDir string) string { return filepath.Join(auditDir(workDir), "audit.log") }
 
+// SchedulerKubeconfigPath / ControllerManagerKubeconfigPath return the per-component
+// client-cert kubeconfigs provisionComponentCerts re-issues on EVERY boot. Exported so
+// `k3sm certificate rotate` reports exactly the files the boot re-issues instead of
+// re-joining the layout in package main (mirrors KubeconfigPath).
+func SchedulerKubeconfigPath(workDir string) string { return schedulerKubeconfigPath(workDir) }
+func ControllerManagerKubeconfigPath(workDir string) string {
+	return controllerManagerKubeconfigPath(workDir)
+}
+
+// TokenFilePath returns the apiserver static token-auth CSV (<workDir>/tokens.csv).
+// Exported so tooling that must NOT touch it (certificate rotation's scope fence) can
+// name it from the one authority for the layout.
+func TokenFilePath(workDir string) string { return tokenFilePath(workDir) }
+
+// ServiceAccountKeyPath / ServiceAccountPubPath return the service-account signing
+// keypair. Rotating them would invalidate every issued ServiceAccount token, so they
+// are deliberately outside certificate rotation — exported so that fence names the
+// same files the executor writes.
+func ServiceAccountKeyPath(workDir string) string { return saKeyPath(workDir) }
+func ServiceAccountPubPath(workDir string) string { return saPubPath(workDir) }
+
+// APIServerCertDir returns the apiserver's own --cert-dir (<workDir>/apiserver-certs),
+// where it self-signs its serving cert. That directory is ALSO the controller-manager's
+// --root-ca-file source and therefore the origin of every pod's projected
+// kube-root-ca.crt, so replacing it is a cluster-wide trust event — exported so the
+// rotation scope fence can name it explicitly.
+//
+// Its apiserver.crt shares a basename with — and has the OPPOSITE rotation semantics
+// of — certs.APIServerServingCertPath (<workDir>/tls/apiserver.crt), which is a leaf
+// re-issued from the cluster CA on every mesh boot. This one is self-signed, is the
+// single-node server's serving material, and is never rotated. Read one another's docs
+// before touching either.
+func APIServerCertDir(workDir string) string { return certDir(workDir) }
+
 // apiServerURL is the loopback HTTPS URL clients use to reach the apiserver.
 func apiServerURL(port int) string {
 	return "https://127.0.0.1:" + strconv.Itoa(port)

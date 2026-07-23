@@ -605,9 +605,8 @@ func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP strin
 	if err != nil {
 		return "", "", fmt.Errorf("issue apiserver serving cert: %w", err)
 	}
-	dir := certs.PKIDir(workDir)
-	certFile = filepath.Join(dir, "apiserver.crt")
-	keyFile = filepath.Join(dir, "apiserver.key")
+	certFile = certs.APIServerServingCertPath(workDir)
+	keyFile = certs.APIServerServingKeyPath(workDir)
 	if err := os.WriteFile(certFile, certPEM, 0o644); err != nil {
 		return "", "", fmt.Errorf("write apiserver serving cert: %w", err)
 	}

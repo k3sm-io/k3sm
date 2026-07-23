@@ -25,6 +25,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // runToken dispatches the `k3sm token` subcommands (currently only `create`).
@@ -63,10 +64,15 @@ func runTokenCreate(args []string) error {
 		return fmt.Errorf("--ttl must be positive, got %s", *ttl)
 	}
 
-	// Ensure the CA hierarchy exists (idempotent — the server uses the same files).
-	h, err := certs.EnsureHierarchy(*workDir)
+	// Read the cluster CA pin. READ-ONLY on purpose: this used to call
+	// certs.EnsureHierarchy, which MINTS a fresh CA when the PKI dir is empty — and a
+	// forgotten sudo resolves --work-dir to <home>/server, so minting there would
+	// leave a stray CA behind and print a token whose K10 pin no node trusts, with no
+	// error. An absent or damaged hierarchy is now a typed failure instead.
+	clusterPin, _, err := certs.LoadCAPins(*workDir)
 	if err != nil {
-		return fmt.Errorf("ensure CA hierarchy: %w", err)
+		return fmt.Errorf("%w — the cluster CA lives in the control-plane state root, owned by the %s service user, so run `sudo k3sm token create` (or point --work-dir at the right state root). No token was minted and no CA was created",
+			err, install.DefaultServiceUser)
 	}
 
 	// M6.1: a SERVER token reconstructs the cluster CAs (it authorizes the CA-bundle
@@ -78,7 +84,7 @@ func runTokenCreate(args []string) error {
 		if err != nil {
 			return fmt.Errorf("server-bootstrap secret: %w", err)
 		}
-		fmt.Println(bootstrap.FormatServerToken(h.Cluster.PinHash(), secret))
+		fmt.Println(bootstrap.FormatServerToken(clusterPin, secret))
 		fmt.Fprintln(os.Stderr, "# k3sm SERVER join token — authorizes reconstructing the cluster CAs; give ONLY to a trusted control-plane Mac")
 		return nil
 	}
@@ -89,7 +95,7 @@ func runTokenCreate(args []string) error {
 		return fmt.Errorf("mint token: %w", err)
 	}
 
-	fmt.Println(bootstrap.FormatToken(h.Cluster.PinHash(), user, secret))
+	fmt.Println(bootstrap.FormatToken(clusterPin, user, secret))
 	fmt.Fprintf(os.Stderr, "# k3sm join token (expires %s) — pins the cluster CA; NOT the admin token\n", expiry.Format(time.RFC3339))
 	return nil
 }

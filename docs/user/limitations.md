@@ -77,6 +77,16 @@ Ingress TLS private keys are held **in-memory by the server process**, and Secre
 **plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods). There is
 no KMS/envelope encryption: treat read access to the host disk as read access to every Secret.
 
+### Certificate rotation does not revoke
+
+`k3sm certificate rotate` re-issues the control plane's CA-signed leaf certificates (by restarting
+the control plane, which re-issues them anyway) and proves the two CAs came through unchanged. It is
+**renewal hygiene, not a compromise response**: k3sm publishes no CRL and no OCSP responder, and
+`--client-ca-file` trust is CA-wide, so a superseded certificate stays valid until it expires. There
+is no way to invalidate a single leaf, no CA-replacement flow, and worker/agent node certs are out of
+scope (they re-issue on agent restart, which needs a fresh join token). See
+[certificates.md](certificates.md).
+
 ### DNS — what works vs what is unwired/planned
 
 The in-process resolver and the `getaddrinfo` shim implement the **search-list / ndots / A-record**
