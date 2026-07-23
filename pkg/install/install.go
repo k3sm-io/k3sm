@@ -126,7 +126,15 @@ type System interface {
 	// label is a no-op success).
 	LaunchctlBootout(label string) error
 	// LaunchctlKickstart (re)starts the labelled daemon (launchctl kickstart -k).
+	// It returns as soon as the restart is REQUESTED — not when the old instance
+	// is gone — so a caller that must observe the new instance pairs it with
+	// LaunchctlServicePID.
 	LaunchctlKickstart(label string) error
+	// LaunchctlServicePID returns the pid launchd currently reports for the
+	// labelled job, or 0 when the job is LOADED but not running (the respawn
+	// window, or a job that has exited and not yet been relaunched). A label that
+	// is not loaded at all is an error. It is read-only.
+	LaunchctlServicePID(label string) (int, error)
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
 	// ~/.kube/config, owned by targetUser (NOT root).
 	WriteUserKubeconfig(targetUser string, contents []byte) error

@@ -32,9 +32,19 @@ around it:
 1. verify the CA hierarchy is present and complete (reading only the certificates — never a CA
    private key);
 2. record both CA pins;
-3. report, or restart the `io.k3sm.server` LaunchDaemon;
+3. report, or note the daemon's current pid and restart the `io.k3sm.server` LaunchDaemon;
 4. re-verify both pins are byte-for-byte the same;
-5. wait, with a bounded timeout, for the control plane to serve again.
+5. wait, with a bounded timeout, for launchd to report a **new** instance that is serving;
+6. re-verify both pins once more, now that the new control plane has booted on them.
+
+Step 5 is stricter than it looks. `launchctl kickstart -k` returns as soon as the restart is
+*requested*, and the outgoing control plane keeps its listeners for several seconds while it shuts
+its components down — so "the apiserver answers" alone would be satisfied by the instance that is
+going away, and a daemon that never came back would be reported as a success. The wait therefore
+requires a **changed launchd pid** as well as a healthy answer, and the answer must come from a TLS
+peer whose certificate chains to a CA k3sm already holds on disk (the cluster CA on a multi-node
+server, the apiserver's own self-signed cert on a single-node one). A different process holding the
+port is not the control plane coming back, and is reported as a failure.
 
 It writes **nothing** into the work dir. That is deliberate: the daemon runs as the unprivileged
 `_k3sm` user, so a root-written file there would make the *next* boot fail with EACCES — and
@@ -62,7 +72,8 @@ one.
 | `--apiserver-port <n>` | The port the post-restart health probe checks (default `6444`). |
 
 The command exits non-zero — and says where to look — if the hierarchy is missing or damaged, if
-the daemon is not loaded, if a CA pin changed, or if the control plane does not come back.
+the daemon is not loaded, if a CA pin changed, or if a new instance of the control plane does not
+come back and serve.
 
 ## Blast radius
 

@@ -116,6 +116,12 @@ func ServiceAccountPubPath(workDir string) string { return saPubPath(workDir) }
 // --root-ca-file source and therefore the origin of every pod's projected
 // kube-root-ca.crt, so replacing it is a cluster-wide trust event — exported so the
 // rotation scope fence can name it explicitly.
+//
+// Its apiserver.crt shares a basename with — and has the OPPOSITE rotation semantics
+// of — certs.APIServerServingCertPath (<workDir>/tls/apiserver.crt), which is a leaf
+// re-issued from the cluster CA on every mesh boot. This one is self-signed, is the
+// single-node server's serving material, and is never rotated. Read one another's docs
+// before touching either.
 func APIServerCertDir(workDir string) string { return certDir(workDir) }
 
 // apiServerURL is the loopback HTTPS URL clients use to reach the apiserver.

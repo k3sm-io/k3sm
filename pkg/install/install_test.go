@@ -36,6 +36,8 @@ type fakeSystem struct {
 	kubeUser    string
 	kubeContent string
 	failBootout bool
+	// pid is the launchd-reported pid of the labelled job; a kickstart advances it.
+	pid int
 }
 
 func (f *fakeSystem) EnsureServiceUser(name string) (uint32, error) {
@@ -80,7 +82,16 @@ func (f *fakeSystem) LaunchctlBootout(label string) error {
 
 func (f *fakeSystem) LaunchctlKickstart(label string) error {
 	f.calls = append(f.calls, "Kickstart:"+label)
+	// A kickstart replaces the running instance, so the fake's reported pid moves —
+	// the discriminator `k3sm certificate rotate` uses to tell the NEW control plane
+	// from the old one still draining its listeners.
+	f.pid++
 	return nil
+}
+
+func (f *fakeSystem) LaunchctlServicePID(label string) (int, error) {
+	f.calls = append(f.calls, "ServicePID:"+label)
+	return f.pid, nil
 }
 
 func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {

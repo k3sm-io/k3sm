@@ -56,20 +56,39 @@ var (
 	// every issued node/component cert chains to these CAs — so it is a loud failure,
 	// not a warning.
 	ErrCAPinChanged = errors.New("executor: the CA pin CHANGED across the rotation — every node's join-token pin is orphaned")
+	// ErrRestartUnconfirmed reports that launchd never came to report a NEW instance
+	// of the daemon within the wait budget. It is distinct from a health failure: the
+	// health probe can be satisfied by the OLD instance, which keeps its listeners
+	// while it drains, so "a new pid exists" is the precondition that makes every
+	// later check mean anything. Hitting it means the daemon never respawned or is
+	// crash-looping under launchd's KeepAlive.
+	ErrRestartUnconfirmed = errors.New("executor: the control-plane daemon did not come back as a NEW launchd instance after the restart")
 )
 
-// DaemonRestarter restarts a launchd-managed k3sm daemon by label. It is declared
-// HERE, at the consumer, and is satisfied by install.System (whose LaunchctlKickstart
-// shells out to `launchctl kickstart -k`); this package cannot import install, which
-// imports it.
+// DaemonRestarter restarts a launchd-managed k3sm daemon by label and reports the
+// pid launchd currently has for it. It is declared HERE, at the consumer, and is
+// satisfied by install.System (which shells out to `launchctl kickstart -k` and
+// `launchctl print`); this package cannot import install, which imports it.
 //
 // The restart MUST go through launchd. A Supervised control plane is in-process state
 // owned by the RUNNING server process; a CLI subcommand is a different process, so
 // constructing a fresh Supervised and calling Start would boot a SECOND control plane
 // against the same SQLite datastore and the same apiserver port — data corruption, not
 // rotation.
+//
+// The pid accessor is what makes the verification honest. `launchctl kickstart -k`
+// returns when the restart is REQUESTED; the old control plane then tears its
+// components down serially (each with its own drain grace, inside the plist's
+// ExitTimeOut), so the OLD apiserver holds its listener for seconds afterwards. A
+// health probe run against that window is satisfied by the dying instance, which is
+// exactly the invisible KeepAlive crash-loop this command exists to catch. Binding
+// the wait to a CHANGED, non-zero pid is what makes "it came back" mean the new
+// instance.
 type DaemonRestarter interface {
 	LaunchctlKickstart(label string) error
+	// LaunchctlServicePID returns the pid launchd reports for the label, or 0 when
+	// the job is loaded but not running. A not-loaded label is an error.
+	LaunchctlServicePID(label string) (int, error)
 }
 
 // RotateOptions parametrizes RotateCertificates. Restarter/DaemonLabel/Health are
@@ -87,8 +106,9 @@ type RotateOptions struct {
 	// Health reports whether the control plane is serving again; nil means "not
 	// yet" is indistinguishable from "never", so it is required for a restart.
 	Health func(ctx context.Context) error
-	// HealthTimeout bounds the post-restart health wait (DefaultRotateHealthTimeout
-	// when zero); HealthPoll is the retry interval (DefaultRotateHealthPoll).
+	// HealthTimeout bounds the post-restart wait for a NEW, serving instance
+	// (DefaultRotateHealthTimeout when zero); HealthPoll is the retry interval
+	// (DefaultRotateHealthPoll).
 	HealthTimeout time.Duration
 	HealthPoll    time.Duration
 }
@@ -120,6 +140,13 @@ type RotationReport struct {
 	OutOfScope []RotationArtifact
 	// Restarted reports whether the daemon was actually kickstarted.
 	Restarted bool
+	// PriorPID / NewPID are the launchd pids of the instance that was replaced and
+	// of the one that came back. NewPID is set ONLY once launchd reported a pid
+	// that is non-zero and differs from PriorPID, so a non-zero NewPID is the
+	// proof that the verified control plane is the new process, not the old one
+	// still draining its listeners.
+	PriorPID int
+	NewPID   int
 }
 
 // RotateCertificates rotates the control plane's CA-signed leaf credentials by
@@ -130,7 +157,8 @@ type RotationReport struct {
 // mesh server, the apiserver serving cert — so a second issuer here would diverge from
 // the boot's validity/SAN/verify posture and be silently overwritten on the next boot.
 // The command's content is therefore: verify the hierarchy → record the pins →
-// [report | restart] → re-verify the pins → verify health → report.
+// [report | read the daemon's pid → restart → re-verify the pins → wait for a NEW
+// launchd instance that serves → re-verify the pins] → report.
 //
 // Two invariants it maintains:
 //
@@ -142,6 +170,12 @@ type RotationReport struct {
 //
 // A nil report is returned only for a configuration error (nothing was inspected); a
 // non-nil report with an error means the rotation got as far as the report describes.
+//
+// Every post-restart check is bound to the NEW launchd instance: the pid is read
+// BEFORE the kickstart and the wait does not accept a health answer until launchd
+// reports a different, non-zero pid. Without that discriminator the old, still-
+// draining apiserver answers the probe and the command reports success for a
+// rotation whose new daemon may never have booted.
 func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationReport, error) {
 	if opts.WorkDir == "" {
 		return nil, ErrRotateWorkDirRequired
@@ -177,22 +211,35 @@ func RotateCertificates(ctx context.Context, opts RotateOptions) (*RotationRepor
 		return rep, nil
 	}
 
+	// Read the pid of the instance about to be replaced. A not-loaded label fails
+	// HERE, before the blast radius — the same fail-closed refusal the kickstart
+	// itself would give, reached one step earlier.
+	priorPID, err := opts.Restarter.LaunchctlServicePID(opts.DaemonLabel)
+	if err != nil {
+		return rep, fmt.Errorf("read the launchd pid of %s before the restart: %w", opts.DaemonLabel, err)
+	}
+	rep.PriorPID = priorPID
+
 	if err := opts.Restarter.LaunchctlKickstart(opts.DaemonLabel); err != nil {
 		return rep, fmt.Errorf("restart %s: %w", opts.DaemonLabel, err)
 	}
 	rep.Restarted = true
 
 	// Re-verify immediately: if the kickstart somehow disturbed the PKI, say so before
-	// spending the health-wait budget.
+	// spending the wait budget.
 	if err := verifyPinsUnchanged(opts.WorkDir, clusterPin, signingPin); err != nil {
 		return rep, err
 	}
-	if err := awaitRotationHealth(ctx, opts); err != nil {
+	newPID, err := awaitRestartedInstance(ctx, opts, priorPID)
+	if err != nil {
 		return rep, err
 	}
-	// Re-verify once more now that the daemon has actually completed its provision
-	// step: this is the check that proves the boot LOADED the CA hierarchy
-	// (EnsureHierarchy's load arm) rather than minting a fresh, cluster-orphaning one.
+	rep.NewPID = newPID
+	// Re-verify once more now that the NEW daemon is up and serving — it has
+	// completed its provision step, so this is the check that proves the boot LOADED
+	// the CA hierarchy (EnsureHierarchy's load arm) rather than minting a fresh,
+	// cluster-orphaning one. It is only meaningful because the wait above refused to
+	// accept an answer from the outgoing instance.
 	if err := verifyPinsUnchanged(opts.WorkDir, clusterPin, signingPin); err != nil {
 		return rep, err
 	}
@@ -214,9 +261,17 @@ func verifyPinsUnchanged(workDir, cluster, signing string) error {
 	return nil
 }
 
-// awaitRotationHealth polls opts.Health until it reports healthy or the bounded
-// timeout elapses, wrapping the LAST probe error so the caller can see why.
-func awaitRotationHealth(ctx context.Context, opts RotateOptions) error {
+// awaitRestartedInstance polls until launchd reports a NEW instance of the daemon
+// (a non-zero pid different from priorPID) that ALSO answers the health probe, and
+// returns that pid. Both conditions must hold in the same iteration: a new pid alone
+// is a process that exists, and a health answer alone can come from the outgoing
+// instance, which keeps its listeners while it drains.
+//
+// A transient read error or a zero pid is the normal respawn window and is tolerated
+// until the deadline; the LAST reason is wrapped into the timeout error so the caller
+// can tell "never respawned" (ErrRestartUnconfirmed) from "respawned but never
+// served" (the probe's own error).
+func awaitRestartedInstance(ctx context.Context, opts RotateOptions, priorPID int) (int, error) {
 	timeout := opts.HealthTimeout
 	if timeout <= 0 {
 		timeout = DefaultRotateHealthTimeout
@@ -226,17 +281,29 @@ func awaitRotationHealth(ctx context.Context, opts RotateOptions) error {
 		poll = DefaultRotateHealthPoll
 	}
 	deadline := time.Now().Add(timeout)
+	var last error
 	for {
-		err := opts.Health(ctx)
-		if err == nil {
-			return nil
+		pid, err := opts.Restarter.LaunchctlServicePID(opts.DaemonLabel)
+		switch {
+		case err != nil:
+			last = fmt.Errorf("%w: reading the launchd pid of %s: %w", ErrRestartUnconfirmed, opts.DaemonLabel, err)
+		case pid == 0:
+			last = fmt.Errorf("%w: %s is loaded but not running", ErrRestartUnconfirmed, opts.DaemonLabel)
+		case pid == priorPID:
+			last = fmt.Errorf("%w: %s still runs the pre-restart instance (pid %d)", ErrRestartUnconfirmed, opts.DaemonLabel, pid)
+		default:
+			herr := opts.Health(ctx)
+			if herr == nil {
+				return pid, nil
+			}
+			last = fmt.Errorf("the new %s instance (pid %d) is not serving: %w", opts.DaemonLabel, pid, herr)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("control plane not healthy within %s of the restart: %w", timeout, err)
+			return 0, fmt.Errorf("control plane not healthy within %s of the restart: %w", timeout, last)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		case <-time.After(poll):
 		}
 	}
