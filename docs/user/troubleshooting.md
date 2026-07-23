@@ -51,7 +51,7 @@ worker-node certs — see [certificates.md](certificates.md) before you rely on 
 
 ## Multi-node join fails
 
-- Re-mint the token (`k3sm token create`) — tokens expire.
+- Re-mint the token (`sudo k3sm token create`) — tokens expire.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
   [multi-node.md](multi-node.md).
 
