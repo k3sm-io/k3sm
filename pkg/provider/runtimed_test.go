@@ -470,6 +470,10 @@ func TestRuntimedDeleteGrace(t *testing.T) {
 // VMBackendAvailable condition TRUE => capable; FALSE, a missing condition (an
 // older runtimed that predates B1), or a nil response => NOT capable (fail-closed,
 // so a probe/skew miss never FALSELY advertises a node as vm-schedulable).
+//
+// B103 consolidated the three capability readers into nodeCapabilitiesFromInfo, so
+// this B1 proof now reads the VMBackend field of that mapper — same assertions,
+// same fail-closed verdicts, one mapper.
 func TestVMBackendAvailableFromInfo(t *testing.T) {
 	cond := func(typ string, st runtimev1.ConditionStatus) *runtimev1.RuntimeCondition {
 		return &runtimev1.RuntimeCondition{Type: typ, Status: st}
@@ -493,8 +497,8 @@ func TestVMBackendAvailableFromInfo(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := vmBackendAvailableFromInfo(tc.info); got != tc.want {
-				t.Errorf("vmBackendAvailableFromInfo = %v, want %v", got, tc.want)
+			if got := nodeCapabilitiesFromInfo(tc.info).VMBackend; got != tc.want {
+				t.Errorf("nodeCapabilitiesFromInfo(...).VMBackend = %v, want %v", got, tc.want)
 			}
 		})
 	}

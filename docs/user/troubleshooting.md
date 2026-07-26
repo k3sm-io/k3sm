@@ -49,6 +49,23 @@ Component certificates are re-issued on every control-plane boot, so a restart r
 never change); `--restart` performs it. Rotation does **not** revoke anything and does not cover
 worker-node certs — see [certificates.md](certificates.md) before you rely on it.
 
+## A Pod selecting `k3sm.io/rosetta` or `k3sm.io/rosetta-linux` stays Pending
+
+The node advertises a capability label only when its start-time probe said yes.
+
+1. Check what the node actually advertises:
+   `kubectl get nodes -L k3sm.io/virtualization,k3sm.io/rosetta,k3sm.io/rosetta-linux`.
+2. If the key is missing, look for the withheld-capability line in the node's log — it carries the
+   `condition` and the `reason` (`NotInstalled`, `TranslationFailed`, `NotSupported`, `QueryFailed`,
+   `VMBackendUnavailable`) explaining exactly why it was not advertised.
+3. `k3sm.io/rosetta-linux` needs **both** virtualization and guest Rosetta. A node with
+   `k3sm.io/rosetta` but no `k3sm.io/virtualization` will **never** carry it — that is correct, not a bug.
+4. Installed Rosetta after the node came up? The probes run once at daemon start — restart it:
+   `sudo launchctl kickstart -k system/io.k3sm.server`.
+5. Your Pod must also keep `kubernetes.io/os: darwin` in its `nodeSelector`; a Pod with only the
+   capability key is rejected with a `422`. See
+   [vm-runtimeclass.md](vm-runtimeclass.md#node-capability-labels).
+
 ## Multi-node join fails
 
 - Re-mint the token (`sudo k3sm token create`) — tokens expire.

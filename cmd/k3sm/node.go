@@ -283,7 +283,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	defer eventBroadcaster.Shutdown()
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
 
-	prov, netAdapter, runtimeLabel, vmCapable, err := buildProvider(ctx, opts, cs, recorder)
+	prov, netAdapter, runtimeLabel, caps, err := buildProvider(ctx, opts, cs, recorder)
 	if err != nil {
 		return err
 	}
@@ -320,7 +320,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		HTTPListenAddr: opts.listen,
 		NumWorkers:     4,
 		TLSConfig:      servingTLS, // nil = plain HTTP (M0 path); set = kubelet-serving TLS
-		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, opts.nodeIP, vmCapable) },
+		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, opts.nodeIP, caps) },
 	})
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
@@ -356,15 +356,24 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 // (M2.1/M2.6). recorder is the EventRecorder both provider paths emit pod
 // lifecycle Events to: the HostProcess path emits Pulled/Created/Started/Killing,
 // the runtimed path emits the BackOff crash-loop Event (B26).
-// buildProvider constructs the VK provider for the selected runtime and reports
-// whether the node is vm-capable (the k3sm.io/virtualization label source, B1). The
-// in-process host-process runtime has no vm backend, so a node running it is never
-// vm-capable; the runtimed runtime probes GetRuntimeInfo's VMBackendAvailable
-// condition ONCE at bring-up (fail-closed inside VMBackendAvailable).
-func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, *provider.PodNetAdapter, string, bool, error) {
+// buildProvider constructs the VK provider for the selected runtime and reports the
+// node's runtimed-advertised capabilities — the source of every k3sm.io/* capability
+// node label (k3sm.io/virtualization from B1, k3sm.io/rosetta{,-linux} from B103).
+//
+// The capabilities travel as ONE provider.NodeCapabilities struct, never as adjacent
+// positional bools: three same-typed bools in a signature make a transposition
+// compile cleanly and mislabel the node fail-OPEN (advertising a capability it lacks),
+// which is exactly the failure the fail-closed probe exists to prevent. They come from
+// ONE GetRuntimeInfo RPC (provider.Capabilities) so the label set is internally
+// coherent.
+//
+// The in-process host-process runtime has no vm backend and no Rosetta probe, so a node
+// running it returns the ZERO value — correct AND fail-closed by construction (nothing
+// advertised), with no per-capability false to keep in sync.
+func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interface, recorder record.EventRecorder) (vkadapter.Provider, *provider.PodNetAdapter, string, provider.NodeCapabilities, error) {
 	switch resolveRuntime(opts.runtime) {
 	case runtimeHostProcess:
-		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), nil, runtimeHostProcess, false, nil
+		return provider.NewHostProcess(opts.nodeName, opts.podRoot, opts.nodeIP, recorder), nil, runtimeHostProcess, provider.NodeCapabilities{}, nil
 	case runtimeRuntimed:
 		cfg := runtimedConfig(opts, cs)
 		// The runtimed path emits the Warning BackOff Event for a throttled
@@ -373,23 +382,30 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		cfg.Recorder = recorder
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
-			return nil, nil, "", false, err
+			return nil, nil, "", provider.NodeCapabilities{}, err
 		}
 		if adapter != nil {
 			cfg.Network = adapter
 		}
 		rt, err := provider.NewRuntimed(cfg)
 		if err != nil {
-			return nil, nil, "", false, fmt.Errorf("build runtimed provider: %w", err)
+			return nil, nil, "", provider.NodeCapabilities{}, fmt.Errorf("build runtimed provider: %w", err)
 		}
 		// Return the adapter so startNode can run its startup reconcile IN-PROCESS:
 		// the embedded runtimed runtime is driven by direct RPC (NewRuntimed), never
 		// runtime.Server.Serve, so runtimed's once-before-serve reconcileNetworkStartup
 		// never fires on this path. Dropping the adapter here would strand both the
 		// stale-alias sweep and the node's own lo0 alias (kubectl top node / node-proxy).
-		return provider.NewVKProvider(rt, opts.nodeName), adapter, runtimeRuntimed, rt.VMBackendAvailable(ctx), nil
+		//
+		// Capabilities is probed ONCE, here at bring-up: runtimed evaluates every
+		// capability probe once in its own constructor, so re-probing per reconcile
+		// would report the same immutable answer. The operator consequence — a host
+		// that GAINS or LOSES Rosetta needs `launchctl kickstart -k system/io.k3sm.server`
+		// before the label tracks it — is documented in docs/user/vm-runtimeclass.md
+		// and the loss-direction ceiling in docs/user/limitations.md.
+		return provider.NewVKProvider(rt, opts.nodeName), adapter, runtimeRuntimed, rt.Capabilities(ctx), nil
 	default:
-		return nil, nil, "", false, fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
+		return nil, nil, "", provider.NodeCapabilities{}, fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)
 	}
 }
 
@@ -602,9 +618,12 @@ func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1
 
 // configureNode stamps the registering Node object with darwin identity,
 // capacity (real host CPU count and hw.memsize memory, with a documented
-// fallback), and the provider taint (the load-bearing placement guard) so stray
-// non-darwin pods cannot land here.
-func configureNode(n *corev1.Node, name, ip string, vmCapable bool) {
+// fallback), the runtimed-probed k3sm.io/* capability labels, and the provider taint
+// (the load-bearing placement guard) so stray non-darwin pods cannot land here.
+//
+// caps is the ONE fail-closed capability snapshot buildProvider probed from runtimed;
+// its zero value advertises nothing.
+func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabilities) {
 	if n.Labels == nil {
 		n.Labels = map[string]string{}
 	}
@@ -628,12 +647,20 @@ func configureNode(n *corev1.Node, name, ip string, vmCapable bool) {
 	// vm RuntimeClass node-capability gate (M5.1/B1): advertise the
 	// Virtualization.framework backend via the k3sm.io/virtualization label ONLY when
 	// this node can run it, so the vm RuntimeClass nodeSelector pins vm pods to a
-	// capable node. vmCapable is the runtimed VMBackendAvailable probe (buildProvider,
-	// fail-closed on any error); a false value leaves the label absent so a vm pod
-	// stays Unschedulable — the fail-closed posture for a non-VZ cluster.
-	applyVirtualizationLabel(n, vmCapable)
+	// capable node. caps.VMBackend is the runtimed VMBackendAvailable probe
+	// (buildProvider, fail-closed on any error); a false value leaves the label absent
+	// so a vm pod stays Unschedulable — the fail-closed posture for a non-VZ cluster.
+	applyVirtualizationLabel(n, caps.VMBackend)
+
+	// Rosetta translation-capability labels (B103), same fail-closed presence-only
+	// discipline as the virtualization label above.
+	applyRosettaLabels(n, caps)
 
 	n.Status.NodeInfo.OperatingSystem = "darwin"
+	// Architecture is the machine's NATIVE ISA and stays arm64 even on a
+	// Rosetta-capable node: a translated-payload capability is advertised ONLY through
+	// the k3sm.io/rosetta{,-linux} labels, never by making this (or
+	// kubernetes.io/arch above) report a foreign arch to every generic client.
 	n.Status.NodeInfo.Architecture = "arm64"
 	n.Status.NodeInfo.KubeletVersion = "k3sm-m1"
 
@@ -700,6 +727,44 @@ func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 		return
 	}
 	delete(n.Labels, runtimeclass.LabelVirtualization)
+}
+
+// applyRosettaLabels sets or CLEARS the two Rosetta translation-capability node
+// labels (B103), mirroring applyVirtualizationLabel — which is the delete-on-loss
+// precedent this follows (B1's shipped k3sm.io/virtualization; NOT B94, which was
+// refused with zero commits, so it is no precedent for anything):
+//
+//   - k3sm.io/rosetta       ⇔ caps.RosettaHost            (darwin/amd64 Mach-O, host Rosetta 2)
+//   - k3sm.io/rosetta-linux ⇔ caps.VMBackend ∧ caps.RosettaGuest (linux/amd64 ELF in a VZ guest)
+//
+// The linux key is a CONJUNCTION because Rosetta for Linux translates inside a guest:
+// a Rosetta-installed but VZ-INCAPABLE node carries k3sm.io/rosetta but must NOT
+// carry k3sm.io/rosetta-linux, or the scheduler would bind linux/amd64 payloads to a
+// node with no guest to run them in. The two keys are otherwise INDEPENDENT — host
+// translation and guest translation are separate probes, so either may be advertised
+// without the other.
+//
+// Presence-only, and DELETE (never "false") on loss: a node that loses a capability
+// across a restart must stop advertising it, and a "false" value would still satisfy
+// an `exists`-style selector. The label is a truthful capability claim, so the
+// fail-closed direction is always absence.
+func applyRosettaLabels(n *corev1.Node, caps provider.NodeCapabilities) {
+	if n.Labels == nil {
+		n.Labels = map[string]string{}
+	}
+	setLabelPresence(n.Labels, runtimeclass.LabelRosetta, caps.RosettaHost)
+	setLabelPresence(n.Labels, runtimeclass.LabelRosettaLinux, caps.VMBackend && caps.RosettaGuest)
+}
+
+// setLabelPresence stamps key=runtimeclass.LabelTrue when present, and DELETES key
+// otherwise — the presence-only capability-label discipline in one place, so a new
+// capability key cannot accidentally ship a "false" value or an omit-instead-of-delete.
+func setLabelPresence(labels map[string]string, key string, present bool) {
+	if present {
+		labels[key] = runtimeclass.LabelTrue
+		return
+	}
+	delete(labels, key)
 }
 
 // defaultNodeRegion is the single static topology.kubernetes.io/region every k3sm
