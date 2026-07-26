@@ -202,8 +202,10 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 		r, _ := newRuntimedFake(t)
 		got := r.Capabilities(context.Background())
 		assertCaps(t, got, NodeCapabilities{})
-		if r.VMBackendAvailable(context.Background()) {
-			t.Error("VMBackendAvailable must be false on an RPC error (B1 fail-closed)")
+		// B1's vm fact specifically: it is read off the SAME snapshot, so an RPC error
+		// leaves it false too (never a node falsely advertised as vm-schedulable).
+		if got.VMBackend {
+			t.Error("Capabilities().VMBackend must be false on an RPC error (B1 fail-closed)")
 		}
 	})
 
@@ -233,9 +235,14 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 		}
 	})
 
-	// B1 must not regress: the single-capability VMBackendAvailable view agrees with
-	// the consolidated struct on both verdicts.
-	t.Run("vmbackendavailable_agrees_with_capabilities", func(t *testing.T) {
+	// B1 must not regress through the CONSOLIDATED reader: the vm fact still tracks the
+	// VMBackendAvailable condition across every status — and costs NO extra RPC. That
+	// second assertion is the regression guard on the incoherent-snapshot hazard: a
+	// single-fact accessor that issued its own GetRuntimeInfo (the deleted
+	// VMBackendAvailable method) could observe a DIFFERENT daemon state than the one
+	// the sibling labels were stamped from, so the vm fact must only ever be a read of
+	// one snapshot.
+	t.Run("vm_backend_tracks_condition_on_one_snapshot", func(t *testing.T) {
 		t.Parallel()
 		for _, tc := range []struct {
 			name string
@@ -248,11 +255,12 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 		} {
 			s := &infoServer{info: info(cond(runtimed.ConditionVMBackendAvailable, tc.st, "r"))}
 			r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir()}, nil, nil)
-			if got := r.VMBackendAvailable(context.Background()); got != tc.want {
-				t.Errorf("%s: VMBackendAvailable = %v, want %v", tc.name, got, tc.want)
+			caps := r.Capabilities(context.Background())
+			if caps.VMBackend != tc.want {
+				t.Errorf("%s: Capabilities().VMBackend = %v, want %v", tc.name, caps.VMBackend, tc.want)
 			}
-			if got := r.Capabilities(context.Background()).VMBackend; got != tc.want {
-				t.Errorf("%s: Capabilities().VMBackend = %v, want %v", tc.name, got, tc.want)
+			if s.calls != 1 {
+				t.Errorf("%s: reading the vm fact issued %d GetRuntimeInfo RPCs, want exactly 1 (one snapshot, never a second probe)", tc.name, s.calls)
 			}
 		}
 	})

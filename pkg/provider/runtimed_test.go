@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // fakeRuntimeServer is an in-memory runtimev1.RuntimeServer for provider tests:
@@ -473,7 +474,11 @@ func TestRuntimedDeleteGrace(t *testing.T) {
 //
 // B103 consolidated the three capability readers into nodeCapabilitiesFromInfo, so
 // this B1 proof now reads the VMBackend field of that mapper — same assertions,
-// same fail-closed verdicts, one mapper.
+// same fail-closed verdicts, one mapper. The condition Types come from the IMPORTED
+// runtimed constants (never restated literals), for the same reason the mapper imports
+// them: a producer/consumer rename must be a compile error here, not a permanently
+// false capability verdict. runtimed's own tests pin those constants to their wire
+// values.
 func TestVMBackendAvailableFromInfo(t *testing.T) {
 	cond := func(typ string, st runtimev1.ConditionStatus) *runtimev1.RuntimeCondition {
 		return &runtimev1.RuntimeCondition{Type: typ, Status: st}
@@ -484,14 +489,14 @@ func TestVMBackendAvailableFromInfo(t *testing.T) {
 		want bool
 	}{
 		{"vm available", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
-			cond("SandboxBackend", runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
-			cond("VMBackendAvailable", runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
+			cond(runtimed.ConditionSandboxBackend, runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
+			cond(runtimed.ConditionVMBackendAvailable, runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
 		}}, true},
 		{"vm unavailable", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
-			cond("VMBackendAvailable", runtimev1.ConditionStatus_CONDITION_STATUS_FALSE),
+			cond(runtimed.ConditionVMBackendAvailable, runtimev1.ConditionStatus_CONDITION_STATUS_FALSE),
 		}}, false},
 		{"condition missing (older runtimed, pre-B1)", &runtimev1.GetRuntimeInfoResponse{Conditions: []*runtimev1.RuntimeCondition{
-			cond("SandboxBackend", runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
+			cond(runtimed.ConditionSandboxBackend, runtimev1.ConditionStatus_CONDITION_STATUS_TRUE),
 		}}, false},
 		{"nil response", nil, false},
 	}

@@ -113,11 +113,36 @@ fi
 # Code-Hex/vz (the Virtualization.framework binding) into runtimed's dependency
 # closure, or every runtimed build would inherit the entitlement/link surface of a VM
 # host. This canary has no other home in the tree today.
-VZ_DEPS="$( (cd "$RUNTIMED_ROOT" && go list -deps ./... 2>/dev/null) | grep -c 'Code-Hex/vz' || true)"
-if [ "$VZ_DEPS" -eq 0 ]; then
-	ladder ok "b103.0c runtimed dependency closure contains no Code-Hex/vz package (0 found)"
+#
+# It FAILS CLOSED in three independent ways, because an absence assertion over a
+# command's output is the classic gate that reports green when it measured NOTHING
+# (the same reason the mapper reads UNSPECIFIED as not-capable rather than trusting a
+# zero value):
+#   1. `go list`'s EXIT STATUS is captured and a non-zero rc is a FAIL — never
+#      swallowed with 2>/dev/null, which would let an empty result grep to 0 and PASS.
+#      stderr is deliberately left attached to this script's stderr so the operator
+#      sees the loader error, and is NOT folded into the grep input (an error text
+#      mentioning the module path must not become a false POSITIVE either).
+#   2. a POSITIVE CONTROL: the closure must contain k3sm.io/runtimed/pkg/sandbox (the
+#      package the probes live in), so an empty or truncated listing can never read as
+#      "vz-clean".
+#   3. the arch/cgo pins the rest of the gate uses are applied here too: the
+#      dependency closure is BUILD-TAG dependent, so the closure that matters is the
+#      one the darwin/arm64 cgo PRODUCT build resolves.
+VZ_LIST_RC=0
+VZ_LIST="$( (cd "$RUNTIMED_ROOT" && "${GOFLAGS_ENV[@]}" go list -deps ./...) )" || VZ_LIST_RC=$?
+if [ "$VZ_LIST_RC" -ne 0 ]; then
+	ladder no "b103.0c runtimed dependency closure enumerable — go list -deps exited $VZ_LIST_RC (see the error above); the vz canary MEASURED NOTHING, so it fails closed"
+elif ! printf '%s\n' "$VZ_LIST" | grep -qx 'k3sm.io/runtimed/pkg/sandbox'; then
+	ladder no "b103.0c vz canary positive control — the closure must list k3sm.io/runtimed/pkg/sandbox (the probe's own package); an empty/garbage listing must not read as vz-clean"
 else
-	ladder no "b103.0c runtimed dependency closure contains no Code-Hex/vz package (found $VZ_DEPS)"
+	VZ_DEPS="$(printf '%s\n' "$VZ_LIST" | grep -c 'Code-Hex/vz' || true)"
+	VZ_PKGS="$(printf '%s\n' "$VZ_LIST" | grep -c . || true)"
+	if [ "$VZ_DEPS" -eq 0 ]; then
+		ladder ok "b103.0c runtimed dependency closure contains no Code-Hex/vz package (0 found across $VZ_PKGS enumerated packages, positive control present)"
+	else
+		ladder no "b103.0c runtimed dependency closure contains no Code-Hex/vz package (found $VZ_DEPS)"
+	fi
 fi
 
 # ---- b103.1 — the producer: four additive conditions + reason vocabulary ----

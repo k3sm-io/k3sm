@@ -624,14 +624,12 @@ func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1
 // caps is the ONE fail-closed capability snapshot buildProvider probed from runtimed;
 // its zero value advertises nothing.
 func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabilities) {
-	if n.Labels == nil {
-		n.Labels = map[string]string{}
-	}
-	n.Labels["kubernetes.io/os"] = "darwin"
-	n.Labels["kubernetes.io/arch"] = "arm64"
-	n.Labels["kubernetes.io/hostname"] = name
-	n.Labels["k3sm.io/native"] = "true"
-	n.Labels["type"] = "k3sm"
+	labels := nodeLabels(n)
+	labels["kubernetes.io/os"] = "darwin"
+	labels["kubernetes.io/arch"] = "arm64"
+	labels["kubernetes.io/hostname"] = name
+	labels["k3sm.io/native"] = "true"
+	labels["type"] = "k3sm"
 
 	// Well-known topology labels, GA keys only (the v1.36.2 scheduler reads these; the
 	// deprecated failure-domain.beta.kubernetes.io aliases are cruft). zone is set to THIS
@@ -641,8 +639,8 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 	// (fail-open) instead of stranding pods Pending on a missing label, and never FALSELY
 	// claims co-located Macs share a failure domain (which a shared static zone would).
 	// region is one static value all nodes agree on — k3sm has no cloud-region concept.
-	n.Labels[corev1.LabelTopologyZone] = name
-	n.Labels[corev1.LabelTopologyRegion] = defaultNodeRegion
+	labels[corev1.LabelTopologyZone] = name
+	labels[corev1.LabelTopologyRegion] = defaultNodeRegion
 
 	// vm RuntimeClass node-capability gate (M5.1/B1): advertise the
 	// Virtualization.framework backend via the k3sm.io/virtualization label ONLY when
@@ -718,15 +716,14 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 // to land on and stays Unschedulable — the fail-closed posture for a non-VZ cluster.
 // Clearing (not merely omitting) handles a node that loses VZ capability across a
 // restart.
+//
+// It is a thin named alias for setLabelPresence, deliberately: this is B1's
+// entry point (and B1's test's), but the set-or-DELETE mechanism must have exactly ONE
+// implementation. A hand-rolled copy here is how the two drift, and the fail-open
+// direction of a drift (writing "false" instead of deleting) still satisfies an
+// `exists`-style nodeSelector on a node that LOST the capability.
 func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
-	if n.Labels == nil {
-		n.Labels = map[string]string{}
-	}
-	if vmCapable {
-		n.Labels[runtimeclass.LabelVirtualization] = runtimeclass.LabelTrue
-		return
-	}
-	delete(n.Labels, runtimeclass.LabelVirtualization)
+	setLabelPresence(n, runtimeclass.LabelVirtualization, vmCapable)
 }
 
 // applyRosettaLabels sets or CLEARS the two Rosetta translation-capability node
@@ -749,22 +746,48 @@ func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 // an `exists`-style selector. The label is a truthful capability claim, so the
 // fail-closed direction is always absence.
 func applyRosettaLabels(n *corev1.Node, caps provider.NodeCapabilities) {
-	if n.Labels == nil {
-		n.Labels = map[string]string{}
+	setLabelPresence(n, runtimeclass.LabelRosetta, caps.RosettaHost)
+	// The ONE place the conjunction is composed (pkg/runtimeclass's LabelRosettaLinux
+	// doc names this function as that place). It gets its own log line because NEITHER
+	// underlying condition explains this outcome: a node with guest Rosetta but no vm
+	// backend withholds the label while RosettaGuestAvailable is TRUE, and
+	// docs/user/troubleshooting.md sends the operator looking for exactly this key.
+	rosettaLinux := caps.VMBackend && caps.RosettaGuest
+	setLabelPresence(n, runtimeclass.LabelRosettaLinux, rosettaLinux)
+	if !rosettaLinux {
+		slog.Info("node capability label withheld: it requires BOTH the vm backend and guest Rosetta (Rosetta for Linux translates inside a guest)",
+			"label", runtimeclass.LabelRosettaLinux, "vm_backend", caps.VMBackend, "rosetta_guest", caps.RosettaGuest)
 	}
-	setLabelPresence(n.Labels, runtimeclass.LabelRosetta, caps.RosettaHost)
-	setLabelPresence(n.Labels, runtimeclass.LabelRosettaLinux, caps.VMBackend && caps.RosettaGuest)
 }
 
-// setLabelPresence stamps key=runtimeclass.LabelTrue when present, and DELETES key
-// otherwise — the presence-only capability-label discipline in one place, so a new
+// setLabelPresence stamps key=runtimeclass.LabelTrue on n when present, and DELETES key
+// otherwise — the presence-only capability-label discipline in ONE place (every
+// capability label goes through here, applyVirtualizationLabel included), so a new
 // capability key cannot accidentally ship a "false" value or an omit-instead-of-delete.
-func setLabelPresence(labels map[string]string, key string, present bool) {
+//
+// It also logs the DECISION naming the LABEL KEY: the provider side logs the runtimed
+// condition + Reason (the "why"), but only this side knows which k3sm.io/* key that
+// verdict resolved to — and the key is what the operator greps for.
+func setLabelPresence(n *corev1.Node, key string, present bool) {
+	labels := nodeLabels(n)
 	if present {
 		labels[key] = runtimeclass.LabelTrue
+		slog.Debug("node capability label stamped", "label", key, "value", runtimeclass.LabelTrue)
 		return
 	}
 	delete(labels, key)
+	slog.Info("node capability label absent: the capability was not advertised by runtimed, so the key is DELETED (never set to \"false\")", "label", key)
+}
+
+// nodeLabels returns n's label map, allocating it when nil — the ONE nil-Labels guard
+// every label writer in this file goes through (it was triplicated across
+// configureNode, applyVirtualizationLabel, and applyRosettaLabels). The returned map
+// aliases n.Labels, so writes through it land on the node.
+func nodeLabels(n *corev1.Node) map[string]string {
+	if n.Labels == nil {
+		n.Labels = map[string]string{}
+	}
+	return n.Labels
 }
 
 // defaultNodeRegion is the single static topology.kubernetes.io/region every k3sm

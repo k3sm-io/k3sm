@@ -380,6 +380,12 @@ func findRuntimeCondition(info *runtimev1.GetRuntimeInfoResponse, condType strin
 // VMBackendUnavailable) so an operator can answer "why is my node not labelled
 // rosetta?" from server.log. An advertised capability is logged at Debug; an ABSENT
 // condition (an older runtimed) is reported as such rather than as a silent false.
+//
+// It names the CONDITION, never a k3sm.io/* label key: this package holds no label
+// vocabulary (the keys live in pkg/runtimeclass, next to the selector that consumes
+// them), and one condition does not map 1:1 to one label anyway — rosetta-linux is a
+// conjunction. The paired line naming the LABEL the verdict resolved to is emitted by
+// cmd/k3sm's setLabelPresence / applyRosettaLabels, which own that decision.
 func logWithheldCapability(log *slog.Logger, info *runtimev1.GetRuntimeInfoResponse, condType string, advertised bool) {
 	if advertised {
 		log.Debug("node capability advertised", "condition", condType)
@@ -393,19 +399,6 @@ func logWithheldCapability(log *slog.Logger, info *runtimev1.GetRuntimeInfoRespo
 	}
 	log.Info("node capability withheld by runtimed; the node will NOT be labelled for it",
 		"condition", condType, "status", c.GetStatus().String(), "reason", c.GetReason(), "message", c.GetMessage())
-}
-
-// VMBackendAvailable reports whether runtimed advertises the vm backend as usable
-// on this host — the VMBackendAvailable RuntimeCondition GetRuntimeInfo carries
-// (Virtualization.framework isSupported + the com.apple.security.virtualization
-// entitlement). The node queries it ONCE at bring-up to set the
-// k3sm.io/virtualization label truthfully (B1). It fails CLOSED (false) on any RPC
-// error or a missing/false condition, matching the no-VZ default so a labeling
-// probe failure never FALSELY advertises a node as vm-schedulable. It is the
-// single-capability view of Capabilities, kept so a caller that needs only the vm
-// fact does not have to know about the others.
-func (r *runtimedRuntime) VMBackendAvailable(ctx context.Context) bool {
-	return r.Capabilities(ctx).VMBackend
 }
 
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the

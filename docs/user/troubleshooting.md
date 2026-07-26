@@ -55,9 +55,10 @@ The node advertises a capability label only when its start-time probe said yes.
 
 1. Check what the node actually advertises:
    `kubectl get nodes -L k3sm.io/virtualization,k3sm.io/rosetta,k3sm.io/rosetta-linux`.
-2. If the key is missing, look for the withheld-capability line in the node's log — it carries the
-   `condition` and the `reason` (`NotInstalled`, `TranslationFailed`, `NotSupported`, `QueryFailed`,
-   `VMBackendUnavailable`) explaining exactly why it was not advertised.
+2. If the key is missing, the node's log carries **two** lines for it: one naming the `condition` and the
+   `reason` (`NotInstalled`, `TranslationFailed`, `NotSupported`, `QueryFailed`, `VMBackendUnavailable`)
+   explaining why the capability was not advertised, and one naming the `label` key that was therefore
+   left absent — grep the log for the key itself (`k3sm.io/rosetta-linux`) and you land on it.
 3. `k3sm.io/rosetta-linux` needs **both** virtualization and guest Rosetta. A node with
    `k3sm.io/rosetta` but no `k3sm.io/virtualization` will **never** carry it — that is correct, not a bug.
 4. Installed Rosetta after the node came up? The probes run once at daemon start — restart it:
@@ -65,6 +66,10 @@ The node advertises a capability label only when its start-time probe said yes.
 5. Your Pod must also keep `kubernetes.io/os: darwin` in its `nodeSelector`; a Pod with only the
    capability key is rejected with a `422`. See
    [vm-runtimeclass.md](vm-runtimeclass.md#node-capability-labels).
+6. **Scheduled, but `ImagePullBackOff` with a platform error?** The two Rosetta labels are **advertised
+   but not yet honored** — k3sm does not select amd64 image variants yet, so an amd64-only image is
+   refused at pull. That is a documented gap, not a broken node; see
+   [vm-runtimeclass.md](vm-runtimeclass.md#the-two-rosetta-labels-are-advertised-not-yet-honored).
 
 ## Multi-node join fails
 

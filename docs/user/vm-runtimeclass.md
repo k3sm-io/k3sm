@@ -41,15 +41,15 @@ Pods without `runtimeClassName: vm` use the default native-process runtime and t
 
 ## Node capability labels
 
-A k3sm node advertises what it can actually run as `k3sm.io/*` **node labels**, each stamped from a
-probe of the real host at node start. The label is **present with value `"true"` or absent** — never
-`"false"` — and it is **removed** when the capability goes away:
+A k3sm node advertises what the **host machine is capable of** as `k3sm.io/*` **node labels**, each
+stamped from a probe of the real host at node start. The label is **present with value `"true"` or
+absent** — never `"false"` — and it is **removed** when the capability goes away:
 
-| Label | Present when the node can run… | Gated by |
-|---|---|---|
-| `k3sm.io/virtualization` | the `vm` RuntimeClass (Virtualization.framework) | the `vm` RuntimeClass's own `nodeSelector` |
-| `k3sm.io/rosetta` | **darwin/amd64** Mach-O payloads via host **Rosetta 2** — natively, no VM | your Pod's `nodeSelector` |
-| `k3sm.io/rosetta-linux` | **linux/amd64** ELF payloads in a Linux guest via **Rosetta for Linux** | your Pod's `nodeSelector` |
+| Label | Present when the host can… | Gated by | k3sm honors it today? |
+|---|---|---|---|
+| `k3sm.io/virtualization` | run the `vm` RuntimeClass (Virtualization.framework) | the `vm` RuntimeClass's own `nodeSelector` | yes — for scheduling (the `vm` path itself is EXPERIMENTAL) |
+| `k3sm.io/rosetta` | translate **darwin/amd64** Mach-O payloads via host **Rosetta 2** — natively, no VM | your Pod's `nodeSelector` | **not yet — see "advertised, not yet honored" below** |
+| `k3sm.io/rosetta-linux` | translate **linux/amd64** ELF payloads in a Linux guest via **Rosetta for Linux** | your Pod's `nodeSelector` | **not yet — see "advertised, not yet honored" below** |
 
 Inspect them with:
 
@@ -69,10 +69,46 @@ Two properties are worth internalizing before you build selectors on these:
   capability, advertised only through the `k3sm.io/*` keys; nothing in the cluster is told the node
   *is* amd64 or *is* Linux.
 
+### The two Rosetta labels are advertised, not yet honored
+
+Read this before you build anything on `k3sm.io/rosetta` or `k3sm.io/rosetta-linux`. The labels are a
+**truthful claim about the host** — the probe really did find Rosetta — and they really do make the node
+**selectable**. But **k3sm does not consume them when it pulls your image yet**: the pull still asks only
+for the node's native architecture (`darwin/arm64`), so an **amd64-only image is refused at pull time**
+with a no-matching-platform error and the Pod lands in `ImagePullBackOff`. A multi-arch image that
+includes `darwin/arm64` is unaffected — it runs natively, as it always did.
+
+That refusal is deliberate, not an oversight. Two things must land first:
+
+- **`k3sm.io/rosetta` (host, darwin/amd64)** — spawning a *translated* Mach-O inside the Seatbelt sandbox
+  is not yet proven end to end (**B105**). Selecting amd64 payloads before it is would also weaken a
+  kernel-level check k3sm relies on: an unsigned **arm64** binary is killed by the OS, while an unsigned
+  **x86_64** one is not.
+- **`k3sm.io/rosetta-linux` (guest, linux/amd64)** — the Linux-guest payload path (rootfs + guest image
+  pull) is not built yet, and translation only happens *inside* a guest, so the Pod must also set
+  `runtimeClassName: vm` to have any chance of getting there.
+
+So today these labels answer "**could** this host translate?", not "will k3sm run my amd64 workload
+here?". Until the paths above land, ship `arm64` (or multi-arch) images. If you have already selected a
+Rosetta label and see `ImagePullBackOff` with a platform error, that is this gap — not a broken node.
+
+### Translated execution shares the node's trust domain
+
+One property to know before you plan on translation. Rosetta does not run entirely inside a Pod's
+sandbox: translation is served by Apple's `oahd` helper, a **system daemon outside the Pod's Seatbelt
+profile running as its own user (`_oahd`)**, and translated code is cached ahead-of-time in a
+**node-global directory, `/private/var/db/oah`**, shared by everything on the machine. A Pod's execution
+**populates** that cache but cannot read it back, and the Pod's Seatbelt profile **does not mediate**
+either the helper or the cache. So a translated Pod stays in the **same-node shared trust domain** as
+every other default Pod — translation adds no isolation, and for untrusted workloads the answer remains
+the `vm` RuntimeClass above.
+
 ### Selecting a Rosetta-capable node (keep the `os` key)
 
 Because these are plain capability labels with no RuntimeClass behind them, your Pod selects them
-itself — and it must **keep `kubernetes.io/os: darwin`** alongside:
+itself — and it must **keep `kubernetes.io/os: darwin`** alongside. This is the selector shape to write
+**when the paths above land** — as written today the Pod schedules onto a capable node and then fails at
+image pull (see the previous section):
 
 ```yaml
 apiVersion: v1
@@ -80,6 +116,7 @@ kind: Pod
 metadata:
   name: legacy-amd64-job
 spec:
+  runtimeClassName: vm                # REQUIRED for rosetta-linux — translation happens in a guest
   nodeSelector:
     kubernetes.io/os: darwin          # REQUIRED — do not drop this
     k3sm.io/rosetta-linux: "true"     # the capability you need
@@ -88,10 +125,21 @@ spec:
       image: myapp-linux-amd64
 ```
 
-Dropping `kubernetes.io/os: darwin` and writing only the capability key **fails admission with a
-`422`**: k3sm enforces a cluster policy that every Pod declare the darwin node selector (it is what
-keeps Linux-assuming workloads off these nodes). The capability key **adds to** that selector, it does
-not replace it.
+Three things about that manifest:
+
+- **`runtimeClassName: vm` is not optional here.** Rosetta for Linux translates *inside* a Linux guest, so
+  without it the Pod runs on the native host-process path, where a `linux/amd64` payload has no meaning.
+  The `vm` RuntimeClass also merges `k3sm.io/virtualization: "true"` into your `nodeSelector`, which is
+  consistent — `k3sm.io/rosetta-linux` already implies a VZ-capable host.
+- **Dropping `kubernetes.io/os: darwin`** and writing only the capability key **fails admission with a
+  `422`**: k3sm enforces a cluster policy that every Pod declare the darwin node selector (it is what
+  keeps Linux-assuming workloads off these nodes). The capability key **adds to** that selector, it does
+  not replace it.
+- **The host-translation variant** selects `k3sm.io/rosetta: "true"` instead and carries **no**
+  `runtimeClassName` (it is the native path, no VM) — with the same not-yet-honored caveat.
+
+For a workload you want to run **today**, drop both the capability key and the RuntimeClass and ship an
+`arm64` (or multi-arch) image — the plain native path with `kubernetes.io/os: darwin` in the selector.
 
 ### Installing Rosetta after the node is up — restart required
 

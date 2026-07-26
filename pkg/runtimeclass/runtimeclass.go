@@ -54,6 +54,16 @@ const LabelVirtualization = "k3sm.io/virtualization"
 // attached — a pod that needs a translated payload selects it directly (see the
 // paired-selector note below).
 //
+// INTERIM SEMANTIC — ADVERTISED, NOT YET HONORED: this label truthfully describes the
+// HOST's capability and makes the node selectable, but k3sm does NOT yet consume it
+// when pulling an image. The pull-time platform policy still passes HostRosetta=false,
+// so a darwin/amd64-ONLY image is refused with image.ErrNoPlatformMatch (an
+// ImagePullBackOff pod), by design: executing a translated Mach-O under Seatbelt is
+// unproven until B105, and selecting amd64 payloads before then would drop the AMFI
+// kernel backstop the signature policy relies on (an unsigned x86_64 Mach-O runs where
+// an unsigned arm64 one is SIGKILLed). Do NOT "fix" that by wiring HostRosetta here.
+// The same statement is in docs/user/vm-runtimeclass.md for operators.
+//
 // Rosetta capability NEVER widens kubernetes.io/arch or NodeInfo.Architecture: both
 // stay the machine's NATIVE arch (arm64). Do NOT "fix" the gap by making the arch
 // label report amd64 — every generic client (the scheduler's arch nodeAffinity,
@@ -75,6 +85,15 @@ const LabelRosetta = "k3sm.io/rosetta"
 // carries LabelRosetta but NOT LabelRosettaLinux. The conjunction is composed in
 // cmd/k3sm (applyRosettaLabels) from the two independent runtimed conditions; do not
 // collapse it to the guest condition alone.
+//
+// INTERIM SEMANTIC — ADVERTISED, NOT YET HONORED: like LabelRosetta, this label
+// truthfully describes the host's capability and makes the node selectable, but k3sm
+// does NOT yet consume it. A pod also needs spec.runtimeClassName: vm to reach a guest
+// at all, the vm path is EXPERIMENTAL, and the guest lane's image pull is unbuilt (the
+// pull-time policy passes GuestRosetta=false, so a linux/amd64-only image is refused
+// with image.ErrNoPlatformMatch). The Linux-guest payload path lands after B105; until
+// then treat this key as an advertisement of host capability, not of a runnable
+// workload. The same statement is in docs/user/vm-runtimeclass.md for operators.
 //
 // The same arch-label rule as LabelRosetta applies: this never changes
 // kubernetes.io/arch or NodeInfo.Architecture (still arm64), and it never changes
