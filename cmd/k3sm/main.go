@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "kubectl", "kubeconfig", "doctor", "dev", "image" are implemented; others are planned):
   server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node (M3)
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -40,6 +40,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       build a native-macOS (OCI artifact) image
+  image       the local image store (image prune; load/import/ls are planned)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   doctor      run preflight environment + datastore-posture checks
@@ -117,6 +118,11 @@ func main() {
 	case "doctor":
 		if err := runDoctor(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm doctor:", err)
+			os.Exit(1)
+		}
+	case "image":
+		if err := runImage(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm image:", err)
 			os.Exit(1)
 		}
 	case "dev":
