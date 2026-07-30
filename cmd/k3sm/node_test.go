@@ -26,6 +26,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/dns"
 
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
@@ -137,16 +138,17 @@ func TestNodeVirtualizationLabel(t *testing.T) {
 		t.Error("clearing the virtualization label must not disturb other node labels")
 	}
 
-	// configureNode threads the runtimed vm-capability probe (B1): vmCapable=false ⇒
-	// the label is ABSENT (no VZ node ⇒ vm pods stay Unschedulable, fail-closed);
-	// vmCapable=true ⇒ present, so the vm RuntimeClass nodeSelector can bind.
+	// configureNode threads the runtimed vm-capability probe (B1) — now carried in the
+	// provider.NodeCapabilities struct (B103): the zero value ⇒ the label is ABSENT
+	// (no VZ node ⇒ vm pods stay Unschedulable, fail-closed); VMBackend: true ⇒
+	// present, so the vm RuntimeClass nodeSelector can bind.
 	incapableNode := &corev1.Node{}
-	configureNode(incapableNode, "k3sm-node", "10.0.0.1", false)
+	configureNode(incapableNode, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
 	if _, present := incapableNode.Labels[runtimeclass.LabelVirtualization]; present {
 		t.Errorf("configureNode(vmCapable=false) must NOT stamp the virtualization label, got present: %v", incapableNode.Labels)
 	}
 	capableNode := &corev1.Node{}
-	configureNode(capableNode, "k3sm-node", "10.0.0.1", true)
+	configureNode(capableNode, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{VMBackend: true})
 	if got := capableNode.Labels[runtimeclass.LabelVirtualization]; got != runtimeclass.LabelTrue {
 		t.Errorf("configureNode(vmCapable=true): label %s = %q, want %q", runtimeclass.LabelVirtualization, got, runtimeclass.LabelTrue)
 	}
@@ -216,7 +218,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", false)
+		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
 
 		capMem := n.Status.Capacity[corev1.ResourceMemory]
 		if capMem.Value() != thirtyTwo {
@@ -262,7 +264,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", false)
+		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
 
 		mem := n.Status.Capacity[corev1.ResourceMemory]
 		if mem.Value() != eightGiB {
@@ -279,7 +281,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", false)
+		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
 
 		mem := n.Status.Capacity[corev1.ResourceMemory]
 		if mem.Value() <= 0 {
@@ -297,7 +299,7 @@ func TestNodeCapacityFromHostMemory(t *testing.T) {
 		t.Cleanup(func() { hostMemBytes = restore })
 
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", false)
+		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
 
 		mem := n.Status.Capacity[corev1.ResourceMemory]
 		if mem.Value() != eightGiB {
@@ -318,7 +320,7 @@ func TestConfigureNodeTopologyLabels(t *testing.T) {
 
 	const host = "k3sm-node"
 	node := &corev1.Node{}
-	configureNode(node, host, "10.0.0.1", false)
+	configureNode(node, host, "10.0.0.1", provider.NodeCapabilities{})
 
 	// zone == the node name AND == the hostname label, by construction: this locks the
 	// per-node zone==hostname coupling. A shared-static-zone regression fails here.

@@ -16,8 +16,12 @@ limitations under the License.
 
 // Package runtimeclass provisions, idempotently at server start, the upstream
 // node.k8s.io/v1 RuntimeClass named "vm" that opts a pod into k3sm's
-// Virtualization.framework micro-VM isolation backend (M5.1), and defines the node
-// label that RuntimeClass's nodeSelector pins to.
+// Virtualization.framework micro-VM isolation backend (M5.1), and owns the k3sm
+// NODE-CAPABILITY label keys — both the one that RuntimeClass's nodeSelector pins to
+// (LabelVirtualization) and the capability keys that have NO RuntimeClass attached
+// and are selected directly by a pod (LabelRosetta, LabelRosettaLinux — B103). The
+// keys live here, next to the selector that consumes one of them, so the label a
+// node stamps and the selector a pod is admitted against can never drift.
 //
 // # The two halves of the vm RuntimeClass
 //
@@ -34,16 +38,23 @@ limitations under the License.
 //
 // A node advertises the VZ backend by carrying LabelVirtualization=LabelTrue, set
 // from the node's ACTUAL Virtualization.framework availability (cmd/k3sm's
-// applyVirtualizationLabel). When no node carries it — the default today, because
-// runtimed's GetRuntimeInfo RPC reports only the selected host-process backend's
-// health and NOT per-backend (VZ) availability (a runtimed extension is needed; see
-// cmd/k3sm/node.go nodeVMCapable) — a vm pod has no node to land on and stays
-// Pending/Unschedulable. That is the correct posture for a non-VZ cluster, and it
-// complements runtimed's runtime-refusal backstop: even if a vm pod reached a node,
-// runtimed's SelectBackend fails closed (sandbox.ErrBackendUnavailable) rather than
-// downgrade to a weaker rung. Provisioning the RuntimeClass itself is also
-// fail-closed by absence: a vm pod naming an unprovisioned RuntimeClass is rejected
-// at admission.
+// applyVirtualizationLabel). runtimed's GetRuntimeInfo RPC reports that availability
+// as an additive VMBackendAvailable RuntimeCondition (the B1 extension — the SAFE
+// isSupported + entitlement probe that never boots a VM), which the provider reads
+// ONCE at node bring-up via provider.Capabilities. When no node carries the label, a
+// vm pod has no node to land on and stays Pending/Unschedulable. That is the correct
+// posture for a non-VZ cluster, and it complements runtimed's runtime-refusal
+// backstop: even if a vm pod reached a node, runtimed's SelectBackend fails closed
+// (sandbox.ErrBackendUnavailable) rather than downgrade to a weaker rung.
+// Provisioning the RuntimeClass itself is also fail-closed by absence: a vm pod
+// naming an unprovisioned RuntimeClass is rejected at admission.
+//
+// The Rosetta capability keys (LabelRosetta, LabelRosettaLinux — B103) are read from
+// the SAME single GetRuntimeInfo probe and stamped by the same fail-closed rule: a
+// probe error, an absent condition (an older runtimed), or any non-TRUE status
+// leaves the key ABSENT, so a node never advertises a translation capability it
+// cannot honor. They gate SCHEDULING ONLY through a pod's own nodeSelector — there
+// is no RuntimeClass and no admission plugin merging them in.
 //
 // # Two-guard defense-in-depth (what B49's reconcile self-heals)
 //
@@ -103,6 +114,11 @@ limitations under the License.
 //     pod is Unschedulable until a VZ node exists), and keeping the admission surface
 //     minimal until the capability is real is the fail-closed default.
 //   - The guest resolv.conf injection (pinned static/immutable per darwin-net's
-//     caveat), Rosetta-for-amd64, and the separate-binary virtualization-entitlement
-//     signing (M4.0 packaging) are lab/packaging remainders.
+//     caveat) and the separate-binary virtualization-entitlement signing (M4.0
+//     packaging) are lab/packaging remainders.
+//   - Rosetta: B103 lands the ADVERTISEMENT half only (the probes + LabelRosetta /
+//     LabelRosettaLinux). Actually EXECUTING a translated darwin/amd64 Mach-O under
+//     Seatbelt, and a live Rosetta-for-Linux guest, remain lab remainders — so a node
+//     may truthfully carry the capability label before the translated exec path is
+//     end-to-end proven.
 package runtimeclass

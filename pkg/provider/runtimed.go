@@ -291,35 +291,114 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 	}
 }
 
-// VMBackendAvailable reports whether runtimed advertises the vm backend as usable
-// on this host — the VMBackendAvailable RuntimeCondition GetRuntimeInfo carries
-// (Virtualization.framework isSupported + the com.apple.security.virtualization
-// entitlement). The node queries it ONCE at bring-up to set the
-// k3sm.io/virtualization label truthfully (B1). It fails CLOSED (false) on any RPC
-// error or a missing/false condition, matching the no-VZ default so a labeling
-// probe failure never FALSELY advertises a node as vm-schedulable.
-func (r *runtimedRuntime) VMBackendAvailable(ctx context.Context) bool {
-	info, err := r.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
-	if err != nil {
-		r.log.Warn("vm-capability probe failed; labeling node vm-incapable (fail-closed)", "err", err)
-		return false
-	}
-	return vmBackendAvailableFromInfo(info)
+// NodeCapabilities are the node-capability facts runtimed advertises as
+// GetRuntimeInfo RuntimeConditions and the node command turns into truthful node
+// labels. They travel as ONE struct, from ONE RPC, deliberately: three separate
+// probes could each observe a DIFFERENT daemon state and produce an incoherent
+// label set (k3sm.io/rosetta-linux stamped from a later observation while
+// k3sm.io/virtualization was deleted from an earlier one). Every field fails CLOSED
+// — the zero value advertises nothing (B103).
+type NodeCapabilities struct {
+	// VMBackend is the VMBackendAvailable condition: this host can run the vm
+	// RuntimeClass (Virtualization.framework isSupported + the
+	// com.apple.security.virtualization entitlement). Drives k3sm.io/virtualization (B1).
+	VMBackend bool
+	// RosettaHost is the RosettaHostAvailable condition: this host can translate
+	// darwin/amd64 Mach-O payloads via Rosetta 2 on the NATIVE host-process spine.
+	// Drives k3sm.io/rosetta.
+	RosettaHost bool
+	// RosettaGuest is the RosettaGuestAvailable condition: a Linux guest on this host
+	// could translate linux/amd64 ELF payloads via Rosetta for Linux. It is only HALF
+	// of k3sm.io/rosetta-linux — that label is RosettaGuest AND VMBackend, since
+	// without the vm backend there is no guest to translate in (see
+	// cmd/k3sm applyRosettaLabels).
+	RosettaGuest bool
 }
 
-// vmBackendAvailableFromInfo reports whether a GetRuntimeInfo response advertises
-// the vm backend as available (its VMBackendAvailable condition is TRUE). Pure — so
-// the node's truthful-labeling mapping is unit-tested without a live runtimed (B1).
-func vmBackendAvailableFromInfo(info *runtimev1.GetRuntimeInfoResponse) bool {
-	if info == nil {
-		return false
+// Capabilities probes runtimed ONCE and reports every node capability the node
+// command labels from. One RPC for all three booleans is load-bearing: separate
+// calls could straddle a daemon restart and yield a mutually-inconsistent label set.
+// It fails CLOSED (the zero value — nothing advertised) on an RPC error, so a probe
+// failure never FALSELY advertises a capability the node does not have.
+func (r *runtimedRuntime) Capabilities(ctx context.Context) NodeCapabilities {
+	info, err := r.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
+	if err != nil {
+		r.log.Warn("node-capability probe failed; advertising no capabilities (fail-closed)", "err", err)
+		return NodeCapabilities{}
 	}
+	caps := nodeCapabilitiesFromInfo(info)
+	// Log at the boundary WITH each withheld capability's Reason: the condition's
+	// Reason/Message is the only answer to "why is my node not labelled rosetta?",
+	// and it is discarded once this returns a bare bool.
+	logWithheldCapability(r.log, info, runtimed.ConditionVMBackendAvailable, caps.VMBackend)
+	logWithheldCapability(r.log, info, runtimed.ConditionRosettaHostAvailable, caps.RosettaHost)
+	logWithheldCapability(r.log, info, runtimed.ConditionRosettaGuestAvailable, caps.RosettaGuest)
+	return caps
+}
+
+// nodeCapabilitiesFromInfo maps a GetRuntimeInfo response to the node capabilities.
+// Pure — so the truthful-labeling mapping is unit-tested without a live runtimed.
+//
+// It fails CLOSED on every degenerate input: a nil response, an empty condition
+// list, a condition ABSENT from the list (an older runtimed that predates the
+// capability), and any status that is not explicitly TRUE — including UNKNOWN and
+// the proto zero UNSPECIFIED, which a `!= FALSE` test would have read as capable.
+// The condition Type strings are IMPORTED from runtimed, never restated here: the
+// reader fails closed, so a typo would mean a permanently-absent label with no error
+// anywhere — importing makes a producer/consumer rename a COMPILE error (B103).
+func nodeCapabilitiesFromInfo(info *runtimev1.GetRuntimeInfoResponse) NodeCapabilities {
+	return NodeCapabilities{
+		VMBackend:    conditionTrue(info, runtimed.ConditionVMBackendAvailable),
+		RosettaHost:  conditionTrue(info, runtimed.ConditionRosettaHostAvailable),
+		RosettaGuest: conditionTrue(info, runtimed.ConditionRosettaGuestAvailable),
+	}
+}
+
+// conditionTrue reports whether info carries condType with status TRUE. FIRST match
+// wins (a duplicated Type — which runtimed never emits — is resolved by the first
+// occurrence, the documented verdict); an absent condition or any non-TRUE status is
+// false.
+func conditionTrue(info *runtimev1.GetRuntimeInfoResponse, condType string) bool {
+	c := findRuntimeCondition(info, condType)
+	return c.GetStatus() == runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+}
+
+// findRuntimeCondition returns the FIRST condition of the given Type, or nil. The
+// proto getters are nil-safe, so callers may use the result unchecked.
+func findRuntimeCondition(info *runtimev1.GetRuntimeInfoResponse, condType string) *runtimev1.RuntimeCondition {
 	for _, c := range info.GetConditions() {
-		if c.GetType() == "VMBackendAvailable" {
-			return c.GetStatus() == runtimev1.ConditionStatus_CONDITION_STATUS_TRUE
+		if c.GetType() == condType {
+			return c
 		}
 	}
-	return false
+	return nil
+}
+
+// logWithheldCapability logs, at the capability boundary, why a capability is NOT
+// advertised — carrying the condition's Reason/Message (the runtimed reason
+// vocabulary: NotInstalled / TranslationFailed / NotSupported / QueryFailed /
+// VMBackendUnavailable) so an operator can answer "why is my node not labelled
+// rosetta?" from server.log. An advertised capability is logged at Debug; an ABSENT
+// condition (an older runtimed) is reported as such rather than as a silent false.
+//
+// It names the CONDITION, never a k3sm.io/* label key: this package holds no label
+// vocabulary (the keys live in pkg/runtimeclass, next to the selector that consumes
+// them), and one condition does not map 1:1 to one label anyway — rosetta-linux is a
+// conjunction. The paired line naming the LABEL the verdict resolved to is emitted by
+// cmd/k3sm's setLabelPresence / applyRosettaLabels, which own that decision.
+func logWithheldCapability(log *slog.Logger, info *runtimev1.GetRuntimeInfoResponse, condType string, advertised bool) {
+	if advertised {
+		log.Debug("node capability advertised", "condition", condType)
+		return
+	}
+	c := findRuntimeCondition(info, condType)
+	if c == nil {
+		log.Info("node capability withheld: runtimed does not report this condition (older daemon); failing closed",
+			"condition", condType)
+		return
+	}
+	log.Info("node capability withheld by runtimed; the node will NOT be labelled for it",
+		"condition", condType, "status", c.GetStatus().String(), "reason", c.GetReason(), "message", c.GetMessage())
 }
 
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the
