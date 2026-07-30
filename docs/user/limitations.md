@@ -119,6 +119,34 @@ The **`vm` RuntimeClass** (M5) and **multi-node / HA** (M6) ship as documented *
 are the v0.2 / v0.3 headlines, **not** launch-blocking, and should be treated as preview-quality. See
 [vm-runtimeclass.md](vm-runtimeclass.md), [multi-node.md](multi-node.md), and [ha.md](ha.md).
 
+### Node capability labels are probed once at daemon start
+
+The `k3sm.io/*` node capability labels — `k3sm.io/virtualization`, `k3sm.io/rosetta`,
+`k3sm.io/rosetta-linux` — are stamped from probes that run **once, when the node daemon starts**, and
+are not re-evaluated while it runs.
+
+The **gain** direction is merely inconvenient: install Rosetta 2, restart the daemon, the label appears
+(see [vm-runtimeclass.md](vm-runtimeclass.md#installing-rosetta-after-the-node-is-up--restart-required)).
+
+The **loss** direction is a real ceiling. A node that **loses** a capability — Rosetta 2 removed, the
+virtualization capability withdrawn — **keeps advertising it** until the daemon restarts. In that window
+the scheduler keeps binding Pods that select the capability onto a node that can no longer honor them,
+and those Pods fail at start rather than staying `Pending` on another node. Remediation, until the
+daemon is restarted:
+
+```sh
+# stop advertising the capability immediately
+kubectl label node <node> k3sm.io/rosetta- k3sm.io/rosetta-linux-
+
+# then restart the daemon so the probes re-run and the labels reflect reality
+sudo launchctl kickstart -k system/io.k3sm.server
+```
+
+The label removal on restart is itself only proven against the node object k3sm *constructs*; whether a
+label **deletion** propagates through Virtual Kubelet's node reconcile to the datastore in every case is
+not yet verified in a lab. `k3sm.io/virtualization` has always had the same property. Treat the manual
+`kubectl label ... -` above as the reliable way to withdraw a capability claim.
+
 ### Single-node datastore consistency
 
 k3sm embeds **kine** over **SQLite (WAL)**. On a single node the datastore serves a **consistent LIST**;

@@ -46,8 +46,68 @@ const Name = string(runtimev1.HandlerVM)
 // share the key so the RuntimeClass selector and the node label never drift.
 const LabelVirtualization = "k3sm.io/virtualization"
 
-// LabelTrue is the value LabelVirtualization carries on a VZ-capable node — and the
-// value this RuntimeClass's nodeSelector requires.
+// LabelRosetta is the node label advertising that this node can translate
+// **darwin/amd64 Mach-O** pod payloads via host Rosetta 2 on the NATIVE
+// host-process spine (no VM involved). A node carries it (value LabelTrue) iff
+// runtimed's RosettaHostAvailable condition is TRUE; absent ⇒ the node can run only
+// native darwin/arm64 payloads. It is a plain capability label with NO RuntimeClass
+// attached — a pod that needs a translated payload selects it directly (see the
+// paired-selector note below).
+//
+// INTERIM SEMANTIC — ADVERTISED, NOT YET HONORED: this label truthfully describes the
+// HOST's capability and makes the node selectable, but k3sm does NOT yet consume it
+// when pulling an image. The pull-time platform policy still passes HostRosetta=false,
+// so a darwin/amd64-ONLY image is refused with image.ErrNoPlatformMatch (an
+// ImagePullBackOff pod), by design: executing a translated Mach-O under Seatbelt is
+// unproven until B105, and selecting amd64 payloads before then would drop the AMFI
+// kernel backstop the signature policy relies on (an unsigned x86_64 Mach-O runs where
+// an unsigned arm64 one is SIGKILLed). Do NOT "fix" that by wiring HostRosetta here.
+// The same statement is in docs/user/vm-runtimeclass.md for operators.
+//
+// Rosetta capability NEVER widens kubernetes.io/arch or NodeInfo.Architecture: both
+// stay the machine's NATIVE arch (arm64). Do NOT "fix" the gap by making the arch
+// label report amd64 — every generic client (the scheduler's arch nodeAffinity,
+// `kubectl get node -L kubernetes.io/arch`, any chart that keys off it) reads those
+// as the machine's real ISA, so a translated capability advertised there would be a
+// lie to all of them. The k3sm.io/* capability key is the truthful place to express
+// "can additionally run amd64 by translation".
+const LabelRosetta = "k3sm.io/rosetta"
+
+// LabelRosettaLinux is the node label advertising that this node can run
+// **linux/amd64 ELF** pod payloads in a Virtualization.framework Linux guest via
+// Rosetta for Linux. Its value is a CONJUNCTION:
+//
+//	LabelRosettaLinux ⇔ VMBackendAvailable ∧ RosettaGuestAvailable
+//
+// because Rosetta for Linux translates INSIDE a guest — with no vm backend there is
+// no guest to translate in. So a node with Rosetta installed but no VZ capability
+// (unsupported hardware, or the process lacking com.apple.security.virtualization)
+// carries LabelRosetta but NOT LabelRosettaLinux. The conjunction is composed in
+// cmd/k3sm (applyRosettaLabels) from the two independent runtimed conditions; do not
+// collapse it to the guest condition alone.
+//
+// INTERIM SEMANTIC — ADVERTISED, NOT YET HONORED: like LabelRosetta, this label
+// truthfully describes the host's capability and makes the node selectable, but k3sm
+// does NOT yet consume it. A pod also needs spec.runtimeClassName: vm to reach a guest
+// at all, the vm path is EXPERIMENTAL, and the guest lane's image pull is unbuilt (the
+// pull-time policy passes GuestRosetta=false, so a linux/amd64-only image is refused
+// with image.ErrNoPlatformMatch). The Linux-guest payload path lands after B105; until
+// then treat this key as an advertisement of host capability, not of a runnable
+// workload. The same statement is in docs/user/vm-runtimeclass.md for operators.
+//
+// The same arch-label rule as LabelRosetta applies: this never changes
+// kubernetes.io/arch or NodeInfo.Architecture (still arm64), and it never changes
+// kubernetes.io/os either — the NODE is darwin even when the payload runs in a Linux
+// guest, so a pod selecting this capability must ALSO keep
+// kubernetes.io/os=darwin (pkg/policy's darwin-selector admission policy rejects a
+// pod that drops the os key with a 422). See docs/user/vm-runtimeclass.md.
+const LabelRosettaLinux = "k3sm.io/rosetta-linux"
+
+// LabelTrue is the value LabelVirtualization, LabelRosetta, and LabelRosettaLinux
+// carry on a capable node — and the value this RuntimeClass's nodeSelector requires.
+// Every one of them is PRESENCE-only: a node that loses the capability has the key
+// DELETED, never set to "false" (see cmd/k3sm's applyVirtualizationLabel /
+// applyRosettaLabels).
 const LabelTrue = "true"
 
 // managedLabel marks the RuntimeClass this package provisions, matching pkg/rbac /
