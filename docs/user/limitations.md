@@ -64,6 +64,44 @@ are never enforced**; and policies against `kube-dns` or the `kubernetes` VIP ar
 (those VIPs bypass the proxy). It is a policy hint, NOT a security boundary — isolate untrusted
 workloads with the vm RuntimeClass ([vm-runtimeclass.md](vm-runtimeclass.md)).
 
+### Which addresses your Services actually answer on
+
+Today at `main`, per port class:
+
+- **NodePort** — bound to the **wildcard** `*:30000-32767` in-process. Every interface on the Mac
+  answers, including `127.0.0.1` and your LAN address. This has always been the case; it is what
+  NodePort means upstream.
+- **LoadBalancer / Ingress** — bound to `127.0.0.1`, so only processes on this Mac can reach them,
+  while `kubectl get svc` advertises the node's InternalIP as `EXTERNAL-IP`. That mismatch is a known
+  bug: the advertised address is not the address the listener is on. **Planned (`B116`)**: the
+  listeners move to the wildcard — matching Docker Desktop and k3s, both of which publish
+  LoadBalancer ports on all interfaces — and the advertised address becomes truthful. After that
+  change LB and Ingress ports are reachable from your LAN, so treat a LoadBalancer Service as
+  publishing to the local network, not to the host alone.
+
+`spec.loadBalancerSourceRanges` is **accepted and silently ignored** today — setting it does not
+restrict anything. **Planned (`B131`)**. When it lands it is an authorization check at the accept
+path, not a firewall: the TCP handshake still completes (so the port answers a scan and a denial
+arrives as a connection reset, not a timeout), it matches the immediate peer address so a relay or
+NAT presents the relay's address, it applies to TCP only, and an empty range set means allow-all.
+Like NetworkPolicy below, it is a hint rather than tenant isolation — every pod runs under one
+`_k3sm` uid on a shared `lo0`, so an on-node pod can dial the backend directly and bypass it.
+
+`spec.loadBalancerClass` is also ignored: k3sm claims **every** `type: LoadBalancer` Service
+regardless of class and overwrites its status, so it will fight another LB implementation rather than
+defer to it (`B135`).
+
+Two further consequences of the LB/Ingress datapath, true both before and after `B116`: the userspace
+splice **discards the client address** when it dials the backend, so a NetworkPolicy denying a pod
+does **not** filter traffic that arrives via that pod's LoadBalancer or Ingress (`B131` restores this
+by carrying the real source into the policy verdict); and a failed listener bind is not visible to
+`kubectl` — the Service simply stays `<pending>` and the reason is only in the daemon log, because the
+provider has no `EventRecorder` yet (`B75`).
+
+All of this assumes the supported posture: a single operator's Mac with trusted namespaces. Any
+principal who can create a Service can claim a host port, and k3sm does not restrict which ports —
+that is an accepted risk of the ServiceLB model k3s also ships, not an oversight.
+
 ### Per-pod IP is addressing and identity, not isolation
 
 A pod's per-pod IP is **addressing/identity only**: binds are port-scoped on shared interfaces, and
