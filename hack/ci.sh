@@ -17,6 +17,10 @@ if [ -n "$(CGO_ENABLED=$CGO go list ./... 2>/dev/null)" ]; then
 	echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [k3sm] go build"; CGO_ENABLED=$CGO go build ./...
 	echo "==> [k3sm] go test";  CGO_ENABLED=$CGO go test ./...   # e2e/ is //go:build e2e — excluded here
+	# The integration tier is NOT run here (it needs darwin + a real socket), but
+	# nothing else in this repo COMPILES the `integration` build tag, so the
+	# B116 privilege-premise canary would rot invisibly. Vet it.
+	echo "==> [k3sm] go vet -tags integration"; CGO_ENABLED=$CGO go vet -tags integration ./...
 else
 	echo "==> [k3sm] (no Go packages yet — skipping vet/build/test)"
 fi

@@ -63,6 +63,16 @@ type Options struct {
 	// Service CIDR a privileged bind can ever be authorized on, and only when a
 	// LoadBalancer Service declares the port. The zero Addr disables the
 	// node-address branch entirely (deny).
+	//
+	// DORMANT BY CONFIGURATION, NOT BY CONSTRUCTION (B133). Since B116 the
+	// ingress/svclb listeners bind the WILDCARD in-process (unprivileged on
+	// Darwin at any port), so nothing asks netd for a node-address bind, and the
+	// installed plist renders NO --node-ip — leaving this zero and the branch
+	// denying. The branch is deliberately KEPT: it is the authorization design
+	// for any future privileged specific-address bind, and B133 owns the decision
+	// to either wire it back or retire it. pkg/install::TestNetdPlistXML pins the
+	// absence of --node-ip, so re-adding the flag reddens rather than silently
+	// re-arming the branch.
 	NodeIP netip.Addr
 	// MeshKeyDir is the root-only directory the MeshKeyResolver reads the node's
 	// wireguard private key from. Empty disables ConfigureMesh (a nil resolver,

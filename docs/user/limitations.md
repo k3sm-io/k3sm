@@ -71,21 +71,47 @@ Today at `main`, per port class:
 - **NodePort** — bound to the **wildcard** `*:30000-32767` in-process. Every interface on the Mac
   answers, including `127.0.0.1` and your LAN address. This has always been the case; it is what
   NodePort means upstream.
-- **LoadBalancer / Ingress** — bound to `127.0.0.1`, so only processes on this Mac can reach them,
-  while `kubectl get svc` advertises the node's InternalIP as `EXTERNAL-IP`. That mismatch is a known
-  bug: the advertised address is not the address the listener is on. **Planned (`B116`)**: the
-  listeners move to the wildcard, matching Docker Desktop and k3s, which both publish LoadBalancer
-  ports on all interfaces.
+- **LoadBalancer / Ingress** — bound to the **wildcard** `*:<port>`, matching Docker Desktop and k3s,
+  which both publish LoadBalancer ports on all interfaces.
 
-  Read the two halves of that change separately, because they are not the same address. The **port**
-  becomes reachable on every interface the Mac has, including its LAN address — so treat a
+  **The bind address and the advertised address are different, on purpose.** Read them separately.
+  The **port** is reachable on every interface the Mac has, including its LAN address — so treat a
   LoadBalancer Service as publishing to the local network, not to the host alone. The **advertised
-  `EXTERNAL-IP`** stays the node's InternalIP, which is an RFC-6598 (`100.64.0.0/10`) alias on `lo0`:
-  reachable from this Mac, from local pods, and from mesh peers over WireGuard, but **not routable
-  from your LAN** — a LAN client has no route to `100.64/10` and must dial the Mac's own LAN address
+  `EXTERNAL-IP`** is the node's InternalIP, an RFC-6598 (`100.64.0.0/10`) alias on `lo0`: reachable
+  from this Mac, from local pods, and from mesh peers over WireGuard, but **not routable from your
+  LAN**. A LAN client has no route to `100.64/10`, so `curl <EXTERNAL-IP>` from your laptop **hangs
+  until timeout** rather than failing fast — dial the Mac's own LAN address and the Service port
   instead. This differs from both analogs: k3s advertises the node's real LAN address, and Docker
   Desktop advertises the literal hostname `localhost`. If you need a LAN-usable value in
   `status.loadBalancer.ingress`, that is not what k3sm publishes today.
+
+  If the derived InternalIP cannot be worked out, k3sm advertises **nothing** — the Service stays
+  `<pending>` while the listeners still serve. That is deliberate: an unreachable `EXTERNAL-IP` is
+  worse than none. See [troubleshooting.md](troubleshooting.md#a-loadbalancer-service-stays-pending).
+
+- **A pod can collide with a LoadBalancer port.** macOS has no network namespaces, so pods share **one
+  port space** with the server process (runtimed's sandbox profile emits a bare `(allow network-bind)`
+  — per-IP scoping does not compile on macOS 26). Previously a LoadBalancer listener bound a specific
+  `lo0` address, so a pod binding `0.0.0.0:8080` never conflicted; now the listener holds
+  `0.0.0.0:8080` and the pod's own `listen()` can fail `EADDRINUSE` — or vice versa, leaving the
+  Service `<pending>`. Admission cannot catch this: the colliding party is a `containerPort`, not a
+  Service field. Pods using the `vm` RuntimeClass are exempt (their own network stack behind VZNAT) —
+  see [vm-runtimeclass.md](vm-runtimeclass.md).
+
+- **k3sm reserves some ports, and rejects LoadBalancer Services that claim them.** The NodePort range
+  `30000-32767` and the kubelet API port `10250` are k3sm's own wildcard listeners; Go sets no
+  `SO_REUSEPORT`, so a second wildcard listener on the same port simply fails. A `type: LoadBalancer`
+  Service declaring one of those ports is **rejected at `kubectl apply`** with a message naming the
+  port, and the controller additionally refuses to bind it. Plain NodePort Services are unaffected —
+  the apiserver allocates their `nodePort` out of that very range. Ordinary duplicate LoadBalancer
+  ports are **not** arbitrated: two Services on `8080` are first-come, and the loser stays `<pending>`.
+
+- **A LoadBalancer Service on 80 or 443 can race the ingress host.** Those are legitimate LoadBalancer
+  ports, so they are deliberately **not** reserved. The ingress listeners are started *before* the
+  LoadBalancer controller, so the ingress host wins in practice — but that is start ordering, not a
+  guarantee. If a Service claims 80/443 and wins, the ingress host burns its bounded bind retry
+  (~155 s) and then logs `ingress bind retries exhausted`, leaving Ingress disabled until the daemon
+  restarts.
 
 `spec.loadBalancerSourceRanges` is **accepted and silently ignored** today — setting it does not
 restrict anything. **Planned (`B131`)**. When it lands it is an authorization check at the accept
@@ -99,7 +125,7 @@ Like NetworkPolicy below, it is a hint rather than tenant isolation — every po
 regardless of class and overwrites its status, so it will fight another LB implementation rather than
 defer to it (`B135`).
 
-Two further consequences of the LB/Ingress datapath, true both before and after `B116`: the userspace
+Two further consequences of the LB/Ingress datapath: the userspace
 splice **discards the client address** when it dials the backend, so a NetworkPolicy denying a pod
 does **not** filter traffic that arrives via that pod's LoadBalancer or Ingress (`B131` restores this
 by carrying the real source into the policy verdict); and a failed listener bind is not visible to

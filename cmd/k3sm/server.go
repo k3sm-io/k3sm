@@ -23,7 +23,6 @@ import (
 	"log"
 	"log/slog"
 	"net"
-	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -35,8 +34,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/darwin-net/pkg/dns"
-	"k3sm.io/darwin-net/pkg/netbind"
-	"k3sm.io/darwin-net/pkg/netd/wire"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
@@ -72,7 +69,7 @@ type serverOptions struct {
 
 	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the B71 cutover; default = warn-only, M10.0)
 
-	ingressHTTPPort  int // ingress HTTP listener port on the node IP (M10.3; 0 disables; 80 = production, an explicit high port = integration tier)
+	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (M10.3/B116; 0 disables; 80 = production, an explicit high port = integration tier)
 	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
 }
 
@@ -105,14 +102,15 @@ func runServer(args []string) error {
 	// the next boot. It is an operator argv toggle of a single apiserver config
 	// value, not a runtime feature-flag code path.
 	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the B71 cutover; the shipped default is baseline-warn only)")
-	// M10.3 ingress listener ports. 80/443 is the production posture (the netd
-	// helper authorizes the privileged node-address bind because the canonical
-	// kube-system/k3sm-ingress LoadBalancer Service declares those ports); an
-	// EXPLICIT high-port pair (e.g. 8080/8443) is the integration-tier mode.
-	// There is deliberately NO silent fallback between the two — a failed
-	// privileged bind is logged and boundedly retried, never re-ported.
-	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port on the node InternalIP (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
-	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port on the node InternalIP (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
+	// M10.3 ingress listener ports. 80/443 is the production posture; an EXPLICIT
+	// high-port pair (e.g. 8080/8443) is the integration-tier mode. There is
+	// deliberately NO silent fallback between the two — a failed bind is logged and
+	// boundedly retried, never re-ported. Since B116 the listeners bind the WILDCARD
+	// in-process (a wildcard bind is unprivileged on Darwin at any port), so no netd
+	// authorization is involved; they are started BEFORE svclb so they win a contest
+	// for these ports against a user LoadBalancer Service declaring them.
+	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port, bound on ALL interfaces (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
+	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port, bound on ALL interfaces (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
@@ -259,7 +257,13 @@ func runServer(args []string) error {
 		} else {
 			logger.Info("wrote HA admin kubeconfig (signing-CA client cert; usable against any server)", "path", adminKubeconfigPath(opts.workDir))
 		}
-		if opts.nodeIP == "127.0.0.1" {
+		// The MESH rewrite. It runs here, at mesh bring-up, and must stay STRICTLY
+		// BEFORE the pod-CIDR advertise derivation (advertisedNodeIP, applied inside
+		// startNode / lbHostingConfigs): applied the other way round, a mesh server
+		// would advertise the pod /24's 100.64.0.1 while its peers — and every HA
+		// server, which all compute the SAME index-0 podCIDR — know it by its mesh
+		// IP, so two Macs would publish one EXTERNAL-IP.
+		if isLoopbackDefault(opts.nodeIP) {
 			opts.nodeIP = opts.meshIP
 		}
 		servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP)
@@ -314,6 +318,15 @@ func runServer(args []string) error {
 	}
 	if err := policy.EnsureUDPServiceWarn(ctx, cs); err != nil {
 		logger.Error("provision UDP-service warn policy", "err", err)
+	}
+	// B116 — DENY a type: LoadBalancer Service declaring a port k3sm's own wildcard
+	// listeners own (the NodePort range, the kubelet API port). Log-and-continue
+	// like every sibling Ensure*, but the message NAMES the consequence: a silently
+	// absent Deny VAP is otherwise indistinguishable from a present one, and the
+	// operator would only meet the collision as an unexplained <pending> Service
+	// (svclb still refuses the bind — that is the datapath half of the guard).
+	if err := policy.EnsureRejectReservedLoadBalancerPort(ctx, cs); err != nil {
+		logger.Error("provision reserved-loadbalancer-port DENY policy: a LoadBalancer Service declaring a k3sm-reserved port (NodePort range / kubelet API port) will now be ACCEPTED by the API instead of rejected; svclb still refuses to bind it, so such a Service stays <pending> with only a log line to explain it", "err", err)
 	}
 	// B17 — honest-gap Warn advisory on Pods: a pod with no toleration for the
 	// provider taint (k3sm.io/provider:NoSchedule, on EVERY node) is left
@@ -411,7 +424,7 @@ func runServer(args []string) error {
 	// that real slice (a static loopback pin would route the VIP at a
 	// non-listening address).
 	apiServerEndpoint := ""
-	if opts.nodeIP == loopbackNodeIP {
+	if isLoopbackDefault(opts.nodeIP) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
 	net := netserve.New(netserve.Config{
@@ -504,44 +517,63 @@ func runServer(args []string) error {
 		<-provDone
 	}()
 
+	// The in-process node's options are built HERE, before the LB/ingress block,
+	// and the LB/ingress configuration is derived from this same value — so the
+	// address `kubectl get svc` shows as EXTERNAL-IP and the address the Node
+	// object advertises cannot diverge (they read one podCIDR, one nodeIP, one
+	// netMode through one shared derivation, advertisedNodeIP).
+	nodeOpts := nodeOptions{
+		kubeconfig: exec.Kubeconfig(),
+		nodeName:   opts.nodeName,
+		listen:     serverKubeletListen,
+		podRoot:    opts.podRoot,
+		nodeIP:     opts.nodeIP,
+		runtime:    opts.rtName,
+		dnsShim:    opts.dnsShim,
+		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
+		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)
+		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
+		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
+	}
+
 	// 4d/4e. M10.3 — ingress hosting + svclb, beside the netserve datapath
 	// (step 4) and like it skipped under --network none (they splice/route to
 	// ClusterIP VIPs, which need the proxy's datapath).
+	//
+	// Both bind the WILDCARD and both advertise the node's DERIVED
+	// globally-unicast InternalIP (B116) — see lbHostingConfigs, which owns the
+	// whole decision. opts.nodeIP is READ, never written back: it feeds the
+	// apiserver's --advertise-address/--bind-address above.
 	//
 	// 4d: darwin-net's L7 ingress (RouteTable + SNI CertStore + class-filtered
 	// Watcher + Server) runs IN THIS PROCESS (SERVER-PROCESS-ONLY — multi-node
 	// ingress is a named follow-up), fed by the same in-process ADMIN client:
 	// referenced TLS Secrets are fetched by name under it, so key bytes only
-	// ever live in the control-plane process and no RBAC is widened. The
-	// listeners bind the node's own InternalIP through the shared netbind seam:
-	// privileged 80/443 go through the netd helper when unprivileged —
-	// authorized because kube-system/k3sm-ingress (the canonical LoadBalancer
-	// Service ingresshost provisions) declares those ports — or directly as
-	// root; --ingress-http-port/--ingress-https-port select the explicit
-	// high-port integration mode (never a silent fallback).
+	// ever live in the control-plane process and no RBAC is widened.
+	// --ingress-http-port/--ingress-https-port select the explicit high-port
+	// integration mode (never a silent fallback).
 	//
-	// 4e: svclb (klipper-lite, B32) binds nodeIP:port listeners for every
-	// LoadBalancer Service and splices them to the Service's ClusterIP VIP,
-	// advertising status.loadBalancer ONLY once a listener is actually bound.
+	// 4e: svclb (klipper-lite, B32) binds *:port listeners for every LoadBalancer
+	// Service and splices them to the Service's ClusterIP VIP, advertising
+	// status.loadBalancer ONLY once a listener is actually bound.
+	//
+	// ORDER IS LOAD-BEARING: the ingress host is started BEFORE svclb, so the
+	// ingress listeners take 80/443 first if a user LoadBalancer Service also
+	// claims them (svclb additionally has an apiserver informer cache-sync to
+	// complete before its first bind). The reserved-port set deliberately does
+	// NOT include 80/443 — those are legitimate LoadBalancer ports — so the
+	// residual race is a documented ceiling, not a guarded invariant.
 	if mode.DataPath() {
-		if nodeAddr, err := netip.ParseAddr(opts.nodeIP); err != nil {
-			logger.Error("ingress + svclb hosting disabled: node IP does not parse", "node-ip", opts.nodeIP, "err", err)
+		lbCfg, ingressCfg, err := lbHostingConfigs(cs, nodeOpts, opts.ingressHTTPPort, opts.ingressHTTPSPort, logger)
+		if err != nil {
+			logger.Error("ingress + svclb hosting disabled", "err", err)
 		} else {
-			// One privileged-bind backend selection, mirroring netserve's: the
-			// netd helper when unprivileged, the direct in-process bind as root.
-			var privBinder netbind.Binder = netbind.Direct{}
-			if mode.UsesHelper() {
-				privBinder = &netbind.Netd{Client: wire.NewClient(mode.Socket)}
-			}
-			if opts.ingressHTTPPort != 0 || opts.ingressHTTPSPort != 0 {
-				ih, err := ingresshost.New(ingresshost.Config{
-					Client:    cs,
-					NodeIP:    nodeAddr,
-					HTTPPort:  uint16(opts.ingressHTTPPort),
-					HTTPSPort: uint16(opts.ingressHTTPSPort),
-					Binder:    privBinder, // helper mode: EVERY ingress bind goes through the daemon (darwin-net's documented contract)
-					Logger:    logger,
-				})
+			// Ensure the advertised address answers on this host BEFORE anything
+			// advertises it (the wildcard listener cannot witness it).
+			ensureAdvertisedNodeAlias(ctx, nodeOpts, logger)
+			if ingressCfg.HTTPPort != 0 || ingressCfg.HTTPSPort != 0 {
+				ih, err := ingresshost.New(ingressCfg)
 				if err != nil {
 					logger.Error("ingress hosting disabled", "err", err)
 				} else {
@@ -554,12 +586,7 @@ func runServer(args []string) error {
 			} else {
 				logger.Info("ingress hosting disabled (--ingress-http-port 0 --ingress-https-port 0)")
 			}
-			lb, err := svclb.New(svclb.Config{
-				Client:           cs,
-				NodeIP:           nodeAddr,
-				PrivilegedBinder: privBinder,
-				Logger:           logger,
-			})
+			lb, err := svclb.New(lbCfg)
 			if err != nil {
 				logger.Error("svclb disabled", "err", err)
 			} else {
@@ -574,20 +601,7 @@ func runServer(args []string) error {
 
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
-	return startNode(ctx, nodeOptions{
-		kubeconfig: exec.Kubeconfig(),
-		nodeName:   opts.nodeName,
-		listen:     ":10250",
-		podRoot:    opts.podRoot,
-		nodeIP:     opts.nodeIP,
-		runtime:    opts.rtName,
-		dnsShim:    opts.dnsShim,
-		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
-		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)
-		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
-	})
+	return startNode(ctx, nodeOpts)
 }
 
 // writeAPIServerServingCert issues the apiserver's serving cert from the cluster CA
