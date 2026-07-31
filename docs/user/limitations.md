@@ -74,10 +74,18 @@ Today at `main`, per port class:
 - **LoadBalancer / Ingress** — bound to `127.0.0.1`, so only processes on this Mac can reach them,
   while `kubectl get svc` advertises the node's InternalIP as `EXTERNAL-IP`. That mismatch is a known
   bug: the advertised address is not the address the listener is on. **Planned (`B116`)**: the
-  listeners move to the wildcard — matching Docker Desktop and k3s, both of which publish
-  LoadBalancer ports on all interfaces — and the advertised address becomes truthful. After that
-  change LB and Ingress ports are reachable from your LAN, so treat a LoadBalancer Service as
-  publishing to the local network, not to the host alone.
+  listeners move to the wildcard, matching Docker Desktop and k3s, which both publish LoadBalancer
+  ports on all interfaces.
+
+  Read the two halves of that change separately, because they are not the same address. The **port**
+  becomes reachable on every interface the Mac has, including its LAN address — so treat a
+  LoadBalancer Service as publishing to the local network, not to the host alone. The **advertised
+  `EXTERNAL-IP`** stays the node's InternalIP, which is an RFC-6598 (`100.64.0.0/10`) alias on `lo0`:
+  reachable from this Mac, from local pods, and from mesh peers over WireGuard, but **not routable
+  from your LAN** — a LAN client has no route to `100.64/10` and must dial the Mac's own LAN address
+  instead. This differs from both analogs: k3s advertises the node's real LAN address, and Docker
+  Desktop advertises the literal hostname `localhost`. If you need a LAN-usable value in
+  `status.loadBalancer.ingress`, that is not what k3sm publishes today.
 
 `spec.loadBalancerSourceRanges` is **accepted and silently ignored** today — setting it does not
 restrict anything. **Planned (`B131`)**. When it lands it is an authorization check at the accept
