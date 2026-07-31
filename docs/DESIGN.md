@@ -51,7 +51,7 @@ Two load-bearing reuses make this feasible: **Virtual Kubelet** (CNCF) reimpleme
 
 ```
 k3sm server (control-plane Mac; also a worker)            ── one app-bundle-wrapped binary (CGO=1: kine sqlite)
-  ├─ kine (goroutine) → unix socket (SQLite ≥0.15, WAL)   ConsistentListFromCache=false until soak-validated
+  ├─ kine (goroutine) → unix socket (SQLite, WAL)         ConsistentListFromCache GA-locked true (§5c; soak owed)
   ├─ kube-apiserver / kube-scheduler / kube-controller-manager (goroutines via New*Command, KCM --controllers scoped)
   ├─ supervisor HTTP (/v1-k3sm/*: token + node-password + HTTP-CSR + mesh-enroll)
   ├─ CoreDNS · userspace Service proxy · wireguard-go (goroutines)
@@ -157,7 +157,7 @@ Local dev does **not** need this (the `go.work` resolves all four modules from l
 
 ## 8. Top risks (verified) + mitigations
 1. **Isolation depends on private/deprecated `sandbox-exec`/`libsandbox` SPI** (no removal date, but unsupported). → Swappable backend + `libsandbox` in-proc path + `uidjail` + `vm`; CI symbol-canary on every macOS build; abstract so the engine is replaceable.
-2. **kine `ConsistentListFromCache` staleness (k3s 1.31–1.33 band).** → Pin kine ≥0.15, gate `ConsistentListFromCache=false`, multi-day watch-staleness soak in CI before trusting it.
+2. **kine `ConsistentListFromCache` staleness (k3s 1.31–1.33 band).** → Pin kine per posture (§5c). The `=false` half of this mitigation is **no longer available** — the gate is GA-locked `true` upstream and the apiserver refuses to start with it `false` — so the multi-day single-node watch-staleness soak is now the **only** remaining mitigation, and it is still owed (tracked internally). *(Corrected 2026-07-31: this line prescribed `ConsistentListFromCache=false` and `≥0.15`, both of which §5c already records as superseded.)*
 3. **Node verbs + apiserver→node trust are unbuilt provider work; KCM assumes real kubelets.** → Provider implements logs/exec/top; define kubelet-serving CSR/CA story; scope KCM `--controllers`.
 4. **Same-node pods are one OS trust domain (no net/pid namespaces); a pod can bind another's IP.** → Document trust model; `vm` RuntimeClass for untrusted tenancy; bind-discipline + pf filter verification for honest pods.
 5. **Shipping: restricted NE capability + bare-daemon-can't-hold-a-profile; quarantine-gap could close.** → App-bundle-wrapped daemon on **raw root utun/pf (no NE)**; ad-hoc-sign-on-pull; keep a notarized-images-only mode; instrument every macOS beta for AMFI/Gatekeeper/NE changes. *(Maintenance reality: k3sm runs a darwin/cgo-free k8s config that k3s doesn't ship → we own 100% of regression testing; ~30+ staging `replace`s kept in lockstep per k8s bump.)*
