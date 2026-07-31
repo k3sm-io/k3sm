@@ -466,32 +466,61 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 	}
 }
 
-// buildPodNetAdapter constructs the node's ONE podnet.Network (darwin-net stays
-// the sole node-/24 allocator) and wraps it in the provider adapter that
-// bridges it into runtimed's PodNetwork + startup-reconcile seams (M10.1). The
-// lo0 alias plumbing follows the resolved host-network backend: the netd helper
-// when unprivileged, the direct root-gated manager otherwise. It returns nil
-// (no adapter — runtimed keeps podIP ≈ nodeIP) only for the EXPLICIT
-// no-datapath backend (`--network none`, control-plane-only/CI); a missing
-// podCIDR with a datapath is a fail-fast error, never a fallback.
-func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
-	if !opts.netMode.DataPath() {
-		return nil, nil
-	}
+// buildPodNetwork constructs a podnet.Network over the node's /24 with the alias
+// backend the resolved host-network mode selects (the netd helper when
+// unprivileged, the direct root-gated manager otherwise). It is the ONE place
+// those podnet.Options are assembled, so a future option cannot reach one call
+// site and miss the other.
+//
+// TWO call sites construct one (they are the same in this process):
+//
+//   - buildPodNetAdapter, below — the node's ALLOCATING Network. darwin-net stays
+//     the sole node-/24 allocator, and this is the instance that holds that
+//     allocator's state.
+//   - ensureAdvertisedNodeAlias (server.go step 4d) — a stateless throwaway used
+//     ONLY for EnsureNodeAlias, which touches the alias manager and nothing else:
+//     the node's .1 lies outside the allocator's [.2,.254] range, so no IPAM state
+//     is read or written and the two instances cannot disagree about any pod's IP.
+//
+// The safety of a second instance rests on that ONE property (alias-only use), not
+// on call ordering: podnet's mutex is per-Network, so two instances serialize
+// nothing between them. Today the call sites are strictly sequential within
+// runServer (step 4d completes before step 5 builds the adapter) and the alias
+// operation is idempotent besides, but do NOT rely on that — if a second
+// construction ever needs Setup/Teardown/SweepStale, share the allocating instance
+// instead of building another.
+func buildPodNetwork(opts nodeOptions, log *slog.Logger) (*podnet.Network, error) {
 	if opts.podCIDR == "" {
-		return nil, fmt.Errorf("runtimed pod network needs the node podCIDR (the enrolled /24) and none was configured")
+		return nil, fmt.Errorf("pod network needs the node podCIDR (the enrolled /24) and none was configured")
 	}
 	prefix, err := netip.ParsePrefix(opts.podCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("parse node podCIDR %q: %w", opts.podCIDR, err)
 	}
-	var popts []podnet.Option
+	popts := []podnet.Option{podnet.WithLogger(log)}
 	if opts.netMode.UsesHelper() {
 		popts = append(popts, podnet.WithNetdHelper(opts.netMode.Socket))
 	}
 	nw, err := podnet.New(prefix, popts...)
 	if err != nil {
 		return nil, fmt.Errorf("build pod network for %s: %w", opts.podCIDR, err)
+	}
+	return nw, nil
+}
+
+// buildPodNetAdapter constructs the node's one ALLOCATING podnet.Network (see
+// buildPodNetwork) and wraps it in the provider adapter that bridges it into
+// runtimed's PodNetwork + startup-reconcile seams (M10.1). It returns nil (no
+// adapter — runtimed keeps podIP ≈ nodeIP) only for the EXPLICIT no-datapath
+// backend (`--network none`, control-plane-only/CI); a missing podCIDR with a
+// datapath is a fail-fast error, never a fallback.
+func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
+	if !opts.netMode.DataPath() {
+		return nil, nil
+	}
+	nw, err := buildPodNetwork(opts, slog.Default())
+	if err != nil {
+		return nil, err
 	}
 	return provider.NewPodNetAdapter(nw, opts.nodeIP, slog.Default()), nil
 }

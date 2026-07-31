@@ -155,20 +155,12 @@ func ensureAdvertisedNodeAlias(ctx context.Context, opts nodeOptions, log *slog.
 		log.Error("advertised node address does not parse; lo0 alias not ensured", "addr", derived, "err", err)
 		return
 	}
-	prefix, err := netip.ParsePrefix(opts.podCIDR)
-	if err != nil {
-		log.Error("node podCIDR does not parse; advertised lo0 alias not ensured", "pod-cidr", opts.podCIDR, "err", err)
-		return
-	}
-	// A second podnet.Network over the same /24 is deliberate and safe: only its
-	// alias manager is used (EnsureNodeAlias touches no IPAM state, and the .1 is
-	// outside the allocator's [.2,.254] range), and the node's ONE allocator is
-	// still the adapter startNode builds.
-	popts := []podnet.Option{podnet.WithLogger(log)}
-	if opts.netMode.UsesHelper() {
-		popts = append(popts, podnet.WithNetdHelper(opts.netMode.Socket))
-	}
-	nw, err := podnet.New(prefix, popts...)
+	// A SECOND podnet.Network over the same /24, built through the shared
+	// buildPodNetwork so the two constructions cannot drift on podnet.Options.
+	// This instance is a stateless throwaway used ONLY for EnsureNodeAlias — see
+	// buildPodNetwork's doc for why that is safe and what would make it unsafe.
+	// The node's one ALLOCATING Network is still the adapter startNode builds.
+	nw, err := buildPodNetwork(opts, log)
 	if err != nil {
 		log.Error("build pod network for the advertised lo0 alias", "pod-cidr", opts.podCIDR, "err", err)
 		return
