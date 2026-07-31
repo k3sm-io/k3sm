@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -51,6 +52,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/policy"
+	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/runtimeclass"
@@ -119,6 +121,19 @@ type nodeOptions struct {
 	netMode hostnet.Mode
 }
 
+// serverKubeletListen is the kubelet HTTP API listen address the in-process node
+// of `k3sm server` and `k3sm agent` uses: the WILDCARD on the kubelet API port,
+// so the apiserver node-proxy reaches it at whatever address the node advertises.
+// nodeKubeletListen is the standalone `k3sm node` default (loopback-scoped).
+//
+// Both are built from ports.KubeletAPIPort — the port was two bare literals inside
+// address strings before B116, with no constant anywhere, while it is one of the
+// two wildcard listeners the reserved-port guard exists to protect.
+var (
+	serverKubeletListen = ":" + strconv.Itoa(ports.KubeletAPIPort)
+	nodeKubeletListen   = loopbackNodeIP + ":" + strconv.Itoa(ports.KubeletAPIPort)
+)
+
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
 // selected runtime (M0 walking skeleton + M1 runtimed image runtime).
 func runNode(args []string) error {
@@ -126,7 +141,7 @@ func runNode(args []string) error {
 	opts := nodeOptions{}
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
-	fs.StringVar(&opts.listen, "listen", "127.0.0.1:10250", "address for the kubelet HTTP API (logs/exec)")
+	fs.StringVar(&opts.listen, "listen", nodeKubeletListen, "address for the kubelet HTTP API (logs/exec)")
 	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
 	addRuntimeFlag(fs, &opts.runtime)
@@ -182,6 +197,52 @@ func defaultNodePodCIDR() string {
 // runs net.IP.IsGlobalUnicast(), which loopback fails — with HTTP 400, breaking
 // `kubectl top node` (GET /nodes/<n>/proxy/stats/summary).
 const loopbackNodeIP = "127.0.0.1"
+
+// isLoopbackDefault reports whether nodeIP is the shipped --node-ip default, i.e.
+// the operator did not choose an address. It is the ONE value predicate all four
+// call sites share (server.go's mesh rewrite and its apiserver-VIP-backend pin,
+// node.go's advertise derivation, and the LB/ingress config assembly) — a
+// flag.Visit-style "was it set?" predicate would diverge from it the moment a
+// caller passes 127.0.0.1 explicitly, and a bare "127.0.0.1" literal (which one
+// site carried) diverges from the const the moment the default moves.
+//
+// The predicate is shared; the DECISIONS keyed on it are NOT. A mesh server
+// rewrites the loopback default to --mesh-ip; a datapath node derives the pod
+// /24's mesh-egress .1. They must stay separate, and the derivation must run
+// STRICTLY AFTER the mesh rewrite (see advertisedNodeIP): applied first, a mesh
+// server would advertise 100.64.0.1 while its peers know it by its mesh IP.
+func isLoopbackDefault(nodeIP string) bool {
+	return nodeIP == loopbackNodeIP
+}
+
+// derivedNodeAdvertiseIP returns the address DERIVED for this node (the pod /24's
+// reserved mesh-egress .1), or "" when no derivation applies — because the node
+// runs no datapath, because the operator chose an explicit --node-ip (or the mesh
+// rewrite already replaced the loopback default with --mesh-ip), or because the
+// podCIDR does not yield one.
+//
+// It is deliberately distinct from advertisedNodeIP: only a DERIVED address is a
+// pod-CIDR /32 this node must alias on lo0 to answer for. An explicit --node-ip or
+// a mesh IP is the operator's/mesh's address and must never be aliased on lo0 here.
+func derivedNodeAdvertiseIP(opts nodeOptions) string {
+	if !opts.netMode.DataPath() || !isLoopbackDefault(opts.nodeIP) {
+		return ""
+	}
+	return nodeInternalIP(opts.podCIDR)
+}
+
+// advertisedNodeIP is the address this node advertises: the derived mesh-egress
+// .1 when the derivation applies, else opts.nodeIP verbatim (an explicit
+// --node-ip, or the --mesh-ip the server already substituted). It is the SINGLE
+// function both startNode (which stamps it on the Node object, the kubelet
+// serving-cert SANs and the podnet adapter) and lbHostingConfigs (which publishes
+// it as EXTERNAL-IP) call, so the two cannot disagree about what this node is.
+func advertisedNodeIP(opts nodeOptions) string {
+	if ip := derivedNodeAdvertiseIP(opts); ip != "" {
+		return ip
+	}
+	return opts.nodeIP
+}
 
 // nodeInternalIP derives the globally-unicast address the VK node advertises as
 // its NodeInternalIP from the node's pod /24: the reserved mesh-egress /32 (.1,
@@ -259,11 +320,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// kubernetes endpoint is unaffected — and flows to the node's advertised
 	// address, its kubelet serving-cert SANs, and the adapter's node alias. An
 	// explicit --node-ip (e.g. --mesh-ip, already globally-unicast) is honored.
-	if opts.netMode.DataPath() && opts.nodeIP == loopbackNodeIP {
-		if ip := nodeInternalIP(opts.podCIDR); ip != "" {
-			opts.nodeIP = ip
-		}
-	}
+	opts.nodeIP = advertisedNodeIP(opts)
 
 	restCfg, err := clientcmd.BuildConfigFromFlags("", opts.kubeconfig)
 	if err != nil {
@@ -697,7 +754,7 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 		{Type: corev1.NodeInternalIP, Address: ip},
 		{Type: corev1.NodeHostName, Address: name},
 	}
-	n.Status.DaemonEndpoints.KubeletEndpoint.Port = 10250
+	n.Status.DaemonEndpoints.KubeletEndpoint.Port = ports.KubeletAPIPort
 
 	// Provider taint: the load-bearing placement guard. Only pods that tolerate
 	// k3sm.io/provider:NoSchedule (the darwin workloads the server provisions a

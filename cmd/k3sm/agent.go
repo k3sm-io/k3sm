@@ -167,7 +167,7 @@ func runAgent(args []string) error {
 	return startNode(ctx, nodeOptions{
 		kubeconfig: kubeconfigPath,
 		nodeName:   opts.nodeName,
-		listen:     ":10250",
+		listen:     serverKubeletListen,
 		podRoot:    opts.podRoot,
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
