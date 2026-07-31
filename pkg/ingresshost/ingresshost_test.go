@@ -431,3 +431,84 @@ func TestIngressHostRetractsWhenNotServing(t *testing.T) {
 		t.Errorf("canonical LB service status = %+v, want retracted once the listeners are gone", svc.Status.LoadBalancer.Ingress)
 	}
 }
+
+// TestIngressHostDoesNotRetractBeforeItEverAdvertises pins the first-advertise
+// latch. serving is FALSE at construction and THREE independent producers can
+// kick the status writer before the first bind completes (the Watcher's
+// OnTLSSecrets callback, countingBinder, serveLoop), so retracting on a bare
+// !serving observation transiently EMPTIES status.loadBalancer on every
+// k3sm-class Ingress and on the canonical LB Service at each ordinary
+// `launchctl kickstart -k` — a self-inflicted outage window on a healthy
+// restart.
+//
+// The invariant: a !serving observation retracts only once this run has actually
+// advertised, i.e. only when live listeners were genuinely LOST. The "never bound
+// at all" case is covered instead by serveLoop's definitive terminal retraction
+// (unconditional, once the bounded retry is exhausted), so a stale entry from a
+// previous run is still cleaned up — just not from a pre-bind kick.
+func TestIngressHostDoesNotRetractBeforeItEverAdvertises(t *testing.T) {
+	own := ClassName
+	mine := classIngress("default", "mine", &own)
+	// What a healthy previous run left behind, and what this run will re-advertise.
+	mine.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{{IP: testAdvertiseAddr.String()}}
+	cs := fake.NewClientset(mine)
+	h, _ := newTestHost(t, cs, 80, 443)
+	ctx := context.Background()
+	if err := h.ensureLBService(ctx); err != nil {
+		t.Fatalf("ensureLBService: %v", err)
+	}
+
+	// The pre-first-bind kicks: serving is still false.
+	h.syncStatus(ctx)
+	h.syncStatus(ctx)
+
+	got, _ := cs.NetworkingV1().Ingresses("default").Get(ctx, "mine", metav1.GetOptions{})
+	if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != testAdvertiseAddr.String() {
+		t.Errorf("ingress status = %+v, want the previous advertisement UNTOUCHED: a kick before the first bind must not empty it (restart flapping)", got.Status.LoadBalancer.Ingress)
+	}
+
+	// Once the listeners bind, the latch arms and a genuine loss retracts.
+	h.serving.Store(true)
+	h.syncStatus(ctx)
+	if !h.advertised.Load() {
+		t.Fatal("the latch must arm on the first successful advertise")
+	}
+	h.serving.Store(false)
+	h.syncStatus(ctx)
+	got, _ = cs.NetworkingV1().Ingresses("default").Get(ctx, "mine", metav1.GetOptions{})
+	if len(got.Status.LoadBalancer.Ingress) != 0 {
+		t.Errorf("ingress status = %+v, want retracted once live listeners are LOST", got.Status.LoadBalancer.Ingress)
+	}
+}
+
+// TestIngressHostRetractsImmediatelyWithNoDerivableAddress pins the other side of
+// the latch: an invalid AdvertiseAddr is STATIC for the whole run — this host will
+// never advertise — so there is no race to protect against and a stale entry from
+// a previous run is retracted on the first sync, latch or no latch.
+func TestIngressHostRetractsImmediatelyWithNoDerivableAddress(t *testing.T) {
+	own := ClassName
+	mine := classIngress("default", "mine", &own)
+	mine.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
+		{IP: "100.64.0.1"}, {IP: "203.0.113.9"},
+	}
+	cs := fake.NewClientset(mine)
+	h, err := New(Config{
+		Client:        cs,
+		BindAddr:      testBindAddr,
+		AdvertiseAddr: netip.Addr{},
+		PodCIDR:       testPodCIDR,
+		HTTPPort:      80,
+		HTTPSPort:     443,
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	h.syncStatus(ctx) // not serving, never advertised — but the address is undecidable
+
+	got, _ := cs.NetworkingV1().Ingresses("default").Get(ctx, "mine", metav1.GetOptions{})
+	if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != "203.0.113.9" {
+		t.Errorf("ingress status = %+v, want the stale pod-space entry retracted and the foreign one kept", got.Status.LoadBalancer.Ingress)
+	}
+}

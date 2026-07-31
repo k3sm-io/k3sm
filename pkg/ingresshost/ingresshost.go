@@ -121,6 +121,16 @@ type Host struct {
 	// advertise — never a dead address). boundCount counts the attempt's binds.
 	serving    atomic.Bool
 	boundCount atomic.Int32
+	// advertised latches TRUE the first time this run actually writes a status.
+	// serving is FALSE at construction and three independent producers can kick
+	// the status writer before the first bind completes (the Watcher's
+	// OnTLSSecrets callback, countingBinder, serveLoop), so retracting on a bare
+	// !serving observation would transiently EMPTY status.loadBalancer on every
+	// k3sm-class Ingress and on the canonical LB Service at each ordinary
+	// `launchctl kickstart -k`. The latch makes the !serving retraction mean
+	// "we advertised and then LOST the listeners", which is the only case a
+	// transition-triggered retraction can honestly claim.
+	advertised atomic.Bool
 	// statusKick coalesces status-sync triggers (reconcile events + listener
 	// transitions). Buffered 1; sends are non-blocking.
 	statusKick chan struct{}
@@ -264,10 +274,16 @@ func (h *Host) serveLoop(ctx context.Context) {
 		}
 		if !errors.Is(err, ingress.ErrBind) {
 			h.log.Error("ingress server stopped", "err", err)
+			h.retractStatus(ctx)
 			return
 		}
 		if attempt >= len(bindRetrySchedule) {
 			h.log.Error("ingress bind retries exhausted; ingress listeners DISABLED until the server restarts (no port fallback — another process or a LoadBalancer Service may hold the wildcard port; check 'lsof -nP -iTCP:<port> -sTCP:LISTEN')", "err", err)
+			// DEFINITIVE, and therefore unconditional: this run will never serve
+			// again. It is the case the advertised latch deliberately excludes from
+			// the transition-triggered path — a host that never bound at all still
+			// has to clear whatever a PREVIOUS run left advertised.
+			h.retractStatus(ctx)
 			return
 		}
 		delay := bindRetrySchedule[attempt]
@@ -406,19 +422,30 @@ func (h *Host) statusLoop(ctx context.Context) {
 // (the explicit high-port integration mode must not claim ports it does not
 // serve).
 func (h *Host) syncStatus(ctx context.Context) {
-	if !h.serving.Load() {
-		// NOT a bare return: the listeners are down, so anything this host
-		// previously advertised is now a dead address. Retract it.
-		h.retractStatus(ctx)
-		return
-	}
 	if !h.cfg.AdvertiseAddr.IsValid() {
-		// Serving, but there is no honest address to publish (the node address
-		// could not be derived). Advertise nothing rather than loopback or the
-		// zero Addr's "invalid IP" — and retract anything a previous life wrote.
+		// STATIC, so there is no race to guard against: with no derivable node
+		// address this host will never advertise for the whole run, and anything
+		// a previous life wrote is already dead. Retract it now.
 		h.retractStatus(ctx)
 		return
 	}
+	if !h.serving.Load() {
+		// Retract only once we have actually advertised this run — otherwise this
+		// fires on the pre-first-bind kicks and empties every k3sm-class Ingress
+		// on each restart (see the advertised latch). A host that NEVER binds this
+		// run is handled by serveLoop's definitive terminal retraction instead.
+		if h.advertised.Load() {
+			h.retractStatus(ctx)
+		}
+		return
+	}
+	// We are serving on a derivable address: from here on this run, an observed
+	// !serving is a genuine LOSS of live listeners, so the retraction above is
+	// armed. Latched before the writes rather than after, because a partially
+	// applied sync (some Ingresses updated, then a List/Update error) has still
+	// published this address.
+	h.advertised.Store(true)
+
 	ip := h.cfg.AdvertiseAddr.String()
 	ings, err := h.cfg.Client.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
