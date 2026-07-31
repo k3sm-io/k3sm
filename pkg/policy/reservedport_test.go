@@ -18,6 +18,7 @@ package policy
 
 import (
 	"context"
+	"flag"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -244,18 +245,35 @@ func TestEnsureRejectReservedLoadBalancerPortShape(t *testing.T) {
 	}
 }
 
+// updateGolden regenerates the golden CEL instead of comparing against it:
+//
+//	go test ./pkg/policy/ -run TestReservedLoadBalancerPortGolden -update
+//
+// It exists because the alternative to a working regeneration path is a reviewer
+// hand-editing the golden file to match the code — which is exactly the "every
+// CEL change is a reviewed diff" property the golden is here to provide.
+var updateGolden = flag.Bool("update", false, "rewrite the golden CEL files from the current expressions")
+
 // TestReservedLoadBalancerPortGolden pins the exact rendered CEL against a golden
 // file, so any change to the expression is a visible, reviewed diff rather than an
-// invisible semantic drift. Regenerate with -update after a DELIBERATE change.
+// invisible semantic drift. Regenerate with -update after a DELIBERATE change,
+// then review the resulting diff.
 func TestReservedLoadBalancerPortGolden(t *testing.T) {
 	golden := filepath.Join("testdata", "reserved-loadbalancer-port.cel")
 	got := reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort) + "\n" +
 		reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort) + "\n"
+	if *updateGolden {
+		if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden %s: %v", golden, err)
+		}
+		t.Logf("golden %s regenerated; REVIEW THE DIFF before committing", golden)
+		return
+	}
 	want, err := os.ReadFile(golden)
 	if err != nil {
-		t.Fatalf("read golden %s: %v", golden, err)
+		t.Fatalf("read golden %s: %v (regenerate with -update)", golden, err)
 	}
 	if string(want) != got {
-		t.Errorf("rendered CEL differs from %s\n--- got ---\n%s\n--- want ---\n%s", golden, got, want)
+		t.Errorf("rendered CEL differs from %s (regenerate with -update if the change is deliberate)\n--- got ---\n%s\n--- want ---\n%s", golden, got, want)
 	}
 }
