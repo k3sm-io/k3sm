@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -51,6 +52,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/policy"
+	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/runtimeclass"
@@ -119,6 +121,19 @@ type nodeOptions struct {
 	netMode hostnet.Mode
 }
 
+// serverKubeletListen is the kubelet HTTP API listen address the in-process node
+// of `k3sm server` and `k3sm agent` uses: the WILDCARD on the kubelet API port,
+// so the apiserver node-proxy reaches it at whatever address the node advertises.
+// nodeKubeletListen is the standalone `k3sm node` default (loopback-scoped).
+//
+// Both are built from ports.KubeletAPIPort — the port was two bare literals inside
+// address strings before B116, with no constant anywhere, while it is one of the
+// two wildcard listeners the reserved-port guard exists to protect.
+var (
+	serverKubeletListen = ":" + strconv.Itoa(ports.KubeletAPIPort)
+	nodeKubeletListen   = loopbackNodeIP + ":" + strconv.Itoa(ports.KubeletAPIPort)
+)
+
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
 // selected runtime (M0 walking skeleton + M1 runtimed image runtime).
 func runNode(args []string) error {
@@ -126,7 +141,7 @@ func runNode(args []string) error {
 	opts := nodeOptions{}
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
-	fs.StringVar(&opts.listen, "listen", "127.0.0.1:10250", "address for the kubelet HTTP API (logs/exec)")
+	fs.StringVar(&opts.listen, "listen", nodeKubeletListen, "address for the kubelet HTTP API (logs/exec)")
 	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
 	addRuntimeFlag(fs, &opts.runtime)
@@ -182,6 +197,52 @@ func defaultNodePodCIDR() string {
 // runs net.IP.IsGlobalUnicast(), which loopback fails — with HTTP 400, breaking
 // `kubectl top node` (GET /nodes/<n>/proxy/stats/summary).
 const loopbackNodeIP = "127.0.0.1"
+
+// isLoopbackDefault reports whether nodeIP is the shipped --node-ip default, i.e.
+// the operator did not choose an address. It is the ONE value predicate all four
+// call sites share (server.go's mesh rewrite and its apiserver-VIP-backend pin,
+// node.go's advertise derivation, and the LB/ingress config assembly) — a
+// flag.Visit-style "was it set?" predicate would diverge from it the moment a
+// caller passes 127.0.0.1 explicitly, and a bare "127.0.0.1" literal (which one
+// site carried) diverges from the const the moment the default moves.
+//
+// The predicate is shared; the DECISIONS keyed on it are NOT. A mesh server
+// rewrites the loopback default to --mesh-ip; a datapath node derives the pod
+// /24's mesh-egress .1. They must stay separate, and the derivation must run
+// STRICTLY AFTER the mesh rewrite (see advertisedNodeIP): applied first, a mesh
+// server would advertise 100.64.0.1 while its peers know it by its mesh IP.
+func isLoopbackDefault(nodeIP string) bool {
+	return nodeIP == loopbackNodeIP
+}
+
+// derivedNodeAdvertiseIP returns the address DERIVED for this node (the pod /24's
+// reserved mesh-egress .1), or "" when no derivation applies — because the node
+// runs no datapath, because the operator chose an explicit --node-ip (or the mesh
+// rewrite already replaced the loopback default with --mesh-ip), or because the
+// podCIDR does not yield one.
+//
+// It is deliberately distinct from advertisedNodeIP: only a DERIVED address is a
+// pod-CIDR /32 this node must alias on lo0 to answer for. An explicit --node-ip or
+// a mesh IP is the operator's/mesh's address and must never be aliased on lo0 here.
+func derivedNodeAdvertiseIP(opts nodeOptions) string {
+	if !opts.netMode.DataPath() || !isLoopbackDefault(opts.nodeIP) {
+		return ""
+	}
+	return nodeInternalIP(opts.podCIDR)
+}
+
+// advertisedNodeIP is the address this node advertises: the derived mesh-egress
+// .1 when the derivation applies, else opts.nodeIP verbatim (an explicit
+// --node-ip, or the --mesh-ip the server already substituted). It is the SINGLE
+// function both startNode (which stamps it on the Node object, the kubelet
+// serving-cert SANs and the podnet adapter) and lbHostingConfigs (which publishes
+// it as EXTERNAL-IP) call, so the two cannot disagree about what this node is.
+func advertisedNodeIP(opts nodeOptions) string {
+	if ip := derivedNodeAdvertiseIP(opts); ip != "" {
+		return ip
+	}
+	return opts.nodeIP
+}
 
 // nodeInternalIP derives the globally-unicast address the VK node advertises as
 // its NodeInternalIP from the node's pod /24: the reserved mesh-egress /32 (.1,
@@ -259,11 +320,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// kubernetes endpoint is unaffected — and flows to the node's advertised
 	// address, its kubelet serving-cert SANs, and the adapter's node alias. An
 	// explicit --node-ip (e.g. --mesh-ip, already globally-unicast) is honored.
-	if opts.netMode.DataPath() && opts.nodeIP == loopbackNodeIP {
-		if ip := nodeInternalIP(opts.podCIDR); ip != "" {
-			opts.nodeIP = ip
-		}
-	}
+	opts.nodeIP = advertisedNodeIP(opts)
 
 	restCfg, err := clientcmd.BuildConfigFromFlags("", opts.kubeconfig)
 	if err != nil {
@@ -409,32 +466,61 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 	}
 }
 
-// buildPodNetAdapter constructs the node's ONE podnet.Network (darwin-net stays
-// the sole node-/24 allocator) and wraps it in the provider adapter that
-// bridges it into runtimed's PodNetwork + startup-reconcile seams (M10.1). The
-// lo0 alias plumbing follows the resolved host-network backend: the netd helper
-// when unprivileged, the direct root-gated manager otherwise. It returns nil
-// (no adapter — runtimed keeps podIP ≈ nodeIP) only for the EXPLICIT
-// no-datapath backend (`--network none`, control-plane-only/CI); a missing
-// podCIDR with a datapath is a fail-fast error, never a fallback.
-func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
-	if !opts.netMode.DataPath() {
-		return nil, nil
-	}
+// buildPodNetwork constructs a podnet.Network over the node's /24 with the alias
+// backend the resolved host-network mode selects (the netd helper when
+// unprivileged, the direct root-gated manager otherwise). It is the ONE place
+// those podnet.Options are assembled, so a future option cannot reach one call
+// site and miss the other.
+//
+// TWO call sites construct one (they are the same in this process):
+//
+//   - buildPodNetAdapter, below — the node's ALLOCATING Network. darwin-net stays
+//     the sole node-/24 allocator, and this is the instance that holds that
+//     allocator's state.
+//   - ensureAdvertisedNodeAlias (server.go step 4d) — a stateless throwaway used
+//     ONLY for EnsureNodeAlias, which touches the alias manager and nothing else:
+//     the node's .1 lies outside the allocator's [.2,.254] range, so no IPAM state
+//     is read or written and the two instances cannot disagree about any pod's IP.
+//
+// The safety of a second instance rests on that ONE property (alias-only use), not
+// on call ordering: podnet's mutex is per-Network, so two instances serialize
+// nothing between them. Today the call sites are strictly sequential within
+// runServer (step 4d completes before step 5 builds the adapter) and the alias
+// operation is idempotent besides, but do NOT rely on that — if a second
+// construction ever needs Setup/Teardown/SweepStale, share the allocating instance
+// instead of building another.
+func buildPodNetwork(opts nodeOptions, log *slog.Logger) (*podnet.Network, error) {
 	if opts.podCIDR == "" {
-		return nil, fmt.Errorf("runtimed pod network needs the node podCIDR (the enrolled /24) and none was configured")
+		return nil, fmt.Errorf("pod network needs the node podCIDR (the enrolled /24) and none was configured")
 	}
 	prefix, err := netip.ParsePrefix(opts.podCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("parse node podCIDR %q: %w", opts.podCIDR, err)
 	}
-	var popts []podnet.Option
+	popts := []podnet.Option{podnet.WithLogger(log)}
 	if opts.netMode.UsesHelper() {
 		popts = append(popts, podnet.WithNetdHelper(opts.netMode.Socket))
 	}
 	nw, err := podnet.New(prefix, popts...)
 	if err != nil {
 		return nil, fmt.Errorf("build pod network for %s: %w", opts.podCIDR, err)
+	}
+	return nw, nil
+}
+
+// buildPodNetAdapter constructs the node's one ALLOCATING podnet.Network (see
+// buildPodNetwork) and wraps it in the provider adapter that bridges it into
+// runtimed's PodNetwork + startup-reconcile seams (M10.1). It returns nil (no
+// adapter — runtimed keeps podIP ≈ nodeIP) only for the EXPLICIT no-datapath
+// backend (`--network none`, control-plane-only/CI); a missing podCIDR with a
+// datapath is a fail-fast error, never a fallback.
+func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
+	if !opts.netMode.DataPath() {
+		return nil, nil
+	}
+	nw, err := buildPodNetwork(opts, slog.Default())
+	if err != nil {
+		return nil, err
 	}
 	return provider.NewPodNetAdapter(nw, opts.nodeIP, slog.Default()), nil
 }
@@ -697,7 +783,7 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 		{Type: corev1.NodeInternalIP, Address: ip},
 		{Type: corev1.NodeHostName, Address: name},
 	}
-	n.Status.DaemonEndpoints.KubeletEndpoint.Port = 10250
+	n.Status.DaemonEndpoints.KubeletEndpoint.Port = ports.KubeletAPIPort
 
 	// Provider taint: the load-bearing placement guard. Only pods that tolerate
 	// k3sm.io/provider:NoSchedule (the darwin workloads the server provisions a

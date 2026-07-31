@@ -30,6 +30,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // fakeListener is a bind-only listener: Accept blocks until Close (no real
@@ -86,6 +88,15 @@ func (b *fakeBinder) boundPorts() map[uint16]bool {
 	return out
 }
 
+// The B116 fixture addresses. BIND and ADVERTISE are deliberately DIFFERENT
+// values (and the advertised one lives inside testPodCIDR) so an assertion that
+// accidentally reads the wrong field cannot pass by coincidence.
+var (
+	testBindAddr      = netip.AddrFrom4([4]byte{}) // 0.0.0.0
+	testAdvertiseAddr = netip.MustParseAddr("100.64.2.1")
+	testPodCIDR       = netip.MustParsePrefix("100.64.0.0/10")
+)
+
 // lbService builds a LoadBalancer Service with the given TCP ports.
 func lbService(namespace, name, clusterIP string, ports ...int32) *corev1.Service {
 	svc := &corev1.Service{
@@ -109,7 +120,6 @@ func lbService(namespace, name, clusterIP string, ports ...int32) *corev1.Servic
 // status; and a resolved conflict is advertised on the next reconcile.
 func TestSvclbStatusHonesty(t *testing.T) {
 	ctx := context.Background()
-	nodeIP := netip.MustParseAddr("192.168.7.20")
 
 	newController := func(t *testing.T, binder *fakeBinder, objs ...*corev1.Service) (*Controller, *fake.Clientset, *bytes.Buffer) {
 		t.Helper()
@@ -121,11 +131,13 @@ func TestSvclbStatusHonesty(t *testing.T) {
 		}
 		var buf bytes.Buffer
 		c, err := New(Config{
-			Client:           cs,
-			NodeIP:           nodeIP,
-			Binder:           binder,
-			PrivilegedBinder: binder,
-			Logger:           slog.New(slog.NewTextHandler(&buf, nil)),
+			Client:        cs,
+			BindAddr:      testBindAddr,
+			AdvertiseAddr: testAdvertiseAddr,
+			PodCIDR:       testPodCIDR,
+			ReservedPorts: ports.ReservedSet(),
+			Binder:        binder,
+			Logger:        slog.New(slog.NewTextHandler(&buf, nil)),
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -153,8 +165,8 @@ func TestSvclbStatusHonesty(t *testing.T) {
 			t.Fatal("the listener must be bound")
 		}
 		st := getStatus(t, cs, "default", "web")
-		if len(st) != 1 || st[0].IP != nodeIP.String() {
-			t.Errorf("status = %+v, want the node IP once the listener is bound", st)
+		if len(st) != 1 || st[0].IP != testAdvertiseAddr.String() {
+			t.Errorf("status = %+v, want the ADVERTISE address once the listener is bound", st)
 		}
 	})
 
@@ -162,7 +174,7 @@ func TestSvclbStatusHonesty(t *testing.T) {
 		binder := &fakeBinder{fail: map[uint16]error{8082: errors.New("address already in use")}}
 		svc := lbService("default", "conflicted", "10.43.0.6", 8082)
 		// A stale advertisement from a previous life must be CLEARED, not kept.
-		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: nodeIP.String()}}
+		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: testAdvertiseAddr.String()}}
 		c, cs, buf := newController(t, binder, svc)
 		defer c.closeAll()
 
@@ -195,8 +207,8 @@ func TestSvclbStatusHonesty(t *testing.T) {
 		delete(binder.fail, 8083)
 		binder.mu.Unlock()
 		c.reconcile(ctx, []*corev1.Service{svc})
-		if st := getStatus(t, cs, "default", "later"); len(st) != 1 || st[0].IP != nodeIP.String() {
-			t.Errorf("status = %+v, want the node IP once the conflict clears", st)
+		if st := getStatus(t, cs, "default", "later"); len(st) != 1 || st[0].IP != testAdvertiseAddr.String() {
+			t.Errorf("status = %+v, want the ADVERTISE address once the conflict clears", st)
 		}
 	})
 
@@ -253,31 +265,108 @@ func TestSvclbStatusHonesty(t *testing.T) {
 		}
 	})
 
-	t.Run("privileged port routes through the privileged binder", func(t *testing.T) {
-		priv := &fakeBinder{}
-		direct := &fakeBinder{}
+	// INVERTED by B116 (was "privileged port routes through the privileged
+	// binder"): the port-keyed binder selection is DELETED. Same fixture — a
+	// Service declaring both a <1024 and a >=1024 port — now asserting the ONE
+	// configured binder takes both. The <1024 half is the load-bearing one: it is
+	// what a wrong diff that only changes the ADDRESS (leaving the privileged
+	// branch live) would break, since netd refuses the wildcard.
+	t.Run("the single in-process binder takes every port, privileged ones included", func(t *testing.T) {
+		binder := &fakeBinder{}
 		cs := fake.NewClientset()
 		svc := lbService("default", "www", "10.43.0.11", 80, 8086)
 		if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 		c, err := New(Config{
-			Client:           cs,
-			NodeIP:           nodeIP,
-			Binder:           direct,
-			PrivilegedBinder: priv,
-			Logger:           slog.New(slog.DiscardHandler),
+			Client:        cs,
+			BindAddr:      testBindAddr,
+			AdvertiseAddr: testAdvertiseAddr,
+			PodCIDR:       testPodCIDR,
+			ReservedPorts: ports.ReservedSet(),
+			Binder:        binder,
+			Logger:        slog.New(slog.DiscardHandler),
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
 		defer c.closeAll()
 		c.reconcile(ctx, []*corev1.Service{svc})
-		if !priv.boundPorts()[80] || priv.boundPorts()[8086] {
-			t.Errorf("priv bound = %v, want exactly {80} (<1024 through the netd seam)", priv.boundPorts())
+		if !binder.boundPorts()[80] || !binder.boundPorts()[8086] {
+			t.Errorf("bound = %v, want BOTH 80 and 8086 through the one configured binder", binder.boundPorts())
 		}
-		if !direct.boundPorts()[8086] || direct.boundPorts()[80] {
-			t.Errorf("direct bound = %v, want exactly {8086} (>=1024 in-process)", direct.boundPorts())
+		// And every one of them on the WILDCARD, not on the advertised address.
+		binder.mu.Lock()
+		defer binder.mu.Unlock()
+		for _, ap := range binder.bound {
+			if ap.Addr() != testBindAddr {
+				t.Errorf("bound %s, want the BIND address %s (never the advertise address)", ap, testBindAddr)
+			}
+		}
+	})
+
+	// D2 — a k3sm-reserved port is REFUSED, not raced. This is the datapath half
+	// of the guard (the Deny VAP is the legible half, and it is failurePolicy:
+	// Ignore, so it may be absent).
+	t.Run("a reserved port is refused: no listener, empty status, warn", func(t *testing.T) {
+		binder := &fakeBinder{}
+		svc := lbService("default", "greedy", "10.43.0.13", 10250)
+		cs := fake.NewClientset()
+		if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		c, err := New(Config{
+			Client:        cs,
+			BindAddr:      testBindAddr,
+			AdvertiseAddr: testAdvertiseAddr,
+			PodCIDR:       testPodCIDR,
+			ReservedPorts: map[int32]bool{10250: true, 30500: true},
+			Binder:        binder,
+			Logger:        slog.New(slog.NewTextHandler(&buf, nil)),
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer c.closeAll()
+		c.reconcile(ctx, []*corev1.Service{svc})
+		if ports := binder.boundPorts(); len(ports) != 0 {
+			t.Errorf("bound ports = %v, want NONE: a reserved port must never reach the binder", ports)
+		}
+		svcOut, err := cs.CoreV1().Services("default").Get(ctx, "greedy", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := svcOut.Status.LoadBalancer.Ingress; len(st) != 0 {
+			t.Errorf("status = %+v, want empty for a refused reserved port", st)
+		}
+		if !strings.Contains(buf.String(), "RESERVED") {
+			t.Errorf("the refusal must Warn naming the reservation; log was:\n%s", buf.String())
+		}
+		if !strings.Contains(buf.String(), "10250") {
+			t.Error("the refusal Warn must name the port")
+		}
+	})
+
+	// The stale-entry case the pre-B116 fixture could not catch: it seeded the
+	// stale IP as the node IP, which the mechanical rename would have kept green
+	// whether or not a retraction rule exists. This entry is NEITHER the bind
+	// address NOR the advertise address — it is what a PREVIOUS podCIDR derived —
+	// and it must still be dropped.
+	t.Run("a stale 127.0.0.1 entry is dropped even though it is neither the bind nor the advertise address", func(t *testing.T) {
+		binder := &fakeBinder{fail: map[uint16]error{8088: errors.New("address already in use")}}
+		svc := lbService("default", "upgraded", "10.43.0.14", 8088)
+		svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
+			{IP: "127.0.0.1"},  // the pre-B116 default an upgraded cluster carries
+			{IP: "100.64.0.1"}, // a PREVIOUS enrollment's derived .1 (podCIDR moved)
+			{IP: "203.0.113.9"} /* a foreign entry: never ours, never touched */}
+		c, cs, _ := newController(t, binder, svc)
+		defer c.closeAll()
+
+		c.reconcile(ctx, []*corev1.Service{svc})
+		st := getStatus(t, cs, "default", "upgraded")
+		if len(st) != 1 || st[0].IP != "203.0.113.9" {
+			t.Errorf("status = %+v, want ONLY the foreign entry: loopback and the previous derived .1 must both be retracted, a foreign address never", st)
 		}
 	})
 
@@ -296,4 +385,160 @@ func TestSvclbStatusHonesty(t *testing.T) {
 			t.Errorf("forwarders = %d, want 0 after the service is removed", len(c.forwarders))
 		}
 	})
+}
+
+// TestSvclbNewValidationAsymmetry pins the B116 construction contract, which had
+// NO test before: BindAddr must be valid but MAY be the wildcard (the production
+// choice — rejecting IsUnspecified here would refuse the shipped configuration),
+// while AdvertiseAddr may be the ZERO Addr, which is the honest "derivation
+// failed" signal rather than an error.
+func TestSvclbNewValidationAsymmetry(t *testing.T) {
+	tests := []struct {
+		name      string
+		bind      netip.Addr
+		advertise netip.Addr
+		wantErr   bool
+	}{
+		{"wildcard bind accepted", netip.AddrFrom4([4]byte{}), testAdvertiseAddr, false},
+		{"specific bind accepted", netip.MustParseAddr("192.168.7.20"), testAdvertiseAddr, false},
+		{"zero bind rejected", netip.Addr{}, testAdvertiseAddr, true},
+		{"zero advertise accepted (bind, never advertise)", netip.AddrFrom4([4]byte{}), netip.Addr{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(Config{
+				Client:        fake.NewClientset(),
+				BindAddr:      tt.bind,
+				AdvertiseAddr: tt.advertise,
+				ReservedPorts: ports.ReservedSet(),
+				Logger:        slog.New(slog.DiscardHandler),
+			})
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("New err = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+	if _, err := New(Config{BindAddr: netip.AddrFrom4([4]byte{}), ReservedPorts: ports.ReservedSet()}); err == nil {
+		t.Error("New must still reject a nil client")
+	}
+
+	// FAIL CLOSED on the zero value of a guard. The reserved-port refusal is the
+	// last of three layers that all fail OPEN (the VAP is failurePolicy: Ignore
+	// and is provisioned log-and-continue), so a nil set must be a construction
+	// ERROR, not a silent "reserve nothing". An explicit empty map is the visible
+	// opt-out.
+	if _, err := New(Config{
+		Client:   fake.NewClientset(),
+		BindAddr: netip.AddrFrom4([4]byte{}),
+		Logger:   slog.New(slog.DiscardHandler),
+	}); err == nil {
+		t.Error("New must REJECT a nil ReservedPorts: the zero value of a guard must not disable it")
+	}
+	if _, err := New(Config{
+		Client:        fake.NewClientset(),
+		BindAddr:      netip.AddrFrom4([4]byte{}),
+		ReservedPorts: map[int32]bool{},
+		Logger:        slog.New(slog.DiscardHandler),
+	}); err != nil {
+		t.Errorf("an EXPLICIT empty ReservedPorts is the sanctioned opt-out, got %v", err)
+	}
+}
+
+// TestSvclbDerivationFailureBindsButNeverAdvertises is gate assert (c) for the
+// svclb half: when the node's advertisable address could NOT be derived, the
+// listeners still bind (the Service is <pending>, not disabled) and the status
+// length is exactly ZERO.
+//
+// It asserts len == 0, deliberately NOT "!= 127.0.0.1": the zero netip.Addr
+// stringifies to "invalid IP", so a controller that published it would satisfy
+// the negative check while advertising an EXTERNAL-IP worse than loopback.
+//
+// The Service is seeded with a STALE entry, not an empty status. An empty seed
+// cannot distinguish "retracted" from "never written", which is exactly how the
+// original version of this code shipped a gap: a fully-bound Service with an
+// underivable advertise address was routed to ensureStatus, which returned early
+// — so clearStatus (and therefore Retractable) never ran and a pre-existing
+// loopback or previous-/24 entry survived forever.
+func TestSvclbDerivationFailureBindsButNeverAdvertises(t *testing.T) {
+	ctx := context.Background()
+	binder := &fakeBinder{}
+	svc := lbService("default", "pending", "10.43.0.15", 8090)
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
+		{IP: "127.0.0.1"},   // a pre-B116 entry an upgraded cluster carries
+		{IP: "100.64.0.1"},  // a previous enrollment's derived .1
+		{IP: "203.0.113.9"}, // foreign: outside the pod space and not loopback
+	}
+	cs := fake.NewClientset()
+	if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Config{
+		Client:        cs,
+		BindAddr:      testBindAddr,
+		AdvertiseAddr: netip.Addr{}, // the derivation failed
+		PodCIDR:       testPodCIDR,
+		ReservedPorts: ports.ReservedSet(),
+		Binder:        binder,
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer c.closeAll()
+
+	c.reconcile(ctx, []*corev1.Service{svc})
+	if !binder.boundPorts()[8090] {
+		t.Error("listeners must STILL bind when the advertise address is undecidable (the Service is <pending>, not disabled)")
+	}
+	out, err := cs.CoreV1().Services("default").Get(ctx, "pending", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lbi := range out.Status.LoadBalancer.Ingress {
+		if lbi.IP == "invalid IP" || lbi.IP == "" {
+			t.Errorf("status carries %q — the zero netip.Addr must never be published", lbi.IP)
+		}
+	}
+	// The retraction MUST have run: a fully-bound Service with no advertisable
+	// address settles into the same state as an unbound one.
+	if len(out.Status.LoadBalancer.Ingress) != 1 || out.Status.LoadBalancer.Ingress[0].IP != "203.0.113.9" {
+		t.Errorf("status = %+v, want ONLY the foreign entry: the stale loopback and previous-/24 entries must be RETRACTED, not merely left unwritten", out.Status.LoadBalancer.Ingress)
+	}
+}
+
+// TestRetractable pins the ONE retraction rule both svclb and ingresshost apply.
+// A single-value comparison against the current advertise address strands both a
+// pre-B116 loopback entry and a previous enrollment's derived .1.
+func TestRetractable(t *testing.T) {
+	podCIDR := netip.MustParsePrefix("100.64.0.0/10")
+	advertise := netip.MustParseAddr("100.64.2.1")
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{"the current advertise address", "100.64.2.1", true},
+		{"a previous enrollment's derived .1", "100.64.0.1", true},
+		{"the pre-B116 loopback default", "127.0.0.1", true},
+		{"another loopback address", "127.0.0.53", true},
+		{"a foreign public address", "203.0.113.9", false},
+		{"a LAN address", "192.168.7.20", false},
+		{"not an address at all", "some-hostname", false},
+		{"empty", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Retractable(podCIDR, advertise, tt.ip); got != tt.want {
+				t.Errorf("Retractable(%s, %s, %q) = %v, want %v", podCIDR, advertise, tt.ip, got, tt.want)
+			}
+		})
+	}
+	// With no podCIDR configured the pod-space arm is simply off; the other two
+	// arms still hold (never a panic, never a widened rule).
+	if Retractable(netip.Prefix{}, advertise, "100.64.0.1") {
+		t.Error("with a zero PodCIDR the pod-space arm must be disabled")
+	}
+	if !Retractable(netip.Prefix{}, advertise, "127.0.0.1") {
+		t.Error("the loopback arm must hold with a zero PodCIDR")
+	}
 }

@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // schedulerCN / controllerManagerCN are the CommonNames of the per-component client
@@ -385,11 +386,18 @@ func apiServerArgs(cfg Config) []string {
 		// Pin the NodePort range to the standard 30000-32767 (the kube-apiserver
 		// default). k3sm's userspace Service proxy binds *:NodePort directly and
 		// in-process as the unprivileged _k3sm user (NOT via the root netd helper,
-		// which rejects wildcards), so every allocated NodePort MUST stay >=1024 or
-		// the bind fails with EACCES. Pinning the range makes that contract explicit
-		// rather than depending on the upstream default never changing; a <1024
-		// NodePort is unsupported by design.
-		"--service-node-port-range", "30000-32767",
+		// which rejects wildcards).
+		//
+		// CORRECTED (B116) — this comment used to claim a <1024 NodePort would fail
+		// EACCES on the wildcard. That is the LINUX rule, and it is false on Darwin:
+		// re-measured on macOS 26, `0.0.0.0:1023` binds fine as an ordinary uid while
+		// `127.0.0.1:1023` returns EACCES — inverted from Linux. So the range is NOT
+		// pinned for a privilege reason; it is pinned so the range k3sm's OWN wildcard
+		// listeners occupy is explicit and single-sourced (pkg/ports), which is what
+		// the reserved-port admission guard and the svclb bind refusal derive from.
+		// The integration canary cmd/k3sm::TestWildcardPrivilegedBindPremise pins the
+		// measured OS behaviour so a future XNU change is loud rather than silent.
+		"--service-node-port-range", ports.NodePortRange(),
 		"--service-account-key-file", saPubPath(wd),
 		"--service-account-signing-key-file", saKeyPath(wd),
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",
