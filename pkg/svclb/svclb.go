@@ -77,9 +77,16 @@ type Config struct {
 	// ReservedPorts is the set of ports k3sm's OWN wildcard listeners occupy (the
 	// NodePort range and the kubelet API port — pkg/ports.ReservedSet). bind
 	// REFUSES them outright rather than racing a k3sm listener for the same
-	// wildcard socket; nil reserves nothing (tests). Admission rejects such a
-	// Service first (pkg/policy) — this is the second, datapath-side enforcement
-	// point, because the VAP is failurePolicy: Ignore and may be absent.
+	// wildcard socket. Admission rejects such a Service first (pkg/policy) — this
+	// is the second, datapath-side enforcement point, because the VAP is
+	// failurePolicy: Ignore and may be absent.
+	//
+	// REQUIRED, and New rejects nil. This is a guard whose other two layers (the
+	// VAP's Ignore failure policy, its log-and-continue provisioning) already fail
+	// OPEN, so letting the ZERO VALUE of this field disable the last one would
+	// point all three the same way. A caller that genuinely wants no reservations
+	// — only a test — passes an explicit empty map, which is a visible opt-out
+	// rather than an omission.
 	ReservedPorts map[int32]bool
 	// Binder opens every listener in-process (no privilege needed: on Darwin a
 	// WILDCARD bind below 1024 does not require root — it is the SPECIFIC-address
@@ -128,6 +135,13 @@ func New(cfg Config) (*Controller, error) {
 	// "derivation failed" signal (bind, never advertise).
 	if !cfg.BindAddr.IsValid() {
 		return nil, fmt.Errorf("svclb: config requires a valid bind address, got %q", cfg.BindAddr)
+	}
+	// Fail CLOSED on the zero value of a guard: a nil set would silently disable
+	// the reserved-port refusal, joining the VAP's Ignore failure policy and its
+	// log-and-continue provisioning in failing open. An empty (non-nil) map is the
+	// explicit opt-out.
+	if cfg.ReservedPorts == nil {
+		return nil, errors.New("svclb: config requires a ReservedPorts set (pass ports.ReservedSet(), or an explicit empty map to reserve nothing)")
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -294,7 +308,15 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 			"service", key, "addr", c.bindAddrPort(p.Port).String(), "advertise", c.advertiseString(), "vip", f.dst.String())
 		bound++
 	}
-	if tcpPorts > 0 && bound == tcpPorts {
+	// A derivable advertise address is part of the "can this Service be
+	// advertised" predicate, not merely an input to it. With no derivable
+	// address there is nothing honest to publish, so the Service settles into
+	// the SAME state as an unbound one — status RETRACTED, not merely left
+	// alone. Routing to ensureStatus here and returning early inside it would
+	// mean clearStatus (and therefore Retractable) never runs, stranding a
+	// pre-existing loopback or previous-/24 entry forever. ingresshost.syncStatus
+	// makes the identical decision; Retractable is the one rule both then apply.
+	if tcpPorts > 0 && bound == tcpPorts && c.cfg.AdvertiseAddr.IsValid() {
 		c.ensureStatus(ctx, svc)
 	} else {
 		c.clearStatus(ctx, svc)
@@ -365,14 +387,11 @@ func (c *Controller) advertiseString() string {
 // process is the single frontend (multi-node svclb is the named follow-up
 // alongside multi-node ingress).
 //
-// When the advertise address could not be derived NOTHING is written: the
-// listeners are bound and serving, but no honest EXTERNAL-IP exists to publish,
-// so the Service stays <pending> rather than advertising loopback (unreachable
-// from anywhere else) or the zero Addr (which stringifies to "invalid IP").
+// PRECONDITION, owned by the caller (reconcileService): AdvertiseAddr is valid.
+// The "is there anything honest to advertise" decision lives at exactly ONE
+// place, so a Service that cannot be advertised is routed to clearStatus rather
+// than silently short-circuiting here.
 func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
-	if !c.cfg.AdvertiseAddr.IsValid() {
-		return
-	}
 	ip := c.cfg.AdvertiseAddr.String()
 	for _, lbi := range svc.Status.LoadBalancer.Ingress {
 		if lbi.IP == ip {
@@ -387,24 +406,46 @@ func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
 }
 
 // Retractable reports whether an existing status.loadBalancer.ingress entry ip
-// belongs to THIS node's advertise identity and must therefore be dropped when
-// the listeners are not (all) bound. It is the ONE retraction rule, exported so
-// the ingress host applies exactly the same predicate to Ingress and canonical
-// LB Service statuses instead of growing a second, drifting copy.
+// must be dropped when this node cannot honestly advertise it. It is the ONE
+// retraction rule, exported so the ingress host applies exactly the same
+// predicate to Ingress and canonical LB Service statuses instead of growing a
+// second, drifting copy.
 //
 // An entry is retractable when it is:
 //
 //   - the CURRENT advertise address (the ordinary case), or
-//   - a loopback address — the pre-B116 default that an upgraded cluster may
+//   - ANY loopback address — the pre-B116 default that an upgraded cluster may
 //     still carry; nothing outside this Mac can ever reach it, so an LB status
 //     advertising loopback is never legitimate, or
-//   - any address inside podCIDR — this catches a PREVIOUS derived address after
-//     the node's /24 moved (a re-enrolled agent goes 100.64.0.0/24 →
-//     100.64.2.0/24), which filtering on the current advertise value alone would
-//     strand forever, since ensureStatus REPLACES the slice (self-healing) but
-//     clearStatus only filters.
+//   - ANY address inside podCIDR. Assemblers pass the CLUSTER pod aggregate
+//     (100.64.0.0/10), not this node's /24, because the entry that most needs
+//     retracting is a PREVIOUS derived address from before the node's /24 moved
+//     (a re-enrolled agent goes 100.64.0.0/24 → 100.64.2.0/24) — which the
+//     current /24 does not contain, and which filtering on the advertise value
+//     alone strands forever, since ensureStatus REPLACES the slice (self-healing)
+//     but clearStatus only filters.
 //
-// A foreign entry (another implementation's, or an operator's) is never touched.
+// # What this does NOT guarantee
+//
+// It is NOT "only k3sm's own entries are touched". The third arm is a whole-range
+// test over 100.64.0.0/10, which is public RFC-6598 CGNAT space that other tools
+// allocate from — Tailscale most commonly, and k3sm's own mesh IPs live there
+// too. Any address in that range appearing in an LB status this controller owns
+// WILL be dropped, whoever wrote it. Only addresses OUTSIDE the range and outside
+// loopback (a LAN address, a public address, a hostname) are left alone.
+//
+// That widening is deliberate and is sound ONLY under one invariant: svclb is the
+// SINGLE server-process frontend for the whole cluster (see the package doc), so
+// every pod-space address in an LB status it manages was written by this
+// controller or by a previous life of it. There is no second writer to collide
+// with.
+//
+// REVISIT THIS ARM when that invariant ends. Multi-node svclb — the named
+// follow-up alongside multi-node ingress — introduces per-node writers whose
+// advertised addresses all live in 100.64.0.0/10, and each would then retract the
+// others' entries on every reconcile. The fix at that point is to scope this arm
+// to the writing node's own /24 plus an explicit record of the /24s it previously
+// held, NOT to keep widening it.
 func Retractable(podCIDR netip.Prefix, advertise netip.Addr, ip string) bool {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {

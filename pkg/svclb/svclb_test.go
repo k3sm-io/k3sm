@@ -30,6 +30,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // fakeListener is a bind-only listener: Accept blocks until Close (no real
@@ -133,6 +135,7 @@ func TestSvclbStatusHonesty(t *testing.T) {
 			BindAddr:      testBindAddr,
 			AdvertiseAddr: testAdvertiseAddr,
 			PodCIDR:       testPodCIDR,
+			ReservedPorts: ports.ReservedSet(),
 			Binder:        binder,
 			Logger:        slog.New(slog.NewTextHandler(&buf, nil)),
 		})
@@ -280,6 +283,7 @@ func TestSvclbStatusHonesty(t *testing.T) {
 			BindAddr:      testBindAddr,
 			AdvertiseAddr: testAdvertiseAddr,
 			PodCIDR:       testPodCIDR,
+			ReservedPorts: ports.ReservedSet(),
 			Binder:        binder,
 			Logger:        slog.New(slog.DiscardHandler),
 		})
@@ -406,6 +410,7 @@ func TestSvclbNewValidationAsymmetry(t *testing.T) {
 				Client:        fake.NewClientset(),
 				BindAddr:      tt.bind,
 				AdvertiseAddr: tt.advertise,
+				ReservedPorts: ports.ReservedSet(),
 				Logger:        slog.New(slog.DiscardHandler),
 			})
 			if gotErr := err != nil; gotErr != tt.wantErr {
@@ -413,8 +418,29 @@ func TestSvclbNewValidationAsymmetry(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New(Config{BindAddr: netip.AddrFrom4([4]byte{})}); err == nil {
+	if _, err := New(Config{BindAddr: netip.AddrFrom4([4]byte{}), ReservedPorts: ports.ReservedSet()}); err == nil {
 		t.Error("New must still reject a nil client")
+	}
+
+	// FAIL CLOSED on the zero value of a guard. The reserved-port refusal is the
+	// last of three layers that all fail OPEN (the VAP is failurePolicy: Ignore
+	// and is provisioned log-and-continue), so a nil set must be a construction
+	// ERROR, not a silent "reserve nothing". An explicit empty map is the visible
+	// opt-out.
+	if _, err := New(Config{
+		Client:   fake.NewClientset(),
+		BindAddr: netip.AddrFrom4([4]byte{}),
+		Logger:   slog.New(slog.DiscardHandler),
+	}); err == nil {
+		t.Error("New must REJECT a nil ReservedPorts: the zero value of a guard must not disable it")
+	}
+	if _, err := New(Config{
+		Client:        fake.NewClientset(),
+		BindAddr:      netip.AddrFrom4([4]byte{}),
+		ReservedPorts: map[int32]bool{},
+		Logger:        slog.New(slog.DiscardHandler),
+	}); err != nil {
+		t.Errorf("an EXPLICIT empty ReservedPorts is the sanctioned opt-out, got %v", err)
 	}
 }
 
@@ -426,10 +452,22 @@ func TestSvclbNewValidationAsymmetry(t *testing.T) {
 // It asserts len == 0, deliberately NOT "!= 127.0.0.1": the zero netip.Addr
 // stringifies to "invalid IP", so a controller that published it would satisfy
 // the negative check while advertising an EXTERNAL-IP worse than loopback.
+//
+// The Service is seeded with a STALE entry, not an empty status. An empty seed
+// cannot distinguish "retracted" from "never written", which is exactly how the
+// original version of this code shipped a gap: a fully-bound Service with an
+// underivable advertise address was routed to ensureStatus, which returned early
+// — so clearStatus (and therefore Retractable) never ran and a pre-existing
+// loopback or previous-/24 entry survived forever.
 func TestSvclbDerivationFailureBindsButNeverAdvertises(t *testing.T) {
 	ctx := context.Background()
 	binder := &fakeBinder{}
 	svc := lbService("default", "pending", "10.43.0.15", 8090)
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
+		{IP: "127.0.0.1"},   // a pre-B116 entry an upgraded cluster carries
+		{IP: "100.64.0.1"},  // a previous enrollment's derived .1
+		{IP: "203.0.113.9"}, // foreign: outside the pod space and not loopback
+	}
 	cs := fake.NewClientset()
 	if _, err := cs.CoreV1().Services("default").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -439,6 +477,7 @@ func TestSvclbDerivationFailureBindsButNeverAdvertises(t *testing.T) {
 		BindAddr:      testBindAddr,
 		AdvertiseAddr: netip.Addr{}, // the derivation failed
 		PodCIDR:       testPodCIDR,
+		ReservedPorts: ports.ReservedSet(),
 		Binder:        binder,
 		Logger:        slog.New(slog.DiscardHandler),
 	})
@@ -455,8 +494,15 @@ func TestSvclbDerivationFailureBindsButNeverAdvertises(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(out.Status.LoadBalancer.Ingress); n != 0 {
-		t.Errorf("status has %d ingress entries (%+v), want exactly 0 — never publish the zero Addr's \"invalid IP\"", n, out.Status.LoadBalancer.Ingress)
+	for _, lbi := range out.Status.LoadBalancer.Ingress {
+		if lbi.IP == "invalid IP" || lbi.IP == "" {
+			t.Errorf("status carries %q — the zero netip.Addr must never be published", lbi.IP)
+		}
+	}
+	// The retraction MUST have run: a fully-bound Service with no advertisable
+	// address settles into the same state as an unbound one.
+	if len(out.Status.LoadBalancer.Ingress) != 1 || out.Status.LoadBalancer.Ingress[0].IP != "203.0.113.9" {
+		t.Errorf("status = %+v, want ONLY the foreign entry: the stale loopback and previous-/24 entries must be RETRACTED, not merely left unwritten", out.Status.LoadBalancer.Ingress)
 	}
 }
 
