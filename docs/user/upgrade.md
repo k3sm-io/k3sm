@@ -30,6 +30,39 @@ control-plane Mac last unless a release note says otherwise. See [multi-node.md]
 - **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
   [versions.md](versions.md).
 
+## Upgrading into the reserved-port policy
+
+The release that moved LoadBalancer listeners to the wildcard also provisions a
+`ValidatingAdmissionPolicy` that **rejects** a `type: LoadBalancer` Service declaring a port k3sm's own
+listeners own — the NodePort range `30000-32767`, or the kubelet API port `10250`. It matches on
+CREATE **and** UPDATE, and it deliberately does **not** ratchet on `oldObject`.
+
+That means a cluster **already carrying** such a Service is not grandfathered in. The object stays in
+the datastore and keeps working, but **every subsequent write to it is denied** — not just a port
+change. A `kubectl label`, an annotation added by an unrelated controller, any `kubectl apply` of the
+same manifest: all rejected, with a message naming the port.
+
+Check before you upgrade:
+
+```sh
+kubectl get svc -A -o json | jq -r '
+  .items[] | select(.spec.type=="LoadBalancer")
+  | select(.spec.ports[]? | .port==10250 or (.port>=30000 and .port<=32767))
+  | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Anything listed has two escape hatches, both a single write **before** the upgrade (or from a
+still-permitted path after it):
+
+- **Change the port** to one outside the reserved set — the intended fix, since the Service could never
+  have had a working listener on a port k3sm already holds.
+- **Patch `type` away from `LoadBalancer`** (e.g. to `ClusterIP` or `NodePort`); the policy is scoped to
+  LoadBalancer Services only, so the object becomes writable again immediately.
+
+Do **not** expect a `--force` or an exemption: the ratcheting is omitted on purpose. A policy that
+tolerated a pre-existing offender would leave the collision — and the `kubectl logs`/`exec` outage it
+can cause — silently in place.
+
 ## Rollback
 
 Rollback is **revert to the previous binary** (`brew` pin/switch to the prior bottle) plus a `launchctl
