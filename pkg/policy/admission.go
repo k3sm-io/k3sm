@@ -26,6 +26,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // ProviderTaintKey is the key of the NoSchedule taint k3sm places on every node
@@ -78,6 +80,14 @@ const (
 	udpServiceBindingName = "k3sm-warn-service-udp-binding"
 )
 
+// reservedLBPortPolicyName / reservedLBPortBindingName name the DENY policy (B116)
+// that rejects a LoadBalancer Service declaring a port k3sm's own wildcard
+// listeners occupy.
+const (
+	reservedLBPortPolicyName  = "k3sm-reject-loadbalancer-reserved-port"
+	reservedLBPortBindingName = "k3sm-reject-loadbalancer-reserved-port-binding"
+)
+
 // etpLocalExpr admits (evaluates true) UNLESS a Service sets
 // externalTrafficPolicy: Local. k3sm's userspace L4 splice opens a fresh backend
 // connection (see darwin-net proxy.splice), so it does NOT preserve the external
@@ -94,6 +104,135 @@ const etpLocalExpr = `!has(object.spec.externalTrafficPolicy) || object.spec.ext
 // rather than leaving the operator to discover it at runtime. The per-port has()
 // guard tolerates a port that omits protocol (defaulted to TCP server-side).
 const udpServiceExpr = `object.spec.ports.all(p, !has(p.protocol) || p.protocol != 'UDP')`
+
+// reservedPortClause is the CEL sub-expression testing whether the port of the
+// Service port bound to variable p falls in the reserved set: the NodePort range,
+// or the kubelet API port. The bounds are INTERPOLATED from their arguments —
+// pkg/ports at the one call site — so no reserved-port literal is ever written
+// into CEL by hand.
+func reservedPortClause(p string, nodePortMin, nodePortMax, kubeletPort int) string {
+	return fmt.Sprintf("((%[1]s.port >= %[2]d && %[1]s.port <= %[3]d) || %[1]s.port == %[4]d)",
+		p, nodePortMin, nodePortMax, kubeletPort)
+}
+
+// reservedLBPortExpr is the CEL the Deny policy enforces on Service CREATE and
+// UPDATE. It ADMITS (evaluates true) unless a type: LoadBalancer Service declares
+// a spec.ports[].port that k3sm's own wildcard listeners own.
+//
+// Why the LoadBalancer scope lives INSIDE the validation expression rather than in
+// a matchCondition: this expression is the whole rule, so it can be read — and
+// evaluated in a test — on its own. Split across a matchCondition, evaluating the
+// expression alone would report "rejects a plain NodePort Service", which is the
+// exact false verdict this policy must not deliver.
+//
+// It keys on spec.ports[].port ONLY, never on nodePort: the apiserver ALLOCATES a
+// plain NodePort Service's nodePort out of the very range this guards, so keying on
+// nodePort — or dropping the type scope — would reject every NodePort Service in the
+// cluster. The has() guards tolerate a Service that omits type or ports.
+func reservedLBPortExpr(nodePortMin, nodePortMax, kubeletPort int) string {
+	return "!has(object.spec.type) || object.spec.type != 'LoadBalancer' || " +
+		"!has(object.spec.ports) || " +
+		"object.spec.ports.all(p, !" + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort) + ")"
+}
+
+// reservedLBPortMessageExpr renders the rejection message, NAMING the first
+// colliding port — the whole reason admission was chosen over refuse-and-park is
+// that the operator learns at `kubectl apply` rather than from a silent <pending>.
+// It is evaluated only when the validation fails, so the filtered list is non-empty.
+//
+// The closing sentence keeps operator trust calibrated: this guard covers k3sm's
+// RESERVED ports only. Two Services declaring the same ORDINARY LoadBalancer port
+// are still first-come — the second one's listener simply fails to bind and its
+// status stays empty.
+func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string {
+	return `'k3sm: LoadBalancer port ' + ` +
+		`string(object.spec.ports.filter(p, ` + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort) + `)[0].port) + ` +
+		fmt.Sprintf(`' is RESERVED by a k3sm wildcard listener (the NodePort range %d-%d and the kubelet API port %d). `, nodePortMin, nodePortMax, kubeletPort) +
+		`k3sm binds LoadBalancer ports on 0.0.0.0 and Go sets no SO_REUSEPORT, so this Service would race a k3sm listener for the same socket ` +
+		`— losing the kubelet API port breaks logs/exec/top on this node, and a NodePort-range collision takes down an unrelated ClusterIP. ` +
+		`Choose a different spec.ports[].port. Only these RESERVED ports are rejected: two Services sharing an ordinary LoadBalancer port are still first-come.'`
+}
+
+// EnsureRejectReservedLoadBalancerPort idempotently provisions the DENY
+// ValidatingAdmissionPolicy (+ binding) that REJECTS a type: LoadBalancer Service
+// declaring a port k3sm's own wildcard listeners own (pkg/ports.Reserved). It is
+// the legible half of a two-point guard: svclb REFUSES to bind such a port at the
+// datapath (pkg/svclb), and this policy makes the refusal visible at
+// `kubectl apply` instead of as an unexplained <pending>.
+//
+// CREATE **and** UPDATE: a port edit, or a `type` patch onto an already-admitted
+// Service, is an ordinary UPDATE, and svclb reconciles live state — a CREATE-only
+// policy would let the collision in through the back door.
+//
+// MatchConstraints pins `services` ONLY — deliberately NOT `services/status`, or
+// this controller's own (and the ingress host's) UpdateStatus writes would be
+// evaluated by it on every reconcile.
+//
+// FailurePolicy is Ignore: a CEL/machinery evaluation error must not turn into a
+// cluster-wide denial of Service writes. The trade is explicit — the guard can
+// fail open, which is why the datapath refusal in svclb exists as the second
+// enforcement point rather than as belt-and-braces.
+//
+// PROVISIONING CONTRACT (bounded, on purpose): like every sibling Ensure*, this is
+// CREATE-IF-ABSENT and NEVER UPDATES. So the CEL is frozen at the moment the policy
+// object is first created: the "reserved set cannot desync" property holds for a
+// FRESH cluster, but a cluster provisioned before a NodePort-range change keeps the
+// old expression until the object is deleted. An Update-on-drift provisioner is a
+// reserved follow-up, not an oversight.
+func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Interface) error {
+	api := cs.AdmissionregistrationV1()
+
+	ignore := admissionregistrationv1.Ignore
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   reservedLBPortPolicyName,
+			Labels: map[string]string{"k3sm.io/managed": "true"},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: &ignore,
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create,
+							admissionregistrationv1.Update,
+						},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"services"},
+						},
+					},
+				}},
+			},
+			Validations: []admissionregistrationv1.Validation{{
+				Expression:        reservedLBPortExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort),
+				MessageExpression: reservedLBPortMessageExpr(ports.NodePortRangeMin, ports.NodePortRangeMax, ports.KubeletAPIPort),
+				Message:           "k3sm: this LoadBalancer Service declares a port reserved by a k3sm wildcard listener (the NodePort range or the kubelet API port); choose a different spec.ports[].port",
+				Reason:            reasonInvalid(),
+			}},
+		},
+	}
+	if _, err := api.ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create reserved-loadbalancer-port admission policy: %w", err)
+	}
+
+	deny := admissionregistrationv1.Deny
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   reservedLBPortBindingName,
+			Labels: map[string]string{"k3sm.io/managed": "true"},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        reservedLBPortPolicyName,
+			ValidationActions: []admissionregistrationv1.ValidationAction{deny},
+		},
+	}
+	if _, err := api.ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create reserved-loadbalancer-port admission binding: %w", err)
+	}
+	return nil
+}
 
 // darwinSelectorExpr is the CEL the policy enforces on Pod CREATE: the pod must
 // declare nodeSelector kubernetes.io/os=darwin. It tolerates a missing
