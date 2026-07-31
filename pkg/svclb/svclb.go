@@ -47,32 +47,63 @@ const IgnoreLabel = "svclb.k3sm.io/ignore"
 const warnInterval = 30 * time.Second
 
 // Config configures the svclb Controller.
+//
+// BindAddr and AdvertiseAddr are DIFFERENT addresses (B116). The listeners bind
+// the wildcard (every interface answers, matching Docker Desktop's vpnkit and
+// k3s' klipper-lb), while the status advertises the node's derived
+// globally-unicast InternalIP. A wildcard bind cannot witness the advertised
+// address, so the assembler — not this package — owns the choice of both.
 type Config struct {
 	// Client is the cluster client the Service informer and status writes use.
 	Client kubernetes.Interface
-	// NodeIP is the SPECIFIC node InternalIP the listeners bind and the address
-	// advertised in status.loadBalancer once they are bound.
-	NodeIP netip.Addr
-	// PrivilegedBinder opens <1024 listeners: netbind.Netd in the unprivileged
-	// helper posture (the daemon authorizes the bind because the LoadBalancer
-	// Service itself declares the port — the netdsvc node-address rule). Nil
-	// means netbind.Direct (run-as-root).
-	PrivilegedBinder netbind.Binder
-	// Binder opens >=1024 listeners directly in-process (no privilege needed).
-	// Nil means netbind.Direct; injectable for tests.
+	// BindAddr is the address every LoadBalancer listener binds. It must be
+	// VALID; the WILDCARD (0.0.0.0) is the production choice and is accepted.
+	BindAddr netip.Addr
+	// AdvertiseAddr is the address published in status.loadBalancer.ingress once
+	// every TCP port of a Service is bound. The ZERO Addr is legal and means the
+	// node's advertisable address could not be derived: listeners STILL bind, but
+	// no status is ever written (the Service stays <pending> — never a loopback
+	// or an "invalid IP" EXTERNAL-IP).
+	AdvertiseAddr netip.Addr
+	// PodCIDR is the pod address space whose addresses this controller OWNS in
+	// status and therefore retracts (see Retractable). Pass the CLUSTER pod CIDR,
+	// not this node's /24: a node that re-enrolls moves from e.g. 100.64.0.0/24 to
+	// 100.64.2.0/24, and the entry stranded in status is the PREVIOUS /24's .1 —
+	// which the current /24 does not contain. svclb is the single server-process
+	// frontend (multi-node svclb is a named follow-up), so every pod-CIDR address
+	// in an LB status was written by this controller or a previous life of it.
+	// The zero Prefix disables that arm of the predicate.
+	PodCIDR netip.Prefix
+	// ReservedPorts is the set of ports k3sm's OWN wildcard listeners occupy (the
+	// NodePort range and the kubelet API port — pkg/ports.ReservedSet). bind
+	// REFUSES them outright rather than racing a k3sm listener for the same
+	// wildcard socket; nil reserves nothing (tests). Admission rejects such a
+	// Service first (pkg/policy) — this is the second, datapath-side enforcement
+	// point, because the VAP is failurePolicy: Ignore and may be absent.
+	ReservedPorts map[int32]bool
+	// Binder opens every listener in-process (no privilege needed: on Darwin a
+	// WILDCARD bind below 1024 does not require root — it is the SPECIFIC-address
+	// bind that returns EACCES, inverted from Linux). Nil means netbind.Direct;
+	// injectable for tests. There is deliberately no second, privileged binder:
+	// routing a wildcard bind through the root netd helper would fail, since netd
+	// refuses the wildcard by design.
 	Binder netbind.Binder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
 }
 
-// Controller reconciles LoadBalancer Services into nodeIP listeners spliced to
+// errReservedPort is the sentinel bind returns for a port k3sm's own wildcard
+// listeners own. It is distinguished from an ordinary bind failure so the
+// operator-facing warning names the real cause.
+var errReservedPort = errors.New("port is reserved by a k3sm listener")
+
+// Controller reconciles LoadBalancer Services into BindAddr listeners spliced to
 // their ClusterIP VIPs, and writes each Service's LB status ONLY once its
 // listeners are actually bound (see the package doc's honesty contract).
 type Controller struct {
-	cfg  Config
-	log  *slog.Logger
-	priv netbind.Binder
-	dir  netbind.Binder
+	cfg Config
+	log *slog.Logger
+	dir netbind.Binder
 
 	// forwarders is keyed service "ns/name" -> port -> forwarder. It is owned
 	// EXCLUSIVELY by the single reconcile-loop goroutine (Run), so it needs no
@@ -90,16 +121,17 @@ func New(cfg Config) (*Controller, error) {
 	if cfg.Client == nil {
 		return nil, errors.New("svclb: config requires a client")
 	}
-	if !cfg.NodeIP.IsValid() || cfg.NodeIP.IsUnspecified() {
-		return nil, fmt.Errorf("svclb: config requires a specific node address, got %q", cfg.NodeIP)
+	// Only VALIDITY is required: the wildcard is the production bind address, so
+	// an IsUnspecified rejection here would refuse the shipped configuration. A
+	// zero Addr stays rejected — it would reach net.Listen as "invalid AddrPort".
+	// AdvertiseAddr is deliberately NOT validated: the zero value is the honest
+	// "derivation failed" signal (bind, never advertise).
+	if !cfg.BindAddr.IsValid() {
+		return nil, fmt.Errorf("svclb: config requires a valid bind address, got %q", cfg.BindAddr)
 	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
-	}
-	priv := cfg.PrivilegedBinder
-	if priv == nil {
-		priv = netbind.Direct{}
 	}
 	dir := cfg.Binder
 	if dir == nil {
@@ -108,7 +140,6 @@ func New(cfg Config) (*Controller, error) {
 	return &Controller{
 		cfg:        cfg,
 		log:        log,
-		priv:       priv,
 		dir:        dir,
 		forwarders: make(map[string]map[int32]*forwarder),
 		lastWarn:   make(map[string]time.Time),
@@ -120,6 +151,12 @@ func New(cfg Config) (*Controller, error) {
 // cancelled, then drains every forwarder. Reconciles are event-driven and
 // coalesced; the loop goroutine is the sole owner of the listener state.
 func (c *Controller) Run(ctx context.Context) error {
+	// ONE line carrying BOTH addresses: after B116 they differ, and every other
+	// log line in this package renders the BIND address (what a listener actually
+	// occupies). Without this line an operator reading "addr=0.0.0.0:8080" has no
+	// way to connect it to the EXTERNAL-IP kubectl shows.
+	c.log.Info("svclb: loadbalancer controller starting",
+		"bind", c.cfg.BindAddr.String(), "advertise", c.advertiseString())
 	factory := informers.NewSharedInformerFactory(c.cfg.Client, 30*time.Second)
 	inf := factory.Core().V1().Services().Informer()
 	trigger := make(chan struct{}, 1)
@@ -237,9 +274,16 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 		}
 		f, err := c.bind(ctx, p.Port, netip.AddrPortFrom(vip, uint16(p.Port)))
 		if err != nil {
+			if errors.Is(err, errReservedPort) {
+				c.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
+					"svclb: loadbalancer port is RESERVED by a k3sm wildcard listener (the NodePort range or the kubelet API port); no listener bound, status stays empty — pick a different spec.ports[].port",
+					"service", key, "port", p.Port, "bind", c.bindAddrPort(p.Port).String())
+				continue
+			}
 			c.throttledWarn(fmt.Sprintf("%s\x00bind:%d", key, p.Port),
-				"svclb: listener bind failed (port conflict?); status stays empty",
-				"service", key, "addr", netip.AddrPortFrom(c.cfg.NodeIP, uint16(p.Port)).String(), "err", err)
+				"svclb: listener bind failed; status stays empty. Likely causes: another local process OR POD already listening on this wildcard port (darwin has no network namespaces, so pods share the node's port space); a second LoadBalancer Service declaring the same port; or a k3sm-reserved port",
+				"service", key, "addr", c.bindAddrPort(p.Port).String(),
+				"diagnose", fmt.Sprintf("lsof -nP -iTCP:%d -sTCP:LISTEN", p.Port), "err", err)
 			continue
 		}
 		if c.forwarders[key] == nil {
@@ -247,7 +291,7 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 		}
 		c.forwarders[key][p.Port] = f
 		c.log.Info("svclb: loadbalancer listener bound",
-			"service", key, "addr", netip.AddrPortFrom(c.cfg.NodeIP, uint16(p.Port)).String(), "vip", f.dst.String())
+			"service", key, "addr", c.bindAddrPort(p.Port).String(), "advertise", c.advertiseString(), "vip", f.dst.String())
 		bound++
 	}
 	if tcpPorts > 0 && bound == tcpPorts {
@@ -257,15 +301,20 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 	}
 }
 
-// bind opens one nodeIP:port listener — through the privileged binder (the
-// netd helper, authorized because the LoadBalancer Service declares the port)
-// for <1024, directly otherwise — and starts its forwarder.
+// bind opens one BindAddr:port listener through the single in-process binder and
+// starts its forwarder. There is no port-keyed binder selection any more: on
+// Darwin a wildcard bind needs no privilege at ANY port, so the netd helper is
+// off the LoadBalancer datapath entirely (and would refuse the wildcard anyway).
+//
+// It REFUSES a reserved port before touching the binder: racing k3sm's own
+// NodePort-range or kubelet-API listener for the same wildcard socket would let
+// the winner be decided by start order, and losing :10250 kills logs/exec/
+// `kubectl top` on this node.
 func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort) (*forwarder, error) {
-	binder := c.dir
-	if port < 1024 {
-		binder = c.priv
+	if c.cfg.ReservedPorts[port] {
+		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)
 	}
-	ln, err := binder.Listen(ctx, "tcp", netip.AddrPortFrom(c.cfg.NodeIP, uint16(port)))
+	ln, err := c.dir.Listen(ctx, "tcp", c.bindAddrPort(port))
 	if err != nil {
 		return nil, err
 	}
@@ -295,11 +344,36 @@ func (c *Controller) throttledWarn(key, msg string, args ...any) {
 	c.log.Warn(msg, args...)
 }
 
-// ensureStatus advertises this node's IP on svc's LB status (idempotent). The
-// status is EXACTLY this node's IP: the server process is the single frontend
-// (multi-node svclb is the named follow-up alongside multi-node ingress).
+// bindAddrPort is the AddrPort a listener for port occupies — always rendered
+// from the BIND address, never the advertised one, so a log line names the
+// socket that actually exists.
+func (c *Controller) bindAddrPort(port int32) netip.AddrPort {
+	return netip.AddrPortFrom(c.cfg.BindAddr, uint16(port))
+}
+
+// advertiseString renders the advertised address for logs, naming the derivation
+// failure explicitly rather than letting the zero Addr print as "invalid IP".
+func (c *Controller) advertiseString() string {
+	if !c.cfg.AdvertiseAddr.IsValid() {
+		return "<none: node address not derived; loadbalancer status stays empty>"
+	}
+	return c.cfg.AdvertiseAddr.String()
+}
+
+// ensureStatus advertises this node's derived address on svc's LB status
+// (idempotent). The status is EXACTLY this node's advertised address: the server
+// process is the single frontend (multi-node svclb is the named follow-up
+// alongside multi-node ingress).
+//
+// When the advertise address could not be derived NOTHING is written: the
+// listeners are bound and serving, but no honest EXTERNAL-IP exists to publish,
+// so the Service stays <pending> rather than advertising loopback (unreachable
+// from anywhere else) or the zero Addr (which stringifies to "invalid IP").
 func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
-	ip := c.cfg.NodeIP.String()
+	if !c.cfg.AdvertiseAddr.IsValid() {
+		return
+	}
+	ip := c.cfg.AdvertiseAddr.String()
 	for _, lbi := range svc.Status.LoadBalancer.Ingress {
 		if lbi.IP == ip {
 			return
@@ -312,13 +386,49 @@ func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
 	}
 }
 
-// clearStatus removes this node's IP from svc's LB status if present (the
-// listeners are not (all) bound — never advertise a dead address).
+// Retractable reports whether an existing status.loadBalancer.ingress entry ip
+// belongs to THIS node's advertise identity and must therefore be dropped when
+// the listeners are not (all) bound. It is the ONE retraction rule, exported so
+// the ingress host applies exactly the same predicate to Ingress and canonical
+// LB Service statuses instead of growing a second, drifting copy.
+//
+// An entry is retractable when it is:
+//
+//   - the CURRENT advertise address (the ordinary case), or
+//   - a loopback address — the pre-B116 default that an upgraded cluster may
+//     still carry; nothing outside this Mac can ever reach it, so an LB status
+//     advertising loopback is never legitimate, or
+//   - any address inside podCIDR — this catches a PREVIOUS derived address after
+//     the node's /24 moved (a re-enrolled agent goes 100.64.0.0/24 →
+//     100.64.2.0/24), which filtering on the current advertise value alone would
+//     strand forever, since ensureStatus REPLACES the slice (self-healing) but
+//     clearStatus only filters.
+//
+// A foreign entry (another implementation's, or an operator's) is never touched.
+func Retractable(podCIDR netip.Prefix, advertise netip.Addr, ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false // not an address we could have written
+	}
+	addr = addr.Unmap()
+	switch {
+	case advertise.IsValid() && addr == advertise:
+		return true
+	case addr.IsLoopback():
+		return true
+	case podCIDR.IsValid() && podCIDR.Contains(addr):
+		return true
+	}
+	return false
+}
+
+// clearStatus removes this node's advertised address from svc's LB status if
+// present (the listeners are not (all) bound — never advertise a dead address).
+// It applies the shared Retractable predicate, NOT a single-value comparison.
 func (c *Controller) clearStatus(ctx context.Context, svc *corev1.Service) {
-	ip := c.cfg.NodeIP.String()
 	keep := make([]corev1.LoadBalancerIngress, 0, len(svc.Status.LoadBalancer.Ingress))
 	for _, lbi := range svc.Status.LoadBalancer.Ingress {
-		if lbi.IP != ip {
+		if !Retractable(c.cfg.PodCIDR, c.cfg.AdvertiseAddr, lbi.IP) {
 			keep = append(keep, lbi)
 		}
 	}

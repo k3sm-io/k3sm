@@ -76,17 +76,32 @@ type Config struct {
 	// targeted TLS-Secret fetches, and the status writes. Keys fetched under it
 	// only ever live in the control-plane process (no RBAC widening).
 	Client kubernetes.Interface
-	// NodeIP is the SPECIFIC node InternalIP the listeners bind (never a
-	// wildcard) and the address written into Ingress/LB statuses.
-	NodeIP netip.Addr
+	// BindAddr is the address the HTTP/HTTPS listeners bind. It must be VALID;
+	// the WILDCARD (0.0.0.0) is the production choice and is accepted — on Darwin
+	// a wildcard bind needs no privilege at 80/443 (it is the SPECIFIC-address
+	// bind that returns EACCES, inverted from Linux), so the ingress listeners
+	// never touch the root netd helper.
+	BindAddr netip.Addr
+	// AdvertiseAddr is the address written into Ingress and canonical-LB-Service
+	// statuses. The ZERO Addr is legal and means the node's advertisable address
+	// could not be derived: the listeners still serve, but NO status is written
+	// (never loopback, never the zero Addr's "invalid IP" rendering).
+	AdvertiseAddr netip.Addr
+	// PodCIDR is the pod address space whose status entries this host owns and
+	// therefore retracts — the same contract, and the same predicate, as
+	// svclb.Config.PodCIDR (pass the CLUSTER pod CIDR).
+	PodCIDR netip.Prefix
 	// HTTPPort / HTTPSPort are the listener ports; 0 disables that listener.
 	// 80/443 is the production posture (netd-authorized via the canonical LB
 	// Service); anything else is the EXPLICIT high-port mode — a config choice,
 	// never a fallback.
 	HTTPPort  uint16
 	HTTPSPort uint16
-	// Binder opens the listeners: netbind.Netd in the unprivileged helper
-	// posture, nil for netbind.Direct (run-as-root, tests).
+	// Binder opens the listeners in-process. Nil means netbind.Direct, which is
+	// the production wiring: a wildcard bind is unprivileged on Darwin, so the
+	// assembler no longer hands this host a privileged (netd) binder — netd
+	// refuses the wildcard by design and would fail every listener. Injectable
+	// for tests.
 	Binder netbind.Binder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
@@ -116,8 +131,14 @@ func New(cfg Config) (*Host, error) {
 	if cfg.Client == nil {
 		return nil, errors.New("ingresshost: config requires a client")
 	}
-	if !cfg.NodeIP.IsValid() || cfg.NodeIP.IsUnspecified() {
-		return nil, fmt.Errorf("ingresshost: config requires a specific node address, got %q", cfg.NodeIP)
+	// Only VALIDITY is checked. The IsUnspecified rejection that used to live here
+	// was the FOURTH wildcard rejection on this path (after darwin-net's
+	// ingress.NewServer, netbind's contract note, and netd's own) — and the one
+	// that would have disabled the ingress at CONSTRUCTION, before darwin-net's
+	// relaxed NewServer was ever reached, while still compiling green. A zero Addr
+	// stays rejected: it would reach net.Listen as the literal "invalid AddrPort".
+	if !cfg.BindAddr.IsValid() {
+		return nil, fmt.Errorf("ingresshost: config requires a valid bind address, got %q", cfg.BindAddr)
 	}
 	if cfg.HTTPPort == 0 && cfg.HTTPSPort == 0 {
 		return nil, errors.New("ingresshost: config enables no listener (both ports zero)")
@@ -217,7 +238,7 @@ func (b countingBinder) Listen(ctx context.Context, network string, addr netip.A
 // loudly until restart.
 func (h *Host) serveLoop(ctx context.Context) {
 	srv, err := ingress.NewServer(h.table, ingress.Config{
-		Addr:      h.cfg.NodeIP,
+		Addr:      h.cfg.BindAddr,
 		HTTPPort:  h.cfg.HTTPPort,
 		HTTPSPort: h.cfg.HTTPSPort,
 		Binder:    countingBinder{h: h},
@@ -228,10 +249,16 @@ func (h *Host) serveLoop(ctx context.Context) {
 		h.log.Error("ingress server construction (misconfiguration, not retried)", "err", err)
 		return
 	}
+	h.log.Info("ingress host starting", "bind", h.cfg.BindAddr.String(), "advertise", h.advertiseString(),
+		"http-port", h.cfg.HTTPPort, "https-port", h.cfg.HTTPSPort)
 	for attempt := 0; ; {
 		h.boundCount.Store(0)
 		err := srv.Run(ctx)
 		h.serving.Store(false)
+		// The listeners are gone: kick the status writer so it RETRACTS this
+		// node's advertised address instead of leaving every k3sm-class Ingress
+		// pointing at a dead one (bind-then-advertise cuts both ways).
+		h.kickStatus()
 		if ctx.Err() != nil {
 			return
 		}
@@ -240,7 +267,7 @@ func (h *Host) serveLoop(ctx context.Context) {
 			return
 		}
 		if attempt >= len(bindRetrySchedule) {
-			h.log.Error("ingress bind retries exhausted; ingress listeners DISABLED until the server restarts (no port fallback — check the netd helper and the k3sm-ingress LoadBalancer authorization)", "err", err)
+			h.log.Error("ingress bind retries exhausted; ingress listeners DISABLED until the server restarts (no port fallback — another process or a LoadBalancer Service may hold the wildcard port; check 'lsof -nP -iTCP:<port> -sTCP:LISTEN')", "err", err)
 			return
 		}
 		delay := bindRetrySchedule[attempt]
@@ -380,9 +407,19 @@ func (h *Host) statusLoop(ctx context.Context) {
 // serve).
 func (h *Host) syncStatus(ctx context.Context) {
 	if !h.serving.Load() {
+		// NOT a bare return: the listeners are down, so anything this host
+		// previously advertised is now a dead address. Retract it.
+		h.retractStatus(ctx)
 		return
 	}
-	ip := h.cfg.NodeIP.String()
+	if !h.cfg.AdvertiseAddr.IsValid() {
+		// Serving, but there is no honest address to publish (the node address
+		// could not be derived). Advertise nothing rather than loopback or the
+		// zero Addr's "invalid IP" — and retract anything a previous life wrote.
+		h.retractStatus(ctx)
+		return
+	}
+	ip := h.cfg.AdvertiseAddr.String()
 	ings, err := h.cfg.Client.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		h.log.Warn("list ingresses for status sync", "err", err)
@@ -431,4 +468,72 @@ func ingressStatusHas(ing *networkingv1.Ingress, ip string) bool {
 		}
 	}
 	return false
+}
+
+// advertiseString renders the advertised address for logs, naming the derivation
+// failure explicitly rather than letting the zero Addr print as "invalid IP".
+func (h *Host) advertiseString() string {
+	if !h.cfg.AdvertiseAddr.IsValid() {
+		return "<none: node address not derived; ingress status stays empty>"
+	}
+	return h.cfg.AdvertiseAddr.String()
+}
+
+// retractStatus removes this node's advertised address from every k3sm-class
+// Ingress and from the canonical LB Service. Before B116 this host had NO
+// retraction path at all — syncStatus returned early on !serving and never
+// removed anything — so after "bind retries exhausted" every k3sm-class Ingress
+// kept advertising a dead address indefinitely. The predicate is svclb's
+// exported Retractable: ONE retraction rule for both controllers, so a stale
+// entry from a previous podCIDR (or a pre-B116 loopback entry) is dropped even
+// though it is neither the current bind nor the current advertise address.
+// Own-class Ingresses ONLY — a foreign or classless Ingress is never touched.
+func (h *Host) retractStatus(ctx context.Context) {
+	ings, err := h.cfg.Client.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		h.log.Warn("list ingresses for status retraction", "err", err)
+	} else {
+		for i := range ings.Items {
+			ing := &ings.Items[i]
+			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != ClassName {
+				continue
+			}
+			keep := make([]networkingv1.IngressLoadBalancerIngress, 0, len(ing.Status.LoadBalancer.Ingress))
+			for _, lbi := range ing.Status.LoadBalancer.Ingress {
+				if !svclb.Retractable(h.cfg.PodCIDR, h.cfg.AdvertiseAddr, lbi.IP) {
+					keep = append(keep, lbi)
+				}
+			}
+			if len(keep) == len(ing.Status.LoadBalancer.Ingress) {
+				continue
+			}
+			upd := ing.DeepCopy()
+			upd.Status.LoadBalancer.Ingress = keep
+			if _, err := h.cfg.Client.NetworkingV1().Ingresses(ing.Namespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
+				h.log.Warn("retract ingress status", "ingress", ing.Namespace+"/"+ing.Name, "err", err)
+			}
+		}
+	}
+
+	svc, err := h.cfg.Client.CoreV1().Services(ServiceNamespace).Get(ctx, ServiceName, metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			h.log.Warn("get canonical ingress loadbalancer service for status retraction", "err", err)
+		}
+		return
+	}
+	keep := make([]corev1.LoadBalancerIngress, 0, len(svc.Status.LoadBalancer.Ingress))
+	for _, lbi := range svc.Status.LoadBalancer.Ingress {
+		if !svclb.Retractable(h.cfg.PodCIDR, h.cfg.AdvertiseAddr, lbi.IP) {
+			keep = append(keep, lbi)
+		}
+	}
+	if len(keep) == len(svc.Status.LoadBalancer.Ingress) {
+		return
+	}
+	upd := svc.DeepCopy()
+	upd.Status.LoadBalancer.Ingress = keep
+	if _, err := h.cfg.Client.CoreV1().Services(ServiceNamespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
+		h.log.Warn("retract canonical ingress loadbalancer service status", "err", err)
+	}
 }
