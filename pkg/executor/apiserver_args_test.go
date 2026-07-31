@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/ports"
 )
 
 // flagValue returns the value following the first occurrence of name in args
@@ -82,18 +83,26 @@ func TestApiserverFlagsMeshBindAnonOff(t *testing.T) {
 	}
 }
 
-// TestApiserverNodePortRangeUnprivileged is the M3.1 wiring guard: the apiserver
-// pins --service-node-port-range and both bounds stay >=1024, because k3sm's
-// userspace Service proxy binds *:NodePort directly as the unprivileged _k3sm
-// user (a <1024 bind would EACCES). It pins the contract the design relies on so
-// an upstream default change cannot silently allocate an unbindable NodePort.
-func TestApiserverNodePortRangeUnprivileged(t *testing.T) {
+// TestApiserverNodePortRangeSingleSourced is the M3.1 wiring guard, RE-BASED by
+// B116: the apiserver pins --service-node-port-range, and it pins it from
+// pkg/ports — the SAME constants the reserved-port admission CEL and the svclb
+// bind refusal derive from, so the range k3sm allocates NodePorts out of cannot
+// desync from the range it guards against a colliding LoadBalancer port.
+//
+// The bounds are also still asserted >=1024. That is now a conservatism, NOT the
+// EACCES claim the M3.1 comment made: re-measured on macOS 26, a WILDCARD bind
+// below 1024 succeeds as an ordinary uid (it is the SPECIFIC-address bind that
+// returns EACCES — inverted from Linux; see the cmd/k3sm integration canary).
+func TestApiserverNodePortRangeSingleSourced(t *testing.T) {
 	cfg := Config{WorkDir: "/wd", KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
 	args := apiServerArgs(cfg)
 
 	rng := flagValue(args, "--service-node-port-range")
 	if rng == "" {
 		t.Fatalf("--service-node-port-range must be pinned, args=%v", args)
+	}
+	if rng != ports.NodePortRange() {
+		t.Errorf("--service-node-port-range = %q, want %q from pkg/ports (never a hand-written literal)", rng, ports.NodePortRange())
 	}
 	lo, hi, ok := strings.Cut(rng, "-")
 	if !ok {
@@ -105,7 +114,7 @@ func TestApiserverNodePortRangeUnprivileged(t *testing.T) {
 			t.Fatalf("node-port-range bound %q not an int: %v", bound, err)
 		}
 		if n < 1024 {
-			t.Errorf("node-port-range bound %d < 1024: the unprivileged _k3sm proxy cannot bind it", n)
+			t.Errorf("node-port-range bound %d < 1024: k3sm keeps the whole range in the unprivileged band by convention (NOT because a wildcard bind there would EACCES — on Darwin it does not)", n)
 		}
 	}
 }
