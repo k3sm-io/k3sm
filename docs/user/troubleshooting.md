@@ -11,6 +11,10 @@ log show --predicate 'subsystem BEGINSWITH "io.k3sm"' --last 10m
 launchctl print system/io.k3sm.server     # daemon state (label may differ per role)
 ```
 
+Not everything lands there. The server process's own structured logs (the LoadBalancer controller, the
+ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
+**`/var/log/k3sm/server.log`** — the unified-log predicate above shows none of them.
+
 ## The control plane will not come up
 
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).
@@ -36,6 +40,59 @@ resolver, and headless/SRV/PTR records are planned. This is a known gap, not a m
 
 Only cluster DNS on `:53` uses UDP today; general UDP Services (ClusterIP **and** NodePort) are deferred.
 See [limitations.md](limitations.md).
+
+## A LoadBalancer Service stays `<pending>`
+
+**Do not look in the unified log for this one.** The LoadBalancer controller and the ingress host log
+through `slog` to **stderr**, which the launchd job routes to a file — the
+`log show --predicate 'subsystem BEGINSWITH "io.k3sm"'` command at the top of this page shows **nothing**
+for them. Read the file instead:
+
+```sh
+grep svclb /var/log/k3sm/server.log | tail -50
+grep ingress /var/log/k3sm/server.log | tail -50
+```
+
+The controller emits one line at start carrying **both** addresses — they are deliberately different:
+
+```
+svclb: loadbalancer controller starting bind=0.0.0.0 advertise=100.64.0.1
+```
+
+Then look for one of these:
+
+- **`svclb: loadbalancer port is RESERVED by a k3sm wildcard listener`** — the Service declares a port
+  k3sm's own listeners own: the NodePort range `30000-32767`, or the kubelet API port `10250`. No
+  listener is bound and the status stays empty **on purpose** (taking `10250` would break
+  `kubectl logs`/`exec`/`top` on this node). Pick a different `spec.ports[].port`. Normally the API
+  rejects such a Service at `kubectl apply` with a message naming the port; if it did not, the admission
+  policy failed to provision — the log carries a matching `provision reserved-loadbalancer-port DENY
+  policy` error.
+- **`svclb: listener bind failed`** — something else already holds that wildcard port. The log line
+  carries the exact diagnostic command; run it:
+
+  ```sh
+  lsof -nP -iTCP:<port> -sTCP:LISTEN
+  ```
+
+  The usual culprits are another process on the Mac, a **pod** (macOS has no network namespaces, so pods
+  share the node's port space — see [limitations.md](limitations.md)), or a second LoadBalancer Service
+  declaring the same port. k3sm never picks a different port for you.
+- **`loadbalancer/ingress status will stay EMPTY: no advertisable node address could be derived`** — the
+  listeners are bound and serving, but there is no honest address to publish, so nothing is written
+  rather than advertising an unreachable one. Check `kubectl get node -o wide` shows a non-loopback
+  `INTERNAL-IP`, and that you did not start the server with `--network none`.
+- **`ingress bind retries exhausted`** — the ingress listeners gave up (bounded retry, no port
+  fallback). Free the port and restart the daemon.
+
+Restart the control plane after fixing the conflict:
+
+```sh
+sudo launchctl kickstart -k system/io.k3sm.server
+```
+
+**A `<pending>` Service is not visible in `kubectl describe`** — k3sm has no `EventRecorder` for this
+path yet (`B75`), so the log file is the only place the reason appears.
 
 ## `kubectl top` returns no metrics
 

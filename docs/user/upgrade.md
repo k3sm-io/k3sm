@@ -37,6 +37,38 @@ kickstart`, not a runtime flag flip. Datastore schema migrations may be forward-
 a datastore migration, plan the forward fix rather than assuming a clean downgrade — see
 [backup-restore.md](backup-restore.md).
 
+### Rolling back past the LoadBalancer bind change leaves durable state
+
+The release that moved LoadBalancer/Ingress listeners to the wildcard also changed **what k3sm writes
+into the cluster**, and the older binary has no code to clean either of those up. Reverting the binary
+does **not** revert them; you have to.
+
+1. **Stale `EXTERNAL-IP` entries.** The new server advertises the node's derived InternalIP (e.g.
+   `100.64.0.1`). The old server only ever retracted the address it was configured with — the loopback
+   default — so it will **never** remove a derived entry. A rolled-back cluster keeps advertising an
+   address its listeners are no longer on. Retract them by hand:
+
+   ```sh
+   kubectl get svc -A -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}'
+   kubectl patch svc <name> -n <ns> --subresource=status --type=merge -p '{"status":{"loadBalancer":{}}}'
+   ```
+
+   Do the same for any `Ingress` of the `k3sm` class (`kubectl patch ingress … --subresource=status`).
+
+2. **The reserved-port Deny policy keeps rejecting Services.** The new server provisions the
+   `k3sm-reject-loadbalancer-reserved-port` ValidatingAdmissionPolicy, which lives in the datastore and
+   **survives the downgrade**. The old binary neither knows about it nor deletes it, so a
+   `type: LoadBalancer` Service on a NodePort-range port or on `10250` stays rejected at
+   `kubectl apply`. If you want the old (unguarded) behaviour back, delete both objects:
+
+   ```sh
+   kubectl delete validatingadmissionpolicybinding k3sm-reject-loadbalancer-reserved-port-binding
+   kubectl delete validatingadmissionpolicy        k3sm-reject-loadbalancer-reserved-port
+   ```
+
+   Leaving them in place is also a valid choice — the policy is honest about a real collision on the old
+   binary too.
+
 ## Next
 
 - [backup-restore.md](backup-restore.md) — snapshot before upgrading.
