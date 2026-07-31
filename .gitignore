@@ -9,6 +9,12 @@
 go.work
 go.work.sum
 
+# Parallel-agent lane worktrees (.claude/rules/parallel-worktrees.md). Lanes normally live
+# OUTSIDE this tree ($K3SM_LANE_ROOT, default ../k3sm-io.worktrees) so `go env GOWORK`
+# cannot escape upward into the workspace go.work; this entry is defence in depth for a
+# lane rooted in-tree by mistake. `hack/worktree.sh doctor` still reports one.
+/.worktrees/
+
 # macOS / editors
 .DS_Store
 .idea/
