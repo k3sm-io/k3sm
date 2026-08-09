@@ -24,14 +24,44 @@ residual limitation (no per-pod uid isolation) — is documented in `docs/privil
 
 ## What gets installed where
 
-- The signed `k3sm` binary (Homebrew keeps the previous bottle so rollback does not require a rebuild).
+- The `k3sm` binary, whichever channel delivered it (with Homebrew, the previous version is
+  retained so rollback does not require a rebuild; with the script, pin `K3SM_INSTALL_VERSION`
+  to reinstall a prior release — the assets stay on GitHub Releases).
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels.
 - The kine/SQLite datastore under the server work directory (see [backup-restore.md](backup-restore.md)).
 
-## Homebrew vs release binary
+## Install channels — the three generations
 
-The supported install is the Homebrew tap (a notarized bottle). A standalone notarized release binary is
-also published for air-gapped or scripted installs. Both are the same signed artifact.
+k3sm's distribution ships in three explicit generations, in shipping order:
+
+1. **The install script (gen 1 — first to ship):**
+
+   ```sh
+   curl -fsSL https://k3sm.io/install.sh | sh
+   ```
+
+   The script preflights (Apple silicon, macOS 26+), downloads the release tarball and its
+   checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do,
+   and then runs `sudo k3sm install`. The verification is **same-origin integrity** — the
+   tarball matches the checksums published beside it — not publisher identity; provenance
+   (Developer ID + notarization) arrives with gen 3. Options, via environment variables:
+   `K3SM_INSTALL_VERSION=v0.1.0` pins a release (also the repair path — an unpinned re-run
+   jumps to latest); `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into the current
+   directory without ever running `sudo`, so you can inspect first. Re-running the one-liner
+   upgrades in place (both daemons restart briefly — see [upgrade.md](upgrade.md)).
+
+2. **Homebrew (gen 2):** `brew install k3sm-io/tap/k3sm`, then `sudo k3sm install` — supported
+   once the tap ships.
+
+3. **Notarized `.pkg` (gen 3):** a signed, stapled installer package for offline and managed
+   installs.
+
+> **Status:** no k3sm release is published yet. Until the first tagged release the script
+> reports that cleanly and installs nothing; the tap and the `.pkg` follow it.
+
+**Switching channels:** every channel manages the same `/Library/k3sm`. After switching (script
+→ brew or back), run `sudo k3sm install` so the daemons run the newly delivered binary — or
+`sudo k3sm uninstall` first for a clean cutover.
 
 ## Verifying
 
