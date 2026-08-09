@@ -4,14 +4,27 @@ Moving a k3sm node or cluster to a new release.
 
 ## Single node
 
+Script (gen-1) installs — re-run the one-liner:
+
+```sh
+curl -fsSL https://k3sm.io/install.sh | sh
+```
+
+An unpinned re-run installs the **latest** release. Pin `K3SM_INSTALL_VERSION=vX.Y.Z` to
+re-install the version you are already on (repair without upgrading), and pin an older version
+to downgrade — that pin-and-re-run is the script channel's rollback path.
+
+Homebrew installs:
+
 ```sh
 brew upgrade k3sm
 ```
 
-The Homebrew upgrade replaces the signed binary and re-`launchctl kickstart`s the k3sm LaunchDaemons
-(the `io.k3sm.netd` root helper and the `_k3sm` server/agent jobs) onto the new version. This is a
-**hard cut** with a brief daemon restart — the node is momentarily unavailable while the daemon
-restarts.
+Either way the upgrade replaces the binary and restarts the k3sm LaunchDaemons (the
+`io.k3sm.netd` root helper and the `_k3sm` server/agent jobs) onto the new version — Homebrew
+via `launchctl kickstart`, the script via the `sudo k3sm install` re-run. This is a **hard
+cut** with a brief daemon restart — the node is momentarily unavailable while the daemons
+restart.
 
 ## Multi-node — roll node-by-node
 
@@ -25,8 +38,9 @@ control-plane Mac last unless a release note says otherwise. See [multi-node.md]
 
 - **Snapshot the datastore.** Take a datastore backup first so you can roll back state if needed — see
   [backup-restore.md](backup-restore.md).
-- **Keep the previous bottle.** Homebrew retains the prior notarized bottle, so rollback does not require
-  a rebuild-and-notarize round-trip.
+- **Know your rollback path.** Homebrew retains the prior bottle, so rollback does not require a
+  rebuild round-trip; on the script channel, prior releases stay downloadable — rollback is
+  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
 - **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
   [versions.md](versions.md).
 
@@ -65,8 +79,9 @@ can cause — silently in place.
 
 ## Rollback
 
-Rollback is **revert to the previous binary** (`brew` pin/switch to the prior bottle) plus a `launchctl
-kickstart`, not a runtime flag flip. Datastore schema migrations may be forward-only; if a release notes
+Rollback is **revert to the previous binary** (`brew` pin/switch to the prior bottle, or on the
+script channel `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run) plus the daemon restart that
+comes with it, not a runtime flag flip. Datastore schema migrations may be forward-only; if a release notes
 a datastore migration, plan the forward fix rather than assuming a clean downgrade — see
 [backup-restore.md](backup-restore.md).
 

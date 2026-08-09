@@ -9,12 +9,15 @@ path; [install.md](install.md) explains what happens underneath.
 ## 1. Install
 
 ```sh
-brew install k3sm-io/tap/k3sm      # or download a notarized release binary
-sudo k3sm install                  # one-time admin step (see install.md)
+curl -fsSL https://k3sm.io/install.sh | sh   # downloads, sha256-verifies, runs sudo k3sm install
+# or, once the tap ships:
+#   brew install k3sm-io/tap/k3sm && sudo k3sm install
 ```
 
-The one-time `sudo k3sm install` creates the unprivileged `_k3sm` user, installs the LaunchDaemons,
-and writes an admin kubeconfig to your home directory. After that, day-to-day use needs **no `sudo`**.
+The one-time admin step (`sudo k3sm install`, which the script runs for you after printing what it
+is about to do) creates the unprivileged `_k3sm` user, installs the LaunchDaemons, and writes an
+admin kubeconfig to your home directory. After that, day-to-day use needs **no `sudo`**. See
+[install.md](install.md) for the install-channel generations and the script's options.
 
 ## 2. Start the control plane + node
 

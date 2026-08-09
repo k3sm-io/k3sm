@@ -392,6 +392,9 @@ phases:
           - id: M7.1-d5
             done: false
             desc: "STUB. Versioning: SemVer v0.x.y (NOT +k3sm1 — k3sm.io/apis must stay go-gettable), same tag across all four repos, four SHAs recorded; k8s alignment via k3sm version + docs/user/versions.md (states the DefaultKubeVersion v1.36.2 vs client-libs v0.35 skew). CHANGELOG.md Keep-a-Changelog. Apple Developer enrollment + certs + ASC key + tap bootstrap are human-only, START IMMEDIATELY (calendar critical path)."
+          - id: M7.1-d6
+            done: false
+            desc: "STUB (M7.1-d6). Gen-1 curl|sh installer (workspace m7-plan Res. 21 — the curl→brew→pkg ladder): k3sm/install.sh at the repo root (k3s convention), served byte-identical at https://k3sm.io/install.sh (workspace hack/verify-install-sync.sh asserts the copy). POSIX sh, main-at-end truncation guard; darwin preflight fail-closed on sysctl hw.optional.arm64 = 1 (Rosetta-proof) + macOS≥26; latest via the releases/latest 302 or K3SM_INSTALL_VERSION; tarball+checksums fetch; exact-entry sha256 verify (hard-fail on a missing entry, before shasum); unconditional pre-escalation banner; sudo <staging>/k3sm install (re-run = upgrade). Ships FIRST — curl sets no quarantine xattr + the Go linker's ad-hoc arm64 signature (the m9 Amendment-16 mechanism) — but the LIVE channel completes only from the first M7.1-d1-complete release (the archive must add k3sm-execshim + both shim dylibs + the cp-payload; the first public tag waits for that — Res. 21). Gate: hack/acceptance/B137.sh (fully mocked e2e: loopback release server, PATH-stubbed sudo/uname/sw_vers/sysctl, T1-T14)."
         acceptance:
           - id: M7.1-a1
             met: false
