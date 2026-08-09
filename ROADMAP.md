@@ -44,8 +44,11 @@ two-Mac gates are burned down in M7. What works:
 
 The first public release. Two tracks, both launch-blocking:
 
-- **Ship it.** `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server`: a signed, notarized
-  binary via goreleaser, GitHub Actions CI across all repos, user docs (`docs/user/`, including
+- **Ship it.** Install arrives in three generations, in shipping order: *(1)*
+  `curl -fsSL https://k3sm.io/install.sh | sh` — a checksum-verified release tarball handed to
+  `sudo k3sm install` (works from the first tagged release; a curl download carries no quarantine
+  xattr); *(2)* `brew install k3sm-io/tap/k3sm`; *(3)* a signed, notarized `.pkg`. Underneath:
+  goreleaser, GitHub Actions CI across all repos, user docs (`docs/user/`, including
   `limitations.md`), and the website.
 - **MLX — the differentiator.** Native Apple-Silicon ML serving: schedule and serve ML models on
   Apple GPUs / unified memory with first-class Kubernetes semantics. An **`MLXModel` CRD**
