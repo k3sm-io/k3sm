@@ -17,7 +17,10 @@ limitations under the License.
 package oci
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -28,16 +31,18 @@ import (
 )
 
 // Sink is where an assembled image is written. It is the seam a store-backed or
-// registry-backed writer slots into later without touching the build code.
+// registry-backed writer slots into later without touching the build code —
+// both of those are cancellable blocking IO, which is why ctx is here from the
+// start rather than as a later breaking change to an exported interface.
 type Sink interface {
-	Write(ref name.Reference, img ggcrv1.Image) error
+	Write(ctx context.Context, ref name.Reference, img ggcrv1.Image) error
 }
 
 // TarballSink writes a docker-save tarball at Path, loadable with `docker load`.
 type TarballSink struct{ Path string }
 
 // Write implements Sink.
-func (s TarballSink) Write(ref name.Reference, img ggcrv1.Image) error {
+func (s TarballSink) Write(_ context.Context, ref name.Reference, img ggcrv1.Image) error {
 	tag, ok := ref.(name.Tag)
 	if !ok {
 		return fmt.Errorf("a docker-save tarball needs a tagged reference, got %q", ref)
@@ -53,13 +58,21 @@ func (s TarballSink) Write(ref name.Reference, img ggcrv1.Image) error {
 type LayoutSink struct{ Path string }
 
 // Write implements Sink.
-func (s LayoutSink) Write(ref name.Reference, img ggcrv1.Image) error {
+func (s LayoutSink) Write(_ context.Context, ref name.Reference, img ggcrv1.Image) error {
 	if err := os.MkdirAll(s.Path, 0o755); err != nil {
 		return fmt.Errorf("create layout dir %s: %w", s.Path, err)
 	}
-	p, err := layout.Write(s.Path, empty.Index)
+	// An OCI layout is a multi-image container: re-initializing an existing one
+	// would drop the manifests already indexed there while orphaning their
+	// blobs, silently narrowing an artifact the operator is accumulating into.
+	p, err := layout.FromPath(s.Path)
 	if err != nil {
-		return fmt.Errorf("init layout %s: %w", s.Path, err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("open layout %s: %w", s.Path, err)
+		}
+		if p, err = layout.Write(s.Path, empty.Index); err != nil {
+			return fmt.Errorf("init layout %s: %w", s.Path, err)
+		}
 	}
 	if err := p.AppendImage(img, layout.WithAnnotations(map[string]string{
 		"org.opencontainers.image.ref.name": ref.String(),

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -209,6 +210,7 @@ func testContainment(t *testing.T) {
 		docker  string
 		want    error
 		wantErr bool
+		check   func(t *testing.T, entries []tarEntry)
 	}{
 		{
 			name:    "relative-parent-escape",
@@ -283,6 +285,21 @@ func testContainment(t *testing.T) {
 				}
 			},
 			docker: "FROM scratch\nCOPY /etc/passwd /p",
+			check: func(t *testing.T, entries []tarEntry) {
+				// Asserting the BODY is what falsifies a host-reading
+				// implementation: the host /etc/passwd contains neither the
+				// marker string nor an unsafe name, so a name-only check passes
+				// for the very bug this row exists to catch.
+				var got string
+				for _, e := range entries {
+					if e.name == "p" {
+						got = string(e.body)
+					}
+				}
+				if got != "in-context" {
+					t.Errorf("entry \"p\" body = %q, want %q (the host file was read)", got, "in-context")
+				}
+			},
 		},
 		{
 			// Docker parity: "/.." is a no-op at the image root, so this is a
@@ -327,15 +344,143 @@ func testContainment(t *testing.T) {
 			}
 			// The escape cases above must not merely error — no image k3sm
 			// builds may ever contain the out-of-context bytes, and no emitted
-			// entry name may escape the image root.
+			// entry name or symlink target may escape the image root.
 			for _, e := range layerEntries(t, img) {
 				if strings.Contains(string(e.body), "PRIVATE KEY") {
 					t.Fatalf("entry %q carries out-of-context bytes", e.name)
 				}
 				assertSafeEntryName(t, e.name)
+				assertSafeLinkname(t, e.name, e.hdr.Linkname)
+			}
+			if tc.check != nil {
+				tc.check(t, layerEntries(t, img))
 			}
 		})
 	}
+
+	// A symlink can point upward through directories that EXIST inside the
+	// context — so it resolves in-context and passes the source-side check —
+	// while the entry it produces sits shallower in the image and escapes on
+	// extraction. Paired with the parent dirs a later layer emits, that is a
+	// write-through primitive against any unpacker that mkdir -p's a component
+	// which is already a symlink.
+	t.Run("symlink-target-escaping-image-root-is-refused", func(t *testing.T) {
+		t.Parallel()
+		ctxDir := t.TempDir()
+		deep := filepath.Join(ctxDir, "a", "b", "c", "d", "e", "f")
+		if err := os.MkdirAll(deep, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ctxDir, "payload"), []byte("PAYLOAD"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Resolves to <ctx>/payload — inside the context.
+		if err := os.Symlink("../../../../../../payload", filepath.Join(deep, "esc")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := buildFrom(t, "FROM scratch\nCOPY a/b/c/d/e/f/esc /esc", ctxDir)
+		if !errors.Is(err, oci.ErrBadEntryName) {
+			t.Fatalf("build = %v, want ErrBadEntryName", err)
+		}
+	})
+
+	// Colliding multi-source COPY: the dedup keeps the last of each equal-name
+	// run, so the winner must be the last SOURCE. With an unstable sort the Go
+	// runtime's pivot choice picks the winner instead, making the layer digest a
+	// function of the toolchain. 12 names are used because the failure only
+	// appears once pdqsort stops falling back to insertion sort.
+	t.Run("colliding-multi-source-copy-last-source-wins", func(t *testing.T) {
+		t.Parallel()
+		ctxDir := t.TempDir()
+		for _, sub := range []string{"sub1", "sub2"} {
+			if err := os.MkdirAll(filepath.Join(ctxDir, sub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for i := range 12 {
+				name := filepath.Join(ctxDir, sub, string(rune('a'+i)))
+				if err := os.WriteFile(name, []byte(sub), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		img, err := buildFrom(t, "FROM scratch\nCOPY sub1 sub2 /dest/", ctxDir)
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		n := 0
+		for _, e := range layerEntries(t, img) {
+			if e.hdr.Typeflag != tar.TypeReg {
+				continue
+			}
+			n++
+			if string(e.body) != "sub2" {
+				t.Errorf("entry %q body = %q, want %q (last source must win)", e.name, e.body, "sub2")
+			}
+		}
+		if n != 12 {
+			t.Errorf("got %d regular entries, want 12", n)
+		}
+	})
+
+	// A "."-terminated destination is a DIRECTORY, not a rename. Recognizing only
+	// a trailing "/" silently writes the payload as a regular file at the
+	// WORKDIR path.
+	t.Run("dot-destination-is-a-directory", func(t *testing.T) {
+		t.Parallel()
+		ctxDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(ctxDir, "app"), []byte("payload"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct{ name, docker, want string }{
+			{"workdir-relative-dot", "FROM scratch\nWORKDIR /w\nCOPY app .", "w/app"},
+			{"explicit-slash-dot", "FROM scratch\nCOPY app /w/.", "w/app"},
+			{"root-dot", "FROM scratch\nCOPY app .", "app"},
+		} {
+			img, err := buildFrom(t, tc.docker, ctxDir)
+			if err != nil {
+				t.Fatalf("%s: build = %v", tc.name, err)
+			}
+			var names []string
+			for _, e := range layerEntries(t, img) {
+				if e.hdr.Typeflag == tar.TypeReg {
+					names = append(names, e.name)
+				}
+			}
+			if len(names) != 1 || names[0] != tc.want {
+				t.Errorf("%s: regular entries = %v, want [%s]", tc.name, names, tc.want)
+			}
+		}
+	})
+
+	t.Run("in-image-relative-symlink-is-preserved", func(t *testing.T) {
+		t.Parallel()
+		ctxDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(ctxDir, "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ctxDir, "d", "real"), []byte("R"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("real", filepath.Join(ctxDir, "d", "link")); err != nil {
+			t.Fatal(err)
+		}
+		img, err := buildFrom(t, "FROM scratch\nCOPY d /d/", ctxDir)
+		if err != nil {
+			t.Fatalf("build = %v, want nil (a legitimate relative link must survive)", err)
+		}
+		var found bool
+		for _, e := range layerEntries(t, img) {
+			if e.name == "d/link" {
+				found = true
+				if e.hdr.Linkname != "real" {
+					t.Errorf("linkname = %q, want %q", e.hdr.Linkname, "real")
+				}
+			}
+		}
+		if !found {
+			t.Error("the symlink entry was dropped")
+		}
+	})
 
 	// The write-side invariant, stated once over a set of hostile destinations:
 	// a pushed image is somebody else's untrusted input, so a builder that can
@@ -361,6 +506,23 @@ func testContainment(t *testing.T) {
 			}
 		}
 	})
+}
+
+// assertSafeLinkname pins that no emitted symlink escapes the image root when
+// resolved at its own depth.
+func assertSafeLinkname(t *testing.T, name, link string) {
+	t.Helper()
+	if link == "" {
+		return
+	}
+	if strings.HasPrefix(link, "/") {
+		t.Errorf("entry %q targets the absolute path %q", name, link)
+		return
+	}
+	resolved := path.Join(path.Dir(name), link)
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		t.Errorf("entry %q targets %q, which escapes the image root", name, link)
+	}
 }
 
 // assertSafeEntryName pins the properties every emitted tar entry name must have.
@@ -644,7 +806,7 @@ func testOutputSinks(t *testing.T) {
 	t.Run("tarball-round-trips", func(t *testing.T) {
 		t.Parallel()
 		out := filepath.Join(t.TempDir(), "img.tar")
-		if err := build(buildOptions{
+		if err := build(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
 			tag:        "example.com/app:v1",
 			output:     out,
@@ -669,7 +831,7 @@ func testOutputSinks(t *testing.T) {
 	t.Run("oci-layout-round-trips", func(t *testing.T) {
 		t.Parallel()
 		out := filepath.Join(t.TempDir(), "layout")
-		if err := build(buildOptions{
+		if err := build(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
 			tag:        "example.com/app:v1",
 			output:     out,
@@ -693,7 +855,7 @@ func testOutputSinks(t *testing.T) {
 			t.Fatal(err)
 		}
 		out := filepath.Join(t.TempDir(), "img.tar")
-		err := build(buildOptions{
+		err := build(t.Context(), buildOptions{
 			dockerfile: bad, tag: "example.com/app:v1", output: out, format: "docker", contextDir: ctxDir,
 		}, io.Discard)
 		if !errors.Is(err, oci.ErrRunUnsupported) {

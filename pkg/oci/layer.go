@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -77,8 +78,17 @@ func BuildLayer(entries []entry, tmpDir string) (ggcrv1.Layer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stage layer: %w", err)
 	}
-	path := f.Name()
+	staged := f.Name()
 	defer f.Close()
+	// The staged tar holds whatever the recipe copied; on any error path it must
+	// not be left behind, since a library caller with TmpDir:"" stages into the
+	// shared OS temp dir.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(staged)
+		}
+	}()
 
 	if err := writeTar(f, entries); err != nil {
 		return nil, err
@@ -90,7 +100,12 @@ func BuildLayer(entries []entry, tmpDir string) (ggcrv1.Layer, error) {
 	// Uncompressed: the digest then depends only on this package's tar output,
 	// never on compress/flate's byte-level behavior, which carries no
 	// cross-version compatibility promise.
-	return tarball.LayerFromFile(path, tarball.WithMediaType(types.OCIUncompressedLayer))
+	layer, err := tarball.LayerFromFile(staged, tarball.WithMediaType(types.OCIUncompressedLayer))
+	if err != nil {
+		return nil, fmt.Errorf("open staged layer: %w", err)
+	}
+	committed = true
+	return layer, nil
 }
 
 // writeTar emits the normalized archive. Entries arrive pre-sorted by in-image
@@ -126,6 +141,9 @@ func writeTar(w io.Writer, entries []entry) error {
 		case e.dir:
 			hdr.Typeflag, hdr.Name, hdr.Mode = tar.TypeDir, e.name+"/", modeDir
 		case e.link != "":
+			if err := checkLinkname(e.name, e.link); err != nil {
+				return err
+			}
 			hdr.Typeflag, hdr.Linkname, hdr.Mode = tar.TypeSymlink, e.link, modeLink
 		default:
 			hdr.Typeflag, hdr.Size, hdr.Mode = tar.TypeReg, e.size, modeFile
@@ -192,6 +210,36 @@ func writeParents(tw *tar.Writer, name string, seen map[string]bool) error {
 		}); err != nil {
 			return fmt.Errorf("write parent dir %s: %w", dir, err)
 		}
+	}
+	return nil
+}
+
+// checkLinkname refuses a symlink entry whose target escapes the image root when
+// resolved at the entry's OWN depth.
+//
+// A context symlink can point upward through directories that exist inside the
+// context — so it resolves in-context and passes the source-side containment
+// check — while the entry it produces sits at a shallower depth in the image and
+// therefore escapes on extraction. Nesting the link deeper in the context makes
+// the escape arbitrarily deep. Paired with the parent directories writeParents
+// emits for a later entry, that is a write-through primitive against any
+// unpacker that mkdir -p's a component which already exists as a symlink.
+//
+// A symlink whose "../" count exceeds its own depth is never a legitimate image
+// construct; every relative link a real image carries satisfies this.
+func checkLinkname(name, link string) error {
+	if link == "" {
+		return fmt.Errorf("%q has an empty symlink target: %w", name, ErrBadEntryName)
+	}
+	if strings.HasPrefix(link, "/") {
+		return fmt.Errorf("%q targets the absolute path %q: %w", name, link, ErrBadEntryName)
+	}
+	if strings.ContainsRune(link, 0) {
+		return fmt.Errorf("%q symlink target contains NUL: %w", name, ErrBadEntryName)
+	}
+	resolved := path.Join(path.Dir(name), link)
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return fmt.Errorf("%q targets %q, which escapes the image root: %w", name, link, ErrBadEntryName)
 	}
 	return nil
 }

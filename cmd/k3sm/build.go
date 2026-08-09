@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -62,7 +63,7 @@ func runBuild(args []string) error {
 	if err != nil {
 		return err
 	}
-	return build(opts, os.Stdout)
+	return build(context.Background(), opts, os.Stdout)
 }
 
 // parseBuildArgs parses argv. It uses ContinueOnError so a bad flag is an error
@@ -119,7 +120,7 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 
 // build parses, assembles and writes. Parsing completes before the output is
 // opened, so a Dockerfile rejected on its last line leaves no artifact behind.
-func build(o buildOptions, out io.Writer) error {
+func build(ctx context.Context, o buildOptions, out io.Writer) error {
 	ref, err := name.NewTag(o.tag)
 	if err != nil {
 		return fmt.Errorf("--tag %q: %w", o.tag, err)
@@ -155,7 +156,7 @@ func build(o buildOptions, out io.Writer) error {
 	if o.format == "oci" {
 		sink = oci.LayoutSink{Path: o.output}
 	}
-	if err := sink.Write(ref, img); err != nil {
+	if err := sink.Write(ctx, ref, img); err != nil {
 		return err
 	}
 

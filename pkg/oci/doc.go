@@ -70,15 +70,27 @@ limitations under the License.
 //
 // # Build-context containment
 //
-// Every COPY/ADD source is resolved through exactly one helper (see
-// (*Context).Open) that applies, in order: a lexical filepath.Join + containment
-// check, a resolved-vs-resolved EvalSymlinks re-check, and an O_NOFOLLOW open
-// whose fd is then fstat'd and read with a cap. There is no second resolution
-// site. An absolute source is interpreted RELATIVE TO THE CONTEXT ROOT (Docker
-// parity) — never as a host path.
+// Every COPY/ADD source passes through (*Context).resolve (lexical
+// filepath.Join + containment) and (*Context).checkResolved (a
+// resolved-vs-resolved EvalSymlinks re-check), and its bytes are read only via
+// openRegular, which opens O_NOFOLLOW and sizes from the fd. An absolute source
+// is interpreted RELATIVE TO THE CONTEXT ROOT (Docker parity) — never as a host
+// path.
 //
 // Without this, "COPY ../../../../var/lib/k3sm/server/tls/cluster-ca.key /"
 // would package the cluster CA private key into an image.
+//
+// Honest limit: the containment decision is made against a PATH, and openRegular
+// re-opens that path when the tar is written. O_NOFOLLOW guards only the final
+// component, so an intermediate directory swapped for a symlink between
+// selection and read would still redirect it. Closing that needs an
+// openat-from-root-fd walk; the residual exposure is a concurrent writer inside
+// the operator's own build context.
+//
+// The write side is guarded too: no emitted tar entry name may be absolute,
+// traverse upward, or carry an OCI whiteout prefix, and no emitted symlink may
+// target a path that escapes the image root at the entry's own depth. A pushed
+// image is somebody else's untrusted input.
 //
 // # Determinism
 //

@@ -70,7 +70,10 @@ func Build(req Request) (ggcrv1.Image, error) {
 		return nil, err
 	}
 
-	img := stampPlatform(empty.Image)
+	img, err := stampPlatform(empty.Image)
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := img.ConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("read base config: %w", err)
@@ -105,27 +108,22 @@ func Build(req Request) (ggcrv1.Image, error) {
 
 		case VerbEnv:
 			cfg.Config.Env = mergeEnv(cfg.Config.Env, inst.Args)
-			cfg.History = append(cfg.History, history(inst))
 
 		case VerbEntrypoint:
 			cfg.Config.Entrypoint = command(inst)
-			cfg.History = append(cfg.History, history(inst))
 
 		case VerbCmd:
 			cfg.Config.Cmd = command(inst)
-			cfg.History = append(cfg.History, history(inst))
 
 		case VerbWorkdir:
 			workdir = joinWorkdir(workdir, inst.Args[0])
 			cfg.Config.WorkingDir = workdir
-			cfg.History = append(cfg.History, history(inst))
 
 		case VerbLabel:
 			for _, kv := range inst.Args {
 				k, v, _ := strings.Cut(kv, "=")
 				cfg.Config.Labels[k] = v
 			}
-			cfg.History = append(cfg.History, history(inst))
 
 		case VerbExpose:
 			if cfg.Config.ExposedPorts == nil {
@@ -134,19 +132,18 @@ func Build(req Request) (ggcrv1.Image, error) {
 			for _, p := range inst.Args {
 				cfg.Config.ExposedPorts[p] = struct{}{}
 			}
-			cfg.History = append(cfg.History, history(inst))
 		}
 	}
 
-	// mutate.Append wrote its own history entries for the layer instructions;
-	// re-apply the accumulated metadata history on top so the config carries one
-	// entry per instruction, in source order.
+	// mutate.Append wrote its own history entries for the layer instructions.
+	// Take RootFS from the assembled image and derive history in ONE place, so
+	// there is a single derivation rather than two that must be proven equal.
 	merged, err := img.ConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("read assembled config: %w", err)
 	}
 	cfg.RootFS = merged.RootFS
-	cfg.History = orderedHistory(req.Dockerfile, merged.History, cfg.History)
+	cfg.History = orderedHistory(req.Dockerfile)
 	cfg.Created = ggcrv1.Time{Time: epoch}
 	cfg.Author = ""
 	cfg.Container = ""
@@ -161,7 +158,9 @@ func Build(req Request) (ggcrv1.Image, error) {
 
 // checkPlatform enforces the single supported target.
 func checkPlatform(p string) error {
-	if p == "" || p == DefaultPlatform {
+	// Accept the full triple too: it is the spelling this builder stamps into
+	// the config, and the one runtimed's platform selection canonicalizes to.
+	if p == "" || p == DefaultPlatform || p == DefaultPlatform+"/"+PlatformVariant {
 		return nil
 	}
 	return fmt.Errorf(
@@ -173,18 +172,21 @@ func checkPlatform(p string) error {
 // carries neither field, and a config with an empty os or architecture is
 // rejected outright by k3sm's own platform verification — so a naive
 // mutate.AppendLayers(empty.Image, …) would produce an image k3sm cannot pull.
-func stampPlatform(base ggcrv1.Image) ggcrv1.Image {
+func stampPlatform(base ggcrv1.Image) (ggcrv1.Image, error) {
 	cfg, err := base.ConfigFile()
 	if err != nil {
-		return base
+		return nil, fmt.Errorf("read base config: %w", err)
 	}
 	cfg = cfg.DeepCopy()
 	cfg.OS, cfg.Architecture, cfg.Variant = PlatformOS, PlatformArch, PlatformVariant
 	out, err := mutate.ConfigFile(base, cfg)
 	if err != nil {
-		return base
+		// Returning the unstamped base here would emit a config with an empty
+		// os/architecture — exactly the "self-consistent lie" this function
+		// exists to prevent, and one that exits 0.
+		return nil, fmt.Errorf("stamp platform: %w", err)
 	}
-	return out
+	return out, nil
 }
 
 // history renders one instruction's history entry. EmptyLayer marks the
@@ -198,20 +200,17 @@ func history(inst Instruction) ggcrv1.History {
 	}
 }
 
-// orderedHistory returns one history entry per instruction in source order,
-// preferring the layer-bearing entries mutate.Append produced.
-func orderedHistory(df *Dockerfile, fromLayers, fromMeta []ggcrv1.History) []ggcrv1.History {
-	byRaw := make(map[string]ggcrv1.History, len(fromLayers)+len(fromMeta))
-	for _, h := range append(append([]ggcrv1.History{}, fromLayers...), fromMeta...) {
-		byRaw[h.CreatedBy] = h
-	}
+// orderedHistory returns one history entry per instruction, in source order.
+//
+// It folds directly over the instructions rather than reconciling the two
+// producers (mutate.Append's entries and the metadata verbs') by CreatedBy:
+// that keying is lossless only while both produce identical values for
+// identical raw lines — an invariant nothing states — and it would silently
+// collapse duplicate lines the moment history() grew a per-instruction field.
+func orderedHistory(df *Dockerfile) []ggcrv1.History {
 	out := make([]ggcrv1.History, 0, len(df.Instructions))
 	for _, inst := range df.Instructions {
 		if inst.Verb == VerbFrom {
-			continue
-		}
-		if h, ok := byRaw[inst.Raw]; ok {
-			out = append(out, h)
 			continue
 		}
 		out = append(out, history(inst))

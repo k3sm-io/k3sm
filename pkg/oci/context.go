@@ -49,7 +49,11 @@ var (
 	ErrContextTooLarge = errors.New("oci: build context selection is too large")
 )
 
-// MaxContextBytes bounds the total bytes one build may read from the context.
+// MaxContextBytes bounds the total bytes one BUILD may read from the context —
+// the budget is carried on the Context and spent across every COPY/ADD, not
+// reset per instruction (a per-instruction cap bounds nothing, since the
+// Dockerfile chooses the instruction count).
+//
 // On a single-Mac cluster the store shares a volume with the kine datastore, so
 // an unbounded `COPY .` at the wrong root is a control-plane availability
 // problem, not just a large image.
@@ -58,8 +62,11 @@ const MaxContextBytes int64 = 2 << 30 // 2 GiB
 // Context is an operator-supplied build-context directory. It is the only
 // gateway between a Dockerfile-supplied string and the filesystem.
 type Context struct {
-	root         string // absolute, symlink-resolved
-	rootResolved string
+	root         string // absolute, as given
+	rootResolved string // absolute, symlink-resolved
+
+	// remaining is the build-wide read budget, spent across all instructions.
+	remaining int64
 }
 
 // NewContext opens dir as a build context. The root is resolved once so every
@@ -81,7 +88,7 @@ func NewContext(dir string) (*Context, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve build context %s: %w", dir, err)
 	}
-	return &Context{root: abs, rootResolved: resolved}, nil
+	return &Context{root: abs, rootResolved: resolved, remaining: MaxContextBytes}, nil
 }
 
 // Root returns the context directory as given (absolute, unresolved).
@@ -153,10 +160,17 @@ func (c *Context) selectEntries(srcs []string, dest, workdir string) ([]entry, e
 	if !strings.HasPrefix(destPath, "/") {
 		destPath = filepath.Join(workdir, destPath)
 	}
-	destIsDir := strings.HasSuffix(dest, "/") || len(srcs) > 1
+	// A destination is a directory when it ends in "/", when it is "." or ".."
+	// (bare or as a final component), or when more than one source targets it.
+	// Recognizing only "/" would make `COPY app .` a file RENAME: under
+	// `WORKDIR /w` it silently writes the payload as a regular file named "w"
+	// where the working directory should be.
+	destIsDir := strings.HasSuffix(dest, "/") ||
+		dest == "." || dest == ".." ||
+		strings.HasSuffix(dest, "/.") || strings.HasSuffix(dest, "/..") ||
+		len(srcs) > 1
 
 	var out []entry
-	var total int64
 	for _, src := range srcs {
 		matches, err := c.glob(src)
 		if err != nil {
@@ -191,9 +205,9 @@ func (c *Context) selectEntries(srcs []string, dest, workdir string) ([]entry, e
 			if err != nil {
 				return nil, err
 			}
-			total += n
-			if total > MaxContextBytes {
-				return nil, fmt.Errorf("selection exceeds %d bytes: %w", MaxContextBytes, ErrContextTooLarge)
+			c.remaining -= n
+			if c.remaining < 0 {
+				return nil, fmt.Errorf("build exceeds the %d-byte context budget: %w", MaxContextBytes, ErrContextTooLarge)
 			}
 			out = append(out, got...)
 		}
@@ -202,7 +216,11 @@ func (c *Context) selectEntries(srcs []string, dest, workdir string) ([]entry, e
 		return nil, fmt.Errorf("%q: %w", strings.Join(srcs, " "), ErrSourceNotFound)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	// STABLE sort: the dedup below keeps the LAST of each equal-name run, so the
+	// winner must be the last SOURCE. An unstable sort would let the Go runtime's
+	// pivot choice pick the winner, making the emitted bytes — and therefore the
+	// layer digest — a function of the toolchain rather than of the recipe.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].name < out[j].name })
 	// A later source may name the same in-image path as an earlier one; the last
 	// wins, as it would with successive writes into a filesystem.
 	dedup := out[:0]
@@ -349,8 +367,14 @@ func (c *Context) leaf(host, name, src string, fi fs.FileInfo) (entry, int64, er
 
 // openRegular opens a regular file for reading with O_NOFOLLOW and returns it
 // with its authoritative size, taken from the descriptor rather than from a
-// prior path stat. Opening by fd and sizing by fstat closes the stat→read race:
-// a path re-opened after a check may be a different inode.
+// prior path stat. Sizing from the fd rather than from a prior path stat is what
+// lets copyBody refuse a file that changed under it.
+//
+// Honest limit: O_NOFOLLOW guards the FINAL path component only. An intermediate
+// directory swapped for a symlink between selection and the read would still
+// redirect it. Closing that needs an openat-from-root-fd walk (or Darwin's
+// O_NOFOLLOW_ANY); it is not closed here, and the exposure is a concurrent
+// writer inside the operator's own build context.
 func openRegular(path string) (*os.File, int64, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
