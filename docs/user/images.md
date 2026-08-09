@@ -2,8 +2,8 @@
 
 k3sm runs Pods as native Darwin processes, so its workloads are **not OCI Linux container
 images** — they are native arm64 executables. This page covers how to reference a workload
-**today**, and the OCI image path (registry pull, `k3sm image load`, `k3sm build`) that is on the
-[roadmap](../../ROADMAP.md).
+**today**, how to **build** an image with `k3sm build`, and the rest of the OCI image path
+(registry pull, `k3sm image load`) that is on the [roadmap](../../ROADMAP.md).
 
 ## Running a native workload today
 
@@ -41,21 +41,63 @@ neither, so a Linux image cannot run as a native Darwin process — one of the h
 in [limitations.md](limitations.md). Linux images are the province of the EXPERIMENTAL
 [`vm` RuntimeClass](vm-runtimeclass.md).
 
-## On the roadmap: the OCI-native image path
+## Building an image: `k3sm build`
+
+`k3sm build` packages a native darwin/arm64 payload into an OCI image from a COPY-only Dockerfile.
+It executes nothing — it copies files and writes metadata.
+
+```sh
+k3sm build --tag myapp:v1 --output myapp.tar .
+docker load -i myapp.tar          # the tarball is a standard docker-save archive
+k3sm build --tag myapp:v1 --output ./layout --format oci .   # or an OCI layout directory
+```
+
+```dockerfile
+FROM scratch
+COPY dist/myapp /usr/local/bin/myapp
+ENV LOG_LEVEL=info
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/myapp"]
+```
+
+**Accepted subset:** `FROM scratch`, `COPY`, `ADD`, `ENV`, `ENTRYPOINT`, `CMD`, `WORKDIR`, `LABEL`,
+`EXPOSE`. Everything else is refused with an error naming what was rejected — the parser never
+guesses and never silently drops an instruction, because a dropped instruction produces an image
+that looks built but is not what the recipe described.
+
+> **A built image is not yet runnable on k3sm.** The ingest and materialize path is still on the
+> roadmap below, so an `image: myapp:v1` Pod spec will **not** resolve to what you just built. Today
+> `k3sm build` produces a portable artifact for registries and other tools; to run a workload on
+> k3sm now, use the native conventions above.
+
+### Deliberate differences from `docker build`
+
+Each of these is a refusal or a documented gap, never a silent divergence:
+
+| | k3sm build |
+|---|---|
+| `RUN` | **Rejected.** This builder packages files; it does not execute them. The RUN-capable path is the vm-backed builder below. |
+| `FROM <ref>` | **Rejected** — `FROM scratch` only. Basing on a pulled image arrives with the registry-pull path. |
+| `ADD` | An exact alias of `COPY`. It does **not** fetch remote URLs and does **not** auto-extract archives; both are refused rather than silently downgraded. |
+| `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory — scope your `COPY` lines, or build from a clean tree. |
+| `--platform` | Accepts only `darwin/arm64`. The builder copies host files verbatim and does not cross-compile, so any other value would declare a platform the bytes do not satisfy. |
+| Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
+| Build output | Written to a path you name (`--output`). There is no default sink and no push; nothing is written to k3sm's shared image store. |
+| Timestamps | Fixed, not wall-clock — rebuilding the same context yields the same image digest. |
+
+## On the roadmap: the rest of the OCI-native image path
 
 Planned, in order (see the [roadmap](../../ROADMAP.md) for positioning):
 
 - **`k3sm image load` / `k3sm image import`** — ingest docker-save tarballs and OCI layouts (the
-  `docker buildx -o type=oci` output) into k3sm's image store.
-- **`k3sm build`** — package a native darwin/arm64 binary from a COPY-only Dockerfile subset
-  (`FROM scratch` + `COPY` + `ENTRYPOINT`; `RUN` is rejected until the vm-backed builder lands).
+  `docker buildx -o type=oci` output) into k3sm's image store, so a built image becomes runnable.
 - **Registry images natively** — `image: ghcr.io/org/app:tag` pulled, verified, and run with
   kubelet-faithful semantics (imagePullPolicy, pull-failure backoff, multi-arch selection).
 - **A full build engine** — `k3sm build` with `RUN` support via a managed BuildKit builder inside
   a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed.
 
-Until those land, the commands in this section do not exist — the native conventions above are the
-supported path.
+Until those land, the commands in *this* list do not exist — the native conventions above are the
+supported way to run a workload.
 
 ## Next
 
