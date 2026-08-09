@@ -1,7 +1,8 @@
 # k3sm — distribution & assembly
 
 Module **`k3sm.io/k3sm`** (≈ k3s): the single-binary distribution. `cmd/k3sm` (server | agent | node |
-install | token | kubectl | doctor | dev | …; `build`/`image` are planned — see docs/user/images.md),
+install | token | kubectl | doctor | dev | build | …; `image` is planned — see docs/user/images.md.
+`build` is COPY-only and writes to a file, not to the shared store; OCI plumbing lives in `pkg/oci`),
 `pkg/provider` (the Virtual Kubelet Darwin provider — the M0 HostProcess runtime), control-plane
 embedding (M1), launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 
