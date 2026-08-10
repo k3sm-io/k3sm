@@ -227,10 +227,10 @@ func (c Config) withDefaults() Config {
 		c.Logger = slog.New(slog.DiscardHandler)
 	}
 	if c.ExecShimSource == "" && c.BinarySource != "" {
-		c.ExecShimSource = filepath.Join(filepath.Dir(c.BinarySource), "k3sm-execshim")
+		c.ExecShimSource = filepath.Join(filepath.Dir(c.BinarySource), ExecShimName)
 	}
 	if c.PayloadSource == "" && c.BinarySource != "" {
-		c.PayloadSource = filepath.Join(filepath.Dir(c.BinarySource), "cp-payload")
+		c.PayloadSource = filepath.Join(filepath.Dir(c.BinarySource), PayloadDirName)
 	}
 	if c.PathShimSource == "" && c.BinarySource != "" {
 		c.PathShimSource = filepath.Join(filepath.Dir(c.BinarySource), PathShimName)
@@ -330,7 +330,7 @@ type artifact struct {
 // plists. Order is install order; uninstall walks it in reverse.
 func artifactManifest(cfg Config) []artifact {
 	cfg = cfg.withDefaults()
-	return []artifact{
+	items := []artifact{
 		// The _k3sm service user — created before the server daemon can resolve it.
 		// PRESERVED: its home IS DataRoot; removing it orphans the data root.
 		{kind: kindServiceUser, disp: dispPreserve, user: cfg.ServiceUser},
@@ -353,11 +353,14 @@ func artifactManifest(cfg Config) []artifact {
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedDNSShim(), assertExists: true},
 		// The control-plane payload staged into InstallDir/bin (the daemon boot
 		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
-		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-apiserver"), assertExists: true},
-		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-scheduler"), assertExists: true},
-		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kube-controller-manager"), assertExists: true},
-		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kubectl"), assertExists: true},
-		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "kine"), assertExists: true},
+	}
+	// Ranged over executor.PayloadBinaries() — the same source Install copies from
+	// — so a new payload binary cannot be installed without also being uninstalled
+	// (the manifest test asserts install ⊆ uninstall coverage).
+	for _, b := range executor.PayloadBinaries() {
+		items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", b), assertExists: true})
+	}
+	items = append(items, []artifact{
 		// FORWARD-DECLARED: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
 		// do NOT exist on disk today (cp/kine land under DataRoot at runtime), so
@@ -381,7 +384,8 @@ func artifactManifest(cfg Config) []artifact {
 		// daemon LogDir. Both survive an uninstall→reinstall.
 		{kind: kindDir, disp: dispPreserve, path: cfg.DataRoot, assertExists: false},
 		{kind: kindDir, disp: dispPreserve, path: LogDir, assertExists: false},
-	}
+	}...)
+	return items
 }
 
 // plistContent renders the launchd plist for a daemon label, so Install can drive

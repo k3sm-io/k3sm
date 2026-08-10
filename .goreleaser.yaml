@@ -35,11 +35,29 @@ builds:
       - CGO_ENABLED=1
     # Target the pkg/version vars (B57). goreleaser's default -X main.version
     # no-ops here (there is no main.version symbol → it would render "dev").
+    # -trimpath keeps absolute build paths off a CGO=1 binary, so two builds of
+    # one tag differ by as little as the toolchain allows.
+    flags:
+      - -trimpath
+    # Target the pkg/version vars (B57). goreleaser's default -X main.version
+    # no-ops here (there is no main.version symbol → it would render "dev").
+    #
+    # The three sibling *Commit stamps carry provenance build info CANNOT: this
+    # module's go.mod holds permanent filesystem `replace` directives onto the
+    # sibling checkouts, and a directory replacement has an empty module version,
+    # so debug.ReadBuildInfo can only ever report "(devel)" for them. The release
+    # tooling supplies the four commit SHAs it just verified clean and synced.
     ldflags:
       - -s -w
       - -X k3sm.io/k3sm/pkg/version.Version={{.Version}}
       - -X k3sm.io/k3sm/pkg/version.Commit={{.Commit}}
       - -X k3sm.io/k3sm/pkg/version.Date={{.Date}}
+      # envOrDefault, not .Env.X: a bare .Env lookup is a hard template error when
+      # the key is unset, which would break every snapshot build that is not a
+      # release (the archive-shape gate, a local `goreleaser build`).
+      - -X k3sm.io/k3sm/pkg/version.APISCommit={{ envOrDefault "K3SM_APIS_COMMIT" "" }}
+      - -X k3sm.io/k3sm/pkg/version.DarwinNetCommit={{ envOrDefault "K3SM_DARWIN_NET_COMMIT" "" }}
+      - -X k3sm.io/k3sm/pkg/version.RuntimedCommit={{ envOrDefault "K3SM_RUNTIMED_COMMIT" "" }}
     hooks:
       # Stage k3sm-netd as a renamed copy of the built single Mach-O so the
       # archive can include it without a second (non-existent) build.
@@ -69,21 +87,55 @@ archives:
           mode: 0755
       - LICENSE
       - NOTICE
-      # --- DEFERRED to the live M7.1 d1 payload-staging slice + B69 pure-Go kine
-      # --- pin. These members have NO in-tree producer today: the control-plane
-      # --- cp-payload (kube-apiserver / kube-scheduler / kube-controller-manager)
-      # --- is fetched at runtime (pkg/executor/setup.go), and kine is built at
-      # --- runtime (the bundled pure-Go kine pin is post-B69, not landed). They
-      # --- are listed here so the FULL manifest shape is reviewable, but they are
-      # --- commented out so this snapshot only stages what actually exists.
-      # - src: "dist/cp-payload/kube-apiserver"
-      # - src: "dist/cp-payload/kube-scheduler"
-      # - src: "dist/cp-payload/kube-controller-manager"
-      # - src: "dist/cp-payload/kine"
+      # --- The supporting artifacts `k3sm install` fail-fasts on. Their producer
+      # --- is hack/release/stage.sh, which builds them into build/stage/ BEFORE
+      # --- goreleaser runs (staging cannot live under dist/ — goreleaser owns
+      # --- that directory and --clean empties it).
+      #
+      # The set and its layout are NOT re-typed here from memory: they are
+      # pkg/install.RequiredSiblings, printed by `k3sm install
+      # --print-required-artifacts`, and the release gate asserts this archive's
+      # member list against that output. Adding an artifact there reddens the
+      # gate until a member appears here.
+      #
+      # Root-level members: strip_parent flattens the staging path, and NO dst,
+      # so the tar member is `k3sm-execshim`, resolved beside the binary.
+      - src: "build/stage/k3sm-execshim"
+        strip_parent: true
+        info:
+          mode: 0755
+      - src: "build/stage/libk3sm_pathrebase_shim.dylib"
+        strip_parent: true
+        info:
+          mode: 0755
+      - src: "build/stage/libk3sm_getaddrinfo_shim.dylib"
+        strip_parent: true
+        info:
+          mode: 0755
+      # Payload members: dst places them under cp-payload/ (install resolves
+      # PayloadSource at <binary dir>/cp-payload), strip_parent drops the staging
+      # prefix. Without BOTH, the members land at the archive root and install
+      # fail-fasts with "run `k3sm payload` first".
+      - src: "build/stage/cp-payload/*"
+        dst: cp-payload
+        strip_parent: true
+        info:
+          mode: 0755
 
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
   algorithm: sha256
+
+release:
+  # Draft by default: the archive is ~250 MB over a home uplink, and GitHub's
+  # `releases/latest` — which install.sh resolves when no version is pinned —
+  # skips drafts. A failed or partial upload therefore stays invisible to users
+  # instead of becoming the release every `curl | sh` installs. The publish step
+  # promotes the draft only after the post-publish verify passes.
+  draft: true
+  # `-rc.N` tags must never become `releases/latest` while a stable release
+  # exists; prerelease marking is what keeps the gen-1 curl channel off them.
+  prerelease: auto
 
 snapshot:
   # Keep snapshot versions from colliding with real tags.

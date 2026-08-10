@@ -209,7 +209,15 @@ func StagePayload(ctx context.Context, destDir string) error {
 	if err := ensureControlPlaneBinariesInto(ctx, destDir, DefaultKubeVersion); err != nil {
 		return err
 	}
-	return ensureKineInto(ctx, destDir, DefaultKineVersion)
+	if err := ensureKineInto(ctx, destDir, DefaultKineVersion); err != nil {
+		return err
+	}
+	// Fail closed on the packaging path: these bytes are about to be archived
+	// and published, so a third-party tag that moved (or an extra asset riding
+	// along) must stop the release rather than ship. The boot-path callers of
+	// ensure*Into are deliberately NOT gated on this — a dev fallback download
+	// is not a published artifact.
+	return VerifyPayloadDigests(destDir, DefaultKubeVersion)
 }
 
 // seedBinDir copies every payload binary present in payloadDir and absent from
