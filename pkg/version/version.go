@@ -50,6 +50,37 @@ var (
 	Date    = ""
 )
 
+// APISCommit, DarwinNetCommit, and RuntimedCommit are the sibling-module commit
+// SHAs stamped by the release pipeline via the same -X mechanism, e.g.
+//
+//	-X k3sm.io/k3sm/pkg/version.APISCommit=<sha>
+//
+// They exist because build-info CANNOT supply them for a release build: k3sm's
+// go.mod carries permanent filesystem `replace` directives onto the sibling
+// checkouts (a lone k3sm clone cannot build), and a directory replacement has an
+// empty module version, so modules() can only ever render "(devel)" for the three
+// siblings. The release records four commit SHAs as provenance for a
+// locally-built binary — the sibling tags are provenance markers, not consumable
+// module versions — so the pipeline stamps them here and modules() prefers a
+// stamped value over the "(devel)" it would otherwise report.
+//
+// Unstamped (every dev build) they are empty and nothing changes.
+var (
+	APISCommit      = ""
+	DarwinNetCommit = ""
+	RuntimedCommit  = ""
+)
+
+// stampedSiblingCommits maps a module path to its stamped commit SHA, empty when
+// unstamped. Kept beside the vars so adding a module means touching one place.
+func stampedSiblingCommits() map[string]string {
+	return map[string]string{
+		"k3sm.io/apis":       APISCommit,
+		"k3sm.io/darwin-net": DarwinNetCommit,
+		"k3sm.io/runtimed":   RuntimedCommit,
+	}
+}
+
 // modulePaths are the four k3sm.io modules k3sm assembles into its single binary
 // (DESIGN §6), in dependency order. Their release SHA/version is read from the
 // build info: a locally-replaced module (the go.work dev build) renders its
@@ -152,9 +183,17 @@ func modules(bi *debug.BuildInfo) []ModuleRef {
 	for _, dep := range bi.Deps {
 		byPath[dep.Path] = dep
 	}
+	stamped := stampedSiblingCommits()
 	refs := make([]ModuleRef, 0, len(modulePaths))
 	for _, path := range modulePaths {
 		ref := ModuleRef{Path: path, SHA: "unknown"}
+		// A stamped sibling SHA is release truth and wins outright: build-info
+		// can only report "(devel)" for a directory-replaced module, so without
+		// this the four-SHA provenance record would be unreportable.
+		if sha := stamped[path]; sha != "" {
+			refs = append(refs, ModuleRef{Path: path, SHA: sha})
+			continue
+		}
 		if mod, found := byPath[path]; found {
 			m := mod
 			if m.Replace != nil {

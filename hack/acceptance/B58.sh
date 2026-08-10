@@ -29,16 +29,21 @@ else
 	ladder no "b58.0  .goreleaser.yaml present"
 fi
 
-# B58.1 — the DEFERRED cp-payload + kine members are DECLARED (commented) in the
-# manifest, labeled deferred. This holds whether or not goreleaser is installed:
-# it proves the full manifest shape is reviewable even though the snapshot only
-# stages what has an in-tree producer.
-if grep -q 'DEFERRED' "$CONFIG" \
-	&& grep -q 'kube-apiserver' "$CONFIG" \
-	&& grep -q '# - src: "dist/cp-payload/kine"' "$CONFIG"; then
-	ladder ok "b58.1  cp-payload + kine declared as deferred (commented) manifest members"
+# B58.1 — the supporting artifacts are LIVE manifest members (they were commented
+# "DEFERRED" while no in-tree producer existed; hack/release/stage.sh is that
+# producer now). The payload members must carry BOTH dst: cp-payload and
+# strip_parent — with either missing, the members land at the wrong path and
+# `k3sm install` fail-fasts on a user's Mac while every build check stays green.
+#
+# The archive's member set as a whole is asserted against
+# `k3sm install --print-required-artifacts` by the release gate; this row only
+# pins the two encodings that are easy to mis-fix.
+if grep -q 'build/stage/k3sm-execshim' "$CONFIG" \
+	&& grep -q 'build/stage/cp-payload/\*' "$CONFIG" \
+	&& grep -q 'dst: cp-payload' "$CONFIG"; then
+	ladder ok "b58.1  supporting artifacts + cp-payload are live manifest members (dst + strip_parent)"
 else
-	ladder no "b58.1  cp-payload + kine declared as deferred (commented) manifest members"
+	ladder no "b58.1  supporting artifacts + cp-payload are live manifest members (dst + strip_parent)"
 fi
 
 # ---- goreleaser presence gate -----------------------------------------------
@@ -60,25 +65,61 @@ fi
 # archives: stanza and produces the tarball + checksums this gate asserts.
 DIST="$REPO_ROOT/dist"
 rm -rf "$DIST"
+
+# The archive now references the supporting artifacts hack/release/stage.sh
+# produces. This gate proves the manifest SHAPE, not the artifacts' contents, so
+# it stages STUBS: nothing here needs a real Mach-O or a ~250 MB control-plane
+# download, and keeping the network out is what lets this run anywhere. The
+# release pipeline stages the real thing and verifies digests.
+STAGE="$REPO_ROOT/build/stage"
+rm -rf "$REPO_ROOT/build"
+mkdir -p "$STAGE/cp-payload"
+printf 'stub\n' >"$STAGE/k3sm-execshim"
+printf 'stub\n' >"$STAGE/libk3sm_pathrebase_shim.dylib"
+printf 'stub\n' >"$STAGE/libk3sm_getaddrinfo_shim.dylib"
+# Derived, not re-typed: the payload set comes from the binary's own contract.
+for b in $(cd "$REPO_ROOT" && GOWORK=off go run ./cmd/k3sm install --print-required-artifacts 2>/dev/null | sed -n 's|^cp-payload/||p'); do
+	printf 'stub\n' >"$STAGE/cp-payload/$b"
+done
+trap 'rm -rf "$REPO_ROOT/build"' EXIT
+
 if ( cd "$REPO_ROOT" && GOWORK=off goreleaser release --snapshot --clean --skip=publish,sign,notarize ); then
 	ladder ok "b58.2  goreleaser snapshot release succeeded"
 else
 	ladder no "b58.2  goreleaser snapshot release succeeded"
 fi
 
-# B58.3 — the darwin/arm64 tarball contains exactly the honestly-stageable set.
+# B58.3 — the archive carries every artifact `k3sm install` resolves beside the
+# binary, at the path it resolves it. The expected set is DERIVED from
+# pkg/install.RequiredSiblings via the binary's own flag, so adding an artifact
+# there reddens this gate until a manifest member appears for it.
 TARBALL="$(find "$DIST" -name '*darwin*arm64*.tar.gz' -print -quit 2>/dev/null || true)"
 if [ -n "$TARBALL" ] && [ -f "$TARBALL" ]; then
 	ladder ok "b58.3  darwin/arm64 archive produced ($(basename "$TARBALL"))"
 	members="$(tar tzf "$TARBALL")"
+	required="$(cd "$REPO_ROOT" && GOWORK=off go run ./cmd/k3sm install --print-required-artifacts 2>/dev/null)"
+	if [ -z "$required" ]; then
+		ladder no "b58.3  could not derive the required-artifact set (k3sm install --print-required-artifacts)"
+	fi
+	# k3sm/k3sm-netd/LICENSE/NOTICE are the manifest's own members; the rest are
+	# derived. cp-payload members are asserted with their DIRECTORY prefix, since
+	# landing them at the archive root is the exact mis-encoding that breaks install.
 	for want in k3sm k3sm-netd LICENSE NOTICE; do
-		# Basename-tolerant: assert the semantic fact "member present" regardless of
-		# whether goreleaser emits it at the archive root, with a leading "./", or a
-		# nested path — robust to goreleaser path-handling across versions.
 		if printf '%s\n' "$members" | grep -qE "(^|/)${want}$"; then
 			ladder ok "b58.3  archive contains $want"
 		else
 			ladder no "b58.3  archive contains $want"
+		fi
+	done
+	for want in $required; do
+		case "$want" in
+		cp-payload/*) pat="(^|/)$(printf '%s' "$want" | sed 's|/|/|g')$" ;;
+		*) pat="(^|/)${want}$" ;;
+		esac
+		if printf '%s\n' "$members" | grep -qE "$pat"; then
+			ladder ok "b58.3  archive contains $want"
+		else
+			ladder no "b58.3  archive contains $want (required by pkg/install.RequiredSiblings)"
 		fi
 	done
 else
