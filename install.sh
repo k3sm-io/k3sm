@@ -16,8 +16,8 @@
 # k3sm gen-1 installer:   curl -fsSL https://k3sm.io/install.sh | sh
 #
 # Canonical copy: github.com/k3sm-io/k3sm/install.sh. The served copy at
-# https://k3sm.io/install.sh MUST stay byte-identical — the workspace
-# hack/verify-install-sync.sh asserts it (m7-plan Res. 21).
+# https://k3sm.io/install.sh MUST stay byte-identical to this file; the two are
+# compared before every site publish, so read either and get the same script.
 #
 # What it does: preflight (Apple silicon + macOS 26+) → fetch the release
 # tarball + checksums from GitHub Releases → sha256-verify → print the
