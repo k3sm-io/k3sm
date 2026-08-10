@@ -55,9 +55,10 @@ else
 	ladder no "b137.2  last code line is exactly: main \"\$@\" (got: $last_code_line)"
 fi
 
-# b137.3 — asset-name cross-check: the goreleaser templates are a frozen public
-# contract (m7-plan Res. 21). If either template changes, this goes red instead
-# of every future release silently 404ing for the live script.
+# b137.3 — asset-name cross-check: the goreleaser name templates are a frozen
+# public contract (they are also the brew formula's download URLs). If either
+# template changes, this goes red instead of every future release silently
+# 404ing for the live script.
 if grep -qF 'name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"' "$CONFIG" \
 	&& grep -qF 'name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"' "$CONFIG" \
 	&& grep -qF 'ARCHIVE="k3sm_${VERSION}_darwin_arm64.tar.gz"' "$SCRIPT" \
