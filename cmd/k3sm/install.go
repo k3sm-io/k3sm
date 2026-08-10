@@ -37,7 +37,19 @@ func runInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	targetUser := fs.String("user", os.Getenv("SUDO_USER"), "the human whose ~/.kube/config receives the admin kubeconfig (default $SUDO_USER)")
 	serviceCIDR := fs.String("service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR")
+	printRequired := fs.Bool("print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	_ = fs.Parse(args)
+
+	// Read-only introspection of the layout contract, deliberately BEFORE the
+	// root check: the release tooling asserts an extracted archive's member set
+	// against this output, and must be able to do so unprivileged. Paths are
+	// printed relative so the caller can join them onto any directory.
+	if *printRequired {
+		for _, p := range install.RequiredSiblings("") {
+			fmt.Println(p)
+		}
+		return nil
+	}
 
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("k3sm install must run as root — use 'sudo k3sm install'")

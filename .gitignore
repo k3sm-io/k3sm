@@ -1,5 +1,9 @@
 # Build output
 /dist/
+# The release staging tree (hack/release/stage.sh). Deliberately OUTSIDE dist/:
+# goreleaser owns that directory and empties it with --clean, which would delete
+# the staged artifacts before the archive globs could read them.
+/build/
 /bin/
 /k3sm
 *.test
