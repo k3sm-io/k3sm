@@ -22,9 +22,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -151,7 +153,22 @@ func ensureControlPlaneBinaries(ctx context.Context, workDir, kubeVersion string
 // explicit bin dir — shared by the boot path (the workdir bin) and StagePayload
 // (an install payload dir).
 func ensureControlPlaneBinariesInto(ctx context.Context, bd, kubeVersion string) error {
+	return ensureControlPlaneBinariesVerified(ctx, bd, kubeVersion, false)
+}
+
+// ensureControlPlaneBinariesVerified is the download path, optionally gated on
+// the pinned digests. verify is true for the packaging producer (StagePayload),
+// whose output is about to be archived and published, and false for the dev boot
+// fallback, which may legitimately run at an unpinned kubeVersion.
+func ensureControlPlaneBinariesVerified(ctx context.Context, bd, kubeVersion string, verify bool) error {
 	if _, err := os.Stat(filepath.Join(bd, "kube-apiserver")); err == nil {
+		if verify {
+			// Already-present bytes are already signed, and signing rewrites the
+			// Mach-O, so their digests can no longer be compared against upstream.
+			// A publishable payload must be built from a clean directory.
+			return fmt.Errorf("%w: %s already contains control-plane binaries; stage into a clean directory so downloads can be digest-verified before signing",
+				ErrPayloadDigestUnpinned, bd)
+		}
 		return signBinaries(ctx, bd, cpBinaries) // already downloaded; ensure signed
 	}
 	tag := kubeVersion + "-kwok.0-darwin-arm64"
@@ -162,6 +179,13 @@ func ensureControlPlaneBinariesInto(ctx context.Context, bd, kubeVersion string)
 	}
 	if err := chmodExec(bd); err != nil {
 		return err
+	}
+	// BEFORE signing: codesign rewrites the binary, so this is the only moment the
+	// downloaded bytes can be compared against the digests upstream published.
+	if verify {
+		if err := VerifyDownloadedDigests(bd, kubeVersion); err != nil {
+			return err
+		}
 	}
 	return signBinaries(ctx, bd, cpBinaries)
 }
@@ -180,12 +204,60 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	if _, err := os.Stat(kine); err == nil {
 		return signBinaries(ctx, bd, []string{"kine"})
 	}
+	// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
+	// is set ("cannot install cross-compiled binaries when GOBIN is set"), and the
+	// release stages for darwin/arm64 explicitly — which counts as cross-compiling
+	// whenever the toolchain's own GOARCH differs, as it does on a Mac running Go
+	// under Rosetta. So install into a scratch GOPATH instead of GOBIN and copy the
+	// result out. Cross-compiled installs land in bin/<goos>_<goarch>/, native ones
+	// directly in bin/, so both are probed.
+	gopath, err := os.MkdirTemp("", "k3sm-kine-gopath")
+	if err != nil {
+		return fmt.Errorf("kine build scratch dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(gopath) }()
+
 	cmd := exec.CommandContext(ctx, "go", "install", "github.com/k3s-io/kine@"+kineVersion)
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOWORK=off", "GOBIN="+bd)
+	// GOBIN is cleared (not just unset in our env) so an ambient GOBIN cannot
+	// re-trigger the refusal above.
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOWORK=off", "GOBIN=", "GOPATH="+gopath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("build kine %s (CGO_ENABLED=1): %w: %s", kineVersion, err, out)
 	}
+
+	goos, goarch := runtime.GOOS, runtime.GOARCH
+	if v := os.Getenv("GOOS"); v != "" {
+		goos = v
+	}
+	if v := os.Getenv("GOARCH"); v != "" {
+		goarch = v
+	}
+	built := filepath.Join(gopath, "bin", goos+"_"+goarch, "kine") // cross-compiled
+	if _, statErr := os.Stat(built); statErr != nil {
+		built = filepath.Join(gopath, "bin", "kine") // native
+	}
+	if err := copyFile(built, kine, 0o755); err != nil {
+		return fmt.Errorf("stage kine binary: %w", err)
+	}
 	return signBinaries(ctx, bd, []string{"kine"})
+}
+
+// copyFile copies src to dst with the given mode, replacing dst if present.
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // PayloadBinaries is the full control-plane payload set a packaged install must
@@ -206,18 +278,19 @@ func StagePayload(ctx context.Context, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create payload dir %s: %w", destDir, err)
 	}
-	if err := ensureControlPlaneBinariesInto(ctx, destDir, DefaultKubeVersion); err != nil {
+	// Fail closed on the packaging path: these bytes are about to be archived and
+	// published, so a third-party tag that moved (or an extra asset riding along)
+	// must stop the release rather than ship. The digest check happens INSIDE the
+	// download, before ad-hoc signing rewrites the Mach-O. The boot-path callers
+	// are deliberately not gated — a dev fallback download is not a published
+	// artifact, and may run at an unpinned version.
+	if err := ensureControlPlaneBinariesVerified(ctx, destDir, DefaultKubeVersion, true); err != nil {
 		return err
 	}
 	if err := ensureKineInto(ctx, destDir, DefaultKineVersion); err != nil {
 		return err
 	}
-	// Fail closed on the packaging path: these bytes are about to be archived
-	// and published, so a third-party tag that moved (or an extra asset riding
-	// along) must stop the release rather than ship. The boot-path callers of
-	// ensure*Into are deliberately NOT gated on this — a dev fallback download
-	// is not a published artifact.
-	return VerifyPayloadDigests(destDir, DefaultKubeVersion)
+	return VerifyPayloadSet(destDir)
 }
 
 // seedBinDir copies every payload binary present in payloadDir and absent from

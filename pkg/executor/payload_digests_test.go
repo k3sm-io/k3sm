@@ -39,33 +39,33 @@ func writeFiles(t *testing.T, dir string, names ...string) {
 	}
 }
 
-func TestVerifyPayloadDigestsUnpinnedVersionIsAnError(t *testing.T) {
+func TestVerifyDownloadedDigestsUnpinnedVersionIsAnError(t *testing.T) {
 	dir := t.TempDir()
-	err := VerifyPayloadDigests(dir, "v9.9.9-not-pinned")
+	err := VerifyDownloadedDigests(dir, "v9.9.9-not-pinned")
 	if !errors.Is(err, ErrPayloadDigestUnpinned) {
-		t.Fatalf("VerifyPayloadDigests(unpinned) error = %v, want ErrPayloadDigestUnpinned", err)
+		t.Fatalf("VerifyDownloadedDigests(unpinned) error = %v, want ErrPayloadDigestUnpinned", err)
 	}
 }
 
-func TestVerifyPayloadDigestsRejectsWrongBytes(t *testing.T) {
+func TestVerifyDownloadedDigestsRejectsWrongBytes(t *testing.T) {
 	dir := t.TempDir()
 	// Content that is definitely not the pinned release bytes.
 	writeFiles(t, dir, append(append([]string{}, cpBinaries...), "kine")...)
 
-	err := VerifyPayloadDigests(dir, DefaultKubeVersion)
+	err := VerifyDownloadedDigests(dir, DefaultKubeVersion)
 	if !errors.Is(err, ErrPayloadDigestMismatch) {
-		t.Fatalf("VerifyPayloadDigests(wrong bytes) error = %v, want ErrPayloadDigestMismatch", err)
+		t.Fatalf("VerifyDownloadedDigests(wrong bytes) error = %v, want ErrPayloadDigestMismatch", err)
 	}
 }
 
-func TestVerifyPayloadDigestsRejectsMissingFile(t *testing.T) {
+func TestVerifyDownloadedDigestsRejectsMissingFile(t *testing.T) {
 	dir := t.TempDir()
 	// Everything except kube-apiserver.
 	writeFiles(t, dir, "kube-scheduler", "kube-controller-manager", "kubectl", "kine")
 
-	err := VerifyPayloadDigests(dir, DefaultKubeVersion)
+	err := VerifyDownloadedDigests(dir, DefaultKubeVersion)
 	if err == nil {
-		t.Fatal("VerifyPayloadDigests(missing kube-apiserver) = nil, want an error")
+		t.Fatal("VerifyDownloadedDigests(missing kube-apiserver) = nil, want an error")
 	}
 	if !os.IsNotExist(errors.Unwrap(err)) && !errors.Is(err, ErrPayloadDigestMismatch) {
 		// Either shape is acceptable; silence is not.
@@ -102,19 +102,43 @@ func TestPinnedDigestsCoverEveryDownloadedBinary(t *testing.T) {
 	}
 }
 
-// TestVerifyPayloadDigestsRejectsExtraFiles pins the set-equality half: the
+// TestVerifyPayloadSetRejectsExtraFiles pins the set-equality half: the
 // third-party download pulls every asset the release carries, so an unexpected
-// executable must stop the release rather than ride inside the archive.
-func TestVerifyPayloadDigestsRejectsExtraFiles(t *testing.T) {
+// executable must stop the release rather than ride inside a k3sm-signed,
+// k3sm-checksummed archive that a reader takes as k3sm-provenanced.
+func TestVerifyPayloadSetRejectsExtraFiles(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, append(append([]string{}, PayloadBinaries()...), "totally-unexpected-tool")...)
 
-	err := VerifyPayloadDigests(dir, DefaultKubeVersion)
+	err := VerifyPayloadSet(dir)
 	if err == nil {
-		t.Fatal("VerifyPayloadDigests(extra file) = nil, want an error")
+		t.Fatal("VerifyPayloadSet(extra file) = nil, want an error")
 	}
-	// The digest check fires first for these fake bytes; either way it must fail.
 	if !errors.Is(err, ErrPayloadDigestMismatch) {
 		t.Fatalf("error = %v, want ErrPayloadDigestMismatch", err)
+	}
+}
+
+// TestVerifyPayloadSetAcceptsExactly the expected payload — the happy path the
+// digest tests cannot construct (they would need a sha256 preimage).
+func TestVerifyPayloadSetAcceptsExactSet(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, PayloadBinaries()...)
+	if err := VerifyPayloadSet(dir); err != nil {
+		t.Fatalf("VerifyPayloadSet(exact payload set) = %v, want nil", err)
+	}
+}
+
+// TestStagePayloadRefusesDirtyDir pins the timing contract: an already-populated
+// payload dir holds SIGNED bytes, and signing rewrites the Mach-O, so their
+// digests can never again be compared against what upstream published. The
+// packaging path must refuse rather than silently skip verification.
+func TestStagePayloadRefusesPrepopulatedDir(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, "kube-apiserver")
+
+	err := ensureControlPlaneBinariesVerified(t.Context(), dir, DefaultKubeVersion, true)
+	if !errors.Is(err, ErrPayloadDigestUnpinned) {
+		t.Fatalf("verified staging into a pre-populated dir = %v, want a refusal", err)
 	}
 }

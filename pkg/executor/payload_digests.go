@@ -99,15 +99,15 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// VerifyPayloadDigests checks every pinned control-plane binary in dir against
-// its recorded sha256, and rejects any unexpected file in the same directory.
+// VerifyDownloadedDigests checks every pinned control-plane binary in dir
+// against its recorded sha256.
 //
-// The unexpected-file check matters as much as the digest check: the download
-// pulls whatever assets the third-party release carries, so a presence-only or
-// subset check would let extra executables ride along inside a k3sm-published,
-// k3sm-checksummed archive. kine is expected here (built locally, sumdb-verified)
-// and so is allow-listed rather than digest-checked.
-func VerifyPayloadDigests(dir, kubeVersion string) error {
+// TIMING IS PART OF THE CONTRACT: this must run on the bytes as downloaded, and
+// BEFORE they are ad-hoc signed. `codesign` rewrites a Mach-O to embed the
+// signature, so a hash taken afterwards can never equal the digest the upstream
+// release published — verifying too late does not merely weaken the check, it
+// makes it permanently, confusingly red.
+func VerifyDownloadedDigests(dir, kubeVersion string) error {
 	want, ok := PinnedPayloadDigests(kubeVersion)
 	if !ok {
 		return fmt.Errorf("%w: %s (record them in pkg/executor/payload_digests.go)", ErrPayloadDigestUnpinned, kubeVersion)
@@ -126,7 +126,17 @@ func VerifyPayloadDigests(dir, kubeVersion string) error {
 			return fmt.Errorf("%w: %s has sha256 %s, want %s", ErrPayloadDigestMismatch, name, got, wantSum)
 		}
 	}
+	return nil
+}
 
+// VerifyPayloadSet rejects any file in dir that is not part of the expected
+// payload.
+//
+// This matters as much as the digest check: the download pulls whatever assets
+// the third-party release happens to carry, so a presence-only or subset check
+// would let an extra executable ride along inside a k3sm-published,
+// k3sm-checksummed archive that a reader reasonably takes as k3sm-provenanced.
+func VerifyPayloadSet(dir string) error {
 	// Set-equality: nothing beyond the expected payload may sit in the tree.
 	allowed := map[string]bool{}
 	for _, b := range PayloadBinaries() {
