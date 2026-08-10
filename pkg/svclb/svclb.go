@@ -119,6 +119,11 @@ type Controller struct {
 	// lastWarn backs the per-key warning throttle; same single-goroutine
 	// ownership as forwarders.
 	lastWarn map[string]time.Time
+	// disclaimed records Services this process has already retracted its own
+	// advertisement from (a foreign loadBalancerClass). One-shot per process, so
+	// declining a Service never becomes a per-reconcile status rewrite that would
+	// fight the implementation that DOES own it. Same single-goroutine ownership.
+	disclaimed map[string]bool
 	// now is the clock seam for the throttle (tests).
 	now func() time.Time
 }
@@ -157,6 +162,7 @@ func New(cfg Config) (*Controller, error) {
 		dir:        dir,
 		forwarders: make(map[string]map[int32]*forwarder),
 		lastWarn:   make(map[string]time.Time),
+		disclaimed: make(map[string]bool),
 		now:        time.Now,
 	}, nil
 }
@@ -215,6 +221,39 @@ func servicesFromStore(store cache.Store) []*corev1.Service {
 	return svcs
 }
 
+// Claims reports whether this controller owns svc — the ONE ownership rule, so
+// the register row, the reconcile filter, the retraction and any dependent item
+// cite one predicate instead of re-deriving it.
+//
+// Three conditions, and the middle one is the API's multi-implementation
+// contract: spec.loadBalancerClass nil means "the default implementation", and
+// an implementation MUST ignore a Service whose class it does not own. k3sm
+// claims NIL ONLY and publishes no class of its own — the same posture upstream's
+// cloud-provider controller, k3s and MetalLB take by default. Publishing a class
+// would mint a permanent, per-Service IMMUTABLE, user-visible API value (the
+// field cannot be changed once set), so it stays an operator decision rather
+// than a default.
+//
+// "Ignore" is literal upstream: a classed Service is never enqueued, so it is
+// never bound AND never status-patched. Declining to serve a Service while still
+// rewriting its status would not defer to the other implementation at all — it
+// would move the collision from the datapath to the status subresource, where it
+// is harder to diagnose.
+func Claims(svc *corev1.Service) bool {
+	if svc == nil || svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		return false
+	}
+	if svc.Spec.LoadBalancerClass != nil {
+		return false
+	}
+	// The k3sm-internal marker on the Service k3sm itself provisions for the
+	// ingress host, whose :80/:443 listeners that component owns directly. It
+	// stays a label rather than a class because loadBalancerClass is immutable
+	// and that Service is created-if-absent, so an upgraded cluster could never
+	// acquire one.
+	return svc.Labels[IgnoreLabel] != "true"
+}
+
 // reconcile drives the listener set + statuses to match svcs: forwarders for
 // removed/retyped Services (or changed VIPs/ports) are torn down, missing
 // listeners are bound, and each Service's status is written or cleared per the
@@ -222,10 +261,11 @@ func servicesFromStore(store cache.Store) []*corev1.Service {
 func (c *Controller) reconcile(ctx context.Context, svcs []*corev1.Service) {
 	desired := make(map[string]*corev1.Service)
 	for _, s := range svcs {
-		if s.Spec.Type != corev1.ServiceTypeLoadBalancer {
-			continue
-		}
-		if s.Labels[IgnoreLabel] == "true" {
+		if !Claims(s) {
+			// A Service with a foreign class was possibly claimed by an earlier
+			// k3sm build; retract that stale advertisement exactly once rather
+			// than leaving an EXTERNAL-IP with no listener behind it.
+			c.retractDisclaimed(ctx, s)
 			continue
 		}
 		desired[s.Namespace+"/"+s.Name] = s
@@ -481,6 +521,61 @@ func (c *Controller) clearStatus(ctx context.Context, svc *corev1.Service) {
 	if _, err := c.cfg.Client.CoreV1().Services(svc.Namespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
 		c.log.Warn("svclb: clear loadbalancer status", "service", svc.Namespace+"/"+svc.Name, "err", err)
 	}
+}
+
+// retractDisclaimed removes THIS controller's own advertisement from a Service
+// it no longer claims, exactly once per Service per process.
+//
+// It exists for one reachable state: a Service carrying a foreign
+// loadBalancerClass that an OLDER k3sm build claimed and advertised. The
+// apiserver cannot clean that up — it wipes LB status only on a type change, and
+// it forbids changing the class in place — so without this the filter would
+// unbind the listeners and leave the address published, turning a wrong claim
+// ("k3sm owns this") into a worse one ("k3sm serves this", with nothing
+// listening). Every generic client reads status, not the daemon log.
+//
+// It is deliberately NARROWER than Retractable, which treats the whole pod CIDR
+// as retractable. That breadth is sound only while svclb is the single LB
+// frontend — the exact invariant honouring loadBalancerClass gives up. Here the
+// Service belongs to another implementation, so only an entry equal to THIS
+// node's AdvertiseAddr may be touched; anything else is the other
+// implementation's to manage.
+func (c *Controller) retractDisclaimed(ctx context.Context, svc *corev1.Service) {
+	if svc == nil || !c.cfg.AdvertiseAddr.IsValid() {
+		return
+	}
+	key := svc.Namespace + "/" + svc.Name
+	if c.disclaimed[key] {
+		return // one-shot per process; never a per-reconcile status rewrite
+	}
+	mine := c.cfg.AdvertiseAddr.String()
+	keep := make([]corev1.LoadBalancerIngress, 0, len(svc.Status.LoadBalancer.Ingress))
+	for _, lbi := range svc.Status.LoadBalancer.Ingress {
+		if lbi.IP != mine {
+			keep = append(keep, lbi)
+		}
+	}
+	c.disclaimed[key] = true
+	if len(keep) == len(svc.Status.LoadBalancer.Ingress) {
+		return // nothing of ours to retract
+	}
+	upd := svc.DeepCopy()
+	upd.Status.LoadBalancer.Ingress = keep
+	if _, err := c.cfg.Client.CoreV1().Services(svc.Namespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
+		c.log.Warn("svclb: retract advertisement for disclaimed service", "service", key, "err", err)
+		delete(c.disclaimed, key) // allow a retry on the next reconcile
+		return
+	}
+	c.log.Info("svclb: retracted stale advertisement for a service this build does not claim",
+		"service", key, "class", classOf(svc), "address", mine)
+}
+
+// classOf renders a Service's loadBalancerClass for logs ("<none>" when unset).
+func classOf(svc *corev1.Service) string {
+	if svc.Spec.LoadBalancerClass == nil {
+		return "<none>"
+	}
+	return *svc.Spec.LoadBalancerClass
 }
 
 // isTCP reports whether p is a TCP port (an empty protocol defaults to TCP).
