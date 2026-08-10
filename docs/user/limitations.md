@@ -121,9 +121,14 @@ NAT presents the relay's address, it applies to TCP only, and an empty range set
 Like NetworkPolicy below, it is a hint rather than tenant isolation — every pod runs under one
 `_k3sm` uid on a shared `lo0`, so an on-node pod can dial the backend directly and bypass it.
 
-`spec.loadBalancerClass` is also ignored: k3sm claims **every** `type: LoadBalancer` Service
-regardless of class and overwrites its status, so it will fight another LB implementation rather than
-defer to it (`B135`).
+`spec.loadBalancerClass` is honoured: k3sm claims a `type: LoadBalancer` Service only when the field
+is unset (the API's "default implementation" case) and ignores a Service that names another class
+entirely — it neither binds its ports nor writes its status. k3sm publishes no class of its own, so
+there is no value to opt into. `spec.allocateLoadBalancerNodePorts` needs nothing from k3sm: the
+apiserver owns allocation, and k3sm's listeners key off whether a nodePort was actually assigned.
+Note that setting it to `false` does not deallocate an already-assigned nodePort — that is upstream
+behaviour, not a k3sm limitation. A Service's nodePort stays reachable regardless of its class, which
+is also upstream behaviour.
 
 Two further consequences of the LB/Ingress datapath: the userspace
 splice **discards the client address** when it dials the backend, so a NetworkPolicy denying a pod

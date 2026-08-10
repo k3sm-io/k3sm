@@ -148,9 +148,10 @@ func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string
 	return `'k3sm: LoadBalancer port ' + ` +
 		`string(object.spec.ports.filter(p, ` + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort) + `)[0].port) + ` +
 		fmt.Sprintf(`' is RESERVED by a k3sm wildcard listener (the NodePort range %d-%d and the kubelet API port %d). `, nodePortMin, nodePortMax, kubeletPort) +
-		`k3sm binds LoadBalancer ports on 0.0.0.0 and Go sets no SO_REUSEPORT, so this Service would race a k3sm listener for the same socket ` +
+		`k3sm binds LoadBalancer ports on 0.0.0.0 and Go sets no SO_REUSEPORT, so a k3sm-served Service would race a k3sm listener for the same socket ` +
 		`— losing the kubelet API port breaks logs/exec/top on this node, and a NodePort-range collision takes down an unrelated ClusterIP. ` +
-		`Choose a different spec.ports[].port. Only these RESERVED ports are rejected: two Services sharing an ordinary LoadBalancer port are still first-come.'`
+		`Choose a different spec.ports[].port. Only these RESERVED ports are rejected: two Services sharing an ordinary LoadBalancer port are still first-come. ` +
+		`These ports belong to the node, so the rejection applies even to a Service k3sm does not itself serve (one carrying a foreign spec.loadBalancerClass): the port would still be taken on this Mac.'`
 }
 
 // EnsureRejectReservedLoadBalancerPort idempotently provisions the DENY
