@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -206,6 +207,12 @@ func newRuntimedFake(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer) {
 // denied unix-socket paths (the root k3sm-netd helper) onto every pod's
 // SandboxProfile, so a same-uid (_k3sm) pod cannot connect() the privileged
 // daemon socket.
+//
+// It asserts CONTAINMENT, not equality: the configured list extends a base
+// deny-set the provider derives for itself, so the profile legitimately carries
+// more paths than the caller named. The base set is asserted — against the
+// rendered SBPL — by TestRuntimedSocketDeniedToPods; this test owns only the
+// caller-supplied half.
 func TestRuntimedDeniesHelperSocket(t *testing.T) {
 	const sock = "/var/lib/k3sm/run/netd.sock"
 	f := newFakeRuntimeServer()
@@ -221,8 +228,8 @@ func TestRuntimedDeniesHelperSocket(t *testing.T) {
 		t.Fatalf("buildBox: %v", err)
 	}
 	got := box.GetSandboxProfile().GetDeniedUnixSocketPaths()
-	if len(got) != 1 || got[0] != sock {
-		t.Errorf("DeniedUnixSocketPaths = %v, want [%q]", got, sock)
+	if !slices.Contains(got, sock) {
+		t.Errorf("DeniedUnixSocketPaths = %v, want it to contain %q", got, sock)
 	}
 }
 
