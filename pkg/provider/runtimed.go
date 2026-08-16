@@ -24,6 +24,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,10 +40,12 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
@@ -72,9 +76,14 @@ type runtimedRuntime struct {
 	resolverVIP   string
 	clusterDomain string
 	// deniedSocks are AF_UNIX socket paths every pod's SBPL must deny connect()
-	// to — notably the root k3sm-netd helper socket, so a same-uid (_k3sm) pod
-	// cannot drive the privileged helper. Threaded onto each PodBox's
-	// SandboxProfile (apis SandboxProfile.denied_unix_socket_paths).
+	// to — the root k3sm-netd helper socket and the runtimed control socket, so a
+	// same-uid (_k3sm) pod cannot drive a privileged daemon. Threaded onto each
+	// PodBox's SandboxProfile (apis SandboxProfile.denied_unix_socket_paths).
+	//
+	// It is the UNION of the non-omittable base set this package derives
+	// (baseSocketDenies) and whatever the caller supplied in
+	// RuntimedConfig.DeniedUnixSocketPaths — sorted and deduplicated once, at
+	// construction, so buildBox stamps a settled value.
 	deniedSocks []string
 	log         *slog.Logger
 
@@ -179,11 +188,15 @@ type RuntimedConfig struct {
 	// so a confined pod's in-cluster client-go (in-pod kubectl) can reach the API
 	// VIP. Empty emits no API-server egress rule.
 	APIServerVIP string
-	// DeniedUnixSocketPaths are AF_UNIX socket paths every pod's SBPL denies
-	// connect() to (the root k3sm-netd helper socket): pods run as the same _k3sm
-	// uid as the legitimate helper client, so the socket must be denied at the
-	// sandbox so a pod cannot drive the privileged daemon. Threaded as data
-	// because runtimed cannot import darwin-net.
+	// DeniedUnixSocketPaths are ADDITIONAL AF_UNIX socket paths every pod's SBPL
+	// denies connect() to (the root k3sm-netd helper socket): pods run as the same
+	// _k3sm uid as the legitimate helper client, so the socket must be denied at the
+	// sandbox so a pod cannot drive the privileged daemon. Threaded as data because
+	// runtimed cannot import darwin-net.
+	//
+	// It EXTENDS, and can never replace or shrink, the base deny-set the provider
+	// derives for itself (baseSocketDenies) — an empty value still yields a
+	// profile that denies the runtimed control socket.
 	DeniedUnixSocketPaths []string
 	// Network is the pod-IP seam (the podnet adapter over darwin-net's IPAM,
 	// M10.1), shared verbatim with the embedded runtimed daemon (Deps.Network) so
@@ -270,14 +283,17 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		"resolver_vip", cfg.ResolverVIP,
 		"cluster_domain", cfg.ClusterDomain)
 	return &runtimedRuntime{
-		rt:             rt,
-		nodeName:       cfg.NodeName,
-		nodeIP:         cfg.NodeIP,
-		rootfs:         cfg.Root,
-		dyldShim:       cfg.DyldShim,
-		resolverVIP:    cfg.ResolverVIP,
-		clusterDomain:  cfg.ClusterDomain,
-		deniedSocks:    cfg.DeniedUnixSocketPaths,
+		rt:            rt,
+		nodeName:      cfg.NodeName,
+		nodeIP:        cfg.NodeIP,
+		rootfs:        cfg.Root,
+		dyldShim:      cfg.DyldShim,
+		resolverVIP:   cfg.ResolverVIP,
+		clusterDomain: cfg.ClusterDomain,
+		// Derived HERE, in the one constructor production and the fake-injected
+		// tests share, so no caller can construct a provider whose pods are missing
+		// the base deny-set.
+		deniedSocks:    unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
 		resolver:       resolver,
 		network:        cfg.Network,
 		client:         cfg.Client,
@@ -289,6 +305,99 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		track:          map[string]*podTrack{},
 		probers:        map[string]*podProber{},
 	}
+}
+
+// baseSocketDenies returns the AF_UNIX deny-set the provider adds to every
+// pod profile ON ITS OWN AUTHORITY: the runtimed control socket, in both
+// spellings a daemon can serve it at. root is RuntimedConfig.Root (empty ⇒ the
+// runtime default work-dir).
+//
+// It is derived rather than accepted from the caller because a deny the producer
+// must remember to list is a deny that gets forgotten — the caller-supplied list
+// (RuntimedConfig.DeniedUnixSocketPaths) named the k3sm-netd helper socket and
+// not this one. Callers EXTEND this set; they cannot shrink it.
+//
+// TWO SPELLINGS, and neither implies the other:
+//
+//   - runtimed.DefaultSocketPath — the absolute default a daemon started without
+//     an explicit socket path listens on, wherever its work-dir happens to be; and
+//   - <root>/run/runtimed.sock — a work-dir-derived spelling NO code path serves
+//     today. The daemon takes its socket from --socket, defaulting to the
+//     absolute const above and never derived from --root, so this entry is cheap
+//     insurance against a future root-derived socket rather than a description of
+//     current behaviour. Stated plainly because a maintainer who checks the
+//     stronger claim would find no such derivation and delete the entry as dead.
+//
+// This mirrors the SBPL generator's own posture resolution, which pins the
+// ABSOLUTE run-dir into the file-deny set in addition to the work-dir-derived one
+// for exactly this asymmetry (see sandbox.RunSubdir). Both leaf names are taken
+// from runtimed's exported const so a rename upstream cannot leave a deny
+// guarding a socket nobody serves. In the default posture the two spellings
+// coincide and only one is emitted.
+//
+// WHAT THIS BUYS, precisely: the node builds its runtime IN-PROCESS (NewRuntimed
+// → runtime.New), and the installed launch daemons do not include a standalone
+// k3sm-runtimed, so on a stock install there is no socket being served and no
+// live channel this closes. It PRE-POSITIONS the rule — a channel can never
+// appear before the deny that covers it — and it fences the standalone
+// k3sm-runtimed posture used in a lab.
+//
+// WHAT IT DOES NOT COVER. A Seatbelt path-deny is not a capability boundary:
+//
+//   - a daemon started with a different --socket path: this is a const plus a
+//     work-dir derivation and does not track that flag;
+//   - any control endpoint reachable over TCP/localhost, which the profile's
+//     allow_network stanza permits outright; and
+//   - a socket fd already open and inherited across exec, which no path deny can
+//     revoke.
+//
+// netd's socket is in the base set for the SAME reason, and deliberately so: the
+// node command still passes it, but a deny that only exists because a caller
+// remembered to pass it is the exact defect this base set exists to remove — and
+// netd being the ONE the caller did remember is not a reason to leave it the one
+// that can be forgotten. Both are unioned, so the caller's list stays additive.
+func baseSocketDenies(root string) []string {
+	if root == "" {
+		root = sandbox.DefaultWorkDir
+	}
+	leaf := filepath.Base(runtimed.DefaultSocketPath)
+	return []string{
+		runtimed.DefaultSocketPath,
+		filepath.Join(root, sandbox.RunSubdir, leaf),
+		netd.DefaultSocketPath,
+		filepath.Join(root, sandbox.RunSubdir, filepath.Base(netd.DefaultSocketPath)),
+	}
+}
+
+// stampSocketDenies merges the provider's non-omittable deny-set onto sp.
+//
+// It is a method rather than two inline lines so the union is FALSIFIABLE: no
+// end-to-end case can tell a union from a plain assignment today, because
+// nothing in the translation path pre-sets the field — so without a seam to
+// assert through, a regression to `=` would be caught by nothing. A nil profile
+// is a no-op; it fails closed further down, where the generator refuses a box
+// with no data volume.
+func (r *runtimedRuntime) stampSocketDenies(sp *runtimev1.SandboxProfile) {
+	if sp == nil {
+		return
+	}
+	sp.DeniedUnixSocketPaths = unionSocketDenies(sp.GetDeniedUnixSocketPaths(), r.deniedSocks)
+}
+
+// unionSocketDenies returns the sorted, deduplicated union of the socket-path
+// sets, dropping empty entries. Union — never replace — is what keeps a
+// caller-supplied list additive with respect to the base deny-set.
+func unionSocketDenies(sets ...[]string) []string {
+	var out []string
+	for _, set := range sets {
+		for _, p := range set {
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // NodeCapabilities are the node-capability facts runtimed advertises as
@@ -500,12 +609,23 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	if err != nil {
 		return nil, err
 	}
-	// Deny every pod the root helper socket: pods share the _k3sm uid with the
-	// legitimate helper client, so the sandbox is where the privileged daemon is
+	// Deny every pod the daemon control sockets: pods share the _k3sm uid with the
+	// legitimate daemon clients, so the sandbox is where a privileged daemon is
 	// fenced off from the workload.
-	if len(r.deniedSocks) > 0 && box.SandboxProfile != nil {
-		box.SandboxProfile.DeniedUnixSocketPaths = r.deniedSocks
-	}
+	//
+	// UNCONDITIONAL on the deny-set being non-empty, and a UNION rather than an
+	// assignment. An emptiness guard would let a caller that supplied no paths
+	// render a profile with no socket-deny stanza at all — indistinguishable, in the
+	// generated profile, from "nothing needed denying", which is the worst shape a
+	// default-deny control can take; and a bare `=` would drop any deny a future
+	// translation step had already put on the box.
+	//
+	// NO ASYMMETRY: baseSocketDenies carries BOTH daemon sockets non-omittably.
+	// The node command still passes netd's, and that stays harmless because this
+	// is a union — but a deny that exists only because a caller remembered to pass
+	// it is precisely the defect the base set removes, and netd being the one the
+	// caller did remember is no reason to leave it the one that can be forgotten.
+	r.stampSocketDenies(box.SandboxProfile)
 	if err := resolvePodBoxEnv(ctx, box, r.nodeName, r.nodeIP, r.resolver); err != nil {
 		return nil, err
 	}
@@ -1035,10 +1155,14 @@ func toCPUStats(c *runtimev1.CPUStats) *statsv1alpha1.CPUStats {
 }
 
 // podRoot returns the per-pod rootfs parent passed to the PodBox sandbox profile.
+// The empty-Root fallback is the runtime's own default work-dir const, the SAME
+// one baseSocketDenies derives the work-dir-relative socket spelling from —
+// two literals here would let the pod dir and the deny path disagree about where
+// the runtime root is.
 func (r *runtimedRuntime) podRoot(id string) string {
 	root := r.rootfs
 	if root == "" {
-		root = "/var/lib/k3sm"
+		root = sandbox.DefaultWorkDir
 	}
 	return root + "/pods/" + id
 }
