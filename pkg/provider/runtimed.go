@@ -261,6 +261,29 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
+	// Startup pod reap — MUST run here, in-process, before any CreatePod can be
+	// served. The embedded node drives this Runtime by direct RPC and never runs
+	// runtime.Server.Serve, so runtimed's own once-before-serve reap never fires on
+	// the shipped path: the reaper existed but was UNREACHABLE here, leaving pod
+	// process groups a prior `launchctl kickstart -k` orphaned onto launchd running
+	// (holding ports, surviving uninstall). This is the exact sibling of the M10.1
+	// network startup reconcile, and for the exact same reason — see the comment
+	// block at cmd/k3sm/node.go's netAdapter.ReconcileStartup call.
+	//
+	// It is sourced HERE, in the constructor, rather than in cmd: a caller cannot
+	// omit it, and the wiring is unit-testable without a live node (cmd is a thin
+	// main).
+	//
+	// DEGRADES, it does not fail closed — the one way it differs from that network
+	// sibling, which returns its error and aborts node startup. ReapOrphanedPods
+	// always returns nil by contract (an unreadable reap store alerts and skips the
+	// reap): a best-effort orphan store is not a scheduling precondition, and
+	// propagating its I/O fault would exit main and launchd-crash-loop the node.
+	// The returned error is therefore checked-and-logged, never propagated — do NOT
+	// "harden" this into a startup failure.
+	if err := rt.ReapOrphanedPods(); err != nil {
+		log.Error("startup pod reap reported an error (degraded, node continues)", "err", err)
+	}
 	return newRuntimedWith(rt, cfg, resolver, log), nil
 }
 
