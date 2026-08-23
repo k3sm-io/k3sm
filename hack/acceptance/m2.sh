@@ -394,6 +394,10 @@ fi
 #       Bound: 180×1s — the same budget m2.3 needs for a cold control-plane start,
 #       which is what a kickstart -k re-runs (apiserver + kine + node bring-up before
 #       the provider is constructed).
+#       COUPLING: this string (and the keep-and-warn one in step 6) is runtimed's
+#       PRIVATE log wording (pkg/runtime/podreap.go), not a contract — reword it
+#       there and this lab leg breaks with no compile/CI signal. Keep in lockstep,
+#       the same caveat the sibling Go gate documents via its reapAlertPrefix const.
 if [ -z "$reap_why" ]; then
 	reap_logged=no
 	for _ in $(seq 1 180); do
