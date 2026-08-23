@@ -353,6 +353,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// mesh-egress /32 on lo0 so the apiserver node-proxy dial to NodeInternalIP:10250
 	// (kubectl top node / logs / exec) reaches the :10250 listener. Fail closed,
 	// matching runtimed's sticky-once contract. nil for hostprocess / --network none.
+	//
+	// Its SIBLING — the startup POD reap, stranded on this path for the same reason —
+	// is not here: it lives inside provider.NewRuntimed (called from buildProvider
+	// above), so it cannot be omitted by a caller and runs before any CreatePod is
+	// served. It DEGRADES rather than failing closed; see the comment at that call.
 	if netAdapter != nil {
 		if err := netAdapter.ReconcileStartup(ctx); err != nil {
 			return fmt.Errorf("pod network startup reconcile: %w", err)

@@ -32,6 +32,28 @@ PAYLOAD_DIR="$REPO_ROOT/cp-payload"
 INVOKING_USER="${SUDO_USER:-$(id -un)}"
 KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
 
+# reap_test_pods kills THIS GATE's leaked pod processes. Pods spawn with
+# POSIX_SPAWN_SETSID and reparent to launchd when the daemon exits, so a native test
+# pod (hello-http/conftool from the conformance bin) or a rootfs pod can outlive its
+# daemon and squat a host port (e.g. :8080) or block a clean uninstall.
+#
+# runtimed NOW HAS a startup pod reaper, and as of this change it is WIRED on the
+# embedded node path (pkg/provider.NewRuntimed → Runtime.ReapOrphanedPods) — it was
+# previously reachable only from the standalone daemon's Serve, which the shipped node
+# never runs. m2.R below proves that daemon-side reap directly. This script-side reap
+# therefore stays purely as belt-and-suspenders for the runs the daemon reaper cannot
+# cover: a build/install-failed run that never boots the server, and any exit path
+# where no new daemon ever starts to run the reap.
+#
+# It is UNCONDITIONAL at both of its call sites and has NO suppression flag: the
+# EXIT-trap reap must fire on every exit path. m2.R avoids reaping its own fixture
+# purely by PLACEMENT — it runs between m2.A and m2.4, where no script reap fires
+# inside its window.
+reap_test_pods() {
+	pkill -9 -f 'k3sm-conformance-bin' >/dev/null 2>&1 || true
+	pkill -9 -f '/var/lib/k3sm/pods/' >/dev/null 2>&1 || true
+}
+
 cleanup() {
 	# Always attempt uninstall so a failed run leaves no daemons/aliases behind.
 	"$BIN" uninstall >/dev/null 2>&1 || true
@@ -39,13 +61,7 @@ cleanup() {
 	# and flush the DNS VIP, so a mid-run failure can't poison a re-run (uninstall
 	# now does the reap too, but a build/install-failed run never reaches it).
 	pkill -9 -f '/var/lib/k3sm/server/bin/' >/dev/null 2>&1 || true
-	# Reap leaked POD processes too: pods spawn with POSIX_SPAWN_SETSID and reparent to
-	# launchd when the daemon exits, so a native test pod (hello-http/conftool from the
-	# conformance bin) or a rootfs pod can outlive its daemon and squat a host port
-	# (e.g. :8080) or block a clean uninstall. runtimed has no startup pod reaper yet
-	# (tracked in the backlog); the gate reaps its own test pods here.
-	pkill -9 -f 'k3sm-conformance-bin' >/dev/null 2>&1 || true
-	pkill -9 -f '/var/lib/k3sm/pods/' >/dev/null 2>&1 || true
+	reap_test_pods
 	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
 	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" "$DNSSHIM" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
@@ -226,8 +242,7 @@ grep -E 'runtimed provider configured|pod box cluster-DNS wiring' /var/log/k3sm/
 # squat host :8080 before this run's readiness pod binds it (TestM2_Probes), then probe
 # the API-VIP path so an InPodKubectl EOF localizes to backend vs proxy vs backend-presence.
 echo "==> [diagnostic] reap leaked pods (:8080) + probe the API VIP path (10.43.0.1:443):"
-pkill -9 -f 'k3sm-conformance-bin' >/dev/null 2>&1 || true
-pkill -9 -f '/var/lib/k3sm/pods/' >/dev/null 2>&1 || true
+reap_test_pods
 echo "--- host :8080 holder after reap (want free — else a leak the reap missed):"
 lsof -nP -iTCP:8080 -sTCP:LISTEN 2>/dev/null | head -3 || true
 echo "--- default/kubernetes EndpointSlice (the API-VIP backend the proxy dials):"
@@ -268,6 +283,172 @@ if run_conformance_slice "$REPO_ROOT" "TestM2" 600s "${M2_CRITERIA[@]}"; then
 else
 	ladder no "m2.A  M2 conformance suite (a required criterion missing, failed, or skipped)"
 fi
+
+# ── m2.R — the DAEMON's own startup pod reap, proven end to end. ─────────────
+# What this leg proves: a pod process group orphaned by a daemon death is killed by
+# runtimed's startup pod reap on the NEXT daemon start — i.e. the reaper is actually
+# REACHED on the shipped embedded node path (pkg/provider.NewRuntimed →
+# Runtime.ReapOrphanedPods), where the standalone daemon's Serve call site never runs.
+# It proves the daemon's reap, NOT the script's: reap_test_pods is unconditional at
+# its two sites and has no suppression flag, so this leg avoids it purely by
+# PLACEMENT — it sits AFTER m2.A and BEFORE m2.4's uninstall, a window in which no
+# script-side reap fires.
+#
+# It proves the KILL branch only. The leader-dead/grandchild-alive case is deliberately
+# keep-and-warn (a permanent runbooked leak beats an unbounded wrong-target root
+# SIGKILL) and is B124's deferred work; step (6) below is a non-gating fixture
+# self-check that we did NOT accidentally land on that path.
+echo "==> m2.R  startup pod reap: orphan a pod across a daemon bounce, assert the daemon reaps it"
+REAP_POD="m2-reap-orphan"
+REAP_ID="m2r-reap-fixture"                     # unique argv token: the leader matcher
+REAP_BIN="$K3SM_CONFORMANCE_BIN/hello-http"
+SERVER_LOG="/var/log/k3sm/server.log"
+REAP_PID=""; REAP_PGID=""; REAP_OFFSET=0
+reap_why=""
+
+# (1) Fixture through the REAL pod path: a long-running pod whose container EXECs its
+#     binary DIRECTLY (exec-form command, no /bin/sh wrapper), so the process group
+#     LEADER runtimed records is the workload itself — which is what the reap's
+#     exact-instance identity check matches on. It reuses the m2.A conformance helper
+#     staged in $K3SM_CONFORMANCE_BIN, on a private port so it cannot collide with the
+#     suite's :8080/:8081 pods.
+if [ ! -x "$REAP_BIN" ]; then
+	reap_why="conformance helper $REAP_BIN missing (m2.A stages it — it must run first)"
+fi
+if [ -z "$reap_why" ]; then
+	"$INSTALL_DIR/k3sm" kubectl delete pod "$REAP_POD" -n default --ignore-not-found >/dev/null 2>&1 || true
+	if ! "$INSTALL_DIR/k3sm" kubectl apply -f - >/dev/null 2>&1 <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $REAP_POD
+  namespace: default
+  labels:
+    app: $REAP_POD
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: app
+      image: native
+      command: ["$REAP_BIN", "-id", "$REAP_ID", "-addr", ":18080"]
+YAML
+	then
+		reap_why="kubectl apply of the fixture pod failed"
+	fi
+fi
+if [ -z "$reap_why" ]; then
+	fixture_running=no
+	for _ in $(seq 1 90); do
+		[ "$("$INSTALL_DIR/k3sm" kubectl get pod "$REAP_POD" -n default -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ] && { fixture_running=yes; break; }
+		sleep 1
+	done
+	[ "$fixture_running" = yes ] || reap_why="fixture pod $REAP_POD never reached Running"
+fi
+
+# (2) Resolve the leader pid/pgid and self-check pid == pgid (the LIVE-LEADER
+#     precondition the reap's kill branch requires). The matcher is the fixture's
+#     unique -id token, not a /var/lib/k3sm/pods/ path: a native-image pod's shim
+#     execs the staged helper IN PLACE, so the live argv is the $K3SM_CONFORMANCE_BIN
+#     path (that is also why reap_test_pods carries the conformance-bin pattern).
+#     A pid != pgid here is a FIXTURE bug (the workload is not the session leader),
+#     not a reaper bug — the leg fails loudly rather than silently testing nothing.
+if [ -z "$reap_why" ]; then
+	REAP_PID="$(pgrep -f "$REAP_ID" 2>/dev/null | head -1 || true)"
+	if [ -z "$REAP_PID" ]; then
+		reap_why="could not resolve the fixture leader pid (pgrep -f $REAP_ID matched nothing)"
+	else
+		REAP_PGID="$(ps -o pgid= -p "$REAP_PID" 2>/dev/null | tr -d '[:space:]' || true)"
+		if [ -z "$REAP_PGID" ] || [ "$REAP_PID" != "$REAP_PGID" ]; then
+			reap_why="fixture leader pid $REAP_PID != pgid ${REAP_PGID:-?} — the pod is not its own session leader (FIXTURE bug, not a reaper bug)"
+		fi
+	fi
+fi
+
+# (3) Capture the server.log byte offset BEFORE the bounce. Matching the whole log
+#     would happily pass on a PRIOR run's reap line — a known trap on this gate.
+if [ -z "$reap_why" ]; then
+	REAP_OFFSET="$(wc -c < "$SERVER_LOG" 2>/dev/null | tr -d '[:space:]' || true)"
+	[ -n "$REAP_OFFSET" ] || REAP_OFFSET=0
+	echo "--- m2.R fixture: pod=$REAP_POD leader pid=pgid=$REAP_PGID, server.log offset=$REAP_OFFSET"
+fi
+
+# (4) Bounce the SERVER daemon explicitly (never netd — netd is the root network
+#     helper and owns no pods). kickstart -k kills the running job first, so the pod's
+#     process group loses its supervising daemon and reparents to launchd: exactly the
+#     orphan class the startup reap exists to close.
+if [ -z "$reap_why" ]; then
+	if ! launchctl kickstart -k system/io.k3sm.server >/dev/null 2>&1; then
+		reap_why="launchctl kickstart -k system/io.k3sm.server failed"
+	fi
+fi
+
+# (5) PRIMARY ASSERTION — both halves are required.
+#   (i) the reap's KILL-branch line appears in server.log AFTER the captured offset.
+#       This is the causal evidence: absence of the process alone would NOT do, since
+#       the reap's kill branch and its drop branch (record dropped unsignaled) are
+#       otherwise indistinguishable from the outside.
+#       Bound: 180×1s — the same budget m2.3 needs for a cold control-plane start,
+#       which is what a kickstart -k re-runs (apiserver + kine + node bring-up before
+#       the provider is constructed).
+#       COUPLING: this string (and the keep-and-warn one in step 6) is runtimed's
+#       PRIVATE log wording (pkg/runtime/podreap.go), not a contract — reword it
+#       there and this lab leg breaks with no compile/CI signal. Keep in lockstep,
+#       the same caveat the sibling Go gate documents via its reapAlertPrefix const.
+if [ -z "$reap_why" ]; then
+	reap_logged=no
+	for _ in $(seq 1 180); do
+		if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'reaping orphaned pod process group'; then
+			reap_logged=yes; break
+		fi
+		sleep 1
+	done
+	[ "$reap_logged" = yes ] || reap_why="no 'reaping orphaned pod process group' line in $SERVER_LOG after byte $REAP_OFFSET — the daemon never ran the startup reap"
+fi
+#  (ii) the recorded pgid's leader is gone, or a ZOMBIE. Z is a PASS: the SIGKILL
+#       landed and launchd simply has not wait()ed the reparented child yet. A live
+#       non-Z process is a FAIL — the reap logged a kill it did not deliver.
+if [ -z "$reap_why" ]; then
+	leader_stat="$(ps -o stat= -p "$REAP_PGID" 2>/dev/null | tr -d '[:space:]' || true)"
+	if [ -z "$leader_stat" ]; then
+		echo "--- m2.R leader pgid $REAP_PGID: gone (killed and reaped by launchd)"
+	elif [ "${leader_stat#Z}" != "$leader_stat" ]; then
+		echo "--- m2.R leader pgid $REAP_PGID: zombie (stat=$leader_stat) — the kill landed, launchd has not wait()ed yet"
+	else
+		reap_why="fixture leader pgid $REAP_PGID still ALIVE (ps stat=$leader_stat) after the reap logged its kill"
+	fi
+fi
+
+ladder "$([ -z "$reap_why" ] && echo ok || echo no)" "m2.R  daemon startup pod reap kills an orphaned pod process group across a kickstart -k"
+[ -z "$reap_why" ] || echo "--- m2.R detail: $reap_why"
+
+# (6) [diagnostic, never gates] Did the fixture accidentally exercise B124's deferred
+#     keep-and-warn path (leader dead, group alive via a grandchild) instead of the
+#     kill branch? A PRESENT line here means the leg's evidence is about the wrong
+#     branch even if it passed.
+echo "--- [diagnostic] m2.R keep-and-warn (B124's deferred leader-dead/grandchild-alive path):"
+if tail -c "+$((REAP_OFFSET + 1))" "$SERVER_LOG" 2>/dev/null | grep -q 'orphaned pod process group leaked'; then
+	echo "    PRESENT — a recorded group hit keep-and-warn; re-read the fixture before trusting m2.R"
+else
+	echo "    none (expected: the fixture's live leader takes the kill branch)"
+fi
+
+# (7) Retire the fixture, then wait for the control plane to be serving again before
+#     falling through to m2.4 — the uninstall leg must not race a cold control plane
+#     that the kickstart -k above only just restarted. Same bounded-retry pattern as m2.3.
+for _ in $(seq 1 60); do
+	if "$INSTALL_DIR/k3sm" kubectl delete pod "$REAP_POD" -n default --ignore-not-found >/dev/null 2>&1; then break; fi
+	sleep 1
+done
+healthy_again=no
+for _ in $(seq 1 180); do
+	[ "$("$INSTALL_DIR/k3sm" kubectl get --raw /healthz 2>/dev/null)" = "ok" ] && { healthy_again=yes; break; }
+	sleep 1
+done
+ladder "$([ "$healthy_again" = yes ] && echo ok || echo no)" "m2.R  control plane healthy again after the reap bounce (m2.4 not racing a cold start)"
 
 # m2.4 — uninstall cleanliness: both daemons booted out, install dir removed,
 # socket gone, and every k3sm lo0 alias flushed (`k3sm uninstall` sweeps the pod
