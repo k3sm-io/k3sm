@@ -14,9 +14,9 @@ code-complete but not yet proven on real hardware, this page says so. The forthc
 
 ## Shipped
 
-The engine. Milestones **M0–M6** are code-complete and workspace-integration-green (`hack/ci.sh`);
-M0/M1 are validated end-to-end by their acceptance gates, and the remaining live-hardware and
-two-Mac gates are burned down in M7. What works:
+The engine. Milestones **M0–M6 and M10** are code-complete and workspace-integration-green
+(`hack/ci.sh`); M0/M1 are validated end-to-end by their acceptance gates, and the remaining
+live-hardware and two-Mac gates are burned down in M7. What works:
 
 - **Native Darwin-process pods, zero Linux.** OCI images ship an arm64 Mach-O payload (never
   `/System`); the runtime `posix_spawn`s them **in place at host paths** — no chroot, SIP-compatible.
@@ -39,6 +39,12 @@ two-Mac gates are burned down in M7. What works:
   a VZ Mac + entitlement — ships EXPERIMENTAL)*
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(code-complete; the live 2-Mac+Postgres failover is a lab gate)*
+- **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
+  allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
+  LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
+  logging, node lifecycle Events. Proven by k3sm's own synthetic-conformance criteria — **not** a
+  CNCF `[Conformance]` pass (k3sm has no Linux containers); the honest register lives at
+  `docs/UPSTREAM-ALIGNMENT.md`, the self-assessment at `docs/conformance-profile.md`.
 
 ## Next — v0.1.0 (the public release, with MLX)
 
@@ -75,14 +81,6 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
 ## Future — post-v0.1.0
 
-- **Kubernetes conformance hardening (M10)** — get as close to standard k8s as the Darwin substrate
-  honestly allows. k3sm already embeds the real apiserver/scheduler/controller-manager, so the whole
-  control-plane API surface is genuine; M10 closes the achievable gaps at the node/network/storage
-  edge: per-pod IPs (unblocking headless/SRV/StatefulSet DNS), an in-process Ingress controller +
-  LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
-  logging, node lifecycle Events. The honest "where we are vs upstream k8s" register lives at
-  `docs/UPSTREAM-ALIGNMENT.md`; the self-assessment (k3sm cannot pass Sonobuoy `[Conformance]` — it
-  has no Linux containers — but targets a documented subset) at `docs/conformance-profile.md`.
 - **De-EXPERIMENTAL the Linux `vm` path (the graduation)** — the Linux-image capability ships at
   v0.1 (EXPERIMENTAL, above); the v0.2 milestone is its **graduation**: the full lab ledger green
   with **published performance figures** (VM boot latency = restart cost, the Rosetta non-TSO
