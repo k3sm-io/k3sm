@@ -216,6 +216,10 @@ canary_inside() {
 canary=ok
 outside="$(canary_outside "$HARNESS")"
 inside="$(canary_inside "$HARNESS")"
+# Counted, never hardcoded: this leg's whole value is its report, so the ladder line
+# must state what was actually measured. A literal "0 outside" would assert the
+# safe verdict on the very run that found a violation.
+outside_n="$(printf '%s' "$outside" | grep -c . || true)"
 
 if [ -n "$outside" ]; then
 	canary=no
@@ -237,7 +241,7 @@ if [ -z "$(canary_outside "$WORK/mutant-canary.sh")" ]; then
 	canary=no
 	echo "        the canary failed to flag a deliberately mutated copy — it proves nothing about the real file"
 fi
-ladder "$canary" "b149.4  host-mutating vocabulary confined to guest_exec ($inside occurrence(s) inside, 0 outside; both positive controls armed)"
+ladder "$canary" "b149.4  host-mutating vocabulary confined to guest_exec ($inside occurrence(s) inside, $outside_n outside; both positive controls armed)"
 
 # ---- b149.5 — REFUSAL: destroy a guest the harness does not own --------------
 # There is no undo for a deleted guest disk, so the prefix check must be structural.
