@@ -89,3 +89,9 @@ go mod tidy                 # no diff
 Keep commits small and focused. **Sign off every commit** for the Developer Certificate of Origin (see
 `DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line certifying the DCO.
 Don't push unless asked.
+
+**Message format.** Commit subjects and PR titles follow **Conventional Commits**; PR bodies follow
+a fixed section order. The subject grammar, the closed `type` set, the scope vocabulary (your scope
+is the package directory you changed), the breaking-change marking, and the PR-body template are
+defined once in **`CONTRIBUTING.md` § Commit messages and pull requests** — this file cites, it does
+not restate. The format is **additive**: the sign-off above is still required on every commit.
