@@ -265,6 +265,45 @@ else
 	ladder no "b149.5b harness-owned guest name accepted and deleted (rc=$d2_rc)"
 fi
 
+# ---- b149.5c — REFUSAL: the guest account may not smuggle an ssh option ------
+# "$GUEST_USER@$ip" used to be one argv token, so an account beginning with '-' was
+# read by ssh as an option; -oProxyCommand=<cmd> runs <cmd> ON THIS HOST before any
+# guest is contacted. That is a second harness->real-machine path, which is exactly
+# what b149.4 certifies does not exist — so the refusal is asserted, not assumed.
+# The canary is a file the smuggled command would create: if it exists afterwards,
+# the command ran and the refusal failed open.
+#
+# Driven through `harness` so every fake IS present: otherwise the run refuses on
+# the missing-tart precondition long before guest_exec, and the leg would pass with
+# the validator deleted — proving nothing. The decisive assertion is that NO ssh
+# call is ever recorded: the fakes only log their argv, so a smuggled ProxyCommand
+# would not execute under test, and "the canary file is absent" is therefore not
+# evidence. Reaching ssh at all is the failure.
+: >"$LOG"
+canary_file="$WORK/proxycommand-executed"
+u_rc=0
+bounded 60 harness --user "-oProxyCommand=touch $canary_file" \
+	run --gate true >"$WORK/baduser.log" 2>&1 || u_rc=$?
+if [ "$u_rc" -ne 0 ] && [ "$u_rc" -ne 124 ] \
+	&& ! grep -q '^ssh ' "$LOG" && [ ! -e "$canary_file" ]; then
+	ladder ok "b149.5c an option-shaped guest account is refused (exit $u_rc) before any ssh call is made"
+else
+	ladder no "b149.5c option-shaped guest account refused before ssh (rc=$u_rc, ssh reached: $(grep -c '^ssh ' "$LOG"), canary: $([ -e "$canary_file" ] && echo YES || echo no))"
+	sed 's/^/        /' "$WORK/baduser.log" | tail -10
+fi
+
+# ---- b149.5d — evidence bundles are never committable ------------------------
+# `collect` harvests /Library/k3sm and /var/lib/k3sm, which carry the guest run's
+# bootstrap CA, node-password and join token. Its default output lands inside this
+# PUBLIC repo, so the ignore rule is the control that keeps a bundle out of a
+# commit. Asserted through git itself, not by grepping .gitignore, so any ignore
+# mechanism counts and a reworded comment cannot red it.
+if git -C "$REPO_ROOT" check-ignore -q lab-vm-out/probe 2>/dev/null; then
+	ladder ok "b149.5d the default collect output directory (lab-vm-out/) is git-ignored"
+else
+	ladder no "b149.5d lab-vm-out/ is NOT git-ignored — a collected bundle carries CA/token material into a public repo"
+fi
+
 # ---- b149.6 — REFUSAL: a missing tart is a HARNESS failure, promptly ---------
 # Exit 2 means "the harness broke"; it must never be confused with a product verdict,
 # and it must arrive rather than hang.

@@ -183,6 +183,26 @@ base_present() {
 	tart_cli list 2>/dev/null | grep -qF "$BASE_IMAGE"
 }
 
+# valid_user <name> — the guest account name must be a plain account name.
+#
+# This is a SECURITY check, not tidiness. The account was previously pasted into
+# the single argv token "$GUEST_USER@$ip"; ssh parses a token beginning with '-'
+# as an option however it was meant, and -oProxyCommand=<cmd> is executed BY THE
+# LOCAL SHELL, ON THIS HOST, before any guest is contacted. That is a second path
+# from the harness to a real machine — exactly what guest_exec exists to prevent
+# and what b149.4 certifies does not exist. Two independent controls now stand in
+# the way: this charset check (no leading '-', no shell metacharacters), and
+# guest_exec's use of `-l <user> <host>`, which puts the account in an option
+# VALUE position where it can never be re-read as a flag.
+valid_user() {
+	case "$1" in
+		"") return 1 ;;
+		-*) return 1 ;;
+		*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
+}
+
 # ------------------------------------------------------------- clone identity
 valid_tag() {
 	case "$1" in
@@ -297,22 +317,29 @@ run_with_deadline() {
 #   collect <ip> <destdir>        pull the guest-side artifact bundle out
 guest_exec() {
 	local mode="$1" ip="$2"; shift 2
+	# Enforced HERE, at the one boundary every remote path crosses, rather than only
+	# at the flag parser: an account name is also settable from the environment, and
+	# a check that sits on one of two entry paths is not a control.
+	valid_user "$GUEST_USER" || die "guest account '$GUEST_USER' is not a plain account name.
+       It is passed to ssh/scp/rsync, where a value beginning with '-' is read as an
+       option — -oProxyCommand=<cmd> would execute <cmd> ON THIS HOST. Allowed: letters,
+       digits, dot, underscore, hyphen; never leading '-'."
 	local opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 		-o LogLevel=ERROR -o ConnectTimeout=5 -o BatchMode=yes)
 	local tgz="/tmp/k3sm-lab-collect.tgz"
 	case "$mode" in
 	probe)
-		"$SSH_BIN" "${opts[@]}" "$GUEST_USER@$ip" true
+		"$SSH_BIN" "${opts[@]}" -l "$GUEST_USER" "$ip" true
 		;;
 	exec)
-		"$SSH_BIN" "${opts[@]}" "$GUEST_USER@$ip" "cd $GUEST_SRC && $*"
+		"$SSH_BIN" "${opts[@]}" -l "$GUEST_USER" "$ip" "cd $GUEST_SRC && $*"
 		;;
 	root)
-		"$SSH_BIN" "${opts[@]}" "$GUEST_USER@$ip" "cd $GUEST_SRC && sudo -n $*"
+		"$SSH_BIN" "${opts[@]}" -l "$GUEST_USER" "$ip" "cd $GUEST_SRC && sudo -n $*"
 		;;
 	push)
 		local src="$1" dst="$2"
-		"$SSH_BIN" "${opts[@]}" "$GUEST_USER@$ip" "mkdir -p $dst"
+		"$SSH_BIN" "${opts[@]}" -l "$GUEST_USER" "$ip" "mkdir -p $dst"
 		"$RSYNC_BIN" -a --delete --exclude '.git' --exclude 'k3sm-lab' \
 			-e "$SSH_BIN ${opts[*]}" "$src/" "$GUEST_USER@$ip:$dst/"
 		;;
@@ -324,8 +351,9 @@ guest_exec() {
 		# legitimately has none of them.
 		local dest="$1"
 		mkdir -p "$dest"
-		"$SSH_BIN" "${opts[@]}" "$GUEST_USER@$ip" \
-			"for p in /Library/k3sm /var/lib/k3sm /var/log/system.log; do [ -e \"\$p\" ] && echo \"\$p\"; done | sudo -n tar -czf $tgz -T - 2>/dev/null; sudo -n chmod 0644 $tgz 2>/dev/null" \
+		chmod 0700 "$dest" 2>/dev/null || true
+		"$SSH_BIN" "${opts[@]}" -l "$GUEST_USER" "$ip" \
+			"for p in /Library/k3sm /var/lib/k3sm /var/log/system.log; do [ -e \"\$p\" ] && echo \"\$p\"; done | sudo -n tar -czf $tgz -T - 2>/dev/null; sudo -n chmod 0600 $tgz 2>/dev/null" \
 			|| true
 		"$SCP_BIN" "${opts[@]}" "$GUEST_USER@$ip:$tgz" "$dest/" || true
 		;;
