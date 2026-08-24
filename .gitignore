@@ -31,3 +31,8 @@ go.work.sum
 /k3sm-execshim
 /libk3sm_getaddrinfo_shim.dylib
 /libk3sm_pathrebase_shim.dylib
+
+# Disposable-guest evidence bundles (hack/lab-vm.sh collect). These carry the
+# guest run's /Library/k3sm and /var/lib/k3sm state, which includes its bootstrap
+# CA, node-password and join token. Per-run and disposable, but never committed.
+lab-vm-out/
