@@ -197,7 +197,21 @@ func nodeIdentityClient(t *testing.T) (kubernetes.Interface, bool) {
 	cfg := rest.CopyConfig(base)
 	cfg.BearerToken, cfg.BearerTokenFile = "", ""
 	cfg.Username, cfg.Password = "", ""
-	cfg.TLSClientConfig = rest.TLSClientConfig{CAData: h.Cluster.CertPEM, CertData: certPEM, KeyData: keyPEM}
+	// Attach ONLY the client identity and keep the admin kubeconfig's
+	// server-verification posture (what tokenClient below does for the same reason).
+	// Replacing the whole struct with CAData: h.Cluster.CertPEM asserts that the
+	// apiserver SERVES a cert issued by the cluster CA, which is not true of this
+	// bring-up -- it serves a self-signed cert from --cert-dir, which is exactly why
+	// the admin kubeconfig sets insecure-skip-tls-verify. That made the leg fail with
+	// "x509: certificate signed by unknown authority" before it could test anything.
+	//
+	// Server-cert provenance is not what this leg is for: it proves how the apiserver
+	// AUTHORIZES a system:node client identity. That identity -- the CA-signed cert
+	// below -- is still fully exercised.
+	cfg.TLSClientConfig.CAFile, cfg.TLSClientConfig.CAData = base.TLSClientConfig.CAFile, base.TLSClientConfig.CAData
+	cfg.TLSClientConfig.Insecure = base.TLSClientConfig.Insecure
+	cfg.TLSClientConfig.CertFile, cfg.TLSClientConfig.KeyFile = "", ""
+	cfg.TLSClientConfig.CertData, cfg.TLSClientConfig.KeyData = certPEM, keyPEM
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		t.Fatalf("build system:node client: %v", err)

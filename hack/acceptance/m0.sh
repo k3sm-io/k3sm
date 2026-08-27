@@ -19,7 +19,7 @@ cluster_up
 node_up k3sm-m0
 
 # Core pod assertions live in the typed e2e suite (apply -> Running -> native process -> delete).
-if ( cd "$REPO_ROOT" && CGO_ENABLED=0 go test -tags e2e -run TestM0 ./e2e/... ); then
+if ( cd "$REPO_ROOT" && CGO_ENABLED=0 go test -tags e2e -run '^TestM0$' ./e2e/... ); then
 	ladder ok "m0.A  native pod runs + deletes (e2e TestM0)"
 else
 	ladder no "m0.A  native pod runs + deletes (e2e TestM0)"

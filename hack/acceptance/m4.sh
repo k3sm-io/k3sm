@@ -33,6 +33,16 @@ trap cleanup EXIT
 echo "==> k3sm M4 integration gate (k3sm server, --authorization-mode=Node,RBAC default since M4.1)"
 server_up k3sm-m4 hostprocess
 
+# Point the node-identity leg at THIS cluster's CA hierarchy. The test defaults to
+# the installed root posture (/var/lib/k3sm/server), which is a DIFFERENT cluster
+# than the one this gate just brought up under $SERVER_WORKDIR. Left unset, the leg
+# does one of two wrong things depending on host state: with no /var/lib/k3sm it
+# silently SKIPS (which the conformance guard scores RED), and with a leftover one it
+# signs a node cert with a STALE CA that the running apiserver has never trusted —
+# failing as "Unauthorized", which looks like an RBAC denial and is really a cert
+# signed by the wrong authority.
+export K3SM_WORK_DIR="$SERVER_WORKDIR"
+
 # m4.1 — the control plane (Node,RBAC authorizer) is serving and pkg/rbac.Provision
 # ran fail-closed before the node started, so the RBAC graph already exists.
 if [ "$(kc get --raw /healthz 2>/dev/null)" = "ok" ]; then

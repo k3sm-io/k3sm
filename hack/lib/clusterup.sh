@@ -278,4 +278,23 @@ server_up() {
 		server_died && { server_died_report "node bring-up"; return 1; }
 		sleep 1; n=$((n+1)); if [ $n -gt 120 ]; then echo "node $node_name not Ready within 120s" >&2; tail -20 "$K3SM_WORKDIR/server.log" >&2; return 1; fi
 	done
+
+	# A Ready node is NOT yet a cluster you can create a pod in. The apiserver's
+	# ServiceAccount admission plugin refuses every pod until default/default exists,
+	# and that object is created ASYNCHRONOUSLY by the controller-manager's
+	# serviceaccount controller. A gate that starts creating pods the instant the node
+	# goes Ready races it and fails with:
+	#
+	#   pods "..." is forbidden: error looking up service account default/default:
+	#   serviceaccount "default" not found
+	#
+	# which reads like a misconfigured cluster but is only a bring-up that returned
+	# too early. The race is timing-dependent, so it hides in whichever gate happens
+	# to spend longer compiling its suite — m3.sh passed while m1.sh failed on the
+	# very same bring-up. Waiting here fixes it for every caller at once.
+	n=0
+	until kc get serviceaccount default -n default >/dev/null 2>&1; do
+		server_died && { server_died_report "default ServiceAccount creation"; return 1; }
+		sleep 1; n=$((n+1)); if [ $n -gt 60 ]; then echo "default/default ServiceAccount not created within 60s" >&2; tail -20 "$K3SM_WORKDIR/server.log" >&2; return 1; fi
+	done
 }

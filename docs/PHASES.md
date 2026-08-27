@@ -205,28 +205,30 @@ phases:
             method: e2e
       - id: M3.1
         title: Wire NodePort Services
-        status: in-progress
+        status: done
         deliverables:
           - id: M3.1-d1
             done: true
             desc: "surface darwin-net:M3's NodePort listener (*:nodePort, TCP) through the server so a NodePort Service is reachable on the host port — no apis change (ServicePort.NodePort already exists). Bound as a DIRECT wildcard *:nodePort in-process (>=1024; NOT via the netd helper, which rejects wildcards); apiserver pins --service-node-port-range 30000-32767 so the unprivileged _k3sm proxy binds it; <1024 NodePort unsupported. Honest-gap Warn VAPs added: externalTrafficPolicy:Local (userspace splice doesn't preserve client src IP) and UDP Service ports (no UDP datapath yet); foreign-user Deny VAP extended to runAsGroup/supplementalGroups/ephemeralContainers. UDP NodePort deferred with darwin-net's UDP relay. CODE-COMPLETE + unit-proven; live reachability is the lab e2e."
         acceptance:
           - id: M3.1-a1
-            met: false
+            met: true
             check: a Deployment behind a NodePort Service is reachable on *:nodePort
             method: e2e
+            evidence: "PROVEN 2026-08-27 on Apple M1 Ultra / macOS 26.5.2 by TestM3_NodePort under hack/acceptance/m3.sh (single-node integration gate): `M3 (integration): 2 passed, 0 failed`, exit 0. Single-node-testable, so it is NOT owed to the two-Mac lab."
       - id: M3.2
         title: APFS local-path provisioner + StatefulSet
-        status: in-progress
+        status: done
         deliverables:
           - id: M3.2-d1
             done: true
             desc: "a local-path provisioner controller watches PVCs and provisions a PV via runtimed:M3 (stable per-PVC dir on the same APFS volume as /var/lib/k3sm, empty-create, lifecycle decoupled from the pod dir, honors ReclaimPolicy); StatefulSet support — stable STORAGE + NAME identity on the hostprocess runtime; stable NETWORK identity requires per-pod IPs (runtimed M2 path)."
         acceptance:
           - id: M3.2-a1
-            met: false
+            met: true
             check: a StatefulSet + PVC writes data, the pod restarts, and the SAME data is present (persistence across restart)
             method: e2e
+            evidence: "PROVEN 2026-08-27 on Apple M1 Ultra / macOS 26.5.2 by TestM3_PVCPersistsAcrossRestart under hack/acceptance/m3.sh, exit 0. Reaching green required a PRODUCT fix, not just a harness one: pkg/provider toVolume had no PersistentVolumeClaim case, so the volume was silently dropped and every StatefulSet with a volumeClaimTemplate was rejected as `volume_mount \"data\" references undefined volume`."
       - id: M3.3
         title: Per-node CoreDNS + node-local kubernetes endpoint (infra-VIP mesh exemption)
         status: in-progress
