@@ -139,9 +139,17 @@ func TestM3_PVCPersistsAcrossRestart(t *testing.T) {
 					NodeSelector: map[string]string{"kubernetes.io/os": "darwin"},
 					Tolerations:  []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 					Containers: []corev1.Container{{
-						Name:         "app",
+						Name: "app",
+						// conftool, NOT /bin/sh. The PVC is symlinked at
+						// <rootfs>/data and, with no mount namespace, an absolute
+						// mount path only resolves there through the path-rebase
+						// DYLD shim -- which cannot be injected into a SIP platform
+						// binary like /bin/sh. A shell probe therefore writes to a
+						// host /data that does not exist and reports an empty
+						// marker, which is not a storage failure but a probe that
+						// cannot see the volume.
 						Image:        "native",
-						Command:      []string{"/bin/sh", "-c", `f=/data/marker; [ -f "$f" ] || echo "v-$(date +%s)-$$" > "$f"; echo "MARKER=$(cat "$f")"; exec /usr/bin/tail -f /dev/null`},
+						Command:      []string{helperBin(t, "conftool"), "marker", "-path", "/data/marker"},
 						VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
 					}},
 				},

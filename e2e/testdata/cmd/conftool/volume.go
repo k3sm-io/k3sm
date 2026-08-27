@@ -18,9 +18,11 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"time"
 )
 
 // readfile reads -path and asserts it contains -contains and (when -mode is set)
@@ -87,4 +89,44 @@ func writeread(args []string) {
 		fail("writeread: %s = %q, want %q", *path, string(data), *token)
 	}
 	fmt.Printf("writeread: %s ok\n", *path)
+}
+
+// marker is the PVC-persistence probe: it creates -path with a fresh value ONLY if
+// the file is absent, prints MARKER=<value> on every start, then idles so the pod
+// stays Running while the test restarts it.
+//
+// It exists because this assertion cannot be made from /bin/sh. A PVC is symlinked
+// at <rootfs><mountPath>, and with no mount namespace an absolute mount path only
+// resolves there through the path-rebase DYLD shim -- which cannot be injected into
+// a SIP platform binary such as /bin/sh (pkg/sandbox documents that ceiling). A Go
+// helper loads the shim, so the absolute path lands in the persistent directory.
+//
+// Create-if-absent is the whole point: an unconditional write would re-mint the
+// value on the restarted pod and the comparison would pass even if the volume were
+// empty every time.
+func marker(args []string) {
+	fs := flag.NewFlagSet("marker", flag.ExitOnError)
+	path := fs.String("path", "", "absolute mount path of the marker file")
+	_ = fs.Parse(args)
+	if *path == "" {
+		fail("marker: -path is required")
+	}
+
+	data, err := os.ReadFile(*path)
+	switch {
+	case err == nil:
+	case errors.Is(err, os.ErrNotExist):
+		v := fmt.Sprintf("v-%d-%d", time.Now().UnixNano(), os.Getpid())
+		if werr := os.WriteFile(*path, []byte(v), 0o644); werr != nil {
+			fail("marker: write %s: %v", *path, werr)
+		}
+		data = []byte(v)
+	default:
+		fail("marker: read %s: %v", *path, err)
+	}
+
+	fmt.Printf("MARKER=%s\n", string(data))
+	for {
+		time.Sleep(time.Hour)
+	}
 }

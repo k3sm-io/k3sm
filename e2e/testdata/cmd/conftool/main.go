@@ -33,7 +33,7 @@ const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage: conftool <memhog|apicall|resolve|readfile|writeread> [flags]")
+		fail("usage: conftool <memhog|apicall|resolve|readfile|writeread|marker> [flags]")
 	}
 	switch os.Args[1] {
 	case "memhog":
@@ -46,6 +46,8 @@ func main() {
 		readfile(os.Args[2:])
 	case "writeread":
 		writeread(os.Args[2:])
+	case "marker":
+		marker(os.Args[2:])
 	default:
 		fail("conftool: unknown subcommand %q", os.Args[1])
 	}
