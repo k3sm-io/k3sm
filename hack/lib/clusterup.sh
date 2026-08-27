@@ -20,7 +20,14 @@ BIN="$K3SM_WORKDIR/bin"
 # under a prefix the per-pod Seatbelt profile admits for reading — /Library is in that
 # baseline, $K3SM_WORKDIR is not — and it is deliberately NOT /Library/k3sm, which
 # belongs to a real `k3sm install`; a gate must never write into or delete that.
-: "${STAGE_DIR:=/Library/k3sm-acceptance}"
+#
+# This is a FIXED internal path, NOT a knob. It is `readonly` on purpose: the gate
+# both `rm -rf`s and recreates it, as root, and the two names differ by a single
+# token — so an overridden value is not a customization, it is a root-owned
+# `rm -rf` pointed at a real installation. stage_dir_ok below is asserted at every
+# site that mutates it, so the invariant holds at all of them rather than at one.
+readonly STAGE_DIR="${STAGE_DIR:-/Library/k3sm-acceptance}"
+stage_dir_ok() { [ "$STAGE_DIR" = /Library/k3sm-acceptance ]; }
 export KUBECONFIG="${KUBECONFIG:-$K3SM_WORKDIR/cluster.kubeconfig}"
 CP_TOKEN="acceptance-secret-token"
 NODE_PID=""
@@ -58,10 +65,9 @@ cluster_down() {
 	[ -n "$SERVER_WORKDIR" ] && for p in kube-controller-manager kube-scheduler kube-apiserver kine; do
 		pkill -f "$SERVER_WORKDIR/bin/$p" 2>/dev/null || true
 	done
-	# Remove the staged pod-support artifacts. Guarded on the exact literal so a
-	# caller-overridden STAGE_DIR can never turn this into an arbitrary rm -rf, and
-	# scoped so it can never touch a real /Library/k3sm installation.
-	[ "$STAGE_DIR" = /Library/k3sm-acceptance ] && rm -rf /Library/k3sm-acceptance 2>/dev/null
+	# Remove the staged pod-support artifacts, through the same assertion the
+	# bring-up side uses, so this can never become an arbitrary root rm -rf.
+	stage_dir_ok && rm -rf /Library/k3sm-acceptance 2>/dev/null
 	return 0
 }
 
@@ -219,6 +225,9 @@ server_up() {
 	local server_cmd=(go run "$REPO_ROOT/cmd/k3sm")
 	if [ "$runtime" = runtimed ]; then
 		[ "$(id -u)" -eq 0 ] || { echo "server_up: the runtimed posture stages pod-readable artifacts under $STAGE_DIR and needs root" >&2; return 1; }
+		# Assert BEFORE the rm -rf, not only on teardown: this runs as root, and
+		# /Library/k3sm-acceptance vs /Library/k3sm is one token apart.
+		stage_dir_ok || { echo "server_up: refusing to stage into unexpected STAGE_DIR $STAGE_DIR" >&2; return 1; }
 		rm -rf "$STAGE_DIR"; mkdir -p "$STAGE_DIR"; chmod 755 "$STAGE_DIR"
 		( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$STAGE_DIR/k3sm" ./cmd/k3sm ) \
 			|| { echo "server_up: building k3sm failed" >&2; return 1; }
