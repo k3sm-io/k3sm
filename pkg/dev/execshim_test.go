@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeBuilder is an in-memory ExecShimBuilder — no real `go build` / `codesign`.
@@ -226,4 +227,81 @@ func TestWithExecShimPathTrailingElementStillPrepends(t *testing.T) {
 	if len(got) != 1 || !strings.HasPrefix(got[0], wantPrefix) {
 		t.Errorf("withExecShimPath = %v, want /dev/.bin prepended even when it already appears later", got)
 	}
+}
+
+// TestDevUpWaitsForDefaultNamespaceBootstrap is the B152 gate.
+//
+// `Up` used to return as soon as the apiserver was healthy and its kubeconfig
+// merged, while the service-account controller and the root-ca-cert-publisher had
+// not yet reconciled the default namespace. A caller that created a pod
+// immediately — every acceptance/e2e suite does — then race-failed either at
+// admission (`serviceaccount "default" not found`) or at volume materialisation
+// (`configMap default/kube-root-ca.crt: file does not exist`). Observed on lab
+// hardware 2026-08-27: both objects existed at AGE=1s, and the same criteria
+// passed against a warm cluster.
+//
+// Scope note: `Up` itself is not unit-reachable (it fork/execs a real server), so
+// this pins the WAIT's semantics — the part that was missing — plus the wiring
+// that makes Up use it. The end-to-end "Up blocks" claim is the lab's to prove.
+func TestDevUpWaitsForDefaultNamespaceBootstrap(t *testing.T) {
+	always := func(context.Context) bool { return true }
+	never := func(context.Context) bool { return false }
+
+	t.Run("returns once BOTH objects are present", func(t *testing.T) {
+		if err := awaitBootstrapObjects(context.Background(), 2*time.Second, "kc", always, always); err != nil {
+			t.Fatalf("both present: err = %v, want nil", err)
+		}
+	})
+
+	t.Run("blocks while either object is missing, and names it on timeout", func(t *testing.T) {
+		err := awaitBootstrapObjects(context.Background(), 300*time.Millisecond, "kc", always, never)
+		if err == nil {
+			t.Fatal("configmap missing: err = nil, want a timeout error")
+		}
+		// The operator has to know WHICH object never landed.
+		if !strings.Contains(err.Error(), "kube-root-ca.crt present=false") {
+			t.Errorf("error %q must name the missing ConfigMap", err)
+		}
+		if !strings.Contains(err.Error(), "serviceaccount/default present=true") {
+			t.Errorf("error %q must report the ServiceAccount as present", err)
+		}
+
+		err = awaitBootstrapObjects(context.Background(), 300*time.Millisecond, "kc", never, always)
+		if err == nil || !strings.Contains(err.Error(), "serviceaccount/default present=false") {
+			t.Errorf("serviceaccount missing: err = %v, must name it", err)
+		}
+	})
+
+	t.Run("each probe is LATCHED — a transient failure never re-opens a settled object", func(t *testing.T) {
+		// The ServiceAccount answers true exactly once, then flaps to false. Without
+		// latching the wait would never converge and would time out.
+		saCalls := 0
+		flaky := func(context.Context) bool { saCalls++; return saCalls == 1 }
+		cmCalls := 0
+		lateCM := func(context.Context) bool { cmCalls++; return cmCalls >= 3 }
+		if err := awaitBootstrapObjects(context.Background(), 5*time.Second, "kc", flaky, lateCM); err != nil {
+			t.Fatalf("latching: err = %v, want nil (the SA was seen once and must stay settled)", err)
+		}
+	})
+
+	t.Run("honors context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := awaitBootstrapObjects(ctx, time.Minute, "kc", never, never); !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("Up is wired to a non-nil wait by default", func(t *testing.T) {
+		m := newTestManager(t, newFakeSystem(), 501)
+		if m.awaitNamespaceBootstrap != nil {
+			t.Fatal("a fresh Manager must leave the seam nil so Up falls back to the production wait")
+		}
+		// The production wait must be a real method, reachable and non-panicking.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := m.awaitDefaultNamespaceBootstrap(ctx, filepath.Join(t.TempDir(), "absent.kubeconfig")); err == nil {
+			t.Error("production wait on an absent kubeconfig = nil, want an error")
+		}
+	})
 }

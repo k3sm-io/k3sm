@@ -28,6 +28,10 @@ import (
 	"syscall"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 )
@@ -115,6 +119,11 @@ type Manager struct {
 	euid    int
 	out     io.Writer
 	kubeMg  *kubeMerger
+	// awaitNamespaceBootstrap blocks until the default namespace carries the two
+	// objects every pod with a projected service-account token needs. It is a
+	// field, not a plain method, so the wait is testable without a live cluster.
+	// nil means the production implementation (awaitDefaultNamespaceBootstrap).
+	awaitNamespaceBootstrap func(ctx context.Context, kubeconfig string) error
 }
 
 // ManagerConfig constructs a Manager.
@@ -291,6 +300,25 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	if err := m.kubeMg.merge(kc, inst.KubeContext); err != nil {
 		_ = m.sys.TerminateProcess(pid, terminateGrace)
 		return Instance{}, fmt.Errorf("merge kubeconfig: %w", err)
+	}
+
+	// A healthy apiserver is NOT a usable cluster. `Up` used to return here, while
+	// the service-account controller and the root-ca-cert-publisher had not yet
+	// reconciled the default namespace — so a caller that creates a pod immediately
+	// (every acceptance/e2e suite does) raced them and failed spuriously, either at
+	// admission ("serviceaccount \"default\" not found") or at volume materialisation
+	// ("configMap default/kube-root-ca.crt: file does not exist",
+	// FAILURE_REASON_ROOTFS_SETUP). Observed on lab hardware 2026-08-27: both objects
+	// existed at AGE=1s, and the same criteria passed against a warm cluster — a
+	// race, not a missing controller. Block until the namespace is actually usable,
+	// the readiness gate kubeadm and kind both apply.
+	wait := m.awaitNamespaceBootstrap
+	if wait == nil {
+		wait = m.awaitDefaultNamespaceBootstrap
+	}
+	if err := wait(ctx, kc); err != nil {
+		_ = m.sys.TerminateProcess(pid, terminateGrace)
+		return Instance{}, err
 	}
 
 	// Under sudo, hand the workdir back to the invoking human so the next rootless
@@ -538,6 +566,76 @@ func (m *Manager) awaitKubeconfig(ctx context.Context, kc string) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// defaultNamespaceBootstrapTimeout bounds awaitDefaultNamespaceBootstrap. The two
+// objects are written by controllers that start with the control plane, so they
+// normally land within a second or two; the budget is generous because the cost of
+// waiting is a slower `dev up`, while the cost of NOT waiting is a spurious red in
+// every suite that creates a pod immediately.
+const defaultNamespaceBootstrapTimeout = 90 * time.Second
+
+// awaitDefaultNamespaceBootstrap blocks until the default namespace carries BOTH
+// objects a pod with a projected service-account token needs:
+//
+//   - the `default` ServiceAccount (written by the service-account controller) —
+//     without it a pod naming it is REJECTED at admission; and
+//   - the `kube-root-ca.crt` ConfigMap (written by the root-ca-cert-publisher) —
+//     without it the kube-api-access projected volume cannot materialise.
+//
+// Both are polled with a typed client built from the instance's own kubeconfig.
+// Each is latched once seen, so a transient error on one never re-tests the other.
+func (m *Manager) awaitDefaultNamespaceBootstrap(ctx context.Context, kubeconfig string) error {
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return fmt.Errorf("build client config from %s: %w", kubeconfig, err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("build clientset for %s: %w", kubeconfig, err)
+	}
+	return awaitBootstrapObjects(ctx, defaultNamespaceBootstrapTimeout, kubeconfig,
+		func(ctx context.Context) bool {
+			_, gerr := cs.CoreV1().ServiceAccounts(metav1.NamespaceDefault).
+				Get(ctx, "default", metav1.GetOptions{})
+			return gerr == nil
+		},
+		func(ctx context.Context) bool {
+			_, gerr := cs.CoreV1().ConfigMaps(metav1.NamespaceDefault).
+				Get(ctx, "kube-root-ca.crt", metav1.GetOptions{})
+			return gerr == nil
+		})
+}
+
+// awaitBootstrapObjects is the pollable core of awaitDefaultNamespaceBootstrap,
+// split out so its semantics are testable without an apiserver: each probe is
+// LATCHED once it first succeeds, so a transient failure on one object never
+// re-opens the other, and the timeout error names which object is still missing.
+func awaitBootstrapObjects(ctx context.Context, timeout time.Duration, kubeconfig string,
+	saPresent, cmPresent func(context.Context) bool) error {
+	deadline := time.Now().Add(timeout)
+	var saOK, cmOK bool
+	for {
+		if !saOK {
+			saOK = saPresent(ctx)
+		}
+		if !cmOK {
+			cmOK = cmPresent(ctx)
+		}
+		if saOK && cmOK {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("default namespace not bootstrapped within %s "+
+				"(serviceaccount/default present=%t, configmap/kube-root-ca.crt present=%t) — "+
+				"see the server.log beside %s", timeout, saOK, cmOK, kubeconfig)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
 		}
 	}
 }
