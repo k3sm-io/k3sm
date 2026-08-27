@@ -86,10 +86,19 @@ func TestProvisionExecShimBuildsWhenAbsent(t *testing.T) {
 	}
 }
 
-func TestProvisionExecShimReusesCached(t *testing.T) {
+// TestProvisionExecShimRebuildsOverCached pins the anti-staleness contract: a
+// cached helper is REBUILT, never trusted on existence alone.
+//
+// The shim's argv is a versioned contract with sandbox.ExecShimBackend, and it
+// has changed (the rlimit + qos tokens were inserted before the profile path).
+// Reusing a helper cached before that change silently skews every pod launch —
+// the caller's rlimit sentinel lands in the old shim's profile slot and each
+// confined pod dies with `read profile -`. This test previously asserted the
+// reuse it is now the guard against.
+func TestProvisionExecShimRebuildsOverCached(t *testing.T) {
 	b := &fakeBuilder{}
 	m := newTestManagerWithBuilder(t, b, 501)
-	// Seed a valid cached helper.
+	// Seed a cached helper — stand-in for one left by an earlier session.
 	if err := os.MkdirAll(m.devBinDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -105,11 +114,38 @@ func TestProvisionExecShimReusesCached(t *testing.T) {
 	if !ok || dir != m.devBinDir() {
 		t.Fatalf("provisionExecShim = (%q,%v), want the cache dir + ok", dir, ok)
 	}
-	// A cached helper is NOT rebuilt (the expensive step is skipped)...
-	if len(b.built) != 0 {
-		t.Errorf("built = %v, want no build (cached helper reused)", b.built)
+	// The cached helper is rebuilt from source, not reused.
+	if len(b.built) != 1 || b.built[0] != shim {
+		t.Errorf("built = %v, want the cached helper rebuilt once", b.built)
 	}
-	// ...but it IS re-signed so a stale signature can't wedge exec.
+	// ...and signed, so a stale signature can't wedge exec.
+	if len(b.signed) != 1 || b.signed[0] != shim {
+		t.Errorf("signed = %v, want the rebuilt helper signed once", b.signed)
+	}
+}
+
+// TestProvisionExecShimKeepsCachedWhenRebuildFails pins the other half: a host
+// that cannot build (an installed k3sm with no workspace source) still gets the
+// isolation a previously-cached helper provides, rather than being dropped to
+// the unconfined hostprocess fallback.
+func TestProvisionExecShimKeepsCachedWhenRebuildFails(t *testing.T) {
+	b := &fakeBuilder{buildErr: errors.New("no workspace source")}
+	m := newTestManagerWithBuilder(t, b, 501)
+	if err := os.MkdirAll(m.devBinDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(m.devBinDir(), execShimName)
+	if err := os.WriteFile(shim, []byte("cached"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dir, ok, err := m.provisionExecShim(context.Background())
+	if err != nil {
+		t.Fatalf("provisionExecShim: %v", err)
+	}
+	if !ok || dir != m.devBinDir() {
+		t.Fatalf("provisionExecShim = (%q,%v), want the cached helper kept + ok", dir, ok)
+	}
 	if len(b.signed) != 1 || b.signed[0] != shim {
 		t.Errorf("signed = %v, want the cached helper re-signed once", b.signed)
 	}
