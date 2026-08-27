@@ -42,6 +42,15 @@ limitations under the License.
 // silent degrade; the effective runtime is recorded in the manifest and shown by
 // `list`.
 //
+// Pod-support DYLD shims: cmd/k3sm resolves the path-rebase and getaddrinfo shims
+// as SIBLINGS of the running executable, and `k3sm dev` re-execs a `go build`
+// binary, so it found neither — absolute volume mounts ENOENT'd in-pod and cluster
+// Service names NXDOMAIN'd. The lifecycle therefore stages both into
+// DefaultPodShimDir (under /Library, the only tree inside the pod Seatbelt read
+// baseline) and passes them as --path-shim / --dns-shim. Staging needs root, and
+// the DNS shim additionally needs a live datapath (no resolver binds the DNS VIP
+// under network=none); an unstageable shim degrades with a notice, never fatally.
+//
 // Testability: every syscall the lifecycle needs (ifconfig lo0 alias listing,
 // flushing an alias, process-liveness/kill, flock) is behind the System
 // interface, so the registry round-trip, port allocation, pre-flight reclaim

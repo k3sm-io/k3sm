@@ -105,6 +105,7 @@ type nodeOptions struct {
 	nodeIP     string
 	runtime    string // "runtimed" (default) or "hostprocess" — see defaultRuntime
 	dnsShim    string // getaddrinfo DNS shim dylib path (runtimed only)
+	pathShim   string // path-rebase DYLD shim dylib path (runtimed only)
 	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
 	domain     string // cluster DNS domain the in-pod shim search list is built from (runtimed)
 	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
@@ -146,6 +147,7 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
 	addRuntimeFlag(fs, &opts.runtime)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
+	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
@@ -601,8 +603,12 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// Prefer an explicit --dns-shim; else resolve the staged shim next to the
 		// binary (the packaged server plist passes no --dns-shim). Empty leaves pods
 		// on the system resolver.
-		DyldShim:      firstNonEmpty(opts.dnsShim, resolveDNSShim()),
-		PathShim:      resolvePathShim(),
+		DyldShim: firstNonEmpty(opts.dnsShim, resolveDNSShim()),
+		// Prefer an explicit --path-shim; else resolve the staged shim next to the
+		// binary. `k3sm dev` re-execs a `go build` binary whose siblings are a
+		// temp dir, so the sibling lookup finds nothing there and the flag is the
+		// ONLY way the dev cluster gets absolute volume mounts.
+		PathShim:      firstNonEmpty(opts.pathShim, resolvePathShim()),
 		ResolverVIP:   resolverVIP,
 		ClusterDomain: clusterDomain,
 		APIServerVIP:  apiServerVIP(),
