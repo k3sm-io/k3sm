@@ -38,6 +38,215 @@ SERVER_PID=""
 # repo root = this file's dir /../.. (hack/lib -> repo), resolved regardless of caller cwd.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# ── per-run isolation (cluster_reset) ───────────────────────────────────────
+# Every gate boots its cluster into $K3SM_WORKDIR, whose default is a FIXED path —
+# and nothing removed it, at bring-up or at teardown. So consecutive gates ran
+# against each other's kine SQLite datastore. That is not theoretical: running
+# m0..m10 back-to-back on 2026-08-27, m3 and m4 both died on "apiserver healthz not
+# ok within 180s" over a server log reading `failed to allocate IP 10.43.0.10:
+# provided IP is already allocated` — the PREVIOUS gate's Service IP allocation,
+# replayed out of the previous gate's datastore; each then passed from a clean
+# slate. A second symptom of the same shape: `listen tcp :10250: bind: address
+# already in use`, a listener a previous gate left behind. A gate whose verdict
+# depends on which gate ran before it is not a gate.
+#
+# cluster_reset is the repair, and the ONLY site that removes cluster state. Every
+# bring-up entry point (cluster_up, server_up) calls it FIRST, so each gate starts
+# from a clean cluster no matter what preceded it.
+#
+# It CLEANS THE FIXED DIR rather than allocating a mktemp one per run, deliberately:
+#   - $K3SM_WORKDIR/bin and $SERVER_WORKDIR/bin are DOWNLOAD CACHES (a kwok-ci/k8s
+#     release download plus a cgo `go install` of kine, per dir). A fresh dir per
+#     run pays both for every gate and leaves an unbounded pile of trees in /tmp.
+#     They hold no state — the datastore does — so keeping them is free of the bug.
+#   - a temp dir isolates only the FILESYSTEM. Half the contamination is host-global
+#     state no path can namespace: the :6444/:2379/:10250 listeners above, and the
+#     lo0 aliases lo0_flush already sweeps. Those need an explicit reap either way.
+#   - a fixed path keeps the logs of a failed gate findable afterwards.
+# So: keep the path, keep the two bin caches, remove EVERYTHING else, reap first.
+#
+# CLUSTER_RESET_DONE makes it fire AT MOST ONCE per gate process. A gate that
+# brings the cluster up, tears it down and brings it up again inside one run is
+# testing continuity, and must not have its datastore deleted underneath it; the
+# contract is "each gate RUN starts clean", not "each bring-up call wipes".
+CLUSTER_RESET_DONE=""
+
+# workdir_ok is the workdir analog of stage_dir_ok, and exists for the same reason:
+# cluster_reset removes files, as root in the m2/m3 postures, under a path that is
+# one token away from a real installation (/var/lib/k3sm/server is the installed
+# server work dir; $SERVER_WORKDIR is the gate's). Unlike STAGE_DIR, $K3SM_WORKDIR
+# is a genuine knob, so it cannot be pinned to a literal — it is constrained
+# STRUCTURALLY instead, and asserted at EVERY site that removes or kills
+# (cluster_reset, reset_dir, reap_port) rather than once at the top. A path that
+# fails the assertion aborts the bring-up; nothing proceeds best-effort on a path
+# the library could not vouch for.
+workdir_ok() {
+	local d="${1:-}"
+	[ -n "$d" ] || return 1
+	case "$d" in
+	/*) ;;                                  # absolute only
+	*) return 1 ;;
+	esac
+	case "$d" in
+	*/../*|*/..|*//*) return 1 ;;           # no traversal, no empty component
+	esac
+	if [ "$d" = "/" ]; then return 1; fi
+	# At least two components: /tmp is refused, /tmp/k3sm-cluster is accepted.
+	if [ "$(dirname "$d")" = "/" ]; then return 1; fi
+	if [ -n "${HOME:-}" ] && [ "$d" = "$HOME" ]; then return 1; fi
+	# Never a real installation, never a system prefix. The trailing slash makes
+	# the directory itself match its own prefix pattern.
+	case "$d/" in
+	/Library/k3sm/*|/var/lib/k3sm/*|/etc/*|/usr/*|/bin/*|/sbin/*|/dev/*|/System/*|/Applications/*|/Volumes/*|/Users/*/Library/*) return 1 ;;
+	esac
+	return 0
+}
+
+# reset_dir <dir> [keep...] removes every DIRECT CHILD of <dir> except the named
+# keep entries. It never removes <dir> itself, never recurses past depth 1 for the
+# decision, and refuses outright on a dir workdir_ok cannot vouch for. Residue it
+# could not delete (the common case: a previous ROOT gate's files, seen by a later
+# rootless gate) is a hard failure with the remediation printed — silently building
+# on top of it is exactly the bug this file is fixing.
+reset_dir() {
+	local d="$1"; shift
+	local keep=" $* " child base left=""
+	if ! workdir_ok "$d"; then
+		echo "reset_dir: refusing to clean an implausible work dir: $d" >&2
+		return 1
+	fi
+	[ -d "$d" ] || return 0
+	while IFS= read -r -d '' child; do
+		base="${child##*/}"
+		case "$keep" in
+		*" $base "*) continue ;;
+		esac
+		rm -rf "$child" 2>/dev/null || true
+		if [ -e "$child" ]; then left="$left $base"; fi
+	done < <(find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+	if [ -n "$left" ]; then
+		echo "reset_dir: could not remove stale cluster state in $d:$left" >&2
+		echo "reset_dir: it is most likely owned by a previous ROOT gate run — clear it with: sudo rm -rf $d" >&2
+		return 1
+	fi
+	return 0
+}
+
+# _port_listeners <port> → the pids LISTENING on <port>. As a non-root user lsof
+# reports only this user's processes, so a root-owned stale listener is invisible
+# here; that is a limit of the rootless posture, not something to work around.
+#
+# The trailing `|| true` is load-bearing, not defensive noise: lsof exits 1 when
+# nothing matches, and the gates run under `set -euo pipefail`, where a plain
+# `pids="$(_port_listeners "$port")"` assignment would then kill the caller — at
+# the exact moment the port turned out to be FREE, i.e. on the success path.
+_port_listeners() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | sort -u || true; }
+
+# _proc_is_ours attributes a pid to THIS acceptance rig before anything kills it.
+# Two witnesses, both structural: the executable path lies under one of the rig's
+# own directories ($BIN, $SERVER_WORKDIR/bin, $STAGE_DIR), or the argv names one of
+# them (`k3sm server --work-dir $SERVER_WORKDIR …` run via `go run` executes out of
+# a temp build dir, so the path witness cannot see it — and that process is exactly
+# the :10250 squatter). Anything else is left alone: an unattributable listener is
+# someone else's process.
+_proc_is_ours() {
+	local pid="$1" comm args
+	comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+	args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+	case "$comm" in
+	"$K3SM_WORKDIR"/*|"$SERVER_WORKDIR"/*|"$STAGE_DIR"/*) return 0 ;;
+	esac
+	case "$args" in
+	*"$K3SM_WORKDIR"/*|*"$SERVER_WORKDIR"/*|*"$STAGE_DIR"/*) return 0 ;;
+	esac
+	return 1
+}
+
+# reap_port <port> [fatal|warn] frees a port a PREVIOUS gate left listening.
+# It kills only pids _proc_is_ours attributes to the rig (TERM, then KILL after a
+# grace period). A listener it cannot attribute is never killed; what happens then
+# is the mode:
+#   fatal (default) — return non-zero. For $KINE_PORT/$APISERVER_PORT a foreign
+#     listener is worse than a failure: wait_tcp would SUCCEED against it and the
+#     gate would run against someone else's endpoint.
+#   warn            — report and return 0. For the kubelet/scheduler/CM ports a
+#     foreign holder produces an honest, self-explanatory bind error inside the
+#     gate, so refusing to start over it would be a false pre-flight abort.
+reap_port() {
+	local port="$1" mode="${2:-fatal}" pid pids comm n=0
+	if ! workdir_ok "$K3SM_WORKDIR"; then
+		echo "reap_port: refusing to attribute processes against an implausible K3SM_WORKDIR: $K3SM_WORKDIR" >&2
+		return 1
+	fi
+	for pid in $(_port_listeners "$port"); do
+		if _proc_is_ours "$pid"; then
+			kill "$pid" 2>/dev/null || true
+			echo "reaped a stale :$port listener from a previous run (pid $pid)"
+		fi
+	done
+	while [ -n "$(_port_listeners "$port")" ]; do
+		sleep 0.2; n=$((n+1))
+		if [ "$n" -eq 15 ]; then
+			for pid in $(_port_listeners "$port"); do
+				if _proc_is_ours "$pid"; then kill -9 "$pid" 2>/dev/null || true; fi
+			done
+		fi
+		if [ "$n" -gt 25 ]; then break; fi
+	done
+	pids="$(_port_listeners "$port")"
+	if [ -n "$pids" ]; then
+		for pid in $pids; do
+			comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+			echo "reap_port: :$port is held by pid $pid ($comm), which is NOT one of this rig's processes — not killing it" >&2
+		done
+		if [ "$mode" = warn ]; then return 0; fi
+		echo "reap_port: free :$port before running the gate (a foreign endpoint there would be indistinguishable from ours)" >&2
+		return 1
+	fi
+	return 0
+}
+
+# cluster_reset puts the host back to a pre-gate state: no stale listeners on the
+# ports the bring-up needs, and no cluster state under the work dirs except the two
+# binary caches. Called first by cluster_up and server_up; safe to call directly.
+cluster_reset() {
+	local keep_extra="" rel port
+	if [ -n "$CLUSTER_RESET_DONE" ]; then return 0; fi
+	if ! workdir_ok "$K3SM_WORKDIR"; then
+		echo "cluster_reset: refusing to reset an implausible K3SM_WORKDIR: $K3SM_WORKDIR" >&2
+		return 1
+	fi
+	if ! workdir_ok "$SERVER_WORKDIR"; then
+		echo "cluster_reset: refusing to reset an implausible SERVER_WORKDIR: $SERVER_WORKDIR" >&2
+		return 1
+	fi
+	# Ports first: a live process holding the datastore open would otherwise be
+	# writing into the tree while it is removed.
+	for port in "$KINE_PORT" "$APISERVER_PORT"; do
+		reap_port "$port" fatal || return 1
+	done
+	for port in 10250 10259 10257; do
+		reap_port "$port" warn || return 1
+	done
+	# $SERVER_WORKDIR defaults INSIDE $K3SM_WORKDIR, so the outer sweep must keep
+	# the component leading to it — otherwise it would take the server's bin cache
+	# with it (a full CP re-download per gate).
+	case "$SERVER_WORKDIR" in
+	"$K3SM_WORKDIR"/*)
+		rel="${SERVER_WORKDIR#"$K3SM_WORKDIR"/}"
+		keep_extra="${rel%%/*}" ;;
+	esac
+	if [ -n "$keep_extra" ]; then
+		reset_dir "$K3SM_WORKDIR" bin "$keep_extra" || return 1
+	else
+		reset_dir "$K3SM_WORKDIR" bin || return 1
+	fi
+	reset_dir "$SERVER_WORKDIR" bin || return 1
+	mkdir -p "$K3SM_WORKDIR" "$SERVER_WORKDIR" || return 1
+	CLUSTER_RESET_DONE=1
+	return 0
+}
+
 # kc runs kubectl against the acceptance cluster.
 kc() { "$BIN/kubectl" --server="https://127.0.0.1:$APISERVER_PORT" --insecure-skip-tls-verify=true --token="$CP_TOKEN" "$@"; }
 
@@ -113,6 +322,9 @@ _ip_to_int() {
 
 # cluster_up brings up kine + apiserver + scheduler + controller-manager and writes $KUBECONFIG.
 cluster_up() {
+	# First statement, before anything is created or downloaded: a gate must not
+	# inherit the previous gate's datastore or listeners (see cluster_reset).
+	cluster_reset || return 1
 	mkdir -p "$BIN"
 	( cd "$K3SM_WORKDIR"
 	  # 1. prebuilt control-plane binaries (upstream won't ship darwin/arm64: k/k#118359)
@@ -197,6 +409,9 @@ node_up() {
 # cold first build); that is expected for the integration tier.
 server_up() {
 	local node_name="${1:-k3sm-m1}" runtime="${2:-hostprocess}" network="${3:-none}"
+	# First statement, before anything is created or built: a gate must not inherit
+	# the previous gate's datastore or listeners (see cluster_reset).
+	cluster_reset || return 1
 	mkdir -p "$BIN" "$SERVER_WORKDIR"
 	( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/kubectl-dl" ./cmd/k3sm >/dev/null 2>&1 ) || true
 	# The runtimed runtime resolves three pod-support artifacts as SIBLINGS of the
