@@ -225,13 +225,21 @@ func safePort(t *testing.T, host string) int32 {
 // spending the deadline to report the symptom ("never came up") and discarding
 // the cause — the failure mode that made the ephemeral-port steal above so
 // hard to read.
-// The 5s deadline this replaces sat INSIDE the observed bring-up distribution.
-// Measured on an idle 8-core M2 under `go test -count=1 ./...`, the listener
-// came up after 4.36s, 4.68s, 4.70s, 5.25s and 5.56s across five runs — so a 5s
-// cut failed roughly half the time, matching the 3-of-5 rate seen in CI. A
-// polling wait returns the moment the listener answers, so a generous deadline
-// costs a passing run nothing; it only bounds how long a genuine failure takes
-// to report. 30s clears the measured spread with a wide margin.
+// DEADLINE IS NOT THE ROOT CAUSE — see B156.
+//
+// An earlier fix raised this from 5s to 30s, concluding the cut simply sat inside
+// a load-proportional bring-up distribution (measured idle: 4.36s, 4.68s, 4.70s,
+// 5.25s, 5.56s). That conclusion was WRONG, or at best partial: the same failure
+// then reproduced at 30s under a parallel-lane gate AND at 180s on an otherwise
+// ordinary run. At three minutes the listener is not slow, it never arrives —
+// while s.Run() returns no error, so the server is up and the proxy simply never
+// binds. In isolation the same test takes ~0.9s and passes 5/5.
+//
+// So there is a real intermittent wedge in the bring-up path. This deadline is
+// deliberately NOT inflated further: raising it only makes CI spend longer to
+// report a genuine hang. 30s is far outside the normal distribution, so a failure
+// here means the wedge, not slowness. The runErr select below is what
+// distinguishes "server died" from "server alive, listener never bound".
 func waitListen(t *testing.T, port int32, runErr <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
