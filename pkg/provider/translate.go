@@ -810,8 +810,9 @@ func toLocalRefs(refs []corev1.LocalObjectReference) []*runtimev1.LocalObjectRef
 	return out
 }
 
-// toVolumes maps the M2.1 corev1 volume subset (configMap / secret / emptyDir /
-// downwardAPI / projected); volumes with an unmodeled source are skipped (the
+// toVolumes maps the modeled corev1 volume subset (configMap / secret / emptyDir /
+// downwardAPI / projected / persistentVolumeClaim); volumes with an unmodeled
+// source are skipped (the
 // runtime materializes only the modeled set).
 func toVolumes(vols []corev1.Volume) []*runtimev1.Volume {
 	if len(vols) == 0 {
@@ -841,10 +842,29 @@ func toVolume(v *corev1.Volume) *runtimev1.Volume {
 		rv.DownwardApi = toDownwardAPIVolumeSource(v.DownwardAPI)
 	case v.Projected != nil:
 		rv.Projected = toProjectedVolumeSource(v.Projected)
+	case v.PersistentVolumeClaim != nil:
+		rv.PersistentVolumeClaim = toPersistentVolumeClaimVolumeSource(v.PersistentVolumeClaim)
 	default:
 		return nil
 	}
 	return rv
+}
+
+// toPersistentVolumeClaimVolumeSource maps the durable PVC source (M3.1). Only the
+// claim reference crosses the wire: runtimed derives the bound directory from
+// (namespace, claim_name) through the shared storage contract, so the provider must
+// NOT resolve a path here.
+//
+// Dropping this case is not a benign omission. An unmodeled source returns nil and
+// the volume is silently skipped, so a container that mounts it fails downstream
+// with "volume_mount %q references undefined volume" — naming the MOUNT, never the
+// missing source. That is what made every StatefulSet with a volumeClaimTemplate
+// unschedulable while the PVC itself bound correctly.
+func toPersistentVolumeClaimVolumeSource(src *corev1.PersistentVolumeClaimVolumeSource) *runtimev1.PersistentVolumeClaimVolumeSource {
+	return &runtimev1.PersistentVolumeClaimVolumeSource{
+		ClaimName: src.ClaimName,
+		ReadOnly:  src.ReadOnly,
+	}
 }
 
 func toConfigMapVolumeSource(src *corev1.ConfigMapVolumeSource) *runtimev1.ConfigMapVolumeSource {
