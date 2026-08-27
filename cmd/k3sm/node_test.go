@@ -110,6 +110,44 @@ func TestRuntimedConfiguresPostureVIPs(t *testing.T) {
 	}
 }
 
+// TestRuntimedConfigPrefersExplicitShimFlags pins the OTHER half of the B151
+// pod-support-shim wiring: an explicitly-passed --path-shim / --dns-shim must win
+// over the sibling-dylib lookup.
+//
+// Both shims were previously resolved ONLY as siblings of the running executable
+// (resolvePathShim / resolveDNSShim), and the path shim had no override at all. A
+// `k3sm dev` server is THIS binary re-exec'd out of a `go build` output dir, so
+// the sibling lookup finds nothing: every absolute volume-mount path ENOENTs
+// in-pod (no path rebase) and every cluster Service name NXDOMAINs (no getaddrinfo
+// interception). The flags are the only channel by which a dev cluster can stage
+// the dylibs somewhere pod-readable (/Library — the pod Seatbelt read baseline)
+// and still have the node use them.
+func TestRuntimedConfigPrefersExplicitShimFlags(t *testing.T) {
+	t.Parallel()
+
+	cfg := runtimedConfig(nodeOptions{
+		pathShim: "/Library/k3sm-dev/libk3sm_pathrebase_shim.dylib",
+		dnsShim:  "/Library/k3sm-dev/libk3sm_getaddrinfo_shim.dylib",
+	}, nil)
+	if cfg.PathShim != "/Library/k3sm-dev/libk3sm_pathrebase_shim.dylib" {
+		t.Errorf("PathShim = %q, want the explicit --path-shim (absolute volume mounts ENOENT in-pod without it)", cfg.PathShim)
+	}
+	if cfg.DyldShim != "/Library/k3sm-dev/libk3sm_getaddrinfo_shim.dylib" {
+		t.Errorf("DyldShim = %q, want the explicit --dns-shim", cfg.DyldShim)
+	}
+
+	// With neither flag the sibling lookup is the fallback, and a from-source run
+	// has no staged sibling — empty, which disables injection rather than pointing
+	// dyld at a path that is not there (dyld fails CLOSED on a missing insert).
+	bare := runtimedConfig(nodeOptions{}, nil)
+	if bare.PathShim != resolvePathShim() {
+		t.Errorf("PathShim with no flag = %q, want the sibling-dylib fallback %q", bare.PathShim, resolvePathShim())
+	}
+	if bare.DyldShim != resolveDNSShim() {
+		t.Errorf("DyldShim with no flag = %q, want the sibling-dylib fallback %q", bare.DyldShim, resolveDNSShim())
+	}
+}
+
 // TestNodeVirtualizationLabel is the M5.1 proof of the vm RuntimeClass
 // node-capability gate: the k3sm.io/virtualization label is present (value "true")
 // iff the node can run the Virtualization.framework backend, and ABSENT otherwise —
