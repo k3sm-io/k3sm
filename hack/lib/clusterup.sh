@@ -29,8 +29,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # kc runs kubectl against the acceptance cluster.
 kc() { "$BIN/kubectl" --server="https://127.0.0.1:$APISERVER_PORT" --insecure-skip-tls-verify=true --token="$CP_TOKEN" "$@"; }
 
+# Every timeout guard below is `if [ $n -gt N ]; then ...; fi`, NEVER the shorter
+# `[ $n -gt N ] && { ...; }`. This is a correctness requirement, not style: a
+# while/until loop exits with the status of the LAST command its body ran, and the
+# short form evaluates to FALSE (status 1) on every pass that does not time out. When
+# such a loop is the last statement of a function, the function inherits that 1, and
+# under `set -e` the CALLER dies — silently, with no message, at the moment the wait
+# actually SUCCEEDED. That is precisely how server_up used to abort m3.sh after the
+# node reached Ready, printing nothing at all. `if/fi` yields 0 when the guard does
+# not fire, so the loop and the function report success.
+#
 # wait_tcp blocks until 127.0.0.1:<port> accepts a connection (or times out).
-wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sleep 0.3; n=$((n+1)); [ $n -gt 100 ] && { echo "timeout :$port" >&2; return 1; }; done; }
+wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sleep 0.3; n=$((n+1)); if [ $n -gt 100 ]; then echo "timeout :$port" >&2; return 1; fi; done; }
 
 # cluster_down stops the node and every control-plane process.
 cluster_down() {
@@ -140,7 +150,7 @@ node_up() {
 	NODE_PID=$!
 	local n=0
 	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
-		sleep 0.5; n=$((n+1)); [ $n -gt 60 ] && { echo "node $node_name not Ready within 30s" >&2; return 1; }
+		sleep 0.5; n=$((n+1)); if [ $n -gt 60 ]; then echo "node $node_name not Ready within 30s" >&2; return 1; fi
 	done
 }
 
@@ -173,8 +183,40 @@ server_up() {
 	local node_name="${1:-k3sm-m1}" runtime="${2:-hostprocess}" network="${3:-none}"
 	mkdir -p "$BIN" "$SERVER_WORKDIR"
 	( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/kubectl-dl" ./cmd/k3sm >/dev/null 2>&1 ) || true
+	# The runtimed runtime resolves three pod-support artifacts as SIBLINGS of the
+	# running executable: k3sm-execshim (sandbox.FindExecShim — also falls back to
+	# PATH) and the two DYLD shims (cmd/k3sm resolveSiblingDylib — sibling ONLY, no
+	# override for the path shim). `go run` puts the executable in a temp build
+	# directory, so NONE of those lookups can hit; the installed posture m2.sh proves
+	# works only because `k3sm install` stages all three next to the binary.
+	#
+	# So for runtimed we build a real binary and stage its siblings, exactly as the
+	# install path does, instead of `go run`. The failure this repairs is not
+	# cosmetic: without the exec shim the server dies during node bring-up AFTER the
+	# control plane is healthy, and without the path shim an absolute volume mount
+	# reaches the host instead of the pod's data volume — which a default-deny
+	# Seatbelt profile then refuses, so a PVC write fails for a reason no log line
+	# connects to a missing dylib.
+	#
+	# hostprocess needs none of this and keeps the cheaper `go run` path.
+	local server_cmd=(go run "$REPO_ROOT/cmd/k3sm")
+	if [ "$runtime" = runtimed ]; then
+		( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/k3sm" ./cmd/k3sm ) \
+			|| { echo "server_up: building k3sm failed" >&2; return 1; }
+		codesign -s - -f "$BIN/k3sm" >/dev/null 2>&1 || true
+		( cd "$REPO_ROOT/.." && CGO_ENABLED=1 go build -o "$BIN/k3sm-execshim" k3sm.io/runtimed/cmd/k3sm-execshim ) \
+			|| { echo "server_up: building k3sm-execshim failed — the runtimed sandbox backend cannot start without it" >&2; return 1; }
+		codesign -s - -f "$BIN/k3sm-execshim" >/dev/null 2>&1 || true
+		"$REPO_ROOT/../runtimed/hack/build-pathshim.sh" "$BIN" >/dev/null \
+			|| { echo "server_up: building the path-rebase shim failed — absolute volume mounts would escape the pod data volume" >&2; return 1; }
+		codesign -s - -f "$BIN/libk3sm_pathrebase_shim.dylib" >/dev/null 2>&1 || true
+		"$REPO_ROOT/../darwin-net/hack/build-shim.sh" "$BIN" >/dev/null \
+			|| { echo "server_up: building the getaddrinfo DNS shim failed — in-pod cluster DNS would NXDOMAIN" >&2; return 1; }
+		codesign -s - -f "$BIN/libk3sm_getaddrinfo_shim.dylib" >/dev/null 2>&1 || true
+		server_cmd=("$BIN/k3sm")
+	fi
 	# The server downloads/ad-hoc-signs the CP binaries + kubectl into its workdir.
-	nohup env CGO_ENABLED=1 go run "$REPO_ROOT/cmd/k3sm" server \
+	nohup env CGO_ENABLED=1 "${server_cmd[@]}" server \
 		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
 		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network "$network" \
 		> "$K3SM_WORKDIR/server.log" 2>&1 &
@@ -183,18 +225,35 @@ server_up() {
 	export KUBECONFIG="$SERVER_WORKDIR/k3sm.kubeconfig"
 	# Reuse the server's kubectl + read its token for the kc() helper.
 	[ -x "$SERVER_WORKDIR/bin/kubectl" ] || true
+
+	# server_died reports whether the server process we launched is gone. Every wait
+	# below polls it, because the server can fail LONG after the control plane is
+	# healthy — node bring-up runs last, and when it fails the server tears the whole
+	# control plane down and exits. Without this check the waits below spin their full
+	# timeout against a corpse and then blame the apiserver, hiding the one line in
+	# server.log that actually says what happened.
+	server_died() { [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; }
+	server_died_report() {
+		echo "k3sm server exited during $1 — its last log lines:" >&2
+		tail -20 "$K3SM_WORKDIR/server.log" >&2
+		return 1
+	}
+
 	local n=0
 	until [ -f "$KUBECONFIG" ] && [ -x "$SERVER_WORKDIR/bin/kubectl" ]; do
-		sleep 1; n=$((n+1)); [ $n -gt 180 ] && { echo "k3sm server did not provision within 180s" >&2; tail -40 "$K3SM_WORKDIR/server.log" >&2; return 1; }
+		server_died && { server_died_report "provisioning"; return 1; }
+		sleep 1; n=$((n+1)); if [ $n -gt 180 ]; then echo "k3sm server did not provision within 180s" >&2; tail -40 "$K3SM_WORKDIR/server.log" >&2; return 1; fi
 	done
 	CP_TOKEN="$(awk -F'token: ' '/token: /{print $2}' "$KUBECONFIG" | tr -d '\r')"
 	BIN="$SERVER_WORKDIR/bin"   # kc() uses $BIN/kubectl
 	n=0
 	until [ "$(kc get --raw /healthz 2>/dev/null)" = "ok" ]; do
-		sleep 1; n=$((n+1)); [ $n -gt 180 ] && { echo "apiserver healthz not ok within 180s" >&2; tail -40 "$K3SM_WORKDIR/server.log" >&2; return 1; }
+		server_died && { server_died_report "control-plane bring-up"; return 1; }
+		sleep 1; n=$((n+1)); if [ $n -gt 180 ]; then echo "apiserver healthz not ok within 180s" >&2; tail -40 "$K3SM_WORKDIR/server.log" >&2; return 1; fi
 	done
 	n=0
 	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
-		sleep 1; n=$((n+1)); [ $n -gt 120 ] && { echo "node $node_name not Ready within 120s" >&2; return 1; }
+		server_died && { server_died_report "node bring-up"; return 1; }
+		sleep 1; n=$((n+1)); if [ $n -gt 120 ]; then echo "node $node_name not Ready within 120s" >&2; tail -20 "$K3SM_WORKDIR/server.log" >&2; return 1; fi
 	done
 }
