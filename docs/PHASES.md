@@ -761,6 +761,55 @@ phases:
             met: false
             check: "the GHCR mirror infra (B121 mirror manifest + workflow, B122 pkg/images pins + verify) is MERGED with gates green — recorded facts per the M12.4-a2 pattern (Res. 12; queue-item ids are not depends_on vocabulary)"
             method: build
+  - id: M13
+    title: Signing & notarization (distribution reach — post-launch, nice-to-have)
+    status: todo
+    depends_on: []
+    notes: >-
+      OPERATOR DIRECTIVE 2026-08-27, on empirical evidence from the two-Mac lab. Apple code
+      signing buys k3sm DISTRIBUTION REACH ONLY — it is NOT a runtime or privilege
+      requirement — so it is re-scoped OUT of the launch critical path into this
+      nice-to-have follow-up milestone. PROVEN THE SAME DAY on the lab host with a binary that
+      is `Signature=adhoc`, `TeamIdentifier=not set`, zero entitlements, and which
+      `spctl -a` REJECTS: `sudo k3sm install` laid down BOTH root LaunchDaemons
+      (io.k3sm.netd as root, io.k3sm.server as _k3sm), the control plane came up healthy via
+      the unprivileged user, uninstall was clean, and the m0/m1/m3/m4 gates ran GREEN with
+      m2 at 9/10 (its one failure is in-pod DNS, unrelated to signing). Root does not
+      require a signing identity on macOS; arm64 requires only SOME signature (ad-hoc
+      satisfies AMFI), and the netd DR TeamID pin is NOT implemented today — peercred.go
+      states the load-bearing control is the LOCAL_PEERCRED uid check, with code identity a
+      deferred cgo defense-in-depth TODO. Homebrew ships the same way (its bottles are
+      ad-hoc, TeamIdentifier not set, spctl-rejected) because curl-fetched files carry no
+      com.apple.quarantine xattr, so Gatekeeper is never consulted. WHAT THIS MILESTONE
+      ADDS, and it is reach not security: browser-downloadable and `.pkg` artifacts,
+      `spctl --assess` acceptance, a notarization ticket to staple, and the OPTION to arm
+      the publisher-identity DR pin. CONSEQUENCE for the launch runbook: the curl-channel
+      profile in docs/m9-plan.md is the BASELINE launch profile, no longer a degraded
+      fallback awaiting enrollment.
+    subphases:
+      - id: M13.1
+        title: Developer ID signing + notarization pipeline
+        status: todo
+        depends_on: []
+        deliverables:
+          - id: M13.1-d1
+            done: false
+            desc: "Developer ID Application enrollment + the signing/notarization credentials held by a human (never in the repo, never on a hosted runner). This is the human_gate — the milestone-grain analog of an operator-supplied credential, and the reason the rest of this milestone cannot be autopilot work."
+          - id: M13.1-d2
+            done: false
+            desc: "goreleaser sign/notarize stanzas UNCOMMENTED (they ship commented today, secrets only via {{.Env.*}} — see .goreleaser.yaml and the B58 lineage) + the .pkg artifact and stapling. Re-scope the signs: block from artifacts:binary to cover the k3sm-netd copy + checksums (the B58 forward-looking flag)."
+          - id: M13.1-d3
+            done: false
+            desc: "Re-arm the enumerated asserts m9-plan drops in the curl-only profile: spctl --assess acceptance, stapler validate, and the netd DR TeamID pin (DESIGN §5c). The DR pin additionally needs the deferred code-identity check (audit-token -> SecCodeCreateWithAuditToken -> SecCodeCheckValidity) which requires Security.framework via cgo; darwin-net is CGO_ENABLED=0 today, so that carve is part of this deliverable, not an assumption."
+        acceptance:
+          - id: M13.1-a1
+            met: false
+            check: "hack/lab/m7.sh runs its FULL profile (not the named degraded profile): spctl --assess accepts the shipped artifact, stapler validate passes, and a browser-downloaded .pkg installs without a Gatekeeper block on a clean Mac"
+            method: lab
+          - id: M13.1-a2
+            met: false
+            check: "the M4-lab/M7-lab phases.json rows (requires: signing) run green; they are the ONLY two rows in the manifest that require signing, which is what bounds this milestone"
+            method: lab
 ---
 
 # k3sm — Phase roadmap
