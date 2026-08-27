@@ -105,19 +105,40 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 	}
 	shim := filepath.Join(dir, execShimName)
 
-	// Reuse a cached helper (a regular, non-empty file). We re-sign a reused helper
-	// so a stale ad-hoc signature from a prior toolchain does not wedge exec.
+	cached := false
 	if info, statErr := os.Stat(shim); statErr == nil && !info.IsDir() && info.Size() > 0 {
-		_ = m.builder.Sign(ctx, shim)
-		return dir, true, nil
+		cached = true
 	}
 
-	// Build from the workspace. A build failure is the honest hostprocess-fallback
-	// signal — NOT fatal (an installed k3sm with no source cannot build it).
+	// ALWAYS rebuild when the source is available, never trust the cache on
+	// existence alone.
+	//
+	// The shim's argv is a versioned contract between it and
+	// sandbox.ExecShimBackend.WrapCommand, and it has changed (the rlimit + qos
+	// launch-spec tokens were inserted BEFORE the profile path). A cached shim
+	// predating that change is silently skewed: the current caller's rlimit
+	// sentinel lands in the old shim's profile slot, so EVERY confined pod dies
+	// with `read profile -: no such file or directory` and the whole M2
+	// conformance surface goes red. Observed on a lab Mac 2026-08-27, where the
+	// cache had been populated by an earlier session; the re-sign below rewrites
+	// the file, so even its mtime looks current and the staleness is invisible.
+	//
+	// go build is itself cached, so an up-to-date rebuild is ~a second — far
+	// cheaper than the failure mode it removes.
 	if buildErr := m.builder.Build(ctx, shim); buildErr != nil {
+		// A build failure is the honest hostprocess-fallback signal — NOT fatal
+		// (an installed k3sm with no source cannot build it). A helper cached by
+		// an earlier session is still better than no isolation at all, so prefer
+		// it; it is only reached when this host cannot build one.
+		if cached {
+			fmt.Fprintf(m.out, "note: could not rebuild %s (%v); reusing the cached helper\n", execShimName, buildErr)
+			_ = m.builder.Sign(ctx, shim)
+			return dir, true, nil
+		}
 		fmt.Fprintf(m.out, "note: could not build %s: %v\n", execShimName, buildErr)
 		return "", false, nil
 	}
+	// Re-sign so a stale ad-hoc signature from a prior toolchain does not wedge exec.
 	_ = m.builder.Sign(ctx, shim)
 	return dir, true, nil
 }
