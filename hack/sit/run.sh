@@ -127,9 +127,18 @@ run_tier() {
 	reclaim_state
 }
 
+# TIER_FAILED records a red tier WITHOUT aborting the run. Under `set -e` a bare
+# run_tier call killed the script the moment T0 went red, so the T1 datapath tier
+# never executed — even under sudo, which is the ONLY reason to invoke it — and
+# the four-bucket summary below (the honesty contract) never printed either, on
+# exactly the runs where it matters most. The tiers are INDEPENDENT bring-ups, so
+# a red T0 says nothing about T1. Red is still red: the summary reports it and the
+# script exits non-zero.
+TIER_FAILED=0
+
 # ── T0 rootless ─────────────────────────────────────────────────────────────
 T0_CRITS=(); while IFS= read -r __l; do [ -n "$__l" ] && T0_CRITS+=("$__l"); done < <(crits_for_tier rootless)
-run_tier "T0 rootless (k3sm dev up · runtimed none)" "" "${T0_CRITS[@]}"
+run_tier "T0 rootless (k3sm dev up · runtimed none)" "" "${T0_CRITS[@]}" || TIER_FAILED=1
 
 # The root-tier criteria are deferred at T0; recorded so they're never silent.
 ROOT_DEFERRED=(); while IFS= read -r __l; do [ -n "$__l" ] && ROOT_DEFERRED+=("$__l"); done < <(crits_for_tier root)
@@ -137,8 +146,9 @@ ROOT_DEFERRED=(); while IFS= read -r __l; do [ -n "$__l" ] && ROOT_DEFERRED+=("$
 # ── T1 root (only under sudo) ───────────────────────────────────────────────
 if [ "$(id -u)" -eq 0 ]; then
 	T1_CRITS=(); while IFS= read -r __l; do [ -n "$__l" ] && T1_CRITS+=("$__l"); done < <(crits_for_tier root)
-	run_tier "T1 root (sudo k3sm dev up --datapath · runtimed direct)" "--datapath" "${T1_CRITS[@]}"
-	# Under sudo the root tier is PROVEN, so it is no longer deferred.
+	run_tier "T1 root (sudo k3sm dev up --datapath · runtimed direct)" "--datapath" "${T1_CRITS[@]}" || TIER_FAILED=1
+	# Under sudo the root tier RAN, so it is no longer deferred — the criteria are
+	# reported by their own tier verdict (PROVEN only on green), never as deferred.
 	ROOT_DEFERRED=()
 else
 	echo ""
@@ -153,4 +163,8 @@ echo "root-deferred (${#ROOT_DEFERRED[@]}):             ${ROOT_DEFERRED[*]:-none
 echo "multi-node-deferred (${#MULTINODE_DEFERRED[@]}):       ${MULTINODE_DEFERRED[*]:-none}"
 echo "feature-unbuilt-deferred (${#UNBUILT_DEFERRED[@]}):  ${UNBUILT_DEFERRED[*]:-none}"
 echo "============================================================="
+if [ "$TIER_FAILED" -ne 0 ]; then
+	echo "SIT RED (at least one RUN tier had a missing/failed/skipped required criterion)"
+	exit 1
+fi
 echo "SIT GREEN (every required criterion in each RUN tier passed)"
