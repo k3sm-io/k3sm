@@ -1515,3 +1515,64 @@ func TestComputeInitialized(t *testing.T) {
 		})
 	}
 }
+
+// TestToPodBoxPersistentVolumeClaimVolume pins the durable PVC source through
+// translation. It is a regression test with a specific history: the source existed in
+// the proto (persistent_volume_claim, M3.1) and runtimed already materialized it, but
+// toVolume had no case for it — so the volume was silently dropped and every
+// StatefulSet with a volumeClaimTemplate failed at admission with "volume_mount
+// \"data\" references undefined volume", a message that names the mount and never the
+// missing source. The mount is asserted alongside the volume because the dropped
+// volume only becomes observable through the dangling mount.
+func TestToPodBoxPersistentVolumeClaimVolume(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "db-0", UID: types.UID("uid-db-0")},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-db-0"}}},
+				{Name: "ro", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "shared", ReadOnly: true}}},
+			},
+			Containers: []corev1.Container{{
+				Name:         "app",
+				Image:        "native",
+				VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/var/data"}},
+			}},
+		},
+	}
+
+	box, err := toPodBox(pod, "10.0.0.7", "/var/lib/k3sm/pods/uid-db-0", "", netv1.DNSConfig{})
+	if err != nil {
+		t.Fatalf("toPodBox: %v", err)
+	}
+
+	byName := map[string]*runtimev1.Volume{}
+	for _, v := range box.GetVolumes() {
+		byName[v.GetName()] = v
+	}
+	if len(byName) != 2 {
+		t.Fatalf("want 2 volumes carried through, got %d (%v) — an unmodeled source is silently dropped", len(byName), byName)
+	}
+
+	data := byName["data"].GetPersistentVolumeClaim()
+	if data == nil {
+		t.Fatal(`volume "data" lost its persistent_volume_claim source`)
+	}
+	if got := data.GetClaimName(); got != "data-db-0" {
+		t.Errorf("claim_name = %q, want %q", got, "data-db-0")
+	}
+	if data.GetReadOnly() {
+		t.Error("read_only = true, want false (the claim is read-write)")
+	}
+	if ro := byName["ro"].GetPersistentVolumeClaim(); ro == nil || !ro.GetReadOnly() {
+		t.Errorf("read-only claim did not carry read_only=true: %+v", ro)
+	}
+
+	// The dangling-mount failure mode: every mount must resolve to a carried volume.
+	for _, c := range box.GetContainers() {
+		for _, m := range c.GetVolumeMounts() {
+			if _, ok := byName[m.GetName()]; !ok {
+				t.Errorf("container %s mounts %q but no such volume was carried — this is the exact shape runtimed rejects", c.GetName(), m.GetName())
+			}
+		}
+	}
+}
