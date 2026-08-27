@@ -19,6 +19,7 @@ package netserve
 import (
 	"context"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -57,8 +58,12 @@ func TestNodePortServiceOpensWildcardListener(t *testing.T) {
 	defer backend.close()
 	backendIP, backendPort := backend.addrPort()
 
-	clusterPort := freePort(t, "127.0.0.1")
-	nodePort := freePort(t, "0.0.0.0") // >=1024 in practice; the unprivileged proxy binds it directly
+	// Both ports come from the NodePort range, NOT bind(:0) — see safePort.
+	clusterPort := safePort(t, "127.0.0.1")
+	nodePort := safePort(t, "0.0.0.0") // the unprivileged proxy binds it directly
+	for nodePort == clusterPort {
+		nodePort = safePort(t, "0.0.0.0")
+	}
 
 	ready := true
 	svc := &corev1.Service{
@@ -101,7 +106,7 @@ func TestNodePortServiceOpensWildcardListener(t *testing.T) {
 
 	// The *:NodePort listener comes up (dialed via loopback) once the watcher
 	// reconciles the Service — the core M3.1-a1 assertion.
-	waitListen(t, nodePort)
+	waitListen(t, nodePort, runErr)
 	// And it splices through to the Ready backend (LB via the userspace proxy).
 	if got := readIDWithRetry(t, nodePort, "np-backend"); got != "np-backend" {
 		t.Fatalf("NodePort served %q, want np-backend", got)
@@ -181,12 +186,61 @@ func freePort(t *testing.T, host string) int32 {
 	return port
 }
 
+// safePort returns a free port on host drawn from the NodePort range
+// (30000-32767) rather than an OS-assigned ephemeral one.
+//
+// freePort's bind(:0) draws from the darwin ephemeral range
+// (net.inet.ip.portrange.first=49152 .. last=65535) and then releases the port
+// before the proxy binds it. Under `go test ./...` the module's packages run as
+// concurrent processes all allocating ephemeral sockets, so that window can be
+// lost to another process; the proxy's later bind then fails for good and the
+// listener never appears. 30000-32767 is outside the range the OS allocator
+// draws from, so a concurrent socket cannot be handed the same port — only
+// another copy of this test could collide, which the retry covers.
+func safePort(t *testing.T, host string) int32 {
+	t.Helper()
+	const (
+		lo       = 30000 // pkg/ports.NodePortRange() == "30000-32767"
+		hi       = 32767
+		attempts = 20
+	)
+	for range attempts {
+		port := int32(lo + rand.IntN(hi-lo+1))
+		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+		if err != nil {
+			continue // in use; try another
+		}
+		_ = ln.Close()
+		return port
+	}
+	t.Fatalf("no free port on %s in %d-%d after %d attempts", host, lo, hi, attempts)
+	return 0
+}
+
 // waitListen blocks until 127.0.0.1:port accepts a connection or the deadline
 // elapses (the listener came up).
-func waitListen(t *testing.T, port int32) {
+//
+// runErr carries the server's Run result. Run returning early means the proxy
+// never got as far as a listener, so the wait reports THAT error rather than
+// spending the deadline to report the symptom ("never came up") and discarding
+// the cause — the failure mode that made the ephemeral-port steal above so
+// hard to read.
+// The 5s deadline this replaces sat INSIDE the observed bring-up distribution.
+// Measured on an idle 8-core M2 under `go test -count=1 ./...`, the listener
+// came up after 4.36s, 4.68s, 4.70s, 5.25s and 5.56s across five runs — so a 5s
+// cut failed roughly half the time, matching the 3-of-5 rate seen in CI. A
+// polling wait returns the moment the listener answers, so a generous deadline
+// costs a passing run nothing; it only bounds how long a genuine failure takes
+// to report. 30s clears the measured spread with a wide margin.
+func waitListen(t *testing.T, port int32, runErr <-chan error) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-runErr:
+			t.Fatalf("server Run exited before the listener on *:%d came up: %v", port, err)
+		default:
+		}
 		c, err := net.DialTimeout("tcp", hostPort(port), 200*time.Millisecond)
 		if err == nil {
 			_ = c.Close()
