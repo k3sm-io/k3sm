@@ -263,8 +263,33 @@ kc() { "$BIN/kubectl" --server="https://127.0.0.1:$APISERVER_PORT" --insecure-sk
 # wait_tcp blocks until 127.0.0.1:<port> accepts a connection (or times out).
 wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sleep 0.3; n=$((n+1)); if [ $n -gt 100 ]; then echo "timeout :$port" >&2; return 1; fi; done; }
 
-# cluster_down stops the node and every control-plane process.
+# cluster_down stops the node and every control-plane process, and hands the host
+# back the global state the run took from it: the ports, and the lo0 aliases.
+#
+# It is the EXIT-side mirror of cluster_reset (B150), and it exists because
+# reaping only at BRING-UP leaves the LAST gate of a sequence uncleaned — nothing
+# follows it to sweep up after. Measured on an ALL-GREEN m0 -> m1 -> m3 -> m4 run
+# (2026-08-27, so this is not a failure path): the host was left with a root
+# `k3sm server` alive 16 minutes still holding *:10250, plus lo0 aliases
+# 10.43.0.10 and 100.64.0.1. That residue is precisely what makes a LATER,
+# unrelated run — or a human's own `k3sm dev up` on the same Mac — die on
+# "listen tcp :10250: bind: address already in use" or "failed to allocate IP
+# 10.43.0.10: provided IP is already allocated".
+#
+# The signal-and-pkill block below provably does not cover two cases, and the
+# observed leak is both of them at once, which is why the port sweep is the step
+# that actually reaps the node rather than belt-and-braces:
+#   - A process that hangs or ignores TERM. $SERVER_PID is signalled here, and the
+#     leaked process IS that one: its control-plane children were already stopped
+#     in the log while it kept the kubelet listener open. Only a KILL escalation
+#     frees the port — which reap_port already implements (TERM, grace, KILL)
+#     behind the rig-attribution rule.
+#   - The pkill patterns are anchored at $BIN/<name>, so they cannot match the
+#     `go run` temp binary (hostprocess posture) nor $STAGE_DIR/k3sm (runtimed
+#     posture, where $BIN has by then been repointed at $SERVER_WORKDIR/bin).
+#     reap_port's argv witness matches both.
 cluster_down() {
+	local port
 	[ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null || true
 	[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
 	for p in k3sm kube-controller-manager kube-scheduler kube-apiserver kine; do
@@ -274,17 +299,39 @@ cluster_down() {
 	[ -n "$SERVER_WORKDIR" ] && for p in kube-controller-manager kube-scheduler kube-apiserver kine; do
 		pkill -f "$SERVER_WORKDIR/bin/$p" 2>/dev/null || true
 	done
+	# Whatever survived the signals above is freed through the SAME attribution
+	# rule the bring-up side uses: reap_port only ever kills a pid _proc_is_ours
+	# can tie to this rig's own dirs or argv. A broad `pkill -f k3sm` would be
+	# shorter and would kill a human's unrelated `k3sm dev` cluster on this
+	# machine, so it is not an option here. The node/server port goes FIRST, so
+	# the supervisor dies before the children it would otherwise re-parent.
+	#
+	# ALWAYS `warn`, never `fatal`: on the way out, a listener this rig cannot
+	# attribute is a fact to report, not a teardown failure. cluster_down runs from
+	# an EXIT trap under `set -e` and the gate's verdict is already decided by then,
+	# so a non-zero return here could only corrupt an already-correct verdict.
+	for port in 10250 10259 10257 "$APISERVER_PORT" "$KINE_PORT"; do
+		reap_port "$port" warn || true
+	done
 	# Remove the staged pod-support artifacts, through the same assertion the
 	# bring-up side uses, so this can never become an arbitrary root rm -rf.
 	stage_dir_ok && rm -rf /Library/k3sm-acceptance 2>/dev/null
+	# lo0 aliases are KERNEL-GLOBAL: they outlive every process reaped above, so no
+	# amount of killing removes them. The datapath postures (m2/m3/m4, root) alias
+	# the Service VIP and the pod IPs onto lo0 and nothing ever gave them back.
+	# lo0_flush is CIDR-scoped to the ranges this rig allocates from, so an address
+	# outside them is never touched; a rootless gate allocates none and cannot
+	# remove one, which makes this a no-op there rather than a special case.
+	lo0_flush 10.43.0.0/16 100.64.0.0/10 || true
 	return 0
 }
 
 # lo0_flush sweeps lo0 of every /32 alias inside the given service + pod CIDRs —
-# the datapath teardown/pre-flight step cluster_down does NOT do (it reaps
-# PROCESSES but not kernel-global lo0 aliases, which outlive the process; see the
-# m2.sh:~127 residual-alias assertion this satisfies). Requires root to remove an
-# alias; a rootless caller allocates none, so it is a no-op over an empty set.
+# the datapath half of teardown, which killing PROCESSES cannot do because the
+# aliases are kernel-global and outlive them (see the m2.sh:~127 residual-alias
+# assertion this satisfies). cluster_down calls it as its last step; a gate with
+# its own trap (m2.sh, hack/sit/run.sh) calls it directly. Requires root to remove
+# an alias; a rootless caller allocates none, so it is a no-op over an empty set.
 # It mirrors pkg/dev's lo0FlushCIDRs so the SIT (hack/sit/run.sh) and `k3sm dev`
 # share one flush contract.
 #   lo0_flush <svc-cidr> <pod-cidr>
