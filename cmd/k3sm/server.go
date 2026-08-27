@@ -57,6 +57,7 @@ type serverOptions struct {
 	podRoot   string
 	rtName    string
 	dnsShim   string
+	pathShim  string
 	apiPort   int
 	clusterIP string // DNS VIP CoreDNS binds + pods resolve against
 	domain    string
@@ -93,6 +94,7 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home")
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
+	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", executor.DefaultAPIServerPort, "apiserver secure port")
 	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
 	// privileged; warn=baseline + audit=restricted — audit-observable, zero
@@ -530,6 +532,7 @@ func runServer(args []string) error {
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
+		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
 		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)

@@ -112,9 +112,14 @@ type DownOptions struct {
 // share one construction. Out is where banners/notices are written (os.Stdout for
 // the CLI).
 type Manager struct {
-	reg     *Registry
-	sys     System
-	builder ExecShimBuilder
+	reg         *Registry
+	sys         System
+	builder     ExecShimBuilder
+	shimBuilder PodShimBuilder
+	// shimDir is the pod-readable directory the two pod-support DYLD shims are
+	// staged into; empty means DefaultPodShimDir. It is a field so a test stages
+	// into a temp dir instead of /Library.
+	shimDir string
 	self    string // absolute path to THIS k3sm binary (re-exec'd as `k3sm server`)
 	euid    int
 	out     io.Writer
@@ -137,6 +142,11 @@ type ManagerConfig struct {
 	// production NewExecShimBuilder (go build + codesign); tests inject a fake so
 	// no real toolchain runs.
 	Builder ExecShimBuilder
+	// ShimBuilder provisions the two pod-support DYLD shim dylibs (build+sign) the
+	// detached runtimed server injects into pods. Optional — nil defaults to the
+	// production NewPodShimBuilder (the owning modules' build scripts + codesign);
+	// tests inject a fake so no real clang runs.
+	ShimBuilder PodShimBuilder
 	// Self is the absolute path to the running k3sm binary, re-exec'd as
 	// `k3sm server` for the detached control plane (required).
 	Self string
@@ -164,14 +174,19 @@ func NewManager(cfg ManagerConfig) *Manager {
 	if builder == nil {
 		builder = NewExecShimBuilder()
 	}
+	shimBuilder := cfg.ShimBuilder
+	if shimBuilder == nil {
+		shimBuilder = NewPodShimBuilder()
+	}
 	return &Manager{
-		reg:     cfg.Registry,
-		sys:     cfg.System,
-		builder: builder,
-		self:    cfg.Self,
-		euid:    cfg.EUID,
-		out:     out,
-		kubeMg:  km,
+		reg:         cfg.Registry,
+		sys:         cfg.System,
+		builder:     builder,
+		shimBuilder: shimBuilder,
+		self:        cfg.Self,
+		euid:        cfg.EUID,
+		out:         out,
+		kubeMg:      km,
 	}
 }
 
@@ -251,13 +266,42 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		fmt.Fprint(m.out, "NOTE: Seatbelt confinement unavailable (no buildable k3sm-execshim helper) — pods run UNCONFINED (dev-only). Run k3sm dev from the workspace, or install, for real isolation.\n")
 	}
 
+	// Provision the two pod-support DYLD shims and hand them to the server as
+	// --path-shim / --dns-shim. cmd/k3sm resolves BOTH as siblings of the running
+	// executable, and `k3sm dev` re-execs THIS binary out of a `go build` output
+	// dir, so it found neither — one miss with two symptoms: every ABSOLUTE volume
+	// mount path (ConfigMap/Secret/emptyDir/the projected SA token) ENOENTs in-pod
+	// without the path-rebase shim, and every cluster Service name NXDOMAINs
+	// without the getaddrinfo shim. Each is provisioned only in a posture that can
+	// stage AND use it (wantsPathShim / wantsDNSShim); an unbuildable shim is a
+	// loud degrade, not a failure.
+	pathShim, dnsShim := "", ""
+	if wantsPathShim(m.euid, runtimeName) {
+		pathShim, err = m.provisionPodShim(ctx, pathShimName)
+		if err != nil {
+			return Instance{}, err
+		}
+		if pathShim == "" {
+			fmt.Fprint(m.out, "NOTE: absolute volume-mount paths unavailable in-pod (no stageable path-rebase shim) — ConfigMap/Secret/emptyDir/service-account mounts will ENOENT. Run k3sm dev from the workspace for volume mounts.\n")
+		}
+	}
+	if wantsDNSShim(m.euid, opts.Datapath, runtimeName) {
+		dnsShim, err = m.provisionPodShim(ctx, dnsShimName)
+		if err != nil {
+			return Instance{}, err
+		}
+		if dnsShim == "" {
+			fmt.Fprint(m.out, "NOTE: in-pod cluster DNS unavailable (no stageable getaddrinfo shim) — pods stay on the system resolver and cluster Service names NXDOMAIN. Run k3sm dev from the workspace for cluster DNS.\n")
+		}
+	}
+
 	// Boot the config-superset via a detached `k3sm server`: --psa-enforce-baseline
 	// (so the M10 PSA cutover criterion works) + K3SM_WORK_DIR exported (so the
 	// audit/PSA e2e read the SAME workdir). runtimed (Seatbelt-confined) is the
 	// default; hostprocess is only the honest execshim-unavailable fallback. The
 	// rootless tier is network=none (runtimePreflight returns nil — no root);
 	// --datapath is network=direct.
-	pid, err := m.spawnServer(ctx, name, workDir, apiPort, network, runtimeName, binDir)
+	pid, err := m.spawnServer(ctx, name, workDir, apiPort, network, runtimeName, binDir, pathShim, dnsShim)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -498,22 +542,13 @@ func (m *Manager) preflightReclaim(name string) error {
 	return nil
 }
 
-// spawnServer starts a detached `k3sm server` (this binary re-exec'd) in its own
-// process group with the config-superset argv, redirecting its output to
-// <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
-// until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
-// read the same workdir.
-func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort int, network, runtimeName, execShimDir string) (int, error) {
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		return 0, fmt.Errorf("create workdir %s: %w", workDir, err)
-	}
-	logPath := filepath.Join(workDir, "server.log")
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return 0, fmt.Errorf("create server log: %w", err)
-	}
-	defer lf.Close()
-
+// serverArgs builds the detached `k3sm server` argv. It is pure (no I/O) so the
+// argv wiring — notably --path-shim and --dns-shim, which carry the provisioned
+// dylibs into the node's provider.RuntimedConfig.PathShim / .DyldShim — is
+// unit-tested without spawning a process. An empty shim path emits NO flag at
+// all: the server must fall back to its own sibling-dylib resolution rather than
+// be pointed at a path that is not there.
+func serverArgs(name, workDir string, apiPort int, network, runtimeName, pathShim, dnsShim string) []string {
 	args := []string{
 		"server",
 		"--work-dir", workDir,
@@ -528,7 +563,32 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort
 		"--ingress-http-port", "0",
 		"--ingress-https-port", "0",
 	}
-	cmd := exec.CommandContext(ctx, m.self, args...)
+	if pathShim != "" {
+		args = append(args, "--path-shim", pathShim)
+	}
+	if dnsShim != "" {
+		args = append(args, "--dns-shim", dnsShim)
+	}
+	return args
+}
+
+// spawnServer starts a detached `k3sm server` (this binary re-exec'd) in its own
+// process group with the config-superset argv, redirecting its output to
+// <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
+// until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
+// read the same workdir.
+func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (int, error) {
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		return 0, fmt.Errorf("create workdir %s: %w", workDir, err)
+	}
+	logPath := filepath.Join(workDir, "server.log")
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return 0, fmt.Errorf("create server log: %w", err)
+	}
+	defer lf.Close()
+
+	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, apiPort, network, runtimeName, pathShim, dnsShim)...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	// Own process group so `down` can SIGTERM the whole supervised tree via -pid,
 	// and detached from ctx cancellation (WaitDelay 0 + no Cancel) so the server
