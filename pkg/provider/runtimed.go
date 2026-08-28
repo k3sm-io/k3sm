@@ -294,15 +294,24 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	// Startup visibility for the in-pod cluster-DNS path: an empty dyld_shim (the
+	// Startup visibility for BOTH pod-support shims: an empty dyld_shim (the
 	// getaddrinfo shim was not resolved beside the binary) or a wrong resolver_vip
-	// silently leaves pods on the system resolver (cluster names NXDOMAIN).
+	// silently leaves pods on the system resolver (cluster names NXDOMAIN), and an
+	// empty path_shim silently ENOENTs every ABSOLUTE volume-mount path in-pod
+	// (runtimed injects no path rebase).
+	//
+	// Both keys are logged UNCONDITIONALLY, empty value included: path_shim was
+	// omitted from this line while its dns sibling was logged, so an absent
+	// path-rebase shim — the exact cause of the in-pod ENOENTs — was INVISIBLE in
+	// the server log and got mis-diagnosed as another subsystem. An absent shim
+	// must read as empty here, never as a missing key.
 	recorder := cfg.Recorder
 	if recorder == nil {
 		recorder = nopRecorder{}
 	}
 	log.Info("runtimed provider configured",
 		"dyld_shim", cfg.DyldShim,
+		"path_shim", cfg.PathShim,
 		"resolver_vip", cfg.ResolverVIP,
 		"cluster_domain", cfg.ClusterDomain)
 	return &runtimedRuntime{

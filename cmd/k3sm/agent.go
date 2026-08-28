@@ -59,11 +59,33 @@ type agentOptions struct {
 	podRoot   string
 	rtName    string
 	dnsShim   string
+	pathShim  string // path-rebase DYLD shim dylib path (runtimed only)
 	apiPort   int
 	meshPort  int
 	network   string // host-network backend: auto (default) | none | direct | helper
 	clusterIP string // DNS VIP the per-node resolver binds + pods resolve against
 	domain    string // cluster DNS domain
+}
+
+// registerAgentFlags binds `k3sm agent`'s flags onto fs. It is a function rather
+// than an inline block in runAgent so the registered surface — notably that BOTH
+// pod-support shims are overridable here, as they are on `k3sm server` / `k3sm
+// node` — is unit-testable without parsing argv through a live join.
+func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
+	fs.StringVar(&opts.server, "server", "", "control-plane mesh host (e.g. 100.64.0.1) to join")
+	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN)")
+	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
+	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
+	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	addRuntimeFlag(fs, &opts.rtName)
+	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
+	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
+	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
+	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
+	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
+	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
+	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 }
 
 // runAgent joins this Mac to an existing cluster: it CA-pins the server (via the
@@ -74,19 +96,7 @@ type agentOptions struct {
 func runAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	opts := agentOptions{}
-	fs.StringVar(&opts.server, "server", "", "control-plane mesh host (e.g. 100.64.0.1) to join")
-	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN)")
-	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
-	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
-	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
-	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
-	addRuntimeFlag(fs, &opts.rtName)
-	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
-	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
-	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
-	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
-	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
-	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
+	registerAgentFlags(fs, &opts)
 	_ = fs.Parse(args)
 
 	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {
@@ -164,7 +174,19 @@ func runAgent(args []string) error {
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
 	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
-	return startNode(ctx, nodeOptions{
+	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode))
+}
+
+// agentNodeOptions builds the joined worker's in-process node options from the
+// agent options + join result. Like workerNetserveConfig it is pure (no I/O), so
+// the worker's node wiring — in particular that BOTH pod-support shim flags reach
+// the node, the same wiring `k3sm server` has — is unit-tested without a live join.
+//
+// The shims are passed through UNRESOLVED: runtimedConfig applies the one shared
+// precedence (an explicit flag, else the sibling-dylib lookup), so the agent path
+// cannot acquire a second resolution idiom.
+func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPath string, mode hostnet.Mode) nodeOptions {
+	return nodeOptions{
 		kubeconfig: kubeconfigPath,
 		nodeName:   opts.nodeName,
 		listen:     serverKubeletListen,
@@ -172,12 +194,13 @@ func runAgent(args []string) error {
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
+		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
 		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source, M10.1)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,
-	})
+	}
 }
 
 // bringUpMesh constructs the node's wireguard mesh for its assigned pod /24, brings
