@@ -20,13 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -931,27 +929,6 @@ func (r *runtimedRuntime) trackByID(id string) *podTrack {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.track[id]
-}
-
-// GetContainerLogs streams the container's buffered combined output from the
-// runtime into a ReadCloser the VK logs HTTP handler serves. Follow is honored
-// only for the non-follow path in M1 (the gate scopes kubectl logs to
-// non-follow); a follow request returns the current buffer and closes.
-func (r *runtimedRuntime) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
-	id, _, _, ok := r.lookup(namespace, podName)
-	if !ok {
-		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
-	}
-	sink := newLogSink(ctx)
-	req := &runtimev1.GetLogsRequest{
-		PodId:     id,
-		Container: containerName,
-		TailLines: int64(opts.Tail),
-	}
-	if err := r.rt.GetLogs(req, sink); err != nil {
-		return nil, fmt.Errorf("runtimed logs %s/%s/%s: %w", namespace, podName, containerName, err)
-	}
-	return io.NopCloser(strings.NewReader(sink.String())), nil
 }
 
 // Watch drives the VK status callback off the runtime's streaming
