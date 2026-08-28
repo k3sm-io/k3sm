@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"flag"
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
@@ -81,6 +82,72 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 		}
 		if cfg.NetdSocket != "" {
 			t.Errorf("NetdSocket = %q, want empty (no helper in --network none)", cfg.NetdSocket)
+		}
+	})
+}
+
+// TestAgentPathShimFlag pins the B159 half of the pod-support-shim wiring on the
+// WORKER path: `k3sm agent` accepts --path-shim, threads it to its in-process
+// node, and gives it the SAME precedence `k3sm server` / `k3sm node` use — an
+// explicit flag wins, else the sibling-dylib lookup.
+//
+// Fails-before: the agent registered --dns-shim only. A joined worker therefore
+// had NO override for the path-rebase shim, so a worker whose k3sm binary has no
+// staged sibling dylib (a from-source or `k3sm dev` run) silently ENOENTed every
+// ABSOLUTE volume-mount path in-pod, with no argv by which to fix it.
+func TestAgentPathShimFlag(t *testing.T) {
+	t.Parallel()
+
+	const staged = "/Library/k3sm-dev/libk3sm_pathrebase_shim.dylib"
+
+	// parseAgent registers the real agent flag surface and parses argv through it.
+	parseAgent := func(t *testing.T, args ...string) agentOptions {
+		t.Helper()
+		fs := flag.NewFlagSet("agent", flag.ContinueOnError)
+		var opts agentOptions
+		registerAgentFlags(fs, &opts)
+		if err := fs.Parse(args); err != nil {
+			t.Fatalf("parse %v: %v (is --path-shim registered on `k3sm agent`?)", args, err)
+		}
+		return opts
+	}
+
+	res := &bootstrap.JoinResult{PodCIDR: "100.64.2.0/24", MeshIP: "100.64.2.1"}
+
+	t.Run("explicit --path-shim wins and reaches the node runtime", func(t *testing.T) {
+		t.Parallel()
+		opts := parseAgent(t, "--path-shim", staged)
+		if opts.pathShim != staged {
+			t.Fatalf("agent --path-shim = %q, want %q", opts.pathShim, staged)
+		}
+		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+		if nodeOpts.pathShim != staged {
+			t.Errorf("worker nodeOptions.pathShim = %q, want %q (the flag must reach the in-process node)", nodeOpts.pathShim, staged)
+		}
+		if got := runtimedConfig(nodeOpts, nil).PathShim; got != staged {
+			t.Errorf("worker RuntimedConfig.PathShim = %q, want the explicit --path-shim %q", got, staged)
+		}
+	})
+
+	t.Run("no flag falls back to the sibling dylib, like server and node", func(t *testing.T) {
+		t.Parallel()
+		opts := parseAgent(t)
+		if opts.pathShim != "" {
+			t.Errorf("agent --path-shim default = %q, want empty", opts.pathShim)
+		}
+		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+		if got := runtimedConfig(nodeOpts, nil).PathShim; got != resolvePathShim() {
+			t.Errorf("worker RuntimedConfig.PathShim with no flag = %q, want the sibling-dylib fallback %q", got, resolvePathShim())
+		}
+	})
+
+	t.Run("the dns shim sibling still threads (no regression)", func(t *testing.T) {
+		t.Parallel()
+		const dnsStaged = "/Library/k3sm-dev/libk3sm_getaddrinfo_shim.dylib"
+		opts := parseAgent(t, "--dns-shim", dnsStaged)
+		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+		if got := runtimedConfig(nodeOpts, nil).DyldShim; got != dnsStaged {
+			t.Errorf("worker RuntimedConfig.DyldShim = %q, want the explicit --dns-shim %q", got, dnsStaged)
 		}
 	})
 }
