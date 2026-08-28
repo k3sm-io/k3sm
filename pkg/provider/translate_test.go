@@ -1576,3 +1576,119 @@ func TestToPodBoxPersistentVolumeClaimVolume(t *testing.T) {
 		}
 	}
 }
+
+// TestToPodBoxForwardsImagePullPolicyVerbatim is the provider half of the M12.1
+// skew contract: the pod spec's STAMPED imagePullPolicy reaches the wire
+// unchanged, on regular and init containers alike, and an unset field maps to
+// UNSPECIFIED — the legacy pull-through runtimed must read as "today's
+// behavior", never as an implicit Never.
+//
+// The image column is what makes this a real assertion: DEFAULTING BELONGS TO
+// THE EMBEDDED APISERVER, which stamps Always for a `:latest`/untagged
+// reference and IfNotPresent otherwise, before the pod is ever scheduled. The
+// provider must NOT re-derive it — so the table deliberately pairs `:latest`
+// with IfNotPresent (and a digest-pinned reference with Always), pairings a
+// tag-reading translation would "correct" and this test would catch. A second
+// derivation point could disagree with the stamped spec, and `kubectl get pod
+// -o yaml` would stop describing what the node did.
+func TestToPodBoxForwardsImagePullPolicyVerbatim(t *testing.T) {
+	cases := []struct {
+		name   string
+		image  string
+		policy corev1.PullPolicy
+		want   runtimev1.ImagePullPolicy
+	}{
+		{
+			name:  "unset_is_legacy_unspecified_even_on_latest",
+			image: "registry/web:latest",
+			want:  runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED,
+		},
+		{
+			name:  "unset_is_legacy_unspecified_on_an_untagged_reference",
+			image: "registry/web",
+			want:  runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED,
+		},
+		{
+			name:   "always_on_a_pinned_tag_is_not_downgraded",
+			image:  "registry/web:v1.2.3",
+			policy: corev1.PullAlways,
+			want:   runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS,
+		},
+		{
+			name:   "if_not_present_on_latest_is_not_upgraded_to_always",
+			image:  "registry/web:latest",
+			policy: corev1.PullIfNotPresent,
+			want:   runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT,
+		},
+		{
+			name:   "never_on_latest_is_not_upgraded_to_always",
+			image:  "registry/web:latest",
+			policy: corev1.PullNever,
+			want:   runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
+		},
+		{
+			name:   "never_on_a_pinned_tag",
+			image:  "registry/web:v1.2.3",
+			policy: corev1.PullNever,
+			want:   runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web", UID: types.UID("uid-web")},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{
+						Name:            "init",
+						Image:           tc.image,
+						Command:         []string{"/init"},
+						ImagePullPolicy: tc.policy,
+					}},
+					Containers: []corev1.Container{{
+						Name:            "c0",
+						Image:           tc.image,
+						Command:         []string{"/web"},
+						ImagePullPolicy: tc.policy,
+					}},
+				},
+			}
+			box, err := toPodBox(pod, "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{})
+			if err != nil {
+				t.Fatalf("toPodBox: %v", err)
+			}
+			if got := box.GetContainers()[0].GetImagePullPolicy(); got != tc.want {
+				t.Errorf("container image_pull_policy = %v, want %v", got, tc.want)
+			}
+			if got := box.GetInitContainers()[0].GetImagePullPolicy(); got != tc.want {
+				t.Errorf("init container image_pull_policy = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// An imagePullPolicy the provider does not recognise is carried as
+	// UNSPECIFIED — the legacy pull-through — rather than guessed at. corev1's
+	// value set is closed and the apiserver validates it, so this is the
+	// unreachable-in-practice arm; it fails SAFE (a pull is attempted) instead
+	// of silently becoming a Never that never starts the pod.
+	t.Run("unknown_policy_falls_back_to_legacy_unspecified", func(t *testing.T) {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web", UID: types.UID("uid-web")},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:            "c0",
+					Image:           "registry/web:v1",
+					Command:         []string{"/web"},
+					ImagePullPolicy: corev1.PullPolicy("Sometimes"),
+				}},
+			},
+		}
+		box, err := toPodBox(pod, "10.0.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{})
+		if err != nil {
+			t.Fatalf("toPodBox: %v", err)
+		}
+		if got := box.GetContainers()[0].GetImagePullPolicy(); got != runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED {
+			t.Errorf("unknown policy mapped to %v, want UNSPECIFIED", got)
+		}
+	})
+}
