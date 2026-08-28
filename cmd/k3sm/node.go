@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
@@ -393,20 +394,66 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	errc := make(chan error, 1)
 	go func() { errc <- n.Run(ctx) }()
 
-	select {
-	case <-n.Ready():
-		log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot)
-	case err := <-errc:
-		return fmt.Errorf("node exited during startup: %w", err)
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
+		return err
 	}
+	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot)
 
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-errc:
 		return err
+	}
+}
+
+// nodeStartupTimeout bounds startNode's wait for the VK node to signal readiness.
+//
+// Picked against two measured numbers and deliberately far from both: a healthy
+// bring-up on the lab Macs signals Ready in SECONDS (provider construction plus
+// the first Node registration), while the 2026-08-27 wedge was still sitting in
+// this wait at THREE MINUTES with the VK run loop alive and no Node object ever
+// created. 5m is ~2 orders of magnitude past the healthy path — a slow but
+// healthy start (cold page-in, a retried apiserver dial, a busy machine) cannot
+// trip it — and still turns the wedge into a bounded, reported failure instead
+// of a process that blocks forever and logs nothing.
+const nodeStartupTimeout = 5 * time.Minute
+
+// errNodeStartupTimeout is returned by awaitNodeReady when the Virtual Kubelet
+// node signals neither readiness nor exit before the deadline. It does NOT
+// diagnose why registration failed — only that it never completed.
+var errNodeStartupTimeout = errors.New("node startup timed out")
+
+// awaitNodeReady waits for a Virtual Kubelet node to finish starting: it returns
+// nil once ready closes, the wrapped run-loop error if errc fires first,
+// ctx.Err() on cancellation, and errNodeStartupTimeout when neither channel
+// fires within timeout.
+//
+// It is factored out of startNode purely so the deadline is unit-testable —
+// startNode builds a real apiserver client and a real VK node, so the wait
+// itself is otherwise unreachable from a unit test.
+//
+// nodeName and listen are carried only for the diagnostic. The timeout message
+// must let an operator reading nothing but the log tell "VK never signalled
+// Ready" (this error) apart from "VK returned an error" (the wrapped errc case),
+// because the observed failure logged neither: the node stayed absent from
+// `kubectl get node` and every pod reported Unschedulable with no further clue.
+func awaitNodeReady(ctx context.Context, ready <-chan struct{}, errc <-chan error, timeout time.Duration, nodeName, listen string) error {
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+
+	select {
+	case <-ready:
+		return nil
+	case err := <-errc:
+		return fmt.Errorf("node exited during startup: %w", err)
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return fmt.Errorf("%w after %s: virtual-kubelet %q signalled neither ready nor exit "+
+			"(its Ready channel never closed and its Run loop has not returned, so no Node object "+
+			"reached the apiserver; listen=%s) — pods will report Unschedulable until a node registers",
+			errNodeStartupTimeout, timeout, nodeName, listen)
 	}
 }
 

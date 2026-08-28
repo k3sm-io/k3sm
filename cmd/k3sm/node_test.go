@@ -17,9 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -486,6 +489,105 @@ func TestNodeAllocatableReserve(t *testing.T) {
 		}
 		if am.Value() <= 0 {
 			t.Errorf("clamp failed: Allocatable memory = %d, must be strictly > 0 (a zero/negative Allocatable strands every pod Pending)", am.Value())
+		}
+	})
+}
+
+// TestNodeStartupBoundedAndDiagnostic pins the bounded startup wait (B158).
+//
+// Before this, startNode blocked FOREVER in a select on the VK node's Ready
+// channel vs its Run error: observed live 2026-08-27, a node whose VK run loop
+// was healthy but which had never created its Node object left the process
+// silent after "starting k3sm node", `kubectl get node` empty, and every pod
+// Unschedulable with no clue in any log. The wait is now bounded and names what
+// it saw. It does NOT diagnose WHY registration failed — that is separate work.
+func TestNodeStartupBoundedAndDiagnostic(t *testing.T) {
+	const (
+		nodeName = "k3sm-lab-1"
+		listen   = "127.0.0.1:10250"
+		// Short deadlines keep the test fast; the shipped value is
+		// nodeStartupTimeout, pinned separately below.
+		testTimeout = 50 * time.Millisecond
+	)
+	boom := errors.New("apiserver dial refused")
+
+	t.Run("wedged node is bounded and named", func(t *testing.T) {
+		// Neither channel ever fires — the observed wedge exactly: VK alive,
+		// no Ready, no error.
+		ready := make(chan struct{})
+		errc := make(chan error, 1)
+
+		start := time.Now()
+		err := awaitNodeReady(context.Background(), ready, errc, testTimeout, nodeName, listen)
+		elapsed := time.Since(start)
+
+		if err == nil {
+			t.Fatal("wedged startup returned nil; want a bounded error")
+		}
+		if !errors.Is(err, errNodeStartupTimeout) {
+			t.Errorf("err = %v; want errNodeStartupTimeout", err)
+		}
+		if elapsed > 20*testTimeout {
+			t.Errorf("waited %s for a %s deadline; the wait is not bounded", elapsed, testTimeout)
+		}
+		// The message alone must tell an operator which channel never fired,
+		// what was last observed, and which node/listener it was.
+		for _, want := range []string{nodeName, listen, "neither ready nor exit", "Ready channel never closed", "Run loop has not returned"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("diagnostic %q lacks %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("ready returns promptly with no error", func(t *testing.T) {
+		ready := make(chan struct{})
+		close(ready)
+		errc := make(chan error, 1)
+
+		start := time.Now()
+		if err := awaitNodeReady(context.Background(), ready, errc, time.Hour, nodeName, listen); err != nil {
+			t.Fatalf("healthy startup: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("healthy startup took %s; want prompt", elapsed)
+		}
+	})
+
+	t.Run("early run error keeps the existing wrapping", func(t *testing.T) {
+		ready := make(chan struct{})
+		errc := make(chan error, 1)
+		errc <- boom
+
+		err := awaitNodeReady(context.Background(), ready, errc, time.Hour, nodeName, listen)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v; want it to wrap %v", err, boom)
+		}
+		if errors.Is(err, errNodeStartupTimeout) {
+			t.Errorf("run-loop error %v misreported as a startup timeout", err)
+		}
+		if got := err.Error(); !strings.HasPrefix(got, "node exited during startup: ") {
+			t.Errorf("err = %q; want the unchanged \"node exited during startup\" prefix", got)
+		}
+	})
+
+	t.Run("cancellation wins over the deadline", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := awaitNodeReady(ctx, make(chan struct{}), make(chan error, 1), time.Hour, nodeName, listen)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v; want context.Canceled", err)
+		}
+	})
+
+	t.Run("shipped deadline clears the observed distributions", func(t *testing.T) {
+		// Healthy bring-up is seconds; the observed wedge was still stuck at
+		// 3 minutes. Keep the shipped value clear of both, in both directions.
+		if nodeStartupTimeout <= 3*time.Minute {
+			t.Errorf("nodeStartupTimeout = %s; must exceed the 3m the observed wedge survived", nodeStartupTimeout)
+		}
+		if nodeStartupTimeout > 15*time.Minute {
+			t.Errorf("nodeStartupTimeout = %s; too long to be a useful bound", nodeStartupTimeout)
 		}
 	})
 }
