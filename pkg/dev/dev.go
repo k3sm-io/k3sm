@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -129,6 +130,12 @@ type Manager struct {
 	// field, not a plain method, so the wait is testable without a live cluster.
 	// nil means the production implementation (awaitDefaultNamespaceBootstrap).
 	awaitNamespaceBootstrap func(ctx context.Context, kubeconfig string) error
+	// awaitNodeRegistration blocks until a node has registered with the fresh
+	// control plane AND reports Ready — without it every pod created right after
+	// `up` is Unschedulable. Same seam shape as awaitNamespaceBootstrap: a field,
+	// not a plain method, so the wait is testable without a live cluster. nil
+	// means the production implementation (awaitNodeRegistered).
+	awaitNodeRegistration func(ctx context.Context, kubeconfig string) error
 }
 
 // ManagerConfig constructs a Manager.
@@ -195,8 +202,11 @@ func NewManager(cfg ManagerConfig) *Manager {
 // prior run, spawns a detached `k3sm server` (runtimed + network=none rootless,
 // or network=direct under --datapath), merges the kubeconfig into ~/.kube/config
 // as context k3sm-dev-<name>, writes the durable manifest, and prints the tier's
-// fidelity banner. It fails fast (never a silent degrade) on a --datapath posture
-// miss, a live-datapath singleton violation, or a workdir/port collision.
+// fidelity banner. It returns only once the cluster is USABLE — the default
+// namespace bootstrapped and a node registered Ready — so a caller that creates a
+// pod immediately does not race the bring-up. It fails fast (never a silent
+// degrade) on a --datapath posture miss, a live-datapath singleton violation, or a
+// workdir/port collision.
 func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	name := opts.Name
 	if name == "" {
@@ -361,6 +371,20 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		wait = m.awaitDefaultNamespaceBootstrap
 	}
 	if err := wait(ctx, kc); err != nil {
+		_ = m.sys.TerminateProcess(pid, terminateGrace)
+		return Instance{}, err
+	}
+
+	// A bootstrapped namespace is still not a schedulable cluster: the node
+	// registers on its own clock, well after the apiserver is serving. Measured on
+	// lab hardware 2026-08-27: the server logged `starting k3sm node` at 12:34:36
+	// and `node ... ready` at 12:36:06 — ~90s later — while `dev up` had already
+	// returned at 12:34. Every caller that listed nodes right after `up` saw NONE,
+	// and every pod it created sat Unschedulable ("no nodes available to schedule
+	// pods"). Block until a Ready node exists, so `up` returning means the cluster
+	// can actually run something.
+	nodeWait := m.nodeRegistrationWait()
+	if err := nodeWait(ctx, kc); err != nil {
 		_ = m.sys.TerminateProcess(pid, terminateGrace)
 		return Instance{}, err
 	}
@@ -696,6 +720,108 @@ func awaitBootstrapObjects(ctx context.Context, timeout time.Duration, kubeconfi
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// nodeRegistrationTimeout bounds the wait for a Ready node.
+//
+// Picked against the measured numbers and deliberately clear of them:
+// registration was observed taking ~90s on lab hardware (2026-08-27), so a 90s
+// bound — the sibling defaultNamespaceBootstrapTimeout's budget — would sit
+// EXACTLY at the observed latency and flake. 5m matches cmd/k3sm's sibling
+// nodeStartupTimeout (the node's own view of the same event) and leaves a wide
+// margin over the observation, while still turning a bring-up that never
+// registers into a bounded, reported failure. It does NOT claim 90s is the
+// worst case: why registration takes that long is unresolved, and a start that
+// exceeds this budget is reported, not diagnosed.
+const nodeRegistrationTimeout = 5 * time.Minute
+
+// nodeRegistrationWait resolves the node-registration wait Up applies: the
+// injected seam when a test set one, else the production implementation. Up
+// itself is not unit-reachable (it fork/execs a real server), so the resolution
+// lives in its own method to keep that wiring testable.
+func (m *Manager) nodeRegistrationWait() func(ctx context.Context, kubeconfig string) error {
+	if m.awaitNodeRegistration != nil {
+		return m.awaitNodeRegistration
+	}
+	return m.awaitNodeRegistered
+}
+
+// awaitNodeRegistered blocks until at least one node has registered with the
+// instance's apiserver and reports Ready, polled with a typed client built from
+// the instance's own kubeconfig.
+func (m *Manager) awaitNodeRegistered(ctx context.Context, kubeconfig string) error {
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return fmt.Errorf("build client config from %s: %w", kubeconfig, err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("build clientset for %s: %w", kubeconfig, err)
+	}
+	return awaitReadyNode(ctx, nodeRegistrationTimeout, kubeconfig,
+		func(ctx context.Context) (registered, ready int, err error) {
+			list, lerr := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			if lerr != nil {
+				return 0, 0, lerr
+			}
+			for i := range list.Items {
+				if nodeIsReady(&list.Items[i]) {
+					ready++
+				}
+			}
+			return len(list.Items), ready, nil
+		})
+}
+
+// nodeIsReady reports whether n carries a Ready condition with status True. A
+// node object that EXISTS is not yet a schedulable node — the scheduler skips it
+// until the condition flips — so registration alone is not the readiness signal.
+func nodeIsReady(n *corev1.Node) bool {
+	for _, c := range n.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// awaitReadyNode is the pollable core of awaitNodeRegistered, split out so its
+// semantics are testable without an apiserver. probe reports how many nodes are
+// registered and how many of those are Ready; a probe error is transient (the
+// apiserver may still be settling) so polling continues, but the last one is
+// carried into the timeout message. Unlike awaitBootstrapObjects nothing is
+// latched: the contract is that a Ready node exists NOW.
+func awaitReadyNode(ctx context.Context, timeout time.Duration, kubeconfig string,
+	probe func(context.Context) (registered, ready int, err error)) error {
+	deadline := time.Now().Add(timeout)
+	var registered, ready int
+	var lastErr error
+	for {
+		r, rd, perr := probe(ctx)
+		if perr != nil {
+			lastErr = perr
+		} else {
+			lastErr = nil
+			registered, ready = r, rd
+			if ready > 0 {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			detail := ""
+			if lastErr != nil {
+				detail = fmt.Sprintf(", last probe error: %v", lastErr)
+			}
+			return fmt.Errorf("no node registered Ready within %s "+
+				"(nodes registered=%d, ready=%d%s) — "+
+				"see the server.log beside %s", timeout, registered, ready, detail, kubeconfig)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
