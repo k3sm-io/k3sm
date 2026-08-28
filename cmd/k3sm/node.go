@@ -42,6 +42,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 
@@ -302,6 +303,44 @@ func runtimePreflight(ctx context.Context, opts nodeOptions) error {
 	return nil
 }
 
+// nodeAPIRequestTimeout bounds every apiserver round-trip the node's client
+// makes (rest.Config.Timeout → the http.Client the clientset dials with).
+// Without it a stalled request — a half-open socket to the loopback apiserver, a
+// TLS handshake against a listener that accepted but never answered — blocks its
+// caller forever with nothing logged, because clientcmd.BuildConfigFromFlags
+// leaves Timeout at its zero value ("no timeout").
+//
+// Picked against three real numbers:
+//   - a healthy registration round-trip against the loopback apiserver takes
+//     MILLISECONDS to low seconds, so 90s is orders of magnitude of headroom —
+//     a slow-but-healthy start (cold page-in, a busy machine, a control plane
+//     still settling) cannot trip it, which matters because a too-tight bound
+//     would turn a healthy start into a failure and be worse than the hang;
+//   - the apiserver's own --request-timeout default is 60s, so any non-watch
+//     request the server is legitimately still serving is ended by the SERVER
+//     first (a legible 504) — 90s never pre-empts it;
+//   - the sibling nodeStartupTimeout is 5m, so a wedged round-trip surfaces at
+//     90s with room to spare inside the startup bound rather than silently
+//     consuming it.
+//
+// Accepted cost: rest.Config.Timeout applies to watches too, so the node's
+// informers re-establish their watch every 90s instead of the reflector's
+// 5–10m. That is a cheap re-watch from the last resourceVersion (no relist) on
+// a loopback apiserver watching one node's pods.
+const nodeAPIRequestTimeout = 90 * time.Second
+
+// nodeRESTConfig loads the node's kubeconfig and applies nodeAPIRequestTimeout.
+// It exists as a named seam so the timeout on the config the node's clientset is
+// built from is unit-testable — startNode itself needs a live apiserver.
+func nodeRESTConfig(kubeconfig string) (*rest.Config, error) {
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	cfg.Timeout = nodeAPIRequestTimeout
+	return cfg, nil
+}
+
 // startNode builds the client, selects the runtime, registers the VK node, and
 // blocks until ctx ends or the node exits. The server calls it directly with an
 // already-built kubeconfig.
@@ -325,9 +364,9 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// explicit --node-ip (e.g. --mesh-ip, already globally-unicast) is honored.
 	opts.nodeIP = advertisedNodeIP(opts)
 
-	restCfg, err := clientcmd.BuildConfigFromFlags("", opts.kubeconfig)
+	restCfg, err := nodeRESTConfig(opts.kubeconfig)
 	if err != nil {
-		return fmt.Errorf("load kubeconfig: %w", err)
+		return err
 	}
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
