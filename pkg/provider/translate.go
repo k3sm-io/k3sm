@@ -635,6 +635,8 @@ func graceSeconds(pod *corev1.Pod) int64 {
 // env carried structurally for resolvePodBoxEnv; image is the pull reference or,
 // when command/args are empty, the host binary path per the M0/M1 convention).
 //
+// imagePullPolicy is carried VERBATIM (M12.1) — see toImagePullPolicy.
+//
 // init selects the M10.2 restart_policy mapping: on an INIT container,
 // restartPolicy: Always (KEP-753) maps to
 // CONTAINER_RESTART_POLICY_ALWAYS — the proto marker runtimed reads to run it
@@ -663,6 +665,7 @@ func toRuntimeContainers(cs []corev1.Container, init bool) []*runtimev1.Containe
 			SecurityContext: toSecurityContext(c.SecurityContext),
 			EnvFrom:         toEnvFrom(c.EnvFrom),
 			Env:             toEnvVars(c.Env),
+			ImagePullPolicy: toImagePullPolicy(c.ImagePullPolicy),
 		}
 		if init && c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
 			rc.RestartPolicy = runtimev1.ContainerRestartPolicy_CONTAINER_RESTART_POLICY_ALWAYS
@@ -670,6 +673,35 @@ func toRuntimeContainers(cs []corev1.Container, init bool) []*runtimev1.Containe
 		out = append(out, rc)
 	}
 	return out
+}
+
+// toImagePullPolicy maps the container's STAMPED corev1 imagePullPolicy onto the
+// proto enum, VERBATIM (M12.1).
+//
+// DEFAULTING IS THE EMBEDDED APISERVER'S — it stamps the corev1 default onto the
+// pod spec before the pod is ever scheduled (a `:latest`/untagged reference
+// defaults to Always, anything else to IfNotPresent). This function therefore
+// reads only the stamped value and NEVER looks at the image reference; runtimed
+// does not re-derive it either. A second derivation point would be free to
+// disagree with the stamped spec, and `kubectl get pod -o yaml` would stop
+// describing what the node actually did.
+//
+// An empty value maps to UNSPECIFIED, which runtimed reads as the legacy
+// pull-through — the skew contract's zero value, never an implicit Never. An
+// unrecognised value maps there too: corev1's set is closed and apiserver
+// validation rejects anything else, so this arm is unreachable in practice, and
+// failing to a pull attempt is the safe direction.
+func toImagePullPolicy(p corev1.PullPolicy) runtimev1.ImagePullPolicy {
+	switch p {
+	case corev1.PullAlways:
+		return runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_ALWAYS
+	case corev1.PullIfNotPresent:
+		return runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_IF_NOT_PRESENT
+	case corev1.PullNever:
+		return runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_NEVER
+	default:
+		return runtimev1.ImagePullPolicy_IMAGE_PULL_POLICY_UNSPECIFIED
+	}
 }
 
 // toEnvVars carries corev1 env structurally: a literal value passes through; a
