@@ -19,13 +19,21 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"k3sm.io/darwin-net/pkg/dns"
 
@@ -588,6 +596,140 @@ func TestNodeStartupBoundedAndDiagnostic(t *testing.T) {
 		}
 		if nodeStartupTimeout > 15*time.Minute {
 			t.Errorf("nodeStartupTimeout = %s; too long to be a useful bound", nodeStartupTimeout)
+		}
+	})
+}
+
+// writeNodeRESTKubeconfig writes a minimal kubeconfig pointing at server and returns
+// its path, so the tests below drive the real nodeRESTConfig loader rather than
+// hand-building a rest.Config the shipped path never sees.
+func writeNodeRESTKubeconfig(t *testing.T, server string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	body := fmt.Sprintf(`apiVersion: v1
+kind: Config
+clusters:
+- name: k3sm
+  cluster:
+    server: %s
+contexts:
+- name: k3sm
+  context:
+    cluster: k3sm
+    user: k3sm
+current-context: k3sm
+users:
+- name: k3sm
+  user: {}
+`, server)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+	return path
+}
+
+// TestNodeRESTClientHasTimeout pins a request timeout on the rest.Config the
+// node's apiserver clientset is built from (B161).
+//
+// clientcmd.BuildConfigFromFlags leaves rest.Config.Timeout at zero ("no
+// timeout"), and nothing else in the node path set one — so a stalled HTTPS
+// request to the loopback apiserver (a half-open socket, a listener that
+// accepted but never answered) blocked its caller forever and logged nothing.
+// Virtual Kubelet's node registration is exactly such an unbounded round-trip.
+// This makes a stall a bounded, reported error; it does NOT claim to diagnose or
+// fix any particular registration failure.
+func TestNodeRESTClientHasTimeout(t *testing.T) {
+	t.Run("the node rest config carries a request timeout", func(t *testing.T) {
+		cfg, err := nodeRESTConfig(writeNodeRESTKubeconfig(t, "https://127.0.0.1:6443"))
+		if err != nil {
+			t.Fatalf("nodeRESTConfig: %v", err)
+		}
+		if cfg.Timeout == 0 {
+			t.Fatal("rest.Config.Timeout = 0 (no timeout): a stalled apiserver round-trip hangs the node forever")
+		}
+		if cfg.Timeout != nodeAPIRequestTimeout {
+			t.Errorf("rest.Config.Timeout = %s, want nodeAPIRequestTimeout %s", cfg.Timeout, nodeAPIRequestTimeout)
+		}
+	})
+
+	t.Run("the timeout reaches the http client the node clientset dials with", func(t *testing.T) {
+		// kubernetes.NewForConfig builds its transport via rest.HTTPClientFor(cfg),
+		// so asserting there proves the value is carried end-to-end into every
+		// request the node makes — not merely stored in a constant.
+		cfg, err := nodeRESTConfig(writeNodeRESTKubeconfig(t, "https://127.0.0.1:6443"))
+		if err != nil {
+			t.Fatalf("nodeRESTConfig: %v", err)
+		}
+		hc, err := rest.HTTPClientFor(cfg)
+		if err != nil {
+			t.Fatalf("HTTPClientFor: %v", err)
+		}
+		if hc.Timeout != nodeAPIRequestTimeout {
+			t.Errorf("http.Client.Timeout = %s, want %s: the timeout does not reach the node's transport", hc.Timeout, nodeAPIRequestTimeout)
+		}
+		if _, err := kubernetes.NewForConfig(cfg); err != nil {
+			t.Fatalf("the timed-out config must still build a clientset: %v", err)
+		}
+	})
+
+	t.Run("the value clears healthy latency and stays well inside the startup bound", func(t *testing.T) {
+		// Floor: the apiserver's own --request-timeout default is 60s, so a
+		// shorter client bound could pre-empt a request the server is still
+		// legitimately serving — turning a slow-but-healthy start into a failure.
+		if nodeAPIRequestTimeout < 60*time.Second {
+			t.Errorf("nodeAPIRequestTimeout = %s; must be >= the apiserver's 60s default --request-timeout so the server, not the client, ends a slow-but-served request", nodeAPIRequestTimeout)
+		}
+		// Ceiling: it must surface a wedged round-trip well before the sibling
+		// startup bound, not silently consume it.
+		if nodeAPIRequestTimeout > nodeStartupTimeout/2 {
+			t.Errorf("nodeAPIRequestTimeout = %s; must stay well under nodeStartupTimeout %s", nodeAPIRequestTimeout, nodeStartupTimeout)
+		}
+	})
+
+	t.Run("a stalled apiserver round-trip errors instead of hanging", func(t *testing.T) {
+		// A server that accepts and never answers — the observed stall shape.
+		// stall releases the handler at teardown: httptest.Server.Close waits for
+		// in-flight requests, and on a REGRESSION (no timeout) the client never
+		// cancels, so without this the failing test would deadlock in Close
+		// instead of reporting.
+		stall := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-stall:
+			}
+		}))
+		defer srv.Close()
+		defer close(stall)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		cfg, err := nodeRESTConfig(writeNodeRESTKubeconfig(t, srv.URL))
+		if err != nil {
+			t.Fatalf("nodeRESTConfig: %v", err)
+		}
+		// Scale the shipped bound down so the test is fast. The FIELD exercised is
+		// the one nodeRESTConfig sets, and an unset (zero) Timeout scales to zero —
+		// so this subtest hangs into its guard rather than passing vacuously.
+		cfg.Timeout /= 600
+		cs, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			t.Fatalf("build client: %v", err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			_, gerr := cs.CoreV1().Nodes().Get(ctx, "k3sm-lab-1", metav1.GetOptions{})
+			done <- gerr
+		}()
+		select {
+		case gerr := <-done:
+			if gerr == nil {
+				t.Fatal("stalled Get returned nil error; want a timeout error")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Get against a stalled apiserver was still pending after 5s: the node client has no request timeout")
 		}
 	})
 }
