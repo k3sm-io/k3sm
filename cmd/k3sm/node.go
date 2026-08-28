@@ -738,6 +738,117 @@ const defaultMemBytes uint64 = 8 * 1024 * 1024 * 1024
 // nodeCapacity hermetic; production reads the live sysctl via golang.org/x/sys/unix.
 var hostMemBytes = func() (uint64, error) { return unix.SysctlUint64("hw.memsize") }
 
+// hostArchFacts is the raw host-architecture evidence nodeArch derives the node's
+// reported architecture from. It is a STRUCT, not a bare string, because no single
+// reading is truthful on its own — measured on Apple Silicon natively and from a
+// process spawned under `arch -x86_64`:
+//
+//	hw.machine              arm64 native / x86_64 translated  -> LIES under translation
+//	uname -m                arm64 native / x86_64 translated  -> LIES under translation
+//	hw.optional.arm64       1     native / 1     translated   -> TRUTHFUL (hardware)
+//	sysctl.proc_translated  0     native / 1     translated   -> is THIS process translated
+//
+// runtime.GOARCH is deliberately absent from this struct: it is the arch the BINARY
+// was BUILT for, never the node's. See nodeArch for why both obvious answers are wrong.
+type hostArchFacts struct {
+	// arm64Capable is hw.optional.arm64 — the HARDWARE can execute arm64. It reads 1
+	// on every Apple Silicon Mac including from inside a translated process, which is
+	// exactly what makes it the truth source. The sysctl does not exist on an Intel
+	// Mac (ENOENT), which reads as a truthful false.
+	arm64Capable bool
+	// machine is hw.machine — the machine AS SEEN BY THIS PROCESS: "arm64" natively,
+	// "x86_64" when this process itself runs translated. A cross-check only, never
+	// the primary source.
+	machine string
+	// procTranslated is sysctl.proc_translated — whether THIS process runs under
+	// Rosetta, i.e. whether machine above is a translated view rather than the host's.
+	procTranslated bool
+}
+
+// readHostArchFacts probes the three host-architecture sysctls. It is a package var so
+// tests inject host facts — including a non-arm64 host, which cannot be reproduced on
+// an Apple Silicon developer machine — without hitting a real syscall, keeping nodeArch
+// hermetic; production reads the live sysctls via golang.org/x/sys/unix.
+var readHostArchFacts = func() (hostArchFacts, error) {
+	machine, err := unix.Sysctl("hw.machine")
+	if err != nil {
+		return hostArchFacts{}, fmt.Errorf("sysctl hw.machine: %w", err)
+	}
+	return hostArchFacts{
+		arm64Capable:   sysctlFlag("hw.optional.arm64"),
+		machine:        machine,
+		procTranslated: sysctlFlag("sysctl.proc_translated"),
+	}, nil
+}
+
+// sysctlFlag reports whether a boolean-valued (4-byte int) sysctl is present and
+// non-zero. A MISSING key is a truthful false, not an error: neither hw.optional.arm64
+// nor sysctl.proc_translated exists on an Intel Mac, where "not arm64-capable" and
+// "not translated" are precisely the right answers.
+func sysctlFlag(name string) bool {
+	v, err := unix.SysctlUint32(name)
+	return err == nil && v != 0
+}
+
+// defaultNodeArch is the architecture advertised when the host-fact probe fails or
+// returns something unrecognized. Like defaultMemBytes above it is a logged FALLBACK,
+// not an assertion: k3sm ships darwin/arm64-only (doctor hard-fails a non-arm64 host
+// at install time), so the supported-platform value is the least-wrong answer, and
+// omitting kubernetes.io/arch entirely would strand every pod that selects on it.
+const defaultNodeArch = "arm64"
+
+// nodeArch derives the architecture the node reports — as both the kubernetes.io/arch
+// label and NodeInfo.Architecture — from host facts. It is pure (no syscall) so it is
+// unit-tested directly, and returns "" when the facts are unrecognizable so the caller
+// can log and fall back.
+//
+// The hardware capability (hw.optional.arm64) is the truth source. Both obvious
+// alternatives are wrong:
+//
+//   - runtime.GOARCH reports the arch the BINARY was built for. A Go toolchain that is
+//     itself amd64-under-Rosetta (a real, observed configuration: `go env GOARCH` says
+//     amd64 on an arm64 Mac) then produces a binary that labels an Apple Silicon node
+//     kubernetes.io/arch=amd64, attracting amd64-only workloads to a node whose native
+//     arch is arm64. The bug is invisible on a correctly-configured host.
+//   - a bare hw.machine is correct only while the reading process happens to be native;
+//     it flips to x86_64 the moment the daemon itself runs translated.
+//
+// procTranslated is a second arm64 witness rather than a correction term: Rosetta 2
+// translation exists only on Apple Silicon, so a translated reader proves arm64
+// hardware even if the capability read came back false.
+func nodeArch(f hostArchFacts) string {
+	if f.arm64Capable || f.procTranslated {
+		return "arm64"
+	}
+	switch f.machine {
+	case "arm64", "arm64e":
+		return "arm64"
+	case "x86_64", "x86_64h":
+		return "amd64"
+	default:
+		return ""
+	}
+}
+
+// hostNodeArch reads the host-arch seam and derives the reported node architecture,
+// logging and falling back to defaultNodeArch on a failed or unrecognized probe (a
+// host-fact hiccup must not keep the node from registering).
+func hostNodeArch() string {
+	facts, err := readHostArchFacts()
+	if err == nil {
+		if arch := nodeArch(facts); arch != "" {
+			return arch
+		}
+	}
+	slog.Warn("host architecture probe failed or unrecognized; advertising the default node architecture",
+		"error", err,
+		"machine", facts.machine,
+		"arm64_capable", facts.arm64Capable,
+		"proc_translated", facts.procTranslated,
+		"default_arch", defaultNodeArch)
+	return defaultNodeArch
+}
+
 // nodeCapacity builds the node Capacity ResourceList from real host facts: numCPU
 // logical CPUs, memBytes total physical RAM (hw.memsize), and maxPods. It is pure
 // and side-effect-free (no syscall) so it is unit-tested directly. Memory uses
@@ -809,7 +920,13 @@ func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1
 func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabilities) {
 	labels := nodeLabels(n)
 	labels["kubernetes.io/os"] = "darwin"
-	labels["kubernetes.io/arch"] = "arm64"
+	// The reported architecture is DERIVED from host facts through the readHostArchFacts
+	// seam (see nodeArch), never from runtime.GOARCH and never from a bare hw.machine —
+	// both of which report amd64/x86_64 on an Apple Silicon Mac under conditions that are
+	// invisible on a correctly-configured host. One derivation feeds BOTH this label and
+	// NodeInfo.Architecture below, so the two can never disagree.
+	arch := hostNodeArch()
+	labels["kubernetes.io/arch"] = arch
 	labels["kubernetes.io/hostname"] = name
 	labels["k3sm.io/native"] = "true"
 	labels["type"] = "k3sm"
@@ -838,11 +955,12 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 	applyRosettaLabels(n, caps)
 
 	n.Status.NodeInfo.OperatingSystem = "darwin"
-	// Architecture is the machine's NATIVE ISA and stays arm64 even on a
-	// Rosetta-capable node: a translated-payload capability is advertised ONLY through
-	// the k3sm.io/rosetta{,-linux} labels, never by making this (or
-	// kubernetes.io/arch above) report a foreign arch to every generic client.
-	n.Status.NodeInfo.Architecture = "arm64"
+	// Architecture is the machine's NATIVE ISA (the same derived value as the
+	// kubernetes.io/arch label above) and stays arm64 on a Rosetta-capable Apple
+	// Silicon node: a translated-payload capability is advertised ONLY through the
+	// k3sm.io/rosetta{,-linux} labels, never by making this (or kubernetes.io/arch)
+	// report a foreign arch to every generic client.
+	n.Status.NodeInfo.Architecture = arch
 	n.Status.NodeInfo.KubeletVersion = "k3sm-m1"
 
 	// Advertise REAL host memory (hw.memsize) as node capacity. A failed read, or

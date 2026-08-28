@@ -171,6 +171,12 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 	// the applyRosettaLabels CALL from configureNode would leave every leaf-helper
 	// subtest above green while the shipped node carried no Rosetta label at all.
 	t.Run("configureNode_threads_caps", func(t *testing.T) {
+		// Pin the HOST facts to a native Apple Silicon Mac (B104): configureNode now
+		// DERIVES the reported arch through the readHostArchFacts seam, so pinning the
+		// facts keeps the arch assertions below hermetic — they prove "Rosetta capability
+		// never widens the arch", not "the machine running the tests happens to be arm64".
+		withHostArchFacts(t, nativeAppleSilicon, nil)
+
 		cases := []struct {
 			name      string
 			caps      provider.NodeCapabilities
@@ -205,8 +211,9 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 				t.Errorf("%s: configureNode must still stamp kubernetes.io/os=darwin; labels=%v", tc.name, n.Labels)
 			}
 			// Rosetta capability NEVER widens the arch the node reports: both the label
-			// and NodeInfo.Architecture stay the machine's native arm64, so a generic
-			// client is never told this node IS amd64 (that is B104's separate question).
+			// and NodeInfo.Architecture stay the machine's native arm64 (derived from the
+			// pinned host facts above — B104), so a generic client is never told this node
+			// IS amd64 no matter which translation capabilities it advertises.
 			if got := n.Labels["kubernetes.io/arch"]; got != "arm64" {
 				t.Errorf("%s: kubernetes.io/arch = %q, want arm64 (Rosetta must not widen the arch label)", tc.name, got)
 			}
