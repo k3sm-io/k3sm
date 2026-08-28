@@ -1,0 +1,51 @@
+# k3sm upstream-image mirror manifest.
+#
+# Every upstream OCI image k3sm depends on is copied ("crane cp" of the FULL index,
+# never a --platform subset, which would re-derive the digest) into the k3sm GHCR
+# namespace at ghcr.io/k3sm-io/mirror/<name> and is consumed from THERE ONLY, by
+# digest. Because an index copy preserves digests, the digest recorded below IS
+# upstream's digest and stays independently auditable against the upstream registry.
+#
+# PAIRED RECORD: the digest-pinned Go constants in k3sm/pkg/images (pins.go). Product
+# code reads the constants; this file is the auditable record behind them. A Go test in
+# that package (TestLockstepShippedManifest) asserts the two are 1:1 in both directions,
+# so it rides `go test ./...` and reds every CI run on drift. `hack/verify-image-pins.sh`
+# is the CLI over the same code, and its --live mode proves each pin actually exists in
+# the registry at the recorded digest, anonymously.
+#
+# BUMP PROCEDURE — ONE human-merged PR that updates BOTH this file and pins.go:
+#   1. Resolve the new upstream index digest and the per-platform digests.
+#   2. Update the entry here (upstream, mirror, tag, platforms) and the matching
+#      constant in pkg/images/pins.go. The lockstep test fails until both move.
+#   3. Re-run the mirror copy so the new digest exists under a durable tag.
+#   4. Reviewer merge-precondition: independently re-resolve the upstream digest from
+#      their own machine and record the match on the PR. A 64-hex digest cannot be
+#      verified by eyeball, and every mechanical check here only proves SELF-consistency
+#      of values written by whoever opened the PR.
+#   5. After the copy runs, `hack/verify-image-pins.sh --live` must be green.
+#
+# ENTRY SCHEMA (all keys required):
+#   name       manifest key; matches the paired constant's Pin name.
+#   upstream   the fully digest-pinned upstream ref, tag AND digest: <ref>:<tag>@sha256:<index>
+#   mirror     ghcr.io/k3sm-io/mirror/<name>@sha256:<the SAME index digest>
+#   tag        the durable per-version mirror tag (= the upstream release tag). A pinned
+#              digest must never sit untagged, where a registry retention policy could
+#              garbage-collect it.
+#   platforms  the per-platform manifest digests inside the index. Runtime platform
+#              selection is the puller's job; these are recorded so --live can prove the
+#              arches k3sm needs are present in the mirrored index.
+#
+# BOUNDARIES: this namespace is never a user-facing, tag-pullable artifact (k3sm consumes
+# it by digest only). k3sm-BUILT images do not belong here. Guest kernel/initramfs assets
+# ship as release assets, not as mirror entries.
+
+images:
+  - name: buildkit
+    upstream: docker.io/moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+    mirror: ghcr.io/k3sm-io/mirror/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+    tag: v0.32.2
+    platforms:
+      - platform: linux/arm64
+        digest: sha256:5a8cd84cb3fcfd082789a08f92bd36f8e745c6231edd78e24a3bf34fd471a823
+      - platform: linux/amd64
+        digest: sha256:040d34121c27906c4ff9ac152a30d52bf2c5d328d3bb748916bb3d2743c02528
