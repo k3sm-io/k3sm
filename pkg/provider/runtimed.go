@@ -558,9 +558,17 @@ var (
 //   - spec.hostNetwork: the pod shares the node's addresses — no /32. The pod is
 //     marked on the adapter so the runtimed-side seam Setup (which the
 //     host-process spine calls unconditionally) also resolves it to the node IP.
-//   - vm RuntimeClass: the guest owns its address inside its own netstack;
-//     runtimed routes it to SetupGuest, never the host-process Setup — no lo0
-//     /32 (which would make the host answer for the guest and blackhole it).
+//   - vm RuntimeClass: no lo0 /32 (which would make the host answer for the
+//     guest and blackhole it), so this branch returns the node IP and routes the
+//     pod away from the host-process Setup. The guest is MEANT to own its own
+//     address inside its netstack via darwin-net podnet.Network.SetupGuest, but
+//     that is NOT WIRED: SetupGuest is implemented and unit-tested in
+//     darwin-net/pkg/podnet/guest.go, and has no production caller anywhere —
+//     there is no transport carrying a GuestNetwork to runtimed yet (the
+//     consumer-side supervisor.GuestNetwork seam, M5.1-d2 / B6). Until it
+//     lands, a vm pod REPORTS THE NODE IP rather than its guest address; that
+//     is a placeholder, not the intended end state. See
+//     k3sm/pkg/runtimeclass/doc.go for the lab-gated remainder.
 //   - otherwise: the podnet /32. Pool exhaustion surfaces as a distinguishable
 //     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap).
 func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, error) {
