@@ -103,6 +103,12 @@ const (
 // process is not root. It carries the exact sudo line the operator must run.
 var ErrDatapathRequiresRoot = errors.New("dev: --datapath needs root (euid 0)")
 
+// ErrServerExited is returned by Up when the detached `k3sm server` it spawned is
+// no longer running. It is the EXIT-shaped verdict, and it beats a readiness
+// verdict: every probe `up` runs is a statement about a socket or an API object,
+// and none of them is falsified by the process serving them having died.
+var ErrServerExited = errors.New("dev: the k3sm server exited during bring-up")
+
 // ErrDatapathSingleton is returned when a second --datapath instance is started
 // while a live datapath (a 10.43.*/100.64.* lo0 alias) is present — its
 // pre-flight lo0 flush would tear the live one down.
@@ -284,7 +290,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		return Instance{}, err
 	}
 
-	apiPort, kinePort, err := allocatePorts(m.sys, name, m.euid)
+	apiPort, kinePort, kubeletPort, err := allocatePorts(m.sys, name, m.euid)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -346,7 +352,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// default; hostprocess is only the honest execshim-unavailable fallback. The
 	// rootless tier is network=none (runtimePreflight returns nil — no root);
 	// --datapath is network=direct.
-	pid, err := m.spawnServer(ctx, name, workDir, podRoot, apiPort, kinePort, network, runtimeName, binDir, pathShim, dnsShim)
+	proc, err := m.spawnServer(ctx, name, workDir, podRoot, apiPort, kinePort, kubeletPort, network, runtimeName, binDir, pathShim, dnsShim)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -356,7 +362,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	m.kubeMg.path = opts.Kubeconfig
 	kubePath, err := m.kubeMg.dest()
 	if err != nil {
-		_ = m.sys.TerminateProcess(pid, terminateGrace)
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 
@@ -367,7 +373,8 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		PodRoot:     podRoot,
 		APIPort:     apiPort,
 		KinePort:    kinePort,
-		PID:         pid,
+		KubeletPort: kubeletPort,
+		PID:         proc.pid,
 		Tier:        tier,
 		Runtime:     runtimeName,
 		Datapath:    datapath,
@@ -383,12 +390,12 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// after the spawn we tear the detached server down so a half-up instance never
 	// leaks.
 	kc := executor.KubeconfigPath(workDir)
-	if err := m.awaitKubeconfig(ctx, kc, serverLogPath(workDir)); err != nil {
-		_ = m.sys.TerminateProcess(pid, terminateGrace)
+	if err := m.awaitOrExit(ctx, proc, m.awaitKubeconfig(ctx, kc, serverLogPath(workDir))); err != nil {
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 	if err := m.kubeMg.merge(kc, inst.KubeContext); err != nil {
-		_ = m.sys.TerminateProcess(pid, terminateGrace)
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
 		return Instance{}, fmt.Errorf("merge kubeconfig: %w", err)
 	}
 
@@ -406,8 +413,8 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	if wait == nil {
 		wait = m.awaitDefaultNamespaceBootstrap
 	}
-	if err := wait(ctx, kc); err != nil {
-		_ = m.sys.TerminateProcess(pid, terminateGrace)
+	if err := m.awaitOrExit(ctx, proc, wait(ctx, kc)); err != nil {
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 
@@ -420,8 +427,8 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// pods"). Block until a Ready node exists, so `up` returning means the cluster
 	// can actually run something.
 	nodeWait := m.nodeRegistrationWait()
-	if err := nodeWait(ctx, kc); err != nil {
-		_ = m.sys.TerminateProcess(pid, terminateGrace)
+	if err := m.awaitOrExit(ctx, proc, nodeWait(ctx, kc)); err != nil {
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 
@@ -433,8 +440,18 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		}
 	}
 
+	// The report is bound to the SERVER, not to the probes that ran against it.
+	// This is the last thing checked before the manifest is written and `up` says
+	// so: `instance "b" up` was once printed over a server that had already died,
+	// because a bring-up whose every gate is a readiness signal reports the health
+	// of signals rather than of a process. A dead server gets no manifest and no
+	// success line.
+	if err := m.awaitOrExit(ctx, proc, nil); err != nil {
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		return Instance{}, err
+	}
 	if err := m.reg.Save(inst); err != nil {
-		_ = m.sys.TerminateProcess(pid, terminateGrace)
+		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 	if m.kubeMg.chownUID >= 0 {
@@ -638,7 +655,7 @@ func (m *Manager) preflightReclaim(name string) error {
 // unit-tested without spawning a process. An empty shim path emits NO flag at
 // all: the server must fall back to its own sibling-dylib resolution rather than
 // be pointed at a path that is not there.
-func serverArgs(name, workDir, podRoot string, apiPort, kinePort int, network, runtimeName, pathShim, dnsShim string) []string {
+func serverArgs(name, workDir, podRoot string, apiPort, kinePort, kubeletPort int, network, runtimeName, pathShim, dnsShim string) []string {
 	args := []string{
 		"server",
 		"--work-dir", workDir,
@@ -657,6 +674,16 @@ func serverArgs(name, workDir, podRoot string, apiPort, kinePort int, network, r
 		// would be refused by the executor (or, before that refusal existed, come up
 		// healthy against the first instance's datastore).
 		"--kine-port", strconv.Itoa(kinePort),
+		// The allocated kubelet-API port, same reason one port further down the
+		// bring-up: the node's logs/exec/stats listener is a per-NODE singleton, so
+		// on the fixed default the second instance's node dies at "bind: address
+		// already in use" after the control plane is already healthy.
+		//
+		// A PORT is all dev hands the server. The listener's bind address (the
+		// wildcard) and its auth posture are the server's own, unchanged by this
+		// flag and not dev's to move: `k3sm dev` must never be the reason that
+		// surface is reachable from somewhere it was not already.
+		"--kubelet-port", strconv.Itoa(kubeletPort),
 		// Disable the ingress listeners: the dev cluster does not front an ingress,
 		// and the production :80/:443 bind needs privileges the rootless tier lacks.
 		"--ingress-http-port", "0",
@@ -676,24 +703,24 @@ func serverArgs(name, workDir, podRoot string, apiPort, kinePort int, network, r
 // <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
 // until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
 // read the same workdir.
-func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, apiPort, kinePort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (int, error) {
+func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, apiPort, kinePort, kubeletPort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (*serverProc, error) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		return 0, fmt.Errorf("create workdir %s: %w", workDir, err)
+		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
 	}
 	// Pre-create the runtime root so a base the caller cannot write (a stale tree
 	// owned by the other euid) fails HERE, with the path named, instead of inside
 	// the detached server's first pod create.
 	if err := os.MkdirAll(podRoot, 0o700); err != nil {
-		return 0, fmt.Errorf("create pod-root %s: %w", podRoot, err)
+		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
 	logPath := serverLogPath(workDir)
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return 0, fmt.Errorf("create server log: %w", err)
+		return nil, fmt.Errorf("create server log: %w", err)
 	}
 	defer lf.Close()
 
-	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, apiPort, kinePort, network, runtimeName, pathShim, dnsShim)...)
+	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, apiPort, kinePort, kubeletPort, network, runtimeName, pathShim, dnsShim)...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	// Own process group so `down` can SIGTERM the whole supervised tree via -pid,
 	// and detached from ctx cancellation (WaitDelay 0 + no Cancel) so the server
@@ -706,13 +733,84 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// helper), which leaves PATH untouched.
 	cmd.Env = append(withExecShimPath(os.Environ(), execShimDir), "K3SM_WORK_DIR="+workDir)
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start k3sm server: %w", err)
+		return nil, fmt.Errorf("start k3sm server: %w", err)
 	}
-	pid := cmd.Process.Pid
+	p := &serverProc{name: name, pid: cmd.Process.Pid, logPath: logPath, exited: make(chan struct{})}
 	// Release the child: a reaper goroutine Waits so the process is not left a
-	// zombie if this CLI lingers, but the server keeps running independently.
-	go func() { _ = cmd.Wait() }()
-	return pid, nil
+	// zombie if this CLI lingers, but the server keeps running independently. The
+	// Wait result is no longer discarded — it is the account of WHY a bring-up
+	// that looked healthy was not, so it is recorded before the close that
+	// publishes it.
+	go func() {
+		p.waitErr = cmd.Wait()
+		close(p.exited)
+	}()
+	return p, nil
+}
+
+// serverProc is the handle spawnServer returns for the detached control plane:
+// its pid, where its output went, and the exit signal the reaper goroutine
+// closes. waitErr is written strictly BEFORE exited closes and read only after
+// <-exited, so the close is the happens-before edge (the same discipline the
+// executor's supervised components use for the same reason).
+type serverProc struct {
+	name    string
+	pid     int
+	logPath string
+	exited  chan struct{}
+	waitErr error
+}
+
+// exitError describes the server's exit: the Wait result (its exit status) plus
+// the tail of the log it died writing, so the operator sees the fatal line rather
+// than an assertion that something is wrong. Call only after <-p.exited.
+func (p *serverProc) exitError() error {
+	return fmt.Errorf("%w: instance %q server (pid %d): %v; last log lines (%s):\n%s",
+		ErrServerExited, p.name, p.pid, p.waitErr, p.logPath,
+		executor.LogTail(p.logPath, bootLogTailLines))
+}
+
+// exitReportGrace bounds how long awaitOrExit waits for the reaper to publish an
+// exit it has already established from the kernel. The close is imminent by
+// construction (the child is gone; the reaper only needs a scheduling slot), so
+// this is a hang guard, not a budget — on expiry the stage's own verdict is
+// returned rather than nothing at all.
+const exitReportGrace = 5 * time.Second
+
+// awaitOrExit decides which verdict a bring-up stage reports, and the server's
+// EXIT always wins.
+//
+// A stage's success is not the instance's success. `up` printed `instance "b" up`
+// for a server whose datastore had already FATAL'd, because every wait it runs is
+// bound to a readiness signal — a kubeconfig file on disk, an API object, a Ready
+// node — and a signal that has already been emitted stays true after the process
+// emitting it dies. So an exit the reaper has published beats err even when err
+// is nil.
+//
+// When the stage FAILED, the kernel is asked directly before a deadline is
+// allowed to author the error: exited is closed by a goroutine that may not have
+// been scheduled yet, so a dead server can otherwise come back as an opaque
+// timeout describing the symptom instead of the cause.
+func (m *Manager) awaitOrExit(ctx context.Context, p *serverProc, err error) error {
+	select {
+	case <-p.exited:
+		return p.exitError()
+	default:
+	}
+	if err == nil {
+		return nil
+	}
+	if !m.sys.ProcessAlive(p.pid) {
+		select {
+		case <-p.exited:
+			return p.exitError()
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(exitReportGrace):
+			// The reaper never reported. Prefer the stage's own verdict to hanging.
+		}
+	}
+	return err
 }
 
 // serverLogPath is where spawnServer redirects a detached server's output. One
