@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -252,7 +253,9 @@ func defaultNodePodCIDR() string {
 // rewritten to a globally-unicast address (see nodeInternalIP) because the
 // apiserver node-proxy rejects a loopback NodeInternalIP — its isProxyableHostname
 // runs net.IP.IsGlobalUnicast(), which loopback fails — with HTTP 400, breaking
-// `kubectl top node` (GET /nodes/<n>/proxy/stats/summary).
+// `kubectl top node` (GET /nodes/<n>/proxy/stats/summary). Off the datapath
+// (`k3sm dev` rootless) proxyableNodeIP does the same job with a host interface
+// address, since no adapter is there to alias a derived one.
 const loopbackNodeIP = "127.0.0.1"
 
 // isLoopbackDefault reports whether nodeIP is the shipped --node-ip default, i.e.
@@ -299,6 +302,118 @@ func advertisedNodeIP(opts nodeOptions) string {
 		return ip
 	}
 	return opts.nodeIP
+}
+
+// proxyableNodeIP returns the address the node REGISTERS as its NodeInternalIP —
+// the one address the apiserver node-proxy will dial. It runs STRICTLY AFTER
+// advertisedNodeIP, as the second tier of the same decision:
+//
+//	tier 1 (datapath):  the derived mesh-egress .1, aliased on lo0 by the podnet
+//	                    adapter — advertisedNodeIP already returned it;
+//	tier 2 (here):      no datapath, so nothing aliases an address for us — take
+//	                    one the host ALREADY answers on, i.e. a globally-unicast
+//	                    address of one of its own up interfaces;
+//	tier 3 (fail-soft): no such address — keep the loopback default. `kubectl top`
+//	                    stays broken, but the node still registers. A metrics
+//	                    nicety never costs a node its registration.
+//
+// Without it a `k3sm dev` node (--network none, so DataPath()==false) registers
+// InternalIP=127.0.0.1, and every GET /api/v1/nodes/<n>/proxy/... is refused
+// with HTTP 400 "address not allowed": upstream's node-proxy ResourceLocation
+// calls isProxyableHostname, which resolves the address and requires
+// net.IP.IsGlobalUnicast() on EVERY result — loopback, unspecified, link-local
+// and multicast all fail it (k8s v1.36.2 pkg/registry/core/node/strategy.go:256
+// and :275-291; the address itself is picked by GetPreferredNodeAddress under
+// the executor's --kubelet-preferred-address-types=InternalIP).
+//
+// It is DELIBERATELY not written back to opts.nodeIP. In the no-datapath posture
+// that value is also the POD-facing address (podIP ≈ nodeIP — see buildProvider
+// and runtimedConfig), and moving pod IPs is a different change with a different
+// blast radius. The two values coincide in every other posture.
+//
+// SECURITY: this opens no port and widens no bind. `k3sm server`/`k3sm agent`
+// already listen on the WILDCARD serverKubeletListen (*:10250), so the kubelet
+// API — whose provider routes are served behind nodeutil.NoAuth(), identity
+// resting on serving-TLS plus network reach (see vkadapter.NewNode) — is
+// reachable at the host's interface addresses with or without this. All that
+// changes is which of those addresses the Node object names. The substitution is
+// therefore gated on wildcardListen: a listener scoped to loopback (standalone
+// `k3sm node`) is never re-advertised at an address it does not serve.
+func proxyableNodeIP(opts nodeOptions) string {
+	if !isLoopbackDefault(opts.nodeIP) || !wildcardListen(opts.listen) {
+		return opts.nodeIP
+	}
+	if ip := firstProxyableIP(hostInterfaceIPs()); ip != "" {
+		return ip
+	}
+	return opts.nodeIP
+}
+
+// hostInterfaceIPs reports the addresses of this host's own up, non-loopback
+// interfaces. It is a package var so proxyableNodeIP's selection is unit-testable:
+// a test cannot add or remove an address on the machine running it.
+var hostInterfaceIPs = func() []net.IP {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var ips []net.IP
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			// One unreadable interface must not hide the rest.
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok {
+				ips = append(ips, n.IP)
+			}
+		}
+	}
+	return ips
+}
+
+// firstProxyableIP returns the first address in ips that satisfies the upstream
+// node-proxy predicate (net.IP.IsGlobalUnicast — the SAME stdlib call
+// isProxyableHostname makes), preferring IPv4 because that is what a dual-stack
+// Mac's clients dial. It returns "" when no address qualifies, which is the
+// caller's fail-soft signal. Interface order is net.Interfaces' index order, so
+// the choice is stable across restarts.
+func firstProxyableIP(ips []net.IP) string {
+	var v6 string
+	for _, ip := range ips {
+		if ip == nil || !ip.IsGlobalUnicast() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+		if v6 == "" {
+			v6 = ip.String()
+		}
+	}
+	return v6
+}
+
+// wildcardListen reports whether listen binds EVERY local address (":10250",
+// "0.0.0.0:10250", "[::]:10250") rather than one scoped address. It is the
+// bind-then-advertise check proxyableNodeIP gates on: the node may only name an
+// address its kubelet API listener actually answers on. An unparseable value is
+// treated as scoped — the conservative direction, since a wrong "yes" advertises
+// an address that refuses the connection.
+func wildcardListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
 }
 
 // nodeInternalIP derives the globally-unicast address the VK node advertises as
@@ -417,6 +532,18 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// explicit --node-ip (e.g. --mesh-ip, already globally-unicast) is honored.
 	opts.nodeIP = advertisedNodeIP(opts)
 
+	// Second tier of the same decision, for the postures the derivation above does
+	// not cover (`k3sm dev` rootless: --network none, so no adapter aliases a /32
+	// for us). It yields the ONE address registered as NodeInternalIP — the address
+	// the apiserver node-proxy dials — and is deliberately kept OUT of opts.nodeIP,
+	// which in a no-datapath posture is also the pod-facing address. See
+	// proxyableNodeIP for the upstream predicate and the security note.
+	internalIP := proxyableNodeIP(opts)
+	if internalIP != opts.nodeIP {
+		slog.Info("registering a host interface address as NodeInternalIP so the apiserver node-proxy can dial this node (kubectl top/logs/exec); the kubelet API listener is already wildcard-bound, so no new port is opened",
+			"internal_ip", internalIP, "node_ip", opts.nodeIP, "listen", opts.listen)
+	}
+
 	restCfg, err := nodeRESTConfig(opts.kubeconfig)
 	if err != nil {
 		return err
@@ -461,7 +588,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 
 	var servingTLS *tls.Config
 	if opts.serveTLS {
-		servingTLS, err = kubeletServingTLS(opts.nodeName, opts.nodeIP)
+		servingTLS, err = kubeletServingTLS(opts.nodeName, opts.nodeIP, internalIP)
 		if err != nil {
 			return fmt.Errorf("kubelet serving tls: %w", err)
 		}
@@ -477,7 +604,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		HTTPListenAddr: opts.listen,
 		NumWorkers:     4,
 		TLSConfig:      servingTLS, // nil = plain HTTP (M0 path); set = kubelet-serving TLS
-		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, opts.nodeIP, caps) },
+		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, caps) },
 	})
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
@@ -1168,13 +1295,24 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 }
 
 // kubeletServingTLS builds the TLS config the VK node serves on :10250. The
-// cert's SANs include the node InternalIP (so the apiserver, started with
-// --kubelet-preferred-address-types=InternalIP, dials by IP and verifies), the
-// node name, and loopback. ClientAuth is left at NoClientCert: M1 keeps the
-// apiserver's AlwaysAllow posture, so the proxy connects without a client cert.
-func kubeletServingTLS(nodeName, nodeIP string) (*tls.Config, error) {
+// cert's SANs include loopback, the node name, and EVERY address in nodeIPs —
+// which must cover the registered NodeInternalIP, since the apiserver (started
+// with --kubelet-preferred-address-types=InternalIP) dials that address by IP and
+// verifies the cert against it. The advertised address and the registered
+// InternalIP diverge in the no-datapath posture (see proxyableNodeIP), so both
+// are passed; duplicates and unparseable entries are dropped. ClientAuth is left
+// at NoClientCert: M1 keeps the apiserver's AlwaysAllow posture, so the proxy
+// connects without a client cert.
+func kubeletServingTLS(nodeName string, nodeIPs ...string) (*tls.Config, error) {
 	ips := []net.IP{net.ParseIP("127.0.0.1")}
-	if ip := net.ParseIP(nodeIP); ip != nil && !ip.Equal(net.ParseIP("127.0.0.1")) {
+	for _, s := range nodeIPs {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			continue
+		}
+		if slices.ContainsFunc(ips, ip.Equal) {
+			continue
+		}
 		ips = append(ips, ip)
 	}
 	cert, err := certs.SelfSignedServing([]string{nodeName, "localhost"}, ips)
