@@ -43,6 +43,7 @@ import (
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
+	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
 	"k3sm.io/k3sm/pkg/runtimeclass"
@@ -307,76 +308,12 @@ func runServer(args []string) error {
 		return fmt.Errorf("build client: %w", err)
 	}
 
-	// 3. M1.2 — provision the os=darwin ValidatingAdmissionPolicy (intent guard).
-	if err := policy.EnsureDarwinAdmission(ctx, cs); err != nil {
-		logger.Error("provision admission policy", "err", err)
-	}
-	// M3.1 — honest-gap Warn advisories on Services: externalTrafficPolicy: Local
-	// is not honored (the userspace splice does not preserve client source IP) and
-	// UDP ports have no datapath yet (the proxy opens no UDP listener). They warn at
-	// the API (never reject) so the divergence is visible in kubectl. Provisioned
-	// unconditionally — these are inherent Service-model limits, not mode-specific.
-	if err := policy.EnsureExternalTrafficPolicyLocalWarn(ctx, cs); err != nil {
-		logger.Error("provision externalTrafficPolicy=Local warn policy", "err", err)
-	}
-	if err := policy.EnsureUDPServiceWarn(ctx, cs); err != nil {
-		logger.Error("provision UDP-service warn policy", "err", err)
-	}
-	// B116 — DENY a type: LoadBalancer Service declaring a port k3sm's own wildcard
-	// listeners own (the NodePort range, the kubelet API port). Log-and-continue
-	// like every sibling Ensure*, but the message NAMES the consequence: a silently
-	// absent Deny VAP is otherwise indistinguishable from a present one, and the
-	// operator would only meet the collision as an unexplained <pending> Service
-	// (svclb still refuses the bind — that is the datapath half of the guard).
-	if err := policy.EnsureRejectReservedLoadBalancerPort(ctx, cs); err != nil {
-		logger.Error("provision reserved-loadbalancer-port DENY policy: a LoadBalancer Service declaring a k3sm-reserved port (NodePort range / kubelet API port) will now be ACCEPTED by the API instead of rejected; svclb still refuses to bind it, so such a Service stays <pending> with only a log line to explain it", "err", err)
-	}
-	// B17 — honest-gap Warn advisory on Pods: a pod with no toleration for the
-	// provider taint (k3sm.io/provider:NoSchedule, on EVERY node) is left
-	// Unschedulable by the scheduler. Warn at the API (never reject — a non-tolerating
-	// pod is valid k8s) so a directly-created pod's omission is visible in kubectl.
-	// Provisioned UNCONDITIONALLY (not mode-gated): the taint is on every node.
-	if err := policy.EnsureProviderTolerationWarn(ctx, cs); err != nil {
-		logger.Error("provision provider-toleration warn policy", "err", err)
-	}
-	// B76 — MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
-	// controller (KCM), so the B17 CREATE-Warn advisory never reaches its author and
-	// the pod sits Unschedulable against the provider taint. Inject the provider
-	// toleration (never the os=darwin nodeSelector — Res.7) so DS pods schedule.
-	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; requires
-	// the executor's v1beta1 runtime-config + MutatingAdmissionPolicy feature gate.
-	if err := policy.EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
-		logger.Error("provision daemonset-toleration mutating policy", "err", err)
-	}
-	// Unprivileged posture: every pod runs as the single _k3sm uid (no per-pod uid
-	// isolation), so REJECT a pod requesting a foreign runAsUser/fsGroup at
-	// admission rather than letting it wedge at runtime (a privilege drop needs
-	// root). The allowed uid is the control plane's own (the _k3sm uid). Only the
-	// helper backend is the unprivileged-_k3sm posture; root (direct) can honor a
-	// drop and none (CI) is not production, so the policy is provisioned only there.
-	if mode.UsesHelper() {
-		if err := policy.EnsureNoForeignUserAdmission(ctx, cs, int64(os.Geteuid())); err != nil {
-			logger.Error("provision foreign-user admission policy", "err", err)
-		}
-	}
-	// M10.0 (Res.5) — the memory-only default LimitRange in the `default` namespace:
-	// containers that omit resources get honest memory defaults (memory IS enforced
-	// via the rusage sampler→OOMKill); deliberately NO cpu key (best-effort only).
-	// Create-if-absent (operator-space — a tuned object is never clobbered);
-	// log-and-continue like the sibling advisories.
-	if err := policy.EnsureDefaultLimitRange(ctx, cs); err != nil {
-		logger.Error("provision default memory limitrange", "err", err)
-	}
-	// M5.1 — provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
-	// scheduling.nodeSelector pinning it to VZ-capable nodes via
-	// k3sm.io/virtualization). Log-and-continue (NOT fail-closed like rbac): a missing
-	// RuntimeClass cannot lock workers out — it only makes a vm pod unschedulable / a
-	// vm-pod admission rejected — so it never halts bring-up. No node advertises the
-	// VZ label today (runtimed reports no per-backend availability), so a vm pod stays
-	// Pending — the correct posture for this non-VZ foundation.
-	if err := runtimeclass.Provision(ctx, cs); err != nil {
-		logger.Error("provision vm runtime class", "err", err)
-	}
+	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
+	// Extracted so the SET is testable against a fake clientset (B153): what this
+	// binary provisions is a posture-INDEPENDENT product decision, and a silently
+	// absent policy is otherwise invisible until a real cluster admits something it
+	// should have rejected.
+	provisionClusterPolicies(ctx, cs, mode, os.Geteuid(), logger)
 
 	// 3b. M4.1 — provision the RBAC graph BEFORE the VK node (step 5) and the
 	// worker-join supervisor (step 4b) start, so a joining worker's system:node
@@ -649,4 +586,98 @@ func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP strin
 		return "", "", fmt.Errorf("write apiserver serving key: %w", err)
 	}
 	return certFile, keyFile, nil
+}
+
+// provisionClusterPolicies lays down the cluster-scoped admission policies and the
+// vm RuntimeClass on a freshly-healthy control plane. Every step is
+// LOG-AND-CONTINUE: none of them can halt bring-up (unlike the fail-closed RBAC
+// graph that follows), because a node that refuses to start is strictly worse than
+// a node missing an advisory.
+//
+// The set is POSTURE-INDEPENDENT — mode is logged, never branched on. That is the
+// B153 fix: the foreign-user ceiling used to be provisioned only under the netd
+// helper backend, so a `--network none`/`direct` cluster ran with no such policy
+// object at all and admitted the very pods the ceiling exists to reject.
+//
+// euid is the effective uid of this process; the foreign-user policy's allowed
+// identity is derived from it by provider.PodExecutionUID, which answers "what uid
+// do pods here actually execute as" rather than "what uid is the server".
+func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode hostnet.Mode, euid int, logger *slog.Logger) {
+	allowedUID := provider.PodExecutionUID(euid)
+	logger.Info("provisioning cluster admission policies",
+		"network-backend", mode.Backend.String(), "pod-execution-uid", allowedUID)
+	// M1.2 — the os=darwin ValidatingAdmissionPolicy (intent guard).
+	if err := policy.EnsureDarwinAdmission(ctx, cs); err != nil {
+		logger.Error("provision admission policy", "err", err)
+	}
+	// M3.1 — honest-gap Warn advisories on Services: externalTrafficPolicy: Local
+	// is not honored (the userspace splice does not preserve client source IP) and
+	// UDP ports have no datapath yet (the proxy opens no UDP listener). They warn at
+	// the API (never reject) so the divergence is visible in kubectl. Provisioned
+	// unconditionally — these are inherent Service-model limits, not mode-specific.
+	if err := policy.EnsureExternalTrafficPolicyLocalWarn(ctx, cs); err != nil {
+		logger.Error("provision externalTrafficPolicy=Local warn policy", "err", err)
+	}
+	if err := policy.EnsureUDPServiceWarn(ctx, cs); err != nil {
+		logger.Error("provision UDP-service warn policy", "err", err)
+	}
+	// B116 — DENY a type: LoadBalancer Service declaring a port k3sm's own wildcard
+	// listeners own (the NodePort range, the kubelet API port). Log-and-continue
+	// like every sibling Ensure*, but the message NAMES the consequence: a silently
+	// absent Deny VAP is otherwise indistinguishable from a present one, and the
+	// operator would only meet the collision as an unexplained <pending> Service
+	// (svclb still refuses the bind — that is the datapath half of the guard).
+	if err := policy.EnsureRejectReservedLoadBalancerPort(ctx, cs); err != nil {
+		logger.Error("provision reserved-loadbalancer-port DENY policy: a LoadBalancer Service declaring a k3sm-reserved port (NodePort range / kubelet API port) will now be ACCEPTED by the API instead of rejected; svclb still refuses to bind it, so such a Service stays <pending> with only a log line to explain it", "err", err)
+	}
+	// B17 — honest-gap Warn advisory on Pods: a pod with no toleration for the
+	// provider taint (k3sm.io/provider:NoSchedule, on EVERY node) is left
+	// Unschedulable by the scheduler. Warn at the API (never reject — a non-tolerating
+	// pod is valid k8s) so a directly-created pod's omission is visible in kubectl.
+	// Provisioned UNCONDITIONALLY (not mode-gated): the taint is on every node.
+	if err := policy.EnsureProviderTolerationWarn(ctx, cs); err != nil {
+		logger.Error("provision provider-toleration warn policy", "err", err)
+	}
+	// B76 — MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
+	// controller (KCM), so the B17 CREATE-Warn advisory never reaches its author and
+	// the pod sits Unschedulable against the provider taint. Inject the provider
+	// toleration (never the os=darwin nodeSelector — Res.7) so DS pods schedule.
+	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; requires
+	// the executor's v1beta1 runtime-config + MutatingAdmissionPolicy feature gate.
+	if err := policy.EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
+		logger.Error("provision daemonset-toleration mutating policy", "err", err)
+	}
+	// B153 — every pod runs as ONE uid (no per-pod uid isolation), so REJECT a pod
+	// requesting a foreign runAsUser/runAsGroup/fsGroup/supplementalGroups at
+	// admission rather than letting it wedge at spawn. Provisioned UNCONDITIONALLY,
+	// like its siblings: the ceiling is a product-wide property. It used to sit
+	// behind `if mode.UsesHelper()` — a deliberate choice, on the reasoning that a
+	// root server can honor a real drop and `none` is CI-only — but that made the
+	// networking-backend selector stand in for "can the runtime honor a uid drop",
+	// so `--network none`/`direct` clusters had NO policy object and admitted the
+	// pods the ceiling exists to reject. Accepted cost of the operator's ratified
+	// Option A: a root server no longer serves a foreign-fsGroup pod it could
+	// genuinely have honored.
+	if err := policy.EnsureNoForeignUserAdmission(ctx, cs, allowedUID); err != nil {
+		logger.Error("provision foreign-user admission policy: a pod requesting a foreign runAsUser/fsGroup will now be ADMITTED and then wedge at spawn (or silently run as the wrong identity) instead of being rejected at the API", "err", err)
+	}
+	// M10.0 (Res.5) — the memory-only default LimitRange in the `default` namespace:
+	// containers that omit resources get honest memory defaults (memory IS enforced
+	// via the rusage sampler→OOMKill); deliberately NO cpu key (best-effort only).
+	// Create-or-update like every sibling Ensure* (B153 — see pkg/policy.ensure:
+	// a create-only provisioner freezes the shipped defaults at whatever a cluster
+	// was first created with); log-and-continue like the sibling advisories.
+	if err := policy.EnsureDefaultLimitRange(ctx, cs); err != nil {
+		logger.Error("provision default memory limitrange", "err", err)
+	}
+	// M5.1 — provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
+	// scheduling.nodeSelector pinning it to VZ-capable nodes via
+	// k3sm.io/virtualization). Log-and-continue (NOT fail-closed like rbac): a missing
+	// RuntimeClass cannot lock workers out — it only makes a vm pod unschedulable / a
+	// vm-pod admission rejected — so it never halts bring-up. No node advertises the
+	// VZ label today (runtimed reports no per-backend availability), so a vm pod stays
+	// Pending — the correct posture for this non-VZ foundation.
+	if err := runtimeclass.Provision(ctx, cs); err != nil {
+		logger.Error("provision vm runtime class", "err", err)
+	}
 }

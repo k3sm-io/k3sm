@@ -23,7 +23,6 @@ import (
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -174,20 +173,16 @@ func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string
 // fail open, which is why the datapath refusal in svclb exists as the second
 // enforcement point rather than as belt-and-braces.
 //
-// PROVISIONING CONTRACT (bounded, on purpose): like every sibling Ensure*, this is
-// CREATE-IF-ABSENT and NEVER UPDATES. So the CEL is frozen at the moment the policy
-// object is first created: the "reserved set cannot desync" property holds for a
-// FRESH cluster, but a cluster provisioned before a NodePort-range change keeps the
-// old expression until the object is deleted. An Update-on-drift provisioner is a
-// reserved follow-up, not an oversight.
+// PROVISIONING CONTRACT: like every sibling Ensure*, this is CREATE-OR-UPDATE
+// (managedObject.ensure) — a cluster provisioned before a NodePort-range change is
+// reconciled onto the new expression on the next server start, so the "reserved set
+// cannot desync" property holds for an EXISTING cluster too, not only a fresh one.
 func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Interface) error {
-	api := cs.AdmissionregistrationV1()
-
 	ignore := admissionregistrationv1.Ignore
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   reservedLBPortPolicyName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
 			FailurePolicy: &ignore,
@@ -214,23 +209,23 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 			}},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create reserved-loadbalancer-port admission policy: %w", err)
+	if err := ensureValidatingAdmissionPolicy(ctx, cs, policy); err != nil {
+		return fmt.Errorf("reserved-loadbalancer-port admission policy: %w", err)
 	}
 
 	deny := admissionregistrationv1.Deny
 	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   reservedLBPortBindingName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
 			PolicyName:        reservedLBPortPolicyName,
 			ValidationActions: []admissionregistrationv1.ValidationAction{deny},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create reserved-loadbalancer-port admission binding: %w", err)
+	if err := ensureValidatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+		return fmt.Errorf("reserved-loadbalancer-port admission binding: %w", err)
 	}
 	return nil
 }
@@ -302,15 +297,14 @@ const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerat
 // policy MUTATES the pod to tolerate it. UNLIKE the Deny/Warn ValidatingAdmissionPolicies
 // it CHANGES the stored object. Both matchConditions must hold (DS-owned AND not already
 // tolerating); the mutation appends exactly one toleration and NEVER a nodeSelector
-// (Res.7). Safe to call on every server start (AlreadyExists is success).
+// (Res.7). Safe to call on every server start (create-or-update; an unchanged
+// spec is not rewritten).
 //
 // This provisions objects for a BETA API (admissionregistration.k8s.io/v1beta1,
 // MutatingAdmissionPolicy) — the executor must enable the v1beta1 runtime-config AND the
 // MutatingAdmissionPolicy feature gate on the apiserver (see executor.apiServerArgs) or
 // this policy is a runtime no-op.
 func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interface) error {
-	api := cs.AdmissionregistrationV1beta1()
-
 	// Ignore — NOT Fail — because this is a scheduling-CONVENIENCE injector, not a
 	// guard: MatchConstraints is all Pods/CREATE, so a Fail policy would turn any
 	// CEL/beta-machinery evaluation error into a cluster-wide denial of Pod CREATE.
@@ -322,7 +316,7 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 	policy := &admissionregistrationv1beta1.MutatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dsTolerationPolicyName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1beta1.MutatingAdmissionPolicySpec{
 			FailurePolicy: &ignore,
@@ -352,37 +346,35 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 			ReinvocationPolicy: admissionregistrationv1beta1.IfNeededReinvocationPolicy,
 		},
 	}
-	if _, err := api.MutatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create daemonset-toleration mutating policy: %w", err)
+	if err := ensureMutatingAdmissionPolicy(ctx, cs, policy); err != nil {
+		return fmt.Errorf("daemonset-toleration mutating policy: %w", err)
 	}
 
 	binding := &admissionregistrationv1beta1.MutatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   dsTolerationBindingName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1beta1.MutatingAdmissionPolicyBindingSpec{
 			PolicyName: dsTolerationPolicyName,
 		},
 	}
-	if _, err := api.MutatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create daemonset-toleration mutating binding: %w", err)
+	if err := ensureMutatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+		return fmt.Errorf("daemonset-toleration mutating binding: %w", err)
 	}
 	return nil
 }
 
 // EnsureDarwinAdmission idempotently provisions the os=darwin
 // ValidatingAdmissionPolicy and its binding so non-darwin Pods are rejected at
-// admission. It is safe to call on every server start: an AlreadyExists is
-// treated as success.
+// admission. It is safe to call on every server start: it create-or-updates, and
+// an unchanged spec is not rewritten.
 func EnsureDarwinAdmission(ctx context.Context, cs kubernetes.Interface) error {
-	api := cs.AdmissionregistrationV1()
-
 	failFail := admissionregistrationv1.Fail
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   darwinPolicyName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
 			FailurePolicy: &failFail,
@@ -406,23 +398,23 @@ func EnsureDarwinAdmission(ctx context.Context, cs kubernetes.Interface) error {
 		},
 	}
 
-	if _, err := api.ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create os=darwin admission policy: %w", err)
+	if err := ensureValidatingAdmissionPolicy(ctx, cs, policy); err != nil {
+		return fmt.Errorf("os=darwin admission policy: %w", err)
 	}
 
 	deny := admissionregistrationv1.Deny
 	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   darwinBindingName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
 			PolicyName:        darwinPolicyName,
 			ValidationActions: []admissionregistrationv1.ValidationAction{deny},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create os=darwin admission binding: %w", err)
+	if err := ensureValidatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+		return fmt.Errorf("os=darwin admission binding: %w", err)
 	}
 	return nil
 }
@@ -476,16 +468,29 @@ func containersClause(list string, allowedID int64, optional bool) string {
 // runAsUser/runAsGroup/fsGroup/supplementalGroups other than allowedUID — the
 // identity every k3sm pod runs as, since the runtime offers no per-pod uid/gid
 // isolation. It is the admission counterpart to the runtime's privilege-drop
-// refusal; provision it with the control plane's own (the _k3sm) uid. Safe to call
-// on every server start (AlreadyExists is success).
+// refusal. Safe to call on every server start (create-or-update; an unchanged spec
+// is not rewritten).
+//
+// PROVISIONED IN EVERY POSTURE (B153). It used to be provisioned ONLY under the
+// netd-helper backend, on the reasoning that a root server can honor a real
+// privilege drop; that made a `--network none`/`direct` cluster admit a
+// foreign-uid pod with NO policy object at all, and under `none` while
+// unprivileged the pod then wedged at spawn — the exact silent failure this guard
+// exists to prevent. The operator ratified the guard as a PRODUCT-WIDE CEILING, at
+// the recorded cost that a root server no longer serves foreign-fsGroup pods it
+// could genuinely have honored.
+//
+// allowedUID is the uid pods on this node actually EXECUTE as — see
+// provider.PodExecutionUID, which is where that question is answered. It is NOT
+// os.Geteuid() of the server: those coincide in the shipped unprivileged posture
+// and diverge under a root server, where passing 0 would name root as "the k3sm
+// pod identity" and admit only root.
 func EnsureNoForeignUserAdmission(ctx context.Context, cs kubernetes.Interface, allowedUID int64) error {
-	api := cs.AdmissionregistrationV1()
-
 	failFail := admissionregistrationv1.Fail
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   foreignUserPolicyName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
 			FailurePolicy: &failFail,
@@ -508,23 +513,23 @@ func EnsureNoForeignUserAdmission(ctx context.Context, cs kubernetes.Interface, 
 			}},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create foreign-user admission policy: %w", err)
+	if err := ensureValidatingAdmissionPolicy(ctx, cs, policy); err != nil {
+		return fmt.Errorf("foreign-user admission policy: %w", err)
 	}
 
 	deny := admissionregistrationv1.Deny
 	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   foreignUserBindingName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
 			PolicyName:        foreignUserPolicyName,
 			ValidationActions: []admissionregistrationv1.ValidationAction{deny},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create foreign-user admission binding: %w", err)
+	if err := ensureValidatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+		return fmt.Errorf("foreign-user admission binding: %w", err)
 	}
 	return nil
 }
@@ -534,7 +539,8 @@ func EnsureNoForeignUserAdmission(ctx context.Context, cs kubernetes.Interface, 
 // k3sm's userspace splice does NOT preserve the client source IP (only Cluster is
 // honored), so Local is silently downgraded to Cluster at the datapath; the policy
 // surfaces that divergence to kubectl WITHOUT rejecting the Service (the field
-// stays valid). Safe to call on every server start (AlreadyExists is success).
+// stays valid). Safe to call on every server start (create-or-update; an unchanged
+// spec is not rewritten).
 func EnsureExternalTrafficPolicyLocalWarn(ctx context.Context, cs kubernetes.Interface) error {
 	return ensureWarnPolicy(ctx, cs, etpLocalPolicyName, etpLocalBindingName, etpLocalExpr,
 		"k3sm: Service externalTrafficPolicy: Local is not honored — the userspace proxy does not preserve client source IP (only Cluster); the field is accepted but treated as Cluster",
@@ -546,7 +552,7 @@ func EnsureExternalTrafficPolicyLocalWarn(ctx context.Context, cs kubernetes.Int
 // yet (the proxy opens no UDP listener), so a UDP Service silently blackholes; the
 // policy says so at the API WITHOUT rejecting the Service (UDP support is a
 // deferred datapath addition, not an invalid request). Safe to call on every
-// server start (AlreadyExists is success).
+// server start (create-or-update; an unchanged spec is not rewritten).
 func EnsureUDPServiceWarn(ctx context.Context, cs kubernetes.Interface) error {
 	return ensureWarnPolicy(ctx, cs, udpServicePolicyName, udpServiceBindingName, udpServiceExpr,
 		"k3sm: UDP Service ports have no datapath yet — the proxy opens no UDP listener, so a UDP Service silently blackholes",
@@ -567,7 +573,8 @@ func EnsureUDPServiceWarn(ctx context.Context, cs kubernetes.Interface) error {
 // Deployment/Job/StatefulSet/etc. the Pod CREATE is issued by the
 // kube-controller-manager, so the HTTP-warning header lands on the KCM's API client,
 // not the user's kubectl. A bare `kubectl run`/`kubectl apply` of a Pod does surface
-// it. Safe to call on every server start (AlreadyExists is success).
+// it. Safe to call on every server start (create-or-update; an unchanged spec is
+// not rewritten).
 func EnsureProviderTolerationWarn(ctx context.Context, cs kubernetes.Interface) error {
 	msg := fmt.Sprintf("k3sm: pod has no toleration for the provider taint %[1]s:NoSchedule — "+
 		"the scheduler will leave it Unschedulable; add a toleration "+
@@ -589,13 +596,11 @@ func EnsureProviderTolerationWarn(ctx context.Context, cs kubernetes.Interface) 
 // warning into a hard failure. Ignore guarantees the advisory can only ever warn —
 // keeping that invariant here, in one place, stops it drifting to Fail per-callsite.
 func ensureWarnPolicy(ctx context.Context, cs kubernetes.Interface, policyName, bindingName, expr, message, resource string, ops ...admissionregistrationv1.OperationType) error {
-	api := cs.AdmissionregistrationV1()
-
 	ignore := admissionregistrationv1.Ignore
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   policyName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
 			FailurePolicy: &ignore,
@@ -617,23 +622,23 @@ func ensureWarnPolicy(ctx context.Context, cs kubernetes.Interface, policyName, 
 			}},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicies().Create(ctx, policy, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create warn policy %s: %w", policyName, err)
+	if err := ensureValidatingAdmissionPolicy(ctx, cs, policy); err != nil {
+		return fmt.Errorf("warn policy %s: %w", policyName, err)
 	}
 
 	warn := admissionregistrationv1.Warn
 	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   bindingName,
-			Labels: map[string]string{"k3sm.io/managed": "true"},
+			Labels: map[string]string{managedLabel: "true"},
 		},
 		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
 			PolicyName:        policyName,
 			ValidationActions: []admissionregistrationv1.ValidationAction{warn},
 		},
 	}
-	if _, err := api.ValidatingAdmissionPolicyBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create warn binding %s: %w", bindingName, err)
+	if err := ensureValidatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+		return fmt.Errorf("warn binding %s: %w", bindingName, err)
 	}
 	return nil
 }

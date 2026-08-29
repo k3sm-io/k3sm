@@ -49,7 +49,7 @@ along **two orthogonal root axes** (do not conflate them):
 | Tier | Bring-up | sudo? | Root axis it exercises |
 |---|---|---|---|
 | **T0 rootless** | `k3sm dev up` (`runtimed` + `network=none`) | no | none — Seatbelt self-confines (`sandbox_apply` on the shim's own process); the control-plane, pod-lifecycle, mounts/env/probes, graceful-stop, `DenyUsers`, RBAC, and audit/PSA surfaces all run here |
-| **T1 root** | `sudo k3sm dev up --datapath` (`runtimed` + `network=direct`) | yes | the **datapath** (a lo0 `/32` alias, or a `<1024` VIP bind) and the **uid-drop** (setuid for a foreign `runAsUser`/`fsGroup`) |
+| **T1 root** | `sudo k3sm dev up --datapath` (`runtimed` + `network=direct`) | yes | the **datapath** (a lo0 `/32` alias, or a `<1024` VIP bind). The **uid-drop** axis (setuid for a foreign `runAsUser`/`fsGroup`) is real but currently claimed by no criterion — see below |
 
 Two root reasons appear in `criteria.env`:
 
@@ -59,17 +59,27 @@ Two root reasons appear in `criteria.env`:
   reason is its **backend pod's** `lo0-alias`, not `lt1024-bind`.
 - **uid-drop** — `setuid-uid-drop`: setuid to a foreign uid, root-only **even
   with the netd helper installed**. Seatbelt self-confinement needs **neither**,
-  so `DenyUsers`/profile-integrity is a **rootless** (T0) criterion.
+  so `DenyUsers`/profile-integrity is a **rootless** (T0) criterion. **No
+  criterion carries this reason today**: since B153 the `k3sm-reject-foreign-user`
+  ValidatingAdmissionPolicy is provisioned in every posture, so a pod asking for a
+  foreign uid/gid is refused at the API and never reaches a `setuid`.
 
 `M2` criteria were originally validated under the `install`/helper topology; the
-SIT runs them under `direct`, which is the same pod-view (real pod IPs, real
-ClusterIP) — T1 is the full-posture run.
+SIT runs them under `direct`, which gives the same **datapath** pod-view (real pod
+IPs, real ClusterIP) — T1 is the full-posture run.
+
+The two topologies were **not** the same for **admission**, and that gap is what
+hid B153: the `k3sm-reject-foreign-user` policy was provisioned only under the
+helper backend, so `none` (T0) and `direct` (T1) ran with the object absent and
+`M2_FsGroup` was red on real hardware for a reason no criterion field expressed.
+It is now provisioned in every posture, which is why that criterion is `rootless`
+— an admission rejection needs no root and no datapath.
 
 ## Running it
 
 ```sh
 hack/sit/run.sh          # T0 only (rootless) — CRD/reconcile/isolation surface
-sudo hack/sit/run.sh     # T0 + T1 (adds the datapath + uid-drop criteria)
+sudo hack/sit/run.sh     # T0 + T1 (adds the datapath criteria)
 ```
 
 `run.sh` traps `k3sm dev down --all` on exit and prints a **reclaim-state line**

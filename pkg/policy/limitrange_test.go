@@ -31,7 +31,8 @@ import (
 // with memory defaults present, carries NO cpu key under ANY field (default/
 // defaultRequest/max/min/maxLimitRequestRatio — CPU is best-effort on Darwin,
 // so a CPU row would over-claim a guarantee k3sm cannot keep), and is
-// create-if-absent (a pre-existing, operator-tuned object is NEVER updated).
+// create-or-update (a pre-existing object is reconciled onto the shipped defaults
+// — B153; see the sub-test for why that contract was reversed).
 func TestDefaultLimitRangeMemoryOnly(t *testing.T) {
 	ctx := context.Background()
 
@@ -80,7 +81,13 @@ func TestDefaultLimitRangeMemoryOnly(t *testing.T) {
 		}
 	})
 
-	t.Run("create-if-absent: a pre-existing object is never updated", func(t *testing.T) {
+	// B153 REVERSED this sub-test's contract. It used to assert create-if-absent
+	// ("in-cluster objects are operator-space — never update"), which is the same
+	// create-only path that made a changed admission policy inert on every existing
+	// cluster. An object carrying k3sm.io/managed is k3sm-owned, so it is now
+	// reconciled; an operator wanting different defaults adds their own LimitRange
+	// (the LimitRanger plugin applies every LimitRange in the namespace).
+	t.Run("create-or-update: a pre-existing object is reconciled onto the shipped defaults", func(t *testing.T) {
 		cs := fake.NewClientset()
 		tuned := &corev1.LimitRange{
 			ObjectMeta: metav1.ObjectMeta{Name: defaultLimitRangeName, Namespace: "default"},
@@ -88,7 +95,7 @@ func TestDefaultLimitRangeMemoryOnly(t *testing.T) {
 				Limits: []corev1.LimitRangeItem{{
 					Type: corev1.LimitTypeContainer,
 					Default: corev1.ResourceList{
-						corev1.ResourceMemory: resource.MustParse("2Gi"), // operator-tuned marker
+						corev1.ResourceMemory: resource.MustParse("2Gi"), // stale/hand-edited marker
 					},
 				}},
 			},
@@ -98,14 +105,17 @@ func TestDefaultLimitRangeMemoryOnly(t *testing.T) {
 		}
 
 		if err := EnsureDefaultLimitRange(ctx, cs); err != nil {
-			t.Fatalf("EnsureDefaultLimitRange with pre-existing object: %v (AlreadyExists must be success)", err)
+			t.Fatalf("EnsureDefaultLimitRange with pre-existing object: %v", err)
 		}
 		got, err := cs.CoreV1().LimitRanges("default").Get(ctx, defaultLimitRangeName, metav1.GetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if mem, want := got.Spec.Limits[0].Default[corev1.ResourceMemory], resource.MustParse("2Gi"); mem.Cmp(want) != 0 {
-			t.Errorf("operator-tuned default.memory = %s, want the untouched 2Gi (in-cluster objects are operator-space — never update)", mem.String())
+		if mem, want := got.Spec.Limits[0].Default[corev1.ResourceMemory], resource.MustParse(defaultMemoryLimit); mem.Cmp(want) != 0 {
+			t.Errorf("default.memory = %s, want the shipped %s (a k3sm-managed object is reconciled, not frozen at its first shape)", mem.String(), want.String())
+		}
+		if _, ok := got.Spec.Limits[0].DefaultRequest[corev1.ResourceMemory]; !ok {
+			t.Error("defaultRequest.memory is missing: the reconcile must land the WHOLE shipped spec, not patch one key")
 		}
 	})
 }

@@ -21,7 +21,6 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -53,16 +52,22 @@ const (
 // k3sm cannot keep — NO cpu key appears under ANY field (default,
 // defaultRequest, max, min, maxLimitRequestRatio).
 //
-// CREATE-IF-ABSENT, never update: unlike the binary-space config files the
-// executor overwrites on boot, an in-cluster LimitRange is OPERATOR-space — an
-// admin who tuned the values must not have them clobbered on the next server
-// start. AlreadyExists is success. Safe to call on every server start.
+// CREATE-OR-UPDATE (managedObject.ensure), like every sibling Ensure* here. The
+// earlier contract was create-if-absent, on the reasoning that an in-cluster
+// LimitRange is operator-space; that is REVERSED deliberately (B153), because the
+// same create-only path is what made a changed policy inert on every existing
+// cluster — an object carrying the k3sm.io/managed label is k3sm-owned, and a
+// silently stale default is worse than a clobbered tuning. An operator who wants
+// different defaults adds their OWN LimitRange (the LimitRanger plugin applies
+// every LimitRange in the namespace) rather than editing this one. A spec that
+// already matches is left completely untouched, so a restart is not a write.
+// Safe to call on every server start.
 func EnsureDefaultLimitRange(ctx context.Context, cs kubernetes.Interface) error {
 	lr := &corev1.LimitRange{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      defaultLimitRangeName,
 			Namespace: defaultLimitRangeNamespace,
-			Labels:    map[string]string{"k3sm.io/managed": "true"},
+			Labels:    map[string]string{managedLabel: "true"},
 		},
 		Spec: corev1.LimitRangeSpec{
 			Limits: []corev1.LimitRangeItem{{
@@ -76,8 +81,8 @@ func EnsureDefaultLimitRange(ctx context.Context, cs kubernetes.Interface) error
 			}},
 		},
 	}
-	if _, err := cs.CoreV1().LimitRanges(defaultLimitRangeNamespace).Create(ctx, lr, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create default memory limitrange: %w", err)
+	if err := ensureLimitRange(ctx, cs, lr); err != nil {
+		return fmt.Errorf("default memory limitrange: %w", err)
 	}
 	return nil
 }
