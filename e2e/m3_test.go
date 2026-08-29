@@ -229,10 +229,25 @@ func TestM3_InPodKubectlAndDNSOnWorker(t *testing.T) {
 
 // --- M3 helpers ---------------------------------------------------------------
 
+// markerLogTimeout bounds the wait for a started pod's FIRST stdout line to reach
+// the logs endpoint. The wait is required, not defensive: Running means the
+// provider spawned the process, and the process's own first write lands after
+// that edge — measured on a COLD `k3sm dev --datapath` instance at ~1.25s (pod
+// Running at t=1.25s, MARKER= readable at t=2.5s), and at ~0 on a warm one. A
+// single read at the Running edge therefore fails on exactly the run the SIT
+// makes: the first pod after a fresh boot. It does not weaken the criterion —
+// the marker must still appear, and the two reads must still agree.
+const markerLogTimeout = 60 * time.Second
+
 // markerFromLogs returns the MARKER= value the StatefulSet pod logs on start.
 func markerFromLogs(t *testing.T, c *Cluster, ns, name string) string {
 	t.Helper()
-	return parseKV(podLogs(t, c, ns, name))["MARKER"]
+	var marker string
+	pollUntil(markerLogTimeout, func() bool {
+		marker = parseKV(podLogs(t, c, ns, name))["MARKER"]
+		return marker != ""
+	})
+	return marker
 }
 
 // waitPodRecreatedRunning blocks until ns/name exists again with a UID different
