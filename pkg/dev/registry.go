@@ -57,6 +57,12 @@ type Instance struct {
 	Name string `json:"name"`
 	// WorkDir is the control-plane state root the detached `k3sm server` owns.
 	WorkDir string `json:"workDir"`
+	// PodRoot is the runtimed root the detached server was given (--pod-root):
+	// pod dirs, the image blob cache and the PVC storage root. It lives OUTSIDE
+	// the registry root (see PodRootBasePrefix), so unlike WorkDir it is not
+	// reclaimed by Remove — teardown deletes it explicitly. Empty on a manifest
+	// written before the split, which read the root from the work-dir parent.
+	PodRoot string `json:"podRoot"`
 	// APIPort / KinePort are the probe-allocated ports (so parallel rootless
 	// instances never collide).
 	APIPort  int `json:"apiPort"`
