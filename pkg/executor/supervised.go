@@ -276,17 +276,31 @@ func (s *Supervised) provisionComponentCerts() error {
 	return nil
 }
 
+// componentReadyTimeout bounds each component's bring-up wait — the same budget
+// the datastore gets, since all of them are local child processes that either
+// bind within a second or are never going to.
+const componentReadyTimeout = 30 * time.Second
+
 // bringUp starts the components in order and waits for the apiserver to be
 // healthy before starting scheduler + controller-manager. Each bring-up wait
 // SELECTS on child-exit as well as readiness (M10.0, SRE fail-fast): a kine or
 // apiserver that dies on a bad flag/config surfaces immediately — with its log
 // tail — instead of wedging opaquely until the healthz timeout.
+//
+// The scheduler and the controller-manager get that same wait, and they need it
+// for a reason the earlier components did not have: they were previously started
+// FIRE-AND-FORGET, so a component that died on its own secure-port bind left
+// bring-up reporting success and the failure surfaced far downstream as something
+// else entirely — a control plane with no service-account controller fails at the
+// first namespace bootstrap, which reads as a bootstrap defect and not as a dead
+// KCM. Waiting on the listener each one owns puts the error back where the fault
+// is, with that component's name and log tail.
 func (s *Supervised) bringUp(ctx context.Context) error {
 	kine, err := s.startKine(ctx)
 	if err != nil {
 		return fmt.Errorf("start kine: %w", err)
 	}
-	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
+	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
 	// kine is serving, so this pin has now genuinely opened this database — stamp it,
@@ -304,11 +318,36 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := s.waitHealthz(ctx, api); err != nil {
 		return fmt.Errorf("apiserver not healthy: %w", err)
 	}
-	if _, err := s.startScheduler(ctx); err != nil {
-		return fmt.Errorf("start scheduler: %w", err)
+	if err := s.startAndAwaitListening(ctx, "scheduler", s.startScheduler, s.cfg.SchedulerPort); err != nil {
+		return err
 	}
-	if _, err := s.startControllerManager(ctx); err != nil {
-		return fmt.Errorf("start controller-manager: %w", err)
+	if err := s.startAndAwaitListening(ctx, "controller-manager", s.startControllerManager, s.cfg.ControllerManagerPort); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startAndAwaitListening starts a component and does not return until its own
+// loopback secure port accepts a connection — or until the child exits, which
+// takes priority and carries that component's name and log tail.
+//
+// The port is what this component can lose to another control plane on the same
+// Mac, so it is guarded from both sides: refused before the spawn if someone else
+// already holds it, and waited on after, which is what turns every other cause of
+// an early death into an error naming the component that had it.
+func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, start func(context.Context) (*component, error), port int) error {
+	// Fail closed BEFORE the spawn if the port is already held: the wait below
+	// would be satisfied by the incumbent's listener, so a component that lost
+	// its bind would leave bring-up reporting success (see preflightComponentPort).
+	if err := preflightComponentPort(ctx, name, port); err != nil {
+		return err
+	}
+	c, err := start(ctx)
+	if err != nil {
+		return fmt.Errorf("start %s: %w", name, err)
+	}
+	if err := awaitHealthy(ctx, c.name, c.exited, c.exitedNow, tcpReady(port), componentReadyTimeout, 300*time.Millisecond, c.exitDetail); err != nil {
+		return fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err)
 	}
 	return nil
 }
