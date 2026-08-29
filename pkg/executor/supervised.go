@@ -94,7 +94,7 @@ type component struct {
 // log file, so the operator sees the fatal flag/config error immediately
 // instead of an opaque healthz timeout. Call only after <-c.exited.
 func (c *component) exitDetail() string {
-	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, tailFile(c.logPath, exitLogTailLines))
+	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, LogTail(c.logPath, exitLogTailLines))
 }
 
 // exitedNow reports whether the child has left the RUNNING state, asked of the
@@ -289,13 +289,13 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
-	// kine is serving, so this pin has now genuinely opened this database — stamp it.
-	// Stamping here (not at provision time) is what makes the pre-migration snapshot
-	// survive a boot that dies before the datastore ever came up.
-	if s.cfg.DatastoreEndpoint == "" {
-		if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
-			return err
-		}
+	// kine is serving, so this pin has now genuinely opened this database — stamp it,
+	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
+	// provision time) is what makes the pre-migration snapshot survive a boot that dies
+	// before the datastore ever came up; recordKinePin itself skips the external-
+	// datastore posture.
+	if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint); err != nil {
+		return err
 	}
 	api, err := s.startAPIServer(ctx)
 	if err != nil {
@@ -699,9 +699,12 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exit
 	}
 }
 
-// tailFile returns the last n lines of the file at path (best-effort: an
+// LogTail returns the last n lines of the file at path (best-effort: an
 // unreadable file yields a placeholder so the caller's error stays actionable).
-func tailFile(path string, n int) string {
+// Exported because a bring-up that times out OUTSIDE this package — `k3sm dev`
+// waiting on a detached server it spawned — owes its operator the same evidence
+// this package's own fail-fast errors carry, and there should be one tail.
+func LogTail(path string, n int) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("<unreadable log: %v>", err)

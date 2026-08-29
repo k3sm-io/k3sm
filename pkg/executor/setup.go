@@ -300,15 +300,12 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	}
 	defer func() { _ = os.RemoveAll(gopath) }()
 
-	cmd := exec.CommandContext(ctx, "go", "install", "github.com/k3s-io/kine@"+kineVersion)
-	// CGO_ENABLED=0 selects kine's pure-Go SQLite backend (modernc.org/sqlite, behind
-	// //go:build !cgo). It is a real, supported kine variant on the pinned version —
-	// not the SQLite-disabled stub the M0 spike measured on the old pin — and it is
-	// what keeps the unmaintained mattn/go-sqlite3 (and a C toolchain) out of every
-	// k3sm artifact. GOBIN is cleared (not just unset in our env) so an ambient GOBIN
-	// cannot re-trigger the cross-compile refusal above.
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	// The scratch GOPATH is thrown away with the build; the MODULE CACHE must not be.
+	modCache, err := kineModuleCacheDir(ctx)
+	if err != nil {
+		return err
+	}
+	if out, err := runKineBuild(ctx, kineVersion, gopath, modCache); err != nil {
 		return fmt.Errorf("build kine %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
 			kineVersion, err, out)
 	}
@@ -337,6 +334,74 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	}
 	// LAST: the marker vouches for a staged, signed binary.
 	return writeKineMarker(bd, kineVersion)
+}
+
+// kineBuildEnv is the environment the pinned kine `go install` runs under.
+//
+// CGO_ENABLED=0 selects kine's pure-Go SQLite backend (modernc.org/sqlite, behind
+// //go:build !cgo). It is a real, supported kine variant on the pinned version — not
+// the SQLite-disabled stub the M0 spike measured on the old pin — and it is what keeps
+// the unmaintained mattn/go-sqlite3 (and a C toolchain) out of every k3sm artifact.
+// GOBIN is cleared (not just unset in our env) so an ambient GOBIN cannot re-trigger
+// the cross-compile refusal ensureKineInto documents.
+//
+// GOMODCACHE is pinned AWAY from the scratch GOPATH, and that pin is the load-bearing
+// part: a module cache left to derive from GOPATH lands inside the per-build temp dir,
+// so kine's whole dependency tree is downloaded and then deleted with it on EVERY
+// boot — a per-boot network round trip long enough to outlast a bring-up deadline,
+// masquerading as a one-time cold-cache cost. Pinned, the pin's modules are fetched
+// once per machine and every later boot builds offline from the warmed cache.
+func kineBuildEnv(gopath, modCache string) []string {
+	return append(os.Environ(),
+		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
+}
+
+// kineModuleCacheDir resolves the stable module cache the kine build downloads into,
+// and runKineBuild runs the build itself. Both are vars so a test can assert the build
+// environment and the cache's reuse across builds without fetching anything.
+var (
+	kineModuleCacheDir = hostGoModCache
+	runKineBuild       = goInstallKine
+)
+
+// hostGoModCache returns the HOST TOOLCHAIN's own module cache (`go env GOMODCACHE`,
+// which already honours an ambient GOMODCACHE or GOPATH).
+//
+// The host cache is chosen over a k3sm-private one deliberately: this code path only
+// runs where a Go toolchain exists (a packaged install seeds kine from its staged
+// payload and never builds), the host cache is shared by every work dir and every dev
+// instance — so a pin is fetched once per machine rather than once per instance — and a
+// `go mod download` warm-up then actually counts for the boot that follows. The
+// fallback covers a toolchain reporting no cache at all; it gives up the sharing but
+// keeps the property that matters, which is that the path is the same on the next boot.
+func hostGoModCache(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, "go", "env", "GOMODCACHE").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve the Go module cache (go env GOMODCACHE): %w", err)
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		base, cerr := os.UserCacheDir()
+		if cerr != nil {
+			return "", fmt.Errorf("resolve a stable Go module cache: %w", cerr)
+		}
+		dir = filepath.Join(base, "k3sm", "gomodcache")
+	}
+	// Created here rather than left to the toolchain so an unwritable cache fails with
+	// the path named instead of inside a `go install` diagnostic.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create Go module cache %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+// goInstallKine runs `go install github.com/k3s-io/kine@<version>` into the scratch
+// GOPATH's bin, downloading through the stable module cache. It returns the combined
+// output so a failure carries the toolchain's own diagnostic.
+func goInstallKine(ctx context.Context, version, gopath, modCache string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "go", "install", "github.com/k3s-io/kine@"+version)
+	cmd.Env = kineBuildEnv(gopath, modCache)
+	return cmd.CombinedOutput()
 }
 
 // copyFile copies src to dst with the given mode, replacing dst if present.
