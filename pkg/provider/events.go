@@ -40,6 +40,11 @@ const (
 	reasonKilling = "Killing" // container process is being stopped (DeletePod)
 	reasonFailed  = "Failed"  // container process failed to start
 	reasonBackOff = "BackOff" // container re-exec is throttled by CrashLoopBackOff
+	// reasonFailedPostStartHook is recorded when a container's postStart hook
+	// returns an error — upstream's `FailedPostStartHook`, the event that makes a
+	// hook failure visible in `kubectl describe pod` before the container is
+	// killed per its restart policy.
+	reasonFailedPostStartHook = "FailedPostStartHook"
 )
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec
@@ -50,6 +55,17 @@ const (
 func msgBackOffRestarting(container string, pod *corev1.Pod) string {
 	return fmt.Sprintf("Back-off restarting failed container %s in pod %s_%s(%s)",
 		container, pod.Name, pod.Namespace, pod.UID)
+}
+
+// msgFailedPostStartHook is the FailedPostStartHook-event message. It carries NO
+// handler output or error text: upstream withholds it deliberately ("do not record
+// the message in the event so that secrets won't leak from the server") and Events
+// flow to a namespace-readable sink here too — the concrete error stays in the node
+// log. Upstream identifies the container through the Event's fieldPath; this
+// provider's involved object is the Pod (see the reason block above), so the
+// container name moves into the message.
+func msgFailedPostStartHook(container string) string {
+	return "PostStartHook failed for container " + container
 }
 
 // msgImageAlreadyPresent is the Pulled-event message. M0 treats the image

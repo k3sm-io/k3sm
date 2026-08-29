@@ -149,6 +149,14 @@ type podTrack struct {
 	// restartMu, never the reverse.
 	restartMu sync.Mutex
 	restarts  map[string]*containerRestart // container name -> restart bookkeeping
+
+	// hookMu guards postStart — the per-container postStart hook bookkeeping of
+	// the B39 fidelity path (poststart.go): the pending/failed readiness gate the
+	// status overlay reads, and the pod-scoped cancel of each in-flight hook.
+	// Separate from r.mu for the same reason as readyMu (buildStatus runs outside
+	// r.mu); it is never held together with r.mu or restartMu.
+	hookMu    sync.Mutex
+	postStart map[string]*postStartHook // container name -> postStart bookkeeping
 }
 
 // RuntimedConfig configures a runtimedRuntime.
@@ -723,13 +731,16 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if old != nil {
 		start = old.startTime // idempotent: keep the original start time
 	}
-	r.track[id] = &podTrack{pod: pod.DeepCopy(), startTime: start}
+	t := &podTrack{pod: pod.DeepCopy(), startTime: start}
+	r.track[id] = t
 	r.mu.Unlock()
 	if old != nil {
 		// The replaced track's pending re-execs must not fire against the new
 		// track's bookkeeping (their goroutines would clear nothing and could
-		// double-restart a container the fresh CreatePod just spawned).
+		// double-restart a container the fresh CreatePod just spawned), and its
+		// in-flight postStart hooks belong to the containers being replaced.
 		old.cancelRestarts()
+		old.cancelPostStart()
 	}
 
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
@@ -746,10 +757,11 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// kubelet, so it must execute the pod's probes itself. No-op for a probe-free
 	// pod; idempotent for a repeated CreatePod.
 	r.startProber(pod, resp.GetStatus().GetPodIp())
-	// Dispatch each container's postStart hook (B10). Fire-and-forget in a bounded
-	// goroutine so CreatePod and the reconcile loop never block on it; a failure is
-	// logged (readiness-gating + terminal-fail fidelity is deferred to B39).
-	r.runPostStart(pod, resp.GetStatus().GetPodIp())
+	// Dispatch each container's postStart hook (B10 + the B39 fidelity: the
+	// container is held NotReady until the hook completes, a failure kills it per
+	// its restart policy, and the hook's lifetime is the pod's). Each hook runs in
+	// its own goroutine so CreatePod and the reconcile loop never block on it.
+	r.runPostStart(t, pod, resp.GetStatus().GetPodIp())
 	r.dispatch(id, resp.GetStatus())
 	return nil
 }
@@ -795,6 +807,12 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 // wall-time (floored at 1s), since runtimed treats a 0 grace as immediate-kill (M2.3).
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
+	// Cancel any in-flight postStart hook FIRST (B39): a hook must not outlive the
+	// pod, and termination must not wait on one — upstream tears the pod worker's
+	// context down on delete, which aborts a running hook.
+	if t := r.trackByID(id); t != nil {
+		t.cancelPostStart()
+	}
 	// Serve preStop hooks BEFORE termination (B10): runtimed sends SIGTERM
 	// synchronously inside DeletePod, so the provider runs preStop first and passes
 	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at 1s).
@@ -911,7 +929,9 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // publish) flows through here, so observeExits sees each container termination
 // regardless of which path delivered it (idempotent per termination), and
 // applyRestartOverlay renders the CrashLoopBackOff surface + Running phase hold
-// on every published status while a re-exec is pending.
+// on every published status while a re-exec is pending. B39's postStart readiness
+// gate rides the same convergence, so no publish path can leak a Ready container
+// whose postStart hook has not completed.
 func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
 	r.observeExits(pod, t, rs)
 	t.readyMu.Lock()
@@ -925,6 +945,10 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	}
 	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps)
 	r.applyRestartOverlay(pod, t, st)
+	// LAST, so its readiness re-derivation sees every other overlay's verdict: a
+	// container whose postStart has not completed is NotReady, and the pod's
+	// ContainersReady/PodReady follow (B39).
+	r.applyPostStartOverlay(pod, t, st)
 	if c := findPodCondition(st.Conditions, corev1.PodReady); c != nil {
 		t.readyMu.Lock()
 		t.lastReady = *c

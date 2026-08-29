@@ -36,6 +36,9 @@ import (
 // and re-execs the container in place through the existing RestartContainer
 // RPC — the same runtime action the liveness-probe path drives.
 //
+// Three triggers, one authority: an observed exit (observeExits), a committed
+// liveness failure and a failed postStart hook (both via killAndRestart, B39).
+//
 // Idempotency (BINDING): the trigger is keyed per container on the
 // termination's identity — terminationKey{restart_count, exit code,
 // FinishedAt} — inside the podTrack, so a stream+backstop double-delivery of
@@ -69,8 +72,9 @@ const reasonCrashLoopBackOff = "CrashLoopBackOff"
 // reason is the only thing that distinguishes them, and runtimed records it in
 // the replacement container's last_termination_state.
 const (
-	restartReasonBackOff  = "back-off restarting failed container"
-	restartReasonLiveness = "liveness probe failed"
+	restartReasonBackOff   = "back-off restarting failed container"
+	restartReasonLiveness  = "liveness probe failed"
+	restartReasonPostStart = "post-start hook failed"
 )
 
 // terminationKey identifies ONE observed container termination: runtimed's
@@ -336,7 +340,7 @@ func (r *runtimedRuntime) scheduleRestartLocked(t *podTrack, podID, name string,
 	r.startRestartWorkerLocked(t, cr, podID, name, restartReasonBackOff, cr.delay)
 }
 
-// restartForLiveness is the LIVENESS half of the single restart authority: the
+// restartForLiveness is the LIVENESS trigger of the single restart authority: the
 // podProber's restartFunc seam (probe.go) routes here instead of calling
 // RestartContainer directly, so a committed liveness failure and an observed
 // exit share ONE containerRestart entry — one restart window, one backoff
@@ -344,18 +348,32 @@ func (r *runtimedRuntime) scheduleRestartLocked(t *podTrack, podID, name string,
 // B26 the probe path bypassed all of it, so a liveness restart was invisible to
 // the exit-driven bookkeeping and could race a second RestartContainer against it.
 //
-// Backoff parity with the kubelet: a container that is NOT already crash-looping
-// is restarted AT ONCE (upstream kills a failed-liveness container immediately;
-// only a container already in the backoff window is throttled), but the shared
-// schedule advances either way, so the NEXT restart of this container — from
-// either trigger — is throttled correctly.
-//
 // ctx is the probe tick's context and is deliberately NOT propagated: the re-exec
 // worker's lifetime is the POD's (cancelled by cancelRestarts), not one probe
-// tick's. It returns an error only when the pod is untracked; a restart already
-// in flight is a successful no-op.
+// tick's. The decision itself is killAndRestart, shared with the postStart-failure
+// trigger.
 func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, container string) error {
 	_ = ctx // see the doc comment: the worker is pod-scoped, not tick-scoped
+	return r.killAndRestart(podID, container, restartReasonLiveness)
+}
+
+// killAndRestart is the KILL-A-LIVE-CONTAINER arm of the single restart authority,
+// shared by the two triggers that decide a running container must go: a committed
+// liveness failure and a failed postStart hook (B39 — upstream kills the container
+// and lets its restart policy restart it). Both are "terminate, then re-spawn",
+// which is exactly the RestartContainer RPC, and both must share ONE
+// containerRestart entry so there is one restart window, one backoff schedule and
+// one surfaced restartCount.
+//
+// Backoff parity with the kubelet: a container that is NOT already crash-looping is
+// restarted AT ONCE (upstream kills such a container immediately; only a container
+// already inside the backoff window is throttled), but the shared schedule advances
+// either way, so the NEXT restart of this container — from any trigger — is
+// throttled correctly.
+//
+// It returns an error only when the pod is untracked; a restart already in flight is
+// a successful no-op.
+func (r *runtimedRuntime) killAndRestart(podID, container, reason string) error {
 	t := r.trackByID(podID)
 	if t == nil {
 		return fmt.Errorf("restart container %s/%s: pod is not tracked", podID, container)
@@ -369,9 +387,9 @@ func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, contain
 	hot := cr.backoff.Hot()
 	cr.delay = cr.backoff.Next()
 	if !hot {
-		cr.delay = 0 // kubelet parity: an idle container's liveness kill is immediate
+		cr.delay = 0 // kubelet parity: an idle container's kill is immediate
 	}
-	r.startRestartWorkerLocked(t, cr, podID, container, restartReasonLiveness, cr.delay)
+	r.startRestartWorkerLocked(t, cr, podID, container, reason, cr.delay)
 	return nil
 }
 
@@ -411,10 +429,11 @@ func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRes
 // reschedule. Upstream's CrashLoopBackOff is by definition an unbounded retry
 // loop, so the worker — not the observer — owns the retry.
 //
-// It returns once the RPC succeeds; the restart WINDOW stays open until the
-// container is observed running (observeExits → observeRunning), which is what
-// keeps the CrashLoopBackOff surface and the Running phase hold stable across
-// the swap.
+// It returns once the RPC succeeds — after re-dispatching the container's postStart
+// hook, which upstream runs on every container START (B39). The restart WINDOW stays
+// open until the container is observed running (observeExits → observeRunning),
+// which is what keeps the CrashLoopBackOff surface and the Running phase hold stable
+// across the swap.
 //
 // The Warning BackOff Event is emitted ONLY when the attempt actually waited
 // (delay > 0). A liveness kill on a container that is not already looping is
@@ -437,6 +456,10 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		}
 		err := r.restartContainerReason(ctx, podID, name, reason)
 		if err == nil {
+			// The container has been STARTED again, so its postStart hook fires
+			// again (B39): upstream runs the hook inside startContainer, which is
+			// the same path a restart takes.
+			r.rerunPostStart(t, podID, name)
 			return
 		}
 		if ctx.Err() != nil {
