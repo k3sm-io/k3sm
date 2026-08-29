@@ -22,8 +22,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -47,10 +45,10 @@ const defaultPodCIDR = "100.64.0.0/24"
 type Config struct {
 	// Client is the cluster client the Service/EndpointSlice watcher uses.
 	Client kubernetes.Interface
-	// WorkDir is where the rendered Corefile is written.
+	// WorkDir is the server's on-disk state directory.
 	WorkDir string
 	// DNSVIP is the cluster DNS VIP the in-process resolver binds and pods resolve
-	// against (the rendered Corefile is the unconsumed native-CoreDNS export).
+	// against.
 	DNSVIP string
 	// ClusterDomain is the cluster DNS domain (e.g. cluster.local).
 	ClusterDomain string
@@ -96,9 +94,9 @@ type Config struct {
 	// run-as-root mode). It is the single construction-time backend selection — set
 	// it from hostnet.Mode.Socket.
 	NetdSocket string
-	// Disabled, when true, runs NO Service-proxy datapath: Run writes the Corefile
-	// (DNS config artifact) and then blocks until ctx, but never starts the proxy
-	// or its Service/EndpointSlice watcher, so no lo0 VIP plumbing is attempted.
+	// Disabled, when true, runs NO Service-proxy datapath: Run blocks until ctx
+	// without ever starting the proxy or its Service/EndpointSlice watcher, so no
+	// lo0 VIP plumbing is attempted.
 	// It is the netserve side of `--network none` (control-plane-only / CI), set
 	// from !hostnet.Mode.DataPath() — an explicit backend, not a silent fallback.
 	Disabled bool
@@ -233,16 +231,12 @@ func staticAPIServerBackends(endpoint string) (map[string][]netv1.Endpoint, erro
 	}, nil
 }
 
-// Run renders the (currently unconsumed) CoreDNS Corefile to the workdir, then runs the Service proxy
-// and its watcher until ctx is cancelled. Both the proxy's worker-supervision
-// loop and the watcher's informers honor ctx; Run returns when they stop. When
-// the Config is Disabled (`--network none`), it writes the Corefile and blocks
-// until ctx WITHOUT starting the proxy/watcher (no lo0 VIP plumbing attempted).
+// Run runs the Service proxy and its watcher until ctx is cancelled. Both the
+// proxy's worker-supervision loop and the watcher's informers honor ctx; Run
+// returns when they stop. When the Config is Disabled (`--network none`), it
+// blocks until ctx WITHOUT starting the proxy/watcher (no lo0 VIP plumbing
+// attempted).
 func (s *Server) Run(ctx context.Context) error {
-	if err := s.writeCorefile(); err != nil {
-		s.log.Error("write corefile", "err", err)
-	}
-
 	if s.cfg.Disabled {
 		s.log.Info("network datapath disabled (--network none): control-plane-only, no Service proxy")
 		<-ctx.Done()
@@ -432,36 +426,10 @@ func (s *Server) bindDNSVIPOnce(ctx context.Context, ap netip.AddrPort) (net.Pac
 	return udp, tcp, nil
 }
 
-// CorefilePath is where Run writes the rendered CoreDNS configuration (an
-// unconsumed native-CoreDNS export — the in-process resolver, not a CoreDNS
-// binary, serves cluster DNS today; see doc.go).
-func (s *Server) CorefilePath() string {
-	return filepath.Join(s.cfg.WorkDir, "Corefile")
-}
-
 // PodDNSConfig returns the netv1.DNSConfig a pod in namespace should receive (the
 // cluster DNS VIP + domain + the standard search list with default ndots) — the
 // data the getaddrinfo shim is initialized with. It is darwin-net's PodDNSConfig,
 // not a reimplementation.
 func (s *Server) PodDNSConfig(namespace string) netv1.DNSConfig {
 	return dns.PodDNSConfig(s.cfg.DNSVIP, s.cfg.ClusterDomain, namespace)
-}
-
-// writeCorefile renders the CoreDNS configuration (bound to the DNS VIP, serving
-// the cluster domain) and writes it to the workdir as the native-CoreDNS export.
-// NOTE: nothing currently loads it — the in-process resolver (resolver.go) serves
-// cluster DNS; the Corefile is kept for the deferred native-CoreDNS follow-up.
-func (s *Server) writeCorefile() error {
-	opts := dns.CorefileOptions{
-		ClusterDomain: s.cfg.ClusterDomain,
-		BindIP:        s.cfg.DNSVIP,
-		Port:          dns.DefaultDNSPort,
-	}
-	if err := os.MkdirAll(s.cfg.WorkDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir workdir: %w", err)
-	}
-	if err := os.WriteFile(s.CorefilePath(), []byte(opts.Corefile()), 0o644); err != nil {
-		return fmt.Errorf("write corefile: %w", err)
-	}
-	return nil
 }

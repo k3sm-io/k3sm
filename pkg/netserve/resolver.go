@@ -147,8 +147,7 @@ type dnsForwarder interface {
 // # Divergence from CoreDNS-the-binary (deliberate, documented)
 //
 // k3sm does NOT run CoreDNS-the-binary nor embed CoreDNS-the-library here. darwin-net
-// supplies only the Corefile RENDERING (dns.CorefileOptions, for an external CoreDNS
-// deployment) and a client-side dns.Resolver — there is no embeddable DNS server
+// supplies only a client-side dns.Resolver — there is no embeddable DNS server
 // seam. CoreDNS-the-binary cannot inherit the netd-helper-passed socket fd under
 // launchd (no socket activation), and the unprivileged _k3sm posture binds the
 // <1024 DNS VIP only via that helper fd; embedding CoreDNS-the-library (which owns

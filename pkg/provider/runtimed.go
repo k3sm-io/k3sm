@@ -177,9 +177,10 @@ type RuntimedConfig struct {
 	ResolverVIP string
 	// ClusterDomain is the cluster DNS suffix (e.g. "cluster.local") buildBox feeds
 	// dns.PodDNSConfig to build the in-pod shim search list. It MUST match the served
-	// zone the per-node resolver answers for (the same --cluster-domain the CoreDNS
-	// Corefile binds): a mismatch makes every unqualified Service lookup NXDOMAIN.
-	// Empty defaults to dns.DefaultClusterDomain ("cluster.local", darwin-net) inside PodDNSConfig.
+	// zone the per-node resolver answers for (the same --cluster-domain the
+	// resolver is started with): a mismatch makes every unqualified Service lookup
+	// NXDOMAIN. Empty defaults to dns.DefaultClusterDomain ("cluster.local",
+	// darwin-net) inside PodDNSConfig.
 	ClusterDomain string
 	// APIServerVIP is the in-cluster Kubernetes API Service VIP (the kubernetes
 	// ClusterIP, 10.43.0.1) the per-pod Seatbelt egress is ADDITIONALLY scoped to,
