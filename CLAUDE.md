@@ -14,11 +14,13 @@ embedding (M1), launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 ```sh
 gofmt -l .
 go vet ./...
-go build ./...        # pure Go today
+CGO_ENABLED=1 go build ./...
 go test ./...
 go mod tidy
 ```
-- **`CGO_ENABLED=1` from M1** (embeds kine → `mattn/go-sqlite3`).
+- **`CGO_ENABLED=1`** (imports runtimed's cgo-backed capability probes). kine is **not**
+  embedded — the executor runs it as a pinned child process built on demand
+  (`go install`, out-of-module); `mattn/go-sqlite3` is in no `k3sm.io` go.mod.
 - Keep the `replace google.golang.org/genproto` in `go.mod` — it resolves the monolith-vs-split
   ambiguous import. Don't remove it.
 
