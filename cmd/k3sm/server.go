@@ -69,9 +69,17 @@ type serverOptions struct {
 	// default. Only the PORT is configurable — the bind stays the wildcard
 	// serverKubeletListenOn builds, and the API's auth posture is untouched.
 	kubeletPort int
-	clusterIP   string // DNS VIP CoreDNS binds + pods resolve against
-	domain      string
-	network     string // host-network backend: auto (default) | none | direct | helper
+	// schedulerPort / controllerManagerPort are the two co-located control-plane
+	// components' secure-serving ports. Per-server for the same reason as the
+	// two above — each is a singleton listener — and they were the LAST fixed
+	// ones, so with these a second control plane on one Mac contends for nothing.
+	// Only the PORT is configurable: both components stay bound to loopback,
+	// which executor.LoopbackServingArgs renders and does not take from here.
+	schedulerPort         int
+	controllerManagerPort int
+	clusterIP             string // DNS VIP CoreDNS binds + pods resolve against
+	domain                string
+	network               string // host-network backend: auto (default) | none | direct | helper
 
 	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite (M6.0)
 	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
@@ -82,6 +90,29 @@ type serverOptions struct {
 
 	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (M10.3/B116; 0 disables; 80 = production, an explicit high port = integration tier)
 	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
+}
+
+// executorConfig renders the control-plane Config these flags describe. It is
+// PURE and lives outside runServer for one reason: every port on it is a
+// singleton listener that a second control plane on the same Mac has to be able
+// to move, and a flag that is parsed but never assigned here reproduces that
+// defect exactly — an operator-supplied port silently replaced by the default,
+// with the collision surfacing as whichever component loses the bind. runServer
+// fills the rest of the Config (payload dir, datastore, mesh) from the
+// environment, which is not testable this way and not what keeps colliding.
+func (opts serverOptions) executorConfig(logger *slog.Logger) executor.Config {
+	return executor.Config{
+		WorkDir:               opts.workDir,
+		APIServerPort:         opts.apiPort,
+		KinePort:              opts.kinePort,
+		SchedulerPort:         opts.schedulerPort,
+		ControllerManagerPort: opts.controllerManagerPort,
+		NodeIP:                opts.nodeIP,
+		// M10.0/B71: false ships baseline-WARN; true is the enforce cutover (see the
+		// flag comment above — executor.Config.PSAEnforceBaseline is the single seam).
+		PSAEnforceBaseline: opts.psaEnforceBaseline,
+		Logger:             logger,
+	}
 }
 
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
@@ -118,6 +149,14 @@ func runServer(args []string) error {
 	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
 	// change the bind address or the API's authn posture.
 	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
+	// The scheduler's and controller-manager's secure ports, the last two fixed
+	// singletons in a server's listener set. A second server on the defaults gets
+	// a healthy apiserver and then a controller-manager that dies on the bind —
+	// which used to surface downstream as a namespace bootstrap that never
+	// completes, because nothing was running the service-account controller.
+	// These flags renumber loopback listeners; they cannot publish one.
+	fs.IntVar(&opts.schedulerPort, "scheduler-port", executor.DefaultSchedulerPort, "kube-scheduler secure-serving port on 127.0.0.1 — every control plane on a host needs its own")
+	fs.IntVar(&opts.controllerManagerPort, "controller-manager-port", executor.DefaultControllerManagerPort, "kube-controller-manager secure-serving port on 127.0.0.1 — every control plane on a host needs its own")
 	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
 	// privileged; warn=baseline + audit=restricted — audit-observable, zero
 	// rejection). This flag is the documented, REVERSIBLE cutover MECHANISM for the
@@ -194,16 +233,7 @@ func runServer(args []string) error {
 	}
 
 	// 1. Control plane (child-process executor). Stop tears it down in reverse.
-	cfg := executor.Config{
-		WorkDir:       opts.workDir,
-		APIServerPort: opts.apiPort,
-		KinePort:      opts.kinePort,
-		NodeIP:        opts.nodeIP,
-		// M10.0/B71: false ships baseline-WARN; true is the enforce cutover (see the
-		// flag comment above — executor.Config.PSAEnforceBaseline is the single seam).
-		PSAEnforceBaseline: opts.psaEnforceBaseline,
-		Logger:             logger,
-	}
+	cfg := opts.executorConfig(logger)
 	// Packaged install: `k3sm install` stages the control-plane payload at
 	// <install-dir>/bin beside the daemon binary; boot seeds the workdir from it
 	// so it never shells out to gh/go (absent under launchd as _k3sm). Dev shells

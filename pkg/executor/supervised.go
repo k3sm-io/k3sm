@@ -521,6 +521,26 @@ func apiServerArgs(cfg Config) []string {
 	return args
 }
 
+// loopbackBindAddress is the address the co-located control-plane components
+// serve their secure port on. It is INVARIANT, and single-sourced here because it
+// is the property that makes renumbering those ports safe.
+const loopbackBindAddress = "127.0.0.1"
+
+// LoopbackServingArgs renders the secure-serving flags for a control-plane
+// component whose HTTPS surface (/healthz, /metrics) is consumed only by the
+// co-located control plane — the scheduler and the controller-manager.
+//
+// Two facts are deliberately rendered TOGETHER by one function. The PORT varies
+// per server, because each of these is a singleton listener and a second control
+// plane on one Mac must not contend for the upstream default. The BIND ADDRESS
+// does not vary at all: these components answer on loopback and nowhere else, so
+// a caller choosing a port can never become the route by which they start
+// answering off-host. Splitting the pair would let the second fact drift while
+// the first is being exercised.
+func LoopbackServingArgs(port int) []string {
+	return []string{"--bind-address", loopbackBindAddress, "--secure-port", strconv.Itoa(port)}
+}
+
 // startScheduler launches kube-scheduler against its OWN per-component kubeconfig.
 func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-scheduler", schedulerArgs(s.cfg)...)
@@ -537,14 +557,13 @@ func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 // scheduler is active (two active schedulers double-bind pods).
 func schedulerArgs(cfg Config) []string {
 	kc := schedulerKubeconfigPath(cfg.WorkDir)
-	return []string{
+	args := []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
 		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
-		"--bind-address", "127.0.0.1",
-		"--secure-port", "10259",
 	}
+	return append(args, LoopbackServingArgs(cfg.schedulerPort())...)
 }
 
 // startControllerManager launches kube-controller-manager with the SCOPED
@@ -569,7 +588,7 @@ func (s *Supervised) startControllerManager(ctx context.Context) (*component, er
 func controllerManagerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
 	kc := controllerManagerKubeconfigPath(wd)
-	return []string{
+	args := []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
@@ -577,10 +596,9 @@ func controllerManagerArgs(cfg Config) []string {
 		"--use-service-account-credentials=true",
 		"--service-account-private-key-file", saKeyPath(wd),
 		"--root-ca-file", filepath.Join(certDir(wd), "apiserver.crt"),
-		"--bind-address", "127.0.0.1",
-		"--secure-port", "10257",
 		"--controllers", controllersFlag(),
 	}
+	return append(args, LoopbackServingArgs(cfg.controllerManagerPort())...)
 }
 
 // controllersFlag renders the scoped --controllers value: "*" (all on-by-default
