@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"k3sm.io/k3sm/pkg/policy"
 )
 
 // M10.0 apiserver conformance config: the
@@ -63,51 +65,23 @@ rules:
 - level: Metadata
 `
 
-// psaPinnedVersion is the PSA level version every defaults entry pins
-// (enforce-version/warn-version/audit-version). PINNED to the vendored k8s
-// minor — NEVER "latest": "latest" would silently retarget every level on a
-// control-plane upgrade, turning a kube bump into an unreviewed policy change.
-const psaPinnedVersion = "v1.36"
-
-// admissionConfigYAML renders the --admission-control-config-file content: an
-// apiserver.config.k8s.io/v1 AdmissionConfiguration embedding the
-// pod-security.admission.config.k8s.io/v1 PodSecurityConfiguration cluster
-// defaults (Res.2). It is a PURE function (table-tested like apiServerArgs) and
-// the SINGLE authority for the PSA level tuple:
+// admissionConfigYAML renders the --admission-control-config-file content by
+// delegating to pkg/policy, the SINGLE authority for the PSA level tuple
+// (Res.2). The executor owns the FILE — path, 0600 mode, the provision-time
+// write, and the argv that references it; policy owns WHAT the levels are, so
+// the B71 enforce cutover is one value there and not a second opinion here.
 //
 //   - enforceBaseline=false (the SHIPPED default): enforce stays privileged
-//     (zero rejection), warn=baseline + audit=restricted make every violation
-//     audit-observable — the warn-first posture.
-//   - enforceBaseline=true (the B71 cutover): enforce flips to baseline; the
-//     warn/audit levels are unchanged.
-//
-// exemptions is deliberately EMPTY (usernames/runtimeClasses/namespaces all
-// []): warn-mode needs none, and the B71 enforce cutover decides exemptions
-// with pre-flight evidence — never pre-baked here.
+//     (zero rejection); warn=baseline + audit=restricted make every violation
+//     observable — the warn-first posture.
+//   - enforceBaseline=true (the B71 cutover, via `k3sm server
+//     --psa-enforce-baseline`): enforce flips to baseline; warn/audit unchanged.
 func admissionConfigYAML(enforceBaseline bool) string {
-	enforce := "privileged"
+	enforce := policy.DefaultPodSecurityEnforceLevel
 	if enforceBaseline {
-		enforce = "baseline"
+		enforce = policy.PodSecurityLevelBaseline
 	}
-	return fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1
-kind: AdmissionConfiguration
-plugins:
-- name: PodSecurity
-  configuration:
-    apiVersion: pod-security.admission.config.k8s.io/v1
-    kind: PodSecurityConfiguration
-    defaults:
-      enforce: %s
-      enforce-version: %s
-      warn: baseline
-      warn-version: %s
-      audit: restricted
-      audit-version: %s
-    exemptions:
-      usernames: []
-      runtimeClasses: []
-      namespaces: []
-`, enforce, psaPinnedVersion, psaPinnedVersion, psaPinnedVersion)
+	return policy.PodSecurityAdmissionConfigYAML(enforce)
 }
 
 // writeConformanceConfig lays down the M10.0 apiserver config artifacts in
