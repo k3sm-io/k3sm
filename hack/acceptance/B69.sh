@@ -2,7 +2,7 @@
 #
 # k3sm B69 acceptance gate — the kine single-pin collapse.
 #
-# What it proves, in six legs:
+# What it proves, in seven legs:
 #
 #   b69.1 LINT       ONE kine pin, >=0.16.x, built CGO_ENABLED=0, with the startup-VACUUM
 #                    opt-out on the shipped SQLite DSN.
@@ -15,11 +15,14 @@
 #   b69.5 DEP-LINT   the shipped kine binary links no mattn/go-sqlite3.
 #   b69.6 MARKER     a kine staged with a stale/absent version marker is RE-STAGED, and
 #                    the new marker records the nocgo variant.
+#   b69.7 REAP       no kine the legs above started is still alive when they are done.
 #
 # red-at-main: pkg/executor/executor.go carries TWO pins (DefaultKineVersion v1.14.2 +
 # DefaultKineVersionHA v0.16.3), ensureKineInto builds CGO_ENABLED=1 and short-circuits
 # on file PRESENCE, the DSN has no vacuum opt-out, and there is no snapshot path at all —
-# so legs 1, 4 and 6 cannot pass, and 2/3/5 do not exist to be run.
+# so legs 1, 4 and 6 cannot pass, and 2/3/5 do not exist to be run. Leg 7 is red on any
+# tree whose fixtures reap their kine children only through a `defer` the failing,
+# interrupted, or timed-out paths never reach.
 #
 # TIER: integration. It builds TWO real kine binaries and runs them, so it needs a Go
 # toolchain and network.
@@ -48,6 +51,24 @@ WORK="$(mktemp -d /tmp/b69.XXXXXX)"
 export GOMODCACHE="${GOMODCACHE:-$(go env GOMODCACHE)}"
 cleanup() { chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
+
+# fixture_kine_pids prints the pids of every kine serving a datastore under this host's
+# TEMP directory. That endpoint — not the process name — is the discriminator, and it is
+# exact: a t.TempDir() database is by construction a Go test fixture's, because a real
+# k3sm server keeps its datastore under its workdir (~/.k3sm/... or /var/lib/k3sm) and
+# never under $TMPDIR. It is what keeps this gate from ever naming, let alone telling a
+# human to kill, an operator's live cluster on the same Mac.
+TMP_PREFIX="${TMPDIR:-/tmp}"; TMP_PREFIX="${TMP_PREFIX%/}"
+fixture_kine_pids() {
+	ps -Ao pid=,command= | awk -v pfx="sqlite://$TMP_PREFIX" '
+		/--endpoint/ && index($0, pfx) { print $1 }' | sort -u
+}
+
+# name_pids prints a one-line ps for each pid, truncated so a long argv cannot bury the
+# verdict.
+name_pids() {
+	for p in $1; do ps -o pid=,args= -p "$p" 2>/dev/null | cut -c1-200 >&2 || true; done
+}
 
 # The host Go toolchain on a Mac can be an amd64 build running under Rosetta, in which
 # case an unpinned `go install` silently emits x86_64 binaries. Every build below pins
@@ -123,6 +144,24 @@ else
 	ladder no "b69.1  ONE kine pin (>=0.16.x), CGO_ENABLED=0 child build, marker-gated staging, VACUUM opt-out"
 	echo "----------------------------------------"
 	echo "B69: the lint leg is red — the compat legs below would measure the wrong build" >&2
+	echo "B69: $PASS passed, $FAIL failed" >&2
+	exit 1
+fi
+
+# ---- pre-flight: nothing left over from an EARLIER run -----------------------
+# The same fail-closed shape bring-up has for a held datastore port, and for the same
+# reason: an orphan is only diagnosable BEFORE anything else starts. After that, its
+# held port and its half-written database surface as some unrelated downstream error.
+PRE_ORPHANS="$(fixture_kine_pids)"
+if [ -n "$PRE_ORPHANS" ]; then
+	echo "----------------------------------------" >&2
+	echo "B69: REFUSING to run — kine process(es) from an EARLIER run of these fixtures are still alive:" >&2
+	name_pids "$PRE_ORPHANS"
+	echo "B69: each holds a TCP port and a temp-dir datastore, and bring-up refuses a datastore port" >&2
+	echo "B69: it finds held — so a later run fails for a reason that has nothing to do with it." >&2
+	echo "B69: stop them by hand (kill $(echo "$PRE_ORPHANS" | tr "\n" " ")) and re-run." >&2
+	echo "B69: this gate never kills a process it did not start: only the run that started one" >&2
+	echo "B69: knows it is finished with it." >&2
 	echo "B69: $PASS passed, $FAIL failed" >&2
 	exit 1
 fi
@@ -270,6 +309,26 @@ if run_test "$WORK/marker.log" -tags kinecompat ./pkg/executor/ -run TestEnsureK
 else
 	ladder no "b69.6  MARKER: a stale/unmarked kine is re-staged; the new marker records $NEW_PIN nocgo"
 	tail -40 "$WORK/marker.log" >&2 || true
+fi
+
+# ---- b69.7 — REAP ------------------------------------------------------------
+# Every kine the legs above started must be gone now. A leaked one holds its port and
+# its temp-dir datastore for as long as the machine stays up, and bring-up refuses a
+# datastore port it finds held — so one run's leftover becomes the next run's
+# unexplained boot refusal, reported against a port nobody in that run chose.
+#
+# The pre-flight above already established that NO fixture-shaped kine was running when
+# this gate started, so anything found here was started by this run. Nothing is killed:
+# the gate reports what it found and leaves the decision to the human, exactly as the
+# pre-flight does.
+POST_ORPHANS="$(fixture_kine_pids)"
+if [ -z "$POST_ORPHANS" ]; then
+	ladder ok "b69.7  REAP: every kine the compat legs started was reaped with the test that started it"
+else
+	ladder no "b69.7  REAP: every kine the compat legs started was reaped with the test that started it"
+	echo "  these outlived the test binary that spawned them:" >&2
+	name_pids "$POST_ORPHANS"
+	echo "  kill them by hand ($(echo "$POST_ORPHANS" | tr "\n" " ")); this gate does not reap what it cannot attribute" >&2
 fi
 
 echo "----------------------------------------"
