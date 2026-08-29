@@ -120,9 +120,11 @@ type Config struct {
 	ServingKeyFile  string
 	// AuthorizationMode is the apiserver --authorization-mode. Empty defaults to
 	// DefaultAuthorizationMode (Node,RBAC) — the M4.1 hard-cut flip from AlwaysAllow.
-	// The flip is pure because the in-process components authenticate with the static
-	// admin token (mapped to system:masters, which bypasses RBAC) and joined workers'
-	// system:node identities get a pre-provisioned datapath grant (pkg/rbac); set it
+	// The flip is pure because no in-process component is left unauthorized: the VK node
+	// + provisioners carry the static admin token (mapped to system:masters, which
+	// bypasses RBAC), the scheduler/KCM carry their own client-cert identities the
+	// apiserver's bootstrap RBAC already binds, and joined workers' system:node
+	// identities get a pre-provisioned datapath grant (pkg/rbac); set it
 	// to "AlwaysAllow" only for a deliberate diagnostic bring-up.
 	AuthorizationMode string
 	// DatastoreEndpoint, when non-empty, is the kine datastore endpoint — a Postgres
@@ -160,8 +162,9 @@ type Config struct {
 	// multi-writer datastore — so only one server's scheduler/KCM is active; two active
 	// schedulers double-bind pods, two KCMs double-reconcile) and OFF single-node (one
 	// candidate, no lease churn — the M1–M5 default). Only the apiserver is active/active
-	// in HA. The leader-election Leases are authorized by the components' static admin
-	// token (system:masters, RBAC-exempt) plus the apiserver's auto-created system:* RBAC.
+	// in HA. The leader-election Leases are authorized by the apiserver's auto-created
+	// system:kube-scheduler / system:kube-controller-manager bootstrap RBAC, which binds
+	// the components' OWN per-component identities — no pkg/rbac object is needed.
 	LeaderElect *bool
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger

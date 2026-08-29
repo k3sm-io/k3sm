@@ -403,10 +403,11 @@ func apiServerArgs(cfg Config) []string {
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",
 		"--token-auth-file", tokenFilePath(wd),
 		// M4.1: enforce the Node authorizer + RBAC (default-deny) instead of
-		// AlwaysAllow. The flip is pure — the in-process components carry the static
-		// admin token (system:masters, RBAC-exempt) and joined workers' system:node
-		// identities get a pre-provisioned datapath grant (pkg/rbac.Provision) before
-		// the VK node / join supervisor start.
+		// AlwaysAllow. The flip is pure — the VK node + provisioners carry the static
+		// admin token (system:masters, RBAC-exempt), the scheduler/KCM carry their own
+		// client-cert identities the apiserver's bootstrap RBAC binds, and joined
+		// workers' system:node identities get a pre-provisioned datapath grant
+		// (pkg/rbac.Provision) before the VK node / join supervisor start.
 		"--authorization-mode", authzMode,
 		// Add NodeRestriction to the default-enabled admission set (--enable-admission-
 		// plugins is ADDITIVE, so the ServiceAccount plugin M2.4 relies on stays on).

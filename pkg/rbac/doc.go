@@ -25,17 +25,20 @@ limitations under the License.
 //
 // # Why a flip alone would lock workers out
 //
-// The flip is advertised as a pure authorizer switch, and it is — but only because
-// every IN-PROCESS server component (the in-process VK node, the scheduler and
-// controller-manager, the provisioners, the bootstrap enroller) authenticates with
-// the static admin token, which the token file maps to the system:masters group;
-// system:masters bypasses RBAC, so those components keep working with the authorizer
-// on, needing no two-phase restart. The real lock-out risk is a JOINED WORKER: its
-// Service proxy, per-node DNS resolver, and mesh watcher authenticate as
-// system:node:<name> (the M3 node cert), and they get/list/watch services,
-// endpointslices (discovery.k8s.io), and meshpeers (net.k3sm.io) — none of which the
-// Node authorizer nor the stock system:node ClusterRole grant. The node-datapath
-// ClusterRole this package binds to the system:nodes group is THE fix.
+// The flip is advertised as a pure authorizer switch, and it is — but only because no
+// in-process server component is left unauthorized by it. The in-process VK node, the
+// provisioners and the bootstrap enroller authenticate with the static admin token,
+// which the token file maps to the system:masters group, and system:masters bypasses
+// RBAC. The scheduler and controller-manager authenticate with their OWN client certs
+// (CN=system:kube-scheduler / system:kube-controller-manager), which the apiserver's
+// auto-created bootstrap RBAC already binds to the matching ClusterRoles. Either way
+// those components keep working with the authorizer on, needing no two-phase
+// restart. The real lock-out risk is a JOINED WORKER: its Service proxy, per-node
+// DNS resolver, and mesh watcher authenticate as system:node:<name> (the M3 node
+// cert), and they get/list/watch services, endpointslices (discovery.k8s.io), and
+// meshpeers (net.k3sm.io) — none of which the Node authorizer nor the stock
+// system:node ClusterRole grant. The node-datapath ClusterRole this package binds
+// to the system:nodes group is THE fix.
 //
 // # What it provisions (ONLY k3sm-named objects)
 //
@@ -58,14 +61,19 @@ limitations under the License.
 // ConsistentListFromCache is GA-locked true, can read stale and double-provision or
 // skip. Any existence check is an authoritative Get-by-name, never a LIST.
 //
-// # Component-identity divergence (documented, adopted, NOT expanded)
+// # Component-identity divergence (M4.1, since narrowed)
 //
-// In M4.1, RBAC is enforced for WORKLOADS and joined-worker system:node identities;
-// the in-process control-plane components (VK node, scheduler, controller-manager,
-// provisioners, enroller) RETAIN system:masters. Moving them to per-component client
-// certs is a DEFERRED follow-up: it would break the pure-switch property (the boot
-// would need component certs provisioned and a re-bootstrap) for no M4.1 benefit,
-// since those components run in the trusted single _k3sm process. The MeshPeer
+// In M4.1, RBAC is enforced for WORKLOADS and joined-worker system:node identities.
+// M4.1 shipped with every in-process control-plane component on the static admin
+// token; #14 (f855a0a) retired the scheduler + controller-manager half — they now
+// authenticate with their own signing-CA-issued client certs (CN=system:kube-scheduler
+// / system:kube-controller-manager, written by executor.provisionComponentCerts) that
+// the apiserver's bootstrap RBAC binds, so RBAC constrains them (the k3s model). What
+// RETAINS system:masters is the residual set: the in-process VK node, the post-bring-up
+// provisioning client (Provision itself), kubectl, and the healthz probe. The embedded
+// node stays on the admin token until Virtual Kubelet's secret/configmap informers are
+// scoped — vanilla nodeutil.NewNode LIST/WATCHes them cluster-wide, which the Node
+// authorizer never grants; that scoping is the tracked follow-up. The MeshPeer
 // write-guard (bootstrap.AuthorizeMeshPeerWrite) stays load-bearing and PERMANENT:
 // NodeRestriction admission covers only core node-owned resources, never the
 // net.k3sm.io/MeshPeer CRD, so the node identity gets meshpeers READ via the
