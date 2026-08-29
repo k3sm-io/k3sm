@@ -18,9 +18,10 @@ limitations under the License.
 // `k3sm netd` subcommand: it turns the cluster's network policy inputs (this
 // node's pod /24, the cluster Service CIDR, the _k3sm service uid) and two
 // fail-closed seams — a PortAuthorizer that confirms a privileged (<1024) bind
-// against the authoritative Service set, and a MeshKeyResolver that reads the
-// node's wireguard private key from a root-only path — into a darwin-net
-// netd.Config. The pure policy and the seams are testable without root or a real
+// against the authoritative Service set (and, for a bind on the node's own
+// address, against ONE named canonical Service), and a MeshKeyResolver that
+// reads the node's wireguard private key from a root-only path — into a
+// darwin-net netd.Config. The pure policy and the seams are testable without root or a real
 // apiserver.
 package netdsvc
 
@@ -31,6 +32,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"k3sm.io/darwin-net/pkg/netd"
@@ -54,25 +56,34 @@ type Options struct {
 	// port — the backing for the Service-CIDR-VIP branch of the privileged-port
 	// authorizer. nil denies every <1024 VIP bind (fail safe).
 	Declares func(port int) bool
-	// DeclaresLB reports whether a Service of type LoadBalancer in the
-	// authoritative set declares port — the backing for the node-own-address
-	// branch of the privileged-port authorizer (the M10.3 ingress/svclb
-	// listener). nil denies every <1024 node-address bind (fail safe).
-	DeclaresLB func(port int) bool
+	// LBDeclarers reports WHICH Services of type LoadBalancer in the
+	// authoritative set declare port, by namespace+name — the backing for the
+	// node-own-address branch of the privileged-port authorizer (the M10.3
+	// ingress/svclb listener). nil denies every <1024 node-address bind (fail
+	// safe). It yields identities rather than a bare bool because that branch is
+	// an ALLOWLIST (B133): declaring the port is necessary but NOT sufficient.
+	LBDeclarers func(port int) []ServiceRef
+	// NodeAddressService is the ONE Service permitted to authorize a privileged
+	// bind on this node's own address — the canonical ingress LoadBalancer. The
+	// assembler binds it from ingresshost.ServiceNamespace/ServiceName (the
+	// single source of that identity). The zero ServiceRef denies the
+	// node-address branch entirely (fail safe).
+	NodeAddressService ServiceRef
 	// NodeIP is this node's own InternalIP — the ONLY address outside the
-	// Service CIDR a privileged bind can ever be authorized on, and only when a
-	// LoadBalancer Service declares the port. The zero Addr disables the
+	// Service CIDR a privileged bind can ever be authorized on, and only when
+	// NodeAddressService itself declares the port. The zero Addr disables the
 	// node-address branch entirely (deny).
 	//
 	// DORMANT BY CONFIGURATION, NOT BY CONSTRUCTION (B133). Since B116 the
 	// ingress/svclb listeners bind the WILDCARD in-process (unprivileged on
 	// Darwin at any port), so nothing asks netd for a node-address bind, and the
 	// installed plist renders NO --node-ip — leaving this zero and the branch
-	// denying. The branch is deliberately KEPT: it is the authorization design
-	// for any future privileged specific-address bind, and B133 owns the decision
-	// to either wire it back or retire it. pkg/install::TestNetdPlistXML pins the
-	// absence of --node-ip, so re-adding the flag reddens rather than silently
-	// re-arming the branch.
+	// denying. The branch is deliberately KEPT rather than deleted: it is the
+	// authorization design for any future privileged specific-address bind, and
+	// B133 narrowed it to the NodeAddressService allowlist so re-arming it cannot
+	// hand the node's address to whichever Service happens to declare the port.
+	// pkg/install::TestNetdPlistXML pins the absence of --node-ip, so re-adding
+	// the flag reddens rather than silently re-arming the branch.
 	NodeIP netip.Addr
 	// MeshKeyDir is the root-only directory the MeshKeyResolver reads the node's
 	// wireguard private key from. Empty disables ConfigureMesh (a nil resolver,
@@ -100,10 +111,11 @@ func BuildConfig(opts Options) (netd.Config, error) {
 		ServiceCIDR: opts.ServiceCIDR,
 		ServiceUID:  opts.ServiceUID,
 		PortAuthorizer: PortAuthorizer(PortPolicy{
-			ServiceCIDR: opts.ServiceCIDR,
-			Declares:    opts.Declares,
-			NodeIP:      opts.NodeIP,
-			DeclaresLB:  opts.DeclaresLB,
+			ServiceCIDR:        opts.ServiceCIDR,
+			Declares:           opts.Declares,
+			NodeIP:             opts.NodeIP,
+			LBDeclarers:        opts.LBDeclarers,
+			NodeAddressService: opts.NodeAddressService,
 		}),
 		Logger: opts.Logger,
 	}
@@ -113,6 +125,23 @@ func BuildConfig(opts Options) (netd.Config, error) {
 	return cfg, nil
 }
 
+// ServiceRef identifies a Service by namespace and name. It is the
+// authorization SUBJECT of the node-address bind class: the daemon authorizes
+// that class for exactly one named Service, never for a shape ("any
+// LoadBalancer"). The zero ServiceRef is invalid and names nothing.
+type ServiceRef struct {
+	// Namespace is the Service's namespace.
+	Namespace string
+	// Name is the Service's name.
+	Name string
+}
+
+// IsValid reports whether the ref names a Service (both parts non-empty).
+func (r ServiceRef) IsValid() bool { return r.Namespace != "" && r.Name != "" }
+
+// String renders the ref as "namespace/name" for error and log messages.
+func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
+
 // PortPolicy is the DENY-BY-DEFAULT privileged-port (<1024) bind policy the
 // authorizer applies. A bind is authorized iff the requested address falls in
 // exactly one of two explicitly named classes (M10.3 — an explicit policy
@@ -120,12 +149,22 @@ func BuildConfig(opts Options) (netd.Config, error) {
 //
 //   - a Service-CIDR VIP whose port some Service in the authoritative set
 //     declares (the proxy's infra VIPs, e.g. 10.43.0.10:53), or
-//   - this node's OWN InternalIP when a Service of type LoadBalancer declares
-//     the port (the ingress/svclb listener; kube-system/k3sm-ingress is the
-//     canonical declaring subject for 80/443).
+//   - this node's OWN InternalIP when NodeAddressService — the ONE named
+//     canonical ingress LoadBalancer, kube-system/k3sm-ingress — declares the
+//     port (the ingress/svclb listener).
 //
-// Every other address class, an undeclared port, and a nil predicate are all
-// denied — the daemon never trusts the client's self-assertion.
+// The node-address class is an ALLOWLIST keyed on namespace+name (B133), not a
+// test on the requester's shape. It used to authorize the bind for ANY Service
+// of type LoadBalancer declaring the port, in any namespace — which made the
+// requesting object its own authorization predicate: any tenant able to create
+// a LoadBalancer Service on :80 could authorize a root-helper bind on the
+// node's real address. Declaring the port is now necessary but not sufficient.
+//
+// Every other address class, an undeclared port, a Service outside the
+// allowlist, and a nil predicate are all denied — the daemon never trusts the
+// client's self-assertion. A refusal is never silent: darwin-net's bind handler
+// logs the returned error at Warn ("netd: port bind rejected"), and the
+// out-of-allowlist message names the Services that did declare the port.
 type PortPolicy struct {
 	// ServiceCIDR classifies the VIP address class. Invalid disables it (deny).
 	ServiceCIDR netip.Prefix
@@ -134,9 +173,12 @@ type PortPolicy struct {
 	// NodeIP is this node's own InternalIP. Invalid disables the node-address
 	// class (deny).
 	NodeIP netip.Addr
-	// DeclaresLB reports whether a Service of type LoadBalancer declares port.
-	// nil denies node-address binds.
-	DeclaresLB func(port int) bool
+	// LBDeclarers reports which Services of type LoadBalancer declare port. nil
+	// denies node-address binds.
+	LBDeclarers func(port int) []ServiceRef
+	// NodeAddressService is the only Service whose declaration authorizes a
+	// node-address bind. The zero ServiceRef denies the class (deny).
+	NodeAddressService ServiceRef
 }
 
 // servicePortAuthorizer confirms a privileged (<1024) bind against the
@@ -169,15 +211,54 @@ func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr s
 		}
 		return nil
 	case a.policy.NodeIP.IsValid() && addr == a.policy.NodeIP:
-		if a.policy.DeclaresLB == nil {
-			return fmt.Errorf("no service set available to authorize port %d on node address %s", port, nodeAddr)
-		}
-		if !a.policy.DeclaresLB(port) {
-			return fmt.Errorf("no LoadBalancer service declares port %d (requested on node address %s)", port, nodeAddr)
-		}
-		return nil
+		return a.authorizeNodeAddress(port, nodeAddr)
 	}
 	return fmt.Errorf("bind address %s is neither a service-CIDR VIP nor this node's own address (port %d denied)", nodeAddr, port)
+}
+
+// authorizeNodeAddress applies the node-own-address allowlist: the bind is
+// authorized only when the ONE canonical Service named by
+// PortPolicy.NodeAddressService is itself among the LoadBalancer Services
+// declaring port. A Service outside the allowlist that declares the port is
+// refused with a reason that NAMES it — the refusal reaches the root daemon's
+// log verbatim (darwin-net netd logs a rejected bind at Warn), so a
+// misconfigured or hostile declaring Service is visible rather than a silent
+// behaviour cliff for the operator.
+func (a servicePortAuthorizer) authorizeNodeAddress(port int, nodeAddr string) error {
+	canonical := a.policy.NodeAddressService
+	if !canonical.IsValid() {
+		return fmt.Errorf("no canonical load-balancer service configured to authorize port %d on node address %s", port, nodeAddr)
+	}
+	if a.policy.LBDeclarers == nil {
+		return fmt.Errorf("no service set available to authorize port %d on node address %s", port, nodeAddr)
+	}
+	declarers := a.policy.LBDeclarers(port)
+	for _, d := range declarers {
+		if d == canonical {
+			return nil
+		}
+	}
+	if len(declarers) == 0 {
+		return fmt.Errorf("the canonical load-balancer service %s does not declare port %d (requested on node address %s)", canonical, port, nodeAddr)
+	}
+	return fmt.Errorf("port %d on node address %s is declared by %s, not by the canonical load-balancer service %s: only that service authorizes a node-address bind", port, nodeAddr, describeDeclarers(declarers), canonical)
+}
+
+// describeDeclarers renders the declaring Services for a refusal message. It
+// sorts (a deterministic log line) and caps the list, so a cluster with many
+// LoadBalancer Services on one port cannot flood the root daemon's log.
+func describeDeclarers(refs []ServiceRef) string {
+	names := make([]string, 0, len(refs))
+	for _, r := range refs {
+		names = append(names, r.String())
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	const max = 4
+	if len(names) > max {
+		return fmt.Sprintf("%s (+%d more)", strings.Join(names[:max], ", "), len(names)-max)
+	}
+	return strings.Join(names, ", ")
 }
 
 // fileMeshKeyResolver resolves a ConfigureMesh key reference to the node's

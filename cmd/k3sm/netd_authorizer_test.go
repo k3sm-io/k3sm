@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"k3sm.io/k3sm/pkg/ingresshost"
 )
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -37,16 +39,32 @@ func TestBuildServiceSetDenyAllUntilReady(t *testing.T) {
 	defer cancel()
 
 	missing := filepath.Join(t.TempDir(), "does-not-exist.kubeconfig")
-	declares, declaresLB, _ := buildServiceSet(ctx, missing, quietLogger())
+	declares, lbDeclarers, _ := buildServiceSet(ctx, missing, quietLogger())
 
 	// The predicates must be non-nil: a nil PortAuthorizer input can never later
 	// authorize, so the async swap-in only works if the closures exist up front.
-	if declares == nil || declaresLB == nil {
+	if declares == nil || lbDeclarers == nil {
 		t.Fatal("buildServiceSet returned nil predicates for a not-yet-present kubeconfig; must be non-nil deny-all so the async authorizer can swap in")
 	}
 	// Deny-all while the lister is nil (the boot window before the swap).
-	if declares(443) || declaresLB(53) {
-		t.Fatal("expected deny (false) before the Service authorizer syncs")
+	if declares(443) || len(lbDeclarers(53)) != 0 {
+		t.Fatal("expected deny (no declarers) before the Service authorizer syncs")
+	}
+}
+
+// TestCanonicalLBServiceIsTheIngressService pins the ONE identity the netd
+// node-address allowlist is bound to (B133). The assembler must name the very
+// Service pkg/ingresshost provisions — a drifted or widened ref here would hand
+// the root helper's node-address bind to some other Service, which is exactly
+// the permissiveness B133 removed.
+func TestCanonicalLBServiceIsTheIngressService(t *testing.T) {
+	ref := canonicalLBService()
+	if ref.Namespace != ingresshost.ServiceNamespace || ref.Name != ingresshost.ServiceName {
+		t.Fatalf("canonicalLBService() = %s, want %s/%s (pkg/ingresshost is the single source)",
+			ref, ingresshost.ServiceNamespace, ingresshost.ServiceName)
+	}
+	if ref.String() != "kube-system/k3sm-ingress" {
+		t.Errorf("canonical node-address subject = %s, want kube-system/k3sm-ingress", ref)
 	}
 }
 
@@ -54,8 +72,8 @@ func TestBuildServiceSetDenyAllUntilReady(t *testing.T) {
 // --kubeconfig configured → nil predicates (netd denies every <1024 bind, the
 // existing "no authoritative Service set" contract).
 func TestBuildServiceSetEmptyKubeconfigDenies(t *testing.T) {
-	declares, declaresLB, _ := buildServiceSet(context.Background(), "", quietLogger())
-	if declares != nil || declaresLB != nil {
+	declares, lbDeclarers, _ := buildServiceSet(context.Background(), "", quietLogger())
+	if declares != nil || lbDeclarers != nil {
 		t.Fatal("empty --kubeconfig must yield nil predicates (deny-all, no authoritative set)")
 	}
 }
