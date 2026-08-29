@@ -122,6 +122,16 @@ type nodeOptions struct {
 	// none). The zero value is BackendNone (no datapath — no adapter, podIP ≈
 	// nodeIP); the commands always set it from their resolved --network mode.
 	netMode hostnet.Mode
+	// standalone marks bring-up via the naked `k3sm node` command (runNode is the
+	// ONLY constructor that sets it true). `k3sm node` stands up no cluster-DNS
+	// resolver of its own — only `k3sm server`/`k3sm agent` call netserve.New
+	// before reaching this shared bring-up (grep `netserve.New` across cmd/k3sm) —
+	// so runtimedConfig uses this flag to guard the K3SM_DNS_* env injection off
+	// (B43): left unset (the zero value, false), a standalone node would inject
+	// env pointing at a VIP with nothing listening, blackholing every pod's
+	// cluster-DNS lookup for ~2s per search candidate before falling through,
+	// where the pre-injection behavior deferred to the host resolver immediately.
+	standalone bool
 }
 
 // serverKubeletListen is the kubelet HTTP API listen address the in-process node
@@ -150,10 +160,23 @@ func runNode(args []string) error {
 	addRuntimeFlag(fs, &opts.runtime)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
-	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only)")
+	// Default "" (NOT dns.DefaultDNSVIP): the standalone node binds no resolver on
+	// any VIP, so defaulting this to the real cluster DNS VIP would silently inject
+	// K3SM_DNS_* pointing at a dead address (B43). See standaloneDNSGuard.
+	fs.StringVar(&opts.dnsVIP, "dns-vip", "", "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only; standalone `k3sm node` binds no resolver — leave unset, see the startup log)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
 	_ = fs.Parse(args)
+	opts.standalone = true
+
+	// B43: fail fast on an explicit --dns-vip (this process has nothing bound on
+	// it) rather than silently injecting a dead VIP; otherwise log once that
+	// cluster DNS is unavailable here so the guard's absence of K3SM_DNS_* env
+	// isn't mistaken for a bug. Checked before the --kubeconfig requirement below
+	// so a misconfigured flag is reported without needing a live cluster.
+	if err := standaloneDNSGuard(opts, slog.Default()); err != nil {
+		return err
+	}
 
 	if opts.kubeconfig == "" {
 		return fmt.Errorf("--kubeconfig (or $KUBECONFIG) is required")
@@ -177,6 +200,36 @@ func runNode(args []string) error {
 	defer stop()
 
 	return startNode(ctx, opts)
+}
+
+// standaloneDNSGuard is the B43 guard against the standalone-node dead-VIP
+// blackhole: `k3sm node --runtime runtimed` threads --dns-vip/--cluster-domain
+// into runtimedConfig, which (pre-B43) always injected the K3SM_DNS_* env the
+// DYLD getaddrinfo shim reads — but this command starts no resolver on that VIP
+// (only server.go/agent.go call netserve.New before reaching the shared
+// startNode/buildProvider/runtimedConfig path). A pod's shim then dialed a dead
+// VIP: a silent ~2s-per-search-candidate timeout instead of the pre-B18
+// immediate defer to the host resolver.
+//
+// The operator decision (2026-08-28, B43) is DEV-ONLY: guard the injection off
+// rather than build a standalone resolver. So an explicit --dns-vip — a request
+// this process cannot honor — fails fast with a clear error (better than a
+// silent blackhole); an unset one (the flag's new "" default) just logs that
+// cluster DNS is unavailable here, and runtimedConfig (opts.standalone) leaves
+// the injection inputs empty so no K3SM_DNS_* env reaches any pod.
+//
+// A no-op for --runtime hostprocess: that path never calls runtimedConfig, so
+// --dns-vip is already inert there (its own flag help already scopes it to
+// "runtimed runtime only").
+func standaloneDNSGuard(opts nodeOptions, log *slog.Logger) error {
+	if resolveRuntime(opts.runtime) != runtimeRuntimed {
+		return nil
+	}
+	if opts.dnsVIP != "" {
+		return fmt.Errorf("--dns-vip %q requested, but standalone `k3sm node` binds no cluster-DNS resolver in this process (only `k3sm server`/`k3sm agent` do) — drop --dns-vip, or run `k3sm server`/`k3sm agent` for cluster DNS instead of blackholing pod lookups against a dead VIP", opts.dnsVIP)
+	}
+	log.Info("standalone node: no cluster-DNS resolver runs in this process; pods will NOT receive K3SM_DNS_* env and fall back to the host resolver (run `k3sm server` or `k3sm agent` for cluster DNS)")
+	return nil
 }
 
 // defaultNodePodCIDR is the control-plane/single-node pod /24: node index 0 of
@@ -669,9 +722,16 @@ func resolveSiblingDylib(name string) string {
 	return p
 }
 
+// B43: opts.standalone (set ONLY by runNode) skips the empty-dnsVIP default-fill
+// below, leaving ResolverVIP "". dns.PodDNSConfig then builds a DNSConfig with an
+// empty ClusterDNSIP, which Validate() rejects — the SAME "dnsCfg not usable"
+// path injectClusterDNSEnv already documents (dns.ConfigToEnv returns nil, no
+// K3SM_DNS_* env is appended, the shim defers to the host resolver) — rather than
+// inventing a second no-DNS fallback. server.go/agent.go never set opts.standalone,
+// so their nodeOptions are unaffected and keep injecting exactly as before B43.
 func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
 	resolverVIP := opts.dnsVIP
-	if resolverVIP == "" {
+	if resolverVIP == "" && !opts.standalone {
 		resolverVIP = dns.DefaultDNSVIP
 	}
 	// Cluster DNS domain the in-pod shim search list is built from. PREFER the
