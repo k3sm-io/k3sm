@@ -188,7 +188,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// Seed the workdir bin from a staged install payload FIRST, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
-	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir); err != nil {
+	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion); err != nil {
 		return err
 	}
 	if err := ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion); err != nil {
@@ -290,6 +290,13 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Record WHICH kine is about to run — version AND build variant. The variant is not
+	// cosmetic: the same kine tag builds two different SQLite implementations depending
+	// on CGO_ENABLED, and a datastore incident that starts "which sqlite was this?"
+	// should be answerable from the node's own log.
+	kineVersion, kineVariant := readKineMarker(binDir(s.cfg.WorkDir))
+	s.cfg.Logger.Info("starting datastore shim", "component", "kine",
+		"version", kineVersion, "variant", kineVariant, "datastore", datastorePosture(s.cfg))
 	env, err := s.kineSecretEnv()
 	if err != nil {
 		return nil, err

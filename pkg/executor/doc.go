@@ -65,10 +65,14 @@ limitations under the License.
 // HA is Postgres-FROM-INIT (greenfield): there is NO live SQLite->Postgres data
 // conversion — the single-node SQLite default is untouched, and the only path from an
 // existing SQLite cluster to Postgres is an operator kine dump/restore (in-place
-// conversion is out of scope). Because the paths never coexist on one datastore, the
-// kine version is split by posture: SQLite stays on DefaultKineVersion (v1.14.2,
-// zero migration risk for the installed base) and Postgres pins DefaultKineVersionHA
-// (>=0.15, carrying the kine#577 watch-progress-notify fix). The multi-writer
+// conversion is out of scope). BOTH postures run the SAME pinned kine build
+// (DefaultKineVersion, a >=0.16 release built CGO_ENABLED=0 against the pure-Go
+// modernc.org/sqlite backend), which carries the kine#577 watch-progress-notify fix;
+// the SQLite/Postgres split is a driver choice inside one binary, not a second
+// version. Moving an EXISTING single-node datastore onto a new pin is a one-way
+// migration, so the boot takes a verified pre-migration snapshot first
+// (snapshotBeforeKineUpgrade — TRUNCATE-checkpointed, integrity-checked, write-once,
+// with the superseded kine binary preserved beside it). The multi-writer
 // watch-staleness soak (a consistent LIST on server B immediately after server A's
 // committed write, under sustained churn — the kine#577 failure mode) is the LAB
 // production-trust gate (hack/lab/m6.sh), not a unit-provable property.

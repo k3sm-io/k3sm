@@ -10,7 +10,7 @@
 # Requires: macOS 26+ arm64, Go, Xcode CLT (clang), gh, curl, openssl, nc.
 
 : "${KUBE_VERSION:=v1.36.2}"          # latest darwin-arm64 on kwok-ci/k8s
-: "${KINE_VERSION:=v1.14.2}"
+: "${KINE_VERSION:=v0.17.0}"     # ONE pin, both postures (executor.DefaultKineVersion)
 : "${K3SM_WORKDIR:=/tmp/k3sm-cluster}"
 : "${APISERVER_PORT:=6444}"           # NOT 6443 — Docker Desktop's k8s squats there
 : "${KINE_PORT:=2379}"
@@ -380,8 +380,11 @@ cluster_up() {
 		chmod +x "$BIN"/*
 	  fi
 	  for b in kube-apiserver kube-scheduler kube-controller-manager kubectl; do codesign -s - -f "$BIN/$b" >/dev/null 2>&1 || true; done
-	  # 2. kine — REQUIRES cgo (mattn/go-sqlite3); the no-cgo build disables sqlite
-	  if [ ! -x "$BIN/kine" ]; then CGO_ENABLED=1 GOWORK=off GOBIN="$BIN" go install "github.com/k3s-io/kine@${KINE_VERSION}"; codesign -s - -f "$BIN/kine" >/dev/null 2>&1 || true; fi
+	  # 2. kine — built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend,
+	  #    the same variant pkg/executor stages. The version marker is written beside it so
+	  #    the server's marker-gated staging finds it current and does not rebuild it.
+	  if [ ! -x "$BIN/kine" ]; then CGO_ENABLED=0 GOWORK=off GOBIN="$BIN" go install "github.com/k3s-io/kine@${KINE_VERSION}"; codesign -s - -f "$BIN/kine" >/dev/null 2>&1 || true; fi
+	  printf '%s nocgo\n' "${KINE_VERSION}" > "$BIN/kine.version"
 	  # 3. SA keypair, static token, kubeconfig
 	  [ -f sa.key ] || { openssl genrsa -out sa.key 2048 2>/dev/null; openssl rsa -in sa.key -pubout -out sa.pub 2>/dev/null; }
 	  printf '%s,admin,admin-uid,"system:masters"\n' "$CP_TOKEN" > tokens.csv; chmod 600 tokens.csv

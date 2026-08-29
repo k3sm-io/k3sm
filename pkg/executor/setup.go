@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -190,9 +191,84 @@ func ensureControlPlaneBinariesVerified(ctx context.Context, bd, kubeVersion str
 	return signBinaries(ctx, bd, cpBinaries)
 }
 
-// ensureKine builds kine from source with cgo (mattn/go-sqlite3 — the no-cgo
-// build disables SQLite, a validated M0 finding) into the workdir bin and ad-hoc
-// signs it. No-op if already present. Mirrors clusterup.sh step 2.
+// kine staging constants. The binary is accompanied by a VERSION MARKER, because a
+// presence-only check ("is there a file called kine?") cannot tell a correctly staged
+// binary from one an EARLIER release built: every node that has booted once already has
+// a kine binary, so a pin change would reach fresh installs only and silently never
+// reach the installed base — the exact failure mode the v1.14.2 -> v0.17.0 collapse
+// would otherwise have had.
+const (
+	// kineBinaryName is the staged kine binary's basename (in the workdir bin, in an
+	// install payload, and in the release archive).
+	kineBinaryName = "kine"
+	// KineMarkerName is the basename of the version marker written beside a staged
+	// kine binary. Exported so the packaging/install paths name the one file the
+	// staging contract depends on rather than re-typing the string.
+	KineMarkerName = "kine.version"
+	// kineBuildVariant records HOW the pinned kine child was built. "nocgo" is
+	// CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
+	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo). It is part of the marker
+	// because version alone does not identify the binary: the same kine tag builds two
+	// different SQLite implementations depending on CGO_ENABLED, and only this one
+	// keeps the unmaintained mattn/go-sqlite3 out of every k3sm artifact.
+	kineBuildVariant = "nocgo"
+)
+
+// kinePath / kineMarkerPath name the staged kine binary and its version marker in a
+// bin dir (a workdir bin or a payload dir).
+func kinePath(bd string) string       { return filepath.Join(bd, kineBinaryName) }
+func kineMarkerPath(bd string) string { return filepath.Join(bd, KineMarkerName) }
+
+// kineMarkerContent renders a marker: "<version> <variant>\n".
+func kineMarkerContent(version string) string { return version + " " + kineBuildVariant + "\n" }
+
+// readKineMarker returns the (version, variant) recorded beside a staged kine binary.
+// A missing or unreadable marker yields ("", ""), which no target ever matches — so an
+// unmarked binary (anything staged before markers existed) always re-stages.
+func readKineMarker(bd string) (version, variant string) {
+	b, err := os.ReadFile(kineMarkerPath(bd))
+	if err != nil {
+		return "", ""
+	}
+	f := strings.Fields(string(b))
+	switch len(f) {
+	case 0:
+		return "", ""
+	case 1:
+		return f[0], ""
+	default:
+		return f[0], f[1]
+	}
+}
+
+// kineStaged reports whether bd holds a kine binary whose marker vouches for exactly
+// (version, kineBuildVariant). The marker is written LAST and only after the binary is
+// staged and signed, so "marker matches" implies "the binary beside it is finished".
+func kineStaged(bd, version string) bool {
+	if _, err := os.Stat(kinePath(bd)); err != nil {
+		return false
+	}
+	v, variant := readKineMarker(bd)
+	return v == version && variant == kineBuildVariant
+}
+
+// writeKineMarker writes the marker atomically (temp + rename) so a crashed or
+// killed boot can never leave a half-written marker vouching for the wrong bytes.
+func writeKineMarker(bd, version string) error {
+	tmp := kineMarkerPath(bd) + ".tmp"
+	if err := os.WriteFile(tmp, []byte(kineMarkerContent(version)), 0o644); err != nil {
+		return fmt.Errorf("write kine version marker: %w", err)
+	}
+	if err := os.Rename(tmp, kineMarkerPath(bd)); err != nil {
+		return fmt.Errorf("install kine version marker: %w", err)
+	}
+	return nil
+}
+
+// ensureKine builds kine from source CGO_ENABLED=0 (kine's pure-Go
+// modernc.org/sqlite backend) into the workdir bin, ad-hoc signs it, and records the
+// version marker. It is a no-op only when the marker already vouches for the wanted
+// version+variant — never on mere presence.
 func ensureKine(ctx context.Context, workDir, kineVersion string) error {
 	return ensureKineInto(ctx, binDir(workDir), kineVersion)
 }
@@ -200,9 +276,16 @@ func ensureKine(ctx context.Context, workDir, kineVersion string) error {
 // ensureKineInto is ensureKine against an explicit bin dir — shared by the boot
 // path and StagePayload.
 func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
-	kine := filepath.Join(bd, "kine")
-	if _, err := os.Stat(kine); err == nil {
-		return signBinaries(ctx, bd, []string{"kine"})
+	kine := kinePath(bd)
+	if kineStaged(bd, kineVersion) {
+		return signBinaries(ctx, bd, []string{kineBinaryName})
+	}
+	// Drop any stale marker BEFORE touching the binary: from here until the marker is
+	// rewritten, the correct answer to "what is staged?" is "nothing trustworthy", and
+	// an interrupted re-stage must re-stage again rather than trust a marker that
+	// describes bytes we did not finish writing.
+	if err := os.Remove(kineMarkerPath(bd)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear kine version marker: %w", err)
 	}
 	// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
 	// is set ("cannot install cross-compiled binaries when GOBIN is set"), and the
@@ -218,11 +301,16 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	defer func() { _ = os.RemoveAll(gopath) }()
 
 	cmd := exec.CommandContext(ctx, "go", "install", "github.com/k3s-io/kine@"+kineVersion)
-	// GOBIN is cleared (not just unset in our env) so an ambient GOBIN cannot
-	// re-trigger the refusal above.
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOWORK=off", "GOBIN=", "GOPATH="+gopath)
+	// CGO_ENABLED=0 selects kine's pure-Go SQLite backend (modernc.org/sqlite, behind
+	// //go:build !cgo). It is a real, supported kine variant on the pinned version —
+	// not the SQLite-disabled stub the M0 spike measured on the old pin — and it is
+	// what keeps the unmaintained mattn/go-sqlite3 (and a C toolchain) out of every
+	// k3sm artifact. GOBIN is cleared (not just unset in our env) so an ambient GOBIN
+	// cannot re-trigger the cross-compile refusal above.
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("build kine %s (CGO_ENABLED=1): %w: %s", kineVersion, err, out)
+		return fmt.Errorf("build kine %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
+			kineVersion, err, out)
 	}
 
 	goos, goarch := runtime.GOOS, runtime.GOARCH
@@ -236,10 +324,19 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	if _, statErr := os.Stat(built); statErr != nil {
 		built = filepath.Join(gopath, "bin", "kine") // native
 	}
-	if err := copyFile(built, kine, 0o755); err != nil {
+	// Stage through a temp name + rename so an interrupted copy cannot leave a
+	// truncated binary at the real path.
+	if err := copyFile(built, kine+".tmp", 0o755); err != nil {
 		return fmt.Errorf("stage kine binary: %w", err)
 	}
-	return signBinaries(ctx, bd, []string{"kine"})
+	if err := os.Rename(kine+".tmp", kine); err != nil {
+		return fmt.Errorf("install kine binary: %w", err)
+	}
+	if err := signBinaries(ctx, bd, []string{kineBinaryName}); err != nil {
+		return err
+	}
+	// LAST: the marker vouches for a staged, signed binary.
+	return writeKineMarker(bd, kineVersion)
 }
 
 // copyFile copies src to dst with the given mode, replacing dst if present.
@@ -269,7 +366,8 @@ func PayloadBinaries() []string { return append(append([]string{}, cpBinaries...
 
 // StagePayload acquires the full control-plane payload into destDir using the
 // executor's own pinned versions (DefaultKubeVersion via `gh release download`,
-// DefaultKineVersion via `go install`). It is the packaging-side producer: run
+// DefaultKineVersion via a CGO_ENABLED=0 `go install`, which also drops the
+// KineMarkerName marker beside the binary so a seeded workdir knows what it got). It is the packaging-side producer: run
 // it where the dev tools exist (a human shell, goreleaser), then hand destDir to
 // `k3sm install`, which stages it beside the daemon; the daemon boot seeds its
 // workdir from the staged copy and never needs gh/go (a launchd _k3sm daemon
@@ -299,7 +397,15 @@ func StagePayload(ctx context.Context, destDir string) error {
 // or missing individual binary is NOT an error here: the ensure* fallbacks
 // still run and fail with their own actionable errors (dev shells keep working
 // with no payload at all).
-func seedBinDir(workDir, payloadDir string) error {
+//
+// kine is the ONE exception to "never overwrite an existing workdir binary", and it
+// has to be: ensureKineInto now re-stages on a version-marker mismatch, and its
+// fallback is a Go toolchain a launchd _k3sm daemon does not have. So on a packaged
+// upgrade whose kine pin moved, the workdir's stale kine is REPLACED from the payload
+// (which ships in the same archive as this binary and therefore carries this binary's
+// pin) instead of being left for a build that cannot run. kineVersion is the target
+// the caller resolved (Config.KineVersion).
+func seedBinDir(workDir, payloadDir, kineVersion string) error {
 	if payloadDir == "" {
 		return nil
 	}
@@ -307,9 +413,17 @@ func seedBinDir(workDir, payloadDir string) error {
 	if err := os.MkdirAll(bd, 0o755); err != nil {
 		return fmt.Errorf("create bin dir %s: %w", bd, err)
 	}
+	// A staged kine whose marker does not vouch for the target is re-seeded from the
+	// payload — but ONLY when the payload's OWN marker vouches for the target. Trusting
+	// an unmarked payload instead would mean stamping "this is the new pin" onto bytes
+	// nobody verified: a node upgraded by replacing only the binary still has the
+	// previous release's payload staged, and the lie would leave it running the old
+	// datastore engine while claiming the new one. An unmarked payload therefore falls
+	// through to ensureKineInto, which rebuilds or reports.
+	restageKine := !kineStaged(bd, kineVersion) && kineStaged(payloadDir, kineVersion)
 	for _, name := range PayloadBinaries() {
 		dst := filepath.Join(bd, name)
-		if _, err := os.Stat(dst); err == nil {
+		if _, err := os.Stat(dst); err == nil && !(name == kineBinaryName && restageKine) {
 			continue // already present (a prior boot seeded/acquired it)
 		}
 		src := filepath.Join(payloadDir, name)
@@ -324,7 +438,20 @@ func seedBinDir(workDir, payloadDir string) error {
 			return fmt.Errorf("seed %s from payload: %w", dst, err)
 		}
 	}
+	if restageKine {
+		if err := writeKineMarker(bd, kineVersion); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// fileExists reports whether path names an existing file (any stat error — including
+// a permission error — reads as absent, which is the conservative answer for every
+// caller here: it falls back to the acquisition path, which reports its own error).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // chmodExec makes every file in dir executable.

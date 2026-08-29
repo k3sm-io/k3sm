@@ -142,6 +142,12 @@ func VerifyPayloadSet(dir string) error {
 	for _, b := range PayloadBinaries() {
 		allowed[b] = true
 	}
+	// The kine version marker rides beside the kine binary it describes (see
+	// KineMarkerName): it is what tells a seeded workdir which pin+variant it got, so
+	// the payload must be allowed to carry it. It is ALLOWED, not required — archives
+	// produced before markers existed still verify, and pkg/install stages it
+	// best-effort for the same reason.
+	allowed[KineMarkerName] = true
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read payload dir %s: %w", dir, err)

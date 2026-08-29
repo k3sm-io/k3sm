@@ -118,7 +118,7 @@ type Info struct {
 	Platform string
 	// KubeVersion is the aligned Kubernetes control-plane version.
 	KubeVersion string
-	// KineVersion is the aligned kine (etcd shim) version.
+	// KineVersion is the aligned kine (etcd shim) version — one pin, both postures.
 	KineVersion string
 	// Modules are the assembled k3sm.io modules and their release SHAs.
 	Modules []ModuleRef
@@ -227,10 +227,9 @@ func (i Info) String() string {
 	fmt.Fprintf(&b, "  go:            %s\n", i.GoVersion)
 	fmt.Fprintf(&b, "  platform:      %s\n", i.Platform)
 	fmt.Fprintf(&b, "  kubernetes:    %s\n", i.KubeVersion)
-	// KineVersion is the single-node SQLite pin (DefaultKineVersion); the
-	// Postgres-HA path selects DefaultKineVersionHA at runtime, so the label is
-	// qualified to avoid misstating the shim version on an HA node.
-	fmt.Fprintf(&b, "  kine (sqlite): %s\n", i.KineVersion)
+	// One kine pin serves both datastore postures (executor.DefaultKineVersion), so
+	// the label is unqualified: it is the shim version on every node, HA or not.
+	fmt.Fprintf(&b, "  kine:          %s\n", i.KineVersion)
 	if len(i.Modules) > 0 {
 		b.WriteString("  modules:\n")
 		for _, m := range i.Modules {

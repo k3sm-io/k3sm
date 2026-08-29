@@ -45,13 +45,28 @@ const (
 	datastoreConnMaxLifetime = "30m"
 )
 
-// sqliteEndpoint is the single-node kine->SQLite WAL DSN. It is BYTE-UNCHANGED from
-// M1 (the single-node installed base depends on this exact string); do not reorder
-// or reformat the query parameters. The path segment composes on StateDBPath so the
-// writer and the `k3sm doctor` probe share one source of the state.db layout — the
-// emitted string is byte-identical to the prior hand-joined form.
+// sqliteEndpoint is the single-node kine->SQLite WAL DSN. The path segment composes
+// on StateDBPath so the writer and the `k3sm doctor` probe share one source of the
+// state.db layout.
+//
+// _kine_disable_startup_vacuum turns OFF the full-database VACUUM kine >=0.16 runs on
+// EVERY startup (kine pkg/drivers/sqlite/sqlite.go: noStartupVacuum). k3sm DELIBERATELY
+// disables it. A VACUUM rewrites the entire database — it needs room for a second full
+// copy on the same APFS volume that also holds the image store, pod dirs, and PV data
+// (DESIGN's ENOSPC hazard), and it lengthens every boot of a laptop-class node in
+// proportion to cluster size, on the critical path before the apiserver can start.
+// Reclaiming post-compaction free pages is worth doing occasionally, not once per
+// `launchctl kickstart`; if it is ever wanted it becomes a deliberate maintenance
+// operation, not a boot-time surprise. The old pin (v1.14.2) never vacuumed at startup,
+// so leaving the flag off would have made "same datastore, new kine pin" silently
+// change what a boot does to the disk.
+//
+// The parameter is valueless by kine's own contract (a strings.Contains probe on the
+// DSN); the no-cgo driver passes unknown parameters through to modernc.org/sqlite,
+// which ignores it. Verified live against the pinned build: kine logs
+// "Startup VACUUM is disabled" and serves normally.
 func sqliteEndpoint(workDir string) string {
-	return "sqlite://" + StateDBPath(workDir) + "?_journal=WAL&_busy_timeout=30000"
+	return "sqlite://" + StateDBPath(workDir) + "?_journal=WAL&_busy_timeout=30000&_kine_disable_startup_vacuum"
 }
 
 // kineArgs renders kine's argv from cfg. It is a pure function (no I/O) so the
@@ -128,4 +143,14 @@ func pgPassPath(workDir string) string { return filepath.Join(workDir, ".pgpass"
 func pgPassLine(password string) string {
 	esc := strings.NewReplacer(`\`, `\\`, `:`, `\:`).Replace(password)
 	return "*:*:*:*:" + esc + "\n"
+}
+
+// datastorePosture names the datastore backing this server for logging: "sqlite" for
+// the single-node WAL default, "postgres" for the HA multi-writer endpoint. It reads
+// only the posture, never the DSN (which carries a password).
+func datastorePosture(cfg Config) string {
+	if cfg.DatastoreEndpoint == "" {
+		return "sqlite"
+	}
+	return "postgres"
 }
