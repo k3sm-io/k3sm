@@ -290,7 +290,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		return Instance{}, err
 	}
 
-	apiPort, kinePort, kubeletPort, err := allocatePorts(m.sys, name, m.euid)
+	alloc, err := allocatePorts(m.sys, name, m.euid)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -352,7 +352,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// default; hostprocess is only the honest execshim-unavailable fallback. The
 	// rootless tier is network=none (runtimePreflight returns nil — no root);
 	// --datapath is network=direct.
-	proc, err := m.spawnServer(ctx, name, workDir, podRoot, apiPort, kinePort, kubeletPort, network, runtimeName, binDir, pathShim, dnsShim)
+	proc, err := m.spawnServer(ctx, name, workDir, podRoot, alloc, network, runtimeName, binDir, pathShim, dnsShim)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -367,23 +367,25 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	}
 
 	inst := Instance{
-		Version:     registryVersion,
-		Name:        name,
-		WorkDir:     workDir,
-		PodRoot:     podRoot,
-		APIPort:     apiPort,
-		KinePort:    kinePort,
-		KubeletPort: kubeletPort,
-		PID:         proc.pid,
-		Tier:        tier,
-		Runtime:     runtimeName,
-		Datapath:    datapath,
-		ServiceCIDR: ServiceCIDR,
-		PodCIDR:     PodCIDR,
-		EUID:        m.euid,
-		KubeContext: kubeContextName(name),
-		Kubeconfig:  kubePath,
-		CreatedAt:   time.Now().UTC(),
+		Version:               registryVersion,
+		Name:                  name,
+		WorkDir:               workDir,
+		PodRoot:               podRoot,
+		APIPort:               alloc.api,
+		KinePort:              alloc.kine,
+		KubeletPort:           alloc.kubelet,
+		SchedulerPort:         alloc.scheduler,
+		ControllerManagerPort: alloc.controllerManager,
+		PID:                   proc.pid,
+		Tier:                  tier,
+		Runtime:               runtimeName,
+		Datapath:              datapath,
+		ServiceCIDR:           ServiceCIDR,
+		PodCIDR:               PodCIDR,
+		EUID:                  m.euid,
+		KubeContext:           kubeContextName(name),
+		Kubeconfig:            kubePath,
+		CreatedAt:             time.Now().UTC(),
 	}
 
 	// Wait for the server to write its kubeconfig, then merge it. On any failure
@@ -459,7 +461,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	}
 
 	fmt.Fprint(m.out, FidelityBanner(datapath, runtimeName))
-	fmt.Fprintf(m.out, "\ninstance %q up — apiserver 127.0.0.1:%d · context %s · kubeconfig %s\n", name, apiPort, inst.KubeContext, kubePath)
+	fmt.Fprintf(m.out, "\ninstance %q up — apiserver 127.0.0.1:%d · context %s · kubeconfig %s\n", name, alloc.api, inst.KubeContext, kubePath)
 	return inst, nil
 }
 
@@ -655,7 +657,7 @@ func (m *Manager) preflightReclaim(name string) error {
 // unit-tested without spawning a process. An empty shim path emits NO flag at
 // all: the server must fall back to its own sibling-dylib resolution rather than
 // be pointed at a path that is not there.
-func serverArgs(name, workDir, podRoot string, apiPort, kinePort, kubeletPort int, network, runtimeName, pathShim, dnsShim string) []string {
+func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, runtimeName, pathShim, dnsShim string) []string {
 	args := []string{
 		"server",
 		"--work-dir", workDir,
@@ -668,12 +670,12 @@ func serverArgs(name, workDir, podRoot string, apiPort, kinePort, kubeletPort in
 		"--node-ip", "127.0.0.1",
 		"--runtime", runtimeName,
 		"--network", network,
-		"--api-port", strconv.Itoa(apiPort),
+		"--api-port", strconv.Itoa(alloc.api),
 		// The allocated datastore port, NOT the server default: without it every
 		// instance's kine would target the one fixed port, and the second instance up
 		// would be refused by the executor (or, before that refusal existed, come up
 		// healthy against the first instance's datastore).
-		"--kine-port", strconv.Itoa(kinePort),
+		"--kine-port", strconv.Itoa(alloc.kine),
 		// The allocated kubelet-API port, same reason one port further down the
 		// bring-up: the node's logs/exec/stats listener is a per-NODE singleton, so
 		// on the fixed default the second instance's node dies at "bind: address
@@ -683,7 +685,18 @@ func serverArgs(name, workDir, podRoot string, apiPort, kinePort, kubeletPort in
 		// wildcard) and its auth posture are the server's own, unchanged by this
 		// flag and not dev's to move: `k3sm dev` must never be the reason that
 		// surface is reachable from somewhere it was not already.
-		"--kubelet-port", strconv.Itoa(kubeletPort),
+		"--kubelet-port", strconv.Itoa(alloc.kubelet),
+		// The allocated scheduler and controller-manager secure ports — the last two
+		// singletons a control plane owns. Without them a second instance reaches a
+		// healthy apiserver and then loses these binds, and the symptom appears
+		// somewhere else entirely: with no service-account controller running, the
+		// default namespace never finishes bootstrapping.
+		//
+		// As with the kubelet port, dev hands over a PORT and nothing else. Both
+		// components are bound to loopback by the server, and moving a listener that
+		// only the co-located control plane talks to is not dev's decision to revisit.
+		"--scheduler-port", strconv.Itoa(alloc.scheduler),
+		"--controller-manager-port", strconv.Itoa(alloc.controllerManager),
 		// Disable the ingress listeners: the dev cluster does not front an ingress,
 		// and the production :80/:443 bind needs privileges the rootless tier lacks.
 		"--ingress-http-port", "0",
@@ -703,7 +716,7 @@ func serverArgs(name, workDir, podRoot string, apiPort, kinePort, kubeletPort in
 // <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
 // until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
 // read the same workdir.
-func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, apiPort, kinePort, kubeletPort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (*serverProc, error) {
+func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, alloc instancePorts, network, runtimeName, execShimDir, pathShim, dnsShim string) (*serverProc, error) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
 	}
@@ -720,7 +733,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	}
 	defer lf.Close()
 
-	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, apiPort, kinePort, kubeletPort, network, runtimeName, pathShim, dnsShim)...)
+	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, alloc, network, runtimeName, pathShim, dnsShim)...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	// Own process group so `down` can SIGTERM the whole supervised tree via -pid,
 	// and detached from ctx cancellation (WaitDelay 0 + no Cancel) so the server

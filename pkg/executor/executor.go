@@ -63,6 +63,13 @@ type Config struct {
 	APIServerPort int
 	// KinePort is the kine (etcd shim) listen port. Defaults to 2379.
 	KinePort int
+	// SchedulerPort is the kube-scheduler secure-serving port. Defaults to 10259.
+	// Per-SERVER, not per-host: it is a singleton listener, so a second control
+	// plane on one Mac whose scheduler keeps the default loses the bind.
+	SchedulerPort int
+	// ControllerManagerPort is the kube-controller-manager secure-serving port.
+	// Defaults to 10257, per-server for the same reason as SchedulerPort.
+	ControllerManagerPort int
 	// KubeVersion is the kwok-ci/k8s control-plane release (darwin-arm64).
 	// Defaults to DefaultKubeVersion.
 	KubeVersion string
@@ -197,6 +204,12 @@ const (
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.
 	DefaultKinePort = 2379
+	// DefaultSchedulerPort is the kube-scheduler secure-serving port (the
+	// upstream default), bound on loopback only.
+	DefaultSchedulerPort = 10259
+	// DefaultControllerManagerPort is the kube-controller-manager secure-serving
+	// port (the upstream default), bound on loopback only.
+	DefaultControllerManagerPort = 10257
 	// DefaultAuthorizationMode is the apiserver authorizer chain from M4.1 onward:
 	// the Node authorizer (scopes a kubelet/VK-node to its own objects) plus RBAC
 	// (default-deny). It replaces the M0–M3 AlwaysAllow posture.
@@ -293,6 +306,27 @@ func (c Config) isHA() bool {
 	return c.DatastoreEndpoint != "" || c.ServerJoin
 }
 
+// schedulerPort resolves the kube-scheduler secure-serving port: the configured
+// value, or the upstream default when unset. Resolving through an accessor (like
+// leaderElect) keeps the pure argv renderers TOTAL — a Config built by hand in a
+// test renders a real port rather than `--secure-port 0`, which upstream reads as
+// "pick any free port" and would make the listener unfindable.
+func (c Config) schedulerPort() int {
+	if c.SchedulerPort == 0 {
+		return DefaultSchedulerPort
+	}
+	return c.SchedulerPort
+}
+
+// controllerManagerPort resolves the kube-controller-manager secure-serving port,
+// same contract as schedulerPort.
+func (c Config) controllerManagerPort() int {
+	if c.ControllerManagerPort == 0 {
+		return DefaultControllerManagerPort
+	}
+	return c.ControllerManagerPort
+}
+
 // leaderElect reports the scheduler + controller-manager --leader-elect setting for
 // this posture (see Config.LeaderElect): an explicit pointer wins, else it derives
 // from isHA — ON in HA, OFF single-node.
@@ -315,6 +349,8 @@ func (c Config) withDefaults() Config {
 	if c.KinePort == 0 {
 		c.KinePort = DefaultKinePort
 	}
+	c.SchedulerPort = c.schedulerPort()
+	c.ControllerManagerPort = c.controllerManagerPort()
 	if c.KubeVersion == "" {
 		c.KubeVersion = DefaultKubeVersion
 	}

@@ -18,8 +18,10 @@ package executor
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -234,5 +236,86 @@ func TestComponentExitedNowTracksTheChild(t *testing.T) {
 	<-gone.exited
 	if !gone.exitedNow() {
 		t.Error("an exited child must report exitedNow() == true")
+	}
+}
+
+// TestLoopbackComponentWaitsForItsListener pins the bring-up stage that the
+// scheduler and controller-manager did not previously have. They were started
+// fire-and-forget, so a component that died after the spawn left bring-up
+// reporting success, and the failure surfaced far downstream — as a namespace
+// bootstrap that never completes, because nothing is running the service-account
+// controller.
+//
+// Both directions run against a REAL child process and a REAL socket. A component
+// that dies must fail with its own name and log tail; a component whose port
+// starts accepting must return promptly rather than block to the timeout. The
+// live listener is opened only AFTER the child is running, because the pre-spawn
+// guard (see preflightComponentPort) correctly refuses a port that was already
+// held — the two halves cover disjoint windows and the test must not conflate
+// them.
+func TestLoopbackComponentWaitsForItsListener(t *testing.T) {
+	wd := t.TempDir()
+	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stands in for kube-scheduler: prints the diagnostic a real one prints when it
+	// cannot get its port, and dies.
+	deadScript := "#!/bin/sh\necho 'failed to listen on 127.0.0.1: address already in use'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir(wd), "kube-scheduler"), []byte(deadScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stands in for a healthy controller-manager: announces that it is running and
+	// stays up. It never binds anything — the test opens the listener, so what the
+	// wait observes is unambiguously the port and not the process.
+	marker := filepath.Join(wd, "kcm.started")
+	liveScript := "#!/bin/sh\ntouch " + marker + "\nsleep 60\n"
+	if err := os.WriteFile(filepath.Join(binDir(wd), "kube-controller-manager"), []byte(liveScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewSupervised(Config{WorkDir: wd})
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	deadPort := freePort(t)
+	err := s.startAndAwaitListening(context.Background(), "scheduler", s.startScheduler, deadPort)
+	if err == nil {
+		t.Fatal("a component that died during bring-up must fail it, got nil")
+	}
+	for _, want := range []string{"kube-scheduler", "exited during bring-up", "address already in use"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must contain %q — the fault has to name the component that has it", err, want)
+		}
+	}
+
+	livePort := freePort(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.startAndAwaitListening(context.Background(), "controller-manager", s.startControllerManager, livePort)
+	}()
+	// Bind only once the child is up, so the pre-spawn guard sees a free port and
+	// the wait sees a listener appear the way a real component's would.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, statErr := os.Stat(marker); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the fake controller-manager never started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	live, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(livePort)))
+	if err != nil {
+		t.Fatalf("open the component's listener: %v", err)
+	}
+	defer live.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("a component whose port accepts must pass bring-up, got %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the wait did not return once the port accepted — it must return on readiness, not on the timeout")
 	}
 }

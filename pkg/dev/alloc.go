@@ -28,6 +28,15 @@ import (
 // so a dev instance never collides with an acceptance run or a second dev
 // instance. The window is high (ephemeral-ish) and wide enough for many parallel
 // rootless instances.
+//
+// The five bases are pairwise more than portSpan apart, so no two instances'
+// windows can overlap and no port can be allocated for two roles:
+//
+//	kubelet             10450–10961
+//	scheduler           11450–11961
+//	kine (datastore)    12379–12890
+//	controller-manager  13450–13961
+//	apiserver           16440–16951
 const (
 	apiPortBase  = 16440
 	kinePortBase = 12379
@@ -36,6 +45,12 @@ const (
 	// 10250 itself, and the scheduler/controller-manager 10259/10257 — so a probe
 	// that walks the whole span still never lands on one of them.
 	kubeletPortBase = 10450
+	// schedulerPortBase and controllerManagerPortBase seed the two co-located
+	// control-plane components' secure-serving ports. Both windows likewise clear
+	// the fixed defaults (10259/10257) they replace. The controller-manager's base
+	// skips a decade because 12450 would fall inside the datastore window above.
+	schedulerPortBase         = 11450
+	controllerManagerPortBase = 13450
 	// portSpan bounds the linear probe from each base — 512 candidate ports is
 	// far more than the realistic parallel-instance count, and keeps the search
 	// bounded so a wedged host fails fast rather than scanning 64k ports.
@@ -45,49 +60,85 @@ const (
 	portStride = 2
 )
 
-// allocatePorts picks a free (apiPort, kinePort, kubeletPort) triple for name,
+// instancePorts is every singleton TCP listener one dev instance owns. It is a
+// STRUCT and not a tuple because the members are all ints: five positional int
+// results, threaded through the spawn path and into an argv, is a shape where
+// transposing two of them compiles cleanly and produces a cluster whose scheduler
+// is listening on the datastore's port.
+type instancePorts struct {
+	api               int
+	kine              int
+	kubelet           int
+	scheduler         int
+	controllerManager int
+}
+
+// portClasses is the allocation order: one entry per listener, each with the base
+// of its own window. Adding a listener is adding a row — which is the point, since
+// this set has grown three times, once per singleton port discovered the hard way
+// by a second instance failing to boot on it.
+//
+// The ORDER is load-bearing: each class consumes the next slice of the hash seed,
+// so re-ordering or inserting above an existing row would move the preferred ports
+// of instances that already exist. New classes go on the END.
+var portClasses = []struct {
+	name string
+	base int
+	set  func(*instancePorts, int)
+}{
+	{"apiserver", apiPortBase, func(p *instancePorts, v int) { p.api = v }},
+	{"kine", kinePortBase, func(p *instancePorts, v int) { p.kine = v }},
+	{"kubelet", kubeletPortBase, func(p *instancePorts, v int) { p.kubelet = v }},
+	{"scheduler", schedulerPortBase, func(p *instancePorts, v int) { p.scheduler = v }},
+	{"controller-manager", controllerManagerPortBase, func(p *instancePorts, v int) { p.controllerManager = v }},
+}
+
+// allocatePorts picks a free port for every listener an instance owns,
 // deterministically SEEDED from (name × euid) so re-running `up <name>` prefers
 // the same ports (a stable dev loop), then linearly probing forward past any that
 // are currently bound (System.PortFree) so parallel rootless instances never
-// collide. It errors only if the whole window is saturated. The three ports are
-// drawn from disjoint bases so they cannot alias each other.
+// collide. It errors only if a window is saturated.
 //
-// EVERY singleton listener an instance owns has to be in here. The kubelet API
-// port joined the pair because it is the node's own listener: two instances that
-// each bind the one fixed default contend for it, and the loser's node exits
-// bring-up with "bind: address already in use" — the same defect the datastore
-// port had, one process further down.
-func allocatePorts(sys System, name string, euid int) (apiPort, kinePort, kubeletPort int, err error) {
+// EVERY singleton listener an instance owns has to be in here, and the set is
+// complete only because each omission was found by a boot that failed: the
+// datastore port (a second instance silently sharing the first one's database),
+// then the node's kubelet API (`bind: address already in use` after a healthy
+// control plane), then the scheduler and controller-manager secure ports (a dead
+// service-account controller, surfacing as a namespace bootstrap that never
+// finishes). A fixed port shared by two instances is not a dev-ergonomics wart —
+// it is a cluster silently wired to another cluster's process.
+func allocatePorts(sys System, name string, euid int) (instancePorts, error) {
+	var out instancePorts
 	seed := hashSeed(name, euid)
-	apiPort, err = probeFreePort(sys, apiPortBase, int(seed%portSpan))
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("allocate apiserver port: %w", err)
+	for _, c := range portClasses {
+		p, err := probeFreePort(sys, c.base, int(seed%portSpan))
+		if err != nil {
+			return instancePorts{}, fmt.Errorf("allocate %s port: %w", c.name, err)
+		}
+		c.set(&out, p)
+		seed /= portStride
 	}
-	kinePort, err = probeFreePort(sys, kinePortBase, int((seed/portStride)%portSpan))
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("allocate kine port: %w", err)
-	}
-	kubeletPort, err = probeFreePort(sys, kubeletPortBase, int((seed/(portStride*portStride))%portSpan))
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("allocate kubelet port: %w", err)
-	}
-	// A degenerate hash could land two of them on the same absolute number only if
-	// their bases were less than a span apart; the closest two bases are 1929
-	// apart, so this cannot happen — but assert it so a future base change can't
-	// silently break it.
-	for _, c := range []struct {
-		a, b   string
-		pa, pb int
+	// Two windows less than a span apart could hand the same absolute number to two
+	// roles. The bases above are spaced so that cannot happen — assert it, so a
+	// future base change cannot silently break it.
+	allocated := []struct {
+		name string
+		port int
 	}{
-		{"apiserver", "kine", apiPort, kinePort},
-		{"apiserver", "kubelet", apiPort, kubeletPort},
-		{"kine", "kubelet", kinePort, kubeletPort},
-	} {
-		if c.pa == c.pb {
-			return 0, 0, 0, fmt.Errorf("allocated %s and %s ports collide on %d", c.a, c.b, c.pa)
+		{"apiserver", out.api},
+		{"kine", out.kine},
+		{"kubelet", out.kubelet},
+		{"scheduler", out.scheduler},
+		{"controller-manager", out.controllerManager},
+	}
+	for i := range allocated {
+		for j := i + 1; j < len(allocated); j++ {
+			if allocated[i].port == allocated[j].port {
+				return instancePorts{}, fmt.Errorf("allocated %s and %s ports collide on %d", allocated[i].name, allocated[j].name, allocated[i].port)
+			}
 		}
 	}
-	return apiPort, kinePort, kubeletPort, nil
+	return out, nil
 }
 
 // probeFreePort linear-scans base+offset, base+offset+1, … (wrapping within
