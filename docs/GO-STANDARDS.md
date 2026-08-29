@@ -72,8 +72,9 @@ Targets **darwin/arm64, macOS 26+**. Go **1.25.x** across all modules.
   - `k3sm` — **`CGO_ENABLED=1`** (imports runtimed's cgo-backed capability probes; a CGO=0
     build compiles but reports those capabilities unavailable). kine is **not** embedded: the
     executor runs it as a pinned **child process**, built on demand out-of-module
-    (`go install …/kine@pin`, CGO on for that child build only); `mattn/go-sqlite3` is not a
-    dependency of any `k3sm.io` module.
+    (`go install …/kine@pin`, built `CGO_ENABLED=0` against kine's pure-Go
+    `modernc.org/sqlite` backend since the M7.1 pin collapse); `mattn/go-sqlite3` is not a
+    dependency of any `k3sm.io` module and no longer ships in the kine child either.
   - `runtimed` — **`CGO_ENABLED=1`** (darwin syscall shims).
 
 ## Project conventions
