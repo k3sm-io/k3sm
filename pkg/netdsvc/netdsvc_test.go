@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -46,21 +47,36 @@ func TestPortAuthorizer(t *testing.T) {
 	}
 }
 
+// canonicalIngress is the one Service the node-address bind class is
+// allowlisted for in these tests — the same namespace+name pkg/ingresshost
+// provisions and the `k3sm netd` assembler binds.
+var canonicalIngress = ServiceRef{Namespace: "kube-system", Name: "k3sm-ingress"}
+
 // TestNetdAuthorizerNodeAddrLB is the M10.3 deny-by-default table for the
 // node-own-address extension: a <1024 bind on the node's OWN InternalIP is
-// authorized ONLY when a Service of type LoadBalancer declares the port (the
-// ingress/svclb listener, declared by kube-system/k3sm-ingress). Everything
-// else — wrong address, wrong port, only a non-LB Service declaring, a nil
-// predicate, no configured node IP, an unparseable address — is denied.
+// authorized ONLY when the canonical ingress LoadBalancer declares the port.
+// Everything else — wrong address, wrong port, only a non-LB Service declaring,
+// a nil predicate, no configured node IP, an unparseable address — is denied.
 func TestNetdAuthorizerNodeAddrLB(t *testing.T) {
 	svcCIDR := netip.MustParsePrefix("10.43.0.0/16")
 	nodeIP := netip.MustParseAddr("192.168.7.20")
 	// The authoritative Service set: kube-dns (ClusterIP) declares 53; the
 	// canonical k3sm-ingress LoadBalancer declares 80+443.
 	declares := func(port int) bool { return port == 53 || port == 80 || port == 443 }
-	declaresLB := func(port int) bool { return port == 80 || port == 443 }
+	lbDeclarers := func(port int) []ServiceRef {
+		if port == 80 || port == 443 {
+			return []ServiceRef{canonicalIngress}
+		}
+		return nil
+	}
 
-	full := PortPolicy{ServiceCIDR: svcCIDR, Declares: declares, NodeIP: nodeIP, DeclaresLB: declaresLB}
+	full := PortPolicy{
+		ServiceCIDR:        svcCIDR,
+		Declares:           declares,
+		NodeIP:             nodeIP,
+		LBDeclarers:        lbDeclarers,
+		NodeAddressService: canonicalIngress,
+	}
 
 	tests := []struct {
 		name   string
@@ -76,10 +92,12 @@ func TestNetdAuthorizerNodeAddrLB(t *testing.T) {
 		{"wrong addr (neither VIP nor node) denied even for an LB-declared port", full, 80, "192.168.7.99", false},
 		{"service VIP + declared port still allowed (existing rule intact)", full, 53, "10.43.0.10", true},
 		{"service VIP + only-LB semantics do not leak: undeclared VIP port denied", full, 22, "10.43.0.10", false},
-		{"nil DeclaresLB denies the node-address class, fail-safe",
-			PortPolicy{ServiceCIDR: svcCIDR, Declares: declares, NodeIP: nodeIP}, 80, "192.168.7.20", false},
+		{"nil LBDeclarers denies the node-address class, fail-safe",
+			PortPolicy{ServiceCIDR: svcCIDR, Declares: declares, NodeIP: nodeIP, NodeAddressService: canonicalIngress}, 80, "192.168.7.20", false},
+		{"zero NodeAddressService denies the node-address class, fail-safe",
+			PortPolicy{ServiceCIDR: svcCIDR, Declares: declares, NodeIP: nodeIP, LBDeclarers: lbDeclarers}, 80, "192.168.7.20", false},
 		{"zero NodeIP disables the node-address class entirely",
-			PortPolicy{ServiceCIDR: svcCIDR, Declares: declares, DeclaresLB: declaresLB}, 80, "192.168.7.20", false},
+			PortPolicy{ServiceCIDR: svcCIDR, Declares: declares, LBDeclarers: lbDeclarers, NodeAddressService: canonicalIngress}, 80, "192.168.7.20", false},
 		{"zero policy denies everything", PortPolicy{}, 80, "192.168.7.20", false},
 		{"unparseable address denied", full, 80, "not-an-ip", false},
 	}
@@ -143,9 +161,15 @@ func TestBuildConfig(t *testing.T) {
 			ServiceCIDR: svcCIDR,
 			ServiceUID:  502,
 			Declares:    func(int) bool { return true },
-			DeclaresLB:  func(port int) bool { return port == 80 },
-			NodeIP:      netip.MustParseAddr("192.168.7.20"),
-			MeshKeyDir:  t.TempDir(),
+			LBDeclarers: func(port int) []ServiceRef {
+				if port == 80 {
+					return []ServiceRef{canonicalIngress}
+				}
+				return nil
+			},
+			NodeAddressService: canonicalIngress,
+			NodeIP:             netip.MustParseAddr("192.168.7.20"),
+			MeshKeyDir:         t.TempDir(),
 		})
 		if err != nil {
 			t.Fatalf("BuildConfig: %v", err)
@@ -194,6 +218,115 @@ func TestBuildConfig(t *testing.T) {
 		}
 		if cfg.MeshKeyResolver != nil {
 			t.Error("an unset MeshKeyDir must leave MeshKeyResolver nil so ConfigureMesh fails fast")
+		}
+	})
+}
+
+// TestNodeAddressAuthorizerAllowlist is the B133 gate: the node-own-address
+// bind class is an ALLOWLIST keyed on namespace+name, not a test on the
+// requester's shape. Before B133 the branch authorized a privileged bind on the
+// node's real address for ANY Service of type LoadBalancer, in ANY namespace,
+// that declared the port — so the requesting object was its own authorization
+// predicate. Now only the canonical ingress Service (kube-system/k3sm-ingress)
+// authorizes it; a same-port, same-name-other-namespace, or
+// same-namespace-other-name Service is refused, and the refusal NAMES the
+// Service that declared the port so the root daemon's log shows who was denied.
+func TestNodeAddressAuthorizerAllowlist(t *testing.T) {
+	const nodeAddr = "192.168.7.20"
+	svcCIDR := netip.MustParsePrefix("10.43.0.0/16")
+	nodeIP := netip.MustParseAddr(nodeAddr)
+
+	// policy returns the production-shaped policy whose LoadBalancer Service set
+	// (for port 80) is exactly declarers.
+	policy := func(declarers ...ServiceRef) PortPolicy {
+		return PortPolicy{
+			ServiceCIDR: svcCIDR,
+			Declares:    func(int) bool { return true },
+			NodeIP:      nodeIP,
+			LBDeclarers: func(port int) []ServiceRef {
+				if port != 80 {
+					return nil
+				}
+				return declarers
+			},
+			NodeAddressService: canonicalIngress,
+		}
+	}
+
+	tests := []struct {
+		name string
+		// declarers is the LoadBalancer Service set declaring port 80.
+		declarers []ServiceRef
+		allow     bool
+		// wantNamed, when set, must appear in the refusal so the operator can
+		// see WHICH Service was denied the node's address.
+		wantNamed string
+	}{
+		{
+			name:      "the canonical ingress Service is authorized",
+			declarers: []ServiceRef{canonicalIngress},
+			allow:     true,
+		},
+		{
+			name:      "same port, another namespace: refused and named",
+			declarers: []ServiceRef{{Namespace: "tenant-a", Name: "public-web"}},
+			wantNamed: "tenant-a/public-web",
+		},
+		{
+			name:      "same NAME, another namespace: refused and named",
+			declarers: []ServiceRef{{Namespace: "tenant-a", Name: "k3sm-ingress"}},
+			wantNamed: "tenant-a/k3sm-ingress",
+		},
+		{
+			name:      "another name in the canonical namespace: refused and named",
+			declarers: []ServiceRef{{Namespace: "kube-system", Name: "traefik"}},
+			wantNamed: "kube-system/traefik",
+		},
+		{
+			name:      "an impostor does not block the canonical Service",
+			declarers: []ServiceRef{{Namespace: "tenant-a", Name: "public-web"}, canonicalIngress},
+			allow:     true,
+		},
+		{
+			name:      "no LoadBalancer Service declares the port: refused",
+			declarers: nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := PortAuthorizer(policy(tc.declarers...)).Authorize(context.Background(), 80, nodeAddr)
+			if tc.allow {
+				if err != nil {
+					t.Fatalf("Authorize(80, %s) = %v, want allow", nodeAddr, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Authorize(80, %s) = nil, want deny: only %s may authorize a node-address bind", nodeAddr, canonicalIngress)
+			}
+			if !strings.Contains(err.Error(), canonicalIngress.String()) {
+				t.Errorf("refusal %q must name the canonical service %s", err, canonicalIngress)
+			}
+			if tc.wantNamed != "" && !strings.Contains(err.Error(), tc.wantNamed) {
+				t.Errorf("refusal %q must NAME the declaring service %q; a silent refusal is invisible to the operator", err, tc.wantNamed)
+			}
+		})
+	}
+
+	t.Run("the refusal caps the named declarers", func(t *testing.T) {
+		var many []ServiceRef
+		for _, ns := range []string{"t1", "t2", "t3", "t4", "t5", "t6"} {
+			many = append(many, ServiceRef{Namespace: ns, Name: "web"})
+		}
+		err := PortAuthorizer(policy(many...)).Authorize(context.Background(), 80, nodeAddr)
+		if err == nil {
+			t.Fatal("six foreign LoadBalancer Services must not authorize a node-address bind")
+		}
+		if !strings.Contains(err.Error(), "t1/web") || !strings.Contains(err.Error(), "(+2 more)") {
+			t.Errorf("refusal %q must name the first declarers in sorted order and cap the rest", err)
+		}
+		if strings.Contains(err.Error(), "t6/web") {
+			t.Errorf("refusal %q must cap the list so a many-Service cluster cannot flood the root daemon log", err)
 		}
 	})
 }

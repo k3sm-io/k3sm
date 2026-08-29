@@ -282,13 +282,13 @@ func TestNetdPlistXML(t *testing.T) {
 		t.Error("netd plist must NOT carry a UserName (it runs as root)")
 	}
 	// B116/B133 — the plist must render NO --node-ip. netdsvc's node-address
-	// authorizer branch (a <1024 bind on the node's OWN InternalIP, authorized by
-	// a declaring LoadBalancer Service) is DORMANT BY CONFIGURATION, not by
-	// construction: the code is still there, and passing --node-ip would re-arm
-	// it. Since B116 the ingress/svclb listeners bind the wildcard in-process and
-	// never ask netd for a node-address bind, so re-adding the flag would widen
-	// the root helper's authorized surface with no consumer. Adding it must
-	// redden HERE; B133 owns the decision to wire it back or retire the branch.
+	// authorizer branch (a <1024 bind on the node's OWN InternalIP, authorized
+	// ONLY by the canonical kube-system/k3sm-ingress Service since B133) is
+	// DORMANT BY CONFIGURATION, not by construction: the code is still there, and
+	// passing --node-ip would re-arm it. Since B116 the ingress/svclb listeners
+	// bind the wildcard in-process and never ask netd for a node-address bind, so
+	// re-adding the flag would widen the root helper's authorized surface with no
+	// consumer. Adding it must redden HERE.
 	if strings.Contains(x, "--node-ip") {
 		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration (B116/B133); re-arming it needs a deliberate decision, not a plist edit")
 	}
