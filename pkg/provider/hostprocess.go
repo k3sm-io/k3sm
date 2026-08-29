@@ -372,8 +372,19 @@ func (p *HostProcess) PortForward(ctx context.Context, ns, podName string, port 
 func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil
 }
+
+// GetMetricsResource transcodes this provider's Summary into the kubelet
+// resource-metrics families. The M0 HostProcess provider meters nothing, so its
+// node-only Summary carries no CPU or memory sample and the transcode yields an
+// EMPTY scrape target — the same honest answer the old stub gave, now produced by
+// the one shared builder rather than a second hard-coded nil (so a future
+// HostProcess that does meter lights up without touching this method).
 func (p *HostProcess) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
-	return nil, nil
+	summary, err := p.GetStatsSummary(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return buildResourceMetrics(summary), nil
 }
 
 // --- helpers ---
