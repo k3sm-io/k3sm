@@ -94,7 +94,7 @@ type component struct {
 // log file, so the operator sees the fatal flag/config error immediately
 // instead of an opaque healthz timeout. Call only after <-c.exited.
 func (c *component) exitDetail() string {
-	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, tailFile(c.logPath, exitLogTailLines))
+	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, LogTail(c.logPath, exitLogTailLines))
 }
 
 // exitedNow reports whether the child has left the RUNNING state, asked of the
@@ -699,9 +699,12 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exit
 	}
 }
 
-// tailFile returns the last n lines of the file at path (best-effort: an
+// LogTail returns the last n lines of the file at path (best-effort: an
 // unreadable file yields a placeholder so the caller's error stays actionable).
-func tailFile(path string, n int) string {
+// Exported because a bring-up that times out OUTSIDE this package — `k3sm dev`
+// waiting on a detached server it spawned — owes its operator the same evidence
+// this package's own fail-fast errors carry, and there should be one tail.
+func LogTail(path string, n int) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("<unreadable log: %v>", err)

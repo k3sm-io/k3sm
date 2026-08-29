@@ -419,3 +419,93 @@ func TestTeardownRemovesPodRoot(t *testing.T) {
 		}
 	})
 }
+
+// TestDevUpSurfacesColdCacheBootTimeout is the boot-timeout surfacing gate.
+//
+// `dev up` spawns a DETACHED server and waits for it to write its kubeconfig. When that
+// wait expired the error said only that the file had not appeared and pointed vaguely
+// at "the server.log beside it" — so the operator of the observed failure, whose log
+// held nothing but `go: downloading` lines (the datastore binary being built from a
+// cold module cache), had no way to learn that anything was progressing at all. The
+// deadline is deliberately NOT the fix and is NOT raised here: a bound that grows to
+// fit the worst run has stopped bounding anything. The fix is that the failure carries
+// the evidence.
+func TestDevUpSurfacesColdCacheBootTimeout(t *testing.T) {
+	writeLog := func(t *testing.T, lines ...string) string {
+		t.Helper()
+		p := serverLogPath(t.TempDir())
+		if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("the timeout names the log and quotes its tail", func(t *testing.T) {
+		logPath := writeLog(t,
+			"time=2026-08-29T09:00:00Z level=INFO msg=\"starting k3sm server\"",
+			"go: downloading modernc.org/sqlite v1.34.5",
+			"go: downloading modernc.org/libc v1.61.0")
+
+		err := awaitKubeconfigFile(t.Context(), 50*time.Millisecond, "/nope/k3sm.kubeconfig", logPath)
+		if err == nil {
+			t.Fatal("no kubeconfig: err = nil, want a timeout error")
+		}
+		for _, want := range []string{
+			"/nope/k3sm.kubeconfig", // what it was waiting for
+			logPath,                 // where the account of the boot lives
+			"go: downloading modernc.org/libc v1.61.0", // the cause, quoted
+			"starting k3sm server",                     // the boot did start
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("timeout error %q does not carry %q", err, want)
+			}
+		}
+	})
+
+	t.Run("the quoted tail is bounded", func(t *testing.T) {
+		lines := make([]string, 0, bootLogTailLines*3)
+		for i := range cap(lines) {
+			lines = append(lines, "line-"+strconv.Itoa(i))
+		}
+		logPath := writeLog(t, lines...)
+
+		err := awaitKubeconfigFile(t.Context(), 50*time.Millisecond, "/nope/k3sm.kubeconfig", logPath)
+		if err == nil {
+			t.Fatal("err = nil, want a timeout error")
+		}
+		if !strings.Contains(err.Error(), lines[len(lines)-1]) {
+			t.Errorf("timeout error %q omits the LAST log line", err)
+		}
+		if strings.Contains(err.Error(), "line-0\n") {
+			t.Errorf("timeout error %q dumped the whole log instead of its tail", err)
+		}
+	})
+
+	t.Run("a log that cannot be read still yields an actionable error", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "server.log")
+		err := awaitKubeconfigFile(t.Context(), 50*time.Millisecond, "/nope/k3sm.kubeconfig", missing)
+		if err == nil {
+			t.Fatal("err = nil, want a timeout error")
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("timeout error %q does not name the log it could not read", err)
+		}
+	})
+
+	t.Run("returns as soon as the kubeconfig appears", func(t *testing.T) {
+		work := t.TempDir()
+		kc := filepath.Join(work, "k3sm.kubeconfig")
+		if err := os.WriteFile(kc, []byte("apiVersion: v1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := awaitKubeconfigFile(t.Context(), time.Second, kc, serverLogPath(work)); err != nil {
+			t.Errorf("kubeconfig present: err = %v, want nil", err)
+		}
+	})
+
+	t.Run("the deadline is not widened to paper over a slow boot", func(t *testing.T) {
+		if kubeconfigWait != 90*time.Second {
+			t.Errorf("kubeconfigWait = %s, want 90s — surfacing the cause is the fix, not a bigger number", kubeconfigWait)
+		}
+	})
+}
