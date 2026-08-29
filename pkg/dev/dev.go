@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -51,6 +52,30 @@ const (
 	// 100.64.0.0/10 — the /32 aliases the datapath binds fall inside it).
 	PodCIDR = "100.64.0.0/10"
 )
+
+// PodRootBasePrefix is the fixed parent of every dev instance's runtimed root —
+// the tree holding the per-pod dirs, the image blob cache and, decisively, the
+// PVC storage root (<runtime-root>/storage/<namespace>/<claim>).
+//
+// It sits OUTSIDE the registry root (<home>/.k3sm/dev/<name>) on purpose, and the
+// reason is a hard runtimed constraint rather than taste: /Users is one of the
+// FIXED system-protected prefixes runtimed's SBPL generator refuses to grant a
+// confined pod (runtimed pkg/sandbox systemProtectedPrefixes — "a hostPath-style
+// mount can never widen the allow-list into /Users"). runtimed derives each PVC's
+// dir from ITS work-dir and hands it to that generator as the pod's read/write
+// scope, so with the runtime root under the invoking user's home EVERY
+// PVC-backed pod is rejected at sandbox setup — `runtimed create pod … rejected:
+// generate sbpl …: extra path is under a protected deny-set` — and sits Pending
+// until it is deleted. The installed posture (/var/lib/k3sm) and the acceptance
+// harness (hack/lib/clusterup.sh's /tmp/k3sm-cluster) both already keep the
+// runtime root clear of /Users; this gives `k3sm dev` the same property.
+//
+// The euid is part of the directory NAME, not a subdirectory, so a root
+// (--datapath) and a rootless instance never need write access to one another's
+// 0700 tree — the same (name × euid) identity the registry work-dir encodes. The
+// /private spelling is the resolved one: Seatbelt evaluates resolved paths, and
+// /var is a symlink to /private/var.
+const PodRootBasePrefix = "/private/var/tmp/k3sm-dev"
 
 // terminateGrace is how long Down waits for a detached server to exit after
 // SIGTERM before escalating to SIGKILL.
@@ -121,10 +146,14 @@ type Manager struct {
 	// staged into; empty means DefaultPodShimDir. It is a field so a test stages
 	// into a temp dir instead of /Library.
 	shimDir string
-	self    string // absolute path to THIS k3sm binary (re-exec'd as `k3sm server`)
-	euid    int
-	out     io.Writer
-	kubeMg  *kubeMerger
+	// podRootBase is the parent of the per-instance runtimed roots; empty means
+	// PodRootBasePrefix-<euid>. It is a field, like shimDir, so a test drives the
+	// derivation and the teardown removal against a temp dir instead of /private.
+	podRootBase string
+	self        string // absolute path to THIS k3sm binary (re-exec'd as `k3sm server`)
+	euid        int
+	out         io.Writer
+	kubeMg      *kubeMerger
 	// awaitNamespaceBootstrap blocks until the default namespace carries the two
 	// objects every pod with a projected service-account token needs. It is a
 	// field, not a plain method, so the wait is testable without a live cluster.
@@ -246,6 +275,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	}
 
 	workDir := m.workDir(name)
+	podRoot := m.podRoot(name)
 
 	// Pre-flight reclaim: self-heal a crashed prior run under this name — reap a
 	// stale pid, flush its lo0 aliases, and re-assert ports. Reads the OLD
@@ -316,7 +346,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// default; hostprocess is only the honest execshim-unavailable fallback. The
 	// rootless tier is network=none (runtimePreflight returns nil — no root);
 	// --datapath is network=direct.
-	pid, err := m.spawnServer(ctx, name, workDir, apiPort, network, runtimeName, binDir, pathShim, dnsShim)
+	pid, err := m.spawnServer(ctx, name, workDir, podRoot, apiPort, network, runtimeName, binDir, pathShim, dnsShim)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -334,6 +364,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		Version:     registryVersion,
 		Name:        name,
 		WorkDir:     workDir,
+		PodRoot:     podRoot,
 		APIPort:     apiPort,
 		KinePort:    kinePort,
 		PID:         pid,
@@ -488,11 +519,41 @@ func (m *Manager) teardown(inst Instance) error {
 	if err := m.kubeMg.remove(inst.KubeContext); err != nil {
 		fmt.Fprintf(m.out, "warning: remove kubeconfig context %q: %v\n", inst.KubeContext, err)
 	}
+	// The runtime root lives outside the registry root, so Remove below cannot
+	// reclaim it: delete it here or every torn-down instance leaks its pod dirs,
+	// blob cache and PVC storage. `down` is destructive by contract — the
+	// pre-split layout put all three inside the instance dir Remove wipes.
+	if dir := removablePodRoot(inst, m.podRootBaseDir()); dir != "" {
+		if err := os.RemoveAll(dir); err != nil {
+			fmt.Fprintf(m.out, "warning: remove pod-root %q: %v\n", dir, err)
+		}
+	}
 	if err := m.reg.Remove(inst.Name); err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("remove registry entry %q: %w", inst.Name, err)
 	}
 	fmt.Fprintf(m.out, "instance %q down\n", inst.Name)
 	return nil
+}
+
+// removablePodRoot returns the instance's runtime root when it is safe to delete
+// recursively, and "" otherwise. Safe means: recorded (an older manifest has
+// none — that layout kept the root inside the instance dir Remove already
+// reclaims), absolute and clean, and a PROPER descendant of base. The bound is
+// what keeps a hand-edited or corrupted manifest from turning teardown into an
+// arbitrary rm -rf running, in the datapath tier, as root.
+func removablePodRoot(inst Instance, base string) string {
+	dir := inst.PodRoot
+	if dir == "" || base == "" {
+		return ""
+	}
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return ""
+	}
+	base = filepath.Clean(base)
+	if base == "/" || !strings.HasPrefix(dir, base+"/") {
+		return ""
+	}
+	return dir
 }
 
 // List returns the durable registry, each entry annotated (via the ALIVE field
@@ -577,10 +638,15 @@ func (m *Manager) preflightReclaim(name string) error {
 // unit-tested without spawning a process. An empty shim path emits NO flag at
 // all: the server must fall back to its own sibling-dylib resolution rather than
 // be pointed at a path that is not there.
-func serverArgs(name, workDir string, apiPort int, network, runtimeName, pathShim, dnsShim string) []string {
+func serverArgs(name, workDir, podRoot string, apiPort int, network, runtimeName, pathShim, dnsShim string) []string {
 	args := []string{
 		"server",
 		"--work-dir", workDir,
+		// Keep the runtime root (pod dirs, blob cache, PVC storage) out of the
+		// registry root under /Users — see PodRootBasePrefix. Without this the
+		// server derives it from the work-dir parent and no PVC-backed pod can
+		// ever start.
+		"--pod-root", podRoot,
 		"--node-name", "k3sm-dev-" + name,
 		"--node-ip", "127.0.0.1",
 		"--runtime", runtimeName,
@@ -605,9 +671,15 @@ func serverArgs(name, workDir string, apiPort int, network, runtimeName, pathShi
 // <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
 // until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
 // read the same workdir.
-func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (int, error) {
+func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, apiPort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (int, error) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return 0, fmt.Errorf("create workdir %s: %w", workDir, err)
+	}
+	// Pre-create the runtime root so a base the caller cannot write (a stale tree
+	// owned by the other euid) fails HERE, with the path named, instead of inside
+	// the detached server's first pod create.
+	if err := os.MkdirAll(podRoot, 0o700); err != nil {
+		return 0, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
 	logPath := filepath.Join(workDir, "server.log")
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -616,7 +688,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir string, apiPort
 	}
 	defer lf.Close()
 
-	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, apiPort, network, runtimeName, pathShim, dnsShim)...)
+	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, apiPort, network, runtimeName, pathShim, dnsShim)...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	// Own process group so `down` can SIGTERM the whole supervised tree via -pid,
 	// and detached from ctx cancellation (WaitDelay 0 + no Cancel) so the server
@@ -835,6 +907,23 @@ func awaitReadyNode(ctx context.Context, timeout time.Duration, kubeconfig strin
 // path and a rootless vs datapath run never share a tree.
 func (m *Manager) workDir(name string) string {
 	return filepath.Join(m.reg.dir(name), "server")
+}
+
+// podRoot is the per-instance runtimed root passed to the detached server as
+// --pod-root: <base>/<name>, where the base carries the euid (see
+// PodRootBasePrefix). It is NOT under the registry root — a runtime root inside
+// /Users makes every PVC-backed pod unschedulable-to-run under Seatbelt.
+func (m *Manager) podRoot(name string) string {
+	return filepath.Join(m.podRootBaseDir(), name)
+}
+
+// podRootBaseDir returns the configured pod-root base, defaulting to the
+// euid-scoped PodRootBasePrefix.
+func (m *Manager) podRootBaseDir() string {
+	if m.podRootBase != "" {
+		return m.podRootBase
+	}
+	return PodRootBasePrefix + "-" + strconv.Itoa(m.euid)
 }
 
 // datapathLockPath is the flock file guarding the --datapath singleton (under the
