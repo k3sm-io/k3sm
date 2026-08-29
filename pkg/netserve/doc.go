@@ -28,10 +28,9 @@ limitations under the License.
 //     ingress only; the always-allow set is seeded from the node/mesh /32s so
 //     node-origin dialers are never policy-denied);
 //   - the per-node cluster DNS resolver (resolver.go): an in-process authoritative
-//     server bound to the DNS VIP (53/UDP+TCP) answering Service A records and
-//     forwarding off-cluster names upstream. It also renders the reference Corefile
-//     from dns.CorefileOptions and exposes the dns.PodDNSConfig the getaddrinfo
-//     shim consumes inside each pod.
+//     server bound to the DNS VIP (53/UDP+TCP) answering Service A records,
+//     forwarding off-cluster names upstream, and exposing the dns.PodDNSConfig the
+//     getaddrinfo shim consumes inside each pod.
 //
 // # Infra VIPs are answered node-locally, never steered over the mesh (M3.3)
 //

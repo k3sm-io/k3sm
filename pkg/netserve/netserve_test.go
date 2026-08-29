@@ -17,10 +17,12 @@ limitations under the License.
 package netserve
 
 import (
+	"context"
+	"io/fs"
 	"net/netip"
-	"os"
-	"strings"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -119,28 +121,48 @@ func TestNetdSocketConstructs(t *testing.T) {
 	}
 }
 
-// TestWriteCorefile checks the rendered CoreDNS config binds the DNS VIP and
-// serves the cluster domain via the kubernetes plugin.
-func TestWriteCorefile(t *testing.T) {
+// TestRunDoesNotWriteCorefile is the B33 gate: it proves Run leaves no
+// Corefile-named file anywhere under the server's WorkDir tree. This is the
+// negative half of B33's deletion of the vestigial CoreDNS Corefile renderer
+// (darwin-net's dns.CorefileOptions/PerNodeDNS, and the writeCorefile call this
+// package's Run used to make on every start) — nothing ever consumed the file it
+// wrote, so the operator decided to delete the renderer outright (git remembers;
+// a future native-CoreDNS follow-up re-derives it from history) rather than keep
+// dead code alive. The real evidence the renderer is gone is the diff itself
+// (dns.CorefileOptions/PerNodeDNS and Run's write call no longer exist); this
+// test only guards against the write path being reintroduced. Disabled:true
+// drives Run's startup work (previously including the Corefile write) without
+// the root-gated lo0/socket datapath, so the test needs no privilege and no
+// stubbed ifconfig.
+func TestRunDoesNotWriteCorefile(t *testing.T) {
 	dir := t.TempDir()
 	s := New(Config{
 		Client:        fake.NewClientset(),
 		WorkDir:       dir,
 		DNSVIP:        "10.43.0.10",
 		ClusterDomain: "cluster.local",
+		Disabled:      true,
 	})
-	if err := s.writeCorefile(); err != nil {
-		t.Fatalf("writeCorefile: %v", err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	b, err := os.ReadFile(s.CorefilePath())
-	if err != nil {
-		t.Fatalf("read corefile: %v", err)
+
+	var found []string
+	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && d.Name() == "Corefile" {
+			found = append(found, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk workdir: %v", err)
 	}
-	cf := string(b)
-	if !strings.Contains(cf, "bind 10.43.0.10") {
-		t.Errorf("corefile does not bind the DNS VIP:\n%s", cf)
-	}
-	if !strings.Contains(cf, "kubernetes cluster.local") {
-		t.Errorf("corefile does not serve the cluster domain:\n%s", cf)
+	if len(found) != 0 {
+		t.Fatalf("Run wrote a Corefile under WorkDir: %v", found)
 	}
 }
