@@ -20,7 +20,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -307,6 +310,112 @@ func TestDevUpWaitsForNodeRegistration(t *testing.T) {
 		}
 		if nodeRegistrationTimeout > 15*time.Minute {
 			t.Errorf("nodeRegistrationTimeout = %s; too long to be a useful bound", nodeRegistrationTimeout)
+		}
+	})
+}
+
+// TestPodRootOutsideProtectedTree pins the one property that decides whether a
+// PVC-backed pod can run in a `k3sm dev` cluster: the runtimed root the detached
+// server is given must not live under /Users.
+//
+// runtimed derives each claim's dir from ITS work-dir (<root>/storage/<ns>/<claim>)
+// and hands it to the SBPL generator as the pod's read/write scope; that generator
+// refuses any such grant under one of its FIXED system-protected prefixes, of
+// which /Users is one (runtimed pkg/sandbox, systemProtectedPrefixes). With the
+// root derived from the work-dir parent — the registry root under the invoking
+// user's home — every PVC pod was rejected at sandbox setup ("extra path is under
+// a protected deny-set") and sat Pending until deleted, while the same criterion
+// passed under hack/acceptance/m3.sh, whose --pod-root is /tmp/k3sm-cluster/pods.
+func TestPodRootOutsideProtectedTree(t *testing.T) {
+	// The runtimed prefixes a confined pod may never be granted, quoted here
+	// because k3sm cannot import them: /private/var/db and the cryptexes are the
+	// rest of that fixed list, kept so a future base is checked against all of it.
+	protected := []string{"/Users", "/private/var/db", "/System/Volumes/Preboot/Cryptexes", "/System/Cryptexes"}
+
+	t.Run("the derived root escapes the registry root and every protected prefix", func(t *testing.T) {
+		for _, euid := range []int{0, 501} {
+			m := newTestManager(t, newFakeSystem(), euid)
+			root := m.podRoot("dev")
+			for _, pre := range protected {
+				if root == pre || strings.HasPrefix(root, pre+"/") {
+					t.Errorf("euid %d: podRoot = %q, which is under the runtimed-protected prefix %q — every PVC pod would be rejected at sandbox setup", euid, root, pre)
+				}
+			}
+			// The work-dir parent is what the server would derive on its own
+			// (executor.RuntimeRoot); the whole point is that the two differ.
+			if derived := filepath.Dir(filepath.Clean(m.workDir("dev"))); root == derived {
+				t.Errorf("euid %d: podRoot = %q, want it OFF the work-dir parent (the registry root under $HOME)", euid, root)
+			}
+			if want := PodRootBasePrefix + "-" + strconv.Itoa(euid) + "/dev"; root != want {
+				t.Errorf("euid %d: podRoot = %q, want %q (the euid-scoped base keeps a root and a rootless instance off one another's 0700 tree)", euid, root, want)
+			}
+		}
+	})
+
+	t.Run("serverArgs hands it to the server as --pod-root", func(t *testing.T) {
+		args := serverArgs("dev", "/w", "/private/var/tmp/k3sm-dev-0/dev", 7443, "direct", runtimeRuntimed, "", "")
+		i := slices.Index(args, "--pod-root")
+		if i < 0 {
+			t.Fatalf("serverArgs = %v, want a --pod-root flag (without it the server derives the root from the work-dir parent)", args)
+		}
+		if i+1 >= len(args) || args[i+1] != "/private/var/tmp/k3sm-dev-0/dev" {
+			t.Errorf("serverArgs --pod-root value = %v, want the instance root", args[i+1:])
+		}
+	})
+}
+
+// TestTeardownRemovesPodRoot pins the other half of the split: the runtime root
+// now lives outside the instance dir Registry.Remove wipes, so teardown must
+// delete it explicitly — and must refuse a path it cannot vouch for, since in the
+// datapath tier that RemoveAll runs as root.
+func TestTeardownRemovesPodRoot(t *testing.T) {
+	t.Run("the recorded root is deleted", func(t *testing.T) {
+		base := t.TempDir()
+		m := newTestManager(t, newFakeSystem(), 501)
+		m.podRootBase = base
+		inst := sampleInstance("gone")
+		inst.PID = 0
+		inst.PodRoot = filepath.Join(base, "gone")
+		if err := os.MkdirAll(filepath.Join(inst.PodRoot, "storage", "default", "data-m3-pvc-0"), 0o755); err != nil {
+			t.Fatalf("seed pod root: %v", err)
+		}
+		if err := m.reg.Save(inst); err != nil {
+			t.Fatalf("seed manifest: %v", err)
+		}
+		if err := m.teardown(inst); err != nil {
+			t.Fatalf("teardown: %v", err)
+		}
+		if _, err := os.Stat(inst.PodRoot); !os.IsNotExist(err) {
+			t.Errorf("pod root %q survived teardown (stat err = %v) — every torn-down instance would leak its pod dirs, blob cache and PVC storage", inst.PodRoot, err)
+		}
+	})
+
+	t.Run("removablePodRoot refuses anything it cannot vouch for", func(t *testing.T) {
+		const base = "/private/var/tmp/k3sm-dev-0"
+		cases := []struct {
+			name    string
+			podRoot string
+			base    string
+			want    string
+		}{
+			{"a proper descendant is removable", base + "/dev", base, base + "/dev"},
+			{"an older manifest records none", "", base, ""},
+			{"the base itself is not removable", base, base, ""},
+			{"a sibling outside the base is refused", "/private/var/tmp/other/dev", base, ""},
+			{"a relative path is refused", "relative/dev", base, ""},
+			{"an unclean path is refused", base + "/../../../etc", base, ""},
+			{"a prefix-string near-match is refused", base + "-elsewhere/dev", base, ""},
+			{"an empty base disables removal", base + "/dev", "", ""},
+			{"a root base is refused", "/anything", "/", ""},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				inst := sampleInstance("x")
+				inst.PodRoot = tc.podRoot
+				if got := removablePodRoot(inst, tc.base); got != tc.want {
+					t.Errorf("removablePodRoot(%q, %q) = %q, want %q", tc.podRoot, tc.base, got, tc.want)
+				}
+			})
 		}
 	})
 }
