@@ -52,7 +52,7 @@ pkg/loadbalancer/ client-side apiserver load balancer (HA)
 # from the workspace root where the four repos are cloned as siblings (go.work spans all four modules)
 go build ./...
 go test ./...
-cd k3sm && CGO_ENABLED=1 go build ./...   # k3sm embeds kine → cgo
+cd k3sm && CGO_ENABLED=1 go build ./...   # cgo: runtimed capability probes
 ```
 
 ## License
