@@ -38,6 +38,10 @@ type fakeSystem struct {
 	busyPorts    map[int]bool    // ports PortFree reports false for
 	lockHeld     map[string]bool // paths currently locked (LOCK_NB semantics)
 	lockFailNext bool            // force the next LockFile to fail
+	// aliveProbe, when set, answers ProcessAlive instead of the in-memory pid
+	// table. A test that spawns a REAL child (the bring-up gates) needs the
+	// liveness seam to tell the truth about it; the map cannot.
+	aliveProbe func(int) bool
 }
 
 func newFakeSystem() *fakeSystem {
@@ -76,8 +80,13 @@ func (f *fakeSystem) Lo0RemoveAlias(ip string) error {
 
 func (f *fakeSystem) ProcessAlive(pid int) bool {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.alivePIDs[pid]
+	probe := f.aliveProbe
+	alive := f.alivePIDs[pid]
+	f.mu.Unlock()
+	if probe != nil {
+		return probe(pid)
+	}
+	return alive
 }
 
 func (f *fakeSystem) TerminateProcess(pid int, _ time.Duration) error {
