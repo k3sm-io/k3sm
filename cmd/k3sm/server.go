@@ -35,6 +35,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/dns"
 
+	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
@@ -390,6 +391,23 @@ func runServer(args []string) error {
 		return fmt.Errorf("provision rbac graph: %w", err)
 	}
 	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader); authorizer is Node,RBAC")
+
+	// 3c. B170 — SSA-converge the EMBEDDED add-on manifest set. The manifests are
+	// compiled into this binary (embed.FS), never read from disk: the work dir is
+	// writable by every pod (all pods share the _k3sm uid and it is outside runtimed's
+	// sandbox-protected prefixes) and this client is the system:masters admin, so a
+	// directory ingress would hand cluster-admin to every pod on the node. See
+	// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
+	// add-on can never delay it. Converge-only — it issues apply patches and never a
+	// delete or a list. Log-and-continue like the sibling boot provisioners: the launchd
+	// job is KeepAlive, so a startup-fatal manifest error would be an unbounded respawn
+	// loop. The shipped set is EMPTY of product manifests today, so this is inert until
+	// the first add-on lands.
+	if ar, err := addons.NewFromConfig(addons.FS(), restCfg); err != nil {
+		logger.Error("build embedded add-on reconciler", "err", err)
+	} else if err := ar.Converge(ctx); err != nil {
+		logger.Error("converge embedded add-on manifests", "err", err)
+	}
 
 	// 4. M1.4/M3.3 — host the node-local datapath: darwin-net's Service proxy
 	// (exempted from the DNS VIP, which the per-node resolver below owns) + the
