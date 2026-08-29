@@ -57,9 +57,20 @@ limitations under the License.
 //     (EnsureDefaultLimitRange): default/defaultRequest MEMORY per container —
 //     memory is enforced by the runtime (rusage sampler → OOMKill) — and
 //     deliberately NO cpu key anywhere (CPU is best-effort; a CPU default would
-//     over-claim a guarantee k3sm cannot keep). Create-if-absent, never update:
-//     in-cluster objects are operator-space, unlike the executor's
-//     overwrite-on-boot binary-space config files.
+//     over-claim a guarantee k3sm cannot keep).
+//
+// PROVISIONING CONTRACT (every Ensure* here, one implementation — ensure.go):
+// CREATE-OR-UPDATE. The object is created when absent and RECONCILED onto the
+// current shape when its stored spec has drifted; an already-current object is not
+// written at all. This replaced create-if-absent in B153, which had frozen every
+// policy's CEL — and the foreign-user policy's allowed uid — at whatever shape the
+// cluster was first provisioned with, making any later fix inert on an existing
+// datastore. The k3sm.io/managed label is stamped at create and is otherwise
+// untouched: this package selects on nothing and deletes nothing.
+//
+// POSTURE INDEPENDENCE: every policy here is provisioned in EVERY --network
+// posture. The foreign-user ceiling used to be gated on the netd-helper backend
+// (B153), which let a `--network none`/`direct` cluster run with the guard absent.
 //
 // CONFORMANCE requirement: a k3sm DaemonSet MUST declare
 // nodeSelector: kubernetes.io/os=darwin in its OWN pod template. The os=darwin Deny VAP
