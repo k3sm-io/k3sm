@@ -216,7 +216,7 @@ func TestKineSnapshotSkips(t *testing.T) {
 
 	t.Run("pin unchanged (stamp matches)", func(t *testing.T) {
 		work := newWALFixture(t, 3)
-		if err := recordKinePin(work, DefaultKineVersion); err != nil {
+		if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
 			t.Fatal(err)
 		}
 		if err := snapshotBeforeKineUpgrade(ctx, log, work, DefaultKineVersion); err != nil {
@@ -294,25 +294,97 @@ func TestKineSnapshotPreservesOldBinary(t *testing.T) {
 	}
 }
 
-// TestRecordKinePinRoundTrip proves the stamp records version AND variant, and that it
-// is not written for a datastore that does not exist (the Postgres posture).
+// TestRecordKinePinRoundTrip proves the stamp records version AND variant. Which boots
+// get stamped at all is TestKinePinStampedOnFirstBoot's contract.
 func TestRecordKinePinRoundTrip(t *testing.T) {
 	work := newWALFixture(t, 1)
-	if err := recordKinePin(work, DefaultKineVersion); err != nil {
+	if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
 		t.Fatal(err)
 	}
 	v, variant, ok := readKinePin(work)
 	if !ok || v != DefaultKineVersion || variant != kineBuildVariant {
 		t.Errorf("readKinePin = (%q,%q,%v), want (%q,%q,true)", v, variant, ok, DefaultKineVersion, kineBuildVariant)
 	}
+	if _, err := os.Stat(kinePinStampPath(work) + ".tmp"); !os.IsNotExist(err) {
+		t.Error("the atomic stamp write left its .tmp behind")
+	}
+}
 
-	empty := t.TempDir()
-	if err := recordKinePin(empty, DefaultKineVersion); err != nil {
-		t.Fatal(err)
+// TestKinePinStampedOnFirstBoot is the fresh-node stamping gate.
+//
+// The stamp is written once kine is serving, and it answers "which pin has opened this
+// datastore". It used to be skipped whenever state.db was not already on disk — but a
+// fresh node's database is created by the kine child, so at that moment there is none:
+// a brand-new node ran its whole first boot unstamped and only became stamped on its
+// SECOND boot. Anything treating the stamp as authoritative (the pin-witness of a
+// long-running soak; an operator asking what opened this database) read "unknown" for a
+// datastore a known pin was serving. The posture that legitimately skips the stamp is
+// an EXTERNAL datastore, which is what the endpoint names.
+func TestKinePinStampedOnFirstBoot(t *testing.T) {
+	cases := []struct {
+		name      string
+		stateDB   bool   // does state.db exist when kine reports ready?
+		endpoint  string // "" = this node's own SQLite datastore
+		wantStamp bool
+		because   string
+	}{
+		{"fresh node — kine has not created state.db yet", false, "", true,
+			"a first boot is exactly when the stamp starts being the answer, and it went missing"},
+		{"returning node — state.db already on disk", true, "", true,
+			"the pre-existing case, which was the only one that ever worked"},
+		{"external datastore, no state.db", false, "postgres://k3sm@db.example:5432/kine", false,
+			"there is no per-node SQLite file for the stamp to describe"},
+		{"external datastore beside a leftover state.db", true, "postgres://k3sm@db.example:5432/kine", false,
+			"the endpoint decides the posture — a stale local file must not resurrect the stamp"},
 	}
-	if _, err := os.Stat(kinePinStampPath(empty)); !os.IsNotExist(err) {
-		t.Error("stamped a work dir with no state.db")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			work := t.TempDir()
+			if err := os.MkdirAll(dbDir(work), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.stateDB {
+				if err := os.WriteFile(StateDBPath(work), []byte("SQLite format 3"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := recordKinePin(work, DefaultKineVersion, tc.endpoint); err != nil {
+				t.Fatalf("recordKinePin = %v, want nil", err)
+			}
+			v, variant, ok := readKinePin(work)
+			if ok != tc.wantStamp {
+				t.Fatalf("stamped = %v, want %v — %s", ok, tc.wantStamp, tc.because)
+			}
+			if !tc.wantStamp {
+				return
+			}
+			if v != DefaultKineVersion || variant != kineBuildVariant {
+				t.Errorf("readKinePin = (%q,%q), want (%q,%q)", v, variant, DefaultKineVersion, kineBuildVariant)
+			}
+		})
 	}
+
+	// The consequence, end to end: a node born on the current pin must not be read as
+	// pre-migration on its NEXT boot. Unstamped, the coarse detection treats it as a
+	// database an older pin wrote and takes a pointless verified snapshot of it.
+	t.Run("a first-boot stamp is read back by the next boot's migration check", func(t *testing.T) {
+		work := newWALFixture(t, 2)
+		if err := os.Remove(StateDBPath(work)); err != nil { // reset to a fresh node
+			t.Fatal(err)
+		}
+		if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(StateDBPath(work), []byte("SQLite format 3"), 0o600); err != nil {
+			t.Fatal(err) // the datastore kine went on to create
+		}
+		if err := snapshotBeforeKineUpgrade(t.Context(), discardLogger(), work, DefaultKineVersion); err != nil {
+			t.Fatalf("snapshotBeforeKineUpgrade = %v, want nil", err)
+		}
+		if _, err := os.Stat(kineBackupPath(work, DefaultKineVersion)); !os.IsNotExist(err) {
+			t.Error("a datastore born on this very pin was snapshotted as if an older pin had written it")
+		}
+	})
 }
 
 // TestKineSnapshotRequiresSQLite3 pins the fail-closed posture. Without the SQLite CLI

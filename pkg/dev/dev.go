@@ -383,7 +383,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// after the spawn we tear the detached server down so a half-up instance never
 	// leaks.
 	kc := executor.KubeconfigPath(workDir)
-	if err := m.awaitKubeconfig(ctx, kc); err != nil {
+	if err := m.awaitKubeconfig(ctx, kc, serverLogPath(workDir)); err != nil {
 		_ = m.sys.TerminateProcess(pid, terminateGrace)
 		return Instance{}, err
 	}
@@ -681,7 +681,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	if err := os.MkdirAll(podRoot, 0o700); err != nil {
 		return 0, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
-	logPath := filepath.Join(workDir, "server.log")
+	logPath := serverLogPath(workDir)
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return 0, fmt.Errorf("create server log: %w", err)
@@ -710,17 +710,45 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	return pid, nil
 }
 
+// serverLogPath is where spawnServer redirects a detached server's output. One
+// helper so the writer and every error that quotes the file name the same path.
+func serverLogPath(workDir string) string { return filepath.Join(workDir, "server.log") }
+
+// kubeconfigWait bounds awaitKubeconfig. It is NOT raised to cover a slow boot: a
+// deadline that moves to fit the worst observed run stops bounding anything, and the
+// causes worth surviving are causes worth SEEING, which is what the log tail below is
+// for.
+const kubeconfigWait = 90 * time.Second
+
+// bootLogTailLines is how many trailing server-log lines a bring-up timeout carries —
+// enough to show what the boot was doing without dumping a whole log into an error.
+const bootLogTailLines = 20
+
 // awaitKubeconfig blocks until the detached server has written its admin
 // kubeconfig (its readiness signal for the merge), bounded so a wedged bring-up
 // fails with an actionable error instead of hanging.
-func (m *Manager) awaitKubeconfig(ctx context.Context, kc string) error {
-	deadline := time.Now().Add(90 * time.Second)
+func (m *Manager) awaitKubeconfig(ctx context.Context, kc, logPath string) error {
+	return awaitKubeconfigFile(ctx, kubeconfigWait, kc, logPath)
+}
+
+// awaitKubeconfigFile is the pollable core of awaitKubeconfig, split out so the
+// timeout's semantics are testable without spawning a server.
+//
+// The timeout QUOTES the server log rather than pointing at it. The server is
+// detached, so its output is the only account of what the boot was doing, and an
+// operator who has to already know the file exists learns nothing from the failure:
+// the observed case was a boot whose log held nothing but `go: downloading` lines —
+// the datastore binary was being built, progress was real, and the error said only
+// that a file had not appeared.
+func awaitKubeconfigFile(ctx context.Context, timeout time.Duration, kc, logPath string) error {
+	deadline := time.Now().Add(timeout)
 	for {
 		if _, err := os.Stat(kc); err == nil {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("k3sm server did not write %s within 90s (see the server.log beside it)", kc)
+			return fmt.Errorf("k3sm server did not write %s within %s; last log lines (%s):\n%s",
+				kc, timeout, logPath, executor.LogTail(logPath, bootLogTailLines))
 		}
 		select {
 		case <-ctx.Done():
