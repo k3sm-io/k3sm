@@ -171,53 +171,12 @@ func TestProvisionConformanceConfigPinned(t *testing.T) {
 	})
 }
 
-// TestPSADefaultLevel pins the PSA level tuple via the PURE renderer for BOTH
-// flag values (Res.2): warn-by-default (enforce stays privileged) and
-// enforce-under-flag (baseline, everything else unchanged). Versions are PINNED
-// v1.36 — never "latest" — and exemptions stay EMPTY (the B71 enforce cutover
-// decides exemptions with pre-flight evidence, never pre-baked).
-func TestPSADefaultLevel(t *testing.T) {
-	for _, tc := range []struct {
-		name            string
-		enforceBaseline bool
-		wantEnforce     string
-	}{
-		{"shipped default is baseline-warn (enforce privileged)", false, "privileged"},
-		{"--psa-enforce-baseline flips enforce to baseline", true, "baseline"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var ac admissionConfigParsed
-			if err := yaml.Unmarshal([]byte(admissionConfigYAML(tc.enforceBaseline)), &ac); err != nil {
-				t.Fatalf("parse rendered admission config: %v", err)
-			}
-			if len(ac.Plugins) != 1 {
-				t.Fatalf("plugins = %+v, want exactly one", ac.Plugins)
-			}
-			psa := ac.Plugins[0].Configuration
-			want := map[string]string{
-				"enforce":         tc.wantEnforce,
-				"enforce-version": "v1.36",
-				"warn":            "baseline",
-				"warn-version":    "v1.36",
-				"audit":           "restricted",
-				"audit-version":   "v1.36",
-			}
-			for k, v := range want {
-				if got := psa.Defaults[k]; got != v {
-					t.Errorf("defaults[%s] = %q, want %q", k, got, v)
-				}
-			}
-			for k, v := range psa.Defaults {
-				if v == "latest" {
-					t.Errorf("defaults[%s] = latest — versions must be PINNED, never latest", k)
-				}
-			}
-			if len(psa.Exemptions.Usernames) != 0 || len(psa.Exemptions.RuntimeClasses) != 0 || len(psa.Exemptions.Namespaces) != 0 {
-				t.Errorf("exemptions must be EMPTY (B71 decides them with pre-flight evidence), got %+v", psa.Exemptions)
-			}
-		})
-	}
-}
+// The PSA LEVEL TUPLE gate lives in pkg/policy (TestPSADefaultLevel — pkg/policy
+// owns the levels; see podsecurity.go). What this package owns and pins is the
+// FILE and the ARGV: TestProvisionConformanceConfigPinned above (the file is
+// written, 0600, and parses as the pinned AdmissionConfiguration GV) and
+// TestPSAAdmissionConfigWiredToArgv below (the argv names that same file, and
+// what the apiserver would load off it is the warn-first posture).
 
 // TestConformanceConfigOverwriteOnBoot pins the overwrite-on-boot contract: the
 // config files track the BINARY (mirroring writeTokenFile, not the Stat-guarded
@@ -243,5 +202,52 @@ func TestConformanceConfigOverwriteOnBoot(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(admissionConfigPath(wd)); string(got) != admissionConfigYAML(false) {
 		t.Errorf("admission config not refreshed on boot (must track the flag, incl. reverting the cutover):\n%s", got)
+	}
+}
+
+// TestPSAAdmissionConfigWiredToArgv is the WIRING leg of the B71 gate (the level
+// tuple itself is pinned by pkg/policy's TestPSADefaultLevel): a PSA config the
+// apiserver never loads is decoration. It asserts the whole seam end to end —
+// provision writes the admission config, the argv passes THAT path to
+// --admission-control-config-file, and the bytes at the path the argv names
+// parse as the warn-first posture. Dropping the argv flag (or pointing it
+// elsewhere) turns this red.
+func TestPSAAdmissionConfigWiredToArgv(t *testing.T) {
+	wd := t.TempDir()
+	cfg := Config{WorkDir: wd, KinePort: 2379, APIServerPort: 6444, NodeIP: "127.0.0.1"}
+
+	if err := writeConformanceConfig(wd, cfg.PSAEnforceBaseline); err != nil {
+		t.Fatalf("writeConformanceConfig: %v", err)
+	}
+	loaded := flagValue(apiServerArgs(cfg), "--admission-control-config-file")
+	if loaded == "" {
+		t.Fatal("--admission-control-config-file is ABSENT from the apiserver argv — the provisioned PodSecurityConfiguration would never be loaded and the cluster default would silently be privileged/no-warn")
+	}
+	if loaded != admissionConfigPath(wd) {
+		t.Fatalf("--admission-control-config-file = %q, want the provisioned %q", loaded, admissionConfigPath(wd))
+	}
+
+	// Read back the file the ARGV names (not the renderer) and pin the posture
+	// the apiserver would actually load.
+	b, err := os.ReadFile(loaded)
+	if err != nil {
+		t.Fatalf("read the file the argv names: %v", err)
+	}
+	var ac admissionConfigParsed
+	if err := yaml.Unmarshal(b, &ac); err != nil {
+		t.Fatalf("parse the file the argv names: %v", err)
+	}
+	if len(ac.Plugins) != 1 || ac.Plugins[0].Name != "PodSecurity" {
+		t.Fatalf("plugins = %+v, want exactly the PodSecurity plugin", ac.Plugins)
+	}
+	d := ac.Plugins[0].Configuration.Defaults
+	for _, want := range []struct{ key, val string }{
+		{"enforce", "privileged"},
+		{"warn", "baseline"},
+		{"audit", "restricted"},
+	} {
+		if got := d[want.key]; got != want.val {
+			t.Errorf("loaded config defaults[%s] = %q, want %q (the shipped warn-first posture)", want.key, got, want.val)
+		}
 	}
 }
