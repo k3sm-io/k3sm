@@ -31,6 +31,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // protoTime converts a proto timestamp to a metav1.Time, returning the zero
@@ -1369,6 +1370,30 @@ func computeInitialized(pod *corev1.Pod, initCS []corev1.ContainerStatus) corev1
 	return cond
 }
 
+// qualifyContainerID renders a runtimed container id in the `<runtime>://<id>`
+// form kubelet consumers expect on ContainerStatus.containerID (containerd
+// reports `containerd://…`, cri-o `cri-o://…`).
+//
+// The scheme is `runtimed.RuntimeName` — the same implementation name the daemon
+// reports on GetRuntimeInfo — taken from the constant rather than spelled here,
+// because two spellings of one runtime's name is exactly how a consumer ends up
+// keying on a value the node stopped using.
+//
+// The prefix is applied HERE and not on the runtimed wire field on purpose: which
+// runtime produced a status is a k8s-PRESENTATION fact known only to the
+// assembler that selected the runtime, so a daemon that also serves a non-kubelet
+// consumer must not have the k8s spelling baked into its own field.
+//
+// An empty id stays EMPTY. A bare `runtimed.RuntimeName + "://"` would assert
+// that a container has an identity while naming none — worse than the blank a
+// reader can see through.
+func qualifyContainerID(id string) string {
+	if id == "" {
+		return ""
+	}
+	return runtimed.RuntimeName + "://" + id
+}
+
 // toContainerStatuses maps runtime container statuses to corev1, carrying the
 // terminated Reason/ExitCode/Signal VERBATIM (so the runtimed OOMKilled reason
 // surfaces) and deriving Ready/Started, plus the M2.1 mirror fields (volume_mounts
@@ -1380,10 +1405,14 @@ func toContainerStatuses(rcs []*runtimev1.ContainerStatus) []corev1.ContainerSta
 	out := make([]corev1.ContainerStatus, 0, len(rcs))
 	for _, rc := range rcs {
 		st := corev1.ContainerStatus{
-			Name:         rc.GetName(),
-			Image:        rc.GetImage(),
+			Name:  rc.GetName(),
+			Image: rc.GetImage(),
+			// The identity pair (B132): image_id is the image's config digest,
+			// carried VERBATIM because it is a content address the runtime
+			// resolved and this boundary has no business rewriting; container_id
+			// is scheme-qualified here (see qualifyContainerID).
 			ImageID:      rc.GetImageId(),
-			ContainerID:  rc.GetContainerId(),
+			ContainerID:  qualifyContainerID(rc.GetContainerId()),
 			RestartCount: rc.GetRestartCount(),
 			Ready:        rc.GetReady(),
 			State:        toContainerState(rc.GetState()),
@@ -1456,7 +1485,7 @@ func toContainerState(rstate *runtimev1.ContainerState) corev1.ContainerState {
 			Message:     t.GetMessage(),
 			StartedAt:   protoTime(t.GetStartedAt()),
 			FinishedAt:  protoTime(t.GetFinishedAt()),
-			ContainerID: t.GetContainerId(),
+			ContainerID: qualifyContainerID(t.GetContainerId()),
 		}}
 	case rstate.GetWaiting() != nil:
 		w := rstate.GetWaiting()
