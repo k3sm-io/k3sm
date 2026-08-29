@@ -113,6 +113,13 @@ func Resolve(network string) (Mode, error) {
 	return resolveMode(network, os.Geteuid(), netd.DefaultSocketPath)
 }
 
+// ResolveFor is Resolve for an EXPLICIT euid. Production code calls Resolve; this
+// is the seam bring-up tests drive the (--network value x euid) posture matrix
+// through, since a test cannot change the process euid.
+func ResolveFor(network string, euid int) (Mode, error) {
+	return resolveMode(network, euid, netd.DefaultSocketPath)
+}
+
 // resolveMode is the testable core of Resolve.
 func resolveMode(network string, euid int, defaultSocket string) (Mode, error) {
 	switch network {
@@ -141,9 +148,13 @@ func resolveMode(network string, euid int, defaultSocket string) (Mode, error) {
 func (m Mode) DataPath() bool { return m.Backend != BackendNone }
 
 // UsesHelper reports whether privileged ops route through the netd helper (the
-// unprivileged production posture). It gates helper-only concerns (e.g. the
-// foreign-runAsUser admission policy, which exists because the unprivileged
-// runtime runs every pod as the single _k3sm uid).
+// unprivileged production posture). It gates helper-only concerns — those where
+// the netd socket itself is the mechanism (the proxy's lo0 alias manager, the
+// privileged-port binder, the mesh key resolver). It is deliberately NOT a proxy
+// for "can the runtime honor a uid drop": the foreign-runAsUser admission policy
+// used to be gated on it and is now provisioned in EVERY posture (B153), because
+// the no-per-pod-uid-isolation ceiling is a product-wide property, not a
+// networking-backend one.
 func (m Mode) UsesHelper() bool { return m.Backend == BackendHelper }
 
 // ProxyOptions returns the darwin-net Service-proxy options for this mode: the
