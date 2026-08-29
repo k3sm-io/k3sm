@@ -74,13 +74,32 @@ func resolvePort(p intstr.IntOrString, ports []corev1.ContainerPort) (int32, boo
 	return 0, false
 }
 
+// boundedContext derives a handler call's context from the caller's: a POSITIVE
+// timeout caps it, a non-positive one leaves ctx as the only bound.
+//
+// Every probe passes a positive timeout (a probe without one is a configuration
+// error), so this changes nothing on the probe path. The unbounded arm exists for
+// the postStart LIFECYCLE hook, which upstream does not time-cap at all — the
+// kubelet runs an exec hook with timeout 0 and lets the pod worker's context be
+// the only bound (k8s.io/api core/v1 types.go, Lifecycle: "management of the
+// container blocks until the action is complete"). Its ctx is pod-scoped, so a
+// hung hook is reclaimed by the pod's deletion, not by a stopgap deadline. The two
+// handlers a lifecycle hook can reach (exec, httpGet) route through here; tcpSocket
+// is not a valid lifecycle handler upstream and keeps its probe-only shape.
+func boundedContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 // httpProbe returns a checkFunc that issues a GET to scheme://host:port/path with
 // any custom headers and succeeds on a 2xx or 3xx status (kubelet semantics:
 // redirects are not followed, the 3xx itself is success). The per-attempt timeout
 // bounds the request.
 func httpProbe(rt http.RoundTripper, scheme, host string, port int32, path string, headers []corev1.HTTPHeader) checkFunc {
 	return func(ctx context.Context, timeout time.Duration) error {
-		cctx, cancel := context.WithTimeout(ctx, timeout)
+		cctx, cancel := boundedContext(ctx, timeout)
 		defer cancel()
 		u := url.URL{Scheme: strings.ToLower(scheme), Host: net.JoinHostPort(host, strconv.Itoa(int(port))), Path: path}
 		req, err := http.NewRequestWithContext(cctx, http.MethodGet, u.String(), nil)
@@ -240,7 +259,7 @@ func (s *execStream) Send(resp *runtimev1.ExecResponse) error {
 // runExecProbe runs cmd in (podID, container) via the runtime Exec RPC, bounded by
 // timeout, and returns nil iff the command exits 0.
 func runExecProbe(ctx context.Context, rt runtimev1.RuntimeServer, podID, container string, cmd []string, timeout time.Duration) error {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	cctx, cancel := boundedContext(ctx, timeout)
 	defer cancel()
 	s := newExecStream(cctx, &runtimev1.ExecRequest{
 		PodId:     podID,
