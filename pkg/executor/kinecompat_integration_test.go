@@ -47,6 +47,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -79,9 +81,24 @@ func kineBinaries(t *testing.T) (old, new string) {
 // stop func. The stop func kills kine and waits, so the NEXT phase opens a database with
 // no live writer — which is the state the real migration runs in (the control plane is
 // stopped when the executor snapshots and re-opens).
+//
+// The child is REGISTERED with the package reaper and reaped from t.Cleanup as well as
+// through the returned stop func. Neither is redundant: the callers below stop the first
+// kine EXPLICITLY because the next phase must open the database with no live writer, and
+// a t.Fatalf anywhere before that call — a seed or a verify failure — Goexits straight
+// past it. Registration makes the child the TEST's to reap on every path out of it
+// (return, Fatal, panic, interrupt, timeout); the explicit stop keeps its ordering
+// meaning. childreap_test.go documents which mechanism covers which path.
 func serve(t *testing.T, bin, dbPath, dsnParams string) (*clientv3.Client, func()) {
 	t.Helper()
+	refuseOnFixtureOrphans(t)
 	port := freePort(t)
+	// The same fail-closed check bring-up makes: a datastore port already held serves
+	// somebody ELSE's database to everything downstream, after which no signal in this
+	// test can tell a correct start from a wrong one.
+	if err := preflightDatastorePort(t.Context(), port); err != nil {
+		t.Fatalf("fixture datastore port: %v", err)
+	}
 	logPath := filepath.Join(t.TempDir(), "kine.log")
 	lf, err := os.Create(logPath)
 	if err != nil {
@@ -92,14 +109,19 @@ func serve(t *testing.T, bin, dbPath, dsnParams string) (*clientv3.Client, func(
 		"--metrics-bind-address", "0",
 		"--endpoint", "sqlite://"+dbPath+dsnParams)
 	cmd.Stdout, cmd.Stderr = lf, lf
+	// Its own process group, so one group-kill reaps the whole subtree and cannot miss
+	// a grandchild — the shape the production supervisor spawns with.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start %s: %v", bin, err)
 	}
+	child := spawnedChildren.track(cmd, "kine "+filepath.Base(bin)+" on :"+strconv.Itoa(port))
+	var logOnce sync.Once
 	stop := func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		_ = lf.Close()
+		child.stop()
+		logOnce.Do(func() { _ = lf.Close() })
 	}
+	t.Cleanup(stop)
 
 	deadline := time.Now().Add(45 * time.Second)
 	for {
