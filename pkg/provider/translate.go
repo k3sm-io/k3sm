@@ -1044,24 +1044,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
 	applyProbeOverlay(cs, probes)
 
-	anyRunning, allReady := false, len(cs) > 0
-	for i := range cs {
-		st := &cs[i]
-		if st.State.Running != nil {
-			anyRunning = true
-		}
-		if !st.Ready {
-			allReady = false
-		}
-	}
-	// containersReady is the AND of every container's Ready AND at least one running
-	// container — NOT a hardcoded True. The anyRunning term matches the kubelet's
-	// running-gate and the pre-B79 behavior: a non-running container carrying a stale
-	// Ready=true must not publish ContainersReady=True. (M0/HostProcess has no
-	// readiness probes: a container is Ready when Running; applyProbeOverlay refines
-	// it when a readiness probe is served — the probe-less reduction.) It gates
-	// PodReady via the shared computeReadiness seam, which honors spec.readinessGates.
-	containersReady := allReady && anyRunning
+	containersReady := containersReadyFrom(cs)
 
 	phase := derivePhase(pod, rs.GetPhase(), cs)
 	out := &corev1.PodStatus{
@@ -1109,6 +1092,55 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	}
 	out.Conditions = append(out.Conditions, carryForwardExternalConditions(pod)...)
 	return out
+}
+
+// containersReadyFrom reports the ContainersReady predicate over the pod's MAIN
+// container statuses: the AND of every container's Ready AND at least one running
+// container — NOT a hardcoded True. The anyRunning term matches the kubelet's
+// running-gate and the pre-B79 behavior: a non-running container carrying a stale
+// Ready=true must not publish ContainersReady=True. (M0/HostProcess has no
+// readiness probes: a container is Ready when Running; applyProbeOverlay refines
+// it when a readiness probe is served — the probe-less reduction.) It gates
+// PodReady via the shared computeReadiness seam, which honors spec.readinessGates.
+//
+// It is a SHARED seam, not a toPodStatus local: a status overlay applied AFTER the
+// conditions are derived (the B39 postStart readiness gate) must re-derive them
+// from the same predicate, and two copies of this AND would drift.
+func containersReadyFrom(cs []corev1.ContainerStatus) bool {
+	anyRunning, allReady := false, len(cs) > 0
+	for i := range cs {
+		if cs[i].State.Running != nil {
+			anyRunning = true
+		}
+		if !cs[i].Ready {
+			allReady = false
+		}
+	}
+	return allReady && anyRunning
+}
+
+// refreshReadinessConditions re-derives the two readiness conditions from the
+// pod's (possibly overlaid) container statuses, in place. A status overlay that
+// clears a container's Ready AFTER toPodStatus derived the conditions would
+// otherwise publish ContainersReady/PodReady=True next to a not-Ready container —
+// a pod that takes Service traffic while the provider itself considers it not
+// ready. PodReady goes back through computeReadiness (readinessGates + the stable
+// LastTransitionTime prior), so a refreshed condition is indistinguishable from
+// one derived with the gate applied in the first place.
+func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus) {
+	ready := containersReadyFrom(st.ContainerStatuses)
+	crStatus := corev1.ConditionFalse
+	if ready {
+		crStatus = corev1.ConditionTrue
+	}
+	for i := range st.Conditions {
+		switch st.Conditions[i].Type {
+		case corev1.PodReady:
+			st.Conditions[i] = computeReadiness(pod, ready)
+		case corev1.ContainersReady:
+			st.Conditions[i].Status = crStatus
+		}
+	}
 }
 
 // computeReadiness derives the PodReady condition, honoring spec.readinessGates. It

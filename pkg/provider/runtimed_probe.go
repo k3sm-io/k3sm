@@ -149,7 +149,7 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	// DeletePod) rather than a request context.
 	ctx, cancel := context.WithCancel(context.Background())
 	pr.cancel = cancel
-	pr.onTransition = func() { r.publishProbeUpdate(ctx, id) }
+	pr.onTransition = func() { r.publishStatusUpdate(ctx, id) }
 	// restartFunc connects the restart DECISION (the prober owns the gate reset) to
 	// the SHARED restart authority: a committed liveness failure routes through the
 	// SAME per-container containerRestart bookkeeping and the SAME CrashLoopBackOff
@@ -218,14 +218,15 @@ func (r *runtimedRuntime) proberFor(id string) probeState {
 	return nil
 }
 
-// publishProbeUpdate re-renders the pod's status (with the prober overlay) and
-// runs the VK callback, after a probe-driven change. It reads the callback under
-// the lock but invokes it OUTSIDE the lock (the VK NotifyPods re-entrancy rule),
-// and no-ops if the pod was deleted concurrently. It renders via buildStatus —
-// the single status assembly point — so a probe-driven publish carries the B79
-// stable PodReady prior and the B26 CrashLoopBackOff overlay (a probe tick
-// while a re-exec is pending must not flash the pod Failed).
-func (r *runtimedRuntime) publishProbeUpdate(ctx context.Context, id string) {
+// publishStatusUpdate re-renders the pod's status (with the prober overlay) and
+// runs the VK callback, after a provider-side change the runtime's own status
+// stream cannot report — a probe verdict, or a postStart hook completing (B39). It
+// reads the callback under the lock but invokes it OUTSIDE the lock (the VK
+// NotifyPods re-entrancy rule), and no-ops if the pod was deleted concurrently. It
+// renders via buildStatus — the single status assembly point — so such a publish
+// carries the B79 stable PodReady prior and the B26 CrashLoopBackOff overlay (a
+// probe tick while a re-exec is pending must not flash the pod Failed).
+func (r *runtimedRuntime) publishStatusUpdate(ctx context.Context, id string) {
 	r.mu.Lock()
 	t, tracked := r.track[id]
 	cb := r.notify

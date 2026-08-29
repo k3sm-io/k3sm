@@ -42,53 +42,9 @@ import (
 // termination grace budget, best-effort (a failed hook is logged; termination
 // proceeds).
 //
-// postStart is DISPATCH-ONLY in B10: the hook is fired in a bounded goroutine after
-// the container starts and a failure is logged, but the upstream failure-fidelity
-// tail — gating container Ready on the hook, terminal-failing a restartPolicy:Never
-// pod, restart-on-failure, and re-running postStart on container restart — is
-// DEFERRED to its successor B39 (the provider has no per-container terminal-fail verb
-// today; that is B8/B26-class runtimed integration work, out of scope for this
-// provider-only unit).
-
-// postStartHookTimeout bounds a dispatched postStart hook's goroutine so it cannot
-// leak. Upstream does not time-cap postStart (it blocks container readiness), but
-// B10 only DISPATCHES the hook — readiness-gating and proper pod-scoped lifetime are
-// deferred to B39 — so a finite cap is the stopgap that keeps the fire-and-forget
-// goroutine bounded.
-const postStartHookTimeout = 2 * time.Minute
-
-// runPostStart fires each container's postStart hook after the pod's containers are
-// created, every hook in its own bounded goroutine so neither CreatePod nor the VK
-// reconcile loop blocks on it (B10 dispatch-only — see the file comment; the
-// readiness/terminal-fail fidelity is deferred to B39). podIP is the freshly bound
-// pod IP (an httpGet hook's default host); it falls back to the node IP. The handler
-// and port table are copied so the goroutine cannot race a later mutation of the
-// caller's Pod.
-func (r *runtimedRuntime) runPostStart(pod *corev1.Pod, podIP string) {
-	if podIP == "" {
-		podIP = r.nodeIP
-	}
-	id := string(pod.UID)
-	ns, name := pod.Namespace, pod.Name
-	for i := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[i]
-		if c.Lifecycle == nil || c.Lifecycle.PostStart == nil {
-			continue
-		}
-		h := c.Lifecycle.PostStart.DeepCopy()
-		ports := append([]corev1.ContainerPort(nil), c.Ports...)
-		cname := c.Name
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), postStartHookTimeout)
-			defer cancel()
-			if err := r.runHook(ctx, id, podIP, cname, ports, h, postStartHookTimeout); err != nil {
-				// B39 will gate container Ready / terminal-fail / restart on this; B10
-				// dispatches and logs only — a postStart failure is otherwise advisory.
-				r.log.Warn("postStart hook failed", "pod", podKey(ns, name), "container", cname, "err", err)
-			}
-		}()
-	}
-}
+// postStart's dispatch, readiness gate, failure handling and pod-scoped lifetime
+// live in poststart.go (B39) — this file owns the shared handler dispatch (runHook)
+// and preStop.
 
 // runPreStop runs each container's preStop hook BEFORE the runtimed DeletePod RPC
 // (which sends SIGTERM synchronously) and returns the residual SIGTERM→SIGKILL grace
@@ -148,7 +104,8 @@ func (r *runtimedRuntime) runPreStop(ctx context.Context, pod *corev1.Pod) int64
 }
 
 // runHook dispatches one lifecycle handler for (podID, container), bounded by
-// timeout, and returns the handler's error (the caller logs it; a hook never aborts
+// timeout (non-positive = bounded only by ctx, the postStart lifetime), and
+// returns the handler's error (the caller logs it; a hook never aborts
 // create or delete). The supported handlers mirror the probe handlers' seams: exec
 // over the runtime Exec RPC, httpGet over r.probeTransport with buildCheck's
 // resolution, and sleep as a pure r.clk timer. tcpSocket (a no-op upstream) and any
@@ -167,9 +124,11 @@ func (r *runtimedRuntime) runHook(ctx context.Context, podID, podIP, container s
 }
 
 // sleepHook blocks for want (clamped to the remaining budget) on r.clk, returning
-// early if ctx is cancelled. A non-positive sleep is a no-op.
+// early if ctx is cancelled. A non-positive sleep is a no-op; a non-positive BUDGET
+// means unbounded (the postStart caller — upstream does not cap a postStart sleep,
+// only preStop is charged against the termination grace), so it does not clamp.
 func (r *runtimedRuntime) sleepHook(ctx context.Context, want, budget time.Duration) error {
-	if want > budget {
+	if budget > 0 && want > budget {
 		want = budget
 	}
 	if want <= 0 {
