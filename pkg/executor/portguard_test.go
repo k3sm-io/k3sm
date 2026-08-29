@@ -90,3 +90,73 @@ func freePort(t *testing.T) int {
 	}
 	return p
 }
+
+// TestBringUpRefusesHeldComponentPort pins the same fail-closed guard for the two
+// co-located components, and it exists because the readiness wait alone was
+// PROVEN insufficient on a live host: with an incumbent control plane holding
+// 11562, a second server's scheduler died on the bind, the wait's probe was
+// answered by the incumbent's listener, and bring-up went on to report a healthy
+// control plane that had no scheduler at all.
+//
+// So the assertion is specifically that nothing is spawned. A test that only
+// checked for an eventual error would pass against the broken behaviour, because
+// the error did eventually arrive — several stages later, describing something
+// else.
+func TestBringUpRefusesHeldComponentPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("open the foreign holder: %v", err)
+	}
+	defer ln.Close()
+	held := ln.Addr().(*net.TCPAddr).Port
+
+	for _, tc := range []struct {
+		name  string
+		start func(*Supervised) func(context.Context) (*component, error)
+	}{
+		{"scheduler", func(s *Supervised) func(context.Context) (*component, error) { return s.startScheduler }},
+		{"controller-manager", func(s *Supervised) func(context.Context) (*component, error) {
+			return s.startControllerManager
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wd := t.TempDir()
+			s := NewSupervised(Config{WorkDir: wd})
+			spawned := false
+			start := func(ctx context.Context) (*component, error) {
+				spawned = true
+				return tc.start(s)(ctx)
+			}
+			err := s.startAndAwaitListening(context.Background(), tc.name, start, held)
+			if !errors.Is(err, ErrComponentPortHeld) {
+				t.Fatalf("startAndAwaitListening on a held port = %v, want ErrComponentPortHeld", err)
+			}
+			if spawned {
+				t.Error("the component was spawned onto a held port — the refusal must come BEFORE the spawn, since after it the readiness probe is answered by the incumbent")
+			}
+			for _, want := range []string{tc.name, strconv.Itoa(held)} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal %q must name %q", err, want)
+				}
+			}
+		})
+	}
+
+	t.Run("free port is not refused", func(t *testing.T) {
+		s := NewSupervised(Config{WorkDir: t.TempDir()})
+		err := s.startAndAwaitListening(context.Background(), "scheduler", s.startScheduler, freePort(t))
+		// The spawn fails (no staged binary in this temp work-dir), which is the
+		// point: a free port must reach the spawn rather than be refused outright.
+		if errors.Is(err, ErrComponentPortHeld) {
+			t.Fatalf("a free component port was refused: %v", err)
+		}
+	})
+}
+
+// TestPreflightComponentPortSkipsUnsetPort mirrors the datastore case: port 0
+// means "the executor will fill the default", not "probe port zero".
+func TestPreflightComponentPortSkipsUnsetPort(t *testing.T) {
+	if err := preflightComponentPort(context.Background(), "scheduler", 0); err != nil {
+		t.Fatalf("preflightComponentPort(0) = %v, want nil", err)
+	}
+}

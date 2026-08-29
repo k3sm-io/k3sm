@@ -240,3 +240,73 @@ func TestClientCAFileAlwaysSet(t *testing.T) {
 		t.Errorf("mesh --client-ca-file = %q, want the explicit %q (honored verbatim)", got, mesh.ClientCAFile)
 	}
 }
+
+// TestLoopbackComponentsBindLoopbackOnly pins the posture of the two co-located
+// control-plane components at the level the dev tier cannot see: their WHOLE argv,
+// not just the flags one helper renders.
+//
+// The scheduler and the controller-manager serve /healthz and /metrics over HTTPS
+// to the co-located control plane and to nothing else. Their ports are now
+// per-server, so that a second control plane on one Mac does not lose the bind —
+// and the risk a renumbering carries is that it becomes the edit which also moves
+// the address. So: exactly ONE --bind-address per component, and it is loopback.
+// Exactly one matters on its own, because these binaries take the LAST value for a
+// repeated flag, and a second one appended anywhere would silently win.
+func TestLoopbackComponentsBindLoopbackOnly(t *testing.T) {
+	cfg := Config{WorkDir: "/var/lib/k3sm/server"}.withDefaults()
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantPort int
+	}{
+		{"kube-scheduler", schedulerArgs(cfg), DefaultSchedulerPort},
+		{"kube-controller-manager", controllerManagerArgs(cfg), DefaultControllerManagerPort},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var binds, secure []string
+			for i, a := range tc.args {
+				if i+1 >= len(tc.args) {
+					continue
+				}
+				switch a {
+				case "--bind-address":
+					binds = append(binds, tc.args[i+1])
+				case "--secure-port":
+					secure = append(secure, tc.args[i+1])
+				}
+			}
+			if len(binds) != 1 {
+				t.Fatalf("%s carries %d --bind-address flags (%v), want exactly 1: the last one wins, so a second is an invisible override", tc.name, len(binds), binds)
+			}
+			if binds[0] != "127.0.0.1" {
+				t.Errorf("%s --bind-address = %q, want 127.0.0.1", tc.name, binds[0])
+			}
+			if len(secure) != 1 || secure[0] != strconv.Itoa(tc.wantPort) {
+				t.Errorf("%s --secure-port = %v, want exactly [%d]", tc.name, secure, tc.wantPort)
+			}
+		})
+	}
+}
+
+// TestLoopbackComponentPortsAreConfigurable pins that the two components' ports
+// come from Config and not from a literal — the property that lets a second
+// control plane exist at all. Rendering the DEFAULT when nothing is set is the
+// other half: a plain `k3sm server` must land byte-for-byte where it always did.
+func TestLoopbackComponentPortsAreConfigurable(t *testing.T) {
+	cfg := Config{WorkDir: "/var/lib/k3sm/server", SchedulerPort: 11455, ControllerManagerPort: 13460}.withDefaults()
+	if got := flagValue(schedulerArgs(cfg), "--secure-port"); got != "11455" {
+		t.Errorf("scheduler --secure-port = %q, want the configured 11455", got)
+	}
+	if got := flagValue(controllerManagerArgs(cfg), "--secure-port"); got != "13460" {
+		t.Errorf("controller-manager --secure-port = %q, want the configured 13460", got)
+	}
+	// An unset Config still renders the upstream defaults, through the accessor,
+	// so a hand-built Config never yields `--secure-port 0` (which upstream reads
+	// as "any free port" — a listener nothing could then find).
+	if got := flagValue(schedulerArgs(Config{}), "--secure-port"); got != strconv.Itoa(DefaultSchedulerPort) {
+		t.Errorf("scheduler --secure-port on a zero Config = %q, want %d", got, DefaultSchedulerPort)
+	}
+	if got := flagValue(controllerManagerArgs(Config{}), "--secure-port"); got != strconv.Itoa(DefaultControllerManagerPort) {
+		t.Errorf("controller-manager --secure-port on a zero Config = %q, want %d", got, DefaultControllerManagerPort)
+	}
+}

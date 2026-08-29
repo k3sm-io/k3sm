@@ -276,17 +276,31 @@ func (s *Supervised) provisionComponentCerts() error {
 	return nil
 }
 
+// componentReadyTimeout bounds each component's bring-up wait — the same budget
+// the datastore gets, since all of them are local child processes that either
+// bind within a second or are never going to.
+const componentReadyTimeout = 30 * time.Second
+
 // bringUp starts the components in order and waits for the apiserver to be
 // healthy before starting scheduler + controller-manager. Each bring-up wait
 // SELECTS on child-exit as well as readiness (M10.0, SRE fail-fast): a kine or
 // apiserver that dies on a bad flag/config surfaces immediately — with its log
 // tail — instead of wedging opaquely until the healthz timeout.
+//
+// The scheduler and the controller-manager get that same wait, and they need it
+// for a reason the earlier components did not have: they were previously started
+// FIRE-AND-FORGET, so a component that died on its own secure-port bind left
+// bring-up reporting success and the failure surfaced far downstream as something
+// else entirely — a control plane with no service-account controller fails at the
+// first namespace bootstrap, which reads as a bootstrap defect and not as a dead
+// KCM. Waiting on the listener each one owns puts the error back where the fault
+// is, with that component's name and log tail.
 func (s *Supervised) bringUp(ctx context.Context) error {
 	kine, err := s.startKine(ctx)
 	if err != nil {
 		return fmt.Errorf("start kine: %w", err)
 	}
-	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
+	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
 	// kine is serving, so this pin has now genuinely opened this database — stamp it,
@@ -304,11 +318,36 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := s.waitHealthz(ctx, api); err != nil {
 		return fmt.Errorf("apiserver not healthy: %w", err)
 	}
-	if _, err := s.startScheduler(ctx); err != nil {
-		return fmt.Errorf("start scheduler: %w", err)
+	if err := s.startAndAwaitListening(ctx, "scheduler", s.startScheduler, s.cfg.SchedulerPort); err != nil {
+		return err
 	}
-	if _, err := s.startControllerManager(ctx); err != nil {
-		return fmt.Errorf("start controller-manager: %w", err)
+	if err := s.startAndAwaitListening(ctx, "controller-manager", s.startControllerManager, s.cfg.ControllerManagerPort); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startAndAwaitListening starts a component and does not return until its own
+// loopback secure port accepts a connection — or until the child exits, which
+// takes priority and carries that component's name and log tail.
+//
+// The port is what this component can lose to another control plane on the same
+// Mac, so it is guarded from both sides: refused before the spawn if someone else
+// already holds it, and waited on after, which is what turns every other cause of
+// an early death into an error naming the component that had it.
+func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, start func(context.Context) (*component, error), port int) error {
+	// Fail closed BEFORE the spawn if the port is already held: the wait below
+	// would be satisfied by the incumbent's listener, so a component that lost
+	// its bind would leave bring-up reporting success (see preflightComponentPort).
+	if err := preflightComponentPort(ctx, name, port); err != nil {
+		return err
+	}
+	c, err := start(ctx)
+	if err != nil {
+		return fmt.Errorf("start %s: %w", name, err)
+	}
+	if err := awaitHealthy(ctx, c.name, c.exited, c.exitedNow, tcpReady(port), componentReadyTimeout, 300*time.Millisecond, c.exitDetail); err != nil {
+		return fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err)
 	}
 	return nil
 }
@@ -521,6 +560,26 @@ func apiServerArgs(cfg Config) []string {
 	return args
 }
 
+// loopbackBindAddress is the address the co-located control-plane components
+// serve their secure port on. It is INVARIANT, and single-sourced here because it
+// is the property that makes renumbering those ports safe.
+const loopbackBindAddress = "127.0.0.1"
+
+// LoopbackServingArgs renders the secure-serving flags for a control-plane
+// component whose HTTPS surface (/healthz, /metrics) is consumed only by the
+// co-located control plane — the scheduler and the controller-manager.
+//
+// Two facts are deliberately rendered TOGETHER by one function. The PORT varies
+// per server, because each of these is a singleton listener and a second control
+// plane on one Mac must not contend for the upstream default. The BIND ADDRESS
+// does not vary at all: these components answer on loopback and nowhere else, so
+// a caller choosing a port can never become the route by which they start
+// answering off-host. Splitting the pair would let the second fact drift while
+// the first is being exercised.
+func LoopbackServingArgs(port int) []string {
+	return []string{"--bind-address", loopbackBindAddress, "--secure-port", strconv.Itoa(port)}
+}
+
 // startScheduler launches kube-scheduler against its OWN per-component kubeconfig.
 func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-scheduler", schedulerArgs(s.cfg)...)
@@ -537,14 +596,13 @@ func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 // scheduler is active (two active schedulers double-bind pods).
 func schedulerArgs(cfg Config) []string {
 	kc := schedulerKubeconfigPath(cfg.WorkDir)
-	return []string{
+	args := []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
 		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
-		"--bind-address", "127.0.0.1",
-		"--secure-port", "10259",
 	}
+	return append(args, LoopbackServingArgs(cfg.schedulerPort())...)
 }
 
 // startControllerManager launches kube-controller-manager with the SCOPED
@@ -569,7 +627,7 @@ func (s *Supervised) startControllerManager(ctx context.Context) (*component, er
 func controllerManagerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
 	kc := controllerManagerKubeconfigPath(wd)
-	return []string{
+	args := []string{
 		"--kubeconfig", kc,
 		"--authentication-kubeconfig", kc,
 		"--authorization-kubeconfig", kc,
@@ -577,10 +635,9 @@ func controllerManagerArgs(cfg Config) []string {
 		"--use-service-account-credentials=true",
 		"--service-account-private-key-file", saKeyPath(wd),
 		"--root-ca-file", filepath.Join(certDir(wd), "apiserver.crt"),
-		"--bind-address", "127.0.0.1",
-		"--secure-port", "10257",
 		"--controllers", controllersFlag(),
 	}
+	return append(args, LoopbackServingArgs(cfg.controllerManagerPort())...)
 }
 
 // controllersFlag renders the scoped --controllers value: "*" (all on-by-default

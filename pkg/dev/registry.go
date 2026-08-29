@@ -63,13 +63,17 @@ type Instance struct {
 	// reclaimed by Remove — teardown deletes it explicitly. Empty on a manifest
 	// written before the split, which read the root from the work-dir parent.
 	PodRoot string `json:"podRoot"`
-	// APIPort / KinePort / KubeletPort are the probe-allocated ports (so parallel
-	// rootless instances never collide). KubeletPort is the node's logs/exec/stats
-	// listener; zero on a manifest written before it was allocated, which read the
-	// server's fixed default.
-	APIPort     int `json:"apiPort"`
-	KinePort    int `json:"kinePort"`
-	KubeletPort int `json:"kubeletPort"`
+	// These are the probe-allocated ports — every singleton listener the instance
+	// owns, so parallel rootless instances never collide. KubeletPort is the node's
+	// logs/exec/stats listener; SchedulerPort and ControllerManagerPort are the two
+	// co-located control-plane components' loopback secure ports. Each is zero on a
+	// manifest written before that port was allocated, which read the server's fixed
+	// default — so a zero here means "the default", not "unknown".
+	APIPort               int `json:"apiPort"`
+	KinePort              int `json:"kinePort"`
+	KubeletPort           int `json:"kubeletPort"`
+	SchedulerPort         int `json:"schedulerPort"`
+	ControllerManagerPort int `json:"controllerManagerPort"`
 	// PID is the detached `k3sm server` process (its own process group), recorded
 	// so `down` tears it down and `list` reports liveness. It is authoritative
 	// only when the manifest is fresh — `list` cross-checks it against
