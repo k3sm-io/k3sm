@@ -78,7 +78,7 @@ PROVEN=(); ROOT_DEFERRED=(); MULTINODE_DEFERRED=(); UNBUILT_DEFERRED=()
 echo "==> k3sm SIT — single-node system integration test (driving \`k3sm dev\`)"
 echo "    manifest: $CRITERIA_ENV"
 
-# Build the binary once (CGO for the embedded kine sqlite).
+# Build the binary once (CGO for runtimed's capability probes; kine is a child process).
 ( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN" ./cmd/k3sm )
 codesign -s - -f "$BIN" >/dev/null 2>&1 || true
 

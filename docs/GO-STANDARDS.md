@@ -69,7 +69,11 @@ Targets **darwin/arm64, macOS 26+**. Go **1.25.x** across all modules.
   the call site, and keep it behind the swappable abstraction + a CI symbol-canary (see DESIGN.md).
 - **CGO posture per repo** (set `CGO_ENABLED` accordingly in build/test):
   - `apis`, `darwin-net` — pure Go (`CGO_ENABLED=0`) for now.
-  - `k3sm` — pure Go today; **`CGO_ENABLED=1` from M1** (embeds kine → `mattn/go-sqlite3`).
+  - `k3sm` — **`CGO_ENABLED=1`** (imports runtimed's cgo-backed capability probes; a CGO=0
+    build compiles but reports those capabilities unavailable). kine is **not** embedded: the
+    executor runs it as a pinned **child process**, built on demand out-of-module
+    (`go install …/kine@pin`, CGO on for that child build only); `mattn/go-sqlite3` is not a
+    dependency of any `k3sm.io` module.
   - `runtimed` — **`CGO_ENABLED=1`** (darwin syscall shims).
 
 ## Project conventions

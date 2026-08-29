@@ -818,8 +818,7 @@ phases:
 > frontmatter above is **authoritative**; this prose mirrors it. Status: ✅ done · 🟡 in-progress · ⛔ blocked · ⬜ todo.
 
 `k3sm` is **Wave 3**: it imports all of `apis`, `runtimed`, `darwin-net` and assembles the distribution, so it
-lands last in every wave and owns the end-to-end exit demos. **CGO is `CGO_ENABLED=1` from M1** (embeds kine →
-`mattn/go-sqlite3`); keep the `replace google.golang.org/genproto` in `go.mod`.
+lands last in every wave and owns the end-to-end exit demos. **CGO is `CGO_ENABLED=1`** (runtimed's cgo probes; kine runs as a pinned child process, not embedded); keep the `replace google.golang.org/genproto` in `go.mod`.
 
 ## M0 — Walking skeleton ✅
 Validated 2026-06-24: a native control plane runs on macOS/arm64, `k3sm node` registers a darwin Virtual

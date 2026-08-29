@@ -49,7 +49,7 @@ is owned by **`docs/user/limitations.md`**.
 | **Observability** (`/stats/summary`, `/metrics/resource`, lifecycle Events) | runtimed working-set surface | **criterion** summary (M2) + **🟡 planned** `/metrics/resource`, node Events | §5/§7 |
 | **Config & storage** (ConfigMap/Secret, emptyDir/projected, PVC/PV local-path) | apiserver-served + runtimed materialization | **criterion** (M1/M3) + **🟡 planned** resize/snapshot/ephemeral (P3) | §11 |
 | **Auth & supply chain** (bootstrap triad, apiserver↔node TLS, code-signing) | k3s-style join + notarized binary | **criterion** (M4) | §8 |
-| **Datastore** (kine→SQLite WAL, KCM scoping) | embedded kine | **criterion** (M1) | §9 |
+| **Datastore** (kine→SQLite WAL, KCM scoping) | bundled kine (child process) | **criterion** (M1) | §9 |
 
 ## Hard ceilings (documented, never chased)
 
