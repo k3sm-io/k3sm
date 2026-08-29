@@ -360,6 +360,12 @@ func artifactManifest(cfg Config) []artifact {
 	for _, b := range executor.PayloadBinaries() {
 		items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", b), assertExists: true})
 	}
+	// The kine version marker rides beside the kine binary it describes: it is what tells
+	// the daemon's work-dir seed which kine pin+variant was staged, so a pin change reaches
+	// an already-booted node instead of being masked by the old binary's mere presence.
+	// assertExists is FALSE — an archive produced before markers existed still installs, and
+	// the seed falls back to rebuilding rather than trusting bytes nothing vouched for.
+	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName), assertExists: false})
 	items = append(items, []artifact{
 		// FORWARD-DECLARED: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
@@ -484,6 +490,14 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 			return fmt.Errorf("install: stage control-plane payload %s: %w (run `k3sm payload %s` first — the launchd daemon cannot acquire binaries itself)", name, err, cfg.PayloadSource)
 		}
 	}
+	//     The kine version marker is staged BEST-EFFORT beside the payload, and the error
+	//     is deliberately ignored: an archive produced before markers existed simply does
+	//     not have one, and its absence must not fail an install. It also cannot fail
+	//     silently in the dangerous direction — an unmarked payload is one the daemon's
+	//     work-dir seed REFUSES to trust (it rebuilds, or reports), rather than one it
+	//     stamps with a pin nothing vouched for.
+	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
+		filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName))
 
 	// 3. Render + write both plists, in manifest (install) order.
 	for _, a := range m {

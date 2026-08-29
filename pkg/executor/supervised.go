@@ -198,10 +198,22 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := ensureWorkDirs(s.cfg.WorkDir); err != nil {
 		return err
 	}
+	// BEFORE anything replaces the staged kine binary or lets the new pin touch the
+	// database: take the verified pre-migration snapshot if this boot moves an existing
+	// datastore onto a kine pin that has not opened it before. It is a no-op on a fresh
+	// node, on an unchanged pin, and on the Postgres posture (no state.db). It must sit
+	// ahead of seedBinDir/ensureKine, which are exactly what would destroy the old kine
+	// binary the rollback path preserves. A refusal (no space, an undrained WAL) stops
+	// the boot rather than migrating unprotected.
+	if s.cfg.DatastoreEndpoint == "" {
+		if err := snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
+			return err
+		}
+	}
 	// Seed the workdir bin from a staged install payload FIRST, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
-	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir); err != nil {
+	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion); err != nil {
 		return err
 	}
 	if err := ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion); err != nil {
@@ -277,6 +289,14 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
+	// kine is serving, so this pin has now genuinely opened this database — stamp it.
+	// Stamping here (not at provision time) is what makes the pre-migration snapshot
+	// survive a boot that dies before the datastore ever came up.
+	if s.cfg.DatastoreEndpoint == "" {
+		if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
+			return err
+		}
+	}
 	api, err := s.startAPIServer(ctx)
 	if err != nil {
 		return fmt.Errorf("start apiserver: %w", err)
@@ -303,6 +323,13 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Record WHICH kine is about to run — version AND build variant. The variant is not
+	// cosmetic: the same kine tag builds two different SQLite implementations depending
+	// on CGO_ENABLED, and a datastore incident that starts "which sqlite was this?"
+	// should be answerable from the node's own log.
+	kineVersion, kineVariant := readKineMarker(binDir(s.cfg.WorkDir))
+	s.cfg.Logger.Info("starting datastore shim", "component", "kine",
+		"version", kineVersion, "variant", kineVariant, "datastore", datastorePosture(s.cfg))
 	env, err := s.kineSecretEnv()
 	if err != nil {
 		return nil, err
