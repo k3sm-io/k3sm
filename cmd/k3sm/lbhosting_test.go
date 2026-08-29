@@ -18,6 +18,7 @@ package main
 
 import (
 	"log/slog"
+	"net"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -254,6 +255,39 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 			t.Error("--ingress-https-port -1 must error")
 		}
 	})
+}
+
+// TestServerKubeletListenOnRenumbersOnlyThePort pins the ONE property that makes
+// `k3sm server --kubelet-port` a port change and not an exposure change: the
+// derivation substitutes the port into the SAME wildcard form serverKubeletListen
+// has always had, and touches nothing else.
+//
+// The listener it addresses serves logs/exec/stats, and its identity rests on
+// serving TLS plus network reach rather than on the address it binds. So a
+// derivation that also moved the host part would alter that surface's exposure
+// while presenting as a renumbering — which is exactly the substitution this test
+// exists to red.
+func TestServerKubeletListenOnRenumbersOnlyThePort(t *testing.T) {
+	// The default reproduces today's address EXACTLY, so a server that passes no
+	// --kubelet-port is byte-for-byte where it was.
+	if got := serverKubeletListenOn(ports.KubeletAPIPort); got != serverKubeletListen {
+		t.Errorf("serverKubeletListenOn(default) = %q, want the unchanged %q", got, serverKubeletListen)
+	}
+	for _, port := range []int{ports.KubeletAPIPort, 10450, 10961} {
+		got := serverKubeletListenOn(port)
+		if want := ":" + strconv.Itoa(port); got != want {
+			t.Errorf("serverKubeletListenOn(%d) = %q, want %q", port, got, want)
+		}
+		// Same wildcard posture at every port: the node-proxy substitution in
+		// proxyableNodeIP gates on exactly this predicate.
+		if !wildcardListen(got) {
+			t.Errorf("serverKubeletListenOn(%d) = %q, which is not the wildcard bind the in-process node has always used", port, got)
+		}
+		host, _, err := net.SplitHostPort(got)
+		if err != nil || host != "" {
+			t.Errorf("serverKubeletListenOn(%d) = %q, want an EMPTY host: renumbering must not name an interface", port, got)
+		}
+	}
 }
 
 // TestKubeletListenAddressesUsePortsConstant pins that the kubelet API listen

@@ -353,7 +353,7 @@ func TestPodRootOutsideProtectedTree(t *testing.T) {
 	})
 
 	t.Run("serverArgs hands it to the server as --pod-root", func(t *testing.T) {
-		args := serverArgs("dev", "/w", "/private/var/tmp/k3sm-dev-0/dev", 7443, 12379, "direct", runtimeRuntimed, "", "")
+		args := serverArgs("dev", "/w", "/private/var/tmp/k3sm-dev-0/dev", 7443, 12379, 10450, "direct", runtimeRuntimed, "", "")
 		i := slices.Index(args, "--pod-root")
 		if i < 0 {
 			t.Fatalf("serverArgs = %v, want a --pod-root flag (without it the server derives the root from the work-dir parent)", args)

@@ -144,9 +144,22 @@ type nodeOptions struct {
 // address strings before B116, with no constant anywhere, while it is one of the
 // two wildcard listeners the reserved-port guard exists to protect.
 var (
-	serverKubeletListen = ":" + strconv.Itoa(ports.KubeletAPIPort)
+	serverKubeletListen = serverKubeletListenOn(ports.KubeletAPIPort)
 	nodeKubeletListen   = loopbackNodeIP + ":" + strconv.Itoa(ports.KubeletAPIPort)
 )
+
+// serverKubeletListenOn is serverKubeletListen at a caller-chosen PORT — the one
+// derivation `k3sm server --kubelet-port` goes through, so a second control plane
+// on one host can give its node a listener of its own instead of contending for
+// the single fixed default.
+//
+// It substitutes the port and NOTHING else. The result is the same wildcard form
+// serverKubeletListen has always had, because the address is not the port's to
+// move: the kubelet API's identity rests on serving TLS plus network reach (see
+// proxyableNodeIP and vkadapter.NewNode), so a derivation that also touched the
+// host part would change that surface's exposure while claiming to renumber a
+// port.
+func serverKubeletListenOn(port int) string { return ":" + strconv.Itoa(port) }
 
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
 // selected runtime (M0 walking skeleton + M1 runtimed image runtime).
