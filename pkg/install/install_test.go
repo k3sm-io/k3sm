@@ -137,6 +137,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm/bin/kube-controller-manager",
 		"CopyToRootOwned:/Library/k3sm/bin/kubectl",
 		"CopyToRootOwned:/Library/k3sm/bin/kine",
+		// The kine version marker rides beside the kine binary it describes, staged
+		// best-effort (a pre-marker archive has none and must still install).
+		"CopyToRootOwned:/Library/k3sm/bin/" + executor.KineMarkerName,
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
@@ -205,8 +208,9 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims.
 	head := len(fixedHead)
-	if want := head + len(executor.PayloadBinaries()); len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + the payload set)", len(dsts), want)
+	// +1 for the kine version marker, staged beside the kine binary it describes.
+	if want := head + len(executor.PayloadBinaries()) + 1; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + the payload set + the kine marker)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], "/Library/k3sm/bin/"+name; got != want {

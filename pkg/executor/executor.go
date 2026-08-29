@@ -136,7 +136,8 @@ type Config struct {
 	// shared Postgres (the k3s topology). The DSN PASSWORD is kept off argv and out of
 	// the logs — it is relocated to a 0600 PGPASSFILE handed to the kine child, and only
 	// the password-stripped DSN reaches kine's --endpoint. Setting this also moves kine
-	// to DefaultKineVersionHA (see KineVersion) and turns on leader election.
+	// on the shared Postgres (see KineVersion — one pin serves both postures) and
+	// turns on leader election.
 	DatastoreEndpoint string
 	// ServerJoin marks this control-plane server as joining/forming an HA control plane
 	// (a 2nd+ apiserver). It is the split-brain guard's trigger: an HA server MUST carry
@@ -174,22 +175,24 @@ type Config struct {
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
 	DefaultKubeVersion = "v1.36.2"
-	// DefaultKineVersion is the kine module version for the SINGLE-NODE kine->SQLite
-	// path (built CGO_ENABLED=1). It stays pinned at the M0-validated v1.14.2 —
-	// UNCHANGED — so the single-node M1–M5 installed base carries zero datastore-
-	// migration risk. (This pin predates the DESIGN's >=0.15 kine#577 watch-progress
-	// fix; that fix is only needed on the multi-writer path.)
-	DefaultKineVersion = "v1.14.2"
-	// DefaultKineVersionHA is the kine version for the Postgres-HA datastore path
-	// (M6.0). It is a real, go-install-verified >=0.15 release (the DESIGN floor) that
-	// carries the kine#577 watch-progress-notify fix: v0.16.x defaults
-	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11, so
-	// the apiserver's watch cache stays fresh under multi-writer churn (the kine half
-	// of the consistent-list-from-cache posture). HA is Postgres-FROM-INIT (greenfield),
-	// so there is no SQLite->newer-kine upgrade of an existing cluster — the version
-	// split is by datastore posture, not an in-place bump. The multi-writer
-	// watch-staleness soak on this version is the lab production-trust gate (hack/lab/m6.sh).
-	DefaultKineVersionHA = "v0.16.3"
+	// DefaultKineVersion is THE kine module version — one pin for BOTH datastore
+	// postures (single-node SQLite and Postgres-HA), built CGO_ENABLED=0 against
+	// kine's pure-Go modernc.org/sqlite backend (kineBuildVariant).
+	//
+	// It replaces the former two-pin split (v1.14.2 SQLite / v0.16.3 Postgres-HA).
+	// The old SQLite pin had no corresponding upstream tag — it resolves only from a
+	// warmed module proxy, so a cold GOPROXY=direct build of the datastore could not
+	// be reproduced at all — and it predated the kine#577 watch-progress-notify fix.
+	// v0.17.0 is what k3s itself pins; it defaults --watch-progress-notify-interval
+	// to 5s and --emulated-etcd-version to 3.6.11, so the apiserver's watch cache
+	// stays fresh on both postures, and its no-cgo build is a real, supported variant
+	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo) rather than the
+	// SQLite-disabled stub the M0 spike measured on the old pin.
+	//
+	// Moving an EXISTING single-node state.db onto this pin is a one-way datastore
+	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
+	// (and preserves the old kine binary) before the new pin ever opens the db.
+	DefaultKineVersion = "v0.17.0"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.
@@ -300,17 +303,6 @@ func (c Config) leaderElect() bool {
 	return c.isHA()
 }
 
-// defaultKineVersion picks the kine version for the datastore posture: the
-// Postgres-HA path pins DefaultKineVersionHA (a >=0.15 release with the kine#577
-// watch-progress fix), the SQLite single-node path stays on the M0-validated
-// DefaultKineVersion (zero migration risk for the installed base).
-func defaultKineVersion(datastoreEndpoint string) string {
-	if datastoreEndpoint != "" {
-		return DefaultKineVersionHA
-	}
-	return DefaultKineVersion
-}
-
 // withDefaults returns a copy of cfg with empty fields filled from the pinned
 // defaults.
 func (c Config) withDefaults() Config {
@@ -327,7 +319,10 @@ func (c Config) withDefaults() Config {
 		c.KubeVersion = DefaultKubeVersion
 	}
 	if c.KineVersion == "" {
-		c.KineVersion = defaultKineVersion(c.DatastoreEndpoint)
+		// ONE pin for both datastore postures (see DefaultKineVersion) — the
+		// SQLite/Postgres split is a driver choice inside a single kine build,
+		// never a second version.
+		c.KineVersion = DefaultKineVersion
 	}
 	if c.NodeIP == "" {
 		c.NodeIP = "127.0.0.1"

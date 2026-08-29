@@ -17,6 +17,7 @@ limitations under the License.
 package executor
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,7 +36,9 @@ func TestDatastoreEndpointSQLiteDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kineArgs: %v", err)
 	}
-	wantEndpoint := "sqlite:///var/lib/k3sm/server/db/state.db?_journal=WAL&_busy_timeout=30000"
+	// The _kine_disable_startup_vacuum opt-out is part of the shipped DSN — see
+	// TestSQLiteEndpointDisablesStartupVacuum for why it is not optional.
+	wantEndpoint := "sqlite:///var/lib/k3sm/server/db/state.db?_journal=WAL&_busy_timeout=30000&_kine_disable_startup_vacuum"
 	want := []string{"--listen-address", "127.0.0.1:2379", "--metrics-bind-address", "0", "--endpoint", wantEndpoint}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Errorf("SQLite kine argv mismatch.\n got %v\nwant %v", args, want)
@@ -153,36 +156,61 @@ func TestDatastorePasswordRelocation(t *testing.T) {
 	}
 }
 
-// TestKineVersionPostureAware proves the deferred bump-vs-soak decision: the SQLite
-// single-node path stays on v1.14.2 (unchanged), while a Postgres datastore endpoint
-// moves kine to the pinned >=0.15 release (DefaultKineVersionHA, with the kine#577
-// watch-progress fix). An explicit KineVersion is honored either way.
-func TestKineVersionPostureAware(t *testing.T) {
-	if got := defaultKineVersion(""); got != DefaultKineVersion {
-		t.Errorf("SQLite path kine version = %q, want %q", got, DefaultKineVersion)
+// TestKineVersionSinglePin proves the collapse: there is ONE kine pin, it serves both
+// datastore postures, and it is a >=0.16 release (the floor that carries the kine#577
+// watch-progress-notify fix and a real pure-Go SQLite backend). The old two-pin split
+// — v1.14.2 for SQLite, a separate HA-only constant for Postgres — is gone, so a
+// re-introduced second pin cannot compile past this test.
+func TestKineVersionSinglePin(t *testing.T) {
+	if !strings.HasPrefix(DefaultKineVersion, "v0.") {
+		t.Fatalf("DefaultKineVersion = %q, want a v0.x release (the two-pin collapse targets kine >=0.16.x; the orphan v1.14.2 line is retired)", DefaultKineVersion)
 	}
-	if got := defaultKineVersion("postgres://k3sm@db/k3sm"); got != DefaultKineVersionHA {
-		t.Errorf("Postgres path kine version = %q, want %q", got, DefaultKineVersionHA)
+	minor := 0
+	if _, err := fmt.Sscanf(DefaultKineVersion, "v0.%d.", &minor); err != nil {
+		t.Fatalf("DefaultKineVersion = %q: cannot parse a minor version: %v", DefaultKineVersion, err)
 	}
-	// The single-node default const must NOT have drifted off the M0-validated pin.
-	if DefaultKineVersion != "v1.14.2" {
-		t.Errorf("DefaultKineVersion = %q, want v1.14.2 (single-node installed base must not migrate)", DefaultKineVersion)
-	}
-	// The HA pin must be a real, distinct version (a >=0.15 release per the DESIGN
-	// floor — the exact value is go-install-verified and documented on the const).
-	if !strings.HasPrefix(DefaultKineVersionHA, "v") || DefaultKineVersionHA == DefaultKineVersion {
-		t.Errorf("DefaultKineVersionHA = %q, want a real version distinct from the SQLite pin %q", DefaultKineVersionHA, DefaultKineVersion)
+	if minor < 16 {
+		t.Errorf("DefaultKineVersion = %q, want >= v0.16.x (the kine#577 watch-progress floor)", DefaultKineVersion)
 	}
 
-	// withDefaults wires the posture: an empty KineVersion fills from the datastore.
+	// withDefaults fills the SAME pin regardless of datastore posture.
 	if got := (Config{}).withDefaults().KineVersion; got != DefaultKineVersion {
 		t.Errorf("withDefaults SQLite KineVersion = %q, want %q", got, DefaultKineVersion)
 	}
-	if got := (Config{DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).withDefaults().KineVersion; got != DefaultKineVersionHA {
-		t.Errorf("withDefaults Postgres KineVersion = %q, want %q", got, DefaultKineVersionHA)
+	if got := (Config{DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).withDefaults().KineVersion; got != DefaultKineVersion {
+		t.Errorf("withDefaults Postgres KineVersion = %q, want %q (one pin, both postures)", got, DefaultKineVersion)
 	}
 	if got := (Config{KineVersion: "v0.99.0", DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).withDefaults().KineVersion; got != "v0.99.0" {
 		t.Errorf("explicit KineVersion must be honored, got %q", got)
+	}
+}
+
+// TestSQLiteEndpointDisablesStartupVacuum pins the DSN opt-out. kine >=0.16 VACUUMs the
+// WHOLE database on EVERY startup unless the DSN carries _kine_disable_startup_vacuum;
+// the pin k3sm left behind never did. Losing this parameter would put a full-database
+// rewrite on the critical path of every `launchctl kickstart`, on the shared APFS volume
+// that also holds images, pod dirs, and PV data — silently, and only on real clusters
+// large enough to notice.
+func TestSQLiteEndpointDisablesStartupVacuum(t *testing.T) {
+	dsn := sqliteEndpoint("/var/lib/k3sm/server")
+	if !strings.Contains(dsn, "_kine_disable_startup_vacuum") {
+		t.Errorf("sqliteEndpoint() = %q, want it to carry _kine_disable_startup_vacuum", dsn)
+	}
+	// kine detects the flag with strings.Contains over the DSN, so it must survive
+	// whole into the rendered argv, not just into this helper.
+	args, err := kineArgs(Config{WorkDir: "/var/lib/k3sm/server"}.withDefaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "_kine_disable_startup_vacuum") {
+		t.Errorf("kineArgs = %v, want the SQLite endpoint to carry _kine_disable_startup_vacuum", args)
+	}
+	// The WAL + busy-timeout posture is unchanged by the opt-out.
+	for _, want := range []string{"_journal=WAL", "_busy_timeout=30000"} {
+		if !strings.Contains(dsn, want) {
+			t.Errorf("sqliteEndpoint() = %q, want it to keep %s", dsn, want)
+		}
 	}
 }
 

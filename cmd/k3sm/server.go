@@ -193,8 +193,8 @@ func runServer(args []string) error {
 		}
 	}
 	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
-	// Postgres (DefaultKineVersionHA) and turns on scheduler/KCM leader election so only
-	// one server is active. The executor fail-closes (ErrHARequiresDatastore) if HA is
+	// Postgres — the same pinned kine build as single-node, a driver choice not a second
+	// version — and turns on scheduler/KCM leader election so only one server is active. The executor fail-closes (ErrHARequiresDatastore) if HA is
 	// requested without the endpoint — never a silent per-server SQLite (split-brain).
 	cfg.DatastoreEndpoint = opts.datastoreEndpoint
 	cfg.ServerJoin = opts.serverJoin
