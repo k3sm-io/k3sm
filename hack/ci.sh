@@ -34,7 +34,13 @@ if [ -n "$go_pkgs" ]; then
 	# The integration tier is NOT run here (it needs darwin + a real socket), but
 	# nothing else in this repo COMPILES the `integration` build tag, so the
 	# B116 privilege-premise canary would rot invisibly. Vet it.
-	echo "==> [k3sm] go vet -tags integration"; CGO_ENABLED=$CGO go vet -tags integration ./...
+	# Every build tag this repo defines gets vetted, not just the ones a stage runs.
+	# A tagged file that no stage COMPILES can break on main invisibly: a helper added
+	# under no tag collided with one under `kinecompat`, and the compat gate could not
+	# build for a full day because nothing here ever tried.
+	for tag in integration kinecompat e2e; do
+		echo "==> [k3sm] go vet -tags $tag"; CGO_ENABLED=$CGO go vet -tags "$tag" ./...
+	done
 else
 	echo "==> [k3sm] (no Go packages yet — skipping vet/build/test)"
 fi
