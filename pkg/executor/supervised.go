@@ -97,6 +97,19 @@ func (c *component) exitDetail() string {
 	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, tailFile(c.logPath, exitLogTailLines))
 }
 
+// exitedNow reports whether the child has left the RUNNING state, asked of the
+// kernel synchronously rather than inferred from the exited channel. It is the
+// deadline tie-break awaitHealthy needs: exited is closed by a reaper goroutine
+// that may not have been scheduled yet, whereas this answer is available the
+// instant the child dies. Safe to call at any time, including before the reaper
+// has run — it never reaps, so it cannot race cmd.Wait.
+func (c *component) exitedNow() bool {
+	if c.cmd == nil || c.cmd.Process == nil {
+		return false
+	}
+	return processExited(c.cmd.Process.Pid)
+}
+
 // Supervised is the child-process control-plane executor: it os/exec-supervises
 // kine, the apiserver, the scheduler, and the controller-manager as child
 // processes, each in its own process group for clean teardown.
@@ -261,7 +274,7 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("start kine: %w", err)
 	}
-	if err := awaitHealthy(ctx, kine.name, kine.exited, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
+	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
 	api, err := s.startAPIServer(ctx)
@@ -602,7 +615,7 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 // the log tail) if the apiserver child exits first. The 90s healthTimeout is
 // unchanged — fail-fast only ever SHORTENS the wedge, never lengthens it.
 func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
-	return awaitHealthy(ctx, api.name, api.exited, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
+	return awaitHealthy(ctx, api.name, api.exited, api.exitedNow, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
 }
 
 // awaitHealthy is the bring-up wait: it polls ready() every poll until it
@@ -612,7 +625,22 @@ func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
 // pure function over channels + funcs so the fail-fast contract is table-tested
 // without spawning real control-plane binaries. A closed exited wins over a
 // concurrently-true ready (a dead child is never "healthy").
-func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, ready func(context.Context) bool, timeout, poll time.Duration, exitDetail func() string) error {
+//
+// exitedNow is the tie-breaker that makes "the child died" beat "the deadline
+// expired" DETERMINISTICALLY. The exited channel is closed by a reaper goroutine,
+// so a child can be long dead while the close has not been SCHEDULED yet — under
+// full-suite parallel load that lag was measured in seconds, which is exactly how
+// a dead child came back as an opaque "not healthy within 10s". So the deadline
+// is not allowed to author its error until exitedNow — an authoritative,
+// synchronous kernel probe running on THIS goroutine — has confirmed the child is
+// still alive. When it says the child has exited, the wait blocks for the close
+// (imminent by construction: the kernel has already released the child, so the
+// reaper only needs a scheduling slot) and returns the exit-shaped error instead.
+// A nil exitedNow disables the tie-break, leaving the deadline unqualified.
+//
+// The probe is consulted ONLY at deadline expiry — one syscall per bring-up wait,
+// not one per poll — because that is the only place a wrong error shape is built.
+func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exitedNow func() bool, ready func(context.Context) bool, timeout, poll time.Duration, exitDetail func() string) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		select {
@@ -624,6 +652,14 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, read
 			return nil
 		}
 		if time.Now().After(deadline) {
+			if exitedNow != nil && exitedNow() {
+				select {
+				case <-exited:
+					return fmt.Errorf("%s exited during bring-up: %s", name, exitDetail())
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			return fmt.Errorf("%s not healthy within %s", name, timeout)
 		}
 		select {
