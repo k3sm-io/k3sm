@@ -351,7 +351,7 @@ func runServer(args []string) error {
 	// per-node cluster DNS resolver bound to the DNS VIP + the pod DNSConfig the
 	// shim consumes. The NetdSocket routes the proxy/resolver privileged lo0/port
 	// ops through the root helper when unprivileged (empty in root mode → direct
-	// ops); Disabled (--network none) writes the Corefile but runs no datapath.
+	// ops); Disabled (--network none) runs no datapath.
 	//
 	// MeshEgressIP is intentionally left empty on the server: `k3sm server` does not
 	// bring up its own wireguard mesh device yet (that is the M3.0 two-Mac lab leg),
