@@ -319,6 +319,13 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 // 0600 PGPASSFILE the kine child reads via PGPASSFILE (kineSecretEnv) and only the
 // password-stripped DSN reaches --endpoint.
 func (s *Supervised) startKine(ctx context.Context) (*component, error) {
+	// Fail closed BEFORE the spawn if the datastore port is already held: a kine we
+	// start over a foreign listener never gets the port, but the readiness probe
+	// below is satisfied by the INCUMBENT, so bring-up would continue against
+	// another cluster's datastore and report healthy (see preflightDatastorePort).
+	if err := preflightDatastorePort(ctx, s.cfg.KinePort); err != nil {
+		return nil, err
+	}
 	args, err := kineArgs(s.cfg)
 	if err != nil {
 		return nil, err
