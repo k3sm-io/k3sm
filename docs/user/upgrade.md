@@ -36,13 +36,37 @@ control-plane Mac last unless a release note says otherwise. See [multi-node.md]
 
 ## Before you upgrade
 
-- **Snapshot the datastore.** Take a datastore backup first so you can roll back state if needed — see
-  [backup-restore.md](backup-restore.md).
+- **Back up the datastore.** There is no `k3sm snapshot` command — take the file-level backup (stop the
+  daemon, `PRAGMA wal_checkpoint(TRUNCATE)`, copy, verify the copy) in
+  [backup-restore.md](backup-restore.md), and keep it off the node. k3sm also takes an automatic
+  pre-migration backup when a release changes the datastore engine (below), but that copy lives on the
+  same disk as the cluster it protects, so it is not a substitute for yours.
 - **Know your rollback path.** Homebrew retains the prior bottle, so rollback does not require a
   rebuild round-trip; on the script channel, prior releases stay downloadable — rollback is
   `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
 - **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
   [versions.md](versions.md).
+
+## Upgrading across a datastore-engine change
+
+Some releases move to a newer **kine** (the etcd-shim over SQLite). A newer kine re-runs its schema
+migrations against your existing `state.db`, which is **one-way** — the migrated database is not
+converted back if you reinstall the older k3sm.
+
+You do not have to do anything for this, but you should know what it does:
+
+- **Before** the new version opens the database, the server takes a verified backup at
+  `db/state.db.pre-<kine-version>.bak` and preserves the old kine binary beside it as
+  `kine.pre-<kine-version>`. The mechanics — the WAL drain, the integrity check, the write-once
+  rule — are in [backup-restore.md](backup-restore.md).
+- It **refuses to start** if the volume does not have twice the database size free, rather than
+  writing a partial backup. Free space and start it again; nothing was changed.
+- The first boot on the new engine is slower than usual (the checkpoint + the copy). Later boots are not.
+- **Keep the `.bak`** until you are satisfied with the new release, then delete it — it is a full copy
+  of the database.
+
+On the [HA](ha.md) Postgres posture none of this applies; the datastore is your Postgres, and its
+backup is `pg_dump`/PITR on your schedule.
 
 ## Upgrading into the reserved-port policy
 
@@ -81,9 +105,13 @@ can cause — silently in place.
 
 Rollback is **revert to the previous binary** (`brew` pin/switch to the prior bottle, or on the
 script channel `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run) plus the daemon restart that
-comes with it, not a runtime flag flip. Datastore schema migrations may be forward-only; if a release notes
-a datastore migration, plan the forward fix rather than assuming a clean downgrade — see
-[backup-restore.md](backup-restore.md).
+comes with it, not a runtime flag flip.
+
+If the release you are leaving changed the **datastore engine**, reverting the binary is only half of
+it — the database has already been migrated in place. Restore the `db/state.db.pre-<kine-version>.bak`
+the upgrade left behind, following the restore procedure and its verification step in
+[backup-restore.md](backup-restore.md), and do it while the daemon is stopped. Rolling the binary back
+without restoring the backup leaves an older k3sm pointed at a database a newer engine has migrated.
 
 ### Rolling back past the LoadBalancer bind change leaves durable state
 
@@ -119,6 +147,6 @@ does **not** revert them; you have to.
 
 ## Next
 
-- [backup-restore.md](backup-restore.md) — snapshot before upgrading.
+- [backup-restore.md](backup-restore.md) — back up before upgrading; the automatic pre-migration copy.
 - [versions.md](versions.md) — the version you are moving to.
 - [troubleshooting.md](troubleshooting.md) — if the daemon does not restart.

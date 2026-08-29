@@ -25,7 +25,8 @@ control-plane Macs so the apiserver remains reachable if one node is lost. This 
 ## Caveats
 
 Because HA is EXPERIMENTAL, do not treat it as a production availability guarantee yet. Validate
-failover and restore on your own hardware, and keep datastore snapshots (see
+failover and restore on your own hardware, and keep datastore backups — on this posture that means
+`pg_dump`/PITR against your Postgres, not the single-node SQLite procedure (see
 [backup-restore.md](backup-restore.md)).
 
 ## Next
