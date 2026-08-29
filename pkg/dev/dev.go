@@ -305,9 +305,14 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		}
 	}
 
-	// Boot the config-superset via a detached `k3sm server`: --psa-enforce-baseline
-	// (so the M10 PSA cutover criterion works) + K3SM_WORK_DIR exported (so the
-	// audit/PSA e2e read the SAME workdir). runtimed (Seatbelt-confined) is the
+	// Boot a detached `k3sm server` on the SHIPPED admission defaults (PSA
+	// enforce=privileged, warn=baseline). dev used to pass --psa-enforce-baseline
+	// "so the M10 PSA cutover criterion works", but that criterion's own skip-spec
+	// demands a SEPARATE flagged boot (K3SM_PSA_ENFORCE=1) — while the flag here
+	// made the default-posture criteria (TestM10_PSADefaultWarn/AuditLogLevel)
+	// structurally unpassable under the SIT: they assert the shipped default and
+	// the harness booted the cutover. K3SM_WORK_DIR is exported so the audit/PSA
+	// e2e read the SAME workdir. runtimed (Seatbelt-confined) is the
 	// default; hostprocess is only the honest execshim-unavailable fallback. The
 	// rootless tier is network=none (runtimePreflight returns nil — no root);
 	// --datapath is network=direct.
@@ -581,7 +586,6 @@ func serverArgs(name, workDir string, apiPort int, network, runtimeName, pathShi
 		"--runtime", runtimeName,
 		"--network", network,
 		"--api-port", strconv.Itoa(apiPort),
-		"--psa-enforce-baseline",
 		// Disable the ingress listeners: the dev cluster does not front an ingress,
 		// and the production :80/:443 bind needs privileges the rootless tier lacks.
 		"--ingress-http-port", "0",
