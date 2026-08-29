@@ -142,7 +142,25 @@ func (v *VKProvider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summar
 	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: v.nodeName}}, nil
 }
 
-// GetMetricsResource returns no custom metrics in M1.
+// GetMetricsResource serves the VK /metrics/resource endpoint — the kubelet
+// resource-metrics scrape target an operator-installed metrics-server reads to
+// populate metrics.k8s.io (`kubectl top`, HPA-on-CPU).
+//
+// It transcodes the SAME Summary snapshot GetStatsSummary serves, so the two
+// endpoints can never disagree about the node. A Runtime with no StatsSource has
+// nothing to report and serves an empty scrape target, which is the honest shape
+// for an unimplemented metering surface.
+//
+// The CPU/memory pair is emitted JOINTLY or not at all — see buildResourceMetrics
+// for why a memory-only endpoint would be a regression on serving nothing.
 func (v *VKProvider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
-	return nil, nil
+	s, ok := v.rt.(StatsSource)
+	if !ok {
+		return nil, nil
+	}
+	summary, err := s.StatsSummary(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return buildResourceMetrics(summary), nil
 }
