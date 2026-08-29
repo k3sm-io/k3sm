@@ -346,7 +346,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// default; hostprocess is only the honest execshim-unavailable fallback. The
 	// rootless tier is network=none (runtimePreflight returns nil — no root);
 	// --datapath is network=direct.
-	pid, err := m.spawnServer(ctx, name, workDir, podRoot, apiPort, network, runtimeName, binDir, pathShim, dnsShim)
+	pid, err := m.spawnServer(ctx, name, workDir, podRoot, apiPort, kinePort, network, runtimeName, binDir, pathShim, dnsShim)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -638,7 +638,7 @@ func (m *Manager) preflightReclaim(name string) error {
 // unit-tested without spawning a process. An empty shim path emits NO flag at
 // all: the server must fall back to its own sibling-dylib resolution rather than
 // be pointed at a path that is not there.
-func serverArgs(name, workDir, podRoot string, apiPort int, network, runtimeName, pathShim, dnsShim string) []string {
+func serverArgs(name, workDir, podRoot string, apiPort, kinePort int, network, runtimeName, pathShim, dnsShim string) []string {
 	args := []string{
 		"server",
 		"--work-dir", workDir,
@@ -652,6 +652,11 @@ func serverArgs(name, workDir, podRoot string, apiPort int, network, runtimeName
 		"--runtime", runtimeName,
 		"--network", network,
 		"--api-port", strconv.Itoa(apiPort),
+		// The allocated datastore port, NOT the server default: without it every
+		// instance's kine would target the one fixed port, and the second instance up
+		// would be refused by the executor (or, before that refusal existed, come up
+		// healthy against the first instance's datastore).
+		"--kine-port", strconv.Itoa(kinePort),
 		// Disable the ingress listeners: the dev cluster does not front an ingress,
 		// and the production :80/:443 bind needs privileges the rootless tier lacks.
 		"--ingress-http-port", "0",
@@ -671,7 +676,7 @@ func serverArgs(name, workDir, podRoot string, apiPort int, network, runtimeName
 // <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
 // until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
 // read the same workdir.
-func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, apiPort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (int, error) {
+func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, apiPort, kinePort int, network, runtimeName, execShimDir, pathShim, dnsShim string) (int, error) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return 0, fmt.Errorf("create workdir %s: %w", workDir, err)
 	}
@@ -688,7 +693,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	}
 	defer lf.Close()
 
-	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, apiPort, network, runtimeName, pathShim, dnsShim)...)
+	cmd := exec.CommandContext(ctx, m.self, serverArgs(name, workDir, podRoot, apiPort, kinePort, network, runtimeName, pathShim, dnsShim)...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	// Own process group so `down` can SIGTERM the whole supervised tree via -pid,
 	// and detached from ctx cancellation (WaitDelay 0 + no Cancel) so the server

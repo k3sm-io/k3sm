@@ -18,6 +18,7 @@ package dev
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -146,4 +147,59 @@ func TestHasAliasInCIDRs(t *testing.T) {
 	if !present {
 		t.Error("hasAliasInCIDRs = false with a pod-CIDR alias present, want true (singleton assert)")
 	}
+}
+
+// TestDevPassesAllocatedKinePort pins BOTH halves of per-instance datastore
+// isolation: two instances get different datastore ports, and the allocated port
+// actually reaches the detached server's argv. Without the argv half the
+// allocation is dead code — every instance's kine targets the one fixed server
+// default, so the second instance up contends for the first one's datastore.
+func TestDevPassesAllocatedKinePort(t *testing.T) {
+	sys := newFakeSystem()
+
+	apiA, kineA, err := allocatePorts(sys, "a", 501)
+	if err != nil {
+		t.Fatalf("allocatePorts(a): %v", err)
+	}
+	// Instance "a" is now up, so its ports are bound — which is the real condition
+	// the second allocation must probe past, not merely a different hash seed.
+	sys.busyPorts[apiA] = true
+	sys.busyPorts[kineA] = true
+	apiB, kineB, err := allocatePorts(sys, "b", 501)
+	if err != nil {
+		t.Fatalf("allocatePorts(b): %v", err)
+	}
+	if kineA == kineB {
+		t.Fatalf("both instances allocated datastore port %d — they would share one datastore", kineA)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		apiPort  int
+		kinePort int
+	}{
+		{"a", apiA, kineA},
+		{"b", apiB, kineB},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := serverArgs(tc.name, "/w", "/pods", tc.apiPort, tc.kinePort, "none", runtimeRuntimed, "", "")
+			got, ok := argvFlagValue(args, "--kine-port")
+			if !ok {
+				t.Fatalf("serverArgs = %v, want a --kine-port flag (without it kine binds the fixed server default)", args)
+			}
+			if want := strconv.Itoa(tc.kinePort); got != want {
+				t.Errorf("--kine-port = %q, want the allocated port %q", got, want)
+			}
+		})
+	}
+}
+
+// argvFlagValue returns the value following flag in args.
+func argvFlagValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
 }
