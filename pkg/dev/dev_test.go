@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -353,7 +354,7 @@ func TestPodRootOutsideProtectedTree(t *testing.T) {
 	})
 
 	t.Run("serverArgs hands it to the server as --pod-root", func(t *testing.T) {
-		args := serverArgs("dev", "/w", "/private/var/tmp/k3sm-dev-0/dev", 7443, 12379, "direct", runtimeRuntimed, "", "")
+		args := serverArgs("dev", "/w", "/private/var/tmp/k3sm-dev-0/dev", 7443, 12379, 10450, "direct", runtimeRuntimed, "", "")
 		i := slices.Index(args, "--pod-root")
 		if i < 0 {
 			t.Fatalf("serverArgs = %v, want a --pod-root flag (without it the server derives the root from the work-dir parent)", args)
@@ -509,3 +510,130 @@ func TestDevUpSurfacesColdCacheBootTimeout(t *testing.T) {
 		}
 	})
 }
+
+// TestDevUpFailsWhenServerDies is the report-vs-reality gate: `k3sm dev up` may
+// only say an instance is up while the server it spawned is still running.
+//
+// It printed `instance "b" up` for a server whose datastore had FATAL'd, and the
+// report was not wrong about anything it had checked — the kubeconfig existed,
+// the default namespace was bootstrapped, a node was Ready. Every one of those is
+// a readiness SIGNAL, and a signal already emitted stays true after the process
+// emitting it dies. So the fixture here is exactly that shape: a server that
+// writes its readiness file and then exits. Both directions are asserted, because
+// a check that only ever fails is as useless as one that only ever passes.
+func TestDevUpFailsWhenServerDies(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fixture  string // shell run after the kubeconfig is written
+		wantFail bool
+	}{
+		{
+			name: "the server exits right after its readiness file appears",
+			// The exit status and the log line are distinctive so the assertions
+			// below prove the ERROR carries the server's own account, not a
+			// synthesised one.
+			fixture:  "echo 'FATAL: kine: listen tcp 127.0.0.1:2379: bind: address already in use' >&2\nexit 7\n",
+			wantFail: true,
+		},
+		{
+			name:     "a server that stays alive still comes up",
+			fixture:  "sleep 120\n",
+			wantFail: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sys := newFakeSystem()
+			// The spawned server is a REAL process, so the liveness seam must answer
+			// about it truthfully — the in-memory pid table cannot.
+			sys.aliveProbe = func(pid int) bool { return syscall.Kill(pid, 0) == nil }
+			m := newTestManager(t, sys, 501)
+			out := &bytes.Buffer{}
+			m.out = out
+			m.builder = &fakeBuilder{}
+			m.podRootBase = filepath.Join(t.TempDir(), "podroot")
+			m.self = writeFakeServer(t, tc.fixture)
+			// The two cluster-shaped waits have no cluster here; the defect under
+			// test is upstream of both, in what `up` concludes from them.
+			m.awaitNamespaceBootstrap = func(context.Context, string) error { return nil }
+			m.awaitNodeRegistration = func(context.Context, string) error { return nil }
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			inst, err := m.Up(ctx, UpOptions{Name: "b", Kubeconfig: filepath.Join(t.TempDir(), "kubeconfig")})
+			if inst.PID > 0 {
+				t.Cleanup(func() { _ = syscall.Kill(-inst.PID, syscall.SIGKILL) })
+			}
+
+			if !tc.wantFail {
+				if err != nil {
+					t.Fatalf("Up over a live server = %v, want nil", err)
+				}
+				if !strings.Contains(out.String(), `instance "b" up`) {
+					t.Errorf("output %q must report the instance up", out)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("Up over a server that exited = nil; it reported %q for a dead control plane", out)
+			}
+			if !errors.Is(err, ErrServerExited) {
+				t.Fatalf("Up error = %v, want ErrServerExited", err)
+			}
+			// The exit REASON, not merely the fact of it: an operator whose kine lost
+			// a port bind must be told that, not told a probe failed.
+			for _, want := range []string{"exit status 7", "bind: address already in use", "server.log"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must carry %q from the server's own exit", err, want)
+				}
+			}
+			if strings.Contains(out.String(), `instance "b" up`) {
+				t.Errorf("output %q reported an instance up over a dead server", out)
+			}
+			// A dead server leaves no durable manifest to mislead `list`/`down`.
+			if _, lerr := m.reg.Load("b"); !errors.Is(lerr, ErrNotFound) {
+				t.Errorf("registry Load after a failed up = %v, want ErrNotFound", lerr)
+			}
+		})
+	}
+}
+
+// writeFakeServer writes an executable stand-in for `k3sm server` that writes the
+// admin kubeconfig into $K3SM_WORK_DIR — the readiness signal `up` waits on — and
+// then runs after. Its argv is ignored: what is under test is what `up` concludes
+// from the signal, not what the server does with its flags.
+func writeFakeServer(t *testing.T, after string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-k3sm-server")
+	// Written temp-then-rename, as the real server writes it: a reader polling for
+	// the file must never observe a half-written one, or this fixture would fail
+	// bring-up at the kubeconfig PARSE and stop exercising the defect.
+	script := "#!/bin/sh\nset -e\ncat > \"$K3SM_WORK_DIR/.kubeconfig.tmp\" <<'KC'\n" +
+		fakeKubeconfig + "KC\n" +
+		"mv \"$K3SM_WORK_DIR/.kubeconfig.tmp\" \"$K3SM_WORK_DIR/k3sm.kubeconfig\"\n" + after
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake server: %v", err)
+	}
+	return path
+}
+
+// fakeKubeconfig is a minimal admin kubeconfig with the sole cluster/user/context
+// the merge expects.
+const fakeKubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: k3sm
+  cluster:
+    server: https://127.0.0.1:16440
+    insecure-skip-tls-verify: true
+users:
+- name: admin
+  user:
+    token: fake-token
+contexts:
+- name: k3sm
+  context:
+    cluster: k3sm
+    user: admin
+current-context: k3sm
+`

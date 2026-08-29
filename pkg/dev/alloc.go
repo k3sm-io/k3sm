@@ -24,45 +24,70 @@ import (
 )
 
 // Port-allocation bounds. The dev tier deliberately avoids the fixed-port
-// defaults the acceptance gates use (6444/2379 — see hack/lib/clusterup.sh) so a
-// dev instance never collides with an acceptance run or a second dev instance.
-// The window is high (ephemeral-ish) and wide enough for many parallel rootless
-// instances.
+// defaults the acceptance gates use (6444/2379/10250 — see hack/lib/clusterup.sh)
+// so a dev instance never collides with an acceptance run or a second dev
+// instance. The window is high (ephemeral-ish) and wide enough for many parallel
+// rootless instances.
 const (
 	apiPortBase  = 16440
 	kinePortBase = 12379
+	// kubeletPortBase seeds the node's kubelet-API port (logs/exec/stats). It is
+	// clear of the fixed control-plane singletons the base must not overlap —
+	// 10250 itself, and the scheduler/controller-manager 10259/10257 — so a probe
+	// that walks the whole span still never lands on one of them.
+	kubeletPortBase = 10450
 	// portSpan bounds the linear probe from each base — 512 candidate ports is
 	// far more than the realistic parallel-instance count, and keeps the search
 	// bounded so a wedged host fails fast rather than scanning 64k ports.
 	portSpan = 512
-	// portStride separates an instance's api/kine hash seeds so a hash collision
-	// on the api port does not also collide the kine port.
+	// portStride separates an instance's per-port hash seeds so a hash collision
+	// on one port does not also collide the next.
 	portStride = 2
 )
 
-// allocatePorts picks a free (apiPort, kinePort) pair for name, deterministically
-// SEEDED from (name × euid) so re-running `up <name>` prefers the same ports (a
-// stable dev loop), then linearly probing forward past any that are currently
-// bound (System.PortFree) so parallel rootless instances never collide. It errors
-// only if the whole window is saturated. The two ports are drawn from disjoint
-// bases so they cannot alias each other.
-func allocatePorts(sys System, name string, euid int) (apiPort, kinePort int, err error) {
+// allocatePorts picks a free (apiPort, kinePort, kubeletPort) triple for name,
+// deterministically SEEDED from (name × euid) so re-running `up <name>` prefers
+// the same ports (a stable dev loop), then linearly probing forward past any that
+// are currently bound (System.PortFree) so parallel rootless instances never
+// collide. It errors only if the whole window is saturated. The three ports are
+// drawn from disjoint bases so they cannot alias each other.
+//
+// EVERY singleton listener an instance owns has to be in here. The kubelet API
+// port joined the pair because it is the node's own listener: two instances that
+// each bind the one fixed default contend for it, and the loser's node exits
+// bring-up with "bind: address already in use" — the same defect the datastore
+// port had, one process further down.
+func allocatePorts(sys System, name string, euid int) (apiPort, kinePort, kubeletPort int, err error) {
 	seed := hashSeed(name, euid)
 	apiPort, err = probeFreePort(sys, apiPortBase, int(seed%portSpan))
 	if err != nil {
-		return 0, 0, fmt.Errorf("allocate apiserver port: %w", err)
+		return 0, 0, 0, fmt.Errorf("allocate apiserver port: %w", err)
 	}
 	kinePort, err = probeFreePort(sys, kinePortBase, int((seed/portStride)%portSpan))
 	if err != nil {
-		return 0, 0, fmt.Errorf("allocate kine port: %w", err)
+		return 0, 0, 0, fmt.Errorf("allocate kine port: %w", err)
 	}
-	// A degenerate hash could land both on the same absolute number only if the
-	// bases differ by less than the span; the bases are >4000 apart so this cannot
-	// happen, but assert it so a future base change can't silently break.
-	if apiPort == kinePort {
-		return 0, 0, fmt.Errorf("allocated apiserver and kine ports collide on %d", apiPort)
+	kubeletPort, err = probeFreePort(sys, kubeletPortBase, int((seed/(portStride*portStride))%portSpan))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("allocate kubelet port: %w", err)
 	}
-	return apiPort, kinePort, nil
+	// A degenerate hash could land two of them on the same absolute number only if
+	// their bases were less than a span apart; the closest two bases are 1929
+	// apart, so this cannot happen — but assert it so a future base change can't
+	// silently break it.
+	for _, c := range []struct {
+		a, b   string
+		pa, pb int
+	}{
+		{"apiserver", "kine", apiPort, kinePort},
+		{"apiserver", "kubelet", apiPort, kubeletPort},
+		{"kine", "kubelet", kinePort, kubeletPort},
+	} {
+		if c.pa == c.pb {
+			return 0, 0, 0, fmt.Errorf("allocated %s and %s ports collide on %d", c.a, c.b, c.pa)
+		}
+	}
+	return apiPort, kinePort, kubeletPort, nil
 }
 
 // probeFreePort linear-scans base+offset, base+offset+1, … (wrapping within

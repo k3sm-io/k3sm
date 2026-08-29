@@ -132,7 +132,7 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 	t.Run("both staged shims reach the server as --path-shim / --dns-shim", func(t *testing.T) {
 		wantPath := filepath.Join(DefaultPodShimDir, pathShimName)
 		wantDNS := filepath.Join(DefaultPodShimDir, dnsShimName)
-		args := serverArgs("dev", "/w", "/pods", 7443, 12379, "direct", runtimeRuntimed, wantPath, wantDNS)
+		args := serverArgs("dev", "/w", "/pods", 7443, 12379, 10450, "direct", runtimeRuntimed, wantPath, wantDNS)
 		for _, tc := range []struct{ flag, want string }{
 			{"--path-shim", wantPath},
 			{"--dns-shim", wantDNS},
@@ -148,14 +148,14 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 	})
 
 	t.Run("an unstaged shim emits no flag at all", func(t *testing.T) {
-		args := serverArgs("dev", "/w", "/pods", 7443, 12379, "none", runtimeRuntimed, "", "")
+		args := serverArgs("dev", "/w", "/pods", 7443, 12379, 10450, "none", runtimeRuntimed, "", "")
 		for _, flag := range []string{"--path-shim", "--dns-shim"} {
 			if slices.Contains(args, flag) {
 				t.Errorf("serverArgs = %v, must not point the server at a shim that was not staged (%s)", args, flag)
 			}
 		}
 		// Each is independent: a staged path shim must not drag in a --dns-shim.
-		args = serverArgs("dev", "/w", "/pods", 7443, 12379, "none", runtimeRuntimed, "/Library/k3sm-dev/"+pathShimName, "")
+		args = serverArgs("dev", "/w", "/pods", 7443, 12379, 10450, "none", runtimeRuntimed, "/Library/k3sm-dev/"+pathShimName, "")
 		if !slices.Contains(args, "--path-shim") || slices.Contains(args, "--dns-shim") {
 			t.Errorf("serverArgs = %v, want --path-shim only", args)
 		}

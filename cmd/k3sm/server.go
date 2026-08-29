@@ -43,6 +43,7 @@ import (
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
+	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
@@ -52,19 +53,25 @@ import (
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
 type serverOptions struct {
-	workDir   string
-	nodeName  string
-	nodeIP    string
-	meshIP    string // wireguard mesh IP; set => multi-node worker-join supervisor (M3.0)
-	podRoot   string
-	rtName    string
-	dnsShim   string
-	pathShim  string
-	apiPort   int
-	kinePort  int    // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
-	clusterIP string // DNS VIP CoreDNS binds + pods resolve against
-	domain    string
-	network   string // host-network backend: auto (default) | none | direct | helper
+	workDir  string
+	nodeName string
+	nodeIP   string
+	meshIP   string // wireguard mesh IP; set => multi-node worker-join supervisor (M3.0)
+	podRoot  string
+	rtName   string
+	dnsShim  string
+	pathShim string
+	apiPort  int
+	kinePort int // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
+	// kubeletPort is the port the in-process node serves the kubelet HTTP API
+	// (logs/exec/stats) on. Per-server for the same reason kinePort is: it is a
+	// singleton listener, so two control planes on one Mac cannot both have the
+	// default. Only the PORT is configurable — the bind stays the wildcard
+	// serverKubeletListenOn builds, and the API's auth posture is untouched.
+	kubeletPort int
+	clusterIP   string // DNS VIP CoreDNS binds + pods resolve against
+	domain      string
+	network     string // host-network backend: auto (default) | none | direct | helper
 
 	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite (M6.0)
 	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
@@ -105,6 +112,12 @@ func runServer(args []string) error {
 	// server's database. The executor refuses that outright; this flag is how a
 	// second control plane on the same host gets a datastore of its own.
 	fs.IntVar(&opts.kinePort, "kine-port", executor.DefaultKinePort, "kine (etcd shim) listen port on 127.0.0.1 — every control plane on a host needs its own")
+	// The node's kubelet-API port. Same per-server reasoning as --kine-port, one
+	// process further down the bring-up: a second server on the default port gets
+	// a healthy control plane and then a node that dies with "listen tcp :10250:
+	// bind: address already in use". This renumbers the LISTENER ONLY; it does not
+	// change the bind address or the API's authn posture.
+	fs.IntVar(&opts.kubeletPort, "kubelet-port", ports.KubeletAPIPort, "kubelet HTTP API (logs/exec/stats) listen port — every node on a host needs its own")
 	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
 	// privileged; warn=baseline + audit=restricted — audit-observable, zero
 	// rejection). This flag is the documented, REVERSIBLE cutover MECHANISM for the
@@ -490,7 +503,7 @@ func runServer(args []string) error {
 	nodeOpts := nodeOptions{
 		kubeconfig: exec.Kubeconfig(),
 		nodeName:   opts.nodeName,
-		listen:     serverKubeletListen,
+		listen:     serverKubeletListenOn(opts.kubeletPort),
 		podRoot:    opts.podRoot,
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
