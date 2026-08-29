@@ -289,13 +289,13 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), 30*time.Second, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
-	// kine is serving, so this pin has now genuinely opened this database — stamp it.
-	// Stamping here (not at provision time) is what makes the pre-migration snapshot
-	// survive a boot that dies before the datastore ever came up.
-	if s.cfg.DatastoreEndpoint == "" {
-		if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
-			return err
-		}
+	// kine is serving, so this pin has now genuinely opened this database — stamp it,
+	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
+	// provision time) is what makes the pre-migration snapshot survive a boot that dies
+	// before the datastore ever came up; recordKinePin itself skips the external-
+	// datastore posture.
+	if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint); err != nil {
+		return err
 	}
 	api, err := s.startAPIServer(ctx)
 	if err != nil {
