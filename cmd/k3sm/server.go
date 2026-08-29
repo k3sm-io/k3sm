@@ -61,6 +61,7 @@ type serverOptions struct {
 	dnsShim   string
 	pathShim  string
 	apiPort   int
+	kinePort  int    // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
 	clusterIP string // DNS VIP CoreDNS binds + pods resolve against
 	domain    string
 	network   string // host-network backend: auto (default) | none | direct | helper
@@ -98,6 +99,12 @@ func runServer(args []string) error {
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
 	fs.IntVar(&opts.apiPort, "api-port", executor.DefaultAPIServerPort, "apiserver secure port")
+	// The datastore port is per-SERVER, not per-host: two control planes on one Mac
+	// sharing it is not a bind contest but a silent datastore takeover — the second
+	// server finds the port already serving and comes up healthy against the first
+	// server's database. The executor refuses that outright; this flag is how a
+	// second control plane on the same host gets a datastore of its own.
+	fs.IntVar(&opts.kinePort, "kine-port", executor.DefaultKinePort, "kine (etcd shim) listen port on 127.0.0.1 — every control plane on a host needs its own")
 	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
 	// privileged; warn=baseline + audit=restricted — audit-observable, zero
 	// rejection). This flag is the documented, REVERSIBLE cutover MECHANISM for the
@@ -177,6 +184,7 @@ func runServer(args []string) error {
 	cfg := executor.Config{
 		WorkDir:       opts.workDir,
 		APIServerPort: opts.apiPort,
+		KinePort:      opts.kinePort,
 		NodeIP:        opts.nodeIP,
 		// M10.0/B71: false ships baseline-WARN; true is the enforce cutover (see the
 		// flag comment above — executor.Config.PSAEnforceBaseline is the single seam).
