@@ -75,17 +75,6 @@ func kineBinaries(t *testing.T) (old, new string) {
 	return old, new
 }
 
-// freePort reserves and releases a loopback port, returning its number.
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = l.Close() }()
-	return l.Addr().(*net.TCPAddr).Port
-}
-
 // serve starts a kine binary against dbPath and returns a connected etcd client plus a
 // stop func. The stop func kills kine and waits, so the NEXT phase opens a database with
 // no live writer — which is the state the real migration runs in (the control plane is
