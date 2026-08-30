@@ -1,0 +1,77 @@
+# mlxmodel — the minimal MLXModel a k3sm cluster accepts, serving a small pinned
+# model on the Mac's GPU through an OpenAI-compatible endpoint.
+#
+# Unlike every other manifest in this directory, this one declares NO nodeSelector
+# and NO toleration. That is not an omission: an MLXModel is not a pod spec. The
+# MLX operator renders the StatefulSet, and it stamps the darwin selector, the
+# k3sm.io/provider:NoSchedule toleration, and the mlx.k3sm.io/gpu resource (in
+# BOTH requests and limits) onto the pods itself. Writing them here would have no
+# effect — spec.nodeSelector below is an additional narrowing, not a replacement.
+#
+# THREE FIELDS ARE STATED EXPLICITLY THAT LOOK OPTIONAL, and each is required for
+# a different reason:
+#
+#   runtime.image   The operator ships NO default serving image: the pinned image
+#                   is a release fact the binary does not carry, so a spec that
+#                   omits it is rejected with an InvalidSpec status rather than
+#                   built around an invented image. Prefer the DIGEST form in
+#                   production — ghcr.io/k3sm-io/mlx-serve@sha256:… — because the
+#                   tag is display-only and the next publish moves it.
+#
+#   port            Same reason, and it must agree with the image: mlx-serve
+#                   listens on 8000 and answers readiness at GET /health.
+#
+#   cache.storageClassName
+#                   k3sm marks NO StorageClass default, so an empty value means
+#                   "the cluster default" and there is none — the PVC would stay
+#                   Pending forever. local-path is k3sm's node-local class; it
+#                   binds WaitForFirstConsumer, so the volume is provisioned on
+#                   whichever Mac the scheduler picked, and the replica returns to
+#                   that Mac for the life of the cache.
+#
+# WHY memory IS 4Gi FOR A 0.6B MODEL. spec.memory is not a hint — on Apple silicon
+# the GPU shares system memory, so it is the real scheduling constraint AND the
+# budget the engine's context window is derived from:
+#
+#     usable   = memory - 512Mi compile/scratch - 6% headroom
+#     kvBudget = 25% of usable          (the rest is the weights)
+#     context  = kvBudget / 4 sequences / 0.15Mi per token, rounded down
+#
+# Below ~1.81Gi that derivation cannot fund the 512-token floor and the model is
+# rejected outright (a truncating context is a worse answer than a clear one).
+# 4Gi funds a 1280-token context across 4 concurrent sequences, against weights
+# that are only ~336 MB at 4-bit — comfortable, not tight. Raising memory raises
+# the context; it never lowers it.
+#
+# Deleting this object deletes the StatefulSet, both Services, and — per the
+# StatefulSet's whenDeleted:Delete retention policy — the cache PVC. The
+# underlying PersistentVolume is Retained by the local-path class, so the weights
+# on disk are reclaimed by hand, deliberately.
+#
+#   kubectl apply -f examples/mlxmodel.yaml
+#   kubectl get mlxmodel qwen3-06b -w
+#   kubectl wait --for=condition=Ready mlxmodel/qwen3-06b --timeout=15m
+#
+# See docs/user/mlx-quickstart.md for the full path, including the completion call.
+apiVersion: mlx.k3sm.io/v1alpha1
+kind: MLXModel
+metadata:
+  name: qwen3-06b
+  namespace: default
+spec:
+  model: mlx-community/Qwen3-0.6B-4bit
+  # Pin the revision. An empty value means the repository's default branch, which
+  # is MUTABLE: two replicas admitted a week apart would then serve different
+  # weights under one object, and only status.resolvedRevision would show it.
+  revision: 73e3e38d981303bc594367cd910ea6eb48349da8
+  memory: 4Gi
+  replicas: 1
+  port: 8000
+  runtime:
+    image: ghcr.io/k3sm-io/mlx-serve:0.4.1
+  cache:
+    # Must comfortably exceed the model's on-disk size (~351 MB here). A volume
+    # too small to hold the weights fails the download rather than degrading to
+    # no cache.
+    size: 5Gi
+    storageClassName: local-path
