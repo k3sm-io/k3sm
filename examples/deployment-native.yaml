@@ -1,0 +1,80 @@
+# deployment-native — a Deployment of a native Darwin workload, with a readiness probe.
+#
+# The Pod template carries the same two mandatory fields a bare Pod does — the
+# kubernetes.io/os=darwin nodeSelector (admission DENIES a Pod without it) and a
+# toleration for the k3sm.io/provider:NoSchedule taint every node carries. They must
+# appear in the TEMPLATE: only DaemonSet-owned Pods get the provider toleration
+# injected for them, so a Deployment/StatefulSet/Job template that omits it produces
+# Pods that are admitted and then never scheduled.
+#
+# ONE REPLICA, on purpose. macOS has no network namespaces, so every Pod on a node
+# shares ONE port space with the node's own listeners. Two replicas of a workload that
+# binds 8080 land on the same Mac and the second one's listen() fails EADDRINUSE. Scale
+# a port-binding workload by adding nodes, not replicas — or have it bind port 0 and
+# register itself.
+#
+#   kubectl apply -f examples/deployment-native.yaml
+#   kubectl rollout status deploy/hello-http
+#   kubectl get pods -l app=hello-http -o wide
+#
+# Front it with examples/service-clusterip.yaml or examples/service-nodeport.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-http
+  namespace: default
+  labels:
+    app: hello-http
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-http
+  template:
+    metadata:
+      labels:
+        app: hello-http
+    spec:
+      nodeSelector:
+        kubernetes.io/os: darwin
+      tolerations:
+        - key: k3sm.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: hello-http
+          # The native sentinel: command[0] is an absolute host binary. For your own
+          # workload, build a darwin/arm64 binary with your normal toolchain and point
+          # command[0] at it (or set `image: /abs/path` and omit command entirely).
+          image: native
+          # A one-connection-at-a-time HTTP responder built only from binaries every Mac
+          # already ships. It is a demo, not a server: it answers a single request per
+          # loop iteration, so the readiness probe and a client can race each other.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while :; do
+                printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello\n' \
+                  | /usr/bin/nc -l 8080 >/dev/null 2>&1 || sleep 1
+              done
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              # Memory IS enforced (the rusage sampler OOM-kills an over-limit pod).
+              # CPU limits are deliberately omitted throughout these examples: CPU is
+              # best-effort on Darwin, so a cpu limit would claim a guarantee k3sm
+              # cannot keep.
+              memory: 128Mi

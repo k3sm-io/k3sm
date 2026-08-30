@@ -22,13 +22,20 @@ the roadmap). Unmodified Linux images are the province of the EXPERIMENTAL
 
 ## Why did my container exit and not restart?
 
-`restartPolicy` is **not honored live** yet — an exited container is reaped, not respawned. See
-[limitations.md](limitations.md).
+On the default runtime it should have — `restartPolicy` **is** honored, with an upstream-shaped
+`CrashLoopBackOff`. The two cases where it is not: a plain (non-sidecar) **init** container, which is
+not re-run in place, and a node started with `--runtime hostprocess`, the rootless-dev opt-out that
+reaps an exited container without respawning it. See
+[limitations.md](limitations.md#restartpolicy--honored-on-the-default-runtime-not-on-the-hostprocess-opt-out).
 
 ## Does cluster DNS work inside a Pod?
 
-Partially. The resolver algorithm works, but **in-pod cluster-DNS wiring is unwired at `main`** and
-headless/SRV/PTR records are planned. See [limitations.md](limitations.md).
+On the default runtime, yes — cluster Service names, headless Services, StatefulSet per-Pod names,
+SRV and PTR all resolve from inside a Pod. Two caveats: the resolver is k3sm's own, not CoreDNS
+(IPv4/A only, no AAAA), and the `getaddrinfo` shim that redirects a Pod's lookups **cannot load into
+a SIP platform binary** such as `/bin/sh`, so shell-script lookups fall back to the host resolver.
+In-pod cluster DNS is **not** wired on `--runtime hostprocess` or on the `vm` RuntimeClass. See
+[limitations.md](limitations.md#dns--what-resolves-and-on-which-runtime-path).
 
 ## Do UDP Services work?
 
@@ -50,7 +57,9 @@ See [versions.md](versions.md) — and read the live pin from `k3sm version`.
 
 ## How do I upgrade?
 
-`brew upgrade` restarts the daemon via launchd; multi-node is node-by-node. See [upgrade.md](upgrade.md).
+Re-run the install script — `curl -fsSL https://k3sm.io/install.sh | sh` — which installs the latest
+release and restarts the daemons. Homebrew (`brew upgrade`) is the second install generation and
+works once the tap ships. A multi-node cluster rolls node-by-node. See [upgrade.md](upgrade.md).
 
 ## Do I need `sudo` every time?
 

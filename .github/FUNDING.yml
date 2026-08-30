@@ -1,0 +1,7 @@
+# GitHub Sponsors is the only funding channel: 0% platform fee, a native
+# Sponsor button on every repo, and no third-party script on any page.
+#
+# NOTE: this file alone does NOT render the Sponsor button. The repo's
+# Settings -> Features -> Sponsorships toggle must also be enabled, and a
+# plain `git push` can leave it off. Verify the button actually renders.
+github: [kitsumiko]

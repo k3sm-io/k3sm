@@ -20,7 +20,8 @@ That step:
 
 After install, `k3sm kubectl …` and Pod lifecycle run as you / `_k3sm` with **no `sudo`**. The full
 trust model — why this is the Docker Desktop / lima / colima pattern applied to k3sm, and the one
-residual limitation (no per-pod uid isolation) — is documented in `docs/privilege-model.md`.
+residual limitation (no per-pod uid isolation) — is documented in
+[privilege-model.md](../privilege-model.md).
 
 ## What gets installed where
 
