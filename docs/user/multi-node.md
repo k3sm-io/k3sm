@@ -42,7 +42,8 @@ the node — the `MeshPeer` records carry public keys only.
 
 ## Caveats
 
-- Per-pod IP identity and headless/StatefulSet DNS across nodes are **planned, not present** — see
+- Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
+  EXPERIMENTAL — validate cross-node resolution for your own workload rather than assuming it. See
   [limitations.md](limitations.md).
 - A cluster upgrade is a **node-by-node** rolling restart of the launchd daemons; see
   [upgrade.md](upgrade.md).

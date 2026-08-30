@@ -164,18 +164,47 @@ is no way to invalidate a single leaf, no CA-replacement flow, and worker/agent 
 scope (they re-issue on agent restart, which needs a fresh join token). See
 [certificates.md](certificates.md).
 
-### DNS — what works vs what is unwired/planned
+### DNS — what resolves, and on which runtime path
 
-The in-process resolver and the `getaddrinfo` shim implement the **search-list / ndots / A-record**
-algorithm correctly. However:
+k3sm does **not** run CoreDNS. Each node serves an in-process, authoritative cluster resolver on the
+DNS VIP and forwards everything else to the host's upstream resolver. What a Pod actually gets
+depends on the runtime path it runs on (see the `restartPolicy` section above for the two paths).
 
-- **In-pod cluster-DNS wiring is currently unwired at `main`** — a Pod's resolver still defers to the
-  **host resolver** rather than the cluster DNS Service. Wiring this is the keystone item on the DNS roadmap.
-- **Headless Services, SRV, PTR, and pod-A records are planned, not present** — per-pod network
-  identity depends on per-pod IP wiring that is not yet plumbed.
+**What the resolver answers (all paths — this is the server side):**
 
-Do **not** assume CoreDNS parity. Cluster-DNS-dependent service discovery from inside a Pod is not
-something you can rely on today.
+- **A records** for `<svc>.<ns>.svc.<domain>`, including `kubernetes.default.svc` → the apiserver VIP.
+- **Headless Services** — the all-backends A set for the bare Service name.
+- **Per-endpoint identity A records** — `<hostname>.<svc>.<ns>.svc.<domain>` for StatefulSet Pods,
+  dashed-IP form otherwise — and stateless pod A names under `<ns>.pod.<domain>`.
+- **SRV** records per named port, under the `_<port>._<proto>` owner names.
+- **PTR** — the reverse zone for the cluster pod and Service CIDRs is authoritative: a name inside
+  either answers locally (a hit or `NXDOMAIN`) and is never forwarded upstream.
+- **`ExternalName`** Services resolve, flattened CNAME→A. The one gap: an `ExternalName` whose target
+  is itself inside the cluster domain is `NXDOMAIN` (deliberately not re-resolved in-cluster).
+- **AAAA is never answered** — k3sm's CIDRs are IPv4.
+
+**In-pod resolution on the default runtime — wired, with one substrate caveat.** A Pod on a
+cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) has the cluster DNS
+configuration injected into every container, and the `getaddrinfo` shim resolves unqualified Service
+names against the DNS VIP with the correct search-list / ndots expansion. Three things to know:
+
+- **The shim cannot load into a SIP platform binary** (`/bin/sh`, `/usr/bin/*`) — macOS strips
+  `DYLD_INSERT_LIBRARIES` from those, so a shell script's lookups fall back to the **host** resolver
+  and cluster names will not resolve. This is the same constraint as the volume-mount shim above:
+  ship a compiled binary.
+- **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing** — those Pods use the host resolver.
+  For `None` that is a gap: a Pod's own `dnsConfig.nameservers` are not yet honored.
+- **Under `ClusterFirst`, `dnsConfig` is merged additively** — extra `searches` are appended and
+  `ndots` is overridden. Not yet honored: `dnsConfig.nameservers`, an explicit `ndots: 0`, and
+  options other than `ndots`.
+
+**On `--runtime hostprocess`, in-pod cluster DNS is not wired.** No shim, no cluster DNS
+configuration — every lookup from inside a Pod goes to the host resolver.
+
+**On the `vm` RuntimeClass, in-pod cluster DNS is not wired either.** A guest owns its own network
+stack, and the guest-network path that would carry the cluster resolver into it is not built yet — a
+`vm` Pod also reports the **node's** IP as its `podIP` rather than a guest address. Treat in-guest
+service discovery as unavailable; see [vm-runtimeclass.md](vm-runtimeclass.md).
 
 ### UDP Services (non-DNS) — deferred
 

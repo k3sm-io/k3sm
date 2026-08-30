@@ -44,9 +44,21 @@ for the precise scope.
 
 ## DNS from inside a Pod does not resolve cluster names
 
-In-pod cluster-DNS wiring is **currently unwired at `main`** — the Pod resolver defers to the host
-resolver, and headless/SRV/PTR records are planned. This is a known gap, not a misconfiguration — see
-[limitations.md](limitations.md).
+On the default runtime this should work — Service A records, headless Services, StatefulSet per-Pod
+names, SRV and PTR all resolve. Check these in order:
+
+- **Is the lookup coming from `/bin/sh` or another `/usr/bin` tool?** macOS strips
+  `DYLD_INSERT_LIBRARIES` from SIP platform binaries, so k3sm's `getaddrinfo` shim never loads into
+  them and their lookups go to the **host** resolver. Do the lookup from your compiled workload
+  instead — this is a substrate ceiling, not a misconfiguration.
+- **Is the Pod's `dnsPolicy` `Default` or `None`?** Neither selects cluster DNS, so nothing is
+  injected. Use `ClusterFirst` (the default when the field is unset).
+- **Is it an AAAA lookup?** k3sm's CIDRs are IPv4; AAAA is never answered.
+- **Are you on `--runtime hostprocess` or the `vm` RuntimeClass?** In-pod cluster DNS is not wired on
+  either — every lookup goes to the host resolver.
+
+See [limitations.md](limitations.md#dns--what-resolves-and-on-which-runtime-path) for the full
+per-path picture.
 
 ## A UDP Service does not work
 

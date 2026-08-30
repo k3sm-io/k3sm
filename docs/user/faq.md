@@ -30,8 +30,12 @@ reaps an exited container without respawning it. See
 
 ## Does cluster DNS work inside a Pod?
 
-Partially. The resolver algorithm works, but **in-pod cluster-DNS wiring is unwired at `main`** and
-headless/SRV/PTR records are planned. See [limitations.md](limitations.md).
+On the default runtime, yes — cluster Service names, headless Services, StatefulSet per-Pod names,
+SRV and PTR all resolve from inside a Pod. Two caveats: the resolver is k3sm's own, not CoreDNS
+(IPv4/A only, no AAAA), and the `getaddrinfo` shim that redirects a Pod's lookups **cannot load into
+a SIP platform binary** such as `/bin/sh`, so shell-script lookups fall back to the host resolver.
+In-pod cluster DNS is **not** wired on `--runtime hostprocess` or on the `vm` RuntimeClass. See
+[limitations.md](limitations.md#dns--what-resolves-and-on-which-runtime-path).
 
 ## Do UDP Services work?
 
