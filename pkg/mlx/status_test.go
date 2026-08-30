@@ -185,7 +185,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 				obs:              Observation{Pods: []PodState{running("qwen3-0", ProbeLoading)}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonLoading,
-				wantPhase:        PhaseLoading,
+				wantPhase:        mlxv1alpha1.MLXModelPhaseLoading,
 				wantRevision:     testRevision,
 				wantTransitionAt: statusBase,
 			},
@@ -217,7 +217,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 				obs:              Observation{Pods: []PodState{running("qwen3-0", ProbeLoading)}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonLoading,
-				wantPhase:        PhaseLoading,
+				wantPhase:        mlxv1alpha1.MLXModelPhaseLoading,
 				wantRevision:     testRevision,
 				wantTransitionAt: statusBase.Add(6 * time.Minute),
 			},
@@ -262,8 +262,8 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		// endpoint that routes nowhere.
 		m := singleReplicaModel()
 		got := DeriveStatus(m, Observation{Pods: []PodState{running("qwen3-0", ProbeServing)}}, statusOptions(), statusBase)
-		if got.Phase != PhaseLoading {
-			t.Errorf("status.phase = %q, want %q for a running replica whose readiness has not passed", got.Phase, PhaseLoading)
+		if got.Phase != mlxv1alpha1.MLXModelPhaseLoading {
+			t.Errorf("status.phase = %q, want %q for a running replica whose readiness has not passed", got.Phase, mlxv1alpha1.MLXModelPhaseLoading)
 		}
 		if got.Endpoint != "" {
 			t.Errorf("status.endpoint = %q, want empty: a probe verdict must not publish an endpoint readiness has not opened", got.Endpoint)
@@ -277,8 +277,8 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		got := DeriveStatus(m, Observation{
 			Pods: []PodState{serving("qwen3-0"), running("qwen3-1", ProbeLoading)},
 		}, statusOptions(), statusBase)
-		if got.Phase != PhaseLoading {
-			t.Errorf("status.phase = %q, want %q with 1 of 2 replicas ready", got.Phase, PhaseLoading)
+		if got.Phase != mlxv1alpha1.MLXModelPhaseLoading {
+			t.Errorf("status.phase = %q, want %q with 1 of 2 replicas ready", got.Phase, mlxv1alpha1.MLXModelPhaseLoading)
 		}
 		if got.Endpoint != "" {
 			t.Errorf("status.endpoint = %q, want empty below the desired replica count", got.Endpoint)
@@ -466,7 +466,7 @@ func TestPhaseFromConditionsIsAProjectionOfTheReadyCondition(t *testing.T) {
 		{
 			name:  "loading",
 			conds: []metav1.Condition{{Type: mlxv1alpha1.MLXModelConditionReady, Status: metav1.ConditionFalse, Reason: ReasonLoading}},
-			want:  PhaseLoading,
+			want:  mlxv1alpha1.MLXModelPhaseLoading,
 		},
 		{
 			name:  "pod_failed",

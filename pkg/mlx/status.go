@@ -64,19 +64,6 @@ const (
 	ReasonPodFailed = "PodFailed"
 )
 
-// PhaseLoading is the derived phase for a replica that is running with its
-// serving surface answering but readiness not yet passing.
-//
-// It is spelled here rather than taken from k3sm.io/apis/mlx/v1alpha1 because
-// that package publishes Pending/Downloading/Ready/Failed and no Loading, and
-// the CRD's status.phase enum admits the same four. That is an apis gap, not a
-// local invention: the M8 plan's status model names five phases, and collapsing
-// Loading into Downloading would report a download that finished minutes ago.
-// Until apis grows the constant and the enum value, an operator that PERSISTS a
-// derived status must treat a Loading phase as unwritable — the derivation
-// itself writes nothing, so nothing is broken by deriving it honestly here.
-const PhaseLoading mlxv1alpha1.MLXModelPhase = "Loading"
-
 // ProbeVerdict is one replica's serving-surface verdict as observed by the
 // operator's own probe client — the OpenAI-compatible /health + /v1/models
 // check, which lives outside this package. The verdict is INJECTED: nothing here
@@ -226,7 +213,7 @@ func PhaseFromConditions(conds []metav1.Condition) mlxv1alpha1.MLXModelPhase {
 	case ReasonDownloading:
 		return mlxv1alpha1.MLXModelPhaseDownloading
 	case ReasonLoading:
-		return PhaseLoading
+		return mlxv1alpha1.MLXModelPhaseLoading
 	case ReasonPodFailed:
 		return mlxv1alpha1.MLXModelPhaseFailed
 	default:
