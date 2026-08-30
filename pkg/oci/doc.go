@@ -100,6 +100,21 @@ limitations under the License.
 // Created and every History entry's Created to the epoch, so a rebuild of the
 // same context yields the same image digest.
 //
+// The precise claim: determinism is CONTENT-ONLY, not merely same-toolchain.
+// Every layer BuildLayer emits is genuinely uncompressed — the bytes under the
+// declared application/vnd.oci.image.layer.v1.tar media type ARE the tar this
+// package wrote, never a gzip encoding of it — so the layer digest and the
+// config's diff_id are the same hash, and that hash is a function of this
+// package's own tar output only. It carries no dependency on compress/flate's
+// byte-level behavior (which Go makes no cross-version compatibility promise
+// about), so the same context reproducibly digests identically across Go
+// toolchain versions, not merely across repeat builds on one binary. The
+// tradeoff is wire size: an uncompressed layer is larger than a gzip'd one
+// (roughly the gzip ratio of the payload) — accepted because the on-disk
+// materialize path (clonefile) already stores the unpacked tree uncompressed,
+// so the layer blob's size was never bounded by compression in the first
+// place.
+//
 // # Output sinks
 //
 // A Sink is where an assembled image is written. v1 ships two, both writing
