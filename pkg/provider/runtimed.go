@@ -484,6 +484,26 @@ func (r *runtimedRuntime) Capabilities(ctx context.Context) NodeCapabilities {
 	return caps
 }
 
+// Healthy reports whether runtimed considers itself able to serve pods, from the
+// overall health flag on its runtime-info response (the conditions detail which
+// subsystem is at fault; this is the summary the node's Ready condition needs).
+//
+// It fails CLOSED: a failed probe reports unhealthy, because a runtime that
+// cannot answer is not a runtime that has answered yes. The caller debounces the
+// verdict over consecutive samples, so one failed probe never reaches the node
+// object on its own.
+func (r *runtimedRuntime) Healthy(ctx context.Context) bool {
+	info, err := r.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
+	if err != nil {
+		r.log.Warn("runtime health probe failed; reporting unhealthy (fail-closed)", "err", err)
+		return false
+	}
+	if !info.GetHealthy() {
+		r.log.Warn("runtime reports itself unhealthy", "conditions", len(info.GetConditions()))
+	}
+	return info.GetHealthy()
+}
+
 // nodeCapabilitiesFromInfo maps a GetRuntimeInfo response to the node capabilities.
 // Pure — so the truthful-labeling mapping is unit-tested without a live runtimed.
 //
@@ -552,8 +572,9 @@ func logWithheldCapability(log *slog.Logger, info *runtimev1.GetRuntimeInfoRespo
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the
 // optional StatsSource capability (the Summary API surface, M2.3).
 var (
-	_ Runtime     = (*runtimedRuntime)(nil)
-	_ StatsSource = (*runtimedRuntime)(nil)
+	_ Runtime        = (*runtimedRuntime)(nil)
+	_ StatsSource    = (*runtimedRuntime)(nil)
+	_ HealthReporter = (*runtimedRuntime)(nil)
 )
 
 // podIP resolves the pod's IP BEFORE translation — the M10.1 ordering fix: the

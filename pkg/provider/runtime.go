@@ -89,3 +89,23 @@ type StreamingRuntime interface {
 	// PortForward proxies a byte stream to a pod TCP port (`kubectl port-forward`).
 	PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error
 }
+
+// HealthReporter is an OPTIONAL Runtime capability: a Runtime that can say
+// whether it is currently able to serve pods. VKProvider exposes it through
+// RuntimeHealthy, which the node-status loop debounces into the Ready condition.
+//
+// It answers a narrower question than "is the runtime process alive" — on the
+// single-binary node the runtime is in-process, so its death is the node's death
+// and the lease already expires. What it catches is the runtime that is RUNNING
+// but degraded: a sandbox backend that went unavailable makes the runtime refuse
+// every pod creation while the node, absent this signal, keeps reporting Ready
+// and keeps being sent work.
+//
+// Defining it here (consumer-side) keeps the core Runtime interface small, the
+// same pattern as StatsSource and StreamingRuntime.
+type HealthReporter interface {
+	// Healthy reports whether the runtime can serve pods. An implementation that
+	// cannot determine the answer reports false — the signal is debounced by the
+	// caller, so a transient false is absorbed rather than acted on.
+	Healthy(ctx context.Context) bool
+}
