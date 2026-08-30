@@ -35,15 +35,15 @@ is owned by **`docs/user/limitations.md`**.
 
 | feature class | k3sm posture | criterion or ceiling | register §home |
 |---|---|---|---|
-| **API machinery** (apiserver, RBAC, VAP admission, APF, CRD/aggregated-API, SSA, webhook delivery) | embedded real kube-apiserver | **criterion** (M4 `Node,RBAC`; webhook-delivery e2e owed under M10.0) | §1 |
-| **Admission config** (audit logging, PSA cluster default, default LimitRange) | argv + config additions | **🟡 planned** `TestM10_AuditLog` / `TestM10_PSADefault` / memory-only LimitRange (M10.0 §-gate, CI-integration) | §1 |
+| **API machinery** (apiserver, RBAC, VAP admission, APF, CRD/aggregated-API, SSA, webhook delivery) | embedded real kube-apiserver | **criterion** (M4 `Node,RBAC`; webhook-delivery e2e owed under M10) | §1 |
+| **Admission config** (audit logging, PSA cluster default, default LimitRange) | argv + config additions | **🟡 planned** `TestM10_AuditLog` / `TestM10_PSADefault` / memory-only LimitRange (M10 §-gate, CI-integration) | §1 |
 | **Pod lifecycle** (phase/conditions, probes, graceful stop, OOMKill, restartPolicy, hooks) | provider reconstructs the kubelet surface | **criterion** (M2) + **🟡 planned** native sidecars, subPath | §2 |
 | **Workload controllers** (Deployment/RS/StatefulSet/DaemonSet/Job/CronJob, GC/finalizers, preemption) | embedded real KCM + scheduler | **criterion** (free-because-embedded) + **🟡 planned** Job/CronJob fidelity, DaemonSet toleration, rolling-update readiness | §10 |
 | **Services** (ClusterIP/NodePort TCP, EndpointSlices, sessionAffinity, iTP:Local) | userspace Service proxy | **criterion** (M3) | §3 |
-| **DNS** (search/ndots/A, ExternalName, in-pod wiring) | in-process resolver + getaddrinfo shim | **criterion** (M3) + **🟡 planned** headless/SRV/PTR/pod-A (M10.1) | §3/§4 |
-| **Per-pod network identity** (headless, SRV, PTR, StatefulSet identity) | `/32` allocator + SBPL bind-discipline exist, **unwired today** | **🟡 planned** (M10.1 — achievable-as-wiring, **not** a ceiling) | §3 |
-| **Ingress / IngressClass / LoadBalancer** | own userspace L7 proxy (`pkg/ingress`) | **🟡 planned** (M10.3; `hack/acceptance/m10-ingress.sh`) | §12 |
-| **NetworkPolicy** | userspace-proxy dst-VIP allow/deny | **🟡 planned** L4 *hint* (M10.4) / **ceiling** as tenant isolation → `vm` | §12 |
+| **DNS** (search/ndots/A, ExternalName, in-pod wiring) | in-process resolver + getaddrinfo shim | **criterion** (M3) + **🟡 planned** headless/SRV/PTR/pod-A (M10) | §3/§4 |
+| **Per-pod network identity** (headless, SRV, PTR, StatefulSet identity) | `/32` allocator + SBPL bind-discipline exist, **unwired today** | **🟡 planned** (M10 — achievable-as-wiring, **not** a ceiling) | §3 |
+| **Ingress / IngressClass / LoadBalancer** | own userspace L7 proxy (`pkg/ingress`) | **🟡 planned** (M10; `hack/acceptance/m10-ingress.sh`) | §12 |
+| **NetworkPolicy** | userspace-proxy dst-VIP allow/deny | **🟡 planned** L4 *hint* (M10) / **ceiling** as tenant isolation → `vm` | §12 |
 | **Scheduling** (nodeSelector/affinity/taints, topology labels) | real upstream scheduler | **criterion** (M3) | §6 |
 | **Resource model** (QoS, memory→OOMKill) | `proc_pid_rusage` sampler | **criterion** memory (M2) / **ceiling** CPU CFS-millicore limits | §7 |
 | **Observability** (`/stats/summary`, `/metrics/resource`, lifecycle Events) | runtimed working-set surface | **criterion** summary (M2) + **🟡 planned** `/metrics/resource`, node Events | §5/§7 |
