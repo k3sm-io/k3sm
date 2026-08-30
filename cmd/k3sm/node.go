@@ -611,6 +611,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// wiring (logs/exec only serve when BOTH a TLS config and a handler are set, so
 	// the apiserver→node proxy reaches /containerLogs — M1.2) and the
 	// nil-NodeProvider → NaiveNodeProvider (auto-Ready + lease heartbeat) path.
+	// nodeStatus is assigned by the NodeProvider callback below, which VK invokes
+	// SYNCHRONOUSLY inside NewNode — so it is set before NewNode returns and the
+	// status loop can be started right after, with no handshake.
+	var nodeStatus *provider.NodeStatusProvider
 	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
 		Client:         cs,
 		Provider:       prov,
@@ -618,6 +622,25 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		NumWorkers:     4,
 		TLSConfig:      servingTLS, // nil = plain HTTP (M0 path); set = kubelet-serving TLS
 		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, caps) },
+		// Replace VK's auto-Ready naive node provider with the real one: it samples
+		// this Mac for memory/disk/PID pressure and debounces the runtime's health
+		// into Ready. It receives the node AFTER configureNode stamped it, and
+		// republishes that exact object every interval with only the conditions
+		// changed — VK assigns the published Status wholesale, so anything not
+		// carried through would be erased from the registered node.
+		NodeProvider: func(nd *corev1.Node) (vkadapter.NodeProvider, error) {
+			nsp, nerr := provider.NewNodeStatusProvider(provider.NodeStatusConfig{
+				Node:           nd,
+				DataRoot:       opts.podRoot,
+				RuntimeHealthy: runtimeHealthProbe(prov),
+				Log:            slog.Default(),
+			})
+			if nerr != nil {
+				return nil, nerr
+			}
+			nodeStatus = nsp
+			return nsp, nil
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("new node: %w", err)
@@ -625,6 +648,11 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 
 	errc := make(chan error, 1)
 	go func() { errc <- n.Run(ctx) }()
+	// The status loop's first publication is what marks the node Ready (supplying a
+	// node provider disables VK's own ready callback), so it must run for the whole
+	// life of the node, not only after startup succeeds. Its first UpdateStatus
+	// blocks until VK registers the notify callback, so starting it here is safe.
+	go func() { _ = nodeStatus.Run(ctx) }()
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err
@@ -637,6 +665,25 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	case err := <-errc:
 		return err
 	}
+}
+
+// runtimeHealthReporter is the optional provider capability the node-status loop
+// reads for the Ready condition. It is declared at this consumer so the node
+// command depends on the one method it needs, not on a concrete provider type.
+type runtimeHealthReporter interface {
+	RuntimeHealthy(ctx context.Context) bool
+}
+
+// runtimeHealthProbe returns prov's runtime-health probe, or nil when prov
+// exposes none. A nil result tells the status provider that Ready must never be
+// contradicted — the M0 host-process runtime has no health surface, and a node
+// must not be marked NotReady on a question its runtime cannot answer.
+func runtimeHealthProbe(prov vkadapter.Provider) func(context.Context) bool {
+	h, ok := prov.(runtimeHealthReporter)
+	if !ok {
+		return nil
+	}
+	return h.RuntimeHealthy
 }
 
 // nodeStartupTimeout bounds startNode's wait for the VK node to signal readiness.

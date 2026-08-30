@@ -35,16 +35,17 @@ import (
 func TestComputeNodeConditionsPressure(t *testing.T) {
 	now := metav1.NewTime(time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC))
 
-	// healthy sits well clear of every threshold: gigabytes of reclaimable
-	// memory, 85% disk free, a handful of the ~1067 PID wall used. Per-signal
-	// subtests clone it and perturb exactly one field.
+	// healthy sits well clear of every threshold: gigabytes of available memory,
+	// 100 GiB free disk (far above the absolute floor AND the hysteresis clear
+	// level), a handful of the systemwide PID wall used. Per-signal subtests clone
+	// it and perturb exactly one field.
 	healthy := hostStats{
 		MemAvailableBytes:  8 << 30, // 8 GiB, far above the 100Mi floor
 		MemCapacityBytes:   16 << 30,
-		DiskAvailableBytes: 850,
-		DiskCapacityBytes:  1000, // 85% free
+		DiskAvailableBytes: 100 << 30, // 100 GiB free
+		DiskCapacityBytes:  500 << 30,
 		PIDCount:           50,
-		PIDMax:             1000, // 5% used
+		PIDMax:             2000, // 2.5% used
 	}
 
 	t.Run("all healthy: every condition explicitly False", func(t *testing.T) {
@@ -88,8 +89,10 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 		}
 	})
 
-	t.Run("DiskPressure threshold (<15% free -> True)", func(t *testing.T) {
-		// Capacity 1000 -> 15% free is exactly 150 available bytes.
+	t.Run("DiskPressure trip edge (<2GiB free -> True)", func(t *testing.T) {
+		// The TRIP edge only; the clear edge is reconcileTransitions' and is pinned
+		// by the hysteresis subtests of the node-provider gate.
+		const thr = diskPressureTripFreeBytes
 		cases := []struct {
 			name       string
 			avail      int64
@@ -97,17 +100,17 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 			wantReason string
 			wantMsg    string
 		}{
-			{"just below 15% free -> pressure", 149, corev1.ConditionTrue,
+			{"just below the 2GiB floor -> pressure", thr - 1, corev1.ConditionTrue,
 				"KubeletHasDiskPressure", "kubelet has disk pressure"},
-			{"exactly 15% free -> no pressure (strict <)", 150, corev1.ConditionFalse,
+			{"exactly 2GiB -> no pressure (strict <)", thr, corev1.ConditionFalse,
 				"KubeletHasNoDiskPressure", "kubelet has no disk pressure"},
-			{"just above 15% free -> no pressure", 151, corev1.ConditionFalse,
+			{"just above the 2GiB floor -> no pressure", thr + 1, corev1.ConditionFalse,
 				"KubeletHasNoDiskPressure", "kubelet has no disk pressure"},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				s := healthy
-				s.DiskCapacityBytes = 1000
+				s.DiskCapacityBytes = 500 << 30
 				s.DiskAvailableBytes = tc.avail
 				checkCond(t, computeNodeConditions(s, now), corev1.NodeDiskPressure,
 					tc.wantStatus, tc.wantReason, tc.wantMsg, now)
@@ -115,7 +118,23 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 		}
 	})
 
-	t.Run("PIDPressure threshold (>90% used -> True)", func(t *testing.T) {
+	t.Run("DiskPressure floor is ABSOLUTE, not a share of the volume", func(t *testing.T) {
+		// The regression this pins: a percentage floor tainted a routine dev Mac.
+		// A 4 TiB volume with 3 GiB free is 0.07% free and must NOT be pressured;
+		// a 4 GiB volume with 1 GiB free is 25% free and MUST be.
+		s := healthy
+		s.DiskCapacityBytes = 4 << 40
+		s.DiskAvailableBytes = 3 << 30
+		checkCond(t, computeNodeConditions(s, now), corev1.NodeDiskPressure,
+			corev1.ConditionFalse, "KubeletHasNoDiskPressure", "kubelet has no disk pressure", now)
+
+		s.DiskCapacityBytes = 4 << 30
+		s.DiskAvailableBytes = 1 << 30
+		checkCond(t, computeNodeConditions(s, now), corev1.NodeDiskPressure,
+			corev1.ConditionTrue, "KubeletHasDiskPressure", "kubelet has disk pressure", now)
+	})
+
+	t.Run("PIDPressure threshold (>90% of kern.maxproc used -> True)", func(t *testing.T) {
 		// PIDMax 1000 -> 90% used is exactly 900 PIDs; True only ABOVE it.
 		cases := []struct {
 			name       string
@@ -160,7 +179,7 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 		s := hostStats{
 			MemAvailableBytes:  0,
 			DiskAvailableBytes: 0,
-			DiskCapacityBytes:  1000,
+			DiskCapacityBytes:  500 << 30,
 			PIDCount:           1000,
 			PIDMax:             1000,
 		}
