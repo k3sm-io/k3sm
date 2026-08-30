@@ -40,7 +40,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       package a native darwin/arm64 image from a COPY-only Dockerfile (RUN is rejected)
-  image       ingest, inspect and reclaim this node's image store (image load|import|prune|ls|df)
+  image       ingest, publish and reclaim this node's images (image load|import|push|prune|ls|df)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   doctor      run preflight environment + datastore-posture checks

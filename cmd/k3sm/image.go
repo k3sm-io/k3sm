@@ -40,6 +40,7 @@ const imageUsage = `k3sm image — ingest, inspect and reclaim this node's image
 
 Usage: k3sm image load <docker-save.tar> [flags]
        k3sm image import <oci-layout.tar> [flags]
+       k3sm image push <oci-layout-dir> <reference> [flags]
        k3sm image prune [flags]
        k3sm image ls [flags]
        k3sm image df [flags]
@@ -50,6 +51,12 @@ import stream a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" +
        Both are streamed to the daemon, which is the store's only writer: it
        re-hashes every byte and records the reference. Loaded content is stored,
        not yet runnable — see docs/user/images.md.
+push   upload the image in an OCI layout directory (what ` + "`k3sm build --format oci`" + `
+       writes) to a registry reference, and print the digest it now has
+       there so callers can pin it. push does NOT talk to the daemon: it
+       reads a directory you own and uploads as you. The credential comes
+       from $K3SM_REGISTRY_TOKEN or the docker config chain — never from the
+       command line, and k3sm stores none of it.
 prune  delete image content no pod references. DRY RUN BY DEFAULT — pass
        --force to actually unlink. The daemon does the deleting: this command
        is a client of the runtimed Images service, it never walks the store
@@ -72,6 +79,11 @@ type imageOptions struct {
 	// subcommand, which take no positional argument at all.
 	archive   string
 	reference string
+	// layoutDir and target are push's two positional arguments: the OCI layout
+	// to read, and the registry reference to write it to. The credential is
+	// neither of them, and is not a flag either — see registryAuth.
+	layoutDir string
+	target    string
 }
 
 // Ingest streams a whole archive, so it cannot share the deadline sized for a
@@ -111,7 +123,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// it cannot re-pull.
 	fs.BoolVar(&o.force, "force", false, "actually unlink (without this, prune only reports what it would delete)")
 	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
-	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the daemon call (load and import default to 30m — they stream an archive)")
+	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import and push default to 30m — they stream image content)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -122,10 +134,10 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// subcommand-first spelling is the one every comparable tool teaches.
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return o, errors.New("exactly one subcommand is required (load, import, prune, ls, df)")
+		return o, errors.New("exactly one subcommand is required (load, import, push, prune, ls, df)")
 	}
 	o.subcommand = rest[0]
-	// load/import take a positional path, so parsing cannot stop at the first
+	// load/import/push take positional paths, so parsing cannot stop at the first
 	// non-flag argument: `image load app.tar --reference x` must reach --reference.
 	// Alternating parse-then-lift accepts every ordering an operator might type.
 	var positional []string
@@ -144,7 +156,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	switch o.subcommand {
 	case "prune", "ls", "df":
 		if len(positional) > 0 {
-			return o, fmt.Errorf("unexpected argument %q: exactly one subcommand is required (load, import, prune, ls, df)", positional[0])
+			return o, fmt.Errorf("unexpected argument %q: exactly one subcommand is required (load, import, push, prune, ls, df)", positional[0])
 		}
 	case "load", "import":
 		if len(positional) == 0 {
@@ -154,8 +166,23 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 			return o, fmt.Errorf("unexpected argument %q: %s takes exactly one archive path", positional[1], o.subcommand)
 		}
 		o.archive = positional[0]
+	case "push":
+		if len(positional) < 2 {
+			return o, errors.New("push requires an OCI layout directory and the reference to push it to")
+		}
+		if len(positional) > 2 {
+			// A third word is most often an operator reaching for a credential
+			// argument. Refusing beats ignoring: a token typed here would already
+			// be in the shell history by the time it was ignored.
+			return o, fmt.Errorf("unexpected argument %q: push takes exactly a layout directory and a reference (the credential is read from $%s or the docker config chain, never from the command line)", positional[2], registryTokenEnv)
+		}
+		o.layoutDir = positional[0]
+		o.target = positional[1]
+		if referenceSet(fs) {
+			return o, errors.New("push takes its reference as the second argument, not --reference")
+		}
 	default:
-		return o, fmt.Errorf("unknown subcommand %q (want load, import, prune, ls or df)", o.subcommand)
+		return o, fmt.Errorf("unknown subcommand %q (want load, import, push, prune, ls or df)", o.subcommand)
 	}
 	// The streaming default applies only when the operator did not choose. Visit
 	// reports flags actually set across both Parse calls, so it distinguishes
@@ -166,13 +193,26 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 			timeoutSet = true
 		}
 	})
-	if !timeoutSet && (o.subcommand == "load" || o.subcommand == "import") {
+	if !timeoutSet && (o.subcommand == "load" || o.subcommand == "import" || o.subcommand == "push") {
 		o.timeout = streamingTimeout
 	}
 	if o.timeout <= 0 {
 		return o, fmt.Errorf("--timeout must be positive, got %v", o.timeout)
 	}
 	return o, nil
+}
+
+// referenceSet reports whether --reference was given on the command line. flag
+// cannot distinguish "not set" from "set to the empty string" by value alone,
+// and push must refuse the flag rather than quietly ignore it.
+func referenceSet(fs *flag.FlagSet) bool {
+	set := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "reference" {
+			set = true
+		}
+	})
+	return set
 }
 
 // imagesDialer opens a connection to a runtimed control socket. It is the test
@@ -206,6 +246,12 @@ func dialRuntimed(_ context.Context, socket string) (grpc.ClientConnInterface, i
 // correct by locking, because no lock it holds is also held across the daemon's
 // own pull commit, so it would race the very writer it is trying to reason about.
 func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
+	// push is the one subcommand that is not a daemon client: it reads a layout
+	// the invoking user owns and uploads it to a registry as that user. Dialing
+	// first would fail a perfectly valid push on a node whose daemon is down.
+	if o.subcommand == "push" {
+		return imagePush(ctx, o, out)
+	}
 	cc, closer, err := dial(ctx, o.socket)
 	if err != nil {
 		return err
