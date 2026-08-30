@@ -36,11 +36,12 @@ control-plane Mac last unless a release note says otherwise. See [multi-node.md]
 
 ## Before you upgrade
 
-- **Back up the datastore.** There is no `k3sm snapshot` command — take the file-level backup (stop the
-  daemon, `PRAGMA wal_checkpoint(TRUNCATE)`, copy, verify the copy) in
-  [backup-restore.md](backup-restore.md), and keep it off the node. k3sm also takes an automatic
-  pre-migration backup when a release changes the datastore engine (below), but that copy lives on the
-  same disk as the cluster it protects, so it is not a substitute for yours.
+- **Back up the datastore.** `sudo k3sm snapshot save --out <somewhere off this node>` — it is safe to
+  run while the cluster is serving, and it verifies the copy before it reports success. The file-level
+  fallback (stop the daemon, `PRAGMA wal_checkpoint(TRUNCATE)`, copy, verify the copy) is in
+  [backup-restore.md](backup-restore.md). k3sm also takes an automatic pre-migration backup when a
+  release changes the datastore engine (below), but that copy lives on the same disk as the cluster it
+  protects, so it is not a substitute for yours.
 - **Know your rollback path.** Homebrew retains the prior bottle, so rollback does not require a
   rebuild round-trip; on the script channel, prior releases stay downloadable — rollback is
   `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
@@ -109,9 +110,18 @@ comes with it, not a runtime flag flip.
 
 If the release you are leaving changed the **datastore engine**, reverting the binary is only half of
 it — the database has already been migrated in place. Restore the `db/state.db.pre-<kine-version>.bak`
-the upgrade left behind, following the restore procedure and its verification step in
-[backup-restore.md](backup-restore.md), and do it while the daemon is stopped. Rolling the binary back
-without restoring the backup leaves an older k3sm pointed at a database a newer engine has migrated.
+the upgrade left behind (or your own pre-upgrade snapshot) with the daemon stopped:
+
+```sh
+sudo launchctl bootout system/io.k3sm.server
+sudo k3sm snapshot restore /var/lib/k3sm/server/db/state.db.pre-<kine-version>.bak
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
+```
+
+`k3sm snapshot restore` refuses while the daemon is running, verifies the backup before it touches
+anything, and prints the verification step you must then run — see
+[backup-restore.md](backup-restore.md). Rolling the binary back without restoring the backup leaves an
+older k3sm pointed at a database a newer engine has migrated.
 
 ### Rolling back past the LoadBalancer bind change leaves durable state
 
