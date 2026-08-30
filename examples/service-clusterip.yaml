@@ -1,0 +1,35 @@
+# service-clusterip — a ClusterIP Service fronting the deployment-native workload.
+#
+# k3sm implements Services in a USERSPACE proxy (there is no kube-proxy, no iptables,
+# no netns on macOS). The ClusterIP is a real VIP the proxy listens on, so the address
+# in `kubectl get svc` works from this Mac and from Pods on it.
+#
+#   kubectl apply -f examples/deployment-native.yaml -f examples/service-clusterip.yaml
+#   kubectl get svc hello-http                       # note the CLUSTER-IP
+#   curl http://$(kubectl get svc hello-http -o jsonpath='{.spec.clusterIP}'):80/
+#
+# Two caveats worth knowing before you build on this:
+#
+#   * Resolve the VIP, not the name. In-Pod cluster-DNS wiring is not live yet — a Pod's
+#     resolver still defers to the host resolver — so `http://hello-http` from inside a
+#     Pod is not something to depend on today. Dial the ClusterIP.
+#   * TCP only. General UDP Services (ClusterIP and NodePort alike) are unimplemented;
+#     a UDP port here would be admitted with a warning and then silently blackhole.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-http
+  namespace: default
+  labels:
+    app: hello-http
+spec:
+  type: ClusterIP
+  selector:
+    app: hello-http
+  ports:
+    - name: http
+      port: 80
+      # The container's named port, so the Service keeps working if the workload's
+      # containerPort changes.
+      targetPort: http
+      protocol: TCP
