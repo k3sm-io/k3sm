@@ -60,6 +60,11 @@ var (
 	// constraint; there is deliberately no default, because a guessed one
 	// schedules successfully and then dies at load time on the node.
 	ErrNoMemory = errors.New("spec.memory is required and must be positive")
+	// ErrMemoryTooSmall is returned when spec.memory cannot fund the weights plus
+	// the minimum serving context (see DeriveSizing). It is a distinct sentinel
+	// from ErrNoMemory because the operator DID state a number and it is the
+	// wrong one: the actionable answer is "raise spec.memory", not "set it".
+	ErrMemoryTooSmall = errors.New("spec.memory cannot fund the minimum serving context")
 	// ErrNoImage is returned when neither spec.runtime.image nor
 	// Options.DefaultImage names a serving image.
 	ErrNoImage = errors.New("no serving image: spec.runtime.image is empty and no default image was configured")
@@ -286,9 +291,18 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 		return nil, renderErr(m, err)
 	}
 
+	// The context/concurrency pins are derived BEFORE anything is rendered: a
+	// spec whose memory cannot fund a serving context has no StatefulSet worth
+	// applying, and the alternative — rendering an unpinned engine — is the
+	// mid-generation SIGKILL DeriveSizing exists to prevent.
+	sizing, err := DeriveSizing(m.Spec.Memory)
+	if err != nil {
+		return nil, renderErr(m, err)
+	}
+
 	owner := ownerReference(m)
 	return &Objects{
-		StatefulSet:      statefulSet(m, owner, image, port, replicas, nodeSelector),
+		StatefulSet:      statefulSet(m, owner, image, port, replicas, nodeSelector, sizing),
 		HeadlessService:  headlessService(m, owner, port),
 		ClusterIPService: clusterIPService(m, owner, port),
 	}, nil
@@ -372,10 +386,18 @@ func podResources(memory resource.Quantity) corev1.ResourceRequirements {
 	}
 }
 
-// engineArgs builds the serving container's argument vector: what to serve and
-// where to listen, then the caller's own arguments LAST so an operator can
-// override any of it without this package growing a flag per knob.
-func engineArgs(spec mlxv1alpha1.MLXModelSpec, port int32) []string {
+// engineArgs builds the serving container's argument vector in three blocks:
+// what to serve and where to listen; the memory-derived sizing pins and the
+// required --continuous-batching flag (see sizing.go); then the caller's own
+// arguments LAST so an operator can override any of it without this package
+// growing a flag per knob.
+//
+// The order of the last two blocks is the override seam and is not cosmetic:
+// argparse takes the final occurrence of a repeated option, so caller args after
+// the pins can raise a context this formula sized conservatively — and a caller
+// who does that owns the consequence, which is why the pins are what ships by
+// default.
+func engineArgs(spec mlxv1alpha1.MLXModelSpec, port int32, sizing Sizing) []string {
 	args := []string{
 		"--model", spec.Model,
 		"--port", strconv.FormatInt(int64(port), 10),
@@ -386,15 +408,16 @@ func engineArgs(spec mlxv1alpha1.MLXModelSpec, port int32) []string {
 	if spec.Quantization != "" {
 		args = append(args, "--quantization", spec.Quantization)
 	}
+	args = append(args, sizing.Args()...)
 	return append(args, spec.Runtime.Args...)
 }
 
 // statefulSet renders the serving StatefulSet.
-func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image string, port, replicas int32, nodeSelector map[string]string) *appsv1.StatefulSet {
+func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image string, port, replicas int32, nodeSelector map[string]string, sizing Sizing) *appsv1.StatefulSet {
 	container := corev1.Container{
 		Name:  containerName,
 		Image: image,
-		Args:  engineArgs(m.Spec, port),
+		Args:  engineArgs(m.Spec, port, sizing),
 		Ports: []corev1.ContainerPort{{
 			Name:          portName,
 			ContainerPort: port,

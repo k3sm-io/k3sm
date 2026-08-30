@@ -1,0 +1,22 @@
+# Engine sizing derived from spec.memory, and the argv it renders.
+# Regenerate: go test ./pkg/mlx/ -run TestEngineArgsPinContextFromMemoryFormula -update
+# Then REVIEW THE DIFF: every number here bounds a pod's runtime memory growth,
+# and a context that grew without spec.memory growing is a SIGKILL on a node.
+
+memory=2Gi context=512 sequences=4 kvCacheBytes=322121728
+args=--model mlx-community/Qwen3-0.6B-4bit --port 9123 --revision 0f1e2d3c4b5a69788796a5b4c3d2e1f001234567 --quantization 4bit --max-model-len 512 --max-num-seqs 4 --continuous-batching --max-tokens 512
+
+memory=8Gi context=2816 sequences=4 kvCacheBytes=1771669504
+args=--model mlx-community/Qwen3-0.6B-4bit --port 9123 --revision 0f1e2d3c4b5a69788796a5b4c3d2e1f001234567 --quantization 4bit --max-model-len 2816 --max-num-seqs 4 --continuous-batching --max-tokens 512
+
+memory=16Gi context=6144 sequences=4 kvCacheBytes=3865460736
+args=--model mlx-community/Qwen3-0.6B-4bit --port 9123 --revision 0f1e2d3c4b5a69788796a5b4c3d2e1f001234567 --quantization 4bit --max-model-len 6144 --max-num-seqs 4 --continuous-batching --max-tokens 512
+
+memory=24Gi context=9216 sequences=4 kvCacheBytes=5798191104
+args=--model mlx-community/Qwen3-0.6B-4bit --port 9123 --revision 0f1e2d3c4b5a69788796a5b4c3d2e1f001234567 --quantization 4bit --max-model-len 9216 --max-num-seqs 4 --continuous-batching --max-tokens 512
+
+memory=64Gi context=25344 sequences=4 kvCacheBytes=15945025536
+args=--model mlx-community/Qwen3-0.6B-4bit --port 9123 --revision 0f1e2d3c4b5a69788796a5b4c3d2e1f001234567 --quantization 4bit --max-model-len 25344 --max-num-seqs 4 --continuous-batching --max-tokens 512
+
+memory=128Gi context=32768 sequences=4 kvCacheBytes=20615790592
+args=--model mlx-community/Qwen3-0.6B-4bit --port 9123 --revision 0f1e2d3c4b5a69788796a5b4c3d2e1f001234567 --quantization 4bit --max-model-len 32768 --max-num-seqs 4 --continuous-batching --max-tokens 512

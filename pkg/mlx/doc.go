@@ -27,7 +27,7 @@ limitations under the License.
 // objects, probes the replicas, and PATCHes the status through the status
 // subresource lives elsewhere.
 //
-// Four properties of the rendered shape are load bearing, and each exists
+// Five properties of the rendered shape are load bearing, and each exists
 // because its absence fails in a way a functional test would not notice:
 //
 //   - READINESS ONLY, NO LIVENESS OR STARTUP PROBE. A model's first start is an
@@ -48,6 +48,15 @@ limitations under the License.
 //     model-sized volume per replica. whenScaled stays Retain deliberately: a
 //     scale-down is reversible and the cache it would destroy costs another full
 //     download to rebuild.
+//
+//   - THE MEMORY-DERIVED ENGINE PINS, and --continuous-batching beside them.
+//     The KV cache grows with every generated token and no killer below k3sm's
+//     own sampler catches the overrun, so an unpinned context turns a
+//     load-time-sized memory limit into a deterministic mid-generation kill;
+//     and the serving engine batches concurrent requests only when told to,
+//     answering HTTP 503 to all but one client otherwise — with a healthy
+//     /health and a green readiness probe, so nothing else reports it. Both are
+//     derived and rendered in sizing.go.
 //
 //   - THE FIXED GUARDRAIL STANZA — the kubernetes.io/os=darwin nodeSelector, the
 //     mlx.k3sm.io/gpu.present selector, the k3sm provider toleration, and the
