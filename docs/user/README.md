@@ -18,8 +18,8 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 7. [Versions](versions.md) — the Kubernetes version k3sm tracks and how to read the live pin.
 8. [Upgrade](upgrade.md) — upgrading a node or cluster, the launchd restart model.
 9. [Certificates](certificates.md) — the two CAs, `k3sm certificate rotate`, and what it does not do.
-10. [Backup & restore](backup-restore.md) — the kine/SQLite datastore: backing it up, the automatic
-    pre-migration copy, and the restore drill.
+10. [Backup & restore](backup-restore.md) — the kine/SQLite datastore: `k3sm snapshot save`/`restore`,
+    the automatic pre-migration copy, and the restore drill.
 11. [Multi-node](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
 12. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
 13. [The `vm` RuntimeClass](vm-runtimeclass.md) — isolation for untrusted workloads, EXPERIMENTAL.

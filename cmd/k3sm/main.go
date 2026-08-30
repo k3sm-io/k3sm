@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "build", "image", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "image", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node (M3)
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -44,6 +44,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   doctor      run preflight environment + datastore-posture checks
+  snapshot    back up and restore the kine SQLite datastore (snapshot save|restore)
   version     print version
 
 See docs/DESIGN.md for the roadmap.
@@ -103,6 +104,11 @@ func main() {
 	case "certificate":
 		if err := runCertificate(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm certificate:", err)
+			os.Exit(1)
+		}
+	case "snapshot":
+		if err := runSnapshot(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm snapshot:", err)
 			os.Exit(1)
 		}
 	case "kubectl":
