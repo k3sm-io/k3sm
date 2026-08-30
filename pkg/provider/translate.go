@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -209,6 +210,10 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 		DataVolumePath: rootfsRoot,
 		AllowNetwork:   true,
 	}
+	// GPU + internet-egress intent (M8.3-d2): read from the pod, then enforce the
+	// egress⇒network pairing so a wider-than-cluster egress grant never arrives
+	// without the route the cluster DNS VIP needs.
+	applyGPUAndEgress(box.SandboxProfile, pod)
 	// For a vm pod, size the guest from the pod's cpu/memory (the VZ vCPU count +
 	// RAM; 0 leaves the runtimed/VZ default). The Seatbelt rungs ignore these.
 	if backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
@@ -216,6 +221,58 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 		box.SandboxProfile.VmMemoryBytes = podVMMemoryBytes(pod)
 	}
 	return box, nil
+}
+
+// podRequestsGPU reports whether the pod requests the mlx.k3sm.io/gpu extended
+// resource (mlxv1alpha1.ResourceGPU) via a container's LIMITS — deliberately
+// NOT requests. Kubernetes extended resources require requests == limits when
+// both are set and are commonly expressed as limits-only, but the read here is
+// pinned to limits alone: a requests-only GPU ask is not a GPU grant, matching
+// how podMemoryLimitBytes and effectiveResource already treat limits as the
+// authoritative ceiling for this provider (m8-plan M8.3-d2). Checked across
+// both init and regular containers — an init container that needs GPU access
+// (e.g. a model-fetch step) is as real a request as a regular one.
+func podRequestsGPU(pod *corev1.Pod) bool {
+	gpu := corev1.ResourceName(mlxv1alpha1.ResourceGPU)
+	for i := range pod.Spec.InitContainers {
+		if q, ok := pod.Spec.InitContainers[i].Resources.Limits[gpu]; ok && !q.IsZero() {
+			return true
+		}
+	}
+	for i := range pod.Spec.Containers {
+		if q, ok := pod.Spec.Containers[i].Resources.Limits[gpu]; ok && !q.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
+// podRequestsInternetEgress reports whether the pod carries the
+// runtimev1.AnnotationInternetEgress annotation (k3sm.io/internet-egress) — by
+// PRESENCE, not a parsed boolean value. The annotation is operator-stamped
+// plumbing under the single-trust-domain model (m8-plan Res. 7); a hand-set use
+// on a non-operator pod is not rejected here (that is the M8.3-d3 Warn VAP's
+// job, a separate admission-time seam), so any value on the key opts the pod in.
+func podRequestsInternetEgress(pod *corev1.Pod) bool {
+	_, ok := pod.Annotations[runtimev1.AnnotationInternetEgress]
+	return ok
+}
+
+// applyGPUAndEgress sets SandboxProfile.AllowGpu/AllowInternetEgress from the
+// pod's GPU-limit and egress-annotation intent, then enforces the
+// AllowInternetEgress ⇒ AllowNetwork pairing (m8-plan Res. 12): a pod that opts
+// into internet egress must still carry AllowNetwork, or it loses the cluster
+// DNS-VIP route Seatbelt only emits under AllowNetwork — an egress-only pod
+// would be unable to resolve names before it could ever reach the network it
+// asked for. AllowNetwork is otherwise left as the caller set it; toPodBox
+// currently hardcodes it true for every pod, but this pairing holds regardless
+// of that caller's choice.
+func applyGPUAndEgress(profile *runtimev1.SandboxProfile, pod *corev1.Pod) {
+	profile.AllowGpu = podRequestsGPU(pod)
+	profile.AllowInternetEgress = podRequestsInternetEgress(pod)
+	if profile.AllowInternetEgress {
+		profile.AllowNetwork = true
+	}
 }
 
 // injectClusterDNSEnv appends the K3SM_DNS_* environment the DYLD getaddrinfo shim
