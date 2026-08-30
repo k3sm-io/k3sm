@@ -165,7 +165,7 @@ func TestM2_InPodKubectl(t *testing.T) {
 
 		// Build the PodBox and bind the pod's SA exactly as the provider's
 		// CreatePod does, then run the runtimed materializer at the seam.
-		box, err := toPodBox(pod, "10.0.0.9", dataVol, "", netv1.DNSConfig{})
+		box, err := toPodBox(pod, "10.0.0.9", "10.0.0.9", dataVol, "", netv1.DNSConfig{}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}

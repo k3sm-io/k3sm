@@ -712,7 +712,7 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 				"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
 		}
 	}
-	box, err := toPodBox(pod, podIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg)
+	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg, r.log)
 	if err != nil {
 		return nil, err
 	}
