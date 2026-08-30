@@ -25,9 +25,11 @@ iptables, systemd, OverlayFS).
 **Pre-release.** The engine (**M0–M6**) is code-complete and workspace-integration-green: native
 Seatbelt-isolated pods, a single `k3sm server` embedding the upstream control plane over kine, lo0
 IP-per-pod + a userspace Service proxy, a wireguard mesh for multi-node, local-path storage, and
-RBAC. M0/M1 are validated end-to-end; the remaining live-hardware and two-Mac acceptance gates, the
-packaging/signing pipeline, and the `vm` RuntimeClass / HA lab validation are burned down in **M7
-(public release)** and **M8 (MLX — native Apple-Silicon ML serving)**.
+RBAC. **M0, M1 and M2 are validated end to end on Apple-Silicon hardware** — M2's gate passed all 13
+required conformance criteria plus the install/uninstall lifecycle against a real root install. The
+remaining live-hardware and two-Mac acceptance gates, the packaging/signing pipeline, and the `vm`
+RuntimeClass / HA lab validation are burned down in **M7 (public release)** and **M8 (MLX — native
+Apple-Silicon ML serving)**.
 
 See the hand-written [**ROADMAP.md**](ROADMAP.md) for the Shipped / Next / Future narrative, and
 [**docs/DESIGN.md**](docs/DESIGN.md) for the full architecture and the macOS-26 red-team findings
