@@ -313,6 +313,6 @@ datastore operational model.
 
 ## MLX / Apple-GPU workloads
 
-MLX and Apple-GPU workloads are a **separate track** (the `MLXModel` CRD and the `mlx.k3sm.io/gpu`
-extended resource). They are not covered by these user pages and ship on their own schedule; nothing
-here should be read as describing GPU behavior.
+MLX and Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have
+their own page — see [MLX quickstart](mlx-quickstart.md). They are not covered by these general
+user pages; nothing here should be read as describing GPU behavior.
