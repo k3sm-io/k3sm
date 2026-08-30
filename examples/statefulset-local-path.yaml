@@ -1,0 +1,102 @@
+# statefulset-local-path — a StatefulSet whose PVC is satisfied by the local-path
+# provisioner, and the node pinning that follows from it.
+#
+# WHY THE POD ENDS UP PINNED TO ONE NODE — and why that is not a nodeName pin:
+#
+#   The local-path StorageClass binds WaitForFirstConsumer, so nothing is provisioned
+#   until the SCHEDULER has chosen a node for the Pod. Only then does the provisioner
+#   create a directory on that Mac's APFS filesystem and a PersistentVolume whose
+#   nodeAffinity names that node. From that moment the data lives on one machine, so
+#   every future Pod bound to this PVC can only be scheduled back to the same node.
+#
+#   The pinning is therefore a CONSEQUENCE of where the volume was provisioned, applied
+#   by the scheduler through the PV's nodeAffinity. Never write `nodeName` yourself: a
+#   hand-pinned Pod bypasses the scheduler entirely, which means it also bypasses the
+#   volume-node checks that keep a Pod and its data on the same Mac.
+#
+# THE WORKLOAD MUST BE A COMPILED BINARY, not a shell script. Volume mounts on k3sm are
+# materialized under the Pod's data directory and made to resolve at their declared
+# absolute path by a DYLD_INSERT_LIBRARIES path-rebase shim. macOS strips that variable
+# from SIP platform binaries (/bin/sh, /usr/bin/*), so a `/bin/sh` command would run but
+# would NOT see /var/lib/counter. Point command[0] at your own darwin/arm64 build.
+#
+#   kubectl apply -f examples/statefulset-local-path.yaml
+#   kubectl get pvc,pv
+#   kubectl get pv -o jsonpath='{.items[0].spec.nodeAffinity}'   # the pin, spelled out
+#
+# Per-pod DNS identity (counter-0.counter.default.svc) is PLANNED, not present: headless
+# Services, SRV and pod-A records are not wired yet. The headless Service below exists
+# because a StatefulSet names one, not because the DNS names it implies resolve today.
+apiVersion: v1
+kind: Service
+metadata:
+  name: counter
+  namespace: default
+  labels:
+    app: counter
+spec:
+  clusterIP: None
+  selector:
+    app: counter
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: counter
+  namespace: default
+spec:
+  serviceName: counter
+  # One replica: each replica would claim its own local-path PV on the node the
+  # scheduler picked for it, and on a single-node cluster they would additionally
+  # contend for the same host port space.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: counter
+  template:
+    metadata:
+      labels:
+        app: counter
+    spec:
+      nodeSelector:
+        kubernetes.io/os: darwin
+      tolerations:
+        - key: k3sm.io/provider
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: counter
+          image: native
+          # Replace with your own darwin/arm64 binary — see the note above on why this
+          # cannot be a /bin/sh script when a volume is mounted.
+          command:
+            - /opt/counter/bin/counter
+            - --data-dir=/var/lib/counter
+            - --listen=0.0.0.0:8080
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/counter
+          resources:
+            requests:
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # k3sm's local-path class. Its reclaim policy is Retain: deleting the PVC
+        # leaves the directory and the PV behind, so data survives a mistake and is
+        # removed deliberately, by hand.
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi
