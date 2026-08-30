@@ -12,9 +12,9 @@ number written into prose can go stale. Always read the live values:
 k3sm version    # prints the k3sm build version + the embedded Kubernetes control-plane pin
 ```
 
-The **machine-authoritative** Kubernetes pin is the `triaged_for_kube_version` frontmatter in the
-conformance register (`docs/UPSTREAM-ALIGNMENT.md`), which is compared against the shipped control-plane
-pin (`executor.DefaultKubeVersion`) by the version-sync tooling. When a pin bump lands, that tooling
+The **machine-authoritative** Kubernetes pin is the shipped control-plane pin
+(`executor.DefaultKubeVersion`), which release tooling compares against the version the project has
+triaged its conformance notes against. When a pin bump lands, that tooling
 updates the register; treat it — and `k3sm version` — as the source of truth over this page.
 
 ## Current skew (point-in-time)
