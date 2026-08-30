@@ -22,8 +22,11 @@ the roadmap). Unmodified Linux images are the province of the EXPERIMENTAL
 
 ## Why did my container exit and not restart?
 
-`restartPolicy` is **not honored live** yet — an exited container is reaped, not respawned. See
-[limitations.md](limitations.md).
+On the default runtime it should have — `restartPolicy` **is** honored, with an upstream-shaped
+`CrashLoopBackOff`. The two cases where it is not: a plain (non-sidecar) **init** container, which is
+not re-run in place, and a node started with `--runtime hostprocess`, the rootless-dev opt-out that
+reaps an exited container without respawning it. See
+[limitations.md](limitations.md#restartpolicy--honored-on-the-default-runtime-not-on-the-hostprocess-opt-out).
 
 ## Does cluster DNS work inside a Pod?
 

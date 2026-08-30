@@ -183,12 +183,32 @@ Only **cluster DNS on `:53`** uses UDP today (the DNS VIP binds 53 directly). Ge
 unimplemented** — this covers **both ClusterIP UDP and NodePort UDP**, not just NodePort. If your
 workload depends on a UDP ClusterIP or NodePort Service, it will not work yet.
 
-### `restartPolicy` is not honored live
+### `restartPolicy` — honored on the default runtime, not on the `hostprocess` opt-out
 
-An exited container is **reaped, but never respawned**. The default `restartPolicy: Always` is decided
-but **not yet live-wired at `main`**. This is a first-order surprise for `Deployment` and `Job` users: a
-process that exits stays exited until the controller replaces the Pod, rather than the container being
-restarted in place.
+k3sm has **two pod runtimes**, and this is the first place the difference is user-visible. The
+default is the **image runtime** (`k3sm server` / `k3sm node` with no `--runtime` flag), which every
+installed cluster uses; `--runtime hostprocess` is an explicit rootless-dev opt-out that runs bare
+native processes with no image handling. Pods using the [`vm` RuntimeClass](vm-runtimeclass.md) run
+on the default runtime too, so they inherit its behavior here.
+
+**On the default runtime, `restartPolicy` is honored** — the container is restarted **in place**, and
+`kubectl` shows the restart count and a `CrashLoopBackOff` waiting reason exactly as upstream does:
+
+- `Always` restarts on any exit, including a clean exit 0; `OnFailure` restarts on a non-zero exit
+  code or a non-zero terminating signal (so an OOM kill counts); `Never` does not restart.
+- A **native sidecar** (an init container with `restartPolicy: Always`) is restarted under an
+  effective `Always` regardless of the Pod's own policy, per upstream sidecar semantics.
+- The backoff schedule matches the upstream kubelet: a 10 s base, doubling, capped at 300 s, reset
+  once the container has stayed up past the stabilization window. A committed liveness-probe failure
+  and a failed `postStart` hook restart the container through the same path.
+
+**The one remaining gap on the default runtime: plain init containers are not restarted.** A regular
+(non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run in place — the Pod
+does not proceed, and a controller replacing the Pod is what unsticks it.
+
+**On `--runtime hostprocess`, `restartPolicy` is not honored at all.** An exited container is reaped
+once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
+process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
 ### `vm` RuntimeClass and multi-node HA are EXPERIMENTAL
 
