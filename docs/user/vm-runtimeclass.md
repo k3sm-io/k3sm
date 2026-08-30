@@ -81,7 +81,7 @@ includes `darwin/arm64` is unaffected — it runs natively, as it always did.
 That refusal is deliberate, not an oversight. Two things must land first:
 
 - **`k3sm.io/rosetta` (host, darwin/amd64)** — spawning a *translated* Mach-O inside the Seatbelt sandbox
-  is not yet proven end to end (**B105**). Selecting amd64 payloads before it is would also weaken a
+  is not yet proven end to end. Selecting amd64 payloads before it is would also weaken a
   kernel-level check k3sm relies on: an unsigned **arm64** binary is killed by the OS, while an unsigned
   **x86_64** one is not.
 - **`k3sm.io/rosetta-linux` (guest, linux/amd64)** — the Linux-guest payload path (rootfs + guest image
