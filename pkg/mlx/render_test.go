@@ -49,16 +49,20 @@ func testOptions() Options {
 // newModel returns the full-featured MLXModel the happy-path assertions render:
 // every optional field set, so an assertion that a field FLOWS cannot pass by
 // accident on a zero value.
+//
+// Except spec.quantization, which is deliberately unset: the serving engine has
+// no expression for it, so a spec that states it is REFUSED rather than rendered
+// (ErrQuantizationUnsupported). That refusal has its own row in
+// TestEngineArgsMatchTheMeasuredSurface.
 func newModel() *mlxv1alpha1.MLXModel {
 	return &mlxv1alpha1.MLXModel{
 		ObjectMeta: metav1.ObjectMeta{Name: "qwen3", Namespace: "models", UID: testUID},
 		Spec: mlxv1alpha1.MLXModelSpec{
-			Model:        "mlx-community/Qwen3-0.6B-4bit",
-			Revision:     "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
-			Quantization: "4bit",
-			Memory:       resource.MustParse("24Gi"),
-			Replicas:     ptr.To(int32(2)),
-			Port:         9123,
+			Model:    "mlx-community/Qwen3-0.6B-4bit",
+			Revision: "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567",
+			Memory:   resource.MustParse("24Gi"),
+			Replicas: ptr.To(int32(2)),
+			Port:     9123,
 			Runtime: mlxv1alpha1.MLXRuntime{
 				Image: "ghcr.io/k3sm-io/mlx-serve@sha256:1111111111111111111111111111111111111111111111111111111111111111",
 				Args:  []string{"--max-tokens", "512"},
@@ -333,6 +337,10 @@ func TestReconcileRendersStatefulSetFromMLXModel(t *testing.T) {
 	t.Run("no_cache_renders_no_claim_and_no_hf_home", func(t *testing.T) {
 		m := newModel()
 		m.Spec.Cache = nil
+		// No cache volume means no HF_HOME to name, which is exactly why a pinned
+		// revision needs one (ErrRevisionNeedsCache); this row is about the
+		// volume, so it renders the unpinned shape.
+		m.Spec.Revision = ""
 		objs, err := Render(m, testOptions())
 		if err != nil {
 			t.Fatalf("Render() error = %v, want nil", err)
@@ -366,11 +374,12 @@ func TestReconcileRendersStatefulSetFromMLXModel(t *testing.T) {
 			t.Errorf("ports = %v, want one %s port %d (from spec.port)", c.Ports, portName, m.Spec.Port)
 		}
 		args := strings.Join(c.Args, " ")
+		// The model is a POSITIONAL and a pinned revision is a path, not an
+		// option — see modelReference and TestEngineArgsMatchTheMeasuredSurface,
+		// which owns the full argv contract.
 		for _, want := range []string{
-			"--model " + m.Spec.Model,
+			"models--mlx-community--Qwen3-0.6B-4bit/snapshots/" + m.Spec.Revision,
 			"--port 9123",
-			"--revision " + m.Spec.Revision,
-			"--quantization " + m.Spec.Quantization,
 		} {
 			if !strings.Contains(args, want) {
 				t.Errorf("args = %q, want it to contain %q", args, want)

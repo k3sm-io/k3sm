@@ -56,7 +56,10 @@ limitations under the License.
 //     and the serving engine batches concurrent requests only when told to,
 //     answering HTTP 503 to all but one client otherwise — with a healthy
 //     /health and a green readiness probe, so nothing else reports it. Both are
-//     derived and rendered in sizing.go.
+//     derived and rendered in sizing.go, which also carries the MEASURED engine
+//     command-line surface every rendered option is checked against — the model
+//     is a positional there, and a pinned revision has no option at all and is
+//     expressed as a path into the cache volume (see modelReference).
 //
 //   - THE FIXED GUARDRAIL STANZA — the kubernetes.io/os=darwin nodeSelector, the
 //     mlx.k3sm.io/gpu.present selector, the k3sm provider toleration, and the
