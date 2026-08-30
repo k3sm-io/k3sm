@@ -27,6 +27,14 @@ import (
 	"time"
 )
 
+// expiredDeadline is a health window that has ALREADY elapsed by the time
+// awaitHealthy evaluates it: time.Now().After(deadline) is true on the very
+// first pass, so a wait given it reaches its deadline branch with no prior poll
+// and no wall-clock wait. The tests below use it to state "the deadline has
+// expired" as a fact rather than as something they wait for — which is what
+// makes them independent of how loaded the machine is (B172, B206).
+const expiredDeadline = time.Nanosecond
+
 // TestAwaitHealthyFailFast table-tests the pure bring-up select loop (M10.0
 // SRE fail-fast): child-exit beats the timeout (killing the opaque 90s wedge),
 // readiness returns nil, the timeout still fires when nothing happens, and ctx
@@ -108,10 +116,22 @@ func TestAwaitHealthyFailFast(t *testing.T) {
 // a fake child (a shell script that prints and exits nonzero — NOT a real
 // control-plane binary): spawnEnv's reaper closes exited, and the bring-up wait
 // returns an error naming the component, its exit status, and the last log
-// lines from its 0600 log file. The wait is handed the component's kernel exit
-// probe, so the assertions below hold even when a loaded machine delays the
-// reaper past the 10s deadline (B172); the constructed interleaving itself is
-// pinned by TestAwaitHealthyExitBeatsExpiredDeadline.
+// lines from its 0600 log file.
+//
+// The exit is OBSERVED (<-c.exited) before the wait is entered, and the wait is
+// then given an already-expired deadline — so no wall-clock window decides the
+// shape of the error this test asserts on (B206). It previously handed the wait
+// a 10s health window and relied on the child dying inside it; on a machine
+// loaded enough to delay the child's exit past that window the wait legitimately
+// authored "failer not healthy within 10s" and the classification assertions
+// below failed. Raising the window would only move the cliff — synchronising on
+// the exit removes it, and costs no coverage: the exit-vs-deadline interleaving
+// is what TestSpawnChildExitTieBreaksAnExpiredDeadline and
+// TestAwaitHealthyExitBeatsExpiredDeadline exist to pin.
+//
+// The <-c.exited receive is deliberately unbounded: `go test -timeout` is the
+// harness-level guard for a wedged machine, and any budget written here would
+// re-import exactly the wall-clock dependence this test was fixed to shed.
 func TestSpawnChildExitSurfacesLog(t *testing.T) {
 	wd := t.TempDir()
 	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {
@@ -129,8 +149,10 @@ func TestSpawnChildExitSurfacesLog(t *testing.T) {
 	}
 	defer func() { _ = s.Stop(context.Background()) }()
 
+	<-c.exited
+
 	never := func(context.Context) bool { return false }
-	waitErr := awaitHealthy(context.Background(), c.name, c.exited, c.exitedNow, never, 10*time.Second, 10*time.Millisecond, c.exitDetail)
+	waitErr := awaitHealthy(context.Background(), c.name, c.exited, c.exitedNow, never, expiredDeadline, 10*time.Millisecond, c.exitDetail)
 	if waitErr == nil {
 		t.Fatal("want an early-exit error, got nil")
 	}
@@ -141,6 +163,74 @@ func TestSpawnChildExitSurfacesLog(t *testing.T) {
 	}
 	if fi, err := os.Stat(filepath.Join(wd, "failer.log")); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Errorf("component log must exist with mode 0600, got %v (err=%v)", fi, err)
+	}
+}
+
+// TestSpawnChildExitTieBreaksAnExpiredDeadline is the REAL-CHILD half of the
+// B172 tie-break that TestSpawnChildExitSurfacesLog no longer covers now that it
+// synchronises on the exit before waiting: a genuine child process, the genuine
+// kernel probe (processExited, not a stub), and a deadline that has already
+// expired must still yield the exit-shaped error rather than the opaque "not
+// healthy within" one.
+//
+// The lagging close is made ORDERED rather than merely likely. awaitHealthy
+// checks exited, then calls ready, then checks the deadline — so a ready that
+// signals when it is first called marks a point strictly after the loop-top exit
+// check, and a close published only after that signal provably cannot be seen by
+// it. The wait therefore reaches the deadline branch every time, with the child
+// genuinely dead and the close genuinely outstanding, which is exactly the state
+// the tie-break exists for. Deleting the tie-break reddens this test on every
+// run, not on a loaded one.
+func TestSpawnChildExitTieBreaksAnExpiredDeadline(t *testing.T) {
+	wd := t.TempDir()
+	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho fatal-flag-error-detail\nexit 3\n"
+	if err := os.WriteFile(filepath.Join(binDir(wd), "failer"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewSupervised(Config{WorkDir: wd})
+	c, err := s.spawnEnv(context.Background(), "failer", nil)
+	if err != nil {
+		t.Fatalf("spawnEnv: %v", err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	// Barrier, not budget: processExited is monotone once the child is gone, so
+	// this returns as soon as the kernel agrees the child has exited and never
+	// depends on how long that took.
+	for !c.exitedNow() {
+		time.Sleep(time.Millisecond)
+	}
+
+	// entered is closed by ready on awaitHealthy's own goroutine, so it needs no
+	// lock; the select is only there to make a second call a no-op.
+	entered := make(chan struct{})
+	never := func(context.Context) bool {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		return false
+	}
+	lagging := make(chan struct{})
+	go func() {
+		<-entered
+		<-c.exited // waitErr is published before this close, so exitDetail is safe
+		close(lagging)
+	}()
+
+	waitErr := awaitHealthy(context.Background(), c.name, lagging, c.exitedNow, never, expiredDeadline, 10*time.Millisecond, c.exitDetail)
+	if waitErr == nil {
+		t.Fatal("want an early-exit error, got nil")
+	}
+	for _, want := range []string{"failer", "exited during bring-up", "exit status 3", "fatal-flag-error-detail"} {
+		if !strings.Contains(waitErr.Error(), want) {
+			t.Errorf("error %q must contain %q — an expired deadline must never outrank a child the kernel already reports dead", waitErr, want)
+		}
 	}
 }
 
@@ -156,9 +246,6 @@ func TestAwaitHealthyExitBeatsExpiredDeadline(t *testing.T) {
 	detail := func() string { return "exit status 3; last log lines:\nfatal-flag-error-detail" }
 	alive := func() bool { return false }
 	dead := func() bool { return true }
-	// expired makes time.Now().After(deadline) true on the very first pass, so
-	// every case below enters the deadline branch with no prior poll.
-	const expired = time.Nanosecond
 
 	t.Run("exited child wins an expired deadline despite a lagging close", func(t *testing.T) {
 		exited := make(chan struct{})
@@ -166,7 +253,7 @@ func TestAwaitHealthyExitBeatsExpiredDeadline(t *testing.T) {
 			time.Sleep(60 * time.Millisecond)
 			close(exited)
 		}()
-		err := awaitHealthy(context.Background(), "failer", exited, dead, never, expired, 10*time.Millisecond, detail)
+		err := awaitHealthy(context.Background(), "failer", exited, dead, never, expiredDeadline, 10*time.Millisecond, detail)
 		if err == nil {
 			t.Fatal("want the early-exit error, got nil")
 		}
@@ -178,14 +265,14 @@ func TestAwaitHealthyExitBeatsExpiredDeadline(t *testing.T) {
 	})
 
 	t.Run("a still-running child leaves the deadline intact", func(t *testing.T) {
-		err := awaitHealthy(context.Background(), "c", make(chan struct{}), alive, never, expired, 10*time.Millisecond, detail)
+		err := awaitHealthy(context.Background(), "c", make(chan struct{}), alive, never, expiredDeadline, 10*time.Millisecond, detail)
 		if err == nil || !strings.Contains(err.Error(), "not healthy within") {
 			t.Fatalf("err = %v, want the timeout error (the probe must not defeat a live child's deadline)", err)
 		}
 	})
 
 	t.Run("no probe leaves the deadline unqualified", func(t *testing.T) {
-		err := awaitHealthy(context.Background(), "c", make(chan struct{}), nil, never, expired, 10*time.Millisecond, detail)
+		err := awaitHealthy(context.Background(), "c", make(chan struct{}), nil, never, expiredDeadline, 10*time.Millisecond, detail)
 		if err == nil || !strings.Contains(err.Error(), "not healthy within") {
 			t.Fatalf("err = %v, want the timeout error", err)
 		}
@@ -194,7 +281,7 @@ func TestAwaitHealthyExitBeatsExpiredDeadline(t *testing.T) {
 	t.Run("ctx cancellation escapes the wait for a lagging close", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		err := awaitHealthy(ctx, "c", make(chan struct{}), dead, never, expired, 10*time.Millisecond, detail)
+		err := awaitHealthy(ctx, "c", make(chan struct{}), dead, never, expiredDeadline, 10*time.Millisecond, detail)
 		if err != context.Canceled {
 			t.Fatalf("err = %v, want context.Canceled", err)
 		}
