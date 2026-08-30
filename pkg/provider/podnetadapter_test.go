@@ -165,6 +165,25 @@ func createdEnv(t *testing.T, f *fakeRuntimeServer, podUID, name string) string 
 	return ""
 }
 
+// createdEnvPresent reports whether env var name is set on the created box's
+// first container (without fataling on absence — the bind-discipline no-injection
+// assertions need to prove ABSENCE, which createdEnv cannot express).
+func createdEnvPresent(t *testing.T, f *fakeRuntimeServer, podUID, name string) bool {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	box, ok := f.created[podUID]
+	if !ok {
+		t.Fatalf("pod %s not created", podUID)
+	}
+	for _, e := range box.GetContainers()[0].GetEnv() {
+		if e.GetName() == name {
+			return true
+		}
+	}
+	return false
+}
+
 // createdPodIP returns the created box's PodIp.
 func createdPodIP(t *testing.T, f *fakeRuntimeServer, podUID string) string {
 	t.Helper()
@@ -222,6 +241,15 @@ func TestCreatePodAssignsDistinctPodIP(t *testing.T) {
 		if got := createdEnv(t, f, "uid-b", "POD_IP"); got != ipB {
 			t.Errorf("pod b POD_IP env = %q, want the allocated /32 %q", got, ipB)
 		}
+		// B217: a distinct-/32 pod carries the bind-discipline env the DYLD interpose
+		// reads (K3SM_POD_IP == the allocated /32), so its wildcard binds rewrite onto
+		// its own address and two same-node pods can both hold :8080.
+		if got := createdEnv(t, f, "uid-a", podnet.EnvPodIP); got != ipA {
+			t.Errorf("pod a %s env = %q, want the allocated /32 %q (bind discipline)", podnet.EnvPodIP, got, ipA)
+		}
+		if got := createdEnv(t, f, "uid-b", podnet.EnvPodIP); got != ipB {
+			t.Errorf("pod b %s env = %q, want the allocated /32 %q (bind discipline)", podnet.EnvPodIP, got, ipB)
+		}
 	})
 
 	t.Run("hostNetwork pod gets the node IP and allocates nothing", func(t *testing.T) {
@@ -236,6 +264,14 @@ func TestCreatePodAssignsDistinctPodIP(t *testing.T) {
 		}
 		if got := createdEnv(t, f, "uid-hostnet", "POD_IP"); got != testNodeIP {
 			t.Errorf("hostNetwork POD_IP env = %q, want nodeIP %q", got, testNodeIP)
+		}
+		// B217: the bind-discipline env is NOT injected for a hostNetwork pod (podIP ==
+		// nodeIP, no distinct /32). Injecting K3SM_POD_IP would rewrite its wildcard
+		// binds onto the node IP and silently narrow the shipped hostNetwork semantic
+		// (share the node's addresses). This asserts the guard the plan's architect
+		// WARNING requires — the shipped hostNetwork behaviour must not be narrowed.
+		if createdEnvPresent(t, f, "uid-hostnet", podnet.EnvPodIP) {
+			t.Errorf("hostNetwork pod carries %s; want NONE (a hostNetwork pod must keep its wildcard binds, not be rewritten onto the node IP)", podnet.EnvPodIP)
 		}
 		if allocs := ipam.allocations(); len(allocs) != 0 {
 			t.Errorf("hostNetwork pod allocated from the pool: %v, want none", allocs)
