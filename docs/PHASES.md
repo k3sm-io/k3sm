@@ -516,14 +516,15 @@ phases:
             method: integration
       - id: M8.5
         title: k3sm operator — pkg/mlx
-        status: todo
+        status: done
+        completed: 2026-08-30
         deliverables:
           - id: M8.5-d1
-            done: false
+            done: true  # 2026-08-30, k3sm#194 — crdensure + operator loop + step-4c-bis wiring; RESIDUALS: Config.GPU nil on the server path (fit check skipped in production; follow-up filed on the workspace queue) and mlx.Options empty until M8.4 lands the image/port defaults
             desc: "STUB (M8.5). NEW k3sm/pkg/mlx in-binary controller mirroring pkg/provisioner (informer + single workqueue worker, no stored Context, resync re-delivery; started in the server.go step-4c pattern, drained LIFO before control-plane teardown). Render: MLXModel → StatefulSet (volumeClaimTemplates → per-replica node-pinned local-path cache PVC) + a headless governing Service + a stable ClusterIP Service; persistentVolumeClaimRetentionPolicy whenDeleted:Delete; controller ownerReferences stamped (Res. 2 — else kubectl delete cascades nothing); readiness-only probes, NO liveness/startup until Ready once (Res. 3); fixed guardrail stanzas (kubernetes.io/os:darwin nodeSelector + k3sm.io/provider:NoSchedule toleration + the GPU resource in requests AND limits) else k3sm's own Deny VAP rejects the STS pods; imagePullSecrets for the private GHCR digest (Res. 16). Conditions-first status (+ observedGeneration, subresource; Phase is a derived printer column; ResolvedRevision recorded at Downloading). CRD ensure via SSA in a NEUTRAL package k3sm/pkg/crdensure (applies mlxmodels ONLY from the embedded k3sm.io/apis/config/crd, field manager k3sm, waits for Established). Pre-render validation: spec.Memory vs GPUFacts wired-limit/working-set → Failed/Degraded WITHOUT creating pods; request=limit from spec.Memory."
         acceptance:
           - id: M8.5-a1
-            met: false
+            met: true  # 2026-08-30 — the 14-test battery orchestrator-verified (-race in the lane; every-spec-fits mutant red x12)
             check: "render golden (placement stanza + retention policy + requests==limits + headless/ClusterIP pair + ownerReferences + readiness-only probe) + ensure SSA-convergence test (fake apiserver: schema drift converges, Established awaited) + pre-render validation table test + conditions/observedGeneration contract test + the CEL spec.distributed-rejected test (beside pkg/crdensure, Res. 9) pass."
             method: unit
       - id: M8.6
