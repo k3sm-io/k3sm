@@ -140,7 +140,7 @@ func runSteps(t *testing.T, m *mlxv1alpha1.MLXModel, steps []step) {
 // derived from that condition or from the observation, never invented.
 //
 // The derivation is HONEST about what a readiness-only probe can tell it (see
-// m8-plan Res. 3): "Loading" is a running replica whose serving surface answers
+// the readiness-only probe model): "Loading" is a running replica whose serving surface answers
 // but whose readiness has not passed, "Ready" is readiness passing, and no state
 // claims knowledge of a liveness signal that the rendered pod deliberately does
 // not have.

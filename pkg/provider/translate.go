@@ -229,7 +229,7 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 // both are set and are commonly expressed as limits-only, but the read here is
 // pinned to limits alone: a requests-only GPU ask is not a GPU grant, matching
 // how podMemoryLimitBytes and effectiveResource already treat limits as the
-// authoritative ceiling for this provider (m8-plan M8.3-d2). Checked across
+// authoritative ceiling for this provider. Checked across
 // both init and regular containers — an init container that needs GPU access
 // (e.g. a model-fetch step) is as real a request as a regular one.
 func podRequestsGPU(pod *corev1.Pod) bool {
@@ -250,7 +250,7 @@ func podRequestsGPU(pod *corev1.Pod) bool {
 // podRequestsInternetEgress reports whether the pod carries the
 // runtimev1.AnnotationInternetEgress annotation (k3sm.io/internet-egress) — by
 // PRESENCE, not a parsed boolean value. The annotation is operator-stamped
-// plumbing under the single-trust-domain model (m8-plan Res. 7); a hand-set use
+// plumbing under the single-trust-domain model; a hand-set use
 // on a non-operator pod is not rejected here (that is the M8.3-d3 Warn VAP's
 // job, a separate admission-time seam), so any value on the key opts the pod in.
 func podRequestsInternetEgress(pod *corev1.Pod) bool {
@@ -260,7 +260,7 @@ func podRequestsInternetEgress(pod *corev1.Pod) bool {
 
 // applyGPUAndEgress sets SandboxProfile.AllowGpu/AllowInternetEgress from the
 // pod's GPU-limit and egress-annotation intent, then enforces the
-// AllowInternetEgress ⇒ AllowNetwork pairing (m8-plan Res. 12): a pod that opts
+// AllowInternetEgress ⇒ AllowNetwork pairing: a pod that opts
 // into internet egress must still carry AllowNetwork, or it loses the cluster
 // DNS-VIP route Seatbelt only emits under AllowNetwork — an egress-only pod
 // would be unable to resolve names before it could ever reach the network it
