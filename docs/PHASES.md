@@ -424,7 +424,7 @@ phases:
         deliverables:
           - id: M7.3-d1
             done: false
-            desc: "STUB. Canonical home k3sm/docs/user/: the machine-asserted page manifest (quickstart/install/upgrade/backup-restore/concepts/limitations/images/multi-node/vm-runtimeclass[EXPERIMENTAL]/ha[EXPERIMENTAL]/storage/kubectl-access/troubleshooting/faq/versions). limitations.md cites UPSTREAM-ALIGNMENT.md + privilege-model.md (not restated) and carries the MLX-trusted-workload-only paragraph. mlx-quickstart.md is authored here but gated by m8.sh, NOT m7/docs.sh (A20). New examples/ (nodeport/statefulset/vm-linux/probes); README refresh across all repos (the k3sm README becomes the front door)."
+            desc: "STUB. Canonical home k3sm/docs/user/: the machine-asserted page manifest (quickstart/install/upgrade/backup-restore/concepts/limitations/images/multi-node/vm-runtimeclass[EXPERIMENTAL]/ha[EXPERIMENTAL]/storage/kubectl-access/troubleshooting/faq/versions). limitations.md cites UPSTREAM-ALIGNMENT.md + privilege-model.md (not restated) and carries the MLX-trusted-workload-only paragraph. mlx-quickstart.md is RE-HOMED to M8.6 (authored AND gated there — m8-plan R24, 2026-08-29; supersedes A20's authored-here-gated-by-m8.sh split, and M7 is launch-deferred). New examples/ (nodeport/statefulset/vm-linux/probes); README refresh across all repos (the k3sm README becomes the front door)."
         acceptance:
           - id: M7.3-a1
             met: false
@@ -459,11 +459,36 @@ phases:
     title: MLX — native Apple-Silicon ML serving (the NVIDIA-GPU-Operator analog for Mac)
     status: todo
     strategy: hard cut
-    note: "LEDGER STUB. Launch-blocking (user decision: launch WITH MLX v1; m8.sh joins the launch-gate set — the public flip is M9). k3sm owns M8.3 (node extended-resource + labels), M8.4 (mlx-serve uv image under hack/images/), M8.5 (pkg/mlx operator), M8.6 (the m8.sh gate). apis owns M8.1 (mlx.k3sm.io/v1alpha1 CRD + reserved-band proto carve); runtimed owns M8.0 spikes + M8.2 (Metal SBPL + egress + AdHocSignTree + GPUFacts — it CONSUMES the OCI-layer unpacker, re-homed 2026-07-11 to the runtimed M11.2 wave as M11.2-d7, via its depends edge; M8 is sequenced after that wave in the amended launch chain). NO M8-lab row — a GPU dev-mac covers it (Res. 15). All wire/API change is additive (new CRD group, reserved-band proto fields default-false)."
+    note: "LEDGER STUB. Launch-blocking (user decision: launch WITH MLX v1; m8.sh joins the launch-gate set — the public flip is M9). OWNERSHIP RECONCILED 2026-08-29 (m8-plan R23, resolving the three-owner M8.0 split): k3sm owns M8.0 (spikes S1–S5, agent-run on the lab Mac — R23), M8.3 (node extended-resource + labels), M8.4 (mlx-serve uv image under hack/images/), M8.5 (pkg/mlx operator), M8.6 (the m8.sh gate). apis owns M8.1 (mlx.k3sm.io/v1alpha1 CRD + reserved-band proto carve); runtimed owns M8.2 (Metal SBPL + egress + AdHocSignTree + GPUFacts — it CONSUMES the OCI-layer unpacker, re-homed 2026-07-11 to the runtimed M11.2 wave as M11.2-d7, via its depends edge; M8 is sequenced after that wave in the amended launch chain). M8.6 ALSO AUTHORS examples/mlxmodel.yaml + docs/user/mlx-quickstart.md (2026-08-29, m8-plan R24 — re-homed from M7.2/M7.3, which are launch-deferred with M7). NO M8-lab row — a GPU dev-mac covers it (Res. 15). All wire/API change is additive (new CRD group, reserved-band proto fields default-false)."
     depends_on:
       - apis:M8.1
       - runtimed:M8.2
     subphases:
+      - id: M8.0
+        title: spikes S1–S5 — lab Mac, agent-driven (k3sm/hack/spike/m8/)
+        status: todo
+        note: "Owner ratified k3sm 2026-08-29 (m8-plan R23; resolves the three-owner split and darwin-net's k3sm:M8.0 edge). ENTRY-INDEPENDENT: precedes the milestone-level depends_on (apis:M8.1 / runtimed:M8.2 bind M8.3+; M8.1 does NOT wait on M8.0 — R23, the illustrative M8.0 → M8.1 DAG edge is non-binding). Runs on the lab rig (Studio, M1 Max 64GB, apple-gpu); each spike commits a findings file under k3sm/hack/spike/m8/; per-spike halt semantics per m8-plan Res. 17. Lab guardrails (binding): writes confined to the dedicated user-level prefix + k3sm scratch trees; never touch /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP posture, or LaunchDaemons outside the prefix; no codesign-check disabling; any allow-set widening beyond a spike's exit criteria is flagged in the findings file, never silently inherited."
+        deliverables:
+          - id: M8.0-d1  # S1 Metal-under-Seatbelt
+            done: false
+            desc: "STUB (M8.0). s1.sh + findings-s1.md — a full MLX inference round-trip under a default-deny Seatbelt profile. PRIMARY job (m8-plan R22): VALIDATE the Apple-practice prefix-rule allow-set candidate — a single (iokit-registry-entry-class-prefix \"AGXAcceleratorG\")-style rule plus the S1-derived mach-lookup / shader-cache scope — which covers AGX user-client class variation M1→M4 without a per-family table. FALLBACK (adopted only if the prefix rule under- or over-scopes on the lab rig): denial-log-derived per-chip-family data. Evidence in the findings file: raw sandbox denial-log excerpts, the concrete allow-set, and BOTH exit criteria — (1) tokens are generated under the profile, (2) the HF weight download succeeds through the production datapath (DNS shim → Service-proxy dialer → egress) under the generated allow_internet_egress profile. S1's two exit criteria are the M8 go/no-go."
+          - id: M8.0-d2  # S2 nested-dylib signing
+            done: false
+            desc: "STUB (M8.0). s2.sh + findings-s2.md — walk-verify the mlx-serve rootfs for nested-dylib signing under AMFI. Evidence: the Mach-O count, the signed / unsigned / invalid-signature tally, and the exec-from-clonefile result (whether an ad-hoc-signed tree survives clonefile materialization and executes). Feeds M8.2-d3 (AdHocSignTree) and M8.4-a1's mechanized walk-verify."
+          - id: M8.0-d3  # S3 memory visibility & growth
+            done: false
+            desc: "STUB (M8.0). s3.sh + findings-s3.md — memory visibility and growth for an MLX serving process: ri_phys_footprint visibility (does the unified-memory/Metal working set show up), per-token growth, jetsam killer-order under pressure, and a process-group coverage verdict (whether sampling the group covers all engine children). Feeds M8.2-d5's contingency and the M8.5 sizing formula."
+          - id: M8.0-d4  # S4 image size & materialize latency
+            done: false
+            desc: "STUB (M8.0). s4.sh + findings-s4.md — mlx-serve image size and materialize latency: unpacked size, cold-start, tree-sign cost, and clonefile cost, each measured against the >2GB / >1min pruning thresholds. ALSO record whether k3sm-build-packaged symlinks (python-build-standalone's) survive the COPY → layer → runtimed-unpack round-trip — the M8.4 packaging premise."
+          - id: M8.0-d5  # S5 engine bake-off
+            done: false
+            desc: "STUB (M8.0). s5.sh + findings-s5.md — engine bake-off: vllm-mlx vs oMLX vs mlx-lm-dev. Evidence: tok/s, OpenAI API fidelity, the /health surface, license, wheel footprint, and process model. OUTPUT: the recorded M8.4 engine decision + the pinned wheel set (the working hypothesis is vllm-mlx; S5 ratifies or replaces it)."
+        acceptance:
+          - id: M8.0-a1
+            met: false
+            check: "every spike script exits 0 on the lab rig and its findings file is COMMITTED under k3sm/hack/spike/m8/ with the named evidence; S1's two exit criteria (tokens under the default-deny profile; HF weight download through the production datapath) are the M8 go/no-go — a failure HALTS the downstream M8 waves per m8-plan Res. 17."
+            method: integration
       - id: M8.3
         title: k3sm node — extended resource + translate + Warn VAP
         status: todo
@@ -482,7 +507,7 @@ phases:
         deliverables:
           - id: M8.4-d1
             done: false
-            desc: "STUB (M8.4). k3sm/hack/images/mlx-serve/: a build script + uv toolchain (uv python install + uv pip install --require-hashes against a checked-in hash-pinned lockfile) assembling python-build-standalone (darwin-arm64) + the spike-S5-winner engine wheels (working hypothesis vllm-mlx) into ghcr.io/k3sm-io/mlx-serve. Entrypoint is the python3 Mach-O directly (argv[0] must be gateSignature-verifiable — never a shell script); process model per S3 (process-group sampling verified or the image pinned single-process). A dedicated versioned GHCR publish workflow (mlx-serve-image.yml); the operator's default Runtime.Image is digest-pinned (tag display-only); pre-M9 the image is private GHCR (stealth). Weights are NEVER in the image (PVC via HF_HOME)."
+            desc: "STUB (M8.4). k3sm/hack/images/mlx-serve/: a build script + uv toolchain (uv python install + uv pip install --require-hashes against a checked-in hash-pinned lockfile) assembling python-build-standalone (darwin-arm64) + the spike-S5-winner engine wheels (working hypothesis vllm-mlx) into ghcr.io/k3sm-io/mlx-serve. Entrypoint is the python3 Mach-O directly (argv[0] must be gateSignature-verifiable — never a shell script); process model per S3 (process-group sampling verified or the image pinned single-process). A dedicated versioned GHCR publish workflow (mlx-serve-image.yml); the operator's default Runtime.Image is digest-pinned (tag display-only); pre-M9 the image is private GHCR (stealth). Weights are NEVER in the image (PVC via HF_HOME). BUILD PATH DECIDED 2026-08-29: no new build tool — the tree is host-staged (uv on the build Mac; RUN is never needed) → k3sm build --format oci (COPY-only packaging, FROM scratch) → pushed via the narrow k3sm image push slice (B189, over the already-vendored go-containerregistry). The GHCR publish workflow stays a human-gated M9-adjacent deliverable (dormant-workflow-classified); pre-M9 publishes run from the lab Mac with the resulting digest recorded."
         acceptance:
           - id: M8.4-a1
             met: false
@@ -506,7 +531,7 @@ phases:
         deliverables:
           - id: M8.6-d1
             done: false
-            desc: "STUB (M8.6). hack/acceptance/m8.sh, requires [dev-mac, apple-gpu, network] (dev-mac is a phases.json requires-token, NOT a K3SM_CI_REQUIRE taxonomy member — Res. 19); no M8-lab row. Pinned small model repo+revision (e.g. mlx-community/Qwen3-0.6B-4bit at a pinned HF commit), cache pre-seeded. Sequence: apply examples/mlxmodel.yaml → status Ready (conditions, not just Phase) → OpenAI chat completion via the ClusterIP returns tokens → records TTFT + tokens/sec through the ClusterIP path vs the direct backend → delete → GC-clean per the whenDeleted:Delete deletion contract (poll-to-absent, bounded timeout — Res. 2). m8.sh also gates mlx-quickstart.md."
+            desc: "STUB (M8.6). hack/acceptance/m8.sh, requires [dev-mac, apple-gpu, network] (dev-mac is a phases.json requires-token, NOT a K3SM_CI_REQUIRE taxonomy member — Res. 19); no M8-lab row. Pinned small model repo+revision (e.g. mlx-community/Qwen3-0.6B-4bit at a pinned HF commit), cache pre-seeded. Sequence: apply examples/mlxmodel.yaml → status Ready (conditions, not just Phase) → OpenAI chat completion via the ClusterIP returns tokens → records TTFT + tokens/sec through the ClusterIP path vs the direct backend → delete → GC-clean per the whenDeleted:Delete deletion contract (poll-to-absent, bounded timeout — Res. 2). m8.sh also gates mlx-quickstart.md; M8.6 ALSO AUTHORS examples/mlxmodel.yaml + docs/user/mlx-quickstart.md (2026-08-29, m8-plan R24 — one owner with the gate, re-homed from M7.2/M7.3)."
         acceptance:
           - id: M8.6-a1
             met: false
@@ -1052,22 +1077,30 @@ Gate machinery: `hack/acceptance/m7.sh` is the single umbrella gate execing `hac
 Ledger stub. **Launch-blocking** (launch
 WITH MLX v1; `m8.sh` joins the launch-gate set — the public flip is M9). **Strategy: hard cut** (a NEW CRD group
 `mlx.k3sm.io/v1alpha1` + reserved-band proto fields default-false). k3sm owns:
+- ⬜ **M8.0** — the five spikes **S1–S5** (`hack/spike/m8/`), **owner k3sm** (ratified 2026-08-29, m8-plan R23 — resolves
+  the three-owner split and darwin-net's `k3sm:M8.0` edge), **agent-run on the lab Mac** (Studio, M1 Max 64GB,
+  `apple-gpu`), each spike committing a findings file as its evidence. **Entry-independent** — M8.1 does not wait on
+  it; S1's two exit criteria (tokens under default-deny; HF weight download through the production datapath) are the
+  **M8 go/no-go**, halting downstream per Res. 17. Standing lab guardrails bind every session (see the ledger note).
 - ⬜ **M8.3** — node extended resource + translate + Warn VAP: `configureNode` advertises `mlx.k3sm.io/gpu: 1` +
   labels **fail-closed** off runtimed GPUFacts (VZ-paravirtual discriminated); `translate.go` reads the GPU request
   from **limits** → `AllowGpu` and the egress annotation → `AllowInternetEgress`; a Warn VAP surfaces a hand-set
   egress annotation (single-trust-domain posture).
 - ⬜ **M8.4** — the `mlx-serve` runtime image (`hack/images/mlx-serve/`, uv-built `--require-hashes`,
   python-build-standalone + the S5-winner engine; `python3` Mach-O entrypoint; digest-pinned GHCR publish; weights
-  never in-image).
+  never in-image). **Build path decided 2026-08-29** — no new build tool: host-staged uv tree on the build Mac →
+  `k3sm build --format oci` (COPY-only, `FROM scratch`) → push via the narrow `k3sm image push` slice (**B189**). The
+  GHCR publish workflow stays a **human-gated, M9-adjacent** deliverable (dormant-workflow-classified); pre-M9
+  publishes run from the lab Mac with the digest recorded.
 - ⬜ **M8.5** — the `pkg/mlx` in-binary operator (MLXModel → StatefulSet + headless + ClusterIP Services, ownerRefs,
   `whenDeleted:Delete`, readiness-only probes, fixed guardrail stanzas, conditions-first status, SSA CRD ensure via a
   neutral `pkg/crdensure`, pre-render validation vs GPUFacts).
 - ⬜ **M8.6** — the `hack/acceptance/m8.sh` gate (`requires [dev-mac, apple-gpu, network]`; **no M8-lab row** — a GPU
   dev-mac covers it): pinned small model → Ready → OpenAI completion via ClusterIP → GC-clean per the deletion
-  contract; also gates `mlx-quickstart.md`.
+  contract; **authors + gates** `mlx-quickstart.md` and `examples/mlxmodel.yaml` (R24, re-homed 2026-08-29 from M7.2/M7.3).
 Prerequisite (runtimed M11.2-d7 — the OCI-layer unpacker, re-homed 2026-07-11 from M8.2-d0 with the
 Linux-layer re-sequencing): the whole M8 product path is blocked on it; the MLX runtimed slice consumes it
-via its depends edge on the M11.2 wave. k3sm's M8.3
+via its **d7-only** depends edge (narrowed 2026-08-29 from the whole M11.2 wave — d1–d5 need only d7's output). k3sm's M8.3
 consumes GPUFacts once M8.2 lands (B63 ships the plumbing against a stubbed fact source first).
 
 ## M10 — Kubernetes conformance hardening ⬜
