@@ -114,7 +114,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		// Includes the saturation region on purpose: past maxContextTokens the
 		// curve is flat, and flat is what "no smaller context" permits. A strict
 		// increase would be the wrong assertion — it would forbid the cap that
-		// keeps --max-model-len under the model's own trained window.
+		// keeps --max-kv-size at a ceiling the weights can still be funded under.
 		mems := []string{"2Gi", "3Gi", "4Gi", "6Gi", "8Gi", "12Gi", "16Gi", "24Gi", "32Gi", "48Gi", "64Gi", "96Gi", "128Gi", "192Gi", "512Gi"}
 		prev := int64(-1)
 		prevMem := ""
@@ -146,7 +146,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		// is Running, /health answers, readiness passes, and 7 of 8 concurrent
 		// clients get HTTP 503 with waiters=0.
 		for _, mem := range sizingCases {
-			for _, callerArgs := range [][]string{nil, {"--max-tokens", "512"}, {"--max-model-len", "4096"}} {
+			for _, callerArgs := range [][]string{nil, {"--max-tokens", "512"}, {"--max-kv-size", "4096"}} {
 				m := newModel()
 				m.Spec.Memory = resource.MustParse(mem)
 				m.Spec.Runtime.Args = callerArgs
@@ -176,7 +176,7 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 		}
 		args := objs.StatefulSet.Spec.Template.Spec.Containers[0].Args
 		for _, want := range [][2]string{
-			{argMaxModelLen, fmt.Sprint(s.MaxContextTokens)},
+			{argMaxKVSize, fmt.Sprint(s.MaxContextTokens)},
 			{argMaxNumSeqs, fmt.Sprint(s.MaxSequences)},
 		} {
 			i := slices.Index(args, want[0])
@@ -191,10 +191,10 @@ func TestEngineArgsPinContextFromMemoryFormula(t *testing.T) {
 
 	t.Run("caller_args_come_after_the_pins", func(t *testing.T) {
 		// The override seam: argparse takes the LAST occurrence, so a caller who
-		// restates --max-model-len wins. Reversed, the render would silently
+		// restates --max-kv-size wins. Reversed, the render would silently
 		// clobber the operator's value while appearing to accept it.
 		m := newModel()
-		m.Spec.Runtime.Args = []string{"--max-model-len", "4096", "--trust-remote-code"}
+		m.Spec.Runtime.Args = []string{"--max-kv-size", "4096", "--trust-remote-code"}
 		objs, err := Render(m, testOptions())
 		if err != nil {
 			t.Fatalf("Render() error = %v, want nil", err)

@@ -47,9 +47,23 @@ later on the node.
 Pin `revision` to an exact model revision. Leaving it empty means the repository's default branch, which
 moves — two replicas started weeks apart would then serve different weights under one object.
 
+Two things follow from how the pin is applied. The serving engine has no option that takes a revision, so
+k3sm points it at that revision's directory **inside the cache volume** instead:
+
+- `revision` requires `cache`. Without a cache volume there is no such directory, and the model is
+  rejected up front with an `InvalidSpec` reason rather than served from the moving default branch.
+- A pinned revision is loaded from the cache, not fetched into it. On a volume that has never held this
+  model, leave `revision` empty for the first start (the engine downloads the default branch), or stage
+  the weights into the volume yourself — `hack/acceptance/m8.sh` does the latter.
+
+`quantization` is rejected today: the engine has no expression for it, and serving a different variant
+than the one asked for would look like success. Name the quantized repository in `model` instead —
+`mlx-community/Qwen3-0.6B-4bit` already does.
+
 ## 3. Watch it become ready
 
-The first start downloads the weights, which can take a while on a cold cache. Read the **conditions**,
+The first start downloads the weights, which can take a while on a cold cache — unless `revision` is
+pinned, in which case they must already be in the volume (above). Read the **conditions**,
 not the `PHASE` column — `PHASE` is a one-word summary for humans and loses information:
 
 ```sh
@@ -108,7 +122,8 @@ That removes the serving workload, both Services, and the cache PVC. The underly
 - Because it runs natively, a served model shares the `_k3sm` trust domain with the other native Pods on
   that Mac. Serve **models and code you trust** — see [limitations.md](limitations.md).
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
-  that volume room for the model you are serving.
+  that volume room for the model you are serving. A pinned `revision` is loaded from that volume rather
+  than downloaded into it — see step 2.
 - `spec.distributed` is reserved for future multi-node sharded serving and is rejected today. One model
   serves from one node.
 - Memory accounting covers the serving process group; the context window is pinned from `memory` so the
