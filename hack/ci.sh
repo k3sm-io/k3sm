@@ -13,6 +13,19 @@ fmt=$(gofmt -l .) || true
 echo "==> [k3sm] license headers"
 hack/verify-boilerplate.sh
 
+# The examples gate runs only in the REAL k3sm module. hack/acceptance/ci_guard_test.go
+# runs this very script inside a throwaway module whose hack/ entries are symlinks back
+# here; that sandbox has no examples/ and could not build the linter against
+# k3sm.io/k3sm anyway. Keying on the module path — not on `[ -d examples ]` — keeps a
+# DELETED examples/ a hard failure here rather than a silent skip.
+if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
+	echo "==> [k3sm] examples"
+	# --lint-only deliberately: the gate's verdict must not depend on whether the machine
+	# running it happens to have a cluster up. The server-dry-run leg is the developer's
+	# stronger check (hack/verify-examples.sh with no flags), not CI's.
+	hack/verify-examples.sh --lint-only
+fi
+
 # Enumerate the Go packages BEFORE deciding to skip anything. Exit 0 with empty
 # output means "no Go packages yet" — the legitimate skip this guard was written
 # for. A NON-ZERO exit (broken go.mod, unresolvable dependency, bad GOWORK, absent

@@ -1,0 +1,86 @@
+# probes — liveness and readiness on a native Darwin Pod.
+#
+# A Virtual Kubelet provider replaces the kubelet, so k3sm runs container probes
+# ITSELF, reproducing the kubelet prober's semantics: a verdict is committed only after
+# successThreshold consecutive successes or failureThreshold consecutive failures; the
+# readiness verdict drives the container's Ready condition and therefore its membership
+# in a Service's EndpointSlice; a committed LIVENESS failure restarts the container.
+# All three handler kinds work — httpGet, tcpSocket, and exec.
+#
+# Choose them for different questions:
+#
+#   readiness   "should traffic go here right now?"  Failing it removes the Pod from
+#               Service endpoints and nothing else. Cheap check, short period.
+#   liveness    "is this process wedged and unrecoverable?"  Failing it KILLS and
+#               re-execs the container. Make it slower, more tolerant, and dumber than
+#               the readiness probe — a liveness probe that checks a dependency turns
+#               that dependency's outage into a restart loop.
+#
+# Note on restarts more generally: an exited container is currently reaped but NOT
+# respawned in place (restartPolicy is not live-wired yet), so a process that exits on
+# its own stays exited until its controller replaces the Pod. A liveness-driven restart
+# is a different path and does re-exec the container.
+#
+#   kubectl apply -f examples/probes.yaml
+#   kubectl get pod probes -o wide
+#   kubectl describe pod probes | sed -n '/Conditions/,/Events/p'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probes
+  namespace: default
+  labels:
+    app: probes
+spec:
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: probes
+      image: native
+      # The same one-connection-at-a-time responder deployment-native.yaml uses, plus a
+      # readiness marker file the exec probe below looks for.
+      command:
+        - /bin/sh
+        - -c
+        - |
+          /usr/bin/touch /tmp/probes.ready
+          while :; do
+            printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nhello\n' \
+              | /usr/bin/nc -l 8081 >/dev/null 2>&1 || sleep 1
+          done
+      ports:
+        - name: http
+          containerPort: 8081
+      # Readiness: an exec probe, deliberately — it asks only whether the workload has
+      # declared itself ready, and it does not consume the demo responder's single
+      # connection the way an httpGet readiness probe would.
+      readinessProbe:
+        exec:
+          command:
+            - /bin/test
+            - -f
+            - /tmp/probes.ready
+        initialDelaySeconds: 1
+        periodSeconds: 5
+        timeoutSeconds: 2
+        successThreshold: 1
+        failureThreshold: 3
+      # Liveness: the crudest possible "is the listener still there" check, with a long
+      # period and a tolerant threshold. Roughly a minute of sustained failure before a
+      # restart, so a transient stall does not cost a re-exec.
+      livenessProbe:
+        tcpSocket:
+          port: http
+        initialDelaySeconds: 10
+        periodSeconds: 20
+        timeoutSeconds: 3
+        failureThreshold: 3
+      resources:
+        requests:
+          memory: 32Mi
+        limits:
+          memory: 128Mi
