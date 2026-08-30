@@ -26,6 +26,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 // TestEnsureDarwinAdmissionProvisions verifies the os=darwin policy + binding are
@@ -318,6 +320,120 @@ func TestProviderTolerationWarn(t *testing.T) {
 	if strings.Contains(providerTolerationExpr, "size(") {
 		t.Errorf("CEL must not use the naive size() emptiness shortcut: %q", providerTolerationExpr)
 	}
+}
+
+// TestEgressAnnotationWarnVAP is the B91 gate. It pins the policy STRUCTURE
+// (Warn-only, FailurePolicy Ignore — load-bearing: this advisory must never
+// take the cluster down — pods/CREATE only) and then EVALUATES the CEL (not
+// merely greps it): a pod that hand-sets runtimev1.AnnotationInternetEgress
+// WITHOUT the operator-managed discriminator warns; the same annotation on a
+// pod carrying pkg/mlx.Render's app.kubernetes.io/managed-by=k3sm label does
+// NOT warn; a pod without the annotation at all does NOT warn either way.
+func TestEgressAnnotationWarnVAP(t *testing.T) {
+	// Structure, and the constant-not-literal pin: the provisioned CEL must
+	// contain the ANNOTATION KEY runtimev1.AnnotationInternetEgress actually
+	// resolves to, plus the discriminator label — proving EnsureEgressAnnotationWarn
+	// built the policy from the constant and the shared label pair, not a second,
+	// independently-typed literal.
+	assertWarnPolicy(t, egressAnnotationPolicyName, egressAnnotationBindingName,
+		[]string{runtimev1.AnnotationInternetEgress, operatorManagedByLabelKey, operatorManagedByLabelValue},
+		"pods", []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+		func(cs kubernetes.Interface) error {
+			return EnsureEgressAnnotationWarn(context.Background(), cs)
+		})
+
+	if runtimev1.AnnotationInternetEgress != "k3sm.io/internet-egress" {
+		t.Fatalf("runtimev1.AnnotationInternetEgress = %q, want k3sm.io/internet-egress (apis#33 drifted)",
+			runtimev1.AnnotationInternetEgress)
+	}
+
+	// Real CEL evaluation of the warn EXPRESSION (admits=true means no warn).
+	prg := celProgram(t, egressAnnotationExpr(runtimev1.AnnotationInternetEgress))
+	tests := []struct {
+		name      string
+		object    map[string]any
+		wantAdmit bool
+	}{
+		{
+			name:      "hand-set annotation on a plain pod warns",
+			object:    egressAnnotationPod(map[string]string{runtimev1.AnnotationInternetEgress: "true"}, nil),
+			wantAdmit: false,
+		},
+		{
+			name: "operator-stamped pod (managed-by=k3sm label present) does not warn",
+			object: egressAnnotationPod(
+				map[string]string{runtimev1.AnnotationInternetEgress: "true"},
+				map[string]string{operatorManagedByLabelKey: operatorManagedByLabelValue},
+			),
+			wantAdmit: true,
+		},
+		{
+			name:      "no annotation at all does not warn",
+			object:    egressAnnotationPod(nil, nil),
+			wantAdmit: true,
+		},
+		{
+			name: "no annotation, managed-by label present anyway, does not warn",
+			object: egressAnnotationPod(nil,
+				map[string]string{operatorManagedByLabelKey: operatorManagedByLabelValue}),
+			wantAdmit: true,
+		},
+		{
+			name: "managed-by label present with a DIFFERENT value still warns",
+			object: egressAnnotationPod(
+				map[string]string{runtimev1.AnnotationInternetEgress: "true"},
+				map[string]string{operatorManagedByLabelKey: "helm"},
+			),
+			wantAdmit: false,
+		},
+		{
+			name: "some OTHER label present (not managed-by) still warns",
+			object: egressAnnotationPod(
+				map[string]string{runtimev1.AnnotationInternetEgress: "true"},
+				map[string]string{"app.kubernetes.io/name": "mlx-model"},
+			),
+			wantAdmit: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _, err := prg.Eval(map[string]any{"object": tt.object})
+			if err != nil {
+				t.Fatalf("eval: %v", err)
+			}
+			admit, ok := out.Value().(bool)
+			if !ok {
+				t.Fatalf("CEL returned %T (%v), want bool", out.Value(), out.Value())
+			}
+			if admit != tt.wantAdmit {
+				t.Errorf("admit = %v, want %v", admit, tt.wantAdmit)
+			}
+		})
+	}
+}
+
+// egressAnnotationPod builds the unstructured Pod object the egress-annotation
+// Warn policy's CEL evaluates. Either map may be nil to OMIT the metadata field
+// entirely (rather than an empty map), exercising the has() guards in
+// egressAnnotationExpr the same way a real Pod without any annotations/labels
+// would.
+func egressAnnotationPod(annotations, labels map[string]string) map[string]any {
+	meta := map[string]any{}
+	if annotations != nil {
+		m := make(map[string]any, len(annotations))
+		for k, v := range annotations {
+			m[k] = v
+		}
+		meta["annotations"] = m
+	}
+	if labels != nil {
+		m := make(map[string]any, len(labels))
+		for k, v := range labels {
+			m[k] = v
+		}
+		meta["labels"] = m
+	}
+	return map[string]any{"metadata": meta}
 }
 
 // TestDaemonSetTolerationInjectedNotNodeSelector is the B76 gate: the MUTATING policy
