@@ -102,14 +102,35 @@ Today at `main`, per port class:
   `<pending>` while the listeners still serve. That is deliberate: an unreachable `EXTERNAL-IP` is
   worse than none. See [troubleshooting.md](troubleshooting.md#a-loadbalancer-service-stays-pending).
 
-- **A pod can collide with a LoadBalancer port.** macOS has no network namespaces, so pods share **one
-  port space** with the server process (runtimed's sandbox profile emits a bare `(allow network-bind)`
-  — per-IP scoping does not compile on macOS 26). Previously a LoadBalancer listener bound a specific
-  `lo0` address, so a pod binding `0.0.0.0:8080` never conflicted; now the listener holds
-  `0.0.0.0:8080` and the pod's own `listen()` can fail `EADDRINUSE` — or vice versa, leaving the
-  Service `<pending>`. Admission cannot catch this: the colliding party is a `containerPort`, not a
-  Service field. Pods using the `vm` RuntimeClass are exempt (their own network stack behind VZNAT) —
-  see [vm-runtimeclass.md](vm-runtimeclass.md).
+- **Same-node Pods get separate per-IP port spaces for ordinary ports.** Each Pod is assigned its own
+  `100.64.0.0/10` loopback address, and on the default runtime a Pod's wildcard `bind()` on an
+  unprivileged port — **1024 and above, both TCP and UDP** — is transparently rewritten onto that
+  address. So two same-node Pods can both hold `:8080`, and a Pod binding `0.0.0.0:8080` no longer
+  collides with a LoadBalancer or NodePort wildcard listener on the same port. This heals the
+  previous `EADDRINUSE` collision, where a second `:8080` Pod would crash-loop. It is a **correctness
+  convenience, not a security boundary** — the rewrite only redirects a Pod's *own* wildcard bind. The
+  scope is deliberately narrow, with named residuals:
+
+  - **Ports below 1024 still share one wildcard port space.** On macOS a wildcard bind needs no
+    privilege at any port, but a *specific-address* bind below 1024 returns `EACCES` for a non-root
+    process, and Pods never run as root — so rewriting a low-port bind would turn a working workload
+    into a permission error. A Pod binding `:80` keeps today's shared behaviour and can still collide.
+  - **A container that sets its own `DYLD_INSERT_LIBRARIES` opts out.** Its value replaces the one that
+    carries the rewrite shim, so that container binds wildcard.
+  - **A native host-binary Pod binds wildcard.** A Pod that runs an absolute host path (rather than a
+    pulled image) is executed in place and is never re-signed; a hardened-runtime binary then silently
+    drops the injected shim, so the rewrite does not apply and the Pod binds the wildcard address. A
+    same-node `EADDRINUSE` here will name whichever Pod bound second, not the offender.
+  - **Platform and statically linked binaries** the dynamic loader will not inject into also bind
+    wildcard.
+  - **An explicit bind to another Pod's address still works.** The rewrite touches only wildcard binds;
+    the trust domain is unchanged. Same-node Pods share one `_k3sm` OS trust domain — untrusted
+    workloads use the `vm` RuntimeClass.
+  - **A grandchild process that outlives Pod teardown** can keep a socket on the address after it is
+    freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
+
+  Pods using the `vm` RuntimeClass have their own network stack behind VZNAT and are unaffected by all
+  of the above — see [vm-runtimeclass.md](vm-runtimeclass.md).
 
 - **k3sm reserves some ports, and rejects LoadBalancer Services that claim them.** The NodePort range
   `30000-32767` and the kubelet API port `10250` are k3sm's own wildcard listeners; Go sets no
