@@ -38,7 +38,7 @@ import (
 // engine-pool gauge whose "loaded_count" reads 0 while genuinely ready. None of
 // that vocabulary is read here — reading it would pin the operator to one
 // engine's JSON shape, which defeats the whole point of choosing the engine by
-// image digest (m8-plan). What every OpenAI-compatible surface DOES agree on is
+// image digest. What every OpenAI-compatible surface DOES agree on is
 // (a) whether it answers at all and (b) whether /v1/models lists a served
 // model by id — so those are the only two signals this function reads.
 //
