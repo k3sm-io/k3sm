@@ -30,6 +30,8 @@ import (
 	"syscall"
 	"time"
 
+	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -41,6 +43,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ingresshost"
+	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/ports"
@@ -524,6 +527,48 @@ func runServer(args []string) error {
 		provCancel()
 		<-provDone
 	}()
+
+	// 4c-bis. M8.5 — the MLX operator: ensures the MLXModel CRD, then reconciles
+	// each MLXModel into a StatefulSet plus its headless and ClusterIP Services.
+	// Same lifetime and the same reasoning as the provisioner above — started now
+	// that the apiserver is healthy, and drained BEFORE exec.Stop tears the control
+	// plane down by a defer registered after it, so LIFO runs this one first.
+	//
+	// mlx.Options is left empty: the pinned serving image and port are release
+	// facts this binary does not yet carry, so a model spec supplies them itself
+	// and one that does not gets an InvalidSpec status naming what is missing —
+	// rather than a StatefulSet built around an invented image.
+	//
+	// No GPU source is wired. The pre-render fit check reads the node-local
+	// runtime daemon's GPU facts, and that connection belongs to the node path,
+	// not to this one; a nil source SKIPS the fit check, which leaves the render's
+	// own GPU extended-resource request as what keeps a model off a GPU-less node.
+	if dynClient, err := dynamic.NewForConfig(restCfg); err != nil {
+		logger.Error("build dynamic client for the mlx operator", "err", err)
+	} else if crdClient, err := apiextensionsclient.NewForConfig(restCfg); err != nil {
+		logger.Error("build apiextensions client for the mlx operator", "err", err)
+	} else if mlxOp, err := operator.New(operator.Config{
+		Client:        cs,
+		Dynamic:       dynClient,
+		CRD:           crdClient,
+		ClusterDomain: opts.domain,
+		Log:           logger,
+	}); err != nil {
+		logger.Error("build the mlx operator", "err", err)
+	} else {
+		mlxCtx, mlxCancel := context.WithCancel(ctx)
+		mlxDone := make(chan struct{})
+		go func() {
+			defer close(mlxDone)
+			if err := mlxOp.Run(mlxCtx); err != nil && mlxCtx.Err() == nil {
+				logger.Error("mlx operator", "err", err)
+			}
+		}()
+		defer func() {
+			mlxCancel()
+			<-mlxDone
+		}()
+	}
 
 	// The in-process node's options are built HERE, before the LB/ingress block,
 	// and the LB/ingress configuration is derived from this same value — so the

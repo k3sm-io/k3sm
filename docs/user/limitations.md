@@ -114,7 +114,7 @@ Today at `main`, per port class:
   restarts.
 
 `spec.loadBalancerSourceRanges` is **accepted and silently ignored** today — setting it does not
-restrict anything. **Planned (`B131`)**. When it lands it is an authorization check at the accept
+restrict anything. **Planned.** When it lands it is an authorization check at the accept
 path, not a firewall: the TCP handshake still completes (so the port answers a scan and a denial
 arrives as a connection reset, not a timeout), it matches the immediate peer address so a relay or
 NAT presents the relay's address, it applies to TCP only, and an empty range set means allow-all.
@@ -132,10 +132,10 @@ is also upstream behaviour.
 
 Two further consequences of the LB/Ingress datapath: the userspace
 splice **discards the client address** when it dials the backend, so a NetworkPolicy denying a pod
-does **not** filter traffic that arrives via that pod's LoadBalancer or Ingress (`B131` restores this
+does **not** filter traffic that arrives via that pod's LoadBalancer or Ingress (planned work restores this
 by carrying the real source into the policy verdict); and a failed listener bind is not visible to
 `kubectl` — the Service simply stays `<pending>` and the reason is only in the daemon log, because the
-provider has no `EventRecorder` yet (`B75`).
+provider has no `EventRecorder` yet; wiring one is planned.
 
 All of this assumes the supported posture: a single operator's Mac with trusted namespaces. Any
 principal who can create a Service can claim a host port, and k3sm does not restrict which ports —
@@ -170,8 +170,8 @@ The in-process resolver and the `getaddrinfo` shim implement the **search-list /
 algorithm correctly. However:
 
 - **In-pod cluster-DNS wiring is currently unwired at `main`** — a Pod's resolver still defers to the
-  **host resolver** rather than the cluster DNS Service. Wiring this is the keystone item (B18).
-- **Headless Services, SRV, PTR, and pod-A records are planned, not present** (B81) — per-pod network
+  **host resolver** rather than the cluster DNS Service. Wiring this is the keystone item on the DNS roadmap.
+- **Headless Services, SRV, PTR, and pod-A records are planned, not present** — per-pod network
   identity depends on per-pod IP wiring that is not yet plumbed.
 
 Do **not** assume CoreDNS parity. Cluster-DNS-dependent service discovery from inside a Pod is not
