@@ -15,7 +15,7 @@ Use `vm` when a workload must not share the `_k3sm` trust domain with its neighb
 tenant isolation, or anything you would isolate with a strong boundary on Linux. This is the same
 framing as [limitations.md](limitations.md) and [concepts.md](concepts.md): the default native path is
 **not** a security boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
-`docs/privilege-model.md`.
+[privilege-model.md](../privilege-model.md).
 
 ## Using it
 
@@ -39,7 +39,8 @@ Pods without `runtimeClassName: vm` use the default native-process runtime and t
 - **Isolation** — a genuine boundary, at the cost of VM startup and overhead versus a native process.
 - **Fidelity** — as an EXPERIMENTAL path, treat behavior as preview-quality and validate your workload.
 - **Fallback posture** — when a Seatbelt SPI symbol-canary trips on the native path, the runtime degrades
-  to `vm` or refuse-to-run, never to an unconfined process (see `docs/privilege-model.md`).
+  to `vm` or refuse-to-run, never to an unconfined process (see
+  [privilege-model.md](../privilege-model.md)).
 
 ## Node capability labels
 

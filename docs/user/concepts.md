@@ -27,7 +27,7 @@ processes rather than a container runtime.
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
 same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads, use the **`vm`
 RuntimeClass** for a real isolation boundary — see [vm-runtimeclass.md](vm-runtimeclass.md). The
-rationale lives in `docs/privilege-model.md`. This is the same framing you will see in
+rationale lives in [privilege-model.md](../privilege-model.md). This is the same framing you will see in
 [limitations.md](limitations.md).
 
 ## Images
