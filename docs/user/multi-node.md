@@ -2,8 +2,9 @@
 
 Joining more than one Mac into a single k3sm cluster.
 
-> **Status: EXPERIMENTAL.** Multi-node (M6) ships as documented **EXPERIMENTAL** — a v0.3 headline, not
-> launch-blocking. Treat it as preview-quality. See [limitations.md](limitations.md).
+> **Status: EXPERIMENTAL.** Multi-node ships as documented **EXPERIMENTAL** and is **not**
+> launch-blocking; its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as
+> preview-quality until then. See [limitations.md](limitations.md).
 
 ## The model
 
@@ -42,7 +43,8 @@ the node — the `MeshPeer` records carry public keys only.
 
 ## Caveats
 
-- Per-pod IP identity and headless/StatefulSet DNS across nodes are **planned, not present** — see
+- Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
+  EXPERIMENTAL — validate cross-node resolution for your own workload rather than assuming it. See
   [limitations.md](limitations.md).
 - A cluster upgrade is a **node-by-node** rolling restart of the launchd daemons; see
   [upgrade.md](upgrade.md).

@@ -164,18 +164,47 @@ is no way to invalidate a single leaf, no CA-replacement flow, and worker/agent 
 scope (they re-issue on agent restart, which needs a fresh join token). See
 [certificates.md](certificates.md).
 
-### DNS — what works vs what is unwired/planned
+### DNS — what resolves, and on which runtime path
 
-The in-process resolver and the `getaddrinfo` shim implement the **search-list / ndots / A-record**
-algorithm correctly. However:
+k3sm does **not** run CoreDNS. Each node serves an in-process, authoritative cluster resolver on the
+DNS VIP and forwards everything else to the host's upstream resolver. What a Pod actually gets
+depends on the runtime path it runs on (see the `restartPolicy` section above for the two paths).
 
-- **In-pod cluster-DNS wiring is currently unwired at `main`** — a Pod's resolver still defers to the
-  **host resolver** rather than the cluster DNS Service. Wiring this is the keystone item on the DNS roadmap.
-- **Headless Services, SRV, PTR, and pod-A records are planned, not present** — per-pod network
-  identity depends on per-pod IP wiring that is not yet plumbed.
+**What the resolver answers (all paths — this is the server side):**
 
-Do **not** assume CoreDNS parity. Cluster-DNS-dependent service discovery from inside a Pod is not
-something you can rely on today.
+- **A records** for `<svc>.<ns>.svc.<domain>`, including `kubernetes.default.svc` → the apiserver VIP.
+- **Headless Services** — the all-backends A set for the bare Service name.
+- **Per-endpoint identity A records** — `<hostname>.<svc>.<ns>.svc.<domain>` for StatefulSet Pods,
+  dashed-IP form otherwise — and stateless pod A names under `<ns>.pod.<domain>`.
+- **SRV** records per named port, under the `_<port>._<proto>` owner names.
+- **PTR** — the reverse zone for the cluster pod and Service CIDRs is authoritative: a name inside
+  either answers locally (a hit or `NXDOMAIN`) and is never forwarded upstream.
+- **`ExternalName`** Services resolve, flattened CNAME→A. The one gap: an `ExternalName` whose target
+  is itself inside the cluster domain is `NXDOMAIN` (deliberately not re-resolved in-cluster).
+- **AAAA is never answered** — k3sm's CIDRs are IPv4.
+
+**In-pod resolution on the default runtime — wired, with one substrate caveat.** A Pod on a
+cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) has the cluster DNS
+configuration injected into every container, and the `getaddrinfo` shim resolves unqualified Service
+names against the DNS VIP with the correct search-list / ndots expansion. Three things to know:
+
+- **The shim cannot load into a SIP platform binary** (`/bin/sh`, `/usr/bin/*`) — macOS strips
+  `DYLD_INSERT_LIBRARIES` from those, so a shell script's lookups fall back to the **host** resolver
+  and cluster names will not resolve. This is the same constraint as the volume-mount shim above:
+  ship a compiled binary.
+- **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing** — those Pods use the host resolver.
+  For `None` that is a gap: a Pod's own `dnsConfig.nameservers` are not yet honored.
+- **Under `ClusterFirst`, `dnsConfig` is merged additively** — extra `searches` are appended and
+  `ndots` is overridden. Not yet honored: `dnsConfig.nameservers`, an explicit `ndots: 0`, and
+  options other than `ndots`.
+
+**On `--runtime hostprocess`, in-pod cluster DNS is not wired.** No shim, no cluster DNS
+configuration — every lookup from inside a Pod goes to the host resolver.
+
+**On the `vm` RuntimeClass, in-pod cluster DNS is not wired either.** A guest owns its own network
+stack, and the guest-network path that would carry the cluster resolver into it is not built yet — a
+`vm` Pod also reports the **node's** IP as its `podIP` rather than a guest address. Treat in-guest
+service discovery as unavailable; see [vm-runtimeclass.md](vm-runtimeclass.md).
 
 ### UDP Services (non-DNS) — deferred
 
@@ -183,18 +212,45 @@ Only **cluster DNS on `:53`** uses UDP today (the DNS VIP binds 53 directly). Ge
 unimplemented** — this covers **both ClusterIP UDP and NodePort UDP**, not just NodePort. If your
 workload depends on a UDP ClusterIP or NodePort Service, it will not work yet.
 
-### `restartPolicy` is not honored live
+### `restartPolicy` — honored on the default runtime, not on the `hostprocess` opt-out
 
-An exited container is **reaped, but never respawned**. The default `restartPolicy: Always` is decided
-but **not yet live-wired at `main`**. This is a first-order surprise for `Deployment` and `Job` users: a
-process that exits stays exited until the controller replaces the Pod, rather than the container being
-restarted in place.
+k3sm has **two pod runtimes**, and this is the first place the difference is user-visible. The
+default is the **image runtime** (`k3sm server` / `k3sm node` with no `--runtime` flag), which every
+installed cluster uses; `--runtime hostprocess` is an explicit rootless-dev opt-out that runs bare
+native processes with no image handling. Pods using the [`vm` RuntimeClass](vm-runtimeclass.md) run
+on the default runtime too, so they inherit its behavior here.
+
+**On the default runtime, `restartPolicy` is honored** — the container is restarted **in place**, and
+`kubectl` shows the restart count and a `CrashLoopBackOff` waiting reason exactly as upstream does:
+
+- `Always` restarts on any exit, including a clean exit 0; `OnFailure` restarts on a non-zero exit
+  code or a non-zero terminating signal (so an OOM kill counts); `Never` does not restart.
+- A **native sidecar** (an init container with `restartPolicy: Always`) is restarted under an
+  effective `Always` regardless of the Pod's own policy, per upstream sidecar semantics.
+- The backoff schedule matches the upstream kubelet: a 10 s base, doubling, capped at 300 s, reset
+  once the container has stayed up past the stabilization window. A committed liveness-probe failure
+  and a failed `postStart` hook restart the container through the same path.
+
+**The one remaining gap on the default runtime: plain init containers are not restarted.** A regular
+(non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run in place — the Pod
+does not proceed, and a controller replacing the Pod is what unsticks it.
+
+**On `--runtime hostprocess`, `restartPolicy` is not honored at all.** An exited container is reaped
+once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
+process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
 ### `vm` RuntimeClass and multi-node HA are EXPERIMENTAL
 
-The **`vm` RuntimeClass** (M5) and **multi-node / HA** (M6) ship as documented **EXPERIMENTAL**. They
-are the v0.2 / v0.3 headlines, **not** launch-blocking, and should be treated as preview-quality. See
-[vm-runtimeclass.md](vm-runtimeclass.md), [multi-node.md](multi-node.md), and [ha.md](ha.md).
+Both ship as documented **EXPERIMENTAL** and should be treated as preview-quality — but they are on
+different tracks:
+
+- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) is targeted at the **v0.1.0**
+  public release as EXPERIMENTAL, and is **launch-gated**: it is announced only if its live lab proof
+  is green against the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed,
+  with published performance figures — is the **v0.2** milestone. See
+  [vm-runtimeclass.md](vm-runtimeclass.md).
+- **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
+  milestone. See [multi-node.md](multi-node.md) and [ha.md](ha.md).
 
 ### Node capability labels are probed once at daemon start
 
