@@ -35,7 +35,8 @@ that shaped it.
 
 ## Layout
 ```
-cmd/k3sm/         single-binary entrypoint (server | agent | node | install | uninstall | token | kubectl | kubeconfig | netd)
+cmd/k3sm/         single-binary entrypoint (server | agent | node | install | uninstall | token |
+                  certificate | build | image | kubectl | kubeconfig | doctor | netd | version)
 pkg/executor/     in-process apiserver/scheduler/controller-manager + kine datastore
 pkg/provider/     Virtual Kubelet Darwin provider (logs/exec/top/port-forward)
 pkg/bootstrap/    token / node-password / HTTP-CSR / cluster CA
