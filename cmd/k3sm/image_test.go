@@ -47,6 +47,14 @@ type fakeImagesDaemon struct {
 	pruneErr  error
 	listResp  *runtimev1.ListImagesResponse
 	fsResp    *runtimev1.ImageFsInfoResponse
+
+	// LoadImage is client-streaming, so the fake keeps the metadata frame apart
+	// from the concatenated payload: the gate asserts on both independently.
+	loadFirst  *runtimev1.LoadImageRequest
+	loadBody   []byte
+	loadChunks int
+	loadResp   *runtimev1.LoadImageResponse
+	loadErr    error
 }
 
 func (f *fakeImagesDaemon) PruneImages(_ context.Context, req *runtimev1.PruneImagesRequest) (*runtimev1.PruneImagesResponse, error) {
@@ -63,6 +71,30 @@ func (f *fakeImagesDaemon) ListImages(context.Context, *runtimev1.ListImagesRequ
 
 func (f *fakeImagesDaemon) ImageFsInfo(context.Context, *runtimev1.ImageFsInfoRequest) (*runtimev1.ImageFsInfoResponse, error) {
 	return f.fsResp, nil
+}
+
+// LoadImage drains the ingest stream, recording the metadata frame and every
+// payload byte. It answers exactly once, at the end, as the RPC's shape requires.
+func (f *fakeImagesDaemon) LoadImage(stream runtimev1.Images_LoadImageServer) error {
+	for {
+		req, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if f.loadFirst == nil {
+			f.loadFirst = req
+			continue
+		}
+		f.loadChunks++
+		f.loadBody = append(f.loadBody, req.GetChunk()...)
+	}
+	if f.loadErr != nil {
+		return f.loadErr
+	}
+	return stream.SendAndClose(f.loadResp)
 }
 
 // serveFakeImages serves fake on a REAL unix socket and returns its path, so the

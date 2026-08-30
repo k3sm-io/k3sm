@@ -36,12 +36,20 @@ import (
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
-const imageUsage = `k3sm image — inspect and reclaim this node's image store
+const imageUsage = `k3sm image — ingest, inspect and reclaim this node's image store
 
-Usage: k3sm image prune [flags]
+Usage: k3sm image load <docker-save.tar> [flags]
+       k3sm image import <oci-layout.tar> [flags]
+       k3sm image prune [flags]
        k3sm image ls [flags]
        k3sm image df [flags]
 
+load   stream a ` + "`docker save`" + ` tar into this node's image store.
+import stream a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
+       output) into this node's image store.
+       Both are streamed to the daemon, which is the store's only writer: it
+       re-hashes every byte and records the reference. Loaded content is stored,
+       not yet runnable — see docs/user/images.md.
 prune  delete image content no pod references. DRY RUN BY DEFAULT — pass
        --force to actually unlink. The daemon does the deleting: this command
        is a client of the runtimed Images service, it never walks the store
@@ -60,7 +68,20 @@ type imageOptions struct {
 	socket     string
 	force      bool
 	timeout    time.Duration
+	// archive is the positional path load/import ingests; empty for every other
+	// subcommand, which take no positional argument at all.
+	archive   string
+	reference string
 }
+
+// Ingest streams a whole archive, so it cannot share the deadline sized for a
+// metadata call: a multi-GB tar over a unix socket routinely outlives two
+// minutes, and a deadline that fires mid-stream throws away every byte already
+// sent. Both are still one flag — an explicit --timeout always wins.
+const (
+	metadataTimeout  = 2 * time.Minute
+	streamingTimeout = 30 * time.Minute
+)
 
 // runImage is the `k3sm image` entry point.
 func runImage(args []string) error {
@@ -89,7 +110,8 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// unintended prune on a node that cannot reach its registry costs every image
 	// it cannot re-pull.
 	fs.BoolVar(&o.force, "force", false, "actually unlink (without this, prune only reports what it would delete)")
-	fs.DurationVar(&o.timeout, "timeout", 2*time.Minute, "overall deadline for the daemon call")
+	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
+	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the daemon call (load and import default to 30m — they stream an archive)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -100,19 +122,52 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// subcommand-first spelling is the one every comparable tool teaches.
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return o, errors.New("exactly one subcommand is required (prune, ls, df)")
+		return o, errors.New("exactly one subcommand is required (load, import, prune, ls, df)")
 	}
 	o.subcommand = rest[0]
-	if err := fs.Parse(rest[1:]); err != nil {
-		return o, err
-	}
-	if extra := fs.Args(); len(extra) > 0 {
-		return o, fmt.Errorf("unexpected argument %q: exactly one subcommand is required (prune, ls, df)", extra[0])
+	// load/import take a positional path, so parsing cannot stop at the first
+	// non-flag argument: `image load app.tar --reference x` must reach --reference.
+	// Alternating parse-then-lift accepts every ordering an operator might type.
+	var positional []string
+	remaining := rest[1:]
+	for {
+		if err := fs.Parse(remaining); err != nil {
+			return o, err
+		}
+		remaining = fs.Args()
+		if len(remaining) == 0 {
+			break
+		}
+		positional = append(positional, remaining[0])
+		remaining = remaining[1:]
 	}
 	switch o.subcommand {
 	case "prune", "ls", "df":
+		if len(positional) > 0 {
+			return o, fmt.Errorf("unexpected argument %q: exactly one subcommand is required (load, import, prune, ls, df)", positional[0])
+		}
+	case "load", "import":
+		if len(positional) == 0 {
+			return o, fmt.Errorf("%s requires the path of the archive to ingest", o.subcommand)
+		}
+		if len(positional) > 1 {
+			return o, fmt.Errorf("unexpected argument %q: %s takes exactly one archive path", positional[1], o.subcommand)
+		}
+		o.archive = positional[0]
 	default:
-		return o, fmt.Errorf("unknown subcommand %q (want prune, ls or df)", o.subcommand)
+		return o, fmt.Errorf("unknown subcommand %q (want load, import, prune, ls or df)", o.subcommand)
+	}
+	// The streaming default applies only when the operator did not choose. Visit
+	// reports flags actually set across both Parse calls, so it distinguishes
+	// "--timeout 2m" from "left alone".
+	timeoutSet := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "timeout" {
+			timeoutSet = true
+		}
+	})
+	if !timeoutSet && (o.subcommand == "load" || o.subcommand == "import") {
+		o.timeout = streamingTimeout
 	}
 	if o.timeout <= 0 {
 		return o, fmt.Errorf("--timeout must be positive, got %v", o.timeout)
@@ -160,6 +215,10 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 	}
 	client := runtimev1.NewImagesClient(cc)
 	switch o.subcommand {
+	case "load":
+		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE)
+	case "import":
+		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
 	case "prune":
 		return imagePrune(ctx, client, o, out)
 	case "ls":
