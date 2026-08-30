@@ -34,6 +34,6 @@ k3sm is **not** a drop-in replacement for a Linux Kubernetes cluster. Workloads 
 several standard behaviors diverge by design. Read [Limitations](limitations.md) first — it cites the
 canonical conformance registers so nothing there is rosier than the truth.
 
-MLX / Apple-GPU workloads are a **separate track** (the `MLXModel` CRD and the
-`mlx.k3sm.io/gpu` extended resource) with its own page — see
-[MLX quickstart](mlx-quickstart.md). The rest of these pages describe the general workload path.
+MLX / Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have
+their own page — see [MLX quickstart](mlx-quickstart.md), item 14 above. The rest of these pages
+describe the general workload path.

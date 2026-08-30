@@ -50,10 +50,17 @@ two-Mac gates are burned down in M7. What works:
   CNCF `[Conformance]` pass (k3sm has no Linux containers). The honest self-assessment —
   targeted feature classes mapped to a green criterion or a documented ceiling — is
   [`docs/conformance-profile.md`](docs/conformance-profile.md).
+- **MLX — native Apple-Silicon ML serving (the NVIDIA-GPU-Operator analog for Mac).** Schedule
+  and serve ML models on Apple GPUs / unified memory with first-class Kubernetes semantics: an
+  **`MLXModel` CRD** (`mlx.k3sm.io/v1alpha1`), an `mlx.k3sm.io/gpu` **extended resource**, and an
+  in-binary operator that reconciles a model to a StatefulSet + Service serving an
+  OpenAI-compatible API. *(validated end to end on Apple-GPU hardware — the
+  `hack/acceptance/m8.sh` gate: 22/22 checks green, including a real Hugging Face weight
+  download under a default-deny Seatbelt profile and a GC-clean deletion)*
 
-## Next — v0.1.0 (the public release, with MLX)
+## Next — v0.1.0 (the public release)
 
-The first public release. Two tracks, both launch-blocking:
+The first public release. One track is launch-blocking:
 
 - **Ship it.** Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh` — a checksum-verified release tarball handed to
@@ -61,12 +68,6 @@ The first public release. Two tracks, both launch-blocking:
   xattr); *(2)* `brew install k3sm-io/tap/k3sm`; *(3)* a signed, notarized `.pkg`. Underneath:
   goreleaser, GitHub Actions CI across all repos, [user docs](docs/user/) (which ship today —
   they are not gated on the release), and the website.
-- **MLX — the differentiator.** Native Apple-Silicon ML serving: schedule and serve ML models on
-  Apple GPUs / unified memory with first-class Kubernetes semantics. An **`MLXModel` CRD**
-  (`mlx.k3sm.io/v1alpha1`) + an `mlx.k3sm.io/gpu` **extended resource** + an in-binary operator that
-  reconciles a model to a StatefulSet + Service serving an OpenAI-compatible API. This is the
-  **NVIDIA-GPU-Operator analog for Mac** — running LLMs on a Mac mini as a k3sm pod is the launch
-  story.
 - **Bring your images (targeted).** `k3sm image load` / `k3sm image import` ingest docker-save
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and a
   first `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset

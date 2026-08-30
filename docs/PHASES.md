@@ -1079,29 +1079,29 @@ Gate machinery: `hack/acceptance/m7.sh` is the single umbrella gate execing `hac
 (a directory **outside** the `m[0-9]*.sh` orphan glob); manual:false skeletons exit non-zero unconditionally; the
 `M4-lab` row **re-points to `hack/lab/m7.sh`** (`hack/lab/m4.sh` deleted, B35 tombstoned). Launch itself is **M9**.
 
-## M8 — MLX: native Apple-Silicon ML serving ⬜
+## M8 — MLX: native Apple-Silicon ML serving ✅
 Ledger stub. **Launch-blocking** (launch
 WITH MLX v1; `m8.sh` joins the launch-gate set — the public flip is M9). **Strategy: hard cut** (a NEW CRD group
 `mlx.k3sm.io/v1alpha1` + reserved-band proto fields default-false). k3sm owns:
-- ⬜ **M8.0** — the five spikes **S1–S5** (`hack/spike/m8/`), **owner k3sm** (ratified 2026-08-29, m8-plan R23 — resolves
+- ✅ **M8.0** — the five spikes **S1–S5** (`hack/spike/m8/`), **owner k3sm** (ratified 2026-08-29, m8-plan R23 — resolves
   the three-owner split and darwin-net's `k3sm:M8.0` edge), **agent-run on the lab Mac** (Studio, M1 Ultra 64GB,
   `apple-gpu`), each spike committing a findings file as its evidence. **Entry-independent** — M8.1 does not wait on
   it; S1's two exit criteria (tokens under default-deny; HF weight download through the production datapath) are the
   **M8 go/no-go**, halting downstream per Res. 17. Standing lab guardrails bind every session (see the ledger note).
-- ⬜ **M8.3** — node extended resource + translate + Warn VAP: `configureNode` advertises `mlx.k3sm.io/gpu: 1` +
+- ✅ **M8.3** — node extended resource + translate + Warn VAP: `configureNode` advertises `mlx.k3sm.io/gpu: 1` +
   labels **fail-closed** off runtimed GPUFacts (VZ-paravirtual discriminated); `translate.go` reads the GPU request
   from **limits** → `AllowGpu` and the egress annotation → `AllowInternetEgress`; a Warn VAP surfaces a hand-set
   egress annotation (single-trust-domain posture).
-- ⬜ **M8.4** — the `mlx-serve` runtime image (`hack/images/mlx-serve/`, uv-built `--require-hashes`,
+- ✅ **M8.4** — the `mlx-serve` runtime image (`hack/images/mlx-serve/`, uv-built `--require-hashes`,
   python-build-standalone + the S5-winner engine; `python3` Mach-O entrypoint; digest-pinned GHCR publish; weights
   never in-image). **Build path decided 2026-08-29** — no new build tool: host-staged uv tree on the build Mac →
   `k3sm build --format oci` (COPY-only, `FROM scratch`) → push via the narrow `k3sm image push` slice (**B189**). The
   GHCR publish workflow stays a **human-gated, M9-adjacent** deliverable (dormant-workflow-classified); pre-M9
   publishes run from the lab Mac with the digest recorded.
-- ⬜ **M8.5** — the `pkg/mlx` in-binary operator (MLXModel → StatefulSet + headless + ClusterIP Services, ownerRefs,
+- ✅ **M8.5** — the `pkg/mlx` in-binary operator (MLXModel → StatefulSet + headless + ClusterIP Services, ownerRefs,
   `whenDeleted:Delete`, readiness-only probes, fixed guardrail stanzas, conditions-first status, SSA CRD ensure via a
   neutral `pkg/crdensure`, pre-render validation vs GPUFacts).
-- ⬜ **M8.6** — the `hack/acceptance/m8.sh` gate (`requires [dev-mac, apple-gpu, network]`; **no M8-lab row** — a GPU
+- ✅ **M8.6** — the `hack/acceptance/m8.sh` gate (`requires [dev-mac, apple-gpu, network]`; **no M8-lab row** — a GPU
   dev-mac covers it): pinned small model → Ready → OpenAI completion via ClusterIP → GC-clean per the deletion
   contract; **authors + gates** `mlx-quickstart.md` and `examples/mlxmodel.yaml` (R24, re-homed 2026-08-29 from M7.2/M7.3).
 Prerequisite (runtimed M11.2-d7 — the OCI-layer unpacker, re-homed 2026-07-11 from M8.2-d0 with the
