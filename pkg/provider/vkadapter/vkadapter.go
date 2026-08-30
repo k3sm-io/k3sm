@@ -31,6 +31,7 @@ package vkadapter
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -102,9 +103,18 @@ type NodeConfig struct {
 	// NumWorkers is the pod controller worker count.
 	NumWorkers int
 	// TLSConfig, when non-nil, serves the kubelet HTTP API over TLS AND attaches the
-	// provider routes (logs/exec/attach/port-forward) behind NoAuth; nil is the
-	// plain-HTTP path with no provider routes (the M0 posture).
+	// provider routes (logs/exec/attach/port-forward); nil is the plain-HTTP path
+	// with no provider routes (the M0 posture).
+	//
+	// When it is set it MUST require and verify a client certificate
+	// (tls.RequireAndVerifyClientCert against a non-nil ClientCAs) — NewNode refuses
+	// otherwise. See validateProviderRouteAuth.
 	TLSConfig *tls.Config
+	// AuthorizeHandler wraps the provider-route handler with the kubelet endpoint's
+	// authorization predicate (provider.KubeletEndpointAuth.Handler). It is REQUIRED
+	// whenever TLSConfig is set and ignored otherwise, because the only wiring that
+	// serves the routes is the TLS one.
+	AuthorizeHandler func(http.Handler) http.Handler
 	// ConfigureNode stamps the registering Node object (labels, capacity, taints)
 	// at bring-up. It runs inside VK's provider-bootstrap callback.
 	ConfigureNode func(*corev1.Node)
@@ -124,10 +134,11 @@ type NodeConfig struct {
 // nodeutil node-builder dance (NodeConfig options + NewNode + the nil-NodeProvider
 // → NewNaiveNodeProvider auto-Ready+lease-heartbeat path) so callers import no VK.
 //
-// The kubelet HTTP API (logs/exec) only serves when BOTH a TLS config and a
-// handler are set: when cfg.TLSConfig is non-nil a mux with the provider routes is
-// wired behind NoAuth and instrumented, matching the pre-confinement behavior
-// byte-for-byte.
+// The kubelet HTTP API (logs/exec) only serves when cfg.TLSConfig is non-nil: a
+// mux with the provider routes is then wired behind cfg.AuthorizeHandler and
+// instrumented. Both fields are required together — see validateProviderRouteAuth,
+// which refuses to build a node whose routes would answer to anything that can
+// reach the port.
 func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 	// Fast-fail on a nil ConfigureNode: it is invoked inside VK's node-bootstrap
 	// callback (a goroutine during bring-up), so a nil field would panic at startup
@@ -137,12 +148,18 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 	}
 	mux := http.NewServeMux()
 	// providerRoutesEnabled is the SINGLE, security-load-bearing gate: the kubelet
-	// HTTP provider routes (logs/exec/attach/port-forward) are served — behind
-	// NoAuth (no client authn; identity rests on serving-TLS + network reach) and
-	// instrumented — ONLY when TLS is configured, so exec/attach never rides plain
-	// HTTP. Both wiring branches below MUST consult this predicate in lockstep so a
-	// future edit cannot expose exec on the M0 plain-HTTP path.
+	// HTTP provider routes (logs/exec/attach/port-forward) are served — mutually
+	// authenticated and instrumented — ONLY when TLS is configured, so exec/attach
+	// never rides plain HTTP. Both wiring branches below MUST consult this predicate
+	// in lockstep so a future edit cannot expose exec on the M0 plain-HTTP path.
 	routes := providerRoutesEnabled(cfg)
+	// And when they ARE served, they are served authenticated: refuse to build the
+	// node at all rather than serve exec to whoever can reach the port.
+	if routes {
+		if err := validateProviderRouteAuth(cfg); err != nil {
+			return nil, err
+		}
+	}
 	nodeOpts := []nodeutil.NodeOpt{
 		func(c *nodeutil.NodeConfig) error {
 			c.Client = cfg.Client
@@ -157,7 +174,7 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 			// provider — so skip VK's resolution and let the provider own it.
 			c.SkipDownwardAPIResolution = true
 			if routes {
-				c.Handler = api.InstrumentHandler(nodeutil.WithAuth(nodeutil.NoAuth(), mux))
+				c.Handler = api.InstrumentHandler(cfg.AuthorizeHandler(mux))
 			}
 			return nil
 		},
@@ -188,3 +205,29 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 // is never exposed on the plain-HTTP (M0) path. This is the invariant the security
 // regression test pins; keep NewNode's two wiring branches routed through it.
 func providerRoutesEnabled(cfg NodeConfig) bool { return cfg.TLSConfig != nil }
+
+// validateProviderRouteAuth is the fail-closed structural gate on the kubelet
+// endpoint's authentication: when the provider routes are served, the listener
+// must demand a verified client certificate AND an authorization predicate must
+// be wrapped around them. A NodeConfig that satisfies neither is a construction
+// ERROR, not a degraded mode.
+//
+// It is stated here, in the one constructor, rather than trusted to each caller,
+// because the pre-B176 posture — nodeutil.NoAuth() over a tls.NoClientCert
+// listener — was reachable by simply not thinking about it: every field involved
+// had a usable zero value. Requiring the three facts together means a regression
+// on ANY of them (an authorizer dropped, ClientAuth relaxed back to NoClientCert
+// or RequestClientCert, a nil CA pool) refuses to start the node instead of
+// quietly re-opening exec to the LAN.
+func validateProviderRouteAuth(cfg NodeConfig) error {
+	if cfg.AuthorizeHandler == nil {
+		return errors.New("vkadapter: NodeConfig.AuthorizeHandler is required when TLSConfig is set (the kubelet provider routes — logs/exec/attach/port-forward — are never served unauthorized)")
+	}
+	if cfg.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert {
+		return fmt.Errorf("vkadapter: NodeConfig.TLSConfig.ClientAuth is %v, want tls.RequireAndVerifyClientCert (the kubelet endpoint authenticates the apiserver by client certificate)", cfg.TLSConfig.ClientAuth)
+	}
+	if cfg.TLSConfig.ClientCAs == nil {
+		return errors.New("vkadapter: NodeConfig.TLSConfig.ClientCAs is nil, so no client certificate could verify (the kubelet endpoint anchors on the cluster's client-identity CA)")
+	}
+	return nil
+}

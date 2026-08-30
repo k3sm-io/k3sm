@@ -91,6 +91,15 @@ type JoinResponse struct {
 	// ClusterCAPEM is the cluster CA the node embeds in its kubeconfig's
 	// certificate-authority-data to verify the apiserver going forward.
 	ClusterCAPEM string `json:"clusterCAPEM"`
+	// ClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA) — the same CA
+	// that issued NodeClientCertPEM below. The node needs the CERTIFICATE (never the
+	// key, which stays on the server) to run its own kubelet endpoint: :10250
+	// requires and verifies the apiserver's client cert against this anchor (B176).
+	//
+	// A CA certificate is public material — it is world-readable 0644 on the server
+	// and already implicitly trusted by this node, whose own identity chains to it —
+	// so shipping it here distributes no secret and adds no trust root.
+	ClientCAPEM string `json:"clientCAPEM,omitempty"`
 	// NodeClientCertPEM is the issued CN=system:node:<name>, O=system:nodes client
 	// cert (the node pairs it with the private key it kept).
 	NodeClientCertPEM string `json:"nodeClientCertPEM"`

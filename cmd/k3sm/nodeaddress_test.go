@@ -17,15 +17,34 @@ limitations under the License.
 package main
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"net"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/provider"
 )
+
+// testKubeletAuth builds the kubelet endpoint's auth posture from a throwaway CA,
+// so the address/SAN assertions here exercise the REAL kubeletServingTLS signature
+// (which has no shape that omits client authentication — B176) without needing a
+// provisioned work dir.
+func testKubeletAuth(t *testing.T) *provider.KubeletEndpointAuth {
+	t.Helper()
+	ca, err := certs.NewCA("k3sm-test-signing-ca")
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+	auth, err := provider.NewKubeletEndpointAuth(ca.CertPEM, nil)
+	if err != nil {
+		t.Fatalf("NewKubeletEndpointAuth: %v", err)
+	}
+	return auth
+}
 
 // upstreamProxyable is the apiserver node-proxy predicate, restated from
 // kubernetes v1.36.2 pkg/registry/core/node/strategy.go:275-291
@@ -195,9 +214,16 @@ func TestNodeAddressProxyable(t *testing.T) {
 		}
 		opts.nodeIP = advertisedNodeIP(opts)
 		internalIP := proxyableNodeIP(opts)
-		cfg, err := kubeletServingTLS(opts.nodeName, opts.nodeIP, internalIP)
+		cfg, err := kubeletServingTLS(testKubeletAuth(t), opts.nodeName, opts.nodeIP, internalIP)
 		if err != nil {
 			t.Fatalf("kubeletServingTLS: %v", err)
+		}
+		// B176: the serving half never ships without the client half.
+		if cfg.ClientAuth != tls.RequireAndVerifyClientCert {
+			t.Errorf("kubeletServingTLS ClientAuth = %v, want tls.RequireAndVerifyClientCert", cfg.ClientAuth)
+		}
+		if cfg.ClientCAs == nil {
+			t.Error("kubeletServingTLS returned a nil ClientCAs pool: no client certificate could verify")
 		}
 		if len(cfg.Certificates) == 0 || len(cfg.Certificates[0].Certificate) == 0 {
 			t.Fatalf("kubeletServingTLS returned no certificate")
