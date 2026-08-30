@@ -3,6 +3,8 @@ This is NOT kind — k3sm is deliberately non-conformant. Develop against the SA
 
 posture: rootless (network=none) — datapath INERT (rootless): Service traffic needs --datapath.
 isolation: hostprocess — pods run UNCONFINED (no Seatbelt; dev-only, k3sm-execshim helper unavailable).
+pod identity: pods run as YOU (your own uid) — a pod with no securityContext.runAsUser keeps this
+  daemon's identity; the installed cluster runs pods as the unprivileged _k3sm user.
 
 SAFE — faithful, develop freely (real upstream apiserver):
   CRD structural schemas · SSA field-managers · CEL validation · admission registration ·
