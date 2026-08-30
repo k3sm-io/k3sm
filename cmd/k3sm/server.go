@@ -534,26 +534,23 @@ func runServer(args []string) error {
 	// that the apiserver is healthy, and drained BEFORE exec.Stop tears the control
 	// plane down by a defer registered after it, so LIFO runs this one first.
 	//
-	// mlx.Options is left empty: the pinned serving image and port are release
-	// facts this binary does not yet carry, so a model spec supplies them itself
-	// and one that does not gets an InvalidSpec status naming what is missing —
-	// rather than a StatefulSet built around an invented image.
+	// The GPU source is LIVE on this path (B195). The pre-render fit check reads
+	// the node-local runtime's GPU facts, and this process is about to bring up
+	// that node in-process — so the source is created here, wired into the
+	// operator now, and ATTACHED to the node's runtime at step 5 bring-up
+	// (nodeOptions.attachRuntimeInfo below). It is the same GetRuntimeInfo the
+	// node's capability probe reads, off the same runtime; no second connection.
 	//
-	// No GPU source is wired. The pre-render fit check reads the node-local
-	// runtime daemon's GPU facts, and that connection belongs to the node path,
-	// not to this one; a nil source SKIPS the fit check, which leaves the render's
-	// own GPU extended-resource request as what keeps a model off a GPU-less node.
+	// Until that attach lands — and forever, on a posture with no runtimed at all
+	// (--runtime hostprocess) — the source reports unknown, which SKIPS the fit
+	// check with a logged warning exactly as a nil source did. A wiring fault
+	// degrades; it never refuses a model and never crashes the reconcile.
+	mlxGPU := operator.NewRuntimeGPU(logger)
 	if dynClient, err := dynamic.NewForConfig(restCfg); err != nil {
 		logger.Error("build dynamic client for the mlx operator", "err", err)
 	} else if crdClient, err := apiextensionsclient.NewForConfig(restCfg); err != nil {
 		logger.Error("build apiextensions client for the mlx operator", "err", err)
-	} else if mlxOp, err := operator.New(operator.Config{
-		Client:        cs,
-		Dynamic:       dynClient,
-		CRD:           crdClient,
-		ClusterDomain: opts.domain,
-		Log:           logger,
-	}); err != nil {
+	} else if mlxOp, err := operator.New(mlxOperatorConfig(cs, dynClient, crdClient, mlxGPU, opts.domain, logger)); err != nil {
 		logger.Error("build the mlx operator", "err", err)
 	} else {
 		mlxCtx, mlxCancel := context.WithCancel(ctx)
@@ -604,6 +601,12 @@ func runServer(args []string) error {
 		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
 
 		kubeletClientCAPEM: kubeletClientCA, // B176: :10250 requires the apiserver's client cert
+
+		// Close the loop opened at step 4c-bis: the node publishes its in-process
+		// runtime here, and the MLX operator's fit check starts reading live GPU
+		// facts off it. A hostprocess node never calls it, leaving the fit check
+		// skipped — the honest answer where there is no runtimed to ask.
+		attachRuntimeInfo: mlxGPU.Attach,
 	}
 
 	// 4d/4e. M10.3 — ingress hosting + svclb, beside the netserve datapath
