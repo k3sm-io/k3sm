@@ -131,7 +131,7 @@ func TestNodeArchLabelTruthful(t *testing.T) {
 			// Pre-seed a WRONG value so each leg proves a real write, not an omission.
 			n.Labels = map[string]string{"kubernetes.io/arch": "riscv64"}
 			n.Status.NodeInfo.Architecture = "riscv64"
-			configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
+			configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{})
 
 			if got := n.Labels["kubernetes.io/arch"]; got != tc.want {
 				t.Errorf("%s: kubernetes.io/arch = %q, want %q", tc.name, got, tc.want)
@@ -178,7 +178,7 @@ func TestNodeArchLabelTruthful(t *testing.T) {
 	t.Run("probe_failure_falls_back", func(t *testing.T) {
 		withHostArchFacts(t, hostArchFacts{}, errors.New("sysctl hw.machine: boom"))
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
+		configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{})
 		if got := n.Labels["kubernetes.io/arch"]; got != defaultNodeArch {
 			t.Errorf("probe error: kubernetes.io/arch = %q, want the %q fallback", got, defaultNodeArch)
 		}
@@ -192,7 +192,7 @@ func TestNodeArchLabelTruthful(t *testing.T) {
 	t.Run("unrecognized_host_falls_back", func(t *testing.T) {
 		withHostArchFacts(t, hostArchFacts{machine: "sparc"}, nil)
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
+		configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{})
 		if got := n.Labels["kubernetes.io/arch"]; got != defaultNodeArch {
 			t.Errorf("unrecognized machine: kubernetes.io/arch = %q, want the %q fallback", got, defaultNodeArch)
 		}
@@ -205,7 +205,7 @@ func TestNodeArchLabelTruthful(t *testing.T) {
 	t.Run("rosetta_capability_never_widens_arch", func(t *testing.T) {
 		withHostArchFacts(t, nativeAppleSilicon, nil)
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{
+		configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{
 			RosettaHost: true, VMBackend: true, RosettaGuest: true,
 		})
 		if got := n.Labels["kubernetes.io/arch"]; got != "arm64" {

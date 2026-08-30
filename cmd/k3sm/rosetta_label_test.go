@@ -196,7 +196,7 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 				runtimeclass.LabelRosetta:      runtimeclass.LabelTrue,
 				runtimeclass.LabelRosettaLinux: runtimeclass.LabelTrue,
 			}
-			configureNode(n, "k3sm-node", "10.0.0.1", tc.caps)
+			configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, tc.caps)
 			if tc.wantHost {
 				wantTrue(t, n, runtimeclass.LabelRosetta)
 			} else {
@@ -227,13 +227,13 @@ func TestRosettaLabelDeleteOnLoss(t *testing.T) {
 	// label from caps.VMBackend.
 	t.Run("configureNode_preserves_vm_label", func(t *testing.T) {
 		n := &corev1.Node{}
-		configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{VMBackend: true})
+		configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{VMBackend: true})
 		wantTrue(t, n, runtimeclass.LabelVirtualization)
 
 		// And the loss direction of B1's label still deletes (pre-seeded).
 		lost := &corev1.Node{}
 		lost.Labels = map[string]string{runtimeclass.LabelVirtualization: runtimeclass.LabelTrue}
-		configureNode(lost, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{})
+		configureNode(lost, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{})
 		wantAbsent(t, lost, runtimeclass.LabelVirtualization)
 	})
 }

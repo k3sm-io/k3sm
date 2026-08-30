@@ -171,6 +171,32 @@ var (
 // port.
 func serverKubeletListenOn(port int) string { return ":" + strconv.Itoa(port) }
 
+// kubeletEndpointPort is the INVERSE of serverKubeletListenOn: the port number the
+// node advertises in .status.daemonEndpoints.kubeletEndpoint, read back off the very
+// address its kubelet HTTP API listener binds. That endpoint is what the apiserver
+// node-proxy dials for `kubectl logs`/`exec`/`top node`, so advertising anything but
+// the bound port hands every client a connection refusal — which is precisely what a
+// per-instance allocation (`k3sm server --kubelet-port`, and the `k3sm dev` port
+// window that drives it) produced while this was the fixed ports.KubeletAPIPort
+// constant: the node came up healthy on its own port and its diagnostics endpoints
+// were unreachable.
+//
+// An unparseable or out-of-range value falls back to the shared default rather than
+// advertising 0, which no client can dial at all: the fallback is only ever reached
+// by a listen address the process would also have failed to bind, so it degrades to
+// the historical answer instead of publishing a nonsense one.
+func kubeletEndpointPort(listen string) int32 {
+	_, portStr, err := net.SplitHostPort(listen)
+	if err != nil {
+		return int32(ports.KubeletAPIPort)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return int32(ports.KubeletAPIPort)
+	}
+	return int32(port)
+}
+
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
 // selected runtime (M0 walking skeleton + M1 runtimed image runtime).
 func runNode(args []string) error {
@@ -665,7 +691,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		NumWorkers:       4,
 		TLSConfig:        servingTLS,       // nil = plain HTTP (M0 path); set = kubelet-serving TLS + required client cert
 		AuthorizeHandler: authorizeKubelet, // nil iff TLSConfig is nil — the adapter enforces the pairing
-		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, caps) },
+		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
 		// into Ready. It receives the node AFTER configureNode stamped it, and
@@ -1209,7 +1235,13 @@ func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1
 // caps is the ONE fail-closed capability snapshot buildProvider probed from runtimed;
 // its zero value advertises nothing — including its GPU facts, which additionally
 // drive the mlx.k3sm.io/gpu extended resource on Capacity/Allocatable.
-func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabilities) {
+//
+// listen is the SAME kubelet HTTP API listen address handed to the VK adapter, not a
+// second copy of the port: the advertised daemon endpoint is derived from it here
+// (kubeletEndpointPort) so the node cannot name a port its listener does not answer
+// on. Passing the address rather than a pre-extracted port is deliberate — one
+// derivation, at the one place both facts are in scope.
+func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCapabilities) {
 	labels := nodeLabels(n)
 	labels["kubernetes.io/os"] = "darwin"
 	// The reported architecture is DERIVED from host facts through the readHostArchFacts
@@ -1299,7 +1331,10 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 		{Type: corev1.NodeInternalIP, Address: ip},
 		{Type: corev1.NodeHostName, Address: name},
 	}
-	n.Status.DaemonEndpoints.KubeletEndpoint.Port = ports.KubeletAPIPort
+	// The ADVERTISED kubelet endpoint is derived from the address the listener
+	// actually binds — never the fixed default — so a per-instance allocation
+	// (`--kubelet-port`) stays dialable by the apiserver node-proxy.
+	n.Status.DaemonEndpoints.KubeletEndpoint.Port = kubeletEndpointPort(listen)
 
 	// Provider taint: the load-bearing placement guard. Only pods that tolerate
 	// k3sm.io/provider:NoSchedule (the darwin workloads the server provisions a

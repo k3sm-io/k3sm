@@ -80,7 +80,7 @@ func registeredInternalIP(t *testing.T, opts nodeOptions) string {
 	// proxyable substitution. Keep them in this order — see advertisedNodeIP.
 	opts.nodeIP = advertisedNodeIP(opts)
 	n := &corev1.Node{}
-	configureNode(n, opts.nodeName, proxyableNodeIP(opts), provider.NodeCapabilities{})
+	configureNode(n, opts.nodeName, proxyableNodeIP(opts), opts.listen, provider.NodeCapabilities{})
 	for _, a := range n.Status.Addresses {
 		if a.Type == corev1.NodeInternalIP {
 			return a.Address
