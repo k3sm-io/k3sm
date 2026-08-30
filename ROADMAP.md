@@ -9,14 +9,18 @@ the default path**, isolated with macOS's own primitives (Seatbelt, `lo0`/vmnet,
 launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS).
 
 This is a k3s-style three-horizon roadmap. Honesty is a feature: where a capability is
-code-complete but not yet proven on real hardware, this page says so. The forthcoming
-`docs/user/limitations.md` (landing in M7) is the canonical honest-tradeoffs page.
+code-complete but not yet proven on real hardware, this page says so. The canonical
+honest-tradeoffs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
+the docs today.
 
 ## Shipped
 
 The engine. Milestones **M0–M6 and M10** are code-complete and workspace-integration-green
-(`hack/ci.sh`); M0/M1 are validated end-to-end by their acceptance gates, and the remaining
-live-hardware and two-Mac gates are burned down in M7. What works:
+(`hack/ci.sh`). **M0, M1 and M2 are validated end to end on Apple-Silicon hardware** — M2's gate is
+the strongest evidence so far: run against a real root install on macOS 26.5, all **13 required
+conformance criteria passed**, together with the full install/uninstall lifecycle checks. That is
+the first live-hardware proof of the packaged single-node path. The remaining live-hardware and
+two-Mac gates are burned down in M7. What works:
 
 - **Native Darwin-process pods, zero Linux.** OCI images ship an arm64 Mach-O payload (never
   `/System`); the runtime `posix_spawn`s them **in place at host paths** — no chroot, SIP-compatible.
@@ -43,8 +47,9 @@ live-hardware and two-Mac gates are burned down in M7. What works:
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
   logging, node lifecycle Events. Proven by k3sm's own synthetic-conformance criteria — **not** a
-  CNCF `[Conformance]` pass (k3sm has no Linux containers); the honest register lives at
-  `docs/UPSTREAM-ALIGNMENT.md`, the self-assessment at `docs/conformance-profile.md`.
+  CNCF `[Conformance]` pass (k3sm has no Linux containers). The honest self-assessment —
+  targeted feature classes mapped to a green criterion or a documented ceiling — is
+  [`docs/conformance-profile.md`](docs/conformance-profile.md).
 
 ## Next — v0.1.0 (the public release, with MLX)
 
@@ -54,8 +59,8 @@ The first public release. Two tracks, both launch-blocking:
   `curl -fsSL https://k3sm.io/install.sh | sh` — a checksum-verified release tarball handed to
   `sudo k3sm install` (works from the first tagged release; a curl download carries no quarantine
   xattr); *(2)* `brew install k3sm-io/tap/k3sm`; *(3)* a signed, notarized `.pkg`. Underneath:
-  goreleaser, GitHub Actions CI across all repos, user docs (`docs/user/`, including
-  `limitations.md`), and the website.
+  goreleaser, GitHub Actions CI across all repos, [user docs](docs/user/) (which ship today —
+  they are not gated on the release), and the website.
 - **MLX — the differentiator.** Native Apple-Silicon ML serving: schedule and serve ML models on
   Apple GPUs / unified memory with first-class Kubernetes semantics. An **`MLXModel` CRD**
   (`mlx.k3sm.io/v1alpha1`) + an `mlx.k3sm.io/gpu` **extended resource** + an in-binary operator that
@@ -86,8 +91,7 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   with **published performance figures** (VM boot latency = restart cost, the Rosetta non-TSO
   ratio, virtiofs I/O vs native APFS), the branding removed, and the remaining ceilings either
   closed or documented (per-pod network segmentation between micro-VMs, host-path sharing).
-  Plus darwin/amd64 pod payloads under host Rosetta on the native path. Engineering plan:
-  `docs/m11-plan.md` (workspace).
+  Plus darwin/amd64 pod payloads under host Rosetta on the native path.
 - **A built-in image build engine** — `k3sm build` grows full Dockerfile support (`RUN` included)
   by managing a BuildKit builder inside a `vm`-RuntimeClass micro-VM (linux/arm64 natively,
   linux/amd64 via Rosetta) behind a bundled buildx front-end — install only k3sm, build and run
@@ -95,7 +99,6 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   live plus the signed vmhost and kernel artifacts that ship with it, then its own lab
   validation). Kubelet-faithful registry semantics on the native path (imagePullPolicy,
   pull-failure backoff, multi-arch selection, offline warm-cache starts) land alongside.
-  Engineering plan: `docs/m12-plan.md` (workspace).
 - **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA** — Dynamic Resource Allocation for GPUs, once extended resources have shipped.
