@@ -80,6 +80,12 @@ var (
 	ErrNotEstablished = errors.New("crd did not become established")
 )
 
+// CRDClient is the API-server access an Ensure needs: the apiextensions
+// clientset. It is an alias rather than a fresh interface so that a caller can
+// pass its real clientset unchanged, while still naming the dependency in its own
+// configuration without importing the generated clientset package itself.
+type CRDClient = apiextensionsclient.Interface
+
 // Options tunes one Ensure call. The zero value is usable and means the bare
 // "k3sm" field manager with the default timings.
 type Options struct {
@@ -126,7 +132,7 @@ func (o Options) withDefaults() Options {
 // It returns the established CRD as the API server stored it, so a caller that
 // wants to log the served version or read back a condition does not need a
 // second round trip.
-func Ensure(ctx context.Context, c apiextensionsclient.Interface, manifest []byte, opts Options) (*apiextensionsv1.CustomResourceDefinition, error) {
+func Ensure(ctx context.Context, c CRDClient, manifest []byte, opts Options) (*apiextensionsv1.CustomResourceDefinition, error) {
 	opts = opts.withDefaults()
 
 	name, body, err := decode(manifest)
@@ -186,7 +192,7 @@ func decode(manifest []byte) (name string, body []byte, err error) {
 // NamesAccepted=False short-circuits the wait: a group/plural already owned by
 // another CRD is a conflict that cannot resolve on its own, and burning the whole
 // timeout on it turns a legible error into a slow, generic one.
-func waitEstablished(ctx context.Context, c apiextensionsclient.Interface, name string, opts Options) (*apiextensionsv1.CustomResourceDefinition, error) {
+func waitEstablished(ctx context.Context, c CRDClient, name string, opts Options) (*apiextensionsv1.CustomResourceDefinition, error) {
 	var (
 		last   *apiextensionsv1.CustomResourceDefinition
 		fatal  error
