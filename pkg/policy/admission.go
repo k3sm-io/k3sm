@@ -292,7 +292,7 @@ func egressAnnotationExpr(annotationKey string) string {
 // rendered StatefulSet's pod template — not typed in by hand.
 //
 // This is advisory ONLY — never Deny, and FailurePolicy is Ignore (load-bearing:
-// per m8-plan open-Q 1, this guard must never take the cluster down). The
+// by design this guard must never take the cluster down). The
 // annotation is not a security boundary either way: its own doc comment already
 // says enforcement stops at the SandboxProfile field today (no per-IP scoping at
 // the Seatbelt layer), so the message says what the annotation DOES and that
