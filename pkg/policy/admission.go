@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -85,6 +86,38 @@ const (
 const (
 	reservedLBPortPolicyName  = "k3sm-reject-loadbalancer-reserved-port"
 	reservedLBPortBindingName = "k3sm-reject-loadbalancer-reserved-port-binding"
+)
+
+// egressAnnotationPolicyName / egressAnnotationBindingName name the Warn policy
+// (B91) that surfaces a pod carrying a hand-set runtimev1.AnnotationInternetEgress
+// annotation that is not stamped by an operator controller.
+const (
+	egressAnnotationPolicyName  = "k3sm-warn-pod-hand-set-internet-egress"
+	egressAnnotationBindingName = "k3sm-warn-pod-hand-set-internet-egress-binding"
+)
+
+// operatorManagedByLabelKey / operatorManagedByLabelValue are the discriminator
+// the egress-annotation Warn policy uses to tell an operator-stamped pod from a
+// hand-edited one. They mirror the "app.kubernetes.io/managed-by": "k3sm" entry
+// pkg/mlx.Render's Labels helper stamps onto every object it renders for an
+// MLXModel — including, via the rendered StatefulSet's pod template, every Pod
+// the StatefulSet controller creates.
+//
+// RESTATED here rather than imported: pkg/mlx already imports THIS package (for
+// ProviderTaintKey, in its DaemonSet-guardrail nodeSelector build), so importing
+// pkg/mlx from here would close an import cycle. If pkg/mlx.Render.Labels ever
+// changes this key or value, move this pair with it.
+//
+// An MLXModel controller ownerReference was considered as the discriminator
+// instead and rejected: the ownerReference an actually-created Pod carries names
+// its IMMEDIATE controller, which for a StatefulSet-managed pod is the
+// StatefulSet itself (kind: StatefulSet) — never the MLXModel two levels up. A
+// CEL check for `o.kind == 'MLXModel'` in a Pod's ownerReferences would never
+// match a real pod, so it is not a usable per-Pod signal at admission time; the
+// propagated label is.
+const (
+	operatorManagedByLabelKey   = "app.kubernetes.io/managed-by"
+	operatorManagedByLabelValue = "k3sm"
 )
 
 // etpLocalExpr admits (evaluates true) UNLESS a Service sets
@@ -228,6 +261,56 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 		return fmt.Errorf("reserved-loadbalancer-port admission binding: %w", err)
 	}
 	return nil
+}
+
+// egressAnnotationExpr admits (evaluates true) UNLESS a pod carries annotationKey
+// (runtimev1.AnnotationInternetEgress, interpolated by the caller — never a
+// literal here) AND is NOT operator-managed. "Operator-managed" is the
+// operatorManagedByLabelKey/Value discriminator (see its doc comment for why a
+// label, not an ownerReference, is the usable per-Pod signal).
+//
+// As with darwinSelectorExpr above, the CEL field-escaping rules
+// (has(object.foo)) apply only to dot PROPERTY access; both annotationKey and
+// operatorManagedByLabelKey contain '.'/'/' and so are used as string-literal
+// map keys via the `in` operator and map indexing, never as a has() path.
+func egressAnnotationExpr(annotationKey string) string {
+	return fmt.Sprintf(
+		"!has(object.metadata.annotations) || !('%[1]s' in object.metadata.annotations) || "+
+			"(has(object.metadata.labels) && '%[2]s' in object.metadata.labels && "+
+			"object.metadata.labels['%[2]s'] == '%[3]s')",
+		annotationKey, operatorManagedByLabelKey, operatorManagedByLabelValue)
+}
+
+// EnsureEgressAnnotationWarn idempotently provisions a Warn-action
+// ValidatingAdmissionPolicy on Pod CREATE that surfaces a pod carrying a HAND-SET
+// runtimev1.AnnotationInternetEgress annotation — one present on the pod WITHOUT
+// the operatorManagedByLabelKey/Value discriminator pkg/mlx.Render stamps. The
+// annotation is operator-facing plumbing (see its doc comment in
+// apis/runtime/v1/labels.go): the k3sm provider reads it at admission and sets
+// SandboxProfile.allow_internet_egress from it, and it is meant to be stamped by
+// a controller acting on the pod's behalf — today, pkg/mlx.Render, via the
+// rendered StatefulSet's pod template — not typed in by hand.
+//
+// This is advisory ONLY — never Deny, and FailurePolicy is Ignore (load-bearing:
+// per m8-plan open-Q 1, this guard must never take the cluster down). The
+// annotation is not a security boundary either way: its own doc comment already
+// says enforcement stops at the SandboxProfile field today (no per-IP scoping at
+// the Seatbelt layer), so the message says what the annotation DOES and that
+// hand-setting it is discouraged plumbing — not a claim that the annotation
+// itself is a boundary being bypassed.
+//
+// CREATE ONLY: matching UPDATE too would re-fire on every unrelated pod status
+// patch — the same reasoning as EnsureProviderTolerationWarn's CREATE-only scope.
+// Safe to call on every server start (create-or-update; an unchanged spec is not
+// rewritten).
+func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) error {
+	msg := fmt.Sprintf("k3sm: pod carries a hand-set %s annotation, which opts its sandbox into "+
+		"SandboxProfile.allow_internet_egress (reaching networks beyond the cluster; enforcement stops "+
+		"at admission today, not at the network layer). It is meant to be stamped by a controller acting "+
+		"on the pod's behalf, not set by hand — hand-setting it still works, but is discouraged plumbing.",
+		runtimev1.AnnotationInternetEgress)
+	return ensureWarnPolicy(ctx, cs, egressAnnotationPolicyName, egressAnnotationBindingName,
+		egressAnnotationExpr(runtimev1.AnnotationInternetEgress), msg, "pods", admissionregistrationv1.Create)
 }
 
 // darwinSelectorExpr is the CEL the policy enforces on Pod CREATE: the pod must
