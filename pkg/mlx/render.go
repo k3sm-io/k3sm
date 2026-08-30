@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -87,6 +89,27 @@ var (
 	// run, and silently ignoring the caller would look like the selector took
 	// effect.
 	ErrGuardrailConflict = errors.New("spec.nodeSelector conflicts with a fixed guardrail selector")
+	// ErrQuantizationUnsupported is returned when spec.quantization is set. The
+	// measured engine surface has NO expression for it (see sizing.go), so the
+	// render can neither honour the field nor pass it on. Refusing is the same
+	// call the CRD already makes for spec.distributed: a field the operator set
+	// and the stack cannot honour is rejected with a legible reason rather than
+	// silently ignored, because a silently-ignored quantization request serves
+	// whatever variant the repository happens to hold and looks like success.
+	ErrQuantizationUnsupported = errors.New("spec.quantization has no expression on the serving engine; name the quantized repository in spec.model instead")
+	// ErrRevisionNeedsCache is returned when spec.revision is set without
+	// spec.cache. The engine takes no revision option, so a pin is expressed as
+	// the snapshot path under the HF_HOME this render sets — and the render sets
+	// HF_HOME only when there is a cache volume to point it at. Without one the
+	// pin cannot be expressed at all, and serving the mutable default branch
+	// under a spec that named an exact revision is the silent-drop this package
+	// refuses to do.
+	ErrRevisionNeedsCache = errors.New("spec.revision requires spec.cache: the pin is expressed as a path inside the cache volume")
+	// ErrInvalidRevision is returned for a revision that is not a single path
+	// segment. The revision becomes a directory name in the rendered argv, so a
+	// value carrying a separator or a parent reference would name a directory
+	// outside the model's own snapshot tree.
+	ErrInvalidRevision = errors.New("spec.revision must be a single path segment")
 )
 
 // Fixed rendering constants. Each is the render's side of a contract with
@@ -141,6 +164,23 @@ const (
 	// root, so the volume can hold other state later without colliding with the
 	// hub's own layout.
 	hfHomePath = CacheMountPath + "/huggingface"
+
+	// hubDir is the hub cache directory the Hugging Face client keeps under
+	// HF_HOME. It is part of that client's on-disk layout, not a k3sm choice, and
+	// it is named here because a pinned revision is rendered as a path INTO it.
+	hubDir = "hub"
+
+	// repoFolderPrefix is how the hub cache names a model repository's directory:
+	// the repo type, then the repository reference with every slash doubled into
+	// a dash (mlx-community/Qwen3-0.6B-4bit -> models--mlx-community--Qwen3-0.6B-4bit).
+	repoFolderPrefix = "models--"
+
+	// snapshotsDir holds one directory per resolved revision, named by the
+	// revision itself. It is the ONLY offline-resolvable entry point: a cache
+	// staged by a plain `hf download <repo> --revision <sha>` carries
+	// snapshots/<sha> and no refs/ entry, so resolving a branch name offline
+	// fails while the snapshot path loads.
+	snapshotsDir = "snapshots"
 
 	// healthPath is the readiness endpoint. It is part of the serving image's
 	// OpenAI-compatible surface, which is the only thing this render assumes
@@ -286,6 +326,17 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 		return nil, renderErr(m, ErrInvalidCacheSize)
 	}
 
+	// What the engine is actually pointed at. It is resolved BEFORE anything is
+	// rendered because a spec whose pin cannot be expressed on the measured
+	// engine surface has no StatefulSet worth applying — see modelReference.
+	if m.Spec.Quantization != "" {
+		return nil, renderErr(m, fmt.Errorf("%w: spec.quantization=%q", ErrQuantizationUnsupported, m.Spec.Quantization))
+	}
+	modelRef, err := modelReference(m.Spec)
+	if err != nil {
+		return nil, renderErr(m, err)
+	}
+
 	nodeSelector, err := podNodeSelector(m.Spec.NodeSelector)
 	if err != nil {
 		return nil, renderErr(m, err)
@@ -302,7 +353,7 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 
 	owner := ownerReference(m)
 	return &Objects{
-		StatefulSet:      statefulSet(m, owner, image, port, replicas, nodeSelector, sizing),
+		StatefulSet:      statefulSet(m, owner, image, modelRef, port, replicas, nodeSelector, sizing),
 		HeadlessService:  headlessService(m, owner, port),
 		ClusterIPService: clusterIPService(m, owner, port),
 	}, nil
@@ -386,38 +437,87 @@ func podResources(memory resource.Quantity) corev1.ResourceRequirements {
 	}
 }
 
-// engineArgs builds the serving container's argument vector in three blocks:
-// what to serve and where to listen; the memory-derived sizing pins and the
-// required --continuous-batching flag (see sizing.go); then the caller's own
+// modelReference resolves what the engine is pointed at — the ONE positional the
+// measured serving surface takes (sizing.go carries the surface table).
+//
+// UNPINNED (spec.revision empty): the repository reference verbatim. The engine
+// resolves it through the hub and downloads the default branch, which is what
+// "unpinned" means.
+//
+// PINNED: the deterministic snapshot path inside the cache volume,
+//
+//	<HF_HOME>/hub/models--<repo with / doubled to -->/snapshots/<revision>
+//
+// because this engine HAS NO --revision option and there is no environment
+// variable that supplies one. A path is the only expression of the pin left, and
+// it is exact: the hub's own cache layout puts the resolved revision there, so a
+// cache staged with `hf download <repo> --revision <sha>` already holds it.
+// Resolving the repository reference OFFLINE would need refs/<branch>, which a
+// revision-staged cache does not write — measured on the rig, and the reason the
+// pinned form is a path rather than a reference plus an offline flag.
+//
+// TWO CONSEQUENCES, both stated rather than discovered later:
+//
+//   - A pin needs a cache volume (ErrRevisionNeedsCache). Without one this render
+//     sets no HF_HOME, so it does not know the path it would have to name.
+//   - A pin does NOT self-populate. The path is loaded, not fetched: on a cache
+//     that has never held this revision the engine finds no such directory and —
+//     by inference from the reference implementation's resolution order, not from
+//     a measurement — falls back to treating the path as a repository id, which
+//     it is not, and fails loudly at start. Pin the revision AND stage the
+//     weights (hack/acceptance/m8.sh does), or leave the revision empty and let
+//     the engine download. Loud is the deliberate half of this: the alternative
+//     shape, silently serving the default branch, is unnoticeable.
+func modelReference(spec mlxv1alpha1.MLXModelSpec) (string, error) {
+	if spec.Revision == "" {
+		return spec.Model, nil
+	}
+	// A single clean path segment, checked with path.Base rather than by hunting
+	// for separators: anything that is not its own basename (refs/pr/1, a/, ..)
+	// would name a directory outside this model's snapshot tree.
+	if spec.Revision != path.Base(spec.Revision) || spec.Revision == "." || spec.Revision == ".." {
+		return "", fmt.Errorf("%w: %q", ErrInvalidRevision, spec.Revision)
+	}
+	if spec.Cache == nil {
+		return "", ErrRevisionNeedsCache
+	}
+	folder := repoFolderPrefix + strings.ReplaceAll(spec.Model, "/", "--")
+	return path.Join(hfHomePath, hubDir, folder, snapshotsDir, spec.Revision), nil
+}
+
+// engineArgs builds the serving container's argument vector in three blocks: the
+// model POSITIONAL and the port to listen on; the memory-derived sizing pins and
+// the required --continuous-batching flag (see sizing.go); then the caller's own
 // arguments LAST so an operator can override any of it without this package
 // growing a flag per knob.
+//
+// The model leads. It is a positional on this engine, so it may sit anywhere,
+// but rendering it first keeps it the first token after the image ENTRYPOINT's
+// own flags — where a human reading `ps` or a pod spec expects to find what is
+// being served.
 //
 // The order of the last two blocks is the override seam and is not cosmetic:
 // argparse takes the final occurrence of a repeated option, so caller args after
 // the pins can raise a context this formula sized conservatively — and a caller
 // who does that owns the consequence, which is why the pins are what ships by
-// default.
-func engineArgs(spec mlxv1alpha1.MLXModelSpec, port int32, sizing Sizing) []string {
+// default. Caller args are NOT checked against the measured surface: an operator
+// running a newer engine must be able to pass an option this package has never
+// heard of.
+func engineArgs(spec mlxv1alpha1.MLXModelSpec, modelRef string, port int32, sizing Sizing) []string {
 	args := []string{
-		"--model", spec.Model,
-		"--port", strconv.FormatInt(int64(port), 10),
-	}
-	if spec.Revision != "" {
-		args = append(args, "--revision", spec.Revision)
-	}
-	if spec.Quantization != "" {
-		args = append(args, "--quantization", spec.Quantization)
+		modelRef,
+		argPort, strconv.FormatInt(int64(port), 10),
 	}
 	args = append(args, sizing.Args()...)
 	return append(args, spec.Runtime.Args...)
 }
 
 // statefulSet renders the serving StatefulSet.
-func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image string, port, replicas int32, nodeSelector map[string]string, sizing Sizing) *appsv1.StatefulSet {
+func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image, modelRef string, port, replicas int32, nodeSelector map[string]string, sizing Sizing) *appsv1.StatefulSet {
 	container := corev1.Container{
 		Name:  containerName,
 		Image: image,
-		Args:  engineArgs(m.Spec, port, sizing),
+		Args:  engineArgs(m.Spec, modelRef, port, sizing),
 		Ports: []corev1.ContainerPort{{
 			Name:          portName,
 			ContainerPort: port,
