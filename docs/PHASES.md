@@ -467,7 +467,7 @@ phases:
       - id: M8.0
         title: spikes S1–S5 — lab Mac, agent-driven (k3sm/hack/spike/m8/)
         status: todo
-        note: "Owner ratified k3sm 2026-08-29 (m8-plan R23; resolves the three-owner split and darwin-net's k3sm:M8.0 edge). ENTRY-INDEPENDENT: precedes the milestone-level depends_on (apis:M8.1 / runtimed:M8.2 bind M8.3+; M8.1 does NOT wait on M8.0 — R23, the illustrative M8.0 → M8.1 DAG edge is non-binding). Runs on the lab rig (Studio, M1 Max 64GB, apple-gpu); each spike commits a findings file under k3sm/hack/spike/m8/; per-spike halt semantics per m8-plan Res. 17. Lab guardrails (binding): writes confined to the dedicated user-level prefix + k3sm scratch trees; never touch /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP posture, or LaunchDaemons outside the prefix; no codesign-check disabling; any allow-set widening beyond a spike's exit criteria is flagged in the findings file, never silently inherited."
+        note: "Owner ratified k3sm 2026-08-29 (m8-plan R23; resolves the three-owner split and darwin-net's k3sm:M8.0 edge). ENTRY-INDEPENDENT: precedes the milestone-level depends_on (apis:M8.1 / runtimed:M8.2 bind M8.3+; M8.1 does NOT wait on M8.0 — R23, the illustrative M8.0 → M8.1 DAG edge is non-binding). Runs on the lab rig (Studio, M1 Ultra 64GB, apple-gpu); each spike commits a findings file under k3sm/hack/spike/m8/; per-spike halt semantics per m8-plan Res. 17. Lab guardrails (binding): writes confined to the dedicated user-level prefix + k3sm scratch trees; never touch /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP posture, or LaunchDaemons outside the prefix; no codesign-check disabling; any allow-set widening beyond a spike's exit criteria is flagged in the findings file, never silently inherited."
         deliverables:
           - id: M8.0-d1  # S1 Metal-under-Seatbelt
             done: false
@@ -1078,7 +1078,7 @@ Ledger stub. **Launch-blocking** (launch
 WITH MLX v1; `m8.sh` joins the launch-gate set — the public flip is M9). **Strategy: hard cut** (a NEW CRD group
 `mlx.k3sm.io/v1alpha1` + reserved-band proto fields default-false). k3sm owns:
 - ⬜ **M8.0** — the five spikes **S1–S5** (`hack/spike/m8/`), **owner k3sm** (ratified 2026-08-29, m8-plan R23 — resolves
-  the three-owner split and darwin-net's `k3sm:M8.0` edge), **agent-run on the lab Mac** (Studio, M1 Max 64GB,
+  the three-owner split and darwin-net's `k3sm:M8.0` edge), **agent-run on the lab Mac** (Studio, M1 Ultra 64GB,
   `apple-gpu`), each spike committing a findings file as its evidence. **Entry-independent** — M8.1 does not wait on
   it; S1's two exit criteria (tokens under default-deny; HF weight download through the production datapath) are the
   **M8 go/no-go**, halting downstream per Res. 17. Standing lab guardrails bind every session (see the ledger note).
