@@ -6,7 +6,11 @@ Mach-O processes, **zero Linux, no VM in the default path** — using macOS's ow
 (Seatbelt, `lo0`/vmnet, wireguard-go, launchd, APFS) instead of Linux's (cgroups, namespaces,
 iptables, systemd, OverlayFS).
 
-> Target install UX (landing in M7): `brew install k3sm-io/tap/k3sm` → `sudo k3sm install server`.
+> Install, once the first release is tagged: `curl -fsSL https://k3sm.io/install.sh | sh`, which
+> downloads, sha256-verifies, and runs `sudo k3sm install` for you. A Homebrew tap
+> (`brew install k3sm-io/tap/k3sm`, then `sudo k3sm install`) and a notarized `.pkg` follow it.
+> **No release is published yet** — neither command works today. See
+> [docs/user/install.md](docs/user/install.md).
 
 ## Repositories (one Go workspace under `k3sm-io/`)
 | Repo | Module | Role (k3s analog) |
