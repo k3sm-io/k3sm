@@ -66,11 +66,10 @@ ENTRYPOINT ["/usr/local/bin/myapp"]
 guesses and never silently drops an instruction, because a dropped instruction produces an image
 that looks built but is not what the recipe described.
 
-> **A built image is not yet runnable on k3sm.** You can load it into this node's image store
-> (below), but an `image: myapp:v1` Pod spec will **not** resolve to it: the step that materializes
-> stored content into a native process tree is still on the roadmap. Today `k3sm build` produces a
-> portable artifact for registries and other tools; to run a workload on k3sm now, use the native
-> conventions above.
+> **A built image runs once it is in the store.** `k3sm build` writes a portable artifact to a
+> path you name and nothing else — it does not touch the node's image store — so an
+> `image: myapp:v1` Pod spec resolves only after you load that artifact (below). The artifact is
+> equally usable with registries and other tools.
 
 ### Deliberate differences from `docker build`
 
@@ -115,10 +114,17 @@ The CLI opens your archive and streams it to the node's runtime daemon, which is
 writer: it re-hashes every byte against the digest it is told to expect and records the reference
 only after that check passes. Nothing is written to the store by the command itself.
 
-**Loaded content is stored, not runnable.** The load succeeds, `k3sm image ls` shows the image, and
-a Pod referencing it still will not start — the step that materializes stored layers into a native
-process tree has not shipped. Load today to stage content (an airgapped node, a pre-seeded cache);
-run workloads with the native conventions above.
+**Loaded content is runnable.** Once the load succeeds and `k3sm image ls` shows the reference, a
+Pod naming that reference runs on the default runtime: the node materializes the stored layers into
+the pod's filesystem, so a command that lives inside the image is there to execute. Loading is
+therefore both a way to stage content (an airgapped node, a pre-seeded cache) and a way to ship a
+workload to a node without a registry.
+
+One caveat, and it is the ordinary Kubernetes one: what a Pod does with a reference is decided by
+its `imagePullPolicy`. `IfNotPresent` and `Never` serve the loaded reference with no registry
+traffic; `Always` — which is what the apiserver defaults a `:latest` tag to — goes to a registry
+regardless of what this node already holds. Tag the images you load with something other than
+`latest`, or set the policy explicitly.
 
 ### Deliberate differences from `docker load`
 
@@ -136,14 +142,14 @@ run workloads with the native conventions above.
 
 Planned, in order (see the [roadmap](../../ROADMAP.md) for positioning):
 
-- **Materializing a stored image** — turning loaded layers into the native process tree a Pod runs,
-  so an `image: myapp:v1` spec resolves to content this node already holds.
 - **Registry images natively** — `image: ghcr.io/org/app:tag` pulled, verified, and run with
   kubelet-faithful semantics (imagePullPolicy, pull-failure backoff, multi-arch selection).
 - **A full build engine** — `k3sm build` with `RUN` support via a managed BuildKit builder inside
   a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed.
 
-Until those land, the native conventions above are the supported way to run a workload.
+Until those land, an image reaches a node the way this page describes: build it (or `docker save`
+it) and load it. The native conventions above remain the shortest path for a binary you already
+have on the host.
 
 ## Next
 
