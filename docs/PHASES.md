@@ -466,27 +466,28 @@ phases:
     subphases:
       - id: M8.0
         title: spikes S1–S5 — lab Mac, agent-driven (k3sm/hack/spike/m8/)
-        status: todo
+        status: done
+        completed: 2026-08-29
         note: "Owner ratified k3sm 2026-08-29 (m8-plan R23; resolves the three-owner split and darwin-net's k3sm:M8.0 edge). ENTRY-INDEPENDENT: precedes the milestone-level depends_on (apis:M8.1 / runtimed:M8.2 bind M8.3+; M8.1 does NOT wait on M8.0 — R23, the illustrative M8.0 → M8.1 DAG edge is non-binding). Runs on the lab rig (Studio, M1 Ultra 64GB, apple-gpu); each spike commits a findings file under k3sm/hack/spike/m8/; per-spike halt semantics per m8-plan Res. 17. Lab guardrails (binding): writes confined to the dedicated user-level prefix + k3sm scratch trees; never touch /Library/Sandbox/Profiles, the TCC/Privacy DB, Gatekeeper/SIP posture, or LaunchDaemons outside the prefix; no codesign-check disabling; any allow-set widening beyond a spike's exit criteria is flagged in the findings file, never silently inherited."
         deliverables:
           - id: M8.0-d1  # S1 Metal-under-Seatbelt
-            done: false
+            done: true  # 2026-08-29, k3sm#164/#168 — S1 GO — two-rule allow-set; criterion 2 SBPL half green, datapath half owed (see a1)
             desc: "STUB (M8.0). s1.sh + findings-s1.md — a full MLX inference round-trip under a default-deny Seatbelt profile. PRIMARY job (m8-plan R22): VALIDATE the Apple-practice prefix-rule allow-set candidate — a single (iokit-registry-entry-class-prefix \"AGXAcceleratorG\")-style rule plus the S1-derived mach-lookup / shader-cache scope — which covers AGX user-client class variation M1→M4 without a per-family table. FALLBACK (adopted only if the prefix rule under- or over-scopes on the lab rig): denial-log-derived per-chip-family data. Evidence in the findings file: raw sandbox denial-log excerpts, the concrete allow-set, and BOTH exit criteria — (1) tokens are generated under the profile, (2) the HF weight download succeeds through the production datapath (DNS shim → Service-proxy dialer → egress) under the generated allow_internet_egress profile. S1's two exit criteria are the M8 go/no-go."
           - id: M8.0-d2  # S2 nested-dylib signing
-            done: false
+            done: true  # 2026-08-29, k3sm#164/#168 — S2 PASS — per-arch verify binding
             desc: "STUB (M8.0). s2.sh + findings-s2.md — walk-verify the mlx-serve rootfs for nested-dylib signing under AMFI. Evidence: the Mach-O count, the signed / unsigned / invalid-signature tally, and the exec-from-clonefile result (whether an ad-hoc-signed tree survives clonefile materialization and executes). Feeds M8.2-d3 (AdHocSignTree) and M8.4-a1's mechanized walk-verify."
           - id: M8.0-d3  # S3 memory visibility & growth
-            done: false
+            done: true  # 2026-08-29, k3sm#164/#168 — S3 PASS — footprint 1:1; sampler-only killer
             desc: "STUB (M8.0). s3.sh + findings-s3.md — memory visibility and growth for an MLX serving process: ri_phys_footprint visibility (does the unified-memory/Metal working set show up), per-token growth, jetsam killer-order under pressure, and a process-group coverage verdict (whether sampling the group covers all engine children). Feeds M8.2-d5's contingency and the M8.5 sizing formula."
           - id: M8.0-d4  # S4 image size & materialize latency
-            done: false
+            done: true  # 2026-08-29, k3sm#164/#168 — S4 PASS both thresholds; symlink premise PASS; found the build-layer media-type defect (fixed)
             desc: "STUB (M8.0). s4.sh + findings-s4.md — mlx-serve image size and materialize latency: unpacked size, cold-start, tree-sign cost, and clonefile cost, each measured against the >2GB / >1min pruning thresholds. ALSO record whether k3sm-build-packaged symlinks (python-build-standalone's) survive the COPY → layer → runtimed-unpack round-trip — the M8.4 packaging premise."
           - id: M8.0-d5  # S5 engine bake-off
-            done: false
+            done: true  # 2026-08-29, k3sm#164/#168 — S5 — engine: vllm-mlx 0.4.1 --continuous-batching; oMLX out on --require-hashes
             desc: "STUB (M8.0). s5.sh + findings-s5.md — engine bake-off: vllm-mlx vs oMLX vs mlx-lm-dev. Evidence: tok/s, OpenAI API fidelity, the /health surface, license, wheel footprint, and process model. OUTPUT: the recorded M8.4 engine decision + the pinned wheel set (the working hypothesis is vllm-mlx; S5 ratifies or replaces it)."
         acceptance:
           - id: M8.0-a1
-            met: false
+            met: false  # lab-ledger carve-out: S1 criterion 1 GREEN + criterion 2's SBPL half GREEN (k3sm#164); the production-datapath half needs the privileged lab slice (rootless dev up is network=none), owned by the M8.6 lab session alongside darwin-net M8.1-a1
             check: "every spike script exits 0 on the lab rig and its findings file is COMMITTED under k3sm/hack/spike/m8/ with the named evidence; S1's two exit criteria (tokens under the default-deny profile; HF weight download through the production datapath) are the M8 go/no-go — a failure HALTS the downstream M8 waves per m8-plan Res. 17."
             method: integration
       - id: M8.3
