@@ -23,9 +23,10 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 11. [Multi-node](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
 12. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
 13. [The `vm` RuntimeClass](vm-runtimeclass.md) — isolation for untrusted workloads, EXPERIMENTAL.
-14. [Limitations](limitations.md) — **the honest gaps** — read this before you rely on k3sm.
-15. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
-16. [FAQ](faq.md) — short answers to the common questions.
+14. [MLX quickstart](mlx-quickstart.md) — serving a model on the Mac's GPU through an OpenAI-compatible endpoint.
+15. [Limitations](limitations.md) — **the honest gaps** — read this before you rely on k3sm.
+16. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
+17. [FAQ](faq.md) — short answers to the common questions.
 
 ## Before you build anything real
 
@@ -34,5 +35,5 @@ several standard behaviors diverge by design. Read [Limitations](limitations.md)
 canonical conformance registers so nothing there is rosier than the truth.
 
 MLX / Apple-GPU workloads are a **separate track** (the `MLXModel` CRD and the
-`mlx.k3sm.io/gpu` extended resource), documented on their own once that track ships. They are not
-covered by these pages.
+`mlx.k3sm.io/gpu` extended resource) with its own page — see
+[MLX quickstart](mlx-quickstart.md). The rest of these pages describe the general workload path.
