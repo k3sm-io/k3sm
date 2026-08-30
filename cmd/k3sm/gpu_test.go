@@ -229,7 +229,7 @@ func TestNodeAdvertisesGPUExtendedResource(t *testing.T) {
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				n := tc.node()
-				configureNode(n, "k3sm-node", "10.0.0.1", provider.NodeCapabilities{GPU: tc.facts})
+				configureNode(n, "k3sm-node", "10.0.0.1", nodeKubeletListen, provider.NodeCapabilities{GPU: tc.facts})
 
 				if !tc.wantAdvertised {
 					wantNothingAdvertised(t, n)

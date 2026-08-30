@@ -184,9 +184,18 @@ require_k3sm() {
 # assert_interpreter_pin fails if uv's manifest no longer maps the pinned key to
 # the pinned artifact. Bumping the interpreter is then a deliberate edit of both
 # constants at the top of this file, never a silent consequence of a uv upgrade.
+#
+# --only-downloads is load-bearing, not a filter for tidiness. The assertion runs
+# AFTER `uv python install`, and by then the default listing has REPLACED the
+# downloadable row for the pinned key with the installed one, whose "url" is null
+# — so without it the assertion reads an empty URL and dies on every cold cache,
+# and the only way to get a build through would be to delete the pin. Restricted
+# to downloads, the manifest row (and its URL) is what is listed on a cold and a
+# warm cache alike, which is exactly the fact being pinned: what uv WOULD fetch
+# for this key.
 assert_interpreter_pin() {
 	local got
-	got="$("$UV" python list --all-versions --output-format json 2>/dev/null |
+	got="$("$UV" python list --all-versions --only-downloads --output-format json 2>/dev/null |
 		python3 -c '
 import json, sys
 key = sys.argv[1]
