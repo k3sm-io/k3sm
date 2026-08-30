@@ -27,7 +27,7 @@ processes rather than a container runtime.
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
 same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads, use the **`vm`
 RuntimeClass** for a real isolation boundary — see [vm-runtimeclass.md](vm-runtimeclass.md). The
-rationale lives in `docs/privilege-model.md`. This is the same framing you will see in
+rationale lives in [privilege-model.md](../privilege-model.md). This is the same framing you will see in
 [limitations.md](limitations.md).
 
 ## Images
@@ -40,9 +40,10 @@ OCI path — registry pull, `k3sm image load`, and running a built image — is 
 
 ## Networking
 
-Pods share the node's `lo0`-based network today; Services are handled by a userspace Service proxy, and
-cluster DNS runs on `:53`. Per-pod IP identity, headless DNS, and general UDP Services are limited or
-planned — see [limitations.md](limitations.md).
+Each Pod gets its own `lo0` address; Services are handled by a userspace Service proxy, and each node
+serves cluster DNS on `:53` — Service A records, headless Services, StatefulSet per-Pod names, SRV and
+PTR. What a Pod resolves depends on its runtime path, and general UDP Services are still deferred —
+see [limitations.md](limitations.md).
 
 ## Storage
 

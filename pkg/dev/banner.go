@@ -59,7 +59,7 @@ func FidelityBanner(datapath, runtime string) string {
 	b.WriteString("  the operator's terminal Ready/Endpoint. (url+host-port webhooks work rootless.)\n\n")
 
 	b.WriteString("UNFAITHFUL — won't reproduce on real k8s regardless of tier (documented ceilings):\n")
-	b.WriteString("  no SRV/PTR/headless DNS (A-only resolver) · NetworkPolicy is a hint, not isolation ·\n")
+	b.WriteString("  cluster DNS on the default runtime path (vm/hostprocess pods use the host resolver) · NetworkPolicy is a hint, not isolation ·\n")
 	b.WriteString("  no cgroup CPU limits / HPA-on-cpu · no EventRecorder (kubectl describe shows no events) ·\n")
 	b.WriteString("  no metrics.k8s.io · native-process pods (Linux images need the vm RuntimeClass).\n")
 	b.WriteString("  See docs/UPSTREAM-ALIGNMENT.md and docs/conformance-profile.md for the full register.\n")
