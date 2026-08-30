@@ -1,31 +1,50 @@
-# k3sm M0 demo — a Kubernetes Pod that runs as a NATIVE macOS process
-# (no Linux, no container, no VM) via the HostProcess Virtual Kubelet provider.
+# hello-native — the smallest Pod a k3sm cluster will admit and schedule.
+#
+# k3sm runs Pods as NATIVE Darwin processes (no Linux, no container, no VM), so
+# `image: native` is a sentinel rather than a registry reference: the workload is
+# `command`, whose first element must be an ABSOLUTE path to a host binary.
+#
+# Two fields below are not optional decoration — a Pod without them does not run:
+#
+#   nodeSelector kubernetes.io/os=darwin   a ValidatingAdmissionPolicy DENIES any Pod
+#                                          that does not declare it (`kubectl apply`
+#                                          fails; nothing is created).
+#   toleration for k3sm.io/provider        every k3sm node carries the NoSchedule
+#                                          taint k3sm.io/provider; without a matching
+#                                          toleration the Pod is admitted and then
+#                                          sits Pending/Unschedulable forever.
 #
 #   kubectl apply -f examples/hello-native.yaml
-#   kubectl get pods -o wide          # Running on the k3sm darwin node
-#   pgrep -fl tail                    # the real native process on your Mac
-#   kubectl delete pod hello-native   # provider SIGKILLs the process group
-#
-# container.command/args is the native argv; the `image` field is a placeholder
-# (native macOS workloads have no image ecosystem yet — that arrives in M1).
+#   kubectl get pods -o wide        # Running on the k3sm darwin node
+#   kubectl logs hello-native
+#   pgrep -fl tail                  # the real native process on your Mac
+#   kubectl delete pod hello-native # the provider SIGKILLs the process group
 apiVersion: v1
 kind: Pod
 metadata:
   name: hello-native
   namespace: default
 spec:
-  nodeName: k3sm-m0          # pin to the k3sm node (no scheduler needed for the demo)
-  restartPolicy: Never
+  # Required by admission. It is also what places the Pod: the scheduler picks a
+  # darwin node, so no nodeName pin is needed (and pinning one would bypass the
+  # scheduler, which is how a Pod ends up stranded when the node is renamed).
+  nodeSelector:
+    kubernetes.io/os: darwin
+  # Keyed on the provider taint, deliberately NOT a blanket `- operator: Exists`.
+  # A blanket toleration also tolerates node.kubernetes.io/not-ready and
+  # /unreachable, which keeps the Pod bound to a node that has stopped working.
   tolerations:
-  - operator: Exists
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  restartPolicy: Never
   containers:
-  - name: hello
-    image: native            # placeholder; the command below is what runs
-    command:
-    - /bin/sh
-    - -c
-    - |
-      echo 'hello from a k3sm NATIVE pod'
-      /usr/bin/sw_vers
-      echo started-ok
-      exec /usr/bin/tail -f /dev/null
+    - name: hello
+      image: native
+      command:
+        - /bin/sh
+        - -c
+        - |
+          echo 'hello from a k3sm native pod'
+          /usr/bin/sw_vers
+          exec /usr/bin/tail -f /dev/null

@@ -1,0 +1,40 @@
+# service-nodeport — a NodePort Service fronting the deployment-native workload.
+#
+# NodePort on k3sm behaves the way it does upstream, which on a personal Mac is worth
+# saying out loud:
+#
+#   * The listener is bound to the WILDCARD, `*:30000-32767`. Every interface answers —
+#     127.0.0.1, and your LAN address too. A NodePort Service on your laptop is
+#     published to whatever network the Mac is on; there is no host-only mode.
+#   * It shares ONE port space with everything else on the machine. macOS has no network
+#     namespaces and Go sets no SO_REUSEPORT, so the nodePort must not collide with
+#     anything already listening — another NodePort Service, a Pod's own containerPort,
+#     or an unrelated app on your Mac. The loser of a collision simply fails to bind.
+#   * k3sm reserves 30000-32767 (this range) and 10250 (the kubelet API) for its own
+#     wildcard listeners. A type: LoadBalancer Service claiming one of those is REJECTED
+#     at apply time; plain NodePort Services like this one are unaffected, because the
+#     apiserver allocates their nodePort out of that very range.
+#   * TCP only — UDP NodePorts are unimplemented.
+#
+# `nodePort` is pinned below so the port is predictable in a demo. Omit it in real use
+# and let the apiserver allocate one; a pinned port is one more thing to collide.
+#
+#   kubectl apply -f examples/deployment-native.yaml -f examples/service-nodeport.yaml
+#   curl http://127.0.0.1:30080/
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-http-nodeport
+  namespace: default
+  labels:
+    app: hello-http
+spec:
+  type: NodePort
+  selector:
+    app: hello-http
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30080
+      protocol: TCP
