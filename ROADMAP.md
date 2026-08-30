@@ -1,7 +1,7 @@
 # k3sm roadmap
 
-> **Hand-written public roadmap narrative.** The per-repo `docs/PHASES.md` are the engineering
-> source of truth. **Edit by hand.**
+> **Hand-written public roadmap narrative.** The engineering ledger each repo keeps is the
+> source of truth for delivery state. **Edit by hand.**
 
 k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/arm64 analog of
 [k3s](https://github.com/k3s-io/k3s). Pods run as **native Darwin processes: zero Linux, no VM in
