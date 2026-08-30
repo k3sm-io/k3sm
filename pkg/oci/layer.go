@@ -27,7 +27,6 @@ import (
 	"time"
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -100,13 +99,70 @@ func BuildLayer(entries []entry, tmpDir string) (ggcrv1.Layer, error) {
 	// Uncompressed: the digest then depends only on this package's tar output,
 	// never on compress/flate's byte-level behavior, which carries no
 	// cross-version compatibility promise.
-	layer, err := tarball.LayerFromFile(staged, tarball.WithMediaType(types.OCIUncompressedLayer))
+	//
+	// tarball.LayerFromFile + WithMediaType does NOT give this: WithMediaType
+	// only relabels the reported media type, while go-containerregistry always
+	// computes Digest() over a gzip encoding of the opener's bytes regardless —
+	// so the emitted blob was gzip under an UNCOMPRESSED label (a strict OCI
+	// reader with no gunzip path correctly refuses it). uncompressedFileLayer
+	// below is the fix: its Compressed() and Uncompressed() are the SAME
+	// reader, so the declared media type always matches the bytes on the wire.
+	layer, err := newUncompressedFileLayer(staged)
 	if err != nil {
 		return nil, fmt.Errorf("open staged layer: %w", err)
 	}
 	committed = true
 	return layer, nil
 }
+
+// uncompressedFileLayer is a ggcrv1.Layer backed by a plain (non-gzip) tar
+// file on disk. Digest and DiffID are the SAME hash — the sha256 of the exact
+// bytes Compressed() and Uncompressed() both return — because for a genuinely
+// uncompressed layer that equality is the property a strict OCI reader is
+// entitled to assume from the declared media type.
+type uncompressedFileLayer struct {
+	path   string
+	digest ggcrv1.Hash
+	size   int64
+}
+
+// newUncompressedFileLayer reads path once to compute its digest and size,
+// then serves both Compressed() and Uncompressed() by reopening it.
+func newUncompressedFileLayer(path string) (*uncompressedFileLayer, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	digest, size, err := ggcrv1.SHA256(f)
+	if err != nil {
+		return nil, fmt.Errorf("digest %s: %w", path, err)
+	}
+	return &uncompressedFileLayer{path: path, digest: digest, size: size}, nil
+}
+
+// Digest implements ggcrv1.Layer. It equals DiffID: this layer carries no
+// compression, so there is only one hash to report.
+func (l *uncompressedFileLayer) Digest() (ggcrv1.Hash, error) { return l.digest, nil }
+
+// DiffID implements ggcrv1.Layer.
+func (l *uncompressedFileLayer) DiffID() (ggcrv1.Hash, error) { return l.digest, nil }
+
+// Size implements ggcrv1.Layer. It is the uncompressed size, since Compressed
+// and Uncompressed return identical bytes.
+func (l *uncompressedFileLayer) Size() (int64, error) { return l.size, nil }
+
+// MediaType implements ggcrv1.Layer.
+func (l *uncompressedFileLayer) MediaType() (types.MediaType, error) {
+	return types.OCIUncompressedLayer, nil
+}
+
+// Compressed implements ggcrv1.Layer. It returns the same bytes as
+// Uncompressed — the whole point of this type over tarball.LayerFromFile.
+func (l *uncompressedFileLayer) Compressed() (io.ReadCloser, error) { return os.Open(l.path) }
+
+// Uncompressed implements ggcrv1.Layer.
+func (l *uncompressedFileLayer) Uncompressed() (io.ReadCloser, error) { return os.Open(l.path) }
 
 // writeTar emits the normalized archive. Entries arrive pre-sorted by in-image
 // name (see selectEntries), so ordering is content-determined.
