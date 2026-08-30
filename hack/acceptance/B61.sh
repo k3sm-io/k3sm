@@ -4,8 +4,10 @@
 # no network, no markdown linter, no control plane. It asserts, red-at-main
 # (docs/user/ absent) via an explicit ladder FAIL line and green-after:
 #
-#   1. exact-set manifest — the 15 required files + README.md present, and
-#      mlx-quickstart.md ABSENT (it is m8-gated; this decouples B61 from m8).
+#   1. exact-set manifest — the 16 required files + README.md present. This set
+#      includes mlx-quickstart.md, which ships with the MLX serving gate; it was
+#      previously required to be ABSENT, to decouple this gate from a page that
+#      did not exist yet.
 #   2. offline relative-link check — every in-repo markdown link in docs/user/*
 #      resolves to a file that exists (dangling -> red). http(s)/mailto/#-anchors
 #      are skipped; a trailing #anchor is stripped before resolving.
@@ -44,6 +46,7 @@ REQUIRED=(
 	quickstart.md install.md concepts.md limitations.md images.md
 	multi-node.md vm-runtimeclass.md ha.md storage.md kubectl-access.md
 	troubleshooting.md faq.md versions.md upgrade.md backup-restore.md
+	mlx-quickstart.md
 )
 for f in "${REQUIRED[@]}"; do
 	if [ -f "$USERDIR/$f" ]; then
@@ -57,12 +60,6 @@ if [ -f "$USERDIR/README.md" ]; then
 	ladder ok "B61.1  README.md index present"
 else
 	ladder no "B61.1  README.md index MISSING"
-fi
-# mlx-quickstart.md is m8-gated: it MUST be absent (present -> red).
-if [ -e "$USERDIR/mlx-quickstart.md" ]; then
-	ladder no "B61.1  mlx-quickstart.md present (must be absent — m8-gated)"
-else
-	ladder ok "B61.1  mlx-quickstart.md absent (m8-gated, decoupled)"
 fi
 
 # --- Check 2: offline relative-link check ------------------------------------
