@@ -520,7 +520,7 @@ func (m *Manager) downAll(ctx context.Context) error {
 // step failure is reported but never blocks the rest (a wedged instance must
 // still be reclaimable).
 func (m *Manager) teardown(inst Instance) error {
-	if inst.PID > 0 && m.sys.ProcessAlive(inst.PID) {
+	if inst.PID > 0 && m.sys.ProcessLiveness(inst.PID).Exists() {
 		if err := m.sys.TerminateProcess(inst.PID, terminateGrace); err != nil {
 			fmt.Fprintf(m.out, "warning: terminate %q pid %d: %v\n", inst.Name, inst.PID, err)
 		}
@@ -575,10 +575,16 @@ func removablePodRoot(inst Instance, base string) string {
 	return dir
 }
 
-// List returns the durable registry, each entry annotated (via the ALIVE field
+// List returns the durable registry, each entry annotated (via the LIVENESS field
 // the caller renders) with current process liveness cross-checked against the
-// System seam — so a stale pid from a crashed run reads not-alive without the
+// System seam — so a stale pid from a crashed run reads LivenessDead without the
 // manifest being lost.
+//
+// The verdict is three-valued (B211). An unprivileged shell cannot signal a
+// root-owned `--datapath` server, and reporting that EPERM as dead made `k3sm dev
+// list` print `stale` for a healthy instance — the one word that invites an
+// operator to clean it up. A pid this process cannot probe is reported
+// LivenessUnknown, never LivenessDead.
 func (m *Manager) List() ([]InstanceStatus, error) {
 	insts, err := m.reg.List()
 	if err != nil {
@@ -586,7 +592,11 @@ func (m *Manager) List() ([]InstanceStatus, error) {
 	}
 	out := make([]InstanceStatus, 0, len(insts))
 	for _, inst := range insts {
-		out = append(out, InstanceStatus{Instance: inst, Alive: inst.PID > 0 && m.sys.ProcessAlive(inst.PID)})
+		live := LivenessDead
+		if inst.PID > 0 {
+			live = m.sys.ProcessLiveness(inst.PID)
+		}
+		out = append(out, InstanceStatus{Instance: inst, Liveness: live})
 	}
 	return out, nil
 }
@@ -594,11 +604,17 @@ func (m *Manager) List() ([]InstanceStatus, error) {
 // InstanceStatus is a registry entry plus its current process liveness.
 type InstanceStatus struct {
 	Instance
-	// Alive reports whether the recorded PID is a live process right now (the
-	// durable manifest survives sleep/reboot; Alive tells `list` if the server is
-	// still running or needs a re-`up`).
-	Alive bool
+	// Liveness is the recorded PID's process state right now (the durable manifest
+	// survives sleep/reboot; this tells `list` whether the server is still running,
+	// needs a re-`up`, or is simply not probeable from this uid).
+	Liveness Liveness
 }
+
+// Alive reports whether the instance's server is known to be running. An
+// unprobeable (root-owned, seen unprivileged) instance is NOT alive by this
+// predicate and is NOT dead either — callers deciding whether to reap must ask
+// Liveness.Exists(), not this.
+func (s InstanceStatus) Alive() bool { return s.Liveness == LivenessRunning }
 
 // Load stages a native-arm64 binary for the dev cluster and returns the
 // `image: <abs>` line (the no-command host-binary convention runtimed's
@@ -638,7 +654,7 @@ func (m *Manager) preflightReclaim(name string) error {
 	if err != nil {
 		return err
 	}
-	if inst.PID > 0 && m.sys.ProcessAlive(inst.PID) {
+	if inst.PID > 0 && m.sys.ProcessLiveness(inst.PID).Exists() {
 		fmt.Fprintf(m.out, "reclaiming prior instance %q (pid %d)\n", name, inst.PID)
 		_ = m.sys.TerminateProcess(inst.PID, terminateGrace)
 	}
@@ -813,7 +829,7 @@ func (m *Manager) awaitOrExit(ctx context.Context, p *serverProc, err error) err
 	if err == nil {
 		return nil
 	}
-	if !m.sys.ProcessAlive(p.pid) {
+	if !m.sys.ProcessLiveness(p.pid).Exists() {
 		select {
 		case <-p.exited:
 			return p.exitError()

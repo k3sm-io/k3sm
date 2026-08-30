@@ -25,9 +25,11 @@ import (
 	"strings"
 	"testing"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/provider"
 )
@@ -42,10 +44,16 @@ import (
 // provisioned ONLY under the netd-helper backend — so a `--network none` or
 // `--network direct` cluster had no such object and ADMITTED a pod requesting a
 // foreign fsGroup/runAsUser, which is exactly what the first SIT T1 run observed.
+//
+// k3sm-warn-pod-hand-set-internet-egress is the B209 member: B91 landed the policy
+// and its package-level tests, but bring-up never called the provisioner, so a live
+// cluster carried six policies and this list is what makes that seventh one's
+// absence a failing test rather than a `kubectl get vap` count nobody runs.
 var wantClusterPolicies = []string{
 	"k3sm-reject-foreign-user",
 	"k3sm-reject-loadbalancer-reserved-port",
 	"k3sm-require-os-darwin",
+	"k3sm-warn-pod-hand-set-internet-egress",
 	"k3sm-warn-pod-missing-provider-toleration",
 	"k3sm-warn-service-externaltrafficpolicy-local",
 	"k3sm-warn-service-udp",
@@ -169,6 +177,96 @@ func TestBringupForeignUserPolicyPinsThePodExecutionUID(t *testing.T) {
 			}
 			if tt.euid != 0 && strings.Contains(expr, "== 0)") {
 				t.Errorf("provisioned CEL admits uid 0 in an unprivileged posture:\n%s", expr)
+			}
+		})
+	}
+}
+
+// TestServerProvisionsTheEgressWarnVAP is the B209 gate: bring-up must CALL
+// policy.EnsureEgressAnnotationWarn, not merely be able to.
+//
+// B91 landed the policy, its CEL, and its package-level tests — all green — while
+// provisionClusterPolicies never invoked it, so a live cluster ran with six
+// ValidatingAdmissionPolicies and hand-setting the internet-egress annotation
+// warned nothing. That is the B195 class: a unit test over an exported constructor
+// proves the object can be built, never that anything builds it. This test is
+// therefore written at the ASSEMBLY seam (provisionClusterPolicies, the one
+// production caller) and reds the moment the call site is dropped.
+//
+// It asserts the provisioned shape as well as the name, because a present-but-inert
+// object is the same operator experience as an absent one: the binding must exist
+// and act WARN (never Deny — the annotation is not a security boundary and its own
+// doc comment says enforcement stops at the SandboxProfile), the policy must be
+// FailurePolicy Ignore (an advisory must never take Pod CREATE down), it must match
+// pods on CREATE only (matching UPDATE re-fires on every status patch), and its CEL
+// must name the real annotation key from apis rather than a copy that can drift.
+func TestServerProvisionsTheEgressWarnVAP(t *testing.T) {
+	const (
+		policyName  = "k3sm-warn-pod-hand-set-internet-egress"
+		bindingName = "k3sm-warn-pod-hand-set-internet-egress-binding"
+	)
+	// The same posture cross-product the sibling gate walks: the advisory is
+	// mode-independent, so every backend must lay it down.
+	for _, tt := range []struct {
+		network string
+		euid    int
+	}{
+		{"", 501},
+		{"auto", 501},
+		{"none", 501},
+		{"none", 0},
+		{"direct", 0},
+		{"helper", 501},
+	} {
+		name := "network=" + tt.network + ",euid=" + strconv.Itoa(tt.euid)
+		if tt.network == "" {
+			name = "network=<unset>,euid=" + strconv.Itoa(tt.euid)
+		}
+		t.Run(name, func(t *testing.T) {
+			mode, err := hostnet.ResolveFor(tt.network, tt.euid)
+			if err != nil {
+				t.Fatalf("hostnet.ResolveFor(%q, %d): %v", tt.network, tt.euid, err)
+			}
+			cs := fake.NewClientset()
+			provisionClusterPolicies(context.Background(), cs, mode, tt.euid,
+				slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			pol, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().
+				Get(context.Background(), policyName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("bring-up did not provision %s (backend %s): %v — the hand-set %s annotation warns nothing on a live cluster",
+					policyName, mode.Backend, err, runtimev1.AnnotationInternetEgress)
+			}
+			if pol.Spec.FailurePolicy == nil || *pol.Spec.FailurePolicy != admissionregistrationv1.Ignore {
+				t.Errorf("%s FailurePolicy = %v, want Ignore — an advisory must never fail Pod CREATE closed", policyName, pol.Spec.FailurePolicy)
+			}
+			if len(pol.Spec.Validations) != 1 {
+				t.Fatalf("%s validations = %d, want 1", policyName, len(pol.Spec.Validations))
+			}
+			if expr := pol.Spec.Validations[0].Expression; !strings.Contains(expr, runtimev1.AnnotationInternetEgress) {
+				t.Errorf("%s CEL does not name %s:\n%s", policyName, runtimev1.AnnotationInternetEgress, expr)
+			}
+			rules := pol.Spec.MatchConstraints.ResourceRules
+			if len(rules) != 1 {
+				t.Fatalf("%s resource rules = %d, want 1", policyName, len(rules))
+			}
+			if got := rules[0].Resources; !slices.Equal(got, []string{"pods"}) {
+				t.Errorf("%s matches %v, want [pods]", policyName, got)
+			}
+			if got := rules[0].Operations; !slices.Equal(got, []admissionregistrationv1.OperationType{admissionregistrationv1.Create}) {
+				t.Errorf("%s operations = %v, want [CREATE] only — matching UPDATE re-fires on every status patch", policyName, got)
+			}
+
+			bind, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().
+				Get(context.Background(), bindingName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("bring-up did not provision %s (backend %s): %v — an unbound policy is evaluated by nothing", bindingName, mode.Backend, err)
+			}
+			if bind.Spec.PolicyName != policyName {
+				t.Errorf("%s binds %q, want %q", bindingName, bind.Spec.PolicyName, policyName)
+			}
+			if got := bind.Spec.ValidationActions; !slices.Equal(got, []admissionregistrationv1.ValidationAction{admissionregistrationv1.Warn}) {
+				t.Errorf("%s actions = %v, want [Warn] — the annotation is plumbing, never a boundary to deny on", bindingName, got)
 			}
 		})
 	}

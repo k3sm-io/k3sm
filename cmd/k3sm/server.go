@@ -752,6 +752,17 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureProviderTolerationWarn(ctx, cs); err != nil {
 		logger.Error("provision provider-toleration warn policy", "err", err)
 	}
+	// B91/B209 — honest-plumbing Warn advisory on Pods: a pod carrying a HAND-SET
+	// k3sm.io/internet-egress annotation (without the operator-managed discriminator
+	// label pkg/mlx.Render stamps) opts its sandbox into allow_internet_egress. The
+	// policy + its unit tests landed with B91 but were never called from bring-up, so
+	// a running cluster provisioned six policies and hand-setting the annotation warned
+	// nothing — the same test-passes-wiring-absent class as B195. Provisioned
+	// UNCONDITIONALLY like its siblings: the annotation is read on every runtime path,
+	// not only under MLX. Log-and-continue — it is advisory, never a boundary.
+	if err := policy.EnsureEgressAnnotationWarn(ctx, cs); err != nil {
+		logger.Error("provision hand-set-internet-egress warn policy", "err", err)
+	}
 	// B76 — MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
 	// controller (KCM), so the B17 CREATE-Warn advisory never reaches its author and
 	// the pod sits Unschedulable against the provider taint. Inject the provider
