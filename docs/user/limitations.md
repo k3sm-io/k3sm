@@ -55,6 +55,13 @@ their absolute volume mounts work as expected. It **cannot** load into a **SIP p
 reads a mounted file at its absolute path won't see it. Ship your workload as a compiled binary (the
 native k3sm model), not a `/bin/sh`-driven image, for mounted config/secret/scratch volumes.
 
+Absolute volume-mount paths resolve **only on the root tier**. The path-rebase shim is **euid-gated**:
+it must be staged under `/Library` to sit inside the pod Seatbelt read baseline, and only euid 0 can
+write there, so an unprivileged (rootless) `k3sm server` never stages it — a rootless pod expecting an
+absolute mount path sees the unmounted host path instead. This is why a ladder that depends on
+absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a root-tier run: rootless stops
+at mount resolution by design, not by omission.
+
 ### NetworkPolicy is a policy hint, not a security boundary
 
 NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with
