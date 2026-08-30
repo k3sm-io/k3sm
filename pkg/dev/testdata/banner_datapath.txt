@@ -3,6 +3,9 @@ This is NOT kind — k3sm is deliberately non-conformant. Develop against the SA
 
 posture: --datapath (root, network=direct) — Service/ClusterIP/DNS/pod-IP datapath is LIVE.
 isolation: runtimed — pods are Seatbelt-confined via the k3sm-execshim helper.
+pod identity: pods run as ROOT (uid 0) — a pod with no securityContext.runAsUser keeps this root
+  daemon's identity. Seatbelt still confines them, but the installed cluster runs pods as the
+  unprivileged _k3sm user; --datapath is dev-only. Do not run untrusted workloads on it.
 
 SAFE — faithful, develop freely (real upstream apiserver):
   CRD structural schemas · SSA field-managers · CEL validation · admission registration ·
