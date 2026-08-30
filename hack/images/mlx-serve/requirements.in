@@ -1,0 +1,12 @@
+# mlx-serve — the serving engine, and nothing else.
+#
+# The engine choice and this exact pin come from the M8 engine bake-off
+# (hack/spike/m8/findings-s5.md): vllm-mlx wins every concurrency axis, is
+# Apache-2.0, is published on PyPI, and — unlike the runner-up — has a
+# dependency closure that can be expressed as a hash-pinned lockfile.
+#
+# Nothing else belongs here. mlx, mlx-lm, mlx-metal, torch and the rest arrive
+# as resolved transitive dependencies and are pinned, with hashes, in
+# requirements.lock. Adding a direct requirement here changes the payload the
+# image ships; regenerate the lockfile in the same commit (see README.md).
+vllm-mlx==0.4.1
