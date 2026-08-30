@@ -92,7 +92,7 @@ sudo launchctl kickstart -k system/io.k3sm.server
 ```
 
 **A `<pending>` Service is not visible in `kubectl describe`** — k3sm has no `EventRecorder` for this
-path yet (`B75`), so the log file is the only place the reason appears.
+path yet (the event pipeline is planned), so the log file is the only place the reason appears.
 
 ## `kubectl top` returns no metrics
 
