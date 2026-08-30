@@ -9,8 +9,59 @@ The control-plane state of record is the kine/SQLite database under the server w
 `db/state.db` family, including its WAL). This is distinct from **PersistentVolume data**, which lives in
 local-path directories on each node (see [storage.md](storage.md)) and must be backed up separately.
 
-There is no `k3sm snapshot` command. Backups are the file-level procedure below, plus the automatic
-pre-upgrade backup k3sm takes for you when a release changes the datastore engine.
+Three things back it up: **`k3sm snapshot save`** (below) on your own schedule, the automatic
+pre-upgrade backup k3sm takes when a release changes the datastore engine, and the file-level
+procedure further down — the fallback for a node where the binary will not run.
+
+## `k3sm snapshot save` — taking a backup
+
+```sh
+k3sm snapshot save                      # -> <work-dir>/db/snapshots/k3sm-snapshot-<UTC>.db
+k3sm snapshot save --out /Volumes/backups/k3sm.db
+```
+
+It is safe to run **while the control plane is serving**: the copy is taken by SQLite inside a read
+transaction, so a concurrent write cannot tear it. What it does, in order:
+
+1. Refuses if this node's state of record is an external **Postgres** datastore (there is nothing
+   local to copy — see [HA / Postgres](#ha--postgres)).
+2. Refuses unless the destination volume has **twice the database size** free, rather than writing a
+   partial snapshot.
+3. Writes a consistent point-in-time image of the datastore, runs `PRAGMA integrity_check` on **that
+   image**, and only then renames it into place — so a snapshot that exists under its final name is
+   complete and was proven readable as a database.
+
+The work directory is owned by the `_k3sm` service user, so run it under `sudo` (or pass
+`--work-dir`) when your shell user cannot read it. The snapshot is written `0600`.
+
+**Copy it off the node.** The default location is the same volume as the cluster it protects, which
+does not survive losing that volume. `--out` onto another disk or host is the better habit.
+
+The snapshot does **not** contain PersistentVolume data — see [storage.md](storage.md).
+
+## `k3sm snapshot restore` — putting one back
+
+```sh
+sudo launchctl bootout system/io.k3sm.server                       # 1. stop the control plane
+sudo k3sm snapshot restore /Volumes/backups/k3sm.db                # 2. restore
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist   # 3. start it again
+```
+
+The restore is built to be survivable when it goes wrong:
+
+- It **refuses while a control plane is running** — the launchd job, a foreground `k3sm server`, or a
+  `k3sm dev` cluster — and names what to stop. Swapping the datastore under a live kine is
+  corruption, not a restore: kine keeps writing to the file it already holds open.
+- It **verifies the snapshot before touching anything**. A snapshot that fails `integrity_check`
+  costs you an error and nothing else; your current datastore is untouched.
+- It **preserves what it replaces**. The superseded `state.db` is moved to
+  `state.db.restore-<UTC>.bak` — never deleted — and its `-wal`/`-shm` sidecars and kine pin stamp go
+  with it, because a stale sidecar left beside a restored database is exactly how a "successful"
+  restore comes back with the state you were trying to discard.
+- It prints the **verification step** below, and the `.bak` to keep if verification fails.
+
+Restoring onto a node with no datastore at all (a rebuilt Mac) is supported — that is what the drill
+is for.
 
 ## The automatic pre-migration backup
 
@@ -39,7 +90,12 @@ In the server work directory's `db/` you will find:
 The backup is **write-once**: once it exists, later boots leave it alone. It is never overwritten by a
 crash-restart loop, and never replaced by a copy of an already-migrated database.
 
-## Backing up by hand
+## Backing up by hand — the fallback
+
+The file-level procedure below does what `k3sm snapshot save` does, with `sqlite3(1)` and `cp`. Use it
+when the k3sm binary will not run on the node (a broken install, a rescue boot from another machine's
+disk), or when you want to see every step. Otherwise prefer the command: it verifies the copy for you
+and refuses rather than writing a partial one.
 
 Because SQLite runs in **WAL** mode, do not copy `state.db` out from under a running server — the copy
 would be missing whatever is still in the log.
@@ -64,10 +120,12 @@ Adjust the work-dir path if you run unprivileged (`~/server` under the service u
 `--work-dir`. Keep backups **off the node** — another disk or another host — so losing the machine does
 not lose the backup with it.
 
-## Restoring
+## Restoring by hand — the fallback
 
-Restoring replaces the datastore with the backup's state. The server must be stopped: an open
-datastore file swapped underneath a running kine is corruption, not a restore.
+The same fallback rule applies: prefer `k3sm snapshot restore`, which performs the steps below and
+verifies the snapshot before it moves anything. Restoring replaces the datastore with the backup's
+state. The server must be stopped: an open datastore file swapped underneath a running kine is
+corruption, not a restore.
 
 ```sh
 # 1. Stop the control plane.
@@ -88,10 +146,11 @@ sudo chown _k3sm state.db
 sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
 ```
 
-### Verify the restore — do not skip this
+## Verify the restore — do not skip this
 
-A restore that starts the daemon is not a restore that worked. Check that the API server is serving
-**and that the objects you expected came back**:
+`k3sm snapshot restore` prints these steps when it finishes; run them either way. A restore that
+starts the daemon is not a restore that worked. Check that the API server is serving **and that the
+objects you expected came back**:
 
 ```sh
 k3sm kubectl get --raw='/readyz?verbose'      # every check ok
@@ -103,7 +162,7 @@ k3sm doctor                                   # datastore check: journal_mode=wa
 If the objects are missing or the datastore check reports a non-WAL journal, stop, keep
 `state.db.broken`, and do not let workloads reconcile against a half-restored cluster.
 
-### Rolling back to the previous kine as well
+## Rolling back to the previous kine as well
 
 If you are restoring a `state.db.pre-<version>.bak` **because** a version move went wrong, install the
 previous k3sm binary too (see [upgrade.md](upgrade.md) § Rollback). The preserved
@@ -115,8 +174,12 @@ rebuilt from source without a module proxy that still carries it, so those bytes
 - **Keep the automatic `.bak` until you are confident in the new version** — a week of real workload
   is a reasonable bar. It is the only pre-migration copy that exists.
 - Once you are confident, delete it. It is a full copy of the database and it does not shrink.
-- Keep your **own** off-node backups on your own schedule; the automatic one only appears when a
-  release changes the datastore engine, so it is not a backup policy.
+- Keep your **own** off-node backups on your own schedule (`k3sm snapshot save --out …`); the
+  automatic one only appears when a release changes the datastore engine, so it is not a backup
+  policy.
+- `k3sm snapshot restore` leaves a `state.db.restore-<UTC>.bak` (plus its sidecars) behind on every
+  restore. Keep the most recent one until the restored cluster has proven itself; they are full
+  copies and do not shrink.
 - Deleting a `.bak` re-arms nothing: the automatic backup is taken per target version, and that
   version has already been recorded as having opened the database.
 
@@ -130,6 +193,13 @@ see [limitations.md](limitations.md).
 
 On the [HA](ha.md) posture the state of record is the operator-managed Postgres, not a local SQLite
 file. Nothing above applies: back it up with `pg_dump`/PITR on your Postgres schedule.
+
+`k3sm snapshot save` and `k3sm snapshot restore` **refuse on that posture** and say so, naming
+`pg_dump`. That is deliberate: k3sm does not read your Postgres, so anything it could write there
+would not be a backup of your cluster. It detects the posture from the server's
+`--datastore-endpoint` (or `$K3SM_DATASTORE_ENDPOINT`) and from the `.pgpass` file the server writes
+in the work directory; if a node no longer uses Postgres, remove that file and the commands work
+again.
 
 ## Next
 

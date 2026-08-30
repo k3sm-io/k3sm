@@ -28,7 +28,8 @@ control-plane Macs so the apiserver remains reachable if one node is lost. This 
 Because HA is EXPERIMENTAL, do not treat it as a production availability guarantee yet. Validate
 failover and restore on your own hardware, and keep datastore backups — on this posture that means
 `pg_dump`/PITR against your Postgres, not the single-node SQLite procedure (see
-[backup-restore.md](backup-restore.md)).
+[backup-restore.md](backup-restore.md)). `k3sm snapshot save`/`restore` refuse here and say so: they
+cover the single-node SQLite datastore only, and k3sm does not read your Postgres.
 
 ## Next
 
