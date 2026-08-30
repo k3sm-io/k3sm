@@ -2,8 +2,9 @@
 
 Joining more than one Mac into a single k3sm cluster.
 
-> **Status: EXPERIMENTAL.** Multi-node (M6) ships as documented **EXPERIMENTAL** — a v0.3 headline, not
-> launch-blocking. Treat it as preview-quality. See [limitations.md](limitations.md).
+> **Status: EXPERIMENTAL.** Multi-node ships as documented **EXPERIMENTAL** and is **not**
+> launch-blocking; its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as
+> preview-quality until then. See [limitations.md](limitations.md).
 
 ## The model
 

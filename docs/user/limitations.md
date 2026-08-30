@@ -241,9 +241,16 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 
 ### `vm` RuntimeClass and multi-node HA are EXPERIMENTAL
 
-The **`vm` RuntimeClass** (M5) and **multi-node / HA** (M6) ship as documented **EXPERIMENTAL**. They
-are the v0.2 / v0.3 headlines, **not** launch-blocking, and should be treated as preview-quality. See
-[vm-runtimeclass.md](vm-runtimeclass.md), [multi-node.md](multi-node.md), and [ha.md](ha.md).
+Both ship as documented **EXPERIMENTAL** and should be treated as preview-quality — but they are on
+different tracks:
+
+- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) is targeted at the **v0.1.0**
+  public release as EXPERIMENTAL, and is **launch-gated**: it is announced only if its live lab proof
+  is green against the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed,
+  with published performance figures — is the **v0.2** milestone. See
+  [vm-runtimeclass.md](vm-runtimeclass.md).
+- **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
+  milestone. See [multi-node.md](multi-node.md) and [ha.md](ha.md).
 
 ### Node capability labels are probed once at daemon start
 

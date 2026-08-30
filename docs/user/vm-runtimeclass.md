@@ -4,8 +4,10 @@ k3sm runs Pods as native Darwin processes under a **single `_k3sm` user**, so th
 isolation** — same-node Pods share one OS trust domain. For **untrusted or multi-tenant** workloads, the
 **`vm` RuntimeClass** provides a real isolation boundary backed by Virtualization.framework.
 
-> **Status: EXPERIMENTAL.** The `vm` RuntimeClass (M5) ships as documented **EXPERIMENTAL** — a v0.2
-> headline, not launch-blocking. See [limitations.md](limitations.md).
+> **Status: EXPERIMENTAL.** The `vm` RuntimeClass ships as documented **EXPERIMENTAL** in the
+> **v0.1.0** public release, launch-gated on its live lab proof. The de-EXPERIMENTAL graduation, with
+> published performance figures, is the **v0.2** milestone. Treat it as preview-quality until then.
+> See [limitations.md](limitations.md).
 
 ## When to use it
 
