@@ -57,7 +57,9 @@ See [versions.md](versions.md) — and read the live pin from `k3sm version`.
 
 ## How do I upgrade?
 
-`brew upgrade` restarts the daemon via launchd; multi-node is node-by-node. See [upgrade.md](upgrade.md).
+Re-run the install script — `curl -fsSL https://k3sm.io/install.sh | sh` — which installs the latest
+release and restarts the daemons. Homebrew (`brew upgrade`) is the second install generation and
+works once the tap ships. A multi-node cluster rolls node-by-node. See [upgrade.md](upgrade.md).
 
 ## Do I need `sudo` every time?
 
