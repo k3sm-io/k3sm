@@ -224,6 +224,16 @@ label **deletion** propagates through Virtual Kubelet's node reconcile to the da
 not yet verified in a lab. `k3sm.io/virtualization` has always had the same property. Treat the manual
 `kubectl label ... -` above as the reliable way to withdraw a capability claim.
 
+### Unprivileged `server` + PVCs need `--pod-root`
+
+An unprivileged `k3sm server` (no `sudo`) with no `--pod-root` override roots the runtime — image
+cache and pod dirs, including PV storage — under `$HOME`, because the default derives from the
+control-plane work-dir's parent. The sandbox generator denies `/Users` **unconditionally**: it is a
+hard-coded protected prefix with no allowlist knob, and none will be added (closed 2026-08-29). So a
+PVC in that default posture is refused with `ErrProtectedPath`. The remedy is `--pod-root`, which
+relocates the runtimed on-disk root off `/Users` — `--work-dir` alone only moves control-plane state
+(kine DB, certs, kubeconfig) and does not change the pods root.
+
 ### Single-node datastore consistency
 
 k3sm embeds **kine** over **SQLite (WAL)**. On a single node the datastore serves a **consistent LIST**;
