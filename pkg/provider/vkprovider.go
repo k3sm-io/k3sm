@@ -90,6 +90,19 @@ func (v *VKProvider) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 	return v.rt.GetPods(ctx)
 }
 
+// RuntimeHealthy reports whether the backing Runtime can currently serve pods,
+// delegating to its optional HealthReporter capability. A Runtime without that
+// capability is reported HEALTHY: the absence of a health surface is not evidence
+// of ill health, and letting it read as unhealthy would make every such node
+// NotReady for a question it was never able to answer.
+func (v *VKProvider) RuntimeHealthy(ctx context.Context) bool {
+	h, ok := v.rt.(HealthReporter)
+	if !ok {
+		return true
+	}
+	return h.Healthy(ctx)
+}
+
 // NotifyPods wires the Runtime's status watch to the VK status callback.
 func (v *VKProvider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	v.rt.Watch(ctx, cb)

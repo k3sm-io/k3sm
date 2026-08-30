@@ -380,6 +380,13 @@ func newContainerMonitor(c *corev1.Container, mk func(c *corev1.Container, p *co
 	return m
 }
 
+// defaultProbeFailureThreshold is the Kubernetes default failureThreshold: how
+// many CONSECUTIVE failures a gauge must see before it commits a failure verdict.
+// It is named because it is applied in two places — a container probe with no
+// explicit threshold, and the node Ready debounce, which deliberately reuses this
+// default rather than introducing a second, separately-tunable number.
+const defaultProbeFailureThreshold int32 = 3
+
 // gaugeFromProbe builds a gauge with the probe's thresholds (Kubernetes defaults:
 // successThreshold 1, failureThreshold 3), forcing successThreshold to 1 for
 // liveness and startup.
@@ -388,7 +395,7 @@ func gaugeFromProbe(p *corev1.Probe, kind probeKind, initial probeOutcome) *prob
 	if kind == probeLiveness || kind == probeStartup {
 		success = 1
 	}
-	return newProbeGauge(success, orDefaultInt32(p.FailureThreshold, 3), initial)
+	return newProbeGauge(success, orDefaultInt32(p.FailureThreshold, defaultProbeFailureThreshold), initial)
 }
 
 // scheduleFromProbe derives the timing from a probe, applying the Kubernetes

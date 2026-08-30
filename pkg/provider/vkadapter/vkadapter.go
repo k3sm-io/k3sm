@@ -57,6 +57,10 @@ type (
 	PodNotifier = vknode.PodNotifier
 	// NodeProvider is the node-status/heartbeat contract (nil ⇒ NaiveNodeProvider).
 	NodeProvider = vknode.NodeProvider
+	// NaiveNodeProvider is VK's node provider that accepts pushed status updates
+	// (UpdateStatus). A k3sm node provider embeds one rather than reimplementing the
+	// notify plumbing.
+	NaiveNodeProvider = vknode.NaiveNodeProviderV2
 	// AttachIO is the exec/attach stdio+resize stream VK hands the streaming verbs.
 	AttachIO = api.AttachIO
 	// ContainerLogOpts is the kubectl-logs options (tail, follow, …) VK passes through.
@@ -64,6 +68,11 @@ type (
 	// TermSize is a tty resize event delivered over an AttachIO Resize channel.
 	TermSize = api.TermSize
 )
+
+// NewNaiveNodeProvider returns a NaiveNodeProvider ready to accept UpdateStatus
+// calls. It MUST be built through this constructor: the zero value has no notify
+// channel, so UpdateStatus on it blocks forever.
+func NewNaiveNodeProvider() *NaiveNodeProvider { return vknode.NewNaiveNodeProvider() }
 
 // NotFound returns VK's own not-found error carrying msg. It MUST delegate to
 // errdefs so the returned value implements the errdefs NotFound() bool interface —
@@ -99,6 +108,16 @@ type NodeConfig struct {
 	// ConfigureNode stamps the registering Node object (labels, capacity, taints)
 	// at bring-up. It runs inside VK's provider-bootstrap callback.
 	ConfigureNode func(*corev1.Node)
+	// NodeProvider, when non-nil, builds the node-status/heartbeat provider from the
+	// registering Node object — called AFTER ConfigureNode has stamped it, so the
+	// builder sees the node exactly as it will be registered and can copy the fields
+	// it must preserve.
+	//
+	// Leaving it nil selects VK's NaiveNodeProvider (auto-Ready + lease heartbeat)
+	// and, with it, VK's built-in ready callback. Supplying one REPLACES that
+	// callback entirely: VK constructs it only for a nil node provider, so a
+	// non-nil provider owns the Ready condition outright and must publish it.
+	NodeProvider func(*corev1.Node) (NodeProvider, error)
 }
 
 // NewNode builds a Virtual Kubelet node from a NodeConfig, encapsulating the
@@ -150,7 +169,14 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 	return nodeutil.NewNode(nodeName,
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, vknode.NodeProvider, error) {
 			cfg.ConfigureNode(pc.Node)
-			return cfg.Provider, nil, nil // nil NodeProvider -> NewNaiveNodeProvider (auto-Ready + lease heartbeat)
+			if cfg.NodeProvider == nil {
+				return cfg.Provider, nil, nil // nil NodeProvider -> NewNaiveNodeProvider (auto-Ready + lease heartbeat)
+			}
+			np, err := cfg.NodeProvider(pc.Node)
+			if err != nil {
+				return nil, nil, err
+			}
+			return cfg.Provider, np, nil
 		},
 		nodeOpts...,
 	)
