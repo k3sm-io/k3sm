@@ -142,9 +142,12 @@ Measured on a clone so the stage stays pristine.
 | signed clone still execs | `Device(gpu, 0)` |
 
 **41 Mach-Os — the exact count S2 measured** across `venv/` + `pyinstall/`,
-reproduced here on an independently assembled tree. S2's "41 is an M8.0 datum,
-not an M8.4 budget" caveat is discharged **for this payload**; it re-opens the
-moment the S5 winner changes the dependency closure.
+reproduced here on an independently assembled tree (and internally consistent:
+S5 counts 30 in the mlx-lm venv alone, plus S2's 11 in the CPython dist). S2's
+"41 is an M8.0 datum, not an M8.4 budget" caveat is discharged **for this
+payload** — and **findings-s5.md re-opens it with the number**: the chosen engine
+brings the tree to ~353 Mach-Os over ~36 000 entries, which is where the walk
+cost below stops being a footnote.
 
 **S2's binding consequence is confirmed with a clean signal, not a muddied one:**
 
@@ -404,7 +407,12 @@ a spec-conformant client.
 3. **`AdHocSignTree` verifies per-arch** (`--arch <native>`), confirmed again on
    an independent tree: 0 invalid arch-aware, 1 invalid whole-file, same file.
 4. **Budget the Mach-O *walk*, not the signature** — 8.4 s vs 0.67 s here, and
-   the walk is `file(1)`-per-file; read the magic in Go instead.
+   the walk is `file(1)`-per-file; read the magic in Go instead. Against the S5
+   engine decision this is no longer optional: ~353 Mach-Os over ~36 000 entries
+   puts the same walk near 38 s. (Also: run any such walk under `LC_ALL=C` — a
+   UTF-8 `awk` aborts on the first invalid byte in a binary blob, SIGPIPEs
+   `file(1)`, and silently **truncates** the count. Observed on the S5 trees: 1
+   Mach-O reported for a 1 GB payload.)
 5. **Stage the RESOLVED versioned interpreter directory.** The builder refuses
    absolute, dangling and escaping symlinks; `uv`'s alias symlink is absolute.
 6. **Strip `lib/python3.12/EXTERNALLY-MANAGED`** from the staged dist, and

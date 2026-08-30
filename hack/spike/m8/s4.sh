@@ -146,7 +146,9 @@ T0=$(date +%s.%N)
 # then "<p> (for architecture x86_64): ..." per slice), and pads the description
 # with spaces AFTER the colon. So: split on the FIRST colon, then keep only
 # fields that are a real file — which drops the per-slice lines by construction.
-find "$S" -type f -print0 | xargs -0 file | awk -F: '/Mach-O/{print $1}' \
+# LC_ALL=C: a UTF-8 awk aborts on the first invalid byte sequence in a binary
+# blob, which SIGPIPEs file(1) and silently TRUNCATES the count.
+find "$S" -type f -print0 | xargs -0 file | LC_ALL=C awk -F: '/Mach-O/{print $1}' \
   | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done | sort -u > "$MACHOS"
 T1=$(date +%s.%N)
 NM=$(wc -l < "$MACHOS" | tr -d ' ')
