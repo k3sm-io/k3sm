@@ -492,26 +492,28 @@ phases:
             method: integration
       - id: M8.3
         title: k3sm node — extended resource + translate + Warn VAP
-        status: todo
+        status: done
+        completed: 2026-08-30
         deliverables:
           - id: M8.3-d1
-            done: false
+            done: true  # 2026-08-30 — shipped via the backlog drain: advertisement k3sm#167 (real GPUFacts, fail-closed, three-state nil), translate k3sm#172 (limits-not-requests + the egress pairing), Warn VAP k3sm#173 (cross-package discriminator agreement)
             desc: "STUB (M8.3). configureNode (cmd/k3sm/node.go) advertises mlx.k3sm.io/gpu: 1 in Capacity/Allocatable + labels (mlx.k3sm.io/gpu.present=true, /chip [normalized slug per Res. 4], /chip-family, /memory-gb), FAIL-CLOSED off runtimed GPUFacts (facts absent / metal_available=false / VZ-paravirtual discrimination trips → remove the resource + clear the labels, mirroring applyVirtualizationLabel). B63 ships the same plumbing against a stubbed fact source (blocked-on-M8.1 per Res. 8); this flips it to real GPUFacts. translate.go reads the GPU request from LIMITS → SandboxProfile.AllowGpu, the egress annotation (apis constant) → AllowInternetEgress (allow_internet_egress implies allow_network — Res. 12). A Warn VAP (pkg/policy/admission.go) surfaces a hand-set egress annotation on a non-operator pod (single-trust-domain posture; FailurePolicy: Ignore)."
         acceptance:
           - id: M8.3-a1
-            met: false
+            met: true  # 2026-08-30 — all three gates green, builder+orchestrator mutants killed; the live advertisement rides m8.sh per this row's own text
             check: "translate table test (limits-not-requests, annotation present/absent, constant-not-literal) + node-advertisement fail-closed unit test (fake GPUFacts, both skew directions) + the Warn VAP test pass. The live GPU advertisement is exercised by m8.sh on an apple-gpu dev-mac."
             method: unit
       - id: M8.4
         title: k3sm runtime image — mlx-serve (parallel with M8.2/M8.3)
-        status: todo
+        status: done
+        completed: 2026-08-30
         deliverables:
           - id: M8.4-d1
-            done: false
+            done: true  # 2026-08-30, k3sm#198 — build.sh (pinned interpreter URL + --require-hashes lock, 1835 hashes generated live) + walk-verify (per-arch, media-type-strict) + selftest 32/32; entrypoint argv carries --continuous-batching + --host 0.0.0.0 (two live engine findings)
             desc: "STUB (M8.4). k3sm/hack/images/mlx-serve/: a build script + uv toolchain (uv python install + uv pip install --require-hashes against a checked-in hash-pinned lockfile) assembling python-build-standalone (darwin-arm64) + the spike-S5-winner engine wheels (working hypothesis vllm-mlx) into ghcr.io/k3sm-io/mlx-serve. Entrypoint is the python3 Mach-O directly (argv[0] must be gateSignature-verifiable — never a shell script); process model per S3 (process-group sampling verified or the image pinned single-process). A dedicated versioned GHCR publish workflow (mlx-serve-image.yml); the operator's default Runtime.Image is digest-pinned (tag display-only); pre-M9 the image is private GHCR (stealth). Weights are NEVER in the image (PVC via HF_HOME). BUILD PATH DECIDED 2026-08-29: no new build tool — the tree is host-staged (uv on the build Mac; RUN is never needed) → k3sm build --format oci (COPY-only packaging, FROM scratch) → pushed via the narrow k3sm image push slice (B189, over the already-vendored go-containerregistry). The GHCR publish workflow stays a human-gated M9-adjacent deliverable (dormant-workflow-classified); pre-M9 publishes run from the lab Mac with the resulting digest recorded."
         acceptance:
           - id: M8.4-a1
-            met: false
+            met: false  # lab-ledger carve-out: the compiled tier (selftest 32/32 + shellcheck + mutation-checked) is green; the live build/walk-verify/push over the real 1.3GB closure is the M8.6-adjacent lab slice, runbook in hack/images/mlx-serve/README.md
             check: "the image builds reproducibly from the lockfile (--require-hashes), fits the S4 size budget, and a walk-verify asserts every Mach-O in the payload is signed or linker-ad-hoc-signed (S2 evidence, mechanized)."
             method: integration
       - id: M8.5
