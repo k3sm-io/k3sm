@@ -457,7 +457,8 @@ phases:
 
   - id: M8
     title: MLX — native Apple-Silicon ML serving (the NVIDIA-GPU-Operator analog for Mac)
-    status: todo
+    status: done
+    completed: 2026-08-30  # per-repo done under the lab-ledger carve-out; the WORKSPACE M8 gate stays open until m8.sh runs green on the apple-gpu rig (the recorded lab session)
     strategy: hard cut
     note: "LEDGER STUB. Launch-blocking (user decision: launch WITH MLX v1; m8.sh joins the launch-gate set — the public flip is M9). OWNERSHIP RECONCILED 2026-08-29 (m8-plan R23, resolving the three-owner M8.0 split): k3sm owns M8.0 (spikes S1–S5, agent-run on the lab Mac — R23), M8.3 (node extended-resource + labels), M8.4 (mlx-serve uv image under hack/images/), M8.5 (pkg/mlx operator), M8.6 (the m8.sh gate). apis owns M8.1 (mlx.k3sm.io/v1alpha1 CRD + reserved-band proto carve); runtimed owns M8.2 (Metal SBPL + egress + AdHocSignTree + GPUFacts — it CONSUMES the OCI-layer unpacker, re-homed 2026-07-11 to the runtimed M11.2 wave as M11.2-d7, via its depends edge; M8 is sequenced after that wave in the amended launch chain). M8.6 ALSO AUTHORS examples/mlxmodel.yaml + docs/user/mlx-quickstart.md (2026-08-29, m8-plan R24 — re-homed from M7.2/M7.3, which are launch-deferred with M7). NO M8-lab row — a GPU dev-mac covers it (Res. 15). All wire/API change is additive (new CRD group, reserved-band proto fields default-false)."
     depends_on:
@@ -531,14 +532,15 @@ phases:
             method: unit
       - id: M8.6
         title: gate — k3sm/hack/acceptance/m8.sh
-        status: todo
+        status: done
+        completed: 2026-08-30
         deliverables:
           - id: M8.6-d1
-            done: false
+            done: true  # 2026-08-30, k3sm#200 — the real m8.sh (concurrent leg per the S5 evidence) + mlxmodel.yaml (pinned revision, render-verified) + mlx-quickstart + the de-skeletoned phases.json row + the authorized linter case
             desc: "STUB (M8.6). hack/acceptance/m8.sh, requires [dev-mac, apple-gpu, network] (dev-mac is a phases.json requires-token, NOT a K3SM_CI_REQUIRE taxonomy member — Res. 19); no M8-lab row. Pinned small model repo+revision (e.g. mlx-community/Qwen3-0.6B-4bit at a pinned HF commit), cache pre-seeded. Sequence: apply examples/mlxmodel.yaml → status Ready (conditions, not just Phase) → OpenAI chat completion via the ClusterIP returns tokens → records TTFT + tokens/sec through the ClusterIP path vs the direct backend → delete → GC-clean per the whenDeleted:Delete deletion contract (poll-to-absent, bounded timeout — Res. 2). m8.sh also gates mlx-quickstart.md; M8.6 ALSO AUTHORS examples/mlxmodel.yaml + docs/user/mlx-quickstart.md (2026-08-29, m8-plan R24 — one owner with the gate, re-homed from M7.2/M7.3)."
         acceptance:
           - id: M8.6-a1
-            met: false
+            met: false  # lab-ledger carve-out: the compiled tier is orchestrator-verified; the live run is THE M8 milestone gate — runbook: hack/images/mlx-serve/README.md publish (digest recorded, pull Secret) then K3SM_MLX_IMAGE=@sha256 m8.sh on the apple-gpu rig; also carries M8.2-a4 and M8.4-a1's live halves + the S1 datapath leg
             check: "hack/acceptance/m8.sh green on an apple-gpu dev-mac: MLXModel → Ready → an OpenAI completion via the ClusterIP returns tokens → delete → every operator-owned object gone + PVC disposition exactly per whenDeleted:Delete."
             method: e2e
 
