@@ -68,6 +68,7 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
 
+	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	"k3sm.io/k3sm/pkg/policy"
 )
 
@@ -338,6 +339,21 @@ func decodeDocument(doc []byte) (string, []podTarget, error) {
 		return tm.Kind, nil, strict(&o)
 	case "networking.k8s.io/v1/NetworkPolicy":
 		var o networkingv1.NetworkPolicy
+		return tm.Kind, nil, strict(&o)
+
+	// A k3sm CRD, strict-decoded against the SAME Go type the MLX operator
+	// reconciles, so a misspelled spec field in an example is caught here rather
+	// than dropped by the apiserver — which would silently change what the example
+	// teaches while still applying cleanly.
+	//
+	// It returns NO podTarget, and that is the point rather than an omission: an
+	// MLXModel carries no pod spec. The operator renders the StatefulSet and stamps
+	// the darwin nodeSelector, the provider toleration and the GPU resource onto
+	// those pods itself. Demanding the pod-shape rules of the MLXModel document
+	// would therefore fail a correct example for lacking fields that do not exist
+	// in its schema.
+	case "mlx.k3sm.io/v1alpha1/MLXModel":
+		var o mlxv1alpha1.MLXModel
 		return tm.Kind, nil, strict(&o)
 	}
 	return tm.Kind, nil, fmt.Errorf("unsupported kind %q — teach hack/examples/lintexamples about it "+
