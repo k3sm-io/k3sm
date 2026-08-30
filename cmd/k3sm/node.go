@@ -54,6 +54,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
@@ -133,6 +134,18 @@ type nodeOptions struct {
 	// cluster-DNS lookup for ~2s per search candidate before falling through,
 	// where the pre-injection behavior deferred to the host resolver immediately.
 	standalone bool
+
+	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
+	// runtime as soon as it is built, so a consumer started EARLIER in the same
+	// process can read runtime-info facts off the SAME runtime this node drives.
+	//
+	// `k3sm server` sets it (the MLX operator it starts before the node needs the
+	// node's GPU facts for its pre-render fit check); every other bring-up leaves
+	// it nil and publishes nothing, which is why the hook is one optional callback
+	// rather than a return value — the standalone `k3sm node` and `k3sm agent`
+	// paths keep their exact current shape. It is never called on the hostprocess
+	// runtime, which has no runtimed to ask.
+	attachRuntimeInfo func(operator.RuntimeInfoSource)
 }
 
 // serverKubeletListen is the kubelet HTTP API listen address the in-process node
@@ -819,6 +832,15 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// that GAINS or LOSES Rosetta needs `launchctl kickstart -k system/io.k3sm.server`
 		// before the label tracks it — is documented in docs/user/vm-runtimeclass.md
 		// and the loss-direction ceiling in docs/user/limitations.md.
+
+		// Hand the runtime to a consumer that was started before this node existed
+		// (the server's MLX operator — see nodeOptions.attachRuntimeInfo). It is
+		// published, not re-probed: the operator reads its GPU facts off the SAME
+		// in-process runtime, so there is no second connection and no second
+		// observation to disagree with the capability read below.
+		if opts.attachRuntimeInfo != nil {
+			opts.attachRuntimeInfo(rt)
+		}
 		return provider.NewVKProvider(rt, opts.nodeName), adapter, runtimeRuntimed, rt.Capabilities(ctx), nil
 	default:
 		return nil, nil, "", provider.NodeCapabilities{}, fmt.Errorf("unknown --runtime %q (want %s or %s)", opts.runtime, runtimeRuntimed, runtimeHostProcess)

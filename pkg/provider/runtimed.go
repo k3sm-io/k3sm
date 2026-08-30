@@ -497,6 +497,27 @@ func (r *runtimedRuntime) Capabilities(ctx context.Context) NodeCapabilities {
 	return caps
 }
 
+// GetRuntimeInfo forwards one runtime-info probe to the in-process runtime,
+// verbatim — no interpretation, no fail-closed substitution.
+//
+// It exists so a consumer that needs a FACT off the runtime-info response rather
+// than a node-capability verdict (the MLX operator's GPU facts, which carry the
+// memory ceilings its pre-render fit check sizes against) can read it from the
+// SAME embedded runtime this provider already drives, instead of opening a second
+// connection to a daemon the shipped install does not even run standalone.
+//
+// It deliberately returns the error rather than swallowing it the way Capabilities
+// and Healthy do: those two answer "may this node advertise X", where an
+// unanswerable probe MUST read as no; this one answers "what did the runtime say",
+// where an unanswerable probe is not a fact about the host and the caller has to
+// be able to tell the two apart.
+//
+// The signature matches runtimev1.RuntimeServer's method exactly, so this value
+// satisfies a one-method consumer interface over that RPC with no adapter.
+func (r *runtimedRuntime) GetRuntimeInfo(ctx context.Context, req *runtimev1.GetRuntimeInfoRequest) (*runtimev1.GetRuntimeInfoResponse, error) {
+	return r.rt.GetRuntimeInfo(ctx, req)
+}
+
 // Healthy reports whether runtimed considers itself able to serve pods, from the
 // overall health flag on its runtime-info response (the conditions detail which
 // subsystem is at fault; this is the summary the node's Ready condition needs).
