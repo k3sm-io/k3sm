@@ -174,7 +174,10 @@ func (c *CA) IssueServing(cn string, dnsNames []string, ipAddrs []net.IP, validF
 // kube-apiserver-kubelet-client) would leave a cluster-admin credential on disk for
 // a job that needs no cluster authority at all. With no groups it is an unbound
 // user under the Node,RBAC authorization mode — default-deny at the apiserver, and
-// authorized ONLY at the kubelet endpoint whose predicate names it.
+// authorized ONLY at the kubelet endpoint whose predicate names it. (That
+// default-deny property is contingent on the authorization mode: under the
+// explicit --authorization-mode=AlwaysAllow diagnostic override, every
+// authenticated identity — this one included — has full apiserver access.)
 const APIServerKubeletClientCN = "k3sm-apiserver-kubelet-client"
 
 // IssueClient mints a fresh CLIENT keypair (ExtKeyUsageClientAuth) signed by this CA,

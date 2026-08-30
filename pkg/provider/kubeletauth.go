@@ -75,7 +75,7 @@ type KubeletEndpointAuth struct {
 // hard, typed failure: without a CA the endpoint can only be served open, which is
 // the exact posture this type exists to remove, so every caller fails to start
 // instead of degrading. Compare with errors.Is.
-var ErrNoKubeletClientCA = errors.New("provider: no client-identity CA for the kubelet endpoint")
+var ErrNoKubeletClientCA = errors.New("provider: no client-identity CA for the kubelet endpoint (on a rolling upgrade this is the expected fail-closed result of starting a new agent against a not-yet-upgraded server — upgrade the server first)")
 
 // NewKubeletEndpointAuth builds the kubelet endpoint's auth posture from the
 // PEM-encoded client-identity CA (the cluster's SIGNING CA: <workDir>/tls/signing-ca.crt
