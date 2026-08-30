@@ -261,10 +261,7 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 		return nil, renderErr(m, ErrNoImage)
 	}
 
-	port := m.Spec.Port
-	if port == 0 {
-		port = opts.DefaultPort
-	}
+	port := resolvePort(m, opts)
 	if port == 0 {
 		return nil, renderErr(m, ErrNoPort)
 	}
@@ -295,6 +292,18 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 		HeadlessService:  headlessService(m, owner, port),
 		ClusterIPService: clusterIPService(m, owner, port),
 	}, nil
+}
+
+// resolvePort is the ONE port-resolution rule: the spec's port, else the
+// operator default, else 0 meaning unresolvable. Status endpoint publication
+// resolves the port through this same function, because a status that names a
+// different port than the rendered Service exposes advertises an address nothing
+// is listening on.
+func resolvePort(m *mlxv1alpha1.MLXModel, opts Options) int32 {
+	if m.Spec.Port != 0 {
+		return m.Spec.Port
+	}
+	return opts.DefaultPort
 }
 
 // renderErr wraps err with the model it came from, so a caller logging one error
