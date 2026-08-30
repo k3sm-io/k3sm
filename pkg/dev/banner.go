@@ -19,6 +19,8 @@ package dev
 import (
 	"fmt"
 	"strings"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // FidelityBanner returns the SAFE/NEEDS-datapath/UNFAITHFUL text `k3sm dev up`
@@ -27,7 +29,8 @@ import (
 // is DatapathNone (rootless — datapath INERT) or DatapathDirect (root — datapath
 // live); the runtime argument (runtimeRuntimed / runtimeHostProcess) drives the
 // isolation line so a hostprocess (execshim-unavailable) fallback reports pods run
-// UNCONFINED honestly. The text is golden-tested (banner_test.go) so its warnings
+// UNCONFINED honestly. The datapath argument also drives the pod-IDENTITY
+// line — a distinct axis from confinement: the root tier runs pods as uid 0. The text is golden-tested (banner_test.go) so its warnings
 // cannot silently regress. The SAFE/UNFAITHFUL classes are the same on both tiers
 // (they are properties of k3sm, not of the privilege posture); only the leading
 // posture + isolation lines vary.
@@ -46,6 +49,21 @@ func FidelityBanner(datapath, runtime string) string {
 		b.WriteString("isolation: hostprocess — pods run UNCONFINED (no Seatbelt; dev-only, k3sm-execshim helper unavailable).\n")
 	} else {
 		b.WriteString("isolation: runtimed — pods are Seatbelt-confined via the k3sm-execshim helper.\n")
+	}
+	// Pod IDENTITY is a separate axis from confinement, and `--datapath` needs root,
+	// so on that tier a pod that declares no securityContext.runAsUser literally runs
+	// as uid 0 (provider.PodExecutionUID: no uid/gid on the PodBox => runtimed
+	// resolves Credential{Drop: false} => the pod keeps the daemon's own identity).
+	// That is strictly worse than the documented shipped posture — the installed
+	// LaunchDaemon runs as install.DefaultServiceUser — and it was invisible here
+	// until B209/B210, so the banner now says it outright on both tiers.
+	if datapath == DatapathDirect {
+		b.WriteString("pod identity: pods run as ROOT (uid 0) — a pod with no securityContext.runAsUser keeps this root\n")
+		b.WriteString("  daemon's identity. Seatbelt still confines them, but the installed cluster runs pods as the\n")
+		b.WriteString("  unprivileged " + install.DefaultServiceUser + " user; --datapath is dev-only. Do not run untrusted workloads on it.\n")
+	} else {
+		b.WriteString("pod identity: pods run as YOU (your own uid) — a pod with no securityContext.runAsUser keeps this\n")
+		b.WriteString("  daemon's identity; the installed cluster runs pods as the unprivileged " + install.DefaultServiceUser + " user.\n")
 	}
 	b.WriteString("\n")
 

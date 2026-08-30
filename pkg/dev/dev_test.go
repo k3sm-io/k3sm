@@ -637,3 +637,126 @@ contexts:
     user: admin
 current-context: k3sm
 `
+
+// TestListReportsUnknownNotStaleWhenUnprobeable is the B211 gate: an instance
+// whose pid EXISTS but cannot be signalled from this uid must never be reported
+// stale.
+//
+// Observed in the M8 gate run: an unprivileged `k3sm dev list` printed STATUS
+// stale for a healthy root-owned `--datapath` instance. The probe was
+// `kill(pid, 0) == nil`, which folds ESRCH (no such process) and EPERM (the
+// process exists, you may not signal it) into one "dead" answer. `stale` is the
+// word that invites a cleanup, so the misreport aimed the operator at a live
+// cluster.
+//
+// The table walks all three kernel answers through the faked seam, and asserts
+// both directions: unknown for EPERM, and — the anti-overcorrection half — still
+// stale for a genuinely-gone pid, so a fix that simply reported everything alive
+// would not pass.
+func TestListReportsUnknownNotStaleWhenUnprobeable(t *testing.T) {
+	const (
+		rootOwnedPID = 4242
+		livePID      = 1111
+		deadPID      = 2222
+	)
+	sys := newFakeSystem()
+	sys.unprobeable[rootOwnedPID] = true // kill -0 -> EPERM: exists, not signallable
+	sys.alivePIDs[livePID] = true        // kill -0 -> nil
+	// deadPID is in neither map: kill -0 -> ESRCH.
+
+	m := newTestManager(t, sys, 501) // unprivileged shell, the reported posture
+	for _, inst := range []Instance{
+		{Version: registryVersion, Name: "rootowned", PID: rootOwnedPID, Tier: "root", Datapath: DatapathDirect},
+		{Version: registryVersion, Name: "mine", PID: livePID, Tier: "rootless", Datapath: DatapathNone},
+		{Version: registryVersion, Name: "crashed", PID: deadPID, Tier: "rootless", Datapath: DatapathNone},
+		{Version: registryVersion, Name: "nopid", PID: 0, Tier: "rootless", Datapath: DatapathNone},
+	} {
+		if err := m.reg.Save(inst); err != nil {
+			t.Fatalf("save %s: %v", inst.Name, err)
+		}
+	}
+
+	statuses, err := m.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := map[string]InstanceStatus{}
+	for _, s := range statuses {
+		got[s.Name] = s
+	}
+	for _, tc := range []struct {
+		name     string
+		want     Liveness
+		wantWord string
+		// exists is the predicate every teardown/reclaim path signals on: an
+		// unprobeable instance must NOT be reapable, or the fix would only have
+		// moved the hazard from the report to the reclaim.
+		wantExists bool
+	}{
+		{"rootowned", LivenessUnknown, "unknown", true},
+		{"mine", LivenessRunning, "running", true},
+		{"crashed", LivenessDead, "stale", false},
+		{"nopid", LivenessDead, "stale", false},
+	} {
+		s, ok := got[tc.name]
+		if !ok {
+			t.Fatalf("List omitted instance %q", tc.name)
+		}
+		if s.Liveness != tc.want {
+			t.Errorf("%s: Liveness = %v (%s), want %v (%s)", tc.name, s.Liveness, s.Liveness, tc.want, tc.want)
+		}
+		if s.Liveness.String() != tc.wantWord {
+			t.Errorf("%s: STATUS word = %q, want %q", tc.name, s.Liveness.String(), tc.wantWord)
+		}
+		if s.Liveness.Exists() != tc.wantExists {
+			t.Errorf("%s: Exists() = %v, want %v", tc.name, s.Liveness.Exists(), tc.wantExists)
+		}
+	}
+	// The load-bearing assertion, named separately so the failure line says what
+	// the operator would have been told: never `stale` for a process that is there.
+	if w := got["rootowned"].Liveness.String(); w == "stale" {
+		t.Errorf("a root-owned instance whose pid EXISTS (kill EPERM) is reported %q — the word that invites a cleanup of a live cluster", w)
+	}
+	if got["rootowned"].Alive() {
+		t.Errorf("an unprobeable instance must not claim Alive() either — its state beyond existence is genuinely unknown")
+	}
+
+	// The faked seam above proves List's plumbing. This subtest proves the
+	// PRODUCTION classifier, because a fix that only taught the fake to say
+	// LivenessUnknown would leave the real kill(2) errno folded exactly as before.
+	// pid 1 is launchd: root-owned, always present, and kill -0 on it from an
+	// unprivileged process is the very EPERM the M8 run hit. Signal 0 changes
+	// nothing on the host — no privilege is taken, no process is touched.
+	t.Run("realSystem classifies a live root-owned pid", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root: kill(1, 0) succeeds, so EPERM cannot be observed here")
+		}
+		if got := NewSystem().ProcessLiveness(1); got != LivenessUnknown {
+			t.Errorf("ProcessLiveness(1) = %v, want unknown — launchd exists and is root-owned, so an unprivileged kill -0 is EPERM, not ESRCH", got)
+		}
+		if got := NewSystem().ProcessLiveness(0); got != LivenessDead {
+			t.Errorf("ProcessLiveness(0) = %v, want dead — a zero pid is no recorded process", got)
+		}
+	})
+}
+
+// TestUnprobeableInstanceIsNotReaped pins the reclaim half of B211: teardown
+// signals an instance it cannot probe rather than skipping it as already-dead.
+// Skipping would leave a live server running while its registry entry, kubeconfig
+// context and lo0 aliases were removed — a worse outcome than the misreport that
+// started this, and the reason Liveness.Exists (not == Running) is the predicate.
+func TestUnprobeableInstanceIsNotReaped(t *testing.T) {
+	const pid = 4242
+	sys := newFakeSystem()
+	sys.unprobeable[pid] = true
+	m := newTestManager(t, sys, 501)
+	if err := m.reg.Save(Instance{Version: registryVersion, Name: "rootowned", PID: pid, Tier: "root", Datapath: DatapathDirect}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := m.teardown(Instance{Name: "rootowned", PID: pid, Tier: "root", Datapath: DatapathDirect}); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if !slices.Contains(sys.terminated, pid) {
+		t.Errorf("teardown terminated %v, want it to signal the unprobeable pid %d — an EPERM probe is not permission to walk away from a live server", sys.terminated, pid)
+	}
+}

@@ -44,6 +44,12 @@ workloads must use the **`vm` RuntimeClass** (Virtualization.framework), which g
 boundary. See [vm-runtimeclass.md](vm-runtimeclass.md) for how to opt in. The same framing appears in
 [concepts.md](concepts.md).
 
+On the **`k3sm dev --datapath` tier only**, it is worse than that: `--datapath` runs the server as
+root, and a Pod that declares no `securityContext.runAsUser` keeps the daemon's identity — so those
+Pods run as **uid 0**. They are still Seatbelt-confined, and no installed cluster behaves this way
+(the LaunchDaemon runs as `_k3sm`), but `--datapath` is a disposable dev tier: do not run untrusted
+workloads on it. `k3sm dev up --datapath` says the same thing in its banner.
+
 ### Volume mounts resolve for native workloads, not `/bin/sh`
 
 k3sm pods run at real host paths with **no chroot / mount namespace**, so a volume mounted at an

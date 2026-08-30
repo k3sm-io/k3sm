@@ -162,10 +162,10 @@ func runDevList(args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tTIER\tRUNTIME\tDATAPATH\tAPI\tPID\tSTATUS\tAGE\tCONTEXT")
 	for _, s := range statuses {
-		status := "stale"
-		if s.Alive {
-			status = "running"
-		}
+		// running | unknown | stale. `unknown` is a root-owned instance probed from
+		// an unprivileged shell (kill EPERM): the process EXISTS, so calling it
+		// `stale` — the word that invites a cleanup — was a lie (B211).
+		status := s.Liveness.String()
 		// An empty Runtime on a pre-fallback manifest reads as runtimed (the default
 		// before the hostprocess-fallback field existed).
 		rt := s.Runtime
