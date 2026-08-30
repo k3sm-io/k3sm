@@ -461,6 +461,19 @@ type NodeCapabilities struct {
 	// without the vm backend there is no guest to translate in (see
 	// cmd/k3sm applyRosettaLabels).
 	RosettaGuest bool
+	// GPU is the host's GPU facts as runtimed reports them, carried VERBATIM from
+	// GetRuntimeInfoResponse.gpu (the raw chip_brand keeps its spaces — the node-label
+	// slug is derived by the advertiser, per the mlx.k3sm.io chip-slug rule). It drives
+	// the mlx.k3sm.io/gpu extended resource and the mlx.k3sm.io chip/memory labels (see
+	// cmd/k3sm applyGPUAdvertisement).
+	//
+	// nil means this daemon reports no GPU facts AT ALL — an older daemon — which is
+	// DISTINCT from a report of a host with no usable GPU (present, MetalAvailable
+	// false). The two are deliberately not collapsed here: they advertise the same
+	// nothing, but only one of them is fixed by upgrading the daemon, and the consumer
+	// says so in its log line. A pointer, unlike the bools above, is therefore a
+	// three-state fact and its zero value still fails CLOSED.
+	GPU *runtimev1.GPUFacts
 }
 
 // Capabilities probes runtimed ONCE and reports every node capability the node
@@ -519,6 +532,11 @@ func nodeCapabilitiesFromInfo(info *runtimev1.GetRuntimeInfoResponse) NodeCapabi
 		VMBackend:    conditionTrue(info, runtimed.ConditionVMBackendAvailable),
 		RosettaHost:  conditionTrue(info, runtimed.ConditionRosettaHostAvailable),
 		RosettaGuest: conditionTrue(info, runtimed.ConditionRosettaGuestAvailable),
+		// The GPU facts are a MESSAGE on the response, not a RuntimeCondition, so they
+		// are read straight through rather than via conditionTrue. The getter is
+		// nil-safe on both the response and the field, which is what makes the
+		// older-daemon case (no gpu field) a nil that advertises nothing.
+		GPU: info.GetGpu(),
 	}
 }
 

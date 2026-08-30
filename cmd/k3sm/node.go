@@ -1163,7 +1163,8 @@ func nodeAllocatable(capacity corev1.ResourceList, memReserveBytes int64) corev1
 // (the load-bearing placement guard) so stray non-darwin pods cannot land here.
 //
 // caps is the ONE fail-closed capability snapshot buildProvider probed from runtimed;
-// its zero value advertises nothing.
+// its zero value advertises nothing — including its GPU facts, which additionally
+// drive the mlx.k3sm.io/gpu extended resource on Capacity/Allocatable.
 func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabilities) {
 	labels := nodeLabels(n)
 	labels["kubernetes.io/os"] = "darwin"
@@ -1241,6 +1242,15 @@ func configureNode(n *corev1.Node, name, ip string, caps provider.NodeCapabiliti
 		"reserve_bytes", reserve,
 		"allocatable_mem_bytes", n.Status.Allocatable.Memory().Value(),
 		"reserve_term", reserveTerm)
+	// GPU advertisement: the mlx.k3sm.io/gpu extended resource in Capacity AND
+	// Allocatable plus the mlx.k3sm.io chip/memory labels, fail-closed off runtimed's
+	// GPUFacts and REMOVED on capability loss (see applyGPUAdvertisement). It runs
+	// AFTER both resource lists are built, deliberately: nodeAllocatable DeepCopies
+	// Capacity, so advertising earlier would have the GPU reach Allocatable by copy
+	// rather than by decision — and the removal direction would then have to know
+	// about that coupling to undo it from both.
+	applyGPUAdvertisement(n, caps.GPU)
+
 	n.Status.Addresses = []corev1.NodeAddress{
 		{Type: corev1.NodeInternalIP, Address: ip},
 		{Type: corev1.NodeHostName, Address: name},
