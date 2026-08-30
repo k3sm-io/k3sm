@@ -24,6 +24,13 @@
 #                     it reads a projection, and observedGeneration is what proves
 #                     the condition describes THIS spec rather than the last one.
 #   m8.5  endpoint  — the ClusterIP Service and the published status.endpoint.
+#   m8.5-c served id— GET /v1/models, asserted singular, IS the id every
+#                     completion below posts. The engine registers whatever it
+#                     decided to call the served snapshot (often a resolved
+#                     on-disk PATH, not examples/mlxmodel.yaml's repo id), so
+#                     posting the spec's repo id 404s a Ready pod (lab D10).
+#                     m8.0-b's pin check is untouched: it pins the SPEC, not
+#                     the served name.
 #   m8.6  completion— one OpenAI chat completion through the ClusterIP returns
 #                     actual tokens.
 #   m8.7  CONCURRENT— N simultaneous completions, ALL of which must succeed.
@@ -120,6 +127,7 @@ if [ "${1:-}" = "--plan" ] || [ "${1:-}" = "--dry-run" ]; then
 	echo "  m8.3  volume      cache PVC Bound; seed copied into the PV local path"
 	echo "  m8.4  ready       status.conditions[Ready]=True AND observedGeneration current"
 	echo "  m8.5  endpoint    ClusterIP allocated; status.endpoint published"
+	echo "  m8.5-c served id  GET /v1/models (singular) — the id every completion posts"
 	echo "  m8.6  completion  POST /v1/chat/completions via the ClusterIP returns tokens"
 	echo "  m8.7  concurrent  $CONCURRENCY simultaneous completions ALL succeed (S5-binding)"
 	echo "  m8.8  latency     TTFT + tokens/sec, ClusterIP vs direct pod (recorded)"
@@ -340,13 +348,46 @@ POD_IP="$(kubectl get pod "$STS-0" -n "$NS" -o jsonpath='{.status.podIP}' 2>/dev
 
 VIP="$CLUSTER_IP:$SERVING_PORT"
 
+# --------------------------------------------------------------------------------
+# m8.5-c the served model id — GET /v1/models, never assumed from the spec.
+#
+# The engine registers whatever it decided to call the served snapshot — often
+# a resolved on-disk PATH, not examples/mlxmodel.yaml's repo id — so a
+# completion posted against MODEL_REPO 404s a Ready pod (lab D10). Ask the
+# serving surface directly, require EXACTLY one model listed (a plural listing
+# would make "the" served id ambiguous), and use THAT id for every completion
+# below. m8.0-b's pin check is a different assertion (the SPEC matches the
+# gate's pins) and is untouched by this rung.
+# --------------------------------------------------------------------------------
+models_body="$(mktemp)"
+models_code="$(curl -sS -m "$REQ_TIMEOUT" -o "$models_body" -w '%{http_code}' "http://$VIP/v1/models" 2>/dev/null || echo 000)"
+SERVED_MODEL_ID="$(python3 - "$models_body" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    data = d.get("data", [])
+    if len(data) == 1:
+        print(data[0]["id"])
+except Exception:
+    pass
+PY
+)"
+rm -f "$models_body"
+if [ "$models_code" = "200" ] && [ -n "$SERVED_MODEL_ID" ]; then
+	ladder ok "m8.5-c  /v1/models lists exactly one model — served id: $SERVED_MODEL_ID"
+else
+	ladder no "m8.5-c  /v1/models did not list exactly one model (http $models_code) — cannot derive the served id"
+	echo "----------------------------------------"; echo "M8: $PASS passed, $FAIL failed, $SKIP skipped"; exit 1
+fi
+
 # completion <addr> <max_tokens> <outfile> -> prints "<http_code> <ttfb> <total>"
 # The body is written to outfile so the caller can assert on content; only the
-# timing triple comes back on stdout.
+# timing triple comes back on stdout. Posts SERVED_MODEL_ID (m8.5-c), never
+# MODEL_REPO — the served id is what the engine actually answers to.
 completion() {
 	curl -sS -m "$REQ_TIMEOUT" -o "$3" -w '%{http_code} %{time_starttransfer} %{time_total}' \
 		-H 'Content-Type: application/json' \
-		-d "{\"model\":\"$MODEL_REPO\",\"messages\":[{\"role\":\"user\",\"content\":\"Name three primary colours.\"}],\"max_tokens\":$2,\"temperature\":0}" \
+		-d "{\"model\":\"$SERVED_MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"Name three primary colours.\"}],\"max_tokens\":$2,\"temperature\":0}" \
 		"http://$1/v1/chat/completions" 2>/dev/null || echo "000 0 0"
 }
 
