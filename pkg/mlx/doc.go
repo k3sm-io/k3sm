@@ -1,0 +1,62 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package mlx renders an MLXModel into the API objects that serve it: a
+// StatefulSet, its headless governing Service, and the stable ClusterIP Service
+// clients talk to.
+//
+// This package is the RENDER half of the MLX operator and nothing else. Render
+// is a PURE function — spec in, objects out — so the whole serving shape is
+// decided by a table test rather than by watching a cluster. It performs no IO,
+// reads no cluster state, writes no status, and starts nothing; the reconcile
+// loop that applies these objects and derives status lives elsewhere.
+//
+// Four properties of the rendered shape are load bearing, and each exists
+// because its absence fails in a way a functional test would not notice:
+//
+//   - READINESS ONLY, NO LIVENESS OR STARTUP PROBE. A model's first start is an
+//     unbounded download-then-load window (tens of minutes for a large model). A
+//     liveness or startup probe turns that window into a kill, and the restart
+//     re-downloads from zero — a crash loop that never converges and looks like
+//     a slow network. Readiness alone keeps the replica out of the Service until
+//     it can serve, which is the only thing a probe is needed for here.
+//
+//   - CONTROLLER ownerReferences ON EVERY OBJECT. Without them `kubectl delete
+//     mlxmodel` cascades nothing: the StatefulSet, both Services, and (through
+//     the retention policy below) the cache PVCs all outlive the object that
+//     asked for them, and the leak is invisible until a node fills up.
+//
+//   - persistentVolumeClaimRetentionPolicy whenDeleted: Delete. ownerReferences
+//     do NOT cascade through the PVCs a StatefulSet creates from a
+//     volumeClaimTemplate, so deleting the MLXModel would otherwise strand one
+//     model-sized volume per replica. whenScaled stays Retain deliberately: a
+//     scale-down is reversible and the cache it would destroy costs another full
+//     download to rebuild.
+//
+//   - THE FIXED GUARDRAIL STANZA — the kubernetes.io/os=darwin nodeSelector, the
+//     mlx.k3sm.io/gpu.present selector, the k3sm provider toleration, and the
+//     GPU extended resource in BOTH requests and limits. These are template
+//     content, not user input: k3sm's own admission policy rejects pod CREATEs
+//     that lack them, and the rejection lands on the StatefulSet controller
+//     rather than on the operator — so a missing stanza surfaces as a
+//     StatefulSet that quietly never creates a pod, with the reason buried in
+//     controller-manager events.
+//
+// Every identifier that crosses a process boundary — the GPU resource name, the
+// GPU presence label, the provider taint key — is taken from its owning package
+// (k3sm.io/apis/mlx/v1alpha1, k3sm.io/k3sm/pkg/policy) and never respelled here.
+// A literal copy compiles perfectly while being wrong.
+package mlx
