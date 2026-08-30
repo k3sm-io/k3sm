@@ -14,15 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package mlx renders an MLXModel into the API objects that serve it: a
+// Package mlx renders an MLXModel into the API objects that serve it — a
 // StatefulSet, its headless governing Service, and the stable ClusterIP Service
-// clients talk to.
+// clients talk to — and derives that model's status back from the pods those
+// objects produce.
 //
-// This package is the RENDER half of the MLX operator and nothing else. Render
-// is a PURE function — spec in, objects out — so the whole serving shape is
-// decided by a table test rather than by watching a cluster. It performs no IO,
-// reads no cluster state, writes no status, and starts nothing; the reconcile
-// loop that applies these objects and derives status lives elsewhere.
+// This package is the PURE half of the MLX operator. Render is spec in, objects
+// out; DeriveStatus is observed pod and probe state in, status out. Neither
+// performs IO, reads cluster state, writes anything, or starts anything — so the
+// serving shape and the whole status machine are each decided by a table test
+// rather than by watching a cluster. The reconcile loop that applies the
+// objects, probes the replicas, and PATCHes the status through the status
+// subresource lives elsewhere.
 //
 // Four properties of the rendered shape are load bearing, and each exists
 // because its absence fails in a way a functional test would not notice:
@@ -54,6 +57,14 @@ limitations under the License.
 //     rather than on the operator — so a missing stanza surfaces as a
 //     StatefulSet that quietly never creates a pod, with the reason buried in
 //     controller-manager events.
+//
+// The status half is bound by what those properties leave observable. With a
+// readiness probe and nothing else, a not-ready replica is one bit; the operator
+// splits it into Downloading and Loading using its own serving-surface probe
+// verdict (injected, never fetched here), and claims nothing that would need a
+// liveness signal the pod deliberately does not carry. Phase is a projection of
+// the Ready condition rather than a second computation beside it, and the
+// endpoint is published only while the model is Ready — see DeriveStatus.
 //
 // Every identifier that crosses a process boundary — the GPU resource name, the
 // GPU presence label, the provider taint key — is taken from its owning package
