@@ -15,13 +15,26 @@ This is the simplest path and needs no extra setup after install.
 
 ## Using a standalone kubectl
 
-The install step writes an **admin kubeconfig** into the invoking user's home directory. Point your own
-`kubectl` (or any client) at it:
+`sudo k3sm install` **merges** an admin cluster/user/context into the invoking user's
+`~/.kube/config`, preserving whatever was already there. So after install your own `kubectl` reaches
+the cluster with no `KUBECONFIG` export at all:
 
 ```sh
-export KUBECONFIG="$HOME/.kube/k3sm.yaml"   # path as reported by `k3sm install` / `k3sm kubectl config`
+kubectl config get-contexts    # the k3sm context is there
 kubectl get nodes
 ```
+
+To get the kubeconfig somewhere else — a second machine, a CI secret, a file of its own — use
+**`k3sm kubeconfig`**, which prints the admin kubeconfig on stdout, or merges it into a file you name:
+
+```sh
+k3sm kubeconfig > ~/k3sm.yaml                  # print it
+k3sm kubeconfig --write --path ~/other.yaml    # merge it into another kubeconfig
+```
+
+(There is no `k3sm kubectl config` that reports a k3sm-specific path: `k3sm kubectl` is a pure
+passthrough to the bundled `kubectl`, so `k3sm kubectl config` is upstream `kubectl config` and knows
+nothing about k3sm's layout.)
 
 Because the control plane is a **real upstream kube-apiserver**, standard clients, RBAC, and API
 machinery work normally. The divergences are on the **node** side (how Pods run), not the API surface —
