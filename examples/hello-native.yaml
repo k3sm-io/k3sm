@@ -1,31 +1,39 @@
-# k3sm M0 demo — a Kubernetes Pod that runs as a NATIVE macOS process
-# (no Linux, no container, no VM) via the HostProcess Virtual Kubelet provider.
+# k3sm demo — a Kubernetes Pod that runs as a NATIVE macOS process
+# (no Linux, no container, no VM).
 #
 #   kubectl apply -f examples/hello-native.yaml
 #   kubectl get pods -o wide          # Running on the k3sm darwin node
 #   pgrep -fl tail                    # the real native process on your Mac
-#   kubectl delete pod hello-native   # provider SIGKILLs the process group
+#   kubectl delete pod hello-native   # the node SIGKILLs the process group
 #
-# container.command/args is the native argv; the `image` field is a placeholder
-# (native macOS workloads have no image ecosystem yet — that arrives in M1).
+# Two fields are REQUIRED on every k3sm Pod and this manifest is the minimal
+# shape that carries them:
+#
+#   * nodeSelector kubernetes.io/os=darwin — a cluster ValidatingAdmissionPolicy
+#     REJECTS a Pod without it (the guardrail that keeps Linux-assuming
+#     workloads off these nodes).
+#   * a toleration for k3sm.io/provider:NoSchedule — every k3sm node carries
+#     that taint, so an untolerating Pod stays Unschedulable.
+#
+# `image: native` is the sentinel for "command[0] is an absolute host binary".
+# For an image-backed workload, see docs/user/images.md.
 apiVersion: v1
 kind: Pod
 metadata:
   name: hello-native
   namespace: default
 spec:
-  nodeName: k3sm-m0          # pin to the k3sm node (no scheduler needed for the demo)
-  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/os: darwin
   tolerations:
-  - operator: Exists
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  restartPolicy: Never
   containers:
-  - name: hello
-    image: native            # placeholder; the command below is what runs
-    command:
-    - /bin/sh
-    - -c
-    - |
-      echo 'hello from a k3sm NATIVE pod'
-      /usr/bin/sw_vers
-      echo started-ok
-      exec /usr/bin/tail -f /dev/null
+    - name: hello
+      image: native
+      command:
+        - /usr/bin/tail
+        - -f
+        - /dev/null

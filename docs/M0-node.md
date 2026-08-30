@@ -36,8 +36,21 @@ KCFG=/tmp/k3sm-spike/spike.kubeconfig          # produced by hack/spike/run.sh
 # 2. the node (HostProcess runtime)
 go run ./cmd/k3sm node --kubeconfig "$KCFG" --node-name k3sm-m0 --pod-root /tmp/k3sm-pods
 
-# 3. a native pod
-kubectl --kubeconfig "$KCFG" apply -f examples/hello-native.yaml
+# 3. a native pod. examples/hello-native.yaml is now the FULL-CLUSTER shape
+#    (scheduler-placed, os=darwin nodeSelector, provider toleration); this spike
+#    has neither a scheduler nor the admission policy, so pin nodeName here.
+kubectl --kubeconfig "$KCFG" apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: hello-native, namespace: default}
+spec:
+  nodeName: k3sm-m0
+  restartPolicy: Never
+  containers:
+    - name: hello
+      image: native
+      command: ["/usr/bin/tail", "-f", "/dev/null"]
+EOF
 kubectl --kubeconfig "$KCFG" get pods -o wide
 pgrep -fl tail                                  # the real process
 kubectl --kubeconfig "$KCFG" delete pod hello-native
