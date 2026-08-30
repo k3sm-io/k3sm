@@ -86,21 +86,52 @@ func dockerSaveFixture(t *testing.T, tags ...string) []byte {
 	})
 }
 
-// ociLayoutFixture is a tarred OCI image layout. An empty refName omits the
-// ref.name annotation, which is the case that must fall back to --reference.
+// dockerSaveMultiImageFixture is a `docker save` archive whose manifest.json
+// carries TWO entries — the docker-save mirror of a multi-manifest layout.
+func dockerSaveMultiImageFixture(t *testing.T, tags ...string) []byte {
+	t.Helper()
+	entries := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		entries = append(entries, fmt.Sprintf(
+			`{"Config":"config.json","RepoTags":[%q],"Layers":["layer.tar"]}`, tag))
+	}
+	return buildLoadTar(t, []loadTarEntry{
+		{name: "config.json", body: `{"architecture":"arm64","os":"darwin"}`},
+		{name: "layer.tar", body: strings.Repeat("payload-bytes\n", 512)},
+		{name: "manifest.json", body: "[" + strings.Join(entries, ",") + "]"},
+	})
+}
+
+// ociLayoutFixture is a tarred OCI image layout indexing ONE image. An empty
+// refName omits the ref.name annotation, which is the case that must fall back
+// to --reference.
 func ociLayoutFixture(t *testing.T, refName string) []byte {
 	t.Helper()
-	annotations := ""
-	if refName != "" {
-		annotations = fmt.Sprintf(`,"annotations":{"org.opencontainers.image.ref.name":%q}`, refName)
+	return ociLayoutFixtureN(t, refName)
+}
+
+// ociLayoutFixtureN is a tarred OCI image layout indexing one manifest per
+// refName — zero of them for an empty layout, several for the multi-image
+// archive v1 refuses. The count is the variable the refusal turns on, so it is
+// the fixture's parameter.
+func ociLayoutFixtureN(t *testing.T, refNames ...string) []byte {
+	t.Helper()
+	digest := strings.Repeat("ab", 32)
+	manifests := make([]string, 0, len(refNames))
+	for _, refName := range refNames {
+		annotations := ""
+		if refName != "" {
+			annotations = fmt.Sprintf(`,"annotations":{"org.opencontainers.image.ref.name":%q}`, refName)
+		}
+		manifests = append(manifests, fmt.Sprintf(`{`+
+			`"mediaType":"application/vnd.oci.image.manifest.v1+json",`+
+			`"digest":"sha256:%s","size":123%s}`, digest, annotations))
 	}
-	index := fmt.Sprintf(`{"schemaVersion":2,"manifests":[{`+
-		`"mediaType":"application/vnd.oci.image.manifest.v1+json",`+
-		`"digest":"sha256:%s","size":123%s}]}`, strings.Repeat("ab", 32), annotations)
+	index := fmt.Sprintf(`{"schemaVersion":2,"manifests":[%s]}`, strings.Join(manifests, ","))
 	return buildLoadTar(t, []loadTarEntry{
 		{name: "oci-layout", body: `{"imageLayoutVersion":"1.0.0"}`},
 		{name: "index.json", body: index},
-		{name: "blobs/sha256/" + strings.Repeat("ab", 32), body: strings.Repeat("blob-bytes\n", 512)},
+		{name: "blobs/sha256/" + digest, body: strings.Repeat("blob-bytes\n", 512)},
 	})
 }
 
@@ -136,6 +167,9 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 	layout := ociLayoutFixture(t, "example.test/app:v2")
 	layoutNoRef := ociLayoutFixture(t, "")
 	multiTag := dockerSaveFixture(t, "example.test/app:v1", "example.test/app:latest")
+	multiManifest := ociLayoutFixtureN(t, "example.test/app:v1", "example.test/app:v2")
+	multiImage := dockerSaveMultiImageFixture(t, "example.test/app:v1", "example.test/other:v1")
+	emptyLayout := ociLayoutFixtureN(t)
 
 	tests := []struct {
 		name       string
@@ -147,6 +181,11 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 		wantRef    string
 		wantOut    []string
 		wantErr    string
+		// wantUnstreamed marks a refusal the CLI must make BEFORE it opens the
+		// stream. Asserting only on the error would pass just as well if the
+		// archive had been shipped and then rejected, which is a different
+		// (and worse) behaviour on a multi-GB file.
+		wantUnstreamed bool
 	}{
 		{
 			name:    "docker-save streams with the reference the archive names",
@@ -198,7 +237,8 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "import", path}
 			},
-			wantErr: "--reference",
+			wantErr:        "--reference",
+			wantUnstreamed: true,
 		},
 		{
 			name:    "an unannotated layout is loadable with --reference",
@@ -216,7 +256,35 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "load", path}
 			},
-			wantErr: "more than one tag",
+			wantErr:        "more than one tag",
+			wantUnstreamed: true,
+		},
+		{
+			name:    "a multi-image docker-save archive is refused, never silently narrowed",
+			archive: multiImage,
+			args: func(sock, path string) []string {
+				return []string{"--socket", sock, "load", path}
+			},
+			wantErr:        "contains 2 images",
+			wantUnstreamed: true,
+		},
+		{
+			name:    "a multi-image OCI layout is refused, never silently narrowed",
+			archive: multiManifest,
+			args: func(sock, path string) []string {
+				return []string{"--socket", sock, "import", path}
+			},
+			wantErr:        "indexes 2 images",
+			wantUnstreamed: true,
+		},
+		{
+			name:    "a layout indexing nothing is refused",
+			archive: emptyLayout,
+			args: func(sock, path string) []string {
+				return []string{"--socket", sock, "import", path}
+			},
+			wantErr:        "indexes no image",
+			wantUnstreamed: true,
 		},
 		{
 			name:    "an OCI layout handed to load names the right verb",
@@ -224,7 +292,8 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "load", path}
 			},
-			wantErr: "k3sm image import",
+			wantErr:        "k3sm image import",
+			wantUnstreamed: true,
 		},
 		{
 			name:    "a docker-save archive handed to import names the right verb",
@@ -232,7 +301,8 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 			args: func(sock, path string) []string {
 				return []string{"--socket", sock, "import", path}
 			},
-			wantErr: "k3sm image load",
+			wantErr:        "k3sm image load",
+			wantUnstreamed: true,
 		},
 		{
 			name:    "a digest mismatch from the daemon fails the command",
@@ -271,6 +341,9 @@ func TestImageLoadDockerSaveAndOCILayout(t *testing.T) {
 				}
 				if !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v; want one containing %q", err, tc.wantErr)
+				}
+				if tc.wantUnstreamed && fake.loadFirst != nil {
+					t.Errorf("the archive was streamed before the CLI refused it")
 				}
 				return
 			}
