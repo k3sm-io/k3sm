@@ -33,12 +33,13 @@ type fakeSystem struct {
 	removed      []string        // addresses passed to Lo0RemoveAlias
 	aliasErr     error           // Lo0Aliases error injection
 	removeErr    error           // Lo0RemoveAlias error injection
-	alivePIDs    map[int]bool    // ProcessAlive lookup
+	alivePIDs    map[int]bool    // pids ProcessLiveness reports LivenessRunning for
+	unprobeable  map[int]bool    // pids ProcessLiveness reports LivenessUnknown for (kill EPERM)
 	terminated   []int           // pids passed to TerminateProcess
 	busyPorts    map[int]bool    // ports PortFree reports false for
 	lockHeld     map[string]bool // paths currently locked (LOCK_NB semantics)
 	lockFailNext bool            // force the next LockFile to fail
-	// aliveProbe, when set, answers ProcessAlive instead of the in-memory pid
+	// aliveProbe, when set, answers ProcessLiveness instead of the in-memory pid
 	// table. A test that spawns a REAL child (the bring-up gates) needs the
 	// liveness seam to tell the truth about it; the map cannot.
 	aliveProbe func(int) bool
@@ -46,9 +47,10 @@ type fakeSystem struct {
 
 func newFakeSystem() *fakeSystem {
 	return &fakeSystem{
-		alivePIDs: map[int]bool{},
-		busyPorts: map[int]bool{},
-		lockHeld:  map[string]bool{},
+		alivePIDs:   map[int]bool{},
+		unprobeable: map[int]bool{},
+		busyPorts:   map[int]bool{},
+		lockHeld:    map[string]bool{},
 	}
 }
 
@@ -78,15 +80,28 @@ func (f *fakeSystem) Lo0RemoveAlias(ip string) error {
 	return nil
 }
 
-func (f *fakeSystem) ProcessAlive(pid int) bool {
+func (f *fakeSystem) ProcessLiveness(pid int) Liveness {
 	f.mu.Lock()
 	probe := f.aliveProbe
 	alive := f.alivePIDs[pid]
+	eperm := f.unprobeable[pid]
 	f.mu.Unlock()
 	if probe != nil {
-		return probe(pid)
+		if probe(pid) {
+			return LivenessRunning
+		}
+		return LivenessDead
 	}
-	return alive
+	// The EPERM seam: the pid exists but this uid cannot signal it. Checked BEFORE
+	// alivePIDs so a test can model "root-owned and unprobeable" without also
+	// having to claim the fake can see it running.
+	if eperm {
+		return LivenessUnknown
+	}
+	if alive {
+		return LivenessRunning
+	}
+	return LivenessDead
 }
 
 func (f *fakeSystem) TerminateProcess(pid int, _ time.Duration) error {

@@ -17,6 +17,7 @@ limitations under the License.
 package dev
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -43,9 +44,12 @@ type System interface {
 	// rootless tier runs network=none), so a flush there is a no-op over an empty
 	// set.
 	Lo0RemoveAlias(ip string) error
-	// ProcessAlive reports whether pid is a live process (kill -0). A stale pid
-	// from a crashed prior run reads false, so pre-flight reclaim reaps it.
-	ProcessAlive(pid int) bool
+	// ProcessLiveness reports whether pid is a live process, as a THREE-valued
+	// verdict (kill -0). A stale pid from a crashed prior run reads LivenessDead,
+	// so pre-flight reclaim reaps it; a pid this uid may not signal reads
+	// LivenessUnknown, which is NOT dead. See the Liveness doc for why the
+	// two-valued predicate this replaced was wrong (B211).
+	ProcessLiveness(pid int) Liveness
 	// TerminateProcess sends SIGTERM to pid's process group, waits up to grace for
 	// it to exit, then SIGKILLs. The supervised control plane runs each component
 	// in its own process group (executor.spawnEnv Setpgid), so signalling the
@@ -60,6 +64,53 @@ type System interface {
 	// closes the fd.
 	LockFile(path string) (unlock func() error, err error)
 }
+
+// Liveness is the verdict of a recorded pid's liveness probe. It is deliberately
+// THREE-valued, not a bool.
+//
+// The bool it replaced was `kill(pid, 0) == nil`, which folds two different kernel
+// answers into "dead": ESRCH (no such process) and EPERM (the process exists, but
+// this uid may not signal it). EPERM is exactly what an unprivileged shell gets
+// when it probes a root-owned `k3sm dev up --datapath` server, so `k3sm dev list`
+// printed STATUS stale for a healthy instance (observed in the M8 gate run). That
+// is not a cosmetic misreport: `stale` is the word that invites a cleanup, and the
+// instance being cleaned up is live.
+//
+// A probe that cannot see the process must therefore say so rather than guess, and
+// every consumer treats "not dead" — not "alive" — as the reap-blocking condition.
+type Liveness int
+
+const (
+	// LivenessDead means the pid does not exist (kill ESRCH) or none was recorded.
+	// This is the ONLY verdict that licenses reaping an instance.
+	LivenessDead Liveness = iota
+	// LivenessRunning means the pid exists and this uid can signal it.
+	LivenessRunning
+	// LivenessUnknown means the pid EXISTS but is not probeable from this uid
+	// (kill EPERM) — a root-owned instance seen from an unprivileged shell. Its
+	// process state beyond existence is genuinely unknown, hence the name: the
+	// honest answer is "there, and I cannot tell you more", not "running".
+	LivenessUnknown
+)
+
+// String renders the verdict as the STATUS word `k3sm dev list` prints.
+func (l Liveness) String() string {
+	switch l {
+	case LivenessRunning:
+		return "running"
+	case LivenessUnknown:
+		return "unknown"
+	default:
+		return "stale"
+	}
+}
+
+// Exists reports whether a process is there at all — true for both Running and
+// Unknown. It is the predicate every teardown/reclaim path signals on, because the
+// question those paths ask is "is there something to terminate", and an unprobeable
+// pid belongs to a process that demonstrably exists. Treating Unknown as absent
+// would make a reclaim act on an absence that was never observed.
+func (l Liveness) Exists() bool { return l != LivenessDead }
 
 // realSystem is the production System over ifconfig/kill/net.Listen/flock.
 type realSystem struct{}
@@ -101,12 +152,25 @@ func (realSystem) Lo0RemoveAlias(ip string) error {
 	return nil
 }
 
-// ProcessAlive sends signal 0 to pid.
-func (realSystem) ProcessAlive(pid int) bool {
+// ProcessLiveness sends signal 0 to pid and classifies the errno.
+//
+// kill(2) distinguishes the two failures this cares about: ESRCH says no such
+// process, EPERM says the process EXISTS but this uid may not signal it. Anything
+// else (an EINVAL that cannot arise for signal 0) is treated as dead, matching the
+// pre-B211 posture for unclassifiable errors.
+func (realSystem) ProcessLiveness(pid int) Liveness {
 	if pid <= 0 {
-		return false
+		return LivenessDead
 	}
-	return syscall.Kill(pid, 0) == nil
+	err := syscall.Kill(pid, 0)
+	switch {
+	case err == nil:
+		return LivenessRunning
+	case errors.Is(err, syscall.EPERM):
+		return LivenessUnknown
+	default:
+		return LivenessDead
+	}
 }
 
 // TerminateProcess SIGTERMs the process group, waits grace, then SIGKILLs.

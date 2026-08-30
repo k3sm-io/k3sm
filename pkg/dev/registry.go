@@ -77,7 +77,7 @@ type Instance struct {
 	// PID is the detached `k3sm server` process (its own process group), recorded
 	// so `down` tears it down and `list` reports liveness. It is authoritative
 	// only when the manifest is fresh — `list` cross-checks it against
-	// System.ProcessAlive.
+	// System.ProcessLiveness.
 	PID int `json:"pid"`
 	// Tier is the privilege tier: "rootless" (network=none) or "root" (--datapath).
 	Tier string `json:"tier"`
