@@ -32,9 +32,9 @@ k3sm kubeconfig > ~/k3sm.yaml                  # print it
 k3sm kubeconfig --write --path ~/other.yaml    # merge it into another kubeconfig
 ```
 
-(There is no `k3sm kubectl config` that reports a k3sm-specific path: `k3sm kubectl` is a pure
-passthrough to the bundled `kubectl`, so `k3sm kubectl config` is upstream `kubectl config` and knows
-nothing about k3sm's layout.)
+Note that `k3sm kubectl` is a **pure passthrough** to the bundled `kubectl` with `KUBECONFIG` preset —
+every subcommand under it is the upstream one, and none of them knows anything about k3sm's own
+layout. `k3sm kubeconfig` is the k3sm-specific verb.
 
 Because the control plane is a **real upstream kube-apiserver**, standard clients, RBAC, and API
 machinery work normally. The divergences are on the **node** side (how Pods run), not the API surface —
