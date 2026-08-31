@@ -1,14 +1,14 @@
-# Limitations — the honest gaps
+# Limitations — the real gaps
 
 k3sm runs Kubernetes Pods as **native Darwin processes** on Apple Silicon. That design buys a
 zero-Linux, zero-VM developer experience, but it also means several standard Kubernetes behaviors
-**diverge by design** or are **not yet wired**. This page is the honest inventory. Read it before you
+**diverge by design** or are **not yet wired**. This page is the full inventory. Read it before you
 rely on k3sm for anything real.
 
 ## Where the full truth lives (cite, don't trust this page alone)
 
 The authoritative source of "what k3sm cannot conform to and why" is
-[**`docs/conformance-profile.md`**](../conformance-profile.md) — the honest self-assessment mapping
+[**`docs/conformance-profile.md`**](../conformance-profile.md) — the self-assessment mapping
 targeted feature classes to a green synthetic-conformance criterion **or** a documented ceiling. It is
 backed by a maintainer-facing full-surface conformance register (one row per standard Kubernetes
 feature × verdict, with a canonical §By-design non-conformance summary) kept internal to the project.
@@ -34,7 +34,7 @@ When in doubt, the profile wins.
   CNI, and netns; k3sm has none of them. No amount of hardening changes this, and k3sm does not claim a
   Certified-Kubernetes badge. See [`conformance-profile.md`](../conformance-profile.md).
 
-## The honest-gaps matrix
+## The gaps matrix
 
 ### No per-pod uid isolation
 
