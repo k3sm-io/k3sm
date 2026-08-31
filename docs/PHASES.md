@@ -732,7 +732,7 @@ phases:
         acceptance:
           - id: M11.5-a1
             met: false
-            check: "hack/lab/m11.sh green on an entitled VZ Mac (K3SM_LAB=1, human-run — the milestone-done predicate; structurally lab-gated, never unit-green-only) + B110 signing recorded; hack/acceptance/m11.sh carries the CI-provable slice"
+            check: "hack/lab/m11.sh green on an entitled VZ Mac (K3SM_LAB=1, human-run — the milestone-done predicate; structurally lab-gated, never unit-green-only) + the R19(c) threat-terms sign-off recorded; hack/acceptance/m11.sh carries the CI-provable slice. AMENDED 2026-08-30 by m11-plan R28: the clause formerly read + B110 signing recorded. Developer-ID buys DISTRIBUTION REACH, not correctness — the virtualization entitlement is unrestricted and rides a plain ad-hoc signature — so a distribution gate was mis-stated as a capability gate. What replaces it is the R19(c) named alternative: the threat-terms enumeration extended for a publicly shipped ad-hoc-signed VZ-entitled binary, with a security-engineer sign-off. Scope is linux/arm64; amd64 and B110 are the v0.2.x follow-on."
             method: lab
 
   - id: M12
