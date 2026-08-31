@@ -316,6 +316,107 @@ a foreign `runAsUser` or `fsGroup` is refused outright (a `422` at `kubectl appl
 downgraded. Until an exemption ships, either drop the field and accept the node's own identity inside
 the guest, or keep that workload on the native path where the same restriction already applies.
 
+### `vm` Pods: a container restart recreates the whole VM
+
+There is no in-guest process supervisor on this path: a `vm` Pod's container **is** the guest, so
+`restartPolicy` acting on it means tearing the micro-VM down and creating a new one, not restarting a
+process inside a surviving one. Measured on the reference hardware, that recreate is fast — cold boot
+(VM create to first console output) came in at a median of **165 ms** (p95 171 ms, N=20), and kernel
+start to init exec at a median of **50 ms**. Say it plainly for planning purposes: on this path,
+**container restart is pod recreate**, and it is cheap enough that a `CrashLoopBackOff` cycle behaves
+the same way it would on the native path.
+
+### `vm` Pods: `linux/arm64` only
+
+The `vm` path runs **`linux/arm64`** guest images. It does not run `linux/amd64` in this release —
+in-guest translation for that architecture is a planned follow-up, not something you can opt into
+today. What you see depends on how the image is described:
+
+- An image whose manifest names `linux/amd64` **only**, and is annotated as such, is refused **before**
+  anything is created — the RuntimeClass's platform check rejects it at admission and records an event
+  naming the missing capability. Nothing boots and nothing is left half-started.
+- An image with no usable platform annotation at all fails later, at the ordinary image-pull step, the
+  same way any unresolvable image reference would.
+
+A multi-arch image that includes a `linux/arm64` variant is unaffected either way — it pulls and runs
+that variant normally.
+
+### `vm` Pods: storage — PVCs work; `fsGroup` and a foreign uid do not; `hostPath` is refused
+
+PVC-backed storage works on the `vm` path and is host-visible: what the guest writes lands on the host
+filesystem, readable from Finder or `sudo`, same as native pod storage. Two ceilings go with that,
+and one of them is now measured rather than assumed:
+
+- **Guest writes land host-side as the pod's own OS identity, and mode bits govern readability** — a
+  guest process that `chmod`s its data directory narrow (a database tightening its data directory to
+  owner-only, for example) makes that host-side tree unreadable without elevated access, even though it
+  sits in an ordinary Finder-visible location.
+- **A foreign `runAsUser` or `fsGroup` is refused at admission**, as described [above](#vm-pods-node-selection-and-security-context-admission)
+  — and the deeper reason is now measured, not just unimplemented: on the tested macOS build, the
+  platform's shared-filesystem device **refuses idmapped mounts** (the kernel mechanism that would let a
+  guest present files under a different owning uid without rewriting every file). That is a property of
+  the current platform build, not a k3sm gap that a future k3sm release closes on its own — a workload
+  that needs to write as a specific uid should run as the guest image's own root instead, which the
+  guest genuinely is isolated enough to allow; a `vm` guest is single-tenant, so running as its own root
+  is the supported shape for that need.
+- **Rootfs writes are RAM, not disk**, backed by a bounded upper layer. A guest that writes past that
+  bound sees `ENOSPC` from its own filesystem, not an out-of-memory kill — read an `ENOSPC` inside a
+  `vm` guest as "the rootfs filled up," not as a resource-limit surprise.
+- **`hostPath` volumes are refused outright** (fail-closed) on the `vm` path today. An allowlisted
+  exception is a planned follow-up; until it ships, a `vm` Pod that needs host access has no supported
+  route to it — use a PVC instead.
+
+### `vm` Pods: filesystem performance and case-sensitivity, measured
+
+Two things worth knowing before you plan storage-heavy workloads on this path, both measured on the
+tested rig and both a property of the shared-filesystem transport, not of PVC storage generally:
+
+- **A synchronous `fsync` costs meaningfully more than an in-guest tmpfs write** — around 0.4 ms on the
+  shared filesystem versus roughly 12 µs on guest tmpfs. That is fine for most workloads and is the kind
+  of thing to budget for if you are running an `fsync`-heavy database with a tight per-transaction
+  latency target.
+- **Sequential throughput is solid; it is transport-bound, not disk-bound.** Sequential IO over the
+  shared filesystem reached roughly 1.2 GB/s write and 2.8 GB/s read on the tested rig — figures that
+  describe the transport's ceiling on that rig, not a durable-media benchmark.
+- **The host volume is case-insensitive, and a case-colliding pair of names collapses silently inside
+  the guest.** Creating `File` and then `file` inside the guest does not produce two files — it produces
+  one, with no error returned to either write. Image layers are checked for this kind of collision when
+  they are unpacked, but a workload's own runtime writes are not, so a workload that itself creates
+  case-colliding filenames on this path will lose data silently.
+
+### `vm` Pods: networking — same-node Services, not direct pod IPs
+
+A `vm` Pod serves and consumes ClusterIP Services on its own node like any other pod — delivery to and
+from a Service VIP is native on this path, with no extra routes or elevated privileges involved.
+
+**Dialing a `vm` Pod's pod IP directly does not work.** The pod IP a `vm` Pod reports is its published
+identity, not a live address a peer can connect to — so anything that depends on a direct pod-IP dial,
+including headless-Service and per-pod DNS name resolution, does not reach a `vm` Pod. Reach it through
+its Service's ClusterIP instead. Cross-node traffic to or from a `vm` Pod is out of scope for this
+release.
+
+Two further things worth knowing about the guest network:
+
+- **Guest-to-guest reachability was found to be blocked on the tested rig** — two `vm` Pods on the same
+  node could not address each other at all, at the network layer, under the tested configuration. That
+  is an *observation* about the platform, not a documented guarantee from it, and it should not be read
+  either way: k3sm does not rely on it as an isolation boundary, and it does not promise it as one
+  either. Do not build a security model on guest-to-guest reachability being absent.
+- **NetworkPolicy cannot yet name a `vm` Pod as an allowed traffic *source*.** Attributing a policy-table
+  entry to a specific `vm` Pod's guest-network address is a planned follow-up; until it ships, a policy
+  rule that tries to allow traffic *from* a `vm` Pod cannot admit it. In the meantime, on a node hosting
+  `vm` Pods, traffic arriving from that guest-network segment that cannot be attributed to a known source
+  is **denied**, not silently allowed, at any destination a NetworkPolicy selects — and the resulting
+  deny is logged plainly, naming what was denied and why.
+
+### `vm` Pods: isolation posture
+
+The process that constructs and drives a `vm` Pod's guest runs confined under the **same Seatbelt
+sandbox profile** as every other pod-hosting process on the node — that was measured working on the
+tested rig, in both possible orderings (confine-then-construct and construct-then-confine). The `vm`
+RuntimeClass remains the recommended rung for untrusted or multi-tenant workloads; see
+[above](#no-per-pod-uid-isolation) for why the default native path cannot offer the same boundary.
+
 ### Node capability labels are probed once at daemon start
 
 The `k3sm.io/*` node capability labels — `k3sm.io/virtualization`, `k3sm.io/rosetta`,
