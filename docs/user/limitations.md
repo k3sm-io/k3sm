@@ -180,7 +180,7 @@ that is an accepted risk of the ServiceLB model k3s also ships, not an oversight
 A pod's per-pod IP is **addressing/identity only**: binds are port-scoped on shared interfaces, and
 Seatbelt cannot express per-IP network filters on macOS 26. A per-pod IP is therefore **never
 network isolation** — any same-node process can dial any pod IP. Untrusted workloads need the vm
-RuntimeClass, same as above.
+RuntimeClass, same as above — and it does not run yet, so today there is no answer for them.
 
 ### Ingress TLS keys and Secrets at rest
 
