@@ -24,6 +24,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"github.com/google/go-containerregistry/pkg/name"
 )
 
 // Verb is an accepted Dockerfile instruction. The set is closed: see the
@@ -84,8 +86,11 @@ var (
 	// ErrMissingFrom reports a Dockerfile whose first instruction is not FROM.
 	ErrMissingFrom = errors.New("oci: Dockerfile must begin with FROM")
 
-	// ErrUnsupportedBase reports a FROM naming anything but scratch.
-	ErrUnsupportedBase = errors.New("oci: only FROM scratch is supported")
+	// ErrUnsupportedBase reports a FROM whose base cannot be used by this build.
+	// The parser accepts any well-formed reference; it is Build that returns this
+	// when a named base was requested and no BaseResolver was configured, because
+	// resolving one is a network operation the library never performs on its own.
+	ErrUnsupportedBase = errors.New("oci: this build cannot resolve a named FROM base")
 
 	// ErrRemoteSource reports an ADD whose source is a URL. This builder performs
 	// no network reads.
@@ -294,11 +299,38 @@ func parseFrom(inst *Instruction, rest string) error {
 	if len(words) != 1 {
 		return fmt.Errorf("line %d: FROM takes one base image: %w", inst.Line, ErrBadInstruction)
 	}
-	if !strings.EqualFold(words[0], "scratch") {
-		return fmt.Errorf("line %d: FROM %s: %w", inst.Line, words[0], ErrUnsupportedBase)
+	if strings.EqualFold(words[0], "scratch") {
+		inst.Args = []string{ScratchBase}
+		return nil
 	}
-	inst.Args = []string{"scratch"}
+	// A named base is parsed, not fetched. Validating the reference here keeps a
+	// typo a PARSE error — reported with its line, before any output is opened,
+	// like every other rejection in this file — rather than a network error
+	// surfacing later with no line number attached.
+	if _, err := name.ParseReference(words[0]); err != nil {
+		return fmt.Errorf("line %d: FROM %s: %w: %v", inst.Line, words[0], ErrBadInstruction, err)
+	}
+	inst.Args = []string{words[0]}
 	return nil
+}
+
+// ScratchBase is the FROM operand naming the empty base. It is the one base the
+// builder can assemble with no I/O beyond the build context.
+const ScratchBase = "scratch"
+
+// Base returns the FROM operand, and whether it names something other than
+// scratch. A parsed Dockerfile always begins with FROM (ErrMissingFrom), so the
+// zero case here means the caller built a Dockerfile value by hand.
+func (d *Dockerfile) Base() (ref string, named bool) {
+	for _, inst := range d.Instructions {
+		if inst.Verb == VerbFrom {
+			if len(inst.Args) == 0 || inst.Args[0] == ScratchBase {
+				return ScratchBase, false
+			}
+			return inst.Args[0], true
+		}
+	}
+	return ScratchBase, false
 }
 
 // archiveSuffixes are the extensions Docker's ADD would auto-extract.

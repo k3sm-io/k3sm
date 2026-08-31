@@ -27,6 +27,8 @@ import (
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"k3sm.io/k3sm/pkg/oci"
 )
@@ -35,13 +37,21 @@ const buildUsage = `k3sm build — package a native darwin/arm64 image from a CO
 
 Usage: k3sm build --tag <ref> --output <path> [flags] <context-dir>
 
-Accepted Dockerfile subset: FROM scratch, COPY, ADD, ENV, ENTRYPOINT, CMD,
-WORKDIR, LABEL, EXPOSE. RUN is rejected — this builder packages files, it does
-not execute them.
+Accepted Dockerfile subset: FROM, COPY, ADD, ENV, ENTRYPOINT, CMD, WORKDIR,
+LABEL, EXPOSE. FROM takes "scratch" or a registry reference; a named base is
+fetched for darwin/arm64 and refused if it declares another platform. RUN is
+rejected — this builder packages files, it does not execute them.
 
-The output is a portable image artifact. k3sm cannot yet RUN an image it built:
-the ingest and materialize path is still on the roadmap, so an "image: <ref>"
-Pod spec will not resolve to it. See docs/user/images.md.
+The output is a portable image artifact, and it RUNS. Get it onto a node and
+name it in a Pod:
+
+  k3sm build --tag myapp:v1 --output myapp.tar .
+  k3sm image load myapp.tar        # this node; or: k3sm image push, then pull
+  kubectl run myapp --image=myapp:v1
+
+Pin FROM to a digest (name@sha256:…) if you want a reproducible build: a tag can
+move under you. See docs/user/what-runs.md for the whole path, and
+docs/user/images.md for the reference.
 
 Flags:
 `
@@ -147,7 +157,11 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	img, err := oci.Build(oci.Request{Dockerfile: df, Context: bc, Platform: o.platform, TmpDir: tmp})
+	baseRef, named := df.Base()
+	img, err := oci.Build(oci.Request{
+		Dockerfile: df, Context: bc, Platform: o.platform, TmpDir: tmp,
+		BaseResolver: remoteBase(ctx),
+	})
 	if err != nil {
 		return err
 	}
@@ -165,5 +179,42 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 		return fmt.Errorf("compute digest: %w", err)
 	}
 	fmt.Fprintf(out, "built %s\n  digest: %s\n  output: %s (%s)\n", ref, digest, o.output, o.format)
+	if named {
+		// The base is reported because it decides whether this build is
+		// reproducible. A DIGEST-pinned FROM is: the same context yields the same
+		// image forever. A TAG-pinned one is not -- the tag can move under you,
+		// and the only way to notice is to have been told what you actually got.
+		fmt.Fprintf(out, "  base:   %s\n", baseRef)
+		if !strings.Contains(baseRef, "@sha256:") {
+			repo := strings.SplitN(baseRef, ":", 2)[0]
+			fmt.Fprintf(out, "  note:   FROM names a tag, so this build is not reproducible; pin FROM %s@<digest> to make it so\n", repo)
+		}
+	}
 	return nil
+}
+
+// remoteBase is the production BaseResolver: it fetches a named FROM base from a
+// registry, for the platform this builder targets, using the same credential
+// chain "k3sm image push" uses. It is passed IN rather than reached for inside
+// pkg/oci so the library keeps its "no I/O outside the build context" contract
+// and its tests stay offline.
+func remoteBase(ctx context.Context) oci.BaseResolver {
+	return func(ref string) (ggcrv1.Image, error) {
+		r, err := name.ParseReference(ref)
+		if err != nil {
+			return nil, err
+		}
+		auth, err := registryAuth(r)
+		if err != nil {
+			return nil, err
+		}
+		return remote.Image(r,
+			remote.WithContext(ctx),
+			remote.WithAuth(auth),
+			// Ask for this builder's platform. A single-manifest image ignores the
+			// hint, which is why oci.Build re-checks the resolved config rather
+			// than trusting the request.
+			remote.WithPlatform(ggcrv1.Platform{OS: oci.PlatformOS, Architecture: oci.PlatformArch}),
+		)
+	}
 }

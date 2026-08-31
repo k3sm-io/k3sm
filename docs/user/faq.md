@@ -15,11 +15,16 @@ untrusted workloads and does not run a Pod yet.
 
 ## Can I run my existing Docker/OCI Linux images?
 
-No — those carry a Linux userland. Workloads must be **adapted** to the native model: build a
-darwin/arm64 binary and reference it directly in the Pod spec (an OCI-based load/build path is on
-the roadmap). Unmodified Linux images are the province of the EXPERIMENTAL
-[`vm` RuntimeClass](vm-runtimeclass.md). See [images.md](images.md) and
-[limitations.md](limitations.md).
+No — those carry a Linux userland, and a k3sm Pod is a Darwin process. A Linux image is refused at
+pull, naming the platforms it offers and the one this node needs.
+
+You can still use images, and the usual toolchain around them: build a `darwin/arm64` binary,
+package it with `k3sm build`, then `k3sm image load` it or `k3sm image push` it to a registry the
+node pulls from. Tags, digests, `imagePullPolicy` and `imagePullSecrets` all behave normally. The
+short version is [what-runs.md](what-runs.md); the reference is [images.md](images.md).
+
+Unmodified Linux images are the province of the [`vm` RuntimeClass](vm-runtimeclass.md), which does
+not run a Pod yet. See also [limitations.md](limitations.md).
 
 ## Why did my container exit and not restart?
 
