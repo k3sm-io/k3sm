@@ -856,6 +856,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
+	// M11.4: refuse an annotated pod this node's capabilities cannot serve BEFORE
+	// the RPC, and before any bookkeeping — a pod refused here leaves no track and
+	// no prober, exactly as if it had never been created. It logs and records its
+	// own Warning Event (preflightImagePlatform); the error is returned already
+	// wrapped.
+	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
+		return err
+	}
 
 	r.mu.Lock()
 	old := r.track[id]

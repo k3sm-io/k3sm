@@ -102,7 +102,8 @@ const defaultGraceSeconds int64 = 30
 //
 // It returns an error — failing closed — when the pod names a RuntimeClass with no
 // backend mapping (runtimev1.ErrUnknownHandler), so a pod that asked for an
-// isolation class k3sm cannot satisfy is refused rather than silently downgraded.
+// isolation class k3sm cannot satisfy is refused rather than silently downgraded,
+// and when its k3sm.io/image-platform annotation is malformed (podImagePlatform).
 //
 // rootfsRoot is the per-pod-dir parent; dyldShim, when non-empty, is wired into
 // the annotation runtimed copies to DYLD_INSERT_LIBRARIES (the DNS shim).
@@ -180,6 +181,18 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 
 	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers, true)
 	box.Containers = toRuntimeContainers(pod.Spec.Containers, false)
+
+	// The k3sm.io/image-platform override (M11.4): parsed ONCE here — the
+	// annotation is pod-level — and stamped onto every container as the typed
+	// Platform message, so nothing downstream re-parses a user string. A
+	// malformed value FAILS the pod here, the same fail-closed posture the rlimit
+	// annotations take: a pod that asked for a platform and silently got the
+	// node's default would run the wrong binaries with no signal anywhere.
+	imagePlatform, err := podImagePlatform(pod)
+	if err != nil {
+		return nil, err
+	}
+	stampImagePlatform(box, imagePlatform)
 
 	// Inject the cluster DNS env the DYLD getaddrinfo shim reads, gated on the pod's
 	// DNSPolicy. Appended AFTER the user env (infra-wins) and to BOTH the init and
