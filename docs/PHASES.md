@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-07-11
-updated_by: roadmap-encoder
+updated: 2026-08-30
+updated_by: M14 encoded from docs/m14-plan.md (multi-node & HA de-EXPERIMENTAL graduation, v0.3); M6.0-d1's stale two-pin kine narrative corrected to the shipped unified v0.17.0
 
 phases:
   - id: M0
@@ -332,7 +332,7 @@ phases:
         deliverables:
           - id: M6.0-d1
             done: true
-            desc: "kine→Postgres multi-writer datastore + HA leader-election (mimicking k3s's external-datastore HA — 2+ servers share ONE Postgres, the single source of truth, NO etcd quorum; the single-node default stays SQLite). pkg/executor: ADDITIVE Config.DatastoreEndpoint (a Postgres DSN) — empty (zero value) keeps the kine→SQLite WAL default BYTE-UNCHANGED (single-node M1–M5 untouched), non-empty points kine at Postgres via pgx; the apiserver still talks to the LOCAL kine (--etcd-servers 127.0.0.1:<KinePort>), each server runs its own kine against the shared Postgres (the k3s topology). SECRET HANDLING: the DSN password never lands on argv or a log — it is relocated to a 0600 PGPASSFILE handed out-of-band to the kine child (pgx reads it via the libpq env fallback), only the password-stripped DSN reaches kine's --endpoint, and component logs are tightened to 0600. POSTURE-AWARE kine version (the deferred bump-vs-soak decision, resolved via k3s): SQLite stays DefaultKineVersion=v1.14.2 (UNCHANGED, zero migration risk for the installed base), Postgres-HA pins DefaultKineVersionHA=v0.16.3 — a real, go-install-verified ≥0.15 release carrying the kine#577 watch-progress-notify fix (defaults --watch-progress-notify-interval=5s + --emulated-etcd-version=3.6.11; greenfield-from-init, so no SQLite→newer-kine upgrade). SPLIT-BRAIN GUARD (fail-closed): Config.Validate rejects an HA server (ServerJoin) without a DatastoreEndpoint (ErrHARequiresDatastore) — a 2nd server can NEVER silently fall back to its own SQLite. LEADER ELECTION: scheduler + KCM --leader-elect is Config-gated (false single-node — unchanged; true in HA so only one server's scheduler/KCM is active — two would double-bind/double-reconcile); only the apiserver is active/active; the leader-election Leases are authorized by the apiserver's auto-created system:kube-scheduler / system:kube-controller-manager bootstrap RBAC binding the components' OWN per-component identities (no new pkg/rbac object). pgx POOL BOUNDS pinned (kine's default is UNLIMITED): 32 max-open/server so 2×32 ≤ Postgres default max_connections (100) + idle/lifetime; doc.go documents Postgres as the operator-managed datastore SPOF (pg_dump/PITR runbook, no _busy_timeout analog → operator statement/lock timeouts, local-WAL-sub-ms→network-RTT write tradeoff; HA buys process redundancy, not datastore redundancy). cmd/k3sm server grows --datastore-endpoint (or $K3SM_DATASTORE_ENDPOINT, off k3sm's own argv) + --server-join. Proven by TestDatastoreEndpointSQLiteDefault / TestDatastoreEndpointPostgres / TestDatastorePasswordRelocation / TestKineVersionPostureAware / TestHARequiresDatastoreEndpoint / TestLeaderElectHAvsSingleNode (pkg/executor, -race clean). The live 2-server-on-Postgres + the kine#577 watch-staleness soak are the lab production-trust gate (hack/lab/m6.sh + e2e/TestM6_*)."
+            desc: "kine→Postgres multi-writer datastore + HA leader-election (mimicking k3s's external-datastore HA — 2+ servers share ONE Postgres, the single source of truth, NO etcd quorum; the single-node default stays SQLite). pkg/executor: ADDITIVE Config.DatastoreEndpoint (a Postgres DSN) — empty (zero value) keeps the kine→SQLite WAL default BYTE-UNCHANGED (single-node M1–M5 untouched), non-empty points kine at Postgres via pgx; the apiserver still talks to the LOCAL kine (--etcd-servers 127.0.0.1:<KinePort>), each server runs its own kine against the shared Postgres (the k3s topology). SECRET HANDLING: the DSN password never lands on argv or a log — it is relocated to a 0600 PGPASSFILE handed out-of-band to the kine child (pgx reads it via the libpq env fallback), only the password-stripped DSN reaches kine's --endpoint, and component logs are tightened to 0600. KINE VERSION (SUPERSEDED 2026-08-30 — this deliverable originally described a POSTURE-AWARE two-pin scheme, SQLite on DefaultKineVersion=v1.14.2 and Postgres-HA on DefaultKineVersionHA=v0.16.3; the M7.1 pin collapse retired both, and the shipped constant is now a SINGLE unified DefaultKineVersion=v0.17.0 for BOTH postures, built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend — pkg/executor/executor.go:202, floor-pinned by datastore_test.go. Corrected here during the M14 encoding so a lab operator reading this row before the M14.5 HA session is not told the two postures run different kine builds). v0.17.0 carries the kine#577 watch-progress-notify fix (defaults --watch-progress-notify-interval=5s + --emulated-etcd-version=3.6.11); HA is greenfield-from-init, so no SQLite→newer-kine upgrade. SPLIT-BRAIN GUARD (fail-closed): Config.Validate rejects an HA server (ServerJoin) without a DatastoreEndpoint (ErrHARequiresDatastore) — a 2nd server can NEVER silently fall back to its own SQLite. LEADER ELECTION: scheduler + KCM --leader-elect is Config-gated (false single-node — unchanged; true in HA so only one server's scheduler/KCM is active — two would double-bind/double-reconcile); only the apiserver is active/active; the leader-election Leases are authorized by the apiserver's auto-created system:kube-scheduler / system:kube-controller-manager bootstrap RBAC binding the components' OWN per-component identities (no new pkg/rbac object). pgx POOL BOUNDS pinned (kine's default is UNLIMITED): 32 max-open/server so 2×32 ≤ Postgres default max_connections (100) + idle/lifetime; doc.go documents Postgres as the operator-managed datastore SPOF (pg_dump/PITR runbook, no _busy_timeout analog → operator statement/lock timeouts, local-WAL-sub-ms→network-RTT write tradeoff; HA buys process redundancy, not datastore redundancy). cmd/k3sm server grows --datastore-endpoint (or $K3SM_DATASTORE_ENDPOINT, off k3sm's own argv) + --server-join. Proven by TestDatastoreEndpointSQLiteDefault / TestDatastoreEndpointPostgres / TestDatastorePasswordRelocation / TestKineVersionPostureAware / TestHARequiresDatastoreEndpoint / TestLeaderElectHAvsSingleNode (pkg/executor, -race clean). The live 2-server-on-Postgres + the kine#577 watch-staleness soak are the lab production-trust gate (hack/lab/m6.sh + e2e/TestM6_*)."
         acceptance:
           - id: M6.0-a1
             met: false
@@ -872,6 +872,168 @@ phases:
             met: false
             check: "the M4-lab/M7-lab phases.json rows (requires: signing) run green; they are the ONLY two rows in the manifest that require signing, which is what bounds this milestone"
             method: lab
+
+  - id: M14
+    title: Multi-node & HA de-EXPERIMENTAL graduation (v0.3)
+    status: todo
+    strategy: hard cut
+    depends_on:
+      - darwin-net:M3
+    note: "Authoritative input: docs/m14-plan.md (workspace) — Phase C encodes ONLY from that doc. M14 is a CROSS-MILESTONE PROGRAM with no user-visible feature of its own: M3 (multi-node/mesh) and M6 (HA) are already CODE-COMPLETE, and this milestone exists to make them PROVABLE on real hardware and therefore graduable out of EXPERIMENTAL at v0.3. It does NOT restructure the M3/M6 blocks — their acceptances flip by phases_ref WRITE-THROUGH exactly as M4.0-a1 flips through M7.1 (see M4.0's tombstone note). It exists because the public two-Macs tutorial ships four true caveats: the tutorial's own e2e run is unrecorded; kubectl logs/exec breaks cluster-wide once a second node joins (B213 + the five sibling lab defects B222–B226); the kubelet-port auth hardening is still in review (B176 / PR k3sm#192); and multi-node ships EXPERIMENTAL. The caveats are rewritten LAST (M14.6), from recorded evidence, never ahead of it. HARD CUT throughout: the hazard-class sub-phase (M14.2 server-side mesh bring-up) deliberately AVOIDS the wireguard MeshPeer/AllowedIPs named exception by scoping the egress source-bind at the DIALER — a unilateral per-node decision no peer observes — so old and new binaries interoperate in any restart order; the operational contract it still owes is a stated cutover criterion (server restarts FIRST, then node-by-node launchctl kickstart -k io.k3sm.*, brief per-node downtime acknowledged). The three lab sub-phases are K3SM_LAB=1 human sessions, never auto-greened (ROADMAP.md gate rules). GATE-MANIFEST OBLIGATION (verified against hack/acceptance/phases_test.go, not assumed): no phases.json row is added at encoding time, but the no_orphan_gate_scripts inverse check globs hack/acceptance/m[0-9]*.sh — which MATCHES m14-servermesh.sh and m14-flip.sh — while TestPhasesGatePathsResolve requires every row's gate to already resolve on disk. So each of those two gates ships WITH its own phases.json row in the same PR that creates the script (M14-servermesh and M14-flip, both tier integration), never earlier and never later. B213.sh is a B<n> gate and matches neither glob, so it needs no row."
+    subphases:
+      - id: M14.0
+        title: kubelet serving cert chains to the cluster CA on mesh clusters (B213)
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Routed to /go as B213 (docs/BACKLOG.md), which depends_on B176 — PR k3sm#192 merges FIRST because this edits the very functions it reshaped (kubeletServingTLS's auth parameter, agentNodeOptions' CA plumb, the vkadapter fail-closed pairing). Cert-class merge precondition: the named gate run green in a human lab session (M14.3) + a recorded security-engineer sign-off."
+        deliverables:
+          - id: M14.0-d1
+            done: false
+            desc: "nodeOptions carries an optional cluster-CA-issued serving pair (kubeletServingCertPEM/KeyPEM); kubeletServingTLS consumes it via tls.X509KeyPair instead of certs.SelfSignedServing when both are set, still flowing through auth.ServingTLS so B176's client-auth stamping is untouched (it sets ClientAuth/ClientCAs, never Certificates). Exactly one of the pair set is an ERROR, mirroring the pairing discipline B176 documented. Empty pair = the self-signed single-node/dev default, pinned by its own test."
+          - id: M14.0-d2
+            done: false
+            desc: "the WORKER consumes the join-delivered pair: runAgent fails fast on an empty res.KubeletServingCertPEM/KeyPEM (the mesh path never silently falls back to self-signed — the same refusal shape as the empty-ClientCAPEM check), agentNodeOptions passes both through. The pair is held IN MEMORY ONLY and re-derived by the fresh bootstrap.Join every agent start — no new key file, so pkg/executor/rotate.go's artifact fence gains no path. This persistence choice is deliberate and stated, not incidental."
+          - id: M14.0-d3
+            done: false
+            desc: "the mesh SERVER mints its own — the control-plane node never joins, so runServer's meshIP-and-hierarchy block mints via hierarchy.Cluster.IssueServing(nodeName, {nodeName, localhost}, ips, 365*24h) and sets the two nodeOpts fields. ips = dedup of meshIP, opts.nodeIP, proxyableNodeIP(nodeOpts), 127.0.0.1 — proxyableNodeIP is INCLUDED because the no-datapath posture lets the registered InternalIP diverge from the advertised one, and a narrowed SAN list would reproduce B213 as a SAN mismatch instead of an issuer mismatch. A CA-issuance failure FAILS CLOSED, never degrades to self-signed. WITHOUT THIS HALF the defect remains cluster-wide — it was observed on the control-plane node's own kubelet."
+          - id: M14.0-d4
+            done: false
+            desc: "rotation honesty: the new artifact is added to pkg/executor/rotate.go's reissuedArtifacts() in the SAME PR. That list is the RotationReport's completeness contract, and an artifact that IS re-minted on restart but absent from Reissued breaks the report's stated honesty invariant just as badly as the reverse."
+          - id: M14.0-d5
+            done: false
+            desc: "doc deliverables — pkg/certs/serving.go's doc comment (SelfSignedServing is now ONLY the single-node/dev/standalone-`k3sm node` cert; its current text states the now-false premise that no --kubelet-certificate-authority is configured) and docs/DESIGN.md §5c's Node-verbs bullet, which today ASSERTS this fix already exists. After M14.0 it becomes true; reword it to name both halves so it describes mechanism, not aspiration."
+        acceptance:
+          - id: M14.0-a1
+            met: false
+            check: "hack/acceptance/B213.sh — unit ladder (issued-pair / self-signed-default / half-pair-rejected / mint-from-cluster-CA with the no-datapath divergent SAN case / CA-unavailable-fails-closed / --kubelet-certificate-authority emitted iff Config.KubeletCAFile) plus integration on a `--mesh-ip 127.0.0.1 --network none` boot (the FLAG alone, no mesh device, so this does not secretly depend on M14.2): openssl s_client chain-verifies :10250 against tls/cluster-ca.crt, kubectl logs completes the apiserver round trip, and a single-node boot still presents a cert that does NOT chain to the cluster CA"
+            method: integration
+      - id: M14.1
+        title: the five sibling mesh lab defects (D1–D5)
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Routed to /go as B222 (D1 loopback probe/kubeconfig), B223 (D2 KCM --root-ca-file), B224 (D3 MeshPeer CRD), B225 (D4 NodeRestriction label), B226 (D5 SA token BoundObjectRef) — see docs/BACKLOG.md for the per-item gates and the human_gate justifications (all false; each argued individually rather than in bulk). D1, D3 and D4 gate M14.2; D2 is owed by the lab's in-pod-API criterion; D5 is lab-independent. B223 and B226 carry the cert-class merge precondition."
+        deliverables:
+          - id: M14.1-d1
+            done: false
+            desc: "B222/D1 — derive the apiserver probe + in-process kubeconfig host from the EFFECTIVE bind (cfg.BindAddress -> NodeIP -> 127.0.0.1, the self-defaulting chain apiServerArgs already uses) instead of the 127.0.0.1 hardcode in pkg/executor/setup.go, which wedges any non-loopback --mesh-ip boot at the healthz wait because a mesh server binds the apiserver to meshIP only. Prerequisite for ANY realistic mesh boot, hence for the two-Mac lab."
+          - id: M14.1-d2
+            done: false
+            desc: "B223/D2 — Config.RootCAFile set to the cluster CA in the mesh block so pods' projected kube-root-ca.crt can verify the apiserver's actual (cluster-CA-issued) serving leaf. BINDING: the branch predicate is the SAME cfg.ServingCertFile != \"\" that gates --tls-cert-file, so the two flags can never disagree about which CA is live; an unconditional repoint would break in-pod TLS on single-node, and the gate therefore asserts BOTH branches."
+          - id: M14.1-d3
+            done: false
+            desc: "B224/D3 — apis grows MeshPeerCRDName + a named MeshPeerCRD() accessor (the MLXModelCRD() shape) and rewrites the embed.go paragraph whose claim that MeshPeer is applied out-of-band is FALSE; k3sm crdensures the CRD fail-closed in the mesh block before newMeshEnroller, since a missing CRD silently 500s every worker join. The accessor's own reservation comment owes a MESH-REGRESSION CHECK — that leg is part of this item's gate, not a follow-up."
+          - id: M14.1-d4
+            done: false
+            desc: "B225/D4 — delete the vendored virtual-kubelet default label kubernetes.io/role in configureNode; NodeRestriction forbids it (neither kubeletLabels nor an allowed namespace), so a joined worker's Node create/update is rejected while the in-process server node escapes only via system:masters. The gate is dependency-bump proof: a table over the full nodeutil.NewNode label set, evaluated across more than one reconcile tick, so a future vendor bump fails loudly instead of silently reopening it."
+          - id: M14.1-d5
+            done: false
+            desc: "B226/D5 — projected SA tokens gain BoundObjectRef{Kind: Pod, APIVersion: v1, Name, UID} via pod-identity context plumbing. The EXACT ref is the acceptance, not merely 'has a BoundObjectRef': upstream's guarantee is pod-lifetime invalidation plus the pod-name/pod-uid TokenReview extras identity consumers read, so a ServiceAccount-kind or UID-less ref would pass a literal reading while restoring none of the semantic. Fail closed when the pod identity is absent."
+        acceptance:
+          - id: M14.1-a1
+            met: false
+            check: "B222–B226 all closed with their named gates green (each proven red-at-main first); no hand-applied shim remains necessary to bring up a two-node mesh cluster"
+            method: integration
+      - id: M14.2
+        title: server-side wireguard mesh bring-up (the M3-lab blocker)
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "ATTENDED /orchestrate work, NEVER /go or /auto — the run log names it 'an architectural datapath change carrying an explicit breaks-ALL-backend-dials hazard; that is not unattended work'. Needs M14.1-d1/d3/d4 merged first. MERGE PRECONDITION, ATTACHED BY HAND: this mints and persists a new wireguard PRIVATE KEY but lives in cmd/k3sm/enroll.go, which the path-based cert/secret force-pattern in hack/go-selftest.sh does not match — so its PR carries the cert-class boxes explicitly (named gate green in a human lab session + a recorded security-engineer sign-off) even though no mechanical check will add them. CUTOVER CRITERION: restart the SERVER first (so its MeshPeer exists when workers reconcile), then each worker, node-by-node via launchctl kickstart -k io.k3sm.*. Rollback leaves the index-0 MeshPeer object behind — harmless, but the runbook must say so, or an on-call reader misreads it as a live server mesh."
+        deliverables:
+          - id: M14.2-d1
+            done: false
+            desc: "darwin-net (see darwin-net:M14.0): destination-scoped egress source-binding, replacing the unconditional bind that is the 'breaks ALL backend dials' hazard. Consumed here — k3sm sets netserve.Config.MeshEgressIP only once that lands."
+          - id: M14.2-d2
+            done: false
+            desc: "a persistent server wireguard identity: load-or-create a private key (helper mode provisions under install.MeshKeyDir and passes the ref via mode.MeshOptions; direct/root uses mesh.WithPrivateKey), persisted 0600 so the public key survives launchctl kickstart."
+          - id: M14.2-d3
+            done: false
+            desc: "EnrollSelf writes the INDEX-0 MeshPeer (PodCIDR = podnet.NodeCIDR(ClusterPodCIDR, 0), MeshIP = its .1, Endpoint = the UNDERLAY LAN address:meshPort, since a worker must reach wg before any mesh exists). It ASSERTS-OR-CREATES index 0 explicitly and must NOT run the worker free-index scanner: defaultNodePodCIDR() hard-codes 100.64.0.0/24 and feeds it to the server's routing locality and pod IPAM, so a self-assigned different index would split what the mesh routes here from what this node's pods are, and mesh.BuildPlan's self-exclusion keys on exact CIDR equality. Idempotent on rejoin; FAIL CLOSED if index 0 is held by a different node name. Same change fixes the WORKER assignment to lowest-unused-index >= 1 (enroll.go's len(existing)+1 skips and double-counts once index 0 is occupied), and corrects the misleading --server help string (the join must reach meshIP:9345 before any mesh exists, so that address is in practice an underlay one)."
+          - id: M14.2-d4
+            done: false
+            desc: "ORDERING, load-bearing: EnrollSelf runs through the SAME e.mu-guarded meshEnroller instance the join RPC handler uses, and is list-back-verified COMPLETE BEFORE startBootstrapServer begins accepting. Without that happens-before, the free-index fix in d3 makes index 0 a legitimately assignable slot to a worker joining in the window before the server's own write lands — two peers claiming one AllowedIPs, which wireguard cannot admit. Mesh bring-up itself is ordered after apiserver-healthy + the D3 CRD ensure + RBAC, and strictly BEFORE netserve.New, because mesh.Start plumbs the mesh-egress lo0 alias the proxy's source-bind depends on."
+          - id: M14.2-d5
+            done: false
+            desc: "wire the proxy: set netserve.Config.MeshEgressIP and seed PeerMeshEgressIPs from the MeshPeer list at construction (the follow-up server.go already names), closing the fail-open NetworkPolicy attribution gap for already-enrolled peers. KNOWN AND ACCEPTED for v0.3: that seed is a BOOT-TIME SNAPSHOT, so an already-running worker recognizes a newly-joined server peer for NetworkPolicy attribution only after its own restart, while its wireguard peer set reconverges live via the informer. The posture is fail-open widen-only ('never a wrong deny') and NetworkPolicy is opt-in, so the gap degrades attribution, not connectivity."
+          - id: M14.2-d6
+            done: false
+            desc: "share the bring-up helper: extract the agent's bringUpMesh into a helper taking DISCRETE FIELDS (podCIDR, meshIP, private key, peers) rather than *bootstrap.JoinResult — the server has no JoinResult and never will, and reusing a network-received wire DTO for a locally synthesized value invites a later reader to assume delivery-trust properties (CA-pinned PinnedClient) that do not hold on the server path."
+          - id: M14.2-d7
+            done: false
+            desc: "FAILURE POSTURE: server-side mesh bring-up is LOG-AND-CONTINUE, following the explicit precedent beside it ('a node that refuses to start is strictly worse than a node missing an advisory'). Under launchd KeepAlive a fatal error here is an unbounded respawn loop on the one process that also hosts apiserver + kine + scheduler — a mesh-only defect must never take the control plane down."
+          - id: M14.2-d8
+            done: false
+            desc: "doc deliverable: docs/DESIGN.md §5b gains server-mesh participation and the destination-scoped egress rule; the 'k3sm server does not bring up its own wireguard mesh yet' comment is deleted along with the behavior it described."
+        acceptance:
+          - id: M14.2-a1
+            met: false
+            check: "hack/acceptance/m14-servermesh.sh on a single Mac WITH --mesh-ip set (the hazard proof must live here: hack/acceptance/m3.sh boots WITHOUT --mesh-ip and cannot exercise a single line of this change, so citing it as regression evidence would be vacuous) — the index-0 MeshPeer exists with the right name/CIDR/MeshIP and a non-empty public key; utun and the mesh-egress lo0 alias are up; THE HAZARD-REGRESSION LEG: a same-node ClusterIP round trip still completes with MeshEgressIP wired, run under -race with concurrent local- and remote-destination dials in flight; a self-enroll-vs-simulated-join race test pins the d4 happens-before; unit tables cover the scoping decision for BOTH TCP and UDP and the lowest-free-index assignment"
+            method: integration
+      - id: M14.3
+        title: hardening lab session — B213 live, B176 two-Mac slice, sign-offs, merges
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "HUMAN SESSION, K3SM_LAB=1, two-Mac rig. Follow B176's own runbook line: UPGRADE AGENTS FIRST (an old agent keeps :10250 open until its daemon kickstarts; a new agent against a not-yet-upgraded server refuses to start, which is the safe direction). Also re-assert the M14.2 destination scoping against REAL cross-Mac traffic — the same-node acceptance leg cannot exercise the actual wireguard egress path, and this defect class is precisely what has blocked M3-lab historically."
+        deliverables:
+          - id: M14.3-d1
+            done: false
+            desc: "run hack/acceptance/B213.sh live on the rig; run k3sm/pkg/provider::TestKubeletEndpointRequiresClientCert live across a dev boot AND a two-Mac join; record the security-engineer sign-offs; merge PR k3sm#192 (B176) and the M14.0/M14.1 PRs. Recorded expectation: the B176 slice CANNOT show working logs/exec until B213 lands — the handshake fails on the SERVING-cert direction before the client-identity predicate is exercised — so that gap is expected, not a new failure."
+        acceptance:
+          - id: M14.3-a1
+            met: false
+            check: "on the two-Mac rig: B213.sh exit 0, the kubelet-endpoint client-cert gate green, an unauthenticated connection to a worker's :10250 refused, and both recorded sign-offs present on the merged PRs"
+            method: lab
+      - id: M14.4
+        title: the recorded two-Mac run — M3-lab green and the tutorial executed as written
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "HUMAN SESSION, K3SM_LAB=1. phases_ref: k3sm M3.3 — M3.3-a1 flips met:true ONLY via this write-through when hack/lab/m3.sh greens here, NOT on any M3-local completion, so M3 does not falsely flip done. The run must use ZERO hand-applied shims (no manual CRD apply, label, cert, or wireguard config — the negation of D1–D5 is the point), and the evidence line records date, hardware, binary SHAs and that no-shims statement explicitly."
+        deliverables:
+          - id: M14.4-d1
+            done: false
+            desc: "on merged main, execute K3SM_LAB=1 hack/lab/m3.sh to exit 0 (NodePort reachable, StatefulSet persistence, in-pod kubectl + cluster DNS from a pod on the JOINED node), then execute site/content/tutorials/07-two-macs.md start to finish exactly as written and record it. Retires the tutorial's 'this tutorial's own end-to-end run has not yet been recorded' caveat, which M14.6 then rewrites."
+        acceptance:
+          - id: M14.4-a1
+            met: false
+            check: "K3SM_LAB=1 hack/lab/m3.sh exits 0 on two real Macs with no hand-applied shims, and the tutorial's command sequence has been executed as written and recorded; writes through to flip k3sm:M3.3-a1 met:true and M3 status:done"
+            method: lab
+      - id: M14.5
+        title: HA lab — two Macs on one Postgres, with the production-trust soak
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "HUMAN SESSION, K3SM_LAB=1, two Macs + Postgres. phases_ref: k3sm M6.0 + M6.1 — M6.0-a1 and M6.1-a1 flip met:true ONLY via this write-through when hack/lab/m6.sh greens here. THE SOAK FLOOR IS BINDING: K3SM_M6_SOAK_DURATION=24h minimum for the v0.3 flip, NOT the script's 20s smoke default, because the fallback this posture originally rested on is gone — ConsistentListFromCache=false is GA-LOCKED true in the pinned k8s build and the apiserver refuses to start with it set, leaving kine's watch-progress-notify plus this soak as the only remaining controls over a low-frequency, load-dependent staleness failure. The evidence line records the duration actually run."
+        deliverables:
+          - id: M14.5-d1
+            done: false
+            desc: "execute K3SM_LAB=1 hack/lab/m6.sh to exit 0: write-on-A/read-on-B, single-active leader election, a second server joining and reconstructing the identical CAs from the sealed bundle, the failover leg, and the watch-staleness soak at >= 24h."
+        acceptance:
+          - id: M14.5-a1
+            met: false
+            check: "K3SM_LAB=1 hack/lab/m6.sh exits 0 on two Macs + Postgres with the soak at >= 24h and the duration recorded; writes through to flip k3sm:M6.0-a1 and k3sm:M6.1-a1 met:true and M6 status:done"
+            method: lab
+      - id: M14.6
+        title: the de-EXPERIMENTAL flip — docs, site, and the v0.3 close
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Runs ONLY after M14.4 AND M14.5 evidence is recorded; a reviewer must not merge the flip on the strength of the plan alone. TWO RULES GOVERN THE EDIT SURFACE, both of which produced a wrong answer once during this program's own drafting. (1) SOURCES VS GENERATED COPIES: edit docs/user/{multi-node,ha,limitations,faq,README}.md and ROADMAP.md, then regenerate — site/content/docs/* AND site/content/roadmap.md are GENERATED (each carries a DO-NOT-EDIT header; the workspace ROADMAP.md is likewise derived, /roadmap-sync only). Site-AUTHORED and edited directly: tutorials/07-two-macs.md, capabilities.md, compare.md, _index.md, support.md, tutorials/12-what-wont-work.md, data/gates.yaml. (2) ONLY THE M3/M6 SENTENCES MOVE: most EXPERIMENTAL occurrences in those files describe the vm RuntimeClass, whose graduation is M11.5/v0.2 and shares none of this evidence — limitations.md even carries both features under one heading — so a whole-file keyword-absence gate would either force a false public claim about vm or never go green. The gate asserts the SPECIFIC rewritten sentences, in the hack/acceptance/B214.sh style, never grep -c EXPERIMENTAL."
+        deliverables:
+          - id: M14.6-d1
+            done: false
+            desc: "flip the multi-node/HA status banners in the doc SOURCES and regenerate the site copies; rewrite the tutorial's caveat block so the three 'not yet' bullets retire in favour of the recorded run's date and hardware; set site/data/gates.yaml M3: validated and M6: validated (the 'proven end to end on real hardware by its named test' rank); update the hack/verify-tutorial-live.sh and hack/acceptance/B212.sh skip REASONS from 'not yet proven' to the recorded run (the skips themselves stay — CI still has one machine)."
+          - id: M14.6-d2
+            done: false
+            desc: "ha.md MUST state the access model honestly: there is no floating apiserver VIP — hack/lab/m6.sh proves survival by switching to server B's kubeconfig, so client failover is a MANUAL KUBECONFIG SWAP, not transparent. A reader who sees the EXPERIMENTAL badge disappear otherwise imports the upstream assumption (apiserver behind a load balancer, clients ride through a server loss); removing the badge without adding this sentence converts a flagged preview-quality gap into a silent surprise."
+        acceptance:
+          - id: M14.6-a1
+            met: false
+            check: "hack/acceptance/m14-flip.sh — sentence-scoped asserts prove the named M3/M6 sentences are rewritten while every vm-RuntimeClass EXPERIMENTAL mention is untouched, site/data/gates.yaml reads M3: validated and M6: validated, ha.md carries the no-VIP access-model sentence, and hack/verify-docs-sync.sh + hack/verify-site-clean.sh are green"
+            method: integration
 ---
 
 # k3sm — Phase roadmap
