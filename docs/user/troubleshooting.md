@@ -103,7 +103,7 @@ Then look for one of these:
   share the node's port space — see [limitations.md](limitations.md)), or a second LoadBalancer Service
   declaring the same port. k3sm never picks a different port for you.
 - **`loadbalancer/ingress status will stay EMPTY: no advertisable node address could be derived`** — the
-  listeners are bound and serving, but there is no honest address to publish, so nothing is written
+  listeners are bound and serving, but there is no address that would be correct to publish, so nothing is written
   rather than advertising an unreachable one. Check `kubectl get node -o wide` shows a non-loopback
   `INTERNAL-IP`, and that you did not start the server with `--network none`.
 - **`ingress bind retries exhausted`** — the ingress listeners gave up (bounded retry, no port
