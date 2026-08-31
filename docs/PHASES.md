@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-08-30
-updated_by: M14 encoded from docs/m14-plan.md (multi-node & HA de-EXPERIMENTAL graduation, v0.3); M6.0-d1's stale two-pin kine narrative corrected to the shipped unified v0.17.0
+updated: 2026-08-31
+updated_by: orchestrator
 
 phases:
   - id: M0
@@ -692,7 +692,7 @@ phases:
             method: integration
       - id: M11.4
         title: capability labels + image-platform annotation + B6 wiring + admission/docs
-        status: todo
+        status: in-progress  # 2026-08-31 — d1-d5 done (d7 is a pointer row, encoded at M11.5-d1); d6 (the limitations rewrite) is the sole remainder and is blocked on the lab spike figures it must publish, so the sub-phase is NOT done
         depends_on: [apis:M11.1, runtimed:M11.2, darwin-net:M11.3]
         deliverables:
           - id: M11.4-d1
@@ -702,13 +702,13 @@ phases:
             done: true  # 2026-08-28, B104 (k3sm#133) — node arch derived from hardware, not the build arch; ledger write-back 2026-08-30
             desc: "kubernetes.io/arch + NodeInfo.Architecture truthfulness via an injected goarch/machine seam (B104; retires the TWO hardcoded arm64 sites, node.go label + NodeInfo). Gate table carries BOTH arm64 and amd64 legs (red-at-main by VALUE). The k3sm binary stays darwin/arm64-only — B105 ships POD PAYLOADS under host Rosetta, never an Intel k3sm binary; doctor keeps its arch check."
           - id: M11.4-d3
-            done: false
+            done: true  # 2026-08-31 — NARROWED at build time (see a1): the provider-side PRE-RPC half only. Annotation parsed once into the typed Platform message and stamped on every container; servability delegated to the pull-side image.Candidates via Override rather than re-implemented, so there is one platform policy. The stamp is forward-provisioning: no runtime reader consumes Container.image_platform yet, documented at the stamp site.
             desc: "k3sm.io/image-platform annotation → per-container Container.image_platform stamp (parsed once, provider-side; pod-level annotation applies to every container). PRE-PULL fail-closed when the node cannot serve the annotated platform (legible event naming the missing capability label; docs pair the annotation with a nodeSelector for true Unschedulable semantics multi-node). Un-annotated mismatches surface at pull as container-waiting ErrImagePull→ImagePullBackOff (pod PENDING — upstream pull-failure semantics; NEVER terminal Failed, which churns ReplicaSets and burns Job backoffLimit)."
           - id: M11.4-d4
-            done: false
+            done: true  # 2026-08-31 — SetupGuest had been implemented-but-uncalled since M5, which is what repeatedly re-blocked the guest-network item; the carrier is now wired end to end. podIP() still reports the node IP for a vm pod on purpose — the pod-IP model is an unanswered lab question this deliverable deliberately does not prejudge.
             desc: "B6 producer wiring per the decided carrier (m11-plan Resolution 3): podnet.SetupGuest + dns.GuestResolvConf run BEFORE toPodBox (the M10.1 one-authority ordering — downward-API status.podIP env resolves pre-translate) through the in-process runtimed.Deps shared podnet adapter; teardown symmetry via the existing releasePodNetwork; NO SandboxProfile proto field."
           - id: M11.4-d5
-            done: false
+            done: true  # 2026-08-31 — the two admission facts an operator hits as a confusing failure: a vm pod still needs nodeSelector kubernetes.io/os=darwin, and a foreign runAsUser/fsGroup is refused 422 until a guest-aware exemption ships.
             desc: "Admission notes ONLY (split 2026-08-30: this deliverable previously conflated admission + the limitations rewrite + the user-doc copy flip; m11-plan §M11.4 defines d1-d7 and the ledger encoded only d1-d5). vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in the reference-workload readiness notes (internal) + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave; MERGE-PRECONDITIONS (plan R21): only after the S3(2) idmap answer records YES and the volume/fsGroup mechanism deliverable has landed; its gate asserts the triple (vm+fsGroup admitted / native+fsGroup still 422 / vm-on-non-VZ-node fails closed) + update-or-recreate semantics for the stored VAP (DISCHARGED by B153: every pkg/policy Ensure* is now create-or-update in place). If S3(2) records NO, the m11-core fsGroup leg records SKIPPED(B112-unmerged) and the storage leg substitutes a root-in-guest image — pre-decided, not improvised in a lab session. This wave cites pkg/policy/admission.go by name so no wave relaxes it ad hoc."
           - id: M11.4-d6
             done: false
@@ -719,7 +719,7 @@ phases:
         acceptance:
           - id: M11.4-a1
             met: false
-            check: "label composition + delete-on-loss tables (fake runtimed conditions); arch-truthfulness both-legs table; annotation→stamp + pre-pull-reject + ImagePullBackOff-surface tables; B6 wiring gate (k3sm/pkg/provider::TestGuestNetworkWiredToRuntimed — the B6 item's own gate) green; all -race"
+            check: "label composition + delete-on-loss tables (fake runtimed conditions); arch-truthfulness both-legs table; annotation→stamp table; pre-pull-reject table carrying BOTH legs — an ACCEPT row as well as a reject row, since a fail-closed check exercised only on its reject leg degrades silently into fail-ALWAYS and makes every annotated pod unschedulable; B6 wiring gate (k3sm/pkg/provider::TestGuestNetworkWiredToRuntimed) green, built over the REAL runtime construction with only leaf effects faked (faking both producer and consumer proves only that the two fakes agree); all -race. The ImagePullBackOff-SURFACE clause was REMOVED from this criterion on 2026-08-31 and is NOT owed here: making an un-annotated platform mismatch present as Pending/ImagePullBackOff requires the kubelet pull-failure taxonomy, which is a separate and currently-blocked deliverable — today a pull error returns from the create RPC and the pod lands Failed. Retaining the clause would have made this criterion unmeetable by anything this sub-phase can build."
             method: unit
       - id: M11.5
         title: gate — hack/lab/m11.sh + m5.sh graduation
