@@ -650,6 +650,45 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 		}
 	})
 
+	// B218: the connect() rung's destination scope, K3SM_CLUSTER_CIDRS, ships
+	// alongside K3SM_POD_IP for a distinct-/32 pod — canonically serialized by
+	// podnet.BindDisciplineEnvWithCIDRs (never hand-formatted here). The cluster
+	// pod CIDR is unconditional (a fixed constant); the Service CIDR is present
+	// only when the pod's cluster DNS config carries a VIP to derive it from
+	// (clusterCIDRs) — the empty-DNSConfig subtest above therefore gets the pod
+	// CIDR alone, proving the derivation degrades gracefully rather than failing.
+	t.Run("K3SM_CLUSTER_CIDRS carries the pod CIDR and the derived Service CIDR", func(t *testing.T) {
+		dnsCfg := netv1.DNSConfig{ClusterDNSIP: "10.43.0.10"}
+		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", dnsCfg, discardLog)
+		if err != nil {
+			t.Fatalf("toPodBox: %v", err)
+		}
+		want := strings.Join([]string{podnet.ClusterPodCIDR.String(), "10.43.0.0/16"}, ",")
+		for _, c := range allContainers(box) {
+			if got := containerEnv(c)[podnet.EnvClusterCIDRs]; got != want {
+				t.Errorf("container %s: %s = %q, want %q", c.GetName(), podnet.EnvClusterCIDRs, got, want)
+			}
+		}
+	})
+
+	// The DNS VIP is the ONLY Service-network-shaped value that reaches toPodBox
+	// (k3sm's server/agent commands carry no explicit --service-cidr flag); an
+	// unset cluster DNS config (a pod not using cluster-first DNS, or a
+	// standalone node) still gets the pod CIDR — clusterCIDRs never lets a
+	// missing Service VIP suppress the whole rung.
+	t.Run("K3SM_CLUSTER_CIDRS carries only the pod CIDR when no DNS VIP is configured", func(t *testing.T) {
+		box, err := toPodBox(bindPod(), podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
+		if err != nil {
+			t.Fatalf("toPodBox: %v", err)
+		}
+		want := podnet.ClusterPodCIDR.String()
+		for _, c := range allContainers(box) {
+			if got := containerEnv(c)[podnet.EnvClusterCIDRs]; got != want {
+				t.Errorf("container %s: %s = %q, want %q", c.GetName(), podnet.EnvClusterCIDRs, got, want)
+			}
+		}
+	})
+
 	t.Run("infra wins over a workload-set K3SM_POD_IP", func(t *testing.T) {
 		box, err := toPodBox(bindPod(corev1.EnvVar{Name: podnet.EnvPodIP, Value: "1.2.3.4"}), podIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
 		if err != nil {
@@ -666,13 +705,20 @@ func TestToPodBoxInjectsBindDisciplineEnv(t *testing.T) {
 	// (hostNetwork/vm/no-network all resolve to nodeIP). Injecting would narrow the
 	// shipped hostNetwork semantic. This is the architect-WARNING guard.
 	t.Run("no injection when podIP == nodeIP (hostNetwork-shaped)", func(t *testing.T) {
-		box, err := toPodBox(bindPod(), nodeIP, nodeIP, rootfs, "", netv1.DNSConfig{}, discardLog)
+		// A DNS VIP is set here too — the K3SM_CLUSTER_CIDRS absence must come from
+		// the podIP == nodeIP gate, not from clusterCIDRs having nothing to derive.
+		dnsCfg := netv1.DNSConfig{ClusterDNSIP: "10.43.0.10"}
+		box, err := toPodBox(bindPod(), nodeIP, nodeIP, rootfs, "", dnsCfg, discardLog)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
 		for _, c := range allContainers(box) {
-			if _, ok := containerEnv(c)[podnet.EnvPodIP]; ok {
+			env := containerEnv(c)
+			if _, ok := env[podnet.EnvPodIP]; ok {
 				t.Errorf("container %s: %s injected for a hostNetwork-shaped pod; want NONE", c.GetName(), podnet.EnvPodIP)
+			}
+			if _, ok := env[podnet.EnvClusterCIDRs]; ok {
+				t.Errorf("container %s: %s injected for a hostNetwork-shaped pod; want NONE", c.GetName(), podnet.EnvClusterCIDRs)
 			}
 		}
 	})

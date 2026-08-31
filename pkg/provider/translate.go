@@ -193,7 +193,7 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 	// gated on the pod having a DISTINCT /32 (podIP != nodeIP). hostNetwork/vm/no-network
 	// pods resolve podIP to nodeIP and get nothing; the shipped hostNetwork semantic
 	// (share the node's addresses) must not be narrowed by rewriting its binds.
-	injectBindDisciplineEnv(box, podIP, nodeIP, log)
+	injectBindDisciplineEnv(box, podIP, nodeIP, clusterCIDRs(dnsCfg.ClusterDNSIP), log)
 
 	box.Volumes = toVolumes(pod.Spec.Volumes)
 	box.PodSecurityContext = toPodSecurityContext(pod.Spec.SecurityContext)
@@ -340,6 +340,33 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 	}
 }
 
+// clusterCIDRs returns the B218 connect() rung's destination scope: the cluster pod
+// CIDR (podnet.ClusterPodCIDR, the lo0-alias /10 every pod /32 is allocated from) and,
+// when derivable, the cluster Service CIDR — the two ranges whose destinations may be
+// source-pinned to a pod's own /32 on an unbound dial.
+//
+// dnsVIP is dnsCfg.ClusterDNSIP, the cluster DNS Service VIP already threaded into
+// toPodBox (r.resolverVIP upstream). It is the ONLY Service-network-shaped value that
+// reaches this assembly point: k3sm's server/agent commands carry no explicit
+// --service-cidr flag (only `k3sm netd`'s proxy path does, via
+// install.DefaultServiceCIDR), so rather than inventing a new one, the Service CIDR is
+// DERIVED by masking the configured VIP to a /16 — the range k3sm always allocates
+// Service VIPs from (10.43.0.10 -> 10.43.0.0/16, matching install.DefaultServiceCIDR).
+// An empty or unparseable/non-IPv4 VIP (e.g. a standalone `k3sm node` with no cluster
+// DNS) yields no Service CIDR entry; the pod CIDR is still returned, since it is a
+// fixed constant independent of the DNS VIP.
+func clusterCIDRs(dnsVIP string) []netip.Prefix {
+	cidrs := []netip.Prefix{podnet.ClusterPodCIDR}
+	if dnsVIP == "" {
+		return cidrs
+	}
+	addr, err := netip.ParseAddr(dnsVIP)
+	if err != nil || !addr.Is4() {
+		return cidrs
+	}
+	return append(cidrs, netip.PrefixFrom(addr, 16).Masked())
+}
+
 // injectBindDisciplineEnv appends the K3SM_POD_IP environment the DYLD bind() interpose
 // (shim/getaddrinfo_shim.c) reads to rewrite a pod's wildcard binds onto its own /32,
 // giving same-node pods separate per-IP port spaces (two pods can both hold :8080 —
@@ -347,14 +374,22 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 // annotation only LOADS the dylib; without this env the interpose passes every bind
 // through unchanged and the same-node EADDRINUSE collision class stands.
 //
+// cidrs (B218) is the connect() rung's destination scope — the cluster pod CIDR and
+// the cluster Service CIDR (see clusterCIDRs) — passed through verbatim to
+// podnet.BindDisciplineEnvWithCIDRs, which additionally emits K3SM_CLUSTER_CIDRS so
+// an unbound dial FROM this pod TO another in-cluster address is source-pinned to the
+// pod's own /32 too (not just an inbound bind). A nil/empty cidrs list degrades
+// exactly to the pre-B218 BindDisciplineEnv output — the connect rung stays off.
+//
 // Gated on the pod having a DISTINCT /32 — podIP != nodeIP. A hostNetwork pod
 // (MarkHostNetwork → podIP == nodeIP, zero allocation), a vm pod, and the --network
 // none posture all resolve podIP to the node IP and get NOTHING: the shipped hostNetwork
 // semantic (a pod shares the node's addresses) must not be narrowed by rewriting its
 // wildcard binds onto the node IP. The value serialization and the IPv4/unspecified
-// rejection are podnet.BindDisciplineEnv's (the single pinned encoder of the shim ABI —
-// never hand-rolled here); a nil return injects nothing (fail-safe passthrough). An
-// unparseable podIP is likewise a no-op — the discipline stays off rather than mis-binds.
+// rejection are podnet.BindDisciplineEnvWithCIDRs's (the single pinned encoder of the
+// shim ABI — never hand-rolled here); a nil return injects nothing (fail-safe
+// passthrough). An unparseable podIP is likewise a no-op — the discipline stays off
+// rather than mis-binds.
 //
 // Precedence (infra-wins) mirrors injectClusterDNSEnv: appended AFTER each container's
 // user env to BOTH init and regular containers, so a workload that set its own
@@ -365,7 +400,7 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 // the DYLD insert and the interpose never loads — the pod binds wildcard regardless of
 // this env. Naming the pod here is the only breadcrumb an operator debugging a
 // host-binary EADDRINUSE gets, since the insert drop is otherwise invisible.
-func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, log *slog.Logger) {
+func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, cidrs []netip.Prefix, log *slog.Logger) {
 	if podIP == "" || podIP == nodeIP {
 		return
 	}
@@ -373,7 +408,7 @@ func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, log *s
 	if err != nil {
 		return
 	}
-	env := podnet.BindDisciplineEnv(addr)
+	env := podnet.BindDisciplineEnvWithCIDRs(addr, cidrs)
 	if env == nil {
 		return
 	}
