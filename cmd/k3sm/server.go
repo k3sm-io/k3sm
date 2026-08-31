@@ -338,6 +338,16 @@ func runServer(args []string) error {
 		cfg.AnonymousAuth = &anonFalse
 		cfg.ServingCertFile = servingCert
 		cfg.ServingKeyFile = servingKey
+		// The CA that ISSUED that serving leaf is what the controller-manager must
+		// republish as every namespace's kube-root-ca.crt — the anchor every Pod uses to
+		// verify the apiserver. Set here, beside the serving cert, because the two are one
+		// posture: the executor derives --root-ca-file off the same predicate as
+		// --tls-cert-file, so they cannot name CAs from different modes. Without it the
+		// KCM would be pointed at the apiserver's SELF-SIGNED --cert-dir file, which on a
+		// mesh boot the apiserver never writes (bring-up dies on "error parsing
+		// root-ca-file"), and which on a work dir that once booted single-node is a stale
+		// CA that anchors nothing — in-pod API TLS then fails cluster-wide.
+		cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
 		logger.Info("multi-node mode: apiserver + join supervisor bound to the mesh interface", "mesh-ip", opts.meshIP)
 	}
 	exec := executor.NewSupervised(cfg)

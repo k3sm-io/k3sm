@@ -116,10 +116,12 @@ func ServiceAccountKeyPath(workDir string) string { return saKeyPath(workDir) }
 func ServiceAccountPubPath(workDir string) string { return saPubPath(workDir) }
 
 // APIServerCertDir returns the apiserver's own --cert-dir (<workDir>/apiserver-certs),
-// where it self-signs its serving cert. That directory is ALSO the controller-manager's
-// --root-ca-file source and therefore the origin of every pod's projected
-// kube-root-ca.crt, so replacing it is a cluster-wide trust event — exported so the
-// rotation scope fence can name it explicitly.
+// where it self-signs its serving cert. On the SINGLE-NODE posture that directory is
+// ALSO the controller-manager's --root-ca-file source and therefore the origin of every
+// pod's projected kube-root-ca.crt, so replacing it is a cluster-wide trust event —
+// exported so the rotation scope fence can name it explicitly. On the MESH posture the
+// apiserver presents a cluster-CA-issued leaf and never self-signs, so this directory
+// is empty and the published trust anchor is the cluster CA instead (Config.rootCAFile).
 //
 // Its apiserver.crt shares a basename with — and has the OPPOSITE rotation semantics
 // of — certs.APIServerServingCertPath (<workDir>/tls/apiserver.crt), which is a leaf
