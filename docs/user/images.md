@@ -70,7 +70,7 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/myapp"]
 ```
 
-**Accepted subset:** `FROM scratch`, `COPY`, `ADD`, `ENV`, `ENTRYPOINT`, `CMD`, `WORKDIR`, `LABEL`,
+**Accepted subset:** `FROM` (`scratch` or a registry reference), `COPY`, `ADD`, `ENV`, `ENTRYPOINT`, `CMD`, `WORKDIR`, `LABEL`,
 `EXPOSE`. Everything else is refused with an error naming what was rejected — the parser never
 guesses and never silently drops an instruction, because a dropped instruction produces an image
 that looks built but is not what the recipe described.
@@ -87,7 +87,7 @@ Each of these is a refusal or a documented gap, never a silent divergence:
 | | k3sm build |
 |---|---|
 | `RUN` | **Rejected.** This builder packages files; it does not execute them. The RUN-capable path is the vm-backed builder below. |
-| `FROM <ref>` | **Rejected** — `FROM scratch` only. Basing on a pulled image arrives with the registry-pull path. |
+| `FROM <ref>` | **Supported**, with two caveats. The base is fetched for `darwin/arm64` using the same credential chain as `k3sm image push`, and is **refused if it declares any other platform** — a `darwin/arm64` image built on a `linux/amd64` base is a self-consistent lie whose payload cannot execute. And a **tag**-pinned base is not reproducible: the tag can move, so the build says so and prints the base it used. Pin a digest if you want the guarantee. In practice bases are ones your own organisation published — see [what-runs.md](what-runs.md) on why there is no public supply of `darwin` images. |
 | `ADD` | An exact alias of `COPY`. It does **not** fetch remote URLs and does **not** auto-extract archives; both are refused rather than silently downgraded. |
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory — scope your `COPY` lines, or build from a clean tree. |
 | `--platform` | Accepts only `darwin/arm64`. The builder copies host files verbatim and does not cross-compile, so any other value would declare a platform the bytes do not satisfy. |

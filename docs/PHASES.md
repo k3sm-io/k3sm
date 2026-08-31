@@ -727,7 +727,7 @@ phases:
         depends_on: [k3sm:M11.4]
         deliverables:
           - id: M11.5-d1
-            done: false
+            done: true  # 2026-08-31, B230 (k3sm#233) — both skeletons + the THREE-row phases.json shape (R18 extended R15's two) + the args schema field + the hack/lab/runs evidence convention
             desc: "Gate machinery (lands with M11's FIRST wave, deliberately not the roadmap encoding): hack/acceptance/m11.sh + hack/lab/m11.sh skeletons + the phases.json two-row shape — M11 (integration, skeleton:true, manual:false, always-red K3SM-SKELETON sentinel) + M11-lab (lab, manual:true, requires vz+signing). Lab legs (docs/m11-plan.md §M11.5): nats under vm (exec exit-code, logs -f, top); pgvector with PVC-backed PGDATA + fsGroup(B112) + dshm tmpfs, WAL-recovers a SIGKILL; the Service-consumed leg (client pod → postgres-in-VM via ClusterIP + Service DNS); the amd64 legs (Rosetta run + legible ImagePullBackOff fail-closed on a non-Rosetta node); measured per-VM host footprint → the B24 overhead reconcile. m5.sh GRADUATES per the M4-lab precedent (re-point + skeleton flip + old-script delete + B34 tombstone in ONE change)."
         acceptance:
           - id: M11.5-a1
