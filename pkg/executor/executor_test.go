@@ -154,7 +154,7 @@ func TestSupervisedPathsLayout(t *testing.T) {
 	if got := binDir(wd); got != wd+"/bin" {
 		t.Errorf("bin dir = %q", got)
 	}
-	if got := apiServerURL(6444); got != "https://127.0.0.1:6444" {
+	if got := apiServerURL(Config{APIServerPort: 6444}); got != "https://127.0.0.1:6444" {
 		t.Errorf("apiserver url = %q", got)
 	}
 }

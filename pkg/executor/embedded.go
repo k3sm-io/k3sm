@@ -52,5 +52,5 @@ func (e *Embedded) Kubeconfig() string { return kubeconfigPath(e.cfg.WorkDir) }
 // RESTConfigToken returns the apiserver URL and static token (unused until
 // implemented).
 func (e *Embedded) RESTConfigToken() (string, string) {
-	return apiServerURL(e.cfg.APIServerPort), e.cfg.Token
+	return apiServerURL(e.cfg), e.cfg.Token
 }
