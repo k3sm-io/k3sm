@@ -3,28 +3,29 @@
 k3sm runs Pods as native Darwin processes under a **single `_k3sm` user**, so there is **no per-pod uid
 isolation** — same-node Pods share one OS trust domain. The **`vm` RuntimeClass** is the intended
 answer for **untrusted or multi-tenant** workloads: a real isolation boundary backed by
-Virtualization.framework. It is the designed answer, not yet an available one — see the status note
-below before you depend on it.
+Virtualization.framework. It is EXPERIMENTAL and preview-quality — see the status note below before
+you depend on it.
 
-> **Status: NOT RUNNING YET.** **No Pod has
-> ever booted in a micro-VM.** What exists today is the dispatch half — the RuntimeClass object, the
-> fail-closed backend selection, the capability labels, the volume and network plumbing — wrapped
-> around a boot path that is not written. A Pod that sets `runtimeClassName: vm` does not start.
+> **Status: EXPERIMENTAL, preview-quality.** A Pod that sets `runtimeClassName: vm` boots — guest
+> boot and restart have been exercised and measured on the reference hardware — but several pieces
+> are not wired yet: serving traffic as a Service backend, in-guest cluster DNS, and direct pod-IP
+> dialing. See [limitations.md](limitations.md) for the full measured picture, including what does
+> and does not work yet.
 >
 > It is targeted at the **v0.1.0** public release as documented **EXPERIMENTAL** and
 > **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is deliberately held for a
 > later release), launch-gated on a live lab proof against the release artifact. The
-> de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2** milestone. Until
-> the v0.1.0 gate is green, treat every instruction below as *what this will do*, not what it does.
-> See [limitations.md](limitations.md).
+> de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2** milestone. Treat
+> this path as preview-quality and validate your own workload before depending on it.
 
 ## When to use it
 
 Use `vm` when a workload must not share the `_k3sm` trust domain with its neighbors — untrusted code,
-tenant isolation, or anything you would isolate with a strong boundary on Linux. Today that means:
-plan for `vm`, but do not schedule onto it, because it does not boot yet. This is the same
-framing as [limitations.md](limitations.md) and [concepts.md](concepts.md): the default native path is
-**not** a security boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
+tenant isolation, or anything you would isolate with a strong boundary on Linux. It is EXPERIMENTAL and
+preview-quality, so validate your own workload against it before relying on it for production
+isolation — see [limitations.md](limitations.md) for what is measured and what is not yet wired. This
+is the same framing as [concepts.md](concepts.md): the default native path is **not** a security
+boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
 [privilege-model.md](../privilege-model.md).
 
 ## Using it
