@@ -39,12 +39,13 @@ two-Mac gates are burned down in M7. What works:
 - **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
   (workloads must select `kubernetes.io/os=darwin`). *(implemented; the live RBAC flip is a
   dev-mac gate)*
-- **`vm` RuntimeClass — dispatch only, and it does not run a Pod yet.** A fail-closed dispatch to a
-  Virtualization.framework Linux micro-VM for Linux-only images (e.g. Postgres). What is shipped is
-  the *dispatch*: the RuntimeClass, the fail-closed backend selection, the capability labels, and
-  the scheduler overhead accounting. **No Pod has ever booted in a micro-VM.** The helper that would
-  build and boot the guest is not written yet, so this is engineering still to do, not a machine
-  waiting to be found. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64` only — see Next.
+- **`vm` RuntimeClass — EXPERIMENTAL, preview-quality.** A fail-closed dispatch to a
+  Virtualization.framework Linux micro-VM for `linux/arm64` images (e.g. Postgres): the RuntimeClass,
+  the fail-closed backend selection, the capability labels, the scheduler overhead accounting, and
+  PVC-backed storage. Guest boot and restart are exercised and measured on the reference hardware
+  (see [docs/user/limitations.md](docs/user/limitations.md)); serving traffic as a Service backend
+  and in-guest cluster DNS are not wired yet. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64`
+  only — see Next.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
@@ -119,10 +120,10 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
 ### Non-goals (deliberate)
 
-- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images are destined
-  for the EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack) once it runs, never the default
-  path.
+- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images run only
+  under the EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack, `linux/arm64` only), never
+  the default path.
 - **A single node is one trust domain.** Same-node pods share `lo0` and a uid — Seatbelt bounds
   filesystem/network *reach*, but there are no per-pod network namespaces or uid isolation.
   Untrusted multi-tenancy is out of scope for the native path; the `vm` RuntimeClass is the
-  intended boundary, and it does not run yet.
+  intended boundary, and it is EXPERIMENTAL preview-quality today.
