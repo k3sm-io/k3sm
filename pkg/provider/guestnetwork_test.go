@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -99,8 +100,8 @@ func (b *recordingVMBackend) created() (int, sandbox.VMSpec) {
 // It exists so the host-process control pod resolves to the Seatbelt rung rather
 // than degrading UP to the vm rung (sandbox.SelectBackend degrades an UNSPECIFIED
 // pod to vm when Seatbelt is unavailable — which would make the negative leg pass
-// for the wrong reason). WrapCommand is never reached: the refusingPuller stops
-// that pod at image pull, before any spawn.
+// for the wrong reason). WrapCommand is never reached: testRegistry stops that
+// pod at image pull, before any spawn.
 type availableSeatbelt struct{}
 
 func (availableSeatbelt) Available() bool { return true }
@@ -109,27 +110,74 @@ func (availableSeatbelt) WrapCommand(context.Context, string, []string, supervis
 	return "", nil, nil, errors.New("test seatbelt backend does not spawn")
 }
 
+// guestVMImage is the OCI reference the vm pod's container names, and the ONLY
+// reference testRegistry serves. The host-process control pod keeps a different
+// one (see hostPod), which is what keeps that leg's pull refusal a routing fact.
+const guestVMImage = "docker.io/library/alpine:3"
+
 // errPullRefused stops the host-process control pod at the image pull — the
 // first step past the vm/host-process fork — with no registry traffic and no
 // spawn, so the negative leg proves the route taken without leaving the process.
-var errPullRefused = errors.New("test puller: unit tests pull nothing")
+var errPullRefused = errors.New("test registry: this world serves one image")
 
-type refusingPuller struct {
+// testRegistry is the pull + image-config seam pair, serving exactly one image:
+// guestVMImage. Every other reference is refused with errPullRefused.
+//
+// It has to SERVE rather than refuse outright because runtimed's vm spine now
+// resolves a pod's containers BEFORE the backend is reached (M11.2-d11
+// resolveVMContainers): each container is pulled, its run config is read, and
+// the two are merged with the pod spec, so a vm pod whose image cannot be pulled
+// fails at IMAGE_PULL and never reaches CreateVM. Both halves are on ONE fake
+// and the config is looked up THROUGH the manifest's own reference — runtimed's
+// own vm-fixture shape (its imageWorld) — so the seam cannot serve a config for
+// one image and a manifest for another.
+//
+// Serving a single image is what leaves the negative leg intact: the
+// host-process pod's reference is unknown here, so it still stops at the pull.
+type testRegistry struct {
 	mu   sync.Mutex
 	refs []string
 }
 
-func (p *refusingPuller) Pull(_ context.Context, ref string, _ *image.RegistryCredential, _ image.PlatformPolicy, _ runtimev1.ImagePullPolicy) (*image.PullResult, error) {
-	p.mu.Lock()
-	p.refs = append(p.refs, ref)
-	p.mu.Unlock()
-	return nil, errPullRefused
+func (r *testRegistry) Pull(_ context.Context, ref string, _ *image.RegistryCredential, _ image.PlatformPolicy, _ runtimev1.ImagePullPolicy) (*image.PullResult, error) {
+	r.mu.Lock()
+	r.refs = append(r.refs, ref)
+	r.mu.Unlock()
+	if ref != guestVMImage {
+		return nil, errPullRefused
+	}
+	return &image.PullResult{
+		Manifest: &runtimev1.ImageManifest{
+			Reference: ref,
+			Config:    &runtimev1.Descriptor{Digest: "sha256:" + strings.Repeat("a", 64)},
+		},
+		CacheHit: true,
+	}, nil
 }
 
-func (p *refusingPuller) pulled() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]string{}, p.refs...)
+// ImageRunConfig serves guestVMImage's declared run config. The entrypoint is
+// the pod-supplied command's counterpart in the four-quadrant merge; what that
+// merge produces is runtimed's own gate (TestVMContainerMergeQuadrants) and is
+// deliberately not re-asserted here — this file asserts VMSpec.Network.
+func (r *testRegistry) ImageRunConfig(mfst *runtimev1.ImageManifest) (image.ImageRunConfig, error) {
+	if ref := mfst.GetReference(); ref != guestVMImage {
+		return image.ImageRunConfig{}, fmt.Errorf("no config for %q", ref)
+	}
+	return image.ImageRunConfig{Entrypoint: []string{"/entrypoint.sh"}}, nil
+}
+
+// MaterializeTree completes the Unpacker seam. The vm path never calls it — a vm
+// pod's containers are resolved but deliberately NOT materialized (the pod-wide
+// rootfs share is the rootfs-builder's to fill) — so it reports a tree at the
+// requested destination and touches no blob store.
+func (r *testRegistry) MaterializeTree(_ context.Context, _ *runtimev1.ImageManifest, policy image.UnpackPolicy, dst string) (*image.MaterializeResult, error) {
+	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:fake", Rootfs: dst, Policy: policy}}, nil
+}
+
+func (r *testRegistry) pulled() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string{}, r.refs...)
 }
 
 // Compile-time proof the fakes satisfy the seams they are injected into: a
@@ -139,7 +187,8 @@ func (p *refusingPuller) pulled() []string {
 var (
 	_ runtimed.VMBackend = (*recordingVMBackend)(nil)
 	_ sandbox.Backend    = availableSeatbelt{}
-	_ runtimed.Puller    = (*refusingPuller)(nil)
+	_ runtimed.Puller    = (*testRegistry)(nil)
+	_ runtimed.Unpacker  = (*testRegistry)(nil)
 )
 
 // guestNode is the node assembly under test: the REAL runtimed runtime over the
@@ -156,7 +205,7 @@ type guestNode struct {
 	adapter *PodNetAdapter
 	ipam    *fakeIPAM
 	vmb     *recordingVMBackend
-	puller  *refusingPuller
+	images  *testRegistry
 }
 
 func newGuestNode(t *testing.T) *guestNode {
@@ -169,13 +218,18 @@ func newGuestNode(t *testing.T) *guestNode {
 	}
 	adapter := NewPodNetAdapter(ipam, guestNodeIP, nil)
 	vmb := &recordingVMBackend{}
-	puller := &refusingPuller{}
+	images := &testRegistry{}
 	root := t.TempDir()
 	rt, err := runtimed.New(runtimed.Config{Root: root, RuntimeVersion: "test"}, runtimed.Deps{
 		Network:   adapter,
 		VMBackend: vmb,
 		Backend:   availableSeatbelt{},
-		Puller:    puller,
+		// Both image seams are the one fake: the vm spine pulls each container
+		// and reads its run config back through the SAME manifest, and the
+		// production Unpacker default would read that config out of a blob store
+		// no unit test commits to.
+		Puller:   images,
+		Unpacker: images,
 		// Pin the host probes: their production defaults fork a process (Rosetta)
 		// and drive Metal (GPU), which would make a unit test depend on the test
 		// host's hardware. None of them participates in the wiring under test.
@@ -197,22 +251,29 @@ func newGuestNode(t *testing.T) *guestNode {
 		ClusterDomain: "cluster.local",
 		Network:       adapter,
 	}, nil, nil)
-	return &guestNode{r: r, adapter: adapter, ipam: ipam, vmb: vmb, puller: puller}
+	return &guestNode{r: r, adapter: adapter, ipam: ipam, vmb: vmb, images: images}
 }
 
 // vmPod is a vm-RuntimeClass pod in namespace ns. The namespace is load-bearing:
 // the guest's search list is derived FROM it by dns.PodDNSConfig +
 // dns.GuestResolvConfFields, so a namespace-specific search domain in the
 // recorded VMSpec is a value no fake in this test could have supplied.
+// Its container names guestVMImage and carries a command of its own, because
+// both are what a vm pod must have to resolve at all: runtimed's mapper refuses
+// an image this registry does not serve before the backend is reached, and the
+// served image declares an entrypoint the pod's command replaces.
 func vmPod(ns, name string) *corev1.Pod {
 	vm := "vm"
 	pod := hostPod(ns, name)
 	pod.Spec.RuntimeClassName = &vm
+	pod.Spec.Containers[0].Image = guestVMImage
+	pod.Spec.Containers[0].Command = []string{"/bin/sleep", "3600"}
 	return pod
 }
 
 // hostPod is the control: no runtimeClassName, so it resolves to the
-// host-process backend.
+// host-process backend. Its image is deliberately one testRegistry does not
+// serve, so the pod stops at the pull — the step that proves the route.
 func hostPod(ns, name string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID("uid-" + name)},
@@ -345,7 +406,7 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		if err == nil {
 			t.Fatal("CreatePod: want the refused pull, got nil")
 		}
-		if got := n.puller.pulled(); len(got) != 1 {
+		if got := n.images.pulled(); len(got) != 1 {
 			t.Fatalf("puller saw %v, want exactly one pull — the pod must reach the host-process spine", got)
 		}
 		if calls, _ := n.vmb.created(); calls != 0 {
