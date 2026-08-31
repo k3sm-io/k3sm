@@ -667,7 +667,7 @@ phases:
     subphases:
       - id: M11.0
         title: spikes S1–S5 — lab Mac, agent-driven (k3sm/hack/spike/m11/)
-        status: in-progress  # 2026-08-31 — d1 (S1) done; d5 (S5) no-root slice recorded; d2 deferred per the arm64-only slice; d3 UNBLOCKED and its HARD GATE answered NO (see the d3 comment) with three non-blocking legs still NOT RUN; d4 open
+        status: in-progress  # 2026-08-31 — d1 (S1) done; d5 (S5) no-root slice recorded (the root slice now has an operator-run driver, s5-root.sh — authored and dry-run tested, deliberately NOT executed by the agent); d2 deferred per the arm64-only slice; d3 UNBLOCKED and its HARD GATE answered NO (see the d3 comment) with three non-blocking legs still NOT RUN; d4 open
         note: "Owner k3sm by the M8.0 precedent (m8-plan R23). FILED 2026-08-30: the spikes were on the critical path and cited by four sub-phases with NO ledger row anywhere — findings had nowhere to be recorded as done. ENTRY: hand-run on an entitled VZ Mac; every script writes a COMMITTED findings file and each named exit criterion is the go/no-go for the sub-phase that consumes it. Order S1 → (S3 ∥ S5) → S4: S3 and S5 both need a guest userland S1 does not build, so both extend S1's harness with a throwaway stock linux/arm64 minirootfs over virtiofs (explicitly NOT the M11.2-d1 snapshot path, not yet exercisable end to end); the tarball digest is recorded so measurements reproduce."
         deliverables:
           - id: M11.0-d1  # S1 minimal VZ Linux boot
