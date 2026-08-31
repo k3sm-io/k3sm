@@ -99,6 +99,13 @@ type runtimedRuntime struct {
 	// posture; runtimed then keeps its single-node NodeNetwork).
 	network PodNetwork
 
+	// transport is the vm-pod transport-override feed (M11.3-d2 consumer half):
+	// it publishes the published-/32 -> live-lease map into the Service proxy's
+	// routing table as each vm pod's guest reports its DHCP lease. nil is the
+	// inert feed (no sink configured — the --network none / no-datapath posture),
+	// and every method tolerates a nil receiver.
+	transport *transportFeed
+
 	// clk, dial, and probeTransport are the provider-served probe seams (M2.2):
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
 	// Production defaults are wired in newRuntimedWith; tests inject fakes.
@@ -216,6 +223,15 @@ type RuntimedConfig struct {
 	// silent production fallback (the commands fail fast via the runtimed
 	// preflight instead).
 	Network PodNetwork
+	// TransportOverrides is the Service-proxy seam a vm pod's LIVE TRANSPORT
+	// address is published through (darwin-net's *proxy.RoutingTable, reached via
+	// the node's netserve Server). The provider is the only component holding both
+	// halves of a vm pod's two-address identity — the published /32 its IPAM
+	// carved and the DHCP lease the guest reported through runtimed — so it is the
+	// only one that can feed the map. nil runs the feed inert: no override is ever
+	// installed and every backend is dialed at its published address exactly as a
+	// host-process pod's is.
+	TransportOverrides TransportOverrideSink
 	// Client is the apiserver client the provider resolves ConfigMap/Secret data,
 	// SA tokens (M2.1 volumes/env), and imagePullSecret credentials (M2.6) with —
 	// runtimed never talks to the apiserver. nil disables data-backed
@@ -336,6 +352,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		deniedSocks:    unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
 		resolver:       resolver,
 		network:        cfg.Network,
+		transport:      newTransportFeed(cfg.TransportOverrides, log),
 		client:         cfg.Client,
 		log:            log,
 		recorder:       recorder,
@@ -967,6 +984,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
 	// delete-path teardown) so pod churn never leaks a node pool address.
 	r.releasePodNetwork(pod)
+	// Drop any Service-proxy transport override for the pod IN THE SAME STEP. No
+	// further status will ever arrive to retract it, and an override that outlives
+	// its guest points at a lease macOS is free to hand to the NEXT guest — a
+	// cross-pod misdelivery, not a failed dial (see transportFeed).
+	r.transport.drop(id)
 	r.mu.Lock()
 	t := r.track[id]
 	delete(r.track, id)
@@ -1073,6 +1095,12 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // whose postStart hook has not completed.
 func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
 	r.observeExits(pod, t, rs)
+	// M11.3-d2: feed the Service proxy this pod's live transport address, on the
+	// same convergence the exit observation rides. It reads the status and the
+	// node's own guest record; it contributes NOTHING to the corev1 status being
+	// built, because the live address must never reach status.podIP, the
+	// EndpointSlice or DNS (see observeTransport).
+	r.observeTransport(string(pod.UID), rs)
 	t.readyMu.Lock()
 	prior := t.lastReady
 	t.readyMu.Unlock()
