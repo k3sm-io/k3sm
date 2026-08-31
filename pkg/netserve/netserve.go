@@ -87,6 +87,28 @@ type Config struct {
 	// a throttled Warn (proxy.PolicyTable's unknown-source contract). The gap can
 	// only widen allows, never manufacture a deny.
 	PeerMeshEgressIPs []string
+	// VMBackend reports that this node's runtime advertises the vm backend (the
+	// runtimed VMBackendAvailable condition, read by the provider's
+	// Capabilities()): this node can host vm-RuntimeClass pods, whose guests are
+	// attached to a macOS NAT segment instead of lo0. It is the ONE input that
+	// arms the NetworkPolicy table's fail-closed unknown-vm-source branch
+	// (M11.3-d3a); false keeps the table byte-identical to a node that runs no
+	// guests.
+	VMBackend bool
+	// VMNetSubnet is the NAT segment those guests are attached to, in CIDR form
+	// (e.g. 192.168.64.0/24) — the node's podnet VMNetworkConfig.NATSubnet.
+	//
+	// It is ADVISORY, and that caveat is load-bearing: macOS's vmnet assigns each
+	// guest's actual address by its own DHCP, and that lease — reported by the
+	// guest agent, never derived from this value — is the single authority for a
+	// guest's live transport address. This field is the EXPECTED segment, which is
+	// exactly what a scoping decision made before any guest boots needs
+	// (podnet.VMNetworkConfig.NATSubnet says so at the source).
+	//
+	// Empty or unparsable leaves the plain policy table even when VMBackend is
+	// set: an unknown vm source then fails OPEN like any other unattributable
+	// source, which is the pre-M11.3 behavior and never a wrong deny.
+	VMNetSubnet string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
 	// k3sm-netd helper at this socket, so the proxy runs unprivileged (the _k3sm
@@ -109,6 +131,10 @@ type Config struct {
 type Server struct {
 	cfg   Config
 	proxy *proxy.Proxy
+	// table is the proxy's routing table, retained so the node assembler can feed
+	// it vm-pod transport overrides through SetTransportOverrides below. The proxy
+	// owns it for routing; this is the same instance, never a second table.
+	table *proxy.RoutingTable
 	watch *proxy.Watcher
 	log   *slog.Logger
 	// policy is the NetworkPolicy L4-subset verdict table (M10.4), seeded with the
@@ -192,9 +218,26 @@ func New(cfg Config) *Server {
 		a, _ := netip.ParseAddr(p) // zero on parse failure → skipped by NewPolicyTable
 		seeds = append(seeds, a)
 	}
-	s.policy = proxy.NewPolicyTable(seeds...)
+	//
+	// M11.3-d3a: on a node that hosts vm guests, the table is additionally scoped
+	// to the node's NAT segment, which arms the ONE extra branch such a node needs
+	// — an unattributable source INSIDE that segment fails CLOSED. A vm guest's
+	// packets carry its DHCP lease, and nothing maps a lease back to a pod yet, so
+	// without the scope those packets would be admitted past a policy that selects
+	// the destination. Every other unknown source still fails open. A node with no
+	// vm backend, or one whose NAT segment is unknown, passes the zero Prefix,
+	// which proxy.NewPolicyTableVMNet defines to be exactly NewPolicyTable.
+	vmnet := vmnetPolicyPrefix(cfg.VMBackend, cfg.VMNetSubnet)
+	if cfg.VMBackend && !vmnet.IsValid() {
+		log.Warn("node advertises the vm backend but its NAT segment is unknown; unknown vm-source traffic fails OPEN at the NetworkPolicy table",
+			"vmnet_subnet", cfg.VMNetSubnet)
+	} else if vmnet.IsValid() {
+		log.Info("NetworkPolicy table scoped to the node's vm NAT segment (unknown sources inside it fail closed)", "vmnet_subnet", vmnet.String())
+	}
+	s.policy = proxy.NewPolicyTableVMNet(vmnet, seeds...)
 	opts = append(opts, proxy.WithPolicyTable(s.policy))
 
+	s.table = table
 	s.proxy = proxy.New(table, opts...)
 	// Loopback-advertising apiserver (single node): pin the kubernetes VIP to the
 	// static backend — the one Service whose endpoints upstream validation forbids
@@ -229,6 +272,45 @@ func staticAPIServerBackends(endpoint string) (map[string][]netv1.Endpoint, erro
 	return map[string][]netv1.Endpoint{
 		"default/kubernetes": {{IP: host, Port: int32(port), Ready: true}},
 	}, nil
+}
+
+// vmnetPolicyPrefix returns the NAT segment the NetworkPolicy table's
+// fail-closed unknown-vm-source branch is scoped to: the node's advisory vm NAT
+// subnet when this node advertises the vm backend, else the zero Prefix (which
+// proxy.NewPolicyTableVMNet treats as the plain table).
+//
+// Both inputs must hold. A node with no vm backend hosts no guest whose lease
+// could arrive unattributable, and an unparsable subnet gives nothing to scope
+// to — in either case widening the deny would be guesswork, so the pre-M11.3
+// fail-open is kept. The prefix is masked so a caller that wrote a host address
+// with a prefix length (192.168.64.1/24) still scopes the whole segment.
+//
+// Pure, so the selection is table-tested without constructing a Server.
+func vmnetPolicyPrefix(vmBackend bool, natSubnet string) netip.Prefix {
+	if !vmBackend {
+		return netip.Prefix{}
+	}
+	p, err := netip.ParsePrefix(natSubnet)
+	if err != nil {
+		return netip.Prefix{}
+	}
+	return p.Masked()
+}
+
+// SetTransportOverrides replaces the Service proxy's published-to-live TRANSPORT
+// address map: the seam a vm pod's guest DHCP lease reaches the backend dial
+// through (proxy.RoutingTable.SetTransportOverrides — read its contract before
+// calling). The node assembler feeds it from the provider, which is the only
+// component holding both a vm pod's published /32 and its reported lease; nothing
+// in netserve derives either.
+//
+// The map is replaced WHOLESALE and the caller owns the liveness obligation: an
+// override that outlives its lease dials an address that may now belong to a
+// different guest. Overrides affect the DIAL only — the picked backend, the
+// NetworkPolicy verdict and the affinity binding all stay keyed on the published
+// identity.
+func (s *Server) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
+	s.table.SetTransportOverrides(overrides)
 }
 
 // Run runs the Service proxy and its watcher until ctx is cancelled. Both the

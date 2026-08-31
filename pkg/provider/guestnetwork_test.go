@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,6 +69,16 @@ type recordingVMBackend struct {
 func (b *recordingVMBackend) Available() bool                  { return true }
 func (b *recordingVMBackend) Name() string                     { return "recording-vm" }
 func (b *recordingVMBackend) GuestRosettaShareSupported() bool { return false }
+
+// The lifecycle legs of runtimed's VMBackend seam. This fake records a boot
+// request and never leaves a helper behind (CreateVM returns the lab-gated stub
+// error), so every one of them is a faithful no-op: there is nothing to stop,
+// nothing to reap, no exit edge to watch, and no helper output to retain.
+func (b *recordingVMBackend) StopVM(context.Context, string, time.Duration) error { return nil }
+func (b *recordingVMBackend) StopAllVMs(context.Context) error                    { return nil }
+func (b *recordingVMBackend) ReapOrphanVMs() error                                { return nil }
+func (b *recordingVMBackend) VMDone(string) (<-chan struct{}, bool)               { return nil, false }
+func (b *recordingVMBackend) VMHelperOutput(string) string                        { return "" }
 
 func (b *recordingVMBackend) CreateVM(_ context.Context, spec sandbox.VMSpec) error {
 	b.mu.Lock()
