@@ -166,4 +166,5 @@ Seatbelt-confined. The consequences, stated plainly:
   §6 (the one-binary doctrine).
 - [user/install.md](user/install.md) — the install channels and what each lays down.
 - [user/limitations.md](user/limitations.md) — the no-per-Pod-uid-isolation gap in context.
-- [user/vm-runtimeclass.md](user/vm-runtimeclass.md) — the isolation boundary for untrusted workloads.
+- [user/vm-runtimeclass.md](user/vm-runtimeclass.md) — the intended isolation boundary for untrusted
+  workloads (not running yet).
