@@ -110,9 +110,13 @@ limitations under the License.
 //     without a VZ Mac and the entitlement. Note the seam landed on
 //     runtime.GuestNetworker, not the supervisor.GuestNetwork this comment once
 //     predicted.
-//   - status.podIP for a vm pod still reports the NODE IP, deliberately: whether the
-//     pod IP becomes a guest eth0 alias is an unanswered lab question, so the carrier
-//     above does not prejudge it.
+//   - status.podIP for a vm pod now publishes the allocated podCIDR /32 — the
+//     PUBLISHED identity of the two-address model. It is deliberately live on no
+//     interface: the guest's DHCP lease is the LIVE TRANSPORT address, carried by
+//     the guest agent's Health report and consumed only by the host's dial paths
+//     (the proxy's transport overrides). The eth0-alias model was measured workable
+//     but NOT adopted (its host-route half is root-only and the model needs no
+//     live /32).
 //   - Foreign runAsUser/fsGroup admission: M4.1's foreign-user VAP rejects them
 //     because the host-process path cannot honor a foreign uid, but a vm pod's guest
 //     CAN. The VAP should therefore EXEMPT runtimeClassName: vm. It is deferred (not
