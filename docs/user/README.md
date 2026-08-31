@@ -28,7 +28,7 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 14. [The `vm` RuntimeClass](vm-runtimeclass.md) — the intended isolation boundary for untrusted
     workloads. EXPERIMENTAL, and it does not run a Pod yet.
 15. [MLX quickstart](mlx-quickstart.md) — serving a model on the Mac's GPU through an OpenAI-compatible endpoint.
-16. [Limitations](limitations.md) — **the real gaps** — read this before you rely on k3sm.
+16. [Limitations](limitations.md) — **the real gaps**.
 17. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
 18. [FAQ](faq.md) — short answers to the common questions.
 
