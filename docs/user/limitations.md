@@ -2,8 +2,7 @@
 
 k3sm runs Kubernetes Pods as **native Darwin processes** on Apple Silicon. That design buys a
 zero-Linux, zero-VM developer experience, but it also means several standard Kubernetes behaviors
-**diverge by design** or are **not yet wired**. This page is the full inventory. Read it before you
-rely on k3sm for anything real.
+**diverge by design** or are **not yet wired**. This page is the full inventory.
 
 ## Where the full truth lives (cite, don't trust this page alone)
 
@@ -31,7 +30,7 @@ When in doubt, the profile wins.
   bind mounts, or Linux-only fields — is rejected at admission or stranded. Images are the k3sm native
   image model (see [images.md](images.md)), not arbitrary OCI Linux images.
 - **k3sm cannot pass CNCF `[Conformance]` / Sonobuoy.** That suite assumes Linux containers, cgroups,
-  CNI, and netns; k3sm has none of them. No amount of hardening changes this, and k3sm does not claim a
+  CNI, and netns; k3sm has none of them, and k3sm does not claim a
   Certified-Kubernetes badge. See [`conformance-profile.md`](../conformance-profile.md).
 
 ## The gaps matrix
