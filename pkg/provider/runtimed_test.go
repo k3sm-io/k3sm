@@ -130,8 +130,13 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 	box := req.GetPod()
 	f.created[box.GetPodId()] = box
 	// Record the ServiceAccount the provider bound to the ctx so the M2.4
-	// per-pod SA-token binding is observable at the runtime seam.
-	f.gotSA = serviceAccountFromContext(ctx)
+	// per-pod SA-token binding is observable at the runtime seam. An unbound ctx
+	// records "" — the fail-closed shape, not a silent "default" (B226).
+	if id, ok := podIdentityFromContext(ctx); ok {
+		f.gotSA = id.serviceAccount
+	} else {
+		f.gotSA = ""
+	}
 	return &runtimev1.CreatePodResponse{Status: f.statusLocked(box.GetPodId())}, nil
 }
 
