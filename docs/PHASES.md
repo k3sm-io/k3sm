@@ -886,7 +886,7 @@ phases:
         status: todo
         strategy: hard cut
         depends_on: []
-        note: "Routed to /go as B213 (docs/BACKLOG.md), which depends_on B176 — PR k3sm#192 merges FIRST because this edits the very functions it reshaped (kubeletServingTLS's auth parameter, agentNodeOptions' CA plumb, the vkadapter fail-closed pairing). Cert-class merge precondition: the named gate run green in a human lab session (M14.3) + a recorded security-engineer sign-off."
+        note: "Routed to the unattended queue as B213, which depends_on B176 — PR k3sm#192 merges FIRST because this edits the very functions it reshaped (kubeletServingTLS's auth parameter, agentNodeOptions' CA plumb, the vkadapter fail-closed pairing). Cert-class merge precondition: the named gate run green in a human lab session (M14.3) + a recorded security-engineer sign-off."
         deliverables:
           - id: M14.0-d1
             done: false
@@ -913,7 +913,7 @@ phases:
         status: todo
         strategy: hard cut
         depends_on: []
-        note: "Routed to /go as B222 (D1 loopback probe/kubeconfig), B223 (D2 KCM --root-ca-file), B224 (D3 MeshPeer CRD), B225 (D4 NodeRestriction label), B226 (D5 SA token BoundObjectRef) — see docs/BACKLOG.md for the per-item gates and the human_gate justifications (all false; each argued individually rather than in bulk). D1, D3 and D4 gate M14.2; D2 is owed by the lab's in-pod-API criterion; D5 is lab-independent. B223 and B226 carry the cert-class merge precondition."
+        note: "Routed to /go as B222 (D1 loopback probe/kubeconfig), B223 (D2 KCM --root-ca-file), B224 (D3 MeshPeer CRD), B225 (D4 NodeRestriction label), B226 (D5 SA token BoundObjectRef) — the per-item gates and human_gate justifications are tracked internally (all false; each argued individually rather than in bulk). D1, D3 and D4 gate M14.2; D2 is owed by the lab's in-pod-API criterion; D5 is lab-independent. B223 and B226 carry the cert-class merge precondition."
         deliverables:
           - id: M14.1-d1
             done: false
@@ -940,7 +940,7 @@ phases:
         status: todo
         strategy: hard cut
         depends_on: []
-        note: "ATTENDED /orchestrate work, NEVER /go or /auto — the run log names it 'an architectural datapath change carrying an explicit breaks-ALL-backend-dials hazard; that is not unattended work'. Needs M14.1-d1/d3/d4 merged first. MERGE PRECONDITION, ATTACHED BY HAND: this mints and persists a new wireguard PRIVATE KEY but lives in cmd/k3sm/enroll.go, which the path-based cert/secret force-pattern in hack/go-selftest.sh does not match — so its PR carries the cert-class boxes explicitly (named gate green in a human lab session + a recorded security-engineer sign-off) even though no mechanical check will add them. CUTOVER CRITERION: restart the SERVER first (so its MeshPeer exists when workers reconcile), then each worker, node-by-node via launchctl kickstart -k io.k3sm.*. Rollback leaves the index-0 MeshPeer object behind — harmless, but the runbook must say so, or an on-call reader misreads it as a live server mesh."
+        note: "ATTENDED milestone work, NEVER the unattended queue — the run log names it 'an architectural datapath change carrying an explicit breaks-ALL-backend-dials hazard; that is not unattended work'. Needs M14.1-d1/d3/d4 merged first. MERGE PRECONDITION, ATTACHED BY HAND: this mints and persists a new wireguard PRIVATE KEY but lives in cmd/k3sm/enroll.go, which the path-based cert/secret force-pattern in hack/go-selftest.sh does not match — so its PR carries the cert-class boxes explicitly (named gate green in a human lab session + a recorded security-engineer sign-off) even though no mechanical check will add them. CUTOVER CRITERION: restart the SERVER first (so its MeshPeer exists when workers reconcile), then each worker, node-by-node via launchctl kickstart -k io.k3sm.*. Rollback leaves the index-0 MeshPeer object behind — harmless, but the runbook must say so, or an on-call reader misreads it as a live server mesh."
         deliverables:
           - id: M14.2-d1
             done: false
