@@ -25,8 +25,9 @@ processes rather than a container runtime.
 ## The trust domain — one `_k3sm` user
 
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
-same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads, use the **`vm`
-RuntimeClass** for a real isolation boundary — see [vm-runtimeclass.md](vm-runtimeclass.md). The
+same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads the **`vm`
+RuntimeClass** is the intended isolation boundary — but it does not run a Pod yet, so today the
+honest answer is that this node is one trust domain. See [vm-runtimeclass.md](vm-runtimeclass.md). The
 rationale lives in [privilege-model.md](../privilege-model.md). This is the same framing you will see in
 [limitations.md](limitations.md).
 
