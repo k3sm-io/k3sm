@@ -56,20 +56,50 @@ type leaseRuntimeServer struct {
 	runtimev1.UnimplementedRuntimeServer
 
 	events chan *runtimev1.PodStatusEvent
+	// echoPodIP makes every status this server emits carry back the PodBox.pod_ip
+	// the provider sent at CreatePod — what a real runtimed does, since a pod's
+	// reported pod_ip IS the address the box was created with. It is OFF by
+	// default so this file's own cases keep an EMPTY pod_ip: the override key must
+	// come from the node's guest record, never from a status the test could shape.
+	echoPodIP bool
 
-	mu   sync.Mutex
-	live map[string]struct{}
+	mu     sync.Mutex
+	live   map[string]struct{}
+	boxIPs map[string]string // pod id -> the PodBox.pod_ip the provider sent
 }
 
-func newLeaseRuntimeServer() *leaseRuntimeServer {
-	return &leaseRuntimeServer{events: make(chan *runtimev1.PodStatusEvent, 16), live: map[string]struct{}{}}
+func newLeaseRuntimeServer(echoPodIP bool) *leaseRuntimeServer {
+	return &leaseRuntimeServer{
+		events:    make(chan *runtimev1.PodStatusEvent, 16),
+		echoPodIP: echoPodIP,
+		live:      map[string]struct{}{},
+		boxIPs:    map[string]string{},
+	}
 }
 
 func (s *leaseRuntimeServer) CreatePod(_ context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	s.mu.Lock()
 	s.live[req.GetPod().GetPodId()] = struct{}{}
+	s.boxIPs[req.GetPod().GetPodId()] = req.GetPod().GetPodIp()
 	s.mu.Unlock()
 	return &runtimev1.CreatePodResponse{}, nil
+}
+
+// boxPodIP returns the PodBox.pod_ip the provider sent for podID — the value
+// podIP resolved, crossing the RPC boundary. It is what a status echoes back when
+// echoPodIP is set, and "" otherwise.
+func (s *leaseRuntimeServer) boxPodIP(podID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.boxIPs[podID]
+}
+
+// reportedPodIP is boxPodIP gated on echoPodIP.
+func (s *leaseRuntimeServer) reportedPodIP(podID string) string {
+	if !s.echoPodIP {
+		return ""
+	}
+	return s.boxPodIP(podID)
 }
 
 func (s *leaseRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
@@ -80,7 +110,7 @@ func (s *leaseRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeleteP
 }
 
 func (s *leaseRuntimeServer) GetPodStatus(_ context.Context, req *runtimev1.GetPodStatusRequest) (*runtimev1.GetPodStatusResponse, error) {
-	return &runtimev1.GetPodStatusResponse{Status: leaseStatus(req.GetPodId(), "")}, nil
+	return &runtimev1.GetPodStatusResponse{Status: leaseStatus(req.GetPodId(), s.reportedPodIP(req.GetPodId()), "")}, nil
 }
 
 // WatchPodStatus forwards pushed events until the stream ends.
@@ -104,20 +134,22 @@ func (s *leaseRuntimeServer) push(t *testing.T, podID, transport string) {
 	select {
 	case s.events <- &runtimev1.PodStatusEvent{
 		Type:   runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED,
-		Status: leaseStatus(podID, transport),
+		Status: leaseStatus(podID, s.reportedPodIP(podID), transport),
 	}:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("push status for %s: the provider is not consuming the stream", podID)
 	}
 }
 
-// leaseStatus is a minimal Running PodStatus carrying the vm-pod live
-// transport address under test. pod_ip is left EMPTY: the published identity the
-// override is keyed on must come from the node's own guest record, never from
-// the status the same test wrote.
-func leaseStatus(podID, transport string) *runtimev1.PodStatus {
+// leaseStatus is a minimal Running PodStatus carrying the vm-pod live transport
+// address under test. podIP is the reported pod_ip: EMPTY for this file's own
+// cases, so the published identity the override is keyed on must come from the
+// node's own guest record and not from a status the same test wrote; echoed back
+// from the created PodBox for the chain gate, which is what a real runtimed does.
+func leaseStatus(podID, podIP, transport string) *runtimev1.PodStatus {
 	return &runtimev1.PodStatus{
 		PodId:                 podID,
+		PodIp:                 podIP,
 		Phase:                 runtimev1.PodPhase_POD_PHASE_RUNNING,
 		GuestTransportAddress: transport,
 		ContainerStatuses: []*runtimev1.ContainerStatus{{
@@ -131,8 +163,15 @@ func leaseStatus(podID, transport string) *runtimev1.PodStatus {
 
 // recordingSink is the TransportOverrideSink under assertion: it records every
 // map generation the feed publishes (copied on arrival, since the feed hands
-// ownership over and the test must not observe a later mutation).
+// ownership over and the test must not observe a later mutation) and FORWARDS it
+// to the real darwin-net routing table.
+//
+// The forward is what keeps the recording honest: the production consumer takes
+// every generation this file asserts on, so a map the real table would reject
+// (an invalid key, a shape it does not accept) cannot pass here.
 type recordingSink struct {
+	table *proxy.RoutingTable
+
 	mu   sync.Mutex
 	sets int
 	last map[netip.Addr]netip.Addr
@@ -140,11 +179,14 @@ type recordingSink struct {
 
 func (s *recordingSink) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.sets++
 	s.last = maps.Clone(overrides)
 	if s.last == nil {
 		s.last = map[netip.Addr]netip.Addr{}
+	}
+	s.mu.Unlock()
+	if s.table != nil {
+		s.table.SetTransportOverrides(overrides)
 	}
 }
 
@@ -170,12 +212,21 @@ type leaseNode struct {
 	ipam   *fakeIPAM
 	rt     *leaseRuntimeServer
 	sink   *recordingSink
+	table  *proxy.RoutingTable
 	mu     sync.Mutex
-	seen   map[string]int // pod id -> status callbacks delivered
+	seen   map[string]int    // pod id -> status callbacks delivered
+	podIPs map[string]string // pod id -> the LAST status.podIP VK was told
 	notify chan struct{}
 }
 
-func newLeaseNode(t *testing.T) *leaseNode {
+// newLeaseNode builds the node with statuses that report NO pod_ip (this file's
+// posture — see leaseStatus).
+func newLeaseNode(t *testing.T) *leaseNode { return newLeaseNodeWith(t, false) }
+
+// newLeaseNodeWith builds the node with a runtimed fake that echoes the created
+// PodBox.pod_ip back on every status when echoPodIP is set, the way a real
+// runtimed does.
+func newLeaseNodeWith(t *testing.T, echoPodIP bool) *leaseNode {
 	t.Helper()
 	ipam := newFakeIPAM(t, guestPodCIDR)
 	ipam.vm = podnet.VMNetworkConfig{
@@ -184,11 +235,15 @@ func newLeaseNode(t *testing.T) *leaseNode {
 		DNSVIP:    netip.MustParseAddr(guestDNSVIP),
 	}
 	adapt := NewPodNetAdapter(ipam, guestNodeIP, nil)
-	rt := newLeaseRuntimeServer()
-	sink := &recordingSink{}
+	rt := newLeaseRuntimeServer(echoPodIP)
+	// The REAL routing table the node's Service proxy would route on, behind the
+	// recorder — so every override generation this fixture asserts on is one the
+	// production consumer actually took.
+	table := proxy.NewRoutingTable(netip.MustParsePrefix(guestPodCIDR))
+	sink := &recordingSink{table: table}
 	n := &leaseNode{
-		ipam: ipam, adapt: adapt, rt: rt, sink: sink,
-		seen: map[string]int{}, notify: make(chan struct{}, 64),
+		ipam: ipam, adapt: adapt, rt: rt, sink: sink, table: table,
+		seen: map[string]int{}, podIPs: map[string]string{}, notify: make(chan struct{}, 64),
 	}
 	n.r = newRuntimedWith(rt, RuntimedConfig{
 		NodeName:           guestNodeName,
@@ -210,6 +265,7 @@ func (n *leaseNode) watch(t *testing.T) {
 	n.r.Watch(ctx, func(pod *corev1.Pod) {
 		n.mu.Lock()
 		n.seen[string(pod.UID)]++
+		n.podIPs[string(pod.UID)] = pod.Status.PodIP
 		n.mu.Unlock()
 		select {
 		case n.notify <- struct{}{}:
@@ -235,6 +291,28 @@ func (n *leaseNode) awaitStatus(t *testing.T, podID string, want int) {
 		case <-n.notify:
 		case <-deadline:
 			t.Fatalf("status callback for %s fired %d times, want >= %d", podID, got, want)
+		}
+	}
+}
+
+// awaitStatusPodIP blocks until the VK callback has reported podID with the given
+// status.podIP. It is how the PUBLISHED identity is observed where a Service
+// controller would observe it, rather than where the provider computed it.
+func (n *leaseNode) awaitStatusPodIP(t *testing.T, podID, want string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		n.mu.Lock()
+		got, seen := n.podIPs[podID], n.seen[podID]
+		n.mu.Unlock()
+		if got == want {
+			return
+		}
+		select {
+		case <-n.notify:
+		case <-time.After(5 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("status.podIP for %s = %q after %d callbacks, want %q", podID, got, seen, want)
 		}
 	}
 }

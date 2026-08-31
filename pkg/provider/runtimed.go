@@ -641,27 +641,40 @@ var (
 // later Setup for the same podID is idempotent and returns the SAME address.
 //
 // Branches (each documented, never a silent fallback):
+//
 //   - no adapter (nil network — the --network none posture): podIP ≈ nodeIP.
+//
 //   - spec.hostNetwork: the pod shares the node's addresses — no /32. The pod is
 //     marked on the adapter so the runtimed-side seam Setup (which the
 //     host-process spine calls unconditionally) also resolves it to the node IP.
-//   - vm RuntimeClass: no lo0 /32 (which would make the host answer for the
-//     guest and blackhole it), so this branch returns the node IP and routes the
-//     pod away from the host-process Setup. The guest DOES own its own address
-//     inside its netstack: setupGuestNetwork (on the create path, before
-//     translation) allocates it through darwin-net podnet.Network.SetupGuest and
-//     the adapter carries it to runtimed as sandbox.VMSpec.Network via the
-//     runtime.GuestNetworker seam — that carrier IS wired (M11.4-d4 / B6).
-//     What is NOT wired is REPORTING that address as the pod's status.podIP:
-//     this function still returns the node IP for a vm pod, because whether the
-//     guest's NAT-private address becomes reachable AT the pod IP is the
-//     lab-gated question (a NAT attachment assigns the guest a macOS-chosen
-//     address, so PodIP crosses as an ADVISORY intent runtimed reconciles). So
-//     every vm pod still publishes the SAME status.podIP — the node's — and that
-//     is a placeholder, not the end state. See k3sm/pkg/runtimeclass/doc.go for
-//     the lab-gated remainder.
+//
+//   - vm RuntimeClass: the /32 darwin-net podnet.Network.SetupGuest allocated for
+//     the guest, via setupGuestNetwork — the SAME address the adapter carries to
+//     runtimed as sandbox.VMSpec.Network through the runtime.GuestNetworker seam.
+//     SetupGuest is idempotent per podID, so buildBox's later call a few frames
+//     down returns this very address and there is still exactly one authority.
+//     NO lo0 alias is plumbed for it (SetupGuest is the not-taken branch of
+//     podnet's path fork): a host alias for the guest's address would make the
+//     host answer for the guest and blackhole it.
+//
+//     WHY THE GUEST'S /32 IS PUBLISHED WHILE THE HOST DOES NOT HOLD IT. A vm pod
+//     has TWO addresses and they are never reconciled into one. This /32 is its
+//     cluster IDENTITY — what status.podIP, its EndpointSlices, cluster DNS and
+//     every NetworkPolicy carry — and it is deliberately live on no interface.
+//     The address that carries bytes is the guest's macOS-assigned vmnet DHCP
+//     lease, reported by the guest agent as PodStatus.guest_transport_address;
+//     it is never published, because a lease churns on every guest restart while
+//     an identity must not. The dial paths TRANSLATE between the two:
+//     observeTransport feeds the Service proxy a published->live override map
+//     keyed on exactly this /32 (proxy.RoutingTable.SetTransportOverrides), so a
+//     Service backend picked and policy-checked on the identity is dialed at the
+//     lease. Publishing the node IP here — which this branch used to do — gave
+//     every vm pod on a node the same status.podIP, which no override map can be
+//     keyed on and which no Service could distinguish.
+//
 //   - otherwise: the podnet /32. Pool exhaustion surfaces as a distinguishable
-//     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap).
+//     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap) —
+//     identically for the guest branch, which draws from the same node pool.
 func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, error) {
 	if r.network == nil {
 		return r.nodeIP, nil
@@ -673,9 +686,24 @@ func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, e
 	}
 	if backend, err := podSandboxBackend(pod); err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
 		// An unknown RuntimeClass error is NOT handled here — toPodBox owns that
-		// fail-closed rejection; this branch only routes a resolved vm pod away
-		// from the host-process /32.
-		return r.nodeIP, nil
+		// fail-closed rejection; this branch only routes a resolved vm pod to the
+		// guest allocation instead of the host-process one.
+		//
+		// The dropped truncation count is buildBox's to report: podDNSConfig is
+		// pure and this is the FIRST of the create path's two calls, so warning
+		// here would double-report one pod's truncated search list.
+		dnsCfg, _ := r.podDNSConfig(pod)
+		gn, err := r.setupGuestNetwork(ctx, pod, dnsCfg)
+		if err != nil {
+			return "", err
+		}
+		if !gn.PodIP.IsValid() {
+			// The seam allocated nothing. Fail the create rather than fall back to
+			// the node IP: a vm pod published at the node's address is unaddressable
+			// as a Service backend and indistinguishable from every other guest.
+			return "", fmt.Errorf("allocate pod ip for %s/%s: the guest network carries no address", pod.Namespace, pod.Name)
+		}
+		return gn.PodIP.String(), nil
 	}
 	ip, err := r.network.Setup(ctx, id)
 	if err != nil {
@@ -719,8 +747,14 @@ func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 // and hands it to the adapter, which records it for runtimed to read back on the
 // vm route (runtime.GuestNetworker -> sandbox.VMSpec.Network). It is the B6
 // producer half; runtimed is the consumer half and never derives this itself.
+// It RETURNS the config, because podIP publishes the allocated /32 as the pod's
+// cluster identity — the zero value (with an invalid PodIP) for every pod the
+// guards below exclude.
 //
-// WHERE IT RUNS. Inside buildBox, immediately before toPodBox, for two reasons.
+// WHERE IT RUNS. Twice on the create path, both times before translation, and
+// that is safe because it is idempotent per podID: podIP calls it to learn the
+// address it must publish, and buildBox calls it immediately before toPodBox.
+// The buildBox call site is the one the ordering argument below is about.
 // It must be BEFORE translation (the M10.1 ordering: the pod's network exists
 // before the box that describes it), and it must consume the SAME dnsCfg value
 // toPodBox is given — the per-pod, namespace-scoped config after the B20a
@@ -745,18 +779,46 @@ func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 // — indistinguishable at that point from an application bug. Pool exhaustion is
 // named through the shared allocError, so it reads identically to a host-process
 // pod exhausting the same 253 addresses.
-func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod, dnsCfg netv1.DNSConfig) error {
+func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod, dnsCfg netv1.DNSConfig) (sandbox.GuestNetworkConfig, error) {
 	if r.network == nil || pod.Spec.HostNetwork {
-		return nil
+		return sandbox.GuestNetworkConfig{}, nil
 	}
 	backend, err := podSandboxBackend(pod)
 	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
-		return nil
+		return sandbox.GuestNetworkConfig{}, nil
 	}
-	if _, err := r.network.SetupGuest(ctx, string(pod.UID), dnsCfg); err != nil {
-		return r.allocError(pod, err)
+	gn, err := r.network.SetupGuest(ctx, string(pod.UID), dnsCfg)
+	if err != nil {
+		return sandbox.GuestNetworkConfig{}, r.allocError(pod, err)
 	}
-	return nil
+	return gn, nil
+}
+
+// podDNSConfig derives one pod's cluster DNS config: the namespace-scoped cluster
+// base (dns.PodDNSConfig), additively merged with a ClusterFirst pod's
+// spec.dnsConfig (B20a — extra search domains appended+deduped, an ndots override).
+// The merge is GATED on the cluster-DNS policy — NOT left to injectClusterDNSEnv's
+// downstream gate — so the B20a/B20b seam is structural: a None/Default pod gets the
+// UNMERGED base, so when B20b makes None inject its own config it cannot inherit a
+// cluster-base merge. dnsConfigOverride does the corev1→discrete-params extraction
+// (k3sm is the corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots,
+// never repoint the cluster server VIP.
+//
+// It returns the config and the number of search domains the in-pod cap DROPPED,
+// and logs nothing: the create path calls it twice for a vm pod (podIP, to learn
+// the guest address it must publish, and buildBox, to translate), so warning inside
+// would double-report one pod's truncation. buildBox owns that warning.
+//
+// It exists as one function for the same reason allocError does: the guest's
+// /etc/resolv.conf and its containers' injected K3SM_DNS_* env are derived from
+// this value, and a second derivation is how the two would come to disagree.
+func (r *runtimedRuntime) podDNSConfig(pod *corev1.Pod) (netv1.DNSConfig, int) {
+	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
+	if !clusterDNSPolicy(pod.Spec.DNSPolicy) || pod.Spec.DNSConfig == nil {
+		return dnsCfg, 0
+	}
+	searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
+	return dns.MergeDNSConfig(dnsCfg, searches, ndots)
 }
 
 // buildBox translates pod to a PodBox and resolves its env into LITERAL values —
@@ -769,32 +831,22 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// Per-pod cluster DNS config: the search list is namespace-scoped
 	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
 	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
-	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
-	// B20a: a ClusterFirst pod's spec.dnsConfig additively augments the cluster base
-	// (extra search domains appended+deduped, ndots override). The merge is GATED here
-	// on the cluster-DNS policy — NOT left to injectClusterDNSEnv's downstream gate —
-	// so the B20a/B20b seam is structural: a None/Default pod gets the UNMERGED base,
-	// so when B20b makes None inject its own config it can't inherit a cluster-base
-	// merge. dnsConfigOverride does the corev1→discrete-params extraction (k3sm is the
-	// corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots, never repoint
-	// the cluster server VIP.
-	if clusterDNSPolicy(pod.Spec.DNSPolicy) && pod.Spec.DNSConfig != nil {
-		searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
-		var dropped int
-		dnsCfg, dropped = dns.MergeDNSConfig(dnsCfg, searches, ndots)
-		if dropped > 0 {
-			// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
-			// deliberate divergence from upstream's 32); the tail was truncated. Log once
-			// here at the corev1-aware boundary WITH pod identity — the darwin-net merge
-			// primitive stays pure and returns the count rather than logging blind.
-			r.log.WarnContext(ctx, "pod dnsConfig search list truncated to the in-pod cap",
-				"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
-		}
+	dnsCfg, dropped := r.podDNSConfig(pod)
+	if dropped > 0 {
+		// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
+		// deliberate divergence from upstream's 32); the tail was truncated. Log once
+		// here at the corev1-aware boundary WITH pod identity — the darwin-net merge
+		// primitive stays pure and returns the count rather than logging blind, and
+		// podDNSConfig's other caller (podIP) deliberately drops the count so one
+		// pod's truncation is reported once.
+		r.log.WarnContext(ctx, "pod dnsConfig search list truncated to the in-pod cap",
+			"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
 	}
 	// Produce the vm pod's GUEST network config BEFORE translation, from the very
 	// dnsCfg above — the M10.1 one-authority ordering applied to the guest carrier.
-	// A no-op for every non-vm pod.
-	if err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
+	// A no-op for every non-vm pod, and idempotent for a vm pod whose address podIP
+	// already drew through this same call.
+	if _, err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
 		return nil, err
 	}
 	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg, r.log)

@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,22 +33,41 @@ import (
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
-// docTruthNetwork is a PodNetwork that records whether the host-process Setup
-// path was taken. A vm pod must never reach it (no lo0 /32 for a guest).
+// The addresses this file pins podIP's dispatch to. Each is distinguishable from
+// the others and from the node IP, so a branch that returned the wrong one cannot
+// look right by coincidence.
+const (
+	docTruthGuestIP = "100.64.0.77" // what SetupGuest allocates for a guest
+	docTruthHostIP  = "127.0.0.42"  // what the host-process Setup binds on lo0
+	docTruthNodeIP  = "10.0.0.5"    // the node's own address
+)
+
+// docTruthNetwork is a PodNetwork that records which allocation path was taken.
+// A vm pod must reach SetupGuest and never the host-process Setup (no lo0 /32 for
+// a guest); a host-process pod must do the reverse.
+//
+// guestIP is what SetupGuest reports back. The zero value (an INVALID address) is
+// the "the seam allocated nothing" case, which podIP must fail closed on rather
+// than substituting the node IP.
 type docTruthNetwork struct {
+	guestIP       netip.Addr
 	setupCalls    []string
 	guestSetups   []string
 	hostNetMarked []string
 }
 
+func newDocTruthNetwork() *docTruthNetwork {
+	return &docTruthNetwork{guestIP: netip.MustParseAddr(docTruthGuestIP)}
+}
+
 func (n *docTruthNetwork) Setup(_ context.Context, podID string) (string, error) {
 	n.setupCalls = append(n.setupCalls, podID)
-	return "127.0.0.42", nil
+	return docTruthHostIP, nil
 }
 func (n *docTruthNetwork) Teardown(string) error { return nil }
 func (n *docTruthNetwork) SetupGuest(_ context.Context, podID string, _ netv1.DNSConfig) (sandbox.GuestNetworkConfig, error) {
 	n.guestSetups = append(n.guestSetups, podID)
-	return sandbox.GuestNetworkConfig{}, nil
+	return sandbox.GuestNetworkConfig{PodIP: n.guestIP}, nil
 }
 func (n *docTruthNetwork) MarkHostNetwork(podID string) {
 	n.hostNetMarked = append(n.hostNetMarked, podID)
@@ -57,52 +77,82 @@ func (n *docTruthNetwork) MarkHostNetwork(podID string) {
 // comment to what podIP actually DOES for a vm-RuntimeClass pod, so the two
 // cannot drift apart again.
 //
-// HISTORY, because the gate's polarity flipped and that is the interesting part.
-// The comment once asserted, in the present tense, that a vm pod was routed to
-// SetupGuest — while nothing called it. The gate then pinned the ABSENCE of a
-// production caller, so that landing the carrier would go red and force the doc
-// to be re-read. M11.4-d4 landed it: buildBox -> setupGuestNetwork ->
-// PodNetwork.SetupGuest allocates the guest's address and the adapter carries the
-// config to runtimed as sandbox.VMSpec.Network. The gate went red exactly as
-// designed, and is now inverted to pin the wiring's PRESENCE.
+// HISTORY, because the gate's polarity has now flipped TWICE and that is the
+// interesting part. The comment once asserted, in the present tense, that a vm
+// pod was routed to SetupGuest — while nothing called it; the gate pinned that
+// ABSENCE. M11.4-d4 landed the carrier and the gate inverted to pin its
+// PRESENCE, while still recording the thing that had NOT changed: podIP returned
+// the NODE IP for a vm pod, so every vm pod on a node published the same
+// status.podIP.
 //
-// What did NOT change is the reason this comment exists: podIP still returns the
-// NODE IP for a vm pod, so every vm pod still publishes the same status.podIP.
-// Reporting the guest's own address is the lab-gated question (a NAT attachment
-// assigns it a macOS-chosen address), and this doc is the only place a reader
-// learns that. A comment that quietly upgraded "the carrier is wired" into "the
-// pod IP is the guest's" would teach the wrong datapath just as effectively as
-// the original false claim did.
+// B237 retires that stand-in, and this gate now pins the end state. podIP
+// publishes the /32 SetupGuest allocated, because the two-address model needs a
+// per-pod identity to key on: the published /32 is the pod's cluster identity
+// (status.podIP, EndpointSlices, DNS, NetworkPolicy) and is live on no
+// interface, while the guest's vmnet DHCP lease is its live TRANSPORT address,
+// and observeTransport feeds the Service proxy a published->live override map
+// keyed on exactly this /32. A node IP could key nothing, because every guest on
+// the node would share it.
 //
-// Four assertions, each red on a different regression:
-//  1. BEHAVIOUR — a vm pod resolves to the node IP and never reaches the
-//     host-process Setup (the real, current dispatch).
-//  2. CONTROL — a non-vm pod DOES take the host-process path.
-//  3. PRODUCTION CALLER — a non-test file in this module calls SetupGuest. If the
+// Six assertions, each red on a different regression:
+//  1. BEHAVIOUR — a vm pod resolves to the SetupGuest-allocated /32 and never
+//     reaches the host-process Setup (no lo0 alias for a guest).
+//  2. FAIL CLOSED — a guest seam that allocated nothing fails the create rather
+//     than falling back to the node IP (which would be unaddressable as a
+//     Service backend and indistinguishable from every other guest).
+//  3. CONTROL — a non-vm pod DOES take the host-process path.
+//  4. THE OTHER BRANCHES — hostNetwork and the nil adapter still resolve to the
+//     node IP, and hostNetwork draws no guest address.
+//  5. PRODUCTION CALLER — a non-test file in this module calls SetupGuest. If the
 //     B6 producer is ever unwired, this goes red and the doc must be restated.
-//  4. THE DOC MATCHES — it names the wired carrier, still records the node-IP
-//     placeholder, and does not revive the retired "no caller / NOT WIRED" claim.
+//  6. THE DOC MATCHES — it names the wired carrier, states the published/live
+//     two-address split, and does not revive any retired claim.
 func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 	t.Parallel()
 
-	t.Run("vm pod resolves to the node IP and skips host-process Setup", func(t *testing.T) {
+	t.Run("vm pod resolves to the allocated guest /32 and skips host-process Setup", func(t *testing.T) {
 		vm := "vm"
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "guest", Namespace: "default", UID: "vm-uid"},
 			Spec:       corev1.PodSpec{RuntimeClassName: &vm},
 		}
-		net := &docTruthNetwork{}
-		r := &runtimedRuntime{nodeName: "n0", nodeIP: "10.0.0.5", network: net}
+		net := newDocTruthNetwork()
+		r := &runtimedRuntime{nodeName: "n0", nodeIP: docTruthNodeIP, network: net}
 
 		ip, err := r.podIP(context.Background(), pod)
 		if err != nil {
 			t.Fatalf("podIP: %v", err)
 		}
-		if ip != "10.0.0.5" {
-			t.Errorf("vm pod IP = %q, want the node IP 10.0.0.5 (the documented placeholder)", ip)
+		if ip != docTruthGuestIP {
+			t.Errorf("vm pod IP = %q, want the SetupGuest-allocated /32 %q (its published cluster identity)", ip, docTruthGuestIP)
+		}
+		if ip == docTruthNodeIP {
+			t.Error("vm pod IP is the node IP; the retired stand-in gave every guest on the node one identity")
+		}
+		if len(net.guestSetups) == 0 {
+			t.Error("the vm pod never reached SetupGuest — its address did not come from the guest seam")
 		}
 		if len(net.setupCalls) != 0 {
 			t.Errorf("vm pod reached the host-process Setup %v — a guest must get no lo0 /32", net.setupCalls)
+		}
+	})
+
+	t.Run("a guest seam that allocates nothing fails the create", func(t *testing.T) {
+		vm := "vm"
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "addressless", Namespace: "default", UID: "vm-none"},
+			Spec:       corev1.PodSpec{RuntimeClassName: &vm},
+		}
+		net := newDocTruthNetwork()
+		net.guestIP = netip.Addr{} // the seam reports no address
+		r := &runtimedRuntime{nodeName: "n0", nodeIP: docTruthNodeIP, network: net}
+
+		ip, err := r.podIP(context.Background(), pod)
+		if err == nil {
+			t.Fatalf("podIP = %q, nil; want a failure — falling back to the node IP would publish an unusable identity", ip)
+		}
+		if ip != "" {
+			t.Errorf("podIP returned %q alongside its error, want the empty string", ip)
 		}
 	})
 
@@ -112,14 +162,50 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "plain", Namespace: "default", UID: "plain-uid"},
 		}
-		net := &docTruthNetwork{}
-		r := &runtimedRuntime{nodeName: "n0", nodeIP: "10.0.0.5", network: net}
+		net := newDocTruthNetwork()
+		r := &runtimedRuntime{nodeName: "n0", nodeIP: docTruthNodeIP, network: net}
 		ip, err := r.podIP(context.Background(), pod)
 		if err != nil {
 			t.Fatalf("podIP: %v", err)
 		}
-		if ip != "127.0.0.42" || len(net.setupCalls) != 1 {
+		if ip != docTruthHostIP || len(net.setupCalls) != 1 {
 			t.Errorf("normal pod: ip=%q setupCalls=%v, want the allocated /32 via exactly one Setup", ip, net.setupCalls)
+		}
+		if len(net.guestSetups) != 0 {
+			t.Errorf("a host-process pod reached SetupGuest %v", net.guestSetups)
+		}
+	})
+
+	// The two branches B237 did NOT touch. Both still resolve to the node IP, and
+	// neither draws a guest address — the vm flip must not have widened into them.
+	t.Run("hostNetwork and the nil adapter still resolve to the node IP", func(t *testing.T) {
+		hostNet := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "hostnet", Namespace: "default", UID: "hostnet-uid"},
+			Spec:       corev1.PodSpec{HostNetwork: true},
+		}
+		net := newDocTruthNetwork()
+		r := &runtimedRuntime{nodeName: "n0", nodeIP: docTruthNodeIP, network: net}
+		ip, err := r.podIP(context.Background(), hostNet)
+		if err != nil {
+			t.Fatalf("podIP(hostNetwork): %v", err)
+		}
+		if ip != docTruthNodeIP {
+			t.Errorf("hostNetwork pod IP = %q, want the node IP %q", ip, docTruthNodeIP)
+		}
+		if len(net.hostNetMarked) != 1 || len(net.guestSetups) != 0 || len(net.setupCalls) != 0 {
+			t.Errorf("hostNetwork pod: marked=%v guestSetups=%v setupCalls=%v, want exactly one mark and no allocation",
+				net.hostNetMarked, net.guestSetups, net.setupCalls)
+		}
+
+		// --network none: no adapter at all.
+		bare := &runtimedRuntime{nodeName: "n0", nodeIP: docTruthNodeIP}
+		vm := "vm"
+		vmPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "guest", Namespace: "default", UID: "vm-uid"},
+			Spec:       corev1.PodSpec{RuntimeClassName: &vm},
+		}
+		if ip, err := bare.podIP(context.Background(), vmPod); err != nil || ip != docTruthNodeIP {
+			t.Errorf("podIP with no adapter = (%q, %v), want (%q, nil)", ip, err, docTruthNodeIP)
 		}
 	})
 
@@ -133,13 +219,13 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 		if !wired {
 			t.Fatal("no non-test file in this module calls SetupGuest — the B6 producer wiring is gone. " +
 				"It ran buildBox -> setupGuestNetwork -> PodNetwork.SetupGuest, and the adapter carried the " +
-				"result to runtimed as sandbox.VMSpec.Network (runtime.GuestNetworker). Restore it; if it was " +
-				"removed deliberately, restate podIP's doc comment for the datapath that replaced it and " +
-				"re-point this gate at that truth.")
+				"result to runtimed as sandbox.VMSpec.Network (runtime.GuestNetworker); podIP publishes the " +
+				"address it returns. Restore it; if it was removed deliberately, restate podIP's doc comment " +
+				"for the datapath that replaced it and re-point this gate at that truth.")
 		}
 	})
 
-	t.Run("the doc names the wired carrier and keeps the node-IP placeholder", func(t *testing.T) {
+	t.Run("the doc names the carrier and the two-address split", func(t *testing.T) {
 		if !wired {
 			t.Skip("SetupGuest has no production caller; the previous subtest owns that failure")
 		}
@@ -155,21 +241,28 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 					"(setupGuestNetwork), and this comment is where a reader goes looking", want)
 			}
 		}
-		// And it must STILL explain the thing that did not change — otherwise the
-		// comment reads as though a vm pod now reports its guest address.
-		if !strings.Contains(doc, "placeholder") || !strings.Contains(doc, "node IP") {
-			t.Error("podIP's doc comment no longer records that a vm pod publishes the NODE IP as a placeholder; " +
-				"that is still what this function returns, and it is the only place a reader learns why")
+		// And it must explain WHY the guest's /32 is published while no interface
+		// holds it — the published-identity / live-transport split is the whole
+		// reason this branch returns what it returns, and this is the only place a
+		// reader of podIP learns it.
+		for _, want := range []string{"published", "lease", "transport", "SetTransportOverrides"} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("podIP's doc comment does not mention %q; without the published-identity vs "+
+					"live-lease-transport split, returning an address no interface holds reads as a bug", want)
+			}
 		}
-		// The retired claims: the carrier now exists, so re-asserting either of
-		// these would be false in exactly the way this gate was built to catch.
+		// The retired claims. Each was true once and is false now, and re-asserting
+		// any of them is exactly the drift this gate was built to catch: the first
+		// two predate the wired carrier, the third is the node-IP stand-in B237
+		// retired.
 		for _, stale := range []*regexp.Regexp{
 			regexp.MustCompile(`(?i)no\s+production\s+caller`),
 			regexp.MustCompile(`NOT WIRED:`),
+			regexp.MustCompile(`(?i)placeholder`),
 		} {
 			if stale.MatchString(doc) {
-				t.Errorf("podIP's doc comment revives the retired claim %q, but the guest-network carrier is wired "+
-					"(setupGuestNetwork calls SetupGuest and the adapter serves runtime.GuestNetworker)", stale)
+				t.Errorf("podIP's doc comment revives the retired claim %q; the guest-network carrier is wired "+
+					"and podIP publishes the address it allocated, not the node IP", stale)
 			}
 		}
 	})
