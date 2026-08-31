@@ -111,6 +111,7 @@ func TestStandaloneNodeGuardsDNSEnvInjection(t *testing.T) {
 			&bootstrap.JoinResult{PodCIDR: "100.64.1.0/24"},
 			"/tmp/node.kubeconfig",
 			hostnet.Mode{},
+			nil,
 		)
 		if agentOpts.standalone {
 			t.Fatal("agentNodeOptions produced a standalone nodeOptions — the B43 guard must not leak into the agent path")

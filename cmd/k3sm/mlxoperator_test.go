@@ -95,7 +95,7 @@ func TestStandaloneNodeOptionsPublishNoRuntime(t *testing.T) {
 	if (nodeOptions{}).attachRuntimeInfo != nil {
 		t.Error("the zero nodeOptions publishes a runtime; the standalone node and agent paths must be unchanged")
 	}
-	if agentNodeOptions(agentOptions{}, &bootstrap.JoinResult{}, "kubeconfig", hostnet.Mode{}).attachRuntimeInfo != nil {
+	if agentNodeOptions(agentOptions{}, &bootstrap.JoinResult{}, "kubeconfig", hostnet.Mode{}, nil).attachRuntimeInfo != nil {
 		t.Error("the agent path publishes a runtime; only `k3sm server` runs an MLX operator in the same process")
 	}
 }

@@ -135,6 +135,16 @@ type nodeOptions struct {
 	// where the pre-injection behavior deferred to the host resolver immediately.
 	standalone bool
 
+	// transportOverrides is the Service-proxy seam the provider publishes a vm
+	// pod's LIVE TRANSPORT address through — the node-local datapath's netserve
+	// Server, which forwards to the proxy's routing table. Built by
+	// nodeTransportOverrides, so the two bring-ups that host a datapath
+	// (`k3sm server`, `k3sm agent`) share one decision about when there is a proxy
+	// to feed. nil (the standalone `k3sm node`, `--network none`) runs the feed
+	// inert: every backend is dialed at its published address, exactly as a
+	// host-process pod's is.
+	transportOverrides provider.TransportOverrideSink
+
 	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
 	// runtime as soon as it is built, so a consumer started EARLIER in the same
 	// process can read runtime-info facts off the SAME runtime this node drives.
@@ -999,6 +1009,12 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs
 		// helper mode (a pod must never drive netd).
 		DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
+		// The Service proxy's transport-override seam (M11.3-d2/B237). A vm pod
+		// publishes the /32 its guest was allocated, and the guest's macOS-assigned
+		// vmnet lease is what actually carries bytes; the provider is the only
+		// component holding both, so it feeds the map. nil here (no datapath) leaves
+		// the feed inert.
+		TransportOverrides: opts.transportOverrides,
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).

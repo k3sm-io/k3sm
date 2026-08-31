@@ -297,8 +297,24 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		if spec.Network.PodIP.String() == guestNodeIP {
 			t.Errorf("VMSpec.Network.PodIP = %v, want the guest's OWN address, not the node IP", spec.Network.PodIP)
 		}
-		if got := n.ipam.guestSetupCalls(); !reflect.DeepEqual(got, []string{id}) {
-			t.Errorf("SetupGuest calls = %v, want exactly [%s]", got, id)
+		// SetupGuest is consulted TWICE on the create path and both calls are for
+		// THIS pod: podIP calls it to learn the /32 it publishes as the pod's
+		// cluster identity, and buildBox calls it again immediately before
+		// translation. What must hold is not a call count but IDEMPOTENCE — the
+		// node pool holds exactly ONE address for the pod, asserted below, which
+		// is the property a second allocation would break and a count assertion
+		// would miss.
+		guestCalls := n.ipam.guestSetupCalls()
+		if len(guestCalls) == 0 {
+			t.Errorf("SetupGuest calls = %v, want the vm pod's guest allocation to have been drawn", guestCalls)
+		}
+		for _, c := range guestCalls {
+			if c != id {
+				t.Errorf("SetupGuest called for %q, want only %q", c, id)
+			}
+		}
+		if got := len(n.ipam.allocations()); got != 1 {
+			t.Errorf("the node pool holds %d allocations, want exactly 1 — SetupGuest must be idempotent per podID", got)
 		}
 		// And no lo0 /32 was plumbed for it: a guest owns its address inside its
 		// own netstack, so the host must never answer for it.

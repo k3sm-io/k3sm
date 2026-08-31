@@ -41,6 +41,34 @@ import (
 // in the routing table (a hint/metric in M1; steering does not depend on it).
 const defaultPodCIDR = "100.64.0.0/24"
 
+// DefaultVMNetSubnet is the NAT segment a vm-RuntimeClass pod's guest is expected
+// to land in: the segment Apple's vmnet hands out behind a
+// VZNATNetworkDeviceAttachment, OBSERVED as 192.168.64.0/24 on the reference rig.
+//
+// Apple does not document it and does not let a host choose it — the segment is
+// assigned by macOS at attach time — so this is the one home for a value that can
+// only be measured, never configured. It fills Config.VMNetSubnet on both node
+// bring-ups; read that field's comment for why it is ADVISORY (a guest's ACTUAL
+// address is its vmnet DHCP lease, reported by the guest agent, and that lease is
+// the only authority for where a given guest landed).
+//
+// WHAT IT SCOPES, AND HOW IT FAILS. Its single consumer is vmnetPolicyPrefix,
+// which scopes the NetworkPolicy table's fail-closed unknown-vm-source branch. If
+// macOS ever hands out a DIFFERENT segment, guest packets arrive from outside this
+// prefix, the branch does not fire, and they fail OPEN exactly as every other
+// unattributable source does — the pre-M11.3 behavior. So a stale value degrades
+// to the old fail-open, never to a wrong deny.
+//
+// THE RECORDED RESIDUAL. The deny is a superset of guests: any unattributable
+// source inside this range is denied, and 192.168.64.0/24 is a plausible home-LAN
+// range. A real LAN client at such an address, dialing a POLICY-SELECTED backend
+// on a vm-hosting node, is denied. It is narrow on three counts at once — the node
+// must advertise the vm backend, the destination must be selected by a
+// NetworkPolicy, and the source must be unattributable — and it is the accepted,
+// recorded trade for not admitting guest traffic past a policy that selects the
+// destination.
+const DefaultVMNetSubnet = "192.168.64.0/24"
+
 // Config configures the network services the server hosts.
 type Config struct {
 	// Client is the cluster client the Service/EndpointSlice watcher uses.
