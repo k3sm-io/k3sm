@@ -386,8 +386,12 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
 
 ### `vm` Pods: networking — same-node Services, not direct pod IPs
 
-A `vm` Pod serves and consumes ClusterIP Services on its own node like any other pod — delivery to and
-from a Service VIP is native on this path, with no extra routes or elevated privileges involved.
+A `vm` Pod **consumes** ClusterIP Services on its own node like any other pod — delivery from the guest
+to a Service VIP is native on this path, with no extra routes or elevated privileges involved. **Serving**
+as a Service backend is not wired yet: the proxy dials a backend at its published address, and a `vm`
+Pod's live guest address reaches the proxy through the same planned follow-up as source attribution.
+Until that ships, put `vm` workloads behind a Service for *their clients'* sake, but do not expect
+traffic to reach them through it.
 
 **Dialing a `vm` Pod's pod IP directly does not work.** The pod IP a `vm` Pod reports is its published
 identity, not a live address a peer can connect to — so anything that depends on a direct pod-IP dial,
