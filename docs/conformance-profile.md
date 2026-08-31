@@ -5,7 +5,7 @@
 > **k3sm has not run — and by design cannot pass — the upstream Sonobuoy `[Conformance]` suite.** That
 > suite ([CNCF Certified Kubernetes](https://www.cncf.io/training/certification/software-conformance/))
 > assumes **Linux containers, cgroups, CNI, and network namespaces**; k3sm runs Pods as **native Darwin
-> processes** on Apple Silicon with none of those substrates. No amount of hardening makes k3sm pass
+> processes** on Apple Silicon with none of those substrates, so it does not pass
 > `[Conformance]`, and this document does **not** claim it does.
 >
 > What this document *is*: a map from k3sm's **targeted feature classes** to a **green synthetic-

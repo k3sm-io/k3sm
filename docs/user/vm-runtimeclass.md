@@ -6,7 +6,7 @@ answer for **untrusted or multi-tenant** workloads: a real isolation boundary ba
 Virtualization.framework. It is the designed answer, not yet an available one — see the status note
 below before you depend on it.
 
-> **Status: NOT RUNNING YET.** Read this before you plan around anything on this page. **No Pod has
+> **Status: NOT RUNNING YET.** **No Pod has
 > ever booted in a micro-VM.** What exists today is the dispatch half — the RuntimeClass object, the
 > fail-closed backend selection, the capability labels, the volume and network plumbing — wrapped
 > around a boot path that is not written. A Pod that sets `runtimeClassName: vm` does not start.
@@ -84,7 +84,7 @@ Two properties are worth internalizing before you build selectors on these:
 
 ### The two Rosetta labels are advertised, not yet honored
 
-Read this before you build anything on `k3sm.io/rosetta` or `k3sm.io/rosetta-linux`. The labels are a
+The `k3sm.io/rosetta` and `k3sm.io/rosetta-linux` labels are a
 **truthful claim about the host** — the probe really did find Rosetta — and they really do make the node
 **selectable**. But **k3sm does not consume them when it pulls your image yet**: the pull still asks only
 for the node's native architecture (`darwin/arm64`), so an **amd64-only image is refused at pull time**

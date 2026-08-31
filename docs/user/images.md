@@ -1,10 +1,14 @@
 # Images
 
-k3sm runs Pods as native Darwin processes, so its workloads are **not OCI Linux container
-images** — they are native arm64 executables. This page covers how to reference a workload
-**today**, how to **build** an image with `k3sm build`, how to **load** one into this node's
-image store, and the rest of the OCI image path (registry pull) that is on the
-[roadmap](../../ROADMAP.md).
+k3sm runs **OCI images** — it pulls them from registries, verifies their digests, unpacks their
+layers and honours their config. What it does not run is a **Linux** image: a k3sm Pod is a native
+Darwin process, so the payload inside the image must be a `darwin/arm64` executable. A Linux image
+is refused at pull rather than started and left to die at `exec`.
+
+If you are here to find out what you can actually run and how to get there, start with
+[what-runs.md](what-runs.md); this page is the reference behind it — the two workload conventions,
+`k3sm build` and its accepted Dockerfile subset, `k3sm image load` / `import` / `push`, and every
+deliberate difference from the Docker tool of the same name.
 
 ## Running a native workload today
 
@@ -35,12 +39,17 @@ Build the binary with your normal toolchain (`go build`, `clang`, …) targeting
 get the full treatment regardless of packaging: Seatbelt confinement, probes, volume mounts,
 resource limits.
 
-## Why not Docker/OCI Linux images
+## Why not Linux images
 
 A standard OCI image carries a **Linux** userland and expects a Linux kernel. The native path has
 neither, so a Linux image cannot run as a native Darwin process — one of the headline divergences
-in [limitations.md](limitations.md). Linux images are the province of the EXPERIMENTAL
-[`vm` RuntimeClass](vm-runtimeclass.md).
+in [limitations.md](limitations.md). k3sm refuses it at pull, naming the platforms the image offers
+and the one this node needs, rather than pulling it and failing opaquely at exec.
+
+Note the distinction this section is *not* making: the objection is to **Linux**, not to OCI. The
+image format, the registry protocol, tags, digests, pull policy and pull secrets all work normally —
+see [what-runs.md](what-runs.md). Linux payloads are the province of the
+[`vm` RuntimeClass](vm-runtimeclass.md), which does not run a Pod yet.
 
 ## Building an image: `k3sm build`
 
@@ -138,21 +147,36 @@ regardless of what this node already holds. Tag the images you load with somethi
 | Requires a running daemon | Yes. The store is written by the node's runtime daemon over its local socket, so `load` works on an installed, running node and not on a bare directory. Its socket is readable only by the daemon's own account. |
 | Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
 
-## On the roadmap: the rest of the OCI-native image path
+## Pushing to a registry: `k3sm image push`
 
-Planned, in order (see the [roadmap](../../ROADMAP.md) for positioning):
+`k3sm image push` uploads the image in an OCI layout directory to a registry reference, so a node
+can pull it the ordinary way instead of being loaded one at a time.
 
-- **Registry images natively** — `image: ghcr.io/org/app:tag` pulled, verified, and run with
-  kubelet-faithful semantics (imagePullPolicy, pull-failure backoff, multi-arch selection).
-- **A full build engine** — `k3sm build` with `RUN` support via a managed BuildKit builder inside
-  a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed.
+```sh
+k3sm build --tag registry.example.com/me/myapp:v1 --output ./layout --format oci .
+k3sm image push ./layout registry.example.com/me/myapp:v1
+```
 
-Until those land, an image reaches a node the way this page describes: build it (or `docker save`
-it) and load it. The native conventions above remain the shortest path for a binary you already
-have on the host.
+The credential is read at the moment of the upload and forgotten: from `K3SM_REGISTRY_TOKEN` if it
+is set, otherwise from the docker config chain (`docker login`). k3sm writes no credential file and
+never takes one on the command line, where it would land in shell history and process listings.
+
+That closes the loop — **build → push → pull → run** — with the node pulling exactly as it would
+from any registry: digests verified, `imagePullSecrets` honoured, multi-arch manifest lists read.
+
+## Still on the roadmap
+
+- **A full build engine** — `k3sm build` with `RUN` support, via a managed BuildKit builder inside
+  a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed. It
+  waits on the `vm` path, which does not run a Pod yet.
+
+Registry pull is **not** on this list: it ships. An `image: ghcr.io/org/app:tag` Pod is pulled,
+digest-verified and run with kubelet-faithful semantics — pull policy, pull-failure backoff and
+multi-arch selection included. What the image must contain is a `darwin/arm64` payload.
 
 ## Next
 
+- [what-runs.md](what-runs.md) — what k3sm can run, and the whole path from Dockerfile to Pod.
 - [quickstart.md](quickstart.md) — run your first native Pod.
 - [limitations.md](limitations.md) — the adaptation requirement.
 - [storage.md](storage.md) — attaching persistent data.
