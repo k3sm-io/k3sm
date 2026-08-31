@@ -37,8 +37,18 @@ import (
 type fakeIPAM struct {
 	alloc *podnet.Allocator
 
-	mu          sync.Mutex
-	byPod       map[string]netip.Addr
+	// vm mirrors the NAT parameters podnet.WithVMNetwork composes into a
+	// GuestNetwork, so SetupGuest returns the same shape the real Network does.
+	vm podnet.VMNetworkConfig
+
+	mu    sync.Mutex
+	byPod map[string]netip.Addr
+	// setups and guestSetups are APPEND-ONLY call records, never cleared by
+	// Teardown: "which seam was this pod provisioned through" must stay
+	// answerable after the pod is gone, or a released allocation is
+	// indistinguishable from one that was never made.
+	setups      []string
+	guestSetups []string
 	sweeps      []map[string]netip.Addr // recorded SweepStale known-sets
 	nodeAliases []netip.Addr            // recorded EnsureNodeAlias addresses
 }
@@ -55,6 +65,7 @@ func newFakeIPAM(t *testing.T, cidr string) *fakeIPAM {
 func (f *fakeIPAM) Setup(_ context.Context, podID string) (netip.Addr, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.setups = append(f.setups, podID)
 	if ip, ok := f.byPod[podID]; ok {
 		return ip, nil // idempotent per podID
 	}
@@ -64,6 +75,29 @@ func (f *fakeIPAM) Setup(_ context.Context, podID string) (netip.Addr, error) {
 	}
 	f.byPod[podID] = ip
 	return ip, nil
+}
+
+// SetupGuest allocates from the SAME pool Setup draws on (a vm pod is not a
+// second address space) and plumbs no alias, mirroring podnet.(*Network).SetupGuest.
+func (f *fakeIPAM) SetupGuest(_ context.Context, podID string) (podnet.GuestNetwork, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ip, ok := f.byPod[podID]
+	if !ok {
+		var err error
+		ip, err = f.alloc.Allocate()
+		if err != nil {
+			return podnet.GuestNetwork{}, fmt.Errorf("allocate guest ip for %s: %w", podID, err)
+		}
+		f.byPod[podID] = ip
+	}
+	f.guestSetups = append(f.guestSetups, podID)
+	return podnet.GuestNetwork{
+		PodIP:     ip,
+		Gateway:   f.vm.Gateway,
+		NATSubnet: f.vm.NATSubnet,
+		DNSVIP:    f.vm.DNSVIP,
+	}, nil
 }
 
 func (f *fakeIPAM) Teardown(_ context.Context, podID string) error {
@@ -89,6 +123,20 @@ func (f *fakeIPAM) EnsureNodeAlias(_ context.Context, ip netip.Addr) error {
 	defer f.mu.Unlock()
 	f.nodeAliases = append(f.nodeAliases, ip)
 	return nil
+}
+
+// setupCalls returns the podIDs Setup was called for, in order.
+func (f *fakeIPAM) setupCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string{}, f.setups...)
+}
+
+// guestSetupCalls returns the podIDs SetupGuest was called for, in order.
+func (f *fakeIPAM) guestSetupCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string{}, f.guestSetups...)
 }
 
 // allocations returns a snapshot of the current podID->IP bindings.

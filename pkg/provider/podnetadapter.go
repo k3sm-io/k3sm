@@ -24,7 +24,11 @@ import (
 	"sync"
 	"time"
 
+	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
@@ -47,6 +51,13 @@ type PodNetwork interface {
 	// MarkHostNetwork records podID as a spec.hostNetwork pod: it shares the
 	// node's addresses, so Setup returns the node IP and allocates nothing.
 	MarkHostNetwork(podID string)
+	// SetupGuest provisions the GUEST network of a vm-RuntimeClass pod (M11.4-d4)
+	// and RECORDS the resulting config for the runtimed-side read: darwin-net
+	// allocates the pod IP + NAT parameters and derives the guest resolv.conf from
+	// dnsCfg, and the implementation folds both into runtimed's plain-data
+	// sandbox.GuestNetworkConfig. Idempotent per podID; released by Teardown.
+	// Errors preserve the podnet sentinels with %w, exactly as Setup does.
+	SetupGuest(ctx context.Context, podID string, dnsCfg netv1.DNSConfig) (sandbox.GuestNetworkConfig, error)
 }
 
 // PodIPAM is the consumer-side slice of darwin-net's *podnet.Network the
@@ -57,8 +68,14 @@ type PodIPAM interface {
 	// Setup allocates an IP for podID, plumbs its lo0 alias, and returns the
 	// bindable address (idempotent per podID).
 	Setup(ctx context.Context, podID string) (netip.Addr, error)
+	// SetupGuest allocates an IP for podID and returns the vm-backend (guest) NAT
+	// config, plumbing NO lo0 alias (idempotent per podID). A guest owns its own
+	// address inside its netstack and is reached over its NAT attachment; a host
+	// alias for that address would make the host answer for the guest.
+	SetupGuest(ctx context.Context, podID string) (podnet.GuestNetwork, error)
 	// Teardown removes podID's lo0 alias and releases its IP (idempotent;
-	// unknown podID is a no-op success).
+	// unknown podID is a no-op success). It releases a guest allocation too — a
+	// vm pod draws from the SAME node pool.
 	Teardown(ctx context.Context, podID string) error
 	// SweepStale removes every k3sm-owned lo0 alias in the node podCIDR not in
 	// the known podID->IP set (the crash-recovery orphan sweep).
@@ -83,11 +100,16 @@ const podnetTeardownTimeout = 15 * time.Second
 // embedded runtimed daemon (runtimed.Deps.Network) — darwin-net stays the sole
 // allocator.
 //
-// Locking discipline: mu guards hostNet, the set of podIDs the provider marked
-// spec.hostNetwork. Those pods share the node's addresses, so Setup must return
-// the node IP without allocating even when the runtimed-side seam calls it
-// unconditionally on the host-process spine (the PodBox contract carries no
-// hostNetwork bit). The wrapped IPAM has its own locks.
+// Locking discipline: mu guards BOTH per-pod maps — hostNet, the set of podIDs
+// the provider marked spec.hostNetwork, and guest, the per-pod guest network
+// config SetupGuest recorded for the runtimed-side GuestNetwork read. hostNet's
+// pods share the node's addresses, so Setup must return the node IP without
+// allocating even when the runtimed-side seam calls it unconditionally on the
+// host-process spine (the PodBox contract carries no hostNetwork bit). One mutex
+// covers both because both are per-pod entries with the SAME lifetime — created
+// on the provider's create path, deleted by the one Teardown — so a second lock
+// would only add an ordering rule with nothing to buy. The wrapped IPAM has its
+// own locks.
 type PodNetAdapter struct {
 	ipam   PodIPAM
 	nodeIP string
@@ -95,15 +117,19 @@ type PodNetAdapter struct {
 
 	mu      sync.Mutex
 	hostNet map[string]struct{}
+	guest   map[string]sandbox.GuestNetworkConfig
 }
 
 // Compile-time checks: the adapter satisfies the provider seam, runtimed's
-// supervisor.PodNetwork, and the optional runtime.NetworkReconciler (so
-// runtimed's once-before-Serve startup reconcile fires — fail-closed).
+// supervisor.PodNetwork, the optional runtime.NetworkReconciler (so runtimed's
+// once-before-Serve startup reconcile fires — fail-closed), and the optional
+// runtime.GuestNetworker (so the vm route reads back the config SetupGuest
+// recorded — this adapter is the SOLE production source of VMSpec.Network).
 var (
 	_ PodNetwork                = (*PodNetAdapter)(nil)
 	_ supervisor.PodNetwork     = (*PodNetAdapter)(nil)
 	_ runtime.NetworkReconciler = (*PodNetAdapter)(nil)
+	_ runtime.GuestNetworker    = (*PodNetAdapter)(nil)
 )
 
 // NewPodNetAdapter builds the adapter over the node's podnet IPAM. nodeIP is
@@ -112,7 +138,13 @@ func NewPodNetAdapter(ipam PodIPAM, nodeIP string, log *slog.Logger) *PodNetAdap
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &PodNetAdapter{ipam: ipam, nodeIP: nodeIP, log: log, hostNet: map[string]struct{}{}}
+	return &PodNetAdapter{
+		ipam:    ipam,
+		nodeIP:  nodeIP,
+		log:     log,
+		hostNet: map[string]struct{}{},
+		guest:   map[string]sandbox.GuestNetworkConfig{},
+	}
 }
 
 // Setup returns podID's IP: the node IP for a marked hostNetwork pod (no
@@ -134,7 +166,9 @@ func (a *PodNetAdapter) Setup(ctx context.Context, podID string) (string, error)
 
 // Teardown releases podID's networking: a marked hostNetwork pod is only
 // unmarked (nothing was allocated); otherwise the podnet teardown removes the
-// lo0 alias and frees the /32 (idempotent, unknown podID is a no-op success).
+// lo0 alias and frees the /32 (idempotent, unknown podID is a no-op success). It
+// also drops any guest config SetupGuest recorded for the pod, so the guest
+// carrier has NO lifecycle of its own to leak from — one teardown, one release.
 // The seam is ctx-less (the supervisor.PodNetwork contract), so the podnet leg
 // runs under a bounded background context — documented, not a deep
 // context.Background: there is no caller context to thread.
@@ -142,6 +176,11 @@ func (a *PodNetAdapter) Teardown(podID string) error {
 	a.mu.Lock()
 	_, host := a.hostNet[podID]
 	delete(a.hostNet, podID)
+	// Drop the recorded guest config on the SAME teardown that frees the address
+	// it describes — deliberately NOT a second lifecycle. It is deleted before the
+	// hostNetwork early return so no path can leave an entry behind, and it is
+	// unconditional: an unknown podID is a no-op, matching the idempotent contract.
+	delete(a.guest, podID)
 	a.mu.Unlock()
 	if host {
 		return nil
@@ -152,6 +191,78 @@ func (a *PodNetAdapter) Teardown(podID string) error {
 		return fmt.Errorf("podnet teardown %s: %w", podID, err)
 	}
 	return nil
+}
+
+// SetupGuest provisions the GUEST network of a vm-RuntimeClass pod and records
+// the config runtimed reads back through GuestNetwork. It is the ONE MAPPER on
+// this seam: darwin-net's podnet allocates the pod's cluster IP and composes the
+// NAT parameters, darwin-net's pkg/dns derives the guest resolv.conf from dnsCfg
+// — structured (nameservers/search/options) AND rendered — and this adapter folds
+// both into runtimed's plain-data sandbox.GuestNetworkConfig, which runtimed
+// cannot build itself (darwin-net and runtimed are co-equal leaves of the
+// cross-repo DAG; neither imports the other).
+//
+// The DNS pair is derived from ONE dnsCfg through ONE normalization pass:
+// GuestResolvConf renders exactly the GuestResolvConfFields result, so the
+// structured fields the guest renders from and the host-rendered text carried
+// beside them describe the same configuration by construction.
+//
+// It DRAWS FROM THE SHARED node pool — the same 253 addresses host-process pods
+// allocate from — so the podnet sentinels are preserved with %w and
+// errors.Is(err, podnet.ErrPoolExhausted) is detectable through the wrap, which
+// is what lets the provider name the exhaustion the same way it does for a
+// host-process pod.
+//
+// A DNS-derivation failure after a successful allocation does NOT release the
+// address here: the pod's eventual DeletePod -> releasePodNetwork -> Teardown
+// reclaims it. That is the same no-auto-release posture the provider's
+// allocate-before-translate ordering takes, and it keeps a retry idempotent
+// rather than ripping an address away mid-create.
+func (a *PodNetAdapter) SetupGuest(ctx context.Context, podID string, dnsCfg netv1.DNSConfig) (sandbox.GuestNetworkConfig, error) {
+	gn, err := a.ipam.SetupGuest(ctx, podID)
+	if err != nil {
+		return sandbox.GuestNetworkConfig{}, fmt.Errorf("podnet setup guest %s: %w", podID, err)
+	}
+	fields, err := dns.GuestResolvConfFields(dnsCfg)
+	if err != nil {
+		return sandbox.GuestNetworkConfig{}, fmt.Errorf("guest resolv.conf fields for %s: %w", podID, err)
+	}
+	rendered, err := dns.GuestResolvConf(dnsCfg)
+	if err != nil {
+		return sandbox.GuestNetworkConfig{}, fmt.Errorf("render guest resolv.conf for %s: %w", podID, err)
+	}
+	cfg := sandbox.GuestNetworkConfig{
+		Nameservers: fields.Nameservers,
+		Searches:    fields.Search,
+		Options:     fields.Options,
+		ResolvConf:  rendered,
+		PodIP:       gn.PodIP,
+		Gateway:     gn.Gateway,
+		NATSubnet:   gn.NATSubnet,
+		DNSVIP:      gn.DNSVIP,
+	}
+	a.mu.Lock()
+	a.guest[podID] = cfg
+	a.mu.Unlock()
+	a.log.Info("guest network provisioned for vm pod",
+		"pod", podID, "pod_ip", gn.PodIP.String(), "dns_vip", gn.DNSVIP.String())
+	return cfg, nil
+}
+
+// GuestNetwork implements runtimed's optional runtime.GuestNetworker seam: it
+// returns the config SetupGuest recorded for podID, comma-ok. false means this
+// adapter has no config for the pod — not an error: the pod is networked by
+// something else (a host process binds an lo0 /32 and reads no guest config), or
+// the provider has not run its create path for it yet. runtimed logs that miss on
+// the vm route and boots the guest with the inert zero value.
+//
+// The returned slices are the ones stored at SetupGuest and are never mutated
+// afterwards, so callers must treat them as READ-ONLY.
+func (a *PodNetAdapter) GuestNetwork(podID string) (sandbox.GuestNetworkConfig, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg, ok := a.guest[podID]
+	return cfg, ok
 }
 
 // MarkHostNetwork records podID as a spec.hostNetwork pod so BOTH Setup callers
