@@ -36,6 +36,7 @@ import (
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/utils/clock"
 
+	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
@@ -629,15 +630,19 @@ var (
 //     host-process spine calls unconditionally) also resolves it to the node IP.
 //   - vm RuntimeClass: no lo0 /32 (which would make the host answer for the
 //     guest and blackhole it), so this branch returns the node IP and routes the
-//     pod away from the host-process Setup. The guest is MEANT to own its own
-//     address inside its netstack via darwin-net podnet.Network.SetupGuest, but
-//     that is NOT WIRED: SetupGuest is implemented and unit-tested in
-//     darwin-net/pkg/podnet/guest.go, and has no production caller anywhere —
-//     there is no transport carrying a GuestNetwork to runtimed yet (the
-//     consumer-side supervisor.GuestNetwork seam, M5.1-d2 / B6). Until it
-//     lands, a vm pod REPORTS THE NODE IP rather than its guest address; that
-//     is a placeholder, not the intended end state. See
-//     k3sm/pkg/runtimeclass/doc.go for the lab-gated remainder.
+//     pod away from the host-process Setup. The guest DOES own its own address
+//     inside its netstack: setupGuestNetwork (on the create path, before
+//     translation) allocates it through darwin-net podnet.Network.SetupGuest and
+//     the adapter carries it to runtimed as sandbox.VMSpec.Network via the
+//     runtime.GuestNetworker seam — that carrier IS wired (M11.4-d4 / B6).
+//     What is NOT wired is REPORTING that address as the pod's status.podIP:
+//     this function still returns the node IP for a vm pod, because whether the
+//     guest's NAT-private address becomes reachable AT the pod IP is the
+//     lab-gated question (a NAT attachment assigns the guest a macOS-chosen
+//     address, so PodIP crosses as an ADVISORY intent runtimed reconciles). So
+//     every vm pod still publishes the SAME status.podIP — the node's — and that
+//     is a placeholder, not the end state. See k3sm/pkg/runtimeclass/doc.go for
+//     the lab-gated remainder.
 //   - otherwise: the podnet /32. Pool exhaustion surfaces as a distinguishable
 //     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap).
 func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, error) {
@@ -657,12 +662,25 @@ func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, e
 	}
 	ip, err := r.network.Setup(ctx, id)
 	if err != nil {
-		if errors.Is(err, podnet.ErrPoolExhausted) {
-			return "", fmt.Errorf("pod ip pool exhausted on node %s (253 pods/node): allocate pod ip for %s/%s: %w", r.nodeName, pod.Namespace, pod.Name, err)
-		}
-		return "", fmt.Errorf("allocate pod ip for %s/%s: %w", pod.Namespace, pod.Name, err)
+		return "", r.allocError(pod, err)
 	}
 	return ip, nil
+}
+
+// allocError names a pod-IP allocation failure. Exhaustion of the node pool gets
+// the FRIENDLY leading clause (the 253-address ceiling is a node fact an operator
+// can act on, not an internal error), and the podnet sentinel is preserved with %w
+// either way.
+//
+// It is one function because there are now TWO consumers of that one pool — the
+// host-process Setup above and the vm-guest SetupGuest — and exhaustion must read
+// the same from both. Duplicating the phrasing at the second call site is exactly
+// how one of them would later stop being legible.
+func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
+	if errors.Is(err, podnet.ErrPoolExhausted) {
+		return fmt.Errorf("pod ip pool exhausted on node %s (253 pods/node): allocate pod ip for %s/%s: %w", r.nodeName, pod.Namespace, pod.Name, err)
+	}
+	return fmt.Errorf("allocate pod ip for %s/%s: %w", pod.Namespace, pod.Name, err)
 }
 
 // releasePodNetwork tears down the pod's network allocation, log-and-continue —
@@ -678,6 +696,50 @@ func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 	if err := r.network.Teardown(string(pod.UID)); err != nil {
 		r.log.Warn("pod network teardown", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 	}
+}
+
+// setupGuestNetwork produces the guest network config of a vm-RuntimeClass pod
+// and hands it to the adapter, which records it for runtimed to read back on the
+// vm route (runtime.GuestNetworker -> sandbox.VMSpec.Network). It is the B6
+// producer half; runtimed is the consumer half and never derives this itself.
+//
+// WHERE IT RUNS. Inside buildBox, immediately before toPodBox, for two reasons.
+// It must be BEFORE translation (the M10.1 ordering: the pod's network exists
+// before the box that describes it), and it must consume the SAME dnsCfg value
+// toPodBox is given — the per-pod, namespace-scoped config after the B20a
+// spec.dnsConfig merge. Deriving it a second time here would create a second
+// authority for one pod's DNS, and the guest's /etc/resolv.conf would be free to
+// disagree with the host-process shim env built from the first.
+//
+// WHAT IS EXCLUDED, and why each:
+//   - a nil adapter (--network none) has nothing to allocate from;
+//   - a spec.hostNetwork pod allocates NOTHING by construction (podIP marks it
+//     and returns the node IP), so it must not draw a guest address either — the
+//     hostNetwork check comes FIRST here for exactly the reason it comes first in
+//     podIP: one pod, one answer;
+//   - a non-vm pod is served by the host-process Setup and reads no guest config.
+//
+// A RuntimeClass that does not resolve is NOT rejected here — toPodBox owns that
+// fail-closed rejection a few lines later, and duplicating it would give one
+// error two spellings.
+//
+// It FAILS the create: a vm pod whose guest config could not be produced would
+// boot with no resolver, pass readiness, and fail on its first in-app DNS lookup
+// — indistinguishable at that point from an application bug. Pool exhaustion is
+// named through the shared allocError, so it reads identically to a host-process
+// pod exhausting the same 253 addresses.
+func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod, dnsCfg netv1.DNSConfig) error {
+	if r.network == nil || pod.Spec.HostNetwork {
+		return nil
+	}
+	backend, err := podSandboxBackend(pod)
+	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		return nil
+	}
+	if _, err := r.network.SetupGuest(ctx, string(pod.UID), dnsCfg); err != nil {
+		return r.allocError(pod, err)
+	}
+	return nil
 }
 
 // buildBox translates pod to a PodBox and resolves its env into LITERAL values —
@@ -711,6 +773,12 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 			r.log.WarnContext(ctx, "pod dnsConfig search list truncated to the in-pod cap",
 				"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
 		}
+	}
+	// Produce the vm pod's GUEST network config BEFORE translation, from the very
+	// dnsCfg above — the M10.1 one-authority ordering applied to the guest carrier.
+	// A no-op for every non-vm pod.
+	if err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
+		return nil, err
 	}
 	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg, r.log)
 	if err != nil {
@@ -787,6 +855,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if err != nil {
 		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	// M11.4: refuse an annotated pod this node's capabilities cannot serve BEFORE
+	// the RPC, and before any bookkeeping — a pod refused here leaves no track and
+	// no prober, exactly as if it had never been created. It logs and records its
+	// own Warning Event (preflightImagePlatform); the error is returned already
+	// wrapped.
+	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
+		return err
 	}
 
 	r.mu.Lock()

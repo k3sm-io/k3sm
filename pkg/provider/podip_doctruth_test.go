@@ -27,12 +27,16 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // docTruthNetwork is a PodNetwork that records whether the host-process Setup
 // path was taken. A vm pod must never reach it (no lo0 /32 for a guest).
 type docTruthNetwork struct {
 	setupCalls    []string
+	guestSetups   []string
 	hostNetMarked []string
 }
 
@@ -41,6 +45,10 @@ func (n *docTruthNetwork) Setup(_ context.Context, podID string) (string, error)
 	return "127.0.0.42", nil
 }
 func (n *docTruthNetwork) Teardown(string) error { return nil }
+func (n *docTruthNetwork) SetupGuest(_ context.Context, podID string, _ netv1.DNSConfig) (sandbox.GuestNetworkConfig, error) {
+	n.guestSetups = append(n.guestSetups, podID)
+	return sandbox.GuestNetworkConfig{}, nil
+}
 func (n *docTruthNetwork) MarkHostNetwork(podID string) {
 	n.hostNetMarked = append(n.hostNetMarked, podID)
 }
@@ -49,23 +57,31 @@ func (n *docTruthNetwork) MarkHostNetwork(podID string) {
 // comment to what podIP actually DOES for a vm-RuntimeClass pod, so the two
 // cannot drift apart again.
 //
-// The comment used to assert, in the present tense, that for a vm pod "runtimed
-// routes it to SetupGuest, never the host-process Setup". podnet.(*Network).
-// SetupGuest is real and unit-tested in darwin-net, but nothing routes to it —
-// there is no transport carrying a GuestNetwork to runtimed yet (M5.1-d2 / B6).
-// That comment is the only explanation a reader finds for why every vm pod
-// publishes the same status.podIP, so a false one actively teaches the wrong
-// model of the vm datapath rather than merely being stale.
+// HISTORY, because the gate's polarity flipped and that is the interesting part.
+// The comment once asserted, in the present tense, that a vm pod was routed to
+// SetupGuest — while nothing called it. The gate then pinned the ABSENCE of a
+// production caller, so that landing the carrier would go red and force the doc
+// to be re-read. M11.4-d4 landed it: buildBox -> setupGuestNetwork ->
+// PodNetwork.SetupGuest allocates the guest's address and the adapter carries the
+// config to runtimed as sandbox.VMSpec.Network. The gate went red exactly as
+// designed, and is now inverted to pin the wiring's PRESENCE.
 //
-// Three assertions, each red on a different regression:
+// What did NOT change is the reason this comment exists: podIP still returns the
+// NODE IP for a vm pod, so every vm pod still publishes the same status.podIP.
+// Reporting the guest's own address is the lab-gated question (a NAT attachment
+// assigns it a macOS-chosen address), and this doc is the only place a reader
+// learns that. A comment that quietly upgraded "the carrier is wired" into "the
+// pod IP is the guest's" would teach the wrong datapath just as effectively as
+// the original false claim did.
+//
+// Four assertions, each red on a different regression:
 //  1. BEHAVIOUR — a vm pod resolves to the node IP and never reaches the
 //     host-process Setup (the real, current dispatch).
-//  2. NO PRODUCTION CALLER — no non-test file in this module calls SetupGuest.
-//     When the transport finally lands and k3sm routes to it, this goes red and
-//     forces the comment to be re-read, which is the point: the doc is pinned to
-//     the wiring, not to a reviewer remembering.
-//  3. NO REVIVED CLAIM — the comment does not re-assert present-tense routing to
-//     SetupGuest while (2) still holds.
+//  2. CONTROL — a non-vm pod DOES take the host-process path.
+//  3. PRODUCTION CALLER — a non-test file in this module calls SetupGuest. If the
+//     B6 producer is ever unwired, this goes red and the doc must be restated.
+//  4. THE DOC MATCHES — it names the wired carrier, still records the node-IP
+//     placeholder, and does not revive the retired "no caller / NOT WIRED" claim.
 func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 	t.Parallel()
 
@@ -113,32 +129,48 @@ func TestPodIPDocMatchesVMBehaviour(t *testing.T) {
 	}
 	wired := setupGuestHasProductionCaller(t)
 
-	t.Run("SetupGuest still has no production caller in this module", func(t *testing.T) {
-		if wired {
-			t.Fatal("k3sm now calls SetupGuest in non-test code — the vm datapath changed. " +
-				"Re-read podIP's doc comment: it documents the node-IP PLACEHOLDER and says the " +
-				"guest-network routing is NOT wired. Update it to the new truth, then update this gate.")
+	t.Run("SetupGuest has a production caller in this module", func(t *testing.T) {
+		if !wired {
+			t.Fatal("no non-test file in this module calls SetupGuest — the B6 producer wiring is gone. " +
+				"It ran buildBox -> setupGuestNetwork -> PodNetwork.SetupGuest, and the adapter carried the " +
+				"result to runtimed as sandbox.VMSpec.Network (runtime.GuestNetworker). Restore it; if it was " +
+				"removed deliberately, restate podIP's doc comment for the datapath that replaced it and " +
+				"re-point this gate at that truth.")
 		}
 	})
 
-	t.Run("the doc does not re-assert routing that is not wired", func(t *testing.T) {
-		if wired {
-			t.Skip("SetupGuest is wired; the claim would no longer be false")
+	t.Run("the doc names the wired carrier and keeps the node-IP placeholder", func(t *testing.T) {
+		if !wired {
+			t.Skip("SetupGuest has no production caller; the previous subtest owns that failure")
 		}
 		doc := podIPDocComment(t, string(src))
 		if doc == "" {
 			t.Fatal("could not locate podIP's doc comment in runtimed.go")
 		}
-		// The false claim was "runtimed routes it to SetupGuest" stated as fact.
-		claim := regexp.MustCompile(`(?i)routes\s+it\s+to\s+SetupGuest`)
-		if claim.MatchString(doc) {
-			t.Error("podIP's doc comment asserts runtimed routes vm pods to SetupGuest, but nothing calls it " +
-				"(no transport for GuestNetwork to runtimed yet — M5.1-d2 / B6). State it as unbuilt intent, not behaviour.")
+		// It must NAME the carrier, so a reader of podIP can find where a vm pod's
+		// network actually comes from.
+		for _, want := range []string{"SetupGuest", "GuestNetworker"} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("podIP's doc comment does not mention %q; a vm pod's network IS produced through it "+
+					"(setupGuestNetwork), and this comment is where a reader goes looking", want)
+			}
 		}
-		// It must still explain what actually happens, or the comment is merely vague.
-		if !strings.Contains(doc, "NOT WIRED") && !strings.Contains(doc, "not wired") {
-			t.Error("podIP's doc comment no longer records that the guest-network routing is unwired; " +
-				"a reader needs that to understand why every vm pod publishes the same status.podIP")
+		// And it must STILL explain the thing that did not change — otherwise the
+		// comment reads as though a vm pod now reports its guest address.
+		if !strings.Contains(doc, "placeholder") || !strings.Contains(doc, "node IP") {
+			t.Error("podIP's doc comment no longer records that a vm pod publishes the NODE IP as a placeholder; " +
+				"that is still what this function returns, and it is the only place a reader learns why")
+		}
+		// The retired claims: the carrier now exists, so re-asserting either of
+		// these would be false in exactly the way this gate was built to catch.
+		for _, stale := range []*regexp.Regexp{
+			regexp.MustCompile(`(?i)no\s+production\s+caller`),
+			regexp.MustCompile(`NOT WIRED:`),
+		} {
+			if stale.MatchString(doc) {
+				t.Errorf("podIP's doc comment revives the retired claim %q, but the guest-network carrier is wired "+
+					"(setupGuestNetwork calls SetupGuest and the adapter serves runtime.GuestNetworker)", stale)
+			}
 		}
 	})
 }

@@ -101,12 +101,18 @@ limitations under the License.
 // The verifiable foundation (provider dispatch + this RuntimeClass + the node-label
 // gate) is unit-proven. The LIVE vm leg is the M5.1 lab remainder:
 //
-//   - VM dispatch end-to-end: provider → darwin-net podnet.Network.SetupGuest for
-//     the guest network → thread the GuestNetwork (guest IP / gateway / NAT subnet /
-//     DNS VIP) to runtimed's VZ backend → boot the Linux guest. darwin-net flagged
-//     there is NO transport for GuestNetwork to runtimed yet; the clean fix is a
-//     runtimed consumer-side supervisor.GuestNetwork seam (no apis change) — the
-//     M5.1-d2 lab leg.
+//   - VM dispatch end-to-end: the CARRIER half is now wired — the provider calls
+//     darwin-net podnet.Network.SetupGuest, folds it together with the rendered and
+//     structured guest resolv.conf, and runtimed's vm branch reads it back through
+//     the optional runtime.GuestNetworker seam (no apis change), so the guest IP /
+//     gateway / NAT subnet / DNS VIP reach sandbox.VMSpec.Network. What stays
+//     lab-gated is BOOTING the Linux guest with it: CreateVM is a stub on a host
+//     without a VZ Mac and the entitlement. Note the seam landed on
+//     runtime.GuestNetworker, not the supervisor.GuestNetwork this comment once
+//     predicted.
+//   - status.podIP for a vm pod still reports the NODE IP, deliberately: whether the
+//     pod IP becomes a guest eth0 alias is an unanswered lab question, so the carrier
+//     above does not prejudge it.
 //   - Foreign runAsUser/fsGroup admission: M4.1's foreign-user VAP rejects them
 //     because the host-process path cannot honor a foreign uid, but a vm pod's guest
 //     CAN. The VAP should therefore EXEMPT runtimeClassName: vm. It is deferred (not
