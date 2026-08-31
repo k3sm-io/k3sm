@@ -109,7 +109,7 @@ year).
 
 So rotation is renewal hygiene — keeping certificates well away from expiry — **not** a response
 to a compromised credential. There is no supported way to invalidate one leaf certificate today.
-If a control-plane credential is compromised, the honest remedy is to recreate the cluster.
+If a control-plane credential is compromised, the remedy is to recreate the cluster.
 
 ## Next
 
