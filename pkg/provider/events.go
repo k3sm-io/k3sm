@@ -45,6 +45,16 @@ const (
 	// hook failure visible in `kubectl describe pod` before the container is
 	// killed per its restart policy.
 	reasonFailedPostStartHook = "FailedPostStartHook"
+	// reasonFailedImagePlatform is recorded when a pod's k3sm.io/image-platform
+	// annotation names a platform this node's capabilities cannot serve, so the
+	// pod is refused BEFORE the CreatePod RPC (preflightImagePlatform).
+	//
+	// It is the ONE reason in this block with NO upstream analogue, deliberately:
+	// upstream has no node-capability-scoped platform annotation, so there is no
+	// kubelet reason to mirror and inventing a near-miss (`Failed`, `ErrImagePull`)
+	// would tell a consumer the pod failed at a stage it never reached. The name
+	// keeps the UpperCamelCase shape the rest of the vocabulary uses.
+	reasonFailedImagePlatform = "FailedImagePlatform"
 )
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec
@@ -94,6 +104,17 @@ func msgStoppingContainer(name string) string { return "Stopping container " + n
 // (see startPod) and the node log — not this broadcast message.
 func msgFailedStart(name string) string {
 	return "Error: failed to start container " + name
+}
+
+// msgFailedImagePlatform is the FailedImagePlatform-event message. Unlike
+// msgFailedStart it DOES carry its error: the error is
+// imagePlatformUnservableError, authored entirely from the pod's own annotation
+// and this node's advertised capability labels — no env, no args, no registry
+// response — and naming the missing k3sm.io/* label is the entire point of
+// emitting the Event. The platform tokens inside it are rendered through
+// image.Platform.String(), the sanitising choke point.
+func msgFailedImagePlatform(err error) string {
+	return "Error: " + err.Error()
 }
 
 // nopRecorder is a no-op record.EventRecorder. NewHostProcess substitutes it when

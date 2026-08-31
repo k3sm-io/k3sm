@@ -287,6 +287,35 @@ different tracks:
 - **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
   milestone. See [multi-node.md](multi-node.md) and [ha.md](ha.md).
 
+### `vm` Pods: node selection and security-context admission
+
+Two admission facts trip people up on the `vm` path specifically.
+
+**The node is still darwin — select it as one.** A `vm` Pod runs a Linux guest, but the *node* it
+schedules onto is a Mac, not a Linux node. The natural reflex — reaching for
+`kubernetes.io/os: linux` because the container image is Linux — schedules nowhere, because no node
+ever carries that label. Write both keys together:
+
+```yaml
+spec:
+  runtimeClassName: vm
+  nodeSelector:
+    kubernetes.io/os: darwin   # the node's OS — always darwin, guest or not
+```
+
+See [vm-runtimeclass.md](vm-runtimeclass.md) for the full selector shape, including the
+`k3sm.io/virtualization` capability the RuntimeClass merges in for you.
+
+**A foreign `runAsUser` or `fsGroup` is rejected at admission, `vm` Pods included.** The cluster-wide
+policy that pins every Pod's `securityContext.runAsUser`/`fsGroup` to the node's own identity exists
+because the native host-process path has no way to honor a different uid — there is no per-pod uid
+isolation to grant it (see [above](#no-per-pod-uid-isolation)). A Linux guest genuinely *can* run as an
+arbitrary uid, so carving out an exemption for `vm` Pods is a reasonable target, but it has not shipped:
+today the policy applies uniformly, before the runtime is even consulted. Applying a `vm` Pod that sets
+a foreign `runAsUser` or `fsGroup` is refused outright (a `422` at `kubectl apply`), not silently
+downgraded. Until an exemption ships, either drop the field and accept the node's own identity inside
+the guest, or keep that workload on the native path where the same restriction already applies.
+
 ### Node capability labels are probed once at daemon start
 
 The `k3sm.io/*` node capability labels — `k3sm.io/virtualization`, `k3sm.io/rosetta`,
