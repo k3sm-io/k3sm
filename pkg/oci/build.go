@@ -23,7 +23,6 @@ import (
 	"strings"
 
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
@@ -58,6 +57,10 @@ type Request struct {
 	Platform string
 	// TmpDir stages layer tars. Empty uses the OS temp dir.
 	TmpDir string
+	// BaseResolver fetches a named FROM base. Nil keeps this build offline, and
+	// a Dockerfile naming a base is then refused rather than downgraded to
+	// scratch. See the BaseResolver doc for why the fetch is injected.
+	BaseResolver BaseResolver
 }
 
 // Build assembles the image described by req. It performs no I/O outside the
@@ -70,7 +73,11 @@ func Build(req Request) (ggcrv1.Image, error) {
 		return nil, err
 	}
 
-	img, err := stampPlatform(empty.Image)
+	img, named, err := resolveBase(req.Dockerfile, req.BaseResolver)
+	if err != nil {
+		return nil, err
+	}
+	baseHistory, err := baseHistoryOf(img, named)
 	if err != nil {
 		return nil, err
 	}
@@ -79,14 +86,28 @@ func Build(req Request) (ggcrv1.Image, error) {
 		return nil, fmt.Errorf("read base config: %w", err)
 	}
 	cfg = cfg.DeepCopy()
-	cfg.Config.Env = nil
-	cfg.Config.Labels = map[string]string{}
+	if !named {
+		// scratch has no environment or labels to inherit, and empty.Image's
+		// config carries ggcr's own defaults; clearing them keeps the artifact a
+		// function of the Dockerfile alone.
+		cfg.Config.Env = nil
+		cfg.Config.Labels = map[string]string{}
+	}
+	// A NAMED base keeps its Env, Labels, ExposedPorts, Entrypoint, Cmd and
+	// WorkingDir, and the instructions below overwrite key by key — the
+	// inheritance a Dockerfile author expects from FROM. Clearing them here (as
+	// the scratch path does) would silently drop the base's PATH, which is the
+	// difference between an image that runs and one that cannot find its own
+	// interpreter.
+	if cfg.Config.Labels == nil {
+		cfg.Config.Labels = map[string]string{}
+	}
 
 	workdir := "/"
 	for _, inst := range req.Dockerfile.Instructions {
 		switch inst.Verb {
 		case VerbFrom:
-			// scratch: the empty base, already in hand.
+			// The base is already in hand, resolved before this loop.
 
 		case VerbCopy, VerbAdd:
 			entries, err := req.Context.selectEntries(inst.Args[:len(inst.Args)-1], inst.Args[len(inst.Args)-1], workdir)
@@ -143,7 +164,10 @@ func Build(req Request) (ggcrv1.Image, error) {
 		return nil, fmt.Errorf("read assembled config: %w", err)
 	}
 	cfg.RootFS = merged.RootFS
-	cfg.History = orderedHistory(req.Dockerfile)
+	// The base's own history is kept ahead of this build's, so the entry count
+	// still matches RootFS.DiffIDs — ggcr requires one non-empty entry per diffID,
+	// and a named base contributes layers this Dockerfile never mentions.
+	cfg.History = append(baseHistory, orderedHistory(req.Dockerfile)...)
 	cfg.Created = ggcrv1.Time{Time: epoch}
 	cfg.Author = ""
 	cfg.Container = ""
@@ -154,6 +178,20 @@ func Build(req Request) (ggcrv1.Image, error) {
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 	return mutate.MediaType(mutate.ConfigMediaType(img, types.OCIConfigJSON), types.OCIManifestSchema1), nil
+}
+
+// baseHistoryOf returns the history entries a named base contributes. scratch
+// contributes none: empty.Image has no layers, so keeping its (absent) history
+// leaves the derivation a pure function of the Dockerfile, exactly as before.
+func baseHistoryOf(img ggcrv1.Image, named bool) ([]ggcrv1.History, error) {
+	if !named {
+		return nil, nil
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("read base history: %w", err)
+	}
+	return append([]ggcrv1.History{}, cfg.History...), nil
 }
 
 // checkPlatform enforces the single supported target.
