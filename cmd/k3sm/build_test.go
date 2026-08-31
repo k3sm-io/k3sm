@@ -136,7 +136,11 @@ func testParseTable(t *testing.T) {
 		{"arg", "FROM scratch\nARG V=1", oci.ErrUnsupportedInstruction},
 		{"maintainer", "FROM scratch\nMAINTAINER me", oci.ErrUnsupportedInstruction},
 		{"unknown-verb", "FROM scratch\nFROBNICATE x", oci.ErrUnknownInstruction},
-		{"from-ref", "FROM alpine:3", oci.ErrUnsupportedBase},
+		// A malformed reference is still a PARSE rejection, reported with its line
+		// before any output is opened. A WELL-FORMED one is no longer rejected here:
+		// the parser accepts it and Build refuses it when no resolver is configured
+		// (see reject-at-build/named-base-without-resolver below).
+		{"from-malformed-ref", "FROM UPPER CASE:!!", oci.ErrBadInstruction},
 		{"multi-stage-second-from", "FROM scratch\nFROM scratch", oci.ErrUnsupportedSyntax},
 		{"heredoc", "FROM scratch\nCOPY <<EOF /f", oci.ErrUnsupportedSyntax},
 		{"syntax-directive", "# syntax=docker/dockerfile:1\nFROM scratch", oci.ErrUnsupportedSyntax},
