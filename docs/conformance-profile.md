@@ -64,7 +64,7 @@ Per the internal §By-design summary — summarized, not restated:
   `terminationMessagePath` bind mounts, node-pressure eviction as a hard guarantee, NetworkPolicy as a
   tenant boundary.
 
-## Honesty contract
+## Scope of these claims
 
 - Criteria are **k3sm's own tests**, static — a green row is "asserted by a k3sm test," never a
   `[Conformance]` pass. Re-derive any row against current `main`.
