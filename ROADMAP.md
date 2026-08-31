@@ -32,7 +32,9 @@ two-Mac gates are burned down in M7. What works:
 - **Pod networking.** IP-per-pod on `lo0` aliases (XNU preserves the bound source IP — no NAT),
   a userspace ClusterIP/NodePort Service proxy, and a per-node DNS resolver.
 - **Multi-node mesh.** A **wireguard-go** userspace mesh over root utun; peers join with one token;
-  public keys distributed via a `MeshPeer` CRD. *(implemented; the two-Mac e2e is a lab gate)*
+  public keys distributed via a `MeshPeer` CRD. *(partly built: the join flow and the worker side
+  work, but a server does not yet bring up its own mesh device, so cross-node pod traffic does not
+  reach its destination. Measured on a two-Mac rig 2026-08-31.)*
 - **Local-path storage.** A local-path provisioner with node-affinity PVs + StatefulSet identity.
 - **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
   (workloads must select `kubernetes.io/os=darwin`). *(implemented; the live RBAC flip is a

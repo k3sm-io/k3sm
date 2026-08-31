@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,9 +130,41 @@ func ServiceAccountPubPath(workDir string) string { return saPubPath(workDir) }
 // before touching either.
 func APIServerCertDir(workDir string) string { return certDir(workDir) }
 
-// apiServerURL is the loopback HTTPS URL clients use to reach the apiserver.
-func apiServerURL(port int) string {
-	return "https://127.0.0.1:" + strconv.Itoa(port)
+// loopbackAPIServerHost is the apiserver bind of last resort — the single-node
+// default, reached only when a Config names neither a bind address nor a node IP.
+//
+// It is deliberately NOT loopbackBindAddress (supervised.go), which carries the
+// opposite contract: that one is an INVARIANT the scheduler and controller-manager
+// may never leave, while this one is a fallback the mesh path routinely overrides.
+// Sharing a symbol would make a future change to either silently move the other.
+const loopbackAPIServerHost = "127.0.0.1"
+
+// apiServerHost is the address the apiserver ACTUALLY BINDS, and therefore the host
+// every in-process client and the healthz probe must dial: the explicit BindAddress,
+// else NodeIP, else loopback.
+//
+// This is the ONE derivation of that chain — apiServerArgs renders --bind-address
+// from it too. That single-sourcing is the whole point of the helper. A second,
+// independent derivation is exactly the defect this closes (lab D1): the probe and
+// the kubeconfigs hardcoded loopback while a --mesh-ip server bound its wireguard IP
+// only, so bring-up wedged at the healthz wait and every in-process client pointed at
+// an address nothing was listening on. Single-node boots — where the chain lands on
+// loopback anyway — masked it completely.
+func apiServerHost(cfg Config) string {
+	if cfg.BindAddress != "" {
+		return cfg.BindAddress
+	}
+	if cfg.NodeIP != "" {
+		return cfg.NodeIP
+	}
+	return loopbackAPIServerHost
+}
+
+// apiServerURL is the HTTPS URL clients use to reach the apiserver: the effective
+// bind host and the secure port. JoinHostPort brackets an IPv6 host; the single-node
+// loopback case renders exactly the string it always did.
+func apiServerURL(cfg Config) string {
+	return "https://" + net.JoinHostPort(apiServerHost(cfg), strconv.Itoa(cfg.APIServerPort))
 }
 
 // ensureWorkDirs creates the workdir subtree (bin, db, certs).
@@ -585,7 +618,11 @@ func writeTokenFile(workDir, token string) error {
 // writeKubeconfig writes an admin kubeconfig pointing at the apiserver with the
 // static token and TLS verification skipped (the apiserver self-signs its
 // serving cert in M1).
-func writeKubeconfig(workDir string, port int, token string) error {
+//
+// It takes the whole Config, not a work dir and a port, because the server URL needs
+// the effective BIND HOST as well (apiServerHost): a mesh server binds its wireguard
+// IP only, so a loopback URL here would hand every in-process client a dead address.
+func writeKubeconfig(cfg Config, token string) error {
 	content := fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
@@ -603,8 +640,8 @@ users:
 - name: admin
   user:
     token: %s
-`, apiServerURL(port), token)
-	if err := os.WriteFile(kubeconfigPath(workDir), []byte(content), 0o600); err != nil {
+`, apiServerURL(cfg), token)
+	if err := os.WriteFile(kubeconfigPath(cfg.WorkDir), []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write kubeconfig: %w", err)
 	}
 	return nil
@@ -612,7 +649,8 @@ users:
 
 // writeComponentKubeconfig mints a client cert (CommonName cn, no Organization)
 // from the SIGNING CA — which the apiserver's unconditional --client-ca-file trusts —
-// and writes a 0600 client-cert kubeconfig at path pointing at the loopback apiserver.
+// and writes a 0600 client-cert kubeconfig at path pointing at the apiserver's
+// EFFECTIVE BIND (apiServerHost — loopback single-node, the mesh IP on a mesh server).
 // The component (kube-scheduler / kube-controller-manager) then authenticates as cn, so
 // the apiserver's auto-created bootstrap RBAC (the system:kube-scheduler /
 // system:kube-controller-manager ClusterRoleBindings) constrains it — the k3s
@@ -624,7 +662,7 @@ users:
 // the co-located loopback component skips verification (insecure-skip-tls-verify, the
 // same posture the single-node admin kubeconfig uses) while still presenting its
 // client-cert identity.
-func writeComponentKubeconfig(path string, port int, cn string, h *certs.Hierarchy, verifyClusterCA bool) error {
+func writeComponentKubeconfig(cfg Config, path, cn string, h *certs.Hierarchy, verifyClusterCA bool) error {
 	certPEM, keyPEM, err := h.Signing.IssueClient(cn, nil, componentCertValidity)
 	if err != nil {
 		return fmt.Errorf("issue %s client cert: %w", cn, err)
@@ -652,7 +690,7 @@ users:
   user:
     client-certificate-data: %s
     client-key-data: %s
-`, apiServerURL(port), clusterTLS, cn, cn, b64(certPEM), b64(keyPEM))
+`, apiServerURL(cfg), clusterTLS, cn, cn, b64(certPEM), b64(keyPEM))
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write %s kubeconfig: %w", cn, err)
 	}
