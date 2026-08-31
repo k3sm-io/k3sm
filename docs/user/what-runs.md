@@ -93,7 +93,7 @@ Almost all of it:
 | Tags and digests | Yes. Pin a digest and you get exactly those bytes. |
 | Private registries | Yes — `imagePullSecrets` on the Pod, resolved at pull. |
 | `imagePullPolicy` | Yes — `Always`, `IfNotPresent`, `Never`, with upstream meanings. |
-| Multi-arch images | Yes — the manifest list is read and the `darwin/arm64` entry selected. An image with no such entry is refused. |
+| Multi-arch images | The manifest list is read and a `darwin/arm64` entry selected — but almost no published image has one, so in practice a multi-arch image is refused like any other. See below. |
 | `docker save` / `docker buildx -o type=oci` | Yes — `k3sm image load` and `k3sm image import` ingest both. |
 | `RUN` in a Dockerfile | **No.** It needs a Linux builder, which needs the `vm` path. |
 | `FROM <linux image>` | **No.** Refused: the base must be `darwin/arm64`. |
@@ -101,6 +101,30 @@ Almost all of it:
 One footgun worth stating twice, because it is the one people hit: the apiserver defaults a
 `:latest` tag to `imagePullPolicy: Always`, so a `:latest` image you loaded locally will still be
 fetched from a registry. Tag with something else, or set the policy explicitly.
+
+## Where darwin images come from
+
+There is no supply of them. You build them.
+
+That is worth stating plainly, because "k3sm runs OCI images" can otherwise be
+read as "k3sm runs the images you can already `docker pull`". Checked against
+Docker Hub:
+
+| image | platforms published | `darwin`? |
+|---|---|---|
+| `alpine`, `nginx`, `postgres`, `redis` | 8 each, every one `linux/*` | none |
+| `golang` | 9 — `linux` **and `windows`** | none |
+
+`golang` is the informative row: the OCI `os` field really does carry non-Linux
+values in the wild, and Windows containers are published. Darwin ones are not,
+anywhere — macOS has no container primitive to build them on, so the ecosystem
+never formed.
+
+So the practical shape of this is: the **format, the registries and the tooling**
+are the ones you know, and the **content** is yours to produce. `k3sm build`
+packages a Mac binary into an ordinary OCI image; `k3sm image push` puts it in
+your registry; nodes pull it the ordinary way. What you cannot do is reach for
+an existing public image and expect it to run.
 
 ## The honest summary
 
