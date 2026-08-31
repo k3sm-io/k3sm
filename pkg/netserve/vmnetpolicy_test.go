@@ -134,3 +134,59 @@ func TestTransportOverrideSinkReachesTheProxyTable(t *testing.T) {
 	})
 	s.SetTransportOverrides(nil)
 }
+
+// TestDefaultVMNetSubnetScopesTheConstructedTable is the B237 wiring gate for the
+// CONSTANT rather than for the selection: DefaultVMNetSubnet — the one home for
+// the vmnet segment both node bring-ups pass — must be a value that actually
+// scopes a constructed table, and must scope it only when the node advertises the
+// vm backend.
+//
+// It is separate from the table above on purpose. That one pins the DECISION
+// against literals; this one pins the SHIPPED VALUE, so a constant edited to
+// something unparsable (or to a prefix that excludes the address macOS was
+// observed to hand a guest) goes red here rather than silently degrading every vm
+// node's policy table to fail-open.
+func TestDefaultVMNetSubnetScopesTheConstructedTable(t *testing.T) {
+	t.Parallel()
+
+	segment, err := netip.ParsePrefix(DefaultVMNetSubnet)
+	if err != nil {
+		t.Fatalf("DefaultVMNetSubnet %q does not parse: %v — an unparsable constant leaves every vm node fail-open", DefaultVMNetSubnet, err)
+	}
+	if segment != segment.Masked() {
+		t.Errorf("DefaultVMNetSubnet = %q, want a masked segment (a host address would still scope, but the constant should read as the segment it is)", DefaultVMNetSubnet)
+	}
+	// The address the reference rig observed a guest lease. It is the value this
+	// constant exists to cover, so a prefix that excludes it is the wrong prefix.
+	observed := netip.MustParseAddr("192.168.64.7")
+	if !segment.Contains(observed) {
+		t.Fatalf("DefaultVMNetSubnet %q does not contain the observed guest lease %v", DefaultVMNetSubnet, observed)
+	}
+
+	backend := netip.MustParseAddr("100.64.0.5") // a policy-selected pod
+	arm := func(s *Server) {
+		s.policy.Update(map[netip.Addr][]proxy.PolicyRule{backend: {}}, nil)
+	}
+	newNode := func(t *testing.T, vmCapable bool) *Server {
+		t.Helper()
+		s := New(Config{
+			Client:      fake.NewClientset(),
+			WorkDir:     t.TempDir(),
+			DNSVIP:      "10.43.0.10",
+			PodCIDR:     "100.64.0.0/24",
+			NodeIP:      "192.168.1.10",
+			VMBackend:   vmCapable,
+			VMNetSubnet: DefaultVMNetSubnet, // exactly what both bring-ups pass
+		})
+		arm(s)
+		return s
+	}
+
+	if newNode(t, true).policy.Allow(observed, backend, 80) {
+		t.Errorf("a vm-capable node ALLOWED the unattributable source %v inside DefaultVMNetSubnet %s; the constant did not reach the table",
+			observed, DefaultVMNetSubnet)
+	}
+	if !newNode(t, false).policy.Allow(observed, backend, 80) {
+		t.Errorf("a node with no vm backend DENIED %v; passing the constant unconditionally must leave the plain table byte-identical", observed)
+	}
+}

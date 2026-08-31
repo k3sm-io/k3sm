@@ -450,6 +450,14 @@ func runServer(args []string) error {
 	if isLoopbackDefault(opts.nodeIP) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
+	// M11.3-d3a: whether this node can host vm guests, asked HERE — before the
+	// datapath is constructed and long before the VK node exists — through
+	// runtimed's own safe host probe rather than through the node's advertised
+	// capability, which is not answerable yet (see vmBackendAvailable). It arms the
+	// NetworkPolicy table's fail-closed unknown-vm-source branch, scoped to the
+	// segment macOS's vmnet is expected to hand guests; false leaves the table
+	// byte-identical to a node that runs no guests.
+	vmCapable := vmBackendAvailable()
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
@@ -458,6 +466,8 @@ func runServer(args []string) error {
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
 		PodCIDR:           serverPodCIDR,
+		VMBackend:         vmCapable,
+		VMNetSubnet:       netserve.DefaultVMNetSubnet,
 		NetdSocket:        mode.Socket,
 		Disabled:          !mode.DataPath(),
 		Logger:            logger,
@@ -627,6 +637,12 @@ func runServer(args []string) error {
 		// facts off it. A hostprocess node never calls it, leaving the fit check
 		// skipped — the honest answer where there is no runtimed to ask.
 		attachRuntimeInfo: mlxGPU.Attach,
+		// The Service proxy this same process just built (step 4) is where the
+		// provider publishes a vm pod's live guest lease, so a Service backed by a
+		// guest is dialed at the address that carries bytes while everything else
+		// keys on the /32 the pod publishes. nil under --network none, where there
+		// is no proxy to feed.
+		transportOverrides: nodeTransportOverrides(net, mode),
 	}
 
 	// 4d/4e. M10.3 — ingress hosting + svclb, beside the netserve datapath
