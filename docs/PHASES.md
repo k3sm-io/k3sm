@@ -647,7 +647,7 @@ phases:
 
   - id: M11
     title: Linux containers & multi-arch (k3sm slice — capability labels, platform annotation, wiring, admission note, gate)
-    status: todo
+    status: in-progress  # 2026-08-31 — the top-level row lagged its own sub-phases (the ledger-repair defect class)
     depends_on: []
     notes: >-
       docs/m11-plan.md is authoritative (Phase C encoded from it). RE-SEQUENCED PRE-LAUNCH
