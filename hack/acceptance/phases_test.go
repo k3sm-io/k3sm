@@ -347,7 +347,7 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 	}
 
 	// (2) The rows are distinct BY ARGS over a shared gate path, and M11-core does not
-	// require signing — m11-plan R28 removed Developer-ID from this path, so a signing
+	// require signing — the M11 plan's R28 removed Developer-ID from this path, so a signing
 	// requirement would make the launch row unrunnable on the rig that must run it.
 	t.Run("manifest_rows_are_distinct_by_args", func(t *testing.T) {
 		if core.Gate != full.Gate {
