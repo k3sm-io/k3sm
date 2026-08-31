@@ -443,13 +443,16 @@ done
 
 note "S5-ROOT — the findings-s5.md rows to paste (this script does NOT edit that file)"
 row() { # row ARR
-  local a="$1" g="$OUT/s5root-guest-$a.log" h="$OUT/s5root-host-$a.log"
+  local a="$1"
+  local g="$OUT/s5root-guest-$a.log" h="$OUT/s5root-host-$a.log"
   printf '| **1 (%s)** | %s | guest: `%s` / `%s` · host receipt: `%s` `%s` | <consequence per s5.sh> |\n' \
     "$a" \
-    "$(case $a in a) echo 'baseline — VIP on lo0, no guest route, forwarding off';;
-                    b) echo '+ guest route for the service CIDR via the NAT gateway';;
-                    c) echo '+ host net.inet.ip.forwarding=1';;
-                    d) echo '+ explicit host route for the VIP on lo0';; esac)" \
+    "$(case $a in
+         (a) echo 'baseline — VIP on lo0, no guest route, forwarding off';;
+         (b) echo '+ guest route for the service CIDR via the NAT gateway';;
+         (c) echo '+ host net.inet.ip.forwarding=1';;
+         (d) echo '+ explicit host route for the VIP on lo0';;
+       esac)" \
     "$(field "$g" "S5ROOT_${a}_TCP")" \
     "$(field "$g" "S5ROOT_${a}_UDP")" \
     "$(grep -m1 "S5_HOST_VIP${a}_TCP_FROM=" "$h" 2>/dev/null | tr -d '\r' || echo 'no TCP receipt')" \
