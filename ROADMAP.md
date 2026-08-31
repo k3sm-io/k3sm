@@ -8,14 +8,13 @@ k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/a
 the default path**, isolated with macOS's own primitives (Seatbelt, `lo0`/vmnet, wireguard-go,
 launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS).
 
-This is a k3s-style three-horizon roadmap. Honesty is a feature: where a capability is
-code-complete but not yet proven on real hardware, this page says so. The canonical
-honest-tradeoffs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
+This is a k3s-style three-horizon roadmap. Where a capability is implemented but not yet
+proven on real hardware, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
 the docs today.
 
 ## Shipped
 
-The engine. Milestones **M0–M6 and M10** are code-complete and workspace-integration-green
+The engine. Milestones **M0–M6 and M10** are implemented and workspace-integration-green
 (`hack/ci.sh`). **M0, M1 and M2 are validated end to end on Apple-Silicon hardware** — M2's gate is
 the strongest evidence so far: run against a real root install on macOS 26.5, all **13 required
 conformance criteria passed**, together with the full install/uninstall lifecycle checks. That is
@@ -33,10 +32,10 @@ two-Mac gates are burned down in M7. What works:
 - **Pod networking.** IP-per-pod on `lo0` aliases (XNU preserves the bound source IP — no NAT),
   a userspace ClusterIP/NodePort Service proxy, and a per-node DNS resolver.
 - **Multi-node mesh.** A **wireguard-go** userspace mesh over root utun; peers join with one token;
-  public keys distributed via a `MeshPeer` CRD. *(code-complete; the two-Mac e2e is a lab gate)*
+  public keys distributed via a `MeshPeer` CRD. *(implemented; the two-Mac e2e is a lab gate)*
 - **Local-path storage.** A local-path provisioner with node-affinity PVs + StatefulSet identity.
 - **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
-  (workloads must select `kubernetes.io/os=darwin`). *(code-complete; the live RBAC flip is a
+  (workloads must select `kubernetes.io/os=darwin`). *(implemented; the live RBAC flip is a
   dev-mac gate)*
 - **`vm` RuntimeClass — dispatch only, and it does not run a Pod yet.** A fail-closed dispatch to a
   Virtualization.framework Linux micro-VM for Linux-only images (e.g. Postgres). What is shipped is
@@ -45,7 +44,7 @@ two-Mac gates are burned down in M7. What works:
   build and boot the guest is not written yet, so this is engineering still to do, not a machine
   waiting to be found. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64` only — see Next.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
-  with an identical-CA bundle. *(code-complete; the live 2-Mac+Postgres failover is a lab gate)*
+  with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
