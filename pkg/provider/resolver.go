@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -85,27 +87,56 @@ func (k *kubeResolver) Secret(ctx context.Context, namespace, name string) (map[
 	return out, nil
 }
 
+// errNoPodIdentity is returned when ServiceAccountToken is reached with no pod
+// identity on the request context. It is a FAIL-CLOSED sentinel: the alternative
+// is minting a token bound to nothing, which outlives its pod.
+var errNoPodIdentity = errors.New("no pod identity bound to the request context; refusing to mint an unbound serviceaccount token")
+
 // ServiceAccountToken mints a bound token via the TokenRequest API (audience +
 // expirationSeconds, rotated each materialize) for the POD's ServiceAccount — the
 // M2.4 in-pod-API surface. The mount.Resolver signature carries only the
 // namespace (it is the single runtimed seam every pod shares), so the per-pod
-// spec.serviceAccountName is bound to the call by the provider via the request
-// context (serviceAccountFromContext) — runtimed threads that ctx from CreatePod
-// through mount.Materialize to here in-process. A context with no bound
-// ServiceAccount falls back to the namespace "default" SA (the apiserver's own
-// default). An empty audience defaults to the apiserver's audiences.
+// identity is bound to the call by the provider via the request context
+// (podIdentityFromContext) — runtimed threads that ctx from CreatePod through
+// mount.Materialize to here in-process. An empty audience defaults to the
+// apiserver's audiences.
+//
+// The TokenRequest carries spec.boundObjectRef pinned to the POD OBJECT, exactly
+// as upstream kubelet binds every projected token: Kind "Pod", APIVersion "v1",
+// the pod's name AND its UID. Both halves are load-bearing. The UID is what lets
+// the apiserver invalidate the token the moment the pod is deleted (without it a
+// deleted pod's token stays usable until expiry), and the pair is what the
+// apiserver echoes into the TokenReview response as the
+// authentication.kubernetes.io/pod-name and pod-uid extras that identity
+// consumers (service-mesh SDS, policy external-data, workload-identity
+// federation) read to attribute a request to a workload. A ServiceAccount-kinded
+// ref, or one without the UID, is a strictly weaker and different binding.
+//
+// FAIL-CLOSED: a call with no pod identity on the context returns
+// errNoPodIdentity rather than minting an unbound token. Every legitimate caller
+// reaches here inside CreatePod/UpdatePod, which bind the identity.
 func (k *kubeResolver) ServiceAccountToken(ctx context.Context, namespace, audience string, expirationSeconds int64) (string, error) {
-	sa := serviceAccountFromContext(ctx)
-	spec := authnv1.TokenRequestSpec{}
+	id, ok := podIdentityFromContext(ctx)
+	if !ok {
+		return "", fmt.Errorf("mint token in namespace %s: %w", namespace, errNoPodIdentity)
+	}
+	spec := authnv1.TokenRequestSpec{
+		BoundObjectRef: &authnv1.BoundObjectReference{
+			Kind:       "Pod",
+			APIVersion: "v1",
+			Name:       id.name,
+			UID:        id.uid,
+		},
+	}
 	if audience != "" {
 		spec.Audiences = []string{audience}
 	}
 	if expirationSeconds > 0 {
 		spec.ExpirationSeconds = &expirationSeconds
 	}
-	tr, err := k.cs.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, sa, &authnv1.TokenRequest{Spec: spec}, metav1.CreateOptions{})
+	tr, err := k.cs.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, id.serviceAccount, &authnv1.TokenRequest{Spec: spec}, metav1.CreateOptions{})
 	if err != nil {
-		return "", fmt.Errorf("mint token for serviceaccount %s/%s: %w", namespace, sa, err)
+		return "", fmt.Errorf("mint token for serviceaccount %s/%s bound to pod %s: %w", namespace, id.serviceAccount, id.name, err)
 	}
 	return tr.Status.Token, nil
 }
@@ -114,30 +145,53 @@ func (k *kubeResolver) ServiceAccountToken(ctx context.Context, namespace, audie
 // the apiserver's ServiceAccount admission default.
 const defaultServiceAccount = "default"
 
-// serviceAccountKey is the context key under which the provider binds a pod's
-// ServiceAccount name for the duration of a CreatePod, so the shared kubeResolver
-// mints the pod's bound token against the right SA. The mount.Resolver seam's
-// ServiceAccountToken(ctx, namespace, audience, exp) signature carries no SA name,
-// so the per-pod SA rides the request context that runtimed threads from
-// CreatePod → mount.Materialize → ServiceAccountToken in-process. This needs no
-// runtimed/apis change. The M2 daemon split (a real gRPC boundary between provider
-// and runtime) cannot carry a context value across the wire, so it will bind the
-// SA in the materialization RPC instead — tracked with that split.
-type serviceAccountKey struct{}
-
-// withServiceAccount returns ctx carrying the pod's ServiceAccount name (sa) so
-// the kubeResolver mints its bound token against the right SA.
-func withServiceAccount(ctx context.Context, sa string) context.Context {
-	return context.WithValue(ctx, serviceAccountKey{}, sa)
+// podIdentity is the pod-scoped identity the provider binds to a CreatePod /
+// UpdatePod request context: the ServiceAccount the token is minted FOR, and the
+// Pod object the token is BOUND TO. The two travel together because they are
+// answered by one pod and consumed by one call — a second parallel context key
+// could go missing independently, which is exactly the shape of the defect this
+// carrier closes.
+type podIdentity struct {
+	serviceAccount string    // spec.serviceAccountName, defaulted
+	name           string    // metadata.name
+	uid            types.UID // metadata.uid — the half that makes the binding invalidate with the pod
 }
 
-// serviceAccountFromContext returns the ServiceAccount name bound by
-// withServiceAccount, or "default" when none is bound.
-func serviceAccountFromContext(ctx context.Context) string {
-	if sa, ok := ctx.Value(serviceAccountKey{}).(string); ok && sa != "" {
-		return sa
+// podIdentityKey is the context key under which the provider binds a pod's
+// identity for the duration of a CreatePod, so the shared kubeResolver mints the
+// pod's token against the right SA and pins it to the right Pod object. The
+// mount.Resolver seam's ServiceAccountToken(ctx, namespace, audience, exp)
+// signature carries neither, so the per-pod identity rides the request context
+// that runtimed threads from CreatePod → mount.Materialize →
+// ServiceAccountToken in-process. This needs no runtimed/apis change. The M2
+// daemon split (a real gRPC boundary between provider and runtime) cannot carry
+// a context value across the wire, so it will bind the identity in the
+// materialization RPC instead — tracked with that split.
+type podIdentityKey struct{}
+
+// withPodIdentity returns ctx carrying pod's ServiceAccount name, name and UID so
+// the kubeResolver mints its token against the right SA and binds it to the pod.
+func withPodIdentity(ctx context.Context, pod *corev1.Pod) context.Context {
+	return context.WithValue(ctx, podIdentityKey{}, podIdentity{
+		serviceAccount: podServiceAccount(pod),
+		name:           pod.Name,
+		uid:            pod.UID,
+	})
+}
+
+// podIdentityFromContext returns the identity bound by withPodIdentity. ok is
+// false when none is bound, OR when the bound one lacks either half of the pod
+// object reference (name, UID) — a partial reference is not a weaker binding to
+// fall back on, it is a different one, so it fails closed at the caller.
+func podIdentityFromContext(ctx context.Context) (podIdentity, bool) {
+	id, ok := ctx.Value(podIdentityKey{}).(podIdentity)
+	if !ok || id.name == "" || id.uid == "" {
+		return podIdentity{}, false
 	}
-	return defaultServiceAccount
+	if id.serviceAccount == "" {
+		id.serviceAccount = defaultServiceAccount
+	}
+	return id, true
 }
 
 // podServiceAccount returns the pod's effective ServiceAccount name. The

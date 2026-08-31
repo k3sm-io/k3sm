@@ -133,7 +133,7 @@ func TestM2_InPodKubectl(t *testing.T) {
 
 	t.Run("token minted for the pod's ServiceAccount", func(t *testing.T) {
 		r := newKubeResolver(newInPodClient(ns))
-		ctx := withServiceAccount(context.Background(), "snapshot-manager")
+		ctx := withPodIdentity(context.Background(), saAccessPod(ns, "snap", "snapshot-manager"))
 		tok, err := r.ServiceAccountToken(ctx, ns, "", 3607)
 		if err != nil {
 			t.Fatalf("ServiceAccountToken: %v", err)
@@ -146,9 +146,10 @@ func TestM2_InPodKubectl(t *testing.T) {
 		}
 	})
 
-	t.Run("token defaults to the default SA when unset", func(t *testing.T) {
+	t.Run("token defaults to the default SA when the pod sets none", func(t *testing.T) {
 		r := newKubeResolver(newInPodClient(ns))
-		tok, err := r.ServiceAccountToken(context.Background(), ns, "", 0)
+		ctx := withPodIdentity(context.Background(), saAccessPod(ns, "snap", ""))
+		tok, err := r.ServiceAccountToken(ctx, ns, "", 0)
 		if err != nil {
 			t.Fatalf("ServiceAccountToken: %v", err)
 		}
@@ -169,7 +170,7 @@ func TestM2_InPodKubectl(t *testing.T) {
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
-		ctx := withServiceAccount(context.Background(), podServiceAccount(pod))
+		ctx := withPodIdentity(context.Background(), pod)
 		layout, err := mount.Materialize(ctx, box, dataVol, "10.0.0.9", newKubeResolver(cs))
 		if err != nil {
 			t.Fatalf("Materialize: %v", err)
