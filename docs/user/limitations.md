@@ -124,12 +124,12 @@ Today at `main`, per port class:
   - **Platform and statically linked binaries** the dynamic loader will not inject into also bind
     wildcard.
   - **An explicit bind to another Pod's address still works.** The rewrite touches only wildcard binds;
-    the trust domain is unchanged. Same-node Pods share one `_k3sm` OS trust domain — untrusted
-    workloads use the `vm` RuntimeClass.
+    the trust domain is unchanged. Same-node Pods share one `_k3sm` OS trust domain — the `vm`
+    RuntimeClass is the intended boundary for untrusted workloads, and does not run yet.
   - **A grandchild process that outlives Pod teardown** can keep a socket on the address after it is
     freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
 
-  Pods using the `vm` RuntimeClass have their own network stack behind VZNAT and are unaffected by all
+  Pods using the `vm` RuntimeClass will have their own network stack behind VZNAT, unaffected by all
   of the above — see [vm-runtimeclass.md](vm-runtimeclass.md).
 
 - **k3sm reserves some ports, and rejects LoadBalancer Services that claim them.** The NodePort range
@@ -278,11 +278,13 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 Both ship as documented **EXPERIMENTAL** and should be treated as preview-quality — but they are on
 different tracks:
 
-- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) is targeted at the **v0.1.0**
-  public release as EXPERIMENTAL, and is **launch-gated**: it is announced only if its live lab proof
-  is green against the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed,
-  with published performance figures — is the **v0.2** milestone. See
-  [vm-runtimeclass.md](vm-runtimeclass.md).
+- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) **does not run a Pod
+  today** — the dispatch, labels and plumbing exist, the guest boot does not, so a Pod that sets
+  `runtimeClassName: vm` will not start. It is targeted at the **v0.1.0** public release as
+  EXPERIMENTAL and **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for
+  a later release), and is **launch-gated**: announced only if its live lab proof is green against
+  the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed, with published
+  performance figures — is the **v0.2** milestone. See [vm-runtimeclass.md](vm-runtimeclass.md).
 - **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
   milestone. See [multi-node.md](multi-node.md) and [ha.md](ha.md).
 

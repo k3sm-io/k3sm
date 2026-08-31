@@ -1,18 +1,28 @@
 # The `vm` RuntimeClass
 
 k3sm runs Pods as native Darwin processes under a **single `_k3sm` user**, so there is **no per-pod uid
-isolation** — same-node Pods share one OS trust domain. For **untrusted or multi-tenant** workloads, the
-**`vm` RuntimeClass** provides a real isolation boundary backed by Virtualization.framework.
+isolation** — same-node Pods share one OS trust domain. The **`vm` RuntimeClass** is the intended
+answer for **untrusted or multi-tenant** workloads: a real isolation boundary backed by
+Virtualization.framework. It is the designed answer, not yet an available one — see the status note
+below before you depend on it.
 
-> **Status: EXPERIMENTAL.** The `vm` RuntimeClass ships as documented **EXPERIMENTAL** in the
-> **v0.1.0** public release, launch-gated on its live lab proof. The de-EXPERIMENTAL graduation, with
-> published performance figures, is the **v0.2** milestone. Treat it as preview-quality until then.
+> **Status: NOT RUNNING YET.** Read this before you plan around anything on this page. **No Pod has
+> ever booted in a micro-VM.** What exists today is the dispatch half — the RuntimeClass object, the
+> fail-closed backend selection, the capability labels, the volume and network plumbing — wrapped
+> around a boot path that is not written. A Pod that sets `runtimeClassName: vm` does not start.
+>
+> It is targeted at the **v0.1.0** public release as documented **EXPERIMENTAL** and
+> **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is deliberately held for a
+> later release), launch-gated on a live lab proof against the release artifact. The
+> de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2** milestone. Until
+> the v0.1.0 gate is green, treat every instruction below as *what this will do*, not what it does.
 > See [limitations.md](limitations.md).
 
 ## When to use it
 
 Use `vm` when a workload must not share the `_k3sm` trust domain with its neighbors — untrusted code,
-tenant isolation, or anything you would isolate with a strong boundary on Linux. This is the same
+tenant isolation, or anything you would isolate with a strong boundary on Linux. Today that means:
+plan for `vm`, but do not schedule onto it, because it does not boot yet. This is the same
 framing as [limitations.md](limitations.md) and [concepts.md](concepts.md): the default native path is
 **not** a security boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
 [privilege-model.md](../privilege-model.md).
