@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // Executor brings up and tears down the k3sm control plane. Start blocks until
@@ -125,6 +127,19 @@ type Config struct {
 	// certificate-authority-data. Empty keeps the M1/M2 self-signed path.
 	ServingCertFile string
 	ServingKeyFile  string
+	// RootCAFile is the CA the kube-controller-manager's root-ca-cert-publisher
+	// republishes into every namespace's kube-root-ca.crt ConfigMap — the trust
+	// anchor every Pod uses to verify the apiserver. It MUST anchor the serving cert
+	// the apiserver actually presents, so it is meaningful ONLY on the mesh path
+	// (where ServingCertFile names a cluster-CA-issued leaf); single-node the
+	// apiserver self-signs into its own --cert-dir and that file is the only possible
+	// anchor. Empty on the mesh path defaults to the cluster CA under the work-dir PKI
+	// dir; setting it WITHOUT a serving cert is a misconfiguration Validate rejects.
+	//
+	// It is never read directly: rootCAFile resolves it off the SAME predicate that
+	// gates --tls-cert-file (meshServingCert), so --root-ca-file and --tls-cert-file
+	// cannot name CAs from different postures.
+	RootCAFile string
 	// AuthorizationMode is the apiserver --authorization-mode. Empty defaults to
 	// DefaultAuthorizationMode (Node,RBAC) — the M4.1 hard-cut flip from AlwaysAllow.
 	// The flip is pure because no in-process component is left unauthorized: the VK node
@@ -289,15 +304,71 @@ func EnsureWorkDirWritable(dir string) error {
 // fail-closed: bring-up halts rather than silently diverging.
 var ErrHARequiresDatastore = errors.New("executor: HA server-join requires a shared datastore endpoint (a Postgres DSN); refusing to start a second server on its own SQLite (split-brain)")
 
+// ErrRootCAWithoutServingCert is returned by Validate when a RootCAFile is supplied
+// without the serving keypair it is supposed to anchor. The two are one posture, not
+// two knobs: on the single-node path the apiserver self-signs into its own --cert-dir,
+// so a cluster CA published as kube-root-ca.crt would anchor NOTHING the apiserver
+// presents and every Pod's in-cluster API TLS would fail. rootCAFile mode-locks the
+// rendering so this can never reach argv; this makes the misconfiguration LOUD instead
+// of silently ignored.
+var ErrRootCAWithoutServingCert = errors.New("executor: RootCAFile is set without ServingCertFile/ServingKeyFile; the published kube-root-ca.crt must anchor the apiserver serving cert, and single-node the apiserver self-signs into its own --cert-dir")
+
 // Validate checks cfg is internally consistent before bring-up. The load-bearing
 // check is the split-brain guard: an HA server (ServerJoin) MUST carry a
 // DatastoreEndpoint. It is called at the top of Start so a misconfigured HA server
 // fails fast with a clear error instead of quietly forming a divergent cluster.
+// The second check is the trust-anchor guard (see ErrRootCAWithoutServingCert).
 func (c Config) Validate() error {
 	if c.ServerJoin && c.DatastoreEndpoint == "" {
 		return ErrHARequiresDatastore
 	}
+	if c.RootCAFile != "" && !c.meshServingCert() {
+		return ErrRootCAWithoutServingCert
+	}
 	return nil
+}
+
+// meshServingCert reports whether an explicit apiserver serving keypair was supplied
+// — the mesh path, where cmd/k3sm issues a CLUSTER-CA-signed leaf into the PKI dir and
+// the apiserver presents it instead of self-signing into --cert-dir.
+//
+// It is THE posture predicate for every flag whose correct value depends on WHICH CA
+// anchors the live apiserver serving cert, and it is single-sourced for exactly that
+// reason: --tls-cert-file (the cert presented) and --root-ca-file (the CA republished
+// to every Pod as kube-root-ca.crt) must never be able to disagree about the posture.
+// The same discrimination is made, from the outside, by cmd/k3sm's
+// apiServerTrustAnchor.
+func (c Config) meshServingCert() bool {
+	return c.ServingCertFile != "" && c.ServingKeyFile != ""
+}
+
+// rootCAFile resolves the kube-controller-manager --root-ca-file: the CA its
+// root-ca-cert-publisher republishes into every namespace's kube-root-ca.crt
+// ConfigMap, which is every Pod's trust anchor for the in-cluster API.
+//
+// It is DERIVED from meshServingCert, never read raw, so the answer is always the CA
+// that anchors the serving cert the apiserver actually presents:
+//
+//   - mesh (a serving keypair was supplied): the configured RootCAFile, defaulting to
+//     the cluster CA under the work-dir PKI dir — the CA that issued that leaf. The
+//     self-signed --cert-dir file is not merely the wrong anchor here, it does not
+//     exist: an apiserver given --tls-cert-file never self-signs, so pinning it fails
+//     the controller-manager's own startup ("error parsing root-ca-file ... no such
+//     file or directory") on a fresh mesh work dir, and publishes a stale, unrelated
+//     CA on a work dir that had previously booted single-node.
+//   - single-node: the apiserver's self-signed --cert-dir cert (leaf + the self-signed
+//     CA that issued it), which is the ONLY anchor for what it serves. An explicit
+//     RootCAFile is deliberately not honored here — Validate rejects that Config
+//     outright, and the renderer stays total so a hand-built Config in a test can
+//     never render a flag pair from two different postures.
+func (c Config) rootCAFile() string {
+	if !c.meshServingCert() {
+		return filepath.Join(certDir(c.WorkDir), "apiserver.crt")
+	}
+	if c.RootCAFile != "" {
+		return c.RootCAFile
+	}
+	return certs.ClusterCACertPath(c.WorkDir)
 }
 
 // isHA reports whether this server runs the HA multi-writer posture: it has a shared
