@@ -1,10 +1,11 @@
 # S1 findings — minimal VZ Linux boot
 
-> Status: criteria 1, 2, 3 and 6 RECORDED from the 2026-08-31 sitting (three
-> runs; the first two exposed harness defects — see Deviations — and the third
-> is the run of record). Criteria 4 and 5 are NOT YET RUN: 4 rides the S5
-> sitting's network-capable guest, 5 needs the seatbelt harness leg. M11.0-d1
-> does not flip done until both are recorded here.
+> Status: criteria 1, 2, 3, 5 and 6 RECORDED from the 2026-08-31 sitting (the
+> first two runs exposed harness defects — see Deviations — and the third is
+> the run of record for 1/2/3/6; criterion 5 was added and run in the same
+> sitting once 1 and 2 had reported GO). Criterion 4 is NOT YET RUN: it rides
+> the S5 sitting's network-capable guest and is mirrored back here verbatim.
+> M11.0-d1 does not flip done until it is recorded.
 
 ## Rig
 
@@ -117,24 +118,71 @@ here verbatim when recorded.
 
 ## Criterion 5 — Seatbelt × VZ coexistence · decides Resolution 7
 
-Mirror `pkg/sandbox/sbpl.go` `Generate()` rule-for-rule and in order, then
-construct a VM in the same process. Also test `sandbox_init` **after** VM
-creation — the ordering may be the whole answer.
+The confined process applies the **product's own pod profile** — a verbatim copy
+of what `runtimed` `pkg/sandbox/sbpl.go` `Generate()` emits for a networked pod
+with no extra paths, no GPU, no denied helper sockets and no credential
+sub-scope, rule-for-rule and in order, with only the work-dir and data-volume
+paths substituted. It is applied through the same private libsandbox pair the
+product uses (`sandbox_compile_string` → `sandbox_apply`), from the same
+process that then constructs the VM. The copy is a copy, not an import: the
+spikes never link the product. That leaves a **mirror obligation** — if
+`Generate()` gains, drops or reorders a rule, this criterion's answer stops
+describing the profile the product applies and the literal in `s1.sh` must be
+regenerated before the result is re-quoted.
 
-One of three:
+The kernel and initramfs are staged INSIDE the pod data volume, where a real vm
+pod's artifacts live. The profile denies `/Users` outright and re-allows only
+that volume, so staging them anywhere else would have produced a file-read
+denial the product would never hit.
 
-- [ ] works as-is
+Both orderings were run, because the ordering could have been the whole answer.
+
+| ordering | `sandbox_apply` | VM construct | VM start | guest ran to power-down | verdict |
+|---|---|---|---|---|---|
+| **before** — confine, THEN construct+start | ok | ok | ok | yes | **works** |
+| **after** — construct+start, THEN confine | ok | ok | ok | yes | **works** |
+
+- [x] works as-is
 - [ ] fails with a specific denial (capture the denial log VERBATIM below)
 - [ ] works only with a named minimal allow-set delta — report it as an
       **ADOPTED ALLOW-SET** block, never a silent widening
 
+**No allow-set delta was needed and none was adopted.** The profile applied is
+byte-identical to the generated one.
+
+**Denial log** — `log show --last 4m` filtered to this process, `sandbox`/`deny`:
+
 ```
-NOT YET RUN — the harness's vzboot has no seatbelt mode yet; the leg is being
-added (sandbox_init via the same cgo build vz already forces).
+(empty — no Seatbelt denial was logged for either ordering)
 ```
 
-**Consequence:** confined, or a documented residual. NOT terminal — the M11 plan's R22
-admits either.
+**Non-vacuity controls.** A "works" verdict would be theatre if the profile were
+not actually in force — the same trap criterion 1's counterfactual exists to
+avoid. Two controls run immediately after `sandbox_apply`, and the verdict is
+downgraded to `inconclusive` unless both hold. Observed, both orderings:
+
+```
+VZBOOT_SB_APPLY=ok
+VZBOOT_SB_CONTROL_NEG=denied err=open <lab prefix>/bin/vzboot: operation not permitted
+VZBOOT_SB_CONTROL_POS=readable
+```
+
+The negative control reads a path the profile denies (the harness binary, under
+the blanket `/Users` deny) — `operation not permitted`, so the sandbox is live.
+The positive control reads the pod's own data volume — readable, so the
+negative is a targeted denial and not a profile that broke everything.
+
+**Verdict:** WORKS, both orderings, with the profile proven in force.
+Resolution 7's vmhost confinement is **not** blocked by Seatbelt: a vmhost
+process can be confined by the ordinary pod profile and still drive VZ, and it
+does not matter whether confinement precedes or follows VM construction. The
+M11 plan's R22 residual is not needed for this criterion on this rig.
+
+Scope of the claim, stated so it is not over-read: this covers VM
+**construction and start plus a full guest run to power-down** with a virtio
+console. It does NOT cover a VM with a virtiofs share, a vsock device or a
+Rosetta share under confinement — those devices touch further host resources
+and are a separate observation, not an inference from this one.
 
 ## Criterion 6 — Rosetta availability probe when UNENTITLED
 

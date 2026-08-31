@@ -10,8 +10,10 @@
 #   1 entitlement-only ad-hoc signing suffices        — GO/NO-GO, with counterfactual
 #   2 console tokens from a real kernel boot          — GO/NO-GO, with gzip control
 #   3 cold-boot latency, TWO figures                  — RECORDING
-#   4 guest<->guest reachability                      — RECORDING (a security fact)
-#   5 Seatbelt x VZ coexistence in one process        — decides Resolution 7
+#   4 guest<->guest reachability                      — RECORDING (a security fact);
+#                                                       run by s5-run.sh, mirrored here
+#   5 Seatbelt x VZ coexistence in one process        — decides Resolution 7; BOTH
+#                                                       orderings (confine-first, VM-first)
 #   6 Rosetta availability probe safe when unentitled — HALTS the shipped label path
 #
 # Criterion 1 is the one most easily mis-proven. Observing that an entitled
@@ -125,19 +127,310 @@ cat > main.go <<'GOEOF'
 // Modes: boot (criteria 2,3), pair (4), seatbelt (5), rosetta (6).
 package main
 
+/*
+#cgo LDFLAGS: -lsandbox
+#include <stdlib.h>
+
+// The private, deprecated libsandbox SPI, declared EXACTLY as runtimed's
+// internal/execshim declares it (macOS 26, arm64) — criterion 5 is only
+// meaningful if the spike confines itself the way the product does.
+extern void *sandbox_compile_string(const char *data, void *params, char **error);
+extern int   sandbox_apply(void *profile);
+extern void  sandbox_free_error(char *error);
+
+static int k3sm_apply_sbpl(const char *profile, char **errmsg) {
+	char *err = NULL;
+	void *p = sandbox_compile_string(profile, NULL, &err);
+	if (p == NULL) {
+		*errmsg = err;
+		return 1;
+	}
+	if (sandbox_apply(p) != 0) {
+		*errmsg = NULL;
+		return 2;
+	}
+	*errmsg = NULL;
+	return 0;
+}
+*/
+import "C"
+
 import (
-	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/Code-Hex/vz/v3"
 )
 
+// podSBPLTemplate is a VERBATIM copy of what runtimed's
+// pkg/sandbox/sbpl.go Generate() emits for a networked pod with no extra
+// paths, no GPU, no denied helper sockets and no credential sub-scope —
+// rule for rule and IN ORDER, with only the two site-specific paths
+// substituted (@WORKDIR@, @DATAVOL@).
+//
+// MIRROR OBLIGATION: this literal has no compile-time link to Generate(). If
+// Generate() gains, drops or reorders a rule, criterion 5's answer stops
+// describing the profile the product actually applies, and this literal must
+// be regenerated from Generate() before the criterion is re-quoted. It is
+// copied rather than imported deliberately: the spike does not link runtimed
+// (k3sm/hack/spike doctrine — the spikes stay standalone and never touch the
+// product exec path).
+const podSBPLTemplate = `;; k3sm per-pod Seatbelt profile — GENERATED, do not edit.
+;; Default-deny; runs a native pod process at host paths (no chroot).
+;; Rule order is last-match-wins: OS/extra allows, THEN protected
+;; denies (so extra paths can't override them), THEN narrow re-allows.
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-exec*)
+(allow process-fork)
+;; read: OS + frameworks + validated extra read paths.
+(allow file-read*
+  (subpath "/Library")
+  (subpath "/System")
+  (subpath "/bin")
+  (subpath "/usr")
+  (literal "/dev/null") (literal "/dev/zero")
+  (literal "/dev/random") (literal "/dev/urandom"))
+;; write: validated extra write paths (+ /dev/null); the pod's own
+;; data volume is re-allowed below, after the protected denies.
+(allow file-write*
+  (literal "/dev/null"))
+;; network: ALLOWED — unfiltered outbound+bind+inbound under (deny default).
+;; macOS 26 Seatbelt accepts only localhost/* hosts in network filters;
+;; per-IP scoping (VIP egress, per-pod-IP bind) does NOT compile.
+(allow network-outbound)
+(allow network-bind)
+(allow network-inbound)
+;; mach-lookup the DNS resolver path (mDNSResponder) needs.
+(allow mach-lookup
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.mDNSResponder"))
+;; PROTECTED: deny user homes, the secrets/state store, the shared
+;; pods root, the daemon-private podreap store AND the control-plane
+;; and daemon trees (server, agent, run, blobs — sibling dirs under
+;; the work-dir) — read+write, AFTER the allows so a caller's extra
+;; path (even an ancestor work-dir grant) can't win.
+(deny file-read* file-write*
+  (subpath "/Users"))
+(deny file-read* file-write*
+  (subpath "/private/var/db"))
+(deny file-read* file-write*
+  (subpath "@WORKDIR@/pods")
+  (subpath "@WORKDIR@/podreap")
+  (subpath "@WORKDIR@/server")
+  (subpath "@WORKDIR@/agent")
+  (subpath "@WORKDIR@/run")
+  (subpath "@WORKDIR@/blobs")
+  (subpath "/var/lib/k3sm/run")
+  (subpath "/private/var/lib/k3sm/run")
+  )
+;; dyld cryptex: deny WRITE only (read is needed at link time).
+(deny file-write*
+  (subpath "/System/Volumes/Preboot/Cryptexes")
+  (subpath "/System/Cryptexes"))
+;; re-allow the dyld closure cache read the /private/var/db deny clobbers.
+(allow file-read*
+  (subpath "/private/var/db/dyld"))
+;; re-allow THIS pod's own data volume (under the denied pods root).
+(allow file-read* file-write*
+  (subpath "@DATAVOL@")
+  )
+`
+
+// podSBPL renders the mirrored profile for one pod's work-dir and data volume.
+func podSBPL(workDir, dataVol string) string {
+	return strings.NewReplacer("@WORKDIR@", workDir, "@DATAVOL@", dataVol).Replace(podSBPLTemplate)
+}
+
+// confine compiles and applies profile to THIS process, irreversibly. It is a
+// copy of runtimed internal/execshim.confine, for the same mirror reason.
+func confine(profile string) error {
+	cProfile := C.CString(profile)
+	defer C.free(unsafe.Pointer(cProfile))
+
+	var cErr *C.char
+	rc := C.k3sm_apply_sbpl(cProfile, &cErr)
+	if rc == 0 {
+		return nil
+	}
+	msg := ""
+	if cErr != nil {
+		msg = C.GoString(cErr)
+		C.sandbox_free_error(cErr)
+	}
+	if msg == "" {
+		return fmt.Errorf("libsandbox apply failed (rc=%d)", int(rc))
+	}
+	return fmt.Errorf("libsandbox apply failed (rc=%d): %s", int(rc), msg)
+}
+
 func die(stage string, err error) {
 	fmt.Printf("VZBOOT_FAIL stage=%s err=%v\n", stage, err)
 	os.Exit(1)
+}
+
+// buildVM assembles the S1 guest (kernel + stub initramfs + virtio console,
+// optionally a NAT device) and returns it unstarted. The failing stage name is
+// returned alongside the error so every caller reports the same vocabulary.
+func buildVM(kernel, initrd, token string, withNAT bool) (*vz.VirtualMachine, string, error) {
+	bl, err := vz.NewLinuxBootLoader(kernel,
+		vz.WithCommandLine("console=hvc0 quiet s1_token="+token),
+		vz.WithInitrd(initrd))
+	if err != nil {
+		return nil, "bootloader", err
+	}
+	cfg, err := vz.NewVirtualMachineConfiguration(bl, 1, 512*1024*1024)
+	if err != nil {
+		return nil, "config", err
+	}
+	// Console -> our stdout, which is how the token and the timings get out.
+	att, err := vz.NewFileHandleSerialPortAttachment(os.Stdin, os.Stdout)
+	if err != nil {
+		return nil, "console-attachment", err
+	}
+	sc, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(att)
+	if err != nil {
+		return nil, "console", err
+	}
+	cfg.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{sc})
+	if withNAT {
+		// Criterion 4 needs two guests on one NAT segment.
+		nat, err := vz.NewNATNetworkDeviceAttachment()
+		if err != nil {
+			return nil, "nat", err
+		}
+		nc, err := vz.NewVirtioNetworkDeviceConfiguration(nat)
+		if err != nil {
+			return nil, "net", err
+		}
+		cfg.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{nc})
+	}
+	if ok, err := cfg.Validate(); !ok || err != nil {
+		return nil, "validate", err
+	}
+	vm, err := vz.NewVirtualMachine(cfg)
+	if err != nil {
+		return nil, "new-vm", err
+	}
+	return vm, "", nil
+}
+
+// waitStopped reports whether vm reached the Stopped state within d.
+func waitStopped(vm *vz.VirtualMachine, d time.Duration) bool {
+	deadline := time.After(d)
+	for {
+		select {
+		case st := <-vm.StateChangedNotify():
+			if st == vz.VirtualMachineStateStopped {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+// runSeatbelt is criterion 5: does a process confined by the product's own pod
+// profile still construct and start a VZ VM, and does the ANSWER DEPEND ON THE
+// ORDER? order is "before" (sandbox_apply, then build+start) or "after"
+// (build+start, then sandbox_apply).
+//
+// Every outcome is a valid recording. A denial here is NOT terminal for M11 —
+// the M11 plan's R22 admits a documented residual — so this never exits
+// non-zero for a denial, only for a harness fault.
+func runSeatbelt(order string) {
+	workDir, dataVol := os.Getenv("S1_SB_WORKDIR"), os.Getenv("S1_SB_DATAVOL")
+	kernel, initrd := os.Getenv("S1_KERNEL"), os.Getenv("S1_INITRD")
+	if workDir == "" || dataVol == "" {
+		fmt.Println("VZBOOT_SB_HARNESS_FAULT=S1_SB_WORKDIR/S1_SB_DATAVOL unset")
+		os.Exit(3)
+	}
+	profile := podSBPL(workDir, dataVol)
+	fmt.Printf("VZBOOT_SB_ORDER=%s\n", order)
+	fmt.Printf("VZBOOT_SB_PROFILE_SHA_LEN=%d\n", len(profile))
+
+	// A "works" verdict is theatre unless the profile is proven IN FORCE — the
+	// same trap criterion 1's counterfactual exists to avoid. Two controls run
+	// immediately after sandbox_apply: a NEGATIVE (a path the profile denies
+	// must now be unreadable) and a POSITIVE (the pod's own data volume must
+	// still be readable, so a "denied" negative cannot come from a profile that
+	// simply broke everything).
+	confined := func() bool {
+		ok := true
+		denied := filepath.Join(workDir, "bin", "vzboot")
+		if _, err := os.ReadFile(denied); err != nil {
+			fmt.Printf("VZBOOT_SB_CONTROL_NEG=denied err=%v\n", err)
+		} else {
+			fmt.Println("VZBOOT_SB_CONTROL_NEG=NOT-CONFINED — a denied path read succeeded")
+			ok = false
+		}
+		if _, err := os.ReadFile(filepath.Join(dataVol, "Image")); err != nil {
+			fmt.Printf("VZBOOT_SB_CONTROL_POS=unreadable err=%v\n", err)
+			ok = false
+		} else {
+			fmt.Println("VZBOOT_SB_CONTROL_POS=readable")
+		}
+		return ok
+	}
+	sandboxProven := false
+	apply := func() bool {
+		if err := confine(profile); err != nil {
+			fmt.Printf("VZBOOT_SB_APPLY=fail err=%v\n", err)
+			return false
+		}
+		fmt.Println("VZBOOT_SB_APPLY=ok")
+		sandboxProven = confined()
+		return true
+	}
+	verdict := func(v string) { fmt.Printf("VZBOOT_SB_VERDICT_%s=%s\n", strings.ToUpper(order), v) }
+
+	if order == "before" {
+		if !apply() {
+			// An unconfined process proves nothing about coexistence.
+			verdict("inconclusive: sandbox_apply itself failed")
+			return
+		}
+	}
+	vm, stage, err := buildVM(kernel, initrd, "sb-"+order, false)
+	if err != nil {
+		fmt.Printf("VZBOOT_SB_BUILD=fail stage=%s err=%v\n", stage, err)
+		verdict("failed stage=" + stage + " err=" + err.Error())
+		return
+	}
+	fmt.Println("VZBOOT_SB_BUILD=ok")
+	runtime.LockOSThread()
+	if err := vm.Start(); err != nil {
+		fmt.Printf("VZBOOT_SB_START=fail err=%v\n", err)
+		verdict("failed stage=start err=" + err.Error())
+		return
+	}
+	fmt.Println("VZBOOT_SB_START=ok")
+	if order == "after" {
+		if !apply() {
+			verdict("failed stage=apply-after-start")
+			// The VM is live and must not be left running.
+			_ = vm.Stop()
+			return
+		}
+	}
+	if waitStopped(vm, 25*time.Second) {
+		fmt.Println("VZBOOT_SB_GUEST_REACHED_STOPPED=yes")
+		if !sandboxProven {
+			verdict("inconclusive: the VM ran but the profile was not proven in force")
+			return
+		}
+		verdict("worked")
+		return
+	}
+	fmt.Println("VZBOOT_SB_GUEST_REACHED_STOPPED=no")
+	_ = vm.Stop()
+	verdict("failed stage=guest-run err=guest did not power down within 25s")
 }
 
 func main() {
@@ -145,13 +438,21 @@ func main() {
 	if len(os.Args) > 1 {
 		mode = os.Args[1]
 	}
-	if mode == "rosetta" {
+	switch mode {
+	case "rosetta":
 		// Criterion 6: this probe SHIPS in the product binary and is called
 		// eagerly once per daemon lifetime. If it raises when unentitled, the
 		// daemon crashes at startup on exactly the machines M11 targets.
 		avail := vz.LinuxRosettaDirectoryShareAvailability()
 		fmt.Printf("VZBOOT_ROSETTA_AVAILABILITY=%v\n", avail)
 		fmt.Println("VZBOOT_ROSETTA_PROBE_DID_NOT_RAISE")
+		return
+	case "seatbelt":
+		order := "before"
+		if len(os.Args) > 2 {
+			order = os.Args[2]
+		}
+		runSeatbelt(order)
 		return
 	}
 
@@ -160,44 +461,9 @@ func main() {
 	token := os.Getenv("S1_TOKEN")
 
 	t0 := time.Now()
-	bl, err := vz.NewLinuxBootLoader(kernel,
-		vz.WithCommandLine("console=hvc0 quiet s1_token="+token),
-		vz.WithInitrd(initrd))
+	vm, stage, err := buildVM(kernel, initrd, token, mode == "pair")
 	if err != nil {
-		die("bootloader", err)
-	}
-	cfg, err := vz.NewVirtualMachineConfiguration(bl, 1, 512*1024*1024)
-	if err != nil {
-		die("config", err)
-	}
-	// Console -> our stdout, which is how the token and the timings get out.
-	att, err := vz.NewFileHandleSerialPortAttachment(os.Stdin, os.Stdout)
-	if err != nil {
-		die("console-attachment", err)
-	}
-	sc, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(att)
-	if err != nil {
-		die("console", err)
-	}
-	cfg.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{sc})
-	if mode == "pair" {
-		// Criterion 4 needs two guests on one NAT segment.
-		nat, err := vz.NewNATNetworkDeviceAttachment()
-		if err != nil {
-			die("nat", err)
-		}
-		nc, err := vz.NewVirtioNetworkDeviceConfiguration(nat)
-		if err != nil {
-			die("net", err)
-		}
-		cfg.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{nc})
-	}
-	if ok, err := cfg.Validate(); !ok || err != nil {
-		die("validate", err)
-	}
-	vm, err := vz.NewVirtualMachine(cfg)
-	if err != nil {
-		die("new-vm", err)
+		die(stage, err)
 	}
 	// Pinned deliberately: VZ drives its own queue, but the process needs a live
 	// thread for the delegate callbacks. Conservative until measured otherwise.
@@ -206,8 +472,6 @@ func main() {
 		die("start", err)
 	}
 	fmt.Printf("VZBOOT_CREATE_TO_START_NS=%d\n", time.Since(t0).Nanoseconds())
-	sc2 := bufio.NewScanner(os.Stdin)
-	_ = sc2
 	deadline := time.After(30 * time.Second)
 	select {
 	case <-deadline:
@@ -318,12 +582,63 @@ grep -q VZBOOT_ROSETTA_PROBE_DID_NOT_RAISE out/rosetta-noent.log \
   || echo "  CRITERION 6: FAIL — HALT the shipped label path; this is a bug in merged code"
 LABEOF
 
-note "S1 done — criteria 4 (guest<->guest) and 5 (Seatbelt x VZ) are the remaining legs"
+note "S1 criterion 5 — Seatbelt × VZ coexistence, BOTH orderings"
+
+lab <<'LABEOF'
+set -euo pipefail
+cd "$PREFIX"
+
+# The confined process is held to the product's own pod profile, whose
+# protected denies cover /Users outright and re-allow ONLY the pod's data
+# volume. So the kernel and initramfs must live where a real vm pod's
+# artifacts would: inside that data volume. Staging them anywhere else would
+# make criterion 5 report a file-read denial that the product would never hit.
+SBDATA="$PREFIX/pods/s1seatbelt/data"
+mkdir -p "$SBDATA"
+cp guest/Image guest/initramfs.cpio "$SBDATA/"
+
+run_order() { # $1 = before|after
+  set +e
+  S1_KERNEL="$SBDATA/Image" S1_INITRD="$SBDATA/initramfs.cpio" \
+  S1_SB_WORKDIR="$PREFIX" S1_SB_DATAVOL="$SBDATA" \
+    run_timeout 60 ./bin/vzboot seatbelt "$1" >"out/seatbelt-$1.log" 2>&1
+  echo "  seatbelt-$1 exit=$?"
+  set -e
+  sed 's/^/     /' "out/seatbelt-$1.log"
+}
+
+echo "-- 5a sandbox_apply FIRST, then construct+start a VM"
+run_order before
+echo "-- 5b construct+start a VM FIRST, then sandbox_apply"
+run_order after
+
+# The denial text is the finding when an ordering fails, so capture it rather
+# than paraphrasing it. Non-root `log show` sees the last few minutes; an empty
+# capture is itself recorded (it means no Seatbelt denial was logged).
+echo "-- Seatbelt denial log (verbatim; empty = none logged)"
+log show --last 4m --style syslog --predicate 'eventMessage CONTAINS "vzboot"' 2>/dev/null \
+  | grep -iE 'sandbox|deny' | head -40 | sed 's/^/     /' || true
+
+for o in before after; do
+  if grep -q "VZBOOT_SB_VERDICT_$(echo "$o" | tr a-z A-Z)=worked" "out/seatbelt-$o.log"; then
+    echo "  CRITERION 5 ($o): WORKS — a VM constructs and starts under the pod profile"
+  else
+    echo "  CRITERION 5 ($o): DOES NOT WORK — record the verbatim line above; NOT terminal (the M11 plan's R22)"
+  fi
+done
+
+# Leave nothing running: both orderings power their guest down, but a timeout
+# kill can strand one.
+pkill -f "$PREFIX/bin/vzboot" 2>/dev/null || true
+LABEOF
+
+note "S1 done — criterion 4 (guest<->guest) is the remaining leg"
 cat <<'EOF'
 
-  Criteria 4 and 5 need a second guest and an sbpl-loaded process respectively;
-  they are run in the same sitting from this harness (vzboot pair / seatbelt)
-  once 1, 2 and 6 have reported, because a NO-GO on 1 or 2 makes them moot.
+  Criterion 4 needs TWO guests with a network userland, which this harness's
+  stub init does not have. Its named vehicle is s5-run.sh, whose Alpine guest
+  boots two VMs on one NAT segment and prints the matrix; the result is
+  mirrored back into findings-s1.md criterion 4 VERBATIM.
 
   RECORD THE OUTCOME in k3sm/hack/spike/m11/findings-s1.md:
     - the rig table, and the kernel sha256 + byte size this run used;
@@ -332,8 +647,9 @@ cat <<'EOF'
     - the console transcript excerpt and the gzip rejection;
     - the latency table with min/median/p95/max for BOTH figures;
     - the guest<->guest matrix, VERBATIM, as a security fact;
-    - the Seatbelt x VZ outcome: works / fails-with-denial / works-with-a-named
-      minimal allow-set (report the delta as an ADOPTED ALLOW-SET block);
+    - the Seatbelt x VZ outcome for BOTH orderings: works / fails-with-denial /
+      works-with-a-named minimal allow-set (report a delta as an ADOPTED
+      ALLOW-SET block, never a silent widening);
     - the Rosetta probe value observed on this rig;
     - any deviation from the guardrails in lib.sh, flagged rather than adopted.
 
