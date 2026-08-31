@@ -115,4 +115,4 @@ If a control-plane credential is compromised, the honest remedy is to recreate t
 
 - [troubleshooting.md](troubleshooting.md) — when the control plane does not come back.
 - [multi-node.md](multi-node.md) — join tokens and the CA pin a joining node checks.
-- [limitations.md](limitations.md) — the honest gaps.
+- [limitations.md](limitations.md) — the real gaps.
