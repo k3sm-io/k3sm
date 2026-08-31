@@ -1,11 +1,11 @@
 # S1 findings — minimal VZ Linux boot
 
-> Status: criteria 1, 2, 3, 5 and 6 RECORDED from the 2026-08-31 sitting (the
-> first two runs exposed harness defects — see Deviations — and the third is
-> the run of record for 1/2/3/6; criterion 5 was added and run in the same
-> sitting once 1 and 2 had reported GO). Criterion 4 is NOT YET RUN: it rides
-> the S5 sitting's network-capable guest and is mirrored back here verbatim.
-> M11.0-d1 does not flip done until it is recorded.
+> Status: ALL SIX criteria RECORDED from the 2026-08-31 sitting (the first two
+> runs exposed harness defects — see Deviations — and the third is the run of
+> record for 1/2/3/6; criterion 5 was added and run in the same sitting once 1
+> and 2 had reported GO; criterion 4 is mirrored verbatim from the S5 sitting
+> on the same rig, its named vehicle, because S1's stub init has no network
+> userland).
 
 ## Rig
 
@@ -105,16 +105,29 @@ follows init exec by under a millisecond, so the derivation does not flatter it.
 
 ## Criterion 4 — guest↔guest reachability · RECORDING (a SECURITY FACT)
 
-Record verbatim. Do not summarise — this text becomes the network-trust ceiling
-in `limitations.md` and `privilege-model.md`.
+Recorded verbatim, mirrored from the S5 sitting on the same rig (`s5-run.sh`,
+2026-08-31) — its network-capable Alpine guest is criterion 4's named vehicle,
+since S1's stub init has no network userland. The full evidence, the liveness
+controls and the caveat live in `findings-s5.md` criterion 4; this is the
+matrix itself, unsummarised.
 
 | from → to | TCP | ICMP | L2-adjacent or routed via gateway |
 |---|---|---|---|
-| guest A → guest B (vmnet addr) | NOT YET RUN | NOT YET RUN | NOT YET RUN |
+| guest A (`192.168.64.8`) → guest B (`192.168.64.7`, vmnet addr) | refused-or-unreachable | 100% packet loss (3 sent, 0 received) | **neither** — ARP for the peer reached `FAILED` after 6 probes, while ARP for the gateway resolved to an lladdr in the same table |
 
-**NOT YET RUN** — the stub init has no network userland; this matrix is
-produced by the S5 sitting's network-capable guest on the same rig and mirrored
-here verbatim when recorded.
+```
+S5_C4_ICMP_RAW=PING 192.168.64.7 (192.168.64.7): 56 data bytes||--- 192.168.64.7 ping statistics ---|3 packets transmitted, 0 packets received, 100% packet loss|
+S5_C4_TCP=refused-or-unreachable dst=192.168.64.7:34812
+S5_C4_ADJACENCY=NOT-adjacent (ARP attempted, no lladdr: 192.168.64.7 dev eth0  used 0/0/0 probes 6 FAILED|)
+```
+
+Both guests were proven live at those addresses first — each reached the
+gateway by ICMP and opened a TCP connection to a host listener that logged its
+source address — so this is isolation, not a broken guest.
+
+**It is an OBSERVATION of macOS 26.6.2 with `VZNATNetworkDeviceAttachment`, not
+a documented guarantee**, and `findings-s5.md` records why it must not be
+published as a security ceiling on that basis.
 
 ## Criterion 5 — Seatbelt × VZ coexistence · decides Resolution 7
 
