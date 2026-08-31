@@ -94,10 +94,15 @@ ladder "$abi" "b217.1  darwin-net podnet exports BindDisciplineEnv + EnvPodIP (K
 # Structural pins so the gate reddens if the injection call or its hostNetwork guard is
 # deleted — the mutant check for a change that would silently narrow the shipped
 # hostNetwork semantic or drop the discipline entirely.
+#
+# B218 widened the call site to also thread the cluster CIDRs (clusterCIDRs) through
+# to podnet.BindDisciplineEnvWithCIDRs (the additive superset of BindDisciplineEnv) —
+# these two pins were updated to match; the gated-on-distinct-/32 pin below is
+# unchanged, since B218 did not touch that guard.
 w=ok
-grep -qE 'injectBindDisciplineEnv\(box, podIP, nodeIP, log\)' "$TRANSLATE" || w=no
+grep -qE 'injectBindDisciplineEnv\(box, podIP, nodeIP, clusterCIDRs\(dnsCfg\.ClusterDNSIP\), log\)' "$TRANSLATE" || w=no
 grep -qE 'podIP == "" \|\| podIP == nodeIP' "$TRANSLATE" || w=no
-grep -qE 'podnet\.BindDisciplineEnv\(addr\)' "$TRANSLATE" || w=no
+grep -qE 'podnet\.BindDisciplineEnvWithCIDRs\(addr, cidrs\)' "$TRANSLATE" || w=no
 ladder "$w" "b217.2  toPodBox calls injectBindDisciplineEnv, gated on podIP != nodeIP (distinct /32)"
 
 # ---- Go leg runner (GOARCH=arm64 CGO_ENABLED=1) ----------------------------
