@@ -24,13 +24,13 @@ limitations under the License.
 // sites, not by reading whatever happens to be embedded here.
 //
 // That neutrality is the whole reason this package exists as its own package.
-// The MeshPeer CRD sits beside the MLXModel manifest in the same apis directory
-// and is applied out-of-band by the existing bootstrap path; adopting it into
-// this ensure owes a mesh-regression check and must be a deliberate act. Had
-// this package globbed a manifest directory, or grown a package-level set of
-// "the CRDs k3sm applies", MeshPeer would have been enlisted by accident and the
-// bootstrap path would have gained a second, competing writer with no diff to
-// review.
+// The MeshPeer CRD sits beside the MLXModel manifest in the same apis directory,
+// and adopting it into this ensure had to be a deliberate act carrying its own
+// mesh-regression check. It has since been adopted (B224): cmd/k3sm's runServer
+// hands this package MeshPeerCRD() on the mesh path, once, before the worker-join
+// supervisor exists. Had this package globbed a manifest directory, or grown a
+// package-level set of "the CRDs k3sm applies", that adoption would have happened
+// by accident, at an unreviewed moment, with no diff to argue about.
 //
 // # Server-side apply, forced, under one field manager
 //
