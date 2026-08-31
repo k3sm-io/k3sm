@@ -48,8 +48,9 @@ and the one this node needs, rather than pulling it and failing opaquely at exec
 
 Note the distinction this section is *not* making: the objection is to **Linux**, not to OCI. The
 image format, the registry protocol, tags, digests, pull policy and pull secrets all work normally —
-see [what-runs.md](what-runs.md). Linux payloads are the province of the
-[`vm` RuntimeClass](vm-runtimeclass.md), which does not run a Pod yet.
+see [what-runs.md](what-runs.md). `linux/arm64` payloads are the province of the
+[`vm` RuntimeClass](vm-runtimeclass.md), an EXPERIMENTAL preview-quality path — see
+[limitations.md](limitations.md).
 
 ## Building an image: `k3sm build`
 
@@ -168,7 +169,7 @@ from any registry: digests verified, `imagePullSecrets` honoured, multi-arch man
 
 - **A full build engine** — `k3sm build` with `RUN` support, via a managed BuildKit builder inside
   a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed. It
-  waits on the `vm` path, which does not run a Pod yet.
+  waits on the `vm` path's own release and lab validation — see [limitations.md](limitations.md).
 
 Registry pull is **not** on this list: it ships. An `image: ghcr.io/org/app:tag` Pod is pulled,
 digest-verified and run with kubelet-faithful semantics — pull policy, pull-failure backoff and

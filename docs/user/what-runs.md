@@ -47,8 +47,9 @@ handed the wrong architecture, is to pull the image, start the container, and le
 with a format error that names nothing. Failing at pull tells you what is wrong while you can still
 act on it.
 
-Linux payloads are the job of the [`vm` RuntimeClass](vm-runtimeclass.md), which runs a micro-VM per
-Pod. **It does not run a Pod yet** — read that page before planning around it.
+`linux/arm64` payloads are the job of the [`vm` RuntimeClass](vm-runtimeclass.md), which runs a
+micro-VM per Pod. **It is EXPERIMENTAL and preview-quality** — read that page and
+[limitations.md](limitations.md) before planning around it.
 
 ## From a Dockerfile to a running Pod
 
