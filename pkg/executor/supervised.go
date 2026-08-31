@@ -266,7 +266,7 @@ func (s *Supervised) provisionComponentCerts() error {
 	// kubeconfig's single-node insecure-skip posture) while still presenting their
 	// client-cert identity. The identity — not the loopback server-auth — is the
 	// load-bearing change.
-	verifyClusterCA := s.cfg.ServingCertFile != "" && s.cfg.ServingKeyFile != ""
+	verifyClusterCA := s.cfg.meshServingCert()
 	if err := writeComponentKubeconfig(schedulerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, schedulerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
@@ -554,7 +554,7 @@ func apiServerArgs(cfg Config) []string {
 	if cfg.AnonymousAuth != nil {
 		args = append(args, fmt.Sprintf("--anonymous-auth=%t", *cfg.AnonymousAuth))
 	}
-	if cfg.ServingCertFile != "" && cfg.ServingKeyFile != "" {
+	if cfg.meshServingCert() {
 		args = append(args, "--tls-cert-file", cfg.ServingCertFile, "--tls-private-key-file", cfg.ServingKeyFile)
 	}
 	return args
@@ -620,8 +620,13 @@ func (s *Supervised) startControllerManager(ctx context.Context) (*component, er
 // service account (system:controller:<name>, bound by the apiserver's bootstrap RBAC) —
 // without it the deployment/endpointslice/etc. controllers would be RBAC-denied. The
 // KCM signs those SA tokens locally with --service-account-private-key-file (no
-// TokenRequest round-trip), so --service-account-private-key-file + --root-ca-file stay
-// as-is. Pure so the M6.0 leader-election posture is table-tested alongside the scoped
+// TokenRequest round-trip), so --service-account-private-key-file stays as-is.
+// --root-ca-file is POSTURE-DERIVED (Config.rootCAFile) rather than pinned at the
+// self-signed --cert-dir file: it is the CA republished to every Pod as
+// kube-root-ca.crt, so it must anchor whatever serving cert the apiserver presents,
+// which on the mesh path is a cluster-CA-issued leaf. It derives off the same
+// predicate as --tls-cert-file so the two cannot disagree.
+// Pure so the M6.0 leader-election posture is table-tested alongside the scoped
 // --controllers set: --leader-elect is false single-node and true in HA so only ONE
 // server's KCM is active (two active KCMs double-reconcile every object).
 func controllerManagerArgs(cfg Config) []string {
@@ -634,7 +639,7 @@ func controllerManagerArgs(cfg Config) []string {
 		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
 		"--use-service-account-credentials=true",
 		"--service-account-private-key-file", saKeyPath(wd),
-		"--root-ca-file", filepath.Join(certDir(wd), "apiserver.crt"),
+		"--root-ca-file", cfg.rootCAFile(),
 		"--controllers", controllersFlag(),
 	}
 	return append(args, LoopbackServingArgs(cfg.controllerManagerPort())...)
