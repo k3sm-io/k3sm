@@ -152,7 +152,7 @@ does **not** revert them; you have to.
    kubectl delete validatingadmissionpolicy        k3sm-reject-loadbalancer-reserved-port
    ```
 
-   Leaving them in place is also a valid choice — the policy is honest about a real collision on the old
+   Leaving them in place is also a valid choice — the policy reflects a real collision on the old
    binary too.
 
 ## Next

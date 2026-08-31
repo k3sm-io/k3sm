@@ -18,7 +18,9 @@ package provider
 
 import (
 	"fmt"
+	"log/slog"
 	"math"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +34,8 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/runtimed/pkg/image"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -124,7 +128,13 @@ const defaultGraceSeconds int64 = 30
 // nameservers), an explicit ndots: 0 (the int32 path cannot tell it from unset),
 // spec.dnsConfig.nameservers under ClusterFirst (the single-server shim ABI), and
 // non-ndots options.
-func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.DNSConfig) (*runtimev1.PodBox, error) {
+//
+// nodeIP is the node's own address; it is the discriminator for the bind-discipline
+// env — a pod with a DISTINCT /32 (podIP != nodeIP) gets K3SM_POD_IP injected so the
+// DYLD bind() interpose rewrites its wildcard binds onto that /32 (B217), while a
+// hostNetwork/vm/no-network pod (which resolves podIP to nodeIP) gets nothing. log,
+// when non-nil, receives the M0 host-binary-route warn — see injectBindDisciplineEnv.
+func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCfg netv1.DNSConfig, log *slog.Logger) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
 		Namespace:   pod.Namespace,
@@ -177,6 +187,13 @@ func toPodBox(pod *corev1.Pod, podIP, rootfsRoot, dyldShim string, dnsCfg netv1.
 	// shim annotation only loads the shim; without these env in-pod cluster Service
 	// names do not resolve (the shim defers to the host resolver).
 	injectClusterDNSEnv(box, pod.Spec.DNSPolicy, dnsCfg)
+
+	// Inject the K3SM_POD_IP env the DYLD bind() interpose reads to rewrite the pod's
+	// wildcard binds onto its own /32 (B217) — appended AFTER the user env (infra-wins),
+	// gated on the pod having a DISTINCT /32 (podIP != nodeIP). hostNetwork/vm/no-network
+	// pods resolve podIP to nodeIP and get nothing; the shipped hostNetwork semantic
+	// (share the node's addresses) must not be narrowed by rewriting its binds.
+	injectBindDisciplineEnv(box, podIP, nodeIP, log)
 
 	box.Volumes = toVolumes(pod.Spec.Volumes)
 	box.PodSecurityContext = toPodSecurityContext(pod.Spec.SecurityContext)
@@ -321,6 +338,90 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 	for _, c := range box.GetContainers() {
 		appendEnv(c)
 	}
+}
+
+// injectBindDisciplineEnv appends the K3SM_POD_IP environment the DYLD bind() interpose
+// (shim/getaddrinfo_shim.c) reads to rewrite a pod's wildcard binds onto its own /32,
+// giving same-node pods separate per-IP port spaces (two pods can both hold :8080 —
+// ≥1024 TCP+UDP, the B215-measured carve). It is the B217 keystone: the DYLD shim
+// annotation only LOADS the dylib; without this env the interpose passes every bind
+// through unchanged and the same-node EADDRINUSE collision class stands.
+//
+// Gated on the pod having a DISTINCT /32 — podIP != nodeIP. A hostNetwork pod
+// (MarkHostNetwork → podIP == nodeIP, zero allocation), a vm pod, and the --network
+// none posture all resolve podIP to the node IP and get NOTHING: the shipped hostNetwork
+// semantic (a pod shares the node's addresses) must not be narrowed by rewriting its
+// wildcard binds onto the node IP. The value serialization and the IPv4/unspecified
+// rejection are podnet.BindDisciplineEnv's (the single pinned encoder of the shim ABI —
+// never hand-rolled here); a nil return injects nothing (fail-safe passthrough). An
+// unparseable podIP is likewise a no-op — the discipline stays off rather than mis-binds.
+//
+// Precedence (infra-wins) mirrors injectClusterDNSEnv: appended AFTER each container's
+// user env to BOTH init and regular containers, so a workload that set its own
+// K3SM_POD_IP cannot override the allocated /32.
+//
+// warn-log: on an M0 host-binary route (the native sentinel, or an absolute-path image
+// with no command/args) the pod binary is NEVER ad-hoc re-signed, so AMFI silently drops
+// the DYLD insert and the interpose never loads — the pod binds wildcard regardless of
+// this env. Naming the pod here is the only breadcrumb an operator debugging a
+// host-binary EADDRINUSE gets, since the insert drop is otherwise invisible.
+func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, log *slog.Logger) {
+	if podIP == "" || podIP == nodeIP {
+		return
+	}
+	addr, err := netip.ParseAddr(podIP)
+	if err != nil {
+		return
+	}
+	env := podnet.BindDisciplineEnv(addr)
+	if env == nil {
+		return
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	appendEnv := func(c *runtimev1.Container) {
+		for _, k := range keys {
+			c.Env = append(c.Env, &runtimev1.EnvVar{Name: k, Value: env[k]})
+		}
+	}
+	for _, c := range box.GetInitContainers() {
+		appendEnv(c)
+	}
+	for _, c := range box.GetContainers() {
+		appendEnv(c)
+	}
+	if log == nil {
+		return
+	}
+	warn := func(c *runtimev1.Container) {
+		if !isHostBinaryRoute(c) {
+			return
+		}
+		log.Warn("bind-discipline env injected on an M0 host-binary route: the host binary is never ad-hoc re-signed, so AMFI drops the DYLD insert and the interpose never loads — this container binds wildcard, and its per-IP port space is NOT enforced (a same-node EADDRINUSE will name the wrong pod)",
+			"namespace", box.GetNamespace(), "pod", box.GetName(), "container", c.GetName(), "pod_ip", podIP)
+	}
+	for _, c := range box.GetInitContainers() {
+		warn(c)
+	}
+	for _, c := range box.GetContainers() {
+		warn(c)
+	}
+}
+
+// isHostBinaryRoute reports whether c runs on the M0 host-binary route runtimed's
+// resolveBinary takes without a pull — the native sentinel (runtimed.NativeImage), or
+// an absolute-path image reference with no command/args (image.IsHostPathReference).
+// Such a binary is executed in place and NEVER ad-hoc re-signed, so a DYLD insert on it
+// is silently dropped by AMFI. It mirrors runtimed/pkg/runtime.resolveBinary's
+// discriminator so the provider warns on exactly the routes the shim cannot reach.
+func isHostBinaryRoute(c *runtimev1.Container) bool {
+	if c.GetImage() == runtimed.NativeImage {
+		return true
+	}
+	return len(c.GetCommand()) == 0 && len(c.GetArgs()) == 0 && image.IsHostPathReference(c.GetImage())
 }
 
 // clusterDNSPolicy reports whether the pod's DNSPolicy selects cluster DNS. An empty

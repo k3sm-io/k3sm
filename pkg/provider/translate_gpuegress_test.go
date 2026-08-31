@@ -229,7 +229,7 @@ func TestTranslateGPURequestAndEgressAnnotation(t *testing.T) {
 				Containers: []corev1.Container{{Name: "c0", Image: "registry/web:latest"}},
 			},
 		}
-		box, err := toPodBox(pod, "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{})
+		box, err := toPodBox(pod, "10.42.0.5", "10.42.0.5", "/var/lib/k3sm/pods/uid-web", "", netv1.DNSConfig{}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
@@ -259,7 +259,7 @@ func TestTranslateGPURequestAndEgressAnnotation(t *testing.T) {
 				}},
 			},
 		}
-		box, err := toPodBox(pod, "10.42.0.6", "/var/lib/k3sm/pods/uid-mlx", "", netv1.DNSConfig{})
+		box, err := toPodBox(pod, "10.42.0.6", "10.42.0.6", "/var/lib/k3sm/pods/uid-mlx", "", netv1.DNSConfig{}, nil)
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
