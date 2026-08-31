@@ -148,8 +148,11 @@ The node advertises a capability label only when its start-time probe said yes.
    capability key is rejected with a `422`. See
    [vm-runtimeclass.md](vm-runtimeclass.md#node-capability-labels).
 6. **Scheduled, but `ImagePullBackOff` with a platform error?** The two Rosetta labels are **advertised
-   but not yet honored** — k3sm does not select amd64 image variants yet, so an amd64-only image is
-   refused at pull. That is a documented gap, not a broken node; see
+   but not yet honored**. Multi-arch selection itself works — k3sm reads the manifest list and picks a
+   platform — but `linux/amd64` is deliberately not among the platforms it will accept, because
+   translating an amd64 payload happens inside a guest and that guest path does not run yet. So an
+   amd64-only image is refused at pull rather than started and left to crash. That is a documented
+   gap, not a broken node; see
    [vm-runtimeclass.md](vm-runtimeclass.md#the-two-rosetta-labels-are-advertised-not-yet-honored).
 
 ## Multi-node join fails

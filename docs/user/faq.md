@@ -44,8 +44,9 @@ Only cluster DNS on `:53`. General UDP Services (ClusterIP and NodePort) are def
 
 ## Are pods isolated from each other?
 
-Not by uid — same-node Pods share one `_k3sm` trust domain. Use the [`vm` RuntimeClass](vm-runtimeclass.md)
-for untrusted workloads.
+Not by uid — same-node Pods share one `_k3sm` trust domain. The [`vm` RuntimeClass](vm-runtimeclass.md)
+is the intended boundary for untrusted workloads, and it does not run yet — so today, treat one node as
+one trust domain.
 
 ## Is multi-node / HA production-ready?
 
