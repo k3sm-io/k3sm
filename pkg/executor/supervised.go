@@ -149,7 +149,7 @@ func (s *Supervised) Kubeconfig() string { return kubeconfigPath(s.cfg.WorkDir) 
 
 // RESTConfigToken returns the apiserver URL and static token.
 func (s *Supervised) RESTConfigToken() (string, string) {
-	return apiServerURL(s.cfg.APIServerPort), s.token
+	return apiServerURL(s.cfg), s.token
 }
 
 // Start provisions the workdir (binaries, kine, SA keys, token, kubeconfig),
@@ -228,7 +228,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := writeTokenFile(s.cfg.WorkDir, s.token); err != nil {
 		return err
 	}
-	if err := writeKubeconfig(s.cfg.WorkDir, s.cfg.APIServerPort, s.token); err != nil {
+	if err := writeKubeconfig(s.cfg, s.token); err != nil {
 		return err
 	}
 	// M10.0 (Res.3): the audit policy + admission-control config the apiserver argv
@@ -266,11 +266,11 @@ func (s *Supervised) provisionComponentCerts() error {
 	// kubeconfig's single-node insecure-skip posture) while still presenting their
 	// client-cert identity. The identity — not the loopback server-auth — is the
 	// load-bearing change.
-	verifyClusterCA := s.cfg.ServingCertFile != "" && s.cfg.ServingKeyFile != ""
-	if err := writeComponentKubeconfig(schedulerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, schedulerCN, h, verifyClusterCA); err != nil {
+	verifyClusterCA := s.cfg.meshServingCert()
+	if err := writeComponentKubeconfig(s.cfg, schedulerKubeconfigPath(s.cfg.WorkDir), schedulerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
-	if err := writeComponentKubeconfig(controllerManagerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, controllerManagerCN, h, verifyClusterCA); err != nil {
+	if err := writeComponentKubeconfig(s.cfg, controllerManagerKubeconfigPath(s.cfg.WorkDir), controllerManagerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
 	// B176: the client identity the apiserver PRESENTS to a node's kubelet endpoint.
@@ -463,13 +463,9 @@ func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 // NodeIP (loopback) and the kubelet-CA / anonymous-auth flags are omitted.
 func apiServerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
-	bind := cfg.BindAddress
-	if bind == "" {
-		bind = cfg.NodeIP
-	}
-	if bind == "" {
-		bind = "127.0.0.1"
-	}
+	// ONE derivation, shared with apiServerURL: what the apiserver binds is what the
+	// probe and the in-process kubeconfigs dial (see apiServerHost).
+	bind := apiServerHost(cfg)
 	authzMode := cfg.AuthorizationMode
 	if authzMode == "" {
 		authzMode = DefaultAuthorizationMode
@@ -573,7 +569,7 @@ func apiServerArgs(cfg Config) []string {
 	if cfg.AnonymousAuth != nil {
 		args = append(args, fmt.Sprintf("--anonymous-auth=%t", *cfg.AnonymousAuth))
 	}
-	if cfg.ServingCertFile != "" && cfg.ServingKeyFile != "" {
+	if cfg.meshServingCert() {
 		args = append(args, "--tls-cert-file", cfg.ServingCertFile, "--tls-private-key-file", cfg.ServingKeyFile)
 	}
 	return args
@@ -639,8 +635,13 @@ func (s *Supervised) startControllerManager(ctx context.Context) (*component, er
 // service account (system:controller:<name>, bound by the apiserver's bootstrap RBAC) —
 // without it the deployment/endpointslice/etc. controllers would be RBAC-denied. The
 // KCM signs those SA tokens locally with --service-account-private-key-file (no
-// TokenRequest round-trip), so --service-account-private-key-file + --root-ca-file stay
-// as-is. Pure so the M6.0 leader-election posture is table-tested alongside the scoped
+// TokenRequest round-trip), so --service-account-private-key-file stays as-is.
+// --root-ca-file is POSTURE-DERIVED (Config.rootCAFile) rather than pinned at the
+// self-signed --cert-dir file: it is the CA republished to every Pod as
+// kube-root-ca.crt, so it must anchor whatever serving cert the apiserver presents,
+// which on the mesh path is a cluster-CA-issued leaf. It derives off the same
+// predicate as --tls-cert-file so the two cannot disagree.
+// Pure so the M6.0 leader-election posture is table-tested alongside the scoped
 // --controllers set: --leader-elect is false single-node and true in HA so only ONE
 // server's KCM is active (two active KCMs double-reconcile every object).
 func controllerManagerArgs(cfg Config) []string {
@@ -653,7 +654,7 @@ func controllerManagerArgs(cfg Config) []string {
 		"--leader-elect=" + strconv.FormatBool(cfg.leaderElect()),
 		"--use-service-account-credentials=true",
 		"--service-account-private-key-file", saKeyPath(wd),
-		"--root-ca-file", filepath.Join(certDir(wd), "apiserver.crt"),
+		"--root-ca-file", cfg.rootCAFile(),
 		"--controllers", controllersFlag(),
 	}
 	return append(args, LoopbackServingArgs(cfg.controllerManagerPort())...)
@@ -799,9 +800,12 @@ func LogTail(path string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// Ready reports whether the apiserver /healthz returns "ok".
+// Ready reports whether the apiserver /healthz returns "ok". It probes the
+// apiserver's EFFECTIVE BIND (apiServerURL), not loopback: a mesh server binds its
+// wireguard IP only, so a hardcoded loopback probe would never observe it healthy and
+// bring-up would wedge until the healthTimeout.
 func (s *Supervised) Ready(ctx context.Context) bool {
-	url := apiServerURL(s.cfg.APIServerPort) + "/healthz"
+	url := apiServerURL(s.cfg) + "/healthz"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false

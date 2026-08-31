@@ -191,8 +191,9 @@ type bootstrapServerDeps struct {
 // endpoint) on meshIP:bootstrapPort over a TLS listener presenting [serving-leaf,
 // cluster-CA] so a joining node's CA-hash pin verifies. It blocks until ctx is
 // cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
-// exercise is the two-Mac K3SM_LAB gate (the MeshPeer CRD must be installed for the
-// enroller's write to land).
+// exercise is the two-Mac K3SM_LAB gate. The MeshPeer CRD the enroller's write lands
+// in is ensured fail-closed by runServer's step 4a before this listener exists, so a
+// join reaching it never meets a missing CRD (B224).
 func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *slog.Logger) error {
 	h := deps.hierarchy
 	meshIP := deps.meshIP

@@ -1277,6 +1277,29 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	labels["k3sm.io/native"] = "true"
 	labels["type"] = "k3sm"
 
+	// Remove kubernetes.io/role, which is NOT ours: the vendored virtual-kubelet
+	// library hard-codes role=agent into the default Node object it builds
+	// (v1.12.0 node/nodeutil/controller.go:296-302), and this function runs AFTER
+	// that defaulting (pkg/provider/vkadapter/vkadapter.go:169-171), so the key is
+	// already present on n before the first line above.
+	//
+	// It has to go because a JOINED WORKER registers as system:node:<name>, and the
+	// NodeRestriction admission plugin lets that identity set only kubelet-settable
+	// labels — the kubelet.kubernetes.io/ and node.kubernetes.io/ namespaces plus a
+	// fixed list (hostname, os, arch, the topology and instance-type keys); every
+	// other kubernetes.io/k8s.io-namespaced key is forbidden on create AND on update
+	// (k8s v1.36.2 plugin/pkg/admission/noderestriction/admission.go:519-524,
+	// 556-560, 601-620, over k8s.io/kubelet/pkg/apis/well_known_labels.go). role is
+	// not on that list, so leaving it here makes the apiserver reject the worker's
+	// Node create outright — and, since the label set rides every status patch, its
+	// heartbeat too. The in-process server node never noticed: it acts as
+	// system:masters, which NodeRestriction does not apply to.
+	//
+	// Deleting is the whole fix; granting the node authority to set the label would
+	// be a privilege widening (a node that can label itself can steer privileged
+	// workloads to itself, which is exactly what the plugin exists to prevent).
+	delete(labels, "kubernetes.io/role")
+
 	// Well-known topology labels, GA keys only (the v1.36.2 scheduler reads these; the
 	// deprecated failure-domain.beta.kubernetes.io aliases are cruft). zone is set to THIS
 	// node's name — == kubernetes.io/hostname by construction (same `name`): a DELIBERATE

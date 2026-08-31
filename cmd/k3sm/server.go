@@ -35,11 +35,13 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
+	crdconfig "k3sm.io/apis/config/crd"
 	"k3sm.io/darwin-net/pkg/dns"
 
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/crdensure"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ingresshost"
@@ -336,6 +338,16 @@ func runServer(args []string) error {
 		cfg.AnonymousAuth = &anonFalse
 		cfg.ServingCertFile = servingCert
 		cfg.ServingKeyFile = servingKey
+		// The CA that ISSUED that serving leaf is what the controller-manager must
+		// republish as every namespace's kube-root-ca.crt — the anchor every Pod uses to
+		// verify the apiserver. Set here, beside the serving cert, because the two are one
+		// posture: the executor derives --root-ca-file off the same predicate as
+		// --tls-cert-file, so they cannot name CAs from different modes. Without it the
+		// KCM would be pointed at the apiserver's SELF-SIGNED --cert-dir file, which on a
+		// mesh boot the apiserver never writes (bring-up dies on "error parsing
+		// root-ca-file"), and which on a work dir that once booted single-node is a stale
+		// CA that anchors nothing — in-pod API TLS then fails cluster-wide.
+		cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
 		logger.Info("multi-node mode: apiserver + join supervisor bound to the mesh interface", "mesh-ip", opts.meshIP)
 	}
 	exec := executor.NewSupervised(cfg)
@@ -456,10 +468,34 @@ func runServer(args []string) error {
 		}
 	}()
 
+	// 4a. B224 — the MeshPeer CRD, on the MESH path only, BEFORE anything that can
+	// write a MeshPeer exists. Nothing used to apply it: the manifest shipped in
+	// k3sm.io/apis and every worker join 500'd at the enroller's write until a human
+	// installed the CRD by hand.
+	//
+	// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
+	// the join listener startBootstrapServer opens, because the first worker to reach
+	// that listener writes a MeshPeer — a CRD ensured afterwards would still lose
+	// whichever join won the race.
+	//
+	// FAIL-CLOSED, like the RBAC graph at step 3b and unlike the log-and-continue
+	// admission policies at step 3: a missing MeshPeer CRD is not a missing advisory,
+	// it is a control plane that accepts worker joins and then fails every one of
+	// them. Halting with the reason beats serving a supervisor that cannot enroll.
+	//
+	// Single-node (--mesh-ip empty) provisions NOTHING — no MeshPeer is ever written
+	// there — and ensureMeshPeerCRD returns before it builds any client, so this call
+	// adds no failure mode to the single-node bring-up path.
+	if err := ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
+		return apiextensionsclient.NewForConfig(restCfg)
+	}, logger); err != nil {
+		return err
+	}
+
 	// 4b. M3.0/M6.1 — the worker-join supervisor (mesh-bound; mints node certs + enrolls
 	// peers), plus the M6.1 CA-bundle endpoint in the HA posture. Only when multi-node is
-	// enabled; the live two-Mac join is the K3SM_LAB gate (the MeshPeer CRD must be
-	// installed for the enroller's write to land).
+	// enabled; the live two-Mac join is the K3SM_LAB gate (step 4a has already ensured
+	// the MeshPeer CRD the enroller's write lands in).
 	if opts.meshIP != "" && hierarchy != nil {
 		tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
 		enroller, err := newMeshEnroller(restCfg, logger)
@@ -674,6 +710,40 @@ func runServer(args []string) error {
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
 	return startNode(ctx, nodeOpts)
+}
+
+// crdClientFactory builds the apiextensions client a CRD ensure applies through.
+//
+// It is a FACTORY rather than a client so that a bring-up which provisions no CRD
+// constructs none: `k3sm server` without --mesh-ip has no MeshPeer consumer, and a
+// client built unconditionally would add a new way for the single-node path to fail
+// at a step it never needed.
+type crdClientFactory func() (crdensure.CRDClient, error)
+
+// ensureMeshPeerCRD server-side-applies the MeshPeer CustomResourceDefinition and
+// blocks until the API server reports it Established, on the MESH path only.
+//
+// meshIP empty is the single-node posture: it returns nil having called newClient
+// zero times. That gate lives HERE, not at the call site, so "which bring-up
+// provisions the CRD" has one answer that a test can drive both sides of.
+//
+// The manifest is k3sm.io/apis' own bytes (crdconfig.MeshPeerCRD) applied through
+// pkg/crdensure — the same applier the MLX operator uses for MLXModel — so there is
+// no second apply path and no shadow copy of the schema. An error is returned, never
+// logged and swallowed: the caller fail-closes on it (see step 4a in runServer).
+func ensureMeshPeerCRD(ctx context.Context, meshIP string, newClient crdClientFactory, logger *slog.Logger) error {
+	if meshIP == "" {
+		return nil
+	}
+	c, err := newClient()
+	if err != nil {
+		return fmt.Errorf("build apiextensions client for the %s crd: %w", crdconfig.MeshPeerCRDName, err)
+	}
+	if _, err := crdensure.Ensure(ctx, c, crdconfig.MeshPeerCRD(), crdensure.Options{Log: logger}); err != nil {
+		return fmt.Errorf("ensure the %s crd (worker joins cannot enroll without it): %w", crdconfig.MeshPeerCRDName, err)
+	}
+	logger.Info("ensured the MeshPeer CRD; worker enroll writes can now land", "crd", crdconfig.MeshPeerCRDName)
+	return nil
 }
 
 // writeAPIServerServingCert issues the apiserver's serving cert from the cluster CA
