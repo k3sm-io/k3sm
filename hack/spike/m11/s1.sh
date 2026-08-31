@@ -60,14 +60,40 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 )
 
+// tokenFromCmdline reads s1_token= off /proc/cmdline. It CANNOT come from the
+// environment: this process is PID 1 inside the guest, and the host's env does
+// not cross the VM boundary. The kernel command line is the only channel the
+// bootloader gives us.
+func tokenFromCmdline() string {
+	b, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return ""
+	}
+	for _, f := range strings.Fields(string(b)) {
+		if v, ok := strings.CutPrefix(f, "s1_token="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
 func main() {
+	// /proc is NOT mounted for us: the initramfs is just this binary, and nothing
+	// has run before PID 1. Both the token (criterion 2, off /proc/cmdline) and the
+	// uptime figure (criterion 3) read from it, so mount it FIRST -- without this
+	// every /proc read fails and the criteria report a boot problem that is really
+	// a missing mount.
+	_ = os.MkdirAll("/proc", 0o555)
+	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
+
 	// Criterion 2: the token proves userspace reached exec.
 	// Criterion 3: the monotonic stamp is the far end of kernel-start -> init-exec.
-	fmt.Printf("K3SM_S1_TOKEN=%s\n", os.Getenv("S1_TOKEN"))
+	fmt.Printf("K3SM_S1_TOKEN=%s\n", tokenFromCmdline())
 	fmt.Printf("K3SM_S1_INIT_EXEC_NS=%d\n", time.Now().UnixNano())
 	if b, err := os.ReadFile("/proc/uptime"); err == nil {
 		fmt.Printf("K3SM_S1_UPTIME=%s", string(b))
@@ -135,7 +161,7 @@ func main() {
 
 	t0 := time.Now()
 	bl, err := vz.NewLinuxBootLoader(kernel,
-		vz.WithCommandLine("console=hvc0 quiet"),
+		vz.WithCommandLine("console=hvc0 quiet s1_token="+token),
 		vz.WithInitrd(initrd))
 	if err != nil {
 		die("bootloader", err)
