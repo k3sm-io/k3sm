@@ -118,9 +118,11 @@ Seatbelt-confined. The consequences, stated plainly:
 - A Pod requesting a **foreign `runAsUser` / `runAsGroup` / `fsGroup` / `supplementalGroups`** is
   **rejected at admission**, never silently coerced. k3sm does not pretend to honor an isolation it
   cannot provide.
-- **Untrusted or multi-tenant workloads belong on the [`vm` RuntimeClass](user/vm-runtimeclass.md)**,
+- **Untrusted or multi-tenant workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md)**,
   which is backed by Virtualization.framework — an *entitlement*, not root — and is a real isolation
-  boundary. This is consistent with the long-standing design position that same-node Pods are one
+  boundary. **It does not run a Pod yet**, so this is where such workloads belong by design, not a
+  mitigation available today; until it lands, a node is one trust domain with no in-product
+  alternative. This is consistent with the long-standing design position that same-node Pods are one
   trust domain ([DESIGN.md](DESIGN.md) §3).
 - If the runtime's Seatbelt capability probe ever fails, the runtime degrades to **`vm` or
   refuse-to-run** — never to "run the Pod unconfined."
@@ -155,7 +157,7 @@ Seatbelt-confined. The consequences, stated plainly:
   the entitlement that would avoid them is Apple-restricted. The one-time admin step is unavoidable;
   even Docker needs it.
 - **Per-Pod uid isolation without a VM.** The helper is networking-only by decision; untrusted
-  workloads go to the [`vm` RuntimeClass](user/vm-runtimeclass.md).
+  workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md), which does not run yet.
 - **Rootless multi-node without the helper.** The mesh — `utun` and routes — is irreducibly root.
 
 ## Related
@@ -164,4 +166,5 @@ Seatbelt-confined. The consequences, stated plainly:
   §6 (the one-binary doctrine).
 - [user/install.md](user/install.md) — the install channels and what each lays down.
 - [user/limitations.md](user/limitations.md) — the no-per-Pod-uid-isolation gap in context.
-- [user/vm-runtimeclass.md](user/vm-runtimeclass.md) — the isolation boundary for untrusted workloads.
+- [user/vm-runtimeclass.md](user/vm-runtimeclass.md) — the intended isolation boundary for untrusted
+  workloads (not running yet).

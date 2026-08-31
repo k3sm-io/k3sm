@@ -22,7 +22,8 @@ directory is the front door to the user-facing docs; read them roughly in the jo
     the automatic pre-migration copy, and the restore drill.
 11. [Multi-node](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
 12. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
-13. [The `vm` RuntimeClass](vm-runtimeclass.md) — isolation for untrusted workloads, EXPERIMENTAL.
+13. [The `vm` RuntimeClass](vm-runtimeclass.md) — the intended isolation boundary for untrusted
+    workloads. EXPERIMENTAL, and it does not run a Pod yet.
 14. [MLX quickstart](mlx-quickstart.md) — serving a model on the Mac's GPU through an OpenAI-compatible endpoint.
 15. [Limitations](limitations.md) — **the real gaps** — read this before you rely on k3sm.
 16. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.

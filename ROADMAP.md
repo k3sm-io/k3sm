@@ -38,9 +38,12 @@ two-Mac gates are burned down in M7. What works:
 - **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
   (workloads must select `kubernetes.io/os=darwin`). *(code-complete; the live RBAC flip is a
   dev-mac gate)*
-- **`vm` RuntimeClass (EXPERIMENTAL).** A fail-closed dispatch to a Virtualization.framework Linux
-  micro-VM for Linux-only images (e.g. Postgres). *(foundation code-complete; the live VM boot needs
-  a VZ Mac + entitlement — ships EXPERIMENTAL)*
+- **`vm` RuntimeClass — dispatch only, and it does not run a Pod yet.** A fail-closed dispatch to a
+  Virtualization.framework Linux micro-VM for Linux-only images (e.g. Postgres). What is shipped is
+  the *dispatch*: the RuntimeClass, the fail-closed backend selection, the capability labels, and
+  the scheduler overhead accounting. **No Pod has ever booted in a micro-VM.** The helper that would
+  build and boot the guest is not written yet, so this is engineering still to do, not a machine
+  waiting to be found. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64` only — see Next.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(code-complete; the live 2-Mac+Postgres failover is a lab gate)*
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
@@ -102,8 +105,9 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   by managing a BuildKit builder inside a `vm`-RuntimeClass micro-VM (linux/arm64 natively,
   linux/amd64 via Rosetta) behind a bundled buildx front-end — install only k3sm, build and run
   containers with no Docker Desktop. Lands **shortly after v0.1** (the builder needs the vm path
-  live plus the signed vmhost and kernel artifacts that ship with it, then its own lab
-  validation). Kubelet-faithful registry semantics on the native path (imagePullPolicy,
+  live, plus the guest kernel artifacts that ship with it, then its own lab validation; Developer-ID
+  signing is deliberately not on that path — the virtualization entitlement rides a plain ad-hoc
+  signature). Kubelet-faithful registry semantics on the native path (imagePullPolicy,
   pull-failure backoff, multi-arch selection, offline warm-cache starts) land alongside.
 - **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
@@ -114,8 +118,10 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
 ### Non-goals (deliberate)
 
-- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images route to the
-  EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack), never the default path.
+- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images are destined
+  for the EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack) once it runs, never the default
+  path.
 - **A single node is one trust domain.** Same-node pods share `lo0` and a uid — Seatbelt bounds
   filesystem/network *reach*, but there are no per-pod network namespaces or uid isolation.
-  Untrusted multi-tenancy is out of scope for the native path; use the `vm` RuntimeClass.
+  Untrusted multi-tenancy is out of scope for the native path; the `vm` RuntimeClass is the
+  intended boundary, and it does not run yet.

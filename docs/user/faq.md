@@ -9,8 +9,9 @@ cgroups, CNI, and network namespaces — k3sm has none of them. See [limitations
 
 ## Does k3sm use Docker or a VM?
 
-No. By default Pods run as **native Darwin processes** — no Linux, no containers, no VM. A VM path exists
-only for the optional [`vm` RuntimeClass](vm-runtimeclass.md) used to isolate untrusted workloads.
+No. By default Pods run as **native Darwin processes** — no Linux, no containers, no VM. A VM path is
+being built for the optional [`vm` RuntimeClass](vm-runtimeclass.md), which is meant to isolate
+untrusted workloads and does not run a Pod yet.
 
 ## Can I run my existing Docker/OCI Linux images?
 
@@ -44,8 +45,9 @@ Only cluster DNS on `:53`. General UDP Services (ClusterIP and NodePort) are def
 
 ## Are pods isolated from each other?
 
-Not by uid — same-node Pods share one `_k3sm` trust domain. Use the [`vm` RuntimeClass](vm-runtimeclass.md)
-for untrusted workloads.
+Not by uid — same-node Pods share one `_k3sm` trust domain. The [`vm` RuntimeClass](vm-runtimeclass.md)
+is the intended boundary for untrusted workloads, and it does not run yet — so today, treat one node as
+one trust domain.
 
 ## Is multi-node / HA production-ready?
 
