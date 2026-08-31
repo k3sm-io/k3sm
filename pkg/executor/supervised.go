@@ -149,7 +149,7 @@ func (s *Supervised) Kubeconfig() string { return kubeconfigPath(s.cfg.WorkDir) 
 
 // RESTConfigToken returns the apiserver URL and static token.
 func (s *Supervised) RESTConfigToken() (string, string) {
-	return apiServerURL(s.cfg.APIServerPort), s.token
+	return apiServerURL(s.cfg), s.token
 }
 
 // Start provisions the workdir (binaries, kine, SA keys, token, kubeconfig),
@@ -228,7 +228,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := writeTokenFile(s.cfg.WorkDir, s.token); err != nil {
 		return err
 	}
-	if err := writeKubeconfig(s.cfg.WorkDir, s.cfg.APIServerPort, s.token); err != nil {
+	if err := writeKubeconfig(s.cfg, s.token); err != nil {
 		return err
 	}
 	// M10.0 (Res.3): the audit policy + admission-control config the apiserver argv
@@ -267,10 +267,10 @@ func (s *Supervised) provisionComponentCerts() error {
 	// client-cert identity. The identity — not the loopback server-auth — is the
 	// load-bearing change.
 	verifyClusterCA := s.cfg.ServingCertFile != "" && s.cfg.ServingKeyFile != ""
-	if err := writeComponentKubeconfig(schedulerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, schedulerCN, h, verifyClusterCA); err != nil {
+	if err := writeComponentKubeconfig(s.cfg, schedulerKubeconfigPath(s.cfg.WorkDir), schedulerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
-	if err := writeComponentKubeconfig(controllerManagerKubeconfigPath(s.cfg.WorkDir), s.cfg.APIServerPort, controllerManagerCN, h, verifyClusterCA); err != nil {
+	if err := writeComponentKubeconfig(s.cfg, controllerManagerKubeconfigPath(s.cfg.WorkDir), controllerManagerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
 	return nil
@@ -455,13 +455,9 @@ func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 // NodeIP (loopback) and the kubelet-CA / anonymous-auth flags are omitted.
 func apiServerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
-	bind := cfg.BindAddress
-	if bind == "" {
-		bind = cfg.NodeIP
-	}
-	if bind == "" {
-		bind = "127.0.0.1"
-	}
+	// ONE derivation, shared with apiServerURL: what the apiserver binds is what the
+	// probe and the in-process kubeconfigs dial (see apiServerHost).
+	bind := apiServerHost(cfg)
 	authzMode := cfg.AuthorizationMode
 	if authzMode == "" {
 		authzMode = DefaultAuthorizationMode
@@ -780,9 +776,12 @@ func LogTail(path string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// Ready reports whether the apiserver /healthz returns "ok".
+// Ready reports whether the apiserver /healthz returns "ok". It probes the
+// apiserver's EFFECTIVE BIND (apiServerURL), not loopback: a mesh server binds its
+// wireguard IP only, so a hardcoded loopback probe would never observe it healthy and
+// bring-up would wedge until the healthTimeout.
 func (s *Supervised) Ready(ctx context.Context) bool {
-	url := apiServerURL(s.cfg.APIServerPort) + "/healthz"
+	url := apiServerURL(s.cfg) + "/healthz"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
