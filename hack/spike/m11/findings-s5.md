@@ -1,16 +1,18 @@
 # S5 findings — guest networking
 
-> Status: criteria **1a, 1b, 2, 4, 5, 6, 7 RECORDED** from the 2026-08-31
-> sitting, run by `s5-run.sh` on the same rig as S1 (two runs; the first lacked
-> the criterion-4 liveness controls, so the second is the run of record).
-> Criterion **3** and the **lo0-alias VIP legs of criterion 1** are NOT RUN —
-> they need root, and the root-needing work is named as a human slice at the
-> bottom of this file rather than approximated.
+> Status: **ALL SEVEN criteria RECORDED.** Criteria **1a, 1b, 2, 4, 5, 6, 7**
+> come from the 2026-08-31 no-root sitting, run by `s5-run.sh` on the same rig
+> as S1 (two runs; the first lacked the criterion-4 liveness controls, so the
+> second is the run of record). Criterion **1's real lo0-alias VIP legs
+> (arrangements a–d)** and criterion **3** (PodIP-as-guest-eth0-alias + a host
+> route) come from a SEPARATE 2026-08-31 root sitting, run by `s5-root.sh` on
+> the same rig — the root-needing human slice this file previously carried at
+> the bottom as NOT RUN.
 >
 > This file is a DECISION TABLE, not a report. Every row carries the observed
 > value AND the pre-named consequence that value selects (the branch wording is
-> `s5.sh`'s). Every `S5_*=` line quoted below appears verbatim in the run's
-> captured console under the lab prefix's `out/` directory.
+> `s5.sh`'s). Every `S5_*=`/`S5ROOT_*=` line quoted below appears verbatim in
+> the corresponding run's captured console.
 
 ## Rig and guest
 
@@ -34,10 +36,14 @@
 | **2** | guest vmnet address host-dialable | **yes** — `192.168.64.5:34811` dialed and delivered from the host | the one path carrying readiness probes, port-forward and the Service-proxy backend dial exists; no netd verb needed for host→guest |
 | **1a** | guest → host listener, no route added | **wildcard-bound: connected. Gateway-address-bound: connected. Loopback(127.0.0.1)-bound: refused** (TCP); UDP identical by host receipt | a guest reaches any host listener that binds the vmnet gateway address or the wildcard. It does **not** reach a loopback-only bind — which is exactly the shape a ClusterIP lo0 alias has, so this is the first evidence that the VIP leg is not free |
 | **1b** | guest-side route for a service-CIDR prefix | `ip route add 10.43.0.0/16 via 192.168.64.1` **accepted**; the dial to `10.43.0.10:34807` got **no answer after 6s** with **`tx_packets_delta=6`** | packets for a service-CIDR prefix **do leave the guest** and are handed to the host as the next hop. Whether the host then weak-host-delivers them to a lo0-alias VIP is UNANSWERED here (no VIP could be plumbed unprivileged) — see the human slice |
+| **1 (VIP-a)** | the real lo0-alias VIP, **no guest route, host forwarding OFF, no host route** — the baseline arrangement | **delivers, both TCP and UDP/53**, guest's own vmnet source observed at the VIP-bound listener | the baseline alone answers criterion 1 YES. See "Criterion 1 — the real lo0-alias VIP legs" below |
+| **1 (VIP-b)** | + guest-side route for the service CIDR via the NAT gateway | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
+| **1 (VIP-c)** | + host `net.inet.ip.forwarding=1` | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
+| **1 (VIP-d)** | + an explicit host route for the VIP on lo0 | **delivers, both TCP and UDP/53** | consistent with (a); adds nothing (a) did not already give |
 | **4** | guest ↔ guest | **NOT reachable, in either protocol** — ICMP 100% loss, TCP unreachable, ARP FAILED — while both guests were proven live to the host | the trust ceiling is **narrower than M11.3-d4 assumed**: on this rig two vm pods on the same NAT segment cannot address each other directly. See the caveat below before this is published |
 | **5** | lease stability under a deterministic MAC | **stable**: `192.168.64.5` on all 3 restarts of the same MAC; a control MAC got a different address (`192.168.64.6`) | the deterministic-MAC lease is semi-stable enough for B113b's address→pod registry, **provided** the lease-change liveness contract is still implemented — stability observed over 3 restarts is not a guarantee |
 | **7** | guest link MTU | **1500** | above the ≤1380 the mesh mss-clamp reasoning assumes. If cross-node vm traffic is ever claimed, the DHCP/init plan must set the guest MTU down — the link will not do it |
-| **3** | PodIP-as-guest-eth0-alias + host route | **NOT RUN** | needs a host route, which needs root. Human slice |
+| **3** | PodIP-as-guest-eth0-alias + a host route | **delivers** — host dials the PodIP and the guest receives the exact payload | the PodIP-as-alias model, if adopted, needs a narrow privileged **host-route** verb (the B232 shape) for THIS leg only — the VIP-delivery legs above need no privileged surface at all |
 
 ## Criterion 6 — the source address (THE deciding fact) · verbatim
 
@@ -108,13 +114,132 @@ immediate error with no transmit — would have meant the guest never emitted
 them. So the guest half of arrangement (b) works unprivileged and needs no
 new host surface; what is unresolved is only the host half.
 
-**Consequence, stated conservatively.** `s5.sh`'s branch "(b) alone suffices ⇒
-ZERO new privileged surface, the route set becomes data on
-`podnet.GuestNetwork`" is **not yet selected** — it cannot be, because the leg
-that would confirm it (a VIP on host lo0 receiving those packets) is the
-root-needing one. What IS established: the guest-side route is free, and the
-loopback-bind result above is a reason to expect the host half to need help.
-The netd-route-verb branch stays live until the human slice runs.
+**Consequence, as recorded here.** At the time this no-root sitting ran, `s5.sh`'s
+branch "(b) alone suffices ⇒ ZERO new privileged surface, the route set becomes
+data on `podnet.GuestNetwork`" could not yet be selected — the leg that would
+confirm it (a VIP on host lo0 receiving those packets) needed root. What was
+established here (the guest-side route is free, and the loopback-bind result
+above raised the expectation that the host half would need help) is now
+**superseded by the root sitting below**: even (b)'s guest route turns out to be
+unnecessary — see "Criterion 1 — the real lo0-alias VIP legs" next.
+
+## Criterion 1 — the real lo0-alias VIP legs (arrangements a–d) · verbatim
+
+Run by `s5-root.sh` in a separate, root-needing sitting on the same rig — the
+human slice this file previously carried as NOT RUN. lo0 carried the alias
+`10.43.0.10/32`; a listener bound the VIP itself (not the wildcard, so the
+question of what XNU does with the destination address is answered, not begged)
+for both TCP `34901` and UDP `53`; four arrangements varied the guest route,
+host `net.inet.ip.forwarding`, and an explicit host route for the VIP:
+
+```
+S5ROOT_FWD_PRIOR=1
+S5ROOT_UNPRIV_ALIAS_RECHECK=ifconfig: ioctl (SIOCAIFADDR): permission denied
+S5ROOT_LO0_ALIAS=	inet 10.43.0.10 netmask 0xffffffff
+```
+
+The unprivileged-alias recheck reconfirms the same negative `findings-s5.md`
+already recorded from the no-root sitting: an ordinary process cannot plumb the
+VIP itself, so the alias in this sitting was plumbed by `s5-root.sh` running as
+root, not by the guest or an unprivileged helper.
+
+```
+S5ROOT_a_FWD=0
+S5ROOT_a_HOSTROUTE=absent
+S5ROOT_GUEST_ADDR=192.168.64.9
+S5ROOT_a_ROUTEADD=not-added (baseline: default route only)
+S5ROOT_a_TCP=connected dst=10.43.0.10:34901 elapsed_s=0 tx_packets_delta=6
+S5ROOT_a_UDP=sent dst=10.43.0.10:53 err=  tx_packets_delta=1
+S5_HOST_VIPa_TCPBIND=ok addr=10.43.0.10:34901
+S5_HOST_VIPa_UDPBIND=ok addr=10.43.0.10:53
+S5_HOST_VIPa_TCP_FROM=192.168.64.9:35355 payload=vip-tcp-from-192.168.64.9-a
+S5_HOST_VIPa_UDP_FROM=192.168.64.9:49988 payload=vip-udp-from-192.168.64.9-a
+S5_HOST_VIPa_DONE=yes
+
+S5ROOT_b_FWD=0
+S5ROOT_b_HOSTROUTE=absent
+S5ROOT_GUEST_ADDR=192.168.64.10
+S5ROOT_b_ROUTEADD=ok cidr=10.43.0.0/16 via=192.168.64.1
+S5ROOT_b_TCP=connected dst=10.43.0.10:34901 elapsed_s=0 tx_packets_delta=6
+S5ROOT_b_UDP=sent dst=10.43.0.10:53 err=  tx_packets_delta=1
+S5_HOST_VIPb_TCP_FROM=192.168.64.10:37261 payload=vip-tcp-from-192.168.64.10-b
+S5_HOST_VIPb_UDP_FROM=192.168.64.10:34913 payload=vip-udp-from-192.168.64.10-b
+S5_HOST_VIPb_DONE=yes
+
+S5ROOT_c_FWD=1
+S5ROOT_c_HOSTROUTE=absent
+S5ROOT_GUEST_ADDR=192.168.64.11
+S5ROOT_c_ROUTEADD=ok cidr=10.43.0.0/16 via=192.168.64.1
+S5ROOT_c_TCP=connected dst=10.43.0.10:34901 elapsed_s=0 tx_packets_delta=6
+S5ROOT_c_UDP=sent dst=10.43.0.10:53 err=  tx_packets_delta=1
+S5_HOST_VIPc_TCP_FROM=192.168.64.11:34901 payload=vip-tcp-from-192.168.64.11-c
+S5_HOST_VIPc_UDP_FROM=192.168.64.11:37429 payload=vip-udp-from-192.168.64.11-c
+S5_HOST_VIPc_DONE=yes
+
+S5ROOT_d_FWD=1
+S5ROOT_d_HOSTROUTE=added (10.43.0.10 -> lo0)
+S5ROOT_GUEST_ADDR=192.168.64.12
+S5ROOT_d_ROUTEADD=ok cidr=10.43.0.0/16 via=192.168.64.1
+S5ROOT_d_TCP=connected dst=10.43.0.10:34901 elapsed_s=0 tx_packets_delta=6
+S5ROOT_d_UDP=sent dst=10.43.0.10:53 err=  tx_packets_delta=1
+S5_HOST_VIPd_TCP_FROM=192.168.64.12:43737 payload=vip-tcp-from-192.168.64.12-d
+S5_HOST_VIPd_UDP_FROM=192.168.64.12:58930 payload=vip-udp-from-192.168.64.12-d
+S5_HOST_VIPd_DONE=yes
+```
+
+All four arrangements delivered BOTH TCP and UDP/53 to the lo0-alias VIP, and
+in every case the host-bound listener observed the **guest's own vmnet source
+address** (`192.168.64.9`–`.12`, one per arrangement's successive DHCP lease),
+not a rewritten one — consistent with criterion 6's finding from the no-root
+sitting.
+
+**Consequence — BETTER than the runbook's best case.** `s5.sh` names "(b)
+alone suffices ⇒ ZERO new privileged surface, the route set becomes data on
+`podnet.GuestNetwork`, applied by the guest's own route plan" as its best
+pre-named branch. The observation here is that **even (b) is unnecessary**:
+arrangement (a) — no guest route, host forwarding forced to 0, no host route —
+**already delivers**, on both protocols. So VIP delivery needs NO route data
+pushed into `podnet.GuestNetwork`, NO netd route verb (B232), NO host
+`ip.forwarding=1`, and NO host route for the VIP. The guest's ordinary default
+NAT route is sufficient on its own; XNU weak-host-delivers the packet to the
+lo0 alias without any of the three widenings the runbook staged as fallbacks.
+
+## Criterion 3 — PodIP-as-guest-eth0-alias + a host route · verbatim
+
+Also run by `s5-root.sh` in the same root sitting. The guest carried the PodIP
+`100.64.0.99/32` as a second address on `eth0`, alongside its ordinary vmnet
+lease; the host then added an explicit host route to that PodIP via the
+guest's vmnet address, and dialed it:
+
+```
+S5ROOT_C3_GUEST_VMNET=192.168.64.13
+S5ROOT_C3_HOSTROUTE=added (100.64.0.99 via 192.168.64.13)
+S5ROOT_C3_ROUTE_GET=   route to: 100.64.0.99|destination: 100.64.0.99|    gateway: 192.168.64.13|  interface: bridge100|      flags: <UP,GATEWAY,HOST,DONE,STATIC>| recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire|       0         0         0         0         0         0      1500         0 |
+S5_HOST_DIAL_C3PODIP=ok target=100.64.0.99:34911 local=192.168.64.1:55699
+S5_HOST_DIAL_C3PODIP_WRITE=ok payload=host-to-podip-hello
+S5ROOT_GUEST_ADDR=192.168.64.13
+S5ROOT_C3_ALIAS=ok podip=100.64.0.99 dev=eth0
+S5ROOT_C3_ADDRS=2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP qlen 1000|    inet 192.168.64.13/24 scope global eth0|       valid_lft forever preferred_lft forever|    inet 100.64.0.99/32 scope global eth0|       valid_lft forever preferred_lft forever|
+S5ROOT_C3_LISTENING=port=34911 podip=100.64.0.99 vmnet=192.168.64.13
+S5ROOT_C3_GUEST_RX=host-to-podip-hello
+```
+
+The guest received the exact payload (`host-to-podip-hello`), so this is a
+completed round trip via the PodIP alias, not a bare `connect()` success.
+
+**Consequence — the design nuance, not a decision.** Criterion 1 above needs no
+privileged surface at all for VIP delivery. Criterion 3 is different: it
+DELIVERS, but only because the host side carries a host route
+(`route add -host 100.64.0.99 192.168.64.13`), and `route -n add` is a
+root-only operation (§RUN — the root-needing human slice below, and the
+no-root sitting's `SIOCAIFADDR: permission denied` reconfirmed the same class
+of negative for the alias case). So **the privileged plumbing need did not
+disappear — it moved**:
+if the PodIP-as-guest-eth0-alias identity model is adopted for the vm path, a
+narrow privileged route verb (the B232 shape named in `s5.sh` — per-pod,
+idempotent, revoked at teardown, uid-gated like every existing netd verb) is
+needed for **this** leg, not for ordinary VIP/Service delivery. Which identity
+model to adopt is not decided here; this file records the dependency only.
 
 ## Criterion 4 — guest ↔ guest · RECORDING (a SECURITY FACT) · verbatim
 
@@ -231,24 +356,44 @@ kernel, so the tree ships **inside the initramfs** instead and the share is kept
 only as the probe that produced the finding above. No probe depends on the
 share; nothing was widened to work around it.
 
-## NOT RUN — the root-needing human slice
+## RUN — the root-needing human slice (2026-08-31 root sitting)
 
-These are recorded as not run, with the reason. No value below is estimated,
-inferred, or filled in from a weaker measurement.
+This section previously recorded these legs as NOT RUN, needing root. A
+separate root sitting, run by `s5-root.sh` on the same rig, has since run every
+leg but one — see "Criterion 1 — the real lo0-alias VIP legs" and
+"Criterion 3" above for the recorded values.
 
-| leg | why it did not run |
+| leg | status |
 |---|---|
-| criterion 1, arrangements (a)–(d) against a **real lo0-alias VIP** | plumbing a ClusterIP alias needs root: the unprivileged attempt fails with `SIOCAIFADDR: permission denied`. Without a VIP on the host there is nothing for XNU to weak-host-deliver to, so the question "does a guest packet reach a host lo0-alias VIP" is untouched by this sitting |
-| criterion 1, arrangement (c) host ip-forwarding | `sysctl net.inet.ip.forwarding=1` is a root write to system state, and out of bounds for the spike guardrails |
-| criterion 1, arrangement (d) explicit host route | `route -n add` needs root |
-| criterion 3, PodIP-as-guest-eth0-alias + host route | the host route half needs root |
-| guest → LAN reachability | deliberately not probed: it sends traffic onto the operator's physical network, which the spike guardrails do not cover |
+| criterion 1, arrangements (a)–(d) against a **real lo0-alias VIP** | **RUN** — see Criterion 1 above. `s5-root.sh` plumbed `10.43.0.10/32` on lo0 as root; the unprivileged recheck reconfirmed `SIOCAIFADDR: permission denied` first |
+| criterion 1, arrangement (c) host ip-forwarding | **RUN** — see Criterion 1 above (`S5ROOT_c_FWD=1`) |
+| criterion 1, arrangement (d) explicit host route | **RUN** — see Criterion 1 above (`S5ROOT_d_HOSTROUTE=added (10.43.0.10 -> lo0)`) |
+| criterion 3, PodIP-as-guest-eth0-alias + host route | **RUN** — see Criterion 3 above |
+| guest → LAN reachability | **still NOT RUN** — deliberately not probed: it sends traffic onto the operator's physical network, which the spike guardrails do not cover, and `s5-root.sh` did not attempt it either |
 
-The human slice is one sitting: with root, plumb `10.43.0.10/32` on lo0, re-run
-the criterion-1 arrangements against it, and add the (c)/(d) rows. The harness
-already emits every other input that sitting needs — the guest-side route is
-proven free, the packets are proven to leave, and the source address is proven
-un-rewritten.
+**Rig facts from the root sitting.** The four VIP arrangements plus criterion 3
+booted five successive guests on one NAT segment; each took the next sequential
+DHCP lease — `192.168.64.9`, `.10`, `.11`, `.12`, `.13` — matching the no-root
+sitting's finding that leases are sequential per boot on this rig. Guest link
+MTU was unchanged from the no-root sitting's criterion-7 finding (`1500`,
+confirmed again incidentally by `S5ROOT_C3_ROUTE_GET`'s `mtu 1500` field on the
+PodIP host route).
+
+**Exit-path restoration, quoted verbatim.** Every host-state mutation this
+sitting made was reversed on exit, and the sitting's own reads prove it:
+
+```
+S5ROOT_RESTORE_LO0_ALIAS=removed (10.43.0.10 is no longer on lo0, verified)
+S5ROOT_RESTORE_ROUTE_VIP=deleted host route for 10.43.0.10 (present after delete: 0)
+S5ROOT_RESTORE_ROUTE_PODIP=deleted host route for 100.64.0.99 (present after delete: 0)
+S5ROOT_RESTORE_FWD=restored to 1 (read back: 1)
+S5ROOT_RESTORE_PROCESSES=vznet/s5host reaped
+```
+
+`S5ROOT_RESTORE_FWD=restored to 1` matches `S5ROOT_FWD_PRIOR=1` read at the
+start of the sitting — the forwarding sysctl the arrangements toggled to `0`
+and `1` in turn was returned to the value read before the first write, exactly
+as the sitting's own pre-run plan promised.
 
 ## Deviations from the guardrails in lib.sh
 
@@ -256,5 +401,8 @@ un-rewritten.
    the throwaway kernel's module-built virtiofs. Flagged above with the
    evidence; the share is still attached so the finding is observed rather
    than assumed.
-2. **No allow-set, privilege, or system-state widening was adopted.** Every
-   root-needing leg is in the table above, unrun.
+2. **No permanent allow-set, privilege, or system-state widening was
+   adopted.** The root-needing legs above WERE run — under root, in one
+   dedicated sitting (`s5-root.sh`), with every mutation restored on exit and
+   the restoration verified (see the RESTORE lines above) — never left as a
+   standing widening of what an unprivileged k3sm process may do.
