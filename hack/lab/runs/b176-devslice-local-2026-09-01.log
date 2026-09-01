@@ -1,0 +1,177 @@
+# k3sm lab run log
+gate: B176 (kubelet-endpoint-mTLS) — dev-boot half only; two-Mac join half NOT run here (hardware access, tracked separately)
+mode: dev-boot (agent-runnable, unprivileged)
+rc_tag: none
+artifact_sha256: local:7d9f6d259bfba1157c4f241c3c6ca59a16db24d449edabd98a7ccf4615930467
+git_sha.apis: 22f9f2c48958fe5bf81f3b553ca24d47c76e5240
+git_sha.darwin-net: 2625a7edd7becad92cacb497b08b3882e8a56102
+git_sha.runtimed: 9c3e44896945eb6b544f5e0d145bcdeede6fa10f
+git_sha.k3sm: 212fea6d616f23c28cf434adecb2cb299afa5eed
+started_utc: 2026-09-01T14:53:00Z
+result: PASS (dev-boot half only)
+
+================================================================================
+RUN — unattended, agent-run, 2026-09-01 UTC
+Rig: MikoStudio (Mac Studio, arm64, macOS 26.6.2)
+Worktree: an isolated lane worktree (branch lane/lab192/b176-devslice, checked
+  out to k3sm PR #192 head 212fea6d616f23c28cf434adecb2cb299afa5eed via
+  `gh pr checkout 192`), plus a lane go.work pinning the sibling repos at the
+  shas above. NOT the primary checkouts.
+Scope: the AGENT-RUNNABLE half of the PR's merge precondition — "dev boot +
+  two-Mac join". Only dev-boot is covered by this log. The two-Mac join half is
+  blocked on hardware access and is tracked outside this log. No sudo was run.
+No code was changed; this is a read/build/run/teardown lab session only.
+================================================================================
+
+## 0. PR gate summary (from the PR body)
+
+  Named gate:  k3sm/pkg/provider::TestKubeletEndpointRequiresClientCert
+    (5-row identity matrix: no client cert / foreign-CA cert / valid-but-wrong
+    identity / cluster-admin identity — all refused — and the apiserver's own
+    kubelet-client identity — served)
+  PR's recorded unit verdict: green on 212fea6 (re-verified below).
+  PR's stated owed slice: a human lab session — kubectl logs/exec green under a
+    dev boot AND a two-Mac agent join (the wire carries the CA cert to workers).
+  This run performs the dev-boot leg of that owed slice.
+
+## 1. Live-cluster collision check (BEFORE any build/run)
+
+  $ ps aux | grep 'k3sm server'
+    _k3sm  ... /Library/k3sm/k3sm server --runtime runtimed --token <redacted>
+  The installed launchd cluster is on the fixed acceptance-gate ports
+  (apiserver :6444, kine :2379, scheduler :10259, controller-manager :10257)
+  under /var/lib/k3sm. `k3sm dev up` (pkg/dev/alloc.go) deliberately allocates
+  from disjoint high windows (apiserver 16440+, kine 12379+, kubelet 10450+,
+  scheduler 11450+, controller-manager 13450+) precisely so it cannot collide
+  with that gate — confirmed by the actual dev bring-up in section 3 landing on
+  apiserver 127.0.0.1:16456 / kubelet 10838, both clear of the live set. The
+  dev registry root is $HOME/.k3sm/dev, disjoint from the live cluster's
+  /var/lib/k3sm work dir. A separate scratch kubeconfig was used throughout so
+  the operator's own ~/.kube/config was never touched.
+
+## 2. Build + unit gate (both runnable without root)
+
+  $ CGO_ENABLED=1 go build -o /tmp/k3sm-192 ./cmd/k3sm
+    exit 0 (native darwin/arm64, go1.27.0)
+
+  $ CGO_ENABLED=1 go test ./pkg/provider/... -run TestKubeletEndpointRequiresClientCert -v
+    === RUN   TestKubeletEndpointRequiresClientCert
+    === RUN   TestKubeletEndpointRequiresClientCert/no_client_certificate_is_refused_at_the_handshake
+    2026/09/01 10:55:33 http: TLS handshake error from 127.0.0.1:50206: tls: client didn't provide a certificate
+    === RUN   TestKubeletEndpointRequiresClientCert/a_certificate_from_a_different_CA_is_refused_at_the_handshake
+    2026/09/01 10:55:33 http: TLS handshake error from 127.0.0.1:50207: tls: failed to verify certificate: x509: certificate signed by unknown authority
+    === RUN   TestKubeletEndpointRequiresClientCert/a_valid_cluster_identity_that_is_not_the_apiserver_is_refused_by_the_authorizer
+    2026/09/01 10:55:33 WARN kubelet endpoint: denied a client certificate whose identity is not the apiserver's path=/exec/default/web/app remote=127.0.0.1:50208 presented-cn=system:node:worker-2 want-cn=k3sm-apiserver-kubelet-client
+    === RUN   TestKubeletEndpointRequiresClientCert/the_cluster_admin_identity_is_refused_by_the_authorizer
+    2026/09/01 10:55:33 WARN kubelet endpoint: denied a client certificate whose identity is not the apiserver's path=/exec/default/web/app remote=127.0.0.1:50209 presented-cn=k3sm-admin want-cn=k3sm-apiserver-kubelet-client
+    === RUN   TestKubeletEndpointRequiresClientCert/the_apiserver's_kubelet-client_identity_is_served
+    --- PASS: TestKubeletEndpointRequiresClientCert (0.01s)
+        --- PASS: .../no_client_certificate_is_refused_at_the_handshake (0.00s)
+        --- PASS: .../a_certificate_from_a_different_CA_is_refused_at_the_handshake (0.00s)
+        --- PASS: .../a_valid_cluster_identity_that_is_not_the_apiserver_is_refused_by_the_authorizer (0.00s)
+        --- PASS: .../the_cluster_admin_identity_is_refused_by_the_authorizer (0.00s)
+        --- PASS: .../the_apiserver's_kubelet-client_identity_is_served (0.00s)
+    PASS
+    ok  k3sm.io/k3sm/pkg/provider  1.081s
+
+  $ CGO_ENABLED=1 go test ./pkg/provider/...
+    ok  k3sm.io/k3sm/pkg/provider           2.710s
+    ok  k3sm.io/k3sm/pkg/provider/vkadapter 1.453s
+
+## 3. Dev-boot slice — unprivileged rootless dev cluster
+
+  $ /tmp/k3sm-192 dev up --name lab192 --kubeconfig <scratch-kubeconfig>
+    posture: rootless (network=none) — datapath INERT: Service traffic needs --datapath.
+    instance "lab192" up — apiserver 127.0.0.1:16456 · context k3sm-dev-lab192
+    (note: k3sm-execshim rebuild was permission-denied against a stale cached
+    copy under $HOME/.k3sm/dev/.bin from a prior run; the manager fell back to
+    the cached helper and continued — non-fatal, pre-existing environment state,
+    unrelated to the PR under test.)
+
+  $ KUBECONFIG=<scratch-kubeconfig> kubectl get nodes -o wide
+    NAME              STATUS  ROLES   AGE  VERSION   INTERNAL-IP
+    k3sm-dev-lab192   Ready   <none>  17s  k3sm-m1   192.168.0.50
+
+  $ kubectl get node k3sm-dev-lab192 -o json | jq '.status.daemonEndpoints'
+    {"kubeletEndpoint": {"Port": 10838}}
+  $ lsof -nP -iTCP:10838 -sTCP:LISTEN
+    k3sm-192  <pid>  <user>  IPv6  TCP *:10838 (LISTEN)
+
+  $ kubectl apply -f examples/hello-native.yaml
+    pod/hello-native created
+  $ kubectl get pods -o wide
+    NAME           READY  STATUS   RESTARTS  IP          NODE
+    hello-native   1/1    Running  0         127.0.0.1   k3sm-dev-lab192
+
+### 3a. mTLS refusal probe — NO client cert against the kubelet endpoint
+
+  $ printf 'GET /exec/default/hello-native/hello HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' \
+      | openssl s_client -connect 127.0.0.1:10838 -quiet
+    Connecting to 127.0.0.1
+    depth=0 CN=k3sm-kubelet
+    verify error:num=18:self-signed certificate
+    ...:error:0A00045C:SSL routines:ssl3_read_bytes:tlsv13 alert certificate required:ssl/record/rec_layer_s3.c:918:SSL alert number 116
+    ...:error:0A000197:SSL routines:SSL_shutdown:shutdown while in init:ssl/ssl_lib.c:2804:
+
+  Corroborating probe (LibreSSL curl, independent TLS stack):
+  $ curl -k -sS -o /dev/null -w 'http_code=%{http_code}\n' https://127.0.0.1:10838/exec/default/hello-native/hello
+    curl: (56) LibreSSL SSL_read: LibreSSL/3.3.6: error:1404C45C:SSL routines:ST_OK:reason(1116), errno 0
+    http_code=000
+
+  VERDICT: REFUSED at the TLS layer. "SSL alert number 116" is the TLS 1.3
+  certificate_required alert — the exact refusal the PR's gate asserts
+  ("no client certificate is refused at the handshake"), now observed live
+  against a running dev-boot kubelet endpoint, not only in the unit fake.
+  No application-layer response of any kind was returned (http_code=000).
+
+### 3b. kubectl logs / kubectl exec through the apiserver (apiserver holds the client cert)
+
+  $ kubectl logs hello-native
+    Error opening /private/var/select/sh: Operation not permitted
+    hello from a k3sm native pod
+    ProductName:		macOS
+    ProductVersion:		26.6.2
+    BuildVersion:		25G83
+
+  $ kubectl exec hello-native -- /usr/bin/sw_vers
+    ProductName:		macOS
+    ProductVersion:		26.6.2
+    BuildVersion:		25G83
+
+  VERDICT: PASS. Both `kubectl logs` and `kubectl exec` returned real pod
+  output through the mTLS-gated kubelet endpoint — the apiserver's
+  CN=k3sm-apiserver-kubelet-client identity was accepted where every other
+  probed identity (3a above, and the unit test's foreign-CA / wrong-identity /
+  cluster-admin rows) was refused. The "Error opening /private/var/select/sh"
+  line is stderr from the pod's OWN `/bin/sh -c` command (a benign macOS shell-
+  selection side effect inside the pod's process, captured as part of its
+  stdout/stderr stream) — not a kubectl/apiserver/mTLS error, and out of scope
+  for this gate.
+  The recorded B213 expectation (kubelet SERVING cert not yet signed by the
+  cluster CA, breaking logs/exec/attach/port-forward cluster-wide on a
+  --mesh-ip cluster) did NOT fire here: this is a single-node dev-boot
+  instance with no --mesh-ip, which is exactly the topology B213 does not
+  cover — so its absence here is expected, not evidence that B213 is moot.
+
+## 4. Teardown
+
+  $ kubectl delete pod hello-native --wait=false
+    pod "hello-native" deleted from default namespace
+  $ /tmp/k3sm-192 dev down --name lab192 --kubeconfig <scratch-kubeconfig>
+    instance "lab192" down
+  $ /tmp/k3sm-192 dev list
+    no k3sm dev instances (run `k3sm dev up`)
+  $ lsof -nP -iTCP:10838 -sTCP:LISTEN   -> (empty)
+  $ lsof -nP -iTCP:16456 -sTCP:LISTEN   -> (empty)
+  $ ps aux | grep -i lab192               -> (empty)
+  Live launchd cluster (kube-apiserver --etcd-servers ... --secure-port 6444)
+  confirmed still running throughout and after — untouched.
+
+## 5. What this run does NOT prove
+
+  - The two-Mac agent-join half of the owed slice (does the CA cert reach a
+    JOINED worker over the wire) — blocked on hardware access, tracked
+    separately, NOT attempted here.
+  - Any multi-node skew/rollout behavior.
+
+result: PASS (dev-boot half only)
