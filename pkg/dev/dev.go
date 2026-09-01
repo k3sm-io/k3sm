@@ -57,18 +57,18 @@ const (
 // the tree holding the per-pod dirs, the image blob cache and, decisively, the
 // PVC storage root (<runtime-root>/storage/<namespace>/<claim>).
 //
-// It sits OUTSIDE the registry root (<home>/.k3sm/dev/<name>) on purpose, and the
-// reason is a hard runtimed constraint rather than taste: /Users is one of the
-// FIXED system-protected prefixes runtimed's SBPL generator refuses to grant a
-// confined pod (runtimed pkg/sandbox systemProtectedPrefixes — "a hostPath-style
-// mount can never widen the allow-list into /Users"). runtimed derives each PVC's
-// dir from ITS work-dir and hands it to that generator as the pod's read/write
-// scope, so with the runtime root under the invoking user's home EVERY
-// PVC-backed pod is rejected at sandbox setup — `runtimed create pod … rejected:
-// generate sbpl …: extra path is under a protected deny-set` — and sits Pending
-// until it is deleted. The installed posture (/var/lib/k3sm) and the acceptance
-// harness (hack/lib/clusterup.sh's /tmp/k3sm-cluster) both already keep the
-// runtime root clear of /Users; this gives `k3sm dev` the same property.
+// It sits outside the registry root (<home>/.k3sm/dev/<name>) on purpose: /Users
+// is one of the fixed system-protected prefixes runtimed's SBPL generator
+// refuses to grant a confined pod (runtimed pkg/sandbox systemProtectedPrefixes
+// — "a hostPath-style mount can never widen the allow-list into /Users").
+// runtimed derives each PVC's dir from its work-dir and hands it to that
+// generator as the pod's read/write scope, so a runtime root under the invoking
+// user's home would reject every PVC-backed pod at sandbox setup (`runtimed
+// create pod … rejected: generate sbpl …: extra path is under a protected
+// deny-set`), leaving it Pending until deleted. The installed posture
+// (/var/lib/k3sm) and the acceptance harness (hack/lib/clusterup.sh's
+// /tmp/k3sm-cluster) already keep the runtime root clear of /Users; this gives
+// `k3sm dev` the same property.
 //
 // The euid is part of the directory NAME, not a subdirectory, so a root
 // (--datapath) and a rootless instance never need write access to one another's
@@ -89,11 +89,11 @@ const (
 )
 
 // runtimeRuntimed / runtimeHostProcess are the effective pod runtimes recorded in
-// the manifest. They MIRROR cmd/k3sm's --runtime values. runtimed (Seatbelt-
-// confined) is the DEFAULT whenever the k3sm-execshim helper is provisionable;
-// hostprocess (UNCONFINED — no Seatbelt) is the honest fallback used only when the
-// helper cannot be built, so the dev loop stays up instead of dying at runtimed
-// init sandbox-backend setup.
+// the manifest, mirroring cmd/k3sm's --runtime values. runtimed (Seatbelt-
+// confined) is the default whenever the k3sm-execshim helper is provisionable;
+// hostprocess (unconfined — no Seatbelt) is the honest fallback used only when
+// the helper cannot be built, so the dev loop stays up instead of dying at
+// runtimed init sandbox-backend setup.
 const (
 	runtimeRuntimed    = "runtimed"
 	runtimeHostProcess = "hostprocess"
@@ -237,7 +237,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 // prior run, spawns a detached `k3sm server` (runtimed + network=none rootless,
 // or network=direct under --datapath), merges the kubeconfig into ~/.kube/config
 // as context k3sm-dev-<name>, writes the durable manifest, and prints the tier's
-// fidelity banner. It returns only once the cluster is USABLE — the default
+// fidelity banner. It returns only once the cluster is usable — the default
 // namespace bootstrapped and a node registered Ready — so a caller that creates a
 // pod immediately does not race the bring-up. It fails fast (never a silent
 // degrade) on a --datapath posture miss, a live-datapath singleton violation, or a
@@ -260,7 +260,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		datapath = DatapathDirect
 	}
 
-	// --datapath singleton: a second datapath `up` must fail fast BEFORE its
+	// --datapath singleton: a second datapath `up` must fail fast before its
 	// pre-flight flush runs, else that flush tears the live datapath instance's
 	// aliases down. The lock guards concurrent racers; the alias assert guards a
 	// still-live prior instance whose lock was released but whose kernel aliases
@@ -284,7 +284,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	podRoot := m.podRoot(name)
 
 	// Pre-flight reclaim: self-heal a crashed prior run under this name — reap a
-	// stale pid, flush its lo0 aliases, and re-assert ports. Reads the OLD
+	// stale pid, flush its lo0 aliases, and re-assert ports. Reads the old
 	// manifest if present; a missing one is a clean first boot.
 	if err := m.preflightReclaim(name); err != nil {
 		return Instance{}, err
@@ -299,8 +299,8 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// prepend it to the detached server's PATH — without it runtimed's FindExecShim
 	// fails and the server dies at `init sandbox backend`. If the helper cannot be
 	// built (an installed k3sm with no workspace source) we fall back to
-	// hostprocess (UNCONFINED, dev-only) with a loud notice rather than crashing —
-	// runtimed stays the default whenever the helper IS provisionable.
+	// hostprocess (unconfined, dev-only) with a loud notice rather than crashing —
+	// runtimed stays the default whenever the helper is provisionable.
 	runtimeName := runtimeRuntimed
 	binDir, provisioned, err := m.provisionExecShim(ctx)
 	if err != nil {
@@ -313,13 +313,13 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	}
 
 	// Provision the two pod-support DYLD shims and hand them to the server as
-	// --path-shim / --dns-shim. cmd/k3sm resolves BOTH as siblings of the running
-	// executable, and `k3sm dev` re-execs THIS binary out of a `go build` output
-	// dir, so it found neither — one miss with two symptoms: every ABSOLUTE volume
+	// --path-shim / --dns-shim. cmd/k3sm resolves both as siblings of the running
+	// executable, and `k3sm dev` re-execs this binary out of a `go build` output
+	// dir, so it found neither — one miss with two symptoms: every absolute volume
 	// mount path (ConfigMap/Secret/emptyDir/the projected SA token) ENOENTs in-pod
 	// without the path-rebase shim, and every cluster Service name NXDOMAINs
 	// without the getaddrinfo shim. Each is provisioned only in a posture that can
-	// stage AND use it (wantsPathShim / wantsDNSShim); an unbuildable shim is a
+	// stage and use it (wantsPathShim / wantsDNSShim); an unbuildable shim is a
 	// loud degrade, not a failure.
 	pathShim, dnsShim := "", ""
 	if wantsPathShim(m.euid, runtimeName) {
@@ -341,17 +341,16 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		}
 	}
 
-	// Boot a detached `k3sm server` on the SHIPPED admission defaults (PSA
-	// enforce=privileged, warn=baseline). dev used to pass --psa-enforce-baseline
-	// "so the M10 PSA cutover criterion works", but that criterion's own skip-spec
-	// demands a SEPARATE flagged boot (K3SM_PSA_ENFORCE=1) — while the flag here
-	// made the default-posture criteria (TestM10_PSADefaultWarn/AuditLogLevel)
-	// structurally unpassable under the SIT: they assert the shipped default and
-	// the harness booted the cutover. K3SM_WORK_DIR is exported so the audit/PSA
-	// e2e read the SAME workdir. runtimed (Seatbelt-confined) is the
-	// default; hostprocess is only the honest execshim-unavailable fallback. The
-	// rootless tier is network=none (runtimePreflight returns nil — no root);
-	// --datapath is network=direct.
+	// Boot a detached `k3sm server` on the shipped admission defaults (PSA
+	// enforce=privileged, warn=baseline) — never --psa-enforce-baseline here: the
+	// M10 PSA cutover criterion demands a separate flagged boot
+	// (K3SM_PSA_ENFORCE=1), and passing the flag by default made
+	// TestM10_PSADefaultWarn/AuditLogLevel structurally unpassable (they assert
+	// the shipped default while the harness booted the cutover). K3SM_WORK_DIR is
+	// exported so the audit/PSA e2e read the same workdir. runtimed
+	// (Seatbelt-confined) is the default; hostprocess is only the honest
+	// execshim-unavailable fallback. The rootless tier is network=none
+	// (runtimePreflight returns nil — no root); --datapath is network=direct.
 	proc, err := m.spawnServer(ctx, name, workDir, podRoot, alloc, network, runtimeName, binDir, pathShim, dnsShim)
 	if err != nil {
 		return Instance{}, err
@@ -424,8 +423,8 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// registers on its own clock, well after the apiserver is serving. Measured on
 	// lab hardware 2026-08-27: the server logged `starting k3sm node` at 12:34:36
 	// and `node ... ready` at 12:36:06 — ~90s later — while `dev up` had already
-	// returned at 12:34. Every caller that listed nodes right after `up` saw NONE,
-	// and every pod it created sat Unschedulable ("no nodes available to schedule
+	// returned at 12:34, so a caller listing nodes right after `up` saw none, and
+	// every pod it created sat Unschedulable ("no nodes available to schedule
 	// pods"). Block until a Ready node exists, so `up` returning means the cluster
 	// can actually run something.
 	nodeWait := m.nodeRegistrationWait()
@@ -442,7 +441,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		}
 	}
 
-	// The report is bound to the SERVER, not to the probes that ran against it.
+	// The report is bound to the server, not to the probes that ran against it.
 	// This is the last thing checked before the manifest is written and `up` says
 	// so: `instance "b" up` was once printed over a server that had already died,
 	// because a bring-up whose every gate is a readiness signal reports the health
@@ -467,7 +466,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 
 // Down tears an instance (or, with --all, every instance) down: SIGTERM the
 // detached server's process group, flush the instance's Service+pod lo0 aliases
-// (cluster_down does NOT reap kernel-global aliases), remove the kubeconfig
+// (cluster_down does not reap kernel-global aliases), remove the kubeconfig
 // context, and delete the registry entry.
 func (m *Manager) Down(ctx context.Context, opts DownOptions) error {
 	if opts.All {
@@ -487,7 +486,7 @@ func (m *Manager) Down(ctx context.Context, opts DownOptions) error {
 	return m.teardown(inst)
 }
 
-// downAll sweeps EVERY registered instance, then a belt-and-braces global lo0
+// downAll sweeps every registered instance, then a belt-and-braces global lo0
 // flush + no-instances state, so a reboot's orphans self-heal even if a manifest
 // was lost. It reports the first teardown error but attempts every instance.
 func (m *Manager) downAll(ctx context.Context) error {
@@ -557,7 +556,7 @@ func (m *Manager) teardown(inst Instance) error {
 // removablePodRoot returns the instance's runtime root when it is safe to delete
 // recursively, and "" otherwise. Safe means: recorded (an older manifest has
 // none — that layout kept the root inside the instance dir Remove already
-// reclaims), absolute and clean, and a PROPER descendant of base. The bound is
+// reclaims), absolute and clean, and a proper descendant of base. The bound is
 // what keeps a hand-edited or corrupted manifest from turning teardown into an
 // arbitrary rm -rf running, in the datapath tier, as root.
 func removablePodRoot(inst Instance, base string) string {
@@ -575,7 +574,7 @@ func removablePodRoot(inst Instance, base string) string {
 	return dir
 }
 
-// List returns the durable registry, each entry annotated (via the LIVENESS field
+// List returns the durable registry, each entry annotated (via the Liveness field
 // the caller renders) with current process liveness cross-checked against the
 // System seam — so a stale pid from a crashed run reads LivenessDead without the
 // manifest being lost.
@@ -611,15 +610,15 @@ type InstanceStatus struct {
 }
 
 // Alive reports whether the instance's server is known to be running. An
-// unprobeable (root-owned, seen unprivileged) instance is NOT alive by this
-// predicate and is NOT dead either — callers deciding whether to reap must ask
+// unprobeable (root-owned, seen unprivileged) instance is not alive by this
+// predicate and is not dead either — callers deciding whether to reap must ask
 // Liveness.Exists(), not this.
 func (s InstanceStatus) Alive() bool { return s.Liveness == LivenessRunning }
 
 // Load stages a native-arm64 binary for the dev cluster and returns the
 // `image: <abs>` line (the no-command host-binary convention runtimed's
-// resolveBinary supports) STAMPED non-portable. It does not copy the binary
-// anywhere — the staged path IS the absolute path the operator passes as a pod's
+// resolveBinary supports) stamped non-portable. It does not copy the binary
+// anywhere — the staged path is the absolute path the operator passes as a pod's
 // image — but it validates the path exists and is absolute so a bad reference is
 // caught here, not at pod admission. The honest `kind load` analog: k3sm has no
 // Docker images, so the stamp warns the ref won't work on real k8s or k3sm's
@@ -693,11 +692,11 @@ func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, run
 		// healthy against the first instance's datastore).
 		"--kine-port", strconv.Itoa(alloc.kine),
 		// The allocated kubelet-API port, same reason one port further down the
-		// bring-up: the node's logs/exec/stats listener is a per-NODE singleton, so
+		// bring-up: the node's logs/exec/stats listener is a per-node singleton, so
 		// on the fixed default the second instance's node dies at "bind: address
 		// already in use" after the control plane is already healthy.
 		//
-		// A PORT is all dev hands the server. The listener's bind address (the
+		// A port is all dev hands the server. The listener's bind address (the
 		// wildcard) and its auth posture are the server's own, unchanged by this
 		// flag and not dev's to move: `k3sm dev` must never be the reason that
 		// surface is reachable from somewhere it was not already.
@@ -708,7 +707,7 @@ func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, run
 		// somewhere else entirely: with no service-account controller running, the
 		// default namespace never finishes bootstrapping.
 		//
-		// As with the kubelet port, dev hands over a PORT and nothing else. Both
+		// As with the kubelet port, dev hands over a port and nothing else. Both
 		// components are bound to loopback by the server, and moving a listener that
 		// only the co-located control plane talks to is not dev's decision to revisit.
 		"--scheduler-port", strconv.Itoa(alloc.scheduler),
@@ -729,7 +728,7 @@ func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, run
 
 // spawnServer starts a detached `k3sm server` (this binary re-exec'd) in its own
 // process group with the config-superset argv, redirecting its output to
-// <workDir>/server.log, and returns its pid. It does NOT wait — the server runs
+// <workDir>/server.log, and returns its pid. It does not wait — the server runs
 // until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
 // read the same workdir.
 func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, alloc instancePorts, network, runtimeName, execShimDir, pathShim, dnsShim string) (*serverProc, error) {
@@ -737,7 +736,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
 	}
 	// Pre-create the runtime root so a base the caller cannot write (a stale tree
-	// owned by the other euid) fails HERE, with the path named, instead of inside
+	// owned by the other euid) fails here, with the path named, instead of inside
 	// the detached server's first pod create.
 	if err := os.MkdirAll(podRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
@@ -755,7 +754,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// and detached from ctx cancellation (WaitDelay 0 + no Cancel) so the server
 	// outlives the `k3sm dev up` CLI invocation.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return nil } // ctx cancel must NOT kill the detached server
+	cmd.Cancel = func() error { return nil } // ctx cancel must not kill the detached server
 	// Prepend the dev-bin cache (holding k3sm-execshim) to PATH so runtimed's
 	// FindExecShim → exec.LookPath("k3sm-execshim") resolves the provisioned helper
 	// in the detached server. execShimDir is empty on the hostprocess fallback (no
@@ -767,9 +766,8 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	p := &serverProc{name: name, pid: cmd.Process.Pid, logPath: logPath, exited: make(chan struct{})}
 	// Release the child: a reaper goroutine Waits so the process is not left a
 	// zombie if this CLI lingers, but the server keeps running independently. The
-	// Wait result is no longer discarded — it is the account of WHY a bring-up
-	// that looked healthy was not, so it is recorded before the close that
-	// publishes it.
+	// Wait result is not discarded — it is the account of why a bring-up that
+	// looked healthy was not, so it is recorded before the close that publishes it.
 	go func() {
 		p.waitErr = cmd.Wait()
 		close(p.exited)
@@ -779,7 +777,7 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 
 // serverProc is the handle spawnServer returns for the detached control plane:
 // its pid, where its output went, and the exit signal the reaper goroutine
-// closes. waitErr is written strictly BEFORE exited closes and read only after
+// closes. waitErr is written strictly before exited closes and read only after
 // <-exited, so the close is the happens-before edge (the same discipline the
 // executor's supervised components use for the same reason).
 type serverProc struct {
@@ -807,16 +805,16 @@ func (p *serverProc) exitError() error {
 const exitReportGrace = 5 * time.Second
 
 // awaitOrExit decides which verdict a bring-up stage reports, and the server's
-// EXIT always wins.
+// exit always wins.
 //
 // A stage's success is not the instance's success. `up` printed `instance "b" up`
-// for a server whose datastore had already FATAL'd, because every wait it runs is
+// for a server whose datastore had already fatal'd, because every wait it runs is
 // bound to a readiness signal — a kubeconfig file on disk, an API object, a Ready
 // node — and a signal that has already been emitted stays true after the process
 // emitting it dies. So an exit the reaper has published beats err even when err
 // is nil.
 //
-// When the stage FAILED, the kernel is asked directly before a deadline is
+// When the stage failed, the kernel is asked directly before a deadline is
 // allowed to author the error: exited is closed by a goroutine that may not have
 // been scheduled yet, so a dead server can otherwise come back as an opaque
 // timeout describing the symptom instead of the cause.
@@ -846,9 +844,9 @@ func (m *Manager) awaitOrExit(ctx context.Context, p *serverProc, err error) err
 // helper so the writer and every error that quotes the file name the same path.
 func serverLogPath(workDir string) string { return filepath.Join(workDir, "server.log") }
 
-// kubeconfigWait bounds awaitKubeconfig. It is NOT raised to cover a slow boot: a
+// kubeconfigWait bounds awaitKubeconfig. It is not raised to cover a slow boot: a
 // deadline that moves to fit the worst observed run stops bounding anything, and the
-// causes worth surviving are causes worth SEEING, which is what the log tail below is
+// causes worth surviving are causes worth seeing, which is what the log tail below is
 // for.
 const kubeconfigWait = 90 * time.Second
 
@@ -866,7 +864,7 @@ func (m *Manager) awaitKubeconfig(ctx context.Context, kc, logPath string) error
 // awaitKubeconfigFile is the pollable core of awaitKubeconfig, split out so the
 // timeout's semantics are testable without spawning a server.
 //
-// The timeout QUOTES the server log rather than pointing at it. The server is
+// The timeout quotes the server log rather than pointing at it. The server is
 // detached, so its output is the only account of what the boot was doing, and an
 // operator who has to already know the file exists learns nothing from the failure:
 // the observed case was a boot whose log held nothing but `go: downloading` lines —
@@ -893,15 +891,15 @@ func awaitKubeconfigFile(ctx context.Context, timeout time.Duration, kc, logPath
 // defaultNamespaceBootstrapTimeout bounds awaitDefaultNamespaceBootstrap. The two
 // objects are written by controllers that start with the control plane, so they
 // normally land within a second or two; the budget is generous because the cost of
-// waiting is a slower `dev up`, while the cost of NOT waiting is a spurious red in
+// waiting is a slower `dev up`, while the cost of not waiting is a spurious red in
 // every suite that creates a pod immediately.
 const defaultNamespaceBootstrapTimeout = 90 * time.Second
 
-// awaitDefaultNamespaceBootstrap blocks until the default namespace carries BOTH
+// awaitDefaultNamespaceBootstrap blocks until the default namespace carries both
 // objects a pod with a projected service-account token needs:
 //
 //   - the `default` ServiceAccount (written by the service-account controller) —
-//     without it a pod naming it is REJECTED at admission; and
+//     without it a pod naming it is rejected at admission; and
 //   - the `kube-root-ca.crt` ConfigMap (written by the root-ca-cert-publisher) —
 //     without it the kube-api-access projected volume cannot materialise.
 //
@@ -931,7 +929,7 @@ func (m *Manager) awaitDefaultNamespaceBootstrap(ctx context.Context, kubeconfig
 
 // awaitBootstrapObjects is the pollable core of awaitDefaultNamespaceBootstrap,
 // split out so its semantics are testable without an apiserver: each probe is
-// LATCHED once it first succeeds, so a transient failure on one object never
+// latched once it first succeeds, so a transient failure on one object never
 // re-opens the other, and the timeout error names which object is still missing.
 func awaitBootstrapObjects(ctx context.Context, timeout time.Duration, kubeconfig string,
 	saPresent, cmPresent func(context.Context) bool) error {
@@ -1012,7 +1010,7 @@ func (m *Manager) awaitNodeRegistered(ctx context.Context, kubeconfig string) er
 }
 
 // nodeIsReady reports whether n carries a Ready condition with status True. A
-// node object that EXISTS is not yet a schedulable node — the scheduler skips it
+// node object that exists is not yet a schedulable node — the scheduler skips it
 // until the condition flips — so registration alone is not the readiness signal.
 func nodeIsReady(n *corev1.Node) bool {
 	for _, c := range n.Status.Conditions {
@@ -1028,7 +1026,7 @@ func nodeIsReady(n *corev1.Node) bool {
 // registered and how many of those are Ready; a probe error is transient (the
 // apiserver may still be settling) so polling continues, but the last one is
 // carried into the timeout message. Unlike awaitBootstrapObjects nothing is
-// latched: the contract is that a Ready node exists NOW.
+// latched: the contract is that a Ready node exists now.
 func awaitReadyNode(ctx context.Context, timeout time.Duration, kubeconfig string,
 	probe func(context.Context) (registered, ready int, err error)) error {
 	deadline := time.Now().Add(timeout)
