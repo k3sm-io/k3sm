@@ -214,7 +214,9 @@ func TestNodeAddressProxyable(t *testing.T) {
 		}
 		opts.nodeIP = advertisedNodeIP(opts)
 		internalIP := proxyableNodeIP(opts)
-		cfg, err := kubeletServingTLS(testKubeletAuth(t), opts.nodeName, opts.nodeIP, internalIP)
+		// nil/nil: the self-signed dev posture this case is about (a mesh node
+		// carries an issued pair — TestKubeletServingTLSUsesIssuedPair).
+		cfg, err := kubeletServingTLS(testKubeletAuth(t), nil, nil, opts.nodeName, opts.nodeIP, internalIP)
 		if err != nil {
 			t.Fatalf("kubeletServingTLS: %v", err)
 		}

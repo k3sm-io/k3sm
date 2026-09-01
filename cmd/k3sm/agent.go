@@ -145,6 +145,17 @@ func runAgent(args []string) error {
 	}
 	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 
+	// B213: refuse a join that delivered no kubelet SERVING keypair, BEFORE anything
+	// starts. A joined worker's apiserver runs with
+	// --kubelet-certificate-authority=<cluster CA>, so a self-signed fallback here
+	// would leave this node's :10250 unusable (x509: unknown authority) while the node
+	// registers Ready — logs/exec broken, and broken invisibly. Failing here reports
+	// the real fault where it can be read, next to the join that should have carried
+	// the pair.
+	if err := requireJoinedServingPair(res); err != nil {
+		return err
+	}
+
 	apiserverURL := fmt.Sprintf("https://%s:%d", opts.server, opts.apiPort)
 	kubeconfigPath := filepath.Join(opts.workDir, "node.kubeconfig")
 	if err := writeNodeKubeconfig(kubeconfigPath, apiserverURL, opts.nodeName, res); err != nil {
@@ -222,10 +233,41 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// wildcard bind and is never served unauthenticated.
 		kubeletClientCAPEM: res.ClientCAPEM,
 
+		// B213: the CLUSTER-CA-issued kubelet SERVING pair, also from the join
+		// response — the cert this worker presents on :10250, chaining to the CA the
+		// apiserver was started with --kubelet-certificate-authority. It is the
+		// counterpart of the anchor above: that one authenticates the apiserver TO this
+		// node, this one authenticates this node TO the apiserver. runAgent has already
+		// refused an empty pair (requireJoinedServingPair), so the self-signed fallback
+		// inside kubeletServingTLS is unreachable on the mesh path.
+		kubeletServingCertPEM: res.KubeletServingCertPEM,
+		kubeletServingKeyPEM:  res.KubeletServingKeyPEM,
+
 		// The worker's own Service proxy is where its vm pods' live guest leases
 		// are published; nil when the worker runs no datapath.
 		transportOverrides: nodeTransportOverrides(datapath, mode),
 	}
+}
+
+// requireJoinedServingPair refuses a join result that carries no usable kubelet
+// SERVING keypair. It is a pure function of the join result so the refusal is
+// unit-testable without a live join — the same shape as the client-CA anchor's
+// fail-closed construction (provider.NewKubeletEndpointAuth), one step earlier.
+//
+// The CERT is checked first and on its own, because the two halves have different
+// origins: the KEY never crosses the wire (bootstrap.Join generates it locally with
+// the serving CSR), so only the cert's absence can report "the server did not issue
+// one" — the realistic failure, a server that predates the field or refused the
+// serving CSR. A cert with no key is the defensive residue and is named as the
+// server-side pairing fault it would have to be.
+func requireJoinedServingPair(res *bootstrap.JoinResult) error {
+	switch {
+	case res == nil || len(res.KubeletServingCertPEM) == 0:
+		return fmt.Errorf("join delivered no kubelet serving certificate: this cluster's apiserver verifies node :10250 against the cluster CA (--kubelet-certificate-authority), so serving a self-signed cert here would fail every kubectl logs/exec against this node with \"x509: certificate signed by unknown authority\" while the node still registered Ready — the SERVER issues this cert during join, so upgrade it and rejoin")
+	case len(res.KubeletServingKeyPEM) == 0:
+		return fmt.Errorf("join delivered a kubelet serving certificate with no private key: %w", errHalfKubeletServingPair)
+	}
+	return nil
 }
 
 // bringUpMesh constructs a node's wireguard mesh for its assigned pod /24, brings

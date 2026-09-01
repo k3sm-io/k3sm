@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -714,6 +715,20 @@ func runServer(args []string) error {
 		transportOverrides: nodeTransportOverrides(net, mode),
 	}
 
+	// 4f-bis. B213 — the control-plane node's OWN kubelet serving cert.
+	//
+	// A worker receives one in its join response; this node never joins, so nothing
+	// hands it one and it self-signed — against its own apiserver, which the mesh
+	// block above started with --kubelet-certificate-authority=<cluster CA>. That is
+	// the defect in its purest form: `kubectl logs` against the control-plane node
+	// failed with "x509: certificate signed by unknown authority" on the very machine
+	// holding the CA that could have signed it. It runs HERE because the SAN set is
+	// read off the finished nodeOpts (below), and it fails the whole bring-up on a
+	// mint error rather than degrading to the self-signed cert that is the defect.
+	if err := setServerKubeletServing(&nodeOpts, hierarchy, opts.meshIP); err != nil {
+		return err
+	}
+
 	// 4g/4h. M10.3 — ingress hosting + svclb, beside the netserve datapath
 	// (step 4c) and like it skipped under --network none (they splice/route to
 	// ClusterIP VIPs, which need the proxy's datapath).
@@ -813,6 +828,97 @@ func ensureMeshPeerCRD(ctx context.Context, meshIP string, newClient crdClientFa
 	}
 	logger.Info("ensured the MeshPeer CRD; worker enroll writes can now land", "crd", crdconfig.MeshPeerCRDName)
 	return nil
+}
+
+// kubeletServingValidFor is the lifetime of the control-plane node's kubelet
+// serving cert. It is pinned to the SAME 365d writeAPIServerServingCert gives the
+// apiserver's leaf: both are re-minted by every boot of the same process, so a
+// shorter life here would only mean the node's cert expired first on a long-lived
+// server — a second expiry date to reason about, buying nothing.
+const kubeletServingValidFor = 365 * 24 * time.Hour
+
+// setServerKubeletServing mints the control-plane node's kubelet serving keypair
+// from the CLUSTER CA and stores it on nodeOpts, for the posture where the
+// apiserver was told to verify node certs against that CA.
+//
+// meshIP == "" is the single-node/dev posture: it leaves the fields EMPTY, so
+// kubeletServingTLS self-signs exactly as before. That branch is load-bearing — a
+// single-node apiserver configures no --kubelet-certificate-authority, so a
+// cluster-CA leaf would buy nothing and the self-signed path stays the default this
+// change does not disturb.
+//
+// The pair is held in MEMORY and re-minted on every boot: nothing is written to
+// disk, so no new private key file joins the work dir and pkg/executor's rotation
+// fence needs no new path (the artifact is nevertheless REPORTED there — see
+// reissuedArtifacts — because a credential re-issued on every boot belongs in the
+// rotation report whether or not it lands on a filesystem).
+//
+// It FAILS CLOSED. A cluster CA that cannot issue is an error the caller must
+// propagate: falling back to a self-signed leaf here would silently reproduce the
+// exact defect this function exists to remove, and would do it in the one case
+// (broken PKI) where an operator most needs to be told.
+func setServerKubeletServing(nodeOpts *nodeOptions, hierarchy *certs.Hierarchy, meshIP string) error {
+	if meshIP == "" {
+		return nil
+	}
+	// Checked BEFORE issuing, and down to the key: a CA loaded without its private
+	// half cannot sign, and x509.CreateCertificate's reaction to one is not a
+	// diagnosable error. Refusing here names the real fault — the work dir's PKI —
+	// where an operator can act on it.
+	if hierarchy == nil || hierarchy.Cluster == nil || hierarchy.Cluster.Cert == nil || hierarchy.Cluster.Key == nil {
+		return fmt.Errorf("mint the control-plane node's kubelet serving cert: no usable cluster CA (the multi-node posture needs the signing half of the CA hierarchy the apiserver's --kubelet-certificate-authority names)")
+	}
+	certPEM, keyPEM, err := hierarchy.Cluster.IssueServing(
+		nodeOpts.nodeName,
+		[]string{nodeOpts.nodeName, "localhost"},
+		serverKubeletServingIPs(*nodeOpts, meshIP),
+		kubeletServingValidFor,
+	)
+	if err != nil {
+		return fmt.Errorf("mint the control-plane node's kubelet serving cert: %w", err)
+	}
+	nodeOpts.kubeletServingCertPEM = certPEM
+	nodeOpts.kubeletServingKeyPEM = keyPEM
+	return nil
+}
+
+// serverKubeletServingIPs is the IP SAN set of that cert: every address the
+// apiserver might dial this node's :10250 at, deduplicated, unparseable entries
+// dropped.
+//
+//   - meshIP — what peers know this node by, and what a mesh apiserver binds;
+//   - the ADVERTISED address (advertisedNodeIP) and the raw nodeOpts.nodeIP — the
+//     two can differ, and startNode advertises the derived one;
+//   - the REGISTERED InternalIP (proxyableNodeIP of the advertised opts, exactly as
+//     startNode computes it). This is the address --kubelet-preferred-address-types
+//     =InternalIP makes the apiserver dial, and in the NO-DATAPATH posture it
+//     legitimately diverges from the advertised address — so omitting it would
+//     reproduce B213 as a SAN mismatch instead of an issuer mismatch, which is the
+//     same broken logs/exec with a less legible error;
+//   - 127.0.0.1 — the same-host dial.
+//
+// A superset is the safe direction here: every address in the set is one this node
+// already serves on (the listen is the wildcard), so naming it in a SAN grants no
+// reach that did not exist. Omitting one silently breaks logs/exec.
+func serverKubeletServingIPs(nodeOpts nodeOptions, meshIP string) []net.IP {
+	advertised := nodeOpts
+	advertised.nodeIP = advertisedNodeIP(nodeOpts)
+	candidates := []string{
+		meshIP,
+		nodeOpts.nodeIP,
+		advertised.nodeIP,
+		proxyableNodeIP(advertised),
+		"127.0.0.1",
+	}
+	var ips []net.IP
+	for _, c := range candidates {
+		ip := net.ParseIP(c)
+		if ip == nil || slices.ContainsFunc(ips, ip.Equal) {
+			continue
+		}
+		ips = append(ips, ip)
+	}
+	return ips
 }
 
 // writeAPIServerServingCert issues the apiserver's serving cert from the cluster CA
