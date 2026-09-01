@@ -222,8 +222,13 @@ func TestM3_InPodKubectlAndDNSOnWorker(t *testing.T) {
 	pod := nativePod("m3-worker-access", "/bin/sh", "-c",
 		fmt.Sprintf(`%s resolve -name kubernetes.default.svc && %s apicall -path /api/v1/namespaces/%s/pods -expect-status 200`, bin, bin, ns))
 	pod.Spec.ServiceAccountName = sa
-	pod.Spec.NodeSelector = nil // pin explicitly to the worker, not the os=darwin scheduler default
-	pod.Spec.NodeName = worker
+	// Pin to the worker THROUGH the scheduler: the admission policy requires the
+	// os=darwin selector on every pod and rejects a directly-set nodeName, so the
+	// pin is the hostname selector alongside the selector the policy demands.
+	pod.Spec.NodeSelector = map[string]string{
+		"kubernetes.io/os":       "darwin",
+		"kubernetes.io/hostname": worker,
+	}
 	applyAndWaitSucceeded(t, c, pod, 120*time.Second)
 }
 
