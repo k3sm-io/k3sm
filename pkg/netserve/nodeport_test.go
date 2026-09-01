@@ -174,22 +174,10 @@ func stubIfconfig(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-// freePort returns a currently-free TCP port on host (bind :0, read, release).
-func freePort(t *testing.T, host string) int32 {
-	t.Helper()
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
-	if err != nil {
-		t.Fatalf("reserve free port on %s: %v", host, err)
-	}
-	port := int32(ln.Addr().(*net.TCPAddr).Port)
-	_ = ln.Close()
-	return port
-}
-
 // safePort returns a free port on host drawn from the NodePort range
 // (30000-32767) rather than an OS-assigned ephemeral one.
 //
-// freePort's bind(:0) draws from the darwin ephemeral range
+// A bind(:0) draws from the darwin ephemeral range
 // (net.inet.ip.portrange.first=49152 .. last=65535) and then releases the port
 // before the proxy binds it. Under `go test ./...` the module's packages run as
 // concurrent processes all allocating ephemeral sockets, so that window can be

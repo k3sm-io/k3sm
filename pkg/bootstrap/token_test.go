@@ -17,7 +17,9 @@ limitations under the License.
 package bootstrap_test
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -136,5 +138,57 @@ func TestFileTokenStoreRoundTrip(t *testing.T) {
 	clock.now = clock.now.Add(2 * time.Hour)
 	if err := verifier.VerifyToken(tok); !errors.Is(err, bootstrap.ErrTokenExpired) {
 		t.Errorf("expired err = %v, want ErrTokenExpired", err)
+	}
+}
+
+// TestFileTokenStoreSaveDoesNotUseAFixedTempName pins the atomicity the store's
+// cross-process contract rests on. `k3sm token create` and the running supervisor are
+// separate processes over one file, and the store's mutex serialises neither, so a
+// scratch file named for the store path alone is a name BOTH processes write into —
+// their writes interleave and the second rename commits the splice.
+//
+// The other process is stood in for by a directory occupying that fixed name: a
+// stand-in, chosen because it makes the dependency fail on every run instead of on an
+// unlucky interleaving. A save that needs "<path>.tmp" cannot get past it; a save that
+// picks its own name never looks at it. The test also asserts the successful save
+// leaves no temp litter behind for the next one to inherit.
+func TestFileTokenStoreSaveDoesNotUseAFixedTempName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, bootstrap.BootstrapTokensFile)
+	store := bootstrap.NewFileTokenStore(path, nil)
+
+	if _, _, _, err := store.Create(time.Hour); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	// Another process holds the name a fixed-temp implementation would reach for.
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
+		t.Fatalf("occupy the fixed temp name: %v", err)
+	}
+
+	if _, _, _, err := store.Create(time.Hour); err != nil {
+		t.Fatalf("second create with the fixed temp name occupied: %v", err)
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the store: %v", err)
+	}
+	var recs []map[string]any
+	if err := json.Unmarshal(b, &recs); err != nil {
+		t.Fatalf("the committed store is not valid JSON: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Errorf("store holds %d records, want 2 — a save was lost", len(recs))
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != bootstrap.BootstrapTokensFile && e.Name() != bootstrap.BootstrapTokensFile+".tmp" {
+			t.Errorf("save left a temp file behind: %s", e.Name())
+		}
 	}
 }

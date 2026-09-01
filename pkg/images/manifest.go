@@ -42,12 +42,12 @@ var ErrManifest = errors.New("mirror manifest")
 // to exist.
 var digestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
-// A Manifest is the parsed hack/images/mirror.yaml.
+// Manifest is the parsed hack/images/mirror.yaml.
 type Manifest struct {
 	Images []Entry `json:"images"`
 }
 
-// An Entry records one mirrored image: where it came from, where k3sm reads it, the
+// Entry records one mirrored image: where it came from, where k3sm reads it, the
 // durable tag that keeps the digest from being garbage-collected, and the per-platform
 // manifest digests inside the index.
 type Entry struct {
@@ -58,7 +58,7 @@ type Entry struct {
 	Platforms []Platform `json:"platforms"`
 }
 
-// A Platform is one per-arch manifest inside a mirrored index.
+// Platform is one per-arch manifest inside a mirrored index.
 type Platform struct {
 	// Platform is os/arch, optionally os/arch/variant.
 	Platform string `json:"platform"`
