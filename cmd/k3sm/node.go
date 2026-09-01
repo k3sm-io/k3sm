@@ -894,7 +894,7 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 //   - buildPodNetAdapter, below — the node's ALLOCATING Network. darwin-net stays
 //     the sole node-/24 allocator, and this is the instance that holds that
 //     allocator's state.
-//   - ensureAdvertisedNodeAlias (server.go step 4d) — a stateless throwaway used
+//   - ensureAdvertisedNodeAlias (server.go step 4g) — a stateless throwaway used
 //     ONLY for EnsureNodeAlias, which touches the alias manager and nothing else:
 //     the node's .1 lies outside the allocator's [.2,.254] range, so no IPAM state
 //     is read or written and the two instances cannot disagree about any pod's IP.
@@ -902,7 +902,7 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 // The safety of a second instance rests on that ONE property (alias-only use), not
 // on call ordering: podnet's mutex is per-Network, so two instances serialize
 // nothing between them. Today the call sites are strictly sequential within
-// runServer (step 4d completes before step 5 builds the adapter) and the alias
+// runServer (step 4g completes before step 5 builds the adapter) and the alias
 // operation is idempotent besides, but do NOT rely on that — if a second
 // construction ever needs Setup/Teardown/SweepStale, share the allocating instance
 // instead of building another.

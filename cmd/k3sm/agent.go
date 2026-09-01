@@ -39,7 +39,6 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
-	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netserve"
 )
 
@@ -72,7 +71,7 @@ type agentOptions struct {
 // pod-support shims are overridable here, as they are on `k3sm server` / `k3sm
 // node` — is unit-testable without parsing argv through a live join.
 func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
-	fs.StringVar(&opts.server, "server", "", "control-plane mesh host (e.g. 100.64.0.1) to join")
+	fs.StringVar(&opts.server, "server", "", "control-plane host to join — in practice an UNDERLAY address (a LAN IP or DNS name), because the join must reach <host>:9345 before this node has any mesh to route over")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN)")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
@@ -161,7 +160,15 @@ func runAgent(args []string) error {
 	// into; it stays nil under `--network none`, where there is no proxy to feed.
 	var datapath *netserve.Server
 	if mode.DataPath() {
-		if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, mode, logger); err != nil {
+		if err := bringUpMesh(ctx, meshBringUp{
+			podCIDR:       res.PodCIDR,
+			meshIP:        res.MeshIP,
+			privateKeyB64: res.WGPrivateKeyB64,
+			keyRef:        meshKeyRef,
+			peers:         res.Peers,
+			listenPort:    opts.meshPort,
+			kubeconfig:    kubeconfigPath,
+		}, mode, logger); err != nil {
 			return fmt.Errorf("mesh bring-up: %w", err)
 		}
 		// Built AFTER join+mesh: the proxy's mesh-egress source is this node's
@@ -211,43 +218,52 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 	}
 }
 
-// bringUpMesh constructs the node's wireguard mesh for its assigned pod /24, brings
+// bringUpMesh constructs a node's wireguard mesh for its assigned pod /24, brings
 // the device up (root utun), programs the initial peer snapshot, and starts the
 // MeshPeer watch so endpoint/key changes reconverge. The device Up/Apply calls are
 // the privileged legs exercised live (the two-Mac lab gate).
-func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, kubeconfigPath string, mode hostnet.Mode, logger *slog.Logger) error {
-	self, err := netip.ParsePrefix(res.PodCIDR)
+//
+// It takes DISCRETE fields (meshBringUp) rather than the join result it was born
+// from, because BOTH node roles bring a mesh up: a worker off a network-received
+// JoinResult, and the control-plane node off values it synthesizes locally
+// (enrollSelfAndBringUpMesh). See meshBringUp for why the wire DTO does not
+// travel down here.
+func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger *slog.Logger) error {
+	self, err := netip.ParsePrefix(in.podCIDR)
 	if err != nil {
-		return fmt.Errorf("parse assigned podCIDR %q: %w", res.PodCIDR, err)
+		return fmt.Errorf("parse assigned podCIDR %q: %w", in.podCIDR, err)
 	}
-	meshOpts := []mesh.Option{mesh.WithListenPort(meshPort), mesh.WithLogger(logger)}
+	meshOpts := []mesh.Option{mesh.WithListenPort(in.listenPort), mesh.WithLogger(logger)}
 	if mode.UsesHelper() {
 		// Helper mode: the root netd daemon owns the utun/wireguard datapath and
 		// resolves the private key from a root-only path (the key never crosses the
-		// socket). Provision the key to that path (best-effort: in the pure _k3sm
-		// posture the root-only dir is privileged, so a privileged install/netd step
-		// owns provisioning — the agent passes only the ref).
-		if err := os.WriteFile(filepath.Join(install.MeshKeyDir, meshKeyRef), []byte(res.WGPrivateKeyB64), 0o600); err != nil {
-			logger.Warn("could not provision mesh private key to the root-only path (provision it via the privileged install step)", "path", filepath.Join(install.MeshKeyDir, meshKeyRef), "err", err)
-		}
-		meshOpts = append(meshOpts, mode.MeshOptions(meshKeyRef)...)
+		// socket), so this process provisions the key there and passes only the ref.
+		in.provisionHelperKey(logger)
+		meshOpts = append(meshOpts, mode.MeshOptions(in.keyRef)...)
 	} else {
-		meshOpts = append(meshOpts, mesh.WithPrivateKey(res.WGPrivateKeyB64))
+		meshOpts = append(meshOpts, mesh.WithPrivateKey(in.privateKeyB64))
 	}
 	m, err := mesh.New(self, meshOpts...)
 	if err != nil {
 		return fmt.Errorf("build mesh: %w", err)
 	}
+	// The mesh derives its own mesh-egress /32 from the self prefix. If that
+	// disagrees with the /32 the enroll assigned, this node's routing locality and
+	// its mesh identity have diverged — fail rather than plumb an lo0 alias the
+	// proxy will never source from.
+	if in.meshIP != "" && m.MeshIP().String() != in.meshIP {
+		return fmt.Errorf("mesh device derives mesh-egress %s from podCIDR %s, but the enroll assigned %s", m.MeshIP(), in.podCIDR, in.meshIP)
+	}
 	if err := m.Start(ctx); err != nil {
 		return fmt.Errorf("start mesh device: %w", err)
 	}
-	if err := m.Reconcile(ctx, res.Peers); err != nil {
+	if err := m.Reconcile(ctx, in.peers); err != nil {
 		logger.Error("initial mesh reconcile", "err", err)
 	}
 
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	restCfg, err := clientcmd.BuildConfigFromFlags("", in.kubeconfig)
 	if err != nil {
-		return fmt.Errorf("load node kubeconfig for mesh watch: %w", err)
+		return fmt.Errorf("load kubeconfig for mesh watch: %w", err)
 	}
 	watcher, err := mesh.NewWatcher(restCfg, m, logger)
 	if err != nil {

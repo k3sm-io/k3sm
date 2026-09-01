@@ -251,9 +251,34 @@ func GenerateWireguardKey() (privB64, pubB64 string, err error) {
 	priv[0] &= 248
 	priv[31] &= 127
 	priv[31] |= 64
-	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	privB64 = base64.StdEncoding.EncodeToString(priv[:])
+	pubB64, err = WireguardPublicKey(privB64)
 	if err != nil {
-		return "", "", fmt.Errorf("derive public key: %w", err)
+		return "", "", err
 	}
-	return base64.StdEncoding.EncodeToString(priv[:]), base64.StdEncoding.EncodeToString(pub), nil
+	return privB64, pubB64, nil
 }
+
+// WireguardPublicKey derives the base64 Curve25519 public key of the base64
+// private key privB64. It is the reverse-lookup a node that PERSISTS its private
+// key needs: the key is minted once and reloaded on every restart, so the public
+// key its MeshPeer advertises has to be re-derived rather than re-minted (a
+// re-mint would rotate the identity on every launchd kickstart and strand every
+// peer's AllowedIPs). It never reads or writes the key file itself.
+func WireguardPublicKey(privB64 string) (string, error) {
+	priv, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privB64))
+	if err != nil {
+		return "", fmt.Errorf("decode wireguard private key: %w", err)
+	}
+	if len(priv) != wireguardKeyBytes {
+		return "", fmt.Errorf("wireguard private key is %d bytes, want %d", len(priv), wireguardKeyBytes)
+	}
+	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return "", fmt.Errorf("derive public key: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(pub), nil
+}
+
+// wireguardKeyBytes is the Curve25519 scalar/point size a wireguard key carries.
+const wireguardKeyBytes = 32
