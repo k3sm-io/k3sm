@@ -19,9 +19,12 @@ limitations under the License.
 // M3 stands up a real PKI (ca.go): a CLUSTER CA (the serving anchor a K10 join
 // token pins) and a SIGNING CA (issues the system:node client certs handed to
 // joining nodes), with VerifyPinnedChain implementing CA-hash-pinned join WITHOUT
-// insecure-skip-tls-verify. SelfSignedServing (below) remains the dev/loopback,
-// single-node path: a CA-less self-signed serving cert for the Virtual Kubelet
-// node's :10250 endpoint when there is no cluster CA to issue from.
+// insecure-skip-tls-verify. SelfSignedServing (below) is ONLY the dev/loopback,
+// single-node and standalone-`k3sm node` path: a CA-less self-signed serving cert
+// for the Virtual Kubelet node's :10250 endpoint in the posture where the apiserver
+// names no --kubelet-certificate-authority. Every multi-node node serves a
+// cluster-CA-issued pair instead (CA.IssueServing on the server, the join-delivered
+// leaf on a worker).
 package certs
 
 import (
@@ -38,15 +41,27 @@ import (
 	"time"
 )
 
-// SelfSignedServing returns a TLS certificate for a server whose SANs include
-// every host in dnsNames and every IP in ipAddrs. The kubelet-serving cert k3sm
-// presents on :10250 uses it: the SANs MUST include the node InternalIP so the
-// apiserver — started with --kubelet-preferred-address-types=InternalIP — can
-// dial the node by IP and have the cert verify (closing the M0.3 logs/exec gap).
+// SelfSignedServing returns a SELF-SIGNED TLS certificate for a server whose SANs
+// include every host in dnsNames and every IP in ipAddrs. The SANs MUST include the
+// node InternalIP: the apiserver is started with
+// --kubelet-preferred-address-types=InternalIP, so it dials the node by IP and the
+// cert has to verify against that address (the M0.3 logs/exec gap).
 //
-// The cert is self-signed (no CA) and short-lived; the apiserver's kubelet
-// client trusts it because no --kubelet-certificate-authority is configured in
-// M1. ECDSA P-256 keeps it small and fast.
+// SCOPE — this is the SINGLE-NODE, dev and standalone-`k3sm node` cert, and nothing
+// else. It is correct exactly where the apiserver configures NO
+// --kubelet-certificate-authority: with no CA named, the kubelet client trusts what
+// the node presents, and a CA-issued leaf would buy nothing.
+//
+// On the MULTI-NODE (--mesh-ip) path it is NOT used, and using it there is a defect
+// (B213): that apiserver runs --kubelet-certificate-authority=<cluster CA>, so a
+// self-signed leaf is refused with "x509: certificate signed by unknown authority"
+// and every kubectl logs/exec against the node fails while the node reports Ready.
+// Both node roles therefore carry a CLUSTER-CA-issued pair instead — a worker from
+// its join response (ApproveAndSignKubeletServing over its own CSR), the
+// control-plane node from its own local mint (CA.IssueServing) — and both refuse to
+// start rather than falling back here.
+//
+// ECDSA P-256 keeps it small and fast.
 func SelfSignedServing(dnsNames []string, ipAddrs []net.IP) (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
