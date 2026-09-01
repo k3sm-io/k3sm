@@ -453,6 +453,18 @@ tested rig, in both possible orderings (confine-then-construct and construct-the
 RuntimeClass remains the recommended rung for untrusted or multi-tenant workloads; see
 [above](#no-per-pod-uid-isolation) for why the default native path cannot offer the same boundary.
 
+**Within one `vm` Pod, a container can read volumes it does not mount.** The guest stages the Pod's
+projected-class volumes (configMap, secret, projected, downwardAPI) into a single pooled directory and
+binds each container's declared mounts out of it — but the pooled directory itself is re-exposed inside
+every container. A container that mounts no Secret can therefore still read another container's Secret,
+and the Pod's ServiceAccount token, by reading the staging path directly. It is read-only, and it does
+not cross a Pod boundary — a `vm` Pod cannot see another Pod's volumes — but it is narrower than
+Kubernetes promises, where a container sees only the volumes it mounts.
+
+The practical consequence: **do not rely on container-level volume separation inside a single `vm`
+Pod as a trust boundary.** If two containers must not see each other's credentials, put them in
+separate Pods, where the boundary is the one this RuntimeClass actually enforces.
+
 ### Node capability labels are probed once at daemon start
 
 The `k3sm.io/*` node capability labels — `k3sm.io/virtualization`, `k3sm.io/rosetta`,
