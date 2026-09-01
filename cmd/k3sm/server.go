@@ -364,7 +364,10 @@ func runServer(args []string) error {
 		// root-ca-file"), and which on a work dir that once booted single-node is a stale
 		// CA that anchors nothing — in-pod API TLS then fails cluster-wide.
 		cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
-		logger.Info("multi-node mode: apiserver + join supervisor bound to the mesh interface", "mesh-ip", opts.meshIP)
+		// The supervisor is deliberately NOT mesh-bound: a joining worker reaches
+		// it over the underlay, having no mesh until that join completes (see
+		// bootstrapListenAddr).
+		logger.Info("multi-node mode: apiserver bound to the mesh interface; the worker-join supervisor listens on every interface", "mesh-ip", opts.meshIP)
 	}
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
