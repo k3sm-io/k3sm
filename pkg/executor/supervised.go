@@ -97,7 +97,7 @@ func (c *component) exitDetail() string {
 	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, LogTail(c.logPath, exitLogTailLines))
 }
 
-// exitedNow reports whether the child has left the RUNNING state, asked of the
+// exitedNow reports whether the child has left the running state, asked of the
 // kernel synchronously rather than inferred from the exited channel. It is the
 // deadline tie-break awaitHealthy needs: exited is closed by a reaper goroutine
 // that may not have been scheduled yet, whereas this answer is available the
@@ -198,7 +198,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := ensureWorkDirs(s.cfg.WorkDir); err != nil {
 		return err
 	}
-	// BEFORE anything replaces the staged kine binary or lets the new pin touch the
+	// Before anything replaces the staged kine binary or lets the new pin touch the
 	// database: take the verified pre-migration snapshot if this boot moves an existing
 	// datastore onto a kine pin that has not opened it before. It is a no-op on a fresh
 	// node, on an unchanged pin, and on the Postgres posture (no state.db). It must sit
@@ -210,7 +210,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 			return err
 		}
 	}
-	// Seed the workdir bin from a staged install payload FIRST, so the ensure*
+	// Seed the workdir bin from a staged install payload first, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
 	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion); err != nil {
@@ -232,7 +232,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 		return err
 	}
 	// M10.0 (Res.3): the audit policy + admission-control config the apiserver argv
-	// references MUST exist before startAPIServer — a missing file would wedge
+	// references must exist before startAPIServer — a missing file would wedge
 	// bring-up opaquely until the healthz timeout. Overwritten every boot (the
 	// files track the binary).
 	if err := writeConformanceConfig(s.cfg.WorkDir, s.cfg.PSAEnforceBaseline); err != nil {
@@ -247,10 +247,10 @@ func (s *Supervised) provision(ctx context.Context) error {
 // provisionComponentCerts ensures the cluster + signing CA hierarchy exists (so the
 // apiserver's unconditional --client-ca-file has a CA to trust) and writes the
 // per-component client-cert kubeconfigs the scheduler and controller-manager
-// authenticate with — each its OWN system: identity instead of the shared system:masters
+// authenticate with — each its own system: identity instead of the shared system:masters
 // admin token (the k3s model; closes the M4.1 component-identity divergence). The certs
-// are signed by the SIGNING CA (= --client-ca-file). EnsureHierarchy is idempotent — it
-// LOADS an existing hierarchy (the mesh path in cmd/k3sm/server.go creates it before
+// are signed by the signing CA (= --client-ca-file). EnsureHierarchy is idempotent — it
+// loads an existing hierarchy (the mesh path in cmd/k3sm/server.go creates it before
 // Start), so single-node mints a fresh hierarchy and both paths re-issue the component
 // kubeconfigs against the same CA on every boot. It runs in provision() (before bringUp
 // starts the scheduler/KCM) so the kubeconfigs and the client-CA exist when those
@@ -283,13 +283,13 @@ const componentReadyTimeout = 30 * time.Second
 
 // bringUp starts the components in order and waits for the apiserver to be
 // healthy before starting scheduler + controller-manager. Each bring-up wait
-// SELECTS on child-exit as well as readiness (M10.0, SRE fail-fast): a kine or
+// selects on child-exit as well as readiness (M10.0, SRE fail-fast): a kine or
 // apiserver that dies on a bad flag/config surfaces immediately — with its log
 // tail — instead of wedging opaquely until the healthz timeout.
 //
 // The scheduler and the controller-manager get that same wait, and they need it
 // for a reason the earlier components did not have: they were previously started
-// FIRE-AND-FORGET, so a component that died on its own secure-port bind left
+// fire-and-forget, so a component that died on its own secure-port bind left
 // bring-up reporting success and the failure surfaced far downstream as something
 // else entirely — a control plane with no service-account controller fails at the
 // first namespace bootstrap, which reads as a bootstrap defect and not as a dead
@@ -336,7 +336,7 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 // already holds it, and waited on after, which is what turns every other cause of
 // an early death into an error naming the component that had it.
 func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, start func(context.Context) (*component, error), port int) error {
-	// Fail closed BEFORE the spawn if the port is already held: the wait below
+	// Fail closed before the spawn if the port is already held: the wait below
 	// would be satisfied by the incumbent's listener, so a component that lost
 	// its bind would leave bring-up reporting success (see preflightComponentPort).
 	if err := preflightComponentPort(ctx, name, port); err != nil {
@@ -358,9 +358,9 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 // 0600 PGPASSFILE the kine child reads via PGPASSFILE (kineSecretEnv) and only the
 // password-stripped DSN reaches --endpoint.
 func (s *Supervised) startKine(ctx context.Context) (*component, error) {
-	// Fail closed BEFORE the spawn if the datastore port is already held: a kine we
+	// Fail closed before the spawn if the datastore port is already held: a kine we
 	// start over a foreign listener never gets the port, but the readiness probe
-	// below is satisfied by the INCUMBENT, so bring-up would continue against
+	// below is satisfied by the incumbent, so bring-up would continue against
 	// another cluster's datastore and report healthy (see preflightDatastorePort).
 	if err := preflightDatastorePort(ctx, s.cfg.KinePort); err != nil {
 		return nil, err
@@ -369,7 +369,7 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Record WHICH kine is about to run — version AND build variant. The variant is not
+	// Record which kine is about to run — version and build variant. The variant is not
 	// cosmetic: the same kine tag builds two different SQLite implementations depending
 	// on CGO_ENABLED, and a datastore incident that starts "which sqlite was this?"
 	// should be answerable from the node's own log.
@@ -383,12 +383,12 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	return s.spawnEnv(ctx, "kine", env, args...)
 }
 
-// kineSecretEnv relocates a Postgres DSN password OFF argv. For a datastore endpoint
+// kineSecretEnv relocates a Postgres DSN password off argv. For a datastore endpoint
 // carrying a password it writes a 0600 PGPASSFILE in the work-dir and returns the
 // PGPASSFILE env var for the kine child; kine's pgx driver (pgx.ParseConfig) reads the
 // password from it as the libpq env fallback when the DSN omits it. It returns nil for
 // the SQLite path or a password-less DSN. Writing here (not in the pure kineArgs) keeps
-// the secret out of both argv AND the args the tests inspect.
+// the secret out of both argv and the args the tests inspect.
 func (s *Supervised) kineSecretEnv() ([]string, error) {
 	if s.cfg.DatastoreEndpoint == "" {
 		return nil, nil
@@ -427,15 +427,15 @@ func (s *Supervised) kineSecretEnv() ([]string, error) {
 // infra VIPs are not blackholed over the mesh — that is M3.3, not here.
 //
 // The ServiceAccount admission plugin (in the default enabled set — the M4.1
-// --enable-admission-plugins=NodeRestriction is ADDITIVE, so ServiceAccount stays
+// --enable-admission-plugins=NodeRestriction is additive, so ServiceAccount stays
 // on) stamps spec.serviceAccountName and injects the projected SA volume (token +
 // kube-root-ca.crt + namespace) the provider materializes; the root-ca-cert-publisher
 // controller (kept by the scoped --controllers "*") publishes kube-root-ca.crt to
 // every namespace.
 //
-// NOTE: the DESIGN's --feature-gates=ConsistentListFromCache=false (the kine#577
-// watch-staleness mitigation) is NOT passed: in the pinned kwok-ci/k8s build
-// (k8s v1.36.2) that gate is GA-LOCKED to true and the apiserver refuses to
+// The DESIGN's --feature-gates=ConsistentListFromCache=false (the kine#577
+// watch-staleness mitigation) is not passed: in the pinned kwok-ci/k8s build
+// (k8s v1.36.2) that gate is GA-locked to true and the apiserver refuses to
 // start if it is set false ("feature is locked to true"). It is left at its
 // locked default; the soak is revisited if k3sm ever pins a kube version where
 // the gate is still settable.
@@ -455,7 +455,7 @@ func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 // NodeIP (loopback) and the kubelet-CA / anonymous-auth flags are omitted.
 func apiServerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
-	// ONE derivation, shared with apiServerURL: what the apiserver binds is what the
+	// One derivation, shared with apiServerURL: what the apiserver binds is what the
 	// probe and the in-process kubeconfigs dial (see apiServerHost).
 	bind := apiServerHost(cfg)
 	authzMode := cfg.AuthorizationMode
@@ -470,15 +470,15 @@ func apiServerArgs(cfg Config) []string {
 		// in-process as the unprivileged _k3sm user (NOT via the root netd helper,
 		// which rejects wildcards).
 		//
-		// CORRECTED (B116) — this comment used to claim a <1024 NodePort would fail
-		// EACCES on the wildcard. That is the LINUX rule, and it is false on Darwin:
-		// re-measured on macOS 26, `0.0.0.0:1023` binds fine as an ordinary uid while
-		// `127.0.0.1:1023` returns EACCES — inverted from Linux. So the range is NOT
-		// pinned for a privilege reason; it is pinned so the range k3sm's OWN wildcard
-		// listeners occupy is explicit and single-sourced (pkg/ports), which is what
-		// the reserved-port admission guard and the svclb bind refusal derive from.
-		// The integration canary cmd/k3sm::TestWildcardPrivilegedBindPremise pins the
-		// measured OS behaviour so a future XNU change is loud rather than silent.
+		// A <1024 NodePort does not need EACCES protection here: that is the Linux
+		// rule, and it is false on Darwin — measured on macOS 26, `0.0.0.0:1023`
+		// binds fine as an ordinary uid while `127.0.0.1:1023` returns EACCES
+		// (inverted from Linux). So the range is not pinned for a privilege reason;
+		// it is pinned so the range k3sm's own wildcard listeners occupy is explicit
+		// and single-sourced (pkg/ports), which is what the reserved-port admission
+		// guard and the svclb bind refusal derive from. The integration canary
+		// cmd/k3sm::TestWildcardPrivilegedBindPremise pins the measured OS behaviour
+		// so a future XNU change is loud rather than silent.
 		"--service-node-port-range", ports.NodePortRange(),
 		"--service-account-key-file", saPubPath(wd),
 		"--service-account-signing-key-file", saKeyPath(wd),
@@ -492,18 +492,18 @@ func apiServerArgs(cfg Config) []string {
 		// (pkg/rbac.Provision) before the VK node / join supervisor start.
 		"--authorization-mode", authzMode,
 		// Add NodeRestriction to the default-enabled admission set (--enable-admission-
-		// plugins is ADDITIVE, so the ServiceAccount plugin M2.4 relies on stays on).
-		// It confines a system:node:<name> identity to mutating only its OWN Node/Pod
-		// objects — the admission half of the Node authorizer. It does NOT cover CRDs,
+		// plugins is additive, so the ServiceAccount plugin M2.4 relies on stays on).
+		// It confines a system:node:<name> identity to mutating only its own Node/Pod
+		// objects — the admission half of the Node authorizer. It does not cover CRDs,
 		// so the net.k3sm.io/MeshPeer write stays guarded by bootstrap.AuthorizeMeshPeerWrite.
 		"--enable-admission-plugins=NodeRestriction",
-		// B76: enable the BETA MutatingAdmissionPolicy API + feature gate so the
+		// B76: enable the beta MutatingAdmissionPolicy API + feature gate so the
 		// EnsureDaemonSetTolerationMutation policy (which injects the provider toleration
 		// into DaemonSet-owned pods) is actually evaluated. MutatingAdmissionPolicy is
-		// BETA and OFF by default at the pinned k8s (v1.36.2); without BOTH of these the
-		// policy is provisioned but a runtime no-op. CAUTION: an invalid feature-gate name
-		// or a v1beta1 group that the pinned apiserver does not serve makes kube-apiserver
-		// REFUSE to start — the gate name + v1beta1 serving MUST be lab-verified against
+		// beta and off by default at the pinned k8s (v1.36.2); without both of these the
+		// policy is provisioned but a runtime no-op. Caution: an invalid feature-gate name
+		// or a v1beta1 group the pinned apiserver does not serve makes kube-apiserver
+		// refuse to start — the gate name + v1beta1 serving must be lab-verified against
 		// the kwok-ci v1.36.2 apiserver before a real rollout.
 		"--runtime-config=admissionregistration.k8s.io/v1beta1=true",
 		"--feature-gates=MutatingAdmissionPolicy=true",
@@ -511,11 +511,11 @@ func apiServerArgs(cfg Config) []string {
 		// Metadata/None-only (see auditPolicyDoc — no Secret cleartext at rest),
 		// the log lands in the 0700 <workDir>/audit dir, and rotation is bounded
 		// (100MiB × (3 backups + 1 live) ≈ 400MB worst case — the honest ENOSPC
-		// bound, off the datastore's db/ subtree). --audit-log-mode is deliberately
-		// NOT set: the upstream default is "blocking" (each event is written before
-		// the response returns), and the stricter blocking-strict — which FAILS the
-		// request when the audit write fails — is deliberately not used: a full
-		// audit volume must degrade to dropped events, never stall serving.
+		// bound, off the datastore's db/ subtree). --audit-log-mode is not set: the
+		// upstream default is "blocking" (each event is written before the response
+		// returns); the stricter blocking-strict, which fails the request when the
+		// audit write fails, is not used — a full audit volume must degrade to
+		// dropped events, never stall serving.
 		"--audit-policy-file", auditPolicyPath(wd),
 		"--audit-log-path", AuditLogPath(wd),
 		"--audit-log-maxsize=100",
@@ -557,7 +557,7 @@ func apiServerArgs(cfg Config) []string {
 }
 
 // loopbackBindAddress is the address the co-located control-plane components
-// serve their secure port on. It is INVARIANT, and single-sourced here because it
+// serve their secure port on. It is invariant, and single-sourced here because it
 // is the property that makes renumbering those ports safe.
 const loopbackBindAddress = "127.0.0.1"
 
@@ -565,9 +565,9 @@ const loopbackBindAddress = "127.0.0.1"
 // component whose HTTPS surface (/healthz, /metrics) is consumed only by the
 // co-located control plane — the scheduler and the controller-manager.
 //
-// Two facts are deliberately rendered TOGETHER by one function. The PORT varies
+// Two facts are rendered together by one function on purpose. The port varies
 // per server, because each of these is a singleton listener and a second control
-// plane on one Mac must not contend for the upstream default. The BIND ADDRESS
+// plane on one Mac must not contend for the upstream default. The bind address
 // does not vary at all: these components answer on loopback and nowhere else, so
 // a caller choosing a port can never become the route by which they start
 // answering off-host. Splitting the pair would let the second fact drift while
@@ -583,12 +583,12 @@ func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 
 // schedulerArgs renders the kube-scheduler argv from cfg. The --kubeconfig /
 // --authentication-kubeconfig / --authorization-kubeconfig point at the scheduler's
-// OWN client-cert kubeconfig (CN=system:kube-scheduler, provisioned by
-// provisionComponentCerts), NOT the system:masters admin kubeconfig — so the
+// own client-cert kubeconfig (CN=system:kube-scheduler, provisioned by
+// provisionComponentCerts), not the system:masters admin kubeconfig — so the
 // apiserver's bootstrap system:kube-scheduler ClusterRoleBinding actually constrains
 // it (the k3s model). Pure so the M6.0 leader-election posture is table-tested:
 // --leader-elect is false single-node (one candidate, no lease churn — the M1–M5
-// default, byte-unchanged) and true in HA (Postgres multi-writer) so only ONE server's
+// default, byte-unchanged) and true in HA (Postgres multi-writer) so only one server's
 // scheduler is active (two active schedulers double-bind pods).
 func schedulerArgs(cfg Config) []string {
 	kc := schedulerKubeconfigPath(cfg.WorkDir)
@@ -601,17 +601,17 @@ func schedulerArgs(cfg Config) []string {
 	return append(args, LoopbackServingArgs(cfg.schedulerPort())...)
 }
 
-// startControllerManager launches kube-controller-manager with the SCOPED
+// startControllerManager launches kube-controller-manager with the scoped
 // controller set (node-side controllers dropped; endpointslice kept).
 func (s *Supervised) startControllerManager(ctx context.Context) (*component, error) {
 	return s.spawn(ctx, "kube-controller-manager", controllerManagerArgs(s.cfg)...)
 }
 
 // controllerManagerArgs renders the kube-controller-manager argv from cfg. The three
-// kubeconfig flags point at the KCM's OWN client-cert kubeconfig
-// (CN=system:kube-controller-manager, provisioned by provisionComponentCerts), NOT the
+// kubeconfig flags point at the KCM's own client-cert kubeconfig
+// (CN=system:kube-controller-manager, provisioned by provisionComponentCerts), not the
 // system:masters admin kubeconfig. Because the system:kube-controller-manager
-// ClusterRole is NOT a superset of the per-controller roles, the move REQUIRES
+// ClusterRole is not a superset of the per-controller roles, the move requires
 // --use-service-account-credentials=true so each controller authenticates as its own
 // service account (system:controller:<name>, bound by the apiserver's bootstrap RBAC) —
 // without it the deployment/endpointslice/etc. controllers would be RBAC-denied. The
@@ -660,12 +660,12 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*c
 // its own process group, redirecting its output to a per-component log file, and
 // records it for teardown. extraEnv is appended to the inherited environment (used to
 // pass the kine child its PGPASSFILE out-of-band, keeping the Postgres secret off
-// argv). It does NOT block on the child — components run until Stop — but it DOES
+// argv). It does not block on the child — components run until Stop — but it does
 // start a reaper goroutine (`go cmd.Wait()`) that closes the component's exited
 // channel the moment the child dies, so the bring-up waits (awaitHealthy) and
 // stopComponent can select on child-exit. That goroutine's lifetime is the child's
-// lifetime — typically the whole process life for a healthy component — which is
-// deliberate and leak-free: it parks in wait4 and ends exactly when the child does.
+// lifetime — typically the whole process life for a healthy component — and is
+// leak-free: it parks in wait4 and ends exactly when the child does.
 //
 // The log file is mode 0600 (not the umask default 0644): a component log can carry
 // bearer tokens and the kine datastore endpoint, so it must not be world-readable.
@@ -689,7 +689,7 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	s.cfg.Logger.Info("started control-plane component", "component", name, "pid", cmd.Process.Pid, "log", logPath)
 
 	c := &component{name: name, cmd: cmd, log: lf, logPath: logPath, exited: make(chan struct{})}
-	// The single reaper: the ONLY cmd.Wait for this child (stopComponent selects on
+	// The single reaper: the only cmd.Wait for this child (stopComponent selects on
 	// exited instead of racing a second Wait). waitErr is written before the close,
 	// so a reader that has observed <-exited reads it race-free.
 	go func() {
@@ -705,13 +705,13 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 
 // waitHealthz waits for the apiserver to report healthz ok, failing fast (with
 // the log tail) if the apiserver child exits first. The 90s healthTimeout is
-// unchanged — fail-fast only ever SHORTENS the wedge, never lengthens it.
+// unchanged — fail-fast only ever shortens the wedge, never lengthens it.
 func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
 	return awaitHealthy(ctx, api.name, api.exited, api.exitedNow, s.Ready, healthTimeout, 500*time.Millisecond, api.exitDetail)
 }
 
 // awaitHealthy is the bring-up wait: it polls ready() every poll until it
-// reports true, SELECTING against child-exit the whole time. It returns nil on
+// reports true, selecting against child-exit the whole time. It returns nil on
 // ready; an early-exit error (naming the component + exitDetail's log tail) the
 // moment exited closes; a timeout error after timeout; or ctx.Err(). It is a
 // pure function over channels + funcs so the fail-fast contract is table-tested
@@ -719,18 +719,18 @@ func (s *Supervised) waitHealthz(ctx context.Context, api *component) error {
 // concurrently-true ready (a dead child is never "healthy").
 //
 // exitedNow is the tie-breaker that makes "the child died" beat "the deadline
-// expired" DETERMINISTICALLY. The exited channel is closed by a reaper goroutine,
-// so a child can be long dead while the close has not been SCHEDULED yet — under
+// expired" deterministically. The exited channel is closed by a reaper goroutine,
+// so a child can be long dead while the close has not been scheduled yet — under
 // full-suite parallel load that lag was measured in seconds, which is exactly how
 // a dead child came back as an opaque "not healthy within 10s". So the deadline
 // is not allowed to author its error until exitedNow — an authoritative,
-// synchronous kernel probe running on THIS goroutine — has confirmed the child is
+// synchronous kernel probe running on this goroutine — has confirmed the child is
 // still alive. When it says the child has exited, the wait blocks for the close
 // (imminent by construction: the kernel has already released the child, so the
 // reaper only needs a scheduling slot) and returns the exit-shaped error instead.
 // A nil exitedNow disables the tie-break, leaving the deadline unqualified.
 //
-// The probe is consulted ONLY at deadline expiry — one syscall per bring-up wait,
+// The probe is consulted only at deadline expiry — one syscall per bring-up wait,
 // not one per poll — because that is the only place a wrong error shape is built.
 func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exitedNow func() bool, ready func(context.Context) bool, timeout, poll time.Duration, exitDetail func() string) error {
 	deadline := time.Now().Add(timeout)
@@ -802,10 +802,10 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK && string(buf[:n]) == "ok"
 }
 
-// Stop tears the control plane down in REVERSE dependency order: the components
+// Stop tears the control plane down in reverse dependency order: the components
 // were appended in start order (kine, apiserver, scheduler, controller-manager),
 // so walking the slice in reverse stops the apiserver and the controllers first
-// and kine LAST, after which the SQLite DB is no longer in use. Idempotent.
+// and kine last, after which the SQLite DB is no longer in use. Idempotent.
 func (s *Supervised) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	comps := s.comps
@@ -814,7 +814,7 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Reverse start order = correct shutdown order, but kine (index 0) must die
-	// LAST. Build the explicit order: apiserver, scheduler, controller-manager,
+	// last. Build the explicit order: apiserver, scheduler, controller-manager,
 	// then kine.
 	for _, c := range shutdownOrder(comps) {
 		s.stopComponent(c)
@@ -823,7 +823,7 @@ func (s *Supervised) Stop(ctx context.Context) error {
 }
 
 // shutdownOrder returns comps ordered for a clean teardown: the apiserver drains
-// FIRST (it stops writing), then scheduler + controller-manager, then kine LAST
+// first (it stops writing), then scheduler + controller-manager, then kine last
 // (so no component loses its datastore mid-shutdown). Components arrive in start
 // order [kine, apiserver, scheduler, controller-manager]; this pulls kine to the
 // end and keeps the rest in start order (apiserver before the controllers).
