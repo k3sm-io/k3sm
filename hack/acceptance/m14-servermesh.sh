@@ -22,7 +22,8 @@
 #   CI TIER (always runs, CGO_ENABLED=1) — the unit-provable half: the index-0 pin
 #   and its fail-closed foreign-claim handling, the list-back verification, the
 #   lowest-free-index allocator table, the persistent wireguard identity, the
-#   underlay endpoint derivation, and — the legs that catch this repo's recurring
+#   underlay endpoint derivation, the supervisor's listen-address derivation and
+#   the mesh-IP alias ensure, and — the legs that catch this repo's recurring
 #   defect class of a well-tested helper bring-up never calls — the structural
 #   ORDERING pins read out of cmd/k3sm/server.go. Plus the two-actor race test that
 #   pins the d4 happens-before, run under -race.
@@ -31,15 +32,24 @@
 #   legs fail to build and every structural pin fails.
 #
 #   ROOT/INTEGRATION TIER (K3SM_LAB=1 AND root, a single Mac) — a live
-#   `k3sm server --mesh-ip 127.0.0.1 --network direct`, built WITH -race, asserting
-#   the index-0 MeshPeer object, the wireguard device artifacts, and the
-#   HAZARD-REGRESSION round trip. Root is required for --network direct (the utun,
-#   the lo0 aliases, the pf anchor); K3SM_LAB gates it because it boots a real
-#   control plane and takes over host network state. Under K3SM_LAB=1 WITHOUT root
-#   the tier FAILS rather than skipping: this row is manual:true in
-#   hack/acceptance/phases.json, so the release process trusts its exit 0 under
-#   K3SM_LAB=1 as "proven", and a silent skip there would green a milestone whose
-#   proof was never run.
+#   `k3sm server --mesh-ip 100.64.0.1 --network direct`, built WITH -race, asserting
+#   the index-0 MeshPeer object, the wireguard device artifacts, the join
+#   supervisor's UNDERLAY reachability, and the HAZARD-REGRESSION round trip. Root
+#   is required for --network direct (the utun, the lo0 aliases, the pf anchor);
+#   K3SM_LAB gates it because it boots a real control plane and takes over host
+#   network state. Under K3SM_LAB=1 WITHOUT root the tier FAILS rather than
+#   skipping: this row is manual:true in hack/acceptance/phases.json, so the
+#   release process trusts its exit 0 under K3SM_LAB=1 as "proven", and a silent
+#   skip there would green a milestone whose proof was never run.
+#
+#   THE MESH IP IS REAL, AND THAT IS THE POINT. This tier booted --mesh-ip
+#   127.0.0.1 until the first live non-loopback boot, and loopback masked two
+#   defects at once: the apiserver bound an address the host already answered on
+#   (so nothing noticed that only mesh.Start ever plumbed the mesh IP, three
+#   phases too late), and a loopback-bound join supervisor was still reachable
+#   from the same host (so nothing noticed it answered on the mesh address alone,
+#   which no un-joined worker can route to). Booting 100.64.0.1 — the index-0
+#   mesh-egress /32 the rest of this gate already asserts — exercises both.
 #
 # WHAT THIS GATE DOES NOT PROVE: a cross-node datapath. One Mac has no second
 # machine to route between, so the actual wireguard egress path — the one this
@@ -137,6 +147,25 @@ else
 	ladder no "m14.1  ordering: ensureMeshPeerCRD(:${crd_ln:-none}) < enrollSelfAndBringUpMesh(:${enr_ln:-none}) < netserve.New(:${net_ln:-none}) < startBootstrapServer(:${sup_ln:-none})"
 fi
 
+# The two bring-up-reachability fixes the first real --mesh-ip boot forced, read
+# structurally so the gate log names them even when the root tier is not run.
+r=ok
+grep -qE 'func bootstrapListenAddr\(' "$ENROLL_GO" || r=no
+grep -qE 'Addr: +bootstrapListenAddr\(meshIP\),' "$ENROLL_GO" || r=no
+# The retired mesh-scoped bind, matched as CODE.
+grep -qE 'Addr: +net\.JoinHostPort\(meshIP,' "$ENROLL_GO" && r=no
+ladder "$r" "m14.1  the join supervisor derives its listen address (wildcard with a mesh) instead of binding meshIP:9345"
+
+a=ok
+grep -qE 'func ensureMeshIPAlias\(' "$K3SM_ROOT/cmd/k3sm/meshalias.go" 2>/dev/null || a=no
+ali_ln="$(grep -n 'ensureMeshIPAlias(ctx, opts\.meshIP,' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
+sup_start_ln="$(grep -n 'exec\.Start(ctx)' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
+if [ "$a" = ok ] && [ -n "$ali_ln" ] && [ -n "$sup_start_ln" ] && [ "$ali_ln" -lt "$sup_start_ln" ]; then
+	ladder ok "m14.1  ensureMeshIPAlias(:$ali_ln) < exec.Start(:$sup_start_ln) — the mesh IP is a host address before the apiserver binds it"
+else
+	ladder no "m14.1  ensureMeshIPAlias(:${ali_ln:-none}) < exec.Start(:${sup_start_ln:-none}) — the apiserver would bind a --mesh-ip nothing has plumbed"
+fi
+
 # d8 — the doc deliverable, and the retirement of the claim it replaces.
 d=ok
 grep -q 'destination-scoped' "$DESIGN_MD" || d=no
@@ -208,6 +237,18 @@ run_test "m14.5" 0 TestRunServerSharesOneMeshEnroller               ./cmd/k3sm/
 run_test "m14.5" 0 TestServerMeshBringUpIsLogAndContinue            ./cmd/k3sm/
 run_test "m14.5" 0 TestServerNetserveWiresTheMeshEgressSource       ./cmd/k3sm/
 
+# ---- m14.7 — the two defects the first REAL --mesh-ip boot exposed ----------
+# Both were invisible to this gate while its lab tier booted --mesh-ip 127.0.0.1;
+# the root tier below now boots $SELF_MESH_IP, and these are their unit-provable
+# halves. Each is red at the pre-fix tree by construction (the derivation and the
+# ensure did not exist).
+run_test "m14.7" 4 TestBootstrapListenAddrIsWildcardOnTheMeshPath   ./cmd/k3sm/
+run_test "m14.7" 0 TestStartBootstrapServerUsesTheDerivedListenAddr ./cmd/k3sm/
+run_test "m14.7" 6 TestEnsureMeshIPAliasDecision                    ./cmd/k3sm/
+run_test "m14.7" 4 TestHostAliasOpsMirrorsTheNetworkBackendSplit    ./cmd/k3sm/
+run_test "m14.7" 0 TestAddrIsLocalSeesLoopback                      ./cmd/k3sm/
+run_test "m14.7" 0 TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane ./cmd/k3sm/
+
 # ---- m14.6 — the darwin-net half, under -race ------------------------------
 # The scoping decision tables (foreign /24 ⇒ bound; own /24, loopback, node LAN,
 # ClusterIP VIP, LocalityUnknown ⇒ unbound, for BOTH TCP and UDP) are M14.2-d1's
@@ -235,10 +276,11 @@ fi
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
 	echo "M14.2 ROOT tier (run: sudo K3SM_LAB=1 $0):"
-	lab_pending "m14.L0  \`k3sm server --mesh-ip 127.0.0.1 --network direct\` (built -race) reaches a healthy apiserver"
+	lab_pending "m14.L0  \`k3sm server --mesh-ip $SELF_MESH_IP --network direct\` (built -race) reaches a healthy apiserver — a REAL mesh IP, which nothing plumbs unless bring-up ensures the lo0 alias first"
 	lab_pending "m14.L1  the index-0 MeshPeer exists: name=<node>, podCIDR=$SELF_POD_CIDR, meshIP=$SELF_MESH_IP, non-empty publicKey (RED before: no such object at all)"
 	lab_pending "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed and the io.k3sm.mesh pf anchor names a utun (the device is up)"
 	lab_pending "m14.L3  wireguard is listening on UDP :51820 — the endpoint the index-0 MeshPeer advertises"
+	lab_pending "m14.L3b the join supervisor answers on the UNDERLAY: TCP :9345 bound to the WILDCARD, and a TLS handshake completes against this host's LAN address (RED before: bound to $SELF_MESH_IP only, so every pre-mesh worker join is refused)"
 	lab_pending "m14.L4  HAZARD REGRESSION: a same-node ClusterIP round trip completes with MeshEgressIP wired, with remote-destination dials concurrently in flight"
 	lab_pending "m14.L5  the -race build reports no DATA RACE across the concurrent local/remote dials"
 	lab_pending "m14.L6  [two-Mac harness] cross-node pod traffic actually traverses the mesh — hack/lab/m3.sh, NOT proven on one Mac"
@@ -287,7 +329,10 @@ m14_down() {
 	# Give the server its shutdown window so it removes the lo0 alias and the pf
 	# anchor itself; sweep what it left behind either way.
 	sleep 3
-	for port in "$M14_KUBELET_PORT" "$M14_SCHED_PORT" "$M14_CM_PORT" "$APISERVER_PORT" "$KINE_PORT"; do
+	# 9345 is the join supervisor's own port; it is swept explicitly because the
+	# supervisor now binds the WILDCARD, so an orphan would block the next run's
+	# bind on every address rather than only on the mesh IP.
+	for port in "$M14_KUBELET_PORT" "$M14_SCHED_PORT" "$M14_CM_PORT" "$APISERVER_PORT" "$KINE_PORT" 9345; do
 		reap_port "$port" warn || true
 	done
 	ifconfig lo0 -alias "$SELF_MESH_IP" 2>/dev/null || true
@@ -317,14 +362,23 @@ if ! ( cd "$K3SM_ROOT" && "${GOFLAGS_ENV[@]}" go build -race -o "$RACE_BIN" ./cm
 fi
 
 echo "M14.2 ROOT tier: booting a mesh-path control plane in $M14_WORK"
-# --mesh-ip 127.0.0.1: the apiserver and the join supervisor bind it, so it has to
-# be an address the host ALREADY answers on — the mesh-egress /32 does not exist
-# until mesh.Start plumbs it, which is after the executor starts. A loopback mesh
-# is a legitimate single-host cluster; the CROSS-node address is the two-Mac slice.
+# --mesh-ip $SELF_MESH_IP: a REAL, non-loopback mesh IP — the index-0 mesh-egress
+# /32 this gate already asserts everywhere else.
+#
+# It booted 127.0.0.1 until the first live non-loopback boot, and that masked two
+# defects. (1) The apiserver binds --mesh-ip at bring-up step 1, but the only code
+# that plumbed the address was mesh.Start at step 4b; loopback already exists, so
+# nothing failed. On a real mesh IP bring-up died at "listen tcp 100.64.0.1:6444:
+# bind: can't assign requested address" until runServer learned to ensure the lo0
+# alias first. (2) The join supervisor bound meshIP:9345; on loopback that is still
+# reachable from this host, so a same-Mac join passed while a real worker dialing
+# the underlay was refused. Booting the real address exercises both, and L2/L3b
+# below read the artifacts each fix produces.
+#
 # The ingress listeners are disabled so the tier does not contend for :80/:443.
 nohup env CGO_ENABLED=1 "$RACE_BIN" server \
 	--work-dir "$SERVER_WORKDIR" --node-name "$M14_NODE" \
-	--mesh-ip 127.0.0.1 --network direct --runtime hostprocess \
+	--mesh-ip "$SELF_MESH_IP" --network direct --runtime hostprocess \
 	--pod-root "$M14_WORK/pods" \
 	--api-port "$M14_API_PORT" --kine-port "$M14_KINE_PORT" \
 	--kubelet-port "$M14_KUBELET_PORT" \
@@ -350,7 +404,7 @@ while [ $n -lt 900 ]; do
 	kill -0 "$SERVER_PID" 2>/dev/null || { echo "k3sm server exited during bring-up:" >&2; break; }
 	sleep 1; n=$((n+1))
 done
-ladder "$up" "m14.L0  \`k3sm server --mesh-ip 127.0.0.1 --network direct\` (-race build) reached a healthy apiserver"
+ladder "$up" "m14.L0  \`k3sm server --mesh-ip $SELF_MESH_IP --network direct\` (-race build) reached a healthy apiserver on a REAL mesh IP"
 if [ "$up" != ok ]; then
 	tail -40 "$M14_WORK/server.log" >&2
 	echo "----------------------------------------"
@@ -411,6 +465,43 @@ if lsof -nP -iUDP:51820 2>/dev/null | grep -q k3sm; then
 	ladder ok "m14.L3  wireguard is listening on UDP :51820 — the port the index-0 MeshPeer's endpoint advertises"
 else
 	ladder no "m14.L3  wireguard is listening on UDP :51820"
+fi
+
+# ---- m14.L3b — the join supervisor answers on the UNDERLAY ------------------
+# The join is a chicken-and-egg: a worker dials :9345 to GET a mesh, so it has to
+# reach the supervisor over the underlay, which is why the MeshPeer this endpoint
+# writes advertises an underlay address too (asserted at L1). Bound to the mesh IP
+# alone, the supervisor answers only where no un-joined worker can route — the
+# live symptom was `lsof` showing 100.64.0.1:9345 and a worker's join refused.
+#
+# RED BEFORE: the bind was net.JoinHostPort(meshIP, 9345), so the address below
+# reads "100.64.0.1:9345" instead of "*:9345" and the LAN handshake is refused.
+sup_bind="$(lsof -nP -iTCP:9345 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $1 ~ /^k3sm/ {print $9}' | head -1)"
+case "$sup_bind" in
+"*:9345")
+	ladder ok "m14.L3b the join supervisor is bound to the WILDCARD (*:9345), so a pre-mesh worker can reach it over the underlay" ;;
+"")
+	ladder no "m14.L3b the join supervisor is listening on TCP :9345 at all — no k3sm process holds the port" ;;
+*)
+	ladder no "m14.L3b the join supervisor is bound to $sup_bind, not *:9345 — a worker has no mesh until this join completes, so a mesh-scoped bind refuses every join" ;;
+esac
+
+# And prove it end to end on the wire: a TLS handshake to this host's own LAN
+# address, which is the address a second Mac would dial. The handshake is the whole
+# assertion — the endpoint requires a K10 token, so a 401/400 body would be a PASS
+# too; a CONNECTION REFUSED is the failure this leg exists to catch.
+UNDERLAY_IP=""
+for iface in $(ifconfig -lu 2>/dev/null); do
+	case "$iface" in lo0 | utun* | gif* | stf* | awdl* | llw* | bridge*) continue ;; esac
+	cand="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+	if [ -n "$cand" ]; then UNDERLAY_IP="$cand"; break; fi
+done
+if [ -z "$UNDERLAY_IP" ]; then
+	lab_pending "m14.L3b [no underlay address on this host] the LAN TLS handshake to :9345 — the wildcard-bind assertion above still ran"
+elif echo | openssl s_client -connect "$UNDERLAY_IP:9345" -servername "$UNDERLAY_IP" >/dev/null 2>&1; then
+	ladder ok "m14.L3b a TLS handshake to the supervisor completes on the UNDERLAY address $UNDERLAY_IP:9345 (the address a second Mac dials)"
+else
+	ladder no "m14.L3b a TLS handshake to the supervisor completes on the UNDERLAY address $UNDERLAY_IP:9345 — this is exactly the dial a joining worker makes before it has any mesh"
 fi
 
 # ---- m14.L4 — THE HAZARD REGRESSION ----------------------------------------

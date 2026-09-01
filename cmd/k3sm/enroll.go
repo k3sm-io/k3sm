@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"sync"
 	"time"
 
@@ -320,9 +321,36 @@ func meshPeerRESTClient(cfg *rest.Config) (rest.Interface, error) {
 	return rest.RESTClientFor(rc)
 }
 
-// bootstrapPort is the dedicated TLS port the supervisor's worker-join endpoint binds
-// on the mesh interface (separate from the apiserver secure port).
+// bootstrapPort is the dedicated TLS port the supervisor's worker-join endpoint
+// binds (separate from the apiserver secure port).
 const bootstrapPort = 9345
+
+// bootstrapListenAddr derives the address the worker-join supervisor listens on.
+//
+// On the MESH path (meshIP set) it is the WILDCARD, and that is the whole point:
+// a joining worker dials this endpoint over the UNDERLAY, because it has no mesh
+// until the join it is making completes (`k3sm agent --server` documents exactly
+// that, and the MeshPeer this endpoint enrolls advertises an underlay endpoint for
+// the same reason). Bound to meshIP alone the supervisor answers only on an
+// address no un-joined worker can route to, so every join is refused — which is
+// the defect the first real --mesh-ip boot exposed and which a 127.0.0.1 mesh IP
+// had masked, loopback being reachable from the same host either way.
+//
+// LAN exposure IS this endpoint's threat model, not a regression of it: every
+// route it serves is authenticated by the K10 cluster token (CA-hash-pinned by the
+// client) or the server-class secret, and the node-password binding is
+// first-write-wins per node name. It has no ambient-authority route.
+//
+// With no mesh (single node) nothing ever opens this listener, but the address is
+// still derived closed — loopback — so a future caller cannot acquire LAN exposure
+// by accident.
+func bootstrapListenAddr(meshIP string) string {
+	host := "127.0.0.1"
+	if meshIP != "" {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(bootstrapPort))
+}
 
 // bootstrapServerDeps are the supervisor's wired dependencies. The worker-join deps
 // (CAs, tokens, node-passwords, enroller) are always set; the M6.1 server-join deps
@@ -340,7 +368,7 @@ type bootstrapServerDeps struct {
 }
 
 // startBootstrapServer serves the worker-join endpoint (and, in HA, the M6.1 CA-bundle
-// endpoint) on meshIP:bootstrapPort over a TLS listener presenting [serving-leaf,
+// endpoint) at bootstrapListenAddr over a TLS listener presenting [serving-leaf,
 // cluster-CA] so a joining node's CA-hash pin verifies. It blocks until ctx is
 // cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
 // exercise is the two-Mac K3SM_LAB gate. The MeshPeer CRD the enroller's write lands
@@ -371,7 +399,7 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 	}
 
 	hs := &http.Server{
-		Addr:              net.JoinHostPort(meshIP, fmt.Sprintf("%d", bootstrapPort)),
+		Addr:              bootstrapListenAddr(meshIP),
 		Handler:           srv.Handler(),
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{servingChain}},
 		ReadHeaderTimeout: 10 * time.Second,
