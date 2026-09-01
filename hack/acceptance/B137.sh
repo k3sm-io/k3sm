@@ -76,9 +76,12 @@ fi
 
 # ---- fixtures ---------------------------------------------------------------
 WORK="$(mktemp -d /tmp/b137.XXXXXX)"
-SERVER_PIDS=()
+# The pids go to FILES, not an array: start_server is called in a command
+# substitution, so its subshell's `$!` never reaches this scope — the array
+# stayed empty and every mock server outlived the run. A leaked server also
+# holds the inherited stderr open, which hangs any `B137.sh | tail`.
 cleanup() {
-	for p in "${SERVER_PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+	for f in "$WORK"/pid-*; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
 	rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -151,8 +154,8 @@ PY
 
 start_server() { # <mode> — echoes the port
 	local portfile="$WORK/port-$1"
-	python3 "$WORK/server.py" "$FIXROOT" "$1" >"$portfile" &
-	SERVER_PIDS+=($!)
+	python3 "$WORK/server.py" "$FIXROOT" "$1" >"$portfile" 2>>"$WORK/server-err.log" &
+	echo $! >"$WORK/pid-$1"
 	local i=0
 	while [ ! -s "$portfile" ]; do
 		i=$((i + 1))
