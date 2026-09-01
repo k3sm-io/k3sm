@@ -35,7 +35,6 @@ type fakeSystem struct {
 	calls       []string
 	kubeUser    string
 	kubeContent string
-	failBootout bool
 	// pid is the launchd-reported pid of the labelled job; a kickstart advances it.
 	pid int
 }

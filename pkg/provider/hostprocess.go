@@ -291,6 +291,8 @@ func (p *HostProcess) stopPod(pod *corev1.Pod) []podEvent {
 	return events
 }
 
+// GetPod returns a deep copy of the tracked pod, or a NotFound error when this
+// provider has no record of it.
 func (p *HostProcess) GetPod(ctx context.Context, ns, name string) (*corev1.Pod, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -301,6 +303,8 @@ func (p *HostProcess) GetPod(ctx context.Context, ns, name string) (*corev1.Pod,
 	return rec.pod.DeepCopy(), nil
 }
 
+// GetPodStatus returns a deep copy of the tracked pod's status, or a NotFound
+// error when this provider has no record of it.
 func (p *HostProcess) GetPodStatus(ctx context.Context, ns, name string) (*corev1.PodStatus, error) {
 	pod, err := p.GetPod(ctx, ns, name)
 	if err != nil {
@@ -309,6 +313,8 @@ func (p *HostProcess) GetPodStatus(ctx context.Context, ns, name string) (*corev
 	return pod.Status.DeepCopy(), nil
 }
 
+// GetPods returns deep copies of every pod this provider tracks — the reconcile
+// view VK syncs against, so it must never hand out the live records.
 func (p *HostProcess) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -358,19 +364,32 @@ func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, contain
 	return os.Open(pr.logPath)
 }
 
+// GetStatsSummary returns the kubelet stats Summary for this node. It IS
+// implemented — the summary is what GetMetricsResource transcodes — but the M0
+// HostProcess provider meters nothing, so it carries the node identity and no CPU
+// or memory sample.
+func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
+	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil
+}
+
 // --- not implemented in M0 ---
 
+// RunInContainer is not implemented by the M0 HostProcess provider: it returns a
+// NotFound error so `kubectl exec` fails with a clear reason rather than hanging.
 func (p *HostProcess) RunInContainer(ctx context.Context, ns, podName, c string, cmd []string, a vkadapter.AttachIO) error {
 	return vkadapter.NotFound("exec is not implemented in the M0 HostProcess provider")
 }
+
+// AttachToContainer is not implemented by the M0 HostProcess provider: it returns
+// a NotFound error so `kubectl attach` fails with a clear reason.
 func (p *HostProcess) AttachToContainer(ctx context.Context, ns, podName, c string, a vkadapter.AttachIO) error {
 	return vkadapter.NotFound("attach is not implemented in the M0 HostProcess provider")
 }
+
+// PortForward is not implemented by the M0 HostProcess provider: it returns a
+// NotFound error so `kubectl port-forward` fails with a clear reason.
 func (p *HostProcess) PortForward(ctx context.Context, ns, podName string, port int32, s io.ReadWriteCloser) error {
 	return vkadapter.NotFound("port-forward is not implemented in the M0 HostProcess provider")
-}
-func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
-	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil
 }
 
 // GetMetricsResource transcodes this provider's Summary into the kubelet

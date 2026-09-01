@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -211,7 +212,9 @@ func EnsureHierarchy(workDir string) (*Hierarchy, error) {
 // so EnsureHierarchy then LOADS the IDENTICAL cluster + signing CAs instead of minting
 // fresh, divergent ones (which would split cluster trust). It REFUSES to overwrite any
 // existing CA file: a server that already has a hierarchy must never be silently
-// re-based onto another's — the import is a first-write, not a replace.
+// re-based onto another's — the import is a first-write, not a replace. The refusal
+// is the kernel's (O_CREATE|O_EXCL), not a stat-then-write, so two joins racing into
+// one work dir cannot both pass the check and then clobber each other's CA.
 func WriteHierarchy(workDir string, h *Hierarchy) error {
 	if h == nil || h.Cluster == nil || h.Signing == nil {
 		return fmt.Errorf("certs: write hierarchy: cluster and signing CA are required")
@@ -232,10 +235,18 @@ func WriteHierarchy(workDir string, h *Hierarchy) error {
 	}
 	for _, f := range files {
 		p := filepath.Join(dir, f.name)
-		if _, err := os.Stat(p); err == nil {
-			return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA)", f.name)
+		fh, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, f.mode)
+		if err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA): %w", f.name, err)
+			}
+			return fmt.Errorf("write %s: %w", f.name, err)
 		}
-		if err := os.WriteFile(p, f.data, f.mode); err != nil {
+		if _, err := fh.Write(f.data); err != nil {
+			_ = fh.Close()
+			return fmt.Errorf("write %s: %w", f.name, err)
+		}
+		if err := fh.Close(); err != nil {
 			return fmt.Errorf("write %s: %w", f.name, err)
 		}
 	}

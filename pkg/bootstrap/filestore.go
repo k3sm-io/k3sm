@@ -149,18 +149,47 @@ func (s *FileTokenStore) load() ([]fileToken, error) {
 	return recs, nil
 }
 
-// save atomically rewrites the records (temp file + rename) at 0600.
+// save atomically rewrites the records at 0600: a UNIQUELY named temp file in the
+// store's own directory (so the rename is same-filesystem, hence atomic), then a
+// rename onto the store path.
+//
+// The uniqueness is the load-bearing part. This store's contract is CROSS-PROCESS —
+// `k3sm token create` and the running supervisor share the file, and mu serialises
+// only within one process — so a fixed "<path>.tmp" gave both processes the same
+// scratch file: their writes interleave in it and whichever renames second commits a
+// spliced record set over the store, losing tokens or corrupting the JSON outright.
+// A per-save temp name removes the shared name the two could collide on. The temp is
+// removed if anything fails before the rename, so a failed save leaves no litter for
+// the next one to trip over.
 func (s *FileTokenStore) save(recs []fileToken) error {
 	b, err := json.MarshalIndent(recs, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode token store: %w", err)
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	// CreateTemp opens with 0600 already — the records are bcrypt hashes, but the
+	// store is still a credential file and must never be world-readable, not even
+	// for the moment before the rename.
+	f, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".tmp*")
+	if err != nil {
+		return fmt.Errorf("write token store: %w", err)
+	}
+	tmp := f.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write token store: %w", err)
+	}
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("write token store: %w", err)
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		return fmt.Errorf("commit token store: %w", err)
 	}
+	committed = true
 	return nil
 }

@@ -114,8 +114,12 @@ func (c *component) exitedNow() bool {
 // kine, the apiserver, the scheduler, and the controller-manager as child
 // processes, each in its own process group for clean teardown.
 //
-// Concurrency: mu guards comps + started. The components run until Stop, which
-// tears them down in reverse dependency order. No Context is stored.
+// Concurrency: mu guards comps, started, and token — every read and write of
+// those three fields is under mu, including the token reads on the
+// RESTConfigToken/Ready paths a caller may drive concurrently with Start. The
+// components run until Stop, which tears them down in reverse dependency order.
+// mu is never held across provision/bringUp, so a Ready poll is never blocked by
+// a boot in progress. No Context is stored.
 type Supervised struct {
 	cfg    Config
 	client *http.Client
@@ -149,13 +153,27 @@ func (s *Supervised) Kubeconfig() string { return kubeconfigPath(s.cfg.WorkDir) 
 
 // RESTConfigToken returns the apiserver URL and static token.
 func (s *Supervised) RESTConfigToken() (string, string) {
-	return apiServerURL(s.cfg), s.token
+	return apiServerURL(s.cfg), s.currentToken()
+}
+
+// currentToken returns the static bearer token under mu. Start mints the token
+// when Config carried none, so a caller polling RESTConfigToken or Ready while
+// the control plane boots reads it concurrently with that write.
+func (s *Supervised) currentToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token
 }
 
 // Start provisions the workdir (binaries, kine, SA keys, token, kubeconfig),
 // then brings the control plane up in dependency order (kine → apiserver →
 // scheduler → controller-manager) and blocks until the apiserver reports healthz
 // ok. On any failure it tears down whatever started.
+//
+// Start is idempotent and safe to call concurrently: exactly one caller boots the
+// control plane and the rest return nil immediately, so a second caller's nil
+// means "someone owns the boot", not "the apiserver is healthy" — poll Ready for
+// that, as an already-started executor has always required.
 func (s *Supervised) Start(ctx context.Context) error {
 	// Split-brain guard (M6.0): fail closed if HA was requested without a shared
 	// datastore — never let a 2nd server quietly form its own SQLite.
@@ -163,34 +181,61 @@ func (s *Supervised) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Claim the boot in ONE critical section. The check and the set used to sit in
+	// two separate ones, so two concurrent Starts could both see started == false
+	// and each boot a full control plane over the same work-dir — a second kine on
+	// the same SQLite file and a second apiserver fighting for the port. The loser
+	// of the claim gets the same idempotent nil an already-started executor
+	// returns; every failure path below releases the claim so a retry can boot.
 	s.mu.Lock()
 	if s.started {
 		s.mu.Unlock()
 		return nil
 	}
+	s.started = true
+	tok := s.token
 	s.mu.Unlock()
 
-	if s.token == "" {
-		tok, err := generateToken()
+	if tok == "" {
+		minted, err := generateToken()
 		if err != nil {
+			s.releaseStartClaim()
 			return err
 		}
-		s.token = tok
+		s.mu.Lock()
+		s.token = minted
+		s.mu.Unlock()
 	}
 
-	if err := s.provision(ctx); err != nil {
+	if err := supervisedProvision(s, ctx); err != nil {
+		s.releaseStartClaim()
 		return err
 	}
 
-	if err := s.bringUp(ctx); err != nil {
+	if err := supervisedBringUp(s, ctx); err != nil {
+		// Stop clears the claim as part of the teardown.
 		_ = s.Stop(context.WithoutCancel(ctx))
 		return err
 	}
 
-	s.mu.Lock()
-	s.started = true
-	s.mu.Unlock()
 	return nil
+}
+
+// supervisedProvision and supervisedBringUp are the two boot phases Start runs,
+// held as vars so a test can drive Start's claim-and-release concurrency without
+// spawning a real control plane (the seam kineModuleCacheDir/runKineBuild use).
+var (
+	supervisedProvision = (*Supervised).provision
+	supervisedBringUp   = (*Supervised).bringUp
+)
+
+// releaseStartClaim gives back the boot claim Start took, so a Start that failed
+// before the components came up does not leave the executor permanently
+// "started" and unstartable.
+func (s *Supervised) releaseStartClaim() {
+	s.mu.Lock()
+	s.started = false
+	s.mu.Unlock()
 }
 
 // provision lays down everything the components need on disk.
@@ -225,10 +270,11 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := writeServiceAccountKeys(ctx, s.cfg.WorkDir); err != nil {
 		return err
 	}
-	if err := writeTokenFile(s.cfg.WorkDir, s.token); err != nil {
+	token := s.currentToken()
+	if err := writeTokenFile(s.cfg.WorkDir, token); err != nil {
 		return err
 	}
-	if err := writeKubeconfig(s.cfg, s.token); err != nil {
+	if err := writeKubeconfig(s.cfg, token); err != nil {
 		return err
 	}
 	// M10.0 (Res.3): the audit policy + admission-control config the apiserver argv
@@ -791,7 +837,7 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Authorization", "Bearer "+s.currentToken())
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return false

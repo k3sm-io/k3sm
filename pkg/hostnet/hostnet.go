@@ -39,6 +39,7 @@ package hostnet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -69,7 +70,7 @@ const probeTimeout = 3 * time.Second
 // unprivileged control plane could not reach the root k3sm-netd helper, so its
 // privileged network ops (pod/Service VIP aliases, mesh) cannot run. Proceeding
 // would wedge every pod in ContainerCreating, so the daemon fails fast.
-var ErrHelperUnreachable = fmt.Errorf("k3sm-netd helper unreachable — run 'sudo k3sm install' and check the io.k3sm.netd daemon (launchctl print system/io.k3sm.netd)")
+var ErrHelperUnreachable = errors.New("k3sm-netd helper unreachable — run 'sudo k3sm install' and check the io.k3sm.netd daemon (launchctl print system/io.k3sm.netd)")
 
 // Backend is the resolved host-network datapath backend.
 type Backend int

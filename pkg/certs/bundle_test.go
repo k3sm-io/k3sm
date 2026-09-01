@@ -17,11 +17,15 @@ limitations under the License.
 package certs
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -133,8 +137,32 @@ func TestWriteHierarchyThenEnsureLoads(t *testing.T) {
 		t.Error("EnsureHierarchy after WriteHierarchy must LOAD the imported CAs (identical pins), not mint fresh ones")
 	}
 
-	// A second write into a dir that already has the CAs is refused (no silent rebase).
-	if err := WriteHierarchy(wd, newTestHierarchy(t)); err == nil {
-		t.Error("WriteHierarchy must refuse to overwrite an existing CA")
+	// A second write into a dir that already has the CAs is refused (no silent
+	// rebase), the refusal names the file and is machine-checkable as fs.ErrExist
+	// (the kernel's O_EXCL, not a stat-then-write), and the incumbent CA is left
+	// byte-for-byte intact — a refusal that had already truncated the file would
+	// have destroyed the trust it exists to protect.
+	before, err := os.ReadFile(filepath.Join(PKIDir(wd), clusterCACert))
+	if err != nil {
+		t.Fatalf("read the incumbent CA: %v", err)
+	}
+	err = WriteHierarchy(wd, newTestHierarchy(t))
+	if err == nil {
+		t.Fatal("WriteHierarchy must refuse to overwrite an existing CA")
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		t.Errorf("refusal %v must wrap fs.ErrExist", err)
+	}
+	for _, want := range []string{clusterCACert, "refusing to overwrite an existing CA"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q must contain %q", err, want)
+		}
+	}
+	after, err := os.ReadFile(filepath.Join(PKIDir(wd), clusterCACert))
+	if err != nil {
+		t.Fatalf("read the CA after the refusal: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("the refused write modified the incumbent CA")
 	}
 }
