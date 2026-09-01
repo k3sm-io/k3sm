@@ -41,7 +41,7 @@ func TestRequiredSiblingsMatchesConfigDefaults(t *testing.T) {
 
 	// Every source path withDefaults derives must be covered. PayloadSource is a
 	// directory, so it is covered by its members rather than by itself.
-	for _, want := range []string{cfg.ExecShimSource, cfg.PathShimSource, cfg.DNSShimSource} {
+	for _, want := range []string{cfg.ExecShimSource, cfg.PathShimSource, cfg.DNSShimSource, cfg.VMHostSource} {
 		if !got[want] {
 			t.Errorf("RequiredSiblings(%q) omits %q, which withDefaults requires", dir, want)
 		}
@@ -52,8 +52,8 @@ func TestRequiredSiblingsMatchesConfigDefaults(t *testing.T) {
 			t.Errorf("RequiredSiblings(%q) omits payload binary %q", dir, want)
 		}
 	}
-	if n := len(RequiredSiblings(dir)); n != 3+len(executor.PayloadBinaries()) {
-		t.Errorf("RequiredSiblings returned %d entries, want 3 shims + %d payload binaries", n, len(executor.PayloadBinaries()))
+	if n := len(RequiredSiblings(dir)); n != 4+len(executor.PayloadBinaries()) {
+		t.Errorf("RequiredSiblings returned %d entries, want 4 shims + %d payload binaries", n, len(executor.PayloadBinaries()))
 	}
 }
 
@@ -71,6 +71,7 @@ func TestRequiredSiblingsRelative(t *testing.T) {
 		ExecShimName,
 		PathShimName,
 		DNSShimName,
+		VMHostName,
 		filepath.Join(PayloadDirName, "kube-apiserver"),
 	}
 	got := strings.Join(RequiredSiblings(""), "\n")
@@ -86,5 +87,14 @@ func TestRequiredSiblingsRelative(t *testing.T) {
 func TestExecShimNameMatchesRuntimed(t *testing.T) {
 	if ExecShimName != "k3sm-execshim" {
 		t.Errorf("ExecShimName = %q, want k3sm-execshim (runtimed's sandbox.ExecShimName)", ExecShimName)
+	}
+}
+
+// TestVMHostNameMatchesRuntimed guards the re-export: pkg/install must not
+// drift from the constant runtimed's sandbox package resolves at exec time
+// (sandbox.FindVMHost).
+func TestVMHostNameMatchesRuntimed(t *testing.T) {
+	if VMHostName != "k3sm-vmhost" {
+		t.Errorf("VMHostName = %q, want k3sm-vmhost (runtimed's sandbox.VMHostName)", VMHostName)
 	}
 }

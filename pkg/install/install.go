@@ -192,6 +192,13 @@ type Config struct {
 	// in-pod cluster DNS reaches the per-node resolver. Defaults to the DNSShimName
 	// sibling of BinarySource.
 	DNSShimSource string
+	// VMHostSource is the k3sm-vmhost VM-host helper binary to install beside the
+	// binary, from which sandbox.FindVMHost resolves it for vm-RuntimeClass pods.
+	// The helper carries its own ad-hoc signature and the
+	// com.apple.security.virtualization entitlement — install copies it verbatim
+	// (see CopyToRootOwned) and never re-signs it. Defaults to the VMHostName
+	// sibling of BinarySource.
+	VMHostSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
@@ -238,6 +245,9 @@ func (c Config) withDefaults() Config {
 	if c.DNSShimSource == "" && c.BinarySource != "" {
 		c.DNSShimSource = filepath.Join(filepath.Dir(c.BinarySource), DNSShimName)
 	}
+	if c.VMHostSource == "" && c.BinarySource != "" {
+		c.VMHostSource = filepath.Join(filepath.Dir(c.BinarySource), VMHostName)
+	}
 	return c
 }
 
@@ -262,6 +272,12 @@ func (c Config) installedPathShim() string {
 // binary, where runtimedConfig resolves it next to the executable.
 func (c Config) installedDNSShim() string {
 	return filepath.Join(c.InstallDir, DNSShimName)
+}
+
+// installedVMHost is the path the k3sm-vmhost VM-host helper is copied to —
+// beside the binary, the first place sandbox.FindVMHost probes.
+func (c Config) installedVMHost() string {
+	return filepath.Join(c.InstallDir, VMHostName)
 }
 
 // plistPath is the LaunchDaemon plist path for a label.
@@ -351,6 +367,10 @@ func artifactManifest(cfg Config) []artifact {
 		// The getaddrinfo DNS shim beside the binary — injected into each pod so an
 		// in-pod cluster-name lookup reaches the per-node resolver. Covered by the sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedDNSShim(), assertExists: true},
+		// The k3sm-vmhost VM-host helper beside the binary (sandbox.FindVMHost's
+		// first probe) — vm-RuntimeClass pods cannot boot without it. Covered by
+		// the sweep.
+		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedVMHost(), assertExists: true},
 		// The control-plane payload staged into InstallDir/bin (the daemon boot
 		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
 	}
@@ -477,6 +497,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      reaches the per-node resolver (build it with darwin-net/hack/build-shim.sh).
 	if err := sys.CopyToRootOwned(cfg.DNSShimSource, cfg.installedDNSShim()); err != nil {
 		return fmt.Errorf("install: copy getaddrinfo DNS shim to %s: %w (build it with darwin-net/hack/build-shim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedDNSShim(), err)
+	}
+	// 2b‴. Copy the k3sm-vmhost VM-host helper beside the binary. runtimed's
+	//      sandbox.FindVMHost resolves it next to the executable for
+	//      vm-RuntimeClass pods. The helper is ad-hoc signed with the
+	//      com.apple.security.virtualization entitlement, and CopyToRootOwned
+	//      (ditto) carries that signature through verbatim — install never
+	//      re-signs it, matching every other sibling binary here.
+	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.installedVMHost()); err != nil {
+		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.installedVMHost(), err)
 	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to

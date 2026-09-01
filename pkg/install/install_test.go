@@ -132,6 +132,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_pathrebase_shim.dylib",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
+		"CopyToRootOwned:/Library/k3sm/k3sm-vmhost",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-scheduler",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-controller-manager",
@@ -196,7 +197,7 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 			dsts = append(dsts, strings.TrimPrefix(c, "CopyToRootOwned:"))
 		}
 	}
-	fixedHead := []string{"/Library/k3sm/k3sm", "/Library/k3sm/k3sm-execshim", "/Library/k3sm/" + PathShimName, "/Library/k3sm/" + DNSShimName}
+	fixedHead := []string{"/Library/k3sm/k3sm", "/Library/k3sm/k3sm-execshim", "/Library/k3sm/" + PathShimName, "/Library/k3sm/" + DNSShimName, "/Library/k3sm/" + VMHostName}
 	if len(dsts) < len(fixedHead) {
 		t.Fatalf("only %d copies %v, want at least the fixed head %v (never the source basename)", len(dsts), dsts, fixedHead)
 	}
@@ -206,11 +207,11 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 		}
 	}
 	// The payload set lands at InstallDir/bin/<name> — one copy per
-	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims.
+	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
 	// +1 for the kine version marker, staged beside the kine binary it describes.
 	if want := head + len(executor.PayloadBinaries()) + 1; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + the payload set + the kine marker)", len(dsts), want)
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the kine marker)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], "/Library/k3sm/bin/"+name; got != want {
@@ -230,6 +231,9 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	}
 	if got := cfg.withDefaults().DNSShimSource; got != "/tmp/build/"+DNSShimName {
 		t.Errorf("DNSShimSource default = %q, want the BinarySource sibling /tmp/build/%s", got, DNSShimName)
+	}
+	if got := cfg.withDefaults().VMHostSource; got != "/tmp/build/"+VMHostName {
+		t.Errorf("VMHostSource default = %q, want the BinarySource sibling /tmp/build/%s", got, VMHostName)
 	}
 }
 
