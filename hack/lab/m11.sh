@@ -470,6 +470,37 @@ else
 	ladder no "m11.2-b  guest identity not asserted — $POD_BOOT never became ready"
 fi
 
+# ── m11.2-c the ServiceAccount projection, AT its mountPath ───────────────────────
+# Read at the path Kubernetes promises, never at the staging share the guest binds
+# from: every base image symlinks /var/run -> /run, so a bind that resolved that
+# symlink against the GUEST's root instead of the container's landed outside the
+# container and left the token silently absent while every upstream step looked
+# correct. The gate passed 24/24 without noticing, because nothing read the token.
+# An in-cluster client library sees exactly what this rung sees.
+if [ "$BOOT_OK" -eq 1 ]; then
+	SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
+	SA_SEEN="$(gexec "$POD_BOOT" "cat $SA_DIR/namespace 2>/dev/null | tr -d '\n'" 2>/dev/null | tr -d '\r' || true)"
+	SA_HAS_TOKEN="$(gexec "$POD_BOOT" "[ -s $SA_DIR/token ] && [ -s $SA_DIR/ca.crt ] && echo yes" 2>/dev/null | tr -d '\r' | head -1 || true)"
+	if [ "$SA_SEEN" = "$NS" ] && [ "$SA_HAS_TOKEN" = "yes" ]; then
+		ladder ok "m11.2-c  the ServiceAccount projection is readable at $SA_DIR (namespace=$SA_SEEN, non-empty token and ca.crt)"
+	else
+		ladder no "m11.2-c  the ServiceAccount projection is NOT usable at $SA_DIR (namespace='${SA_SEEN:-<absent>}' want '$NS', token+ca.crt present='${SA_HAS_TOKEN:-no}') — a vm Pod cannot authenticate to the apiserver as itself"
+	fi
+	# Gated on the projection actually being there. A write that fails because the
+	# directory does not exist proves nothing about read-only enforcement, and a
+	# security rung that can pass for the wrong reason is worse than no rung.
+	if [ "$SA_HAS_TOKEN" != "yes" ]; then
+		ladder no "m11.2-d  read-only enforcement not asserted — $SA_DIR is absent, so a failed write would prove nothing"
+	elif gexec "$POD_BOOT" "touch $SA_DIR/m11-write-probe" >/dev/null 2>&1; then
+		ladder no "m11.2-d  $SA_DIR is WRITABLE — a projected credential must be read-only in the container"
+	else
+		ladder ok "m11.2-d  $SA_DIR exists and refuses a write (projected credentials stay read-only in the guest)"
+	fi
+else
+	ladder no "m11.2-c  ServiceAccount projection not asserted — $POD_BOOT never became ready"
+	ladder no "m11.2-d  credential writability not asserted — $POD_BOOT never became ready"
+fi
+
 # ── m11.3 logs ────────────────────────────────────────────────────────────────────
 if [ "$BOOT_OK" -eq 1 ]; then
 	LOGS="$(kn logs "$POD_BOOT" 2>/dev/null || true)"
