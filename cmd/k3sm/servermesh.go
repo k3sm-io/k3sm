@@ -27,7 +27,6 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/mesh"
 
-	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -46,36 +45,12 @@ const serverMeshKeyRef = "server.key"
 // is exactly one value that makes them agree without a second knob.
 const serverMeshListenPort = mesh.DefaultListenPort
 
-// loadOrCreateServerMeshKey returns this node's persisted wireguard identity
-// (base64 private + derived public key), minting and persisting a fresh private
-// key 0600 under workDir on first run.
-//
-// Persistence is the whole point. The public key is what the node's MeshPeer
-// advertises and what every peer programs into its wireguard device; a key
-// re-minted on each boot would rotate that identity on every `launchctl
-// kickstart` and silently blackhole the mesh until each peer re-reconciled. The
-// PUBLIC key is derived from the stored private key rather than stored beside
-// it, so the two can never disagree.
+// loadOrCreateServerMeshKey returns the CONTROL-PLANE node's persisted wireguard
+// identity, minting it under workDir on first run. It is loadOrCreateMeshKey
+// named at this node role's ref — the server and a worker on one Mac must not
+// share a key file (serverMeshKeyRef).
 func loadOrCreateServerMeshKey(workDir string) (privB64, pubB64 string, err error) {
-	path := filepath.Join(workDir, serverMeshKeyRef)
-	if b, err := os.ReadFile(path); err == nil {
-		priv := string(b)
-		pub, err := bootstrap.WireguardPublicKey(priv)
-		if err != nil {
-			return "", "", fmt.Errorf("read persisted mesh key %s: %w", path, err)
-		}
-		return priv, pub, nil
-	} else if !os.IsNotExist(err) {
-		return "", "", fmt.Errorf("read mesh key %s: %w", path, err)
-	}
-	priv, pub, err := bootstrap.GenerateWireguardKey()
-	if err != nil {
-		return "", "", fmt.Errorf("mint server mesh key: %w", err)
-	}
-	if err := os.WriteFile(path, []byte(priv), 0o600); err != nil {
-		return "", "", fmt.Errorf("persist server mesh key: %w", err)
-	}
-	return priv, pub, nil
+	return loadOrCreateMeshKey(workDir, serverMeshKeyRef)
 }
 
 // serverMeshEndpoint is the address:port a joining worker dials to reach this

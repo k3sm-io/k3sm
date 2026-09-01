@@ -132,6 +132,16 @@ func runAgent(args []string) error {
 		return err
 	}
 
+	// The wireguard identity: minted once, persisted 0600, reused across restarts
+	// for the same reason — the public key derived from it is what every peer
+	// programs, so a per-start key rotates this node's MeshPeer on every restart and
+	// strands the mesh until each peer re-reconciles.
+	meshPriv, meshPub, err := loadOrCreateMeshKey(opts.workDir, meshKeyRef)
+	if err != nil {
+		return err
+	}
+	logger.Info("mesh identity", "node", opts.nodeName, "publicKey", meshPub, "keyRef", meshKeyRef)
+
 	// The join client is built HERE rather than left to bootstrap.Join so its dialer
 	// can report which of this Mac's addresses reaches the control plane — the one
 	// fact the mesh endpoint below has to be derived from. It is still the CA-pinned
@@ -166,6 +176,9 @@ func runAgent(args []string) error {
 		NodePassword: password,
 		MeshEndpoint: meshEndpoint,
 		HTTPClient:   joinClient,
+		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
+		// back as exactly this value and is what bringUpMesh programs below.
+		WGPrivateKeyB64: meshPriv,
 	})
 	if err != nil {
 		return fmt.Errorf("join: %w", err)
