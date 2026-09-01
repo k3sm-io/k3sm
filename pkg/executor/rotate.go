@@ -325,6 +325,30 @@ func reissuedArtifacts(workDir string) []RotationArtifact {
 			"apiserver serving cert, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-issued on every boot"),
 		artifact(certs.APIServerServingKeyPath(workDir),
 			"apiserver serving key for the cert above — multi-node servers only"),
+		kubeletServingArtifact(workDir),
+	}
+}
+
+// kubeletServingArtifact describes the control-plane node's kubelet SERVING
+// keypair — the cert :10250 presents, issued by the cluster CA on a multi-node
+// (--mesh-ip) boot (B213).
+//
+// It is listed because Reissued's contract is COMPLETENESS: it is what a boot
+// re-issues, and this pair is re-minted on every boot exactly like the apiserver's
+// leaf beside it. Omitting it because it is not a file would understate the
+// rotation just as badly as claiming an artifact that is not re-issued.
+//
+// It has no path: the pair is held in memory for the life of the server process and
+// deliberately never written (no new private key on disk). Present is therefore read
+// off the mesh posture's on-disk WITNESS — the apiserver serving cert, minted in the
+// same --mesh-ip branch — so a single-node work dir reports it absent, which is
+// true: nothing mints it there.
+func kubeletServingArtifact(workDir string) RotationArtifact {
+	_, err := os.Stat(certs.APIServerServingCertPath(workDir))
+	return RotationArtifact{
+		Path:    "(in memory — never written to disk)",
+		Detail:  "kubelet serving cert+key for this node's :10250, issued by the cluster CA — multi-node (--mesh-ip) servers only; re-minted into memory on every boot, so its presence is read off " + certs.APIServerServingCertPath(workDir),
+		Present: err == nil,
 	}
 }
 
