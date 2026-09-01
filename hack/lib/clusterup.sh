@@ -32,6 +32,19 @@ export KUBECONFIG="${KUBECONFIG:-$K3SM_WORKDIR/cluster.kubeconfig}"
 CP_TOKEN="acceptance-secret-token"
 NODE_PID=""
 SERVER_PID=""
+# AGENT_PID / the agent's dirs are set by agent_up (the joined-worker half). They
+# are declared here, beside their server siblings, so cluster_down can reap an
+# agent it did not itself start — a gate that dies between agent_up and its own
+# trap must still hand the host back :10250.
+AGENT_PID=""
+AGENT_WORKDIR=""
+AGENT_POD_ROOT=""
+# K3SM_CMD is the argv prefix that runs THIS repo's k3sm binary, set by server_up
+# once it has decided between `go run` (hostprocess) and the staged real binary
+# (runtimed — the sibling-artifact lookups need a real path). agent_up and
+# `token create` reuse it rather than re-deciding, so a joined worker can never
+# end up running a different build than the server it joins.
+K3SM_CMD=()
 # From M1 the gates can bring the whole control plane + node up via `k3sm server`
 # (the embedded-by-supervision executor). It manages its own workdir/kubeconfig.
 : "${SERVER_WORKDIR:=$K3SM_WORKDIR/server}"
@@ -291,6 +304,10 @@ wait_tcp() { local port=$1 n=0; until nc -z 127.0.0.1 "$port" 2>/dev/null; do sl
 cluster_down() {
 	local port
 	[ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null || true
+	# The agent goes BEFORE the server: it holds a watch on the apiserver it joined,
+	# and killing the control plane out from under it produces a page of reconnect
+	# noise in agent.log that buries whatever the gate actually failed on.
+	[ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null || true
 	[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
 	for p in k3sm kube-controller-manager kube-scheduler kube-apiserver kine; do
 		pkill -f "$BIN/$p" 2>/dev/null && echo "stopped $p" || true
@@ -457,8 +474,22 @@ node_up() {
 # EndpointSlices populate. hack/acceptance/m3.sh uses `server_up <n> runtimed
 # direct` under root. NOTE: under sudo, `go run` compiles into root's GOCACHE (a
 # cold first build); that is expected for the integration tier.
+# server_up <node_name> [runtime] [network] [mesh_ip] [kubelet_port]
+#
+# The last two are OPTIONAL and default to the single-node shape every existing
+# gate already gets: no --mesh-ip (so no worker-join supervisor, the M1/M2
+# loopback/self-signed path) and no --kubelet-port (so the node keeps the default
+# :10250). They exist for the ONE posture that needs both — a server that a
+# `k3sm agent` on the SAME Mac can join (agent_up):
+#
+#   - mesh_ip enables the join supervisor. 127.0.0.1 is legitimate here: the mesh
+#     rewrite is address-agnostic and a loopback mesh is a single-host cluster.
+#   - kubelet_port must MOVE THE SERVER'S node off :10250, because `k3sm agent`
+#     has no --kubelet-port of its own and would otherwise lose the bind contest
+#     against the server's in-process node.
 server_up() {
 	local node_name="${1:-k3sm-m1}" runtime="${2:-hostprocess}" network="${3:-none}"
+	local mesh_ip="${4:-}" kubelet_port="${5:-}"
 	# First statement, before anything is created or built: a gate must not inherit
 	# the previous gate's datastore or listeners (see cluster_reset).
 	cluster_reset || return 1
@@ -487,7 +518,7 @@ server_up() {
 	# gate run can never collide with, or clean up, a real installation.
 	#
 	# hostprocess needs none of this and keeps the cheaper `go run` path.
-	local server_cmd=(go run "$REPO_ROOT/cmd/k3sm")
+	K3SM_CMD=(go run "$REPO_ROOT/cmd/k3sm")
 	if [ "$runtime" = runtimed ]; then
 		[ "$(id -u)" -eq 0 ] || { echo "server_up: the runtimed posture stages pod-readable artifacts under $STAGE_DIR and needs root" >&2; return 1; }
 		# Assert BEFORE the rm -rf, not only on teardown: this runs as root, and
@@ -509,12 +540,18 @@ server_up() {
 		# The pod runs as a different uid than the staging root; the dylibs must be
 		# world-readable or dyld fails closed exactly as an unadmitted path does.
 		chmod 644 "$STAGE_DIR"/*.dylib 2>/dev/null || true
-		server_cmd=("$STAGE_DIR/k3sm")
+		K3SM_CMD=("$STAGE_DIR/k3sm")
 	fi
+	# The two optional flags are appended only when asked for, so the argv of every
+	# existing gate is byte-identical to what it was before agent_up existed.
+	local extra=()
+	[ -n "$mesh_ip" ] && extra+=(--mesh-ip "$mesh_ip")
+	[ -n "$kubelet_port" ] && extra+=(--kubelet-port "$kubelet_port")
 	# The server downloads/ad-hoc-signs the CP binaries + kubectl into its workdir.
-	nohup env CGO_ENABLED=1 "${server_cmd[@]}" server \
+	nohup env CGO_ENABLED=1 "${K3SM_CMD[@]}" server \
 		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
 		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network "$network" \
+		"${extra[@]+"${extra[@]}"}" \
 		> "$K3SM_WORKDIR/server.log" 2>&1 &
 	SERVER_PID=$!
 
@@ -570,5 +607,88 @@ server_up() {
 	until kc get serviceaccount default -n default >/dev/null 2>&1; do
 		server_died && { server_died_report "default ServiceAccount creation"; return 1; }
 		sleep 1; n=$((n+1)); if [ $n -gt 60 ]; then echo "default/default ServiceAccount not created within 60s" >&2; tail -20 "$K3SM_WORKDIR/server.log" >&2; return 1; fi
+	done
+}
+
+# ── the joined-worker half ──────────────────────────────────────────────────
+#
+# agent_up <node_name> [runtime] [network] joins a SECOND k3sm node to the server
+# server_up brought up, on THIS SAME Mac, and returns once that node is Ready.
+#
+# It exists because the multi-node claim had no unattended harness at all: every
+# join proof was a two-Mac K3SM_LAB session, so anything a joined worker derives
+# INDEPENDENTLY of its server — the guest-artifact verdict this was added for
+# (B108), the capability labels, the per-node datapath — had no way to be checked
+# by a gate. One host cannot prove the mesh (there is no second machine to route
+# between), but it can prove per-node DERIVATION, which is a different property
+# and the one most likely to drift silently.
+#
+# THREE preconditions, all of them consequences of running two nodes on one host:
+#
+#   1. server_up must have been given a mesh_ip. `k3sm agent` joins through the
+#      bootstrap supervisor, which `k3sm server` starts only in multi-node mode.
+#   2. server_up must have been given a kubelet_port other than 10250. The agent
+#      has no --kubelet-port flag, so the SERVER's node is the one that has to
+#      move; otherwise the agent dies on "listen tcp :10250: address already in
+#      use" after a successful join, which reads like a join failure and is not.
+#   3. network defaults to `none`. The mesh datapath is a root utun and a second
+#      wireguard peer on the same host has no one to talk to; `--network none`
+#      joins, registers and runs pods without it. Passing anything else here is a
+#      lab decision, not a gate one.
+#
+# The token travels in $K3SM_TOKEN, never on argv — the same rule the product
+# documents for its own flag, and `ps` on a shared Mac is a real reader.
+agent_up() {
+	local node_name="${1:-k3sm-agent}" runtime="${2:-hostprocess}" network="${3:-none}"
+	local token n=0
+
+	if [ -z "$SERVER_PID" ] || [ "${#K3SM_CMD[@]}" -eq 0 ]; then
+		echo "agent_up: no server has been started in this process — call server_up first" >&2
+		return 1
+	fi
+	if ! workdir_ok "$K3SM_WORKDIR"; then
+		echo "agent_up: refusing to use an implausible K3SM_WORKDIR: $K3SM_WORKDIR" >&2
+		return 1
+	fi
+	AGENT_WORKDIR="$K3SM_WORKDIR/agent"
+	AGENT_POD_ROOT="$K3SM_WORKDIR/agent-pods"
+	mkdir -p "$AGENT_WORKDIR" "$AGENT_POD_ROOT" || return 1
+
+	# The token is minted from the SERVER's work dir, so its K10 prefix pins the CA
+	# the server actually serves. `token create` prints the token on stdout and its
+	# expiry note on stderr, so stdout's last line is the token and nothing else.
+	token="$(CGO_ENABLED=1 "${K3SM_CMD[@]}" token create --work-dir "$SERVER_WORKDIR" 2>/dev/null | tail -1)"
+	case "$token" in
+	K10*) ;;
+	*)
+		echo "agent_up: could not mint a join token from $SERVER_WORKDIR (got ${token:-<empty>})" >&2
+		tail -20 "$K3SM_WORKDIR/server.log" >&2
+		return 1 ;;
+	esac
+
+	nohup env CGO_ENABLED=1 K3SM_TOKEN="$token" "${K3SM_CMD[@]}" agent \
+		--server 127.0.0.1 --node-name "$node_name" --node-ip 127.0.0.1 \
+		--work-dir "$AGENT_WORKDIR" --pod-root "$AGENT_POD_ROOT" \
+		--runtime "$runtime" --network "$network" --api-port "$APISERVER_PORT" \
+		> "$K3SM_WORKDIR/agent.log" 2>&1 &
+	AGENT_PID=$!
+
+	# Same shape as server_up's waits, and for the same reason: a joined worker can
+	# fail LONG after the join succeeds (the node bring-up runs last), and a wait
+	# that only watches the apiserver would spin its full timeout against a corpse
+	# and then blame the control plane.
+	agent_died() { [ -n "$AGENT_PID" ] && ! kill -0 "$AGENT_PID" 2>/dev/null; }
+	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
+		if agent_died; then
+			echo "k3sm agent exited during join/bring-up — its last log lines:" >&2
+			tail -30 "$K3SM_WORKDIR/agent.log" >&2
+			return 1
+		fi
+		sleep 1; n=$((n+1))
+		if [ $n -gt 180 ]; then
+			echo "joined node $node_name not Ready within 180s" >&2
+			tail -30 "$K3SM_WORKDIR/agent.log" >&2
+			return 1
+		fi
 	done
 }

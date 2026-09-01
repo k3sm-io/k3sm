@@ -103,6 +103,27 @@ const LabelRosetta = "k3sm.io/rosetta"
 // pod that drops the os key with a 422). See docs/user/vm-runtimeclass.md.
 const LabelRosettaLinux = "k3sm.io/rosetta-linux"
 
+// LabelVMArtifacts is the node label advertising that this node holds the pinned
+// Linux guest boot artifacts — the kernel and the initramfs named by the in-code
+// digest pin — materialised and digest-verified on this daemon start (B108).
+//
+// It is the ADVERTISEMENT half of the VMArtifactsAvailable capability, minted by
+// cmd/k3sm from provider.NodeCapabilities.VMArtifacts, and it follows the same
+// presence-only, delete-on-loss discipline as every key above.
+//
+// IT IS DELIBERATELY NOT ON THE vm RuntimeClass NODESELECTOR, which stays pinned
+// to LabelVirtualization alone. The two facts are independent (see
+// provider.NodeCapabilities.VMArtifacts), and a vm pod genuinely needs both — but
+// adding a second required key to the shipped RuntimeClass would change the
+// scheduling contract of every existing vm pod in a commit whose subject is the
+// artifact feeder. What this key buys today is a TRUTHFUL answer to "why did my
+// vm pod land here and fail closed", which is exactly the question the artifact
+// half of the failure produces and the virtualization label cannot answer.
+//
+// Like its siblings it never changes kubernetes.io/arch or kubernetes.io/os: the
+// node is darwin, whatever the guest it can boot.
+const LabelVMArtifacts = "k3sm.io/vm-artifacts"
+
 // LabelTrue is the value LabelVirtualization, LabelRosetta, and LabelRosettaLinux
 // carry on a capable node — and the value this RuntimeClass's nodeSelector requires.
 // Every one of them is PRESENCE-only: a node that loses the capability has the key

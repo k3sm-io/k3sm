@@ -112,6 +112,10 @@ archives:
         strip_parent: true
         info:
           mode: 0755
+      - src: "build/stage/k3sm-vmhost"
+        strip_parent: true
+        info:
+          mode: 0755
       # Payload members: dst places them under cp-payload/ (install resolves
       # PayloadSource at <binary dir>/cp-payload), strip_parent drops the staging
       # prefix. Without BOTH, the members land at the archive root and install

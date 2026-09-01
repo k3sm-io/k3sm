@@ -45,6 +45,19 @@ const (
 	// the binary. It is runtimed's constant, re-exported so callers that only
 	// import pkg/install still read one definition rather than a copy.
 	ExecShimName = sandbox.ExecShimName
+	// VMHostName is the basename of the k3sm-vmhost VM-host helper installed
+	// beside the binary (sandbox.FindVMHost's first probe). It is runtimed's
+	// constant, re-exported so callers that only import pkg/install still read
+	// one definition rather than a copy.
+	//
+	// It ships unconditionally, exactly like ExecShimName: whether a given Mac
+	// can actually run vm-RuntimeClass pods is a RUNTIME question
+	// (sandbox.VMBackend.Available reports false, never an install-time error,
+	// when the host lacks virtualization support) — the release archive is not
+	// the place that answer is decided, and withholding the helper from one
+	// archive and not another would make availability depend on which archive an
+	// operator happened to unpack rather than on their hardware.
+	VMHostName = sandbox.VMHostName
 	// PayloadDirName is the basename of the directory holding the control-plane
 	// payload (executor.PayloadBinaries) beside the binary. The launchd daemon
 	// seeds its work dir from it, having neither gh nor a Go toolchain.
@@ -52,8 +65,8 @@ const (
 )
 
 // RequiredSiblings returns every path Install requires to exist alongside the
-// k3sm binary in dir, in a stable order: the exec shim, both DYLD shims, and
-// each control-plane payload binary under PayloadDirName.
+// k3sm binary in dir, in a stable order: the exec shim, both DYLD shims, the
+// VM-host helper, and each control-plane payload binary under PayloadDirName.
 //
 // The k3sm binary itself is deliberately absent — it is the anchor the paths are
 // derived from, not a sibling of itself. Paths are joined onto dir, so passing
@@ -63,6 +76,7 @@ func RequiredSiblings(dir string) []string {
 		filepath.Join(dir, ExecShimName),
 		filepath.Join(dir, PathShimName),
 		filepath.Join(dir, DNSShimName),
+		filepath.Join(dir, VMHostName),
 	}
 	for _, b := range executor.PayloadBinaries() {
 		out = append(out, filepath.Join(dir, PayloadDirName, b))
