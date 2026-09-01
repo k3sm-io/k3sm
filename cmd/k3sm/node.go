@@ -124,6 +124,27 @@ type nodeOptions struct {
 	// `k3sm node --serve-tls` takes it from --kubelet-client-ca.
 	kubeletClientCAPEM []byte
 
+	// kubeletServingCertPEM / kubeletServingKeyPEM are this node's kubelet SERVING
+	// keypair — the cert :10250 presents — issued by the cluster CA, in PEM. They are
+	// the half of the endpoint's TLS that the APISERVER verifies: a mesh server runs
+	// with --kubelet-certificate-authority=<cluster CA>, so a serving cert that does
+	// not chain to it is refused with "x509: certificate signed by unknown authority"
+	// and kubectl logs/exec is broken cluster-wide (B213).
+	//
+	// EMPTY is the single-node/dev default: kubeletServingTLS self-signs (see
+	// certs.SelfSignedServing), which is correct exactly where no cluster CA is
+	// configured on the apiserver's kubelet client. `k3sm agent` fills them from the
+	// join response and `k3sm server --mesh-ip` from its own local mint, so on every
+	// posture where the apiserver was told which CA to trust, the node presents a leaf
+	// from that CA.
+	//
+	// Both or neither: exactly one set is a hard error (kubeletServingTLS refuses),
+	// mirroring the pairing discipline the client-CA anchor above already carries. The
+	// pair is held in MEMORY only and re-derived on every start — no key file, so
+	// nothing here widens the on-disk key material a node keeps.
+	kubeletServingCertPEM []byte
+	kubeletServingKeyPEM  []byte
+
 	// kubeletClientCAPath is the standalone `k3sm node --kubelet-client-ca` file
 	// path kubeletClientCAPEM is read from. Only runNode sets it (`k3sm server`
 	// reads the anchor off its work dir, `k3sm agent` off its join response), so
@@ -711,7 +732,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		if aerr != nil {
 			return fmt.Errorf("kubelet endpoint auth: %w", aerr)
 		}
-		servingTLS, err = kubeletServingTLS(auth, opts.nodeName, opts.nodeIP, internalIP)
+		servingTLS, err = kubeletServingTLS(auth, opts.kubeletServingCertPEM, opts.kubeletServingKeyPEM, opts.nodeName, opts.nodeIP, internalIP)
 		if err != nil {
 			return fmt.Errorf("kubelet serving tls: %w", err)
 		}
@@ -1558,6 +1579,18 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 	return append(taints, t)
 }
 
+// errHalfKubeletServingPair reports a kubelet serving cert without its key, or a
+// key without its cert. The cause is always SERVER-side — one write site emits both
+// halves together (pkg/bootstrap's join response, or the mesh server's own local
+// mint) — so the message says so: an operator handed this error must go look at the
+// server's PKI/bootstrap bundle, not at a setting on the node that reported it.
+//
+// It is fail-fast rather than "fall back to self-signed", because the silent
+// fallback is exactly the B213 defect: a node that quietly presents a self-signed
+// leaf to an apiserver started with --kubelet-certificate-authority is a node whose
+// logs/exec is broken, and it looks healthy while being so.
+var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-present (a cert without its key, or a key without its cert) — both halves are minted and delivered TOGETHER by the server (the join response's kubeletServingCertPEM/KeyPEM, or a mesh server's own local mint), so this is a corrupt or truncated server-side bootstrap bundle, not a setting on this node")
+
 // kubeletServingTLS builds the TLS config the VK node serves on :10250. The
 // cert's SANs include loopback, the node name, and EVERY address in nodeIPs —
 // which must cover the registered NodeInternalIP, since the apiserver (started
@@ -1566,14 +1599,49 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 // InternalIP diverge in the no-datapath posture (see proxyableNodeIP), so both
 // are passed; duplicates and unparseable entries are dropped.
 //
+// servingCertPEM/servingKeyPEM are the CLUSTER-CA-ISSUED pair this node was given
+// (a worker in its join response, a mesh server from its own mint). When BOTH are
+// present they are used verbatim and nothing is self-signed: their SANs were chosen
+// by the issuer, which is why nodeIPs then only feeds the self-signed fallback. When
+// BOTH are empty the cert is self-signed — the single-node/dev posture, where the
+// apiserver configures no --kubelet-certificate-authority and therefore trusts what
+// the node presents. Exactly one present is errHalfKubeletServingPair.
+//
 // The CLIENT half is not optional and is not this function's to choose: auth
 // stamps tls.RequireAndVerifyClientCert plus the cluster's client-identity CA onto
 // the result, so the listener authenticates the apiserver instead of serving
 // exec/attach to anything that can reach the wildcard bind (B176). Taking auth as
 // a required PARAMETER rather than an optional field is deliberate: there is no
 // argument list that produces a serving config without client authentication, so
-// the posture cannot be lost by forgetting to opt into it.
-func kubeletServingTLS(auth *provider.KubeletEndpointAuth, nodeName string, nodeIPs ...string) (*tls.Config, error) {
+// the posture cannot be lost by forgetting to opt into it. The issued-pair path
+// above changes only which certificate is presented — it flows through the SAME
+// auth.ServingTLS stamping, which sets ClientAuth/ClientCAs and never Certificates.
+func kubeletServingTLS(auth *provider.KubeletEndpointAuth, servingCertPEM, servingKeyPEM []byte, nodeName string, nodeIPs ...string) (*tls.Config, error) {
+	cert, err := kubeletServingCertificate(servingCertPEM, servingKeyPEM, nodeName, nodeIPs)
+	if err != nil {
+		return nil, err
+	}
+	return auth.ServingTLS(&tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}), nil
+}
+
+// kubeletServingCertificate selects the certificate :10250 presents: the issued
+// pair when this node has one, else a freshly self-signed leaf over nodeIPs. It is
+// split out from kubeletServingTLS so the SELECTION is testable without a
+// KubeletEndpointAuth, and so the half-pair refusal has one home.
+func kubeletServingCertificate(servingCertPEM, servingKeyPEM []byte, nodeName string, nodeIPs []string) (tls.Certificate, error) {
+	switch {
+	case len(servingCertPEM) > 0 && len(servingKeyPEM) > 0:
+		cert, err := tls.X509KeyPair(servingCertPEM, servingKeyPEM)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("load the cluster-CA-issued kubelet serving keypair: %w", err)
+		}
+		return cert, nil
+	case len(servingCertPEM) > 0 || len(servingKeyPEM) > 0:
+		return tls.Certificate{}, errHalfKubeletServingPair
+	}
 	ips := []net.IP{net.ParseIP("127.0.0.1")}
 	for _, s := range nodeIPs {
 		ip := net.ParseIP(s)
@@ -1585,14 +1653,7 @@ func kubeletServingTLS(auth *provider.KubeletEndpointAuth, nodeName string, node
 		}
 		ips = append(ips, ip)
 	}
-	cert, err := certs.SelfSignedServing([]string{nodeName, "localhost"}, ips)
-	if err != nil {
-		return nil, err
-	}
-	return auth.ServingTLS(&tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{cert},
-	}), nil
+	return certs.SelfSignedServing([]string{nodeName, "localhost"}, ips)
 }
 
 func defaultNodeName() string {
