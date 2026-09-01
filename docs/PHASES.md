@@ -667,7 +667,7 @@ phases:
     subphases:
       - id: M11.0
         title: spikes S1–S5 — lab Mac, agent-driven (k3sm/hack/spike/m11/)
-        status: in-progress  # 2026-08-31 — d1 (S1) done; d5 (S5) done (the root sitting under s5-root.sh has now run and all seven criteria are recorded in findings-s5.md); d2 deferred per the arm64-only slice; d3 gate-measured (its HARD GATE answered NO, see the d3 comment) with three non-blocking legs still NOT RUN, so d3 itself stays open; d4 open
+        status: in-progress  # 2026-09-01 (M11 validation): d1/d3/d4/d5 DONE — S3's hard gate is answered NO and its consequence applied downstream, S4 was built reproducibly, published and pinned. d2 stays deferred per the arm64-only slice. Only a1 keeps this row open, and it reserves a human sign-off that is not an agent's to give.
         note: "Owner k3sm by the M8.0 precedent (m8-plan R23). FILED 2026-08-30: the spikes were on the critical path and cited by four sub-phases with NO ledger row anywhere — findings had nowhere to be recorded as done. ENTRY: hand-run on an entitled VZ Mac; every script writes a COMMITTED findings file and each named exit criterion is the go/no-go for the sub-phase that consumes it. Order S1 → (S3 ∥ S5) → S4: S3 and S5 both need a guest userland S1 does not build, so both extend S1's harness with a throwaway stock linux/arm64 minirootfs over virtiofs (explicitly NOT the M11.2-d1 snapshot path, not yet exercisable end to end); the tarball digest is recorded so measurements reproduce."
         deliverables:
           - id: M11.0-d1  # S1 minimal VZ Linux boot
@@ -723,7 +723,7 @@ phases:
             method: unit
       - id: M11.5
         title: gate — hack/lab/m11.sh + m5.sh graduation
-        status: todo
+        status: in-progress  # 2026-09-01 (M11 validation): d1 DONE and no longer a skeleton — hack/lab/m11.sh ran green on an entitled M1 Ultra against the released artifact (M11-core 21/0/1, M11-lab 26/0/1), logs committed under hack/lab/runs/. a1 stays open for its R19(c) threat-terms sign-off only.
         depends_on: [k3sm:M11.4]
         deliverables:
           - id: M11.5-d1
