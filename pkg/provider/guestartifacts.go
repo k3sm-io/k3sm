@@ -28,14 +28,16 @@ import (
 )
 
 // GuestArtifactsSubdir is the component under the runtimed on-disk root that
-// holds this node's content-addressed guest boot artifact cache (B108).
+// holds this node's content-addressed guest boot artifact cache (B108). It
+// cites the runtimed constant so the in-process node and the standalone lab
+// twin can never derive different cache layouts.
 //
 // It is a SIBLING of the vm spine's other state (the orphan-record store's
 // <root>/vmreap, the per-pod <root>/run/vm/<pod>) rather than a child of any of
 // them, because its lifetime is the NODE's, not a pod's or a daemon run's: the
 // cache is what lets an offline node still boot the set it verified yesterday,
 // so nothing that clears per-run state may take it with it.
-const GuestArtifactsSubdir = "guest-artifacts"
+const GuestArtifactsSubdir = guestartifacts.GuestArtifactsSubdir
 
 // GuestArtifactsDir returns the guest-artifact cache directory for a runtimed
 // on-disk root, resolving an empty root to the runtimed default exactly as
