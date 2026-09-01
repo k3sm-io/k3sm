@@ -210,11 +210,13 @@ func kubeletEndpointPort(listen string) int32 {
 	return int32(port)
 }
 
-// runNode registers this Mac as a Virtual Kubelet node and runs pods via the
-// selected runtime (M0 walking skeleton + M1 runtimed image runtime).
-func runNode(args []string) error {
-	fs := flag.NewFlagSet("node", flag.ExitOnError)
-	opts := nodeOptions{}
+// registerNodeFlags binds the standalone `k3sm node`'s flags onto fs.
+//
+// Extracted for the same reason registerAgentFlags and registerServerFlags are:
+// the registered surface is assertable without a live bring-up, which is the only
+// way to write the NEGATIVE assertion that the dev-only guest-artifact directory
+// override never appears on a daemon command (TestGuestArtifactsDirOverrideIsDevOnly).
+func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.listen, "listen", nodeKubeletListen, "address for the kubelet HTTP API (logs/exec)")
@@ -229,6 +231,14 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.dnsVIP, "dns-vip", "", "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only; standalone `k3sm node` binds no resolver — leave unset, see the startup log)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
+}
+
+// runNode registers this Mac as a Virtual Kubelet node and runs pods via the
+// selected runtime (M0 walking skeleton + M1 runtimed image runtime).
+func runNode(args []string) error {
+	fs := flag.NewFlagSet("node", flag.ExitOnError)
+	opts := nodeOptions{}
+	registerNodeFlags(fs, &opts)
 	_ = fs.Parse(args)
 	opts.standalone = true
 
@@ -819,6 +829,22 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// container re-exec (B26), so `kubectl describe pod` on a crash-looping pod
 		// shows the crash loop in its Events table.
 		cfg.Recorder = recorder
+		// Guest boot artifacts (B108), ensured HERE — at daemon start, before the
+		// runtime that boots from them exists — and never lazily on a pod's first
+		// CreateVM. Doing it here is the whole posture: a hundred-megabyte fetch on
+		// the critical path of a scheduled pod would turn a slow network into a pod
+		// that times out with no useful reason, and would leave the node advertising
+		// a capability it had not yet earned.
+		//
+		// It CANNOT fail this function. Ensure decides the degradation itself and
+		// returns only a boolean (see GuestArtifactSource.Ensure): a node with an
+		// unminted pin, no network, or a rotted cache still runs every native pod it
+		// has, advertises VMArtifactsAvailable=false, and fails vm pods closed. Do
+		// NOT "harden" this into a startup error — it is the same rule the startup
+		// pod reap follows, and for the same reason.
+		if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
+			cfg.GuestArtifacts = &art
+		}
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
 			return nil, nil, "", provider.NodeCapabilities{}, err
@@ -1295,6 +1321,11 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// discipline as the virtualization label above.
 	applyRosettaLabels(n, caps)
 
+	// Guest boot artifacts (B108): present only when THIS daemon start ensured and
+	// digest-verified the pinned kernel + initramfs. Same presence-only discipline;
+	// see LabelVMArtifacts for why it is advertised but not selected on.
+	applyVMArtifactsLabel(n, caps.VMArtifacts)
+
 	n.Status.NodeInfo.OperatingSystem = "darwin"
 	// Architecture is the machine's NATIVE ISA (the same derived value as the
 	// kubernetes.io/arch label above) and stays arm64 on a Rosetta-capable Apple
@@ -1378,6 +1409,20 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 // `exists`-style nodeSelector on a node that LOST the capability.
 func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 	setLabelPresence(n, runtimeclass.LabelVirtualization, vmCapable)
+}
+
+// applyVMArtifactsLabel sets (present) or CLEARS (!present) the
+// k3sm.io/vm-artifacts node label advertising that this node's pinned guest boot
+// artifacts were ensured and digest-verified at daemon start (B108).
+//
+// Like applyVirtualizationLabel it is a thin named alias for setLabelPresence, so
+// the set-or-DELETE mechanism keeps exactly one implementation. The delete
+// direction is the load-bearing one here: artifact availability is re-derived on
+// EVERY start (ensure re-verifies rather than trusting a marker), so a node whose
+// cache rotted, whose pin moved, or whose network went away must stop advertising
+// between one start and the next.
+func applyVMArtifactsLabel(n *corev1.Node, present bool) {
+	setLabelPresence(n, runtimeclass.LabelVMArtifacts, present)
 }
 
 // applyRosettaLabels sets or CLEARS the two Rosetta translation-capability node

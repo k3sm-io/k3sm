@@ -120,13 +120,18 @@ func (opts serverOptions) executorConfig(logger *slog.Logger) executor.Config {
 	}
 }
 
-// runServer brings up the control plane (via the executor) and a Virtual Kubelet
-// node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
-// DNS shim and provisions the os=darwin admission policy. It blocks until
-// interrupted, then shuts the control plane down cleanly.
-func runServer(args []string) error {
-	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	opts := serverOptions{}
+// registerServerFlags binds `k3sm server`'s flags onto fs and returns the error
+// (if any) from resolving the posture-aware --work-dir DEFAULT, which the caller
+// surfaces after Parse so an explicit --work-dir can still override it.
+//
+// It is a function rather than an inline block in runServer for the same reason
+// registerAgentFlags is: the REGISTERED SURFACE is then assertable without
+// parsing argv through a live bring-up — including the negative assertions,
+// which are the ones that cannot be written any other way. The dev-only
+// guest-artifact directory override is exactly such a negative
+// (TestGuestArtifactsDirOverrideIsDevOnly): a flag whose absence is the
+// requirement can only be checked against the real flag set.
+func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// The work-dir default is POSTURE-AWARE (decoupled from the root-only
 	// DefaultWorkDir const): root → /var/lib/k3sm/server, the unprivileged _k3sm
 	// control plane → <home>/server (the root const would EACCES). A resolve error
@@ -192,6 +197,17 @@ func runServer(args []string) error {
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
 	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join, M6.1; requires --server-join --mesh-ip --token)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
+	return workDirErr
+}
+
+// runServer brings up the control plane (via the executor) and a Virtual Kubelet
+// node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
+// DNS shim and provisions the os=darwin admission policy. It blocks until
+// interrupted, then shuts the control plane down cleanly.
+func runServer(args []string) error {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	opts := serverOptions{}
+	workDirErr := registerServerFlags(fs, &opts)
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
