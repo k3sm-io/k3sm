@@ -8,7 +8,7 @@ git_sha.darwin-net: 7bd05f385b9c6586bd71f9f3682e0e2abcf20ec5
 git_sha.runtimed: 9c3e44896945eb6b544f5e0d145bcdeede6fa10f
 git_sha.k3sm: ef9643c21540203380e2580a6a1d8f7b9b488b40 (server) / 25595ba73e14 (worker agent, includes the join-path fixes)
 started_utc: 2026-09-01T19:00:00Z
-result: PARTIAL — 2 of 3 conformance legs green + m3.0; the PVC leg's red is the tracked serving-cert gap only
+result: PASS — FULL GREEN on run 6 (post-B213): M3: 3 passed, 0 failed
 
 # HEADER PROVENANCE: hand-recorded (hack/lab/m3.sh has no emit_run_log_header);
 # every field re-derivable from `k3sm version` on each node and shasum of the
@@ -68,3 +68,22 @@ a single token: `k3sm agent --server 192.168.0.50 --node-ip 100.64.1.1
 
 Full command transcripts in the session logs; gate outputs preserved at the
 operator's scratch tree (m3-run1..5.log).
+
+================================================================================
+RUN 6 — 2026-09-01, post-B213 (both nodes redeployed on main @eee0fb3, the
+kubelet serving-cert fix merged as k3sm#275 after the operator closed #192's
+preconditions). Worker cert verified live: :10250 now presents
+issuer=CN=k3sm-cluster-ca (was self-signed CN=k3sm-kubelet).
+================================================================================
+
+- m3.0 multi-node: PASS (2 Ready nodes)
+- TestM3_NodePort: PASS (1.26s)
+- TestM3_PVCPersistsAcrossRestart: PASS (2.08s — the log channel works; the
+  earlier 62s timeout was the serving-cert gap, as diagnosed)
+- TestM3_InPodKubectlAndDNSOnWorker: PASS (1.03s)
+- Gate verdict: M3: 3 passed, 0 failed — the two-Mac M3 lab gate is FULLY GREEN.
+
+Redeploy notes: the daemon restart reproduced the known alias-strip defect
+(B245's sibling, the teardown/bring-up interleave) — the apiserver held its
+100.64.0.1:6444 socket while the lo0 alias was gone; re-adding the alias
+healed it. Recorded, not fixed here.
