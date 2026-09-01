@@ -319,6 +319,14 @@ func (s *Supervised) provisionComponentCerts() error {
 	if err := writeComponentKubeconfig(s.cfg, controllerManagerKubeconfigPath(s.cfg.WorkDir), controllerManagerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
+	// B176: the client identity the apiserver PRESENTS to a node's kubelet endpoint.
+	// Unconditional, and provisioned here, because apiServerArgs renders
+	// --kubelet-client-certificate unconditionally: a node's :10250 requires and
+	// verifies a client cert in every posture (single-node, dev, mesh, HA), so an
+	// apiserver without one can serve neither `kubectl logs` nor `kubectl exec`.
+	if err := writeAPIServerKubeletClientCert(s.cfg.WorkDir, h); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -590,6 +598,17 @@ func apiServerArgs(cfg Config) []string {
 		clientCA = certs.SigningCACertPath(wd)
 	}
 	args = append(args, "--client-ca-file", clientCA)
+	// B176: the client cert the apiserver PRESENTS to a node's kubelet endpoint.
+	// UNCONDITIONAL, for the same reason --client-ca-file is: :10250 requires and
+	// verifies a client certificate in EVERY posture, so an apiserver that omitted
+	// this would lose logs/exec/attach/port-forward and the node proxy (kubectl top)
+	// on single-node and dev exactly as on a mesh. provisionComponentCerts writes the
+	// keypair on every boot, before bring-up, so the files always exist here.
+	// --kubelet-certificate-authority below is the INDEPENDENT other direction (does
+	// the apiserver verify the NODE's serving cert); the two are not a pair.
+	args = append(args,
+		"--kubelet-client-certificate", apiServerKubeletClientCertPath(wd),
+		"--kubelet-client-key", apiServerKubeletClientKeyPath(wd))
 	if cfg.KubeletCAFile != "" {
 		args = append(args, "--kubelet-certificate-authority", cfg.KubeletCAFile)
 	}

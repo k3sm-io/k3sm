@@ -18,6 +18,8 @@ package vkadapter
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"net/http"
 	"testing"
 )
 
@@ -40,6 +42,70 @@ func TestProviderRoutesEnabledGate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := providerRoutesEnabled(tt.cfg); got != tt.want {
 				t.Errorf("providerRoutesEnabled(%+v) = %v, want %v", tt.cfg, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestValidateProviderRouteAuth pins the B176 fail-closed gate on the OTHER
+// security axis: given that the routes are served at all, they are served
+// authenticated. The three facts must hold TOGETHER — an authorization predicate,
+// a listener that REQUIRES a client certificate, and a CA pool to verify it
+// against — and dropping any one of them is a construction error, not a degraded
+// mode. The accepted row is the positive control: without it a validator that
+// rejected everything would pass this table vacuously.
+func TestValidateProviderRouteAuth(t *testing.T) {
+	pool := x509.NewCertPool()
+	pass := func(h http.Handler) http.Handler { return h }
+	mutual := func() *tls.Config {
+		return &tls.Config{ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}
+	}
+
+	tests := []struct {
+		name    string
+		cfg     NodeConfig
+		wantErr bool
+	}{
+		{
+			name:    "mutual TLS plus an authorizer is accepted",
+			cfg:     NodeConfig{TLSConfig: mutual(), AuthorizeHandler: pass},
+			wantErr: false,
+		},
+		{
+			name:    "the pre-B176 posture (no client auth, no authorizer) is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{}},
+			wantErr: true,
+		},
+		{
+			name:    "a missing authorizer is refused",
+			cfg:     NodeConfig{TLSConfig: mutual()},
+			wantErr: true,
+		},
+		{
+			name:    "ClientAuth relaxed to NoClientCert is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.NoClientCert, ClientCAs: pool}, AuthorizeHandler: pass},
+			wantErr: true,
+		},
+		{
+			name:    "ClientAuth relaxed to RequestClientCert is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.RequestClientCert, ClientCAs: pool}, AuthorizeHandler: pass},
+			wantErr: true,
+		},
+		{
+			name:    "VerifyClientCertIfGiven (verified only when offered) is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: pool}, AuthorizeHandler: pass},
+			wantErr: true,
+		},
+		{
+			name:    "a nil CA pool is refused",
+			cfg:     NodeConfig{TLSConfig: &tls.Config{ClientAuth: tls.RequireAndVerifyClientCert}, AuthorizeHandler: pass},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateProviderRouteAuth(tt.cfg); (err != nil) != tt.wantErr {
+				t.Errorf("validateProviderRouteAuth error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

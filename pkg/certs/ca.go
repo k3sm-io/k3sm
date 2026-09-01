@@ -157,6 +157,29 @@ func (c *CA) IssueServing(cn string, dnsNames []string, ipAddrs []net.IP, validF
 	return certPEM, keyPEM, nil
 }
 
+// APIServerKubeletClientCN is the CommonName the SIGNING CA mints for the ONE
+// client identity a node's kubelet HTTP endpoint (:10250 — logs, exec, attach,
+// port-forward, stats) accepts: the apiserver's kubelet client.
+//
+// It lives here, in the PKI vocabulary, because two packages must agree on it and
+// a duplicated literal in a security predicate is exactly how such an agreement
+// rots: pkg/executor MINTS the cert with this CN (provisionComponentCerts, wired
+// into the apiserver's --kubelet-client-certificate) and pkg/provider VERIFIES it
+// (KubeletEndpointAuth — the accepted-identity predicate). Change it in one place
+// or not at all.
+//
+// It is deliberately NOT a system: name and carries NO Organization. The signing CA
+// is also the apiserver's --client-ca-file, so this keypair authenticates to the
+// apiserver too; giving it O=system:masters (as kubeadm does for its
+// kube-apiserver-kubelet-client) would leave a cluster-admin credential on disk for
+// a job that needs no cluster authority at all. With no groups it is an unbound
+// user under the Node,RBAC authorization mode — default-deny at the apiserver, and
+// authorized ONLY at the kubelet endpoint whose predicate names it. (That
+// default-deny property is contingent on the authorization mode: under the
+// explicit --authorization-mode=AlwaysAllow diagnostic override, every
+// authenticated identity — this one included — has full apiserver access.)
+const APIServerKubeletClientCN = "k3sm-apiserver-kubelet-client"
+
 // IssueClient mints a fresh CLIENT keypair (ExtKeyUsageClientAuth) signed by this CA,
 // for a client identity the CA owns the key material of. cn becomes the certificate's
 // CommonName (the authenticated user) and org its Organization (the RBAC groups). It is

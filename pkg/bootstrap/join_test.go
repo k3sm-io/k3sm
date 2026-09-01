@@ -17,6 +17,7 @@ limitations under the License.
 package bootstrap_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -145,6 +146,17 @@ func TestJoinRoundTrip(t *testing.T) {
 	}
 	if string(res.ClusterCAPEM) != string(clusterCA.CertPEM) {
 		t.Error("join did not return the cluster CA")
+	}
+	// B176: the joining worker also receives the CLIENT-IDENTITY (signing) CA — the
+	// anchor its own :10250 verifies the apiserver's client cert against. Without it
+	// the worker cannot authenticate the one caller it must serve, and startNode
+	// refuses to bring the node up rather than serve exec/attach unauthenticated.
+	// It is the CA CERTIFICATE only; the key never leaves the server.
+	if string(res.ClientCAPEM) != string(signingCA.CertPEM) {
+		t.Error("join did not return the client-identity (signing) CA the worker's kubelet endpoint anchors on")
+	}
+	if bytes.Contains(res.ClientCAPEM, signingCA.KeyPEM) || bytes.Contains(res.ClientCAPEM, []byte("PRIVATE KEY")) {
+		t.Error("join response leaked CA private key material")
 	}
 	if res.PodCIDR != "100.64.1.0/24" {
 		t.Errorf("assigned podCIDR = %q, want 100.64.1.0/24", res.PodCIDR)

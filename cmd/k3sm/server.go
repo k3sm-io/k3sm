@@ -671,6 +671,19 @@ func runServer(args []string) error {
 	// address `kubectl get svc` shows as EXTERNAL-IP and the address the Node
 	// object advertises cannot diverge (they read one podCIDR, one nodeIP, one
 	// netMode through one shared derivation, advertisedNodeIP).
+	//
+	// The kubelet endpoint's client-identity anchor is read here, off the work dir's
+	// PKI: EnsureHierarchy has run (the mesh block above, or the executor's
+	// provisionComponentCerts during exec.Start), so the signing CA certificate
+	// exists in EVERY posture — single-node, `k3sm dev`, mesh and HA alike. It is
+	// the same CA the apiserver's --client-ca-file trusts and the issuer of the
+	// --kubelet-client-certificate the executor just minted, so the node and the
+	// apiserver agree on the identity by construction rather than by configuration.
+	// A read failure stops the server: :10250 is not served unauthenticated (B176).
+	kubeletClientCA, err := os.ReadFile(certs.SigningCACertPath(opts.workDir))
+	if err != nil {
+		return fmt.Errorf("read the kubelet endpoint's client-identity CA: %w", err)
+	}
 	nodeOpts := nodeOptions{
 		kubeconfig: exec.Kubeconfig(),
 		nodeName:   opts.nodeName,
@@ -685,6 +698,9 @@ func runServer(args []string) error {
 		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
+
+		kubeletClientCAPEM: kubeletClientCA, // B176: :10250 requires the apiserver's client cert
+
 		// Close the loop opened at step 4f: the node publishes its in-process
 		// runtime here, and the MLX operator's fit check starts reading live GPU
 		// facts off it. A hostprocess node never calls it, leaving the fit check
