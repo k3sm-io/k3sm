@@ -616,7 +616,7 @@ phases:
         acceptance:
           - id: M10.2-a1
             met: true
-            check: "pkg/provider::TestNativeSidecarStaysRunning (an initContainer restartPolicy:Always stays Running + reverse-order teardown, over the new apis proto field) + TestJobBackoffAndCompletionAccounting (depends B8) + TestDaemonSetLandsOnDarwinNode (toleration-injection ONLY, never the os=darwin nodeSelector) + pkg/provider::TestProviderEmitsLifecycleEvents. Live exercise is the M10 composite gate once these land green."
+            check: "pkg/provider::TestNativeSidecarStaysRunning (an initContainer restartPolicy:Always stays Running + reverse-order teardown, over the new apis proto field) + TestJobBackoffAndCompletionAccounting (depends B8) + pkg/policy::TestDaemonSetTolerationInjectedNotNodeSelector (toleration-injection ONLY, never the os=darwin nodeSelector; name reconciled 2026-08-31 — the cited TestDaemonSetLandsOnDarwinNode never existed under that name) + pkg/provider::TestProviderEmitsLifecycleEvents. Live exercise is the M10 composite gate once these land green."
             method: unit
       - id: M10.3
         title: Ingress + IngressClass + klipper-lite LoadBalancer
