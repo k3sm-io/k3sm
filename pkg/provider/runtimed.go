@@ -106,6 +106,19 @@ type runtimedRuntime struct {
 	// and every method tolerates a nil receiver.
 	transport *transportFeed
 
+	// guestArtifacts records whether this node's pinned guest boot artifacts were
+	// ensured and verified at construction (B108) — the VMArtifactsAvailable
+	// capability Capabilities reports and cmd/k3sm turns into the
+	// k3sm.io/vm-artifacts node label.
+	//
+	// It is a k3sm-side fact, not a runtimed RuntimeCondition, because ENSURE runS
+	// here: runtimed owns the mechanism (guestartifacts.EnsureGuestArtifacts) but
+	// the daemon that calls it is this one, and a node may not advertise a
+	// capability whose outcome the advertiser did not observe. It mirrors exactly
+	// what was wired into the vm backend — true iff a locator was installed — so
+	// the label can never claim more than CreateVM can deliver.
+	guestArtifacts bool
+
 	// clk, dial, and probeTransport are the provider-served probe seams (M2.2):
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
 	// Production defaults are wired in newRuntimedWith; tests inject fakes.
@@ -237,6 +250,17 @@ type RuntimedConfig struct {
 	// runtimed never talks to the apiserver. nil disables data-backed
 	// volumes/env/credentials (they fail closed / pull anonymously).
 	Client kubernetes.Interface
+	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
+	// set (B108) — the kernel, the initramfs and the cmdline a vm pod boots from.
+	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
+	// config is built, never a directory this constructor would fetch into: daemon
+	// start is not a place to discover that a hundred megabytes are missing.
+	//
+	// nil is the FAIL-CLOSED posture and the shipped one on any node whose ensure
+	// did not succeed (an unminted pin, no network, a digest mismatch). It leaves
+	// the vm backend's artifact locator unset, so CreateVM fails every vm pod with
+	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
+	GuestArtifacts *sandbox.GuestArtifacts
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -267,6 +291,31 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	if cfg.Network != nil {
 		network = cfg.Network
 	}
+	// The vm backend is constructed HERE, rather than left to runtimed's own
+	// default, ONLY when this node has verified guest artifacts to wire into it:
+	// sandbox.WithGuestArtifacts is a construction option, and runtimed's default
+	// backend deliberately leaves the locator unset (its feeder — this — is a
+	// separate deliverable). Everything else about the backend is runtimed's
+	// default reproduced verbatim, so the ONE difference between a node with
+	// artifacts and a node without is the locator.
+	//
+	// The state root is passed through runtimeRoot for a reason worth keeping: an
+	// empty Root means "runtimed's default", and a backend built with an empty
+	// state root has its vm orphan store DISABLED — a daemon `kill -9`ed while a
+	// guest ran would leave a helper no later start could find. Defaulting the
+	// root at this call site is what makes the override behaviourally identical to
+	// the default it replaces.
+	var deps runtimed.Deps
+	if cfg.GuestArtifacts != nil {
+		deps.VMBackend = sandbox.NewVMBackend(
+			sandbox.WithStateRoot(runtimeRoot(cfg.Root)),
+			sandbox.WithLogger(log),
+			sandbox.WithGuestArtifacts(guestArtifactLocator(*cfg.GuestArtifacts)),
+		)
+	}
+	deps.Resolver = resolver
+	deps.Credentials = creds
+	deps.Network = network
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",
@@ -277,11 +326,7 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		ResolverVIP:  cfg.ResolverVIP,
 		APIServerVIP: cfg.APIServerVIP,
 		PathShimPath: cfg.PathShim,
-	}, runtimed.Deps{
-		Resolver:    resolver,
-		Credentials: creds,
-		Network:     network,
-	})
+	}, deps)
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
@@ -353,6 +398,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		resolver:       resolver,
 		network:        cfg.Network,
 		transport:      newTransportFeed(cfg.TransportOverrides, log),
+		guestArtifacts: cfg.GuestArtifacts != nil,
 		client:         cfg.Client,
 		log:            log,
 		recorder:       recorder,
@@ -457,6 +503,17 @@ func unionSocketDenies(sets ...[]string) []string {
 	return slices.Compact(out)
 }
 
+// ConditionVMArtifactsAvailable is the NAME the guest-artifact capability is
+// narrated under (B108).
+//
+// It is a k3sm-local string, NOT one of runtimed's imported RuntimeCondition Type
+// constants, because no RuntimeCondition carries this fact: the ensure runs here,
+// so runtimed has nothing to report (see NodeCapabilities.VMArtifacts). It is
+// exported so the log line, the ledger, the docs and the integration gate all
+// spell the capability the same way — a capability whose name is retyped at each
+// site is one an operator cannot grep for.
+const ConditionVMArtifactsAvailable = "VMArtifactsAvailable"
+
 // NodeCapabilities are the node-capability facts runtimed advertises as
 // GetRuntimeInfo RuntimeConditions and the node command turns into truthful node
 // labels. They travel as ONE struct, from ONE RPC, deliberately: three separate
@@ -469,6 +526,24 @@ type NodeCapabilities struct {
 	// RuntimeClass (Virtualization.framework isSupported + the
 	// com.apple.security.virtualization entitlement). Drives k3sm.io/virtualization (B1).
 	VMBackend bool
+	// VMArtifacts is the VMArtifactsAvailable condition: this node holds the pinned
+	// guest kernel + initramfs, digest-verified on THIS daemon start, so a booted
+	// guest has something to boot. Drives k3sm.io/vm-artifacts (B108).
+	//
+	// It is the ONE field here that does NOT come off the GetRuntimeInfo response,
+	// and the asymmetry is deliberate rather than an oversight: the ensure runs in
+	// k3sm (GuestArtifactSource.Ensure, at daemon start), so runtimed has no
+	// condition to report — it is handed the outcome as a construction input. It
+	// still fails CLOSED with the rest of the struct: the zero value advertises
+	// nothing, and a probe error leaves it false along with everything else.
+	//
+	// It is INDEPENDENT of VMBackend. The two answer different questions — "can
+	// this Mac run a guest" and "does this node have a guest to run" — and either
+	// can be true without the other (an entitled Mac that could not fetch; an
+	// air-gap-seeded cache on a Mac with no VZ). A vm pod needs both, which is why
+	// the vm RuntimeClass still selects on k3sm.io/virtualization and this label is
+	// additive advertisement, not a second scheduling gate.
+	VMArtifacts bool
 	// RosettaHost is the RosettaHostAvailable condition: this host can translate
 	// darwin/amd64 Mach-O payloads via Rosetta 2 on the NATIVE host-process spine.
 	// Drives k3sm.io/rosetta.
@@ -506,12 +581,25 @@ func (r *runtimedRuntime) Capabilities(ctx context.Context) NodeCapabilities {
 		return NodeCapabilities{}
 	}
 	caps := nodeCapabilitiesFromInfo(info)
+	// Stamped from what THIS provider wired, not read back off the response: the
+	// ensure is k3sm's (see NodeCapabilities.VMArtifacts), so the runtime has no
+	// opinion to report and a `conditionTrue` read would be permanently false.
+	caps.VMArtifacts = r.guestArtifacts
 	// Log at the boundary WITH each withheld capability's Reason: the condition's
 	// Reason/Message is the only answer to "why is my node not labelled rosetta?",
 	// and it is discarded once this returns a bare bool.
 	logWithheldCapability(r.log, info, runtimed.ConditionVMBackendAvailable, caps.VMBackend)
 	logWithheldCapability(r.log, info, runtimed.ConditionRosettaHostAvailable, caps.RosettaHost)
 	logWithheldCapability(r.log, info, runtimed.ConditionRosettaGuestAvailable, caps.RosettaGuest)
+	// The artifact capability has no RuntimeCondition to carry a Reason, so its
+	// withheld case is narrated here with the condition name the ledger and the
+	// docs use. GuestArtifactSource.Ensure already logged the CAUSE at start; this
+	// line is what an operator finds when they ask why the node is not labelled.
+	if !caps.VMArtifacts {
+		r.log.Info("node capability withheld: "+ConditionVMArtifactsAvailable+
+			" is false — no digest-verified guest boot artifacts were wired into this runtime, so every vm pod fails closed",
+			"condition", ConditionVMArtifactsAvailable)
+	}
 	return caps
 }
 
