@@ -137,10 +137,14 @@ Install:
 
 \`sudo ./k3sm install\` creates /Library/k3sm, the _k3sm service user, the
 LaunchDaemons io.k3sm.netd and io.k3sm.server, and an admin kubeconfig in your
-home directory. It copies the binary and every file listed in sha256sums out of
-this directory, so the extracted directory can be deleted afterwards. The
-supporting files must stay beside k3sm until then — the installer resolves them
+home directory. It copies the binary, the two shim libraries, k3sm-execshim and
+cp-payload/ into /Library/k3sm, so this directory can be deleted afterwards.
+Until then those files must stay beside k3sm — the installer resolves them
 relative to the binary and stops if one is missing.
+
+k3sm-vmhost ships here but is not one of the files install copies. Pods that ask
+for the Linux vm runtime cannot start until it is placed in /Library/k3sm by
+hand; everything else works without it.
 
 Verify before installing:
 
