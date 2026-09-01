@@ -277,9 +277,11 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 Both ship as documented **EXPERIMENTAL** and should be treated as preview-quality — but they are on
 different tracks:
 
-- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) **does not run a Pod
-  today** — the dispatch, labels and plumbing exist, the guest boot does not, so a Pod that sets
-  `runtimeClassName: vm` will not start. It is targeted at the **v0.1.0** public release as
+- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod
+  end to end — create-to-Running restarts measure a 165 ms median on the reference hardware
+  (the figures below) — but the install-time artifact chain is not wired yet: the guest kernel
+  and initramfs it boots are dev-provided, not fetched and verified at install. Treat the whole
+  path as preview-quality. It is targeted at the **v0.1.0** public release as
   EXPERIMENTAL and **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for
   a later release), and is **launch-gated**: announced only if its live lab proof is green against
   the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed, with published
