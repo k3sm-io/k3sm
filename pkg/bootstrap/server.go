@@ -202,6 +202,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		SchemaVersion:         JoinSchemaVersion,
 		NodeName:              req.NodeName,
 		ClusterCAPEM:          string(s.cfg.ClusterCA.CertPEM),
+		ClientCAPEM:           string(s.cfg.SigningCA.CertPEM),
 		NodeClientCertPEM:     string(clientCert),
 		KubeletServingCertPEM: string(servingCert),
 		APIServers:            s.cfg.APIServers,

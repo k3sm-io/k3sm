@@ -63,11 +63,14 @@ provides today:
 
 3. **The kubelet HTTP API server.** VK's `nodeutil` wires the HTTPS server that
    serves the kubelet verbs the apiserver proxies to — `/containerLogs`
-   (`kubectl logs`), and exec/attach/port-forward — behind an auth handler
-   (`WithAuth`/`NoAuth`), TLS config, and request instrumentation
+   (`kubectl logs`), and exec/attach/port-forward — behind an auth handler,
+   TLS config, and request instrumentation
    (`AttachProviderRoutes` + `InstrumentHandler`). `vkadapter.NewNode`
    encapsulates exactly this wiring. A replacement must stand up that HTTPS
-   server, route the streaming verbs, and reproduce the auth/TLS posture.
+   server, route the streaming verbs, and reproduce the auth/TLS posture — which
+   for k3sm means mutual TLS anchored on the cluster's client-identity CA plus the
+   accepted-identity predicate in `provider.KubeletEndpointAuth`, not `nodeutil`'s
+   own auth helpers.
 
 4. **Node registration + lifecycle.** VK registers the Node object at bring-up
    (letting the provider stamp labels/capacity/taints via the bootstrap

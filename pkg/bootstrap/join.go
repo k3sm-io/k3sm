@@ -81,8 +81,13 @@ type JoinOptions struct {
 // issued certs paired with the private keys the node kept, the assigned pod network,
 // the peer snapshot, and the node's wireguard keypair.
 type JoinResult struct {
-	NodeName              string
-	ClusterCAPEM          []byte
+	NodeName     string
+	ClusterCAPEM []byte
+	// ClientCAPEM is the cluster's client-identity (signing) CA certificate — the
+	// anchor this node's OWN kubelet endpoint verifies the apiserver's client cert
+	// against (B176). Empty only against a server that predates the field, which a
+	// worker treats as a hard failure rather than serving :10250 open.
+	ClientCAPEM           []byte
 	NodeClientCertPEM     []byte
 	NodeClientKeyPEM      []byte
 	KubeletServingCertPEM []byte
@@ -197,6 +202,7 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	return &JoinResult{
 		NodeName:              resp.NodeName,
 		ClusterCAPEM:          []byte(resp.ClusterCAPEM),
+		ClientCAPEM:           []byte(resp.ClientCAPEM),
 		NodeClientCertPEM:     []byte(resp.NodeClientCertPEM),
 		NodeClientKeyPEM:      clientKeyPEM,
 		KubeletServingCertPEM: []byte(resp.KubeletServingCertPEM),
