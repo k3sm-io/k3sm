@@ -185,7 +185,16 @@ func (lb *LoadBalancer) healthLoop(ctx context.Context, interval time.Duration) 
 	}
 }
 
-// forward proxies client↔upstream bytes both ways until either side closes or ctx ends.
+// forward proxies client↔upstream bytes both ways with TCP half-close propagation,
+// returning only once BOTH directions have finished (or ctx ends).
+//
+// Waiting for both is what keeps the apiserver's long half-duplex responses intact.
+// Tearing the pair down as soon as EITHER direction ended truncated every request
+// whose client stops writing first and then reads for a long time — `kubectl logs -f`,
+// `exec`, a `watch`: the client's half-close ended the client→upstream copy, which
+// closed both conns while the response was still streaming. The half-close must be
+// PROPAGATED (so the apiserver sees the request end) and not mistaken for a session
+// end. This is the same shape as the svclb forwarder's splice.
 func (lb *LoadBalancer) forward(ctx context.Context, client net.Conn) {
 	defer client.Close()
 	server, ok := lb.Pick()
@@ -200,12 +209,38 @@ func (lb *LoadBalancer) forward(ctx context.Context, client net.Conn) {
 		return
 	}
 	defer upstream.Close()
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
-	select {
-	case <-ctx.Done():
-	case <-done:
+
+	// Close both conns on ctx cancel so a shutdown still drains in-flight forwards
+	// (wg.Wait would otherwise park until the peers hang up); the deferred cancel
+	// reaps the watcher when the forward ends first.
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+	go func() {
+		<-connCtx.Done()
+		_ = client.Close()
+		_ = upstream.Close()
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(upstream, client)
+		closeWrite(upstream)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(client, upstream)
+		closeWrite(client)
+	}()
+	wg.Wait()
+}
+
+// closeWrite propagates a half-close where the conn supports it (TCP), so the peer
+// reads EOF on that direction while the other direction stays open.
+func closeWrite(c net.Conn) {
+	if hc, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = hc.CloseWrite()
 	}
 }
 

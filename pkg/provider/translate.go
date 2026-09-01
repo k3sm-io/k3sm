@@ -65,22 +65,20 @@ const memoryLimitAnnotation = "k3sm.io/memory-limit-bytes"
 // rlimitAnnotationPrefix prefixes the pod annotations that source
 // PodBox.rlimits[] (field 102): `k3sm.io/rlimit-<resource>` (e.g.
 // k3sm.io/rlimit-nofile, k3sm.io/rlimit-nproc), value `<soft>` or
-// `<soft>:<hard>` where each part is a decimal integer up to 2^63-1 or
-// "unlimited" (a single value means soft=hard; see parseRlimitMagnitude for
-// why larger magnitudes are rejected). The suffix is transformed MECHANICALLY —
-// "RLIMIT_"+strings.ToUpper(suffix) — and forwarded VERBATIM into
-// ResourceLimit.type: the provider keeps NO rlimit-name allowlist, runtimed's
-// rlimitResource map is the single semantic authority (an unknown name is its
-// skip-with-warning). The provider validates SYNTAX only, and a malformed
-// annotation fails CreatePod naming the key — a producer-side skip would
-// compose with the consumer-side skip into a silently-unconstrained pod.
+// `<soft>:<hard>`, each a decimal integer up to 2^63-1 or "unlimited" (a
+// single value means soft=hard; see parseRlimitMagnitude for the ceiling).
+// The suffix maps to ResourceLimit.type as "RLIMIT_"+strings.ToUpper(suffix)
+// with no name allowlist — runtimed's rlimitResource map is the semantic
+// authority; the provider validates syntax only and fails CreatePod naming
+// the bad key, so a producer-side skip can't compose with a consumer-side one
+// into an unconstrained pod.
 //
-// POD-SCOPED BY CONSTRUCTION (mirroring memoryLimitAnnotation): PodBox.rlimits
-// is a pod-level field, so these limits apply to init/sidecar/main containers
-// alike; per-container rlimits would need an apis change — out of B7 scope.
-// Darwin semantics live with the consumer: runtimed clamps an unlimited
-// RLIMIT_NOFILE to the kernel ceiling, and RLIMIT_NPROC counts per-uid (the
-// shared _k3sm user) — see runtimed/docs/resources.md.
+// PodBox.rlimits is pod-level (like memoryLimitAnnotation), so these limits
+// apply to init/sidecar/main containers alike; per-container rlimits would
+// need an apis change (out of B7 scope). Darwin semantics live with the
+// consumer: runtimed clamps an unlimited RLIMIT_NOFILE to the kernel ceiling
+// and counts RLIMIT_NPROC per-uid (the shared _k3sm user) — see
+// runtimed/docs/resources.md.
 const rlimitAnnotationPrefix = "k3sm.io/rlimit-"
 
 // rlimitUnlimited is the annotation value token for "no limit". It is encoded
@@ -95,45 +93,40 @@ const rlimitUnlimited = "unlimited"
 const defaultGraceSeconds int64 = 30
 
 // toPodBox translates a corev1.Pod into the runtime PodBox runtimed consumes. It
-// FILLS sandbox_profile and signature_policy so runtimed's fail-closed gate
-// passes: a nil profile or an UNSPECIFIED signature policy makes CreatePod refuse
-// the pod. (The sandbox BACKEND may be UNSPECIFIED — that is the host-process
-// default; see podSandboxBackend.)
+// fills sandbox_profile and signature_policy so runtimed's fail-closed gate
+// passes: a nil profile or an unset signature policy makes CreatePod refuse the
+// pod (the sandbox backend itself may be unspecified — that is the host-process
+// default; see podSandboxBackend).
 //
-// It returns an error — failing closed — when the pod names a RuntimeClass with no
-// backend mapping (runtimev1.ErrUnknownHandler), so a pod that asked for an
-// isolation class k3sm cannot satisfy is refused rather than silently downgraded.
+// It fails closed when the pod names a RuntimeClass with no backend mapping
+// (runtimev1.ErrUnknownHandler — refused rather than silently downgraded), and
+// when its k3sm.io/image-platform annotation is malformed (podImagePlatform).
 //
 // rootfsRoot is the per-pod-dir parent; dyldShim, when non-empty, is wired into
 // the annotation runtimed copies to DYLD_INSERT_LIBRARIES (the DNS shim).
 //
-// Container env is carried STRUCTURALLY here (literal value, valueFrom, envFrom);
-// resolvePodBoxEnv flattens it into literal values before the box is sent to
-// runtimed, which reads only EnvVar.value (it never talks to the apiserver).
+// Container env is carried structurally (literal value, valueFrom, envFrom);
+// resolvePodBoxEnv flattens it into literal values before the box reaches
+// runtimed, which reads only EnvVar.value and never talks to the apiserver.
 //
-// dnsCfg is the pod's cluster DNS configuration; when the pod uses a cluster-first
-// DNSPolicy, toPodBox injects the K3SM_DNS_* env the DYLD getaddrinfo shim reads
-// (via dns.ConfigToEnv) into every container so in-pod cluster Service names
-// resolve against the cluster DNS VIP — see injectClusterDNSEnv (B18). The
-// injection is the keystone for in-pod cluster DNS: the shim annotation alone only
-// loads the shim, which then defers every lookup to the host resolver until these
-// env are present.
+// dnsCfg is the pod's cluster DNS configuration. For a cluster-first DNSPolicy,
+// toPodBox injects the K3SM_DNS_* env the DYLD getaddrinfo shim reads (via
+// dns.ConfigToEnv) into every container so in-pod Service names resolve against
+// the cluster DNS VIP (B18, see injectClusterDNSEnv) — without this env the shim
+// only loads and falls back to the host resolver.
 //
-// B20a augments the ClusterFirst path: a cluster-first pod's spec.dnsConfig is
-// additively merged into the cluster base (extra search domains appended+deduped,
-// ndots override) by buildBox before this injection — the merge is gated on the
-// cluster-DNS policy there, so a None/Default pod keeps the UNMERGED base. Still
-// DEFERRED to B20b (the apis wave): dnsPolicy: None (a pod's own spec.dnsConfig
-// nameservers — a None pod falls back to the host resolver, not its declared
-// nameservers), an explicit ndots: 0 (the int32 path cannot tell it from unset),
-// spec.dnsConfig.nameservers under ClusterFirst (the single-server shim ABI), and
-// non-ndots options.
+// B20a additively merges a cluster-first pod's spec.dnsConfig into the cluster
+// base (extra search domains appended+deduped, ndots override) before this
+// injection; a None/Default pod keeps the unmerged base. Still deferred to B20b:
+// dnsPolicy: None's own nameservers, an explicit ndots: 0 (indistinguishable
+// from unset in this int32 path), spec.dnsConfig.nameservers under ClusterFirst
+// (the shim ABI carries one server), and non-ndots options.
 //
-// nodeIP is the node's own address; it is the discriminator for the bind-discipline
-// env — a pod with a DISTINCT /32 (podIP != nodeIP) gets K3SM_POD_IP injected so the
-// DYLD bind() interpose rewrites its wildcard binds onto that /32 (B217), while a
-// hostNetwork/vm/no-network pod (which resolves podIP to nodeIP) gets nothing. log,
-// when non-nil, receives the M0 host-binary-route warn — see injectBindDisciplineEnv.
+// nodeIP discriminates the bind-discipline env: a pod with a distinct /32
+// (podIP != nodeIP) gets K3SM_POD_IP injected so the DYLD bind() interpose
+// rewrites its wildcard binds onto that /32 (B217); hostNetwork/vm/no-network
+// pods (podIP == nodeIP) get nothing. log, when non-nil, receives the M0
+// host-binary-route warn — see injectBindDisciplineEnv.
 func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCfg netv1.DNSConfig, log *slog.Logger) (*runtimev1.PodBox, error) {
 	box := &runtimev1.PodBox{
 		PodId:       string(pod.UID),
@@ -156,22 +149,21 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 	if dyldShim != "" {
 		box.Annotations[dyldInsertAnnotation] = dyldShim
 	}
-	// The provider is the trusted producer of the resource-limit inputs. Set the
-	// TYPED apis:M2.2 PodBox fields: memory_limit_bytes (the OOM ceiling runtimed
-	// compares ri_phys_footprint against) and qos_class (runtimed's best-effort CPU
-	// policy). The k3sm.io/memory-limit-bytes annotation is also written AFTER the
-	// user annotations as a transitional fallback (runtimed bridges it when the
-	// typed field is unset); the typed field is authoritative.
+	// Set the typed apis:M2.2 PodBox fields: memory_limit_bytes (the OOM ceiling
+	// runtimed compares ri_phys_footprint against) and qos_class (runtimed's
+	// best-effort CPU policy). The k3sm.io/memory-limit-bytes annotation is also
+	// written after the user annotations as a transitional fallback runtimed
+	// bridges when the typed field is unset; the typed field is authoritative.
 	if lim := podMemoryLimitBytes(pod); lim > 0 {
 		box.MemoryLimitBytes = lim
 		box.Annotations[memoryLimitAnnotation] = strconv.FormatInt(lim, 10)
 	}
 	box.QosClass = podQOSClass(pod)
 
-	// The rlimit SOURCE (B7): explicit k3sm.io/rlimit-* annotations and ONLY
-	// those — the producer mirrors runtimed's no-synthesis discipline (no
-	// RLIMIT_AS from resources.limits.memory, no RLIMIT_CPU from cpu; see
-	// resolveRlimitPlan for why). A malformed annotation fails the pod here.
+	// The rlimit source (B7) is explicit k3sm.io/rlimit-* annotations only —
+	// mirroring runtimed's no-synthesis discipline (no RLIMIT_AS from
+	// resources.limits.memory, no RLIMIT_CPU from cpu; see resolveRlimitPlan). A
+	// malformed annotation fails the pod here.
 	rlimits, err := podRlimits(pod)
 	if err != nil {
 		return nil, err
@@ -181,18 +173,23 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers, true)
 	box.Containers = toRuntimeContainers(pod.Spec.Containers, false)
 
-	// Inject the cluster DNS env the DYLD getaddrinfo shim reads, gated on the pod's
-	// DNSPolicy. Appended AFTER the user env (infra-wins) and to BOTH the init and
-	// regular containers — see injectClusterDNSEnv. This is the B18 DNS keystone: the
-	// shim annotation only loads the shim; without these env in-pod cluster Service
-	// names do not resolve (the shim defers to the host resolver).
+	// The k3sm.io/image-platform override (M11.4) is parsed once here — the
+	// annotation is pod-level — and stamped onto every container as the typed
+	// Platform message, so nothing downstream re-parses a user string. A
+	// malformed value fails the pod here (same fail-closed posture as rlimits):
+	// silently defaulting the platform would run the wrong binaries unnoticed.
+	imagePlatform, err := podImagePlatform(pod)
+	if err != nil {
+		return nil, err
+	}
+	stampImagePlatform(box, imagePlatform)
+
+	// Inject cluster DNS env for the DYLD shim, gated on DNSPolicy — see
+	// injectClusterDNSEnv (B18).
 	injectClusterDNSEnv(box, pod.Spec.DNSPolicy, dnsCfg)
 
-	// Inject the K3SM_POD_IP env the DYLD bind() interpose reads to rewrite the pod's
-	// wildcard binds onto its own /32 (B217) — appended AFTER the user env (infra-wins),
-	// gated on the pod having a DISTINCT /32 (podIP != nodeIP). hostNetwork/vm/no-network
-	// pods resolve podIP to nodeIP and get nothing; the shipped hostNetwork semantic
-	// (share the node's addresses) must not be narrowed by rewriting its binds.
+	// Inject K3SM_POD_IP for the DYLD bind() interpose, gated on a distinct /32
+	// (B217) — see injectBindDisciplineEnv.
 	injectBindDisciplineEnv(box, podIP, nodeIP, clusterCIDRs(dnsCfg.ClusterDNSIP), log)
 
 	box.Volumes = toVolumes(pod.Spec.Volumes)
@@ -207,14 +204,8 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 		box.TerminationGracePeriodSeconds = *g
 	}
 
-	// Resolve the pod's RuntimeClass to its isolation backend (M5.1). A pod with no
-	// runtimeClassName resolves to SANDBOX_BACKEND_UNSPECIFIED — NOT a hardcoded
-	// Seatbelt rung — so runtimed's SelectBackend(UNSPECIFIED,…) walks the
-	// host-OS-version-gated Seatbelt ladder and picks the correct rung for the host
-	// (SEATBELT_INPROC where libsandbox is present); runtimeClassName: vm resolves to
-	// SANDBOX_BACKEND_VM (the Virtualization.framework micro-VM); an unknown handler
-	// FAILS CLOSED here rather than downgrading a pod that requested stronger
-	// isolation onto the host-process path.
+	// Resolve the pod's RuntimeClass to its isolation backend (M5.1) — see
+	// podSandboxBackend for the fail-closed contract.
 	backend, err := podSandboxBackend(pod)
 	if err != nil {
 		return nil, err
@@ -227,9 +218,8 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 		DataVolumePath: rootfsRoot,
 		AllowNetwork:   true,
 	}
-	// GPU + internet-egress intent (M8.3-d2): read from the pod, then enforce the
-	// egress⇒network pairing so a wider-than-cluster egress grant never arrives
-	// without the route the cluster DNS VIP needs.
+	// GPU + internet-egress intent (M8.3-d2) — see applyGPUAndEgress for the
+	// egress⇒network pairing.
 	applyGPUAndEgress(box.SandboxProfile, pod)
 	// For a vm pod, size the guest from the pod's cpu/memory (the VZ vCPU count +
 	// RAM; 0 leaves the runtimed/VZ default). The Seatbelt rungs ignore these.
@@ -241,13 +231,10 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 }
 
 // podRequestsGPU reports whether the pod requests the mlx.k3sm.io/gpu extended
-// resource (mlxv1alpha1.ResourceGPU) via a container's LIMITS — deliberately
-// NOT requests. Kubernetes extended resources require requests == limits when
-// both are set and are commonly expressed as limits-only, but the read here is
-// pinned to limits alone: a requests-only GPU ask is not a GPU grant, matching
-// how podMemoryLimitBytes and effectiveResource already treat limits as the
-// authoritative ceiling for this provider. Checked across
-// both init and regular containers — an init container that needs GPU access
+// resource (mlxv1alpha1.ResourceGPU) via a container's limits, not requests —
+// matching how podMemoryLimitBytes and effectiveResource already treat limits
+// as the authoritative ceiling; a requests-only GPU ask is not a grant. Checked
+// across init and regular containers: an init container that needs GPU access
 // (e.g. a model-fetch step) is as real a request as a regular one.
 func podRequestsGPU(pod *corev1.Pod) bool {
 	gpu := corev1.ResourceName(mlxv1alpha1.ResourceGPU)
@@ -265,11 +252,11 @@ func podRequestsGPU(pod *corev1.Pod) bool {
 }
 
 // podRequestsInternetEgress reports whether the pod carries the
-// runtimev1.AnnotationInternetEgress annotation (k3sm.io/internet-egress) — by
-// PRESENCE, not a parsed boolean value. The annotation is operator-stamped
-// plumbing under the single-trust-domain model; a hand-set use
-// on a non-operator pod is not rejected here (that is the M8.3-d3 Warn VAP's
-// job, a separate admission-time seam), so any value on the key opts the pod in.
+// runtimev1.AnnotationInternetEgress annotation (k3sm.io/internet-egress), by
+// presence, not a parsed boolean. The annotation is operator-stamped plumbing
+// under the single-trust-domain model; a hand-set use on a non-operator pod is
+// not rejected here (that is the M8.3-d3 Warn VAP's job), so any value on the
+// key opts the pod in.
 func podRequestsInternetEgress(pod *corev1.Pod) bool {
 	_, ok := pod.Annotations[runtimev1.AnnotationInternetEgress]
 	return ok
@@ -277,13 +264,12 @@ func podRequestsInternetEgress(pod *corev1.Pod) bool {
 
 // applyGPUAndEgress sets SandboxProfile.AllowGpu/AllowInternetEgress from the
 // pod's GPU-limit and egress-annotation intent, then enforces the
-// AllowInternetEgress ⇒ AllowNetwork pairing: a pod that opts
-// into internet egress must still carry AllowNetwork, or it loses the cluster
-// DNS-VIP route Seatbelt only emits under AllowNetwork — an egress-only pod
-// would be unable to resolve names before it could ever reach the network it
-// asked for. AllowNetwork is otherwise left as the caller set it; toPodBox
-// currently hardcodes it true for every pod, but this pairing holds regardless
-// of that caller's choice.
+// AllowInternetEgress ⇒ AllowNetwork pairing: a pod that opts into internet
+// egress must still carry AllowNetwork, or it loses the cluster DNS-VIP route
+// Seatbelt only emits under AllowNetwork — it would be unable to resolve names
+// before reaching the network it asked for. AllowNetwork is otherwise left as
+// the caller set it (toPodBox hardcodes it true for every pod today), but the
+// pairing holds regardless of that caller's choice.
 func applyGPUAndEgress(profile *runtimev1.SandboxProfile, pod *corev1.Pod) {
 	profile.AllowGpu = podRequestsGPU(pod)
 	profile.AllowInternetEgress = podRequestsInternetEgress(pod)
@@ -293,27 +279,26 @@ func applyGPUAndEgress(profile *runtimev1.SandboxProfile, pod *corev1.Pod) {
 }
 
 // injectClusterDNSEnv appends the K3SM_DNS_* environment the DYLD getaddrinfo shim
-// reads (serialized by the single pinned dns.ConfigToEnv encoder — NEVER hand-rolled
-// here, a wrong separator would silently break ALL in-pod cluster DNS) to every
-// container so a pod's unqualified Service lookups expand against the cluster DNS VIP.
+// reads (serialized by the single pinned dns.ConfigToEnv encoder, never
+// hand-rolled here — a wrong separator would break in-pod cluster DNS) to every
+// container so a pod's unqualified Service lookups expand against the cluster
+// DNS VIP.
 //
-// It is DNSPolicy-gated to the cluster-first policies (clusterDNSPolicy): Default and
-// None inject NOTHING. A Default pod opted out of cluster DNS, and injecting no env
-// makes the shim fall back to the host resolver — exactly Default semantics; None
-// (custom spec.dnsConfig nameservers) is deferred to B20b and likewise falls back
-// to the host for now rather than its declared nameservers.
+// DNSPolicy-gated to the cluster-first policies (clusterDNSPolicy): Default and
+// None inject nothing, falling back to the host resolver — Default semantics for
+// a Default pod; for None (custom spec.dnsConfig nameservers) this is deferred
+// to B20b.
 //
-// Scope parity: the env is appended to BOTH InitContainers and Containers, matching
-// the box-wide DYLD shim annotation — an init container that resolves a Service needs
-// cluster DNS too.
+// Scope parity: appended to both InitContainers and Containers, matching the
+// box-wide DYLD shim annotation.
 //
-// Precedence (infra-wins): the env is appended AFTER each container's user env, so
-// resolveContainerEnv's later-wins upsert makes the cluster value authoritative — a
-// workload that set its own K3SM_DNS_SERVER cannot override cluster DNS (ClusterFirst
-// means cluster DNS). The keys are sorted for deterministic output.
+// Precedence (infra-wins): appended after each container's user env, so
+// resolveContainerEnv's later-wins upsert makes the cluster value authoritative
+// — a workload cannot override cluster DNS under ClusterFirst. Keys are sorted
+// for deterministic output.
 //
-// When dnsCfg is not usable (no cluster DNS VIP / invalid), dns.ConfigToEnv returns
-// nil and nothing is injected — the shim then defers to the host resolver.
+// When dnsCfg is not usable (no cluster DNS VIP / invalid), dns.ConfigToEnv
+// returns nil and nothing is injected.
 func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg netv1.DNSConfig) {
 	if !clusterDNSPolicy(policy) {
 		return
@@ -346,15 +331,13 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 // source-pinned to a pod's own /32 on an unbound dial.
 //
 // dnsVIP is dnsCfg.ClusterDNSIP, the cluster DNS Service VIP already threaded into
-// toPodBox (r.resolverVIP upstream). It is the ONLY Service-network-shaped value that
-// reaches this assembly point: k3sm's server/agent commands carry no explicit
-// --service-cidr flag (only `k3sm netd`'s proxy path does, via
-// install.DefaultServiceCIDR), so rather than inventing a new one, the Service CIDR is
-// DERIVED by masking the configured VIP to a /16 — the range k3sm always allocates
-// Service VIPs from (10.43.0.10 -> 10.43.0.0/16, matching install.DefaultServiceCIDR).
-// An empty or unparseable/non-IPv4 VIP (e.g. a standalone `k3sm node` with no cluster
-// DNS) yields no Service CIDR entry; the pod CIDR is still returned, since it is a
-// fixed constant independent of the DNS VIP.
+// toPodBox. It is the only Service-network-shaped value reaching this assembly
+// point — k3sm's server/agent commands carry no --service-cidr flag (only `k3sm
+// netd`'s proxy path does) — so the Service CIDR is derived by masking the
+// configured VIP to a /16, the range k3sm always allocates Service VIPs from
+// (10.43.0.10 -> 10.43.0.0/16, matching install.DefaultServiceCIDR). An empty or
+// unparseable/non-IPv4 VIP (e.g. a standalone `k3sm node` with no cluster DNS)
+// yields no Service CIDR entry; the pod CIDR is still returned as a fixed constant.
 func clusterCIDRs(dnsVIP string) []netip.Prefix {
 	cidrs := []netip.Prefix{podnet.ClusterPodCIDR}
 	if dnsVIP == "" {
@@ -371,34 +354,33 @@ func clusterCIDRs(dnsVIP string) []netip.Prefix {
 // (shim/getaddrinfo_shim.c) reads to rewrite a pod's wildcard binds onto its own /32,
 // giving same-node pods separate per-IP port spaces (two pods can both hold :8080 —
 // ≥1024 TCP+UDP, the B215-measured carve). It is the B217 keystone: the DYLD shim
-// annotation only LOADS the dylib; without this env the interpose passes every bind
+// annotation only loads the dylib; without this env the interpose passes every bind
 // through unchanged and the same-node EADDRINUSE collision class stands.
 //
 // cidrs (B218) is the connect() rung's destination scope — the cluster pod CIDR and
 // the cluster Service CIDR (see clusterCIDRs) — passed through verbatim to
 // podnet.BindDisciplineEnvWithCIDRs, which additionally emits K3SM_CLUSTER_CIDRS so
-// an unbound dial FROM this pod TO another in-cluster address is source-pinned to the
-// pod's own /32 too (not just an inbound bind). A nil/empty cidrs list degrades
-// exactly to the pre-B218 BindDisciplineEnv output — the connect rung stays off.
+// an unbound dial from this pod to another in-cluster address is source-pinned to the
+// pod's own /32 too, not just an inbound bind. A nil/empty cidrs list degrades to the
+// pre-B218 BindDisciplineEnv output — the connect rung stays off.
 //
-// Gated on the pod having a DISTINCT /32 — podIP != nodeIP. A hostNetwork pod
-// (MarkHostNetwork → podIP == nodeIP, zero allocation), a vm pod, and the --network
-// none posture all resolve podIP to the node IP and get NOTHING: the shipped hostNetwork
-// semantic (a pod shares the node's addresses) must not be narrowed by rewriting its
-// wildcard binds onto the node IP. The value serialization and the IPv4/unspecified
-// rejection are podnet.BindDisciplineEnvWithCIDRs's (the single pinned encoder of the
-// shim ABI — never hand-rolled here); a nil return injects nothing (fail-safe
-// passthrough). An unparseable podIP is likewise a no-op — the discipline stays off
-// rather than mis-binds.
+// Gated on the pod having a distinct /32 (podIP != nodeIP). A hostNetwork pod
+// (MarkHostNetwork → podIP == nodeIP, zero allocation), a vm pod, and --network none
+// all resolve podIP to the node IP and get nothing: hostNetwork's shipped semantic
+// (a pod shares the node's addresses) must not be narrowed by rewriting its wildcard
+// binds onto the node IP. Value serialization and IPv4/unspecified rejection are
+// podnet.BindDisciplineEnvWithCIDRs's (the single pinned encoder of the shim ABI); a
+// nil return injects nothing, and an unparseable podIP is likewise a no-op — the
+// discipline stays off rather than mis-binds.
 //
-// Precedence (infra-wins) mirrors injectClusterDNSEnv: appended AFTER each container's
-// user env to BOTH init and regular containers, so a workload that set its own
-// K3SM_POD_IP cannot override the allocated /32.
+// Precedence (infra-wins) mirrors injectClusterDNSEnv: appended after each
+// container's user env to both init and regular containers, so a workload cannot
+// override the allocated /32.
 //
-// warn-log: on an M0 host-binary route (the native sentinel, or an absolute-path image
-// with no command/args) the pod binary is NEVER ad-hoc re-signed, so AMFI silently drops
-// the DYLD insert and the interpose never loads — the pod binds wildcard regardless of
-// this env. Naming the pod here is the only breadcrumb an operator debugging a
+// On an M0 host-binary route (the native sentinel, or an absolute-path image with no
+// command/args) the pod binary is never ad-hoc re-signed, so AMFI drops the DYLD
+// insert and the interpose never loads — the pod binds wildcard regardless of this
+// env. The warn log naming the pod is the only breadcrumb an operator debugging a
 // host-binary EADDRINUSE gets, since the insert drop is otherwise invisible.
 func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, cidrs []netip.Prefix, log *slog.Logger) {
 	if podIP == "" || podIP == nodeIP {
@@ -480,7 +462,7 @@ func clusterDNSPolicy(policy corev1.DNSPolicy) bool {
 // A nil c yields (nil, 0): no extra searches, "keep the cluster base ndots". searches
 // is the pod's spec.dnsConfig.searches verbatim. ndots scans c.Options for the first
 // "ndots" entry: a non-negative integer value (strconv.Atoi) becomes the override,
-// CLAMPED to [0, dns.MaxNDots] (the resolv.conf RES_MAXNDOTS ceiling) BEFORE the int32
+// clamped to [0, dns.MaxNDots] (the resolv.conf RES_MAXNDOTS ceiling) before the int32
 // narrowing so an absurd value (>=2^31) cannot wrap negative and be silently dropped as
 // keep-base; anything else — absent, nil/empty, unparseable, or negative — yields 0,
 // which dns.MergeDNSConfig reads as "keep base".
@@ -499,18 +481,12 @@ func dnsConfigOverride(c *corev1.PodDNSConfig) (searches []string, ndots int32) 
 		if c.Options[i].Name != "ndots" {
 			continue
 		}
-		// The first "ndots" option decides: a non-negative integer overrides the
-		// cluster ndots; a nil/unparseable/negative value keeps base (0). An explicit
-		// `ndots: 0` is indistinguishable from unset in this int32 path — deferred to B20b.
+		// The first "ndots" option decides (see the func doc for the deferral and
+		// the keep-base fallback).
 		if v := c.Options[i].Value; v != nil {
 			if n, err := strconv.Atoi(*v); err == nil && n >= 0 {
-				// Clamp to the shared resolv.conf ndots ceiling (dns.MaxNDots ==
-				// RES_MAXNDOTS) BEFORE the int32 narrowing: an absurd value (>=2^31)
-				// would otherwise wrap negative and be silently dropped by
-				// MergeDNSConfig as keep-base, masking the misconfig. Clamping the int
-				// first fails predictably (→ dns.MaxNDots). dns.MaxNDots is untyped so it
-				// compares against int n with no cast. strconv.Atoi already returns
-				// ErrRange for values beyond int64, so those keep base.
+				// dns.MaxNDots is untyped, so it compares directly against n with no
+				// cast; strconv.Atoi already returns ErrRange beyond int64.
 				if n > dns.MaxNDots {
 					n = dns.MaxNDots
 				}
@@ -622,7 +598,7 @@ func podMemoryLimitBytes(pod *corev1.Pod) int64 {
 // annotations (see rlimitAnnotationPrefix for the grammar and the pod-scoped
 // contract). The annotation suffix becomes ResourceLimit.type mechanically
 // ("RLIMIT_"+ToUpper), with no name allowlist — semantic validity is runtimed's
-// (rlimitResource). Validation here is SYNTAX only, and it fails fast naming
+// (rlimitResource). Validation here is syntax only, and it fails fast naming
 // the offending annotation key: unparseable values, soft>hard (unlimited counts
 // as max), and two keys colliding onto one type (their apply order would be
 // map-iteration random) all reject the pod. The result is sorted by type name
@@ -642,11 +618,9 @@ func podRlimits(pod *corev1.Pod) ([]*runtimev1.ResourceLimit, error) {
 	byType := make(map[string]string, len(keys)) // type → source annotation key
 	for _, k := range keys {
 		typ := "RLIMIT_" + strings.ToUpper(strings.TrimPrefix(k, rlimitAnnotationPrefix))
-		// Critique-ratified syntax contract: the duplicate-type reject (here) and
-		// the soft≤hard reject (parseRlimitValue) are value/shape checks, NOT name
-		// semantics — they need no rlimit-name knowledge and preserve the
-		// deterministic-apply-order and fail-fast guarantees. Do not strip them
-		// as provider-side scope creep.
+		// The duplicate-type reject (here) and the soft≤hard reject
+		// (parseRlimitValue) are value/shape checks, not name semantics — they
+		// need no rlimit-name knowledge. Keep them; they are not scope creep.
 		if prev, dup := byType[typ]; dup {
 			return nil, fmt.Errorf("rlimit annotations %s and %s both map to type %s", prev, k, typ)
 		}
@@ -665,8 +639,8 @@ func podRlimits(pod *corev1.Pod) ([]*runtimev1.ResourceLimit, error) {
 // `<soft>:<hard>`, each a decimal integer up to 2^63-1 or the "unlimited"
 // token; a single value means soft=hard. soft must not exceed hard, with
 // unlimited counting as the maximum (its ^uint64(0) encoding makes that a
-// plain compare). The soft≤hard reject is part of the critique-ratified
-// syntax contract (a value-shape check, not name semantics — see podRlimits).
+// plain compare). The soft≤hard reject is a value-shape check, not name
+// semantics — see podRlimits.
 func parseRlimitValue(v string) (soft, hard uint64, err error) {
 	softStr, hardStr, hasHard := strings.Cut(v, ":")
 	soft, err = parseRlimitMagnitude(softStr)
@@ -690,7 +664,7 @@ func parseRlimitValue(v string) (soft, hard uint64, err error) {
 // 2^63-1 (math.MaxInt64), or the "unlimited" token encoded as ^uint64(0) (the
 // all-ones sentinel runtimed's rlimitValue maps to unix.RLIM_INFINITY).
 //
-// Magnitudes ABOVE 2^63-1 are rejected, not carried: darwin's RLIM_INFINITY is
+// Magnitudes above 2^63-1 are rejected, not carried: darwin's RLIM_INFINITY is
 // 2^63-1, and runtimed collapses only the true sentinels (^uint64(0) /
 // RLIM_INFINITY's own bit pattern) — a value in (2^63-1, 2^64-1) would ride
 // through verbatim and make setrlimit see Cur > Max (e.g. huge soft with an
@@ -712,10 +686,9 @@ func parseRlimitMagnitude(s string) (uint64, error) {
 
 // podQOSClass computes the pod's Quality-of-Service class and maps it to the apis
 // runtime QOSClass enum runtimed uses for best-effort CPU scheduling policy (k3sm
-// has no CFS millicore enforcement). The
-// VK provider REPLACES the kubelet, which is where Status.QOSClass is normally
-// derived, so the provider computes it from the spec here rather than trusting a
-// possibly-unset status field.
+// has no CFS millicore enforcement). The VK provider replaces the kubelet, which
+// is where Status.QOSClass is normally derived, so the provider computes it from
+// the spec here rather than trusting a possibly-unset status field.
 func podQOSClass(pod *corev1.Pod) runtimev1.QOSClass {
 	switch computePodQOS(pod) {
 	case corev1.PodQOSGuaranteed:
@@ -736,10 +709,10 @@ func podQOSClass(pod *corev1.Pod) runtimev1.QOSClass {
 //   - BestEffort: no container sets any CPU/memory request or limit;
 //   - Burstable: anything in between.
 //
-// This is a HAND REPRODUCTION of a server-side computation and MUST track upstream
+// This is a hand reproduction of a server-side computation and must track upstream
 // k8s.io/component-helpers/scheduling/corev1/v1qos.GetPodQOS — k3sm replaces the
 // kubelet, so when the apiserver has not yet stamped Status.QOSClass this is the
-// only source of the class. It is the FALLBACK only: toPodStatus carries forward
+// only source of the class. It is the fallback only: toPodStatus carries forward
 // the apiserver's value when present (immune to any drift here);
 // TestPodStatusQOSClass pins this reproduction.
 func computePodQOS(pod *corev1.Pod) corev1.PodQOSClass {
@@ -829,16 +802,15 @@ func graceSeconds(pod *corev1.Pod) int64 {
 // env carried structurally for resolvePodBoxEnv; image is the pull reference or,
 // when command/args are empty, the host binary path per the M0/M1 convention).
 //
-// imagePullPolicy is carried VERBATIM (M12.1) — see toImagePullPolicy.
+// imagePullPolicy is carried verbatim (M12.1) — see toImagePullPolicy.
 //
-// init selects the M10.2 restart_policy mapping: on an INIT container,
-// restartPolicy: Always (KEP-753) maps to
-// CONTAINER_RESTART_POLICY_ALWAYS — the proto marker runtimed reads to run it
-// as a NATIVE SIDECAR (spawned-not-waited, tracked long-lived, torn down in
-// reverse after the mains). Regular containers always carry UNSPECIFIED:
-// per-container policy on regular containers is out of scope, and the proto
-// field is meaningful only on init containers today (see
-// apis runtime.proto Container.restart_policy — the contract).
+// init selects the M10.2 restart_policy mapping: on an init container,
+// restartPolicy: Always (KEP-753) maps to CONTAINER_RESTART_POLICY_ALWAYS — the
+// proto marker runtimed reads to run it as a native sidecar (spawned-not-waited,
+// tracked long-lived, torn down in reverse after the mains). Regular containers
+// always carry UNSPECIFIED: per-container policy on regular containers is out of
+// scope, and the proto field is meaningful only on init containers today (see
+// apis runtime.proto Container.restart_policy).
 func toRuntimeContainers(cs []corev1.Container, init bool) []*runtimev1.Container {
 	if len(cs) == 0 {
 		return nil
@@ -869,16 +841,15 @@ func toRuntimeContainers(cs []corev1.Container, init bool) []*runtimev1.Containe
 	return out
 }
 
-// toImagePullPolicy maps the container's STAMPED corev1 imagePullPolicy onto the
-// proto enum, VERBATIM (M12.1).
+// toImagePullPolicy maps the container's stamped corev1 imagePullPolicy onto the
+// proto enum, verbatim (M12.1).
 //
-// DEFAULTING IS THE EMBEDDED APISERVER'S — it stamps the corev1 default onto the
-// pod spec before the pod is ever scheduled (a `:latest`/untagged reference
-// defaults to Always, anything else to IfNotPresent). This function therefore
-// reads only the stamped value and NEVER looks at the image reference; runtimed
-// does not re-derive it either. A second derivation point would be free to
-// disagree with the stamped spec, and `kubectl get pod -o yaml` would stop
-// describing what the node actually did.
+// Defaulting is the embedded apiserver's: it stamps the corev1 default onto the
+// pod spec before scheduling (a `:latest`/untagged reference defaults to Always,
+// anything else to IfNotPresent). This function reads only the stamped value and
+// never looks at the image reference; runtimed does not re-derive it either — a
+// second derivation point could disagree with the stamped spec, and `kubectl get
+// pod -o yaml` would stop describing what the node actually did.
 //
 // An empty value maps to UNSPECIFIED, which runtimed reads as the legacy
 // pull-through — the skew contract's zero value, never an implicit Never. An
@@ -1210,17 +1181,17 @@ func derefInt64(p *int64) int64 {
 }
 
 // toPodStatus translates a runtime PodStatus into the corev1.PodStatus VK
-// publishes, DERIVING the fields runtimed's renderer omits (it is lossy):
+// publishes, deriving the fields runtimed's renderer omits (it is lossy):
 //   - the four Pod Conditions (Initialized/Ready/ContainersReady/PodScheduled),
 //   - phase Running when any container runs and none has failed,
-//   - a STABLE StartTime (passed in from CreatePod, not the per-snapshot value
+//   - a stable StartTime (passed in from CreatePod, not the per-snapshot value
 //     runtimed regenerates),
 //   - per-container Started (*bool) and Ready,
-//   - terminated Reason/ExitCode/Signal carried VERBATIM (not the M0 "Error"
+//   - terminated Reason/ExitCode/Signal carried verbatim (not the M0 "Error"
 //     heuristic) — this is the path the runtimed OOMKilled reason surfaces on,
 //   - the M2.1 ContainerStatus mirror (volume_mounts, user),
 //   - HostIP/HostIPs from the node IP,
-//   - Status.QOSClass (B12): toPodStatus is the SINGLE place QOSClass is set, so
+//   - Status.QOSClass (B12): toPodStatus is the single place QOSClass is set, so
 //     all four publish paths (GetPodStatus, GetPods, the watch-stream cb, the
 //     probe-driven cb) emit a consistent value instead of blanking it on every
 //     full-status replace. The apiserver-set value is carried forward
@@ -1230,7 +1201,7 @@ func derefInt64(p *int64) int64 {
 // probes, when non-nil, overlays the provider-served probe verdicts (M2.2):
 // readiness drives each container's Ready (and thus the pod Ready/ContainersReady
 // conditions → Service EndpointSlice membership), startup drives Started, and the
-// probe-driven restart count is added — applied BEFORE the conditions are derived
+// probe-driven restart count is added — applied before the conditions are derived
 // so the readiness signal propagates. A nil probes leaves the runtime status
 // untouched (a pod with no probes).
 func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState) *corev1.PodStatus {
@@ -1256,12 +1227,9 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 		out.PodIPs = []corev1.PodIP{{IP: ip}}
 	}
 
-	// QOSClass is set HERE and nowhere else (B12): every publish path does a full
-	// pod.Status = *toPodStatus(...) replace, so deriving it elsewhere would let the
-	// field flap blank vs real across reconcile-vs-probe ticks. Carry forward the
-	// apiserver's authoritative value (immutable, and immune to any drift between
-	// computePodQOS and upstream GetPodQOS); fall back to the hand-rolled derivation
-	// only when the apiserver has not stamped it yet, or when no pod is in scope.
+	// QOSClass is set here and nowhere else (B12 — see the func doc). Carry
+	// forward the apiserver's authoritative value; fall back to the hand-rolled
+	// derivation only when unset or when no pod is in scope.
 	if pod != nil {
 		out.QOSClass = pod.Status.QOSClass
 		if out.QOSClass == "" {
@@ -1275,9 +1243,9 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	}
 	// Merge-not-replace (mirrors the QOSClass carry-forward above): emit the four
 	// provider-owned conditions — PodReady via the shared computeReadiness seam so
-	// spec.readinessGates are honored — then carry FORWARD any external condition on
-	// the input pod (e.g. a readinessGate condition a controller patched) so it
-	// survives this status write and stays observable to computeReadiness.
+	// spec.readinessGates are honored — then carry forward any external condition
+	// on the input pod (e.g. a readinessGate a controller patched) so it survives
+	// this status write and stays observable to computeReadiness.
 	out.Conditions = []corev1.PodCondition{
 		computeInitialized(pod, initCS),
 		computeReadiness(pod, containersReady),
@@ -1290,16 +1258,16 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 
 // containersReadyFrom reports the ContainersReady predicate over the pod's MAIN
 // container statuses: the AND of every container's Ready AND at least one running
-// container — NOT a hardcoded True. The anyRunning term matches the kubelet's
+// container — not a hardcoded True. The anyRunning term matches the kubelet's
 // running-gate and the pre-B79 behavior: a non-running container carrying a stale
 // Ready=true must not publish ContainersReady=True. (M0/HostProcess has no
 // readiness probes: a container is Ready when Running; applyProbeOverlay refines
 // it when a readiness probe is served — the probe-less reduction.) It gates
 // PodReady via the shared computeReadiness seam, which honors spec.readinessGates.
 //
-// It is a SHARED seam, not a toPodStatus local: a status overlay applied AFTER the
-// conditions are derived (the B39 postStart readiness gate) must re-derive them
-// from the same predicate, and two copies of this AND would drift.
+// It is a shared seam, not a toPodStatus local: a status overlay applied after
+// the conditions are derived (the B39 postStart readiness gate) must re-derive
+// them from the same predicate, and two copies of this AND would drift.
 func containersReadyFrom(cs []corev1.ContainerStatus) bool {
 	anyRunning, allReady := false, len(cs) > 0
 	for i := range cs {
@@ -1315,7 +1283,7 @@ func containersReadyFrom(cs []corev1.ContainerStatus) bool {
 
 // refreshReadinessConditions re-derives the two readiness conditions from the
 // pod's (possibly overlaid) container statuses, in place. A status overlay that
-// clears a container's Ready AFTER toPodStatus derived the conditions would
+// clears a container's Ready after toPodStatus derived the conditions would
 // otherwise publish ContainersReady/PodReady=True next to a not-Ready container —
 // a pod that takes Service traffic while the provider itself considers it not
 // ready. PodReady goes back through computeReadiness (readinessGates + the stable
@@ -1347,20 +1315,19 @@ func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus) {
 //     gates are short-circuited and PodReady is False/"ContainersNotReady" (the
 //     kubelet short-circuits gates behind ContainersReady).
 //   - otherwise PodReady = ContainersReady AND (every readinessGate whose condition
-//     is PRESENT on the pod is True): a gate present-and-True is satisfied; a gate
+//     is present on the pod is True): a gate present-and-True is satisfied; a gate
 //     present-and-not-True (False/Unknown) blocks with "ReadinessGatesNotReady"
 //     naming the gate.
 //
-// CEILING — the absent-gate anti-stall safety rule (do NOT change without reading
-// this): a readinessGate whose condition is ABSENT from pod.Status.Conditions does
-// NOT block PodReady — it is treated as not-yet-observable, as-if-satisfied. This is
-// deliberate and load-bearing. The k3sm VK provider CANNOT observe an
-// externally-patched gate condition today (VK's podsEqual ignores status, UpdatePod
-// is a no-op, and VK blind-overwrites pod status), so if an ABSENT gate blocked
-// PodReady, every pod carrying an external readinessGate would stall NotReady FOREVER
-// — strictly worse than advancing a rolling update too early. k3sm therefore honors
-// OBSERVABLE gates only; the informer feedback loop that would let the provider react
-// to external gate patches is a DEFERRED follow-up, not shipped here.
+// Anti-stall ceiling (do not change without reading this): a readinessGate whose
+// condition is absent from pod.Status.Conditions does not block PodReady — it is
+// treated as not-yet-observable, as-if-satisfied. The k3sm VK provider cannot
+// observe an externally-patched gate condition today (VK's podsEqual ignores
+// status, UpdatePod is a no-op, and VK blind-overwrites pod status), so an absent
+// gate blocking PodReady would stall every pod with an external readinessGate
+// NotReady forever — strictly worse than advancing a rolling update too early.
+// k3sm therefore honors observable gates only; the informer feedback loop that
+// would let the provider react to external gate patches is a deferred follow-up.
 func computeReadiness(pod *corev1.Pod, containersReady bool) corev1.PodCondition {
 	cond := corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}
 	switch {
@@ -1424,19 +1391,19 @@ func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 	}
 }
 
-// carryForwardExternalConditions returns the pod's existing conditions MINUS the
+// carryForwardExternalConditions returns the pod's existing conditions minus the
 // four provider-owned types, so external/readinessGate conditions survive a provider
 // status rebuild (merge-not-replace, mirroring the QOSClass carry-forward in
 // toPodStatus). A nil pod yields nil.
 //
-// DEFERRED: this carry-forward is a safe no-op in PRODUCTION today — the k3sm VK
-// provider cannot yet OBSERVE an externally-patched gate condition (VK's podsEqual
-// ignores status, UpdatePod is a no-op, and VK blind-overwrites pod status), so the
-// input pod carries no external condition to preserve. It is wired now so that when
-// the external-gate feedback loop lands (an informer feeding external gate patches
-// back to the provider, with no-clobber + a kine watch-staleness review — the
-// deferred B79 follow-up), present gates are already observable to computeReadiness.
-// Do NOT mistake this for an already-live external-gate path.
+// This is a safe no-op in production today: the k3sm VK provider cannot yet
+// observe an externally-patched gate condition (VK's podsEqual ignores status,
+// UpdatePod is a no-op, and VK blind-overwrites pod status), so the input pod
+// carries no external condition to preserve. It is wired now so that when the
+// external-gate feedback loop lands (an informer feeding patches back to the
+// provider, with no-clobber + a kine watch-staleness review — deferred B79),
+// present gates are already observable to computeReadiness. Not an already-live
+// external-gate path.
 func carryForwardExternalConditions(pod *corev1.Pod) []corev1.PodCondition {
 	if pod == nil {
 		return nil
@@ -1483,26 +1450,25 @@ func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 	}
 }
 
-// derivePhase maps the runtime phase + the MAIN container states to a corev1
+// derivePhase maps the runtime phase + the main container states to a corev1
 // phase, honoring the pod's effective restart policy (B26).
 //
-// The policy is load-bearing, not decoration. Upstream's kubelet getPhase
-// branches on RestartPolicy BEFORE it can ever return Failed: a pod only reaches
+// The policy is load-bearing, not decoration: upstream's kubelet getPhase
+// branches on RestartPolicy before it can return Failed — a pod only reaches
 // Failed under Never (and only once every container is terminal), while under
 // Always/OnFailure a terminated-but-restartable container keeps the pod Running.
-// This function previously took a policy-blind (anyRunning, anyFailed) pair and
-// returned PodFailed whenever anyFailed was set — even alongside a running
-// container — so a crash-looping restartPolicy:Always pod reported Failed and
-// upstream reacted as if it were dead (a ReplicaSet delete/replace, a podgc
-// reap, a Job backoffLimit strike). It now consumes the SAME effective-policy
-// resolver the restart decision uses (shouldRestartOnExit), so the phase and the
-// restart decision can never disagree.
+// A policy-blind (anyRunning, anyFailed) check would report Failed for a
+// crash-looping restartPolicy:Always pod, and upstream would react as if it
+// were dead (a ReplicaSet delete/replace, a podgc reap, a Job backoffLimit
+// strike). This consumes the same effective-policy resolver the restart
+// decision uses (shouldRestartOnExit), so the phase and the restart decision
+// can never disagree.
 //
 // Rules, in order:
 //   - the runtime's PENDING is authoritative (the pod has not started);
-//   - ANY running main ⇒ Running — upstream never reports a terminal phase while
+//   - any running main ⇒ Running — upstream never reports a terminal phase while
 //     a container runs, whatever a sibling did;
-//   - a main that WILL be restarted (its termination resolves restartable, or it
+//   - a main that will be restarted (its termination resolves restartable, or it
 //     already carries the synthesized CrashLoopBackOff waiting state) ⇒ Running;
 //   - otherwise the runtime's own terminal verdict stands (mains-only, per the
 //     B74 Job contract).
@@ -1550,17 +1516,17 @@ func derivePhase(pod *corev1.Pod, rp runtimev1.PodPhase, cs []corev1.ContainerSt
 }
 
 // computeInitialized derives the PodInitialized condition from the init-container
-// statuses, replacing the unconditional ConditionTrue the provider used to stamp
-// (B26 conformance fix): a pod whose native sidecar is crash-looping before it
-// ever started, or whose plain init container has not yet completed, must NOT
+// statuses (B26 conformance fix), rather than the unconditional ConditionTrue the
+// provider used to stamp: a pod whose native sidecar is crash-looping before it
+// ever started, or whose plain init container has not yet completed, must not
 // report Initialized=True — controllers and `kubectl describe` read that
 // condition as "the init phase is done".
 //
 // The rule mirrors the kubelet:
 //   - a pod with no init containers is Initialized (nothing to wait for);
-//   - a PLAIN init container satisfies it by terminating with exit code 0;
-//   - a NATIVE SIDECAR (init container with restartPolicy: Always, KEP-753)
-//     satisfies it by having STARTED — it is long-running by design and never
+//   - a plain init container satisfies it by terminating with exit code 0;
+//   - a native sidecar (init container with restartPolicy: Always, KEP-753)
+//     satisfies it by having started — it is long-running by design and never
 //     terminates before the mains;
 //   - a declared init container with no status yet does not satisfy it.
 //
@@ -1620,7 +1586,7 @@ func qualifyContainerID(id string) string {
 }
 
 // toContainerStatuses maps runtime container statuses to corev1, carrying the
-// terminated Reason/ExitCode/Signal VERBATIM (so the runtimed OOMKilled reason
+// terminated Reason/ExitCode/Signal verbatim (so the runtimed OOMKilled reason
 // surfaces) and deriving Ready/Started, plus the M2.1 mirror fields (volume_mounts
 // + user) so kubectl describe / get -o yaml stays a lossless mirror.
 func toContainerStatuses(rcs []*runtimev1.ContainerStatus) []corev1.ContainerStatus {
@@ -1633,7 +1599,7 @@ func toContainerStatuses(rcs []*runtimev1.ContainerStatus) []corev1.ContainerSta
 			Name:  rc.GetName(),
 			Image: rc.GetImage(),
 			// The identity pair (B132): image_id is the image's config digest,
-			// carried VERBATIM because it is a content address the runtime
+			// carried verbatim because it is a content address the runtime
 			// resolved and this boundary has no business rewriting; container_id
 			// is scheme-qualified here (see qualifyContainerID).
 			ImageID:      rc.GetImageId(),

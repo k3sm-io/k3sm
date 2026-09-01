@@ -36,6 +36,7 @@ import (
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/utils/clock"
 
+	netv1 "k3sm.io/apis/net/v1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
@@ -97,6 +98,26 @@ type runtimedRuntime struct {
 	// idempotent authority. nil ⇒ podIP ≈ nodeIP (the --network none / no-datapath
 	// posture; runtimed then keeps its single-node NodeNetwork).
 	network PodNetwork
+
+	// transport is the vm-pod transport-override feed (M11.3-d2 consumer half):
+	// it publishes the published-/32 -> live-lease map into the Service proxy's
+	// routing table as each vm pod's guest reports its DHCP lease. nil is the
+	// inert feed (no sink configured — the --network none / no-datapath posture),
+	// and every method tolerates a nil receiver.
+	transport *transportFeed
+
+	// guestArtifacts records whether this node's pinned guest boot artifacts were
+	// ensured and verified at construction (B108) — the VMArtifactsAvailable
+	// capability Capabilities reports and cmd/k3sm turns into the
+	// k3sm.io/vm-artifacts node label.
+	//
+	// It is a k3sm-side fact, not a runtimed RuntimeCondition, because ENSURE runS
+	// here: runtimed owns the mechanism (guestartifacts.EnsureGuestArtifacts) but
+	// the daemon that calls it is this one, and a node may not advertise a
+	// capability whose outcome the advertiser did not observe. It mirrors exactly
+	// what was wired into the vm backend — true iff a locator was installed — so
+	// the label can never claim more than CreateVM can deliver.
+	guestArtifacts bool
 
 	// clk, dial, and probeTransport are the provider-served probe seams (M2.2):
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
@@ -215,11 +236,31 @@ type RuntimedConfig struct {
 	// silent production fallback (the commands fail fast via the runtimed
 	// preflight instead).
 	Network PodNetwork
+	// TransportOverrides is the Service-proxy seam a vm pod's LIVE TRANSPORT
+	// address is published through (darwin-net's *proxy.RoutingTable, reached via
+	// the node's netserve Server). The provider is the only component holding both
+	// halves of a vm pod's two-address identity — the published /32 its IPAM
+	// carved and the DHCP lease the guest reported through runtimed — so it is the
+	// only one that can feed the map. nil runs the feed inert: no override is ever
+	// installed and every backend is dialed at its published address exactly as a
+	// host-process pod's is.
+	TransportOverrides TransportOverrideSink
 	// Client is the apiserver client the provider resolves ConfigMap/Secret data,
 	// SA tokens (M2.1 volumes/env), and imagePullSecret credentials (M2.6) with —
 	// runtimed never talks to the apiserver. nil disables data-backed
 	// volumes/env/credentials (they fail closed / pull anonymously).
 	Client kubernetes.Interface
+	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
+	// set (B108) — the kernel, the initramfs and the cmdline a vm pod boots from.
+	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
+	// config is built, never a directory this constructor would fetch into: daemon
+	// start is not a place to discover that a hundred megabytes are missing.
+	//
+	// nil is the FAIL-CLOSED posture and the shipped one on any node whose ensure
+	// did not succeed (an unminted pin, no network, a digest mismatch). It leaves
+	// the vm backend's artifact locator unset, so CreateVM fails every vm pod with
+	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
+	GuestArtifacts *EnsuredGuestArtifacts
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -250,6 +291,31 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	if cfg.Network != nil {
 		network = cfg.Network
 	}
+	// The vm backend is constructed HERE, rather than left to runtimed's own
+	// default, ONLY when this node has verified guest artifacts to wire into it:
+	// sandbox.WithGuestArtifacts is a construction option, and runtimed's default
+	// backend deliberately leaves the locator unset (its feeder — this — is a
+	// separate deliverable). Everything else about the backend is runtimed's
+	// default reproduced verbatim, so the ONE difference between a node with
+	// artifacts and a node without is the locator.
+	//
+	// The state root is passed through runtimeRoot for a reason worth keeping: an
+	// empty Root means "runtimed's default", and a backend built with an empty
+	// state root has its vm orphan store DISABLED — a daemon `kill -9`ed while a
+	// guest ran would leave a helper no later start could find. Defaulting the
+	// root at this call site is what makes the override behaviourally identical to
+	// the default it replaces.
+	var deps runtimed.Deps
+	if cfg.GuestArtifacts != nil {
+		deps.VMBackend = sandbox.NewVMBackend(
+			sandbox.WithStateRoot(runtimeRoot(cfg.Root)),
+			sandbox.WithLogger(log),
+			sandbox.WithGuestArtifacts(guestArtifactLocator(*cfg.GuestArtifacts)),
+		)
+	}
+	deps.Resolver = resolver
+	deps.Credentials = creds
+	deps.Network = network
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",
@@ -260,11 +326,7 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		ResolverVIP:  cfg.ResolverVIP,
 		APIServerVIP: cfg.APIServerVIP,
 		PathShimPath: cfg.PathShim,
-	}, runtimed.Deps{
-		Resolver:    resolver,
-		Credentials: creds,
-		Network:     network,
-	})
+	}, deps)
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
@@ -335,6 +397,8 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		deniedSocks:    unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
 		resolver:       resolver,
 		network:        cfg.Network,
+		transport:      newTransportFeed(cfg.TransportOverrides, log),
+		guestArtifacts: cfg.GuestArtifacts != nil,
 		client:         cfg.Client,
 		log:            log,
 		recorder:       recorder,
@@ -439,6 +503,17 @@ func unionSocketDenies(sets ...[]string) []string {
 	return slices.Compact(out)
 }
 
+// ConditionVMArtifactsAvailable is the NAME the guest-artifact capability is
+// narrated under (B108).
+//
+// It is a k3sm-local string, NOT one of runtimed's imported RuntimeCondition Type
+// constants, because no RuntimeCondition carries this fact: the ensure runs here,
+// so runtimed has nothing to report (see NodeCapabilities.VMArtifacts). It is
+// exported so the log line, the ledger, the docs and the integration gate all
+// spell the capability the same way — a capability whose name is retyped at each
+// site is one an operator cannot grep for.
+const ConditionVMArtifactsAvailable = "VMArtifactsAvailable"
+
 // NodeCapabilities are the node-capability facts runtimed advertises as
 // GetRuntimeInfo RuntimeConditions and the node command turns into truthful node
 // labels. They travel as ONE struct, from ONE RPC, deliberately: three separate
@@ -451,6 +526,24 @@ type NodeCapabilities struct {
 	// RuntimeClass (Virtualization.framework isSupported + the
 	// com.apple.security.virtualization entitlement). Drives k3sm.io/virtualization (B1).
 	VMBackend bool
+	// VMArtifacts is the VMArtifactsAvailable condition: this node holds the pinned
+	// guest kernel + initramfs, digest-verified on THIS daemon start, so a booted
+	// guest has something to boot. Drives k3sm.io/vm-artifacts (B108).
+	//
+	// It is the ONE field here that does NOT come off the GetRuntimeInfo response,
+	// and the asymmetry is deliberate rather than an oversight: the ensure runs in
+	// k3sm (GuestArtifactSource.Ensure, at daemon start), so runtimed has no
+	// condition to report — it is handed the outcome as a construction input. It
+	// still fails CLOSED with the rest of the struct: the zero value advertises
+	// nothing, and a probe error leaves it false along with everything else.
+	//
+	// It is INDEPENDENT of VMBackend. The two answer different questions — "can
+	// this Mac run a guest" and "does this node have a guest to run" — and either
+	// can be true without the other (an entitled Mac that could not fetch; an
+	// air-gap-seeded cache on a Mac with no VZ). A vm pod needs both, which is why
+	// the vm RuntimeClass still selects on k3sm.io/virtualization and this label is
+	// additive advertisement, not a second scheduling gate.
+	VMArtifacts bool
 	// RosettaHost is the RosettaHostAvailable condition: this host can translate
 	// darwin/amd64 Mach-O payloads via Rosetta 2 on the NATIVE host-process spine.
 	// Drives k3sm.io/rosetta.
@@ -488,12 +581,25 @@ func (r *runtimedRuntime) Capabilities(ctx context.Context) NodeCapabilities {
 		return NodeCapabilities{}
 	}
 	caps := nodeCapabilitiesFromInfo(info)
+	// Stamped from what THIS provider wired, not read back off the response: the
+	// ensure is k3sm's (see NodeCapabilities.VMArtifacts), so the runtime has no
+	// opinion to report and a `conditionTrue` read would be permanently false.
+	caps.VMArtifacts = r.guestArtifacts
 	// Log at the boundary WITH each withheld capability's Reason: the condition's
 	// Reason/Message is the only answer to "why is my node not labelled rosetta?",
 	// and it is discarded once this returns a bare bool.
 	logWithheldCapability(r.log, info, runtimed.ConditionVMBackendAvailable, caps.VMBackend)
 	logWithheldCapability(r.log, info, runtimed.ConditionRosettaHostAvailable, caps.RosettaHost)
 	logWithheldCapability(r.log, info, runtimed.ConditionRosettaGuestAvailable, caps.RosettaGuest)
+	// The artifact capability has no RuntimeCondition to carry a Reason, so its
+	// withheld case is narrated here with the condition name the ledger and the
+	// docs use. GuestArtifactSource.Ensure already logged the CAUSE at start; this
+	// line is what an operator finds when they ask why the node is not labelled.
+	if !caps.VMArtifacts {
+		r.log.Info("node capability withheld: "+ConditionVMArtifactsAvailable+
+			" is false — no digest-verified guest boot artifacts were wired into this runtime, so every vm pod fails closed",
+			"condition", ConditionVMArtifactsAvailable)
+	}
 	return caps
 }
 
@@ -623,23 +729,40 @@ var (
 // later Setup for the same podID is idempotent and returns the SAME address.
 //
 // Branches (each documented, never a silent fallback):
+//
 //   - no adapter (nil network — the --network none posture): podIP ≈ nodeIP.
+//
 //   - spec.hostNetwork: the pod shares the node's addresses — no /32. The pod is
 //     marked on the adapter so the runtimed-side seam Setup (which the
 //     host-process spine calls unconditionally) also resolves it to the node IP.
-//   - vm RuntimeClass: no lo0 /32 (which would make the host answer for the
-//     guest and blackhole it), so this branch returns the node IP and routes the
-//     pod away from the host-process Setup. The guest is MEANT to own its own
-//     address inside its netstack via darwin-net podnet.Network.SetupGuest, but
-//     that is NOT WIRED: SetupGuest is implemented and unit-tested in
-//     darwin-net/pkg/podnet/guest.go, and has no production caller anywhere —
-//     there is no transport carrying a GuestNetwork to runtimed yet (the
-//     consumer-side supervisor.GuestNetwork seam, M5.1-d2 / B6). Until it
-//     lands, a vm pod REPORTS THE NODE IP rather than its guest address; that
-//     is a placeholder, not the intended end state. See
-//     k3sm/pkg/runtimeclass/doc.go for the lab-gated remainder.
+//
+//   - vm RuntimeClass: the /32 darwin-net podnet.Network.SetupGuest allocated for
+//     the guest, via setupGuestNetwork — the SAME address the adapter carries to
+//     runtimed as sandbox.VMSpec.Network through the runtime.GuestNetworker seam.
+//     SetupGuest is idempotent per podID, so buildBox's later call a few frames
+//     down returns this very address and there is still exactly one authority.
+//     NO lo0 alias is plumbed for it (SetupGuest is the not-taken branch of
+//     podnet's path fork): a host alias for the guest's address would make the
+//     host answer for the guest and blackhole it.
+//
+//     WHY THE GUEST'S /32 IS PUBLISHED WHILE THE HOST DOES NOT HOLD IT. A vm pod
+//     has TWO addresses and they are never reconciled into one. This /32 is its
+//     cluster IDENTITY — what status.podIP, its EndpointSlices, cluster DNS and
+//     every NetworkPolicy carry — and it is deliberately live on no interface.
+//     The address that carries bytes is the guest's macOS-assigned vmnet DHCP
+//     lease, reported by the guest agent as PodStatus.guest_transport_address;
+//     it is never published, because a lease churns on every guest restart while
+//     an identity must not. The dial paths TRANSLATE between the two:
+//     observeTransport feeds the Service proxy a published->live override map
+//     keyed on exactly this /32 (proxy.RoutingTable.SetTransportOverrides), so a
+//     Service backend picked and policy-checked on the identity is dialed at the
+//     lease. Publishing the node IP here — which this branch used to do — gave
+//     every vm pod on a node the same status.podIP, which no override map can be
+//     keyed on and which no Service could distinguish.
+//
 //   - otherwise: the podnet /32. Pool exhaustion surfaces as a distinguishable
-//     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap).
+//     error (errors.Is(err, podnet.ErrPoolExhausted) holds through the wrap) —
+//     identically for the guest branch, which draws from the same node pool.
 func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, error) {
 	if r.network == nil {
 		return r.nodeIP, nil
@@ -651,18 +774,46 @@ func (r *runtimedRuntime) podIP(ctx context.Context, pod *corev1.Pod) (string, e
 	}
 	if backend, err := podSandboxBackend(pod); err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
 		// An unknown RuntimeClass error is NOT handled here — toPodBox owns that
-		// fail-closed rejection; this branch only routes a resolved vm pod away
-		// from the host-process /32.
-		return r.nodeIP, nil
+		// fail-closed rejection; this branch only routes a resolved vm pod to the
+		// guest allocation instead of the host-process one.
+		//
+		// The dropped truncation count is buildBox's to report: podDNSConfig is
+		// pure and this is the FIRST of the create path's two calls, so warning
+		// here would double-report one pod's truncated search list.
+		dnsCfg, _ := r.podDNSConfig(pod)
+		gn, err := r.setupGuestNetwork(ctx, pod, dnsCfg)
+		if err != nil {
+			return "", err
+		}
+		if !gn.PodIP.IsValid() {
+			// The seam allocated nothing. Fail the create rather than fall back to
+			// the node IP: a vm pod published at the node's address is unaddressable
+			// as a Service backend and indistinguishable from every other guest.
+			return "", fmt.Errorf("allocate pod ip for %s/%s: the guest network carries no address", pod.Namespace, pod.Name)
+		}
+		return gn.PodIP.String(), nil
 	}
 	ip, err := r.network.Setup(ctx, id)
 	if err != nil {
-		if errors.Is(err, podnet.ErrPoolExhausted) {
-			return "", fmt.Errorf("pod ip pool exhausted on node %s (253 pods/node): allocate pod ip for %s/%s: %w", r.nodeName, pod.Namespace, pod.Name, err)
-		}
-		return "", fmt.Errorf("allocate pod ip for %s/%s: %w", pod.Namespace, pod.Name, err)
+		return "", r.allocError(pod, err)
 	}
 	return ip, nil
+}
+
+// allocError names a pod-IP allocation failure. Exhaustion of the node pool gets
+// the FRIENDLY leading clause (the 253-address ceiling is a node fact an operator
+// can act on, not an internal error), and the podnet sentinel is preserved with %w
+// either way.
+//
+// It is one function because there are now TWO consumers of that one pool — the
+// host-process Setup above and the vm-guest SetupGuest — and exhaustion must read
+// the same from both. Duplicating the phrasing at the second call site is exactly
+// how one of them would later stop being legible.
+func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
+	if errors.Is(err, podnet.ErrPoolExhausted) {
+		return fmt.Errorf("pod ip pool exhausted on node %s (253 pods/node): allocate pod ip for %s/%s: %w", r.nodeName, pod.Namespace, pod.Name, err)
+	}
+	return fmt.Errorf("allocate pod ip for %s/%s: %w", pod.Namespace, pod.Name, err)
 }
 
 // releasePodNetwork tears down the pod's network allocation, log-and-continue —
@@ -680,6 +831,84 @@ func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
 	}
 }
 
+// setupGuestNetwork produces the guest network config of a vm-RuntimeClass pod
+// and hands it to the adapter, which records it for runtimed to read back on the
+// vm route (runtime.GuestNetworker -> sandbox.VMSpec.Network). It is the B6
+// producer half; runtimed is the consumer half and never derives this itself.
+// It RETURNS the config, because podIP publishes the allocated /32 as the pod's
+// cluster identity — the zero value (with an invalid PodIP) for every pod the
+// guards below exclude.
+//
+// WHERE IT RUNS. Twice on the create path, both times before translation, and
+// that is safe because it is idempotent per podID: podIP calls it to learn the
+// address it must publish, and buildBox calls it immediately before toPodBox.
+// The buildBox call site is the one the ordering argument below is about.
+// It must be BEFORE translation (the M10.1 ordering: the pod's network exists
+// before the box that describes it), and it must consume the SAME dnsCfg value
+// toPodBox is given — the per-pod, namespace-scoped config after the B20a
+// spec.dnsConfig merge. Deriving it a second time here would create a second
+// authority for one pod's DNS, and the guest's /etc/resolv.conf would be free to
+// disagree with the host-process shim env built from the first.
+//
+// WHAT IS EXCLUDED, and why each:
+//   - a nil adapter (--network none) has nothing to allocate from;
+//   - a spec.hostNetwork pod allocates NOTHING by construction (podIP marks it
+//     and returns the node IP), so it must not draw a guest address either — the
+//     hostNetwork check comes FIRST here for exactly the reason it comes first in
+//     podIP: one pod, one answer;
+//   - a non-vm pod is served by the host-process Setup and reads no guest config.
+//
+// A RuntimeClass that does not resolve is NOT rejected here — toPodBox owns that
+// fail-closed rejection a few lines later, and duplicating it would give one
+// error two spellings.
+//
+// It FAILS the create: a vm pod whose guest config could not be produced would
+// boot with no resolver, pass readiness, and fail on its first in-app DNS lookup
+// — indistinguishable at that point from an application bug. Pool exhaustion is
+// named through the shared allocError, so it reads identically to a host-process
+// pod exhausting the same 253 addresses.
+func (r *runtimedRuntime) setupGuestNetwork(ctx context.Context, pod *corev1.Pod, dnsCfg netv1.DNSConfig) (sandbox.GuestNetworkConfig, error) {
+	if r.network == nil || pod.Spec.HostNetwork {
+		return sandbox.GuestNetworkConfig{}, nil
+	}
+	backend, err := podSandboxBackend(pod)
+	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		return sandbox.GuestNetworkConfig{}, nil
+	}
+	gn, err := r.network.SetupGuest(ctx, string(pod.UID), dnsCfg)
+	if err != nil {
+		return sandbox.GuestNetworkConfig{}, r.allocError(pod, err)
+	}
+	return gn, nil
+}
+
+// podDNSConfig derives one pod's cluster DNS config: the namespace-scoped cluster
+// base (dns.PodDNSConfig), additively merged with a ClusterFirst pod's
+// spec.dnsConfig (B20a — extra search domains appended+deduped, an ndots override).
+// The merge is GATED on the cluster-DNS policy — NOT left to injectClusterDNSEnv's
+// downstream gate — so the B20a/B20b seam is structural: a None/Default pod gets the
+// UNMERGED base, so when B20b makes None inject its own config it cannot inherit a
+// cluster-base merge. dnsConfigOverride does the corev1→discrete-params extraction
+// (k3sm is the corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots,
+// never repoint the cluster server VIP.
+//
+// It returns the config and the number of search domains the in-pod cap DROPPED,
+// and logs nothing: the create path calls it twice for a vm pod (podIP, to learn
+// the guest address it must publish, and buildBox, to translate), so warning inside
+// would double-report one pod's truncation. buildBox owns that warning.
+//
+// It exists as one function for the same reason allocError does: the guest's
+// /etc/resolv.conf and its containers' injected K3SM_DNS_* env are derived from
+// this value, and a second derivation is how the two would come to disagree.
+func (r *runtimedRuntime) podDNSConfig(pod *corev1.Pod) (netv1.DNSConfig, int) {
+	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
+	if !clusterDNSPolicy(pod.Spec.DNSPolicy) || pod.Spec.DNSConfig == nil {
+		return dnsCfg, 0
+	}
+	searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
+	return dns.MergeDNSConfig(dnsCfg, searches, ndots)
+}
+
 // buildBox translates pod to a PodBox and resolves its env into LITERAL values —
 // runtimed reads only EnvVar.value and never talks to the apiserver, so the
 // provider resolves configMap/secret/envFrom (via its Resolver) and downward-API
@@ -690,27 +919,23 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// Per-pod cluster DNS config: the search list is namespace-scoped
 	// (<ns>.svc.<domain>, …) so an unqualified Service name in this pod's namespace
 	// resolves first. toPodBox injects it (DNSPolicy-gated) into the containers.
-	dnsCfg := dns.PodDNSConfig(r.resolverVIP, r.clusterDomain, pod.Namespace)
-	// B20a: a ClusterFirst pod's spec.dnsConfig additively augments the cluster base
-	// (extra search domains appended+deduped, ndots override). The merge is GATED here
-	// on the cluster-DNS policy — NOT left to injectClusterDNSEnv's downstream gate —
-	// so the B20a/B20b seam is structural: a None/Default pod gets the UNMERGED base,
-	// so when B20b makes None inject its own config it can't inherit a cluster-base
-	// merge. dnsConfigOverride does the corev1→discrete-params extraction (k3sm is the
-	// corev1-aware layer); dns.MergeDNSConfig can only ADD search/ndots, never repoint
-	// the cluster server VIP.
-	if clusterDNSPolicy(pod.Spec.DNSPolicy) && pod.Spec.DNSConfig != nil {
-		searches, ndots := dnsConfigOverride(pod.Spec.DNSConfig)
-		var dropped int
-		dnsCfg, dropped = dns.MergeDNSConfig(dnsCfg, searches, ndots)
-		if dropped > 0 {
-			// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
-			// deliberate divergence from upstream's 32); the tail was truncated. Log once
-			// here at the corev1-aware boundary WITH pod identity — the darwin-net merge
-			// primitive stays pure and returns the count rather than logging blind.
-			r.log.WarnContext(ctx, "pod dnsConfig search list truncated to the in-pod cap",
-				"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
-		}
+	dnsCfg, dropped := r.podDNSConfig(pod)
+	if dropped > 0 {
+		// The pod's merged search list exceeded the in-pod cap (MaxSearchDomains, a
+		// deliberate divergence from upstream's 32); the tail was truncated. Log once
+		// here at the corev1-aware boundary WITH pod identity — the darwin-net merge
+		// primitive stays pure and returns the count rather than logging blind, and
+		// podDNSConfig's other caller (podIP) deliberately drops the count so one
+		// pod's truncation is reported once.
+		r.log.WarnContext(ctx, "pod dnsConfig search list truncated to the in-pod cap",
+			"namespace", pod.Namespace, "name", pod.Name, "dropped", dropped, "cap", dns.MaxSearchDomains)
+	}
+	// Produce the vm pod's GUEST network config BEFORE translation, from the very
+	// dnsCfg above — the M10.1 one-authority ordering applied to the guest carrier.
+	// A no-op for every non-vm pod, and idempotent for a vm pod whose address podIP
+	// already drew through this same call.
+	if _, err := r.setupGuestNetwork(ctx, pod, dnsCfg); err != nil {
+		return nil, err
 	}
 	box, err := toPodBox(pod, podIP, r.nodeIP, r.podRoot(string(pod.UID)), r.dyldShim, dnsCfg, r.log)
 	if err != nil {
@@ -787,6 +1012,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if err != nil {
 		r.log.Error("CreatePod: translate/buildBox", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	// M11.4: refuse an annotated pod this node's capabilities cannot serve BEFORE
+	// the RPC, and before any bookkeeping — a pod refused here leaves no track and
+	// no prober, exactly as if it had never been created. It logs and records its
+	// own Warning Event (preflightImagePlatform); the error is returned already
+	// wrapped.
+	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
+		return err
 	}
 
 	r.mu.Lock()
@@ -891,6 +1124,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
 	// delete-path teardown) so pod churn never leaks a node pool address.
 	r.releasePodNetwork(pod)
+	// Drop any Service-proxy transport override for the pod IN THE SAME STEP. No
+	// further status will ever arrive to retract it, and an override that outlives
+	// its guest points at a lease macOS is free to hand to the NEXT guest — a
+	// cross-pod misdelivery, not a failed dial (see transportFeed).
+	r.transport.drop(id)
 	r.mu.Lock()
 	t := r.track[id]
 	delete(r.track, id)
@@ -997,6 +1235,12 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // whose postStart hook has not completed.
 func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
 	r.observeExits(pod, t, rs)
+	// M11.3-d2: feed the Service proxy this pod's live transport address, on the
+	// same convergence the exit observation rides. It reads the status and the
+	// node's own guest record; it contributes NOTHING to the corev1 status being
+	// built, because the live address must never reach status.podIP, the
+	// EndpointSlice or DNS (see observeTransport).
+	r.observeTransport(string(pod.UID), rs)
 	t.readyMu.Lock()
 	prior := t.lastReady
 	t.readyMu.Unlock()

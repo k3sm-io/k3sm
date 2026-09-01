@@ -4,6 +4,10 @@
 # goreleaser owns that directory and empties it with --clean, which would delete
 # the staged artifacts before the archive globs could read them.
 /build/
+# The local artifact set (hack/release/stage-artifact.sh): the staged binaries,
+# the control-plane payload, and the tarball built from them. Hundreds of MB of
+# build output, rebuilt from scratch on every run.
+/hack/release/out/
 /bin/
 /k3sm
 *.test

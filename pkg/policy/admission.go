@@ -59,7 +59,7 @@ const (
 	foreignUserBindingName = "k3sm-reject-foreign-user-binding"
 )
 
-// dsTolerationPolicyName / dsTolerationBindingName name the MUTATING policy (B76)
+// dsTolerationPolicyName / dsTolerationBindingName name the mutating policy (B76)
 // that injects the provider toleration into DaemonSet-owned pods so they schedule.
 const (
 	dsTolerationPolicyName  = "k3sm-inject-daemonset-provider-toleration"
@@ -80,7 +80,7 @@ const (
 	udpServiceBindingName = "k3sm-warn-service-udp-binding"
 )
 
-// reservedLBPortPolicyName / reservedLBPortBindingName name the DENY policy (B116)
+// reservedLBPortPolicyName / reservedLBPortBindingName name the deny policy (B116)
 // that rejects a LoadBalancer Service declaring a port k3sm's own wildcard
 // listeners occupy.
 const (
@@ -103,14 +103,14 @@ const (
 // MLXModel — including, via the rendered StatefulSet's pod template, every Pod
 // the StatefulSet controller creates.
 //
-// RESTATED here rather than imported: pkg/mlx already imports THIS package (for
+// Restated here rather than imported: pkg/mlx already imports this package (for
 // ProviderTaintKey, in its DaemonSet-guardrail nodeSelector build), so importing
 // pkg/mlx from here would close an import cycle. If pkg/mlx.Render.Labels ever
 // changes this key or value, move this pair with it.
 //
 // An MLXModel controller ownerReference was considered as the discriminator
 // instead and rejected: the ownerReference an actually-created Pod carries names
-// its IMMEDIATE controller, which for a StatefulSet-managed pod is the
+// its immediate controller, which for a StatefulSet-managed pod is the
 // StatefulSet itself (kind: StatefulSet) — never the MLXModel two levels up. A
 // CEL check for `o.kind == 'MLXModel'` in a Pod's ownerReferences would never
 // match a real pod, so it is not a usable per-Pod signal at admission time; the
@@ -120,16 +120,16 @@ const (
 	operatorManagedByLabelValue = "k3sm"
 )
 
-// etpLocalExpr admits (evaluates true) UNLESS a Service sets
+// etpLocalExpr admits (evaluates true) unless a Service sets
 // externalTrafficPolicy: Local. k3sm's userspace L4 splice opens a fresh backend
-// connection (see darwin-net proxy.splice), so it does NOT preserve the external
+// connection (see darwin-net proxy.splice), so it does not preserve the external
 // client's source IP — only externalTrafficPolicy: Cluster is honored. A Local
 // Service is not rejected (the field stays valid) but the divergence is surfaced
 // to kubectl as a warning. The has() guard tolerates a Service that omits the
 // field (every ClusterIP Service), so only an explicit Local triggers the warning.
 const etpLocalExpr = `!has(object.spec.externalTrafficPolicy) || object.spec.externalTrafficPolicy != 'Local'`
 
-// udpServiceExpr admits (evaluates true) UNLESS any Service port is UDP. k3sm
+// udpServiceExpr admits (evaluates true) unless any Service port is UDP. k3sm
 // opens no UDP datapath (the proxy binds only TCP listeners — see darwin-net
 // proxy.openListener, where a UDP port ensures the lo0 alias but opens no datagram
 // socket), so a UDP Service silently blackholes. The warning says so at the API
@@ -139,7 +139,7 @@ const udpServiceExpr = `object.spec.ports.all(p, !has(p.protocol) || p.protocol 
 
 // reservedPortClause is the CEL sub-expression testing whether the port of the
 // Service port bound to variable p falls in the reserved set: the NodePort range,
-// or the kubelet API port. The bounds are INTERPOLATED from their arguments —
+// or the kubelet API port. The bounds are interpolated from their arguments —
 // pkg/ports at the one call site — so no reserved-port literal is ever written
 // into CEL by hand.
 func reservedPortClause(p string, nodePortMin, nodePortMax, kubeletPort int) string {
@@ -147,17 +147,17 @@ func reservedPortClause(p string, nodePortMin, nodePortMax, kubeletPort int) str
 		p, nodePortMin, nodePortMax, kubeletPort)
 }
 
-// reservedLBPortExpr is the CEL the Deny policy enforces on Service CREATE and
-// UPDATE. It ADMITS (evaluates true) unless a type: LoadBalancer Service declares
+// reservedLBPortExpr is the CEL the Deny policy enforces on Service create and
+// update. It admits (evaluates true) unless a type: LoadBalancer Service declares
 // a spec.ports[].port that k3sm's own wildcard listeners own.
 //
-// Why the LoadBalancer scope lives INSIDE the validation expression rather than in
+// Why the LoadBalancer scope lives inside the validation expression rather than in
 // a matchCondition: this expression is the whole rule, so it can be read — and
 // evaluated in a test — on its own. Split across a matchCondition, evaluating the
 // expression alone would report "rejects a plain NodePort Service", which is the
 // exact false verdict this policy must not deliver.
 //
-// It keys on spec.ports[].port ONLY, never on nodePort: the apiserver ALLOCATES a
+// It keys on spec.ports[].port only, never on nodePort: the apiserver allocates a
 // plain NodePort Service's nodePort out of the very range this guards, so keying on
 // nodePort — or dropping the type scope — would reject every NodePort Service in the
 // cluster. The has() guards tolerate a Service that omits type or ports.
@@ -167,13 +167,13 @@ func reservedLBPortExpr(nodePortMin, nodePortMax, kubeletPort int) string {
 		"object.spec.ports.all(p, !" + reservedPortClause("p", nodePortMin, nodePortMax, kubeletPort) + ")"
 }
 
-// reservedLBPortMessageExpr renders the rejection message, NAMING the first
+// reservedLBPortMessageExpr renders the rejection message, naming the first
 // colliding port — the whole reason admission was chosen over refuse-and-park is
 // that the operator learns at `kubectl apply` rather than from a silent <pending>.
 // It is evaluated only when the validation fails, so the filtered list is non-empty.
 //
 // The closing sentence keeps operator trust calibrated: this guard covers k3sm's
-// RESERVED ports only. Two Services declaring the same ORDINARY LoadBalancer port
+// reserved ports only. Two Services declaring the same ordinary LoadBalancer port
 // are still first-come — the second one's listener simply fails to bind and its
 // status stays empty.
 func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string {
@@ -186,18 +186,18 @@ func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string
 		`These ports belong to the node, so the rejection applies even to a Service k3sm does not itself serve (one carrying a foreign spec.loadBalancerClass): the port would still be taken on this Mac.'`
 }
 
-// EnsureRejectReservedLoadBalancerPort idempotently provisions the DENY
-// ValidatingAdmissionPolicy (+ binding) that REJECTS a type: LoadBalancer Service
+// EnsureRejectReservedLoadBalancerPort idempotently provisions the deny
+// ValidatingAdmissionPolicy (+ binding) that rejects a type: LoadBalancer Service
 // declaring a port k3sm's own wildcard listeners own (pkg/ports.Reserved). It is
-// the legible half of a two-point guard: svclb REFUSES to bind such a port at the
+// the legible half of a two-point guard: svclb refuses to bind such a port at the
 // datapath (pkg/svclb), and this policy makes the refusal visible at
 // `kubectl apply` instead of as an unexplained <pending>.
 //
-// CREATE **and** UPDATE: a port edit, or a `type` patch onto an already-admitted
-// Service, is an ordinary UPDATE, and svclb reconciles live state — a CREATE-only
+// Create **and** update: a port edit, or a `type` patch onto an already-admitted
+// Service, is an ordinary update, and svclb reconciles live state — a create-only
 // policy would let the collision in through the back door.
 //
-// MatchConstraints pins `services` ONLY — deliberately NOT `services/status`, or
+// MatchConstraints pins `services` only — deliberately not `services/status`, or
 // this controller's own (and the ingress host's) UpdateStatus writes would be
 // evaluated by it on every reconcile.
 //
@@ -206,10 +206,10 @@ func reservedLBPortMessageExpr(nodePortMin, nodePortMax, kubeletPort int) string
 // fail open, which is why the datapath refusal in svclb exists as the second
 // enforcement point rather than as belt-and-braces.
 //
-// PROVISIONING CONTRACT: like every sibling Ensure*, this is CREATE-OR-UPDATE
+// Provisioning contract: like every sibling Ensure*, this is create-or-update
 // (managedObject.ensure) — a cluster provisioned before a NodePort-range change is
 // reconciled onto the new expression on the next server start, so the "reserved set
-// cannot desync" property holds for an EXISTING cluster too, not only a fresh one.
+// cannot desync" property holds for an existing cluster too, not only a fresh one.
 func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Interface) error {
 	ignore := admissionregistrationv1.Ignore
 	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
@@ -263,14 +263,14 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 	return nil
 }
 
-// egressAnnotationExpr admits (evaluates true) UNLESS a pod carries annotationKey
+// egressAnnotationExpr admits (evaluates true) unless a pod carries annotationKey
 // (runtimev1.AnnotationInternetEgress, interpolated by the caller — never a
-// literal here) AND is NOT operator-managed. "Operator-managed" is the
+// literal here) and is not operator-managed. "Operator-managed" is the
 // operatorManagedByLabelKey/Value discriminator (see its doc comment for why a
 // label, not an ownerReference, is the usable per-Pod signal).
 //
 // As with darwinSelectorExpr above, the CEL field-escaping rules
-// (has(object.foo)) apply only to dot PROPERTY access; both annotationKey and
+// (has(object.foo)) apply only to dot property access; both annotationKey and
 // operatorManagedByLabelKey contain '.'/'/' and so are used as string-literal
 // map keys via the `in` operator and map indexing, never as a has() path.
 func egressAnnotationExpr(annotationKey string) string {
@@ -282,8 +282,8 @@ func egressAnnotationExpr(annotationKey string) string {
 }
 
 // EnsureEgressAnnotationWarn idempotently provisions a Warn-action
-// ValidatingAdmissionPolicy on Pod CREATE that surfaces a pod carrying a HAND-SET
-// runtimev1.AnnotationInternetEgress annotation — one present on the pod WITHOUT
+// ValidatingAdmissionPolicy on Pod create that surfaces a pod carrying a hand-set
+// runtimev1.AnnotationInternetEgress annotation — one present on the pod without
 // the operatorManagedByLabelKey/Value discriminator pkg/mlx.Render stamps. The
 // annotation is operator-facing plumbing (see its doc comment in
 // apis/runtime/v1/labels.go): the k3sm provider reads it at admission and sets
@@ -291,16 +291,16 @@ func egressAnnotationExpr(annotationKey string) string {
 // a controller acting on the pod's behalf — today, pkg/mlx.Render, via the
 // rendered StatefulSet's pod template — not typed in by hand.
 //
-// This is advisory ONLY — never Deny, and FailurePolicy is Ignore (load-bearing:
+// This is advisory only — never Deny, and FailurePolicy is Ignore (load-bearing:
 // by design this guard must never take the cluster down). The
 // annotation is not a security boundary either way: its own doc comment already
 // says enforcement stops at the SandboxProfile field today (no per-IP scoping at
-// the Seatbelt layer), so the message says what the annotation DOES and that
+// the Seatbelt layer), so the message says what the annotation does and that
 // hand-setting it is discouraged plumbing — not a claim that the annotation
 // itself is a boundary being bypassed.
 //
-// CREATE ONLY: matching UPDATE too would re-fire on every unrelated pod status
-// patch — the same reasoning as EnsureProviderTolerationWarn's CREATE-only scope.
+// Create only: matching update too would re-fire on every unrelated pod status
+// patch — the same reasoning as EnsureProviderTolerationWarn's create-only scope.
 // Safe to call on every server start (create-or-update; an unchanged spec is not
 // rewritten).
 func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) error {
@@ -313,10 +313,10 @@ func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) er
 		egressAnnotationExpr(runtimev1.AnnotationInternetEgress), msg, "pods", admissionregistrationv1.Create)
 }
 
-// darwinSelectorExpr is the CEL the policy enforces on Pod CREATE: the pod must
+// darwinSelectorExpr is the CEL the policy enforces on Pod create: the pod must
 // declare nodeSelector kubernetes.io/os=darwin. It tolerates a missing
 // nodeSelector map (has(...)). The CEL field-escaping rules apply only to dot
-// property ACCESS (object.foo); a string LITERAL used as a map key / `in`
+// property access (object.foo); a string literal used as a map key / `in`
 // operand is the real key, so the literal "kubernetes.io/os" is used directly.
 // A pod without the selector — i.e. any Linux pod — fails the rule and is denied.
 const darwinSelectorExpr = `has(object.spec.nodeSelector) && ` +
@@ -324,23 +324,24 @@ const darwinSelectorExpr = `has(object.spec.nodeSelector) && ` +
 	`object.spec.nodeSelector['kubernetes.io/os'] == 'darwin'`
 
 // providerTolerationExpr is the CEL the provider-toleration Warn policy enforces on
-// Pod CREATE. It evaluates TRUE when the pod TOLERATES the provider taint
-// (ProviderTaintKey:NoSchedule, value "") — no warning — and FALSE otherwise, when
+// Pod create. It evaluates true when the pod tolerates the provider taint
+// (ProviderTaintKey:NoSchedule, value "") — no warning — and false otherwise, when
 // the scheduler would leave the pod Unschedulable and the binding warns.
 //
 // It is the faithful CEL transcription of Kubernetes' Toleration.ToleratesTaint
 // (k8s.io/api/core/v1): a toleration tolerates the taint iff its effect matches (or
-// is empty), its key matches (or is empty), and EITHER operator==Exists (any value)
-// OR operator is Equal/empty AND its value equals the taint's (empty) value. The
-// exists() requires SOME toleration to satisfy all three.
+// is empty), its key matches (or is empty), and either operator==Exists (any value)
+// or operator is Equal/empty and its value equals the taint's (empty) value. The
+// exists() requires some toleration to satisfy all three.
 //
-// CRITICAL — this is the full-match exists() form, NOT the naive
-// `!has(object.spec.tolerations)` / `size(...)==0` emptiness shortcut. The default-on
-// DefaultTolerationSeconds admission plugin auto-injects NoExecute tolerations
-// (node.kubernetes.io/not-ready, …) into nearly every Pod, so an emptiness test would
-// see a non-empty list and NEVER warn; and a pod carrying a DIFFERENT-key toleration
-// is still Unschedulable here. ProviderTaintKey is interpolated (a const concat) so
-// the taint key lives in exactly one place.
+// This is the full-match exists() form, not the naive
+// `!has(object.spec.tolerations)` / `size(...)==0` emptiness shortcut — a distinction
+// worth getting right: the default-on DefaultTolerationSeconds admission plugin
+// auto-injects NoExecute tolerations (node.kubernetes.io/not-ready, …) into nearly
+// every Pod, so an emptiness test would see a non-empty list and never warn; and a
+// pod carrying a different-key toleration is still Unschedulable here.
+// ProviderTaintKey is interpolated (a const concat) so the taint key lives in
+// exactly one place.
 const providerTolerationExpr = `has(object.spec.tolerations) && object.spec.tolerations.exists(t, ` +
 	`(!has(t.effect) || t.effect == 'NoSchedule') && ` +
 	`(!has(t.key) || t.key == '` + ProviderTaintKey + `') && ` +
@@ -348,23 +349,23 @@ const providerTolerationExpr = `has(object.spec.tolerations) && object.spec.tole
 	`((!has(t.operator) || t.operator == 'Equal') && (!has(t.value) || t.value == ''))))`
 
 // daemonSetOwnedExpr is the matchCondition CEL that fires the B76 mutating policy
-// ONLY for a pod created by the DaemonSet controller. It is GROUP-QUALIFIED
+// only for a pod created by the DaemonSet controller. It is group-qualified
 // (o.apiVersion.startsWith('apps/')) so a CRD `kind: DaemonSet` in some other API
 // group cannot masquerade as a real apps/v1 DaemonSet and steal the injection; and
 // it requires o.controller == true so only the managing (controller) ownerReference —
 // not a bare owner cross-reference — matches. A ReplicaSet/Job/StatefulSet-owned pod
-// (the KCM's other controllers) does NOT match, so it never receives the toleration.
+// (the KCM's other controllers) does not match, so it never receives the toleration.
 const daemonSetOwnedExpr = `object.metadata.ownerReferences.exists(o, ` +
 	`o.kind == 'DaemonSet' && o.controller == true && o.apiVersion.startsWith('apps/'))`
 
-// daemonSetTolerationPatchExpr is the JSONPatch-mutation CEL that APPENDS exactly one
+// daemonSetTolerationPatchExpr is the JSONPatch-mutation CEL that appends exactly one
 // toleration for the provider taint to a DS-owned pod. A JSONPatch (append to
-// /spec/tolerations/-) is used deliberately INSTEAD of an ApplyConfiguration: the
-// tolerations list is an ATOMIC list, so an apply-config would REPLACE the whole list
+// /spec/tolerations/-) is used instead of an ApplyConfiguration: the
+// tolerations list is an atomic list, so an apply-config would replace the whole list
 // and clobber the NoExecute tolerations the default-on DefaultTolerationSeconds plugin
 // injects (node.kubernetes.io/not-ready, …). The append is idempotent because the
 // not-already-tolerating matchCondition (the negation of providerTolerationExpr) only
-// lets the mutation run when the pod does not already tolerate the taint. ONLY the
+// lets the mutation run when the pod does not already tolerate the taint. Only the
 // toleration is injected — never the kubernetes.io/os=darwin nodeSelector: a DaemonSet
 // declares its own placement intent, and overriding it here would defeat the DS's
 // nodeSelector/affinity (B76 Res.7). ProviderTaintKey is interpolated so the taint key
@@ -375,26 +376,26 @@ const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerat
 // EnsureDaemonSetTolerationMutation idempotently provisions the B76
 // MutatingAdmissionPolicy (+ binding) that injects the provider toleration into
 // DaemonSet-owned pods. A DS pod is created by the DaemonSet controller in the
-// kube-controller-manager, so the B17 CREATE-Warn advisory never reaches its author and
+// kube-controller-manager, so the B17 create-Warn advisory never reaches its author and
 // the pod would sit Unschedulable against the k3sm.io/provider:NoSchedule taint; this
-// policy MUTATES the pod to tolerate it. UNLIKE the Deny/Warn ValidatingAdmissionPolicies
-// it CHANGES the stored object. Both matchConditions must hold (DS-owned AND not already
-// tolerating); the mutation appends exactly one toleration and NEVER a nodeSelector
+// policy mutates the pod to tolerate it. Unlike the Deny/Warn ValidatingAdmissionPolicies
+// it changes the stored object. Both matchConditions must hold (DS-owned and not already
+// tolerating); the mutation appends exactly one toleration and never a nodeSelector
 // (Res.7). Safe to call on every server start (create-or-update; an unchanged
 // spec is not rewritten).
 //
-// This provisions objects for a BETA API (admissionregistration.k8s.io/v1beta1,
-// MutatingAdmissionPolicy) — the executor must enable the v1beta1 runtime-config AND the
+// This provisions objects for a beta API (admissionregistration.k8s.io/v1beta1,
+// MutatingAdmissionPolicy) — the executor must enable the v1beta1 runtime-config and the
 // MutatingAdmissionPolicy feature gate on the apiserver (see executor.apiServerArgs) or
 // this policy is a runtime no-op.
 func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interface) error {
-	// Ignore — NOT Fail — because this is a scheduling-CONVENIENCE injector, not a
-	// guard: MatchConstraints is all Pods/CREATE, so a Fail policy would turn any
-	// CEL/beta-machinery evaluation error into a cluster-wide denial of Pod CREATE.
+	// Ignore — not Fail — because this is a scheduling-convenience injector, not a
+	// guard: MatchConstraints is all Pods/Create, so a Fail policy would turn any
+	// CEL/beta-machinery evaluation error into a cluster-wide denial of Pod create.
 	// Failing open instead degrades to the pre-B76 status quo (the DS pod is created
 	// without the toleration and stays Unschedulable — visible and recoverable, no
 	// guard bypass: the os=darwin Deny VAP and the provider taint still hold). Mirrors
-	// the advisory Warn VAP's deliberate Ignore.
+	// the advisory Warn VAP's Ignore.
 	ignore := admissionregistrationv1beta1.Ignore
 	policy := &admissionregistrationv1beta1.MutatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
@@ -415,7 +416,7 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 					},
 				}},
 			},
-			// BOTH conditions must hold: the pod is DS-owned (group-qualified) AND it does
+			// Both conditions must hold: the pod is DS-owned (group-qualified) and it does
 			// not already tolerate the taint (the negation of the single-sourced
 			// providerTolerationExpr — never a second, drifting ToleratesTaint CEL).
 			MatchConditions: []admissionregistrationv1beta1.MatchCondition{
@@ -547,24 +548,23 @@ func containersClause(list string, allowedID int64, optional bool) string {
 }
 
 // EnsureNoForeignUserAdmission idempotently provisions the ValidatingAdmissionPolicy
-// that REJECTS (server-side, never silently coerces) a pod requesting any
+// that rejects (server-side, never silently coerces) a pod requesting any
 // runAsUser/runAsGroup/fsGroup/supplementalGroups other than allowedUID — the
 // identity every k3sm pod runs as, since the runtime offers no per-pod uid/gid
 // isolation. It is the admission counterpart to the runtime's privilege-drop
 // refusal. Safe to call on every server start (create-or-update; an unchanged spec
 // is not rewritten).
 //
-// PROVISIONED IN EVERY POSTURE (B153). It used to be provisioned ONLY under the
-// netd-helper backend, on the reasoning that a root server can honor a real
-// privilege drop; that made a `--network none`/`direct` cluster admit a
-// foreign-uid pod with NO policy object at all, and under `none` while
-// unprivileged the pod then wedged at spawn — the exact silent failure this guard
-// exists to prevent. The operator ratified the guard as a PRODUCT-WIDE CEILING, at
-// the recorded cost that a root server no longer serves foreign-fsGroup pods it
+// Provisioned in every posture (B153), not only under the netd-helper backend:
+// scoping it to that backend let a `--network none`/`direct` cluster admit a
+// foreign-uid pod with no policy object at all, which then wedged at spawn under
+// `none` while unprivileged — the exact silent failure this guard exists to
+// prevent. The operator ratified the guard as a product-wide ceiling, at the
+// recorded cost that a root server no longer serves foreign-fsGroup pods it
 // could genuinely have honored.
 //
-// allowedUID is the uid pods on this node actually EXECUTE as — see
-// provider.PodExecutionUID, which is where that question is answered. It is NOT
+// allowedUID is the uid pods on this node actually execute as — see
+// provider.PodExecutionUID, which is where that question is answered. It is not
 // os.Geteuid() of the server: those coincide in the shipped unprivileged posture
 // and diverge under a root server, where passing 0 would name root as "the k3sm
 // pod identity" and admit only root.
@@ -619,9 +619,9 @@ func EnsureNoForeignUserAdmission(ctx context.Context, cs kubernetes.Interface, 
 
 // EnsureExternalTrafficPolicyLocalWarn idempotently provisions a Warn-action
 // ValidatingAdmissionPolicy on Services that set externalTrafficPolicy: Local.
-// k3sm's userspace splice does NOT preserve the client source IP (only Cluster is
+// k3sm's userspace splice does not preserve the client source IP (only Cluster is
 // honored), so Local is silently downgraded to Cluster at the datapath; the policy
-// surfaces that divergence to kubectl WITHOUT rejecting the Service (the field
+// surfaces that divergence to kubectl without rejecting the Service (the field
 // stays valid). Safe to call on every server start (create-or-update; an unchanged
 // spec is not rewritten).
 func EnsureExternalTrafficPolicyLocalWarn(ctx context.Context, cs kubernetes.Interface) error {
@@ -643,17 +643,17 @@ func EnsureUDPServiceWarn(ctx context.Context, cs kubernetes.Interface) error {
 }
 
 // EnsureProviderTolerationWarn idempotently provisions a Warn-action
-// ValidatingAdmissionPolicy on Pod CREATE that surfaces a pod with NO toleration for
+// ValidatingAdmissionPolicy on Pod create that surfaces a pod with no toleration for
 // the provider taint (ProviderTaintKey:NoSchedule, on every k3sm node). Such a pod is
 // perfectly valid Kubernetes — it is just left Unschedulable by the scheduler — so
-// this is advisory (Warn), NOT Deny: the policy says so at the API rather than leaving
+// this is advisory (Warn), not Deny: the policy says so at the API rather than leaving
 // the operator to discover a silently-Pending pod. The CEL is the faithful
 // ToleratesTaint encoding (see providerTolerationExpr), not the emptiness shortcut
-// that DefaultTolerationSeconds would defeat. Matched on CREATE ONLY (an UPDATE warn
+// that DefaultTolerationSeconds would defeat. Matched on create only (an update warn
 // would re-fire on every unrelated pod status patch).
 //
-// Coverage limit (honest): the warning reaches only DIRECTLY-created pods — for a
-// Deployment/Job/StatefulSet/etc. the Pod CREATE is issued by the
+// Coverage limit (honest): the warning reaches only directly-created pods — for a
+// Deployment/Job/StatefulSet/etc. the Pod create is issued by the
 // kube-controller-manager, so the HTTP-warning header lands on the KCM's API client,
 // not the user's kubectl. A bare `kubectl run`/`kubectl apply` of a Pod does surface
 // it. Safe to call on every server start (create-or-update; an unchanged spec is
@@ -668,13 +668,13 @@ func EnsureProviderTolerationWarn(ctx context.Context, cs kubernetes.Interface) 
 
 // ensureWarnPolicy idempotently provisions a Warn-action ValidatingAdmissionPolicy on
 // resource for the given ops whose CEL expr, when it evaluates false, surfaces message
-// to the client as an HTTP-299 warning WITHOUT rejecting the request. It is the SINGLE
+// to the client as an HTTP-299 warning without rejecting the request. It is the single
 // source of the advisory invariant for every k3sm Warn VAP (Service divergences and
 // the pod-toleration advisory), parameterized only by resource + ops.
 //
-// FailurePolicy is Ignore — NOT Fail — precisely because the action is advisory: a
+// FailurePolicy is Ignore — not Fail — precisely because the action is advisory: a
 // Fail policy rejects the request when its CEL hits a runtime/typecheck error,
-// REGARDLESS of the binding action (admissionregistration/v1 types.go: "If
+// regardless of the binding action (admissionregistration/v1 types.go: "If
 // failurePolicy=Fail, reject the request"), which would turn an informational
 // warning into a hard failure. Ignore guarantees the advisory can only ever warn —
 // keeping that invariant here, in one place, stops it drifting to Fail per-callsite.

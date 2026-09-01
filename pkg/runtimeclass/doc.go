@@ -101,12 +101,22 @@ limitations under the License.
 // The verifiable foundation (provider dispatch + this RuntimeClass + the node-label
 // gate) is unit-proven. The LIVE vm leg is the M5.1 lab remainder:
 //
-//   - VM dispatch end-to-end: provider → darwin-net podnet.Network.SetupGuest for
-//     the guest network → thread the GuestNetwork (guest IP / gateway / NAT subnet /
-//     DNS VIP) to runtimed's VZ backend → boot the Linux guest. darwin-net flagged
-//     there is NO transport for GuestNetwork to runtimed yet; the clean fix is a
-//     runtimed consumer-side supervisor.GuestNetwork seam (no apis change) — the
-//     M5.1-d2 lab leg.
+//   - VM dispatch end-to-end: the CARRIER half is now wired — the provider calls
+//     darwin-net podnet.Network.SetupGuest, folds it together with the rendered and
+//     structured guest resolv.conf, and runtimed's vm branch reads it back through
+//     the optional runtime.GuestNetworker seam (no apis change), so the guest IP /
+//     gateway / NAT subnet / DNS VIP reach sandbox.VMSpec.Network. What stays
+//     lab-gated is BOOTING the Linux guest with it: CreateVM is a stub on a host
+//     without a VZ Mac and the entitlement. Note the seam landed on
+//     runtime.GuestNetworker, not the supervisor.GuestNetwork this comment once
+//     predicted.
+//   - status.podIP for a vm pod now publishes the allocated podCIDR /32 — the
+//     PUBLISHED identity of the two-address model. It is deliberately live on no
+//     interface: the guest's DHCP lease is the LIVE TRANSPORT address, carried by
+//     the guest agent's Health report and consumed only by the host's dial paths
+//     (the proxy's transport overrides). The eth0-alias model was measured workable
+//     but NOT adopted (its host-route half is root-only and the model needs no
+//     live /32).
 //   - Foreign runAsUser/fsGroup admission: M4.1's foreign-user VAP rejects them
 //     because the host-process path cannot honor a foreign uid, but a vm pod's guest
 //     CAN. The VAP should therefore EXEMPT runtimeClassName: vm. It is deferred (not

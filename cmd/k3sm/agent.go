@@ -156,6 +156,10 @@ func runAgent(args []string) error {
 	// keep it converging via the MeshPeer watch, THEN the node-local datapath (the
 	// Service proxy + per-node cluster DNS resolver). `--network none` skips both
 	// (control-plane-only / CI join); the node still registers below.
+	//
+	// datapath is the Server the in-process node feeds vm-pod transport overrides
+	// into; it stays nil under `--network none`, where there is no proxy to feed.
+	var datapath *netserve.Server
 	if mode.DataPath() {
 		if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, mode, logger); err != nil {
 			return fmt.Errorf("mesh bring-up: %w", err)
@@ -165,7 +169,8 @@ func runAgent(args []string) error {
 		// routing-table locality is its assigned pod /24 (res.PodCIDR) — neither is
 		// known before enroll. Without this a joined worker has no Service proxy and
 		// no DNS, so a pod on it can't resolve names or reach the API VIP (M3.3).
-		if err := startWorkerNetserve(ctx, opts, res, mode, kubeconfigPath, logger); err != nil {
+		datapath, err = startWorkerNetserve(ctx, opts, res, mode, kubeconfigPath, logger)
+		if err != nil {
 			return err
 		}
 	} else {
@@ -174,7 +179,7 @@ func runAgent(args []string) error {
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
 	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
-	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode))
+	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode, datapath))
 }
 
 // agentNodeOptions builds the joined worker's in-process node options from the
@@ -185,7 +190,7 @@ func runAgent(args []string) error {
 // The shims are passed through UNRESOLVED: runtimedConfig applies the one shared
 // precedence (an explicit flag, else the sibling-dylib lookup), so the agent path
 // cannot acquire a second resolution idiom.
-func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPath string, mode hostnet.Mode) nodeOptions {
+func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPath string, mode hostnet.Mode, datapath *netserve.Server) nodeOptions {
 	return nodeOptions{
 		kubeconfig: kubeconfigPath,
 		nodeName:   opts.nodeName,
@@ -209,6 +214,10 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// intended failure — a worker's kubelet endpoint is LAN-reachable on the
 		// wildcard bind and is never served unauthenticated.
 		kubeletClientCAPEM: res.ClientCAPEM,
+
+		// The worker's own Service proxy is where its vm pods' live guest leases
+		// are published; nil when the worker runs no datapath.
+		transportOverrides: nodeTransportOverrides(datapath, mode),
 	}
 }
 
@@ -269,16 +278,24 @@ func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, k
 // a goroutine that runs until ctx. It is launched after join+mesh so the
 // mesh-egress source and pod /24 are known. A client build failure is fatal (a
 // worker with no datapath cannot run pods usefully); a runtime error is logged.
-func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, kubeconfigPath string, logger *slog.Logger) error {
+//
+// It RETURNS the Server so the worker's in-process node can feed it vm-pod
+// transport overrides (nodeTransportOverrides): the provider holds both halves of
+// a guest's two-address identity and this is the proxy that must learn the live
+// one.
+func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, kubeconfigPath string, logger *slog.Logger) (*netserve.Server, error) {
 	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	if err != nil {
-		return fmt.Errorf("load node kubeconfig for node-local datapath: %w", err)
+		return nil, fmt.Errorf("load node kubeconfig for node-local datapath: %w", err)
 	}
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
-		return fmt.Errorf("build client for node-local datapath: %w", err)
+		return nil, fmt.Errorf("build client for node-local datapath: %w", err)
 	}
-	cfg := workerNetserveConfig(opts, res, mode, logger)
+	// The vm-capability question is asked HERE, before the datapath is built and
+	// before the VK node exists — through runtimed's own safe host probe, the same
+	// verdict the node will later advertise (see vmBackendAvailable).
+	cfg := workerNetserveConfig(opts, res, mode, vmBackendAvailable(), logger)
 	cfg.Client = cs
 	srv := netserve.New(cfg)
 	go func() {
@@ -286,7 +303,7 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 			logger.Error("node-local datapath (Service proxy + cluster DNS)", "err", err)
 		}
 	}()
-	return nil
+	return srv, nil
 }
 
 // workerNetserveConfig builds the node-local datapath config for a joined worker
@@ -296,7 +313,7 @@ func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.
 // proxy/resolver privileged ops route through the netd helper when unprivileged
 // (mode.Socket). The caller sets Client. It is pure (no I/O) so the worker wiring
 // is unit-tested without a live join.
-func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, logger *slog.Logger) netserve.Config {
+func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, vmCapable bool, logger *slog.Logger) netserve.Config {
 	return netserve.Config{
 		WorkDir:           opts.workDir,
 		DNSVIP:            opts.clusterIP,
@@ -305,9 +322,15 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		PodCIDR:           res.PodCIDR,
 		MeshEgressIP:      res.MeshIP,
 		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),
-		NetdSocket:        mode.Socket,
-		Disabled:          !mode.DataPath(),
-		Logger:            logger,
+		// M11.3-d3a: vmCapable alone arms the NetworkPolicy table's fail-closed
+		// unknown-vm-source branch. The segment is passed unconditionally because it
+		// is a host fact, not a decision — vmnetPolicyPrefix ANDs the two, so a
+		// worker with no vm backend keeps the byte-identical plain table.
+		VMBackend:   vmCapable,
+		VMNetSubnet: netserve.DefaultVMNetSubnet,
+		NetdSocket:  mode.Socket,
+		Disabled:    !mode.DataPath(),
+		Logger:      logger,
 	}
 }
 

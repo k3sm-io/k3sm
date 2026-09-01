@@ -39,7 +39,7 @@ const (
 	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 )
 
-// A Pin is one digest-pinned image constant, named so it can be matched against the
+// Pin is one digest-pinned image constant, named so it can be matched against the
 // mirror manifest entry that records where the digest came from.
 type Pin struct {
 	// Name is the manifest key. It matches the "name" of exactly one manifest entry.

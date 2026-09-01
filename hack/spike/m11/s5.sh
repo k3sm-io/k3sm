@@ -109,4 +109,23 @@ cat <<'EOF'
   for a vm pod.
 EOF
 
+note "S5 — the automatable criteria are RUN by s5-run.sh"
+cat <<'EOF'
+  This script is the runbook: it owns every criterion's statement and its
+  branch consequence. The criteria that need NO ROOT are executed by
+
+      hack/spike/m11/s5-run.sh
+
+  on a network-capable Alpine guest — 1a/1b (guest -> host, and whether
+  service-CIDR packets leave the guest), 2 (host -> guest), 4 (the guest<->guest
+  matrix, with liveness controls), 5 (lease stability under a deterministic
+  MAC), 6 (the source address the host observes) and 7 (guest link MTU). Its
+  results are already recorded in findings-s5.md.
+
+  What s5-run.sh deliberately does NOT do is the root-needing half: no lo0 VIP
+  alias, no host route, no ip-forwarding sysctl. Those legs are listed as the
+  human slice at the bottom of findings-s5.md and are run by a human with root
+  in one sitting; they are never approximated.
+EOF
+
 note "S5 — record every answer in findings-s5.md as a DECISION TABLE, not prose"

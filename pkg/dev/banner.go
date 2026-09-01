@@ -24,8 +24,8 @@ import (
 )
 
 // FidelityBanner returns the SAFE/NEEDS-datapath/UNFAITHFUL text `k3sm dev up`
-// prints so the fidelity axis (docs/UPSTREAM-ALIGNMENT.md, docs/conformance-
-// profile.md) is surfaced at the entry point, not buried. The datapath argument
+// prints so the fidelity axis (docs/conformance-profile.md) is surfaced at the
+// entry point, not buried. The datapath argument
 // is DatapathNone (rootless — datapath INERT) or DatapathDirect (root — datapath
 // live); the runtime argument (runtimeRuntimed / runtimeHostProcess) drives the
 // isolation line so a hostprocess (execshim-unavailable) fallback reports pods run
@@ -80,7 +80,7 @@ func FidelityBanner(datapath, runtime string) string {
 	b.WriteString("  cluster DNS on the default runtime path (vm/hostprocess pods use the host resolver) · NetworkPolicy is a hint, not isolation ·\n")
 	b.WriteString("  no cgroup CPU limits / HPA-on-cpu · no EventRecorder (kubectl describe shows no events) ·\n")
 	b.WriteString("  no metrics.k8s.io · native-process pods (Linux images need the vm RuntimeClass).\n")
-	b.WriteString("  See docs/UPSTREAM-ALIGNMENT.md and docs/conformance-profile.md for the full register.\n")
+	b.WriteString("  See docs/conformance-profile.md for the full register.\n")
 
 	return b.String()
 }

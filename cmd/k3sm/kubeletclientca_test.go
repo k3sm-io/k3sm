@@ -50,7 +50,7 @@ func TestWorkerKubeletClientCAThreads(t *testing.T) {
 	}
 	opts := agentOptions{nodeName: "k3sm-worker", nodeIP: "100.64.2.1"}
 
-	nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+	nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
 	if !nodeOpts.serveTLS {
 		t.Fatal("a joined worker must serve the kubelet API over TLS")
 	}

@@ -120,13 +120,18 @@ func (opts serverOptions) executorConfig(logger *slog.Logger) executor.Config {
 	}
 }
 
-// runServer brings up the control plane (via the executor) and a Virtual Kubelet
-// node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
-// DNS shim and provisions the os=darwin admission policy. It blocks until
-// interrupted, then shuts the control plane down cleanly.
-func runServer(args []string) error {
-	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	opts := serverOptions{}
+// registerServerFlags binds `k3sm server`'s flags onto fs and returns the error
+// (if any) from resolving the posture-aware --work-dir DEFAULT, which the caller
+// surfaces after Parse so an explicit --work-dir can still override it.
+//
+// It is a function rather than an inline block in runServer for the same reason
+// registerAgentFlags is: the REGISTERED SURFACE is then assertable without
+// parsing argv through a live bring-up — including the negative assertions,
+// which are the ones that cannot be written any other way. The dev-only
+// guest-artifact directory override is exactly such a negative
+// (TestGuestArtifactsDirOverrideIsDevOnly): a flag whose absence is the
+// requirement can only be checked against the real flag set.
+func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// The work-dir default is POSTURE-AWARE (decoupled from the root-only
 	// DefaultWorkDir const): root → /var/lib/k3sm/server, the unprivileged _k3sm
 	// control plane → <home>/server (the root const would EACCES). A resolve error
@@ -192,6 +197,17 @@ func runServer(args []string) error {
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
 	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join, M6.1; requires --server-join --mesh-ip --token)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
+	return workDirErr
+}
+
+// runServer brings up the control plane (via the executor) and a Virtual Kubelet
+// node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
+// DNS shim and provisions the os=darwin admission policy. It blocks until
+// interrupted, then shuts the control plane down cleanly.
+func runServer(args []string) error {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	opts := serverOptions{}
+	workDirErr := registerServerFlags(fs, &opts)
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -450,6 +466,14 @@ func runServer(args []string) error {
 	if isLoopbackDefault(opts.nodeIP) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
+	// M11.3-d3a: whether this node can host vm guests, asked HERE — before the
+	// datapath is constructed and long before the VK node exists — through
+	// runtimed's own safe host probe rather than through the node's advertised
+	// capability, which is not answerable yet (see vmBackendAvailable). It arms the
+	// NetworkPolicy table's fail-closed unknown-vm-source branch, scoped to the
+	// segment macOS's vmnet is expected to hand guests; false leaves the table
+	// byte-identical to a node that runs no guests.
+	vmCapable := vmBackendAvailable()
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
@@ -458,6 +482,8 @@ func runServer(args []string) error {
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
 		PodCIDR:           serverPodCIDR,
+		VMBackend:         vmCapable,
+		VMNetSubnet:       netserve.DefaultVMNetSubnet,
 		NetdSocket:        mode.Socket,
 		Disabled:          !mode.DataPath(),
 		Logger:            logger,
@@ -643,6 +669,12 @@ func runServer(args []string) error {
 		// facts off it. A hostprocess node never calls it, leaving the fit check
 		// skipped — the honest answer where there is no runtimed to ask.
 		attachRuntimeInfo: mlxGPU.Attach,
+		// The Service proxy this same process just built (step 4) is where the
+		// provider publishes a vm pod's live guest lease, so a Service backed by a
+		// guest is dialed at the address that carries bytes while everything else
+		// keys on the /32 the pod publishes. nil under --network none, where there
+		// is no proxy to feed.
+		transportOverrides: nodeTransportOverrides(net, mode),
 	}
 
 	// 4d/4e. M10.3 — ingress hosting + svclb, beside the netserve datapath

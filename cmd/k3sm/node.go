@@ -124,6 +124,12 @@ type nodeOptions struct {
 	// `k3sm node --serve-tls` takes it from --kubelet-client-ca.
 	kubeletClientCAPEM []byte
 
+	// kubeletClientCAPath is the standalone `k3sm node --kubelet-client-ca` file
+	// path kubeletClientCAPEM is read from. Only runNode sets it (`k3sm server`
+	// reads the anchor off its work dir, `k3sm agent` off its join response), so
+	// it is empty on every other bring-up.
+	kubeletClientCAPath string
+
 	// podCIDR is this node's pod /24 the runtimed podnet adapter allocates /32s
 	// from — the SAME CIDR the mesh AllowedIPs carry: an enrolled worker's
 	// assigned res.PodCIDR, the reserved index-0 /24 on the control-plane/
@@ -144,6 +150,16 @@ type nodeOptions struct {
 	// cluster-DNS lookup for ~2s per search candidate before falling through,
 	// where the pre-injection behavior deferred to the host resolver immediately.
 	standalone bool
+
+	// transportOverrides is the Service-proxy seam the provider publishes a vm
+	// pod's LIVE TRANSPORT address through — the node-local datapath's netserve
+	// Server, which forwards to the proxy's routing table. Built by
+	// nodeTransportOverrides, so the two bring-ups that host a datapath
+	// (`k3sm server`, `k3sm agent`) share one decision about when there is a proxy
+	// to feed. nil (the standalone `k3sm node`, `--network none`) runs the feed
+	// inert: every backend is dialed at its published address, exactly as a
+	// host-process pod's is.
+	transportOverrides provider.TransportOverrideSink
 
 	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
 	// runtime as soon as it is built, so a consumer started EARLIER in the same
@@ -210,11 +226,13 @@ func kubeletEndpointPort(listen string) int32 {
 	return int32(port)
 }
 
-// runNode registers this Mac as a Virtual Kubelet node and runs pods via the
-// selected runtime (M0 walking skeleton + M1 runtimed image runtime).
-func runNode(args []string) error {
-	fs := flag.NewFlagSet("node", flag.ExitOnError)
-	opts := nodeOptions{}
+// registerNodeFlags binds the standalone `k3sm node`'s flags onto fs.
+//
+// Extracted for the same reason registerAgentFlags and registerServerFlags are:
+// the registered surface is assertable without a live bring-up, which is the only
+// way to write the NEGATIVE assertion that the dev-only guest-artifact directory
+// override never appears on a daemon command (TestGuestArtifactsDirOverrideIsDevOnly).
+func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.listen, "listen", nodeKubeletListen, "address for the kubelet HTTP API (logs/exec)")
@@ -229,8 +247,19 @@ func runNode(args []string) error {
 	fs.StringVar(&opts.dnsVIP, "dns-vip", "", "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only; standalone `k3sm node` binds no resolver — leave unset, see the startup log)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
-	var kubeletClientCA string
-	fs.StringVar(&kubeletClientCA, "kubelet-client-ca", "", "PEM CA certificate the kubelet HTTP API verifies the apiserver's client cert against (required with --serve-tls; the cluster's signing CA, e.g. /var/lib/k3sm/server/tls/signing-ca.crt)")
+	// B176: standalone `k3sm node` has no PKI of its own, so the anchor its
+	// :10250 verifies the apiserver's client cert against can only be named by
+	// the operator. Registered here rather than in runNode so the whole
+	// standalone flag surface stays assertable from one function.
+	fs.StringVar(&opts.kubeletClientCAPath, "kubelet-client-ca", "", "PEM CA certificate the kubelet HTTP API verifies the apiserver's client cert against (required with --serve-tls; the cluster's signing CA, e.g. /var/lib/k3sm/server/tls/signing-ca.crt)")
+}
+
+// runNode registers this Mac as a Virtual Kubelet node and runs pods via the
+// selected runtime (M0 walking skeleton + M1 runtimed image runtime).
+func runNode(args []string) error {
+	fs := flag.NewFlagSet("node", flag.ExitOnError)
+	opts := nodeOptions{}
+	registerNodeFlags(fs, &opts)
 	_ = fs.Parse(args)
 	opts.standalone = true
 
@@ -240,10 +269,10 @@ func runNode(args []string) error {
 	// cluster's client CA is — and being unable to name it is a refusal, not a
 	// reason to drop back to the pre-B176 unauthenticated listener.
 	if opts.serveTLS {
-		if kubeletClientCA == "" {
+		if opts.kubeletClientCAPath == "" {
 			return fmt.Errorf("--serve-tls requires --kubelet-client-ca: the kubelet HTTP API (logs/exec/attach/port-forward) authenticates the apiserver by client certificate and is never served unauthenticated")
 		}
-		caPEM, err := os.ReadFile(kubeletClientCA)
+		caPEM, err := os.ReadFile(opts.kubeletClientCAPath)
 		if err != nil {
 			return fmt.Errorf("read --kubelet-client-ca: %w", err)
 		}
@@ -853,6 +882,22 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		// container re-exec (B26), so `kubectl describe pod` on a crash-looping pod
 		// shows the crash loop in its Events table.
 		cfg.Recorder = recorder
+		// Guest boot artifacts (B108), ensured HERE — at daemon start, before the
+		// runtime that boots from them exists — and never lazily on a pod's first
+		// CreateVM. Doing it here is the whole posture: a hundred-megabyte fetch on
+		// the critical path of a scheduled pod would turn a slow network into a pod
+		// that times out with no useful reason, and would leave the node advertising
+		// a capability it had not yet earned.
+		//
+		// It CANNOT fail this function. Ensure decides the degradation itself and
+		// returns only a boolean (see GuestArtifactSource.Ensure): a node with an
+		// unminted pin, no network, or a rotted cache still runs every native pod it
+		// has, advertises VMArtifactsAvailable=false, and fails vm pods closed. Do
+		// NOT "harden" this into a startup error — it is the same rule the startup
+		// pod reap follows, and for the same reason.
+		if art, ok := (provider.GuestArtifactSource{}).Ensure(ctx, cfg.Root, slog.Default()); ok {
+			cfg.GuestArtifacts = &art
+		}
 		adapter, err := buildPodNetAdapter(opts)
 		if err != nil {
 			return nil, nil, "", provider.NodeCapabilities{}, err
@@ -1043,6 +1088,12 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs
 		// helper mode (a pod must never drive netd).
 		DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
+		// The Service proxy's transport-override seam (M11.3-d2/B237). A vm pod
+		// publishes the /32 its guest was allocated, and the guest's macOS-assigned
+		// vmnet lease is what actually carries bytes; the provider is the only
+		// component holding both, so it feeds the map. nil here (no datapath) leaves
+		// the feed inert.
+		TransportOverrides: opts.transportOverrides,
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).
@@ -1323,6 +1374,11 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// discipline as the virtualization label above.
 	applyRosettaLabels(n, caps)
 
+	// Guest boot artifacts (B108): present only when THIS daemon start ensured and
+	// digest-verified the pinned kernel + initramfs. Same presence-only discipline;
+	// see LabelVMArtifacts for why it is advertised but not selected on.
+	applyVMArtifactsLabel(n, caps.VMArtifacts)
+
 	n.Status.NodeInfo.OperatingSystem = "darwin"
 	// Architecture is the machine's NATIVE ISA (the same derived value as the
 	// kubernetes.io/arch label above) and stays arm64 on a Rosetta-capable Apple
@@ -1406,6 +1462,20 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 // `exists`-style nodeSelector on a node that LOST the capability.
 func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 	setLabelPresence(n, runtimeclass.LabelVirtualization, vmCapable)
+}
+
+// applyVMArtifactsLabel sets (present) or CLEARS (!present) the
+// k3sm.io/vm-artifacts node label advertising that this node's pinned guest boot
+// artifacts were ensured and digest-verified at daemon start (B108).
+//
+// Like applyVirtualizationLabel it is a thin named alias for setLabelPresence, so
+// the set-or-DELETE mechanism keeps exactly one implementation. The delete
+// direction is the load-bearing one here: artifact availability is re-derived on
+// EVERY start (ensure re-verifies rather than trusting a marker), so a node whose
+// cache rotted, whose pin moved, or whose network went away must stop advertising
+// between one start and the next.
+func applyVMArtifactsLabel(n *corev1.Node, present bool) {
+	setLabelPresence(n, runtimeclass.LabelVMArtifacts, present)
 }
 
 // applyRosettaLabels sets or CLEARS the two Rosetta translation-capability node

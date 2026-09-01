@@ -6,7 +6,9 @@
 k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/arm64 analog of
 [k3s](https://github.com/k3s-io/k3s). Pods run as **native Darwin processes: zero Linux, no VM in
 the default path**, isolated with macOS's own primitives (Seatbelt, `lo0`/vmnet, wireguard-go,
-launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS).
+launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS). An
+EXPERIMENTAL `vm` RuntimeClass adds an opt-in path that boots `linux/arm64` OCI images in a
+per-pod micro-VM — see Shipped, below.
 
 This is a k3s-style three-horizon roadmap. Where a capability is implemented but not yet
 proven on real hardware, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
@@ -21,9 +23,10 @@ conformance criteria passed**, together with the full install/uninstall lifecycl
 the first live-hardware proof of the packaged single-node path. The remaining live-hardware and
 two-Mac gates are burned down in M7. What works:
 
-- **Native Darwin-process pods, zero Linux.** OCI images ship an arm64 Mach-O payload (never
-  `/System`); the runtime `posix_spawn`s them **in place at host paths** — no chroot, SIP-compatible.
-  *(validated on macOS 26.5.1)*
+- **Native Darwin-process pods, zero Linux on the default path.** OCI images ship an arm64
+  Mach-O payload (never `/System`); the runtime `posix_spawn`s them **in place at host paths** —
+  no chroot, SIP-compatible. *(validated on macOS 26.5.1)* Linux images run too, opt-in, under the
+  `vm` RuntimeClass below.
 - **Seatbelt isolation.** A generated **default-deny SBPL profile** per pod (read `/System`+the pod
   dir, write only the pod's APFS data volume, network scoped to the pod IP). *(validated)*
 - **One `k3sm server`.** A single binary embeds the upstream apiserver / scheduler /
@@ -39,19 +42,21 @@ two-Mac gates are burned down in M7. What works:
 - **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
   (workloads must select `kubernetes.io/os=darwin`). *(implemented; the live RBAC flip is a
   dev-mac gate)*
-- **`vm` RuntimeClass — dispatch only, and it does not run a Pod yet.** A fail-closed dispatch to a
-  Virtualization.framework Linux micro-VM for Linux-only images (e.g. Postgres). What is shipped is
-  the *dispatch*: the RuntimeClass, the fail-closed backend selection, the capability labels, and
-  the scheduler overhead accounting. **No Pod has ever booted in a micro-VM.** The helper that would
-  build and boot the guest is not written yet, so this is engineering still to do, not a machine
-  waiting to be found. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64` only — see Next.
+- **`vm` RuntimeClass — EXPERIMENTAL, preview-quality.** A fail-closed dispatch to a
+  Virtualization.framework Linux micro-VM for `linux/arm64` images (e.g. Postgres): the RuntimeClass,
+  the fail-closed backend selection, the capability labels, the scheduler overhead accounting, and
+  PVC-backed storage. Guest boot and restart are exercised and measured on the reference hardware
+  (see [docs/user/limitations.md](docs/user/limitations.md)); serving traffic as a Service backend
+  and in-guest cluster DNS are not wired yet. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64`
+  only — see Next.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
   logging, node lifecycle Events. Proven by k3sm's own synthetic-conformance criteria — **not** a
-  CNCF `[Conformance]` pass (k3sm has no Linux containers). The honest self-assessment —
+  CNCF `[Conformance]` pass (the default path, which the suite targets, runs no Linux containers).
+  The self-assessment —
   targeted feature classes mapped to a green criterion or a documented ceiling — is
   [`docs/conformance-profile.md`](docs/conformance-profile.md).
 - **MLX — native Apple-Silicon ML serving (the NVIDIA-GPU-Operator analog for Mac).** Schedule
@@ -119,10 +124,10 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
 ### Non-goals (deliberate)
 
-- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images are destined
-  for the EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack) once it runs, never the default
-  path.
+- **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images run only
+  under the EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack, `linux/arm64` only), never
+  the default path.
 - **A single node is one trust domain.** Same-node pods share `lo0` and a uid — Seatbelt bounds
   filesystem/network *reach*, but there are no per-pod network namespaces or uid isolation.
   Untrusted multi-tenancy is out of scope for the native path; the `vm` RuntimeClass is the
-  intended boundary, and it does not run yet.
+  intended boundary, and it is EXPERIMENTAL preview-quality today.

@@ -48,7 +48,7 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 
 	t.Run("unprivileged helper worker", func(t *testing.T) {
 		t.Parallel()
-		cfg := workerNetserveConfig(opts, res, hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/run/netd.sock"}, nil)
+		cfg := workerNetserveConfig(opts, res, hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/run/netd.sock"}, false, nil)
 		if cfg.MeshEgressIP != res.MeshIP {
 			t.Errorf("MeshEgressIP = %q, want %q (the join-assigned mesh-egress /32)", cfg.MeshEgressIP, res.MeshIP)
 		}
@@ -76,7 +76,7 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 
 	t.Run("network none worker", func(t *testing.T) {
 		t.Parallel()
-		cfg := workerNetserveConfig(opts, res, hostnet.Mode{Backend: hostnet.BackendNone}, nil)
+		cfg := workerNetserveConfig(opts, res, hostnet.Mode{Backend: hostnet.BackendNone}, false, nil)
 		if !cfg.Disabled {
 			t.Error("Disabled = false, want true (--network none runs no datapath)")
 		}
@@ -120,7 +120,7 @@ func TestAgentPathShimFlag(t *testing.T) {
 		if opts.pathShim != staged {
 			t.Fatalf("agent --path-shim = %q, want %q", opts.pathShim, staged)
 		}
-		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
 		if nodeOpts.pathShim != staged {
 			t.Errorf("worker nodeOptions.pathShim = %q, want %q (the flag must reach the in-process node)", nodeOpts.pathShim, staged)
 		}
@@ -135,7 +135,7 @@ func TestAgentPathShimFlag(t *testing.T) {
 		if opts.pathShim != "" {
 			t.Errorf("agent --path-shim default = %q, want empty", opts.pathShim)
 		}
-		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
 		if got := runtimedConfig(nodeOpts, nil).PathShim; got != resolvePathShim() {
 			t.Errorf("worker RuntimedConfig.PathShim with no flag = %q, want the sibling-dylib fallback %q", got, resolvePathShim())
 		}
@@ -145,7 +145,7 @@ func TestAgentPathShimFlag(t *testing.T) {
 		t.Parallel()
 		const dnsStaged = "/Library/k3sm-dev/libk3sm_getaddrinfo_shim.dylib"
 		opts := parseAgent(t, "--dns-shim", dnsStaged)
-		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper})
+		nodeOpts := agentNodeOptions(opts, res, "/var/lib/k3sm/agent/node.kubeconfig", hostnet.Mode{Backend: hostnet.BackendHelper}, nil)
 		if got := runtimedConfig(nodeOpts, nil).DyldShim; got != dnsStaged {
 			t.Errorf("worker RuntimedConfig.DyldShim = %q, want the explicit --dns-shim %q", got, dnsStaged)
 		}

@@ -23,7 +23,7 @@ limitations under the License.
 // the launchd plist rendering, and the fake live here.
 //
 // The Homebrew formula / goreleaser config / brew post_install kickstart hook /
-// notarization + designated-requirement entitlements that DRIVE these commands
+// notarization + designated-requirement entitlements that drive these commands
 // are the packaging follow-up (DESIGN §5c) — out of scope here.
 package install
 
@@ -102,9 +102,9 @@ type System interface {
 	// EnsureServiceUser idempotently creates name as a no-login system user
 	// (home = DefaultDataRoot, owned by it) and returns its uid.
 	EnsureServiceUser(name string) (uid uint32, err error)
-	// CopyToRootOwned copies src to EXACTLY dst (creating dst's parent dir
+	// CopyToRootOwned copies src to exactly dst (creating dst's parent dir
 	// root:wheel 0755), leaving dst root:wheel 0755 with signature/xattrs
-	// preserved. dst is the full installed path — NEVER derived from src's
+	// preserved. dst is the full installed path — never derived from src's
 	// basename: the LaunchDaemon plists exec the fixed installedBinary() path, so
 	// a build artifact named e.g. `k3sm-m2` must still land at InstallDir/k3sm (a
 	// basename-derived dst bricks both daemons with launchd's unrecoverable
@@ -112,9 +112,9 @@ type System interface {
 	CopyToRootOwned(src, dst string) error
 	// EnsureLogDir creates (or repairs) the daemons' log directory owned by the
 	// service uid (group staff, 0755) so launchd can open the UserName=_k3sm
-	// server job's StandardOut/ErrorPath AS _k3sm. launchd auto-creates a missing
-	// log dir with root-only perms when the ROOT netd job spawns first — the
-	// _k3sm server job then fails "Service could not initialize" and NEVER
+	// server job's StandardOut/ErrorPath as _k3sm. launchd auto-creates a missing
+	// log dir with root-only perms when the root netd job spawns first — the
+	// _k3sm server job then fails "Service could not initialize" and never
 	// spawns (the live M2-gate failure this fixes). Idempotent: perms/owner are
 	// re-applied on every install, repairing a previously mis-created dir.
 	EnsureLogDir(dir string, uid uint32) error
@@ -126,17 +126,17 @@ type System interface {
 	// label is a no-op success).
 	LaunchctlBootout(label string) error
 	// LaunchctlKickstart (re)starts the labelled daemon (launchctl kickstart -k).
-	// It returns as soon as the restart is REQUESTED — not when the old instance
+	// It returns as soon as the restart is requested — not when the old instance
 	// is gone — so a caller that must observe the new instance pairs it with
 	// LaunchctlServicePID.
 	LaunchctlKickstart(label string) error
 	// LaunchctlServicePID returns the pid launchd currently reports for the
-	// labelled job, or 0 when the job is LOADED but not running (the respawn
+	// labelled job, or 0 when the job is loaded but not running (the respawn
 	// window, or a job that has exited and not yet been relaunched). A label that
 	// is not loaded at all is an error. It is read-only.
 	LaunchctlServicePID(label string) (int, error)
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
-	// ~/.kube/config, owned by targetUser (NOT root).
+	// ~/.kube/config, owned by targetUser (not root).
 	WriteUserKubeconfig(targetUser string, contents []byte) error
 	// RemoveAll removes a path tree (the install dir on uninstall).
 	RemoveAll(path string) error
@@ -192,6 +192,13 @@ type Config struct {
 	// in-pod cluster DNS reaches the per-node resolver. Defaults to the DNSShimName
 	// sibling of BinarySource.
 	DNSShimSource string
+	// VMHostSource is the k3sm-vmhost VM-host helper binary to install beside the
+	// binary, from which sandbox.FindVMHost resolves it for vm-RuntimeClass pods.
+	// The helper carries its own ad-hoc signature and the
+	// com.apple.security.virtualization entitlement — install copies it verbatim
+	// (see CopyToRootOwned) and never re-signs it. Defaults to the VMHostName
+	// sibling of BinarySource.
+	VMHostSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
@@ -238,6 +245,9 @@ func (c Config) withDefaults() Config {
 	if c.DNSShimSource == "" && c.BinarySource != "" {
 		c.DNSShimSource = filepath.Join(filepath.Dir(c.BinarySource), DNSShimName)
 	}
+	if c.VMHostSource == "" && c.BinarySource != "" {
+		c.VMHostSource = filepath.Join(filepath.Dir(c.BinarySource), VMHostName)
+	}
 	return c
 }
 
@@ -262,6 +272,12 @@ func (c Config) installedPathShim() string {
 // binary, where runtimedConfig resolves it next to the executable.
 func (c Config) installedDNSShim() string {
 	return filepath.Join(c.InstallDir, DNSShimName)
+}
+
+// installedVMHost is the path the k3sm-vmhost VM-host helper is copied to —
+// beside the binary, the first place sandbox.FindVMHost probes.
+func (c Config) installedVMHost() string {
+	return filepath.Join(c.InstallDir, VMHostName)
 }
 
 // plistPath is the LaunchDaemon plist path for a label.
@@ -296,14 +312,14 @@ const (
 	// dispInstallDirCovered lives under InstallDir and is removed by the single
 	// RemoveAll(InstallDir) sweep — never individually (that would double-remove).
 	dispInstallDirCovered
-	// dispPreserve is installed but DELIBERATELY kept on uninstall: DataRoot (kine
-	// state.db + mesh keys — nuking it loses data on reinstall), the human
-	// kubeconfig (may hold other clusters), the _k3sm user, LogDir.
+	// dispPreserve is installed but kept on uninstall: DataRoot (kine state.db +
+	// mesh keys — nuking it loses data on reinstall), the human kubeconfig (may
+	// hold other clusters), the _k3sm user, LogDir.
 	dispPreserve
 )
 
 // artifact is one thing install lays down. Every path is derived from a Config
-// accessor/const — NEVER a re-hardcoded /Library/... literal (a third copy of a
+// accessor/const — never a re-hardcoded /Library/... literal (a third copy of a
 // path is the same divergence bug B62 fixes). A daemon binds its Label and
 // plistPath into one entry so a booted-out label can never leave a leaked
 // KeepAlive plist (the original leak).
@@ -313,16 +329,16 @@ type artifact struct {
 	path  string // file/dir/plist path; empty for kindServiceUser/kindKubeconfig
 	label string // launchd label for kindDaemon; empty otherwise
 	user  string // user name for kindServiceUser/kindKubeconfig; empty otherwise
-	// assertExists records whether the path is expected on disk TODAY. It is
+	// assertExists records whether the path is expected on disk today. It is
 	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
 	// + relocated k3sm-netd): the packaging follow-up owns moving cp/kine off
 	// DataRoot into InstallDir, so those paths do not exist yet. The manifest
-	// proves the DISPOSITION (InstallDir-covered), not on-disk presence — that
+	// proves the disposition (InstallDir-covered), not on-disk presence — that
 	// follow-up lights them up with no manifest change.
 	assertExists bool
 }
 
-// artifactManifest is the SINGLE source of truth for what install lays down and
+// artifactManifest is the single source of truth for what install lays down and
 // how uninstall tears it down. It is a pure func(Config) — hermetic and testable
 // — deriving every path from the existing Config accessors/consts. Both Install
 // (lay-down order + plist paths) and Uninstall (reverse-order teardown) consume
@@ -332,7 +348,7 @@ func artifactManifest(cfg Config) []artifact {
 	cfg = cfg.withDefaults()
 	items := []artifact{
 		// The _k3sm service user — created before the server daemon can resolve it.
-		// PRESERVED: its home IS DataRoot; removing it orphans the data root.
+		// Preserved: its home is DataRoot; removing it orphans the data root.
 		{kind: kindServiceUser, disp: dispPreserve, user: cfg.ServiceUser},
 
 		// The InstallDir tree — the single RemoveAll(InstallDir) sweep on uninstall.
@@ -351,6 +367,10 @@ func artifactManifest(cfg Config) []artifact {
 		// The getaddrinfo DNS shim beside the binary — injected into each pod so an
 		// in-pod cluster-name lookup reaches the per-node resolver. Covered by the sweep.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedDNSShim(), assertExists: true},
+		// The k3sm-vmhost VM-host helper beside the binary (sandbox.FindVMHost's
+		// first probe) — vm-RuntimeClass pods cannot boot without it. Covered by
+		// the sweep.
+		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedVMHost(), assertExists: true},
 		// The control-plane payload staged into InstallDir/bin (the daemon boot
 		// seeds its workdir from it — no gh/go under launchd). Covered by the sweep.
 	}
@@ -363,30 +383,30 @@ func artifactManifest(cfg Config) []artifact {
 	// The kine version marker rides beside the kine binary it describes: it is what tells
 	// the daemon's work-dir seed which kine pin+variant was staged, so a pin change reaches
 	// an already-booted node instead of being masked by the old binary's mere presence.
-	// assertExists is FALSE — an archive produced before markers existed still installs, and
+	// assertExists is false — an archive produced before markers existed still installs, and
 	// the seed falls back to rebuilding rather than trusting bytes nothing vouched for.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName), assertExists: false})
 	items = append(items, []artifact{
-		// FORWARD-DECLARED: the cp-payload bin tree + relocated k3sm-netd land
+		// Forward-declared: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
-		// do NOT exist on disk today (cp/kine land under DataRoot at runtime), so
-		// existence is NOT asserted; the InstallDir sweep already covers them.
+		// do not exist on disk today (cp/kine land under DataRoot at runtime), so
+		// existence is not asserted; the InstallDir sweep already covers them.
 		{kind: kindDir, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin"), assertExists: false},
 		{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", "k3sm-netd"), assertExists: false},
 
-		// The two LaunchDaemons — netd BEFORE server (install order: netd is
-		// bootstrapped first, the server depends on it). Each REMOVED on uninstall:
-		// Bootout(label) THEN RemoveAll(plistPath). Removing the plist is the B62
-		// fix — previously the label was booted out but the plist LEAKED, leaving a
+		// The two LaunchDaemons — netd before server (install order: netd is
+		// bootstrapped first, the server depends on it). Each removed on uninstall:
+		// Bootout(label) then RemoveAll(plistPath). Removing the plist is the B62
+		// fix — previously the label was booted out but the plist leaked, leaving a
 		// phantom KeepAlive respawn-throttle root job pointing at a deleted binary.
 		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
 		{kind: kindDaemon, disp: dispRemove, label: ServerLabel, path: cfg.plistPath(ServerLabel), assertExists: true},
 
-		// The admin kubeconfig in the human's home — PRESERVED (it may hold other
+		// The admin kubeconfig in the human's home — preserved (it may hold other
 		// clusters; k3sm never owns the whole file).
 		{kind: kindKubeconfig, disp: dispPreserve, user: cfg.TargetUser},
 
-		// PRESERVED privileged state: DataRoot (kine state.db + mesh keys) and the
+		// Preserved privileged state: DataRoot (kine state.db + mesh keys) and the
 		// daemon LogDir. Both survive an uninstall→reinstall.
 		{kind: kindDir, disp: dispPreserve, path: cfg.DataRoot, assertExists: false},
 		{kind: kindDir, disp: dispPreserve, path: LogDir, assertExists: false},
@@ -442,7 +462,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	}
 	cfg.Logger.Info("ensured service user", "user", cfg.ServiceUser, "uid", uid)
 
-	// 1b. The log dir must be writable by the SERVICE user before either daemon
+	// 1b. The log dir must be writable by the service user before either daemon
 	//     bootstraps: launchd opens a UserName job's StandardOut/ErrorPath as
 	//     that user, and if the root netd job's spawn auto-creates the dir first
 	//     (root-only perms), the _k3sm server job fails "Service could not
@@ -451,7 +471,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
 	}
 
-	// 2. Copy the binary to the EXACT path the plists exec (installedBinary()),
+	// 2. Copy the binary to the exact path the plists exec (installedBinary()),
 	//    regardless of the source artifact's name. It lands under InstallDir, so
 	//    the InstallDir sweep covers it on uninstall.
 	if err := sys.CopyToRootOwned(cfg.BinarySource, cfg.installedBinary()); err != nil {
@@ -478,6 +498,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := sys.CopyToRootOwned(cfg.DNSShimSource, cfg.installedDNSShim()); err != nil {
 		return fmt.Errorf("install: copy getaddrinfo DNS shim to %s: %w (build it with darwin-net/hack/build-shim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedDNSShim(), err)
 	}
+	// 2b‴. Copy the k3sm-vmhost VM-host helper beside the binary. runtimed's
+	//      sandbox.FindVMHost resolves it next to the executable for
+	//      vm-RuntimeClass pods. The helper is ad-hoc signed with the
+	//      com.apple.security.virtualization entitlement, and CopyToRootOwned
+	//      (ditto) carries that signature through verbatim — install never
+	//      re-signs it, matching every other sibling binary here.
+	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.installedVMHost()); err != nil {
+		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.installedVMHost(), err)
+	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to
 	//     `gh`/`go` acquisition, which cannot exist under launchd as _k3sm (the
@@ -490,12 +519,12 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 			return fmt.Errorf("install: stage control-plane payload %s: %w (run `k3sm payload %s` first — the launchd daemon cannot acquire binaries itself)", name, err, cfg.PayloadSource)
 		}
 	}
-	//     The kine version marker is staged BEST-EFFORT beside the payload, and the error
-	//     is deliberately ignored: an archive produced before markers existed simply does
-	//     not have one, and its absence must not fail an install. It also cannot fail
-	//     silently in the dangerous direction — an unmarked payload is one the daemon's
-	//     work-dir seed REFUSES to trust (it rebuilds, or reports), rather than one it
-	//     stamps with a pin nothing vouched for.
+	//     The kine version marker is staged best-effort beside the payload, and the error
+	//     is ignored: an archive produced before markers existed simply does not have
+	//     one, and its absence must not fail an install. It also cannot fail silently
+	//     in the dangerous direction — an unmarked payload is one the daemon's work-dir
+	//     seed refuses to trust (it rebuilds, or reports), rather than one it stamps
+	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName))
 
@@ -513,14 +542,14 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 
-	// 4. (Re)start in manifest order: netd FIRST (root helper), then the server
+	// 4. (Re)start in manifest order: netd first (root helper), then the server
 	//    (depends on it) — the manifest lists netd before server. Each label is
-	//    BOOTED OUT first (idempotent — a not-loaded label is a no-op), then
-	//    bootstrapped: `launchctl bootstrap` on an ALREADY-loaded label does NOT
+	//    booted out first (idempotent — a not-loaded label is a no-op), then
+	//    bootstrapped: `launchctl bootstrap` on an already-loaded label does not
 	//    re-exec an updated on-disk binary — the stale daemon keeps running the old
 	//    code, so a reinstall/upgrade (or a live rebuild between acceptance runs)
 	//    would silently serve the superseded binary. bootout blocks until the old
-	//    job unloads, so the following bootstrap always (re)starts the FRESH binary.
+	//    job unloads, so the following bootstrap always (re)starts the fresh binary.
 	for _, a := range m {
 		if a.kind != kindDaemon {
 			continue
@@ -533,7 +562,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 
-	// 5. Write the admin kubeconfig to the HUMAN's home (owned by them, not root).
+	// 5. Write the admin kubeconfig to the human's home (owned by them, not root).
 	if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
 		return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
 	}
@@ -541,18 +570,18 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	return nil
 }
 
-// Uninstall tears down every artifact install laid down, driven by the SAME
+// Uninstall tears down every artifact install laid down, driven by the same
 // manifest install consumes — so nothing install creates can be left behind
 // (the B62 leak was the two plists, which the old hardcoded uninstall never
-// removed). It walks the manifest in REVERSE install order: the server daemon
+// removed). It walks the manifest in reverse install order: the server daemon
 // before netd (server first stops driving the helper; netd's SIGTERM handler
-// then flushes lo0/pf/utun), each daemon torn down as Bootout(label) THEN
+// then flushes lo0/pf/utun), each daemon torn down as Bootout(label) then
 // RemoveAll(plistPath) so the label and its plist never diverge. InstallDir-
 // covered artifacts are swept by the single RemoveAll(InstallDir); dispPreserve
 // artifacts (DataRoot's kine state.db + mesh keys, the human kubeconfig, the
-// _k3sm user, LogDir) are DELIBERATELY left in place. It is idempotent: a
-// bootout of a not-loaded label and a RemoveAll of an absent path are both
-// no-op successes, so re-running after a partial install (or twice) is safe.
+// _k3sm user, LogDir) are left in place. It is idempotent: a bootout of a
+// not-loaded label and a RemoveAll of an absent path are both no-op successes,
+// so re-running after a partial install (or twice) is safe.
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
 	var firstErr error
@@ -561,7 +590,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			firstErr = err
 		}
 	}
-	// safeRemove guards every ROOT RemoveAll: it refuses a non-absolute path or one
+	// safeRemove guards every root RemoveAll: it refuses a non-absolute path or one
 	// fewer than two segments deep, so an operator fat-finger (e.g. a Config with
 	// InstallDir="/" or "/Library") can never hand "/" or a filesystem root to a
 	// root-privileged RemoveAll. The normal targets (/Library/k3sm, the two
@@ -586,10 +615,10 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			continue
 		case dispRemove:
 			if a.kind == kindDaemon {
-				// Bootout THEN remove the plist — binding them so a booted-out label
+				// Bootout then remove the plist — binding them so a booted-out label
 				// can never leave a leaked KeepAlive plist (the B62 leak). But if
-				// bootout returns a REAL error (not the idempotent not-loaded case,
-				// which returns nil), the root job may still be LOADED — do NOT delete
+				// bootout returns a real error (not the idempotent not-loaded case,
+				// which returns nil), the root job may still be loaded — do not delete
 				// its plist definition (that would orphan a live root job until reboot,
 				// a variant of the same leak). Record the error and leave the plist.
 				if err := sys.LaunchctlBootout(a.label); err != nil {
@@ -611,7 +640,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// no daemon removes on the way out — netd tracks per-connection alias caps
 	// (not cleanup), the server's pod teardown misses anything a failed run
 	// leaked, the Service VIP aliases (API + DNS VIPs) live for the daemon's
-	// lifetime, and the node's own mesh-egress .1 is deliberately OUTSIDE the pod
+	// lifetime, and the node's own mesh-egress .1 is outside the pod
 	// stale-sweep range. Scope: the pinned cluster pod aggregate + the Service
 	// CIDR — exactly the address space k3sm ever aliases (never the host's own
 	// addresses). Uninstall runs as root, so this is direct ifconfig, no helper.
@@ -657,17 +686,17 @@ func NetdPlist(cfg Config) []byte {
 // 256 default, which floors the budget at 8192 with NO headroom for the
 // co-resident apiserver/kine.
 //
-// 131072 is deliberate: it is ≤ kern.maxfilesperproc (245760 on Apple Silicon) so
-// it BINDS. The k3s Linux value (1048576) EXCEEDS the macOS per-process ceiling
+// 131072 is chosen because it is ≤ kern.maxfilesperproc (245760 on Apple Silicon)
+// so it binds. The k3s Linux value (1048576) exceeds the macOS per-process ceiling
 // and would be clamped by the kernel, voiding the budget's half-for-UDP /
 // half-for-control-plane split. 131072 yields a UDP flow budget of 65536
 // (rl.Cur/2), ~8× the 8192 floor, leaving the control plane the other half.
 //
-// RELOAD CONTRACT: launchd applies *ResourceLimits at process SPAWN from the job
-// definition captured at bootstrap — so this raised limit binds on a FRESH
-// install or an uninstall→install (bootout→bootstrap), NOT on
+// Reload contract: launchd applies *ResourceLimits at process spawn from the job
+// definition captured at bootstrap — so this raised limit binds on a fresh
+// install or an uninstall→install (bootout→bootstrap), not on
 // `launchctl kickstart -k`, which respawns the existing in-memory job with the
-// OLD limit. Existing installs need a reinstall for the new limit to bind.
+// old limit. Existing installs need a reinstall for the new limit to bind.
 const serverFileLimit = 131072
 
 // ServerPlist renders the io.k3sm.server LaunchDaemon plist. It runs as the
@@ -779,7 +808,7 @@ func renderPlist(p launchdPlist) []byte {
 		writeKeyInt(&b, "ExitTimeOut", p.ExitTimeOut)
 	}
 	if p.SoftFileLimit > 0 {
-		// Emit BOTH Soft and Hard NumberOfFiles: a soft limit may never exceed the
+		// Emit both Soft and Hard NumberOfFiles: a soft limit may never exceed the
 		// hard one, and an MDM-managed Mac may set a finite launchd hard limit that
 		// would clamp a soft-only raise — launchd (PID 1) can raise the hard limit
 		// up to the kernel ceiling, so we set both to the requested value.
