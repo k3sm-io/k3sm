@@ -26,7 +26,7 @@ limitations under the License.
 //   - hostnet.Mode (network=none rootless / network=direct root) selects the
 //     datapath posture.
 //
-// Honest positioning (docs/conformance-profile.md, docs/UPSTREAM-ALIGNMENT.md):
+// Honest positioning (docs/conformance-profile.md):
 // this is "more than envtest — a real control plane + a real single node," NOT
 // "kind" — k3sm is deliberately non-conformant, so the SAFE (declarative API,
 // develop freely) vs NEEDS-datapath vs UNFAITHFUL axis is warned at every entry
