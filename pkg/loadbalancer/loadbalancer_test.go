@@ -114,3 +114,72 @@ func TestLoadBalancerForwardsToHealthy(t *testing.T) {
 		t.Errorf("echo = %q, want ping (LB did not forward to the healthy upstream)", buf)
 	}
 }
+
+// TestLoadBalancerDeliversResponseAfterClientHalfClose pins the half-duplex case the
+// apiserver LB exists to carry: a client that finishes its request and half-closes must
+// still receive the WHOLE response. That is `kubectl logs -f`, `exec`, and every watch —
+// the client stops writing early and then reads for a long time.
+//
+// The upstream here deliberately sends only AFTER it has observed the client's EOF, and
+// sends a payload far larger than any socket buffer, so a forwarder that tears the pair
+// down when the first copy direction ends cannot accidentally satisfy the read: it has
+// already closed both conns before the response exists. The brief pause after the EOF
+// removes the last ordering coincidence; it does not weaken the assertion, which is
+// byte-exact delivery of the full payload.
+func TestLoadBalancerDeliversResponseAfterClientHalfClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const payload = 1 << 20 // 1 MiB: bigger than any loopback socket buffer
+
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	defer upstream.Close()
+	sawEOF := make(chan struct{})
+	go func() {
+		c, err := upstream.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// Drain the request; the read ends when the client half-closes.
+		_, _ = io.Copy(io.Discard, c)
+		close(sawEOF)
+		// A real apiserver goes on streaming here for as long as the watch lives.
+		time.Sleep(50 * time.Millisecond)
+		_, _ = c.Write(make([]byte, payload))
+	}()
+
+	lb := New([]string{upstream.Addr().String()}, func(context.Context, string) bool { return true }, nil)
+	front, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen front: %v", err)
+	}
+	go func() { _ = lb.serveListener(ctx, front) }()
+
+	conn, err := net.DialTimeout("tcp", front.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial LB: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	if _, err := conn.Write([]byte("GET /watch")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	// The client is done writing — exactly what an in-flight watch looks like.
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("half-close: %v", err)
+	}
+	<-sawEOF
+
+	n, err := io.Copy(io.Discard, conn)
+	if err != nil {
+		t.Fatalf("read response after the half-close: %v (got %d of %d bytes)", err, n, payload)
+	}
+	if n != payload {
+		t.Errorf("received %d bytes, want %d — the forward truncated the response at the client's half-close", n, payload)
+	}
+}
