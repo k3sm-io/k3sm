@@ -21,11 +21,16 @@ When in doubt, the profile wins.
 - **Pods are native Darwin processes.** There are **no Linux containers, cgroups, CNI, or network
   namespaces**, and no device-plugins or hugepages. Anything that assumes those substrates does not
   apply.
-- **Best-effort resource model.** There is **no CFS millicore CPU enforcement** — CPU `limits` are not
-  enforced, `HPA`-on-CPU is **unservable**, and `kubectl top` needs an **operator-installed
-  metrics-server** (k3sm does not ship one; there is no CPU accounting behind `metrics.k8s.io`). Memory
-  is sampled (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement,
-  and there is no node-pressure eviction guarantee.
+- **Best-effort resource model.** There is **no CFS millicore CPU enforcement** on the native path —
+  CPU `limits` are not enforced and `HPA`-on-CPU is **unservable**. Memory is sampled
+  (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement, and
+  there is no node-pressure eviction guarantee. `kubectl top` always needs an **operator-installed
+  metrics-server** — k3sm does not ship one.
+  The **`vm` RuntimeClass differs**: a guest is a real Linux kernel, so each container gets a cgroup2
+  leaf and the node publishes genuine per-container CPU **and** memory for `vm` Pods on the
+  `metrics.k8s.io` scrape target. Native Pods publish neither, because that endpoint emits the
+  CPU/memory pair jointly or not at all. A `vm` Pod's memory ceiling is still the guest's whole-VM
+  size rather than a per-container limit — see [vm-runtimeclass.md](vm-runtimeclass.md).
 - **Workloads must be adapted.** A raw upstream `[Conformance]` Pod — one that assumes a Linux image,
   bind mounts, or Linux-only fields — is rejected at admission or stranded. Images are the k3sm native
   image model (see [images.md](images.md)), not arbitrary OCI Linux images.
@@ -236,10 +241,15 @@ names against the DNS VIP with the correct search-list / ndots expansion. Three 
 **On `--runtime hostprocess`, in-pod cluster DNS is not wired.** No shim, no cluster DNS
 configuration — every lookup from inside a Pod goes to the host resolver.
 
-**On the `vm` RuntimeClass, in-pod cluster DNS is not wired either.** A guest owns its own network
-stack, and the guest-network path that would carry the cluster resolver into it is not built yet — a
-`vm` Pod also reports the **node's** IP as its `podIP` rather than a guest address. Treat in-guest
-service discovery as unavailable; see [vm-runtimeclass.md](vm-runtimeclass.md).
+**On the `vm` RuntimeClass, in-pod cluster DNS works.** The guest brings up its interface, leases an
+address on the node's NAT segment, and installs a default route; `/etc/resolv.conf` is written by the
+guest with the cluster resolver and search list, and lookups reach the cluster DNS VIP. Resolving a
+service FQDN and connecting to the returned ClusterIP are both exercised on the reference hardware.
+
+Two caveats remain. A guest's musl resolver may ignore `options ndots`, so prefer a **fully qualified**
+service name (`svc.ns.svc.cluster.local`) from inside a `vm` Pod rather than relying on the search
+list to complete a short name. And a guest's link MTU is 1500 and the link will not lower it, so
+cross-node `vm` traffic is not claimed in this release.
 
 ### UDP Services (non-DNS) — deferred
 
@@ -281,9 +291,12 @@ different tracks:
 
 - The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod
   end to end — create-to-Running restarts measure a 165 ms median on the reference hardware
-  (the figures below) — but the install-time artifact chain is not wired yet: the guest kernel
-  and initramfs it boots are dev-provided, not fetched and verified at install. Treat the whole
-  path as preview-quality. It is targeted at the **v0.1.0** public release as
+  (the figures below), and one idle Pod with a 512 MiB guest costs about **46 MB of host memory**,
+  because the hypervisor allocates guest RAM lazily rather than reserving it. The guest kernel and
+  initramfs are digest-pinned and verified on every node start. Treat the path as preview-quality:
+  what is measured is single-node, and a multi-image Pod is not supported — every container in a
+  `vm` Pod shares one root filesystem, so a Pod naming two different images runs the second
+  container's command against the first container's image. It is targeted at the **v0.1.0** release as
   EXPERIMENTAL and **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for
   a later release), and is **launch-gated**: announced only if its live lab proof is green against
   the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed, with published
