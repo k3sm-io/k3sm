@@ -5,10 +5,12 @@ user-facing mental model.
 
 ## Pods are native Darwin processes
 
-k3sm has **no Linux, no containers, no cgroups, no CNI, no network namespaces**. A Pod's containers are
-launched as native macOS processes (`posix_spawn`), Seatbelt-confined, with an APFS-cloned root. This is
-the fundamental difference from every Linux Kubernetes distribution and the reason several behaviors
-diverge — see [limitations.md](limitations.md).
+On the default path, k3sm has **no Linux, no containers, no cgroups, no CNI, no network
+namespaces**. A Pod's containers are launched as native macOS processes (`posix_spawn`),
+Seatbelt-confined, with an APFS-cloned root. This is the fundamental difference from every Linux
+Kubernetes distribution and the reason several behaviors diverge — see
+[limitations.md](limitations.md). An EXPERIMENTAL `vm` RuntimeClass opts a Pod into a real Linux
+guest instead — see [vm-runtimeclass.md](vm-runtimeclass.md).
 
 ## The control plane
 
@@ -26,9 +28,10 @@ processes rather than a container runtime.
 
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
 same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads the **`vm`
-RuntimeClass** is the intended isolation boundary — but it does not run a Pod yet, so today the
-honest answer is that this node is one trust domain. See [vm-runtimeclass.md](vm-runtimeclass.md). The
-rationale lives in [privilege-model.md](../privilege-model.md). This is the same framing you will see in
+RuntimeClass** is the intended isolation boundary — it boots and runs a Pod, but it is EXPERIMENTAL
+and preview-quality, so treat one node as one trust domain until it is validated for your workload.
+See [vm-runtimeclass.md](vm-runtimeclass.md). The rationale lives in
+[privilege-model.md](../privilege-model.md). This is the same framing you will see in
 [limitations.md](limitations.md).
 
 ## Images

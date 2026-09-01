@@ -127,10 +127,11 @@ packages a Mac binary into an ordinary OCI image; `k3sm image push` puts it in
 your registry; nodes pull it the ordinary way. What you cannot do is reach for
 an existing public image and expect it to run.
 
-## The honest summary
+## Summary
 
-k3sm is not a way to run the containers you already have. It is a way to run **Mac-native
-workloads** — including ones that need Metal, CoreML, `codesign` or Xcode, which no Linux VM can
-give you — with Kubernetes semantics and the OCI toolchain around them. If your workload is a Linux
-binary you cannot rebuild, this is the wrong tool today, and
-[limitations.md](limitations.md) says so at greater length.
+The default path runs **Mac-native workloads** — including ones that need Metal, CoreML,
+`codesign` or Xcode, which no Linux VM can give you — with Kubernetes semantics and the OCI
+toolchain around them. Unmodified `linux/arm64` images run too, opt-in, through the EXPERIMENTAL
+`vm` RuntimeClass described above; `linux/amd64` images do not run yet. If your workload is a
+Linux binary you cannot rebuild and the `vm` path does not cover it,
+[limitations.md](limitations.md) has the full picture.

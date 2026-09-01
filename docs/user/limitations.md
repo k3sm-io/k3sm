@@ -124,7 +124,8 @@ Today at `main`, per port class:
     wildcard.
   - **An explicit bind to another Pod's address still works.** The rewrite touches only wildcard binds;
     the trust domain is unchanged. Same-node Pods share one `_k3sm` OS trust domain — the `vm`
-    RuntimeClass is the intended boundary for untrusted workloads, and does not run yet.
+    RuntimeClass is the intended boundary for untrusted workloads; it is EXPERIMENTAL and
+    preview-quality (see below).
   - **A grandchild process that outlives Pod teardown** can keep a socket on the address after it is
     freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
 
@@ -178,8 +179,9 @@ that is an accepted risk of the ServiceLB model k3s also ships, not an oversight
 
 A pod's per-pod IP is **addressing/identity only**: binds are port-scoped on shared interfaces, and
 Seatbelt cannot express per-IP network filters on macOS 26. A per-pod IP is therefore **never
-network isolation** — any same-node process can dial any pod IP. Untrusted workloads need the vm
-RuntimeClass, same as above — and it does not run yet, so today there is no answer for them.
+network isolation** — any same-node process can dial any pod IP. Untrusted workloads need the `vm`
+RuntimeClass, same as above; it is EXPERIMENTAL and preview-quality, so validate it against your
+own workload before relying on it here too.
 
 ### Ingress TLS keys and Secrets at rest
 
