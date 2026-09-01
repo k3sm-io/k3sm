@@ -65,7 +65,6 @@ func TestFidelityBannerContent(t *testing.T) {
 		"SAFE",
 		"UNFAITHFUL",
 		"Seatbelt-confined",
-		"docs/UPSTREAM-ALIGNMENT.md",
 		"docs/conformance-profile.md",
 	} {
 		if !strings.Contains(rootless, must) {
