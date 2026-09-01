@@ -247,3 +247,71 @@ func TestServerNetserveWiresTheMeshEgressSource(t *testing.T) {
 		}
 	}
 }
+
+// TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane is the ordering pin for
+// the second defect the first real --mesh-ip boot exposed.
+//
+// runServer hands --mesh-ip to the executor as the apiserver's BindAddress at step
+// 1, but for M14.2 the only code that ever plumbed that address was mesh.Start —
+// at step 4b, three phases later. So a mesh IP that is not already a host address
+// dies at `listen tcp 100.64.0.1:6444: bind: can't assign requested address`
+// before any of this file's other pins can even be reached, and the operator has
+// to alias it by hand. The M14.2 lab tier booted --mesh-ip 127.0.0.1, which every
+// host already answers on, so the ordering was never exercised.
+//
+// The ensure must therefore precede BOTH the executor's construction and its
+// Start. Its no-mesh behaviour is not asserted here but in the ensure itself
+// (ensureMeshIPAliasWith returns before touching anything on an empty mesh IP);
+// what IS asserted structurally is that runServer passes opts.meshIP through
+// rather than calling it under some other predicate — the same shape
+// ensureMeshPeerCRD uses one phase later.
+func TestRunServerEnsuresTheMeshIPAliasBeforeTheControlPlane(t *testing.T) {
+	fset, body := runServerBody(t)
+	first := firstCallPositions(body)
+
+	for _, name := range []string{"ensureMeshIPAlias", "executor.NewSupervised", "exec.Start"} {
+		if _, ok := first[name]; !ok {
+			t.Fatalf("runServer never calls %s — a --mesh-ip the host does not already answer on cannot be bound, so bring-up dies before any other wiring runs", name)
+		}
+	}
+	for _, want := range []struct{ before, after, why string }{
+		{"ensureMeshIPAlias", "executor.NewSupervised", "the executor is built with --mesh-ip as the apiserver BindAddress"},
+		{"ensureMeshIPAlias", "exec.Start", "the apiserver binds the mesh IP the moment the control plane starts"},
+		{"ensureMeshIPAlias", "enrollSelfAndBringUpMesh", "mesh.Start plumbs the same alias far too late to serve the apiserver's bind"},
+	} {
+		if first[want.before] >= first[want.after] {
+			t.Errorf("runServer calls %s at %s, NOT before %s at %s — %s",
+				want.before, fset.Position(first[want.before]),
+				want.after, fset.Position(first[want.after]), want.why)
+		}
+	}
+
+	var call *ast.CallExpr
+	ast.Inspect(body, func(n ast.Node) bool {
+		c, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if ident, ok := c.Fun.(*ast.Ident); ok && ident.Name == "ensureMeshIPAlias" && call == nil {
+			call = c
+		}
+		return true
+	})
+	if call == nil {
+		t.Fatal("runServer's ensureMeshIPAlias call could not be read back")
+	}
+	passesMeshIP := false
+	for _, arg := range call.Args {
+		sel, ok := arg.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+		if x, ok := sel.X.(*ast.Ident); ok && x.Name == "opts" && sel.Sel.Name == "meshIP" {
+			passesMeshIP = true
+		}
+	}
+	if !passesMeshIP {
+		t.Errorf("runServer's ensureMeshIPAlias at %s is not passed opts.meshIP — the single-node posture's no-op is what keeps this call free there",
+			fset.Position(call.Pos()))
+	}
+}
