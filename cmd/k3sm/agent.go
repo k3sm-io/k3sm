@@ -23,10 +23,12 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"k8s.io/client-go/kubernetes"
@@ -130,15 +132,53 @@ func runAgent(args []string) error {
 		return err
 	}
 
-	bootstrapURL := fmt.Sprintf("https://%s:%d", opts.server, bootstrapPort)
-	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName, "nodeIP", opts.nodeIP)
+	// The wireguard identity: minted once, persisted 0600, reused across restarts
+	// for the same reason — the public key derived from it is what every peer
+	// programs, so a per-start key rotates this node's MeshPeer on every restart and
+	// strands the mesh until each peer re-reconciles.
+	meshPriv, meshPub, err := loadOrCreateMeshKey(opts.workDir, meshKeyRef)
+	if err != nil {
+		return err
+	}
+	logger.Info("mesh identity", "node", opts.nodeName, "publicKey", meshPub, "keyRef", meshKeyRef)
+
+	// The join client is built HERE rather than left to bootstrap.Join so its dialer
+	// can report which of this Mac's addresses reaches the control plane — the one
+	// fact the mesh endpoint below has to be derived from. It is still the CA-pinned
+	// client; pinnedJoinClient layers only the dialer onto it.
+	tok, err := bootstrap.ParseToken(opts.token)
+	if err != nil {
+		return err
+	}
+	joinClient, joinDialer, err := pinnedJoinClient(tok.CAHash)
+	if err != nil {
+		return err
+	}
+	joinHost := net.JoinHostPort(opts.server, strconv.Itoa(bootstrapPort))
+	joinDialer.probe(ctx, joinHost)
+
+	// The advertised wireguard endpoint is an UNDERLAY address, never opts.nodeIP:
+	// that flag carries this node's MESH InternalIP, and a peer must dial the
+	// underlay to open the handshake that creates the mesh in the first place.
+	meshEndpoint, err := underlayMeshEndpoint(joinDialer.localIP(), opts.nodeIP, opts.meshPort)
+	if err != nil {
+		return err
+	}
+
+	bootstrapURL := "https://" + joinHost
+	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
+		"nodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
 	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
 		Server:       bootstrapURL,
 		Token:        opts.token,
 		NodeName:     opts.nodeName,
 		NodeIP:       opts.nodeIP,
 		NodePassword: password,
-		MeshEndpoint: fmt.Sprintf("%s:%d", opts.nodeIP, opts.meshPort),
+		MeshEndpoint: meshEndpoint,
+		HTTPClient:   joinClient,
+		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
+		// back as exactly this value and is what bringUpMesh programs below.
+		WGPrivateKeyB64: meshPriv,
 	})
 	if err != nil {
 		return fmt.Errorf("join: %w", err)
