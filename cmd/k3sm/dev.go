@@ -51,7 +51,7 @@ Tiers:
 Develop freely here (SAFE): reconcile-only CRD operators (CRD-ensure/render/CEL/conditions up to Ready)
 and macOS-native single-process workloads. Operators that depend on Service/ClusterIP delivery, cluster
 DNS, Service-backed webhooks, NetworkPolicy isolation, metrics.k8s.io, or lifecycle Events diverge here —
-see docs/conformance-profile.md and docs/UPSTREAM-ALIGNMENT.md before relying on those.
+see docs/conformance-profile.md before relying on those.
 
 NOT kind: k3sm is deliberately non-conformant. This framing is internal dev tooling.
 `
