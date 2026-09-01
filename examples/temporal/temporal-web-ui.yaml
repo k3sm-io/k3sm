@@ -1,0 +1,84 @@
+# temporal-web-ui — the standalone Temporal Web UI as a second Linux Pod.
+#
+# OPTIONAL. temporal-dev-server.yaml already serves the Web UI on port 8233 from
+# the same process, and for a single-machine setup that is the shape to use. This
+# manifest exists to show the multi-Pod form — the one a production Temporal
+# deployment has, where the UI server is a separate image that reaches the
+# frontend over the network — and to demonstrate one Linux Pod consuming another
+# through a Service.
+#
+# > The `vm` RuntimeClass is EXPERIMENTAL and preview-quality. See
+# > docs/user/vm-runtimeclass.md and docs/user/limitations.md before depending on it.
+#
+# It depends on temporal-dev-server.yaml being applied first: TEMPORAL_ADDRESS
+# names that Pod's Service. Two properties of the `vm` path make that line what it
+# is rather than the shorter form:
+#
+#   * A guest resolves cluster DNS — its /etc/resolv.conf carries the cluster
+#     resolver — but its resolver may ignore `options ndots`, so the address is
+#     FULLY QUALIFIED rather than the bare Service name.
+#   * The address is the SERVICE, never the frontend Pod's IP. A `vm` Pod's pod IP
+#     is its published identity and not a live address; traffic reaches a guest
+#     through the Service proxy.
+#
+# No probe is declared. On this path only exec probes reach into a guest, and an
+# exec probe would have to assume an HTTP client exists inside this image; with no
+# readinessProbe the container is Ready once it is running, which is what puts it
+# into the Service's endpoints.
+#
+#   kubectl apply -f examples/temporal/temporal-web-ui.yaml
+#   kubectl get pod temporal-ui -o wide
+#   open http://127.0.0.1:30808
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temporal-ui
+  namespace: default
+  labels:
+    app: temporal-ui
+spec:
+  runtimeClassName: vm
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: ui
+      # Multi-arch on Docker Hub with a linux/arm64 manifest, as the `vm` path
+      # requires. The image's entrypoint starts the UI server, so no command here.
+      image: docker.io/temporalio/ui:2.53.3
+      env:
+        - name: TEMPORAL_ADDRESS
+          value: temporal-frontend.default.svc.cluster.local:7233
+        - name: TEMPORAL_UI_PORT
+          value: "8080"
+      ports:
+        - name: http
+          containerPort: 8080
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-ui
+  namespace: default
+  labels:
+    app: temporal-ui
+spec:
+  type: NodePort
+  selector:
+    app: temporal-ui
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30808
+      protocol: TCP

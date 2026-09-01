@@ -56,11 +56,21 @@ type JoinOptions struct {
 	// 0600 once, then reuses it so the first-write-wins binding keeps matching).
 	NodePassword string
 	// MeshEndpoint is the host:port the node's wireguard is reachable at (advertised
-	// to peers).
+	// to peers). It must be an UNDERLAY address: a peer dials it to OPEN the
+	// handshake, so an address inside the mesh is unreachable by definition. The
+	// agent derives it from the source address of this join's own connection (see
+	// underlayMeshEndpoint).
 	MeshEndpoint string
 	// RequestedPodCIDR is an optional requested pod /24; empty asks the server to
 	// assign one.
 	RequestedPodCIDR string
+	// WGPrivateKeyB64 is this node's PERSISTED wireguard private key, whose public
+	// half is enrolled. Supplying it is how a node keeps ONE mesh identity across
+	// restarts: a key minted per join rotates the public key every peer has
+	// programmed, so each restart blackholes this node until every peer
+	// re-reconciles. Empty mints a fresh keypair (the zero value stays usable), and
+	// an unusable value fails the join rather than falling through to a mint.
+	WGPrivateKeyB64 string
 	// HTTPClient overrides the default pinned-CA client (tests inject one). When nil,
 	// Join builds a client that verifies the server's chain against the token's CA
 	// hash.
@@ -87,8 +97,12 @@ type JoinResult struct {
 	Peers                 []netv1.MeshPeerSpec
 	WGPrivateKeyB64       string
 	WGPublicKeyB64        string
-	// APIServers are the control-plane apiserver endpoints (host:port) for this node's
-	// client-side load-balancer (M6.1); empty for a single-server cluster.
+	// APIServers are the control-plane apiserver endpoints (host:port) this node
+	// targets. A multi-node server advertises the address its apiserver actually
+	// binds — its MESH IP — so this, not the underlay --server the join travelled
+	// over, is where the node's kubeconfig and its client-side load-balancer (M6.1)
+	// must point. Empty only when the server serves no mesh (single-node), where
+	// the joined-over address is the apiserver's address too.
 	APIServers []string
 }
 
@@ -120,6 +134,10 @@ func PinnedClient(caHash string) *http.Client {
 // mesh-enroll request, and return the issued certs, cluster CA, and mesh snapshot.
 // The node's client/serving private keys and its wireguard private key NEVER leave
 // the node (only CSRs and the wireguard PUBLIC key are sent).
+//
+// The wireguard identity is the caller's persisted one when opts.WGPrivateKeyB64
+// is set, and freshly minted otherwise — see that field for why a worker must
+// supply it.
 func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	tok, err := ParseToken(opts.Token)
 	if err != nil {
@@ -146,9 +164,14 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 		return nil, fmt.Errorf("generate serving CSR: %w", err)
 	}
 
-	wgPriv, wgPub, err := GenerateWireguardKey()
-	if err != nil {
-		return nil, fmt.Errorf("generate wireguard key: %w", err)
+	wgPriv, wgPub := opts.WGPrivateKeyB64, ""
+	if wgPriv == "" {
+		wgPriv, wgPub, err = GenerateWireguardKey()
+		if err != nil {
+			return nil, fmt.Errorf("generate wireguard key: %w", err)
+		}
+	} else if wgPub, err = WireguardPublicKey(wgPriv); err != nil {
+		return nil, fmt.Errorf("derive the public key of this node's persisted wireguard key: %w", err)
 	}
 
 	reqBody := JoinRequest{

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -187,9 +188,51 @@ func (s *FileTokenStore) save(recs []fileToken) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("write token store: %w", err)
 	}
+	// The store is CROSS-USER as well as cross-process: `sudo k3sm token create`
+	// runs as root while the supervisor reads the file as the service user. A
+	// root-written store must therefore keep the owner the daemon reads as —
+	// otherwise the 0600 mode locks the daemon out and every join 401s with
+	// "read token store: permission denied" (observed live). Root adopts the
+	// owner of the existing store, else of the store's directory; a non-root
+	// writer changes nothing (it could not chown anyway).
+	if err := adoptStoreOwner(tmp, s.path); err != nil {
+		return fmt.Errorf("commit token store: %w", err)
+	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		return fmt.Errorf("commit token store: %w", err)
 	}
 	committed = true
 	return nil
 }
+
+// adoptStoreOwner chowns tmp to the owner of path (or path's directory when the
+// store does not exist yet) when running as root. It is a no-op for a non-root
+// writer. Split out so the decision is testable without privilege.
+func adoptStoreOwner(tmp, path string) error {
+	if geteuid() != 0 {
+		return nil
+	}
+	ref := path
+	if _, err := os.Stat(ref); err != nil {
+		ref = filepath.Dir(path)
+	}
+	st, err := os.Stat(ref)
+	if err != nil {
+		return fmt.Errorf("stat owner reference %s: %w", ref, err)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	if err := chown(tmp, int(sys.Uid), int(sys.Gid)); err != nil {
+		return fmt.Errorf("adopt owner of %s: %w", ref, err)
+	}
+	return nil
+}
+
+// geteuid and chown are seams so adoptStoreOwner's decision runs under test
+// without real privilege.
+var (
+	geteuid = os.Geteuid
+	chown   = os.Chown
+)
