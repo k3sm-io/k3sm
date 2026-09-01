@@ -9,10 +9,23 @@ path; [install.md](install.md) explains what happens underneath.
 ## 1. Install
 
 ```sh
-curl -fsSL https://k3sm.io/install.sh | sh   # downloads, sha256-verifies, runs sudo k3sm install
-# or, once the tap ships:
-#   brew install k3sm-io/tap/k3sm && sudo k3sm install
+curl -fsSL https://k3sm.io/install.sh | sh
 ```
+
+The script checks that this is an Apple silicon Mac on macOS 26+, downloads the release tarball and
+its checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do, and
+then runs `sudo k3sm install`. It installs the newest published release — and until the first stable
+version is tagged, that means the newest pre-release. Pin a particular one with
+`K3SM_INSTALL_VERSION=v0.1.0`, or set `K3SM_INSTALL_DOWNLOAD_ONLY=1` to download and verify into the
+current directory without running anything as root.
+
+Two alternatives:
+
+- **Homebrew**, once the tap ships: `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
+- **From source**, if you would rather build it yourself: clone the four `k3sm.io` repositories side
+  by side, build with `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm`, then run `sudo ./k3sm install`.
+  The full steps are in the
+  [repository README](https://github.com/k3sm-io/k3sm#quick-start).
 
 The one-time admin step (`sudo k3sm install`, which the script runs for you after printing what it
 is about to do) creates the unprivileged `_k3sm` user, installs the LaunchDaemons, and writes an

@@ -76,9 +76,12 @@ fi
 
 # ---- fixtures ---------------------------------------------------------------
 WORK="$(mktemp -d /tmp/b137.XXXXXX)"
-SERVER_PIDS=()
+# The pids go to FILES, not an array: start_server is called in a command
+# substitution, so its subshell's `$!` never reaches this scope — the array
+# stayed empty and every mock server outlived the run. A leaked server also
+# holds the inherited stderr open, which hangs any `B137.sh | tail`.
 cleanup() {
-	for p in "${SERVER_PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+	for f in "$WORK"/pid-*; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
 	rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -112,13 +115,41 @@ STUB
 mk_release 9.9.9 good
 mk_release 6.6.6 corrupt
 mk_release 5.5.5 missing-entry
+mk_release 7.7.7 good   # the NEWER of the two pre-stable releases
+mk_release 4.4.4 good   # the older one, listed FIRST by the API fixture
 
 # ---- the loopback mock release server ---------------------------------------
 cat >"$WORK/server.py" <<'PY'
-import http.server, os, socketserver, sys
+import http.server, json, os, socketserver, sys
 
 ROOT = sys.argv[1]
-MODE = sys.argv[2]  # "ok" | "zerorelease"
+MODE = sys.argv[2]  # "ok" | "zerorelease" | "prerelease" | "badtag"
+
+
+def rel(tag, published):
+    """One release object shaped like the live API's: the nested author and
+    asset objects are present precisely because the resolver must NOT pick up
+    their timestamps."""
+    return {
+        "url": "http://x/releases/1", "html_url": "http://x/releases/tag/" + tag,
+        "id": 1, "author": {"login": "a", "id": 2, "created_at": "1999-01-01T00:00:00Z"},
+        "tag_name": tag, "name": tag, "draft": False, "prerelease": True,
+        "created_at": published, "published_at": published,
+        "assets": [{"id": 3, "name": "k3sm.tar.gz",
+                    "created_at": "1999-01-01T00:00:00Z",
+                    "updated_at": "1999-01-01T00:00:00Z"}],
+    }
+
+
+# The NEWER release is listed SECOND on purpose: the live endpoint is not
+# ordered newest-first (verified against the real repo), so a resolver that
+# takes element 0 installs the wrong version.
+API = {
+    "prerelease": [rel("v4.4.4", "2026-01-01T00:00:00Z"),
+                   rel("v7.7.7", "2026-06-01T00:00:00Z")],
+    "badtag": [rel("v9.9.9/../../../etc/passwd", "2026-06-01T00:00:00Z")],
+}
+
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -127,6 +158,11 @@ class H(http.server.BaseHTTPRequestHandler):
         if p == "/releases/latest":
             target = "/releases/tag/v9.9.9" if MODE == "ok" else "/releases"
             self.send_response(302); self.send_header("Location", target); self.end_headers()
+            return
+        if p.startswith("/releases?"):
+            body = json.dumps(API.get(MODE, [])).encode()
+            self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers()
+            if send_body: self.wfile.write(body)
             return
         if p in ("/releases", "/releases/tag/v9.9.9"):
             body = b"releases page\n"
@@ -151,8 +187,8 @@ PY
 
 start_server() { # <mode> — echoes the port
 	local portfile="$WORK/port-$1"
-	python3 "$WORK/server.py" "$FIXROOT" "$1" >"$portfile" &
-	SERVER_PIDS+=($!)
+	python3 "$WORK/server.py" "$FIXROOT" "$1" >"$portfile" 2>>"$WORK/server-err.log" &
+	echo $! >"$WORK/pid-$1"
 	local i=0
 	while [ ! -s "$portfile" ]; do
 		i=$((i + 1))
@@ -163,8 +199,12 @@ start_server() { # <mode> — echoes the port
 }
 PORT_OK="$(start_server ok)"
 PORT_ZERO="$(start_server zerorelease)"
+PORT_PRE="$(start_server prerelease)"
+PORT_BADTAG="$(start_server badtag)"
 BASE_OK="http://127.0.0.1:$PORT_OK/releases"
 BASE_ZERO="http://127.0.0.1:$PORT_ZERO/releases"
+BASE_PRE="http://127.0.0.1:$PORT_PRE/releases"
+BASE_BADTAG="http://127.0.0.1:$PORT_BADTAG/releases"
 
 # ---- PATH stubs (uniform: sudo, uname, sw_vers, sysctl) ---------------------
 STUBS="$WORK/stubs"
@@ -370,6 +410,26 @@ if [ "$CASE_RC" -eq 0 ] && banner_before_sudo && sudo_ran; then
 	ladder ok "b137.T14 cached-sudo path: pre-escalation banner precedes every sudo line"
 else
 	ladder no "b137.T14 cached-sudo path: pre-escalation banner precedes every sudo line (rc=$CASE_RC)"
+fi
+
+# T15 — the pre-stable channel: no stable release, so releases/latest resolves
+# nothing and the newest release of any kind is taken from the releases API.
+# The fixture lists the OLDER release first, so position-based selection fails.
+run_case t15 K3SM_INSTALL_BASE_URL="$BASE_PRE"
+if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
+	&& has 'k3sm_7.7.7_darwin_arm64.tar.gz' && ! has '4.4.4'; then
+	ladder ok "b137.T15 pre-stable fallback: newest prerelease by published_at, not by position"
+else
+	ladder no "b137.T15 pre-stable fallback: newest prerelease by published_at, not by position (rc=$CASE_RC)"
+fi
+
+# T16 — a path-traversing tag from the releases API is refused outright; it is
+# never quoted into a download URL or an asset name.
+run_case t16 K3SM_INSTALL_BASE_URL="$BASE_BADTAG"
+if [ "$CASE_RC" -ne 0 ] && has 'refusing an unusable release tag' && no_exec; then
+	ladder ok "b137.T16 hostile resolved tag: refused before any fetch, nothing executed"
+else
+	ladder no "b137.T16 hostile resolved tag: refused before any fetch, nothing executed (rc=$CASE_RC)"
 fi
 
 echo "----------------------------------------"
