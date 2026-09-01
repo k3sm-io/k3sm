@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"k8s.io/client-go/kubernetes"
@@ -52,7 +53,7 @@ const meshKeyRef = "node.key"
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.
 type agentOptions struct {
-	server    string // control-plane mesh host (the join + apiserver target)
+	server    string // control-plane UNDERLAY host (the join target; apiserver fallback only)
 	token     string // K10<caHash>::<user>:<secret>
 	nodeName  string
 	nodeIP    string // this node's mesh InternalIP (bound into the issued certs)
@@ -82,7 +83,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
-	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
+	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port to dial on the control plane (the HOST is not this flag: it comes from the apiserver endpoint the join advertises — the server's mesh IP — falling back to --server)")
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
@@ -185,8 +186,15 @@ func runAgent(args []string) error {
 	}
 	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 
-	apiserverURL := fmt.Sprintf("https://%s:%d", opts.server, opts.apiPort)
+	// The apiserver this worker targets is the SERVER'S MESH address, not the
+	// underlay --server it just joined over (see workerAPIServerURL). Writing the
+	// kubeconfig here — before bringUpMesh — is only a file write; every dial
+	// against this URL happens after the tunnel exists (the MeshPeer watcher's
+	// informer starts after mesh.Start, and the datapath + node clients are built
+	// later still), which is the ordering the mesh-IP URL requires.
+	apiserverURL := workerAPIServerURL(res, opts.server, opts.apiPort)
 	kubeconfigPath := filepath.Join(opts.workDir, "node.kubeconfig")
+	logger.Info("apiserver target for this node", "url", apiserverURL, "advertised", res.APIServers)
 	if err := writeNodeKubeconfig(kubeconfigPath, apiserverURL, opts.nodeName, res); err != nil {
 		return err
 	}
@@ -425,6 +433,60 @@ func loadOrCreateNodePassword(workDir string) (string, error) {
 		return "", fmt.Errorf("persist node-password: %w", err)
 	}
 	return pw, nil
+}
+
+// workerAPIServerURL derives the apiserver URL a joined worker targets: the base
+// of its node kubeconfig, and so of every client the worker builds off it (the
+// MeshPeer watcher, the Service proxy + kube-dns ensure, the VK node
+// registration).
+//
+// The HOST is the control plane's OWN advertised apiserver endpoint
+// (bootstrap.JoinResult.APIServers) whenever the join carried one, because a
+// multi-node server binds its apiserver on the mesh interface and NOTHING else
+// (`k3sm server --mesh-ip` sets BindAddress to the mesh IP), so the only address
+// that answers is reachable through the wireguard tunnel. serverHost — the
+// agent's `--server` — cannot stand in for it: it is an UNDERLAY address by
+// construction (the join must reach <host>:9345 before this node has any mesh),
+// and dialing the apiserver there is refused by construction. That was the live
+// defect: the worker wrote https://<underlay>:6444, every dial was refused, and
+// the virtual-kubelet never registered.
+//
+// It falls back to serverHost when the join advertised no usable endpoint — a
+// non-mesh server joined remotely, where the underlay address IS where the
+// apiserver listens. The PORT is always apiPort: the advertised endpoint
+// contributes only the host, and `--api-port` keeps its role as the port.
+func workerAPIServerURL(res *bootstrap.JoinResult, serverHost string, apiPort int) string {
+	host := serverHost
+	if advertised := advertisedAPIServerHost(res); advertised != "" {
+		host = advertised
+	}
+	return "https://" + net.JoinHostPort(host, strconv.Itoa(apiPort))
+}
+
+// advertisedAPIServerHost returns the host of the first DIALABLE apiserver
+// endpoint the join response advertised, or "" when it advertised none. An
+// endpoint whose host is missing or unspecified (":6444", "0.0.0.0:6444") is not
+// dialable, so it is skipped rather than turned into a dead URL — the caller then
+// keeps its `--server` fallback, which is at least an address that once answered.
+func advertisedAPIServerHost(res *bootstrap.JoinResult) string {
+	if res == nil {
+		return ""
+	}
+	for _, endpoint := range res.APIServers {
+		host := strings.TrimSpace(endpoint)
+		// A bare host (no port) fails SplitHostPort; keep it as-is then.
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if host == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(host); err == nil && addr.IsUnspecified() {
+			continue
+		}
+		return host
+	}
+	return ""
 }
 
 // writeNodeKubeconfig writes a 0600 kubeconfig that authenticates as the issued
