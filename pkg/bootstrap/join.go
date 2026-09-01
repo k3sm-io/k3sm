@@ -56,7 +56,10 @@ type JoinOptions struct {
 	// 0600 once, then reuses it so the first-write-wins binding keeps matching).
 	NodePassword string
 	// MeshEndpoint is the host:port the node's wireguard is reachable at (advertised
-	// to peers).
+	// to peers). It must be an UNDERLAY address: a peer dials it to OPEN the
+	// handshake, so an address inside the mesh is unreachable by definition. The
+	// agent derives it from the source address of this join's own connection (see
+	// underlayMeshEndpoint).
 	MeshEndpoint string
 	// RequestedPodCIDR is an optional requested pod /24; empty asks the server to
 	// assign one.
