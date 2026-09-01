@@ -134,8 +134,23 @@ Today at `main`, per port class:
   - **A grandchild process that outlives Pod teardown** can keep a socket on the address after it is
     freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
 
-  Pods using the `vm` RuntimeClass will have their own network stack behind VZNAT, unaffected by all
-  of the above — see [vm-runtimeclass.md](vm-runtimeclass.md).
+  Pods using the `vm` RuntimeClass have their own network stack behind VZNAT, unaffected by all of the
+  above — see [vm-runtimeclass.md](vm-runtimeclass.md). What a guest can reach was measured on the
+  reference hardware rather than assumed:
+
+  | from a `vm` Pod's guest to | result |
+  |---|---|
+  | another `vm` Pod's guest on the same node | **blocked** — TCP refused, ICMP 100% loss |
+  | a ClusterIP Service, including the cluster DNS VIP | reachable (TCP and UDP) |
+  | the internet, through the NAT gateway | reachable |
+  | another machine on the host's LAN | **blocked** |
+
+  Two consequences worth stating plainly. Guest-to-guest isolation is **stronger** than a shared L2
+  segment would give — a `vm` Pod cannot address its neighbour's guest directly, so same-node `vm`
+  traffic cannot bypass Services. And a guest reaches the internet but not the host's LAN, so a `vm`
+  Pod is not a route onto your local network. Both are properties of the platform's NAT rather than
+  of a k3sm policy engine: they are what was measured here, not a guarantee k3sm enforces, and they
+  are not a substitute for NetworkPolicy.
 
 - **k3sm reserves some ports, and rejects LoadBalancer Services that claim them.** The NodePort range
   `30000-32767` and the kubelet API port `10250` are k3sm's own wildcard listeners; Go sets no
