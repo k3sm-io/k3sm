@@ -14,7 +14,7 @@
 # and staging fails if anything it names is missing at the end.
 #
 #   hack/release/stage.sh <out-dir> [--binary-name <name>] [--stub-payload]
-#                         [--ldflags <flags>] [--vmhost]
+#                         [--ldflags <flags>]
 #
 #   <out-dir>        directory to assemble into (created; must not be under dist/,
 #                    which goreleaser empties with --clean)
@@ -25,14 +25,9 @@
 #   --ldflags        -ldflags value for the k3sm build, e.g. the pkg/version -X
 #                    stamps. Empty (the default) leaves an unstamped dev build,
 #                    which reports its version from the embedded VCS build info.
-#   --vmhost         additionally build k3sm-vmhost and sign it with
-#                    cmd/k3sm-vmhost/vmhost.entitlements. Off by default because
-#                    the goreleaser archive does not carry the helper yet, and a
-#                    file staged but never archived is a lie about what ships.
-#                    `k3sm install` does NOT install it either (it is absent from
-#                    pkg/install.RequiredSiblings); the flag exists for the
-#                    curl-channel artifact set, which ships the helper beside the
-#                    binary so FindVMHost resolves it.
+#   (k3sm-vmhost is always built and signed with
+#   cmd/k3sm-vmhost/vmhost.entitlements: pkg/install.RequiredSiblings names it,
+#   so a stage without it fails the required-artifact loop.)
 #
 # ARCHITECTURE PIN: everything here is darwin/arm64. That is not decoration — a
 # Mac whose Go toolchain runs under Rosetta defaults to GOARCH=amd64, so an
@@ -48,7 +43,6 @@ WS_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 BINARY_NAME="k3sm"
 STUB_PAYLOAD=0
 LDFLAGS=""
-WITH_VMHOST=0
 OUT=""
 
 die() { echo "stage: $*" >&2; exit 1; }
@@ -58,7 +52,6 @@ while [ $# -gt 0 ]; do
 	--binary-name) BINARY_NAME="${2:?--binary-name needs a value}"; shift 2 ;;
 	--stub-payload) STUB_PAYLOAD=1; shift ;;
 	--ldflags) LDFLAGS="${2?--ldflags needs a value}"; shift 2 ;;
-	--vmhost) WITH_VMHOST=1; shift ;;
 	-h | --help) sed -n '2,35p' "$0"; exit 0 ;;
 	-*) die "unknown flag: $1" ;;
 	*)
@@ -106,11 +99,9 @@ echo "==> build DYLD shims (runtimed path-rebase, darwin-net getaddrinfo)"
 # carries com.apple.security.virtualization, which is the whole point of it being
 # a separate process (runtimed/pkg/sandbox.VMHostName).
 VMHOST_ENTITLEMENTS="$WS_ROOT/runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
-if [ "$WITH_VMHOST" = 1 ]; then
-	echo "==> build k3sm-vmhost (runtimed)"
-	[ -f "$VMHOST_ENTITLEMENTS" ] || die "vmhost entitlements plist not found at $VMHOST_ENTITLEMENTS"
-	( cd "$WS_ROOT" && go build -trimpath -o "$OUT/k3sm-vmhost" k3sm.io/runtimed/cmd/k3sm-vmhost )
-fi
+echo "==> build k3sm-vmhost (runtimed)"
+[ -f "$VMHOST_ENTITLEMENTS" ] || die "vmhost entitlements plist not found at $VMHOST_ENTITLEMENTS"
+( cd "$WS_ROOT" && go build -trimpath -o "$OUT/k3sm-vmhost" k3sm.io/runtimed/cmd/k3sm-vmhost )
 
 # The control-plane payload. `k3sm payload` downloads the pinned kwok-ci/k8s
 # binaries, builds kine, and — on this path — verifies every downloaded binary
@@ -162,9 +153,7 @@ else
 		sign_and_verify "$f"
 	done
 fi
-if [ "$WITH_VMHOST" = 1 ]; then
-	sign_and_verify "$OUT/k3sm-vmhost" "$VMHOST_ENTITLEMENTS"
-fi
+sign_and_verify "$OUT/k3sm-vmhost" "$VMHOST_ENTITLEMENTS"
 
 # Completeness, derived from the binary's own contract rather than this script's
 # memory of it: adding an artifact to pkg/install.RequiredSiblings reddens here

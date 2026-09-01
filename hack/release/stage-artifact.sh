@@ -14,7 +14,7 @@
 # exists, and for handing someone a binary today.
 #
 #   hack/release/stage-artifact.sh [--version <v>] [--out <dir>] [--stub-payload]
-#                                 [--no-vmhost]
+#                                
 #
 #   --version        version to stamp and name the archive with
 #                    (default: 0.1.0-dev.<short sha of this repo's HEAD>, with
@@ -23,7 +23,6 @@
 #   --stub-payload   stage placeholder control-plane files instead of downloading
 #                    the real ~250 MB pinned set. Shape checks only — the result
 #                    cannot install, and must never be handed to anyone.
-#   --no-vmhost      omit the k3sm-vmhost helper (and with it the vm backend)
 #
 # ARCHIVE NAMING is not free: install.sh resolves
 #   k3sm_<version>_darwin_arm64.tar.gz  and  k3sm_<version>_checksums.txt
@@ -47,7 +46,6 @@ WS_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 VERSION=""
 OUT="$REPO_ROOT/hack/release/out"
 STUB_PAYLOAD=0
-WITH_VMHOST=1
 
 die() { echo "stage-artifact: $*" >&2; exit 1; }
 
@@ -56,7 +54,6 @@ while [ $# -gt 0 ]; do
 	--version) VERSION="${2:?--version needs a value}"; shift 2 ;;
 	--out) OUT="${2:?--out needs a value}"; shift 2 ;;
 	--stub-payload) STUB_PAYLOAD=1; shift ;;
-	--no-vmhost) WITH_VMHOST=0; shift ;;
 	-h | --help) sed -n '2,40p' "$0"; exit 0 ;;
 	*) die "unknown flag: $1 (see --help)" ;;
 	esac
@@ -110,7 +107,6 @@ OUT="$(cd "$OUT" && pwd)"
 
 stage_flags=()
 if [ "$STUB_PAYLOAD" = 1 ]; then stage_flags+=(--stub-payload); fi
-if [ "$WITH_VMHOST" = 1 ]; then stage_flags+=(--vmhost); fi
 # ${a[@]+"${a[@]}"}: an empty array expanded plainly is an unbound-variable error
 # under `set -u` on the bash macOS ships (3.2).
 "$HERE/stage.sh" "$OUT" --ldflags "$LDFLAGS" ${stage_flags[@]+"${stage_flags[@]}"}
@@ -198,10 +194,8 @@ done
 ( cd "$OUT" && shasum -a 256 -c "$CHECKSUMS" >/dev/null ) || die "$ARCHIVE does not match $CHECKSUMS"
 
 codesign --verify --strict "$vdir/k3sm" >/dev/null 2>&1 || die "the archived k3sm fails codesign --verify"
-if [ "$WITH_VMHOST" = 1 ]; then
-	codesign -d --entitlements - "$vdir/k3sm-vmhost" 2>/dev/null | grep -q com.apple.security.virtualization ||
-		die "the archived k3sm-vmhost carries no virtualization entitlement"
-fi
+codesign -d --entitlements - "$vdir/k3sm-vmhost" 2>/dev/null | grep -q com.apple.security.virtualization ||
+	die "the archived k3sm-vmhost carries no virtualization entitlement"
 
 echo "----------------------------------------"
 echo "staged $VERSION into $OUT"
