@@ -92,8 +92,12 @@ type JoinResult struct {
 	Peers                 []netv1.MeshPeerSpec
 	WGPrivateKeyB64       string
 	WGPublicKeyB64        string
-	// APIServers are the control-plane apiserver endpoints (host:port) for this node's
-	// client-side load-balancer (M6.1); empty for a single-server cluster.
+	// APIServers are the control-plane apiserver endpoints (host:port) this node
+	// targets. A multi-node server advertises the address its apiserver actually
+	// binds — its MESH IP — so this, not the underlay --server the join travelled
+	// over, is where the node's kubeconfig and its client-side load-balancer (M6.1)
+	// must point. Empty only when the server serves no mesh (single-node), where
+	// the joined-over address is the apiserver's address too.
 	APIServers []string
 }
 
