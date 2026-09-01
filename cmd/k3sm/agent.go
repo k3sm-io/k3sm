@@ -260,6 +260,16 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source, M10.1)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,
+
+		// B176: the cluster's client-identity (signing) CA, received in the join
+		// response — the anchor this worker's :10250 verifies the apiserver's client
+		// cert against. It is the SAME CA that issued this node's own system:node
+		// credential, so a worker that joined successfully always has it; an empty
+		// value (a server predating the field) makes startNode refuse, which is the
+		// intended failure — a worker's kubelet endpoint is LAN-reachable on the
+		// wildcard bind and is never served unauthenticated.
+		kubeletClientCAPEM: res.ClientCAPEM,
+
 		// The worker's own Service proxy is where its vm pods' live guest leases
 		// are published; nil when the worker runs no datapath.
 		transportOverrides: nodeTransportOverrides(datapath, mode),

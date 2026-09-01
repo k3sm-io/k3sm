@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
@@ -113,6 +114,21 @@ type nodeOptions struct {
 	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
 	domain     string // cluster DNS domain the in-pod shim search list is built from (runtimed)
 	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
+
+	// kubeletClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA)
+	// certificate, in PEM. It is the anchor the kubelet HTTP endpoint (:10250 —
+	// logs, exec, attach, port-forward, stats) verifies the apiserver's client
+	// certificate against, and it is REQUIRED whenever serveTLS is set: the routes
+	// are never served without mutual TLS (B176). `k3sm server` reads it off the
+	// work dir's PKI, `k3sm agent` receives it in its join response, and standalone
+	// `k3sm node --serve-tls` takes it from --kubelet-client-ca.
+	kubeletClientCAPEM []byte
+
+	// kubeletClientCAPath is the standalone `k3sm node --kubelet-client-ca` file
+	// path kubeletClientCAPEM is read from. Only runNode sets it (`k3sm server`
+	// reads the anchor off its work dir, `k3sm agent` off its join response), so
+	// it is empty on every other bring-up.
+	kubeletClientCAPath string
 
 	// podCIDR is this node's pod /24 the runtimed podnet adapter allocates /32s
 	// from — the SAME CIDR the mesh AllowedIPs carry: an enrolled worker's
@@ -231,6 +247,11 @@ func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 	fs.StringVar(&opts.dnsVIP, "dns-vip", "", "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only; standalone `k3sm node` binds no resolver — leave unset, see the startup log)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
+	// B176: standalone `k3sm node` has no PKI of its own, so the anchor its
+	// :10250 verifies the apiserver's client cert against can only be named by
+	// the operator. Registered here rather than in runNode so the whole
+	// standalone flag surface stays assertable from one function.
+	fs.StringVar(&opts.kubeletClientCAPath, "kubelet-client-ca", "", "PEM CA certificate the kubelet HTTP API verifies the apiserver's client cert against (required with --serve-tls; the cluster's signing CA, e.g. /var/lib/k3sm/server/tls/signing-ca.crt)")
 }
 
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
@@ -241,6 +262,22 @@ func runNode(args []string) error {
 	registerNodeFlags(fs, &opts)
 	_ = fs.Parse(args)
 	opts.standalone = true
+
+	// The kubelet endpoint is never served open. `k3sm server` and `k3sm agent`
+	// obtain this anchor from the cluster itself; a standalone node is pointed at
+	// somebody else's cluster by --kubeconfig, so only the operator knows where that
+	// cluster's client CA is — and being unable to name it is a refusal, not a
+	// reason to drop back to the pre-B176 unauthenticated listener.
+	if opts.serveTLS {
+		if opts.kubeletClientCAPath == "" {
+			return fmt.Errorf("--serve-tls requires --kubelet-client-ca: the kubelet HTTP API (logs/exec/attach/port-forward) authenticates the apiserver by client certificate and is never served unauthenticated")
+		}
+		caPEM, err := os.ReadFile(opts.kubeletClientCAPath)
+		if err != nil {
+			return fmt.Errorf("read --kubelet-client-ca: %w", err)
+		}
+		opts.kubeletClientCAPEM = caPEM
+	}
 
 	// B43: fail fast on an explicit --dns-vip (this process has nothing bound on
 	// it) rather than silently injecting a dead VIP; otherwise log once that
@@ -405,12 +442,17 @@ func advertisedNodeIP(opts nodeOptions) string {
 //
 // SECURITY: this opens no port and widens no bind. `k3sm server`/`k3sm agent`
 // already listen on the WILDCARD serverKubeletListen (*:10250), so the kubelet
-// API — whose provider routes are served behind nodeutil.NoAuth(), identity
-// resting on serving-TLS plus network reach (see vkadapter.NewNode) — is
-// reachable at the host's interface addresses with or without this. All that
-// changes is which of those addresses the Node object names. The substitution is
-// therefore gated on wildcardListen: a listener scoped to loopback (standalone
-// `k3sm node`) is never re-advertised at an address it does not serve.
+// API is reachable at the host's interface addresses with or without this. All
+// that changes is which of those addresses the Node object names. The
+// substitution is therefore gated on wildcardListen: a listener scoped to
+// loopback (standalone `k3sm node`) is never re-advertised at an address it does
+// not serve.
+//
+// Reaching the port is no longer the same as being able to use it: since B176 the
+// provider routes (logs, exec, attach, port-forward) require the apiserver's
+// client certificate, verified against the cluster's client-identity CA
+// (provider.KubeletEndpointAuth). Identity rests on that certificate, not on
+// network reach.
 func proxyableNodeIP(opts nodeOptions) string {
 	if !isLoopbackDefault(opts.nodeIP) || !wildcardListen(opts.listen) {
 		return opts.nodeIP
@@ -658,12 +700,22 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		}
 	}
 
+	// The kubelet HTTP API's TLS + auth posture. Both halves are built together and
+	// handed to the adapter together, because serving the provider routes
+	// (logs/exec/attach/port-forward) without either one is the B176 defect; the
+	// adapter refuses a NodeConfig that carries only one of them.
 	var servingTLS *tls.Config
+	var authorizeKubelet func(http.Handler) http.Handler
 	if opts.serveTLS {
-		servingTLS, err = kubeletServingTLS(opts.nodeName, opts.nodeIP, internalIP)
+		auth, aerr := provider.NewKubeletEndpointAuth(opts.kubeletClientCAPEM, slog.Default())
+		if aerr != nil {
+			return fmt.Errorf("kubelet endpoint auth: %w", aerr)
+		}
+		servingTLS, err = kubeletServingTLS(auth, opts.nodeName, opts.nodeIP, internalIP)
 		if err != nil {
 			return fmt.Errorf("kubelet serving tls: %w", err)
 		}
+		authorizeKubelet = auth.Handler
 	}
 
 	// Build the VK node through the adapter: it encapsulates the kubelet HTTP API
@@ -675,12 +727,13 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// status loop can be started right after, with no handshake.
 	var nodeStatus *provider.NodeStatusProvider
 	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
-		Client:         cs,
-		Provider:       prov,
-		HTTPListenAddr: opts.listen,
-		NumWorkers:     4,
-		TLSConfig:      servingTLS, // nil = plain HTTP (M0 path); set = kubelet-serving TLS
-		ConfigureNode:  func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
+		Client:           cs,
+		Provider:         prov,
+		HTTPListenAddr:   opts.listen,
+		NumWorkers:       4,
+		TLSConfig:        servingTLS,       // nil = plain HTTP (M0 path); set = kubelet-serving TLS + required client cert
+		AuthorizeHandler: authorizeKubelet, // nil iff TLSConfig is nil — the adapter enforces the pairing
+		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
 		// into Ready. It receives the node AFTER configureNode stamped it, and
@@ -1511,10 +1564,16 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 // with --kubelet-preferred-address-types=InternalIP) dials that address by IP and
 // verifies the cert against it. The advertised address and the registered
 // InternalIP diverge in the no-datapath posture (see proxyableNodeIP), so both
-// are passed; duplicates and unparseable entries are dropped. ClientAuth is left
-// at NoClientCert: M1 keeps the apiserver's AlwaysAllow posture, so the proxy
-// connects without a client cert.
-func kubeletServingTLS(nodeName string, nodeIPs ...string) (*tls.Config, error) {
+// are passed; duplicates and unparseable entries are dropped.
+//
+// The CLIENT half is not optional and is not this function's to choose: auth
+// stamps tls.RequireAndVerifyClientCert plus the cluster's client-identity CA onto
+// the result, so the listener authenticates the apiserver instead of serving
+// exec/attach to anything that can reach the wildcard bind (B176). Taking auth as
+// a required PARAMETER rather than an optional field is deliberate: there is no
+// argument list that produces a serving config without client authentication, so
+// the posture cannot be lost by forgetting to opt into it.
+func kubeletServingTLS(auth *provider.KubeletEndpointAuth, nodeName string, nodeIPs ...string) (*tls.Config, error) {
 	ips := []net.IP{net.ParseIP("127.0.0.1")}
 	for _, s := range nodeIPs {
 		ip := net.ParseIP(s)
@@ -1530,11 +1589,10 @@ func kubeletServingTLS(nodeName string, nodeIPs ...string) (*tls.Config, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{
+	return auth.ServingTLS(&tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.NoClientCert,
-	}, nil
+	}), nil
 }
 
 func defaultNodeName() string {

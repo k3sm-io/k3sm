@@ -66,6 +66,28 @@ func controllerManagerKubeconfigPath(workDir string) string {
 	return filepath.Join(workDir, "kube-controller-manager.kubeconfig")
 }
 
+// apiServerKubeletClientCertPath / apiServerKubeletClientKeyPath are the client
+// keypair the apiserver PRESENTS to a node's kubelet endpoint
+// (--kubelet-client-certificate / --kubelet-client-key). It is a signing-CA-issued
+// CN=certs.APIServerKubeletClientCN client cert, re-issued on every boot beside the
+// scheduler/KCM identities, and it is the ONLY identity a node's :10250 admits.
+func apiServerKubeletClientCertPath(workDir string) string {
+	return filepath.Join(workDir, "kube-apiserver-kubelet-client.crt")
+}
+func apiServerKubeletClientKeyPath(workDir string) string {
+	return filepath.Join(workDir, "kube-apiserver-kubelet-client.key")
+}
+
+// APIServerKubeletClientCertPath / APIServerKubeletClientKeyPath name the keypair
+// above from outside the package (the rotation report), so the layout is joined in
+// exactly one place — mirroring SchedulerKubeconfigPath.
+func APIServerKubeletClientCertPath(workDir string) string {
+	return apiServerKubeletClientCertPath(workDir)
+}
+func APIServerKubeletClientKeyPath(workDir string) string {
+	return apiServerKubeletClientKeyPath(workDir)
+}
+
 // tokenFilePath is the static token-auth CSV.
 func tokenFilePath(workDir string) string { return filepath.Join(workDir, "tokens.csv") }
 
@@ -693,6 +715,33 @@ users:
 `, apiServerURL(cfg), clusterTLS, cn, cn, b64(certPEM), b64(keyPEM))
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write %s kubeconfig: %w", cn, err)
+	}
+	return nil
+}
+
+// writeAPIServerKubeletClientCert mints the client keypair the apiserver presents
+// to a node's kubelet endpoint (:10250 — logs, exec, attach, port-forward, stats)
+// and writes it beside the per-component kubeconfigs (cert 0644, key 0600).
+//
+// It is issued by the SIGNING CA, which is both the apiserver's --client-ca-file
+// and the anchor every node's kubelet endpoint verifies client certs against — so
+// one CA distribution (the server reads it off disk, a joining worker receives it
+// in its join response) covers the whole cluster. Its CN is the single identity
+// that endpoint authorizes; see certs.APIServerKubeletClientCN for why it carries
+// no Organization.
+//
+// Re-issued on every boot like the component kubeconfigs. That is transparent to
+// the nodes: they pin the CA, never this leaf.
+func writeAPIServerKubeletClientCert(workDir string, h *certs.Hierarchy) error {
+	certPEM, keyPEM, err := h.Signing.IssueClient(certs.APIServerKubeletClientCN, nil, componentCertValidity)
+	if err != nil {
+		return fmt.Errorf("issue %s client cert: %w", certs.APIServerKubeletClientCN, err)
+	}
+	if err := os.WriteFile(apiServerKubeletClientCertPath(workDir), certPEM, 0o644); err != nil {
+		return fmt.Errorf("write apiserver kubelet-client cert: %w", err)
+	}
+	if err := os.WriteFile(apiServerKubeletClientKeyPath(workDir), keyPEM, 0o600); err != nil {
+		return fmt.Errorf("write apiserver kubelet-client key: %w", err)
 	}
 	return nil
 }
