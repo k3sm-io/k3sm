@@ -14,6 +14,7 @@
 # and staging fails if anything it names is missing at the end.
 #
 #   hack/release/stage.sh <out-dir> [--binary-name <name>] [--stub-payload]
+#                         [--ldflags <flags>]
 #
 #   <out-dir>        directory to assemble into (created; must not be under dist/,
 #                    which goreleaser empties with --clean)
@@ -21,6 +22,12 @@
 #   --stub-payload   write placeholder payload files instead of downloading the
 #                    real ~250 MB control-plane set; for shape/layout checks only,
 #                    never for anything published
+#   --ldflags        -ldflags value for the k3sm build, e.g. the pkg/version -X
+#                    stamps. Empty (the default) leaves an unstamped dev build,
+#                    which reports its version from the embedded VCS build info.
+#   (k3sm-vmhost is always built and signed with
+#   cmd/k3sm-vmhost/vmhost.entitlements: pkg/install.RequiredSiblings names it,
+#   so a stage without it fails the required-artifact loop.)
 #
 # ARCHITECTURE PIN: everything here is darwin/arm64. That is not decoration — a
 # Mac whose Go toolchain runs under Rosetta defaults to GOARCH=amd64, so an
@@ -35,6 +42,7 @@ WS_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
 BINARY_NAME="k3sm"
 STUB_PAYLOAD=0
+LDFLAGS=""
 OUT=""
 
 die() { echo "stage: $*" >&2; exit 1; }
@@ -43,7 +51,8 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--binary-name) BINARY_NAME="${2:?--binary-name needs a value}"; shift 2 ;;
 	--stub-payload) STUB_PAYLOAD=1; shift ;;
-	-h | --help) sed -n '2,28p' "$0"; exit 0 ;;
+	--ldflags) LDFLAGS="${2?--ldflags needs a value}"; shift 2 ;;
+	-h | --help) sed -n '2,35p' "$0"; exit 0 ;;
 	-*) die "unknown flag: $1" ;;
 	*)
 		[ -z "$OUT" ] || die "only one output directory may be given (got '$OUT' and '$1')"
@@ -69,7 +78,9 @@ echo "==> staging into $OUT (darwin/arm64)"
 # The k3sm binary. Built from the repo with the workspace active so the sibling
 # modules resolve to these checkouts.
 echo "==> build $BINARY_NAME"
-( cd "$REPO_ROOT" && go build -trimpath -o "$BIN" ./cmd/k3sm )
+build_flags=(-trimpath)
+[ -n "$LDFLAGS" ] && build_flags+=(-ldflags "$LDFLAGS")
+( cd "$REPO_ROOT" && go build "${build_flags[@]}" -o "$BIN" ./cmd/k3sm )
 
 # The Seatbelt exec helper. Built from the WORKSPACE root because go.work is what
 # spans the runtimed module; without this helper the server dies at boot.
@@ -82,6 +93,15 @@ echo "==> build k3sm-execshim (runtimed)"
 echo "==> build DYLD shims (runtimed path-rebase, darwin-net getaddrinfo)"
 "$WS_ROOT/runtimed/hack/build-pathshim.sh" "$OUT" >/dev/null
 "$WS_ROOT/darwin-net/hack/build-shim.sh" "$OUT" >/dev/null
+
+# The per-pod VM host helper. Built from the workspace root for the same reason
+# as the exec shim, and signed separately below: it is the ONLY k3sm binary that
+# carries com.apple.security.virtualization, which is the whole point of it being
+# a separate process (runtimed/pkg/sandbox.VMHostName).
+VMHOST_ENTITLEMENTS="$WS_ROOT/runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
+echo "==> build k3sm-vmhost (runtimed)"
+[ -f "$VMHOST_ENTITLEMENTS" ] || die "vmhost entitlements plist not found at $VMHOST_ENTITLEMENTS"
+( cd "$WS_ROOT" && go build -trimpath -o "$OUT/k3sm-vmhost" k3sm.io/runtimed/cmd/k3sm-vmhost )
 
 # The control-plane payload. `k3sm payload` downloads the pinned kwok-ci/k8s
 # binaries, builds kine, and — on this path — verifies every downloaded binary
@@ -104,9 +124,24 @@ fi
 # signer whose exit status is discarded proves nothing, so each is checked.
 echo "==> ad-hoc sign + verify"
 sign_and_verify() {
-	local f="$1"
-	codesign -s - -f "$f" >/dev/null 2>&1 || die "codesign failed for $f"
+	local f="$1" ents="${2:-}"
+	if [ -n "$ents" ]; then
+		codesign -s - -f --entitlements "$ents" "$f" >/dev/null 2>&1 || die "codesign failed for $f"
+	else
+		codesign -s - -f "$f" >/dev/null 2>&1 || die "codesign failed for $f"
+	fi
 	codesign --verify --strict "$f" >/dev/null 2>&1 || die "codesign --verify failed for $f"
+	# An entitled binary needs a SECOND assertion, because the first one cannot
+	# fail for the reason that matters: AMFI's plist parser is stricter than
+	# plutil's, and codesign attaches NO entitlements when it balks — while still
+	# producing a signature that verifies as valid. The only symptom downstream is
+	# VMBackend.Available() reporting false on a capable Mac, with nothing saying
+	# why (runtimed cmd/k3sm-vmhost/entitlements_test.go). So read the entitlement
+	# back off the signed Mach-O and require it to be there.
+	if [ -n "$ents" ]; then
+		codesign -d --entitlements - "$f" 2>/dev/null | grep -q "com.apple.security.virtualization" ||
+			die "$f signed but carries no com.apple.security.virtualization entitlement (AMFI rejected $ents?)"
+	fi
 }
 # Stubs are not Mach-Os, so signing is skipped for them by construction.
 if [ "$STUB_PAYLOAD" = 1 ]; then
@@ -118,6 +153,7 @@ else
 		sign_and_verify "$f"
 	done
 fi
+sign_and_verify "$OUT/k3sm-vmhost" "$VMHOST_ENTITLEMENTS"
 
 # Completeness, derived from the binary's own contract rather than this script's
 # memory of it: adding an artifact to pkg/install.RequiredSiblings reddens here
