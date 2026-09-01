@@ -39,7 +39,13 @@ the actual work of running and connecting pods.
 
 ## Quick start
 
-No tagged release is published yet, so the working path today is building from source.
+Install the latest release (pre-releases included until the first stable one):
+
+```sh
+curl -fsSL https://k3sm.io/install.sh | sh
+```
+
+Or build from source:
 
 k3sm's `go.mod` resolves its sibling modules (`k3sm.io/apis`, `k3sm.io/runtimed`,
 `k3sm.io/darwin-net`) as relative paths, so clone all four repos side by side:
