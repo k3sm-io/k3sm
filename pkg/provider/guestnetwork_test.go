@@ -166,9 +166,11 @@ func (r *testRegistry) ImageRunConfig(mfst *runtimev1.ImageManifest) (image.Imag
 	return image.ImageRunConfig{Entrypoint: []string{"/entrypoint.sh"}}, nil
 }
 
-// MaterializeTree completes the Unpacker seam. The vm path never calls it — a vm
-// pod's containers are resolved but deliberately NOT materialized (the pod-wide
-// rootfs share is the rootfs-builder's to fill) — so it reports a tree at the
+// MaterializeTree completes the Unpacker seam. The vm path DOES call it: it is
+// what fills the pod-wide rootfs the k3sm.rootfs virtiofs share exports, without
+// which the guest has no executable to run. (It did not until the M11 validation
+// found every vm pod booting onto an empty rootfs; this comment previously
+// asserted the opposite and is corrected here.) The fake reports a tree at the
 // requested destination and touches no blob store.
 func (r *testRegistry) MaterializeTree(_ context.Context, _ *runtimev1.ImageManifest, policy image.UnpackPolicy, dst string) (*image.MaterializeResult, error) {
 	return &image.MaterializeResult{Tree: &image.Tree{Key: "sha256:fake", Rootfs: dst, Policy: policy}}, nil
