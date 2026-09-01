@@ -1,0 +1,51 @@
+# k3sm lab run log
+gate: M11-core
+mode: core
+rc_tag: v0.1.0-dev.22a84ba
+artifact_sha256: a55c8460490fab60c03ebe95989151efc404a04dbe524b979ab3f3077075be21
+git_sha.apis: 22f9f2c48958fe5bf81f3b553ca24d47c76e5240
+git_sha.runtimed: 4a740e45c8971bed7ee1553d511c50dc4970e8e2
+git_sha.darwin-net: 44ae0f8884b95571fcb8e8c7ce824b68d2acf35d
+git_sha.k3sm: 22a84ba1ec22b725d42793e41afab2acab0f57e8
+started_utc: 2026-09-01T06:38:37Z
+result: FAIL (provisional — the final result line below is the verdict; a log that ends here did not finish)
+==> k3sm M11-core gate — the vm path on real VZ hardware (ns k3sm-m11, mode core)
+PASS  m11.1-a  a node advertises k3sm.io/virtualization=true (k3sm-mikostudio; candidates: k3sm-mikostudio)
+PASS  m11.1-b  k3sm-mikostudio advertises k3sm.io/vm-artifacts=true (the pinned guest kernel+initramfs are ensured and verified)
+PASS  m11.1-c  k3sm.io/rosetta-linux is ABSENT on k3sm-mikostudio — the arm64-only posture of this release, advertised truthfully
+PASS  m11.1-d  the vm RuntimeClass is provisioned
+      m11-boot: phase=Pending waiting=none ready=? (2s)
+PASS  m11.2-a  alpine:3.20 under runtimeClassName: vm is Running 1/1 on k3sm-mikostudio
+PASS  m11.2-b  the guest is really Linux/arm64 (uname -sm = 'Linux aarch64')
+PASS  m11.2-c  the ServiceAccount projection is readable at /var/run/secrets/kubernetes.io/serviceaccount (namespace=k3sm-m11, non-empty token and ca.crt)
+PASS  m11.2-d  /var/run/secrets/kubernetes.io/serviceaccount exists and refuses a write (projected credentials stay read-only in the guest)
+PASS  m11.3-a  kubectl logs returns the marker the container echoed (m11-log-20 m11-marker-41643)
+PASS  m11.3-b  kubectl logs --tail=5 returns exactly 5 lines
+PASS  m11.4  kubectl exec propagates the guest exit code (exit 42 -> 42)
+PASS  m11.7-a  guest eth0 is UP with 192.168.64.56, inside the node's vmnet segment 192.168.64.0/24
+PASS  m11.7-b  the guest has a default route (default via 192.168.64.1 dev eth0 )
+PASS  m11.7-c  kubernetes.default.svc.cluster.local resolves to 10.43.0.1 through the cluster DNS VIP 10.43.0.10
+PASS  m11.7-d  the guest completes a TCP connect to the kubernetes ClusterIP 10.43.0.1:443
+PASS  m11.7-e  the host completes a TCP connect to the guest's leased address 192.168.64.56:9376
+REC   m11.9  per-VM host footprint: k3sm-vmhost pid 41690 rss 26.0 MiB (rss_kb vsz_kb etime pcpu: 26624 436682304 00:07   1.5)
+      recorded for the B24 overhead reconcile (RuntimeClass overhead.podFixed); this rung never fails the gate
+      m11-nats: phase=Pending waiting=none ready=? (9s)
+PASS  m11.5  nats:2.10-alpine is Running and logs 'Server is ready' (bare-name entrypoint resolved in the guest)
+      m11-store: phase=Pending waiting=none ready=? (14s)
+PASS  m11.6-a  local-path PVC m11-data is Bound (PV pvc-a0284288-3661-4c83-95ef-c9c3b46ce288) and the vm pod wrote store-a-41643 into it
+      the local-path class reclaims Retain, so deleting this gate's namespace leaves PV pvc-a0284288-3661-4c83-95ef-c9c3b46ce288 and its bytes on the node — remove it by hand
+      the k3sm-vmhost helper is root-owned; running: sudo pkill -9 -f 'k3sm-vmhost.*5721bc93-0ba1-4e40-9aa4-852a4feca12a' (sudo may prompt)
+      m11-store after the helper SIGKILL: phase=Running waiting=CrashLoopBackOff ready=false
+PASS  m11.6-b  SIGKILLing the pod's k3sm-vmhost helper (pid 41797) takes the pod out of service (CrashLoopBackOff / not ready)
+      m11-store: phase=Pending waiting=none ready=? (20s)
+PASS  m11.6-c  a fresh vm pod on the SAME claim sees both the pre-kill marker store-a-41643 and the new store-b-41643 — the bytes survived the guest
+PASS  m11.8  docker.io/amd64/alpine:3.20 fails closed and the failure names the platform mismatch ('no image manifest matches a runnable platform')
+      Message:             runtimed create pod k3sm-m11/m11-amd64 rejected: container app: pull image "docker.io/amd64/alpine:3.20": pull "docker.io/amd64/alpine:3.20": no image manifest matches a runnable platform: want [linux/arm64/v8], image provides [linux/amd64] (FAILURE_REASON_IMAGE_PULL)
+        Warning  ProviderCreateFailed  5s    k3sm-mikostudio/pod-controller  runtimed create pod k3sm-m11/m11-amd64 rejected: container app: pull image "docker.io/amd64/alpine:3.20": pull "docker.io/amd64/alpine:3.20": no image manifest matches a runnable platform: want [linux/arm64/v8], image provides [linux/amd64] (FAILURE_REASON_IMAGE_PULL)
+      m11.10-12 (Service, logs -f, stats) are the FULL ledger's rungs and are NOT part of --core
+----------------------------------------
+M11-core: 21 passed, 0 failed, 1 recorded (mode: core)
+gate: M11-core
+finished_utc: 2026-09-01T06:39:07Z
+result: PASS
+================ M11-core GREEN ================
