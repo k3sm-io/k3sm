@@ -260,7 +260,7 @@ type RuntimedConfig struct {
 	// did not succeed (an unminted pin, no network, a digest mismatch). It leaves
 	// the vm backend's artifact locator unset, so CreateVM fails every vm pod with
 	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
-	GuestArtifacts *sandbox.GuestArtifacts
+	GuestArtifacts *EnsuredGuestArtifacts
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }

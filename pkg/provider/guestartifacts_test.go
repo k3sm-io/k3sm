@@ -32,7 +32,6 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/guestartifacts"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
-	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // The guest-artifact wiring tests. Every one of them runs with NO NETWORK and no
@@ -168,9 +167,13 @@ func TestEnsureGuestArtifactsWiring(t *testing.T) {
 		pin, fetcher := mintedPin()
 
 		src := GuestArtifactSource{Pin: pinFunc(pin, nil), Fetcher: fetcher, Timeout: 30 * time.Second}
-		art, ok := src.Ensure(t.Context(), root, slog.New(slog.DiscardHandler))
+		ga, ok := src.Ensure(t.Context(), root, slog.New(slog.DiscardHandler))
 		if !ok {
 			t.Fatalf("Ensure reported unavailable with a minted pin and a fetcher serving both artifacts")
+		}
+		art := ga.Artifacts
+		if ga.Pin.SetDigest() != pin.SetDigest() {
+			t.Fatalf("Ensure returned pin %q, want the one it was given %q", ga.Pin.SetDigest(), pin.SetDigest())
 		}
 
 		// The returned paths are inside THIS node's cache root — the derivation
@@ -191,7 +194,7 @@ func TestEnsureGuestArtifactsWiring(t *testing.T) {
 			}
 		}
 
-		rt := mustNewRuntimed(t, root, &art)
+		rt := mustNewRuntimed(t, root, &ga)
 		if caps := rt.Capabilities(t.Context()); !caps.VMArtifacts {
 			t.Errorf("Capabilities().VMArtifacts = false after a successful ensure; the node would advertise no %s", ConditionVMArtifactsAvailable)
 		}
@@ -318,7 +321,7 @@ func TestGuestArtifactFailureBlastRadiusIsOneNode(t *testing.T) {
 //
 // Construction succeeding IS an assertion in every degraded case here, which is
 // why this helper never tolerates an error.
-func mustNewRuntimed(t *testing.T, root string, art *sandbox.GuestArtifacts) *runtimedRuntime {
+func mustNewRuntimed(t *testing.T, root string, art *EnsuredGuestArtifacts) *runtimedRuntime {
 	t.Helper()
 	rt, err := NewRuntimed(RuntimedConfig{
 		NodeName:       "n1",

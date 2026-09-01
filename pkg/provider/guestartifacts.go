@@ -61,6 +61,17 @@ func runtimeRoot(root string) string {
 	return root
 }
 
+// EnsuredGuestArtifacts is a verified artifact set together with the pin it
+// was verified against. The pair travels together because the LOCATOR needs
+// both: the paths to hand the vm backend, and the digests to re-verify them
+// against on every guest boot (guestartifacts.Locator).
+type EnsuredGuestArtifacts struct {
+	// Pin is the in-code pin the set was ensured from.
+	Pin guestartifacts.GuestKernelPin
+	// Artifacts is the on-disk, digest-verified set.
+	Artifacts sandbox.GuestArtifacts
+}
+
 // GuestArtifactSource is the node's guest-artifact ENSURE input: which pin to
 // materialise, how to fetch it, and how long the whole attempt may take.
 //
@@ -104,11 +115,11 @@ type GuestArtifactSource struct {
 // A false return leaves the vm backend's artifact locator UNSET, so CreateVM
 // fails every vm pod closed with sandbox.ErrGuestArtifactsUnavailable — the
 // fail-closed posture. It does not touch the host-process pod path.
-func (s GuestArtifactSource) Ensure(ctx context.Context, root string, log *slog.Logger) (sandbox.GuestArtifacts, bool) {
+func (s GuestArtifactSource) Ensure(ctx context.Context, root string, log *slog.Logger) (EnsuredGuestArtifacts, bool) {
 	if log == nil {
 		log = slog.Default()
 	}
-	var zero sandbox.GuestArtifacts
+	var zero EnsuredGuestArtifacts
 
 	pin, err := s.pin()
 	if err != nil {
@@ -134,7 +145,7 @@ func (s GuestArtifactSource) Ensure(ctx context.Context, root string, log *slog.
 	log.Info("guest boot artifacts verified",
 		"dir", dir, "guest_kernel", guestartifacts.ActiveGuestKernel,
 		"kernel", art.KernelPath, "initramfs", art.InitramfsPath)
-	return art, true
+	return EnsuredGuestArtifacts{Pin: pin, Artifacts: art}, true
 }
 
 // pin resolves the pin to ensure, defaulting to the in-code active one.
@@ -162,14 +173,14 @@ func (s GuestArtifactSource) timeout() time.Duration {
 }
 
 // guestArtifactLocator adapts an already-ensured artifact set to the
-// sandbox.GuestArtifactLocator seam the vm backend takes.
+// sandbox.GuestArtifactLocator seam the vm backend takes, re-verifying the
+// on-disk bytes against the pin on EVERY call (guestartifacts.Locator).
 //
-// The set is captured BY VALUE at construction, so the locator is a constant
-// function: ensure ran once, at daemon start, and re-deriving the paths per vm
-// pod would either re-hash a hundred megabytes on every CreateVM or — worse —
-// hand back paths nothing re-verified. The re-verification cadence is
-// deliberately "once per daemon start" (see EnsureGuestArtifacts); this seam
-// must not quietly change it.
-func guestArtifactLocator(art sandbox.GuestArtifacts) sandbox.GuestArtifactLocator {
-	return func() (sandbox.GuestArtifacts, error) { return art, nil }
+// The daemon runs for weeks; a vm pod created long after daemon start must not
+// boot bytes only the start-time ensure ever hashed — a VZ-booted kernel gets
+// no OS code-signing check, so the digest compare is the whole chain and is
+// enforced per boot. A mismatch fails that one CreateVM closed; it never
+// degrades the node's other pods.
+func guestArtifactLocator(ga EnsuredGuestArtifacts) sandbox.GuestArtifactLocator {
+	return guestartifacts.Locator(ga.Pin, ga.Artifacts)
 }
