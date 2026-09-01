@@ -23,10 +23,13 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"k8s.io/client-go/kubernetes"
@@ -39,7 +42,6 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
-	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netserve"
 )
 
@@ -51,7 +53,7 @@ const meshKeyRef = "node.key"
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.
 type agentOptions struct {
-	server    string // control-plane mesh host (the join + apiserver target)
+	server    string // control-plane UNDERLAY host (the join target; apiserver fallback only)
 	token     string // K10<caHash>::<user>:<secret>
 	nodeName  string
 	nodeIP    string // this node's mesh InternalIP (bound into the issued certs)
@@ -72,7 +74,7 @@ type agentOptions struct {
 // pod-support shims are overridable here, as they are on `k3sm server` / `k3sm
 // node` — is unit-testable without parsing argv through a live join.
 func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
-	fs.StringVar(&opts.server, "server", "", "control-plane mesh host (e.g. 100.64.0.1) to join")
+	fs.StringVar(&opts.server, "server", "", "control-plane host to join — in practice an UNDERLAY address (a LAN IP or DNS name), because the join must reach <host>:9345 before this node has any mesh to route over")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN)")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
@@ -81,7 +83,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
-	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port on the control-plane host")
+	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port to dial on the control plane (the HOST is not this flag: it comes from the apiserver endpoint the join advertises — the server's mesh IP — falling back to --server)")
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
@@ -131,23 +133,68 @@ func runAgent(args []string) error {
 		return err
 	}
 
-	bootstrapURL := fmt.Sprintf("https://%s:%d", opts.server, bootstrapPort)
-	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName, "nodeIP", opts.nodeIP)
+	// The wireguard identity: minted once, persisted 0600, reused across restarts
+	// for the same reason — the public key derived from it is what every peer
+	// programs, so a per-start key rotates this node's MeshPeer on every restart and
+	// strands the mesh until each peer re-reconciles.
+	meshPriv, meshPub, err := loadOrCreateMeshKey(opts.workDir, meshKeyRef)
+	if err != nil {
+		return err
+	}
+	logger.Info("mesh identity", "node", opts.nodeName, "publicKey", meshPub, "keyRef", meshKeyRef)
+
+	// The join client is built HERE rather than left to bootstrap.Join so its dialer
+	// can report which of this Mac's addresses reaches the control plane — the one
+	// fact the mesh endpoint below has to be derived from. It is still the CA-pinned
+	// client; pinnedJoinClient layers only the dialer onto it.
+	tok, err := bootstrap.ParseToken(opts.token)
+	if err != nil {
+		return err
+	}
+	joinClient, joinDialer, err := pinnedJoinClient(tok.CAHash)
+	if err != nil {
+		return err
+	}
+	joinHost := net.JoinHostPort(opts.server, strconv.Itoa(bootstrapPort))
+	joinDialer.probe(ctx, joinHost)
+
+	// The advertised wireguard endpoint is an UNDERLAY address, never opts.nodeIP:
+	// that flag carries this node's MESH InternalIP, and a peer must dial the
+	// underlay to open the handshake that creates the mesh in the first place.
+	meshEndpoint, err := underlayMeshEndpoint(joinDialer.localIP(), opts.nodeIP, opts.meshPort)
+	if err != nil {
+		return err
+	}
+
+	bootstrapURL := "https://" + joinHost
+	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
+		"nodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
 	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
 		Server:       bootstrapURL,
 		Token:        opts.token,
 		NodeName:     opts.nodeName,
 		NodeIP:       opts.nodeIP,
 		NodePassword: password,
-		MeshEndpoint: fmt.Sprintf("%s:%d", opts.nodeIP, opts.meshPort),
+		MeshEndpoint: meshEndpoint,
+		HTTPClient:   joinClient,
+		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
+		// back as exactly this value and is what bringUpMesh programs below.
+		WGPrivateKeyB64: meshPriv,
 	})
 	if err != nil {
 		return fmt.Errorf("join: %w", err)
 	}
 	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 
-	apiserverURL := fmt.Sprintf("https://%s:%d", opts.server, opts.apiPort)
+	// The apiserver this worker targets is the SERVER'S MESH address, not the
+	// underlay --server it just joined over (see workerAPIServerURL). Writing the
+	// kubeconfig here — before bringUpMesh — is only a file write; every dial
+	// against this URL happens after the tunnel exists (the MeshPeer watcher's
+	// informer starts after mesh.Start, and the datapath + node clients are built
+	// later still), which is the ordering the mesh-IP URL requires.
+	apiserverURL := workerAPIServerURL(res, opts.server, opts.apiPort)
 	kubeconfigPath := filepath.Join(opts.workDir, "node.kubeconfig")
+	logger.Info("apiserver target for this node", "url", apiserverURL, "advertised", res.APIServers)
 	if err := writeNodeKubeconfig(kubeconfigPath, apiserverURL, opts.nodeName, res); err != nil {
 		return err
 	}
@@ -161,7 +208,15 @@ func runAgent(args []string) error {
 	// into; it stays nil under `--network none`, where there is no proxy to feed.
 	var datapath *netserve.Server
 	if mode.DataPath() {
-		if err := bringUpMesh(ctx, res, opts.meshPort, kubeconfigPath, mode, logger); err != nil {
+		if err := bringUpMesh(ctx, meshBringUp{
+			podCIDR:       res.PodCIDR,
+			meshIP:        res.MeshIP,
+			privateKeyB64: res.WGPrivateKeyB64,
+			keyRef:        meshKeyRef,
+			peers:         res.Peers,
+			listenPort:    opts.meshPort,
+			kubeconfig:    kubeconfigPath,
+		}, mode, logger); err != nil {
 			return fmt.Errorf("mesh bring-up: %w", err)
 		}
 		// Built AFTER join+mesh: the proxy's mesh-egress source is this node's
@@ -221,43 +276,52 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 	}
 }
 
-// bringUpMesh constructs the node's wireguard mesh for its assigned pod /24, brings
+// bringUpMesh constructs a node's wireguard mesh for its assigned pod /24, brings
 // the device up (root utun), programs the initial peer snapshot, and starts the
 // MeshPeer watch so endpoint/key changes reconverge. The device Up/Apply calls are
 // the privileged legs exercised live (the two-Mac lab gate).
-func bringUpMesh(ctx context.Context, res *bootstrap.JoinResult, meshPort int, kubeconfigPath string, mode hostnet.Mode, logger *slog.Logger) error {
-	self, err := netip.ParsePrefix(res.PodCIDR)
+//
+// It takes DISCRETE fields (meshBringUp) rather than the join result it was born
+// from, because BOTH node roles bring a mesh up: a worker off a network-received
+// JoinResult, and the control-plane node off values it synthesizes locally
+// (enrollSelfAndBringUpMesh). See meshBringUp for why the wire DTO does not
+// travel down here.
+func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger *slog.Logger) error {
+	self, err := netip.ParsePrefix(in.podCIDR)
 	if err != nil {
-		return fmt.Errorf("parse assigned podCIDR %q: %w", res.PodCIDR, err)
+		return fmt.Errorf("parse assigned podCIDR %q: %w", in.podCIDR, err)
 	}
-	meshOpts := []mesh.Option{mesh.WithListenPort(meshPort), mesh.WithLogger(logger)}
+	meshOpts := []mesh.Option{mesh.WithListenPort(in.listenPort), mesh.WithLogger(logger)}
 	if mode.UsesHelper() {
 		// Helper mode: the root netd daemon owns the utun/wireguard datapath and
 		// resolves the private key from a root-only path (the key never crosses the
-		// socket). Provision the key to that path (best-effort: in the pure _k3sm
-		// posture the root-only dir is privileged, so a privileged install/netd step
-		// owns provisioning — the agent passes only the ref).
-		if err := os.WriteFile(filepath.Join(install.MeshKeyDir, meshKeyRef), []byte(res.WGPrivateKeyB64), 0o600); err != nil {
-			logger.Warn("could not provision mesh private key to the root-only path (provision it via the privileged install step)", "path", filepath.Join(install.MeshKeyDir, meshKeyRef), "err", err)
-		}
-		meshOpts = append(meshOpts, mode.MeshOptions(meshKeyRef)...)
+		// socket), so this process provisions the key there and passes only the ref.
+		in.provisionHelperKey(logger)
+		meshOpts = append(meshOpts, mode.MeshOptions(in.keyRef)...)
 	} else {
-		meshOpts = append(meshOpts, mesh.WithPrivateKey(res.WGPrivateKeyB64))
+		meshOpts = append(meshOpts, mesh.WithPrivateKey(in.privateKeyB64))
 	}
 	m, err := mesh.New(self, meshOpts...)
 	if err != nil {
 		return fmt.Errorf("build mesh: %w", err)
 	}
+	// The mesh derives its own mesh-egress /32 from the self prefix. If that
+	// disagrees with the /32 the enroll assigned, this node's routing locality and
+	// its mesh identity have diverged — fail rather than plumb an lo0 alias the
+	// proxy will never source from.
+	if in.meshIP != "" && m.MeshIP().String() != in.meshIP {
+		return fmt.Errorf("mesh device derives mesh-egress %s from podCIDR %s, but the enroll assigned %s", m.MeshIP(), in.podCIDR, in.meshIP)
+	}
 	if err := m.Start(ctx); err != nil {
 		return fmt.Errorf("start mesh device: %w", err)
 	}
-	if err := m.Reconcile(ctx, res.Peers); err != nil {
+	if err := m.Reconcile(ctx, in.peers); err != nil {
 		logger.Error("initial mesh reconcile", "err", err)
 	}
 
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	restCfg, err := clientcmd.BuildConfigFromFlags("", in.kubeconfig)
 	if err != nil {
-		return fmt.Errorf("load node kubeconfig for mesh watch: %w", err)
+		return fmt.Errorf("load kubeconfig for mesh watch: %w", err)
 	}
 	watcher, err := mesh.NewWatcher(restCfg, m, logger)
 	if err != nil {
@@ -379,6 +443,60 @@ func loadOrCreateNodePassword(workDir string) (string, error) {
 		return "", fmt.Errorf("persist node-password: %w", err)
 	}
 	return pw, nil
+}
+
+// workerAPIServerURL derives the apiserver URL a joined worker targets: the base
+// of its node kubeconfig, and so of every client the worker builds off it (the
+// MeshPeer watcher, the Service proxy + kube-dns ensure, the VK node
+// registration).
+//
+// The HOST is the control plane's OWN advertised apiserver endpoint
+// (bootstrap.JoinResult.APIServers) whenever the join carried one, because a
+// multi-node server binds its apiserver on the mesh interface and NOTHING else
+// (`k3sm server --mesh-ip` sets BindAddress to the mesh IP), so the only address
+// that answers is reachable through the wireguard tunnel. serverHost — the
+// agent's `--server` — cannot stand in for it: it is an UNDERLAY address by
+// construction (the join must reach <host>:9345 before this node has any mesh),
+// and dialing the apiserver there is refused by construction. That was the live
+// defect: the worker wrote https://<underlay>:6444, every dial was refused, and
+// the virtual-kubelet never registered.
+//
+// It falls back to serverHost when the join advertised no usable endpoint — a
+// non-mesh server joined remotely, where the underlay address IS where the
+// apiserver listens. The PORT is always apiPort: the advertised endpoint
+// contributes only the host, and `--api-port` keeps its role as the port.
+func workerAPIServerURL(res *bootstrap.JoinResult, serverHost string, apiPort int) string {
+	host := serverHost
+	if advertised := advertisedAPIServerHost(res); advertised != "" {
+		host = advertised
+	}
+	return "https://" + net.JoinHostPort(host, strconv.Itoa(apiPort))
+}
+
+// advertisedAPIServerHost returns the host of the first DIALABLE apiserver
+// endpoint the join response advertised, or "" when it advertised none. An
+// endpoint whose host is missing or unspecified (":6444", "0.0.0.0:6444") is not
+// dialable, so it is skipped rather than turned into a dead URL — the caller then
+// keeps its `--server` fallback, which is at least an address that once answered.
+func advertisedAPIServerHost(res *bootstrap.JoinResult) string {
+	if res == nil {
+		return ""
+	}
+	for _, endpoint := range res.APIServers {
+		host := strings.TrimSpace(endpoint)
+		// A bare host (no port) fails SplitHostPort; keep it as-is then.
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if host == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(host); err == nil && addr.IsUnspecified() {
+			continue
+		}
+		return host
+	}
+	return ""
 }
 
 // writeNodeKubeconfig writes a 0600 kubeconfig that authenticates as the issued

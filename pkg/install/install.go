@@ -86,6 +86,19 @@ const (
 	DefaultServiceCIDR = "10.43.0.0/16"
 	// MeshKeyDir is the root-only directory the netd MeshKeyResolver reads.
 	MeshKeyDir = "/var/lib/k3sm/run/keys"
+	// VMRunDir is the per-pod guest-agent socket directory runtimed binds under,
+	// as the SERVICE USER. It must be pre-created here because its parent
+	// (/var/lib/k3sm/run) is root:wheel — netd owns that directory so an
+	// unprivileged process cannot replace netd.sock — and an unprivileged
+	// mkdir inside a root-owned directory is EACCES. Only root can carve this
+	// one _k3sm-owned subdirectory out, and only the installer runs as root.
+	//
+	// The path mirrors runtimed's guestAgentSocket derivation
+	// (<runtimed root>/run/vm/<podID>/agent.sock). Without it every vm pod dies
+	// at boot with "agent socket dir: mkdir /var/lib/k3sm/run/vm: permission
+	// denied" (FAILURE_REASON_SANDBOX_SETUP) on an otherwise healthy, entitled
+	// Mac — i.e. the whole vm RuntimeClass is unusable on a stock install.
+	VMRunDir = "/var/lib/k3sm/run/vm"
 	// LogDir is where the daemons' stdout/stderr are written.
 	LogDir = "/var/log/k3sm"
 )
@@ -118,6 +131,14 @@ type System interface {
 	// spawns (the live M2-gate failure this fixes). Idempotent: perms/owner are
 	// re-applied on every install, repairing a previously mis-created dir.
 	EnsureLogDir(dir string, uid uint32) error
+	// EnsureVMRunDir creates (or repairs) the vm guest-agent socket directory
+	// owned by the service uid (group staff, 0700). runtimed binds a per-pod
+	// socket under it as _k3sm, but its parent is root-owned so the
+	// unprivileged mkdir cannot succeed; only the root installer can carve it
+	// out. Idempotent, and owner/mode are re-applied on every install so a
+	// directory left root-owned by an earlier build is repaired rather than
+	// silently keeping every vm pod unbootable. See VMRunDir.
+	EnsureVMRunDir(dir string, uid uint32) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
@@ -469,6 +490,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     initialize" and never spawns. Created/repaired idempotently.
 	if err := sys.EnsureLogDir(LogDir, uid); err != nil {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
+	}
+
+	// 1c. The vm guest-agent socket dir, for the same class of reason: runtimed
+	//     binds <VMRunDir>/<podID>/agent.sock as _k3sm, but /var/lib/k3sm/run is
+	//     root-owned (netd owns netd.sock there), so the unprivileged mkdir is
+	//     EACCES and every vm-RuntimeClass pod fails to boot. Root carves out
+	//     this one subdirectory; netd.sock stays unreachable to _k3sm.
+	if err := sys.EnsureVMRunDir(VMRunDir, uid); err != nil {
+		return fmt.Errorf("install: ensure vm run dir %s: %w", VMRunDir, err)
 	}
 
 	// 2. Copy the binary to the exact path the plists exec (installedBinary()),

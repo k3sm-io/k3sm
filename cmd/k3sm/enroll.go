@@ -19,11 +19,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"sync"
 	"time"
 
@@ -46,9 +48,12 @@ import (
 // for any other node), and returns the current peer snapshot.
 //
 // Locking discipline: mu serializes the assign→write so two concurrent joins do not
-// claim the same /24. podCIDR assignment is by current MeshPeer count (index 0 is
-// reserved for the control-plane node); it is a dev-scale scheme — robust index
-// recycling across node deletes is an M4 concern.
+// claim the same /24, and the SAME instance serves both the join RPC and this
+// server's own EnrollSelf — the two allocators must contend on one lock or a worker
+// joining during bring-up can be handed the index the server is claiming.
+// podCIDR assignment is the LOWEST FREE index ≥ 1 (index 0 is the control-plane
+// node's, pinned by EnrollSelf); it is a dev-scale scheme — robust index recycling
+// across node deletes is an M4 concern.
 type meshEnroller struct {
 	client     rest.Interface
 	clusterPod netip.Prefix
@@ -84,7 +89,11 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 		}
 	}
 	if podCIDR == "" {
-		cidr, err := podnet.NodeCIDR(e.clusterPod, len(existing)+1)
+		index, err := lowestFreeNodeIndex(e.clusterPod, existing)
+		if err != nil {
+			return netv1.MeshEnrollResponse{}, fmt.Errorf("assign podCIDR: %w", err)
+		}
+		cidr, err := podnet.NodeCIDR(e.clusterPod, index)
 		if err != nil {
 			return netv1.MeshEnrollResponse{}, fmt.Errorf("assign podCIDR: %w", err)
 		}
@@ -119,6 +128,150 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 		Peers:    peers,
 	}.WithDefaults(), nil
 }
+
+// serverNodeIndex is the node index the CONTROL-PLANE node's pod /24 is carved
+// at. It is pinned, not assigned: defaultNodePodCIDR() hard-codes the same index-0
+// carve and feeds it to this node's routing locality and its pod IPAM, so a
+// self-assigned different index would split "what the mesh routes here" from "what
+// this node's pods are" — and mesh.BuildPlan's self-exclusion keys on exact CIDR
+// equality, so the node would program a route to itself.
+const serverNodeIndex = 0
+
+// ErrMeshIndexClaimed is returned by EnrollSelf when the control-plane node's
+// index-0 pod /24 is already held by a DIFFERENT node. Compare with errors.Is.
+var ErrMeshIndexClaimed = errors.New("enroll: the control-plane mesh index is claimed by another node")
+
+// EnrollSelf asserts-or-creates the CONTROL-PLANE node's own MeshPeer at index 0
+// and returns the resulting peer snapshot, so the server participates in the mesh
+// it hosts rather than only brokering other nodes into it.
+//
+// It runs under the SAME mutex as Enroll and through the same writePeer upsert, so
+// it is serialized against every concurrent worker join; and it LIST-BACK VERIFIES
+// its own write before returning, so a caller that opens the join listener only
+// after this returns has a durable index-0 claim in place. Without that
+// happens-before, Enroll's lowest-free-index scanner would legitimately hand index
+// 0 to a worker that joins in the window, and two peers would claim one AllowedIPs
+// — which wireguard cannot admit.
+//
+// It NEVER runs the free-index scanner (see serverNodeIndex) and it FAILS CLOSED
+// with ErrMeshIndexClaimed if index 0 is held by a different node name: silently
+// taking the slot would rewrite a live peer's AllowedIPs out from under it.
+// Re-enrolling this same node is idempotent — the upsert updates the endpoint and
+// public key in place.
+func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	selfCIDR, err := podnet.NodeCIDR(e.clusterPod, serverNodeIndex)
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("derive the control-plane podCIDR: %w", err)
+	}
+	meshIP, err := podnet.MeshEgressIP(selfCIDR)
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("derive mesh-egress IP: %w", err)
+	}
+
+	existing, err := e.listPeers(ctx)
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("list mesh peers: %w", err)
+	}
+	for _, p := range existing {
+		idx, ok := nodeIndexOf(e.clusterPod, p.PodCIDR)
+		if !ok || idx != serverNodeIndex || p.NodeName == nodeName {
+			continue
+		}
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("%w: %s is held by node %q, not %q",
+			ErrMeshIndexClaimed, selfCIDR, p.NodeName, nodeName)
+	}
+
+	peer, err := bootstrap.BuildMeshPeer(nodeName, selfCIDR.String(), meshIP.String(), req)
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, err
+	}
+	if err := e.writePeer(ctx, peer); err != nil {
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
+	}
+
+	// LIST-BACK VERIFY. This is not a re-read for convenience: it is the
+	// happens-before the caller depends on. Returning nil here is the claim that
+	// index 0 is durably this node's, so it has to be read back from the apiserver
+	// rather than inferred from a successful write.
+	peers, err := e.listPeers(ctx)
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("verify self-enroll: %w", err)
+	}
+	verified := false
+	for _, p := range peers {
+		if p.NodeName == nodeName && p.PodCIDR == selfCIDR.String() {
+			verified = true
+		}
+	}
+	if !verified {
+		return netv1.MeshEnrollResponse{}, fmt.Errorf("verify self-enroll: no MeshPeer %q at %s after the write", nodeName, selfCIDR)
+	}
+	return netv1.MeshEnrollResponse{
+		NodeName: nodeName,
+		PodCIDR:  selfCIDR.String(),
+		MeshIP:   meshIP.String(),
+		Peers:    peers,
+	}.WithDefaults(), nil
+}
+
+// lowestFreeNodeIndex returns the lowest node index ≥ 1 whose /24 no existing peer
+// holds.
+//
+// It replaces a len(existing)+1 counter, which is wrong the moment index 0 is
+// occupied by the control-plane node's own MeshPeer: with one peer present the
+// counter returns 2, skipping index 1 forever, and with the server plus one worker
+// it returns 3 — an index scheme whose answers depend on how many peers exist
+// rather than on which indices are taken. It also never recovered an index after a
+// node was deleted. Starting at 1 keeps index 0 reserved (serverNodeIndex); a peer
+// whose podCIDR does not parse or falls outside the cluster CIDR is ignored rather
+// than allowed to shift the numbering.
+func lowestFreeNodeIndex(clusterCIDR netip.Prefix, existing []netv1.MeshPeerSpec) (int, error) {
+	used := make(map[int]struct{}, len(existing))
+	for _, p := range existing {
+		if idx, ok := nodeIndexOf(clusterCIDR, p.PodCIDR); ok {
+			used[idx] = struct{}{}
+		}
+	}
+	for index := serverNodeIndex + 1; ; index++ {
+		if _, taken := used[index]; taken {
+			continue
+		}
+		if _, err := podnet.NodeCIDR(clusterCIDR, index); err != nil {
+			return 0, fmt.Errorf("no free node index in %s: %w", clusterCIDR, err)
+		}
+		return index, nil
+	}
+}
+
+// nodeIndexOf reports which node index of clusterCIDR the /24 podCIDR is, and
+// whether it is one at all. A podCIDR that does not parse, is not a /24, or lies
+// outside clusterCIDR is not an index — the caller ignores it rather than guessing.
+func nodeIndexOf(clusterCIDR netip.Prefix, podCIDR string) (int, bool) {
+	prefix, err := netip.ParsePrefix(podCIDR)
+	if err != nil {
+		return 0, false
+	}
+	prefix = prefix.Masked()
+	base := clusterCIDR.Masked()
+	if !base.IsValid() || !prefix.Addr().Is4() || !base.Addr().Is4() {
+		return 0, false
+	}
+	if prefix.Bits() != nodePodCIDRBits || !base.Contains(prefix.Addr()) {
+		return 0, false
+	}
+	p := prefix.Addr().As4()
+	b := base.Addr().As4()
+	offset := (uint32(p[0])<<24 | uint32(p[1])<<16 | uint32(p[2])<<8 | uint32(p[3])) -
+		(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
+	return int(offset >> (32 - nodePodCIDRBits)), true
+}
+
+// nodePodCIDRBits is the prefix length of a per-node pod CIDR, mirroring podnet's
+// own unexported constant — the carve NodeCIDR produces and nodeIndexOf inverts.
+const nodePodCIDRBits = 24
 
 // listPeers returns the current MeshPeer specs from the apiserver.
 func (e *meshEnroller) listPeers(ctx context.Context) ([]netv1.MeshPeerSpec, error) {
@@ -168,9 +321,36 @@ func meshPeerRESTClient(cfg *rest.Config) (rest.Interface, error) {
 	return rest.RESTClientFor(rc)
 }
 
-// bootstrapPort is the dedicated TLS port the supervisor's worker-join endpoint binds
-// on the mesh interface (separate from the apiserver secure port).
+// bootstrapPort is the dedicated TLS port the supervisor's worker-join endpoint
+// binds (separate from the apiserver secure port).
 const bootstrapPort = 9345
+
+// bootstrapListenAddr derives the address the worker-join supervisor listens on.
+//
+// On the MESH path (meshIP set) it is the WILDCARD, and that is the whole point:
+// a joining worker dials this endpoint over the UNDERLAY, because it has no mesh
+// until the join it is making completes (`k3sm agent --server` documents exactly
+// that, and the MeshPeer this endpoint enrolls advertises an underlay endpoint for
+// the same reason). Bound to meshIP alone the supervisor answers only on an
+// address no un-joined worker can route to, so every join is refused — which is
+// the defect the first real --mesh-ip boot exposed and which a 127.0.0.1 mesh IP
+// had masked, loopback being reachable from the same host either way.
+//
+// LAN exposure IS this endpoint's threat model, not a regression of it: every
+// route it serves is authenticated by the K10 cluster token (CA-hash-pinned by the
+// client) or the server-class secret, and the node-password binding is
+// first-write-wins per node name. It has no ambient-authority route.
+//
+// With no mesh (single node) nothing ever opens this listener, but the address is
+// still derived closed — loopback — so a future caller cannot acquire LAN exposure
+// by accident.
+func bootstrapListenAddr(meshIP string) string {
+	host := "127.0.0.1"
+	if meshIP != "" {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, strconv.Itoa(bootstrapPort))
+}
 
 // bootstrapServerDeps are the supervisor's wired dependencies. The worker-join deps
 // (CAs, tokens, node-passwords, enroller) are always set; the M6.1 server-join deps
@@ -188,7 +368,7 @@ type bootstrapServerDeps struct {
 }
 
 // startBootstrapServer serves the worker-join endpoint (and, in HA, the M6.1 CA-bundle
-// endpoint) on meshIP:bootstrapPort over a TLS listener presenting [serving-leaf,
+// endpoint) at bootstrapListenAddr over a TLS listener presenting [serving-leaf,
 // cluster-CA] so a joining node's CA-hash pin verifies. It blocks until ctx is
 // cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
 // exercise is the two-Mac K3SM_LAB gate. The MeshPeer CRD the enroller's write lands
@@ -219,7 +399,7 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 	}
 
 	hs := &http.Server{
-		Addr:              net.JoinHostPort(meshIP, fmt.Sprintf("%d", bootstrapPort)),
+		Addr:              bootstrapListenAddr(meshIP),
 		Handler:           srv.Handler(),
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{servingChain}},
 		ReadHeaderTimeout: 10 * time.Second,

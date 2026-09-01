@@ -364,8 +364,22 @@ func runServer(args []string) error {
 		// root-ca-file"), and which on a work dir that once booted single-node is a stale
 		// CA that anchors nothing — in-pod API TLS then fails cluster-wide.
 		cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
-		logger.Info("multi-node mode: apiserver + join supervisor bound to the mesh interface", "mesh-ip", opts.meshIP)
+		// The supervisor is deliberately NOT mesh-bound: a joining worker reaches
+		// it over the underlay, having no mesh until that join completes (see
+		// bootstrapListenAddr).
+		logger.Info("multi-node mode: apiserver bound to the mesh interface; the worker-join supervisor listens on every interface", "mesh-ip", opts.meshIP)
 	}
+	// 1b. The mesh IP has to be an address this host ANSWERS on before the
+	// apiserver is told to bind it. Nothing used to plumb it this early: the only
+	// writer was mesh.Start, at step 4b, so the first real `--mesh-ip 100.64.0.1`
+	// boot died at step 1 with "listen tcp 100.64.0.1:6444: bind: can't assign
+	// requested address" and a human had to alias it by hand. FAIL-FAST, unlike
+	// the log-and-continue mesh bring-up at 4b: that stage degrades a live control
+	// plane, this one decides whether there is a control plane at all.
+	if err := ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
+		return err
+	}
+
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
@@ -398,7 +412,7 @@ func runServer(args []string) error {
 	provisionClusterPolicies(ctx, cs, mode, os.Geteuid(), logger)
 
 	// 3b. M4.1 — provision the RBAC graph BEFORE the VK node (step 5) and the
-	// worker-join supervisor (step 4b) start, so a joining worker's system:node
+	// worker-join supervisor (step 4d) start, so a joining worker's system:node
 	// datapath bindings already exist when the Node,RBAC authorizer (the apiserver
 	// default since M4.1) evaluates its first request. FAIL-CLOSED: unlike the
 	// advisory admission policies above (log-and-continue), a provisioning failure
@@ -428,33 +442,95 @@ func runServer(args []string) error {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
 
-	// 4. M1.4/M3.3 — host the node-local datapath: darwin-net's Service proxy
+	// 4a. B224 — the MeshPeer CRD, on the MESH path only, BEFORE anything that can
+	// write a MeshPeer exists. Nothing used to apply it: the manifest shipped in
+	// k3sm.io/apis and every worker join 500'd at the enroller's write until a human
+	// installed the CRD by hand.
+	//
+	// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
+	// the join listener startBootstrapServer opens, because the first worker to reach
+	// that listener writes a MeshPeer — a CRD ensured afterwards would still lose
+	// whichever join won the race. Since M14.2 it also precedes this server's OWN
+	// enroll, which is the very first MeshPeer written on a fresh cluster.
+	//
+	// FAIL-CLOSED, like the RBAC graph at step 3b and unlike the log-and-continue
+	// admission policies at step 3: a missing MeshPeer CRD is not a missing advisory,
+	// it is a control plane that accepts worker joins and then fails every one of
+	// them. Halting with the reason beats serving a supervisor that cannot enroll.
+	//
+	// Single-node (--mesh-ip empty) provisions NOTHING — no MeshPeer is ever written
+	// there — and ensureMeshPeerCRD returns before it builds any client, so this call
+	// adds no failure mode to the single-node bring-up path.
+	if err := ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
+		return apiextensionsclient.NewForConfig(restCfg)
+	}, logger); err != nil {
+		return err
+	}
+
+	// 4b. M14.2 — THIS SERVER JOINS ITS OWN MESH.
+	//
+	// The enroller is constructed here, not at the supervisor (step 4d), because both
+	// callers must share ONE instance: its mutex is what serializes this node's
+	// index-0 claim against a worker join, and two instances would contend on
+	// nothing. Its construction stays FAIL-CLOSED — a supervisor that cannot enroll
+	// is a control plane that rejects every join.
+	//
+	// The self-enroll itself is LOG-AND-CONTINUE, following the precedent
+	// provisionClusterPolicies sets: under launchd KeepAlive a fatal error on this
+	// path is an unbounded respawn loop on the one process that also hosts the
+	// apiserver, kine and the scheduler, and a mesh-only defect must never take the
+	// control plane down. What is lost on failure is named in the log line, because
+	// "the server is not on its own mesh" is otherwise only visible as cross-node
+	// traffic that silently goes nowhere.
+	//
+	// It completes BEFORE step 4c builds the proxy (mesh.Start plumbs the mesh-egress
+	// lo0 alias the proxy's source bind depends on) and BEFORE step 4d opens the join
+	// listener (EnrollSelf list-back verifies the index-0 claim, so no worker can be
+	// assigned index 0 in the window).
+	var enroller *meshEnroller
+	// serverPodCIDR is the control-plane node's pod /24: the reserved index-0 carve
+	// of the cluster pod CIDR — the ONE value the routing-table locality (step 4c)
+	// and the node's podnet adapter (step 5) both allocate against (M10.1).
+	serverPodCIDR := defaultNodePodCIDR()
+	// The mesh-egress source the proxy binds for cross-node backend dials, and the
+	// peer mesh-egress /32s the NetworkPolicy table always-allows. Empty until this
+	// node is on its own mesh — an empty MeshEgressIP is the honest "no mesh here".
+	var serverMeshEgressIP string
+	var peerMeshEgress []string
+	if opts.meshIP != "" && hierarchy != nil {
+		e, err := newMeshEnroller(restCfg, logger)
+		if err != nil {
+			return fmt.Errorf("build mesh enroller: %w", err)
+		}
+		enroller = e
+		if res, err := enrollSelfAndBringUpMesh(ctx, enroller, opts, mode, exec.Kubeconfig(), logger); err != nil {
+			logger.Error("server mesh bring-up failed; this node is NOT on its own mesh, so cross-node pod traffic to it has no path and its Service proxy will source backend dials from the kernel default", "err", err)
+		} else {
+			serverPodCIDR = res.PodCIDR
+			if mode.DataPath() {
+				serverMeshEgressIP = res.MeshIP
+				// M10.4: a boot-time SNAPSHOT. A peer that enrolls after this
+				// point reconverges in wireguard via the MeshPeer watch but is
+				// not in this table until the next restart; the posture is
+				// fail-open widen-only ("never a wrong deny"), so the gap
+				// degrades attribution, not connectivity.
+				peerMeshEgress = peerMeshEgressIPs(res.Peers)
+			}
+		}
+	}
+
+	// 4c. M1.4/M3.3 — host the node-local datapath: darwin-net's Service proxy
 	// (exempted from the DNS VIP, which the per-node resolver below owns) + the
 	// per-node cluster DNS resolver bound to the DNS VIP + the pod DNSConfig the
 	// shim consumes. The NetdSocket routes the proxy/resolver privileged lo0/port
 	// ops through the root helper when unprivileged (empty in root mode → direct
 	// ops); Disabled (--network none) runs no datapath.
 	//
-	// MeshEgressIP is intentionally left empty on the server: `k3sm server` does not
-	// bring up its own wireguard mesh device yet (that is the M3.0 two-Mac lab leg),
-	// so there is no mesh-egress /32 lo0 alias to source from. Because the proxy's
-	// backend dialer binds the mesh-egress source UNCONDITIONALLY (every dial,
-	// including same-node loopback), setting a non-local value here would break ALL
-	// backend dials. It is wired the moment the server-side mesh bring-up lands.
-	// The control-plane node's pod /24: the reserved index-0 carve of the cluster
-	// pod CIDR — the ONE value both the routing-table locality below and the
-	// node's podnet adapter (step 5) allocate against (M10.1; the mesh enroller
-	// reserves index 0 for this node, workers enroll 1+).
-	//
-	// M10.4: the NetworkPolicy table's always-allow set is seeded from this config
-	// (NodeIP only here — MeshEgressIP is empty for the no-server-mesh reason
-	// above, and no peer mesh-egress /32s are known at construction: workers
-	// enroll DYNAMICALLY via the MeshPeer path after netserve is built). That is
-	// the documented dynamic-peer gap (netserve.Config.PeerMeshEgressIPs): an
-	// unseeded peer's node-origin dials are unattributable at this proxy and FAIL
-	// OPEN with a throttled Warn — widen-only, never a wrong deny. Seeding peers
-	// here rides the same follow-up as the server-side mesh bring-up.
-	serverPodCIDR := defaultNodePodCIDR()
+	// MeshEgressIP and PeerMeshEgressIPs are seeded from step 4b's enroll. The
+	// dialer's source bind is DESTINATION-SCOPED (darwin-net binds it only for a
+	// destination inside the cluster pod CIDR and outside this node's own /24), so
+	// wiring a real mesh-egress source here does not disturb loopback, ClusterIP or
+	// node-LAN dials — which is what made this wiring unsafe before M14.2.
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
 	// address — upstream validation rejects loopback endpoint addresses, so no
@@ -482,6 +558,8 @@ func runServer(args []string) error {
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
 		PodCIDR:           serverPodCIDR,
+		MeshEgressIP:      serverMeshEgressIP,
+		PeerMeshEgressIPs: peerMeshEgress,
 		VMBackend:         vmCapable,
 		VMNetSubnet:       netserve.DefaultVMNetSubnet,
 		NetdSocket:        mode.Socket,
@@ -494,40 +572,13 @@ func runServer(args []string) error {
 		}
 	}()
 
-	// 4a. B224 — the MeshPeer CRD, on the MESH path only, BEFORE anything that can
-	// write a MeshPeer exists. Nothing used to apply it: the manifest shipped in
-	// k3sm.io/apis and every worker join 500'd at the enroller's write until a human
-	// installed the CRD by hand.
-	//
-	// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
-	// the join listener startBootstrapServer opens, because the first worker to reach
-	// that listener writes a MeshPeer — a CRD ensured afterwards would still lose
-	// whichever join won the race.
-	//
-	// FAIL-CLOSED, like the RBAC graph at step 3b and unlike the log-and-continue
-	// admission policies at step 3: a missing MeshPeer CRD is not a missing advisory,
-	// it is a control plane that accepts worker joins and then fails every one of
-	// them. Halting with the reason beats serving a supervisor that cannot enroll.
-	//
-	// Single-node (--mesh-ip empty) provisions NOTHING — no MeshPeer is ever written
-	// there — and ensureMeshPeerCRD returns before it builds any client, so this call
-	// adds no failure mode to the single-node bring-up path.
-	if err := ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
-		return apiextensionsclient.NewForConfig(restCfg)
-	}, logger); err != nil {
-		return err
-	}
-
-	// 4b. M3.0/M6.1 — the worker-join supervisor (mesh-bound; mints node certs + enrolls
+	// 4d. M3.0/M6.1 — the worker-join supervisor (mesh-bound; mints node certs + enrolls
 	// peers), plus the M6.1 CA-bundle endpoint in the HA posture. Only when multi-node is
 	// enabled; the live two-Mac join is the K3SM_LAB gate (step 4a has already ensured
-	// the MeshPeer CRD the enroller's write lands in).
-	if opts.meshIP != "" && hierarchy != nil {
+	// the MeshPeer CRD the enroller's write lands in, and step 4b has already claimed
+	// index 0 through this same enroller).
+	if enroller != nil {
 		tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
-		enroller, err := newMeshEnroller(restCfg, logger)
-		if err != nil {
-			return fmt.Errorf("build mesh enroller: %w", err)
-		}
 		// M6.1 deliverable 4: in HA the node-password binding must be SHARED across
 		// servers (a name bound on A is enforced on B), so it is datastore-backed (a
 		// kube-system Secret on the shared Postgres). A single multi-node server keeps
@@ -565,7 +616,7 @@ func runServer(args []string) error {
 		}()
 	}
 
-	// 4c. M3.2 — the APFS local-path provisioner: a pure API-object controller that
+	// 4e. M3.2 — the APFS local-path provisioner: a pure API-object controller that
 	// registers the local-path StorageClass and creates a Retain, node-affinity-pinned
 	// PV for each PVC the scheduler has placed. It does NO filesystem I/O — runtimed
 	// empty-creates the per-(namespace, claim) dir on the consuming node. The class
@@ -590,7 +641,7 @@ func runServer(args []string) error {
 		<-provDone
 	}()
 
-	// 4c-bis. M8.5 — the MLX operator: ensures the MLXModel CRD, then reconciles
+	// 4f. M8.5 — the MLX operator: ensures the MLXModel CRD, then reconciles
 	// each MLXModel into a StatefulSet plus its headless and ClusterIP Services.
 	// Same lifetime and the same reasoning as the provisioner above — started now
 	// that the apiserver is healthy, and drained BEFORE exec.Stop tears the control
@@ -664,7 +715,7 @@ func runServer(args []string) error {
 
 		kubeletClientCAPEM: kubeletClientCA, // B176: :10250 requires the apiserver's client cert
 
-		// Close the loop opened at step 4c-bis: the node publishes its in-process
+		// Close the loop opened at step 4f: the node publishes its in-process
 		// runtime here, and the MLX operator's fit check starts reading live GPU
 		// facts off it. A hostprocess node never calls it, leaving the fit check
 		// skipped — the honest answer where there is no runtimed to ask.
@@ -677,8 +728,8 @@ func runServer(args []string) error {
 		transportOverrides: nodeTransportOverrides(net, mode),
 	}
 
-	// 4d/4e. M10.3 — ingress hosting + svclb, beside the netserve datapath
-	// (step 4) and like it skipped under --network none (they splice/route to
+	// 4g/4h. M10.3 — ingress hosting + svclb, beside the netserve datapath
+	// (step 4c) and like it skipped under --network none (they splice/route to
 	// ClusterIP VIPs, which need the proxy's datapath).
 	//
 	// Both bind the WILDCARD and both advertise the node's DERIVED
@@ -686,7 +737,7 @@ func runServer(args []string) error {
 	// whole decision. opts.nodeIP is READ, never written back: it feeds the
 	// apiserver's --advertise-address/--bind-address above.
 	//
-	// 4d: darwin-net's L7 ingress (RouteTable + SNI CertStore + class-filtered
+	// 4g: darwin-net's L7 ingress (RouteTable + SNI CertStore + class-filtered
 	// Watcher + Server) runs IN THIS PROCESS (SERVER-PROCESS-ONLY — multi-node
 	// ingress is a named follow-up), fed by the same in-process ADMIN client:
 	// referenced TLS Secrets are fetched by name under it, so key bytes only
@@ -694,7 +745,7 @@ func runServer(args []string) error {
 	// --ingress-http-port/--ingress-https-port select the explicit high-port
 	// integration mode (never a silent fallback).
 	//
-	// 4e: svclb (klipper-lite, B32) binds *:port listeners for every LoadBalancer
+	// 4h: svclb (klipper-lite, B32) binds *:port listeners for every LoadBalancer
 	// Service and splices them to the Service's ClusterIP VIP, advertising
 	// status.loadBalancer ONLY once a listener is actually bound.
 	//

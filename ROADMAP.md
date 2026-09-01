@@ -45,10 +45,12 @@ two-Mac gates are burned down in M7. What works:
 - **`vm` RuntimeClass — EXPERIMENTAL, preview-quality.** A fail-closed dispatch to a
   Virtualization.framework Linux micro-VM for `linux/arm64` images (e.g. Postgres): the RuntimeClass,
   the fail-closed backend selection, the capability labels, the scheduler overhead accounting, and
-  PVC-backed storage. Guest boot and restart are exercised and measured on the reference hardware
-  (see [docs/user/limitations.md](docs/user/limitations.md)); serving traffic as a Service backend
-  and in-guest cluster DNS are not wired yet. Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64`
-  only — see Next.
+  PVC-backed storage. Proven end to end on the reference hardware (see
+  [docs/user/limitations.md](docs/user/limitations.md)): boot and restart, `kubectl logs`/`exec` with
+  exit-code propagation, PersistentVolumeClaims that survive a hard hypervisor kill, in-guest cluster
+  DNS, per-container CPU and memory, and a Service routing to a `vm` pod through its ClusterIP.
+  Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64` only — an `amd64` image is refused at pull
+  rather than started and left to crash. See Next.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly

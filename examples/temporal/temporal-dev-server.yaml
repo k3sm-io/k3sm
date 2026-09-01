@@ -1,0 +1,156 @@
+# temporal-dev-server — a real multi-service system running as a Linux Pod on a Mac.
+#
+# Temporal is a durable-execution service: a gRPC frontend, a history and matching
+# engine, a worker service and a Web UI over a SQL store. This manifest runs all of
+# it from the official Temporal CLI image, whose `server start-dev` subcommand
+# bundles the Temporal Server, SQLite persistence and the Web UI in one process.
+# The image is `linux/arm64`, so it runs under the `vm` RuntimeClass — a per-Pod
+# micro-VM on Virtualization.framework — while the node stays a Mac.
+#
+# > The `vm` RuntimeClass is EXPERIMENTAL and preview-quality. See
+# > docs/user/vm-runtimeclass.md and docs/user/limitations.md before depending on it.
+#
+# WHY ONE POD AND ONE IMAGE. Every container in a `vm` Pod shares a single root
+# filesystem, so a Pod naming two different images runs the second container's
+# command against the FIRST container's image. The upstream production shape
+# (a server, a datastore and a UI as sidecars) therefore cannot be a single Pod
+# here; it has to be several. `server start-dev` collapses the whole service into
+# one image, which is what makes the one-Pod form both simplest and truthful.
+# The separate Web UI Pod in temporal-web-ui.yaml shows the multi-Pod shape.
+#
+# FOUR FIELDS THAT LOOK OPTIONAL AND ARE NOT:
+#
+#   runtimeClassName: vm       Without it the Pod runs on the default native path,
+#                              where a Linux image has no meaning.
+#
+#   nodeSelector os=darwin     The node is a Mac, guest or not — no node ever
+#                              carries kubernetes.io/os=linux, so selecting `linux`
+#                              because the image is Linux schedules nowhere. A
+#                              ValidatingAdmissionPolicy also denies any Pod that
+#                              omits this key.
+#
+#   toleration                 Every k3sm node carries the k3sm.io/provider:NoSchedule
+#                              taint; a Pod that does not tolerate it stays Pending.
+#
+#   --ip 0.0.0.0               The dev server binds `localhost` by default, which
+#                              inside the guest is reachable only from the guest.
+#                              The Service proxy dials the guest from outside it.
+#
+# RESOURCES SIZE THE GUEST. On the `vm` path the containers' memory limits are
+# summed into the guest's RAM ceiling and their CPU limits are summed and rounded
+# up to whole vCPUs. These are not scheduling hints here — they are the machine.
+#
+#   kubectl apply -f examples/temporal/temporal-dev-server.yaml
+#   kubectl get pod temporal -o wide
+#   kubectl logs -f temporal
+#   kubectl exec -it temporal -- temporal operator cluster health
+#
+# The full walkthrough, including driving the server from the macOS-native
+# `temporal` CLI, is docs/user/temporal-example.md.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temporal
+  namespace: default
+  labels:
+    app: temporal
+spec:
+  runtimeClassName: vm
+  nodeSelector:
+    kubernetes.io/os: darwin
+  # Keyed on the provider taint rather than a blanket `- operator: Exists`, which
+  # would also tolerate not-ready and unreachable and keep the Pod bound to a node
+  # that has stopped working.
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: temporal
+      # Docker Hub's official Temporal CLI image, published as a multi-arch index
+      # with a linux/arm64 manifest. The `vm` path runs linux/arm64 only: an
+      # amd64-only image is refused at admission, naming the missing capability.
+      image: docker.io/temporalio/temporal:1.8.2
+      # No `command`, so the image's own entrypoint (`temporal`) is kept and these
+      # become its arguments — the same entrypoint/args merge kubelet performs.
+      args:
+        - server
+        - start-dev
+        - --ip
+        - 0.0.0.0
+        - --port
+        - "7233"
+        - --ui-port
+        - "8233"
+      # Workflow state lives in memory: the dev server's SQLite store is ephemeral
+      # unless `--db-filename` names a file on a mounted volume. Deleting this Pod
+      # discards the workflow history with it. See the tutorial for the persistent
+      # variant and the storage ceilings that come with it.
+      ports:
+        - name: grpc
+          containerPort: 7233
+        - name: ui
+          containerPort: 8233
+      # An EXEC probe, deliberately. httpGet, tcpSocket and gRPC probes are dialed
+      # at the Pod's published pod IP, which is a `vm` Pod's identity rather than a
+      # live address — only exec reaches into the guest. The CLI that serves the
+      # cluster is the same binary this image already ships.
+      readinessProbe:
+        exec:
+          command:
+            - temporal
+            - operator
+            - cluster
+            - health
+            - --address
+            - 127.0.0.1:7233
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 10
+        failureThreshold: 6
+      resources:
+        requests:
+          cpu: "1"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+---
+# The Service. k3sm implements Services in a userspace proxy — there is no
+# kube-proxy and no iptables — and the proxy is what carries traffic to a `vm`
+# Pod's guest: a guest's live address is never published, so a client dials the
+# Service, never the pod IP.
+#
+# `type: NodePort` gets both consumers in one object:
+#
+#   in-cluster   temporal-frontend.default.svc.cluster.local:7233 — resolvable and
+#                dialable from another Pod, including from a `vm` guest. Prefer the
+#                fully qualified name inside a guest: its resolver may ignore the
+#                search list.
+#   from the Mac 127.0.0.1:30733 — every interface answers a NodePort, which is
+#                what lets the macOS-native `temporal` CLI drive this server.
+#
+# TCP only: general UDP Services are not implemented, and Temporal needs none.
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-frontend
+  namespace: default
+  labels:
+    app: temporal
+spec:
+  type: NodePort
+  selector:
+    app: temporal
+  ports:
+    - name: grpc
+      port: 7233
+      # The container's named port, so the Service survives a containerPort change.
+      targetPort: grpc
+      nodePort: 30733
+      protocol: TCP
+    - name: ui
+      port: 8233
+      targetPort: ui
+      nodePort: 30823
+      protocol: TCP

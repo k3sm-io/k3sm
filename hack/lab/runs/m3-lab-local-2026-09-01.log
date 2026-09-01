@@ -1,0 +1,213 @@
+# k3sm lab run log
+gate: M3-lab
+mode: full
+rc_tag: none
+artifact_sha256: local:a55c8460490fab60c03ebe95989151efc404a04dbe524b979ab3f3077075be21
+git_sha.apis: 22f9f2c48958fe5bf81f3b553ca24d47c76e5240
+git_sha.runtimed: 12bad5054a1135f75e0cdd3a0ef9baa454bfe845
+git_sha.darwin-net: 4c674e707dd9009f18d9e3dacc5c4d61f38d0cda
+git_sha.k3sm: 1d75205608b6dc6907393574c37ccd26437bdd91
+started_utc: 2026-09-01T14:44:00Z
+result: FAIL
+
+# HEADER PROVENANCE — read this before trusting the four fields above.
+# hack/lab/m3.sh has NO emit_run_log_header (the only emitter in the tree is
+# hack/lab/m11.sh:74). hack/lab/runs/README.md says the gate emits its own header
+# and the operator redirects it, and there is deliberately no generator. So this
+# header was HAND-RECORDED by the operator-driven run below, from the values
+# named in the appendix, not emitted by the gate. That is an evidence gap in
+# hack/lab/m3.sh to see, not to hide: the M3-lab gate cannot currently produce a
+# conformant run log on its own. Every field above is independently reproducible
+# from the appendix commands.
+#
+# git_sha.k3sm is the WORKING-TREE HEAD (branch build/mirror-debian-toolchain,
+# 1 ahead / 14 behind origin/main b11432cc1376a4baa781ce655f2edc004543d411). The
+# two source facts this run turns on were re-verified against origin/main
+# directly (appendix D) so the branch position does not weaken them.
+# artifact_sha256 is the INSTALLED /Library/k3sm/k3sm serving the live cluster:
+# k3sm 0.1.0-dev.22a84ba, commit 22a84ba1ec22b725d42793e41afab2acab0f57e8,
+# built 2026-09-01T06:36:35Z. It is a developer build, hence local:<sha>.
+
+================================================================================
+RUN — attended, operator-authorized, 2026-09-01 UTC
+Rig: MikoStudio (Mac Studio, arm64, macOS 26.6.2) — the established lab host,
+     the same machine hack/spike/m11/lib.sh reaches as its K3SM_SPIKE_HOST default.
+Intended second node: the operator's laptop. NOT REACHED — see section 1.
+Scope: every UNPRIVILEGED leg. No sudo was run. No code was changed.
+================================================================================
+
+## 1. SECOND-NODE DISCOVERY — the laptop exists and is NOT reachable
+
+Enumerated ~/.ssh/config (14 Host blocks), ~/.ssh/known_hosts (2 hostnames), and
+the host defaults in the lab/spike scripts
+(hack/spike/m11/lib.sh:27 and hack/spike/m8/lib.sh:25, both
+the same K3SM_SPIKE_HOST default; hack/lab/m3.sh names only
+K3SM_WORKER, a NODE name, never an ssh host).
+
+  ssh -o BatchMode=yes -o ConnectTimeout=5 <spike-host-default> \
+      'uname -m; sw_vers -productVersion; hostname'
+    arm64
+    26.6.2
+    MikoStudio.local
+  => the K3SM_SPIKE_HOST default is THIS Mac Studio. Confirmed, not a second node.
+
+  ssh <unrelated-project-host-0>          -> connect to port 22: Operation timed out
+  ssh <unrelated-project-host-1>          -> Connection timed out during banner exchange
+  (both belong to an unrelated project, not to k3sm lab Macs)
+
+LAN sweep, the rig's wired /24 (addresses redacted to their host role):
+  dns-sd -B _ssh._tcp local        -> only instance advertised: MikoStudio
+  dns-sd -B _companion-link._tcp   -> MikoStudio, MikoBook      <-- the laptop
+  reverse-resolve of the ARP table -> <laptop-ip>   = MikoBook.local
+                                      <other-ip>    = an Intel iMac (not Apple Silicon lab kit)
+  ping -c1 MikoBook.local          -> 64 bytes from <laptop-ip>, 10.8 ms   (L3 UP)
+  nc -z <laptop-ip> {22,23,2222,30015,62078} -> all closed
+  ssh -o BatchMode=yes MikoBook.local 'hostname'
+    ssh: connect to host mikobook.local port 22: Connection refused
+
+  Port-22 CONNECTION REFUSED (not filtered, not timed out) on a host that answers
+  ICMP is definitive: the laptop is up on the LAN and macOS Remote Login is OFF.
+  Only one other LAN address answered on 22, banner SSH-2.0-IPSSH-6.6.0 — an
+  embedded appliance, not a Mac.
+
+  VERDICT: the second node is the laptop MikoBook. It cannot be driven from
+  here. No credentials were guessed. Enabling Remote Login is an operator step
+  (section 5).
+
+## 2. GATE EXECUTED — hack/lab/m3.sh (phases.json row "M3-lab")
+
+  phases.json M3-lab: gate hack/lab/m3.sh, tier lab, requires ["two-macs"], manual true.
+
+  KUBECONFIG=$HOME/.kube/config K3SM_LAB=1 hack/lab/m3.sh
+  exit status: 1
+
+    ==> k3sm M3 lab gate (two Macs: control plane + joined worker; KUBECONFIG=$HOME/.kube/config)
+    FAIL  m3.0  multi-node cluster (need >=2 Ready nodes, got 1) — join a worker Mac first
+    M3: no worker joined — aborting
+    M3: 0 passed, 1 failed
+
+  Failing assert: hack/lab/m3.sh:68-69 (the m3.0 ladder rung), reached because
+  hack/lab/m3.sh:63-65 counted 1 Ready node.
+
+  Ladder position: m3.0 RED. The gate aborts at m3.0 by design, so m3.A (the
+  TestM3 conformance slice: NodePort, PVC-across-restart, in-pod kubectl + cluster
+  DNS on the worker) was NEVER REACHED. This log therefore says nothing about
+  those three criteria — it is not partial credit for them.
+
+## 3. CLUSTER UNDER TEST (live, unprivileged observation only)
+
+  kubectl get nodes -o wide
+    NAME              STATUS  ROLES   AGE  VERSION   INTERNAL-IP
+    k3sm-mikostudio   Ready   <none>  10h  k3sm-m1   100.64.0.1
+  Server version v1.36.2. One node. Control plane healthy and serving for 10h.
+
+  Server argv (ps -o args= -p 41350):
+    /Library/k3sm/k3sm server --runtime runtimed --token <redacted>
+  => NO --mesh-ip. This is a single-node, non-mesh server. A worker cannot join a
+     server that is not on a mesh IP (hack/lab/m3.sh:27-29 prerequisites).
+
+  MeshPeer CRD:  meshpeers.net.k3sm.io  present (created 2026-09-01T04:32:39Z)
+  MeshPeer CRs:  none
+  => D3 (CRD never applied) is LANDED and observably working on this rig: the
+     server ensures the CRD. Index 0 is unfilled, exactly as M14.2-d3 predicts.
+
+  wireguard device: NONE. utun0-utun11 are all pre-existing (VPN/mtu-1380
+  tunnels plus utun11 192.168.64.1, the Virtualization bridge). No k3sm mesh utun.
+
+## 4. WHY THE MISSING LAPTOP IS NOT THE ONLY BLOCKER — KNOWN DEFECTS
+
+Cross-checked against the M14 program plan (workspace-internal) "The defect chain, verified". Source facts
+re-verified against origin/main b11432cc, not just the working tree (appendix D).
+
+  D1 (probe/kubeconfig host hardcoded to loopback)        LANDED  k3sm #229
+  D2 (--root-ca-file pinned to the self-signed apiserver) LANDED  k3sm #231
+  D3 (MeshPeer CRD applied by nothing)                    LANDED  k3sm #232 (CRD live, above)
+  D4 (vendored kubernetes.io/role label)                  LANDED  k3sm #228
+      cmd/k3sm/node.go:1273  delete(labels, "kubernetes.io/role")
+  D5 (projected SA tokens unbound to their pod)           LANDED  k3sm #230
+
+  B213 (kubelet serving cert not signed by the cluster CA)  NOT LANDED
+      origin/main cmd/k3sm/node.go:1529 still calls certs.SelfSignedServing
+      unconditionally; nodeOptions carries no serving-keypair field; the
+      join wire's JoinResult.KubeletServingCertPEM/KeyPEM is still consumed by
+      nothing. hack/acceptance/B213.sh does not exist.
+      => kubectl logs/exec/attach/port-forward/top stay broken cluster-wide on
+         any --mesh-ip cluster. This is the M14.0 row, unstarted.
+
+  M14.2 SERVER-SIDE MESH BRING-UP                           NOT LANDED
+      origin/main cmd/k3sm/server.go:438-446, verbatim:
+        "MeshEgressIP is intentionally left empty on the server: `k3sm server`
+         does not bring up its own wireguard mesh device yet (that is the M3.0
+         two-Mac lab leg) ... setting a non-local value here would break ALL
+         backend dials. It is wired the moment the server-side mesh bring-up
+         lands."
+      No mesh.New / mesh.Start / mesh.Reconcile call exists anywhere in
+      cmd/k3sm/server.go. The server has no utun and no route to a worker /24.
+      the M14 program plan (workspace-internal) records the empirical consequence, measured on two Macs
+      on 2026-08-31: 100% packet loss to a pod IP on the other node.
+
+  CONSEQUENCE FOR THIS GATE: hack/lab/m3.sh's own m3.A criterion
+  TestM3_InPodKubectlAndDNSOnWorker requires a pod on the JOINED worker to reach
+  the node-local API VIP and CoreDNS over the mesh. With M14.2 absent that path
+  cannot carry traffic, and with B213 absent the apiserver rejects every :10250.
+  So even with the laptop joined and every root step performed today, m3.A would
+  be RED for two RECORDED, NAMED causes. This run's FAIL is a KNOWN failure, not
+  a new one.
+
+## 5. ROOT / OPERATOR STEPS NOT PERFORMED
+
+No sudo was invoked at any point in this run, and nothing below was attempted.
+Listed in dependency order so a later sitting can resume from step 0.
+
+  0. ON THE LAPTOP, by hand at the machine (not scriptable from here):
+       System Settings > General > Sharing > Remote Login = ON
+     Verify from the rig:  ssh -o BatchMode=yes MikoBook.local 'uname -m'
+
+  1. ON THE RIG (control plane) — the running server has NO --mesh-ip, so it must
+     be reinstalled onto a mesh IP before any worker can join. This TEARS DOWN the
+     live single-node cluster currently serving the M11 vm-path work; coordinate
+     before running it.
+       sudo /Library/k3sm/k3sm install server --mesh-ip <cp-mesh-ip>
+       sudo launchctl kickstart -k system/io.k3sm.server      # if already installed
+       /Library/k3sm/k3sm token create                        # mint the join token
+
+  2. ON THE LAPTOP (worker):
+       # stage the binary and the conformance helpers first — native pods exec a
+       # HOST binary path and there is no image distribution (hack/lab/m3.sh:93-96)
+       scp /Library/k3sm/k3sm MikoBook.local:/tmp/k3sm
+       ssh MikoBook.local 'sudo install -m 0755 /tmp/k3sm /Library/k3sm/k3sm'
+       ssh MikoBook.local 'sudo /Library/k3sm/k3sm install agent \
+             --server <cp-mesh-ip> --token <join-token> --node-ip <worker-mesh-ip>'
+       # then mirror $K3SM_CONFORMANCE_BIN (default /tmp/k3sm-conformance-bin)
+       # from the rig to the SAME path on the worker
+
+  3. BACK ON THE RIG, re-run this gate:
+       KUBECONFIG=$HOME/.kube/config K3SM_LAB=1 hack/lab/m3.sh \
+         | tee hack/lab/runs/m3-lab-local-<UTCdate>.log
+
+  RESUME-AFTER-ROOT: hack/lab/m3.sh itself needs NO root — it is pure kubectl plus
+  the e2e suite against $KUBECONFIG. Every root step above is CLUSTER BRING-UP,
+  which the gate's header (lines 26-30) explicitly declares out of scope
+  ("Prerequisites (manual two-Mac setup, NOT done here)"). So the resume flow is
+  simply step 3: once the two nodes are up, the gate is re-runnable unprivileged
+  by an agent. There is no partial-progress state to carry across the root steps.
+
+  EXPECTED RESULT OF STEP 3 TODAY: m3.0 goes GREEN (two Ready nodes) and m3.A goes
+  RED, for the two named causes in section 4 (B213 unlanded => the apiserver
+  rejects :10250, so in-pod kubectl fails; M14.2 unlanded => the server has no
+  mesh device, so the cross-node path carries no traffic). Performing the root
+  steps does not by itself turn this gate green.
+
+## APPENDIX — reproduction commands
+
+A. artifact sha:   shasum -a 256 /Library/k3sm/k3sm
+B. version:        /Library/k3sm/k3sm --version
+C. git shas:       git -C <repo> rev-parse HEAD   (four repos)
+D. origin/main source facts (branch-independent):
+     git -C k3sm show origin/main:cmd/k3sm/node.go   | grep -n SelfSignedServing
+     git -C k3sm show origin/main:cmd/k3sm/server.go | sed -n '435,450p'
+E. gate:           KUBECONFIG=$HOME/.kube/config K3SM_LAB=1 hack/lab/m3.sh
+F. discovery:      dns-sd -B _companion-link._tcp local
+                   ssh -o BatchMode=yes -o ConnectTimeout=5 MikoBook.local hostname
+
+result: FAIL

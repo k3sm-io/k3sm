@@ -125,6 +125,40 @@ func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
 	return nil
 }
 
+// EnsureVMRunDir creates (or repairs) the vm guest-agent socket dir owned by the
+// service uid, group staff, mode 0700 — the parent (/var/lib/k3sm/run) is
+// root:wheel so that _k3sm cannot replace netd.sock, which also means _k3sm
+// cannot mkdir inside it. Root carves out this one subdirectory instead.
+//
+// MkdirAll skips an existing directory, so owner and mode are re-applied
+// unconditionally: an install over a tree whose run/vm was left root-owned by an
+// earlier build must be repaired, not silently left unbootable for vm pods.
+func (darwinSystem) EnsureVMRunDir(dir string, uid uint32) error {
+	// The PARENT is created explicitly at 0755 before the leaf. A bare
+	// MkdirAll(dir, 0o700) would create a missing /var/lib/k3sm/run at 0700
+	// root-owned too, and _k3sm — which is only in the group — could then not
+	// even traverse it to reach the directory this function exists to give it.
+	// That is strictly worse than the bug being fixed, and it is invisible
+	// until a vm pod boots, so the parent's mode is asserted, not assumed.
+	parent := filepath.Dir(dir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create vm run dir parent %s: %w", parent, err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil { // repair a 0700 left by an earlier build
+		return fmt.Errorf("chmod vm run dir parent %s 0755: %w", parent, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create vm run dir %s: %w", dir, err)
+	}
+	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
+		return fmt.Errorf("chown vm run dir %s to %d:staff: %w", dir, uid, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil { // repair a mis-created mode (MkdirAll skips existing)
+		return fmt.Errorf("chmod vm run dir %s 0700: %w", dir, err)
+	}
+	return nil
+}
+
 // CopyToRootOwned copies src to exactly dst (parent dir created root:wheel 0755)
 // using ditto (preserves the signature/extended attributes the notarized binary
 // needs). dst is the caller's contract — never derived from src's basename, so a

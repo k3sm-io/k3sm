@@ -6,11 +6,14 @@ answer for **untrusted or multi-tenant** workloads: a real isolation boundary ba
 Virtualization.framework. It is EXPERIMENTAL and preview-quality — see the status note below before
 you depend on it.
 
-> **Status: EXPERIMENTAL, preview-quality.** A Pod that sets `runtimeClassName: vm` boots — guest
-> boot and restart have been exercised and measured on the reference hardware — but several pieces
-> are not wired yet: serving traffic as a Service backend, in-guest cluster DNS, and direct pod-IP
-> dialing. See [limitations.md](limitations.md) for the full measured picture, including what does
-> and does not work yet.
+> **Status: EXPERIMENTAL, preview-quality.** A Pod that sets `runtimeClassName: vm` boots a
+> `linux/arm64` container image in its own micro-VM. Exercised and measured on the reference
+> hardware: boot and restart, `kubectl logs` (including `--tail` and `-f`), `kubectl exec` with
+> exit-code propagation, `CrashLoopBackOff` and restart backoff, PersistentVolumeClaim storage that
+> survives a hard hypervisor kill, per-container CPU and memory accounting, and in-guest networking
+> — the guest leases an address on the node's NAT segment, resolves cluster DNS, and reaches
+> ClusterIP Services. See [limitations.md](limitations.md) for the full measured picture, including
+> what is still not wired.
 >
 > It is targeted at the **v0.1.0** public release as documented **EXPERIMENTAL** and
 > **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is deliberately held for a
@@ -37,9 +40,27 @@ metadata:
   name: untrusted-job
 spec:
   runtimeClassName: vm
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
   containers:
     - name: app
-      image: myapp
+      image: myapp          # must be linux/arm64
+```
+
+The `tolerations` entry is **required**, and is not specific to `vm`: every k3sm node carries the
+`k3sm.io/provider:NoSchedule` taint, so a Pod that does not tolerate it stays `Pending` with
+`untolerated taint` rather than running. Admission warns about a missing toleration but only injects
+one for DaemonSet Pods. The same stanza appears in [quickstart.md](quickstart.md).
+
+The image must be `linux/arm64`. An `amd64`-only image is refused at pull with a message naming the
+mismatch — it is never started and left to crash:
+
+```
+no image manifest matches a runnable platform: want [linux/arm64/v8], image provides [linux/amd64]
 ```
 
 Pods without `runtimeClassName: vm` use the default native-process runtime and therefore share the

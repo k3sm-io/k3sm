@@ -26,7 +26,6 @@ package e2e
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -218,12 +217,27 @@ func TestM3_InPodKubectlAndDNSOnWorker(t *testing.T) {
 	}
 
 	// One pod, pinned to the worker, that BOTH resolves the cluster names AND calls
-	// the apiserver (DNS + API VIP both answered node-locally on the worker).
-	pod := nativePod("m3-worker-access", "/bin/sh", "-c",
-		fmt.Sprintf(`%s resolve -name kubernetes.default.svc && %s apicall -path /api/v1/namespaces/%s/pods -expect-status 200`, bin, bin, ns))
+	// the apiserver (DNS + API VIP both answered node-locally on the worker). Both
+	// legs exec conftool DIRECTLY: a /bin/sh -c wrapper is a SIP-restricted platform
+	// binary whose exec strips DYLD_* from the environment, so the DNS shim would
+	// never reach conftool and every cluster name would be NXDOMAIN (measured on
+	// both nodes of the two-Mac rig). The resolve leg rides an init container so
+	// the two stay ordered in one pod.
+	pod := nativePod("m3-worker-access", bin, "apicall",
+		"-path", "/api/v1/namespaces/"+ns+"/pods", "-expect-status", "200")
+	pod.Spec.InitContainers = []corev1.Container{{
+		Name:    "resolve",
+		Image:   "native",
+		Command: []string{bin, "resolve", "-name", "kubernetes.default.svc"},
+	}}
 	pod.Spec.ServiceAccountName = sa
-	pod.Spec.NodeSelector = nil // pin explicitly to the worker, not the os=darwin scheduler default
-	pod.Spec.NodeName = worker
+	// Pin to the worker THROUGH the scheduler: the admission policy requires the
+	// os=darwin selector on every pod and rejects a directly-set nodeName, so the
+	// pin is the hostname selector alongside the selector the policy demands.
+	pod.Spec.NodeSelector = map[string]string{
+		"kubernetes.io/os":       "darwin",
+		"kubernetes.io/hostname": worker,
+	}
 	applyAndWaitSucceeded(t, c, pod, 120*time.Second)
 }
 
