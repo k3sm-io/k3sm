@@ -29,11 +29,13 @@
 # The platform facts this script exists to satisfy. Each was measured on the
 # k3sm vm path, and each produces a misleading error when violated:
 #
-#  1. NO /proc AND NO /sys/fs/cgroup in the container chroot by default. The
-#     kernel filesystems are guest-root-only and are not pre-mounted into the
-#     pod's rootfs. buildkitd's OCI worker and runc both need them. We are guest
-#     root, so we mount them ourselves — TOLERANT of a runtimed that already
-#     provides them (the per-container prereq change landing in parallel).
+#  1. NO /proc AND NO WORKING /sys/fs/cgroup in the container chroot by default.
+#     The kernel filesystems are guest-root-only. buildkitd's OCI worker and runc
+#     both need them, and we are guest root, so we mount them ourselves. /proc is
+#     TOLERANT of a runtimed that already provides it; cgroup2 is NOT — the
+#     per-container cgroup2 the guest hands us can be an EMPTY, non-functional
+#     hierarchy (in mountinfo, but no cgroup.controllers), so we stack a fresh
+#     cgroup2 over it UNCONDITIONALLY and verify a controllers file appears.
 #  2. The writable rootfs upper is RAM-BACKED and HARD-CAPPED. A layer store
 #     blows through it in minutes, so buildkit's --root, $TMPDIR and the buildx
 #     state dir all live on the cache PVC — but NOT as bare virtiofs paths:
@@ -91,12 +93,23 @@ is_mounted() { grep -q "[[:space:]]$1[[:space:]]" /proc/mounts 2>/dev/null; }
 if ! is_mounted /sys; then
     mount -t sysfs sysfs /sys 2>/dev/null || say "note: sysfs not mounted at /sys (continuing — cgroup2 below is what runc needs)"
 fi
-if ! is_mounted /sys/fs/cgroup; then
-    mkdir -p /sys/fs/cgroup
-    mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null \
-        || fatal "could not mount cgroup2 at /sys/fs/cgroup — runc cannot create a build container without it"
-fi
-say "kernel filesystems: /proc $(is_mounted /proc && echo ok || echo MISSING), /sys/fs/cgroup $(is_mounted /sys/fs/cgroup && echo ok || echo MISSING)"
+# cgroup2: mount a fresh hierarchy UNCONDITIONALLY, even when one is already
+# present. The per-container cgroup2 the guest hands us can be EMPTY and
+# non-functional — present in mountinfo but with no cgroup.controllers and no
+# cgroup.procs — and runc then fails every RUN step with
+# "runc run failed: no cgroup mount found in mountinfo". A fresh cgroup2 STACKED
+# over the mountpoint immediately yields a working hierarchy even when an empty
+# one is already there (root-caused live 2026-09-02; the mudkitty prototype
+# self-mounts the same way). Skipping on "already mounted" would keep the broken
+# empty view, so we never test is_mounted here.
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null \
+    || fatal "could not mount cgroup2 at /sys/fs/cgroup — runc cannot create a build container without it"
+# Fail LOUD here, not cryptically inside runc later: an empty cgroup2 exposes no
+# cgroup.controllers, so assert the fresh mount actually presents one.
+[ -e /sys/fs/cgroup/cgroup.controllers ] \
+    || fatal "cgroup2 mounted at /sys/fs/cgroup but shows no controllers — the hierarchy is non-functional"
+say "kernel filesystems: /proc $(is_mounted /proc && echo ok || echo MISSING), /sys/fs/cgroup controllers=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo NONE)"
 
 # ---- 2. buildkit state on ext4-over-loop (fact 2) --------------------------
 EXT4_IMG="$CACHE_DIR/buildkit.ext4"
