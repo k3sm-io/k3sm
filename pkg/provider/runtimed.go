@@ -42,6 +42,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
+	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -250,6 +251,20 @@ type RuntimedConfig struct {
 	// runtimed never talks to the apiserver. nil disables data-backed
 	// volumes/env/credentials (they fail closed / pull anonymously).
 	Client kubernetes.Interface
+	// ImageMirrors supplies the CLUSTER MIRROR candidates runtimed's puller falls
+	// back to when this node's own ingest registry misses a NODE-RELATIVE
+	// reference (a `localhost:<port>/…` image the operator pushed on a different
+	// Mac). k3sm.io/k3sm/pkg/clustermirror is the shipped implementation; the
+	// contract, including why the puller and not the source does the reference
+	// rewrite and why no credential crosses the seam, is owned by
+	// runtimed/pkg/image's MirrorSource.
+	//
+	// nil is the SINGLE-NODE posture and the complete, correct behavior there: no
+	// candidate is ever produced, so no fallback can run and a pull's own registry
+	// error stands as its answer. The provider never blocks on it — the source
+	// answers from a cache that may not have synced, and "no candidates yet" is a
+	// valid answer at any moment.
+	ImageMirrors image.MirrorSource
 	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
 	// set (B108) — the kernel, the initramfs and the cmdline a vm pod boots from.
 	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
@@ -316,6 +331,12 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	deps.Resolver = resolver
 	deps.Credentials = creds
 	deps.Network = network
+	// The cluster-mirror seam. Threaded as DATA, exactly like the resolver and the
+	// credential resolver above and for the same reason: runtimed never reads the
+	// apiserver, so the component that knows the cluster's peers is the one that
+	// must supply them. nil (single node, or a node with no client) leaves
+	// runtimed's puller byte-identical to its pre-mirror behavior.
+	deps.ImageMirrors = cfg.ImageMirrors
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",
