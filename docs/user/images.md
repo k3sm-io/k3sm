@@ -5,7 +5,7 @@ layers and honours their config. What it does not run is a **Linux** image: a k3
 Darwin process, so the payload inside the image must be a `darwin/arm64` executable. A Linux image
 is refused at pull rather than started and left to die at `exec`.
 
-If you are here to find out what you can actually run and how to get there, start with
+If you are here to find out what you can run and how to get there, start with
 [What runs](what-runs.md); this page is the reference behind it — the two workload conventions,
 `k3sm build` and its accepted Dockerfile subset, `k3sm image load` / `import` / `push`, and every
 deliberate difference from the Docker tool of the same name.

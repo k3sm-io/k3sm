@@ -74,7 +74,7 @@ backup is `pg_dump`/PITR on your schedule.
 The release that moved LoadBalancer listeners to the wildcard also provisions a
 `ValidatingAdmissionPolicy` that **rejects** a `type: LoadBalancer` Service declaring a port k3sm's own
 listeners own — the NodePort range `30000-32767`, or the kubelet API port `10250`. It matches on
-CREATE **and** UPDATE, and it deliberately does **not** ratchet on `oldObject`.
+CREATE **and** UPDATE, and it does **not** ratchet on `oldObject`.
 
 That means a cluster **already carrying** such a Service is not grandfathered in. The object stays in
 the datastore and keeps working, but **every subsequent write to it is denied** — not just a port

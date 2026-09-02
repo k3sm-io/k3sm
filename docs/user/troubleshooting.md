@@ -77,7 +77,7 @@ grep svclb /var/log/k3sm/server.log | tail -50
 grep ingress /var/log/k3sm/server.log | tail -50
 ```
 
-The controller emits one line at start carrying **both** addresses — they are deliberately different:
+The controller emits one line at start carrying **both** addresses — they are different:
 
 ```
 svclb: loadbalancer controller starting bind=0.0.0.0 advertise=100.64.0.1
@@ -134,7 +134,7 @@ worker-node certs — see [Certificates](certificates.md) before you rely on it.
 
 The node advertises a capability label only when its start-time probe said yes.
 
-1. Check what the node actually advertises:
+1. Check what the node advertises:
    `kubectl get nodes -L k3sm.io/virtualization,k3sm.io/rosetta,k3sm.io/rosetta-linux`.
 2. If the key is missing, the node's log carries **two** lines for it: one naming the `condition` and the
    `reason` (`NotInstalled`, `TranslationFailed`, `NotSupported`, `QueryFailed`, `VMBackendUnavailable`)
@@ -149,7 +149,7 @@ The node advertises a capability label only when its start-time probe said yes.
    [`vm` RuntimeClass](vm-runtimeclass.md#node-capability-labels).
 6. **Scheduled, but `ImagePullBackOff` with a platform error?** The two Rosetta labels are **advertised
    but not yet honored**. Multi-arch selection itself works — k3sm reads the manifest list and picks a
-   platform — but `linux/amd64` is deliberately not among the platforms it will accept, because
+   platform — but `linux/amd64` is not among the platforms it will accept, because
    translating an amd64 payload happens inside a guest and that guest path does not run yet. So an
    amd64-only image is refused at pull rather than started and left to crash. That is a documented
    gap, not a broken node; see
