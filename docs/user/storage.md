@@ -8,13 +8,20 @@ Persistent storage in k3sm uses a **local-path** provisioner with **node affinit
 - **`emptyDir` and projected volumes** work as ephemeral per-Pod storage.
 - **PersistentVolumes** use a **local-path** provisioner: a PVC is satisfied by a directory on a node's
   APFS filesystem, and the resulting PV carries **node affinity** pinning it to the node that holds the
-  data.
+  data. Binding is `WaitForFirstConsumer`, so the scheduler picks the node before the volume exists.
 
 ## Node affinity is load-bearing
 
 Because a local-path PV lives on one node's disk, a Pod that mounts it can only be scheduled onto **that
 node**. In a [multi-node](multi-node.md) cluster this means stateful Pods are pinned to wherever their
 data lives — plan placement accordingly.
+
+## Capacity is best-effort
+
+PersistentVolume data and the kine datastore share one APFS volume, so a volume that grows without
+bound can fill the disk the datastore sits on. `capacity.storage` records what the claim asked for; it
+is not a quota. Over-commit is not refused when the volume binds — it surfaces later as a write
+failure (`ENOSPC`) inside the Pod.
 
 ## Every claim must name the class
 
