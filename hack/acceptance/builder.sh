@@ -99,6 +99,7 @@ run_test "builder.3b" 1 TestUpToReady ./pkg/builder/
 run_test "builder.3c" 1 TestUpWaitsThenReady ./pkg/builder/
 run_test "builder.3d" 1 TestDownKeepsCache ./pkg/builder/
 run_test "builder.3e" 3 TestEndpoint ./pkg/builder/
+run_test "builder.3f" 1 TestUpCreatesNamespaceBeforePVC ./pkg/builder/
 
 # ---- builder.4 — legible-absence + the image-source default ---------------
 run_test "builder.4a" 1 TestStatusAbsentIsLegible ./pkg/builder/

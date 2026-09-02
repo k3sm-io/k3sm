@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 const (
@@ -307,5 +308,62 @@ func TestCountWorkers(t *testing.T) {
 				t.Errorf("countWorkers(%q) = %d, want %d", tc.out, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestUpCreatesNamespaceBeforePVC pins the ordering the live defect exposed: the
+// builder namespace must be created BEFORE the PVC/Pod/Service that target it, or
+// the create fails with "namespaces \"k3sm-builder\" not found". A reactor
+// records create order; removing the ensureNamespace step makes this red (the
+// namespace create never appears).
+func TestUpCreatesNamespaceBeforePVC(t *testing.T) {
+	cs := fake.NewSimpleClientset(builderPod(corev1.PodRunning), builderService("10.96.0.9"))
+	var order []string
+	cs.PrependReactor("create", "*", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		order = append(order, a.GetResource().Resource)
+		return false, nil, nil // let the default tracker handle it
+	})
+	m := NewManager(cs, &fakeExecer{outputs: []string{oneWorker}}, Config{}, nil)
+	m.pollInterval = time.Millisecond
+	if _, err := m.Up(context.Background()); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+
+	nsIdx, pvcIdx := -1, -1
+	for i, r := range order {
+		if r == "namespaces" && nsIdx == -1 {
+			nsIdx = i
+		}
+		if r == "persistentvolumeclaims" && pvcIdx == -1 {
+			pvcIdx = i
+		}
+	}
+	if nsIdx == -1 {
+		t.Fatalf("Up never created the builder namespace (create order: %v)", order)
+	}
+	if pvcIdx == -1 {
+		t.Fatalf("Up never created the PVC (create order: %v)", order)
+	}
+	if nsIdx > pvcIdx {
+		t.Errorf("namespace was created AFTER the PVC (order: %v) — the PVC targets a namespace that must exist first", order)
+	}
+
+	if _, err := cs.CoreV1().Namespaces().Get(context.Background(), DefaultNamespace, metav1.GetOptions{}); err != nil {
+		t.Errorf("builder namespace was not created: %v", err)
+	}
+}
+
+// TestUpNamespaceIdempotent pins that a pre-existing namespace is tolerated.
+func TestUpNamespaceIdempotent(t *testing.T) {
+	cfg := Config{}.Normalize()
+	cs := fake.NewSimpleClientset(
+		cfg.NamespaceObject(),
+		builderPod(corev1.PodRunning),
+		builderService("10.96.0.9"),
+	)
+	m := NewManager(cs, &fakeExecer{outputs: []string{oneWorker}}, Config{}, nil)
+	m.pollInterval = time.Millisecond
+	if _, err := m.Up(context.Background()); err != nil {
+		t.Fatalf("Up with an existing namespace must succeed: %v", err)
 	}
 }
