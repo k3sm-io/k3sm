@@ -6,7 +6,7 @@ Joining more than one Mac into a single k3sm cluster.
 > launch-blocking; its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as
 > preview-quality until then. See [Limitations](limitations.md).
 
-## The model
+## Mesh model
 
 One Mac runs the control plane (`k3sm server`); additional Macs join as **agents** running the Virtual
 Kubelet node. Nodes are connected by a **wireguard mesh** (the `MeshPeer` model), so Pods and Services

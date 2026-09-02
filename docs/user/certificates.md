@@ -7,7 +7,7 @@ verify the certificate authorities came through it untouched.
 > Read [Limitations](limitations.md) for what k3sm does **not** do here — most importantly,
 > rotation does not revoke anything.
 
-## The two CAs
+## Two CAs
 
 k3sm stands up two independent self-signed CAs under the server work dir's `tls/` directory
 (the k3s server-CA / client-CA split):

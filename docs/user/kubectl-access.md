@@ -2,7 +2,7 @@
 
 Talking to a k3sm cluster with `kubectl`.
 
-## The bundled path
+## Bundled path
 
 k3sm ships a `kubectl` passthrough that uses the admin kubeconfig written by `sudo k3sm install`:
 

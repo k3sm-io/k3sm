@@ -2,7 +2,7 @@
 
 Persistent storage in k3sm uses a **local-path** provisioner with **node affinity**.
 
-## The model
+## Storage model
 
 - **ConfigMaps and Secrets** are served by the apiserver and materialized into the Pod by the node.
 - **`emptyDir` and projected volumes** work as ephemeral per-Pod storage.
