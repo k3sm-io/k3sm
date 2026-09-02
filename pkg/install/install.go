@@ -42,6 +42,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
@@ -77,28 +78,37 @@ const (
 	// DefaultDataRoot is the _k3sm-owned data root (the _k3sm home): the
 	// control-plane work-dir, runtimed pods/storage/image cache live under it.
 	DefaultDataRoot = "/var/lib/k3sm"
+	// DefaultRunDir is the runtime run directory under the default data root: the
+	// directory half of every k3sm rendezvous socket (netd.sock, runtimed.sock,
+	// the per-pod vm agent sockets) and of the mesh key dir. It is composed from
+	// runtimed's OWN subdir name rather than re-typed, so the directory the
+	// installer prepares and the one provider.RuntimedSocketPath binds inside can
+	// never drift; RunDir is the same derivation for a non-default data root.
+	DefaultRunDir = DefaultDataRoot + "/" + sandbox.RunSubdir
 	// DefaultNetdSocket is the root netd unix socket the daemons rendezvous on.
-	DefaultNetdSocket = "/var/lib/k3sm/run/netd.sock"
+	DefaultNetdSocket = DefaultRunDir + "/netd.sock"
 	// DefaultAPIServerPort is the apiserver secure port (avoids Docker's :6443).
 	DefaultAPIServerPort = 6444
 	// DefaultServiceCIDR is the cluster Service CIDR the netd daemon pins so the
 	// proxy's ClusterIP VIP aliases are admitted.
 	DefaultServiceCIDR = "10.43.0.0/16"
-	// MeshKeyDir is the root-only directory the netd MeshKeyResolver reads.
-	MeshKeyDir = "/var/lib/k3sm/run/keys"
+	// MeshKeyDir is the directory the netd MeshKeyResolver reads the node's
+	// wireguard private key from. It lives inside the run dir, whose owner is the
+	// service user — see EnsureRunDir for what that ownership does and does not
+	// fence off.
+	MeshKeyDir = DefaultRunDir + "/keys"
 	// VMRunDir is the per-pod guest-agent socket directory runtimed binds under,
-	// as the SERVICE USER. It must be pre-created here because its parent
-	// (/var/lib/k3sm/run) is root:wheel — netd owns that directory so an
-	// unprivileged process cannot replace netd.sock — and an unprivileged
-	// mkdir inside a root-owned directory is EACCES. Only root can carve this
-	// one _k3sm-owned subdirectory out, and only the installer runs as root.
+	// as the SERVICE USER. It is pre-created by the installer for the same reason
+	// the run dir itself is: only root can hand the service user a directory
+	// under /var/lib, and an install over a tree an earlier build left root-owned
+	// must repair the ownership rather than leave it unusable.
 	//
 	// The path mirrors runtimed's guestAgentSocket derivation
 	// (<runtimed root>/run/vm/<podID>/agent.sock). Without it every vm pod dies
 	// at boot with "agent socket dir: mkdir /var/lib/k3sm/run/vm: permission
 	// denied" (FAILURE_REASON_SANDBOX_SETUP) on an otherwise healthy, entitled
 	// Mac — i.e. the whole vm RuntimeClass is unusable on a stock install.
-	VMRunDir = "/var/lib/k3sm/run/vm"
+	VMRunDir = DefaultRunDir + "/vm"
 	// LogDir is where the daemons' stdout/stderr are written.
 	LogDir = "/var/log/k3sm"
 )
@@ -107,6 +117,26 @@ const (
 // The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
 // message) name it, so the two can never drift apart.
 func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
+
+// RunDir returns the runtime run directory for a data root: <dataRoot>/run, with
+// an empty dataRoot meaning runtimed's default work dir. It is the DIRECTORY the
+// node's runtimed control-socket listener binds inside — the same derivation
+// provider.RuntimedSocketPath performs on the socket itself, composed from
+// runtimed's exported subdir name rather than a second literal so the directory
+// the installer prepares is by construction the one the listener needs.
+//
+// That single-sourcing is load-bearing, not tidiness. The run dir was created by
+// whichever daemon reached it first, which is root netd — leaving it root:wheel,
+// so the _k3sm server's bind of <run>/runtimed.sock failed EACCES, the node's
+// bounded retry gave up, and the control socket was silently disabled on an
+// otherwise healthy install. Install now prepares it explicitly, before either
+// daemon bootstraps.
+func RunDir(dataRoot string) string {
+	if dataRoot == "" {
+		dataRoot = sandbox.DefaultWorkDir
+	}
+	return filepath.Join(dataRoot, sandbox.RunSubdir)
+}
 
 // System is the privileged-operation seam install/uninstall drive. The real
 // darwin implementation performs the root syscalls/tools; tests inject a fake so
@@ -131,6 +161,29 @@ type System interface {
 	// spawns (the live M2-gate failure this fixes). Idempotent: perms/owner are
 	// re-applied on every install, repairing a previously mis-created dir.
 	EnsureLogDir(dir string, uid uint32) error
+	// EnsureRunDir creates (or repairs) the runtime run directory owned by the
+	// service uid (group staff, 0700) — the directory the _k3sm node binds its
+	// runtimed control socket in (RunDir / provider.RuntimedSocketPath), and the
+	// parent of the vm guest-agent socket dir and the mesh key dir.
+	//
+	// It must run BEFORE either daemon bootstraps. Whichever daemon starts first
+	// creates a missing run dir, and that is root netd — which left it root:wheel,
+	// so the unprivileged server could not create runtimed.sock there and its
+	// control socket was disabled after a bounded retry. Only root can hand the
+	// directory to the service user, and only the installer runs as root.
+	//
+	// Owner and mode are re-applied on every install, repairing a tree an earlier
+	// build left root-owned instead of silently keeping the socket unbindable.
+	//
+	// What the ownership does NOT fence off, stated plainly: root netd still
+	// creates netd.sock and reads MeshKeyDir inside a directory the service user
+	// owns (root bypasses the mode), so _k3sm — the control plane, which already
+	// drives netd over that socket — can rename or replace either. That is a
+	// smaller trust surface than it looks (netd takes its orders from _k3sm
+	// regardless), and it is the price of the service user owning the one
+	// directory it must write in; per-uid isolation is the vm RuntimeClass's job,
+	// not this directory's.
+	EnsureRunDir(dir string, uid uint32) error
 	// EnsureVMRunDir creates (or repairs) the vm guest-agent socket directory
 	// owned by the service uid (group staff, 0700). runtimed binds a per-pod
 	// socket under it as _k3sm, but its parent is root-owned so the
@@ -271,6 +324,10 @@ func (c Config) withDefaults() Config {
 	}
 	return c
 }
+
+// runDir is the runtime run directory for this Config's data root — the one the
+// installer prepares for the service user (see RunDir).
+func (c Config) runDir() string { return RunDir(c.DataRoot) }
 
 // installedBinary is the path the k3sm binary is copied to.
 func (c Config) installedBinary() string {
@@ -492,11 +549,22 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
 	}
 
-	// 1c. The vm guest-agent socket dir, for the same class of reason: runtimed
-	//     binds <VMRunDir>/<podID>/agent.sock as _k3sm, but /var/lib/k3sm/run is
-	//     root-owned (netd owns netd.sock there), so the unprivileged mkdir is
-	//     EACCES and every vm-RuntimeClass pod fails to boot. Root carves out
-	//     this one subdirectory; netd.sock stays unreachable to _k3sm.
+	// 1c. The run dir, BEFORE either daemon bootstraps — because whichever daemon
+	//     starts first creates it, and that is root netd, which left it root:wheel
+	//     0755. The _k3sm server then could not bind <run>/runtimed.sock there
+	//     (EACCES), its bounded retry gave up, and the runtimed control socket was
+	//     silently disabled on an install that otherwise looked healthy. Root netd
+	//     still creates netd.sock inside a service-user-owned directory — root
+	//     bypasses the mode — so ordering this first costs the helper nothing.
+	runDir := cfg.runDir()
+	if err := sys.EnsureRunDir(runDir, uid); err != nil {
+		return fmt.Errorf("install: ensure run dir %s: %w", runDir, err)
+	}
+
+	// 1d. The vm guest-agent socket dir inside it: runtimed binds
+	//     <VMRunDir>/<podID>/agent.sock as _k3sm, and an install over a tree an
+	//     earlier build left root-owned must repair the ownership or every
+	//     vm-RuntimeClass pod fails to boot.
 	if err := sys.EnsureVMRunDir(VMRunDir, uid); err != nil {
 		return fmt.Errorf("install: ensure vm run dir %s: %w", VMRunDir, err)
 	}

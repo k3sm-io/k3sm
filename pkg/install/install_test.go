@@ -49,6 +49,11 @@ func (f *fakeSystem) EnsureLogDir(dir string, uid uint32) error {
 	return nil
 }
 
+func (f *fakeSystem) EnsureRunDir(dir string, uid uint32) error {
+	f.calls = append(f.calls, "EnsureRunDir:"+dir)
+	return nil
+}
+
 func (f *fakeSystem) EnsureVMRunDir(dir string, uid uint32) error {
 	f.calls = append(f.calls, "EnsureVMRunDir:"+dir)
 	return nil
@@ -132,9 +137,11 @@ func TestInstallOrchestration(t *testing.T) {
 	want := []string{
 		"EnsureServiceUser:_k3sm",
 		"EnsureLogDir:/var/log/k3sm",
-		// Before any daemon bootstraps: runtimed binds each vm pod's guest-agent
-		// socket under here as _k3sm, and only root can create it inside the
-		// root-owned run dir. Missing it makes every vm pod fail to boot.
+		// Before any daemon bootstraps: root netd would otherwise create the run
+		// dir root-owned and the _k3sm server could not bind runtimed.sock in it.
+		"EnsureRunDir:/var/lib/k3sm/run",
+		// Same reason, one level down: runtimed binds each vm pod's guest-agent
+		// socket under here as _k3sm. Missing it makes every vm pod fail to boot.
 		"EnsureVMRunDir:/var/lib/k3sm/run/vm",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
