@@ -55,6 +55,82 @@ type fakeImagesDaemon struct {
 	loadChunks int
 	loadResp   *runtimev1.LoadImageResponse
 	loadErr    error
+
+	// The B191 verbs. Each keeps the request it was handed, because the gate's
+	// claim is that the CLI is a CLIENT — the daemon decides — and the only way
+	// to see that is what reached the wire.
+	gotPull     *runtimev1.PullImageRequest
+	pullResp    *runtimev1.PullImageResponse
+	pullErr     error
+	gotTag      *runtimev1.TagImageRequest
+	tagResp     *runtimev1.TagImageResponse
+	tagErr      error
+	gotUntag    *runtimev1.UntagImageRequest
+	untagResp   *runtimev1.UntagImageResponse
+	untagErr    error
+	gotInspect  []*runtimev1.InspectImageRequest
+	inspectResp *runtimev1.InspectImageResponse
+	inspectErr  error
+
+	// SaveImage is server-streaming, so the fake scripts the frames rather than
+	// a response: saveChunks are the archive frames, saveTerminal is the terminal
+	// frame (nil scripts a stream that ENDS WITHOUT ONE — the truncation the
+	// client must refuse).
+	gotSave      *runtimev1.SaveImageRequest
+	saveChunks   [][]byte
+	saveTerminal *runtimev1.SaveImageResponse
+	saveErr      error
+}
+
+func (f *fakeImagesDaemon) PullImage(_ context.Context, req *runtimev1.PullImageRequest) (*runtimev1.PullImageResponse, error) {
+	f.gotPull = req
+	if f.pullErr != nil {
+		return nil, f.pullErr
+	}
+	return f.pullResp, nil
+}
+
+func (f *fakeImagesDaemon) TagImage(_ context.Context, req *runtimev1.TagImageRequest) (*runtimev1.TagImageResponse, error) {
+	f.gotTag = req
+	if f.tagErr != nil {
+		return nil, f.tagErr
+	}
+	return f.tagResp, nil
+}
+
+func (f *fakeImagesDaemon) UntagImage(_ context.Context, req *runtimev1.UntagImageRequest) (*runtimev1.UntagImageResponse, error) {
+	f.gotUntag = req
+	if f.untagErr != nil {
+		return nil, f.untagErr
+	}
+	return f.untagResp, nil
+}
+
+func (f *fakeImagesDaemon) InspectImage(_ context.Context, req *runtimev1.InspectImageRequest) (*runtimev1.InspectImageResponse, error) {
+	f.gotInspect = append(f.gotInspect, req)
+	if f.inspectErr != nil {
+		return nil, f.inspectErr
+	}
+	return f.inspectResp, nil
+}
+
+// SaveImage replays the scripted frames. A nil saveTerminal ends the stream
+// after the chunks, which is exactly the truncated archive the wire contract
+// says a client must discard.
+func (f *fakeImagesDaemon) SaveImage(req *runtimev1.SaveImageRequest, stream runtimev1.Images_SaveImageServer) error {
+	f.gotSave = req
+	for _, chunk := range f.saveChunks {
+		if err := stream.Send(&runtimev1.SaveImageResponse{Chunk: chunk}); err != nil {
+			return err
+		}
+	}
+	if f.saveErr != nil {
+		return f.saveErr
+	}
+	if f.saveTerminal == nil {
+		return nil
+	}
+	return stream.Send(f.saveTerminal)
 }
 
 func (f *fakeImagesDaemon) PruneImages(_ context.Context, req *runtimev1.PruneImagesRequest) (*runtimev1.PruneImagesResponse, error) {
