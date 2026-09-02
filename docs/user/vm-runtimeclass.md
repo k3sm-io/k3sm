@@ -3,10 +3,9 @@
 k3sm runs Pods as native Darwin processes under a **single `_k3sm` user**, so there is **no per-pod uid
 isolation** — same-node Pods share one OS trust domain. The **`vm` RuntimeClass** is the intended
 answer for **untrusted or multi-tenant** workloads: a real isolation boundary backed by
-Virtualization.framework. It is EXPERIMENTAL and preview-quality — see the status note below before
-you depend on it.
+Virtualization.framework. See the status note below for what it supports today.
 
-> **Status: EXPERIMENTAL, preview-quality — validated on real hardware.** A Pod that sets
+> **Status: validated on real hardware.** A Pod that sets
 > `runtimeClassName: vm` boots a `linux/arm64` container image in its own micro-VM. Exercised and
 > measured on the reference hardware: boot and restart, `kubectl logs` (including `--tail` and
 > `-f`), `kubectl exec` with exit-code propagation, `CrashLoopBackOff` and restart backoff,
@@ -16,18 +15,15 @@ you depend on it.
 > Service's ClusterIP on the same node. See [Limitations](limitations.md) for the full measured
 > picture, including what is still not wired.
 >
-> It ships **EXPERIMENTAL** and **`linux/arm64` only** (`linux/amd64` needs in-guest translation
-> and is deliberately held for a later release); its live lab run is green against the release
-> artifact. The de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2**
-> milestone. Treat this path as preview-quality and single-node, and validate your own workload
-> before depending on it.
+> It ships **`linux/arm64` only** (`linux/amd64` needs in-guest translation
+> and is held for a later release); its live lab run is green against the release
+> artifact. This path is single-node.
 
 ## When to use it
 
 Use `vm` when a workload must not share the `_k3sm` trust domain with its neighbors — untrusted code,
-tenant isolation, or anything you would isolate with a strong boundary on Linux. It is EXPERIMENTAL and
-preview-quality, so validate your own workload against it before relying on it for production
-isolation — see [Limitations](limitations.md) for what is measured and what is not yet wired. This
+tenant isolation, or anything you would isolate with a strong boundary on Linux. See
+[Limitations](limitations.md) for what is measured and what is not yet wired. This
 is the same framing as [Concepts](concepts.md): the default native path is **not** a security
 boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
 [the privilege model](../privilege-model.md).
@@ -70,7 +66,8 @@ Pods without `runtimeClassName: vm` use the default native-process runtime and t
 ## Trade-offs
 
 - **Isolation** — a genuine boundary, at the cost of VM startup and overhead versus a native process.
-- **Fidelity** — as an EXPERIMENTAL path, treat behavior as preview-quality and validate your workload.
+- **Fidelity** — behavior is measured against the reference hardware; see
+  [Limitations](limitations.md) for what is covered and what is not yet wired.
 - **Fallback posture** — when a Seatbelt SPI symbol-canary trips on the native path, the runtime degrades
   to `vm` or refuse-to-run, never to an unconfined process (see
   [the privilege model](../privilege-model.md)).
@@ -83,7 +80,7 @@ absent** — never `"false"` — and it is **removed** when the capability goes 
 
 | Label | Present when the host can… | Gated by | k3sm honors it today? |
 |---|---|---|---|
-| `k3sm.io/virtualization` | run the `vm` RuntimeClass (Virtualization.framework) | the `vm` RuntimeClass's own `nodeSelector` | yes — for scheduling (the `vm` path itself is EXPERIMENTAL) |
+| `k3sm.io/virtualization` | run the `vm` RuntimeClass (Virtualization.framework) | the `vm` RuntimeClass's own `nodeSelector` | yes — for scheduling |
 | `k3sm.io/rosetta` | translate **darwin/amd64** Mach-O payloads via host **Rosetta 2** — natively, no VM | your Pod's `nodeSelector` | **not yet — see "advertised, not yet honored" below** |
 | `k3sm.io/rosetta-linux` | translate **linux/amd64** ELF payloads in a Linux guest via **Rosetta for Linux** | your Pod's `nodeSelector` | **not yet — see "advertised, not yet honored" below** |
 

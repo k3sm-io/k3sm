@@ -49,7 +49,7 @@ and the one this node needs, rather than pulling it and failing opaquely at exec
 Note the distinction this section is *not* making: the objection is to **Linux**, not to OCI. The
 image format, the registry protocol, tags, digests, pull policy and pull secrets all work normally —
 see [What runs](what-runs.md). `linux/arm64` payloads are the province of the
-[`vm` RuntimeClass](vm-runtimeclass.md), an EXPERIMENTAL preview-quality path — see
+[`vm` RuntimeClass](vm-runtimeclass.md) — see
 [Limitations](limitations.md).
 
 ## Building an image: `k3sm build`

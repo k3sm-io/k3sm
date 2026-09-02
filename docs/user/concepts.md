@@ -9,7 +9,7 @@ On the default path, k3sm has **no Linux, no containers, no cgroups, no CNI, no 
 namespaces**. A Pod's containers are launched as native macOS processes (`posix_spawn`),
 Seatbelt-confined, with an APFS-cloned root. This is the fundamental difference from every Linux
 Kubernetes distribution and the reason several behaviors diverge — see
-[Limitations](limitations.md). An EXPERIMENTAL `vm` RuntimeClass opts a Pod into a real Linux
+[Limitations](limitations.md). The `vm` RuntimeClass opts a Pod into a real Linux
 guest instead — see [`vm` RuntimeClass](vm-runtimeclass.md).
 
 ## Control plane
@@ -28,9 +28,8 @@ processes rather than a container runtime.
 
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
 same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads the **`vm`
-RuntimeClass** is the intended isolation boundary — it boots and runs a Pod, but it is EXPERIMENTAL
-and preview-quality, so treat one node as one trust domain until it is validated for your workload.
-See [`vm` RuntimeClass](vm-runtimeclass.md). The rationale lives in
+RuntimeClass** is the intended isolation boundary — it boots a Pod into its own micro-VM,
+validated on real hardware. See [`vm` RuntimeClass](vm-runtimeclass.md). The rationale lives in
 [the privilege model](../privilege-model.md). This is the same framing you will see in
 [Limitations](limitations.md).
 
@@ -40,7 +39,7 @@ k3sm workloads are OCI images whose payload is a **native Darwin executable**. R
 tags, digests, pull policy and pull secrets work as in any Kubernetes; `k3sm build` packages a
 binary into an image from a COPY-only Dockerfile, and `k3sm image load` ingests a tarball without a
 registry. For development, a Pod can name a binary directly (`image: native` plus an absolute
-`command`). A `linux/arm64` image runs under the `vm` RuntimeClass, which is EXPERIMENTAL. See
+`command`). A `linux/arm64` image runs under the `vm` RuntimeClass. See
 [Images](images.md) and [Linux images](vm-runtimeclass.md).
 
 ## Networking
