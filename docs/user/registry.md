@@ -103,6 +103,41 @@ Pod reference `localhost:<port>/…` with nothing configured.
 the port can read the images this cluster runs, and only the holder of the current push credential
 can put a new one there.
 
+## Using Images Across the Cluster
+
+Every node runs its own registry, so `localhost:6450/myapp:v1` names a **different** registry on
+every Mac in the cluster. Push on one machine, let the scheduler place the Pod on another, and the
+pull fails — the reference is right, and the node it landed on was simply never fed.
+
+k3sm closes that without asking you to do anything differently. Each node publishes where its own
+registry can be reached from inside the cluster, and a node that cannot find a `localhost:<port>/…`
+image in its own registry asks the other nodes for it. The image is stored under the name your Pod
+asked for, so nothing downstream can tell which machine the bytes came from, and every layer is
+verified against its digest exactly as it is on a pull from a public registry.
+
+Two things are worth knowing about how it behaves.
+
+**The direction matters.** The node running the Pod dials the node that has the image. So the
+machine you pushed to has to be up and on the cluster network at the moment the pull happens — this
+is a fallback between running nodes, not a copy made in advance. If that machine is off, the pull
+fails the same way it would have before, and the Pod reports the same image-pull error.
+
+**Reading is open inside the cluster; writing is not.** A pull between nodes is anonymous, which is
+what lets a Pod reference `localhost:<port>/…` with nothing configured. Pushing still needs the
+per-boot credential, and that credential never leaves the machine that minted it — so another node
+can read the images this cluster runs and cannot put a new one there.
+
+Nothing about the registry's own listener changes: it still binds loopback and refuses anything
+else. What is reachable from the rest of the cluster is a separate, narrow forwarder that carries
+connections to it, on the cluster network address and nowhere else.
+
+A process running **inside** a Linux-guest Pod — a build running in the cluster, say — reaches the
+node's registry at the guest network's gateway address (the first address of the `192.168.64.0/24`
+segment) rather than at `localhost`, because a guest's `localhost` is its own.
+
+On a single-machine cluster none of this is in play: there are no other nodes, nothing is published,
+and no forwarder is started.
+
 ## Storage
 
 Image content lives under the control plane's state directory:
@@ -119,7 +154,14 @@ depends on its contents.
 ## Security Posture
 
 - **Loopback only.** The listener binds `127.0.0.1` and that is not configurable — a non-loopback
-  bind is rejected at startup rather than served. Nothing off your Mac can reach it.
+  bind is rejected at startup rather than served. On a single-machine cluster, nothing off your Mac
+  can reach it.
+- **Reachable from the rest of the cluster, and only from there.** On a multi-machine cluster a
+  separate forwarder carries connections from the cluster network to that loopback listener, so
+  another node can pull an image this machine holds. It adds exactly two addresses — the cluster
+  network address and the guest network's gateway — and never a wildcard bind, so it does not
+  expose the registry to any other network your Mac is on. See
+  [Using Images Across the Cluster](#using-images-across-the-cluster).
 - **Plain HTTP, no TLS.** A certificate would buy nothing against an attacker who is already
   running code on the host, and it would mean every client had to be taught a new trust anchor.
 - **Anonymous read.** Any process on the machine can list and pull the images the cluster runs.

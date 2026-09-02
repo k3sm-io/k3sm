@@ -43,6 +43,21 @@ import (
 // binary that could not have driven a guest anyway.
 func vmBackendAvailable() bool { return sandbox.NewVMBackend().Available() }
 
+// guestNATSubnet returns the NAT segment this node's Linux guests attach to, or
+// "" when this node cannot host one.
+//
+// It exists so the two consumers of that segment — the ingest registry's relay,
+// whose gateway bind is the only address a guest can reach a host listener at,
+// and the NetworkPolicy table's fail-closed unknown-vm-source branch — make the
+// SAME decision from the same probe. A node with no vm backend names no segment,
+// so nothing is bound and nothing is scoped for guests that cannot exist.
+func guestNATSubnet(vmCapable bool) string {
+	if !vmCapable {
+		return ""
+	}
+	return netserve.DefaultVMNetSubnet
+}
+
 // nodeTransportOverrides returns the sink the in-process node feeds vm-pod
 // transport overrides into: the node-local datapath's Server, which forwards to
 // the Service proxy's routing table (netserve.Server.SetTransportOverrides).

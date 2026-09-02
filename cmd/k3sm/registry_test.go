@@ -113,7 +113,11 @@ func TestStartIngestRegistry(t *testing.T) {
 	t.Run("a healthy registry is published and torn down", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), svc, 6450, cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace), logger)
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a",
+			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger: logger,
+		})
 		if stop == nil {
 			t.Fatal("startIngestRegistry returned a nil teardown; the caller defers it unconditionally")
 		}
@@ -140,7 +144,11 @@ func TestStartIngestRegistry(t *testing.T) {
 	t.Run("a registry that cannot start is not fatal and publishes nothing", func(t *testing.T) {
 		svc := &fakeRegistry{startErr: errors.New("port held")}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), svc, 6450, cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace), logger)
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
+			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger: logger,
+		})
 		if stop == nil {
 			t.Fatal("startIngestRegistry returned a nil teardown on the failure path")
 		}
@@ -148,15 +156,72 @@ func TestStartIngestRegistry(t *testing.T) {
 			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{}); err == nil {
 			t.Error("a registry that never started still published a discovery ConfigMap naming its port")
 		}
+		// Nor an advertisement: a peer that found one would wait out a dial to a
+		// port nothing is listening on, on every pull that missed locally.
+		if _, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), registrysvc.AdvertisementName("mac-a"), metav1.GetOptions{}); err == nil {
+			t.Error("a registry that never started still advertised itself to peers")
+		}
 		stop() // must not panic on a service that never started
 		if svc.shutdowns != 0 {
 			t.Errorf("shutdowns = %d, want 0 — nothing was started", svc.shutdowns)
 		}
 	})
 
+	t.Run("a mesh node advertises itself and retracts on teardown", func(t *testing.T) {
+		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
+		cs := fake.NewSimpleClientset()
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
+			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger: logger,
+		})
+		cm, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), registrysvc.AdvertisementName("mac-a"), metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("this node published no advertisement, so no peer can pull from it: %v", err)
+		}
+		if got := cm.Data[registrysvc.AdvertisementMeshHostKey]; got != "100.64.1.1:6450" {
+			t.Errorf("advertised %q, want the node's own mesh address and the registry port", got)
+		}
+		stop()
+		// Retracted: a peer must stop being told to dial a registry that is going
+		// away. Best effort, but the clean-shutdown path is the one that can.
+		if _, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), registrysvc.AdvertisementName("mac-a"), metav1.GetOptions{}); err == nil {
+			t.Error("the advertisement survived a clean shutdown")
+		}
+	})
+
+	t.Run("a single node advertises nothing", func(t *testing.T) {
+		// No mesh address: there is no address a peer could dial, and an
+		// advertisement naming one would be a lie a peer then dials.
+		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
+		cs := fake.NewSimpleClientset()
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a",
+			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger: logger,
+		})
+		defer stop()
+		list, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
+			List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, cm := range list.Items {
+			if strings.HasPrefix(cm.Name, registrysvc.AdvertisementPrefix) {
+				t.Errorf("a node with no mesh address published %s", cm.Name)
+			}
+		}
+	})
+
 	t.Run("a failed publish leaves the registry serving", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
-		stop := startIngestRegistry(t.Context(), svc, 6450, failingConfigMaps{}, logger)
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
+			cms: failingConfigMaps{}, logger: logger,
+		})
 		if svc.starts != 1 {
 			t.Fatalf("starts = %d, want 1", svc.starts)
 		}
@@ -208,6 +273,10 @@ func (failingConfigMaps) Create(context.Context, *corev1.ConfigMap, metav1.Creat
 
 func (failingConfigMaps) Update(context.Context, *corev1.ConfigMap, metav1.UpdateOptions) (*corev1.ConfigMap, error) {
 	return nil, errors.New("apiserver unavailable")
+}
+
+func (failingConfigMaps) Delete(context.Context, string, metav1.DeleteOptions) error {
+	return errors.New("apiserver unavailable")
 }
 
 // discard is an io.Writer that drops the test logger's output.

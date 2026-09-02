@@ -51,8 +51,10 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/runtimed/pkg/image"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/clustermirror"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/mlx/operator"
@@ -181,6 +183,14 @@ type nodeOptions struct {
 	// inert: every backend is dialed at its published address, exactly as a
 	// host-process pod's is.
 	transportOverrides provider.TransportOverrideSink
+
+	// imageMirrors supplies the peer ingest registries runtimed's puller falls
+	// back to when this node's own registry misses a node-relative
+	// `localhost:<port>/…` reference — the image was pushed on a different Mac.
+	// It is set by startNode from the node's own apiserver client (every bring-up
+	// that has one gets it), never by a caller, and nil restores the single-node
+	// behavior in which no fallback can run.
+	imageMirrors image.MirrorSource
 
 	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
 	// runtime as soon as it is built, so a consumer started EARLIER in the same
@@ -697,6 +707,23 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	defer eventBroadcaster.Shutdown()
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "k3sm", Host: opts.nodeName})
 
+	// Cluster image mirrors (the peer ingest registries this node may fall back
+	// to). Started HERE, off the node's own client, so every bring-up that has an
+	// apiserver gets it from one place — and BEFORE the provider, because the
+	// provider construction is what threads the source into runtimed's puller.
+	//
+	// Start does not block on the informer's first sync: a node must not wait on
+	// an apiserver round trip to learn about mirrors it may never need, and until
+	// the cache is warm the source answers "no candidates", which is exactly the
+	// single-node behavior. It cannot fail bring-up — see clustermirror's doc.
+	mirrors := clustermirror.New(clustermirror.Config{
+		NodeName: opts.nodeName,
+		Client:   cs,
+		Logger:   slog.Default(),
+	})
+	mirrors.Start(ctx)
+	opts.imageMirrors = mirrors
+
 	prov, netAdapter, runtimeLabel, caps, err := buildProvider(ctx, opts, cs, recorder)
 	if err != nil {
 		return err
@@ -1136,6 +1163,11 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// component holding both, so it feeds the map. nil here (no datapath) leaves
 		// the feed inert.
 		TransportOverrides: opts.transportOverrides,
+		// The cluster-mirror seam: the peer registries runtimed's puller consults
+		// when this node's own ingest registry misses a node-relative reference.
+		// nil (a bring-up with no apiserver client) leaves the puller with no
+		// fallback, which is the single-node behavior.
+		ImageMirrors: opts.imageMirrors,
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).

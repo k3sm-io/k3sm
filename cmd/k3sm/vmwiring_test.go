@@ -150,3 +150,22 @@ func TestVMDatapathWiring(t *testing.T) {
 		}
 	})
 }
+
+// TestGuestNATSubnet pins the ONE decision two consumers share: the NAT segment
+// this node's Linux guests attach to.
+//
+// The registry relay's gateway bind is derived from it, and that bind is the only
+// address a guest can reach a host listener at — a guest cannot reach loopback
+// (measured; hack/spike/m11/findings-s5.md criterion 1a). So a node that CAN host
+// guests must name the segment, and a node that cannot must name nothing: binding
+// a gateway for guests that can never exist opens an address for no one.
+func TestGuestNATSubnet(t *testing.T) {
+	t.Parallel()
+
+	if got := guestNATSubnet(true); got != netserve.DefaultVMNetSubnet {
+		t.Errorf("guestNATSubnet(true) = %q, want the one named segment constant %q", got, netserve.DefaultVMNetSubnet)
+	}
+	if got := guestNATSubnet(false); got != "" {
+		t.Errorf("guestNATSubnet(false) = %q, want empty — this node hosts no guests", got)
+	}
+}
