@@ -18,8 +18,11 @@
 #   half: what a node advertises and what it refuses to advertise, the reader's
 #   strictness against a malformed or hostile advertisement, the relay's closed
 #   set of bindable addresses (the ONLY off-loopback exposure in the product),
-#   the mirror source's self-exclusion and stable order, and the seam wiring that
-#   carries peers into runtimed's puller.
+#   the mirror source's self-exclusion and stable order, the seam wiring that
+#   carries peers into runtimed's puller, and the RBAC grant that lets a node
+#   read the advertisements at all — pinned to its exact verbs, because that
+#   grant is the one thing here that widens what every node in the cluster may
+#   do, and a widening of it is invisible to every other rung.
 #
 #   LIVE TIER (two Macs) — the thing itself: push on node A only, schedule a Pod
 #   on node B naming `localhost:<port>/<ref>`, and watch it reach Running by way
@@ -50,11 +53,12 @@ for src in \
 	pkg/registrysvc/advert.go \
 	pkg/registrysvc/relay.go \
 	pkg/clustermirror/source.go \
+	pkg/rbac/rbac.go \
 	cmd/k3sm/registry.go
 do
 	[ -f "$K3SM_ROOT/$src" ] || b0=no
 done
-ladder "$b0" "mirrors.0  gate parses (bash -n) + the advertisement, relay, mirror source and server wiring are present"
+ladder "$b0" "mirrors.0  gate parses (bash -n) + the advertisement, relay, mirror source, RBAC grant and server wiring are present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "cluster-mirrors: the gate or its sources are missing/unparseable — nothing else can run" >&2
@@ -143,18 +147,29 @@ run_flat_test "mirrors.4c" TestStartWatchesTheCluster ./pkg/clustermirror/
 # A seam that is never assigned leaves a node that starts, runs every pod it has,
 # and simply never falls back to a peer. Nothing else in the suite goes red.
 run_test "mirrors.5a" 3 TestClusterMirrorWiring ./cmd/k3sm/
-run_test "mirrors.5b" 5 TestStartIngestRegistry ./cmd/k3sm/
+run_test "mirrors.5b" 6 TestStartIngestRegistry ./cmd/k3sm/
 run_flat_test "mirrors.5c" TestGuestNATSubnet ./cmd/k3sm/
 
-# ---- mirrors.6 — the consumer end of the seam (cross-module) --------------
+# ---- mirrors.6 — the grant that lets a node read the advertisements -------
+# A node's puller watches the advertisement ConfigMaps, and an informer needs
+# list and watch — neither of which RBAC's resourceNames can narrow. So the
+# NAMESPACE is the scope, which is why the advertisements have their own and why
+# these two rungs assert an exact shape rather than mere presence: three verbs,
+# one resource, one namespaced Role bound to system:nodes, and the cluster-scoped
+# node-datapath ClusterRole pinned byte-for-byte so a namespaced read cannot have
+# quietly become a cluster-wide one. Operator-approved 2026-09-02.
+run_flat_test "mirrors.6a" TestRBACRegistryAdvertReaderRole ./pkg/rbac/
+run_flat_test "mirrors.6b" TestRBACNodeDatapathUnchangedByTheRegistryGrant ./pkg/rbac/
+
+# ---- mirrors.7 — the consumer end of the seam (cross-module) --------------
 # Every test above proves k3sm SUPPLIES peers. This one proves runtimed's puller
 # CONSUMES them: it drives Deps.ImageMirrors through the puller the daemon itself
 # builds, against two real in-process registries, with a negative control. It
 # runs only when the sibling module is resolvable from this checkout.
 if (cd "$K3SM_ROOT" && "${GOFLAGS_ENV[@]}" go list k3sm.io/runtimed/pkg/runtime >/dev/null 2>&1); then
-	run_test "mirrors.6" 2 TestDefaultPullerConsultsClusterMirrors k3sm.io/runtimed/pkg/runtime
+	run_test "mirrors.7" 2 TestDefaultPullerConsultsClusterMirrors k3sm.io/runtimed/pkg/runtime
 else
-	pending "mirrors.6  the runtimed-side fallback test           (k3sm.io/runtimed is not resolvable from this checkout)"
+	pending "mirrors.7  the runtimed-side fallback test           (k3sm.io/runtimed is not resolvable from this checkout)"
 fi
 
 # ---- LIVE TIER (two Macs) — OWED, never claimed ---------------------------
@@ -163,11 +178,16 @@ fi
 # one-Mac run would prove only that a node can pull from itself.
 echo "----------------------------------------"
 echo "LIVE TIER (two Macs, run by hand on the lab rig):"
-pending "mirrors.7  both nodes advertise: kubectl get cm -n kube-public | grep k3sm-node-registry-"
-pending "mirrors.8  node A only: k3sm image push <layout> localhost:<port>/probe:t"
-pending "mirrors.9  a Pod pinned to node B naming localhost:<port>/probe:t reaches Running"
-pending "mirrors.10 node B's log carries \"pulled from a cluster mirror\" naming node A's mesh host"
-pending "mirrors.11 a vm-RuntimeClass Pod on either node pushes to <vmnet-gateway>:<port>"
+pending "mirrors.8  both nodes advertise: kubectl get cm -n k3sm-registry | grep k3sm-node-registry-"
+pending "mirrors.9  the grant is in place: kubectl get role,rolebinding -n k3sm-registry k3sm-registry-advert-reader"
+pending "mirrors.10 a node identity may read them and nothing else there:"
+pending "           kubectl auth can-i list configmaps -n k3sm-registry --as-group=system:nodes --as=system:node:<node>   => yes"
+pending "           kubectl auth can-i list secrets    -n k3sm-registry --as-group=system:nodes --as=system:node:<node>   => no"
+pending "           kubectl auth can-i list configmaps -n kube-public    --as-group=system:nodes --as=system:node:<node>   => no"
+pending "mirrors.11 node A only: k3sm image push <layout> localhost:<port>/probe:t"
+pending "mirrors.12 a Pod pinned to node B naming localhost:<port>/probe:t reaches Running"
+pending "mirrors.13 node B's log carries \"pulled from a cluster mirror\" naming node A's mesh host"
+pending "mirrors.14 a vm-RuntimeClass Pod on either node pushes to <vmnet-gateway>:<port>"
 
 echo "----------------------------------------"
 echo "cluster-mirrors: $PASS passed, $FAIL failed, $PENDING OWED"

@@ -440,7 +440,7 @@ func runServer(args []string) error {
 	if err := rbac.Provision(ctx, cs); err != nil {
 		return fmt.Errorf("provision rbac graph: %w", err)
 	}
-	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader); authorizer is Node,RBAC")
+	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader + registry-advertisement reader); authorizer is Node,RBAC")
 
 	// 3c. B170 — SSA-converge the EMBEDDED add-on manifest set. The manifests are
 	// compiled into this binary (embed.FS), never read from disk: the work dir is
@@ -501,7 +501,8 @@ func runServer(args []string) error {
 				// (it cannot reach loopback). A node that cannot host guests names no
 				// segment and gets no such bind.
 				vmNetSubnet: guestNATSubnet(vmCapable),
-				cms:         cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+				hostingCMs:  cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+				advertCMs:   cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
 				logger:      logger,
 			})
 			defer stopRegistry()

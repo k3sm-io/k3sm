@@ -78,8 +78,19 @@ func TestAdvertisement(t *testing.T) {
 			if want := AdvertisementPrefix + tc.node; cm.Name != want {
 				t.Errorf("name = %q, want %q", cm.Name, want)
 			}
-			if cm.Namespace != AdvertisementNamespace {
-				t.Errorf("namespace = %q, want %q", cm.Namespace, AdvertisementNamespace)
+			// Pinned as a LITERAL rather than against the constant the object was
+			// rendered from, because the namespace is not an implementation
+			// detail here: it IS the scope of the node identity's read grant
+			// (pkg/rbac's registry-advertisement reader Role). A rename, or a
+			// move back beside the KEP-1755 document in the shared kube-public
+			// namespace, silently widens what every node may read — so it has to
+			// be a red test, and an assertion against the constant could never
+			// be one.
+			if cm.Namespace != "k3sm-registry" {
+				t.Errorf("namespace = %q, want the dedicated k3sm-registry namespace the node read grant is scoped to", cm.Namespace)
+			}
+			if AdvertisementNamespace == HostingNamespace {
+				t.Errorf("the advertisements share %q with the KEP-1755 document, so the node read grant is no longer scoped to advertisements", HostingNamespace)
 			}
 			if cm.Data[AdvertisementNodeKey] != tc.node {
 				t.Errorf("data[%s] = %q, want %q", AdvertisementNodeKey, cm.Data[AdvertisementNodeKey], tc.node)

@@ -127,6 +127,10 @@ what lets a Pod reference `localhost:<port>/…` with nothing configured. Pushin
 per-boot credential, and that credential never leaves the machine that minted it — so another node
 can read the images this cluster runs and cannot put a new one there.
 
+Each node publishes where its registry can be reached as a ConfigMap in the **`k3sm-registry`**
+namespace, which k3sm creates for exactly this. Nodes are granted read on that one namespace and
+nothing more — `kubectl get configmaps -n k3sm-registry` shows what they see.
+
 Nothing about the registry's own listener changes: it still binds loopback and refuses anything
 else. What is reachable from the rest of the cluster is a separate, narrow forwarder that carries
 connections to it, on the cluster network address and nowhere else.

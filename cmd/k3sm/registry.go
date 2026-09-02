@@ -96,9 +96,14 @@ type ingestRegistry struct {
 	// which is the only way a guest can reach a host listener (a guest cannot
 	// reach loopback).
 	vmNetSubnet string
-	// cms writes both ConfigMaps: the KEP-1755 discovery document and this node's
-	// own advertisement.
-	cms registrysvc.AdvertisementClient
+	// hostingCMs writes the KEP-1755 discovery document, in kube-public.
+	hostingCMs registrysvc.ConfigMapClient
+	// advertCMs writes and retracts this node's own advertisement, in
+	// registrysvc.AdvertisementNamespace. It is a SECOND client because the two
+	// objects live in different namespaces on purpose: the advertisement set is
+	// namespace-isolated so the read grant a node identity gets can be scoped to
+	// it (pkg/rbac), and a namespaced client is bound to one namespace.
+	advertCMs registrysvc.AdvertisementClient
 	// logger receives bring-up and teardown events.
 	logger *slog.Logger
 }
@@ -125,7 +130,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) func() {
 		logger.Error("ingest registry disabled", "err", err)
 		return func() {}
 	}
-	if err := registrysvc.PublishHosting(ctx, r.cms, r.port); err != nil {
+	if err := registrysvc.PublishHosting(ctx, r.hostingCMs, r.port); err != nil {
 		// The registry is serving and pushes to it work; only the DISCOVERY of it
 		// failed. Reporting and continuing keeps the working half working.
 		logger.Error("publish the local-registry-hosting ConfigMap", "err", err,
@@ -167,7 +172,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) func() {
 // single-node cluster that is the whole truth, not a degradation.
 func (r ingestRegistry) advertise(ctx context.Context, wg *sync.WaitGroup) {
 	publish := func(ctx context.Context) {
-		err := registrysvc.PublishAdvertisement(ctx, r.cms, r.nodeName, r.meshIP, r.port)
+		err := registrysvc.PublishAdvertisement(ctx, r.advertCMs, r.nodeName, r.meshIP, r.port)
 		switch {
 		case err == nil:
 		case errors.Is(err, registrysvc.ErrNoMeshAddress):
@@ -241,7 +246,7 @@ func (r ingestRegistry) retract(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, registryRetractGrace)
 	defer cancel()
-	if err := registrysvc.RemoveAdvertisement(ctx, r.cms, r.nodeName); err != nil {
+	if err := registrysvc.RemoveAdvertisement(ctx, r.advertCMs, r.nodeName); err != nil {
 		r.logger.Warn("retract this node's registry advertisement", "err", err,
 			"name", registrysvc.AdvertisementName(r.nodeName))
 	}

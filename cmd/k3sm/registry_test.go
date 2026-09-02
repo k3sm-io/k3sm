@@ -115,8 +115,9 @@ func TestStartIngestRegistry(t *testing.T) {
 		cs := fake.NewSimpleClientset()
 		stop := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a",
-			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-			logger: logger,
+			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger:     logger,
 		})
 		if stop == nil {
 			t.Fatal("startIngestRegistry returned a nil teardown; the caller defers it unconditionally")
@@ -146,8 +147,9 @@ func TestStartIngestRegistry(t *testing.T) {
 		cs := fake.NewSimpleClientset()
 		stop := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
-			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-			logger: logger,
+			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger:     logger,
 		})
 		if stop == nil {
 			t.Fatal("startIngestRegistry returned a nil teardown on the failure path")
@@ -173,8 +175,9 @@ func TestStartIngestRegistry(t *testing.T) {
 		cs := fake.NewSimpleClientset()
 		stop := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
-			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-			logger: logger,
+			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger:     logger,
 		})
 		cm, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
 			Get(context.Background(), registrysvc.AdvertisementName("mac-a"), metav1.GetOptions{})
@@ -200,8 +203,9 @@ func TestStartIngestRegistry(t *testing.T) {
 		cs := fake.NewSimpleClientset()
 		stop := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a",
-			cms:    cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-			logger: logger,
+			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger:     logger,
 		})
 		defer stop()
 		list, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
@@ -216,11 +220,53 @@ func TestStartIngestRegistry(t *testing.T) {
 		}
 	})
 
+	t.Run("the discovery document and the advertisement land in different namespaces", func(t *testing.T) {
+		// The separation is what earns the node identity's read grant its scope:
+		// an informer needs list and watch, RBAC's resourceNames constrains
+		// neither, so the namespace holding the advertisements IS the scope of
+		// what a node may read (pkg/rbac). Publishing both into kube-public — as
+		// this used to — would have made that grant read everything parked there.
+		if registrysvc.AdvertisementNamespace == registrysvc.HostingNamespace {
+			t.Fatalf("the advertisements share %q with the KEP-1755 document; the node read grant is no longer scoped to advertisements",
+				registrysvc.HostingNamespace)
+		}
+		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
+		cs := fake.NewSimpleClientset()
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
+			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			logger:     logger,
+		})
+		defer stop()
+
+		// The KEP-1755 document stays in kube-public, which the KEP mandates.
+		if _, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
+			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{}); err != nil {
+			t.Errorf("the KEP-1755 document is not in %s: %v", registrysvc.HostingNamespace, err)
+		}
+		// …and no advertisement follows it there.
+		hosting, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
+			List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Fatalf("list %s: %v", registrysvc.HostingNamespace, err)
+		}
+		for _, cm := range hosting.Items {
+			if strings.HasPrefix(cm.Name, registrysvc.AdvertisementPrefix) {
+				t.Errorf("advertisement %s was published into %s, outside the scoped namespace", cm.Name, registrysvc.HostingNamespace)
+			}
+		}
+		if _, err := cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), registrysvc.AdvertisementName("mac-a"), metav1.GetOptions{}); err != nil {
+			t.Errorf("the advertisement is not in %s: %v", registrysvc.AdvertisementNamespace, err)
+		}
+	})
+
 	t.Run("a failed publish leaves the registry serving", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		stop := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
-			cms: failingConfigMaps{}, logger: logger,
+			hostingCMs: failingConfigMaps{}, advertCMs: failingConfigMaps{}, logger: logger,
 		})
 		if svc.starts != 1 {
 			t.Fatalf("starts = %d, want 1", svc.starts)

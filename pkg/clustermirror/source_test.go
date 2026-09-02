@@ -200,17 +200,37 @@ func TestMirrorsDegrades(t *testing.T) {
 // other test in this file injects the lister and would stay green against a
 // Source that watched nothing at all.
 func TestStartWatchesTheCluster(t *testing.T) {
-	cs := fake.NewClientset(&corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      registrysvc.AdvertisementName("mac-b"),
-			Namespace: registrysvc.AdvertisementNamespace,
+	cs := fake.NewClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      registrysvc.AdvertisementName("mac-b"),
+				Namespace: registrysvc.AdvertisementNamespace,
+			},
+			Data: map[string]string{
+				registrysvc.AdvertisementNodeKey:      "mac-b",
+				registrysvc.AdvertisementMeshHostKey:  "100.64.2.1:6450",
+				registrysvc.AdvertisementPlainHTTPKey: "true",
+			},
 		},
-		Data: map[string]string{
-			registrysvc.AdvertisementNodeKey:      "mac-b",
-			registrysvc.AdvertisementMeshHostKey:  "100.64.2.1:6450",
-			registrysvc.AdvertisementPlainHTTPKey: "true",
+		// A DECOY in the namespace the advertisements used to share with the
+		// KEP-1755 document. It is well-formed, so only the watch's namespace
+		// scoping keeps it out — and that scoping is what makes the node
+		// identity's read grant narrow enough to be a namespaced Role over
+		// configmaps (pkg/rbac). A Source that read kube-public would both dial a
+		// peer anyone able to write there could name, and prove the grant needed
+		// to be wider than it is.
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      registrysvc.AdvertisementName("mac-decoy"),
+				Namespace: registrysvc.HostingNamespace,
+			},
+			Data: map[string]string{
+				registrysvc.AdvertisementNodeKey:      "mac-decoy",
+				registrysvc.AdvertisementMeshHostKey:  "100.64.9.9:6450",
+				registrysvc.AdvertisementPlainHTTPKey: "true",
+			},
 		},
-	})
+	)
 	s := New(Config{NodeName: "mac-a", Client: cs, Logger: quietLogger()})
 	s.Start(t.Context())
 
@@ -220,8 +240,14 @@ func TestStartWatchesTheCluster(t *testing.T) {
 		if len(got) == 1 && got[0].Host == "100.64.2.1:6450" && got[0].PlainHTTP {
 			return
 		}
+		for _, m := range got {
+			if m.Host == "100.64.9.9:6450" {
+				t.Fatalf("Mirrors() returned the %s decoy %+v: the watch is not scoped to %s, so the node read grant is wider than the Role that authorizes it",
+					registrysvc.HostingNamespace, m, registrysvc.AdvertisementNamespace)
+			}
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("Mirrors() = %+v after the informer should have synced, want the peer's advertisement", got)
+			t.Fatalf("Mirrors() = %+v after the informer should have synced, want exactly the peer's advertisement from %s", got, registrysvc.AdvertisementNamespace)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
