@@ -459,6 +459,17 @@ func runServer(args []string) error {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
 
+	// M11.3-d3a: whether this node can host vm guests, asked HERE — before the
+	// registry and the datapath are constructed and long before the VK node exists
+	// — through runtimed's own safe host probe rather than through the node's
+	// advertised capability, which is not answerable yet (see vmBackendAvailable).
+	// It has two consumers: the registry relay's vmnet-gateway bind (step 3d),
+	// which is the only address a Linux-guest Pod can reach a host listener at, and
+	// the NetworkPolicy table's fail-closed unknown-vm-source branch (step 4c),
+	// scoped to the segment macOS's vmnet is expected to hand guests. False leaves
+	// both byte-identical to a node that runs no guests.
+	vmCapable := vmBackendAvailable()
+
 	// 3d. The node-local OCI ingest registry (--registry-port; 0 disables, which
 	// is the default). It runs HERE, after the apiserver is healthy, because
 	// bringing it up also publishes the KEP-1755 local-registry-hosting ConfigMap
@@ -477,8 +488,22 @@ func runServer(args []string) error {
 		if err != nil {
 			logger.Error("ingest registry disabled", "err", err)
 		} else {
-			stopRegistry := startIngestRegistry(ctx, svc, opts.registryPort,
-				cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace), logger)
+			stopRegistry := startIngestRegistry(ctx, ingestRegistry{
+				svc:      svc,
+				port:     opts.registryPort,
+				nodeName: opts.nodeName,
+				// The mesh address is what peers are advertised at and what the
+				// relay binds; empty (single node) publishes no advertisement and
+				// leaves the registry loopback-only, which is the whole truth there.
+				meshIP: opts.meshIP,
+				// The vm NAT segment contributes the relay's gateway bind — the only
+				// address a Linux-guest Pod on this Mac can reach a host listener at
+				// (it cannot reach loopback). A node that cannot host guests names no
+				// segment and gets no such bind.
+				vmNetSubnet: guestNATSubnet(vmCapable),
+				cms:         cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+				logger:      logger,
+			})
 			defer stopRegistry()
 		}
 	}
@@ -583,14 +608,6 @@ func runServer(args []string) error {
 	if isLoopbackDefault(opts.nodeIP) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
-	// M11.3-d3a: whether this node can host vm guests, asked HERE — before the
-	// datapath is constructed and long before the VK node exists — through
-	// runtimed's own safe host probe rather than through the node's advertised
-	// capability, which is not answerable yet (see vmBackendAvailable). It arms the
-	// NetworkPolicy table's fail-closed unknown-vm-source branch, scoped to the
-	// segment macOS's vmnet is expected to hand guests; false leaves the table
-	// byte-identical to a node that runs no guests.
-	vmCapable := vmBackendAvailable()
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
