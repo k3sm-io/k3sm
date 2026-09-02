@@ -14,7 +14,7 @@
 # the transferred M4.0 acceptance AND the ex-M4-lab reboot debt in one run. NONE of
 # that exists yet.
 #
-# Honesty contract (why each branch exits the way it does; mirrors hack/lab/m5.sh):
+# Honesty contract (why each branch exits the way it does; mirrors hack/lab/m3.sh):
 #   - K3SM_LAB unset / != 1 (the common case, incl. CI): this gate is NOT on a real
 #     reboot/signing rig, so it prints a PENDING notice and exits 0 — a "skip",
 #     reported as "pending lab" and NEVER counted as a proven milestone.
