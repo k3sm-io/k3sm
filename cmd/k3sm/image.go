@@ -34,6 +34,8 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 const imageUsage = `k3sm image — ingest, inspect and reclaim this node's image store
@@ -55,8 +57,9 @@ push   upload the image in an OCI layout directory (what ` + "`k3sm build --form
        writes) to a registry reference, and print the digest it now has
        there so callers can pin it. push does NOT talk to the daemon: it
        reads a directory you own and uploads as you. The credential comes
-       from $K3SM_REGISTRY_TOKEN or the docker config chain — never from the
-       command line, and k3sm stores none of it.
+       from $K3SM_REGISTRY_TOKEN, this node's own ingest-registry credential
+       (only when the target IS this node's loopback registry), or the docker
+       config chain — never from the command line, and k3sm stores none of it.
 prune  delete image content no pod references. DRY RUN BY DEFAULT — pass
        --force to actually unlink. The daemon does the deleting: this command
        is a client of the runtimed Images service, it never walks the store
@@ -84,6 +87,10 @@ type imageOptions struct {
 	// neither of them, and is not a flag either — see registryAuth.
 	layoutDir string
 	target    string
+	// workDir is the control-plane state root push looks in for THIS node's
+	// ingest-registry credential. It is a path, never a secret: the credential
+	// itself stays in a 0600 file the invoking user must already be able to read.
+	workDir string
 }
 
 // Ingest streams a whole archive, so it cannot share the deadline sized for a
@@ -117,6 +124,12 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&o.socket, "socket", runtimed.DefaultSocketPath, "runtimed control socket to dial")
+	// The control-plane state root, consulted by push ONLY, and only to find this
+	// node's ingest-registry credential. A resolve failure is not reported here:
+	// every other subcommand is a client of runtimed and has no use for a work
+	// dir, so an unresolvable one must not make `k3sm image ls` fail.
+	defaultWorkDir, _ := executor.ResolveWorkDir()
+	fs.StringVar(&o.workDir, "work-dir", defaultWorkDir, "control-plane state root to read this node's ingest-registry push credential from (push only)")
 	// DRY RUN IS THE DEFAULT and deleting takes an explicit flag, because the
 	// blast radius is asymmetric: a needless dry run costs a statfs, while an
 	// unintended prune on a node that cannot reach its registry costs every image

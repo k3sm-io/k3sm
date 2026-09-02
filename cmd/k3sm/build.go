@@ -30,6 +30,7 @@ import (
 	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/oci"
 )
 
@@ -160,7 +161,7 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 	baseRef, named := df.Base()
 	img, err := oci.Build(oci.Request{
 		Dockerfile: df, Context: bc, Platform: o.platform, TmpDir: tmp,
-		BaseResolver: remoteBase(ctx),
+		BaseResolver: remoteBase(ctx, localRegistryWorkDir()),
 	})
 	if err != nil {
 		return err
@@ -193,18 +194,32 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 	return nil
 }
 
+// localRegistryWorkDir resolves the control-plane state root the build's FROM
+// resolution looks in for this node's ingest-registry credential. An
+// unresolvable one yields "", which registryAuth reads as "there is no local
+// registry credential" and falls through to the docker chain — `k3sm build` must
+// not fail because a control plane it never talks to could not be located.
+func localRegistryWorkDir() string {
+	wd, err := executor.ResolveWorkDir()
+	if err != nil {
+		return ""
+	}
+	return wd
+}
+
 // remoteBase is the production BaseResolver: it fetches a named FROM base from a
 // registry, for the platform this builder targets, using the same credential
-// chain "k3sm image push" uses. It is passed IN rather than reached for inside
-// pkg/oci so the library keeps its "no I/O outside the build context" contract
-// and its tests stay offline.
-func remoteBase(ctx context.Context) oci.BaseResolver {
+// chain "k3sm image push" uses — including this node's own ingest registry, so
+// `FROM localhost:<port>/…` resolves against an image pushed there. It is passed
+// IN rather than reached for inside pkg/oci so the library keeps its "no I/O
+// outside the build context" contract and its tests stay offline.
+func remoteBase(ctx context.Context, workDir string) oci.BaseResolver {
 	return func(ref string) (ggcrv1.Image, error) {
 		r, err := name.ParseReference(ref)
 		if err != nil {
 			return nil, err
 		}
-		auth, err := registryAuth(r)
+		auth, err := registryAuth(r, workDir)
 		if err != nil {
 			return nil, err
 		}

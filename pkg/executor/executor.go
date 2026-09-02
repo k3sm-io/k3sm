@@ -225,6 +225,22 @@ const (
 	// DefaultControllerManagerPort is the kube-controller-manager secure-serving
 	// port (the upstream default), bound on loopback only.
 	DefaultControllerManagerPort = 10257
+	// DefaultRegistryPort is the loopback port `k3sm server --registry-port`
+	// serves the node-local OCI ingest registry on (pkg/registrysvc).
+	//
+	// It is DISABLED by default — the flag's own default is 0 — so this constant
+	// is the port an operator gets when they ask for the registry without naming
+	// one, not a port k3sm binds unasked.
+	//
+	// 6450 was picked by elimination rather than convention. The obvious choices
+	// are taken: 5000 and 7000 are macOS AirPlay Receiver (a bind there succeeds
+	// and then answers HTTP that is not a registry, which is worse than a
+	// refusal), and this process already owns 6444 (apiserver), 2379 (kine),
+	// 10250 (kubelet API), 10257/10259 (controller-manager/scheduler) and the
+	// whole 30000-32767 NodePort range (pkg/ports). 6450 sits clear of all of
+	// them, adjacent to the apiserver's port so an operator reading `lsof` sees
+	// k3sm's listeners together.
+	DefaultRegistryPort = 6450
 	// DefaultAuthorizationMode is the apiserver authorizer chain from M4.1 onward:
 	// the Node authorizer (scopes a kubelet/VK-node to its own objects) plus RBAC
 	// (default-deny). It replaces the M0–M3 AlwaysAllow posture.

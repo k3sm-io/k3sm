@@ -716,6 +716,16 @@ func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, run
 		// and the production :80/:443 bind needs privileges the rootless tier lacks.
 		"--ingress-http-port", "0",
 		"--ingress-https-port", "0",
+		// The node-local OCI ingest registry, ON by default here and off by default
+		// in `k3sm server`. The defaults differ because the postures do: a dev
+		// instance exists to run an image somebody is still building, so the whole
+		// point is a push target, while a production server is asked for one
+		// deliberately. The port is allocated per instance for the same reason every
+		// other one is — two instances on the fixed suggestion would have the second
+		// one's registry lose the bind, and its pods pull from the first one's store.
+		// Discover it from the cluster: the KEP-1755 local-registry-hosting ConfigMap
+		// in kube-public names it.
+		"--registry-port", strconv.Itoa(alloc.registry),
 	}
 	if pathShim != "" {
 		args = append(args, "--path-shim", pathShim)

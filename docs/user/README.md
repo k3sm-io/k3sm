@@ -17,20 +17,22 @@ directory is the front door to the user-facing docs; read them roughly in the jo
    Dockerfile to a running Pod.
 6. [Images](images.md) — the reference: both workload conventions, `k3sm build`, `image
    load`/`import`/`push`, and every deliberate difference from the Docker tool of the same name.
-7. [Storage](storage.md) — local-path PVs, node affinity, what is and isn't supported.
-8. [Version support](versions.md) — the Kubernetes version k3sm tracks and how to read the live pin.
-9. [Upgrades](upgrade.md) — upgrading a node or cluster, the launchd restart model.
-10. [Certificates](certificates.md) — the two CAs, `k3sm certificate rotate`, and what it does not do.
-11. [Backup and restore](backup-restore.md) — the kine/SQLite datastore: `k3sm snapshot save`/`restore`,
+7. [Node-local registry](registry.md) — the loopback OCI registry: push a locally built image and
+   pull it back through the ordinary Kubernetes image path.
+8. [Storage](storage.md) — local-path PVs, node affinity, what is and isn't supported.
+9. [Version support](versions.md) — the Kubernetes version k3sm tracks and how to read the live pin.
+10. [Upgrades](upgrade.md) — upgrading a node or cluster, the launchd restart model.
+11. [Certificates](certificates.md) — the two CAs, `k3sm certificate rotate`, and what it does not do.
+12. [Backup and restore](backup-restore.md) — the kine/SQLite datastore: `k3sm snapshot save`/`restore`,
     the automatic pre-migration copy, and the restore drill.
-12. [Multi-node clusters](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
-13. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
-14. [Linux images](vm-runtimeclass.md) — the intended isolation boundary for untrusted
+13. [Multi-node clusters](multi-node.md) — joining agents, the mesh, EXPERIMENTAL status.
+14. [High availability](ha.md) — HA control plane, EXPERIMENTAL status.
+15. [Linux images](vm-runtimeclass.md) — the intended isolation boundary for untrusted
     workloads: it boots `linux/arm64` images per Pod today.
-15. [MLX serving](mlx-quickstart.md) — serving a model on the Mac's GPU through an OpenAI-compatible endpoint.
-16. [Limitations](limitations.md) — **the real gaps**.
-17. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
-18. [FAQ](faq.md) — short answers to the common questions.
+16. [MLX serving](mlx-quickstart.md) — serving a model on the Mac's GPU through an OpenAI-compatible endpoint.
+17. [Limitations](limitations.md) — **the real gaps**.
+18. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
+19. [FAQ](faq.md) — short answers to the common questions.
 
 ## Before You Build Anything Real
 
@@ -39,5 +41,5 @@ several standard behaviors diverge by design. Read [Limitations](limitations.md)
 canonical conformance registers so nothing there is rosier than the truth.
 
 MLX / Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have
-their own page — see [MLX quickstart](mlx-quickstart.md), item 14 above. The rest of these pages
+their own page — see [MLX quickstart](mlx-quickstart.md), item 16 above. The rest of these pages
 describe the general workload path.
