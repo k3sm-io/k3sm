@@ -36,11 +36,12 @@ See [`vm` RuntimeClass](vm-runtimeclass.md). The rationale lives in
 
 ## Images
 
-k3sm workloads are **native Darwin executables**, not OCI Linux images: today you reference a
-binary directly in the Pod spec (`image: native` plus an absolute `command`, or `image: /abs/path`).
-`k3sm build` packages a native binary into an OCI image from a COPY-only Dockerfile; the rest of the
-OCI path — registry pull, `k3sm image load`, and running a built image — is on the roadmap. See
-[Images](images.md).
+k3sm workloads are OCI images whose payload is a **native Darwin executable**. Registry pull,
+tags, digests, pull policy and pull secrets work as in any Kubernetes; `k3sm build` packages a
+binary into an image from a COPY-only Dockerfile, and `k3sm image load` ingests a tarball without a
+registry. For development, a Pod can name a binary directly (`image: native` plus an absolute
+`command`). A `linux/arm64` image runs under the `vm` RuntimeClass, which is EXPERIMENTAL. See
+[Images](images.md) and [Linux images](vm-runtimeclass.md).
 
 ## Networking
 

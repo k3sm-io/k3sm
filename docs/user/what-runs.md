@@ -1,4 +1,4 @@
-# What runs on k3sm
+# Supported workloads
 
 The short answer: **OCI container images whose payload is a native `darwin/arm64`
 executable**. The workflow around them is the one you already know — build, tag, push, pull,
@@ -10,7 +10,7 @@ slowly", not "runs with a flag" — a `linux/amd64` or `linux/arm64` image is re
 to pull it. That is the trade this project makes on purpose, and this page is here so you can tell
 in a minute whether it is a trade you want.
 
-## What runs
+## The default path
 
 **An OCI image with a Mac binary inside.** This is the normal path:
 
