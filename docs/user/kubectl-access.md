@@ -38,22 +38,22 @@ layout. `k3sm kubeconfig` is the k3sm-specific verb.
 
 Because the control plane is a **real upstream kube-apiserver**, standard clients, RBAC, and API
 machinery work normally. The divergences are on the **node** side (how Pods run), not the API surface —
-see [concepts.md](concepts.md).
+see [Concepts](concepts.md).
 
 ## Auth model
 
 Access is authenticated via the kubeconfig credentials generated at install time and scoped by RBAC.
-The bootstrap/join credentials for adding nodes are separate — see [multi-node.md](multi-node.md).
+The bootstrap/join credentials for adding nodes are separate — see [Multi-node](multi-node.md).
 
 ## Things that behave differently through kubectl
 
 - **`kubectl top`** needs an **operator-installed metrics-server**; k3sm does not ship one and has no CPU
-  accounting, so `top` and HPA-on-CPU do not work out of the box — see [limitations.md](limitations.md).
+  accounting, so `top` and HPA-on-CPU do not work out of the box — see [Limitations](limitations.md).
 - **`kubectl exec` / `logs` / `port-forward`** target native processes via the node; behavior tracks the
   Virtual Kubelet surface.
 
 ## Next
 
-- [install.md](install.md) — where the kubeconfig comes from.
-- [quickstart.md](quickstart.md) — first commands.
-- [troubleshooting.md](troubleshooting.md) — connection failures.
+- [Install](install.md) — where the kubeconfig comes from.
+- [Quickstart](quickstart.md) — first commands.
+- [Troubleshooting](troubleshooting.md) — connection failures.

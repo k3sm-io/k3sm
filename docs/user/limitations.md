@@ -7,7 +7,7 @@ zero-Linux, zero-VM developer experience, but it also means several standard Kub
 ## Where the full truth lives (cite, don't trust this page alone)
 
 The authoritative source of "what k3sm cannot conform to and why" is
-[**`docs/conformance-profile.md`**](../conformance-profile.md) — the self-assessment mapping
+[**Conformance profile**](../conformance-profile.md) — the self-assessment mapping
 targeted feature classes to a green synthetic-conformance criterion **or** a documented ceiling. It is
 backed by a maintainer-facing full-surface conformance register (one row per standard Kubernetes
 feature × verdict, with a canonical §By-design non-conformance summary) kept internal to the project.
@@ -30,13 +30,13 @@ When in doubt, the profile wins.
   leaf and the node publishes genuine per-container CPU **and** memory for `vm` Pods on the
   `metrics.k8s.io` scrape target. Native Pods publish neither, because that endpoint emits the
   CPU/memory pair jointly or not at all. A `vm` Pod's memory ceiling is still the guest's whole-VM
-  size rather than a per-container limit — see [vm-runtimeclass.md](vm-runtimeclass.md).
+  size rather than a per-container limit — see [`vm` RuntimeClass](vm-runtimeclass.md).
 - **Workloads must be adapted.** A raw upstream `[Conformance]` Pod — one that assumes a Linux image,
   bind mounts, or Linux-only fields — is rejected at admission or stranded. Images are the k3sm native
-  image model (see [images.md](images.md)), not arbitrary OCI Linux images.
+  image model (see [Images](images.md)), not arbitrary OCI Linux images.
 - **k3sm cannot pass CNCF `[Conformance]` / Sonobuoy.** That suite assumes Linux containers, cgroups,
   CNI, and netns; k3sm has none of them, and k3sm does not claim a
-  Certified-Kubernetes badge. See [`conformance-profile.md`](../conformance-profile.md).
+  Certified-Kubernetes badge. See [Conformance profile](../conformance-profile.md).
 
 ## The gaps matrix
 
@@ -45,8 +45,8 @@ When in doubt, the profile wins.
 All Pods on a node run as the **same unprivileged `_k3sm` OS user**, Seatbelt-confined. There is **no
 per-pod uid isolation**, so same-node Pods share a single OS trust domain. Untrusted or multi-tenant
 workloads must use the **`vm` RuntimeClass** (Virtualization.framework), which gives a real isolation
-boundary. See [vm-runtimeclass.md](vm-runtimeclass.md) for how to opt in. The same framing appears in
-[concepts.md](concepts.md).
+boundary. See [`vm` RuntimeClass](vm-runtimeclass.md) for how to opt in. The same framing appears in
+[Concepts](concepts.md).
 
 On the **`k3sm dev --datapath` tier only**, it is worse than that: `--datapath` runs the server as
 root, and a Pod that declares no `securityContext.runAsUser` keeps the daemon's identity — so those
@@ -79,7 +79,7 @@ per-pod source fidelity for same-node clients. Any direct pod-IP connection — 
 headless-Service and StatefulSet traffic** — bypasses it completely; **egress rules and `ipBlock`
 are never enforced**; and policies against `kube-dns` or the `kubernetes` VIP are unenforceable
 (those VIPs bypass the proxy). It is a policy hint, NOT a security boundary — isolate untrusted
-workloads with the vm RuntimeClass ([vm-runtimeclass.md](vm-runtimeclass.md)).
+workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
 ### Which addresses your Services actually answer on
 
@@ -104,7 +104,7 @@ Today at `main`, per port class:
 
   If the derived InternalIP cannot be worked out, k3sm advertises **nothing** — the Service stays
   `<pending>` while the listeners still serve. That is deliberate: an unreachable `EXTERNAL-IP` is
-  worse than none. See [troubleshooting.md](troubleshooting.md#a-loadbalancer-service-stays-pending).
+  worse than none. See [Troubleshooting](troubleshooting.md#a-loadbalancer-service-stays-pending).
 
 - **Same-node Pods get separate per-IP port spaces for ordinary ports.** Each Pod is assigned its own
   `100.64.0.0/10` loopback address, and on the default runtime a Pod's wildcard `bind()` on an
@@ -135,7 +135,7 @@ Today at `main`, per port class:
     freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
 
   Pods using the `vm` RuntimeClass have their own network stack behind VZNAT, unaffected by all of the
-  above — see [vm-runtimeclass.md](vm-runtimeclass.md). What a guest can reach was measured on the
+  above — see [`vm` RuntimeClass](vm-runtimeclass.md). What a guest can reach was measured on the
   reference hardware rather than assumed:
 
   | from a `vm` Pod's guest to | result |
@@ -217,7 +217,7 @@ the control plane, which re-issues them anyway) and proves the two CAs came thro
 `--client-ca-file` trust is CA-wide, so a superseded certificate stays valid until it expires. There
 is no way to invalidate a single leaf, no CA-replacement flow, and worker/agent node certs are out of
 scope (they re-issue on agent restart, which needs a fresh join token). See
-[certificates.md](certificates.md).
+[Certificates](certificates.md).
 
 ### DNS — what resolves, and on which runtime path
 
@@ -315,9 +315,9 @@ different tracks:
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
   release); its live lab run is green against the release artifact. The **de-EXPERIMENTAL
   graduation** — the branding removed, with published performance figures — is the **v0.2**
-  milestone. See [vm-runtimeclass.md](vm-runtimeclass.md).
+  milestone. See [`vm` RuntimeClass](vm-runtimeclass.md).
 - **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
-  milestone. See [multi-node.md](multi-node.md) and [ha.md](ha.md).
+  milestone. See [Multi-node](multi-node.md) and [HA](ha.md).
 
 ### `vm` Pods: node selection and security-context admission
 
@@ -335,7 +335,7 @@ spec:
     kubernetes.io/os: darwin   # the node's OS — always darwin, guest or not
 ```
 
-See [vm-runtimeclass.md](vm-runtimeclass.md) for the full selector shape, including the
+See [`vm` RuntimeClass](vm-runtimeclass.md) for the full selector shape, including the
 `k3sm.io/virtualization` capability the RuntimeClass merges in for you.
 
 **A foreign `runAsUser` or `fsGroup` is rejected at admission, `vm` Pods included.** The cluster-wide
@@ -469,7 +469,7 @@ The `k3sm.io/*` node capability labels — `k3sm.io/virtualization`, `k3sm.io/ro
 are not re-evaluated while it runs.
 
 The **gain** direction is merely inconvenient: install Rosetta 2, restart the daemon, the label appears
-(see [vm-runtimeclass.md](vm-runtimeclass.md#installing-rosetta-after-the-node-is-up--restart-required)).
+(see [`vm` RuntimeClass](vm-runtimeclass.md#installing-rosetta-after-the-node-is-up--restart-required)).
 
 The **loss** direction is a real ceiling. A node that **loses** a capability — Rosetta 2 removed, the
 virtualization capability withdrawn — **keeps advertising it** until the daemon restarts. In that window
@@ -505,7 +505,7 @@ relocates the runtimed on-disk root off `/Users` — `--work-dir` alone only mov
 k3sm embeds **kine** over **SQLite (WAL)**. On a single node the datastore serves a **consistent LIST**;
 under churn there is a **potential watch-staleness** posture that is **soak-pending** validation (the
 dev-Mac churn soak). Until that soak is signed off, treat heavy-churn watch semantics as
-accepted-with-known-issue rather than guaranteed. See [backup-restore.md](backup-restore.md) for the
+accepted-with-known-issue rather than guaranteed. See [Backup & restore](backup-restore.md) for the
 datastore operational model.
 
 ## MLX / Apple-GPU workloads

@@ -31,10 +31,10 @@ binary before this prose catches up.
 ## Compatibility
 
 Standard `kubectl` and client-go clients within a minor of the control-plane pin work normally, since the
-API surface is a **real upstream apiserver** (see [concepts.md](concepts.md)). The divergences are on the
+API surface is a **real upstream apiserver** (see [Concepts](concepts.md)). The divergences are on the
 node side, not the API version.
 
 ## Next
 
-- [upgrade.md](upgrade.md) — moving to a new k3sm release.
-- [kubectl-access.md](kubectl-access.md) — client setup.
+- [Upgrade](upgrade.md) — moving to a new k3sm release.
+- [kubectl access](kubectl-access.md) — client setup.
