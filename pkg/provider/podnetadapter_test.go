@@ -421,6 +421,74 @@ func TestPodNetAdapterReconcileStartupLoopbackSkipsNodeAlias(t *testing.T) {
 	}
 }
 
+// TestPodNetAdapterReconcileStartupRunsExactlyOnce pins the property that makes
+// serving runtimed's control socket off the node's own in-process runtime safe.
+//
+// TWO callers invoke this seam on one node: startNode calls it directly at
+// bring-up (the embedded runtime is driven by RPC, so runtimed's
+// once-before-Serve hook would never fire), and runtime.Server.Serve calls it
+// again through Runtime.reconcileNetworkStartup, whose own sync.Once the direct
+// call does not trip. A second pass is DESTRUCTIVE, not redundant: the known set
+// is empty by construction, so a sweep running after pods are live reads every
+// live alias as stale.
+//
+// The assertion is on the SWEEP COUNT rather than on any observable error,
+// because the destructive version of this code passes every functional test —
+// it tears down pod networking silently.
+func TestPodNetAdapterReconcileStartupRunsExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	ipam := newFakeIPAM(t, "100.64.0.0/24")
+	adapter := NewPodNetAdapter(ipam, testNodeIP, nil)
+	for i := range 3 {
+		if err := adapter.ReconcileStartup(ctx); err != nil {
+			t.Fatalf("ReconcileStartup call %d: %v", i+1, err)
+		}
+	}
+	ipam.mu.Lock()
+	defer ipam.mu.Unlock()
+	if len(ipam.sweeps) != 1 {
+		t.Errorf("SweepStale called %d times across 3 ReconcileStartup calls, want 1", len(ipam.sweeps))
+	}
+	if len(ipam.nodeAliases) != 1 {
+		t.Errorf("EnsureNodeAlias called %d times across 3 ReconcileStartup calls, want 1", len(ipam.nodeAliases))
+	}
+}
+
+// TestPodNetAdapterReconcileStartupReplaysFailure pins the other half of the
+// once: a FAILED reconcile stays failed for every later caller. The fail-closed
+// contract is that a node never serves allocations over an inconsistent alias
+// table, so the second caller must inherit the first verdict rather than get a
+// fresh attempt that might succeed against half-swept state.
+func TestPodNetAdapterReconcileStartupReplaysFailure(t *testing.T) {
+	ctx := context.Background()
+	ipam := &sweepFailIPAM{fakeIPAM: newFakeIPAM(t, "100.64.0.0/24")}
+	adapter := NewPodNetAdapter(ipam, testNodeIP, nil)
+	first := adapter.ReconcileStartup(ctx)
+	if first == nil {
+		t.Fatal("ReconcileStartup with a failing sweep succeeded, want the sweep error")
+	}
+	second := adapter.ReconcileStartup(ctx)
+	if second == nil || second.Error() != first.Error() {
+		t.Fatalf("second ReconcileStartup = %v, want the replayed first error %v", second, first)
+	}
+	ipam.mu.Lock()
+	defer ipam.mu.Unlock()
+	if len(ipam.sweeps) != 1 {
+		t.Errorf("SweepStale called %d times, want 1 (the failure is sticky, not retried)", len(ipam.sweeps))
+	}
+}
+
+// sweepFailIPAM is a fakeIPAM whose stale-alias sweep always fails — the
+// crash-recovery fault the fail-closed contract is written for.
+type sweepFailIPAM struct{ *fakeIPAM }
+
+func (f *sweepFailIPAM) SweepStale(_ context.Context, known map[string]netip.Addr) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweeps = append(f.sweeps, known)
+	return errors.New("netd unreachable")
+}
+
 // TestPodNetAdapterTeardownIdempotent pins the teardown contract callers rely
 // on: unknown pods are a no-op success and a marked hostNetwork pod is only
 // unmarked (no pool interaction) — so the provider's belt-and-braces DeletePod

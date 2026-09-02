@@ -25,6 +25,7 @@ import (
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // VKProvider adapts any Runtime into the full Virtual Kubelet provider contract
@@ -101,6 +102,19 @@ func (v *VKProvider) RuntimeHealthy(ctx context.Context) bool {
 		return true
 	}
 	return h.Healthy(ctx)
+}
+
+// ServableRuntime returns the in-process runtimed runtime the backing Runtime
+// drives, comma-ok, delegating to its optional ControlSocketSource capability. A
+// Runtime without that capability reports false and the node binds no runtimed
+// control socket — the correct answer for the HostProcess runtime, which has no
+// runtime/v1 services to serve.
+func (v *VKProvider) ServableRuntime() (*runtimed.Runtime, bool) {
+	s, ok := v.rt.(ControlSocketSource)
+	if !ok {
+		return nil, false
+	}
+	return s.ServableRuntime()
 }
 
 // NotifyPods wires the Runtime's status watch to the VK status callback.

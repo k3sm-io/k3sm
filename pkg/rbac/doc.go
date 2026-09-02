@@ -47,7 +47,16 @@ limitations under the License.
 //     meshpeers — keeping a joined worker's datapath alive after the flip;
 //   - the in-pod reader Role + RoleBinding (namespaced) for the in-pod-kubectl
 //     reference ServiceAccount, so the M2 in-pod-kubectl conformance path stays green
-//     under default-deny (see ConformanceServiceAccount).
+//     under default-deny (see ConformanceServiceAccount);
+//   - the k3sm-registry namespace and the registry-advertisement reader Role +
+//     RoleBinding to the system:nodes group, granting read (get/list/watch) on
+//     configmaps IN THAT NAMESPACE ONLY, so a node's image puller can learn which
+//     peers hold an image it was asked to pull. Operator-approved 2026-09-02 as
+//     the narrowest widening available: the reader is an informer, so it needs
+//     list and watch, and RBAC resourceNames does not constrain either verb — the
+//     namespace IS the scope, which is why the advertisements were moved out of
+//     the shared kube-public namespace to earn it (the KEP-1755 hosting document
+//     stays there, as the KEP requires).
 //
 // # What it deliberately does NOT touch
 //

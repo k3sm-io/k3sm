@@ -148,6 +148,63 @@ regardless of what this node already holds. Tag the images you load with somethi
 | Requires a running daemon | Yes. The store is written by the node's runtime daemon over its local socket, so `load` works on an installed, running node and not on a bare directory. Its socket is readable only by the daemon's own account. |
 | Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
 
+### The Daemon Socket
+
+Every subcommand except `push` is a client of the node's runtime daemon, which they reach
+over a local unix socket. A running `k3sm server` (or `k3sm agent`) serves that socket as part of
+normal bring-up, so on a standard install the commands work with no extra setup and no flags:
+
+```sh
+k3sm image ls
+k3sm image df
+```
+
+The socket lives in the runtime root's `run` directory — `/var/lib/k3sm/run/runtimed.sock` on a
+standard install, which is what `--socket` defaults to. A node started with a different runtime
+root serves beside its own image store instead, so point the command at it:
+
+```sh
+k3sm image ls --socket /path/to/root/run/runtimed.sock
+```
+
+**Only the daemon's own account can use it.** The socket is created mode `600` inside a `700`
+directory, so a dial from any other user is refused by the operating system before the command
+sends anything. Pods are fenced off it separately, by the sandbox profile every Pod carries — they
+share the daemon's account, so file permissions alone would not keep them out.
+
+If a command reports that it cannot dial the socket, the node is not running, or it is running with
+a different runtime root. `k3sm doctor` reports the former; the latter is a `--socket` away.
+
+## Working With the Store: `pull`, `tag`, `untag`, `inspect`, `save`
+
+These five verbs are the store's day-to-day surface. Each one is a client of the node's runtime
+daemon — the daemon is the store's only writer, so nothing here walks the store directly.
+
+```sh
+k3sm image pull ghcr.io/org/app:v1            # warm the store ahead of a workload
+k3sm image tag ghcr.io/org/app:v1 app:local   # give content a second name
+k3sm image inspect app:local                  # digest, platform, config, layer sizes
+k3sm image save app:local -o app.tar          # export a tarred OCI layout
+k3sm image untag app:local                    # remove that name again
+```
+
+| verb | what it does |
+|---|---|
+| `pull <reference>` | Fetches the reference through the daemon's own puller — the same code path a Pod's pull takes, so every blob is re-hashed against its digest before it is recorded. Prints the digest it resolved to. `--platform os/arch[/variant]` picks which manifest of a multi-platform index to fetch; `--policy always\|if-not-present\|never` carries the ordinary Kubernetes pull-policy meanings. |
+| `tag <digest\|reference> <new-reference>` | Records an **additional** name for content the node already holds. Contacts no registry and writes no blob. The target is named by digest — a reference you pass is resolved to one first, and the resolution is printed — because a tag that named another tag could be re-aimed by a concurrent pull. It never re-points an existing name: that is `untag`, then `tag`. |
+| `untag <reference>` | Removes **one** name. `--digest` refuses the removal unless the name still resolves to that digest; `--platform` picks the entry when a reference has more than one, and an ambiguous untag is refused rather than guessed. |
+| `inspect <reference\|digest>` | Reports the digest, the resolved platform, the creation time, entrypoint/cmd, user, working directory and each layer's size. `-o json` prints the daemon's raw response for scripting. Read-only: it contacts no registry and records nothing. |
+| `save <reference> -o <file.tar>` | Streams the image out as a tarred OCI image layout — the `docker save` analog, and the exact inverse of `import`. The archive is checked against the digest and the byte count the daemon reports it sent, and a short one is discarded rather than left on disk. |
+
+**Untag removes a name, not bytes.** No blob is unlinked by `untag`; content is reclaimed only by
+`k3sm image prune`, which re-derives what is still reachable first. So untagging a name a running
+Pod still uses leaves that Pod unharmed — and, conversely, a name you removed does not free any
+space until you prune.
+
+**A pulled image survives a prune.** `pull` and `tag` record the reference as something the node
+holds on purpose, so a warmed-but-unused image is not reclaimed behind your back. Untag it when
+you no longer want it, then prune.
+
 ## Pushing to a Registry: `k3sm image push`
 
 `k3sm image push` uploads the image in an OCI layout directory to a registry reference, so a node
@@ -156,6 +213,14 @@ can pull it the ordinary way instead of being loaded one at a time.
 ```sh
 k3sm build --tag registry.example.com/me/myapp:v1 --output ./layout --format oci .
 k3sm image push ./layout registry.example.com/me/myapp:v1
+```
+
+The first argument is normally that layout directory. A first argument that is **no path on
+disk** is taken as a reference in this node's own store instead: k3sm exports it with `save`,
+verifies the export, and uploads the result.
+
+```sh
+k3sm image push myapp:v1 registry.example.com/me/myapp:v1
 ```
 
 The credential is read at the moment of the upload and forgotten: from `K3SM_REGISTRY_TOKEN` if it

@@ -40,33 +40,65 @@ import (
 
 const imageUsage = `k3sm image — ingest, inspect and reclaim this node's image store
 
-Usage: k3sm image load <docker-save.tar> [flags]
+Usage: k3sm image pull <reference> [flags]
+       k3sm image tag <digest|reference> <new-reference> [flags]
+       k3sm image untag <reference> [flags]
+       k3sm image inspect <reference|digest> [flags]
+       k3sm image save <reference> -o <file.tar> [flags]
+       k3sm image load <docker-save.tar> [flags]
        k3sm image import <oci-layout.tar> [flags]
-       k3sm image push <oci-layout-dir> <reference> [flags]
+       k3sm image push <oci-layout-dir|reference> <registry-reference> [flags]
        k3sm image prune [flags]
        k3sm image ls [flags]
        k3sm image df [flags]
 
-load   stream a ` + "`docker save`" + ` tar into this node's image store.
-import stream a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
-       output) into this node's image store.
-       Both are streamed to the daemon, which is the store's only writer: it
-       re-hashes every byte and records the reference. Loaded content is stored,
-       not yet runnable — see docs/user/images.md.
-push   upload the image in an OCI layout directory (what ` + "`k3sm build --format oci`" + `
-       writes) to a registry reference, and print the digest it now has
-       there so callers can pin it. push does NOT talk to the daemon: it
-       reads a directory you own and uploads as you. The credential comes
-       from $K3SM_REGISTRY_TOKEN, this node's own ingest-registry credential
-       (only when the target IS this node's loopback registry), or the docker
-       config chain — never from the command line, and k3sm stores none of it.
-prune  delete image content no pod references. DRY RUN BY DEFAULT — pass
-       --force to actually unlink. The daemon does the deleting: this command
-       is a client of the runtimed Images service, it never walks the store
-       itself. A pod's content is never deleted, and if the daemon cannot
-       enumerate every pod's references it refuses the whole prune.
-ls     list the images this node has recorded.
-df     show the image store's filesystem usage.
+pull    fetch a reference into this node's store through the daemon's OWN
+        puller — the same code path a pod-driven pull takes, so every blob is
+        re-hashed against its digest before it is recorded. Prints the digest
+        the reference resolved to. --platform pins which manifest of a
+        multi-platform index to fetch; --policy carries the corev1 pull-policy
+        semantics (always, if-not-present, never). A pulled image survives
+        prune until you untag it.
+tag     record an ADDITIONAL name for content this node already holds. The
+        target is named by digest — a reference is resolved to one first —
+        because a tag that named another tag could be re-aimed by a concurrent
+        pull. It never re-points an existing name: that is untag, then tag.
+untag   remove ONE (reference x platform) name. UNTAG REMOVES A NAME, NOT
+        BYTES: no blob is unlinked here, and content is reclaimed only by
+        ` + "`k3sm image prune`" + `, which re-derives reachability first — so untagging
+        a name a running pod still pins leaves that pod unharmed. --digest
+        refuses the removal unless the name still resolves to that digest.
+inspect report what the store knows about one image: digest, resolved platform,
+        creation time, entrypoint/cmd, user, working directory, and each
+        layer's digest and size. -o json prints the daemon's raw response
+        instead of the table. Read-only — it contacts no registry.
+save    stream one image out of the store as a tarred OCI image layout (the
+        ` + "`docker save`" + ` analog) into the file -o names. The archive is checked
+        against the digest and the byte count the daemon reports it sent, and
+        a short one is discarded rather than left on disk.
+load    stream a ` + "`docker save`" + ` tar into this node's image store.
+import  stream a tarred OCI image layout (the ` + "`docker buildx -o type=oci`" + `
+        output) into this node's image store.
+        Both are streamed to the daemon, which is the store's only writer: it
+        re-hashes every byte and records the reference. Loaded content is stored,
+        not yet runnable — see docs/user/images.md.
+push    upload an image to a registry reference, and print the digest it now has
+        there so callers can pin it. The first argument is normally the OCI
+        layout directory ` + "`k3sm build --format oci`" + ` writes; a first argument
+        that is no path on disk is taken as a reference in THIS NODE's store,
+        exported with save and then uploaded. The upload itself does NOT talk to
+        the daemon: it reads a directory you own and uploads as you. The
+        credential comes from $K3SM_REGISTRY_TOKEN, this node's own
+        ingest-registry credential (only when the target IS this node's loopback
+        registry), or the docker config chain — never from the command line, and
+        k3sm stores none of it.
+prune   delete image content no pod references. DRY RUN BY DEFAULT — pass
+        --force to actually unlink. The daemon does the deleting: this command
+        is a client of the runtimed Images service, it never walks the store
+        itself. A pod's content is never deleted, and if the daemon cannot
+        enumerate every pod's references it refuses the whole prune.
+ls      list the images this node has recorded.
+df      show the image store's filesystem usage.
 
 Flags:
 `
@@ -82,6 +114,26 @@ type imageOptions struct {
 	// subcommand, which take no positional argument at all.
 	archive   string
 	reference string
+	// source is the image the verb NAMES: pull's reference, tag's existing
+	// digest-or-reference, and the reference-or-digest untag, inspect and save
+	// act on. It is kept apart from --reference because that flag names the
+	// entry load/import is about to CREATE, and folding the two would make
+	// `image save app:v1 --reference other:v1` mean something.
+	source string
+	// platform is the parsed --platform selector, nil when unset. Unset is not
+	// "every platform": the daemon reads it as its own host platform for a pull
+	// and as "the reference's single entry" for the verbs that name one, so the
+	// distinction has to survive to the wire.
+	platform *runtimev1.Platform
+	// policy is the parsed --policy, pull only.
+	policy runtimev1.ImagePullPolicy
+	// digest is untag's --digest pin: the removal is refused unless the entry
+	// still resolves to it.
+	digest string
+	// output is -o/--output, whose meaning is the subcommand's: the file save
+	// writes the archive to, and inspect's rendering (empty for the table,
+	// "json" for the daemon's raw response).
+	output string
 	// layoutDir and target are push's two positional arguments: the OCI layout
 	// to read, and the registry reference to write it to. The credential is
 	// neither of them, and is not a flag either — see registryAuth.
@@ -136,7 +188,20 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// it cannot re-pull.
 	fs.BoolVar(&o.force, "force", false, "actually unlink (without this, prune only reports what it would delete)")
 	fs.StringVar(&o.reference, "reference", "", "reference to record a loaded image under (load, import; defaults to the one the archive names)")
-	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import and push default to 30m — they stream image content)")
+	// The platform is part of the store's (reference x platform) KEY, never a
+	// filter, so it is spelled the way an OCI platform is spelled everywhere
+	// else — os/arch[/variant] — rather than as three flags nobody would pair
+	// correctly.
+	var platformSpec, policySpec string
+	fs.StringVar(&platformSpec, "platform", "", "os/arch[/variant] this verb acts on, e.g. darwin/arm64 (pull, tag, untag, inspect, save)")
+	fs.StringVar(&policySpec, "policy", "", "pull policy: always, if-not-present or never (pull only; default is the pull-through behaviour)")
+	fs.StringVar(&o.digest, "digest", "", "refuse the removal unless the name still resolves to this manifest digest (untag only)")
+	// One flag, two meanings, chosen by the subcommand — the spelling `docker`
+	// uses for both. It is validated per subcommand at parse time so `inspect -o
+	// out.tar` fails before anything is dialled.
+	fs.StringVar(&o.output, "o", "", "save: the file to write the archive to; inspect: json, for the daemon's raw response instead of the table")
+	fs.StringVar(&o.output, "output", "", "alias for -o")
+	fs.DurationVar(&o.timeout, "timeout", metadataTimeout, "overall deadline for the call (load, import, push, pull and save default to 30m — they stream image content)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -147,7 +212,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	// subcommand-first spelling is the one every comparable tool teaches.
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return o, errors.New("exactly one subcommand is required (load, import, push, prune, ls, df)")
+		return o, fmt.Errorf("exactly one subcommand is required (%s)", imageSubcommands)
 	}
 	o.subcommand = rest[0]
 	// load/import/push take positional paths, so parsing cannot stop at the first
@@ -169,7 +234,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	switch o.subcommand {
 	case "prune", "ls", "df":
 		if len(positional) > 0 {
-			return o, fmt.Errorf("unexpected argument %q: exactly one subcommand is required (load, import, push, prune, ls, df)", positional[0])
+			return o, fmt.Errorf("unexpected argument %q: exactly one subcommand is required (%s)", positional[0], imageSubcommands)
 		}
 	case "load", "import":
 		if len(positional) == 0 {
@@ -181,7 +246,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		o.archive = positional[0]
 	case "push":
 		if len(positional) < 2 {
-			return o, errors.New("push requires an OCI layout directory and the reference to push it to")
+			return o, errors.New("push requires a source (an OCI layout directory, or a reference in this node's store) and the registry reference to push it to")
 		}
 		if len(positional) > 2 {
 			// A third word is most often an operator reaching for a credential
@@ -191,11 +256,63 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 		}
 		o.layoutDir = positional[0]
 		o.target = positional[1]
-		if referenceSet(fs) {
+		if flagWasSet(fs, "reference") {
 			return o, errors.New("push takes its reference as the second argument, not --reference")
 		}
+	case "pull", "untag", "inspect", "save":
+		if len(positional) == 0 {
+			return o, fmt.Errorf("%s requires the reference%s to act on", o.subcommand, digestAlso(o.subcommand))
+		}
+		if len(positional) > 1 {
+			return o, fmt.Errorf("unexpected argument %q: %s takes exactly one reference%s", positional[1], o.subcommand, digestAlso(o.subcommand))
+		}
+		o.source = positional[0]
+	case "tag":
+		if len(positional) < 2 {
+			return o, errors.New("tag requires the digest or reference to name, and the new reference to record for it")
+		}
+		if len(positional) > 2 {
+			return o, fmt.Errorf("unexpected argument %q: tag takes exactly a source (digest or reference) and the new reference", positional[2])
+		}
+		o.source = positional[0]
+		o.target = positional[1]
 	default:
-		return o, fmt.Errorf("unknown subcommand %q (want load, import, push, prune, ls or df)", o.subcommand)
+		return o, fmt.Errorf("unknown subcommand %q (want one of %s)", o.subcommand, imageSubcommands)
+	}
+
+	// Every flag below belongs to a subset of the verbs. Refusing a flag the
+	// verb cannot honour beats ignoring it: an ignored --platform on a prune
+	// reads as "that platform was pruned" until someone re-reads the store.
+	platformVerbs := map[string]bool{"pull": true, "tag": true, "untag": true, "inspect": true, "save": true}
+	if flagWasSet(fs, "platform") && !platformVerbs[o.subcommand] {
+		return o, fmt.Errorf("%s does not take --platform (it selects the (reference x platform) entry pull, tag, untag, inspect and save act on)", o.subcommand)
+	}
+	var err error
+	if o.platform, err = parsePlatform(platformSpec); err != nil {
+		return o, err
+	}
+	if flagWasSet(fs, "policy") && o.subcommand != "pull" {
+		return o, fmt.Errorf("%s does not take --policy (only pull performs a registry round trip)", o.subcommand)
+	}
+	if o.policy, err = parsePullPolicy(policySpec); err != nil {
+		return o, err
+	}
+	if flagWasSet(fs, "digest") && o.subcommand != "untag" {
+		return o, fmt.Errorf("%s does not take --digest (it pins the entry untag is allowed to remove)", o.subcommand)
+	}
+	switch o.subcommand {
+	case "save":
+		if o.output == "" {
+			return o, errors.New("save requires -o <file.tar>: the archive is written to a file you name, never to the terminal")
+		}
+	case "inspect":
+		if o.output != "" && o.output != "json" {
+			return o, fmt.Errorf("-o %q: inspect renders a table by default and `json` on request", o.output)
+		}
+	default:
+		if flagWasSet(fs, "o") || flagWasSet(fs, "output") {
+			return o, fmt.Errorf("%s does not take -o (save writes an archive to it, inspect chooses a rendering with it)", o.subcommand)
+		}
 	}
 	// The streaming default applies only when the operator did not choose. Visit
 	// reports flags actually set across both Parse calls, so it distinguishes
@@ -206,7 +323,7 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 			timeoutSet = true
 		}
 	})
-	if !timeoutSet && (o.subcommand == "load" || o.subcommand == "import" || o.subcommand == "push") {
+	if !timeoutSet && streamingSubcommands[o.subcommand] {
 		o.timeout = streamingTimeout
 	}
 	if o.timeout <= 0 {
@@ -215,13 +332,34 @@ func parseImageArgs(args []string, errOut io.Writer) (imageOptions, error) {
 	return o, nil
 }
 
-// referenceSet reports whether --reference was given on the command line. flag
-// cannot distinguish "not set" from "set to the empty string" by value alone,
-// and push must refuse the flag rather than quietly ignore it.
-func referenceSet(fs *flag.FlagSet) bool {
+// imageSubcommands is the verb list an argument error names, kept in one place
+// so a new verb cannot be advertised in the usage and forgotten in the errors.
+const imageSubcommands = "pull, tag, untag, inspect, save, load, import, push, prune, ls, df"
+
+// streamingSubcommands are the verbs that move image content rather than
+// metadata, and so inherit the streaming deadline when the operator did not
+// choose one. A deadline sized for a metadata call fires mid-transfer and
+// throws away every byte already moved.
+var streamingSubcommands = map[string]bool{
+	"load": true, "import": true, "push": true, "pull": true, "save": true,
+}
+
+// digestAlso names the alternative target spelling in an argument error, for
+// the verbs that accept a digest as well as a reference.
+func digestAlso(subcommand string) string {
+	if subcommand == "pull" || subcommand == "untag" {
+		return ""
+	}
+	return " (or digest)"
+}
+
+// flagWasSet reports whether name was given on the command line. flag cannot
+// distinguish "not set" from "set to the empty string" by value alone, and a
+// verb that cannot honour a flag must refuse it rather than quietly ignore it.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
 	set := false
 	fs.Visit(func(fl *flag.Flag) {
-		if fl.Name == "reference" {
+		if fl.Name == name {
 			set = true
 		}
 	})
@@ -259,11 +397,13 @@ func dialRuntimed(_ context.Context, socket string) (grpc.ClientConnInterface, i
 // correct by locking, because no lock it holds is also held across the daemon's
 // own pull commit, so it would race the very writer it is trying to reason about.
 func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
-	// push is the one subcommand that is not a daemon client: it reads a layout
-	// the invoking user owns and uploads it to a registry as that user. Dialing
-	// first would fail a perfectly valid push on a node whose daemon is down.
+	// push is the one subcommand whose ordinary form is not a daemon client: it
+	// reads a layout the invoking user owns and uploads it to a registry as that
+	// user. Dialing first would fail a perfectly valid push on a node whose
+	// daemon is down, so push takes the dialer and uses it only for the store-ref
+	// form, which genuinely has to ask the daemon for the bytes.
 	if o.subcommand == "push" {
-		return imagePush(ctx, o, out)
+		return imagePush(ctx, o, out, dial)
 	}
 	cc, closer, err := dial(ctx, o.socket)
 	if err != nil {
@@ -278,6 +418,16 @@ func imageCommand(ctx context.Context, o imageOptions, out io.Writer, dial image
 		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_DOCKER_SAVE)
 	case "import":
 		return imageLoad(ctx, client, o, out, runtimev1.LoadImageFormat_LOAD_IMAGE_FORMAT_OCI_LAYOUT)
+	case "pull":
+		return imagePull(ctx, client, o, out)
+	case "tag":
+		return imageTag(ctx, client, o, out)
+	case "untag":
+		return imageUntag(ctx, client, o, out)
+	case "inspect":
+		return imageInspect(ctx, client, o, out)
+	case "save":
+		return imageSave(ctx, client, o, out)
 	case "prune":
 		return imagePrune(ctx, client, o, out)
 	case "ls":
