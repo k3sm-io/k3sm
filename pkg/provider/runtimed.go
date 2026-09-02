@@ -424,12 +424,14 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 //
 //   - runtimed.DefaultSocketPath — the absolute default a daemon started without
 //     an explicit socket path listens on, wherever its work-dir happens to be; and
-//   - <root>/run/runtimed.sock — a work-dir-derived spelling NO code path serves
-//     today. The daemon takes its socket from --socket, defaulting to the
-//     absolute const above and never derived from --root, so this entry is cheap
-//     insurance against a future root-derived socket rather than a description of
-//     current behaviour. Stated plainly because a maintainer who checks the
-//     stronger claim would find no such derivation and delete the entry as dead.
+//   - <root>/run/runtimed.sock — the work-dir-derived spelling THIS node serves,
+//     produced by RuntimedSocketPath. That is the ONE derivation the node's
+//     control-socket listener also goes through, so the socket a node actually
+//     binds is by construction a socket every pod profile denies. The standalone
+//     k3sm-runtimed daemon still takes its socket from --socket, defaulting to
+//     the absolute const above and never derived from --root, which is why both
+//     spellings are emitted rather than one; in the default posture they coincide
+//     and the dedupe leaves a single entry.
 //
 // This mirrors the SBPL generator's own posture resolution, which pins the
 // ABSOLUTE run-dir into the file-deny set in addition to the work-dir-derived one
@@ -439,11 +441,12 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 // coincide and only one is emitted.
 //
 // WHAT THIS BUYS, precisely: the node builds its runtime IN-PROCESS (NewRuntimed
-// → runtime.New), and the installed launch daemons do not include a standalone
-// k3sm-runtimed, so on a stock install there is no socket being served and no
-// live channel this closes. It PRE-POSITIONS the rule — a channel can never
-// appear before the deny that covers it — and it fences the standalone
-// k3sm-runtimed posture used in a lab.
+// → runtime.New) and SERVES it on the derived socket above, so this deny closes
+// a LIVE channel rather than pre-positioning against a future one. It has to:
+// the socket's 0700-dir / 0600-node posture admits the daemon's own uid, and a
+// confined pod runs as that same uid, so the filesystem permissions alone do not
+// fence a pod out of the node's control API. The deny is what does. It also
+// fences the standalone k3sm-runtimed posture used in a lab.
 //
 // WHAT IT DOES NOT COVER. A Seatbelt path-deny is not a capability boundary:
 //
@@ -463,13 +466,32 @@ func baseSocketDenies(root string) []string {
 	if root == "" {
 		root = sandbox.DefaultWorkDir
 	}
-	leaf := filepath.Base(runtimed.DefaultSocketPath)
 	return []string{
 		runtimed.DefaultSocketPath,
-		filepath.Join(root, sandbox.RunSubdir, leaf),
+		RuntimedSocketPath(root),
 		netd.DefaultSocketPath,
 		filepath.Join(root, sandbox.RunSubdir, filepath.Base(netd.DefaultSocketPath)),
 	}
+}
+
+// RuntimedSocketPath returns the unix socket a node whose runtime root is root
+// serves its runtimed gRPC control API on: <root>/run/runtimed.sock, the leaf
+// name taken from runtimed's own exported default so a rename upstream cannot
+// leave the two out of step. An empty root means the runtime default work-dir,
+// for which the result is exactly runtimed.DefaultSocketPath — so a stock
+// install serves the very path `k3sm image` dials by default, and a second
+// instance with its own root (a `k3sm dev` cluster, a lab node) serves beside
+// its own image store instead of contending for the shared one.
+//
+// It is EXPORTED and used by baseSocketDenies so there is exactly one derivation
+// of this path in the tree. That is the point: the served socket and the pod
+// deny-set are then the same string by construction, and a node cannot come to
+// serve a control API at an address no pod profile denies.
+func RuntimedSocketPath(root string) string {
+	if root == "" {
+		root = sandbox.DefaultWorkDir
+	}
+	return filepath.Join(root, sandbox.RunSubdir, filepath.Base(runtimed.DefaultSocketPath))
 }
 
 // stampSocketDenies merges the provider's non-omittable deny-set onto sp.
@@ -714,12 +736,34 @@ func logWithheldCapability(log *slog.Logger, info *runtimev1.GetRuntimeInfoRespo
 		"condition", condType, "status", c.GetStatus().String(), "reason", c.GetReason(), "message", c.GetMessage())
 }
 
+// ServableRuntime implements the optional ControlSocketSource capability: it
+// hands back the in-process *runtime.Runtime this provider drives, so the node
+// can additionally SERVE it on runtimed's gRPC control socket and the
+// daemon-side `k3sm image` commands work on a stock install.
+//
+// It is comma-ok rather than a bare pointer because the field it reads is the
+// runtimev1.RuntimeServer seam newRuntimedWith accepts, and the unit tests
+// inject a fake through exactly that seam. false therefore means "this provider
+// is not driving a real runtimed runtime" — a test double, or any future
+// out-of-process backend — and the caller serves nothing, which is the only
+// honest answer: a Server can only be built over the concrete runtime.
+//
+// It returns the runtime UNWRAPPED and shared, not a copy: the whole point is
+// that the socket serves the SAME instance the VK node drives, so an image
+// loaded over the socket is visible to the next pod this node starts. A second
+// runtime over the same root would be a second writer to one image store.
+func (r *runtimedRuntime) ServableRuntime() (*runtimed.Runtime, bool) {
+	rt, ok := r.rt.(*runtimed.Runtime)
+	return rt, ok
+}
+
 // Compile-time check that runtimedRuntime satisfies the Runtime seam and the
 // optional StatsSource capability (the Summary API surface, M2.3).
 var (
-	_ Runtime        = (*runtimedRuntime)(nil)
-	_ StatsSource    = (*runtimedRuntime)(nil)
-	_ HealthReporter = (*runtimedRuntime)(nil)
+	_ Runtime             = (*runtimedRuntime)(nil)
+	_ StatsSource         = (*runtimedRuntime)(nil)
+	_ HealthReporter      = (*runtimedRuntime)(nil)
+	_ ControlSocketSource = (*runtimedRuntime)(nil)
 )
 
 // podIP resolves the pod's IP BEFORE translation — the M10.1 ordering fix: the

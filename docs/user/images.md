@@ -148,6 +148,33 @@ regardless of what this node already holds. Tag the images you load with somethi
 | Requires a running daemon | Yes. The store is written by the node's runtime daemon over its local socket, so `load` works on an installed, running node and not on a bare directory. Its socket is readable only by the daemon's own account. |
 | Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
 
+### The Daemon Socket
+
+`ls`, `df`, `prune`, `load` and `import` are clients of the node's runtime daemon, which they reach
+over a local unix socket. A running `k3sm server` (or `k3sm agent`) serves that socket as part of
+normal bring-up, so on a standard install the commands work with no extra setup and no flags:
+
+```sh
+k3sm image ls
+k3sm image df
+```
+
+The socket lives in the runtime root's `run` directory — `/var/lib/k3sm/run/runtimed.sock` on a
+standard install, which is what `--socket` defaults to. A node started with a different runtime
+root serves beside its own image store instead, so point the command at it:
+
+```sh
+k3sm image ls --socket /path/to/root/run/runtimed.sock
+```
+
+**Only the daemon's own account can use it.** The socket is created mode `600` inside a `700`
+directory, so a dial from any other user is refused by the operating system before the command
+sends anything. Pods are fenced off it separately, by the sandbox profile every Pod carries — they
+share the daemon's account, so file permissions alone would not keep them out.
+
+If a command reports that it cannot dial the socket, the node is not running, or it is running with
+a different runtime root. `k3sm doctor` reports the former; the latter is a `--socket` away.
+
 ## Pushing to a Registry: `k3sm image push`
 
 `k3sm image push` uploads the image in an OCI layout directory to a registry reference, so a node

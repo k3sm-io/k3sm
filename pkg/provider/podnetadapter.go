@@ -118,6 +118,14 @@ type PodNetAdapter struct {
 	mu      sync.Mutex
 	hostNet map[string]struct{}
 	guest   map[string]sandbox.GuestNetworkConfig
+
+	// reconcileOnce/reconcileErr make ReconcileStartup exactly-once PER ADAPTER,
+	// independently of how many callers invoke it. They are outside mu on
+	// purpose: sync.Once carries its own barrier, the reconcile takes seconds of
+	// netd round-trips, and holding the per-pod mutex across it would block every
+	// Setup/Teardown for the duration.
+	reconcileOnce sync.Once
+	reconcileErr  error
 }
 
 // Compile-time checks: the adapter satisfies the provider seam, runtimed's
@@ -280,9 +288,29 @@ func (a *PodNetAdapter) MarkHostNetwork(podID string) {
 // at assembly the fresh adapter/provider tracks no pods (runtimed pods are
 // in-process children with no durable podID->IP manifest to ReattachPod from,
 // so nothing survives a daemon restart) — every alias a crashed previous daemon
-// left behind is stale. A failed sweep fails the runtime closed (runtimed's
-// sticky once), never serving allocations over an inconsistent alias table.
+// left behind is stale. A failed sweep fails the runtime closed, never serving
+// allocations over an inconsistent alias table.
+//
+// EXACTLY ONCE, and enforced HERE rather than only by runtimed's own sticky
+// once, because this adapter now has TWO callers on one node: startNode calls it
+// directly at bring-up (the embedded runtime is driven by RPC, so runtimed's
+// once-before-Serve hook would otherwise never fire), and runtime.Server.Serve —
+// which the node also starts, for the runtimed control socket — calls it again
+// through Runtime.reconcileNetworkStartup, whose own once has not been tripped
+// by the direct call.
+//
+// A second full pass is NOT harmless, which is the whole reason for the once: the
+// sweep's known set is empty by construction, so a pass that ran after pods had
+// started would read every LIVE pod alias as stale and tear the node's pod
+// networking out from under it. The once makes the second caller a no-op that
+// replays the first verdict, so ordering between the two callers cannot matter.
 func (a *PodNetAdapter) ReconcileStartup(ctx context.Context) error {
+	a.reconcileOnce.Do(func() { a.reconcileErr = a.reconcileStartup(ctx) })
+	return a.reconcileErr
+}
+
+// reconcileStartup is the one-shot body ReconcileStartup guards.
+func (a *PodNetAdapter) reconcileStartup(ctx context.Context) error {
 	if err := a.ipam.SweepStale(ctx, nil); err != nil {
 		return fmt.Errorf("podnet startup stale-alias sweep: %w", err)
 	}

@@ -24,6 +24,7 @@ import (
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // Runtime is the consumer-side seam between the Virtual Kubelet provider and a
@@ -108,4 +109,26 @@ type HealthReporter interface {
 	// cannot determine the answer reports false — the signal is debounced by the
 	// caller, so a transient false is absorbed rather than acted on.
 	Healthy(ctx context.Context) bool
+}
+
+// ControlSocketSource is an OPTIONAL Runtime capability: a Runtime backed by an
+// in-process runtimed runtime that can additionally be SERVED on runtimed's gRPC
+// control socket. VKProvider exposes it through ServableRuntime, which the node
+// bring-up uses to bind that socket alongside the pod lifecycle it already
+// drives — so the daemon-side `k3sm image` commands (ls, df, prune, load,
+// import) reach a store that is otherwise only addressable in-process.
+//
+// It is deliberately NOT part of the core Runtime seam. HostProcess has no
+// runtimed behind it and can never serve the runtime/v1 services, so a node
+// running it simply binds no control socket; the same pattern as StatsSource,
+// StreamingRuntime and HealthReporter.
+//
+// The concrete *runtime.Runtime is unavoidable here: runtime.NewServer takes the
+// concrete type, so an interface-valued capability could not be served. That is
+// also why the result is comma-ok — a Runtime holding a test fake reports false
+// rather than fabricating a runtime nobody can serve.
+type ControlSocketSource interface {
+	// ServableRuntime returns the in-process runtimed runtime to serve, comma-ok.
+	// false means this Runtime is not driving one; the caller serves nothing.
+	ServableRuntime() (*runtimed.Runtime, bool)
 }
