@@ -186,7 +186,7 @@ softwareupdate --install-rosetta --agree-to-license
 
 # 2. restart the k3sm daemon so the capability probes re-run
 #    (io.k3sm.server is the installed control-plane/node LaunchDaemon; use the label
-#     your role installed — see troubleshooting.md)
+#     your role installed — see the Troubleshooting page)
 sudo launchctl kickstart -k system/io.k3sm.server
 
 # 3. confirm the label appeared

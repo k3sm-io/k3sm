@@ -28,8 +28,12 @@ On the agent Mac:
 
 ```sh
 sudo k3sm install
-k3sm agent --server https://<server-host>:6443 --token <token>
+k3sm agent --server <server-underlay-ip> --node-ip <this-macs-underlay-ip> --token <token>
 ```
+
+`--server` is the control-plane Mac's **underlay** address (a LAN IP or DNS name, no scheme, no
+port) — the join dials `<server>:9345`, not the apiserver's `:6443`. `--node-ip` is **required**:
+it's this Mac's own underlay address, bound into the certs the join issues.
 
 The agent authenticates with the bootstrap token, receives its node credentials, and its wireguard peer
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
