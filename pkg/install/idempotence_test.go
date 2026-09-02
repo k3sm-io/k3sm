@@ -18,9 +18,12 @@ package install
 
 import (
 	"context"
+	"encoding/base64"
 	"slices"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // The three reinstall defects observed live across four install cycles on the
@@ -255,6 +258,138 @@ func TestParseProgramArguments(t *testing.T) {
 			if _, err := parseProgramArguments([]byte(bad)); err == nil {
 				t.Errorf("expected an error for %q", bad)
 			}
+		}
+	})
+}
+
+// TestAdminKubeconfigServerURL is defect 3's table: where the admin kubeconfig
+// points, and what it trusts, under each server posture.
+func TestAdminKubeconfigServerURL(t *testing.T) {
+	ca := []byte("-----BEGIN CERTIFICATE-----\nclusterca\n-----END CERTIFICATE-----\n")
+	for _, tc := range []struct {
+		name       string
+		extraArgs  []string
+		clusterCA  []byte
+		wantServer string
+		wantTLS    string
+		absentTLS  string
+	}{
+		{
+			name:       "single-node: loopback, self-signed serving cert, skip verify",
+			wantServer: `server: "https://127.0.0.1:6444"`,
+			wantTLS:    "insecure-skip-tls-verify: true",
+			absentTLS:  "certificate-authority-data",
+		},
+		{
+			name:       "mesh with the cluster CA on disk: mesh URL, verified",
+			extraArgs:  []string{"--mesh-ip", "100.64.0.1", "--registry-port", "6450"},
+			clusterCA:  ca,
+			wantServer: `server: "https://100.64.0.1:6444"`,
+			wantTLS:    "certificate-authority-data: " + base64.StdEncoding.EncodeToString(ca),
+			absentTLS:  "insecure-skip-tls-verify",
+		},
+		{
+			name:       "mesh before the CA exists: mesh URL, skip verify (first install)",
+			extraArgs:  []string{"--mesh-ip", "100.64.0.1"},
+			wantServer: `server: "https://100.64.0.1:6444"`,
+			wantTLS:    "insecure-skip-tls-verify: true",
+			absentTLS:  "certificate-authority-data",
+		},
+		{
+			name:       "inline --mesh-ip= spelling is read the same way",
+			extraArgs:  []string{"--mesh-ip=100.64.0.2"},
+			wantServer: `server: "https://100.64.0.2:6444"`,
+			wantTLS:    "insecure-skip-tls-verify: true",
+		},
+		{
+			name:       "an IPv6 mesh IP is bracketed",
+			extraArgs:  []string{"--mesh-ip", "fd00::1"},
+			wantServer: `server: "https://[fd00::1]:6444"`,
+			wantTLS:    "insecure-skip-tls-verify: true",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := string(AdminKubeconfig(Config{
+				AdminToken:      "k3sm-tok",
+				ExtraServerArgs: tc.extraArgs,
+				ClusterCA:       tc.clusterCA,
+			}))
+			if !strings.Contains(out, tc.wantServer) {
+				t.Errorf("kubeconfig missing %q\n--- kubeconfig ---\n%s", tc.wantServer, out)
+			}
+			if !strings.Contains(out, tc.wantTLS) {
+				t.Errorf("kubeconfig missing %q\n--- kubeconfig ---\n%s", tc.wantTLS, out)
+			}
+			if tc.absentTLS != "" && strings.Contains(out, tc.absentTLS) {
+				t.Errorf("kubeconfig must not carry %q under this posture\n--- kubeconfig ---\n%s", tc.absentTLS, out)
+			}
+			if !strings.Contains(out, "token: k3sm-tok") {
+				t.Error("kubeconfig must carry the shared bearer token")
+			}
+		})
+	}
+}
+
+// TestInstallKubeconfigFollowsThePreservedMeshIP is the end-to-end of defect 3:
+// the URL and the trust anchor both come from the state of the install, so a
+// reinstall over a mesh node produces a kubeconfig that connects AND verifies —
+// without anyone editing it afterwards.
+func TestInstallKubeconfigFollowsThePreservedMeshIP(t *testing.T) {
+	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	dc := cfg.withDefaults()
+	caPath := certs.ClusterCACertPath(dc.serverWorkDir())
+	ca := []byte("-----BEGIN CERTIFICATE-----\nclusterca\n-----END CERTIFICATE-----\n")
+
+	t.Run("single-node install does not read a CA and stays on loopback", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(caPath, ca) // present but irrelevant: the apiserver self-signs on loopback
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if idx(f.calls, "ReadFile:"+caPath) >= 0 {
+			t.Error("a single-node install must not pin a CA that does not anchor the self-signed serving cert")
+		}
+		if !strings.Contains(f.kubeContent, "https://127.0.0.1:6444") {
+			t.Errorf("single-node kubeconfig must address loopback:\n%s", f.kubeContent)
+		}
+	})
+
+	t.Run("mesh reinstall addresses the mesh IP and pins the cluster CA", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(dc.plistPath(ServerLabel), ServerPlist(Config{
+			AdminToken:      "k3sm-old",
+			ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1"},
+		}))
+		f.putFile(caPath, ca)
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !strings.Contains(f.kubeContent, "https://100.64.0.1:6444") {
+			t.Errorf("mesh kubeconfig must address the mesh IP:\n%s", f.kubeContent)
+		}
+		want := "certificate-authority-data: " + base64.StdEncoding.EncodeToString(ca)
+		if !strings.Contains(f.kubeContent, want) {
+			t.Errorf("mesh kubeconfig must pin the cluster CA:\n%s", f.kubeContent)
+		}
+		if strings.Contains(f.kubeContent, "insecure-skip-tls-verify") {
+			t.Errorf("mesh kubeconfig must verify the apiserver:\n%s", f.kubeContent)
+		}
+	})
+
+	t.Run("mesh reinstall with no CA yet degrades to skip-verify, never to loopback", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(dc.plistPath(ServerLabel), ServerPlist(Config{
+			AdminToken:      "k3sm-old",
+			ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1"},
+		}))
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !strings.Contains(f.kubeContent, "https://100.64.0.1:6444") {
+			t.Errorf("the URL must follow the mesh IP even without a CA:\n%s", f.kubeContent)
+		}
+		if !strings.Contains(f.kubeContent, "insecure-skip-tls-verify: true") {
+			t.Errorf("an absent CA must degrade to skip-verify, not fail the install:\n%s", f.kubeContent)
 		}
 	})
 }

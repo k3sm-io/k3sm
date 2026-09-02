@@ -31,16 +31,21 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
 	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -292,7 +297,13 @@ type Config struct {
 	// template over it; a first install leaves it empty. AdminKubeconfig reads
 	// --mesh-ip out of it to address the apiserver where it actually binds.
 	ExtraServerArgs []string
-	Logger          *slog.Logger
+	// ClusterCA is the cluster CA certificate PEM the admin kubeconfig pins as
+	// certificate-authority-data. Install reads it off disk on a mesh install (the
+	// only posture in which the apiserver serves a cluster-CA-signed leaf); empty
+	// keeps the single-node insecure-skip-tls-verify posture, which is the only
+	// correct one against a self-signed serving cert.
+	ClusterCA []byte
+	Logger    *slog.Logger
 }
 
 func (c Config) withDefaults() Config {
@@ -341,6 +352,21 @@ func (c Config) withDefaults() Config {
 // runDir is the runtime run directory for this Config's data root — the one the
 // installer prepares for the service user (see RunDir).
 func (c Config) runDir() string { return RunDir(c.DataRoot) }
+
+// serverWorkDir is the control-plane state root the _k3sm server resolves under
+// its home (executor.ResolveWorkDir's unprivileged branch: <home>/server, and the
+// _k3sm home IS DataRoot). The installer needs it to read the PKI the running
+// control plane wrote there; it is a Config accessor so the leaf name is not
+// re-typed at each use.
+func (c Config) serverWorkDir() string { return filepath.Join(c.DataRoot, "server") }
+
+// meshIP returns the --mesh-ip value carried in ExtraServerArgs, or "" when the
+// server runs single-node. It is the discriminator between the two apiserver
+// postures the admin kubeconfig must address: a mesh server binds its wireguard
+// IP ONLY and serves a cluster-CA-signed leaf, so a loopback URL reaches nothing
+// and the cluster CA is the right anchor; single-node binds loopback and
+// self-signs, for which no CA on disk is the anchor.
+func (c Config) meshIP() string { return flagValue(c.ExtraServerArgs, "mesh-ip") }
 
 // installedBinary is the path the k3sm binary is copied to.
 func (c Config) installedBinary() string {
@@ -655,6 +681,24 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", strings.Join(extra, " "))
 	}
 
+	// 2e. On a mesh install the apiserver serves a CLUSTER-CA-SIGNED leaf, so the
+	//     admin kubeconfig can and must verify it. Read that CA (install runs as
+	//     root; the file is the _k3sm control plane's). Absent on a first install,
+	//     where the control plane has not booted yet — the kubeconfig then falls
+	//     back to the skip-verify posture and the next reinstall picks the CA up.
+	if mesh := cfg.meshIP(); mesh != "" {
+		caPath := certs.ClusterCACertPath(cfg.serverWorkDir())
+		ca, err := sys.ReadFile(caPath)
+		switch {
+		case err == nil:
+			cfg.ClusterCA = ca
+		case errors.Is(err, fs.ErrNotExist):
+			cfg.Logger.Warn("cluster CA not on disk yet; admin kubeconfig keeps insecure-skip-tls-verify until the next install", "path", caPath)
+		default:
+			return fmt.Errorf("install: read cluster CA %s: %w", caPath, err)
+		}
+	}
+
 	// 3. Render + write both plists, in manifest (install) order.
 	for _, a := range m {
 		if a.kind != kindDaemon {
@@ -762,7 +806,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// server daemon (a Stop() cut short by launchd's SIGKILL, or a crash). They
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
-	note(sys.ReapOrphans(filepath.Join(cfg.DataRoot, "server", "bin")))
+	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
 	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
 	// no daemon removes on the way out — netd tracks per-connection alias caps
 	// (not cleanup), the server's pod teardown misses anything a failed run
@@ -796,7 +840,7 @@ func NetdPlist(cfg Config) []byte {
 			"--socket", cfg.NetdSocket,
 			"--service-cidr", cfg.ServiceCIDR,
 			"--mesh-key-dir", MeshKeyDir,
-			"--kubeconfig", filepath.Join(cfg.DataRoot, "server", "k3sm.kubeconfig"),
+			"--kubeconfig", filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig"),
 		},
 		RunAtLoad:  true,
 		KeepAlive:  true,
@@ -865,18 +909,47 @@ func ServerPlist(cfg Config) []byte {
 	})
 }
 
-// AdminKubeconfig renders the admin kubeconfig (loopback apiserver + the shared
-// static token + insecure-skip-tls for the single-node self-signed serving cert)
-// written to the human's home so `kubectl` works once the server is up.
+// adminLoopbackHost is the apiserver address the admin kubeconfig uses on a
+// single-node install: the loopback the control plane binds when no mesh IP is
+// configured. A mesh install overrides it with the mesh IP — see AdminKubeconfig.
+const adminLoopbackHost = "127.0.0.1"
+
+// AdminKubeconfig renders the admin kubeconfig (the apiserver's EFFECTIVE
+// address + the shared static token) written to the human's home so `kubectl`
+// works once the server is up.
+//
+// Two postures, selected by whether the preserved server arguments carry a
+// --mesh-ip (Config.meshIP):
+//
+//   - MESH: the apiserver binds its wireguard IP ONLY and serves a
+//     cluster-CA-signed leaf. The URL is that IP — a loopback URL addresses
+//     nothing, which is how a multi-node install shipped an admin kubeconfig that
+//     could not connect at all — and the cluster CA (Config.ClusterCA, read off
+//     disk by Install) is pinned as certificate-authority-data so the connection
+//     is actually verified. An absent CA falls back to skip-verify, because a
+//     first install writes this file before the control plane has minted one.
+//   - SINGLE-NODE: loopback, and insecure-skip-tls-verify — the apiserver
+//     self-signs its serving cert there, so no CA on disk anchors it and pinning
+//     one would break kubectl rather than secure it. This mirrors the executor's
+//     own posture split (writeComponentKubeconfig's verifyClusterCA).
 func AdminKubeconfig(cfg Config) []byte {
 	cfg = cfg.withDefaults()
+	host := adminLoopbackHost
+	clusterTLS := "    insecure-skip-tls-verify: true"
+	if mesh := cfg.meshIP(); mesh != "" {
+		host = mesh
+		if len(cfg.ClusterCA) > 0 {
+			clusterTLS = "    certificate-authority-data: " + base64.StdEncoding.EncodeToString(cfg.ClusterCA)
+		}
+	}
+	server := "https://" + net.JoinHostPort(host, strconv.Itoa(cfg.APIServerPort))
 	return []byte(fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
 - name: k3sm
   cluster:
-    server: "https://127.0.0.1:%d"
-    insecure-skip-tls-verify: true
+    server: %q
+%s
 contexts:
 - name: k3sm
   context:
@@ -887,7 +960,7 @@ users:
 - name: admin
   user:
     token: %s
-`, cfg.APIServerPort, cfg.AdminToken))
+`, server, clusterTLS, cfg.AdminToken))
 }
 
 // launchdPlist is the subset of a launchd job we render. A non-empty UserName
