@@ -22,7 +22,7 @@ join token and every node's kubeconfig; re-minting the signing CA would invalida
 certificate at once. There is no CA-replacement flow — `k3sm certificate rotate-ca` exists only
 to say so explicitly. Replacing a CA means recreating the cluster.
 
-## What Rotation Actually Is
+## What Rotation Is
 
 Every control-plane boot re-issues the CA-signed leaves unconditionally: the scheduler and
 controller-manager client-cert kubeconfigs, and (on a multi-node server) the apiserver serving
@@ -67,7 +67,7 @@ one.
 
 | Flag | Meaning |
 |---|---|
-| `--restart` (alias `--yes`) | Actually restart. Without it the command only reports. |
+| `--restart` (alias `--yes`) | Restart. Without it the command only reports. |
 | `--work-dir <dir>` | The control-plane state root. Defaults to this posture's work dir. |
 | `--apiserver-port <n>` | The port the post-restart health probe checks (default `6444`). |
 

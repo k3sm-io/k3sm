@@ -76,7 +76,7 @@ The `Ready` condition's `reason` names the state: `Pending` (no replica running 
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
 replica died), `ScaledToZero` (you set `replicas: 0`).
 
-There is deliberately no liveness probe on the serving pod: a first start is an unbounded download, and
+There is no liveness probe on the serving pod: a first start is an unbounded download, and
 a probe that killed it would restart the download from zero.
 
 ## 4. Call It

@@ -22,9 +22,8 @@ findings as high severity, and include the affected component and a reproduction
 
 ## Supported versions
 
-k3sm is **pre-release** — there are no supported release lines yet. Please report
-against the latest `main`. A supported-versions policy will be published with the
-first tagged release.
+Please report against the latest `main`. A supported-versions policy is published
+with the first stable release.
 
 ## Disclosure process
 
