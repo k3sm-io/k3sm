@@ -34,6 +34,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // registryTokenEnv overrides the docker config chain with a bearer token read
@@ -84,7 +86,7 @@ func imagePush(ctx context.Context, o imageOptions, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("compute digest of the image in %s: %w", o.layoutDir, err)
 	}
-	auth, err := registryAuth(ref)
+	auth, err := registryAuth(ref, o.workDir)
 	if err != nil {
 		return err
 	}
@@ -147,13 +149,22 @@ func layoutImage(dir string) (ggcrv1.Image, error) {
 
 // registryAuth resolves the credential for ref.
 //
-// Two sources, in this order: the K3SM_REGISTRY_TOKEN environment variable, then
-// the standard docker config chain (`docker login`, `crane auth login`, and the
-// credential helpers those configure). argv is deliberately not a third: an
-// argument is visible in `ps` to every user on the machine for as long as the
-// upload runs, and it is written verbatim into the invoking shell's history
-// file, so a token passed that way outlives the command that used it.
-func registryAuth(ref name.Reference) (authn.Authenticator, error) {
+// Three sources, in this order: the K3SM_REGISTRY_TOKEN environment variable,
+// this node's OWN ingest-registry credential, then the standard docker config
+// chain (`docker login`, `crane auth login`, and the credential helpers those
+// configure). argv is deliberately not a fourth: an argument is visible in `ps`
+// to every user on the machine for as long as the upload runs, and it is written
+// verbatim into the invoking shell's history file, so a token passed that way
+// outlives the command that used it.
+//
+// The ORDER is deliberate at both ends. The explicit env token wins, because an
+// operator who set it meant it. The local credential comes BEFORE the docker
+// chain because the chain never says "no match" — it returns Anonymous — so a
+// push to this node's own registry would otherwise arrive unauthenticated and be
+// refused 401 with a credential sitting on disk the whole time. It cannot shadow
+// a real login, because localRegistryAuth only answers for a loopback target
+// whose address matches the credential's own.
+func registryAuth(ref name.Reference, workDir string) (authn.Authenticator, error) {
 	// Trimmed because the usual way to set this is from a file or a command
 	// substitution, both of which carry the trailing newline into the value —
 	// and a bearer token with a newline in it is rejected as a bad credential,
@@ -161,11 +172,43 @@ func registryAuth(ref name.Reference) (authn.Authenticator, error) {
 	if token := strings.TrimSpace(os.Getenv(registryTokenEnv)); token != "" {
 		return authn.FromConfig(authn.AuthConfig{RegistryToken: token}), nil
 	}
+	if local := localRegistryAuth(ref, workDir); local != nil {
+		return local, nil
+	}
 	auth, err := authn.DefaultKeychain.Resolve(ref.Context())
 	if err != nil {
 		return nil, fmt.Errorf("resolve a credential for %s: %w", ref.Context().RegistryStr(), err)
 	}
 	return auth, nil
+}
+
+// localRegistryAuth returns this node's ingest-registry credential when ref
+// targets exactly that registry, and nil otherwise.
+//
+// Every failure mode returns nil rather than an error, and that is the whole
+// design of this seam: the credential is an OPTIONAL convenience for one target,
+// so a missing work dir, a disabled registry, an unreadable file (the invoking
+// user is not the one the control plane runs as) or a malformed one must all fall
+// through to the docker chain, which then produces the ordinary "unauthenticated"
+// outcome. Failing the push here would break every push to every OTHER registry
+// on a host whose local registry happens to be off.
+//
+// MatchesRegistry is what keeps the secret contained: it answers true only for a
+// loopback spelling on the exact port the credential was minted for, so the
+// password is never presented to a public registry or to a different instance's
+// registry on the same Mac.
+func localRegistryAuth(ref name.Reference, workDir string) authn.Authenticator {
+	if workDir == "" {
+		return nil
+	}
+	cred, err := registrysvc.ReadCredential(workDir)
+	if err != nil {
+		return nil
+	}
+	if !cred.MatchesRegistry(ref.Context().RegistryStr()) {
+		return nil
+	}
+	return authn.FromConfig(authn.AuthConfig{Username: cred.Username, Password: cred.Password})
 }
 
 // pushError classifies an upload failure into the sentinel an operator can act
@@ -176,8 +219,8 @@ func pushError(ref name.Reference, err error) error {
 	if errors.As(err, &terr) {
 		switch terr.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return fmt.Errorf("push %s: %w: %s answered HTTP %d (set %s, or log in so the docker config chain resolves that registry)",
-				ref, errPushAuth, ref.Context().RegistryStr(), terr.StatusCode, registryTokenEnv)
+			return fmt.Errorf("push %s: %w: %s answered HTTP %d (set %s, log in so the docker config chain resolves that registry, or — for this node's own ingest registry — point --work-dir at the control plane that minted %s)",
+				ref, errPushAuth, ref.Context().RegistryStr(), terr.StatusCode, registryTokenEnv, registrysvc.CredentialPath("<work-dir>"))
 		}
 		return fmt.Errorf("push %s: %s answered HTTP %d: %v", ref, ref.Context().RegistryStr(), terr.StatusCode, terr)
 	}
