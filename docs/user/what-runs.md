@@ -48,8 +48,8 @@ with a format error that names nothing. Failing at pull tells you what is wrong 
 act on it.
 
 `linux/arm64` payloads are the job of the [`vm` RuntimeClass](vm-runtimeclass.md), which runs a
-micro-VM per Pod. **It is EXPERIMENTAL and preview-quality** — read that page and
-[Limitations](limitations.md) before planning around it.
+micro-VM per Pod, validated on real hardware — read that page and
+[Limitations](limitations.md) for what it supports.
 
 ## From a Dockerfile to a running Pod
 
@@ -131,7 +131,7 @@ an existing public image and expect it to run.
 
 The default path runs **Mac-native workloads** — including ones that need Metal, CoreML,
 `codesign` or Xcode, which no Linux VM can give you — with Kubernetes semantics and the OCI
-toolchain around them. Unmodified `linux/arm64` images run too, opt-in, through the EXPERIMENTAL
+toolchain around them. Unmodified `linux/arm64` images run too, opt-in, through the
 `vm` RuntimeClass described above; `linux/amd64` images do not run yet. If your workload is a
 Linux binary you cannot rebuild and the `vm` path does not cover it,
 [Limitations](limitations.md) has the full picture.

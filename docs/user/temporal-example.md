@@ -11,9 +11,9 @@ and the **client** is the native macOS `temporal` binary from Homebrew, talking 
 > **Requirements:** Apple Silicon, macOS 26+, a running k3sm cluster ([quickstart.md](quickstart.md)),
 > a node that advertises `k3sm.io/virtualization`, and network access to pull images from Docker Hub.
 >
-> **The `vm` RuntimeClass is EXPERIMENTAL and preview-quality.** Read
-> [vm-runtimeclass.md](vm-runtimeclass.md) and [limitations.md](limitations.md) before depending on it
-> for anything that matters.
+> The `vm` RuntimeClass runs unmodified `linux/arm64` images in a per-Pod micro-VM. Read
+> [vm-runtimeclass.md](vm-runtimeclass.md) and [limitations.md](limitations.md) for what it supports
+> today.
 
 ## What it stands up
 
