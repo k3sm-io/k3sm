@@ -17,7 +17,7 @@ you depend on it.
 >
 > It is targeted at the **v0.1.0** public release as documented **EXPERIMENTAL** and
 > **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is deliberately held for a
-> later release), launch-gated on a live lab proof against the release artifact. The
+> later release), launch-gated on a live lab run against the release artifact. The
 > de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2** milestone. Treat
 > this path as preview-quality and validate your own workload before depending on it.
 
@@ -116,7 +116,7 @@ includes `darwin/arm64` is unaffected — it runs natively, as it always did.
 That refusal is deliberate, not an oversight. Two things must land first:
 
 - **`k3sm.io/rosetta` (host, darwin/amd64)** — spawning a *translated* Mach-O inside the Seatbelt sandbox
-  is not yet proven end to end. Selecting amd64 payloads before it is would also weaken a
+  is not yet validated end to end. Selecting amd64 payloads before it is would also weaken a
   kernel-level check k3sm relies on: an unsigned **arm64** binary is killed by the OS, while an unsigned
   **x86_64** one is not.
 - **`k3sm.io/rosetta-linux` (guest, linux/amd64)** — the Linux-guest payload path (rootfs + guest image

@@ -313,7 +313,7 @@ different tracks:
   `vm` Pod shares one root filesystem, so a Pod naming two different images runs the second
   container's command against the first container's image. It is targeted at the **v0.1.0** release as
   EXPERIMENTAL and **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for
-  a later release), and is **launch-gated**: announced only if its live lab proof is green against
+  a later release), and is **launch-gated**: announced only if its live lab run is green against
   the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed, with published
   performance figures — is the **v0.2** milestone. See [vm-runtimeclass.md](vm-runtimeclass.md).
 - **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
@@ -488,7 +488,7 @@ kubectl label node <node> k3sm.io/rosetta- k3sm.io/rosetta-linux-
 sudo launchctl kickstart -k system/io.k3sm.server
 ```
 
-The label removal on restart is itself only proven against the node object k3sm *constructs*; whether a
+The label removal on restart is itself only validated against the node object k3sm *constructs*; whether a
 label **deletion** propagates through Virtual Kubelet's node reconcile to the datastore in every case is
 not yet verified in a lab. `k3sm.io/virtualization` has always had the same property. Treat the manual
 `kubectl label ... -` above as the reliable way to withdraw a capability claim.

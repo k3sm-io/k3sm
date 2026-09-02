@@ -11,7 +11,7 @@ EXPERIMENTAL `vm` RuntimeClass adds an opt-in path that boots `linux/arm64` OCI 
 per-pod micro-VM — see Shipped, below.
 
 This is a k3s-style three-horizon roadmap. Where a capability is implemented but not yet
-proven on real hardware, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
+validated on real hardware, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
 the docs today.
 
 ## Shipped
@@ -20,7 +20,7 @@ The engine. Milestones **M0–M6 and M10** are implemented and workspace-integra
 (`hack/ci.sh`). **M0, M1 and M2 are validated end to end on Apple-Silicon hardware** — M2's gate is
 the strongest evidence so far: run against a real root install on macOS 26.5, all **13 required
 conformance criteria passed**, together with the full install/uninstall lifecycle checks. That is
-the first live-hardware proof of the packaged single-node path. The remaining live-hardware and
+the first live-hardware validation of the packaged single-node path. The remaining live-hardware and
 two-Mac gates are burned down in M7. What works:
 
 - **Native Darwin-process pods, zero Linux on the default path.** OCI images ship an arm64
@@ -45,7 +45,7 @@ two-Mac gates are burned down in M7. What works:
 - **`vm` RuntimeClass — EXPERIMENTAL, preview-quality.** A fail-closed dispatch to a
   Virtualization.framework Linux micro-VM for `linux/arm64` images (e.g. Postgres): the RuntimeClass,
   the fail-closed backend selection, the capability labels, the scheduler overhead accounting, and
-  PVC-backed storage. Proven end to end on the reference hardware (see
+  PVC-backed storage. Validated end to end on the reference hardware (see
   [docs/user/limitations.md](docs/user/limitations.md)): boot and restart, `kubectl logs`/`exec` with
   exit-code propagation, PersistentVolumeClaims that survive a hard hypervisor kill, in-guest cluster
   DNS, per-container CPU and memory, and a Service routing to a `vm` pod through its ClusterIP.
@@ -56,7 +56,7 @@ two-Mac gates are burned down in M7. What works:
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
-  logging, node lifecycle Events. Proven by k3sm's own synthetic-conformance criteria — **not** a
+  logging, node lifecycle Events. Validated by k3sm's own synthetic-conformance criteria — **not** a
   CNCF `[Conformance]` pass (the default path, which the suite targets, runs no Linux containers).
   The self-assessment —
   targeted feature classes mapped to a green criterion or a documented ceiling — is
@@ -89,12 +89,12 @@ The first public release. One track is launch-blocking:
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers, unmodified images with a three-line manifest
   adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
-  *(targeted at v0.1.0 as EXPERIMENTAL — launch-gated by a live lab proof against the release
+  *(targeted at v0.1.0 as EXPERIMENTAL — launch-gated by a live lab run against the release
   artifact; included in the announcement only if that gate is green; the de-EXPERIMENTAL
   graduation with published performance figures is the v0.2 milestone below)*
 - **linux/amd64 images are NOT in v0.1.0.** Running them needs Rosetta-for-Linux translation
   inside the guest, and it is deliberately cut from the first release so the arm64 path can be
-  proven on hardware on its own. There is no emulation fallback — no qemu exists for a Darwin
+  validated on hardware on its own. There is no emulation fallback — no qemu exists for a Darwin
   host — so until translation lands, an amd64-only image is refused at pull with a
   no-matching-platform error rather than started and left to crash, and a node that cannot
   translate does not advertise that it can. *(scheduled for a v0.1.x follow-up)*

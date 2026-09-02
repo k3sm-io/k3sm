@@ -29,7 +29,7 @@ transaction, so a concurrent write cannot tear it. What it does, in order:
    partial snapshot.
 3. Writes a consistent point-in-time image of the datastore, runs `PRAGMA integrity_check` on **that
    image**, and only then renames it into place — so a snapshot that exists under its final name is
-   complete and was proven readable as a database.
+   complete and was confirmed readable as a database.
 
 The work directory is owned by the `_k3sm` service user, so run it under `sudo` (or pass
 `--work-dir`) when your shell user cannot read it. The snapshot is written `0600`.
@@ -178,7 +178,7 @@ rebuilt from source without a module proxy that still carries it, so those bytes
   automatic one only appears when a release changes the datastore engine, so it is not a backup
   policy.
 - `k3sm snapshot restore` leaves a `state.db.restore-<UTC>.bak` (plus its sidecars) behind on every
-  restore. Keep the most recent one until the restored cluster has proven itself; they are full
+  restore. Keep the most recent one until you are confident in the restored cluster; they are full
   copies and do not shrink.
 - Deleting a `.bak` re-arms nothing: the automatic backup is taken per target version, and that
   version has already been recorded as having opened the database.
