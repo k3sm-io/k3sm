@@ -12,7 +12,7 @@ Report privately, in order of preference:
    choose **Report a vulnerability** (GitHub's private advisory flow). This is the
    preferred channel: it is private, supports coordinated/embargoed collaboration, and
    can issue a CVE.
-2. **Email** — <michelle@k3sm.io>. Use this if the advisory flow is unavailable to
+2. **Email** — <kitsumiko@k3sm.io>. Use this if the advisory flow is unavailable to
    you, or if you would rather not open a GitHub account to make a report.
 3. **Direct contact** — message the maintainer **[@kitsumiko](https://github.com/kitsumiko)** on GitHub.
 
