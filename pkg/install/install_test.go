@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
+	"io/fs"
 	"net/netip"
 	"path/filepath"
 	"strings"
@@ -35,8 +37,28 @@ type fakeSystem struct {
 	calls       []string
 	kubeUser    string
 	kubeContent string
+	// files is the fake root filesystem ReadFile answers from. WriteLaunchDaemon
+	// records into it, so running Install twice against ONE fake reproduces a real
+	// reinstall: the second run reads back the plist the first run wrote.
+	files map[string][]byte
 	// pid is the launchd-reported pid of the labelled job; a kickstart advances it.
 	pid int
+}
+
+// putFile seeds the fake root filesystem (an installed plist, the cluster CA).
+func (f *fakeSystem) putFile(path string, content []byte) {
+	if f.files == nil {
+		f.files = map[string][]byte{}
+	}
+	f.files[path] = content
+}
+
+func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
+	f.calls = append(f.calls, "ReadFile:"+path)
+	if content, ok := f.files[path]; ok {
+		return content, nil
+	}
+	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
 func (f *fakeSystem) EnsureServiceUser(name string) (uint32, error) {
@@ -74,8 +96,9 @@ func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
 	return nil
 }
 
-func (f *fakeSystem) WriteLaunchDaemon(plistPath string, _ []byte) error {
+func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
 	f.calls = append(f.calls, "WriteLaunchDaemon:"+plistPath)
+	f.putFile(plistPath, contents)
 	return nil
 }
 
@@ -156,6 +179,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm/bin/" + executor.KineMarkerName,
+		// The installed server plist is read BEFORE the plists are rendered, so a
+		// reinstall carries the operator's own arguments into the new render.
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",

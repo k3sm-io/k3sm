@@ -211,6 +211,13 @@ func (darwinSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
 	return nil
 }
 
+// ReadFile reads a root-readable file, propagating os.ReadFile's error verbatim
+// so a caller can distinguish "not there yet" (fs.ErrNotExist — a first install
+// has neither the installed plist nor the cluster CA) from a real read failure.
+func (darwinSystem) ReadFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
 // LaunchctlBootstrap loads the daemon into the system domain.
 func (darwinSystem) LaunchctlBootstrap(label string) error {
 	plist := filepath.Join(DefaultLaunchDaemonDir, label+".plist")

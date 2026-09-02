@@ -194,6 +194,12 @@ type System interface {
 	EnsureVMRunDir(dir string, uid uint32) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
+	// ReadFile reads a root-readable file: the installed server plist, whose
+	// operator-supplied arguments a reinstall must carry over, and the cluster CA
+	// the admin kubeconfig pins. A missing file returns an error satisfying
+	// errors.Is(err, fs.ErrNotExist), which callers treat as "nothing to carry
+	// over" rather than a failure — a FIRST install has neither file.
+	ReadFile(path string) ([]byte, error)
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
 	LaunchctlBootstrap(label string) error
 	// LaunchctlBootout unloads the labelled daemon (idempotent: a not-loaded
@@ -279,7 +285,14 @@ type Config struct {
 	// AdminToken is the static bearer token shared between the server LaunchDaemon
 	// (--token) and the admin kubeconfig. Generated when empty.
 	AdminToken string
-	Logger     *slog.Logger
+	// ExtraServerArgs are operator-supplied `k3sm server` arguments appended to
+	// the fixed set ServerPlist renders (--mesh-ip, --registry-port, …). Install
+	// populates it from the ARGUMENTS OF THE PLIST ALREADY ON DISK, so a reinstall
+	// preserves what an operator configured instead of re-rendering the bare
+	// template over it; a first install leaves it empty. AdminKubeconfig reads
+	// --mesh-ip out of it to address the apiserver where it actually binds.
+	ExtraServerArgs []string
+	Logger          *slog.Logger
 }
 
 func (c Config) withDefaults() Config {
@@ -626,6 +639,22 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName))
 
+	// 2d. Carry over the operator-supplied server arguments from the plist ALREADY
+	//     ON DISK. ServerPlist renders a fixed template, so before this a reinstall
+	//     silently dropped every argument a human had added (--mesh-ip,
+	//     --registry-port) and the cluster came back single-node on loopback until
+	//     someone repaired the plist by hand. A first install finds no plist and
+	//     preserves nothing; --token is deliberately NOT preserved (it is
+	//     install-managed and re-minted here, in lockstep with the kubeconfig).
+	extra, err := installedServerArgs(sys, cfg)
+	if err != nil {
+		return err
+	}
+	cfg.ExtraServerArgs = extra
+	if len(extra) > 0 {
+		cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", strings.Join(extra, " "))
+	}
+
 	// 3. Render + write both plists, in manifest (install) order.
 	for _, a := range m {
 		if a.kind != kindDaemon {
@@ -801,16 +830,24 @@ const serverFileLimit = 131072
 // unprivileged _k3sm user (UserName) execing `k3sm server` (the control plane +
 // VK node), which reaches the root helper over the netd socket. KeepAlive +
 // RunAtLoad make it boot-surviving and headless.
+//
+// The argument list is the fixed managed set followed by Config.ExtraServerArgs
+// — the operator's own arguments, which Install reads off the installed plist so
+// a reinstall does not re-render the bare template over them. They are appended
+// AFTER the managed set (and in their original relative order) so a preserved
+// argument can never displace one this renderer owns.
 func ServerPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
+	args := []string{
+		cfg.installedBinary(), "server",
+		"--runtime", "runtimed",
+		"--token", cfg.AdminToken,
+	}
+	args = append(args, cfg.ExtraServerArgs...)
 	return renderPlist(launchdPlist{
-		Label:    ServerLabel,
-		UserName: cfg.ServiceUser,
-		ProgramArguments: []string{
-			cfg.installedBinary(), "server",
-			"--runtime", "runtimed",
-			"--token", cfg.AdminToken,
-		},
+		Label:            ServerLabel,
+		UserName:         cfg.ServiceUser,
+		ProgramArguments: args,
 		RunAtLoad:        true,
 		KeepAlive:        true,
 		WorkingDirectory: cfg.DataRoot,
