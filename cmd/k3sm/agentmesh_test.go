@@ -40,7 +40,7 @@ func stubUnderlayIPs(t *testing.T, ips []net.IP) {
 // every other node dials to open the wireguard handshake, and a peer that has not
 // yet completed that handshake has no route into the mesh — so an endpoint inside
 // the mesh is unreachable by definition. The live lab showed exactly that:
-// `k3sm-lab-b` enrolled `100.64.1.1:51820`, its own mesh IP, and the server then
+// `k3sm-worker-b` enrolled `100.64.1.1:51820`, its own mesh IP, and the server then
 // initiated handshakes into its own tunnel.
 //
 // The captured address is preferred because it is the source address the kernel's

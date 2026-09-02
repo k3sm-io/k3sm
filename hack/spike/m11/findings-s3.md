@@ -56,8 +56,8 @@ anything it supplies S4 with a second data point (see the M11.0-d4 note below).
 
 | | |
 |---|---|
-| host | the lab Mac (the lab host), run locally through the harness's ssh path |
-| macOS | 26.6.2 · `hw.model` Apple silicon · arm64 |
+| host | the lab Mac, run locally through the harness's ssh path |
+| macOS | 26.6.2 · arm64 |
 | date (UTC) | 2026-08-31 |
 | guest kernel | `6.14.0-37-generic` (Ubuntu 25.04 plucky, arm64 generic cloud) |
 | kernel URL | `https://cloud-images.ubuntu.com/releases/25.04/release/unpacked/ubuntu-25.04-server-cloudimg-arm64-vmlinuz-generic` |
@@ -153,7 +153,7 @@ human-reviewed re-plan's job, and this file deliberately does not pre-empt it.
 
 ### Scope of the claim
 
-One rig, one macOS build (26.6.2 / (redacted)), one guest kernel, one
+One rig, one macOS version (26.6.2), one guest kernel, one
 `VZVirtioFileSystemDeviceConfiguration` single-directory share. **The host-side
 server behaviour was observed on THIS macOS build only.** Apple documents no
 FUSE feature-negotiation contract for its virtiofs device, so a later macOS may

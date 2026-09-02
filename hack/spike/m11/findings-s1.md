@@ -11,9 +11,8 @@
 
 | | |
 |---|---|
-| host | the lab host (the lab Mac, run over the harness's ssh path) |
-| macOS | 26.6.2 |
-| hw.model | Apple silicon |
+| host | the lab Mac, run over the harness's ssh path |
+| macOS | 26.6.2 · arm64 |
 | date (UTC) | 2026-08-31 |
 | kernel sha256 | 6f905cefaef1f76b2b420967b1f65dc1ea3621e68eecf6bdce164cf4132aa195 |
 | kernel bytes | 59079048 (uncompressed arm64 Image, throwaway Ubuntu 24.04 cloud kernel) |

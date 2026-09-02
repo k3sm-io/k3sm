@@ -24,7 +24,7 @@
 > The stated minimum bar is cleared by more than one candidate, so the "S5
 > terminal" halt condition does not fire.
 
-Run: 2026-08-29 on the S1 rig (Apple M1 Ultra, 64 GiB, macOS 26.5.2 / (redacted)),
+Run: 2026-08-29 on the S1 rig (Apple M1-family, 64 GiB, macOS 26.5.2),
 agent-driven over ssh. Re-run with `hack/spike/m8/s5.sh`
 (`--reinstall`, `--only <engine>`). Model: `Qwen2.5-0.5B-Instruct-4bit` for all
 candidates; each engine in its **own** venv under the spike prefix so footprints

@@ -5,7 +5,7 @@
 > both unsandboxed and under the S1 Seatbelt profile, and the one file the walk
 > flags is a *known, characterized* class that `AdHocSignTree` must handle.
 
-Run: 2026-08-29 on the S1 rig (M1 Ultra, macOS 26.5.2 / (redacted)). Re-run with
+Run: 2026-08-29 on the S1 rig (Apple M1-family, macOS 26.5.2). Re-run with
 `hack/spike/m8/s2.sh`.
 
 ## The walk

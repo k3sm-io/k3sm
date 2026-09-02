@@ -13,9 +13,9 @@ Run: 2026-08-29, agent-driven over ssh. Re-run with `hack/spike/m8/s1.sh`
 
 | | |
 |---|---|
-| host | `lab-host.invalid` (the bare name does not resolve) |
-| SoC | **Apple M1 Ultra**, 20-core, 64 GiB unified — *not* the M1 Max the M8.0 ledger row records; the row should be corrected |
-| macOS | **26.5.2**, build **(redacted)** |
+| host | the lab Mac, reached over the harness's ssh path (`K3SM_SPIKE_HOST`) |
+| SoC | **Apple M1-family**, 64 GiB unified — *not* the part the M8.0 ledger row records; the row should be corrected |
+| macOS | **26.5.2** |
 | GPU | `AGXAcceleratorG13X` (IOKit service class); MLX reports `architecture: applegpu_g13d`, `max_recommended_working_set_size: 55662788608` |
 | toolchain | uv 0.12.7 → CPython 3.12.14 (python-build-standalone) |
 | pins | `mlx==0.32.2`, `mlx-metal==0.32.2`, `mlx-lm==0.31.3`, `transformers==5.16.1`, `tokenizers==0.23.1`, `numpy==2.5.2`, `safetensors==0.8.0`, `huggingface-hub==1.29.0` (full set: `$PREFIX/logs/pip-freeze.txt`) |
@@ -254,4 +254,7 @@ probe whose failure MLX and CPython tolerate; none was widened.
    path dies in `import rich` on `os.getcwd()` → `PermissionError`, long before
    any GPU rule matters. Cost one debugging cycle here; it will cost M8.4 one too
    if `mlx-serve`'s entrypoint does not chdir.
-5. **The lab rig is an M1 Ultra, not an M1 Max** — correct the M8.0 ledger row.
+5. **The M8.0 ledger row names the wrong SoC** — the rig is a higher-tier
+   M1-family part with 64 GiB unified, not the M1 Max the row records. The GPU
+   row in the rig table above is the operative fact for the allow-set; correct
+   the ledger row to the SoC family.

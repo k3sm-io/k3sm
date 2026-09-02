@@ -3,9 +3,23 @@
 A lab gate is run by hand, on real hardware, and then it is over. Nothing about that
 run survives in CI, so the **log is the evidence** — the only artifact a later reader
 can use to decide whether a ledger row was actually satisfied, and by *what*. This
-directory is where those logs live, and this file is the convention they follow.
+file is the convention those logs follow.
 
-## File name
+## The logs themselves are NOT tracked
+
+A lab log is a transcript of a real machine. It carries that machine's host name, its
+LAN addresses, its hardware model and OS build, and whatever else the gate printed
+while it ran — none of which belongs in a public repository. So `hack/lab/runs/*.log`
+is **gitignored**: the logs are **operator-held evidence**, retained outside the repo,
+and this README is the only tracked file in the directory.
+
+That does not weaken the evidence chain, because the chain never ran through git. A
+ledger row cites a log by its **run id** — the file name below, which already encodes
+the gate, the artifact under test and the UTC date — and the operator holds the log
+that name refers to. A reader who needs the transcript asks for it by run id; a reader
+who only needs to know *which* run discharged a row reads the id in the ledger.
+
+## File name (the run id)
 
 ```
 hack/lab/runs/<gate>-<rc-tag>-<UTCdate>.log
@@ -39,6 +53,10 @@ missing any of them is not evidence:
 K3SM_LAB=1 K3SM_RC_TAG=v0.1.0-rc.3 K3SM_ARTIFACT=/path/to/k3sm \
   hack/lab/m11.sh --core | tee hack/lab/runs/m11-core-v0.1.0-rc.3-2026-09-01.log
 ```
+
+The redirect target is inside this directory purely for convenience — the file is
+gitignored the moment it is written. Move or copy it to the operator's evidence store;
+never `git add -f` one.
 
 `K3SM_ARTIFACT` is the binary under test (it is what `artifact_sha256` hashes);
 `K3SM_RC_TAG` promotes the recorded sha from `local:<sha>` to the bare rc form. With

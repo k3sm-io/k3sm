@@ -40,3 +40,9 @@ go.work.sum
 # guest run's /Library/k3sm and /var/lib/k3sm state, which includes its bootstrap
 # CA, node-password and join token. Per-run and disposable, but never committed.
 lab-vm-out/
+
+# Lab-gate run logs (hack/lab/runs/, convention in that directory's README). A lab
+# gate runs on real hardware, so its log carries host names, LAN addresses and the
+# rig's hardware/OS fingerprint. The logs stay OPERATOR-HELD evidence outside the
+# repo and are cited from the ledger by run id; only the README is tracked.
+hack/lab/runs/*.log

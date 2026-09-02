@@ -3,7 +3,7 @@
 Recorded 2026-08-31. S4's dry-run was overtaken by events: the production
 `runtimed/hack/guest-kernel/build.sh` was built, run twice, and published the same
 day, so this file records the real build rather than a rehearsal. Rig: the M11
-lab host (Apple silicon, macOS 26.6.x, Docker 29.6.2 aarch64).
+lab host (arm64, macOS 26.6.x).
 
 ## The artifact
 
