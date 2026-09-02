@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
+	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 	"k3sm.io/k3sm/pkg/svclb"
 )
@@ -96,6 +97,12 @@ type serverOptions struct {
 
 	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (M10.3/B116; 0 disables; 80 = production, an explicit high port = integration tier)
 	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
+
+	// registryPort is the loopback port the node-local OCI ingest registry serves
+	// on. 0 DISABLES it, and that is the shipped default: the registry stages and
+	// runs a pinned zot child, which is real disk and a real process, and a server
+	// that never ingests a locally built image should pay for neither.
+	registryPort int
 }
 
 // executorConfig renders the control-plane Config these flags describe. It is
@@ -185,6 +192,12 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// for these ports against a user LoadBalancer Service declaring them.
 	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port, bound on ALL interfaces (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
 	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port, bound on ALL interfaces (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
+	// The node-local OCI ingest registry (pkg/registrysvc). DISABLED by default —
+	// it is opt-in capacity, not part of a control plane. When enabled it binds
+	// LOOPBACK ONLY and that is not configurable: pull is anonymous and push is
+	// plain HTTP, so the whole posture rests on nothing off-host being able to
+	// reach it. `k3sm dev` enables it on a per-instance allocated port.
+	fs.IntVar(&opts.registryPort, "registry-port", 0, "node-local OCI ingest registry port on 127.0.0.1 — push locally built images here and pull them by `localhost:<port>/<ref>` (0 disables; "+strconv.Itoa(executor.DefaultRegistryPort)+" is the suggested port)")
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
@@ -218,6 +231,9 @@ func runServer(args []string) error {
 	}
 	if opts.ingressHTTPSPort < 0 || opts.ingressHTTPSPort > 65535 {
 		return fmt.Errorf("--ingress-https-port %d out of range 0-65535", opts.ingressHTTPSPort)
+	}
+	if opts.registryPort < 0 || opts.registryPort > 65535 {
+		return fmt.Errorf("--registry-port %d out of range 0-65535 (0 disables)", opts.registryPort)
 	}
 	if opts.workDir == "" {
 		if workDirErr != nil {
@@ -441,6 +457,30 @@ func runServer(args []string) error {
 		logger.Error("build embedded add-on reconciler", "err", err)
 	} else if err := ar.Converge(ctx); err != nil {
 		logger.Error("converge embedded add-on manifests", "err", err)
+	}
+
+	// 3d. The node-local OCI ingest registry (--registry-port; 0 disables, which
+	// is the default). It runs HERE, after the apiserver is healthy, because
+	// bringing it up also publishes the KEP-1755 local-registry-hosting ConfigMap
+	// — discovery needs a cluster to publish into.
+	//
+	// It is torn down BEFORE the control plane: this defer is registered AFTER
+	// exec.Stop's, so LIFO runs it first. That ordering is not cosmetic — the
+	// registry child holds a port and an open blob store, and a control plane that
+	// went away underneath it would leave both to the process reaper.
+	//
+	// NEVER FATAL: startIngestRegistry logs and returns a no-op teardown if the
+	// registry cannot come up. See its doc for why that is the right posture here
+	// and the wrong one at step 3b.
+	if opts.registryPort != 0 {
+		svc, err := registrysvc.New(registryConfig(opts, cfg.PayloadBinDir, logger))
+		if err != nil {
+			logger.Error("ingest registry disabled", "err", err)
+		} else {
+			stopRegistry := startIngestRegistry(ctx, svc, opts.registryPort,
+				cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace), logger)
+			defer stopRegistry()
+		}
 	}
 
 	// 4a. B224 — the MeshPeer CRD, on the MESH path only, BEFORE anything that can
