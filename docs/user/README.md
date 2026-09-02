@@ -7,7 +7,7 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 > These pages describe user-visible behavior. The authoritative product design lives in
 > [the design document](../DESIGN.md).
 
-## Read in order
+## Read in Order
 
 1. [Quickstart](quickstart.md) — one node, first Pod, in a few minutes.
 2. [Installation](install.md) — what `k3sm install` does, the one-time admin step, the `_k3sm` posture.
@@ -32,7 +32,7 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 17. [Troubleshooting](troubleshooting.md) — logs, common failures, recovery.
 18. [FAQ](faq.md) — short answers to the common questions.
 
-## Before you build anything real
+## Before You Build Anything Real
 
 k3sm is **not** a drop-in replacement for a Linux Kubernetes cluster. Workloads must be adapted, and
 several standard behaviors diverge by design. Read [Limitations](limitations.md) first — it cites the

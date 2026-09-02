@@ -7,7 +7,7 @@ the serving workload, its Services, and its weight cache.
 > **Requirements:** Apple Silicon (arm64), macOS 26+, a running k3sm cluster ([Quickstart](quickstart.md)),
 > and network access to fetch model weights the first time.
 
-## 1. Check the node offers a GPU
+## 1. Check the Node Offers a GPU
 
 k3sm advertises the Mac's GPU as the extended resource `mlx.k3sm.io/gpu`, alongside labels describing the
 chip. A node that does not advertise it cannot serve a model, and an `MLXModel` scheduled there stays
@@ -22,7 +22,7 @@ The count is `1` — a Mac has one integrated GPU — so **one model serves per 
 `MLXModel` on the same Mac stays Pending until the first is deleted, rather than contending for the
 same device.
 
-## 2. Apply a model
+## 2. Apply a Model
 
 [`examples/mlxmodel.yaml`](https://github.com/k3sm-io/k3sm/blob/main/examples/mlxmodel.yaml) serves a small pinned model and is the fastest
 way to see the path work end to end:
@@ -60,7 +60,7 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
 than the one asked for would look like success. Name the quantized repository in `model` instead —
 `mlx-community/Qwen3-0.6B-4bit` already does.
 
-## 3. Watch it become ready
+## 3. Watch It Become Ready
 
 The first start downloads the weights, which can take a while on a cold cache — unless `revision` is
 pinned, in which case they must already be in the volume (above). Read the **conditions**,
@@ -79,7 +79,7 @@ replica died), `ScaledToZero` (you set `replicas: 0`).
 There is deliberately no liveness probe on the serving pod: a first start is an unbounded download, and
 a probe that killed it would restart the download from zero.
 
-## 4. Call it
+## 4. Call It
 
 When the model is ready, `status.endpoint` carries the in-cluster address:
 
@@ -105,7 +105,7 @@ Any OpenAI-compatible client works — point its base URL at `http://$VIP:8000/v
 non-empty API key. Concurrent requests are batched by the server; the number it will batch is derived
 from `memory`.
 
-## 5. Delete it
+## 5. Delete It
 
 ```sh
 kubectl delete mlxmodel qwen3-06b
@@ -114,7 +114,7 @@ kubectl delete mlxmodel qwen3-06b
 That removes the serving workload, both Services, and the cache PVC. The underlying PersistentVolume is
 **retained** — the downloaded weights stay on disk until you remove them by hand ([Storage](storage.md)).
 
-## Things to know
+## Things to Know
 
 - MLX serving runs on the **default native runtime path**. Do not set `runtimeClassName: vm`: the
   serving process needs direct access to the Mac's GPU, and the [`vm` RuntimeClass](vm-runtimeclass.md) isolates a workload from exactly that.

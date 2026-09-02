@@ -2,7 +2,7 @@
 
 Moving a k3sm node or cluster to a new release.
 
-## Single node
+## Single Node
 
 Script (gen-1) installs — re-run the one-liner:
 
@@ -26,7 +26,7 @@ via `launchctl kickstart`, the script via the `sudo k3sm install` re-run. This i
 cut** with a brief daemon restart — the node is momentarily unavailable while the daemons
 restart.
 
-## Multi-node — roll node-by-node
+## Multi-Node — Roll Node-by-Node
 
 A cluster upgrades **one node at a time**, not all at once. Restarting each node's daemon via `launchctl
 kickstart` creates a short **binary-version-skew window** where old and new nodes coexist; k3sm releases
@@ -34,7 +34,7 @@ are designed so adjacent versions interoperate across that window. Upgrade agent
 control-plane Mac last unless a release note says otherwise. See [Multi-node](multi-node.md) and
 [HA](ha.md).
 
-## Before you upgrade
+## Before You Upgrade
 
 - **Back up the datastore.** `sudo k3sm snapshot save --out <somewhere off this node>` — it is safe to
   run while the cluster is serving, and it verifies the copy before it reports success. The file-level
@@ -48,7 +48,7 @@ control-plane Mac last unless a release note says otherwise. See [Multi-node](mu
 - **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
   [Versions](versions.md).
 
-## Upgrading across a datastore-engine change
+## Upgrading Across a Datastore-Engine Change
 
 Some releases move to a newer **kine** (the etcd-shim over SQLite). A newer kine re-runs its schema
 migrations against your existing `state.db`, which is **one-way** — the migrated database is not
@@ -69,7 +69,7 @@ You do not have to do anything for this, but you should know what it does:
 On the [HA](ha.md) Postgres posture none of this applies; the datastore is your Postgres, and its
 backup is `pg_dump`/PITR on your schedule.
 
-## Upgrading into the reserved-port policy
+## Upgrading Into the Reserved-Port Policy
 
 The release that moved LoadBalancer listeners to the wildcard also provisions a
 `ValidatingAdmissionPolicy` that **rejects** a `type: LoadBalancer` Service declaring a port k3sm's own
@@ -123,7 +123,7 @@ anything, and prints the verification step you must then run — see
 [Backup & restore](backup-restore.md). Rolling the binary back without restoring the backup leaves an
 older k3sm pointed at a database a newer engine has migrated.
 
-### Rolling back past the LoadBalancer bind change leaves durable state
+### Rolling Back Past the LoadBalancer Bind Change Leaves Durable State
 
 The release that moved LoadBalancer/Ingress listeners to the wildcard also changed **what k3sm writes
 into the cluster**, and the older binary has no code to clean either of those up. Reverting the binary

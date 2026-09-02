@@ -32,7 +32,7 @@ is about to do) creates the unprivileged `_k3sm` user, installs the LaunchDaemon
 admin kubeconfig to your home directory. After that, day-to-day use needs **no `sudo`**. See
 [Install](install.md) for the install-channel generations and the script's options.
 
-## 2. Confirm the cluster is up
+## 2. Confirm the Cluster Is Up
 
 **Do not run `k3sm server` yourself.** The install step registered the `io.k3sm.server` LaunchDaemon
 with `RunAtLoad` and `KeepAlive`, so the control plane and the node are **already running** and will
@@ -51,7 +51,7 @@ with no further setup. See [kubectl access](kubectl-access.md) for the details, 
 > Running a **foreground** cluster instead (no daemons, for a throwaway experiment)? Then skip step 1
 > entirely and run `k3sm server` in a terminal — never both.
 
-## 3. Run a native binary as a Pod
+## 3. Run a Native Binary as a Pod
 
 k3sm workloads are native Darwin executables, not OCI Linux images — see [Images](images.md).
 The `image: native` sentinel runs an absolute host binary as a confined pod. Every k3sm Pod must
@@ -88,7 +88,7 @@ Linux-assuming workloads off these nodes. `examples/hello-native.yaml` in the re
 For your own workload, build a darwin/arm64 binary with your normal toolchain and point
 `command[0]` at its absolute path (or set `image: /abs/path` with no command).
 
-## Before you go further
+## Before You Go Further
 
 k3sm is not a drop-in Linux Kubernetes. Read [Limitations](limitations.md) — especially the notes on
 DNS, `restartPolicy` per runtime path, and the resource model — before building anything you depend on.

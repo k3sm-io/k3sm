@@ -10,7 +10,7 @@ If you are here to find out what you can actually run and how to get there, star
 `k3sm build` and its accepted Dockerfile subset, `k3sm image load` / `import` / `push`, and every
 deliberate difference from the Docker tool of the same name.
 
-## Running a native workload today
+## Running a Native Workload Today
 
 Reference the binary directly in the Pod spec — there is no build step:
 
@@ -39,7 +39,7 @@ Build the binary with your normal toolchain (`go build`, `clang`, …) targeting
 get the full treatment regardless of packaging: Seatbelt confinement, probes, volume mounts,
 resource limits.
 
-## Why not Linux images
+## Why Not Linux Images
 
 A standard OCI image carries a **Linux** userland and expects a Linux kernel. The native path has
 neither, so a Linux image cannot run as a native Darwin process — one of the headline divergences
@@ -52,7 +52,7 @@ see [What runs](what-runs.md). `linux/arm64` payloads are the province of the
 [`vm` RuntimeClass](vm-runtimeclass.md) — see
 [Limitations](limitations.md).
 
-## Building an image: `k3sm build`
+## Building an Image: `k3sm build`
 
 `k3sm build` packages a native darwin/arm64 payload into an OCI image from a COPY-only Dockerfile.
 It executes nothing — it copies files and writes metadata.
@@ -81,7 +81,7 @@ that looks built but is not what the recipe described.
 > `image: myapp:v1` Pod spec resolves only after you load that artifact (below). The artifact is
 > equally usable with registries and other tools.
 
-### Deliberate differences from `docker build`
+### Deliberate Differences From `docker build`
 
 Each of these is a refusal or a documented gap, never a silent divergence:
 
@@ -100,7 +100,7 @@ Each of these is a refusal or a documented gap, never a silent divergence:
 | Special files | Devices, FIFOs and sockets in the context are **refused**, not skipped. Symlinks are preserved as symlinks, but one whose target would escape the image root is refused. |
 | `WORKDIR` | Sets the config's working directory but does **not** create it in the image. On `FROM scratch` there is no base filesystem to supply it, so add a `COPY` if the directory must exist. |
 
-## Loading an image into the store: `k3sm image load` / `k3sm image import`
+## Loading an Image Into the Store: `k3sm image load` / `k3sm image import`
 
 `k3sm image load` ingests a `docker save` tarball. `k3sm image import` ingests a **tarred** OCI
 image layout — what `docker buildx -o type=oci` writes, and what `k3sm build --format oci`
@@ -136,7 +136,7 @@ traffic; `Always` — which is what the apiserver defaults a `:latest` tag to �
 regardless of what this node already holds. Tag the images you load with something other than
 `latest`, or set the policy explicitly.
 
-### Deliberate differences from `docker load`
+### Deliberate Differences From `docker load`
 
 | | `k3sm image load` / `import` |
 |---|---|
@@ -148,7 +148,7 @@ regardless of what this node already holds. Tag the images you load with somethi
 | Requires a running daemon | Yes. The store is written by the node's runtime daemon over its local socket, so `load` works on an installed, running node and not on a bare directory. Its socket is readable only by the daemon's own account. |
 | Deadline | `--timeout` defaults to 30m for these two verbs (they stream a whole archive) and 2m for the metadata verbs. |
 
-## Pushing to a registry: `k3sm image push`
+## Pushing to a Registry: `k3sm image push`
 
 `k3sm image push` uploads the image in an OCI layout directory to a registry reference, so a node
 can pull it the ordinary way instead of being loaded one at a time.
@@ -165,7 +165,7 @@ never takes one on the command line, where it would land in shell history and pr
 That closes the loop — **build → push → pull → run** — with the node pulling exactly as it would
 from any registry: digests verified, `imagePullSecrets` honoured, multi-arch manifest lists read.
 
-## Still on the roadmap
+## Still on the Roadmap
 
 - **A full build engine** — `k3sm build` with `RUN` support, via a managed BuildKit builder inside
   a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed. It

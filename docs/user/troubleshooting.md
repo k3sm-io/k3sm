@@ -15,14 +15,14 @@ Not everything lands there. The server process's own structured logs (the LoadBa
 ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
 **`/var/log/k3sm/server.log`** — the unified-log predicate above shows none of them.
 
-## Control plane startup failure
+## Control Plane Startup Failure
 
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).
 - Check the datastore is present and not locked — the kine/SQLite DB lives under the server work
   directory (see [Backup & restore](backup-restore.md)).
 - Restart the daemon: `launchctl kickstart -k system/io.k3sm.server` (label per your role).
 
-## Stuck or crash-looping Pods
+## Stuck or Crash-Looping Pods
 
 On the **default runtime** (what every installed cluster runs), `restartPolicy` **is** honored: the
 container is restarted in place with an upstream-shaped `CrashLoopBackOff` backoff, and
@@ -42,7 +42,7 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
 See [Limitations](limitations.md#restartpolicy--honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
 
-## DNS from inside a Pod does not resolve cluster names
+## DNS From Inside a Pod Does Not Resolve Cluster Names
 
 On the default runtime this should work — Service A records, headless Services, StatefulSet per-Pod
 names, SRV and PTR all resolve. Check these in order:
@@ -60,12 +60,12 @@ names, SRV and PTR all resolve. Check these in order:
 See [Limitations](limitations.md#dns--what-resolves-and-on-which-runtime-path) for the full
 per-path picture.
 
-## UDP Service failures
+## UDP Service Failures
 
 Only cluster DNS on `:53` uses UDP today; general UDP Services (ClusterIP **and** NodePort) are deferred.
 See [Limitations](limitations.md).
 
-## LoadBalancer stuck `<pending>`
+## LoadBalancer Stuck `<pending>`
 
 **Do not look in the unified log for this one.** The LoadBalancer controller and the ingress host log
 through `slog` to **stderr**, which the launchd job routes to a file — the
@@ -118,19 +118,19 @@ sudo launchctl kickstart -k system/io.k3sm.server
 **A `<pending>` Service is not visible in `kubectl describe`** — k3sm has no `EventRecorder` for this
 path yet (the event pipeline is planned), so the log file is the only place the reason appears.
 
-## `kubectl top` returns no metrics
+## `kubectl top` Returns No Metrics
 
 k3sm ships no metrics-server and has no CPU accounting; install a metrics-server operator if you need the
 `metrics.k8s.io` verb. See [kubectl access](kubectl-access.md) and [Limitations](limitations.md).
 
-## Certificate nearing expiry
+## Certificate Nearing Expiry
 
 Component certificates are re-issued on every control-plane boot, so a restart renews them.
 `sudo k3sm certificate rotate` reports what a restart would re-issue (and both CA pins, which
 never change); `--restart` performs it. Rotation does **not** revoke anything and does not cover
 worker-node certs — see [Certificates](certificates.md) before you rely on it.
 
-## Rosetta-selecting Pods stuck Pending
+## Rosetta-Selecting Pods Stuck Pending
 
 The node advertises a capability label only when its start-time probe said yes.
 
@@ -155,7 +155,7 @@ The node advertises a capability label only when its start-time probe said yes.
    gap, not a broken node; see
    [`vm` RuntimeClass](vm-runtimeclass.md#rosetta-labels-advertised-only).
 
-## Multi-node join fails
+## Multi-Node Join Fails
 
 - Re-mint the token (`sudo k3sm token create`) — tokens expire.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See

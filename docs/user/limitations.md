@@ -4,7 +4,7 @@ k3sm runs Kubernetes Pods as **native Darwin processes** on Apple Silicon. That 
 zero-Linux, zero-VM developer experience, but it also means several standard Kubernetes behaviors
 **diverge by design** or are **not yet wired**. This page is the full inventory.
 
-## Where the full truth lives (cite, don't trust this page alone)
+## Where the Full Truth Lives (Cite, Don't Trust This Page Alone)
 
 The authoritative source of "what k3sm cannot conform to and why" is
 [**Conformance profile**](../conformance-profile.md) — the self-assessment mapping
@@ -16,7 +16,7 @@ That profile is the single source of truth; the summaries below restate the user
 so this page stands on its own, but they are deliberately **not** more optimistic than the profile.
 When in doubt, the profile wins.
 
-## Headline divergences
+## Headline Divergences
 
 - **Pods are native Darwin processes.** There are **no Linux containers, cgroups, CNI, or network
   namespaces**, and no device-plugins or hugepages. Anything that assumes those substrates does not
@@ -38,9 +38,9 @@ When in doubt, the profile wins.
   CNI, and netns; k3sm has none of them, and k3sm does not claim a
   Certified-Kubernetes badge. See [Conformance profile](../conformance-profile.md).
 
-## Gaps matrix
+## Gaps Matrix
 
-### No per-pod uid isolation
+### No Per-Pod uid Isolation
 
 All Pods on a node run as the **same unprivileged `_k3sm` OS user**, Seatbelt-confined. There is **no
 per-pod uid isolation**, so same-node Pods share a single OS trust domain. Untrusted or multi-tenant
@@ -54,7 +54,7 @@ Pods run as **uid 0**. They are still Seatbelt-confined, and no installed cluste
 (the LaunchDaemon runs as `_k3sm`), but `--datapath` is a disposable dev tier: do not run untrusted
 workloads on it. `k3sm dev up --datapath` says the same thing in its banner.
 
-### Volume mounts resolve for native workloads, not `/bin/sh`
+### Volume Mounts Resolve for Native Workloads, Not `/bin/sh`
 
 k3sm pods run at real host paths with **no chroot / mount namespace**, so a volume mounted at an
 absolute container path (e.g. `/etc/nats`) is materialized under the pod data volume and made to
@@ -72,7 +72,7 @@ absolute mount path sees the unmounted host path instead. This is why a ladder t
 absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a root-tier run: rootless stops
 at mount resolution by design, not by omission.
 
-### NetworkPolicy is a policy hint, not a security boundary
+### NetworkPolicy Is a Policy Hint, Not a Security Boundary
 
 NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with
 per-pod source fidelity for same-node clients. Any direct pod-IP connection — including **all
@@ -81,7 +81,7 @@ are never enforced**; and policies against `kube-dns` or the `kubernetes` VIP ar
 (those VIPs bypass the proxy). It is a policy hint, NOT a security boundary — isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
-### Which addresses your Services actually answer on
+### Which Addresses Your Services Actually Answer On
 
 Today at `main`, per port class:
 
@@ -194,20 +194,20 @@ All of this assumes the supported posture: a single operator's Mac with trusted 
 principal who can create a Service can claim a host port, and k3sm does not restrict which ports —
 that is an accepted risk of the ServiceLB model k3s also ships, not an oversight.
 
-### Per-pod IP is addressing and identity, not isolation
+### Per-Pod IP Is Addressing and Identity, Not Isolation
 
 A pod's per-pod IP is **addressing/identity only**: binds are port-scoped on shared interfaces, and
 Seatbelt cannot express per-IP network filters on macOS 26. A per-pod IP is therefore **never
 network isolation** — any same-node process can dial any pod IP. Untrusted workloads need the `vm`
 RuntimeClass, same as above.
 
-### Ingress TLS keys and Secrets at rest
+### Ingress TLS Keys and Secrets at Rest
 
 Ingress TLS private keys are held **in-memory by the server process**, and Secrets are
 **plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods). There is
 no KMS/envelope encryption: treat read access to the host disk as read access to every Secret.
 
-### Certificate rotation does not revoke
+### Certificate Rotation Does Not Revoke
 
 `k3sm certificate rotate` re-issues the control plane's CA-signed leaf certificates (by restarting
 the control plane, which re-issues them anyway) and proves the two CAs came through unchanged. It is
@@ -217,7 +217,7 @@ is no way to invalidate a single leaf, no CA-replacement flow, and worker/agent 
 scope (they re-issue on agent restart, which needs a fresh join token). See
 [Certificates](certificates.md).
 
-### DNS — what resolves, and on which runtime path
+### DNS — What Resolves, and on Which Runtime Path
 
 k3sm does **not** run CoreDNS. Each node serves an in-process, authoritative cluster resolver on the
 DNS VIP and forwards everything else to the host's upstream resolver. What a Pod actually gets
@@ -264,19 +264,19 @@ service name (`svc.ns.svc.cluster.local`) from inside a `vm` Pod rather than rel
 list to complete a short name. And a guest's link MTU is 1500 and the link will not lower it, so
 cross-node `vm` traffic is not claimed in this release.
 
-### `externalTrafficPolicy: Local` is not honored
+### `externalTrafficPolicy: Local` Is Not Honored
 
 The userspace Service proxy splices each connection, so the client's source address does not survive
 to the backend and the node cannot tell a local endpoint apart from a remote one. A Service that sets
 `externalTrafficPolicy: Local` is admitted with a warning and then behaves as `Cluster`.
 
-### UDP Services (non-DNS) — deferred
+### UDP Services (Non-DNS) — Deferred
 
 Only **cluster DNS on `:53`** uses UDP today (the DNS VIP binds 53 directly). General **UDP Services are
 unimplemented** — this covers **both ClusterIP UDP and NodePort UDP**, not just NodePort. If your
 workload depends on a UDP ClusterIP or NodePort Service, it will not work yet.
 
-### `restartPolicy` — honored on the default runtime, not on the `hostprocess` opt-out
+### `restartPolicy` — Honored on the Default Runtime, Not on the `hostprocess` Opt-Out
 
 k3sm has **two pod runtimes**, and this is the first place the difference is user-visible. The
 default is the **image runtime** (`k3sm server` / `k3sm node` with no `--runtime` flag), which every
@@ -303,7 +303,7 @@ does not proceed, and a controller replacing the Pod is what unsticks it.
 once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
 process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
-### `vm` RuntimeClass, multi-node, and HA status
+### `vm` RuntimeClass, Multi-Node, and HA Status
 
 - The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod
   end to end — create-to-Running restarts measure a 165 ms median on the reference hardware
@@ -320,7 +320,7 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
   de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md) and
   [HA](ha.md).
 
-### `vm` Pods: node selection and security-context admission
+### `vm` Pods: Node Selection and Security-Context Admission
 
 Two admission facts trip people up on the `vm` path specifically.
 
@@ -349,7 +349,7 @@ a foreign `runAsUser` or `fsGroup` is refused outright (a `422` at `kubectl appl
 downgraded. Until an exemption ships, either drop the field and accept the node's own identity inside
 the guest, or keep that workload on the native path where the same restriction already applies.
 
-### `vm` Pods: a container restart recreates the whole VM
+### `vm` Pods: A Container Restart Recreates the Whole VM
 
 There is no in-guest process supervisor on this path: a `vm` Pod's container **is** the guest, so
 `restartPolicy` acting on it means tearing the micro-VM down and creating a new one, not restarting a
@@ -359,7 +359,7 @@ start to init exec at a median of **50 ms**. Say it plainly for planning purpose
 **container restart is pod recreate**, and it is cheap enough that a `CrashLoopBackOff` cycle behaves
 the same way it would on the native path.
 
-### `vm` Pods: `linux/arm64` only
+### `vm` Pods: `linux/arm64` Only
 
 The `vm` path runs **`linux/arm64`** guest images. It does not run `linux/amd64` in this release —
 in-guest translation for that architecture is a planned follow-up, not something you can opt into
@@ -374,7 +374,7 @@ today. What you see depends on how the image is described:
 A multi-arch image that includes a `linux/arm64` variant is unaffected either way — it pulls and runs
 that variant normally.
 
-### `vm` Pods: storage — PVCs work; `fsGroup` and a foreign uid do not; `hostPath` is refused
+### `vm` Pods: Storage — PVCs Work; `fsGroup` and a Foreign uid Do Not; `hostPath` Is Refused
 
 PVC-backed storage works on the `vm` path and is host-visible: what the guest writes lands on the host
 filesystem, readable from Finder or `sudo`, same as native pod storage. Two ceilings go with that,
@@ -399,7 +399,7 @@ and one of them is now measured rather than assumed:
   exception is a planned follow-up; until it ships, a `vm` Pod that needs host access has no supported
   route to it — use a PVC instead.
 
-### `vm` Pods: filesystem performance and case-sensitivity, measured
+### `vm` Pods: Filesystem Performance and Case-Sensitivity, Measured
 
 Two things worth knowing before you plan storage-heavy workloads on this path, both measured on the
 tested rig and both a property of the shared-filesystem transport, not of PVC storage generally:
@@ -417,7 +417,7 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
   they are unpacked, but a workload's own runtime writes are not, so a workload that itself creates
   case-colliding filenames on this path will lose data silently.
 
-### `vm` Pods: networking — same-node Services, not direct pod IPs
+### `vm` Pods: Networking — Same-Node Services, Not Direct Pod IPs
 
 A `vm` Pod **consumes and serves** ClusterIP Services on its own node like any other pod — delivery
 from the guest to a Service VIP is native on this path, and the proxy routes a Service to a `vm`
@@ -443,7 +443,7 @@ Two further things worth knowing about the guest network:
   is **denied**, not silently allowed, at any destination a NetworkPolicy selects — and the resulting
   deny is logged plainly, naming what was denied and why.
 
-### `vm` Pods: isolation posture
+### `vm` Pods: Isolation Posture
 
 The process that constructs and drives a `vm` Pod's guest runs confined under the **same Seatbelt
 sandbox profile** as every other pod-hosting process on the node — that was measured working on the
@@ -463,7 +463,7 @@ The practical consequence: **do not rely on container-level volume separation in
 Pod as a trust boundary.** If two containers must not see each other's credentials, put them in
 separate Pods, where the boundary is the one this RuntimeClass actually enforces.
 
-### Node capability labels are probed once at daemon start
+### Node Capability Labels Are Probed Once at Daemon Start
 
 The `k3sm.io/*` node capability labels — `k3sm.io/virtualization`, `k3sm.io/rosetta`,
 `k3sm.io/rosetta-linux` — are stamped from probes that run **once, when the node daemon starts**, and
@@ -491,7 +491,7 @@ label **deletion** propagates through Virtual Kubelet's node reconcile to the da
 not yet verified in a lab. `k3sm.io/virtualization` has always had the same property. Treat the manual
 `kubectl label ... -` above as the reliable way to withdraw a capability claim.
 
-### Unprivileged `server` + PVCs need `--pod-root`
+### Unprivileged `server` + PVCs Need `--pod-root`
 
 An unprivileged `k3sm server` (no `sudo`) with no `--pod-root` override roots the runtime — image
 cache and pod dirs, including PV storage — under `$HOME`, because the default derives from the
@@ -501,7 +501,7 @@ PVC in that default posture is refused with `ErrProtectedPath`. The remedy is `-
 relocates the runtimed on-disk root off `/Users` — `--work-dir` alone only moves control-plane state
 (kine DB, certs, kubeconfig) and does not change the pods root.
 
-### Single-node datastore consistency
+### Single-Node Datastore Consistency
 
 k3sm embeds **kine** over **SQLite (WAL)**. On a single node the datastore serves a **consistent LIST**;
 under churn there is a **potential watch-staleness** posture that is **soak-pending** validation (the
@@ -509,7 +509,7 @@ dev-Mac churn soak). Until that soak is signed off, treat heavy-churn watch sema
 accepted-with-known-issue rather than guaranteed. See [Backup & restore](backup-restore.md) for the
 datastore operational model.
 
-## MLX / Apple-GPU workloads
+## MLX / Apple-GPU Workloads
 
 MLX and Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have
 their own page — see [MLX quickstart](mlx-quickstart.md). They are not covered by these general

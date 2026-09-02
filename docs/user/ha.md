@@ -6,7 +6,7 @@ Running the k3sm control plane so a single Mac is not a single point of failure.
 > its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as preview-quality until then.
 > See [Limitations](limitations.md).
 
-## HA model
+## HA Model
 
 A single-node k3sm embeds the control plane over **kine/SQLite**. HA extends this to multiple
 control-plane Macs so the apiserver remains reachable if one node is lost, with kine pointed at an
@@ -14,7 +14,7 @@ operator-managed **Postgres** instead of the local SQLite file. The controller-m
 elect a leader across the servers, and a joining server authenticates against the same cluster CA
 bundle. This builds on the [multi-node](multi-node.md) mesh.
 
-## What to plan for
+## What to Plan For
 
 - **Datastore** — the Postgres datastore is the state of record. Understand
   [Backup & restore](backup-restore.md) before running HA; a datastore restore is the recovery path if

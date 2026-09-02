@@ -6,13 +6,13 @@ Joining more than one Mac into a single k3sm cluster.
 > launch-blocking; its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as
 > preview-quality until then. See [Limitations](limitations.md).
 
-## Mesh model
+## Mesh Model
 
 One Mac runs the control plane (`k3sm server`); additional Macs join as **agents** running the Virtual
 Kubelet node. Nodes are connected by a **wireguard mesh** (the `MeshPeer` model), so Pods and Services
 can be reached across machines.
 
-## Joining an agent
+## Joining an Agent
 
 On the server, mint a join token:
 
@@ -35,7 +35,7 @@ The agent authenticates with the bootstrap token, receives its node credentials,
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
 the node — the `MeshPeer` records carry public keys only.
 
-## What crosses nodes
+## What Crosses Nodes
 
 - **Services** resolve cluster-wide via the userspace Service proxy.
 - **Mesh traffic** between Pods on different nodes rides the wireguard tunnel with per-peer symmetric

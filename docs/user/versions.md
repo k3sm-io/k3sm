@@ -3,7 +3,7 @@
 Which Kubernetes version k3sm tracks, and how to read the **live** pin so this page cannot silently
 drift.
 
-## Read the live pin — don't trust a literal
+## Read the Live Pin — Don't Trust a Literal
 
 The authoritative version is what the binary reports and what the conformance register records; a
 number written into prose can go stale. Always read the live values:
@@ -17,7 +17,7 @@ The **machine-authoritative** Kubernetes pin is the shipped control-plane pin
 triaged its conformance notes against. When a pin bump lands, that tooling
 updates the register; treat it — and `k3sm version` — as the source of truth over this page.
 
-## Current skew (point-in-time)
+## Current Skew (Point-in-Time)
 
 At the time of writing:
 

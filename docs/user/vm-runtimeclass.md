@@ -19,7 +19,7 @@ Virtualization.framework. See the status note below for what it supports today.
 > and is held for a later release); its live lab run is green against the release
 > artifact. This path is single-node.
 
-## When to use it
+## When to Use It
 
 Use `vm` when a workload must not share the `_k3sm` trust domain with its neighbors — untrusted code,
 tenant isolation, or anything you would isolate with a strong boundary on Linux. See
@@ -28,7 +28,7 @@ is the same framing as [Concepts](concepts.md): the default native path is **not
 boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
 [the privilege model](../privilege-model.md).
 
-## Using it
+## Using It
 
 ```yaml
 apiVersion: v1
@@ -63,7 +63,7 @@ no image manifest matches a runnable platform: want [linux/arm64/v8], image prov
 Pods without `runtimeClassName: vm` use the default native-process runtime and therefore share the
 `_k3sm` trust domain with other default Pods on the same node.
 
-## Trade-offs
+## Trade-Offs
 
 - **Isolation** — a genuine boundary, at the cost of VM startup and overhead versus a native process.
 - **Fidelity** — behavior is measured against the reference hardware; see
@@ -72,7 +72,7 @@ Pods without `runtimeClassName: vm` use the default native-process runtime and t
   to `vm` or refuse-to-run, never to an unconfined process (see
   [the privilege model](../privilege-model.md)).
 
-## Node capability labels
+## Node Capability Labels
 
 A k3sm node advertises what the **host machine is capable of** as `k3sm.io/*` **node labels**, each
 stamped from a probe of the real host at node start. The label is **present with value `"true"` or
@@ -102,7 +102,7 @@ Two properties are worth internalizing before you build selectors on these:
   capability, advertised only through the `k3sm.io/*` keys; nothing in the cluster is told the node
   *is* amd64 or *is* Linux.
 
-### Rosetta labels, advertised only
+### Rosetta Labels, Advertised Only
 
 The `k3sm.io/rosetta` and `k3sm.io/rosetta-linux` labels are a
 **truthful claim about the host** — the probe really did find Rosetta — and they really do make the node
@@ -125,7 +125,7 @@ So today these labels answer "**could** this host translate?", not "will k3sm ru
 here?". Until the paths above land, ship `arm64` (or multi-arch) images. If you have already selected a
 Rosetta label and see `ImagePullBackOff` with a platform error, that is this gap — not a broken node.
 
-### Translated execution shares the node's trust domain
+### Translated Execution Shares the Node's Trust Domain
 
 One property to know before you plan on translation. Rosetta does not run entirely inside a Pod's
 sandbox: translation is served by Apple's `oahd` helper, a **system daemon outside the Pod's Seatbelt
@@ -136,7 +136,7 @@ either the helper or the cache. So a translated Pod stays in the **same-node sha
 every other default Pod — translation adds no isolation, and for untrusted workloads the answer remains
 the `vm` RuntimeClass above.
 
-### Selecting a Rosetta-capable node (keep the `os` key)
+### Selecting a Rosetta-Capable Node (Keep the `os` Key)
 
 Because these are plain capability labels with no RuntimeClass behind them, your Pod selects them
 itself — and it must **keep `kubernetes.io/os: darwin`** alongside. This is the selector shape to write
@@ -174,7 +174,7 @@ Three things about that manifest:
 For a workload you want to run **today**, drop both the capability key and the RuntimeClass and ship an
 `arm64` (or multi-arch) image — the plain native path with `kubernetes.io/os: darwin` in the selector.
 
-### Installing Rosetta after the node is up — restart required
+### Installing Rosetta After the Node Is Up — Restart Required
 
 Capability probes run **once, at daemon start**. If you install Rosetta 2 (or grant virtualization
 capability) on a Mac that is already serving as a k3sm node, the node keeps reporting the **old** answer
