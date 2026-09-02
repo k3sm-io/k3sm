@@ -35,6 +35,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 
+	runtimev1 "k3sm.io/apis/runtime/v1"
+
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
@@ -67,15 +69,34 @@ var (
 // that upload, and forgotten: k3sm writes no credential file and adds nothing to
 // the operator's docker config. See registryAuth for why argv is excluded.
 //
-// This is the one `k3sm image` subcommand that is not a client of runtimed. It
-// reads a path the invoking user owns and talks to a registry as that user; the
-// node's image store is not involved, so no daemon has to be running.
-func imagePush(ctx context.Context, o imageOptions, out io.Writer) error {
+// THE UPLOAD IS NOT A DAEMON CLIENT. It reads a path the invoking user owns and
+// talks to a registry as that user, so no daemon has to be running for the
+// primary form. The store-ref form is the one exception, and it is contained:
+// the daemon is asked only for the BYTES, through the same verified SaveImage
+// export `k3sm image save` uses, and everything after that is the identical
+// layout upload.
+func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDialer) error {
 	ref, err := name.ParseReference(o.target)
 	if err != nil {
 		return fmt.Errorf("target reference %q: %w", o.target, err)
 	}
-	img, err := layoutImage(o.layoutDir)
+	layoutDir := o.layoutDir
+	if pushSourceIsStoreRef(o.layoutDir) {
+		cc, closer, derr := dial(ctx, o.socket)
+		if derr != nil {
+			return derr
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		staged, cleanup, serr := stageStoreImage(ctx, runtimev1.NewImagesClient(cc), o)
+		if serr != nil {
+			return serr
+		}
+		defer cleanup()
+		layoutDir = staged
+	}
+	img, err := layoutImage(layoutDir)
 	if err != nil {
 		return err
 	}
@@ -84,7 +105,7 @@ func imagePush(ctx context.Context, o imageOptions, out io.Writer) error {
 	// — a registry that answered with a different digest would not change it.
 	digest, err := img.Digest()
 	if err != nil {
-		return fmt.Errorf("compute digest of the image in %s: %w", o.layoutDir, err)
+		return fmt.Errorf("compute digest of the image in %s: %w", layoutDir, err)
 	}
 	auth, err := registryAuth(ref, o.workDir)
 	if err != nil {
