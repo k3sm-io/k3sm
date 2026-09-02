@@ -63,6 +63,94 @@ no image manifest matches a runnable platform: want [linux/arm64/v8], image prov
 Pods without `runtimeClassName: vm` use the default native-process runtime and therefore share the
 `_k3sm` trust domain with other default Pods on the same node.
 
+## Interactive Sessions
+
+A `vm` Pod answers the interactive `kubectl` verbs, and the guest gives every container a real
+terminal to run them on.
+
+### `kubectl exec -it`
+
+```sh
+kubectl exec -it untrusted-job -- /bin/sh
+```
+
+The guest allocates a pseudo-terminal for the session, so the command really is on a terminal:
+`test -t 0` is true, shell job control and line editing work, `stty size` reports a real window, and
+resizing your own terminal delivers `SIGWINCH` to the process. `tty` names a device that exists
+**inside the container**, because the terminal is allocated from the container's own `devpts`
+instance rather than the guest's — so `ps`, `w`, and any program that reopens its controlling
+terminal agree with each other instead of naming something that is not there.
+
+Exec **without** a terminal is unchanged: the command runs on pipes, `stdout` and `stderr` stay
+separate, and the exit code propagates.
+
+### `kubectl attach`
+
+`kubectl attach` connects to the process the container is **already** running instead of starting a
+new one. Declare on the container what stdio it should keep:
+
+```yaml
+spec:
+  runtimeClassName: vm
+  containers:
+    - name: app
+      image: myapp
+      tty: true      # give the container a terminal as its stdio
+      stdin: true    # retain a writable stdin
+```
+
+A container with `tty: true` is started on its own pseudo-terminal — sized 24x80 until a client
+resizes it, held as all three descriptors, and made the session's controlling terminal. That is the
+shape `docker run -t` gives you, and it has one visible consequence: the terminal's line discipline
+merges `stdout` and `stderr` before either leaves the container, so `kubectl logs` shows **one merged
+stream** for a `tty` container, exactly as it already does for a `tty` exec.
+
+A container with `stdin: true` and no terminal keeps a writable pipe instead. A container that
+declares neither is started exactly as before.
+
+Then:
+
+```sh
+kubectl attach -it untrusted-job
+```
+
+- **Detaching is not killing.** Closing the client unsubscribes it and does nothing else — the
+  process is never signalled, its stdin is never closed, and its terminal is never hung up.
+- **Reattaching resumes.** A new attach replays the recent output the guest still holds, then
+  follows live.
+- **Concurrent attaches are allowed.** Each client gets its own copy of the output; their keystrokes
+  interleave in arrival order, which is left to the people at the keyboards to coordinate.
+- **Asking for stdin on a container that kept none fails loudly** — a `FailedPrecondition` naming the
+  fix (`stdin: true`), never a silent discard of what you typed.
+
+The two ceilings on this path — `stdinOnce`, and what a replayed screen can look like — are on
+[Limitations](limitations.md). So is what the default native runtime does instead.
+
+### Every Container Gets a Minimal `/dev`
+
+A container's root filesystem comes out of an OCI image, whose `/dev` is empty by construction, and
+the container is cut off from the guest's own device tree. A container with nothing there is not
+merely austere: `echo x > /dev/null` writes an ordinary file that grows forever, `/dev/urandom` is
+missing under every language runtime that seeds from it, and no terminal could exist at all. So each
+container is given:
+
+| Path | What it is |
+|---|---|
+| `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty` | the OCI runtime-spec default character devices |
+| `/dev/pts`, `/dev/ptmx` | the container's **own** `devpts` instance, and a relative symlink into it |
+| `/dev/shm` | a private `tmpfs` bounded at **64 MiB** — the size other runtimes give a container that did not ask for one |
+
+Two properties are deliberate rather than incidental:
+
+- **That table is the whole of it.** The guest's own `/dev` is never re-exposed wholesale, and
+  nothing outside the list appears. Enumerating what a container gets — rather than filtering what it
+  does not — is what keeps the node that reaches the Pod's guest agent out of every container's
+  reach, since that agent can start processes in, and read the logs of, every container in the Pod.
+- **Your Pod wins.** Anything the default `/dev` would place where one of your volumes mounts is
+  omitted rather than stacked underneath. A `Memory` `emptyDir` at `/dev/shm` therefore *replaces*
+  the bounded default outright — that is how you ask for a bigger one. A Pod that mounts over `/dev`
+  itself gets its mount and no private `devpts`.
+
 ## Trade-Offs
 
 - **Isolation** — a genuine boundary, at the cost of VM startup and overhead versus a native process.
