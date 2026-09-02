@@ -8,7 +8,7 @@
 > by the entire child working set, so Res. 18's contingency is **required**
 > unless M8.4 pins the S5 winner single-process.
 
-Run: 2026-08-29 on the S1 rig (M1 Ultra, 64 GiB, macOS 26.5.2 / 25F84).
+Run: 2026-08-29 on the S1 rig (Apple M1-family, 64 GiB, macOS 26.5.2).
 Re-run with `hack/spike/m8/s3.sh`. Model: `mlx-community/Llama-3.2-3B-Instruct-4bit`
 (1.7 GB, under the 2 GB cap). Sampler: `s3mem`, whose cgo call is
 `proc_pid_rusage(pid, RUSAGE_INFO_V2).ri_phys_footprint` — the *same* call

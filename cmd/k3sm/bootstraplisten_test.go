@@ -48,7 +48,7 @@ func TestBootstrapListenAddrIsWildcardOnTheMeshPath(t *testing.T) {
 	}{
 		{"a real mesh IP listens on every interface", "100.64.0.1", "0.0.0.0:9345"},
 		{"a loopback mesh IP still listens on every interface", "127.0.0.1", "0.0.0.0:9345"},
-		{"a single-host mesh IP still listens on every interface", "192.168.0.111", "0.0.0.0:9345"},
+		{"a single-host mesh IP still listens on every interface", "203.0.113.111", "0.0.0.0:9345"},
 		{"no mesh derives loopback, never the wildcard", "", "127.0.0.1:9345"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

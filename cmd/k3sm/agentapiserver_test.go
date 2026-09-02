@@ -25,12 +25,14 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 )
 
-// The live-lab addresses this file pins: the control plane's mesh IP (the ONLY
-// address its apiserver binds under `--mesh-ip`) and the underlay LAN address the
-// worker joined over. The defect was that the worker targeted the latter.
+// The two address ROLES this file pins: the control plane's mesh IP (the ONLY
+// address its apiserver binds under `--mesh-ip`) and the underlay address the worker
+// joined over. The defect was that the worker targeted the latter. The underlay
+// literal is RFC 5737 TEST-NET-3 documentation space — the property under test is
+// "not the mesh IP", which no real address is needed to express.
 const (
 	labServerMeshIP   = "100.64.0.1"
-	labServerUnderlay = "192.168.0.50"
+	labServerUnderlay = "203.0.113.50"
 )
 
 // TestWorkerAPIServerURLTargetsTheServerMesh pins the worker-side apiserver

@@ -18,8 +18,8 @@
 
 | | |
 |---|---|
-| host | MikoStudio (the lab Mac, over the harness's ssh path) |
-| macOS | 26.6.2 · `hw.model` Mac13,2 · arm64 |
+| host | the lab Mac, over the harness's ssh path |
+| macOS | 26.6.2 · arm64 |
 | date (UTC) | 2026-08-31 |
 | host kernel for the guest | the S1 throwaway uncompressed arm64 `Image` (Ubuntu `6.8.0-138-generic`) |
 | guest rootfs | `alpine-minirootfs-3.24.1-aarch64.tar.gz` |

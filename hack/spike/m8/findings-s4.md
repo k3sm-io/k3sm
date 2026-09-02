@@ -22,8 +22,8 @@ skip the source push + `go build`).
 
 ## Rig & method
 
-Same rig as S1–S3 (**Apple M1 Ultra**, 20-core, 64 GiB unified, macOS **26.5.2**
-build **25F84**). Every write confined to the spike prefix; **no sudo, no root**,
+Same rig as S1–S3 (**Apple M1-family**, 64 GiB unified, macOS **26.5.2**).
+Every write confined to the spike prefix; **no sudo, no root**,
 no host-config mutation.
 
 The `k3sm` binary under test is built **on the lab** (`CGO_ENABLED=1
