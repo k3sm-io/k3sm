@@ -721,6 +721,27 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		}
 	}
 
+	// Serve runtimed's gRPC control socket off the SAME in-process runtime this
+	// node drives, so `k3sm image ls|df|prune|load|import` — clients of runtimed's
+	// Images service — work on a stock install, where no standalone k3sm-runtimed
+	// daemon exists and nothing was serving that socket.
+	//
+	// AFTER the reconcile above, and that ordering is load-bearing in one
+	// direction only: runtime.Server.Serve re-enters the same reconcile through
+	// Runtime.reconcileNetworkStartup, and the adapter's own exactly-once makes
+	// that second call replay this call's verdict instead of running a second full
+	// stale-alias sweep over a node whose pods are by then live. See
+	// PodNetAdapter.ReconcileStartup for why a second pass would be destructive.
+	// Serve's other two startup legs are already once-guarded upstream: the pod
+	// reap ran inside NewRuntimed (runtimed's sticky once), and the image GC is
+	// started by Serve because nothing else on this path ever starts it.
+	//
+	// Never fatal, and torn down before this function returns — the deferred stop
+	// closes the listener (unlinking the socket) ahead of the event broadcaster's
+	// shutdown deferred above it.
+	stopControlSocket := startRuntimedControlSocket(ctx, prov, opts.podRoot, slog.Default())
+	defer stopControlSocket()
+
 	// The kubelet HTTP API's TLS + auth posture. Both halves are built together and
 	// handed to the adapter together, because serving the provider routes
 	// (logs/exec/attach/port-forward) without either one is the B176 defect; the
