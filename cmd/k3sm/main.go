@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "image", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "builder", "image", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node (M3)
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -40,6 +40,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       package a native darwin/arm64 image from a COPY-only Dockerfile (RUN is rejected)
+  builder     manage the in-cluster buildkitd engine for RUN-capable builds (builder up|down|status)
   image       ingest, publish and reclaim this node's images (image load|import|push|prune|ls|df)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
@@ -134,6 +135,11 @@ func main() {
 	case "build":
 		if err := runBuild(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm build:", err)
+			os.Exit(1)
+		}
+	case "builder":
+		if err := runBuilder(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm builder:", err)
 			os.Exit(1)
 		}
 	case "image":
