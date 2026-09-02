@@ -55,6 +55,21 @@ else
 	ladder no "builder.0b the embedded entrypoint parses (bash -n)"
 fi
 
+# ---- builder.0c — the entrypoint mounts a WORKING cgroup2 unconditionally ---
+# The per-container cgroup2 the guest hands us can be an empty, non-functional
+# hierarchy; runc then fails every RUN step with "no cgroup mount found in
+# mountinfo". The fix stacks a fresh cgroup2 UNCONDITIONALLY (no is_mounted
+# guard) and asserts cgroup.controllers appears. This structural check pins that
+# posture so a "skip if already mounted" regression cannot land silently.
+EP="$K3SM_ROOT/pkg/builder/assets/entrypoint.sh"
+b0c=ok
+grep -qE 'mount -t cgroup2 none /sys/fs/cgroup' "$EP" || b0c=no
+# The cgroup2 mount must NOT sit behind an `is_mounted /sys/fs/cgroup` guard.
+grep -qE 'is_mounted[[:space:]]+/sys/fs/cgroup' "$EP" && b0c=no
+# And it must verify controllers rather than trust the mount.
+grep -qE '/sys/fs/cgroup/cgroup\.controllers' "$EP" || b0c=no
+ladder "$b0c" "builder.0c the entrypoint stacks cgroup2 unconditionally and verifies cgroup.controllers"
+
 # ---- Go leg runner (GOARCH=arm64 CGO_ENABLED=1) ----------------------------
 GOFLAGS_ENV=(env GOARCH=arm64 CGO_ENABLED=1)
 
