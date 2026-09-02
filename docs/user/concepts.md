@@ -3,7 +3,7 @@
 How k3sm maps Kubernetes onto macOS. The full design is in [the design document](../DESIGN.md); this is the
 user-facing mental model.
 
-## Pods are native Darwin processes
+## Pods Are Native Darwin Processes
 
 On the default path, k3sm has **no Linux, no containers, no cgroups, no CNI, no network
 namespaces**. A Pod's containers are launched as native macOS processes (`posix_spawn`),
@@ -12,19 +12,19 @@ Kubernetes distribution and the reason several behaviors diverge — see
 [Limitations](limitations.md). The `vm` RuntimeClass opts a Pod into a real Linux
 guest instead — see [`vm` RuntimeClass](vm-runtimeclass.md).
 
-## Control plane
+## Control Plane
 
 k3sm embeds a **real upstream kube-apiserver, controller-manager, and scheduler**, supervised in one
 process, backed by **kine over SQLite** (WAL). The API surface is genuine Kubernetes: RBAC, admission,
 CRDs, workload controllers, and the scheduler all work. What differs is the **node** underneath.
 
-## Node — a Virtual Kubelet
+## Node — A Virtual Kubelet
 
 The node is a **Virtual Kubelet** Darwin provider. It reconstructs the kubelet surface (Pod phases,
 conditions, probes, graceful stop, the `/stats/summary` observability surface) on top of native
 processes rather than a container runtime.
 
-## Trust domain — one `_k3sm` user
+## Trust Domain — One `_k3sm` User
 
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
 same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads the **`vm`

@@ -2,7 +2,7 @@
 
 Talking to a k3sm cluster with `kubectl`.
 
-## Bundled path
+## Bundled Path
 
 k3sm ships a `kubectl` passthrough that uses the admin kubeconfig written by `sudo k3sm install`:
 
@@ -13,7 +13,7 @@ k3sm kubectl get pods -A
 
 This is the simplest path and needs no extra setup after install.
 
-## Using a standalone kubectl
+## Using a Standalone kubectl
 
 `sudo k3sm install` **merges** an admin cluster/user/context into the invoking user's
 `~/.kube/config`, preserving whatever was already there. So after install your own `kubectl` reaches
@@ -40,12 +40,12 @@ Because the control plane is a **real upstream kube-apiserver**, standard client
 machinery work normally. The divergences are on the **node** side (how Pods run), not the API surface —
 see [Concepts](concepts.md).
 
-## Auth model
+## Auth Model
 
 Access is authenticated via the kubeconfig credentials generated at install time and scoped by RBAC.
 The bootstrap/join credentials for adding nodes are separate — see [Multi-node](multi-node.md).
 
-## Things that behave differently through kubectl
+## Things That Behave Differently Through kubectl
 
 - **`kubectl top`** needs an **operator-installed metrics-server**; k3sm does not ship one and has no CPU
   accounting, so `top` and HPA-on-CPU do not work out of the box — see [Limitations](limitations.md).

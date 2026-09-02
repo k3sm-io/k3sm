@@ -15,7 +15,7 @@ and the **client** is the native macOS `temporal` binary from Homebrew, talking 
 > [vm-runtimeclass.md](vm-runtimeclass.md) and [limitations.md](limitations.md) for what it supports
 > today.
 
-## What it stands up
+## What It Stands Up
 
 | Object | What it is |
 |---|---|
@@ -33,7 +33,7 @@ shape — server, datastore and UI as separate images — must therefore be sepa
 server collapses the service into a single image, which is why the one-Pod form is both the simplest
 and the honest one.
 
-## 1. Check the node can run a micro-VM
+## 1. Check the Node Can Run a Micro-VM
 
 ```sh
 kubectl get nodes -L k3sm.io/virtualization
@@ -43,7 +43,7 @@ A node without that label cannot run a `vm` Pod, and the Pod stays Pending. If t
 the label is missing, the capability was probed at daemon start — see
 [vm-runtimeclass.md](vm-runtimeclass.md).
 
-## 2. Apply the server
+## 2. Apply the Server
 
 ```sh
 kubectl apply -f examples/temporal/temporal-dev-server.yaml
@@ -58,7 +58,7 @@ the server come up with:
 kubectl logs -f temporal
 ```
 
-## 3. Drive it from inside the cluster
+## 3. Drive It From Inside the Cluster
 
 The image ships the `temporal` CLI as its entrypoint, so the fastest check needs no networking at all:
 
@@ -70,7 +70,7 @@ kubectl exec -it temporal -- temporal operator namespace list
 `kubectl exec` reaches into the guest directly. Use it whenever you want to separate "is the server
 healthy?" from "can I reach the server?".
 
-## 4. Connect the macOS-native `temporal` CLI
+## 4. Connect the macOS-Native `temporal` CLI
 
 Install the CLI as a native arm64 binary and point it at the node port:
 
@@ -120,7 +120,7 @@ open http://127.0.0.1:30808
 That Pod is a second Linux guest consuming the first one through cluster DNS and a Service, which is
 the interesting part of applying it.
 
-## 6. Run a workflow
+## 6. Run a Workflow
 
 A workflow needs a **worker** — your own code, using a Temporal SDK. Run it as a native macOS process
 against the same address the CLI uses:
@@ -143,7 +143,7 @@ temporal workflow describe --workflow-id demo-1
 Nothing about the worker is k3sm-specific: it is a normal macOS process talking to a normal Temporal
 frontend that happens to be a Linux Pod on the same machine.
 
-## 7. Tear it down
+## 7. Tear It Down
 
 ```sh
 kubectl delete -f examples/temporal/temporal-web-ui.yaml --ignore-not-found
@@ -153,7 +153,7 @@ kubectl delete -f examples/temporal/temporal-dev-server.yaml
 Deleting the Pod destroys its guest, and with it the workflow history — the example keeps state in
 memory. Nothing is left on disk beyond the cached image.
 
-## Things to know
+## Things to Know
 
 - **This is a development server.** `temporal server start-dev` relaxes checks that a production
   Temporal deployment enforces, and it is a single instance with no replication. It is the right shape

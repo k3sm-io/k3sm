@@ -10,7 +10,7 @@ slowly", not "runs with a flag" — a `linux/amd64` or `linux/arm64` image is re
 to pull it. That is the trade this project makes on purpose, and this page is here so you can tell
 in a minute whether it is a trade you want.
 
-## Default path
+## Default Path
 
 **An OCI image with a Mac binary inside.** This is the normal path:
 
@@ -36,7 +36,7 @@ Darwin process under a Seatbelt profile.
 
 See [Images](images.md) for both conventions in full.
 
-## What does not run, and why
+## What Does Not Run, and Why
 
 A stock image from Docker Hub — `nginx`, `postgres`, `redis` — carries a Linux userland and expects
 a Linux kernel. A k3sm Pod is a Darwin process; there is no Linux kernel under it. So the image is
@@ -51,7 +51,7 @@ act on it.
 micro-VM per Pod, validated on real hardware — read that page and
 [Limitations](limitations.md) for what it supports.
 
-## From a Dockerfile to a running Pod
+## From a Dockerfile to a Running Pod
 
 The whole loop, with nothing left out. Build a `darwin/arm64` binary first — `go build`, `clang`,
 whatever you normally use — then:
@@ -85,7 +85,7 @@ kubectl logs myapp
 `darwin/arm64` and refused if it declares any other platform. The full subset, and every deliberate
 difference from `docker build`, is in [Images](images.md).
 
-## What carries over from Docker and Kubernetes
+## What Carries Over From Docker and Kubernetes
 
 Almost all of it:
 
@@ -103,7 +103,7 @@ One footgun worth stating twice, because it is the one people hit: the apiserver
 `:latest` tag to `imagePullPolicy: Always`, so a `:latest` image you loaded locally will still be
 fetched from a registry. Tag with something else, or set the policy explicitly.
 
-## Where darwin images come from
+## Where darwin Images Come From
 
 There is no supply of them. You build them.
 

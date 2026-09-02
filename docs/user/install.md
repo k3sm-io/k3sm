@@ -2,7 +2,7 @@
 
 How k3sm installs, and why it needs admin rights exactly **once**.
 
-## One-time admin step
+## One-Time Admin Step
 
 k3sm is designed to run **without per-command `sudo`**. A single privileged install sets up an
 unprivileged posture that everything else runs under:
@@ -23,7 +23,7 @@ trust model — why this is the Docker Desktop / lima / colima pattern applied t
 residual limitation (no per-pod uid isolation) — is documented in
 [the privilege model](../privilege-model.md).
 
-## What gets installed where
+## What Gets Installed Where
 
 - The `k3sm` binary, whichever channel delivered it (with Homebrew, the previous version is
   retained so rollback does not require a rebuild; with the script, pin `K3SM_INSTALL_VERSION`
@@ -31,7 +31,7 @@ residual limitation (no per-pod uid isolation) — is documented in
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
 
-## Install channels — the three generations
+## Install Channels — The Three Generations
 
 k3sm's distribution ships in three explicit generations, in shipping order:
 
