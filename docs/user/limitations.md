@@ -13,7 +13,7 @@ backed by a maintainer-facing full-surface conformance register (one row per sta
 feature × verdict, with a canonical §By-design non-conformance summary) kept internal to the project.
 
 That profile is the single source of truth; the summaries below restate the user-visible consequences
-so this page stands on its own, but they are deliberately **not** more optimistic than the profile.
+so this page stands on its own, but they are **not** more optimistic than the profile.
 When in doubt, the profile wins.
 
 ## Headline Divergences
@@ -81,7 +81,7 @@ are never enforced**; and policies against `kube-dns` or the `kubernetes` VIP ar
 (those VIPs bypass the proxy). It is a policy hint, NOT a security boundary — isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
-### Which Addresses Your Services Actually Answer On
+### Which Addresses Your Services Answer On
 
 Today at `main`, per port class:
 
@@ -113,7 +113,7 @@ Today at `main`, per port class:
   collides with a LoadBalancer or NodePort wildcard listener on the same port. This heals the
   previous `EADDRINUSE` collision, where a second `:8080` Pod would crash-loop. It is a **correctness
   convenience, not a security boundary** — the rewrite only redirects a Pod's *own* wildcard bind. The
-  scope is deliberately narrow, with named residuals:
+  scope is narrow, with named residuals:
 
   - **Ports below 1024 still share one wildcard port space.** On macOS a wildcard bind needs no
     privilege at any port, but a *specific-address* bind below 1024 returns `EACCES` for a non-root
@@ -160,7 +160,7 @@ Today at `main`, per port class:
   ports are **not** arbitrated: two Services on `8080` are first-come, and the loser stays `<pending>`.
 
 - **A LoadBalancer Service on 80 or 443 can race the ingress host.** Those are legitimate LoadBalancer
-  ports, so they are deliberately **not** reserved. The ingress listeners are started *before* the
+  ports, so they are **not** reserved. The ingress listeners are started *before* the
   LoadBalancer controller, so the ingress host wins in practice — but that is start ordering, not a
   guarantee. If a Service claims 80/443 and wins, the ingress host burns its bounded bind retry
   (~155 s) and then logs `ingress bind retries exhausted`, leaving Ingress disabled until the daemon
@@ -178,7 +178,7 @@ Like NetworkPolicy below, it is a hint rather than tenant isolation — every po
 is unset (the API's "default implementation" case) and ignores a Service that names another class
 entirely — it neither binds its ports nor writes its status. k3sm publishes no class of its own, so
 there is no value to opt into. `spec.allocateLoadBalancerNodePorts` needs nothing from k3sm: the
-apiserver owns allocation, and k3sm's listeners key off whether a nodePort was actually assigned.
+apiserver owns allocation, and k3sm's listeners key off whether a nodePort was assigned.
 Note that setting it to `false` does not deallocate an already-assigned nodePort — that is upstream
 behaviour, not a k3sm limitation. A Service's nodePort stays reachable regardless of its class, which
 is also upstream behaviour.
@@ -220,7 +220,7 @@ scope (they re-issue on agent restart, which needs a fresh join token). See
 ### DNS — What Resolves, and on Which Runtime Path
 
 k3sm does **not** run CoreDNS. Each node serves an in-process, authoritative cluster resolver on the
-DNS VIP and forwards everything else to the host's upstream resolver. What a Pod actually gets
+DNS VIP and forwards everything else to the host's upstream resolver. What a Pod gets
 depends on the runtime path it runs on (see the `restartPolicy` section above for the two paths).
 
 **What the resolver answers (all paths — this is the server side):**
@@ -233,7 +233,7 @@ depends on the runtime path it runs on (see the `restartPolicy` section above fo
 - **PTR** — the reverse zone for the cluster pod and Service CIDRs is authoritative: a name inside
   either answers locally (a hit or `NXDOMAIN`) and is never forwarded upstream.
 - **`ExternalName`** Services resolve, flattened CNAME→A. The one gap: an `ExternalName` whose target
-  is itself inside the cluster domain is `NXDOMAIN` (deliberately not re-resolved in-cluster).
+  is itself inside the cluster domain is `NXDOMAIN` (not re-resolved in-cluster).
 - **AAAA is never answered** — k3sm's CIDRs are IPv4.
 
 **In-pod resolution on the default runtime — wired, with one substrate caveat.** A Pod on a
@@ -342,7 +342,7 @@ See [`vm` RuntimeClass](vm-runtimeclass.md) for the full selector shape, includi
 **A foreign `runAsUser` or `fsGroup` is rejected at admission, `vm` Pods included.** The cluster-wide
 policy that pins every Pod's `securityContext.runAsUser`/`fsGroup` to the node's own identity exists
 because the native host-process path has no way to honor a different uid — there is no per-pod uid
-isolation to grant it (see [above](#no-per-pod-uid-isolation)). A Linux guest genuinely *can* run as an
+isolation to grant it (see [above](#no-per-pod-uid-isolation)). A Linux guest *can* run as an
 arbitrary uid, so carving out an exemption for `vm` Pods is a reasonable target, but it has not shipped:
 today the policy applies uniformly, before the runtime is even consulted. Applying a `vm` Pod that sets
 a foreign `runAsUser` or `fsGroup` is refused outright (a `422` at `kubectl apply`), not silently
@@ -390,7 +390,7 @@ and one of them is now measured rather than assumed:
   guest present files under a different owning uid without rewriting every file). That is a property of
   the current platform build, not a k3sm gap that a future k3sm release closes on its own — a workload
   that needs to write as a specific uid should run as the guest image's own root instead, which the
-  guest genuinely is isolated enough to allow; a `vm` guest is single-tenant, so running as its own root
+  guest is isolated enough to allow; a `vm` guest is single-tenant, so running as its own root
   is the supported shape for that need.
 - **Rootfs writes are RAM, not disk**, backed by a bounded upper layer. A guest that writes past that
   bound sees `ENOSPC` from its own filesystem, not an out-of-memory kill — read an `ENOSPC` inside a
@@ -401,7 +401,7 @@ and one of them is now measured rather than assumed:
 
 ### `vm` Pods: Filesystem Performance and Case-Sensitivity, Measured
 
-Two things worth knowing before you plan storage-heavy workloads on this path, both measured on the
+Two properties matter before you plan storage-heavy workloads on this path, both measured on the
 tested rig and both a property of the shared-filesystem transport, not of PVC storage generally:
 
 - **A synchronous `fsync` costs meaningfully more than an in-guest tmpfs write** — around 0.4 ms on the
@@ -429,7 +429,7 @@ including headless-Service and per-pod DNS name resolution, does not reach a `vm
 its Service's ClusterIP instead, which does work. Cross-node traffic to or from a `vm` Pod is out of
 scope for this release.
 
-Two further things worth knowing about the guest network:
+Two further properties of the guest network:
 
 - **Guest-to-guest reachability was found to be blocked on the tested rig** — two `vm` Pods on the same
   node could not address each other at all, at the network layer, under the tested configuration. That
@@ -461,7 +461,7 @@ Kubernetes promises, where a container sees only the volumes it mounts.
 
 The practical consequence: **do not rely on container-level volume separation inside a single `vm`
 Pod as a trust boundary.** If two containers must not see each other's credentials, put them in
-separate Pods, where the boundary is the one this RuntimeClass actually enforces.
+separate Pods, where the boundary is the one this RuntimeClass enforces.
 
 ### Node Capability Labels Are Probed Once at Daemon Start
 

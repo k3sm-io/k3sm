@@ -57,9 +57,9 @@ k3sm's distribution ships in three explicit generations, in shipping order:
 3. **Notarized `.pkg` (gen 3):** a signed, stapled installer package for offline and managed
    installs.
 
-> **Status:** pre-release builds are published; the script resolves the newest one until the
-> first stable release exists, and a pin via `K3SM_INSTALL_VERSION` always wins. The Homebrew
-> tap and the `.pkg` follow the first stable release.
+> **Status:** pre-release builds are published; the script resolves the newest one, and a pin
+> via `K3SM_INSTALL_VERSION` always wins. The Homebrew tap and the `.pkg` arrive with the
+> first stable release.
 
 **Switching channels:** every channel manages the same `/Library/k3sm`. After switching (script
 → brew or back), run `sudo k3sm install` so the daemons run the newly delivered binary — or
