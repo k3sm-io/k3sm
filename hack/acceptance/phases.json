@@ -7,7 +7,7 @@
   "M3-lab": { "gate": "hack/lab/m3.sh",    "tier": "lab",         "requires": ["two-macs"],               "manual": true },
   "M4": { "gate": "hack/acceptance/m4.sh", "tier": "integration", "requires": ["dev-mac"],                "manual": false },
   "M4-lab": { "_comment": "re-pointed 2026-07 → hack/lab/m7.sh: the reboot-survival proof needs the M7.1 brew/pkg artifact, so it is superseded by the M7-lab gate and runs in the M7 tail (B35 tombstoned; the old hack/lab/m4.sh skeleton is deleted in the same change).", "gate": "hack/lab/m7.sh", "tier": "lab", "requires": ["macos-runner", "reboot", "signing"], "manual": true, "skeleton": true },
-  "M5": { "gate": "hack/lab/m5.sh",        "tier": "lab",         "requires": ["vz"],                     "manual": true, "skeleton": true },
+  "M5": { "_comment": "graduated 2026-09-01 → hack/lab/m11.sh: M11 absorbed the M5 lab remainder (docs/PHASES.md), so the vm-RuntimeClass reachability proof this row exists for is the FULL M11-lab ledger, not a standalone M5 script (the old hack/lab/m5.sh skeleton is deleted in the same change, per the M4-lab precedent).", "gate": "hack/lab/m11.sh", "tier": "lab", "requires": ["vz"], "manual": true, "skeleton": false },
   "M6": { "gate": "hack/lab/m6.sh",        "tier": "lab",         "requires": ["two-macs", "postgres"],   "manual": true },
   "M7": { "gate": "hack/acceptance/m7.sh", "tier": "integration", "requires": ["dev-mac", "network"],                  "manual": false, "skeleton": true },
   "M7-lab": { "gate": "hack/lab/m7.sh",    "tier": "lab",         "requires": ["macos-runner", "reboot", "signing"],   "manual": true,  "skeleton": true },

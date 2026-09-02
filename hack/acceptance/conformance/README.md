@@ -26,8 +26,9 @@ compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
   the required set is the checklist of record.
 - **CGO_ENABLED=1** for every M2+ slice (k3sm is cgo from M1). **Tier** per `phases.json`: single-node →
   `integration` (`m2.sh` root; `m3.sh` root single-node NodePort+PVC; `m4.sh` non-root RBAC); cross-node / `vm` →
-  `lab` (`K3SM_LAB=1`; `hack/lab/m3.sh` two-Mac mesh/DNS, `m5.sh`). M3 and M4 each split an integration row and a
-  lab row. Slices **share one cluster bring-up**.
+  `lab` (`K3SM_LAB=1`; `hack/lab/m3.sh` two-Mac mesh/DNS; the `vm` slice is proven by `hack/lab/m11.sh`, which
+  absorbed the M5 lab remainder). M3 and M4 each split an integration row and a lab row. Slices **share one
+  cluster bring-up**.
 - Helper binaries **`hello-http`** (controllable HTTP server: probe-transition health toggles + NodePort backend)
   and **`conftool`** (`memhog` for OOMKilled, `apicall` for in-pod kubectl, `resolve` for in-pod DNS) are built
   from sources under `e2e/testdata/cmd/` by the suite's `TestMain` into `$K3SM_CONFORMANCE_BIN` and
@@ -69,4 +70,6 @@ This is the **spec**, plus (as of M4.2) the **authored + compile-verified + gate
 `hack/lab/m3.sh` (two-Mac M3 lab), `m4.sh` (RBAC integration) enumerate their required criteria under the
 non-vacuous guard. The **LIVE green is integration-tier** (a dev Mac + root for `m2.sh`/`m3.sh`; `k3sm install`
 for the helper posture), so it is not run in unit CI — **M4.2-a1 stays `met:false` (integration-pending)** until
-the gates run green on a capable host. The `m5.sh` `vm` slice is authored at M5.
+the gates run green on a capable host. The `vm` slice is proven by `hack/lab/m11.sh` (M11 absorbed the M5
+lab remainder — see `hack/acceptance/phases.json`'s `M5` row), not by a criterion-test slice under this
+directory.

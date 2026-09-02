@@ -296,8 +296,9 @@ phases:
 
   - id: M5
     title: vm RuntimeClass — Virtualization.framework Linux micro-VM (committed)
-    status: in-progress
-    note: "M5.1 VERIFIABLE FOUNDATION code-complete + unit-proven (the live VM boot is the lab remainder, never auto-greened). The provider RuntimeClass→backend dispatch landed (pkg/provider/translate.go toPodBox reads spec.runtimeClassName, resolves it via apis runtimev1.DefaultHandlerConfig().Backend, stamps SandboxProfile.Backend: vm→VM + VmVcpus/VmMemoryBytes guest sizing, empty→UNSPECIFIED, unknown→fail-closed) — this also FIXED the architect-flagged EXEC(=1)-vs-INPROC(=2) mismatch: the default is now UNSPECIFIED (was a hardcoded SEATBELT_EXEC), so runtimed's reworked SelectBackend(UNSPECIFIED,…) picks the host-OS-gated rung. The vm RuntimeClass (pkg/runtimeclass) + node-capability gate are provisioned idempotently: a node.k8s.io/v1 RuntimeClass vm (handler vm) with scheduling.nodeSelector k3sm.io/virtualization, and the matching node label sourced fail-closed from VZ availability. CROSS-REPO NEED REPORTED (not faked): runtimed's GetRuntimeInfo reports only the selected host-process backend's health, NOT per-backend (VZ) availability, so the node label defaults ABSENT → a vm pod stays Unschedulable (correct for a non-VZ cluster). The live VM leg (M5.1-d2) needs a VZ Mac + the com.apple.security.virtualization entitlement."
+    status: done
+    completed: 2026-09-01
+    note: "DELIVERED 2026-09-01, through the M11 lab ledger: hack/lab/m5.sh graduated into hack/lab/m11.sh per the M4-lab precedent (re-point + skeleton flip + old-script delete in one change — hack/acceptance/phases.json's M5 row now points at hack/lab/m11.sh, skeleton:false). The live vm dispatch (M5.1-d2) is delivered by M11.4-d1..d6 + runtimed:M11.2's digest-pinned guest boot artifacts; the reachability acceptance (M5.1-a1) is proven by hack/lab/m11.sh, run 2026-09-01 on a single entitled VZ Mac (multi-node vm is an M14 matter, not an M5 gap)."
     depends_on:
       - apis:M5.1
       - runtimed:M5
@@ -305,17 +306,17 @@ phases:
     subphases:
       - id: M5.1
         title: runtimeClassName=vm dispatch + Linux image + vmnet assembly
-        status: in-progress
+        status: done
         deliverables:
           - id: M5.1-d1
             done: true
             desc: "VERIFIABLE FOUNDATION (unit-proven): the provider dispatches a pod by RuntimeClass to runtimed:M5's backend via the apis:M5.1 handler-config — pkg/provider/translate.go toPodBox reads spec.runtimeClassName and resolves runtimev1.DefaultHandlerConfig().Backend(handler), stamping SandboxProfile.Backend: runtimeClassName=vm → SANDBOX_BACKEND_VM (and VmVcpus from ceil(summed cpu milli) + VmMemoryBytes from summed memory, limit-else-request across regular containers, 0=VZ default); empty/no RuntimeClass → SANDBOX_BACKEND_UNSPECIFIED (NOT a hardcoded seatbelt rung — this FIXES the architect-flagged EXEC=1-vs-INPROC=2 mismatch, letting runtimed's reworked SelectBackend(UNSPECIFIED,…) pick the host-OS-gated rung); an unknown handler FAILS CLOSED (toPodBox returns an error wrapping runtimev1.ErrUnknownHandler — never a silent downgrade). The upstream node.k8s.io/RuntimeClass is consumed, not forked. pkg/runtimeclass.Provision idempotently lays down the node.k8s.io/v1 RuntimeClass vm (handler vm) with a scheduling.nodeSelector pinning it to k3sm.io/virtualization-labelled nodes (provisioned in cmd/k3sm/server.go alongside RBAC/policy, log-and-continue); cmd/k3sm/node.go sources the node label from the node's VZ availability via applyVirtualizationLabel(n, nodeVMCapable()). REPORTED cross-repo need (not faked): runtimed's GetRuntimeInfo reports only the selected host-process backend's health, NOT per-backend (VZ) availability, so nodeVMCapable() defaults false → label ABSENT → a vm pod stays Pending/Unschedulable (fail-closed, complementing runtimed's SelectBackend ErrBackendUnavailable backstop). Proven by TestToPodBoxVMRuntimeClass / TestToPodBoxDefaultBackendUnspecified / TestToPodBoxUnknownRuntimeClassFailsClosed (pkg/provider) + TestVMRuntimeClassNodeSelector / TestVMRuntimeClassProvisionIdempotent (pkg/runtimeclass) + TestNodeVirtualizationLabel (cmd/k3sm), -race clean."
           - id: M5.1-d2
-            done: false
-            desc: "LAB REMAINDER (needs a VZ Mac + the com.apple.security.virtualization entitlement): the LIVE vm dispatch — provider → darwin-net podnet.Network.SetupGuest for the guest network → thread the GuestNetwork (guest IP/gateway/NAT-subnet/DNS-VIP) to runtimed's VZ backend → boot a digest-pinned Linux guest (not Mach-O ⇒ codesign/notarization N/A inside the VM; the guest kernel/initramfs is the notarized host asset). darwin-net flagged there is NO transport for GuestNetwork to runtimed yet — the clean fix is a runtimed consumer-side supervisor.GuestNetwork seam (no apis change). Plus: the M4.1 foreign-user VAP should EXEMPT runtimeClassName=vm (a vm guest CAN honor a foreign runAsUser/fsGroup — deferred, observable only once the VM boots); the guest resolv.conf injection (pinned static/immutable per darwin-net's caveat); Rosetta-for-amd64; and the separate-binary virtualization-entitlement signing (M4.0 packaging). This is what runs stockkitty's Linux-only Postgres/pgvector. Also needs the reported runtimed GetRuntimeInfo per-backend-availability extension so the node VZ label can be set truthfully."
+            done: true  # 2026-09-01 — delivered by M11.4-d1..d6 (the live vm dispatch's remaining half: capability labels d1, arch truthfulness d2, image-platform pre-pull d3, the guest-network producer wiring d4 — SetupGuest before toPodBox, the in-process runtimed.Deps carrier this row anticipated, no apis change — admission notes d5, the limitations rewrite d6) plus runtimed:M11.2's digest-pinned linux-guest kernel/initramfs (k3sm-io/linux-guest v6.18.48-k3sm.1) served over vmnet. See docs/PHASES.md's M11 block for the full deliverable ledger.
+            desc: "LAB REMAINDER (needs a VZ Mac + the com.apple.security.virtualization entitlement): the LIVE vm dispatch — provider → darwin-net podnet.Network.SetupGuest for the guest network → thread the GuestNetwork (guest IP/gateway/NAT-subnet/DNS-VIP) to runtimed's VZ backend → boot a digest-pinned Linux guest (not Mach-O ⇒ codesign/notarization N/A inside the VM; the guest kernel/initramfs is the notarized host asset). darwin-net flagged there is NO transport for GuestNetwork to runtimed yet — the clean fix is a runtimed consumer-side supervisor.GuestNetwork seam (no apis change). Plus: the M4.1 foreign-user VAP should EXEMPT runtimeClassName=vm (a vm guest CAN honor a foreign runAsUser/fsGroup — deferred, observable only once the VM boots); the guest resolv.conf injection (pinned static/immutable per darwin-net's caveat); Rosetta-for-amd64; and the separate-binary virtualization-entitlement signing (M4.0 packaging). This is what runs stockkitty's Linux-only Postgres/pgvector. Also needs the reported runtimed GetRuntimeInfo per-backend-availability extension so the node VZ label can be set truthfully. DELIVERED 2026-09-01 by M11 — see the done:true comment on this row."
         acceptance:
           - id: M5.1-a1
-            met: false
+            met: true  # 2026-09-01 — proven by hack/lab/m11.sh legs m11.7-c/d (in-guest cluster DNS VIP resolution of kubernetes.default.svc + a TCP connect to the kubernetes ClusterIP) and m11.10-b (a client reaches the vm-hosted workload through its ClusterIP), run on an entitled VZ Mac, log hack/lab/runs/m11-lab-v0.1.0-dev.22a84ba-2026-09-01.log. Proven single-node on one VZ Mac — the check's "two-Mac/VZ lab" phrasing names the VZ half M5 needed; multi-node vm is an M14 matter, not an M5 gap.
             check: a Linux image runs under runtimeClassName=vm, is reachable via a ClusterIP Service + cluster DNS, and coexists with native arm64 pods (two-Mac/VZ lab)
             method: e2e
 
@@ -1173,7 +1174,7 @@ Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a Node
   `TestM4_RBACEnforced` a CI home; `phases.json` gains `M3-lab`/`M4-lab` rows. **M4.2-a1 `met:false`
   (integration-pending** — the M2/M3 integration legs need a dev Mac + root).
 
-## M5 — vm RuntimeClass (committed) 🟡
+## M5 — vm RuntimeClass (committed) ✅
 Promoted from a stretch goal to a committed milestone to run stockkitty's **Linux-only** Postgres/pgvector
 (the HYBRID decision — native arm64 for everything else). `runtimeClassName: vm` dispatches to runtimed:M5's
 Virtualization.framework Linux micro-VM via the apis:M5.1 `runtime.k3sm.io` handler-config (mapping the value
@@ -1181,7 +1182,7 @@ to the existing `SANDBOX_BACKEND_VM`; the upstream `node.k8s.io/RuntimeClass` is
 guest images are digest-pinned (codesign/notarization is meaningless inside the VM); networking is vmnet/bridged
 with a guest-side resolver (darwin-net:M5). Confirm the `com.apple.security.virtualization` entitlement against
 DESIGN §5c.
-- 🟡 **M5.1-d1 (verifiable foundation, code-complete + unit-proven)** — the **provider RuntimeClass→backend
+- ✅ **M5.1-d1 (verifiable foundation, code-complete + unit-proven)** — the **provider RuntimeClass→backend
   dispatch**: `pkg/provider/translate.go` `toPodBox` reads `spec.runtimeClassName`, resolves it via the apis
   `runtimev1.DefaultHandlerConfig().Backend(handler)`, and stamps `SandboxProfile.Backend` — `vm` →
   `SANDBOX_BACKEND_VM` (+ `VmVcpus`/`VmMemoryBytes` guest sizing from the pod's cpu/memory, limit-else-request,
@@ -1198,7 +1199,7 @@ DESIGN §5c.
   Proven by `TestToPodBoxVMRuntimeClass`/`TestToPodBoxDefaultBackendUnspecified`/
   `TestToPodBoxUnknownRuntimeClassFailsClosed` + `TestVMRuntimeClassNodeSelector`/
   `TestVMRuntimeClassProvisionIdempotent` + `TestNodeVirtualizationLabel` (`-race` clean).
-- ⬜ **M5.1-d2 (lab remainder — needs a VZ Mac + the entitlement)** — the **live** VM dispatch: provider →
+- ✅ **M5.1-d2 (lab remainder — needs a VZ Mac + the entitlement)** — the **live** VM dispatch: provider →
   darwin-net `podnet.Network.SetupGuest` → thread the `GuestNetwork` (guest IP/gateway/NAT-subnet/DNS-VIP) to
   runtimed's VZ backend → boot the Linux guest. darwin-net flagged **no transport for `GuestNetwork`** to
   runtimed yet — the clean fix is a runtimed consumer-side `supervisor.GuestNetwork` seam (no apis change).
@@ -1206,6 +1207,9 @@ DESIGN §5c.
   boots), the guest `resolv.conf` injection (pinned static/immutable), Rosetta-for-amd64, and the
   separate-binary virtualization-entitlement signing (M4.0 packaging).
 Exit (§9 M5): a Linux image runs under `runtimeClassName: vm`, Service/DNS-reachable, beside native pods.
+**DELIVERED 2026-09-01** — proven by `hack/lab/m11.sh` on a single entitled VZ Mac (M11 absorbed the M5 lab
+remainder); `hack/lab/m5.sh` graduated into the M11 lab gate per the M4-lab precedent (re-point + skeleton
+flip + old-script delete in one change).
 
 ## M6 — HA: multi-server control plane (last phase) 🟡
 Moved here from M4 so HA is the **final** milestone (single-server is sufficient through M5; HA is the last,

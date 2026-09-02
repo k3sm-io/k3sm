@@ -17,7 +17,7 @@
 #   - K3SM_LAB unset / != 1 (the common case, incl. CI): this gate is NOT on a real
 #     multi-node rig, so it prints a PENDING notice and exits 0 — a "skip",
 #     reported as "pending lab" and NEVER counted as a proven milestone
-#     (mirrors hack/lab/m3.sh, hack/lab/m5.sh, hack/lab/m6.sh).
+#     (mirrors hack/lab/m3.sh, hack/lab/m6.sh).
 #   - K3SM_LAB == 1 (a real lab run is being attempted): this placeholder CANNOT
 #     prove cross-node per-pod-IP / in-pod SRV/PTR, so it exits 1 (RED) rather than 0.
 #     An exit 0 here would be read as "M10-lab proven" and falsely pass the
