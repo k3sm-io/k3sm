@@ -3,7 +3,7 @@
 `k3sm build` packages a **COPY-only** image natively — no daemon, no cluster. That
 covers a large class of images: a compiled binary plus its assets, a static site,
 a config bundle. If a Dockerfile only assembles files, use `k3sm build` and stop
-reading here — see [images.md](images.md).
+reading here — see [Images](images.md).
 
 A Dockerfile that **runs** commands (`RUN apt-get …`, `RUN cargo build …`) needs a
 real builder. k3sm provides one **in the cluster**: a long-lived
