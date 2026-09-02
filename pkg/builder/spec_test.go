@@ -244,3 +244,18 @@ func TestPVCSpec(t *testing.T) {
 		t.Errorf("cache size = %s, want %s", got.String(), DefaultCacheSize)
 	}
 }
+
+// TestNamespaceObject pins the builder namespace render: named, and labeled like
+// the server-provisioned namespaces (pkg/rbac).
+func TestNamespaceObject(t *testing.T) {
+	ns := Config{}.NamespaceObject()
+	if ns.Name != DefaultNamespace {
+		t.Errorf("namespace name = %q, want %q", ns.Name, DefaultNamespace)
+	}
+	if ns.Namespace != "" {
+		t.Errorf("namespace object should have no namespace scope, got %q", ns.Namespace)
+	}
+	if ns.Labels[managedLabel] != "true" {
+		t.Errorf("namespace missing the managed label: %v", ns.Labels)
+	}
+}

@@ -204,6 +204,17 @@ func (c Config) meta() metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: c.Name, Namespace: c.Namespace, Labels: c.labels()}
 }
 
+// Namespace renders the namespace the builder stack lives in. It carries the
+// same managed labels as the objects inside it, matching how the server
+// provisions its own namespaces (pkg/rbac). Its own name is namespace-scoped,
+// so its ObjectMeta is bare of a Namespace field.
+func (c Config) NamespaceObject() *corev1.Namespace {
+	n := c.Normalize()
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: n.Namespace, Labels: n.labels()},
+	}
+}
+
 // PersistentVolumeClaim renders the build-cache claim. It is ReadWriteOnce (one
 // node holds the engine) and is KEPT across Down so a rebuilt engine finds a warm
 // cache.

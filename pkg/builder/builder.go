@@ -124,6 +124,13 @@ func (m *Manager) Up(ctx context.Context) (Status, error) {
 	if m.exec == nil {
 		return Status{}, fmt.Errorf("builder up: no exec seam configured for the readiness probe")
 	}
+	// The namespace FIRST: the PVC/Pod/Service all target it, and a create into
+	// an absent namespace fails ("namespaces %q not found"), observed live. This
+	// is the pkg/rbac provisioning pattern — one step owns the namespace next to
+	// the objects that are meaningless without it.
+	if err := m.ensureNamespace(ctx); err != nil {
+		return Status{}, err
+	}
 	if err := m.ensurePVC(ctx); err != nil {
 		return Status{}, err
 	}
@@ -261,6 +268,19 @@ func (m *Manager) resolveEndpoint(ctx context.Context) (string, error) {
 }
 
 // ---- ensure helpers (Get-then-Create; idempotent) --------------------------
+
+func (m *Manager) ensureNamespace(ctx context.Context) error {
+	cli := m.kube.CoreV1().Namespaces()
+	if _, err := cli.Get(ctx, m.cfg.Namespace, metav1.GetOptions{}); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get builder namespace: %w", err)
+	}
+	if _, err := cli.Create(ctx, m.cfg.NamespaceObject(), metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create builder namespace: %w", err)
+	}
+	return nil
+}
 
 func (m *Manager) ensurePVC(ctx context.Context) error {
 	cli := m.kube.CoreV1().PersistentVolumeClaims(m.cfg.Namespace)
