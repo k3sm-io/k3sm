@@ -19,7 +19,7 @@ ingress host, the control-plane supervisor) go to **stderr**, which launchd rout
 
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).
 - Check the datastore is present and not locked — the kine/SQLite DB lives under the server work
-  directory (see [backup-restore.md](backup-restore.md)).
+  directory (see [Backup & restore](backup-restore.md)).
 - Restart the daemon: `launchctl kickstart -k system/io.k3sm.server` (label per your role).
 
 ## A Pod is stuck or exits and does not restart
@@ -37,9 +37,9 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
 - **Is the Pod's policy `Never`, or is it a `Job` that has already succeeded?** Both are working as
   specified.
 - **Stuck rather than exiting?** Check the Pod was **adapted** to the native image model — a raw
-  Linux image cannot run as a Darwin process (see [images.md](images.md)).
+  Linux image cannot run as a Darwin process (see [Images](images.md)).
 
-See [limitations.md](limitations.md#restartpolicy--honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
+See [Limitations](limitations.md#restartpolicy--honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
 
 ## DNS from inside a Pod does not resolve cluster names
@@ -57,13 +57,13 @@ names, SRV and PTR all resolve. Check these in order:
 - **Are you on `--runtime hostprocess` or the `vm` RuntimeClass?** In-pod cluster DNS is not wired on
   either — every lookup goes to the host resolver.
 
-See [limitations.md](limitations.md#dns--what-resolves-and-on-which-runtime-path) for the full
+See [Limitations](limitations.md#dns--what-resolves-and-on-which-runtime-path) for the full
 per-path picture.
 
 ## A UDP Service does not work
 
 Only cluster DNS on `:53` uses UDP today; general UDP Services (ClusterIP **and** NodePort) are deferred.
-See [limitations.md](limitations.md).
+See [Limitations](limitations.md).
 
 ## A LoadBalancer Service stays `<pending>`
 
@@ -100,7 +100,7 @@ Then look for one of these:
   ```
 
   The usual culprits are another process on the Mac, a **pod** (macOS has no network namespaces, so pods
-  share the node's port space — see [limitations.md](limitations.md)), or a second LoadBalancer Service
+  share the node's port space — see [Limitations](limitations.md)), or a second LoadBalancer Service
   declaring the same port. k3sm never picks a different port for you.
 - **`loadbalancer/ingress status will stay EMPTY: no advertisable node address could be derived`** — the
   listeners are bound and serving, but there is no address that would be correct to publish, so nothing is written
@@ -121,14 +121,14 @@ path yet (the event pipeline is planned), so the log file is the only place the 
 ## `kubectl top` returns no metrics
 
 k3sm ships no metrics-server and has no CPU accounting; install a metrics-server operator if you need the
-`metrics.k8s.io` verb. See [kubectl-access.md](kubectl-access.md) and [limitations.md](limitations.md).
+`metrics.k8s.io` verb. See [kubectl access](kubectl-access.md) and [Limitations](limitations.md).
 
 ## A control-plane certificate is close to expiry
 
 Component certificates are re-issued on every control-plane boot, so a restart renews them.
 `sudo k3sm certificate rotate` reports what a restart would re-issue (and both CA pins, which
 never change); `--restart` performs it. Rotation does **not** revoke anything and does not cover
-worker-node certs — see [certificates.md](certificates.md) before you rely on it.
+worker-node certs — see [Certificates](certificates.md) before you rely on it.
 
 ## A Pod selecting `k3sm.io/rosetta` or `k3sm.io/rosetta-linux` stays Pending
 
@@ -146,24 +146,24 @@ The node advertises a capability label only when its start-time probe said yes.
    `sudo launchctl kickstart -k system/io.k3sm.server`.
 5. Your Pod must also keep `kubernetes.io/os: darwin` in its `nodeSelector`; a Pod with only the
    capability key is rejected with a `422`. See
-   [vm-runtimeclass.md](vm-runtimeclass.md#node-capability-labels).
+   [`vm` RuntimeClass](vm-runtimeclass.md#node-capability-labels).
 6. **Scheduled, but `ImagePullBackOff` with a platform error?** The two Rosetta labels are **advertised
    but not yet honored**. Multi-arch selection itself works — k3sm reads the manifest list and picks a
    platform — but `linux/amd64` is deliberately not among the platforms it will accept, because
    translating an amd64 payload happens inside a guest and that guest path does not run yet. So an
    amd64-only image is refused at pull rather than started and left to crash. That is a documented
    gap, not a broken node; see
-   [vm-runtimeclass.md](vm-runtimeclass.md#the-two-rosetta-labels-are-advertised-not-yet-honored).
+   [`vm` RuntimeClass](vm-runtimeclass.md#the-two-rosetta-labels-are-advertised-not-yet-honored).
 
 ## Multi-node join fails
 
 - Re-mint the token (`sudo k3sm token create`) — tokens expire.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
-  [multi-node.md](multi-node.md).
+  [Multi-node](multi-node.md).
 
 ## Next
 
-- [faq.md](faq.md) — quick answers.
-- [limitations.md](limitations.md) — is this a bug or a documented gap?
-- [backup-restore.md](backup-restore.md) — recover the datastore.
-- [certificates.md](certificates.md) — the PKI, rotation, and its limits.
+- [FAQ](faq.md) — quick answers.
+- [Limitations](limitations.md) — is this a bug or a documented gap?
+- [Backup & restore](backup-restore.md) — recover the datastore.
+- [Certificates](certificates.md) — the PKI, rotation, and its limits.

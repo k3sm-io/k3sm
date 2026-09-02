@@ -6,7 +6,7 @@ Darwin process, so the payload inside the image must be a `darwin/arm64` executa
 is refused at pull rather than started and left to die at `exec`.
 
 If you are here to find out what you can actually run and how to get there, start with
-[what-runs.md](what-runs.md); this page is the reference behind it — the two workload conventions,
+[What runs](what-runs.md); this page is the reference behind it — the two workload conventions,
 `k3sm build` and its accepted Dockerfile subset, `k3sm image load` / `import` / `push`, and every
 deliberate difference from the Docker tool of the same name.
 
@@ -43,14 +43,14 @@ resource limits.
 
 A standard OCI image carries a **Linux** userland and expects a Linux kernel. The native path has
 neither, so a Linux image cannot run as a native Darwin process — one of the headline divergences
-in [limitations.md](limitations.md). k3sm refuses it at pull, naming the platforms the image offers
+in [Limitations](limitations.md). k3sm refuses it at pull, naming the platforms the image offers
 and the one this node needs, rather than pulling it and failing opaquely at exec.
 
 Note the distinction this section is *not* making: the objection is to **Linux**, not to OCI. The
 image format, the registry protocol, tags, digests, pull policy and pull secrets all work normally —
-see [what-runs.md](what-runs.md). `linux/arm64` payloads are the province of the
+see [What runs](what-runs.md). `linux/arm64` payloads are the province of the
 [`vm` RuntimeClass](vm-runtimeclass.md), an EXPERIMENTAL preview-quality path — see
-[limitations.md](limitations.md).
+[Limitations](limitations.md).
 
 ## Building an image: `k3sm build`
 
@@ -88,7 +88,7 @@ Each of these is a refusal or a documented gap, never a silent divergence:
 | | k3sm build |
 |---|---|
 | `RUN` | **Rejected.** This builder packages files; it does not execute them. The RUN-capable path is the vm-backed builder below. |
-| `FROM <ref>` | **Supported**, with two caveats. The base is fetched for `darwin/arm64` using the same credential chain as `k3sm image push`, and is **refused if it declares any other platform** — a `darwin/arm64` image built on a `linux/amd64` base is a self-consistent lie whose payload cannot execute. And a **tag**-pinned base is not reproducible: the tag can move, so the build says so and prints the base it used. Pin a digest if you want the guarantee. In practice bases are ones your own organisation published — see [what-runs.md](what-runs.md) on why there is no public supply of `darwin` images. |
+| `FROM <ref>` | **Supported**, with two caveats. The base is fetched for `darwin/arm64` using the same credential chain as `k3sm image push`, and is **refused if it declares any other platform** — a `darwin/arm64` image built on a `linux/amd64` base is a self-consistent lie whose payload cannot execute. And a **tag**-pinned base is not reproducible: the tag can move, so the build says so and prints the base it used. Pin a digest if you want the guarantee. In practice bases are ones your own organisation published — see [What runs](what-runs.md) on why there is no public supply of `darwin` images. |
 | `ADD` | An exact alias of `COPY`. It does **not** fetch remote URLs and does **not** auto-extract archives; both are refused rather than silently downgraded. |
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory — scope your `COPY` lines, or build from a clean tree. |
 | `--platform` | Accepts only `darwin/arm64`. The builder copies host files verbatim and does not cross-compile, so any other value would declare a platform the bytes do not satisfy. |
@@ -169,7 +169,7 @@ from any registry: digests verified, `imagePullSecrets` honoured, multi-arch man
 
 - **A full build engine** — `k3sm build` with `RUN` support, via a managed BuildKit builder inside
   a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed. It
-  waits on the `vm` path's own release and lab validation — see [limitations.md](limitations.md).
+  waits on the `vm` path's own release and lab validation — see [Limitations](limitations.md).
 
 Registry pull is **not** on this list: it ships. An `image: ghcr.io/org/app:tag` Pod is pulled,
 digest-verified and run with kubelet-faithful semantics — pull policy, pull-failure backoff and
@@ -177,7 +177,7 @@ multi-arch selection included. What the image must contain is a `darwin/arm64` p
 
 ## Next
 
-- [what-runs.md](what-runs.md) — what k3sm can run, and the whole path from Dockerfile to Pod.
-- [quickstart.md](quickstart.md) — run your first native Pod.
-- [limitations.md](limitations.md) — the adaptation requirement.
-- [storage.md](storage.md) — attaching persistent data.
+- [What runs](what-runs.md) — what k3sm can run, and the whole path from Dockerfile to Pod.
+- [Quickstart](quickstart.md) — run your first native Pod.
+- [Limitations](limitations.md) — the adaptation requirement.
+- [Storage](storage.md) — attaching persistent data.

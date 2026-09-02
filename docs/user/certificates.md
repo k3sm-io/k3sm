@@ -4,7 +4,7 @@ k3sm mints its own PKI at first boot and re-issues the control plane's leaf cert
 **every** boot. `k3sm certificate rotate` is the supported way to force that re-issue and to
 verify the certificate authorities came through it untouched.
 
-> Read [limitations.md](limitations.md) for what k3sm does **not** do here — most importantly,
+> Read [Limitations](limitations.md) for what k3sm does **not** do here — most importantly,
 > rotation does not revoke anything.
 
 ## The two CAs
@@ -86,7 +86,7 @@ A rotation restarts the control-plane daemon, which is **not** a graceful, in-pl
   back and the watch cache is rebuilt.
 - On an HA control plane the scheduler / controller-manager leader-election leases flap.
 
-Treat it like a node restart, because it is one. See [upgrade.md](upgrade.md) for the same
+Treat it like a node restart, because it is one. See [Upgrade](upgrade.md) for the same
 restart model applied to a version bump.
 
 ## What is not rotated
@@ -113,6 +113,6 @@ If a control-plane credential is compromised, the remedy is to recreate the clus
 
 ## Next
 
-- [troubleshooting.md](troubleshooting.md) — when the control plane does not come back.
-- [multi-node.md](multi-node.md) — join tokens and the CA pin a joining node checks.
-- [limitations.md](limitations.md) — the real gaps.
+- [Troubleshooting](troubleshooting.md) — when the control plane does not come back.
+- [Multi-node](multi-node.md) — join tokens and the CA pin a joining node checks.
+- [Limitations](limitations.md) — the real gaps.

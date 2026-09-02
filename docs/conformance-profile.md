@@ -19,7 +19,7 @@ The authoritative, single-source explanation of **which upstream areas k3sm cann
 lives in k3sm's internal full-surface conformance register (one row per feature × verdict, with a
 canonical §By-design non-conformance summary). This profile summarizes that assessment; it does not
 restate the full register. User-facing tradeoff guidance (what an operator should do about each ceiling)
-is owned by **`docs/user/limitations.md`**.
+is owned by **[Limitations](user/limitations.md)**.
 
 ## Terms
 

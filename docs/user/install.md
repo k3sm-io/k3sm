@@ -21,7 +21,7 @@ That step:
 After install, `k3sm kubectl …` and Pod lifecycle run as you / `_k3sm` with **no `sudo`**. The full
 trust model — why this is the Docker Desktop / lima / colima pattern applied to k3sm, and the one
 residual limitation (no per-pod uid isolation) — is documented in
-[privilege-model.md](../privilege-model.md).
+[the privilege model](../privilege-model.md).
 
 ## What gets installed where
 
@@ -29,7 +29,7 @@ residual limitation (no per-pod uid isolation) — is documented in
   retained so rollback does not require a rebuild; with the script, pin `K3SM_INSTALL_VERSION`
   to reinstall a prior release — the assets stay on GitHub Releases).
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels.
-- The kine/SQLite datastore under the server work directory (see [backup-restore.md](backup-restore.md)).
+- The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
 
 ## Install channels — the three generations
 
@@ -49,7 +49,7 @@ k3sm's distribution ships in three explicit generations, in shipping order:
    `K3SM_INSTALL_VERSION=v0.1.0` pins a release (also the repair path — an unpinned re-run
    jumps to latest); `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into the current
    directory without ever running `sudo`, so you can inspect first. Re-running the one-liner
-   upgrades in place (both daemons restart briefly — see [upgrade.md](upgrade.md)).
+   upgrades in place (both daemons restart briefly — see [Upgrade](upgrade.md)).
 
 2. **Homebrew (gen 2):** `brew install k3sm-io/tap/k3sm`, then `sudo k3sm install` — supported
    once the tap ships.
@@ -74,7 +74,7 @@ k3sm kubectl get nodes
 
 ## Next
 
-- [quickstart.md](quickstart.md) — first Pod.
-- [kubectl-access.md](kubectl-access.md) — kubeconfig details.
-- [upgrade.md](upgrade.md) — how upgrades restart the daemon.
-- [limitations.md](limitations.md) — read before relying on k3sm.
+- [Quickstart](quickstart.md) — first Pod.
+- [kubectl access](kubectl-access.md) — kubeconfig details.
+- [Upgrade](upgrade.md) — how upgrades restart the daemon.
+- [Limitations](limitations.md) — read before relying on k3sm.

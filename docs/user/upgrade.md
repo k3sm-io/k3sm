@@ -31,22 +31,22 @@ restart.
 A cluster upgrades **one node at a time**, not all at once. Restarting each node's daemon via `launchctl
 kickstart` creates a short **binary-version-skew window** where old and new nodes coexist; k3sm releases
 are designed so adjacent versions interoperate across that window. Upgrade agents first and the
-control-plane Mac last unless a release note says otherwise. See [multi-node.md](multi-node.md) and
-[ha.md](ha.md).
+control-plane Mac last unless a release note says otherwise. See [Multi-node](multi-node.md) and
+[HA](ha.md).
 
 ## Before you upgrade
 
 - **Back up the datastore.** `sudo k3sm snapshot save --out <somewhere off this node>` — it is safe to
   run while the cluster is serving, and it verifies the copy before it reports success. The file-level
   fallback (stop the daemon, `PRAGMA wal_checkpoint(TRUNCATE)`, copy, verify the copy) is in
-  [backup-restore.md](backup-restore.md). k3sm also takes an automatic pre-migration backup when a
+  [Backup & restore](backup-restore.md). k3sm also takes an automatic pre-migration backup when a
   release changes the datastore engine (below), but that copy lives on the same disk as the cluster it
   protects, so it is not a substitute for yours.
 - **Know your rollback path.** Homebrew retains the prior bottle, so rollback does not require a
   rebuild round-trip; on the script channel, prior releases stay downloadable — rollback is
   `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
 - **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
-  [versions.md](versions.md).
+  [Versions](versions.md).
 
 ## Upgrading across a datastore-engine change
 
@@ -59,7 +59,7 @@ You do not have to do anything for this, but you should know what it does:
 - **Before** the new version opens the database, the server takes a verified backup at
   `db/state.db.pre-<kine-version>.bak` and preserves the old kine binary beside it as
   `kine.pre-<kine-version>`. The mechanics — the WAL drain, the integrity check, the write-once
-  rule — are in [backup-restore.md](backup-restore.md).
+  rule — are in [Backup & restore](backup-restore.md).
 - It **refuses to start** if the volume does not have twice the database size free, rather than
   writing a partial backup. Free space and start it again; nothing was changed.
 - The first boot on the new engine is slower than usual (the checkpoint + the copy). Later boots are not.
@@ -120,7 +120,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
 
 `k3sm snapshot restore` refuses while the daemon is running, verifies the backup before it touches
 anything, and prints the verification step you must then run — see
-[backup-restore.md](backup-restore.md). Rolling the binary back without restoring the backup leaves an
+[Backup & restore](backup-restore.md). Rolling the binary back without restoring the backup leaves an
 older k3sm pointed at a database a newer engine has migrated.
 
 ### Rolling back past the LoadBalancer bind change leaves durable state
@@ -157,6 +157,6 @@ does **not** revert them; you have to.
 
 ## Next
 
-- [backup-restore.md](backup-restore.md) — back up before upgrading; the automatic pre-migration copy.
-- [versions.md](versions.md) — the version you are moving to.
-- [troubleshooting.md](troubleshooting.md) — if the daemon does not restart.
+- [Backup & restore](backup-restore.md) — back up before upgrading; the automatic pre-migration copy.
+- [Versions](versions.md) — the version you are moving to.
+- [Troubleshooting](troubleshooting.md) — if the daemon does not restart.
