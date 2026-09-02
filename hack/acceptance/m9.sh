@@ -10,7 +10,7 @@
 # m8.sh MLX) and confirms each is green at the flip SHA. NONE of that enumeration
 # exists yet — it is tracked internally.
 #
-# Honesty contract (mirrors hack/lab/m5.sh; TestLabSkeletonHonesty pins it):
+# Honesty contract (mirrors hack/lab/m7.sh; TestLabSkeletonHonesty pins it):
 #   - K3SM_LAB unset / != 1 (the common case, incl. CI): this pre-flight is NOT being
 #     run against a real launch-candidate, so it prints a PENDING notice and exits 0 —
 #     a "skip", reported as "pending lab" and NEVER counted as "launch cleared".
