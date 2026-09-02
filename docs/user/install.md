@@ -68,7 +68,7 @@ k3sm's distribution ships in three explicit generations, in shipping order:
 ## Verifying
 
 ```sh
-k3sm version        # prints the k3sm version + the Kubernetes control-plane pin (see versions.md)
+k3sm version        # prints the k3sm version + the Kubernetes control-plane pin (see the Version Support page)
 k3sm kubectl get nodes
 ```
 
