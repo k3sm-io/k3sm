@@ -22,7 +22,7 @@ join token and every node's kubeconfig; re-minting the signing CA would invalida
 certificate at once. There is no CA-replacement flow — `k3sm certificate rotate-ca` exists only
 to say so explicitly. Replacing a CA means recreating the cluster.
 
-## What rotation actually is
+## What Rotation Actually Is
 
 Every control-plane boot re-issues the CA-signed leaves unconditionally: the scheduler and
 controller-manager client-cert kubeconfigs, and (on a multi-node server) the apiserver serving
@@ -75,7 +75,7 @@ The command exits non-zero — and says where to look — if the hierarchy is mi
 the daemon is not loaded, if a CA pin changed, or if a new instance of the control plane does not
 come back and serve.
 
-## Blast radius
+## Blast Radius
 
 A rotation restarts the control-plane daemon, which is **not** a graceful, in-place reload:
 
@@ -89,7 +89,7 @@ A rotation restarts the control-plane daemon, which is **not** a graceful, in-pl
 Treat it like a node restart, because it is one. See [Upgrade](upgrade.md) for the same
 restart model applied to a version bump.
 
-## What is not rotated
+## What Is Not Rotated
 
 | Not rotated | Why |
 |---|---|
@@ -100,7 +100,7 @@ restart model applied to a version bump.
 | Join tokens (`k3sm token create`) and the HA server-join secret | Separate credentials with their own lifecycle. Worker tokens are TTL-bounded; mint a new one when you need one. |
 | **Worker / agent node certificates** | A node's client and kubelet-serving certs are re-issued when the **agent** restarts and re-runs its join, which needs a fresh join token. Rotating the server does not touch them. |
 
-## Rotation does not revoke
+## Rotation Does Not Revoke
 
 k3sm publishes no CRL and no OCSP responder, and `--client-ca-file` trust is CA-wide: the
 apiserver accepts *any* unexpired certificate signed by the signing CA. A certificate superseded

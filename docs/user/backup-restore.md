@@ -3,7 +3,7 @@
 k3sm keeps cluster state in an embedded **kine** datastore over **SQLite (WAL)**. Backing it up and
 restoring it is how you protect and recover a cluster.
 
-## What holds the state
+## What Holds the State
 
 The control-plane state of record is the kine/SQLite database under the server work directory (the
 `db/state.db` family, including its WAL). This is distinct from **PersistentVolume data**, which lives in
@@ -13,7 +13,7 @@ Three things back it up: **`k3sm snapshot save`** (below) on your own schedule, 
 pre-upgrade backup k3sm takes when a release changes the datastore engine, and the file-level
 procedure further down — the fallback for a node where the binary will not run.
 
-## `k3sm snapshot save` — taking a backup
+## `k3sm snapshot save` — Taking a Backup
 
 ```sh
 k3sm snapshot save                      # -> <work-dir>/db/snapshots/k3sm-snapshot-<UTC>.db
@@ -39,7 +39,7 @@ does not survive losing that volume. `--out` onto another disk or host is the be
 
 The snapshot does **not** contain PersistentVolume data — see [Storage](storage.md).
 
-## `k3sm snapshot restore` — putting one back
+## `k3sm snapshot restore` — Putting One Back
 
 ```sh
 sudo launchctl bootout system/io.k3sm.server                       # 1. stop the control plane
@@ -63,7 +63,7 @@ The restore is built to be survivable when it goes wrong:
 Restoring onto a node with no datastore at all (a rebuilt Mac) is supported — that is what the drill
 is for.
 
-## Automatic pre-migration backup
+## Automatic Pre-Migration Backup
 
 A release may move to a newer kine, which re-runs its schema migrations against your existing
 database. That is **one-way**, so before the new version opens the database for the first time, the
@@ -90,7 +90,7 @@ In the server work directory's `db/` you will find:
 The backup is **write-once**: once it exists, later boots leave it alone. It is never overwritten by a
 crash-restart loop, and never replaced by a copy of an already-migrated database.
 
-## Backing up by hand — the fallback
+## Backing Up by Hand — The Fallback
 
 The file-level procedure below does what `k3sm snapshot save` does, with `sqlite3(1)` and `cp`. Use it
 when the k3sm binary will not run on the node (a broken install, a rescue boot from another machine's
@@ -120,7 +120,7 @@ Adjust the work-dir path if you run unprivileged (`~/server` under the service u
 `--work-dir`. Keep backups **off the node** — another disk or another host — so losing the machine does
 not lose the backup with it.
 
-## Restoring by hand — the fallback
+## Restoring by Hand — The Fallback
 
 The same fallback rule applies: prefer `k3sm snapshot restore`, which performs the steps below and
 verifies the snapshot before it moves anything. Restoring replaces the datastore with the backup's
@@ -146,7 +146,7 @@ sudo chown _k3sm state.db
 sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
 ```
 
-## Verify the restore — do not skip this
+## Verify the Restore — Do Not Skip This
 
 `k3sm snapshot restore` prints these steps when it finishes; run them either way. A restore that
 starts the daemon is not a restore that worked. Check that the API server is serving **and that the
@@ -162,7 +162,7 @@ k3sm doctor                                   # datastore check: journal_mode=wa
 If the objects are missing or the datastore check reports a non-WAL journal, stop, keep
 `state.db.broken`, and do not let workloads reconcile against a half-restored cluster.
 
-## Rolling back to the previous kine as well
+## Rolling Back to the Previous kine as Well
 
 If you are restoring a `state.db.pre-<version>.bak` **because** a version move went wrong, install the
 previous k3sm binary too (see [Upgrade](upgrade.md) § Rollback). The preserved
@@ -183,7 +183,7 @@ rebuilt from source without a module proxy that still carries it, so those bytes
 - Deleting a `.bak` re-arms nothing: the automatic backup is taken per target version, and that
   version has already been recorded as having opened the database.
 
-## Consistency notes
+## Consistency Notes
 
 Single-node datastore reads are **consistent-LIST**; under heavy churn there is a **potential
 watch-staleness** posture that is **soak-pending** validation. Factor that into recovery expectations —

@@ -2,7 +2,7 @@
 
 Persistent storage in k3sm uses a **local-path** provisioner with **node affinity**.
 
-## Storage model
+## Storage Model
 
 - **ConfigMaps and Secrets** are served by the apiserver and materialized into the Pod by the node.
 - **`emptyDir` and projected volumes** work as ephemeral per-Pod storage.
@@ -10,20 +10,20 @@ Persistent storage in k3sm uses a **local-path** provisioner with **node affinit
   APFS filesystem, and the resulting PV carries **node affinity** pinning it to the node that holds the
   data. Binding is `WaitForFirstConsumer`, so the scheduler picks the node before the volume exists.
 
-## Node affinity is load-bearing
+## Node Affinity Is Load-Bearing
 
 Because a local-path PV lives on one node's disk, a Pod that mounts it can only be scheduled onto **that
 node**. In a [multi-node](multi-node.md) cluster this means stateful Pods are pinned to wherever their
 data lives — plan placement accordingly.
 
-## Capacity is best-effort
+## Capacity Is Best-Effort
 
 PersistentVolume data and the kine datastore share one APFS volume, so a volume that grows without
 bound can fill the disk the datastore sits on. `capacity.storage` records what the claim asked for; it
 is not a quota. Over-commit is not refused when the volume binds — it surfaces later as a write
 failure (`ENOSPC`) inside the Pod.
 
-## Every claim must name the class
+## Every Claim Must Name the Class
 
 `local-path` is **not** marked as the cluster's default StorageClass. That is deliberate: a PVC that did
 not ask for node-local storage is never silently bound to a volume that pins its Pod to one machine.
@@ -58,7 +58,7 @@ rather than a bind mount. Its data is durable across the Pod's lifetime: files w
 on the host under the claim's directory, owned by the `_k3sm` service user. See
 [`vm` RuntimeClass](vm-runtimeclass.md) for the ownership ceilings that follow from that.
 
-## What is not supported (yet)
+## What Is Not Supported (Yet)
 
 - **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present — see
   [Limitations](limitations.md).
