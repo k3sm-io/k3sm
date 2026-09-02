@@ -129,8 +129,7 @@ Today at `main`, per port class:
     wildcard.
   - **An explicit bind to another Pod's address still works.** The rewrite touches only wildcard binds;
     the trust domain is unchanged. Same-node Pods share one `_k3sm` OS trust domain — the `vm`
-    RuntimeClass is the intended boundary for untrusted workloads; it is EXPERIMENTAL and
-    preview-quality (see below).
+    RuntimeClass is the intended boundary for untrusted workloads (see below).
   - **A grandchild process that outlives Pod teardown** can keep a socket on the address after it is
     freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
 
@@ -200,8 +199,7 @@ that is an accepted risk of the ServiceLB model k3s also ships, not an oversight
 A pod's per-pod IP is **addressing/identity only**: binds are port-scoped on shared interfaces, and
 Seatbelt cannot express per-IP network filters on macOS 26. A per-pod IP is therefore **never
 network isolation** — any same-node process can dial any pod IP. Untrusted workloads need the `vm`
-RuntimeClass, same as above; it is EXPERIMENTAL and preview-quality, so validate it against your
-own workload before relying on it here too.
+RuntimeClass, same as above.
 
 ### Ingress TLS keys and Secrets at rest
 
@@ -299,25 +297,22 @@ does not proceed, and a controller replacing the Pod is what unsticks it.
 once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
 process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
-### `vm` RuntimeClass and multi-node HA are EXPERIMENTAL
-
-Both ship as documented **EXPERIMENTAL** and should be treated as preview-quality — but they are on
-different tracks:
+### `vm` RuntimeClass, multi-node, and HA status
 
 - The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod
   end to end — create-to-Running restarts measure a 165 ms median on the reference hardware
   (the figures below), and one idle Pod with a 512 MiB guest costs about **46 MB of host memory**,
   because the hypervisor allocates guest RAM lazily rather than reserving it. The guest kernel and
-  initramfs are digest-pinned and verified on every node start. Treat the path as preview-quality:
-  what is measured is single-node, and a multi-image Pod is not supported — every container in a
+  initramfs are digest-pinned and verified on every node start. What is measured is single-node,
+  and a multi-image Pod is not supported — every container in a
   `vm` Pod shares one root filesystem, so a Pod naming two different images runs the second
-  container's command against the first container's image. It ships **EXPERIMENTAL** and
+  container's command against the first container's image. It ships
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
-  release); its live lab run is green against the release artifact. The **de-EXPERIMENTAL
-  graduation** — the branding removed, with published performance figures — is the **v0.2**
-  milestone. See [`vm` RuntimeClass](vm-runtimeclass.md).
-- **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
-  milestone. See [Multi-node](multi-node.md) and [HA](ha.md).
+  release); its live lab run is green against the release artifact. See
+  [`vm` RuntimeClass](vm-runtimeclass.md).
+- **Multi-node and HA** ship as documented **EXPERIMENTAL** and are not launch-blocking; their
+  de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md) and
+  [HA](ha.md).
 
 ### `vm` Pods: node selection and security-context admission
 

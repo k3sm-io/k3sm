@@ -11,7 +11,7 @@ cgroups, CNI, and network namespaces — k3sm has none of them. See [Limitations
 
 No. By default Pods run as **native Darwin processes** — no Linux, no containers, no VM. An optional
 [`vm` RuntimeClass](vm-runtimeclass.md) runs `linux/arm64` Pods in a per-Pod micro-VM to isolate
-untrusted workloads; it is EXPERIMENTAL and preview-quality — see [Limitations](limitations.md).
+untrusted workloads — see [Limitations](limitations.md).
 
 ## Can I run my existing Docker/OCI Linux images?
 
@@ -23,8 +23,8 @@ package it with `k3sm build`, then `k3sm image load` it or `k3sm image push` it 
 node pulls from. Tags, digests, `imagePullPolicy` and `imagePullSecrets` all behave normally. The
 short version is [What runs](what-runs.md); the reference is [Images](images.md).
 
-Unmodified `linux/arm64` images are the province of the [`vm` RuntimeClass](vm-runtimeclass.md), an
-EXPERIMENTAL preview-quality path (`linux/amd64` is not supported yet). See also
+Unmodified `linux/arm64` images are the province of the [`vm` RuntimeClass](vm-runtimeclass.md)
+(`linux/amd64` is not supported yet). See also
 [Limitations](limitations.md).
 
 ## Why did my container exit and not restart?
@@ -52,9 +52,8 @@ Only cluster DNS on `:53`. General UDP Services (ClusterIP and NodePort) are def
 ## Are pods isolated from each other?
 
 Not by uid — same-node Pods share one `_k3sm` trust domain. The [`vm` RuntimeClass](vm-runtimeclass.md)
-is the intended boundary for untrusted workloads, but it is EXPERIMENTAL and preview-quality — see
-[Limitations](limitations.md) before relying on it, and treat one node as one trust domain until
-then.
+is the intended boundary for untrusted workloads — see
+[Limitations](limitations.md) for what it supports today.
 
 ## Is multi-node / HA production-ready?
 

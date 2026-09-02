@@ -6,8 +6,8 @@
 k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/arm64 analog of
 [k3s](https://github.com/k3s-io/k3s). Pods run as **native Darwin processes: zero Linux, no VM in
 the default path**, isolated with macOS's own primitives (Seatbelt, `lo0`/vmnet, wireguard-go,
-launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS). An
-EXPERIMENTAL `vm` RuntimeClass adds an opt-in path that boots `linux/arm64` OCI images in a
+launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, OverlayFS). A
+`vm` RuntimeClass adds an opt-in path that boots `linux/arm64` OCI images in a
 per-pod micro-VM — see Shipped, below.
 
 This is a k3s-style three-horizon roadmap. Where a capability is implemented but not yet
@@ -42,14 +42,14 @@ two-Mac gates are burned down in M7. What works:
 - **RBAC + admission.** `Node,RBAC` authorization with `NodeRestriction`, and admission guardrails
   (workloads must select `kubernetes.io/os=darwin`). *(implemented; the live RBAC flip is a
   dev-mac gate)*
-- **`vm` RuntimeClass — EXPERIMENTAL, preview-quality.** A fail-closed dispatch to a
+- **`vm` RuntimeClass.** A fail-closed dispatch to a
   Virtualization.framework Linux micro-VM for `linux/arm64` images (e.g. Postgres): the RuntimeClass,
   the fail-closed backend selection, the capability labels, the scheduler overhead accounting, and
   PVC-backed storage. Validated end to end on the reference hardware (see
   [docs/user/limitations.md](docs/user/limitations.md)): boot and restart, `kubectl logs`/`exec` with
   exit-code propagation, PersistentVolumeClaims that survive a hard hypervisor kill, in-guest cluster
   DNS, per-container CPU and memory, and a Service routing to a `vm` pod through its ClusterIP.
-  Targeted at v0.1.0 as EXPERIMENTAL and `linux/arm64` only — an `amd64` image is refused at pull
+  Targeted at v0.1.0, `linux/arm64` only — an `amd64` image is refused at pull
   rather than started and left to crash. See Next.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
@@ -84,14 +84,14 @@ The first public release. One track is launch-blocking:
   first `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
   (`RUN` arrives with the vm-backed builder, below). *(targeted at v0.1.0; included in the release
   announcement only if merged and green by the pre-flight)*
-- **Run your Linux images (EXPERIMENTAL, validated on hardware).** Standard **linux/arm64 images**
+- **Run your Linux images (validated on hardware).** Standard **linux/arm64 images**
   run as `vm`-RuntimeClass pods — one lightweight micro-VM per pod — with `kubectl exec/logs/top`,
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers, unmodified images with a three-line manifest
   adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
   *(the live lab run against the released artifact is green — see Shipped, above; targeted for
-  the v0.1.0 announcement; the de-EXPERIMENTAL graduation with published performance figures is
-  the v0.2 milestone below)*
+  the v0.1.0 announcement; published performance figures and the remaining ceilings are the
+  v0.2 milestone below)*
 - **linux/amd64 images are NOT in v0.1.0.** Running them needs Rosetta-for-Linux translation
   inside the guest, and it is deliberately cut from the first release so the arm64 path can be
   validated on hardware on its own. There is no emulation fallback — no qemu exists for a Darwin
@@ -103,12 +103,11 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 
 ## Future — post-v0.1.0
 
-- **De-EXPERIMENTAL the Linux `vm` path (the graduation)** — the Linux-image capability ships at
-  v0.1 (EXPERIMENTAL, above); the v0.2 milestone is its **graduation**: the full lab ledger green
-  with **published performance figures** (VM boot latency = restart cost, the Rosetta non-TSO
-  ratio, virtiofs I/O vs native APFS), the branding removed, and the remaining ceilings either
-  closed or documented (per-pod network segmentation between micro-VMs, host-path sharing).
-  Plus darwin/amd64 pod payloads under host Rosetta on the native path.
+- **The Linux `vm` path, v0.2** — the Linux-image capability ships at v0.1 (above); v0.2 adds
+  the full lab ledger green with **published performance figures** (VM boot latency = restart
+  cost, the Rosetta non-TSO ratio, virtiofs I/O vs native APFS), and the remaining ceilings
+  either closed or documented (per-pod network segmentation between micro-VMs, host-path
+  sharing). Plus darwin/amd64 pod payloads under host Rosetta on the native path.
 - **A built-in image build engine** — `k3sm build` grows full Dockerfile support (`RUN` included)
   by managing a BuildKit builder inside a `vm`-RuntimeClass micro-VM (linux/arm64 natively,
   linux/amd64 via Rosetta) behind a bundled buildx front-end — install only k3sm, build and run
@@ -127,9 +126,9 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
 ### Non-goals (deliberate)
 
 - **Not a Linux-container runtime.** k3sm runs native Darwin processes. Linux images run only
-  under the EXPERIMENTAL `vm` RuntimeClass (a separate micro-VM stack, `linux/arm64` only), never
+  under the `vm` RuntimeClass (a separate micro-VM stack, `linux/arm64` only), never
   the default path.
 - **A single node is one trust domain.** Same-node pods share `lo0` and a uid — Seatbelt bounds
   filesystem/network *reach*, but there are no per-pod network namespaces or uid isolation.
   Untrusted multi-tenancy is out of scope for the native path; the `vm` RuntimeClass is the
-  intended boundary, and it is EXPERIMENTAL preview-quality today.
+  intended boundary.

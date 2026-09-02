@@ -4,7 +4,7 @@ k3sm is a macOS-native Kubernetes distribution for Apple Silicon — the macOS/a
 [k3s](https://github.com/k3s-io/k3s). Pods run as native Darwin processes: real arm64 Mach-O
 executables, isolated with a Seatbelt sandbox, on the same Mac as the control plane. There is
 no Linux, no container runtime, and no VM in the default path. Linux container images can run
-too, in a per-pod Virtualization.framework micro-VM, but that path is an EXPERIMENTAL opt-in
+too, in a per-pod Virtualization.framework micro-VM, through an opt-in RuntimeClass
 (`runtimeClassName: vm`), not the default.
 
 ## What's in the binary
