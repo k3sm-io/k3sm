@@ -5,7 +5,7 @@ k3s. Pods run as **native Darwin processes** (no Linux, no containers, no VM by 
 directory is the front door to the user-facing docs; read them roughly in the journey order below.
 
 > These pages describe user-visible behavior. The authoritative product design lives in
-> [`../DESIGN.md`](../DESIGN.md).
+> [the design document](../DESIGN.md).
 
 ## Read in order
 

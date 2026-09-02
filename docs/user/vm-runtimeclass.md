@@ -13,7 +13,7 @@ you depend on it.
 > PersistentVolumeClaim storage that survives a hard hypervisor kill, per-container CPU and memory
 > accounting, and in-guest networking — the guest leases an address on the node's NAT segment,
 > resolves cluster DNS, reaches ClusterIP Services, and is itself reachable through its own
-> Service's ClusterIP on the same node. See [limitations.md](limitations.md) for the full measured
+> Service's ClusterIP on the same node. See [Limitations](limitations.md) for the full measured
 > picture, including what is still not wired.
 >
 > It ships **EXPERIMENTAL** and **`linux/arm64` only** (`linux/amd64` needs in-guest translation
@@ -27,10 +27,10 @@ you depend on it.
 Use `vm` when a workload must not share the `_k3sm` trust domain with its neighbors — untrusted code,
 tenant isolation, or anything you would isolate with a strong boundary on Linux. It is EXPERIMENTAL and
 preview-quality, so validate your own workload against it before relying on it for production
-isolation — see [limitations.md](limitations.md) for what is measured and what is not yet wired. This
-is the same framing as [concepts.md](concepts.md): the default native path is **not** a security
+isolation — see [Limitations](limitations.md) for what is measured and what is not yet wired. This
+is the same framing as [Concepts](concepts.md): the default native path is **not** a security
 boundary between Pods; `vm` is. The rationale and the trust-domain analysis live in
-[privilege-model.md](../privilege-model.md).
+[the privilege model](../privilege-model.md).
 
 ## Using it
 
@@ -55,7 +55,7 @@ spec:
 The `tolerations` entry is **required**, and is not specific to `vm`: every k3sm node carries the
 `k3sm.io/provider:NoSchedule` taint, so a Pod that does not tolerate it stays `Pending` with
 `untolerated taint` rather than running. Admission warns about a missing toleration but only injects
-one for DaemonSet Pods. The same stanza appears in [quickstart.md](quickstart.md).
+one for DaemonSet Pods. The same stanza appears in [Quickstart](quickstart.md).
 
 The image must be `linux/arm64`. An `amd64`-only image is refused at pull with a message naming the
 mismatch — it is never started and left to crash:
@@ -73,7 +73,7 @@ Pods without `runtimeClassName: vm` use the default native-process runtime and t
 - **Fidelity** — as an EXPERIMENTAL path, treat behavior as preview-quality and validate your workload.
 - **Fallback posture** — when a Seatbelt SPI symbol-canary trips on the native path, the runtime degrades
   to `vm` or refuse-to-run, never to an unconfined process (see
-  [privilege-model.md](../privilege-model.md)).
+  [the privilege model](../privilege-model.md)).
 
 ## Node capability labels
 
@@ -198,14 +198,14 @@ kubectl get nodes -L k3sm.io/rosetta,k3sm.io/rosetta-linux
 
 Until step 2, a Pod selecting `k3sm.io/rosetta` stays `Pending` with no node to bind to. The **reverse**
 direction — a node that *loses* a capability — has a documented ceiling; see
-[limitations.md](limitations.md#node-capability-labels-are-probed-once-at-daemon-start).
+[Limitations](limitations.md#node-capability-labels-are-probed-once-at-daemon-start).
 
 If the label still does not appear after a restart, `k3sm` logs the reason it withheld each capability
 (the runtimed condition's `reason`, e.g. `NotInstalled` / `TranslationFailed` / `NotSupported` /
-`VMBackendUnavailable`) at node bring-up. See [troubleshooting.md](troubleshooting.md).
+`VMBackendUnavailable`) at node bring-up. See [Troubleshooting](troubleshooting.md).
 
 ## Next
 
-- [limitations.md](limitations.md) — the no-per-pod-uid-isolation gap in context.
-- [concepts.md](concepts.md) — the trust-domain model.
-- [troubleshooting.md](troubleshooting.md) — a capability label that will not appear.
+- [Limitations](limitations.md) — the no-per-pod-uid-isolation gap in context.
+- [Concepts](concepts.md) — the trust-domain model.
+- [Troubleshooting](troubleshooting.md) — a capability label that will not appear.

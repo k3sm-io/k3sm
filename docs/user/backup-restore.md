@@ -7,7 +7,7 @@ restoring it is how you protect and recover a cluster.
 
 The control-plane state of record is the kine/SQLite database under the server work directory (the
 `db/state.db` family, including its WAL). This is distinct from **PersistentVolume data**, which lives in
-local-path directories on each node (see [storage.md](storage.md)) and must be backed up separately.
+local-path directories on each node (see [Storage](storage.md)) and must be backed up separately.
 
 Three things back it up: **`k3sm snapshot save`** (below) on your own schedule, the automatic
 pre-upgrade backup k3sm takes when a release changes the datastore engine, and the file-level
@@ -37,7 +37,7 @@ The work directory is owned by the `_k3sm` service user, so run it under `sudo` 
 **Copy it off the node.** The default location is the same volume as the cluster it protects, which
 does not survive losing that volume. `--out` onto another disk or host is the better habit.
 
-The snapshot does **not** contain PersistentVolume data — see [storage.md](storage.md).
+The snapshot does **not** contain PersistentVolume data — see [Storage](storage.md).
 
 ## `k3sm snapshot restore` — putting one back
 
@@ -165,7 +165,7 @@ If the objects are missing or the datastore check reports a non-WAL journal, sto
 ## Rolling back to the previous kine as well
 
 If you are restoring a `state.db.pre-<version>.bak` **because** a version move went wrong, install the
-previous k3sm binary too (see [upgrade.md](upgrade.md) § Rollback). The preserved
+previous k3sm binary too (see [Upgrade](upgrade.md) § Rollback). The preserved
 `kine.pre-<version>` binary beside the backup is there for that case: the superseded kine pin cannot be
 rebuilt from source without a module proxy that still carries it, so those bytes are the copy you have.
 
@@ -187,7 +187,7 @@ rebuilt from source without a module proxy that still carries it, so those bytes
 
 Single-node datastore reads are **consistent-LIST**; under heavy churn there is a **potential
 watch-staleness** posture that is **soak-pending** validation. Factor that into recovery expectations —
-see [limitations.md](limitations.md).
+see [Limitations](limitations.md).
 
 ## HA / Postgres
 
@@ -203,6 +203,6 @@ again.
 
 ## Next
 
-- [upgrade.md](upgrade.md) — what happens to the datastore across a version move.
-- [ha.md](ha.md) — the Postgres datastore and its own backup path.
-- [storage.md](storage.md) — backing up PV data separately.
+- [Upgrade](upgrade.md) — what happens to the datastore across a version move.
+- [HA](ha.md) — the Postgres datastore and its own backup path.
+- [Storage](storage.md) — backing up PV data separately.

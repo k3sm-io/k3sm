@@ -34,7 +34,7 @@ Darwin process under a Seatbelt profile.
       command: ["/opt/myapp/bin/myapp", "--flag"]
 ```
 
-See [images.md](images.md) for both conventions in full.
+See [Images](images.md) for both conventions in full.
 
 ## What does not run, and why
 
@@ -49,7 +49,7 @@ act on it.
 
 `linux/arm64` payloads are the job of the [`vm` RuntimeClass](vm-runtimeclass.md), which runs a
 micro-VM per Pod. **It is EXPERIMENTAL and preview-quality** — read that page and
-[limitations.md](limitations.md) before planning around it.
+[Limitations](limitations.md) before planning around it.
 
 ## From a Dockerfile to a running Pod
 
@@ -83,7 +83,7 @@ kubectl logs myapp
 `k3sm build` accepts a COPY-only Dockerfile subset — it packages files, it does not execute them, so
 `RUN` is refused. `FROM` takes `scratch` or a registry reference; a named base is fetched for
 `darwin/arm64` and refused if it declares any other platform. The full subset, and every deliberate
-difference from `docker build`, is in [images.md](images.md).
+difference from `docker build`, is in [Images](images.md).
 
 ## What carries over from Docker and Kubernetes
 
@@ -134,4 +134,4 @@ The default path runs **Mac-native workloads** — including ones that need Meta
 toolchain around them. Unmodified `linux/arm64` images run too, opt-in, through the EXPERIMENTAL
 `vm` RuntimeClass described above; `linux/amd64` images do not run yet. If your workload is a
 Linux binary you cannot rebuild and the `vm` path does not cover it,
-[limitations.md](limitations.md) has the full picture.
+[Limitations](limitations.md) has the full picture.

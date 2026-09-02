@@ -4,7 +4,7 @@ Joining more than one Mac into a single k3sm cluster.
 
 > **Status: EXPERIMENTAL.** Multi-node ships as documented **EXPERIMENTAL** and is **not**
 > launch-blocking; its de-EXPERIMENTAL graduation is the **v0.3** milestone. Treat it as
-> preview-quality until then. See [limitations.md](limitations.md).
+> preview-quality until then. See [Limitations](limitations.md).
 
 ## The model
 
@@ -45,13 +45,13 @@ the node — the `MeshPeer` records carry public keys only.
 
 - Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
   EXPERIMENTAL — validate cross-node resolution for your own workload rather than assuming it. See
-  [limitations.md](limitations.md).
+  [Limitations](limitations.md).
 - A cluster upgrade is a **node-by-node** rolling restart of the launchd daemons; see
-  [upgrade.md](upgrade.md).
-- For a highly-available control plane, see [ha.md](ha.md) (also EXPERIMENTAL).
+  [Upgrade](upgrade.md).
+- For a highly-available control plane, see [HA](ha.md) (also EXPERIMENTAL).
 
 ## Next
 
-- [ha.md](ha.md) — HA control plane.
-- [upgrade.md](upgrade.md) — the rolling-restart model.
-- [troubleshooting.md](troubleshooting.md) — join and mesh failures.
+- [HA](ha.md) — HA control plane.
+- [Upgrade](upgrade.md) — the rolling-restart model.
+- [Troubleshooting](troubleshooting.md) — join and mesh failures.

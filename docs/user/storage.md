@@ -49,18 +49,18 @@ Mount it in a Pod as usual; the provisioner allocates a local-path PV with node 
 A claim mounted by a `runtimeClassName: vm` Pod works the same way and is reached over a virtiofs share
 rather than a bind mount. Its data is durable across the Pod's lifetime: files written in the guest land
 on the host under the claim's directory, owned by the `_k3sm` service user. See
-[vm-runtimeclass.md](vm-runtimeclass.md) for the ownership ceilings that follow from that.
+[`vm` RuntimeClass](vm-runtimeclass.md) for the ownership ceilings that follow from that.
 
 ## What is not supported (yet)
 
 - **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present — see
-  [limitations.md](limitations.md).
+  [Limitations](limitations.md).
 - **`hostPath` bind mounts** and `terminationMessagePath` file mounts are a documented ceiling on the
-  native substrate (no Linux bind mounts) — see [limitations.md](limitations.md).
+  native substrate (no Linux bind mounts) — see [Limitations](limitations.md).
 - Networked / distributed storage classes are out of scope for the local-path model.
 
 ## Next
 
-- [concepts.md](concepts.md) — the storage model in context.
-- [backup-restore.md](backup-restore.md) — the control-plane datastore (distinct from PV data).
-- [limitations.md](limitations.md) — the storage ceilings.
+- [Concepts](concepts.md) — the storage model in context.
+- [Backup & restore](backup-restore.md) — the control-plane datastore (distinct from PV data).
+- [Limitations](limitations.md) — the storage ceilings.
