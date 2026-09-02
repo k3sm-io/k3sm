@@ -125,5 +125,7 @@ That removes the serving workload, both Services, and the cache PVC. The underly
   than downloaded into it — see step 2.
 - `spec.distributed` is reserved for future multi-node sharded serving and is rejected today. One model
   serves from one node.
+- The **Apple Neural Engine is not a serving target**. MLX runs on the GPU; Apple publishes no stable
+  API for scheduling ANE work, so k3sm has no ANE path planned.
 - Memory accounting covers the serving process group; the context window is pinned from `memory` so the
   cache cannot grow past the limit mid-generation.
