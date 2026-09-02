@@ -47,6 +47,24 @@ when the release is published.
   standard `local-registry-hosting` ConfigMap is published in `kube-public` so tools can discover the
   port. Off unless you ask for it.
 
+- **Image commands work on a stock install.** The server now serves the daemon's control
+  socket, so `k3sm image ls`, `df`, `prune`, `load`, and `import` no longer need a separately
+  started daemon. The socket is owner-only; the pod sandbox denies it to workloads.
+- **The rest of the image verb set.** `k3sm image pull` (warm/pin an image through the same
+  verified path a Pod pull takes), `tag` and `untag` (names are edges over digest-pinned
+  content — untag removes a name, never bytes; bytes are reclaimed only by reachability-driven
+  prune), `inspect`, `save` (verified OCI-layout export), and `push` straight out of the
+  node's store.
+- **Images travel across the cluster.** A node with the registry enabled advertises it to the
+  cluster; when another node's Pod names a `localhost:<port>/...` image it doesn't have, the
+  pull falls back to the advertising peers over the encrypted node mesh — content still
+  digest-verified on arrival, pushes still credential-gated. Nodes read the advertisements
+  through a purpose-made namespace with the narrowest possible grant.
+- **Linux-guest Pods can reach the node registry.** The registry is relayed onto the node's
+  guest-network gateway address, so a Pod running under the Linux RuntimeClass can pull from —
+  and, with the push credential, push to — the node's own registry. This is what lets an
+  in-cluster build Pod publish its result without any external registry.
+
 ### Known Limitations
 
 - `stdinOnce` is accepted but **not honored** — a container that sets it behaves as though it were
