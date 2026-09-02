@@ -443,6 +443,42 @@ Two further properties of the guest network:
   is **denied**, not silently allowed, at any destination a NetworkPolicy selects — and the resulting
   deny is logged plainly, naming what was denied and why.
 
+### `vm` Pods: Interactive Sessions — What Attach Carries, and What It Does Not
+
+`kubectl exec -it` and `kubectl attach` both work on the `vm` path — see
+[`vm` RuntimeClass](vm-runtimeclass.md). Three things about attach are worth knowing before you
+build a workflow on it.
+
+**`stdinOnce` is not honored.** A container that sets `stdinOnce: true` behaves as though it had set
+`false`: stdin stays open across attaches, and the first client to detach neither closes it nor ends
+the container. Kubernetes uses that field to model "one interactive session, then done"; k3sm does
+not implement it, and accepts it silently rather than rejecting it at admission. If a workload
+depends on stdin reaching EOF when the operator walks away, do not rely on `stdinOnce` to deliver it.
+
+**Attach replays a bounded buffer, so a screen can start out wrong.** Attaching replays the most
+recent output the guest still holds — bounded to **64 KiB**, and to 4096 separate writes — and then
+follows live. Two consequences for a full-screen program: the replay can begin in the middle of an
+escape sequence, and a client too slow to keep up has bytes dropped on purpose, with an in-band
+notice saying so. Dropping is the deliberate choice: the alternative is blocking the workload on its
+own `stdout` because somebody's terminal is slow. Both render as a garbled line or two. Redraw with
+`Ctrl-L` — nothing is wrong with the process.
+
+**An out-of-date guest refuses rather than misbehaves.** A Pod booted from a guest image that
+predates these verbs answers `exec -it` and `attach` with a message naming the fix — recreate the Pod
+so it boots the guest image this node pins — instead of a bare "not implemented". This only arises
+under a development override that points a node at a guest image it does not pin; an ordinary node
+pins that image in the binary and cannot reach the mismatch.
+
+### `kubectl attach` on the Default Native Path Is Output-Only
+
+On the default native runtime a container is a Darwin process started with its combined output wired
+to the log pipe and **no retained stdin**, so there is no descriptor left to feed input to a process
+that is already running. `kubectl attach` there serves the output half faithfully — it replays the
+buffered output, follows new output live, and delivers the exit code — but `kubectl attach -i` or
+`-t` is reported `Unimplemented` rather than quietly discarding what you type. Use `kubectl exec -it`,
+which does allocate a terminal on the native path, or the [`vm` RuntimeClass](vm-runtimeclass.md),
+whose guest keeps these endpoints from the moment the container starts.
+
 ### `vm` Pods: Isolation Posture
 
 The process that constructs and drives a `vm` Pod's guest runs confined under the **same Seatbelt

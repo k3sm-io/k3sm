@@ -75,6 +75,10 @@ k3sm image ls
 k3sm build --tag registry.example.com/me/myapp:v1 --output ./layout --format oci .
 k3sm image push ./layout registry.example.com/me/myapp:v1
 
+# 2c. ...or push it to this node's own registry, if you started one
+k3sm build --tag localhost:6450/myapp:v1 --output ./layout --format oci .
+k3sm image push ./layout localhost:6450/myapp:v1
+
 # 3. run it
 kubectl run myapp --image=myapp:v1
 kubectl logs myapp
@@ -84,6 +88,12 @@ kubectl logs myapp
 `RUN` is refused. `FROM` takes `scratch` or a registry reference; a named base is fetched for
 `darwin/arm64` and refused if it declares any other platform. The full subset, and every deliberate
 difference from `docker build`, is in [Images](images.md).
+
+Step 2c needs the node's own registry running — it is off unless you pass `--registry-port` (or use
+`k3sm dev`, which turns it on for you). It is worth the extra step when you want the *real* pull
+path: a Pod referencing `localhost:<port>/…` honors `imagePullPolicy: Always`, notices a moved tag,
+and fails the way a remote registry would, none of which `k3sm image load` can reproduce. See
+[Node-local registry](registry.md).
 
 ## What Carries Over From Docker and Kubernetes
 

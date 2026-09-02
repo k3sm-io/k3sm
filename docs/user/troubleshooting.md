@@ -123,6 +123,37 @@ path yet (the event pipeline is planned), so the log file is the only place the 
 k3sm ships no metrics-server and has no CPU accounting; install a metrics-server operator if you need the
 `metrics.k8s.io` verb. See [kubectl access](kubectl-access.md) and [Limitations](limitations.md).
 
+## `kubectl exec -it` or `attach` Into a Linux Pod Is Refused
+
+Both verbs are served by the Pod's guest, so the refusal message says which half is missing.
+
+- **"…does not advertise the … capability … recreate the pod"** — the Pod is running a guest image
+  older than the one this node pins, which can only happen under a development override. Delete and
+  recreate the Pod so it boots the pinned image.
+- **`FailedPrecondition` on attach** — the container kept no stdin to write to. Set `stdin: true`
+  (and `tty: true` if you want a terminal) on the container and recreate the Pod; stdio is decided
+  when the container starts, not when you attach.
+- **`Unimplemented` on `kubectl attach -i` / `-t`** — that Pod is on the default native path, where
+  attach is output-only. Use `kubectl exec -it`, or the `vm` RuntimeClass. See
+  [Limitations](limitations.md).
+
+A garbled first screen after attaching is not a failure — attach replays a bounded buffer and can
+start mid-escape-sequence. Redraw with `Ctrl-L`.
+
+## A Pod Cannot Pull From the Node-Local Registry
+
+- **Connection refused** — the registry is **off by default**. Start the server with
+  `--registry-port <port>` (or use `k3sm dev`, which enables it), and read the published port back
+  from the `local-registry-hosting` ConfigMap in `kube-public` rather than remembering it.
+- **A Pod under `runtimeClassName: vm` cannot reach it at all.** The guest has its own loopback, and
+  the registry listens only on the node's. That is a documented ceiling, not a misconfiguration: use
+  a registry the guest can reach, or load the image into the node's store directly.
+- **Push denied** — pushes need the per-boot credential, pulls do not. If the control plane runs as
+  a different user than the one you are pushing from, point push at its state directory with
+  `--work-dir`.
+
+See [Node-local registry](registry.md) for the full model.
+
 ## Certificate Nearing Expiry
 
 Component certificates are re-issued on every control-plane boot, so a restart renews them.
