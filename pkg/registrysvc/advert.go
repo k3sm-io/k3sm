@@ -41,14 +41,25 @@ import (
 // read only by k3sm's own image puller. Folding a per-node address into the
 // singleton would make the last writer the only reachable node.
 //
-// It lives in the SAME namespace as the KEP-1755 document, which is
-// world-readable by design — correct here for the same reason it is correct
-// there: the document carries an address, never a credential. Pull inside the
-// mesh is anonymous; the push credential stays on loopback and is never
-// distributed (see the package doc's access section).
+// It lives in its OWN namespace rather than beside the KEP-1755 document in
+// kube-public, and the reason is the READER's grant, not the content. A node's
+// image puller must list and watch these objects, and neither verb can be
+// narrowed to a set of names — RBAC's resourceNames does not apply to list or
+// watch — so whatever namespace holds them is the exact scope of the grant a
+// node identity gets. In kube-public that grant would have read every object
+// any component ever parks there; here it reads registry advertisements and
+// nothing else. The KEP-1755 document STAYS in kube-public, which is its
+// KEP-mandated home.
+//
+// The objects themselves remain address-only: a peer's pull inside the mesh is
+// anonymous, and the push credential stays on loopback and is never distributed
+// (see the package doc's access section). The namespace narrows who can read
+// what, not what is safe to publish.
 const (
-	// AdvertisementNamespace is where a node publishes its advertisement.
-	AdvertisementNamespace = HostingNamespace
+	// AdvertisementNamespace is where a node publishes its advertisement. It is
+	// provisioned at server bring-up (pkg/rbac) together with the Role that lets
+	// a node identity read it.
+	AdvertisementNamespace = "k3sm-registry"
 	// AdvertisementPrefix prefixes every advertisement's ConfigMap name. A reader
 	// selects the set by this prefix, so a name outside it is not an
 	// advertisement however similar it looks.

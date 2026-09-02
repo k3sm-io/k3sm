@@ -205,11 +205,12 @@ func (s *Source) Mirrors(string) []image.Mirror {
 }
 
 // isAdvertisement reports whether a ConfigMap name is in the advertisement set.
-// The namespace is shared with the KEP-1755 hosting document and with whatever
-// else a cluster puts in a world-readable namespace, so the prefix is the
-// membership test — and ParseAdvertisement re-checks it, because a reader that
-// trusted the name alone would accept any object an operator named to look like
-// one.
+// The namespace is k3sm's own and holds nothing else today, but the prefix stays
+// the membership test rather than the namespace: nothing stops an operator or a
+// future component from putting a ConfigMap there, and a reader that treated
+// every object in a namespace as an advertisement would dial whatever it found.
+// ParseAdvertisement re-checks the prefix for the same reason — a reader that
+// trusted the name alone would accept any object named to look like one.
 func isAdvertisement(name string) bool {
 	return strings.HasPrefix(name, registrysvc.AdvertisementPrefix)
 }

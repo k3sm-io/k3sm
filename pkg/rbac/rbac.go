@@ -21,12 +21,15 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	netv1 "k3sm.io/apis/net/v1"
+
+	"k3sm.io/k3sm/pkg/registrysvc"
 )
 
 // nodeDatapathRole / inPodReaderRole are the cluster-scoped / namespaced names of
@@ -37,6 +40,15 @@ const (
 	nodeDatapathRole = "k3sm:node-datapath"
 	inPodReaderRole  = "k3sm:in-pod-reader"
 )
+
+// registryAdvertReaderRole is the namespaced Role (and its RoleBinding) that lets
+// a node identity read the per-node registry advertisements. It is named without
+// the "k3sm:" prefix because it is the object an operator inspects when a
+// cross-node image pull does not fall back, and a bare name is what
+// `kubectl get role -n k3sm-registry` reads back; the collision the prefix
+// guards against does not arise for a namespaced object in a k3sm-owned
+// namespace.
+const registryAdvertReaderRole = "k3sm-registry-advert-reader"
 
 // systemNodesGroup is the group every joined worker's system:node:<name> client
 // cert carries (O=system:nodes). The node-datapath ClusterRoleBinding binds the
@@ -111,7 +123,10 @@ func ensureGraph(ctx context.Context, cs kubernetes.Interface) error {
 	if err := ensureNodeDatapathRBAC(ctx, cs); err != nil {
 		return err
 	}
-	return ensureInPodReaderRBAC(ctx, cs, ConformanceNamespace, ConformanceServiceAccount)
+	if err := ensureInPodReaderRBAC(ctx, cs, ConformanceNamespace, ConformanceServiceAccount); err != nil {
+		return err
+	}
+	return ensureRegistryAdvertReaderRBAC(ctx, cs)
 }
 
 // ensureNodeDatapathRBAC provisions the node-datapath ClusterRole + its
@@ -195,6 +210,74 @@ func ensureInPodReaderRBAC(ctx context.Context, cs kubernetes.Interface, ns, sa 
 	}
 	if _, err := api.RoleBindings(ns).Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create in-pod reader role binding in %s: %w", ns, err)
+	}
+	return nil
+}
+
+// ensureRegistryAdvertReaderRBAC provisions the k3sm-registry namespace and the
+// namespaced Role + RoleBinding that let a joined worker's image puller read the
+// per-node registry advertisements (registrysvc.AdvertisementNamespace) — the
+// grant without which a node never learns which peers hold an image it was asked
+// to pull, and a cross-node pull of a `localhost:<port>/…` reference fails on a
+// node that was simply never fed.
+//
+// OPERATOR-APPROVED 2026-09-02 as the narrowest widening available. Approval was
+// asked for because this is the first grant that gives the system:nodes group a
+// read it did not have, and the shape of it is forced: the reader is a shared
+// informer, so it needs list and watch, and RBAC's resourceNames narrows GET but
+// has NO effect on list or watch — a rule cannot say "watch only the objects
+// named k3sm-node-registry-*". THE NAMESPACE IS THEREFORE THE SCOPE. Putting the
+// advertisements in their own namespace (rather than beside the KEP-1755
+// document in kube-public, where they used to live) is what makes the grant read
+// exactly these objects and nothing any other component parks in a shared
+// namespace. The verbs are read-only for the same reason: a node publishes its
+// OWN advertisement through the server, never through this identity.
+//
+// The namespace is created HERE, next to the Role that is meaningless without
+// it: a Role create into an absent namespace fails, so the two are one
+// provisioning step rather than an ordering an unrelated caller has to know
+// about. Create-tolerate-AlreadyExists throughout, so a restart is a no-op.
+func ensureRegistryAdvertReaderRBAC(ctx context.Context, cs kubernetes.Interface) error {
+	ns := registrysvc.AdvertisementNamespace
+
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: managedLabels()},
+	}
+	if _, err := cs.CoreV1().Namespaces().Create(ctx, namespace, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the %s namespace: %w", ns, err)
+	}
+
+	api := cs.RbacV1()
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: registryAdvertReaderRole, Labels: managedLabels()},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"configmaps"}, Verbs: []string{"get", "list", "watch"}},
+		},
+	}
+	if _, err := api.Roles(ns).Create(ctx, role, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the registry advertisement reader role in %s: %w", ns, err)
+	}
+
+	binding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: registryAdvertReaderRole, Labels: managedLabels()},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     registryAdvertReaderRole,
+		},
+		// The same system:nodes GROUP the node-datapath ClusterRoleBinding names —
+		// every joined worker's client cert carries O=system:nodes, and the reader
+		// is the node's own puller, not a workload ServiceAccount. Referenced,
+		// never authored (see doc.go).
+		Subjects: []rbacv1.Subject{{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Group",
+			Name:     systemNodesGroup,
+		}},
+	}
+	if _, err := api.RoleBindings(ns).Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the registry advertisement reader role binding in %s: %w", ns, err)
 	}
 	return nil
 }
