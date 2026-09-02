@@ -338,16 +338,38 @@ func serviceGID() int {
 	return 0
 }
 
-// listenNetd creates the root-owned socket directory, removes any stale socket,
+// listenNetd ensures the SHARED run directory, removes any stale socket,
 // listens, and sets the socket group + 0660 mode so the _k3sm control plane can
 // connect (the SCM_CREDS uid verifier is the authoritative peer gate on top).
+//
+// The directory is shared with the _k3sm daemon's own control socket, and the
+// ownership POLICY belongs to `k3sm install` (EnsureRunDir: _k3sm:staff 0700).
+// netd runs as root, so it needs no ownership of the directory to create its
+// socket inside it — and taking ownership here is exactly the boot-order bug
+// that locked the service user out of its own socket dir (observed live
+// 2026-09-02: install set _k3sm 0700, netd re-owned root:wheel on bootstrap,
+// the server's dial then failed permission-denied in a crash loop). netd
+// therefore ALIGNS the directory to the install policy when it can name the
+// service user, and leaves ownership alone otherwise; it never takes the
+// directory for root.
 func listenNetd(socket string, gid int) (net.Listener, error) {
 	dir := filepath.Dir(socket)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir %s: %w", dir, err)
 	}
-	if err := os.Chown(dir, 0, 0); err != nil {
-		return nil, fmt.Errorf("chown socket dir %s root:wheel: %w", dir, err)
+	if u, err := user.Lookup(install.DefaultServiceUser); err == nil {
+		if uid, uerr := strconv.Atoi(u.Uid); uerr == nil {
+			sgid, gerr := strconv.Atoi(u.Gid)
+			if gerr != nil {
+				sgid = 0
+			}
+			if err := os.Chown(dir, uid, sgid); err != nil {
+				return nil, fmt.Errorf("chown socket dir %s to the service user: %w", dir, err)
+			}
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return nil, fmt.Errorf("chmod socket dir %s 0700: %w", dir, err)
+			}
+		}
 	}
 	// Remove a stale socket from a previous run so Listen does not EADDRINUSE.
 	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {

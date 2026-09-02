@@ -31,17 +31,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
 	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // Reverse-DNS launchd labels for the two daemons (io.k3sm.* per the project
@@ -77,28 +83,37 @@ const (
 	// DefaultDataRoot is the _k3sm-owned data root (the _k3sm home): the
 	// control-plane work-dir, runtimed pods/storage/image cache live under it.
 	DefaultDataRoot = "/var/lib/k3sm"
+	// DefaultRunDir is the runtime run directory under the default data root: the
+	// directory half of every k3sm rendezvous socket (netd.sock, runtimed.sock,
+	// the per-pod vm agent sockets) and of the mesh key dir. It is composed from
+	// runtimed's OWN subdir name rather than re-typed, so the directory the
+	// installer prepares and the one provider.RuntimedSocketPath binds inside can
+	// never drift; RunDir is the same derivation for a non-default data root.
+	DefaultRunDir = DefaultDataRoot + "/" + sandbox.RunSubdir
 	// DefaultNetdSocket is the root netd unix socket the daemons rendezvous on.
-	DefaultNetdSocket = "/var/lib/k3sm/run/netd.sock"
+	DefaultNetdSocket = DefaultRunDir + "/netd.sock"
 	// DefaultAPIServerPort is the apiserver secure port (avoids Docker's :6443).
 	DefaultAPIServerPort = 6444
 	// DefaultServiceCIDR is the cluster Service CIDR the netd daemon pins so the
 	// proxy's ClusterIP VIP aliases are admitted.
 	DefaultServiceCIDR = "10.43.0.0/16"
-	// MeshKeyDir is the root-only directory the netd MeshKeyResolver reads.
-	MeshKeyDir = "/var/lib/k3sm/run/keys"
+	// MeshKeyDir is the directory the netd MeshKeyResolver reads the node's
+	// wireguard private key from. It lives inside the run dir, whose owner is the
+	// service user — see EnsureRunDir for what that ownership does and does not
+	// fence off.
+	MeshKeyDir = DefaultRunDir + "/keys"
 	// VMRunDir is the per-pod guest-agent socket directory runtimed binds under,
-	// as the SERVICE USER. It must be pre-created here because its parent
-	// (/var/lib/k3sm/run) is root:wheel — netd owns that directory so an
-	// unprivileged process cannot replace netd.sock — and an unprivileged
-	// mkdir inside a root-owned directory is EACCES. Only root can carve this
-	// one _k3sm-owned subdirectory out, and only the installer runs as root.
+	// as the SERVICE USER. It is pre-created by the installer for the same reason
+	// the run dir itself is: only root can hand the service user a directory
+	// under /var/lib, and an install over a tree an earlier build left root-owned
+	// must repair the ownership rather than leave it unusable.
 	//
 	// The path mirrors runtimed's guestAgentSocket derivation
 	// (<runtimed root>/run/vm/<podID>/agent.sock). Without it every vm pod dies
 	// at boot with "agent socket dir: mkdir /var/lib/k3sm/run/vm: permission
 	// denied" (FAILURE_REASON_SANDBOX_SETUP) on an otherwise healthy, entitled
 	// Mac — i.e. the whole vm RuntimeClass is unusable on a stock install.
-	VMRunDir = "/var/lib/k3sm/run/vm"
+	VMRunDir = DefaultRunDir + "/vm"
 	// LogDir is where the daemons' stdout/stderr are written.
 	LogDir = "/var/log/k3sm"
 )
@@ -107,6 +122,26 @@ const (
 // The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
 // message) name it, so the two can never drift apart.
 func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
+
+// RunDir returns the runtime run directory for a data root: <dataRoot>/run, with
+// an empty dataRoot meaning runtimed's default work dir. It is the DIRECTORY the
+// node's runtimed control-socket listener binds inside — the same derivation
+// provider.RuntimedSocketPath performs on the socket itself, composed from
+// runtimed's exported subdir name rather than a second literal so the directory
+// the installer prepares is by construction the one the listener needs.
+//
+// That single-sourcing is load-bearing, not tidiness. The run dir was created by
+// whichever daemon reached it first, which is root netd — leaving it root:wheel,
+// so the _k3sm server's bind of <run>/runtimed.sock failed EACCES, the node's
+// bounded retry gave up, and the control socket was silently disabled on an
+// otherwise healthy install. Install now prepares it explicitly, before either
+// daemon bootstraps.
+func RunDir(dataRoot string) string {
+	if dataRoot == "" {
+		dataRoot = sandbox.DefaultWorkDir
+	}
+	return filepath.Join(dataRoot, sandbox.RunSubdir)
+}
 
 // System is the privileged-operation seam install/uninstall drive. The real
 // darwin implementation performs the root syscalls/tools; tests inject a fake so
@@ -131,6 +166,29 @@ type System interface {
 	// spawns (the live M2-gate failure this fixes). Idempotent: perms/owner are
 	// re-applied on every install, repairing a previously mis-created dir.
 	EnsureLogDir(dir string, uid uint32) error
+	// EnsureRunDir creates (or repairs) the runtime run directory owned by the
+	// service uid (group staff, 0700) — the directory the _k3sm node binds its
+	// runtimed control socket in (RunDir / provider.RuntimedSocketPath), and the
+	// parent of the vm guest-agent socket dir and the mesh key dir.
+	//
+	// It must run BEFORE either daemon bootstraps. Whichever daemon starts first
+	// creates a missing run dir, and that is root netd — which left it root:wheel,
+	// so the unprivileged server could not create runtimed.sock there and its
+	// control socket was disabled after a bounded retry. Only root can hand the
+	// directory to the service user, and only the installer runs as root.
+	//
+	// Owner and mode are re-applied on every install, repairing a tree an earlier
+	// build left root-owned instead of silently keeping the socket unbindable.
+	//
+	// What the ownership does NOT fence off, stated plainly: root netd still
+	// creates netd.sock and reads MeshKeyDir inside a directory the service user
+	// owns (root bypasses the mode), so _k3sm — the control plane, which already
+	// drives netd over that socket — can rename or replace either. That is a
+	// smaller trust surface than it looks (netd takes its orders from _k3sm
+	// regardless), and it is the price of the service user owning the one
+	// directory it must write in; per-uid isolation is the vm RuntimeClass's job,
+	// not this directory's.
+	EnsureRunDir(dir string, uid uint32) error
 	// EnsureVMRunDir creates (or repairs) the vm guest-agent socket directory
 	// owned by the service uid (group staff, 0700). runtimed binds a per-pod
 	// socket under it as _k3sm, but its parent is root-owned so the
@@ -141,6 +199,12 @@ type System interface {
 	EnsureVMRunDir(dir string, uid uint32) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
+	// ReadFile reads a root-readable file: the installed server plist, whose
+	// operator-supplied arguments a reinstall must carry over, and the cluster CA
+	// the admin kubeconfig pins. A missing file returns an error satisfying
+	// errors.Is(err, fs.ErrNotExist), which callers treat as "nothing to carry
+	// over" rather than a failure — a FIRST install has neither file.
+	ReadFile(path string) ([]byte, error)
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
 	LaunchctlBootstrap(label string) error
 	// LaunchctlBootout unloads the labelled daemon (idempotent: a not-loaded
@@ -226,7 +290,20 @@ type Config struct {
 	// AdminToken is the static bearer token shared between the server LaunchDaemon
 	// (--token) and the admin kubeconfig. Generated when empty.
 	AdminToken string
-	Logger     *slog.Logger
+	// ExtraServerArgs are operator-supplied `k3sm server` arguments appended to
+	// the fixed set ServerPlist renders (--mesh-ip, --registry-port, …). Install
+	// populates it from the ARGUMENTS OF THE PLIST ALREADY ON DISK, so a reinstall
+	// preserves what an operator configured instead of re-rendering the bare
+	// template over it; a first install leaves it empty. AdminKubeconfig reads
+	// --mesh-ip out of it to address the apiserver where it actually binds.
+	ExtraServerArgs []string
+	// ClusterCA is the cluster CA certificate PEM the admin kubeconfig pins as
+	// certificate-authority-data. Install reads it off disk on a mesh install (the
+	// only posture in which the apiserver serves a cluster-CA-signed leaf); empty
+	// keeps the single-node insecure-skip-tls-verify posture, which is the only
+	// correct one against a self-signed serving cert.
+	ClusterCA []byte
+	Logger    *slog.Logger
 }
 
 func (c Config) withDefaults() Config {
@@ -271,6 +348,25 @@ func (c Config) withDefaults() Config {
 	}
 	return c
 }
+
+// runDir is the runtime run directory for this Config's data root — the one the
+// installer prepares for the service user (see RunDir).
+func (c Config) runDir() string { return RunDir(c.DataRoot) }
+
+// serverWorkDir is the control-plane state root the _k3sm server resolves under
+// its home (executor.ResolveWorkDir's unprivileged branch: <home>/server, and the
+// _k3sm home IS DataRoot). The installer needs it to read the PKI the running
+// control plane wrote there; it is a Config accessor so the leaf name is not
+// re-typed at each use.
+func (c Config) serverWorkDir() string { return filepath.Join(c.DataRoot, "server") }
+
+// meshIP returns the --mesh-ip value carried in ExtraServerArgs, or "" when the
+// server runs single-node. It is the discriminator between the two apiserver
+// postures the admin kubeconfig must address: a mesh server binds its wireguard
+// IP ONLY and serves a cluster-CA-signed leaf, so a loopback URL reaches nothing
+// and the cluster CA is the right anchor; single-node binds loopback and
+// self-signs, for which no CA on disk is the anchor.
+func (c Config) meshIP() string { return flagValue(c.ExtraServerArgs, "mesh-ip") }
 
 // installedBinary is the path the k3sm binary is copied to.
 func (c Config) installedBinary() string {
@@ -492,11 +588,22 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
 	}
 
-	// 1c. The vm guest-agent socket dir, for the same class of reason: runtimed
-	//     binds <VMRunDir>/<podID>/agent.sock as _k3sm, but /var/lib/k3sm/run is
-	//     root-owned (netd owns netd.sock there), so the unprivileged mkdir is
-	//     EACCES and every vm-RuntimeClass pod fails to boot. Root carves out
-	//     this one subdirectory; netd.sock stays unreachable to _k3sm.
+	// 1c. The run dir, BEFORE either daemon bootstraps — because whichever daemon
+	//     starts first creates it, and that is root netd, which left it root:wheel
+	//     0755. The _k3sm server then could not bind <run>/runtimed.sock there
+	//     (EACCES), its bounded retry gave up, and the runtimed control socket was
+	//     silently disabled on an install that otherwise looked healthy. Root netd
+	//     still creates netd.sock inside a service-user-owned directory — root
+	//     bypasses the mode — so ordering this first costs the helper nothing.
+	runDir := cfg.runDir()
+	if err := sys.EnsureRunDir(runDir, uid); err != nil {
+		return fmt.Errorf("install: ensure run dir %s: %w", runDir, err)
+	}
+
+	// 1d. The vm guest-agent socket dir inside it: runtimed binds
+	//     <VMRunDir>/<podID>/agent.sock as _k3sm, and an install over a tree an
+	//     earlier build left root-owned must repair the ownership or every
+	//     vm-RuntimeClass pod fails to boot.
 	if err := sys.EnsureVMRunDir(VMRunDir, uid); err != nil {
 		return fmt.Errorf("install: ensure vm run dir %s: %w", VMRunDir, err)
 	}
@@ -557,6 +664,40 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName))
+
+	// 2d. Carry over the operator-supplied server arguments from the plist ALREADY
+	//     ON DISK. ServerPlist renders a fixed template, so before this a reinstall
+	//     silently dropped every argument a human had added (--mesh-ip,
+	//     --registry-port) and the cluster came back single-node on loopback until
+	//     someone repaired the plist by hand. A first install finds no plist and
+	//     preserves nothing; --token is deliberately NOT preserved (it is
+	//     install-managed and re-minted here, in lockstep with the kubeconfig).
+	extra, err := installedServerArgs(sys, cfg)
+	if err != nil {
+		return err
+	}
+	cfg.ExtraServerArgs = extra
+	if len(extra) > 0 {
+		cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", strings.Join(extra, " "))
+	}
+
+	// 2e. On a mesh install the apiserver serves a CLUSTER-CA-SIGNED leaf, so the
+	//     admin kubeconfig can and must verify it. Read that CA (install runs as
+	//     root; the file is the _k3sm control plane's). Absent on a first install,
+	//     where the control plane has not booted yet — the kubeconfig then falls
+	//     back to the skip-verify posture and the next reinstall picks the CA up.
+	if mesh := cfg.meshIP(); mesh != "" {
+		caPath := certs.ClusterCACertPath(cfg.serverWorkDir())
+		ca, err := sys.ReadFile(caPath)
+		switch {
+		case err == nil:
+			cfg.ClusterCA = ca
+		case errors.Is(err, fs.ErrNotExist):
+			cfg.Logger.Warn("cluster CA not on disk yet; admin kubeconfig keeps insecure-skip-tls-verify until the next install", "path", caPath)
+		default:
+			return fmt.Errorf("install: read cluster CA %s: %w", caPath, err)
+		}
+	}
 
 	// 3. Render + write both plists, in manifest (install) order.
 	for _, a := range m {
@@ -665,7 +806,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// server daemon (a Stop() cut short by launchd's SIGKILL, or a crash). They
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
-	note(sys.ReapOrphans(filepath.Join(cfg.DataRoot, "server", "bin")))
+	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
 	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
 	// no daemon removes on the way out — netd tracks per-connection alias caps
 	// (not cleanup), the server's pod teardown misses anything a failed run
@@ -699,7 +840,7 @@ func NetdPlist(cfg Config) []byte {
 			"--socket", cfg.NetdSocket,
 			"--service-cidr", cfg.ServiceCIDR,
 			"--mesh-key-dir", MeshKeyDir,
-			"--kubeconfig", filepath.Join(cfg.DataRoot, "server", "k3sm.kubeconfig"),
+			"--kubeconfig", filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig"),
 		},
 		RunAtLoad:  true,
 		KeepAlive:  true,
@@ -733,16 +874,24 @@ const serverFileLimit = 131072
 // unprivileged _k3sm user (UserName) execing `k3sm server` (the control plane +
 // VK node), which reaches the root helper over the netd socket. KeepAlive +
 // RunAtLoad make it boot-surviving and headless.
+//
+// The argument list is the fixed managed set followed by Config.ExtraServerArgs
+// — the operator's own arguments, which Install reads off the installed plist so
+// a reinstall does not re-render the bare template over them. They are appended
+// AFTER the managed set (and in their original relative order) so a preserved
+// argument can never displace one this renderer owns.
 func ServerPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
+	args := []string{
+		cfg.installedBinary(), "server",
+		"--runtime", "runtimed",
+		"--token", cfg.AdminToken,
+	}
+	args = append(args, cfg.ExtraServerArgs...)
 	return renderPlist(launchdPlist{
-		Label:    ServerLabel,
-		UserName: cfg.ServiceUser,
-		ProgramArguments: []string{
-			cfg.installedBinary(), "server",
-			"--runtime", "runtimed",
-			"--token", cfg.AdminToken,
-		},
+		Label:            ServerLabel,
+		UserName:         cfg.ServiceUser,
+		ProgramArguments: args,
 		RunAtLoad:        true,
 		KeepAlive:        true,
 		WorkingDirectory: cfg.DataRoot,
@@ -760,18 +909,47 @@ func ServerPlist(cfg Config) []byte {
 	})
 }
 
-// AdminKubeconfig renders the admin kubeconfig (loopback apiserver + the shared
-// static token + insecure-skip-tls for the single-node self-signed serving cert)
-// written to the human's home so `kubectl` works once the server is up.
+// adminLoopbackHost is the apiserver address the admin kubeconfig uses on a
+// single-node install: the loopback the control plane binds when no mesh IP is
+// configured. A mesh install overrides it with the mesh IP — see AdminKubeconfig.
+const adminLoopbackHost = "127.0.0.1"
+
+// AdminKubeconfig renders the admin kubeconfig (the apiserver's EFFECTIVE
+// address + the shared static token) written to the human's home so `kubectl`
+// works once the server is up.
+//
+// Two postures, selected by whether the preserved server arguments carry a
+// --mesh-ip (Config.meshIP):
+//
+//   - MESH: the apiserver binds its wireguard IP ONLY and serves a
+//     cluster-CA-signed leaf. The URL is that IP — a loopback URL addresses
+//     nothing, which is how a multi-node install shipped an admin kubeconfig that
+//     could not connect at all — and the cluster CA (Config.ClusterCA, read off
+//     disk by Install) is pinned as certificate-authority-data so the connection
+//     is actually verified. An absent CA falls back to skip-verify, because a
+//     first install writes this file before the control plane has minted one.
+//   - SINGLE-NODE: loopback, and insecure-skip-tls-verify — the apiserver
+//     self-signs its serving cert there, so no CA on disk anchors it and pinning
+//     one would break kubectl rather than secure it. This mirrors the executor's
+//     own posture split (writeComponentKubeconfig's verifyClusterCA).
 func AdminKubeconfig(cfg Config) []byte {
 	cfg = cfg.withDefaults()
+	host := adminLoopbackHost
+	clusterTLS := "    insecure-skip-tls-verify: true"
+	if mesh := cfg.meshIP(); mesh != "" {
+		host = mesh
+		if len(cfg.ClusterCA) > 0 {
+			clusterTLS = "    certificate-authority-data: " + base64.StdEncoding.EncodeToString(cfg.ClusterCA)
+		}
+	}
+	server := "https://" + net.JoinHostPort(host, strconv.Itoa(cfg.APIServerPort))
 	return []byte(fmt.Sprintf(`apiVersion: v1
 kind: Config
 clusters:
 - name: k3sm
   cluster:
-    server: "https://127.0.0.1:%d"
-    insecure-skip-tls-verify: true
+    server: %q
+%s
 contexts:
 - name: k3sm
   context:
@@ -782,7 +960,7 @@ users:
 - name: admin
   user:
     token: %s
-`, cfg.APIServerPort, cfg.AdminToken))
+`, server, clusterTLS, cfg.AdminToken))
 }
 
 // launchdPlist is the subset of a launchd job we render. A non-empty UserName

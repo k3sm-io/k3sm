@@ -125,36 +125,44 @@ func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
 	return nil
 }
 
+// EnsureRunDir creates (or repairs) the runtime run dir owned by the service
+// uid, group staff, mode 0700 — the directory the _k3sm node binds its runtimed
+// control socket in. See the System interface for why the installer, not a
+// daemon, must be the one to create it.
+func (darwinSystem) EnsureRunDir(dir string, uid uint32) error {
+	return ensureServiceOwnedDir(dir, uid, "run dir")
+}
+
 // EnsureVMRunDir creates (or repairs) the vm guest-agent socket dir owned by the
-// service uid, group staff, mode 0700 — the parent (/var/lib/k3sm/run) is
-// root:wheel so that _k3sm cannot replace netd.sock, which also means _k3sm
-// cannot mkdir inside it. Root carves out this one subdirectory instead.
+// service uid, group staff, mode 0700.
 //
-// MkdirAll skips an existing directory, so owner and mode are re-applied
-// unconditionally: an install over a tree whose run/vm was left root-owned by an
-// earlier build must be repaired, not silently left unbootable for vm pods.
+// Its PARENT — the run dir — is ensured first, through the same helper and with
+// the same owner and mode. A bare MkdirAll of the leaf would create a missing
+// parent root-owned, which _k3sm could not then traverse; and re-applying the
+// parent's ownership here (rather than assuming Install already did) keeps this
+// function correct on its own terms instead of correct only in one call order.
 func (darwinSystem) EnsureVMRunDir(dir string, uid uint32) error {
-	// The PARENT is created explicitly at 0755 before the leaf. A bare
-	// MkdirAll(dir, 0o700) would create a missing /var/lib/k3sm/run at 0700
-	// root-owned too, and _k3sm — which is only in the group — could then not
-	// even traverse it to reach the directory this function exists to give it.
-	// That is strictly worse than the bug being fixed, and it is invisible
-	// until a vm pod boots, so the parent's mode is asserted, not assumed.
 	parent := filepath.Dir(dir)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return fmt.Errorf("create vm run dir parent %s: %w", parent, err)
+	if err := ensureServiceOwnedDir(parent, uid, "vm run dir parent"); err != nil {
+		return err
 	}
-	if err := os.Chmod(parent, 0o755); err != nil { // repair a 0700 left by an earlier build
-		return fmt.Errorf("chmod vm run dir parent %s 0755: %w", parent, err)
-	}
+	return ensureServiceOwnedDir(dir, uid, "vm run dir")
+}
+
+// ensureServiceOwnedDir creates dir and re-applies owner uid:staff and mode 0700
+// on EVERY call. MkdirAll skips an existing directory, so an install over a tree
+// an earlier build (or a root daemon that got there first) left root-owned is
+// repaired rather than silently left unwritable by the service user. what names
+// the directory in any error, so a failure says which one.
+func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create vm run dir %s: %w", dir, err)
+		return fmt.Errorf("create %s %s: %w", what, dir, err)
 	}
 	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
-		return fmt.Errorf("chown vm run dir %s to %d:staff: %w", dir, uid, err)
+		return fmt.Errorf("chown %s %s to %d:staff: %w", what, dir, uid, err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil { // repair a mis-created mode (MkdirAll skips existing)
-		return fmt.Errorf("chmod vm run dir %s 0700: %w", dir, err)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("chmod %s %s 0700: %w", what, dir, err)
 	}
 	return nil
 }
@@ -201,6 +209,13 @@ func (darwinSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
 		return fmt.Errorf("chown %s root:wheel: %w", plistPath, err)
 	}
 	return nil
+}
+
+// ReadFile reads a root-readable file, propagating os.ReadFile's error verbatim
+// so a caller can distinguish "not there yet" (fs.ErrNotExist — a first install
+// has neither the installed plist nor the cluster CA) from a real read failure.
+func (darwinSystem) ReadFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
 }
 
 // LaunchctlBootstrap loads the daemon into the system domain.
