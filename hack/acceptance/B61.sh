@@ -12,14 +12,16 @@
 #      resolves to a file that exists (dangling -> red). http(s)/mailto/#-anchors
 #      are skipped; a trailing #anchor is stripped before resolving.
 #   3. honest-gaps matrix — limitations.md carries each required gap token AND
-#      names both conformance registers (the citation-presence check).
+#      cites the public conformance-profile register (the citation-presence check).
 #   4. stale-string denylist — no `Pre-M0` / `private development` anywhere.
 #
-# The register citations in limitations.md are BY NAME (plain text), not
-# relative links: UPSTREAM-ALIGNMENT.md / conformance-profile.md live at the
-# WORKSPACE-root docs/ dir, OUTSIDE the k3sm repo, so a relative link would
-# dangle in a standalone checkout / on the published site. The offline
-# link-check therefore covers only IN-repo docs/user/* targets.
+# The conformance-profile.md citation in limitations.md IS a relative link
+# (../conformance-profile.md, resolved and asserted by check 2 above, since
+# that file lives in-repo at k3sm/docs/): the maintainer-facing full-surface
+# UPSTREAM-ALIGNMENT.md register it is backed by lives at the WORKSPACE-root
+# docs/ dir, OUTSIDE the k3sm repo, and is deliberately not linked or named
+# from a public page (removed by the public-repo scrub, k3sm#54) — it would
+# dangle in a standalone checkout / on the published site.
 #
 # Exit 0 iff every check passes. Mirrors hack/acceptance/m1.sh conventions.
 #
@@ -119,12 +121,10 @@ if [ -f "$LIM" ]; then
 			ladder no "B61.3  limitations gap MISSING: ${GAP_LABELS[$i]}"
 		fi
 	done
-	# citation-presence (the conformance CRITICAL): both registers named.
-	if grep -iq "UPSTREAM-ALIGNMENT" "$LIM"; then
-		ladder ok "B61.3  limitations cites UPSTREAM-ALIGNMENT register"
-	else
-		ladder no "B61.3  limitations MISSING UPSTREAM-ALIGNMENT citation"
-	fi
+	# citation-presence (the conformance CRITICAL): the public self-assessment
+	# register (conformance-profile.md) is named. The internal, workspace-root
+	# UPSTREAM-ALIGNMENT.md register was removed from limitations.md by the
+	# public-repo scrub (k3sm#54) and is no longer checked for here.
 	if grep -iq "conformance-profile" "$LIM"; then
 		ladder ok "B61.3  limitations cites conformance-profile register"
 	else
