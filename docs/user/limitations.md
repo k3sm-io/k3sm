@@ -311,11 +311,11 @@ different tracks:
   initramfs are digest-pinned and verified on every node start. Treat the path as preview-quality:
   what is measured is single-node, and a multi-image Pod is not supported — every container in a
   `vm` Pod shares one root filesystem, so a Pod naming two different images runs the second
-  container's command against the first container's image. It is targeted at the **v0.1.0** release as
-  EXPERIMENTAL and **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for
-  a later release), and is **launch-gated**: announced only if its live lab run is green against
-  the release artifact. The **de-EXPERIMENTAL graduation** — the branding removed, with published
-  performance figures — is the **v0.2** milestone. See [vm-runtimeclass.md](vm-runtimeclass.md).
+  container's command against the first container's image. It ships **EXPERIMENTAL** and
+  **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
+  release); its live lab run is green against the release artifact. The **de-EXPERIMENTAL
+  graduation** — the branding removed, with published performance figures — is the **v0.2**
+  milestone. See [vm-runtimeclass.md](vm-runtimeclass.md).
 - **Multi-node and HA** are not launch-blocking; their de-EXPERIMENTAL graduation is the **v0.3**
   milestone. See [multi-node.md](multi-node.md) and [ha.md](ha.md).
 
@@ -418,18 +418,15 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
 
 ### `vm` Pods: networking — same-node Services, not direct pod IPs
 
-A `vm` Pod **consumes** ClusterIP Services on its own node like any other pod — delivery from the guest
-to a Service VIP is native on this path, with no extra routes or elevated privileges involved. **Serving**
-as a Service backend is not wired yet: the proxy dials a backend at its published address, and a `vm`
-Pod's live guest address reaches the proxy through the same planned follow-up as source attribution.
-Until that ships, put `vm` workloads behind a Service for *their clients'* sake, but do not expect
-traffic to reach them through it.
+A `vm` Pod **consumes and serves** ClusterIP Services on its own node like any other pod — delivery
+from the guest to a Service VIP is native on this path, and the proxy routes a Service to a `vm`
+Pod backend the same way, measured on the reference hardware.
 
 **Dialing a `vm` Pod's pod IP directly does not work.** The pod IP a `vm` Pod reports is its published
 identity, not a live address a peer can connect to — so anything that depends on a direct pod-IP dial,
 including headless-Service and per-pod DNS name resolution, does not reach a `vm` Pod. Reach it through
-its Service's ClusterIP instead. Cross-node traffic to or from a `vm` Pod is out of scope for this
-release.
+its Service's ClusterIP instead, which does work. Cross-node traffic to or from a `vm` Pod is out of
+scope for this release.
 
 Two further things worth knowing about the guest network:
 

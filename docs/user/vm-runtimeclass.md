@@ -6,20 +6,21 @@ answer for **untrusted or multi-tenant** workloads: a real isolation boundary ba
 Virtualization.framework. It is EXPERIMENTAL and preview-quality — see the status note below before
 you depend on it.
 
-> **Status: EXPERIMENTAL, preview-quality.** A Pod that sets `runtimeClassName: vm` boots a
-> `linux/arm64` container image in its own micro-VM. Exercised and measured on the reference
-> hardware: boot and restart, `kubectl logs` (including `--tail` and `-f`), `kubectl exec` with
-> exit-code propagation, `CrashLoopBackOff` and restart backoff, PersistentVolumeClaim storage that
-> survives a hard hypervisor kill, per-container CPU and memory accounting, and in-guest networking
-> — the guest leases an address on the node's NAT segment, resolves cluster DNS, and reaches
-> ClusterIP Services. See [limitations.md](limitations.md) for the full measured picture, including
-> what is still not wired.
+> **Status: EXPERIMENTAL, preview-quality — validated on real hardware.** A Pod that sets
+> `runtimeClassName: vm` boots a `linux/arm64` container image in its own micro-VM. Exercised and
+> measured on the reference hardware: boot and restart, `kubectl logs` (including `--tail` and
+> `-f`), `kubectl exec` with exit-code propagation, `CrashLoopBackOff` and restart backoff,
+> PersistentVolumeClaim storage that survives a hard hypervisor kill, per-container CPU and memory
+> accounting, and in-guest networking — the guest leases an address on the node's NAT segment,
+> resolves cluster DNS, reaches ClusterIP Services, and is itself reachable through its own
+> Service's ClusterIP on the same node. See [limitations.md](limitations.md) for the full measured
+> picture, including what is still not wired.
 >
-> It is targeted at the **v0.1.0** public release as documented **EXPERIMENTAL** and
-> **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is deliberately held for a
-> later release), launch-gated on a live lab run against the release artifact. The
-> de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2** milestone. Treat
-> this path as preview-quality and validate your own workload before depending on it.
+> It ships **EXPERIMENTAL** and **`linux/arm64` only** (`linux/amd64` needs in-guest translation
+> and is deliberately held for a later release); its live lab run is green against the release
+> artifact. The de-EXPERIMENTAL graduation, with published performance figures, is the **v0.2**
+> milestone. Treat this path as preview-quality and single-node, and validate your own workload
+> before depending on it.
 
 ## When to use it
 
