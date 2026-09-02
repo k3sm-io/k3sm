@@ -101,7 +101,7 @@ declare -a GAP_LABELS=(
 	"no per-pod uid isolation"
 	"DNS gap"
 	"UDP Services deferred"
-	"vm/HA EXPERIMENTAL"
+	"multi-node/HA EXPERIMENTAL"
 	"single-node watch-staleness (B28)"
 )
 declare -a GAP_PATTERNS=(

@@ -6,8 +6,8 @@
 # load-bearing:
 #
 #   M11-core  gate hack/lab/m11.sh, args ["--core"], tier lab, manual: true,
-#             requires dev-mac + vz + network. The LAUNCH row: the functional-
-#             EXPERIMENTAL vm path must demonstrate this before v0.1 ships.
+#             requires dev-mac + vz + network. The LAUNCH row: the vm path
+#             (linux/arm64) must demonstrate this before v0.1 ships.
 #   M11-lab   gate hack/lab/m11.sh (NO args), tier lab, manual: true,
 #             requires vz + network. The FULL B109 ledger — every vm-path leg.
 #

@@ -2,7 +2,7 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-08-31
+updated: 2026-09-01
 updated_by: orchestrator
 
 phases:
@@ -426,7 +426,7 @@ phases:
         deliverables:
           - id: M7.3-d1
             done: false
-            desc: "STUB. Canonical home k3sm/docs/user/: the machine-asserted page manifest (quickstart/install/upgrade/backup-restore/concepts/limitations/images/multi-node/vm-runtimeclass[EXPERIMENTAL]/ha[EXPERIMENTAL]/storage/kubectl-access/troubleshooting/faq/versions). limitations.md cites UPSTREAM-ALIGNMENT.md + privilege-model.md (not restated) and carries the MLX-trusted-workload-only paragraph. mlx-quickstart.md is RE-HOMED to M8.6 (authored AND gated there — m8-plan R24, 2026-08-29; supersedes A20's authored-here-gated-by-m8.sh split, and M7 is launch-deferred). New examples/ (nodeport/statefulset/vm-linux/probes); README refresh across all repos (the k3sm README becomes the front door)."
+            desc: "STUB. Canonical home k3sm/docs/user/: the machine-asserted page manifest (quickstart/install/upgrade/backup-restore/concepts/limitations/images/multi-node/vm-runtimeclass/ha[EXPERIMENTAL]/storage/kubectl-access/troubleshooting/faq/versions). limitations.md cites UPSTREAM-ALIGNMENT.md + privilege-model.md (not restated) and carries the MLX-trusted-workload-only paragraph. mlx-quickstart.md is RE-HOMED to M8.6 (authored AND gated there — m8-plan R24, 2026-08-29; supersedes A20's authored-here-gated-by-m8.sh split, and M7 is launch-deferred). New examples/ (nodeport/statefulset/vm-linux/probes); README refresh across all repos (the k3sm README becomes the front door)."
         acceptance:
           - id: M7.3-a1
             met: false
@@ -550,7 +550,7 @@ phases:
     title: Public launch — the flip, the gates, the announcement (WITH MLX v1)
     status: todo
     strategy: hard cut
-    note: "LEDGER STUB. No new product code — M9 is the launch checklist. IRREVERSIBLE: repos-public + tagged module versions are forever (sumdb pins tags). Gate hack/acceptance/m9.sh is a manual:true phases.json row (a launch is a human act; the release process never auto-greens it) that machine-enumerates the launch-blocking ledger (m2/m3/m4 dev-mac, lab/m3 two-Mac, m7 umbrella + lab/m7 reboot-via-real-brew-artifact, m7/{ci,docs,hygiene}, verify-vanity, m8.sh MLX e2e, B28 disposition, AND — re-sequenced 2026-07-11 — the m11-core row: lab/m11.sh --core, the Linux-images-under-vm functional slice, rc-artifact-sha-bound like the other lab rows, with named conditional dispositions for spike/enrollment contingencies). The vm path ships functional-EXPERIMENTAL AT launch; the de-EXPERIMENTAL flip stays the v0.2 headline; M6 (HA) ships documented EXPERIMENTAL — NOT launch-blocking, the v0.3 headline. Degraded brew-only profile is the only sanctioned Apple-enrollment fallback (security-engineer co-signed; under it the vm headline drops to conditional by default)."
+    note: "LEDGER STUB. No new product code — M9 is the launch checklist. IRREVERSIBLE: repos-public + tagged module versions are forever (sumdb pins tags). Gate hack/acceptance/m9.sh is a manual:true phases.json row (a launch is a human act; the release process never auto-greens it) that machine-enumerates the launch-blocking ledger (m2/m3/m4 dev-mac, lab/m3 two-Mac, m7 umbrella + lab/m7 reboot-via-real-brew-artifact, m7/{ci,docs,hygiene}, verify-vanity, m8.sh MLX e2e, B28 disposition, AND — re-sequenced 2026-07-11 — the m11-core row: lab/m11.sh --core, the Linux-images-under-vm functional slice, rc-artifact-sha-bound like the other lab rows, with named conditional dispositions for spike/enrollment contingencies). The vm path ships de-EXPERIMENTAL AT launch (linux/arm64, single-node — flipped early on 2026-09-01 by operator decision, on the M11-core/M11-lab green against the release artifact; the published performance figures and the remaining ceilings are the v0.2 event); M6 (HA) ships documented EXPERIMENTAL — NOT launch-blocking, the v0.3 headline. Degraded brew-only profile is the only sanctioned Apple-enrollment fallback (security-engineer co-signed; under it the vm headline drops to conditional by default)."
     depends_on:
       - k3sm:M7
       - k3sm:M8
@@ -561,7 +561,7 @@ phases:
         deliverables:
           - id: M9.1-d1
             done: false
-            desc: "STUB. The 8-step flip runbook: rc dry-run (v0.1.0-rc.1, cross-repo GitHub App read credential, brews.skip_upload:auto, lab/m7.sh rc-mode local-formula install) → same-day m9.sh pre-flight (rotation verified-complete before flip; the m11-core row re-run against the rc artifact) → repos public apis→runtimed+darwin-net→k3sm one sitting (repo-settings.sh per flip incl. v* tag protection + release-env) → GHCR mlx-serve public → site deploy at commit (re-deploy after tag) → tag v0.1.0 ×4 same SHA set → outside-world verify (clean-Mac brew install + MLXModel demo + proxy.golang.org ×4 modules post-tag) → announce after a settle window. Announcement assets (blog 'Kubernetes with zero Linux' + the linux-images-under-vm EXPERIMENTAL story conditional on the m11-core row, MLX demo asciinema, comparison table, limitations.md linked) staged in M7.3/M8."
+            desc: "STUB. The 8-step flip runbook: rc dry-run (v0.1.0-rc.1, cross-repo GitHub App read credential, brews.skip_upload:auto, lab/m7.sh rc-mode local-formula install) → same-day m9.sh pre-flight (rotation verified-complete before flip; the m11-core row re-run against the rc artifact) → repos public apis→runtimed+darwin-net→k3sm one sitting (repo-settings.sh per flip incl. v* tag protection + release-env) → GHCR mlx-serve public → site deploy at commit (re-deploy after tag) → tag v0.1.0 ×4 same SHA set → outside-world verify (clean-Mac brew install + MLXModel demo + proxy.golang.org ×4 modules post-tag) → announce after a settle window. Announcement assets (blog 'Kubernetes with zero Linux' + the linux-images-under-vm story conditional on the m11-core row, MLX demo asciinema, comparison table, limitations.md linked) staged in M7.3/M8."
         acceptance:
           - id: M9.1-a1
             met: false
@@ -654,14 +654,16 @@ phases:
     depends_on: []
     notes: >-
       docs/m11-plan.md is authoritative (Phase C encoded from it). RE-SEQUENCED PRE-LAUNCH
-      (2026-07-11, its R16): the build waves ship the vm path FUNCTIONAL-EXPERIMENTAL at
-      v0.1 (both arches — linux/arm64 + linux/amd64-via-Rosetta), proven by the m11-core
-      launch ledger row; the de-EXPERIMENTAL flip alone stays the post-launch v0.2 headline
-      SHARED with M10.2–M10.4. Run out of ledger order with recorded rationale — the M10
-      remainder is hardware-gated and not a dependency. Hard cut. The de-EXPERIMENTAL flip
-      is STRUCTURALLY lab-gated: B109 (the FULL hack/lab/m11.sh ledger + published figures
-      on an entitled VZ Mac) + B110 (vmhost release signing, human-gated — now load-bearing
-      for the v0.1 headline) — never unit-green-only. The foreign-user VAP exemption for vm
+      (2026-07-11, its R16): the build waves ship the vm path at v0.1, proven by the
+      m11-core launch ledger row. FLIPPED EARLY (2026-09-01, its R29 — operator decision):
+      the vm RuntimeClass ships DE-EXPERIMENTAL at v0.1 for linux/arm64, single-node; the
+      user docs and the public roadmap describe it by what it runs (k3sm#282). What stays
+      v0.2: the published performance figures, linux/amd64-via-Rosetta, and the remaining
+      ceilings (per-pod network segmentation between guests, host-path sharing). Run out of
+      ledger order with recorded rationale — the M10 remainder is hardware-gated and not a
+      dependency. Hard cut. The flip WAS structurally lab-gated, never unit-green-only: the
+      full hack/lab/m11.sh ledger green on an entitled VZ Mac against the release artifact
+      (M11.5-a1) + the R19(c) threat-terms sign-off that R28 substituted for B110 signing. The foreign-user VAP exemption for vm
       pods is human-gated B112 (admission-model change, the B71 precedent) — WITHOUT it the
       headline fsGroup workload is rejected 422 at admission; this wave cites
       pkg/policy/admission.go by name so nobody relaxes it ad hoc. Guest hostPath stays
@@ -716,7 +718,7 @@ phases:
             desc: "Admission notes ONLY (split 2026-08-30: this deliverable previously conflated admission + the limitations rewrite + the user-doc copy flip; m11-plan §M11.4 defines d1-d7 and the ledger encoded only d1-d5). vm pods still carry nodeSelector kubernetes.io/os=darwin (the node IS darwin; the guest is an implementation detail) — the chart incantation (os=darwin + runtimeClassName: vm) documented in the reference-workload readiness notes (internal) + limitations.md. The foreign-user VAP exemption (scope foreignUserExpr by runtimeClassName==vm; security-engineer-authored CEL; native pods keep the full pin) is HUMAN-GATED B112 — tracked, never built by a wave; MERGE-PRECONDITIONS (plan R21): only after the S3(2) idmap answer records YES and the volume/fsGroup mechanism deliverable has landed; its gate asserts the triple (vm+fsGroup admitted / native+fsGroup still 422 / vm-on-non-VZ-node fails closed) + update-or-recreate semantics for the stored VAP (DISCHARGED by B153: every pkg/policy Ensure* is now create-or-update in place). If S3(2) records NO, the m11-core fsGroup leg records SKIPPED(B112-unmerged) and the storage leg substitutes a root-in-guest image — pre-decided, not improvised in a lab session. This wave cites pkg/policy/admission.go by name so no wave relaxes it ad hoc."
           - id: M11.4-d6
             done: true  # 2026-08-31 — the vm limitations rewrite landed with every published figure traced to a committed findings file; the section INTRO was stale until 2026-08-31 (still said a vm Pod does not run — reconciled to the measured state, artifacts-not-yet-install-ensured caveat kept) (restart cost 165ms median, fsync/IO, the idmapped-mount refusal as the fsGroup ceiling, the case-collision collapse, the networking posture incl. the direct-pod-IP and serving ceilings, the hedged guest<->guest wording, the confinement posture). The deferred translation figure is omitted rather than estimated
-            desc: "docs/user/limitations.md vm-section rewrite (split out of d5, 2026-08-30; m11-plan §M11.4-d6). States what EXPERIMENTAL promises (the m11-core-proven behaviours incl. PVC durability) and what it denies: the S1 cold-boot figure published as the vm-pod RESTART COST; the S5(4) network-trust ceiling (same-node vm pods share one NAT segment NetworkPolicy cannot segment, plus R24(d)'s except-through-a-deliberately-shared-RWX-claim clause); the vmhost confinement posture as S1(5) actually recorded it (confined, or a documented residual); guest hostPath FAIL-CLOSED pending B98 (the launch slice is PVC-only); rootfs writes are RAM (bounded tmpfs upper — ENOSPC beats a misattributed guest OOM); PVC host-visibility with R24(d)'s honest ceilings (guest writes land host-side as _k3sm and mode bits rule readability — postgres chmods PGDATA 0700, so that tree needs sudo despite being in Finder); and ARM64-ONLY — linux/amd64 does not run in this release (R19(a)/R26), an amd64-only image being refused at pull rather than started and crashed. Names the de-EXPERIMENTAL criteria (the FULL B109 ledger + published figures). USER-DOC COPY FLIP rides here: faq.md, vm-runtimeclass.md, images.md, and the public ROADMAP Shipped/Next/Non-goals bullets; the launch pre-flight denylist blocks the stale strings. Mirrored into the workspace privilege-model doc."
+            desc: "docs/user/limitations.md vm-section rewrite (split out of d5, 2026-08-30; m11-plan §M11.4-d6). States what EXPERIMENTAL promises (the m11-core-proven behaviours incl. PVC durability) and what it denies: the S1 cold-boot figure published as the vm-pod RESTART COST; the S5(4) network-trust ceiling (same-node vm pods share one NAT segment NetworkPolicy cannot segment, plus R24(d)'s except-through-a-deliberately-shared-RWX-claim clause); the vmhost confinement posture as S1(5) actually recorded it (confined, or a documented residual); guest hostPath FAIL-CLOSED pending B98 (the launch slice is PVC-only); rootfs writes are RAM (bounded tmpfs upper — ENOSPC beats a misattributed guest OOM); PVC host-visibility with R24(d)'s honest ceilings (guest writes land host-side as _k3sm and mode bits rule readability — postgres chmods PGDATA 0700, so that tree needs sudo despite being in Finder); and ARM64-ONLY — linux/amd64 does not run in this release (R19(a)/R26), an amd64-only image being refused at pull rather than started and crashed. Names the de-EXPERIMENTAL criteria (the FULL B109 ledger + published figures) — SUPERSEDED 2026-09-01 by the early flip (R29): the section now describes the path by what it runs, with no EXPERIMENTAL framing (k3sm#282). USER-DOC COPY FLIP rides here: faq.md, vm-runtimeclass.md, images.md, and the public ROADMAP Shipped/Next/Non-goals bullets; the launch pre-flight denylist blocks the stale strings. Mirrored into the workspace privilege-model doc."
           - id: M11.4-d7
             done: true  # 2026-09-01 (M11 validation): pointer row, carries no independent work by its own desc — its referent k3sm:M11.5-d1 (hack/lab/m11.sh + hack/acceptance/m11.sh + the phases.json rows) is done, and the gate machinery it points at now runs green on hardware.
             desc: "Gate machinery POINTER (split out of d5, 2026-08-30). m11-plan §M11.4-d7 and §M11.5-d1 describe the SAME deliverable — hack/acceptance/m11.sh + hack/lab/m11.sh + the phases.json rows. It is encoded ONCE, at k3sm:M11.5-d1, so the ledger does not double-count it; this row exists only so the d1-d7 numbering matches the plan text and carries no independent work. See M11.5-d1."
@@ -752,7 +754,7 @@ phases:
       re-sequencing — + B99 + B100; B100 owns the OCI-ref discriminator/MergeRunSpec, never
       re-filed here); M12.4 lands EARLY-POST-LAUNCH (v0.1.x): it depends on the k3sm M11.4
       wave + the recorded vmhost-signing and kernel-artifact facts (both pre-launch under
-      the re-sequencing) — no longer on the v0.2 de-EXPERIMENTAL flip. Hard cut throughout;
+      the re-sequencing) — no longer on the vm de-EXPERIMENTAL flip (itself done at v0.1, 2026-09-01). Hard cut throughout;
       the one proto carve rides apis M12.1.
     subphases:
       - id: M12.1
@@ -1026,7 +1028,7 @@ phases:
         status: todo
         strategy: hard cut
         depends_on: []
-        note: "Runs ONLY after M14.4 AND M14.5 evidence is recorded; a reviewer must not merge the flip on the strength of the plan alone. TWO RULES GOVERN THE EDIT SURFACE, both of which produced a wrong answer once during this program's own drafting. (1) SOURCES VS GENERATED COPIES: edit docs/user/{multi-node,ha,limitations,faq,README}.md and ROADMAP.md, then regenerate — site/content/docs/* AND site/content/roadmap.md are GENERATED (each carries a DO-NOT-EDIT header; the workspace ROADMAP.md is likewise derived, /roadmap-sync only). Site-AUTHORED and edited directly: tutorials/07-two-macs.md, capabilities.md, compare.md, _index.md, support.md, tutorials/12-what-wont-work.md, data/gates.yaml. (2) ONLY THE M3/M6 SENTENCES MOVE: most EXPERIMENTAL occurrences in those files describe the vm RuntimeClass, whose graduation is M11.5/v0.2 and shares none of this evidence — limitations.md even carries both features under one heading — so a whole-file keyword-absence gate would either force a false public claim about vm or never go green. The gate asserts the SPECIFIC rewritten sentences, in the hack/acceptance/B214.sh style, never grep -c EXPERIMENTAL."
+        note: "Runs ONLY after M14.4 AND M14.5 evidence is recorded; a reviewer must not merge the flip on the strength of the plan alone. TWO RULES GOVERN THE EDIT SURFACE, both of which produced a wrong answer once during this program's own drafting. (1) SOURCES VS GENERATED COPIES: edit docs/user/{multi-node,ha,limitations,faq,README}.md and ROADMAP.md, then regenerate — site/content/docs/* AND site/content/roadmap.md are GENERATED (each carries a DO-NOT-EDIT header; the workspace ROADMAP.md is likewise derived, /roadmap-sync only). Site-AUTHORED and edited directly: tutorials/07-two-macs.md, capabilities.md, compare.md, _index.md, support.md, tutorials/12-what-wont-work.md, data/gates.yaml. (2) ONLY THE M3/M6 SENTENCES MOVE: when this rule was written most EXPERIMENTAL occurrences in those files described the vm RuntimeClass, which shares none of this evidence — limitations.md even carries both features under one heading — so a whole-file keyword-absence gate would either have forced a false public claim about vm or never gone green. The vm RuntimeClass since graduated on its own evidence (v0.1, 2026-09-01, k3sm#282), which changes nothing here: the gate asserts the SPECIFIC rewritten M3/M6 sentences, in the hack/acceptance/B214.sh style, never grep -c EXPERIMENTAL, and never re-touches the vm copy."
         deliverables:
           - id: M14.6-d1
             done: false
@@ -1037,7 +1039,7 @@ phases:
         acceptance:
           - id: M14.6-a1
             met: false
-            check: "hack/acceptance/m14-flip.sh — sentence-scoped asserts prove the named M3/M6 sentences are rewritten while every vm-RuntimeClass EXPERIMENTAL mention is untouched, site/data/gates.yaml reads M3: validated and M6: validated, ha.md carries the no-VIP access-model sentence, and hack/verify-docs-sync.sh + hack/verify-site-clean.sh are green"
+            check: "hack/acceptance/m14-flip.sh — sentence-scoped asserts prove the named M3/M6 sentences are rewritten (never a whole-file EXPERIMENTAL grep — the vm RuntimeClass copy in the same files graduated separately at v0.1 and is not this gate's subject), site/data/gates.yaml reads M3: validated and M6: validated, ha.md carries the no-VIP access-model sentence, and hack/verify-docs-sync.sh + hack/verify-site-clean.sh are green"
             method: integration
 ---
 
@@ -1257,7 +1259,7 @@ watchpoint is the **kine single-pin** (both pins → one modern ≥0.16.x, `CGO_
 only after datastore-compat is verified, else it escapes to the named kine/SQLite datastore-migration exception.
 - ⬜ **M7.0** — validation-debt burn-down (human-at-hardware: m2/m3/m4.sh + `hack/lab/m3.sh` two-Mac + the B28
   dev-mac churn soak `hack/acceptance/m7/soak.sh` against the M7.1 kine pin). On completion M4 flips `done` on
-  validation runs alone; M5/M6 lab gates ship documented **EXPERIMENTAL**.
+  validation runs alone; the M6 lab gate ships documented **EXPERIMENTAL** (the M5 remainder was absorbed by M11, which shipped de-EXPERIMENTAL at v0.1).
 - ⬜ **M7.1** — release-engineering pipeline (**absorbs M4.0**, `phases_ref: k3sm M4.0`): `setup.go` verify-then-use
   (build cp binaries from pinned k/k, ship under `libexec/` → root-owned `/Library/k3sm/bin` via a named `pkg/install`
   payload copy; fail-fast on a missing bundle); the kine single-pin + nocgo dep-lint; goreleaser + the two signed
@@ -1374,11 +1376,13 @@ server-join + the AES-256-GCM identical-CA bundle) are both code-complete + unit
 write-A-read-B, single-active-leader, watch-staleness soak, second-server-join (identical CAs), and kill-A→serve-via-B
 failover are the `hack/lab/m6.sh` / `e2e/TestM6_*` lab legs (`K3SM_LAB=1`, never auto-greened).**
 
-## M11 — Linux containers & multi-arch (k3sm slice) ⬜
-`docs/m11-plan.md` is authoritative (encoded 2026-07-10). M11 **de-EXPERIMENTALs the `vm`
-RuntimeClass** — it shares the post-launch v0.2 headline with M10.2–M10.4. **Hard cut.** The
-de-EXPERIMENTAL flip is **structurally lab-gated** (B109 `hack/lab/m11.sh` green on an entitled VZ
-Mac + human-gated B110 vmhost release signing) — never unit-green-only.
+## M11 — Linux containers & multi-arch (k3sm slice) ✅
+`docs/m11-plan.md` is authoritative (encoded 2026-07-10; done 2026-09-01). M11 **de-EXPERIMENTALs the
+`vm` RuntimeClass** — flipped early at v0.1 (its R29, 2026-09-01) for `linux/arm64`, single-node;
+the published performance figures, `linux/amd64`, and the remaining ceilings are the v0.2 event.
+**Hard cut.** The flip was **structurally lab-gated** (the full `hack/lab/m11.sh` ledger green on an
+entitled VZ Mac against the release artifact + the R19(c) threat-terms sign-off) — never
+unit-green-only.
 
 ### M11.4 — capability labels + image-platform annotation + B6 wiring + admission/docs ⬜
 **Cross-repo dep:** `apis:M11.1` + `runtimed:M11.2` + `darwin-net:M11.3`.
