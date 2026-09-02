@@ -264,6 +264,12 @@ service name (`svc.ns.svc.cluster.local`) from inside a `vm` Pod rather than rel
 list to complete a short name. And a guest's link MTU is 1500 and the link will not lower it, so
 cross-node `vm` traffic is not claimed in this release.
 
+### `externalTrafficPolicy: Local` is not honored
+
+The userspace Service proxy splices each connection, so the client's source address does not survive
+to the backend and the node cannot tell a local endpoint apart from a remote one. A Service that sets
+`externalTrafficPolicy: Local` is admitted with a warning and then behaves as `Cluster`.
+
 ### UDP Services (non-DNS) — deferred
 
 Only **cluster DNS on `:53`** uses UDP today (the DNS VIP binds 53 directly). General **UDP Services are
