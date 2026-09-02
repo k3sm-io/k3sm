@@ -84,14 +84,14 @@ The first public release. One track is launch-blocking:
   first `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
   (`RUN` arrives with the vm-backed builder, below). *(targeted at v0.1.0; included in the release
   announcement only if merged and green by the pre-flight)*
-- **Run your Linux images (targeted, EXPERIMENTAL).** Standard **linux/arm64 images** run as
-  `vm`-RuntimeClass pods — one lightweight micro-VM per pod — with `kubectl exec/logs/top`,
+- **Run your Linux images (EXPERIMENTAL, validated on hardware).** Standard **linux/arm64 images**
+  run as `vm`-RuntimeClass pods — one lightweight micro-VM per pod — with `kubectl exec/logs/top`,
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers, unmodified images with a three-line manifest
   adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
-  *(targeted at v0.1.0 as EXPERIMENTAL — launch-gated by a live lab run against the release
-  artifact; included in the announcement only if that gate is green; the de-EXPERIMENTAL
-  graduation with published performance figures is the v0.2 milestone below)*
+  *(the live lab run against the released artifact is green — see Shipped, above; targeted for
+  the v0.1.0 announcement; the de-EXPERIMENTAL graduation with published performance figures is
+  the v0.2 milestone below)*
 - **linux/amd64 images are NOT in v0.1.0.** Running them needs Rosetta-for-Linux translation
   inside the guest, and it is deliberately cut from the first release so the arm64 path can be
   validated on hardware on its own. There is no emulation fallback — no qemu exists for a Darwin
