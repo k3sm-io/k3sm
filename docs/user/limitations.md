@@ -38,7 +38,7 @@ When in doubt, the profile wins.
   CNI, and netns; k3sm has none of them, and k3sm does not claim a
   Certified-Kubernetes badge. See [Conformance profile](../conformance-profile.md).
 
-## The gaps matrix
+## Gaps matrix
 
 ### No per-pod uid isolation
 
@@ -104,7 +104,7 @@ Today at `main`, per port class:
 
   If the derived InternalIP cannot be worked out, k3sm advertises **nothing** — the Service stays
   `<pending>` while the listeners still serve. That is deliberate: an unreachable `EXTERNAL-IP` is
-  worse than none. See [Troubleshooting](troubleshooting.md#a-loadbalancer-service-stays-pending).
+  worse than none. See [Troubleshooting](troubleshooting.md#loadbalancer-stuck-pending).
 
 - **Same-node Pods get separate per-IP port spaces for ordinary ports.** Each Pod is assigned its own
   `100.64.0.0/10` loopback address, and on the default runtime a Pod's wildcard `bind()` on an

@@ -1,4 +1,4 @@
-# The `vm` RuntimeClass
+# `vm` RuntimeClass
 
 k3sm runs Pods as native Darwin processes under a **single `_k3sm` user**, so there is **no per-pod uid
 isolation** — same-node Pods share one OS trust domain. The **`vm` RuntimeClass** is the intended
@@ -105,7 +105,7 @@ Two properties are worth internalizing before you build selectors on these:
   capability, advertised only through the `k3sm.io/*` keys; nothing in the cluster is told the node
   *is* amd64 or *is* Linux.
 
-### The two Rosetta labels are advertised, not yet honored
+### Rosetta labels, advertised only
 
 The `k3sm.io/rosetta` and `k3sm.io/rosetta-linux` labels are a
 **truthful claim about the host** — the probe really did find Rosetta — and they really do make the node

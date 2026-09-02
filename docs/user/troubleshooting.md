@@ -15,14 +15,14 @@ Not everything lands there. The server process's own structured logs (the LoadBa
 ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
 **`/var/log/k3sm/server.log`** — the unified-log predicate above shows none of them.
 
-## The control plane will not come up
+## Control plane startup failure
 
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).
 - Check the datastore is present and not locked — the kine/SQLite DB lives under the server work
   directory (see [Backup & restore](backup-restore.md)).
 - Restart the daemon: `launchctl kickstart -k system/io.k3sm.server` (label per your role).
 
-## A Pod is stuck or exits and does not restart
+## Stuck or crash-looping Pods
 
 On the **default runtime** (what every installed cluster runs), `restartPolicy` **is** honored: the
 container is restarted in place with an upstream-shaped `CrashLoopBackOff` backoff, and
@@ -60,12 +60,12 @@ names, SRV and PTR all resolve. Check these in order:
 See [Limitations](limitations.md#dns--what-resolves-and-on-which-runtime-path) for the full
 per-path picture.
 
-## A UDP Service does not work
+## UDP Service failures
 
 Only cluster DNS on `:53` uses UDP today; general UDP Services (ClusterIP **and** NodePort) are deferred.
 See [Limitations](limitations.md).
 
-## A LoadBalancer Service stays `<pending>`
+## LoadBalancer stuck `<pending>`
 
 **Do not look in the unified log for this one.** The LoadBalancer controller and the ingress host log
 through `slog` to **stderr**, which the launchd job routes to a file — the
@@ -123,14 +123,14 @@ path yet (the event pipeline is planned), so the log file is the only place the 
 k3sm ships no metrics-server and has no CPU accounting; install a metrics-server operator if you need the
 `metrics.k8s.io` verb. See [kubectl access](kubectl-access.md) and [Limitations](limitations.md).
 
-## A control-plane certificate is close to expiry
+## Certificate nearing expiry
 
 Component certificates are re-issued on every control-plane boot, so a restart renews them.
 `sudo k3sm certificate rotate` reports what a restart would re-issue (and both CA pins, which
 never change); `--restart` performs it. Rotation does **not** revoke anything and does not cover
 worker-node certs — see [Certificates](certificates.md) before you rely on it.
 
-## A Pod selecting `k3sm.io/rosetta` or `k3sm.io/rosetta-linux` stays Pending
+## Rosetta-selecting Pods stuck Pending
 
 The node advertises a capability label only when its start-time probe said yes.
 
@@ -153,7 +153,7 @@ The node advertises a capability label only when its start-time probe said yes.
    translating an amd64 payload happens inside a guest and that guest path does not run yet. So an
    amd64-only image is refused at pull rather than started and left to crash. That is a documented
    gap, not a broken node; see
-   [`vm` RuntimeClass](vm-runtimeclass.md#the-two-rosetta-labels-are-advertised-not-yet-honored).
+   [`vm` RuntimeClass](vm-runtimeclass.md#rosetta-labels-advertised-only).
 
 ## Multi-node join fails
 
