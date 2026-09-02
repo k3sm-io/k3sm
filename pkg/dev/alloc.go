@@ -36,6 +36,7 @@ import (
 //	scheduler           11450–11961
 //	kine (datastore)    12379–12890
 //	controller-manager  13450–13961
+//	registry (ingest)   14450–14961
 //	apiserver           16440–16951
 const (
 	apiPortBase  = 16440
@@ -51,6 +52,12 @@ const (
 	// skips a decade because 12450 would fall inside the datastore window above.
 	schedulerPortBase         = 11450
 	controllerManagerPortBase = 13450
+	// registryPortBase seeds the instance's node-local OCI ingest registry port.
+	// Its window sits between the controller-manager's and the apiserver's, clear
+	// of both by more than portSpan, and clear of the fixed 6450 a non-dev server
+	// suggests — a dev instance must never contend with a hand-run `k3sm server`
+	// for the port an image is pushed to.
+	registryPortBase = 14450
 	// portSpan bounds the linear probe from each base — 512 candidate ports is
 	// far more than the realistic parallel-instance count, and keeps the search
 	// bounded so a wedged host fails fast rather than scanning 64k ports.
@@ -71,6 +78,7 @@ type instancePorts struct {
 	kubelet           int
 	scheduler         int
 	controllerManager int
+	registry          int
 }
 
 // portClasses is the allocation order: one entry per listener, each with the base
@@ -91,6 +99,7 @@ var portClasses = []struct {
 	{"kubelet", kubeletPortBase, func(p *instancePorts, v int) { p.kubelet = v }},
 	{"scheduler", schedulerPortBase, func(p *instancePorts, v int) { p.scheduler = v }},
 	{"controller-manager", controllerManagerPortBase, func(p *instancePorts, v int) { p.controllerManager = v }},
+	{"registry", registryPortBase, func(p *instancePorts, v int) { p.registry = v }},
 }
 
 // allocatePorts picks a free port for every listener an instance owns,
@@ -130,6 +139,7 @@ func allocatePorts(sys System, name string, euid int) (instancePorts, error) {
 		{"kubelet", out.kubelet},
 		{"scheduler", out.scheduler},
 		{"controller-manager", out.controllerManager},
+		{"registry", out.registry},
 	}
 	for i := range allocated {
 		for j := i + 1; j < len(allocated); j++ {

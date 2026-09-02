@@ -30,7 +30,7 @@ import (
 // testPorts is a fixed allocation for the argv tests that are not ABOUT the
 // allocator — every value distinct, so a flag wired to the wrong member shows up
 // as a wrong number rather than a coincidence.
-var testPorts = instancePorts{api: 7443, kine: 12379, kubelet: 10450, scheduler: 11450, controllerManager: 13450}
+var testPorts = instancePorts{api: 7443, kine: 12379, kubelet: 10450, scheduler: 11450, controllerManager: 13450, registry: 14450}
 
 func TestAllocatePortsStableAndDisjoint(t *testing.T) {
 	sys := newFakeSystem()
@@ -56,6 +56,7 @@ func TestAllocatePortsStableAndDisjoint(t *testing.T) {
 		{"kubelet", got.kubelet, kubeletPortBase},
 		{"scheduler", got.scheduler, schedulerPortBase},
 		{"controller-manager", got.controllerManager, controllerManagerPortBase},
+		{"registry", got.registry, registryPortBase},
 	} {
 		if w.port < w.base || w.port >= w.base+portSpan {
 			t.Errorf("%s port %d out of window [%d,%d)", w.name, w.port, w.base, w.base+portSpan)
@@ -88,6 +89,7 @@ func allPorts(p instancePorts) []struct {
 		{"kubelet", p.kubelet},
 		{"scheduler", p.scheduler},
 		{"controller-manager", p.controllerManager},
+		{"registry", p.registry},
 	}
 }
 
@@ -438,4 +440,51 @@ func argvFlagValue(args []string, flag string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// TestDevEnablesTheIngestRegistry pins the dev tier's registry posture, which is
+// the OPPOSITE of `k3sm server`'s: on by default here, off by default there. A
+// dev instance exists to run an image somebody is still building, so it needs a
+// push target; a production server is asked for one deliberately.
+//
+// The two halves are both load bearing. The ALLOCATION half keeps two instances
+// off one port — the second one's registry would lose the bind, and its pods would
+// then pull from the first instance's store, which looks like a working cluster
+// serving the wrong image. The ARGV half is what makes the allocation reach the
+// server at all; without it every instance falls back to the disabled default and
+// no dev cluster can ingest anything.
+func TestDevEnablesTheIngestRegistry(t *testing.T) {
+	sys := newFakeSystem()
+	a, b := twoLiveInstances(t, sys)
+
+	if a.registry == b.registry {
+		t.Fatalf("both instances allocated registry port %d — the second would pull from the first's store", a.registry)
+	}
+	for _, p := range []int{a.registry, b.registry} {
+		if p == executor.DefaultRegistryPort {
+			t.Errorf("allocated registry port %d is the fixed suggestion a hand-run `k3sm server` takes", p)
+		}
+		if p < registryPortBase || p >= registryPortBase+portSpan {
+			t.Errorf("registry port %d is outside its window [%d,%d)", p, registryPortBase, registryPortBase+portSpan)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		alloc instancePorts
+	}{{"a", a}, {"b", b}} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := serverArgs(tc.name, "/w", "/pods", tc.alloc, "none", runtimeRuntimed, "", "")
+			got, ok := argvFlagValue(args, "--registry-port")
+			if !ok {
+				t.Fatalf("serverArgs = %v, want a --registry-port flag (without it the dev cluster has no push target)", args)
+			}
+			if want := strconv.Itoa(tc.alloc.registry); got != want {
+				t.Errorf("--registry-port = %q, want the allocated port %q", got, want)
+			}
+			if got == "0" {
+				t.Error("--registry-port 0 disables the registry; a dev instance must ship one")
+			}
+		})
+	}
 }
