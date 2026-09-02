@@ -63,7 +63,7 @@ The restore is built to be survivable when it goes wrong:
 Restoring onto a node with no datastore at all (a rebuilt Mac) is supported — that is what the drill
 is for.
 
-## The automatic pre-migration backup
+## Automatic pre-migration backup
 
 A release may move to a newer kine, which re-runs its schema migrations against your existing
 database. That is **one-way**, so before the new version opens the database for the first time, the

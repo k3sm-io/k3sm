@@ -10,7 +10,7 @@ slowly", not "runs with a flag" — a `linux/amd64` or `linux/arm64` image is re
 to pull it. That is the trade this project makes on purpose, and this page is here so you can tell
 in a minute whether it is a trade you want.
 
-## The default path
+## Default path
 
 **An OCI image with a Mac binary inside.** This is the normal path:
 

@@ -2,7 +2,7 @@
 
 How k3sm installs, and why it needs admin rights exactly **once**.
 
-## The one-time admin step
+## One-time admin step
 
 k3sm is designed to run **without per-command `sudo`**. A single privileged install sets up an
 unprivileged posture that everything else runs under:
