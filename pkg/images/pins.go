@@ -37,6 +37,13 @@ const (
 	// upstream, so pulling it from there and side-loading the result is a complete
 	// recovery path.
 	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+
+	// DebianToolchain is the guest-kernel build toolchain image: the mirror of the
+	// upstream debian trixie-20260824-slim release index, byte-identical, so the
+	// digest is upstream's own. Consumed by runtimed/hack/guest-kernel/build.sh
+	// (which pins the linux/arm64 platform manifest recorded in mirror.yaml under
+	// this index) — a build-time dependency, never pulled by product code.
+	DebianToolchain = "ghcr.io/k3sm-io/mirror/debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
 )
 
 // Pin is one digest-pinned image constant, named so it can be matched against the
@@ -63,5 +70,6 @@ type Pin struct {
 func Pins() []Pin {
 	return []Pin{
 		{Name: "buildkit", Ref: Buildkitd},
+		{Name: "debian", Ref: DebianToolchain},
 	}
 }
