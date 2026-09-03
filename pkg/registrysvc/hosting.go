@@ -40,22 +40,40 @@ const (
 	HostingConfigMapName = "local-registry-hosting"
 	// HostingDataKey is the single data key, fixed by the KEP.
 	HostingDataKey = "localRegistryHosting.v1"
-	// hostingHelp points a reader at the documentation for this registry.
-	hostingHelp = "https://k3sm.io/docs/user/registry/"
+	// hostingHelp points a reader at the documentation for this registry, and
+	// states the one transport fact the addresses themselves cannot.
+	//
+	// The two localhost addresses carry their transport in their name: the
+	// docker/OCI toolchain special-cases the literal `localhost` as an insecure
+	// (plain HTTP) registry. The in-cluster address is a Service name, which gets
+	// no such treatment — a client handed it would infer HTTPS and fail the
+	// handshake against a plain-HTTP listener. The KEP gives no field for
+	// transport, so it is said here, where a reader of the document is already
+	// looking. The FIELD NAME is deliberately not repeated in this sentence: a
+	// reader (and a gate) greps the document for the key, and a help string
+	// carrying it would answer that grep from the wrong line.
+	hostingHelp = "https://k3sm.io/docs/user/registry/ — the in-cluster address serves plain HTTP, not TLS"
 )
 
 // hosting is the KEP-1755 document.
 //
-// hostFromClusterNetwork is DELIBERATELY ABSENT, and its absence is a truthful
-// statement rather than an omission. The field means "an address a workload
-// inside the cluster network can pull from", and on k3sm there is none: a native
-// Pod is a Darwin process on this host, so its "localhost" IS the host's and
-// hostFromContainerRuntime already covers it — while a vm Pod is a Linux guest
-// with its OWN loopback, on which nothing is listening. Publishing any address
-// for that field would tell a guest to pull from itself.
+// hostFromClusterNetwork means "an address a workload inside the cluster network
+// can pull from". k3sm publishes the node's per-node registry Service
+// (clusterservice.go), which is one name that answers for all three classes of
+// caller: a native Pod (a Darwin process, reaching the VIP through the node's
+// lo0 alias), a Linux vm guest (whose own loopback answers nothing, and which
+// reaches the VIP through the same userspace proxy every other Service is
+// reached through), and the host.
+//
+// It is OMITTED when there is no such Service — a single-Mac cluster with no
+// mesh address and no vm network has no relay, so nothing off loopback answers,
+// and an address published there would be one no caller could use. Emptiness is
+// therefore a statement, not a default: the field is present exactly when it is
+// true.
 type hosting struct {
 	Host                     string `json:"host"`
 	HostFromContainerRuntime string `json:"hostFromContainerRuntime"`
+	HostFromClusterNetwork   string `json:"hostFromClusterNetwork,omitempty"`
 	Help                     string `json:"help"`
 }
 
@@ -70,17 +88,27 @@ type ConfigMapClient interface {
 	Update(ctx context.Context, cm *corev1.ConfigMap, opts metav1.UpdateOptions) (*corev1.ConfigMap, error)
 }
 
-// HostingDocument renders the KEP-1755 document for a registry on port.
+// HostingDocument renders the KEP-1755 document for a registry on port, reachable
+// from inside the cluster network at clusterNetworkHost.
 //
-// Both addresses are "localhost:<port>" rather than "127.0.0.1:<port>", because
-// the docker/OCI toolchain special-cases the literal name `localhost` to mean an
-// insecure (plain HTTP) registry, and this one serves plain HTTP. A reader handed
-// 127.0.0.1 would have to be told separately to disable TLS.
-func HostingDocument(port int) ([]byte, error) {
+// The first two addresses are "localhost:<port>" rather than "127.0.0.1:<port>",
+// because the docker/OCI toolchain special-cases the literal name `localhost` to
+// mean an insecure (plain HTTP) registry, and this one serves plain HTTP. A
+// reader handed 127.0.0.1 would have to be told separately to disable TLS.
+//
+// clusterNetworkHost is the node's registry Service authority
+// (ClusterServiceAuthority) — or "", which OMITS hostFromClusterNetwork. It is a
+// parameter rather than something rendered here because only the caller knows
+// whether the Service was actually published; rendering the name unconditionally
+// would publish an address on a node that has no relay to answer it. That
+// authority speaks PLAIN HTTP and does not say so in its name, which is why the
+// help string does (see hostingHelp).
+func HostingDocument(port int, clusterNetworkHost string) ([]byte, error) {
 	addr := "localhost:" + strconv.Itoa(port)
 	b, err := yaml.Marshal(hosting{
 		Host:                     addr,
 		HostFromContainerRuntime: addr,
+		HostFromClusterNetwork:   clusterNetworkHost,
 		Help:                     hostingHelp,
 	})
 	if err != nil {
@@ -97,8 +125,8 @@ func HostingDocument(port int) ([]byte, error) {
 // is returned to the caller, which logs it — a losing writer in a two-server
 // cluster is not an error worth retrying, because the winner published the same
 // document.
-func PublishHosting(ctx context.Context, c ConfigMapClient, port int) error {
-	doc, err := HostingDocument(port)
+func PublishHosting(ctx context.Context, c ConfigMapClient, port int, clusterNetworkHost string) error {
+	doc, err := HostingDocument(port, clusterNetworkHost)
 	if err != nil {
 		return err
 	}

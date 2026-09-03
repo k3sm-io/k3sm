@@ -503,7 +503,17 @@ func runServer(args []string) error {
 				vmNetSubnet: guestNATSubnet(vmCapable),
 				hostingCMs:  cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 				advertCMs:   cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-				logger:      logger,
+				// The per-node registry Service + its hand-written EndpointSlice,
+				// in the SAME namespace as the advertisement: one cluster address
+				// a native Pod, a vm guest and the host all reach this node's
+				// registry at. Written with the retained admin client, exactly as
+				// the advertisement is — the node identities that READ them
+				// already hold cluster-wide services/endpointslices through
+				// k3sm:node-datapath (pkg/rbac).
+				clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
+				clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
+				clusterDomain: opts.domain,
+				logger:        logger,
 			})
 			defer stopRegistry()
 		}

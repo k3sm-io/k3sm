@@ -262,6 +262,90 @@ func TestStartIngestRegistry(t *testing.T) {
 		}
 	})
 
+	t.Run("a node with a relay address publishes its cluster Service", func(t *testing.T) {
+		// The ONE cluster address a native Pod, a vm guest and the host all reach
+		// this node's registry at. The endpoint is the relay's own address —
+		// EndpointSlice validation refuses a loopback one, so the registry's
+		// 127.0.0.1 listener can never be published here.
+		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
+		cs := fake.NewSimpleClientset()
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
+			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
+			clusterDomain: "cluster.local",
+			logger:        logger,
+		})
+		name := registrysvc.ClusterServiceName("mac-a")
+		published, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("no cluster Service was published: %v", err)
+		}
+		if published.Spec.Selector != nil {
+			t.Errorf("the Service carries a selector %v; nothing schedules the registry", published.Spec.Selector)
+		}
+		es, err := cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("no EndpointSlice was published, so the Service has a VIP and no backend: %v", err)
+		}
+		if len(es.Endpoints) != 1 || len(es.Endpoints[0].Addresses) != 1 || es.Endpoints[0].Addresses[0] != "100.64.1.1" {
+			t.Errorf("endpoints = %+v, want the node's relay address", es.Endpoints)
+		}
+		// The discovery document now names it, and only because it exists.
+		cm, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
+			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("the discovery ConfigMap was not published: %v", err)
+		}
+		want := registrysvc.ClusterServiceAuthority("mac-a", "cluster.local", 6450)
+		if !strings.Contains(cm.Data[registrysvc.HostingDataKey], want) {
+			t.Errorf("the discovery document %q does not carry hostFromClusterNetwork %q",
+				cm.Data[registrysvc.HostingDataKey], want)
+		}
+		stop()
+		if _, err := cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), name, metav1.GetOptions{}); err == nil {
+			t.Error("the EndpointSlice survived a clean shutdown")
+		}
+		if _, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), name, metav1.GetOptions{}); err == nil {
+			t.Error("the cluster Service survived a clean shutdown")
+		}
+	})
+
+	t.Run("a node with no relay address publishes no cluster Service and claims none", func(t *testing.T) {
+		// No mesh address and no vm network: nothing off loopback answers, so a
+		// hostFromClusterNetwork would name an address no caller could reach.
+		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
+		cs := fake.NewSimpleClientset()
+		stop := startIngestRegistry(t.Context(), ingestRegistry{
+			svc: svc, port: 6450, nodeName: "mac-a",
+			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
+			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
+			clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
+			clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
+			logger:        logger,
+		})
+		defer stop()
+		if _, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
+			Get(context.Background(), registrysvc.ClusterServiceName("mac-a"), metav1.GetOptions{}); err == nil {
+			t.Error("a node with no relay address published a cluster Service nothing would answer")
+		}
+		cm, err := cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace).
+			Get(context.Background(), registrysvc.HostingConfigMapName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("the discovery ConfigMap was not published: %v", err)
+		}
+		if strings.Contains(cm.Data[registrysvc.HostingDataKey], "hostFromClusterNetwork:") {
+			t.Errorf("the discovery document %q claims a cluster address on a node with no relay",
+				cm.Data[registrysvc.HostingDataKey])
+		}
+	})
+
 	t.Run("a failed publish leaves the registry serving", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		stop := startIngestRegistry(t.Context(), ingestRegistry{
