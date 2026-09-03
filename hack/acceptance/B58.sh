@@ -71,17 +71,44 @@ rm -rf "$DIST"
 # it stages STUBS: nothing here needs a real Mach-O or a ~250 MB control-plane
 # download, and keeping the network out is what lets this run anywhere. The
 # release pipeline stages the real thing and verifies digests.
+#
+# The stub set is DERIVED IN FULL from `k3sm install --print-required-artifacts`
+# — the same witness b58.3 asserts the archive's members against, and the same
+# contract hack/release/stage.sh produces into build/stage/ for a real release.
+# ONE witness, both sides: an artifact added to pkg/install.RequiredSiblings is
+# staged here and demanded there in the same edit, so this gate can only ever go
+# red for a MISSING MANIFEST MEMBER — never for a stale stub list.
+#
+# FIXED 2026-09-03. This loop previously derived only the cp-payload half and
+# re-typed the root-level half by hand, which is the second copy that went stale:
+# the vm path added k3sm-vmhost to RequiredSiblings and to .goreleaser.yaml, no
+# stub was staged for it, and goreleaser aborted the whole release with
+# "globbing failed for pattern build/stage/k3sm-vmhost" — reddening 15 rungs for
+# a defect in this gate's own fixture rather than in the manifest it gates.
+#
+# Fail-closed: the derivation's exit status is captured (never swallowed with
+# 2>/dev/null) and an empty set is a hard FAIL. A silent derivation failure would
+# stage nothing, and "goreleaser could not find its inputs" must not be reported
+# as a manifest defect.
 STAGE="$REPO_ROOT/build/stage"
 rm -rf "$REPO_ROOT/build"
-mkdir -p "$STAGE/cp-payload"
-printf 'stub\n' >"$STAGE/k3sm-execshim"
-printf 'stub\n' >"$STAGE/libk3sm_pathrebase_shim.dylib"
-printf 'stub\n' >"$STAGE/libk3sm_getaddrinfo_shim.dylib"
-# Derived, not re-typed: the payload set comes from the binary's own contract.
-for b in $(cd "$REPO_ROOT" && GOWORK=off go run ./cmd/k3sm install --print-required-artifacts 2>/dev/null | sed -n 's|^cp-payload/||p'); do
-	printf 'stub\n' >"$STAGE/cp-payload/$b"
-done
+mkdir -p "$STAGE"
 trap 'rm -rf "$REPO_ROOT/build"' EXIT
+REQ_RC=0
+REQUIRED="$( (cd "$REPO_ROOT" && GOWORK=off go run ./cmd/k3sm install --print-required-artifacts) )" || REQ_RC=$?
+if [ "$REQ_RC" -ne 0 ] || [ -z "$REQUIRED" ]; then
+	ladder no "b58.2  derive the required-artifact set (k3sm install --print-required-artifacts exited $REQ_RC) — the staging fixture cannot be built, so the archive proof MEASURED NOTHING"
+	echo "----------------------------------------"
+	echo "B58: $PASS passed, $FAIL failed" >&2
+	exit 1
+fi
+while IFS= read -r rel; do
+	[ -n "$rel" ] || continue
+	mkdir -p "$STAGE/$(dirname "$rel")"
+	printf 'stub\n' >"$STAGE/$rel"
+done <<EOF
+$REQUIRED
+EOF
 
 if ( cd "$REPO_ROOT" && GOWORK=off goreleaser release --snapshot --clean --skip=publish,sign,notarize ); then
 	ladder ok "b58.2  goreleaser snapshot release succeeded"
@@ -97,10 +124,9 @@ TARBALL="$(find "$DIST" -name '*darwin*arm64*.tar.gz' -print -quit 2>/dev/null |
 if [ -n "$TARBALL" ] && [ -f "$TARBALL" ]; then
 	ladder ok "b58.3  darwin/arm64 archive produced ($(basename "$TARBALL"))"
 	members="$(tar tzf "$TARBALL")"
-	required="$(cd "$REPO_ROOT" && GOWORK=off go run ./cmd/k3sm install --print-required-artifacts 2>/dev/null)"
-	if [ -z "$required" ]; then
-		ladder no "b58.3  could not derive the required-artifact set (k3sm install --print-required-artifacts)"
-	fi
+	# The SAME derived set the stubs were staged from — re-running the binary here
+	# could only introduce a skew between what was staged and what is demanded.
+	required="$REQUIRED"
 	# k3sm/k3sm-netd/LICENSE/NOTICE are the manifest's own members; the rest are
 	# derived. cp-payload members are asserted with their DIRECTORY prefix, since
 	# landing them at the archive root is the exact mis-encoding that breaks install.
