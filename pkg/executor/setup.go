@@ -110,6 +110,12 @@ func StateDBPath(workDir string) string { return filepath.Join(dbDir(workDir), "
 // (downloaded alongside the control-plane binaries by ensureControlPlaneBinaries).
 func KubectlPath(workDir string) string { return filepath.Join(binDir(workDir), "kubectl") }
 
+// BinDir returns the work dir's binary cache (<workDir>/bin) — where the
+// control-plane payload, kubectl and the pinned host buildx live. Exported so a
+// caller that stages another pinned binary there joins the layout HERE rather
+// than repeating it, mirroring KubectlPath.
+func BinDir(workDir string) string { return binDir(workDir) }
+
 // AuditLogPath returns the apiserver audit-log path for a given work dir
 // (<workDir>/audit/audit.log — the 0700 dir writeConformanceConfig creates).
 // Exported so argv, the tests, and the M10 audit e2e all probe the SAME file

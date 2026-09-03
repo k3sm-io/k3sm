@@ -19,6 +19,7 @@ package builder
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,6 +201,70 @@ func TestUpToReady(t *testing.T) {
 	if _, err := cs.CoreV1().PersistentVolumeClaims(DefaultNamespace).Get(context.Background(), DefaultName, metav1.GetOptions{}); err != nil {
 		t.Errorf("PVC was not created by Up: %v", err)
 	}
+}
+
+// TestEnsureRunning pins the bootstrap entry point `k3sm build` calls: a ready
+// engine is a silent no-op, and an absent one is brought up with exactly one
+// progress line rather than an instruction to go run another command.
+func TestEnsureRunning(t *testing.T) {
+	t.Run("a ready engine is untouched and silent", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(builderPod(corev1.PodRunning), builderService("10.96.0.9"))
+		m := NewManager(cs, &fakeExecer{outputs: []string{oneWorker}}, Config{}, nil)
+		m.pollInterval = time.Millisecond
+
+		var said []string
+		st, err := m.EnsureRunning(context.Background(), func(msg string) { said = append(said, msg) })
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+		if st.State != StateReady || st.Endpoint != "tcp://10.96.0.9:1234" {
+			t.Errorf("state = %q endpoint = %q", st.State, st.Endpoint)
+		}
+		if len(said) != 0 {
+			t.Errorf("a ready engine reported progress: %v", said)
+		}
+		if _, err := cs.CoreV1().PersistentVolumeClaims(DefaultNamespace).Get(context.Background(), DefaultName, metav1.GetOptions{}); err == nil {
+			t.Error("a ready engine had its stack re-applied")
+		}
+	})
+
+	t.Run("an engine that is not serving is brought up with one progress line", func(t *testing.T) {
+		// The pod exists but no worker has registered (buildkitd binds its
+		// listener before the OCI worker is ready), so the engine is Starting:
+		// EnsureRunning must say so once and then wait, not return a
+		// not-ready engine to a build that would dial into nothing.
+		ex := &fakeExecer{outputs: []string{workersHeader, oneWorker}}
+		cs := fake.NewSimpleClientset(builderPod(corev1.PodRunning), builderService("10.96.0.9"))
+		m := NewManager(cs, ex, Config{}, nil)
+		m.pollInterval = time.Millisecond
+
+		var said []string
+		st, err := m.EnsureRunning(context.Background(), func(msg string) { said = append(said, msg) })
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+		if st.State != StateReady {
+			t.Errorf("state = %q, want Ready", st.State)
+		}
+		if len(said) != 1 {
+			t.Fatalf("progress lines = %d (%v), want exactly 1", len(said), said)
+		}
+		if !strings.Contains(said[0], "build engine") {
+			t.Errorf("progress line does not say what is happening: %q", said[0])
+		}
+		if _, err := cs.CoreV1().PersistentVolumeClaims(DefaultNamespace).Get(context.Background(), DefaultName, metav1.GetOptions{}); err != nil {
+			t.Errorf("Up did not run (no cache PVC): %v", err)
+		}
+	})
+
+	t.Run("a nil progress callback is allowed", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(builderPod(corev1.PodRunning), builderService("10.96.0.9"))
+		m := NewManager(cs, &fakeExecer{outputs: []string{workersHeader, oneWorker}}, Config{}, nil)
+		m.pollInterval = time.Millisecond
+		if _, err := m.EnsureRunning(context.Background(), nil); err != nil {
+			t.Fatalf("EnsureRunning with a nil progress: %v", err)
+		}
+	})
 }
 
 // TestUpWaitsThenReady pins the poll loop: the first probe finds no worker, the

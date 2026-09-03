@@ -48,28 +48,33 @@ func TestBuildxPinIsWellFormed(t *testing.T) {
 }
 
 // TestValidatePin exercises the pure validation core across well-formed and
-// malformed pins.
+// malformed pins, on both the guest (linux-arm64) and host (darwin-arm64) axes —
+// the platform argument is what stops a bump from pinning one arch's asset name
+// against the other arch's digest.
 func TestValidatePin(t *testing.T) {
 	good := "de05dccd47932eb9fd6e63781ab29d2b0b2c834bbdd19b51d7ea452b1fe378d3"
 	cases := []struct {
-		name    string
-		version string
-		asset   string
-		sha     string
-		wantErr bool
+		name     string
+		version  string
+		asset    string
+		sha      string
+		platform string
+		wantErr  bool
 	}{
-		{"valid", "v0.17.1", "buildx-v0.17.1.linux-arm64", good, false},
-		{"empty version", "", "buildx-.linux-arm64", good, true},
-		{"short sha", "v0.17.1", "buildx-v0.17.1.linux-arm64", "abcd", true},
-		{"uppercase sha", "v0.17.1", "buildx-v0.17.1.linux-arm64", strings.ToUpper(good), true},
-		{"asset version mismatch", "v0.17.1", "buildx-v0.16.0.linux-arm64", good, true},
-		{"asset wrong arch", "v0.17.1", "buildx-v0.17.1.linux-amd64", good, true},
+		{"valid", "v0.17.1", "buildx-v0.17.1.linux-arm64", good, "linux-arm64", false},
+		{"valid host", "v0.17.1", "buildx-v0.17.1.darwin-arm64", good, "darwin-arm64", false},
+		{"empty version", "", "buildx-.linux-arm64", good, "linux-arm64", true},
+		{"short sha", "v0.17.1", "buildx-v0.17.1.linux-arm64", "abcd", "linux-arm64", true},
+		{"uppercase sha", "v0.17.1", "buildx-v0.17.1.linux-arm64", strings.ToUpper(good), "linux-arm64", true},
+		{"asset version mismatch", "v0.17.1", "buildx-v0.16.0.linux-arm64", good, "linux-arm64", true},
+		{"asset wrong arch", "v0.17.1", "buildx-v0.17.1.linux-amd64", good, "linux-arm64", true},
+		{"guest asset under host platform", "v0.17.1", "buildx-v0.17.1.linux-arm64", good, "darwin-arm64", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePin(tc.version, tc.asset, tc.sha)
+			err := validatePin(tc.version, tc.asset, tc.sha, tc.platform)
 			if tc.wantErr != (err != nil) {
-				t.Fatalf("validatePin(%q,%q,%q) err=%v, wantErr=%v", tc.version, tc.asset, tc.sha, err, tc.wantErr)
+				t.Fatalf("validatePin(%q,%q,%q,%q) err=%v, wantErr=%v", tc.version, tc.asset, tc.sha, tc.platform, err, tc.wantErr)
 			}
 		})
 	}

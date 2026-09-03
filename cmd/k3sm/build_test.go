@@ -810,13 +810,13 @@ func testOutputSinks(t *testing.T) {
 	t.Run("tarball-round-trips", func(t *testing.T) {
 		t.Parallel()
 		out := filepath.Join(t.TempDir(), "img.tar")
-		if err := build(t.Context(), buildOptions{
+		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
 			tag:        "example.com/app:v1",
 			output:     out,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard); err != nil {
+		}, io.Discard, engineBuild, noStore); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		img, err := tarball.ImageFromPath(out, nil)
@@ -835,13 +835,13 @@ func testOutputSinks(t *testing.T) {
 	t.Run("oci-layout-round-trips", func(t *testing.T) {
 		t.Parallel()
 		out := filepath.Join(t.TempDir(), "layout")
-		if err := build(t.Context(), buildOptions{
+		if err := buildWith(t.Context(), buildOptions{
 			dockerfile: filepath.Join(ctxDir, "Dockerfile"),
 			tag:        "example.com/app:v1",
 			output:     out,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, io.Discard); err != nil {
+		}, io.Discard, engineBuild, noStore); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(out, "index.json")); err != nil {
@@ -852,18 +852,22 @@ func testOutputSinks(t *testing.T) {
 		}
 	})
 
-	t.Run("rejected-dockerfile-writes-no-output", func(t *testing.T) {
+	t.Run("malformed-dockerfile-writes-no-output", func(t *testing.T) {
 		t.Parallel()
-		bad := filepath.Join(ctxDir, "Dockerfile.run")
-		if err := os.WriteFile(bad, []byte("FROM scratch\nCOPY app /app\nRUN make"), 0o644); err != nil {
+		// A Dockerfile that is not usable by ANY builder is still refused here,
+		// natively and immediately — routing it to the engine would spend
+		// minutes to re-derive the same syntax error. The artifact assertion is
+		// the point: parsing completes before the output is opened.
+		bad := filepath.Join(ctxDir, "Dockerfile.malformed")
+		if err := os.WriteFile(bad, []byte("FROM scratch\nCOPY app"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		out := filepath.Join(t.TempDir(), "img.tar")
-		err := build(t.Context(), buildOptions{
+		err := buildWith(t.Context(), buildOptions{
 			dockerfile: bad, tag: "example.com/app:v1", output: out, format: "docker", contextDir: ctxDir,
-		}, io.Discard)
-		if !errors.Is(err, oci.ErrRunUnsupported) {
-			t.Fatalf("build = %v, want ErrRunUnsupported", err)
+		}, io.Discard, engineBuild, noStore)
+		if !errors.Is(err, oci.ErrBadInstruction) {
+			t.Fatalf("build = %v, want ErrBadInstruction", err)
 		}
 		if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("a rejected build left an artifact at %s", out)
@@ -883,7 +887,6 @@ func testBuildCLI(t *testing.T) {
 	}{
 		{"unknown-flag", []string{"--nope", "."}, "nope"},
 		{"missing-tag", []string{"--output", "o.tar", "."}, "--tag"},
-		{"missing-output", []string{"--tag", "a:v1", "."}, "--output"},
 		{"missing-context", []string{"--tag", "a:v1", "--output", "o.tar"}, "context"},
 		{"bad-format", []string{"--tag", "a:v1", "--output", "o", "--format", "zip", "."}, "format"},
 		{"flag-after-context", []string{".", "--tag", "a:v1"}, "before the context"},
