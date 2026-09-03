@@ -105,7 +105,7 @@ run_test() {
 }
 
 # ---- builder.1 — the Pod/Service/PVC render (the posture) ------------------
-# Guest-root with NO securityContext is the load-bearing fact (m12-plan Res. 5):
+# Guest-root with NO securityContext is the load-bearing fact:
 # the vm is the isolation boundary and buildkitd needs real root.
 run_test "builder.1a" 9 TestPodSpec ./pkg/builder/
 run_test "builder.1b" 1 TestServiceSpec ./pkg/builder/

@@ -80,8 +80,8 @@ const (
 // ghcr.io/k3sm-io/mirror/* namespace is currently PRIVATE and its populate
 // workflow is dormant, so an anonymous mirror pull fails today and the pod would
 // need an imagePullSecret it cannot get. The digest is byte-identical either way
-// (m12-plan Resolution 12: the mirror copy preserves upstream's digest), so this
-// is exactly the documented GHCR-outage runbook — pull the same digest from
+// — per the digest-pinned mirror decision, the mirror copy preserves upstream's
+// digest — so this is exactly the documented GHCR-outage runbook — pull the same digest from
 // upstream — made the default. `Config.UseMirror` flips to the mirror ref for a
 // deployment that has published the package and holds a read:packages token.
 func DefaultImage() string {
@@ -255,7 +255,7 @@ func (c Config) Service() *corev1.Service {
 
 // Pod renders the long-lived buildkitd engine Pod.
 //
-// It carries NO securityContext by design (m12-plan Resolution 5): the vm
+// It carries NO securityContext by design: the vm
 // RuntimeClass boots it under Virtualization.framework and the image's own root
 // IS guest root with full caps — the VM is the isolation boundary, and buildkitd
 // + runc need real root to mount cgroups and create build containers. restartPolicy
