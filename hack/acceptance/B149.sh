@@ -181,6 +181,10 @@ snap_hits() { grep -vE '^[[:space:]]*#' "$1" | grep -c 'snapshot' || true; }
 # POSITIVE CONTROL: the same scan over a copy that DOES emit it must find it. An
 # absence assertion that never demonstrated it can detect a presence is not a test.
 cp "$HARNESS" "$WORK/mutant-snap.sh"
+# The single quotes are the point: the mutant must carry the LITERAL text a real
+# checkpoint call would have, `$name` included, so the scan sees exactly what it
+# would see in the harness. Expanding it here would test a different string.
+# shellcheck disable=SC2016  # deliberate literal — the mutant is data, not code to run
 echo 'tart_cli snapshot "$name"' >>"$WORK/mutant-snap.sh"
 if [ "$(snap_hits "$HARNESS")" -ne 0 ]; then
 	vocab=no; echo "        hack/lab-vm.sh source emits the checkpoint verb outside a comment"
