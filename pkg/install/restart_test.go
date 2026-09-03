@@ -189,4 +189,51 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		}
 	})
 
+	t.Run("verifyDaemons names both states", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		f.putLoaded(NetdLabel) // the server never came up
+		err := verifyDaemons(context.Background(), f, installCfg().withDefaults())
+		if err == nil {
+			t.Fatal("verifyDaemons must fail when a daemon is down")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, NetdLabel+" up (pid") || !strings.Contains(msg, ServerLabel+" DOWN") {
+			t.Errorf("verifyDaemons error %q must name the state of BOTH daemons", msg)
+		}
+	})
+}
+
+// TestInstallVerifiesDaemonsAfterRestart proves install asserts what it claims:
+// both daemons live AND the netd socket the two rendezvous on present. Without this
+// an install returns success having left the helper dead — which is exactly how the
+// failure went unnoticed until cluster DNS stopped answering.
+func TestInstallVerifiesDaemonsAfterRestart(t *testing.T) {
+	t.Run("a healthy pair verifies", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := reinstallFake()
+		if err := Install(context.Background(), f, installCfg()); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if countCalls(f, "PathExists:"+DefaultNetdSocket) == 0 {
+			t.Errorf("install never verified the netd socket %s", DefaultNetdSocket)
+		}
+	})
+
+	t.Run("netd loaded but never binding its socket fails the install", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := reinstallFake()
+		f.putMissingPath(DefaultNetdSocket)
+
+		err := Install(context.Background(), f, installCfg())
+		if err == nil {
+			t.Fatal("install must fail when netd never binds the helper socket the control plane dials")
+		}
+		if !strings.Contains(err.Error(), DefaultNetdSocket) {
+			t.Errorf("error %q must name the absent socket", err)
+		}
+		if f.kubeUser != "" {
+			t.Errorf("kubeconfig written to %q despite an unverified install", f.kubeUser)
+		}
+	})
 }

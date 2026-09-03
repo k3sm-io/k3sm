@@ -67,6 +67,10 @@ type fakeSystem struct {
 	// It is consulted after the queue, so a test can describe "transient twice,
 	// then permanently broken" if it needs to.
 	bootstrapAlways map[string]error
+	// missingPaths are paths PathExists reports absent. The zero value reports
+	// EVERY path present, so an unconfigured fake describes a healthy install and
+	// only a test that cares about the netd socket has to say so.
+	missingPaths map[string]bool
 	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
 	// path. The zero value (no entry) means "signed and entitled" so that every
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
@@ -110,6 +114,15 @@ func (f *fakeSystem) putLoaded(labels ...string) {
 		f.pid++
 		f.loaded[l] = f.pid
 	}
+}
+
+// putMissingPath makes PathExists report path absent (the netd socket a helper that
+// never came up never binds).
+func (f *fakeSystem) putMissingPath(path string) {
+	if f.missingPaths == nil {
+		f.missingPaths = map[string]bool{}
+	}
+	f.missingPaths[path] = true
 }
 
 // shrinkRestartBudgets collapses the restart waits for the duration of a test, so a
@@ -258,6 +271,13 @@ func (f *fakeSystem) LaunchctlServicePID(label string) (int, error) {
 	return pid, nil
 }
 
+// PathExists answers present for every path a test has not explicitly hidden, so an
+// unconfigured fake describes a healthy install.
+func (f *fakeSystem) PathExists(path string) (bool, error) {
+	f.calls = append(f.calls, "PathExists:"+path)
+	return !f.missingPaths[path], nil
+}
+
 func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
 	f.kubeUser = targetUser
@@ -332,6 +352,11 @@ func TestInstallOrchestration(t *testing.T) {
 		"ServicePID:io.k3sm.server",
 		"Bootstrap:io.k3sm.server",
 		"ServicePID:io.k3sm.server",
+		// Then the post-restart verification: both pids re-read, and the netd
+		// socket the two daemons rendezvous on asserted present.
+		"ServicePID:io.k3sm.netd",
+		"ServicePID:io.k3sm.server",
+		"PathExists:/var/lib/k3sm/run/netd.sock",
 		"WriteUserKubeconfig:alice",
 	}
 	if len(f.calls) != len(want) {

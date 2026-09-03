@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -302,6 +303,23 @@ func transientLaunchctlOutput(out string) bool {
 	return strings.Contains(lower, "operation already in progress") ||
 		strings.Contains(lower, "input/output error") ||
 		transientErrno.MatchString(out)
+}
+
+// PathExists reports whether path exists, without opening it. Install verifies the
+// netd unix socket this way because no file read can answer for a socket: opening
+// one with the file API fails whether or not netd is listening. A not-exist stat is
+// (false, nil); any other stat failure is returned, because "I could not tell" must
+// never be reported as "absent". Lstat, not Stat, so a dangling symlink at the
+// socket path is reported as present — it exists, and it is not this check's job to
+// decide it is the wrong kind of thing.
+func (darwinSystem) PathExists(path string) (bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // LaunchctlBootout unloads the daemon. A not-loaded label (exit 113/3) is treated

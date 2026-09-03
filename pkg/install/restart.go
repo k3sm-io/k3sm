@@ -239,6 +239,58 @@ func recoverBootedOut(sys System, labels []string) string {
 	}
 }
 
+// verifyDaemons is the assertion the install path never used to make: after the
+// restarts, BOTH daemons report a live pid and the netd unix socket the two
+// rendezvous on is on disk. Without it an install could return success having left
+// netd down — the exact outcome the racing bootstrap produced, and the reason it
+// went unnoticed until a cluster's DNS stopped answering.
+//
+// The socket is polled rather than sampled once: netd binds it after its own
+// startup, so a single read immediately after the bootstrap tests the wrong thing.
+// The error names the state of EVERY component, not just the first bad one — an
+// operator needs to know what IS running as much as what is not.
+func verifyDaemons(ctx context.Context, sys System, cfg Config) error {
+	states, healthy := daemonStates(sys)
+	switch err := awaitPath(ctx, sys, cfg.NetdSocket, restartBudgetFor(NetdLabel)); {
+	case err == nil:
+		states = append(states, cfg.NetdSocket+" present")
+	default:
+		states = append(states, err.Error())
+		healthy = false
+	}
+	if !healthy {
+		return fmt.Errorf("the restarted daemons are not both healthy: %s", strings.Join(states, "; "))
+	}
+	cfg.Logger.Info("verified both daemons after the restart", "state", strings.Join(states, "; "))
+	return nil
+}
+
+// awaitPath polls for path to appear, within the budget's running window. Its
+// error text is a state clause, because verifyDaemons reports it alongside the two
+// pid clauses rather than wrapping it.
+func awaitPath(ctx context.Context, sys System, path string, b restartBudget) error {
+	deadline := time.Now().Add(b.running)
+	for {
+		ok, err := sys.PathExists(path)
+		switch {
+		case err != nil:
+			// Unverifiable is not absent, and must not be reported as either
+			// present or absent.
+			return fmt.Errorf("%s unverifiable: %v", path, err)
+		case ok:
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s ABSENT after %s (netd is not serving the helper socket the control plane dials)", path, b.running)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(b.poll):
+		}
+	}
+}
+
 // daemonStates reports one clause per daemon — "up (pid N)" or "DOWN (<why>)" —
 // and whether every one of them is up. It is the single home of that vocabulary,
 // used both by the post-restart verification and by the mid-restart failure path,

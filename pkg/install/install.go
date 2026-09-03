@@ -238,6 +238,14 @@ type System interface {
 	// window, or a job that has exited and not yet been relaunched). A label that
 	// is not loaded at all is an error. It is read-only.
 	LaunchctlServicePID(label string) (int, error)
+	// PathExists reports whether path exists, WITHOUT reading it. Install's
+	// post-restart verification uses it on the netd unix socket, which no
+	// ReadFile can answer for: opening a socket with the file API fails on
+	// darwin regardless of whether the helper is listening, so "readable" and
+	// "present" are different questions and only the second one is meaningful
+	// here. A false verdict is not an error; an error means the check itself
+	// could not be made (a permission or IO failure on the parent tree).
+	PathExists(path string) (bool, error)
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
 	// ~/.kube/config, owned by targetUser (not root).
 	WriteUserKubeconfig(targetUser string, contents []byte) error
@@ -770,6 +778,14 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//    restart.go sequences them — see its file comment for the failure this cost
 	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
 	if err := restartDaemons(ctx, sys, m, cfg.Logger); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+
+	// 4b. Verify the claim step 4 makes, rather than assuming it. An install that
+	//     reports success having left a daemon down is worse than one that fails:
+	//     the operator walks away, and the breakage surfaces later as something
+	//     else entirely (a cluster whose DNS stopped answering).
+	if err := verifyDaemons(ctx, sys, cfg); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 
