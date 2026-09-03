@@ -70,7 +70,7 @@ it must be staged under `/Library` to sit inside the pod Seatbelt read baseline,
 write there, so an unprivileged (rootless) `k3sm server` never stages it — a rootless pod expecting an
 absolute mount path sees the unmounted host path instead. This is why a ladder that depends on
 absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a root-tier run: rootless stops
-at mount resolution by design, not by omission.
+at mount resolution.
 
 ### NetworkPolicy Is a Policy Hint, Not a Security Boundary
 
@@ -192,7 +192,7 @@ provider has no `EventRecorder` yet; wiring one is planned.
 
 All of this assumes the supported posture: a single operator's Mac with trusted namespaces. Any
 principal who can create a Service can claim a host port, and k3sm does not restrict which ports —
-that is an accepted risk of the ServiceLB model k3s also ships, not an oversight.
+that is an accepted risk of the ServiceLB model k3s also ships.
 
 ### Per-Pod IP Is Addressing and Identity, Not Isolation
 
@@ -458,8 +458,8 @@ depends on stdin reaching EOF when the operator walks away, do not rely on `stdi
 **Attach replays a bounded buffer, so a screen can start out wrong.** Attaching replays the most
 recent output the guest still holds — bounded to **64 KiB**, and to 4096 separate writes — and then
 follows live. Two consequences for a full-screen program: the replay can begin in the middle of an
-escape sequence, and a client too slow to keep up has bytes dropped on purpose, with an in-band
-notice saying so. Dropping is the deliberate choice: the alternative is blocking the workload on its
+escape sequence, and a client too slow to keep up has bytes dropped, with an in-band
+notice saying so. The alternative would block the workload on its
 own `stdout` because somebody's terminal is slow. Both render as a garbled line or two. Redraw with
 `Ctrl-L` — nothing is wrong with the process.
 

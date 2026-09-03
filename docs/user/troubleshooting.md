@@ -172,7 +172,7 @@ The node advertises a capability label only when its start-time probe said yes.
    explaining why the capability was not advertised, and one naming the `label` key that was therefore
    left absent — grep the log for the key itself (`k3sm.io/rosetta-linux`) and you land on it.
 3. `k3sm.io/rosetta-linux` needs **both** virtualization and guest Rosetta. A node with
-   `k3sm.io/rosetta` but no `k3sm.io/virtualization` will **never** carry it — that is correct, not a bug.
+   `k3sm.io/rosetta` but no `k3sm.io/virtualization` will **never** carry it.
 4. Installed Rosetta after the node came up? The probes run once at daemon start — restart it:
    `sudo launchctl kickstart -k system/io.k3sm.server`.
 5. Your Pod must also keep `kubernetes.io/os: darwin` in its `nodeSelector`; a Pod with only the

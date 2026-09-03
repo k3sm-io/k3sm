@@ -40,9 +40,8 @@ host: localhost:6450
 hostFromContainerRuntime: localhost:6450
 ```
 
-`hostFromClusterNetwork` is deliberately **absent**, and its absence is a truthful statement rather
-than an oversight. That field means "an address a workload inside the cluster network can pull
-from". A native Pod is a Darwin process on this host, so its `localhost` is the host's and
+`hostFromClusterNetwork` is **absent**. That field means "an address a workload inside the cluster
+network can pull from". A native Pod is a Darwin process on this host, so its `localhost` is the host's and
 `hostFromContainerRuntime` already covers it. A Pod running under the Linux `RuntimeClass` is a
 guest with its **own** loopback, on which the registry is not listening — so there is no address
 k3sm could publish there that a guest could actually use.
