@@ -15,9 +15,18 @@
 #
 #   hack/release/stage.sh <out-dir> [--binary-name <name>] [--stub-payload]
 #                         [--ldflags <flags>]
+#   hack/release/stage.sh <dir> --verify-only [--binary-name <name>]
 #
 #   <out-dir>        directory to assemble into (created; must not be under dist/,
 #                    which goreleaser empties with --clean)
+#   --verify-only    build and sign NOTHING; run only the verification block
+#                    (completeness against the install contract, codesign --verify
+#                    on every Mach-O, the arm64 arch assert, and the k3sm-vmhost
+#                    virtualization-entitlement read-back) over a tree that already
+#                    exists. This is the seam the workspace's hack/release-gate.sh
+#                    drives so the artifact-quality tier re-uses THESE checks over
+#                    the extracted archive rather than growing a second copy of
+#                    them that can drift from what staging asserts.
 #   --binary-name    name for the k3sm binary in <out-dir> (default: k3sm)
 #   --stub-payload   write placeholder payload files instead of downloading the
 #                    real ~250 MB control-plane set; for shape/layout checks only,
@@ -42,6 +51,7 @@ WS_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 
 BINARY_NAME="k3sm"
 STUB_PAYLOAD=0
+VERIFY_ONLY=0
 LDFLAGS=""
 OUT=""
 
@@ -51,8 +61,9 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--binary-name) BINARY_NAME="${2:?--binary-name needs a value}"; shift 2 ;;
 	--stub-payload) STUB_PAYLOAD=1; shift ;;
+	--verify-only) VERIFY_ONLY=1; shift ;;
 	--ldflags) LDFLAGS="${2?--ldflags needs a value}"; shift 2 ;;
-	-h | --help) sed -n '2,35p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,44p' "$0"; exit 0 ;;
 	-*) die "unknown flag: $1" ;;
 	*)
 		[ -z "$OUT" ] || die "only one output directory may be given (got '$OUT' and '$1')"
@@ -61,17 +72,94 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$OUT" ] || die "usage: stage.sh <out-dir> [--binary-name <name>] [--stub-payload]"
 
-case "$OUT" in
-*/dist | */dist/*) die "refusing to stage under dist/ — goreleaser owns it and --clean empties it before the archive globs run" ;;
-esac
+if [ "$VERIFY_ONLY" = 1 ]; then
+	[ "$STUB_PAYLOAD" = 0 ] || die "--verify-only and --stub-payload are mutually exclusive (nothing is produced to stub)"
+	[ -z "$LDFLAGS" ] || die "--verify-only builds nothing, so --ldflags has no meaning"
+	[ -d "$OUT" ] || die "--verify-only: $OUT is not a directory"
+else
+	case "$OUT" in
+	*/dist | */dist/*) die "refusing to stage under dist/ — goreleaser owns it and --clean empties it before the archive globs run" ;;
+	esac
+	mkdir -p "$OUT"
+fi
 
-mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 BIN="$OUT/$BINARY_NAME"
 PAYLOAD_DIR="$OUT/cp-payload"
 
 # Every Go build in this script targets the shipped platform, never the host's.
 export GOOS=darwin GOARCH=arm64 CGO_ENABLED=1
+
+# The per-pod VM host helper is the ONLY k3sm binary that carries
+# com.apple.security.virtualization (runtimed/pkg/sandbox.VMHostName), which is
+# why it is signed separately below and why its entitlement is read back in
+# verify_tree: a dev-staged k3sm-vmhost without it installs cleanly and then
+# breaks every vm-RuntimeClass pod, with the only symptom being the node losing
+# its k3sm.io/virtualization label.
+VMHOST_ENTITLEMENTS="$WS_ROOT/runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
+
+# ---- verification ------------------------------------------------------------
+# ONE implementation, driven from two directions: the staging path calls it after
+# it builds and signs, and --verify-only calls it over a tree somebody else
+# produced (an extracted release archive, a set about to be installed). Keeping
+# it a function rather than a second script is the point — the checks that decide
+# whether a staged tree is shippable must not have a second copy that drifts.
+#
+# Every set below is DERIVED, never listed: the required members come from the
+# binary's own `install --print-required-artifacts` contract, and the Mach-O set
+# comes from file(1) rather than a name list, so an artifact added to
+# pkg/install.RequiredSiblings is checked here without this script being edited.
+verify_tree() {
+	local rel missing=0 f desc bad_sign=0 bad_arch=0 n_macho=0
+
+	echo "==> verify completeness against the install contract"
+	[ -x "$BIN" ] || die "$BIN is missing or not executable — cannot ask it what the set must contain"
+	for rel in $("$BIN" install --print-required-artifacts); do
+		[ -e "$OUT/$rel" ] || { echo "    MISSING: $rel"; missing=1; }
+	done
+	[ "$missing" = 0 ] || die "tree is incomplete — 'k3sm install' would fail-fast on the above"
+
+	# codesign + architecture, per Mach-O. The signature is load-bearing even
+	# without a Developer ID: AMFI requires *some* signature on darwin/arm64. The
+	# arch assert is the ARCHITECTURE PIN check — a Mac whose Go toolchain runs
+	# under Rosetta defaults to GOARCH=amd64, and dyld HARD-TERMINATES a process
+	# whose inserted library is the wrong architecture.
+	echo "==> verify codesign + arm64 over every Mach-O"
+	while IFS= read -r f; do
+		desc="$(file -b "$f" 2>/dev/null || echo '?')"
+		case "$desc" in
+		*Mach-O*) ;;
+		*) continue ;;
+		esac
+		n_macho=$((n_macho + 1))
+		codesign --verify --strict "$f" >/dev/null 2>&1 || { echo "    UNSIGNED/INVALID: $f"; bad_sign=1; }
+		case "$desc" in
+		*arm64*) ;;
+		*) echo "    WRONG ARCH: $f -> $desc"; bad_arch=1 ;;
+		esac
+	done < <(find "$OUT" -type f)
+	[ "$bad_sign" = 0 ] || die "a staged Mach-O fails codesign --verify — launchd refuses it with OS_REASON_CODESIGNING"
+	[ "$bad_arch" = 0 ] || die "non-arm64 artifact staged (a Rosetta-defaulted toolchain? every build here pins GOARCH=arm64)"
+	[ "$n_macho" -ge 4 ] || die "only $n_macho Mach-O(s) found under $OUT — the set cannot be complete"
+
+	# The entitlement, read back off the signed Mach-O. codesign attaches NO
+	# entitlements when AMFI's plist parser balks — while still producing a
+	# signature that verifies as valid — so the check above cannot fail for the
+	# reason that matters (runtimed cmd/k3sm-vmhost/entitlements_test.go).
+	echo "==> verify k3sm-vmhost carries com.apple.security.virtualization"
+	[ -f "$OUT/k3sm-vmhost" ] || die "k3sm-vmhost is not in the tree"
+	codesign -d --entitlements - "$OUT/k3sm-vmhost" 2>/dev/null | grep -q "com.apple.security.virtualization" ||
+		die "k3sm-vmhost carries no com.apple.security.virtualization entitlement — every vm-RuntimeClass pod would go Pending on the node's missing k3sm.io/virtualization label"
+
+	echo "    $n_macho Mach-O(s) verified"
+}
+
+if [ "$VERIFY_ONLY" = 1 ]; then
+	echo "==> verify-only over $OUT (nothing built, nothing downloaded, nothing signed)"
+	verify_tree
+	echo "==> verified $(find "$OUT" -type f | wc -l | tr -d ' ') files in $OUT"
+	exit 0
+fi
 
 echo "==> staging into $OUT (darwin/arm64)"
 
@@ -95,10 +183,7 @@ echo "==> build DYLD shims (runtimed path-rebase, darwin-net getaddrinfo)"
 "$WS_ROOT/darwin-net/hack/build-shim.sh" "$OUT" >/dev/null
 
 # The per-pod VM host helper. Built from the workspace root for the same reason
-# as the exec shim, and signed separately below: it is the ONLY k3sm binary that
-# carries com.apple.security.virtualization, which is the whole point of it being
-# a separate process (runtimed/pkg/sandbox.VMHostName).
-VMHOST_ENTITLEMENTS="$WS_ROOT/runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
+# as the exec shim, and signed separately below (see VMHOST_ENTITLEMENTS above).
 echo "==> build k3sm-vmhost (runtimed)"
 [ -f "$VMHOST_ENTITLEMENTS" ] || die "vmhost entitlements plist not found at $VMHOST_ENTITLEMENTS"
 ( cd "$WS_ROOT" && go build -trimpath -o "$OUT/k3sm-vmhost" k3sm.io/runtimed/cmd/k3sm-vmhost )
@@ -119,64 +204,32 @@ else
 	"$BIN" payload "$PAYLOAD_DIR"
 fi
 
-# Ad-hoc sign every Mach-O, then VERIFY. The signature is load-bearing even
-# unsigned-by-Developer-ID: AMFI requires *some* signature on darwin/arm64. A
-# signer whose exit status is discarded proves nothing, so each is checked.
-echo "==> ad-hoc sign + verify"
-sign_and_verify() {
+# Ad-hoc sign every Mach-O. The signature is load-bearing even without a
+# Developer ID: AMFI requires *some* signature on darwin/arm64. Signing is all
+# that happens here — the assertions live in verify_tree above, which runs over
+# the finished tree, so the thing checked is the thing that ships rather than the
+# thing each step believed it had just made.
+echo "==> ad-hoc sign"
+sign_one() {
 	local f="$1" ents="${2:-}"
 	if [ -n "$ents" ]; then
 		codesign -s - -f --entitlements "$ents" "$f" >/dev/null 2>&1 || die "codesign failed for $f"
 	else
 		codesign -s - -f "$f" >/dev/null 2>&1 || die "codesign failed for $f"
 	fi
-	codesign --verify --strict "$f" >/dev/null 2>&1 || die "codesign --verify failed for $f"
-	# An entitled binary needs a SECOND assertion, because the first one cannot
-	# fail for the reason that matters: AMFI's plist parser is stricter than
-	# plutil's, and codesign attaches NO entitlements when it balks — while still
-	# producing a signature that verifies as valid. The only symptom downstream is
-	# VMBackend.Available() reporting false on a capable Mac, with nothing saying
-	# why (runtimed cmd/k3sm-vmhost/entitlements_test.go). So read the entitlement
-	# back off the signed Mach-O and require it to be there.
-	if [ -n "$ents" ]; then
-		codesign -d --entitlements - "$f" 2>/dev/null | grep -q "com.apple.security.virtualization" ||
-			die "$f signed but carries no com.apple.security.virtualization entitlement (AMFI rejected $ents?)"
-	fi
 }
 # Stubs are not Mach-Os, so signing is skipped for them by construction.
 if [ "$STUB_PAYLOAD" = 1 ]; then
 	for f in "$BIN" "$OUT/k3sm-execshim" "$OUT/libk3sm_pathrebase_shim.dylib" "$OUT/libk3sm_getaddrinfo_shim.dylib"; do
-		sign_and_verify "$f"
+		sign_one "$f"
 	done
 else
 	for f in "$BIN" "$OUT/k3sm-execshim" "$OUT/libk3sm_pathrebase_shim.dylib" "$OUT/libk3sm_getaddrinfo_shim.dylib" "$PAYLOAD_DIR"/*; do
-		sign_and_verify "$f"
+		sign_one "$f"
 	done
 fi
-sign_and_verify "$OUT/k3sm-vmhost" "$VMHOST_ENTITLEMENTS"
+sign_one "$OUT/k3sm-vmhost" "$VMHOST_ENTITLEMENTS"
 
-# Completeness, derived from the binary's own contract rather than this script's
-# memory of it: adding an artifact to pkg/install.RequiredSiblings reddens here
-# until the producer above learns to make it.
-echo "==> verify completeness against the install contract"
-missing=0
-for rel in $("$BIN" install --print-required-artifacts); do
-	[ -e "$OUT/$rel" ] || { echo "    MISSING: $rel"; missing=1; }
-done
-[ "$missing" = 0 ] || die "staged tree is incomplete — 'k3sm install' would fail-fast on the above"
-
-# Architecture, asserted per Mach-O. See the ARCHITECTURE PIN note above: this is
-# the check that catches a Rosetta-defaulted toolchain before the bytes ship.
-if [ "$STUB_PAYLOAD" != 1 ]; then
-	echo "==> verify every Mach-O is arm64"
-	badarch=0
-	while IFS= read -r f; do
-		case "$(file -b "$f")" in
-		*arm64*) ;;
-		*) echo "    WRONG ARCH: $f -> $(file -b "$f")"; badarch=1 ;;
-		esac
-	done < <(find "$OUT" -type f -perm -u+x)
-	[ "$badarch" = 0 ] || die "non-arm64 artifact staged (a Rosetta-defaulted toolchain? every build here pins GOARCH=arm64)"
-fi
+verify_tree
 
 echo "==> staged $(find "$OUT" -type f | wc -l | tr -d ' ') files into $OUT"
