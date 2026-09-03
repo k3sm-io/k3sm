@@ -165,21 +165,49 @@ func ClusterServiceAuthority(node, clusterDomain string, port int) string {
 }
 
 // ClusterLocalAuthorities returns every authority that names THIS node's own
-// ingest registry through its cluster Service — the fully qualified name, the
-// namespace-qualified ".svc" short form a Pod can resolve, and the VIP itself.
+// ingest registry through its cluster Service.
 //
-// It exists for runtimed's puller. runtimed decides whether a reference is
-// node-relative (and therefore eligible for the cluster-mirror fallback, and for
-// this node's own ingest registry's brokering) by asking whether its authority is
-// a LOOPBACK spelling — see runtimed/pkg/image's clusterLocalRef. A Pod that
-// names the Service address is asking for exactly the same registry by a
-// different name, so those spellings have to be injected: the classifier cannot
-// derive them, because they depend on a node name and a cluster domain runtimed
-// has never heard of.
+// It exists for runtimed's puller, which decides whether a reference is
+// node-relative — eligible for plain HTTP on the primary fetch and for the
+// peer-mirror fallback — by matching its authority EXACTLY, against a loopback
+// spelling plus whatever this list admits (runtimed/pkg/image's
+// WithClusterRegistries). The classifier cannot derive these: they depend on a
+// node name, a cluster domain and an assigned VIP runtimed has never heard of.
 //
-// clusterIP may be empty (the Service has not been assigned one yet), in which
-// case only the name spellings are returned. Nothing here is a URL: each element
-// is a bare host[:port] authority, the shape a reference's first component takes.
+// # Why these four spellings and no others
+//
+// The match is exact, so a spelling that is not listed is dialled as HTTPS
+// against a plain-HTTP listener — an inscrutable TLS error, not a 404. The set is
+// therefore every form that RESOLVES to this Service through a standard Pod's
+// resolv.conf (search "<ns>.svc.<domain> svc.<domain> <domain>", ndots 5), and
+// nothing beyond it:
+//
+//   - registry-<node>.k3sm-registry.svc.<domain>:<port> — fully qualified. What
+//     the KEP-1755 document publishes and what the docs tell an operator to write.
+//   - registry-<node>.k3sm-registry.svc:<port> — resolves from ANY namespace via
+//     the "svc.<domain>" search entry. The realistic hand-typed form.
+//   - registry-<node>.k3sm-registry:<port> — the classic "<service>.<namespace>"
+//     short form, which resolves through the same search entry. Listed because a
+//     Kubernetes user writes it by habit, and omitting it fails as a TLS error.
+//   - <clusterIP>:<port> — what a tool that already resolved the name writes back,
+//     and the only form available to a caller with no cluster DNS.
+//
+// Every one of them names the same Service, so admitting all four widens no
+// trust boundary: the plaintext posture is scoped to this node's own registry
+// however it is spelled.
+//
+// HONESTY: the three NAME forms are resolvable from inside a Pod, not from the
+// Mac. runtimed's puller runs host-side and uses the host resolver, which k3sm
+// does not point at the cluster's DNS — so a `spec.containers[].image` naming one
+// of them fails to resolve today, and only the VIP form is dialable there.
+// Admitting the names is still correct: it is the classification a reference
+// carrying one deserves, so if a caller ever does present one the transport and
+// the peer brokering are already right, and the failure a user does hit is a name
+// lookup rather than a TLS handshake against a plain-HTTP listener.
+//
+// clusterIP may be empty (no VIP assigned yet), in which case only the name
+// spellings are returned. Nothing here is a URL: each element is a bare
+// host[:port] authority, the shape a reference's first component takes.
 func ClusterLocalAuthorities(node, clusterDomain, clusterIP string, port int) []string {
 	if node == "" || port <= 0 || port > 65535 {
 		return nil
@@ -193,11 +221,26 @@ func ClusterLocalAuthorities(node, clusterDomain, clusterIP string, port int) []
 	out := []string{
 		net.JoinHostPort(fmt.Sprintf("%s.%s.svc.%s", name, AdvertisementNamespace, domain), p),
 		net.JoinHostPort(fmt.Sprintf("%s.%s.svc", name, AdvertisementNamespace), p),
+		net.JoinHostPort(fmt.Sprintf("%s.%s", name, AdvertisementNamespace), p),
 	}
 	if addr, err := netip.ParseAddr(clusterIP); err == nil && addr.IsValid() {
 		out = append(out, net.JoinHostPort(addr.String(), p))
 	}
 	return out
+}
+
+// LoopbackAuthority renders this node's own ingest registry as the loopback
+// authority a reference names it by — "localhost:<port>".
+//
+// It is spelled `localhost` and not 127.0.0.1 for the same reason the KEP-1755
+// document is: the OCI toolchain special-cases the literal name as an insecure
+// registry, and this is the authority a bare-name pull is rewritten to, so it is
+// the string that ends up in an image reference an operator reads back.
+func LoopbackAuthority(port int) string {
+	if port <= 0 || port > 65535 {
+		return ""
+	}
+	return net.JoinHostPort("localhost", strconv.Itoa(port))
 }
 
 // ClusterEndpointAddress returns the address the per-node Service sends a caller

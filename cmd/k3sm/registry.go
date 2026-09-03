@@ -119,10 +119,40 @@ type ingestRegistry struct {
 	logger *slog.Logger
 }
 
+// registryPullerWiring is everything runtimed's puller has to be told about THIS
+// node's own ingest registry. It is one struct rather than two return values
+// because the two fields are constrained by each other: runtimed refuses a
+// LocalHost that is neither a loopback spelling nor one of ClusterRegistries, and
+// that refusal fails the node's bring-up — so they are produced together, by the
+// one component that knows both.
+//
+// The zero value is the complete, correct wiring for a node with no registry:
+// runtimed's classification is then byte-identical to its pre-seam behavior.
+type registryPullerWiring struct {
+	// LocalHost is this node's ingest registry as a reference names it —
+	// "localhost:<port>". It makes a bare "app:v1" resolve here first instead of
+	// normalising straight to Docker Hub.
+	LocalHost string
+	// ClusterRegistries are the NON-loopback spellings of the same registry: the
+	// per-node Service's four resolvable authorities and its VIP
+	// (registrysvc.ClusterLocalAuthorities). Empty on a node that publishes no
+	// Service.
+	ClusterRegistries []string
+}
+
 // startIngestRegistry brings the registry up, publishes the KEP-1755 discovery
-// ConfigMap and this node's peer-facing advertisement, starts the mesh/guest
-// relay, and returns the teardown closure the caller defers. The closure is never
-// nil, so the caller's `defer stop()` is unconditional.
+// ConfigMap, this node's peer-facing advertisement and its per-node cluster
+// Service, starts the mesh/guest relay, and returns the teardown closure the
+// caller defers. The closure is never nil, so the caller's `defer stop()` is
+// unconditional.
+//
+// It ALSO returns the puller wiring: how runtimed should spell this node's own
+// registry (registryPullerWiring). It is returned rather than published somewhere
+// because runtimed's puller is the consumer — a reference carrying one of those
+// authorities is node-relative in exactly the sense a loopback one is, and
+// runtimed cannot derive them (they depend on a node name, a cluster domain and
+// an assigned VIP it never sees). The zero value on a registry that never started
+// leaves runtimed's classification byte for byte as it was.
 //
 // NOTHING HERE IS FATAL. A registry that cannot build, bind or serve leaves a
 // cluster that cannot ingest images; a bring-up that aborted over it leaves a
@@ -135,16 +165,16 @@ type ingestRegistry struct {
 // and advertisement alike. A document naming a port nothing answers on is worse
 // than no document: a reader that finds it stops looking and then fails at the
 // push, and a peer that finds it makes a pull wait on a dial that cannot succeed.
-func startIngestRegistry(ctx context.Context, r ingestRegistry) func() {
+func startIngestRegistry(ctx context.Context, r ingestRegistry) (func(), registryPullerWiring) {
 	logger := r.logger
 	if err := r.svc.Start(ctx); err != nil {
 		logger.Error("ingest registry disabled", "err", err)
-		return func() {}
+		return func() {}, registryPullerWiring{}
 	}
 	// The per-node Service comes BEFORE the discovery document, because the
 	// document's hostFromClusterNetwork is a claim about it: the address is
 	// published exactly when a Service exists to answer it, and "" otherwise.
-	clusterHost := r.publishClusterService(ctx)
+	clusterHost, clusterIP := r.publishClusterService(ctx)
 	if err := registrysvc.PublishHosting(ctx, r.hostingCMs, r.port, clusterHost); err != nil {
 		// The registry is serving and pushes to it work; only the DISCOVERY of it
 		// failed. Reporting and continuing keeps the working half working.
@@ -166,6 +196,14 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) func() {
 	r.refreshClusterService(auxCtx, &aux)
 	r.relay(auxCtx, &aux)
 
+	// The registry is SERVING at this point, which is what makes the loopback
+	// spelling true; the cluster spellings are added only when a Service was
+	// actually published, so runtimed never admits an authority nothing answers.
+	wiring := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(r.port)}
+	if clusterHost != "" {
+		wiring.ClusterRegistries = registrysvc.ClusterLocalAuthorities(r.nodeName, r.clusterDomain, clusterIP, r.port)
+	}
+
 	return func() {
 		stopAux()
 		aux.Wait()
@@ -180,7 +218,7 @@ func startIngestRegistry(ctx context.Context, r ingestRegistry) func() {
 		if err := r.svc.Shutdown(stopCtx); err != nil {
 			logger.Error("ingest registry shutdown", "err", err)
 		}
-	}
+	}, wiring
 }
 
 // advertise publishes this node's peer-facing advertisement and keeps it fresh
@@ -229,7 +267,8 @@ func (r ingestRegistry) advertise(ctx context.Context, wg *sync.WaitGroup) {
 // publishClusterService publishes this node's per-node registry Service and its
 // hand-written EndpointSlice, and returns the in-cluster authority a caller dials
 // — or "" when there is none, which is the value HostingDocument omits the field
-// for.
+// for — together with the ClusterIP the apiserver assigned, which is the other
+// spelling of the same registry a workload may write into a reference.
 //
 // It returns "" and says why, once at Info, in the two states where there is
 // nothing to publish: no cluster clients (a bring-up with no apiserver), and no
@@ -240,31 +279,31 @@ func (r ingestRegistry) advertise(ctx context.Context, wg *sync.WaitGroup) {
 // node's own pods pull from it; only the cluster-facing name failed, and
 // publishing a hostFromClusterNetwork for a Service that does not exist would
 // send every reader at a name that resolves to nothing.
-func (r ingestRegistry) publishClusterService(ctx context.Context) string {
+func (r ingestRegistry) publishClusterService(ctx context.Context) (authority, clusterIP string) {
 	if r.clusterSvcs == nil || r.clusterSlices == nil {
-		return ""
+		return "", ""
 	}
 	addr, err := registrysvc.ClusterEndpointAddress(r.meshIP, r.vmNetSubnet)
 	switch {
 	case errors.Is(err, registrysvc.ErrNoClusterAddress):
 		r.logger.Info("this node's ingest registry has no cluster address: no mesh address and no vm network, so loopback reaches everything that exists",
 			"node", r.nodeName)
-		return ""
+		return "", ""
 	case err != nil:
 		r.logger.Error("this node's ingest registry has no publishable cluster address", "err", err, "node", r.nodeName)
-		return ""
+		return "", ""
 	}
-	clusterIP, err := registrysvc.PublishClusterService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
+	clusterIP, err = registrysvc.PublishClusterService(ctx, r.clusterSvcs, r.clusterSlices, r.nodeName, r.port, addr)
 	if err != nil {
 		r.logger.Error("publish this node's registry Service", "err", err,
 			"namespace", registrysvc.AdvertisementNamespace, "name", registrysvc.ClusterServiceName(r.nodeName))
-		return ""
+		return "", ""
 	}
-	authority := registrysvc.ClusterServiceAuthority(r.nodeName, r.clusterDomain, r.port)
+	authority = registrysvc.ClusterServiceAuthority(r.nodeName, r.clusterDomain, r.port)
 	r.logger.Info("published this node's ingest registry as a cluster Service",
 		"namespace", registrysvc.AdvertisementNamespace, "name", registrysvc.ClusterServiceName(r.nodeName),
 		"authority", authority, "clusterIP", clusterIP, "endpoint", addr.String())
-	return authority
+	return authority, clusterIP
 }
 
 // refreshClusterService re-publishes the Service and its EndpointSlice on the

@@ -483,12 +483,18 @@ func runServer(args []string) error {
 	// NEVER FATAL: startIngestRegistry logs and returns a no-op teardown if the
 	// registry cannot come up. See its doc for why that is the right posture here
 	// and the wrong one at step 3b.
+	//
+	// It also yields the PULLER WIRING — how runtimed should spell this node's own
+	// registry — which is handed to the node below so a reference naming the
+	// Service address is classified exactly as a loopback one is. The zero value
+	// (no registry) leaves runtimed's classification unchanged.
+	var registryPuller registryPullerWiring
 	if opts.registryPort != 0 {
 		svc, err := registrysvc.New(registryConfig(opts, cfg.PayloadBinDir, logger))
 		if err != nil {
 			logger.Error("ingest registry disabled", "err", err)
 		} else {
-			stopRegistry := startIngestRegistry(ctx, ingestRegistry{
+			stopRegistry, puller := startIngestRegistry(ctx, ingestRegistry{
 				svc:      svc,
 				port:     opts.registryPort,
 				nodeName: opts.nodeName,
@@ -516,6 +522,7 @@ func runServer(args []string) error {
 				logger:        logger,
 			})
 			defer stopRegistry()
+			registryPuller = puller
 		}
 	}
 
@@ -795,6 +802,14 @@ func runServer(args []string) error {
 		// keys on the /32 the pod publishes. nil under --network none, where there
 		// is no proxy to feed.
 		transportOverrides: nodeTransportOverrides(net, mode),
+		// How runtimed spells this node's own ingest registry (step 3d): the
+		// loopback authority a bare "app:v1" resolves against first, and the
+		// non-loopback spellings of the same registry — a reference naming one of
+		// them is node-relative in exactly the sense a `localhost:<port>/…`
+		// reference is, so it gets the same plain-HTTP transport and the same
+		// peer-mirror brokering. Zero on a node with no registry.
+		localRegistryHost: registryPuller.LocalHost,
+		clusterRegistries: registryPuller.ClusterRegistries,
 	}
 
 	// 4f-bis. B213 — the control-plane node's OWN kubelet serving cert.

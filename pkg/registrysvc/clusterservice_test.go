@@ -291,6 +291,7 @@ func TestClusterLocalAuthorities(t *testing.T) {
 	want := []string{
 		"registry-mac-a.k3sm-registry.svc.cluster.local:6450",
 		"registry-mac-a.k3sm-registry.svc:6450",
+		"registry-mac-a.k3sm-registry:6450",
 		"10.43.7.9:6450",
 	}
 	if len(got) != len(want) {
@@ -304,8 +305,8 @@ func TestClusterLocalAuthorities(t *testing.T) {
 
 	t.Run("no ClusterIP yields only the name spellings", func(t *testing.T) {
 		got := ClusterLocalAuthorities("mac-a", "", "", 6450)
-		if len(got) != 2 {
-			t.Fatalf("authorities = %v, want the two name spellings only", got)
+		if len(got) != 3 {
+			t.Fatalf("authorities = %v, want the three name spellings only", got)
 		}
 	})
 
@@ -325,6 +326,21 @@ func TestClusterLocalAuthorities(t *testing.T) {
 		}
 		if got := ClusterLocalAuthorities("mac-a", "", "", 0); got != nil {
 			t.Errorf("authorities = %v for port 0, want nil", got)
+		}
+	})
+
+	t.Run("the loopback authority is the localhost spelling", func(t *testing.T) {
+		// `localhost` and not 127.0.0.1: the OCI toolchain special-cases the
+		// literal name as an insecure registry, and this authority is what a
+		// bare-name pull is rewritten to, so it ends up in a reference an operator
+		// reads back.
+		if got := LoopbackAuthority(6450); got != "localhost:6450" {
+			t.Errorf("LoopbackAuthority = %q, want localhost:6450", got)
+		}
+		for _, port := range []int{0, -1, 65536} {
+			if got := LoopbackAuthority(port); got != "" {
+				t.Errorf("LoopbackAuthority(%d) = %q, want empty", port, got)
+			}
 		}
 	})
 

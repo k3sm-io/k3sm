@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,6 +29,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"k3sm.io/runtimed/pkg/image"
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/registrysvc"
@@ -113,7 +116,7 @@ func TestStartIngestRegistry(t *testing.T) {
 	t.Run("a healthy registry is published and torn down", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a",
 			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -145,7 +148,7 @@ func TestStartIngestRegistry(t *testing.T) {
 	t.Run("a registry that cannot start is not fatal and publishes nothing", func(t *testing.T) {
 		svc := &fakeRegistry{startErr: errors.New("port held")}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
 			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -173,7 +176,7 @@ func TestStartIngestRegistry(t *testing.T) {
 	t.Run("a mesh node advertises itself and retracts on teardown", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
 			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -201,7 +204,7 @@ func TestStartIngestRegistry(t *testing.T) {
 		// advertisement naming one would be a lie a peer then dials.
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a",
 			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -232,7 +235,7 @@ func TestStartIngestRegistry(t *testing.T) {
 		}
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
 			hostingCMs: cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:  cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -269,7 +272,7 @@ func TestStartIngestRegistry(t *testing.T) {
 		// 127.0.0.1 listener can never be published here.
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, puller := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
 			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -278,6 +281,17 @@ func TestStartIngestRegistry(t *testing.T) {
 			clusterDomain: "cluster.local",
 			logger:        logger,
 		})
+		// runtimed's puller classifies a reference as node-relative by its
+		// authority; it cannot derive these spellings, so the bring-up hands them
+		// over. Without them a Pod pulling by the Service name would be dialled as
+		// HTTPS against a plain-HTTP listener and would get no peer fallback.
+		wantAuthority := registrysvc.ClusterServiceAuthority("mac-a", "cluster.local", 6450)
+		if !slices.Contains(puller.ClusterRegistries, wantAuthority) {
+			t.Errorf("cluster-local authorities = %v, want them to carry %q", puller.ClusterRegistries, wantAuthority)
+		}
+		if puller.LocalHost != registrysvc.LoopbackAuthority(6450) {
+			t.Errorf("LocalHost = %q, want %q", puller.LocalHost, registrysvc.LoopbackAuthority(6450))
+		}
 		name := registrysvc.ClusterServiceName("mac-a")
 		published, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
 			Get(context.Background(), name, metav1.GetOptions{})
@@ -322,7 +336,7 @@ func TestStartIngestRegistry(t *testing.T) {
 		// hostFromClusterNetwork would name an address no caller could reach.
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
 		cs := fake.NewSimpleClientset()
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, puller := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a",
 			hostingCMs:    cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
 			advertCMs:     cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
@@ -331,6 +345,14 @@ func TestStartIngestRegistry(t *testing.T) {
 			logger:        logger,
 		})
 		defer stop()
+		if len(puller.ClusterRegistries) != 0 {
+			t.Errorf("cluster-local authorities = %v on a node with no Service; runtimed would admit a spelling nothing answers", puller.ClusterRegistries)
+		}
+		// The loopback spelling is still wired: the registry serves on it whether
+		// or not anything off-host can reach it.
+		if puller.LocalHost != registrysvc.LoopbackAuthority(6450) {
+			t.Errorf("LocalHost = %q, want %q", puller.LocalHost, registrysvc.LoopbackAuthority(6450))
+		}
 		if _, err := cs.CoreV1().Services(registrysvc.AdvertisementNamespace).
 			Get(context.Background(), registrysvc.ClusterServiceName("mac-a"), metav1.GetOptions{}); err == nil {
 			t.Error("a node with no relay address published a cluster Service nothing would answer")
@@ -348,7 +370,7 @@ func TestStartIngestRegistry(t *testing.T) {
 
 	t.Run("a failed publish leaves the registry serving", func(t *testing.T) {
 		svc := &fakeRegistry{addr: "127.0.0.1:6450"}
-		stop := startIngestRegistry(t.Context(), ingestRegistry{
+		stop, _ := startIngestRegistry(t.Context(), ingestRegistry{
 			svc: svc, port: 6450, nodeName: "mac-a", meshIP: "100.64.1.1",
 			hostingCMs: failingConfigMaps{}, advertCMs: failingConfigMaps{}, logger: logger,
 		})
@@ -413,3 +435,62 @@ func (failingConfigMaps) Delete(context.Context, string, metav1.DeleteOptions) e
 type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestRegistryPullerWiringIsAccepted proves the exact combination this file hands
+// runtimed is one runtimed accepts.
+//
+// It matters because the two fields constrain each other: image.NewPuller REFUSES
+// a local-registry host that is neither a loopback spelling nor one of the
+// admitted cluster authorities, and that refusal fails runtime.New — so a bad
+// combination here is not a degraded pull path, it is a node that does not start.
+// The refusal is asserted too, so this test fails if the constraint is ever
+// dropped and stops proving anything.
+func TestRegistryPullerWiringIsAccepted(t *testing.T) {
+	cache, err := image.NewCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+	newPuller := func(w registryPullerWiring) error {
+		opts := []image.PullerOption{}
+		if len(w.ClusterRegistries) > 0 {
+			opts = append(opts, image.WithClusterRegistries(w.ClusterRegistries, image.RemoteInsecureFetch))
+		}
+		if w.LocalHost != "" {
+			opts = append(opts, image.WithLocalRegistry(w.LocalHost))
+		}
+		_, perr := image.NewPuller(cache, image.RemoteFetch, image.NoLocalIndex{}, opts...)
+		return perr
+	}
+
+	t.Run("a node with a registry Service", func(t *testing.T) {
+		w := registryPullerWiring{
+			LocalHost:         registrysvc.LoopbackAuthority(6450),
+			ClusterRegistries: registrysvc.ClusterLocalAuthorities("mac-a", "cluster.local", "10.43.7.9", 6450),
+		}
+		if err := newPuller(w); err != nil {
+			t.Fatalf("runtimed refuses the wiring this node publishes (%+v): %v", w, err)
+		}
+	})
+
+	t.Run("a node with no registry Service", func(t *testing.T) {
+		// Loopback alone is cluster-local unconditionally, so the single-Mac
+		// wiring must be accepted with no authority set at all.
+		w := registryPullerWiring{LocalHost: registrysvc.LoopbackAuthority(6450)}
+		if err := newPuller(w); err != nil {
+			t.Fatalf("runtimed refuses the single-node wiring (%+v): %v", w, err)
+		}
+	})
+
+	t.Run("a node with no registry at all", func(t *testing.T) {
+		if err := newPuller(registryPullerWiring{}); err != nil {
+			t.Fatalf("runtimed refuses the zero wiring: %v", err)
+		}
+	})
+
+	t.Run("the constraint this wiring satisfies is real", func(t *testing.T) {
+		w := registryPullerWiring{LocalHost: "registry.example.com:6450"}
+		if err := newPuller(w); err == nil {
+			t.Fatal("runtimed accepted a local registry host that is neither loopback nor admitted; the wiring above no longer proves anything")
+		}
+	})
+}

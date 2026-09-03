@@ -134,8 +134,11 @@ run_test "registry.11d" 8 TestPublishClusterService ./pkg/registrysvc/
 run_test "registry.11e" 4 TestRemoveClusterService ./pkg/registrysvc/
 # The spellings runtimed must treat as naming THIS node's own registry, so a Pod
 # that pulls by the Service name gets the same brokering as one that pulls by
-# localhost.
-run_test "registry.11f" 4 TestClusterLocalAuthorities ./pkg/registrysvc/
+# localhost — and the proof that runtimed ACCEPTS the exact combination this node
+# hands it. The two fields constrain each other, and a bad combination is not a
+# degraded pull path: it fails runtime.New, so the node does not start.
+run_test "registry.11f" 5 TestClusterLocalAuthorities ./pkg/registrysvc/
+run_test "registry.11h" 4 TestRegistryPullerWiringIsAccepted ./cmd/k3sm/
 # The KEP-1755 document in both shapes: three addresses on a node that has a
 # cluster Service, two on a node that has no relay at all.
 run_test "registry.11g" 3 TestHostingDocument ./pkg/registrysvc/

@@ -150,27 +150,40 @@ Kubernetes Service, named after the node, in the `k3sm-registry` namespace.
 kubectl get svc,endpointslice -n k3sm-registry
 ```
 
-Dial it the way you would any Service:
+Dial it the way you would any Service. All four of these name it:
 
 ```
 registry-<node>.k3sm-registry.svc.cluster.local:6450
+registry-<node>.k3sm-registry.svc:6450
+registry-<node>.k3sm-registry:6450
+<the Service's ClusterIP>:6450
 ```
 
-Substitute your node's name — `kubectl get nodes` — or read the address straight out of the
-discovery ConfigMap's `hostFromClusterNetwork`, which is what it is there for. The name is
+Substitute your node's name — `kubectl get nodes` — or read the fully qualified form straight out
+of the discovery ConfigMap's `hostFromClusterNetwork`, which is what it is there for. The name is
 per-node because every node's registry holds different content, so one shared name would resolve
 to whichever machine answered first.
 
-Three things to know before you use it:
+Some things to know before you use it:
 
 **It speaks plain HTTP.** The `localhost` spelling gets an insecure-registry exemption from the
 docker/OCI toolchain automatically; a Service name does not. Tell your client to use HTTP —
 `--plain-http`, `--insecure`, or whatever the tool calls it. The discovery ConfigMap's `help`
 line says so too.
 
+**It is for tools inside the Pod, not for `image:`.** Keep writing `localhost:6450/myapp:v1` in
+a Pod spec. Kubernetes image references are resolved by the node's runtime, which runs on the
+Mac and does not use the cluster's DNS — so a Service name in `spec.containers[].image` has
+nothing to resolve it. The addresses above are for a process inside the Pod that is fetching or
+inspecting images itself.
+
 **It is a pull address.** Pushing from inside a Pod is not supported: `k3sm image push` finds the
 node's credential only for a loopback target, and that credential never leaves the machine that
 minted it. Push from the Mac.
+
+**Reads are anonymous, here as everywhere.** Anything that can reach the address can list and
+pull the images this cluster runs. That is the same posture the loopback listener has, extended
+to the cluster network and no further.
 
 **A vm Pod needs the node to be running guests.** The address a caller is sent to is the node's
 cluster-network address — the mesh address on a multi-machine cluster, otherwise the guest
