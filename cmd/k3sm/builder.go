@@ -33,10 +33,11 @@ import (
 
 const builderUsage = `k3sm builder — manage the in-cluster buildkitd engine that powers RUN-capable builds
 
-Usage: k3sm builder <up|down|status> [flags]
+Usage: k3sm builder <up|down|delete|status> [flags]
 
   up      ensure the builder Pod, Service and cache PVC, and wait for a worker
   down    delete the Pod and Service (the cache PVC is KEPT for a warm rebuild)
+  delete  tear down the engine AND remove the build cache (full reset)
   status  report the engine state and, when ready, its buildx dial endpoint
 
 The engine is one long-lived vm Pod running the pinned upstream moby/buildkit
@@ -70,18 +71,18 @@ type builderOptions struct {
 func runBuilder(args []string) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, builderUsage)
-		return fmt.Errorf("k3sm builder needs a subcommand (up|down|status)")
+		return fmt.Errorf("k3sm builder needs a subcommand (up|down|delete|status)")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "-h", "--help", "help":
 		fmt.Print(builderUsage)
 		return nil
-	case "up", "down", "status":
+	case "up", "down", "delete", "status":
 		return runBuilderVerb(sub, rest)
 	default:
 		fmt.Fprint(os.Stderr, builderUsage)
-		return fmt.Errorf("unknown `k3sm builder` subcommand %q (want up|down|status)", sub)
+		return fmt.Errorf("unknown `k3sm builder` subcommand %q (want up|down|delete|status)", sub)
 	}
 }
 
@@ -168,6 +169,8 @@ func runBuilderVerb(sub string, args []string) error {
 		return nil
 	case "down":
 		return mgr.Down(context.Background())
+	case "delete":
+		return mgr.Delete(context.Background())
 	case "status":
 		st, err := mgr.Status(context.Background())
 		if err != nil {

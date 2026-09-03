@@ -43,11 +43,24 @@ Check on it any time:
 k3sm builder status
 ```
 
-Tear it down (the **cache is kept**, so the next `up` starts warm):
+Stop it (the **cache is kept**, so the next `up` starts warm):
 
 ```sh
 k3sm builder down
 ```
+
+For a **full reset** — remove the engine *and* the build cache (and the
+`k3sm-builder` namespace) — use `delete`. The next `up` rebuilds the cache from
+scratch:
+
+```sh
+k3sm builder delete
+```
+
+The distinction is deliberate: `down` **stops** the engine and keeps the cache for
+a fast warm rebuild; `delete` is the **full reset** — everything the engine
+created is gone. Reach for `delete` when the cache is corrupt or you want to
+reclaim its disk; reach for `down` for the everyday stop.
 
 ## The buildx driver
 
@@ -77,7 +90,8 @@ k3sm image push out.oci localhost:<registry-port>/myapp:v1
 The engine keeps its layer cache and BuildKit state on the `k3sm-builder`
 PersistentVolumeClaim (40Gi by default; `k3sm builder up --cache-size <size>`).
 `k3sm builder down` keeps it, so an incremental rebuild after a restart is fast.
-Delete the PVC by hand if you want a cold cache.
+For a cold cache, `k3sm builder delete` removes the PVC (and the namespace) for
+you — the next `up` rebuilds the cache from scratch.
 
 The cache lives on an ext4 image the guest loop-mounts on the claim — a real Linux
 filesystem is what BuildKit's overlay snapshotter needs, and the host storage

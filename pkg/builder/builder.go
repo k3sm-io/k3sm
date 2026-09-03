@@ -187,6 +187,34 @@ func (m *Manager) Down(ctx context.Context) error {
 	return nil
 }
 
+// Delete is the full reset: it removes the Pod, Service and the cache PVC, then
+// the builder namespace last (which reaps anything left). Down keeps the cache
+// for a warm rebuild; Delete is the full reset — the next `up` rebuilds the cache
+// from scratch. It is idempotent, the same posture as Down — a not-found delete
+// is success. The named objects are deleted explicitly first for a fast, legible
+// teardown; the namespace delete then cascades over any remainder.
+func (m *Manager) Delete(ctx context.Context) error {
+	var errs []error
+	if err := m.kube.CoreV1().Pods(m.cfg.Namespace).Delete(ctx, m.cfg.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, fmt.Errorf("delete pod: %w", err))
+	}
+	if err := m.kube.CoreV1().Services(m.cfg.Namespace).Delete(ctx, m.cfg.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, fmt.Errorf("delete service: %w", err))
+	}
+	if err := m.kube.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Delete(ctx, m.cfg.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, fmt.Errorf("delete pvc: %w", err))
+	}
+	if err := m.kube.CoreV1().Namespaces().Delete(ctx, m.cfg.Namespace, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, fmt.Errorf("delete namespace: %w", err))
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	m.log.Info("builder engine deleted; cache claim removed",
+		"namespace", m.cfg.Namespace, "name", m.cfg.Name)
+	return nil
+}
+
 // Status derives the current engine state from the live Pod and, when Running, a
 // worker probe. An absent Pod is StateAbsent with the legible fix in Message.
 func (m *Manager) Status(ctx context.Context) (Status, error) {
