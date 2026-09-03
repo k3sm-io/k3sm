@@ -192,26 +192,39 @@ Two properties are worth internalizing before you build selectors on these:
 
 ### Rosetta Labels, Advertised Only
 
-The `k3sm.io/rosetta` and `k3sm.io/rosetta-linux` labels report what the probe found on the
-host — the probe really did find Rosetta — and they do make the node
-**selectable**. But **k3sm does not consume them when it pulls your image yet**: the pull still asks only
-for the node's native architecture (`darwin/arm64`), so an **amd64-only image is refused at pull time**
-with a no-matching-platform error and the Pod lands in `ImagePullBackOff`. A multi-arch image that
-includes `darwin/arm64` is unaffected — it runs natively, as it always did.
+The `k3sm.io/rosetta` label reports what the host probe found — the probe really did find Rosetta
+2 — and does make the node **selectable**. But **k3sm does not consume it when it pulls your image
+yet**: the pull still asks only for the node's native architecture (`darwin/arm64`), so an
+**amd64-only image is refused at pull time** with a no-matching-platform error. That refusal shows
+up on the Pod as **`ProviderFailed`** with a **`ProviderCreateFailed`** event naming the mismatch —
+look at `kubectl get pods` and `kubectl describe pod`, not `ImagePullBackOff`, which this path never
+produces. A multi-arch image that includes `darwin/arm64` is unaffected — it runs natively, as it
+always did.
 
-That refusal is deliberate. Two things must land first:
+`k3sm.io/rosetta-linux` is never set on any node today, on any host. The Linux-guest payload path
+itself — rootfs, guest image pull, boot — is built and validated (see the status note at the top of
+this page); the piece that is missing is narrower: the node's VM host attaches no Rosetta directory
+share to the guests it builds, so nothing inside a guest could translate a `linux/amd64` ELF however
+capable the host is, and the guest-Rosetta probe is short-circuited to that answer before it ever
+asks the framework. Advertising the label without the share would add `linux/amd64` to the pull
+candidate set for every `vm` Pod on the node and then fail *inside the guest* after the pull, so the
+label stays off until the share is attached.
+
+That refusal is deliberate. Two things must land before either label changes what k3sm will actually
+run:
 
 - **`k3sm.io/rosetta` (host, darwin/amd64)** — spawning a *translated* Mach-O inside the Seatbelt
   sandbox is not wired. Selecting amd64 payloads before that lands would also weaken a
   kernel-level check k3sm relies on: an unsigned **arm64** binary is killed by the OS, while an unsigned
   **x86_64** one is not.
-- **`k3sm.io/rosetta-linux` (guest, linux/amd64)** — the Linux-guest payload path (rootfs + guest image
-  pull) is not built yet, and translation only happens *inside* a guest, so the Pod must also set
-  `runtimeClassName: vm` to have any chance of getting there.
+- **`k3sm.io/rosetta-linux` (guest, linux/amd64)** — the VM host needs to attach a Rosetta directory
+  share to the guests it builds. The guest path that would carry it — `runtimeClassName: vm`,
+  `linux/arm64` — is already built and validated; the share is the one piece not yet wired.
 
-So today these labels answer "**could** this host translate?", not "will k3sm run my amd64 workload
-here?". Until the paths above land, ship `arm64` (or multi-arch) images. If you have already selected a
-Rosetta label and see `ImagePullBackOff` with a platform error, that is this gap — not a broken node.
+So today `k3sm.io/rosetta` answers "**could** this host translate?", not "will k3sm run my amd64
+workload here?" — and `k3sm.io/rosetta-linux` does not answer at all, because it is never set. Until
+the paths above land, ship `arm64` (or multi-arch) images. If a Pod is stuck `ProviderFailed` with a
+`ProviderCreateFailed` event naming a platform mismatch, that is this gap — not a broken node.
 
 ### Translated Execution Shares the Node's Trust Domain
 
@@ -228,8 +241,11 @@ the `vm` RuntimeClass above.
 
 Because these are plain capability labels with no RuntimeClass behind them, your Pod selects them
 itself — and it must **keep `kubernetes.io/os: darwin`** alongside. This is the selector shape to write
-**when the paths above land** — as written today the Pod schedules onto a capable node and then fails at
-image pull (see the previous section):
+**when the paths above land**. As written today the two labels behave differently at schedule time:
+`k3sm.io/rosetta: "true"` matches a real node when Rosetta 2 is installed, so the Pod schedules and
+then fails at pull (see the previous section); `k3sm.io/rosetta-linux: "true"` matches **no** node —
+the label is never set (see above) — so the Pod stays `Pending`, unscheduled, until a node advertises
+it:
 
 ```yaml
 apiVersion: v1

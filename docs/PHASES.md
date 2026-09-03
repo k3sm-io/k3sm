@@ -764,13 +764,13 @@ phases:
         depends_on: [apis:M12.1, runtimed:M12.1]
         deliverables:
           - id: M12.1-d1
-            done: false
+            done: true  # 2026-08-28, runtimed PR #56 + k3sm PR #130 — provider forwards the apiserver-stamped imagePullPolicy VERBATIM (never re-derives from the tag); B120.
             desc: "Provider translates the apiserver-defaulted imagePullPolicy VERBATIM (defaulting — :latest/untagged → Always — is the embedded apiserver's; the provider never re-derives). Consumers slice is queue item B120."
           - id: M12.1-d2
             done: false
             desc: "Pull-failure taxonomy kubelet-verbatim (queue item B119): ErrImagePull ↔ ImagePullBackOff alternation (per-image exponential 10s→300s cap), ErrImageNeverPull (policy Never: no backoff, no attempt), InvalidImageName (terminal). Invariants: pod phase stays Pending; restartCount untouched; a pull failure never fails CreatePod wholesale (no ReplicaSet churn / registry hammering). Rides the existing ContainerStateWaiting.reason — zero new proto surface. Lifecycle events (Pulling/Pulled/Failed/BackOff) coordinate with the B75 EventRecorder work — cite, never duplicate."
           - id: M12.1-d3
-            done: false
+            done: true  # 2026-08-29, runtimed e89eb872 (PR #64) + k3sm 0c889e82 (PR #144) — image_id is the resolved CONFIG digest, container_id derives from the existing pgid-based reap identity; B132.
             desc: "status.containerStatuses[].imageID = the resolved repo digest. Image-config USER: ACCEPTED with documented divergence (the workload runs as the service user — non-root by construction; register cross-cite to the no-per-pod-uid ceiling); the vm path stays kubelet-verbatim in-guest. Offline/warm-cache posture + the :latest→Always trap documented in docs/user/limitations.md + images.md; image preload (B117) named as the airgap/outage mitigation."
         acceptance:
           - id: M12.1-a1
@@ -783,28 +783,28 @@ phases:
             method: integration
       - id: M12.2
         title: k3sm image CLI — docker interop (load / import / ls / push)
-        status: todo
+        status: done  # 2026-08-29 — d1 + a1 both landed; B117
         depends_on: []
         deliverables:
           - id: M12.2-d1
-            done: false
+            done: true  # 2026-08-29, runtimed PR #71 + k3sm PR #165 — LoadImage stream ingest + load/import streaming verbs, verify-pass mutant proven red; B117.
             desc: "k3sm image load <docker-save.tar> / import <oci-layout> (the buildx OCI output) / ls / push, in ONE plumbing home pkg/oci (shared with M12.3). Store topology: links runtimed's exported store package IN-PROCESS (the one-binary assembly; staged+rename commits are concurrent-writer-safe) — never a second store implementation. Ingest is SELF-AUTHENTICATING: every blob re-hashed against its claimed digest before commit; a digest-mismatched blob and a quarantined-source tarball are REJECTED. Loaded images are provenance-free by design (operator-CLI-only surface, documented). push authenticates as the INVOKING USER (docker config/keychain), never the cluster imagePullSecret resolver. Queue item B117."
         acceptance:
           - id: M12.2-a1
-            met: false
+            met: true  # 2026-08-29 — TestImageLoadDockerSaveAndOCILayout and neighbors green under -race; B117.
             check: "TestImageLoadDockerSaveAndOCILayout: golden docker-save + OCI-layout fixtures ingest; digest-mismatched blob rejected; quarantined-source tarball rejected; ls round-trips the index"
             method: unit
       - id: M12.3
         title: k3sm build v1 — COPY-only native Dockerfile builder
-        status: todo
+        status: done  # 2026-08-30 — d1 + a1 both landed; B118
         depends_on: []
         deliverables:
           - id: M12.3-d1
-            done: false
+            done: true  # 2026-08-30, k3sm PR #104 — COPY-only crane-append builder lands, RUN rejected naming the M12.4 vm builder; B118.
             desc: "Dockerfile SUBSET builder (crane-append, pkg/oci): FROM scratch|<ref>, COPY/ADD, ENV/ENTRYPOINT/CMD/WORKDIR/LABEL/EXPOSE; RUN is REJECTED with a legible error naming the M12.4 vm builder as the RUN-capable path. darwin/arm64 default (--platform for metadata targets); output → local store / tarball / OCI layout / --push. Ships the command the user docs describe — the docs become true. Queue item B118."
         acceptance:
           - id: M12.3-a1
-            met: false
+            met: true  # 2026-08-30 — TestCopyOnlyDockerfileBuild green (subset parse table, RUN/unknown-verb rejection, deterministic layer digests); B118.
             check: "TestCopyOnlyDockerfileBuild: subset parse table (accepted verbs + RUN rejection + unknown-verb rejection); deterministic layer digests for a golden context; entrypoint/env/workdir metadata round-trip"
             method: unit
       - id: M12.4
@@ -813,14 +813,14 @@ phases:
         depends_on: [k3sm:M11.4]
         deliverables:
           - id: M12.4-d1
-            done: false
+            done: true  # 2026-09-02, k3sm PR #300 (+ #301/#302/#304 fixes) — `k3sm builder up|down|delete` manages a guest-root buildkitd vm pod + PVC-backed cache + ClusterIP Service; the image defaults to the upstream digest matching the (still-private) GHCR mirror pin, `--mirror` flips to it once B121 populates the mirror.
             desc: "k3sm builder up|down manages a buildkitd vm pod (Linux arm64 + Rosetta amd64, PVC-backed cache); buildkitd runs guest-root inside its dedicated micro-VM (the VM boundary IS the isolation; the pod spec declares no foreign securityContext). The buildkitd image is consumed ONLY from the k3sm GHCR mirror, digest-pinned in code (ghcr.io/k3sm-io/mirror/buildkit@sha256:… via pkg/images; populated per Res. 12 by the committed hack/images/mirror.yaml manifest + digest-verified copy workflow, B121/B122; human-merged bumps; airgap = pre-seed via k3sm image load). k3sm build (full path) drives the BUNDLED buildx over the NAT-dial path proven by the vm networking spike (a Service/pod-IP dial — never a new vmhost socket forward); COPY-only Dockerfiles auto-route to the M12.3 native fast-path."
           - id: M12.4-d2
             done: false
             desc: "Packaging (named, never assumed): buildx SOURCE-BUILT at a pinned upstream tag (the control-plane-payload provenance precedent — never re-sign a prebuilt); committed pin file (version+sha256); release workflow fifth-checkout + sibling assert; archive-manifest + nested-code enumeration + bidirectional entitlement row (buildx carries NONE); brew source-build leg; install path + uninstall-manifest coverage; k3sm doctor builder probe; release image-pin gate: hack/verify-image-pins.sh --live proves every pkg/images pin exists on GHCR at its recorded digest with linux/arm64+linux/amd64, anonymously, wired into release.yml before the first tagged release consuming images.Buildkitd; legible-absence contract (builder stack absent ⇒ the full path errors naming the install step; the COPY-only fast-path is unaffected). Third-party attribution: license tooling run AGAINST the buildx checkout at its pinned ref + its LICENSE shipped (the module-graph generator cannot see a separately-compiled binary); hygiene gate extended to verify."
         acceptance:
           - id: M12.4-a1
-            met: false
+            met: true  # 2026-09-02, k3sm PR #302 — validated live end-to-end on a vm-capable Mac: RUN build → OCI export → `k3sm image push` → a pod ran the RUN-baked /proof.txt; `builder down` kept the cache PVC.
             check: "a Dockerfile WITH RUN steps builds green against the managed builder on a vm-capable Mac (K3SM_LAB=1, human-run); the COPY-only fast-path routes natively; builder-absent degrades legibly"
             method: lab
           - id: M12.4-a2

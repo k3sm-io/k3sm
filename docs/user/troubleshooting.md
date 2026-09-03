@@ -54,8 +54,9 @@ names, SRV and PTR all resolve. Check these in order:
 - **Is the Pod's `dnsPolicy` `Default` or `None`?** Neither selects cluster DNS, so nothing is
   injected. Use `ClusterFirst` (the default when the field is unset).
 - **Is it an AAAA lookup?** k3sm's CIDRs are IPv4; AAAA is never answered.
-- **Are you on `--runtime hostprocess` or the `vm` RuntimeClass?** In-pod cluster DNS is not wired on
-  either — every lookup goes to the host resolver.
+- **Are you on `--runtime hostprocess`?** In-pod cluster DNS is not wired there — every lookup goes
+  to the host resolver. The `vm` RuntimeClass is not this gap: cluster DNS works there, validated on
+  real hardware.
 
 See [Limitations](limitations.md#dns--what-resolves-and-on-which-runtime-path) for the full
 per-path picture.
@@ -178,12 +179,14 @@ The node advertises a capability label only when its start-time probe said yes.
 5. Your Pod must also keep `kubernetes.io/os: darwin` in its `nodeSelector`; a Pod with only the
    capability key is rejected with a `422`. See
    [`vm` RuntimeClass](vm-runtimeclass.md#node-capability-labels).
-6. **Scheduled, but `ImagePullBackOff` with a platform error?** The two Rosetta labels are **advertised
-   but not yet honored**. Multi-arch selection itself works — k3sm reads the manifest list and picks a
-   platform — but `linux/amd64` is not among the platforms it will accept, because
-   translating an amd64 payload happens inside a guest and that guest path does not run yet. So an
-   amd64-only image is refused at pull rather than started and left to crash. That is a documented
-   gap, not a broken node; see
+6. **Scheduled, but stuck `ProviderFailed` with a `ProviderCreateFailed` event naming a platform
+   mismatch?** (`kubectl describe pod` — this is never `ImagePullBackOff`.) The Rosetta labels are
+   **advertised but not yet honored** at pull. Multi-arch selection itself works — k3sm reads the
+   manifest list and picks a platform — but `linux/amd64` is not among the platforms it will accept
+   on either path today: the guest path itself (`runtimeClassName: vm`, `linux/arm64`) is built and
+   validated, but the node's VM host attaches no Rosetta directory share to its guests, so nothing
+   inside a guest could translate an amd64 payload yet. So an amd64-only image is refused at pull
+   rather than started and left to crash. That is a documented gap, not a broken node; see
    [`vm` RuntimeClass](vm-runtimeclass.md#rosetta-labels-advertised-only).
 
 ## Multi-Node Join Fails
