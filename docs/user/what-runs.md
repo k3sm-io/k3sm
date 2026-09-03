@@ -5,13 +5,15 @@ k3sm runs OCI images two ways, and you pick per Pod:
 - **`darwin/arm64` images run as native Mac processes.** This is the default and the fastest path:
   no VM, no kernel to boot, and access to Metal, CoreML, `codesign` and Xcode.
 - **`linux/arm64` images run in a Linux micro-VM.** One line in the Pod spec —
-  `runtimeClassName: vm` — and an ordinary Linux image runs, unmodified.
+  `runtimeClassName: vm` — and an ordinary Linux image runs, unmodified. Any multi-arch image with
+  an `arm64` variant qualifies, which is most published images. Validated single-node.
 
 Either way the workflow is the one you already know: build, tag, push, pull, digests,
 `imagePullPolicy`, `imagePullSecrets`. `k3sm build` builds both kinds.
 
-The one shape k3sm has no path for today is `linux/amd64`, which needs in-guest translation and is
-held for a later release.
+The one shape k3sm runs on no path today is **`amd64`**. An `amd64`-only image does not start,
+natively or under `vm`: the Linux guest would need in-guest translation, which is held for a later
+release.
 
 ## Default Path
 
@@ -72,13 +74,18 @@ measured on real hardware.
 
 Two facts to plan around. Each Pod gets its own VM, so it costs a boot and a VM's memory where a
 native process costs neither — the native path stays the fast one for anything you can compile for
-the Mac. And the image must be `linux/arm64`: an `amd64`-only image is refused at pull, with an
-error naming the platforms the image offers and the one the node needs.
+the Mac. And the image must have an `arm64` variant: an `amd64`-only image does not start.
 
-Both refusals — a Linux image on the default path, an `amd64` image on the `vm` path — happen at
-pull rather than at `exec`. A Linux container runtime handed the wrong architecture pulls the image,
-starts the container, and lets it die with a format error that names nothing; failing at pull tells
-you what is wrong while you can still act on it.
+A platform mismatch — a Linux image on the default path, an `amd64`-only image on the `vm` path —
+surfaces as a Pod in **`ProviderFailed`** with a `ProviderCreateFailed` event naming both sides:
+
+```
+no image manifest matches a runnable platform: want [linux/arm64/v8], image provides [linux/amd64]
+```
+
+k3sm decides this before it starts anything. A Linux container runtime handed the wrong architecture
+starts the container and lets it die with a format error that names nothing; being told which
+platforms the image offers, and which one the node needs, is what you can act on.
 
 ## From a Dockerfile to a Running Pod
 
@@ -143,7 +150,7 @@ Almost all of it:
 | `RUN` in a Dockerfile | Yes — `k3sm build` builds it on the cluster's build engine, a Linux builder that starts on first use. See [Building images](builder.md). |
 | `FROM <linux image>` | Yes, for a Linux build — `k3sm build --platform linux/arm64` resolves the base on the engine. On the native darwin path the base must be `darwin/arm64`. |
 | `linux/arm64` images | Yes — `runtimeClassName: vm`, one line in the Pod spec. |
-| `linux/amd64` images | Not yet. They need in-guest translation, held for a later release. |
+| `amd64` images | Not yet, on either path. An `amd64`-only image does not start; a multi-arch image with an `arm64` variant runs under `vm` by selecting that variant. |
 
 One footgun worth stating twice, because it is the one people hit: the apiserver defaults a
 `:latest` tag to `imagePullPolicy: Always`, so a `:latest` image you loaded locally will still be
@@ -178,5 +185,6 @@ image, and that is what `runtimeClassName: vm` is for.
 The default path runs **Mac-native workloads** — including ones that need Metal, CoreML, `codesign`
 or Xcode, which no Linux VM can give you — with Kubernetes semantics and the OCI toolchain around
 them. Unmodified **`linux/arm64` images run** on the same cluster, one `runtimeClassName: vm` line
-away, at the cost of a VM per Pod. `linux/amd64` images need in-guest translation and are held for a
-later release; if that is your workload, [Limitations](limitations.md) has the full picture.
+away, at the cost of a VM per Pod — and most published images carry an `arm64` variant. `amd64`
+payloads run on no path today; if that is your workload, [Limitations](limitations.md) has the full
+picture.

@@ -60,6 +60,9 @@ COPY dist/myapp-amd64 /usr/local/bin/myapp
 ENTRYPOINT ["/usr/local/bin/myapp"]
 ```
 
+That image is one you build for other clusters: k3sm nodes run no `amd64`
+payload today, on either path. See [What runs](what-runs.md).
+
 ## Getting the image out
 
 The image is in this node's store when the build finishes, which is everything a

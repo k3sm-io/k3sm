@@ -111,6 +111,9 @@ The engine's guest is `arm64` and registers no emulator, so a `RUN` step for ano
 refused by name before the engine starts. That is the shape of a `linux/amd64` build here: compile
 elsewhere and `COPY` the binary in, rather than `RUN` the toolchain.
 
+Such an image is one you build **for other clusters**. k3sm nodes run no `amd64` payload today, on
+either path — see [What runs](what-runs.md).
+
 > **A built image is in this node's store when the build finishes.** `k3sm build` records it under
 > the tag you gave, so an `image: myapp:v1` Pod spec resolves with no further step. `--output` also
 > writes a portable artifact to a path you name — that is what you want for moving the image to
