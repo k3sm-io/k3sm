@@ -13,8 +13,10 @@
 #   refusal, the builder-instance create/repair decision, the `k3sm builder
 #   buildx` passthrough, the `k3sm build` engine ROUTING over a faked engine, the
 #   SINK MATRIX (the node's image store is the default terminal state; --output
-#   additionally writes the artifact) over a faked store, the lifecycle state
-#   machine over a fake kube/exec seam, and the legible-absence contract.
+#   additionally writes the artifact) over a faked store, the --push TARGET
+#   RESOLUTION table and the store-then-push ORDER (a faked pusher, plus a real
+#   upload to an in-process registry on loopback), the lifecycle state machine
+#   over a fake kube/exec seam, and the legible-absence contract.
 #
 #   LIVE TIER (needs $KUBECONFIG on a vm-capable node) — the engine actually
 #   serving. It is PRINTED AS OWED here, not run: it needs a booted vm guest, a
@@ -220,6 +222,39 @@ else
 	ladder no "builder.9d the store recording goes through the daemon's LoadImage ingest"
 fi
 
+# ---- builder.10 — `k3sm build --push` (the build→push one-liner) ----------
+# THE SECOND RED→GREEN RUNG. On main there is no --push at all: an image reached
+# a registry only through a separate `k3sm image push` of an --output layout. The
+# resolution table is the load-bearing half — a BARE tag goes to THIS node's
+# ingest registry (the push-side mirror of bare-name pull resolution), a tag that
+# names a registry is untouched, and a bare tag on a node with no registry is
+# REFUSED rather than normalised to Docker Hub, which would publish a private
+# image to the internet.
+run_test "builder.10a" 12 TestResolvePushTarget ./cmd/k3sm/
+run_test "builder.10b" 5 TestBuildPushOrdering ./cmd/k3sm/
+run_test "builder.10c" 4 TestBuildPushFlag ./cmd/k3sm/
+# The end-to-end rung: a real build, the real upload path, a real registry on
+# loopback, and the node's own per-boot credential discovered and presented.
+run_test "builder.10d" 2 TestBuildPushToRegistry ./cmd/k3sm/
+# The upload must go through the ONE path `k3sm image push` uses. A second
+# remote.Write would fork the credential chain, the plain-HTTP selection and the
+# failure taxonomy — and the fork is the copy nobody re-reads.
+b10e=ok
+grep -q 'push imagePusher' "$K3SM_ROOT/cmd/k3sm/buildstore.go" || b10e=no
+grep -q 'func pushImage(' "$K3SM_ROOT/cmd/k3sm/imagepush.go" || b10e=no
+grep -q 'pushImage(ctx, ref, img, o.workDir)' "$K3SM_ROOT/cmd/k3sm/imagepush.go" || b10e=no
+grep -q 'deliver(ctx, o, ref, img, out, record, push' "$K3SM_ROOT/cmd/k3sm/build.go" || b10e=no
+grep -q 'deliver(ctx, o, ref, img, out, recordInStore, pushImage' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b10e=no
+ladder "$b10e" "builder.10e both build paths push through the same upload path k3sm image push uses"
+# The store recording is NOT skipped by --push (the divergence from docker
+# buildx): deliver records first and uploads second, so a failed upload leaves a
+# runnable image and an error that says so.
+if grep -q 'is in the node store; push failed' "$K3SM_ROOT/cmd/k3sm/buildpush.go"; then
+	ladder ok "builder.10f a failed push reports that the image is already in the node store"
+else
+	ladder no "builder.10f a failed push reports that the image is already in the node store"
+fi
+
 # ---- LIVE TIER (owed — the orchestrator's single-node lab step) ------------
 owed "builder.20 live: \`k3sm builder up\` registers a buildkit worker          (needs a vm-capable node)"
 owed "builder.21 live: a RUN-containing build through Endpoint() produces an OCI layout"
@@ -229,6 +264,8 @@ owed "builder.23b live: \`k3sm image ls\` shows that entry and a Pod naming app:
 owed "builder.24 live: \`k3sm image push\` of the layout, then a Pod runs it"
 owed "builder.25 live: \`k3sm builder down\` deletes the Pod but keeps the cache PVC"
 owed "builder.26 live: \`k3sm builder delete\` removes the Pod, Service, cache PVC AND the namespace (full reset)"
+owed "builder.27 live: \`k3sm build -t myapp:v1 --push .\` on a node with --registry-port lands the image in that node's registry and a Pod naming myapp:v1 pulls it back"
+owed "builder.28 live: \`k3sm build -t myapp:v1 --push .\` with the registry DISABLED exits non-zero, names --registry-port, and \`k3sm image ls\` still shows myapp:v1"
 
 echo "----------------------------------------"
 echo "builder: $PASS passed, $FAIL failed, $PENDING OWED (live)"

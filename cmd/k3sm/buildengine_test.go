@@ -120,7 +120,7 @@ func TestBuildRouting(t *testing.T) {
 				return nil
 			}
 
-			err := buildWith(t.Context(), o, io.Discard, engine, noStore)
+			err := buildWith(t.Context(), o, io.Discard, engine, noStore, noPush)
 			switch {
 			case tc.wantErr != nil:
 				if !errors.Is(err, tc.wantErr) {

@@ -107,17 +107,35 @@ func imagePush(ctx context.Context, o imageOptions, out io.Writer, dial imagesDi
 	if err != nil {
 		return fmt.Errorf("compute digest of the image in %s: %w", layoutDir, err)
 	}
-	auth, err := registryAuth(ref, o.workDir)
+	if err := pushImage(ctx, ref, img, o.workDir); err != nil {
+		return err
+	}
+	// The digest is printed so the caller can pin what it just published: a tag
+	// is mutable and the next push moves it, while ref@digest names these bytes
+	// forever.
+	fmt.Fprintf(out, "pushed %s\n  digest: %s\n  pin:    %s@%s\n", ref, digest, ref.Context().Name(), digest)
+	return nil
+}
+
+// pushImage uploads img to ref: it resolves the credential, performs the upload
+// and classifies a failure into the sentinel an operator acts on.
+//
+// It is the ONE upload path in this binary. `k3sm image push` reaches it with an
+// image read from a layout directory or exported from this node's store, and
+// `k3sm build --push` with the image it has just built and recorded. Sharing it
+// is what makes three things identical across both: the credential chain
+// (registryAuth, including this node's own per-boot ingest credential), the
+// transport go-containerregistry derives from the reference (plain HTTP for a
+// loopback authority, TLS everywhere else), and the failure taxonomy. A second
+// remote.Write would fork all three, and a fork is the copy nobody re-reads.
+func pushImage(ctx context.Context, ref name.Reference, img ggcrv1.Image, workDir string) error {
+	auth, err := registryAuth(ref, workDir)
 	if err != nil {
 		return err
 	}
 	if err := remote.Write(ref, img, remote.WithContext(ctx), remote.WithAuth(auth)); err != nil {
 		return pushError(ref, err)
 	}
-	// The digest is printed so the caller can pin what it just published: a tag
-	// is mutable and the next push moves it, while ref@digest names these bytes
-	// forever.
-	fmt.Fprintf(out, "pushed %s\n  digest: %s\n  pin:    %s@%s\n", ref, digest, ref.Context().Name(), digest)
 	return nil
 }
 

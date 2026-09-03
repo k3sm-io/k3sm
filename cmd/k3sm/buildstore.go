@@ -38,18 +38,25 @@ import (
 type storeRecorder func(ctx context.Context, ref name.Tag, img ggcrv1.Image) error
 
 // deliver puts a built image where the operator can use it: recorded in this
-// node's image store under --tag, and — when --output was given — ADDITIONALLY
-// written as a portable artifact.
+// node's image store under --tag, and — when they were given — ADDITIONALLY
+// written as a portable artifact (--output) and uploaded to a registry (--push).
 //
 // The store is the DEFAULT terminal state for both build paths, so `k3sm build
 // -t app:dev .` is followed by naming app:dev in a Pod, with nothing in between
 // and no difference between a COPY-only build and one that RUNs commands. The
 // artifact keeps its old meaning exactly: a file you can carry to another node.
+// --push is a THIRD sink, not a replacement for the store: unlike `docker build
+// --push`, the recording still happens, because a k3sm build's product is an
+// image this node can run.
 //
-// The artifact is written FIRST. It is local and cheap, so a bad --output path
-// fails before a multi-gigabyte stream is sent to the daemon; and if the store
-// leg then fails, the operator holds a file `k3sm image load` can finish with.
-func deliver(ctx context.Context, o buildOptions, ref name.Tag, img ggcrv1.Image, out io.Writer, record storeRecorder, engineEndpoint, enginePlatform string) error {
+// THE ORDER IS ARTIFACT, STORE, PUSH, and each step earns its place. The
+// artifact is local and cheap, so a bad --output path fails before a
+// multi-gigabyte stream is sent to the daemon, and if the store leg then fails
+// the operator holds a file `k3sm image load` can finish with. The push is LAST
+// because it is the only step that can fail for a reason outside this Mac — a
+// refused credential, an unreachable host — and a failure there must not cost
+// the operator the build.
+func deliver(ctx context.Context, o buildOptions, ref name.Tag, img ggcrv1.Image, out io.Writer, record storeRecorder, push imagePusher, engineEndpoint, enginePlatform string) error {
 	if o.output != "" {
 		var sink oci.Sink = oci.TarballSink{Path: o.output}
 		if o.format == "oci" {
@@ -63,6 +70,19 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, img ggcrv1.Image
 		return err
 	}
 
+	// The upload comes after the recording, so a target this node cannot reach
+	// costs the operator an error message rather than the build. The reference it
+	// landed under is returned rather than re-derived for the summary: a printed
+	// target that was computed twice can disagree with the one that was pushed to.
+	var target name.Tag
+	if o.push {
+		pushed, err := pushDelivered(ctx, o, ref, img, push)
+		if err != nil {
+			return err
+		}
+		target = pushed
+	}
+
 	digest, err := img.Digest()
 	if err != nil {
 		return fmt.Errorf("compute digest: %w", err)
@@ -70,6 +90,9 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, img ggcrv1.Image
 	fmt.Fprintf(out, "built %s\n  digest: %s\n  store:  recorded in this node's image store (kubectl run app --image=%s)\n", ref, digest, ref)
 	if o.output != "" {
 		fmt.Fprintf(out, "  output: %s (%s)\n", o.output, o.format)
+	}
+	if o.push {
+		fmt.Fprintf(out, "  push:   %s\n", target)
 	}
 	if engineEndpoint != "" {
 		fmt.Fprintf(out, "  engine: %s (%s)\n", engineEndpoint, enginePlatform)

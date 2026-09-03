@@ -135,7 +135,8 @@ func engineBuild(ctx context.Context, o buildOptions, out io.Writer) error {
 	}
 
 	// The SAME delivery as the native path: recorded in this node's store under
-	// --tag, plus the artifact when --output asked for one. Sharing this is what
-	// makes "which engine built it" invisible after the build.
-	return deliver(ctx, o, ref, img, out, recordInStore, sess.endpoint, platform)
+	// --tag, plus the artifact when --output asked for one and the upload when
+	// --push did. Sharing this is what makes "which engine built it" invisible
+	// after the build.
+	return deliver(ctx, o, ref, img, out, recordInStore, pushImage, sess.endpoint, platform)
 }

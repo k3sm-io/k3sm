@@ -54,10 +54,14 @@ ONE command, two engines, chosen from the Dockerfile:
 Either way the image is RECORDED IN THIS NODE'S IMAGE STORE under --tag, ready
 for a Pod to name — so what you do next does not depend on which engine built
 it. --output additionally writes a portable artifact you can carry to another
-node ("docker" tarball, or "oci" for a layout directory).
+node ("docker" tarball, or "oci" for a layout directory). --push additionally
+uploads it to the registry the tag names; a BARE tag goes to this node's own
+ingest registry (--registry-port), which is where a bare name resolves from.
 
   k3sm build -t myapp:v1 .                       # usable here, right away
   k3sm build -t myapp:v1 --output myapp.tar .    # and a file to carry
+  k3sm build -t myapp:v1 --push .                # and into this node's registry
+  k3sm build -t ghcr.io/org/myapp:v1 --push .    # or into a named registry
 
 The built image RUNS. Name it in a Pod:
 
@@ -77,6 +81,10 @@ type buildOptions struct {
 	dockerfile string
 	tag        string
 	output     string
+	// push additionally uploads the built image to a registry once it is in the
+	// store. It is a sink, not a substitute: the store recording happens either
+	// way, so an image that failed to upload is still runnable on this node.
+	push       bool
 	format     string
 	platform   string
 	contextDir string
@@ -111,6 +119,7 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	fs.StringVar(&o.tag, "tag", "", "image reference to assign, e.g. myapp:v1 (required)")
 	fs.StringVar(&o.tag, "t", "", "short form of --tag")
 	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the store recording always happens)")
+	fs.BoolVar(&o.push, "push", false, "additionally upload the image to the registry the tag names (a bare tag goes to this node's ingest registry)")
 	fs.StringVar(&o.format, "format", "docker", "output format: docker (a `docker load` tarball) or oci (an OCI layout dir)")
 	fs.StringVar(&o.platform, "platform", oci.DefaultPlatform, "target platform (only "+oci.DefaultPlatform+" is supported)")
 	if err := fs.Parse(args); err != nil {
@@ -155,7 +164,7 @@ type engineBuilder func(ctx context.Context, o buildOptions, out io.Writer) erro
 // build parses, assembles and writes, routing to the build engine when the
 // Dockerfile needs one.
 func build(ctx context.Context, o buildOptions, out io.Writer) error {
-	return buildWith(ctx, o, out, engineBuild, recordInStore)
+	return buildWith(ctx, o, out, engineBuild, recordInStore, pushImage)
 }
 
 // buildWith is build with the engine seam injected.
@@ -164,7 +173,7 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 // last line leaves no artifact behind — and the routing decision is taken from
 // that same parse, so no Dockerfile is read twice or classified by a second,
 // drifting reader.
-func buildWith(ctx context.Context, o buildOptions, out io.Writer, engine engineBuilder, record storeRecorder) error {
+func buildWith(ctx context.Context, o buildOptions, out io.Writer, engine engineBuilder, record storeRecorder, push imagePusher) error {
 	ref, err := name.NewTag(o.tag)
 	if err != nil {
 		return fmt.Errorf("--tag %q: %w", o.tag, err)
@@ -206,7 +215,7 @@ func buildWith(ctx context.Context, o buildOptions, out io.Writer, engine engine
 		return err
 	}
 
-	if err := deliver(ctx, o, ref, img, out, record, "", ""); err != nil {
+	if err := deliver(ctx, o, ref, img, out, record, push, "", ""); err != nil {
 		return err
 	}
 	if named {
