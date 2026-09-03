@@ -60,7 +60,9 @@ metadata. One with `RUN` builds on the cluster's build engine, which starts on f
 [Building images](builder.md).
 
 ```sh
-k3sm build --tag myapp:v1 --output myapp.tar .
+k3sm build --tag myapp:v1 .                                  # into this node's image store
+k3sm build --tag myapp:v1 --push .                           # and on to a registry
+k3sm build --tag myapp:v1 --output myapp.tar .               # and into a file to carry
 docker load -i myapp.tar          # the tarball is a standard docker-save archive
 k3sm build --tag myapp:v1 --output ./layout --format oci .   # or an OCI layout directory
 ```
@@ -80,6 +82,38 @@ error naming what was rejected — the parser never guesses and never silently d
 because a dropped instruction produces an image that looks built but is not what the recipe
 described.
 
+### Building a Linux Image
+
+`darwin/arm64` is the default target. Name a Linux one and you get a Linux image, from any
+Dockerfile:
+
+```sh
+k3sm build --tag myapp:v1 --platform linux/arm64 .
+```
+
+Run it with `runtimeClassName: vm` — see [`vm` RuntimeClass](vm-runtimeclass.md). A Linux target
+always builds on the cluster's build engine, including for a Dockerfile that only copies files in:
+the native packager copies host files into a darwin image and produces no other kind.
+
+Several targets at once build an index:
+
+```sh
+k3sm build --tag myapp:v1 --platform linux/arm64,linux/amd64 --format oci --output ./layout .
+```
+
+`--output` (as `oci`) and `--push` carry every platform. This node's image store holds one image per
+name, so it records the `linux/arm64` one — the platform this node's own guests run — and the build
+summary says which it took. A multi-platform build with no `linux/arm64` in it is refused rather
+than recorded under a name that would not start, and `--format docker` is refused for one, because a
+`docker save` tarball holds a single image.
+
+The engine's guest is `arm64` and registers no emulator, so a `RUN` step for another architecture is
+refused by name before the engine starts. That is the shape of a `linux/amd64` build here: compile
+elsewhere and `COPY` the binary in, rather than `RUN` the toolchain.
+
+Such an image is one you build **for other clusters**. k3sm nodes run no `amd64` payload today, on
+either path — see [What runs](what-runs.md).
+
 > **A built image is in this node's store when the build finishes.** `k3sm build` records it under
 > the tag you gave, so an `image: myapp:v1` Pod spec resolves with no further step. `--output` also
 > writes a portable artifact to a path you name — that is what you want for moving the image to
@@ -95,9 +129,9 @@ Each of these is a documented difference, never a silent divergence:
 | `FROM <ref>` | **Supported**, with two caveats. The base is fetched for `darwin/arm64` using the same credential chain as `k3sm image push`, and is **refused if it declares any other platform** — a `darwin/arm64` image built on a `linux/amd64` base is a self-consistent lie whose payload cannot execute. And a **tag**-pinned base is not reproducible: the tag can move, so the build says so and prints the base it used. Pin a digest if you want the guarantee. In practice bases are ones your own organisation published — see [What runs](what-runs.md) on why there is no public supply of `darwin` images. |
 | `ADD` | An exact alias of `COPY`. It does **not** fetch remote URLs and does **not** auto-extract archives; both are refused rather than silently downgraded. |
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory — scope your `COPY` lines, or build from a clean tree. |
-| `--platform` | Accepts only `darwin/arm64`. The builder copies host files verbatim and does not cross-compile, so any other value would declare a platform the bytes do not satisfy. |
+| `--platform` | Accepts `darwin/arm64` (the default, packaged natively) and Linux targets, which build on the engine — several at once for a multi-platform index. Neither builder cross-compiles: a `darwin/arm64` image is refused any other value on the native path, and a `RUN` step for an architecture the engine's `arm64` guest cannot execute is refused by name. |
 | Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
-| Build output | Recorded in this node's image store under the tag you gave. `--output` additionally writes a portable artifact — a docker-save tar, or an OCI layout with `--format oci` — to a path you name. There is no push. |
+| Build output | Recorded in this node's image store under the tag you gave. `--output` additionally writes a portable artifact — a docker-save tar, or an OCI layout with `--format oci` — to a path you name. `--push` additionally uploads it. The store recording happens in every case, including with `--push`: what a k3sm build produces is an image this node can run. |
 | Timestamps | Fixed, not wall-clock — rebuilding the same context yields the same image digest. |
 | File modes | Normalized to `0755` (if any execute bit is set) or `0644`. A `0600` source becomes world-readable in the image, and setuid/setgid/sticky bits are dropped. Preserving source modes would break reproducibility, since git records only the execute bit. |
 | Ownership & xattrs | Every entry is `uid 0 / gid 0` with no user or group name, and no extended attributes — the builder's account identity and macOS xattrs (including `com.apple.quarantine`) never reach the image. |
@@ -217,6 +251,14 @@ can pull it the ordinary way instead of being loaded one at a time.
 ```sh
 k3sm build --tag registry.example.com/me/myapp:v1 --output ./layout --format oci .
 k3sm image push ./layout registry.example.com/me/myapp:v1
+```
+
+A build you are pushing straight away needs neither step — `k3sm build --push` uploads through this
+same path, after recording the image in the store:
+
+```sh
+k3sm build --tag registry.example.com/me/myapp:v1 --push .
+k3sm build --tag myapp:v1 --push .                     # a bare tag: this node's own registry
 ```
 
 The first argument is normally that layout directory. A first argument that is **no path on

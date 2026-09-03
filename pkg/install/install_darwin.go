@@ -20,11 +20,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -264,13 +266,60 @@ func (darwinSystem) ReadFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// LaunchctlBootstrap loads the daemon into the system domain.
+// LaunchctlBootstrap loads the daemon into the system domain. A failure launchd
+// attributes to the domain still settling is wrapped with ErrLaunchctlTransient so
+// the caller can retry exactly that class — see transientLaunchctlOutput. This is
+// the ONLY place launchctl's output text is inspected; the orchestration above
+// compares sentinels.
 func (darwinSystem) LaunchctlBootstrap(label string) error {
 	plist := filepath.Join(DefaultLaunchDaemonDir, label+".plist")
-	if out, err := exec.Command("launchctl", "bootstrap", "system", plist).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap %s: %w: %s", label, err, out)
+	out, err := exec.Command("launchctl", "bootstrap", "system", plist).CombinedOutput()
+	if err == nil {
+		return nil
 	}
-	return nil
+	if transientLaunchctlOutput(string(out)) {
+		return fmt.Errorf("launchctl bootstrap %s: %w: %w: %s", label, ErrLaunchctlTransient, err, out)
+	}
+	return fmt.Errorf("launchctl bootstrap %s: %w: %s", label, err, out)
+}
+
+// transientErrno matches launchctl's "<verb> failed: <errno>: <text>" line for the
+// two errnos launchd returns while a booted-out label is still leaving the system
+// domain: 37 (EINPROGRESS — the removal is in flight) and 5 (EIO — observed for
+// 1.77s while the label drained on a live install). The errno is anchored to the
+// failure line so an unrelated ": 5:" elsewhere in the output cannot match.
+var transientErrno = regexp.MustCompile(`(?im)^\s*\w+ failed:\s*(5|37):`)
+
+// transientLaunchctlOutput reports whether launchctl's output describes the domain
+// settling rather than a verdict on the job. It matches both the numeric form and
+// the two strerror texts, because launchctl has printed each shape depending on
+// the subcommand and the macOS release, and a missed classification here silently
+// reverts the caller to the un-retried behaviour this exists to fix.
+//
+// Misclassifying a PERMANENT failure as transient costs only a bounded retry that
+// fails identically and is then reported; the asymmetry is deliberate.
+func transientLaunchctlOutput(out string) bool {
+	lower := strings.ToLower(out)
+	return strings.Contains(lower, "operation already in progress") ||
+		strings.Contains(lower, "input/output error") ||
+		transientErrno.MatchString(out)
+}
+
+// PathExists reports whether path exists, without opening it. Install verifies the
+// netd unix socket this way because no file read can answer for a socket: opening
+// one with the file API fails whether or not netd is listening. A not-exist stat is
+// (false, nil); any other stat failure is returned, because "I could not tell" must
+// never be reported as "absent". Lstat, not Stat, so a dangling symlink at the
+// socket path is reported as present — it exists, and it is not this check's job to
+// decide it is the wrong kind of thing.
+func (darwinSystem) PathExists(path string) (bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // LaunchctlBootout unloads the daemon. A not-loaded label (exit 113/3) is treated

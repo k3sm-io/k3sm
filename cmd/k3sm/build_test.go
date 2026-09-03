@@ -816,7 +816,7 @@ func testOutputSinks(t *testing.T) {
 			output:     out,
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuild, noStore); err != nil {
+		}, io.Discard, engineBuild, noStore, noPush); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		img, err := tarball.ImageFromPath(out, nil)
@@ -841,7 +841,7 @@ func testOutputSinks(t *testing.T) {
 			output:     out,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuild, noStore); err != nil {
+		}, io.Discard, engineBuild, noStore, noPush); err != nil {
 			t.Fatalf("build: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(out, "index.json")); err != nil {
@@ -865,7 +865,7 @@ func testOutputSinks(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "img.tar")
 		err := buildWith(t.Context(), buildOptions{
 			dockerfile: bad, tag: "example.com/app:v1", output: out, format: "docker", contextDir: ctxDir,
-		}, io.Discard, engineBuild, noStore)
+		}, io.Discard, engineBuild, noStore, noPush)
 		if !errors.Is(err, oci.ErrBadInstruction) {
 			t.Fatalf("build = %v, want ErrBadInstruction", err)
 		}

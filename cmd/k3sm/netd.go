@@ -254,9 +254,13 @@ func activateServiceAuthorizer(ctx context.Context, kubeconfig string, logger *s
 	}
 }
 
-// startServiceInformer loads kubeconfig, builds a Services informer, and blocks on
-// the initial cache sync (bounded, so a not-yet-serving apiserver is a retryable
-// error rather than a hang). It returns a retryable error if the kubeconfig is
+// serviceInformerSyncTimeout bounds one attempt's wait for the initial Services
+// cache sync, so a not-yet-serving apiserver is a retryable error rather than a
+// hang. activateServiceAuthorizer retries the whole attempt on its own timer.
+const serviceInformerSyncTimeout = 10 * time.Second
+
+// startServiceInformer loads kubeconfig, builds a client, and hands off to
+// runServiceInformer. It returns a retryable error if the kubeconfig is
 // absent/unreadable, the client can't be built, or the cache doesn't sync in time.
 func startServiceInformer(ctx context.Context, kubeconfig string) (corev1listers.ServiceLister, error) {
 	if _, err := os.Stat(kubeconfig); err != nil {
@@ -270,15 +274,48 @@ func startServiceInformer(ctx context.Context, kubeconfig string) (corev1listers
 	if err != nil {
 		return nil, fmt.Errorf("build client: %w", err)
 	}
+	return runServiceInformer(ctx, cs, serviceInformerSyncTimeout)
+}
+
+// runServiceInformer starts a Services informer against cs and blocks on the
+// initial cache sync, returning the lister once it is warm.
+//
+// The informer runs under a context of this ATTEMPT's own, not the daemon's. That
+// distinction is the whole point: this function is called on a retry loop, and it
+// is called at boot with a kubeconfig whose token the server is about to rewrite.
+// Started against the daemon context, a failed attempt left its reflector running
+// for the daemon's life, re-listing with the stale credential every few seconds —
+// so each retry stacked another one, and netd logged Unauthorized forever while the
+// attempt that eventually succeeded worked fine. Cancelling here on every error path
+// (and calling Shutdown, which blocks until the goroutines are gone) makes a failed
+// attempt leave nothing behind. The successful attempt's informer survives, tied to
+// ctx, because that is the one whose lister the caller keeps.
+func runServiceInformer(ctx context.Context, cs kubernetes.Interface, syncTimeout time.Duration) (corev1listers.ServiceLister, error) {
 	factory := informers.NewSharedInformerFactory(cs, 30*time.Second)
 	svcInformer := factory.Core().V1().Services().Informer()
 	lister := factory.Core().V1().Services().Lister()
-	factory.Start(ctx.Done())
-	syncCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	keep := false
+	// Deferred rather than inline, so every failure exit — including one added
+	// later — tears this attempt's reflector down. Shutdown blocks until the
+	// goroutines are actually gone, which is what makes "left nothing behind" a
+	// fact rather than a hope.
+	defer func() {
+		if keep {
+			return
+		}
+		cancel()
+		factory.Shutdown()
+	}()
+
+	factory.Start(runCtx.Done())
+	syncCtx, cancelSync := context.WithTimeout(runCtx, syncTimeout)
+	defer cancelSync()
 	if !cache.WaitForCacheSync(syncCtx.Done(), svcInformer.HasSynced) {
-		return nil, fmt.Errorf("service cache did not sync before timeout")
+		return nil, fmt.Errorf("service cache did not sync within %s", syncTimeout)
 	}
+	keep = true
 	return lister, nil
 }
 

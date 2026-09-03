@@ -23,6 +23,75 @@ afterwards, so the next such build goes straight to it.
 
 Same command, same tag, same store, either way.
 
+## Choosing the platform
+
+Unset, `--platform` follows the Dockerfile: a COPY-only one is packaged as a
+`darwin/arm64` image, and one the engine builds produces `linux/arm64`.
+
+Naming a Linux target builds a Linux image from any Dockerfile:
+
+```sh
+k3sm build -t myapp:v1 --platform linux/arm64 .
+```
+
+That goes to the engine even for a Dockerfile that only copies files in, because
+the native packager copies host files into a darwin image and produces no other
+kind. Run it with `runtimeClassName: vm` — see
+[`vm` RuntimeClass](vm-runtimeclass.md).
+
+Several targets at once build an index:
+
+```sh
+k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .
+```
+
+`--output` (as `oci`) and `--push` carry every platform. This node's image store
+holds one image per name, so it records the `linux/arm64` one — what the node's
+own guests run — and the summary says so.
+
+The engine's guest is `arm64` and registers no emulator, so `RUN` steps for
+another architecture are refused by name before the engine starts. Copy a
+cross-compiled binary in instead, which is how a `linux/amd64` image is built
+here:
+
+```dockerfile
+FROM scratch
+COPY dist/myapp-amd64 /usr/local/bin/myapp
+ENTRYPOINT ["/usr/local/bin/myapp"]
+```
+
+That image is one you build for other clusters: k3sm nodes run no `amd64`
+payload today, on either path. See [What runs](what-runs.md).
+
+## Getting the image out
+
+The image is in this node's store when the build finishes, which is everything a
+Pod on this node needs. `--push` sends it on to a registry in the same command:
+
+```sh
+k3sm build -t myapp:v1 --push .               # this node's own registry
+k3sm build -t ghcr.io/org/myapp:v1 --push .   # a registry you name
+```
+
+A tag that names a registry goes to that registry. A bare tag goes to this node's
+registry on `localhost:<registry-port>` — the same place a bare `image: myapp:v1`
+in a Pod spec resolves from — and the store keeps your original bare name either
+way. The node's registry is started with `--registry-port`
+([Node-local registry](registry.md)); with none running, a bare tag and `--push`
+is an error naming both ways forward.
+
+The store recording happens first. When the upload then fails — a refused
+credential, an unreachable host — the build exits non-zero and says the image is
+in the store, so what you retry is the push.
+
+The two-step form is still there, and is what you want for an image you built
+earlier or received as a layout:
+
+```sh
+k3sm build -t myapp:v1 --output ./layout --format oci .
+k3sm image push ./layout localhost:6450/myapp:v1
+```
+
 ## The engine
 
 The engine is a long-lived [BuildKit](https://github.com/moby/buildkit) daemon
@@ -125,6 +194,9 @@ credential and store:
 k3sm image push out.oci localhost:<registry-port>/myapp:v1
 ```
 
+A build you drive through `k3sm build` needs neither step: `--push` uploads it
+through that same credential, and the store recording is already done.
+
 ## Limitations
 
 - **`RUN` needs a VM-capable node.** A Dockerfile that only copies files in
@@ -132,6 +204,9 @@ k3sm image push out.oci localhost:<registry-port>/myapp:v1
   needs a Mac that can boot a Linux guest.
 - **The engine is a single pod.** It is not replicated, and a build in flight
   does not survive the node going away.
+- **`RUN` executes as the guest's architecture, `arm64`.** The engine registers
+  no emulator, so a `RUN` step for another architecture is refused by name. A
+  foreign-architecture image is built by copying a cross-compiled binary in.
 - **buildx is a separate tool.** k3sm bundles the pieces it builds; `buildx`
   itself is the upstream release, pinned by version and checksum.
 - **No port-forward driver.** Your own `buildx` reaches the engine over its

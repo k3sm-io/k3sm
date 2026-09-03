@@ -59,25 +59,59 @@ type LayoutSink struct{ Path string }
 
 // Write implements Sink.
 func (s LayoutSink) Write(_ context.Context, ref name.Reference, img ggcrv1.Image) error {
-	if err := os.MkdirAll(s.Path, 0o755); err != nil {
-		return fmt.Errorf("create layout dir %s: %w", s.Path, err)
-	}
-	// An OCI layout is a multi-image container: re-initializing an existing one
-	// would drop the manifests already indexed there while orphaning their
-	// blobs, silently narrowing an artifact the operator is accumulating into.
-	p, err := layout.FromPath(s.Path)
+	p, err := s.openOrInit()
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("open layout %s: %w", s.Path, err)
-		}
-		if p, err = layout.Write(s.Path, empty.Index); err != nil {
-			return fmt.Errorf("init layout %s: %w", s.Path, err)
-		}
+		return err
 	}
-	if err := p.AppendImage(img, layout.WithAnnotations(map[string]string{
-		"org.opencontainers.image.ref.name": ref.String(),
-	})); err != nil {
+	if err := p.AppendImage(img, layout.WithAnnotations(refAnnotation(ref))); err != nil {
 		return fmt.Errorf("write layout %s: %w", s.Path, err)
 	}
 	return nil
+}
+
+// WriteIndex writes a multi-platform image INDEX into the layout at Path, with
+// every manifest it names and their blobs.
+//
+// It is a sibling of Write rather than a second Sink implementation because the
+// two differ only in what they append: an index is the shape a multi-platform
+// build produces, and a caller holding one must not have to flatten it to a
+// single image to write it out. The layout is the only --output format that can
+// carry more than one platform, which is why there is no tarball equivalent.
+func (s LayoutSink) WriteIndex(_ context.Context, ref name.Reference, idx ggcrv1.ImageIndex) error {
+	p, err := s.openOrInit()
+	if err != nil {
+		return err
+	}
+	if err := p.AppendIndex(idx, layout.WithAnnotations(refAnnotation(ref))); err != nil {
+		return fmt.Errorf("write layout %s: %w", s.Path, err)
+	}
+	return nil
+}
+
+// openOrInit opens the layout at Path, creating it when it is not there.
+//
+// An OCI layout is a multi-image container, so an existing one is APPENDED to:
+// re-initializing it would drop the manifests already indexed there while
+// orphaning their blobs, silently narrowing an artifact the operator is
+// accumulating into.
+func (s LayoutSink) openOrInit() (layout.Path, error) {
+	if err := os.MkdirAll(s.Path, 0o755); err != nil {
+		return "", fmt.Errorf("create layout dir %s: %w", s.Path, err)
+	}
+	p, err := layout.FromPath(s.Path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("open layout %s: %w", s.Path, err)
+		}
+		if p, err = layout.Write(s.Path, empty.Index); err != nil {
+			return "", fmt.Errorf("init layout %s: %w", s.Path, err)
+		}
+	}
+	return p, nil
+}
+
+// refAnnotation is the ref.name annotation every manifest this package writes
+// into a layout carries — the name `k3sm image import` reads back.
+func refAnnotation(ref name.Reference) map[string]string {
+	return map[string]string{"org.opencontainers.image.ref.name": ref.String()}
 }

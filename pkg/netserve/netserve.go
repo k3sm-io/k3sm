@@ -455,16 +455,15 @@ func (s *Server) runResolver(ctx context.Context) {
 	// helper, whose Service authorizer is populated ASYNCHRONOUSLY after boot (it
 	// authorizes :53 only once the kube-dns Service is in its cache — see
 	// cmd/k3sm/netd.go buildServiceSet). netd and this server are separate launchd
-	// daemons racing at startup, so the first bind attempt is routinely denied. A
-	// one-shot bind (the previous behavior) permanently disabled cluster DNS on that
-	// transient denial; retry with backoff so the resolver comes up as soon as netd
-	// self-heals, rather than staying dark for the daemon's life.
+	// daemons racing at startup, so the first bind attempt is routinely denied — and
+	// netd can also be down outright, for as long as it takes an operator to notice.
+	// bindDNSVIP therefore retries until it succeeds or the daemon shuts down; it
+	// returns an error only in the second case.
 	ap := netip.AddrPortFrom(s.dnsVIP, dns.DefaultDNSPort)
 	udp, tcp, err := s.bindDNSVIP(ctx, ap)
 	if err != nil {
 		if ctx.Err() == nil {
-			s.log.Error("bind DNS VIP; per-node resolver disabled after retries (check the netd helper's Service authorizer + the kube-dns Service)",
-				"addr", ap.String(), "err", err)
+			s.log.Error("bind DNS VIP; per-node resolver disabled", "addr", ap.String(), "err", err)
 		}
 		return
 	}
@@ -478,24 +477,51 @@ func (s *Server) runResolver(ctx context.Context) {
 	}
 }
 
-// dnsBindRetrySchedule backs off the DNS-VIP bind while the netd helper's Service
-// authorizer catches up after boot (netd is a separate launchd daemon whose <1024
-// authorizer syncs seconds after this server starts). The cumulative window
-// (~2.5 min) comfortably spans the kubeconfig-write + apiserver-up + kube-dns
-// Service-create sequence netd must observe before it authorizes :53.
-var dnsBindRetrySchedule = []time.Duration{
-	2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second,
+// dnsBindRetryInitial and dnsBindRetryMax bound the exponential backoff the DNS-VIP
+// bind re-attempts on. They mirror darwin-net's proxy openRetryInitial/openRetryMax
+// (pkg/proxy/proxy.go) deliberately: same shape, same 30s ceiling, same reason —
+// nothing else re-attempts the bind, so the first transient failure would otherwise
+// leave the socket unbound for the process's lifetime.
+//
+// The retry is UNBOUNDED, and that is the change from the schedule this replaced.
+// That schedule gave up permanently after ~2.5 minutes, on the assumption that the
+// only thing being waited for was netd's Service authorizer syncing at boot. It is
+// not: a netd outage that outlives the window (a reinstall that leaves the helper
+// down, a helper restart coinciding with the server's) killed cluster DNS for the
+// server's whole life, with one log line and no recovery path short of a restart.
+// A capped-backoff retry that never gives up costs one goroutine and two log lines
+// a minute; giving up costs the cluster its DNS.
+var (
+	dnsBindRetryInitial = 2 * time.Second
+	dnsBindRetryMax     = 30 * time.Second
+)
+
+// dnsBindWait blocks for d, or until ctx is done. It is a var so a unit test can
+// drive the retry loop through hundreds of attempts without spending real time;
+// nothing in the product replaces it.
+var dnsBindWait = func(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 // bindDNSVIP ensures the DNS VIP lo0 alias and binds 53/UDP+53/TCP, retrying the
-// whole sequence with backoff (dnsBindRetrySchedule) until it succeeds or ctx is
-// cancelled. The <1024 bind flows through the netd helper, which denies it until
-// its Service authorizer syncs — so a transient denial is expected at boot and must
-// not permanently disable the resolver. On success it returns both listeners; on
-// ctx cancellation or exhausted retries it returns the last error (both closed).
+// whole sequence with capped exponential backoff until it succeeds or ctx is
+// cancelled — those are the only two ways it returns. The <1024 bind flows through
+// the netd helper, which denies it until its Service authorizer syncs, and netd is
+// a separate launchd daemon that can be down for arbitrarily long, so there is no
+// deadline after which "still failing" means anything other than "still failing".
+//
+// Every attempt is logged at Warn, forever. That is a heartbeat, not spam: at the
+// 30s ceiling it is two lines a minute, each one saying that this node's cluster
+// DNS is down and why — and it was precisely the silence after the old schedule
+// expired that let a dead resolver go unnoticed.
 func (s *Server) bindDNSVIP(ctx context.Context, ap netip.AddrPort) (net.PacketConn, net.Listener, error) {
-	var lastErr error
-	for attempt := 0; ; attempt++ {
+	backoff := dnsBindRetryInitial
+	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
@@ -503,18 +529,12 @@ func (s *Server) bindDNSVIP(ctx context.Context, ap netip.AddrPort) (net.PacketC
 		if err == nil {
 			return udp, tcp, nil
 		}
-		lastErr = err
-		if attempt >= len(dnsBindRetrySchedule) {
-			return nil, nil, lastErr
+		s.log.Warn("DNS VIP bind failed (netd helper down, or its Service authorizer not yet synced); cluster DNS is unavailable on this node until it succeeds",
+			"addr", ap.String(), "attempt", attempt, "retry-in", backoff, "err", err)
+		if err := dnsBindWait(ctx, backoff); err != nil {
+			return nil, nil, err
 		}
-		delay := dnsBindRetrySchedule[attempt]
-		s.log.Warn("DNS VIP bind failed (netd authorizer likely not yet synced); retrying",
-			"addr", ap.String(), "attempt", attempt+1, "retry-in", delay, "err", err)
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		case <-time.After(delay):
-		}
+		backoff = min(2*backoff, dnsBindRetryMax)
 	}
 }
 

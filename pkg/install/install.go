@@ -238,6 +238,14 @@ type System interface {
 	// window, or a job that has exited and not yet been relaunched). A label that
 	// is not loaded at all is an error. It is read-only.
 	LaunchctlServicePID(label string) (int, error)
+	// PathExists reports whether path exists, WITHOUT reading it. Install's
+	// post-restart verification uses it on the netd unix socket, which no
+	// ReadFile can answer for: opening a socket with the file API fails on
+	// darwin regardless of whether the helper is listening, so "readable" and
+	// "present" are different questions and only the second one is meaningful
+	// here. A false verdict is not an error; an error means the check itself
+	// could not be made (a permission or IO failure on the parent tree).
+	PathExists(path string) (bool, error)
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
 	// ~/.kube/config, owned by targetUser (not root).
 	WriteUserKubeconfig(targetUser string, contents []byte) error
@@ -763,18 +771,22 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//    bootstrapped: `launchctl bootstrap` on an already-loaded label does not
 	//    re-exec an updated on-disk binary — the stale daemon keeps running the old
 	//    code, so a reinstall/upgrade (or a live rebuild between acceptance runs)
-	//    would silently serve the superseded binary. bootout blocks until the old
-	//    job unloads, so the following bootstrap always (re)starts the fresh binary.
-	for _, a := range m {
-		if a.kind != kindDaemon {
-			continue
-		}
-		if err := sys.LaunchctlBootout(a.label); err != nil {
-			return fmt.Errorf("install: bootout stale %s before (re)bootstrap: %w", a.label, err)
-		}
-		if err := sys.LaunchctlBootstrap(a.label); err != nil {
-			return fmt.Errorf("install: bootstrap %s: %w", a.label, err)
-		}
+	//    would silently serve the superseded binary.
+	//
+	//    The two commands are NOT a pair: bootout returns before launchd has
+	//    removed the label, so an immediate bootstrap races the teardown and loses.
+	//    restart.go sequences them — see its file comment for the failure this cost
+	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
+	if err := restartDaemons(ctx, sys, m, cfg.Logger); err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+
+	// 4b. Verify the claim step 4 makes, rather than assuming it. An install that
+	//     reports success having left a daemon down is worse than one that fails:
+	//     the operator walks away, and the breakage surfaces later as something
+	//     else entirely (a cluster whose DNS stopped answering).
+	if err := verifyDaemons(ctx, sys, cfg); err != nil {
+		return fmt.Errorf("install: %w", err)
 	}
 
 	// 5. Write the admin kubeconfig to the human's home (owned by them, not root).
@@ -789,14 +801,38 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 // manifest install consumes — so nothing install creates can be left behind
 // (the B62 leak was the two plists, which the old hardcoded uninstall never
 // removed). It walks the manifest in reverse install order: the server daemon
-// before netd (server first stops driving the helper; netd's SIGTERM handler
-// then flushes lo0/pf/utun), each daemon torn down as Bootout(label) then
+// before netd, so the control plane stops driving the helper before the helper
+// goes away. Each daemon is torn down as Bootout(label) then
 // RemoveAll(plistPath) so the label and its plist never diverge. InstallDir-
 // covered artifacts are swept by the single RemoveAll(InstallDir); dispPreserve
 // artifacts (DataRoot's kine state.db + mesh keys, the human kubeconfig, the
 // _k3sm user, LogDir) are left in place. It is idempotent: a bootout of a
 // not-loaded label and a RemoveAll of an absent path are both no-op successes,
 // so re-running after a partial install (or twice) is safe.
+//
+// What netd's SIGTERM does, precisely: `k3sm netd` cancels its context, and
+// netd.Server.Serve closes its listener and returns. That is all — it flushes
+// NOTHING. A full teardown does exist (mesh.WGDevice.Down deletes the routes,
+// flushes the pf anchor, drops the mesh-egress alias and closes the utun), but
+// the only caller is the RemoveMesh RPC; no signal path reaches it. This comment
+// used to assert the opposite — "netd's SIGTERM handler then flushes lo0/pf/utun"
+// — and believing it is how the residue below went unaccounted for.
+//
+// So a booted-out netd leaves durable kernel state, and uninstall removes exactly
+// one class of it:
+//
+//   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
+//     because no daemon does it.
+//   - the mesh MSS-clamp pf anchor — NOT removed. It survives netd, scoped to a
+//     utun that is gone, until something flushes the anchor or the host reboots.
+//   - the wireguard utun and its routes — NOT explicitly removed. The interface
+//     is created in-process (tun.CreateTUN) and goes away with netd, and the
+//     kernel drops routes whose interface has vanished; nothing here proves the
+//     routing table is clean, only that no rule keeps it dirty.
+//
+// Flushing those on the way out is a darwin-net change (a shutdown hook that
+// reaches Down), not an installer one, and is filed separately. Uninstall makes
+// no claim to do it.
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
 	var firstErr error
