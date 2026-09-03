@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/executor"
 )
@@ -41,13 +42,84 @@ type fakeSystem struct {
 	// records into it, so running Install twice against ONE fake reproduces a real
 	// reinstall: the second run reads back the plist the first run wrote.
 	files map[string][]byte
-	// pid is the launchd-reported pid of the labelled job; a kickstart advances it.
+	// pid is the next pid the fake launchd hands out; a bootstrap or a kickstart
+	// advances it, so a restarted job reports a DIFFERENT pid — the discriminator
+	// `k3sm certificate rotate` uses to tell the new control plane from the old one
+	// still draining its listeners.
 	pid int
+	// loaded models the launchd system domain: a label present here is loaded, and
+	// its value is the pid launchd reports (0 = loaded but not spawned). A label
+	// ABSENT is not loaded, which LaunchctlServicePID reports as an ERROR — the very
+	// discriminator install's await-unloaded step polls on.
+	loaded map[string]int
+	// drain[label] is how many LaunchctlServicePID reads the label lingers in the
+	// domain AFTER its bootout returns. This is the real launchd behaviour the whole
+	// restart sequence exists for (bootout returns before the label is gone), and it
+	// is 0 by default so every pre-existing test still describes an instant unload.
+	drain map[string]int
+	// bootstrapErrs[label] is a queue of errors LaunchctlBootstrap returns before it
+	// finally succeeds — the transient-then-succeeds shape a racing bootstrap has on
+	// a real install. Empty (the zero value) means every bootstrap succeeds, so no
+	// pre-existing test has to say anything about it.
+	bootstrapErrs map[string][]error
+	// bootstrapAlways[label] is an error LaunchctlBootstrap returns for EVERY
+	// attempt (a plist launchd will never accept, or a domain that never settles).
+	// It is consulted after the queue, so a test can describe "transient twice,
+	// then permanently broken" if it needs to.
+	bootstrapAlways map[string]error
 	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
 	// path. The zero value (no entry) means "signed and entitled" so that every
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
 	// states the failure explicitly with putEntitlement.
 	entitlement map[string]error
+}
+
+// putDrain makes the fake launchd keep label in the domain for reads
+// LaunchctlServicePID answers after its bootout — the bootout-returns-early race.
+func (f *fakeSystem) putDrain(label string, reads int) {
+	if f.drain == nil {
+		f.drain = map[string]int{}
+	}
+	f.drain[label] = reads
+}
+
+// putBootstrapErrs queues the errors LaunchctlBootstrap returns for label before it
+// succeeds.
+func (f *fakeSystem) putBootstrapErrs(label string, errs ...error) {
+	if f.bootstrapErrs == nil {
+		f.bootstrapErrs = map[string][]error{}
+	}
+	f.bootstrapErrs[label] = errs
+}
+
+// putBootstrapAlways makes every LaunchctlBootstrap of label fail with err.
+func (f *fakeSystem) putBootstrapAlways(label string, err error) {
+	if f.bootstrapAlways == nil {
+		f.bootstrapAlways = map[string]error{}
+	}
+	f.bootstrapAlways[label] = err
+}
+
+// putLoaded seeds the fake launchd domain with an already-running label — the
+// reinstall posture, where both daemons are up before install touches them.
+func (f *fakeSystem) putLoaded(labels ...string) {
+	if f.loaded == nil {
+		f.loaded = map[string]int{}
+	}
+	for _, l := range labels {
+		f.pid++
+		f.loaded[l] = f.pid
+	}
+}
+
+// shrinkRestartBudgets collapses the restart waits for the duration of a test, so a
+// sequence that would spend a real minute waiting on launchd runs in microseconds.
+func shrinkRestartBudgets(t *testing.T) {
+	t.Helper()
+	tiny := restartBudget{unload: 50 * time.Millisecond, running: 50 * time.Millisecond, poll: time.Microsecond}
+	netdOrig, serverOrig := netdRestartBudget, serverRestartBudget
+	netdRestartBudget, serverRestartBudget = tiny, tiny
+	t.Cleanup(func() { netdRestartBudget, serverRestartBudget = netdOrig, serverOrig })
 }
 
 // putEntitlement makes the faked codesign probe report err for path — the seam at
@@ -121,13 +193,35 @@ func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte) error 
 	return nil
 }
 
+// LaunchctlBootstrap loads the label, unless the test queued a failure for it. A
+// queued error is consumed, so putBootstrapErrs(l, transient) describes "fails
+// once, then succeeds" — the racing-bootstrap shape.
 func (f *fakeSystem) LaunchctlBootstrap(label string) error {
 	f.calls = append(f.calls, "Bootstrap:"+label)
+	if queued := f.bootstrapErrs[label]; len(queued) > 0 {
+		f.bootstrapErrs[label] = queued[1:]
+		return queued[0]
+	}
+	if err := f.bootstrapAlways[label]; err != nil {
+		return err
+	}
+	if f.loaded == nil {
+		f.loaded = map[string]int{}
+	}
+	f.pid++
+	f.loaded[label] = f.pid
 	return nil
 }
 
+// LaunchctlBootout removes the label — but only after f.drain[label] further
+// LaunchctlServicePID reads, mirroring launchd's real behaviour: bootout returns
+// before the label has left the domain.
 func (f *fakeSystem) LaunchctlBootout(label string) error {
 	f.calls = append(f.calls, "Bootout:"+label)
+	if f.drain[label] > 0 {
+		return nil // still in the domain; ServicePID drains the counter
+	}
+	delete(f.loaded, label)
 	return nil
 }
 
@@ -137,12 +231,31 @@ func (f *fakeSystem) LaunchctlKickstart(label string) error {
 	// the discriminator `k3sm certificate rotate` uses to tell the NEW control plane
 	// from the old one still draining its listeners.
 	f.pid++
+	if f.loaded == nil {
+		f.loaded = map[string]int{}
+	}
+	f.loaded[label] = f.pid
 	return nil
 }
 
+// LaunchctlServicePID answers from the fake domain: a loaded label reports its pid,
+// an absent one is an ERROR (never pid 0 — "not loaded" and "loaded but not
+// spawned" are different states, and install's await-unloaded step depends on the
+// difference). Each read also drains one tick of a pending bootout.
 func (f *fakeSystem) LaunchctlServicePID(label string) (int, error) {
 	f.calls = append(f.calls, "ServicePID:"+label)
-	return f.pid, nil
+	if n := f.drain[label]; n > 0 {
+		f.drain[label] = n - 1
+		if f.drain[label] == 0 {
+			delete(f.loaded, label)
+		}
+		return f.loaded[label], nil
+	}
+	pid, ok := f.loaded[label]
+	if !ok {
+		return 0, fmt.Errorf("launchctl print system/%s: %w", label, fs.ErrNotExist)
+	}
+	return pid, nil
 }
 
 func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
@@ -207,10 +320,18 @@ func TestInstallOrchestration(t *testing.T) {
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
+		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is
+		// the only proof launchd finished the teardown) → bootstrap → await-running
+		// (the read that proves the fresh instance actually spawned). The bare
+		// bootout;bootstrap pair this replaced raced launchd's own removal.
 		"Bootout:io.k3sm.netd",
+		"ServicePID:io.k3sm.netd",
 		"Bootstrap:io.k3sm.netd",
+		"ServicePID:io.k3sm.netd",
 		"Bootout:io.k3sm.server",
+		"ServicePID:io.k3sm.server",
 		"Bootstrap:io.k3sm.server",
+		"ServicePID:io.k3sm.server",
 		"WriteUserKubeconfig:alice",
 	}
 	if len(f.calls) != len(want) {
