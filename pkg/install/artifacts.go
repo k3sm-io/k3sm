@@ -58,6 +58,19 @@ const (
 	// archive and not another would make availability depend on which archive an
 	// operator happened to unpack rather than on their hardware.
 	VMHostName = sandbox.VMHostName
+	// VirtualizationEntitlement is the code-signing entitlement the k3sm-vmhost
+	// helper must carry to create a VZVirtualMachine. Install verifies the staged
+	// helper's signature grants it before copying the helper into place
+	// (Config.VMHostSource), because the copy preserves the signature verbatim and
+	// can therefore only propagate whatever the build produced.
+	//
+	// The string is stated here rather than imported because runtimed exports no Go
+	// constant for it: its home is the cmd/k3sm-vmhost/vmhost.entitlements plist the
+	// signing toolchain reads, and runtimed's own probe is the unexported cgo
+	// Security.framework read behind sandbox.VMBackend.Available. The two are bound
+	// by the integration-tier probe test, which signs its fixture with that very
+	// plist and then requires this package's gate to accept the result.
+	VirtualizationEntitlement = "com.apple.security.virtualization"
 	// PayloadDirName is the basename of the directory holding the control-plane
 	// payload (executor.PayloadBinaries) beside the binary. The launchd daemon
 	// seeds its work dir from it, having neither gh nor a Go toolchain.

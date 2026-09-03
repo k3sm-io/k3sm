@@ -43,6 +43,25 @@ type fakeSystem struct {
 	files map[string][]byte
 	// pid is the launchd-reported pid of the labelled job; a kickstart advances it.
 	pid int
+	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
+	// path. The zero value (no entry) means "signed and entitled" so that every
+	// pre-existing test keeps describing a healthy staging tree; a test that cares
+	// states the failure explicitly with putEntitlement.
+	entitlement map[string]error
+}
+
+// putEntitlement makes the faked codesign probe report err for path — the seam at
+// which the entitlement check is stubbed, so no unit test signs anything.
+func (f *fakeSystem) putEntitlement(path string, err error) {
+	if f.entitlement == nil {
+		f.entitlement = map[string]error{}
+	}
+	f.entitlement[path] = err
+}
+
+func (f *fakeSystem) VerifyVirtualizationEntitlement(path string) error {
+	f.calls = append(f.calls, "VerifyVirtualizationEntitlement:"+path)
+	return f.entitlement[path]
 }
 
 // putFile seeds the fake root filesystem (an installed plist, the cluster CA).
@@ -170,6 +189,10 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_pathrebase_shim.dylib",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
+		// The helper's entitlement is read BEFORE it is copied: the copy preserves
+		// the signature verbatim, so this is the last moment install can still
+		// decline to lay down a helper that cannot boot a VM.
+		"VerifyVirtualizationEntitlement:/tmp/k3sm-vmhost",
 		"CopyToRootOwned:/Library/k3sm/k3sm-vmhost",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-scheduler",
