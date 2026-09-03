@@ -23,8 +23,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/layout"
 
 	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/oci"
@@ -61,16 +64,18 @@ func needsBuildEngine(err error) bool {
 	return false
 }
 
-// engineBuildPlatform resolves the platform the engine builds for, or refuses a
-// target only the native path can serve.
+// engineBuildPlatform resolves the platform — or the comma-separated platforms —
+// the engine builds for, or refuses a target only the native path can serve.
 func engineBuildPlatform(o buildOptions) (string, error) {
 	if !o.platformSet {
 		return enginePlatform, nil
 	}
-	if o.platform == oci.DefaultPlatform {
-		return "", fmt.Errorf("--platform %s is the native COPY-only path's target; this Dockerfile needs the build engine, which produces Linux images (drop --platform for %s, or keep the Dockerfile within the native subset)", o.platform, enginePlatform)
+	for _, p := range o.targets() {
+		if platformOS(p) == oci.PlatformOS {
+			return "", fmt.Errorf("--platform %s is the native COPY-only path's target; this Dockerfile needs the build engine, which produces Linux images (drop --platform for %s, or keep the Dockerfile within the native subset)", p, enginePlatform)
+		}
 	}
-	return o.platform, nil
+	return strings.Join(o.targets(), ","), nil
 }
 
 // engineBuildArgs is the buildx argv the engine path runs. Pure, so the exact
@@ -129,14 +134,79 @@ func engineBuild(ctx context.Context, o buildOptions, out io.Writer) error {
 		return fmt.Errorf("build through the k3sm build engine at %s: %w", sess.endpoint, err)
 	}
 
-	img, err := layoutImage(layoutDir)
+	b, err := engineArtifact(layoutDir, strings.Split(platform, ","))
 	if err != nil {
-		return fmt.Errorf("read the engine's output: %w", err)
+		return err
 	}
 
 	// The SAME delivery as the native path: recorded in this node's store under
 	// --tag, plus the artifact when --output asked for one and the upload when
 	// --push did. Sharing this is what makes "which engine built it" invisible
 	// after the build.
-	return deliver(ctx, o, ref, img, out, recordInStore, pushImage, sess.endpoint, platform)
+	return deliver(ctx, o, ref, b, out, recordInStore, pushBuilt, sess.endpoint, platform)
+}
+
+// layoutIndex returns the multi-platform image index a layout's single
+// top-level descriptor names, and nil when that descriptor is an image manifest
+// or when the layout is not the one-descriptor shape at all.
+//
+// nil is not an error precisely so the two readers stay in one order: this one
+// answers "is there an index to descend into", and layoutImage — the reader
+// `k3sm image push` already uses — produces every refusal about a layout that
+// holds the wrong number of things. Two readers with two error registers for one
+// malformed layout is how a caller ends up reporting the wrong one.
+func layoutIndex(dir string) (ggcrv1.ImageIndex, error) {
+	p, err := layout.FromPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	idx, err := p.ImageIndex()
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := idx.IndexManifest()
+	if err != nil {
+		return nil, err
+	}
+	if len(manifest.Manifests) != 1 || !manifest.Manifests[0].MediaType.IsIndex() {
+		return nil, nil
+	}
+	return idx.ImageIndex(manifest.Manifests[0].Digest)
+}
+
+// engineArtifact reads what buildx exported into layoutDir.
+//
+// buildx writes ONE top-level descriptor per build: an image manifest for a
+// single platform, and an image INDEX when several were asked for. Both shapes
+// are read here, and a single-child index is collapsed to that image, so
+// "multi-platform" means what it says downstream — a build for one platform
+// takes exactly the paths it always took, whatever shape the exporter chose.
+func engineArtifact(layoutDir string, platforms []string) (built, error) {
+	idx, err := layoutIndex(layoutDir)
+	if err != nil {
+		return built{}, fmt.Errorf("read the engine's output: %w", err)
+	}
+	if idx == nil {
+		img, err := layoutImage(layoutDir)
+		if err != nil {
+			return built{}, fmt.Errorf("read the engine's output: %w", err)
+		}
+		return built{image: img, platforms: platforms, storePlatform: platforms[0]}, nil
+	}
+	manifest, err := idx.IndexManifest()
+	if err != nil {
+		return built{}, fmt.Errorf("read the engine's output: %w", err)
+	}
+	if len(manifest.Manifests) == 1 {
+		img, err := idx.Image(manifest.Manifests[0].Digest)
+		if err != nil {
+			return built{}, fmt.Errorf("read the engine's output: %w", err)
+		}
+		return built{image: img, platforms: platforms, storePlatform: platforms[0]}, nil
+	}
+	img, storePlatform, err := selectStoreImage(idx, enginePlatform)
+	if err != nil {
+		return built{}, err
+	}
+	return built{image: img, index: idx, platforms: platforms, storePlatform: storePlatform}, nil
 }

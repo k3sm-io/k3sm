@@ -24,7 +24,6 @@ import (
 	"strconv"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	ggcrv1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"k3sm.io/k3sm/pkg/registrysvc"
 )
@@ -39,10 +38,23 @@ import (
 // exit 0 on a command whose entire purpose was the upload.
 var errNoNodeRegistry = errors.New("this node has no ingest registry to push to")
 
-// imagePusher uploads a built image to a registry reference. It is a seam so the
-// ORDER — the node's store first, the registry second — and the wording of a
-// failed upload are provable without a registry, a credential or a network.
-type imagePusher func(ctx context.Context, ref name.Reference, img ggcrv1.Image, workDir string) error
+// imagePusher uploads what a build produced to a registry reference. It is a
+// seam so the ORDER — the node's store first, the registry second — and the
+// wording of a failed upload are provable without a registry, a credential or a
+// network.
+type imagePusher func(ctx context.Context, ref name.Reference, b built, workDir string) error
+
+// pushBuilt is the production imagePusher: it uploads a single-platform build
+// through the same path `k3sm image push` uses, and a multi-platform build as
+// the INDEX it is — every platform under one reference, which is what makes the
+// pushed artifact indistinguishable from any other multi-arch image a puller
+// selects from.
+func pushBuilt(ctx context.Context, ref name.Reference, b built, workDir string) error {
+	if b.index != nil {
+		return pushIndex(ctx, ref, b.index, workDir)
+	}
+	return pushImage(ctx, ref, b.image, workDir)
+}
 
 // pushDelivered sends an image that is ALREADY recorded in this node's store on
 // to a registry, and returns the reference it landed under.
@@ -52,7 +64,7 @@ type imagePusher func(ctx context.Context, ref name.Reference, img ggcrv1.Image,
 // --tag and a Pod can name it right now, so the operator's next step is to retry
 // the upload, not the build. An error that did not say so would read as "the
 // build failed".
-func pushDelivered(ctx context.Context, o buildOptions, ref name.Tag, img ggcrv1.Image, push imagePusher) (name.Tag, error) {
+func pushDelivered(ctx context.Context, o buildOptions, ref name.Tag, b built, push imagePusher) (name.Tag, error) {
 	// The control-plane state root is resolved the way every other
 	// registry-aware verb in this binary resolves it, so `k3sm build --push`
 	// finds exactly the per-boot credential `k3sm image push` would.
@@ -61,7 +73,7 @@ func pushDelivered(ctx context.Context, o buildOptions, ref name.Tag, img ggcrv1
 	if err != nil {
 		return name.Tag{}, pushAfterStoreError(ref, err)
 	}
-	if err := push(ctx, target, img, workDir); err != nil {
+	if err := push(ctx, target, b, workDir); err != nil {
 		return name.Tag{}, pushAfterStoreError(ref, err)
 	}
 	return target, nil

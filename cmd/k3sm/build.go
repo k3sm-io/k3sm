@@ -63,6 +63,19 @@ ingest registry (--registry-port), which is where a bare name resolves from.
   k3sm build -t myapp:v1 --push .                # and into this node's registry
   k3sm build -t ghcr.io/org/myapp:v1 --push .    # or into a named registry
 
+--platform names the target. Unset builds darwin/arm64 natively, or a Linux
+image when the Dockerfile needs the engine. An EXPLICIT Linux target always
+builds on the engine, so a COPY-only Dockerfile can produce a Linux image too:
+
+  k3sm build -t myapp:v1 --platform linux/arm64 .
+  k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .
+
+Several platforms at once produce an index. --output (as "oci") and --push carry
+every one of them; this node's image store holds one image per name, so it
+records the platform this node's Linux guests run and the summary says so. The
+engine's guest is arm64 and registers no emulator, so RUN steps for another
+architecture are refused by name — COPY a cross-compiled binary in instead.
+
 The built image RUNS. Name it in a Pod:
 
   k3sm build --tag myapp:v1 .
@@ -84,9 +97,12 @@ type buildOptions struct {
 	// push additionally uploads the built image to a registry once it is in the
 	// store. It is a sink, not a substitute: the store recording happens either
 	// way, so an image that failed to upload is still runnable on this node.
-	push       bool
-	format     string
-	platform   string
+	push   bool
+	format string
+	// platforms is the parsed --platform list: one target, or several for a
+	// multi-platform build. It is never empty — an argv that named no platform
+	// carries the native path's default.
+	platforms  []string
 	contextDir string
 	// platformSet records whether --platform was given. The engine path builds
 	// Linux images, so it must tell "the operator asked for darwin/arm64" (a
@@ -121,11 +137,16 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the store recording always happens)")
 	fs.BoolVar(&o.push, "push", false, "additionally upload the image to the registry the tag names (a bare tag goes to this node's ingest registry)")
 	fs.StringVar(&o.format, "format", "docker", "output format: docker (a `docker load` tarball) or oci (an OCI layout dir)")
-	fs.StringVar(&o.platform, "platform", oci.DefaultPlatform, "target platform (only "+oci.DefaultPlatform+" is supported)")
+	var platformSpec string
+	fs.StringVar(&platformSpec, "platform", oci.DefaultPlatform, "target platform, or several separated by commas: "+oci.DefaultPlatform+" (native) or "+enginePlatform+" and friends (the build engine)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
 	o.platformSet = flagWasSet(fs, "platform")
+	var err error
+	if o.platforms, err = parsePlatforms(platformSpec); err != nil {
+		return o, err
+	}
 
 	// stdlib flag stops at the first non-flag argument, so "k3sm build . --tag x"
 	// would silently leave --tag unparsed and build an untagged image. That
@@ -150,6 +171,12 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	if o.format != "docker" && o.format != "oci" {
 		return o, fmt.Errorf("--format %q: want \"docker\" or \"oci\"", o.format)
 	}
+	// A docker-save tarball holds ONE image. A multi-platform build produces an
+	// index, so the combination is refused here rather than at the end of a build
+	// that would then have to drop every platform but one.
+	if len(o.platforms) > 1 && o.output != "" && o.format == "docker" {
+		return o, fmt.Errorf("--format docker holds one image and --platform names %d; use --format oci, which carries them all", len(o.platforms))
+	}
 	if o.dockerfile == "" {
 		o.dockerfile = filepath.Join(o.contextDir, "Dockerfile")
 	}
@@ -164,7 +191,7 @@ type engineBuilder func(ctx context.Context, o buildOptions, out io.Writer) erro
 // build parses, assembles and writes, routing to the build engine when the
 // Dockerfile needs one.
 func build(ctx context.Context, o buildOptions, out io.Writer) error {
-	return buildWith(ctx, o, out, engineBuild, recordInStore, pushImage)
+	return buildWith(ctx, o, out, engineBuild, recordInStore, pushBuilt)
 }
 
 // buildWith is build with the engine seam injected.
@@ -189,9 +216,23 @@ func buildWith(ctx context.Context, o buildOptions, out io.Writer, engine engine
 		if !needsBuildEngine(err) {
 			return err
 		}
+		// The one combination the engine provably cannot serve is refused here,
+		// before it is started: minutes of boot and layer work ending in runc's
+		// "exec format error" names neither the architecture nor the reason.
+		if refusal := emulationRefusal(o, err); refusal != nil {
+			return refusal
+		}
 		// The Dockerfile is valid Docker that this builder cannot express. That
 		// is not a user error, so it is not reported as one: the engine builds
 		// it. `k3sm build` is the one build command either way.
+		return engine(ctx, o, out)
+	}
+	// The Dockerfile is within the native subset, but the native packager copies
+	// host files into a DARWIN image and cannot produce a Linux one — so an
+	// explicit Linux target is an engine build by definition, COPY-only or not.
+	// The parse still happened first, so a malformed Dockerfile is still refused
+	// natively rather than after an engine boot.
+	if enginePlatformRequested(o) {
 		return engine(ctx, o, out)
 	}
 
@@ -208,14 +249,14 @@ func buildWith(ctx context.Context, o buildOptions, out io.Writer, engine engine
 
 	baseRef, named := df.Base()
 	img, err := oci.Build(oci.Request{
-		Dockerfile: df, Context: bc, Platform: o.platform, TmpDir: tmp,
+		Dockerfile: df, Context: bc, Platform: o.targets()[0], TmpDir: tmp,
 		BaseResolver: remoteBase(ctx, localRegistryWorkDir()),
 	})
 	if err != nil {
 		return err
 	}
 
-	if err := deliver(ctx, o, ref, img, out, record, push, "", ""); err != nil {
+	if err := deliver(ctx, o, ref, built{image: img, platforms: o.targets(), storePlatform: o.targets()[0]}, out, record, push, "", ""); err != nil {
 		return err
 	}
 	if named {

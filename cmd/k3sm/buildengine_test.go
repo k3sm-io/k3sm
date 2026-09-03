@@ -108,7 +108,7 @@ func TestBuildRouting(t *testing.T) {
 				tag:        "example.com/app:v1",
 				output:     out,
 				format:     "docker",
-				platform:   oci.DefaultPlatform,
+				platforms:  []string{oci.DefaultPlatform},
 				contextDir: ctxDir,
 			}
 
@@ -158,13 +158,13 @@ func TestBuildRouting(t *testing.T) {
 // TestEngineBuildPlatform pins the one flag whose meaning differs per path.
 func TestEngineBuildPlatform(t *testing.T) {
 	t.Run("unset defaults to the guest platform", func(t *testing.T) {
-		got, err := engineBuildPlatform(buildOptions{platform: oci.DefaultPlatform})
+		got, err := engineBuildPlatform(buildOptions{platforms: []string{oci.DefaultPlatform}})
 		if err != nil || got != enginePlatform {
 			t.Fatalf("engineBuildPlatform = (%q, %v), want (%q, nil)", got, err, enginePlatform)
 		}
 	})
 	t.Run("an explicit darwin target names the constraint", func(t *testing.T) {
-		_, err := engineBuildPlatform(buildOptions{platform: oci.DefaultPlatform, platformSet: true})
+		_, err := engineBuildPlatform(buildOptions{platforms: []string{oci.DefaultPlatform}, platformSet: true})
 		if err == nil {
 			t.Fatal("expected a refusal for a darwin target on the engine path")
 		}
@@ -175,7 +175,7 @@ func TestEngineBuildPlatform(t *testing.T) {
 		}
 	})
 	t.Run("an explicit linux target passes through", func(t *testing.T) {
-		got, err := engineBuildPlatform(buildOptions{platform: "linux/amd64", platformSet: true})
+		got, err := engineBuildPlatform(buildOptions{platforms: []string{"linux/amd64"}, platformSet: true})
 		if err != nil || got != "linux/amd64" {
 			t.Fatalf("engineBuildPlatform = (%q, %v), want (linux/amd64, nil)", got, err)
 		}
@@ -238,8 +238,8 @@ func TestBuildShortFlags(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !set.platformSet || set.platform != "linux/amd64" {
-			t.Errorf("platform = %q, set = %v", set.platform, set.platformSet)
+		if !set.platformSet || len(set.platforms) != 1 || set.platforms[0] != "linux/amd64" {
+			t.Errorf("platforms = %v, set = %v", set.platforms, set.platformSet)
 		}
 	})
 }

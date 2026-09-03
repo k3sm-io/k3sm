@@ -139,6 +139,24 @@ func pushImage(ctx context.Context, ref name.Reference, img ggcrv1.Image, workDi
 	return nil
 }
 
+// pushIndex uploads a multi-platform image index to ref: every manifest it
+// names, every blob those name, and the index itself.
+//
+// It is the index arm of pushImage and shares both halves that carry the
+// contract — registryAuth for the credential and pushError for the failure
+// taxonomy — because "what was uploaded" is the only axis on which a
+// multi-platform push differs from a single-platform one.
+func pushIndex(ctx context.Context, ref name.Reference, idx ggcrv1.ImageIndex, workDir string) error {
+	auth, err := registryAuth(ref, workDir)
+	if err != nil {
+		return err
+	}
+	if err := remote.WriteIndex(ref, idx, remote.WithContext(ctx), remote.WithAuth(auth)); err != nil {
+		return pushError(ref, err)
+	}
+	return nil
+}
+
 // layoutImage opens an OCI image layout directory and returns the one image it
 // holds.
 //

@@ -35,7 +35,7 @@ import (
 // nothing and cannot fail, so a build test never needs a registry. It is also
 // the assertion that --push was NOT asked for — deliver only calls the seam when
 // the flag is set.
-func noPush(context.Context, name.Reference, ggcrv1.Image, string) error { return nil }
+func noPush(context.Context, name.Reference, built, string) error { return nil }
 
 // recordingPush is an imagePusher that remembers what it was handed and appends
 // to a shared event log, which is how the store-then-push ORDER is proven
@@ -47,8 +47,8 @@ type recordingPush struct {
 	err      error
 }
 
-func (p *recordingPush) push(_ context.Context, ref name.Reference, img ggcrv1.Image, workDir string) error {
-	if img == nil {
+func (p *recordingPush) push(_ context.Context, ref name.Reference, b built, workDir string) error {
+	if b.image == nil {
 		return errors.New("the pusher was handed a nil image")
 	}
 	*p.log = append(*p.log, "push")
@@ -381,7 +381,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuild, store.record, pushImage); err != nil {
+		}, &out, engineBuild, store.record, pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 
@@ -427,7 +427,7 @@ func TestBuildPushToRegistry(t *testing.T) {
 			output:     layout,
 			format:     "oci",
 			contextDir: ctxDir,
-		}, &out, engineBuild, noStore, pushImage); err != nil {
+		}, &out, engineBuild, noStore, pushBuilt); err != nil {
 			t.Fatalf("build --push: %v", err)
 		}
 		if !strings.Contains(out.String(), "push:   "+target) {

@@ -211,8 +211,8 @@ run_test "builder.9b" 4 TestBuildTagRequiredWithoutOutput ./cmd/k3sm/
 # BOTH paths must deliver through the one function, or the two terminal states
 # drift and "which engine built it" becomes visible again.
 b9c=ok
-grep -q 'deliver(ctx, o, ref, img, out, record' "$K3SM_ROOT/cmd/k3sm/build.go" || b9c=no
-grep -q 'deliver(ctx, o, ref, img, out, recordInStore' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b9c=no
+grep -q 'deliver(ctx, o, ref, built{' "$K3SM_ROOT/cmd/k3sm/build.go" || b9c=no
+grep -q 'deliver(ctx, o, ref, b, out, recordInStore' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b9c=no
 ladder "$b9c" "builder.9c both build paths deliver through the same store+artifact function"
 # The store leg must use the daemon's own ingest RPC — the CLI never writes the
 # store itself (the daemon is its sole writer).
@@ -243,8 +243,8 @@ b10e=ok
 grep -q 'push imagePusher' "$K3SM_ROOT/cmd/k3sm/buildstore.go" || b10e=no
 grep -q 'func pushImage(' "$K3SM_ROOT/cmd/k3sm/imagepush.go" || b10e=no
 grep -q 'pushImage(ctx, ref, img, o.workDir)' "$K3SM_ROOT/cmd/k3sm/imagepush.go" || b10e=no
-grep -q 'deliver(ctx, o, ref, img, out, record, push' "$K3SM_ROOT/cmd/k3sm/build.go" || b10e=no
-grep -q 'deliver(ctx, o, ref, img, out, recordInStore, pushImage' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b10e=no
+grep -q 'out, record, push, ' "$K3SM_ROOT/cmd/k3sm/build.go" || b10e=no
+grep -q 'recordInStore, pushBuilt' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b10e=no
 ladder "$b10e" "builder.10e both build paths push through the same upload path k3sm image push uses"
 # The store recording is NOT skipped by --push (the divergence from docker
 # buildx): deliver records first and uploads second, so a failed upload leaves a
@@ -254,6 +254,37 @@ if grep -q 'is in the node store; push failed' "$K3SM_ROOT/cmd/k3sm/buildpush.go
 else
 	ladder no "builder.10f a failed push reports that the image is already in the node store"
 fi
+
+# ---- builder.11 — `--platform` is a first-class target ---------------------
+# THE THIRD RED→GREEN RUNG. On main --platform only qualified a build the
+# DOCKERFILE had already routed: a COPY-only Dockerfile with --platform
+# linux/arm64 built a darwin image. Here the TARGET decides — the native
+# packager copies host files into a darwin image and cannot produce a Linux one,
+# so an explicit Linux target is an engine build whatever the Dockerfile says.
+run_test "builder.11a" 12 TestParsePlatforms ./cmd/k3sm/
+run_test "builder.11b" 12 TestBuildPlatformRouting ./cmd/k3sm/
+# The engine's guest is arm64 and installs no emulator, which is a fact of THIS
+# repo (the entrypoint asserts the arch and adds no binfmt handler), so a RUN
+# step for another architecture is refused by name before the engine starts.
+if grep -qE 'aarch64\|arm64\) : ;;' "$K3SM_ROOT/pkg/builder/assets/entrypoint.sh"; then
+	ladder ok "builder.11c the engine entrypoint pins the guest arch the emulation refusal is derived from"
+else
+	ladder no "builder.11c the engine entrypoint pins the guest arch the emulation refusal is derived from"
+fi
+if grep -q 'engineGuestArch = platformArch(enginePlatform)' "$K3SM_ROOT/cmd/k3sm/buildplatform.go"; then
+	ladder ok "builder.11d the refusal derives the guest arch from enginePlatform rather than restating it"
+else
+	ladder no "builder.11d the refusal derives the guest arch from enginePlatform rather than restating it"
+fi
+
+# ---- builder.12 — multi-platform delivery ---------------------------------
+# Several platforms at once produce an INDEX. --output (as oci) and --push carry
+# every platform; this node's store holds one image per name, so it records the
+# platform this node's Linux guests run and the summary says which.
+run_test "builder.12a" 3 TestSelectStoreImage ./cmd/k3sm/
+run_test "builder.12b" 1 TestMultiPlatformDelivery ./cmd/k3sm/
+run_test "builder.12c" 4 TestMultiPlatformFormat ./cmd/k3sm/
+run_test "builder.12d" 2 TestLayoutSinkWriteIndex ./pkg/oci/
 
 # ---- LIVE TIER (owed — the orchestrator's single-node lab step) ------------
 owed "builder.20 live: \`k3sm builder up\` registers a buildkit worker          (needs a vm-capable node)"
@@ -266,6 +297,10 @@ owed "builder.25 live: \`k3sm builder down\` deletes the Pod but keeps the cache
 owed "builder.26 live: \`k3sm builder delete\` removes the Pod, Service, cache PVC AND the namespace (full reset)"
 owed "builder.27 live: \`k3sm build -t myapp:v1 --push .\` on a node with --registry-port lands the image in that node's registry and a Pod naming myapp:v1 pulls it back"
 owed "builder.28 live: \`k3sm build -t myapp:v1 --push .\` with the registry DISABLED exits non-zero, names --registry-port, and \`k3sm image ls\` still shows myapp:v1"
+owed "builder.29 live: \`k3sm build -t myapp:v1 --platform linux/arm64 .\` on a COPY-only Dockerfile produces a LINUX image (k3sm image inspect reports linux/arm64) and a runtimeClassName: vm Pod runs it"
+owed "builder.30 live: \`k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .\` writes an index holding both, the store records linux/arm64, and --push publishes the whole index"
+owed "builder.31 live: \`k3sm build --platform linux/amd64 .\` on a COPY-only Dockerfile — does buildkit accept a target its worker cannot execute? (the one multi-arch behaviour no offline gate can settle)"
+owed "builder.32 live: a build summary carries no \`docker-desktop://\` line (buildx v0.17.1 prints it only when ~/.docker/desktop-build/.lastaccess exists; see the probe note in builder.11)"
 
 echo "----------------------------------------"
 echo "builder: $PASS passed, $FAIL failed, $PENDING OWED (live)"
