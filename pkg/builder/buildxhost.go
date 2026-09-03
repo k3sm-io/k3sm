@@ -196,10 +196,19 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// HostHomeDir is the k3sm-owned HOME directory buildx runs with, inside the
+// k3sm BUILDX_CONFIG store for cfgDir. See BuildxEnv for why HOME is redirected
+// at all; it lives under the store so a reset of the store takes it with it.
+func HostHomeDir(cfgDir string) string {
+	return filepath.Join(cfgDir, "home")
+}
+
 // BuildxEnv returns the environment for a buildx exec: base, with BUILDX_CONFIG
-// forced to the k3sm-owned cfgDir.
+// forced to the k3sm-owned cfgDir, HOME forced to a k3sm-owned directory inside
+// it, and DOCKER_CONFIG pinned to the config directory the caller's own
+// environment resolves to.
 //
-// Setting it is load-bearing at BOTH ends. buildx writes the instance record
+// BUILDX_CONFIG is load-bearing at BOTH ends. buildx writes the instance record
 // under BUILDX_CONFIG at create time and reads it back from there at build time;
 // with the variable unset (or different) for the build, buildx does not find the
 // k3sm instance and quietly falls back to the docker context, which on a Mac
@@ -207,33 +216,110 @@ func sha256File(path string) (string, error) {
 // than the real cause. Deriving both ends from this one function is what makes
 // the two agree.
 //
-// DOCKER_CONFIG is deliberately left untouched: it is inherited unchanged by the
-// create and the build alike, so registry credentials the user already has keep
-// working. BUILDX_CONFIG being explicit is what makes the instance lookup
-// independent of it.
+// HOME is redirected to suppress the Docker Desktop deep link. On a Mac that has
+// ever used Desktop's build backend, buildx ends every non-quiet build with
+// "View build details: docker-desktop://…" — a link that opens an app k3sm does
+// not use and cannot be reached by any hint variable: buildx v0.17.1 calls
+// desktop.PrintBuildDetails unconditionally (commands/build.go, the default arm
+// of the progressMode switch), gated only on desktop.BuildBackendEnabled(),
+// which is
 //
-// NO HINT-SUPPRESSING VARIABLE IS SET HERE, and that is a finding rather than an
-// omission. On a Mac that has used Docker Desktop's build backend, buildx ends a
-// build with "View build details: docker-desktop://…" — a deep link that means
-// nothing on a k3sm cluster. It is NOT reachable by environment at the pinned
-// version: buildx v0.17.1 calls desktop.PrintBuildDetails unconditionally from
-// commands/build.go for every non-quiet progress mode, and the only gate on it
-// is desktop.BuildBackendEnabled(), which tests for
-// $HOME/.docker/desktop-build/.lastaccess. DOCKER_CLI_HINTS reaches only
-// docker/cli's HooksEnabled(), which buildx v0.17.1 never calls, so setting it
-// would suppress nothing and claim otherwise. The two levers that would work are
-// both worse than the line: redirecting HOME (which is where the user's docker
-// credentials and credential helpers live) and filtering buildx's stderr (which
-// carries the build's own progress).
+//	home, err := os.UserHomeDir()        // util/desktop/desktop.go:21-26
+//	_, err = os.Stat(filepath.Join(home, ".docker", "desktop-build", ".lastaccess"))
+//
+// That path is rooted in os.UserHomeDir() LITERALLY, not in docker/cli's
+// config.Dir(), so DOCKER_CONFIG cannot move it and pointing DOCKER_CONFIG
+// somewhere clean suppresses nothing. DOCKER_CLI_HINTS reaches only docker/cli's
+// HooksEnabled(), which buildx v0.17.1 never calls. os.UserHomeDir() on darwin
+// is exactly os.Getenv("HOME"), so the one lever that works is HOME — and the
+// user's credentials are handed back by DOCKER_CONFIG, whose derivation
+// (docker/cli cli/config/config.go Dir(): $DOCKER_CONFIG, else $HOME/.docker) is
+// reproduced here from the CALLER's environment before HOME is replaced. An
+// inherited DOCKER_CONFIG is kept verbatim; auths, credsStore, credHelpers,
+// contexts and the config file's other keys are read from the same directory
+// they were before. A config directory that does not exist, or one with no
+// config.json, is valid: docker/cli loads an empty config for it.
+//
+// WHAT ELSE THE REDIRECT MOVES, audited against the buildx v0.17.1 tree for the
+// path k3sm drives (a local build context, the remote driver over tcp):
+//
+//   - docker/cli config.Dir() (cli/config/config.go) — the credentials, contexts
+//     and .token_seed. Pinned by DOCKER_CONFIG above; unmoved.
+//   - buildx's own store (util/confutil ConfigDir) — $BUILDX_CONFIG wins over
+//     the config dir, and it is set here; unmoved.
+//   - git, shelled out by util/gitutil with cmd.Env = os.Environ() to stamp
+//     vcs provenance on a local context. It loses ~/.gitconfig. Verified not to
+//     matter for what buildx asks it: every call is a read (rev-parse, remote
+//     get-url, show --format, symbolic-ref, for-each-ref) and git's
+//     dubious-ownership check exempts a sudo invocation by SUDO_UID rather than
+//     by anything in HOME — confirmed on this repo, where rev-parse under sudo
+//     answers the same with HOME redirected. Losing the global config cannot
+//     change a commit sha.
+//   - driver/kubernetes/context/load.go reads ~/.kube/config, but only for the
+//     kubernetes driver. k3sm registers the remote driver and injects its own
+//     --builder, and the k3sm BUILDX_CONFIG store holds no other instance, so
+//     the kubernetes loader is unreachable from here.
+//   - buildkit's appdefaults HOME paths are the rootless local-daemon address,
+//     used only when the client address is empty. The remote driver always
+//     supplies tcp://<endpoint>.
+//   - RESIDUAL, accepted: `--cache-to/from type=s3` resolves AWS credentials
+//     through the aws-sdk shared-config files under ~/.aws (util/buildflags
+//     addAwsCredentials), and `bake` of a compose file expands a leading ~/ in
+//     compose paths (compose-go paths.ExpandUser). Both follow the new HOME. A
+//     user who needs either sets the SDK's own AWS_SHARED_CREDENTIALS_FILE /
+//     AWS_CONFIG_FILE, or writes an absolute path. Neither is a registry
+//     credential, so --push is unaffected.
+//
+// The rejected alternatives were filtering buildx's stderr (which carries the
+// build's own progress UI) and patching the pinned binary (a fork to maintain
+// for one line of output).
 func BuildxEnv(base []string, cfgDir string) []string {
-	out := make([]string, 0, len(base)+1)
+	dockerCfg := dockerConfigDir(base)
+	out := make([]string, 0, len(base)+3)
 	for _, kv := range base {
-		if strings.HasPrefix(kv, "BUILDX_CONFIG=") {
+		// Every copy is dropped, not just the last: execve keeps duplicates and
+		// getenv answers with the FIRST match, so a surviving inherited entry
+		// would beat the one appended below.
+		if hasEnvKey(kv, "BUILDX_CONFIG") || hasEnvKey(kv, "HOME") || hasEnvKey(kv, "DOCKER_CONFIG") {
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out, "BUILDX_CONFIG="+cfgDir)
+	out = append(out, "BUILDX_CONFIG="+cfgDir, "HOME="+HostHomeDir(cfgDir))
+	if dockerCfg != "" {
+		out = append(out, "DOCKER_CONFIG="+dockerCfg)
+	}
+	return out
+}
+
+// dockerConfigDir reproduces docker/cli's config.Dir() over base: $DOCKER_CONFIG
+// when set, else $HOME/.docker. It returns "" when base names neither, in which
+// case BuildxEnv sets nothing and buildx falls back to the k3sm-owned HOME —
+// there were no credentials to preserve.
+func dockerConfigDir(base []string) string {
+	if v := envValue(base, "DOCKER_CONFIG"); v != "" {
+		return v
+	}
+	if home := envValue(base, "HOME"); home != "" {
+		return filepath.Join(home, ".docker")
+	}
+	return ""
+}
+
+// envValue returns the value key takes in an environment slice, using getenv's
+// first-match rule so a duplicated key resolves the way the child would see it.
+func envValue(env []string, key string) string {
+	for _, kv := range env {
+		if hasEnvKey(kv, key) {
+			return kv[len(key)+1:]
+		}
+	}
+	return ""
+}
+
+// hasEnvKey reports whether the "K=V" entry kv names key.
+func hasEnvKey(kv, key string) bool {
+	return len(kv) > len(key) && kv[len(key)] == '=' && kv[:len(key)] == key
 }
 
 // BuildxArgs assembles the argv for a passthrough run: `--builder <instance>`
@@ -278,6 +364,13 @@ type buildxRunner func(ctx context.Context, args ...string) (string, error)
 func EnsureBuilderInstance(ctx context.Context, bin, cfgDir, endpoint string) error {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		return fmt.Errorf("create buildx config dir %s: %w", cfgDir, err)
+	}
+	// The redirected HOME is created, not merely named: buildx and the tools it
+	// shells out to may write into it, and a HOME that does not exist turns a
+	// write into a failure the operator cannot place.
+	home := HostHomeDir(cfgDir)
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return fmt.Errorf("create buildx home dir %s: %w", home, err)
 	}
 	return ensureBuilderInstance(ctx, hostRunner(bin, BuildxEnv(os.Environ(), cfgDir)), endpoint)
 }

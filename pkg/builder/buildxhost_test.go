@@ -360,35 +360,139 @@ func TestBuildxArgsPassThrough(t *testing.T) {
 	})
 }
 
-// TestBuildxEnvForcesConfigDir pins that BUILDX_CONFIG is set to the k3sm-owned
-// dir, that an inherited value cannot win, and that DOCKER_CONFIG rides through
-// untouched (registry credentials keep working for a --push).
+// TestBuildxEnvForcesConfigDir pins that BUILDX_CONFIG is the k3sm-owned store,
+// that an inherited value cannot win, and that the rest of the caller's
+// environment rides through untouched.
 func TestBuildxEnvForcesConfigDir(t *testing.T) {
-	base := []string{"PATH=/usr/bin", "BUILDX_CONFIG=/home/user/.docker/buildx", "DOCKER_CONFIG=/home/user/.docker"}
-	env := BuildxEnv(base, "/var/lib/k3sm/server/buildx")
+	const cfgDir = "/var/lib/k3sm/server/buildx"
 
-	var buildxConfig []string
-	docker := ""
-	path := false
-	for _, kv := range env {
-		switch {
-		case strings.HasPrefix(kv, "BUILDX_CONFIG="):
-			buildxConfig = append(buildxConfig, strings.TrimPrefix(kv, "BUILDX_CONFIG="))
-		case strings.HasPrefix(kv, "DOCKER_CONFIG="):
-			docker = strings.TrimPrefix(kv, "DOCKER_CONFIG=")
-		case kv == "PATH=/usr/bin":
-			path = true
+	t.Run("the k3sm store wins over an inherited one", func(t *testing.T) {
+		env := BuildxEnv([]string{"PATH=/usr/bin", "BUILDX_CONFIG=/Users/dev/.docker/buildx"}, cfgDir)
+		assertEnv(t, env, map[string]string{"BUILDX_CONFIG": cfgDir, "PATH": "/usr/bin"})
+		if n := countEnv(env, "BUILDX_CONFIG"); n != 1 {
+			t.Errorf("BUILDX_CONFIG appears %d times, want exactly 1: %v", n, env)
+		}
+	})
+
+	t.Run("a key that merely starts with the name is left alone", func(t *testing.T) {
+		env := BuildxEnv([]string{"BUILDX_CONFIG_X=y", "HOMEBREW_PREFIX=/opt/homebrew"}, cfgDir)
+		assertEnv(t, env, map[string]string{"BUILDX_CONFIG_X": "y", "HOMEBREW_PREFIX": "/opt/homebrew"})
+	})
+}
+
+// TestBuildxEnvSuppressesTheDesktopLink pins the other half of the buildx
+// environment: HOME moved to a k3sm-owned directory (which is what keeps buildx
+// from finding Docker Desktop's build-backend marker and ending every build with
+// a docker-desktop:// link) and DOCKER_CONFIG pinned to the config directory the
+// CALLER's environment resolved to, which is what hands the user's registry
+// credentials back after HOME has moved. Neither half is optional: without the
+// redirect the link prints, without the pin a --push is 401.
+func TestBuildxEnvSuppressesTheDesktopLink(t *testing.T) {
+	const cfgDir = "/var/lib/k3sm/server/buildx"
+	home := HostHomeDir(cfgDir)
+
+	t.Run("the k3sm home is inside the k3sm store and is not the user's", func(t *testing.T) {
+		if got, want := home, filepath.Join(cfgDir, "home"); got != want {
+			t.Errorf("HostHomeDir = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("HOME is redirected and DOCKER_CONFIG derived from the caller's", func(t *testing.T) {
+		env := BuildxEnv([]string{"PATH=/usr/bin", "HOME=/Users/dev"}, cfgDir)
+		assertEnv(t, env, map[string]string{
+			"HOME":          home,
+			"DOCKER_CONFIG": "/Users/dev/.docker",
+			"PATH":          "/usr/bin",
+		})
+	})
+
+	t.Run("an inherited DOCKER_CONFIG wins over the derivation", func(t *testing.T) {
+		// docker/cli's config.Dir() prefers $DOCKER_CONFIG over $HOME/.docker, so
+		// reproducing that order is what makes a user's explicit choice survive.
+		env := BuildxEnv([]string{"HOME=/Users/dev", "DOCKER_CONFIG=/etc/docker-cfg"}, cfgDir)
+		assertEnv(t, env, map[string]string{"DOCKER_CONFIG": "/etc/docker-cfg", "HOME": home})
+	})
+
+	t.Run("a config dir with no config.json is still pinned", func(t *testing.T) {
+		// docker/cli loads an empty config for a directory that holds no
+		// config.json, so an absent user config is not a reason to leave
+		// DOCKER_CONFIG unset and let it re-derive from the k3sm HOME.
+		dir := t.TempDir()
+		env := BuildxEnv([]string{"HOME=" + dir}, cfgDir)
+		assertEnv(t, env, map[string]string{"DOCKER_CONFIG": filepath.Join(dir, ".docker")})
+	})
+
+	t.Run("a symlinked config dir is pinned by the path, not resolved", func(t *testing.T) {
+		// The value is handed to buildx verbatim; resolving it here would defeat
+		// a user who symlinks ~/.docker at a credential store on another volume.
+		real := filepath.Join(t.TempDir(), "real-docker")
+		if err := os.MkdirAll(real, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "link-docker")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		env := BuildxEnv([]string{"DOCKER_CONFIG=" + link}, cfgDir)
+		assertEnv(t, env, map[string]string{"DOCKER_CONFIG": link})
+	})
+
+	t.Run("no HOME and no DOCKER_CONFIG leaves DOCKER_CONFIG unset", func(t *testing.T) {
+		// There were no credentials to preserve, and inventing a path would point
+		// buildx at a directory nobody has written.
+		env := BuildxEnv([]string{"PATH=/usr/bin"}, cfgDir)
+		if n := countEnv(env, "DOCKER_CONFIG"); n != 0 {
+			t.Errorf("DOCKER_CONFIG was set with nothing to derive it from: %v", env)
+		}
+		assertEnv(t, env, map[string]string{"HOME": home})
+	})
+
+	t.Run("every inherited copy is dropped, not just the last", func(t *testing.T) {
+		// execve keeps duplicate keys and getenv answers with the FIRST match, so
+		// a surviving inherited entry would beat the one appended.
+		base := []string{
+			"HOME=/Users/dev",
+			"DOCKER_CONFIG=/Users/dev/.docker",
+			"HOME=/Users/dev",
+			"DOCKER_CONFIG=/tmp/other",
+		}
+		env := BuildxEnv(base, cfgDir)
+		for _, key := range []string{"HOME", "DOCKER_CONFIG"} {
+			if n := countEnv(env, key); n != 1 {
+				t.Errorf("%s appears %d times, want exactly 1: %v", key, n, env)
+			}
+		}
+		assertEnv(t, env, map[string]string{"HOME": home, "DOCKER_CONFIG": "/Users/dev/.docker"})
+	})
+}
+
+// assertEnv checks that env resolves each wanted key to its wanted value, using
+// getenv's first-match rule.
+func assertEnv(t *testing.T, env []string, want map[string]string) {
+	t.Helper()
+	for key, val := range want {
+		got := ""
+		for _, kv := range env {
+			if strings.HasPrefix(kv, key+"=") {
+				got = strings.TrimPrefix(kv, key+"=")
+				break
+			}
+		}
+		if got != val {
+			t.Errorf("%s = %q, want %q", key, got, val)
 		}
 	}
-	if len(buildxConfig) != 1 || buildxConfig[0] != "/var/lib/k3sm/server/buildx" {
-		t.Errorf("BUILDX_CONFIG = %v, want exactly the k3sm dir", buildxConfig)
+}
+
+// countEnv counts the entries in env naming key.
+func countEnv(env []string, key string) int {
+	n := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			n++
+		}
 	}
-	if docker != "/home/user/.docker" {
-		t.Errorf("DOCKER_CONFIG = %q, want the inherited value untouched", docker)
-	}
-	if !path {
-		t.Error("the base environment was not carried through")
-	}
+	return n
 }
 
 // TestHostPathsAreVersioned pins the cache layout: the binary name carries the

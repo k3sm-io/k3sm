@@ -16,7 +16,9 @@
 #   additionally writes the artifact) over a faked store, the --push TARGET
 #   RESOLUTION table and the store-then-push ORDER (a faked pusher, plus a real
 #   upload to an in-process registry on loopback), the lifecycle state machine
-#   over a fake kube/exec seam, and the legible-absence contract.
+#   over a fake kube/exec seam, the buildx ENV SHAPE that suppresses the Docker
+#   Desktop deep link without losing the user's registry credentials, and the
+#   legible-absence contract.
 #
 #   LIVE TIER (needs $KUBECONFIG on a vm-capable node) — the engine actually
 #   serving. It is PRINTED AS OWED here, not run: it needs a booted vm guest, a
@@ -166,7 +168,7 @@ fi
 run_test "builder.7a" 6 TestEnsureBuilderInstance ./pkg/builder/
 run_test "builder.7b" 6 TestInstanceEndpoints ./pkg/builder/
 run_test "builder.7c" 3 TestBuildxArgsPassThrough ./pkg/builder/
-run_test "builder.7d" 1 TestBuildxEnvForcesConfigDir ./pkg/builder/
+run_test "builder.7d" 2 TestBuildxEnvForcesConfigDir ./pkg/builder/
 run_test "builder.7e" 1 TestBuilderAcceptsBuildx ./cmd/k3sm/
 run_test "builder.7f" 1 TestBuilderUsageListsBuildx ./cmd/k3sm/
 run_test "builder.7g" 1 TestBuilderBuildxNeedsACommand ./cmd/k3sm/
@@ -286,6 +288,25 @@ run_test "builder.12b" 1 TestMultiPlatformDelivery ./cmd/k3sm/
 run_test "builder.12c" 4 TestMultiPlatformFormat ./cmd/k3sm/
 run_test "builder.12d" 2 TestLayoutSinkWriteIndex ./pkg/oci/
 
+# ---- builder.13 — no Docker Desktop deep link ------------------------------
+# A Mac that once used Desktop's build backend made buildx end every build with
+# "View build details: docker-desktop://…". buildx v0.17.1 gates that print on
+# os.Stat($HOME/.docker/desktop-build/.lastaccess) taken from os.UserHomeDir()
+# LITERALLY (util/desktop/desktop.go), so the only lever is HOME — and moving
+# HOME is safe only because DOCKER_CONFIG hands the credentials back. Both
+# halves are one env shape, so one test pins the whole suppression.
+run_test "builder.13a" 7 TestBuildxEnvSuppressesTheDesktopLink ./pkg/builder/
+# The live half was run on this rig 2026-09-03: `k3sm builder buildx build` and
+# `k3sm build` both printed the line before the change and neither prints it
+# after, and a --push to an authed registry (credential reachable ONLY through
+# the pinned DOCKER_CONFIG) authenticated — the same run with DOCKER_CONFIG
+# unpinned is 401, which is what makes the pin load-bearing rather than tidy.
+if grep -q 'DOCKER_CONFIG=' "$K3SM_ROOT/pkg/builder/buildxhost.go" && grep -q 'HOME=' "$K3SM_ROOT/pkg/builder/buildxhost.go"; then
+	ladder ok "builder.13b the buildx env sets BOTH the redirected HOME and the credential-preserving DOCKER_CONFIG"
+else
+	ladder no "builder.13b the buildx env sets BOTH the redirected HOME and the credential-preserving DOCKER_CONFIG"
+fi
+
 # ---- LIVE TIER (owed — the orchestrator's single-node lab step) ------------
 owed "builder.20 live: \`k3sm builder up\` registers a buildkit worker          (needs a vm-capable node)"
 owed "builder.21 live: a RUN-containing build through Endpoint() produces an OCI layout"
@@ -300,7 +321,6 @@ owed "builder.28 live: \`k3sm build -t myapp:v1 --push .\` with the registry DIS
 owed "builder.29 live: \`k3sm build -t myapp:v1 --platform linux/arm64 .\` on a COPY-only Dockerfile produces a LINUX image (k3sm image inspect reports linux/arm64) and a runtimeClassName: vm Pod runs it"
 owed "builder.30 live: \`k3sm build -t myapp:v1 --platform linux/arm64,linux/amd64 --format oci -o out .\` writes an index holding both, the store records linux/arm64, and --push publishes the whole index"
 owed "builder.31 live: \`k3sm build --platform linux/amd64 .\` on a COPY-only Dockerfile — does buildkit accept a target its worker cannot execute? (the one multi-arch behaviour no offline gate can settle)"
-owed "builder.32 live: a build summary carries no \`docker-desktop://\` line (buildx v0.17.1 prints it only when ~/.docker/desktop-build/.lastaccess exists; see the probe note in builder.11)"
 
 echo "----------------------------------------"
 echo "builder: $PASS passed, $FAIL failed, $PENDING OWED (live)"
