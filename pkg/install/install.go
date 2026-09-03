@@ -158,6 +158,24 @@ type System interface {
 	// basename-derived dst bricks both daemons with launchd's unrecoverable
 	// "Missing executable" — the live M2-gate failure this contract fixes).
 	CopyToRootOwned(src, dst string) error
+	// VerifyVirtualizationEntitlement reports whether the Mach-O at path is signed
+	// and its signature grants VirtualizationEntitlement. It is READ-ONLY — it is in
+	// this seam not because it is privileged but because it is the one environment
+	// fact install must observe about a file it is about to copy, and tests must be
+	// able to state that fact without signing anything.
+	//
+	// The contract is deliberately three-valued, and FAIL-CLOSED on everything the
+	// probe cannot affirm:
+	//
+	//	nil                                  signed, and the entitlement is present
+	//	errors.Is(err, fs.ErrNotExist)       nothing at path — the caller falls through
+	//	                                     to the copy, which owns that message
+	//	any other error                      REFUSE: unsigned, signed-but-unentitled,
+	//	                                     or the probe itself could not run
+	//
+	// The fs.ErrNotExist arm mirrors ReadFile's above: absence is a state a caller
+	// interprets, never a failure this seam decides.
+	VerifyVirtualizationEntitlement(path string) error
 	// EnsureLogDir creates (or repairs) the daemons' log directory owned by the
 	// service uid (group staff, 0755) so launchd can open the UserName=_k3sm
 	// server job's StandardOut/ErrorPath as _k3sm. launchd auto-creates a missing
@@ -281,8 +299,19 @@ type Config struct {
 	// binary, from which sandbox.FindVMHost resolves it for vm-RuntimeClass pods.
 	// The helper carries its own ad-hoc signature and the
 	// com.apple.security.virtualization entitlement — install copies it verbatim
-	// (see CopyToRootOwned) and never re-signs it. Defaults to the VMHostName
-	// sibling of BinarySource.
+	// (see CopyToRootOwned) and never re-signs it: a release helper is
+	// Developer-ID signed, and re-signing would destroy that.
+	//
+	// Because the copy can only propagate whatever the build produced, install
+	// FAILS CLOSED on a helper that does not already carry the entitlement
+	// (VerifyVirtualizationEntitlement, run immediately before the copy). Without
+	// that gate a dev helper built with a plain `go build` installs unentitled and
+	// the consequence surfaces nowhere near the cause: runtimed withholds
+	// VMBackendAvailable, the server deletes the node's k3sm.io/virtualization
+	// label, and every vm-RuntimeClass pod stays Pending behind the RuntimeClass's
+	// own node selector — reported only as "didn't match node affinity/selector".
+	//
+	// Defaults to the VMHostName sibling of BinarySource.
 	VMHostSource string
 	// TargetUser is the human (SUDO_USER) the admin kubeconfig is written for and
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
@@ -641,6 +670,21 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      com.apple.security.virtualization entitlement, and CopyToRootOwned
 	//      (ditto) carries that signature through verbatim — install never
 	//      re-signs it, matching every other sibling binary here.
+	//
+	//      Which is exactly why the entitlement is verified FIRST. Copying verbatim
+	//      means install can only propagate what the build produced, and a helper
+	//      built with a plain `go build` carries no entitlement at all. Installed
+	//      that way it fails silently and remotely: runtimed withholds
+	//      VMBackendAvailable, the server deletes the node's k3sm.io/virtualization
+	//      label, and every vm-RuntimeClass pod sits Pending reporting only the
+	//      RuntimeClass selector it no longer matches. Refusing here turns that into
+	//      one legible sentence at the one moment the fix is trivial.
+	//
+	//      A MISSING helper is not this gate's business — the probe reports
+	//      fs.ErrNotExist and the copy below keeps its existing message.
+	if err := sys.VerifyVirtualizationEntitlement(cfg.VMHostSource); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("install: staged %s does not carry the %s entitlement: %w (install copies the helper verbatim and never re-signs it, so an unentitled helper installs unentitled and every vm-RuntimeClass pod then stays Pending on an opaque node-affinity message; sign a dev build with `codesign --force --sign - --entitlements runtimed/cmd/k3sm-vmhost/vmhost.entitlements %s` — release artifacts already carry it)", cfg.VMHostSource, VirtualizationEntitlement, err, cfg.VMHostSource)
+	}
 	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.installedVMHost()); err != nil {
 		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.installedVMHost(), err)
 	}
