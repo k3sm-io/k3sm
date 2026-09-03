@@ -42,7 +42,7 @@ import (
 // arm64 asset is pinned; the entrypoint refuses any other guest arch rather than
 // run an unverifiable one.
 //
-// TODO(m12-plan Res. 11 packaging leg): the release build ships buildx
+// TODO(release packaging): the release build ships buildx
 // SOURCE-BUILT at this pinned tag as a goreleaser builds entry (the
 // cp-payload/vmhost provenance precedent — never re-sign Docker's prebuilt
 // binary), with its LICENSE run through go-licenses against the checkout. That

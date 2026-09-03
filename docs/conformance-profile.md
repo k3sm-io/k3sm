@@ -57,7 +57,7 @@ Per the internal §By-design summary — summarized, not restated:
 
 - No Linux containers / cgroups / CNI / netns / device-plugins / hugepages (`not-applicable`).
 - No per-pod uid isolation — same-node pods share one `_k3sm` trust domain; untrusted tenancy is
-  destined for `vm`, which does not run yet.
+  destined for `vm`, which runs today (`linux/arm64`, single-node, validated on real hardware).
 - Absolute-path volume mounts resolve for **native workloads** (a `DYLD_INSERT` path-rebase shim; no
   chroot), **not** SIP platform binaries — a `/bin/sh` script can't read a mounted file at its
   absolute path (macOS strips `DYLD_INSERT_LIBRARIES` from platform binaries).

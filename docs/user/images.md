@@ -8,7 +8,7 @@ is refused at pull rather than started and left to die at `exec`.
 If you are here to find out what you can run and how to get there, start with
 [What runs](what-runs.md); this page is the reference behind it — the two workload conventions,
 `k3sm build` and what it does with a Dockerfile, `k3sm image load` / `import` / `push`, and every
-deliberate difference from the Docker tool of the same name.
+deliberate difference from the `docker` verb of the same name.
 
 ## Running a Native Workload Today
 

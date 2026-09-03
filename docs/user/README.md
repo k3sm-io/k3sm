@@ -16,7 +16,7 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 5. [Supported workloads](what-runs.md) — the OCI images k3sm runs, what it refuses, and the path from a
    Dockerfile to a running Pod.
 6. [Images](images.md) — the reference: both workload conventions, `k3sm build`, `image
-   load`/`import`/`push`, and every deliberate difference from the Docker tool of the same name.
+   load`/`import`/`push`, and every deliberate difference from the `docker` verb of the same name.
 7. [Node-local registry](registry.md) — the loopback OCI registry: push a locally built image and
    pull it back through the ordinary Kubernetes image path.
 8. [Storage](storage.md) — local-path PVs, node affinity, what is and isn't supported.

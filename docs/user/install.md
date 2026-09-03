@@ -19,8 +19,8 @@ That step:
 - writes an **admin kubeconfig** to the invoking user's home directory.
 
 After install, `k3sm kubectl …` and Pod lifecycle run as you / `_k3sm` with **no `sudo`**. The full
-trust model — why this is the Docker Desktop / lima / colima pattern applied to k3sm, and the one
-residual limitation (no per-pod uid isolation) — is documented in
+trust model — why this is the same privileged-helper pattern Docker Desktop, Lima, and Colima use,
+applied to k3sm, and the one residual limitation (no per-pod uid isolation) — is documented in
 [the privilege model](../privilege-model.md).
 
 ## What Gets Installed Where

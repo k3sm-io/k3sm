@@ -49,8 +49,18 @@ two-Mac gates are burned down in M7. What works:
   [docs/user/limitations.md](docs/user/limitations.md)): boot and restart, `kubectl logs`/`exec` with
   exit-code propagation, PersistentVolumeClaims that survive a hard hypervisor kill, in-guest cluster
   DNS, per-container CPU and memory, and a Service routing to a `vm` pod through its ClusterIP.
-  Targeted at v0.1.0, `linux/arm64` only — an `amd64` image is refused at pull
-  rather than started and left to crash. See Next.
+  Shipped at v0.1.0 (tagged 2026-09-01), `linux/arm64` only — an `amd64` image is refused at pull
+  rather than started and left to crash, on either the native or the `vm` path. See Next.
+- **A built-in image build engine.** `k3sm builder up|down|delete` manages a guest-root buildkitd
+  engine inside a `vm`-RuntimeClass micro-VM with a PVC-backed cache; `k3sm build` auto-routes any
+  Dockerfile with `RUN` (or another engine-only verb) through it while a COPY-only Dockerfile keeps
+  the native fast path, and `k3sm builder buildx` exposes the bundled, pinned buildx directly —
+  install only k3sm, build and run containers with no Docker Desktop. Validated live end to end,
+  2026-09-02/03: a RUN build → OCI export → `k3sm image push` → a Pod running the result.
+  `linux/arm64` only — `linux/amd64` under guest Rosetta is not wired (see Future, below). The
+  buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
+  k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
+  the remaining packaging work.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
 - **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
@@ -69,37 +79,32 @@ two-Mac gates are burned down in M7. What works:
   `hack/acceptance/m8.sh` gate: 22/22 checks green, including a real Hugging Face weight
   download under a default-deny Seatbelt profile and a GC-clean deletion)*
 
-## Next — v0.1.0 (the public release)
-
-The first public release. One track is launch-blocking:
+## v0.1.0 — the public release (shipped 2026-09-01)
 
 - **Ship it.** Install arrives in three generations, in shipping order: *(1)*
   `curl -fsSL https://k3sm.io/install.sh | sh` — a checksum-verified release tarball handed to
-  `sudo k3sm install` (works from the first tagged release; a curl download carries no quarantine
-  xattr); *(2)* `brew install k3sm-io/tap/k3sm`; *(3)* a signed, notarized `.pkg`. Underneath:
-  goreleaser, GitHub Actions CI across all repos, [user docs](docs/user/) (which ship today —
-  they are not gated on the release), and the website.
-- **Bring your images (targeted).** `k3sm image load` / `k3sm image import` ingest docker-save
-  tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and a
-  first `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
-  (`RUN` arrives with the vm-backed builder, below). *(targeted at v0.1.0; included in the release
-  announcement only if merged and green by the pre-flight)*
+  `sudo k3sm install` (a curl download carries no quarantine xattr); *(2)*
+  `brew install k3sm-io/tap/k3sm`; *(3)* a signed, notarized `.pkg`. Underneath: goreleaser,
+  [user docs](docs/user/), and the website.
+- **Bring your images.** `k3sm image load` / `k3sm image import` ingest docker-save
+  tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and
+  `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
+  (`RUN` arrives with the vm-backed builder — see Shipped, above).
 - **Run your Linux images (validated on hardware).** Standard **linux/arm64 images**
   run as `vm`-RuntimeClass pods — one lightweight micro-VM per pod — with `kubectl exec/logs/top`,
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers, unmodified images with a three-line manifest
   adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
-  *(the live lab run against the released artifact is green — see Shipped, above; targeted for
-  the v0.1.0 announcement; published performance figures and the remaining ceilings are the
-  v0.2 milestone below)*
-- **linux/amd64 images are NOT in v0.1.0.** Running them needs Rosetta-for-Linux translation
-  inside the guest, and it is deliberately cut from the first release so the arm64 path can be
+  *(the live lab run against the released artifact is green — see Shipped, above;
+  published performance figures and the remaining ceilings are the v0.2 milestone below)*
+- **linux/amd64 images are not supported on any path yet.** Running them needs Rosetta-for-Linux
+  translation inside the guest, deliberately cut from the first release so the arm64 path could be
   validated on hardware on its own. There is no emulation fallback — no qemu exists for a Darwin
-  host — so until translation lands, an amd64-only image is refused at pull with a
-  no-matching-platform error rather than started and left to crash, and a node that cannot
-  translate does not advertise that it can. *(scheduled for a v0.1.x follow-up)*
+  host — so an amd64-only image is refused at pull with a no-matching-platform error rather than
+  started and left to crash, and a node that cannot translate does not advertise that it can.
+  *(scheduled for a v0.1.x follow-up)*
 
-Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
+v0.1.1 followed on 2026-09-02 — see [CHANGELOG.md](CHANGELOG.md) for what it adds.
 
 ## Future — post-v0.1.0
 
@@ -108,14 +113,13 @@ Launch (the public flip, the `v0.1.0` tag, the announcement) is its own runbook.
   cost, the Rosetta non-TSO ratio, virtiofs I/O vs native APFS), and the remaining ceilings
   either closed or documented (per-pod network segmentation between micro-VMs, host-path
   sharing). Plus darwin/amd64 pod payloads under host Rosetta on the native path.
-- **A built-in image build engine** — `k3sm build` grows full Dockerfile support (`RUN` included)
-  by managing a BuildKit builder inside a `vm`-RuntimeClass micro-VM (linux/arm64 natively,
-  linux/amd64 via Rosetta) behind a bundled buildx front-end — install only k3sm, build and run
-  containers with no Docker Desktop. Lands **shortly after v0.1** (the builder needs the vm path
-  live, plus the guest kernel artifacts that ship with it, then its own lab validation; Developer-ID
-  signing is deliberately not on that path — the virtualization entitlement rides a plain ad-hoc
-  signature). Kubelet-faithful registry semantics on the native path (imagePullPolicy,
-  pull-failure backoff, multi-arch selection, offline warm-cache starts) land alongside.
+- **`linux/amd64` in the build engine, via guest Rosetta** — the managed buildkitd builder (see
+  Shipped, above) builds `linux/arm64` only today; targeting `linux/amd64` needs the same
+  in-guest Rosetta translation the `vm` RuntimeClass itself doesn't have yet (see Limitations).
+- **Kubelet-faithful registry semantics on the native path** — the pull-failure backoff taxonomy
+  (`ErrImagePull`/`ImagePullBackOff` alternation, `ErrImageNeverPull`), Rosetta-consuming
+  multi-arch selection, and a warm-cache offline start under `imagePullPolicy: IfNotPresent` /
+  `Never` are still open.
 - **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA** — Dynamic Resource Allocation for GPUs, once extended resources have shipped.
