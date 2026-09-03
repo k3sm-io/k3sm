@@ -108,13 +108,25 @@ else
 	ladder no "b103.0b runtimed pkg/sandbox + pkg/runtime build CGO_ENABLED=0 (pure-Go stub parity)"
 fi
 
-# ---- b103.0c — no vz in the product binary ----------------------------------
+# ---- b103.0c — no vz in the DAEMON binary -----------------------------------
 # The Rosetta GUEST probe must stay a pure capability inference: it may NOT pull
-# Code-Hex/vz (the Virtualization.framework binding) into runtimed's dependency
-# closure, or every runtimed build would inherit the entitlement/link surface of a VM
-# host. This canary has no other home in the tree today.
+# Code-Hex/vz (the Virtualization.framework binding) into the closure of the runtimed
+# DAEMON, or the daemon — which parses tenant images and serves the provider's gRPC
+# socket — would inherit the entitlement/link surface of a VM host.
 #
-# It FAILS CLOSED in three independent ways, because an absence assertion over a
+# RE-SCOPED 2026-09-03. This rung originally enumerated `./...`, which was an exact
+# proxy for "the daemon" only while runtimed shipped no VM host at all. It no longer
+# is: the vm path landed cmd/k3sm-vmhost + pkg/vmhost, and github.com/Code-Hex/vz is
+# now a deliberate, pinned dependency reachable from exactly those two packages —
+# which is the WHOLE POINT of the entitlement split (k3sm-vmhost is the one binary
+# carrying com.apple.security.virtualization). A `./...` closure therefore says
+# nothing about the daemon and reads red for the intended design. The contract that
+# survived that change is the one this rung's own header always named — the DAEMON
+# binary — so it is what is asserted now. This is a re-scope, not a relaxation: the
+# separation runtimed's own TestVZIsNotReachableFromTheDaemon enforces per-package is
+# asserted here over the LINKED binary, which is the question the linker actually asks.
+#
+# It FAILS CLOSED in four independent ways, because an absence assertion over a
 # command's output is the classic gate that reports green when it measured NOTHING
 # (the same reason the mapper reads UNSPECIFIED as not-capable rather than trusting a
 # zero value):
@@ -123,25 +135,36 @@ fi
 #      stderr is deliberately left attached to this script's stderr so the operator
 #      sees the loader error, and is NOT folded into the grep input (an error text
 #      mentioning the module path must not become a false POSITIVE either).
-#   2. a POSITIVE CONTROL: the closure must contain k3sm.io/runtimed/pkg/sandbox (the
-#      package the probes live in), so an empty or truncated listing can never read as
-#      "vz-clean".
-#   3. the arch/cgo pins the rest of the gate uses are applied here too: the
+#   2. a POSITIVE CONTROL: the daemon closure must contain k3sm.io/runtimed/pkg/sandbox
+#      (the package the probes live in), so an empty or truncated listing can never
+#      read as "vz-clean".
+#   3. a NEGATIVE CONTROL: the SAME pattern run over cmd/k3sm-vmhost's closure must
+#      MATCH. Without it a typo'd or stale module pattern would report the daemon
+#      vz-clean forever — the assertion would be unfalsifiable rather than true.
+#   4. the arch/cgo pins the rest of the gate uses are applied here too: the
 #      dependency closure is BUILD-TAG dependent, so the closure that matters is the
 #      one the darwin/arm64 cgo PRODUCT build resolves.
+#
+# The pattern matches the MODULE prefix, not an exact package: a future
+# github.com/Code-Hex/vz/v4 or a subpackage must redden this too.
+VZ_PATTERN='github.com/Code-Hex/vz'
 VZ_LIST_RC=0
-VZ_LIST="$( (cd "$RUNTIMED_ROOT" && "${GOFLAGS_ENV[@]}" go list -deps ./...) )" || VZ_LIST_RC=$?
-if [ "$VZ_LIST_RC" -ne 0 ]; then
-	ladder no "b103.0c runtimed dependency closure enumerable — go list -deps exited $VZ_LIST_RC (see the error above); the vz canary MEASURED NOTHING, so it fails closed"
+VZ_LIST="$( (cd "$RUNTIMED_ROOT" && "${GOFLAGS_ENV[@]}" go list -deps ./cmd/k3sm-runtimed) )" || VZ_LIST_RC=$?
+VZ_HOST_RC=0
+VZ_HOST_LIST="$( (cd "$RUNTIMED_ROOT" && "${GOFLAGS_ENV[@]}" go list -deps ./cmd/k3sm-vmhost) )" || VZ_HOST_RC=$?
+if [ "$VZ_LIST_RC" -ne 0 ] || [ "$VZ_HOST_RC" -ne 0 ]; then
+	ladder no "b103.0c runtimed daemon/vmhost dependency closures enumerable — go list -deps exited $VZ_LIST_RC/$VZ_HOST_RC (see the error above); the vz canary MEASURED NOTHING, so it fails closed"
 elif ! printf '%s\n' "$VZ_LIST" | grep -qx 'k3sm.io/runtimed/pkg/sandbox'; then
-	ladder no "b103.0c vz canary positive control — the closure must list k3sm.io/runtimed/pkg/sandbox (the probe's own package); an empty/garbage listing must not read as vz-clean"
+	ladder no "b103.0c vz canary positive control — the daemon closure must list k3sm.io/runtimed/pkg/sandbox (the probe's own package); an empty/garbage listing must not read as vz-clean"
+elif ! printf '%s\n' "$VZ_HOST_LIST" | grep -q "$VZ_PATTERN"; then
+	ladder no "b103.0c vz canary negative control — cmd/k3sm-vmhost's closure must MATCH '$VZ_PATTERN' (it is the binary that links Virtualization); a pattern that matches nothing anywhere cannot prove the daemon clean"
 else
-	VZ_DEPS="$(printf '%s\n' "$VZ_LIST" | grep -c 'Code-Hex/vz' || true)"
+	VZ_DEPS="$(printf '%s\n' "$VZ_LIST" | grep -c "$VZ_PATTERN" || true)"
 	VZ_PKGS="$(printf '%s\n' "$VZ_LIST" | grep -c . || true)"
 	if [ "$VZ_DEPS" -eq 0 ]; then
-		ladder ok "b103.0c runtimed dependency closure contains no Code-Hex/vz package (0 found across $VZ_PKGS enumerated packages, positive control present)"
+		ladder ok "b103.0c runtimed DAEMON closure (cmd/k3sm-runtimed) contains no $VZ_PATTERN package (0 found across $VZ_PKGS enumerated packages; positive + negative controls armed)"
 	else
-		ladder no "b103.0c runtimed dependency closure contains no Code-Hex/vz package (found $VZ_DEPS)"
+		ladder no "b103.0c runtimed DAEMON closure (cmd/k3sm-runtimed) contains no $VZ_PATTERN package (found $VZ_DEPS) — the entitlement split is broken: only cmd/k3sm-vmhost may link Virtualization"
 	fi
 fi
 
