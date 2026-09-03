@@ -97,13 +97,28 @@ ladder "$a" "b222.2  apiServerArgs renders --bind-address from apiServerHost (ON
 # ---- b222.3 — every consumer is threaded --------------------------------------
 # The full consumer set: the healthz probe, both RESTConfigToken implementations,
 # and the three kubeconfig writes (admin + scheduler + controller-manager).
+#
+# WHAT IS PINNED, AND WHAT DELIBERATELY IS NOT (re-scoped 2026-09-03): B222's
+# subject is the HOST — that every consumer takes it from the ONE derivation
+# (apiServerURL/apiServerHost over the config) instead of re-deriving loopback.
+# The TOKEN argument travelling beside it is not B222's subject and never was, so
+# it is matched loosely. Two rungs here pinned the token expression literally and
+# went stale when it changed for unrelated reasons: `s.token` became
+# `s.currentToken()` (a mutex-guarded read added with the concurrency fix), and
+# the writeKubeconfig call site hoisted the same value into a local so the token
+# FILE and the kubeconfig are written from one snapshot. Neither touched a host
+# derivation — the behavioural rungs b222.4-b222.9 stayed green throughout — so
+# this rung was reporting on token plumbing it does not own. The host halves
+# (`apiServerURL(s.cfg)`, `apiServerURL(e.cfg)`, `writeKubeconfig(s.cfg,`,
+# `writeComponentKubeconfig(s.cfg,`) stay pinned EXACTLY: those are the literals
+# whose loss is the defect B222 exists to prevent.
 c=ok
 grep -qE 'url := apiServerURL\(s\.cfg\) \+ "/healthz"' "$SUPERVISED" || c=no
-grep -qE 'return apiServerURL\(s\.cfg\), s\.token' "$SUPERVISED" || c=no
+grep -qE 'return apiServerURL\(s\.cfg\), ' "$SUPERVISED" || c=no
 grep -qE 'return apiServerURL\(e\.cfg\), e\.cfg\.Token' "$EMBEDDED" || c=no
 grep -qE '^func writeKubeconfig\(cfg Config, token string\) error \{' "$SETUP" || c=no
 grep -qE '^func writeComponentKubeconfig\(cfg Config, path, cn string,' "$SETUP" || c=no
-grep -qE 'writeKubeconfig\(s\.cfg, s\.token\)' "$SUPERVISED" || c=no
+grep -qE 'writeKubeconfig\(s\.cfg, ' "$SUPERVISED" || c=no
 [ "$(grep -cE 'writeComponentKubeconfig\(s\.cfg, ' "$SUPERVISED")" -eq 2 ] || c=no
 ladder "$c" "b222.3  Ready, both RESTConfigToken, and all three kubeconfig writes consume the derived host"
 
