@@ -97,7 +97,7 @@ k3sm builder up --mirror --pull-secret <name>   # a private mirror
 The pinned reference is a digest, so the pulled image is byte-identical whichever
 source serves it.
 
-## Honest limitations
+## Limitations
 
 - **RUN needs the engine.** Only COPY-only Dockerfiles build with no cluster.
   Anything with `RUN` needs `k3sm builder up` first.

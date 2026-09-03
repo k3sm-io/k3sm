@@ -192,14 +192,14 @@ Two properties are worth internalizing before you build selectors on these:
 
 ### Rosetta Labels, Advertised Only
 
-The `k3sm.io/rosetta` and `k3sm.io/rosetta-linux` labels are a
-**truthful claim about the host** — the probe really did find Rosetta — and they really do make the node
+The `k3sm.io/rosetta` and `k3sm.io/rosetta-linux` labels report what the probe found on the
+host — the probe really did find Rosetta — and they do make the node
 **selectable**. But **k3sm does not consume them when it pulls your image yet**: the pull still asks only
 for the node's native architecture (`darwin/arm64`), so an **amd64-only image is refused at pull time**
 with a no-matching-platform error and the Pod lands in `ImagePullBackOff`. A multi-arch image that
 includes `darwin/arm64` is unaffected — it runs natively, as it always did.
 
-That refusal is deliberate, not an oversight. Two things must land first:
+That refusal is deliberate. Two things must land first:
 
 - **`k3sm.io/rosetta` (host, darwin/amd64)** — spawning a *translated* Mach-O inside the Seatbelt
   sandbox is not wired. Selecting amd64 payloads before that lands would also weaken a
