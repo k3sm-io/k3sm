@@ -21,7 +21,8 @@ current directory without running anything as root.
 
 Two alternatives:
 
-- **Homebrew**, once the tap ships: `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
+- **Homebrew** — planned; the `k3sm-io/tap` is not published yet. When it ships:
+  `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
 - **From source**, if you would rather build it yourself: clone the four `k3sm.io` repositories side
   by side, build with `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm`, then run `sudo ./k3sm install`.
   The full steps are in the

@@ -20,7 +20,7 @@ k3sm ships as a single binary. Its subcommands:
 | `token` | Mint cluster join tokens |
 | `certificate` | Re-issue the control-plane leaf certificates over the existing CA |
 | `snapshot` | Back up and restore the kine SQLite datastore |
-| `build` | Package a native darwin/arm64 image from a COPY-only Dockerfile |
+| `build` | Build a Dockerfile into an image — natively for copy-only recipes, on the cluster's build engine for `RUN` |
 | `image` | Load, import, push, prune, list and inspect this node's images |
 | `kubectl` | Run the bundled kubectl against this cluster, with `KUBECONFIG` preset |
 | `kubeconfig` | Print the admin kubeconfig, or write/merge it into `~/.kube/config` |

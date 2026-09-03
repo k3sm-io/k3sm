@@ -84,10 +84,11 @@ kubectl run myapp --image=myapp:v1
 kubectl logs myapp
 ```
 
-`k3sm build` accepts a COPY-only Dockerfile subset — it packages files, it does not execute them, so
-`RUN` is refused. `FROM` takes `scratch` or a registry reference; a named base is fetched for
-`darwin/arm64` and refused if it declares any other platform. The full subset, and every deliberate
-difference from `docker build`, is in [Images](images.md).
+`k3sm build` takes any Dockerfile. One that only copies files in is packaged on the spot, with no
+cluster involved; one with `RUN` builds on the cluster's build engine, which starts on first use —
+see [Building images](builder.md). `FROM` takes `scratch` or a registry reference; a named base is
+fetched for `darwin/arm64` and refused if it declares any other platform. Every deliberate
+difference from `docker build` is in [Images](images.md).
 
 Step 2c needs the node's own registry running — it is off unless you pass `--registry-port` (or use
 `k3sm dev`, which turns it on for you). It is worth the extra step when you want the *real* pull
@@ -106,7 +107,7 @@ Almost all of it:
 | `imagePullPolicy` | Yes — `Always`, `IfNotPresent`, `Never`, with upstream meanings. |
 | Multi-arch images | The manifest list is read and a `darwin/arm64` entry selected — but almost no published image has one, so in practice a multi-arch image is refused like any other. See below. |
 | `docker save` / `docker buildx -o type=oci` | Yes — `k3sm image load` and `k3sm image import` ingest both. |
-| `RUN` in a Dockerfile | **No.** It needs a Linux builder, which needs the `vm` path. |
+| `RUN` in a Dockerfile | Yes — `k3sm build` builds it on the cluster's build engine, a Linux builder that starts on first use. See [Building images](builder.md). |
 | `FROM <linux image>` | **No.** Refused: the base must be `darwin/arm64`. |
 
 One footgun worth stating twice, because it is the one people hit: the apiserver defaults a

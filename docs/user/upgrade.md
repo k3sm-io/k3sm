@@ -14,17 +14,13 @@ An unpinned re-run installs the **latest** release. Pin `K3SM_INSTALL_VERSION=vX
 re-install the version you are already on (repair without upgrading), and pin an older version
 to downgrade — that pin-and-re-run is the script channel's rollback path.
 
-Homebrew installs:
+The re-run replaces the binary and restarts the k3sm LaunchDaemons (the `io.k3sm.netd` root
+helper and the `_k3sm` server/agent jobs) onto the new version, through the `sudo k3sm install`
+it performs. The new binary **replaces** the old one — there is no side-by-side window and no
+flag to switch back — so the node is momentarily unavailable while the daemons restart.
 
-```sh
-brew upgrade k3sm
-```
-
-Either way the upgrade replaces the binary and restarts the k3sm LaunchDaemons (the
-`io.k3sm.netd` root helper and the `_k3sm` server/agent jobs) onto the new version — Homebrew
-via `launchctl kickstart`, the script via the `sudo k3sm install` re-run. This is a **hard
-cut** with a brief daemon restart — the node is momentarily unavailable while the daemons
-restart.
+> **Homebrew is planned; the `k3sm-io/tap` is not published yet.** When it ships, `brew upgrade
+> k3sm` will do the same job, restarting the daemons via `launchctl kickstart`.
 
 ## Multi-Node — Roll Node-by-Node
 
@@ -42,9 +38,9 @@ control-plane Mac last unless a release note says otherwise. See [Multi-node](mu
   [Backup & restore](backup-restore.md). k3sm also takes an automatic pre-migration backup when a
   release changes the datastore engine (below), but that copy lives on the same disk as the cluster it
   protects, so it is not a substitute for yours.
-- **Know your rollback path.** Homebrew retains the prior bottle, so rollback does not require a
-  rebuild round-trip; on the script channel, prior releases stay downloadable — rollback is
-  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run.
+- **Know your rollback path.** On the script channel, prior releases stay downloadable — rollback
+  is `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run. The planned Homebrew channel will retain the
+  prior bottle, so rollback there will not need a rebuild round-trip.
 - **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
   [Versions](versions.md).
 
@@ -104,9 +100,10 @@ can cause — silently in place.
 
 ## Rollback
 
-Rollback is **revert to the previous binary** (`brew` pin/switch to the prior bottle, or on the
-script channel `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run) plus the daemon restart that
-comes with it, not a runtime flag flip.
+Rollback is **revert to the previous binary** — on the script channel,
+`K3SM_INSTALL_VERSION=<prior-tag>` and a re-run — plus the daemon restart that comes with it, not
+a runtime flag flip. On the planned Homebrew channel it will be a `brew` pin or a switch to the
+prior bottle.
 
 If the release you are leaving changed the **datastore engine**, reverting the binary is only half of
 it — the database has already been migrated in place. Restore the `db/state.db.pre-<kine-version>.bak`

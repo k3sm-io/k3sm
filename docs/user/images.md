@@ -7,7 +7,7 @@ is refused at pull rather than started and left to die at `exec`.
 
 If you are here to find out what you can run and how to get there, start with
 [What runs](what-runs.md); this page is the reference behind it — the two workload conventions,
-`k3sm build` and its accepted Dockerfile subset, `k3sm image load` / `import` / `push`, and every
+`k3sm build` and what it does with a Dockerfile, `k3sm image load` / `import` / `push`, and every
 deliberate difference from the Docker tool of the same name.
 
 ## Running a Native Workload Today
@@ -54,8 +54,10 @@ see [What runs](what-runs.md). `linux/arm64` payloads are the province of the
 
 ## Building an Image: `k3sm build`
 
-`k3sm build` packages a native darwin/arm64 payload into an OCI image from a COPY-only Dockerfile.
-It executes nothing — it copies files and writes metadata.
+`k3sm build` builds a Dockerfile into an OCI image carrying a native darwin/arm64 payload. One that
+only copies files in is packaged on the spot — it executes nothing, it copies files and writes
+metadata. One with `RUN` builds on the cluster's build engine, which starts on first use; see
+[Building images](builder.md).
 
 ```sh
 k3sm build --tag myapp:v1 --output myapp.tar .
@@ -71,29 +73,31 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/myapp"]
 ```
 
-**Accepted subset:** `FROM` (`scratch` or a registry reference), `COPY`, `ADD`, `ENV`, `ENTRYPOINT`, `CMD`, `WORKDIR`, `LABEL`,
-`EXPOSE`. Everything else is refused with an error naming what was rejected — the parser never
-guesses and never silently drops an instruction, because a dropped instruction produces an image
-that looks built but is not what the recipe described.
+**Packaged natively:** `FROM` (`scratch` or a registry reference), `COPY`, `ADD`, `ENV`,
+`ENTRYPOINT`, `CMD`, `WORKDIR`, `LABEL`, `EXPOSE`. A Dockerfile of only these needs no cluster and
+builds in about a second. `RUN` goes to the build engine instead. Anything else is refused with an
+error naming what was rejected — the parser never guesses and never silently drops an instruction,
+because a dropped instruction produces an image that looks built but is not what the recipe
+described.
 
-> **A built image runs once it is in the store.** `k3sm build` writes a portable artifact to a
-> path you name and nothing else — it does not touch the node's image store — so an
-> `image: myapp:v1` Pod spec resolves only after you load that artifact (below). The artifact is
-> equally usable with registries and other tools.
+> **A built image is in this node's store when the build finishes.** `k3sm build` records it under
+> the tag you gave, so an `image: myapp:v1` Pod spec resolves with no further step. `--output` also
+> writes a portable artifact to a path you name — that is what you want for moving the image to
+> another node or a registry, and it is equally usable with other tools.
 
 ### Deliberate Differences From `docker build`
 
-Each of these is a refusal or a documented gap, never a silent divergence:
+Each of these is a documented difference, never a silent divergence:
 
 | | k3sm build |
 |---|---|
-| `RUN` | **Rejected.** This builder packages files; it does not execute them. The RUN-capable path is the vm-backed builder below. |
+| `RUN` | **Supported, on the cluster.** The native packager copies files; it does not execute them, so a `RUN`-containing Dockerfile builds on the in-cluster engine, which `k3sm build` starts on first use. The image lands in the store under its tag either way — see [Building images](builder.md). |
 | `FROM <ref>` | **Supported**, with two caveats. The base is fetched for `darwin/arm64` using the same credential chain as `k3sm image push`, and is **refused if it declares any other platform** — a `darwin/arm64` image built on a `linux/amd64` base is a self-consistent lie whose payload cannot execute. And a **tag**-pinned base is not reproducible: the tag can move, so the build says so and prints the base it used. Pin a digest if you want the guarantee. In practice bases are ones your own organisation published — see [What runs](what-runs.md) on why there is no public supply of `darwin` images. |
 | `ADD` | An exact alias of `COPY`. It does **not** fetch remote URLs and does **not** auto-extract archives; both are refused rather than silently downgraded. |
 | `.dockerignore` | **Not implemented.** `COPY .` therefore includes `.git`, `.env` and anything else in the directory — scope your `COPY` lines, or build from a clean tree. |
 | `--platform` | Accepts only `darwin/arm64`. The builder copies host files verbatim and does not cross-compile, so any other value would declare a platform the bytes do not satisfy. |
 | Variables (`$VAR`), `ARG` | **Rejected.** No expansion is performed, and a literal `$` in a path would be an invisible divergence. |
-| Build output | Written to a path you name (`--output`). There is no default sink and no push; nothing is written to k3sm's shared image store. |
+| Build output | Recorded in this node's image store under the tag you gave. `--output` additionally writes a portable artifact — a docker-save tar, or an OCI layout with `--format oci` — to a path you name. There is no push. |
 | Timestamps | Fixed, not wall-clock — rebuilding the same context yields the same image digest. |
 | File modes | Normalized to `0755` (if any execute bit is set) or `0644`. A `0600` source becomes world-readable in the image, and setuid/setgid/sticky bits are dropped. Preserving source modes would break reproducibility, since git records only the execute bit. |
 | Ownership & xattrs | Every entry is `uid 0 / gid 0` with no user or group name, and no extended attributes — the builder's account identity and macOS xattrs (including `com.apple.quarantine`) never reach the image. |
@@ -230,18 +234,13 @@ never takes one on the command line, where it would land in shell history and pr
 That closes the loop — **build → push → pull → run** — with the node pulling exactly as it would
 from any registry: digests verified, `imagePullSecrets` honoured, multi-arch manifest lists read.
 
-## Still on the Roadmap
-
-- **A full build engine** — `k3sm build` with `RUN` support, via a managed BuildKit builder inside
-  a `vm`-RuntimeClass micro-VM, so building and running containers needs only k3sm installed. It
-  waits on the `vm` path's own release and lab validation — see [Limitations](limitations.md).
-
-Registry pull is **not** on this list: it ships. An `image: ghcr.io/org/app:tag` Pod is pulled,
+Registry pull needs nothing special either. An `image: ghcr.io/org/app:tag` Pod is pulled,
 digest-verified and run with kubelet-faithful semantics — pull policy, pull-failure backoff and
 multi-arch selection included. What the image must contain is a `darwin/arm64` payload.
 
 ## Next
 
+- [Building images](builder.md) — building a Dockerfile that runs commands, on the cluster.
 - [What runs](what-runs.md) — what k3sm can run, and the whole path from Dockerfile to Pod.
 - [Quickstart](quickstart.md) — run your first native Pod.
 - [Limitations](limitations.md) — the adaptation requirement.
