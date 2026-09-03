@@ -25,9 +25,9 @@ residual limitation (no per-pod uid isolation) — is documented in
 
 ## What Gets Installed Where
 
-- The `k3sm` binary, whichever channel delivered it (with Homebrew, the previous version is
-  retained so rollback does not require a rebuild; with the script, pin `K3SM_INSTALL_VERSION`
-  to reinstall a prior release — the assets stay on GitHub Releases).
+- The `k3sm` binary, whichever channel delivered it (with the script, pin `K3SM_INSTALL_VERSION`
+  to reinstall a prior release — the assets stay on GitHub Releases; the planned Homebrew channel
+  will retain the previous version, so rollback there will not need a rebuild).
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
 
@@ -51,18 +51,18 @@ k3sm's distribution ships in three explicit generations, in shipping order:
    directory without ever running `sudo`, so you can inspect first. Re-running the one-liner
    upgrades in place (both daemons restart briefly — see [Upgrade](upgrade.md)).
 
-2. **Homebrew (gen 2):** `brew install k3sm-io/tap/k3sm`, then `sudo k3sm install` — supported
-   once the tap ships.
+2. **Homebrew (gen 2) — planned; the `k3sm-io/tap` is not published yet.** When it ships:
+   `brew install k3sm-io/tap/k3sm`, then `sudo k3sm install`.
 
 3. **Notarized `.pkg` (gen 3):** a signed, stapled installer package for offline and managed
    installs.
 
 > **Status:** pre-release builds are published; the script resolves the newest one, and a pin
-> via `K3SM_INSTALL_VERSION` always wins. The Homebrew tap and the `.pkg` arrive with the
-> first stable release.
+> via `K3SM_INSTALL_VERSION` always wins. The `k3sm-io/tap` is not published yet — the Homebrew
+> channel and the `.pkg` arrive with the first stable release.
 
-**Switching channels:** every channel manages the same `/Library/k3sm`. After switching (script
-→ brew or back), run `sudo k3sm install` so the daemons run the newly delivered binary — or
+**Switching channels:** every channel manages the same `/Library/k3sm`. Once more than one has
+shipped, run `sudo k3sm install` after a switch so the daemons run the newly delivered binary — or
 `sudo k3sm uninstall` first for a clean cutover.
 
 ## Verifying
