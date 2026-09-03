@@ -81,7 +81,7 @@ func TestBuildSinkMatrix(t *testing.T) {
 				output:     out,
 				format:     tc.format,
 				contextDir: ctxDir,
-			}, &log, engineBuild, store.record)
+			}, &log, engineBuild, store.record, noPush)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -119,7 +119,7 @@ func TestBuildSinkMatrix(t *testing.T) {
 			tag:        "example.com/app:v1",
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuild, store.record)
+		}, io.Discard, engineBuild, store.record, noPush)
 		if err == nil {
 			t.Fatal("expected the store failure to fail the build")
 		}
@@ -139,7 +139,7 @@ func TestBuildSinkMatrix(t *testing.T) {
 			output:     filepath.Join(t.TempDir(), "no-such-dir", "img.tar"),
 			format:     "docker",
 			contextDir: ctxDir,
-		}, io.Discard, engineBuild, store.record)
+		}, io.Discard, engineBuild, store.record, noPush)
 		if err == nil {
 			t.Fatal("expected an error for an unwritable --output")
 		}
