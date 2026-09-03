@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -193,6 +194,51 @@ func (darwinSystem) CopyToRootOwned(src, dst string) error {
 	}
 	if err := unix.Access(dst, unix.X_OK); err != nil {
 		return fmt.Errorf("installed binary %s is not executable (launchd would invalidate the daemons): %w", dst, err)
+	}
+	return nil
+}
+
+// VerifyVirtualizationEntitlement reads the code-signing entitlements off the
+// Mach-O at path and requires VirtualizationEntitlement to be among them. See the
+// System interface for the three-valued contract; this implementation is where the
+// "any other error means refuse" arm gets its concrete causes.
+//
+// The oracle is `codesign -d --entitlements -`, the SAME invocation
+// hack/release/stage.sh makes after it signs the helper. That identity is the
+// reason for the choice: the release stager and the installer then judge an
+// artifact by one mechanism instead of two that can disagree, and the property the
+// stager asserts on the way out is the property the installer asserts on the way
+// in.
+//
+// Reading the entitlement blob is not a signature VALIDITY check, and deliberately
+// so. A stricter probe exists — runtimed's cgo SecStaticCodeCheckValidity read
+// behind sandbox.VMBackend.Available — and it is the daemon's job, run at every
+// boot against the INSTALLED helper. Duplicating it here would mean either a
+// second cgo Security.framework shim in this repo or a Go re-implementation of
+// signature validation, to catch a case (a helper mangled after signing) that the
+// daemon already catches. What install adds is the case the daemon cannot report
+// legibly: an entitlement that was never granted in the first place.
+//
+// An unsigned binary needs no separate arm: codesign exits non-zero on it ("code
+// object is not signed at all"), which is already a refusal.
+func (darwinSystem) VerifyVirtualizationEntitlement(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		// Wraps fs.ErrNotExist for a missing file, which the caller reads as
+		// "nothing staged" rather than "unentitled".
+		return err
+	}
+	cmd := exec.Command("codesign", "-d", "--entitlements", "-", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	// Entitlements go to stdout; codesign's "Executable=<path>" banner goes to
+	// stderr. Only stdout is matched, so a path that happens to contain the
+	// entitlement string cannot satisfy the check.
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("codesign -d --entitlements - %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
+	}
+	if !bytes.Contains(out, []byte(VirtualizationEntitlement)) {
+		return fmt.Errorf("signature grants no %s", VirtualizationEntitlement)
 	}
 	return nil
 }
