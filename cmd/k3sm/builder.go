@@ -34,11 +34,20 @@ import (
 const builderUsage = `k3sm builder — manage the in-cluster buildkitd engine that powers RUN-capable builds
 
 Usage: k3sm builder <up|down|delete|status> [flags]
+       k3sm builder buildx <args...>
 
   up      ensure the builder Pod, Service and cache PVC, and wait for a worker
   down    delete the Pod and Service (the cache PVC is KEPT for a warm rebuild)
   delete  tear down the engine AND remove the build cache (full reset)
   status  report the engine state and, when ready, its buildx dial endpoint
+  buildx  run the bundled buildx against the engine (args pass through verbatim)
+
+"k3sm builder buildx" is the whole driver setup: it stages the pinned buildx,
+registers a remote-driver builder at the engine's endpoint, and runs your
+command against it — no "buildx create", no endpoint to copy.
+
+  k3sm builder buildx build -t myapp:dev .
+  k3sm builder buildx bake -f bake.hcl target
 
 The engine is one long-lived vm Pod running the pinned upstream moby/buildkit
 image. buildkitd runs guest-root inside its own micro-VM — the VM is the
@@ -67,11 +76,11 @@ type builderOptions struct {
 	workDir    string
 }
 
-// runBuilder is the `k3sm builder up|down|status` entry point.
+// runBuilder is the `k3sm builder up|down|delete|status|buildx` entry point.
 func runBuilder(args []string) error {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, builderUsage)
-		return fmt.Errorf("k3sm builder needs a subcommand (up|down|delete|status)")
+		return fmt.Errorf("k3sm builder needs a subcommand (up|down|delete|status|buildx)")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -80,9 +89,13 @@ func runBuilder(args []string) error {
 		return nil
 	case "up", "down", "delete", "status":
 		return runBuilderVerb(sub, rest)
+	case "buildx":
+		// Everything after `buildx` belongs to buildx: no flag parsing happens
+		// here, so a buildx flag k3sm has never heard of still reaches it.
+		return runBuilderBuildx(rest)
 	default:
 		fmt.Fprint(os.Stderr, builderUsage)
-		return fmt.Errorf("unknown `k3sm builder` subcommand %q (want up|down|delete|status)", sub)
+		return fmt.Errorf("unknown `k3sm builder` subcommand %q (want up|down|delete|status|buildx)", sub)
 	}
 }
 
@@ -165,7 +178,8 @@ func runBuilderVerb(sub string, args []string) error {
 			return err
 		}
 		fmt.Printf("builder engine ready: %d worker(s), endpoint %s\n", st.Workers, st.Endpoint)
-		fmt.Println("drive it with `k3sm build` on a Dockerfile that uses RUN (COPY-only builds stay native).")
+		fmt.Println("`k3sm build` uses it automatically for a Dockerfile that RUNs commands;")
+		fmt.Println("`k3sm builder buildx <args...>` drives buildx against it directly.")
 		return nil
 	case "down":
 		return mgr.Down(context.Background())

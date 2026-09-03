@@ -8,9 +8,13 @@
 #
 #   CI TIER (always runs, GOARCH=arm64 CGO_ENABLED=1 pinned) — the unit-provable
 #   half: the Pod/Service/PVC render (guest-root, NO securityContext, the vm
-#   RuntimeClass, the cache mount, the ClusterIP Service), the buildx pin
-#   verification, the lifecycle state machine over a fake kube/exec seam, and the
-#   legible-absence contract.
+#   RuntimeClass, the cache mount, the ClusterIP Service), BOTH buildx pins (the
+#   in-pod linux asset and the host darwin asset), the host-side fetch/verify
+#   refusal, the builder-instance create/repair decision, the `k3sm builder
+#   buildx` passthrough, the `k3sm build` engine ROUTING over a faked engine, the
+#   SINK MATRIX (the node's image store is the default terminal state; --output
+#   additionally writes the artifact) over a faked store, the lifecycle state
+#   machine over a fake kube/exec seam, and the legible-absence contract.
 #
 #   LIVE TIER (needs $KUBECONFIG on a vm-capable node) — the engine actually
 #   serving. It is PRINTED AS OWED here, not run: it needs a booted vm guest, a
@@ -141,12 +145,90 @@ else
 	ladder no "builder.5e k3sm builder delete is dispatched to mgr.Delete"
 fi
 
+# ---- builder.6 — the HOST buildx pin and its fetch/verify contract ---------
+# The host asset is a SECOND pin (darwin-arm64, same release tag) because the Mac
+# runs buildx to drive the engine. Its bytes are verified on every call, and a
+# mismatch must install nothing at all.
+run_test "builder.6a" 5 TestHostBuildxPinIsWellFormed ./pkg/builder/
+run_test "builder.6b" 5 TestEnsureVerifiedBinary ./pkg/builder/
+if grep -q 'darwin-arm64' "$K3SM_ROOT/pkg/builder/buildxhost.go"; then
+	ladder ok "builder.6c the host pin names the darwin-arm64 asset"
+else
+	ladder no "builder.6c the host pin names the darwin-arm64 asset"
+fi
+
+# ---- builder.7 — the builder instance and the passthrough ------------------
+# BUILDX_CONFIG must be k3sm-owned and identical at create and build time, or
+# buildx silently falls back to the docker context; the argv after `buildx` is
+# never parsed by k3sm.
+run_test "builder.7a" 6 TestEnsureBuilderInstance ./pkg/builder/
+run_test "builder.7b" 6 TestInstanceEndpoints ./pkg/builder/
+run_test "builder.7c" 3 TestBuildxArgsPassThrough ./pkg/builder/
+run_test "builder.7d" 1 TestBuildxEnvForcesConfigDir ./pkg/builder/
+run_test "builder.7e" 1 TestBuilderAcceptsBuildx ./cmd/k3sm/
+run_test "builder.7f" 1 TestBuilderUsageListsBuildx ./cmd/k3sm/
+run_test "builder.7g" 1 TestBuilderBuildxNeedsACommand ./cmd/k3sm/
+if grep -qE 'case "buildx":' "$K3SM_ROOT/cmd/k3sm/builder.go"; then
+	ladder ok "builder.7h k3sm builder buildx is dispatched from runBuilder"
+else
+	ladder no "builder.7h k3sm builder buildx is dispatched from runBuilder"
+fi
+# The passthrough must not grow a flag parser: one FlagSet in the buildx path
+# would swallow a buildx flag k3sm has never heard of.
+if grep -q 'flag\.' "$K3SM_ROOT/cmd/k3sm/builderbuildx.go"; then
+	ladder no "builder.7i the buildx passthrough parses no flags of its own"
+else
+	ladder ok "builder.7i the buildx passthrough parses no flags of its own"
+fi
+
+# ---- builder.8 — `k3sm build` routes a RUN Dockerfile to the engine --------
+# THE RED→GREEN RUNG. On main a RUN-bearing Dockerfile is REFUSED
+# (oci.ErrRunUnsupported); here it must route to the build engine instead, with
+# the engine faked at its seam so the routing is provable without a cluster. A
+# malformed Dockerfile still fails natively — booting an engine to re-derive a
+# syntax error answers nothing.
+run_test "builder.8a" 16 TestNeedsBuildEngine ./cmd/k3sm/
+run_test "builder.8b" 5 TestBuildRouting ./cmd/k3sm/
+run_test "builder.8c" 4 TestEngineBuildPlatform ./cmd/k3sm/
+run_test "builder.8d" 1 TestEngineBuildArgs ./cmd/k3sm/
+run_test "builder.8e" 2 TestBuildShortFlags ./cmd/k3sm/
+run_test "builder.8f" 4 TestEnsureRunning ./pkg/builder/
+# The routing must be wired into the real entry point, not only the seam.
+if grep -q 'needsBuildEngine(err)' "$K3SM_ROOT/cmd/k3sm/build.go"; then
+	ladder ok "builder.8g k3sm build consults the engine classification"
+else
+	ladder no "builder.8g k3sm build consults the engine classification"
+fi
+
+# ---- builder.9 — the sink matrix (store by default, artifact on request) ---
+# Docker parity: `k3sm build -t app:dev .` is followed by naming app:dev in a
+# Pod, with nothing in between and no difference between the two build paths.
+# The store is faked at its seam, so the CI tier needs no runtimed.
+run_test "builder.9a" 6 TestBuildSinkMatrix ./cmd/k3sm/
+run_test "builder.9b" 4 TestBuildTagRequiredWithoutOutput ./cmd/k3sm/
+# BOTH paths must deliver through the one function, or the two terminal states
+# drift and "which engine built it" becomes visible again.
+b9c=ok
+grep -q 'deliver(ctx, o, ref, img, out, record' "$K3SM_ROOT/cmd/k3sm/build.go" || b9c=no
+grep -q 'deliver(ctx, o, ref, img, out, recordInStore' "$K3SM_ROOT/cmd/k3sm/buildengine.go" || b9c=no
+ladder "$b9c" "builder.9c both build paths deliver through the same store+artifact function"
+# The store leg must use the daemon's own ingest RPC — the CLI never writes the
+# store itself (the daemon is its sole writer).
+if grep -q 'LOAD_IMAGE_FORMAT_DOCKER_SAVE' "$K3SM_ROOT/cmd/k3sm/buildstore.go"; then
+	ladder ok "builder.9d the store recording goes through the daemon's LoadImage ingest"
+else
+	ladder no "builder.9d the store recording goes through the daemon's LoadImage ingest"
+fi
+
 # ---- LIVE TIER (owed — the orchestrator's single-node lab step) ------------
-owed "builder.6  live: \`k3sm builder up\` registers a buildkit worker          (needs a vm-capable node)"
-owed "builder.7  live: a RUN-containing build through Endpoint() produces an OCI layout"
-owed "builder.8  live: \`k3sm image push\` of the layout, then a Pod runs it"
-owed "builder.9  live: \`k3sm builder down\` deletes the Pod but keeps the cache PVC"
-owed "builder.10 live: \`k3sm builder delete\` removes the Pod, Service, cache PVC AND the namespace (full reset)"
+owed "builder.20 live: \`k3sm builder up\` registers a buildkit worker          (needs a vm-capable node)"
+owed "builder.21 live: a RUN-containing build through Endpoint() produces an OCI layout"
+owed "builder.22 live: \`k3sm builder buildx build --output type=oci,dest=out .\` of a RUN Dockerfile succeeds"
+owed "builder.23 live: \`k3sm build -t app:dev .\` on a RUN Dockerfile starts the engine and records app:dev in the store"
+owed "builder.23b live: \`k3sm image ls\` shows that entry and a Pod naming app:dev runs (both build paths)"
+owed "builder.24 live: \`k3sm image push\` of the layout, then a Pod runs it"
+owed "builder.25 live: \`k3sm builder down\` deletes the Pod but keeps the cache PVC"
+owed "builder.26 live: \`k3sm builder delete\` removes the Pod, Service, cache PVC AND the namespace (full reset)"
 
 echo "----------------------------------------"
 echo "builder: $PASS passed, $FAIL failed, $PENDING OWED (live)"

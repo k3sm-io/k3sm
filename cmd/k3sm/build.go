@@ -34,21 +34,35 @@ import (
 	"k3sm.io/k3sm/pkg/oci"
 )
 
-const buildUsage = `k3sm build — package a native darwin/arm64 image from a COPY-only Dockerfile
+const buildUsage = `k3sm build — build an image from a Dockerfile
 
 Usage: k3sm build --tag <ref> --output <path> [flags] <context-dir>
 
-Accepted Dockerfile subset: FROM, COPY, ADD, ENV, ENTRYPOINT, CMD, WORKDIR,
-LABEL, EXPOSE. FROM takes "scratch" or a registry reference; a named base is
-fetched for darwin/arm64 and refused if it declares another platform. RUN is
-rejected — this builder packages files, it does not execute them.
+ONE command, two engines, chosen from the Dockerfile:
 
-The output is a portable image artifact, and it RUNS. Get it onto a node and
-name it in a Pod:
+  COPY-only (FROM, COPY, ADD, ENV, ENTRYPOINT, CMD, WORKDIR, LABEL, EXPOSE)
+  packages NATIVELY — no daemon, no cluster, a darwin/arm64 image. FROM takes
+  "scratch" or a registry reference; a named base is fetched for darwin/arm64
+  and refused if it declares another platform.
 
-  k3sm build --tag myapp:v1 --output myapp.tar .
-  k3sm image load myapp.tar        # this node; or: k3sm image push, then pull
-  kubectl run myapp --image=myapp:v1
+  Anything the native builder cannot express — RUN above all, and multi-stage
+  builds, ARG, USER and the rest of the full Dockerfile — routes to the k3sm
+  build engine (BuildKit in a Linux micro-VM) and produces a linux image. The
+  engine is started on first use; "k3sm builder status" shows it and
+  "k3sm builder down" stops it.
+
+Either way the image is RECORDED IN THIS NODE'S IMAGE STORE under --tag, ready
+for a Pod to name — so what you do next does not depend on which engine built
+it. --output additionally writes a portable artifact you can carry to another
+node ("docker" tarball, or "oci" for a layout directory).
+
+  k3sm build -t myapp:v1 .                       # usable here, right away
+  k3sm build -t myapp:v1 --output myapp.tar .    # and a file to carry
+
+The built image RUNS. Name it in a Pod:
+
+  k3sm build --tag myapp:v1 .
+  kubectl run myapp --image=myapp:v1              # already in this node's store
 
 Pin FROM to a digest (name@sha256:…) if you want a reproducible build: a tag can
 move under you. See docs/user/what-runs.md for the whole path, and
@@ -66,6 +80,11 @@ type buildOptions struct {
 	format     string
 	platform   string
 	contextDir string
+	// platformSet records whether --platform was given. The engine path builds
+	// Linux images, so it must tell "the operator asked for darwin/arm64" (a
+	// native-only target, and an error) from "nobody asked" (the default, which
+	// the engine reads as its own guest platform).
+	platformSet bool
 }
 
 // runBuild is the `k3sm build` entry point.
@@ -88,13 +107,16 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 		fs.PrintDefaults()
 	}
 	fs.StringVar(&o.dockerfile, "file", "", "path to the Dockerfile (default <context>/Dockerfile)")
+	fs.StringVar(&o.dockerfile, "f", "", "short form of --file")
 	fs.StringVar(&o.tag, "tag", "", "image reference to assign, e.g. myapp:v1 (required)")
-	fs.StringVar(&o.output, "output", "", "path to write the image to (required)")
+	fs.StringVar(&o.tag, "t", "", "short form of --tag")
+	fs.StringVar(&o.output, "output", "", "additionally write the image to this path (the store recording always happens)")
 	fs.StringVar(&o.format, "format", "docker", "output format: docker (a `docker load` tarball) or oci (an OCI layout dir)")
 	fs.StringVar(&o.platform, "platform", oci.DefaultPlatform, "target platform (only "+oci.DefaultPlatform+" is supported)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
+	o.platformSet = flagWasSet(fs, "platform")
 
 	// stdlib flag stops at the first non-flag argument, so "k3sm build . --tag x"
 	// would silently leave --tag unparsed and build an untagged image. That
@@ -111,14 +133,10 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	}
 	o.contextDir = rest[0]
 
+	// --tag is required with or without --output: it NAMES the store entry the
+	// build always creates, and an unnamed recording is one nothing can select.
 	if o.tag == "" {
 		return o, errors.New("--tag is required")
-	}
-	// There is no default output: with the shared local store deliberately out of
-	// scope there is no safe implicit sink, and a build that assembles an image
-	// and then discards it while exiting 0 is indistinguishable from success.
-	if o.output == "" {
-		return o, errors.New("--output is required (this builder has no default sink)")
 	}
 	if o.format != "docker" && o.format != "oci" {
 		return o, fmt.Errorf("--format %q: want \"docker\" or \"oci\"", o.format)
@@ -129,9 +147,24 @@ func parseBuildArgs(args []string, errOut io.Writer) (buildOptions, error) {
 	return o, nil
 }
 
-// build parses, assembles and writes. Parsing completes before the output is
-// opened, so a Dockerfile rejected on its last line leaves no artifact behind.
+// engineBuilder builds a Dockerfile the native packager cannot express, through
+// the in-cluster build engine. It is a seam so the ROUTING decision — which
+// Dockerfiles go where — is provable without a cluster, a VM or a network.
+type engineBuilder func(ctx context.Context, o buildOptions, out io.Writer) error
+
+// build parses, assembles and writes, routing to the build engine when the
+// Dockerfile needs one.
 func build(ctx context.Context, o buildOptions, out io.Writer) error {
+	return buildWith(ctx, o, out, engineBuild, recordInStore)
+}
+
+// buildWith is build with the engine seam injected.
+//
+// Parsing completes before the output is opened, so a Dockerfile rejected on its
+// last line leaves no artifact behind — and the routing decision is taken from
+// that same parse, so no Dockerfile is read twice or classified by a second,
+// drifting reader.
+func buildWith(ctx context.Context, o buildOptions, out io.Writer, engine engineBuilder, record storeRecorder) error {
 	ref, err := name.NewTag(o.tag)
 	if err != nil {
 		return fmt.Errorf("--tag %q: %w", o.tag, err)
@@ -144,7 +177,13 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 	defer f.Close()
 	df, err := oci.Parse(f)
 	if err != nil {
-		return err
+		if !needsBuildEngine(err) {
+			return err
+		}
+		// The Dockerfile is valid Docker that this builder cannot express. That
+		// is not a user error, so it is not reported as one: the engine builds
+		// it. `k3sm build` is the one build command either way.
+		return engine(ctx, o, out)
 	}
 
 	bc, err := oci.NewContext(o.contextDir)
@@ -167,19 +206,9 @@ func build(ctx context.Context, o buildOptions, out io.Writer) error {
 		return err
 	}
 
-	var sink oci.Sink = oci.TarballSink{Path: o.output}
-	if o.format == "oci" {
-		sink = oci.LayoutSink{Path: o.output}
-	}
-	if err := sink.Write(ctx, ref, img); err != nil {
+	if err := deliver(ctx, o, ref, img, out, record, "", ""); err != nil {
 		return err
 	}
-
-	digest, err := img.Digest()
-	if err != nil {
-		return fmt.Errorf("compute digest: %w", err)
-	}
-	fmt.Fprintf(out, "built %s\n  digest: %s\n  output: %s (%s)\n", ref, digest, o.output, o.format)
 	if named {
 		// The base is reported because it decides whether this build is
 		// reproducible. A DIGEST-pinned FROM is: the same context yields the same

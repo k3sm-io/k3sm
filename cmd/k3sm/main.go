@@ -39,8 +39,8 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   uninstall   remove the netd + server launchd daemons (run as root via sudo)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
-  build       package a native darwin/arm64 image from a COPY-only Dockerfile (RUN is rejected)
-  builder     manage the in-cluster buildkitd engine for RUN-capable builds (builder up|down|status)
+  build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
+  builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
   image       ingest, publish and reclaim this node's images (image load|import|push|prune|ls|df)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config

@@ -52,9 +52,12 @@ const (
 	// BuildxVersion is the pinned buildx release tag.
 	BuildxVersion = "v0.17.1"
 	// BuildxAsset is the pinned buildx asset name (the guest is linux/arm64).
-	BuildxAsset = "buildx-" + BuildxVersion + ".linux-arm64"
+	BuildxAsset = "buildx-" + BuildxVersion + "." + guestBuildxPlatform
 	// BuildxSHA256 is the pinned asset's sha256, from the release checksums.txt.
 	BuildxSHA256 = "de05dccd47932eb9fd6e63781ab29d2b0b2c834bbdd19b51d7ea452b1fe378d3"
+
+	// guestBuildxPlatform is the in-pod asset's platform suffix (the guest arch).
+	guestBuildxPlatform = "linux-arm64"
 )
 
 // BuildxURL is the download URL for the pinned buildx asset.
@@ -65,6 +68,9 @@ func BuildxURL() string {
 // sha256Hex matches a lowercase 64-hex-char sha256 digest.
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// The HOST-side asset (the darwin/arm64 buildx the Mac runs to drive this engine)
+// is pinned beside these constants in buildxhost.go, against the same release tag.
+
 // ValidateBuildxPin fails if the compiled-in buildx pin is malformed. It is a
 // build-time contract check, not a network fetch: it proves the constants are
 // internally consistent (the asset names the version, the sha256 is a well-formed
@@ -72,20 +78,23 @@ var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // an unverifiable binary an hour into a build. The actual byte verification is
 // the entrypoint's `sha256sum -c` against the pinned hash.
 func ValidateBuildxPin() error {
-	return validatePin(BuildxVersion, BuildxAsset, BuildxSHA256)
+	return validatePin(BuildxVersion, BuildxAsset, BuildxSHA256, guestBuildxPlatform)
 }
 
-// validatePin is the pure core of ValidateBuildxPin, split out so both the
-// happy path and the malformed-bump cases are table-testable without mutating
-// package constants.
-func validatePin(version, asset, sha string) error {
+// validatePin is the pure core of ValidateBuildxPin and ValidateHostBuildxPin,
+// split out so both the happy path and the malformed-bump cases are
+// table-testable without mutating package constants. platform is the asset's
+// expected os-arch suffix — the check that a pin cannot name one arch's asset
+// while carrying another's, which is the bump mistake that would otherwise reach
+// a running guest.
+func validatePin(version, asset, sha, platform string) error {
 	if version == "" {
 		return fmt.Errorf("buildx pin: empty version")
 	}
 	if !sha256Hex.MatchString(sha) {
 		return fmt.Errorf("buildx pin: sha256 %q is not a 64-char lowercase hex digest", sha)
 	}
-	want := "buildx-" + version + ".linux-arm64"
+	want := "buildx-" + version + "." + platform
 	if asset != want {
 		return fmt.Errorf("buildx pin: asset %q does not match version %q (want %q)", asset, version, want)
 	}

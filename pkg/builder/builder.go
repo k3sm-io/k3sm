@@ -169,6 +169,32 @@ func (m *Manager) waitReady(ctx context.Context) (Status, error) {
 	}
 }
 
+// EnsureRunning returns a READY engine, bringing the stack up when it is not
+// already serving. It is the programmatic form of `k3sm builder up` that
+// `k3sm build` calls when a Dockerfile needs a real builder: a first RUN build
+// bootstraps the engine instead of refusing with an instruction to go run
+// another command, which is buildx's own posture for a missing builder instance.
+//
+// progress is called at most once, and only when work is actually about to
+// happen, so an already-Ready engine stays silent and a build that must wait
+// says so. A nil progress is allowed (no reporting).
+//
+// It is Up's semantics after a cheap Status: idempotent, and safe to call
+// concurrently with another Up, because every ensure step is Get-then-Create.
+func (m *Manager) EnsureRunning(ctx context.Context, progress func(string)) (Status, error) {
+	st, err := m.Status(ctx)
+	if err != nil {
+		return st, err
+	}
+	if st.State == StateReady {
+		return st, nil
+	}
+	if progress != nil {
+		progress(fmt.Sprintf("starting the k3sm build engine in namespace %s (first RUN build only; `k3sm builder down` stops it)", m.cfg.Namespace))
+	}
+	return m.Up(ctx)
+}
+
 // Down deletes the Pod and Service and KEEPS the cache PVC, so a rebuilt engine
 // finds a warm layer cache. It is idempotent — a not-found delete is success.
 func (m *Manager) Down(ctx context.Context) error {
