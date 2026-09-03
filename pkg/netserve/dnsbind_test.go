@@ -57,14 +57,37 @@ func testServer(binder dnsBinder) *Server {
 	}
 }
 
+// fakeBindClock replaces the retry sleep so the loop can be driven through hundreds
+// of attempts instantly, and records every backoff it was asked to wait — the only
+// place the schedule's shape is observable.
+type fakeBindClock struct {
+	waits []time.Duration
+}
+
+func (c *fakeBindClock) wait(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.waits = append(c.waits, d)
+	return nil
+}
+
+// useFakeBindClock installs the fake for the duration of a test. No unit test here
+// spends real time on a backoff.
+func useFakeBindClock(t *testing.T) *fakeBindClock {
+	t.Helper()
+	c := &fakeBindClock{}
+	orig := dnsBindWait
+	dnsBindWait = c.wait
+	t.Cleanup(func() { dnsBindWait = orig })
+	return c
+}
+
 // TestBindDNSVIPRetriesUntilAuthorized proves the resolver's DNS-VIP bind survives
 // the transient netd-authorizer denial at boot instead of one-shot-disabling — the
 // regression that left cluster DNS dark for the daemon's whole life.
 func TestBindDNSVIPRetriesUntilAuthorized(t *testing.T) {
-	// Shrink the schedule so the test doesn't wait real backoff seconds.
-	orig := dnsBindRetrySchedule
-	dnsBindRetrySchedule = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
-	t.Cleanup(func() { dnsBindRetrySchedule = orig })
+	useFakeBindClock(t)
 
 	b := &flakyBinder{failUntil: 2} // denied twice, authorized on the 3rd attempt
 	s := testServer(b)
@@ -81,33 +104,54 @@ func TestBindDNSVIPRetriesUntilAuthorized(t *testing.T) {
 	}
 }
 
-// TestBindDNSVIPExhaustsRetries proves a persistently-denied bind eventually gives
-// up with the last error rather than looping forever.
-func TestBindDNSVIPExhaustsRetries(t *testing.T) {
-	orig := dnsBindRetrySchedule
-	dnsBindRetrySchedule = []time.Duration{time.Millisecond, time.Millisecond}
-	t.Cleanup(func() { dnsBindRetrySchedule = orig })
+// TestBindDNSVIPRetriesIndefinitely is the regression for the permanent give-up.
+// The old schedule stopped after ~2.5 minutes on the assumption that the only thing
+// being waited for was netd's authorizer syncing at boot — so a netd outage longer
+// than that (a reinstall that left the helper down; a helper restart coinciding with
+// the server's) killed this node's cluster DNS for the process's whole life. The
+// bind must keep trying, at a capped interval, for as long as the daemon runs.
+func TestBindDNSVIPRetriesIndefinitely(t *testing.T) {
+	c := useFakeBindClock(t)
 
-	b := &flakyBinder{failUntil: 1000} // never authorized
+	// Far more failures than any bounded schedule would have tolerated.
+	const denials = 500
+	b := &flakyBinder{failUntil: denials}
 	s := testServer(b)
 	ap := netip.AddrPortFrom(s.dnsVIP, 53)
 
-	if _, _, err := s.bindDNSVIP(context.Background(), ap); err == nil {
-		t.Fatal("expected bindDNSVIP to fail after exhausting retries")
+	udp, tcp, err := s.bindDNSVIP(context.Background(), ap)
+	if err != nil {
+		t.Fatalf("bindDNSVIP must not give up: %v", err)
 	}
-	// len(schedule)+1 attempts: the initial try plus one per scheduled backoff.
-	if b.attempts != len(dnsBindRetrySchedule)+1 {
-		t.Fatalf("expected %d attempts, got %d", len(dnsBindRetrySchedule)+1, b.attempts)
+	defer udp.Close()
+	defer tcp.Close()
+	if b.attempts != denials+1 {
+		t.Fatalf("bind attempts = %d, want %d (every denial retried, then the success)", b.attempts, denials+1)
+	}
+	if len(c.waits) != denials {
+		t.Fatalf("backoff waits = %d, want %d (one per denial)", len(c.waits), denials)
+	}
+	// The backoff grows and then holds at the ceiling — it never runs away, and it
+	// never collapses to a hot loop.
+	if c.waits[0] != dnsBindRetryInitial {
+		t.Errorf("first backoff = %s, want %s", c.waits[0], dnsBindRetryInitial)
+	}
+	for i, d := range c.waits {
+		if d > dnsBindRetryMax {
+			t.Fatalf("backoff %d = %s, above the %s ceiling", i, d, dnsBindRetryMax)
+		}
+		if i > 0 && d < c.waits[i-1] {
+			t.Fatalf("backoff %d = %s went backwards from %s", i, d, c.waits[i-1])
+		}
+	}
+	if last := c.waits[len(c.waits)-1]; last != dnsBindRetryMax {
+		t.Errorf("steady-state backoff = %s, want the %s ceiling", last, dnsBindRetryMax)
 	}
 }
 
 // TestBindDNSVIPHonorsCancellation proves a cancelled ctx aborts the retry loop
 // promptly (the daemon is shutting down; don't keep retrying a doomed bind).
 func TestBindDNSVIPHonorsCancellation(t *testing.T) {
-	orig := dnsBindRetrySchedule
-	dnsBindRetrySchedule = []time.Duration{time.Hour} // long backoff we must not wait out
-	t.Cleanup(func() { dnsBindRetrySchedule = orig })
-
 	b := &flakyBinder{failUntil: 1000}
 	s := testServer(b)
 	ap := netip.AddrPortFrom(s.dnsVIP, 53)
