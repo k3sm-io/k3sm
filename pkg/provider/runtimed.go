@@ -265,6 +265,31 @@ type RuntimedConfig struct {
 	// answers from a cache that may not have synced, and "no candidates yet" is a
 	// valid answer at any moment.
 	ImageMirrors image.MirrorSource
+	// ClusterRegistries names ADDITIONAL registry authorities that spell THIS
+	// node's own ingest registry — its per-node Service DNS name and the VIP
+	// behind it — which runtimed's puller must classify exactly as it classifies a
+	// loopback spelling: plain HTTP on the primary fetch (go-containerregistry
+	// infers http only for loopback and RFC 1918, so a Service name would
+	// otherwise be dialled as HTTPS against a plain-HTTP listener) and eligible
+	// for the peer-mirror fallback. The contract, including why the set carries
+	// its own fetcher, is owned by runtimed/pkg/image's WithClusterRegistries.
+	//
+	// nil is the default and leaves the loopback-only classification byte for
+	// byte. runtimed REFUSES a malformed authority at construction rather than
+	// silently never matching it, so a bad value here fails the node's bring-up.
+	ClusterRegistries []string
+	// LocalRegistryHost names THIS NODE's own ingest registry as a reference
+	// spells it ("localhost:<port>"). When set, a pull for a reference that names
+	// no registry at all resolves against it before normalising to Docker Hub —
+	// the local-development loop `k3sm image load` and the ingest registry exist
+	// for. The contract, and the bounded cost of the divergence, are owned by
+	// runtimed/pkg/image's WithLocalRegistry.
+	//
+	// It MUST be a loopback spelling or one of ClusterRegistries above; runtimed
+	// refuses anything else at construction, which fails the node's bring-up
+	// rather than silently treating a third-party registry as this node's own. ""
+	// is the default and leaves bare-name resolution stock.
+	LocalRegistryHost string
 	// GuestArtifacts is this node's ENSURED, digest-verified guest boot artifact
 	// set (B108) — the kernel, the initramfs and the cmdline a vm pod boots from.
 	// It is DATA, already materialised by GuestArtifactSource.Ensure before this
@@ -337,6 +362,11 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	// must supply them. nil (single node, or a node with no client) leaves
 	// runtimed's puller byte-identical to its pre-mirror behavior.
 	deps.ImageMirrors = cfg.ImageMirrors
+	// The same DATA treatment, and for the same reason: runtimed never reads the
+	// apiserver, so the component that published the Service is the one that must
+	// name it.
+	deps.ClusterRegistries = cfg.ClusterRegistries
+	deps.LocalRegistryHost = cfg.LocalRegistryHost
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
 		RuntimeVersion: "k3sm-m1",

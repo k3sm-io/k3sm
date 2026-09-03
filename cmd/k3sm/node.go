@@ -192,6 +192,25 @@ type nodeOptions struct {
 	// behavior in which no fallback can run.
 	imageMirrors image.MirrorSource
 
+	// clusterRegistries names the NON-LOOPBACK spellings of this node's own ingest
+	// registry — its per-node Service authority and the VIP behind it. A reference
+	// carrying one of them is node-relative in exactly the sense a
+	// `localhost:<port>/…` reference is: it resolves against content this cluster
+	// ingested, so it earns the same plain-HTTP transport and the same peer-mirror
+	// fallback. It is set by `k3sm server` from the registry bring-up, which is the
+	// only component that knows the node name, the cluster domain and the assigned
+	// VIP; empty everywhere else leaves runtimed's loopback-only classification
+	// exactly as it was.
+	clusterRegistries []string
+
+	// localRegistryHost names this node's own ingest registry as a reference spells
+	// it ("localhost:<port>"), which makes a bare "app:v1" — a reference that names
+	// no registry at all — resolve here before it normalises to Docker Hub. It is
+	// set by `k3sm server` when the registry actually started serving; empty
+	// leaves bare-name resolution stock. runtimed REFUSES a value that is neither
+	// a loopback spelling nor one of clusterRegistries, so the two travel together.
+	localRegistryHost string
+
 	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
 	// runtime as soon as it is built, so a consumer started EARLIER in the same
 	// process can read runtime-info facts off the SAME runtime this node drives.
@@ -1168,6 +1187,11 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// nil (a bring-up with no apiserver client) leaves the puller with no
 		// fallback, which is the single-node behavior.
 		ImageMirrors: opts.imageMirrors,
+		// The node's own registry under its cluster names, so a pull spelled with
+		// the Service address is brokered identically to one spelled on loopback.
+		ClusterRegistries: opts.clusterRegistries,
+		// The same registry under the name a bare reference resolves against.
+		LocalRegistryHost: opts.localRegistryHost,
 		// Wire the process default logger so the runtimed provider is not SILENT: it
 		// otherwise falls back to a DiscardHandler, dropping pod-lifecycle + cluster-DNS
 		// wiring logs the operator needs (server.log had no provider lines at all).

@@ -35,19 +35,19 @@ kubectl get configmap local-registry-hosting -n kube-public \
 ```
 
 ```yaml
-help: https://k3sm.io/docs/user/registry/
+help: https://k3sm.io/docs/user/registry/ — the in-cluster address serves plain HTTP,
+  not TLS
 host: localhost:6450
+hostFromClusterNetwork: registry-k3sm-mystudio.k3sm-registry.svc.cluster.local:6450
 hostFromContainerRuntime: localhost:6450
 ```
 
-`hostFromClusterNetwork` is **absent**. That field means "an address a workload inside the cluster
-network can pull from". A native Pod is a Darwin process on this host, so its `localhost` is the host's and
-`hostFromContainerRuntime` already covers it. A Pod running under the Linux `RuntimeClass` is a
-guest with its **own** loopback, on which the registry is not listening — so there is no address
-k3sm could publish there that a guest could actually use.
+`host` and `hostFromContainerRuntime` are for tools running **on the Mac**.
+`hostFromClusterNetwork` is the address for something running **inside the cluster** — see
+[Pulling From Inside a Pod](#pulling-from-inside-a-pod).
 
-That is the one ceiling worth knowing about: **a Linux-guest Pod cannot pull from the node-local
-registry.** Use a reachable registry for those images, or load them into the node's store directly.
+`hostFromClusterNetwork` is absent on a single Mac that hosts no Linux guests. There is nothing
+listening off loopback on such a node, so there is no in-cluster address to publish.
 
 ## Pushing
 
@@ -134,12 +134,60 @@ Nothing about the registry's own listener changes: it still binds loopback and r
 else. What is reachable from the rest of the cluster is a separate, narrow forwarder that carries
 connections to it, on the cluster network address and nowhere else.
 
-A process running **inside** a Linux-guest Pod — a build running in the cluster, say — reaches the
-node's registry at the guest network's gateway address (the first address of the `192.168.64.0/24`
-segment) rather than at `localhost`, because a guest's `localhost` is its own.
-
 On a single-machine cluster none of this is in play: there are no other nodes, nothing is published,
 and no forwarder is started.
+
+## Pulling From Inside a Pod
+
+A process running **inside** a Pod — a build running in the cluster, say — cannot use
+`localhost:6450`. A native Pod's `localhost` is the host's, so that one happens to work; a Linux
+guest's `localhost` is its own, and nothing is listening on it.
+
+Each node publishes one address that works for both, and for the Mac itself: an ordinary
+Kubernetes Service, named after the node, in the `k3sm-registry` namespace.
+
+```sh
+kubectl get svc,endpointslice -n k3sm-registry
+```
+
+Dial it the way you would any Service. All four of these name it:
+
+```
+registry-<node>.k3sm-registry.svc.cluster.local:6450
+registry-<node>.k3sm-registry.svc:6450
+registry-<node>.k3sm-registry:6450
+<the Service's ClusterIP>:6450
+```
+
+Substitute your node's name — `kubectl get nodes` — or read the fully qualified form straight out
+of the discovery ConfigMap's `hostFromClusterNetwork`, which is what it is there for. The name is
+per-node because every node's registry holds different content, so one shared name would resolve
+to whichever machine answered first.
+
+Some things to know before you use it:
+
+**It speaks plain HTTP.** The `localhost` spelling gets an insecure-registry exemption from the
+docker/OCI toolchain automatically; a Service name does not. Tell your client to use HTTP —
+`--plain-http`, `--insecure`, or whatever the tool calls it. The discovery ConfigMap's `help`
+line says so too.
+
+**It is for tools inside the Pod, not for `image:`.** Keep writing `localhost:6450/myapp:v1` in
+a Pod spec. Kubernetes image references are resolved by the node's runtime, which runs on the
+Mac and does not use the cluster's DNS — so a Service name in `spec.containers[].image` has
+nothing to resolve it. The addresses above are for a process inside the Pod that is fetching or
+inspecting images itself.
+
+**It is a pull address.** Pushing from inside a Pod is not supported: `k3sm image push` finds the
+node's credential only for a loopback target, and that credential never leaves the machine that
+minted it. Push from the Mac.
+
+**Reads are anonymous, here as everywhere.** Anything that can reach the address can list and
+pull the images this cluster runs. That is the same posture the loopback listener has, extended
+to the cluster network and no further.
+
+**A vm Pod needs the node to be running guests.** The address a caller is sent to is the node's
+cluster-network address — the mesh address on a multi-machine cluster, otherwise the guest
+network's gateway. A single Mac with neither publishes no Service at all.
 
 ## Storage
 
@@ -183,4 +231,4 @@ directory is left where it is; delete `<work-dir>/registry/` to reclaim the spac
 - [Images](images.md) — the full image reference: `k3sm build`, `image load`/`import`/`push`, and
   the deliberate differences from the Docker tool of the same name.
 - [What runs](what-runs.md) — the path from a Dockerfile to a running Pod.
-- [Linux images](vm-runtimeclass.md) — the guest path, and why it cannot reach this registry.
+- [Linux images](vm-runtimeclass.md) — the guest path.

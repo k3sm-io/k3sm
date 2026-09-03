@@ -16,13 +16,22 @@
 #   half: the loopback-bind refusal (a non-loopback bind is an ERROR, at both the
 #   constructor and the config render), the config's anonymous-read /
 #   authenticated-write access control, the credential contract `k3sm image push`
-#   reads, and the KEP-1755 document's deliberately absent hostFromClusterNetwork.
+#   reads, the per-node cluster Service and its hand-written EndpointSlice
+#   (mesh-else-gateway endpoint choice, and the loopback refusal that keeps the
+#   registry's own listener out of the slice), and the KEP-1755 document's
+#   three-field render.
 #
 #   LIVE TIER (needs $KUBECONFIG) — the registry actually serving: the KEP-1755
 #   ConfigMap names a port something answers on, the credential file is where the
 #   contract says at mode 600, an authenticated push succeeds, an unauthenticated
-#   push is REFUSED, an anonymous pull succeeds, and a native Pod naming
-#   `localhost:<port>/<ref>` with `imagePullPolicy: Always` reaches Running.
+#   push is REFUSED, an anonymous pull succeeds, a native Pod naming
+#   `localhost:<port>/<ref>` with `imagePullPolicy: Always` reaches Running, and
+#   the node's registry Service answers the dist-spec probe at its VIP.
+#
+#   LAB TIER (human-run, K3SM_LAB) — the one leg neither tier above can reach: a
+#   Linux-guest Pod pulling from `registry-<node>.k3sm-registry.svc:<port>`. It
+#   needs a vm-capable Mac with a guest actually booted, so it is announced OWED
+#   rather than skipped silently.
 #
 # Without $KUBECONFIG the live rungs are announced LIVE-PENDING and never fail —
 # and the summary says so in as many words, so an exit 0 from a CI-tier-only run
@@ -41,6 +50,7 @@
 #   KUBECONFIG          a cluster started with --registry-port <p> (enables the live tier)
 #   K3SM_REGISTRY_PORT  override the port instead of reading it from KEP-1755
 #   K3SM_WORK_DIR       the control-plane work dir holding the push credential
+#   K3SM_CLUSTER_DOMAIN the cluster DNS suffix (default cluster.local)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -112,6 +122,27 @@ run_test "registry.3c" 3 TestRegistryAuthChainOrder ./cmd/k3sm/
 run_test "registry.4a" 3 TestStartIngestRegistry ./cmd/k3sm/
 run_test "registry.4b" 2 TestDevEnablesTheIngestRegistry ./pkg/dev/
 
+# ---- registry.11 — the per-node cluster Service (CI half) -----------------
+# The ONE cluster address a native Pod, a vm guest and the host all reach this
+# node's registry at. The endpoint is the RELAY's address, never the registry's
+# own loopback listener — EndpointSlice validation refuses a loopback address at
+# the apiserver, and the renderer refuses it here, where the reason can be named.
+run_test "registry.11a" 9 TestClusterEndpointAddress ./pkg/registrysvc/
+run_test "registry.11b" 3 TestClusterService ./pkg/registrysvc/
+run_test "registry.11c" 4 TestClusterEndpointSlice ./pkg/registrysvc/
+run_test "registry.11d" 8 TestPublishClusterService ./pkg/registrysvc/
+run_test "registry.11e" 4 TestRemoveClusterService ./pkg/registrysvc/
+# The spellings runtimed must treat as naming THIS node's own registry, so a Pod
+# that pulls by the Service name gets the same brokering as one that pulls by
+# localhost — and the proof that runtimed ACCEPTS the exact combination this node
+# hands it. The two fields constrain each other, and a bad combination is not a
+# degraded pull path: it fails runtime.New, so the node does not start.
+run_test "registry.11f" 5 TestClusterLocalAuthorities ./pkg/registrysvc/
+run_test "registry.11h" 4 TestRegistryPullerWiringIsAccepted ./cmd/k3sm/
+# The KEP-1755 document in both shapes: three addresses on a node that has a
+# cluster Service, two on a node that has no relay at all.
+run_test "registry.11g" 3 TestHostingDocument ./pkg/registrysvc/
+
 # ---- LIVE TIER ------------------------------------------------------------
 if [ -z "${KUBECONFIG:-}" ]; then
 	pending "registry.5  live: KEP-1755 discovery names a serving port          (set KUBECONFIG)"
@@ -120,6 +151,9 @@ if [ -z "${KUBECONFIG:-}" ]; then
 	pending "registry.8  live: an unauthenticated push is refused               (set KUBECONFIG)"
 	pending "registry.9  live: an anonymous pull succeeds                       (set KUBECONFIG)"
 	pending "registry.10 live: a Pod pulls localhost:<p>/probe:t and runs       (set KUBECONFIG)"
+	pending "registry.12 live: the per-node registry Service + EndpointSlice exist (set KUBECONFIG)"
+	pending "registry.13 live: the Service VIP answers the dist-spec /v2/ probe  (set KUBECONFIG)"
+	pending "registry.14 lab:  a vm-guest Pod pulls by the Service name          (OWED — human-run)"
 	echo "----------------------------------------"
 	echo "registry: $PASS passed, $FAIL failed, $PENDING LIVE-PENDING"
 	[ "$FAIL" -eq 0 ] || exit 1
@@ -133,6 +167,9 @@ command -v curl >/dev/null || { echo "curl is required for the live tier" >&2; e
 kubectl get --raw /healthz >/dev/null || { echo "the cluster at \$KUBECONFIG is not serving" >&2; exit 1; }
 
 NS=default
+# The cluster DNS suffix the Service authority is rendered with. It matches the
+# server's --cluster-domain; override when a cluster was started with a custom one.
+CLUSTER_DOMAIN="${K3SM_CLUSTER_DOMAIN:-cluster.local}"
 TMP="$(mktemp -d)"
 cleanup() {
 	kubectl delete pod registry-probe -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -157,12 +194,26 @@ if [ -z "$PORT" ]; then
 	exit 1
 fi
 ladder ok "registry.5a KEP-1755 local-registry-hosting in kube-public names localhost:$PORT"
-# hostFromClusterNetwork must be ABSENT: a vm Pod is a Linux guest with its own
-# loopback, so any value there would tell a guest to pull from itself.
-if printf '%s\n' "$HOSTING" | grep -q 'hostFromClusterNetwork'; then
-	ladder no "registry.5b KEP-1755 document omits hostFromClusterNetwork (a vm guest's loopback answers nothing)"
+
+# The per-node registry Service is the ground truth for the in-cluster address:
+# it exists exactly on a node that has a relay to answer it (a mesh address, or a
+# vm network). hostFromClusterNetwork must agree with it in BOTH directions — a
+# published address with no Service sends every reader at a name that resolves to
+# nothing, and a Service nobody is told about is a name nobody uses.
+SVC_NS=k3sm-registry
+SVC_NAME="$(kubectl get svc -n "$SVC_NS" \
+	-o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep '^registry-' | head -1 || true)"
+HFCN="$(printf '%s\n' "$HOSTING" | sed -n 's/^hostFromClusterNetwork:[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' | head -1)"
+if [ -n "$SVC_NAME" ]; then
+	if [ "$HFCN" = "$SVC_NAME.$SVC_NS.svc.$CLUSTER_DOMAIN:$PORT" ]; then
+		ladder ok "registry.5b KEP-1755 hostFromClusterNetwork names the node's registry Service ($HFCN)"
+	else
+		ladder no "registry.5b KEP-1755 hostFromClusterNetwork names the node's registry Service (got '${HFCN:-absent}', want $SVC_NAME.$SVC_NS.svc.$CLUSTER_DOMAIN:$PORT)"
+	fi
+elif [ -z "$HFCN" ]; then
+	ladder ok "registry.5b KEP-1755 omits hostFromClusterNetwork on a node with no registry Service to answer it"
 else
-	ladder ok "registry.5b KEP-1755 document omits hostFromClusterNetwork (a vm guest's loopback answers nothing)"
+	ladder no "registry.5b KEP-1755 publishes hostFromClusterNetwork '$HFCN' with no registry Service in $SVC_NS to answer it"
 fi
 if [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://127.0.0.1:$PORT/v2/" || true)" = "200" ]; then
 	ladder ok "registry.5c the published port answers the dist-spec /v2/ probe"
@@ -277,7 +328,56 @@ else
 	ladder no "registry.10 a Pod pulled localhost:$PORT/probe:t (imagePullPolicy: Always) and reached Ready"
 fi
 
+# ---- registry.12 — the per-node Service and its hand-written EndpointSlice --
+# A selector-less Service plus a slice written by k3sm: there is no Pod to select,
+# because the registry is a child process reached through the relay. The endpoint
+# must be NON-LOOPBACK — 127.0.0.1 is every caller's own address, and the
+# apiserver refuses one in a slice anyway, so a loopback value here would mean the
+# object never landed.
+if [ -z "$SVC_NAME" ]; then
+	pending "registry.12 the per-node registry Service exists (this node has no mesh address and no vm network)"
+	pending "registry.13 the Service VIP answers /v2/ (no Service to dial)"
+else
+	SVC_IP="$(kubectl get svc "$SVC_NAME" -n "$SVC_NS" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+	SVC_SEL="$(kubectl get svc "$SVC_NAME" -n "$SVC_NS" -o jsonpath='{.spec.selector}' 2>/dev/null || true)"
+	SVC_PORT="$(kubectl get svc "$SVC_NAME" -n "$SVC_NS" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+	EP_ADDR="$(kubectl get endpointslice "$SVC_NAME" -n "$SVC_NS" -o jsonpath='{.endpoints[0].addresses[0]}' 2>/dev/null || true)"
+	EP_READY="$(kubectl get endpointslice "$SVC_NAME" -n "$SVC_NS" -o jsonpath='{.endpoints[0].conditions.ready}' 2>/dev/null || true)"
+	if [ -n "$SVC_IP" ] && [ "$SVC_IP" != "None" ] && [ "$SVC_PORT" = "$PORT" ] && [ -z "$SVC_SEL" ]; then
+		ladder ok "registry.12a $SVC_NS/$SVC_NAME is a selector-less ClusterIP Service on port $PORT (VIP $SVC_IP)"
+	else
+		ladder no "registry.12a $SVC_NS/$SVC_NAME is a selector-less ClusterIP Service on port $PORT (clusterIP='${SVC_IP:-none}' port='${SVC_PORT:-none}' selector='${SVC_SEL:-none}')"
+	fi
+	case "${EP_ADDR:-none}" in
+	none | 127.* | ::1) ladder no "registry.12b the EndpointSlice carries a NON-loopback endpoint (got '${EP_ADDR:-absent}') — the Service would have a VIP and no reachable backend" ;;
+	*) ladder ok "registry.12b the EndpointSlice carries the relay address $EP_ADDR, not the registry's loopback listener" ;;
+	esac
+	if [ "$EP_READY" = "true" ]; then
+		ladder ok "registry.12c the endpoint is explicitly Ready"
+	else
+		ladder no "registry.12c the endpoint is explicitly Ready (got '${EP_READY:-absent}') — a nil Ready reads as not-ready and the Service has no backend"
+	fi
+
+	# ---- registry.13 — the VIP actually answers -------------------------------
+	# The host reaches a VIP through its lo0 alias, and the userspace proxy dials
+	# the backend host-side — so a 200 here proves the whole chain the in-pod
+	# address depends on: name -> VIP -> proxy -> relay -> loopback registry.
+	VIP_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://$SVC_IP:$PORT/v2/" || true)"
+	if [ "$VIP_CODE" = "200" ]; then
+		ladder ok "registry.13 the registry Service VIP answers the dist-spec /v2/ probe (http://$SVC_IP:$PORT)"
+	else
+		ladder no "registry.13 the registry Service VIP answers the dist-spec /v2/ probe (http://$SVC_IP:$PORT, got HTTP ${VIP_CODE:-none})"
+	fi
+fi
+
+# ---- registry.14 — the vm-guest leg (LAB, human-run) -----------------------
+# Neither tier above can reach it: it needs a vm-capable Mac with a guest booted,
+# pulling by the Service name over plain HTTP. Announced OWED so an exit 0 here is
+# never read as covering it.
+pending "registry.14 lab: a vm-guest Pod pulls $SVC_NAME.$SVC_NS.svc:$PORT over plain HTTP (OWED — human-run)"
+
 echo "----------------------------------------"
-echo "registry: $PASS passed, $FAIL failed"
+echo "registry: $PASS passed, $FAIL failed, $PENDING pending"
 [ "$FAIL" -eq 0 ] || exit 1
+echo "registry: the LAB rung above is OWED — the vm-guest pull by Service name is human-run."
 echo "=========== INGEST REGISTRY GREEN ==========="
