@@ -136,7 +136,7 @@ want the *real* pull path: a Pod referencing `localhost:<port>/…` honors `imag
 notices a moved tag, and fails the way a remote registry would, none of which `k3sm image load` can
 reproduce. See [Node-local registry](registry.md).
 
-## What Carries Over From Docker and Kubernetes
+## What Carries Over From Your Container and Kubernetes Workflow
 
 Almost all of it:
 

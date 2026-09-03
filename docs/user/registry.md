@@ -245,6 +245,6 @@ directory is left where it is; delete `<work-dir>/registry/` to reclaim the spac
 ## See Also
 
 - [Images](images.md) — the full image reference: `k3sm build`, `image load`/`import`/`push`, and
-  the deliberate differences from the Docker tool of the same name.
+  the deliberate differences from the `docker` verb of the same name.
 - [What runs](what-runs.md) — the path from a Dockerfile to a running Pod.
 - [Linux images](vm-runtimeclass.md) — the guest path.
