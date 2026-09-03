@@ -51,8 +51,21 @@ listening off loopback on such a node, so there is no in-cluster address to publ
 
 ## Pushing
 
-Build an OCI layout and push it. No credential is needed on the command line — `k3sm image push`
-finds the node's own push credential when, and only when, the target is this node's registry:
+`k3sm build --push` builds and uploads in one command. No credential is needed on the command line —
+the build finds the node's own push credential when, and only when, the target is this node's
+registry:
+
+```sh
+k3sm build --tag localhost:6450/myapp:v1 --push .
+k3sm build --tag myapp:v1 --push .          # a bare tag goes here too, on the port above
+```
+
+A bare tag is the short form of the same thing: it resolves to `localhost:<registry-port>`, which is
+where a bare `image: myapp:v1` in a Pod spec is served from as well. The store keeps the name you
+gave, so the tag in your Pod spec is the tag you typed.
+
+For an image that already exists — a layout you built earlier, or one someone handed you — push it
+on its own:
 
 ```sh
 k3sm build --tag localhost:6450/myapp:v1 --format oci --output ./myapp-layout .
@@ -79,6 +92,9 @@ install runs it as its own service account — point push at that control plane'
 ```sh
 k3sm image push --work-dir /var/lib/k3sm/server ./myapp-layout localhost:6450/myapp:v1
 ```
+
+`k3sm build --push` reads the same file, from the work dir it resolves for the current user or from
+`K3SM_WORK_DIR` when that is set.
 
 The credential itself lives at:
 

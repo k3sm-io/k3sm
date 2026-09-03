@@ -211,6 +211,20 @@ func sha256File(path string) (string, error) {
 // create and the build alike, so registry credentials the user already has keep
 // working. BUILDX_CONFIG being explicit is what makes the instance lookup
 // independent of it.
+//
+// NO HINT-SUPPRESSING VARIABLE IS SET HERE, and that is a finding rather than an
+// omission. On a Mac that has used Docker Desktop's build backend, buildx ends a
+// build with "View build details: docker-desktop://…" — a deep link that means
+// nothing on a k3sm cluster. It is NOT reachable by environment at the pinned
+// version: buildx v0.17.1 calls desktop.PrintBuildDetails unconditionally from
+// commands/build.go for every non-quiet progress mode, and the only gate on it
+// is desktop.BuildBackendEnabled(), which tests for
+// $HOME/.docker/desktop-build/.lastaccess. DOCKER_CLI_HINTS reaches only
+// docker/cli's HooksEnabled(), which buildx v0.17.1 never calls, so setting it
+// would suppress nothing and claim otherwise. The two levers that would work are
+// both worse than the line: redirecting HOME (which is where the user's docker
+// credentials and credential helpers live) and filtering buildx's stderr (which
+// carries the build's own progress).
 func BuildxEnv(base []string, cfgDir string) []string {
 	out := make([]string, 0, len(base)+1)
 	for _, kv := range base {
