@@ -115,6 +115,9 @@ run_test "builder.3c" 1 TestUpWaitsThenReady ./pkg/builder/
 run_test "builder.3d" 1 TestDownKeepsCache ./pkg/builder/
 run_test "builder.3e" 3 TestEndpoint ./pkg/builder/
 run_test "builder.3f" 1 TestUpCreatesNamespaceBeforePVC ./pkg/builder/
+# Delete is the full reset (Pod, Service, cache PVC AND namespace) — the contrast
+# to Down, which keeps the cache. builder.3g asserts all four are removed.
+run_test "builder.3g" 1 TestDeleteRemovesCacheAndNamespace ./pkg/builder/
 
 # ---- builder.4 — legible-absence + the image-source default ---------------
 run_test "builder.4a" 1 TestStatusAbsentIsLegible ./pkg/builder/
@@ -129,12 +132,21 @@ if grep -q 'case "builder"' "$K3SM_ROOT/cmd/k3sm/main.go"; then
 else
 	ladder no "builder.5c k3sm builder is dispatched from main.go"
 fi
+run_test "builder.5d" 1 TestBuilderAcceptsDelete ./cmd/k3sm/
+# The delete verb must reach mgr.Delete in the runBuilderVerb dispatch switch —
+# a grep pins the wiring the arg-parse test cannot see past the cluster boundary.
+if grep -qE 'case "delete":' "$K3SM_ROOT/cmd/k3sm/builder.go"; then
+	ladder ok "builder.5e k3sm builder delete is dispatched to mgr.Delete"
+else
+	ladder no "builder.5e k3sm builder delete is dispatched to mgr.Delete"
+fi
 
 # ---- LIVE TIER (owed — the orchestrator's single-node lab step) ------------
 owed "builder.6  live: \`k3sm builder up\` registers a buildkit worker          (needs a vm-capable node)"
 owed "builder.7  live: a RUN-containing build through Endpoint() produces an OCI layout"
 owed "builder.8  live: \`k3sm image push\` of the layout, then a Pod runs it"
 owed "builder.9  live: \`k3sm builder down\` deletes the Pod but keeps the cache PVC"
+owed "builder.10 live: \`k3sm builder delete\` removes the Pod, Service, cache PVC AND the namespace (full reset)"
 
 echo "----------------------------------------"
 echo "builder: $PASS passed, $FAIL failed, $PENDING OWED (live)"

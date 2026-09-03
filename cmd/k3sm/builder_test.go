@@ -63,6 +63,38 @@ func TestParseBuilderArgsDefaults(t *testing.T) {
 	}
 }
 
+// TestBuilderAcceptsDelete pins that `delete` is a wired subcommand: it parses
+// like the other verbs, and runBuilder dispatches it past the accept list rather
+// than rejecting it as unknown. With a temp work dir (no kubeconfig) it reaches
+// the legible control-plane error — proof it was accepted, not refused. A missing
+// accept-list entry would instead surface the "unknown subcommand" error.
+func TestBuilderAcceptsDelete(t *testing.T) {
+	if _, err := parseBuilderArgs("delete", nil); err != nil {
+		t.Fatalf("parse delete: %v", err)
+	}
+	err := runBuilder([]string{"delete", "--work-dir", t.TempDir()})
+	if err == nil {
+		t.Fatal("expected the legible control-plane error for a missing kubeconfig")
+	}
+	if strings.Contains(err.Error(), "unknown") {
+		t.Errorf("delete was refused as unknown, not accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "k3sm server") {
+		t.Errorf("expected the legible kubeconfig error, got: %v", err)
+	}
+}
+
+// TestBuilderUsageListsDelete pins that the usage string advertises delete and
+// distinguishes it from down (full reset vs keep-cache stop).
+func TestBuilderUsageListsDelete(t *testing.T) {
+	if !strings.Contains(builderUsage, "up|down|delete|status") {
+		t.Errorf("usage does not list delete in the subcommand line")
+	}
+	if !strings.Contains(builderUsage, "full reset") {
+		t.Errorf("usage does not describe delete as a full reset")
+	}
+}
+
 // TestBuilderAbsentControlPlaneIsLegible pins that a missing kubeconfig names the
 // fix (`k3sm server`) rather than surfacing a bare file-not-found.
 func TestBuilderAbsentControlPlaneIsLegible(t *testing.T) {

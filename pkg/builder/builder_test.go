@@ -282,6 +282,44 @@ func TestDownKeepsCache(t *testing.T) {
 	}
 }
 
+// TestDeleteRemovesCacheAndNamespace pins that Delete is the full reset: the Pod,
+// Service, the cache PVC AND the builder namespace are all removed. It is the
+// contrast to TestDownKeepsCache, which keeps the PVC for a warm rebuild — this
+// goes red if Delete misses any of the four objects.
+func TestDeleteRemovesCacheAndNamespace(t *testing.T) {
+	cfg := Config{}.Normalize()
+	cs := fake.NewSimpleClientset(
+		cfg.NamespaceObject(),
+		builderPod(corev1.PodRunning),
+		builderService("10.96.0.9"),
+		cfg.PersistentVolumeClaim(),
+	)
+	m := NewManager(cs, &fakeExecer{}, Config{}, nil)
+	if err := m.Delete(context.Background()); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods(DefaultNamespace).Get(context.Background(), DefaultName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("pod should be gone, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Services(DefaultNamespace).Get(context.Background(), DefaultName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("service should be gone, err=%v", err)
+	}
+	if _, err := cs.CoreV1().PersistentVolumeClaims(DefaultNamespace).Get(context.Background(), DefaultName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("cache PVC must be REMOVED on a full reset, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Namespaces().Get(context.Background(), DefaultNamespace, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("builder namespace must be REMOVED on a full reset, err=%v", err)
+	}
+}
+
+// TestDeleteIdempotent pins that a Delete of an absent stack is success.
+func TestDeleteIdempotent(t *testing.T) {
+	m := NewManager(fake.NewSimpleClientset(), &fakeExecer{}, Config{}, nil)
+	if err := m.Delete(context.Background()); err != nil {
+		t.Errorf("Delete of an absent stack should succeed, got %v", err)
+	}
+}
+
 // TestDownIdempotent pins that a Down of an absent stack is success.
 func TestDownIdempotent(t *testing.T) {
 	m := NewManager(fake.NewSimpleClientset(), &fakeExecer{}, Config{}, nil)
