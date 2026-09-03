@@ -209,6 +209,13 @@ through that same credential, and the store recording is already done.
   foreign-architecture image is built by copying a cross-compiled binary in.
 - **buildx is a separate tool.** k3sm bundles the pieces it builds; `buildx`
   itself is the upstream release, pinned by version and checksum.
+- **The bundled buildx runs with a k3sm-owned `HOME`,** so it cannot mistake a
+  Docker Desktop install for the build backend and end every build with a
+  `docker-desktop://` link. Your registry credentials are unaffected — k3sm
+  points `DOCKER_CONFIG` at the same config directory buildx would have used —
+  but a flag that reads something else out of your home directory (`--cache-to
+  type=s3`, which resolves `~/.aws`) needs that tool's own environment variable
+  instead.
 - **No port-forward driver.** Your own `buildx` reaches the engine over its
   Service ClusterIP, not a `kubectl port-forward` tunnel. If the ClusterIP is not
   host-reachable in your setup, that dial fails — check `k3sm builder status` for
