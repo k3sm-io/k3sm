@@ -801,14 +801,38 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 // manifest install consumes — so nothing install creates can be left behind
 // (the B62 leak was the two plists, which the old hardcoded uninstall never
 // removed). It walks the manifest in reverse install order: the server daemon
-// before netd (server first stops driving the helper; netd's SIGTERM handler
-// then flushes lo0/pf/utun), each daemon torn down as Bootout(label) then
+// before netd, so the control plane stops driving the helper before the helper
+// goes away. Each daemon is torn down as Bootout(label) then
 // RemoveAll(plistPath) so the label and its plist never diverge. InstallDir-
 // covered artifacts are swept by the single RemoveAll(InstallDir); dispPreserve
 // artifacts (DataRoot's kine state.db + mesh keys, the human kubeconfig, the
 // _k3sm user, LogDir) are left in place. It is idempotent: a bootout of a
 // not-loaded label and a RemoveAll of an absent path are both no-op successes,
 // so re-running after a partial install (or twice) is safe.
+//
+// What netd's SIGTERM does, precisely: `k3sm netd` cancels its context, and
+// netd.Server.Serve closes its listener and returns. That is all — it flushes
+// NOTHING. A full teardown does exist (mesh.WGDevice.Down deletes the routes,
+// flushes the pf anchor, drops the mesh-egress alias and closes the utun), but
+// the only caller is the RemoveMesh RPC; no signal path reaches it. This comment
+// used to assert the opposite — "netd's SIGTERM handler then flushes lo0/pf/utun"
+// — and believing it is how the residue below went unaccounted for.
+//
+// So a booted-out netd leaves durable kernel state, and uninstall removes exactly
+// one class of it:
+//
+//   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
+//     because no daemon does it.
+//   - the mesh MSS-clamp pf anchor — NOT removed. It survives netd, scoped to a
+//     utun that is gone, until something flushes the anchor or the host reboots.
+//   - the wireguard utun and its routes — NOT explicitly removed. The interface
+//     is created in-process (tun.CreateTUN) and goes away with netd, and the
+//     kernel drops routes whose interface has vanished; nothing here proves the
+//     routing table is clean, only that no rule keeps it dirty.
+//
+// Flushing those on the way out is a darwin-net change (a shutdown hook that
+// reaches Down), not an installer one, and is filed separately. Uninstall makes
+// no claim to do it.
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
 	var firstErr error
