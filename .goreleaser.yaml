@@ -131,6 +131,9 @@ checksum:
   algorithm: sha256
 
 release:
+  # The release title is the bare tag (v0.1.2) — never a summary of the
+  # release. The summary is the body's first line; the title is the handle.
+  name_template: "{{ .Tag }}"
   # Draft by default: the archive is ~250 MB over a home uplink, and GitHub's
   # `releases/latest` — which install.sh resolves when no version is pinned —
   # skips drafts. A failed or partial upload therefore stays invisible to users
