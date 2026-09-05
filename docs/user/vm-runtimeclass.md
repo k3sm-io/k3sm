@@ -3,11 +3,10 @@
 k3sm runs Pods as native Darwin processes under a **single `_k3sm` user**, so there is **no per-pod uid
 isolation** — same-node Pods share one OS trust domain. The **`vm` RuntimeClass** is the intended
 answer for **untrusted or multi-tenant** workloads: a real isolation boundary backed by
-Virtualization.framework. See the status note below for what it supports today.
+Virtualization.framework. The note below is the supported scope.
 
-> **Status: validated on real hardware.** A Pod that sets
-> `runtimeClassName: vm` boots a `linux/arm64` container image in its own micro-VM. Exercised and
-> measured on the reference hardware: boot and restart, `kubectl logs` (including `--tail` and
+> **Single-node.** A Pod that sets `runtimeClassName: vm` boots a `linux/arm64` container image
+> in its own micro-VM. Supported: boot and restart, `kubectl logs` (including `--tail` and
 > `-f`), `kubectl exec` with exit-code propagation, `CrashLoopBackOff` and restart backoff,
 > PersistentVolumeClaim storage that survives a hard hypervisor kill, per-container CPU and memory
 > accounting, and in-guest networking — the guest leases an address on the node's NAT segment,
@@ -154,7 +153,7 @@ Two properties are deliberate rather than incidental:
 ## Trade-Offs
 
 - **Isolation** — a genuine boundary, at the cost of VM startup and overhead versus a native process.
-- **Fidelity** — behavior is measured against the reference hardware; see
+- **Fidelity** — behavior is measured, not assumed; see
   [Limitations](limitations.md) for what is covered and what is not yet wired.
 - **Fallback posture** — when a Seatbelt SPI symbol-canary trips on the native path, the runtime degrades
   to `vm` or refuse-to-run, never to an unconfined process (see
@@ -202,7 +201,7 @@ produces. A multi-arch image that includes `darwin/arm64` is unaffected — it r
 always did.
 
 `k3sm.io/rosetta-linux` is never set on any node today, on any host. The Linux-guest payload path
-itself — rootfs, guest image pull, boot — is built and validated (see the status note at the top of
+itself — rootfs, guest image pull, boot — is built and works (see the status note at the top of
 this page); the piece that is missing is narrower: the node's VM host attaches no Rosetta directory
 share to the guests it builds, so nothing inside a guest could translate a `linux/amd64` ELF however
 capable the host is, and the guest-Rosetta probe is short-circuited to that answer before it ever
@@ -219,7 +218,7 @@ run:
   **x86_64** one is not.
 - **`k3sm.io/rosetta-linux` (guest, linux/amd64)** — the VM host needs to attach a Rosetta directory
   share to the guests it builds. The guest path that would carry it — `runtimeClassName: vm`,
-  `linux/arm64` — is already built and validated; the share is the one piece not yet wired.
+  `linux/arm64` — is already built and works; the share is the one piece not yet wired.
 
 So today `k3sm.io/rosetta` answers "**could** this host translate?", not "will k3sm run my amd64
 workload here?" — and `k3sm.io/rosetta-linux` does not answer at all, because it is never set. Until

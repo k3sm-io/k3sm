@@ -6,7 +6,7 @@ k3sm runs OCI images two ways, and you pick per Pod:
   no VM, no kernel to boot, and access to Metal, CoreML, `codesign` and Xcode.
 - **`linux/arm64` images run in a Linux micro-VM.** One line in the Pod spec —
   `runtimeClassName: vm` — and an ordinary Linux image runs, unmodified. Any multi-arch image with
-  an `arm64` variant qualifies, which is most published images. Validated single-node.
+  an `arm64` variant qualifies, which is most published images, on a single node.
 
 Either way the workflow is the one you already know: build, tag, push, pull, digests,
 `imagePullPolicy`, `imagePullSecrets`. `k3sm build` builds both kinds.
@@ -69,8 +69,7 @@ The `nodeSelector` and `tolerations` stanza is on every k3sm Pod, `vm` or not �
 `k3sm.io/provider:NoSchedule` taint. The `vm`-specific part is the one `runtimeClassName` line.
 
 `kubectl logs`, `exec -it` with a real terminal, `attach`, probes, PersistentVolumeClaims, cluster
-DNS and ClusterIP Services all work there; [`vm` RuntimeClass](vm-runtimeclass.md) is the full page,
-measured on real hardware.
+DNS and ClusterIP Services all work there; [`vm` RuntimeClass](vm-runtimeclass.md) is the full page.
 
 Two facts to plan around. Each Pod gets its own VM, so it costs a boot and a VM's memory where a
 native process costs neither — the native path stays the fast one for anything you can compile for

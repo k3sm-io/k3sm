@@ -11,25 +11,24 @@ launchd, APFS) instead of Linux's (cgroups, namespaces, iptables, systemd, Overl
 per-pod micro-VM — see Shipped, below.
 
 This is a k3s-style three-horizon roadmap. Where a capability is implemented but not yet
-validated on real hardware, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
+run live, this page says so. The trade-offs page is [**docs/user/limitations.md**](docs/user/limitations.md), which ships with
 the docs today.
 
 ## Shipped
 
 The engine. Everything listed below is implemented and workspace-integration-green
-(`hack/ci.sh`). **The single-node path — the Virtual Kubelet node, the embedded control plane, and
-pod isolation/resource fidelity — is validated end to end on Apple-Silicon hardware.** The isolation
+(`hack/ci.sh`). **The single-node path is complete: the Virtual Kubelet node, the embedded control plane, and
+pod isolation/resource fidelity.** The isolation
 gate is the strongest evidence so far: run against a real root install on macOS 26.5, all **13
 required conformance criteria passed**, together with the full install/uninstall lifecycle checks.
-That is the first live-hardware validation of the packaged single-node path. The remaining
-live-hardware and two-Mac gates are burned down as part of release engineering. What works:
+The remaining two-Mac gates are burned down as part of release engineering. What ships:
 
 - **Native Darwin-process pods, zero Linux on the default path.** OCI images ship an arm64
   Mach-O payload (never `/System`); the runtime `posix_spawn`s them **in place at host paths** —
-  no chroot, SIP-compatible. *(validated on macOS 26.5.1)* Linux images run too, opt-in, under the
+  no chroot, SIP-compatible. *(on macOS 26.5.1)* Linux images run too, opt-in, under the
   `vm` RuntimeClass below.
 - **Seatbelt isolation.** A generated **default-deny SBPL profile** per pod (read `/System`+the pod
-  dir, write only the pod's APFS data volume, network scoped to the pod IP). *(validated)*
+  dir, write only the pod's APFS data volume, network scoped to the pod IP).
 - **One `k3sm server`.** A single binary embeds the upstream apiserver / scheduler /
   controller-manager (built from source for darwin/arm64) over **kine → SQLite**, plus the Virtual
   Kubelet Darwin node, a userspace Service proxy, and DNS.
@@ -46,7 +45,7 @@ live-hardware and two-Mac gates are burned down as part of release engineering. 
 - **`vm` RuntimeClass.** A fail-closed dispatch to a
   Virtualization.framework Linux micro-VM for `linux/arm64` images (e.g. Postgres): the RuntimeClass,
   the fail-closed backend selection, the capability labels, the scheduler overhead accounting, and
-  PVC-backed storage. Validated end to end on the reference hardware (see
+  PVC-backed storage. Covered (see
   [docs/user/limitations.md](docs/user/limitations.md)): boot and restart, `kubectl logs`/`exec` with
   exit-code propagation, PersistentVolumeClaims that survive a hard hypervisor kill, in-guest cluster
   DNS, per-container CPU and memory, and a Service routing to a `vm` pod through its ClusterIP.
@@ -56,8 +55,8 @@ live-hardware and two-Mac gates are burned down as part of release engineering. 
   engine inside a `vm`-RuntimeClass micro-VM with a PVC-backed cache; `k3sm build` auto-routes any
   Dockerfile with `RUN` (or another engine-only verb) through it while a COPY-only Dockerfile keeps
   the native fast path, and `k3sm builder buildx` exposes the bundled, pinned buildx directly —
-  install only k3sm, build and run containers with no Docker Desktop. Validated live end to end,
-  2026-09-02/03: a RUN build → OCI export → `k3sm image push` → a Pod running the result.
+  install only k3sm, build and run containers with no Docker Desktop. The full loop is a RUN build → OCI export →
+  `k3sm image push` → a Pod running the result.
   `linux/arm64` only — `linux/amd64` under guest Rosetta is not wired (see Future, below). The
   buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
   k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
@@ -67,7 +66,7 @@ live-hardware and two-Mac gates are burned down as part of release engineering. 
 - **Conformance hardening.** As close to standard k8s as the Darwin substrate honestly
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
-  logging, node lifecycle Events. Validated by k3sm's own synthetic-conformance criteria — **not** a
+  logging, node lifecycle Events. Checked against k3sm's own synthetic-conformance criteria — **not** a
   CNCF `[Conformance]` pass (the default path, which the suite targets, runs no Linux containers).
   The self-assessment —
   targeted feature classes mapped to a green criterion or a documented ceiling — is
@@ -76,8 +75,8 @@ live-hardware and two-Mac gates are burned down as part of release engineering. 
   and serve ML models on Apple GPUs / unified memory with first-class Kubernetes semantics: an
   **`MLXModel` CRD** (`mlx.k3sm.io/v1alpha1`), an `mlx.k3sm.io/gpu` **extended resource**, and an
   in-binary operator that reconciles a model to a StatefulSet + Service serving an
-  OpenAI-compatible API. *(validated end to end on Apple-GPU hardware — the
-  `hack/acceptance/m8.sh` gate: 22/22 checks green, including a real Hugging Face weight
+  OpenAI-compatible API. *(the `hack/acceptance/m8.sh` gate: 22/22 checks green on an
+  Apple GPU, including a real Hugging Face weight
   download under a default-deny Seatbelt profile and a GC-clean deletion)*
 
 ## v0.1.0 — the public release (shipped 2026-09-01)
@@ -91,7 +90,7 @@ live-hardware and two-Mac gates are burned down as part of release engineering. 
   tarballs and OCI layouts (the `docker buildx -o type=oci` output) into k3sm's image store, and
   `k3sm build` packages native darwin/arm64 binaries from a COPY-only Dockerfile subset
   (`RUN` arrives with the vm-backed builder — see Shipped, above).
-- **Run your Linux images (validated on hardware).** Standard **linux/arm64 images**
+- **Run your Linux images.** Standard **linux/arm64 images**
   run as `vm`-RuntimeClass pods — one lightweight micro-VM per pod — with `kubectl exec/logs/top`,
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers, unmodified images with a three-line manifest
@@ -99,10 +98,10 @@ live-hardware and two-Mac gates are burned down as part of release engineering. 
   *(the live lab run against the released artifact is green — see Shipped, above;
   published performance figures and the remaining ceilings are the v0.2 milestone below)*
 - **linux/amd64 images are not supported on any path yet.** Running them needs Rosetta-for-Linux
-  translation inside the guest, deliberately cut from the first release so the arm64 path could be
-  validated on hardware on its own. There is no emulation fallback — no qemu exists for a Darwin
-  host — so an amd64-only image is refused at pull with a no-matching-platform error rather than
-  started and left to crash, and a node that cannot translate does not advertise that it can.
+  translation inside the guest, deliberately cut from the first release so the arm64 path could
+  ship on its own. There is no emulation fallback — no qemu exists for a Darwin host — so an
+  amd64-only image is refused at pull with a no-matching-platform error rather than started and
+  left to crash, and a node that cannot translate does not advertise that it can.
   *(scheduled for a v0.1.x follow-up)*
 
 v0.1.1 followed on 2026-09-02 — see [CHANGELOG.md](CHANGELOG.md) for what it adds.
@@ -121,7 +120,7 @@ v0.1.1 followed on 2026-09-02 — see [CHANGELOG.md](CHANGELOG.md) for what it a
   (`ErrImagePull`/`ImagePullBackOff` alternation, `ErrImageNeverPull`), Rosetta-consuming
   multi-arch selection, and a warm-cache offline start under `imagePullPolicy: IfNotPresent` /
   `Never` are still open.
-- **De-EXPERIMENTAL HA** — the v0.3 headline, once lab-validated (two Macs + Postgres).
+- **De-EXPERIMENTAL HA** — the v0.3 headline, once tested in the lab (two Macs + Postgres).
 - **ANE** — Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA** — Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **JACCL / distributed inference** — multi-Mac model sharding (the reserved `MLXModel.Distributed`
