@@ -74,6 +74,34 @@ func TestInstallEnsuresRunDir(t *testing.T) {
 	}
 }
 
+// TestReinstallRelinksIdempotently proves a SECOND install over the first asks
+// for the same launcher link and succeeds. The installer asks unconditionally —
+// it does not read the link and decide — because an upgrade that changed the
+// install prefix must re-point the launcher, and "already correct" is the real
+// implementation's no-op, not a case the orchestration has to know about.
+func TestReinstallRelinksIdempotently(t *testing.T) {
+	f := &fakeSystem{}
+	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	for i := 1; i <= 2; i++ {
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install %d: %v", i, err)
+		}
+	}
+	want := "EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm"
+	n := 0
+	for _, c := range f.calls {
+		if c == want {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("recorded %d %q calls across two installs, want 2 (the same link, asked for again)", n, want)
+	}
+	if got := f.links["/usr/local/bin/k3sm"]; got != "/Library/k3sm/k3sm" {
+		t.Errorf("link target after reinstall = %q, want %q", got, "/Library/k3sm/k3sm")
+	}
+}
+
 // TestRunDirDerivation pins RunDir against the constants the installer's other
 // run-dir paths are composed from. The cross-package half of this invariant —
 // that RunDir is the DIRECTORY provider.RuntimedSocketPath binds inside — is

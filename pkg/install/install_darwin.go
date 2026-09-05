@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -198,6 +199,179 @@ func (darwinSystem) CopyToRootOwned(src, dst string) error {
 		return fmt.Errorf("installed binary %s is not executable (launchd would invalidate the daemons): %w", dst, err)
 	}
 	return nil
+}
+
+// linkDirMaxMode is the permission bits a link directory may NOT carry: group or
+// other write. A directory anyone in the `admin` group (or any local user) can
+// write is a directory in which the launcher can be swapped for something else,
+// and the launcher is what a human types.
+const linkDirMaxMode = 0o022
+
+// checkLinkDirTrust reports whether dir is a directory k3sm is willing to write a
+// launcher symlink into: a REAL directory (not a symlink to one), not group- or
+// other-writable, and — when we are actually running as root, which is the only
+// posture in which the answer is meaningful — owned by uid 0.
+//
+// This is the one deliberate exception to the privilege model's "the binary and
+// plist live in /Library/k3sm, never a Homebrew, /usr/local or /Applications
+// prefix an `admin`-group member could overwrite" rule (docs/privilege-model.md
+// §Root-owned everything). The exception is narrow and is trusted ONLY because
+// this check holds: nothing executable is placed in /usr/local/bin, only a
+// symlink back into the root-owned tree, and the link is refused outright unless
+// the directory holding it is itself root-owned and unwritable by anyone else —
+// i.e. unless /usr/local/bin has the same trust properties /Library does. On a
+// host where Homebrew has taken /usr/local/bin for the admin group, install
+// refuses to link rather than quietly creating a hijackable entry point.
+//
+// The uid-0 half is conditional on os.Geteuid()==0 on purpose: an unprivileged
+// caller (the unit table, a dry run) cannot chown anything anyway, and demanding
+// root ownership of a temp dir it just made would make the function untestable
+// without proving anything about the production path.
+func checkLinkDirTrust(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	reason := ""
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		reason = "is a symlink"
+	case !fi.IsDir():
+		reason = "not a directory"
+	case fi.Mode().Perm()&linkDirMaxMode != 0:
+		reason = fmt.Sprintf("group/other writable (mode %04o)", fi.Mode().Perm())
+	case os.Geteuid() == 0:
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			reason = "cannot read its ownership"
+		} else if st.Uid != 0 {
+			reason = fmt.Sprintf("owned by uid %d, not root", st.Uid)
+		}
+	}
+	if reason == "" {
+		return nil
+	}
+	return fmt.Errorf("refusing to link into %s: %s — k3sm only installs a launcher into a root-owned, non-world-writable directory", dir, reason)
+}
+
+// EnsureSymlink lays down (or repairs) the `k3sm` launcher symlink at link,
+// pointing at target. See the System interface for the contract; this is where
+// its two refusals get their concrete causes.
+//
+// Order matters: the directory-trust check runs FIRST, before any write, so an
+// untrusted link directory is never even touched. Only then is a missing parent
+// created (root:wheel 0755 when we are root), and only then is the link itself
+// considered.
+//
+// Replacement is symlink-then-rename rather than remove-then-symlink: rename(2)
+// is atomic on the same filesystem, so `k3sm` never transiently disappears from
+// PATH while an upgrade re-points it. The residual window is the same one
+// EnsureRunDir documents for its own check-then-act: link is re-Lstat'd
+// immediately before the rename and the rename is refused if the kind changed,
+// but a racing writer could still slip between that read and the syscall. With a
+// root-owned, non-group/other-writable parent — which the trust check has just
+// asserted — only root can be that writer, and root is who we already are.
+func (darwinSystem) EnsureSymlink(target, link string) error {
+	parent := filepath.Dir(link)
+	// Trust the directory that will hold the link. When the parent does not exist
+	// yet we must trust its GRANDPARENT instead, because that is the directory
+	// whose permissions decide who could have created the parent before us.
+	trustDir := parent
+	parentAbsent := false
+	if _, err := os.Lstat(parent); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("stat link dir %s: %w", parent, err)
+		}
+		parentAbsent = true
+		trustDir = filepath.Dir(parent)
+	}
+	if err := checkLinkDirTrust(trustDir); err != nil {
+		return err
+	}
+	if parentAbsent {
+		if err := os.Mkdir(parent, 0o755); err != nil {
+			return fmt.Errorf("create link dir %s: %w", parent, err)
+		}
+		if os.Geteuid() == 0 {
+			if err := os.Chown(parent, 0, 0); err != nil {
+				return fmt.Errorf("chown link dir %s root:wheel: %w", parent, err)
+			}
+		}
+	}
+
+	fi, err := os.Lstat(link)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.Symlink(target, link); err != nil {
+			return fmt.Errorf("symlink %s -> %s: %w", link, target, err)
+		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("stat %s: %w", link, err)
+	case fi.Mode()&fs.ModeSymlink == 0:
+		// A regular file or a directory at link belongs to somebody else. k3sm
+		// installs a launcher; it does not evict one.
+		return fmt.Errorf("refusing to replace non-symlink %s; move it aside and re-run", link)
+	}
+	if got, err := os.Readlink(link); err == nil && got == target {
+		return nil // already correct
+	}
+
+	// Stale (points elsewhere) or dangling: replace atomically.
+	tmp := fmt.Sprintf("%s.k3sm-tmp-%d", link, os.Getpid())
+	_ = os.Remove(tmp) // a temp left by an interrupted earlier run
+	if err := os.Symlink(target, tmp); err != nil {
+		return fmt.Errorf("symlink %s -> %s: %w", tmp, target, err)
+	}
+	again, err := os.Lstat(link)
+	if err != nil || again.Mode()&fs.ModeSymlink == 0 {
+		_ = os.Remove(tmp)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", link, err)
+		}
+		return fmt.Errorf("refusing to replace non-symlink %s; move it aside and re-run", link)
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s -> %s: %w", tmp, link, err)
+	}
+	return nil
+}
+
+// RemoveSymlink removes link only when it is a symlink still pointing at target.
+// See the System interface for the contract: everything else is (false, nil) —
+// "not ours", which is the whole point of the function, because link lives
+// outside the trees uninstall may delete by path.
+//
+// The residual window is the check-then-unlink one EnsureSymlink documents above:
+// link is read, judged, and then unlinked, and a racing writer could re-point it
+// in between. The same containment applies — the parent is root-owned and not
+// group/other-writable, so only root can race it.
+func (darwinSystem) RemoveSymlink(link, target string) (bool, error) {
+	if !filepath.IsAbs(link) {
+		return false, fmt.Errorf("refusing to remove non-absolute link path %q", link)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat %s: %w", link, err)
+	}
+	if fi.Mode()&fs.ModeSymlink == 0 {
+		return false, nil // a real file or directory — never k3sm's
+	}
+	got, err := os.Readlink(link)
+	if err != nil {
+		return false, fmt.Errorf("readlink %s: %w", link, err)
+	}
+	if got != target {
+		return false, nil // re-pointed by someone else — leave it
+	}
+	if err := os.Remove(link); err != nil {
+		return false, fmt.Errorf("remove %s: %w", link, err)
+	}
+	return true, nil
 }
 
 // VerifyVirtualizationEntitlement reads the code-signing entitlements off the
