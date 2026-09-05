@@ -45,7 +45,7 @@ k3sm kubeconfig > ~/k3sm.yaml                  # print it
 k3sm kubeconfig --write --path ~/other.yaml    # merge it into another kubeconfig
 ```
 
-Note that apart from choosing those credentials, `k3sm kubectl` is a **pure passthrough** to the
+Apart from choosing those credentials, `k3sm kubectl` is a **pure passthrough** to the
 bundled `kubectl` — every subcommand under it is the upstream one, and none of them knows anything
 about k3sm's own layout. `k3sm kubeconfig` is the k3sm-specific verb, and it finds the cluster the
 same two ways `k3sm kubectl` does.

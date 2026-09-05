@@ -15,8 +15,8 @@ Virtualization.framework. The note below is the supported scope.
 > picture, including what is still not wired.
 >
 > It ships **`linux/arm64` only** (`linux/amd64` needs in-guest translation
-> and is held for a later release); its live lab run is green against the release
-> artifact. This path is single-node.
+> and is held for a later release); it passes against the release
+> build. This path is single-node.
 
 ## When to Use It
 
