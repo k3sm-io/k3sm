@@ -16,8 +16,8 @@ the docs today.
 
 ## Shipped
 
-The engine. Everything listed below is implemented and workspace-integration-green
-(`hack/ci.sh`). **The single-node path is complete: the Virtual Kubelet node, the embedded control plane, and
+The engine. Everything listed below is implemented and passes k3sm's own test suite.
+**The single-node path is complete: the Virtual Kubelet node, the embedded control plane, and
 pod isolation/resource fidelity.** The isolation
 gate is the strongest evidence so far: run against a real root install on macOS 26.5, all **13
 required conformance criteria passed**, together with the full install/uninstall lifecycle checks.
@@ -63,7 +63,7 @@ The remaining two-Mac gates are burned down as part of release engineering. What
   the remaining packaging work.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
-- **Conformance hardening.** As close to standard k8s as the Darwin substrate honestly
+- **Conformance hardening.** As close to standard k8s as the Darwin substrate
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
   logging, node lifecycle Events. Checked against k3sm's own synthetic-conformance criteria — **not** a
@@ -75,9 +75,9 @@ The remaining two-Mac gates are burned down as part of release engineering. What
   and serve ML models on Apple GPUs / unified memory with first-class Kubernetes semantics: an
   **`MLXModel` CRD** (`mlx.k3sm.io/v1alpha1`), an `mlx.k3sm.io/gpu` **extended resource**, and an
   in-binary operator that reconciles a model to a StatefulSet + Service serving an
-  OpenAI-compatible API. *(the `hack/acceptance/m8.sh` gate: 22/22 checks green on an
-  Apple GPU, including a real Hugging Face weight
-  download under a default-deny Seatbelt profile and a GC-clean deletion)*
+  OpenAI-compatible API. *(22 of 22 checks pass on an
+  Apple GPU, including a Hugging Face weight
+  download under a default-deny Seatbelt profile and a clean deletion)*
 
 ## v0.1.0 — the public release (shipped 2026-09-01)
 
@@ -95,8 +95,8 @@ The remaining two-Mac gates are burned down as part of release engineering. What
   PVC-backed persistence, Service/DNS reachability, readiness probes, and private-registry
   pulls. A whole multi-part app's containers, unmodified images with a three-line manifest
   adaptation (`kubernetes.io/os: darwin` + `runtimeClassName: vm`).
-  *(the live lab run against the released artifact is green — see Shipped, above;
-  published performance figures and the remaining ceilings are the v0.2 milestone below)*
+  *(it was run and passed against the released build — see Shipped, above;
+  published performance figures and the remaining gaps ship in v0.2, below)*
 - **linux/amd64 images are not supported on any path yet.** Running them needs Rosetta-for-Linux
   translation inside the guest, deliberately cut from the first release so the arm64 path could
   ship on its own. There is no emulation fallback — no qemu exists for a Darwin host — so an

@@ -25,7 +25,7 @@ same device.
 ## 2. Apply a Model
 
 [`examples/mlxmodel.yaml`](../../examples/mlxmodel.yaml) serves a small pinned model and is the fastest
-way to see the path work end to end:
+way to see the path work:
 
 ```sh
 kubectl apply -f examples/mlxmodel.yaml

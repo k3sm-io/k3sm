@@ -30,8 +30,7 @@ file you can skip: the dev server already serves a Web UI.
 **One image per Pod.** Every container in a `vm` Pod shares one root filesystem, so a Pod naming two
 images runs the second container's command against the first container's image. Temporal's production
 shape — server, datastore and UI as separate images — must therefore be separate Pods here. The dev
-server collapses the service into a single image, which is why the one-Pod form is both the simplest
-and the honest one.
+server collapses the service into a single image, which is why the one-Pod form is the simplest one.
 
 ## 1. Check the Node Can Run a Micro-VM
 

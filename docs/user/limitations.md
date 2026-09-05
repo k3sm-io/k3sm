@@ -179,7 +179,7 @@ is unset (the API's "default implementation" case) and ignores a Service that na
 entirely — it neither binds its ports nor writes its status. k3sm publishes no class of its own, so
 there is no value to opt into. `spec.allocateLoadBalancerNodePorts` needs nothing from k3sm: the
 apiserver owns allocation, and k3sm's listeners key off whether a nodePort was assigned.
-Note that setting it to `false` does not deallocate an already-assigned nodePort — that is upstream
+Setting it to `false` does not deallocate an already-assigned nodePort — that is upstream
 behaviour, not a k3sm limitation. A Service's nodePort stays reachable regardless of its class, which
 is also upstream behaviour.
 
@@ -305,8 +305,8 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 
 ### `vm` RuntimeClass, Multi-Node, and HA Status
 
-- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod
-  end to end — create-to-Running restarts measure a 165 ms median (the figures
+- The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod —
+  create-to-Running restarts measure a 165 ms median (the figures
   below), and one idle Pod with a 512 MiB guest costs about **46 MB of host memory**,
   because the hypervisor allocates guest RAM lazily rather than reserving it. The guest kernel and
   initramfs are digest-pinned and verified on every node start. What is measured is single-node,
@@ -314,7 +314,7 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
   `vm` Pod shares one root filesystem, so a Pod naming two different images runs the second
   container's command against the first container's image. It ships
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
-  release); its live lab run is green against the release artifact. See
+  release); it passes against the release build. See
   [`vm` RuntimeClass](vm-runtimeclass.md).
 - **Multi-node and HA** ship as documented **EXPERIMENTAL** and are not launch-blocking; their
   de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md) and
@@ -355,7 +355,7 @@ There is no in-guest process supervisor on this path: a `vm` Pod's container **i
 `restartPolicy` acting on it means tearing the micro-VM down and creating a new one, not restarting a
 process inside a surviving one. That recreate is fast — cold boot
 (VM create to first console output) came in at a median of **165 ms** (p95 171 ms, N=20), and kernel
-start to init exec at a median of **50 ms**. Say it plainly for planning purposes: on this path,
+start to init exec at a median of **50 ms**, on an M1 Ultra Mac Studio. On this path,
 **container restart is pod recreate**, and it is cheap enough that a `CrashLoopBackOff` cycle behaves
 the same way it would on the native path.
 
