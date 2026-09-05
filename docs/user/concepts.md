@@ -28,8 +28,8 @@ processes rather than a container runtime.
 
 All Pods on a node run as the **same unprivileged `_k3sm` user**. There is **no per-pod uid isolation**;
 same-node Pods share one OS trust domain. For untrusted or multi-tenant workloads the **`vm`
-RuntimeClass** is the intended isolation boundary — it boots a Pod into its own micro-VM,
-validated on real hardware. See [`vm` RuntimeClass](vm-runtimeclass.md). The rationale lives in
+RuntimeClass** is the intended isolation boundary — it boots a Pod into its own micro-VM.
+See [`vm` RuntimeClass](vm-runtimeclass.md). The rationale lives in
 [the privilege model](../privilege-model.md). This is the same framing you will see in
 [Limitations](limitations.md).
 

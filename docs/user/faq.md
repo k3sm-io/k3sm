@@ -17,7 +17,7 @@ untrusted workloads — see [Limitations](limitations.md).
 
 No, on the default path — those carry a Linux userland, and a k3sm Pod there is a Darwin process.
 An unmodified `linux/arm64` image (or a multi-arch image that includes it) runs instead under the
-[`vm` RuntimeClass](vm-runtimeclass.md), validated on real hardware, single-node. Outside that path
+[`vm` RuntimeClass](vm-runtimeclass.md), single-node. Outside that path
 a Linux image is refused at pull, naming the platforms it offers and the one this node needs;
 `linux/amd64` is refused on both paths today.
 
@@ -42,8 +42,7 @@ On the default runtime, yes — cluster Service names, headless Services, Statef
 SRV and PTR all resolve from inside a Pod. Two caveats: the resolver is k3sm's own, not CoreDNS
 (IPv4/A only, no AAAA), and the `getaddrinfo` shim that redirects a Pod's lookups **cannot load into
 a SIP platform binary** such as `/bin/sh`, so shell-script lookups fall back to the host resolver.
-In-pod cluster DNS is **not** wired on `--runtime hostprocess`; on the `vm` RuntimeClass it works,
-validated on real hardware. See
+In-pod cluster DNS is **not** wired on `--runtime hostprocess`; on the `vm` RuntimeClass it works. See
 [Limitations](limitations.md#dns--what-resolves-and-on-which-runtime-path).
 
 ## Do UDP Services Work?

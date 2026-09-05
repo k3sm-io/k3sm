@@ -134,8 +134,8 @@ Today at `main`, per port class:
     freed (inherited behaviour, not introduced here) — the same leak the old shared wildcard had.
 
   Pods using the `vm` RuntimeClass have their own network stack behind VZNAT, unaffected by all of the
-  above — see [`vm` RuntimeClass](vm-runtimeclass.md). What a guest can reach was measured on the
-  reference hardware rather than assumed:
+  above — see [`vm` RuntimeClass](vm-runtimeclass.md). What a guest can reach was measured rather than
+  assumed:
 
   | from a `vm` Pod's guest to | result |
   |---|---|
@@ -257,7 +257,7 @@ configuration — every lookup from inside a Pod goes to the host resolver.
 **On the `vm` RuntimeClass, in-pod cluster DNS works.** The guest brings up its interface, leases an
 address on the node's NAT segment, and installs a default route; `/etc/resolv.conf` is written by the
 guest with the cluster resolver and search list, and lookups reach the cluster DNS VIP. Resolving a
-service FQDN and connecting to the returned ClusterIP are both exercised on the reference hardware.
+service FQDN and connecting to the returned ClusterIP both work.
 
 Two caveats remain. A guest's musl resolver may ignore `options ndots`, so prefer a **fully qualified**
 service name (`svc.ns.svc.cluster.local`) from inside a `vm` Pod rather than relying on the search
@@ -306,8 +306,8 @@ process that exits stays exited until a `Deployment`/`Job` controller replaces t
 ### `vm` RuntimeClass, Multi-Node, and HA Status
 
 - The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod
-  end to end — create-to-Running restarts measure a 165 ms median on the reference hardware
-  (the figures below), and one idle Pod with a 512 MiB guest costs about **46 MB of host memory**,
+  end to end — create-to-Running restarts measure a 165 ms median (the figures
+  below), and one idle Pod with a 512 MiB guest costs about **46 MB of host memory**,
   because the hypervisor allocates guest RAM lazily rather than reserving it. The guest kernel and
   initramfs are digest-pinned and verified on every node start. What is measured is single-node,
   and a multi-image Pod is not supported — every container in a
@@ -353,7 +353,7 @@ the guest, or keep that workload on the native path where the same restriction a
 
 There is no in-guest process supervisor on this path: a `vm` Pod's container **is** the guest, so
 `restartPolicy` acting on it means tearing the micro-VM down and creating a new one, not restarting a
-process inside a surviving one. Measured on the reference hardware, that recreate is fast — cold boot
+process inside a surviving one. That recreate is fast — cold boot
 (VM create to first console output) came in at a median of **165 ms** (p95 171 ms, N=20), and kernel
 start to init exec at a median of **50 ms**. Say it plainly for planning purposes: on this path,
 **container restart is pod recreate**, and it is cheap enough that a `CrashLoopBackOff` cycle behaves
@@ -421,7 +421,7 @@ tested rig and both a property of the shared-filesystem transport, not of PVC st
 
 A `vm` Pod **consumes and serves** ClusterIP Services on its own node like any other pod — delivery
 from the guest to a Service VIP is native on this path, and the proxy routes a Service to a `vm`
-Pod backend the same way, measured on the reference hardware.
+Pod backend the same way.
 
 **Dialing a `vm` Pod's pod IP directly does not work.** The pod IP a `vm` Pod reports is its published
 identity, not a live address a peer can connect to — so anything that depends on a direct pod-IP dial,
@@ -522,7 +522,7 @@ kubectl label node <node> k3sm.io/rosetta- k3sm.io/rosetta-linux-
 sudo launchctl kickstart -k system/io.k3sm.server
 ```
 
-The label removal on restart is itself only validated against the node object k3sm *constructs*; whether a
+The label removal on restart is only tested against the node object k3sm *constructs*; whether a
 label **deletion** propagates through Virtual Kubelet's node reconcile to the datastore in every case is
 not yet verified in a lab. `k3sm.io/virtualization` has always had the same property. Treat the manual
 `kubectl label ... -` above as the reliable way to withdraw a capability claim.
