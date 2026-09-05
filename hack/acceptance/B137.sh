@@ -432,6 +432,49 @@ else
 	ladder no "b137.T16 hostile resolved tag: refused before any fetch, nothing executed (rc=$CASE_RC)"
 fi
 
+# T17/T18 — the CLOSING HINT, which no other case asserts on. The old script
+# ended with an unconditional "try: k3sm kubectl get nodes" that could not work:
+# nothing had put k3sm on PATH. Both branches are pinned hermetically by
+# restricting PATH so the resolution has one answer.
+#
+# PATH is "$STUBS:/usr/bin:/bin" — env applies assignments in order, so the
+# per-case PATH below overrides run_case's own. The stubs supply sudo, uname,
+# sw_vers and sysctl (sysctl lives in /usr/sbin, which is excluded); /usr/bin
+# and /bin supply the rest of the script's bare-name commands (curl, awk, tr,
+# shasum, tar, mktemp, rm, cp). Neither directory holds a k3sm, so T17's
+# `command -v k3sm` cannot find one however the host is set up.
+HINT_PATH="$STUBS:/usr/bin:/bin"
+
+# T17 — no k3sm on PATH: the hint names the launcher and the PATH remedy.
+run_case t17 PATH="$HINT_PATH" \
+	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
+if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
+	&& has 'installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher' \
+	&& ! has 'installed — try:'; then
+	ladder ok "b137.T17 k3sm NOT on PATH: closing hint names the launcher + the PATH remedy"
+else
+	ladder no "b137.T17 k3sm NOT on PATH: closing hint names the launcher + the PATH remedy (rc=$CASE_RC)"
+fi
+
+# T18 — k3sm resolvable on PATH (the post-install steady state the symlink
+# creates): the hint is the runnable one.
+HINT_STUBS="$WORK/stubs-t18"
+mkdir -p "$HINT_STUBS"
+cat >"$HINT_STUBS/k3sm" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$HINT_STUBS/k3sm"
+run_case t18 PATH="$STUBS:$HINT_STUBS:/usr/bin:/bin" \
+	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
+if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
+	&& has 'installed — try: k3sm kubectl get nodes' \
+	&& ! has 'is the launcher'; then
+	ladder ok "b137.T18 k3sm ON PATH: closing hint is the runnable one"
+else
+	ladder no "b137.T18 k3sm ON PATH: closing hint is the runnable one (rc=$CASE_RC)"
+fi
+
 echo "----------------------------------------"
 echo "B137: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
