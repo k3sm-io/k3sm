@@ -41,6 +41,28 @@ echo $PATH                    # should contain /usr/local/bin
   sudo k3sm install
   ```
 
+## `kubeconfig … not found` From `k3sm kubectl`
+
+`k3sm kubectl` and `k3sm kubeconfig` say this when they were pointed at a specific server work
+directory that holds no admin kubeconfig, or when they found no credentials at all. Which one it is
+depends on how you ran them:
+
+- **`K3SM_WORK_DIR` is set.** That names one server and is never second-guessed, so if the directory
+  holds no kubeconfig the command stops there. Point it at the right work directory, or unset it.
+- **Nothing was found anywhere.** The message names both places it looked. If you are root or the
+  `_k3sm` service user, that means the control plane has not written its kubeconfig — check the
+  server is actually up (see below) and read its log.
+- **Your own kubeconfig has no `k3sm` context.** For an ordinary account that context is the way in —
+  the installed server's work directory belongs to the service user and is not readable by you:
+
+  ```sh
+  kubectl config get-contexts    # is there a k3sm context?
+  sudo k3sm install              # idempotent; re-merges it into ~/.kube/config
+  k3sm kubeconfig --write        # with the context in place, refreshes it (--path writes elsewhere)
+  ```
+
+See [kubectl access](kubectl-access.md) for the full resolution order.
+
 ## Control Plane Startup Failure
 
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).
