@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"strings"
 	"testing"
 
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -139,5 +140,94 @@ func TestIsLoopbackServer(t *testing.T) {
 		if got := isLoopbackServer(s); got != want {
 			t.Errorf("isLoopbackServer(%q) = %v, want %v", s, got, want)
 		}
+	}
+}
+
+func TestExtractContext(t *testing.T) {
+	// A user's own kubeconfig: the merged k3sm entries plus an unrelated cluster.
+	userCfg := func() *clientcmdapi.Config {
+		c := clientcmdapi.NewConfig()
+		c.Clusters["k3sm"] = &clientcmdapi.Cluster{Server: "https://127.0.0.1:6444", InsecureSkipTLSVerify: true}
+		c.AuthInfos["k3sm"] = &clientcmdapi.AuthInfo{Token: "k3sm-deadbeef"}
+		c.Contexts["k3sm"] = &clientcmdapi.Context{Cluster: "k3sm", AuthInfo: "k3sm"}
+		c.Clusters["prod"] = &clientcmdapi.Cluster{Server: "https://prod:6443"}
+		c.AuthInfos["prod"] = &clientcmdapi.AuthInfo{Token: "p"}
+		c.Contexts["prod"] = &clientcmdapi.Context{Cluster: "prod", AuthInfo: "prod"}
+		c.CurrentContext = "prod"
+		return c
+	}
+
+	t.Run("takes only the named context and what it references", func(t *testing.T) {
+		got, err := extractContext(userCfg(), "k3sm")
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		if got.CurrentContext != "k3sm" {
+			t.Errorf("current-context = %q, want %q", got.CurrentContext, "k3sm")
+		}
+		if len(got.Contexts) != 1 || len(got.Clusters) != 1 || len(got.AuthInfos) != 1 {
+			t.Fatalf("extracted %d contexts / %d clusters / %d users, want 1 of each",
+				len(got.Contexts), len(got.Clusters), len(got.AuthInfos))
+		}
+		if cl := got.Clusters["k3sm"]; cl == nil || cl.Server != "https://127.0.0.1:6444" {
+			t.Errorf("cluster = %+v, want the k3sm loopback server", cl)
+		}
+		if u := got.AuthInfos["k3sm"]; u == nil || u.Token != "k3sm-deadbeef" {
+			t.Errorf("user = %+v, want the k3sm token", u)
+		}
+		// It must be a copy: mutating the result cannot touch the caller's config.
+		src := userCfg()
+		out, err := extractContext(src, "k3sm")
+		if err != nil {
+			t.Fatalf("extractContext: %v", err)
+		}
+		out.Clusters["k3sm"].Server = "https://elsewhere"
+		if src.Clusters["k3sm"].Server != "https://127.0.0.1:6444" {
+			t.Error("extractContext aliased the source cluster instead of copying it")
+		}
+	})
+
+	for _, tt := range []struct {
+		name    string
+		cfg     func() *clientcmdapi.Config
+		lookup  string
+		wantErr string
+	}{
+		{
+			name:    "context absent",
+			cfg:     userCfg,
+			lookup:  "k3sm-dev",
+			wantErr: `no context "k3sm-dev" in your kubeconfig`,
+		},
+		{
+			name: "cluster the context names is missing",
+			cfg: func() *clientcmdapi.Config {
+				c := userCfg()
+				delete(c.Clusters, "k3sm")
+				return c
+			},
+			lookup:  "k3sm",
+			wantErr: `names cluster "k3sm"`,
+		},
+		{
+			name: "user the context names is missing",
+			cfg: func() *clientcmdapi.Config {
+				c := userCfg()
+				delete(c.AuthInfos, "k3sm")
+				return c
+			},
+			lookup:  "k3sm",
+			wantErr: `names user "k3sm"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := extractContext(tt.cfg(), tt.lookup)
+			if err == nil {
+				t.Fatalf("extractContext = %+v, want an error containing %q", got, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
 	}
 }
