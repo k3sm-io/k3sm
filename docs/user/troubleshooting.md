@@ -15,6 +15,32 @@ Not everything lands there. The server process's own structured logs (the LoadBa
 ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
 **`/var/log/k3sm/server.log`** — the unified-log predicate above shows none of them.
 
+## `k3sm: command not found` After Install
+
+Install links `/usr/local/bin/k3sm` → `/Library/k3sm/k3sm`. If the shell cannot find it:
+
+```sh
+ls -l /usr/local/bin/k3sm     # should be a symlink into /Library/k3sm
+echo $PATH                    # should contain /usr/local/bin
+/Library/k3sm/k3sm version    # always works — the binary itself
+```
+
+- **The link is there but the shell does not see it.** A terminal opened *before* the install may
+  have cached the old lookup. Run `hash -r`, or open a new window.
+- **`/usr/local/bin` is missing from `PATH`.** It is the first entry in `/etc/paths`, so a login
+  shell normally has it; a `PATH` that is overwritten (rather than appended to) in a shell profile
+  can drop it. Add it back, or invoke `/Library/k3sm/k3sm` directly.
+- **A regular file sits at `/usr/local/bin/k3sm`.** Install refuses to replace anything that is not
+  a symlink — that file belongs to something else. Move it aside and re-run `sudo k3sm install`.
+- **Install failed with `refusing to link into /usr/local/bin`.** The directory is not root-owned,
+  or it is group/other-writable, which would let another account swap the launcher out from under
+  you. Fix it and re-run the install:
+
+  ```sh
+  sudo chown root:wheel /usr/local/bin && sudo chmod 755 /usr/local/bin
+  sudo k3sm install
+  ```
+
 ## Control Plane Startup Failure
 
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).

@@ -180,6 +180,7 @@ run_install() {
 	info "  sha256:   $ARCHIVE_SHA256"
 	info "  installs: /Library/k3sm (root-owned), the _k3sm service user,"
 	info "            LaunchDaemons io.k3sm.netd (root) + io.k3sm.server (_k3sm),"
+	info "            a k3sm symlink in /usr/local/bin (an existing non-symlink there is never replaced),"
 	info "            and an admin kubeconfig in your home directory"
 	# Under `curl … | sh` stdin is the script stream — never read from it.
 	# sudo prompts on /dev/tty; require one unless credentials are cached.
@@ -196,7 +197,12 @@ run_install() {
 		printf '[k3sm-install]   Logs: /var/log/k3sm/ — diagnostics: k3sm doctor\n' >&2
 		exit 1
 	fi
-	info "installed — try: k3sm kubectl get nodes"
+	if command -v k3sm >/dev/null 2>&1; then
+		info "installed — try: k3sm kubectl get nodes"
+	else
+		info "installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher —"
+		info "  open a new terminal, or add /usr/local/bin to PATH, then: k3sm kubectl get nodes"
+	fi
 }
 
 main() {

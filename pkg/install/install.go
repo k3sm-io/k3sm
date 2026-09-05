@@ -67,6 +67,21 @@ const (
 	// DefaultInstallDir is the root-owned (root:wheel 0755) directory the binary
 	// and supporting files are copied into.
 	DefaultInstallDir = "/Library/k3sm"
+	// DefaultLinkDir is the directory the installer lays the `k3sm` launcher
+	// SYMLINK into, pointing back at installedBinary(). It exists because
+	// nothing about copying the binary into DefaultInstallDir puts `k3sm` on a
+	// shell's PATH, and every post-install instruction k3sm prints assumes it is
+	// there.
+	//
+	// /usr/local/bin is the choice because macOS ships it as the FIRST line of
+	// /etc/paths, which path_helper(8) expands into PATH for every login shell —
+	// so a link there is found by a new terminal with no profile edit, and it
+	// takes precedence over a same-named binary further down the path. It is a
+	// symlink and never a copy: the LaunchDaemons exec installedBinary()
+	// directly, so a second copy would be a second thing to keep in step, and a
+	// copy of a signed Mach-O out of its install tree is a signature/notarization
+	// hazard a symlink simply does not have.
+	DefaultLinkDir = "/usr/local/bin"
 	// PathShimName is the basename of the path-rebase DYLD shim (runtimed's
 	// shim/pathrebase_shim.c) installed beside the binary. runtimed resolves it
 	// next to the executable and injects it into a mounting pod so an absolute
@@ -158,6 +173,22 @@ type System interface {
 	// basename-derived dst bricks both daemons with launchd's unrecoverable
 	// "Missing executable" — the live M2-gate failure this contract fixes).
 	CopyToRootOwned(src, dst string) error
+	// EnsureSymlink idempotently makes link a symlink pointing at target — the
+	// `k3sm` launcher in LinkDir. It is the ONE thing install writes outside the
+	// root-owned trees it owns, so it is fail-closed on both halves of that
+	// exposure: it REFUSES a link directory that is not a real, root-owned,
+	// non-group/other-writable directory, and it REFUSES to replace anything at
+	// link that is not already a symlink (a regular file or directory there
+	// belongs to someone else). Replacing a stale or dangling symlink is
+	// atomic — a temp link renamed over it — so no window exists in which the
+	// launcher is missing. An already-correct link is a no-op success.
+	EnsureSymlink(target, link string) error
+	// RemoveSymlink removes link ONLY when it is a symlink that still points at
+	// target, and reports whether it did. Anything else — absent, a regular file,
+	// a symlink someone re-pointed — is (false, nil): not ours, never touched.
+	// That is what makes uninstall safe on a path outside k3sm's own trees; an
+	// error means the check itself could not be made.
+	RemoveSymlink(link, target string) (removed bool, err error)
 	// VerifyVirtualizationEntitlement reports whether the Mach-O at path is signed
 	// and its signature grants VirtualizationEntitlement. It is READ-ONLY — it is in
 	// this seam not because it is privileged but because it is the one environment
@@ -272,6 +303,7 @@ type System interface {
 type Config struct {
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
+	LinkDir         string // /usr/local/bin
 	LaunchDaemonDir string // /Library/LaunchDaemons
 	DataRoot        string // /var/lib/k3sm
 	NetdSocket      string // /var/lib/k3sm/run/netd.sock
@@ -350,6 +382,9 @@ func (c Config) withDefaults() Config {
 	if c.InstallDir == "" {
 		c.InstallDir = DefaultInstallDir
 	}
+	if c.LinkDir == "" {
+		c.LinkDir = DefaultLinkDir
+	}
 	if c.LaunchDaemonDir == "" {
 		c.LaunchDaemonDir = DefaultLaunchDaemonDir
 	}
@@ -410,6 +445,15 @@ func (c Config) installedBinary() string {
 	return filepath.Join(c.InstallDir, "k3sm")
 }
 
+// installedLink is the path of the `k3sm` launcher symlink, in LinkDir, pointing
+// at installedBinary(). Its BASENAME is taken from the installed binary rather
+// than re-typed, so the command a shell resolves and the file the LaunchDaemons
+// exec can never be given different names; no bare /usr/local/bin/k3sm literal
+// exists outside the tests that pin this derivation.
+func (c Config) installedLink() string {
+	return filepath.Join(c.LinkDir, filepath.Base(c.installedBinary()))
+}
+
 // installedExecShim is the path the k3sm-execshim helper is copied to — beside
 // the binary, the first place sandbox.FindExecShim probes.
 func (c Config) installedExecShim() string {
@@ -455,6 +499,9 @@ const (
 	kindServiceUser
 	// kindKubeconfig is the admin kubeconfig written into the human's ~/.kube/config.
 	kindKubeconfig
+	// kindSymlink is a symlink whose target is another manifest artifact; laid
+	// down after its target, removed only when it still points at that target.
+	kindSymlink
 )
 
 // disposition is what uninstall does with an artifact install laid down.
@@ -483,6 +530,9 @@ type artifact struct {
 	path  string // file/dir/plist path; empty for kindServiceUser/kindKubeconfig
 	label string // launchd label for kindDaemon; empty otherwise
 	user  string // user name for kindServiceUser/kindKubeconfig; empty otherwise
+	// target is what a kindSymlink entry points at — itself a manifest path, so
+	// the link and its target cannot name different files. Empty otherwise.
+	target string
 	// assertExists records whether the path is expected on disk today. It is
 	// false for the forward-declared cp-payload items (the /Library/k3sm/bin tree
 	// + relocated k3sm-netd): the packaging follow-up owns moving cp/kine off
@@ -510,6 +560,12 @@ func artifactManifest(cfg Config) []artifact {
 		// The k3sm binary copied into InstallDir — covered by the sweep, not
 		// removed individually.
 		{kind: kindFile, disp: dispInstallDirCovered, path: cfg.installedBinary(), assertExists: true},
+		// The `k3sm` launcher symlink in LinkDir pointing at that binary. It sits
+		// immediately after its target so install order lays the target down
+		// first, and so the reverse uninstall walk removes the link BEFORE the
+		// InstallDir sweep deletes what it points at (a link removed after its
+		// target would be judged against a path that no longer exists).
+		{kind: kindSymlink, disp: dispRemove, path: cfg.installedLink(), target: cfg.installedBinary(), assertExists: true},
 		// The k3sm-execshim Seatbelt helper beside it (sandbox.FindExecShim's
 		// first probe) — the runtimed backend the server plist hardcodes cannot
 		// boot without it. Covered by the InstallDir sweep.
@@ -651,7 +707,22 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := sys.CopyToRootOwned(cfg.BinarySource, cfg.installedBinary()); err != nil {
 		return fmt.Errorf("install: copy binary to %s: %w", cfg.installedBinary(), err)
 	}
-	// 2b. Copy the k3sm-execshim Seatbelt helper beside it. Fail fast when the
+	// 2b. Put `k3sm` on PATH, from the manifest's kindSymlink entries — right
+	//     after the binary they point at, and before anything else, so the
+	//     launcher exists the moment its target does. Copying the binary into
+	//     /Library/k3sm never made `k3sm` a command a shell could find, yet every
+	//     post-install instruction (and install.sh's closing hint) assumes it is
+	//     one; the link is the whole of that fix and is therefore a hard install
+	//     failure when it cannot be laid down, not a best-effort nicety.
+	for _, a := range m {
+		if a.kind != kindSymlink {
+			continue
+		}
+		if err := sys.EnsureSymlink(a.target, a.path); err != nil {
+			return fmt.Errorf("install: link %s -> %s: %w", a.path, a.target, err)
+		}
+	}
+	// 2b′. Copy the k3sm-execshim Seatbelt helper beside it. Fail fast when the
 	//     source shim is absent: the server plist hardcodes --runtime runtimed,
 	//     whose backend resolves the shim next to the executable — without it the
 	//     server dies at boot in an invisible KeepAlive crash-loop (the live
@@ -659,20 +730,20 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.installedExecShim()); err != nil {
 		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.installedExecShim(), err)
 	}
-	// 2b′. Copy the path-rebase DYLD shim beside the binary. runtimed resolves it
+	// 2b″. Copy the path-rebase DYLD shim beside the binary. runtimed resolves it
 	//      next to the executable and injects it into a mounting pod so an absolute
 	//      volume mount resolves under the pod data volume (build it with
 	//      runtimed/hack/build-pathshim.sh and ad-hoc sign it).
 	if err := sys.CopyToRootOwned(cfg.PathShimSource, cfg.installedPathShim()); err != nil {
 		return fmt.Errorf("install: copy path-rebase shim to %s: %w (build it with runtimed/hack/build-pathshim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedPathShim(), err)
 	}
-	// 2b″. Copy the getaddrinfo DNS shim beside the binary. The provider resolves it
+	// 2b‴. Copy the getaddrinfo DNS shim beside the binary. The provider resolves it
 	//      next to the executable and injects it into each pod so in-pod cluster DNS
 	//      reaches the per-node resolver (build it with darwin-net/hack/build-shim.sh).
 	if err := sys.CopyToRootOwned(cfg.DNSShimSource, cfg.installedDNSShim()); err != nil {
 		return fmt.Errorf("install: copy getaddrinfo DNS shim to %s: %w (build it with darwin-net/hack/build-shim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedDNSShim(), err)
 	}
-	// 2b‴. Copy the k3sm-vmhost VM-host helper beside the binary. runtimed's
+	// 2b⁗. Copy the k3sm-vmhost VM-host helper beside the binary. runtimed's
 	//      sandbox.FindVMHost resolves it next to the executable for
 	//      vm-RuntimeClass pods. The helper is ad-hoc signed with the
 	//      com.apple.security.virtualization entitlement, and CopyToRootOwned
@@ -793,7 +864,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
 		return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
 	}
-	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "kubeconfig-owner", cfg.TargetUser)
+	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
 	return nil
 }
 
@@ -877,6 +948,24 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 					continue
 				}
 				note(safeRemove(a.path))
+			} else if a.kind == kindSymlink {
+				// The launcher link lives OUTSIDE the trees k3sm owns, so it is
+				// removed by identity, not by path: only a symlink still pointing
+				// at this install's binary is ours. A regular file, a directory, or
+				// a link someone re-pointed is left exactly where it is — an
+				// uninstall that deleted it would be deleting another tool's
+				// launcher. safeRemove is deliberately NOT the mechanism here: it
+				// removes a path, and the question is what the path IS.
+				removed, err := sys.RemoveSymlink(a.path, a.target)
+				if err != nil {
+					note(err)
+					continue
+				}
+				if !removed {
+					if exists, perr := sys.PathExists(a.path); perr == nil && exists {
+						cfg.Logger.Info("link kept: not ours", "path", a.path, "expected-target", a.target)
+					}
+				}
 			} else {
 				note(safeRemove(a.path))
 			}

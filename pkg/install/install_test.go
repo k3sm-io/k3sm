@@ -71,6 +71,10 @@ type fakeSystem struct {
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
 	missingPaths map[string]bool
+	// links models the symlinks EnsureSymlink has laid down (link -> target), so a
+	// SECOND Install over the same fake describes the real "already correct"
+	// reinstall rather than a fresh lay-down.
+	links map[string]string
 	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
 	// path. The zero value (no entry) means "signed and entitled" so that every
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
@@ -200,6 +204,29 @@ func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
 	return nil
 }
 
+// EnsureSymlink records the requested link and models idempotence: a second call
+// for a link already pointing at the same target still records the call (the
+// installer asks unconditionally) and still succeeds, which is the contract the
+// real darwin implementation's "already correct → no-op nil" arm provides.
+func (f *fakeSystem) EnsureSymlink(target, link string) error {
+	f.calls = append(f.calls, "EnsureSymlink:"+target+"->"+link)
+	if f.links == nil {
+		f.links = map[string]string{}
+	}
+	f.links[link] = target
+	return nil
+}
+
+// RemoveSymlink records the link and reports it removed — the healthy uninstall
+// of a link this install laid down. A test that needs the "not ours" verdict
+// asserts on the real implementation's table in install_darwin_test.go, where the
+// judgement actually lives.
+func (f *fakeSystem) RemoveSymlink(link, target string) (bool, error) {
+	f.calls = append(f.calls, "RemoveSymlink:"+link)
+	delete(f.links, link)
+	return true, nil
+}
+
 func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
 	f.calls = append(f.calls, "WriteLaunchDaemon:"+plistPath)
 	f.putFile(plistPath, contents)
@@ -319,6 +346,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// socket under here as _k3sm. Missing it makes every vm pod fail to boot.
 		"EnsureVMRunDir:/var/lib/k3sm/run/vm",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
+		// The launcher link goes down immediately after the binary it points at,
+		// and long before any daemon work: copying into /Library/k3sm never put
+		// `k3sm` on a shell's PATH, which every post-install instruction assumes.
+		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_pathrebase_shim.dylib",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
@@ -471,6 +502,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The launcher link is judged BEFORE the sweep deletes its target: after
+		// the sweep it is a dangling link whose identity can no longer be read.
+		"RemoveSymlink:/usr/local/bin/k3sm",
 		"RemoveAll:/Library/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
 		// The lo0 flush covers the pinned pod aggregate + the Service CIDR — the
@@ -612,9 +646,13 @@ func daemonByPath(m []artifact, path string) (artifact, bool) {
 	return artifact{}, false
 }
 
+// fileDispByPath classifies a path-bearing manifest entry. kindSymlink is
+// admitted alongside kindFile/kindDir so a symlink entry whose disposition is not
+// dispRemove fails the coverage assertion instead of being silently invisible to
+// it — an unremoved launcher link is exactly the leak this gate exists to catch.
 func fileDispByPath(m []artifact, path string) (disposition, bool) {
 	for _, a := range m {
-		if (a.kind == kindFile || a.kind == kindDir) && a.path == path {
+		if (a.kind == kindFile || a.kind == kindDir || a.kind == kindSymlink) && a.path == path {
 			return a.disp, true
 		}
 	}
@@ -670,6 +708,31 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 		}
 		if !removed[a.path] {
 			gaps = append(gaps, "plist leaked: "+a.path)
+		}
+	}
+
+	// Symlinks laid down by EnsureSymlink. They live OUTSIDE the InstallDir sweep
+	// (that is the entire point of a launcher on PATH), so no sweep can cover
+	// them: uninstall must ask for each one by name, and a link install created
+	// with no matching RemoveSymlink is a leak the other three loops cannot see.
+	unlinked := toSet(recorded(uninstallCalls, "RemoveSymlink:"))
+	for _, call := range recorded(installCalls, "EnsureSymlink:") {
+		target, link, ok := strings.Cut(call, "->")
+		if !ok {
+			gaps = append(gaps, "unparsable EnsureSymlink record: "+call)
+			continue
+		}
+		disp, known := fileDispByPath(m, link)
+		if !known {
+			gaps = append(gaps, "off-manifest link: "+link)
+			continue
+		}
+		if disp != dispRemove {
+			gaps = append(gaps, "link not marked for removal: "+link)
+			continue
+		}
+		if !unlinked[link] {
+			gaps = append(gaps, "link leaked (never unlinked): "+link+" -> "+target)
 		}
 	}
 	return gaps
@@ -795,6 +858,83 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 			if !strings.HasPrefix(a.path, dc.InstallDir+"/") {
 				t.Errorf("forward-declared artifact %q must live under InstallDir %q", a.path, dc.InstallDir)
 			}
+		}
+	})
+}
+
+// TestInstallLinksK3smOntoPath is the gate for the defect this manifest entry
+// fixes: install copied the binary to /Library/k3sm and stopped, so `k3sm` was
+// not a command any shell could resolve — while install.sh closed by telling the
+// operator to run one. The launcher is a first-class manifest artifact, laid
+// down after its target and torn down by identity before the InstallDir sweep
+// deletes what it points at.
+func TestInstallLinksK3smOntoPath(t *testing.T) {
+	cfg := Config{BinarySource: "/tmp/build/k3sm-m2", TargetUser: "alice"}
+	dc := cfg.withDefaults()
+
+	t.Run("the manifest carries exactly one launcher link", func(t *testing.T) {
+		var links []artifact
+		for _, a := range artifactManifest(dc) {
+			if a.kind == kindSymlink {
+				links = append(links, a)
+			}
+		}
+		if len(links) != 1 {
+			t.Fatalf("manifest has %d kindSymlink entries, want exactly 1: %+v", len(links), links)
+		}
+		a := links[0]
+		if a.path != dc.installedLink() {
+			t.Errorf("link path = %q, want installedLink() %q", a.path, dc.installedLink())
+		}
+		if a.target != dc.installedBinary() {
+			t.Errorf("link target = %q, want installedBinary() %q", a.target, dc.installedBinary())
+		}
+		if a.path != "/usr/local/bin/k3sm" {
+			t.Errorf("link path = %q, want the /etc/paths-covered launcher %q", a.path, "/usr/local/bin/k3sm")
+		}
+		// It cannot ride the InstallDir sweep: it does not live under InstallDir.
+		if a.disp != dispRemove {
+			t.Errorf("link disposition = %v, want dispRemove (no sweep covers a path outside InstallDir)", a.disp)
+		}
+	})
+
+	t.Run("install links after the binary lands and before any daemon starts", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		link := idx(f.calls, "EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm")
+		if link < 0 {
+			t.Fatalf("install never linked k3sm onto PATH; calls = %v", f.calls)
+		}
+		// After its target: a link laid before the binary points at nothing.
+		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm/k3sm"); binary < 0 || link < binary {
+			t.Errorf("link (%d) must be laid down after the binary copy (%d)", link, binary)
+		}
+		// Before any daemon work, so a failure to link fails the install early
+		// rather than after the cluster is running.
+		for _, label := range []string{NetdLabel, ServerLabel} {
+			if boot := idx(f.calls, "Bootstrap:"+label); boot >= 0 && link > boot {
+				t.Errorf("link (%d) must be laid down before %s bootstraps (%d)", link, label, boot)
+			}
+		}
+	})
+
+	t.Run("uninstall unlinks before the InstallDir sweep removes the target", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Uninstall(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Uninstall: %v", err)
+		}
+		unlink := idx(f.calls, "RemoveSymlink:/usr/local/bin/k3sm")
+		if unlink < 0 {
+			t.Fatalf("uninstall never removed the launcher link; calls = %v", f.calls)
+		}
+		sweep := idx(f.calls, "RemoveAll:/Library/k3sm")
+		if sweep < 0 {
+			t.Fatalf("uninstall never swept InstallDir; calls = %v", f.calls)
+		}
+		if unlink > sweep {
+			t.Errorf("the link (%d) must be judged before its target is deleted (%d): after the sweep it is a dangling link whose identity can no longer be read", unlink, sweep)
 		}
 	})
 }
