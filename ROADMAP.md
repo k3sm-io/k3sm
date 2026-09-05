@@ -21,7 +21,7 @@ The engine. Everything listed below is implemented and passes k3sm's own test su
 pod isolation/resource fidelity.** The isolation
 gate is the strongest evidence so far: run against a real root install on macOS 26.5, all **13
 required conformance criteria passed**, together with the full install/uninstall lifecycle checks.
-The remaining two-Mac gates are burned down as part of release engineering. What ships:
+The two-Mac features are being tested on hardware as part of release engineering. What ships:
 
 - **Native Darwin-process pods, zero Linux on the default path.** OCI images ship an arm64
   Mach-O payload (never `/System`); the runtime `posix_spawn`s them **in place at host paths** —
@@ -62,7 +62,7 @@ The remaining two-Mac gates are burned down as part of release engineering. What
   k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
   the remaining packaging work.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
-  with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
+  with an identical-CA bundle. *(implemented; a two-Mac + Postgres failover has not run yet)*
 - **Conformance hardening.** As close to standard k8s as the Darwin substrate
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
@@ -109,7 +109,7 @@ v0.1.1 followed on 2026-09-02 — see [CHANGELOG.md](CHANGELOG.md) for what it a
 ## Future — post-v0.1.0
 
 - **The Linux `vm` path, v0.2** — the Linux-image capability ships at v0.1 (above); v0.2 adds
-  the full lab ledger green with **published performance figures** (VM boot latency = restart
+  the remaining two-Mac and vm tests with **published performance figures** (VM boot latency = restart
   cost, the Rosetta non-TSO ratio, virtiofs I/O vs native APFS), and the remaining ceilings
   either closed or documented (per-pod network segmentation between micro-VMs, host-path
   sharing). Plus darwin/amd64 pod payloads under host Rosetta on the native path.

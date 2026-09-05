@@ -54,7 +54,7 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
   rejected up front with an `InvalidSpec` reason rather than served from the moving default branch.
 - A pinned revision is loaded from the cache, not fetched into it. On a volume that has never held this
   model, leave `revision` empty for the first start (the engine downloads the default branch), or stage
-  the weights into the volume yourself — `hack/acceptance/m8.sh` does the latter.
+  the weights into the volume yourself.
 
 `quantization` is rejected today: the engine has no expression for it, and serving a different variant
 than the one asked for would look like success. Name the quantized repository in `model` instead —
