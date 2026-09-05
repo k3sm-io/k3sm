@@ -182,7 +182,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// cluster clean (B71 owns flipping it); dropping the flag reverts the posture on
 	// the next boot. It is an operator argv toggle of a single apiserver config
 	// value, not a runtime feature-flag code path.
-	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the B71 cutover; the shipped default is baseline-warn only)")
+	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the baseline-enforce cutover; the shipped default is baseline-warn only)")
 	// M10.3 ingress listener ports. 80/443 is the production posture; an EXPLICIT
 	// high-port pair (e.g. 8080/8443) is the integration-tier mode. There is
 	// deliberately NO silent fallback between the two — a failed bind is logged and
@@ -205,11 +205,11 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// k3sm's own argv (mirrors --token/$K3SM_TOKEN). k3sm relocates the password off
 	// the kine child's argv too (a 0600 PGPASSFILE), so `ps` never sees the secret.
 	fs.StringVar(&opts.datastoreEndpoint, "datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "kine datastore DSN (postgres://user:pass@host:port/db?sslmode=…) for HA multi-writer; empty = single-node kine→SQLite (or $K3SM_DATASTORE_ENDPOINT)")
-	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard) and sets the HA leader-election. With --server it also fetches the identical-CA bundle from an existing server (M6.1)")
+	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard) and sets the HA leader-election. With --server it also fetches the identical-CA bundle from an existing server")
 	// M6.1 HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
-	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join, M6.1; requires --server-join --mesh-ip --token)")
+	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join; requires --server-join --mesh-ip --token)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
 	return workDirErr
 }

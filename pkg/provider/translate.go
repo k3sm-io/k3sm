@@ -417,7 +417,7 @@ func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, cidrs 
 		if !isHostBinaryRoute(c) {
 			return
 		}
-		log.Warn("bind-discipline env injected on an M0 host-binary route: the host binary is never ad-hoc re-signed, so AMFI drops the DYLD insert and the interpose never loads — this container binds wildcard, and its per-IP port space is NOT enforced (a same-node EADDRINUSE will name the wrong pod)",
+		log.Warn("bind-discipline env injected on a host-binary route: the host binary is never ad-hoc re-signed, so AMFI drops the DYLD insert and the interpose never loads — this container binds wildcard, and its per-IP port space is NOT enforced (a same-node EADDRINUSE will name the wrong pod)",
 			"namespace", box.GetNamespace(), "pod", box.GetName(), "container", c.GetName(), "pod_ip", podIP)
 	}
 	for _, c := range box.GetInitContainers() {

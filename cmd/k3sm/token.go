@@ -57,7 +57,7 @@ func runTokenCreate(args []string) error {
 	}
 	workDir := fs.String("work-dir", defaultWorkDir, "control-plane state root (the cluster CA + token store live here)")
 	ttl := fs.Duration("ttl", 24*time.Hour, "token time-to-live (must be positive; ignored for --server)")
-	serverTok := fs.Bool("server", false, "mint a SERVER-class join token (to add an HA control-plane server, M6.1) instead of a worker token")
+	serverTok := fs.Bool("server", false, "mint a SERVER-class join token (to add an HA control-plane server) instead of a worker token")
 	_ = fs.Parse(args)
 
 	if !*serverTok && *ttl <= 0 {

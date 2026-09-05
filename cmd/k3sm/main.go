@@ -30,8 +30,8 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 Usage: k3sm <command> [flags]
 
 Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "builder", "image", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
-  server      run the control plane + a node on this Mac (M1; --mesh-ip enables multi-node join)
-  agent       join this Mac to an existing cluster as a worker node (M3)
+  server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
+  agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
   dev         disposable single-node dev cluster (up|down|list|load) — internal dev tooling
   netd        run the root privileged-network helper (launched by the io.k3sm.netd LaunchDaemon)
@@ -148,7 +148,7 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "k3sm: unknown command %q (pre-M0 scaffold)\n\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "k3sm: unknown command %q\n\n", os.Args[1])
 		fmt.Fprintf(os.Stderr, usage, ver.Version)
 		os.Exit(2)
 	}
