@@ -153,7 +153,7 @@ func (m Mode) DataPath() bool { return m.Backend != BackendNone }
 // the netd socket itself is the mechanism (the proxy's lo0 alias manager, the
 // privileged-port binder, the mesh key resolver). It is deliberately NOT a proxy
 // for "can the runtime honor a uid drop": the foreign-runAsUser admission policy
-// used to be gated on it and is now provisioned in EVERY posture (B153), because
+// used to be gated on it and is now provisioned in EVERY posture, because
 // the no-per-pod-uid-isolation ceiling is a product-wide property, not a
 // networking-backend one.
 func (m Mode) UsesHelper() bool { return m.Backend == BackendHelper }

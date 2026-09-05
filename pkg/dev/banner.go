@@ -56,7 +56,7 @@ func FidelityBanner(datapath, runtime string) string {
 	// resolves Credential{Drop: false} => the pod keeps the daemon's own identity).
 	// That is strictly worse than the documented shipped posture — the installed
 	// LaunchDaemon runs as install.DefaultServiceUser — and it was invisible here
-	// until B209/B210, so the banner now says it outright on both tiers.
+	// until it was reported, so the banner now says it outright on both tiers.
 	if datapath == DatapathDirect {
 		b.WriteString("pod identity: pods run as ROOT (uid 0) — a pod with no securityContext.runAsUser keeps this root\n")
 		b.WriteString("  daemon's identity. Seatbelt still confines them, but the installed cluster runs pods as the\n")

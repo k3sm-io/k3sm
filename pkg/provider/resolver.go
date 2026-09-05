@@ -94,7 +94,7 @@ var errNoPodIdentity = errors.New("no pod identity bound to the request context;
 
 // ServiceAccountToken mints a bound token via the TokenRequest API (audience +
 // expirationSeconds, rotated each materialize) for the POD's ServiceAccount — the
-// M2.4 in-pod-API surface. The mount.Resolver signature carries only the
+// in-pod-API surface. The mount.Resolver signature carries only the
 // namespace (it is the single runtimed seam every pod shares), so the per-pod
 // identity is bound to the call by the provider via the request context
 // (podIdentityFromContext) — runtimed threads that ctx from CreatePod through
@@ -163,7 +163,7 @@ type podIdentity struct {
 // mount.Resolver seam's ServiceAccountToken(ctx, namespace, audience, exp)
 // signature carries neither, so the per-pod identity rides the request context
 // that runtimed threads from CreatePod → mount.Materialize →
-// ServiceAccountToken in-process. This needs no runtimed/apis change. The M2
+// ServiceAccountToken in-process. This needs no runtimed/apis change. A future
 // daemon split (a real gRPC boundary between provider and runtime) cannot carry
 // a context value across the wire, so it will bind the identity in the
 // materialization RPC instead — tracked with that split.
@@ -216,8 +216,8 @@ func notFoundAware(err error) error {
 
 // kubeCredentials resolves private-registry pull credentials from a pod's
 // imagePullSecrets, backed by the apiserver client. The resolved credential is
-// consumed ONLY by runtimed's pull client and never reaches the pod dir (the M2.6
-// invariant); the proto carries only LocalObjectReference names.
+// consumed ONLY by runtimed's pull client and never reaches the pod dir (the
+// pull-credential invariant); the proto carries only LocalObjectReference names.
 type kubeCredentials struct {
 	cs kubernetes.Interface
 }

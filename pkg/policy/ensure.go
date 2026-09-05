@@ -42,9 +42,9 @@ const managedLabel = "k3sm.io/managed"
 // object first appeared: a changed CEL expression, a changed allowed uid, or a
 // changed LimitRange default is INERT on any cluster whose datastore already holds
 // the old object, and a server restart never repairs it. That is not a theoretical
-// staleness: B153's fix changes both the provisioning set AND the foreign-user
-// expression's parameter, so without this path the fix would land green in CI and
-// do nothing on every existing cluster.
+// staleness: the foreign-user fix changed both the provisioning set AND the
+// policy expression's parameter, so without this path it would have landed green
+// in CI and done nothing on every existing cluster.
 //
 // The contract, deliberately narrow:
 //

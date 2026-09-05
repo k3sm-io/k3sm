@@ -67,7 +67,7 @@ import (
 
 // The pod runtime selector values (`--runtime`).
 const (
-	// runtimeHostProcess is the M0 native-process runtime: rootless dev, no
+	// runtimeHostProcess is the native-process runtime: rootless dev, no
 	// image pull, no Seatbelt isolation, podIP ≈ nodeIP (its documented shape).
 	runtimeHostProcess = "hostprocess"
 	// runtimeRuntimed is the image runtime (OCI pull → clonefile → ad-hoc-sign →
@@ -76,7 +76,7 @@ const (
 )
 
 // defaultRuntime is the pod runtime every k3sm command selects when --runtime
-// is not given: runtimed — THE M10.1 default-runtime flip (the HostProcess
+// is not given: runtimed (the HostProcess
 // os/exec path is rejected for per-pod IP: no bind discipline, two same-node
 // pods collide on shared lo0). It requires the runtimed posture (root, or the
 // one-time `sudo k3sm install` netd helper); a posture miss REFUSES to start
@@ -115,13 +115,13 @@ type nodeOptions struct {
 	pathShim   string // path-rebase DYLD shim dylib path (runtimed only)
 	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
 	domain     string // cluster DNS domain the in-pod shim search list is built from (runtimed)
-	serveTLS   bool   // serve the kubelet HTTP API over TLS (M1.2: logs/exec over the proxy)
+	serveTLS   bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
 
 	// kubeletClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA)
 	// certificate, in PEM. It is the anchor the kubelet HTTP endpoint (:10250 —
 	// logs, exec, attach, port-forward, stats) verifies the apiserver's client
 	// certificate against, and it is REQUIRED whenever serveTLS is set: the routes
-	// are never served without mutual TLS (B176). `k3sm server` reads it off the
+	// are never served without mutual TLS. `k3sm server` reads it off the
 	// work dir's PKI, `k3sm agent` receives it in its join response, and standalone
 	// `k3sm node --serve-tls` takes it from --kubelet-client-ca.
 	kubeletClientCAPEM []byte
@@ -131,7 +131,7 @@ type nodeOptions struct {
 	// the half of the endpoint's TLS that the APISERVER verifies: a mesh server runs
 	// with --kubelet-certificate-authority=<cluster CA>, so a serving cert that does
 	// not chain to it is refused with "x509: certificate signed by unknown authority"
-	// and kubectl logs/exec is broken cluster-wide (B213).
+	// and kubectl logs/exec is broken cluster-wide.
 	//
 	// EMPTY is the single-node/dev default: kubeletServingTLS self-signs (see
 	// certs.SelfSignedServing), which is correct exactly where no cluster CA is
@@ -168,7 +168,7 @@ type nodeOptions struct {
 	// resolver of its own — only `k3sm server`/`k3sm agent` call netserve.New
 	// before reaching this shared bring-up (grep `netserve.New` across cmd/k3sm) —
 	// so runtimedConfig uses this flag to guard the K3SM_DNS_* env injection off
-	// (B43): left unset (the zero value, false), a standalone node would inject
+	// left unset (the zero value, false), a standalone node would inject
 	// env pointing at a VIP with nothing listening, blackholing every pod's
 	// cluster-DNS lookup for ~2s per search candidate before falling through,
 	// where the pre-injection behavior deferred to the host resolver immediately.
@@ -230,7 +230,7 @@ type nodeOptions struct {
 // nodeKubeletListen is the standalone `k3sm node` default (loopback-scoped).
 //
 // Both are built from ports.KubeletAPIPort — the port was two bare literals inside
-// address strings before B116, with no constant anywhere, while it is one of the
+// address strings, with no constant anywhere, while it is one of the
 // two wildcard listeners the reserved-port guard exists to protect.
 var (
 	serverKubeletListen = serverKubeletListenOn(ports.KubeletAPIPort)
@@ -293,11 +293,11 @@ func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
 	// Default "" (NOT dns.DefaultDNSVIP): the standalone node binds no resolver on
 	// any VIP, so defaulting this to the real cluster DNS VIP would silently inject
-	// K3SM_DNS_* pointing at a dead address (B43). See standaloneDNSGuard.
+	// K3SM_DNS_* pointing at a dead address. See standaloneDNSGuard.
 	fs.StringVar(&opts.dnsVIP, "dns-vip", "", "cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed runtime only; standalone `k3sm node` binds no resolver — leave unset, see the startup log)")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the in-pod getaddrinfo shim search list is built from (runtimed runtime only)")
 	fs.BoolVar(&opts.serveTLS, "serve-tls", false, "serve the kubelet HTTP API over TLS so kubectl logs/exec work via the apiserver proxy")
-	// B176: standalone `k3sm node` has no PKI of its own, so the anchor its
+	// Standalone `k3sm node` has no PKI of its own, so the anchor its
 	// :10250 verifies the apiserver's client cert against can only be named by
 	// the operator. Registered here rather than in runNode so the whole
 	// standalone flag surface stays assertable from one function.
@@ -305,7 +305,7 @@ func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 }
 
 // runNode registers this Mac as a Virtual Kubelet node and runs pods via the
-// selected runtime (M0 walking skeleton + M1 runtimed image runtime).
+// selected runtime (the host-process skeleton, or the runtimed image runtime).
 func runNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	opts := nodeOptions{}
@@ -317,7 +317,7 @@ func runNode(args []string) error {
 	// obtain this anchor from the cluster itself; a standalone node is pointed at
 	// somebody else's cluster by --kubeconfig, so only the operator knows where that
 	// cluster's client CA is — and being unable to name it is a refusal, not a
-	// reason to drop back to the pre-B176 unauthenticated listener.
+	// reason to drop back to an unauthenticated listener.
 	if opts.serveTLS {
 		if opts.kubeletClientCAPath == "" {
 			return fmt.Errorf("--serve-tls requires --kubelet-client-ca: the kubelet HTTP API (logs/exec/attach/port-forward) authenticates the apiserver by client certificate and is never served unauthenticated")
@@ -329,7 +329,7 @@ func runNode(args []string) error {
 		opts.kubeletClientCAPEM = caPEM
 	}
 
-	// B43: fail fast on an explicit --dns-vip (this process has nothing bound on
+	// Fail fast on an explicit --dns-vip (this process has nothing bound on
 	// it) rather than silently injecting a dead VIP; otherwise log once that
 	// cluster DNS is unavailable here so the guard's absence of K3SM_DNS_* env
 	// isn't mistaken for a bug. Checked before the --kubeconfig requirement below
@@ -362,16 +362,16 @@ func runNode(args []string) error {
 	return startNode(ctx, opts)
 }
 
-// standaloneDNSGuard is the B43 guard against the standalone-node dead-VIP
+// standaloneDNSGuard is the guard against the standalone-node dead-VIP
 // blackhole: `k3sm node --runtime runtimed` threads --dns-vip/--cluster-domain
-// into runtimedConfig, which (pre-B43) always injected the K3SM_DNS_* env the
+// into runtimedConfig, which used to always inject the K3SM_DNS_* env the
 // DYLD getaddrinfo shim reads — but this command starts no resolver on that VIP
 // (only server.go/agent.go call netserve.New before reaching the shared
 // startNode/buildProvider/runtimedConfig path). A pod's shim then dialed a dead
-// VIP: a silent ~2s-per-search-candidate timeout instead of the pre-B18
-// immediate defer to the host resolver.
+// VIP: a silent ~2s-per-search-candidate timeout instead of an immediate defer
+// to the host resolver.
 //
-// The operator decision (2026-08-28, B43) is DEV-ONLY: guard the injection off
+// The operator decision (2026-08-28) is DEV-ONLY: guard the injection off
 // rather than build a standalone resolver. So an explicit --dns-vip — a request
 // this process cannot honor — fails fast with a clear error (better than a
 // silent blackhole); an unset one (the flag's new "" default) just logs that
@@ -498,7 +498,7 @@ func advertisedNodeIP(opts nodeOptions) string {
 // loopback (standalone `k3sm node`) is never re-advertised at an address it does
 // not serve.
 //
-// Reaching the port is no longer the same as being able to use it: since B176 the
+// Reaching the port is not the same as being able to use it: the
 // provider routes (logs, exec, attach, port-forward) require the apiserver's
 // client certificate, verified against the cluster's client-identity CA
 // (provider.KubeletEndpointAuth). Identity rests on that certificate, not on
@@ -602,8 +602,8 @@ func nodeInternalIP(podCIDR string) string {
 	return ip.String()
 }
 
-// errRuntimedPosture is the NAMED refuse-to-start error of the M10.1
-// default-runtime flip: the runtimed runtime's pod network needs root or the
+// errRuntimedPosture is the NAMED refuse-to-start error of the default runtime:
+// the runtimed runtime's pod network needs root or the
 // netd helper, and neither is present. k3sm never silently degrades to
 // hostprocess — the operator either installs the posture or opts out.
 var errRuntimedPosture = errors.New("runtimed runtime posture missing")
@@ -677,7 +677,7 @@ func nodeRESTConfig(kubeconfig string) (*rest.Config, error) {
 // blocks until ctx ends or the node exits. The server calls it directly with an
 // already-built kubeconfig.
 func startNode(ctx context.Context, opts nodeOptions) error {
-	// M10.1 flip guard: refuse to start (named error, actionable message) when
+	// Posture guard: refuse to start (named error, actionable message) when
 	// the default runtimed runtime's posture is missing — BEFORE anything
 	// registers against the cluster. Never a silent hostprocess fallback.
 	if err := runtimePreflight(ctx, opts); err != nil {
@@ -748,7 +748,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		return err
 	}
 
-	// M10.1 startup reconcile — MUST run here, in-process, before the node serves.
+	// Startup reconcile — MUST run here, in-process, before the node serves.
 	// The embedded runtimed runtime is driven by direct RPC (provider.NewRuntimed),
 	// never runtime.Server.Serve, so runtimed's own once-before-serve reconcile never
 	// fires on this path. Run the adapter's reconcile directly: it sweeps stale lo0
@@ -790,7 +790,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 
 	// The kubelet HTTP API's TLS + auth posture. Both halves are built together and
 	// handed to the adapter together, because serving the provider routes
-	// (logs/exec/attach/port-forward) without either one is the B176 defect; the
+	// (logs/exec/attach/port-forward) without either one is a wide-open endpoint; the
 	// adapter refuses a NodeConfig that carries only one of them.
 	var servingTLS *tls.Config
 	var authorizeKubelet func(http.Handler) http.Handler
@@ -808,7 +808,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 
 	// Build the VK node through the adapter: it encapsulates the kubelet HTTP API
 	// wiring (logs/exec only serve when BOTH a TLS config and a handler are set, so
-	// the apiserver→node proxy reaches /containerLogs — M1.2) and the
+	// the apiserver→node proxy reaches /containerLogs) and the
 	// nil-NodeProvider → NaiveNodeProvider (auto-Ready + lease heartbeat) path.
 	// nodeStatus is assigned by the NodeProvider callback below, which VK invokes
 	// SYNCHRONOUSLY inside NewNode — so it is set before NewNode returns and the
@@ -819,7 +819,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		Provider:         prov,
 		HTTPListenAddr:   opts.listen,
 		NumWorkers:       4,
-		TLSConfig:        servingTLS,       // nil = plain HTTP (M0 path); set = kubelet-serving TLS + required client cert
+		TLSConfig:        servingTLS,       // nil = plain HTTP (dev path); set = kubelet-serving TLS + required client cert
 		AuthorizeHandler: authorizeKubelet, // nil iff TLSConfig is nil — the adapter enforces the pairing
 		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
@@ -876,7 +876,7 @@ type runtimeHealthReporter interface {
 
 // runtimeHealthProbe returns prov's runtime-health probe, or nil when prov
 // exposes none. A nil result tells the status provider that Ready must never be
-// contradicted — the M0 host-process runtime has no health surface, and a node
+// contradicted — the host-process runtime has no health surface, and a node
 // must not be marked NotReady on a question its runtime cannot answer.
 func runtimeHealthProbe(prov vkadapter.Provider) func(context.Context) bool {
 	h, ok := prov.(runtimeHealthReporter)
@@ -937,18 +937,18 @@ func awaitNodeReady(ctx context.Context, ready <-chan struct{}, errc <-chan erro
 }
 
 // buildProvider selects and constructs the VK provider for the requested
-// runtime. runtimed is the default (defaultRuntime — the M1 image runtime: OCI
+// runtime. runtimed is the default (defaultRuntime — the image runtime: OCI
 // pull → clonefile → ad-hoc-sign → Seatbelt confine, per-pod /32 pod IPs via
 // the injected podnet adapter), wrapped in the VK adapter; hostprocess is the
-// explicit rootless-dev opt-out (M0 native processes, no isolation, podIP ≈
-// nodeIP — its documented shape, untouched by M10.1). cs is the apiserver
-// client the runtimed provider resolves volumes/env/imagePullSecrets with
-// (M2.1/M2.6). recorder is the EventRecorder both provider paths emit pod
+// explicit rootless-dev opt-out (native processes, no isolation, podIP ≈
+// nodeIP — its documented shape). cs is the apiserver
+// client the runtimed provider resolves volumes/env/imagePullSecrets with.
+// recorder is the EventRecorder both provider paths emit pod
 // lifecycle Events to: the HostProcess path emits Pulled/Created/Started/Killing,
-// the runtimed path emits the BackOff crash-loop Event (B26).
+// the runtimed path emits the BackOff crash-loop Event.
 // buildProvider constructs the VK provider for the selected runtime and reports the
 // node's runtimed-advertised capabilities — the source of every k3sm.io/* capability
-// node label (k3sm.io/virtualization from B1, k3sm.io/rosetta{,-linux} from B103).
+// node label (k3sm.io/virtualization and k3sm.io/rosetta{,-linux}).
 //
 // The capabilities travel as ONE provider.NodeCapabilities struct, never as adjacent
 // positional bools: three same-typed bools in a signature make a transposition
@@ -967,10 +967,10 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 	case runtimeRuntimed:
 		cfg := runtimedConfig(opts, cs)
 		// The runtimed path emits the Warning BackOff Event for a throttled
-		// container re-exec (B26), so `kubectl describe pod` on a crash-looping pod
+		// container re-exec, so `kubectl describe pod` on a crash-looping pod
 		// shows the crash loop in its Events table.
 		cfg.Recorder = recorder
-		// Guest boot artifacts (B108), ensured HERE — at daemon start, before the
+		// Guest boot artifacts, ensured HERE — at daemon start, before the
 		// runtime that boots from them exists — and never lazily on a pod's first
 		// CreateVM. Doing it here is the whole posture: a hundred-megabyte fetch on
 		// the critical path of a scheduled pod would turn a slow network into a pod
@@ -1068,7 +1068,7 @@ func buildPodNetwork(opts nodeOptions, log *slog.Logger) (*podnet.Network, error
 
 // buildPodNetAdapter constructs the node's one ALLOCATING podnet.Network (see
 // buildPodNetwork) and wraps it in the provider adapter that bridges it into
-// runtimed's PodNetwork + startup-reconcile seams (M10.1). It returns nil (no
+// runtimed's PodNetwork + startup-reconcile seams. It returns nil (no
 // adapter — runtimed keeps podIP ≈ nodeIP) only for the EXPLICIT no-datapath
 // backend (`--network none`, control-plane-only/CI); a missing podCIDR with a
 // datapath is a fail-fast error, never a fallback.
@@ -1090,9 +1090,9 @@ func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
 // 10.96.0.10) and APIServerVIP is the kubernetes Service ClusterIP derived from
 // the cluster service CIDR; runtimed threads both into its per-pod sandbox.Posture
 // so a confined pod's DNS + in-pod client-go reach the node-local resolver / API
-// VIP (M3.3). ClusterDomain (the --cluster-domain flag) is the in-pod shim search
+// VIP. ClusterDomain (the --cluster-domain flag) is the in-pod shim search
 // suffix the provider injects as K3SM_DNS_* env so cluster Service names resolve
-// (B18); it MUST match the resolver's served zone. It is pure (no I/O) so the VIP +
+// env; it MUST match the resolver's served zone. It is pure (no I/O) so the VIP +
 // domain wiring is unit-tested directly.
 // resolvePathShim returns the path-rebase DYLD shim dylib installed beside the
 // k3sm binary (/Library/k3sm/<PathShimName> in the packaged layout), or "" when
@@ -1134,13 +1134,13 @@ func resolveSiblingDylib(name string) string {
 	return p
 }
 
-// B43: opts.standalone (set ONLY by runNode) skips the empty-dnsVIP default-fill
+// opts.standalone (set ONLY by runNode) skips the empty-dnsVIP default-fill
 // below, leaving ResolverVIP "". dns.PodDNSConfig then builds a DNSConfig with an
 // empty ClusterDNSIP, which Validate() rejects — the SAME "dnsCfg not usable"
 // path injectClusterDNSEnv already documents (dns.ConfigToEnv returns nil, no
 // K3SM_DNS_* env is appended, the shim defers to the host resolver) — rather than
 // inventing a second no-DNS fallback. server.go/agent.go never set opts.standalone,
-// so their nodeOptions are unaffected and keep injecting exactly as before B43.
+// so their nodeOptions are unaffected and keep injecting exactly as before.
 func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.RuntimedConfig {
 	resolverVIP := opts.dnsVIP
 	if resolverVIP == "" && !opts.standalone {
@@ -1176,7 +1176,7 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs
 		// helper mode (a pod must never drive netd).
 		DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
-		// The Service proxy's transport-override seam (M11.3-d2/B237). A vm pod
+		// The Service proxy's transport-override seam. A vm pod
 		// publishes the /32 its guest was allocated, and the guest's macOS-assigned
 		// vmnet lease is what actually carries bytes; the provider is the only
 		// component holding both, so it feeds the map. nil here (no datapath) leaves
@@ -1355,7 +1355,7 @@ func nodeCapacity(numCPU int, memBytes uint64, maxPods int64) corev1.ResourceLis
 // system-reserved headroom for the CO-LOCATED control plane. apiserver, scheduler,
 // KCM, kine/SQLite, runtimed, and the node-agent all run in the single io.k3sm.server
 // launchd job, with a combined real working set of roughly 1.2-2.3Gi — so 2Gi is a
-// conservative, lab-refinable floor (the M5 lab measures the true RSS). It DOMINATES
+// conservative, lab-refinable floor (a lab run measures the true RSS). It DOMINATES
 // the 10% term on small/8Gi hosts (10% of 8Gi = 800Mi < 2Gi); the 10% term scales the
 // apiserver watch-cache up on larger Macs. See memReserveBytes.
 const defaultMemReserveBytes int64 = 2 * 1024 * 1024 * 1024
@@ -1460,7 +1460,7 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	labels[corev1.LabelTopologyZone] = name
 	labels[corev1.LabelTopologyRegion] = defaultNodeRegion
 
-	// vm RuntimeClass node-capability gate (M5.1/B1): advertise the
+	// vm RuntimeClass node-capability gate: advertise the
 	// Virtualization.framework backend via the k3sm.io/virtualization label ONLY when
 	// this node can run it, so the vm RuntimeClass nodeSelector pins vm pods to a
 	// capable node. caps.VMBackend is the runtimed VMBackendAvailable probe
@@ -1468,11 +1468,11 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// so a vm pod stays Unschedulable — the fail-closed posture for a non-VZ cluster.
 	applyVirtualizationLabel(n, caps.VMBackend)
 
-	// Rosetta translation-capability labels (B103), same fail-closed presence-only
+	// Rosetta translation-capability labels, same fail-closed presence-only
 	// discipline as the virtualization label above.
 	applyRosettaLabels(n, caps)
 
-	// Guest boot artifacts (B108): present only when THIS daemon start ensured and
+	// Guest boot artifacts: present only when THIS daemon start ensured and
 	// digest-verified the pinned kernel + initramfs. Same presence-only discipline;
 	// see LabelVMArtifacts for why it is advertised but not selected on.
 	applyVMArtifactsLabel(n, caps.VMArtifacts)
@@ -1497,14 +1497,14 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 		memBytes = defaultMemBytes
 	}
 	n.Status.Capacity = nodeCapacity(runtime.NumCPU(), memBytes, 110)
-	// System-reserved memory carve-out (B41): hold back max(2Gi, 10% of capacity) from
+	// System-reserved memory carve-out: hold back max(2Gi, 10% of capacity) from
 	// Allocatable for the CO-LOCATED control plane, so the scheduler cannot commit 100%
 	// of RAM to pod requests and starve apiserver/scheduler/KCM/kine/runtimed/node-agent
 	// (all in the one io.k3sm.server job). Capacity stays the true hw.memsize; cpu/pods
 	// pass through unchanged. This is a SCHEDULING-ONLY hold-back — no kubepods cgroup
 	// enforces it at runtime, so it lowers (not eliminates) the chance macOS jetsam kills
 	// the largest process (the control plane); the runtime fix (a jetsam-priority band)
-	// is B46. See nodeAllocatable / DESIGN §5a.
+	// is a jetsam-priority band, not yet built. See nodeAllocatable / DESIGN §5a.
 	capMem := n.Status.Capacity.Memory().Value()
 	reserve := memReserveBytes(capMem)
 	n.Status.Allocatable = nodeAllocatable(n.Status.Capacity, reserve)
@@ -1553,8 +1553,9 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 // Clearing (not merely omitting) handles a node that loses VZ capability across a
 // restart.
 //
-// It is a thin named alias for setLabelPresence, deliberately: this is B1's
-// entry point (and B1's test's), but the set-or-DELETE mechanism must have exactly ONE
+// It is a thin named alias for setLabelPresence, deliberately: it is the
+// virtualization label's entry point (and its test's), but the set-or-DELETE
+// mechanism must have exactly ONE
 // implementation. A hand-rolled copy here is how the two drift, and the fail-open
 // direction of a drift (writing "false" instead of deleting) still satisfies an
 // `exists`-style nodeSelector on a node that LOST the capability.
@@ -1564,7 +1565,7 @@ func applyVirtualizationLabel(n *corev1.Node, vmCapable bool) {
 
 // applyVMArtifactsLabel sets (present) or CLEARS (!present) the
 // k3sm.io/vm-artifacts node label advertising that this node's pinned guest boot
-// artifacts were ensured and digest-verified at daemon start (B108).
+// artifacts were ensured and digest-verified at daemon start.
 //
 // Like applyVirtualizationLabel it is a thin named alias for setLabelPresence, so
 // the set-or-DELETE mechanism keeps exactly one implementation. The delete
@@ -1577,9 +1578,8 @@ func applyVMArtifactsLabel(n *corev1.Node, present bool) {
 }
 
 // applyRosettaLabels sets or CLEARS the two Rosetta translation-capability node
-// labels (B103), mirroring applyVirtualizationLabel — which is the delete-on-loss
-// precedent this follows (B1's shipped k3sm.io/virtualization; NOT B94, which was
-// refused with zero commits, so it is no precedent for anything):
+// labels, mirroring applyVirtualizationLabel — the shipped
+// k3sm.io/virtualization label is the delete-on-loss precedent this follows:
 //
 //   - k3sm.io/rosetta       ⇔ caps.RosettaHost            (darwin/amd64 Mach-O, host Rosetta 2)
 //   - k3sm.io/rosetta-linux ⇔ caps.VMBackend ∧ caps.RosettaGuest (linux/amd64 ELF in a VZ guest)
@@ -1663,7 +1663,7 @@ func upsertTaint(taints []corev1.Taint, t corev1.Taint) []corev1.Taint {
 // server's PKI/bootstrap bundle, not at a setting on the node that reported it.
 //
 // It is fail-fast rather than "fall back to self-signed", because the silent
-// fallback is exactly the B213 defect: a node that quietly presents a self-signed
+// fallback is exactly the defect this guards: a node that quietly presents a self-signed
 // leaf to an apiserver started with --kubelet-certificate-authority is a node whose
 // logs/exec is broken, and it looks healthy while being so.
 var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-present (a cert without its key, or a key without its cert) — both halves are minted and delivered TOGETHER by the server (the join response's kubeletServingCertPEM/KeyPEM, or a mesh server's own local mint), so this is a corrupt or truncated server-side bootstrap bundle, not a setting on this node")
@@ -1687,7 +1687,7 @@ var errHalfKubeletServingPair = errors.New("kubelet serving keypair is half-pres
 // The CLIENT half is not optional and is not this function's to choose: auth
 // stamps tls.RequireAndVerifyClientCert plus the cluster's client-identity CA onto
 // the result, so the listener authenticates the apiserver instead of serving
-// exec/attach to anything that can reach the wildcard bind (B176). Taking auth as
+// exec/attach to anything that can reach the wildcard bind. Taking auth as
 // a required PARAMETER rather than an optional field is deliberate: there is no
 // argument list that produces a serving config without client authentication, so
 // the posture cannot be lost by forgetting to opt into it. The issued-pair path

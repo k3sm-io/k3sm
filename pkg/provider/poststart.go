@@ -22,7 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// postStart hook FIDELITY (B39) — the upstream semantics B10's dispatch-only hook
+// postStart hook FIDELITY — the upstream semantics the earlier dispatch-only hook
 // deferred. The contract this file implements is the one stated on the API type
 // itself (k8s.io/api core/v1 types.go, Lifecycle / Lifecycle.PostStart):
 //
@@ -48,7 +48,7 @@ import (
 //  2. FAILURE ⇒ THE CONTAINER IS KILLED, then handled by its restart policy. Under
 //     an effective policy that restarts a failed container (Always/OnFailure, and a
 //     native sidecar's effective Always) that kill IS a re-exec, so it routes
-//     through the SINGLE restart authority (B26, runtimed_restart.go) and inherits
+//     through the SINGLE restart authority (runtimed_restart.go) and inherits
 //     one CrashLoopBackOff schedule and one restart window. Under Never the kill is
 //     TERMINAL — and that is the one arm the provider cannot perform today; see
 //     failPostStart for exactly what is done instead and why nothing is faked.
@@ -60,12 +60,12 @@ import (
 //
 //  4. POD-SCOPED CANCELABLE LIFETIME — each hook goroutine runs under a context
 //     owned by the pod's track and cancelled by DeletePod (and by the idempotent
-//     CreatePod that replaces the track). B10's stopgap — context.Background() with
+//     CreatePod that replaces the track). The earlier stopgap — context.Background() with
 //     a 2-minute cap — both outlived pod teardown (up to 2m) and imposed a deadline
 //     upstream does not have. Cancellation replaces the cap: the hook's bound is the
 //     pod's lifetime.
 //
-// SCOPE: mains only (pod.Spec.Containers), matching B10's dispatch. An init
+// SCOPE: mains only (pod.Spec.Containers), matching the create-path dispatch. An init
 // container's or native sidecar's postStart is not dispatched at create, so it is
 // not re-run on restart either — the two halves stay consistent, and the gap is the
 // pre-existing one, not a new asymmetry.
@@ -233,7 +233,7 @@ func (r *runtimedRuntime) completePostStart(ctx context.Context, t *podTrack, po
 // the container is terminated and restarted according to its restart policy").
 //
 // Under an effective policy that restarts a failed container the kill IS a re-exec,
-// so it routes through the single restart authority (B26) — one backoff schedule,
+// so it routes through the single restart authority — one backoff schedule,
 // one restart window, runtimed's restart_count — and the replacement re-runs the
 // hook (rerunPostStart).
 //

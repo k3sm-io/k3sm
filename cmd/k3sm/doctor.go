@@ -150,8 +150,8 @@ func checkSIP(env doctorEnv) checkResult {
 
 // checkHelper reports the k3sm-netd root helper's launchd state. Installed and
 // running is PASS; installed-but-stopped or not-installed are WARN — the
-// DEFAULT runtimed runtime refuses to start unprivileged without it (the M10.1
-// preflight), but root, `--runtime hostprocess` (rootless dev), and
+// DEFAULT runtimed runtime refuses to start unprivileged without it (the
+// runtime preflight), but root, `--runtime hostprocess` (rootless dev), and
 // `--network none` (control-plane-only) all work, so it is not a hard fail.
 func checkHelper(env doctorEnv) checkResult {
 	installed, running := env.helperState()

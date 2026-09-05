@@ -125,7 +125,7 @@ func (f *followReader) Close() error {
 // logSink is an in-process grpc.ServerStreamingServer[LogEntry] that collects the
 // runtime's GetLogs output into a buffer the VK logs handler returns as a
 // ReadCloser. Like watchStream, it lets the provider consume a streaming
-// RuntimeServer method in-process without a gRPC socket; the M2 daemon split
+// RuntimeServer method in-process without a gRPC socket; a future daemon split
 // swaps it for a real client stream.
 type logSink struct {
 	grpc.ServerStream

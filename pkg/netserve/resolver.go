@@ -110,13 +110,13 @@ type dnsZone interface {
 	LookupService(namespace, name string) (serviceTarget, bool)
 }
 
-// identitySource is the OPTIONAL record-synthesis capability of a dnsZone
-// (M10.1): headless all-backends A sets, per-endpoint identity A records
+// identitySource is the OPTIONAL record-synthesis capability of a dnsZone:
+// headless all-backends A sets, per-endpoint identity A records
 // (StatefulSet hostname / dashed-IP), SRV per named port, and the authoritative
 // PTR reverse zone. The resolver detects it with a type assertion (the same
 // optional-capability pattern as provider.StatsSource): the production
 // serviceZone implements it off the Services + EndpointSlices listers; a zone
-// without it keeps the pre-M10.1 A/VIP-only behavior.
+// without it keeps the A/VIP-only behavior.
 type identitySource interface {
 	// SynthRecords synthesizes the namespace/name Service's full record set
 	// (dns.Synthesize semantics). ok==false for an absent or ExternalName
@@ -155,7 +155,7 @@ type dnsForwarder interface {
 // minimal authoritative resolver over the helper/direct-bound sockets instead.
 //
 // The divergence is scope, not behavior: this resolver answers cluster Service
-// A records + forwards off-cluster names — and, since M10.1, the DNS identity
+// A records + forwards off-cluster names — plus the DNS identity
 // surface synthesized by darwin-net's dns.Synthesize (consumed, never
 // reimplemented): headless all-backends A sets, per-endpoint identity A records
 // (<hostname>.<svc>... for StatefulSet pods, dashed-IP otherwise), SRV per
@@ -165,7 +165,7 @@ type dnsForwarder interface {
 // NXDOMAIN) and are NEVER forwarded upstream. AAAA stays unanswered (k3sm's
 // CIDRs are IPv4).
 //
-// ExternalName Services ARE resolved (B19): the target is chased through the
+// ExternalName Services ARE resolved: the target is chased through the
 // upstream forwarder and FLATTENED CNAME→A — the resolver is A-only, so a client
 // gets the target's A records under the queried name, never the upstream CNAME RR (a
 // TypeCNAME / ai_canonname query gets NODATA, the same rule the off-cluster forward
@@ -876,7 +876,7 @@ func isNotFound(err error) bool {
 // serviceZone is the production dnsZone: it reads the cluster Service set from a
 // Services lister and the backend endpoints from an EndpointSlices lister (both
 // informer caches), so a lookup is in-memory with no apiserver round-trip per
-// query. It also implements identitySource (M10.1): the record-synthesis inputs
+// query. It also implements identitySource: the record-synthesis inputs
 // are extracted from those listers and handed to darwin-net's dns.Synthesize —
 // consumed, never reimplemented.
 type serviceZone struct {

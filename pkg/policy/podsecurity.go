@@ -39,12 +39,11 @@ const (
 // control-plane upgrade, turning a kube bump into an unreviewed policy change.
 const PodSecurityPinnedVersion = "v1.36"
 
-// The shipped cluster-default PSA level tuple (M10.0, Res.2 — the warn-first
-// posture). These three constants ARE the posture; nothing else in the tree
+// The shipped cluster-default PSA level tuple (the warn-first posture). These three constants ARE the posture; nothing else in the tree
 // decides a level:
 //
 //   - DefaultPodSecurityEnforceLevel is privileged, i.e. admission rejects
-//     NOTHING. The B71 baseline-ENFORCE cutover is exactly this one value
+//     NOTHING. The baseline-ENFORCE cutover is exactly this one value
 //     becoming PodSecurityLevelBaseline (operators can already take it per-boot
 //     with `k3sm server --psa-enforce-baseline`, which is argv-reversible: the
 //     config file is re-rendered on every boot, so dropping the flag reverts the
@@ -70,8 +69,8 @@ const (
 // PodSecurityAdmissionConfigYAML renders the apiserver's
 // --admission-control-config-file content: an apiserver.config.k8s.io/v1
 // AdmissionConfiguration embedding the pod-security.admission.config.k8s.io/v1
-// PodSecurityConfiguration cluster defaults (M10.0, Res.2). Both apiVersions are
-// pinned to the vendored k8s v1.36.2 (Res.3).
+// PodSecurityConfiguration cluster defaults. Both apiVersions are pinned to the
+// vendored k8s v1.36.2.
 //
 // It is a PURE function and the SINGLE authority for the level tuple: enforce is
 // the caller's argument (DefaultPodSecurityEnforceLevel ships it), warn and audit
@@ -79,7 +78,7 @@ const (
 // and the argv; they never re-decide a level.
 //
 // exemptions is deliberately EMPTY (usernames/runtimeClasses/namespaces all []):
-// warn-mode needs none — nothing is rejected — and the B71 enforce cutover picks
+// warn-mode needs none — nothing is rejected — and the enforce cutover picks
 // exemptions from pre-flight scan evidence, never from a pre-baked guess that
 // would silently carry a hole into enforcement.
 func PodSecurityAdmissionConfigYAML(enforce PodSecurityLevel) string {

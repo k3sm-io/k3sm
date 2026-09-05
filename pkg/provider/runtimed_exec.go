@@ -30,21 +30,21 @@ import (
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
-// M2.5 — provider-served exec/attach/port-forward. The Virtual Kubelet provider
+// Provider-served exec/attach/port-forward. The Virtual Kubelet provider
 // replaces the kubelet, so it must serve `kubectl exec`/`attach`/`port-forward`
 // itself by driving the runtime/v1 Exec/Attach/PortForward bidi RPCs. These are a
 // provider-implementation gap against a FROZEN apis contract (no apis change):
 // runtimedRuntime wires the VK AttachIO (and the port-forward byte stream) to the
-// runtime stream in-process, mirroring the watchStream/logSink adapters so the M2
-// daemon split swaps the transport, not the logic.
+// runtime stream in-process, mirroring the watchStream/logSink adapters so a
+// future out-of-process daemon split swaps the transport, not the logic.
 
-// Compile-time check that runtimedRuntime serves the streaming verbs (M2.5).
+// Compile-time check that runtimedRuntime serves the streaming verbs.
 var _ StreamingRuntime = (*runtimedRuntime)(nil)
 
 // streamPipe is an in-process grpc.BidiStreamingServer[Req, Resp]: the runtime
 // server consumes it (Recv pulls client→server frames, Send pushes server→client
 // frames) while the provider drives the client side. It mirrors the in-process
-// watchStream/logSink/execStream adapters so the M2 daemon split swaps it for a
+// watchStream/logSink/execStream adapters so a future daemon split swaps it for a
 // real gRPC client stream rather than a redesign.
 //
 // reqs carries the client frames the provider feeds (initial params, stdin,
@@ -280,7 +280,7 @@ func streamAttachIO[Req, Resp any](
 	// stdout byte is written to attach.Stdout() BEFORE invoke returns — no stdout is
 	// left buffered past this call. That is exactly why a `tar cf -` stream (kubectl
 	// cp pod:src → local) is never truncated: the terminal ExecResult cannot be
-	// observed until all preceding stdout Sends have completed. The M2 daemon split
+	// observed until all preceding stdout Sends have completed. A future daemon split
 	// (which swaps the in-process streamPipe transport — see the streamPipe type
 	// comment — for a real gRPC client stream) MUST preserve this by BLOCKING on an
 	// explicit read-to-close drain of the server stream before RunInContainer

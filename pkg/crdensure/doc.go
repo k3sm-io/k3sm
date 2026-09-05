@@ -26,7 +26,7 @@ limitations under the License.
 // That neutrality is the whole reason this package exists as its own package.
 // The MeshPeer CRD sits beside the MLXModel manifest in the same apis directory,
 // and adopting it into this ensure had to be a deliberate act carrying its own
-// mesh-regression check. It has since been adopted (B224): cmd/k3sm's runServer
+// mesh-regression check. It has since been adopted: cmd/k3sm's runServer
 // hands this package MeshPeerCRD() on the mesh path, once, before the worker-join
 // supervisor exists. Had this package globbed a manifest directory, or grown a
 // package-level set of "the CRDs k3sm applies", that adoption would have happened

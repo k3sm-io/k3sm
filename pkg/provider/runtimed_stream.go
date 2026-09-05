@@ -28,7 +28,7 @@ import (
 // runtimed Runtime satisfies runtimev1.RuntimeServer (server-side), so to consume
 // its WatchPodStatus in-process — without a gRPC socket — we hand it this stream:
 // Send pushes each event onto a buffered channel the provider reads. It mirrors
-// the fake stream runtimed's own tests use, making the M2 daemon split (a real
+// the fake stream runtimed's own tests use, making a future daemon split (a real
 // gRPC stream) a swap of this type, not a redesign.
 type watchStream struct {
 	grpc.ServerStream

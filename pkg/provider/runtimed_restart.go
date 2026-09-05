@@ -27,7 +27,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
-// B26 — the provider is the single exit-driven restart authority on the
+// The provider is the single exit-driven restart authority on the
 // runtimed path. runtimed performs no exit-driven restarts (its contract:
 // apis runtime.proto Container.restart_policy); the provider observes every
 // container termination via the status stream + the GetPodStatus backstop
@@ -37,7 +37,7 @@ import (
 // RPC — the same runtime action the liveness-probe path drives.
 //
 // Three triggers, one authority: an observed exit (observeExits), a committed
-// liveness failure and a failed postStart hook (both via killAndRestart, B39).
+// liveness failure and a failed postStart hook (both via killAndRestart).
 //
 // Idempotency (binding): the trigger is keyed per container on the
 // termination's identity — terminationKey{restart_count, exit code,
@@ -61,14 +61,14 @@ import (
 // installs a new podTrack while a worker may be blocked inside RestartContainer,
 // so a worker that looked its track up on return would mutate the replacement's
 // bookkeeping and could release a claim it does not hold — reintroducing the two
-// competing restart authorities B26 exists to collapse.
+// competing restart authorities this single-authority design exists to collapse.
 
 // reasonCrashLoopBackOff is the corev1 waiting reason the provider synthesizes
 // while a container sits between its exit and the scheduled re-exec.
 const reasonCrashLoopBackOff = "CrashLoopBackOff"
 
 // The reasons recorded on the RestartContainer RPC, one per trigger. Both
-// triggers share the bookkeeping, the backoff and the count authority (B26); the
+// triggers share the bookkeeping, the backoff and the count authority; the
 // reason is the only thing that distinguishes them, and runtimed records it in
 // the replacement container's last_termination_state.
 const (
@@ -90,7 +90,7 @@ type terminationKey struct {
 
 // containerRestart is the per-container restart bookkeeping held in
 // podTrack.restarts under restartMu. It is the single authority for both restart
-// triggers (B26): the exit-driven path (observeExits) and the liveness-probe
+// triggers: the exit-driven path (observeExits) and the liveness-probe
 // path (restartForLiveness) share one entry, so there is exactly one backoff
 // schedule and one restart-window per container, never two competing ones.
 //
@@ -132,7 +132,7 @@ type containerRestart struct {
 	// that already has a worker back to scheduleRestartLocked, which gates solely
 	// on `attempt` — two concurrent RestartContainer RPCs and two independent
 	// backoff.Next() advances against one schedule, exactly the
-	// two-competing-authorities condition B26 exists to eliminate.
+	// two-competing-authorities condition this design exists to eliminate.
 	attemptGen uint64
 	// delay is the backoff wait of the in-flight (or most recent) re-exec — the
 	// value the CrashLoopBackOff message reports.
@@ -233,7 +233,7 @@ func isNativeSidecar(pod *corev1.Pod, name string) bool {
 	return false
 }
 
-// observeExits is the B26 trigger: called from buildStatus on every runtime
+// observeExits is the exit-driven trigger: called from buildStatus on every runtime
 // status observation (stream, backstop, direct GetPodStatus), it decides — via
 // the effective-policy resolver — which terminated containers are due a
 // restart and schedules each re-exec exactly once (see terminationKey).
@@ -246,7 +246,7 @@ func isNativeSidecar(pod *corev1.Pod, name string) bool {
 // Init:CrashLoopBackOff under a held-Pending pod is not implemented).
 //
 // Terminal gate: when runtimed's mains-only phase is Succeeded/Failed and no
-// main container is due a restart, the pod is genuinely terminal (the B74 Job
+// main container is due a restart, the pod is genuinely terminal (the Job
 // contract: Never + exit≠0 → Failed, exit 0 → Succeeded) — nothing restarts,
 // including sidecars (runtimed owns their reverse-order teardown), and any
 // pending re-exec is cancelled. When a main IS due (Always, or OnFailure on a
@@ -269,7 +269,7 @@ func (r *runtimedRuntime) observeExits(pod *corev1.Pod, t *podTrack, rs *runtime
 	collect := func(cs *runtimev1.ContainerStatus, containerPolicy *corev1.ContainerRestartPolicy) bool {
 		state := toContainerState(cs.GetState())
 		if state.Running != nil {
-			// The evidence that closes an open restart window (B26): the
+			// The evidence that closes an open restart window: the
 			// replacement process is up.
 			running = append(running, cs.GetName())
 			return false
@@ -344,8 +344,8 @@ func (r *runtimedRuntime) scheduleRestartLocked(t *podTrack, podID, name string,
 // podProber's restartFunc seam (probe.go) routes here instead of calling
 // RestartContainer directly, so a committed liveness failure and an observed
 // exit share one containerRestart entry — one restart window, one backoff
-// schedule, one surfaced restartCount (runtimed's, bumped by the RPC). Before
-// B26 the probe path bypassed all of it, so a liveness restart was invisible to
+// schedule, one surfaced restartCount (runtimed's, bumped by the RPC). The probe
+// path used to bypass all of it, so a liveness restart was invisible to
 // the exit-driven bookkeeping and could race a second RestartContainer against it.
 //
 // ctx is the probe tick's context and is not propagated: the re-exec
@@ -359,7 +359,7 @@ func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, contain
 
 // killAndRestart is the kill-a-live-container arm of the single restart authority,
 // shared by the two triggers that decide a running container must go: a committed
-// liveness failure and a failed postStart hook (B39 — upstream kills the container
+// liveness failure and a failed postStart hook (upstream kills the container
 // and lets its restart policy restart it). Both are "terminate, then re-spawn",
 // which is exactly the RestartContainer RPC, and both must share one
 // containerRestart entry so there is one restart window, one backoff schedule and
@@ -422,7 +422,7 @@ func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRes
 // the single count authority.
 //
 // A failed RPC is retried under the advanced backoff, indefinitely, until it
-// succeeds or the pod goes away (B26). Returning after one failed attempt would
+// succeeds or the pod goes away. Returning after one failed attempt would
 // abandon the container forever: a failed re-exec never bumps runtimed's
 // restart_count, so the next status observation reproduces the same
 // terminationKey, the idempotency latch drops it, and nothing can ever
@@ -430,7 +430,7 @@ func (r *runtimedRuntime) startRestartWorkerLocked(t *podTrack, cr *containerRes
 // loop, so the worker — not the observer — owns the retry.
 //
 // It returns once the RPC succeeds — after re-dispatching the container's postStart
-// hook, which upstream runs on every container start (B39). The restart window stays
+// hook, which upstream runs on every container start. The restart window stays
 // open until the container is observed running (observeExits → observeRunning),
 // which is what keeps the CrashLoopBackOff surface and the Running phase hold stable
 // across the swap.
@@ -457,7 +457,7 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		err := r.restartContainerReason(ctx, podID, name, reason)
 		if err == nil {
 			// The container has been started again, so its postStart hook fires
-			// again (B39): upstream runs the hook inside startContainer, which is
+			// again: upstream runs the hook inside startContainer, which is
 			// the same path a restart takes.
 			r.rerunPostStart(t, podID, name)
 			return
@@ -536,8 +536,8 @@ func (r *runtimedRuntime) podByID(id string) *corev1.Pod {
 // scheduled by construction). A restarting sidecar alone never lifts a phase:
 // the mains decide it.
 //
-// This overlay is now a belt to derivePhase's braces, not the only guard: since
-// B26 derivePhase itself honors the effective restart policy, so a restartable
+// This overlay is now a belt to derivePhase's braces, not the only guard:
+// derivePhase itself honors the effective restart policy, so a restartable
 // termination reports Running even on a status built before any bookkeeping
 // exists. The overlay still owns the surface (Waiting/lastState) and covers the
 // window where runtimed reports neither a terminated nor a running container.

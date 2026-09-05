@@ -27,9 +27,9 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 )
 
-// The canonical kubelet identity. The Node authorizer (M4) keys off exactly this
-// subject: CN=system:node:<nodeName>, O=system:nodes. Wiring --client-ca-file in M3
-// so these certs authenticate makes the M4 Node,RBAC flip a pure authorizer switch.
+// The canonical kubelet identity. The Node authorizer keys off exactly this
+// subject: CN=system:node:<nodeName>, O=system:nodes. --client-ca-file is wired
+// unconditionally so these certs authenticate in every posture.
 const (
 	systemNodePrefix = "system:node:"
 	systemNodesGroup = "system:nodes"

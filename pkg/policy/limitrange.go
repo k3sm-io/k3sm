@@ -26,11 +26,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// defaultLimitRangeName / defaultLimitRangeNamespace name the M10.0 memory-only
+// defaultLimitRangeName / defaultLimitRangeNamespace name the memory-only
 // default LimitRange. It lives in the `default` namespace ONLY — deliberately
-// no other namespaces and NO namespace-watching controller (Res.5 scopes the
-// default object to the out-of-the-box workload namespace; an operator who
-// wants it elsewhere copies it).
+// no other namespaces and NO namespace-watching controller: the default object
+// is scoped to the out-of-the-box workload namespace, and an operator who wants
+// it elsewhere copies it.
 const (
 	defaultLimitRangeName      = "k3sm-default-memory"
 	defaultLimitRangeNamespace = "default"
@@ -44,7 +44,7 @@ const (
 )
 
 // EnsureDefaultLimitRange idempotently provisions the MEMORY-ONLY default
-// LimitRange in the `default` namespace (M10.0, Res.5): type Container with
+// LimitRange in the `default` namespace: type Container with
 // default.memory + defaultRequest.memory, so a container that declares no
 // resources still gets an honest memory bound. Memory-ONLY because memory IS
 // enforced by the runtime (the rusage sampler → OOMKill); CPU is best-effort
@@ -54,7 +54,7 @@ const (
 //
 // CREATE-OR-UPDATE (managedObject.ensure), like every sibling Ensure* here. The
 // earlier contract was create-if-absent, on the reasoning that an in-cluster
-// LimitRange is operator-space; that is REVERSED deliberately (B153), because the
+// LimitRange is operator-space; that is REVERSED deliberately, because the
 // same create-only path is what made a changed policy inert on every existing
 // cluster — an object carrying the k3sm.io/managed label is k3sm-owned, and a
 // silently stale default is worse than a clobbered tuning. An operator who wants

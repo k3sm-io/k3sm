@@ -58,10 +58,10 @@ type Options struct {
 	Declares func(port int) bool
 	// LBDeclarers reports WHICH Services of type LoadBalancer in the
 	// authoritative set declare port, by namespace+name — the backing for the
-	// node-own-address branch of the privileged-port authorizer (the M10.3
+	// node-own-address branch of the privileged-port authorizer (the
 	// ingress/svclb listener). nil denies every <1024 node-address bind (fail
 	// safe). It yields identities rather than a bare bool because that branch is
-	// an ALLOWLIST (B133): declaring the port is necessary but NOT sufficient.
+	// an ALLOWLIST: declaring the port is necessary but NOT sufficient.
 	LBDeclarers func(port int) []ServiceRef
 	// NodeAddressService is the ONE Service permitted to authorize a privileged
 	// bind on this node's own address — the canonical ingress LoadBalancer. The
@@ -74,13 +74,13 @@ type Options struct {
 	// NodeAddressService itself declares the port. The zero Addr disables the
 	// node-address branch entirely (deny).
 	//
-	// DORMANT BY CONFIGURATION, NOT BY CONSTRUCTION (B133). Since B116 the
+	// DORMANT BY CONFIGURATION, NOT BY CONSTRUCTION. The
 	// ingress/svclb listeners bind the WILDCARD in-process (unprivileged on
 	// Darwin at any port), so nothing asks netd for a node-address bind, and the
 	// installed plist renders NO --node-ip — leaving this zero and the branch
 	// denying. The branch is deliberately KEPT rather than deleted: it is the
 	// authorization design for any future privileged specific-address bind, and
-	// B133 narrowed it to the NodeAddressService allowlist so re-arming it cannot
+	// it was narrowed to the NodeAddressService allowlist so re-arming it cannot
 	// hand the node's address to whichever Service happens to declare the port.
 	// pkg/install::TestNetdPlistXML pins the absence of --node-ip, so re-adding
 	// the flag reddens rather than silently re-arming the branch.
@@ -144,8 +144,8 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 
 // PortPolicy is the DENY-BY-DEFAULT privileged-port (<1024) bind policy the
 // authorizer applies. A bind is authorized iff the requested address falls in
-// exactly one of two explicitly named classes (M10.3 — an explicit policy
-// decision, never allowed-by-coincidence):
+// exactly one of two explicitly named classes (an explicit policy decision,
+// never allowed-by-coincidence):
 //
 //   - a Service-CIDR VIP whose port some Service in the authoritative set
 //     declares (the proxy's infra VIPs, e.g. 10.43.0.10:53), or
@@ -153,7 +153,7 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //     canonical ingress LoadBalancer, kube-system/k3sm-ingress — declares the
 //     port (the ingress/svclb listener).
 //
-// The node-address class is an ALLOWLIST keyed on namespace+name (B133), not a
+// The node-address class is an ALLOWLIST keyed on namespace+name, not a
 // test on the requester's shape. It used to authorize the bind for ANY Service
 // of type LoadBalancer declaring the port, in any namespace — which made the
 // requesting object its own authorization predicate: any tenant able to create

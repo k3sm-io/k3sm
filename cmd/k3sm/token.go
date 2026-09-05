@@ -75,7 +75,7 @@ func runTokenCreate(args []string) error {
 			err, install.DefaultServiceUser)
 	}
 
-	// M6.1: a SERVER token reconstructs the cluster CAs (it authorizes the CA-bundle
+	// A SERVER token reconstructs the cluster CAs (it authorizes the CA-bundle
 	// endpoint and its secret is the bundle's KDF passphrase). It is stable (not
 	// TTL-bounded) and DISTINCT from a worker token — give it only to a trusted
 	// control-plane Mac. A leaked WORKER token can never reconstruct the signing CA.

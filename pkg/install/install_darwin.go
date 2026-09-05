@@ -37,7 +37,7 @@ import (
 // darwinSystem is the production System: it performs the privileged operations
 // via the macOS tools (dscl for the service user, ditto for the root-owned copy,
 // launchctl for the daemons) and os.Chown for ownership. It is exercised by the
-// M2 acceptance gate (the one-time root install), NOT by unit tests — the
+// install acceptance gate (the one-time root install), NOT by unit tests — the
 // standards forbid real privilege in unit tests, so install_test.go uses the
 // fake instead.
 type darwinSystem struct{}

@@ -25,8 +25,8 @@ limitations under the License.
 // inside its own micro-VM: the VM is the isolation boundary, so the Pod carries
 // NO securityContext (k3sm admission rejects a foreign runAsUser, and a rootless
 // daemon cannot mount the cgroups and create the containers a build needs). This
-// is the sanctioned builder posture: B112's foreign-user admission never fires
-// because there is no foreign user.
+// is the sanctioned builder posture: the foreign-user admission policy never
+// fires, because there is no foreign user.
 //
 // # The three lifecycle verbs
 //

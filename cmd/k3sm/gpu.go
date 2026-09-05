@@ -51,7 +51,7 @@ const maxLabelValueLen = 63
 
 // applyGPUAdvertisement advertises — or REMOVES — this node's GPU: the
 // mlx.k3sm.io/gpu extended resource in both Capacity and Allocatable, plus the
-// mlx.k3sm.io presence/chip/chip-family/memory labels. It is the M8 counterpart of
+// mlx.k3sm.io presence/chip/chip-family/memory labels. It is the MLX counterpart of
 // applyVirtualizationLabel and follows the same delete-on-loss discipline: a node
 // that LOSES the capability across a restart must stop advertising it, in the
 // resource as well as the labels, or the scheduler keeps binding GPU pods to a node

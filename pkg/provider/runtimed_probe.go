@@ -153,7 +153,7 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 	// restartFunc connects the restart DECISION (the prober owns the gate reset) to
 	// the SHARED restart authority: a committed liveness failure routes through the
 	// SAME per-container containerRestart bookkeeping and the SAME CrashLoopBackOff
-	// schedule the exit-driven path uses (B26), which then drives the apis:M2.2
+	// schedule the exit-driven path uses, which then drives the runtime's
 	// RestartContainer RPC. It deliberately does NOT call the RPC directly — that
 	// bypass left the liveness restart invisible to the exit-driven bookkeeping and
 	// let two authorities issue competing re-execs for one container.
@@ -220,11 +220,11 @@ func (r *runtimedRuntime) proberFor(id string) probeState {
 
 // publishStatusUpdate re-renders the pod's status (with the prober overlay) and
 // runs the VK callback, after a provider-side change the runtime's own status
-// stream cannot report — a probe verdict, or a postStart hook completing (B39). It
+// stream cannot report — a probe verdict, or a postStart hook completing. It
 // reads the callback under the lock but invokes it OUTSIDE the lock (the VK
 // NotifyPods re-entrancy rule), and no-ops if the pod was deleted concurrently. It
 // renders via buildStatus — the single status assembly point — so such a publish
-// carries the B79 stable PodReady prior and the B26 CrashLoopBackOff overlay (a
+// carries the stable PodReady prior and the CrashLoopBackOff overlay (a
 // probe tick while a re-exec is pending must not flash the pod Failed).
 func (r *runtimedRuntime) publishStatusUpdate(ctx context.Context, id string) {
 	r.mu.Lock()

@@ -32,8 +32,8 @@ import (
 // and renders Node/Pod status; the Runtime turns a corev1.Pod into running work
 // on this Mac and reports its status back.
 //
-// Two implementations satisfy it: HostProcess (the M0 native-process runtime,
-// no isolation) and runtimedRuntime (the M1 in-process runtimed image runtime —
+// Two implementations satisfy it: HostProcess (the native-process runtime,
+// no isolation) and runtimedRuntime (the in-process runtimed image runtime —
 // OCI pull → clonefile → ad-hoc-sign → Seatbelt confine). Defining the interface
 // here, at the consumer, keeps the provider decoupled from either backend and
 // lets the server pick one behind a flag.
@@ -75,10 +75,10 @@ type StatsSource interface {
 
 // StreamingRuntime is an OPTIONAL Runtime capability: a Runtime that serves the
 // container streaming verbs — exec, attach, and port-forward — by wiring the VK
-// AttachIO/byte stream to the runtime/v1 Exec/Attach/PortForward RPCs (M2.5).
+// AttachIO/byte stream to the runtime/v1 Exec/Attach/PortForward RPCs.
 // VKProvider delegates to it via a type assertion, returning NotFound when the
 // backing Runtime lacks it. The runtimed runtime implements it; HostProcess (the
-// M0 native-process runtime) does not — it has no confined exec channel.
+// native-process runtime) does not — it has no confined exec channel.
 // Defining it here (consumer-side) keeps the core Runtime interface small, the
 // same pattern as StatsSource.
 type StreamingRuntime interface {

@@ -18,7 +18,7 @@ limitations under the License.
 // start: the admission guardrails — ValidatingAdmissionPolicies (GA since 1.30,
 // so no webhook server is needed; the apiserver evaluates the CEL in-process)
 // plus one MutatingAdmissionPolicy — and the plain (non-admission) default
-// policy objects, today the M10.0 memory-only LimitRange.
+// policy objects, today the memory-only LimitRange.
 //
 // Two are Deny guards:
 //   - os=darwin (the INTENT guard): every Pod must target k3sm's darwin nodes via
@@ -32,14 +32,14 @@ limitations under the License.
 //     _k3sm identity, since the runtime has no per-pod uid/gid isolation — rejected
 //     at admission, never silently coerced.
 //
-// Two are Warn advisories (M3.1) that surface honest k3sm datapath divergences to
+// Two are Warn advisories that surface honest k3sm datapath divergences to
 // kubectl WITHOUT rejecting the Service (failurePolicy Ignore so they can only
 // ever warn):
 //   - externalTrafficPolicy: Local is not honored (the userspace splice does not
 //     preserve client source IP — only Cluster).
 //   - UDP Service ports have no datapath yet (the proxy opens no UDP listener).
 //
-// One is a MUTATING policy (B76) — a MutatingAdmissionPolicy (beta,
+// One is a MUTATING policy — a MutatingAdmissionPolicy (beta,
 // admissionregistration.k8s.io/v1beta1), which unlike the Deny/Warn VAPs above CHANGES
 // the stored object:
 //   - daemonset-provider-toleration: a DaemonSet-owned pod is created by the DS
@@ -52,7 +52,7 @@ limitations under the License.
 //     kubernetes.io/os=darwin nodeSelector — a DaemonSet declares its own placement
 //     intent and overriding it would defeat the DS's selector/affinity (Res.7).
 //
-// One is a plain policy OBJECT, not an admission policy (M10.0, Res.5):
+// One is a plain policy OBJECT, not an admission policy:
 //   - the memory-only default LimitRange in the `default` namespace
 //     (EnsureDefaultLimitRange): default/defaultRequest MEMORY per container —
 //     memory is enforced by the runtime (rusage sampler → OOMKill) — and
@@ -62,7 +62,7 @@ limitations under the License.
 // PROVISIONING CONTRACT (every Ensure* here, one implementation — ensure.go):
 // CREATE-OR-UPDATE. The object is created when absent and RECONCILED onto the
 // current shape when its stored spec has drifted; an already-current object is not
-// written at all. This replaced create-if-absent in B153, which had frozen every
+// written at all. This replaced create-if-absent, which had frozen every
 // policy's CEL — and the foreign-user policy's allowed uid — at whatever shape the
 // cluster was first provisioned with, making any later fix inert on an existing
 // datastore. The k3sm.io/managed label is stamped at create and is otherwise
@@ -70,11 +70,12 @@ limitations under the License.
 //
 // POSTURE INDEPENDENCE: every policy here is provisioned in EVERY --network
 // posture. The foreign-user ceiling used to be gated on the netd-helper backend
-// (B153), which let a `--network none`/`direct` cluster run with the guard absent.
+// which let a `--network none`/`direct` cluster run with the guard absent.
 //
 // CONFORMANCE requirement: a k3sm DaemonSet MUST declare
 // nodeSelector: kubernetes.io/os=darwin in its OWN pod template. The os=darwin Deny VAP
-// (the intent guard) still requires that selector on every pod; B76 injects only the
+// (the intent guard) still requires that selector on every pod; the mutating policy
+// injects only the
 // toleration and deliberately does not supply the selector (injecting it would override
 // the DS's placement, Res.7).
 package policy

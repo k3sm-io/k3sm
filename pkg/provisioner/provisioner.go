@@ -62,7 +62,7 @@ const (
 //
 // Install invariant: every node's _k3sm home — hence its runtime root — is the
 // SAME absolute path across the cluster, so this single advisory path is valid
-// cluster-wide (M4 install enforces the homogeneous-home invariant).
+// cluster-wide (`k3sm install` enforces the homogeneous-home invariant).
 func ClassForRoot(runtimeRoot string) storagev1.LocalPathClass {
 	class := storagev1.DefaultLocalPathClass()
 	class.BasePath = filepath.Join(runtimeRoot, "storage")

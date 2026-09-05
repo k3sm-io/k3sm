@@ -61,7 +61,7 @@ const systemNodesGroup = "system:nodes"
 // in-pod-kubectl reference path runs as (TestM2_InPodKubectl, the snapshotManager
 // workload). Provision binds it to the
 // minimal in-pod reader Role so that path keeps working once the authorizer is
-// Node,RBAC (default-deny). They are EXPORTED so the M2 e2e / in-pod test binds the
+// Node,RBAC (default-deny). They are EXPORTED so the e2e / in-pod test binds the
 // SAME names — one source of truth, not two hard-coded copies that can drift.
 const (
 	ConformanceNamespace      = "default"
@@ -175,9 +175,9 @@ func ensureNodeDatapathRBAC(ctx context.Context, cs kubernetes.Interface) error 
 
 // ensureInPodReaderRBAC provisions the minimal namespaced Role + RoleBinding that
 // lets the in-pod-kubectl reference ServiceAccount (sa in namespace ns) read pods,
-// configmaps, and services after the Node,RBAC flip — so the M2 in-pod-kubectl
+// configmaps, and services after the Node,RBAC flip — so the in-pod-kubectl
 // conformance path stays green under default-deny. It is deliberately MINIMAL
-// (read-only, three core resources, one namespace): the M4 acceptance asserts this
+// (read-only, three core resources, one namespace): the acceptance gate asserts this
 // SA is authorized for those verbs yet DENIED everything else (e.g. secrets). The
 // binding may name an SA that does not exist yet — RBAC resolves subjects by name at
 // request time — so it is safe to provision before the workload is created.

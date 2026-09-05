@@ -28,7 +28,7 @@ import (
 )
 
 // GuestArtifactsSubdir is the component under the runtimed on-disk root that
-// holds this node's content-addressed guest boot artifact cache (B108). It
+// holds this node's content-addressed guest boot artifact cache. It
 // cites the runtimed constant so the in-process node and the standalone lab
 // twin can never derive different cache layouts.
 //

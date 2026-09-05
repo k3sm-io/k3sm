@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package svclb is k3sm's klipper-lite LoadBalancer implementation (M10.3,
-// closes B32): a server-side controller that, for every Service of type
+// Package svclb is k3sm's klipper-lite LoadBalancer implementation: a
+// server-side controller that, for every Service of type
 // LoadBalancer, binds BindAddr:servicePort listeners and splices each accepted
 // connection to the Service's ClusterIP VIP (a plain two-way TCP forward —
 // the L4 Service proxy behind the VIP keeps EndpointSlice tracking, affinity,
-// and mesh-egress discipline). It is DISTINCT from pkg/loadbalancer, the M6
+// and mesh-egress discipline). It is DISTINCT from pkg/loadbalancer, the
 // client-side HA apiserver LB.
 //
-// # Bind and advertise are different addresses (B116)
+// # Bind and advertise are different addresses
 //
 // Listeners bind the WILDCARD (0.0.0.0) — every interface answers, matching
 // Docker Desktop's vpnkit and k3s' klipper-lb — while status advertises the

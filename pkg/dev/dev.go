@@ -343,7 +343,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 
 	// Boot a detached `k3sm server` on the shipped admission defaults (PSA
 	// enforce=privileged, warn=baseline) — never --psa-enforce-baseline here: the
-	// M10 PSA cutover criterion demands a separate flagged boot
+	// PSA cutover criterion demands a separate flagged boot
 	// (K3SM_PSA_ENFORCE=1), and passing the flag by default made
 	// TestM10_PSADefaultWarn/AuditLogLevel structurally unpassable (they assert
 	// the shipped default while the harness booted the cutover). K3SM_WORK_DIR is
@@ -579,7 +579,7 @@ func removablePodRoot(inst Instance, base string) string {
 // System seam — so a stale pid from a crashed run reads LivenessDead without the
 // manifest being lost.
 //
-// The verdict is three-valued (B211). An unprivileged shell cannot signal a
+// The verdict is three-valued. An unprivileged shell cannot signal a
 // root-owned `--datapath` server, and reporting that EPERM as dead made `k3sm dev
 // list` print `stale` for a healthy instance — the one word that invites an
 // operator to clean it up. A pid this process cannot probe is reported
@@ -739,7 +739,7 @@ func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, run
 // spawnServer starts a detached `k3sm server` (this binary re-exec'd) in its own
 // process group with the config-superset argv, redirecting its output to
 // <workDir>/server.log, and returns its pid. It does not wait — the server runs
-// until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the M10 audit/PSA e2e
+// until `down` SIGTERMs it. K3SM_WORK_DIR is exported so the audit/PSA e2e
 // read the same workdir.
 func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string, alloc instancePorts, network, runtimeName, execShimDir, pathShim, dnsShim string) (*serverProc, error) {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {

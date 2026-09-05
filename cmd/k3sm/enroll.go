@@ -53,7 +53,7 @@ import (
 // joining during bring-up can be handed the index the server is claiming.
 // podCIDR assignment is the LOWEST FREE index ≥ 1 (index 0 is the control-plane
 // node's, pinned by EnrollSelf); it is a dev-scale scheme — robust index recycling
-// across node deletes is an M4 concern.
+// across node deletes is not implemented.
 type meshEnroller struct {
 	client     rest.Interface
 	clusterPod netip.Prefix
@@ -353,7 +353,7 @@ func bootstrapListenAddr(meshIP string) string {
 }
 
 // bootstrapServerDeps are the supervisor's wired dependencies. The worker-join deps
-// (CAs, tokens, node-passwords, enroller) are always set; the M6.1 server-join deps
+// (CAs, tokens, node-passwords, enroller) are always set; the server-join deps
 // (ServerAuth + Bundle + APIServers) are set only in the HA posture, where they light up
 // the CA-bundle endpoint.
 type bootstrapServerDeps struct {
@@ -367,13 +367,13 @@ type bootstrapServerDeps struct {
 	apiServers    []string
 }
 
-// startBootstrapServer serves the worker-join endpoint (and, in HA, the M6.1 CA-bundle
+// startBootstrapServer serves the worker-join endpoint (and, in HA, the CA-bundle
 // endpoint) at bootstrapListenAddr over a TLS listener presenting [serving-leaf,
 // cluster-CA] so a joining node's CA-hash pin verifies. It blocks until ctx is
 // cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
 // exercise is the two-Mac K3SM_LAB gate. The MeshPeer CRD the enroller's write lands
 // in is ensured fail-closed by runServer's step 4a before this listener exists, so a
-// join reaching it never meets a missing CRD (B224).
+// join reaching it never meets a missing CRD.
 func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *slog.Logger) error {
 	h := deps.hierarchy
 	meshIP := deps.meshIP

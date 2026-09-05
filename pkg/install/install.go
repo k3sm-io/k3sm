@@ -171,7 +171,7 @@ type System interface {
 	// basename: the LaunchDaemon plists exec the fixed installedBinary() path, so
 	// a build artifact named e.g. `k3sm-m2` must still land at InstallDir/k3sm (a
 	// basename-derived dst bricks both daemons with launchd's unrecoverable
-	// "Missing executable" — the live M2-gate failure this contract fixes).
+	// "Missing executable" — an observed live-hardware failure this contract fixes).
 	CopyToRootOwned(src, dst string) error
 	// EnsureSymlink idempotently makes link a symlink pointing at target — the
 	// `k3sm` launcher in LinkDir. It is the ONE thing install writes outside the
@@ -212,7 +212,7 @@ type System interface {
 	// server job's StandardOut/ErrorPath as _k3sm. launchd auto-creates a missing
 	// log dir with root-only perms when the root netd job spawns first — the
 	// _k3sm server job then fails "Service could not initialize" and never
-	// spawns (the live M2-gate failure this fixes). Idempotent: perms/owner are
+	// spawns (an observed live-hardware failure this fixes). Idempotent: perms/owner are
 	// re-applied on every install, repairing a previously mis-created dir.
 	EnsureLogDir(dir string, uid uint32) error
 	// EnsureRunDir creates (or repairs) the runtime run directory owned by the
@@ -521,7 +521,7 @@ const (
 
 // artifact is one thing install lays down. Every path is derived from a Config
 // accessor/const — never a re-hardcoded /Library/... literal (a third copy of a
-// path is the same divergence bug B62 fixes). A daemon binds its Label and
+// path is the same divergence bug this manifest exists to prevent). A daemon binds its Label and
 // plistPath into one entry so a booted-out label can never leave a leaked
 // KeepAlive plist (the original leak).
 type artifact struct {
@@ -606,8 +606,8 @@ func artifactManifest(cfg Config) []artifact {
 
 		// The two LaunchDaemons — netd before server (install order: netd is
 		// bootstrapped first, the server depends on it). Each removed on uninstall:
-		// Bootout(label) then RemoveAll(plistPath). Removing the plist is the B62
-		// fix — previously the label was booted out but the plist leaked, leaving a
+		// Bootout(label) then RemoveAll(plistPath). Removing the plist is the fix for
+		// a leak — previously the label was booted out but the plist leaked, leaving a
 		// phantom KeepAlive respawn-throttle root job pointing at a deleted binary.
 		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
 		{kind: kindDaemon, disp: dispRemove, label: ServerLabel, path: cfg.plistPath(ServerLabel), assertExists: true},
@@ -726,7 +726,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     source shim is absent: the server plist hardcodes --runtime runtimed,
 	//     whose backend resolves the shim next to the executable — without it the
 	//     server dies at boot in an invisible KeepAlive crash-loop (the live
-	//     M2-gate failure mode), so a missing shim is an install-time error.
+	//     live-hardware failure mode), so a missing shim is an install-time error.
 	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.installedExecShim()); err != nil {
 		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.installedExecShim(), err)
 	}
@@ -770,7 +770,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to
 	//     `gh`/`go` acquisition, which cannot exist under launchd as _k3sm (the
-	//     second live M2-gate failure mode). Produce the payload with
+	//     second live-hardware failure mode). Produce the payload with
 	//     `k3sm payload <dir>` in a shell that has gh + go.
 	for _, name := range executor.PayloadBinaries() {
 		src := filepath.Join(cfg.PayloadSource, name)
@@ -870,7 +870,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 
 // Uninstall tears down every artifact install laid down, driven by the same
 // manifest install consumes — so nothing install creates can be left behind
-// (the B62 leak was the two plists, which the old hardcoded uninstall never
+// (the leak was the two plists, which the old hardcoded uninstall never
 // removed). It walks the manifest in reverse install order: the server daemon
 // before netd, so the control plane stops driving the helper before the helper
 // goes away. Each daemon is torn down as Bootout(label) then
@@ -938,7 +938,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 		case dispRemove:
 			if a.kind == kindDaemon {
 				// Bootout then remove the plist — binding them so a booted-out label
-				// can never leave a leaked KeepAlive plist (the B62 leak). But if
+				// can never leave a leaked KeepAlive plist. But if
 				// bootout returns a real error (not the idempotent not-loaded case,
 				// which returns nil), the root job may still be loaded — do not delete
 				// its plist definition (that would orphan a live root job until reboot,
@@ -1021,8 +1021,8 @@ func NetdPlist(cfg Config) []byte {
 
 // serverFileLimit is the soft+hard RLIMIT_NOFILE (launchd NumberOfFiles) the
 // server LaunchDaemon requests. The server process hosts the Service proxy / UDP
-// relay, whose flow budget darwin-net sizes as max(8192, rl.Cur/2) (B48's
-// defaultUDPFlowBudget) — so the fd table it reads must be raised above launchd's
+// relay, whose flow budget darwin-net sizes as max(8192, rl.Cur/2)
+// (defaultUDPFlowBudget) — so the fd table it reads must be raised above launchd's
 // 256 default, which floors the budget at 8192 with NO headroom for the
 // co-resident apiserver/kine.
 //

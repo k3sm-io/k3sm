@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package loadbalancer is the client-side apiserver load-balancer for HA (M6.1). A
+// Package loadbalancer is the client-side apiserver load-balancer for HA. A
 // joined node — and the admin kubeconfig — targets a LOCAL endpoint that health-checks
 // the set of control-plane apiservers and forwards each connection to a healthy one, so
 // a server death fails over WITHOUT re-pointing the kubeconfig (the k3s agent

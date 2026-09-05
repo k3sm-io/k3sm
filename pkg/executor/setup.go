@@ -118,7 +118,7 @@ func BinDir(workDir string) string { return binDir(workDir) }
 
 // AuditLogPath returns the apiserver audit-log path for a given work dir
 // (<workDir>/audit/audit.log — the 0700 dir writeConformanceConfig creates).
-// Exported so argv, the tests, and the M10 audit e2e all probe the SAME file
+// Exported so argv, the tests, and the audit e2e all probe the SAME file
 // the apiserver writes — single-sourcing the layout (mirrors StateDBPath).
 func AuditLogPath(workDir string) string { return filepath.Join(auditDir(workDir), "audit.log") }
 
@@ -403,7 +403,7 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 //
 // CGO_ENABLED=0 selects kine's pure-Go SQLite backend (modernc.org/sqlite, behind
 // //go:build !cgo). It is a real, supported kine variant on the pinned version — not
-// the SQLite-disabled stub the M0 spike measured on the old pin — and it is what keeps
+// the SQLite-disabled stub the spike measured on the old pin — and it is what keeps
 // the unmaintained mattn/go-sqlite3 (and a C toolchain) out of every k3sm artifact.
 // GOBIN is cleared (not just unset in our env) so an ambient GOBIN cannot re-trigger
 // the cross-compile refusal ensureKineInto documents.
@@ -499,7 +499,7 @@ func PayloadBinaries() []string { return append(append([]string{}, cpBinaries...
 // it where the dev tools exist (a human shell, goreleaser), then hand destDir to
 // `k3sm install`, which stages it beside the daemon; the daemon boot seeds its
 // workdir from the staged copy and never needs gh/go (a launchd _k3sm daemon
-// has neither — the live M2-gate failure this closes).
+// has neither — an observed live-hardware failure this closes).
 func StagePayload(ctx context.Context, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create payload dir %s: %w", destDir, err)
@@ -633,8 +633,8 @@ func writeServiceAccountKeys(ctx context.Context, workDir string) error {
 }
 
 // writeTokenFile writes the static bearer token CSV (token,user,uid,groups) the
-// apiserver loads via --token-auth-file, granting system:masters for the M1
-// AlwaysAllow posture.
+// apiserver loads via --token-auth-file, granting system:masters to the
+// in-process node, the provisioning client and the healthz probe.
 func writeTokenFile(workDir, token string) error {
 	line := fmt.Sprintf("%s,admin,admin-uid,\"system:masters\"\n", token)
 	if err := os.WriteFile(tokenFilePath(workDir), []byte(line), 0o600); err != nil {
@@ -645,7 +645,7 @@ func writeTokenFile(workDir, token string) error {
 
 // writeKubeconfig writes an admin kubeconfig pointing at the apiserver with the
 // static token and TLS verification skipped (the apiserver self-signs its
-// serving cert in M1).
+// serving cert single-node).
 //
 // It takes the whole Config, not a work dir and a port, because the server URL needs
 // the effective BIND HOST as well (apiServerHost): a mesh server binds its wireguard
