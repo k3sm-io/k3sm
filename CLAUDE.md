@@ -4,8 +4,8 @@ Module **`k3sm.io/k3sm`** (≈ k3s): the single-binary distribution. `cmd/k3sm` 
 install | token | kubectl | doctor | dev | build | image | …; `image` is load|import|prune|ls|df, a
 client of runtimed's Images service — the daemon is the store's only writer. `build` is COPY-only and
 writes to a file, not to the shared store; OCI plumbing lives in `pkg/oci` — see docs/user/images.md),
-`pkg/provider` (the Virtual Kubelet Darwin provider — the M0 HostProcess runtime), control-plane
-embedding (M1), launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
+`pkg/provider` (the Virtual Kubelet Darwin provider — the HostProcess runtime), control-plane
+embedding, launchd/packaging. Imports `k3sm.io/{apis,runtimed,darwin-net}`.
 
 > Product design: `docs/DESIGN.md`. Milestones: `docs/M0-spike.md`, `docs/M0-node.md`. Spike: `hack/spike/run.sh`.
 > Roadmap & current phase: `docs/PHASES.md`. Acceptance gates: `hack/acceptance/`.
@@ -25,7 +25,7 @@ go mod tidy
 - Keep the `replace google.golang.org/genproto` in `go.mod` — it resolves the monolith-vs-split
   ambiguous import. Don't remove it.
 
-## Run the node (M0)
+## Run the node
 ```sh
 go run ./cmd/k3sm node --kubeconfig <spike-kubeconfig> --node-name k3sm-m0
 kubectl apply -f examples/hello-native.yaml

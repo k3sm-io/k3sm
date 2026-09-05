@@ -8,7 +8,7 @@
 # reference blocks).
 #
 # The live archive proof runs in CI (goreleaser is not installed in the lab); the
-# local acceptance gate hack/acceptance/B58.sh reports PENDING when the tool is
+# local release-archive acceptance gate reports PENDING when the tool is
 # absent and exits non-zero so red-at-main stays provable.
 version: 2
 
@@ -33,13 +33,13 @@ builds:
       # CGO=1 is required by runtimed's darwin-SPI imports (the durable reason);
       # it is NOT for kine — kine goes pure-Go under the modern-stack reset.
       - CGO_ENABLED=1
-    # Target the pkg/version vars (B57). goreleaser's default -X main.version
+    # Target the pkg/version vars. goreleaser's default -X main.version
     # no-ops here (there is no main.version symbol → it would render "dev").
     # -trimpath keeps absolute build paths off a CGO=1 binary, so two builds of
     # one tag differ by as little as the toolchain allows.
     flags:
       - -trimpath
-    # Target the pkg/version vars (B57). goreleaser's default -X main.version
+    # Target the pkg/version vars. goreleaser's default -X main.version
     # no-ops here (there is no main.version symbol → it would render "dev").
     #
     # The three sibling *Commit stamps carry provenance build info CANNOT: this
@@ -148,7 +148,7 @@ snapshot:
   # Keep snapshot versions from colliding with real tags.
   version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
 
-# --- STUBBED HUMAN M7.1 SLICE (signing / notarization / Homebrew tap) ---------
+# --- STUBBED HUMAN SLICE (signing / notarization / Homebrew tap) --------------
 # Kept as commented reference so the full release contract is reviewable without
 # failing schema validation against certs/tokens that are absent in this repo.
 # Secrets are referenced ONLY via {{ .Env.* }} templates — never literals.
