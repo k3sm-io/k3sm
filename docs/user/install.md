@@ -16,6 +16,7 @@ That step:
 - creates the dedicated unprivileged **`_k3sm`** user,
 - installs the minimal root networking helper (`k3sm-netd`) and the `_k3sm` LaunchDaemons
   (`RunAtLoad` / `KeepAlive`, boot-surviving),
+- links **`/usr/local/bin/k3sm`** so `k3sm` is a command your shell can find,
 - writes an **admin kubeconfig** to the invoking user's home directory.
 
 After install, `k3sm kubectl …` and Pod lifecycle run as you / `_k3sm` with **no `sudo`**. The full
@@ -25,9 +26,15 @@ applied to k3sm, and the one residual limitation (no per-pod uid isolation) — 
 
 ## What Gets Installed Where
 
-- The `k3sm` binary, whichever channel delivered it (with the script, pin `K3SM_INSTALL_VERSION`
-  to reinstall a prior release — the assets stay on GitHub Releases; the planned Homebrew channel
-  will retain the previous version, so rollback there will not need a rebuild).
+- The `k3sm` binary in **`/Library/k3sm`** (`root:wheel`), whichever channel delivered it (with the
+  script, pin `K3SM_INSTALL_VERSION` to reinstall a prior release — the assets stay on GitHub
+  Releases; the planned Homebrew channel will retain the previous version, so rollback there will
+  not need a rebuild).
+- A symlink **`/usr/local/bin/k3sm` → `/Library/k3sm/k3sm`** — the launcher. `/usr/local/bin` is
+  the first entry in `/etc/paths`, so every terminal opened after the install finds `k3sm` with no
+  profile edit; a terminal that was already open may need `hash -r` or simply a new window. It is
+  a symlink and not a copy, so the daemons and your shell always run the same binary. If something
+  other than a symlink already sits at that path, install refuses to replace it and says so.
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
 
@@ -64,6 +71,18 @@ k3sm's distribution ships in three explicit generations, in shipping order:
 **Switching channels:** every channel manages the same `/Library/k3sm`. Once more than one has
 shipped, run `sudo k3sm install` after a switch so the daemons run the newly delivered binary — or
 `sudo k3sm uninstall` first for a clean cutover.
+
+## Uninstalling
+
+```sh
+sudo k3sm uninstall
+```
+
+It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes the
+`/usr/local/bin/k3sm` launcher — but only that link, and only while it still points at
+`/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
+left exactly as it is. Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
+reinstall picks up where you left off.
 
 ## Verifying
 
