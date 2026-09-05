@@ -37,6 +37,13 @@ import (
 // remote access; for any non-loopback server a CA (--certificate-authority) is
 // REQUIRED — k3sm refuses to persist an insecure (skip-TLS-verify) admin context
 // to a durable config off loopback.
+//
+// The kubeconfig it starts from is the control-plane work dir's admin file when
+// that is readable (root, or the _k3sm service user). It is not readable by an
+// ordinary user — the service user's work dir is mode 0700 — so there the
+// --context-name context that `sudo k3sm install` merged into the caller's own
+// kubeconfig is used instead. Setting K3SM_WORK_DIR pins the work-dir file with
+// no fallback.
 func runKubeconfig(args []string) error {
 	fs := flag.NewFlagSet("kubeconfig", flag.ExitOnError)
 	var (
@@ -51,15 +58,13 @@ func runKubeconfig(args []string) error {
 	fs.StringVar(&path, "path", defaultKubeconfigDest(), "kubeconfig to merge into (with --write)")
 	fs.StringVar(&server, "server", "", "override the apiserver URL (e.g. for remote access)")
 	fs.StringVar(&caFile, "certificate-authority", "", "PEM CA bundle to embed (required when --server is non-loopback)")
-	fs.StringVar(&name, "context-name", "k3sm", "name for the merged cluster/user/context")
+	fs.StringVar(&name, "context-name", installedContextName, "name of the k3sm cluster/user/context (looked up in your kubeconfig, and used for the merge)")
 	fs.BoolVar(&setCurr, "set-current", true, "set the merged context as current-context (with --write)")
 	_ = fs.Parse(args)
 
-	workDir := workDirFromEnv()
-	srcPath := executor.KubeconfigPath(workDir)
-	src, err := clientcmd.LoadFromFile(srcPath)
+	src, err := loadKubeconfigSource(name)
 	if err != nil {
-		return fmt.Errorf("load k3sm kubeconfig %s (run `k3sm server` first): %w", srcPath, err)
+		return err
 	}
 	if err := retarget(src, server, caFile); err != nil {
 		return err
@@ -96,6 +101,58 @@ func runKubeconfig(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "merged k3sm context %q into %s\n", name, path)
 	return nil
+}
+
+// loadKubeconfigSource returns the kubeconfig `k3sm kubeconfig` operates on: the
+// control-plane work dir's admin file, or — when that is not readable and no
+// K3SM_WORK_DIR pinned it — the named context out of the caller's own kubeconfig,
+// where `k3sm install` merged it. An explicit K3SM_WORK_DIR never falls back: the
+// caller named a server work dir, so reporting some other cluster's credentials
+// would be a lie.
+func loadKubeconfigSource(name string) (*clientcmdapi.Config, error) {
+	srcPath := executor.KubeconfigPath(workDirFromEnv())
+	src, err := clientcmd.LoadFromFile(srcPath)
+	if err == nil {
+		return src, nil
+	}
+	if os.Getenv("K3SM_WORK_DIR") != "" {
+		return nil, fmt.Errorf("load k3sm kubeconfig %s (run `k3sm server` first): %w", srcPath, err)
+	}
+	raw, err := clientcmd.NewDefaultClientConfigLoadingRules().Load()
+	if err != nil {
+		return nil, fmt.Errorf("load your kubeconfig: %w", err)
+	}
+	out, err := extractContext(raw, name)
+	if err != nil {
+		return nil, fmt.Errorf("no k3sm kubeconfig: %s is not readable and %w — run `sudo k3sm install`, or set K3SM_WORK_DIR", srcPath, err)
+	}
+	return out, nil
+}
+
+// extractContext returns a minimal config holding ONLY the named context and the
+// cluster and user it references, with that context current — the same shape the
+// executor's admin kubeconfig has, so every caller downstream (retarget, the
+// print, the --write merge) is unchanged. It is pure (no IO) so it is
+// unit-testable.
+func extractContext(cfg *clientcmdapi.Config, name string) (*clientcmdapi.Config, error) {
+	kctx := cfg.Contexts[name]
+	if kctx == nil {
+		return nil, fmt.Errorf("no context %q in your kubeconfig", name)
+	}
+	cl := cfg.Clusters[kctx.Cluster]
+	if cl == nil {
+		return nil, fmt.Errorf("context %q names cluster %q, which your kubeconfig does not define", name, kctx.Cluster)
+	}
+	user := cfg.AuthInfos[kctx.AuthInfo]
+	if user == nil {
+		return nil, fmt.Errorf("context %q names user %q, which your kubeconfig does not define", name, kctx.AuthInfo)
+	}
+	out := clientcmdapi.NewConfig()
+	out.Clusters[kctx.Cluster] = cl.DeepCopy()
+	out.AuthInfos[kctx.AuthInfo] = user.DeepCopy()
+	out.Contexts[name] = kctx.DeepCopy()
+	out.CurrentContext = name
+	return out, nil
 }
 
 // retarget rewrites the k3sm cluster's server and/or CA in place. It refuses to
