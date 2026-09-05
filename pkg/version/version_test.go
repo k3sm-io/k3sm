@@ -218,3 +218,59 @@ func TestGetUsesExecutorAlignedVersions(t *testing.T) {
 		t.Errorf("String() does not render the aligned Kubernetes version %q:\n%s", executor.DefaultKubeVersion, got.String())
 	}
 }
+
+// TestNodeVersion is the gate for NodeVersion: the node must report the
+// aligned Kubernetes version with the k3sm release folded in as semver build
+// metadata (the k3s "v1.33.1+k3s1" shape), never a raw internal identifier —
+// and the k3sm part must always be valid build metadata even when the
+// underlying Version is a Go pseudo-version, a dirty VCS build, or carries
+// characters build metadata forbids.
+func TestNodeVersion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		info Info
+		want string
+	}{
+		{
+			name: "release version renders the k3s-style +k3sm suffix",
+			info: Info{Version: "0.1.3", KubeVersion: "v1.36.2"},
+			want: "v1.36.2+k3sm.0.1.3",
+		},
+		{
+			name: "unstamped dev build renders the dev marker",
+			info: Info{Version: "dev", KubeVersion: "v1.36.2"},
+			want: "v1.36.2+k3sm.dev",
+		},
+		{
+			name: "VCS-recovered dirty pseudo-version drops its own v and appends .dirty",
+			info: Info{
+				Version:     "v0.1.4-0.20260905125152-5246e94c338a",
+				Dirty:       true,
+				KubeVersion: "v1.36.2",
+			},
+			want: "v1.36.2+k3sm.0.1.4-0.20260905125152-5246e94c338a.dirty",
+		},
+		{
+			name: "a KubeVersion missing its leading v gains one",
+			info: Info{Version: "0.1.3", KubeVersion: "1.36.2"},
+			want: "v1.36.2+k3sm.0.1.3",
+		},
+		{
+			name: "an embedded + and an illegal character are both sanitized",
+			info: Info{Version: "1.2.3+build!label", KubeVersion: "v1.36.2"},
+			want: "v1.36.2+k3sm.1.2.3.build-label",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.info.NodeVersion(); got != tt.want {
+				t.Errorf("NodeVersion() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -31,7 +31,8 @@ import (
 )
 
 // DefaultNodeCertTTL is how long an issued node client / kubelet-serving cert is
-// valid. A year matches the kubelet client-cert lifetime; rotation is an M4 concern.
+// valid. A year matches the kubelet client-cert lifetime; automatic rotation is
+// not implemented.
 const DefaultNodeCertTTL = 365 * 24 * time.Hour
 
 // ServerConfig configures the supervisor-side bootstrap Server.
@@ -53,7 +54,7 @@ type ServerConfig struct {
 	// APIServers are the control-plane apiserver endpoints advertised to a joining node
 	// in the JoinResponse (for its client-side load-balancer). Optional.
 	APIServers []string
-	// ServerAuth authorizes the M6.1 CA-bundle endpoint (BundlePath) to the SERVER-class
+	// ServerAuth authorizes the CA-bundle endpoint (BundlePath) to the SERVER-class
 	// token only. When nil (single-node / non-HA), the bundle endpoint is not served.
 	ServerAuth ServerAuthorizer
 	// Bundle yields the sealed CA bundle the bundle endpoint returns. When nil, the
@@ -97,7 +98,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return &Server{cfg: cfg}, nil
 }
 
-// Handler returns the bootstrap HTTP mux (CACertPath + JoinPath, plus the M6.1
+// Handler returns the bootstrap HTTP mux (CACertPath + JoinPath, plus the
 // server-bootstrap CA-bundle endpoint when ServerAuth + Bundle are configured).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -217,7 +218,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBundle serves the AES-256-GCM-sealed CA bootstrap bundle to a joining
-// control-plane SERVER (M6.1). It authorizes the SERVER-class token ONLY (a worker
+// control-plane SERVER. It authorizes the SERVER-class token ONLY (a worker
 // token is rejected at AuthorizeServerToken — ErrNotServerToken), then returns the
 // sealed envelope. A leaked worker token can therefore never reconstruct the signing
 // CA. Registered only when ServerAuth + Bundle are configured (the HA supervisor).

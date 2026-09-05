@@ -40,7 +40,7 @@ import (
 // identities (the k3s model), which the apiserver's auto-created bootstrap RBAC
 // (ClusterRoleBindings system:kube-scheduler / system:kube-controller-manager) binds
 // to the matching ClusterRoles. They replace the shared system:masters admin token the
-// child components carried through M6.
+// child components used to carry.
 const (
 	schedulerCN         = "system:kube-scheduler"
 	controllerManagerCN = "system:kube-controller-manager"
@@ -55,7 +55,7 @@ const (
 // The --controllers value is rendered as "*,-<each>" — enable every
 // on-by-default controller, then disable just these. That is robust across kube
 // versions (no brittle allow-list to keep in sync) AND keeps the
-// endpointslice-controller ON, which M1.4's Service proxy reconciles off.
+// endpointslice-controller ON, which the Service proxy reconciles off.
 var kcmDisabledControllers = []string{
 	"persistentvolume-attach-detach-controller", // attach-detach: no real volumes to (de)attach
 	"cloud-node-lifecycle-controller",           // cloud provider lifecycle: not a cloud node
@@ -136,7 +136,7 @@ func NewSupervised(cfg Config) *Supervised {
 	return &Supervised{
 		cfg:   cfg,
 		token: cfg.Token,
-		// The apiserver self-signs its serving cert in M1; skip verification on the
+		// The apiserver self-signs its serving cert single-node; skip verification on the
 		// loopback healthz probe (the kubeconfig does the same).
 		client: &http.Client{
 			Timeout:   3 * time.Second,
@@ -175,7 +175,7 @@ func (s *Supervised) currentToken() string {
 // means "someone owns the boot", not "the apiserver is healthy" — poll Ready for
 // that, as an already-started executor has always required.
 func (s *Supervised) Start(ctx context.Context) error {
-	// Split-brain guard (M6.0): fail closed if HA was requested without a shared
+	// Split-brain guard: fail closed if HA was requested without a shared
 	// datastore — never let a 2nd server quietly form its own SQLite.
 	if err := s.cfg.Validate(); err != nil {
 		return err
@@ -277,7 +277,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := writeKubeconfig(s.cfg, token); err != nil {
 		return err
 	}
-	// M10.0 (Res.3): the audit policy + admission-control config the apiserver argv
+	// The audit policy + admission-control config the apiserver argv
 	// references must exist before startAPIServer — a missing file would wedge
 	// bring-up opaquely until the healthz timeout. Overwritten every boot (the
 	// files track the binary).
@@ -294,7 +294,7 @@ func (s *Supervised) provision(ctx context.Context) error {
 // apiserver's unconditional --client-ca-file has a CA to trust) and writes the
 // per-component client-cert kubeconfigs the scheduler and controller-manager
 // authenticate with — each its own system: identity instead of the shared system:masters
-// admin token (the k3s model; closes the M4.1 component-identity divergence). The certs
+// admin token (the k3s model; no shared component identity). The certs
 // are signed by the signing CA (= --client-ca-file). EnsureHierarchy is idempotent — it
 // loads an existing hierarchy (the mesh path in cmd/k3sm/server.go creates it before
 // Start), so single-node mints a fresh hierarchy and both paths re-issue the component
@@ -319,7 +319,7 @@ func (s *Supervised) provisionComponentCerts() error {
 	if err := writeComponentKubeconfig(s.cfg, controllerManagerKubeconfigPath(s.cfg.WorkDir), controllerManagerCN, h, verifyClusterCA); err != nil {
 		return err
 	}
-	// B176: the client identity the apiserver PRESENTS to a node's kubelet endpoint.
+	// The client identity the apiserver PRESENTS to a node's kubelet endpoint.
 	// Unconditional, and provisioned here, because apiServerArgs renders
 	// --kubelet-client-certificate unconditionally: a node's :10250 requires and
 	// verifies a client cert in every posture (single-node, dev, mesh, HA), so an
@@ -337,7 +337,7 @@ const componentReadyTimeout = 30 * time.Second
 
 // bringUp starts the components in order and waits for the apiserver to be
 // healthy before starting scheduler + controller-manager. Each bring-up wait
-// selects on child-exit as well as readiness (M10.0, SRE fail-fast): a kine or
+// selects on child-exit as well as readiness (fail fast): a kine or
 // apiserver that dies on a bad flag/config surfaces immediately — with its log
 // tail — instead of wedging opaquely until the healthz timeout.
 //
@@ -407,8 +407,8 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 }
 
 // startKine launches the kine etcd shim. The datastore is the single-node SQLite WAL
-// DB (the M1–M5 default, byte-unchanged) unless cfg.DatastoreEndpoint names a Postgres
-// DSN (M6.0 HA multi-writer), in which case the password is relocated off argv into a
+// DB (the single-node default) unless cfg.DatastoreEndpoint names a Postgres
+// DSN (HA multi-writer), in which case the password is relocated off argv into a
 // 0600 PGPASSFILE the kine child reads via PGPASSFILE (kineSecretEnv) and only the
 // password-stripped DSN reaches --endpoint.
 func (s *Supervised) startKine(ctx context.Context) (*component, error) {
@@ -461,16 +461,16 @@ func (s *Supervised) kineSecretEnv() ([]string, error) {
 	return []string{"PGPASSFILE=" + path}, nil
 }
 
-// startAPIServer launches kube-apiserver against kine on the secure port. From M4.1
-// it enforces --authorization-mode=Node,RBAC + the NodeRestriction admission plugin
+// startAPIServer launches kube-apiserver against kine on the secure port. It
+// enforces --authorization-mode=Node,RBAC + the NodeRestriction admission plugin
 // (the scheduler + controller-manager authenticate with their OWN per-component client
 // certs — system:kube-scheduler / system:kube-controller-manager, bound by the
 // apiserver's bootstrap RBAC; only the in-process VK node + post-bring-up provisioning
 // + the healthz probe still carry the system:masters admin token) and sets
 // --kubelet-preferred-address-types=InternalIP so kubectl logs/exec reach the node by
-// IP (closing the M0.3 gap).
+// IP.
 //
-// In-pod API reachability (M2.4): the apiserver binds 127.0.0.1 and the
+// In-pod API reachability: the apiserver binds 127.0.0.1 and the
 // auto-created kubernetes.default.svc endpoint advertises --advertise-address,
 // which is NodeIP — defaulting to 127.0.0.1 for a single node (see cmd/k3sm
 // --node-ip). So on a single node the endpoint resolves to the loopback the
@@ -478,9 +478,10 @@ func (s *Supervised) kineSecretEnv() ([]string, error) {
 // reaches it; a pod's projected SA token + the kube-root-ca.crt CA then complete
 // a working in-cluster config. When NodeIP is a routable address (multi-node),
 // the kubernetes endpoint must be rewritten to a node-local address per node so
-// infra VIPs are not blackholed over the mesh — that is M3.3, not here.
+// infra VIPs are not blackholed over the mesh — that is the node-local resolver's
+// job, not this one's.
 //
-// The ServiceAccount admission plugin (in the default enabled set — the M4.1
+// The ServiceAccount admission plugin (in the default enabled set —
 // --enable-admission-plugins=NodeRestriction is additive, so ServiceAccount stays
 // on) stamps spec.serviceAccountName and injects the projected SA volume (token +
 // kube-root-ca.crt + namespace) the provider materializes; the root-ca-cert-publisher
@@ -498,14 +499,14 @@ func (s *Supervised) startAPIServer(ctx context.Context) (*component, error) {
 }
 
 // apiServerArgs renders the kube-apiserver argv from cfg. It is a pure function so
-// the M3/M4 trust posture is table-tested without booting the apiserver: the mesh
+// the trust posture is table-tested without booting the apiserver: the mesh
 // BindAddress (never 0.0.0.0), --anonymous-auth=false, --client-ca-file (always set —
 // defaulting to the signing CA so the per-component + system:node client certs
 // authenticate single-node too), --kubelet-certificate-authority, the
-// --authorization-mode (Node,RBAC by default, M4.1), and the NodeRestriction
+// --authorization-mode (Node,RBAC by default), and the NodeRestriction
 // admission plugin are all asserted here. It self-defaults the bind address and the
 // authorization mode (so a raw Config in a test renders the production posture); the
-// M1/M2 single-node path leaves the M3 fields zero, so the binding falls back to
+// single-node path leaves the mesh fields zero, so the binding falls back to
 // NodeIP (loopback) and the kubelet-CA / anonymous-auth flags are omitted.
 func apiServerArgs(cfg Config) []string {
 	wd := cfg.WorkDir
@@ -538,7 +539,7 @@ func apiServerArgs(cfg Config) []string {
 		"--service-account-signing-key-file", saKeyPath(wd),
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",
 		"--token-auth-file", tokenFilePath(wd),
-		// M4.1: enforce the Node authorizer + RBAC (default-deny) instead of
+		// Enforce the Node authorizer + RBAC (default-deny) instead of
 		// AlwaysAllow. The flip is pure — the VK node + provisioners carry the static
 		// admin token (system:masters, RBAC-exempt), the scheduler/KCM carry their own
 		// client-cert identities the apiserver's bootstrap RBAC binds, and joined
@@ -546,12 +547,13 @@ func apiServerArgs(cfg Config) []string {
 		// (pkg/rbac.Provision) before the VK node / join supervisor start.
 		"--authorization-mode", authzMode,
 		// Add NodeRestriction to the default-enabled admission set (--enable-admission-
-		// plugins is additive, so the ServiceAccount plugin M2.4 relies on stays on).
+		// plugins is additive, so the ServiceAccount plugin in-pod API access relies
+		// on stays on).
 		// It confines a system:node:<name> identity to mutating only its own Node/Pod
 		// objects — the admission half of the Node authorizer. It does not cover CRDs,
 		// so the net.k3sm.io/MeshPeer write stays guarded by bootstrap.AuthorizeMeshPeerWrite.
 		"--enable-admission-plugins=NodeRestriction",
-		// B76: enable the beta MutatingAdmissionPolicy API + feature gate so the
+		// Enable the beta MutatingAdmissionPolicy API + feature gate so the
 		// EnsureDaemonSetTolerationMutation policy (which injects the provider toleration
 		// into DaemonSet-owned pods) is actually evaluated. MutatingAdmissionPolicy is
 		// beta and off by default at the pinned k8s (v1.36.2); without both of these the
@@ -561,7 +563,7 @@ func apiServerArgs(cfg Config) []string {
 		// the kwok-ci v1.36.2 apiserver before a real rollout.
 		"--runtime-config=admissionregistration.k8s.io/v1beta1=true",
 		"--feature-gates=MutatingAdmissionPolicy=true",
-		// M10.0 audit logging (Res.4): the shipped policy is structurally
+		// Audit logging: the shipped policy is structurally
 		// Metadata/None-only (see auditPolicyDoc — no Secret cleartext at rest),
 		// the log lands in the 0700 <workDir>/audit dir, and rotation is bounded
 		// (100MiB × (3 backups + 1 live) ≈ 400MB worst case — the honest ENOSPC
@@ -575,9 +577,10 @@ func apiServerArgs(cfg Config) []string {
 		"--audit-log-maxsize=100",
 		"--audit-log-maxbackup=3",
 		"--audit-log-maxage=30",
-		// M10.0 PSA cluster defaults (Res.2): the AdmissionConfiguration embedding
+		// PSA cluster defaults: the AdmissionConfiguration embedding
 		// the PodSecurityConfiguration (warn=baseline + audit=restricted; enforce
-		// stays privileged unless Config.PSAEnforceBaseline flips the B71 cutover).
+		// stays privileged unless Config.PSAEnforceBaseline flips the baseline-enforce
+		// cutover).
 		"--admission-control-config-file", admissionConfigPath(wd),
 		"--bind-address", bind,
 		"--advertise-address", cfg.NodeIP,
@@ -586,7 +589,7 @@ func apiServerArgs(cfg Config) []string {
 		"--kubelet-preferred-address-types", "InternalIP",
 		"--allow-privileged",
 	}
-	// --client-ca-file is UNCONDITIONAL (the M4.1 review flagged the mesh-gating): the
+	// --client-ca-file is UNCONDITIONAL (never mesh-gated): the
 	// apiserver must trust the cluster client-CA so the per-component client certs
 	// (system:kube-scheduler / system:kube-controller-manager) AND joined workers'
 	// system:node certs authenticate — single-node included. It defaults to the signing
@@ -598,7 +601,7 @@ func apiServerArgs(cfg Config) []string {
 		clientCA = certs.SigningCACertPath(wd)
 	}
 	args = append(args, "--client-ca-file", clientCA)
-	// B176: the client cert the apiserver PRESENTS to a node's kubelet endpoint.
+	// The client cert the apiserver PRESENTS to a node's kubelet endpoint.
 	// UNCONDITIONAL, for the same reason --client-ca-file is: :10250 requires and
 	// verifies a client certificate in EVERY posture, so an apiserver that omitted
 	// this would lose logs/exec/attach/port-forward and the node proxy (kubectl top)
@@ -651,9 +654,9 @@ func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 // own client-cert kubeconfig (CN=system:kube-scheduler, provisioned by
 // provisionComponentCerts), not the system:masters admin kubeconfig — so the
 // apiserver's bootstrap system:kube-scheduler ClusterRoleBinding actually constrains
-// it (the k3s model). Pure so the M6.0 leader-election posture is table-tested:
-// --leader-elect is false single-node (one candidate, no lease churn — the M1–M5
-// default, byte-unchanged) and true in HA (Postgres multi-writer) so only one server's
+// it (the k3s model). Pure so the leader-election posture is table-tested:
+// --leader-elect is false single-node (one candidate, no lease churn — the
+// single-node default) and true in HA (Postgres multi-writer) so only one server's
 // scheduler is active (two active schedulers double-bind pods).
 func schedulerArgs(cfg Config) []string {
 	kc := schedulerKubeconfigPath(cfg.WorkDir)
@@ -687,7 +690,7 @@ func (s *Supervised) startControllerManager(ctx context.Context) (*component, er
 // kube-root-ca.crt, so it must anchor whatever serving cert the apiserver presents,
 // which on the mesh path is a cluster-CA-issued leaf. It derives off the same
 // predicate as --tls-cert-file so the two cannot disagree.
-// Pure so the M6.0 leader-election posture is table-tested alongside the scoped
+// Pure so the leader-election posture is table-tested alongside the scoped
 // --controllers set: --leader-elect is false single-node and true in HA so only ONE
 // server's KCM is active (two active KCMs double-reconcile every object).
 func controllerManagerArgs(cfg Config) []string {

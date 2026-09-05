@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package provisioner is the k3sm APFS local-path PersistentVolume provisioner
-// (k3sm:M3.2): an in-process, API-object-only controller — NOT a
+// an in-process, API-object-only controller — NOT a
 // kube-controller-manager controller — that registers the local-path
 // StorageClass and, for each PersistentVolumeClaim bound to it once the scheduler
 // has selected a node, creates the backing PersistentVolume object. The embedded
@@ -82,6 +82,6 @@ limitations under the License.
 // identity is GAPPED on the hostprocess runtime — every hostprocess pod reports
 // podIP = nodeIP (pkg/provider/hostprocess.go), so per-pod stable DNS via a
 // headless Service does not resolve to distinct addresses. Headless-Service peer
-// discovery is therefore an explicit excluded subset of M3.2; it needs per-pod
+// discovery is therefore an explicitly excluded subset here; it needs per-pod
 // IPs (the runtimed lo0-alias path). See docs/DESIGN.md §5c.
 package provisioner

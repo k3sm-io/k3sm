@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package rbac provisions, idempotently at server start, the minimal RBAC graph
 // that MUST exist before the apiserver enforces --authorization-mode=Node,RBAC
-// (the M4.1 flip from AlwaysAllow). It runs in cmd/k3sm/server.go's step-3
+// (the flip from AlwaysAllow). It runs in cmd/k3sm/server.go's step-3
 // provisioning slot — after the apiserver is healthy, BEFORE the VK node and the
 // worker-join supervisor start — so a joining worker's bindings already exist, and
 // it is FAIL-CLOSED: a provisioning failure halts bring-up rather than the
@@ -34,8 +34,8 @@ limitations under the License.
 // auto-created bootstrap RBAC already binds to the matching ClusterRoles. Either way
 // those components keep working with the authorizer on, needing no two-phase
 // restart. The real lock-out risk is a JOINED WORKER: its Service proxy, per-node
-// DNS resolver, and mesh watcher authenticate as system:node:<name> (the M3 node
-// cert), and they get/list/watch services, endpointslices (discovery.k8s.io), and
+// DNS resolver, and mesh watcher authenticate as system:node:<name> (the joined
+// node's client cert), and they get/list/watch services, endpointslices (discovery.k8s.io), and
 // meshpeers (net.k3sm.io) — none of which the Node authorizer nor the stock
 // system:node ClusterRole grant. The node-datapath ClusterRole this package binds
 // to the system:nodes group is THE fix.
@@ -46,7 +46,7 @@ limitations under the License.
 //     group, granting read (get/list/watch) on services, endpointslices, and
 //     meshpeers — keeping a joined worker's datapath alive after the flip;
 //   - the in-pod reader Role + RoleBinding (namespaced) for the in-pod-kubectl
-//     reference ServiceAccount, so the M2 in-pod-kubectl conformance path stays green
+//     reference ServiceAccount, so the in-pod-kubectl conformance path stays green
 //     under default-deny (see ConformanceServiceAccount);
 //   - the k3sm-registry namespace and the registry-advertisement reader Role +
 //     RoleBinding to the system:nodes group, granting read (get/list/watch) on
@@ -70,11 +70,11 @@ limitations under the License.
 // ConsistentListFromCache is GA-locked true, can read stale and double-provision or
 // skip. Any existence check is an authoritative Get-by-name, never a LIST.
 //
-// # Component-identity divergence (M4.1, since narrowed)
+// # Component-identity divergence (since narrowed)
 //
-// In M4.1, RBAC is enforced for WORKLOADS and joined-worker system:node identities.
-// M4.1 shipped with every in-process control-plane component on the static admin
-// token; #14 (f855a0a) retired the scheduler + controller-manager half — they now
+// RBAC is enforced for WORKLOADS and joined-worker system:node identities. The
+// authorizer flip shipped with every in-process control-plane component on the
+// static admin token; #14 (f855a0a) retired the scheduler + controller-manager half — they now
 // authenticate with their own signing-CA-issued client certs (CN=system:kube-scheduler
 // / system:kube-controller-manager, written by executor.provisionComponentCerts) that
 // the apiserver's bootstrap RBAC binds, so RBAC constrains them (the k3s model). What

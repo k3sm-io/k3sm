@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package certs is k3sm's certificate authority and TLS material.
 //
-// M3 stands up a real PKI (ca.go): a CLUSTER CA (the serving anchor a K10 join
+// It stands up a real PKI (ca.go): a CLUSTER CA (the serving anchor a K10 join
 // token pins) and a SIGNING CA (issues the system:node client certs handed to
 // joining nodes), with VerifyPinnedChain implementing CA-hash-pinned join WITHOUT
 // insecure-skip-tls-verify. SelfSignedServing (below) is ONLY the dev/loopback,
@@ -45,7 +45,7 @@ import (
 // include every host in dnsNames and every IP in ipAddrs. The SANs MUST include the
 // node InternalIP: the apiserver is started with
 // --kubelet-preferred-address-types=InternalIP, so it dials the node by IP and the
-// cert has to verify against that address (the M0.3 logs/exec gap).
+// cert has to verify against that address, or logs/exec break.
 //
 // SCOPE — this is the SINGLE-NODE, dev and standalone-`k3sm node` cert, and nothing
 // else. It is correct exactly where the apiserver configures NO
@@ -53,7 +53,7 @@ import (
 // the node presents, and a CA-issued leaf would buy nothing.
 //
 // On the MULTI-NODE (--mesh-ip) path it is NOT used, and using it there is a defect
-// (B213): that apiserver runs --kubelet-certificate-authority=<cluster CA>, so a
+// that apiserver runs --kubelet-certificate-authority=<cluster CA>, so a
 // self-signed leaf is refused with "x509: certificate signed by unknown authority"
 // and every kubectl logs/exec against the node fails while the node reports Ready.
 // Both node roles therefore carry a CLUSTER-CA-issued pair instead — a worker from

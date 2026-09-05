@@ -43,7 +43,7 @@ import (
 // proceeds).
 //
 // postStart's dispatch, readiness gate, failure handling and pod-scoped lifetime
-// live in poststart.go (B39) — this file owns the shared handler dispatch (runHook)
+// live in poststart.go — this file owns the shared handler dispatch (runHook)
 // and preStop.
 
 // runPreStop runs each container's preStop hook BEFORE the runtimed DeletePod RPC

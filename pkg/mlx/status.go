@@ -140,8 +140,7 @@ type StatusOptions struct {
 //
 // It is PURE: no IO, no cluster reads, no writes, no clock of its own (now is
 // supplied), and m is not mutated. The status it returns is the WHOLE status —
-// the caller applies it through the status subresource, and the M8.5 reconcile
-// remainder is what does that.
+// the caller applies it through the status subresource.
 //
 // The previous status matters and is read from m.Status:
 //

@@ -186,7 +186,7 @@ func runAgent(args []string) error {
 	}
 	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 
-	// B213: refuse a join that delivered no kubelet SERVING keypair, BEFORE anything
+	// Refuse a join that delivered no kubelet SERVING keypair, BEFORE anything
 	// starts. A joined worker's apiserver runs with
 	// --kubelet-certificate-authority=<cluster CA>, so a self-signed fallback here
 	// would leave this node's :10250 unusable (x509: unknown authority) while the node
@@ -234,7 +234,7 @@ func runAgent(args []string) error {
 		// assigned /32 (res.MeshIP, now an lo0 alias plumbed by mesh.Start) and the
 		// routing-table locality is its assigned pod /24 (res.PodCIDR) — neither is
 		// known before enroll. Without this a joined worker has no Service proxy and
-		// no DNS, so a pod on it can't resolve names or reach the API VIP (M3.3).
+		// no DNS, so a pod on it can't resolve names or reach the API VIP.
 		datapath, err = startWorkerNetserve(ctx, opts, res, mode, kubeconfigPath, logger)
 		if err != nil {
 			return err
@@ -267,12 +267,12 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
-		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source, M10.1)
+		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list
+		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,
 
-		// B176: the cluster's client-identity (signing) CA, received in the join
+		// The cluster's client-identity (signing) CA, received in the join
 		// response — the anchor this worker's :10250 verifies the apiserver's client
 		// cert against. It is the SAME CA that issued this node's own system:node
 		// credential, so a worker that joined successfully always has it; an empty
@@ -281,7 +281,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		// wildcard bind and is never served unauthenticated.
 		kubeletClientCAPEM: res.ClientCAPEM,
 
-		// B213: the CLUSTER-CA-issued kubelet SERVING pair, also from the join
+		// The CLUSTER-CA-issued kubelet SERVING pair, also from the join
 		// response — the cert this worker presents on :10250, chaining to the CA the
 		// apiserver was started with --kubelet-certificate-authority. It is the
 		// counterpart of the anchor above: that one authenticates the apiserver TO this
@@ -428,7 +428,7 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		PodCIDR:           res.PodCIDR,
 		MeshEgressIP:      res.MeshIP,
 		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),
-		// M11.3-d3a: vmCapable alone arms the NetworkPolicy table's fail-closed
+		// vmCapable alone arms the NetworkPolicy table's fail-closed
 		// unknown-vm-source branch. The segment is passed unconditionally because it
 		// is a host fact, not a decision — vmnetPolicyPrefix ANDs the two, so a
 		// worker with no vm backend keeps the byte-identical plain table.
@@ -444,7 +444,7 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 // declared Spec.MeshIP, falling back to the canonical .1-of-the-pod-/24
 // derivation (podnet.MeshEgressIP — the one derivation the mesh and proxy share)
 // when unset. These seed the NetworkPolicy table's always-allow source set
-// (M10.4): a peer's Service proxy re-originates cross-node traffic from its
+// a peer's Service proxy re-originates cross-node traffic from its
 // mesh-egress /32, and those node-origin dials must never be denied by a pod
 // policy. A peer that enrolls AFTER this snapshot is the documented fail-open
 // gap (netserve.Config.PeerMeshEgressIPs); an unparsable peer is skipped — its

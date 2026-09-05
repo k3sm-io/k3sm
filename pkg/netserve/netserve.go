@@ -38,7 +38,7 @@ import (
 )
 
 // defaultPodCIDR is the node's pod CIDR used for backend locality classification
-// in the routing table (a hint/metric in M1; steering does not depend on it).
+// in the routing table (a hint/metric; steering does not depend on it).
 const defaultPodCIDR = "100.64.0.0/24"
 
 // DefaultVMNetSubnet is the NAT segment a vm-RuntimeClass pod's guest is expected
@@ -56,8 +56,8 @@ const defaultPodCIDR = "100.64.0.0/24"
 // which scopes the NetworkPolicy table's fail-closed unknown-vm-source branch. If
 // macOS ever hands out a DIFFERENT segment, guest packets arrive from outside this
 // prefix, the branch does not fire, and they fail OPEN exactly as every other
-// unattributable source does — the pre-M11.3 behavior. So a stale value degrades
-// to the old fail-open, never to a wrong deny.
+// unattributable source does — the unscoped behavior. So a stale value degrades
+// to the plain fail-open, never to a wrong deny.
 //
 // THE RECORDED RESIDUAL. The deny is a superset of guests: any unattributable
 // source inside this range is denied, and 192.168.64.0/24 is a plausible home-LAN
@@ -107,7 +107,7 @@ type Config struct {
 	// PeerMeshEgressIPs are the peer nodes' reserved mesh-egress /32s known at
 	// construction (a worker seeds them from the join snapshot). Together with
 	// NodeIP and MeshEgressIP they seed the NetworkPolicy table's ALWAYS-ALLOW
-	// source set (M10.4): a peer's Service proxy re-originates cross-node traffic
+	// source set: a peer's Service proxy re-originates cross-node traffic
 	// from its mesh-egress /32, and such node-origin dialers must never be locked
 	// out by a pod policy. Dynamic-peer gap (documented follow-up): a peer that
 	// enrolls AFTER construction is not re-seeded — no MeshPeer-event plumbing
@@ -120,7 +120,7 @@ type Config struct {
 	// Capabilities()): this node can host vm-RuntimeClass pods, whose guests are
 	// attached to a macOS NAT segment instead of lo0. It is the ONE input that
 	// arms the NetworkPolicy table's fail-closed unknown-vm-source branch
-	// (M11.3-d3a); false keeps the table byte-identical to a node that runs no
+	// branch; false keeps the table byte-identical to a node that runs no
 	// guests.
 	VMBackend bool
 	// VMNetSubnet is the NAT segment those guests are attached to, in CIDR form
@@ -135,7 +135,7 @@ type Config struct {
 	//
 	// Empty or unparsable leaves the plain policy table even when VMBackend is
 	// set: an unknown vm source then fails OPEN like any other unattributable
-	// source, which is the pre-M11.3 behavior and never a wrong deny.
+	// source, which is the unscoped behavior and never a wrong deny.
 	VMNetSubnet string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
@@ -165,7 +165,7 @@ type Server struct {
 	table *proxy.RoutingTable
 	watch *proxy.Watcher
 	log   *slog.Logger
-	// policy is the NetworkPolicy L4-subset verdict table (M10.4), seeded with the
+	// policy is the NetworkPolicy L4-subset verdict table, seeded with the
 	// always-allow node-origin /32s (NodeIP, MeshEgressIP, PeerMeshEgressIPs) and
 	// wired into the proxy's accept paths via proxy.WithPolicyTable.
 	policy *proxy.PolicyTable
@@ -232,7 +232,7 @@ func New(cfg Config) *Server {
 		opts = append(opts, proxy.WithMeshEgressSource(egress))
 	}
 
-	// M10.4 — NetworkPolicy hosting, unconditional when the datapath runs (the
+	// NetworkPolicy hosting, unconditional when the datapath runs (the
 	// nil-table proxy default is the off-switch upstream of this assembler). The
 	// verdict table is seeded with the always-allow node-origin sources — the
 	// node's InternalIP, this node's mesh-egress /32, and the peer mesh-egress
@@ -247,7 +247,7 @@ func New(cfg Config) *Server {
 		seeds = append(seeds, a)
 	}
 	//
-	// M11.3-d3a: on a node that hosts vm guests, the table is additionally scoped
+	// On a node that hosts vm guests, the table is additionally scoped
 	// to the node's NAT segment, which arms the ONE extra branch such a node needs
 	// — an unattributable source INSIDE that segment fails CLOSED. A vm guest's
 	// packets carry its DHCP lease, and nothing maps a lease back to a pod yet, so
@@ -309,7 +309,7 @@ func staticAPIServerBackends(endpoint string) (map[string][]netv1.Endpoint, erro
 //
 // Both inputs must hold. A node with no vm backend hosts no guest whose lease
 // could arrive unattributable, and an unparsable subnet gives nothing to scope
-// to — in either case widening the deny would be guesswork, so the pre-M11.3
+// to — in either case widening the deny would be guesswork, so the unscoped
 // fail-open is kept. The prefix is masked so a caller that wrote a host address
 // with a prefix length (192.168.64.1/24) still scopes the whole segment.
 //
@@ -356,7 +356,7 @@ func (s *Server) Run(ctx context.Context) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return s.proxy.Run(gctx) })
 	g.Go(func() error { return s.watch.Run(gctx) })
-	// The NetworkPolicy watcher (M10.4) runs beside the Service watcher: same
+	// The NetworkPolicy watcher runs beside the Service watcher: same
 	// client, same lifecycle. The table stays empty (allow-everything) until its
 	// informers sync — the documented fail-open — so it never gates bring-up.
 	g.Go(func() error { return s.policyWatch.Run(gctx) })
@@ -432,7 +432,7 @@ func (s *Server) runResolver(ctx context.Context) {
 	}
 
 	// The cluster Service zone, read from informer caches (no apiserver round-trip
-	// per query): Services for the A/VIP answers, EndpointSlices for the M10.1
+	// per query): Services for the A/VIP answers, EndpointSlices for the DNS
 	// identity records (headless all-backends A, StatefulSet hostname identity,
 	// SRV, PTR). Both listers are created BEFORE Start so both informers run;
 	// warm the caches before serving.

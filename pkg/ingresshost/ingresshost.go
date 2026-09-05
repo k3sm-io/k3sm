@@ -297,7 +297,7 @@ func (h *Host) serveLoop(ctx context.Context) {
 	}
 }
 
-// installCertificates enforces the M10.3 TLS-Secret discipline
+// installCertificates enforces the TLS-Secret discipline
 // (SECURITY-BINDING):
 //
 //   - every referenced Secret is fetched BY NAME via a targeted
@@ -507,12 +507,12 @@ func (h *Host) advertiseString() string {
 }
 
 // retractStatus removes this node's advertised address from every k3sm-class
-// Ingress and from the canonical LB Service. Before B116 this host had NO
+// Ingress and from the canonical LB Service. This host used to have NO
 // retraction path at all — syncStatus returned early on !serving and never
 // removed anything — so after "bind retries exhausted" every k3sm-class Ingress
 // kept advertising a dead address indefinitely. The predicate is svclb's
 // exported Retractable: ONE retraction rule for both controllers, so a stale
-// entry from a previous podCIDR (or a pre-B116 loopback entry) is dropped even
+// entry from a previous podCIDR (or an older loopback entry) is dropped even
 // though it is neither the current bind nor the current advertise address.
 // Own-class Ingresses ONLY — a foreign or classless Ingress is never touched.
 func (h *Host) retractStatus(ctx context.Context) {

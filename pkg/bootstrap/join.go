@@ -85,7 +85,7 @@ type JoinResult struct {
 	ClusterCAPEM []byte
 	// ClientCAPEM is the cluster's client-identity (signing) CA certificate — the
 	// anchor this node's OWN kubelet endpoint verifies the apiserver's client cert
-	// against (B176). Empty only against a server that predates the field, which a
+	// against. Empty only against a server that predates the field, which a
 	// worker treats as a hard failure rather than serving :10250 open.
 	ClientCAPEM           []byte
 	NodeClientCertPEM     []byte
@@ -100,8 +100,8 @@ type JoinResult struct {
 	// APIServers are the control-plane apiserver endpoints (host:port) this node
 	// targets. A multi-node server advertises the address its apiserver actually
 	// binds — its MESH IP — so this, not the underlay --server the join travelled
-	// over, is where the node's kubeconfig and its client-side load-balancer (M6.1)
-	// must point. Empty only when the server serves no mesh (single-node), where
+	// over, is where the node's kubeconfig and its client-side load-balancer must
+	// point. Empty only when the server serves no mesh (single-node), where
 	// the joined-over address is the apiserver's address too.
 	APIServers []string
 }

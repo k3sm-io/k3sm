@@ -19,7 +19,7 @@ limitations under the License.
 //
 // # Strategy
 //
-// hard cut (greenfield): M1 productizes the VALIDATED M0 spike
+// hard cut (greenfield): this package productizes the VALIDATED bring-up spike
 // (hack/lib/clusterup.sh) into a Go Executor with a Supervised strategy that
 // os/exec-supervises the four components as CHILD PROCESSES — it ensures the
 // prebuilt darwin/arm64 control-plane binaries (kwok-ci/k8s; upstream refuses to
@@ -46,16 +46,16 @@ limitations under the License.
 // mid-shutdown), and finally closes the SQLite database. The whole lifecycle is
 // ctx-driven.
 //
-// # Auth posture (M1)
+// # Auth posture
 //
-// M1 keeps the spike's AlwaysAllow authorization + a static bearer token so the
-// existing M0 Virtual Kubelet node still registers unchanged. Real RBAC + issued
-// node certs are an M3/M4 concern.
+// The apiserver enforces Node,RBAC by default (DefaultAuthorizationMode); the
+// static bearer token remains for the in-process Virtual Kubelet node, the
+// post-bring-up provisioning client, and the healthz probe.
 //
-// # HA datastore (M6.0)
+// # HA datastore
 //
 // Strategy: phased (named exception: kine/SQLite datastore migration). The default
-// stays single-node kine->SQLite (WAL), byte-unchanged from M1. Setting
+// stays single-node kine->SQLite (WAL). Setting
 // Config.DatastoreEndpoint to a Postgres DSN switches kine to Postgres (pure-Go
 // jackc/pgx/v5) so 2+ control-plane servers can share ONE datastore — the single
 // source of truth, no etcd quorum (the k3s external-datastore-HA topology). The
@@ -96,11 +96,11 @@ limitations under the License.
 // datastore SPOF; its own HA/backup (a pg_dump/PITR runbook, streaming replication,
 // or a managed Postgres) is the operator's responsibility, as in k3s.
 //
-// # Leader election (M6.0)
+// # Leader election
 //
 // Only the apiserver is active/active in HA. The scheduler and controller-manager run
 // with --leader-elect, derived from the posture (Config.leaderElect): false
-// single-node (one candidate, no lease churn — the M1–M5 default, byte-unchanged) and
+// single-node (one candidate, no lease churn — the single-node default) and
 // true in HA, so exactly one server's scheduler/KCM is active (two active schedulers
 // would double-bind pods; two KCMs would double-reconcile). The leader-election Leases
 // (coordination.k8s.io, kube-system/kube-scheduler + kube-controller-manager) are
@@ -114,7 +114,7 @@ limitations under the License.
 // client certs (CN=system:kube-scheduler / system:kube-controller-manager) via
 // per-component kubeconfigs (provisionComponentCerts), NOT the shared system:masters
 // admin token — so the apiserver's bootstrap RBAC actually constrains them (the k3s
-// model; this closes the M4.1 component-identity divergence). The KCM additionally runs
+// model, with no shared component identity). The KCM additionally runs
 // with --use-service-account-credentials=true, so each controller authenticates as its
 // own system:controller:<name> service account. --client-ca-file is set unconditionally
 // (single-node included) so those client certs authenticate. The in-process VK node, the

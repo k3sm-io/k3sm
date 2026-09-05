@@ -331,7 +331,7 @@ func reissuedArtifacts(workDir string) []RotationArtifact {
 
 // kubeletServingArtifact describes the control-plane node's kubelet SERVING
 // keypair — the cert :10250 presents, issued by the cluster CA on a multi-node
-// (--mesh-ip) boot (B213).
+// (--mesh-ip) boot.
 //
 // It is listed because Reissued's contract is COMPLETENESS: it is what a boot
 // re-issues, and this pair is re-minted on every boot exactly like the apiserver's

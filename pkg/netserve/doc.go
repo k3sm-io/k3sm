@@ -32,7 +32,7 @@ limitations under the License.
 //     forwarding off-cluster names upstream, and exposing the dns.PodDNSConfig the
 //     getaddrinfo shim consumes inside each pod.
 //
-// # Infra VIPs are answered node-locally, never steered over the mesh (M3.3)
+// # Infra VIPs are answered node-locally, never steered over the mesh
 //
 // The infra VIPs — kube-dns (10.43.0.10) and kubernetes (10.43.0.1) — are not in
 // any pod's podCIDR, so a podCIDR router would steer them over the wireguard mesh

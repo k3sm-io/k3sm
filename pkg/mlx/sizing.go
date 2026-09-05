@@ -173,7 +173,7 @@ const (
 	// KV cache is budgeted for the ceiling it is given, and no sequence reaches
 	// past the model's own trained window, so a ceiling above that window buys
 	// nothing and reserves memory the weights need. 32768 is the native window
-	// of the model classes M8 targets. A model with a SMALLER window is not an
+	// of the model classes k3sm targets. A model with a SMALLER window is not an
 	// error here — --max-kv-size bounds the cache, it does not promise the model
 	// can fill it — but an operator who wants the tighter pin states
 	// --max-kv-size in spec.runtime.args, which is why those args are appended

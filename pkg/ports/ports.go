@@ -20,7 +20,7 @@ limitations under the License.
 // It is a LEAF: it depends on nothing else in this repo, so the apiserver argv
 // (pkg/executor), the kubelet API listen addresses (cmd/k3sm), the svclb bind
 // refusal (pkg/svclb) and the admission CEL (pkg/policy) all read ONE
-// definition. Before B116 the NodePort range was a bare string inside the
+// definition. The NodePort range used to be a bare string inside the
 // apiserver argv and the kubelet port had no constant at all — two bare literals
 // inside listen addresses — so a range change could silently desync the guard
 // from the thing it guards.

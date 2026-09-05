@@ -48,7 +48,7 @@ type System interface {
 	// verdict (kill -0). A stale pid from a crashed prior run reads LivenessDead,
 	// so pre-flight reclaim reaps it; a pid this uid may not signal reads
 	// LivenessUnknown, which is NOT dead. See the Liveness doc for why the
-	// two-valued predicate this replaced was wrong (B211).
+	// two-valued predicate this replaced was wrong.
 	ProcessLiveness(pid int) Liveness
 	// TerminateProcess sends SIGTERM to pid's process group, waits up to grace for
 	// it to exit, then SIGKILLs. The supervised control plane runs each component
@@ -72,7 +72,7 @@ type System interface {
 // answers into "dead": ESRCH (no such process) and EPERM (the process exists, but
 // this uid may not signal it). EPERM is exactly what an unprivileged shell gets
 // when it probes a root-owned `k3sm dev up --datapath` server, so `k3sm dev list`
-// printed STATUS stale for a healthy instance (observed in the M8 gate run). That
+// printed STATUS stale for a healthy instance (observed in a live gate run). That
 // is not a cosmetic misreport: `stale` is the word that invites a cleanup, and the
 // instance being cleaned up is live.
 //
@@ -157,7 +157,7 @@ func (realSystem) Lo0RemoveAlias(ip string) error {
 // kill(2) distinguishes the two failures this cares about: ESRCH says no such
 // process, EPERM says the process EXISTS but this uid may not signal it. Anything
 // else (an EINVAL that cannot arise for signal 0) is treated as dead, matching the
-// pre-B211 posture for unclassifiable errors.
+// earlier posture for unclassifiable errors.
 func (realSystem) ProcessLiveness(pid int) Liveness {
 	if pid <= 0 {
 		return LivenessDead

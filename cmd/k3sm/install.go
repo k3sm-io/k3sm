@@ -32,7 +32,7 @@ import (
 // the root-owned install dir, writes the plists, bootstraps both daemons, and
 // writes the admin kubeconfig to the invoking human's home ($SUDO_USER), owned by
 // them. The Homebrew formula that invokes this and the notarize/signing pipeline
-// are the M4 packaging follow-up.
+// are the packaging follow-up.
 func runInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	targetUser := fs.String("user", os.Getenv("SUDO_USER"), "the human whose ~/.kube/config receives the admin kubeconfig (default $SUDO_USER)")

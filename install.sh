@@ -39,8 +39,8 @@
 #   K3SM_INSTALL_DOWNLOAD_ONLY  =1: download + verify into the current dir; never runs sudo
 #
 # NOTE: external commands (sudo curl sysctl sw_vers uname shasum tar) are
-# invoked by BARE NAME deliberately — the B137 acceptance gate substitutes them
-# via PATH. Do not absolutize them "for hardening"; it breaks the gate.
+# invoked by BARE NAME deliberately — the installer acceptance gate substitutes
+# them via PATH. Do not absolutize them "for hardening"; it breaks the gate.
 #
 # The checksum verify is same-origin INTEGRITY (the tarball matches the
 # checksums file published beside it), not publisher identity. Provenance
@@ -73,14 +73,15 @@ require_darwin_arm64() {
 check_base_url() {
 	case "$BASE_URL" in
 	https://*) ;;
-	# Loopback http is the B137 mock-server seam; every other http URL is refused.
+	# Loopback http is the acceptance gate's mock-server seam; every other http URL
+	# is refused.
 	http://127.0.0.1:* | http://127.0.0.1/* | 'http://[::1]:'* | 'http://[::1]/'*) ;;
 	*) fatal "K3SM_INSTALL_BASE_URL must be https:// (got: $BASE_URL)" ;;
 	esac
 }
 
 # The releases API for $BASE_URL. The canonical github.com/<owner>/<repo>/releases
-# maps to its api.github.com form; anything else (the B137 loopback mock, a
+# maps to its api.github.com form; anything else (the loopback test mock, a
 # mirror) is queried at BASE_URL itself, so one code path serves both.
 api_base() {
 	case "$BASE_URL" in

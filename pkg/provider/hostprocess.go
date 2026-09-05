@@ -37,19 +37,19 @@ import (
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
-// HostProcess is the k3sm M0 "HostProcess" Virtual Kubelet provider: it runs each
+// HostProcess is the k3sm "HostProcess" Virtual Kubelet provider: it runs each
 // pod container as a NATIVE macOS process at host paths — no Linux, no VM, and (for
 // now) no isolation. It is the walking-skeleton runtime that proves a Kubernetes Pod
 // can execute as a native arm64 process. Seatbelt confinement (see
-// runtimed/prototypes/seatbelt-hostpath) and the gRPC runtimed split arrive in M2.
+// runtimed/prototypes/seatbelt-hostpath) live on the runtimed runtime instead.
 //
 // Container argv = container.Command + container.Args; if both are empty the image
-// reference is treated as the binary path (M0 convention, since native macOS
+// reference is treated as the binary path (the host-binary convention, since native macOS
 // workloads have no image ecosystem yet).
 //
-// restartPolicy is NOT honored on this provider (M10.2): an exited container is
+// restartPolicy is NOT honored on this provider: an exited container is
 // reaped once and never re-exec'd, whatever the pod or container restartPolicy
-// says. The B26 exit-driven restart authority (restartpolicy.go +
+// says. The exit-driven restart authority (restartpolicy.go +
 // runtimed_restart.go) is wired only on the runtimed path; the conformance
 // register carries this HostProcess ceiling at write-back.
 type HostProcess struct {
@@ -144,9 +144,9 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 		c := &pod.Spec.Containers[i]
 		argv := append(append([]string{}, c.Command...), c.Args...)
 		if len(argv) == 0 {
-			argv = []string{c.Image} // M0 convention: image ref == binary path
+			argv = []string{c.Image} // host-binary convention: image ref == binary path
 		}
-		// M0 has no registry pull (image == already-present native binary), so the
+		// This runtime has no registry pull (image == already-present native binary), so the
 		// Pulled event uses the kubelet's "already present" phrasing.
 		events = append(events, podEvent{corev1.EventTypeNormal, reasonPulled, msgImageAlreadyPresent(c.Image)})
 		logPath := filepath.Join(dir, c.Name+".log")
@@ -174,7 +174,7 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 	// containersReady is the AND of every container's Ready over the statuses just
 	// built (a StartError container is not Ready) — NOT a hardcoded True. It gates
 	// PodReady through the shared computeReadiness seam so spec.readinessGates are
-	// honored (M0/HostProcess is probe-less: a container is Ready when Running).
+	// honored (HostProcess is probe-less: a container is Ready when Running).
 	containersReady := len(cstats) > 0
 	for i := range cstats {
 		if !cstats[i].Ready {
@@ -254,7 +254,7 @@ func (p *HostProcess) reap(k, cname string, cmd *exec.Cmd, lf *os.File) {
 	p.dispatch(rec.pod)
 }
 
-// UpdatePod is a no-op for M0 (we don't restart on spec changes yet).
+// UpdatePod is a no-op on this provider: it does not restart on spec changes.
 func (p *HostProcess) UpdatePod(ctx context.Context, pod *corev1.Pod) error { return nil }
 
 // DeletePod kills every container process group and forgets the pod, then emits a
@@ -365,35 +365,35 @@ func (p *HostProcess) GetContainerLogs(ctx context.Context, ns, podName, contain
 }
 
 // GetStatsSummary returns the kubelet stats Summary for this node. It IS
-// implemented — the summary is what GetMetricsResource transcodes — but the M0
+// implemented — the summary is what GetMetricsResource transcodes — but the
 // HostProcess provider meters nothing, so it carries the node identity and no CPU
 // or memory sample.
 func (p *HostProcess) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	return &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.nodeName}}, nil
 }
 
-// --- not implemented in M0 ---
+// --- not implemented on this provider ---
 
-// RunInContainer is not implemented by the M0 HostProcess provider: it returns a
+// RunInContainer is not implemented by the HostProcess provider: it returns a
 // NotFound error so `kubectl exec` fails with a clear reason rather than hanging.
 func (p *HostProcess) RunInContainer(ctx context.Context, ns, podName, c string, cmd []string, a vkadapter.AttachIO) error {
-	return vkadapter.NotFound("exec is not implemented in the M0 HostProcess provider")
+	return vkadapter.NotFound("exec is not implemented by the HostProcess provider")
 }
 
-// AttachToContainer is not implemented by the M0 HostProcess provider: it returns
+// AttachToContainer is not implemented by the HostProcess provider: it returns
 // a NotFound error so `kubectl attach` fails with a clear reason.
 func (p *HostProcess) AttachToContainer(ctx context.Context, ns, podName, c string, a vkadapter.AttachIO) error {
-	return vkadapter.NotFound("attach is not implemented in the M0 HostProcess provider")
+	return vkadapter.NotFound("attach is not implemented by the HostProcess provider")
 }
 
-// PortForward is not implemented by the M0 HostProcess provider: it returns a
+// PortForward is not implemented by the HostProcess provider: it returns a
 // NotFound error so `kubectl port-forward` fails with a clear reason.
 func (p *HostProcess) PortForward(ctx context.Context, ns, podName string, port int32, s io.ReadWriteCloser) error {
-	return vkadapter.NotFound("port-forward is not implemented in the M0 HostProcess provider")
+	return vkadapter.NotFound("port-forward is not implemented by the HostProcess provider")
 }
 
 // GetMetricsResource transcodes this provider's Summary into the kubelet
-// resource-metrics families. The M0 HostProcess provider meters nothing, so its
+// resource-metrics families. The HostProcess provider meters nothing, so its
 // node-only Summary carries no CPU or memory sample and the transcode yields an
 // EMPTY scrape target — the same honest answer the old stub gave, now produced by
 // the one shared builder rather than a second hard-coded nil (so a future

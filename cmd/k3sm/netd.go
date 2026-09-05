@@ -72,7 +72,7 @@ func runNetd(args []string) error {
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses (empty denies every <1024 bind)")
-	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT since B116 — ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
 	_ = fs.Parse(args)
 
 	if os.Geteuid() != 0 {
@@ -98,7 +98,7 @@ func runNetd(args []string) error {
 	}
 
 	// The node's own InternalIP for the node-address LB branch of the port
-	// authorizer (M10.3). Empty is a valid posture — the branch simply denies —
+	// authorizer. Empty is a valid posture — the branch simply denies —
 	// so only a NON-empty value that fails to parse is a config error.
 	var nodeIP netip.Addr
 	if opts.nodeIP != "" {
@@ -169,7 +169,7 @@ func canonicalLBService() netdsvc.ServiceRef {
 // buildServiceSet returns the privileged-port authorizer's two predicates —
 // declares (some Service declares a given port; the Service-CIDR-VIP branch)
 // and lbDeclarers (WHICH Services of TYPE LoadBalancer declare it, by
-// namespace+name; the node-own-address branch, M10.3, whose allowlist match
+// namespace+name; the node-own-address branch, whose allowlist match
 // netdsvc applies) — backed by one Services informer, plus the _k3sm gid for
 // the socket group. With no kubeconfig both predicates are nil, so the daemon
 // denies every <1024 bind (fail safe). The informer runs until ctx ends; the
@@ -340,7 +340,7 @@ func serviceDeclaresPort(lister corev1listers.ServiceLister, port int) bool {
 // LoadBalancer in the cache that declare port. It deliberately reports who
 // declared rather than a bare bool: netdsvc's node-own-address branch is an
 // allowlist keyed on namespace+name, and its refusal names the Services that
-// declared the port but are not the canonical one (B133). A ClusterIP Service
+// declared the port but are not the canonical one. A ClusterIP Service
 // declaring :80 is not reported at all — it cannot authorize a node-address
 // listener under any policy.
 func lbServicesDeclaringPort(lister corev1listers.ServiceLister, port int) []netdsvc.ServiceRef {

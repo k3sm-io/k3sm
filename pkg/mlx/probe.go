@@ -67,7 +67,7 @@ import (
 //
 // rt is the transport (NewProbeTransport for production use; a fake
 // RoundTripper or an httptest server's default transport in tests) — probe
-// targets are pod-local addresses with no cluster PKI, so, like the B9 kubelet
+// targets are pod-local addresses with no cluster PKI, so, like the kubelet
 // probe handlers (pkg/provider/probe_handlers.go), verification is relaxed by
 // NewProbeTransport rather than by this function reaching for insecure
 // defaults itself.
@@ -96,8 +96,8 @@ func ProbeOpenAISurface(ctx context.Context, rt http.RoundTripper, baseURL, mode
 
 // NewProbeTransport is the HTTP transport for OpenAI-surface probes. Probe
 // targets are pod-local addresses with no cluster PKI, so — mirroring
-// pkg/provider/probe_handlers.go's newProbeTransport (the B9 hardening this
-// item reuses) — server certificates are not verified and connections are not
+// pkg/provider/probe_handlers.go's newProbeTransport, whose hardening this
+// reuses — server certificates are not verified and connections are not
 // pooled: each probe call is a fresh, short-lived request, never one held open
 // across a reconcile loop's iterations against a replica that may have
 // restarted with a new pod IP.

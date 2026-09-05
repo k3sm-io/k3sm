@@ -29,7 +29,7 @@ import (
 // open-connections defaults to 0 (UNLIMITED), so N control-plane servers sharing one
 // Postgres can exhaust its max_connections. We pin per-server bounds so the cluster
 // total stays within a documented Postgres max_connections. See the package doc
-// ("HA datastore (M6)") for the SPOF + sizing rationale.
+// ("HA datastore") for the SPOF + sizing rationale.
 const (
 	// datastoreMaxOpenConns bounds kine's Postgres connections PER SERVER. With 2 HA
 	// servers that is 2*32 = 64 <= 100 (the Postgres default max_connections), leaving
@@ -73,7 +73,8 @@ func sqliteEndpoint(workDir string) string {
 // datastore posture is table-tested without spawning kine.
 //
 // Empty Config.DatastoreEndpoint -> the single-node SQLite WAL default, argv
-// byte-identical to M1 (no connection-pool flags, no out-of-band env). A non-empty
+// byte-identical to the pre-HA shape (no connection-pool flags, no out-of-band
+// env). A non-empty
 // endpoint -> the operator's Postgres DSN with the PASSWORD STRIPPED (the password
 // is relocated out-of-band to PGPASSFILE by kineSecretEnv; it must never reach argv
 // or a log) plus the pinned pgx connection-pool bounds.

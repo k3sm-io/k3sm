@@ -24,7 +24,7 @@ import (
 	"k3sm.io/k3sm/pkg/policy"
 )
 
-// M10.0 apiserver conformance config: the
+// The apiserver conformance config: the
 // audit policy and the admission-control config (PSA PodSecurityConfiguration)
 // the apiserver argv references. Both files TRACK THE BINARY — they are
 // overwritten on every boot (mirroring writeTokenFile, NOT the Stat-guarded
@@ -69,12 +69,12 @@ rules:
 // delegating to pkg/policy, the SINGLE authority for the PSA level tuple
 // (Res.2). The executor owns the FILE — path, 0600 mode, the provision-time
 // write, and the argv that references it; policy owns WHAT the levels are, so
-// the B71 enforce cutover is one value there and not a second opinion here.
+// the baseline-enforce cutover is one value there and not a second opinion here.
 //
 //   - enforceBaseline=false (the SHIPPED default): enforce stays privileged
 //     (zero rejection); warn=baseline + audit=restricted make every violation
 //     observable — the warn-first posture.
-//   - enforceBaseline=true (the B71 cutover, via `k3sm server
+//   - enforceBaseline=true (the baseline-enforce cutover, via `k3sm server
 //     --psa-enforce-baseline`): enforce flips to baseline; warn/audit unchanged.
 func admissionConfigYAML(enforceBaseline bool) string {
 	enforce := policy.DefaultPodSecurityEnforceLevel
@@ -84,7 +84,7 @@ func admissionConfigYAML(enforceBaseline bool) string {
 	return policy.PodSecurityAdmissionConfigYAML(enforce)
 }
 
-// writeConformanceConfig lays down the M10.0 apiserver config artifacts in
+// writeConformanceConfig lays down the apiserver conformance config artifacts in
 // provision() (before startAPIServer — Res.3: argv referencing a missing file
 // would wedge bring-up opaquely for the healthz timeout): the 0700 audit dir
 // and the two 0600 config files, both overwritten on every boot (they track

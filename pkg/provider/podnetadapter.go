@@ -32,7 +32,7 @@ import (
 	"k3sm.io/runtimed/pkg/supervisor"
 )
 
-// PodNetwork is the provider-side pod-IP seam (M10.1): the ONE per-node
+// PodNetwork is the provider-side pod-IP seam: the ONE per-node
 // allocation authority the runtimed provider resolves a pod's IP from BEFORE
 // translation (so box.PodIp, the downward-API status.podIP env, and the SBPL
 // bind discipline all carry the same /32) and the embedded runtimed daemon
@@ -51,7 +51,7 @@ type PodNetwork interface {
 	// MarkHostNetwork records podID as a spec.hostNetwork pod: it shares the
 	// node's addresses, so Setup returns the node IP and allocates nothing.
 	MarkHostNetwork(podID string)
-	// SetupGuest provisions the GUEST network of a vm-RuntimeClass pod (M11.4-d4)
+	// SetupGuest provisions the GUEST network of a vm-RuntimeClass pod
 	// and RECORDS the resulting config for the runtimed-side read: darwin-net
 	// allocates the pod IP + NAT parameters and derives the guest resolv.conf from
 	// dnsCfg, and the implementation folds both into runtimed's plain-data

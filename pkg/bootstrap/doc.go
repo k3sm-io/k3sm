@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package bootstrap implements k3sm's multi-node worker join + trust (M3.0).
+// Package bootstrap implements k3sm's multi-node worker join + trust.
 //
 // It is the security-critical core of "a second Mac joins the cluster" (DESIGN
 // §5c): the K10 CA-pinned join token (token.go), the TTL-bounded

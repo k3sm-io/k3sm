@@ -95,36 +95,36 @@ type Config struct {
 	// the node's wireguard mesh IP so a joining node can reach the apiserver and the
 	// AlwaysAllow+token surface is NOT exposed on 0.0.0.0 or the LAN (bind the mesh
 	// interface ONLY). Empty falls back to NodeIP (loopback for the
-	// single-node dev path), so M1/M2 are unchanged.
+	// single-node dev path).
 	BindAddress string
 	// ClientCAFile is the apiserver --client-ca-file: the client-CA the apiserver trusts
 	// so client certs authenticate (node certs CN=system:node:<name> and the per-component
 	// certs CN=system:kube-scheduler / system:kube-controller-manager, all signed by the
 	// signing CA). It is now wired UNCONDITIONALLY — when empty, apiServerArgs defaults it
 	// to the signing CA under the work-dir PKI dir (certs.SigningCACertPath), so the
-	// single-node path gets it too (the M4.1 review flagged the prior mesh-gating). An
-	// explicit value (the mesh path) is honored verbatim. Originally wired in M3 (while the
-	// authorizer was still AlwaysAllow) so M4.1's Node,RBAC flip is a pure authorizer switch.
+	// single-node path gets it too — it is never mesh-gated. An explicit value (the
+	// mesh path) is honored verbatim. It was wired while the authorizer was still
+	// AlwaysAllow, so the Node,RBAC flip was a pure authorizer switch.
 	ClientCAFile string
 	// KubeletCAFile, when set, is passed as --kubelet-certificate-authority so the
 	// apiserver verifies the kubelet-serving cert and remote exec/logs are not
 	// MITM-able.
 	KubeletCAFile string
 	// AnonymousAuth, when non-nil, sets --anonymous-auth explicitly. withDefaults
-	// fills a nil pointer with FALSE: under Node,RBAC (M4.1) anonymous requests map to
+	// fills a nil pointer with FALSE: under Node,RBAC anonymous requests map to
 	// system:anonymous and RBAC default-denies them, but closing the surface outright
 	// is defense-in-depth — it keeps an unauthenticated caller from probing the
-	// apiserver at all (and pre-M4.1, under AlwaysAllow, it was the only thing stopping
+	// apiserver at all (and under the old AlwaysAllow posture it was the only thing stopping
 	// anonymous cluster-admin). The static bearer token (scheduler/CM/kubectl/healthz
 	// all carry it) is unaffected; only credential-less requests are rejected. The pure
-	// apiServerArgs still omits the flag for a nil pointer, so the M3 multi-node path
+	// apiServerArgs still omits the flag for a nil pointer, so the multi-node path
 	// (explicit false) and the arg-rendering tests are unchanged.
 	AnonymousAuth *bool
 	// ServingCertFile / ServingKeyFile, when both set, are passed as
 	// --tls-cert-file / --tls-private-key-file so the apiserver presents a cluster-CA
 	// -signed serving cert (instead of self-signing into --cert-dir). A joining node
 	// that pinned the cluster CA then verifies the apiserver via its kubeconfig
-	// certificate-authority-data. Empty keeps the M1/M2 self-signed path.
+	// certificate-authority-data. Empty keeps the self-signed single-node path.
 	ServingCertFile string
 	ServingKeyFile  string
 	// RootCAFile is the CA the kube-controller-manager's root-ca-cert-publisher
@@ -141,7 +141,7 @@ type Config struct {
 	// cannot name CAs from different postures.
 	RootCAFile string
 	// AuthorizationMode is the apiserver --authorization-mode. Empty defaults to
-	// DefaultAuthorizationMode (Node,RBAC) — the M4.1 hard-cut flip from AlwaysAllow.
+	// DefaultAuthorizationMode (Node,RBAC) — the hard-cut flip from AlwaysAllow.
 	// The flip is pure because no in-process component is left unauthorized: the VK node
 	// + provisioners carry the static admin token (mapped to system:masters, which
 	// bypasses RBAC), the scheduler/KCM carry their own client-cert identities the
@@ -151,9 +151,9 @@ type Config struct {
 	AuthorizationMode string
 	// DatastoreEndpoint, when non-empty, is the kine datastore endpoint — a Postgres
 	// connection URL (postgres://user[:password]@host:port/dbname?sslmode=...) for the
-	// HA multi-writer posture (M6.0): 2+ control-plane servers share ONE Postgres, the
+	// HA multi-writer posture: 2+ control-plane servers share ONE Postgres, the
 	// single source of truth (no etcd quorum). Empty keeps the single-node kine->SQLite
-	// WAL default (M1–M5), byte-unchanged. The apiserver always talks to the LOCAL kine
+	// WAL default. The apiserver always talks to the LOCAL kine
 	// (--etcd-servers 127.0.0.1:<KinePort>); each server runs its own kine against the
 	// shared Postgres (the k3s topology). The DSN PASSWORD is kept off argv and out of
 	// the logs — it is relocated to a 0600 PGPASSFILE handed to the kine child, and only
@@ -166,15 +166,15 @@ type Config struct {
 	// a DatastoreEndpoint — Validate fails closed otherwise, so a 2nd server can NEVER
 	// silently fall back to its own SQLite (two servers each on their own SQLite is
 	// split-brain — divergent state, no single source of truth). The full HA server-join
-	// bootstrap (the identical-CA bundle, DESIGN §5c) is M6.1; M6.0 consumes this only
-	// for the guard + the leader-election posture.
+	// bootstrap (the identical-CA bundle, DESIGN §5c) is a separate path; this field
+	// drives only the guard + the leader-election posture.
 	ServerJoin bool
 	// PSAEnforceBaseline, when true, flips the cluster-wide Pod Security Admission
 	// default ENFORCE level from privileged to baseline in the provisioned
 	// PodSecurityConfiguration (see admissionConfigYAML — the SINGLE authority for
 	// the PSA level tuple). The SHIPPED default is false — baseline-WARN only
 	// (warn=baseline + audit=restricted, zero rejection).
-	// This field is the documented, reversible B71 cutover MECHANISM: flip it (via
+	// This field is the documented, reversible cutover MECHANISM: flip it (via
 	// `k3sm server --psa-enforce-baseline`) only after a pre-flight scan proves the
 	// cluster clean; reverting the flag reverts the posture on the next boot. PSA
 	// here is conformance-surface + defense-in-depth, NOT the privilege boundary
@@ -184,7 +184,7 @@ type Config struct {
 	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (a Postgres
 	// multi-writer datastore — so only one server's scheduler/KCM is active; two active
 	// schedulers double-bind pods, two KCMs double-reconcile) and OFF single-node (one
-	// candidate, no lease churn — the M1–M5 default). Only the apiserver is active/active
+	// candidate, no lease churn — the single-node default). Only the apiserver is active/active
 	// in HA. The leader-election Leases are authorized by the apiserver's auto-created
 	// system:kube-scheduler / system:kube-controller-manager bootstrap RBAC, which binds
 	// the components' OWN per-component identities — no pkg/rbac object is needed.
@@ -193,7 +193,7 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// Pinned defaults — the versions VALIDATED by the M0 spike (docs/M0-spike.md).
+// Pinned defaults — the versions VALIDATED by the bring-up spike.
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
 	DefaultKubeVersion = "v1.36.2"
@@ -209,7 +209,7 @@ const (
 	// to 5s and --emulated-etcd-version to 3.6.11, so the apiserver's watch cache
 	// stays fresh on both postures, and its no-cgo build is a real, supported variant
 	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo) rather than the
-	// SQLite-disabled stub the M0 spike measured on the old pin.
+	// SQLite-disabled stub the spike measured on the old pin.
 	//
 	// Moving an EXISTING single-node state.db onto this pin is a one-way datastore
 	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
@@ -241,9 +241,9 @@ const (
 	// them, adjacent to the apiserver's port so an operator reading `lsof` sees
 	// k3sm's listeners together.
 	DefaultRegistryPort = 6450
-	// DefaultAuthorizationMode is the apiserver authorizer chain from M4.1 onward:
+	// DefaultAuthorizationMode is the apiserver authorizer chain:
 	// the Node authorizer (scopes a kubelet/VK-node to its own objects) plus RBAC
-	// (default-deny). It replaces the M0–M3 AlwaysAllow posture.
+	// (default-deny). It replaced the earlier AlwaysAllow posture.
 	DefaultAuthorizationMode = "Node,RBAC"
 	// DefaultWorkDir is the control-plane state root for the ROOT posture
 	// (explicit run-as-root mode). It is root-owned; the unprivileged _k3sm
@@ -457,7 +457,7 @@ func (c Config) withDefaults() Config {
 		// Close the anonymous surface by default (defense-in-depth on top of the
 		// Node,RBAC default-deny): an unauthenticated caller is rejected outright
 		// rather than reaching the authorizer as system:anonymous. Explicit settings
-		// (the M3 multi-node path) are preserved.
+		// (the multi-node path) are preserved.
 		anonOff := false
 		c.AnonymousAuth = &anonOff
 	}

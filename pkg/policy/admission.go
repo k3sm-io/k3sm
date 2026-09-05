@@ -59,7 +59,7 @@ const (
 	foreignUserBindingName = "k3sm-reject-foreign-user-binding"
 )
 
-// dsTolerationPolicyName / dsTolerationBindingName name the mutating policy (B76)
+// dsTolerationPolicyName / dsTolerationBindingName name the mutating policy
 // that injects the provider toleration into DaemonSet-owned pods so they schedule.
 const (
 	dsTolerationPolicyName  = "k3sm-inject-daemonset-provider-toleration"
@@ -80,7 +80,7 @@ const (
 	udpServiceBindingName = "k3sm-warn-service-udp-binding"
 )
 
-// reservedLBPortPolicyName / reservedLBPortBindingName name the deny policy (B116)
+// reservedLBPortPolicyName / reservedLBPortBindingName name the deny policy
 // that rejects a LoadBalancer Service declaring a port k3sm's own wildcard
 // listeners occupy.
 const (
@@ -89,7 +89,7 @@ const (
 )
 
 // egressAnnotationPolicyName / egressAnnotationBindingName name the Warn policy
-// (B91) that surfaces a pod carrying a hand-set runtimev1.AnnotationInternetEgress
+// that surfaces a pod carrying a hand-set runtimev1.AnnotationInternetEgress
 // annotation that is not stamped by an operator controller.
 const (
 	egressAnnotationPolicyName  = "k3sm-warn-pod-hand-set-internet-egress"
@@ -348,7 +348,7 @@ const providerTolerationExpr = `has(object.spec.tolerations) && object.spec.tole
 	`((has(t.operator) && t.operator == 'Exists') || ` +
 	`((!has(t.operator) || t.operator == 'Equal') && (!has(t.value) || t.value == ''))))`
 
-// daemonSetOwnedExpr is the matchCondition CEL that fires the B76 mutating policy
+// daemonSetOwnedExpr is the matchCondition CEL that fires the mutating policy
 // only for a pod created by the DaemonSet controller. It is group-qualified
 // (o.apiVersion.startsWith('apps/')) so a CRD `kind: DaemonSet` in some other API
 // group cannot masquerade as a real apps/v1 DaemonSet and steal the injection; and
@@ -368,20 +368,20 @@ const daemonSetOwnedExpr = `object.metadata.ownerReferences.exists(o, ` +
 // lets the mutation run when the pod does not already tolerate the taint. Only the
 // toleration is injected — never the kubernetes.io/os=darwin nodeSelector: a DaemonSet
 // declares its own placement intent, and overriding it here would defeat the DS's
-// nodeSelector/affinity (B76 Res.7). ProviderTaintKey is interpolated so the taint key
+// nodeSelector/affinity. ProviderTaintKey is interpolated so the taint key
 // lives in exactly one place (single-sourced with the taint the node stamps).
 const daemonSetTolerationPatchExpr = `[JSONPatch{op: "add", path: "/spec/tolerations/-", ` +
 	`value: Object.spec.tolerations{key: "` + ProviderTaintKey + `", operator: "Exists", effect: "NoSchedule"}}]`
 
-// EnsureDaemonSetTolerationMutation idempotently provisions the B76
+// EnsureDaemonSetTolerationMutation idempotently provisions the
 // MutatingAdmissionPolicy (+ binding) that injects the provider toleration into
 // DaemonSet-owned pods. A DS pod is created by the DaemonSet controller in the
-// kube-controller-manager, so the B17 create-Warn advisory never reaches its author and
+// kube-controller-manager, so the create-Warn advisory never reaches its author and
 // the pod would sit Unschedulable against the k3sm.io/provider:NoSchedule taint; this
 // policy mutates the pod to tolerate it. Unlike the Deny/Warn ValidatingAdmissionPolicies
 // it changes the stored object. Both matchConditions must hold (DS-owned and not already
-// tolerating); the mutation appends exactly one toleration and never a nodeSelector
-// (Res.7). Safe to call on every server start (create-or-update; an unchanged
+// tolerating); the mutation appends exactly one toleration and never a
+// nodeSelector. Safe to call on every server start (create-or-update; an unchanged
 // spec is not rewritten).
 //
 // This provisions objects for a beta API (admissionregistration.k8s.io/v1beta1,
@@ -392,7 +392,7 @@ func EnsureDaemonSetTolerationMutation(ctx context.Context, cs kubernetes.Interf
 	// Ignore — not Fail — because this is a scheduling-convenience injector, not a
 	// guard: MatchConstraints is all Pods/Create, so a Fail policy would turn any
 	// CEL/beta-machinery evaluation error into a cluster-wide denial of Pod create.
-	// Failing open instead degrades to the pre-B76 status quo (the DS pod is created
+	// Failing open instead degrades to the un-mutated status quo (the DS pod is created
 	// without the toleration and stays Unschedulable — visible and recoverable, no
 	// guard bypass: the os=darwin Deny VAP and the provider taint still hold). Mirrors
 	// the advisory Warn VAP's Ignore.
@@ -555,7 +555,7 @@ func containersClause(list string, allowedID int64, optional bool) string {
 // refusal. Safe to call on every server start (create-or-update; an unchanged spec
 // is not rewritten).
 //
-// Provisioned in every posture (B153), not only under the netd-helper backend:
+// Provisioned in every posture, not only under the netd-helper backend:
 // scoping it to that backend let a `--network none`/`direct` cluster admit a
 // foreign-uid pod with no policy object at all, which then wedged at spawn under
 // `none` while unprivileged — the exact silent failure this guard exists to

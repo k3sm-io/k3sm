@@ -104,7 +104,7 @@ type NodeConfig struct {
 	NumWorkers int
 	// TLSConfig, when non-nil, serves the kubelet HTTP API over TLS AND attaches the
 	// provider routes (logs/exec/attach/port-forward); nil is the plain-HTTP path
-	// with no provider routes (the M0 posture).
+	// with no provider routes.
 	//
 	// When it is set it MUST require and verify a client certificate
 	// (tls.RequireAndVerifyClientCert against a non-nil ClientCAs) — NewNode refuses
@@ -151,7 +151,7 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 	// HTTP provider routes (logs/exec/attach/port-forward) are served — mutually
 	// authenticated and instrumented — ONLY when TLS is configured, so exec/attach
 	// never rides plain HTTP. Both wiring branches below MUST consult this predicate
-	// in lockstep so a future edit cannot expose exec on the M0 plain-HTTP path.
+	// in lockstep so a future edit cannot expose exec on the plain-HTTP path.
 	routes := providerRoutesEnabled(cfg)
 	// And when they ARE served, they are served authenticated: refuse to build the
 	// node at all rather than serve exec to whoever can reach the port.
@@ -165,7 +165,7 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 			c.Client = cfg.Client
 			c.HTTPListenAddr = cfg.HTTPListenAddr
 			c.NumWorkers = cfg.NumWorkers
-			c.TLSConfig = cfg.TLSConfig // nil = plain HTTP (M0 path); set = kubelet-serving TLS
+			c.TLSConfig = cfg.TLSConfig // nil = plain HTTP; set = kubelet-serving TLS
 			// k3sm resolves downward-API env in the provider itself (env.go
 			// resolveDownwardEnv), AFTER the pod's /32 is allocated so status.podIP
 			// carries the real IP. VK v1.12.0's own PopulateEnvironmentVariables runs
@@ -202,7 +202,7 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 // providerRoutesEnabled reports whether NewNode serves the kubelet HTTP provider
 // routes (logs/exec/attach/port-forward). It is TRUE only when TLS is configured,
 // so the interactive exec/attach surface — which reaches the root-owned runtime —
-// is never exposed on the plain-HTTP (M0) path. This is the invariant the security
+// is never exposed on the plain-HTTP path. This is the invariant the security
 // regression test pins; keep NewNode's two wiring branches routed through it.
 func providerRoutesEnabled(cfg NodeConfig) bool { return cfg.TLSConfig != nil }
 
@@ -213,7 +213,7 @@ func providerRoutesEnabled(cfg NodeConfig) bool { return cfg.TLSConfig != nil }
 // ERROR, not a degraded mode.
 //
 // It is stated here, in the one constructor, rather than trusted to each caller,
-// because the pre-B176 posture — nodeutil.NoAuth() over a tls.NoClientCert
+// because the earlier posture — nodeutil.NoAuth() over a tls.NoClientCert
 // listener — was reachable by simply not thinking about it: every field involved
 // had a usable zero value. Requiring the three facts together means a regression
 // on ANY of them (an authorizer dropped, ClientAuth relaxed back to NoClientCert

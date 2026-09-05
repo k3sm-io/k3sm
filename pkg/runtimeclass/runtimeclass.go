@@ -59,7 +59,7 @@ const LabelVirtualization = "k3sm.io/virtualization"
 // when pulling an image. The pull-time platform policy still passes HostRosetta=false,
 // so a darwin/amd64-ONLY image is refused with image.ErrNoPlatformMatch (an
 // ImagePullBackOff pod), by design: executing a translated Mach-O under Seatbelt is
-// unproven until B105, and selecting amd64 payloads before then would drop the AMFI
+// unproven, and selecting amd64 payloads before that is proven would drop the AMFI
 // kernel backstop the signature policy relies on (an unsigned x86_64 Mach-O runs where
 // an unsigned arm64 one is SIGKILLed). Do NOT "fix" that by wiring HostRosetta here.
 // The same statement is in docs/user/vm-runtimeclass.md for operators.
@@ -91,7 +91,7 @@ const LabelRosetta = "k3sm.io/rosetta"
 // does NOT yet consume it. A pod also needs spec.runtimeClassName: vm to reach a guest
 // at all, the vm path is EXPERIMENTAL, and the guest lane's image pull is unbuilt (the
 // pull-time policy passes GuestRosetta=false, so a linux/amd64-only image is refused
-// with image.ErrNoPlatformMatch). The Linux-guest payload path lands after B105; until
+// with image.ErrNoPlatformMatch). The Linux-guest payload path is unbuilt; until
 // then treat this key as an advertisement of host capability, not of a runnable
 // workload. The same statement is in docs/user/vm-runtimeclass.md for operators.
 //
@@ -105,7 +105,7 @@ const LabelRosettaLinux = "k3sm.io/rosetta-linux"
 
 // LabelVMArtifacts is the node label advertising that this node holds the pinned
 // Linux guest boot artifacts — the kernel and the initramfs named by the in-code
-// digest pin — materialised and digest-verified on this daemon start (B108).
+// digest pin — materialised and digest-verified on this daemon start.
 //
 // It is the ADVERTISEMENT half of the VMArtifactsAvailable capability, minted by
 // cmd/k3sm from provider.NodeCapabilities.VMArtifacts, and it follows the same
@@ -142,8 +142,8 @@ const managedLabel = "k3sm.io/managed"
 // host-process RSS (~50–150Mi) plus the guest Linux kernel baseline (~50–100Mi). The
 // scheduler subtracts Overhead.PodFixed from node allocatable when admitting a vm
 // pod, so without it the scheduler accounts ZERO micro-VM overhead and oversubscribes
-// the node. It is a deliberately conservative floor to be REFINED by the M5 VZ-boot
-// lab, NOT a measured exact figure. 256Mi (not 128Mi: 128Mi would be consumed by the
+// the node. It is a deliberately conservative floor to be REFINED by a VZ-boot
+// lab run, NOT a measured exact figure. 256Mi (not 128Mi: 128Mi would be consumed by the
 // VMM process alone, re-admitting the very oversubscription this fixes; cf. Kata
 // Containers' 160–256Mi defaults).
 //
@@ -179,8 +179,8 @@ var vmMemoryOverhead = resource.MustParse("256Mi")
 // (matching pkg/rbac under the pinned kine, where ConsistentListFromCache is GA-locked
 // true and a watch-cache LIST can read stale). On AlreadyExists it RECONCILES the
 // k3sm-owned MANAGED SHAPE onto the persisted object — the "vm" RuntimeClass lives in
-// kine across restarts, so a cluster first provisioned by an older k3sm (pre-B24 had no
-// Overhead; pre-B49 never re-pinned the nodeSelector) or hand-edited by an operator is
+// kine across restarts, so a cluster first provisioned by an older k3sm (which had no
+// Overhead, and never re-pinned the nodeSelector) or hand-edited by an operator is
 // repaired in place. The reconcile does a direct, consistent Get (never a stale-prone
 // LIST) and repairs two MUTABLE dimensions with a per-key FLOOR-merge, never a wholesale
 // clobber:

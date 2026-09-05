@@ -28,7 +28,7 @@ import (
 // effective restart policy. They encode the upstream kubelet truth table and
 // the CrashLoopBackOff schedule.
 //
-// Wired (M10.2, B26) on the RUNTIMED path only: runtimed_restart.go's
+// Wired on the RUNTIMED path only: runtimed_restart.go's
 // observeExits is the single exit-driven restart authority — it consumes this
 // resolver + crashLoopBackoff, schedules the re-exec via the RestartContainer
 // RPC, and synthesizes the Waiting{Reason: CrashLoopBackOff} overlay while
@@ -36,7 +36,7 @@ import (
 // actually scheduled: flipping the phase without the re-exec would mask a
 // permanently-dead pod as Running, worse than an honest PodFailed.
 //
-// NOT wired on the HostProcess provider (the M0 opt-in runtime): a HostProcess
+// NOT wired on the HostProcess provider (the opt-in rootless-dev runtime): a HostProcess
 // pod's exited container is reaped once and never re-exec'd, whatever its
 // restartPolicy — the conformance register handles that row at write-back.
 //
@@ -119,8 +119,8 @@ const (
 // crashLoopBackoff computes the per-container CrashLoopBackOff delay schedule. It
 // has no wall-clock side effects: it never sleeps; it reads the injected clock
 // only to detect the stabilization reset. The zero value is not usable —
-// construct it with newCrashLoopBackoff. It is not safe for concurrent use; B26
-// owns one per container inside containerRestart, serialized by
+// construct it with newCrashLoopBackoff. It is not safe for concurrent use; the
+// restart authority owns one per container inside containerRestart, serialized by
 // podTrack.restartMu (runtimed_restart.go).
 type crashLoopBackoff struct {
 	clk  clock.Clock
@@ -165,7 +165,7 @@ func (b *crashLoopBackoff) Next() time.Duration {
 // crash-looping. A cold schedule (never used, or reset by a run that outlasted
 // the window) means a restart may proceed immediately.
 //
-// It exists for kubelet parity on the LIVENESS trigger (B26): upstream kills a
+// It exists for kubelet parity on the LIVENESS trigger: upstream kills a
 // container whose liveness probe committed failure AT ONCE and only throttles a
 // container that is already looping. The exit-driven trigger always waits — an
 // exit IS the crash the schedule exists to pace — so only restartForLiveness

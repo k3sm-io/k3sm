@@ -118,7 +118,7 @@ func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool
 	// launch-spec tokens were inserted BEFORE the profile path). A cached shim
 	// predating that change is silently skewed: the current caller's rlimit
 	// sentinel lands in the old shim's profile slot, so EVERY confined pod dies
-	// with `read profile -: no such file or directory` and the whole M2
+	// with `read profile -: no such file or directory` and the whole isolation
 	// conformance surface goes red. Observed on a lab Mac 2026-08-27, where the
 	// cache had been populated by an earlier session; the re-sign below rewrites
 	// the file, so even its mtime looks current and the staleness is invisible.

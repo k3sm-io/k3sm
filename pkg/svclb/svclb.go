@@ -48,7 +48,7 @@ const warnInterval = 30 * time.Second
 
 // Config configures the svclb Controller.
 //
-// BindAddr and AdvertiseAddr are DIFFERENT addresses (B116). The listeners bind
+// BindAddr and AdvertiseAddr are DIFFERENT addresses. The listeners bind
 // the wildcard (every interface answers, matching Docker Desktop's vpnkit and
 // k3s' klipper-lb), while the status advertises the node's derived
 // globally-unicast InternalIP. A wildcard bind cannot witness the advertised
@@ -171,7 +171,7 @@ func New(cfg Config) (*Controller, error) {
 // cancelled, then drains every forwarder. Reconciles are event-driven and
 // coalesced; the loop goroutine is the sole owner of the listener state.
 func (c *Controller) Run(ctx context.Context) error {
-	// ONE line carrying BOTH addresses: after B116 they differ, and every other
+	// ONE line carrying BOTH addresses: they differ, and every other
 	// log line in this package renders the BIND address (what a listener actually
 	// occupies). Without this line an operator reading "addr=0.0.0.0:8080" has no
 	// way to connect it to the EXTERNAL-IP kubectl shows.
@@ -454,7 +454,7 @@ func (c *Controller) ensureStatus(ctx context.Context, svc *corev1.Service) {
 // An entry is retractable when it is:
 //
 //   - the CURRENT advertise address (the ordinary case), or
-//   - ANY loopback address — the pre-B116 default that an upgraded cluster may
+//   - ANY loopback address — an older default that an upgraded cluster may
 //     still carry; nothing outside this Mac can ever reach it, so an LB status
 //     advertising loopback is never legitimate, or
 //   - ANY address inside podCIDR. Assemblers pass the CLUSTER pod aggregate

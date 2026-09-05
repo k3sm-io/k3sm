@@ -287,7 +287,7 @@ func (m *containerMonitor) eachSpec(fn func(kind probeKind, s *probeSpec)) {
 // Started (and gates Ready). restarts is the monitor's own liveness-restart
 // tally — internal gauge-reset bookkeeping observable at this seam, NEVER added
 // to the surfaced RestartCount: runtimed's restart_count is the single count
-// authority (the RestartContainer RPC bumps it — M10.2/B26), so adding the
+// authority (the RestartContainer RPC bumps it), so adding the
 // tally would double-count every liveness-driven restart.
 type probeVerdict struct {
 	hasReadiness bool

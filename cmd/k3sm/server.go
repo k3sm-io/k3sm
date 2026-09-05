@@ -63,7 +63,7 @@ type serverOptions struct {
 	workDir  string
 	nodeName string
 	nodeIP   string
-	meshIP   string // wireguard mesh IP; set => multi-node worker-join supervisor (M3.0)
+	meshIP   string // wireguard mesh IP; set => multi-node worker-join supervisor
 	podRoot  string
 	rtName   string
 	dnsShim  string
@@ -88,14 +88,14 @@ type serverOptions struct {
 	domain                string
 	network               string // host-network backend: auto (default) | none | direct | helper
 
-	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite (M6.0)
+	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite
 	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
-	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (M6.1 HA server-join)
-	token             string // server-class join token (K10<caHash>::server:<secret>) for the HA server-join (M6.1)
+	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (HA server-join)
+	token             string // server-class join token (K10<caHash>::server:<secret>) for the HA server-join
 
-	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the B71 cutover; default = warn-only, M10.0)
+	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the baseline-enforce cutover; default = warn-only)
 
-	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (M10.3/B116; 0 disables; 80 = production, an explicit high port = integration tier)
+	ingressHTTPPort  int // ingress HTTP listener port, bound on the wildcard (0 disables; 80 = production, an explicit high port = integration tier)
 	ingressHTTPSPort int // ingress HTTPS listener port (same contract as ingressHTTPPort; 443 = production)
 
 	// registryPort is the loopback port the node-local OCI ingest registry serves
@@ -121,7 +121,7 @@ func (opts serverOptions) executorConfig(logger *slog.Logger) executor.Config {
 		SchedulerPort:         opts.schedulerPort,
 		ControllerManagerPort: opts.controllerManagerPort,
 		NodeIP:                opts.nodeIP,
-		// M10.0/B71: false ships baseline-WARN; true is the enforce cutover (see the
+		// false ships baseline-WARN; true is the enforce cutover (see the
 		// flag comment above — executor.Config.PSAEnforceBaseline is the single seam).
 		PSAEnforceBaseline: opts.psaEnforceBaseline,
 		Logger:             logger,
@@ -175,18 +175,17 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// These flags renumber loopback listeners; they cannot publish one.
 	fs.IntVar(&opts.schedulerPort, "scheduler-port", executor.DefaultSchedulerPort, "kube-scheduler secure-serving port on 127.0.0.1 — every control plane on a host needs its own")
 	fs.IntVar(&opts.controllerManagerPort, "controller-manager-port", executor.DefaultControllerManagerPort, "kube-controller-manager secure-serving port on 127.0.0.1 — every control plane on a host needs its own")
-	// M10.0 PSA (Res.2). The SHIPPED default is baseline-WARN only (enforce stays
+	// Pod Security Admission. The SHIPPED default is baseline-WARN only (enforce stays
 	// privileged; warn=baseline + audit=restricted — audit-observable, zero
 	// rejection). This flag is the documented, REVERSIBLE cutover MECHANISM for the
-	// B71 baseline-enforce flip: set it only after a pre-flight scan proves the
-	// cluster clean (B71 owns flipping it); dropping the flag reverts the posture on
-	// the next boot. It is an operator argv toggle of a single apiserver config
+	// baseline-enforce flip: set it only after a pre-flight scan proves the cluster
+	// clean; dropping the flag reverts the posture on the next boot. It is an operator argv toggle of a single apiserver config
 	// value, not a runtime feature-flag code path.
-	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the B71 cutover; the shipped default is baseline-warn only)")
-	// M10.3 ingress listener ports. 80/443 is the production posture; an EXPLICIT
+	fs.BoolVar(&opts.psaEnforceBaseline, "psa-enforce-baseline", false, "flip the cluster-wide Pod Security Admission default ENFORCE level from privileged to baseline (the baseline-enforce cutover; the shipped default is baseline-warn only)")
+	// Ingress listener ports. 80/443 is the production posture; an EXPLICIT
 	// high-port pair (e.g. 8080/8443) is the integration-tier mode. There is
 	// deliberately NO silent fallback between the two — a failed bind is logged and
-	// boundedly retried, never re-ported. Since B116 the listeners bind the WILDCARD
+	// boundedly retried, never re-ported. The listeners bind the WILDCARD
 	// in-process (a wildcard bind is unprivileged on Darwin at any port), so no netd
 	// authorization is involved; they are started BEFORE svclb so they win a contest
 	// for these ports against a user LoadBalancer Service declaring them.
@@ -201,15 +200,15 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
-	// M6.0 HA datastore. The DSN may carry a password; prefer the env so it stays off
+	// HA datastore. The DSN may carry a password; prefer the env so it stays off
 	// k3sm's own argv (mirrors --token/$K3SM_TOKEN). k3sm relocates the password off
 	// the kine child's argv too (a 0600 PGPASSFILE), so `ps` never sees the secret.
 	fs.StringVar(&opts.datastoreEndpoint, "datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "kine datastore DSN (postgres://user:pass@host:port/db?sslmode=…) for HA multi-writer; empty = single-node kine→SQLite (or $K3SM_DATASTORE_ENDPOINT)")
-	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard) and sets the HA leader-election. With --server it also fetches the identical-CA bundle from an existing server (M6.1)")
-	// M6.1 HA server-join: a SECOND control-plane server reconstructs the identical
+	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard) and sets the HA leader-election. With --server it also fetches the identical-CA bundle from an existing server")
+	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
-	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join, M6.1; requires --server-join --mesh-ip --token)")
+	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join; requires --server-join --mesh-ip --token)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
 	return workDirErr
 }
@@ -281,7 +280,7 @@ func runServer(args []string) error {
 			cfg.PayloadBinDir = filepath.Join(filepath.Dir(exe), "bin")
 		}
 	}
-	// M6.0 HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
+	// HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared
 	// Postgres — the same pinned kine build as single-node, a driver choice not a second
 	// version — and turns on scheduler/KCM leader election so only one server is active. The executor fail-closes (ErrHARequiresDatastore) if HA is
 	// requested without the endpoint — never a silent per-server SQLite (split-brain).
@@ -293,7 +292,7 @@ func runServer(args []string) error {
 	// Standalone (non-HA-join): --token is the STATIC ADMIN bearer token — it must be
 	// BOTH what the apiserver loads into its token-auth-file (system:masters) AND what
 	// `k3sm install` wrote into the admin kubeconfig, or every admin request is
-	// Unauthorized (the live M2-gate failure). Empty (a bare `k3sm server`) lets the
+	// Unauthorized (an observed live-hardware failure). Empty (a bare `k3sm server`) lets the
 	// executor generate one + write its own kubeconfig. In the HA server-join path
 	// --token is instead the JOIN token (consumed above to fetch the CA bundle); the
 	// executor generates its own static token and HA admin auth is a client cert, so
@@ -301,7 +300,7 @@ func runServer(args []string) error {
 	if !opts.serverJoin {
 		cfg.Token = opts.token
 	}
-	// M6.1 HA server-join: a SECOND control-plane server reconstructs the IDENTICAL
+	// HA server-join: a SECOND control-plane server reconstructs the IDENTICAL
 	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
 	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
 	// bring-up; we never fall through to minting fresh, divergent CAs (cluster trust
@@ -319,10 +318,10 @@ func runServer(args []string) error {
 		}
 	}
 
-	// M3.0 multi-node: bind the apiserver + the worker-join supervisor on the mesh
+	// Multi-node: bind the apiserver + the worker-join supervisor on the mesh
 	// interface ONLY, serve a cluster-CA-signed cert, wire --client-ca-file +
 	// --kubelet-certificate-authority + --anonymous-auth=false. Empty --mesh-ip keeps
-	// the single-node loopback/self-signed path (M1/M2) unchanged.
+	// the single-node loopback/self-signed path unchanged.
 	var hierarchy *certs.Hierarchy
 	var serverSecret string
 	if opts.meshIP != "" {
@@ -331,7 +330,7 @@ func runServer(args []string) error {
 			return fmt.Errorf("ensure CA hierarchy: %w", err)
 		}
 		hierarchy = h
-		// M6.1: the server-bootstrap secret (machine-generated ≥256-bit) — minted +
+		// The server-bootstrap secret (machine-generated ≥256-bit) — minted +
 		// persisted on the first server, already saved by importServerCABundle on a
 		// joining server. It is the CA-bundle endpoint credential AND the bundle's KDF
 		// passphrase.
@@ -339,7 +338,7 @@ func runServer(args []string) error {
 		if err != nil {
 			return fmt.Errorf("server-bootstrap secret: %w", err)
 		}
-		// M6.1 deliverable 5b: an admin kubeconfig authenticated by a signing-CA-issued
+		// An admin kubeconfig authenticated by a signing-CA-issued
 		// system:masters CLIENT CERT (reconstructible on every server from the shared
 		// signing CA) + cluster-CA server verification — so kubectl works against ANY HA
 		// server. Written beside the executor's loopback token kubeconfig (which the
@@ -422,16 +421,16 @@ func runServer(args []string) error {
 	}
 
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
-	// Extracted so the SET is testable against a fake clientset (B153): what this
+	// Extracted so the SET is testable against a fake clientset: what this
 	// binary provisions is a posture-INDEPENDENT product decision, and a silently
 	// absent policy is otherwise invisible until a real cluster admits something it
 	// should have rejected.
 	provisionClusterPolicies(ctx, cs, mode, os.Geteuid(), logger)
 
-	// 3b. M4.1 — provision the RBAC graph BEFORE the VK node (step 5) and the
+	// 3b. Provision the RBAC graph BEFORE the VK node (step 5) and the
 	// worker-join supervisor (step 4d) start, so a joining worker's system:node
 	// datapath bindings already exist when the Node,RBAC authorizer (the apiserver
-	// default since M4.1) evaluates its first request. FAIL-CLOSED: unlike the
+	// shipped default) evaluates its first request. FAIL-CLOSED: unlike the
 	// advisory admission policies above (log-and-continue), a provisioning failure
 	// HALTS bring-up — a half-applied graph under an enforcing authorizer silently
 	// locks workers out of services/endpointslices/meshpeers. It runs under the
@@ -442,7 +441,7 @@ func runServer(args []string) error {
 	}
 	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader + registry-advertisement reader); authorizer is Node,RBAC")
 
-	// 3c. B170 — SSA-converge the EMBEDDED add-on manifest set. The manifests are
+	// 3c. SSA-converge the EMBEDDED add-on manifest set. The manifests are
 	// compiled into this binary (embed.FS), never read from disk: the work dir is
 	// writable by every pod (all pods share the _k3sm uid and it is outside runtimed's
 	// sandbox-protected prefixes) and this client is the system:masters admin, so a
@@ -459,7 +458,7 @@ func runServer(args []string) error {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
 
-	// M11.3-d3a: whether this node can host vm guests, asked HERE — before the
+	// Whether this node can host vm guests, asked HERE — before the
 	// registry and the datapath are constructed and long before the VK node exists
 	// — through runtimed's own safe host probe rather than through the node's
 	// advertised capability, which is not answerable yet (see vmBackendAvailable).
@@ -526,7 +525,7 @@ func runServer(args []string) error {
 		}
 	}
 
-	// 4a. B224 — the MeshPeer CRD, on the MESH path only, BEFORE anything that can
+	// 4a. The MeshPeer CRD, on the MESH path only, BEFORE anything that can
 	// write a MeshPeer exists. Nothing used to apply it: the manifest shipped in
 	// k3sm.io/apis and every worker join 500'd at the enroller's write until a human
 	// installed the CRD by hand.
@@ -534,7 +533,7 @@ func runServer(args []string) error {
 	// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
 	// the join listener startBootstrapServer opens, because the first worker to reach
 	// that listener writes a MeshPeer — a CRD ensured afterwards would still lose
-	// whichever join won the race. Since M14.2 it also precedes this server's OWN
+	// whichever join won the race. It also precedes this server's OWN
 	// enroll, which is the very first MeshPeer written on a fresh cluster.
 	//
 	// FAIL-CLOSED, like the RBAC graph at step 3b and unlike the log-and-continue
@@ -551,7 +550,7 @@ func runServer(args []string) error {
 		return err
 	}
 
-	// 4b. M14.2 — THIS SERVER JOINS ITS OWN MESH.
+	// 4b. THIS SERVER JOINS ITS OWN MESH.
 	//
 	// The enroller is constructed here, not at the supervisor (step 4d), because both
 	// callers must share ONE instance: its mutex is what serializes this node's
@@ -574,7 +573,7 @@ func runServer(args []string) error {
 	var enroller *meshEnroller
 	// serverPodCIDR is the control-plane node's pod /24: the reserved index-0 carve
 	// of the cluster pod CIDR — the ONE value the routing-table locality (step 4c)
-	// and the node's podnet adapter (step 5) both allocate against (M10.1).
+	// and the node's podnet adapter (step 5) both allocate against.
 	serverPodCIDR := defaultNodePodCIDR()
 	// The mesh-egress source the proxy binds for cross-node backend dials, and the
 	// peer mesh-egress /32s the NetworkPolicy table always-allows. Empty until this
@@ -593,7 +592,7 @@ func runServer(args []string) error {
 			serverPodCIDR = res.PodCIDR
 			if mode.DataPath() {
 				serverMeshEgressIP = res.MeshIP
-				// M10.4: a boot-time SNAPSHOT. A peer that enrolls after this
+				// A boot-time SNAPSHOT. A peer that enrolls after this
 				// point reconverges in wireguard via the MeshPeer watch but is
 				// not in this table until the next restart; the posture is
 				// fail-open widen-only ("never a wrong deny"), so the gap
@@ -603,7 +602,7 @@ func runServer(args []string) error {
 		}
 	}
 
-	// 4c. M1.4/M3.3 — host the node-local datapath: darwin-net's Service proxy
+	// 4c. Host the node-local datapath: darwin-net's Service proxy
 	// (exempted from the DNS VIP, which the per-node resolver below owns) + the
 	// per-node cluster DNS resolver bound to the DNS VIP + the pod DNSConfig the
 	// shim consumes. The NetdSocket routes the proxy/resolver privileged lo0/port
@@ -614,7 +613,8 @@ func runServer(args []string) error {
 	// dialer's source bind is DESTINATION-SCOPED (darwin-net binds it only for a
 	// destination inside the cluster pod CIDR and outside this node's own /24), so
 	// wiring a real mesh-egress source here does not disturb loopback, ClusterIP or
-	// node-LAN dials — which is what made this wiring unsafe before M14.2.
+	// node-LAN dials — an unscoped source bind is what made this wiring unsafe
+	// before.
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
 	// address — upstream validation rejects loopback endpoint addresses, so no
@@ -648,14 +648,14 @@ func runServer(args []string) error {
 		}
 	}()
 
-	// 4d. M3.0/M6.1 — the worker-join supervisor (mesh-bound; mints node certs + enrolls
-	// peers), plus the M6.1 CA-bundle endpoint in the HA posture. Only when multi-node is
+	// 4d. The worker-join supervisor (mesh-bound; mints node certs + enrolls
+	// peers), plus the CA-bundle endpoint in the HA posture. Only when multi-node is
 	// enabled; the live two-Mac join is the K3SM_LAB gate (step 4a has already ensured
 	// the MeshPeer CRD the enroller's write lands in, and step 4b has already claimed
 	// index 0 through this same enroller).
 	if enroller != nil {
 		tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
-		// M6.1 deliverable 4: in HA the node-password binding must be SHARED across
+		// In HA the node-password binding must be SHARED across
 		// servers (a name bound on A is enforced on B), so it is datastore-backed (a
 		// kube-system Secret on the shared Postgres). A single multi-node server keeps
 		// the in-memory store.
@@ -672,7 +672,7 @@ func runServer(args []string) error {
 			enroller:      enroller,
 			apiServers:    []string{fmt.Sprintf("%s:%d", opts.meshIP, opts.apiPort)},
 		}
-		// M6.1 deliverables 1+2: serve the AES-256-GCM CA bundle authorized by the
+		// Serve the AES-256-GCM CA bundle authorized by the
 		// SERVER-class token ONLY (never a worker), sealing the live hierarchy; publish
 		// the sealed envelope to the shared datastore (the k3s bootstrap-key model).
 		if ha {
@@ -692,7 +692,7 @@ func runServer(args []string) error {
 		}()
 	}
 
-	// 4e. M3.2 — the APFS local-path provisioner: a pure API-object controller that
+	// 4e. The APFS local-path provisioner: a pure API-object controller that
 	// registers the local-path StorageClass and creates a Retain, node-affinity-pinned
 	// PV for each PVC the scheduler has placed. It does NO filesystem I/O — runtimed
 	// empty-creates the per-(namespace, claim) dir on the consuming node. The class
@@ -717,13 +717,13 @@ func runServer(args []string) error {
 		<-provDone
 	}()
 
-	// 4f. M8.5 — the MLX operator: ensures the MLXModel CRD, then reconciles
+	// 4f. The MLX operator: ensures the MLXModel CRD, then reconciles
 	// each MLXModel into a StatefulSet plus its headless and ClusterIP Services.
 	// Same lifetime and the same reasoning as the provisioner above — started now
 	// that the apiserver is healthy, and drained BEFORE exec.Stop tears the control
 	// plane down by a defer registered after it, so LIFO runs this one first.
 	//
-	// The GPU source is LIVE on this path (B195). The pre-render fit check reads
+	// The GPU source is LIVE on this path. The pre-render fit check reads
 	// the node-local runtime's GPU facts, and this process is about to bring up
 	// that node in-process — so the source is created here, wired into the
 	// operator now, and ATTACHED to the node's runtime at step 5 bring-up
@@ -769,7 +769,7 @@ func runServer(args []string) error {
 	// the same CA the apiserver's --client-ca-file trusts and the issuer of the
 	// --kubelet-client-certificate the executor just minted, so the node and the
 	// apiserver agree on the identity by construction rather than by configuration.
-	// A read failure stops the server: :10250 is not served unauthenticated (B176).
+	// A read failure stops the server: :10250 is not served unauthenticated.
 	kubeletClientCA, err := os.ReadFile(certs.SigningCACertPath(opts.workDir))
 	if err != nil {
 		return fmt.Errorf("read the kubelet endpoint's client-identity CA: %w", err)
@@ -784,12 +784,12 @@ func runServer(args []string) error {
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list (B18)
-		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above, M10.1)
+		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list
+		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,           // M1.2: serve kubelet API over TLS so logs/exec work via the proxy
+		serveTLS:   true,           // serve kubelet API over TLS so logs/exec work via the proxy
 
-		kubeletClientCAPEM: kubeletClientCA, // B176: :10250 requires the apiserver's client cert
+		kubeletClientCAPEM: kubeletClientCA, // :10250 requires the apiserver's client cert
 
 		// Close the loop opened at step 4f: the node publishes its in-process
 		// runtime here, and the MLX operator's fit check starts reading live GPU
@@ -812,7 +812,7 @@ func runServer(args []string) error {
 		clusterRegistries: registryPuller.ClusterRegistries,
 	}
 
-	// 4f-bis. B213 — the control-plane node's OWN kubelet serving cert.
+	// 4f-bis. The control-plane node's OWN kubelet serving cert.
 	//
 	// A worker receives one in its join response; this node never joins, so nothing
 	// hands it one and it self-signed — against its own apiserver, which the mesh
@@ -826,12 +826,12 @@ func runServer(args []string) error {
 		return err
 	}
 
-	// 4g/4h. M10.3 — ingress hosting + svclb, beside the netserve datapath
+	// 4g/4h. Ingress hosting + svclb, beside the netserve datapath
 	// (step 4c) and like it skipped under --network none (they splice/route to
 	// ClusterIP VIPs, which need the proxy's datapath).
 	//
 	// Both bind the WILDCARD and both advertise the node's DERIVED
-	// globally-unicast InternalIP (B116) — see lbHostingConfigs, which owns the
+	// globally-unicast InternalIP — see lbHostingConfigs, which owns the
 	// whole decision. opts.nodeIP is READ, never written back: it feeds the
 	// apiserver's --advertise-address/--bind-address above.
 	//
@@ -843,7 +843,7 @@ func runServer(args []string) error {
 	// --ingress-http-port/--ingress-https-port select the explicit high-port
 	// integration mode (never a silent fallback).
 	//
-	// 4h: svclb (klipper-lite, B32) binds *:port listeners for every LoadBalancer
+	// 4h: svclb (klipper-lite) binds *:port listeners for every LoadBalancer
 	// Service and splices them to the Service's ClusterIP VIP, advertising
 	// status.loadBalancer ONLY once a listener is actually bound.
 	//
@@ -990,7 +990,8 @@ func setServerKubeletServing(nodeOpts *nodeOptions, hierarchy *certs.Hierarchy, 
 //     startNode computes it). This is the address --kubelet-preferred-address-types
 //     =InternalIP makes the apiserver dial, and in the NO-DATAPATH posture it
 //     legitimately diverges from the advertised address — so omitting it would
-//     reproduce B213 as a SAN mismatch instead of an issuer mismatch, which is the
+//     reproduce the broken-logs/exec defect as a SAN mismatch instead of an issuer
+//     mismatch, which is the
 //     same broken logs/exec with a less legible error;
 //   - 127.0.0.1 — the same-host dial.
 //
@@ -1051,7 +1052,7 @@ func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP strin
 // a node missing an advisory.
 //
 // The set is POSTURE-INDEPENDENT — mode is logged, never branched on. That is the
-// B153 fix: the foreign-user ceiling used to be provisioned only under the netd
+// The fix: the foreign-user ceiling used to be provisioned only under the netd
 // helper backend, so a `--network none`/`direct` cluster ran with no such policy
 // object at all and admitted the very pods the ceiling exists to reject.
 //
@@ -1062,11 +1063,11 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	allowedUID := provider.PodExecutionUID(euid)
 	logger.Info("provisioning cluster admission policies",
 		"network-backend", mode.Backend.String(), "pod-execution-uid", allowedUID)
-	// M1.2 — the os=darwin ValidatingAdmissionPolicy (intent guard).
+	// The os=darwin ValidatingAdmissionPolicy (intent guard).
 	if err := policy.EnsureDarwinAdmission(ctx, cs); err != nil {
 		logger.Error("provision admission policy", "err", err)
 	}
-	// M3.1 — honest-gap Warn advisories on Services: externalTrafficPolicy: Local
+	// Honest-gap Warn advisories on Services: externalTrafficPolicy: Local
 	// is not honored (the userspace splice does not preserve client source IP) and
 	// UDP ports have no datapath yet (the proxy opens no UDP listener). They warn at
 	// the API (never reject) so the divergence is visible in kubectl. Provisioned
@@ -1077,7 +1078,7 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureUDPServiceWarn(ctx, cs); err != nil {
 		logger.Error("provision UDP-service warn policy", "err", err)
 	}
-	// B116 — DENY a type: LoadBalancer Service declaring a port k3sm's own wildcard
+	// DENY a type: LoadBalancer Service declaring a port k3sm's own wildcard
 	// listeners own (the NodePort range, the kubelet API port). Log-and-continue
 	// like every sibling Ensure*, but the message NAMES the consequence: a silently
 	// absent Deny VAP is otherwise indistinguishable from a present one, and the
@@ -1086,7 +1087,7 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureRejectReservedLoadBalancerPort(ctx, cs); err != nil {
 		logger.Error("provision reserved-loadbalancer-port DENY policy: a LoadBalancer Service declaring a k3sm-reserved port (NodePort range / kubelet API port) will now be ACCEPTED by the API instead of rejected; svclb still refuses to bind it, so such a Service stays <pending> with only a log line to explain it", "err", err)
 	}
-	// B17 — honest-gap Warn advisory on Pods: a pod with no toleration for the
+	// Honest-gap Warn advisory on Pods: a pod with no toleration for the
 	// provider taint (k3sm.io/provider:NoSchedule, on EVERY node) is left
 	// Unschedulable by the scheduler. Warn at the API (never reject — a non-tolerating
 	// pod is valid k8s) so a directly-created pod's omission is visible in kubectl.
@@ -1094,19 +1095,20 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureProviderTolerationWarn(ctx, cs); err != nil {
 		logger.Error("provision provider-toleration warn policy", "err", err)
 	}
-	// B91/B209 — honest-plumbing Warn advisory on Pods: a pod carrying a HAND-SET
+	// Honest-plumbing Warn advisory on Pods: a pod carrying a HAND-SET
 	// k3sm.io/internet-egress annotation (without the operator-managed discriminator
 	// label pkg/mlx.Render stamps) opts its sandbox into allow_internet_egress. The
-	// policy + its unit tests landed with B91 but were never called from bring-up, so
-	// a running cluster provisioned six policies and hand-setting the annotation warned
-	// nothing — the same test-passes-wiring-absent class as B195. Provisioned
+	// policy + its unit tests landed before any call site existed, so a running
+	// cluster provisioned six policies and hand-setting the annotation warned
+	// nothing — the same tests-pass-but-wiring-absent class as the operator's
+	// unwired GPU source above. Provisioned
 	// UNCONDITIONALLY like its siblings: the annotation is read on every runtime path,
 	// not only under MLX. Log-and-continue — it is advisory, never a boundary.
 	if err := policy.EnsureEgressAnnotationWarn(ctx, cs); err != nil {
 		logger.Error("provision hand-set-internet-egress warn policy", "err", err)
 	}
-	// B76 — MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
-	// controller (KCM), so the B17 CREATE-Warn advisory never reaches its author and
+	// MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
+	// controller (KCM), so the CREATE-Warn advisory above never reaches its author and
 	// the pod sits Unschedulable against the provider taint. Inject the provider
 	// toleration (never the os=darwin nodeSelector — Res.7) so DS pods schedule.
 	// CHANGES the stored object, unlike the Warn/Deny VAPs. Log-and-continue; requires
@@ -1114,7 +1116,7 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureDaemonSetTolerationMutation(ctx, cs); err != nil {
 		logger.Error("provision daemonset-toleration mutating policy", "err", err)
 	}
-	// B153 — every pod runs as ONE uid (no per-pod uid isolation), so REJECT a pod
+	// Every pod runs as ONE uid (no per-pod uid isolation), so REJECT a pod
 	// requesting a foreign runAsUser/runAsGroup/fsGroup/supplementalGroups at
 	// admission rather than letting it wedge at spawn. Provisioned UNCONDITIONALLY,
 	// like its siblings: the ceiling is a product-wide property. It used to sit
@@ -1128,16 +1130,16 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureNoForeignUserAdmission(ctx, cs, allowedUID); err != nil {
 		logger.Error("provision foreign-user admission policy: a pod requesting a foreign runAsUser/fsGroup will now be ADMITTED and then wedge at spawn (or silently run as the wrong identity) instead of being rejected at the API", "err", err)
 	}
-	// M10.0 (Res.5) — the memory-only default LimitRange in the `default` namespace:
+	// The memory-only default LimitRange in the `default` namespace:
 	// containers that omit resources get honest memory defaults (memory IS enforced
 	// via the rusage sampler→OOMKill); deliberately NO cpu key (best-effort only).
-	// Create-or-update like every sibling Ensure* (B153 — see pkg/policy.ensure:
+	// Create-or-update like every sibling Ensure* (see pkg/policy.ensure:
 	// a create-only provisioner freezes the shipped defaults at whatever a cluster
 	// was first created with); log-and-continue like the sibling advisories.
 	if err := policy.EnsureDefaultLimitRange(ctx, cs); err != nil {
 		logger.Error("provision default memory limitrange", "err", err)
 	}
-	// M5.1 — provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
+	// Provision the vm RuntimeClass (node.k8s.io/v1 "vm", handler vm, with a
 	// scheduling.nodeSelector pinning it to VZ-capable nodes via
 	// k3sm.io/virtualization). Log-and-continue (NOT fail-closed like rbac): a missing
 	// RuntimeClass cannot lock workers out — it only makes a vm pod unschedulable / a

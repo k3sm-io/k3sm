@@ -164,7 +164,7 @@ func runDevList(args []string) error {
 	for _, s := range statuses {
 		// running | unknown | stale. `unknown` is a root-owned instance probed from
 		// an unprivileged shell (kill EPERM): the process EXISTS, so calling it
-		// `stale` — the word that invites a cleanup — was a lie (B211).
+		// `stale` — the word that invites a cleanup — was a lie.
 		status := s.Liveness.String()
 		// An empty Runtime on a pre-fallback manifest reads as runtimed (the default
 		// before the hostprocess-fallback field existed).

@@ -209,7 +209,7 @@ func newProbeTransport() *http.Transport {
 // that drives a single exec to completion for an exec probe: it hands the runtime
 // one ExecRequest then EOF (no stdin), discards stdout/stderr, and captures the
 // terminal exit code. Like watchStream/logSink it lets the provider consume a
-// streaming RuntimeServer method in-process; the M2 daemon split swaps it for a
+// streaming RuntimeServer method in-process; a future daemon split swaps it for a
 // real client stream.
 type execStream struct {
 	grpc.ServerStream

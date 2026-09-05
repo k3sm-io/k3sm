@@ -29,12 +29,12 @@ import (
 // consumers keying off the reason behave the same. Shared (unexported) here so a
 // future runtimed-path emit reuses the identical reasons and messages.
 //
-// SCOPE: BackOff is emitted on the RUNTIMED path ONLY (B26 — the exit-driven
-// re-exec + CrashLoopBackOff loop lives there). The M0 HostProcess provider has
+// SCOPE: BackOff is emitted on the RUNTIMED path ONLY (the exit-driven
+// re-exec + CrashLoopBackOff loop lives there). The HostProcess provider has
 // no live restart/backoff loop (reap never re-execs, UpdatePod is a no-op), so
 // emitting it there would fabricate a control-loop state that does not exist.
 const (
-	reasonPulled  = "Pulled"  // image (M0: binary) resolved for the container
+	reasonPulled  = "Pulled"  // image (or host binary) resolved for the container
 	reasonCreated = "Created" // container object created, before process start
 	reasonStarted = "Started" // container process started successfully
 	reasonKilling = "Killing" // container process is being stopped (DeletePod)
@@ -78,7 +78,7 @@ func msgFailedPostStartHook(container string) string {
 	return "PostStartHook failed for container " + container
 }
 
-// msgImageAlreadyPresent is the Pulled-event message. M0 treats the image
+// msgImageAlreadyPresent is the Pulled-event message. HostProcess treats the image
 // reference as an already-present native binary path (there is no registry pull),
 // so this uses the kubelet's "already present on machine" phrasing rather than a
 // fabricated "Successfully pulled … in Xs".

@@ -210,6 +210,45 @@ func modules(bi *debug.BuildInfo) []ModuleRef {
 	return refs
 }
 
+// NodeVersion is the value the node reports as its kubelet version: the
+// aligned Kubernetes version with the k3sm release as semver build metadata,
+// the same shape k3s uses (v1.33.1+k3s1). Tools that read
+// NodeInfo.KubeletVersion parse it as semver, so the k3sm part is sanitized
+// into a valid build-metadata suffix: the leading "v" is dropped and any "+"
+// (a dev build's "+dirty") becomes ".".
+func (i Info) NodeVersion() string {
+	kube := i.KubeVersion
+	if !strings.HasPrefix(kube, "v") {
+		kube = "v" + kube
+	}
+	suffix := i.Version
+	if i.Dirty {
+		suffix += "+dirty"
+	}
+	return kube + "+k3sm." + sanitizeBuildMetadata(suffix)
+}
+
+// sanitizeBuildMetadata makes s safe to append as semver build metadata after
+// a "+": it drops a leading "v" (a Go pseudo-version's own prefix; the kube
+// version already carries one), turns "+" into "." (semver build metadata
+// cannot contain a second "+"), and replaces any remaining character outside
+// [0-9A-Za-z.-] with "-".
+func sanitizeBuildMetadata(s string) string {
+	s = strings.TrimPrefix(s, "v")
+	s = strings.ReplaceAll(s, "+", ".")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '.', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
 // String renders the multi-line human-readable output for `k3sm version`.
 func (i Info) String() string {
 	var b strings.Builder

@@ -31,13 +31,13 @@ const (
 	// BundlePath serves the AES-256-GCM-sealed CA bootstrap bundle to a joining
 	// control-plane SERVER (server-token-authorized via the Authorization bearer header;
 	// never a worker). The joining server decrypts it to reconstruct the IDENTICAL
-	// cluster + signing CAs (M6.1, DESIGN §5c).
+	// cluster + signing CAs (DESIGN §5c).
 	BundlePath = "/v1-k3sm/server-bootstrap"
 )
 
 // JoinSchemaVersion stamps the k3sm-internal join exchange payloads (JoinRequest /
 // JoinResponse). These wrap the apis net/v1 mesh-enroll payloads, which carry their
-// own version stamp; both are version-stamped from day one so an M4+ node-by-node
+// own version stamp; both are version-stamped from day one so a node-by-node
 // roll has a compatibility seam.
 const JoinSchemaVersion int32 = 1
 
@@ -94,7 +94,7 @@ type JoinResponse struct {
 	// ClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA) — the same CA
 	// that issued NodeClientCertPEM below. The node needs the CERTIFICATE (never the
 	// key, which stays on the server) to run its own kubelet endpoint: :10250
-	// requires and verifies the apiserver's client cert against this anchor (B176).
+	// requires and verifies the apiserver's client cert against this anchor.
 	//
 	// A CA certificate is public material — it is world-readable 0644 on the server
 	// and already implicitly trusted by this node, whose own identity chains to it —
@@ -108,7 +108,7 @@ type JoinResponse struct {
 	KubeletServingCertPEM string `json:"kubeletServingCertPEM,omitempty"`
 	// APIServers are the control-plane apiserver endpoints (host:port) the joining
 	// node's client-side load-balancer health-checks + targets, so a server death fails
-	// over without re-pointing the kubeconfig (M6.1). A single-server cluster carries
+	// over without re-pointing the kubeconfig. A single-server cluster carries
 	// that one server; the live cross-node failover is the lab leg.
 	APIServers []string `json:"apiServers,omitempty"`
 	// Mesh is the mesh-enroll response (assigned podCIDR + mesh-egress IP + peer

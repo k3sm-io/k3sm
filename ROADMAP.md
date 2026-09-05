@@ -16,12 +16,13 @@ the docs today.
 
 ## Shipped
 
-The engine. Milestones **M0–M6 and M10** are implemented and workspace-integration-green
-(`hack/ci.sh`). **M0, M1 and M2 are validated end to end on Apple-Silicon hardware** — M2's gate is
-the strongest evidence so far: run against a real root install on macOS 26.5, all **13 required
-conformance criteria passed**, together with the full install/uninstall lifecycle checks. That is
-the first live-hardware validation of the packaged single-node path. The remaining live-hardware and
-two-Mac gates are burned down in M7. What works:
+The engine. Everything listed below is implemented and workspace-integration-green
+(`hack/ci.sh`). **The single-node path — the Virtual Kubelet node, the embedded control plane, and
+pod isolation/resource fidelity — is validated end to end on Apple-Silicon hardware.** The isolation
+gate is the strongest evidence so far: run against a real root install on macOS 26.5, all **13
+required conformance criteria passed**, together with the full install/uninstall lifecycle checks.
+That is the first live-hardware validation of the packaged single-node path. The remaining
+live-hardware and two-Mac gates are burned down as part of release engineering. What works:
 
 - **Native Darwin-process pods, zero Linux on the default path.** OCI images ship an arm64
   Mach-O payload (never `/System`); the runtime `posix_spawn`s them **in place at host paths** —
@@ -63,7 +64,7 @@ two-Mac gates are burned down in M7. What works:
   the remaining packaging work.
 - **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
   with an identical-CA bundle. *(implemented; the live 2-Mac+Postgres failover is a lab gate)*
-- **Conformance hardening (M10).** As close to standard k8s as the Darwin substrate honestly
+- **Conformance hardening.** As close to standard k8s as the Darwin substrate honestly
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
   logging, node lifecycle Events. Validated by k3sm's own synthetic-conformance criteria — **not** a

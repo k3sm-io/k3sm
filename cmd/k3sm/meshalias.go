@@ -74,8 +74,8 @@ func hostAliasOps(mode hostnet.Mode) meshAliasOps {
 // while the only thing that ever plumbed that address was mesh.Start, several
 // bring-up steps LATER. The first real `--mesh-ip 100.64.0.1` boot therefore died
 // with `listen tcp 100.64.0.1:6444: bind: can't assign requested address`, and a
-// human had to `ifconfig lo0 alias 100.64.0.1/32` by hand to get past it. The
-// M14.2 lab tier had masked it by booting with --mesh-ip 127.0.0.1, an address
+// human had to `ifconfig lo0 alias 100.64.0.1/32` by hand to get past it.
+// Earlier lab runs had masked it by booting with --mesh-ip 127.0.0.1, an address
 // every host already answers on.
 //
 // It is FAIL-FAST, unlike the log-and-continue mesh device bring-up further down:

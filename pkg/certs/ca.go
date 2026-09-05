@@ -40,7 +40,7 @@ import (
 var ErrPinMismatch = errors.New("certs: presented chain does not match the pinned CA hash")
 
 // CA is a certificate authority — a self-signed CA certificate plus its private
-// key — that signs the leaf certificates k3sm's PKI issues in M3+: the apiserver
+// key — that signs the leaf certificates k3sm's PKI issues: the apiserver
 // serving cert, kubelet-serving certs, and the system:node client certs handed to
 // joining nodes. k3sm stands up two CAs (DESIGN §5c): a CLUSTER CA
 // (the serving anchor the join token pins) and a SIGNING CA (issues node client

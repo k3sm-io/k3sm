@@ -15,16 +15,16 @@ limitations under the License.
 */
 
 // Package ingresshost hosts darwin-net's L7 ingress datapath inside the `k3sm
-// server` process (M10.3, SERVER-PROCESS-ONLY — multi-node ingress is a named
+// server` process (SERVER-PROCESS-ONLY — multi-node ingress is a named
 // follow-up): it assembles the ingress.RouteTable + SNI CertStore +
 // class-filtered Watcher + Server, provisions the `k3sm` IngressClass
 // (controller k3sm.io/ingress) and the canonical kube-system/k3sm-ingress
 // LoadBalancer Service, and writes Ingress / LoadBalancer statuses.
 //
 // The canonical Service remains the declaring subject the netd port authorizer
-// would check a privileged NODE-ADDRESS bind against, but since B116 the ingress
+// would check a privileged NODE-ADDRESS bind against, but the ingress
 // listeners bind the WILDCARD in-process and never reach netd, so that authorizer
-// branch is dormant BY CONFIGURATION (see pkg/netdsvc, B133) — not by removal.
+// branch is dormant BY CONFIGURATION (see pkg/netdsvc) — not by removal.
 //
 // # TLS Secret discipline (SECURITY-BINDING)
 //

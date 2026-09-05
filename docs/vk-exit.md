@@ -2,7 +2,7 @@
 
 k3sm's node runs today on the
 [`virtual-kubelet/virtual-kubelet`](https://github.com/virtual-kubelet/virtual-kubelet)
-node/provider machinery. B67 confines every reference to that module to ONE
+node/provider machinery. k3sm confines every reference to that module to ONE
 package — `k3sm.io/k3sm/pkg/provider/vkadapter` — so the coupling is visible,
 auditable, and edited in one place. The module-wide gate
 `provider.TestVKImportsConfinedToAdapter` fails the `go test` / `hack/ci.sh` gate
@@ -11,7 +11,7 @@ Virtual Kubelet directly.
 
 This document is honest about what that buys and what it does not.
 
-## What B67 achieves: import-confinement, not decoupling
+## What the confinement achieves: one edit site, not decoupling
 
 The vkadapter re-exports are deliberately **type aliases** (`type Provider =
 nodeutil.Provider`, `type AttachIO = api.AttachIO`, …), not fresh wrapper
@@ -78,9 +78,9 @@ provides today:
    down cleanly on context cancellation. A replacement owns node
    create/patch/deregister and the run/ready/stop lifecycle.
 
-None of these are stubbed by B67. They remain VK's job; B67 only guarantees that
-the day k3sm chooses to re-implement them, there is exactly one package to edit
-and one gate to flip.
+None of these are stubbed by the vkadapter. They remain VK's job; the confinement
+only guarantees that the day k3sm chooses to re-implement them, there is exactly
+one package to edit and one gate to flip.
 
 ## The vkadapter surface (for maintainers)
 
