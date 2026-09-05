@@ -63,6 +63,7 @@ import (
 	"k3sm.io/k3sm/pkg/provider"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/runtimeclass"
+	"k3sm.io/k3sm/pkg/version"
 )
 
 // The pod runtime selector values (`--runtime`).
@@ -1484,7 +1485,7 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// k3sm.io/rosetta{,-linux} labels, never by making this (or kubernetes.io/arch)
 	// report a foreign arch to every generic client.
 	n.Status.NodeInfo.Architecture = arch
-	n.Status.NodeInfo.KubeletVersion = "k3sm-m1"
+	n.Status.NodeInfo.KubeletVersion = version.Get().NodeVersion()
 
 	// Advertise REAL host memory (hw.memsize) as node capacity. A failed read, or
 	// an implausible value (0, or one above math.MaxInt64 that would convert to a

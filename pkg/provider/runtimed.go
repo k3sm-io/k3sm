@@ -42,6 +42,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
+	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/image"
 	"k3sm.io/runtimed/pkg/mount"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
@@ -369,7 +370,7 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	deps.LocalRegistryHost = cfg.LocalRegistryHost
 	rt, err := runtimed.New(runtimed.Config{
 		Root:           cfg.Root,
-		RuntimeVersion: "k3sm-m1",
+		RuntimeVersion: version.Get().Version,
 		Logger:         log,
 		// Scope each pod's Seatbelt egress to the cluster DNS + API VIPs so a
 		// confined pod's DNS and in-pod client-go reach the node-local resolver /
