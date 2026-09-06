@@ -3,14 +3,108 @@
 User-visible changes, newest first.
 
 Each released section below is the text published as that version's
-[GitHub release](https://github.com/k3sm-io/k3sm/releases) notes. The
+[GitHub release](https://github.com/k3sm-io/k3sm/releases) notes, with the version heading
+dropped and its subsections promoted one level. The
 [releases page](https://k3sm.io/releases/) lists every published build with the version to
 pin, its date, and the tarball's sha256.
 
-## Unreleased — v0.1.1
+## Unreleased — v0.1.4
 
-**Not yet cut.** This section is the release notes for the next patch release; it gains a date
-when the release is published.
+One command that says what is running, and daemons that refuse to write into an unmounted data
+root.
+
+### Added
+
+- **`k3sm status`.** One screen that answers "is my cluster up, and if not, which piece is down
+  and why": a one-line verdict first, then one row per component — install, netd, server,
+  apiserver, node, workloads, data root, datastore, kubeconfig — each with its state, a detail,
+  and the command that fixes it. `k3sm status daemons` shows the launchd view (state, pid, runs,
+  last exit, plist, log); `k3sm status cluster` the apiserver, node, Pods by phase, control-plane
+  children and Linux guest hosts; `k3sm status logs [netd|server]` tails the daemon logs. `-o json`
+  emits the same report for scripts, `--wait` blocks until the cluster is running, `--watch`
+  re-renders in a terminal. The exit code is the verdict: 0 running, 3 stopped, 4 degraded, 5 not
+  installed, 6 unknown (`k3sm status --help` is the reference). Colour and glyphs follow `NO_COLOR`
+  and whether stdout is a terminal; the text is never the only signal.
+- **Data-root guard.** A data root kept on its own volume is declared in `/etc/fstab`; when that
+  volume is not mounted, the netd helper, the server and `sudo k3sm install` now refuse to start
+  or install rather than writing a shadow directory into the empty mountpoint — the message names
+  the mount command. On a plain-directory data root, the netd helper realigns a root-owned data
+  root to the service user on every start, so a wrong owner is repaired by restarting it.
+
+### Fixed
+
+- A data root that was not mounted at boot no longer leaves the server crash-looping on
+  `permission denied` behind a root-owned shadow directory, and can no longer receive a fresh,
+  empty datastore over the real one. `k3sm status` names the state and the fix.
+
+## v0.1.3 — 2026-09-05
+
+The k3sm command is on PATH after install, and `k3sm kubectl` works without sudo.
+
+### Added
+
+- **A `k3sm` launcher on PATH** — `sudo k3sm install` links `/usr/local/bin/k3sm` to the installed
+  binary, so every new terminal finds `k3sm` with no profile edits. The link is a symlink, never a
+  copy, so it always runs the same binary the daemons do. The installer refuses to replace a
+  non-symlink already at that path and refuses to link into a directory that is not root-owned or
+  is group/other-writable, naming the fix in each case; `sudo k3sm uninstall` removes only the link
+  it created.
+
+### Fixed
+
+- **`k3sm kubectl` and `k3sm kubeconfig` work as you, not just as root.** Both verbs looked only in
+  the control plane's private work directory for the admin kubeconfig and the bundled kubectl, so
+  after a normal install they failed for the user who ran it. They now use the `k3sm` context that
+  install merges into your `~/.kube/config` (or `$KUBECONFIG`) and the kubectl installed alongside
+  k3sm; a user-supplied `--context` still wins, and `K3SM_WORK_DIR` still pins a non-default server
+  work directory.
+- The installer's closing hint now tells the truth for the current shell: when `k3sm` is not yet on
+  PATH it names the launcher and the two ways to reach it (a new terminal, or adding
+  `/usr/local/bin` to PATH) instead of suggesting a command that could not work. The pre-escalation
+  banner lists the symlink alongside everything else the install lays down.
+
+## v0.1.2 — 2026-09-03
+
+One-command in-cluster image builds, one cluster address for the node registry, and
+self-recovering daemons.
+
+### Added
+
+- **One-command builds** — `k3sm build` builds any Dockerfile: a copy-only recipe packages natively
+  in about a second, and a recipe with `RUN` steps builds on the cluster's build engine, which
+  starts automatically on first use. The image is recorded in the node's image store under its tag
+  either way, ready for a Pod to name; `--output` additionally writes a portable artifact.
+- **Build and push in one step** — `k3sm build --push` publishes the built image after the store
+  recording; a bare tag publishes to the node's own registry, a full reference pushes as written.
+- **Linux images as a first-class build target** — `k3sm build --platform linux/arm64` builds a
+  Linux image even from a copy-only Dockerfile; multi-platform builds export and push a full OCI
+  index.
+- **A raw buildx surface for the engine** — `k3sm builder buildx` drives the build engine with the
+  bundled, digest-verified buildx; `k3sm builder delete` fully resets the engine, cache included.
+- **One cluster address for the node registry** — each node publishes a `registry-<node>` Service
+  backed by its relay address, so in-pod tools — Linux guests included — reach the registry at one
+  name, and the registry hosting ConfigMap now carries `hostFromClusterNetwork`.
+- **Bare image names** — a Pod naming `app:v1` resolves from the node's registry first, then from
+  cluster peers, before Docker Hub; no registry prefix required for images you built or pushed
+  locally.
+
+### Fixed
+
+- `sudo k3sm install` over a running node now sequences the daemon restart around launchd's
+  asynchronous teardown, retries transient bootstrap failures, and verifies both daemons serve
+  before reporting success — the in-place upgrade path is exercised by the release suite on every
+  cut.
+- The installer refuses a `k3sm-vmhost` helper that lacks the virtualization entitlement, naming
+  the exact fix, instead of installing it and leaving every `vm` Pod Pending on an opaque
+  scheduling message.
+- The netd helper exits and restarts cleanly if its control socket is removed or replaced; the
+  cluster-DNS listener retries its bind indefinitely instead of giving up; a failed Service-watch
+  start no longer leaks a stale retry loop.
+- The build engine's output no longer prints a Docker Desktop deep link.
+
+## v0.1.1 — 2026-09-02
+
+Interactive Linux workloads, a node-local image registry, and in-cluster image builds.
 
 ### Added
 
