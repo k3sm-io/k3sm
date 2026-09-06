@@ -1,0 +1,14 @@
+system/io.k3sm.server = {
+	active count = 0
+	path = /Library/LaunchDaemons/io.k3sm.server.plist
+	state = not running
+	program = /Library/k3sm/k3sm
+
+	arguments = {
+		/Library/k3sm/k3sm
+		server
+	}
+
+	runs = 1
+	last exit code = 1
+}

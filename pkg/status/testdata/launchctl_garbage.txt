@@ -1,0 +1,6 @@
+system/io.k3sm.server = {
+	path = /Library/LaunchDaemons/io.k3sm.server.plist
+	pid = abc
+	runs = ??
+	last exit code = maybe
+}

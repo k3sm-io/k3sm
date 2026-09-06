@@ -1,0 +1,13 @@
+k3sm degraded: workloads: 1 running · 2 pending · 1 failed  v0.1.1 · kube v1.36.2 · macOS 26.1
+
+    install     ok          installed
+    netd        running     pid 1292
+    server      running     pid 840
+    apiserver   ready       https://127.0.0.1:6444 readyz ok
+    node        ready       1/1 nodes ready · my-mac kubelet v1.36.2
+    workloads   not-ready   1 running · 2 pending · 1 failed
+    data-root   ok          /var/lib/k3sm (apfs volume k3sm, mounted)
+    datastore   ok          kine sqlite, wal, user_version 1
+    kubeconfig  ok          ~/.kube/config context "k3sm"
+
+Next: k3sm kubectl get pods -A

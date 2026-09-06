@@ -1,0 +1,15 @@
+k3sm unknown: could not determine cluster state as this user (re-run with sudo)  v0.1.1 · kube v1.36.2 · macOS 26.1
+
+    install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
+    netd        unknown     launchctl reported a state this build cannot read
+    server      unknown     launchctl reported a state this build cannot read
+    apiserver   unknown     no kubeconfig: no k3sm context in ~/.kube/config
+    node        unknown     apiserver unreachable
+    workloads   unknown     apiserver unreachable
+    data-root   unknown     the data root was not probed
+    datastore   unknown     state.db not readable as this user (re-run with sudo)
+    kubeconfig  missing     no k3sm context in ~/.kube/config
+
+Next: sudo k3sm status
+      sudo k3sm install
+      k3sm kubeconfig --write

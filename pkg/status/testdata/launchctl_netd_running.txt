@@ -1,0 +1,22 @@
+system/io.k3sm.netd = {
+	active count = 1
+	path = /Library/LaunchDaemons/io.k3sm.netd.plist
+	state = running
+	program = /Library/k3sm/k3sm
+
+	arguments = {
+		/Library/k3sm/k3sm
+		netd
+		--socket
+		/var/lib/k3sm/run/netd.sock
+	}
+
+	stdout path = /var/log/k3sm/netd.log
+	stderr path = /var/log/k3sm/netd.log
+	pid = 1292
+	immediate reason = speculative
+	forks = 0
+	execs = 1
+	runs = 1
+	last exit code = (never exited)
+}
