@@ -1,0 +1,6 @@
+system/io.k3sm.server = {
+	status: running
+	process id: 12
+	restart count: 4
+	exit status: 0
+}

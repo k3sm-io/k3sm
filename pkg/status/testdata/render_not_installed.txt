@@ -1,0 +1,8 @@
+k3sm not-installed: k3sm is not installed on this Mac       v0.1.1 · kube v1.36.2 · macOS 26.1
+
+    install     absent      no k3sm install found on this Mac
+    netd        not-loaded  io.k3sm.netd is not loaded in the system domain
+    server      not-loaded  io.k3sm.server is not loaded in the system domain
+    apiserver   unknown     no kubeconfig: no k3sm context in ~/.kube/config
+
+Next: sudo k3sm install

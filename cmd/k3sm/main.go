@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "builder", "image", "kubectl", "kubeconfig", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -44,6 +44,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   image       ingest, publish and reclaim this node's images (image load|import|push|prune|ls|df)
   kubectl     run the bundled kubectl against this cluster (KUBECONFIG preset)
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
+  status      show what is running (daemons, apiserver, node, workloads, data root) — the exit code is the verdict, see k3sm status --help
   doctor      run preflight environment + datastore-posture checks
   snapshot    back up and restore the kine SQLite datastore (snapshot save|restore)
   version     print version
@@ -122,6 +123,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "k3sm kubeconfig:", err)
 			os.Exit(1)
 		}
+	case "status":
+		// status returns its own exit code: the code IS the verdict (running,
+		// stopped, degraded, not-installed, unknown), so the generic exit-1
+		// wrapper the other verbs use would throw the answer away.
+		os.Exit(runStatus(os.Args[2:]))
 	case "doctor":
 		if err := runDoctor(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm doctor:", err)

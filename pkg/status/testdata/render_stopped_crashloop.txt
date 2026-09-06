@@ -1,0 +1,15 @@
+k3sm stopped: io.k3sm.server is crash-looping (497 runs, last exit 1)  v0.1.1 · kube v1.36.2 · macOS 26.1
+
+    install     ok          installed
+    netd        running     pid 1292
+    server      crash-loop  497 runs, last exit 1
+      log: level=ERROR msg="control plane exited" err="listen tcp 127.0.0.1:6444: bind: address already in use" (×497)
+    apiserver   down        https://127.0.0.1:6444: connection refused
+    node        ready       1/1 nodes ready · my-mac kubelet v1.36.2
+    workloads   ok          3 running
+    data-root   ok          /var/lib/k3sm (apfs volume k3sm, mounted)
+    datastore   ok          kine sqlite, wal, user_version 1
+    kubeconfig  ok          ~/.kube/config context "k3sm"
+
+Next: sudo launchctl kickstart -k system/io.k3sm.server
+      k3sm status logs server

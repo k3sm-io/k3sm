@@ -1,0 +1,2 @@
+com.apple.some.other.job => disabled
+"io.k3sm.server" => disabled
