@@ -32,6 +32,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"k3sm.io/k3sm/pkg/dataroot"
 )
 
 // darwinSystem is the production System: it performs the privileged operations
@@ -56,9 +58,16 @@ const (
 // whose home is DefaultDataRoot, and ensures that data root exists owned by it
 // (so the _k3sm control plane can write its work-dir there). It returns the uid.
 func (darwinSystem) EnsureServiceUser(name string) (uint32, error) {
+	// Never create or chown into a data root that is declared as a mount point
+	// but is not mounted: that would hand the service user the bare mountpoint
+	// on the boot disk and let the control plane build an empty datastore over
+	// the real volume's.
+	if err := refuseShadowedDataRoot(dataroot.OSFS{}, DefaultDataRoot); err != nil {
+		return 0, err
+	}
 	if u, err := user.Lookup(name); err == nil {
 		uid, _ := strconv.Atoi(u.Uid)
-		if err := ensureOwnedDir(DefaultDataRoot, uid); err != nil {
+		if err := EnsureDataRoot(DefaultDataRoot, uid); err != nil {
 			return 0, err
 		}
 		return uint32(uid), nil
@@ -83,7 +92,7 @@ func (darwinSystem) EnsureServiceUser(name string) (uint32, error) {
 			return 0, fmt.Errorf("create service user (%s): %w: %s", strings.Join(s, " "), err, out)
 		}
 	}
-	if err := ensureOwnedDir(DefaultDataRoot, uid); err != nil {
+	if err := EnsureDataRoot(DefaultDataRoot, uid); err != nil {
 		return 0, err
 	}
 	return uint32(uid), nil
@@ -99,13 +108,19 @@ func freeSystemUID() (int, error) {
 	return 0, fmt.Errorf("no free system uid in [%d,%d]", systemUIDFloor, systemUIDCeil)
 }
 
-// ensureOwnedDir creates dir 0750 (idempotent) and chowns it to uid:staff so the
-// service user owns its data root.
+// EnsureDataRoot creates dir with the data-root policy (idempotent) and chowns
+// it to uid:staff so the service user owns it. Exported because `k3sm install`
+// is not the only writer of that policy — the root netd helper applies the same
+// one when it finds a drifted root at boot — and the two must agree.
+func EnsureDataRoot(dir string, uid int) error { return ensureOwnedDir(dir, uid) }
+
+// ensureOwnedDir creates dir DataRootMode (idempotent) and chowns it to
+// uid:DataRootGID so the service user owns its data root.
 func ensureOwnedDir(dir string, uid int) error {
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := os.MkdirAll(dir, DataRootMode); err != nil {
 		return fmt.Errorf("create data root %s: %w", dir, err)
 	}
-	if err := os.Chown(dir, uid, 20); err != nil {
+	if err := os.Chown(dir, uid, DataRootGID); err != nil {
 		return fmt.Errorf("chown data root %s to %d: %w", dir, uid, err)
 	}
 	return nil

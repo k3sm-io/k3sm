@@ -43,9 +43,11 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/crdensure"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ingresshost"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
@@ -213,6 +215,31 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	return workDirErr
 }
 
+// refuseShadowedWorkDir refuses to bring the control plane up when workDir sits
+// directly inside a data root that /etc/fstab declares as a mount point but
+// which is not mounted — the installed posture, <dataRoot>/server. Coming up
+// there means creating the datastore in the bare mountpoint on the boot disk,
+// so the cluster silently loses every object on the real volume; refusing costs
+// a restart once the volume is mounted.
+//
+// The cheap containment test comes first: a work-dir outside the data root (a
+// --work-dir override, the unprivileged <home>/server dev posture) is none of
+// this function's business and does not even read /etc/fstab. An inspection
+// error is not a refusal — EnsureWorkDirWritable reports the real failure.
+func refuseShadowedWorkDir(fsys dataroot.FS, workDir, dataRoot string) error {
+	if filepath.Dir(filepath.Clean(workDir)) != filepath.Clean(dataRoot) {
+		return nil
+	}
+	st, err := dataroot.Read(fsys, dataRoot)
+	if err != nil {
+		return nil
+	}
+	if st.Shadowed() {
+		return dataroot.Refusal(dataRoot)
+	}
+	return nil
+}
+
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
 // node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
 // DNS shim and provisions the os=darwin admission policy. It blocks until
@@ -239,6 +266,12 @@ func runServer(args []string) error {
 			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
 		}
 		return fmt.Errorf("control-plane work-dir is empty (pass --work-dir)")
+	}
+	// Refuse a shadowed data root before touching it: writing the work-dir into
+	// a declared-but-unmounted mountpoint would build a fresh, empty datastore
+	// that hides the real volume's (2026-09-05).
+	if err := refuseShadowedWorkDir(dataroot.OSFS{}, opts.workDir, install.DefaultDataRoot); err != nil {
+		return err
 	}
 	// Fail fast if the work-dir is not writable (the unprivileged control plane
 	// must not EACCES mid-bring-up against the root-owned default).

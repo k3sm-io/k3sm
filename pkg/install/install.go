@@ -46,6 +46,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -98,6 +99,13 @@ const (
 	// DefaultDataRoot is the _k3sm-owned data root (the _k3sm home): the
 	// control-plane work-dir, runtimed pods/storage/image cache live under it.
 	DefaultDataRoot = "/var/lib/k3sm"
+	// DataRootMode and DataRootGID are the ownership POLICY for the data root:
+	// service-user-owned, group staff (the service user's primary group), 0750.
+	// They are named because two daemons apply them — `k3sm install` when it
+	// creates the root, and the netd helper when it finds one that has drifted —
+	// and a second literal would let those two answers diverge.
+	DataRootMode fs.FileMode = 0o750
+	DataRootGID              = 20
 	// DefaultRunDir is the runtime run directory under the default data root: the
 	// directory half of every k3sm rendezvous socket (netd.sock, runtimed.sock,
 	// the per-pod vm agent sockets) and of the mesh key dir. It is composed from
@@ -137,6 +145,28 @@ const (
 // The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
 // message) name it, so the two can never drift apart.
 func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
+
+// NetdLogPath returns the root network helper's combined stdout/stderr log path.
+// The netd plist points at it, so — like ServerLogPath — the plist and any
+// diagnostic that names the file cannot drift apart.
+func NetdLogPath() string { return filepath.Join(LogDir, "netd.log") }
+
+// refuseShadowedDataRoot returns dataroot.Refusal when dir is declared in
+// /etc/fstab as a mount point but nothing is mounted there. Installing into that
+// posture would chown the bare mountpoint on the boot disk to the service user,
+// which is worse than the crash it prevents: the control plane would then build
+// a fresh, empty datastore that shadows the real volume's. An inspection error
+// is not a refusal — the caller's own mkdir/chown reports the real failure.
+func refuseShadowedDataRoot(fsys dataroot.FS, dir string) error {
+	st, err := dataroot.Read(fsys, dir)
+	if err != nil {
+		return nil
+	}
+	if st.Shadowed() {
+		return dataroot.Refusal(dir)
+	}
+	return nil
+}
 
 // RunDir returns the runtime run directory for a data root: <dataRoot>/run, with
 // an empty dataRoot meaning runtimed's default work dir. It is the DIRECTORY the
@@ -1013,8 +1043,8 @@ func NetdPlist(cfg Config) []byte {
 		},
 		RunAtLoad:  true,
 		KeepAlive:  true,
-		StdoutPath: filepath.Join(LogDir, "netd.log"),
-		StderrPath: filepath.Join(LogDir, "netd.log"),
+		StdoutPath: NetdLogPath(),
+		StderrPath: NetdLogPath(),
 		// No UserName: netd is root.
 	})
 }
