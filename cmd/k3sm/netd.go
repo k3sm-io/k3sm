@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -28,6 +29,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +44,7 @@ import (
 
 	"k3sm.io/darwin-net/pkg/netd"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netdsvc"
@@ -125,7 +128,7 @@ func runNetd(args []string) error {
 		return err
 	}
 
-	l, err := listenNetd(opts.socket, gid)
+	l, err := listenNetd(opts.socket, install.DefaultDataRoot, gid, osOwnership{})
 	if err != nil {
 		return err
 	}
@@ -375,54 +378,169 @@ func serviceGID() int {
 	return 0
 }
 
-// listenNetd ensures the SHARED run directory, removes any stale socket,
-// listens, and sets the socket group + 0660 mode so the _k3sm control plane can
-// connect (the SCM_CREDS uid verifier is the authoritative peer gate on top).
+// listenNetd prepares the data root and the SHARED run directory, removes any
+// stale socket, listens, and sets the socket group + 0660 mode so the _k3sm
+// control plane can connect (the SCM_CREDS uid verifier is the authoritative
+// peer gate on top). It splits into a REFUSAL and an ALIGNMENT, because the two
+// data-root failures netd has actually caused want opposite responses.
 //
-// The directory is shared with the _k3sm daemon's own control socket, and the
-// ownership POLICY belongs to `k3sm install` (EnsureRunDir: _k3sm:staff 0700).
-// netd runs as root, so it needs no ownership of the directory to create its
-// socket inside it — and taking ownership here is exactly the boot-order bug
-// that locked the service user out of its own socket dir (observed live
-// 2026-09-02: install set _k3sm 0700, netd re-owned root:wheel on bootstrap,
-// the server's dial then failed permission-denied in a crash loop). netd
-// therefore ALIGNS the directory to the install policy when it can name the
-// service user, and leaves ownership alone otherwise; it never takes the
-// directory for root.
-func listenNetd(socket string, gid int) (net.Listener, error) {
+// REFUSE (2026-09-05): when the data root is declared in /etc/fstab as a mount
+// point but nothing is mounted there, netd creates and chowns NOTHING and
+// returns dataroot.Refusal. Creating <root>/run inside the bare mountpoint
+// hides the real volume; on the day this was found netd made that shadow
+// root-owned, the _k3sm server could not create its work-dir beside it, and the
+// server crash-looped ~500 times. The kinder-looking outcome is the worse one:
+// a service-user-owned shadow would have let the control plane build a fresh,
+// empty datastore over a perfectly good one. launchd's KeepAlive re-runs netd,
+// so this refusal repeats — one line per attempt — until the volume is mounted.
+//
+// ALIGN: otherwise netd applies the install ownership policy to what it finds.
+// The data root itself gets install.DataRootMode owned by the service user when
+// it is missing or has drifted (the second 2026-09-05 defect: netd's MkdirAll
+// created a plain root root-owned and only re-owned run/). Each directory netd
+// creates below it — and the socket dir if it has drifted — gets the run-dir
+// policy: service user, 0700, non-recursively.
+//
+// netd runs as root, so it needs no ownership of these directories to create
+// its socket inside them, and it never takes them for root: that was the
+// 2026-09-02 boot-order bug in which install set _k3sm 0700, netd re-owned
+// root:wheel on bootstrap, and the server's dial failed permission-denied in a
+// crash loop. When the service user does not exist yet (a pre-install posture)
+// netd logs and leaves ownership exactly as it is.
+func listenNetd(socket, dataRoot string, gid int, own ownership) (net.Listener, error) {
 	dir := filepath.Dir(socket)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	root := filepath.Clean(dataRoot)
+
+	st, err := dataroot.Read(own, root)
+	if err != nil {
+		return nil, fmt.Errorf("inspect data root %s: %w", root, err)
+	}
+	if st.Shadowed() {
+		return nil, dataroot.Refusal(root)
+	}
+	var rootPerm fs.FileMode
+	if fi, serr := own.Stat(root); serr == nil {
+		rootPerm = fi.Mode().Perm()
+	}
+	// Which levels MkdirAll is about to create — decided BEFORE it creates them,
+	// since afterwards every level looks equally present.
+	created := missingLevels(own, root, dir)
+
+	if err := own.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create socket dir %s: %w", dir, err)
 	}
-	if u, err := user.Lookup(install.DefaultServiceUser); err == nil {
-		if uid, uerr := strconv.Atoi(u.Uid); uerr == nil {
-			sgid, gerr := strconv.Atoi(u.Gid)
-			if gerr != nil {
-				sgid = 0
+	uid, sgid, lerr := own.Lookup(install.DefaultServiceUser)
+	if lerr != nil {
+		slog.Error("netd: service user not found; data-root ownership left as-is",
+			"user", install.DefaultServiceUser, "err", lerr)
+	} else {
+		if !st.Exists || st.OwnerUID != uid || rootPerm != install.DataRootMode {
+			if err := own.Chown(root, uid, install.DataRootGID); err != nil {
+				return nil, fmt.Errorf("chown data root %s to the service user: %w", root, err)
 			}
-			if err := os.Chown(dir, uid, sgid); err != nil {
-				return nil, fmt.Errorf("chown socket dir %s to the service user: %w", dir, err)
+			if err := own.Chmod(root, install.DataRootMode); err != nil {
+				return nil, fmt.Errorf("chmod data root %s %#o: %w", root, install.DataRootMode, err)
 			}
-			if err := os.Chmod(dir, 0o700); err != nil {
-				return nil, fmt.Errorf("chmod socket dir %s 0700: %w", dir, err)
+			slog.Warn("netd: aligned data-root ownership", "dir", root,
+				"from", fmt.Sprintf("uid=%d mode=%04o", st.OwnerUID, rootPerm),
+				"to", fmt.Sprintf("uid=%d mode=%04o", uid, install.DataRootMode))
+		}
+		for _, level := range alignTargets(own, created, dir, uid) {
+			if err := alignRunDir(own, level, uid, sgid); err != nil {
+				return nil, err
 			}
 		}
 	}
 	// Remove a stale socket from a previous run so Listen does not EADDRINUSE.
-	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+	if err := own.Remove(socket); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("remove stale socket %s: %w", socket, err)
 	}
 	l, err := net.Listen("unix", socket)
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", socket, err)
 	}
-	if err := os.Chown(socket, 0, gid); err != nil {
+	if err := own.Chown(socket, 0, gid); err != nil {
 		_ = l.Close()
 		return nil, fmt.Errorf("chown socket %s group %d: %w", socket, gid, err)
 	}
-	if err := os.Chmod(socket, 0o660); err != nil {
+	if err := own.Chmod(socket, 0o660); err != nil {
 		_ = l.Close()
 		return nil, fmt.Errorf("chmod socket %s 0660: %w", socket, err)
 	}
 	return l, nil
+}
+
+// missingLevels returns the directory levels from root (exclusive) down to dir
+// (inclusive) that do not exist yet — exactly the ones a MkdirAll(dir) is about
+// to create. Once the first level is missing every level below it is too, so
+// the walk stops stat-ing and simply collects. A dir outside root yields dir
+// alone when it is missing (netd still owns what it creates).
+func missingLevels(own ownership, root, dir string) []string {
+	rel, err := filepath.Rel(root, filepath.Clean(dir))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		if _, serr := own.Stat(dir); serr != nil {
+			return []string{filepath.Clean(dir)}
+		}
+		return nil
+	}
+	if rel == "." {
+		return nil
+	}
+	var (
+		out     []string
+		cur     = root
+		missing bool
+	)
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, part)
+		if !missing {
+			if _, err := own.Stat(cur); err != nil {
+				missing = true
+			}
+		}
+		if missing {
+			out = append(out, cur)
+		}
+	}
+	return out
+}
+
+// alignTargets is created plus the socket dir when that already existed but has
+// drifted off the service user — the case the 2026-09-02 fix exists for, which
+// a create-time-only alignment would stop healing. Levels that already existed
+// and are already correct are left untouched.
+func alignTargets(own ownership, created []string, dir string, uid int) []string {
+	dir = filepath.Clean(dir)
+	if len(created) > 0 && created[len(created)-1] == dir {
+		return created
+	}
+	if dirOwnerUID(own, dir) == uid {
+		return created
+	}
+	return append(created, dir)
+}
+
+// alignRunDir applies the run-directory policy to one directory: owned by the
+// service user, 0700, non-recursive.
+func alignRunDir(own ownership, dir string, uid, sgid int) error {
+	if err := own.Chown(dir, uid, sgid); err != nil {
+		return fmt.Errorf("chown %s to the service user: %w", dir, err)
+	}
+	if err := own.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("chmod %s 0700: %w", dir, err)
+	}
+	return nil
+}
+
+// dirOwnerUID reports dir's owning uid, or -1 when it cannot be determined
+// (absent, or a FileInfo without the platform payload).
+func dirOwnerUID(own ownership, dir string) int {
+	fi, err := own.Stat(dir)
+	if err != nil {
+		return -1
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st != nil {
+		return int(st.Uid)
+	}
+	return -1
 }
