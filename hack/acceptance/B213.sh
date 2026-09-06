@@ -148,7 +148,7 @@ d=ok
 grep -q 'two mint sites and one anchor' "$DESIGN_MD" || d=no
 grep -q 'setServerKubeletServing' "$DESIGN_MD" || d=no
 grep -q 'SCOPE — this is the SINGLE-NODE, dev and standalone' "$SERVING_GO" || d=no
-grep -q 'B213' "$SERVING_GO" || d=no
+grep -q 'kubelet-certificate-authority' "$SERVING_GO" || d=no   # the mechanism, not a backlog id (public code carries no ids since #319)
 ladder "$d" "b213.5  DESIGN §5c names both mint sites, and SelfSignedServing's doc scopes itself to the dev posture"
 
 # ---- Go leg runner (GOARCH=arm64 CGO_ENABLED=1) ----------------------------
