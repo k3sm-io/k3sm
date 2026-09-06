@@ -8,7 +8,7 @@ dropped and its subsections promoted one level. The
 [releases page](https://k3sm.io/releases/) lists every published build with the version to
 pin, its date, and the tarball's sha256.
 
-## Unreleased — v0.1.4
+## v0.1.4 — 2026-09-06
 
 One command that says what is running, and daemons that refuse to write into an unmounted data
 root.
