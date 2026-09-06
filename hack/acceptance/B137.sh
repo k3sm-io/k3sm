@@ -468,7 +468,7 @@ chmod +x "$HINT_STUBS/k3sm"
 run_case t18 PATH="$STUBS:$HINT_STUBS:/usr/bin:/bin" \
 	K3SM_INSTALL_BASE_URL="$BASE_OK" K3SM_INSTALL_VERSION=v9.9.9
 if [ "$CASE_RC" -eq 0 ] && sudo_ran && k3sm_ran \
-	&& has 'installed — try: k3sm kubectl get nodes' \
+	&& has 'installed — try: k3sm status, then k3sm kubectl get nodes' \
 	&& ! has 'is the launcher'; then
 	ladder ok "b137.T18 k3sm ON PATH: closing hint is the runnable one"
 else
