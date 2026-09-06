@@ -23,6 +23,13 @@ bound can fill the disk the datastore sits on. `capacity.storage` records what t
 is not a quota. Over-commit is not refused when the volume binds — it surfaces later as a write
 failure (`ENOSPC`) inside the Pod.
 
+Keeping the data root on its own volume is the way to bound that. A separate volume is declared in
+`/etc/fstab` — the only supported way to attach one — and must be mounted before the daemons start:
+they refuse to run against a mountpoint with nothing mounted on it, because writing into the bare
+directory would put a second, empty datastore on the boot disk and hide the real volume's contents.
+`k3sm status` names that state (`data-root  not-mounted`) and prints the mount command; see
+[Troubleshooting](troubleshooting.md) for the full recovery.
+
 ## Every Claim Must Name the Class
 
 `local-path` is **not** marked as the cluster's default StorageClass. That is deliberate: a PVC that did

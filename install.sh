@@ -195,14 +195,14 @@ run_install() {
 	if ! sudo "$STAGE/k3sm" install; then
 		printf '[k3sm-install] ERROR: sudo k3sm install failed.\n' >&2
 		printf '[k3sm-install]   A partial install is safe to retire: sudo %s/k3sm uninstall (idempotent).\n' "$STAGE" >&2
-		printf '[k3sm-install]   Logs: /var/log/k3sm/ — diagnostics: k3sm doctor\n' >&2
+		printf '[k3sm-install]   Diagnostics: k3sm status, then k3sm doctor — logs: /var/log/k3sm/\n' >&2
 		exit 1
 	fi
 	if command -v k3sm >/dev/null 2>&1; then
-		info "installed — try: k3sm kubectl get nodes"
+		info "installed — try: k3sm status, then k3sm kubectl get nodes"
 	else
 		info "installed to /Library/k3sm; /usr/local/bin/k3sm is the launcher —"
-		info "  open a new terminal, or add /usr/local/bin to PATH, then: k3sm kubectl get nodes"
+		info "  open a new terminal, or add /usr/local/bin to PATH, then: k3sm status"
 	fi
 }
 

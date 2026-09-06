@@ -1,6 +1,71 @@
 # Troubleshooting
 
-When a k3sm cluster does not behave. Start with logs, then the common failure modes below.
+When a k3sm cluster does not behave. Start with `k3sm status`, then the common failure modes below.
+
+## Start with `k3sm status`
+
+`k3sm status` is one screen: the two LaunchDaemons, the apiserver, the node, the workloads, the data
+root, the datastore and your kubeconfig — with a one-line verdict at the top and, at the bottom, the
+command that fixes whatever is down.
+
+A healthy cluster looks like this:
+
+```
+k3sm running: 1/1 nodes ready                               v0.1.1 · kube v1.36.2 · macOS 26.1
+
+    install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
+    netd        running     pid 512 · socket /var/lib/k3sm/run/netd.sock
+    server      running     pid 840
+    apiserver   ready       https://127.0.0.1:6444 readyz ok
+    node        ready       1/1 nodes ready · my-mac kubelet v1.36.2
+    workloads   ok          3 running
+    data-root   ok          /var/lib/k3sm (apfs volume k3sm, mounted)
+    datastore   ok          kine sqlite, wal, user_version 1
+    kubeconfig  ok          ~/.kube/config context "k3sm"
+
+Next: k3sm kubectl get pods -A
+```
+
+A control plane that will not start looks like this — the verdict names the cause, and the server row
+quotes the last line of its log:
+
+```
+k3sm stopped: io.k3sm.server is crash-looping (12 runs, last exit 1)  v0.1.1 · kube v1.36.2 · macOS 26.1
+
+    install     ok          /Library/k3sm/k3sm · launcher /usr/local/bin/k3sm · 2 LaunchDaemons in /Library/LaunchDaemons
+    netd        running     pid 512 · socket /var/lib/k3sm/run/netd.sock
+    server      crash-loop  12 runs, last exit 1
+      log: level=ERROR msg="control plane exited" err="bind: address already in use" (×12)
+    apiserver   down        https://127.0.0.1:6444: connection refused
+    node        unknown     apiserver unreachable
+    workloads   unknown     apiserver unreachable
+    data-root   ok          /var/lib/k3sm (apfs volume k3sm, mounted)
+    datastore   ok          kine sqlite, wal, user_version 1
+    kubeconfig  ok          ~/.kube/config context "k3sm"
+
+Next: sudo launchctl kickstart -k system/io.k3sm.server
+      k3sm status logs server
+```
+
+Three more views go deeper when the overview is not enough:
+
+```sh
+k3sm status daemons          # per-daemon detail: run count, last exit, plist and log paths
+k3sm status cluster          # readyz, node, workloads by phase, datastore, runtime daemon
+k3sm status logs server      # tail a daemon's log (netd or server; both when omitted)
+```
+
+And two flags for scripts and for watching a restart:
+
+```sh
+k3sm status -o json          # the machine interface; the text screen is rendered from it
+k3sm status --wait           # poll until the cluster is running, or --timeout elapses
+```
+
+The exit code is the verdict, so a script can branch on it. `k3sm status --help` lists the codes.
+
+Rows say `unknown` when your account cannot read something the daemons own — the run directory, the
+datastore, the runtime socket. That is not a failure; re-run with `sudo` for those rows.
 
 ## Logs
 
@@ -65,10 +130,42 @@ See [kubectl access](kubectl-access.md) for the full resolution order.
 
 ## Control Plane Startup Failure
 
+- **Run `k3sm status` first.** It says whether the server daemon is running, crash-looping, stopped
+  or not loaded, and it quotes the last line of the server log for the two failure cases.
 - Confirm install completed: `k3sm version` and `sudo k3sm install` (idempotent).
 - Check the datastore is present and not locked — the kine/SQLite DB lives under the server work
   directory (see [Backup & restore](backup-restore.md)).
 - Restart the daemon: `launchctl kickstart -k system/io.k3sm.server` (label per your role).
+
+### The Data Root Is Declared But Not Mounted
+
+If you keep `/var/lib/k3sm` on its own APFS volume, that volume is declared in `/etc/fstab` and must
+be mounted **before** the daemons start. When it is not, writes land on the boot disk in the bare
+mountpoint and shadow the real volume — which looks exactly like an empty cluster. `k3sm status`
+reports the data root as `not-mounted` and the verdict as `stopped`, because the daemons refuse to
+run against an unmounted mountpoint rather than build a second, empty datastore on top of your data.
+
+```sh
+diskutil info /var/lib/k3sm                     # the Device Node line names the volume
+sudo rm -r /var/lib/k3sm/run                    # the shadow holds only the netd socket
+sudo diskutil mount -mountPoint /var/lib/k3sm /dev/diskNsM
+sudo launchctl kickstart -k system/io.k3sm.netd
+sudo launchctl kickstart -k system/io.k3sm.server
+```
+
+`sudo k3sm install` refuses this posture until the volume is mounted, so mount it first and then
+re-run the install if you were in the middle of one.
+
+### The Data Root Has The Wrong Owner
+
+The data root belongs to the unprivileged `_k3sm` service user. If something has changed its
+ownership, the control plane cannot write to it and `k3sm status` reports the data root as
+`wrong-owner` with the uid it found. Restarting the netd helper realigns the ownership:
+
+```sh
+sudo launchctl kickstart -k system/io.k3sm.netd
+sudo k3sm install                               # the authoritative repair, and idempotent
+```
 
 ## Stuck or Crash-Looping Pods
 

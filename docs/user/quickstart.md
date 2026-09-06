@@ -41,9 +41,13 @@ come back after a reboot. A second, foreground `k3sm server` would contend with 
 directory and the apiserver port.
 
 ```sh
-launchctl print system/io.k3sm.server | head -5   # the daemon launchd is running
-kubectl get nodes                                 # one Ready darwin node
+k3sm status         # one screen: daemons, apiserver, node, workloads, data root
+kubectl get nodes   # one Ready darwin node
 ```
+
+The `install` row names the two LaunchDaemons: they are what makes the cluster survive a reboot, and
+`k3sm status` is how you check they came back. Its exit code is the verdict, so a script can branch
+on it — `k3sm status --help` lists the codes.
 
 Install merged an admin context into your `~/.kube/config`, so your own `kubectl` reaches the cluster
 with no further setup. See [kubectl access](kubectl-access.md) for the details, and
