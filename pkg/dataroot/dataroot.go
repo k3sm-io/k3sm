@@ -115,12 +115,20 @@ func Read(fsys FS, dir string) (State, error) {
 		s.OwnerUID = int(st.Uid)
 	}
 
+	// A mount point is a directory whose device differs from its parent's.
+	// That is the test that survives macOS's /var -> /private/var symlink:
+	// statfs(2) and mount(8) report the RESOLVED mount point, so a string
+	// compare against the declared path calls a healthy, mounted data root
+	// "not mounted" -- the shadow verdict about a working Mac (found live
+	// 2026-09-05, one commit after the guard landed). The name compare stays
+	// as a second witness for callers whose Stat payload carries no device.
+	s.Mounted = mountedByDevice(fsys, fi, dir)
 	var st unix.Statfs_t
 	if err := fsys.Statfs(dir, &st); err == nil {
-		// statfs(2) answers for the filesystem CONTAINING the path, so the
-		// mount point must match exactly for dir to be a mount point itself.
 		if cstring(st.Mntonname[:]) == dir {
 			s.Mounted = true
+		}
+		if s.Mounted {
 			s.FSType = cstring(st.Fstypename[:])
 			s.VolumeName = filepath.Base(cstring(st.Mntfromname[:]))
 		}
@@ -142,4 +150,28 @@ func cstring(b []byte) string {
 		b = b[:i]
 	}
 	return string(b)
+}
+
+// mountedByDevice reports whether dir sits on a different device than its
+// parent directory -- the definition of a mount point that no symlink in the
+// path can disturb. It answers false when either Stat payload carries no
+// device (a fake), leaving the mount-name compare in Read as the witness.
+func mountedByDevice(fsys FS, fi fs.FileInfo, dir string) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil || st.Dev == 0 {
+		return false
+	}
+	parent := filepath.Dir(dir)
+	if parent == dir {
+		return false
+	}
+	pfi, err := fsys.Stat(parent)
+	if err != nil {
+		return false
+	}
+	pst, ok := pfi.Sys().(*syscall.Stat_t)
+	if !ok || pst == nil || pst.Dev == 0 {
+		return false
+	}
+	return pst.Dev != st.Dev
 }

@@ -33,6 +33,7 @@ type fakeInfo struct {
 	name string
 	mode fs.FileMode
 	uid  uint32
+	dev  int32 // 0 = no device in the payload
 }
 
 func (f fakeInfo) Name() string       { return f.name }
@@ -40,7 +41,7 @@ func (f fakeInfo) Size() int64        { return 0 }
 func (f fakeInfo) Mode() fs.FileMode  { return f.mode | fs.ModeDir }
 func (f fakeInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeInfo) IsDir() bool        { return true }
-func (f fakeInfo) Sys() any           { return &syscall.Stat_t{Uid: f.uid} }
+func (f fakeInfo) Sys() any           { return &syscall.Stat_t{Uid: f.uid, Dev: f.dev} }
 
 // fakeEntry is a fs.DirEntry carrying only a name.
 type fakeEntry struct{ name string }
@@ -129,6 +130,40 @@ func TestRead(t *testing.T) {
 				Exists: true, DeclaredMount: true, Mounted: true,
 				FSType: "apfs", VolumeName: "disk3s7",
 				OwnerUID: 250, OwnerWritable: true,
+			},
+		},
+		{
+			name: "declared volume mounted behind the /private symlink (statfs reports the resolved path)",
+			fsys: fakeFS{
+				fstab: declared,
+				stat: map[string]fakeInfo{
+					testRoot:   {name: "k3sm", mode: 0o750, uid: 250, dev: 16777233},
+					"/var/lib": {name: "lib", mode: 0o755, uid: 0, dev: 16777231},
+				},
+				statfs: map[string]fakeMount{testRoot: {on: "/private" + testRoot, fstype: "apfs", from: "/dev/disk3s7"}},
+			},
+			dir: testRoot,
+			want: State{
+				Exists: true, DeclaredMount: true, Mounted: true,
+				FSType: "apfs", VolumeName: "disk3s7",
+				OwnerUID: 250, OwnerWritable: true,
+			},
+		},
+		{
+			name: "same device as the parent and a foreign mount name is NOT mounted",
+			fsys: fakeFS{
+				fstab: declared,
+				stat: map[string]fakeInfo{
+					testRoot:   {name: "k3sm", mode: 0o755, uid: 0, dev: 16777231},
+					"/var/lib": {name: "lib", mode: 0o755, uid: 0, dev: 16777231},
+				},
+				statfs:  map[string]fakeMount{testRoot: {on: "/System/Volumes/Data", fstype: "apfs", from: "/dev/disk3s5"}},
+				entries: map[string][]string{testRoot: {"run"}},
+			},
+			dir: testRoot,
+			want: State{
+				Exists: true, DeclaredMount: true, Mounted: false,
+				OwnerUID: 0, OwnerWritable: true, ShadowEntries: []string{"run"},
 			},
 		},
 		{
