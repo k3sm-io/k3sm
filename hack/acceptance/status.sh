@@ -204,11 +204,33 @@ elif ! grep -qE "^[^#]*[[:space:]]${DATA_ROOT}[[:space:]]" /etc/fstab 2>/dev/nul
 else
 	K3SM_BIN="${K3SM_BIN:-k3sm}"
 	VOLUME="$(diskutil info "$DATA_ROOT" 2>/dev/null | awk -F': *' '/Device Node/ {print $2}' | tr -d ' ')"
+	NETD_PLIST=/Library/LaunchDaemons/io.k3sm.netd.plist
+	SERVER_PLIST=/Library/LaunchDaemons/io.k3sm.server.plist
 
+	# A mount point is a directory whose device differs from its parent's -- the
+	# one test that survives /var -> /private/var (mount(8) prints the resolved
+	# path, so a string match on $DATA_ROOT silently fails on every Mac).
+	mounted() { [ "$(stat -f %d "$DATA_ROOT" 2>/dev/null)" != "$(stat -f %d "$(dirname "$DATA_ROOT")" 2>/dev/null)" ]; }
+	loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
+	# bootout returns before launchd finishes tearing the job down; a bootstrap
+	# issued inside that window fails with errno 37/5 (the documented race). So:
+	# wait for the label to leave the domain, then bootstrap with a bounded retry.
+	await_unloaded() { for _ in $(seq 1 15); do loaded "$1" || return 0; sleep 2; done; return 1; }
+	bootstrap_job() {
+		local label="$1" plist="$2"
+		for _ in $(seq 1 10); do
+			if loaded "$label"; then return 0; fi
+			sudo launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
+			sleep 2
+		done
+		loaded "$label"
+	}
 	restore() {
 		echo "--- restoring $DATA_ROOT and the daemons"
-		mount | grep -q " ${DATA_ROOT} " || sudo diskutil mount -mountPoint "$DATA_ROOT" "$VOLUME" >/dev/null 2>&1 || true
+		mounted || sudo diskutil mount -mountPoint "$DATA_ROOT" "$VOLUME" >/dev/null 2>&1 || true
+		bootstrap_job io.k3sm.netd "$NETD_PLIST" || true
 		sudo launchctl kickstart -k system/io.k3sm.netd >/dev/null 2>&1 || true
+		bootstrap_job io.k3sm.server "$SERVER_PLIST" || true
 		sudo launchctl kickstart -k system/io.k3sm.server >/dev/null 2>&1 || true
 	}
 	trap restore EXIT
@@ -218,43 +240,70 @@ else
 	else
 		sudo launchctl bootout system/io.k3sm.server >/dev/null 2>&1 || true
 		sudo launchctl bootout system/io.k3sm.netd >/dev/null 2>&1 || true
-		sudo diskutil unmount "$DATA_ROOT" >/dev/null 2>&1 || true
-
-		# netd's own bring-up races the unmount teardown (the documented errno 37/5
-		# window), so bootstrap it with a bounded retry rather than once.
-		for _ in 1 2 3 4 5; do
-			sudo launchctl kickstart -k system/io.k3sm.netd >/dev/null 2>&1 || true
-			sleep 2
-			launchctl print system/io.k3sm.netd >/dev/null 2>&1 && break
+		await_unloaded io.k3sm.server || true
+		await_unloaded io.k3sm.netd || true
+		# A k3sm-vmhost that outlives the booted-out server keeps the volume busy
+		# (observed 2026-09-06: "dissented by PID <n> (/Library/k3sm/k3sm-vmhost)").
+		# That is a product observation the gate records rather than hides; the
+		# reproduction still needs the volume, so the orphan is terminated here.
+		orphans="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
+		if [ -n "$orphans" ]; then
+			echo "NOTE  s.D0  k3sm-vmhost outlived io.k3sm.server (pids: $orphans) — terminated so the volume can unmount; see the run log for the follow-up"
+			for pid in $orphans; do sudo kill "$pid" 2>/dev/null || true; done
+			sleep 3
+			for pid in $orphans; do sudo kill -9 "$pid" 2>/dev/null || true; done
+		fi
+		# The volume is busy until the daemons' files close; bounded retry, then a
+		# loud FAIL that names the cause -- and NOTHING below runs against a
+		# volume that is still mounted (the 2026-09-06 first run of this tier
+		# deleted the real run/ dir, mesh key included, for exactly that reason).
+		unmount_out=""
+		for _ in $(seq 1 10); do
+			unmount_out="$(sudo diskutil unmount "$DATA_ROOT" 2>&1 || true)"
+			mounted || break
+			sleep 3
 		done
-
-		shadow_json="$("$K3SM_BIN" status -o json 2>/dev/null)" && srC=0 || srC=$?
-		sv="$(printf '%s' "$shadow_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' 2>/dev/null || true)"
-		sd="$(printf '%s' "$shadow_json" | python3 -c 'import json,sys; print(next(r["state"] for r in json.load(sys.stdin)["rows"] if r["name"]=="data-root"))' 2>/dev/null || true)"
-		if [ "$sd" = "not-mounted" ]; then
-			ladder ok "s.D1a [destructive] the data-root row reports not-mounted"
+		if mounted; then
+			ladder no "s.D1  [destructive] could not unmount $DATA_ROOT after the daemons were booted out: ${unmount_out}"
 		else
-			ladder no "s.D1a [destructive] the data-root row reports not-mounted (got '${sd:-<none>}')"
-		fi
-		if [ "$sv" = "stopped" ] && [ "$srC" = 3 ]; then
-			ladder ok "s.D1b [destructive] the verdict is stopped and the exit code is 3"
-		else
-			ladder no "s.D1b [destructive] the verdict is stopped/3 (got '${sv:-<none>}'/$srC)"
-		fi
-		if [ -z "$(ls -A "$DATA_ROOT" 2>/dev/null | grep -v '^run$' || true)" ]; then
-			ladder ok "s.D1c [destructive] the unmounted mountpoint holds nothing but the run dir"
-		else
-			ladder no "s.D1c [destructive] the unmounted mountpoint holds more than the run dir"
-		fi
-
-		sudo rm -rf "${DATA_ROOT:?}/run" >/dev/null 2>&1 || true
-		sudo diskutil mount -mountPoint "$DATA_ROOT" "$VOLUME" >/dev/null 2>&1 || true
-		sudo launchctl kickstart -k system/io.k3sm.netd >/dev/null 2>&1 || true
-		sudo launchctl kickstart -k system/io.k3sm.server >/dev/null 2>&1 || true
-		if "$K3SM_BIN" status --wait --timeout 180s >/dev/null 2>&1; then
-			ladder ok "s.D1d [destructive] remounting and restarting returns the cluster to running"
-		else
-			ladder no "s.D1d [destructive] the cluster did not return to running within 180s"
+			if [ -z "$(ls -A "$DATA_ROOT" 2>/dev/null)" ]; then
+				ladder ok "s.D1a [destructive] the bare mountpoint is empty before netd starts"
+			else
+				ladder no "s.D1a [destructive] the bare mountpoint already holds: $(ls -A "$DATA_ROOT" | tr '\n' ' ')"
+			fi
+			bootstrap_job io.k3sm.netd "$NETD_PLIST" || true
+			sleep 6
+			if [ -z "$(ls -A "$DATA_ROOT" 2>/dev/null)" ]; then
+				ladder ok "s.D1b [destructive] netd created NOTHING in the unmounted mountpoint"
+			else
+				ladder no "s.D1b [destructive] netd wrote into the unmounted mountpoint: $(ls -A "$DATA_ROOT" | tr '\n' ' ')"
+			fi
+			if sudo tail -50 /var/log/k3sm/netd.log 2>/dev/null | grep -q 'declared in /etc/fstab but not mounted'; then
+				ladder ok "s.D1c [destructive] netd's log carries the refusal naming the mount"
+			else
+				ladder no "s.D1c [destructive] netd's log does not carry the refusal"
+			fi
+			shadow_json="$("$K3SM_BIN" status -o json 2>/dev/null)" && srC=0 || srC=$?
+			sv="$(printf '%s' "$shadow_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' 2>/dev/null || true)"
+			sd="$(printf '%s' "$shadow_json" | python3 -c 'import json,sys; print(next(r["state"] for r in json.load(sys.stdin)["rows"] if r["name"]=="data-root"))' 2>/dev/null || true)"
+			if [ "$sd" = "not-mounted" ]; then
+				ladder ok "s.D1d [destructive] the data-root row reports not-mounted"
+			else
+				ladder no "s.D1d [destructive] the data-root row reports not-mounted (got '${sd:-<none>}')"
+			fi
+			if [ "$sv" = "stopped" ] && [ "$srC" = 3 ]; then
+				ladder ok "s.D1e [destructive] the verdict is stopped and the exit code is 3"
+			else
+				ladder no "s.D1e [destructive] the verdict is stopped/3 (got '${sv:-<none>}'/$srC)"
+			fi
+			sudo diskutil mount -mountPoint "$DATA_ROOT" "$VOLUME" >/dev/null 2>&1 || true
+			sudo launchctl kickstart -k system/io.k3sm.netd >/dev/null 2>&1 || true
+			bootstrap_job io.k3sm.server "$SERVER_PLIST" || true
+			if "$K3SM_BIN" status --wait --timeout 180s >/dev/null 2>&1; then
+				ladder ok "s.D1f [destructive] remounting and restarting returns the cluster to running with no reinstall"
+			else
+				ladder no "s.D1f [destructive] the cluster did not return to running within 180s"
+			fi
 		fi
 	fi
 	trap - EXIT
