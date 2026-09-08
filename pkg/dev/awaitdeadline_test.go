@@ -102,3 +102,46 @@ func TestAwaitReadyNodeBoundsAWedgedProbe(t *testing.T) {
 		t.Fatal("awaitReadyNode never returned: the probe is unbounded, so its own deadline is unreachable")
 	}
 }
+
+// The deadline lives on a probe context DERIVED from the caller's, not on the
+// caller's context itself — so a Ctrl-C (caller cancellation) still wins against
+// a wedged probe, promptly, and is reported as the caller's error rather than
+// waiting out the helper's own timeout. This pins the reason the two contexts
+// are separate.
+func TestAwaitHelpersHonourCallerCancellationAgainstAWedgedProbe(t *testing.T) {
+	const timeout = 10 * time.Second // far longer than the test; only cancellation can end it
+	for _, tc := range []struct {
+		name string
+		run  func(ctx context.Context) error
+	}{
+		{"awaitBootstrapObjects", func(ctx context.Context) error {
+			return awaitBootstrapObjects(ctx, timeout, "/tmp/kubeconfig", blockUntilCtxDone, blockUntilCtxDone)
+		}},
+		{"awaitReadyNode", func(ctx context.Context) error {
+			return awaitReadyNode(ctx, timeout, "/tmp/kubeconfig", func(ctx context.Context) (int, int, error) {
+				<-ctx.Done()
+				return 0, 0, ctx.Err()
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- tc.run(ctx) }()
+			time.Sleep(50 * time.Millisecond) // let the probe wedge
+			start := time.Now()
+			cancel()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("want the caller's cancellation error, got nil")
+				}
+				if elapsed := time.Since(start); elapsed > 2*time.Second {
+					t.Fatalf("returned %s after cancel; the caller's context is not reaching the probe", elapsed)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s never returned after the caller cancelled", tc.name)
+			}
+		})
+	}
+}
