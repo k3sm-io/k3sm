@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -427,6 +428,34 @@ func runServer(args []string) error {
 	// plane, this one decides whether there is a control plane at all.
 	if err := ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
 		return err
+	}
+
+	// A control-plane child that dies after bring-up must take this process with
+	// it. Nothing watched them before: the per-component reapers were the only
+	// observers, and their only readers were bring-up and teardown. So a
+	// kube-apiserver, kine, kube-scheduler or kube-controller-manager that died
+	// at hour six left `k3sm server` running, which meant launchd's KeepAlive —
+	// a plain bool, and therefore a restart-on-EXIT policy — never fired. The
+	// cluster was wedged while `k3sm status` still reported the daemon up. That
+	// is worst for the scheduler and the controller-manager, which unlike the
+	// apiserver and kine have no /readyz row: a dead scheduler shows up only as
+	// pods that never leave Pending, and a dead KCM never shows up at all.
+	//
+	// Exiting is the k3s-faithful minimum and the smallest correct move.
+	// Respawning the child in-process is the larger one and is deliberately not
+	// taken here: every in-process client still holds a connection to the old
+	// apiserver, so a respawn would leave the node talking to a corpse.
+	ctx, crashCancel := context.WithCancel(ctx)
+	defer crashCancel()
+	var crashedComponent atomic.Pointer[string]
+	cfg.OnComponentExit = func(name string, err error, logTail string) {
+		// First writer wins: the components die in a cascade (kine's exit takes
+		// the apiserver with it), and the FIRST one names the actual cause.
+		if crashedComponent.CompareAndSwap(nil, &name) {
+			logger.Error("control-plane component exited after bring-up; shutting down so launchd restarts the daemon",
+				"component", name, "err", err, "log-tail", logTail)
+		}
+		crashCancel()
 	}
 
 	exec := executor.NewSupervised(cfg)
@@ -923,7 +952,16 @@ func runServer(args []string) error {
 
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
-	return startNode(ctx, nodeOpts)
+	err = startNode(ctx, nodeOpts)
+	// startNode returns nil on a cancelled context, which is right for a signal
+	// but wrong for a crash: exiting 0 would tell the operator, and the logs,
+	// that this was a clean shutdown. Name the component instead. launchd
+	// restarts either way (KeepAlive is an unconditional bool), so the exit
+	// status is for the human.
+	if name := crashedComponent.Load(); name != nil && err == nil {
+		return fmt.Errorf("control-plane component %q exited; restarting the daemon", *name)
+	}
+	return err
 }
 
 // crdClientFactory builds the apiextensions client a CRD ensure applies through.

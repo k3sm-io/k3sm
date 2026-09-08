@@ -189,6 +189,19 @@ type Config struct {
 	// system:kube-scheduler / system:kube-controller-manager bootstrap RBAC, which binds
 	// the components' OWN per-component identities — no pkg/rbac object is needed.
 	LeaderElect *bool
+	// OnComponentExit, when non-nil, is called from a component's reaper goroutine
+	// when that component exits AFTER a successful bring-up — i.e. it crashed. It
+	// is never called for a bring-up failure (supervisedBringUp reports those) nor
+	// for a component Stop deliberately killed.
+	//
+	// It receives the component name, cmd.Wait's error, and the tail of that
+	// component's log. It runs ON the reaper goroutine, so it must return
+	// promptly and MUST NOT call Stop — Stop tears down the remaining components
+	// and would run concurrently with the caller's own deferred Stop. The
+	// intended implementation cancels the server's root context and returns,
+	// which lets the ordinary shutdown path run every deferred teardown exactly
+	// once, in order.
+	OnComponentExit func(name string, err error, logTail string)
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }

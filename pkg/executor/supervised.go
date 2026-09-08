@@ -127,7 +127,17 @@ type Supervised struct {
 	mu      sync.Mutex
 	comps   []*component // in start order; Stop walks it in reverse
 	started bool
-	token   string
+	// supervising gates the OnComponentExit callback. It is DISTINCT from
+	// started, which Start claims before bring-up: a child that dies during
+	// bring-up must NOT fire the callback, because supervisedBringUp is already
+	// reporting that death through awaitHealthy with the component name and its
+	// log tail. Cancelling the boot context from under that would make
+	// awaitHealthy's select race ctx.Done() against exited and return a bare
+	// context error instead — losing exactly the diagnostic the fail-fast path
+	// exists to produce. So this is set only once bring-up has SUCCEEDED, and
+	// cleared by Stop before it signals anything.
+	supervising bool
+	token       string
 }
 
 // NewSupervised returns a Supervised executor for cfg, filling defaults.
@@ -217,6 +227,12 @@ func (s *Supervised) Start(ctx context.Context) error {
 		_ = s.Stop(context.WithoutCancel(ctx))
 		return err
 	}
+
+	// Bring-up is complete: from here a child exit is a CRASH, not a bring-up
+	// failure, and is the callback's to report.
+	s.mu.Lock()
+	s.supervising = true
+	s.mu.Unlock()
 
 	return nil
 }
@@ -763,6 +779,19 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	go func() {
 		c.waitErr = cmd.Wait()
 		close(c.exited)
+		// Nothing watched the control plane after bring-up: the reapers were the
+		// only observers of a child's death, and their only readers were
+		// awaitHealthy (bring-up) and stopComponent (teardown). A component that
+		// died at hour six left the parent alive, so launchd's KeepAlive — a
+		// plain bool, which fires on process EXIT only — never saw a reason to
+		// restart, and the cluster stayed wedged while the daemon looked healthy.
+		// The reaper already knows; it just had nobody to tell.
+		s.mu.Lock()
+		live := s.supervising
+		s.mu.Unlock()
+		if live && s.cfg.OnComponentExit != nil {
+			s.cfg.OnComponentExit(c.name, c.waitErr, LogTail(c.logPath, exitLogTailLines))
+		}
 	}()
 
 	s.mu.Lock()
@@ -879,6 +908,10 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	comps := s.comps
 	s.comps = nil
 	s.started = false
+	// Cleared HERE, under mu and strictly before any child is signalled, so the
+	// reaper of a child this Stop is about to kill cannot mistake a deliberate
+	// teardown for a crash.
+	s.supervising = false
 	s.mu.Unlock()
 
 	// Reverse start order = correct shutdown order, but kine (index 0) must die
