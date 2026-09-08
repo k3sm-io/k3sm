@@ -78,7 +78,7 @@ func FuzzCheckEntryName(f *testing.F) {
 // FuzzCheckLinkname asserts that no accepted symlink can point outside the image
 // root, including via the directory its own name sits in.
 //
-// It reproduces buildLayer's ORDER (layer.go:174 then :200): checkEntryName gates
+// It reproduces writeTar's ORDER (BuildLayer's tar pass; layer.go:174 then :200): checkEntryName gates
 // every entry, and checkLinkname only ever sees a name that already passed. That
 // precondition is load-bearing, not decoration — fuzzing checkLinkname standalone
 // reports ("/", "..") as an escape within seconds, because path.Dir("/") is "/"
@@ -101,7 +101,7 @@ func FuzzCheckLinkname(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, name, link string) {
 		if checkEntryName(name) != nil {
-			return // buildLayer rejects the entry before the link is ever examined
+			return // writeTar rejects the entry before the link is ever examined
 		}
 		if checkLinkname(name, link) != nil {
 			return // rejections are always safe
@@ -125,11 +125,16 @@ func FuzzDockerfileParse(f *testing.F) {
 		"FROM scratch\nRUN echo hi\n", "FROM scratch\nCOPY a \\\n b\n",
 		"FROM scratch\nENTRYPOINT [\"/bin/sh\"]\n", "FROM scratch\nENV a=\"unterminated\n",
 		"FROM scratch\nEXPOSE 99999\n", strings.Repeat("#c\n", 512) + "FROM scratch\n",
+		// one byte over the documented input bound: Parse must refuse, never truncate
+		"FROM scratch\n" + strings.Repeat("#", maxDockerfileBytes-len("FROM scratch\n")+1),
 	} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, src string) {
 		df, err := Parse(strings.NewReader(src))
+		if len(src) > maxDockerfileBytes && err == nil {
+			t.Fatalf("Parse accepted %d bytes; the documented bound is %d", len(src), maxDockerfileBytes)
+		}
 		if err != nil {
 			if df != nil {
 				t.Fatalf("Parse returned both a Dockerfile and the error %v", err)
@@ -158,7 +163,7 @@ func FuzzDockerfileParse(f *testing.F) {
 }
 
 // TestCheckLinknameNeedsCheckEntryName pins the precondition FuzzCheckLinkname
-// relies on: checkLinkname is NOT a standalone guard. buildLayer must keep
+// relies on: checkLinkname is NOT a standalone guard. writeTar must keep
 // calling checkEntryName first (layer.go:174 before :200). If a future caller
 // invokes checkLinkname alone, these are the inputs that escape.
 func TestCheckLinknameNeedsCheckEntryName(t *testing.T) {
@@ -173,7 +178,7 @@ func TestCheckLinknameNeedsCheckEntryName(t *testing.T) {
 		}
 		if err := checkEntryName(tc.name); err == nil {
 			t.Fatalf("checkEntryName(%q) accepted an absolute name; the gate "+
-				"FuzzCheckLinkname and buildLayer depend on is gone", tc.name)
+				"FuzzCheckLinkname and writeTar depend on is gone", tc.name)
 		}
 	}
 }
