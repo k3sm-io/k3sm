@@ -9,7 +9,7 @@ require (
 	github.com/prometheus/common v0.67.4
 	github.com/virtual-kubelet/virtual-kubelet v1.12.0
 	go.etcd.io/etcd/client/v3 v3.6.5
-	golang.org/x/crypto v0.51.0
+	golang.org/x/crypto v0.52.0
 	golang.org/x/net v0.55.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.45.0
