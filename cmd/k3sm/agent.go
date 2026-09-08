@@ -267,7 +267,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list
+		domain:     opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
 		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,

@@ -241,7 +241,7 @@ func refuseShadowedWorkDir(fsys dataroot.FS, workDir, dataRoot string) error {
 }
 
 // runServer brings up the control plane (via the executor) and a Virtual Kubelet
-// node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
+// node in one process, then hosts darwin-net's Service proxy + per-node DNS resolver +
 // DNS shim and provisions the os=darwin admission policy. It blocks until
 // interrupted, then shuts the control plane down cleanly.
 func runServer(args []string) error {
@@ -817,7 +817,7 @@ func runServer(args []string) error {
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain CoreDNS serves → in-pod shim search list
+		domain:     opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
 		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above)
 		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,           // serve kubelet API over TLS so logs/exec work via the proxy
