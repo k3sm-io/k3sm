@@ -1283,16 +1283,31 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 
 // GetPods returns every tracked pod with its current status applied.
 func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
+	// The pod POINTER is snapshotted inside the critical section, not just the
+	// track. r.mu guards the t.pod field itself — UpdatePod reassigns it at
+	// :1170 under this same lock — so reading t.pod out in the loop below was a
+	// data race, reported by -race against the 10s backstop's GetPods running
+	// concurrently with a VK pod worker's UpdatePod. It is the one mutable field
+	// of podTrack that r.mu guards: readyMu, restartMu and hookMu exist
+	// precisely because the status reconstruction below runs OUTSIDE r.mu, and
+	// startTime is write-once.
+	//
+	// Only the pointer is taken here. The DeepCopy stays outside the lock, where
+	// it belongs — it is the expensive part, it is per-pod, and the pointee is
+	// never mutated after publication, so a snapshotted pointer is safe to copy
+	// at leisure.
 	r.mu.Lock()
 	tracks := make([]*podTrack, 0, len(r.track))
+	pods := make([]*corev1.Pod, 0, len(r.track))
 	for _, t := range r.track {
 		tracks = append(tracks, t)
+		pods = append(pods, t.pod)
 	}
 	r.mu.Unlock()
 
 	out := make([]*corev1.Pod, 0, len(tracks))
-	for _, t := range tracks {
-		pod := t.pod.DeepCopy()
+	for i, t := range tracks {
+		pod := pods[i].DeepCopy()
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 		if err == nil && (resp.GetError() == nil || resp.GetError().GetCode() == 0) {
 			pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
