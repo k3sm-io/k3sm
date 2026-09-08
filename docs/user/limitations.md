@@ -395,9 +395,21 @@ and one of them is now measured rather than assumed:
 - **Rootfs writes are RAM, not disk**, backed by a bounded upper layer. A guest that writes past that
   bound sees `ENOSPC` from its own filesystem, not an out-of-memory kill — read an `ENOSPC` inside a
   `vm` guest as "the rootfs filled up," not as a resource-limit surprise.
-- **`hostPath` volumes are refused outright** (fail-closed) on the `vm` path today. An allowlisted
-  exception is a planned follow-up; until it ships, a `vm` Pod that needs host access has no supported
-  route to it — use a PVC instead.
+- **`hostPath` volumes are silently dropped, on every path — not refused.** This is a footgun, not a
+  fail-closed guard, and it is not specific to `vm`: `toVolume`
+  ([`pkg/provider/translate.go`](https://github.com/k3sm-io/k3sm/blob/main/pkg/provider/translate.go))
+  models no `hostPath` case, so the source falls through its `default` and the volume is skipped.
+  Admission does not stop it either — k3sm ships PodSecurity `enforce = privileged`, so a `hostPath`
+  Pod is *admitted* (you get a PSA **warning**, not a rejection). What happens next depends only on
+  whether a container mounts it:
+    - **Declared and mounted** — the Pod fails with `volume_mount %q references undefined volume`,
+      naming the **mount** and never the missing `hostPath` source, so the error does not point at the
+      real cause.
+    - **Declared but not mounted** — the Pod runs to completion with **no error and no warning at all**.
+      Nothing anywhere reports that the host path was ignored.
+
+  Treat a `hostPath` in a manifest as "will not be there", and use a PVC instead. A real refusal at
+  admission or translation time, and an allowlisted exception after it, are follow-ups.
 
 ### `vm` Pods: Filesystem Performance and Case-Sensitivity, Measured
 

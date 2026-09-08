@@ -147,9 +147,11 @@ Seatbelt-confined. The consequences, stated plainly:
   a routine upgrade does not break the datapath. Homebrew packaging and the notarized, signed
   installer are the second and third install generations, arriving with and after the first public
   release — see [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
-- **Uninstall.** `sudo k3sm uninstall` boots out both daemons, flushes all privileged state (the `lo0`
-  aliases, the `io.k3sm.*` `pf` anchor, the `utun`), and removes `/Library/k3sm`. No orphaned root
-  listener survives.
+- **Uninstall.** `sudo k3sm uninstall` boots out both daemons, removes the `lo0` aliases, and removes
+  `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd — the kernel
+  reaps a `utun` when the process holding it exits. **The `io.k3sm.*` `pf` anchor is not removed**: it
+  is left in the packet filter until an explicit `pfctl` flush or the next reboot. Uninstall therefore
+  does *not* flush all privileged state; if that matters to you, flush the anchor by hand.
 
 ## Explicitly out of scope
 

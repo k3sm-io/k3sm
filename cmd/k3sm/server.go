@@ -86,7 +86,7 @@ type serverOptions struct {
 	// which executor.LoopbackServingArgs renders and does not take from here.
 	schedulerPort         int
 	controllerManagerPort int
-	clusterIP             string // DNS VIP CoreDNS binds + pods resolve against
+	clusterIP             string // DNS VIP the per-node resolver binds + pods resolve against
 	domain                string
 	network               string // host-network backend: auto (default) | none | direct | helper
 
@@ -199,7 +199,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// plain HTTP, so the whole posture rests on nothing off-host being able to
 	// reach it. `k3sm dev` enables it on a per-instance allocated port.
 	fs.IntVar(&opts.registryPort, "registry-port", 0, "node-local OCI ingest registry port on 127.0.0.1 — push locally built images here and pull them by `localhost:<port>/<ref>` (0 disables; "+strconv.Itoa(executor.DefaultRegistryPort)+" is the suggested port)")
-	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP CoreDNS binds and pods resolve against")
+	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (control-plane-only, no datapath/probe) | direct (force lo0, root) | helper (force netd helper)")
 	// HA datastore. The DSN may carry a password; prefer the env so it stays off
