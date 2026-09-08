@@ -72,6 +72,24 @@ absolute mount path sees the unmounted host path instead. This is why a ladder t
 absolute volume mounts (e.g. the MLX acceptance gate's cache PVC) is a root-tier run: rootless stops
 at mount resolution.
 
+### `hostPath` Volumes Are Silently Dropped, Not Refused
+
+`hostPath` is **not modeled on any runtime path** — native or `vm` — and a Pod that declares one is
+**not** rejected. `toVolume`
+([`pkg/provider/translate.go`](https://github.com/k3sm-io/k3sm/blob/main/pkg/provider/translate.go))
+carries no `hostPath` case, so the source falls through its `default` and the volume is skipped.
+Admission does not stop it either: k3sm ships PodSecurity `enforce = privileged`, so a `hostPath` Pod
+is *admitted* with a PSA **warning**, not a rejection. This is a footgun, not a fail-closed guard.
+What you see next depends only on whether a container mounts it:
+
+- **Declared and mounted** — the Pod fails with `volume_mount %q references undefined volume`, naming
+  the **mount** and never the missing `hostPath` source, so the error does not point at the real cause.
+- **Declared but not mounted** — the Pod runs to completion with **no error and no warning at all**.
+  Nothing anywhere reports that the host path was ignored.
+
+Treat a `hostPath` in a manifest as "will not be there", and use a PVC instead. A real refusal at
+admission or translation time, and an allowlisted exception after it, are follow-ups.
+
 ### NetworkPolicy Is a Policy Hint, Not a Security Boundary
 
 NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with
@@ -374,7 +392,7 @@ today. What you see depends on how the image is described:
 A multi-arch image that includes a `linux/arm64` variant is unaffected either way — it pulls and runs
 that variant normally.
 
-### `vm` Pods: Storage — PVCs Work; `fsGroup` and a Foreign uid Do Not; `hostPath` Is Refused
+### `vm` Pods: Storage — PVCs Work; `fsGroup` and a Foreign uid Do Not
 
 PVC-backed storage works on the `vm` path and is host-visible: what the guest writes lands on the host
 filesystem, readable from Finder or `sudo`, same as native pod storage. Two ceilings go with that,
@@ -395,21 +413,6 @@ and one of them is now measured rather than assumed:
 - **Rootfs writes are RAM, not disk**, backed by a bounded upper layer. A guest that writes past that
   bound sees `ENOSPC` from its own filesystem, not an out-of-memory kill — read an `ENOSPC` inside a
   `vm` guest as "the rootfs filled up," not as a resource-limit surprise.
-- **`hostPath` volumes are silently dropped, on every path — not refused.** This is a footgun, not a
-  fail-closed guard, and it is not specific to `vm`: `toVolume`
-  ([`pkg/provider/translate.go`](https://github.com/k3sm-io/k3sm/blob/main/pkg/provider/translate.go))
-  models no `hostPath` case, so the source falls through its `default` and the volume is skipped.
-  Admission does not stop it either — k3sm ships PodSecurity `enforce = privileged`, so a `hostPath`
-  Pod is *admitted* (you get a PSA **warning**, not a rejection). What happens next depends only on
-  whether a container mounts it:
-    - **Declared and mounted** — the Pod fails with `volume_mount %q references undefined volume`,
-      naming the **mount** and never the missing `hostPath` source, so the error does not point at the
-      real cause.
-    - **Declared but not mounted** — the Pod runs to completion with **no error and no warning at all**.
-      Nothing anywhere reports that the host path was ignored.
-
-  Treat a `hostPath` in a manifest as "will not be there", and use a PVC instead. A real refusal at
-  admission or translation time, and an allowlisted exception after it, are follow-ups.
 
 ### `vm` Pods: Filesystem Performance and Case-Sensitivity, Measured
 
