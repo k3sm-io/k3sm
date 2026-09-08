@@ -944,13 +944,27 @@ func (m *Manager) awaitDefaultNamespaceBootstrap(ctx context.Context, kubeconfig
 func awaitBootstrapObjects(ctx context.Context, timeout time.Duration, kubeconfig string,
 	saPresent, cmPresent func(context.Context) bool) error {
 	deadline := time.Now().Add(timeout)
+	// The probes must CARRY the deadline, not merely be measured against it. Each
+	// is a client-go Get whose rest.Config leaves Timeout at zero, so it is bounded
+	// only by the context it is handed. Handing it the caller's ctx — which has no
+	// deadline of its own — made the timeout check below unreachable against a
+	// wedged apiserver: the probe never returned, so `timeout` never fired and
+	// `k3sm dev up` hung indefinitely with nothing logged.
+	//
+	// The deadline goes on a SEPARATE probe context, not on ctx. Putting it on ctx
+	// makes <-ctx.Done() in the select below win the race at expiry and return a
+	// bare "context deadline exceeded", losing the present=%t detail that tells an
+	// operator WHICH object never landed. Keeping ctx for cancellation only means
+	// the loop still exits through its descriptive branch, and a Ctrl-C still wins.
+	probeCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	var saOK, cmOK bool
 	for {
 		if !saOK {
-			saOK = saPresent(ctx)
+			saOK = saPresent(probeCtx)
 		}
 		if !cmOK {
-			cmOK = cmPresent(ctx)
+			cmOK = cmPresent(probeCtx)
 		}
 		if saOK && cmOK {
 			return nil
@@ -1040,10 +1054,18 @@ func nodeIsReady(n *corev1.Node) bool {
 func awaitReadyNode(ctx context.Context, timeout time.Duration, kubeconfig string,
 	probe func(context.Context) (registered, ready int, err error)) error {
 	deadline := time.Now().Add(timeout)
+	// A separate deadline-bearing context for the probe, for the reason spelled
+	// out in awaitBootstrapObjects: an unbounded probe makes the timeout below
+	// unreachable, and putting the deadline on ctx itself would let the select
+	// pre-empt the descriptive error. Here it also improves that error, which
+	// reports lastErr — a wedged List now names "context deadline exceeded"
+	// instead of reporting registered=0 with no cause.
+	probeCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	var registered, ready int
 	var lastErr error
 	for {
-		r, rd, perr := probe(ctx)
+		r, rd, perr := probe(probeCtx)
 		if perr != nil {
 			lastErr = perr
 		} else {
