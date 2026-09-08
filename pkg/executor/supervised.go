@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,6 +88,15 @@ type component struct {
 	logPath string
 	exited  chan struct{}
 	waitErr error
+	// supervised is set, under Supervised.mu, once THIS component has passed its
+	// own readiness gate — not once the whole bring-up sequence has. bringUp
+	// awaits the four children in order, so a single post-sequence flip would
+	// leave a scheduler that dies after its own port opens but before the
+	// controller-manager is ready reported to nobody: the same silent wedge in a
+	// narrower window. Read by this component's reaper to decide whether its
+	// death is a crash (the callback's to report) or a bring-up failure
+	// (awaitHealthy's, with the name and log tail the fail-fast path produces).
+	supervised bool
 }
 
 // exitDetail describes an early child exit for the fail-fast bring-up error:
@@ -127,17 +137,28 @@ type Supervised struct {
 	mu      sync.Mutex
 	comps   []*component // in start order; Stop walks it in reverse
 	started bool
-	// supervising gates the OnComponentExit callback. It is DISTINCT from
-	// started, which Start claims before bring-up: a child that dies during
-	// bring-up must NOT fire the callback, because supervisedBringUp is already
-	// reporting that death through awaitHealthy with the component name and its
-	// log tail. Cancelling the boot context from under that would make
-	// awaitHealthy's select race ctx.Done() against exited and return a bare
+	// supervising is the BACKSTOP for the per-component flags: component.supervised
+	// is the real gate, marked at each child's own readiness gate, and this is
+	// set once bring-up has SUCCEEDED as a whole. It exists so a component added
+	// to bringUp without a markSupervised call degrades to the old
+	// end-of-bring-up behaviour rather than to no supervision at all — an
+	// unsupervised component is the exact silent wedge this seam exists to close,
+	// and it would be invisible.
+	//
+	// Neither flag is `started`, which Start claims BEFORE bring-up: a child that
+	// dies during bring-up must not fire the callback, because supervisedBringUp
+	// is already reporting that death through awaitHealthy with the component
+	// name and its log tail. Cancelling the boot context from under that would
+	// make awaitHealthy's select race ctx.Done() against exited and return a bare
 	// context error instead — losing exactly the diagnostic the fail-fast path
-	// exists to produce. So this is set only once bring-up has SUCCEEDED, and
-	// cleared by Stop before it signals anything.
+	// exists to produce. Cleared by Stop before it signals anything.
 	supervising bool
 	token       string
+	// reapers counts the live per-component reaper goroutines so Stop can return
+	// only once every one of them has taken its supervision decision. Without it
+	// Stop could return, and the process exit, while a reaper was still inside
+	// OnComponentExit.
+	reapers sync.WaitGroup
 }
 
 // NewSupervised returns a Supervised executor for cfg, filling defaults.
@@ -365,6 +386,21 @@ const componentReadyTimeout = 30 * time.Second
 // first namespace bootstrap, which reads as a bootstrap defect and not as a dead
 // KCM. Waiting on the listener each one owns puts the error back where the fault
 // is, with that component's name and log tail.
+// markSupervised promotes one component from "coming up" to "supervised": from
+// here its own death is a crash for OnComponentExit to report, not a bring-up
+// failure awaitHealthy is already reporting.
+//
+// Called immediately after THAT component's own readiness gate, which is what
+// closes the window a single end-of-bring-up flip leaves open: kine → apiserver
+// → scheduler → controller-manager are awaited in sequence, so a scheduler that
+// dies after its own port opens, while the controller-manager is still coming
+// up, would otherwise be dropped.
+func (s *Supervised) markSupervised(c *component) {
+	s.mu.Lock()
+	c.supervised = true
+	s.mu.Unlock()
+}
+
 func (s *Supervised) bringUp(ctx context.Context) error {
 	kine, err := s.startKine(ctx)
 	if err != nil {
@@ -373,6 +409,7 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
+	s.markSupervised(kine)
 	// kine is serving, so this pin has now genuinely opened this database — stamp it,
 	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
 	// provision time) is what makes the pre-migration snapshot survive a boot that dies
@@ -388,6 +425,7 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := s.waitHealthz(ctx, api); err != nil {
 		return fmt.Errorf("apiserver not healthy: %w", err)
 	}
+	s.markSupervised(api)
 	if err := s.startAndAwaitListening(ctx, "scheduler", s.startScheduler, s.cfg.SchedulerPort); err != nil {
 		return err
 	}
@@ -419,6 +457,9 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 	if err := awaitHealthy(ctx, c.name, c.exited, c.exitedNow, tcpReady(port), componentReadyTimeout, 300*time.Millisecond, c.exitDetail); err != nil {
 		return fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err)
 	}
+	// This component is up; its own death from here is a crash, reported even
+	// though the components after it are still coming up.
+	s.markSupervised(c)
 	return nil
 }
 
@@ -776,7 +817,9 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	// The single reaper: the only cmd.Wait for this child (stopComponent selects on
 	// exited instead of racing a second Wait). waitErr is written before the close,
 	// so a reader that has observed <-exited reads it race-free.
+	s.reapers.Add(1)
 	go func() {
+		defer s.reapers.Done()
 		c.waitErr = cmd.Wait()
 		close(c.exited)
 		// Nothing watched the control plane after bring-up: the reapers were the
@@ -786,11 +829,20 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 		// plain bool, which fires on process EXIT only — never saw a reason to
 		// restart, and the cluster stayed wedged while the daemon looked healthy.
 		// The reaper already knows; it just had nobody to tell.
+		//
+		// This component's OWN flag decides, not a global one: see markSupervised
+		// for the window a global flip leaves open. supervising is the backstop
+		// for a component bringUp forgot to mark.
 		s.mu.Lock()
-		live := s.supervising
+		live := c.supervised || s.supervising
 		s.mu.Unlock()
 		if live && s.cfg.OnComponentExit != nil {
-			s.cfg.OnComponentExit(c.name, c.waitErr, LogTail(c.logPath, exitLogTailLines))
+			// The tail is REDACTED and byte-capped here, inside the package that
+			// owns the 0600 log, because the consumer logs it to the daemon's
+			// logger and launchd captures that into a world-readable file. The
+			// logPath goes with it so the operator is pointed at the 0600
+			// original rather than left with only the safe extract.
+			s.cfg.OnComponentExit(c.name, c.waitErr, c.logPath, redactedLogTail(c.logPath))
 		}
 	}()
 
@@ -878,6 +930,73 @@ func LogTail(path string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
+// exitLogTailBytes caps the redacted tail handed to OnComponentExit. The line cap
+// alone does not bound it: a control-plane child can emit a single enormous line
+// (a marshalled object, a stack), and this tail is destined for a structured log
+// record, not a file.
+const exitLogTailBytes = 4 << 10
+
+// redactedTokenPlaceholder is what replaces matched credential material. It is a
+// fixed word, never a prefix-preserving mask: showing the first characters of a
+// token is showing part of a token.
+const redactedTokenPlaceholder = "<redacted>"
+
+// The credential shapes a control-plane component's log can carry. spawnEnv opens
+// that log 0600 precisely because of them — in its own words, a component log "can
+// carry bearer tokens and the kine datastore endpoint" — so nothing derived from it
+// may reach a less-protected sink unredacted.
+//
+// pkg/status.Redact is the sibling of this function and covers the same class for
+// the status report. It cannot be reused here: pkg/status imports pkg/executor, so
+// importing it back is a cycle. Hoisting both into a leaf package is the right
+// end state and is left as a follow-up; these patterns cover the component-log
+// shapes (bearer headers, DSN userinfo) that the status patterns do not.
+var (
+	// credentialAssignments matches a key=value or key: value whose KEY names a
+	// credential, with or without a flag prefix — component argv echoed on a
+	// fatal flag error, a structured log field, and a DSN query parameter are all
+	// this shape. It over-redacts (an English sentence ending "token: expired"
+	// loses the word "expired"), which is the safe direction: the operator has
+	// the unredacted 0600 log, whose path travels with the tail.
+	credentialAssignments = regexp.MustCompile(`(?i)((?:--?)?[a-z0-9_.-]*(?:token|password|passwd|secret|credential)[a-z0-9_.-]*)(\s*[=:]\s*)\S+`)
+	// authHeaders matches an HTTP authorization header value by scheme, wherever
+	// it was logged from.
+	authHeaders = regexp.MustCompile(`(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]+`)
+	// dsnUserinfo matches the credentials embedded in a datastore URL, keeping the
+	// scheme and the host: "which Postgres?" is diagnostics, the password is not.
+	dsnUserinfo = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^\s:/@]+(?::[^\s/@]*)?@`)
+	// mintedTokens matches the credential shapes k3sm itself mints — the join
+	// token (`k3sm-<opaque>`) and the CA-pinned bootstrap token (`K10<sha256>::…`)
+	// — on shape rather than on context, because a secret that has reached a log
+	// line has already escaped the argv it came from.
+	mintedTokens = regexp.MustCompile(`k3sm-[A-Za-z0-9._~+/=-]{12,}|K10[0-9a-fA-F]{16,}(?:::\S+)?`)
+)
+
+// redactedLogTail reads the tail of a component's 0600 log and returns it with
+// credential material removed and its size bounded, fit to hand to a consumer
+// that will put it somewhere less protected. The daemon logger is exactly that
+// consumer: launchd captures it into /var/log/k3sm/server.log, which is
+// world-readable on an installed cluster.
+//
+// The full, unredacted log stays at the 0600 path, which is what OnComponentExit
+// receives alongside this — so redaction here can afford to be blunt.
+func redactedLogTail(path string) string {
+	return redactLogTail(LogTail(path, exitLogTailLines))
+}
+
+// redactLogTail is the pure half of redactedLogTail, over already-read text.
+func redactLogTail(tail string) string {
+	tail = credentialAssignments.ReplaceAllString(tail, "${1}${2}"+redactedTokenPlaceholder)
+	tail = authHeaders.ReplaceAllString(tail, "${1}${2}"+redactedTokenPlaceholder)
+	tail = dsnUserinfo.ReplaceAllString(tail, "${1}"+redactedTokenPlaceholder+"@")
+	tail = mintedTokens.ReplaceAllString(tail, redactedTokenPlaceholder)
+	if len(tail) > exitLogTailBytes {
+		// Keep the END: the fatal line is the last one, not the first.
+		tail = "<truncated>" + tail[len(tail)-exitLogTailBytes:]
+	}
+	return tail
+}
+
 // Ready reports whether the apiserver /healthz returns "ok". It probes the
 // apiserver's EFFECTIVE BIND (apiServerURL), not loopback: a mesh server binds its
 // wireguard IP only, so a hardcoded loopback probe would never observe it healthy and
@@ -910,8 +1029,12 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	s.started = false
 	// Cleared HERE, under mu and strictly before any child is signalled, so the
 	// reaper of a child this Stop is about to kill cannot mistake a deliberate
-	// teardown for a crash.
+	// teardown for a crash. Both gates must be cleared: the per-component flags
+	// are the ones the reapers actually read.
 	s.supervising = false
+	for _, c := range comps {
+		c.supervised = false
+	}
 	s.mu.Unlock()
 
 	// Reverse start order = correct shutdown order, but kine (index 0) must die
@@ -920,6 +1043,11 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	for _, c := range shutdownOrder(comps) {
 		s.stopComponent(c)
 	}
+	// Every reaper has closed its exited channel by now (stopComponent waits on
+	// it), but closing is not the last thing a reaper does — it still has its
+	// supervision decision to take and, on a crash, a callback to run. Wait for
+	// them outside mu so Stop does not return while one is still in flight.
+	s.reapers.Wait()
 	return nil
 }
 
@@ -953,7 +1081,20 @@ func (s *Supervised) stopComponent(c *component) {
 	if c == nil || c.cmd == nil || c.cmd.Process == nil {
 		return
 	}
+	// Whether this child was ALREADY gone before the signal, asked before it is
+	// sent. A crashed component has just been reported by name on the crash path;
+	// saying "stopped" for it here logs the same death a second time, and reads
+	// as if teardown were what ended it.
+	alreadyExited := false
+	select {
+	case <-c.exited:
+		alreadyExited = true
+	default:
+	}
+
 	pid := c.cmd.Process.Pid
+	// Signalled even when already exited: the target is the process GROUP, which
+	// can still hold grandchildren the dead component left behind.
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 
 	select {
@@ -964,6 +1105,10 @@ func (s *Supervised) stopComponent(c *component) {
 	}
 	if c.log != nil {
 		_ = c.log.Close()
+	}
+	if alreadyExited {
+		s.cfg.Logger.Debug("control-plane component had already exited before teardown", "component", c.name)
+		return
 	}
 	s.cfg.Logger.Info("stopped control-plane component", "component", c.name)
 }

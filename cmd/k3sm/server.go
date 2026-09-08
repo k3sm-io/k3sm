@@ -245,7 +245,7 @@ func refuseShadowedWorkDir(fsys dataroot.FS, workDir, dataRoot string) error {
 // node in one process, then hosts darwin-net's Service proxy + CoreDNS config +
 // DNS shim and provisions the os=darwin admission policy. It blocks until
 // interrupted, then shuts the control plane down cleanly.
-func runServer(args []string) error {
+func runServer(args []string) (err error) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	opts := serverOptions{}
 	workDirErr := registerServerFlags(fs, &opts)
@@ -448,15 +448,40 @@ func runServer(args []string) error {
 	ctx, crashCancel := context.WithCancel(ctx)
 	defer crashCancel()
 	var crashedComponent atomic.Pointer[string]
-	cfg.OnComponentExit = func(name string, err error, logTail string) {
+	cfg.OnComponentExit = func(name string, exitErr error, logPath, logTail string) {
 		// First writer wins: the components die in a cascade (kine's exit takes
 		// the apiserver with it), and the FIRST one names the actual cause.
 		if crashedComponent.CompareAndSwap(nil, &name) {
-			logger.Error("control-plane component exited after bring-up; shutting down so launchd restarts the daemon",
-				"component", name, "err", err, "log-tail", logTail)
+			// The tail is already redacted and capped by pkg/executor, because
+			// launchd captures this logger into a world-readable
+			// /var/log/k3sm/server.log while the component log is 0600. The path
+			// is logged so the operator knows where the unredacted original is.
+			logger.Error("control-plane component exited; shutting down so launchd restarts the daemon",
+				"component", name, "err", exitErr, "log", logPath, "log-tail", logTail)
 		}
 		crashCancel()
 	}
+	// A crash cancels ctx, and ctx feeds everything below — so the error that
+	// actually reaches the exit line depends on WHERE bring-up had got to, and
+	// most of those errors are a bare "context canceled" that names nothing.
+	// Rewriting it here, once, covers every return path after this point:
+	// exec.Start (a component that crashes while a later one is still coming
+	// up), the RBAC and CRD provisioning in between, and startNode — which
+	// returns nil on a cancelled context, right for a signal but wrong for a
+	// crash, since exiting 0 would tell the operator this was a clean shutdown.
+	// launchd restarts either way (KeepAlive is an unconditional bool), so the
+	// exit status is for the human.
+	defer func() {
+		name := crashedComponent.Load()
+		if name == nil {
+			return
+		}
+		if err == nil {
+			err = fmt.Errorf("control-plane component %q exited; restarting the daemon", *name)
+			return
+		}
+		err = fmt.Errorf("control-plane component %q exited; restarting the daemon: %w", *name, err)
+	}()
 
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
@@ -952,16 +977,8 @@ func runServer(args []string) error {
 
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
-	err = startNode(ctx, nodeOpts)
-	// startNode returns nil on a cancelled context, which is right for a signal
-	// but wrong for a crash: exiting 0 would tell the operator, and the logs,
-	// that this was a clean shutdown. Name the component instead. launchd
-	// restarts either way (KeepAlive is an unconditional bool), so the exit
-	// status is for the human.
-	if name := crashedComponent.Load(); name != nil && err == nil {
-		return fmt.Errorf("control-plane component %q exited; restarting the daemon", *name)
-	}
-	return err
+	// The deferred crash check above names the component on this path too.
+	return startNode(ctx, nodeOpts)
 }
 
 // crdClientFactory builds the apiextensions client a CRD ensure applies through.
