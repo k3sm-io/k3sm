@@ -135,6 +135,13 @@ that. A one-line change with a self-explanatory subject needs no body.
    ```
 5. Address review feedback; keep commits focused and signed off.
 
+**What happens after you open a PR or an issue.** The maintainers' tooling posts a first-pass
+review comment on new pull requests (what it checked, what it could reproduce, what it
+recommends) and a triage comment on new issues. Those comments are advisory: a maintainer reads
+your change and merges it, and a maintainer decides what an issue becomes. If you offer to take
+an issue and the maintainers accept, the offer stays yours for about a week; if no PR references
+the issue by then, it returns to the open queue and you are told so on the issue.
+
 ## Reporting security issues
 
 Do **not** open a public issue for a security vulnerability — see
