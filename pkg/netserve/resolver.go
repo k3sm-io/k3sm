@@ -835,9 +835,9 @@ func parseClusterServiceName(qname, domain string) (svc, ns string, ok bool) {
 // lacks the two service labels. qname must already be normalized.
 //
 // It returns the extra-label COUNT rather than the labels themselves because a
-// count is all either caller has ever consumed: respond branches on
-// `extraLabels == 0` (resolver.go:404) and parseClusterServiceName rejects
-// `!= 0`. Returning the slice cost a strings.Split allocation on every query
+// count is all any caller has ever consumed — respond branches on
+// `extraLabels == 0` and nothing reads the labels themselves anywhere in the
+// tree. Returning the slice cost a strings.Split allocation on every query
 // whose only reader was len() — measured at 14% of the allocations on the
 // hottest path in k3sm (BenchmarkRespondClusterA, alloc_objects profile).
 // Walking by index answers the same question without allocating.
