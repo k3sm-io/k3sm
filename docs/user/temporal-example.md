@@ -9,7 +9,7 @@ That combination is the point of this example. The **server** is a Linux system 
 and the **client** is the native macOS `temporal` binary from Homebrew, talking to it over a Service.
 
 > **Requirements:** Apple Silicon, macOS 26+, a running k3sm cluster ([quickstart.md](quickstart.md)),
-> a node that advertises `k3sm.io/virtualization`, and network access to pull images from Docker Hub.
+> a node that advertises `k3sm.io/virtualization`, and network access to pull images from a public OCI registry.
 >
 > The `vm` RuntimeClass runs unmodified `linux/arm64` images in a per-Pod micro-VM. Read
 > [vm-runtimeclass.md](vm-runtimeclass.md) and [limitations.md](limitations.md) for what it supports

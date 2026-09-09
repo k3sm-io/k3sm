@@ -106,8 +106,8 @@ Today at `main`, per port class:
 - **NodePort** — bound to the **wildcard** `*:30000-32767` in-process. Every interface on the Mac
   answers, including `127.0.0.1` and your LAN address. This has always been the case; it is what
   NodePort means upstream.
-- **LoadBalancer / Ingress** — bound to the **wildcard** `*:<port>`, matching Docker Desktop and k3s,
-  which both publish LoadBalancer ports on all interfaces.
+- **LoadBalancer / Ingress** — bound to the **wildcard** `*:<port>`, matching k3s and the desktop
+  container tools, which publish LoadBalancer ports on all interfaces.
 
   **The bind address and the advertised address are different, on purpose.** Read them separately.
   The **port** is reachable on every interface the Mac has, including its LAN address — so treat a
@@ -116,8 +116,8 @@ Today at `main`, per port class:
   from this Mac, from local pods, and from mesh peers over WireGuard, but **not routable from your
   LAN**. A LAN client has no route to `100.64/10`, so `curl <EXTERNAL-IP>` from your laptop **hangs
   until timeout** rather than failing fast — dial the Mac's own LAN address and the Service port
-  instead. This differs from both analogs: k3s advertises the node's real LAN address, and Docker
-  Desktop advertises the literal hostname `localhost`. If you need a LAN-usable value in
+  instead. This differs from both analogs: k3s advertises the node's real LAN address, and the
+  desktop container tools advertise the literal hostname `localhost`. If you need a LAN-usable value in
   `status.loadBalancer.ingress`, that is not what k3sm publishes today.
 
   If the derived InternalIP cannot be worked out, k3sm advertises **nothing** — the Service stays

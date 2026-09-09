@@ -7,13 +7,13 @@ Short answers. Follow the links for the full story.
 No. k3sm **cannot pass** the CNCF `[Conformance]` / Sonobuoy suite, which assumes Linux containers,
 cgroups, CNI, and network namespaces — k3sm has none of them. See [Limitations](limitations.md).
 
-## Does k3sm Use Docker or a VM?
+## Does k3sm Use a Container Engine or a VM?
 
 No. By default Pods run as **native Darwin processes** — no Linux, no containers, no VM. An optional
 [`vm` RuntimeClass](vm-runtimeclass.md) runs `linux/arm64` Pods in a per-Pod micro-VM to isolate
 untrusted workloads — see [Limitations](limitations.md).
 
-## Can I Run My Existing Docker/OCI Linux Images?
+## Can I Run My Existing OCI Linux Images?
 
 No, on the default path — those carry a Linux userland, and a k3sm Pod there is a Darwin process.
 An unmodified `linux/arm64` image (or a multi-arch image that includes it) runs instead under the

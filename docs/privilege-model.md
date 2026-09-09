@@ -3,9 +3,9 @@
 How k3sm runs without per-command `sudo`: a **one-time admin install** of a tiny root helper
 (`k3sm-netd`) that performs only the irreducibly privileged network operations, with **everything
 else** — the control plane, the Virtual Kubelet node, the runtime daemon, the Service proxy, and your
-Pods — running as a dedicated **unprivileged `_k3sm`** user. This is the pattern Docker Desktop, lima,
-colima and Rancher Desktop all use (`com.docker.vmnetd`, `socket_vmnet`), applied to k3sm. No
-networking fidelity is given up for it.
+Pods — running as a dedicated **unprivileged `_k3sm`** user. This is the pattern the desktop container
+tools and Linux VM managers on macOS all use (a small root-owned vmnet or socket helper beside an
+unprivileged main process), applied to k3sm. No networking fidelity is given up for it.
 
 The architecture behind this page is [DESIGN.md](DESIGN.md) §5b (networking) and §5c (control plane,
 bootstrap, packaging).
@@ -23,8 +23,8 @@ process:
 | bind a `<1024` port on a specific `lo0` VIP | the infra VIPs (`10.43.0.1:443` API, `10.43.0.10:53` DNS) and any `<1024` ClusterIP port | a reserved-port bind on a specific address needs root |
 
 The `com.apple.vm.networking` entitlement that *would* let a user-space `vmnet` client avoid all this
-is **Apple-contract-restricted** — even Docker Desktop cannot obtain it, which is exactly why Docker
-also ships a one-time-admin root helper. **Zero-root-ever is therefore impossible** for those four
+is **Apple-contract-restricted** — the desktop container tools cannot obtain it either, which is
+exactly why they ship a one-time-admin root helper too. **Zero-root-ever is therefore impossible** for those four
 operations. The honest answer is everyone else's answer: do them in a minimal root daemon, installed
 once, and run everything else unprivileged.
 
@@ -164,7 +164,7 @@ Seatbelt-confined. The consequences, stated plainly:
 
 - **A fully zero-admin install.** Impossible on macOS for `lo0`, `utun`, `pf` and `<1024` binds, since
   the entitlement that would avoid them is Apple-restricted. The one-time admin step is unavoidable;
-  even Docker needs it.
+  every desktop container tool on macOS needs it.
 - **Per-Pod uid isolation without a VM.** The helper is networking-only by decision; untrusted
   workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md), which does not run yet.
 - **Rootless multi-node without the helper.** The mesh — `utun` and routes — is irreducibly root.

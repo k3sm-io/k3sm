@@ -43,7 +43,7 @@ See [Images](images.md) for both conventions in full.
 
 ## Linux Path
 
-A stock image from Docker Hub — `nginx`, `postgres`, `redis` — carries a Linux userland and expects a
+A stock image from a public OCI registry — `nginx`, `postgres`, `redis` — carries a Linux userland and expects a
 Linux kernel. k3sm gives it one. Add `runtimeClassName: vm` and the image runs in its own Linux
 micro-VM on the same node, under the same Kubernetes semantics:
 
@@ -161,7 +161,7 @@ There is no supply of them. You build them.
 
 That is worth stating plainly, because "k3sm runs OCI images" can otherwise be
 read as "k3sm runs the images you can already `docker pull`". Checked against
-Docker Hub:
+the public registry those images are published on:
 
 | image | platforms published | `darwin`? |
 |---|---|---|

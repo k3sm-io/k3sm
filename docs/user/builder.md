@@ -210,8 +210,8 @@ through that same credential, and the store recording is already done.
 - **buildx is a separate tool.** k3sm bundles the pieces it builds; `buildx`
   itself is the upstream release, pinned by version and checksum.
 - **The bundled buildx runs with a k3sm-owned `HOME`,** so it cannot mistake a
-  Docker Desktop install for the build backend and end every build with a
-  `docker-desktop://` link. Your registry credentials are unaffected — k3sm
+  desktop container tool's install for the build backend and end every build
+  with that tool's deep link. Your registry credentials are unaffected — k3sm
   points `DOCKER_CONFIG` at the same config directory buildx would have used —
   but a flag that reads something else out of your home directory (`--cache-to
   type=s3`, which resolves `~/.aws`) needs that tool's own environment variable
