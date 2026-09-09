@@ -96,6 +96,13 @@ const (
 	egressAnnotationBindingName = "k3sm-warn-pod-hand-set-internet-egress-binding"
 )
 
+// xcodeToolchainAnnotationPolicyName / xcodeToolchainAnnotationBindingName name the
+// Warn policy that surfaces a pod with a hand-set Xcode-toolchain annotation.
+const (
+	xcodeToolchainAnnotationPolicyName  = "k3sm-warn-pod-hand-set-xcode-toolchain"
+	xcodeToolchainAnnotationBindingName = "k3sm-warn-pod-hand-set-xcode-toolchain-binding"
+)
+
 // operatorManagedByLabelKey / operatorManagedByLabelValue are the discriminator
 // the egress-annotation Warn policy uses to tell an operator-stamped pod from a
 // hand-edited one. They mirror the "app.kubernetes.io/managed-by": "k3sm" entry
@@ -264,8 +271,11 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 }
 
 // egressAnnotationExpr admits (evaluates true) unless a pod carries annotationKey
-// (runtimev1.AnnotationInternetEgress, interpolated by the caller — never a
-// literal here) and is not operator-managed. "Operator-managed" is the
+// (runtimev1.AnnotationInternetEgress or runtimev1.AnnotationXcodeToolchain,
+// interpolated by the caller — never a literal here) and is not operator-managed.
+// It is parameterized by key, and shared by every hand-set-opt-in advisory, so a
+// second opt-in annotation costs a call rather than a second expression to keep
+// in step with this one. "Operator-managed" is the
 // operatorManagedByLabelKey/Value discriminator (see its doc comment for why a
 // label, not an ownerReference, is the usable per-Pod signal).
 //
@@ -311,6 +321,44 @@ func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) er
 		runtimev1.AnnotationInternetEgress)
 	return ensureWarnPolicy(ctx, cs, egressAnnotationPolicyName, egressAnnotationBindingName,
 		egressAnnotationExpr(runtimev1.AnnotationInternetEgress), msg, "pods", admissionregistrationv1.Create)
+}
+
+// EnsureXcodeToolchainAnnotationWarn idempotently provisions a Warn-action
+// ValidatingAdmissionPolicy on Pod create that surfaces a pod carrying a hand-set
+// runtimev1.AnnotationXcodeToolchain annotation — one present on the pod without
+// the operatorManagedByLabelKey/Value discriminator. It is the exact sibling of
+// EnsureEgressAnnotationWarn: same egressAnnotationExpr shape (the CEL is
+// parameterized by annotation key precisely so a second opt-in annotation is one
+// call, not a second hand-written expression), same Warn action, same
+// FailurePolicy Ignore, same create-only scope, and the same reasoning for each.
+//
+// What the annotation does, which is what the message must say: the k3sm provider
+// reads it at translation and sets SandboxProfile.xcode_toolchain_dir to the
+// NODE's developer directory (`xcode-select -p`), widening the pod's Seatbelt
+// profile with READ access to that toolchain — the compilers, linker, and SDKs a
+// build workload needs. The pod cannot name the directory; it can only ask for
+// the node's. Like its egress sibling it is meant to be stamped by a controller
+// acting on the pod's behalf rather than typed in by hand, and hand-setting it
+// still works.
+//
+// Advisory only — never Deny, and FailurePolicy Ignore (load-bearing: this guard
+// must never take the cluster down). The warning is not a claim that a boundary
+// was bypassed: the grant is read-only and path-minimal, and every pod on the node
+// already runs as the same uid, so the annotation widens what a pod can READ, not
+// who it is.
+//
+// Create only, for the same reason as its siblings: matching update too would
+// re-fire on every unrelated pod status patch. Safe to call on every server start
+// (create-or-update; an unchanged spec is not rewritten).
+func EnsureXcodeToolchainAnnotationWarn(ctx context.Context, cs kubernetes.Interface) error {
+	msg := fmt.Sprintf("k3sm: pod carries a hand-set %s annotation, which opts its sandbox into read "+
+		"access to this node's developer toolchain (SandboxProfile.xcode_toolchain_dir, rooted at the "+
+		"node's `xcode-select -p`: the compilers, linker, and SDKs — xcodebuild is not covered). It is "+
+		"meant to be stamped by a controller acting on the pod's behalf, not set by hand — hand-setting "+
+		"it still works, but is discouraged plumbing.",
+		runtimev1.AnnotationXcodeToolchain)
+	return ensureWarnPolicy(ctx, cs, xcodeToolchainAnnotationPolicyName, xcodeToolchainAnnotationBindingName,
+		egressAnnotationExpr(runtimev1.AnnotationXcodeToolchain), msg, "pods", admissionregistrationv1.Create)
 }
 
 // darwinSelectorExpr is the CEL the policy enforces on Pod create: the pod must

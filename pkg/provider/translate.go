@@ -279,6 +279,35 @@ func applyGPUAndEgress(profile *runtimev1.SandboxProfile, pod *corev1.Pod) {
 	}
 }
 
+// podRequestsXcodeToolchain reports whether the pod carries the
+// runtimev1.AnnotationXcodeToolchain annotation (k3sm.io/xcode-toolchain), by
+// presence, not a parsed boolean — the same contract as
+// podRequestsInternetEgress above, and for the same reason: the annotation is
+// operator-stamped plumbing under the single-trust-domain model, so any value on
+// the key opts the pod in and a hand-set use is surfaced by the Warn admission
+// policy (pkg/policy.EnsureXcodeToolchainAnnotationWarn), never rejected here.
+func podRequestsXcodeToolchain(pod *corev1.Pod) bool {
+	_, ok := pod.Annotations[runtimev1.AnnotationXcodeToolchain]
+	return ok
+}
+
+// applyXcodeToolchain sets SandboxProfile.XcodeToolchainDir to developerDir when
+// the pod requests the node's developer toolchain, and leaves it empty
+// otherwise. The sibling of applyGPUAndEgress on the opt-in axis, kept separate
+// because its grant needs a NODE fact the pure pod translation does not carry:
+// developerDir is the node's `xcode-select -p`, resolved once at provider
+// construction (resolveDeveloperDir) and threaded in by the caller.
+//
+// An empty developerDir on a requesting pod is not an error: the node has no
+// toolchain, the field stays empty, and the profile grants nothing — the same
+// outcome as not asking. The daemon already warned about the absence at
+// construction, which is the one place it can be explained.
+func applyXcodeToolchain(profile *runtimev1.SandboxProfile, pod *corev1.Pod, developerDir string) {
+	if podRequestsXcodeToolchain(pod) {
+		profile.XcodeToolchainDir = developerDir
+	}
+}
+
 // injectClusterDNSEnv appends the K3SM_DNS_* environment the DYLD getaddrinfo shim
 // reads (serialized by the single pinned dns.ConfigToEnv encoder, never
 // hand-rolled here — a wrong separator would break in-pod cluster DNS) to every
