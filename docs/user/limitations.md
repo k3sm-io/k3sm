@@ -54,6 +54,38 @@ Pods run as **uid 0**. They are still Seatbelt-confined, and no installed cluste
 (the LaunchDaemon runs as `_k3sm`), but `--datapath` is a disposable dev tier: do not run untrusted
 workloads on it. `k3sm dev up --datapath` says the same thing in its banner.
 
+### Keychain Reads Return Nothing, and Report Success
+
+A Pod reaching the keychain gets an **empty result with a zero exit status**, not an error. The
+`security` command talks to the keychain over the `com.apple.SecurityServer` mach service, which the
+default-deny Seatbelt profile does not grant, and the framework treats the unreachable service as an
+empty search rather than a failure. On a host whose System keychain holds certificates, asking
+`security` to list every certificate in it prints them outside a Pod and prints nothing inside one;
+both exit `0`. A workload that branches on "did I find a certificate" therefore takes the wrong
+branch silently.
+
+Anything built on the keychain inherits this. **Notarization** is out on three counts at once: the
+`notarytool` binary lives inside the Xcode application bundle, which the profile does not read; its
+stored credentials live in the keychain; and it needs outbound network, which a Pod is denied unless
+it carries the `k3sm.io/internet-egress` annotation. Signing with a Developer ID identity has the
+same keychain dependency. Sign and notarize on the host: a `vm` Pod runs Linux, so it cannot run
+this tooling either.
+
+### The Compiler Toolchain Needs a Temp Directory It Cannot Reach
+
+`clang`, `swiftc`, and `codesign` fail inside a Pod under the default profile. The cause is one
+directory: Apple's toolchain resolves its scratch and module-cache locations through
+`confstr(_CS_DARWIN_USER_TEMP_DIR)` and `_CS_DARWIN_USER_CACHE_DIR`, which always name a path under
+`/var/folders` and **ignore `TMPDIR`**. k3sm gives every Pod a writable temp directory inside its own
+data volume and points `TMPDIR` at it, but that is not the location the toolchain asks the platform
+for, and the profile does not grant `/var/folders`. The two failure shapes differ: `xcrun`-shimmed
+tools report `couldn't create cache file … Operation not permitted`, and the toolchain binaries
+invoked directly exit non-zero and print nothing at all.
+
+Build Mac binaries on the host. A `vm` Pod runs Linux, so it builds Linux binaries, not Mac ones.
+What a native Pod runs is the **already-built** binary, and that path reaches CoreML inference,
+Metal, and MLX serving directly.
+
 ### Volume Mounts Resolve for Native Workloads, Not `/bin/sh`
 
 k3sm pods run at real host paths with **no chroot / mount namespace**, so a volume mounted at an

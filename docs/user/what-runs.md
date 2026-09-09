@@ -3,7 +3,7 @@
 k3sm runs OCI images two ways, and you pick per Pod:
 
 - **`darwin/arm64` images run as native Mac processes.** This is the default and the fastest path:
-  no VM, no kernel to boot, and access to Metal, CoreML and `codesign`.
+  no VM, no kernel to boot, and access to Metal and CoreML.
 - **`linux/arm64` images run in a Linux micro-VM.** One line in the Pod spec —
   `runtimeClassName: vm` — and an ordinary Linux image runs, unmodified. Any multi-arch image with
   an `arm64` variant qualifies, which is most published images, on a single node.
@@ -181,8 +181,8 @@ image, and that is what `runtimeClassName: vm` is for.
 
 ## Summary
 
-The default path runs **Mac-native workloads** — including ones that need Metal, CoreML or
-`codesign`, which no Linux VM can give you — with Kubernetes semantics and the OCI toolchain around
+The default path runs **Mac-native workloads** — including ones that need Metal or CoreML,
+which no Linux VM can give you — with Kubernetes semantics and the OCI toolchain around
 them. Unmodified **`linux/arm64` images run** on the same cluster, one `runtimeClassName: vm` line
 away, at the cost of a VM per Pod — and most published images carry an `arm64` variant. `amd64`
 payloads run on no path today; if that is your workload, [Limitations](limitations.md) has the full
