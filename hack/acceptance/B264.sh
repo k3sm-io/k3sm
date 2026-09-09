@@ -22,7 +22,12 @@
 #   B264.2  xcodebuild -version        inside the pod
 #   B264.3  the toolchain grant itself, TWO checks, both under this rung:
 #             (a) swiftc -sdk $SDKROOT compiles a one-file program in the pod's data volume and the
-#                 built binary runs — the compiler, linker and SDK reached from the pod;
+#                 built binary runs — the compiler, linker and SDK reached from the pod. It passes
+#                 NO -module-cache-path and sets no cache env: Swift always writes a clang module
+#                 cache, the toolchain resolves that path through confstr (which ignores TMPDIR),
+#                 and the pod profile denies the shared /var/folders tree it names. runtimed
+#                 injects a per-pod CLANG_MODULE_CACHE_PATH instead, so this rung is also the
+#                 test that the injection is present and working;
 #             (b) swift build (SwiftPM) builds the same file as a package and the built binary runs.
 #                 SwiftPM nests its OWN sandbox around the manifest, which cannot apply inside the
 #                 pod's, so the workload passes --disable-sandbox — the documented workload-side
@@ -122,8 +127,12 @@ DEVELOPER_DIR_HOST="$(xcode-select -p)"
 # creation fails for a reason that has nothing to do with the toolchain grant under test.
 kn create configmap b264-script --from-literal=run.sh='set -u
 export HOME="$PWD" TMPDIR="$PWD/tmp"
-mkdir tmp; mkdir tmp/mc
-export CLANG_MODULE_CACHE_PATH="$PWD/tmp/mc"
+mkdir tmp
+# CLANG_MODULE_CACHE_PATH is DELIBERATELY not set here. runtimed injects it, per
+# pod, alongside TMPDIR; a gate that set it itself would compensate for the very
+# default it is meant to test, and that is exactly how the missing grant survived
+# an earlier ablation. If the daemon stops injecting it, the compile rungs below
+# must go red.
 export DEVELOPER_DIR="${B264_DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 export SDKROOT="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 TC="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin"
@@ -135,7 +144,8 @@ echo "print(\"hello from a pod\")" > hello/Sources/hello/main.swift
 r xcrun /usr/bin/xcrun --version
 r xcrun-find /usr/bin/xcrun --find swift
 r xcodebuild-version /usr/bin/xcodebuild -version
-r swiftc "$TC/swiftc" -sdk "$SDKROOT" -module-cache-path tmp/mc -o hello/one hello/Sources/hello/main.swift
+echo "B264 module-cache-env=${CLANG_MODULE_CACHE_PATH:-<unset>}"
+r swiftc "$TC/swiftc" -sdk "$SDKROOT" -o hello/one hello/Sources/hello/main.swift
 if [ -x hello/one ]; then r run-one hello/one; said run-one; else echo "B264 step=run-one exit=127"; fi
 SPMFLAGS="--package-path hello --scratch-path hello/.build --cache-path tmp/spm-cache --config-path tmp/spm-config --security-path tmp/spm-sec --disable-sandbox"
 r spm-build "$TC/swift" build $SPMFLAGS
@@ -189,12 +199,21 @@ e="$(step_exit xcrun)"; f="$(printf '%s\n' "$LOGS" | sed -n '/^B264 step=xcrun-f
 if [ "$e" = 0 ] && printf '%s' "$f" | grep -q "^$DEVELOPER_DIR_HOST"; then rung 1 PASS "xcrun --version exit 0 and xcrun --find swift resolves under $DEVELOPER_DIR_HOST"; elif [ "$e" = 0 ]; then rung 1 FAIL "xcrun --version exit 0 but xcrun --find swift resolved to '${f:-nothing}', not under the Xcode developer dir (the pod is reaching the Command Line Tools, not Xcode)"; else rung 1 FAIL "xcrun --version exit ${e:-none} (pod phase ${phase:-?})"; fi
 e="$(step_exit xcodebuild-version)"; if [ "$e" = 0 ]; then rung 2 PASS "xcodebuild -version exit 0"; else rung 2 FAIL "xcodebuild -version exit ${e:-none}"; fi
 
-# B264.3 (a) — the compiler, linker and SDK, driven directly.
+# B264.3 (a) — the compiler, linker and SDK, driven directly, with NO module-cache
+# flag or env of the gate's own. Swift always writes a clang module cache, and the
+# toolchain resolves that path through confstr, which ignores TMPDIR — so this rung
+# fails unless runtimed injected a per-pod CLANG_MODULE_CACHE_PATH. The injected
+# value is reported either way, because "unset" and "set but denied" are different
+# bugs and the exit code alone cannot tell them apart.
+MCENV="$(printf '%s\n' "$LOGS" | sed -n 's/^B264 module-cache-env=//p' | tail -1)"
+note "pod CLANG_MODULE_CACHE_PATH=${MCENV:-<no line>}"
 e="$(step_exit swiftc)"; e2="$(step_exit run-one)"; said="$(step_said run-one)"
 if [ "$e" = 0 ] && [ "$e2" = 0 ] && [ "$said" = "hello from a pod" ]; then
-	rung 3 PASS "swiftc -sdk built a one-file program in the data volume and it printed \"hello from a pod\""
+	rung 3 PASS "swiftc -sdk built a one-file program in the data volume and it printed \"hello from a pod\" (module cache: ${MCENV:-<unset>})"
+elif [ -z "$MCENV" ] || [ "$MCENV" = "<unset>" ]; then
+	rung 3 FAIL "swiftc exit ${e:-none}: the pod carried NO CLANG_MODULE_CACHE_PATH, so the toolchain wrote to the confstr user-cache dir the profile denies — the daemon is not injecting a per-pod module cache"
 else
-	rung 3 FAIL "swiftc exit ${e:-none}, built binary exit ${e2:-none}, output '${said}' (want 'hello from a pod')"
+	rung 3 FAIL "swiftc exit ${e:-none}, built binary exit ${e2:-none}, output '${said}' (want 'hello from a pod'); module cache was ${MCENV}"
 fi
 # B264.3 (b) — the same file through SwiftPM. --disable-sandbox is the workload's own setting:
 # SwiftPM wraps the manifest in a NESTED sandbox that cannot be applied inside the pod's.
