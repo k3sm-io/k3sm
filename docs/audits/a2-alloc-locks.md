@@ -29,6 +29,16 @@ byte-scaling paths — see [benchmark-baselines.md](benchmark-baselines.md).
 | 1 | `writeTar` allocated a copy buffer per tar entry; for files <32 KiB the buffer equalled the file, so discarded buffer volume tracked total context BYTES (ceiling ~2 GiB) | CONFIRMED (measured) | −89.5% bytes small-file, −97.5% large-file | `ab9f277` |
 | 2 | `writeParents` split-and-joined every ancestor of every entry, with the `seen` test *after* the Join | CONFIRMED (measured) | −52% allocs on a depth-10 tree | `ab9f277` |
 | 3 | `parseClusterZoneName` returned a `[]string` whose only consumer, at both call sites, was `len()` | CONFIRMED (measured) | −1 alloc on every in-cluster DNS query | `ab9f277` |
+| 4 | `splice` allocated a 32 KiB copy buffer per direction per connection — both stdlib zero-copy paths are inert on darwin, so `io.Copy` fell through to `make([]byte, 32*1024)` | CONFIRMED (measured) | −94.5% bytes per spliced connection | `8df0b35` |
+
+Finding 4 carries a trap worth recording: `io.copyBuffer` tests
+`src.(io.WriterTo)` and `dst.(io.ReaderFrom)` **before** it looks at the buffer
+it was given, and a `*net.TCPConn` satisfies both — so the naive
+`io.CopyBuffer(dst, src, buf)` silently discards the buffer and is a complete
+no-op that still compiles and still copies bytes correctly. The fix has to
+shadow both interfaces. Its allocation test was verified against that exact
+mutant in both plain and `-race` modes, because the fidelity test **passes**
+against it: behavioural tests cannot see this regression.
 
 Each carries a regression test **verified to fail against the unfixed code**.
 Where the change is behaviour-preserving rather than behaviour-changing, the test
