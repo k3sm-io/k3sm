@@ -395,7 +395,7 @@ that variant normally.
 ### `vm` Pods: Storage — PVCs Work; `fsGroup` and a Foreign uid Do Not
 
 PVC-backed storage works on the `vm` path and is host-visible: what the guest writes lands on the host
-filesystem, readable from Finder or `sudo`, same as native pod storage. Two ceilings go with that,
+filesystem, readable from Finder or `sudo`, same as native pod storage. Three ceilings go with that,
 and one of them is now measured rather than assumed:
 
 - **Guest writes land host-side as the pod's own OS identity, and mode bits govern readability** — a

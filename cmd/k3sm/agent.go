@@ -65,7 +65,7 @@ type agentOptions struct {
 	apiPort   int
 	meshPort  int
 	network   string // host-network backend: auto (default) | none | direct | helper
-	clusterIP string // DNS VIP the per-node resolver binds + pods resolve against
+	clusterIP string // DNS VIP the per-node resolver serves on + pods resolve against
 	domain    string // cluster DNS domain
 }
 
@@ -86,7 +86,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.IntVar(&opts.apiPort, "api-port", 6444, "apiserver secure port to dial on the control plane (the HOST is not this flag: it comes from the apiserver endpoint the join advertises — the server's mesh IP — falling back to --server)")
 	fs.IntVar(&opts.meshPort, "mesh-port", mesh.DefaultListenPort, "UDP port this node's wireguard listens on")
 	fs.StringVar(&opts.network, "network", hostnet.NetworkAuto, "host-network backend: auto (root→direct, unprivileged→netd helper +probe) | none (no mesh datapath/probe) | direct (force utun, root) | helper (force netd helper)")
-	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver binds and pods resolve against")
+	fs.StringVar(&opts.clusterIP, "dns-vip", "10.43.0.10", "cluster DNS VIP the per-node resolver serves on and pods resolve against")
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 }
 
