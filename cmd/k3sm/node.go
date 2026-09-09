@@ -1148,8 +1148,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		resolverVIP = dns.DefaultDNSVIP
 	}
 	// Cluster DNS domain the in-pod shim search list is built from. PREFER the
-	// threaded --cluster-domain (the SAME value the per-node resolver's CoreDNS
-	// serves) so a custom domain's unqualified Service lookups are not NXDOMAIN;
+	// threaded --cluster-domain (the SAME value the per-node resolver serves) so
+	// a custom domain's unqualified Service lookups are not NXDOMAIN;
 	// fall back to the canonical default only when unset.
 	clusterDomain := opts.domain
 	if clusterDomain == "" {

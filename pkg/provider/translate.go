@@ -212,7 +212,7 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 		return nil, err
 	}
 	// data_volume_path is the only path the pod may write; default-deny otherwise.
-	// allow_network is true so the pod can reach the Service proxy + CoreDNS VIP
+	// allow_network is true so the pod can reach the Service proxy + cluster DNS VIP
 	// (runtime scopes it to the pod IP).
 	box.SandboxProfile = &runtimev1.SandboxProfile{
 		Backend:        backend,
