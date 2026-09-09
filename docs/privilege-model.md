@@ -126,6 +126,13 @@ Seatbelt-confined. The consequences, stated plainly:
   trust domain ([DESIGN.md](DESIGN.md) §3).
 - If the runtime's Seatbelt capability probe ever fails, the runtime degrades to **`vm` or
   refuse-to-run** — never to "run the Pod unconfined."
+- **Signalling the control plane.** The control-plane children run under the same `_k3sm` uid as
+  native Pods, and a component's death now takes the whole server down for a launchd restart — so the
+  shared uid is also a *liveness* surface, not only a confidentiality one. A **Seatbelt-confined Pod
+  cannot reach it**: every generated profile begins `(deny default)` and no profile grants a `signal`
+  stanza. The residual is any **non-sandboxed process already running as `_k3sm`**, which is the same
+  one-trust-domain limitation this section names — it can restart the node's control plane, though not
+  escalate beyond the uid it already holds.
 
 ## Install, run, upgrade, uninstall
 

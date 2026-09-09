@@ -189,6 +189,28 @@ type Config struct {
 	// system:kube-scheduler / system:kube-controller-manager bootstrap RBAC, which binds
 	// the components' OWN per-component identities — no pkg/rbac object is needed.
 	LeaderElect *bool
+	// OnComponentExit, when non-nil, is called from a component's reaper goroutine
+	// when that component exits after passing ITS OWN readiness gate — i.e. it
+	// crashed. It is never called for a bring-up failure of that same component
+	// (supervisedBringUp reports those, with the name and log tail) nor for a
+	// component Stop deliberately killed. A component that has come up DOES fire
+	// while later components are still coming up: that window is a real crash
+	// window, not a bring-up failure (see Supervised.markSupervised).
+	//
+	// It receives the component name, cmd.Wait's error, the path of that
+	// component's 0600 log, and a REDACTED, byte-capped tail of it. The tail is
+	// safe for a less-protected sink — a daemon logger launchd captures into a
+	// world-readable file — and the path is where the operator gets the
+	// unredacted original. Do not read the log yourself to "improve" the tail:
+	// that is what the redaction is for.
+	//
+	// It runs ON the reaper goroutine, so it must return promptly and MUST NOT
+	// call Stop — Stop tears down the remaining components and would run
+	// concurrently with the caller's own deferred Stop, and it waits for the
+	// reapers, so calling it from one deadlocks. The intended implementation
+	// cancels the server's root context and returns, which lets the ordinary
+	// shutdown path run every deferred teardown exactly once, in order.
+	OnComponentExit func(name string, err error, logPath, logTail string)
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }

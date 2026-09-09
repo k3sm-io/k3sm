@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -244,7 +245,7 @@ func refuseShadowedWorkDir(fsys dataroot.FS, workDir, dataRoot string) error {
 // node in one process, then hosts darwin-net's Service proxy + per-node DNS resolver +
 // DNS shim and provisions the os=darwin admission policy. It blocks until
 // interrupted, then shuts the control plane down cleanly.
-func runServer(args []string) error {
+func runServer(args []string) (err error) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	opts := serverOptions{}
 	workDirErr := registerServerFlags(fs, &opts)
@@ -428,6 +429,59 @@ func runServer(args []string) error {
 	if err := ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
 		return err
 	}
+
+	// A control-plane child that dies after bring-up must take this process with
+	// it. Nothing watched them before: the per-component reapers were the only
+	// observers, and their only readers were bring-up and teardown. So a
+	// kube-apiserver, kine, kube-scheduler or kube-controller-manager that died
+	// at hour six left `k3sm server` running, which meant launchd's KeepAlive —
+	// a plain bool, and therefore a restart-on-EXIT policy — never fired. The
+	// cluster was wedged while `k3sm status` still reported the daemon up. That
+	// is worst for the scheduler and the controller-manager, which unlike the
+	// apiserver and kine have no /readyz row: a dead scheduler shows up only as
+	// pods that never leave Pending, and a dead KCM never shows up at all.
+	//
+	// Exiting is the k3s-faithful minimum and the smallest correct move.
+	// Respawning the child in-process is the larger one and is deliberately not
+	// taken here: every in-process client still holds a connection to the old
+	// apiserver, so a respawn would leave the node talking to a corpse.
+	ctx, crashCancel := context.WithCancel(ctx)
+	defer crashCancel()
+	var crashedComponent atomic.Pointer[string]
+	cfg.OnComponentExit = func(name string, exitErr error, logPath, logTail string) {
+		// First writer wins: the components die in a cascade (kine's exit takes
+		// the apiserver with it), and the FIRST one names the actual cause.
+		if crashedComponent.CompareAndSwap(nil, &name) {
+			// The tail is already redacted and capped by pkg/executor, because
+			// launchd captures this logger into a world-readable
+			// /var/log/k3sm/server.log while the component log is 0600. The path
+			// is logged so the operator knows where the unredacted original is.
+			logger.Error("control-plane component exited; shutting down so launchd restarts the daemon",
+				"component", name, "err", exitErr, "log", logPath, "log-tail", logTail)
+		}
+		crashCancel()
+	}
+	// A crash cancels ctx, and ctx feeds everything below — so the error that
+	// actually reaches the exit line depends on WHERE bring-up had got to, and
+	// most of those errors are a bare "context canceled" that names nothing.
+	// Rewriting it here, once, covers every return path after this point:
+	// exec.Start (a component that crashes while a later one is still coming
+	// up), the RBAC and CRD provisioning in between, and startNode — which
+	// returns nil on a cancelled context, right for a signal but wrong for a
+	// crash, since exiting 0 would tell the operator this was a clean shutdown.
+	// launchd restarts either way (KeepAlive is an unconditional bool), so the
+	// exit status is for the human.
+	defer func() {
+		name := crashedComponent.Load()
+		if name == nil {
+			return
+		}
+		if err == nil {
+			err = fmt.Errorf("control-plane component %q exited; restarting the daemon", *name)
+			return
+		}
+		err = fmt.Errorf("control-plane component %q exited; restarting the daemon: %w", *name, err)
+	}()
 
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
@@ -923,6 +977,7 @@ func runServer(args []string) error {
 
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
+	// The deferred crash check above names the component on this path too.
 	return startNode(ctx, nodeOpts)
 }
 

@@ -24,15 +24,36 @@ import (
 	"testing"
 )
 
-// stubBootPhases replaces Start's two boot phases for the duration of the test,
-// so the concurrency below is exercised without spawning kine or an apiserver.
-// provision runs the caller's fn; bringUp is a no-op success.
-func stubBootPhases(t *testing.T, provision func(*Supervised, context.Context) error) {
+// stubPhases replaces BOTH of Start's boot phase seams for the duration of the
+// test and restores them afterwards, so a test exercises Start without spawning
+// kine or an apiserver. A nil fn is a no-op success.
+//
+// stubBootPhases and stubBoot are the two useful halves of it: this repo's tests
+// stub one phase and want the other inert.
+func stubPhases(t *testing.T, provision, bringUp func(*Supervised, context.Context) error) {
 	t.Helper()
 	origProvision, origBringUp := supervisedProvision, supervisedBringUp
 	t.Cleanup(func() { supervisedProvision, supervisedBringUp = origProvision, origBringUp })
-	supervisedProvision = provision
-	supervisedBringUp = func(*Supervised, context.Context) error { return nil }
+	noop := func(*Supervised, context.Context) error { return nil }
+	if provision == nil {
+		provision = noop
+	}
+	if bringUp == nil {
+		bringUp = noop
+	}
+	supervisedProvision, supervisedBringUp = provision, bringUp
+}
+
+// stubBootPhases stubs the PROVISION phase with fn; bring-up is a no-op success.
+func stubBootPhases(t *testing.T, provision func(*Supervised, context.Context) error) {
+	t.Helper()
+	stubPhases(t, provision, nil)
+}
+
+// stubBoot stubs the BRING-UP phase with fn; provisioning is a no-op success.
+func stubBoot(t *testing.T, bringUp func(*Supervised, context.Context) error) {
+	t.Helper()
+	stubPhases(t, nil, bringUp)
 }
 
 // TestStartClaimsTheBootExactlyOnce pins the check-and-set that keeps two
