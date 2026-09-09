@@ -18,6 +18,7 @@ package oci
 
 import (
 	"archive/tar"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -80,14 +81,21 @@ func TestWriteTarAllocationDoesNotScaleWithFileSize(t *testing.T) {
 }
 
 // TestWriteParentsMatchesSplitJoinSemantics is the equivalence check for
-// replacing strings.Split + strings.Join with prefix slicing. The two must agree
-// on the exact SET and ORDER of directory entries emitted, because those headers
-// are part of the digested tar bytes — a divergence would silently change every
-// layer digest, and the golden-digest test only covers the one fixture it builds.
+// replacing strings.Split + strings.Join with prefix slicing.
+//
+// It compares the RAW TAR BYTES, not the header names, because the bytes are
+// what gets hashed into the layer digest — and the parent headers carry Mode,
+// Uid, Gid, ModTime and Format as well as Name. An earlier version of this test
+// compared names only, against an oracle that omitted Uid/Gid/ModTime; it would
+// have passed while any of those fields changed underneath it. Comparing the
+// serialized bytes makes the test pin what it claims to pin.
+//
+// The oracle below is the pre-optimisation body with a header literal kept
+// byte-identical to production's, so a divergence in either the dir sequence or
+// the header fields fails here.
 func TestWriteParentsMatchesSplitJoinSemantics(t *testing.T) {
 	t.Parallel()
 
-	// reference is the pre-optimisation body, kept verbatim as the oracle.
 	reference := func(tw *tar.Writer, name string, seen map[string]bool) error {
 		parts := strings.Split(name, "/")
 		for i := 1; i < len(parts); i++ {
@@ -97,9 +105,12 @@ func TestWriteParentsMatchesSplitJoinSemantics(t *testing.T) {
 			}
 			seen[dir] = true
 			if err := tw.WriteHeader(&tar.Header{
-				Typeflag: tar.TypeDir,
 				Name:     dir + "/",
-				Mode:     0o755,
+				Typeflag: tar.TypeDir,
+				Mode:     modeDir,
+				Uid:      entryUID,
+				Gid:      entryGID,
+				ModTime:  epoch,
 				Format:   tar.FormatPAX,
 			}); err != nil {
 				return err
@@ -108,44 +119,64 @@ func TestWriteParentsMatchesSplitJoinSemantics(t *testing.T) {
 		return nil
 	}
 
-	// Names chosen to cover: plain nesting, repeated ancestors (the seen-hit
-	// path), single labels with no separator, leading slash, doubled slash, and
-	// deep repetition.
+	// Corpus deliberately includes the separator-anomalous shapes that
+	// filepath.Clean makes unreachable in production. They are where a
+	// hand-derived equivalence argument is most likely to be wrong, so they are
+	// exactly what an equivalence test should cover — the two implementations
+	// must agree there too, reachable or not.
 	corpora := [][]string{
 		{"app/main"},
 		{"app/lib/x", "app/lib/y", "app/lib/z"},
 		{"a/b/c/d/e/f/g"},
 		{"solo"},
+		{""},
+		{"/"},
+		{"//"},
+		{"///"},
+		{"a/"},
+		{"/a"},
+		{"a//b"},
+		{"//a"},
+		{"a//"},
 		{"/leading/slash"},
 		{"double//slash/file"},
 		{"app/lib/x", "app/lib/x", "other/lib/x"},
 		{"a/b", "a/b/c", "a/b/c/d"},
 		{"x//", "x/y"},
+		{".", "..", "..."},
+		{"a/./b", "a/../b"},
+		{"é/漢/🙂"},
+		{"\xff/\xc3\x28"}, // invalid UTF-8
+		{strings.Repeat("d/", 60) + "leaf"},
+		{strings.Repeat("/", 16) + "x"},
 	}
 	for i, names := range corpora {
 		t.Run(fmt.Sprintf("corpus%d", i), func(t *testing.T) {
 			t.Parallel()
-			got := collectDirNames(t, names, writeParents)
-			want := collectDirNames(t, names, reference)
-			if len(got) != len(want) {
-				t.Fatalf("names %v: emitted %d dir headers %v, reference emitted %d %v",
-					names, len(got), got, len(want), want)
+			gotBytes, gotSeen := runWriteParents(t, names, writeParents)
+			wantBytes, wantSeen := runWriteParents(t, names, reference)
+			if !bytes.Equal(gotBytes, wantBytes) {
+				t.Errorf("names %v: emitted tar bytes differ from the split/join reference — "+
+					"these bytes are hashed into the layer digest\n got %d bytes\nwant %d bytes",
+					names, len(gotBytes), len(wantBytes))
 			}
-			for j := range want {
-				if got[j] != want[j] {
-					t.Errorf("names %v: dir header %d = %q, reference = %q (order and set must match exactly — these bytes are digested)",
-						names, j, got[j], want[j])
+			if len(gotSeen) != len(wantSeen) {
+				t.Errorf("names %v: seen map has %d keys, reference has %d", names, len(gotSeen), len(wantSeen))
+			}
+			for k := range wantSeen {
+				if !gotSeen[k] {
+					t.Errorf("names %v: seen map is missing key %q that the reference recorded", names, k)
 				}
 			}
 		})
 	}
 }
 
-// collectDirNames runs a writeParents-shaped function over names and returns the
-// directory entry names it emitted, in order.
-func collectDirNames(t *testing.T, names []string, fn func(*tar.Writer, string, map[string]bool) error) []string {
+// runWriteParents drives a writeParents-shaped function over names and returns
+// the serialized tar bytes plus the resulting seen map.
+func runWriteParents(t *testing.T, names []string, fn func(*tar.Writer, string, map[string]bool) error) ([]byte, map[string]bool) {
 	t.Helper()
-	var sink strings.Builder
+	var sink bytes.Buffer
 	tw := tar.NewWriter(&sink)
 	seen := map[string]bool{}
 	for _, n := range names {
@@ -153,20 +184,10 @@ func collectDirNames(t *testing.T, names []string, fn func(*tar.Writer, string, 
 			t.Fatalf("writeParents(%q): %v", n, err)
 		}
 	}
-	// Bodies are irrelevant; flush headers only.
 	if err := tw.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	tr := tar.NewReader(strings.NewReader(sink.String()))
-	var out []string
-	for {
-		h, err := tr.Next()
-		if err != nil {
-			break
-		}
-		out = append(out, h.Name)
-	}
-	return out
+	return sink.Bytes(), seen
 }
 
 // allocTree materializes n files of the given size and returns their entries.
