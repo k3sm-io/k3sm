@@ -54,7 +54,7 @@ The two-Mac features are being tested on hardware as part of release engineering
   engine inside a `vm`-RuntimeClass micro-VM with a PVC-backed cache; `k3sm build` auto-routes any
   Dockerfile with `RUN` (or another engine-only verb) through it while a COPY-only Dockerfile keeps
   the native fast path, and `k3sm builder buildx` exposes the bundled, pinned buildx directly —
-  install only k3sm, build and run containers with no Docker Desktop. The full loop is a RUN build → OCI export →
+  install only k3sm, build and run containers with no separate container engine. The full loop is a RUN build → OCI export →
   `k3sm image push` → a Pod running the result.
   `linux/arm64` only — `linux/amd64` under guest Rosetta is not wired (see Future, below). The
   buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
