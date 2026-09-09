@@ -147,11 +147,12 @@ func TestRunServerSharesOneMeshEnroller(t *testing.T) {
 
 // TestServerMeshBringUpIsLogAndContinue is M14.2 d7 / R12.
 //
-// Under launchd KeepAlive a fatal error on this path is an unbounded respawn loop
-// on the one process that also hosts the apiserver, kine and the scheduler. A
-// mesh-only defect must never take the control plane down, so the enroll's error
-// is LOGGED — the assertion is the absence of a `return` in its error branch,
-// which is exactly what a well-meaning later edit would add.
+// The repo's one rule for a fault on this process: unsurvivable faults exit (a
+// dead control-plane child does, and the crash-loop breaker bounds the respawns);
+// survivable ones continue. A mesh-only defect is survivable — the apiserver, kine
+// and the scheduler serve without it — so the enroll's error is LOGGED. The
+// assertion is the absence of a `return` in its error branch, which is exactly
+// what a well-meaning later edit would add.
 func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 	fset, body := runServerBody(t)
 	found := false
@@ -173,7 +174,7 @@ func TestServerMeshBringUpIsLogAndContinue(t *testing.T) {
 		found = true
 		ast.Inspect(ifStmt.Body, func(m ast.Node) bool {
 			if ret, ok := m.(*ast.ReturnStmt); ok {
-				t.Errorf("runServer RETURNS at %s when the server mesh bring-up fails; under launchd KeepAlive that is an unbounded respawn loop on the control plane (M14.2 d7 requires log-and-continue)",
+				t.Errorf("runServer RETURNS at %s when the server mesh bring-up fails; a mesh-only defect is survivable and must not take the control plane down (M14.2 d7 requires log-and-continue)",
 					fset.Position(ret.Pos()))
 			}
 			return true

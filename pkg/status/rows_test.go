@@ -82,6 +82,9 @@ type fakeFS struct {
 	tail     map[string][]string
 	tailErr  map[string]error
 	fileMode fs.FileMode
+	// contents / unreadable back ReadFile (the crash-loop record).
+	contents   map[string][]byte
+	unreadable map[string]bool
 }
 
 func (f fakeFS) Stat(path string) (fs.FileInfo, error) {
@@ -99,6 +102,20 @@ func (f fakeFS) ReadTail(path string, _ int) ([]string, error) {
 		return nil, err
 	}
 	return f.tail[path], nil
+}
+
+// ReadFile serves the fake's files map like Stat does; an absent path is
+// os.ErrNotExist so the crash-loop row reads "no record", and a path the fake
+// marks unreadable is EACCES — the plain-user posture against a 0700 work dir.
+func (f fakeFS) ReadFile(path string) ([]byte, error) {
+	if f.unreadable != nil && f.unreadable[path] {
+		return nil, os.ErrPermission
+	}
+	b, ok := f.contents[path]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return b, nil
 }
 
 func (f fakeFS) Readlink(path string) (string, error) {
