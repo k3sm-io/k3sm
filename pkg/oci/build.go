@@ -171,6 +171,9 @@ func Build(req Request) (ggcrv1.Image, error) {
 	cfg.Created = ggcrv1.Time{Time: epoch}
 	cfg.Author = ""
 	cfg.Container = ""
+	// Zeroed deliberately: a build-tool version string in the config would make
+	// the image digest depend on the toolchain that produced it.
+	//lint:ignore SA1019 deliberately zeroing a deprecated field for determinism
 	cfg.DockerVersion = ""
 
 	img, err = mutate.ConfigFile(img, cfg)

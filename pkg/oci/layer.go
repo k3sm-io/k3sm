@@ -191,7 +191,11 @@ func writeTar(w io.Writer, entries []entry) error {
 			ModTime:    epoch,
 			Format:     tar.FormatPAX,
 			PAXRecords: nil,
-			Xattrs:     nil, //nolint:staticcheck // pinned nil: Darwin xattrs (com.apple.quarantine, resource forks) are host state, never image content
+			// Pinned nil: Darwin xattrs (com.apple.quarantine, resource forks) are
+			// host state, never image content. PAXRecords above is the modern
+			// field and is pinned nil for the same reason.
+			//lint:ignore SA1019 deliberate pinned nil; see above
+			Xattrs: nil,
 		}
 		switch {
 		case e.dir:

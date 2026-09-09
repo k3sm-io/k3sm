@@ -43,7 +43,34 @@ fi
 if [ -n "$go_pkgs" ]; then
 	echo "==> [k3sm] go vet";   CGO_ENABLED=$CGO go vet ./...
 	echo "==> [k3sm] go build"; CGO_ENABLED=$CGO go build ./...
-	echo "==> [k3sm] go test";  CGO_ENABLED=$CGO go test ./...   # e2e/ is //go:build e2e — excluded here
+	# -race, because docs/GO-STANDARDS.md promises it three times ("CI runs
+	# -race", "CI adds -race") and this gate did not deliver it. The A1 and A2
+	# audit passes both found races that the gate had let through; both were
+	# caught by running -race by hand, which is exactly the work a gate exists
+	# to stop repeating.
+	echo "==> [k3sm] go test -race"; CGO_ENABLED=$CGO go test -race ./...   # e2e/ is //go:build e2e — excluded here
+
+	# staticcheck, scoped to non-test code with -tests=false.
+	#
+	# The scope is deliberate and worth stating, because an unscoped run is not
+	# gateable today: it reports ~54 findings, 52 of them one mechanical
+	# deprecation (fake.NewSimpleClientset -> fake.NewClientset) in test files,
+	# plus one known false positive (SA4000 at pkg/provider/probe_test.go,
+	# refuted in docs/audits/audit-findings.md — feed() mutates via m.observe(),
+	# so the two operands are different state transitions). Gating on non-test
+	# code is achievable NOW at zero findings; widening it to tests is a separate
+	# mechanical sweep, and gating on something unachievable is how a gate ends
+	# up permanently bypassed.
+	#
+	# Note for anyone adding a suppression: bare staticcheck honours
+	# `//lint:ignore <Check> <reason>` on the PRECEDING line. It does NOT honour
+	# `//nolint:...`, which is golangci-lint's spelling — this repo carried five
+	# of those and every one suppressed nothing.
+	if command -v staticcheck >/dev/null 2>&1; then
+		echo "==> [k3sm] staticcheck (non-test)"; CGO_ENABLED=$CGO staticcheck -tests=false ./...
+	else
+		echo "==> [k3sm] staticcheck SKIPPED — not installed (go install honnef.co/go/tools/cmd/staticcheck@latest)"
+	fi
 	# The integration tier is NOT run here (it needs darwin + a real socket), but
 	# nothing else in this repo COMPILES the `integration` build tag, so the
 	# B116 privilege-premise canary would rot invisibly. Vet it.

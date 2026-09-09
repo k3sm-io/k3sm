@@ -105,7 +105,7 @@ const (
 	// creates the root, and the netd helper when it finds one that has drifted —
 	// and a second literal would let those two answers diverge.
 	DataRootMode fs.FileMode = 0o750
-	DataRootGID              = 20
+	DataRootGID  int         = 20
 	// DefaultRunDir is the runtime run directory under the default data root: the
 	// directory half of every k3sm rendezvous socket (netd.sock, runtimed.sock,
 	// the per-pod vm agent sockets) and of the mesh key dir. It is composed from
