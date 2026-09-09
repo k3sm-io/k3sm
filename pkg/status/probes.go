@@ -46,6 +46,10 @@ type FS interface {
 	Stat(path string) (fs.FileInfo, error)
 	ReadTail(path string, n int) ([]string, error)
 	Readlink(path string) (string, error)
+	// ReadFile reads a whole small file (the crash-loop record). It exists as
+	// its own method so a fake can refuse it the way a 0700 work dir refuses a
+	// plain-user status run.
+	ReadFile(path string) ([]byte, error)
 }
 
 // Kube is the apiserver read surface. It is five methods rather than the usual

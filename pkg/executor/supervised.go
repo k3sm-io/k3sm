@@ -828,7 +828,9 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 		// died at hour six left the parent alive, so launchd's KeepAlive — a
 		// plain bool, which fires on process EXIT only — never saw a reason to
 		// restart, and the cluster stayed wedged while the daemon looked healthy.
-		// The reaper already knows; it just had nobody to tell.
+		// The reaper already knows; it just had nobody to tell. What bounds the
+		// resulting restarts when the fault is persistent is the crash-loop
+		// breaker (crashloop.go, wired by cmd/k3sm): the answer to k3sm#344.
 		//
 		// This component's OWN flag decides, not a global one: see markSupervised
 		// for the window a global flip leaves open. supervising is the backstop

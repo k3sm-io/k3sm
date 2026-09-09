@@ -241,6 +241,7 @@ func (osStatusFS) Readlink(path string) (string, error) { return os.Readlink(pat
 
 // ReadTail reads the last lines of a file.
 func (osStatusFS) ReadTail(path string, lines int) ([]string, error) { return readTail(path, lines) }
+func (osStatusFS) ReadFile(path string) ([]byte, error)              { return os.ReadFile(path) }
 
 // readTail returns the last n lines of path without reading the whole file: it
 // seeks to the last logTailBudget bytes and drops the first (necessarily

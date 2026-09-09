@@ -18,9 +18,11 @@ package status
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -51,6 +53,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	install, installed := c.installRow()
 	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
 	server, serverPID := c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
+	c.crashLoop(&server)
 	apiserver := c.apiserverRow(ctx)
 	serving := apiserver.Severity == SeverityOK
 
@@ -639,4 +642,27 @@ func plural(n int, noun string) string {
 		return fmt.Sprintf("%d %s", n, noun)
 	}
 	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// crashLoop folds the daemon's crash record into the server row (see
+// crashloop.go). The record is read through the FS seam; when the collector has
+// none, or no work dir, the row is left to launchd's verdict.
+func (c Collector) crashLoop(row *Row) {
+	if c.FS == nil || c.Paths.WorkDir == "" {
+		return
+	}
+	path := executor.CrashLoopPath(c.Paths.WorkDir)
+	now := time.Now()
+	if c.Now != nil {
+		now = c.Now()
+	}
+	b, err := c.FS.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	var rec executor.CrashRecord
+	if err == nil {
+		err = json.Unmarshal(b, &rec)
+	}
+	applyCrashLoop(row, ClassifyCrashLoop(rec, err, path, now))
 }

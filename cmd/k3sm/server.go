@@ -63,16 +63,18 @@ import (
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
 type serverOptions struct {
-	workDir  string
-	nodeName string
-	nodeIP   string
-	meshIP   string // wireguard mesh IP; set => multi-node worker-join supervisor
-	podRoot  string
-	rtName   string
-	dnsShim  string
-	pathShim string
-	apiPort  int
-	kinePort int // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
+	workDir string
+	// clearCrashLoop clears the crash-loop record and exits instead of serving.
+	clearCrashLoop bool
+	nodeName       string
+	nodeIP         string
+	meshIP         string // wireguard mesh IP; set => multi-node worker-join supervisor
+	podRoot        string
+	rtName         string
+	dnsShim        string
+	pathShim       string
+	apiPort        int
+	kinePort       int // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
 	// kubeletPort is the port the in-process node serves the kubelet HTTP API
 	// (logs/exec/stats) on. Per-server for the same reason kinePort is: it is a
 	// singleton listener, so two control planes on one Mac cannot both have the
@@ -151,6 +153,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	defaultWorkDir, workDirErr := executor.ResolveWorkDir()
 	fs.StringVar(&opts.workDir, "work-dir", defaultWorkDir, "control-plane state root (binaries, kine DB, certs, kubeconfig); posture-aware default")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
+	fs.BoolVar(&opts.clearCrashLoop, "clear-crashloop", false, "clear the crash-loop record under --work-dir and exit 0 instead of serving; a parked daemon then exits and launchd starts a clean boot")
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
@@ -279,6 +282,22 @@ func runServer(args []string) (err error) {
 	if err := executor.EnsureWorkDirWritable(opts.workDir); err != nil {
 		return err
 	}
+	// The crash-loop circuit breaker (k3sm#344). Every component crash below is
+	// recorded under the work dir; once CrashLoopThreshold of them land inside
+	// CrashLoopWindow the record is tripped and this daemon PARKS instead of
+	// bringing the control plane up — resident and idle, because the server
+	// plist's KeepAlive is a bare `true` and launchd would respawn any exit
+	// straight back into the same failure. The park ends when an operator clears
+	// the record (`k3sm server --clear-crashloop`, or deleting the file) or on a
+	// stop signal. The status row names the marker and the remedy.
+	breaker := newCrashBreaker(opts.workDir, logger)
+	if opts.clearCrashLoop {
+		if err := executor.ClearCrashRecord(breaker.path); err != nil {
+			return fmt.Errorf("clear crash-loop record: %w", err)
+		}
+		logger.Info("crash-loop record cleared; a parked daemon will now restart itself", "path", breaker.path)
+		return nil
+	}
 	// runtimed's on-disk root is the work-dir's parent (so the SBPL Posture.WorkDir
 	// resides under the daemon home and its containment check is active).
 	if opts.podRoot == "" {
@@ -298,6 +317,14 @@ func runServer(args []string) (err error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if rec := breaker.load(); rec.Tripped() {
+		last, _ := rec.Last()
+		logger.Error("crash-loop breaker tripped; parking the control plane until an operator clears the record",
+			"path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
+			"last-component", last.Component, "crashes-in-window", rec.Recent(time.Now()),
+			"clear-with", "k3sm server --clear-crashloop")
+		return parkUntilCleared(ctx, breaker.path, crashLoopPollInterval, logger)
+	}
 
 	if err := mode.Probe(ctx); err != nil {
 		return err
@@ -458,6 +485,10 @@ func runServer(args []string) (err error) {
 			// is logged so the operator knows where the unredacted original is.
 			logger.Error("control-plane component exited; shutting down so launchd restarts the daemon",
 				"component", name, "err", exitErr, "log", logPath, "log-tail", logTail)
+			if breaker.record(name, logTail) {
+				logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
+					"path", breaker.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+			}
 		}
 		crashCancel()
 	}
@@ -470,7 +501,8 @@ func runServer(args []string) (err error) {
 	// returns nil on a cancelled context, right for a signal but wrong for a
 	// crash, since exiting 0 would tell the operator this was a clean shutdown.
 	// launchd restarts either way (KeepAlive is an unconditional bool), so the
-	// exit status is for the human.
+	// exit status is for the human; the crash-loop breaker above is what bounds
+	// the restarts.
 	defer func() {
 		name := crashedComponent.Load()
 		if name == nil {
@@ -496,6 +528,10 @@ func runServer(args []string) (err error) {
 		}
 	}()
 	log.Printf("k3sm control plane healthy (kubeconfig=%s)", exec.Kubeconfig())
+	// A bring-up that stays healthy for the whole window resets the breaker;
+	// a crash before then leaves the record for the count (see crashBreaker).
+	healthyReset := time.AfterFunc(executor.CrashLoopWindow, breaker.resetIfHealthy)
+	defer healthyReset.Stop()
 
 	// 2. Client for the post-bring-up provisioning + Service watch.
 	restCfg, err := clientcmd.BuildConfigFromFlags("", exec.Kubeconfig())
@@ -535,10 +571,12 @@ func runServer(args []string) (err error) {
 	// directory ingress would hand cluster-admin to every pod on the node. See
 	// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
 	// add-on can never delay it. Converge-only — it issues apply patches and never a
-	// delete or a list. Log-and-continue like the sibling boot provisioners: the launchd
-	// job is KeepAlive, so a startup-fatal manifest error would be an unbounded respawn
-	// loop. The shipped set is EMPTY of product manifests today, so this is inert until
-	// the first add-on lands.
+	// delete or a list. Log-and-continue like the sibling boot provisioners, by the
+	// repo's one rule for a fault on this process: UNSURVIVABLE faults exit (a dead
+	// control-plane child does, and the crash-loop breaker bounds the respawns);
+	// SURVIVABLE ones continue, and a manifest that will not apply is survivable —
+	// the control plane is up without it. The shipped set is EMPTY of product
+	// manifests today, so this is inert until the first add-on lands.
 	if ar, err := addons.NewFromConfig(addons.FS(), restCfg); err != nil {
 		logger.Error("build embedded add-on reconciler", "err", err)
 	} else if err := ar.Converge(ctx); err != nil {
@@ -646,12 +684,13 @@ func runServer(args []string) (err error) {
 	// is a control plane that rejects every join.
 	//
 	// The self-enroll itself is LOG-AND-CONTINUE, following the precedent
-	// provisionClusterPolicies sets: under launchd KeepAlive a fatal error on this
-	// path is an unbounded respawn loop on the one process that also hosts the
-	// apiserver, kine and the scheduler, and a mesh-only defect must never take the
-	// control plane down. What is lost on failure is named in the log line, because
-	// "the server is not on its own mesh" is otherwise only visible as cross-node
-	// traffic that silently goes nowhere.
+	// provisionClusterPolicies sets and the repo's one rule for a fault on this
+	// process: UNSURVIVABLE faults exit (a dead control-plane child does, and the
+	// crash-loop breaker bounds the respawns); SURVIVABLE ones continue. A mesh-only
+	// defect is survivable — the control plane serves without it — so it must never
+	// take the process down. What is lost on failure is named in the log line,
+	// because "the server is not on its own mesh" is otherwise only visible as
+	// cross-node traffic that silently goes nowhere.
 	//
 	// It completes BEFORE step 4c builds the proxy (mesh.Start plumbs the mesh-egress
 	// lo0 alias the proxy's source bind depends on) and BEFORE step 4d opens the join
