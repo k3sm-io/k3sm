@@ -52,6 +52,12 @@ func TestRedactLogTailRemovesCredentialMaterial(t *testing.T) {
 			keeps:  "flag provided but not defined",
 		},
 		{
+			name:   "quoted JSON key and value keep the neighbouring field",
+			in:     `{"level":"error","msg":"join rejected","token":"abcdef0123456789","peer":"node-2"}`,
+			leaked: "abcdef0123456789",
+			keeps:  "node-2",
+		},
+		{
 			name:   "structured log field",
 			in:     `time=2026-09-08T10:00:00Z level=ERROR msg="join rejected" token=abcdef0123456789 peer=node-2`,
 			leaked: "abcdef0123456789",

@@ -952,13 +952,14 @@ const redactedTokenPlaceholder = "<redacted>"
 // end state and is left as a follow-up; these patterns cover the component-log
 // shapes (bearer headers, DSN userinfo) that the status patterns do not.
 var (
-	// credentialAssignments matches a key=value or key: value whose KEY names a
+	// credentialAssignments matches a key=value or key: value (the key and the
+	// value may each be double-quoted, as in a JSON log line) whose KEY names a
 	// credential, with or without a flag prefix — component argv echoed on a
 	// fatal flag error, a structured log field, and a DSN query parameter are all
 	// this shape. It over-redacts (an English sentence ending "token: expired"
 	// loses the word "expired"), which is the safe direction: the operator has
 	// the unredacted 0600 log, whose path travels with the tail.
-	credentialAssignments = regexp.MustCompile(`(?i)((?:--?)?[a-z0-9_.-]*(?:token|password|passwd|secret|credential)[a-z0-9_.-]*)(\s*[=:]\s*)\S+`)
+	credentialAssignments = regexp.MustCompile(`(?i)((?:--?)?[a-z0-9_.-]*(?:token|password|passwd|secret|credential)[a-z0-9_.-]*)("?\s*[=:]\s*)(?:"[^"]*"|\S+)`)
 	// authHeaders matches an HTTP authorization header value by scheme, wherever
 	// it was logged from.
 	authHeaders = regexp.MustCompile(`(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]+`)
