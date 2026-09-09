@@ -2,7 +2,7 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-09-01
+updated: 2026-09-09
 updated_by: orchestrator
 
 phases:
@@ -1042,6 +1042,48 @@ phases:
             met: false
             check: "hack/acceptance/m14-flip.sh — sentence-scoped asserts prove the named M3/M6 sentences are rewritten (never a whole-file EXPERIMENTAL grep — the vm RuntimeClass copy in the same files graduated separately at v0.1 and is not this gate's subject), site/data/gates.yaml reads M3: validated and M6: validated, ha.md carries the no-VIP access-model sentence, and hack/verify-docs-sync.sh + hack/verify-site-clean.sh are green"
             method: integration
+  - id: M15
+    title: container-vm RuntimeClass (k3sm slice — the class, the label, the capability, the docs, the gates)
+    status: todo
+    strategy: phased (multi-node launchd rolling restart)
+    depends_on:
+      - runtimed:M15.2
+    note: "Authoritative input: docs/m15-plan.md (workspace) — Phase C encodes ONLY from that doc; the B267 spike's answers are binding. The deploy contract: a pre-M15 node has no container-vm handler row and never sets the k3sm.io/container-vm label, so the scheduler never places a container-vm pod on it and a forced one fails closed (guard #2); the control-plane Mac restarts LAST because it provisions the class; window one release line; rollback = revert + reinstall, a leftover class object is harmless. The M15 gate rows ship in this block's B268 encoding as honest skeletons (TestLabSkeletonHonesty pins them) and M15.3 replaces hack/lab/m15.sh's body with the real ladder, flipping skeleton to false in the same change (m11-plan R27). Merge precondition inherited by M15.2: the operator runs hack/lab/m11.sh --core on the rc artifact first — the GuestBackend generalization's hardware-level vm regression guard is that manual gate."
+    subphases:
+      - id: M15.3
+        title: the container-vm class, label, capability, status row, user doc, and the real lab ladder
+        status: todo
+        strategy: phased (multi-node launchd rolling restart)
+        depends_on: []
+        deliverables:
+          - id: M15.3-d1
+            done: false
+            desc: "pkg/runtimeclass refactored from a single Name const to a class list; the container-vm class provisioned beside vm (nodeSelector k3sm.io/container-vm, Overhead measured from the spike's helper RSS + the guest size — never copied from vm); NodeCapabilities.ContainerVMBackend + applyContainerVMLabel (presence-only via setLabelPresence); the imagePlatformPolicy case; the k3sm status row naming any missing probe term."
+          - id: M15.3-d2
+            done: false
+            desc: "docs/user/container-vm-runtimeclass.md in the vm-runtimeclass.md contract shape: the supported list, linux/arm64 only, single node, the amd64 refusal message verbatim, an 'advertised, not yet honored' section for anything the spike narrowed, the three-memory-figures rule restated; EXPERIMENTAL as an attribute; the dependency named once as a fact (the open-source Containerization Swift package), never as the feature."
+          - id: M15.3-d3
+            done: false
+            desc: "hack/lab/m15.sh: the REAL ladder replacing the B268 placeholder (skeleton → false in the same change): preflight (label present, class provisioned, the probe never touched the container CLI — a negative assertion), boot (uname -sm = Linux aarch64 AND uname -r = the pinned kernel string; never /proc/1/comm), logs --tail=N exact, exec exit-code propagation, a published image with a bare-name entrypoint, PVC survives helper SIGKILL, in-guest network (lease, cluster DNS, ClusterIP), the amd64 NEGATIVE, footprint recorded; the full ledger adds service, logs -f, /stats/summary, Attach semantics, and the live cross-backend segment measurement whose sentence lands in docs/CONTAINER-VM-GUEST.md and docs/privilege-model.md; B112's fsGroup exemption, when it lands, re-verified by its own rung."
+        acceptance:
+          - id: M15.3-a1
+            met: false
+            check: "hack/lab/m15.sh --core green on the rc artifact on a VZ Mac (rungs 1–9), the run log in hack/lab/runs/ with the machine named; the M15 skeleton row flipped to its real composite; k3sm hack/ci.sh green"
+            method: lab
+      - id: M15.4
+        title: site sentence + the de-EXPERIMENTAL bar
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        deliverables:
+          - id: M15.4-d1
+            done: false
+            desc: "site: the what-runs third-path sentence and the compare page's resource-cost cell, only after M15-core is green; the de-EXPERIMENTAL bar written the way m11-plan R28 did (rungs 1–9 green on the rc artifact, two named machines)."
+        acceptance:
+          - id: M15.4-a1
+            met: false
+            check: "hack/site.sh verify green with the new sentence; the graduation bar recorded in docs/m15-plan.md"
+            method: unit
 ---
 
 # k3sm — Phase roadmap
