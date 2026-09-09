@@ -667,6 +667,15 @@ const spliceBufSize = 32 * 1024
 // equals the number of concurrently spliced connections — which is what is
 // already resident today. A per-forwarder buffer is NOT an option, since one
 // forwarder's connections are concurrent with each other.
+//
+// One behaviour this does change: peak footprint is unchanged (both designs
+// need 2 x concurrency x spliceBufSize live at peak), but RELEASE is one GC
+// cycle slower — sync.Pool's victim cache holds the high-water mark through
+// the first GC and frees it on the second. Measured at 2,000 concurrent
+// buffers: 58.7 MiB still resident after one GC, 4.1 MiB after two. The
+// window is also stretched in wall-clock terms because lowering the
+// allocation rate lengthens GC cycles. Bounded and modest, but real: after a
+// connection storm the memory comes back one cycle later than it used to.
 var spliceBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, spliceBufSize)
@@ -686,12 +695,21 @@ var spliceBufPool = sync.Pool{
 // uses the supplied buffer.
 //
 // Nothing is lost by hiding them on this platform: both stdlib zero-copy paths
-// are unavailable on darwin. net/splice_stub.go is //go:build !linux and reports
-// handled=false, and the sendfile path fails because internal/poll.SendFile
-// begins with a Seek on the source fd, which a socket rejects. On Linux this
-// would forfeit splice(2), but k3sm cannot build for Linux at all —
-// darwin-net's mesh package pulls golang.org/x/net/route, which is BSD-only —
-// so no shippable configuration is affected.
+// are unavailable on darwin. net/splice_stub.go is //go:build !linux and
+// reports handled=false, and the sendfile path never engages because
+// net.sendFile bails at its `r.(syscall.Conn)` assertion — the stdlib's OWN
+// struct{io.Reader} wrapper (inside genericReadFrom) has already hidden that
+// interface by the time it is consulted, so poll.SendFile is never reached.
+//
+// On Linux, hiding these WOULD forfeit splice(2). That costs nothing today
+// only because the k3sm binary cannot target Linux: darwin-net's mesh package
+// pulls golang.org/x/net/route, which is BSD-only. Note the limit of that
+// guarantee — `GOOS=linux go build ./pkg/svclb/` succeeds, so THIS package is
+// Linux-portable and the protection is a transitive dependency in another
+// repository, not a constraint on this file. A future Linux path in
+// darwin-net/pkg/mesh would silently forfeit splice(2) here with no build
+// error and no test failure. If k3sm ever targets Linux, gate copyPooled on
+// GOOS rather than deleting this comment.
 type onlyReader struct{ io.Reader }
 type onlyWriter struct{ io.Writer }
 

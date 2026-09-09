@@ -60,8 +60,15 @@ func TestOnlyWrappersHideTheCopyFastPaths(t *testing.T) {
 	}
 }
 
-// TestCopyPooledDoesNotAllocatePerCall pins the allocation outcome, measured
-// rather than argued. A per-call 32 KiB buffer is unmistakable at this scale.
+// TestCopyPooledDoesNotAllocatePerCall pins the PER-CALL allocation: that
+// entering copyPooled does not itself allocate a 32 KiB buffer, which is what
+// dropping the interface wrappers would restore.
+//
+// Scope limit, stated because it is easy to over-read: every peer's write half
+// is closed before the copy, so io.copyBuffer's loop body never runs and this
+// measures only the per-call overhead. It therefore CANNOT see a buffer
+// allocated per chunk — TestCopyPooledAllocationDoesNotScaleWithChunks covers
+// that, and neither test subsumes the other.
 func TestCopyPooledDoesNotAllocatePerCall(t *testing.T) {
 	const calls = 40
 
@@ -103,7 +110,15 @@ func TestCopyPooledDoesNotAllocatePerCall(t *testing.T) {
 	// hundred bytes normally and ~10 KB under -race (the detector's own
 	// bookkeeping, which is why this cannot be a tight bound), while a
 	// discarded buffer measures at least spliceBufSize itself.
-	limit := uint64(spliceBufSize / 2)
+	// Three quarters of the buffer, not half. The bound has to clear -race's
+	// own accounting from below and stay under a restored buffer from above,
+	// and half the buffer was too close to the floor: measured overhead under
+	// -race reaches ~14.4 KB against a 16 KB bound, i.e. ~12% headroom, which
+	// is a flaky test waiting for a different machine or toolchain. At 24 KB
+	// the margins are ~70% above the observed -race ceiling and ~25% below a
+	// restored buffer (32.9 KB plain, 44.7 KB under -race), both verified by
+	// mutation in both modes.
+	limit := uint64(spliceBufSize * 3 / 4)
 	if perCall > limit {
 		t.Errorf("copyPooled allocated %d B per call, want under %d "+
 			"(>= %d would mean the pooled buffer is being discarded and io.copyBuffer is "+
@@ -180,4 +195,146 @@ func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 		_ = b.Close()
 	})
 	return a, b
+}
+
+// TestCopyPooledConcurrentCopiesDoNotAlias is the guard on the pool's central
+// safety claim, and the one this file was missing.
+//
+// copyPooled draws a shared buffer from a sync.Pool, and splice runs one copy
+// per direction per connection — all concurrent. If a buffer is ever held by
+// two copies at once (one shared buffer instead of a pool, a Put before the
+// copy finishes, a double Put handing the same buffer to two callers), bytes
+// from one proxied connection land in another. That is silent traffic
+// corruption between unrelated clients, and it is the worst thing this change
+// could do.
+//
+// Nothing else in this package tests it: the fidelity test is single-threaded
+// and the benchmark drives splice synchronously from its accept loop. Verified
+// against three separate aliasing mutations, each of which passes the rest of
+// the suite under -race.
+//
+// Detection is by CONTENT, not by the race detector, so this fails on a plain
+// `go test` too: each connection carries its own distinct repeated byte, and
+// any byte from a different connection appearing in the output is aliasing.
+func TestCopyPooledConcurrentCopiesDoNotAlias(t *testing.T) {
+	const conns = 48
+	// Several buffer-lengths each, so every copy loops many times and the
+	// window for a shared buffer to be observed is wide.
+	payloadLen := spliceBufSize*5 + 137
+
+	var wg sync.WaitGroup
+	errs := make(chan string, conns)
+	for i := range conns {
+		// A byte value unique per connection, avoiding 0 so a zeroed buffer is
+		// distinguishable from a wrong-connection byte.
+		want := byte(1 + i)
+		src, peer := tcpPair(t)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			payload := bytes.Repeat([]byte{want}, payloadLen)
+			if _, err := peer.Write(payload); err != nil {
+				return
+			}
+			_ = peer.CloseWrite()
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var got bytes.Buffer
+			n, err := copyPooled(&got, src)
+			if err != nil {
+				errs <- "copyPooled: " + err.Error()
+				return
+			}
+			if n != int64(payloadLen) {
+				errs <- "short copy"
+				return
+			}
+			// The whole point: every byte must be this connection's own.
+			for off, b := range got.Bytes() {
+				if b != want {
+					errs <- "ALIASING: connection expecting byte " +
+						string(rune('0'+want%10)) + " saw a foreign byte at offset " +
+						itoa(off) + " — a pooled buffer is shared between concurrent copies"
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
+// TestCopyPooledAllocationDoesNotScaleWithChunks closes the second hole: the
+// zero-byte test above never executes io.copyBuffer's loop body at all, so it
+// cannot see a buffer allocated per CHUNK rather than per call.
+//
+// A per-chunk allocation is strictly worse than the io.Copy it replaced — it
+// pays 32 KiB for every 32 KiB moved instead of once per connection — and it
+// passes both the zero-byte allocation test and the fidelity test. The
+// invariant that catches it is scale-independence: for the same number of
+// calls, allocation must not grow with the number of chunks copied.
+//
+// A ratio is used rather than an absolute bound because -race inflates the
+// baseline substantially; a ratio is immune to that.
+func TestCopyPooledAllocationDoesNotScaleWithChunks(t *testing.T) {
+	measure := func(chunks int) uint64 {
+		const calls = 8
+		payload := bytes.Repeat([]byte("x"), spliceBufSize*chunks)
+		run := func() {
+			for range calls {
+				src, peer := tcpPair(t)
+				var wg sync.WaitGroup
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_, _ = peer.Write(payload)
+					_ = peer.CloseWrite()
+				}()
+				if _, err := copyPooled(io.Discard, src); err != nil {
+					t.Fatalf("copyPooled: %v", err)
+				}
+				wg.Wait()
+			}
+		}
+		run() // warm the pool and the conn machinery
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		run()
+		runtime.ReadMemStats(&after)
+		return (after.TotalAlloc - before.TotalAlloc) / calls
+	}
+
+	few := measure(2)
+	many := measure(64) // 32x the chunks
+	if few == 0 {
+		t.Fatal("measured zero allocation; the measurement is broken, not the code")
+	}
+	ratio := float64(many) / float64(few)
+	if ratio > 8 {
+		t.Errorf("copyPooled allocated %d B/call copying 2 chunks but %d B/call copying 64 chunks "+
+			"(ratio %.1fx, want < 8x): allocation is scaling with CHUNK COUNT, so a buffer is being "+
+			"allocated per chunk rather than drawn once from the pool — strictly worse than the io.Copy "+
+			"this replaced", few, many, ratio)
+	}
+}
+
+// itoa avoids a fmt dependency in the hot assertion loop above.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }
