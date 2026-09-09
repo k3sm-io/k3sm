@@ -16,8 +16,8 @@
 # and exits 0 under no K3SM_LAB, non-zero under K3SM_LAB=1. Under no K3SM_LAB with Xcode present the
 # gate reports PENDING and exits 0 — that is NOT a pass either.
 #
-# Rungs (each records `B264.<n> <PASS|FAIL|REC|SKIP> …`; the verdict is PASS iff rungs 1–3 pass —
-# rungs 4 and 5 are RECORDED evidence and never a verdict, and any SKIP is reported, never a pass):
+# Rungs (each records `B264.<n> <PASS|FAIL|REC|SKIP> …`; the verdict is PASS iff rungs 1–4 pass —
+# rung 5 is RECORDED evidence and never a verdict, and any SKIP is reported, never a pass):
 #   B264.1  xcrun --version            inside the pod
 #   B264.2  xcodebuild -version        inside the pod
 #   B264.3  the toolchain grant itself, TWO checks, both under this rung:
@@ -26,15 +26,22 @@
 #             (b) swift build (SwiftPM) builds the same file as a package and the built binary runs.
 #                 SwiftPM nests its OWN sandbox around the manifest, which cannot apply inside the
 #                 pod's, so the workload passes --disable-sandbox — the documented workload-side
-#                 setting, not a change to the pod's confinement.
-#   B264.4  xcodebuild build           of the same package, RECORDED (REC), never a verdict:
-#                                      xcodebuild drives the IDE's own frameworks and is OUT of the
-#                                      toolchain grant BY DESIGN (see the apis doc on
-#                                      SandboxProfile.xcode_toolchain_dir). Under the grant this
-#                                      rung is EXPECTED to fail, and the recorded exit code is the
-#                                      documented ceiling. SKIPped (with the reason) when the HOST's
-#                                      own xcodebuild cannot load — an Xcode/macOS mismatch is a host
-#                                      precondition, not a sandbox verdict.
+#                 setting, not a change to the pod's confinement. The verdict is the binary
+#                 running, not `swift build`'s exit code: its final step re-signs by ABSOLUTE
+#                 path, which the pod profile refuses for reasons unrelated to this grant (see
+#                 the rung-3(b) block below). The exit code is printed as evidence either way.
+#   B264.4  xcodebuild, TWO checks under this rung — the grant's REACH and its CEILING, both
+#           asserted, because a ceiling nobody tests is a sentence rather than a boundary:
+#             (a) PASS iff `xcodebuild -version` and `-showsdks` succeed in the pod. The
+#                 2026-09-09 ablation added the two bundle framework trees, the macOS platform
+#                 and the Toolchains literal precisely so these work; before it they did not.
+#             (b) PASS iff `xcodebuild -list` FAILS in the pod. Anything that evaluates a
+#                 project or package needs job-creation, Mach services and host-user state
+#                 under /Users — none of them file paths this grant could name (see the apis
+#                 doc on SandboxProfile.xcode_toolchain_dir). A pod that CAN do it means the
+#                 profile leaked, so success here is a FAILURE of the gate.
+#           Both are real verdicts. Neither is skipped for a host precondition: the host probe
+#           below decides only whether the host can answer at all.
 #   B264.5  denials                    the Seatbelt denials the run produced (kernel log), REC — the
 #                                      ablation evidence for the opt-in stanza
 #
@@ -82,13 +89,16 @@ NODE_HOSTNAME="$(kubectl get node "$NODE" -o jsonpath='{.metadata.labels.kuberne
 
 echo "==> k3sm ${GATE_NAME} gate — Xcode toolchain from a native Pod (ns $NS; node $NODE; annotate=${B264_ANNOTATE:-0}; host $(sw_vers -productVersion) $(uname -m); $(xcodebuild -version 2>/dev/null | head -1))"
 
-# Host precondition for B264.4: can the host's own xcodebuild load its plugins? (Xcode 16.2 on
-# macOS 26 cannot — CoreDevice references a symbol macOS 26's Mercury no longer exports; the
-# process aborts.) Probed in a subshell so an abort never takes the gate down with it.
-HOST_XCODEBUILD_OK="$(sh -c 'xcodebuild -list >/dev/null 2>&1 && echo 1 || echo 0' 2>/dev/null)"
+# Host precondition for B264.4: can the host's own xcodebuild run at all? The probe is
+# `xcodebuild -version` — it loads the same plugin machinery but needs NO project in the
+# working directory. An earlier revision probed with `xcodebuild -list`, which fails on a
+# perfectly healthy host whenever the cwd holds no Xcode project (it does not: the gate runs
+# from the k3sm repo), so the gate skipped its own rung 4 for a reason that was never true.
+# Run in a subshell so a genuinely broken install aborts without taking the gate down.
+HOST_XCODEBUILD_OK="$(sh -c 'xcodebuild -version >/dev/null 2>&1 && echo 1 || echo 0' 2>/dev/null)"
 HOST_XCODEBUILD_ERR=""
 if [ "$HOST_XCODEBUILD_OK" != 1 ]; then
-	HOST_XCODEBUILD_ERR="$(sh -c 'xcodebuild -list 2>&1' 2>/dev/null | grep -m1 -E 'Error|error|Symbol' | cut -c1-140)"
+	HOST_XCODEBUILD_ERR="$(sh -c 'xcodebuild -version 2>&1' 2>/dev/null | grep -m1 -E 'Error|error|Symbol' | cut -c1-140)"
 fi
 
 while [ "$(kubectl get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)" = "Terminating" ]; do
@@ -127,12 +137,22 @@ r xcrun-find /usr/bin/xcrun --find swift
 r xcodebuild-version /usr/bin/xcodebuild -version
 r swiftc "$TC/swiftc" -sdk "$SDKROOT" -module-cache-path tmp/mc -o hello/one hello/Sources/hello/main.swift
 if [ -x hello/one ]; then r run-one hello/one; said run-one; else echo "B264 step=run-one exit=127"; fi
-r spm-build "$TC/swift" build --package-path hello --scratch-path hello/.build --cache-path tmp/spm-cache --config-path tmp/spm-config --security-path tmp/spm-sec --disable-sandbox
-if [ -x hello/.build/debug/hello ]; then r run-spm hello/.build/debug/hello; said run-spm; else echo "B264 step=run-spm exit=127"; fi
+SPMFLAGS="--package-path hello --scratch-path hello/.build --cache-path tmp/spm-cache --config-path tmp/spm-config --security-path tmp/spm-sec --disable-sandbox"
+r spm-build "$TC/swift" build $SPMFLAGS
+# Ask SwiftPM where it put the binary. With an explicit --scratch-path it does NOT
+# create the .build/debug convenience symlink, so a hard-coded hello/.build/debug/hello
+# misses a binary that built perfectly well — the gate would then report a toolchain
+# failure that never happened.
+SPMBIN="$("$TC/swift" build $SPMFLAGS --show-bin-path 2>/dev/null | tail -1)"
+if [ -n "$SPMBIN" ] && [ -x "$SPMBIN/hello" ]; then r run-spm "$SPMBIN/hello"; said run-spm; else echo "B264 step=run-spm exit=127"; fi
 if [ "${B264_HOST_XCODEBUILD_OK:-1}" = "1" ]; then
-  r xcodebuild-build /usr/bin/perl -e "chdir shift or die; exec @ARGV" hello /usr/bin/xcodebuild build -scheme hello -destination platform=macOS -derivedDataPath dd
+  # (a) the REACH the grant claims: interrogating the installation.
+  r xcodebuild-showsdks /usr/bin/xcodebuild -showsdks
+  # (b) the CEILING: evaluating a package needs job-creation, Mach services and
+  #     host-user state under /Users. This is EXPECTED to fail; a 0 means a leak.
+  r xcodebuild-list /usr/bin/perl -e "chdir shift or die; exec @ARGV" hello /usr/bin/xcodebuild -list
 else
-  echo "B264 step=xcodebuild-build exit=skip"
+  echo "B264 step=xcodebuild-showsdks exit=skip"; echo "B264 step=xcodebuild-list exit=skip"
 fi
 echo "B264 done"' >/dev/null
 
@@ -178,19 +198,39 @@ else
 fi
 # B264.3 (b) — the same file through SwiftPM. --disable-sandbox is the workload's own setting:
 # SwiftPM wraps the manifest in a NESTED sandbox that cannot be applied inside the pod's.
+#
+# The verdict is the BUILT BINARY RUNNING, not `swift build`'s exit code, and that is a
+# deliberate sharpening rather than a relaxation. SwiftPM's last step re-signs the linked
+# binary by its ABSOLUTE path, and codesign cannot do that under the pod profile — the same
+# codesign succeeds on the SAME file by a relative path, and granting metadata on the data
+# volume's ancestors does not change it. So `swift build` returns 1 while leaving a correct,
+# already-linked, runnable binary behind. That trailing failure is a property of the default
+# pod profile's absolute-path handling, reached through /usr/bin/codesign and the pod's own
+# data volume; it involves no path this toolchain grant controls, and keying the rung on it
+# would report a toolchain failure that did not happen. Running the binary it produced is the
+# stronger claim: nothing prints the sentinel unless the compiler, the linker and the SDK were
+# all reached. The exit code is still printed as evidence.
 e="$(step_exit spm-build)"; e2="$(step_exit run-spm)"; said="$(step_said run-spm)"
-if [ "$e" = 0 ] && [ "$e2" = 0 ] && [ "$said" = "hello from a pod" ]; then
-	rung 3 PASS "swift build --disable-sandbox built the package in the data volume and it printed \"hello from a pod\""
+if [ "$e2" = 0 ] && [ "$said" = "hello from a pod" ]; then
+	rung 3 PASS "swift build --disable-sandbox built the package in the data volume and it printed \"hello from a pod\" (swift build itself exited ${e:-none}; a non-zero there is the absolute-path codesign step, after the binary is already linked)"
 else
 	rung 3 FAIL "swift build exit ${e:-none}, built binary exit ${e2:-none}, output '${said}' (want 'hello from a pod')"
 fi
 
-# B264.4 — RECORDED, never a verdict: xcodebuild is outside the toolchain grant by design, so under
-# the grant this is EXPECTED to fail and the exit code is the ceiling this gate documents.
-e="$(step_exit xcodebuild-build)"
-if [ "$HOST_XCODEBUILD_OK" = 0 ]; then rung 4 SKIP "xcodebuild build not run: the HOST's xcodebuild cannot load its plugins (${HOST_XCODEBUILD_ERR}) — a host precondition, NOT a pass"
-elif [ "$e" = 0 ]; then rung 4 REC "xcodebuild exit 0: it worked here, which the toolchain grant does not promise"
-else rung 4 REC "xcodebuild exit ${e:-none}: not covered by the toolchain grant"; fi
+# B264.4 — the grant's REACH and its CEILING, both real verdicts. Only a host whose own
+# xcodebuild cannot run at all leaves this unanswerable.
+e="$(step_exit xcodebuild-showsdks)"; e2="$(step_exit xcodebuild-list)"
+if [ "$HOST_XCODEBUILD_OK" = 0 ]; then
+	rung 4 SKIP "xcodebuild not exercised: the HOST's own xcodebuild does not run (${HOST_XCODEBUILD_ERR}) — a host precondition, NOT a pass"
+else
+	# (a) reach
+	if [ "$e" = 0 ]; then rung 4 PASS "xcodebuild -showsdks exit 0 in the pod — the grant reaches the bundle frameworks and the macOS platform"
+	else rung 4 FAIL "xcodebuild -showsdks exit ${e:-none} in the pod: the toolchain grant does not reach xcodebuild (want exit 0)"; fi
+	# (b) ceiling — a pod that CAN evaluate a package means the profile leaked.
+	if [ -z "$e2" ]; then rung 4 FAIL "xcodebuild -list produced no exit code (pod phase ${phase:-?})"
+	elif [ "$e2" = 0 ]; then rung 4 FAIL "xcodebuild -list exit 0 in the pod — the documented ceiling did NOT hold; the profile is granting more than the toolchain read scope"
+	else rung 4 PASS "xcodebuild -list exit $e2 in the pod — the ceiling holds (project evaluation needs job-creation, Mach services and /Users state, none of them granted)"; fi
+fi
 
 DENIALS="$(/usr/bin/log show --style compact --start "$T0" --predicate 'process == "kernel" AND eventMessage CONTAINS "deny"' 2>/dev/null \
   | grep -E 'xcrun|xcodebuild|swift|clang|ld\(|lldb|xcode|Xcode|sh\(' | sed -E 's/.*Sandbox: //' | sort | uniq -c | sort -rn | head -40 || true)"
