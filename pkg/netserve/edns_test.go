@@ -78,7 +78,7 @@ func headlessResolver(t *testing.T, svc string, nEndpoints int, withPort bool) *
 
 // buildEDNSQuery packs a query of the given type carrying an OPT pseudo-record
 // (RFC 6891) that advertises udpSize, EDNS version 0, DO clear.
-func buildEDNSQuery(t *testing.T, name string, qtype dnsmessage.Type, udpSize uint16) []byte {
+func buildEDNSQuery(t testing.TB, name string, qtype dnsmessage.Type, udpSize uint16) []byte {
 	t.Helper()
 	return buildEDNSQueryV(t, name, qtype, udpSize, 0, false)
 }
@@ -86,7 +86,7 @@ func buildEDNSQuery(t *testing.T, name string, qtype dnsmessage.Type, udpSize ui
 // buildEDNSQueryV packs a query with a fully specified OPT: advertised UDP size,
 // EDNS version, and DO bit — so a test can drive the version>0 (BADVERS) and
 // DO-echo paths.
-func buildEDNSQueryV(t *testing.T, name string, qtype dnsmessage.Type, udpSize uint16, version uint8, do bool) []byte {
+func buildEDNSQueryV(t testing.TB, name string, qtype dnsmessage.Type, udpSize uint16, version uint8, do bool) []byte {
 	t.Helper()
 	if name == "" || name[len(name)-1] != '.' {
 		name += "."
