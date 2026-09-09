@@ -21,7 +21,19 @@ The normal path is an OCI image with a Mac binary inside:
 ```yaml
 apiVersion: v1
 kind: Pod
+metadata:
+  name: app
 spec:
+  # Both are required on every k3sm Pod: the nodeSelector is enforced at
+  # admission (the os=darwin intent guard) and the toleration clears the
+  # provider taint the node carries. Omit either and the Pod is rejected or
+  # never scheduled — see [Quickstart](quickstart.md).
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
   containers:
     - name: app
       image: myapp:v1        # a real image reference: registry, tag or digest
@@ -106,8 +118,26 @@ DOCKERFILE
 # 2. build it — the image is in this node's store when this returns
 k3sm build --tag myapp:v1 .
 
-# 3. run it
-kubectl run myapp --image=myapp:v1
+# 3. run it — a manifest, not `kubectl run`, which cannot set the
+#    nodeSelector and toleration every k3sm Pod requires
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: k3sm.io/provider
+      operator: Exists
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: myapp
+      image: myapp:v1
+EOF
+
 kubectl logs myapp
 ```
 
