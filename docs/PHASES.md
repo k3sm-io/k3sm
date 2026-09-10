@@ -883,7 +883,7 @@ phases:
 
   - id: M14
     title: Multi-node & HA de-EXPERIMENTAL graduation (v0.3)
-    status: todo
+    status: in-progress
     strategy: hard cut
     depends_on:
       - darwin-net:M3
@@ -891,25 +891,25 @@ phases:
     subphases:
       - id: M14.0
         title: kubelet serving cert chains to the cluster CA on mesh clusters (B213)
-        status: todo
+        status: in-progress
         strategy: hard cut
         depends_on: []
         note: "Routed to the unattended queue as B213, which depends_on B176 — PR k3sm#192 merges FIRST because this edits the very functions it reshaped (kubeletServingTLS's auth parameter, agentNodeOptions' CA plumb, the vkadapter fail-closed pairing). Cert-class merge precondition: the named gate run green in a human lab session (M14.3) + a recorded security-engineer sign-off."
         deliverables:
           - id: M14.0-d1
-            done: false
+            done: true
             desc: "nodeOptions carries an optional cluster-CA-issued serving pair (kubeletServingCertPEM/KeyPEM); kubeletServingTLS consumes it via tls.X509KeyPair instead of certs.SelfSignedServing when both are set, still flowing through auth.ServingTLS so B176's client-auth stamping is untouched (it sets ClientAuth/ClientCAs, never Certificates). Exactly one of the pair set is an ERROR, mirroring the pairing discipline B176 documented. Empty pair = the self-signed single-node/dev default, pinned by its own test."
           - id: M14.0-d2
-            done: false
+            done: true
             desc: "the WORKER consumes the join-delivered pair: runAgent fails fast on an empty res.KubeletServingCertPEM/KeyPEM (the mesh path never silently falls back to self-signed — the same refusal shape as the empty-ClientCAPEM check), agentNodeOptions passes both through. The pair is held IN MEMORY ONLY and re-derived by the fresh bootstrap.Join every agent start — no new key file, so pkg/executor/rotate.go's artifact fence gains no path. This persistence choice is deliberate and stated, not incidental."
           - id: M14.0-d3
-            done: false
+            done: true
             desc: "the mesh SERVER mints its own — the control-plane node never joins, so runServer's meshIP-and-hierarchy block mints via hierarchy.Cluster.IssueServing(nodeName, {nodeName, localhost}, ips, 365*24h) and sets the two nodeOpts fields. ips = dedup of meshIP, opts.nodeIP, proxyableNodeIP(nodeOpts), 127.0.0.1 — proxyableNodeIP is INCLUDED because the no-datapath posture lets the registered InternalIP diverge from the advertised one, and a narrowed SAN list would reproduce B213 as a SAN mismatch instead of an issuer mismatch. A CA-issuance failure FAILS CLOSED, never degrades to self-signed. WITHOUT THIS HALF the defect remains cluster-wide — it was observed on the control-plane node's own kubelet."
           - id: M14.0-d4
-            done: false
-            desc: "rotation honesty: the new artifact is added to pkg/executor/rotate.go's reissuedArtifacts() in the SAME PR. That list is the RotationReport's completeness contract, and an artifact that IS re-minted on restart but absent from Reissued breaks the report's stated honesty invariant just as badly as the reverse."
+            done: true
+            desc: "rotation honesty: the new artifact is added to pkg/executor/rotate.go's reissuedArtifacts() in the SAME PR. That list is the RotationReport's completeness contract, and an artifact that IS re-minted on restart but absent from Reissued breaks the report's stated honesty invariant just as badly as the reverse. LANDED as kubeletServingArtifact (pkg/executor/rotate.go:328,332-352, PR #275): since the pair has no path (d2's memory-only decision), Present is read off the on-disk WITNESS instead — the apiserver serving cert minted in the same --mesh-ip branch — with Path rendered as the literal string '(in memory — never written to disk)' rather than a filesystem path. That satisfies the completeness contract without contradicting d2."
           - id: M14.0-d5
-            done: false
+            done: true
             desc: "doc deliverables — pkg/certs/serving.go's doc comment (SelfSignedServing is now ONLY the single-node/dev/standalone-`k3sm node` cert; its current text states the now-false premise that no --kubelet-certificate-authority is configured) and docs/DESIGN.md §5c's Node-verbs bullet, which today ASSERTS this fix already exists. After M14.0 it becomes true; reword it to name both halves so it describes mechanism, not aspiration."
         acceptance:
           - id: M14.0-a1
@@ -918,25 +918,25 @@ phases:
             method: integration
       - id: M14.1
         title: the five sibling mesh lab defects (D1–D5)
-        status: todo
+        status: in-progress
         strategy: hard cut
         depends_on: []
         note: "Routed to /go as B222 (D1 loopback probe/kubeconfig), B223 (D2 KCM --root-ca-file), B224 (D3 MeshPeer CRD), B225 (D4 NodeRestriction label), B226 (D5 SA token BoundObjectRef) — the per-item gates and human_gate justifications are tracked internally (all false; each argued individually rather than in bulk). D1, D3 and D4 gate M14.2; D2 is owed by the lab's in-pod-API criterion; D5 is lab-independent. B223 and B226 carry the cert-class merge precondition."
         deliverables:
           - id: M14.1-d1
-            done: false
+            done: true
             desc: "B222/D1 — derive the apiserver probe + in-process kubeconfig host from the EFFECTIVE bind (cfg.BindAddress -> NodeIP -> 127.0.0.1, the self-defaulting chain apiServerArgs already uses) instead of the 127.0.0.1 hardcode in pkg/executor/setup.go, which wedges any non-loopback --mesh-ip boot at the healthz wait because a mesh server binds the apiserver to meshIP only. Prerequisite for ANY realistic mesh boot, hence for the two-Mac lab."
           - id: M14.1-d2
-            done: false
+            done: true
             desc: "B223/D2 — Config.RootCAFile set to the cluster CA in the mesh block so pods' projected kube-root-ca.crt can verify the apiserver's actual (cluster-CA-issued) serving leaf. BINDING: the branch predicate is the SAME cfg.ServingCertFile != \"\" that gates --tls-cert-file, so the two flags can never disagree about which CA is live; an unconditional repoint would break in-pod TLS on single-node, and the gate therefore asserts BOTH branches."
           - id: M14.1-d3
-            done: false
+            done: true
             desc: "B224/D3 — apis grows MeshPeerCRDName + a named MeshPeerCRD() accessor (the MLXModelCRD() shape) and rewrites the embed.go paragraph whose claim that MeshPeer is applied out-of-band is FALSE; k3sm crdensures the CRD fail-closed in the mesh block before newMeshEnroller, since a missing CRD silently 500s every worker join. The accessor's own reservation comment owes a MESH-REGRESSION CHECK — that leg is part of this item's gate, not a follow-up."
           - id: M14.1-d4
-            done: false
+            done: true
             desc: "B225/D4 — delete the vendored virtual-kubelet default label kubernetes.io/role in configureNode; NodeRestriction forbids it (neither kubeletLabels nor an allowed namespace), so a joined worker's Node create/update is rejected while the in-process server node escapes only via system:masters. The gate is dependency-bump proof: a table over the full nodeutil.NewNode label set, evaluated across more than one reconcile tick, so a future vendor bump fails loudly instead of silently reopening it."
           - id: M14.1-d5
-            done: false
+            done: true
             desc: "B226/D5 — projected SA tokens gain BoundObjectRef{Kind: Pod, APIVersion: v1, Name, UID} via pod-identity context plumbing. The EXACT ref is the acceptance, not merely 'has a BoundObjectRef': upstream's guarantee is pod-lifetime invalidation plus the pod-name/pod-uid TokenReview extras identity consumers read, so a ServiceAccount-kind or UID-less ref would pass a literal reading while restoring none of the semantic. Fail closed when the pod identity is absent."
         acceptance:
           - id: M14.1-a1
@@ -945,34 +945,34 @@ phases:
             method: integration
       - id: M14.2
         title: server-side wireguard mesh bring-up (the M3-lab blocker)
-        status: todo
+        status: in-progress
         strategy: hard cut
         depends_on: []
         note: "ATTENDED milestone work, NEVER the unattended queue — the run log names it 'an architectural datapath change carrying an explicit breaks-ALL-backend-dials hazard; that is not unattended work'. Needs M14.1-d1/d3/d4 merged first. MERGE PRECONDITION, ATTACHED BY HAND: this mints and persists a new wireguard PRIVATE KEY but lives in cmd/k3sm/enroll.go, which the path-based cert/secret force-pattern in hack/go-selftest.sh does not match — so its PR carries the cert-class boxes explicitly (named gate green in a human lab session + a recorded security-engineer sign-off) even though no mechanical check will add them. CUTOVER CRITERION: restart the SERVER first (so its MeshPeer exists when workers reconcile), then each worker, node-by-node via launchctl kickstart -k io.k3sm.*. Rollback leaves the index-0 MeshPeer object behind — harmless, but the runbook must say so, or an on-call reader misreads it as a live server mesh."
         deliverables:
           - id: M14.2-d1
-            done: false
+            done: true
             desc: "darwin-net (see darwin-net:M14.0): destination-scoped egress source-binding, replacing the unconditional bind that is the 'breaks ALL backend dials' hazard. Consumed here — k3sm sets netserve.Config.MeshEgressIP only once that lands."
           - id: M14.2-d2
-            done: false
+            done: true
             desc: "a persistent server wireguard identity: load-or-create a private key (helper mode provisions under install.MeshKeyDir and passes the ref via mode.MeshOptions; direct/root uses mesh.WithPrivateKey), persisted 0600 so the public key survives launchctl kickstart."
           - id: M14.2-d3
-            done: false
+            done: true
             desc: "EnrollSelf writes the INDEX-0 MeshPeer (PodCIDR = podnet.NodeCIDR(ClusterPodCIDR, 0), MeshIP = its .1, Endpoint = the UNDERLAY LAN address:meshPort, since a worker must reach wg before any mesh exists). It ASSERTS-OR-CREATES index 0 explicitly and must NOT run the worker free-index scanner: defaultNodePodCIDR() hard-codes 100.64.0.0/24 and feeds it to the server's routing locality and pod IPAM, so a self-assigned different index would split what the mesh routes here from what this node's pods are, and mesh.BuildPlan's self-exclusion keys on exact CIDR equality. Idempotent on rejoin; FAIL CLOSED if index 0 is held by a different node name. Same change fixes the WORKER assignment to lowest-unused-index >= 1 (enroll.go's len(existing)+1 skips and double-counts once index 0 is occupied), and corrects the misleading --server help string (the join must reach meshIP:9345 before any mesh exists, so that address is in practice an underlay one)."
           - id: M14.2-d4
-            done: false
+            done: true
             desc: "ORDERING, load-bearing: EnrollSelf runs through the SAME e.mu-guarded meshEnroller instance the join RPC handler uses, and is list-back-verified COMPLETE BEFORE startBootstrapServer begins accepting. Without that happens-before, the free-index fix in d3 makes index 0 a legitimately assignable slot to a worker joining in the window before the server's own write lands — two peers claiming one AllowedIPs, which wireguard cannot admit. Mesh bring-up itself is ordered after apiserver-healthy + the D3 CRD ensure + RBAC, and strictly BEFORE netserve.New, because mesh.Start plumbs the mesh-egress lo0 alias the proxy's source-bind depends on."
           - id: M14.2-d5
-            done: false
+            done: true
             desc: "wire the proxy: set netserve.Config.MeshEgressIP and seed PeerMeshEgressIPs from the MeshPeer list at construction (the follow-up server.go already names), closing the fail-open NetworkPolicy attribution gap for already-enrolled peers. KNOWN AND ACCEPTED for v0.3: that seed is a BOOT-TIME SNAPSHOT, so an already-running worker recognizes a newly-joined server peer for NetworkPolicy attribution only after its own restart, while its wireguard peer set reconverges live via the informer. The posture is fail-open widen-only ('never a wrong deny') and NetworkPolicy is opt-in, so the gap degrades attribution, not connectivity."
           - id: M14.2-d6
-            done: false
+            done: true
             desc: "share the bring-up helper: extract the agent's bringUpMesh into a helper taking DISCRETE FIELDS (podCIDR, meshIP, private key, peers) rather than *bootstrap.JoinResult — the server has no JoinResult and never will, and reusing a network-received wire DTO for a locally synthesized value invites a later reader to assume delivery-trust properties (CA-pinned PinnedClient) that do not hold on the server path."
           - id: M14.2-d7
-            done: false
+            done: true
             desc: "FAILURE POSTURE: server-side mesh bring-up is LOG-AND-CONTINUE, following the explicit precedent beside it ('a node that refuses to start is strictly worse than a node missing an advisory'). Under launchd KeepAlive a fatal error here is an unbounded respawn loop on the one process that also hosts apiserver + kine + scheduler — a mesh-only defect must never take the control plane down."
           - id: M14.2-d8
-            done: false
+            done: true
             desc: "doc deliverable: docs/DESIGN.md §5b gains server-mesh participation and the destination-scoped egress rule; the 'k3sm server does not bring up its own wireguard mesh yet' comment is deleted along with the behavior it described."
         acceptance:
           - id: M14.2-a1
