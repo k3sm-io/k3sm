@@ -34,6 +34,7 @@ func healthyDoctorEnv() doctorEnv {
 		helperState:      func() (bool, bool) { return true, true },
 		brewPresent:      func() bool { return true },
 		datastorePosture: func() (bool, int, string, error) { return true, 3, "wal", nil },
+		developerDir:     func() (string, error) { return "/Applications/Xcode.app/Contents/Developer", nil },
 	}
 }
 
@@ -103,6 +104,22 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"datastore/warn-probe-error", checkDatastore, func(e *doctorEnv) {
 			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", errors.New("io error") }
 		}, statusWarn},
+
+		// toolchain: the three node classes. A full Xcode developer dir is the one
+		// the annotation grants; the other two grant nothing and are WARN, never
+		// FAIL — a Mac with no Xcode is a normal k3sm node for anything that is not
+		// a build. The verdict is sandbox.ValidateXcodeToolchainDir's, so the
+		// Command Line Tools case is decided by the same predicate the daemon uses
+		// rather than by this test's idea of a path shape.
+		{"toolchain/pass-full-xcode", checkXcodeToolchain, func(e *doctorEnv) {
+			e.developerDir = func() (string, error) { return "/Applications/Xcode.app/Contents/Developer", nil }
+		}, statusPass},
+		{"toolchain/warn-command-line-tools", checkXcodeToolchain, func(e *doctorEnv) {
+			e.developerDir = func() (string, error) { return "/Library/Developer/CommandLineTools", nil }
+		}, statusWarn},
+		{"toolchain/warn-no-developer-dir", checkXcodeToolchain, func(e *doctorEnv) {
+			e.developerDir = func() (string, error) { return "", errors.New("xcode-select -p: no developer tools") }
+		}, statusWarn},
 	}
 
 	for _, c := range cases {
@@ -156,7 +173,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "brew", "datastore"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "brew", "datastore", "toolchain"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}

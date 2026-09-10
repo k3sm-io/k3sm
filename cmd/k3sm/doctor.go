@@ -25,9 +25,11 @@ import (
 	"strconv"
 	"strings"
 
+	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // supportedMacOSFloor is the minimum supported macOS major version (macOS 26).
@@ -84,6 +86,7 @@ type doctorEnv struct {
 	helperState      func() (installed, running bool)                                      // launchctl print system/io.k3sm.netd
 	brewPresent      func() bool                                                           // exec.LookPath("brew")
 	datastorePosture func() (present bool, userVersion int, journalMode string, err error) // read-only sqlite header
+	developerDir     func() (string, error)                                                // xcode-select -p
 }
 
 // doctorCheck is a registry entry: a stable name and its pure check function. The
@@ -103,6 +106,7 @@ func doctorChecks() []doctorCheck {
 		{"netd-helper", checkHelper},
 		{"brew", checkBrew},
 		{"datastore", checkDatastore},
+		{"toolchain", checkXcodeToolchain},
 	}
 }
 
@@ -192,6 +196,50 @@ func checkDatastore(env doctorEnv) checkResult {
 	return checkResult{"datastore", statusPass, detail}
 }
 
+// checkXcodeToolchain reports what the k3sm.io/xcode-toolchain annotation grants
+// on THIS node. It is a reporter, never a failure: a Mac with no Xcode is a
+// perfectly good k3sm node for every workload that is not a build, so the two
+// no-grant classes are WARN.
+//
+// The verdict comes from sandbox.ValidateXcodeToolchainDir — the profile
+// generator's own predicate, the same one the provider asks before it stamps
+// SandboxProfile.xcode_toolchain_dir. A checker that re-derived the rule here
+// would be vouching for a decision it does not make, and would report a grant on
+// a directory the generator then refuses; that refusal is fail-closed and costs
+// the pod its start, which is exactly the outcome this row exists to predict.
+//
+// The node fact itself (`xcode-select -p`, unconfined) is read the same way the
+// daemon reads it, deliberately: this row answers "what will the daemon grant",
+// so it must start from the daemon's input, not from a confined re-probe that
+// would answer a different question.
+//
+// Three classes, and the middle one is the reason the row exists: a Command Line
+// Tools selection is a directory `xcode-select -p` reports successfully, so
+// nothing upstream of the generator looks wrong, yet it is not a DEVELOPER_DIR
+// the Xcode stanza can be rendered from.
+func checkXcodeToolchain(env doctorEnv) checkResult {
+	const (
+		name   = "toolchain"
+		once   = "The directory is resolved once, when the node daemon starts, so a later `xcode-select --switch` is invisible until it restarts."
+		remedy = "For the Xcode toolchain run `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`."
+	)
+	dir, err := env.developerDir()
+	if err != nil {
+		return checkResult{name, statusWarn, fmt.Sprintf(
+			"no developer toolchain on this node (%v), so %s grants nothing here. %s %s",
+			err, runtimev1.AnnotationXcodeToolchain, remedy, once)}
+	}
+	granted, verr := sandbox.ValidateXcodeToolchainDir(dir, sandbox.Posture{})
+	if verr != nil {
+		return checkResult{name, statusWarn, fmt.Sprintf(
+			"%s is not a directory the toolchain grant accepts, so %s grants nothing here — and needs to grant nothing if it is a Command Line Tools root, which a pod already reads. %s %s",
+			dir, runtimev1.AnnotationXcodeToolchain, remedy, once)}
+	}
+	return checkResult{name, statusPass, fmt.Sprintf(
+		"%s — %s grants a pod read access to this toolchain. %s",
+		granted, runtimev1.AnnotationXcodeToolchain, once)}
+}
+
 // majorVersion parses the leading integer of a dotted version string ("26.1" → 26).
 func majorVersion(v string) (int, error) {
 	v = strings.TrimSpace(v)
@@ -243,6 +291,7 @@ func realDoctorEnv(workDir string) doctorEnv {
 		datastorePosture: func() (bool, int, string, error) {
 			return probeDatastorePosture(executor.StateDBPath(workDir))
 		},
+		developerDir: probeDeveloperDir,
 	}
 }
 
@@ -273,6 +322,28 @@ func probeHelperState() (installed, running bool) {
 		return false, false
 	}
 	return true, strings.Contains(string(out), "state = running")
+}
+
+// probeDeveloperDir reads this node's active developer directory from
+// `xcode-select -p`, trimmed — the same command, and the same trim, the provider
+// runs at daemon construction (pkg/provider.lookupDeveloperDir). The two are
+// separate calls because a CLI preflight cannot reach into the provider's
+// package-level seam; what must not be duplicated is the VERDICT, and that comes
+// from sandbox.ValidateXcodeToolchainDir in both places.
+//
+// An empty result is an error, not a directory: `xcode-select -p` printing
+// nothing is a node with no selection, and returning "" as a success would make
+// the check report a grant on the empty string.
+func probeDeveloperDir() (string, error) {
+	out, err := exec.Command("/usr/bin/xcode-select", "-p").Output()
+	if err != nil {
+		return "", fmt.Errorf("xcode-select -p: %w", err)
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return "", fmt.Errorf("xcode-select -p: empty developer directory")
+	}
+	return dir, nil
 }
 
 // probeDatastorePosture reads the kine SQLite datastore posture. The read-only
