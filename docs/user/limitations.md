@@ -71,20 +71,27 @@ it carries the `k3sm.io/internet-egress` annotation. Signing with a Developer ID
 same keychain dependency. Sign and notarize on the host: a `vm` Pod runs Linux, so it cannot run
 this tooling either.
 
-### The Compiler Toolchain Needs a Temp Directory It Cannot Reach
+### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
 
-`clang`, `swiftc`, and `codesign` fail inside a Pod under the default profile. The cause is one
-directory: Apple's toolchain resolves its scratch and module-cache locations through
-`confstr(_CS_DARWIN_USER_TEMP_DIR)` and `_CS_DARWIN_USER_CACHE_DIR`, which always name a path under
-`/var/folders` and **ignore `TMPDIR`**. k3sm gives every Pod a writable temp directory inside its own
-data volume and points `TMPDIR` at it, but that is not the location the toolchain asks the platform
-for, and the profile does not grant `/var/folders`. The two failure shapes differ: `xcrun`-shimmed
-tools report `couldn't create cache file … Operation not permitted`, and the toolchain binaries
-invoked directly exit non-zero and print nothing at all.
+A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
+Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well: `codesign -s -`
+succeeds when the file is named by a **relative** path.
 
-Build Mac binaries on the host. A `vm` Pod runs Linux, so it builds Linux binaries, not Mac ones.
-What a native Pod runs is the **already-built** binary, and that path reaches CoreML inference,
-Metal, and MLX serving directly.
+Naming that same file by an **absolute** path is refused with `Operation not permitted`. This is what
+stops SwiftPM: `swift build` re-signs its product by absolute path as its final step, so the build
+does not complete inside a Pod even though every compile and link before it succeeded.
+
+One message on the way is not a failure and is worth recognising. Apple's toolchain resolves its
+`xcrun` lookup cache through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which **ignores `TMPDIR`** and names
+a path under `/var/folders` that the profile does not grant. Invocations therefore print
+`couldn't create cache file … Operation not permitted` on **stderr** and then succeed on stdout. The
+clang module cache resolves the same way, and that one would genuinely have broken compilation, so
+k3sm gives every Pod its own by pointing `CLANG_MODULE_CACHE_PATH` into the Pod's data volume — for
+every Pod, with no annotation required.
+
+Signing with a Developer ID identity is a different limit, and it stands: that needs the keychain,
+which a Pod cannot read (above). A `vm` Pod is no help for any of this — it runs Linux, so it builds
+Linux binaries, not Mac ones.
 
 ### Volume Mounts Resolve for Native Workloads, Not `/bin/sh`
 
