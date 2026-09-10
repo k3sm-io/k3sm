@@ -54,6 +54,45 @@ Pods run as **uid 0**. They are still Seatbelt-confined, and no installed cluste
 (the LaunchDaemon runs as `_k3sm`), but `--datapath` is a disposable dev tier: do not run untrusted
 workloads on it. `k3sm dev up --datapath` says the same thing in its banner.
 
+### Keychain Reads Return Nothing, and Report Success
+
+A Pod reaching the keychain gets an **empty result with a zero exit status**, not an error. The
+`security` command talks to the keychain over the `com.apple.SecurityServer` mach service, which the
+default-deny Seatbelt profile does not grant, and the framework treats the unreachable service as an
+empty search rather than a failure. On a host whose System keychain holds certificates, asking
+`security` to list every certificate in it prints them outside a Pod and prints nothing inside one;
+both exit `0`. A workload that branches on "did I find a certificate" therefore takes the wrong
+branch silently.
+
+Anything built on the keychain inherits this. **Notarization** is out on three counts at once: the
+`notarytool` binary lives inside the Xcode application bundle, which the profile does not read; its
+stored credentials live in the keychain; and it needs outbound network, which a Pod is denied unless
+it carries the `k3sm.io/internet-egress` annotation. Signing with a Developer ID identity has the
+same keychain dependency. Sign and notarize on the host: a `vm` Pod runs Linux, so it cannot run
+this tooling either.
+
+### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
+
+A Pod compiles. `clang` and `swiftc` build C, Objective-C and Swift against an installed SDK into the
+Pod's own data volume, and the binary they produce runs. Ad-hoc signing works as well: `codesign -s -`
+succeeds when the file is named by a **relative** path.
+
+Naming that same file by an **absolute** path is refused with `Operation not permitted`. This is what
+stops SwiftPM: `swift build` re-signs its product by absolute path as its final step, so the build
+does not complete inside a Pod even though every compile and link before it succeeded.
+
+One message on the way is not a failure and is worth recognising. Apple's toolchain resolves its
+`xcrun` lookup cache through `confstr(_CS_DARWIN_USER_TEMP_DIR)`, which **ignores `TMPDIR`** and names
+a path under `/var/folders` that the profile does not grant. Invocations therefore print
+`couldn't create cache file … Operation not permitted` on **stderr** and then succeed on stdout. The
+clang module cache resolves the same way, and that one would genuinely have broken compilation, so
+k3sm gives every Pod its own by pointing `CLANG_MODULE_CACHE_PATH` into the Pod's data volume — for
+every Pod, with no annotation required.
+
+Signing with a Developer ID identity is a different limit, and it stands: that needs the keychain,
+which a Pod cannot read (above). A `vm` Pod is no help for any of this — it runs Linux, so it builds
+Linux binaries, not Mac ones.
+
 ### Volume Mounts Resolve for Native Workloads, Not `/bin/sh`
 
 k3sm pods run at real host paths with **no chroot / mount namespace**, so a volume mounted at an
