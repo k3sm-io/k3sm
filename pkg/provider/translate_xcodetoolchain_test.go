@@ -126,6 +126,46 @@ func TestXcodeToolchainOptIn(t *testing.T) {
 				nodeDir:     "",
 				want:        "",
 			},
+			{
+				// THE CLT CASE. `xcode-select -p` succeeds on a Command Line
+				// Tools-only node and returns this path, so nothing before the
+				// generator looks wrong — but its base name is not "Developer",
+				// the generator refuses it, and a refused xcode_toolchain_dir
+				// costs the WHOLE profile (fail-closed: no profile, no pod).
+				// Filtering it here loses nothing: the tree is already readable
+				// under the shipped profile with no grant.
+				name:        "a Command Line Tools root is filtered, not stamped",
+				annotations: map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+				nodeDir:     "/Library/Developer/CommandLineTools",
+				want:        "",
+			},
+			{
+				// Not a hand-written base-name test: the filter is the
+				// generator's own predicate, so every class it rejects is
+				// rejected here too. A relative path is one of the six.
+				name:        "a relative developer dir is filtered",
+				annotations: map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+				nodeDir:     "Contents/Developer",
+				want:        "",
+			},
+			{
+				name:        "an unclean developer dir is filtered",
+				annotations: map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+				nodeDir:     "/Applications/Xcode.app/Contents/../Contents/Developer",
+				want:        "",
+			},
+			{
+				name:        "the filesystem root is filtered",
+				annotations: map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+				nodeDir:     "/",
+				want:        "",
+			},
+			{
+				name:        "a dir under /Users is filtered (protected prefix)",
+				annotations: map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+				nodeDir:     "/Users/someone/Xcode.app/Contents/Developer",
+				want:        "",
+			},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -167,6 +207,32 @@ func TestXcodeToolchainOptIn(t *testing.T) {
 		}
 	})
 
+	// The end-to-end half of the CLT filter: a node whose `xcode-select -p`
+	// answers with the Command Line Tools root stamps NOTHING on an annotated
+	// pod, so runtimed's generator never sees a value it would refuse and the
+	// pod starts.
+	t.Run("buildBox_filters_a_command_line_tools_node", func(t *testing.T) {
+		withDeveloperDir(t, "/Library/Developer/CommandLineTools")
+		r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
+			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(),
+		}, nil, nil)
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default", Name: "build-clt", UID: types.UID("uid-build-clt"),
+				Annotations: map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c0", Image: "img"}}},
+		}
+		box, err := r.buildBox(context.Background(), pod, "10.0.0.5")
+		if err != nil {
+			t.Fatalf("buildBox: %v", err)
+		}
+		if got := box.GetSandboxProfile().GetXcodeToolchainDir(); got != "" {
+			t.Errorf("XcodeToolchainDir = %q, want empty — a Command Line Tools root is not a grantable developer dir", got)
+		}
+	})
+
 	t.Run("buildBox_leaves_an_unannotated_pod_empty", func(t *testing.T) {
 		withDeveloperDir(t, devDir)
 		r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
@@ -192,6 +258,11 @@ func TestXcodeToolchainOptIn(t *testing.T) {
 // exactly one WARN naming the annotation that now grants nothing.
 func TestResolveDeveloperDir(t *testing.T) {
 	t.Run("present", func(t *testing.T) {
+		// The Command Line Tools root comes back VERBATIM, and that is correct at
+		// THIS layer: resolveDeveloperDir reports the node's selection, it does not
+		// judge it. applyXcodeToolchain is where the judgement lives and it now
+		// filters this exact value out of the grant — so this case pins "reported",
+		// never "blessed".
 		withDeveloperDir(t, "/Library/Developer/CommandLineTools")
 		var buf bytes.Buffer
 		log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
