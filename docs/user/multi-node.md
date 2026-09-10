@@ -47,6 +47,10 @@ the node — the `MeshPeer` records carry public keys only.
 
 ## Caveats
 
+- Cross-node Pod traffic has been shown to pass only on the two-Mac lab rig the
+  [roadmap](https://github.com/k3sm-io/k3sm/blob/main/ROADMAP.md) records (2026-09-01), not by a
+  shipped acceptance gate, and cross-node traffic to or from a `vm` Pod is out of scope for this
+  release ([Limitations](limitations.md)).
 - Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
   EXPERIMENTAL — validate cross-node resolution for your own workload rather than assuming it. See
   [Limitations](limitations.md).
