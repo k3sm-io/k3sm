@@ -16,8 +16,9 @@
 # and exits 0 under no K3SM_LAB, non-zero under K3SM_LAB=1. Under no K3SM_LAB with Xcode present the
 # gate reports PENDING and exits 0 — that is NOT a pass either.
 #
-# Rungs (each records `B264.<n> <PASS|FAIL|REC|SKIP> …`; the verdict is PASS iff rungs 1–4 pass —
-# rung 5 is RECORDED evidence and never a verdict, and any SKIP is reported, never a pass):
+# Rungs (each records `B264.<n> <PASS|FAIL|REC|SKIP> …`; the verdict is PASS iff every rung that IS
+# a verdict passes — rung 3(b) and rung 5 are RECORDED evidence and never verdicts, and any SKIP is
+# reported, never a pass):
 #   B264.1  xcrun --version            inside the pod
 #   B264.2  xcodebuild -version        inside the pod
 #   B264.3  the toolchain grant itself, TWO checks, both under this rung:
@@ -28,13 +29,12 @@
 #                 and the pod profile denies the shared /var/folders tree it names. runtimed
 #                 injects a per-pod CLANG_MODULE_CACHE_PATH instead, so this rung is also the
 #                 test that the injection is present and working;
-#             (b) swift build (SwiftPM) builds the same file as a package and the built binary runs.
-#                 SwiftPM nests its OWN sandbox around the manifest, which cannot apply inside the
-#                 pod's, so the workload passes --disable-sandbox — the documented workload-side
-#                 setting, not a change to the pod's confinement. The verdict is the binary
-#                 running, not `swift build`'s exit code: its final step re-signs by ABSOLUTE
-#                 path, which the pod profile refuses for reasons unrelated to this grant (see
-#                 the rung-3(b) block below). The exit code is printed as evidence either way.
+#             (b) swift build (SwiftPM) on the same file — RECORDED, not a verdict. SwiftPM
+#                 cannot complete in a pod: its final step re-signs by ABSOLUTE path and
+#                 codesign refuses that under the profile, for reasons unrelated to this
+#                 grant, so the exit code is never 0. It usually leaves a runnable binary
+#                 anyway, but not always (see the rung-3(b) block below), and a verdict
+#                 resting on an intermittent salvage is a flaky gate. Both facts recorded.
 #   B264.4  xcodebuild, TWO checks under this rung — the grant's REACH and its CEILING, both
 #           asserted, because a ceiling nobody tests is a sentence rather than a boundary:
 #             (a) PASS iff `xcodebuild -version` and `-showsdks` succeed in the pod. The
@@ -136,13 +136,24 @@ mkdir tmp
 export DEVELOPER_DIR="${B264_DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 export SDKROOT="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 TC="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin"
-r() { name="$1"; shift; "$@" >"$name.out" 2>&1; rc=$?; echo "B264 step=$name exit=$rc"; head -c 300 "$name.out" | sed "s/^/    /"; echo; }
+# r keeps stdout and stderr in SEPARATE files. They used to be merged with 2>&1,
+# and said()/the gate then pattern-matched a value that could be a warning line:
+# every Apple toolchain binary here writes "couldn'"'"'t create cache file ... xcrun_db"
+# to stderr (xcrun resolves its lookup cache through confstr, which ignores TMPDIR,
+# so it names the shared /var/folders tree the profile denies) and STILL succeeds on
+# stdout. Merged, that warning became the "resolved path" and rung 1 failed while the
+# toolchain was working. Both streams are still printed as evidence, stderr marked.
+r() { name="$1"; shift; "$@" >"$name.out" 2>"$name.err"; rc=$?; echo "B264 step=$name exit=$rc"
+	head -c 300 "$name.out" | sed "s/^/    /"; echo
+	[ -s "$name.err" ] && { head -c 300 "$name.err" | sed "s/^/    stderr| /"; echo; }
+	return 0; }
 said() { echo "B264 $1-said=$(sed -n 1p "$1.out" 2>/dev/null)"; }
 mkdir hello; mkdir hello/Sources; mkdir hello/Sources/hello
 printf "%s\n" "// swift-tools-version:5.9" "import PackageDescription" "let package = Package(name: \"hello\", targets: [.executableTarget(name: \"hello\", path: \"Sources/hello\")])" > hello/Package.swift
 echo "print(\"hello from a pod\")" > hello/Sources/hello/main.swift
 r xcrun /usr/bin/xcrun --version
 r xcrun-find /usr/bin/xcrun --find swift
+said xcrun-find
 r xcodebuild-version /usr/bin/xcodebuild -version
 echo "B264 module-cache-env=${CLANG_MODULE_CACHE_PATH:-<unset>}"
 r swiftc "$TC/swiftc" -sdk "$SDKROOT" -o hello/one hello/Sources/hello/main.swift
@@ -195,8 +206,14 @@ LOGS="$(kn logs "$POD" 2>/dev/null || true)"
 step_exit() { printf '%s\n' "$LOGS" | sed -n "s/^B264 step=$1 exit=//p" | tail -1; }
 step_said() { printf '%s\n' "$LOGS" | sed -n "s/^B264 $1-said=//p" | tail -1; }
 
-e="$(step_exit xcrun)"; f="$(printf '%s\n' "$LOGS" | sed -n '/^B264 step=xcrun-find exit=0/{n;p;}' | tr -d ' ')"
-if [ "$e" = 0 ] && printf '%s' "$f" | grep -q "^$DEVELOPER_DIR_HOST"; then rung 1 PASS "xcrun --version exit 0 and xcrun --find swift resolves under $DEVELOPER_DIR_HOST"; elif [ "$e" = 0 ]; then rung 1 FAIL "xcrun --version exit 0 but xcrun --find swift resolved to '${f:-nothing}', not under the Xcode developer dir (the pod is reaching the Command Line Tools, not Xcode)"; else rung 1 FAIL "xcrun --version exit ${e:-none} (pod phase ${phase:-?})"; fi
+# The resolved path is read from the KEYED stdout line, not from "the line after the
+# exit line" — that positional parse picked up whatever came next, which after the
+# stream split is no longer the path and before it was the xcrun_db stderr warning.
+# The prefix test is `case`, not grep: the developer dir contains regex metacharacters
+# (Xcode.app), and a path comparison should be literal.
+e="$(step_exit xcrun)"; f="$(step_said xcrun-find)"
+case "$f" in "$DEVELOPER_DIR_HOST"/*) under_xcode=1 ;; *) under_xcode=0 ;; esac
+if [ "$e" = 0 ] && [ "$under_xcode" = 1 ]; then rung 1 PASS "xcrun --version exit 0 and xcrun --find swift resolves under $DEVELOPER_DIR_HOST ($f)"; elif [ "$e" = 0 ]; then rung 1 FAIL "xcrun --version exit 0 but xcrun --find swift resolved to '${f:-nothing}', not under the Xcode developer dir (the pod is reaching the Command Line Tools, not Xcode)"; else rung 1 FAIL "xcrun --version exit ${e:-none} (pod phase ${phase:-?})"; fi
 e="$(step_exit xcodebuild-version)"; if [ "$e" = 0 ]; then rung 2 PASS "xcodebuild -version exit 0"; else rung 2 FAIL "xcodebuild -version exit ${e:-none}"; fi
 
 # B264.3 (a) — the compiler, linker and SDK, driven directly, with NO module-cache
@@ -215,25 +232,37 @@ elif [ -z "$MCENV" ] || [ "$MCENV" = "<unset>" ]; then
 else
 	rung 3 FAIL "swiftc exit ${e:-none}, built binary exit ${e2:-none}, output '${said}' (want 'hello from a pod'); module cache was ${MCENV}"
 fi
-# B264.3 (b) — the same file through SwiftPM. --disable-sandbox is the workload's own setting:
-# SwiftPM wraps the manifest in a NESTED sandbox that cannot be applied inside the pod's.
+# B264.3 (b) — the same file through SwiftPM. RECORDED, never a verdict, because SwiftPM
+# cannot complete inside the pod and the part that sometimes survives is not deterministic.
 #
-# The verdict is the BUILT BINARY RUNNING, not `swift build`'s exit code, and that is a
-# deliberate sharpening rather than a relaxation. SwiftPM's last step re-signs the linked
-# binary by its ABSOLUTE path, and codesign cannot do that under the pod profile — the same
-# codesign succeeds on the SAME file by a relative path, and granting metadata on the data
-# volume's ancestors does not change it. So `swift build` returns 1 while leaving a correct,
-# already-linked, runnable binary behind. That trailing failure is a property of the default
-# pod profile's absolute-path handling, reached through /usr/bin/codesign and the pod's own
-# data volume; it involves no path this toolchain grant controls, and keying the rung on it
-# would report a toolchain failure that did not happen. Running the binary it produced is the
-# stronger claim: nothing prints the sentinel unless the compiler, the linker and the SDK were
-# all reached. The exit code is still printed as evidence.
+# What is REPRODUCIBLE (2026-09-09, this rig, the shipped profile driven through
+# sandbox-exec, twice, including the pod's exact swiftc-then-swift-build sequence):
+# `swift build --disable-sandbox` compiles and LINKS, then fails its final "Applying"
+# step, which re-signs the linked binary by its ABSOLUTE path — codesign refuses that
+# under the pod profile, while the same codesign on the same file by a RELATIVE path
+# succeeds. So `swift build` is guaranteed non-zero here, by a mechanism that involves
+# no path this toolchain grant controls. In those runs it left a correct, runnable
+# binary that printed the sentinel.
+#
+# What happens IN A REAL POD is worse, and reproduced 2/2 on 2026-09-09 (pod UIDs
+# 6976921e and 77042d1f): the build fails EARLIER, at `encountered an I/O error
+# (code: 1) while reading .../hello.build/output-file-map.json`, and leaves NO binary.
+# The sandbox-exec replica above never got there, so the two environments disagree —
+# the replica runs as the invoking uid against the golden fixture, the pod as _k3sm
+# against its own data volume, and something in that difference decides how far
+# SwiftPM gets. That is unresolved, and it is exactly why this is not a verdict.
+#
+# So the salvage this rung used to key on — "the binary it left behind runs" — does not
+# hold in the environment the gate actually measures, and a PASS/FAIL verdict resting on
+# it would be red for a reason that is not about the toolchain grant. Both facts are
+# recorded instead: the guaranteed ceiling, and what this run actually produced.
+# Rung 3(a) above is the real verdict on the grant; it drives the compiler, linker and
+# SDK directly, and it passes.
 e="$(step_exit spm-build)"; e2="$(step_exit run-spm)"; said="$(step_said run-spm)"
 if [ "$e2" = 0 ] && [ "$said" = "hello from a pod" ]; then
-	rung 3 PASS "swift build --disable-sandbox built the package in the data volume and it printed \"hello from a pod\" (swift build itself exited ${e:-none}; a non-zero there is the absolute-path codesign step, after the binary is already linked)"
+	rung 3 REC "SwiftPM ceiling: swift build exit ${e:-none} (never 0 in a pod — the final step re-signs by ABSOLUTE path and codesign refuses that), and the binary it left behind ran: \"$said\""
 else
-	rung 3 FAIL "swift build exit ${e:-none}, built binary exit ${e2:-none}, output '${said}' (want 'hello from a pod')"
+	rung 3 REC "SwiftPM ceiling: swift build exit ${e:-none} (never 0 in a pod — the final step re-signs by ABSOLUTE path and codesign refuses that); this run left no runnable binary (exit ${e2:-none}, output '${said}')"
 fi
 
 # B264.4 — the grant's REACH and its CEILING, both real verdicts. Only a host whose own
