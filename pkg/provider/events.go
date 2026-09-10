@@ -22,6 +22,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
 // Pod lifecycle Event reasons. They match the kubelet's UpperCamelCase reason
@@ -55,6 +57,18 @@ const (
 	// would tell a consumer the pod failed at a stage it never reached. The name
 	// keeps the UpperCamelCase shape the rest of the vocabulary uses.
 	reasonFailedImagePlatform = "FailedImagePlatform"
+	// reasonXcodeToolchainUngranted is recorded when a pod carries the
+	// k3sm.io/xcode-toolchain annotation but this node's developer-directory
+	// selection yields no grant — the node has none, or the one it has is not a
+	// directory the profile generator accepts.
+	//
+	// Like FailedImagePlatform it has no upstream analogue, and unlike it the pod
+	// is NOT refused: the annotation is a request, and a node that cannot honour
+	// it still runs the pod. The Event exists because that outcome is otherwise
+	// invisible — the pod reports healthy and builds against whatever toolchain it
+	// finds, while the only other trace is a node-daemon line written at startup,
+	// possibly days before this pod was scheduled.
+	reasonXcodeToolchainUngranted = "XcodeToolchainUngranted"
 )
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec
@@ -115,6 +129,35 @@ func msgFailedStart(name string) string {
 // image.Platform.String(), the sanitising choke point.
 func msgFailedImagePlatform(err error) string {
 	return "Error: " + err.Error()
+}
+
+// msgXcodeToolchainUngranted is the XcodeToolchainUngranted-event message for a
+// pod that asked for the node's developer toolchain and got nothing.
+// developerDir is what the node's `xcode-select -p` printed at daemon start, or
+// empty when it printed nothing.
+//
+// It DOES carry that path, and the reasoning is the same one that lets
+// msgFailedImagePlatform carry its error: the value is authored by the node
+// itself (a developer-directory selection), not by pod env, args, or a registry
+// response, and naming it is the whole point — an operator cannot act on "the
+// grant is empty" without knowing which directory the node is pointed at.
+//
+// The remediation line is stated once and identically in both branches, and it
+// names the restart: the directory is read once, at daemon construction, so an
+// `xcode-select --switch` alone changes nothing for a running node.
+func msgXcodeToolchainUngranted(developerDir string) string {
+	const remedy = "To grant the Xcode toolchain, run `sudo xcode-select -s " +
+		"/Applications/Xcode.app/Contents/Developer` on this node and restart the k3sm node daemon — " +
+		"the directory is read once, at daemon start."
+	if developerDir == "" {
+		return fmt.Sprintf("Pod requests %s, but this node has no developer directory selected, "+
+			"so the annotation grants nothing here. %s",
+			runtimev1.AnnotationXcodeToolchain, remedy)
+	}
+	return fmt.Sprintf("Pod requests %s, but this node's developer directory %s is not one the "+
+		"toolchain grant accepts — it grants a full Xcode developer directory, and a Command Line "+
+		"Tools root needs no grant because a pod already reads that tree. %s",
+		runtimev1.AnnotationXcodeToolchain, developerDir, remedy)
 }
 
 // nopRecorder is a no-op record.EventRecorder. NewHostProcess substitutes it when

@@ -1132,6 +1132,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	if err := r.preflightImagePlatform(ctx, pod, box); err != nil {
 		return err
 	}
+	// A pod that asked for the developer toolchain and got none still runs; say so
+	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
+	r.warnXcodeToolchainUngranted(ctx, pod, box)
 
 	r.mu.Lock()
 	old := r.track[id]
