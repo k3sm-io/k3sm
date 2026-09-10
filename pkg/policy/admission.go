@@ -353,7 +353,8 @@ func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) er
 func EnsureXcodeToolchainAnnotationWarn(ctx context.Context, cs kubernetes.Interface) error {
 	msg := fmt.Sprintf("k3sm: pod carries a hand-set %s annotation, which opts its sandbox into read "+
 		"access to this node's developer toolchain (SandboxProfile.xcode_toolchain_dir, rooted at the "+
-		"node's `xcode-select -p`: the compilers, linker, and SDKs — xcodebuild is not covered). It is "+
+		"node's `xcode-select -p`: the compilers, linker, SDKs, and the xcodebuild subcommands that "+
+		"only interrogate the installation — driving a full xcodebuild build is not covered). It is "+
 		"meant to be stamped by a controller acting on the pod's behalf, not set by hand — hand-setting "+
 		"it still works, but is discouraged plumbing.",
 		runtimev1.AnnotationXcodeToolchain)
