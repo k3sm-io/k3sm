@@ -24,10 +24,21 @@
 # absent/empty TestM3 (no tests matched) FAILS the gate rather than false-greening.
 #
 # Prerequisites (manual two-Mac setup, NOT done here):
-#   - control-plane Mac:  sudo k3sm install server --mesh-ip <cp-mesh-ip>
-#   - worker Mac:         sudo k3sm install agent --server <cp-mesh-ip> \
-#                             --token <join-token> --node-ip <worker-mesh-ip>
+#   - control-plane Mac:  sudo k3sm install          # stages /Library/k3sm + the netd
+#                         k3sm server --mesh-ip <cp-mesh-ip> --token <join-token>
+#   - worker Mac:         sudo k3sm install
+#                         k3sm agent --server <cp-underlay-host> \
+#                             --node-ip <worker-mesh-ip> --token <join-token>
 #   - this host has the admin kubeconfig exported as $KUBECONFIG.
+#
+# `install` is its OWN command and takes NO join arguments: it defines only --user,
+# --service-cidr and --print-required-artifacts, writes the io.k3sm.netd and
+# io.k3sm.server plists, and never reads fs.Args() (cmd/k3sm/install.go:36-52). So the
+# form this header used to document -- `sudo k3sm install agent --server ... --token
+# ...` -- silently installed a SERVER and discarded every join flag. Corrected
+# 2026-09-10 after a two-Mac run; `server` and `agent` are separate subcommands, and
+# --server is an UNDERLAY address (the join must reach <host>:9345 before this node has
+# any mesh to route over), not the mesh IP.
 #
 # Tier: lab (two-macs). Exit 0 iff every check passes (or skipped pending lab).
 #
