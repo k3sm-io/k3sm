@@ -1234,6 +1234,15 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := policy.EnsureEgressAnnotationWarn(ctx, cs); err != nil {
 		logger.Error("provision hand-set-internet-egress warn policy", "err", err)
 	}
+	// The same honest-plumbing advisory for the OTHER opt-in annotation: a pod
+	// carrying a hand-set k3sm.io/xcode-toolchain annotation widens its sandbox with
+	// read access to this node's developer toolchain. Provisioned right beside its
+	// sibling and on the same terms — unconditional (the annotation is read on every
+	// native runtime path), advisory, log-and-continue — so the pair cannot drift
+	// into the state where one opt-in warns and the other passes unremarked.
+	if err := policy.EnsureXcodeToolchainAnnotationWarn(ctx, cs); err != nil {
+		logger.Error("provision hand-set-xcode-toolchain warn policy", "err", err)
+	}
 	// MUTATING policy on Pods: a DaemonSet-owned pod is created by the DS
 	// controller (KCM), so the CREATE-Warn advisory above never reaches its author and
 	// the pod sits Unschedulable against the provider taint. Inject the provider

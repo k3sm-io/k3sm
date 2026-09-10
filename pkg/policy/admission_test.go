@@ -412,6 +412,119 @@ func TestEgressAnnotationWarnVAP(t *testing.T) {
 	}
 }
 
+// TestXcodeToolchainAnnotationWarnVAP is the B264 admission gate, the exact
+// sibling of TestEgressAnnotationWarnVAP above: it pins the policy STRUCTURE
+// (Warn-only, FailurePolicy Ignore — this advisory must never take the cluster
+// down — pods/CREATE only) and then EVALUATES the CEL rather than grepping it. A
+// pod that hand-sets runtimev1.AnnotationXcodeToolchain WITHOUT the
+// operator-managed discriminator warns; the same annotation on an
+// operator-stamped pod does not; a pod without it does not warn either way.
+//
+// It also pins the two policies APART: the toolchain policy must key on the
+// toolchain annotation and not on the internet-egress one, which a copy-paste of
+// the shared expression builder's argument would silently produce (both calls
+// look identical at the call site but for that one constant).
+func TestXcodeToolchainAnnotationWarnVAP(t *testing.T) {
+	assertWarnPolicy(t, xcodeToolchainAnnotationPolicyName, xcodeToolchainAnnotationBindingName,
+		[]string{runtimev1.AnnotationXcodeToolchain, operatorManagedByLabelKey, operatorManagedByLabelValue},
+		"pods", []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+		func(cs kubernetes.Interface) error {
+			return EnsureXcodeToolchainAnnotationWarn(context.Background(), cs)
+		})
+
+	if runtimev1.AnnotationXcodeToolchain != "k3sm.io/xcode-toolchain" {
+		t.Fatalf("runtimev1.AnnotationXcodeToolchain = %q, want k3sm.io/xcode-toolchain (apis drifted)",
+			runtimev1.AnnotationXcodeToolchain)
+	}
+
+	// The two advisories are distinct objects — a shared name would make the
+	// second Ensure* overwrite the first, leaving one annotation unguarded.
+	if xcodeToolchainAnnotationPolicyName == egressAnnotationPolicyName ||
+		xcodeToolchainAnnotationBindingName == egressAnnotationBindingName {
+		t.Fatal("the toolchain and egress advisories must not share a policy/binding name")
+	}
+
+	// The provisioned CEL must key on the TOOLCHAIN annotation only: the egress
+	// key appearing here would mean the wrong constant was passed to the shared
+	// expression builder.
+	cs := fake.NewClientset()
+	if err := EnsureXcodeToolchainAnnotationWarn(context.Background(), cs); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	pol, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(
+		context.Background(), xcodeToolchainAnnotationPolicyName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get policy: %v", err)
+	}
+	if expr := pol.Spec.Validations[0].Expression; strings.Contains(expr, runtimev1.AnnotationInternetEgress) {
+		t.Errorf("CEL keys on the internet-egress annotation, not the toolchain one: %q", expr)
+	}
+	// The Warn message must say what the annotation grants — a bare "discouraged"
+	// tells an operator nothing about what the pod may now read.
+	msg := pol.Spec.Validations[0].Message
+	for _, want := range []string{runtimev1.AnnotationXcodeToolchain, "xcode_toolchain_dir", "xcode-select"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("warn message missing %q: %q", want, msg)
+		}
+	}
+
+	prg := celProgram(t, egressAnnotationExpr(runtimev1.AnnotationXcodeToolchain))
+	tests := []struct {
+		name      string
+		object    map[string]any
+		wantAdmit bool
+	}{
+		{
+			name:      "hand-set annotation on a plain pod warns",
+			object:    egressAnnotationPod(map[string]string{runtimev1.AnnotationXcodeToolchain: ""}, nil),
+			wantAdmit: false,
+		},
+		{
+			name: "operator-stamped pod (managed-by=k3sm label present) does not warn",
+			object: egressAnnotationPod(
+				map[string]string{runtimev1.AnnotationXcodeToolchain: ""},
+				map[string]string{operatorManagedByLabelKey: operatorManagedByLabelValue},
+			),
+			wantAdmit: true,
+		},
+		{
+			name:      "no annotation at all does not warn",
+			object:    egressAnnotationPod(nil, nil),
+			wantAdmit: true,
+		},
+		{
+			// The sibling annotation is a different opt-in with its own advisory:
+			// this policy must stay silent about it.
+			name:      "the internet-egress annotation alone does not warn here",
+			object:    egressAnnotationPod(map[string]string{runtimev1.AnnotationInternetEgress: "true"}, nil),
+			wantAdmit: true,
+		},
+		{
+			name: "managed-by label present with a DIFFERENT value still warns",
+			object: egressAnnotationPod(
+				map[string]string{runtimev1.AnnotationXcodeToolchain: "true"},
+				map[string]string{operatorManagedByLabelKey: "helm"},
+			),
+			wantAdmit: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _, err := prg.Eval(map[string]any{"object": tt.object})
+			if err != nil {
+				t.Fatalf("eval: %v", err)
+			}
+			admit, ok := out.Value().(bool)
+			if !ok {
+				t.Fatalf("CEL returned %T (%v), want bool", out.Value(), out.Value())
+			}
+			if admit != tt.wantAdmit {
+				t.Errorf("admit = %v, want %v", admit, tt.wantAdmit)
+			}
+		})
+	}
+}
+
 // egressAnnotationPod builds the unstructured Pod object the egress-annotation
 // Warn policy's CEL evaluates. Either map may be nil to OMIT the metadata field
 // entirely (rather than an empty map), exercising the has() guards in

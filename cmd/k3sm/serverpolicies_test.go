@@ -49,11 +49,17 @@ import (
 // and its package-level tests, but bring-up never called the provisioner, so a live
 // cluster carried six policies and this list is what makes that seventh one's
 // absence a failing test rather than a `kubectl get vap` count nobody runs.
+//
+// k3sm-warn-pod-hand-set-xcode-toolchain is the B264 member — the second hand-set
+// opt-in advisory, listed here for the same reason as the first: the two annotations
+// are provisioned side by side in bring-up, and this list is what keeps one of them
+// from being dropped while the other's tests stay green.
 var wantClusterPolicies = []string{
 	"k3sm-reject-foreign-user",
 	"k3sm-reject-loadbalancer-reserved-port",
 	"k3sm-require-os-darwin",
 	"k3sm-warn-pod-hand-set-internet-egress",
+	"k3sm-warn-pod-hand-set-xcode-toolchain",
 	"k3sm-warn-pod-missing-provider-toleration",
 	"k3sm-warn-service-externaltrafficpolicy-local",
 	"k3sm-warn-service-udp",

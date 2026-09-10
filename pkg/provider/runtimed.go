@@ -88,6 +88,13 @@ type runtimedRuntime struct {
 	deniedSocks []string
 	log         *slog.Logger
 
+	// developerDir is this node's active developer directory (`xcode-select -p`),
+	// resolved ONCE at construction and stamped onto the SandboxProfile of every
+	// pod that carries runtimev1.AnnotationXcodeToolchain. Empty means the node has
+	// no toolchain — the annotation then grants nothing, which the constructor
+	// logged when it looked.
+	developerDir string
+
 	// resolver supplies ConfigMap/Secret data for the env resolution the
 	// provider performs before sending the box to runtimed (runtimed reads only
 	// literal env). It is the SAME resolver wired into runtimed's Deps for volume
@@ -446,7 +453,11 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		// Derived HERE, in the one constructor production and the fake-injected
 		// tests share, so no caller can construct a provider whose pods are missing
 		// the base deny-set.
-		deniedSocks:    unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
+		deniedSocks: unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
+		// Resolved HERE, in the one constructor production and the fake-injected
+		// tests share, for the same reason as the deny-set above: a node fact the
+		// pod path must never re-derive per pod.
+		developerDir:   resolveDeveloperDir(log),
 		resolver:       resolver,
 		network:        cfg.Network,
 		transport:      newTransportFeed(cfg.TransportOverrides, log),
@@ -1053,6 +1064,11 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// it is precisely the defect the base set removes, and netd being the one the
 	// caller did remember is no reason to leave it the one that can be forgotten.
 	r.stampSocketDenies(box.SandboxProfile)
+	// Xcode-toolchain opt-in: stamp the node's developer dir onto a pod that asked
+	// for it. Applied HERE and not inside toPodBox because the grant is a node
+	// fact (this node's `xcode-select -p`), which the pure pod translation does not
+	// and should not carry — the same split as the socket denies above.
+	applyXcodeToolchain(box.SandboxProfile, pod, r.developerDir)
 	if err := resolvePodBoxEnv(ctx, box, r.nodeName, r.nodeIP, r.resolver); err != nil {
 		return nil, err
 	}
