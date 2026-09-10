@@ -460,12 +460,23 @@ func TestXcodeToolchainAnnotationWarnVAP(t *testing.T) {
 		t.Errorf("CEL keys on the internet-egress annotation, not the toolchain one: %q", expr)
 	}
 	// The Warn message must say what the annotation grants — a bare "discouraged"
-	// tells an operator nothing about what the pod may now read.
+	// tells an operator nothing about what the pod may now read. It must also say
+	// which NODE CLASS is granted: the grant is a full Xcode developer directory,
+	// and a node whose `xcode-select -p` names a Command Line Tools root gets
+	// nothing. This message is what an operator reads in their terminal, so a
+	// "rooted at the node's `xcode-select -p`" claim here would be the false
+	// contract at its most visible.
 	msg := pol.Spec.Validations[0].Message
-	for _, want := range []string{runtimev1.AnnotationXcodeToolchain, "xcode_toolchain_dir", "xcode-select"} {
+	for _, want := range []string{
+		runtimev1.AnnotationXcodeToolchain, "xcode_toolchain_dir", "xcode-select",
+		"full Xcode developer directory", "Command Line Tools",
+	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("warn message missing %q: %q", want, msg)
 		}
+	}
+	if strings.Contains(msg, "rooted at the node's") {
+		t.Errorf("warn message still claims the grant is rooted at whatever xcode-select -p prints: %q", msg)
 	}
 
 	prg := celProgram(t, egressAnnotationExpr(runtimev1.AnnotationXcodeToolchain))
