@@ -93,6 +93,38 @@ Signing with a Developer ID identity is a different limit, and it stands: that n
 which a Pod cannot read (above). A `vm` Pod is no help for any of this — it runs Linux, so it builds
 Linux binaries, not Mac ones.
 
+### `k3sm.io/xcode-toolchain` Grants One Node Class, and Says Nothing About the Others
+
+A Pod that carries the `k3sm.io/xcode-toolchain` annotation asks its node for **read** access to the
+node's Xcode toolchain — the compilers, linker and SDKs inside the developer directory. The Pod
+cannot name the directory; it can only ask for whichever one the node has. Read access is all it is:
+the Pod still runs as the same `_k3sm` user with the same sandbox everywhere else.
+
+What the annotation grants depends on what the node has selected, and only one of the three cases is
+a grant:
+
+- **A full Xcode developer directory** (`/Applications/Xcode.app/Contents/Developer`) — granted. This
+  is the case the annotation exists for.
+- **Command Line Tools only** (`/Library/Developer/CommandLineTools`) — **nothing is granted, and
+  nothing needs to be**. That tree is already readable from inside a Pod under the default profile,
+  so a Pod that wants `clang` or `swiftc` from the Command Line Tools does not need the annotation at
+  all. The annotation is accepted and ignored.
+- **No developer directory at all** — nothing is granted. A Mac with no toolchain is still a normal
+  k3sm node; a Pod asking for one is not rejected.
+
+Two things follow that are easy to trip over. The node's developer directory is read **once, when the
+node daemon starts**, so running `sudo xcode-select -s …` changes nothing for a running node until
+the daemon restarts. And a Pod whose request is not granted **starts and reports healthy** — it
+simply builds against whatever it can already reach. To see which case a node is in, run
+`k3sm doctor` on it and read the `toolchain` row; a Pod that asked and got nothing also carries a
+`XcodeToolchainUngranted` warning Event in `kubectl describe pod`.
+
+Whichever case you are in, every `xcrun` invocation inside a Pod prints
+`couldn't create cache file '/var/folders/…/xcrun_db-…'` on stderr first. It is the lookup-cache
+message described above, it is not a failure, and the compile that follows it succeeds. It cannot be
+silenced from inside the Pod: `xcrun`'s documented `xcrun_nocache=1` and `--no-cache` both *refresh*
+the cache entry rather than skip it, so the write — and the message — happen anyway.
+
 ### Volume Mounts Resolve for Native Workloads, Not `/bin/sh`
 
 k3sm pods run at real host paths with **no chroot / mount namespace**, so a volume mounted at an

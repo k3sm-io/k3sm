@@ -17,10 +17,13 @@ limitations under the License.
 package provider
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
+
+	corev1 "k8s.io/api/core/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
@@ -74,4 +77,40 @@ func resolveDeveloperDir(log *slog.Logger) string {
 		return ""
 	}
 	return dir
+}
+
+// warnXcodeToolchainUngranted reports, ON THE POD, that a pod which asked for
+// the node's developer toolchain did not get it — because the node has no
+// developer directory selected, or because the one it has is not a directory
+// applyXcodeToolchain could stamp (sandbox.ValidateXcodeToolchainDir refused it,
+// a Command Line Tools root being the ordinary case).
+//
+// Degrade, not fail: it returns nothing and the create proceeds. That is the
+// deliberate half of this design — the annotation is a request, and refusing the
+// pod would make a node without Xcode unable to run a workload that merely
+// prefers it. The other half is that a degrade nobody can see is indistinguishable
+// from a grant that worked: post-fix the pod runs, reports healthy, and builds
+// against whatever toolchain it can reach, so the only question an operator
+// actually asks — "why did my build not see Xcode?" — has no answer on the pod
+// unless one is put there. The node log alone cannot answer it: developerDir is
+// resolved at daemon construction, which may be days before this pod existed.
+//
+// It reads the BOX, not developerDir, for the granted/ungranted verdict, so the
+// Event follows whatever applyXcodeToolchain actually decided rather than a
+// second opinion about the same node fact — the same shape preflightImagePlatform
+// uses when it reads the box's platform annotation back.
+//
+// CREATE-ONLY by placement (CreatePod calls it; UpdatePod does not), matching the
+// admission advisory's create-only scope and for the same reason: buildBox also
+// runs on an in-place label/annotation update, and warning there would re-fire on
+// every unrelated update of a pod whose node has not changed.
+func (r *runtimedRuntime) warnXcodeToolchainUngranted(ctx context.Context, pod *corev1.Pod, box *runtimev1.PodBox) {
+	if !podRequestsXcodeToolchain(pod) || box.GetSandboxProfile().GetXcodeToolchainDir() != "" {
+		return
+	}
+	r.log.WarnContext(ctx, "pod requested the developer toolchain; this node grants none",
+		"namespace", pod.Namespace, "name", pod.Name,
+		"annotation", runtimev1.AnnotationXcodeToolchain, "developer_dir", r.developerDir)
+	r.recorder.Event(pod, corev1.EventTypeWarning, reasonXcodeToolchainUngranted,
+		msgXcodeToolchainUngranted(r.developerDir))
 }

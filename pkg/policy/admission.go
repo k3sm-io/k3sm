@@ -334,12 +334,20 @@ func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) er
 //
 // What the annotation does, which is what the message must say: the k3sm provider
 // reads it at translation and sets SandboxProfile.xcode_toolchain_dir to the
-// NODE's developer directory (`xcode-select -p`), widening the pod's Seatbelt
-// profile with READ access to that toolchain — the compilers, linker, and SDKs a
-// build workload needs. The pod cannot name the directory; it can only ask for
-// the node's. Like its egress sibling it is meant to be stamped by a controller
-// acting on the pod's behalf rather than typed in by hand, and hand-setting it
-// still works.
+// NODE's developer directory, widening the pod's Seatbelt profile with READ
+// access to that toolchain — the compilers, linker, and SDKs a build workload
+// needs. The pod cannot name the directory; it can only ask for the node's.
+//
+// It grants a FULL XCODE developer directory, and only that. A node whose
+// `xcode-select -p` names a Command Line Tools root is not granted: that path is
+// not a DEVELOPER_DIR the profile generator can render the Xcode stanza from, and
+// it needs no grant either, because a pod already reads that tree under the
+// shipped profile. Saying "rooted at the node's `xcode-select -p`" here would be
+// the same false contract the provider used to act on — a successful
+// `xcode-select -p` is not by itself a grantable directory.
+//
+// Like its egress sibling it is meant to be stamped by a controller acting on the
+// pod's behalf rather than typed in by hand, and hand-setting it still works.
 //
 // Advisory only — never Deny, and FailurePolicy Ignore (load-bearing: this guard
 // must never take the cluster down). The warning is not a claim that a boundary
@@ -352,11 +360,13 @@ func EnsureEgressAnnotationWarn(ctx context.Context, cs kubernetes.Interface) er
 // (create-or-update; an unchanged spec is not rewritten).
 func EnsureXcodeToolchainAnnotationWarn(ctx context.Context, cs kubernetes.Interface) error {
 	msg := fmt.Sprintf("k3sm: pod carries a hand-set %s annotation, which opts its sandbox into read "+
-		"access to this node's developer toolchain (SandboxProfile.xcode_toolchain_dir, rooted at the "+
-		"node's `xcode-select -p`: the compilers, linker, SDKs, and the xcodebuild subcommands that "+
-		"only interrogate the installation — driving a full xcodebuild build is not covered). It is "+
-		"meant to be stamped by a controller acting on the pod's behalf, not set by hand — hand-setting "+
-		"it still works, but is discouraged plumbing.",
+		"access to this node's Xcode toolchain (SandboxProfile.xcode_toolchain_dir: the compilers, "+
+		"linker, SDKs, and the xcodebuild subcommands that only interrogate the installation — driving "+
+		"a full xcodebuild build is not covered). What it grants is a full Xcode developer directory: "+
+		"on a node whose `xcode-select -p` names a Command Line Tools root the annotation grants "+
+		"nothing, and needs to grant nothing, because a pod already reads that tree. It is meant to be "+
+		"stamped by a controller acting on the pod's behalf, not set by hand — hand-setting it still "+
+		"works, but is discouraged plumbing.",
 		runtimev1.AnnotationXcodeToolchain)
 	return ensureWarnPolicy(ctx, cs, xcodeToolchainAnnotationPolicyName, xcodeToolchainAnnotationBindingName,
 		egressAnnotationExpr(runtimev1.AnnotationXcodeToolchain), msg, "pods", admissionregistrationv1.Create)

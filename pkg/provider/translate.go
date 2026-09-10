@@ -37,6 +37,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/runtimed/pkg/image"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 )
 
 // protoTime converts a proto timestamp to a metav1.Time, returning the zero
@@ -292,20 +293,48 @@ func podRequestsXcodeToolchain(pod *corev1.Pod) bool {
 }
 
 // applyXcodeToolchain sets SandboxProfile.XcodeToolchainDir to developerDir when
-// the pod requests the node's developer toolchain, and leaves it empty
-// otherwise. The sibling of applyGPUAndEgress on the opt-in axis, kept separate
-// because its grant needs a NODE fact the pure pod translation does not carry:
-// developerDir is the node's `xcode-select -p`, resolved once at provider
-// construction (resolveDeveloperDir) and threaded in by the caller.
+// the pod requests the node's developer toolchain AND that directory is one the
+// profile generator will accept, and leaves it empty otherwise. The sibling of
+// applyGPUAndEgress on the opt-in axis, kept separate because its grant needs a
+// NODE fact the pure pod translation does not carry: developerDir is the node's
+// `xcode-select -p`, resolved once at provider construction
+// (resolveDeveloperDir) and threaded in by the caller.
 //
-// An empty developerDir on a requesting pod is not an error: the node has no
-// toolchain, the field stays empty, and the profile grants nothing — the same
-// outcome as not asking. The daemon already warned about the absence at
-// construction, which is the one place it can be explained.
+// The acceptance question is asked of sandbox.ValidateXcodeToolchainDir — the
+// generator's OWN predicate, exported for this caller — and never re-derived
+// here. That matters beyond tidiness: the rule set has six rejection classes
+// (relative, unclean, the filesystem root, under a protected prefix such as
+// /Users, at or under the runtimed pods root, and a base name that is not
+// "Developer"), and it is under active revision, so a second hand-maintained
+// copy in this repo would be wrong within a release.
+// The posture passed is the zero value, i.e. the default work-dir deny-set; the
+// residual that leaves is recorded on the predicate itself.
+//
+// A rejected directory is filtered rather than stamped, because stamping one is
+// strictly worse than granting nothing: the generator fails CLOSED on a bad
+// xcode_toolchain_dir and emits NO profile at all, so the pod does not start.
+// The common case is a node whose selection is a Command Line Tools root
+// (/Library/Developer/CommandLineTools), which is not a DEVELOPER_DIR the Xcode
+// stanza can be rendered from — and needs no grant, since a pod already reads
+// that tree under the shipped profile.
+//
+// An empty developerDir on a requesting pod is not an error either: the node has
+// no toolchain, the field stays empty, and the profile grants nothing — the same
+// outcome as not asking. Both empty outcomes are made visible per POD by
+// runtimedRuntime.warnXcodeToolchainUngranted; the construction-time warning
+// alone would be a daemon-lifetime event for a pod-lifetime question.
 func applyXcodeToolchain(profile *runtimev1.SandboxProfile, pod *corev1.Pod, developerDir string) {
-	if podRequestsXcodeToolchain(pod) {
-		profile.XcodeToolchainDir = developerDir
+	if !podRequestsXcodeToolchain(pod) {
+		return
 	}
+	dir, err := sandbox.ValidateXcodeToolchainDir(developerDir, sandbox.Posture{})
+	if err != nil {
+		// Not returned to the caller: a node the grant cannot be rendered on is a
+		// node where the annotation grants nothing, which is a degrade, not a pod
+		// failure. warnXcodeToolchainUngranted reports it on the pod.
+		return
+	}
+	profile.XcodeToolchainDir = dir
 }
 
 // injectClusterDNSEnv appends the K3SM_DNS_* environment the DYLD getaddrinfo shim
