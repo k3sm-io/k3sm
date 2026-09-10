@@ -11,7 +11,7 @@
 # runs the pod. On a multi-node cluster an unpinned pod would answer a question about some other
 # Mac's Xcode. Override with K3SM_B264_NODE.
 #
-# Skip contract (docs/BACKLOG.md B264): `xcode-select -p` failing prints the literal
+# Skip contract: `xcode-select -p` failing prints the literal
 #   SKIP (xcode-select absent) — NOT a pass
 # and exits 0 under no K3SM_LAB, non-zero under K3SM_LAB=1. Under no K3SM_LAB with Xcode present the
 # gate reports PENDING and exits 0 — that is NOT a pass either.
