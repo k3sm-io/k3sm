@@ -326,13 +326,13 @@ func queryTCP(t *testing.T, server, name string) (dnsmessage.RCode, []netip.Addr
 }
 
 // buildAQuery packs an A-record query for name (FQDN-normalized).
-func buildAQuery(t *testing.T, name string) []byte {
+func buildAQuery(t testing.TB, name string) []byte {
 	t.Helper()
 	return buildTypedQuery(t, name, dnsmessage.TypeA)
 }
 
 // buildTypedQuery packs a query of the given record type for name (FQDN-normalized).
-func buildTypedQuery(t *testing.T, name string, qtype dnsmessage.Type) []byte {
+func buildTypedQuery(t testing.TB, name string, qtype dnsmessage.Type) []byte {
 	t.Helper()
 	if name == "" || name[len(name)-1] != '.' {
 		name += "."
@@ -595,7 +595,7 @@ func TestServiceZoneBranchesOnType(t *testing.T) {
 // listers fed by the fake clientset's objects (informer caches, warmed before
 // return), so the real Type-branching LookupService AND the M10.1 record
 // synthesis are exercised end to end.
-func newServiceZone(t *testing.T, cs *fake.Clientset) serviceZone {
+func newServiceZone(t testing.TB, cs *fake.Clientset) serviceZone {
 	t.Helper()
 	factory := informers.NewSharedInformerFactory(cs, 0)
 	z := serviceZone{

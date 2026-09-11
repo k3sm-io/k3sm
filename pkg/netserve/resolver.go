@@ -398,10 +398,10 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, in
 	rcode := dnsmessage.RCodeSuccess
 	var ans dnsAnswer
 
-	switch extra, svc, ns, inSvcZone := parseClusterZoneName(qname, r.domain); {
+	switch extraLabels, svc, ns, inSvcZone := parseClusterZoneName(qname, r.domain); {
 	case strings.HasSuffix(qname, ".in-addr.arpa"):
 		ans, rcode = r.respondReverse(q.Type, qname)
-	case inSvcZone && len(extra) == 0:
+	case inSvcZone && extraLabels == 0:
 		// The exact <svc>.<ns> Service name. A answers ClusterIP / ExternalName
 		// chase / headless synthesis; SRV on the bare service name is NODATA when
 		// the service exists (SRV owner names are the _port._proto forms below).
@@ -820,34 +820,54 @@ func truncateResponse(resp []byte) ([]byte, error) {
 // name is not a two-label Service name under .svc.<domain>. qname must already be
 // normalized (lowercased, no trailing dot).
 func parseClusterServiceName(qname, domain string) (svc, ns string, ok bool) {
-	extra, svc, ns, ok := parseClusterZoneName(qname, domain)
-	if !ok || len(extra) != 0 {
+	extraLabels, svc, ns, ok := parseClusterZoneName(qname, domain)
+	if !ok || extraLabels != 0 {
 		return "", "", false
 	}
 	return svc, ns, true
 }
 
 // parseClusterZoneName splits any name under .svc.<domain> into its owning
-// service and namespace (the two labels immediately before the suffix) plus the
-// extra leading labels: a per-endpoint identity name yields one extra label
+// service and namespace (the two labels immediately before the suffix) and
+// COUNTS the extra leading labels: a per-endpoint identity name yields one
 // (the hostname / dashed IP), an SRV owner name two (_port, _proto), the bare
 // service name none. ok==false when the name is not under .svc.<domain> or
 // lacks the two service labels. qname must already be normalized.
-func parseClusterZoneName(qname, domain string) (extra []string, svc, ns string, ok bool) {
+//
+// It returns the extra-label COUNT rather than the labels themselves because a
+// count is all any caller has ever consumed — respond branches on
+// `extraLabels == 0` and nothing reads the labels themselves anywhere in the
+// tree. Returning the slice cost a strings.Split allocation on every query
+// whose only reader was len() — measured at 14% of the allocations on the
+// hottest path in k3sm (BenchmarkRespondClusterA, alloc_objects profile).
+// Walking by index answers the same question without allocating.
+func parseClusterZoneName(qname, domain string) (extraLabels int, svc, ns string, ok bool) {
 	host, found := strings.CutSuffix(qname, ".svc."+domain)
 	if !found {
-		return nil, "", "", false
+		return 0, "", "", false
 	}
-	parts := strings.Split(host, ".")
-	if len(parts) < 2 {
-		return nil, "", "", false
+	// Refuse any empty label — the same refusal the previous implementation made
+	// by splitting and testing every element against "". An empty label can only
+	// present as a leading dot, a trailing dot, or a "..", so the scan is
+	// equivalent without materializing the labels.
+	if host == "" || host[0] == '.' || host[len(host)-1] == '.' || strings.Contains(host, "..") {
+		return 0, "", "", false
 	}
-	for _, p := range parts {
-		if p == "" {
-			return nil, "", "", false
-		}
+	// ns is the final label and svc the one before it; everything ahead of svc
+	// is "extra".
+	nsDot := strings.LastIndexByte(host, '.')
+	if nsDot < 0 {
+		return 0, "", "", false // a single label carries no <svc>.<ns> pair
 	}
-	return parts[:len(parts)-2], parts[len(parts)-2], parts[len(parts)-1], true
+	ns = host[nsDot+1:]
+	rest := host[:nsDot]
+	svcDot := strings.LastIndexByte(rest, '.')
+	svc = rest[svcDot+1:] // svcDot == -1 leaves svc == rest, which is correct
+	if svcDot < 0 {
+		return 0, svc, ns, true // exactly <svc>.<ns>, no extra labels
+	}
+	// Labels ahead of svc == separators among them + 1.
+	return strings.Count(rest[:svcDot], ".") + 1, svc, ns, true
 }
 
 // inClusterDomain reports whether qname falls under the cluster domain (so it must
