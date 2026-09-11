@@ -4,7 +4,7 @@ k3sm mints its own PKI at first boot and re-issues the control plane's leaf cert
 **every** boot. `k3sm certificate rotate` is the supported way to force that re-issue and to
 verify the certificate authorities came through it untouched.
 
-> Read [Limitations](limitations.md) for what k3sm does **not** do here — most importantly,
+> Read [Limitations](limitations.md) for what k3sm does **not** do here. Most importantly,
 > rotation does not revoke anything.
 
 ## Two CAs
@@ -19,17 +19,17 @@ k3sm stands up two independent self-signed CAs under the server work dir's `tls/
 
 **Neither CA is ever re-minted.** Re-minting the cluster CA would invalidate the pin in every
 join token and every node's kubeconfig; re-minting the signing CA would invalidate every client
-certificate at once. There is no CA-replacement flow — `k3sm certificate rotate-ca` exists only
+certificate at once. There is no CA-replacement flow. `k3sm certificate rotate-ca` exists only
 to say so explicitly. Replacing a CA means recreating the cluster.
 
 ## What Rotation Is
 
 Every control-plane boot re-issues the CA-signed leaves unconditionally: the scheduler and
 controller-manager client-cert kubeconfigs, and (on a multi-node server) the apiserver serving
-cert. A restart therefore *is* the rotation. `k3sm certificate rotate` is the safe wrapper
-around it:
+cert. A restart therefore *is* the rotation. `k3sm certificate rotate` wraps that restart with
+checks:
 
-1. verify the CA hierarchy is present and complete (reading only the certificates — never a CA
+1. verify the CA hierarchy is present and complete (reading only the certificates, never a CA
    private key);
 2. record both CA pins;
 3. report, or note the daemon's current pid and restart the `io.k3sm.server` LaunchDaemon;
@@ -39,16 +39,16 @@ around it:
 
 Step 5 is stricter than it looks. `launchctl kickstart -k` returns as soon as the restart is
 *requested*, and the outgoing control plane keeps its listeners for several seconds while it shuts
-its components down — so "the apiserver answers" alone would be satisfied by the instance that is
+its components down, so "the apiserver answers" alone would be satisfied by the instance that is
 going away, and a daemon that never came back would be reported as a success. The wait therefore
 requires a **changed launchd pid** as well as a healthy answer, and the answer must come from a TLS
 peer whose certificate chains to a CA k3sm already holds on disk (the cluster CA on a multi-node
 server, the apiserver's own self-signed cert on a single-node one). A different process holding the
 port is not the control plane coming back, and is reported as a failure.
 
-It writes **nothing** into the work dir. That is deliberate: the daemon runs as the unprivileged
-`_k3sm` user, so a root-written file there would make the *next* boot fail with EACCES — and
-launchd's `KeepAlive` would turn that into an invisible restart loop.
+It writes **nothing** into the work dir, because the daemon runs as the unprivileged `_k3sm` user:
+a root-written file there would make the *next* boot fail with EACCES, and launchd's `KeepAlive`
+would turn that into an invisible restart loop.
 
 ## Usage
 
@@ -71,7 +71,7 @@ one.
 | `--work-dir <dir>` | The control-plane state root. Defaults to this posture's work dir. |
 | `--apiserver-port <n>` | The port the post-restart health probe checks (default `6444`). |
 
-The command exits non-zero — and says where to look — if the hierarchy is missing or damaged, if
+The command exits non-zero (and says where to look) if the hierarchy is missing or damaged, if
 the daemon is not loaded, if a CA pin changed, or if a new instance of the control plane does not
 come back and serve.
 
@@ -79,10 +79,10 @@ come back and serve.
 
 A rotation restarts the control-plane daemon, which is **not** a graceful, in-place reload:
 
-- **Every pod on the node is destroyed.** Pods are in-process children of the daemon; there is no
+- Every pod on the node is destroyed. Pods are in-process children of the daemon; there is no
   durable pod-to-IP manifest, and startup reconciliation sweeps every k3sm-owned `lo0` alias.
   Controller-owned pods (Deployments, StatefulSets) are recreated; bare pods are not.
-- **The apiserver is unavailable for roughly 5–90 seconds** while kine and the apiserver come
+- The apiserver is unavailable for roughly 5–90 seconds while kine and the apiserver come
   back and the watch cache is rebuilt.
 - On an HA control plane the scheduler / controller-manager leader-election leases flap.
 
@@ -93,7 +93,7 @@ restart model applied to a version bump.
 
 | Not rotated | Why |
 |---|---|
-| The cluster CA and signing CA | Re-minting either orphans every node — see above. |
+| The cluster CA and signing CA | Re-minting either orphans every node; see above. |
 | `apiserver-certs/` | The apiserver's own self-signed serving material. It is also the controller-manager's `--root-ca-file` and therefore the source of every pod's projected `kube-root-ca.crt`; replacing it is a cluster-wide trust event. Out of scope. |
 | The admin kubeconfig and `tokens.csv` | The admin credential is a static bearer token set at install time, not a CA-signed identity. Re-run `sudo k3sm install` to change it. |
 | `sa.key` / `sa.pub` | The service-account signing keypair. Replacing it invalidates every issued ServiceAccount token. |
@@ -107,12 +107,12 @@ apiserver accepts *any* unexpired certificate signed by the signing CA. A certif
 by a rotation therefore **stays valid until it expires** (component certs are issued for one
 year).
 
-So rotation is renewal hygiene — keeping certificates well away from expiry — **not** a response
+Rotation is renewal hygiene, keeping certificates well away from expiry. It is **not** a response
 to a compromised credential. There is no supported way to invalidate one leaf certificate today.
 If a control-plane credential is compromised, the remedy is to recreate the cluster.
 
 ## Next
 
-- [Troubleshooting](troubleshooting.md) — when the control plane does not come back.
-- [Multi-node](multi-node.md) — join tokens and the CA pin a joining node checks.
-- [Limitations](limitations.md) — the real gaps.
+- [Troubleshooting](troubleshooting.md), when the control plane does not come back.
+- [Multi-node](multi-node.md), for join tokens and the CA pin a joining node checks.
+- [Limitations](limitations.md), the gaps.

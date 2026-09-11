@@ -3,7 +3,7 @@
 Bring up a single-node k3sm cluster on your Mac and run your first native Pod. This is the fastest
 path; [Install](install.md) explains what happens underneath.
 
-> **Requirements:** Apple Silicon (arm64), macOS 26+. k3sm runs Pods as native Darwin processes — see
+> **Requirements:** Apple Silicon (arm64), macOS 26+. k3sm runs Pods as native Darwin processes; see
 > [Concepts](concepts.md).
 
 ## 1. Install
@@ -14,14 +14,14 @@ curl -fsSL https://k3sm.io/install.sh | sh
 
 The script checks that this is an Apple silicon Mac on macOS 26+, downloads the release tarball and
 its checksums from GitHub Releases, verifies the sha256, prints exactly what it is about to do, and
-then runs `sudo k3sm install`. It installs the newest published release — and until the first stable
+then runs `sudo k3sm install`. It installs the newest published release. Until the first stable
 version is tagged, that means the newest pre-release. Pin a particular one with
 `K3SM_INSTALL_VERSION=v0.1.0`, or set `K3SM_INSTALL_DOWNLOAD_ONLY=1` to download and verify into the
 current directory without running anything as root.
 
 Two alternatives:
 
-- **Homebrew** — planned; the `k3sm-io/tap` is not published yet. When it ships:
+- **Homebrew** is planned, and the `k3sm-io/tap` is not published yet. When it ships, run
   `brew install k3sm-io/tap/k3sm && sudo k3sm install`.
 - **From source**, if you would rather build it yourself: clone the four `k3sm.io` repositories side
   by side, build with `CGO_ENABLED=1 go build -o k3sm ./cmd/k3sm`, then run `sudo ./k3sm install`.
@@ -45,20 +45,20 @@ k3sm status         # one screen: daemons, apiserver, node, workloads, data root
 kubectl get nodes   # one Ready darwin node
 ```
 
-The `install` row names the two LaunchDaemons: they are what makes the cluster survive a reboot, and
+The `install` row names the two LaunchDaemons. They are what makes the cluster survive a reboot, and
 `k3sm status` is how you check they came back. Its exit code is the verdict, so a script can branch
-on it — `k3sm status --help` lists the codes.
+on it; `k3sm status --help` lists the codes.
 
 Install merged an admin context into your `~/.kube/config`, so your own `kubectl` reaches the cluster
 with no further setup. See [kubectl access](kubectl-access.md) for the details, and
 [Install](install.md) for what the daemons do.
 
 > Running a **foreground** cluster instead (no daemons, for a throwaway experiment)? Then skip step 1
-> entirely and run `k3sm server` in a terminal — never both.
+> entirely and run `k3sm server` in a terminal. Never run both.
 
 ## 3. Run a Native Binary as a Pod
 
-k3sm workloads are native Darwin executables, not OCI Linux images — see [Images](images.md).
+k3sm workloads are native Darwin executables, not OCI Linux images; see [Images](images.md).
 The `image: native` sentinel runs an absolute host binary as a confined pod. Every k3sm Pod must
 declare the darwin node selector and tolerate the node's provider taint, so use a manifest rather
 than `kubectl run`:
@@ -87,7 +87,7 @@ kubectl get pods
 kubectl logs hello
 ```
 
-Drop the `nodeSelector` and the cluster rejects the Pod at admission — that guardrail is what keeps
+Drop the `nodeSelector` and the cluster rejects the Pod at admission. That guardrail keeps
 Linux-assuming workloads off these nodes. `examples/hello-native.yaml` in the repo is the same shape.
 
 For your own workload, build a darwin/arm64 binary with your normal toolchain and point
@@ -95,11 +95,12 @@ For your own workload, build a darwin/arm64 binary with your normal toolchain an
 
 ## Before You Go Further
 
-k3sm is not a drop-in Linux Kubernetes. Read [Limitations](limitations.md) — especially the notes on
-DNS, `restartPolicy` per runtime path, and the resource model — before building anything you depend on.
+k3sm is not a drop-in Linux Kubernetes. Before building anything you depend on, read
+[Limitations](limitations.md), especially the notes on DNS, `restartPolicy` per runtime path, and
+the resource model.
 
 ## Next
 
-- [Install](install.md) — the install model and the `_k3sm` posture.
-- [Concepts](concepts.md) — how Kubernetes maps onto Darwin processes.
-- [Troubleshooting](troubleshooting.md) — when something does not come up.
+- [Install](install.md) covers the install model and the `_k3sm` posture.
+- [Concepts](concepts.md) explains how Kubernetes maps onto Darwin processes.
+- [Troubleshooting](troubleshooting.md) helps when something does not come up.

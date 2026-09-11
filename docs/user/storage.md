@@ -10,21 +10,21 @@ Persistent storage in k3sm uses a **local-path** provisioner with **node affinit
   APFS filesystem, and the resulting PV carries **node affinity** pinning it to the node that holds the
   data. Binding is `WaitForFirstConsumer`, so the scheduler picks the node before the volume exists.
 
-## Node Affinity Is Load-Bearing
+## Node Affinity Pins the Pod
 
 Because a local-path PV lives on one node's disk, a Pod that mounts it can only be scheduled onto **that
 node**. In a [multi-node](multi-node.md) cluster this means stateful Pods are pinned to wherever their
-data lives — plan placement accordingly.
+data lives, so plan placement accordingly.
 
 ## Capacity Is Best-Effort
 
 PersistentVolume data and the kine datastore share one APFS volume, so a volume that grows without
 bound can fill the disk the datastore sits on. `capacity.storage` records what the claim asked for; it
-is not a quota. Over-commit is not refused when the volume binds — it surfaces later as a write
+is not a quota. Over-commit is not refused when the volume binds. It surfaces later as a write
 failure (`ENOSPC`) inside the Pod.
 
 Keeping the data root on its own volume is the way to bound that. A separate volume is declared in
-`/etc/fstab` — the only supported way to attach one — and must be mounted before the daemons start:
+`/etc/fstab`, the only supported way to attach one, and must be mounted before the daemons start:
 they refuse to run against a mountpoint with nothing mounted on it, because writing into the bare
 directory would put a second, empty datastore on the boot disk and hide the real volume's contents.
 `k3sm status` names that state (`data-root  not-mounted`) and prints the mount command; see
@@ -32,12 +32,12 @@ directory would put a second, empty datastore on the boot disk and hide the real
 
 ## Every Claim Must Name the Class
 
-`local-path` is **not** marked as the cluster's default StorageClass. That is deliberate: a PVC that did
-not ask for node-local storage is never silently bound to a volume that pins its Pod to one machine.
+`local-path` is **not** marked as the cluster's default StorageClass, so a PVC that did not ask for
+node-local storage is never silently bound to a volume that pins its Pod to one machine.
 
-The practical consequence is that **`storageClassName: local-path` is required on every PVC**. A claim
-that omits it matches no class, stays `Pending` indefinitely, and the Pod that mounts it reports
-`pod has unbound immediate PersistentVolumeClaims` — which names the symptom, not this cause.
+Every PVC therefore needs **`storageClassName: local-path`**. A claim that omits it matches no class,
+stays `Pending` indefinitely, and the Pod that mounts it reports
+`pod has unbound immediate PersistentVolumeClaims`, which names the symptom rather than this cause.
 
 ```sh
 kubectl get storageclass    # local-path, with no (default) marker — by design
@@ -67,14 +67,14 @@ on the host under the claim's directory, owned by the `_k3sm` service user. See
 
 ## What Is Not Supported (Yet)
 
-- **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present — see
+- **Volume resize, snapshots, and generic ephemeral volumes** are **planned**, not present. See
   [Limitations](limitations.md).
 - **`hostPath` bind mounts** and `terminationMessagePath` file mounts are a documented ceiling on the
-  native substrate (no Linux bind mounts) — see [Limitations](limitations.md).
+  native substrate (no Linux bind mounts). See [Limitations](limitations.md).
 - Networked / distributed storage classes are out of scope for the local-path model.
 
 ## Next
 
-- [Concepts](concepts.md) — the storage model in context.
-- [Backup & restore](backup-restore.md) — the control-plane datastore (distinct from PV data).
-- [Limitations](limitations.md) — the storage ceilings.
+- [Concepts](concepts.md) puts the storage model in context.
+- [Backup & restore](backup-restore.md) covers the control-plane datastore, which is distinct from PV data.
+- [Limitations](limitations.md) lists the storage ceilings.

@@ -1,16 +1,16 @@
-# The k3sm privilege model — user-space by default, one minimal root helper
+# The k3sm privilege model: user-space by default, one minimal root helper
 
-How k3sm runs without per-command `sudo`: a **one-time admin install** of a tiny root helper
-(`k3sm-netd`) that performs only the irreducibly privileged network operations, with **everything
-else** — the control plane, the Virtual Kubelet node, the runtime daemon, the Service proxy, and your
-Pods — running as a dedicated **unprivileged `_k3sm`** user. This is the pattern the desktop container
-tools and Linux VM managers on macOS all use (a small root-owned vmnet or socket helper beside an
-unprivileged main process), applied to k3sm. No networking fidelity is given up for it.
+k3sm runs without per-command `sudo`. A **one-time admin install** puts a tiny root helper
+(`k3sm-netd`) in place, and that helper performs only the irreducibly privileged network
+operations. Everything else runs as a dedicated **unprivileged `_k3sm`** user: the control plane,
+the Virtual Kubelet node, the runtime daemon, the Service proxy, and your Pods. The desktop
+container tools and Linux VM managers on macOS all work this way, each pairing a small root-owned
+vmnet or socket helper with an unprivileged main process. No networking fidelity is given up for it.
 
 The architecture behind this page is [DESIGN.md](DESIGN.md) §5b (networking) and §5c (control plane,
 bootstrap, packaging).
 
-## Why a helper at all — the macOS constraint
+## Why macOS needs a root helper
 
 A handful of operations are **irreducibly root** on macOS and cannot be done from an unprivileged
 process:
@@ -23,12 +23,12 @@ process:
 | bind a `<1024` port on a specific `lo0` VIP | the infra VIPs (`10.43.0.1:443` API, `10.43.0.10:53` DNS) and any `<1024` ClusterIP port | a reserved-port bind on a specific address needs root |
 
 The `com.apple.vm.networking` entitlement that *would* let a user-space `vmnet` client avoid all this
-is **Apple-contract-restricted** — the desktop container tools cannot obtain it either, which is
-exactly why they ship a one-time-admin root helper too. **Zero-root-ever is therefore impossible** for those four
-operations. The honest answer is everyone else's answer: do them in a minimal root daemon, installed
-once, and run everything else unprivileged.
+is **Apple-contract-restricted**. The desktop container tools cannot obtain it either, which is why
+they ship a one-time-admin root helper too. Zero-root-ever is therefore impossible for those four
+operations. k3sm takes the route everyone else takes. The four operations happen in a minimal root
+daemon, installed once, and everything else runs unprivileged.
 
-## The shape
+## Process layout
 
 ```
    you ──kubectl──▶ apiserver (loopback)          the admin kubeconfig install merged
@@ -43,57 +43,56 @@ once, and run everything else unprivileged.
    └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **`k3sm-netd` is the same single `k3sm` binary re-exec'd in `netd` mode** — one binary, two launchd
-  identities.
-- The unprivileged side is a **LaunchDaemon with `UserName=_k3sm`** (`RunAtLoad` + `KeepAlive`), *not*
-  a per-user LaunchAgent, so the cluster **survives a reboot** on a headless Mac and never depends on
-  a GUI login session.
-- **You are a different uid from `_k3sm`**, so Pods (which run as `_k3sm`) cannot read your
-  `~/.kube/config` or `~/.ssh` — POSIX permissions and Seatbelt both deny it.
+- `k3sm-netd` is the same single `k3sm` binary re-exec'd in `netd` mode. One binary carries two
+  launchd identities.
+- The unprivileged side is a LaunchDaemon with `UserName=_k3sm` (`RunAtLoad` + `KeepAlive`), not a
+  per-user LaunchAgent, so the cluster survives a reboot on a headless Mac and never depends on a
+  GUI login session.
+- You are a different uid from `_k3sm`, so Pods (which run as `_k3sm`) cannot read your
+  `~/.kube/config` or `~/.ssh`. POSIX permissions and Seatbelt both deny it.
 
-## The helper is the high-risk surface — and its controls
+## How the root helper is constrained
 
 A root daemon taking IPC from user space is the classic local-privilege-escalation surface, the CVE
 class `vmnetd` and `socket_vmnet` have lived through. `k3sm-netd` is built to a strict model:
 
-- **Networking and privileged-port binds ONLY.** No Pod spawning, no file operations, no sandbox
-  profile application — those stay in user space. The verb set is closed: `EnsureAlias`,
-  `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `LoadPFAnchor`, `BindPort`.
-- **Typed scalars, never text.** The RPC carries an IP, a typed peer (`{public key, endpoint,
-  allowedIPs}`), an MSS integer, a `{port, node address}` — never `route`, `pf` or wireguard-UAPI
+- The helper does networking and privileged-port binds, and nothing else. No Pod spawning, no file
+  operations, no sandbox profile application; those stay in user space. The verb set is closed:
+  `EnsureAlias`, `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `LoadPFAnchor`, `BindPort`.
+- The RPC carries typed scalars, never text. It passes an IP, a typed peer (`{public key, endpoint,
+  allowedIPs}`), an MSS integer, a `{port, node address}`, and never `route`, `pf` or wireguard-UAPI
   *text*. The daemon **renders** the privileged artifact itself and **re-validates** every parameter
   against pinned policy: an alias must be a `/32` inside the pinned aggregate intersected with the
   node's Pod CIDR; a route must pass the route-set predicate; the `pf` rule is the daemon's own
-  MSS-clamp template loaded into the `io.k3sm.*` anchor. This is the `socket_vmnet` lesson — never
-  pass caller-supplied arguments to a privileged tool.
-- **A privileged-port bind is authorized, not merely requested**, and only for **specific `lo0` VIP
+  MSS-clamp template loaded into the `io.k3sm.*` anchor. This follows the `socket_vmnet` lesson that
+  caller-supplied arguments never reach a privileged tool.
+- A privileged-port bind is authorized, not merely requested, and only for **specific `lo0` VIP
   addresses**, never a wildcard. The helper's `<1024` `BindPort` serves the infra VIPs
-  (`10.43.0.1:443`, `10.43.0.10:53`) and any `<1024` ClusterIP port; the bind is permitted only when
+  (`10.43.0.1:443`, `10.43.0.10:53`) and any `<1024` ClusterIP port. The bind is permitted only when
   the Service-backed authorizer confirms a real Service declares that port, and the daemon binds the
-  **specific VIP address**, rejecting a wildcard request. **NodePort is not bound by the helper**: it
+  **specific VIP address**, rejecting a wildcard request. The helper does not bind NodePort, which
   needs all-interfaces reachability including `127.0.0.1`, so the Service proxy binds a wildcard
-  `*:nodePort` in-process — the apiserver pins the NodePort range to `30000-32767`, all of which are
-  `≥1024` and bindable unprivileged as `_k3sm`. A `<1024` NodePort is unsupported.
-  LoadBalancer and Ingress listeners likewise bind the **wildcard**, and on macOS a wildcard
-  privileged bind needs no root (a specific-address one does — inverted from Linux), so that datapath
-  never reaches the helper at all.
-- **Peer authentication.** `LOCAL_PEERCRED` requires the `_k3sm` uid, which keeps *other* local users
-  off the socket. A code-identity check (audit token → code-signature validity against the signed
-  binary's designated requirement) is a documented defense-in-depth follow-up.
-- **Root-owned everything.** The binary and plist live in `/Library/k3sm` (`root:wheel`, `0755`) —
-  deliberately *not* a Homebrew, `/usr/local` or `/Applications` prefix that a member of the `admin`
-  group could overwrite. The socket lives in a root-owned directory, mode `0660`. On a signed release
-  the helper is notarized with a hardened runtime, minimal entitlements, and a designated requirement
-  pinned to its identifier and team, so it cannot be downgraded or substituted.
-- **Bounded and robust.** The helper emits file descriptors outward only (it never accepts an inbound
-  descriptor or path); per-connection resource caps are sized to a node's `/24` Pod capacity; the
-  decoder is allocation-bounded, returns errors and never panics; every rejection and lifecycle event
-  is logged.
-- **Crash recovery.** When the helper restarts, the user-space client invalidates its idempotency
-  cache on socket reconnect and re-ensures every live Pod IP, and the mesh reconverges through the
-  peer informer's bounded periodic resync (≤30 s), which re-applies the full wireguard state. A
-  helper restarted out from under a running cluster therefore reconverges within the resync interval
-  rather than stranding Pods.
+  `*:nodePort` in-process, and the apiserver pins the NodePort range to `30000-32767`, all of which
+  are `≥1024` and bindable unprivileged as `_k3sm`. A `<1024` NodePort is unsupported. LoadBalancer
+  and Ingress listeners likewise bind the **wildcard**, and on macOS a wildcard privileged bind needs
+  no root while a specific-address one does (inverted from Linux), so that datapath never reaches the
+  helper at all.
+- The socket authenticates its peer. `LOCAL_PEERCRED` requires the `_k3sm` uid, which keeps *other*
+  local users off the socket. A code-identity check (audit token → code-signature validity against
+  the signed binary's designated requirement) is a documented defense-in-depth follow-up.
+- Everything the helper owns is root-owned. The binary and plist live in `/Library/k3sm`
+  (`root:wheel`, `0755`), and not in a Homebrew, `/usr/local` or `/Applications` prefix that a member
+  of the `admin` group could overwrite. The socket lives in a root-owned directory, mode `0660`. On a
+  signed release the helper is notarized with a hardened runtime, minimal entitlements, and a
+  designated requirement pinned to its identifier and team, so it cannot be downgraded or
+  substituted.
+- The helper emits file descriptors outward only, and never accepts an inbound descriptor or path.
+  Per-connection resource caps are sized to a node's `/24` Pod capacity. The decoder is
+  allocation-bounded, returns errors and never panics. Every rejection and lifecycle event is logged.
+- When the helper restarts, the user-space client invalidates its idempotency cache on socket
+  reconnect and re-ensures every live Pod IP, and the mesh reconverges through the peer informer's
+  bounded periodic resync (≤30 s), which re-applies the full wireguard state. A helper restarted out
+  from under a running cluster reconverges within the resync interval rather than stranding Pods.
 
 ## Network egress is a contract, not a Seatbelt boundary
 
@@ -104,76 +103,75 @@ network stanza under `(deny default)` that an ordinary networked Pod gets. No pr
 dropped by the annotation, and network-layer enforcement is future work. **Never describe it as a
 network isolation boundary.**
 
-## The one residual limitation — no per-Pod uid isolation
+## One residual limitation: no per-Pod uid isolation
 
-Because the helper is networking-only — minting a per-Pod uid would need root *in the runtime*, which
-is exactly the privilege this model removes — every Pod on a node runs as the **same `_k3sm` uid**,
-Seatbelt-confined. The consequences, stated plainly:
+The helper is networking-only, because minting a per-Pod uid would need root *in the runtime*, which
+is the privilege this model removes. So every Pod on a node runs as the **same `_k3sm` uid**,
+Seatbelt-confined. The consequences:
 
 - Pods share `_k3sm` with the runtime's own helper client, so `LOCAL_PEERCRED` does **not** separate a
-  Pod from the helper. The load-bearing barrier keeping a Pod off the helper socket is the **Seatbelt
-  AF_UNIX deny** the runtime emits into every Pod's profile; the helper's own request validation
-  backstops even a breach, since a socket-reaching Pod could still only ask for operations a
-  legitimate client would.
+  Pod from the helper. What keeps a Pod off the helper socket is the **Seatbelt AF_UNIX deny** the
+  runtime emits into every Pod's profile; the helper's own request validation backstops even a
+  breach, since a socket-reaching Pod could still only ask for operations a legitimate client would.
 - A Pod requesting a **foreign `runAsUser` / `runAsGroup` / `fsGroup` / `supplementalGroups`** is
-  **rejected at admission**, never silently coerced. k3sm does not pretend to honor an isolation it
-  cannot provide.
+  **rejected at admission**, never silently coerced, since k3sm cannot provide that isolation.
 - **Untrusted or multi-tenant workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md)**,
-  which is backed by Virtualization.framework — an *entitlement*, not root — and is a real isolation
-  boundary. **It does not run a Pod yet**, so this is where such workloads belong by design, not a
-  mitigation available today; until it lands, a node is one trust domain with no in-product
-  alternative. This is consistent with the long-standing design position that same-node Pods are one
-  trust domain ([DESIGN.md](DESIGN.md) §3).
+  which is backed by Virtualization.framework (an *entitlement*, not root) and is a real isolation
+  boundary. **It does not run a Pod yet**, so it is where such workloads belong by design and not a
+  mitigation available today. Until it lands, a node is one trust domain with no in-product
+  alternative, consistent with the long-standing design position that same-node Pods are one trust
+  domain ([DESIGN.md](DESIGN.md) §3).
 - If the runtime's Seatbelt capability probe ever fails, the runtime degrades to **`vm` or
-  refuse-to-run** — never to "run the Pod unconfined."
-- **Signalling the control plane.** The control-plane children run under the same `_k3sm` uid as
-  native Pods, and a component's death now takes the whole server down for a launchd restart — so the
-  shared uid is also a *liveness* surface, not only a confidentiality one. A **Seatbelt-confined Pod
-  cannot reach it**: every generated profile begins `(deny default)` and no profile grants a `signal`
-  stanza. The residual is any **non-sandboxed process already running as `_k3sm`**, which is the same
-  one-trust-domain limitation this section names — it can restart the node's control plane, though not
-  escalate beyond the uid it already holds.
+  refuse-to-run**, never to "run the Pod unconfined."
+- The control-plane children run under the same `_k3sm` uid as native Pods, and a component's death
+  now takes the whole server down for a launchd restart, so the shared uid is a *liveness* surface as
+  well as a confidentiality one. A **Seatbelt-confined Pod cannot reach it**, because every generated
+  profile begins `(deny default)` and no profile grants a `signal` stanza. The residual is any
+  **non-sandboxed process already running as `_k3sm`**, the same one-trust-domain limitation this
+  section names. Such a process can restart the node's control plane, though it cannot escalate
+  beyond the uid it already holds.
 
 ## Install, run, upgrade, uninstall
 
-- **Install — the one privileged step.** `sudo k3sm install` creates `_k3sm`, copies the binary and
-  plists into the root-owned `/Library/k3sm`, bootstraps the `io.k3sm.netd` (root) and
+- **Install.** `sudo k3sm install` is the one privileged step. It creates `_k3sm`, copies the binary
+  and plists into the root-owned `/Library/k3sm`, bootstraps the `io.k3sm.netd` (root) and
   `io.k3sm.server` (`UserName=_k3sm`) LaunchDaemons, and merges an admin kubeconfig into the
   **invoking** user's `~/.kube/config`. It uses the classic `launchctl` path rather than
   `SMAppService`, which requires a GUI `.app` bundle and a System Settings approval and cannot be
-  re-registered by a package-manager upgrade — disqualifying for a headless CLI server.
+  re-registered by a package-manager upgrade, all of which disqualify it for a headless CLI server.
   See [user/install.md](user/install.md).
-- **Run — no `sudo`.** Afterwards `kubectl` and the whole Pod lifecycle run as you and as `_k3sm`
-  with no `sudo`, and the stack survives a reboot.
+- **Run.** Afterwards nothing needs `sudo`. `kubectl` and the whole Pod lifecycle run as you and as
+  `_k3sm` with no `sudo`, and the stack survives a reboot.
 - **Networking modes.** `k3sm server --network auto` (the default) uses the direct `lo0` path when
-  running as root and the helper plus a startup probe otherwise — the production posture.
+  running as root, and the helper plus a startup probe otherwise, which is how it runs in production.
   `--network none` is no-op networking for control-plane-only or CI bring-up; it is **not** a
   production fallback.
 - **Upgrade.** Re-running the install script, or a Homebrew upgrade once the tap ships, replaces the
   binary and restarts both LaunchDaemons onto it. The helper RPC is version-stamped and additive, so
   a routine upgrade does not break the datapath. Homebrew packaging and the notarized, signed
   installer are the second and third install generations, arriving with and after the first public
-  release — see [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
+  release. See [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
 - **Uninstall.** `sudo k3sm uninstall` boots out both daemons, removes the `lo0` aliases, and removes
-  `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd — the kernel
-  reaps a `utun` when the process holding it exits. **The `io.k3sm.*` `pf` anchor is not removed**: it
-  is left in the packet filter until an explicit `pfctl` flush or the next reboot. Uninstall therefore
-  does *not* flush all privileged state; if that matters to you, flush the anchor by hand.
+  `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd, because the
+  kernel reaps a `utun` when the process holding it exits. **The `io.k3sm.*` `pf` anchor is not
+  removed**: it stays in the packet filter until an explicit `pfctl` flush or the next reboot, so
+  uninstall does *not* flush all privileged state. If that matters to you, flush the anchor by hand.
 
 ## Explicitly out of scope
 
 - **A fully zero-admin install.** Impossible on macOS for `lo0`, `utun`, `pf` and `<1024` binds, since
-  the entitlement that would avoid them is Apple-restricted. The one-time admin step is unavoidable;
-  every desktop container tool on macOS needs it.
+  the entitlement that would avoid them is Apple-restricted. The one-time admin step is unavoidable,
+  and every desktop container tool on macOS needs it.
 - **Per-Pod uid isolation without a VM.** The helper is networking-only by decision; untrusted
   workloads are destined for the [`vm` RuntimeClass](user/vm-runtimeclass.md), which does not run yet.
-- **Rootless multi-node without the helper.** The mesh — `utun` and routes — is irreducibly root.
+- **Rootless multi-node without the helper.** The mesh needs `utun` and routes, which are irreducibly
+  root.
 
 ## Related
 
-- [DESIGN.md](DESIGN.md) — §3 (the trust domain), §5b (networking), §5c (install and packaging),
-  §6 (the one-binary doctrine).
-- [user/install.md](user/install.md) — the install channels and what each lays down.
-- [user/limitations.md](user/limitations.md) — the no-per-Pod-uid-isolation gap in context.
-- [user/vm-runtimeclass.md](user/vm-runtimeclass.md) — the intended isolation boundary for untrusted
-  workloads (not running yet).
+- [DESIGN.md](DESIGN.md) covers §3 (the trust domain), §5b (networking), §5c (install and packaging),
+  and §6 (the one-binary doctrine).
+- [user/install.md](user/install.md) lists the install channels and what each lays down.
+- [user/limitations.md](user/limitations.md) puts the no-per-Pod-uid-isolation gap in context.
+- [user/vm-runtimeclass.md](user/vm-runtimeclass.md) describes the intended isolation boundary for
+  untrusted workloads, which does not run yet.

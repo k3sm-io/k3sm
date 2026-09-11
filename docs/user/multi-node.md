@@ -20,9 +20,9 @@ On the server, mint a join token:
 sudo k3sm token create
 ```
 
-Run it with `sudo`: the cluster CA whose hash the token pins lives in the control-plane state root,
-which belongs to the `_k3sm` service user. Without `sudo` the work dir resolves to your own home and
-the command exits non-zero rather than inventing a CA there.
+Run it with `sudo`, because the cluster CA whose hash the token pins lives in the control-plane
+state root, which belongs to the `_k3sm` service user. Without `sudo` the work dir resolves to your
+own home and the command exits non-zero rather than inventing a CA there.
 
 On the agent Mac:
 
@@ -32,17 +32,17 @@ k3sm agent --server <server-underlay-ip> --node-ip <this-macs-underlay-ip> --tok
 ```
 
 `--server` is the control-plane Mac's **underlay** address (a LAN IP or DNS name, no scheme, no
-port) — the join dials `<server>:9345`, not the apiserver's `:6443`. `--node-ip` is **required**:
-it's this Mac's own underlay address, bound into the certs the join issues.
+port). The join dials `<server>:9345`, not the apiserver's `:6443`. `--node-ip` is **required**. It
+is this Mac's own underlay address, bound into the certs the join issues.
 
 The agent authenticates with the bootstrap token, receives its node credentials, and its wireguard peer
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
-the node — the `MeshPeer` records carry public keys only.
+the node. The `MeshPeer` records carry public keys only.
 
 ## What Crosses Nodes
 
-- **Services** resolve cluster-wide via the userspace Service proxy.
-- **Mesh traffic** between Pods on different nodes rides the wireguard tunnel with per-peer symmetric
+- Services resolve cluster-wide via the userspace Service proxy.
+- Mesh traffic between Pods on different nodes rides the wireguard tunnel with per-peer symmetric
   `AllowedIPs`.
 
 ## Caveats
@@ -52,7 +52,7 @@ the node — the `MeshPeer` records carry public keys only.
   shipped acceptance gate, and cross-node traffic to or from a `vm` Pod is out of scope for this
   release ([Limitations](limitations.md)).
 - Per-pod IP identity and headless/StatefulSet DNS records are present, but multi-node as a whole is
-  EXPERIMENTAL — validate cross-node resolution for your own workload rather than assuming it. See
+  EXPERIMENTAL. Validate cross-node resolution for your own workload rather than assuming it. See
   [Limitations](limitations.md).
 - A cluster upgrade is a **node-by-node** rolling restart of the launchd daemons; see
   [Upgrade](upgrade.md).
@@ -60,6 +60,6 @@ the node — the `MeshPeer` records carry public keys only.
 
 ## Next
 
-- [HA](ha.md) — HA control plane.
-- [Upgrade](upgrade.md) — the rolling-restart model.
-- [Troubleshooting](troubleshooting.md) — join and mesh failures.
+- [HA](ha.md) covers the HA control plane.
+- [Upgrade](upgrade.md) describes the rolling-restart model.
+- [Troubleshooting](troubleshooting.md) covers join and mesh failures.

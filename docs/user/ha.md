@@ -16,25 +16,23 @@ bundle. This builds on the [multi-node](multi-node.md) mesh.
 
 ## What to Plan For
 
-- **Datastore** — the Postgres datastore is the state of record. Understand
-  [Backup & restore](backup-restore.md) before running HA; a datastore restore is the recovery path if
-  data is lost.
-- **Rolling upgrades** — control-plane Macs upgrade **node-by-node** via launchd restart, creating a
-  brief binary-version-skew window. See [Upgrade](upgrade.md).
-- **Consistency** — single-node datastore consistency is consistent-LIST with a soak-pending
-  watch-staleness posture; multi-node consistency semantics inherit that caveat. See
-  [Limitations](limitations.md).
+- The Postgres datastore is the state of record. Read [Backup & restore](backup-restore.md) before
+  running HA; a datastore restore is the recovery path if data is lost.
+- Control-plane Macs upgrade **node-by-node** via launchd restart, creating a brief
+  binary-version-skew window. See [Upgrade](upgrade.md).
+- Single-node datastore consistency is consistent-LIST with a soak-pending watch-staleness posture,
+  and multi-node consistency semantics inherit that caveat. See [Limitations](limitations.md).
 
 ## Caveats
 
 Because HA is EXPERIMENTAL, do not treat it as a production availability guarantee yet. Validate
-failover and restore on your own hardware, and keep datastore backups — on this posture that means
+failover and restore on your own hardware, and keep datastore backups. With HA that means
 `pg_dump`/PITR against your Postgres, not the single-node SQLite procedure (see
-[Backup & restore](backup-restore.md)). `k3sm snapshot save`/`restore` refuse here and say so: they
-cover the single-node SQLite datastore only, and k3sm does not read your Postgres.
+[Backup & restore](backup-restore.md)). `k3sm snapshot save`/`restore` refuse here and say so,
+because they cover the single-node SQLite datastore only and k3sm does not read your Postgres.
 
 ## Next
 
-- [Multi-node](multi-node.md) — the mesh HA rides on.
-- [Backup & restore](backup-restore.md) — datastore recovery.
-- [Upgrade](upgrade.md) — rolling restarts.
+- [Multi-node](multi-node.md) is the mesh HA rides on.
+- [Backup & restore](backup-restore.md) covers datastore recovery.
+- [Upgrade](upgrade.md) describes the rolling restarts.
