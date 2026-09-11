@@ -169,6 +169,26 @@ func (l *uncompressedFileLayer) Uncompressed() (io.ReadCloser, error) { return o
 func writeTar(w io.Writer, entries []entry) error {
 	tw := tar.NewWriter(w)
 	seen := make(map[string]bool, len(entries)*2)
+	// ONE copy buffer for the whole tar, reused by every entry.
+	//
+	// io.Copy cannot take either of its allocation-free fast paths here:
+	// *tar.Writer does not implement io.ReaderFrom (archive/tar keeps readFrom
+	// unexported) and *io.LimitedReader does not implement io.WriterTo. So it
+	// falls through to allocating a scratch buffer per call — and because its
+	// *LimitedReader special case sizes that buffer to min(32KiB, remaining),
+	// a file UNDER 32 KiB gets a buffer the size of the file. Per-entry, that
+	// made discarded buffer volume track the context's total BYTES rather than
+	// its entry count: measured at 86% of allocated bytes for a 3000-file tree
+	// of 6 KiB files, and 97% for 256 KiB files (BenchmarkWriteTarSmallFiles /
+	// LargeFiles). A context may be up to MaxContextBytes (2 GiB) and nothing
+	// bounds the entry count, so the ceiling was ~2 GiB of single-use buffer.
+	//
+	// Chunk size does not affect the emitted bytes — tar.Writer.Write forwards
+	// to regFileWriter.Write, which only decrements its remaining count, and
+	// padding is computed from that count, not from write boundaries — so the
+	// layer digest is unchanged. That is load-bearing here (see the determinism
+	// contract in doc.go) and is gated by TestBuildFromScratchDigestUnchanged.
+	buf := make([]byte, 32*1024)
 
 	for _, e := range entries {
 		if err := checkEntryName(e.name); err != nil {
@@ -217,7 +237,7 @@ func writeTar(w io.Writer, entries []entry) error {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		if err := copyBody(tw, e); err != nil {
+		if err := copyBody(tw, e, buf); err != nil {
 			return err
 		}
 	}
@@ -230,7 +250,10 @@ func writeTar(w io.Writer, entries []entry) error {
 // copyBody streams one regular file into the archive, refusing a file that grew
 // or shrank since it was selected. A short or over-long body would otherwise be
 // silently absorbed into a valid-looking archive.
-func copyBody(tw *tar.Writer, e entry) error {
+// buf is the caller's reusable copy buffer; it must be non-empty, since
+// io.CopyBuffer panics on a non-nil zero-length buffer. It is not safe to share
+// across goroutines — writeTar is single-goroutine and must stay so.
+func copyBody(tw *tar.Writer, e entry, buf []byte) error {
 	f, size, err := openRegular(e.host)
 	if err != nil {
 		return err
@@ -239,7 +262,7 @@ func copyBody(tw *tar.Writer, e entry) error {
 	if size != e.size {
 		return fmt.Errorf("%s changed size during the build (%d → %d)", e.name, e.size, size)
 	}
-	n, err := io.Copy(tw, io.LimitReader(f, e.size))
+	n, err := io.CopyBuffer(tw, io.LimitReader(f, e.size), buf)
 	if err != nil {
 		return fmt.Errorf("write %s: %w", e.name, err)
 	}
@@ -252,9 +275,25 @@ func copyBody(tw *tar.Writer, e entry) error {
 // writeParents emits an explicit directory entry for every ancestor of name, so
 // an unpacker never has to infer one (and never has to choose a mode for it).
 func writeParents(tw *tar.Writer, name string, seen map[string]bool) error {
-	parts := strings.Split(name, "/")
-	for i := 1; i < len(parts); i++ {
-		dir := strings.Join(parts[:i], "/")
+	// Walk the separator positions and slice prefixes directly. The previous
+	// strings.Split + strings.Join per ancestor allocated the label slice plus a
+	// fresh string for every ancestor of every entry — ~7 allocations per entry
+	// at depth 6, almost all of them immediately garbage because the seen[dir]
+	// test happens AFTER the Join has already built the string. A prefix slice
+	// of an existing string allocates nothing, so the only remaining allocation
+	// is on a directory's FIRST sighting, which is real work.
+	//
+	// Equivalent to the split form on every input: Split+parts[:i] yields
+	// exactly the prefixes ending before each "/", which is what slicing at
+	// each separator index gives. A leading "/" produced parts[0] == "" and was
+	// skipped by the dir == "" guard; name[:0] == "" is skipped by the same
+	// guard. A trailing "/" cannot occur (callers pass e.name; the "/" suffix is
+	// appended later) and an empty name is rejected by checkEntryName first.
+	for i := range len(name) {
+		if name[i] != '/' {
+			continue
+		}
+		dir := name[:i]
 		if dir == "" || seen[dir] {
 			continue
 		}

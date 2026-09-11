@@ -183,7 +183,7 @@ func emulationRefusal(o buildOptions, parseErr error) error {
 //
 // The store holds single-platform entries, and the reason the choice is not
 // arbitrary is the summary line it feeds: the build tells the operator to
-// `kubectl run app --image=<tag>`, and that is true only for an image a Pod on
+// a Pod naming `<tag>`, and that is true only for an image a Pod on
 // this node can actually run. So the pick is the platform the node's own Linux
 // guests run — the engine's guest platform — and a build that produced none is
 // refused rather than recorded under a name that would not start.
