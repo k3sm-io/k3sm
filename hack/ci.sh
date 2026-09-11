@@ -53,8 +53,9 @@ if [ -n "$go_pkgs" ]; then
 	# staticcheck, scoped to non-test code with -tests=false.
 	#
 	# The scope is deliberate and worth stating, because an unscoped run is not
-	# gateable today: it reports ~54 findings, 52 of them one mechanical
-	# deprecation (fake.NewSimpleClientset -> fake.NewClientset) in test files,
+	# gateable today: it reports 55 findings, every one in a _test.go file: 50 of
+	# one mechanical deprecation (fake.NewSimpleClientset -> fake.NewClientset),
+	# four unused test helpers in pkg/executor/childreap_test.go (U1000),
 	# plus one known false positive (SA4000 at pkg/provider/probe_test.go,
 	# refuted in docs/audits/audit-findings.md — feed() mutates via m.observe(),
 	# so the two operands are different state transitions). Gating on non-test
