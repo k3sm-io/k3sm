@@ -249,33 +249,6 @@ func TestM3_3_ResolverBindsViaHelper(t *testing.T) {
 	}
 }
 
-// TestParseClusterServiceName checks the <svc>.<ns>.svc.<domain> A-name parser and
-// the cluster-domain containment used to keep cluster names off the upstream.
-func TestParseClusterServiceName(t *testing.T) {
-	t.Parallel()
-	const domain = "cluster.local"
-	cases := []struct {
-		qname              string
-		wantSvc, wantNS    string
-		wantOK, wantInZone bool
-	}{
-		{"kubernetes.default.svc.cluster.local", "kubernetes", "default", true, true},
-		{"web.prod.svc.cluster.local", "web", "prod", true, true},
-		{"too.many.labels.svc.cluster.local", "", "", false, true}, // in domain, not a 2-label svc name
-		{"6-4-3-2.default.pod.cluster.local", "", "", false, true}, // pod record (unsupported) but in domain
-		{"example.com", "", "", false, false},                      // off-cluster → forwarded
-	}
-	for _, tc := range cases {
-		svc, ns, ok := parseClusterServiceName(tc.qname, domain)
-		if ok != tc.wantOK || svc != tc.wantSvc || ns != tc.wantNS {
-			t.Errorf("parseClusterServiceName(%q) = (%q,%q,%v), want (%q,%q,%v)", tc.qname, svc, ns, ok, tc.wantSvc, tc.wantNS, tc.wantOK)
-		}
-		if got := inClusterDomain(tc.qname, domain); got != tc.wantInZone {
-			t.Errorf("inClusterDomain(%q) = %v, want %v", tc.qname, got, tc.wantInZone)
-		}
-	}
-}
-
 // queryUDP sends an A query for name to a UDP DNS server and returns its rcode + A
 // answers.
 func queryUDP(t *testing.T, server, name string) (dnsmessage.RCode, []netip.Addr) {

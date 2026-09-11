@@ -815,18 +815,6 @@ func truncateResponse(resp []byte) ([]byte, error) {
 	return b.Finish()
 }
 
-// parseClusterServiceName splits an A query name of the form
-// <svc>.<ns>.svc.<domain> into its service and namespace, with ok==false when the
-// name is not a two-label Service name under .svc.<domain>. qname must already be
-// normalized (lowercased, no trailing dot).
-func parseClusterServiceName(qname, domain string) (svc, ns string, ok bool) {
-	extraLabels, svc, ns, ok := parseClusterZoneName(qname, domain)
-	if !ok || extraLabels != 0 {
-		return "", "", false
-	}
-	return svc, ns, true
-}
-
 // parseClusterZoneName splits any name under .svc.<domain> into its owning
 // service and namespace (the two labels immediately before the suffix) and
 // COUNTS the extra leading labels: a per-endpoint identity name yields one
