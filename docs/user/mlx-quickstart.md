@@ -1,7 +1,7 @@
 # MLX quickstart
 
 Serve a language model on your Mac's GPU and call it from an OpenAI-compatible client. k3sm models the
-workload as an **`MLXModel`** object: you declare the model and the memory it needs, and k3sm renders
+workload as an **`MLXModel`** object. You declare the model and the memory it needs, and k3sm renders
 the serving workload, its Services, and its weight cache.
 
 > **Requirements:** Apple Silicon (arm64), macOS 26+, a running k3sm cluster ([Quickstart](quickstart.md)),
@@ -18,7 +18,7 @@ kubectl get nodes -L mlx.k3sm.io/chip,mlx.k3sm.io/chip-family,mlx.k3sm.io/memory
 kubectl get nodes -o jsonpath='{.items[*].status.allocatable.mlx\.k3sm\.io/gpu}{"\n"}'
 ```
 
-The count is `1` — a Mac has one integrated GPU — so **one model serves per node at a time**. A second
+The count is `1`, because a Mac has one integrated GPU, so **one model serves per node at a time**. A second
 `MLXModel` on the same Mac stays Pending until the first is deleted, rather than contending for the
 same device.
 
@@ -35,17 +35,17 @@ Three fields in it look optional but are not:
 
 | Field | Why you must set it |
 |---|---|
-| `runtime.image` | k3sm ships no built-in serving image. Use the published `mlx-serve` image, ideally by digest — the digest for your release is recorded in [the image's build notes](../../hack/images/mlx-serve/README.md). |
+| `runtime.image` | k3sm ships no built-in serving image. Use the published `mlx-serve` image, ideally by digest. The digest for your release is recorded in [the image's build notes](../../hack/images/mlx-serve/README.md). |
 | `port` | Must match the image; `mlx-serve` listens on 8000. |
 | `cache.storageClassName` | k3sm marks no StorageClass as default, so `local-path` must be named or the cache volume never binds. See [Storage](storage.md). |
 
-`memory` is the other field worth understanding: on Apple Silicon the GPU shares system memory, so this
+`memory` is the other field to get right. On Apple Silicon the GPU shares system memory, so this
 is both the scheduling constraint and the budget the serving engine's context window is derived from.
 More memory buys a longer context; too little is rejected up front with a reason, rather than failing
 later on the node.
 
 Pin `revision` to an exact model revision. Leaving it empty means the repository's default branch, which
-moves — two replicas started weeks apart would then serve different weights under one object.
+moves, and two replicas started weeks apart would then serve different weights under one object.
 
 Two things follow from how the pin is applied. The serving engine has no option that takes a revision, so
 k3sm points it at that revision's directory **inside the cache volume** instead:
@@ -56,15 +56,15 @@ k3sm points it at that revision's directory **inside the cache volume** instead:
   model, leave `revision` empty for the first start (the engine downloads the default branch), or stage
   the weights into the volume yourself.
 
-`quantization` is rejected today: the engine has no expression for it, and serving a different variant
-than the one asked for would look like success. Name the quantized repository in `model` instead —
-`mlx-community/Qwen3-0.6B-4bit` already does.
+`quantization` is rejected today, because the engine has no expression for it and serving a different
+variant than the one asked for would look like success. Name the quantized repository in `model`
+instead. `mlx-community/Qwen3-0.6B-4bit` already does.
 
 ## 3. Watch It Become Ready
 
-The first start downloads the weights, which can take a while on a cold cache — unless `revision` is
-pinned, in which case they must already be in the volume (above). Read the **conditions**,
-not the `PHASE` column — `PHASE` is a one-word summary for humans and loses information:
+The first start downloads the weights, which can take a while on a cold cache. If `revision` is
+pinned, the weights must already be in the volume (above). Read the **conditions**, not the `PHASE`
+column. `PHASE` is a one-word summary for humans and loses information:
 
 ```sh
 kubectl get mlxmodel qwen3-06b -w
@@ -76,8 +76,8 @@ The `Ready` condition's `reason` names the state: `Pending` (no replica running 
 (fetching weights), `Loading` (weights fetched, model loading), `Serving` (ready), `PodFailed` (the
 replica died), `ScaledToZero` (you set `replicas: 0`).
 
-There is no liveness probe on the serving pod: a first start is an unbounded download, and
-a probe that killed it would restart the download from zero.
+There is no liveness probe on the serving pod, because a first start is an unbounded download and a
+probe that killed it would restart the download from zero.
 
 ## 4. Call It
 
@@ -101,7 +101,7 @@ curl -sS "http://$VIP:8000/v1/chat/completions" \
       }'
 ```
 
-Any OpenAI-compatible client works — point its base URL at `http://$VIP:8000/v1` and give it any
+Any OpenAI-compatible client works. Point its base URL at `http://$VIP:8000/v1` and give it any
 non-empty API key. Concurrent requests are batched by the server; the number it will batch is derived
 from `memory`.
 
@@ -112,17 +112,17 @@ kubectl delete mlxmodel qwen3-06b
 ```
 
 That removes the serving workload, both Services, and the cache PVC. The underlying PersistentVolume is
-**retained** — the downloaded weights stay on disk until you remove them by hand ([Storage](storage.md)).
+**retained**, so the downloaded weights stay on disk until you remove them by hand ([Storage](storage.md)).
 
 ## Things to Know
 
-- MLX serving runs on the **default native runtime path**. Do not set `runtimeClassName: vm`: the
-  serving process needs direct access to the Mac's GPU, and the [`vm` RuntimeClass](vm-runtimeclass.md) isolates a workload from exactly that.
+- MLX serving runs on the **default native runtime path**. Do not set `runtimeClassName: vm`.
+  The serving process needs direct access to the Mac's GPU, and the [`vm` RuntimeClass](vm-runtimeclass.md) isolates a workload from exactly that.
 - Because it runs natively, a served model shares the `_k3sm` trust domain with the other native Pods on
-  that Mac. Serve **models and code you trust** — see [Limitations](limitations.md).
+  that Mac. Serve **models and code you trust**; see [Limitations](limitations.md).
 - Weights never live in the image. They are downloaded on first start into the cache volume, so give
   that volume room for the model you are serving. A pinned `revision` is loaded from that volume rather
-  than downloaded into it — see step 2.
+  than downloaded into it (see step 2).
 - `spec.distributed` is reserved for future multi-node sharded serving and is rejected today. One model
   serves from one node.
 - The **Apple Neural Engine is not a serving target**. MLX runs on the GPU; Apple publishes no stable

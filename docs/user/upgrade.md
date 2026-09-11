@@ -4,7 +4,7 @@ Moving a k3sm node or cluster to a new release.
 
 ## Single Node
 
-Script (gen-1) installs — re-run the one-liner:
+For script (gen-1) installs, re-run the one-liner:
 
 ```sh
 curl -fsSL https://k3sm.io/install.sh | sh
@@ -12,17 +12,17 @@ curl -fsSL https://k3sm.io/install.sh | sh
 
 An unpinned re-run installs the **latest** release. Pin `K3SM_INSTALL_VERSION=vX.Y.Z` to
 re-install the version you are already on (repair without upgrading), and pin an older version
-to downgrade — that pin-and-re-run is the script channel's rollback path.
+to downgrade. That pin-and-re-run is the script channel's rollback path.
 
 The re-run replaces the binary and restarts the k3sm LaunchDaemons (the `io.k3sm.netd` root
 helper and the `_k3sm` server/agent jobs) onto the new version, through the `sudo k3sm install`
-it performs. The new binary **replaces** the old one — there is no side-by-side window and no
-flag to switch back — so the node is momentarily unavailable while the daemons restart.
+it performs. The new binary **replaces** the old one, with no side-by-side window and no flag to
+switch back, so the node is momentarily unavailable while the daemons restart.
 
 > **Homebrew is planned; the `k3sm-io/tap` is not published yet.** When it ships, `brew upgrade
 > k3sm` will do the same job, restarting the daemons via `launchctl kickstart`.
 
-## Multi-Node — Roll Node-by-Node
+## Multi-Node Rolling Upgrade
 
 A cluster upgrades **one node at a time**, not all at once. Restarting each node's daemon via `launchctl
 kickstart` creates a short **binary-version-skew window** where old and new nodes coexist; k3sm releases
@@ -32,48 +32,48 @@ control-plane Mac last unless a release note says otherwise. See [Multi-node](mu
 
 ## Before You Upgrade
 
-- **Back up the datastore.** `sudo k3sm snapshot save --out <somewhere off this node>` — it is safe to
+- Back up the datastore with `sudo k3sm snapshot save --out <somewhere off this node>`. It is safe to
   run while the cluster is serving, and it verifies the copy before it reports success. The file-level
   fallback (stop the daemon, `PRAGMA wal_checkpoint(TRUNCATE)`, copy, verify the copy) is in
   [Backup & restore](backup-restore.md). k3sm also takes an automatic pre-migration backup when a
   release changes the datastore engine (below), but that copy lives on the same disk as the cluster it
   protects, so it is not a substitute for yours.
-- **Know your rollback path.** On the script channel, prior releases stay downloadable — rollback
-  is `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run. The planned Homebrew channel will retain the
+- Know your rollback path. On the script channel, prior releases stay downloadable, so rollback is
+  `K3SM_INSTALL_VERSION=<prior-tag>` and a re-run. The planned Homebrew channel will retain the
   prior bottle, so rollback there will not need a rebuild round-trip.
-- **Check the version skew.** Confirm the target Kubernetes pin with `k3sm version` — see
+- Check the version skew. Confirm the target Kubernetes pin with `k3sm version`; see
   [Versions](versions.md).
 
 ## Upgrading Across a Datastore-Engine Change
 
 Some releases move to a newer **kine** (the etcd-shim over SQLite). A newer kine re-runs its schema
-migrations against your existing `state.db`, which is **one-way** — the migrated database is not
+migrations against your existing `state.db`, and that is **one-way**. The migrated database is not
 converted back if you reinstall the older k3sm.
 
-You do not have to do anything for this, but you should know what it does:
+You do not have to do anything for this, but you should know what it does.
 
 - **Before** the new version opens the database, the server takes a verified backup at
   `db/state.db.pre-<kine-version>.bak` and preserves the old kine binary beside it as
-  `kine.pre-<kine-version>`. The mechanics — the WAL drain, the integrity check, the write-once
-  rule — are in [Backup & restore](backup-restore.md).
+  `kine.pre-<kine-version>`. The mechanics (the WAL drain, the integrity check, the write-once
+  rule) are in [Backup & restore](backup-restore.md).
 - It **refuses to start** if the volume does not have twice the database size free, rather than
   writing a partial backup. Free space and start it again; nothing was changed.
 - The first boot on the new engine is slower than usual (the checkpoint + the copy). Later boots are not.
-- **Keep the `.bak`** until you are satisfied with the new release, then delete it — it is a full copy
+- Keep the `.bak` until you are satisfied with the new release, then delete it. It is a full copy
   of the database.
 
-On the [HA](ha.md) Postgres posture none of this applies; the datastore is your Postgres, and its
+On the [HA](ha.md) Postgres setup none of this applies. The datastore is your Postgres, and its
 backup is `pg_dump`/PITR on your schedule.
 
 ## Upgrading Into the Reserved-Port Policy
 
 The release that moved LoadBalancer listeners to the wildcard also provisions a
 `ValidatingAdmissionPolicy` that **rejects** a `type: LoadBalancer` Service declaring a port k3sm's own
-listeners own — the NodePort range `30000-32767`, or the kubelet API port `10250`. It matches on
+listeners own, either the NodePort range `30000-32767` or the kubelet API port `10250`. It matches on
 CREATE **and** UPDATE, and it does **not** ratchet on `oldObject`.
 
 That means a cluster **already carrying** such a Service is not grandfathered in. The object stays in
-the datastore and keeps working, but **every subsequent write to it is denied** — not just a port
+the datastore and keeps working, but **every subsequent write to it is denied**, not just a port
 change. A `kubectl label`, an annotation added by an unrelated controller, any `kubectl apply` of the
 same manifest: all rejected, with a message naming the port.
 
@@ -89,25 +89,24 @@ kubectl get svc -A -o json | jq -r '
 Anything listed has two escape hatches, both a single write **before** the upgrade (or from a
 still-permitted path after it):
 
-- **Change the port** to one outside the reserved set — the intended fix, since the Service could never
-  have had a working listener on a port k3sm already holds.
-- **Patch `type` away from `LoadBalancer`** (e.g. to `ClusterIP` or `NodePort`); the policy is scoped to
+- Change the port to one outside the reserved set. This is the intended fix, since the Service could
+  never have had a working listener on a port k3sm already holds.
+- Patch `type` away from `LoadBalancer` (e.g. to `ClusterIP` or `NodePort`); the policy is scoped to
   LoadBalancer Services only, so the object becomes writable again immediately.
 
-Do **not** expect a `--force` or an exemption: the ratcheting is omitted on purpose. A policy that
-tolerated a pre-existing offender would leave the collision — and the `kubectl logs`/`exec` outage it
-can cause — silently in place.
+There is no `--force` and no exemption. A policy that tolerated a pre-existing offender would leave
+the collision silently in place, along with the `kubectl logs`/`exec` outage it can cause.
 
 ## Rollback
 
-Rollback is **revert to the previous binary** — on the script channel,
-`K3SM_INSTALL_VERSION=<prior-tag>` and a re-run — plus the daemon restart that comes with it, not
-a runtime flag flip. On the planned Homebrew channel it will be a `brew` pin or a switch to the
-prior bottle.
+Rollback means reverting to the previous binary, plus the daemon restart that comes with it. There is
+no runtime flag to flip. On the script channel that is `K3SM_INSTALL_VERSION=<prior-tag>` and a
+re-run. On the planned Homebrew channel it will be a `brew` pin or a switch to the prior bottle.
 
 If the release you are leaving changed the **datastore engine**, reverting the binary is only half of
-it — the database has already been migrated in place. Restore the `db/state.db.pre-<kine-version>.bak`
-the upgrade left behind (or your own pre-upgrade snapshot) with the daemon stopped:
+it, because the database has already been migrated in place. Restore the
+`db/state.db.pre-<kine-version>.bak` the upgrade left behind (or your own pre-upgrade snapshot) with
+the daemon stopped:
 
 ```sh
 sudo launchctl bootout system/io.k3sm.server
@@ -116,19 +115,19 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/io.k3sm.server.plist
 ```
 
 `k3sm snapshot restore` refuses while the daemon is running, verifies the backup before it touches
-anything, and prints the verification step you must then run — see
+anything, and prints the verification step you must then run; see
 [Backup & restore](backup-restore.md). Rolling the binary back without restoring the backup leaves an
 older k3sm pointed at a database a newer engine has migrated.
 
-### Rolling Back Past the LoadBalancer Bind Change Leaves Durable State
+### Durable State After Rolling Back Past the LoadBalancer Bind Change
 
 The release that moved LoadBalancer/Ingress listeners to the wildcard also changed **what k3sm writes
 into the cluster**, and the older binary has no code to clean either of those up. Reverting the binary
 does **not** revert them; you have to.
 
 1. **Stale `EXTERNAL-IP` entries.** The new server advertises the node's derived InternalIP (e.g.
-   `100.64.0.1`). The old server only ever retracted the address it was configured with — the loopback
-   default — so it will **never** remove a derived entry. A rolled-back cluster keeps advertising an
+   `100.64.0.1`). The old server only ever retracted the address it was configured with, the loopback
+   default, so it will **never** remove a derived entry. A rolled-back cluster keeps advertising an
    address its listeners are no longer on. Retract them by hand:
 
    ```sh
@@ -138,7 +137,7 @@ does **not** revert them; you have to.
 
    Do the same for any `Ingress` of the `k3sm` class (`kubectl patch ingress … --subresource=status`).
 
-2. **The reserved-port Deny policy keeps rejecting Services.** The new server provisions the
+2. **The reserved-port Deny policy.** The new server provisions the
    `k3sm-reject-loadbalancer-reserved-port` ValidatingAdmissionPolicy, which lives in the datastore and
    **survives the downgrade**. The old binary neither knows about it nor deletes it, so a
    `type: LoadBalancer` Service on a NodePort-range port or on `10250` stays rejected at
@@ -149,11 +148,12 @@ does **not** revert them; you have to.
    kubectl delete validatingadmissionpolicy        k3sm-reject-loadbalancer-reserved-port
    ```
 
-   Leaving them in place is also a valid choice — the policy reflects a real collision on the old
-   binary too.
+   Leaving them in place is also a valid choice, because the policy reflects a real collision on the
+   old binary too.
 
 ## Next
 
-- [Backup & restore](backup-restore.md) — back up before upgrading; the automatic pre-migration copy.
-- [Versions](versions.md) — the version you are moving to.
-- [Troubleshooting](troubleshooting.md) — if the daemon does not restart.
+- [Backup & restore](backup-restore.md) covers backing up before an upgrade, and the automatic
+  pre-migration copy.
+- [Versions](versions.md) describes the version you are moving to.
+- [Troubleshooting](troubleshooting.md) is where to go if the daemon does not restart.

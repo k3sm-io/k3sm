@@ -2,20 +2,20 @@
 
 > ## ⚠️ This is NOT a CNCF Certified-Kubernetes badge
 >
-> **k3sm has not run — and by design cannot pass — the upstream Sonobuoy `[Conformance]` suite.** That
+> **k3sm has not run the upstream Sonobuoy `[Conformance]` suite, and by design cannot pass it.** That
 > suite ([CNCF Certified Kubernetes](https://www.cncf.io/training/certification/software-conformance/))
 > assumes **Linux containers, cgroups, CNI, and network namespaces**; k3sm runs Pods as **native Darwin
 > processes** on Apple Silicon with none of those substrates, so it does not pass
 > `[Conformance]`, and this document does **not** claim it does.
 >
-> What this document *is*: a map from k3sm's **targeted feature classes** to a **green synthetic-
-> conformance criterion** (a k3sm-authored test in `hack/lib/conformance.sh`, static, run in
-> `hack/ci.sh` — **NOT** the CNCF suite) **or** a documented ceiling. A green criterion here means
+> This document maps k3sm's **targeted feature classes** to a **green synthetic-conformance
+> criterion** (a k3sm-authored test in `hack/lib/conformance.sh`, static, run in `hack/ci.sh`,
+> **NOT** the CNCF suite) **or** a documented ceiling. A green criterion here means
 > "k3sm's own test asserts this behavior," not "upstream's e2e passed."
 
 ## Canonical "why we can't pass"
 
-The authoritative, single-source explanation of **which upstream areas k3sm cannot conform to and why**
+The authoritative explanation of **which upstream areas k3sm cannot conform to and why**
 lives in k3sm's internal full-surface conformance register (one row per feature × verdict, with a
 canonical §By-design non-conformance summary). This profile summarizes that assessment; it does not
 restate the full register. User-facing tradeoff guidance (what an operator should do about each ceiling)
@@ -23,12 +23,12 @@ is owned by **[Limitations](user/limitations.md)**.
 
 ## Terms
 
-- **synthetic-conformance criterion** — a k3sm-authored Go test in a `hack/lib/conformance.sh`
+- **synthetic-conformance criterion**: a k3sm-authored Go test in a `hack/lib/conformance.sh`
   criterion slice, static and hermetic-or-integration-tiered, run by `hack/ci.sh`. Promoted into a
   criterion set **only in the PR that lands it green** (never regress a green gate).
-- **ceiling** — a behavior the macOS substrate forbids (`honest-limitation` in the register) or that
-  routes to the `vm` RuntimeClass for correctness. Documented, not chased.
-- **🟡 planned** — achievable-as-wiring and scheduled (tracked internally against the
+- **ceiling**: a behavior the macOS substrate forbids (`honest-limitation` in the register) or that
+  routes to the `vm` RuntimeClass for correctness. It is documented rather than chased.
+- **🟡 planned**: achievable-as-wiring and scheduled (tracked internally against the
   conformance-hardening work); green criterion owed, not yet landed.
 
 ## Feature classes → criterion or ceiling
@@ -53,21 +53,21 @@ is owned by **[Limitations](user/limitations.md)**.
 
 ## Hard ceilings (documented, never chased)
 
-Per the internal §By-design summary — summarized, not restated:
+Per the internal §By-design summary, summarized rather than restated:
 
 - No Linux containers / cgroups / CNI / netns / device-plugins / hugepages (`not-applicable`).
-- No per-pod uid isolation — same-node pods share one `_k3sm` trust domain; untrusted tenancy is
-  destined for `vm` (`linux/arm64`, single-node).
+- No per-pod uid isolation, because same-node pods share one `_k3sm` trust domain. Untrusted tenancy
+  is destined for `vm` (`linux/arm64`, single-node).
 - Absolute-path volume mounts resolve for **native workloads** (a `DYLD_INSERT` path-rebase shim; no
-  chroot), **not** SIP platform binaries — a `/bin/sh` script can't read a mounted file at its
-  absolute path (macOS strips `DYLD_INSERT_LIBRARIES` from platform binaries).
+  chroot), **not** SIP platform binaries. A `/bin/sh` script can't read a mounted file at its
+  absolute path, because macOS strips `DYLD_INSERT_LIBRARIES` from platform binaries.
 - `externalTrafficPolicy: Local`, CFS millicore CPU *limits*, HPA-on-CPU-limit, `hostPath` /
   `terminationMessagePath` bind mounts, node-pressure eviction as a hard guarantee, NetworkPolicy as a
   tenant boundary.
 
 ## Scope of these claims
 
-- Criteria are **k3sm's own tests**, static — a green row is "asserted by a k3sm test," never a
+- Criteria are **k3sm's own tests**, static. A green row is "asserted by a k3sm test," never a
   `[Conformance]` pass. Re-derive any row against current `main`.
 - A `🟡 planned` row's criterion is **owed**, not present; it names the behaviour still to be
   asserted.
