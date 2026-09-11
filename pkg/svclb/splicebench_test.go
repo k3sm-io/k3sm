@@ -50,7 +50,6 @@ func spliceBackend(b *testing.B) (string, func()) {
 		b.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	done := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -79,7 +78,6 @@ func spliceBackend(b *testing.B) (string, func()) {
 		}
 	}()
 	return ln.Addr().String(), func() {
-		close(done)
 		_ = ln.Close()
 		wg.Wait()
 	}

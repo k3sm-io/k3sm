@@ -60,7 +60,7 @@ the unit that matters. The small-file row is load-bearing: `io.Copy` sizes its
 scratch buffer to `min(32KiB, remaining)` for a `*io.LimitedReader`, so below
 32 KiB the buffer equals the file and buffer garbage tracks total bytes.
 
-Post-fix (`ab9f277`), with the pre-fix figures for contrast:
+Post-fix (#363), with the pre-fix figures for contrast:
 
 | Benchmark | B/op before | B/op after | allocs before | allocs after |
 |---|---|---|---|---|

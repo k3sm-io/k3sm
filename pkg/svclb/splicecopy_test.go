@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-// TestOnlyWrapperseHideTheCopyFastPaths is the guard on the reason copyPooled is
+// TestOnlyWrappersHideTheCopyFastPaths is the guard on the reason copyPooled is
 // written the way it is, and it is the test this change most needs.
 //
 // io.copyBuffer tests src.(io.WriterTo) and dst.(io.ReaderFrom) BEFORE it looks
