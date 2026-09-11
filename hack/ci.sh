@@ -66,10 +66,17 @@ if [ -n "$go_pkgs" ]; then
 	# `//lint:ignore <Check> <reason>` on the PRECEDING line. It does NOT honour
 	# `//nolint:...`, which is golangci-lint's spelling — this repo carried five
 	# of those and every one suppressed nothing.
-	if command -v staticcheck >/dev/null 2>&1; then
-		echo "==> [k3sm] staticcheck (non-test)"; CGO_ENABLED=$CGO staticcheck -tests=false ./...
+	#
+	# A missing tool is a RED, not a SKIP: a gate that can silently not run and
+	# still print green is the failure class the go-list guard above exists to
+	# stop. The pin is the version the gate was brought to zero findings with.
+	sc=$(command -v staticcheck || true)
+	[ -n "$sc" ] || sc="$(go env GOPATH)/bin/staticcheck"
+	if [ -x "$sc" ]; then
+		echo "==> [k3sm] staticcheck (non-test)"; CGO_ENABLED=$CGO "$sc" -tests=false ./...
 	else
-		echo "==> [k3sm] staticcheck SKIPPED — not installed (go install honnef.co/go/tools/cmd/staticcheck@latest)"
+		echo "==> [k3sm] staticcheck: not installed; the gate needs it (go install honnef.co/go/tools/cmd/staticcheck@2026.2.1)" >&2
+		exit 1
 	fi
 	# The integration tier is NOT run here (it needs darwin + a real socket), but
 	# nothing else in this repo COMPILES the `integration` build tag, so the
