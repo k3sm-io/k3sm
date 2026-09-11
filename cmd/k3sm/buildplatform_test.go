@@ -232,9 +232,9 @@ func TestBuildPlatformRouting(t *testing.T) {
 // TestSelectStoreImage pins WHICH image of a multi-platform build the node's
 // store records.
 //
-// The choice feeds the summary's `kubectl run app --image=<tag>` line, which is
-// only true for an image a Pod on this node can run — so it is the platform this
-// node's Linux guests run, and a build that produced none is refused rather than
+// The choice is the image the summary tells the user to run, which is only true
+// for an image a Pod on this node can run — so it is the platform this node's
+// Linux guests run, and a build that produced none is refused rather than
 // recorded under a name that would not start.
 func TestSelectStoreImage(t *testing.T) {
 	t.Run("picks the platform this node runs", func(t *testing.T) {

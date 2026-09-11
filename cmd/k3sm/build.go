@@ -76,10 +76,14 @@ records the platform this node's Linux guests run and the summary says so. The
 engine's guest is arm64 and registers no emulator, so RUN steps for another
 architecture are refused by name — COPY a cross-compiled binary in instead.
 
-The built image RUNS. Name it in a Pod:
+The built image RUNS. Name it in a Pod — from a manifest, not "kubectl run",
+which cannot declare the darwin nodeSelector and provider toleration every
+k3sm Pod requires (a ValidatingAdmissionPolicy refuses a Pod without them):
 
   k3sm build --tag myapp:v1 .
-  kubectl run myapp --image=myapp:v1              # already in this node's store
+  kubectl apply -f pod.yaml                      # already in this node's store
+
+See docs/user/what-runs.md for a copy-pasteable manifest.
 
 Pin FROM to a digest (name@sha256:…) if you want a reproducible build: a tag can
 move under you. See docs/user/what-runs.md for the whole path, and

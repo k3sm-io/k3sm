@@ -95,7 +95,7 @@ func pushAfterStoreError(ref name.Tag, err error) error {
 // first, so a build that pushes "myapp:v1" must put it there.
 //
 // The store entry is unaffected either way: it keeps the reference the operator
-// wrote, so `kubectl run app --image=myapp:v1` resolves whether or not the push
+// wrote, so a Pod naming `myapp:v1` resolves whether or not the push
 // happened.
 func resolvePushTarget(tag, workDir string) (name.Tag, error) {
 	// Parsed with an EMPTY default registry, so "this reference names no

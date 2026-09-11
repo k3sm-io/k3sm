@@ -130,7 +130,11 @@ func deliver(ctx context.Context, o buildOptions, ref name.Tag, b built, out io.
 	if err != nil {
 		return fmt.Errorf("compute digest: %w", err)
 	}
-	fmt.Fprintf(out, "built %s\n  digest: %s\n  store:  recorded in this node's image store (kubectl run app --image=%s)\n", ref, digest, ref)
+	// Deliberately NOT suggesting `kubectl run` here. It cannot set the darwin
+	// nodeSelector or the provider toleration, so the Pod it creates is refused
+	// at admission — printing it on every successful build sent the operator
+	// straight into a failure.
+	fmt.Fprintf(out, "built %s\n  digest: %s\n  store:  recorded in this node's image store (name %s in a Pod manifest)\n", ref, digest, ref)
 	// The platform line appears only for a build that produced more than one,
 	// where "which of these is in the store" is a question the operator now has.
 	// A single-platform build's platform is the one they asked for, or the one
