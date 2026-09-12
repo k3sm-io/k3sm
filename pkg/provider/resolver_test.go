@@ -18,13 +18,19 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/mount"
@@ -237,4 +243,116 @@ func TestKubeCredentialsDockerConfig(t *testing.T) {
 	if ok {
 		t.Error("a non-matching registry must resolve to an anonymous pull (ok=false)")
 	}
+}
+
+// TestPullCredentialErrorsCarryNoSecretContent pins runtimed's CredentialResolver
+// error contract on the provider's implementation: a returned error names the
+// failure class and the operator's own references, and never quotes, echoes, or
+// paraphrases what was inside the Secret.
+//
+// Non-vacuity: the two parse sites wrapped encoding/json's error with %w, and
+// Go's decoder puts the offending MAP KEY in its message — here a registry host
+// read out of the Secret's own bytes. That text then reached the node log and,
+// through runtimed's pullCredential, the bounded waiting message every reader of
+// `kubectl describe pod` sees. The marker assertion below fails against it.
+func TestPullCredentialErrorsCarryNoSecretContent(t *testing.T) {
+	const marker = "marker-registry.internal"
+	ctx := context.Background()
+	refs := []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+
+	tests := []struct {
+		name string
+		key  string
+		data string
+	}{
+		{"dockerconfigjson", corev1.DockerConfigJsonKey, `{"auths":{"` + marker + `":"not-an-object"}}`},
+		{"legacy dockercfg", corev1.DockerConfigKey, `{"` + marker + `":"not-an-object"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "regcred"},
+				Data:       map[string][]byte{tt.key: []byte(tt.data)},
+			})
+			_, _, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+			if err == nil {
+				t.Fatal("PullCredential = nil, want a malformed-secret error")
+			}
+			if !errors.Is(err, ErrPullSecretMalformed) {
+				t.Errorf("error %v does not match ErrPullSecretMalformed; callers classify by sentinel, not by text", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Errorf("error %q quotes Secret content", err)
+			}
+			for _, want := range []string{"prod", "regcred", tt.key} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name the operator's own reference %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestPullCredentialApiserverReadErrors pins the OTHER half of the
+// CredentialResolver error contract: the classification of a read that never
+// reached the Secret's bytes at all.
+//
+// A read the apiserver REFUSES is a node-side authorization fact, and the
+// StatusError carrying it can quote the request — so it is classified into the
+// sentinel plus the operator's own references and never wrapped. A read that
+// comes back NotFound is not an error at all: upstream's kubelet skips a missing
+// imagePullSecret and pulls with whatever the remaining ones provide, so the
+// pull stays anonymous rather than failing.
+//
+// Non-vacuity: the marker rides the StatusError's own message, so a %w wrap of
+// the apiserver error — the shape every other client-go call site in this
+// package uses — puts it in err.Error() and fails the first group; the second
+// group fails for any implementation that returns the read error instead of
+// moving to the next reference.
+func TestPullCredentialApiserverReadErrors(t *testing.T) {
+	const marker = "marker-user@marker.example"
+	ctx := context.Background()
+	refs := []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+	secrets := schema.GroupResource{Resource: "secrets"}
+
+	refuse := func(err error) *fake.Clientset {
+		cs := fake.NewSimpleClientset()
+		cs.PrependReactor("get", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, err
+		})
+		return cs
+	}
+
+	t.Run("a Forbidden read is classified, never quoted", func(t *testing.T) {
+		cs := refuse(apierrors.NewForbidden(secrets, "regcred", errors.New(marker)))
+		_, ok, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+		if err == nil {
+			t.Fatal("PullCredential = nil, want an unreadable-secret error")
+		}
+		if ok {
+			t.Error("ok = true for a Secret that was never read")
+		}
+		if !errors.Is(err, ErrPullSecretNotReadable) {
+			t.Errorf("error %v does not match ErrPullSecretNotReadable; callers classify by sentinel, not by text", err)
+		}
+		if strings.Contains(err.Error(), marker) {
+			t.Errorf("error %q carries the apiserver's own message, which can quote the request", err)
+		}
+		for _, want := range []string{"prod", "regcred", "forbidden"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %q — the operator's own reference and the failure class", err, want)
+			}
+		}
+	})
+
+	t.Run("a NotFound read is skipped, not failed", func(t *testing.T) {
+		cs := refuse(apierrors.NewNotFound(secrets, "regcred"))
+		cred, ok, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+		if err != nil {
+			t.Fatalf("PullCredential = %v, want nil: a missing imagePullSecret leaves the pull anonymous", err)
+		}
+		if ok || cred != nil {
+			t.Errorf("credential = %+v ok=%v, want no credential", cred, ok)
+		}
+	})
 }

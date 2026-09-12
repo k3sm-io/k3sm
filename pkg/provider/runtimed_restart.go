@@ -67,6 +67,37 @@ import (
 // while a container sits between its exit and the scheduled re-exec.
 const reasonCrashLoopBackOff = "CrashLoopBackOff"
 
+// The container waiting reasons the provider renders for a container that never
+// started, kubelet-verbatim (pkg/kubelet/images/types.go + kubetypes). runtimed
+// reports a TYPED failure_reason and a bounded message and leaves reason empty
+// (apis ContainerStateWaiting): rendering the kubelet's string is the provider's
+// job, because it is the kubelet the workload's tooling expects to be talking to
+// — `kubectl describe`, event consumers and CI assertions all key off these exact
+// tokens.
+const (
+	// reasonErrImagePull is the attempt that failed: the pull, its credential,
+	// its platform match, or its signature gate.
+	reasonErrImagePull = "ErrImagePull"
+	// reasonImagePullBackOff is the same container while the provider's retry
+	// schedule for its image is sleeping between attempts.
+	reasonImagePullBackOff = "ImagePullBackOff"
+	// reasonErrImageNeverPull is imagePullPolicy: Never with the image absent
+	// from this node's store. Upstream never pulls and never backs off for it.
+	reasonErrImageNeverPull = "ErrImageNeverPull"
+	// reasonInvalidImageName is a reference that does not parse. Deterministic,
+	// so re-attempting an unchanged reference cannot help.
+	reasonInvalidImageName = "InvalidImageName"
+	// reasonCreateContainerConfigError is a container whose run spec could not
+	// be built (env/argv resolution, the image config merge).
+	reasonCreateContainerConfigError = "CreateContainerConfigError"
+	// reasonContainerCreating is the non-failure wait between the pod's
+	// admission and the runtime reporting its containers.
+	reasonContainerCreating = "ContainerCreating"
+	// reasonPodInitializing is the non-failure wait of a container held behind
+	// an init sequence that has not finished.
+	reasonPodInitializing = "PodInitializing"
+)
+
 // The reasons recorded on the RestartContainer RPC, one per trigger. Both
 // triggers share the bookkeeping, the backoff and the count authority; the
 // reason is the only thing that distinguishes them, and runtimed records it in

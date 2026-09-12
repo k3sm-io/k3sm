@@ -247,7 +247,7 @@ func TestPostStartFidelity(t *testing.T) {
 
 		// The failure reaches the pod's Events with the kubelet's reason, and
 		// WITHOUT the handler's output (Events are namespace-readable).
-		ev := drainEvents(t, rec.Events, 1, 3*time.Second)[0]
+		ev := nextLifecycleEvent(rec.Events, 3*time.Second)
 		if !strings.HasPrefix(ev, "Warning "+reasonFailedPostStartHook+" ") || !strings.Contains(ev, "c0") {
 			t.Errorf("event = %q, want a Warning %s naming container c0", ev, reasonFailedPostStartHook)
 		}

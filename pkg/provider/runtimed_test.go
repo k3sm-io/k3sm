@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -52,6 +53,48 @@ type fakeRuntimeServer struct {
 	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
 	restartErr   error             // when set, RestartContainer fails (the B26 retry path)
+
+	// The StartContainer seam of the B119 pull-retry path (see pullfailure_test.go):
+	// a FIFO of queued outcomes, a call tally, and an optional hold channel that
+	// parks the handler so a test can observe the provider inside its attempt
+	// window. An exhausted FIFO answers success.
+	startCalls int
+	lastStart  startRecord
+	startFIFO  []startOutcome
+	startHold  chan struct{}
+	// startCancels counts the held StartContainer calls released by their
+	// CONTEXT rather than by the test — the observable that separates a tracked,
+	// pod-scoped retry from a bare goroutine on context.Background.
+	startCancels int
+
+	// The CreatePod/DeletePod seams of the B119 parked-create path: a FIFO of
+	// refusals the fake answers before its default success (the vm shape, where
+	// a container-class image failure fails the whole create), call tallies, and
+	// an optional hold on DeletePod so the delete ORDER — cancel the pull
+	// workers BEFORE the RPC — is observable.
+	createCalls int
+	createFIFO  []*runtimev1.CreatePodResponse
+	// createHold parks every subsequent CreatePod inside the RPC, AFTER the call
+	// is recorded, so a test can act while the provider is mid-create. Unlike the
+	// StartContainer hold it deliberately IGNORES the caller's context: a create
+	// the runtime has already accepted is not un-done by the client cancelling
+	// its context, and that gap is exactly the window the parked-retry fence
+	// guards.
+	createHold  chan struct{}
+	deleteCalls int
+	// deleteIDs is every pod id DeletePod has been called with, in order — the
+	// observable for a COMPENSATING delete issued after a create landed late.
+	deleteIDs  []string
+	deleteHold chan struct{}
+	// deleteFIFO queues DeletePod outcomes ahead of the fake's default success: a
+	// non-nil entry is returned as the RPC's transport error AND leaves the pod
+	// created, which is the shape a compensating delete must survive — a delete
+	// that failed did not delete anything.
+	deleteFIFO []error
+	// updateCalls counts UpdatePod RPCs, so "the provider never called the
+	// runtime at all" is assertable (a parked pod has nothing to update in
+	// place, because the runtime holds nothing for it).
+	updateCalls int
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
@@ -126,9 +169,7 @@ func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.R
 
 func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	box := req.GetPod()
-	f.created[box.GetPodId()] = box
+	f.createCalls++
 	// Record the ServiceAccount the provider bound to the ctx so the M2.4
 	// per-pod SA-token binding is observable at the runtime seam. An unbound ctx
 	// records "" — the fail-closed shape, not a silent "default" (B226).
@@ -137,14 +178,62 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 	} else {
 		f.gotSA = ""
 	}
+	hold := f.createHold
+	f.mu.Unlock()
+	// Held OUTSIDE the lock and AFTER the call is recorded, so a test can observe
+	// the provider inside the RPC; the caller's context is ignored on purpose
+	// (see the createHold field doc).
+	if hold != nil {
+		<-hold
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	box := req.GetPod()
+	// A queued refusal leaves the pod UNcreated, which is the vm reality the
+	// parked-create path exists for: the guest was never built, so a later
+	// GetPodStatus answers NotFound and the provider must synthesize.
+	if len(f.createFIFO) > 0 {
+		var resp *runtimev1.CreatePodResponse
+		resp, f.createFIFO = f.createFIFO[0], f.createFIFO[1:]
+		return resp, nil
+	}
+	f.created[box.GetPodId()] = box
 	return &runtimev1.CreatePodResponse{Status: f.statusLocked(box.GetPodId())}, nil
+}
+
+// UpdatePod counts the RPC and refuses it: the fake serves no in-place update,
+// so a test can tell "the provider called the runtime and the call failed" apart
+// from "the provider never called the runtime at all".
+func (f *fakeRuntimeServer) UpdatePod(_ context.Context, _ *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
+	f.mu.Lock()
+	f.updateCalls++
+	f.mu.Unlock()
+	return nil, errors.New("fake runtime serves no UpdatePod")
 }
 
 func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.deleteCalls++
+	f.deleteIDs = append(f.deleteIDs, req.GetPodId())
 	f.lastGrace = req.GetGracePeriodSeconds()
-	delete(f.created, req.GetPodId())
+	var qerr error
+	if len(f.deleteFIFO) > 0 {
+		qerr, f.deleteFIFO = f.deleteFIFO[0], f.deleteFIFO[1:]
+	}
+	if qerr == nil {
+		delete(f.created, req.GetPodId())
+	}
+	hold := f.deleteHold
+	f.mu.Unlock()
+	// Held OUTSIDE the lock: a test parks the provider inside this RPC to assert
+	// what it had already done before issuing it.
+	if hold != nil {
+		<-hold
+	}
+	if qerr != nil {
+		return nil, qerr
+	}
 	return &runtimev1.DeletePodResponse{}, nil
 }
 

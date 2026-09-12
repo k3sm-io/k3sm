@@ -86,14 +86,12 @@ func TestXcodeToolchainUngrantedEvent(t *testing.T) {
 			}
 
 			if !tc.wantEvent {
-				select {
-				case e := <-rec.Events:
+				if e := nextLifecycleEvent(rec.Events, 100*time.Millisecond); e != "" {
 					t.Fatalf("unexpected Event %q", e)
-				case <-time.After(100 * time.Millisecond):
 				}
 				return
 			}
-			got := drainEvents(t, rec.Events, 1, 3*time.Second)[0]
+			got := nextLifecycleEvent(rec.Events, 3*time.Second)
 			if !strings.HasPrefix(got, "Warning "+reasonXcodeToolchainUngranted+" ") {
 				t.Fatalf("Event = %q, want a Warning %s", got, reasonXcodeToolchainUngranted)
 			}

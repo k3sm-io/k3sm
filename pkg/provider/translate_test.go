@@ -1219,9 +1219,22 @@ func TestDerivePhase(t *testing.T) {
 			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: code}},
 		}
 	}
+	// A crash-looping container carries the termination that triggered the
+	// re-exec (applyRestartOverlay writes both halves), which is exactly what
+	// distinguishes it from a container that never started: upstream's getPhase
+	// counts a Waiting container as "waiting" only when it has NO last
+	// termination, so this one keeps its Running verdict while a pull failure
+	// (below) holds the pod Pending.
 	crashLooping := corev1.ContainerStatus{
 		Name:  "c-loop",
 		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonCrashLoopBackOff}},
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
+		},
+	}
+	neverStarted := corev1.ContainerStatus{
+		Name:  "c-wait",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reasonErrImagePull}},
 	}
 
 	tests := []struct {
@@ -1242,6 +1255,9 @@ func TestDerivePhase(t *testing.T) {
 		{"empty policy defaults to Always", policyPod(""), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodRunning},
 		{"a running main beats a failed sibling under Never", policyPod(corev1.RestartPolicyNever), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1), running}, corev1.PodRunning},
 		{"a synthesized CrashLoopBackOff holds Running", policyPod(corev1.RestartPolicyNever), runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{crashLooping}, corev1.PodRunning},
+		{"a container that never started holds the pod Pending", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_RUNNING, []corev1.ContainerStatus{neverStarted}, corev1.PodPending},
+		{"waiting is counted before running (kubelet getPhase order)", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_RUNNING, []corev1.ContainerStatus{running, neverStarted}, corev1.PodPending},
+		{"a crash-looping container beside a running one is still Running", policyPod(corev1.RestartPolicyAlways), runtimev1.PodPhase_POD_PHASE_RUNNING, []corev1.ContainerStatus{running, crashLooping}, corev1.PodRunning},
 		{"nil pod: runtime Failed is authoritative", nil, runtimev1.PodPhase_POD_PHASE_FAILED, []corev1.ContainerStatus{exited(1)}, corev1.PodFailed},
 		{"nil pod: runtime Succeeded is authoritative", nil, runtimev1.PodPhase_POD_PHASE_SUCCEEDED, nil, corev1.PodSucceeded},
 		{"nil pod: unspecified + failed derives Failed", nil, runtimev1.PodPhase_POD_PHASE_UNSPECIFIED, []corev1.ContainerStatus{exited(1)}, corev1.PodFailed},

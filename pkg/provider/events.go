@@ -18,6 +18,7 @@ package provider
 
 import (
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,12 +37,17 @@ import (
 // no live restart/backoff loop (reap never re-execs, UpdatePod is a no-op), so
 // emitting it there would fabricate a control-loop state that does not exist.
 const (
+	reasonPulling = "Pulling" // the image is being resolved for a start attempt
 	reasonPulled  = "Pulled"  // image (or host binary) resolved for the container
 	reasonCreated = "Created" // container object created, before process start
 	reasonStarted = "Started" // container process started successfully
 	reasonKilling = "Killing" // container process is being stopped (DeletePod)
 	reasonFailed  = "Failed"  // container process failed to start
 	reasonBackOff = "BackOff" // container re-exec is throttled by CrashLoopBackOff
+	// reasonInspectFailed is recorded when a container's image reference cannot
+	// be parsed at all — upstream's InspectFailed, the event that pairs with the
+	// InvalidImageName waiting reason.
+	reasonInspectFailed = "InspectFailed"
 	// reasonFailedPostStartHook is recorded when a container's postStart hook
 	// returns an error — upstream's `FailedPostStartHook`, the event that makes a
 	// hook failure visible in `kubectl describe pod` before the container is
@@ -81,6 +87,56 @@ func msgBackOffRestarting(container string, pod *corev1.Pod) string {
 		container, pod.Name, pod.Namespace, pod.UID)
 }
 
+// msgFailedPullImage is the Failed-event message for an image that could not be
+// pulled. Unlike msgFailedStart it DOES carry the error text, and the reason is
+// the same one that lets msgFailedImagePlatform carry its own: this string is the
+// kubelet's own pull message, and runtimed has already BOUNDED it (quoteBounded)
+// before it reaches the waiting entry — the same text `kubectl describe pod`
+// shows in status. Withholding it here would leave an operator with a Failed
+// event that names no registry, no status code and no digest, while the same
+// text sits one column away in the pod status.
+func msgFailedPullImage(image, message string) string {
+	return fmt.Sprintf("Failed to pull image %q: %s", image, message)
+}
+
+// msgBackOffPullingImage is the BackOff-event message (and the waiting message)
+// for an image whose retry schedule is sleeping. Kubelet-verbatim, so
+// `kubectl describe pod` reads identically to upstream.
+func msgBackOffPullingImage(image string) string {
+	return fmt.Sprintf("Back-off pulling image %q", image)
+}
+
+// msgImageNeverPull is the ErrImageNeverPull-event message for a container whose
+// imagePullPolicy is Never and whose image is not in this node's store.
+// Kubelet-verbatim.
+func msgImageNeverPull(image string) string {
+	return fmt.Sprintf("Container image %q is not present with pull policy of Never", image)
+}
+
+// msgInspectFailed is the InspectFailed-event message for a reference that does
+// not parse. It carries runtimed's bounded parse error for the same reason
+// msgFailedPullImage does: the text is the node's own, and the malformed
+// reference is the entire actionable content.
+//
+// The phrasing is the kubelet's for THIS cause specifically: upstream reaches
+// InspectFailed/InvalidImageName from applyDefaultImageTag, whose message is
+// "Failed to apply default image tag %q: %v" (pkg/kubelet/images/image_manager.go).
+// Its own "Failed to inspect image" text belongs to a different failure — an
+// image the runtime holds but cannot describe — which is not a state k3sm can
+// reach, so borrowing it would name the wrong stage for every pod that lands
+// here.
+func msgInspectFailed(image, message string) string {
+	return fmt.Sprintf("Failed to apply default image tag %q: %s", image, message)
+}
+
+// msgContainerConfigError is the Failed-event message for a container whose run
+// spec could not be built. Upstream's phrasing for this class is a bare
+// "Error: <what went wrong>", which is what the CreateContainerConfigError
+// waiting message carries too.
+func msgContainerConfigError(message string) string {
+	return "Error: " + message
+}
+
 // msgFailedPostStartHook is the FailedPostStartHook-event message. It carries NO
 // handler output or error text: upstream withholds it deliberately ("do not record
 // the message in the event so that secrets won't leak from the server") and Events
@@ -92,10 +148,38 @@ func msgFailedPostStartHook(container string) string {
 	return "PostStartHook failed for container " + container
 }
 
-// msgImageAlreadyPresent is the Pulled-event message. HostProcess treats the image
-// reference as an already-present native binary path (there is no registry pull),
-// so this uses the kubelet's "already present on machine" phrasing rather than a
-// fabricated "Successfully pulled … in Xs".
+// msgPullingImage is the Pulling-event message, recorded when the provider
+// dispatches a start attempt for a container whose image must be resolved.
+// Kubelet-verbatim.
+//
+// It is emitted per ATTEMPT, not per container-start: upstream records one
+// Pulling per trip through its image manager, and a retry is another trip. A
+// host-binary route (the native sentinel, an absolute path) gets none at all,
+// because runtimed resolves it in place and never contacts a registry.
+func msgPullingImage(image string) string {
+	return fmt.Sprintf("Pulling image %q", image)
+}
+
+// msgPulledImage is the Pulled-event message for an image the runtime FETCHED,
+// carrying the kubelet's two durations: the resolution step itself, and the
+// wall time since the attempt was announced (upstream's "including waiting",
+// which covers the queueing its serialized puller adds).
+//
+// Both are truncated to milliseconds, as upstream truncates, so the text is
+// stable enough to read and to match. The image-size clause upstream appends is
+// omitted rather than guessed: runtimed reports no size for a resolution, and a
+// fabricated byte count on a diagnostic event is worse than a shorter sentence.
+func msgPulledImage(image string, pull, total time.Duration) string {
+	return fmt.Sprintf("Successfully pulled image %q in %v (%v including waiting)",
+		image, pull.Truncate(time.Millisecond), total.Truncate(time.Millisecond))
+}
+
+// msgImageAlreadyPresent is the Pulled-event message for an image the runtime did
+// NOT fetch. HostProcess treats the image reference as an already-present native
+// binary path (there is no registry pull), and the runtimed path uses the same
+// text when runtimed reports the image was already in the node's store — the
+// kubelet's "already present on machine" phrasing rather than a fabricated
+// "Successfully pulled … in Xs".
 func msgImageAlreadyPresent(image string) string {
 	return fmt.Sprintf("Container image %q already present on machine", image)
 }
