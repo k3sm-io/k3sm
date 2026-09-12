@@ -86,6 +86,11 @@ type fakeRuntimeServer struct {
 	// observable for a COMPENSATING delete issued after a create landed late.
 	deleteIDs  []string
 	deleteHold chan struct{}
+	// deleteFIFO queues DeletePod outcomes ahead of the fake's default success: a
+	// non-nil entry is returned as the RPC's transport error AND leaves the pod
+	// created, which is the shape a compensating delete must survive — a delete
+	// that failed did not delete anything.
+	deleteFIFO []error
 	// updateCalls counts UpdatePod RPCs, so "the provider never called the
 	// runtime at all" is assertable (a parked pod has nothing to update in
 	// place, because the runtime holds nothing for it).
@@ -212,13 +217,22 @@ func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePo
 	f.deleteCalls++
 	f.deleteIDs = append(f.deleteIDs, req.GetPodId())
 	f.lastGrace = req.GetGracePeriodSeconds()
-	delete(f.created, req.GetPodId())
+	var qerr error
+	if len(f.deleteFIFO) > 0 {
+		qerr, f.deleteFIFO = f.deleteFIFO[0], f.deleteFIFO[1:]
+	}
+	if qerr == nil {
+		delete(f.created, req.GetPodId())
+	}
 	hold := f.deleteHold
 	f.mu.Unlock()
 	// Held OUTSIDE the lock: a test parks the provider inside this RPC to assert
 	// what it had already done before issuing it.
 	if hold != nil {
 		<-hold
+	}
+	if qerr != nil {
+		return nil, qerr
 	}
 	return &runtimev1.DeletePodResponse{}, nil
 }

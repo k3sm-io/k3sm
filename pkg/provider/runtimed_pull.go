@@ -449,7 +449,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 		if !r.endPullSleep(t, pr, gen) {
 			return
 		}
-		reason, message, err := r.attemptPull(ctx, t, pr, gen, podID, image)
+		reason, message, err := r.attemptPull(ctx, t, podID, image)
 		if ctx.Err() != nil {
 			return // the pod was deleted / replaced while the RPC was in flight
 		}
@@ -482,7 +482,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 // the image absent), so a failure here only logs.
 func (r *runtimedRuntime) runPullOnce(ctx context.Context, t *podTrack, pr *imagePullRetry, gen uint64, podID, image string) {
 	defer r.finishPullAttempt(t, pr, gen)
-	reason, message, err := r.attemptPull(ctx, t, pr, gen, podID, image)
+	reason, message, err := r.attemptPull(ctx, t, podID, image)
 	switch {
 	case ctx.Err() != nil:
 		return
@@ -1081,7 +1081,7 @@ func (r *runtimedRuntime) synthesizedStatus(pod *corev1.Pod, t *podTrack) *runti
 // holds is re-attempted with StartContainer for the containers naming this
 // image, and a parked pod is re-attempted with the whole CreatePod, because
 // nothing exists there to start.
-func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, pr *imagePullRetry, gen uint64, podID, image string) (runtimev1.FailureReason, string, error) {
+func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, podID, image string) (runtimev1.FailureReason, string, error) {
 	pod := r.trackPod(t)
 	parked := t.parkedFailure() != nil
 	// A parked retry rebuilds the WHOLE pod, so every pullable container is part
@@ -1094,7 +1094,7 @@ func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, pr *imag
 		r.recordPodEvent(podID, e)
 	}
 	if parked {
-		return r.retryParkedCreate(ctx, pod, t, pr, gen)
+		return r.retryParkedCreate(ctx, pod, t)
 	}
 	return r.startWaitingContainers(ctx, pod, podID, image)
 }
@@ -1110,19 +1110,21 @@ func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, pr *imag
 // no track at all. Re-running them here would either re-warn on every retry or
 // have to un-track a pod that is already tracked.
 //
-// A create that SUCCEEDS is adopted only if the pod is still there to adopt it
-// (commitParkedCreate). The RPC is the one call in this path that changes the
-// runtime's state before the provider gets a say, and the provider's own
-// cancellation does not reach into it: DeletePod cancels this worker's context,
-// but a guest the runtime has already built stays built. So the adoption is
-// fenced, and a create that lost the race is undone rather than kept.
+// A create that SUCCEEDS is committed according to WHY it could be committed —
+// commitParkedCreate returns the reason and this function acts on it. The RPC is
+// the one call in this path that changes the runtime's state before the provider
+// gets a say, and the provider's own cancellation does not reach into it:
+// DeletePod cancels this worker's context, but a guest the runtime has already
+// built stays built. So a create that raced a DELETE is undone, a create whose
+// pod was taken over by an idempotent successor is left where it is, and a create
+// that merely outlived its own schedule is adopted.
 //
 // A retry that fails for a POD-LEVEL reason cannot un-park the pod — VK is long
 // past its CreatePod call and there is no error channel left — and has no
 // kubelet waiting reason to render, so the STATUS keeps the last image-class
 // cause while the new one is published where it is not a lie: the Warning Event
 // the caller records from the returned message, and the node log.
-func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod, t *podTrack, pr *imagePullRetry, gen uint64) (runtimev1.FailureReason, string, error) {
+func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod, t *podTrack) (runtimev1.FailureReason, string, error) {
 	if pod == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
@@ -1146,47 +1148,93 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 		t.updateParked(resp.GetFailureReason(), e.GetMessage())
 		return resp.GetFailureReason(), e.GetMessage(), nil
 	}
-	if !r.commitParkedCreate(t, pr, gen, string(pod.UID)) {
+	switch r.commitParkedCreate(t, string(pod.UID)) {
+	case commitDeleted:
 		r.compensateLateCreate(pod)
 		// NOT_FOUND ends the schedule (pullClassNone), which is the truth: there
 		// is no pod left to retry a create for.
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
+	case commitSuperseded:
+		// Nothing to undo and nothing to adopt. runtimed's CreatePod is idempotent
+		// on pod id, so the successor's own create resolves to the SAME guest this
+		// one just built; a compensating delete here would tear down the pod the
+		// successor has already been told it owns, and the successor's create
+		// would never be replayed to rebuild it.
+		r.log.Info("a parked pod's create landed after an idempotent re-create took the pod over; leaving it to the successor",
+			"namespace", pod.Namespace, "name", pod.Name, "pod", string(pod.UID))
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", nil
 }
 
-// commitParkedCreate decides whether a create that has just LANDED may be
-// adopted, and adopts it in the same critical section as the decision.
+// commitReason is WHY a create that has just landed could (or could not) be
+// committed to the track that asked for it. The three answers demand three
+// different actions, and collapsing them into "committed / not" is what made a
+// bare cancellation look identical to a delete.
+type commitReason int
+
+const (
+	// commitAdopted: the track is still the live one for this pod id and no
+	// delete has begun, so the guest belongs to this pod. It has been unparked.
+	commitAdopted commitReason = iota
+	// commitDeleted: the pod is being (or has been) deleted, so nothing will ever
+	// reference this guest again — the caller must delete it.
+	commitDeleted
+	// commitSuperseded: an idempotent CreatePod installed a successor track for
+	// the same UID. The guest is the successor's; the caller must leave it alone.
+	commitSuperseded
+)
+
+// commitParkedCreate decides how a create that has just LANDED may be committed,
+// and performs the adoption in the same critical section as the decision.
 //
-// Three things must still hold: the track must be the live one for this pod id
-// (an idempotent CreatePod installs a successor), the delete must not have begun
-// (podTrack.deleting, set before DeletePod cancels anything), and the calling
-// worker must still hold its attempt claim (the same generation discipline every
-// other schedule mutation uses). The unpark happens under the SAME restartMu the
-// last two are read under, so a DeletePod cannot slip between the check and the
-// commit: either it marks first and this returns false, or it marks second and
-// finds an ordinary tracked pod to tear down.
+// The GENERATION claim is deliberately NOT part of this decision, though every
+// other schedule mutation checks it. A claim answers "does this worker still own
+// the schedule?", and the question here is "does this pod still own the guest the
+// runtime just built?" — which the schedule cannot speak to. An image re-key
+// (retryPullsForChangedImages) drops the claim of a live pod's in-flight retry
+// without touching the pod, so a claim-gated commit answered a routine
+// `kubectl set image` by deleting a running pod. A create for a UID this provider
+// still tracks, and is not deleting, is adopted whatever became of the claim: the
+// live paths reconcile any drift between the adopted guest and the current spec
+// from there.
+//
+// Order matters between the two remaining checks. DeletePod sets podTrack.deleting
+// BEFORE it removes the track (runtimed.go), so a delete is visible as deleting
+// whether or not the track is still installed — while the reverse reading, "the
+// track is not installed", cannot tell a delete from a replace. deleting is
+// therefore decisive, and the track lookup only distinguishes the other two. The
+// unpark happens under the SAME restartMu deleting is read under, so a DeletePod
+// cannot slip between the check and the commit: either it marks first and this
+// answers commitDeleted, or it marks second and finds an ordinary tracked pod to
+// tear down.
 //
 // Lock order is r.mu → restartMu, as everywhere else.
-func (r *runtimedRuntime) commitParkedCreate(t *podTrack, pr *imagePullRetry, gen uint64, podID string) bool {
+func (r *runtimedRuntime) commitParkedCreate(t *podTrack, podID string) commitReason {
 	r.mu.Lock()
-	live := r.track[podID] == t
+	live := r.track[podID]
 	r.mu.Unlock()
-	if !live {
-		return false
-	}
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if t.deleting || !pr.holdsAttempt(gen) {
-		return false
+	switch {
+	case t.deleting:
+		return commitDeleted
+	case live == t:
+		t.parked = nil
+		return commitAdopted
+	case live != nil:
+		return commitSuperseded
+	default:
+		// No track at all and this one was never marked: the id was deleted after
+		// a successor had taken it over, so the successor's delete carried the
+		// deleting flag and this track never saw it. Nothing owns the guest.
+		return commitDeleted
 	}
-	t.parked = nil
-	return true
 }
 
 // compensateLateCreate deletes a pod the runtime created for a retry the
-// provider can no longer adopt.
+// provider can no longer adopt, retrying until the delete lands.
 //
 // Without it the create is a RESURRECTION: virtual-kubelet is long past its
 // DeletePod, the track is gone, and runtimed's DeletePod for a pod id it does
@@ -1194,17 +1242,63 @@ func (r *runtimedRuntime) commitParkedCreate(t *podTrack, pr *imagePullRetry, ge
 // replayed against it, and the guest outlives every reference to it. The one
 // process that knows the create happened is this one.
 //
-// It roots its OWN context: the worker's was cancelled by the very delete being
-// compensated for, and a cancelled context would make the compensating delete a
-// no-op, which is the failure it exists to prevent.
+// Which is also why a FAILED compensating delete may not simply be logged: this
+// is the last reference to the guest in the whole system, so dropping it on a
+// transport error leaks exactly what the compensation exists to prevent, and
+// nothing re-arms it. The retry runs on the shared crashLoopBackoff primitive
+// (never a second schedule) against the provider clock, and is recorded in
+// r.compensating so a second late create for the same id joins the loop already
+// running instead of starting a rival one.
+//
+// It roots its own delete calls at context.Background: the worker's context was
+// cancelled by the very delete being compensated for, and a cancelled context
+// would make the compensating delete a no-op. Its LOOP is bounded by the
+// provider's lifetime instead (r.lifetime), so a shutdown mid-retry ends it with
+// an explicit error rather than a goroutine nobody can stop.
 func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
 	podID := string(pod.UID)
-	r.log.Warn("a parked pod's create landed after the pod was deleted or replaced; deleting it again",
+	r.mu.Lock()
+	already := r.compensating[podID]
+	if !already {
+		if r.compensating == nil {
+			r.compensating = map[string]bool{}
+		}
+		r.compensating[podID] = true
+	}
+	r.mu.Unlock()
+	if already {
+		return
+	}
+	r.log.Warn("a parked pod's create landed after the pod was deleted; deleting it again",
 		"namespace", pod.Namespace, "name", pod.Name, "pod", podID)
-	if _, err := r.rt.DeletePod(context.Background(),
-		&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: 0}); err != nil {
-		r.log.Error("could not delete the pod a late create left behind; it will outlive its Pod object",
+	go r.runCompensatingDelete(pod, podID)
+}
+
+// runCompensatingDelete is compensateLateCreate's single retry loop for one pod
+// id. It returns only when the delete has landed or the provider is shutting
+// down, and clears the pod's entry in r.compensating either way.
+func (r *runtimedRuntime) runCompensatingDelete(pod *corev1.Pod, podID string) {
+	defer func() {
+		r.mu.Lock()
+		delete(r.compensating, podID)
+		r.mu.Unlock()
+	}()
+	backoff := newCrashLoopBackoff(r.clk)
+	for {
+		_, err := r.rt.DeletePod(context.Background(),
+			&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: 0})
+		if err == nil {
+			return
+		}
+		r.log.Warn("could not delete the pod a late create left behind; retrying under the back-off",
 			"namespace", pod.Namespace, "name", pod.Name, "pod", podID, "err", err)
+		select {
+		case <-r.lifetime:
+			r.log.Error("the provider is shutting down with a compensating delete still owed; the pod will outlive its Pod object",
+				"namespace", pod.Namespace, "name", pod.Name, "pod", podID)
+			return
+		case <-r.clk.After(backoff.Next()):
+		}
 	}
 }
 

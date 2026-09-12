@@ -153,6 +153,34 @@ type runtimedRuntime struct {
 	track   map[string]*podTrack  // pod id -> bookkeeping
 	probers map[string]*podProber // pod id -> provider-served probe runner
 	notify  func(*corev1.Pod)
+	// compensating is the set of pod ids with a compensating delete owed and in
+	// flight — a guest a parked pod's retry built after the pod was deleted, which
+	// nothing but this provider knows about (runtimed_pull.go). It is
+	// PROVIDER-level rather than per-track for the only reason that matters: the
+	// track is gone by then, so there is nowhere else to hold it, and the pod id
+	// is what the delete is keyed on anyway. It is also the dedupe: one loop per
+	// pod id, however many late creates land for it.
+	compensating map[string]bool // pod id -> a compensating delete is in flight
+
+	// lifetime is closed when the provider shuts down — the Watch context, which
+	// bounds every other provider-owned goroutine, ending. It bounds the ONE
+	// worker that outlives the call that started it and has no pod to be
+	// cancelled with: the compensating-delete retry loop, whose track is gone by
+	// construction (runtimed_pull.go). It is a channel rather than a stored
+	// Context because a Context in a struct is exactly what the standards forbid,
+	// and closure is all a select needs.
+	//
+	// It is created at construction, not at Watch: a compensating delete can be
+	// owed by a provider nobody ever called Watch on (every unit test, and the
+	// window before the node's watch starts).
+	lifetime     chan struct{}
+	lifetimeOnce sync.Once
+}
+
+// shutdown closes the provider's lifetime channel, ending every worker bounded
+// by it. Idempotent, and safe to call from any goroutine.
+func (r *runtimedRuntime) shutdown() {
+	r.lifetimeOnce.Do(func() { close(r.lifetime) })
 }
 
 // podTrack is the provider-side bookkeeping the runtime does not retain: a stable
@@ -499,6 +527,8 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		probeTransport: newProbeTransport(),
 		track:          map[string]*podTrack{},
 		probers:        map[string]*podProber{},
+		compensating:   map[string]bool{},
+		lifetime:       make(chan struct{}),
 	}
 }
 
@@ -1534,6 +1564,14 @@ func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 
 	go r.runWatch(ctx)
 	go r.runBackstop(ctx)
+	// ctx is the provider's run lifetime: when it ends, so does this provider.
+	// The workers with a pod behind them are cancelled by that pod's own delete;
+	// this is what ends the one that has no pod left (runtimed_pull.go's
+	// compensating delete).
+	go func() {
+		<-ctx.Done()
+		r.shutdown()
+	}()
 }
 
 // runWatch consumes the runtime's WatchPodStatus stream, reconnecting whenever it

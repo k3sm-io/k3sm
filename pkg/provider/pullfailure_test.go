@@ -178,6 +178,13 @@ func (f *fakeRuntimeServer) holdCreate() func() {
 	}
 }
 
+// pushDeleteErr queues one DeletePod failure; an exhausted FIFO answers success.
+func (f *fakeRuntimeServer) pushDeleteErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteFIFO = append(f.deleteFIFO, err)
+}
+
 // deleteRecords is every pod id DeletePod has been called with, in order.
 func (f *fakeRuntimeServer) deleteRecords() []string {
 	f.mu.Lock()
@@ -349,6 +356,15 @@ func proberCount(r *runtimedRuntime) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.probers)
+}
+
+// compensatingCount is the number of compensating deletes the provider still
+// owes — the observable for "the retry loop retired", which a call tally cannot
+// express (a tally that has stopped growing may simply be mid-sleep).
+func compensatingCount(r *runtimedRuntime) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.compensating)
 }
 
 // waitingOf returns the named main container's waiting state, or nil.
@@ -994,9 +1010,12 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 	})
 }
 
-// TestParkedCreateFencedAgainstDelete pins the fence between a parked pod's
-// retry and its delete: the retry's CreatePod may LAND after DeletePod has run,
-// and the provider must undo it rather than adopt it.
+// TestParkedCreateFencedAgainstDelete pins what a parked pod's retry does with a
+// create that LANDS too late to be committed the ordinary way, and the answer is
+// decided by WHY it could not: the pod was deleted (undo the create), a fresh
+// idempotent CreatePod for the same UID took the pod over (leave it alone — the
+// successor owns that guest), or nothing happened to the pod at all and only
+// this worker's own schedule was retired (adopt it; the guest is this pod's).
 //
 // Non-vacuity: before the fence, retryParkedCreate unparked and completed the
 // create as soon as the RPC returned, checking nothing. A DeletePod that beat
@@ -1005,13 +1024,19 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 // pod on the runtime with no track, no Pod object, and no second delete coming.
 // runtimed's DeletePod for an id it does not know is a no-op, so the pod that
 // deleted it can never delete this one either: the guest outlives everything
-// that could reach it. Both groups below fail against that provider — the first
-// because no compensating delete is issued, the second because a fence that
-// simply refused every late create would strand the ordinary retry.
+// that could reach it.
+//
+// The fence that closed that hole then collapsed all three outcomes into one
+// bool — "committed, or not" — and compensated with a DeletePod for every
+// not. Two of the three groups below fail against THAT provider: an idempotent
+// replace and a bare schedule cancellation (an image re-key) both lose the
+// worker's claim, so both were answered with a delete of a pod nobody had
+// deleted — the replace destroying the guest the successor had just been handed,
+// the re-key destroying a live pod outright.
 func TestParkedCreateFencedAgainstDelete(t *testing.T) {
 	// parkedWithHeldRetry parks pod's create, then parks its RETRY inside the
-	// CreatePod RPC, returning the release func.
-	parkedWithHeldRetry := func(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntimeServer, func()) {
+	// CreatePod RPC, returning the clock and the release func.
+	parkedWithHeldRetry := func(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntimeServer, *testclock.FakeClock, func()) {
 		t.Helper()
 		r, f, clk, _ := newPullProvider(t)
 		f.pushCreate(createRefusal(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
@@ -1023,13 +1048,13 @@ func TestParkedCreateFencedAgainstDelete(t *testing.T) {
 		waitRestart(t, "the pull back-off timer to arm", clk.HasWaiters)
 		clk.Step(11 * time.Second)
 		waitRestart(t, "the retry's CreatePod to be entered", func() bool { return f.createCount() == 2 })
-		return r, f, release
+		return r, f, clk, release
 	}
 
 	t.Run("a create that lands after the delete is compensated, never adopted", func(t *testing.T) {
 		pod := probePullPod("late-create")
 		id := string(pod.UID)
-		r, f, release := parkedWithHeldRetry(t, pod)
+		r, f, _, release := parkedWithHeldRetry(t, pod)
 		defer release()
 
 		if err := r.DeletePod(context.Background(), pod); err != nil {
@@ -1058,7 +1083,7 @@ func TestParkedCreateFencedAgainstDelete(t *testing.T) {
 	t.Run("a create that lands while the pod is still live is adopted", func(t *testing.T) {
 		pod := probePullPod("live-create")
 		id := string(pod.UID)
-		r, f, release := parkedWithHeldRetry(t, pod)
+		r, f, _, release := parkedWithHeldRetry(t, pod)
 
 		release()
 		tr := r.trackByID(id)
@@ -1074,6 +1099,129 @@ func TestParkedCreateFencedAgainstDelete(t *testing.T) {
 		}
 		waitRestart(t, "the probe runner the adopted create owes",
 			func() bool { return proberCount(r) == 1 })
+	})
+
+	t.Run("a create that lands after an idempotent replace is left to its successor", func(t *testing.T) {
+		pod := probePullPod("replaced-create")
+		id := string(pod.UID)
+		r, f, _, release := parkedWithHeldRetry(t, pod)
+
+		// A fresh CreatePod for the SAME UID — the idempotent re-create VK issues
+		// when it re-syncs a pod the provider already tracks. It installs a
+		// successor track and cancels the parked track's workers, so the held
+		// retry below can no longer hold its claim. Its own RPC is held too, so
+		// it is started in a goroutine and awaited at the seam.
+		created := make(chan error, 1)
+		go func() { created <- r.CreatePod(context.Background(), pod.DeepCopy()) }()
+		waitRestart(t, "the successor's CreatePod to be entered", func() bool { return f.createCount() == 3 })
+		successor := r.trackByID(id)
+		if successor == nil {
+			t.Fatal("the successor did not install a track")
+		}
+
+		release()
+		if err := <-created; err != nil {
+			t.Fatalf("the successor's CreatePod = %v, want nil", err)
+		}
+		waitRestart(t, "the late create to be resolved", func() bool { return !f.hasCreated(id) || compensatingCount(r) == 0 })
+
+		if got := f.deleteRecords(); len(got) != 0 {
+			t.Errorf("DeletePod RPCs = %v, want none: the successor owns this pod id, and the runtime's CreatePod is idempotent on it", got)
+		}
+		if !f.hasCreated(id) {
+			t.Error("the runtime no longer holds the pod: a late create was compensated away from underneath its successor")
+		}
+		if tr := r.trackByID(id); tr != successor {
+			t.Errorf("the live track = %p, want the successor %p — exactly one track owns a pod id", tr, successor)
+		}
+		st, err := r.GetPodStatus(context.Background(), "default", pod.Name)
+		if err != nil {
+			t.Fatalf("GetPodStatus after the replace: %v", err)
+		}
+		if st.Phase != corev1.PodRunning {
+			t.Errorf("phase = %s, want Running — the successor's own create completed", st.Phase)
+		}
+		waitRestart(t, "the successor's probe runner", func() bool { return proberCount(r) == 1 })
+	})
+
+	t.Run("a create that lands after only its own schedule was cancelled is adopted", func(t *testing.T) {
+		pod := probePullPod("rekeyed-create")
+		id := string(pod.UID)
+		r, f, _, release := parkedWithHeldRetry(t, pod)
+
+		// An image re-key cancels the in-flight worker's claim and drops its
+		// schedule (retryPullsForChangedImages) — and does nothing else: the pod
+		// is not deleted, and its track is the same one. A guest built for this
+		// UID therefore belongs to this pod, whatever became of the claim.
+		fixed := pod.DeepCopy()
+		fixed.Spec.Containers[0].Image = "registry.example/web:2"
+		if err := r.UpdatePod(context.Background(), fixed); err != nil {
+			t.Fatalf("UpdatePod on a parked pod = %v, want nil", err)
+		}
+		tr := r.trackByID(id)
+		if tr == nil {
+			t.Fatal("the re-key dropped the track")
+		}
+
+		release()
+		waitRestart(t, "the park to clear", func() bool { return tr.parkedFailure() == nil })
+		if got := f.deleteRecords(); len(got) != 0 {
+			t.Errorf("DeletePod RPCs = %v, want none: nobody deleted or replaced this pod", got)
+		}
+		if !f.hasCreated(id) {
+			t.Error("the runtime does not hold the pod: a live pod's own create was compensated away")
+		}
+		st, err := r.GetPodStatus(context.Background(), "default", pod.Name)
+		if err != nil {
+			t.Fatalf("GetPodStatus after the re-key: %v", err)
+		}
+		if st.Phase != corev1.PodRunning {
+			t.Errorf("phase = %s, want Running once the adopted create completed", st.Phase)
+		}
+		waitRestart(t, "the probe runner the adopted create owes", func() bool { return proberCount(r) == 1 })
+	})
+
+	t.Run("a compensating delete that fails is retried until it lands", func(t *testing.T) {
+		pod := probePullPod("compensate-retry")
+		id := string(pod.UID)
+		r, f, clk, release := parkedWithHeldRetry(t, pod)
+		defer release()
+
+		if err := r.DeletePod(context.Background(), pod); err != nil {
+			t.Fatalf("DeletePod: %v", err)
+		}
+		// The next two DeletePod RPCs fail, and a failed delete deleted nothing:
+		// the guest the late create built is still there to be undone.
+		f.pushDeleteErr(errors.New("runtimed unavailable"))
+		f.pushDeleteErr(errors.New("runtimed unavailable"))
+
+		release()
+		waitRestart(t, "the first compensating delete", func() bool { return len(f.deleteRecords()) == 2 })
+		if !f.hasCreated(id) {
+			t.Fatal("setup: the failed delete removed the pod, so the retry under test has nothing left to undo")
+		}
+		waitRestart(t, "the compensating retry to arm", clk.HasWaiters)
+		clk.Step(11 * time.Second)
+		waitRestart(t, "the second compensating delete", func() bool { return len(f.deleteRecords()) == 3 })
+		waitRestart(t, "the compensating retry to re-arm at the doubled delay", clk.HasWaiters)
+		clk.Step(21 * time.Second)
+		waitRestart(t, "the third compensating delete", func() bool { return len(f.deleteRecords()) == 4 })
+
+		waitRestart(t, "the compensator to retire once the delete landed",
+			func() bool { return compensatingCount(r) == 0 })
+		if f.hasCreated(id) {
+			t.Error("the runtime still holds the pod after the compensating delete succeeded")
+		}
+		// The loop is retired, so no clock step can produce another attempt.
+		clk.Step(10 * time.Minute)
+		if got := f.deleteRecords(); len(got) != 4 {
+			t.Errorf("DeletePod RPCs = %v, want 4 (the pod's own + three compensating attempts) and no more", got)
+		}
+		for _, got := range f.deleteRecords()[1:] {
+			if got != id {
+				t.Errorf("a compensating delete named %q, want the deleted pod's id %q", got, id)
+			}
+		}
 	})
 }
 
