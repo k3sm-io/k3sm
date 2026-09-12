@@ -18,12 +18,16 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/image"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // The provider is the image-pull RETRY authority on the runtimed path, exactly
@@ -37,7 +41,10 @@ import (
 // other's: the provider never inspects a message to classify a failure (the
 // typed reason is the contract), and runtimed never runs a retry loop.
 //
-// The retry verb is StartContainer, never RestartContainer: a container that
+// The retry verb is StartContainer for a pod runtimed HOLDS, and CreatePod for a
+// pod it refused to create at all (the parked-create path below): a pod whose
+// guest was never built has no container to start, so asking it to start one is
+// a NotFound forever. Never RestartContainer: a container that
 // never started has no process to replace, and RestartContainer's contract is to
 // bump restart_count and record a last termination. Driving a pull retry through
 // it would report a growing restart count for a container that has restarted
@@ -229,21 +236,13 @@ func (t *podTrack) cancelPulls() {
 	for _, pr := range t.pulls {
 		pr.abort()
 	}
-}
-
-// dropPullsFor cancels and forgets the schedules of the named image references —
-// the UpdatePod re-key: a container whose image changed is a different pull, so
-// the old reference's schedule (and its worker) has nothing left to retry, and
-// the next failure starts a fresh schedule at the 10s base.
-func (t *podTrack) dropPullsFor(images []string) {
-	t.restartMu.Lock()
-	defer t.restartMu.Unlock()
-	for _, image := range images {
-		if pr := t.pulls[image]; pr != nil {
-			pr.abort()
-			delete(t.pulls, image)
-		}
-	}
+	// The schedules go with the workers. A cancelled schedule paces nothing, and
+	// leaving the entries behind would keep rendering an ImagePullBackOff overlay
+	// (and, for a replaced track, a park) for a pod that is being torn down. A
+	// worker still unwinding holds its own *imagePullRetry pointer, so its
+	// generation-claim release is unaffected by the map being emptied.
+	clear(t.pulls)
+	clear(t.pulling)
 }
 
 // pullObservation is one container reported Waiting for a typed reason.
@@ -276,6 +275,26 @@ func (r *runtimedRuntime) observePulls(pod *corev1.Pod, t *podTrack, rs *runtime
 	var events []podEvent
 
 	t.restartMu.Lock()
+	// Close every attempt window whose container now reports what its image
+	// resolution did. This runs on EVERY observation, parked or not: the Pulled
+	// event is owed as soon as an outcome exists, and the outcome is the only
+	// thing that says which of the kubelet's two messages is true.
+	events = append(events, r.pulledEventsLocked(t, rs)...)
+	if t.parked != nil {
+		// A pod runtimed never created has exactly ONE thing to retry — the
+		// create — so the park owns the single schedule and the per-container
+		// filing below is skipped entirely. Skipping it is not an optimisation:
+		// the synthesized status stamps each container's OWN image (anything else
+		// would be a lie in `kubectl get pod -o yaml`), so the loop below would
+		// file one schedule per distinct image and run that many concurrent
+		// CreatePod retries for one pod.
+		events = append(events, r.observeParkedLocked(pod, t, podID)...)
+		t.restartMu.Unlock()
+		for _, e := range events {
+			r.recordPodEvent(podID, e)
+		}
+		return
+	}
 	live := make(map[string]bool, len(obs))
 	for _, o := range obs {
 		live[o.image] = true
@@ -430,7 +449,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 		if !r.endPullSleep(t, pr, gen) {
 			return
 		}
-		reason, message, err := r.startWaitingContainers(ctx, t, podID, image)
+		reason, message, err := r.attemptPull(ctx, t, podID, image)
 		if ctx.Err() != nil {
 			return // the pod was deleted / replaced while the RPC was in flight
 		}
@@ -463,7 +482,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 // the image absent), so a failure here only logs.
 func (r *runtimedRuntime) runPullOnce(ctx context.Context, t *podTrack, pr *imagePullRetry, gen uint64, podID, image string) {
 	defer r.finishPullAttempt(t, pr, gen)
-	reason, message, err := r.startWaitingContainers(ctx, t, podID, image)
+	reason, message, err := r.attemptPull(ctx, t, podID, image)
 	switch {
 	case ctx.Err() != nil:
 		return
@@ -485,8 +504,8 @@ func (r *runtimedRuntime) runPullOnce(ctx context.Context, t *podTrack, pr *imag
 // A NOT_UPDATABLE refusal is skipped rather than reported: it means the
 // container already has a process (it started, or another attempt won the race),
 // which is not this schedule's failure.
-func (r *runtimedRuntime) startWaitingContainers(ctx context.Context, t *podTrack, podID, image string) (runtimev1.FailureReason, string, error) {
-	names := containersWithImage(r.trackPod(t), image)
+func (r *runtimedRuntime) startWaitingContainers(ctx context.Context, pod *corev1.Pod, podID, image string) (runtimev1.FailureReason, string, error) {
+	names := containersWithImage(pod, image)
 	failReason := runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED
 	failMessage := ""
 	for _, name := range names {
@@ -590,8 +609,16 @@ func (r *runtimedRuntime) applyPullOverlay(pod *corev1.Pod, t *podTrack, st *cor
 	if len(t.pulls) == 0 {
 		return
 	}
-	overlayPullBackOff(pod, st.ContainerStatuses, t.pulls)
-	overlayPullBackOff(pod, st.InitContainerStatuses, t.pulls)
+	// A parked pod has one schedule for the whole pod (see observePulls), so
+	// every container waiting on the refusal follows it — including the ones
+	// whose own image is a different reference.
+	var park *imagePullRetry
+	parkImage := ""
+	if t.parked != nil {
+		park, parkImage = t.pulls[t.parked.image], t.parked.image
+	}
+	overlayPullBackOff(pod, st.ContainerStatuses, t.pulls, park, parkImage)
+	overlayPullBackOff(pod, st.InitContainerStatuses, t.pulls, park, parkImage)
 	// The failed attempt has now been published once; from here the surface
 	// follows the schedule (see imagePullRetry.firstReport).
 	for _, pr := range t.pulls {
@@ -600,20 +627,25 @@ func (r *runtimedRuntime) applyPullOverlay(pod *corev1.Pod, t *podTrack, st *cor
 }
 
 // overlayPullBackOff rewrites ErrImagePull to ImagePullBackOff for every
-// container whose image is mid-sleep. Caller holds t.restartMu.
-func overlayPullBackOff(pod *corev1.Pod, cs []corev1.ContainerStatus, pulls map[string]*imagePullRetry) {
+// container whose image is mid-sleep. park, when non-nil, is the single schedule
+// of a parked pod and overrides the per-image lookup for every waiting
+// container. Caller holds t.restartMu.
+func overlayPullBackOff(pod *corev1.Pod, cs []corev1.ContainerStatus, pulls map[string]*imagePullRetry, park *imagePullRetry, parkImage string) {
 	for i := range cs {
 		w := cs[i].State.Waiting
 		if w == nil || w.Reason != reasonErrImagePull {
 			continue
 		}
-		image := imageRefFor(pod, cs[i].Name, cs[i].Image)
-		pr := pulls[image]
+		ref := imageRefFor(pod, cs[i].Name, cs[i].Image)
+		pr := pulls[ref]
+		if park != nil {
+			pr, ref = park, parkImage
+		}
 		if pr == nil || !pr.sleeping || pr.firstReport {
 			continue
 		}
 		w.Reason = reasonImagePullBackOff
-		w.Message = msgBackOffPullingImage(image)
+		w.Message = msgBackOffPullingImage(ref)
 	}
 }
 
@@ -653,12 +685,477 @@ func creatingContainerStatus(c *corev1.Container, reason string) *runtimev1.Cont
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Pull PROGRESS: the Pulling → Pulled pair
+// ---------------------------------------------------------------------------
+
+// pullAttempt is one dispatched start attempt for a container whose image has to
+// be resolved: the Pulling event has been recorded, and the matching Pulled
+// event is OWED until a status carries that attempt's image_pull outcome.
+//
+// It is per CONTAINER rather than per image because the outcome is: two
+// containers naming one image are resolved separately by the runtime, and each
+// gets its own answer about whether the fetch happened. Held in podTrack.pulling
+// under restartMu, beside the retry schedules, so one lock covers the whole pull
+// surface.
+type pullAttempt struct {
+	image string
+	// at is the clock time the Pulling event was recorded, the base of the
+	// kubelet's "(%v including waiting)" duration.
+	at time.Time
+}
+
+// containerImage is a declared container and the image reference it names.
+type containerImage struct {
+	name  string
+	image string
+}
+
+// pullableContainers names every declared container (init and main) whose image
+// the runtime must RESOLVE, in start order. only, when non-empty, restricts the
+// selection to the containers naming that reference.
+//
+// A host-binary route is excluded: runtimed's resolveBinary takes the native
+// sentinel and an absolute-path reference in place, never parsing them as image
+// references and never contacting a registry (pinned on the runtime side by
+// runtimed's TestHostBinaryRoutesNeverReachTheReferenceParser). Announcing a
+// pull for one would report work that provably does not happen.
+func pullableContainers(pod *corev1.Pod, only string) []containerImage {
+	if pod == nil {
+		return nil
+	}
+	var out []containerImage
+	add := func(cs []corev1.Container) {
+		for i := range cs {
+			c := &cs[i]
+			if c.Image == "" || isHostBinaryContainer(c) {
+				continue
+			}
+			if only != "" && c.Image != only {
+				continue
+			}
+			out = append(out, containerImage{name: c.Name, image: c.Image})
+		}
+	}
+	add(pod.Spec.InitContainers)
+	add(pod.Spec.Containers)
+	return out
+}
+
+// isHostBinaryContainer is isHostBinaryRoute's pod-spec twin, applying the same
+// discriminator to the corev1 container the provider still has in hand on the
+// paths that never build a PodBox (a retry, a status observation). The two must
+// agree: translate.go copies Command/Args onto the box verbatim, so they read
+// the same fields.
+func isHostBinaryContainer(c *corev1.Container) bool {
+	if c.Image == runtimed.NativeImage {
+		return true
+	}
+	return len(c.Command) == 0 && len(c.Args) == 0 && image.IsHostPathReference(c.Image)
+}
+
+// notePullDispatch opens the attempt window for each container an imminent start
+// attempt will resolve an image for, returning the Pulling Events to record
+// OUTSIDE every provider lock.
+func (r *runtimedRuntime) notePullDispatch(t *podTrack, cs []containerImage) []podEvent {
+	if len(cs) == 0 {
+		return nil
+	}
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return r.notePullDispatchLocked(t, cs)
+}
+
+// notePullDispatchLocked is notePullDispatch for a caller already holding
+// t.restartMu.
+func (r *runtimedRuntime) notePullDispatchLocked(t *podTrack, cs []containerImage) []podEvent {
+	if len(cs) == 0 {
+		return nil
+	}
+	if t.pulling == nil {
+		t.pulling = map[string]*pullAttempt{}
+	}
+	now := r.clk.Now()
+	out := make([]podEvent, 0, len(cs))
+	for _, ci := range cs {
+		// A re-dispatch REPLACES the window: the previous attempt's outcome never
+		// arrived (it failed), and the duration the next Pulled reports must be
+		// this attempt's, not the abandoned one's.
+		t.pulling[ci.name] = &pullAttempt{image: ci.image, at: now}
+		out = append(out, podEvent{corev1.EventTypeNormal, reasonPulling, msgPullingImage(ci.image)})
+	}
+	return out
+}
+
+// pulledEventsLocked closes every open attempt window whose container now
+// reports an image_pull outcome, returning the Pulled Events. Emitting is
+// once-per-attempt by construction: the window is deleted as it is closed, and
+// only a fresh dispatch reopens one. Caller holds t.restartMu.
+//
+// Which of the kubelet's two messages applies is READ from runtimed's outcome,
+// never inferred: "already present on machine" and "successfully pulled in %v"
+// are claims about what the node did, and the container state, the resolved
+// image and the image id look identical either way.
+func (r *runtimedRuntime) pulledEventsLocked(t *podTrack, rs *runtimev1.PodStatus) []podEvent {
+	if len(t.pulling) == 0 {
+		return nil
+	}
+	now := r.clk.Now()
+	var out []podEvent
+	scan := func(css []*runtimev1.ContainerStatus) {
+		for _, cs := range css {
+			op := cs.GetImagePull()
+			at := t.pulling[cs.GetName()]
+			if op == nil || at == nil {
+				continue
+			}
+			delete(t.pulling, cs.GetName())
+			ref := at.image
+			if ref == "" {
+				ref = cs.GetImage()
+			}
+			if !op.GetPulled() {
+				out = append(out, podEvent{corev1.EventTypeNormal, reasonPulled, msgImageAlreadyPresent(ref)})
+				continue
+			}
+			out = append(out, podEvent{corev1.EventTypeNormal, reasonPulled,
+				msgPulledImage(ref, op.GetDuration().AsDuration(), now.Sub(at.at))})
+		}
+	}
+	scan(rs.GetContainerStatuses())
+	scan(rs.GetInitContainerStatuses())
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// The PARKED create: a pod whose CreatePod the runtime refused for an image
+// ---------------------------------------------------------------------------
+
+// createFailure is the provider-side record of a CreatePod runtimed refused for
+// a CONTAINER-class image failure, held in podTrack.parked under restartMu.
+//
+// Why the record exists at all: on the vm spine the whole pod is one guest, so
+// an image that cannot be resolved fails the CREATE rather than leaving a
+// container Waiting inside a pod that exists (runtimed's resolveVMContainers
+// returns before CreateVM). Returning that refusal to virtual-kubelet lands the
+// pod ProviderFailed — a TERMINAL phase — for a condition upstream reports as a
+// retryable ImagePullBackOff. The visible cost is not cosmetic: a ReplicaSet
+// whose Pod goes Failed creates a replacement, so a registry outage turns into
+// unbounded Pod churn against the registry that is down, and `kubectl get pod`
+// shows a fresh Pending pod each time instead of one pod with a backoff. So the
+// provider keeps the pod, reports the kubelet's waiting surface for it, and
+// retries the create on the same schedule a started pod's failed pull gets.
+//
+// The record is what makes that surface possible: runtimed holds nothing for
+// this pod, so every status the provider publishes for it is synthesized, and
+// this is the only place the cause survives.
+type createFailure struct {
+	// reason/message are runtimed's typed cause and its bounded message, updated
+	// by each failed retry so the surface reports the current cause.
+	reason  runtimev1.FailureReason
+	message string
+	// image is the reference the failure is attributed to — the schedule key, so
+	// the retry cadence is the same (pod UID × image) key the started-pod path
+	// uses.
+	image string
+	// container, when set, is the single container the refusal named; the rest of
+	// the pod then reports ContainerCreating. Empty means the failure is
+	// attributed pod-wide and every container reports it.
+	container string
+}
+
+// isContainerClassFailure reports whether a CreatePod refusal is about a
+// CONTAINER's image rather than about the pod.
+//
+// It is a CLOSED list, deliberately, and not pullClassFor's forward-compatible
+// default: parking a pod means telling virtual-kubelet the create SUCCEEDED, and
+// a wrong yes hides a genuinely failed pod behind a Pending that retries
+// forever. The waiting-reason path can afford to guess "probably an image"
+// because the worst case there is a mislabelled reason on a pod that is already
+// visibly stuck; this one cannot. A future runtimed reason is therefore an
+// error return until it is added here on purpose.
+func isContainerClassFailure(fr runtimev1.FailureReason) bool {
+	switch fr {
+	case runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL,
+		runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG,
+		runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED:
+		return true
+	default:
+		return false
+	}
+}
+
+// parkedFailure returns the track's create-refusal record, or nil for a pod the
+// runtime created.
+func (t *podTrack) parkedFailure() *createFailure {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.parked
+}
+
+// updateParked refreshes the record with the cause of the latest failed retry,
+// keeping the schedule key: the backoff is per (pod UID × image), and the image
+// being retried has not changed.
+func (t *podTrack) updateParked(reason runtimev1.FailureReason, message string) {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if t.parked == nil {
+		return
+	}
+	t.parked.reason, t.parked.message = reason, message
+}
+
+// unpark clears the record: the create finally succeeded and the pod is a normal
+// tracked pod from here.
+func (t *podTrack) unpark() {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	t.parked = nil
+}
+
+// parkCreate records a refused create, files its retry schedule, and announces
+// the failure with the same Events the started-pod path emits.
+func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtimev1.FailureReason, message string) {
+	cf := &createFailure{reason: reason, message: message}
+	cf.image, cf.container = attributeCreateFailure(pod, message)
+	podID := string(pod.UID)
+	events := []podEvent{pullEventFor(pullObservation{
+		container: cf.container, image: cf.image, message: message, reason: reason,
+	})}
+
+	t.restartMu.Lock()
+	t.parked = cf
+	events = append(events, r.observeParkedLocked(pod, t, podID)...)
+	t.restartMu.Unlock()
+
+	for _, e := range events {
+		r.recordPodEvent(podID, e)
+	}
+}
+
+// observeParkedLocked keeps a parked pod's SINGLE schedule filed and paces the
+// classes that have no exponential worker, returning any Events to record
+// outside the lock. It runs on every status observation, so a schedule a worker
+// retired (its class stopped fitting) is re-filed from the current cause rather
+// than leaving the pod parked with nothing left to retry it.
+//
+// Caller holds t.restartMu and t.parked is non-nil.
+func (r *runtimedRuntime) observeParkedLocked(pod *corev1.Pod, t *podTrack, podID string) []podEvent {
+	cf := t.parked
+	cls := pullClassFor(cf.reason)
+	pr, fresh := t.pullFor(cf.image, cls, r.clk)
+	pr.class, pr.reason, pr.message = cls, cf.reason, cf.message
+	// One pod, one create, one schedule: drop anything a previous life of this
+	// track filed under another reference.
+	for ref, other := range t.pulls {
+		if ref != cf.image && !other.attempt {
+			delete(t.pulls, ref)
+		}
+	}
+	switch {
+	case fresh:
+		pr.lastAttempt = r.clk.Now()
+		pr.firstReport = true
+		if cls == pullClassBackoff {
+			r.startPullWorkerLocked(t, pr, podID, cf.image)
+		}
+		// The refusal's own Events belong to the caller that observed it
+		// (parkCreate, or the worker whose attempt failed), not to this filing.
+		return nil
+	case cls == pullClassResync && !pr.attempt && !r.clk.Now().Before(pr.lastAttempt.Add(resyncInterval)):
+		pr.lastAttempt = r.clk.Now()
+		events := []podEvent{pullEventFor(pullObservation{
+			container: cf.container, image: cf.image, message: cf.message, reason: cf.reason,
+		})}
+		events = append(events, r.notePullDispatchLocked(t, pullableContainers(pod, ""))...)
+		r.startPullOnceLocked(t, pr, podID, cf.image)
+		return events
+	default:
+		return nil
+	}
+}
+
+// attributeCreateFailure decides which image a wholesale refusal is about, and
+// whether one container owns it.
+//
+// runtimed's vm refusals are shaped `container <name>: pull image "<ref>": …`,
+// so both facts are usually present in the bounded message. The message is read
+// only to MATCH strings the pod itself declares — never parsed for content — so
+// a message that says something unexpected degrades to a pod-wide attribution
+// rather than mis-naming a container.
+//
+// Exactly one declared image named ⇒ the failure is the pod's: every container
+// reports it, because on the vm spine no container exists and none will until
+// that one image resolves. Anything else ⇒ the named container carries the
+// failure and the rest report ContainerCreating, which is the truth for them.
+func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
+	cs := pullableContainers(pod, "")
+	var named []string
+	seen := map[string]bool{}
+	for _, ci := range cs {
+		if seen[ci.image] || !strings.Contains(message, ci.image) {
+			continue
+		}
+		seen[ci.image] = true
+		named = append(named, ci.image)
+	}
+	container := ""
+	for _, ci := range cs {
+		if strings.Contains(message, "container "+ci.name+":") {
+			container = ci.name
+			break
+		}
+	}
+	switch {
+	case len(named) == 1:
+		return named[0], ""
+	case container != "":
+		return imagesByContainer(pod)[container], container
+	case len(named) > 1:
+		return named[0], ""
+	case len(cs) > 0:
+		return cs[0].image, ""
+	default:
+		return "", ""
+	}
+}
+
+// parkedRuntimeStatus synthesizes the runtime status of a parked pod: Pending,
+// with the refusal rendered as each container's waiting entry. It carries the
+// TYPED failure_reason, so translate.go maps it to the kubelet's waiting reason
+// through the one table both paths use.
+//
+// Each container reports its OWN image, never the failing one, because
+// ContainerStatus.image is what `kubectl get pod -o yaml` prints for it.
+func parkedRuntimeStatus(pod *corev1.Pod, cf *createFailure) *runtimev1.PodStatus {
+	rs := &runtimev1.PodStatus{PodId: string(pod.UID), Phase: runtimev1.PodPhase_POD_PHASE_PENDING}
+	entry := func(c *corev1.Container) *runtimev1.ContainerStatus {
+		if cf.container != "" && c.Name != cf.container {
+			return creatingContainerStatus(c, reasonContainerCreating)
+		}
+		return &runtimev1.ContainerStatus{
+			Name:  c.Name,
+			Image: c.Image,
+			State: &runtimev1.ContainerState{Waiting: &runtimev1.ContainerStateWaiting{
+				Message:       cf.message,
+				FailureReason: cf.reason,
+			}},
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		rs.InitContainerStatuses = append(rs.InitContainerStatuses, entry(&pod.Spec.InitContainers[i]))
+	}
+	for i := range pod.Spec.Containers {
+		rs.ContainerStatuses = append(rs.ContainerStatuses, entry(&pod.Spec.Containers[i]))
+	}
+	return rs
+}
+
+// synthesizedStatus is the provider's own answer for a tracked pod the RUNTIME
+// does not report: the CreatePod call window, or a pod whose create runtimed
+// refused for an image failure and the provider parked.
+func (r *runtimedRuntime) synthesizedStatus(pod *corev1.Pod, t *podTrack) *runtimev1.PodStatus {
+	if cf := t.parkedFailure(); cf != nil {
+		return parkedRuntimeStatus(pod, cf)
+	}
+	return creatingRuntimeStatus(pod)
+}
+
+// attemptPull runs one re-attempt for the schedule keyed by image, announcing it
+// with the kubelet's Pulling Event first.
+//
+// It is the ONE place the two retry verbs are chosen between: a pod runtimed
+// holds is re-attempted with StartContainer for the containers naming this
+// image, and a parked pod is re-attempted with the whole CreatePod, because
+// nothing exists there to start.
+func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, podID, image string) (runtimev1.FailureReason, string, error) {
+	pod := r.trackPod(t)
+	parked := t.parkedFailure() != nil
+	// A parked retry rebuilds the WHOLE pod, so every pullable container is part
+	// of this attempt; a started pod's retry touches only this image.
+	selector := image
+	if parked {
+		selector = ""
+	}
+	for _, e := range r.notePullDispatch(t, pullableContainers(pod, selector)) {
+		r.recordPodEvent(podID, e)
+	}
+	if parked {
+		return r.retryParkedCreate(ctx, pod, t)
+	}
+	return r.startWaitingContainers(ctx, pod, podID, image)
+}
+
+// retryParkedCreate re-runs the create for a parked pod and, on success,
+// completes it exactly as CreatePod would have.
+//
+// It repeats CreatePod's address allocation and translation rather than sharing
+// its whole body on purpose: the two refusals CreatePod makes BEFORE the RPC —
+// the image-platform preflight and the Xcode-toolchain warning — are decided by
+// this node's capabilities and this pod's annotations, neither of which a retry
+// can have changed, and the preflight's contract is that a pod it refuses leaves
+// no track at all. Re-running them here would either re-warn on every retry or
+// have to un-track a pod that is already tracked.
+//
+// A retry that fails for a POD-LEVEL reason cannot un-park the pod — VK is long
+// past its CreatePod call and there is no error channel left — and has no
+// kubelet waiting reason to render, so the STATUS keeps the last image-class
+// cause while the new one is published where it is not a lie: the Warning Event
+// the caller records from the returned message, and the node log.
+func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod, t *podTrack) (runtimev1.FailureReason, string, error) {
+	if pod == nil {
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
+	}
+	ctx = withPodIdentity(ctx, pod)
+	podIP, err := r.podIP(ctx, pod)
+	if err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
+			fmt.Errorf("allocate pod ip %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	box, err := r.buildBox(ctx, pod, podIP)
+	if err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
+			fmt.Errorf("translate pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
+	if err != nil {
+		return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "",
+			fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		t.updateParked(resp.GetFailureReason(), e.GetMessage())
+		return resp.GetFailureReason(), e.GetMessage(), nil
+	}
+	t.unpark()
+	r.completeCreate(pod, t, resp.GetStatus())
+	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", nil
+}
+
 // retryPullsForChangedImages is the UpdatePod half of the cadence rules: a
 // container whose image reference changed is a different pull, so its old
 // schedule is cancelled and forgotten, and the new reference is attempted at
 // once. This is the ONLY thing that unsticks an InvalidImageName container,
 // whose reference is deterministic and can never parse differently — the
 // troubleshooting doc names `kubectl set image` for exactly this.
+//
+// The re-attempt is filed as a schedule in t.pulls and run by the SAME
+// generation-claimed worker machinery every other re-attempt uses; it is never a
+// bare goroutine. That is the whole difference between "the pod's retry" and "a
+// goroutine that happens to mention the pod": a tracked worker's context is
+// cancelled by cancelPulls when the pod is deleted or its track replaced, and a
+// goroutine rooted at context.Background is reachable by nothing — it would go
+// on talking to runtimed about a pod that no longer exists, and on a node
+// churning pods it accumulates one such goroutine per image edit.
+//
+// The fresh schedule is a RESYNC-class one-shot rather than an exponential
+// worker, whatever the old reference's class was: a spec change earns exactly
+// one immediate attempt, and if it fails, the next status observation carries
+// runtimed's typed reason for the NEW reference and re-classifies from that.
+// Inheriting the old class would pace the new image by the old one's failures.
 //
 // It runs before the UpdatePod RPC: re-keying is provider-side bookkeeping and
 // must not wait on the runtime to answer.
@@ -667,35 +1164,42 @@ func (r *runtimedRuntime) retryPullsForChangedImages(t *podTrack, old, updated *
 		return
 	}
 	previous := imagesByContainer(old)
-	var staleRefs []string
-	var changed []string
-	for name, image := range imagesByContainer(updated) {
+	var staleRefs, freshRefs []string
+	seen := map[string]bool{}
+	for name, ref := range imagesByContainer(updated) {
 		was, ok := previous[name]
-		if !ok || was == image {
+		if !ok || was == ref || seen[ref] {
 			continue
 		}
+		seen[ref] = true
 		staleRefs = append(staleRefs, was)
-		changed = append(changed, name)
+		freshRefs = append(freshRefs, ref)
 	}
-	if len(changed) == 0 {
+	if len(freshRefs) == 0 {
 		return
 	}
-	t.dropPullsFor(staleRefs)
 	podID := string(updated.UID)
-	go func() {
-		for _, name := range changed {
-			resp, err := r.rt.StartContainer(context.Background(), &runtimev1.StartContainerRequest{PodId: podID, Container: name})
-			switch {
-			case err != nil:
-				r.log.Warn("start container after an image change could not reach the runtime",
-					"pod", podID, "container", name, "err", err)
-			case resp.GetError() != nil && resp.GetError().GetCode() != 0 &&
-				resp.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_NOT_UPDATABLE:
-				r.log.Warn("start container after an image change failed; it stays waiting",
-					"pod", podID, "container", name, "reason", resp.GetFailureReason().String())
-			}
+	var events []podEvent
+
+	t.restartMu.Lock()
+	for _, ref := range staleRefs {
+		if pr := t.pulls[ref]; pr != nil {
+			pr.abort()
+			delete(t.pulls, ref)
 		}
-	}()
+	}
+	for _, ref := range freshRefs {
+		pr, _ := t.pullFor(ref, pullClassResync, r.clk)
+		pr.class = pullClassResync
+		pr.lastAttempt = r.clk.Now()
+		events = append(events, r.notePullDispatchLocked(t, pullableContainers(updated, ref))...)
+		r.startPullOnceLocked(t, pr, podID, ref)
+	}
+	t.restartMu.Unlock()
+
+	for _, e := range events {
+		r.recordPodEvent(podID, e)
+	}
 }
 
 // imagesByContainer maps every declared container (init and main) to its image

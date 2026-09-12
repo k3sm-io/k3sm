@@ -384,10 +384,8 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 			t.Error("a container being restarted must not be Ready")
 		}
 
-		select {
-		case ev := <-rec.Events:
+		if ev := nextLifecycleEvent(rec.Events, 100*time.Millisecond); ev != "" {
 			t.Errorf("recorded %q, want NO BackOff event for an un-throttled liveness restart", ev)
-		case <-time.After(100 * time.Millisecond):
 		}
 	})
 
@@ -400,11 +398,11 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 		clk.Step(11 * time.Second)
 		waitRestart(t, "RestartContainer call", func() bool { n, _ := f.restartState(); return n == 1 })
 
-		got := drainEvents(t, rec.Events, 1, 3*time.Second)
+		got := nextLifecycleEvent(rec.Events, 3*time.Second)
 		want := fmt.Sprintf("Warning BackOff Back-off restarting failed container c0 in pod %s_%s(%s)",
 			pod.Name, pod.Namespace, pod.UID)
-		if got[0] != want {
-			t.Errorf("event = %q, want %q", got[0], want)
+		if got != want {
+			t.Errorf("event = %q, want %q", got, want)
 		}
 	})
 

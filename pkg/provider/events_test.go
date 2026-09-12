@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
 )
 
@@ -42,6 +43,38 @@ func drainEvents(t *testing.T, ch <-chan string, want int, timeout time.Duration
 		}
 	}
 	return got
+}
+
+// isPullProgressEvent reports whether ev is one of the pull-PROGRESS events the
+// runtimed path records for every start attempt (Pulling, then Pulled once the
+// runtime reports the outcome — runtimed_pull.go). They ride EVERY create of a
+// pod naming a registry image, so a test asserting on a pod-LIFECYCLE event
+// filters them out instead of re-asserting them at every call site;
+// TestPullProgressEvents owns them.
+func isPullProgressEvent(ev string) bool {
+	return strings.HasPrefix(ev, corev1.EventTypeNormal+" "+reasonPulling+" ") ||
+		strings.HasPrefix(ev, corev1.EventTypeNormal+" "+reasonPulled+" ")
+}
+
+// nextLifecycleEvent returns the next recorded event that is not pull progress,
+// or "" if none arrives within d. A non-positive d makes one non-blocking pass,
+// which is the "assert silence" shape.
+func nextLifecycleEvent(ch <-chan string, d time.Duration) string {
+	deadline := time.Now().Add(d)
+	for {
+		select {
+		case ev := <-ch:
+			if isPullProgressEvent(ev) {
+				continue
+			}
+			return ev
+		default:
+		}
+		if !time.Now().Before(deadline) {
+			return ""
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // TestProviderEmitsLifecycleEvents is the B75 gate: the HostProcess provider must

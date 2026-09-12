@@ -25,9 +25,12 @@ import (
 
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	testclock "k8s.io/utils/clock/testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
@@ -57,7 +60,7 @@ type startRecord struct {
 // StartContainer serves the queued outcomes in order, recording every call. It
 // blocks on the hold channel (when armed) AFTER recording the call, so a test
 // can observe the provider inside its attempt window.
-func (f *fakeRuntimeServer) StartContainer(_ context.Context, req *runtimev1.StartContainerRequest) (*runtimev1.StartContainerResponse, error) {
+func (f *fakeRuntimeServer) StartContainer(ctx context.Context, req *runtimev1.StartContainerRequest) (*runtimev1.StartContainerResponse, error) {
 	f.mu.Lock()
 	f.startCalls++
 	f.lastStart = startRecord{podID: req.GetPodId(), container: req.GetContainer()}
@@ -67,8 +70,18 @@ func (f *fakeRuntimeServer) StartContainer(_ context.Context, req *runtimev1.Sta
 	}
 	hold := f.startHold
 	f.mu.Unlock()
+	// The hold honours the CALLER's context, which is what makes "this attempt
+	// belongs to the pod" observable: a tracked worker's ctx dies with the pod,
+	// a goroutine rooted at context.Background never does.
 	if hold != nil {
-		<-hold
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.startCancels++
+			f.mu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 	switch {
 	case out.err != nil:
@@ -111,6 +124,102 @@ func (f *fakeRuntimeServer) startState() (int, startRecord) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.startCalls, f.lastStart
+}
+
+// startCancelCount is the number of held StartContainer calls that ended by
+// context cancellation.
+func (f *fakeRuntimeServer) startCancelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.startCancels
+}
+
+// createCount is the number of CreatePod RPCs the fake has served.
+func (f *fakeRuntimeServer) createCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createCalls
+}
+
+// deleteCount is the number of DeletePod RPCs the fake has been ENTERED with —
+// incremented before the optional hold, so a test can observe the provider
+// parked inside the call.
+func (f *fakeRuntimeServer) deleteCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deleteCalls
+}
+
+// pushCreate queues one CreatePod refusal; an exhausted FIFO answers success.
+func (f *fakeRuntimeServer) pushCreate(resp *runtimev1.CreatePodResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createFIFO = append(f.createFIFO, resp)
+}
+
+// holdDelete parks every subsequent DeletePod inside the RPC until the returned
+// release func runs.
+func (f *fakeRuntimeServer) holdDelete() func() {
+	hold := make(chan struct{})
+	f.mu.Lock()
+	f.deleteHold = hold
+	f.mu.Unlock()
+	var released bool
+	return func() {
+		f.mu.Lock()
+		f.deleteHold = nil
+		f.mu.Unlock()
+		if !released {
+			released = true
+			close(hold)
+		}
+	}
+}
+
+// createRefusal is the CreatePodResponse runtimed returns when the whole create
+// failed — the vm shape, where no guest exists to hold a per-container waiting
+// state, so the typed reason rides the response itself.
+func createRefusal(fr runtimev1.FailureReason, message string) *runtimev1.CreatePodResponse {
+	return &runtimev1.CreatePodResponse{
+		Error:         &rpcstatus.Status{Code: int32(codes.FailedPrecondition), Message: message},
+		FailureReason: fr,
+	}
+}
+
+// newPullProvider wires a fake-clocked, recorder-backed provider WITHOUT
+// creating a pod, so a test can arm the CreatePod FIFO before the create it is
+// about to assert on (newCrashFake creates eagerly).
+func newPullProvider(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer, *testclock.FakeClock, *record.FakeRecorder) {
+	t.Helper()
+	f := newFakeRuntimeServer()
+	rec := record.NewFakeRecorder(64)
+	r := newRuntimedWith(f, RuntimedConfig{
+		NodeName: "n",
+		NodeIP:   "192.168.1.10",
+		Root:     t.TempDir(),
+		Recorder: rec,
+	}, nil, nil)
+	clk := testclock.NewFakeClock(time.Unix(10000, 0))
+	r.clk = clk
+	return r, f, clk, rec
+}
+
+// rtRunningPulled is a running container status carrying the image-pull outcome
+// runtimed stamps for the most recent start attempt.
+func rtRunningPulled(name, image string, pulled bool, d time.Duration) *runtimev1.ContainerStatus {
+	cs := rtRunning(name)
+	cs.Image = image
+	cs.ImagePull = &runtimev1.ImagePullOutcome{Pulled: pulled, Duration: durationpb.New(d)}
+	return cs
+}
+
+// runningStatusOf is the pod status of a pod whose containers are all up.
+func runningStatusOf(pod *corev1.Pod, cs ...*runtimev1.ContainerStatus) *runtimev1.PodStatus {
+	return &runtimev1.PodStatus{
+		PodId:             string(pod.UID),
+		Phase:             runtimev1.PodPhase_POD_PHASE_RUNNING,
+		ContainerStatuses: cs,
+	}
 }
 
 // forget drops a pod from the fake WITHOUT telling the provider, reproducing the
@@ -346,8 +455,13 @@ func TestPullFailureWaitingStates(t *testing.T) {
 			}
 		})
 
+		// A host-binary route is resolved without a pull: runtimed never parses it
+		// as a reference (that exemption is pinned on the runtime side by
+		// runtimed's TestHostBinaryRoutesNeverReachTheReferenceParser), so nothing
+		// on this side may treat it as an image being fetched. This drives both
+		// routes all the way to a published status and asserts the whole
+		// pull surface stays silent for them.
 		t.Run("the native routes never reach the reference parser", func(t *testing.T) {
-			r, _ := newRuntimedFake(t)
 			for _, tc := range []struct {
 				name  string
 				image string
@@ -358,12 +472,13 @@ func TestPullFailureWaitingStates(t *testing.T) {
 				{"a registry reference", pullImage, false},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					pod := runtimedPod("default", "native")
+					pod := runtimedPod("default", "native-"+strings.NewReplacer("/", "-", " ", "-").Replace(tc.image))
 					pod.Spec.Containers[0].Image = tc.image
 					if tc.image == runtimed.NativeImage || strings.HasPrefix(tc.image, "/") {
 						// The host-binary route is the no-command shape.
 						pod.Spec.Containers[0].Command = nil
 					}
+					r, _, _, tr, rec := newCrashFake(t, pod)
 					box, err := r.buildBox(context.Background(), pod, "192.168.1.10")
 					if err != nil {
 						t.Fatalf("buildBox: %v", err)
@@ -374,12 +489,15 @@ func TestPullFailureWaitingStates(t *testing.T) {
 					if !tc.want {
 						return
 					}
-					// A host-binary route is resolved without a pull, so runtimed
-					// never parses it as a reference and no InvalidImageName wait can
-					// be produced for it. Pin the consequence at this seam: the class
-					// of a non-failure wait is "no schedule".
-					if got := pullClassFor(runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED); got != pullClassNone {
-						t.Errorf("pullClassFor(UNSPECIFIED) = %v, want no schedule", got)
+					st := r.buildStatus(pod.DeepCopy(), tr, runningStatusOf(pod, rtRunning("c0")), nil)
+					if w := waitingOf(&st, "c0"); w != nil {
+						t.Errorf("waiting = %+v, want none — a host binary is resolved in place", w)
+					}
+					if got := pullEntries(tr); len(got) != 0 {
+						t.Errorf("pull schedules = %v, want none for a route that is never pulled", got)
+					}
+					if events := recordedEvents(rec.Events); containsEvent(events, "Pulling image") {
+						t.Errorf("events = %v, want no Pulling event for a host-binary route", events)
 					}
 				})
 			}
@@ -543,23 +661,69 @@ func TestPullFailureWaitingStates(t *testing.T) {
 			}
 		})
 
-		t.Run("UpdatePod with a changed image drops the schedule", func(t *testing.T) {
-			pod := pullPod("updated")
-			r, _, _, tr, _ := newCrashFake(t, pod)
+		t.Run("the delete cancels the worker BEFORE the runtimed DeletePod RPC", func(t *testing.T) {
+			pod := pullPod("delete-order")
+			r, f, clk, tr, _ := newCrashFake(t, pod)
 			r.buildStatus(pod.DeepCopy(), tr, pendingStatus(pod,
 				rtWaiting("c0", pullImage, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, "boom")), nil)
+			waitRestart(t, "the pull back-off timer to arm", clk.HasWaiters)
+
+			// Park the provider inside the DeletePod RPC and assert what it had
+			// ALREADY done: the sleeping worker is cancelled, so firing its timer
+			// now reaches the runtime with nothing. Cancelling after the RPC — the
+			// previous order — leaves a StartContainer racing a pod runtimed is
+			// tearing down; runtimed refuses it, but the two sides must close the
+			// window together rather than leaning on one another.
+			release := f.holdDelete()
+			done := make(chan error, 1)
+			go func() { done <- r.DeletePod(context.Background(), pod) }()
+			waitRestart(t, "the DeletePod RPC to be entered", func() bool { return f.deleteCount() == 1 })
+
+			clk.Step(600 * time.Second)
+			settleStartCalls(t, f, 0)
+			release()
+			if err := <-done; err != nil {
+				t.Fatalf("DeletePod: %v", err)
+			}
+		})
+
+		t.Run("an image change re-keys through the tracked machinery, never a bare goroutine", func(t *testing.T) {
+			pod := pullPod("updated")
+			r, f, clk, tr, _ := newCrashFake(t, pod)
+			// InvalidImageName earns no exponential worker, so the only attempt in
+			// this test is the one the re-key files — nothing else can produce it.
+			r.buildStatus(pod.DeepCopy(), tr, pendingStatus(pod,
+				rtWaiting("c0", pullImage, runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME, "parse ref: invalid tag")), nil)
 			if got := pullEntries(tr); len(got) != 1 || got[0] != pullImage {
 				t.Fatalf("pull schedules = %v, want one for %q", got, pullImage)
 			}
 
+			release := f.holdStart()
+			defer release()
 			fixed := pod.DeepCopy()
 			fixed.Spec.Containers[0].Image = "registry.example/web:2"
 			// The fake serves no UpdatePod, so the RPC fails; the re-keying happens
 			// before it, which is the point — a spec change must not wait on the
 			// runtime to answer.
 			_ = r.UpdatePod(context.Background(), fixed)
+			waitRestart(t, "the re-keyed attempt", func() bool { n, _ := f.startState(); return n == 1 })
+			if got := pullEntries(tr); len(got) != 1 || got[0] != "registry.example/web:2" {
+				t.Fatalf("pull schedules after the image change = %v, want one for the NEW reference", got)
+			}
+
+			// The attempt lives in t.pulls, so the pod's own delete reaches it. A
+			// goroutine rooted at context.Background never learns the pod is gone
+			// and would still be talking to runtimed after this returns.
+			if err := r.DeletePod(context.Background(), pod); err != nil {
+				t.Fatalf("DeletePod: %v", err)
+			}
+			waitRestart(t, "the in-flight attempt to be cancelled by the delete",
+				func() bool { return f.startCancelCount() == 1 })
+			release()
+			clk.Step(600 * time.Second)
+			settleStartCalls(t, f, 1)
 			if got := pullEntries(tr); len(got) != 0 {
-				t.Errorf("pull schedules after the image change = %v, want none (the old reference is gone)", got)
+				t.Errorf("pull schedules after the delete = %v, want none", got)
 			}
 		})
 	})
@@ -576,4 +740,179 @@ func settleStartCalls(t *testing.T, f *fakeRuntimeServer, want int) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// TestPullProgressEvents pins the kubelet's pull-PROGRESS events on the runtimed
+// path — the pair `kubectl describe pod` shows for every image a container
+// starts behind, and the pair whose absence made a slow start indistinguishable
+// from a hung one.
+//
+// Non-vacuity: before this change the runtimed path emitted Pulling nowhere and
+// Pulled nowhere (only the HostProcess path had a Pulled emitter, for its
+// already-present host binaries), so every assertion below fails against it.
+// The Pulled message shape is not derivable from the status alone either: it is
+// read from runtimed's typed image_pull outcome, which is why the wire carries
+// one.
+func TestPullProgressEvents(t *testing.T) {
+	t.Run("CreatePod announces Pulling, and the first outcome announces Pulled", func(t *testing.T) {
+		pod := pullPod("pulling")
+		r, _, _, tr, rec := newCrashFake(t, pod)
+
+		events := recordedEvents(rec.Events)
+		if !containsEvent(events, msgPullingImage(pullImage)) {
+			t.Fatalf("events = %v, want %q at the create attempt", events, msgPullingImage(pullImage))
+		}
+		if containsEvent(events, "Successfully pulled") {
+			t.Errorf("events = %v, want no Pulled before any outcome is reported", events)
+		}
+
+		running := runningStatusOf(pod, rtRunningPulled("c0", pullImage, true, 1500*time.Millisecond))
+		r.buildStatus(pod.DeepCopy(), tr, running, nil)
+		events = recordedEvents(rec.Events)
+		want := `Successfully pulled image "` + pullImage + `" in 1.5s`
+		if !containsEvent(events, want) {
+			t.Errorf("events = %v, want one containing %q", events, want)
+		}
+		if !containsEvent(events, "including waiting") {
+			t.Errorf("events = %v, want the kubelet's two-duration Pulled message", events)
+		}
+
+		// Once per attempt: re-observing the same outcome says nothing more.
+		r.buildStatus(pod.DeepCopy(), tr, running, nil)
+		if events := recordedEvents(rec.Events); containsEvent(events, "Successfully pulled") {
+			t.Errorf("events = %v, want Pulled exactly once per attempt", events)
+		}
+	})
+
+	t.Run("an image already on the machine gets the local-hit message", func(t *testing.T) {
+		pod := pullPod("present")
+		r, _, _, tr, rec := newCrashFake(t, pod)
+		_ = recordedEvents(rec.Events)
+
+		r.buildStatus(pod.DeepCopy(), tr,
+			runningStatusOf(pod, rtRunningPulled("c0", pullImage, false, 3*time.Millisecond)), nil)
+		events := recordedEvents(rec.Events)
+		if !containsEvent(events, msgImageAlreadyPresent(pullImage)) {
+			t.Errorf("events = %v, want %q", events, msgImageAlreadyPresent(pullImage))
+		}
+		if containsEvent(events, "Successfully pulled") {
+			t.Errorf("events = %v, want no registry-fetch phrasing for a local hit", events)
+		}
+	})
+
+	t.Run("a retry attempt announces its own Pulling", func(t *testing.T) {
+		pod := pullPod("retry-pulling")
+		r, f, clk, tr, rec := newCrashFake(t, pod)
+		r.buildStatus(pod.DeepCopy(), tr, pendingStatus(pod,
+			rtWaiting("c0", pullImage, runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL, "boom")), nil)
+		_ = recordedEvents(rec.Events)
+
+		waitRestart(t, "the pull back-off timer to arm", clk.HasWaiters)
+		clk.Step(11 * time.Second)
+		waitRestart(t, "the StartContainer retry", func() bool { n, _ := f.startState(); return n == 1 })
+		waitRestart(t, "the retry's Pulling event", func() bool {
+			return containsEvent(recordedEvents(rec.Events), msgPullingImage(pullImage))
+		})
+	})
+
+	t.Run("an unparseable reference reports the kubelet's InspectFailed message", func(t *testing.T) {
+		pod := pullPod("badref")
+		r, _, _, tr, rec := newCrashFake(t, pod)
+		_ = recordedEvents(rec.Events)
+
+		const bounded = "parse reference: invalid tag"
+		r.buildStatus(pod.DeepCopy(), tr, pendingStatus(pod,
+			rtWaiting("c0", pullImage, runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME, bounded)), nil)
+		want := `Failed to apply default image tag "` + pullImage + `": ` + bounded
+		if events := recordedEvents(rec.Events); !containsEvent(events, want) {
+			t.Errorf("events = %v, want the kubelet's applyDefaultImageTag message %q", events, want)
+		}
+	})
+}
+
+// TestParkedCreateForAnUnresolvableImage is the vm half of the pull-failure
+// surface: a pod whose CreatePod fails WHOLESALE for a container-class image
+// reason, because no guest exists to hold a per-container waiting state.
+//
+// Non-vacuity: before this change the provider returned that refusal as an
+// error, which lands the pod ProviderFailed — a terminal phase for a condition
+// upstream reports as a retryable ImagePullBackOff, and one that makes a
+// ReplicaSet churn new Pods against a registry that is merely down. Every
+// assertion in the first group fails against that provider, and the second
+// group pins the pod-level reasons that must KEEP failing the create.
+func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
+	t.Run("a container-class refusal parks the pod instead of failing it", func(t *testing.T) {
+		pod := pullPod("parked")
+		r, f, clk, rec := newPullProvider(t)
+		f.pushCreate(createRefusal(runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+			`container c0: pull image "`+pullImage+`": unexpected status 500 Internal Server Error`))
+
+		if err := r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod = %v, want the pod parked rather than failed", err)
+		}
+		tr := r.trackByID(string(pod.UID))
+		if tr == nil {
+			t.Fatal("the refused pod is not tracked, so nothing can retry it")
+		}
+
+		st, err := r.GetPodStatus(context.Background(), "default", "parked")
+		if err != nil {
+			t.Fatalf("GetPodStatus on a parked pod: %v", err)
+		}
+		if st.Phase != corev1.PodPending {
+			t.Errorf("phase = %s, want Pending", st.Phase)
+		}
+		if w := waitingOf(st, "c0"); w == nil || w.Reason != reasonErrImagePull {
+			t.Fatalf("waiting = %+v, want Waiting{ErrImagePull}", w)
+		}
+		events := recordedEvents(rec.Events)
+		if !containsEvent(events, "Failed to pull image") {
+			t.Errorf("events = %v, want the same Failed event the started-pod path emits", events)
+		}
+		if !containsEvent(events, msgPullingImage(pullImage)) {
+			t.Errorf("events = %v, want a Pulling event for the create attempt", events)
+		}
+
+		// The same alternation, on the same schedule primitive.
+		waitRestart(t, "the pull back-off timer to arm", clk.HasWaiters)
+		st, err = r.GetPodStatus(context.Background(), "default", "parked")
+		if err != nil {
+			t.Fatalf("GetPodStatus during the back-off: %v", err)
+		}
+		if w := waitingOf(st, "c0"); w == nil || w.Reason != reasonImagePullBackOff {
+			t.Fatalf("during the back-off = %+v, want Waiting{ImagePullBackOff}", w)
+		}
+
+		// The retry verb is CreatePod: runtimed holds nothing to start.
+		clk.Step(11 * time.Second)
+		waitRestart(t, "the CreatePod retry", func() bool { return f.createCount() == 2 })
+		if n, _ := f.startState(); n != 0 {
+			t.Errorf("StartContainer called %d times, want 0 for a pod runtimed never created", n)
+		}
+
+		// The FIFO is exhausted, so the retry succeeded: the pod proceeds exactly
+		// like a normal create.
+		waitRestart(t, "the park to clear", func() bool { return len(pullEntries(tr)) == 0 })
+		st, err = r.GetPodStatus(context.Background(), "default", "parked")
+		if err != nil {
+			t.Fatalf("GetPodStatus after the successful retry: %v", err)
+		}
+		if st.Phase != corev1.PodRunning {
+			t.Errorf("phase = %s, want Running once the retry created the pod", st.Phase)
+		}
+	})
+
+	t.Run("a pod-level refusal still fails the create", func(t *testing.T) {
+		pod := pullPod("podlevel")
+		r, f, _, _ := newPullProvider(t)
+		f.pushCreate(createRefusal(runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+			"create vm for pod: guest did not come up"))
+
+		if err := r.CreatePod(context.Background(), pod); err == nil {
+			t.Fatal("CreatePod = nil, want an error — a pod-level failure is not an image the node can retry")
+		}
+		if tr := r.trackByID(string(pod.UID)); tr != nil && tr.parkedFailure() != nil {
+			t.Error("a pod-level failure parked the pod; only container-class image failures park")
+		}
+	})
 }

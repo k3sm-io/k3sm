@@ -188,6 +188,17 @@ type podTrack struct {
 	// own: both maps are read by the same buildStatus overlay chain, so one lock
 	// is the honest shape and a second would only add a lock-order rule.
 	pulls map[string]*imagePullRetry // image reference -> pull retry schedule
+	// pulling is the per-container Pulling→Pulled attempt window
+	// (runtimed_pull.go): a container the provider has announced a start attempt
+	// for, owed the kubelet's Pulled event until a status carries that attempt's
+	// image_pull outcome. Guarded by restartMu with the rest of the pull surface.
+	pulling map[string]*pullAttempt // container name -> open attempt window
+	// parked, when non-nil, records a CreatePod runtimed refused for a
+	// CONTAINER-class image failure — the vm shape, where the whole guest was
+	// never built. The pod stays tracked and reports the kubelet's waiting
+	// surface from this record while the create is retried; see createFailure
+	// for why the refusal is not returned to virtual-kubelet.
+	parked *createFailure
 
 	// hookMu guards postStart — the per-container postStart hook bookkeeping of
 	// the postStart fidelity path (poststart.go): the pending/failed readiness gate the
@@ -1163,27 +1174,56 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		old.cancelPostStart()
 	}
 
+	// Announce the attempt before it is made: every container whose image the
+	// runtime has to resolve gets the kubelet's Pulling Event, and the window its
+	// Pulled Event closes opens here (runtimed_pull.go). A host-binary route gets
+	// none — nothing is fetched for it.
+	for _, e := range r.notePullDispatch(t, pullableContainers(pod, "")) {
+		r.recordPodEvent(id, e)
+	}
+
 	resp, err := r.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
 	if err != nil {
 		r.log.Error("CreatePod: runtimed RPC", "namespace", pod.Namespace, "name", pod.Name, "err", err)
 		return fmt.Errorf("runtimed create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		// A CONTAINER-class image failure failed the WHOLE create, which is the vm
+		// spine's shape: one guest per pod, so an image that will not resolve
+		// leaves nothing to hold a per-container waiting state. Returning it lands
+		// the pod ProviderFailed — terminal — for a condition upstream reports as
+		// a retryable ImagePullBackOff, and a controller then churns replacement
+		// Pods at whatever is broken. So the pod is PARKED instead: kept tracked,
+		// reported Pending with the kubelet's waiting reason, and re-created on
+		// the same schedule a started pod's failed pull gets (createFailure).
+		if isContainerClassFailure(resp.GetFailureReason()) {
+			r.log.Warn("CreatePod: runtimed could not resolve an image; the pod is kept and retried",
+				"namespace", pod.Namespace, "name", pod.Name,
+				"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
+			r.parkCreate(pod, t, resp.GetFailureReason(), e.GetMessage())
+			return nil
+		}
 		r.log.Error("CreatePod: runtimed rejected the pod", "namespace", pod.Namespace, "name", pod.Name,
 			"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
-	// Start the provider-served probe runner: the VK provider replaces the
-	// kubelet, so it must execute the pod's probes itself. No-op for a probe-free
-	// pod; idempotent for a repeated CreatePod.
-	r.startProber(pod, resp.GetStatus().GetPodIp())
-	// Dispatch each container's postStart hook (the
-	// container is held NotReady until the hook completes, a failure kills it per
-	// its restart policy, and the hook's lifetime is the pod's). Each hook runs in
-	// its own goroutine so CreatePod and the reconcile loop never block on it.
-	r.runPostStart(t, pod, resp.GetStatus().GetPodIp())
-	r.dispatch(id, resp.GetStatus())
+	r.completeCreate(pod, t, resp.GetStatus())
 	return nil
+}
+
+// completeCreate performs the wiring a successful create owes, whether it was
+// the first attempt or a parked pod's retry: the provider-served probe runner
+// (the VK provider replaces the kubelet, so it executes the pod's probes
+// itself — a no-op for a probe-free pod and idempotent for a repeated create),
+// each container's postStart hook (the container is held NotReady until the hook
+// completes, a failure kills it per its restart policy, and the hook's lifetime
+// is the pod's; each runs in its own goroutine so no create blocks on one), and
+// the immediate status dispatch so VK sees the new state without waiting for the
+// stream.
+func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus) {
+	r.startProber(pod, rs.GetPodIp())
+	r.runPostStart(t, pod, rs.GetPodIp())
+	r.dispatch(string(pod.UID), rs)
 }
 
 // UpdatePod forwards labels/annotations changes (the only fields runtimed
@@ -1236,11 +1276,18 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 // wall-time (floored at 1s), since runtimed treats a 0 grace as immediate-kill.
 func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	id := string(pod.UID)
-	// Cancel any in-flight postStart hook FIRST: a hook must not outlive the
-	// pod, and termination must not wait on one — upstream tears the pod worker's
-	// context down on delete, which aborts a running hook.
+	// Cancel every in-flight provider worker FIRST, BEFORE the RPC. A postStart
+	// hook must not outlive the pod and termination must not wait on one —
+	// upstream tears the pod worker's context down on delete, which aborts a
+	// running hook — and the same is true of the two retry authorities: a pending
+	// re-exec or pull re-attempt that fires while runtimed is tearing the pod
+	// down is a StartContainer against a pod being deleted. runtimed refuses that
+	// with a typed precondition failure, but the window is closed from BOTH sides
+	// rather than either leaning on the other.
 	if t := r.trackByID(id); t != nil {
 		t.cancelPostStart()
+		t.cancelRestarts()
+		t.cancelPulls()
 	}
 	// Serve preStop hooks BEFORE termination: runtimed sends SIGTERM
 	// synchronously inside DeletePod, so the provider runs preStop first and passes
@@ -1267,10 +1314,12 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	delete(r.track, id)
 	r.mu.Unlock()
 	if t != nil {
-		// Abort any pending exit-driven re-exec: no restart goroutine may
-		// outlive the pod, and a deleted pod must never be re-spawned. Its
-		// pull-retry twin goes with it: a StartContainer against a pod runtimed
-		// has already torn down is at best a NotFound and at worst a resurrection.
+		// Again, now that the track is unreachable: a status observation landing
+		// while the RPC was in flight can file a fresh re-exec or re-attempt, and
+		// nothing else would ever cancel it. No restart goroutine may outlive the
+		// pod, and a deleted pod must never be re-spawned; a StartContainer
+		// against a pod runtimed has already torn down is at best a NotFound and
+		// at worst a resurrection.
 		t.cancelRestarts()
 		t.cancelPulls()
 	}
@@ -1316,14 +1365,16 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		// The provider tracks this pod but the runtime does not know it yet: the
+		// The provider tracks this pod but the runtime does not know it: either the
 		// CreatePod RPC is still in flight (the track is installed before the
-		// call). NotFound here would report a pod being created as a pod that
-		// does not exist, which VK surfaces as a disappearing Pod; the truthful
-		// answer is the kubelet's own creation surface, every container Waiting
-		// with ContainerCreating. NotFound stays for a pod the PROVIDER does not
-		// track — the one case where nothing is being created.
-		st := r.buildStatus(pod.DeepCopy(), t, creatingRuntimeStatus(pod), r.proberFor(id))
+		// call), or the create was refused for an image failure and the pod is
+		// parked. NotFound here would report a pod being created — or waiting on
+		// a registry — as a pod that does not exist, which VK surfaces as a
+		// disappearing Pod; the truthful answer is the kubelet's own surface,
+		// every container Waiting with ContainerCreating or with the refusal's
+		// reason. NotFound stays for a pod the PROVIDER does not track — the one
+		// case where nothing is being created.
+		st := r.buildStatus(pod.DeepCopy(), t, r.synthesizedStatus(pod, t), r.proberFor(id))
 		return &st, nil
 	}
 	st := r.buildStatus(pod.DeepCopy(), t, resp.GetStatus(), r.proberFor(id))
@@ -1358,7 +1409,17 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 	for i, t := range tracks {
 		pod := pods[i].DeepCopy()
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
-		if err == nil && (resp.GetError() == nil || resp.GetError().GetCode() == 0) {
+		switch {
+		case err != nil:
+			// A transport failure says nothing about the pod; leave the status it
+			// already carries rather than replacing it with a guess.
+		case resp.GetError() != nil && resp.GetError().GetCode() != 0:
+			// The same synthesis GetPodStatus does for a pod the runtime does not
+			// know — the create window, or a parked create. Leaving the status
+			// empty here would publish a phase-less Pod on every backstop tick for
+			// a pod that is legitimately waiting.
+			pod.Status = r.buildStatus(pod, t, r.synthesizedStatus(pod, t), r.proberFor(string(pod.UID)))
+		default:
 			pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
 		}
 		out = append(out, pod)

@@ -377,10 +377,8 @@ func TestImagePlatformPreflightFailsClosed(t *testing.T) {
 				if createCalls != 1 {
 					t.Errorf("CreatePod RPC calls = %d, want 1 — an admitted pod must reach runtimed", createCalls)
 				}
-				select {
-				case ev := <-rec.Events:
+				if ev := nextLifecycleEvent(rec.Events, 0); ev != "" {
 					t.Errorf("admitted pod recorded an Event %q, want none", ev)
-				default:
 				}
 				return
 			}

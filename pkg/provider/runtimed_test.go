@@ -61,6 +61,20 @@ type fakeRuntimeServer struct {
 	lastStart  startRecord
 	startFIFO  []startOutcome
 	startHold  chan struct{}
+	// startCancels counts the held StartContainer calls released by their
+	// CONTEXT rather than by the test — the observable that separates a tracked,
+	// pod-scoped retry from a bare goroutine on context.Background.
+	startCancels int
+
+	// The CreatePod/DeletePod seams of the B119 parked-create path: a FIFO of
+	// refusals the fake answers before its default success (the vm shape, where
+	// a container-class image failure fails the whole create), call tallies, and
+	// an optional hold on DeletePod so the delete ORDER — cancel the pull
+	// workers BEFORE the RPC — is observable.
+	createCalls int
+	createFIFO  []*runtimev1.CreatePodResponse
+	deleteCalls int
+	deleteHold  chan struct{}
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
@@ -137,7 +151,7 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	box := req.GetPod()
-	f.created[box.GetPodId()] = box
+	f.createCalls++
 	// Record the ServiceAccount the provider bound to the ctx so the M2.4
 	// per-pod SA-token binding is observable at the runtime seam. An unbound ctx
 	// records "" — the fail-closed shape, not a silent "default" (B226).
@@ -146,14 +160,30 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 	} else {
 		f.gotSA = ""
 	}
+	// A queued refusal leaves the pod UNcreated, which is the vm reality the
+	// parked-create path exists for: the guest was never built, so a later
+	// GetPodStatus answers NotFound and the provider must synthesize.
+	if len(f.createFIFO) > 0 {
+		var resp *runtimev1.CreatePodResponse
+		resp, f.createFIFO = f.createFIFO[0], f.createFIFO[1:]
+		return resp, nil
+	}
+	f.created[box.GetPodId()] = box
 	return &runtimev1.CreatePodResponse{Status: f.statusLocked(box.GetPodId())}, nil
 }
 
 func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.deleteCalls++
 	f.lastGrace = req.GetGracePeriodSeconds()
 	delete(f.created, req.GetPodId())
+	hold := f.deleteHold
+	f.mu.Unlock()
+	// Held OUTSIDE the lock: a test parks the provider inside this RPC to assert
+	// what it had already done before issuing it.
+	if hold != nil {
+		<-hold
+	}
 	return &runtimev1.DeletePodResponse{}, nil
 }
 
