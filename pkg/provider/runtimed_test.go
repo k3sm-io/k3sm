@@ -52,6 +52,15 @@ type fakeRuntimeServer struct {
 	restartCalls int               // RestartContainer RPC invocations (M2.2 swap)
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
 	restartErr   error             // when set, RestartContainer fails (the B26 retry path)
+
+	// The StartContainer seam of the B119 pull-retry path (see pullfailure_test.go):
+	// a FIFO of queued outcomes, a call tally, and an optional hold channel that
+	// parks the handler so a test can observe the provider inside its attempt
+	// window. An exhausted FIFO answers success.
+	startCalls int
+	lastStart  startRecord
+	startFIFO  []startOutcome
+	startHold  chan struct{}
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil

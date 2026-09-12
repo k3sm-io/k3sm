@@ -189,6 +189,41 @@ container is restarted in place with an upstream-shaped `CrashLoopBackOff` backo
 See [Limitations](limitations.md#restartpolicy-is-honored-on-the-default-runtime-not-on-the-hostprocess-opt-out)
 for the precise scope.
 
+## A Pod's Image Will Not Pull
+
+A container whose image cannot be resolved does **not** fail the rest of the Pod. The Pod is
+created, the containers that can start do start, and the one that cannot sits `Waiting` with the
+reason `kubectl get pod` prints in its `STATUS` column. The Pod's phase stays `Pending` while any
+container waits, and the restart count stays at 0, because a container that never started has not
+restarted.
+
+Read the reason first, because each one has a different recovery:
+
+| Reason | What it means | How it recovers |
+|---|---|---|
+| `ErrImagePull` | The attempt that just failed: the registry pull, the `imagePullSecret`, the platform match, or the signature gate. | Retried automatically, 10s then 20s, doubling to a 300s ceiling. |
+| `ImagePullBackOff` | The same container between attempts. | Nothing to do; the next attempt is already scheduled. |
+| `ErrImageNeverPull` | `imagePullPolicy: Never` and the image is not in this node's store. Nothing is pulled and no registry is contacted. | Load it (`k3sm image load`), then wait one resync (about 10s). |
+| `CreateContainerConfigError` | The container's run spec could not be built: a missing ConfigMap or Secret key, an env reference that does not resolve, an entrypoint the image config does not supply. | Fix the referenced object, then wait one resync (about 10s). |
+| `InvalidImageName` | The reference does not parse. | Only a spec change helps: `kubectl set image`, or delete and recreate. Parsing the same string again cannot give a different answer. |
+
+`kubectl describe pod` carries the same story as Events: `Failed` on each failed attempt, `BackOff`
+when a retry is scheduled, `InspectFailed` for an unparseable reference, and `ErrImageNeverPull`
+each time the node re-checks for an image that policy forbids it to fetch.
+
+Three things worth knowing before you debug further:
+
+- **The message is bounded.** The waiting message and the `Failed` event carry a truncated copy of
+  the underlying error, where upstream Kubernetes prints it whole. The full text, including the
+  registry response, is in the node log (`k3sm logs`, or `log show --predicate 'subsystem ==
+  "io.k3sm.node"'`).
+- **The schedule is per Pod and per image.** Ten Pods referencing one bad image are ten independent
+  retry schedules, exactly as they would be on a kubelet. Restarting the node daemon resets every
+  schedule to the 10s base, so a restart is the fastest way to retry everything at once after you
+  fix a registry.
+- **Deleting and recreating the Pod resets its backoff.** The schedule lives in the running daemon
+  and is keyed to the Pod, so a fresh Pod starts at 10s again rather than inheriting a 300s wait.
+
 ## DNS From Inside a Pod Does Not Resolve Cluster Names
 
 On the default runtime this should work. Service A records, headless Services, StatefulSet per-Pod

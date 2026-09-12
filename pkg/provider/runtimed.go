@@ -179,6 +179,15 @@ type podTrack struct {
 	// restartMu, never the reverse.
 	restartMu sync.Mutex
 	restarts  map[string]*containerRestart // container name -> restart bookkeeping
+	// pulls is the per-image retry bookkeeping of the image pull-failure path
+	// (runtimed_pull.go): the schedule that paces StartContainer re-attempts for
+	// a container that never started, keyed by image reference (the track is
+	// already per pod UID, so the key is the kubelet's pod UID × image).
+	//
+	// It is guarded by restartMu ABOVE, deliberately and not by a mutex of its
+	// own: both maps are read by the same buildStatus overlay chain, so one lock
+	// is the honest shape and a second would only add a lock-order rule.
+	pulls map[string]*imagePullRetry // image reference -> pull retry schedule
 
 	// hookMu guards postStart — the per-container postStart hook bookkeeping of
 	// the postStart fidelity path (poststart.go): the pending/failed readiness gate the
@@ -1150,6 +1159,7 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// double-restart a container the fresh CreatePod just spawned), and its
 		// in-flight postStart hooks belong to the containers being replaced.
 		old.cancelRestarts()
+		old.cancelPulls()
 		old.cancelPostStart()
 	}
 
@@ -1185,10 +1195,19 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	ctx = withPodIdentity(ctx, pod)
 	id := string(pod.UID)
 	r.mu.Lock()
-	if t, ok := r.track[id]; ok {
+	t, tracked := r.track[id]
+	var previous *corev1.Pod
+	if tracked {
+		previous = t.pod
 		t.pod = pod.DeepCopy()
 	}
 	r.mu.Unlock()
+	if tracked {
+		// A container whose image reference changed is a different pull: retire
+		// the old reference's schedule and attempt the new one now. This is the
+		// only recovery an InvalidImageName container has (runtimed_pull.go).
+		r.retryPullsForChangedImages(t, previous, pod)
+	}
 
 	// Same allocate-before-translate ordering as CreatePod; Setup is idempotent
 	// per podID, so an update re-reads the pod's existing /32 (one authority).
@@ -1249,8 +1268,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	r.mu.Unlock()
 	if t != nil {
 		// Abort any pending exit-driven re-exec: no restart goroutine may
-		// outlive the pod, and a deleted pod must never be re-spawned.
+		// outlive the pod, and a deleted pod must never be re-spawned. Its
+		// pull-retry twin goes with it: a StartContainer against a pod runtimed
+		// has already torn down is at best a NotFound and at worst a resurrection.
 		t.cancelRestarts()
+		t.cancelPulls()
 	}
 	// Force-delete the pod from the apiserver now that runtimed has torn its
 	// containers down (r.rt.DeletePod is synchronous). Virtual Kubelet would
@@ -1289,12 +1311,20 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	if err != nil {
 		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, name, err)
 	}
-	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		return nil, vkadapter.NotFoundf("pod %q not found in runtime", namespace+"/"+name)
-	}
 	t := r.trackByID(id)
 	if t == nil {
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
+	}
+	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		// The provider tracks this pod but the runtime does not know it yet: the
+		// CreatePod RPC is still in flight (the track is installed before the
+		// call). NotFound here would report a pod being created as a pod that
+		// does not exist, which VK surfaces as a disappearing Pod; the truthful
+		// answer is the kubelet's own creation surface, every container Waiting
+		// with ContainerCreating. NotFound stays for a pod the PROVIDER does not
+		// track — the one case where nothing is being created.
+		st := r.buildStatus(pod.DeepCopy(), t, creatingRuntimeStatus(pod), r.proberFor(id))
+		return &st, nil
 	}
 	st := r.buildStatus(pod.DeepCopy(), t, resp.GetStatus(), r.proberFor(id))
 	return &st, nil
@@ -1364,6 +1394,10 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // whose postStart hook has not completed.
 func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
 	r.observeExits(pod, t, rs)
+	// The pull-failure twin of observeExits: a container runtimed could not start
+	// gets (or keeps) its retry schedule on the same convergence, so every status
+	// path — stream, backstop, direct GetPodStatus — paces the retries identically.
+	r.observePulls(pod, t, rs)
 	// Feed the Service proxy this pod's live transport address, on the
 	// same convergence the exit observation rides. It reads the status and the
 	// node's own guest record; it contributes NOTHING to the corev1 status being
@@ -1381,6 +1415,9 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	}
 	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps)
 	r.applyRestartOverlay(pod, t, st)
+	// The ErrImagePull ↔ ImagePullBackOff flip, which only the provider's own
+	// schedule can decide (translate.go maps the typed cause and nothing else).
+	r.applyPullOverlay(pod, t, st)
 	// LAST, so its readiness re-derivation sees every other overlay's verdict: a
 	// container whose postStart has not completed is NotReady, and the pod's
 	// ContainersReady/PodReady follow.

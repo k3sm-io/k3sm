@@ -42,6 +42,10 @@ const (
 	reasonKilling = "Killing" // container process is being stopped (DeletePod)
 	reasonFailed  = "Failed"  // container process failed to start
 	reasonBackOff = "BackOff" // container re-exec is throttled by CrashLoopBackOff
+	// reasonInspectFailed is recorded when a container's image reference cannot
+	// be parsed at all — upstream's InspectFailed, the event that pairs with the
+	// InvalidImageName waiting reason.
+	reasonInspectFailed = "InspectFailed"
 	// reasonFailedPostStartHook is recorded when a container's postStart hook
 	// returns an error — upstream's `FailedPostStartHook`, the event that makes a
 	// hook failure visible in `kubectl describe pod` before the container is
@@ -79,6 +83,48 @@ const (
 func msgBackOffRestarting(container string, pod *corev1.Pod) string {
 	return fmt.Sprintf("Back-off restarting failed container %s in pod %s_%s(%s)",
 		container, pod.Name, pod.Namespace, pod.UID)
+}
+
+// msgFailedPullImage is the Failed-event message for an image that could not be
+// pulled. Unlike msgFailedStart it DOES carry the error text, and the reason is
+// the same one that lets msgFailedImagePlatform carry its own: this string is the
+// kubelet's own pull message, and runtimed has already BOUNDED it (quoteBounded)
+// before it reaches the waiting entry — the same text `kubectl describe pod`
+// shows in status. Withholding it here would leave an operator with a Failed
+// event that names no registry, no status code and no digest, while the same
+// text sits one column away in the pod status.
+func msgFailedPullImage(image, message string) string {
+	return fmt.Sprintf("Failed to pull image %q: %s", image, message)
+}
+
+// msgBackOffPullingImage is the BackOff-event message (and the waiting message)
+// for an image whose retry schedule is sleeping. Kubelet-verbatim, so
+// `kubectl describe pod` reads identically to upstream.
+func msgBackOffPullingImage(image string) string {
+	return fmt.Sprintf("Back-off pulling image %q", image)
+}
+
+// msgImageNeverPull is the ErrImageNeverPull-event message for a container whose
+// imagePullPolicy is Never and whose image is not in this node's store.
+// Kubelet-verbatim.
+func msgImageNeverPull(image string) string {
+	return fmt.Sprintf("Container image %q is not present with pull policy of Never", image)
+}
+
+// msgInspectFailed is the InspectFailed-event message for a reference that does
+// not parse. It carries runtimed's bounded parse error for the same reason
+// msgFailedPullImage does: the text is the node's own, and the malformed
+// reference is the entire actionable content.
+func msgInspectFailed(image, message string) string {
+	return fmt.Sprintf("Failed to inspect image %q: %s", image, message)
+}
+
+// msgContainerConfigError is the Failed-event message for a container whose run
+// spec could not be built. Upstream's phrasing for this class is a bare
+// "Error: <what went wrong>", which is what the CreateContainerConfigError
+// waiting message carries too.
+func msgContainerConfigError(message string) string {
+	return "Error: " + message
 }
 
 // msgFailedPostStartHook is the FailedPostStartHook-event message. It carries NO

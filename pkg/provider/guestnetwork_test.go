@@ -402,11 +402,37 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		pod := hostPod("team-a", "native")
 		id := string(pod.UID)
 
-		// It fails at the image pull — the first step PAST the vm/host-process
-		// fork — which is what proves it took the host-process route at all.
-		err := n.r.CreatePod(context.Background(), pod)
-		if err == nil {
-			t.Fatal("CreatePod: want the refused pull, got nil")
+		// Its image is the one testRegistry refuses, so the container stops at the
+		// pull — the first step PAST the vm/host-process fork, which is what
+		// proves it took the host-process route at all. Under the partial-start
+		// contract that no longer fails the call: the pod is created and the
+		// container is reported Waiting with the typed pull failure, which the
+		// provider renders as the kubelet's ErrImagePull.
+		if err := n.r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod: %v, want the pod created with its container waiting", err)
+		}
+		// Delete before the test ends so the provider's pull-retry worker (armed
+		// by the waiting container) cannot outlive it.
+		defer func() { _ = n.r.DeletePod(context.Background(), pod) }()
+
+		st, err := n.r.GetPodStatus(context.Background(), pod.Namespace, pod.Name)
+		if err != nil {
+			t.Fatalf("GetPodStatus: %v", err)
+		}
+		if st.Phase != corev1.PodPending {
+			t.Errorf("phase = %s, want Pending while the container waits", st.Phase)
+		}
+		// Either half of the pull-failure surface is correct here: the provider
+		// arms its retry schedule as soon as it observes the failure, so a status
+		// read after the worker started sleeping legitimately reads
+		// ImagePullBackOff. Which one is racing the real clock; that the container
+		// waits on the PULL is the routing fact this leg is about (the
+		// alternation itself is pinned on a fake clock by
+		// TestPullFailureWaitingStates).
+		w := st.ContainerStatuses[0].State.Waiting
+		if len(st.ContainerStatuses) != 1 || w == nil ||
+			(w.Reason != reasonErrImagePull && w.Reason != reasonImagePullBackOff) {
+			t.Errorf("container status = %+v, want Waiting{ErrImagePull|ImagePullBackOff}", st.ContainerStatuses)
 		}
 		if got := n.images.pulled(); len(got) != 1 {
 			t.Fatalf("puller saw %v, want exactly one pull — the pod must reach the host-process spine", got)

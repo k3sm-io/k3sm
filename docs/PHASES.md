@@ -767,15 +767,15 @@ phases:
             done: true  # 2026-08-28, runtimed PR #56 + k3sm PR #130 — provider forwards the apiserver-stamped imagePullPolicy VERBATIM (never re-derives from the tag); B120.
             desc: "Provider translates the apiserver-defaulted imagePullPolicy VERBATIM (defaulting — :latest/untagged → Always — is the embedded apiserver's; the provider never re-derives). Consumers slice is queue item B120."
           - id: M12.1-d2
-            done: false
-            desc: "Pull-failure taxonomy kubelet-verbatim (queue item B119): ErrImagePull ↔ ImagePullBackOff alternation (per-image exponential 10s→300s cap), ErrImageNeverPull (policy Never: no backoff, no attempt), InvalidImageName (terminal). Invariants: pod phase stays Pending; restartCount untouched; a pull failure never fails CreatePod wholesale (no ReplicaSet churn / registry hammering). Rides the existing ContainerStateWaiting.reason — zero new proto surface. Lifecycle events (Pulling/Pulled/Failed/BackOff) coordinate with the B75 EventRecorder work — cite, never duplicate."
+            done: true  # 2026-09-11, this PR (apis + runtimed + k3sm, one lane) — the provider renders the kubelet waiting vocabulary from runtimed's typed failure_reason and owns the retry schedule; B119 / k3sm#356.
+            desc: "Pull-failure taxonomy kubelet-verbatim (queue item B119): ErrImagePull ↔ ImagePullBackOff alternation (per pod UID × image exponential 10s→300s cap, the SAME crashLoopBackoff primitive as the restart path), ErrImageNeverPull (policy Never: no backoff, no attempt; re-attempted once per resync), CreateContainerConfigError (resync cadence), InvalidImageName (terminal until UpdatePod changes the reference), ContainerCreating/PodInitializing for the create window. Invariants: pod phase stays Pending (derivePhase counts waiting BEFORE running, kubelet getPhase order); restartCount untouched (the retry verb is StartContainer, never RestartContainer); a pull failure never fails CreatePod wholesale (no ReplicaSet churn / registry hammering). Rides an ADDITIVE proto carve — the six decisions of 2026-09-11 rescinded the original \"zero new proto surface\" plan: FailureReason 12-16, ContainerStateWaiting.failure_reason, and the StartContainer rpc, so the cause is typed and switchable instead of matched on message text. Lifecycle events (Failed/BackOff/InspectFailed/ErrImageNeverPull) extend the B75 EventRecorder vocabulary — cite, never duplicate."
           - id: M12.1-d3
             done: true  # 2026-08-29, runtimed e89eb872 (PR #64) + k3sm 0c889e82 (PR #144) — image_id is the resolved CONFIG digest, container_id derives from the existing pgid-based reap identity; B132.
             desc: "status.containerStatuses[].imageID = the resolved repo digest. Image-config USER: ACCEPTED with documented divergence (the workload runs as the service user — non-root by construction; register cross-cite to the no-per-pod-uid ceiling); the vm path stays kubelet-verbatim in-guest. Offline/warm-cache posture + the :latest→Always trap documented in docs/user/limitations.md + images.md; image preload (B117) named as the airgap/outage mitigation."
         acceptance:
           - id: M12.1-a1
-            met: false
-            check: "TestPullFailureWaitingStates: all four waiting reasons, the platform-mismatch row, phase-Pending + restartCount-untouched invariants (fake runtime; -race clean)"
+            met: true  # 2026-09-11 — TestPullFailureWaitingStates green under -race (pkg/provider), red before the change; B119.
+            check: "TestPullFailureWaitingStates: every waiting reason + the forward-compat default, the platform-mismatch row, the ErrImagePull↔ImagePullBackOff alternation on a fake clock, phase-Pending + restartCount-untouched invariants (fake runtime; -race clean)"
             method: unit
           - id: M12.1-a2
             met: false

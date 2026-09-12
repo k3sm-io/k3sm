@@ -1527,6 +1527,12 @@ func applyProbeOverlay(cs []corev1.ContainerStatus, probes probeState) {
 //
 // Rules, in order:
 //   - the runtime's PENDING is authoritative (the pod has not started);
+//   - any main that is WAITING and has never run (no last termination) ⇒ Pending,
+//     checked BEFORE the running case, because upstream's getPhase counts waiting
+//     first: a pod whose second container cannot pull its image is Pending even
+//     while its first container runs. A waiting container that DOES carry a last
+//     termination is a restart in progress, not a start that never happened, so
+//     CrashLoopBackOff keeps its Running verdict below;
 //   - any running main ⇒ Running — upstream never reports a terminal phase while
 //     a container runs, whatever a sibling did;
 //   - a main that will be restarted (its termination resolves restartable, or it
@@ -1542,11 +1548,15 @@ func derivePhase(pod *corev1.Pod, rp runtimev1.PodPhase, cs []corev1.ContainerSt
 		return corev1.PodPending
 	}
 	anyRunning, anyFailed, restartable := false, false, false
+	waiting := 0
 	policy := effectivePodRestartPolicy(pod)
 	for i := range cs {
 		st := &cs[i]
 		if st.State.Running != nil {
 			anyRunning = true
+		}
+		if st.State.Waiting != nil && st.LastTerminationState.Terminated == nil {
+			waiting++
 		}
 		if t := st.State.Terminated; t != nil {
 			if t.ExitCode != 0 || t.Signal != 0 {
@@ -1561,6 +1571,8 @@ func derivePhase(pod *corev1.Pod, rp runtimev1.PodPhase, cs []corev1.ContainerSt
 		}
 	}
 	switch {
+	case waiting > 0:
+		return corev1.PodPending
 	case anyRunning:
 		return corev1.PodRunning
 	case restartable:
@@ -1719,6 +1731,39 @@ func toContainerUser(u *runtimev1.ContainerUser) *corev1.ContainerUser {
 
 // toContainerState maps a runtime ContainerState to corev1, preserving the
 // terminated fields exactly (ExitCode, Signal, Reason, Message, timestamps).
+// waitingReasonFor renders the kubelet's waiting reason for a runtimed waiting
+// entry, switching on its TYPED failure_reason rather than on any text: runtimed
+// owns the cause, the provider owns the vocabulary the kubelet's consumers read
+// (see the reason block in runtimed_restart.go). A non-failure wait
+// (UNSPECIFIED) carries runtimed's own kubelet-verbatim reason — PodInitializing
+// for a container held behind an init sequence — and is passed through.
+//
+// The default arm is the proto's forward-compatibility rule, not a fallback of
+// convenience: every value in the failure_reason 12-16 band is an image or
+// container-start failure, so a value a future runtimed adds reads as
+// ErrImagePull here rather than as an empty reason that would render a container
+// stuck with no explanation at all (apis runtime.proto,
+// ContainerStateWaiting.failure_reason).
+func waitingReasonFor(w *runtimev1.ContainerStateWaiting) string {
+	switch w.GetFailureReason() {
+	case runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED:
+		return w.GetReason()
+	case runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME:
+		return reasonInvalidImageName
+	case runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL:
+		return reasonErrImageNeverPull
+	case runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG:
+		return reasonCreateContainerConfigError
+	case runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_PULL_CREDENTIAL,
+		runtimev1.FailureReason_FAILURE_REASON_IMAGE_NO_PLATFORM_MATCH,
+		runtimev1.FailureReason_FAILURE_REASON_SIGNATURE_REJECTED:
+		return reasonErrImagePull
+	default:
+		return reasonErrImagePull
+	}
+}
+
 func toContainerState(rstate *runtimev1.ContainerState) corev1.ContainerState {
 	if rstate == nil {
 		return corev1.ContainerState{}
@@ -1742,7 +1787,7 @@ func toContainerState(rstate *runtimev1.ContainerState) corev1.ContainerState {
 	case rstate.GetWaiting() != nil:
 		w := rstate.GetWaiting()
 		return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
-			Reason:  w.GetReason(),
+			Reason:  waitingReasonFor(w),
 			Message: w.GetMessage(),
 		}}
 	default:
