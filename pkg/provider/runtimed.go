@@ -199,6 +199,15 @@ type podTrack struct {
 	// surface from this record while the create is retried; see createFailure
 	// for why the refusal is not returned to virtual-kubelet.
 	parked *createFailure
+	// deleting is set the instant DeletePod begins, BEFORE it cancels a single
+	// worker, and is never cleared (the track is discarded moments later, and an
+	// idempotent CreatePod installs a fresh one). It is the fence a late create
+	// checks: cancelling a worker's context does not un-build what the runtime
+	// has already built, so a parked pod's CreatePod can still return SUCCESS
+	// after the pod is gone. Guarded by restartMu with the rest of the pull
+	// surface, so the check and the unpark are one critical section
+	// (commitParkedCreate).
+	deleting bool
 
 	// hookMu guards postStart — the per-container postStart hook bookkeeping of
 	// the postStart fidelity path (poststart.go): the pending/failed readiness gate the
@@ -1247,6 +1256,16 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		// the old reference's schedule and attempt the new one now. This is the
 		// only recovery an InvalidImageName container has (runtimed_pull.go).
 		r.retryPullsForChangedImages(t, previous, pod)
+		if t.parkedFailure() != nil {
+			// A parked pod exists on the provider side only: runtimed refused its
+			// create, so there is no guest to update in place and the RPC would be
+			// a guaranteed NotFound returned to virtual-kubelet. Replacing the
+			// tracked spec above IS the update, and the re-key just pointed the
+			// schedule at whatever image the new spec names; the next retry builds
+			// the pod from it. This is what makes `kubectl set image` the recovery
+			// an InvalidImageName pod actually has.
+			return nil
+		}
 	}
 
 	// Same allocate-before-translate ordering as CreatePod; Setup is idempotent
@@ -1285,6 +1304,13 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// with a typed precondition failure, but the window is closed from BOTH sides
 	// rather than either leaning on the other.
 	if t := r.trackByID(id); t != nil {
+		// Close the track to a late create BEFORE cancelling anything. A parked
+		// pod's retry may already be inside its CreatePod RPC, and cancelling its
+		// context does not un-build a guest the runtime has accepted; marking
+		// first is what makes "the delete won" decidable by the create rather
+		// than by whichever goroutine happens to run next. The create then
+		// compensates itself (retryParkedCreate).
+		t.markDeleting()
 		t.cancelPostStart()
 		t.cancelRestarts()
 		t.cancelPulls()

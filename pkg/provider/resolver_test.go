@@ -18,8 +18,10 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -236,5 +238,53 @@ func TestKubeCredentialsDockerConfig(t *testing.T) {
 	}
 	if ok {
 		t.Error("a non-matching registry must resolve to an anonymous pull (ok=false)")
+	}
+}
+
+// TestPullCredentialErrorsCarryNoSecretContent pins runtimed's CredentialResolver
+// error contract on the provider's implementation: a returned error names the
+// failure class and the operator's own references, and never quotes, echoes, or
+// paraphrases what was inside the Secret.
+//
+// Non-vacuity: the two parse sites wrapped encoding/json's error with %w, and
+// Go's decoder puts the offending MAP KEY in its message — here a registry host
+// read out of the Secret's own bytes. That text then reached the node log and,
+// through runtimed's pullCredential, the bounded waiting message every reader of
+// `kubectl describe pod` sees. The marker assertion below fails against it.
+func TestPullCredentialErrorsCarryNoSecretContent(t *testing.T) {
+	const marker = "marker-registry.internal"
+	ctx := context.Background()
+	refs := []*runtimev1.LocalObjectReference{{Name: "regcred"}}
+
+	tests := []struct {
+		name string
+		key  string
+		data string
+	}{
+		{"dockerconfigjson", corev1.DockerConfigJsonKey, `{"auths":{"` + marker + `":"not-an-object"}}`},
+		{"legacy dockercfg", corev1.DockerConfigKey, `{"` + marker + `":"not-an-object"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "regcred"},
+				Data:       map[string][]byte{tt.key: []byte(tt.data)},
+			})
+			_, _, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+			if err == nil {
+				t.Fatal("PullCredential = nil, want a malformed-secret error")
+			}
+			if !errors.Is(err, ErrPullSecretMalformed) {
+				t.Errorf("error %v does not match ErrPullSecretMalformed; callers classify by sentinel, not by text", err)
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Errorf("error %q quotes Secret content", err)
+			}
+			for _, want := range []string{"prod", "regcred", tt.key} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name the operator's own reference %q", err, want)
+				}
+			}
+		})
 	}
 }

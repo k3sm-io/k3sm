@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
@@ -73,8 +74,22 @@ type fakeRuntimeServer struct {
 	// workers BEFORE the RPC — is observable.
 	createCalls int
 	createFIFO  []*runtimev1.CreatePodResponse
+	// createHold parks every subsequent CreatePod inside the RPC, AFTER the call
+	// is recorded, so a test can act while the provider is mid-create. Unlike the
+	// StartContainer hold it deliberately IGNORES the caller's context: a create
+	// the runtime has already accepted is not un-done by the client cancelling
+	// its context, and that gap is exactly the window the parked-retry fence
+	// guards.
+	createHold  chan struct{}
 	deleteCalls int
-	deleteHold  chan struct{}
+	// deleteIDs is every pod id DeletePod has been called with, in order — the
+	// observable for a COMPENSATING delete issued after a create landed late.
+	deleteIDs  []string
+	deleteHold chan struct{}
+	// updateCalls counts UpdatePod RPCs, so "the provider never called the
+	// runtime at all" is assertable (a parked pod has nothing to update in
+	// place, because the runtime holds nothing for it).
+	updateCalls int
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
@@ -149,8 +164,6 @@ func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.R
 
 func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	box := req.GetPod()
 	f.createCalls++
 	// Record the ServiceAccount the provider bound to the ctx so the M2.4
 	// per-pod SA-token binding is observable at the runtime seam. An unbound ctx
@@ -160,6 +173,18 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 	} else {
 		f.gotSA = ""
 	}
+	hold := f.createHold
+	f.mu.Unlock()
+	// Held OUTSIDE the lock and AFTER the call is recorded, so a test can observe
+	// the provider inside the RPC; the caller's context is ignored on purpose
+	// (see the createHold field doc).
+	if hold != nil {
+		<-hold
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	box := req.GetPod()
 	// A queued refusal leaves the pod UNcreated, which is the vm reality the
 	// parked-create path exists for: the guest was never built, so a later
 	// GetPodStatus answers NotFound and the provider must synthesize.
@@ -172,9 +197,20 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 	return &runtimev1.CreatePodResponse{Status: f.statusLocked(box.GetPodId())}, nil
 }
 
+// UpdatePod counts the RPC and refuses it: the fake serves no in-place update,
+// so a test can tell "the provider called the runtime and the call failed" apart
+// from "the provider never called the runtime at all".
+func (f *fakeRuntimeServer) UpdatePod(_ context.Context, _ *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
+	f.mu.Lock()
+	f.updateCalls++
+	f.mu.Unlock()
+	return nil, errors.New("fake runtime serves no UpdatePod")
+}
+
 func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	f.mu.Lock()
 	f.deleteCalls++
+	f.deleteIDs = append(f.deleteIDs, req.GetPodId())
 	f.lastGrace = req.GetGracePeriodSeconds()
 	delete(f.created, req.GetPodId())
 	hold := f.deleteHold

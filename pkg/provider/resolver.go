@@ -230,6 +230,24 @@ func newKubeCredentials(cs kubernetes.Interface) *kubeCredentials {
 // Compile-time check that kubeCredentials satisfies the runtimed seam.
 var _ runtimed.CredentialResolver = (*kubeCredentials)(nil)
 
+// The pull-credential error sentinels. runtimed's CredentialResolver contract
+// binds an implementation's ERRORS to the same invariant as the credential
+// itself: an error may name the failure class and the operator's own references
+// (namespace, Secret name, data key, image) and nothing that was inside the
+// Secret. So the causes below are reported as sentinels a caller classifies with
+// errors.Is, and neither the apiserver's error text nor the JSON decoder's is
+// wrapped into them — the decoder in particular puts the offending map key,
+// which is a registry host read out of the Secret's own bytes, into its message.
+var (
+	// ErrPullSecretNotReadable is returned when an imagePullSecret exists but
+	// could not be read. A NotFound is not an error at all (the next Secret in
+	// the list is tried), so this is a permission or transport failure.
+	ErrPullSecretNotReadable = errors.New("imagePullSecret could not be read")
+	// ErrPullSecretMalformed is returned when an imagePullSecret's docker-config
+	// payload does not decode.
+	ErrPullSecretMalformed = errors.New("imagePullSecret is not a valid docker config")
+)
+
 // PullCredential reads the referenced docker-config Secrets and returns the
 // credential whose registry matches ref's host, or ok=false for an anonymous pull
 // (no secret matched). A missing pull secret is non-fatal (the next is tried).
@@ -241,9 +259,17 @@ func (k *kubeCredentials) PullCredential(ctx context.Context, namespace string, 
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, false, fmt.Errorf("read imagePullSecret %s/%s: %w", namespace, s.GetName(), err)
+			// The apiserver's error is CLASSIFIED, never wrapped: its text can
+			// carry the response body of a request for a Secret, and this error
+			// reaches runtimed's node log and its bounded waiting message.
+			class := "unreadable"
+			if apierrors.IsForbidden(err) {
+				class = "forbidden"
+			}
+			return nil, false, fmt.Errorf("%w: secret %s/%s (%s)",
+				ErrPullSecretNotReadable, namespace, s.GetName(), class)
 		}
-		cred, ok, err := credentialFromSecret(sec, host)
+		cred, ok, err := credentialFromSecret(sec, namespace, host)
 		if err != nil {
 			return nil, false, err
 		}
@@ -270,11 +296,21 @@ type dockerAuthEntry struct {
 
 // credentialFromSecret parses a dockerconfigjson (or legacy dockercfg) Secret and
 // returns the credential matching host, ok=false when none matches.
-func credentialFromSecret(sec *corev1.Secret, host string) (*image.RegistryCredential, bool, error) {
+//
+// A decode failure is reported as ErrPullSecretMalformed naming the namespace,
+// the Secret and the data key, and the decoder's own error is DISCARDED rather
+// than wrapped: encoding/json puts the offending map key in its message, and in
+// a docker config that key is a registry host read out of the Secret's bytes.
+// namespace is passed in rather than read off sec so the reference is the one
+// the caller looked the Secret up by.
+func credentialFromSecret(sec *corev1.Secret, namespace, host string) (*image.RegistryCredential, bool, error) {
+	malformed := func(key string) error {
+		return fmt.Errorf("%w: secret %s/%s key %s", ErrPullSecretMalformed, namespace, sec.Name, key)
+	}
 	if raw, ok := sec.Data[corev1.DockerConfigJsonKey]; ok {
 		var cfg dockerConfigJSON
 		if err := json.Unmarshal(raw, &cfg); err != nil {
-			return nil, false, fmt.Errorf("parse %s in secret %s: %w", corev1.DockerConfigJsonKey, sec.Name, err)
+			return nil, false, malformed(corev1.DockerConfigJsonKey)
 		}
 		if e, ok := matchAuth(cfg.Auths, host); ok {
 			return toRegistryCredential(e), true, nil
@@ -284,7 +320,7 @@ func credentialFromSecret(sec *corev1.Secret, host string) (*image.RegistryCrede
 	if raw, ok := sec.Data[corev1.DockerConfigKey]; ok {
 		var auths map[string]dockerAuthEntry // legacy .dockercfg has no "auths" wrapper
 		if err := json.Unmarshal(raw, &auths); err != nil {
-			return nil, false, fmt.Errorf("parse %s in secret %s: %w", corev1.DockerConfigKey, sec.Name, err)
+			return nil, false, malformed(corev1.DockerConfigKey)
 		}
 		if e, ok := matchAuth(auths, host); ok {
 			return toRegistryCredential(e), true, nil

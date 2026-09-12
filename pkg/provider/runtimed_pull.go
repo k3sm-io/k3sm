@@ -288,7 +288,7 @@ func (r *runtimedRuntime) observePulls(pod *corev1.Pod, t *podTrack, rs *runtime
 		// would be a lie in `kubectl get pod -o yaml`), so the loop below would
 		// file one schedule per distinct image and run that many concurrent
 		// CreatePod retries for one pod.
-		events = append(events, r.observeParkedLocked(pod, t, podID)...)
+		events = append(events, r.observeParkedLocked(t, podID)...)
 		t.restartMu.Unlock()
 		for _, e := range events {
 			r.recordPodEvent(podID, e)
@@ -449,7 +449,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 		if !r.endPullSleep(t, pr, gen) {
 			return
 		}
-		reason, message, err := r.attemptPull(ctx, t, podID, image)
+		reason, message, err := r.attemptPull(ctx, t, pr, gen, podID, image)
 		if ctx.Err() != nil {
 			return // the pod was deleted / replaced while the RPC was in flight
 		}
@@ -482,7 +482,7 @@ func (r *runtimedRuntime) runPullRetry(ctx context.Context, t *podTrack, pr *ima
 // the image absent), so a failure here only logs.
 func (r *runtimedRuntime) runPullOnce(ctx context.Context, t *podTrack, pr *imagePullRetry, gen uint64, podID, image string) {
 	defer r.finishPullAttempt(t, pr, gen)
-	reason, message, err := r.attemptPull(ctx, t, podID, image)
+	reason, message, err := r.attemptPull(ctx, t, pr, gen, podID, image)
 	switch {
 	case ctx.Err() != nil:
 		return
@@ -757,21 +757,19 @@ func isHostBinaryContainer(c *corev1.Container) bool {
 // notePullDispatch opens the attempt window for each container an imminent start
 // attempt will resolve an image for, returning the Pulling Events to record
 // OUTSIDE every provider lock.
+//
+// It is called from exactly ONE place per attempt — attemptPull, on the worker
+// that is about to make the call, plus CreatePod for the first attempt of all.
+// An observer that merely SCHEDULES an attempt must not call it too: upstream
+// records one Pulling per trip through its image manager, and a second dispatch
+// also REPLACES the attempt window, which resets the base of the
+// "(… including waiting)" duration the eventual Pulled reports.
 func (r *runtimedRuntime) notePullDispatch(t *podTrack, cs []containerImage) []podEvent {
 	if len(cs) == 0 {
 		return nil
 	}
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	return r.notePullDispatchLocked(t, cs)
-}
-
-// notePullDispatchLocked is notePullDispatch for a caller already holding
-// t.restartMu.
-func (r *runtimedRuntime) notePullDispatchLocked(t *podTrack, cs []containerImage) []podEvent {
-	if len(cs) == 0 {
-		return nil
-	}
 	if t.pulling == nil {
 		t.pulling = map[string]*pullAttempt{}
 	}
@@ -909,12 +907,14 @@ func (t *podTrack) updateParked(reason runtimev1.FailureReason, message string) 
 	t.parked.reason, t.parked.message = reason, message
 }
 
-// unpark clears the record: the create finally succeeded and the pod is a normal
-// tracked pod from here.
-func (t *podTrack) unpark() {
+// markDeleting closes the track to any further create. DeletePod sets it BEFORE
+// it cancels a worker, so a create RPC already in flight cannot find the track
+// live once the delete has begun. See podTrack.deleting for why cancellation
+// alone is not enough.
+func (t *podTrack) markDeleting() {
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	t.parked = nil
+	t.deleting = true
 }
 
 // parkCreate records a refused create, files its retry schedule, and announces
@@ -929,7 +929,7 @@ func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtim
 
 	t.restartMu.Lock()
 	t.parked = cf
-	events = append(events, r.observeParkedLocked(pod, t, podID)...)
+	events = append(events, r.observeParkedLocked(t, podID)...)
 	t.restartMu.Unlock()
 
 	for _, e := range events {
@@ -944,7 +944,7 @@ func (r *runtimedRuntime) parkCreate(pod *corev1.Pod, t *podTrack, reason runtim
 // than leaving the pod parked with nothing left to retry it.
 //
 // Caller holds t.restartMu and t.parked is non-nil.
-func (r *runtimedRuntime) observeParkedLocked(pod *corev1.Pod, t *podTrack, podID string) []podEvent {
+func (r *runtimedRuntime) observeParkedLocked(t *podTrack, podID string) []podEvent {
 	cf := t.parked
 	cls := pullClassFor(cf.reason)
 	pr, fresh := t.pullFor(cf.image, cls, r.clk)
@@ -971,7 +971,8 @@ func (r *runtimedRuntime) observeParkedLocked(pod *corev1.Pod, t *podTrack, podI
 		events := []podEvent{pullEventFor(pullObservation{
 			container: cf.container, image: cf.image, message: cf.message, reason: cf.reason,
 		})}
-		events = append(events, r.notePullDispatchLocked(t, pullableContainers(pod, ""))...)
+		// The attempt's own Pulling belongs to the worker that makes the call
+		// (attemptPull), exactly as on the started-pod resync branch above.
 		r.startPullOnceLocked(t, pr, podID, cf.image)
 		return events
 	default:
@@ -988,10 +989,20 @@ func (r *runtimedRuntime) observeParkedLocked(pod *corev1.Pod, t *podTrack, podI
 // a message that says something unexpected degrades to a pod-wide attribution
 // rather than mis-naming a container.
 //
-// Exactly one declared image named ⇒ the failure is the pod's: every container
-// reports it, because on the vm spine no container exists and none will until
-// that one image resolves. Anything else ⇒ the named container carries the
-// failure and the rest report ContainerCreating, which is the truth for them.
+// A NAMED container wins, and wins first: the refusal is that container's
+// failure, so only it carries the typed reason and the bounded message, and the
+// rest of the pod reports ContainerCreating. That is the truth for them — they
+// never started because the POD could not be created, not because of anything
+// about their own images, and stamping a registry error about someone else's
+// image onto every container of the pod says otherwise in `kubectl get pod`.
+// The named container's own declared image keys the schedule, so the retry
+// cadence stays the (pod UID × image) key the started-pod path uses.
+//
+// NOTHING named ⇒ the failure is the pod's and every container reports it,
+// because on the vm spine no container exists and none will until the create
+// succeeds; the schedule keys on the single named image when there is one, and
+// otherwise on the pod's first declared image, which is the one the runtime
+// resolves first.
 func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 	cs := pullableContainers(pod, "")
 	var named []string
@@ -1011,11 +1022,9 @@ func attributeCreateFailure(pod *corev1.Pod, message string) (string, string) {
 		}
 	}
 	switch {
-	case len(named) == 1:
-		return named[0], ""
 	case container != "":
 		return imagesByContainer(pod)[container], container
-	case len(named) > 1:
+	case len(named) > 0:
 		return named[0], ""
 	case len(cs) > 0:
 		return cs[0].image, ""
@@ -1072,7 +1081,7 @@ func (r *runtimedRuntime) synthesizedStatus(pod *corev1.Pod, t *podTrack) *runti
 // holds is re-attempted with StartContainer for the containers naming this
 // image, and a parked pod is re-attempted with the whole CreatePod, because
 // nothing exists there to start.
-func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, podID, image string) (runtimev1.FailureReason, string, error) {
+func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, pr *imagePullRetry, gen uint64, podID, image string) (runtimev1.FailureReason, string, error) {
 	pod := r.trackPod(t)
 	parked := t.parkedFailure() != nil
 	// A parked retry rebuilds the WHOLE pod, so every pullable container is part
@@ -1085,7 +1094,7 @@ func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, podID, i
 		r.recordPodEvent(podID, e)
 	}
 	if parked {
-		return r.retryParkedCreate(ctx, pod, t)
+		return r.retryParkedCreate(ctx, pod, t, pr, gen)
 	}
 	return r.startWaitingContainers(ctx, pod, podID, image)
 }
@@ -1101,12 +1110,19 @@ func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, podID, i
 // no track at all. Re-running them here would either re-warn on every retry or
 // have to un-track a pod that is already tracked.
 //
+// A create that SUCCEEDS is adopted only if the pod is still there to adopt it
+// (commitParkedCreate). The RPC is the one call in this path that changes the
+// runtime's state before the provider gets a say, and the provider's own
+// cancellation does not reach into it: DeletePod cancels this worker's context,
+// but a guest the runtime has already built stays built. So the adoption is
+// fenced, and a create that lost the race is undone rather than kept.
+//
 // A retry that fails for a POD-LEVEL reason cannot un-park the pod — VK is long
 // past its CreatePod call and there is no error channel left — and has no
 // kubelet waiting reason to render, so the STATUS keeps the last image-class
 // cause while the new one is published where it is not a lie: the Warning Event
 // the caller records from the returned message, and the node log.
-func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod, t *podTrack) (runtimev1.FailureReason, string, error) {
+func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod, t *podTrack, pr *imagePullRetry, gen uint64) (runtimev1.FailureReason, string, error) {
 	if pod == nil {
 		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
 	}
@@ -1130,9 +1146,66 @@ func (r *runtimedRuntime) retryParkedCreate(ctx context.Context, pod *corev1.Pod
 		t.updateParked(resp.GetFailureReason(), e.GetMessage())
 		return resp.GetFailureReason(), e.GetMessage(), nil
 	}
-	t.unpark()
+	if !r.commitParkedCreate(t, pr, gen, string(pod.UID)) {
+		r.compensateLateCreate(pod)
+		// NOT_FOUND ends the schedule (pullClassNone), which is the truth: there
+		// is no pod left to retry a create for.
+		return runtimev1.FailureReason_FAILURE_REASON_NOT_FOUND, "", nil
+	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED, "", nil
+}
+
+// commitParkedCreate decides whether a create that has just LANDED may be
+// adopted, and adopts it in the same critical section as the decision.
+//
+// Three things must still hold: the track must be the live one for this pod id
+// (an idempotent CreatePod installs a successor), the delete must not have begun
+// (podTrack.deleting, set before DeletePod cancels anything), and the calling
+// worker must still hold its attempt claim (the same generation discipline every
+// other schedule mutation uses). The unpark happens under the SAME restartMu the
+// last two are read under, so a DeletePod cannot slip between the check and the
+// commit: either it marks first and this returns false, or it marks second and
+// finds an ordinary tracked pod to tear down.
+//
+// Lock order is r.mu → restartMu, as everywhere else.
+func (r *runtimedRuntime) commitParkedCreate(t *podTrack, pr *imagePullRetry, gen uint64, podID string) bool {
+	r.mu.Lock()
+	live := r.track[podID] == t
+	r.mu.Unlock()
+	if !live {
+		return false
+	}
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if t.deleting || !pr.holdsAttempt(gen) {
+		return false
+	}
+	t.parked = nil
+	return true
+}
+
+// compensateLateCreate deletes a pod the runtime created for a retry the
+// provider can no longer adopt.
+//
+// Without it the create is a RESURRECTION: virtual-kubelet is long past its
+// DeletePod, the track is gone, and runtimed's DeletePod for a pod id it does
+// not know is a no-op — so the delete that raced this create can never be
+// replayed against it, and the guest outlives every reference to it. The one
+// process that knows the create happened is this one.
+//
+// It roots its OWN context: the worker's was cancelled by the very delete being
+// compensated for, and a cancelled context would make the compensating delete a
+// no-op, which is the failure it exists to prevent.
+func (r *runtimedRuntime) compensateLateCreate(pod *corev1.Pod) {
+	podID := string(pod.UID)
+	r.log.Warn("a parked pod's create landed after the pod was deleted or replaced; deleting it again",
+		"namespace", pod.Namespace, "name", pod.Name, "pod", podID)
+	if _, err := r.rt.DeletePod(context.Background(),
+		&runtimev1.DeletePodRequest{PodId: podID, GracePeriodSeconds: 0}); err != nil {
+		r.log.Error("could not delete the pod a late create left behind; it will outlive its Pod object",
+			"namespace", pod.Namespace, "name", pod.Name, "pod", podID, "err", err)
+	}
 }
 
 // retryPullsForChangedImages is the UpdatePod half of the cadence rules: a
@@ -1179,7 +1252,6 @@ func (r *runtimedRuntime) retryPullsForChangedImages(t *podTrack, old, updated *
 		return
 	}
 	podID := string(updated.UID)
-	var events []podEvent
 
 	t.restartMu.Lock()
 	for _, ref := range staleRefs {
@@ -1192,14 +1264,12 @@ func (r *runtimedRuntime) retryPullsForChangedImages(t *podTrack, old, updated *
 		pr, _ := t.pullFor(ref, pullClassResync, r.clk)
 		pr.class = pullClassResync
 		pr.lastAttempt = r.clk.Now()
-		events = append(events, r.notePullDispatchLocked(t, pullableContainers(updated, ref))...)
+		// No Pulling is announced here: the worker started below announces its own
+		// (notePullDispatch), and a second dispatch would double the event and
+		// reset the attempt window it opens.
 		r.startPullOnceLocked(t, pr, podID, ref)
 	}
 	t.restartMu.Unlock()
-
-	for _, e := range events {
-		r.recordPodEvent(podID, e)
-	}
 }
 
 // imagesByContainer maps every declared container (init and main) to its image

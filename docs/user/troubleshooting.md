@@ -212,11 +212,26 @@ the image; `Pulled` closes a successful one, saying either how long the fetch to
 was already on the machine. On the failing side: `Failed` on each failed attempt, `BackOff` when a
 retry is scheduled, `InspectFailed` for an unparseable reference, and `ErrImageNeverPull` each time
 the node re-checks for an image that policy forbids it to fetch. A container whose image is a host
-binary (an absolute path, or the native sentinel) gets no `Pulling` or `Pulled` at all, because
-nothing is fetched for it.
+binary gets no `Pulling` or `Pulled` at all, because nothing is fetched for it: that is the native
+sentinel, or an absolute path on a container that sets neither `command` nor `args`. Give such a
+container a `command` and the reference is treated as an image again.
 
-Three things worth knowing before you debug further:
+One attempt announces `Pulling` for **every** container of the Pod, not just the one that is behind.
+The node resolves a Pod's images in order inside a single start attempt, so a later container's
+`Pulled` reports a wait that includes the earlier containers' fetches. That is what the
+`(… including waiting)` figure means here, and it is why the two durations in a `Pulled` message can
+be far apart. The message also omits the image-size clause upstream Kubernetes appends: the runtime
+reports no size for a resolution, and a fabricated byte count would be worse than a shorter sentence.
 
+Four things worth knowing before you debug further:
+
+- **On the `vm` RuntimeClass, one bad image holds the whole Pod.** A `vm` Pod is a single guest, so
+  an image that will not resolve fails the guest build rather than leaving one container behind.
+  Every container reports `Pending`: the container the failure names carries the reason and the
+  message, and the others read `ContainerCreating`, because they never started for a reason of their
+  own. The Pod is kept and the create is retried on the same schedule described above, so nothing
+  goes `Failed` and no controller churns replacements. A host-process Pod behaves as the paragraph
+  at the top of this section says: its other containers start and keep running.
 - **The message is bounded.** The waiting message and the `Failed` event carry a truncated copy of
   the underlying error, where upstream Kubernetes prints it whole. The full text, including the
   registry response, is in the node log (`k3sm logs`, or `log show --predicate 'subsystem ==
