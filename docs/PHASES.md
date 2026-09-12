@@ -745,7 +745,7 @@ phases:
 
   - id: M12
     title: Images & build engine (k3sm slice — provider pull semantics, image CLI, build v1, buildx engine)
-    status: todo
+    status: in-progress  # 2026-09-11: M12.1 d1/d2/d3 done, a1 met (B119, k3sm#364); a2 (integration) still owed
     depends_on: []
     notes: >-
       docs/m12-plan.md is authoritative (Phase C encoded from it; its Resolution 11 carries
@@ -760,7 +760,7 @@ phases:
     subphases:
       - id: M12.1
         title: kubelet pull semantics at the provider (verbatim translate + failure taxonomy + imageID)
-        status: todo
+        status: in-progress  # 2026-09-11: d1/d2/d3 done, a1 met; a2 (warm-cache offline start, integration) not yet run
         depends_on: [apis:M12.1, runtimed:M12.1]
         deliverables:
           - id: M12.1-d1
