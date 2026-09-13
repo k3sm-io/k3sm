@@ -66,7 +66,7 @@ func newMeshEndpointFixture(t *testing.T) *meshEndpointFixture {
 	peer := netv1.MeshPeerSpec{
 		NodeName:   "worker-1",
 		PublicKey:  "dGVzdC1wdWJsaWMta2V5LWJhc2U2NC0zMmJ5dGVzPT0=",
-		Endpoint:   "192.168.0.206:51820",
+		Endpoint:   "192.0.2.206:51820",
 		PodCIDR:    "100.64.1.0/24",
 		AllowedIPs: []string{"100.64.1.0/24"},
 		MeshIP:     "100.64.1.1",
@@ -214,7 +214,7 @@ func postRefresh(t *testing.T, client *http.Client, baseURL, body string, header
 // below pins one denial, and the denial rows assert the enroller was never called:
 // "the request was refused" and "the write never happened" are different claims.
 func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
-	const body = `{"nodeName":"worker-1","endpoint":"192.168.0.111:51820"}`
+	const body = `{"nodeName":"worker-1","endpoint":"192.0.2.111:51820"}`
 
 	t.Run("no client certificate is 401 and never writes", func(t *testing.T) {
 		f := newMeshEndpointFixture(t)
@@ -281,7 +281,7 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 		if calls != 0 {
 			t.Errorf("the enroller was called %d times for a cross-node write", calls)
 		}
-		if after.Endpoint != "192.168.0.206:51820" {
+		if after.Endpoint != "192.0.2.206:51820" {
 			t.Errorf("worker-1's endpoint became %q under worker-2's certificate", after.Endpoint)
 		}
 	})
@@ -301,7 +301,7 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 		if calls != 1 {
 			t.Errorf("the enroller was called %d times, want 1", calls)
 		}
-		if after.Endpoint != "192.168.0.111:51820" {
+		if after.Endpoint != "192.0.2.111:51820" {
 			t.Errorf("endpoint = %q, want the refreshed value", after.Endpoint)
 		}
 		// Everything a forged peer would want to move must be untouched.
@@ -313,10 +313,10 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 		}
 
 		// The production client helper drives the same exchange end to end.
-		if err := bootstrap.RefreshMeshEndpoint(context.Background(), client, f.ts.URL, "worker-1", "192.168.0.112:51820"); err != nil {
+		if err := bootstrap.RefreshMeshEndpoint(context.Background(), client, f.ts.URL, "worker-1", "192.0.2.112:51820"); err != nil {
 			t.Fatalf("RefreshMeshEndpoint: %v", err)
 		}
-		if final, _ := f.enroller.snapshot(); final.Endpoint != "192.168.0.112:51820" {
+		if final, _ := f.enroller.snapshot(); final.Endpoint != "192.0.2.112:51820" {
 			t.Errorf("endpoint after RefreshMeshEndpoint = %q", final.Endpoint)
 		}
 	})
@@ -324,7 +324,7 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 	t.Run("a valid join token without a certificate is 401", func(t *testing.T) {
 		f := newMeshEndpointFixture(t)
 		code, err := postRefresh(t, f.anonymousClient(t), f.ts.URL,
-			`{"nodeName":"worker-1","endpoint":"192.168.0.111:51820","token":"`+f.token+`"}`,
+			`{"nodeName":"worker-1","endpoint":"192.0.2.111:51820","token":"`+f.token+`"}`,
 			map[string]string{"Authorization": "Bearer " + f.token})
 		if err != nil {
 			t.Fatalf("post: %v", err)
@@ -356,7 +356,7 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 			NodeName:     "worker-1",
 			NodeIP:       "100.64.1.1",
 			NodePassword: "node-secret-1",
-			MeshEndpoint: "192.168.0.206:51820",
+			MeshEndpoint: "192.0.2.206:51820",
 			HTTPClient:   client,
 		})
 		if err != nil {
@@ -384,8 +384,8 @@ func TestMeshEndpointVerbAuthAndGuard(t *testing.T) {
 	t.Run("a malformed endpoint is 400", func(t *testing.T) {
 		f := newMeshEndpointFixture(t)
 		client := f.nodeClient(t, f.signingCA, "system:node:worker-1", []string{"system:nodes"})
-		for _, bad := range []string{`{"nodeName":"worker-1","endpoint":"192.168.0.111"}`,
-			`{"nodeName":"worker-1","endpoint":"192.168.0.111:0"}`,
+		for _, bad := range []string{`{"nodeName":"worker-1","endpoint":"192.0.2.111"}`,
+			`{"nodeName":"worker-1","endpoint":"192.0.2.111:0"}`,
 			`{"nodeName":"worker-1","endpoint":""}`} {
 			code, err := postRefresh(t, client, f.ts.URL, bad, nil)
 			if err != nil {

@@ -5,7 +5,7 @@
 #
 # The defect (observed on the two-Mac lab rig, 2026-09-13): a node's
 # MeshPeer.spec.endpoint is derived ONCE — at join for a worker, at self-enroll for
-# the control-plane node — and never again. MikoBook joined at 192.168.0.206:51820
+# the control-plane node — and never again. the worker joined at 192.0.2.206:51820
 # and now lives at .111; the CR still said .206. Wireguard's roaming hides that for
 # as long as the node keeps sending (a peer learns the new source address from an
 # authenticated packet) and STOPS hiding it at the next full resync on the peer

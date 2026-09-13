@@ -37,9 +37,9 @@ import (
 // trade a possibly-stale endpoint for a certainly-wrong one.
 func TestMeshEndpointRefresherRepublishesOnChange(t *testing.T) {
 	const (
-		joined = "192.168.0.206:51820"
-		moved  = "192.168.0.111:51820"
-		other  = "192.168.0.222:51820"
+		joined = "192.0.2.206:51820"
+		moved  = "192.0.2.111:51820"
+		other  = "192.0.2.222:51820"
 	)
 	errDerive := errors.New("no route to the control plane")
 

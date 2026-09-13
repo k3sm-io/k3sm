@@ -180,13 +180,13 @@ func TestServerMeshEndpointNeverPicksATunnel(t *testing.T) {
 		// underlayInterfaceIPs excludes tunnel devices at the source; the mesh IP
 		// is listed here anyway so the CIDR filter is the thing under test, not
 		// the interface-name filter alone.
-		return []net.IP{net.ParseIP(meshIP), net.ParseIP("192.168.0.111")}
+		return []net.IP{net.ParseIP(meshIP), net.ParseIP("192.0.2.111")}
 	}
 	got, err := serverMeshEndpoint(meshIP, meshIP, serverMeshListenPort)
 	if err != nil {
 		t.Fatalf("serverMeshEndpoint: %v", err)
 	}
-	if want := "192.168.0.111:51820"; got != want {
+	if want := "192.0.2.111:51820"; got != want {
 		t.Fatalf("serverMeshEndpoint = %q, want the en0 address %q — a mesh endpoint inside the tunnel is unreachable to an un-joined peer", got, want)
 	}
 
