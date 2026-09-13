@@ -219,6 +219,17 @@ func runAgent(args []string) error {
 	// into; it stays nil under `--network none`, where there is no proxy to feed.
 	var datapath *netserve.Server
 	if mode.DataPath() {
+		// The endpoint this node just published goes stale the moment its LAN
+		// address changes, so the refresher carries that value forward and
+		// republishes it when the derivation changes. A construction failure is
+		// SURVIVABLE — the mesh is up and the join-time endpoint is correct
+		// today — so it is logged with what is lost rather than failing the
+		// agent.
+		refresher, err := newWorkerEndpointRefresher(opts, res, joinHost, meshEndpoint, logger)
+		if err != nil {
+			logger.Warn("this node will not republish its wireguard endpoint if its address changes; peers would keep dialing the address it joined from until it rejoins",
+				"endpoint", meshEndpoint, "err", err)
+		}
 		if err := bringUpMesh(ctx, meshBringUp{
 			podCIDR:       res.PodCIDR,
 			meshIP:        res.MeshIP,
@@ -227,6 +238,7 @@ func runAgent(args []string) error {
 			peers:         res.Peers,
 			listenPort:    opts.meshPort,
 			kubeconfig:    kubeconfigPath,
+			refresher:     refresher,
 		}, mode, logger); err != nil {
 			return fmt.Errorf("mesh bring-up: %w", err)
 		}
@@ -375,6 +387,18 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 		}
 		_ = m.Close(context.WithoutCancel(ctx))
 	}()
+
+	// The endpoint refresher, for BOTH roles. It starts after the device is up
+	// because its first derivation must see the world the device made: on the
+	// server that means the mesh utun exists, which is the case serverMeshEndpoint
+	// now excludes rather than accidentally picks.
+	if in.refresher != nil {
+		go func() {
+			if err := in.refresher.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("mesh endpoint refresher", "err", err)
+			}
+		}()
+	}
 	return nil
 }
 

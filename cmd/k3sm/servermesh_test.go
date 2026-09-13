@@ -119,23 +119,88 @@ func TestServerMeshKeyRefIsNotTheAgentRef(t *testing.T) {
 // TestServerMeshEndpointPrefersAnUnderlayAddress pins d3's endpoint rule: a
 // joining worker has no mesh yet, so the endpoint it dials for the wireguard
 // handshake has to be an address the host answers on TODAY. It falls back to the
-// configured node IP only when the host offers no globally-unicast address of its
-// own (a single-host cluster), never to nothing.
+// configured node IP only when that IP is loopback (a single-host cluster, where
+// loopback is a legitimate wireguard endpoint), never to nothing.
+//
+// The seam moved from hostInterfaceIPs to underlayInterfaceIPs with the
+// derivation itself — see TestServerMeshEndpointNeverPicksATunnel for why the
+// tunnel-excluding scan is the one this path must use.
 func TestServerMeshEndpointPrefersAnUnderlayAddress(t *testing.T) {
-	orig := hostInterfaceIPs
-	t.Cleanup(func() { hostInterfaceIPs = orig })
+	orig := underlayInterfaceIPs
+	t.Cleanup(func() { underlayInterfaceIPs = orig })
 
-	hostInterfaceIPs = func() []net.IP { return []net.IP{net.ParseIP("192.0.2.55")} }
-	if got, want := serverMeshEndpoint("100.64.0.1", 51820), "192.0.2.55:51820"; got != want {
+	underlayInterfaceIPs = func() []net.IP { return []net.IP{net.ParseIP("192.0.2.55")} }
+	got, err := serverMeshEndpoint("100.64.0.1", "100.64.0.1", 51820)
+	if err != nil {
+		t.Fatalf("serverMeshEndpoint: %v", err)
+	}
+	if want := "192.0.2.55:51820"; got != want {
 		t.Errorf("serverMeshEndpoint = %q, want the host's own underlay address %q", got, want)
 	}
 
-	hostInterfaceIPs = func() []net.IP { return nil }
-	if got, want := serverMeshEndpoint("127.0.0.1", 51820), "127.0.0.1:51820"; got != want {
+	underlayInterfaceIPs = func() []net.IP { return nil }
+	got, err = serverMeshEndpoint("127.0.0.1", "127.0.0.1", 51820)
+	if err != nil {
+		t.Fatalf("serverMeshEndpoint single-host fallback: %v", err)
+	}
+	if want := "127.0.0.1:51820"; got != want {
 		t.Errorf("serverMeshEndpoint fallback = %q, want %q", got, want)
 	}
-	if host, port, err := net.SplitHostPort(serverMeshEndpoint("100.64.0.1", serverMeshListenPort)); err != nil || host == "" || port == "" {
+
+	underlayInterfaceIPs = func() []net.IP { return []net.IP{net.ParseIP("192.0.2.55")} }
+	endpoint, err := serverMeshEndpoint("100.64.0.1", "100.64.0.1", serverMeshListenPort)
+	if err != nil {
+		t.Fatalf("serverMeshEndpoint: %v", err)
+	}
+	if host, port, err := net.SplitHostPort(endpoint); err != nil || host == "" || port == "" {
 		t.Errorf("serverMeshEndpoint produced an unparsable host:port (%v)", err)
+	}
+}
+
+// TestServerMeshEndpointNeverPicksATunnel is B283's B3 leg.
+//
+// At bring-up the mesh utun does not exist, so the old tunnel-INCLUDING scan was
+// harmless by accident. The endpoint refresher re-derives this value every 30s
+// with the device up and carrying this node's mesh /32 — and a tunnel-including
+// scan would then publish that /32 as the address peers should dial to OPEN a
+// handshake, which is the one address an un-joined peer provably cannot route to.
+// A peer cannot tell such an endpoint from a working one; it just never completes.
+//
+// The second case is why the empty scan is an error rather than a fallback: on the
+// mesh path runServer has already rewritten nodeIP to the mesh IP, so a fallback
+// would publish exactly the address the first case refuses.
+func TestServerMeshEndpointNeverPicksATunnel(t *testing.T) {
+	orig := underlayInterfaceIPs
+	t.Cleanup(func() { underlayInterfaceIPs = orig })
+
+	const meshIP = "100.64.0.1"
+
+	// An up utun carrying the mesh IP, plus a real LAN address: the LAN address wins.
+	underlayInterfaceIPs = func() []net.IP {
+		// underlayInterfaceIPs excludes tunnel devices at the source; the mesh IP
+		// is listed here anyway so the CIDR filter is the thing under test, not
+		// the interface-name filter alone.
+		return []net.IP{net.ParseIP(meshIP), net.ParseIP("192.168.0.111")}
+	}
+	got, err := serverMeshEndpoint(meshIP, meshIP, serverMeshListenPort)
+	if err != nil {
+		t.Fatalf("serverMeshEndpoint: %v", err)
+	}
+	if want := "192.168.0.111:51820"; got != want {
+		t.Fatalf("serverMeshEndpoint = %q, want the en0 address %q — a mesh endpoint inside the tunnel is unreachable to an un-joined peer", got, want)
+	}
+
+	// ONLY the tunnel address: an error, never the mesh IP.
+	underlayInterfaceIPs = func() []net.IP { return []net.IP{net.ParseIP(meshIP)} }
+	got, err = serverMeshEndpoint(meshIP, meshIP, serverMeshListenPort)
+	if err == nil {
+		t.Fatalf("serverMeshEndpoint returned %q with only the mesh address available; it must fail rather than publish an endpoint no peer can dial", got)
+	}
+	if strings.Contains(got, meshIP) {
+		t.Errorf("serverMeshEndpoint returned %q, which names the mesh IP", got)
+	}
+	if !strings.Contains(err.Error(), meshIP) {
+		t.Errorf("serverMeshEndpoint error %q does not name the mesh IP it refused", err)
 	}
 }
 

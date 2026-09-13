@@ -33,6 +33,13 @@ const (
 	// never a worker). The joining server decrypts it to reconstruct the IDENTICAL
 	// cluster + signing CAs (DESIGN §5c).
 	BundlePath = "/v1-k3sm/server-bootstrap"
+	// MeshEndpointPath is the endpoint-refresh verb: a node that has already
+	// joined republishes the host:port its wireguard is reachable at, so a DHCP
+	// lease change or a move between Wi-Fi and Ethernet does not leave every peer
+	// dialing an address this node no longer owns. It is the ONLY bootstrap route
+	// authenticated by the node's own client certificate rather than the join
+	// token (see MeshEndpointRefreshRequest).
+	MeshEndpointPath = "/v1-k3sm/mesh/endpoint"
 )
 
 // JoinSchemaVersion stamps the k3sm-internal join exchange payloads (JoinRequest /
@@ -78,6 +85,25 @@ func (r JoinRequest) WithDefaults() JoinRequest {
 	}
 	out.Mesh = out.Mesh.WithDefaults()
 	return out
+}
+
+// MeshEndpointRefreshRequest is the payload a JOINED node POSTs to
+// MeshEndpointPath to republish its wireguard endpoint.
+//
+// It carries the endpoint and nothing else. The public key, the podCIDR and the
+// AllowedIPs are NOT writable through this channel: they are the fields a forged
+// peer would use to hijack another node's pod traffic, and none of them changes
+// when a Mac's address does. The node name is present only so the server can
+// check it against the certificate that authenticated the request — it is never
+// trusted on its own (see Server.handleMeshEndpoint).
+type MeshEndpointRefreshRequest struct {
+	// NodeName is the node claiming the change. It MUST equal the authenticated
+	// certificate's system:node:<name> identity; a mismatch is a 403.
+	NodeName string `json:"nodeName"`
+	// Endpoint is the host:port peers should dial to open a wireguard handshake
+	// with this node — an UNDERLAY address, for the same reason the join-time
+	// endpoint is one.
+	Endpoint string `json:"endpoint"`
 }
 
 // JoinResponse is the bootstrap endpoint's reply: the cluster CA the node now trusts
@@ -141,4 +167,10 @@ type BundleSource interface {
 // podnet allocator, keeping that dependency out of this package.
 type Enroller interface {
 	Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error)
+	// RefreshEndpoint updates ONLY spec.endpoint on the node's EXISTING MeshPeer.
+	// It never creates one: a node whose peer is gone has lost its podCIDR
+	// assignment too, and inventing a peer here would hand it an endpoint with no
+	// AllowedIPs behind it. That case returns ErrNoMeshPeer, which the handler
+	// maps to 404 — the signal for the agent to rejoin.
+	RefreshEndpoint(ctx context.Context, nodeName, endpoint string) error
 }

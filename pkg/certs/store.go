@@ -145,7 +145,7 @@ func caPin(certPath, keyPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", certPath, err)
 	}
-	pin, err := certPin(certPEM)
+	pin, err := CertPin(certPEM)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", certPath, err)
 	}
@@ -171,9 +171,14 @@ func statRegular(path string, absent error) error {
 	return nil
 }
 
-// certPin returns the lowercase-hex SHA-256 of a PEM-encoded certificate's DER — the
+// CertPin returns the lowercase-hex SHA-256 of a PEM-encoded certificate's DER — the
 // same value CA.PinHash returns, computed without the private key.
-func certPin(certPEM []byte) (string, error) {
+//
+// It is exported because a node holds its cluster CA as PEM and nothing else: the
+// join token that first carried the pin is TTL-bounded and deliberately not
+// retained, so any later pinned dial (the mesh-endpoint refresh) has to re-derive
+// the anchor from the persisted certificate.
+func CertPin(certPEM []byte) (string, error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil || block.Type != "CERTIFICATE" {
 		return "", errors.New("certs: no CERTIFICATE PEM block")
