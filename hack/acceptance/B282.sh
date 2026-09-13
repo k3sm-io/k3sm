@@ -326,7 +326,20 @@ else
 			          echo LASTLINE;
 			          sleep 600
 			YAML
-		bkc apply -f "$B282_WORK/chatty.yaml" >/dev/null 2>&1 || true
+		# The apiserver answers healthz seconds before the node registers and the
+		# ServiceAccount controller mints the default SA; an apply in that window
+		# is rejected (no SA to mount) and the rung fails on an empty tree. Wait
+		# for both, the same readiness gate the release suite applies.
+		ready=0
+		for i in $(seq 1 60); do
+			if bkc get node b282-logs -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True \
+				&& bkc get serviceaccount default >/dev/null 2>&1; then ready=1; break; fi
+			sleep 2
+		done
+		[ "$ready" = 1 ] || echo "WARN  b282.L1  node b282-logs or the default ServiceAccount not ready after 120s; applying anyway" >&2
+		if ! out="$(bkc apply -f "$B282_WORK/chatty.yaml" 2>&1)"; then
+			echo "WARN  b282.L1  apply chatty.yaml: $out" >&2
+		fi
 
 		# Wait for the log file to appear, then for the writer to finish.
 		n=0; dir=""
