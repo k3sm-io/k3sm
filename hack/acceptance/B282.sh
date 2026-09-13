@@ -318,11 +318,10 @@ else
 			      args:
 			        - >-
 			          echo FIRSTLINE;
-			          i=0;
-			          while [ $i -lt 12000 ]; do
+			          burst() { i=0; while [ $i -lt 12000 ]; do
 			            printf '%s\n' "$(head -c 900 < /dev/zero | tr '\0' 'x')";
-			            i=$((i+1));
-			          done;
+			            i=$((i+1)); done; };
+			          burst; sleep 15; burst; sleep 15;
 			          echo LASTLINE;
 			          sleep 600
 			YAML
@@ -355,14 +354,21 @@ else
 			tail -30 "$B282_WORK/server.log" >&2
 		fi
 
-		if [ -n "$dir" ] && head -1 "$dir/0.log" 2>/dev/null | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] '; then
+		# The format sample comes from whichever plain file is non-empty: after a
+		# rotation the current 0.log can be empty and the content sits in the
+		# newest timestamped sibling (upstream keeps that one uncompressed).
+		sample="$dir/0.log"
+		[ -s "$sample" ] || sample="$(ls "$dir"/0.log.[0-9]* 2>/dev/null | grep -v '\.gz$' | head -1)"
+		if [ -n "$dir" ] && head -1 "$sample" 2>/dev/null | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? (stdout|stderr) [FP] '; then
 			ladder ok "b282.L1  the file is in the CRI line format (<timestamp> <stream> <F|P> <content>)"
 		else
-			ladder no "b282.L1  the file is in the CRI line format; first line: $(head -1 "$dir/0.log" 2>/dev/null | cut -c1-80)"
+			ladder no "b282.L1  the file is in the CRI line format; first line: $(head -1 "$sample" 2>/dev/null | cut -c1-80)"
 		fi
 
-		# Rotation: >10 MiB of output must leave a timestamped sibling, and every
-		# rotated file except the newest is gzipped.
+		# Rotation: the pod writes two >10 MiB bursts 15 s apart (the manager
+		# ticks every 10 s), so the first rotated file is gzipped when the
+		# second rotation lands; upstream never compresses the newest rotated
+		# file, which is why one rotation alone shows no .gz.
 		n=0; rot=no
 		while [ $n -lt 180 ]; do
 			if ls "$dir"/0.log.*.gz >/dev/null 2>&1; then rot=ok; break; fi
@@ -371,6 +377,14 @@ else
 		ladder "$rot" "b282.L2  >10 MiB of output rotated: 0.log plus a timestamped .gz sibling ($(ls "$dir" 2>/dev/null | tr '\n' ' '))"
 
 		# The read options, against the file the node just wrote.
+		# The marker is printed 15 s after the second burst, so it lands in the
+		# current file rather than a rotated one (kubectl logs reads only the
+		# current file, as upstream). Wait for it before reading options.
+		n=0
+		while [ $n -lt 150 ]; do
+			[ "$(bkc logs chatty --tail 1 2>/dev/null)" = "LASTLINE" ] && break
+			sleep 1; n=$((n+1))
+		done
 		if [ "$(bkc logs chatty --tail 1 2>/dev/null)" = "LASTLINE" ]; then
 			ladder ok "b282.L3  --tail 1 returns the final line"
 		else
