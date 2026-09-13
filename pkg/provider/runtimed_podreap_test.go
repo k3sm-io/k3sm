@@ -141,7 +141,7 @@ func TestEmbeddedStartupPodReapWired(t *testing.T) {
 		}
 		h := newCaptureHandler()
 
-		if _, err := NewRuntimed(RuntimedConfig{NodeName: "n1", Root: root, Logger: slog.New(h)}); err != nil {
+		if _, err := NewRuntimed(RuntimedConfig{NodeName: "n1", Root: root, PodLogsDir: root, Logger: slog.New(h)}); err != nil {
 			t.Fatalf("NewRuntimed: %v", err)
 		}
 
@@ -161,7 +161,7 @@ func TestEmbeddedStartupPodReapWired(t *testing.T) {
 		root := t.TempDir() // no reap store at all: the normal no-prior-run shape
 		h := newCaptureHandler()
 
-		if _, err := NewRuntimed(RuntimedConfig{NodeName: "n1", Root: root, Logger: slog.New(h)}); err != nil {
+		if _, err := NewRuntimed(RuntimedConfig{NodeName: "n1", Root: root, PodLogsDir: root, Logger: slog.New(h)}); err != nil {
 			t.Fatalf("NewRuntimed: %v", err)
 		}
 

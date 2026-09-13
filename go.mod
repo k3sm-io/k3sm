@@ -3,6 +3,7 @@ module k3sm.io/k3sm
 go 1.25.8
 
 require (
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/cel-go v0.29.0
 	github.com/google/go-containerregistry v0.21.6
 	github.com/prometheus/client_model v0.6.2
@@ -44,7 +45,6 @@ require (
 	github.com/docker/docker-credential-helpers v0.9.3 // indirect
 	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

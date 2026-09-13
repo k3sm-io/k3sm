@@ -462,7 +462,7 @@ func (statsLessRuntime) GetPodStatus(context.Context, string, string) (*corev1.P
 	return nil, vkadapter.NotFound("no pods")
 }
 func (statsLessRuntime) GetPods(context.Context) ([]*corev1.Pod, error) { return nil, nil }
-func (statsLessRuntime) GetContainerLogs(context.Context, string, string, string, vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
+func (statsLessRuntime) GetContainerLogs(context.Context, string, string, string, *corev1.PodLogOptions) (io.ReadCloser, error) {
 	return nil, vkadapter.NotFound("no logs")
 }
 func (statsLessRuntime) Watch(context.Context, func(*corev1.Pod)) {}

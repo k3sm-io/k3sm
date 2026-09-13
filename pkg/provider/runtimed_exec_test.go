@@ -200,7 +200,7 @@ func (f *fakeAttachIO) Resize() <-chan vkadapter.TermSize { return f.resize }
 // in "default") so the streaming verbs resolve it.
 func newStreamProvider(t *testing.T, f runtimev1.RuntimeServer) *runtimedRuntime {
 	t.Helper()
-	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir()}, nil, nil)
+	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 	if err := r.CreatePod(context.Background(), runtimedPod("default", "web")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}

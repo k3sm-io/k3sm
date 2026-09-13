@@ -69,7 +69,7 @@ func TestXcodeToolchainUngrantedEvent(t *testing.T) {
 			withDeveloperDir(t, tc.nodeDir)
 			rec := record.NewFakeRecorder(8)
 			r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
-				NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(), Recorder: rec,
+				NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
 			}, nil, nil)
 
 			pod := &corev1.Pod{

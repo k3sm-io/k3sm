@@ -59,7 +59,7 @@ func newCrashFake(t *testing.T, pod *corev1.Pod) (*runtimedRuntime, *fakeRuntime
 	r := newRuntimedWith(f, RuntimedConfig{
 		NodeName: "n",
 		NodeIP:   "192.168.1.10",
-		Root:     t.TempDir(),
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
 		Recorder: rec,
 	}, nil, nil)
 	clk := testclock.NewFakeClock(time.Unix(10000, 0))

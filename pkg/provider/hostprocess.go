@@ -91,11 +91,19 @@ func NewHostProcess(nodeName, podRoot, nodeIP string, recorder record.EventRecor
 	return &HostProcess{nodeName: nodeName, podRoot: podRoot, nodeIP: nodeIP, recorder: recorder, pods: map[string]*podRec{}}
 }
 
-// Compile-time checks that we satisfy the VK contracts and the Runtime seam.
+// Compile-time checks that we satisfy the VK contracts.
+//
+// The Runtime seam is deliberately NOT asserted here. HostProcess is wired
+// straight into the VK node as a vkadapter.Provider (see cmd/k3sm buildProvider),
+// never behind VKProvider, and it keeps its own private log handling: it writes
+// one combined file per container under --pod-root and reads that file back. It
+// has no CRI log tree, no restart-count instances and no rotation, so it cannot
+// answer the kubelet-typed Runtime.GetContainerLogs contract the runtimed runtime
+// implements, and pretending otherwise would put a divergent second reader behind
+// one interface.
 var (
 	_ vkadapter.PodLifecycleHandler = (*HostProcess)(nil)
 	_ vkadapter.PodNotifier         = (*HostProcess)(nil)
-	_ Runtime                       = (*HostProcess)(nil)
 )
 
 // podEvent is a lifecycle Event buffered under p.mu and emitted after the lock is

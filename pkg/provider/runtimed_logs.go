@@ -17,96 +17,84 @@ limitations under the License.
 package provider
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 )
 
-// GetContainerLogs serves `kubectl logs` from the runtime's GetLogs RPC, honoring
-// the full kubelet option set: tail, since, timestamps, limit-bytes, previous and
-// follow. Every option is translated into the apis GetLogsRequest and applied by
-// the RUNTIME (which owns the buffer and its per-line timestamps) — the provider
-// never re-filters, so what the client asked for and what the runtime evaluated
-// are the same predicate.
+// The node reads container logs OFF THE FILESYSTEM, exactly as the kubelet does.
 //
-// Two delivery shapes, deliberately:
-//   - non-follow reads the whole selection into a buffer and returns it, so a
-//     runtime-side failure (unknown pod, an option the runtime refuses) surfaces
-//     as an error from THIS call and becomes a proper HTTP status;
-//   - follow returns a pipe fed by a goroutine, so lines reach the client as they
-//     are written. Its errors can only arrive mid-stream, as a Read error.
+// runtimed writes each container instance to
+// <podLogsDir>/<ns>_<pod>_<uid>/<container>/<n>.log in the CRI line format and
+// reports the path on ContainerStatus.log_path; nothing else about a log crosses
+// the runtime boundary. The runtime's GetLogs RPC survives on the wire for the
+// guest relay but answers Unimplemented for a native pod, and the provider no
+// longer calls it: a streamed copy through gRPC could serve `kubectl logs` only
+// for output the runtime still held in memory, which is why `--previous` was
+// unimplementable and why a bounded in-memory buffer silently dropped the
+// beginning of a chatty container's output.
+
+// ContainerLogs renders one container's logs onto stdout and stderr per opts. It
+// is the kubelet's GetKubeletContainerLogs half: resolve the INSTANCE to a file,
+// then read the file.
 //
-// Closing the returned ReadCloser cancels the follow stream; the non-follow reader
-// holds no resources.
-func (r *runtimedRuntime) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
-	id, _, _, ok := r.lookup(namespace, podName)
-	if !ok {
-		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
+// stderr may be the same writer as stdout (it is, on the `kubectl logs` path,
+// because the kubelet's gate-off stream handling sends both to one response).
+func (r *runtimedRuntime) ContainerLogs(ctx context.Context, namespace, podName, containerName string, opts *corev1.PodLogOptions, stdout, stderr io.Writer) error {
+	if opts == nil {
+		opts = &corev1.PodLogOptions{}
 	}
-	req := r.logsRequest(id, containerName, opts)
+	path, err := r.containerLogPath(ctx, namespace, podName, containerName, opts.Previous)
+	if err != nil {
+		return err
+	}
+	readOpts := r.readOptions(opts)
+	var isRunning podlogs.RunningFunc
 	if opts.Follow {
-		return r.followLogs(ctx, req, namespace, podName, containerName), nil
+		isRunning = func(ctx context.Context) (bool, error) {
+			return r.containerRunning(ctx, namespace, podName, containerName)
+		}
 	}
-	sink := newLogSink(ctx)
-	if err := r.rt.GetLogs(req, sink); err != nil {
-		return nil, fmt.Errorf("runtimed logs %s/%s/%s: %w", namespace, podName, containerName, err)
-	}
-	return io.NopCloser(strings.NewReader(sink.String())), nil
+	return podlogs.ReadLogs(ctx, path, readOpts, isRunning, r.log, stdout, stderr)
 }
 
-// logsRequest translates the kubelet's ContainerLogOpts into the wire request.
+// GetContainerLogs satisfies the Runtime seam by rendering ContainerLogs into a
+// ReadCloser.
 //
-// sinceSeconds and sinceTime are one field on the wire: the kubelet API accepts
-// either (and rejects both together), while GetLogsRequest carries only the
-// ABSOLUTE since_time — the form the runtime can evaluate against a stored line
-// timestamp without knowing when the request was made. A relative sinceSeconds is
-// therefore resolved here, against the provider's clock, and an absolute sinceTime
-// wins if both somehow arrive.
-func (r *runtimedRuntime) logsRequest(podID, container string, opts vkadapter.ContainerLogOpts) *runtimev1.GetLogsRequest {
-	req := &runtimev1.GetLogsRequest{
-		PodId:      podID,
-		Container:  container,
-		Follow:     opts.Follow,
-		TailLines:  int64(opts.Tail),
-		Timestamps: opts.Timestamps,
-		Previous:   opts.Previous,
-		LimitBytes: int64(opts.LimitBytes),
+// Two delivery shapes, kept from the RPC-backed implementation this replaced and
+// for the same reason: a NON-follow read is performed synchronously into a buffer
+// so a resolution failure (unknown pod, no log file, an unreadable file) is
+// returned by THIS call and can become a proper HTTP status, while a FOLLOW read
+// returns a pipe fed by a goroutine so lines reach the client as they land.
+// Closing the returned reader cancels the follow.
+func (r *runtimedRuntime) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
+	if opts == nil {
+		opts = &corev1.PodLogOptions{}
 	}
-	switch {
-	case !opts.SinceTime.IsZero():
-		req.SinceTime = timestamppb.New(opts.SinceTime)
-	case opts.SinceSeconds > 0:
-		req.SinceTime = timestamppb.New(r.clk.Now().Add(-time.Duration(opts.SinceSeconds) * time.Second))
+	if !opts.Follow {
+		var buf bytes.Buffer
+		if err := r.ContainerLogs(ctx, namespace, podName, containerName, opts, &buf, &buf); err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
 	}
-	return req
-}
-
-// followLogs runs GetLogs in a goroutine that writes each entry into a pipe, and
-// returns the read end. The goroutine's lifetime is bounded twice over: by ctx
-// (the client's request context) and by Close on the returned reader, which both
-// cancels that context and closes the pipe — so an in-flight Send unblocks with
-// ErrClosedPipe even if the runtime is not watching its context.
-func (r *runtimedRuntime) followLogs(ctx context.Context, req *runtimev1.GetLogsRequest, namespace, podName, containerName string) io.ReadCloser {
 	ctx, cancel := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
 	go func() {
-		err := r.rt.GetLogs(req, &logPipe{ctx: ctx, w: pw})
-		if err != nil {
-			err = fmt.Errorf("runtimed logs %s/%s/%s: %w", namespace, podName, containerName, err)
-		}
-		// A nil error closes the pipe with io.EOF, which is the clean end of a
-		// followed stream (the container exited).
+		err := r.ContainerLogs(ctx, namespace, podName, containerName, opts, pw, pw)
+		// A nil error closes the pipe with io.EOF, the clean end of a followed
+		// stream (the container exited and its final drain completed).
 		_ = pw.CloseWithError(err)
 	}()
-	return &followReader{PipeReader: pr, cancel: cancel}
+	return &followReader{PipeReader: pr, cancel: cancel}, nil
 }
 
 // followReader is the follow path's ReadCloser: closing it stops the producing
@@ -116,69 +104,98 @@ type followReader struct {
 	cancel context.CancelFunc
 }
 
-// Close cancels the underlying GetLogs stream and closes the pipe.
+// Close cancels the underlying read and closes the pipe.
 func (f *followReader) Close() error {
 	f.cancel()
 	return f.PipeReader.Close()
 }
 
-// logSink is an in-process grpc.ServerStreamingServer[LogEntry] that collects the
-// runtime's GetLogs output into a buffer the VK logs handler returns as a
-// ReadCloser. Like watchStream, it lets the provider consume a streaming
-// RuntimeServer method in-process without a gRPC socket; a future daemon split
-// swaps it for a real client stream.
-type logSink struct {
-	grpc.ServerStream
-	ctx context.Context
-	buf strings.Builder
-}
-
-// newLogSink returns a logSink bound to ctx.
-func newLogSink(ctx context.Context) *logSink {
-	return &logSink{ctx: ctx}
-}
-
-// Context returns the stream context.
-func (s *logSink) Context() context.Context { return s.ctx }
-
-// Send appends a log entry's line to the buffer, adding a newline so the on-wire
-// format matches the kubelet's line-delimited logs.
-func (s *logSink) Send(e *runtimev1.LogEntry) error {
-	s.buf.Write(logLineBytes(e))
-	return nil
-}
-
-// String returns the accumulated log text.
-func (s *logSink) String() string { return s.buf.String() }
-
-// logPipe is the follow path's counterpart to logSink: instead of accumulating,
-// it writes each entry straight through to w. A blocked write is the intended
-// backpressure — it propagates the client's read rate to the runtime rather than
-// growing an unbounded buffer in the provider.
-type logPipe struct {
-	grpc.ServerStream
-	ctx context.Context
-	w   io.Writer
-}
-
-// Context returns the stream context.
-func (p *logPipe) Context() context.Context { return p.ctx }
-
-// Send writes one log entry through to the reader.
-func (p *logPipe) Send(e *runtimev1.LogEntry) error {
-	_, err := p.w.Write(logLineBytes(e))
-	return err
-}
-
-// logLineBytes renders one entry in the kubelet's line-delimited log format: the
-// line as the runtime emitted it (already carrying the RFC3339 prefix when the
-// request asked for timestamps), newline-terminated if it is not already.
-func logLineBytes(e *runtimev1.LogEntry) []byte {
-	line := e.GetLine()
-	if n := len(line); n > 0 && line[n-1] == '\n' {
-		return line
+// readOptions translates the kubelet's PodLogOptions into the reader's options.
+//
+// sinceSeconds and sinceTime are one absolute instant to the reader: the kubelet
+// API accepts either (and rejects both together), and a relative sinceSeconds is
+// resolved here, against the provider's clock, because that is the only clock
+// that knows when the request was made. An absolute sinceTime wins if both
+// somehow arrive.
+func (r *runtimedRuntime) readOptions(opts *corev1.PodLogOptions) *podlogs.Options {
+	out := &podlogs.Options{
+		TailLines:  opts.TailLines,
+		LimitBytes: opts.LimitBytes,
+		Timestamps: opts.Timestamps,
+		Follow:     opts.Follow,
 	}
-	out := make([]byte, 0, len(line)+1)
-	out = append(out, line...)
-	return append(out, '\n')
+	switch {
+	case opts.SinceTime != nil:
+		out.Since = opts.SinceTime.Time
+	case opts.SinceSeconds != nil:
+		out.Since = r.clk.Now().Add(-time.Duration(*opts.SinceSeconds) * time.Second)
+	}
+	return out
+}
+
+// containerLogPath resolves which instance's file to read.
+//
+// previous names the LAST TERMINATED instance, whose path the runtime carries on
+// last_termination_state.log_path; it is empty once this package's garbage
+// collector has pruned that instance, and the refusal below is the honest answer
+// rather than silently showing the current instance under the previous one's
+// name. The current instance's path is ContainerStatus.log_path, falling back to
+// the terminated state's own path for a container that has exited and has no
+// successor.
+func (r *runtimedRuntime) containerLogPath(ctx context.Context, namespace, podName, containerName string, previous bool) (string, error) {
+	cs, err := r.containerStatus(ctx, namespace, podName, containerName)
+	if err != nil {
+		return "", err
+	}
+	if previous {
+		path := cs.GetLastTerminationState().GetTerminated().GetLogPath()
+		if path == "" {
+			return "", fmt.Errorf("previous terminated container %q in pod %q not found", containerName, podName)
+		}
+		return path, nil
+	}
+	if path := cs.GetLogPath(); path != "" {
+		return path, nil
+	}
+	if path := cs.GetState().GetTerminated().GetLogPath(); path != "" {
+		return path, nil
+	}
+	return "", fmt.Errorf("container %q in pod %q has no log file", containerName, podName)
+}
+
+// containerStatus returns the runtime's status for one container of a tracked
+// pod, searching the regular and init container lists (an init container's logs
+// are `kubectl logs -c` addressable too).
+func (r *runtimedRuntime) containerStatus(ctx context.Context, namespace, podName, containerName string) (*runtimev1.ContainerStatus, error) {
+	id, _, _, ok := r.lookup(namespace, podName)
+	if !ok {
+		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+podName)
+	}
+	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
+	if err != nil {
+		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, podName, err)
+	}
+	st := resp.GetStatus()
+	for _, cs := range st.GetContainerStatuses() {
+		if cs.GetName() == containerName {
+			return cs, nil
+		}
+	}
+	for _, cs := range st.GetInitContainerStatuses() {
+		if cs.GetName() == containerName {
+			return cs, nil
+		}
+	}
+	return nil, fmt.Errorf("container %q in pod %q is not available", containerName, podName)
+}
+
+// containerRunning reports whether the named container is running right now. It
+// is the follow path's exit signal: the reader performs ONE final drain after
+// this goes false, so nothing written between the last read and the exit is lost.
+func (r *runtimedRuntime) containerRunning(ctx context.Context, namespace, podName, containerName string) (bool, error) {
+	cs, err := r.containerStatus(ctx, namespace, podName, containerName)
+	if err != nil {
+		return false, err
+	}
+	return cs.GetState().GetRunning() != nil, nil
 }

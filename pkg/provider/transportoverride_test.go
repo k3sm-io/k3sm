@@ -246,9 +246,9 @@ func newLeaseNodeWith(t *testing.T, echoPodIP bool) *leaseNode {
 		seen: map[string]int{}, podIPs: map[string]string{}, notify: make(chan struct{}, 64),
 	}
 	n.r = newRuntimedWith(rt, RuntimedConfig{
-		NodeName:           guestNodeName,
-		NodeIP:             guestNodeIP,
-		Root:               t.TempDir(),
+		NodeName: guestNodeName,
+		NodeIP:   guestNodeIP,
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
 		ResolverVIP:        guestDNSVIP,
 		ClusterDomain:      "cluster.local",
 		Network:            adapt,

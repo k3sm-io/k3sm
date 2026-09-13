@@ -35,8 +35,11 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 16. [MLX serving](mlx-quickstart.md) walks through serving a model on the Mac's GPU through an
     OpenAI-compatible endpoint.
 17. [Limitations](limitations.md) lists the gaps.
-18. [Troubleshooting](troubleshooting.md) covers logs, common failures, and recovery.
-19. [FAQ](faq.md) gives short answers to the common questions.
+18. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
+    recovery.
+19. [Container logs](logs.md) covers where a Pod's output is written, `kubectl logs` and its
+    options, rotation, and how to ship logs off a node.
+20. [FAQ](faq.md) gives short answers to the common questions.
 
 ## Before You Build Anything Real
 

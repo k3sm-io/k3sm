@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -222,7 +223,7 @@ func newGuestNode(t *testing.T) *guestNode {
 	vmb := &recordingVMBackend{}
 	images := &testRegistry{}
 	root := t.TempDir()
-	rt, err := runtimed.New(runtimed.Config{Root: root, RuntimeVersion: "test"}, runtimed.Deps{
+	rt, err := runtimed.New(runtimed.Config{Root: root, RuntimeVersion: "test", PodLogsDir: filepath.Join(root, "podlogs")}, runtimed.Deps{
 		Network:   adapter,
 		VMBackend: vmb,
 		Backend:   availableSeatbelt{},
@@ -246,9 +247,9 @@ func newGuestNode(t *testing.T) *guestNode {
 	// assembles a node (a second adapter would be a second allocator; a second
 	// root would make every pod's data_volume_path fail runtimed's derivation).
 	r := newRuntimedWith(rt, RuntimedConfig{
-		NodeName:      guestNodeName,
-		NodeIP:        guestNodeIP,
-		Root:          root,
+		NodeName: guestNodeName,
+		NodeIP:   guestNodeIP,
+		Root:     root, PodLogsDir: root,
 		ResolverVIP:   guestDNSVIP,
 		ClusterDomain: "cluster.local",
 		Network:       adapter,

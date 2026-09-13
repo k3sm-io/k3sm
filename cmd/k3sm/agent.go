@@ -53,12 +53,15 @@ const meshKeyRef = "node.key"
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.
 type agentOptions struct {
-	server    string // control-plane UNDERLAY host (the join target; apiserver fallback only)
-	token     string // K10<caHash>::<user>:<secret>
-	nodeName  string
-	nodeIP    string // this node's mesh InternalIP (bound into the issued certs)
-	workDir   string
-	podRoot   string
+	server   string // control-plane UNDERLAY host (the join target; apiserver fallback only)
+	token    string // K10<caHash>::<user>:<secret>
+	nodeName string
+	nodeIP   string // this node's mesh InternalIP (bound into the issued certs)
+	workDir  string
+	podRoot  string
+	// logs is the container-log flag group, passed through to the node this
+	// agent brings up.
+	logs      containerLogOptions
 	rtName    string
 	dnsShim   string
 	pathShim  string // path-rebase DYLD shim dylib path (runtimed only)
@@ -80,6 +83,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
 	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	registerContainerLogFlags(fs, &opts.logs)
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
@@ -262,6 +266,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		nodeName:   opts.nodeName,
 		listen:     serverKubeletListen,
 		podRoot:    opts.podRoot,
+		logs:       opts.logs,
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,

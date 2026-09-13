@@ -101,7 +101,7 @@ func TestRuntimedSocketPathIsAlwaysDenied(t *testing.T) {
 // runtime.New, which wants a writable image root and the host capability probes —
 // and is covered by hack/acceptance/image-socket.sh instead.
 func TestServableRuntimeRejectsAFake(t *testing.T) {
-	r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{NodeName: "n", Root: t.TempDir()}, nil, nil)
+	r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{NodeName: "n", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 	if rt, ok := r.ServableRuntime(); ok || rt != nil {
 		t.Fatalf("ServableRuntime over a fake = (%v, %v), want (nil, false)", rt, ok)
 	}

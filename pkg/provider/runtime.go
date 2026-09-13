@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
+	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
@@ -52,8 +53,17 @@ type Runtime interface {
 	GetPodStatus(ctx context.Context, namespace, name string) (*corev1.PodStatus, error)
 	// GetPods returns the pods this runtime is tracking.
 	GetPods(ctx context.Context) ([]*corev1.Pod, error)
-	// GetContainerLogs returns a container's combined stdout/stderr.
-	GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error)
+	// GetContainerLogs returns a container's combined stdout/stderr, honoring the
+	// kubelet's own option type.
+	//
+	// The options are *corev1.PodLogOptions and NOT VK's ContainerLogOpts, which
+	// is the seam's one deliberate divergence from the VK provider contract: VK
+	// flattens tailLines and limitBytes into plain ints, so "show no lines"
+	// (tailLines=0) and "show every line" (tailLines unset) arrive identical. The
+	// node serves /containerLogs itself (pkg/provider/podlogs) precisely so the
+	// pointer survives from the query string to the file reader; VKProvider keeps
+	// the VK-shaped method as a converting shim for interface compliance.
+	GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
 	// Watch delivers a full corev1.Pod (with .Status) on every status change for
 	// the lifetime of ctx. The implementation runs cb OUTSIDE any held lock (the
 	// VK re-entrancy rule) and resyncs the current state when its underlying
@@ -89,6 +99,28 @@ type StreamingRuntime interface {
 	AttachToContainer(ctx context.Context, namespace, podName, container string, attach vkadapter.AttachIO) error
 	// PortForward proxies a byte stream to a pod TCP port (`kubectl port-forward`).
 	PortForward(ctx context.Context, namespace, podName string, port int32, stream io.ReadWriteCloser) error
+}
+
+// ContainerLogSource is an OPTIONAL Runtime capability: a Runtime that keeps
+// container logs as CRI files on disk and can therefore serve the kubelet's own
+// /containerLogs HTTP surface, rotate those files, and garbage-collect them.
+//
+// The runtimed runtime implements it; HostProcess does not — it writes one
+// undifferentiated file per container under --pod-root, with no restart-count
+// instances to select between and nothing to rotate, so a node running it serves
+// Virtual Kubelet's own logs route and nothing more.
+//
+// Defining it here, at the consumer, keeps the core Runtime seam small — the same
+// pattern as StatsSource, StreamingRuntime and HealthReporter.
+type ContainerLogSource interface {
+	// Backend answers the /containerLogs handler's questions (pod lookup, pod
+	// status, the read itself).
+	podlogs.Backend
+	// StartLogMaintenance starts container-log rotation and the log garbage
+	// collector, and records that the node's pod set has synced. Call it ONCE,
+	// after the node is ready — see the implementation for why the GC must not
+	// run before then.
+	StartLogMaintenance(ctx context.Context)
 }
 
 // HealthReporter is an OPTIONAL Runtime capability: a Runtime that can say

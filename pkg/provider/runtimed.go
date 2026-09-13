@@ -41,6 +41,7 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/image"
@@ -76,6 +77,31 @@ type runtimedRuntime struct {
 	// .ClusterDomain.
 	resolverVIP   string
 	clusterDomain string
+	// podLogsDir is the root of the CRI container-log tree
+	// (<dir>/<ns>_<pod>_<uid>/<container>/<n>.log) — the kubelet's --pod-logs-dir,
+	// defaulted to /var/log/pods. The provider CREATES the directories, READS the
+	// files for `kubectl logs`, ROTATES them and is their only DELETER; runtimed
+	// opens the files and writes them and does nothing else with them.
+	podLogsDir string
+	// containerLogsDir is the flat symlink directory (/var/log/containers) log
+	// shippers glob. Empty disables symlink creation and the dangling-symlink
+	// sweep, which is what a node running without the installer's tree wants.
+	containerLogsDir string
+	// logLocks serialises the rotator and the log GC per pod directory (shared
+	// with both, which is the point of holding it here).
+	logLocks *podlogs.DirLocks
+	// logRotator is the container-log rotation manager. Never nil after
+	// construction: rotation disabled by a negative max size yields the stub.
+	logRotator podlogs.ContainerLogManager
+	// logGC removes dead instances, orphaned pod directories and dangling
+	// symlinks. nil only in the fake-runtime tests that build no log tree.
+	logGC *podlogs.GC
+	// podsSynced records that the node has seen the cluster's pod set for this
+	// node at least once. It ARMS the log GC's deletions and nothing else: before
+	// the first sync an empty track map means "not told yet", not "every pod is
+	// gone", and deleting on that reading would wipe the node's logs after every
+	// restart. Guarded by mu.
+	podsSynced bool
 	// deniedSocks are AF_UNIX socket paths every pod's SBPL must deny connect()
 	// to — the root k3sm-netd helper socket and the runtimed control socket, so a
 	// same-uid (_k3sm) pod cannot drive a privileged daemon. Threaded onto each
@@ -366,6 +392,29 @@ type RuntimedConfig struct {
 	// the vm backend's artifact locator unset, so CreateVM fails every vm pod with
 	// sandbox.ErrGuestArtifactsUnavailable while every native pod is untouched.
 	GuestArtifacts *EnsuredGuestArtifacts
+	// PodLogsDir is the root of the CRI container-log tree, the kubelet's
+	// --pod-logs-dir. Empty defaults to podlogs.DefaultPodLogsDir
+	// (/var/log/pods) — the same default and the same layout a kubelet uses, so
+	// a k8s operator's habits and every log shipper's glob keep working.
+	PodLogsDir string
+	// ContainerLogsDir is the flat per-container symlink directory
+	// (/var/log/containers). Empty disables the symlinks entirely rather than
+	// defaulting, because a node that was not installed has no root-owned tree to
+	// write them into and a failed symlink per container start is noise.
+	ContainerLogsDir string
+	// ContainerLogMaxSize is the resource.Quantity string at which a container
+	// log is rotated (kubelet containerLogMaxSize; default "10Mi"). A NEGATIVE
+	// value disables rotation, as upstream.
+	ContainerLogMaxSize string
+	// ContainerLogMaxFiles is the total number of files one container keeps
+	// (kubelet containerLogMaxFiles; default 5, must be > 1).
+	ContainerLogMaxFiles int
+	// ContainerLogMaxWorkers is the rotation worker count (kubelet
+	// containerLogMaxWorkers; default 1).
+	ContainerLogMaxWorkers int
+	// ContainerLogMonitorInterval is how often the rotation scan runs (kubelet
+	// containerLogMonitorInterval; default 10s).
+	ContainerLogMonitorInterval time.Duration
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 }
@@ -441,6 +490,15 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		// API VIP. runtimed threads these into its per-pod sandbox.Posture.
 		ResolverVIP:  cfg.ResolverVIP,
 		APIServerVIP: cfg.APIServerVIP,
+		// The container-log root, threaded so runtimed's Seatbelt profile denies
+		// every confined pod read AND write access to the tree its own output is
+		// written into. It is REQUIRED by runtimed and deliberately has no default
+		// there: a deny rendered for /var/log/pods on a node whose logs actually
+		// live under a `k3sm dev` instance directory protects nothing while
+		// reading like protection. Resolved here through the same expression the
+		// provider's own tree uses, so the denied path and the written path are
+		// one value.
+		PodLogsDir:   podLogsDirOf(cfg),
 		PathShimPath: cfg.PathShim,
 	}, deps)
 	if err != nil {
@@ -499,7 +557,9 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		"path_shim", cfg.PathShim,
 		"resolver_vip", cfg.ResolverVIP,
 		"cluster_domain", cfg.ClusterDomain)
-	return &runtimedRuntime{
+	podLogsDir := podLogsDirOf(cfg)
+	locks := podlogs.NewDirLocks()
+	r := &runtimedRuntime{
 		rt:            rt,
 		nodeName:      cfg.NodeName,
 		nodeIP:        cfg.NodeIP,
@@ -529,7 +589,72 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		probers:        map[string]*podProber{},
 		compensating:   map[string]bool{},
 		lifetime:       make(chan struct{}),
+
+		podLogsDir:       podLogsDir,
+		containerLogsDir: cfg.ContainerLogsDir,
+		logLocks:         locks,
 	}
+	// The rotator and the GC are built here, in the ONE constructor production and
+	// the fake-injected tests share, for the same reason the socket deny-set is:
+	// a node whose logs are never rotated fills the system volume, and that must
+	// not be reachable by a caller forgetting to wire something.
+	//
+	// A bad rotation policy DEGRADES rather than failing construction: the flags
+	// are validated at parse time in cmd/k3sm (so an operator hears about a typo
+	// at startup), and a node that refused to start because it could not rotate
+	// logs would be trading a bounded disk problem for a total outage.
+	rotator, err := podlogs.NewContainerLogManager(r, rotationMaxSize(cfg), rotationMaxFiles(cfg), cfg.ContainerLogMaxWorkers, cfg.ContainerLogMonitorInterval, locks, log)
+	if err != nil {
+		log.Error("container log rotation is DISABLED: the rotation policy is invalid", "err", err)
+		rotator = podlogs.NewStubContainerLogManager()
+	}
+	r.logRotator = rotator
+	r.logGC = podlogs.NewGC(podLogsDir, cfg.ContainerLogsDir, r, locks, log)
+	return r
+}
+
+// podLogsDirOf returns the configured container-log root, defaulting to the
+// kubelet's own /var/log/pods. It is one function because the value has two
+// consumers that must never disagree: the provider's own tree, and the Seatbelt
+// deny runtimed renders against it.
+func podLogsDirOf(cfg RuntimedConfig) string {
+	if cfg.PodLogsDir == "" {
+		return podlogs.DefaultPodLogsDir
+	}
+	return cfg.PodLogsDir
+}
+
+// rotationMaxSize returns the configured container-log max size, defaulting to
+// the kubelet's own.
+func rotationMaxSize(cfg RuntimedConfig) string {
+	if cfg.ContainerLogMaxSize == "" {
+		return podlogs.DefaultContainerLogMaxSize
+	}
+	return cfg.ContainerLogMaxSize
+}
+
+// rotationMaxFiles returns the configured container-log file count, defaulting to
+// the kubelet's own. Zero means "unset" here, not "keep nothing": the flag layer
+// rejects an explicit value <= 1 before it ever reaches this point.
+func rotationMaxFiles(cfg RuntimedConfig) int {
+	if cfg.ContainerLogMaxFiles == 0 {
+		return podlogs.DefaultContainerLogMaxFiles
+	}
+	return cfg.ContainerLogMaxFiles
+}
+
+// StartLogMaintenance starts container-log rotation and the log garbage
+// collector, and ARMS the GC by recording that the node's pod set has synced.
+//
+// It is called once, by the node bring-up, AFTER Virtual Kubelet reports the node
+// ready — which is after its pod informer has synced, so the provider's track map
+// is the cluster's view of this node rather than an empty map that has not been
+// filled in yet. Starting the GC any earlier would let it read "no pods" and
+// delete every pod log tree on the node after each restart.
+func (r *runtimedRuntime) StartLogMaintenance(ctx context.Context) {
+	r.MarkPodsSynced()
+	r.logRotator.Start(ctx)
+	go r.logGC.Run(ctx)
 }
 
 // baseSocketDenies returns the AF_UNIX deny-set the provider adds to every
@@ -1122,6 +1247,22 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// is a union — but a deny that exists only because a caller remembered to pass
 	// it is precisely the defect the base set removes, and netd being the one the
 	// caller did remember is no reason to leave it the one that can be forgotten.
+	// The pod's CRI log directory, and the directories themselves. Applied HERE
+	// rather than inside toPodBox for the same reason the socket denies below are:
+	// the tree's root is a NODE fact (--pod-logs-dir), which the pure pod
+	// translation neither carries nor should.
+	//
+	// The MkdirAll rides with it deliberately. runtimed opens
+	// <log_directory>/<container>/<n>.log and creates no directory above the
+	// container's own, so the box and the tree it names have to be produced
+	// together or a pod starts with nowhere to write. It is idempotent, so the
+	// update and parked-retry paths through this function cost one stat per
+	// container.
+	logDir, err := r.ensurePodLogDirs(pod)
+	if err != nil {
+		return nil, err
+	}
+	box.LogDirectory = logDir
 	r.stampSocketDenies(box.SandboxProfile)
 	// Xcode-toolchain opt-in: stamp the node's developer dir onto a pod that asked
 	// for it. Applied HERE and not inside toPodBox because the grant is a node
@@ -1260,6 +1401,9 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 // the immediate status dispatch so VK sees the new state without waiting for the
 // stream.
 func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus) {
+	// The flat /var/log/containers symlinks, now that the containers have started
+	// and their log files exist. Best effort — see linkContainerLogs.
+	r.linkContainerLogs(pod, rs)
 	r.startProber(pod, rs.GetPodIp())
 	r.runPostStart(t, pod, rs.GetPodIp())
 	r.dispatch(string(pod.UID), rs)
@@ -1360,6 +1504,11 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
 	// delete-path teardown) so pod churn never leaks a node pool address.
 	r.releasePodNetwork(pod)
+	// Remove the pod's log tree, now that runtimed has confirmed every container
+	// is gone (the RPC above is synchronous). Deleting it while a container still
+	// held the file open would strand the output on an unlinked inode, which is
+	// the one way this node can lose logs without saying so.
+	r.removePodLogs(pod)
 	// Drop any Service-proxy transport override for the pod IN THE SAME STEP. No
 	// further status will ever arrive to retract it, and an override that outlives
 	// its guest points at a lease macOS is free to hand to the NEXT guest — a
@@ -1531,6 +1680,10 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 		pod.Status.Conditions = append(pod.Status.Conditions, prior)
 	}
 	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps)
+	// terminationMessagePolicy: FallbackToLogsOnError, from the terminated
+	// instance's own log file. First, so every overlay below sees the final
+	// message the way a kubelet's status assembly does.
+	r.applyTerminationMessageOverlay(pod, rs, st)
 	r.applyRestartOverlay(pod, t, st)
 	// The ErrImagePull ↔ ImagePullBackOff flip, which only the provider's own
 	// schedule can decide (translate.go maps the typed cause and nothing else).

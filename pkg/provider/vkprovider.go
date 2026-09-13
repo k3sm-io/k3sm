@@ -22,8 +22,10 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
+	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
@@ -122,9 +124,72 @@ func (v *VKProvider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	v.rt.Watch(ctx, cb)
 }
 
-// GetContainerLogs delegates to the Runtime.
+// GetContainerLogs satisfies the VK provider contract by converting VK's
+// flattened option struct into the kubelet's own *corev1.PodLogOptions and
+// delegating to the Runtime.
+//
+// It exists for INTERFACE COMPLIANCE, not because anything should route through
+// it: the node registers the kubelet's real /containerLogs handler
+// (pkg/provider/podlogs) on a more specific mux pattern than VK's catch-all, so
+// a `kubectl logs` request reaches the Runtime with its options intact. This
+// path is what a caller holding a bare vkadapter.Provider gets, and it is lossy
+// in the one way VK's struct is lossy — see toPodLogOptions.
 func (v *VKProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts vkadapter.ContainerLogOpts) (io.ReadCloser, error) {
-	return v.rt.GetContainerLogs(ctx, namespace, podName, containerName, opts)
+	return v.rt.GetContainerLogs(ctx, namespace, podName, containerName, toPodLogOptions(opts))
+}
+
+// toPodLogOptions converts VK's ContainerLogOpts to the kubelet's PodLogOptions.
+//
+// Tail and LimitBytes are plain ints in VK's struct, so zero and unset are the
+// same value there and cannot be told apart here: both are mapped to UNSET
+// ("show everything"), because the alternative — mapping 0 to "show nothing" —
+// would make an ordinary `kubectl logs` that never asked for a tail return an
+// empty stream. The node's own handler does not go through this function and so
+// does not pay that cost.
+func toPodLogOptions(opts vkadapter.ContainerLogOpts) *corev1.PodLogOptions {
+	out := &corev1.PodLogOptions{
+		Follow:     opts.Follow,
+		Previous:   opts.Previous,
+		Timestamps: opts.Timestamps,
+	}
+	if opts.Tail > 0 {
+		tail := int64(opts.Tail)
+		out.TailLines = &tail
+	}
+	if opts.LimitBytes > 0 {
+		limit := int64(opts.LimitBytes)
+		out.LimitBytes = &limit
+	}
+	if opts.SinceSeconds > 0 {
+		since := int64(opts.SinceSeconds)
+		out.SinceSeconds = &since
+	}
+	if !opts.SinceTime.IsZero() {
+		t := metav1.NewTime(opts.SinceTime)
+		out.SinceTime = &t
+	}
+	return out
+}
+
+// ContainerLogBackend returns the backing Runtime's kubelet /containerLogs
+// backend, comma-ok. false means this Runtime keeps no CRI log tree, and the node
+// registers no /containerLogs route of its own.
+func (v *VKProvider) ContainerLogBackend() (podlogs.Backend, bool) {
+	s, ok := v.rt.(ContainerLogSource)
+	if !ok {
+		return nil, false
+	}
+	return s, true
+}
+
+// StartLogMaintenance starts container-log rotation and the log garbage
+// collector on the backing Runtime, if it keeps a CRI log tree. A Runtime without
+// one has nothing to rotate and nothing to collect, so this is a no-op rather
+// than an error.
+func (v *VKProvider) StartLogMaintenance(ctx context.Context) {
+	if s, ok := v.rt.(ContainerLogSource); ok {
+		s.StartLogMaintenance(ctx)
+	}
 }
 
 // RunInContainer serves `kubectl exec`, delegating to the backing Runtime's
