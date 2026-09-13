@@ -400,6 +400,9 @@ else
 		else
 			ladder no "b282.L3  --timestamps prefixes the line (got: $(bkc logs chatty --tail 1 --timestamps 2>&1 | cut -c1-60))"
 		fi
+		# The marker was written moments ago; since is strict-Before on the
+		# line's own timestamp, so let it age out of a 1 s window first.
+		sleep 2
 		if [ -z "$(bkc logs chatty --since 1s --tail 5 2>/dev/null)" ]; then
 			ladder ok "b282.L3  --since drops everything older than it"
 		else
