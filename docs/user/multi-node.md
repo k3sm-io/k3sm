@@ -39,6 +39,23 @@ The agent authenticates with the bootstrap token, receives its node credentials,
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
 the node. The `MeshPeer` records carry public keys only.
 
+### If a node's address changes
+
+The endpoint a node publishes is the address its peers dial to open a wireguard handshake, and on a
+Mac that address is not fixed: a DHCP lease can change, and moving between Wi-Fi and Ethernet or
+docking and undocking changes it outright. Each node therefore re-checks the address it is reachable
+at every 30 seconds and republishes it when it has changed, so its `MeshPeer` record follows the
+machine rather than recording where it was when it joined. A change takes about a minute to appear,
+because a new value has to be seen twice in a row before it is published. That delay is deliberate:
+an address seen once during an interface transition may belong to a link that is about to go away,
+and publishing it would point every peer at an address that no longer answers.
+
+The node authenticates this update with its own node certificate, the credential it received when it
+joined, and the update can carry nothing but the endpoint. A node can only change its own record. The
+join token is not involved and is not kept on the node after the join; it expires after 24 hours by
+default, so an update that depended on it would stop working after a day. `kubectl describe node
+<name>` shows a `MeshEndpointChanged` event with the old and new values whenever this happens.
+
 ## What Crosses Nodes
 
 - Services resolve cluster-wide via the userspace Service proxy.

@@ -98,12 +98,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return &Server{cfg: cfg}, nil
 }
 
-// Handler returns the bootstrap HTTP mux (CACertPath + JoinPath, plus the
-// server-bootstrap CA-bundle endpoint when ServerAuth + Bundle are configured).
+// Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +
+// MeshEndpointPath, plus the server-bootstrap CA-bundle endpoint when ServerAuth +
+// Bundle are configured).
+//
+// The routes do NOT share an authentication scheme, and that is deliberate:
+// /cacert, /join and /server-bootstrap are reached by a node that holds no cluster
+// certificate yet, so they authenticate a token (or nothing, for the public CA);
+// MeshEndpointPath is reached only by a node that has already joined, so it
+// authenticates that node's own certificate and accepts no token at all.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(CACertPath, s.handleCACert)
 	mux.HandleFunc(JoinPath, s.handleJoin)
+	mux.HandleFunc(MeshEndpointPath, s.handleMeshEndpoint)
 	if s.cfg.ServerAuth != nil && s.cfg.Bundle != nil {
 		mux.HandleFunc(BundlePath, s.handleBundle)
 	}

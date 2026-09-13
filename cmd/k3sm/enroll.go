@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,9 +28,13 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/kubernetes"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -58,7 +61,11 @@ type meshEnroller struct {
 	client     rest.Interface
 	clusterPod netip.Prefix
 	log        *slog.Logger
-	mu         sync.Mutex
+	// events records an endpoint change against the Node object. It is nil when
+	// the core client could not be built, in which case the refresh still writes
+	// the MeshPeer and only the Event is lost.
+	events typedcorev1.EventInterface
+	mu     sync.Mutex
 }
 
 // newMeshEnroller builds the enroller over the cluster REST config (the typed
@@ -68,7 +75,16 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &meshEnroller{client: client, clusterPod: podnet.ClusterPodCIDR, log: log}, nil
+	e := &meshEnroller{client: client, clusterPod: podnet.ClusterPodCIDR, log: log}
+	// The Event sink is best-effort by construction: an enroller that cannot
+	// record events still enrolls, and refusing to build one here would turn an
+	// observability dependency into a join outage.
+	if cs, err := kubernetes.NewForConfig(cfg); err != nil {
+		log.Warn("mesh endpoint changes will not be recorded as Node Events", "err", err)
+	} else {
+		e.events = cs.CoreV1().Events(metav1.NamespaceDefault)
+	}
+	return e, nil
 }
 
 // Enroll implements bootstrap.Enroller.
@@ -216,6 +232,87 @@ func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, req netv
 		Peers:    peers,
 	}.WithDefaults(), nil
 }
+
+// RefreshEndpoint implements bootstrap.Enroller: it updates ONLY spec.endpoint on
+// this node's EXISTING MeshPeer, and records the change as a Node Event.
+//
+// It reads-modifies-writes rather than upserting, and never creates: a node whose
+// peer is gone has lost its podCIDR assignment with it, so a peer invented here
+// would advertise an endpoint with no AllowedIPs behind it and no IPAM range — the
+// node has to rejoin. That case is bootstrap.ErrNoMeshPeer, which the handler maps
+// to 404.
+//
+// Every other field is copied forward untouched. The public key, the podCIDR and
+// the AllowedIPs are what a forged peer would use to hijack a victim's pod
+// traffic; the refresh channel exists to move ONE string, so it moves one string.
+// The assembled spec is Validate()d — apis owns the endpoint rule — before the PUT.
+//
+// It runs under the SAME mutex as Enroll/EnrollSelf. The mutex serializes the
+// podCIDR assignment, and a refresh interleaved between a join's list and its
+// write would be lost by that write's copy of the object.
+func (e *meshEnroller) RefreshEndpoint(ctx context.Context, nodeName, endpoint string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var cur netv1.MeshPeer
+	if err := e.client.Get().Resource(meshPeerResource).Name(nodeName).Do(ctx).Into(&cur); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: %q", bootstrap.ErrNoMeshPeer, nodeName)
+		}
+		return fmt.Errorf("read mesh peer %q: %w", nodeName, err)
+	}
+	old := cur.Spec.Endpoint
+	if old == endpoint {
+		return nil
+	}
+	cur.Spec.Endpoint = endpoint
+	if err := cur.Spec.WithDefaults().Validate(); err != nil {
+		return fmt.Errorf("refresh mesh peer %q endpoint: %w", nodeName, err)
+	}
+	if err := e.client.Put().Resource(meshPeerResource).Name(nodeName).Body(&cur).Do(ctx).Into(&netv1.MeshPeer{}); err != nil {
+		return fmt.Errorf("write mesh peer %q endpoint: %w", nodeName, err)
+	}
+	e.log.Info("mesh peer endpoint refreshed", "node", nodeName, "old", old, "new", endpoint)
+	e.recordEndpointChange(ctx, nodeName, old, endpoint)
+	return nil
+}
+
+// recordEndpointChange posts the Node Event that makes an endpoint move visible to
+// an operator running `kubectl describe node`.
+//
+// A node's address changing under a running cluster is otherwise a silent event
+// with loud consequences — every peer keeps dialing the old address until
+// wireguard roaming or the next full resync papers over it — so the record is
+// worth more than it costs. It is BEST EFFORT and log-only on failure: the
+// MeshPeer write above is the durable half and has already succeeded, and failing
+// the refresh over an unrecorded event would turn an observability gap into a
+// connectivity one.
+func (e *meshEnroller) recordEndpointChange(ctx context.Context, nodeName, old, current string) {
+	if e.events == nil {
+		return
+	}
+	now := metav1.Now()
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.%x", nodeName, now.UnixNano()),
+			Namespace: metav1.NamespaceDefault,
+		},
+		InvolvedObject: corev1.ObjectReference{Kind: "Node", Name: nodeName, APIVersion: "v1"},
+		Reason:         meshEndpointChangedReason,
+		Message:        fmt.Sprintf("wireguard endpoint %s -> %s", old, current),
+		Type:           corev1.EventTypeNormal,
+		Source:         corev1.EventSource{Component: "k3sm-supervisor"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+	}
+	if _, err := e.events.Create(ctx, event, metav1.CreateOptions{}); err != nil {
+		e.log.Warn("could not record the mesh endpoint change as a Node Event", "node", nodeName, "err", err)
+	}
+}
+
+// meshEndpointChangedReason is the Event reason an endpoint refresh records.
+const meshEndpointChangedReason = "MeshEndpointChanged"
 
 // lowestFreeNodeIndex returns the lowest node index ≥ 1 whose /24 no existing peer
 // holds.
@@ -398,10 +495,23 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 		return fmt.Errorf("supervisor serving cert: %w", err)
 	}
 
+	// The listener OPTIONALLY verifies a client certificate against the cluster's
+	// client-identity (signing) CA — the same anchor a node's own :10250 uses. It
+	// is what lets the endpoint-refresh verb authenticate a joined node by its
+	// system:node certificate instead of the TTL-bounded join token, and it is
+	// optional because /join, /cacert and /server-bootstrap are reached by nodes
+	// that hold no certificate yet. It FAILS CLOSED on a missing CA
+	// (bootstrap.ErrNoClientIdentityCA): a listener built with no pool would abort
+	// every presented certificate, so the refresh verb would 401 forever while the
+	// join path kept working — a fault that reads as a network problem.
+	tlsCfg, err := bootstrap.ListenerTLSConfig(servingChain, h.Signing.CertPEM)
+	if err != nil {
+		return fmt.Errorf("bootstrap listener TLS: %w", err)
+	}
 	hs := &http.Server{
 		Addr:              bootstrapListenAddr(meshIP),
 		Handler:           srv.Handler(),
-		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{servingChain}},
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

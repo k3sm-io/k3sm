@@ -50,6 +50,13 @@ func (c *capturingEnroller) Enroll(_ context.Context, nodeName string, req netv1
 	}.WithDefaults(), nil
 }
 
+// RefreshEndpoint satisfies bootstrap.Enroller. This fixture exercises the JOIN
+// path only; a refresh reaching it would be a test wiring mistake, so it reports
+// the "rejoin" error rather than silently succeeding.
+func (c *capturingEnroller) RefreshEndpoint(_ context.Context, _, _ string) error {
+	return bootstrap.ErrNoMeshPeer
+}
+
 func (c *capturingEnroller) captured() []netv1.MeshEnrollRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()

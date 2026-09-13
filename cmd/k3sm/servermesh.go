@@ -23,9 +23,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/mesh"
+	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
@@ -58,16 +60,43 @@ func loadOrCreateServerMeshKey(workDir string) (privB64, pubB64 string, err erro
 //
 // It is an UNDERLAY address by necessity, not by preference: a worker has no
 // mesh until this handshake completes, so an endpoint inside the mesh would be
-// unreachable at exactly the moment it is needed. The derivation is the same
-// globally-unicast host-interface pick the node's own advertise path uses,
-// falling back to the configured node IP when the host offers none (a
-// single-host cluster, where loopback is a legitimate wireguard endpoint).
-func serverMeshEndpoint(nodeIP string, port int) string {
-	host := firstProxyableIP(hostInterfaceIPs())
-	if host == "" {
-		host = nodeIP
+// unreachable at exactly the moment it is needed. The derivation is therefore
+// the agent's — underlayInterfaceIPs (which EXCLUDES tunnels) filtered by
+// usableUnderlayIP and reduced by firstProxyableIP — and not node.go's
+// hostInterfaceIPs, which does not exclude them.
+//
+// That difference is the whole reason this function changed. At bring-up the
+// mesh utun does not exist yet, so a tunnel-including scan happened to be
+// harmless; the moment this derivation runs PERIODICALLY (meshEndpointRefresher)
+// the device is up and carrying this node's mesh /32, and the scan would pick
+// the one address no un-joined worker can route to — publishing an endpoint that
+// can never complete a handshake, which from a peer's side is indistinguishable
+// from a working one.
+//
+// It falls back to nodeIP ONLY when that address is loopback: the single-host
+// posture, where every "peer" is on this Mac and loopback is a legitimate
+// wireguard endpoint. Anywhere else an empty scan is an ERROR rather than a
+// fallback, because on the mesh path nodeIP has already been rewritten to the
+// mesh IP (runServer), so falling back would advertise exactly the address this
+// function exists to refuse.
+func serverMeshEndpoint(nodeIP, meshIP string, port int) (string, error) {
+	scanned := underlayInterfaceIPs()
+	candidates := make([]net.IP, 0, len(scanned))
+	for _, ip := range scanned {
+		if usableUnderlayIP(ip, meshIP) != "" {
+			candidates = append(candidates, ip)
+		}
 	}
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	if host := firstProxyableIP(candidates); host != "" {
+		return net.JoinHostPort(host, strconv.Itoa(port)), nil
+	}
+	if ip := net.ParseIP(nodeIP); ip != nil && ip.IsLoopback() {
+		return net.JoinHostPort(nodeIP, strconv.Itoa(port)), nil
+	}
+	return "", fmt.Errorf("no underlay address to advertise as this control-plane node's wireguard endpoint: "+
+		"no up, non-loopback, non-tunnel interface has a globally-unicast address outside the mesh CIDR %s, "+
+		"and the node IP %s is not loopback (the node's mesh IP %s is not a valid endpoint — no un-joined peer can dial it)",
+		podnet.ClusterPodCIDR, nodeIP, meshIP)
 }
 
 // meshBringUp is the DISCRETE input to bringUpMesh: everything the wireguard
@@ -101,6 +130,14 @@ type meshBringUp struct {
 	// kubeconfig authenticates the MeshPeer watch that keeps the peer set
 	// converging after the initial program.
 	kubeconfig string
+	// refresher republishes this node's own endpoint when the address it is
+	// reachable at changes. It is a FIELD rather than something bringUpMesh
+	// builds because the two roles publish through different channels (a worker
+	// over the certificate-authenticated bootstrap verb, the server in-process
+	// through its enroller) and only the caller holds the credentials for its
+	// own. Nil runs no refresher, which is what the unit tests of the device
+	// bring-up want.
+	refresher *meshEndpointRefresher
 }
 
 // provisionHelperKey writes the private key to the root-only path the netd
@@ -139,10 +176,14 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverO
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, err
 	}
+	endpoint, err := serverMeshEndpoint(opts.nodeIP, opts.meshIP, serverMeshListenPort)
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, err
+	}
 	res, err := e.EnrollSelf(ctx, opts.nodeName, netv1.MeshEnrollRequest{
 		NodeName:  opts.nodeName,
 		PublicKey: pub,
-		Endpoint:  serverMeshEndpoint(opts.nodeIP, serverMeshListenPort),
+		Endpoint:  endpoint,
 	})
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, err
@@ -161,6 +202,11 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverO
 		peers:         res.Peers,
 		listenPort:    serverMeshListenPort,
 		kubeconfig:    kubeconfig,
+		// The control-plane node's endpoint goes stale the same way a worker's
+		// does — this Mac's LAN address is no more fixed than any other — and a
+		// worker that joined before the move dials the old one on its next full
+		// resync. The write is in-process through the same locked enroller.
+		refresher: newServerEndpointRefresher(e, opts, endpoint, logger),
 	}, mode, logger); err != nil {
 		return netv1.MeshEnrollResponse{}, err
 	}

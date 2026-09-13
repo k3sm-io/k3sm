@@ -26,10 +26,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
+
+	"k3sm.io/k3sm/pkg/bootstrap"
 )
 
 // fakeClock is a mutable clock for TTL tests.
@@ -38,11 +41,24 @@ type fakeClock struct{ now time.Time }
 func (c *fakeClock) Now() time.Time { return c.now }
 
 // fakeEnroller is a controller-mediated enroll stub: it returns a fixed assigned
-// podCIDR + mesh-egress IP and a canned peer snapshot.
+// podCIDR + mesh-egress IP and a canned peer snapshot, and holds ONE stored peer
+// spec so an endpoint refresh can be observed as the mutation it is.
+//
+// Locking discipline: mu guards peer + refreshes; httptest serves each request on
+// its own goroutine.
 type fakeEnroller struct {
 	podCIDR string
 	meshIP  string
 	peers   []netv1.MeshPeerSpec
+
+	mu sync.Mutex
+	// peer is the stored MeshPeer spec RefreshEndpoint updates. Nil models a node
+	// with no peer (the rejoin case), which returns bootstrap.ErrNoMeshPeer.
+	peer *netv1.MeshPeerSpec
+	// refreshes counts EVERY RefreshEndpoint call, including the ones that fail.
+	// A denial test asserts it stayed zero: "the request was refused" and "the
+	// write never happened" are different claims, and only the second one matters.
+	refreshes int
 }
 
 func (f *fakeEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
@@ -52,6 +68,27 @@ func (f *fakeEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEn
 		MeshIP:   f.meshIP,
 		Peers:    f.peers,
 	}.WithDefaults(), nil
+}
+
+func (f *fakeEnroller) RefreshEndpoint(_ context.Context, _, endpoint string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refreshes++
+	if f.peer == nil {
+		return bootstrap.ErrNoMeshPeer
+	}
+	f.peer.Endpoint = endpoint
+	return nil
+}
+
+// snapshot returns the stored peer spec and the refresh call count.
+func (f *fakeEnroller) snapshot() (netv1.MeshPeerSpec, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.peer == nil {
+		return netv1.MeshPeerSpec{}, f.refreshes
+	}
+	return *f.peer, f.refreshes
 }
 
 // newTestCSR mints an ECDSA P-256 keypair and a PEM CSR carrying the given subject +
