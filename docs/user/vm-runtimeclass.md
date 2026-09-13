@@ -124,7 +124,7 @@ kubectl attach -it untrusted-job
 
 - Closing the client detaches without killing anything. It unsubscribes that client and does nothing
   else. The process is never signalled, its stdin is never closed, and its terminal is never hung up.
-- A new attach replays the recent output the guest still holds, then follows live.
+- A new attach follows output from the moment it connects, as with any CRI runtime. Use `kubectl logs` for what was written before.
 - Concurrent attaches are allowed. Each client gets its own copy of the output, and their keystrokes
   interleave in arrival order, which is left to the people at the keyboards to coordinate.
 - Asking for stdin on a container that kept none fails loudly, with a `FailedPrecondition` naming the

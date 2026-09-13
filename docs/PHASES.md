@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-09-09
-updated_by: orchestrator
+updated: 2026-09-13
+updated_by: B282 write-back (on-disk container logs served by the node)
 
 phases:
   - id: M0
@@ -58,7 +58,7 @@ phases:
         acceptance:
           - id: M1.2-a1
             met: true
-            check: a pod without the os=darwin selector is rejected by admission; kubectl logs work over the proxy (non-follow)
+            check: a pod without the os=darwin selector is rejected by admission; kubectl logs work over the proxy (non-follow) — B282 write-back 2026-09-13: the M1 non-follow scoping is retired; the node now serves kubectl logs (tail, since, timestamps, limit-bytes, follow, previous) from the on-disk CRI log files at ContainerStatus.log_path with the kubelet's own reader, rotates them (containerLogMaxSize/Files) and garbage-collects them, behind a kubelet-shaped /containerLogs handler (pkg/provider/podlogs); docs/user/logs.md
             method: integration
       - id: M1.3
         title: Wire the runtimed image runtime
