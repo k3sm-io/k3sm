@@ -144,6 +144,33 @@ func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
 	return nil
 }
 
+// EnsureContainerLogDir creates (or repairs) one directory of the container-log
+// tree owned by the service uid, group wheel, mode 0700. See the System
+// interface for why the installer, not the node, must create it, and see
+// ContainerLogDirMode for why the mode is not EnsureLogDir's 0755.
+func (darwinSystem) EnsureContainerLogDir(dir string, uid uint32) error {
+	return ensureContainerLogDir(dir, int(uid), ContainerLogDirGID)
+}
+
+// ensureContainerLogDir applies the container-log ownership policy to dir. It
+// takes uid and gid explicitly — rather than reading the constants — so the
+// policy can be exercised with the test process's own identity, on a machine
+// where chowning to another uid or to group wheel needs root.
+func ensureContainerLogDir(dir string, uid, gid int) error {
+	if err := os.MkdirAll(dir, ContainerLogDirMode); err != nil {
+		return fmt.Errorf("create container log dir %s: %w", dir, err)
+	}
+	if err := os.Chown(dir, uid, gid); err != nil {
+		return fmt.Errorf("chown container log dir %s to %d:%d: %w", dir, uid, gid, err)
+	}
+	// MkdirAll skips an existing directory, so the chmod is what repairs a tree an
+	// earlier build or a hand-run mkdir left group- or world-readable.
+	if err := os.Chmod(dir, ContainerLogDirMode); err != nil {
+		return fmt.Errorf("chmod container log dir %s %#o: %w", dir, ContainerLogDirMode, err)
+	}
+	return nil
+}
+
 // EnsureRunDir creates (or repairs) the runtime run dir owned by the service
 // uid, group staff, mode 0700 — the directory the _k3sm node binds its runtimed
 // control socket in. See the System interface for why the installer, not a

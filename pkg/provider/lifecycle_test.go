@@ -94,7 +94,7 @@ func (f *fakeLifecycleServer) snapshot() []lifecycleEvent {
 func newLifecycleFake(t *testing.T, clk clock.Clock) (*runtimedRuntime, *fakeLifecycleServer) {
 	t.Helper()
 	f := &fakeLifecycleServer{fakeRuntimeServer: newFakeRuntimeServer()}
-	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir()}, nil, nil)
+	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 	if clk != nil {
 		r.clk = clk
 	}

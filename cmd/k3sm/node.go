@@ -110,13 +110,17 @@ type nodeOptions struct {
 	nodeName   string
 	listen     string
 	podRoot    string
-	nodeIP     string
-	runtime    string // "runtimed" (default) or "hostprocess" — see defaultRuntime
-	dnsShim    string // getaddrinfo DNS shim dylib path (runtimed only)
-	pathShim   string // path-rebase DYLD shim dylib path (runtimed only)
-	dnsVIP     string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
-	domain     string // cluster DNS domain the in-pod shim search list is built from (runtimed)
-	serveTLS   bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
+	// logs is the container-log flag group (--pod-logs-dir and the four rotation
+	// knobs), carried through every bring-up path so `k3sm server`, `k3sm agent`
+	// and `k3sm node` configure the node's logs identically.
+	logs     containerLogOptions
+	nodeIP   string
+	runtime  string // "runtimed" (default) or "hostprocess" — see defaultRuntime
+	dnsShim  string // getaddrinfo DNS shim dylib path (runtimed only)
+	pathShim string // path-rebase DYLD shim dylib path (runtimed only)
+	dnsVIP   string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
+	domain   string // cluster DNS domain the in-pod shim search list is built from (runtimed)
+	serveTLS bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
 
 	// kubeletClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA)
 	// certificate, in PEM. It is the anchor the kubelet HTTP endpoint (:10250 —
@@ -288,6 +292,7 @@ func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.listen, "listen", nodeKubeletListen, "address for the kubelet HTTP API (logs/exec)")
 	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	registerContainerLogFlags(fs, &opts.logs)
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
 	addRuntimeFlag(fs, &opts.runtime)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
@@ -685,6 +690,19 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		return err
 	}
 
+	// The container-log posture, checked before this node registers anything: an
+	// invalid rotation policy is a typo the operator should hear about now, and a
+	// missing or unwritable log directory means every pod on this node would run
+	// with nowhere to write its output and `kubectl logs` would answer "no log
+	// file" forever. Both are refusals rather than degradations, and the second
+	// names the command that fixes it.
+	if err := opts.logs.validate(); err != nil {
+		return err
+	}
+	if err := opts.logs.ensureWritable(); err != nil {
+		return err
+	}
+
 	// Advertise a globally-unicast NodeInternalIP on the runtimed datapath so the
 	// apiserver node-proxy accepts /nodes/<n>/proxy/stats/summary (kubectl top
 	// node): a loopback InternalIP fails isProxyableHostname (IsGlobalUnicast) →
@@ -823,6 +841,14 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		TLSConfig:        servingTLS,       // nil = plain HTTP (dev path); set = kubelet-serving TLS + required client cert
 		AuthorizeHandler: authorizeKubelet, // nil iff TLSConfig is nil — the adapter enforces the pairing
 		ConfigureNode:    func(nd *corev1.Node) { configureNode(nd, opts.nodeName, internalIP, opts.listen, caps) },
+		// The kubelet's own /containerLogs surface, on a subtree pattern that
+		// beats Virtual Kubelet's "/" catch-all. VK's logs route flattens
+		// tailLines and limitBytes into ints, which cannot express `--tail=0` or
+		// distinguish it from "no tail at all"; this handler decodes
+		// v1.PodLogOptions the way a kubelet does and reads the file with the
+		// pointer intact. Empty when the runtime keeps no CRI log tree (the
+		// hostprocess node), in which case VK's route stands.
+		ExtraRoutes: containerLogRoutes(prov),
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
 		// into Ready. It receives the node AFTER configureNode stamped it, and
@@ -858,7 +884,13 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err
 	}
-	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot)
+	// Container-log rotation and garbage collection start HERE, after the node is
+	// ready — which is after Virtual Kubelet's pod informer has synced, so the
+	// provider's view of this node's pods is the cluster's. Starting the GC any
+	// earlier would let it read an empty pod set as "every pod is gone" and delete
+	// the whole log tree on every restart.
+	startContainerLogMaintenance(ctx, prov)
+	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir)
 
 	select {
 	case <-ctx.Done():
@@ -1170,8 +1202,16 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		PathShim:      firstNonEmpty(opts.pathShim, resolvePathShim()),
 		ResolverVIP:   resolverVIP,
 		ClusterDomain: clusterDomain,
-		APIServerVIP:  apiServerVIP(),
-		Client:        cs,
+		// The container-log tree and its rotation policy — the kubelet's own
+		// defaults unless the operator said otherwise.
+		PodLogsDir:                  opts.logs.dir,
+		ContainerLogsDir:            opts.logs.containerLogsDir(),
+		ContainerLogMaxSize:         opts.logs.maxSize,
+		ContainerLogMaxFiles:        opts.logs.maxFiles,
+		ContainerLogMaxWorkers:      opts.logs.maxWorkers,
+		ContainerLogMonitorInterval: opts.logs.monitorInterval,
+		APIServerVIP:                apiServerVIP(),
+		Client:                      cs,
 		// Fence every pod off the root helper socket at the sandbox: pods share the
 		// _k3sm uid with the legitimate helper client, so the SBPL must deny
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs

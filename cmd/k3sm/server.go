@@ -70,11 +70,13 @@ type serverOptions struct {
 	nodeIP         string
 	meshIP         string // wireguard mesh IP; set => multi-node worker-join supervisor
 	podRoot        string
-	rtName         string
-	dnsShim        string
-	pathShim       string
-	apiPort        int
-	kinePort       int // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
+	// logs is the container-log flag group, passed through to the in-process node.
+	logs     containerLogOptions
+	rtName   string
+	dnsShim  string
+	pathShim string
+	apiPort  int
+	kinePort int // kine (etcd shim) listen port; per-server, so two control planes on one host never share a datastore
 	// kubeletPort is the port the in-process node serves the kubelet HTTP API
 	// (logs/exec/stats) on. Per-server for the same reason kinePort is: it is a
 	// singleton listener, so two control planes on one Mac cannot both have the
@@ -157,6 +159,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node InternalIP to advertise")
 	fs.StringVar(&opts.meshIP, "mesh-ip", "", "wireguard mesh IP to bind the apiserver + worker-join supervisor on (enables multi-node join; empty = single-node)")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
+	registerContainerLogFlags(fs, &opts.logs)
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
 	fs.StringVar(&opts.pathShim, "path-shim", "", "path-rebase DYLD shim dylib path (runtimed runtime only)")
@@ -905,6 +908,7 @@ func runServer(args []string) (err error) {
 		nodeName:   opts.nodeName,
 		listen:     serverKubeletListenOn(opts.kubeletPort),
 		podRoot:    opts.podRoot,
+		logs:       opts.logs,
 		nodeIP:     opts.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,

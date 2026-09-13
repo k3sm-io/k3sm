@@ -293,7 +293,7 @@ func (f *fakeRuntimeServer) statusLocked(id string) *runtimev1.PodStatus {
 func newRuntimedFake(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer) {
 	t.Helper()
 	f := newFakeRuntimeServer()
-	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir()}, nil, nil)
+	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 	return r, f
 }
 
@@ -311,9 +311,9 @@ func TestRuntimedDeniesHelperSocket(t *testing.T) {
 	const sock = "/var/lib/k3sm/run/netd.sock"
 	f := newFakeRuntimeServer()
 	r := newRuntimedWith(f, RuntimedConfig{
-		NodeName:              "n",
-		NodeIP:                "192.168.1.10",
-		Root:                  t.TempDir(),
+		NodeName: "n",
+		NodeIP:   "192.168.1.10",
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
 		DeniedUnixSocketPaths: []string{sock},
 	}, nil, nil)
 

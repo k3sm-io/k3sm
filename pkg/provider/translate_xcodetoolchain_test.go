@@ -184,7 +184,7 @@ func TestXcodeToolchainOptIn(t *testing.T) {
 	t.Run("buildBox_stamps_the_node_dir", func(t *testing.T) {
 		withDeveloperDir(t, devDir)
 		r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
-			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(),
+			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(), PodLogsDir: t.TempDir(),
 		}, nil, nil)
 
 		pod := &corev1.Pod{
@@ -214,7 +214,7 @@ func TestXcodeToolchainOptIn(t *testing.T) {
 	t.Run("buildBox_filters_a_command_line_tools_node", func(t *testing.T) {
 		withDeveloperDir(t, "/Library/Developer/CommandLineTools")
 		r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
-			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(),
+			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(), PodLogsDir: t.TempDir(),
 		}, nil, nil)
 
 		pod := &corev1.Pod{
@@ -236,7 +236,7 @@ func TestXcodeToolchainOptIn(t *testing.T) {
 	t.Run("buildBox_leaves_an_unannotated_pod_empty", func(t *testing.T) {
 		withDeveloperDir(t, devDir)
 		r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
-			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(),
+			NodeName: "n", NodeIP: "10.0.0.5", Root: t.TempDir(), PodLogsDir: t.TempDir(),
 		}, nil, nil)
 
 		pod := &corev1.Pod{

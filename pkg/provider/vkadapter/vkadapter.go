@@ -128,6 +128,31 @@ type NodeConfig struct {
 	// callback entirely: VK constructs it only for a nil node provider, so a
 	// non-nil provider owns the Ready condition outright and must publish it.
 	NodeProvider func(*corev1.Node) (NodeProvider, error)
+	// ExtraRoutes are k3sm-owned handlers registered on the kubelet HTTP API's
+	// mux alongside the Virtual Kubelet provider routes. They are served under
+	// exactly the same conditions those are — only when TLSConfig is set, and
+	// only behind AuthorizeHandler — so an extra route can never be a way to
+	// reach the node on the plain-HTTP path or without a verified client
+	// certificate.
+	//
+	// This field is the ONE sanctioned seam for a route VK's own router does not
+	// provide. It exists because VK registers its logs handler at the "/"
+	// catch-all with an options struct that cannot express `tailLines=0` (see
+	// provider.toPodLogOptions), and k3sm serves the kubelet's real
+	// /containerLogs contract instead. net/http routes by the most specific
+	// pattern, not by registration order, so a subtree pattern like
+	// "/containerLogs/" wins over "/" deterministically — which is why a route
+	// here overrides a VK route without any ordering rule for a future edit to
+	// get wrong.
+	ExtraRoutes []Route
+}
+
+// Route is one extra handler registered on the kubelet HTTP API mux.
+type Route struct {
+	// Pattern is the net/http ServeMux pattern (e.g. "/containerLogs/").
+	Pattern string
+	// Handler serves it.
+	Handler http.Handler
 }
 
 // NewNode builds a Virtual Kubelet node from a NodeConfig, encapsulating the
@@ -181,6 +206,17 @@ func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
 	}
 	if routes {
 		nodeOpts = append(nodeOpts, nodeutil.AttachProviderRoutes(mux))
+		// Registered directly on the same mux VK's own routes are attached to
+		// (nodeutil applies that opt later, when it builds the node). A pattern
+		// claimed twice is a ServeMux panic either way, never a silent shadow —
+		// which is the right answer, since the patterns are disjoint by design:
+		// VK registers "/" and k3sm registers subtree patterns under it.
+		for _, rt := range cfg.ExtraRoutes {
+			if rt.Pattern == "" || rt.Handler == nil {
+				return nil, fmt.Errorf("vkadapter: NodeConfig.ExtraRoutes entry %q needs both a pattern and a handler", rt.Pattern)
+			}
+			mux.Handle(rt.Pattern, rt.Handler)
+		}
 	}
 
 	return nodeutil.NewNode(nodeName,

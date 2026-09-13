@@ -179,6 +179,11 @@ func (f *fakeSystem) EnsureLogDir(dir string, uid uint32) error {
 	return nil
 }
 
+func (f *fakeSystem) EnsureContainerLogDir(dir string, uid uint32) error {
+	f.calls = append(f.calls, "EnsureContainerLogDir:"+dir)
+	return nil
+}
+
 func (f *fakeSystem) EnsureRunDir(dir string, uid uint32) error {
 	f.calls = append(f.calls, "EnsureRunDir:"+dir)
 	return nil
@@ -339,6 +344,11 @@ func TestInstallOrchestration(t *testing.T) {
 	want := []string{
 		"EnsureServiceUser:_k3sm",
 		"EnsureLogDir:/var/log/k3sm",
+		// The container-log tree, at the same moment and for the same reason: the
+		// node refuses to start without it, and only root can create it owned by
+		// the service user at a mode that keeps pod output off every local account.
+		"EnsureContainerLogDir:/var/log/pods",
+		"EnsureContainerLogDir:/var/log/containers",
 		// Before any daemon bootstraps: root netd would otherwise create the run
 		// dir root-owned and the _k3sm server could not bind runtimed.sock in it.
 		"EnsureRunDir:/var/lib/k3sm/run",
@@ -498,6 +508,13 @@ func TestUninstallIdempotent(t *testing.T) {
 		t.Fatalf("Uninstall: %v", err)
 	}
 	want := []string{
+		// The container-log tree goes FIRST (the manifest is walked in reverse
+		// install order) and it goes at all, unlike DataRoot and the daemon
+		// LogDir: every file in it belongs to a pod that will not exist once k3sm
+		// is uninstalled, and it is a root-equivalent tree of former workloads'
+		// output.
+		"RemoveAll:/var/log/containers",
+		"RemoveAll:/var/log/pods",
 		"Bootout:io.k3sm.server",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
@@ -805,6 +822,13 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		created := toSet(recorded(installCalls, "WriteLaunchDaemon:"))
 		for _, path := range recorded(installCalls, "CopyToRootOwned:") {
 			created[filepath.Dir(path)] = true // the InstallDir tree (the sweep root)
+		}
+		// The container-log tree is created through its own seam method rather
+		// than by a copy, so it enters the created set the same way it is laid
+		// down. The bidirectional property is unchanged: a RemoveAll of a path
+		// NOTHING in installCalls produced is still a failure.
+		for _, path := range recorded(installCalls, "EnsureContainerLogDir:") {
+			created[path] = true
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {

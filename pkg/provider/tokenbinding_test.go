@@ -143,7 +143,7 @@ func newTokenBindingFake(t *testing.T, rec *tokenRecorder) (*runtimedRuntime, *t
 	t.Helper()
 	res := newKubeResolver(newTokenClient(rec))
 	f := &tokenMintingRuntime{fakeRuntimeServer: newFakeRuntimeServer(), resolver: res}
-	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir()}, res, nil)
+	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, res, nil)
 	return r, f
 }
 

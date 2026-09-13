@@ -94,7 +94,7 @@ func newHookFake(t *testing.T) (*runtimedRuntime, *hookRuntime, *record.FakeReco
 	f := &hookRuntime{fakeRuntimeServer: newFakeRuntimeServer()}
 	rec := record.NewFakeRecorder(32)
 	r := newRuntimedWith(f, RuntimedConfig{
-		NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), Recorder: rec,
+		NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
 	}, nil, nil)
 	return r, f, rec
 }

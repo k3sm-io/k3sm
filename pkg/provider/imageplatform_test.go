@@ -353,7 +353,7 @@ func TestImagePlatformPreflightFailsClosed(t *testing.T) {
 			f := &platformFake{fakeRuntimeServer: newFakeRuntimeServer(), info: capabilityInfo(tc.caps)}
 			rec := record.NewFakeRecorder(8)
 			r := newRuntimedWith(f, RuntimedConfig{
-				NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), Recorder: rec,
+				NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
 			}, nil, nil)
 
 			pod := platformPod(tc.annotation)

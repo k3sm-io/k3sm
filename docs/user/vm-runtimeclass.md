@@ -6,8 +6,9 @@ answer for **untrusted or multi-tenant** workloads, an isolation boundary backed
 Virtualization.framework.
 
 > **Single-node.** A Pod that sets `runtimeClassName: vm` boots a `linux/arm64` container image
-> in its own micro-VM. It supports boot and restart, `kubectl logs` (including `--tail` and
-> `-f`), `kubectl exec` with exit-code propagation, `CrashLoopBackOff` and restart backoff,
+> in its own micro-VM. It supports boot and restart, `kubectl logs` with every option (including
+> `--tail`, `-f` and `--previous`), `kubectl exec` with exit-code propagation,
+> `CrashLoopBackOff` and restart backoff,
 > PersistentVolumeClaim storage that survives a hard hypervisor kill, per-container CPU and memory
 > accounting, and in-guest networking. The guest leases an address on the node's NAT segment,
 > resolves cluster DNS, reaches ClusterIP Services, and is itself reachable through its own
@@ -107,6 +108,14 @@ discipline merges `stdout` and `stderr` before either leaves the container, so `
 A container with `stdin: true` and no terminal keeps a writable pipe instead. A container that
 declares neither is started exactly as before.
 
+## Logs
+
+A `vm` Pod's logs are the same files a native Pod's are. The guest's output is relayed to the node
+and written to `/var/log/pods/<namespace>_<pod>_<uid>/<container>/<restartCount>.log` in the CRI
+format, by the same writer, so there is one log tree on the node and one reader over it. Rotation,
+`--previous` after a restart, the flat `/var/log/containers` symlinks and a host-level log shipper
+all behave identically on both paths. [Container logs](logs.md) is the full page.
+
 Then:
 
 ```sh
@@ -115,7 +124,7 @@ kubectl attach -it untrusted-job
 
 - Closing the client detaches without killing anything. It unsubscribes that client and does nothing
   else. The process is never signalled, its stdin is never closed, and its terminal is never hung up.
-- A new attach replays the recent output the guest still holds, then follows live.
+- A new attach follows output from the moment it connects, as with any CRI runtime. Use `kubectl logs` for what was written before.
 - Concurrent attaches are allowed. Each client gets its own copy of the output, and their keystrokes
   interleave in arrival order, which is left to the people at the keyboards to coordinate.
 - Asking for stdin on a container that kept none fails loudly, with a `FailedPrecondition` naming the

@@ -681,6 +681,12 @@ func serverArgs(name, workDir, podRoot string, alloc instancePorts, network, run
 		// server derives it from the work-dir parent and no PVC-backed pod can
 		// ever start.
 		"--pod-root", podRoot,
+		// A PER-INSTANCE container-log tree. The default is the shared, root-owned
+		// /var/log/pods that `sudo k3sm install` lays down; a `k3sm dev` instance
+		// is unprivileged, disposable and may run beside others, so it keeps its
+		// logs inside its own runtime root — which `k3sm dev down` already removes,
+		// and which is outside /Users for the same Seatbelt reason --pod-root is.
+		"--pod-logs-dir", devPodLogsDir(podRoot),
 		"--node-name", "k3sm-dev-" + name,
 		"--node-ip", "127.0.0.1",
 		"--runtime", runtimeName,
@@ -750,6 +756,14 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// the detached server's first pod create.
 	if err := os.MkdirAll(podRoot, 0o700); err != nil {
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
+	}
+	// The instance's container-log root. The node REFUSES to start without it
+	// (it never creates the directory itself, because on a real install only root
+	// may), so dev creates it here the way the installer does for a real node.
+	if dir := devPodLogsDir(podRoot); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("create pod-logs-dir %s: %w", dir, err)
+		}
 	}
 	logPath := serverLogPath(workDir)
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -853,6 +867,11 @@ func (m *Manager) awaitOrExit(ctx context.Context, p *serverProc, err error) err
 // serverLogPath is where spawnServer redirects a detached server's output. One
 // helper so the writer and every error that quotes the file name the same path.
 func serverLogPath(workDir string) string { return filepath.Join(workDir, "server.log") }
+
+// devPodLogsDir returns an instance's container-log root, under its runtime root.
+// The layout inside it is the kubelet's (<ns>_<pod>_<uid>/<container>/<n>.log),
+// so a dev instance's logs are read exactly the way an installed node's are.
+func devPodLogsDir(podRoot string) string { return filepath.Join(podRoot, "log", "pods") }
 
 // kubeconfigWait bounds awaitKubeconfig. It is not raised to cover a slow boot: a
 // deadline that moves to fit the worst observed run stops bounding anything, and the

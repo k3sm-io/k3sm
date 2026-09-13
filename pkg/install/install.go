@@ -48,6 +48,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -139,6 +140,33 @@ const (
 	VMRunDir = DefaultRunDir + "/vm"
 	// LogDir is where the daemons' stdout/stderr are written.
 	LogDir = "/var/log/k3sm"
+	// PodLogsDir is the root of the CRI container-log tree the node writes pod
+	// output into (<dir>/<ns>_<pod>_<uid>/<container>/<n>.log). It is the
+	// kubelet's own default path, taken from the package that defines the layout
+	// so the installer and the node can never name two different directories.
+	PodLogsDir = podlogs.DefaultPodLogsDir
+	// ContainerLogsDir is the flat per-container symlink directory log shippers
+	// glob, again the kubelet's own path.
+	ContainerLogsDir = podlogs.ContainerLogsDir
+)
+
+// ContainerLogDirMode and ContainerLogDirGID are the ownership POLICY for the
+// container-log tree: service-user-owned, group WHEEL (gid 0), mode 0700.
+//
+// Deliberately NOT the `staff 0755` of EnsureLogDir above, and the difference is
+// the whole point. That directory holds the daemons' own stdout, which is
+// low-sensitivity and must be openable by launchd on the _k3sm job's behalf. This
+// one holds every pod's output — application logs, stack traces, whatever a
+// workload prints — and upstream's /var/log/pods is root-owned, i.e. readable
+// only by root. _k3sm's primary group is `staff`, which is the default group of
+// every ordinary macOS account, so copying upstream's numeric 0755 across would
+// silently turn "root only" into "any local user can read every pod's output".
+// 0700 with group wheel is the closest honest equivalent of upstream's posture on
+// this platform: the node reads it, `kubectl logs` serves it, and a human reads it
+// with sudo.
+const (
+	ContainerLogDirMode fs.FileMode = 0o700
+	ContainerLogDirGID  int         = 0
 )
 
 // ServerLogPath returns the control-plane daemon's combined stdout/stderr log path.
@@ -245,6 +273,21 @@ type System interface {
 	// spawns (an observed live-hardware failure this fixes). Idempotent: perms/owner are
 	// re-applied on every install, repairing a previously mis-created dir.
 	EnsureLogDir(dir string, uid uint32) error
+	// EnsureContainerLogDir creates (or repairs) one directory of the container-log
+	// tree — /var/log/pods and /var/log/containers — owned by the service uid,
+	// group wheel, mode 0700 (ContainerLogDirMode / ContainerLogDirGID).
+	//
+	// Only root can hand a directory under /var/log to the service user, and only
+	// the installer runs as root, which is why this is an install step and not
+	// something the node does for itself at start-up. The node REFUSES to start
+	// when the directory is missing or unwritable rather than creating it, because
+	// a node-created directory would be owned by _k3sm with whatever umask was in
+	// force, and the one thing this tree's mode has to be is deliberate.
+	//
+	// Owner and mode are re-applied on every install, so a tree an earlier build
+	// (or a hand-run mkdir) left group-readable is repaired rather than left as it
+	// was found.
+	EnsureContainerLogDir(dir string, uid uint32) error
 	// EnsureRunDir creates (or repairs) the runtime run directory owned by the
 	// service uid (group staff, 0700) — the directory the _k3sm node binds its
 	// runtimed control socket in (RunDir / provider.RuntimedSocketPath), and the
@@ -650,6 +693,15 @@ func artifactManifest(cfg Config) []artifact {
 		// daemon LogDir. Both survive an uninstall→reinstall.
 		{kind: kindDir, disp: dispPreserve, path: cfg.DataRoot, assertExists: false},
 		{kind: kindDir, disp: dispPreserve, path: LogDir, assertExists: false},
+
+		// The container-log tree is REMOVED on uninstall, unlike the daemon LogDir
+		// above and unlike DataRoot. It holds no state a reinstall wants and no
+		// record anyone is keeping: every file in it belongs to a pod that no
+		// longer exists once k3sm is gone, and leaving a root-equivalent tree of
+		// former workloads' output behind on a machine somebody just uninstalled
+		// k3sm from is not a kindness.
+		{kind: kindDir, disp: dispRemove, path: PodLogsDir, assertExists: false},
+		{kind: kindDir, disp: dispRemove, path: ContainerLogsDir, assertExists: false},
 	}...)
 	return items
 }
@@ -709,6 +761,16 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     initialize" and never spawns. Created/repaired idempotently.
 	if err := sys.EnsureLogDir(LogDir, uid); err != nil {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
+	}
+
+	// 1b'. The container-log tree, for the same reason and at the same moment: the
+	//     node refuses to start without it, and only root can create it owned by
+	//     the service user with a mode that does not expose every pod's output to
+	//     every local account.
+	for _, dir := range []string{PodLogsDir, ContainerLogsDir} {
+		if err := sys.EnsureContainerLogDir(dir, uid); err != nil {
+			return fmt.Errorf("install: ensure container log dir %s: %w", dir, err)
+		}
 	}
 
 	// 1c. The run dir, BEFORE either daemon bootstraps — because whichever daemon

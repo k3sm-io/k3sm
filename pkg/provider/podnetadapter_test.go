@@ -176,8 +176,8 @@ func newRuntimedWithPodNet(t *testing.T) (*runtimedRuntime, *fakeRuntimeServer, 
 	r := newRuntimedWith(f, RuntimedConfig{
 		NodeName: "n",
 		NodeIP:   testNodeIP,
-		Root:     t.TempDir(),
-		Network:  adapter,
+		Root:     t.TempDir(), PodLogsDir: t.TempDir(),
+		Network: adapter,
 	}, nil, nil)
 	return r, f, ipam, adapter
 }

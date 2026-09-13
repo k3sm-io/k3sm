@@ -65,7 +65,7 @@ func TestProviderLogsBothShimPaths(t *testing.T) {
 	}{
 		{
 			name:         "both shims staged",
-			cfg:          RuntimedConfig{NodeName: "n", Root: t.TempDir(), DyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib", PathShim: "/Library/k3sm/libk3sm_pathrebase_shim.dylib"},
+			cfg:          RuntimedConfig{NodeName: "n", Root: t.TempDir(), PodLogsDir: t.TempDir(), DyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib", PathShim: "/Library/k3sm/libk3sm_pathrebase_shim.dylib"},
 			wantDyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
 			wantPathShim: "/Library/k3sm/libk3sm_pathrebase_shim.dylib",
 		},
@@ -74,13 +74,13 @@ func TestProviderLogsBothShimPaths(t *testing.T) {
 			// Pre-B159 this logged one shim and silently dropped the other — the
 			// unstaged one being exactly the fault to diagnose.
 			name:         "path shim absent, dns shim staged",
-			cfg:          RuntimedConfig{NodeName: "n", Root: t.TempDir(), DyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib"},
+			cfg:          RuntimedConfig{NodeName: "n", Root: t.TempDir(), PodLogsDir: t.TempDir(), DyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib"},
 			wantDyldShim: "/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
 			wantPathShim: "",
 		},
 		{
 			name: "neither shim staged (a from-source run)",
-			cfg:  RuntimedConfig{NodeName: "n", Root: t.TempDir()},
+			cfg:  RuntimedConfig{NodeName: "n", Root: t.TempDir(), PodLogsDir: t.TempDir()},
 		},
 	}
 

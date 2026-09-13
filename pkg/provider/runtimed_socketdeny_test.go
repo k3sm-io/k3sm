@@ -154,9 +154,14 @@ func TestRuntimedSocketDeniedToPods(t *testing.T) {
 func renderPodProfile(t *testing.T, root string, supplied []string) string {
 	t.Helper()
 	r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
-		NodeName:              "n",
-		NodeIP:                "192.168.1.10",
-		Root:                  root,
+		NodeName: "n",
+		NodeIP:   "192.168.1.10",
+		Root:     root,
+		// A temp dir, NOT root: this test deliberately passes unwritable,
+		// non-existent roots (/opt/k3sm-lab, /var/k3sm-lab) to exercise the socket
+		// path spellings, and the box translation now also creates the pod's log
+		// tree under PodLogsDir.
+		PodLogsDir:            t.TempDir(),
 		DeniedUnixSocketPaths: supplied,
 	}, nil, nil)
 	box, err := r.buildBox(context.Background(), runtimedPod("default", "web"), "192.168.1.10")

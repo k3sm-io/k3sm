@@ -443,9 +443,9 @@ func TestToPodBoxClusterFirstMergesDNSConfig(t *testing.T) {
 	newR := func(t *testing.T) *runtimedRuntime {
 		t.Helper()
 		return newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
-			NodeName:      "n",
-			NodeIP:        "10.0.0.5",
-			Root:          t.TempDir(),
+			NodeName: "n",
+			NodeIP:   "10.0.0.5",
+			Root:     t.TempDir(), PodLogsDir: t.TempDir(),
 			ResolverVIP:   vip,
 			ClusterDomain: domain,
 		}, nil, nil)

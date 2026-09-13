@@ -213,7 +213,7 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 	t.Run("rpc_nil_response_fails_closed", func(t *testing.T) {
 		t.Parallel()
 		s := &infoServer{}
-		r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir()}, nil, nil)
+		r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 		assertCaps(t, r.Capabilities(context.Background()), NodeCapabilities{})
 	})
 
@@ -227,7 +227,7 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 			cond(runtimed.ConditionRosettaHostAvailable, condTrue, "Available"),
 			cond(runtimed.ConditionRosettaGuestAvailable, condTrue, "Available"),
 		)}
-		r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir()}, nil, nil)
+		r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 		got := r.Capabilities(context.Background())
 		assertCaps(t, got, NodeCapabilities{VMBackend: true, RosettaHost: true, RosettaGuest: true})
 		if s.calls != 1 {
@@ -254,7 +254,7 @@ func TestRosettaCapabilitiesFromInfo(t *testing.T) {
 			{"unknown", condUnknown, false},
 		} {
 			s := &infoServer{info: info(cond(runtimed.ConditionVMBackendAvailable, tc.st, "r"))}
-			r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir()}, nil, nil)
+			r := newRuntimedWith(s, RuntimedConfig{NodeName: "n", NodeIP: "10.0.0.1", Root: t.TempDir(), PodLogsDir: t.TempDir()}, nil, nil)
 			caps := r.Capabilities(context.Background())
 			if caps.VMBackend != tc.want {
 				t.Errorf("%s: Capabilities().VMBackend = %v, want %v", tc.name, caps.VMBackend, tc.want)
