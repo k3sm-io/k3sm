@@ -250,7 +250,14 @@ else
 	rm -rf "$LOGTREE"; mkdir -p "$LOGTREE"; chmod 0700 "$LOGTREE"
 	echo "----------------------------------------"
 	echo "B282 INTEGRATION tier: booting a control plane in $B282_WORK with --pod-logs-dir $LOGTREE"
-	( cd "$K3SM_ROOT" && nohup env CGO_ENABLED=1 go run ./cmd/k3sm server \
+	# runtimed locates k3sm-execshim next to the k3sm executable or on PATH
+	# (sandbox.FindExecShim); a `go run` binary lives alone in a build cache dir,
+	# so build both into one bin dir and run the server from there.
+	mkdir -p "$B282_WORK/bin"
+	( cd "$K3SM_ROOT" && CGO_ENABLED=1 go build -o "$B282_WORK/bin/k3sm" ./cmd/k3sm \
+		&& CGO_ENABLED=1 go build -o "$B282_WORK/bin/k3sm-execshim" k3sm.io/runtimed/cmd/k3sm-execshim ) \
+		|| { echo "FAIL  b282.L0  building k3sm + k3sm-execshim into $B282_WORK/bin" >&2; exit 1; }
+	( cd "$K3SM_ROOT" && nohup env PATH="$B282_WORK/bin:$PATH" "$B282_WORK/bin/k3sm" server \
 		--work-dir "$SERVER_WORKDIR" --node-name b282-logs \
 		--network none --runtime runtimed \
 		--pod-root "$B282_WORK/pods" --pod-logs-dir "$LOGTREE" \
