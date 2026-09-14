@@ -74,10 +74,15 @@ var RetryPolicy = Retry{Poll: 2 * time.Second, Budget: 90 * time.Second}
 // mounted k3sm data volume.
 //
 // It is idempotent. The RECORD'S volume already mounted there -- by this
-// daemon, by diskarbitrationd from the fstab line, or by hand -- returns
-// immediately, and a partial previous run is completed rather than redone.
-// Some OTHER filesystem mounted there is not the same thing and is refused:
-// "a filesystem is mounted" is not the question the caller is asking.
+// daemon, by diskarbitrationd from the fstab line, or by hand -- skips the
+// mount, but still gets the marker and the exclusions applied, so a partial
+// previous run is completed rather than redone. Some OTHER filesystem mounted
+// there is not the same thing and is refused: "a filesystem is mounted" is not
+// the question the caller is asking.
+//
+// Ownership is the one step the fast path does NOT take: a volume that was
+// already mounted has an owner, and re-chowning a live data root under the
+// running daemons is not something an idempotent call should do.
 //
 // It refuses two postures outright, both of which come from the record being a
 // file that can be wrong: a mount point no data root could be at
@@ -120,21 +125,18 @@ func MountRecorded(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroo
 			return fmt.Errorf("%s has a filesystem mounted on it, but volume %s (%s) is mounted at %q: %w",
 				rec.Mountpoint, rec.Name, rec.UUID, info.MountPoint, ErrRecordMismatch)
 		}
-		return nil
+		// The volume is the right one and it is already mounted, but that
+		// says nothing about whether it has been MARKED. Adopting a volume
+		// the operator mounted themselves takes exactly this path, and it is
+		// the run that must leave the marker and the exclusions behind.
+		return applyVolumePolicy(ctx, deps, fsys, rec.Mountpoint, logger)
 	}
 
 	if err := mountWithRetry(ctx, deps, fsys, rec); err != nil {
 		return err
 	}
 
-	if err := deps.Indexing.SpotlightOff(ctx, rec.Mountpoint); err != nil {
-		logger.Warn("could not disable Spotlight on the data volume", "mountpoint", rec.Mountpoint, "err", err)
-	}
-	if err := deps.Indexing.TimeMachineExclude(ctx, rec.Mountpoint); err != nil {
-		logger.Warn("could not exclude the data volume from Time Machine", "mountpoint", rec.Mountpoint, "err", err)
-	}
-
-	if err := writeMarker(fsys, rec.Mountpoint); err != nil {
+	if err := applyVolumePolicy(ctx, deps, fsys, rec.Mountpoint, logger); err != nil {
 		return err
 	}
 
@@ -223,6 +225,28 @@ func mountOnce(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroot.Re
 		return fmt.Errorf("diskutil reported success but nothing is mounted at %s", rec.Mountpoint)
 	}
 	return nil
+}
+
+// applyVolumePolicy is everything k3sm puts ON a mounted data volume: the
+// provenance marker Ensure later adopts by, and the two exclusions that keep
+// Spotlight and Time Machine out of it.
+//
+// Every step is idempotent, which is what lets both of MountRecorded's paths
+// call it. The fast path needs it because a volume can be mounted without ever
+// having been marked -- the rig's own volume was, mounted from /etc/fstab
+// years before k3sm had a record -- and an adoption that returned early left
+// no marker, so the next Ensure could not recognise its own volume.
+//
+// Indexing failures are logged and not returned: an indexed data root still
+// works, and refusing to mount over it would be the worse outcome.
+func applyVolumePolicy(ctx context.Context, deps Deps, fsys dataroot.FS, mountpoint string, logger *slog.Logger) error {
+	if err := deps.Indexing.SpotlightOff(ctx, mountpoint); err != nil {
+		logger.Warn("could not disable Spotlight on the data volume", "mountpoint", mountpoint, "err", err)
+	}
+	if err := deps.Indexing.TimeMachineExclude(ctx, mountpoint); err != nil {
+		logger.Warn("could not exclude the data volume from Time Machine", "mountpoint", mountpoint, "err", err)
+	}
+	return writeMarker(fsys, mountpoint)
 }
 
 // writeMarker writes the provenance marker if it is not already there.

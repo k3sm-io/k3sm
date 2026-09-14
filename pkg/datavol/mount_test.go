@@ -77,10 +77,16 @@ func TestMountRecordedIsIdempotent(t *testing.T) {
 		if err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil); err != nil {
 			t.Fatalf("MountRecorded: %v", err)
 		}
-		// The fast path costs exactly one Info: it confirms that what is
-		// mounted there is the record's own volume, and does nothing else.
-		if want := []string{"info " + rigUUID}; !reflect.DeepEqual(f.Calls, want) {
+		// The fast path skips the mount, not the policy: it confirms the
+		// volume is the record's own, then marks and excludes it. Adopting a
+		// volume the operator mounted themselves takes exactly this path, and
+		// it is the run that has to leave the marker behind.
+		want := []string{"info " + rigUUID, "spotlight " + mp, "timemachine " + mp}
+		if !reflect.DeepEqual(f.Calls, want) {
 			t.Fatalf("calls %v, want %v", f.Calls, want)
+		}
+		if _, err := os.Stat(filepath.Join(mp, datavol.MarkerName)); err != nil {
+			t.Fatalf("an already-mounted volume was left unmarked: %v", err)
 		}
 	})
 
@@ -110,13 +116,15 @@ func TestMountRecordedIsIdempotent(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(mp, datavol.MarkerName)); err != nil {
 			t.Fatalf("the provenance marker was not written: %v", err)
 		}
-		// A second run does nothing but confirm what is mounted there.
+		// A second run re-applies the idempotent policy and nothing else: no
+		// second mount, and the marker that is already there is left alone.
 		before := len(f.Calls)
 		if err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil); err != nil {
 			t.Fatalf("MountRecorded (second): %v", err)
 		}
-		if got, want := f.Calls[before:], []string{"info " + rigUUID}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("the second run did %v, want %v", got, want)
+		again := []string{"info " + rigUUID, "spotlight " + mp, "timemachine " + mp}
+		if got := f.Calls[before:]; !reflect.DeepEqual(got, again) {
+			t.Fatalf("the second run did %v, want %v", got, again)
 		}
 	})
 
