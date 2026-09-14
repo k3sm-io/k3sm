@@ -59,8 +59,11 @@ type Volume struct {
 	Quota   uint64
 	Reserve uint64
 	InUse   uint64
-	// Encrypted, Locked and CaseSensitive are what Info reports.
-	Encrypted     bool
+	// Encrypted means the volume is passphrase-gated: Info reports it as
+	// FileVault, and Info's own Encrypted (encryption at rest) is always true,
+	// as it is for every volume on Apple silicon internal storage.
+	Encrypted bool
+	// Locked and CaseSensitive are what Info reports under those names.
 	Locked        bool
 	CaseSensitive bool
 	// FilesystemType is what Info reports, "apfs" unless a test wants a
@@ -229,8 +232,12 @@ func (f *Fake) Info(_ context.Context, target string) (datavol.Info, error) {
 		FilesystemType:     v.FilesystemType,
 		FilesystemName:     name,
 		CaseSensitive:      v.CaseSensitive,
-		Encrypted:          v.Encrypted,
-		Locked:             v.Locked,
+		// Mirrors the platform: encryption at rest is reported for every
+		// volume on Apple silicon internal storage, while FileVault is
+		// reported only for one that is actually passphrase-gated.
+		Encrypted: true,
+		FileVault: v.Encrypted,
+		Locked:    v.Locked,
 	}, nil
 }
 

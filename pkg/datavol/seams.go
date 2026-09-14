@@ -57,11 +57,20 @@ type Info struct {
 	// layers and Linux root trees routinely carry names that differ only in
 	// case, and a case-insensitive volume silently collapses them.
 	CaseSensitive bool
-	// Encrypted reports APFS encryption of any kind, including the hardware
-	// encryption an Apple Silicon Mac applies with no passphrase.
+	// Encrypted is the plist's Encryption key: encryption AT REST of any
+	// kind. It is true for EVERY volume on Apple silicon internal storage,
+	// because the SEP encrypts the whole container with a key the hardware
+	// holds; such a volume needs no passphrase, is never locked, and mounts
+	// itself at boot. It is therefore NOT the flag any decision here turns
+	// on, and the rig's own data volume reports Encryption=true with no
+	// passphrase in existence.
 	Encrypted bool
-	// FileVault reports that the encryption is FileVault, i.e. gated on a
-	// user or recovery key rather than the SEP alone.
+	// FileVault is the plist's FileVault key: encryption GATED ON A
+	// PASSPHRASE (a user key, a recovery key, or the random one k3sm stores
+	// in the System keychain). This is the property that matters to k3sm --
+	// a FileVault volume reports Locked after an unmount and cannot be
+	// mounted again until something supplies the passphrase -- so it is what
+	// the record's "encrypted" field means and what every decision uses.
 	FileVault bool
 	// Locked reports that the volume cannot be mounted until it is unlocked
 	// with its passphrase.

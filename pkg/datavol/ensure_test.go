@@ -223,6 +223,48 @@ func TestEnsureCreatesOrAdopts(t *testing.T) {
 		}
 	})
 
+	t.Run("adopting a hardware-encrypted, passphrase-less volume records encrypted=false", func(t *testing.T) {
+		f := datavoltest.New()
+		f.Fstab = "UUID=" + rigUUID + " " + testRoot + " apfs rw\n"
+		f.Add(k3smVolume(testRoot)) // no passphrase, like the rig's own volume
+
+		// The platform reports encryption at rest for every internal volume,
+		// which is exactly the trap: it says nothing about a passphrase.
+		info, err := f.Info(ctx, rigUUID)
+		if err != nil {
+			t.Fatalf("Info: %v", err)
+		}
+		if !info.Encrypted || info.FileVault {
+			t.Fatalf("Info = %+v, want Encrypted (at rest) without FileVault", info)
+		}
+
+		got, _, err := datavol.Ensure(ctx, f.Deps(), f.FS(), recordPath, base)
+		if err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		if got.Encrypted {
+			t.Fatal("the record claims a passphrase-gated volume; there is no passphrase and no keychain item")
+		}
+	})
+
+	t.Run("adopting a FileVault volume records encrypted=true", func(t *testing.T) {
+		f := datavoltest.New()
+		f.Fstab = "UUID=" + rigUUID + " " + testRoot + " apfs rw\n"
+		v := k3smVolume(testRoot)
+		v.Encrypted = true // created with a passphrase: FileVault
+		f.Add(v)
+
+		o := base
+		o.Encrypt = true
+		got, plan, err := datavol.Ensure(ctx, f.Deps(), f.FS(), recordPath, o)
+		if err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		if !plan.Adopted || !got.Encrypted {
+			t.Fatalf("Plan = %+v, record = %+v; want an adopted encrypted volume", plan, got)
+		}
+	})
+
 	t.Run("encryption over an adopted unencrypted volume is refused", func(t *testing.T) {
 		f := datavoltest.New()
 		f.Fstab = "UUID=" + rigUUID + " " + testRoot + " apfs rw\n"

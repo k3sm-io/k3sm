@@ -178,7 +178,11 @@ func adopt(ctx context.Context, deps Deps, info Info, o Options) (dataroot.Recor
 		return dataroot.Record{}, fmt.Errorf("the volume at %s is %s, and k3sm's data root must be a case-sensitive APFS volume: %w",
 			o.Mountpoint, describeFilesystem(info), ErrForeignVolume)
 	}
-	if o.Encrypt && !info.Encrypted {
+	// FileVault, not Encrypted: on Apple silicon every internal volume
+	// reports encryption at rest, so adopting on that flag would promise a
+	// passphrase gate the volume does not have, and would write a record
+	// claiming a keychain item that was never created.
+	if o.Encrypt && !info.FileVault {
 		return dataroot.Record{}, fmt.Errorf("data volume %s (%s): %w", info.VolumeName, info.VolumeUUID, ErrEncryptRequiresFresh)
 	}
 	capacity, err := deps.Volumes.Capacity(ctx, info.ContainerReference, info.VolumeUUID)
@@ -191,7 +195,7 @@ func adopt(ctx context.Context, deps Deps, info Info, o Options) (dataroot.Recor
 		Name:       info.VolumeName,
 		Mountpoint: o.Mountpoint,
 		QuotaBytes: capacity.Quota,
-		Encrypted:  info.Encrypted,
+		Encrypted:  info.FileVault,
 		CreatedBy:  o.CreatedBy,
 		CreatedAt:  now(),
 		Adopted:    true,
