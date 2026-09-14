@@ -79,12 +79,13 @@ func TestDeleteRefuses(t *testing.T) {
 		}
 	})
 
-	t.Run("a loaded daemon stops it before the unmount", func(t *testing.T) {
+	t.Run("a loaded daemon stops it before the unmount, on the live data root", func(t *testing.T) {
 		for _, label := range []string{netdLabel, serverLabel} {
 			rec, recPath, fstabPath, f := deleteRig(t, false)
 			f.LoadedLabels[label] = true
 			err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{
 				Yes: true, FstabPath: fstabPath, NetdLabel: netdLabel, ServerLabel: serverLabel,
+				ProtectedMountpoint: rec.Mountpoint,
 			})
 			if !errors.Is(err, datavol.ErrDaemonsLoaded) {
 				t.Fatalf("Delete with %s loaded = %v, want ErrDaemonsLoaded", label, err)
@@ -95,6 +96,24 @@ func TestDeleteRefuses(t *testing.T) {
 			if len(f.Calls) != 0 {
 				t.Fatalf("Delete acted with %s loaded: %v", label, f.Calls)
 			}
+		}
+	})
+
+	t.Run("the live data root is recognised through the /private symlink", func(t *testing.T) {
+		rec, recPath, fstabPath, f := deleteRig(t, false)
+		f.LoadedLabels[netdLabel] = true
+		// The mount point reached through a symlinked parent is the same
+		// directory, the way /var/lib/k3sm and /private/var/lib/k3sm are.
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(filepath.Dir(rec.Mountpoint), link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{
+			Yes: true, FstabPath: fstabPath, NetdLabel: netdLabel, ServerLabel: serverLabel,
+			ProtectedMountpoint: filepath.Join(link, filepath.Base(rec.Mountpoint)),
+		})
+		if !errors.Is(err, datavol.ErrDaemonsLoaded) {
+			t.Fatalf("Delete = %v, want ErrDaemonsLoaded through the symlinked spelling", err)
 		}
 	})
 
@@ -154,6 +173,7 @@ func TestDeleteSequence(t *testing.T) {
 
 		if err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{
 			Yes: true, FstabPath: fstabPath, NetdLabel: netdLabel, ServerLabel: serverLabel,
+			ProtectedMountpoint: rec.Mountpoint,
 		}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
@@ -184,6 +204,22 @@ func TestDeleteSequence(t *testing.T) {
 		}
 		if _, err := os.Stat(rec.Mountpoint); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("the empty mount point survived: %v", err)
+		}
+	})
+
+	t.Run("a scratch volume elsewhere is deletable while the daemons run", func(t *testing.T) {
+		rec, recPath, fstabPath, f := deleteRig(t, false)
+		f.LoadedLabels[netdLabel] = true
+		f.LoadedLabels[serverLabel] = true
+
+		if err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{
+			Yes: true, FstabPath: fstabPath, NetdLabel: netdLabel, ServerLabel: serverLabel,
+			ProtectedMountpoint: "/var/lib/k3sm",
+		}); err != nil {
+			t.Fatalf("Delete of a scratch volume: %v", err)
+		}
+		if _, ok := f.Vols[rigUUID]; ok {
+			t.Fatal("the scratch volume survived")
 		}
 	})
 

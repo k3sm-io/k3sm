@@ -44,14 +44,21 @@ type DeleteOptions struct {
 	// running. An empty label is not checked.
 	NetdLabel   string
 	ServerLabel string
+	// ProtectedMountpoint is the LIVE data root, /var/lib/k3sm. The
+	// daemons-loaded refusal applies only to a record for THAT mount point:
+	// the daemons hold the live data root open and nothing else, so a scratch
+	// volume mounted elsewhere is deletable while the cluster runs. Empty
+	// disables the check entirely.
+	ProtectedMountpoint string
 }
 
 var (
 	// ErrConfirmRequired is returned when Delete was called without Yes.
 	ErrConfirmRequired = errors.New("deleting the data volume destroys every cluster object, image and volume on it and needs an explicit confirmation")
-	// ErrDaemonsLoaded is returned while netd or the server is still loaded.
-	// Unmounting under a running control plane is how a datastore gets
-	// truncated.
+	// ErrDaemonsLoaded is returned while netd or the server is still loaded
+	// and the volume being deleted is the live data root. Unmounting THAT one
+	// under a running control plane is how a datastore gets truncated; a
+	// scratch volume elsewhere is nobody's business but the operator's.
 	ErrDaemonsLoaded = errors.New("the k3sm daemons are still loaded")
 	// ErrImplausibleMountpoint is returned for a mount point no k3sm data
 	// volume could be at. It is the guard against a corrupted or
@@ -62,8 +69,9 @@ var (
 // Delete destroys the data volume rec describes and every declaration of it.
 //
 // It is deliberately hard to reach: it refuses without an explicit
-// confirmation, it refuses while either daemon is loaded, and it refuses a
-// mount point that could not be a k3sm data root. What it removes, in order,
+// confirmation, it refuses while either daemon is loaded AND the record names
+// the live data root (o.ProtectedMountpoint), and it refuses a mount point
+// that could not be a k3sm data root. What it removes, in order,
 // is the mount, the volume, the keychain item, the fstab line, the record and
 // an empty mount point. It never touches the .pre-volume copy of a migrated
 // data root -- that is the operator's rollback and only the operator deletes
@@ -75,10 +83,10 @@ func Delete(ctx context.Context, deps Deps, fsys dataroot.FS, ld Launchd, record
 	if !o.Yes {
 		return fmt.Errorf("data volume %s (%s) at %s: %w", rec.Name, rec.UUID, rec.Mountpoint, ErrConfirmRequired)
 	}
-	if ld != nil {
+	if ld != nil && o.ProtectedMountpoint != "" && samePath(rec.Mountpoint, o.ProtectedMountpoint) {
 		for _, label := range []string{o.NetdLabel, o.ServerLabel} {
 			if label != "" && ld.Loaded(label) {
-				return fmt.Errorf("%s is loaded: %w — run `sudo k3sm uninstall` first", label, ErrDaemonsLoaded)
+				return fmt.Errorf("%s is loaded and %s is the live data root: %w — run `sudo k3sm uninstall` first", label, rec.Mountpoint, ErrDaemonsLoaded)
 			}
 		}
 	}

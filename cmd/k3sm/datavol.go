@@ -288,10 +288,15 @@ func runDatavolDelete(args []string) error {
 		return fmt.Errorf("no data volume is recorded at %s; there is nothing to delete", *record)
 	}
 	opts := datavol.DeleteOptions{
-		Yes:         *yes,
-		FstabPath:   dataroot.FstabPath,
-		NetdLabel:   install.NetdLabel,
-		ServerLabel: install.ServerLabel,
+		Yes:       *yes,
+		FstabPath: dataroot.FstabPath,
+		// The running-daemons refusal guards the LIVE data root, which is the
+		// only volume netd and the server hold open. A scratch volume
+		// recorded elsewhere (the acceptance gate's, an operator's) is
+		// deletable without stopping the cluster.
+		NetdLabel:           install.NetdLabel,
+		ServerLabel:         install.ServerLabel,
+		ProtectedMountpoint: install.DefaultDataRoot,
 	}
 	if err := datavol.Delete(context.Background(), datavol.NewDarwin(), dataroot.OSFS{}, datavolLaunchd{}, *record, *rec, opts); err != nil {
 		return err
