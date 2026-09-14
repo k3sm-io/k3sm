@@ -43,16 +43,27 @@ type FS interface {
 type State struct {
 	// Exists reports whether the directory itself is present.
 	Exists bool
-	// DeclaredMount reports an /etc/fstab line whose mount-point field is
-	// exactly this directory. A subdirectory of a declared root is not declared.
+	// DeclaredMount reports that this directory is declared a mount point by
+	// at least one of the two sources in DeclaredBy. A subdirectory of a
+	// declared root is not declared.
 	DeclaredMount bool
+	// DeclaredBy names the sources that declared it, in a stable order:
+	// "fstab" for an /etc/fstab line whose mount-point field is exactly this
+	// directory, "record" for a k3sm data-volume record naming it. Status
+	// only — DeclaredMount is what decides.
+	DeclaredBy []string
+	// Volume is the k3sm data-volume record that declares THIS directory, nil
+	// when none does (no record, an unreadable one, or one describing another
+	// directory). Status only.
+	Volume *Record
 	// Mounted reports that a filesystem is mounted ON this directory (as
 	// opposed to the directory merely residing on some other filesystem).
 	Mounted bool
 	// FSType is the mounted filesystem's type (e.g. "apfs"). Status only.
 	FSType string
-	// VolumeName is the last path element of the mounted device/volume.
-	// Status only.
+	// VolumeName is the basename of the mounted device node (e.g. "disk3s7"),
+	// which is what statfs(2) reports; it is NOT the APFS volume label. The
+	// label lives in Volume.Name when a record declares this root. Status only.
 	VolumeName string
 	// OwnerUID is the directory's owning uid, 0 when unknown.
 	OwnerUID int
@@ -64,30 +75,33 @@ type State struct {
 }
 
 // Shadowed reports the one posture the daemons must refuse: the data root is
-// declared in /etc/fstab as a mount point but nothing is mounted there, so any
-// write lands on the boot disk and hides the real volume's contents.
+// declared a mount point but nothing is mounted there, so any write lands on
+// the boot disk and hides the real volume's contents.
 func (s State) Shadowed() bool { return s.DeclaredMount && !s.Mounted }
 
 // ErrNotMounted is the sentinel every shadow refusal wraps. Match it with
 // errors.Is, never by string.
-var ErrNotMounted = errors.New("data root is declared in /etc/fstab but not mounted")
+var ErrNotMounted = errors.New("data root is declared as a mount point but not mounted")
 
 // Refusal returns the error a daemon exits with when dir is shadowed: the
 // sentinel plus the operator action that clears it.
 func Refusal(dir string) error {
-	return fmt.Errorf("data root %s: %w — mount it (sudo diskutil mount -mountPoint %s <volume>) then restart io.k3sm.netd and io.k3sm.server", dir, ErrNotMounted, dir)
+	return fmt.Errorf("data root %s: %w — run `sudo k3sm datavol mount`, then restart io.k3sm.netd and io.k3sm.server", dir, ErrNotMounted)
 }
 
 // Read reports the posture of dir.
 //
 // dir is ALWAYS the data root itself (/var/lib/k3sm), never a subdirectory: the
-// mount-point comparisons against /etc/fstab and against statfs(2) are exact, so
-// passing <root>/run reports DeclaredMount=false and Mounted=false and the
-// shadow verdict silently disappears.
+// mount-point comparisons against the declarations and against statfs(2) are
+// exact, so passing <root>/run reports DeclaredMount=false and Mounted=false
+// and the shadow verdict silently disappears.
 //
 // A missing dir is not an error (Exists=false) — that is the ordinary
-// first-install posture. Nor is a missing or unreadable /etc/fstab
-// (DeclaredMount=false): no declaration means no volume was promised.
+// first-install posture. Nor is a missing or unreadable /etc/fstab, nor a
+// missing or unreadable record (DeclaredMount=false from that source): no
+// declaration means no volume was promised. An unreadable record is
+// deliberately NOT fatal here because the fstab line is the second
+// declaration; the authoring paths in pkg/datavol do treat it as fatal.
 func Read(fsys FS, dir string) (State, error) {
 	dir = filepath.Clean(dir)
 	var s State
@@ -95,11 +109,16 @@ func Read(fsys FS, dir string) (State, error) {
 	if data, err := fsys.ReadFile(FstabPath); err == nil {
 		for _, e := range parseFstab(data) {
 			if filepath.Clean(e.Dir) == dir {
-				s.DeclaredMount = true
+				s.DeclaredBy = append(s.DeclaredBy, "fstab")
 				break
 			}
 		}
 	}
+	if rec, err := ReadRecord(fsys, DefaultRecordPath); err == nil && rec != nil && samePath(rec.Mountpoint, dir) {
+		s.DeclaredBy = append(s.DeclaredBy, "record")
+		s.Volume = rec
+	}
+	s.DeclaredMount = len(s.DeclaredBy) > 0
 
 	fi, err := fsys.Stat(dir)
 	if err != nil {
@@ -174,4 +193,29 @@ func mountedByDevice(fsys FS, fi fs.FileInfo, dir string) bool {
 		return false
 	}
 	return pst.Dev != st.Dev
+}
+
+// samePath reports whether two paths name the same directory. It compares the
+// lexically cleaned forms first, then the symlink-resolved forms when BOTH
+// resolve, so a record written as /private/var/lib/k3sm matches a data root
+// spelt /var/lib/k3sm — the /var symlink class that produced the 2026-09-05
+// "not mounted" verdict about a healthy Mac.
+//
+// The resolution deliberately touches the real filesystem rather than the FS
+// seam: there is no symlink operation on that interface, and a path that does
+// not resolve simply falls back to the lexical compare.
+func samePath(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if a == b {
+		return true
+	}
+	ra, erra := filepath.EvalSymlinks(a)
+	if erra != nil {
+		return false
+	}
+	rb, errb := filepath.EvalSymlinks(b)
+	if errb != nil {
+		return false
+	}
+	return filepath.Clean(ra) == filepath.Clean(rb)
 }
