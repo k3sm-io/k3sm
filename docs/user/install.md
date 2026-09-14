@@ -11,6 +11,10 @@ daemons that everything after it runs under:
 sudo k3sm install
 ```
 
+The install script cannot pass extra flags, so if you want the data root on its own size-capped
+APFS volume, run `sudo k3sm install --data-volume` after the script, or in place of it if you
+already have the binary. See [The Data Volume](storage.md#the-data-volume).
+
 That step:
 
 - creates the dedicated unprivileged **`_k3sm`** user,
@@ -82,7 +86,9 @@ It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes th
 `/usr/local/bin/k3sm` launcher, but only that link, and only while it still points at
 `/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
 left exactly as it is. Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
-reinstall picks up where you left off.
+reinstall picks up where you left off. If you installed a data volume, it stays mounted and
+declared; the command prints `sudo k3sm install --data-volume` to reinstall onto it and `sudo k3sm
+datavol delete --yes` to remove it for good.
 
 ## Verifying
 

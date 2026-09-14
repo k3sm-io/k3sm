@@ -8,6 +8,30 @@ dropped and its subsections promoted one level. The
 [releases page](https://k3sm.io/releases/) lists every published build with the version to
 pin, its date, and the tarball's sha256.
 
+## Unreleased
+
+### Added
+
+- **`k3sm install --data-volume`.** Puts the data root on a dedicated, size-capped APFS volume
+  instead of a plain directory on the boot disk. It creates a case-sensitive volume in the boot
+  container (or adopts one you already declared in `/etc/fstab`), mounts it at `/var/lib/k3sm`
+  hidden from Finder, Spotlight and Time Machine, and migrates any existing data root onto it,
+  verifying the copy before the old tree is renamed aside. `--data-volume-size` sets the quota
+  (100 GiB by default, a floor of 32 GiB), and `--data-volume-encrypt` protects it with a random
+  passphrase kept in the System keychain.
+- **`k3sm datavol mount|status|delete`.** `mount` is what the new `io.k3sm.datavol` LaunchDaemon
+  runs at boot and is safe to run by hand; `status` reports the volume, its quota, its usage and
+  any leftover pre-migration copy with no privilege needed; `delete --yes` destroys the volume and
+  every declaration of it.
+- **`k3sm status` reports the data volume.** The data-root row names the volume, its quota and its
+  usage, and warns once usage passes 90% of the quota. A new `datavol` row tracks the boot mount
+  daemon, and a `pre-volume` row appears while a migration's pre-migration copy is still on disk.
+
+### Changed
+
+- The data-root refusal message now names `sudo k3sm datavol mount` as the remedy for a declared
+  but unmounted data root.
+
 ## v0.1.4 — 2026-09-06
 
 One command that says what is running, and daemons that refuse to write into an unmounted data
