@@ -18,8 +18,9 @@ limitations under the License.
 // on: creating it, adopting one that already exists, migrating a plain data
 // root onto it, mounting it at boot, and deleting it.
 //
-// It is the ONE home of every diskutil, security, mdutil and tmutil command
-// line k3sm runs. Nothing else in the tree shells out to those tools, so the
+// It is the ONE home of every diskutil, security and mdutil command line k3sm
+// runs, and of the two extended-attribute and marker-file mechanisms that
+// stand in for tmutil. Nothing else in the tree shells out to those tools, so the
 // argv of a privileged command is reviewable in one file (darwin.go) and
 // fakeable at one seam (the Volumes, Keychain and Indexing interfaces in
 // seams.go, with datavoltest.Fake as the single exported double).
@@ -45,6 +46,19 @@ limitations under the License.
 // capacity, which was untrue while k3sm set no quota. Resizing means creating
 // a new volume and copying; that is a documented operator procedure, not an
 // operation here.
+//
+// # Keeping the data root out of Spotlight and Time Machine
+//
+// Neither exclusion goes through the obvious tool, because on a nobrowse
+// volume neither tool works. Spotlight is turned off by writing an empty
+// .metadata_never_index at the volume root, which every volume honours,
+// because Spotlight does not track a nobrowse volume at all and `mdutil -i
+// off` therefore fails with "unknown indexing state" (mdutil is still run
+// afterwards, and that one answer is treated as success). Time Machine is
+// excluded by setting the com.apple.metadata:com_apple_backup_excludeItem
+// extended attribute directly -- the same thing `tmutil addexclusion` writes
+// -- because tmutil itself is gated behind Full Disk Access and exits 80 even
+// as root, so it cannot be called from a LaunchDaemon.
 //
 // # Passphrases
 //

@@ -219,9 +219,10 @@ func walkTree(root string) (treeSummary, error) {
 		if err != nil {
 			return err
 		}
-		if rel == MarkerName {
-			// The marker is written by k3sm on the destination, never
-			// present on the source; it is not part of the copy.
+		if isVolumeMarker(rel) {
+			// k3sm's own markers are written on the destination volume and
+			// are never part of the copy, so counting them would make every
+			// verification report one extra file.
 			return nil
 		}
 		fi, err := d.Info()
@@ -306,4 +307,12 @@ func hashFile(path string) (string, error) {
 		return "", fmt.Errorf("read %s: %w", path, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// isVolumeMarker reports whether a path relative to a tree root is one of the
+// files k3sm itself puts at the root of a volume it owns: the provenance
+// marker MountRecorded writes, and the Spotlight opt-out SpotlightOff writes
+// before anything is copied onto a staging mount.
+func isVolumeMarker(rel string) bool {
+	return rel == MarkerName || rel == spotlightMarkerName
 }

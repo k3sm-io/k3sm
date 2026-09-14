@@ -20,9 +20,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // systemKeychain is the keychain an encrypted data volume's passphrase lives
@@ -36,6 +40,17 @@ const keychainAccount = "k3sm"
 
 // keychainLabel is what the item shows as in Keychain Access.
 const keychainLabel = "k3sm data volume"
+
+// spotlightMarkerName is the file whose presence at the root of a volume tells
+// Spotlight never to index it.
+const spotlightMarkerName = ".metadata_never_index"
+
+// timeMachineExcludeAttr and timeMachineExcludeValue are the extended
+// attribute Time Machine reads to skip a path, and the value tmutil writes.
+const (
+	timeMachineExcludeAttr  = "com.apple.metadata:com_apple_backup_excludeItem"
+	timeMachineExcludeValue = "com.apple.backupd"
+)
 
 // Darwin is the production implementation of all three seams: it runs the real
 // diskutil, security, mdutil and tmutil. Its zero value is usable.
@@ -182,17 +197,44 @@ func (Darwin) Delete(ctx context.Context, uuid string) error {
 }
 
 // SpotlightOff implements Indexing.
+//
+// The marker file is the primary mechanism, not a belt-and-braces addition:
+// Spotlight does not track a nobrowse volume at all, so `mdutil -i off` on a
+// freshly mounted k3sm data volume exits 1 with "Error: unknown indexing
+// state." every time, whoever runs it. (A hand-configured volume answers
+// "Indexing disabled" only because it was set while browsable.) An empty
+// .metadata_never_index at the root of a volume is honoured on every volume
+// regardless, so it is what actually holds.
+//
+// mdutil still runs afterwards, because a volume that later becomes browsable
+// should carry the explicit setting too. Its "unknown indexing state" is the
+// expected answer described above and counts as success; any other failure is
+// returned, and the caller logs it without failing the mount.
 func (Darwin) SpotlightOff(ctx context.Context, mountpoint string) error {
+	marker := filepath.Join(mountpoint, spotlightMarkerName)
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", marker, err)
+	}
 	if _, err := run(ctx, "", "mdutil", "-i", "off", mountpoint); err != nil {
+		if strings.Contains(err.Error(), "unknown indexing state") {
+			return nil
+		}
 		return fmt.Errorf("mdutil -i off %s: %w", mountpoint, err)
 	}
 	return nil
 }
 
 // TimeMachineExclude implements Indexing.
-func (Darwin) TimeMachineExclude(ctx context.Context, mountpoint string) error {
-	if _, err := run(ctx, "", "tmutil", "addexclusion", "-p", mountpoint); err != nil {
-		return fmt.Errorf("tmutil addexclusion %s: %w", mountpoint, err)
+//
+// This sets the extended attribute directly rather than running tmutil:
+// `tmutil addexclusion` is TCC-gated behind Full Disk Access and exits 80
+// ("requires Full Disk Access privileges") even as root, so it is unusable
+// from a LaunchDaemon. The xattr below is exactly what a non-`-p`
+// `tmutil addexclusion` writes, and setting it makes `tmutil isexcluded`
+// report [Excluded] with no TCC involvement.
+func (Darwin) TimeMachineExclude(_ context.Context, mountpoint string) error {
+	if err := unix.Setxattr(mountpoint, timeMachineExcludeAttr, []byte(timeMachineExcludeValue), 0); err != nil {
+		return fmt.Errorf("set %s on %s: %w", timeMachineExcludeAttr, mountpoint, err)
 	}
 	return nil
 }

@@ -66,6 +66,20 @@ func (m mutatingSys) CopyTree(src, dst string) error {
 	return nil
 }
 
+// markingIndexing is a Fake whose SpotlightOff really writes the opt-out
+// marker, the way the production Darwin implementation does. It exists to pin
+// that the verification walk does not count k3sm's own markers: they land on
+// the staging mount BEFORE the copy, so counting them would fail every
+// migration.
+type markingIndexing struct{ *datavoltest.Fake }
+
+func (m markingIndexing) SpotlightOff(ctx context.Context, mountpoint string) error {
+	if err := m.Fake.SpotlightOff(ctx, mountpoint); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(mountpoint, ".metadata_never_index"), nil, 0o644)
+}
+
 // stagedVolume registers an unmounted volume and returns its record.
 func stagedVolume(f *datavoltest.Fake, mountpoint string) dataroot.Record {
 	f.Add(datavoltest.Volume{UUID: rigUUID, Name: "k3sm", Container: "disk3", CaseSensitive: true, Quota: 100 << 30})
@@ -106,6 +120,26 @@ func TestMigrateFailsSafe(t *testing.T) {
 			if f.Calls[i] != w {
 				t.Fatalf("calls %v, want %v first", f.Calls, want)
 			}
+		}
+	})
+
+	t.Run("the markers k3sm writes on the staging mount are not counted", func(t *testing.T) {
+		f := datavoltest.New()
+		root := plainDataRoot(t)
+		staging := t.TempDir()
+		rec := stagedVolume(f, root)
+		deps := f.Deps()
+		deps.Indexing = markingIndexing{Fake: f}
+
+		stats, err := datavol.Migrate(ctx, deps, f.FS(), f, rec, root, staging, datavol.MigrateOptions{})
+		if err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		if stats.Files != 3 {
+			t.Fatalf("Files = %d, want 3 (the Spotlight marker is k3sm's, not the operator's data)", stats.Files)
+		}
+		if _, err := os.Stat(filepath.Join(staging, ".metadata_never_index")); err != nil {
+			t.Fatalf("the Spotlight marker was not written before the copy: %v", err)
 		}
 	})
 
