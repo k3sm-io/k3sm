@@ -386,7 +386,10 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 	if [ "$l4" = ok ]; then
 		sudo security find-generic-password -s "$UUID_E" /Library/Keychains/System.keychain >/dev/null 2>&1 || { echo "    no System-keychain item for $UUID_E"; l4=no; }
 		sudo diskutil unmount "$MP_E" >/dev/null 2>&1 || { echo "    could not unmount $MP_E"; l4=no; }
-		sudo diskutil apfs lockVolume "$UUID_E" >/dev/null 2>&1 || { echo "    could not lock $UUID_E"; l4=no; }
+		# Unmounting an encrypted APFS volume locks it on macOS 26 (proven on the
+		# rig: lockVolume afterwards answers "already locked" and exits 1), so the
+		# explicit lock is best-effort and the Locked= read below is the assertion.
+		sudo diskutil apfs lockVolume "$UUID_E" >/dev/null 2>&1 || true
 		locked="$(diskutil info -plist "$UUID_E" | plutil -extract Locked raw -o - - 2>/dev/null || true)"
 		[ "$locked" = "true" ] || { echo "    Locked=$locked after apfs lockVolume"; l4=no; }
 		sudo "$K3SM_BIN" datavol mount --record "$REC_E" || { echo "    k3sm datavol mount did not unlock and mount $UUID_E"; l4=no; }
