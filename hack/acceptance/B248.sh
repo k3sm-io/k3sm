@@ -150,10 +150,12 @@ run_test "b248.4" 6 TestInstallWithDataVolumeSequencing ./pkg/install/ "$K3SM_RO
 run_test "b248.4" 0 TestDatavolPlist ./pkg/install/ "$K3SM_ROOT" 1
 
 # ---- b248.5 — pkg/status and the CLI ---------------------------------------
-run_test "b248.5" 7 TestDataRootRowNamesVolume ./pkg/status/ "$K3SM_ROOT" 1
+run_test "b248.5" 9 TestDataRootRowNamesVolume ./pkg/status/ "$K3SM_ROOT" 1
+run_test "b248.5" 4 TestInstallRowCountsDatavolPlist ./pkg/status/ "$K3SM_ROOT" 1
 run_test "b248.5" 5 TestOneshotRow ./pkg/status/ "$K3SM_ROOT" 1
 run_test "b248.5" 6 TestInstallFlagsDataVolume ./cmd/k3sm/ "$K3SM_ROOT" 1
 run_test "b248.5" 3 TestDatavolStatusJSONShape ./cmd/k3sm/ "$K3SM_ROOT" 1
+run_test "b248.5" 4 TestDatavolStatusUsedSource ./cmd/k3sm/ "$K3SM_ROOT" 1
 
 # ---- b248.6 — the packages are formatted and vet-clean ---------------------
 DATAVOL_PKGS="./pkg/dataroot/... ./pkg/datavol/... ./pkg/install/... ./pkg/status/... ./cmd/k3sm/... ./hack/acceptance/b248helper/..."
