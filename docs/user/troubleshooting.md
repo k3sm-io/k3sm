@@ -19,7 +19,7 @@ k3sm running: 1/1 nodes ready                               v0.1.1 · kube v1.36
     apiserver   ready       https://127.0.0.1:6444 readyz ok
     node        ready       1/1 nodes ready · my-mac kubelet v1.36.2
     workloads   ok          3 running
-    data-root   ok          /var/lib/k3sm (apfs volume k3sm, mounted)
+    data-root   ok          /var/lib/k3sm (apfs volume k3sm, 29.9G of 100G used, mounted)
     datastore   ok          kine sqlite, wal, user_version 1
     kubeconfig  ok          ~/.kube/config context "k3sm"
 
@@ -39,7 +39,7 @@ k3sm stopped: io.k3sm.server is crash-looping (12 runs, last exit 1)  v0.1.1 · 
     apiserver   down        https://127.0.0.1:6444: connection refused
     node        unknown     apiserver unreachable
     workloads   unknown     apiserver unreachable
-    data-root   ok          /var/lib/k3sm (apfs volume k3sm, mounted)
+    data-root   ok          /var/lib/k3sm (apfs volume k3sm, 29.9G of 100G used, mounted)
     datastore   ok          kine sqlite, wal, user_version 1
     kubeconfig  ok          ~/.kube/config context "k3sm"
 
@@ -87,7 +87,7 @@ Install links `/usr/local/bin/k3sm` → `/Library/k3sm/k3sm`. If the shell canno
 ```sh
 ls -l /usr/local/bin/k3sm     # should be a symlink into /Library/k3sm
 echo $PATH                    # should contain /usr/local/bin
-/Library/k3sm/k3sm version    # always works — the binary itself
+/Library/k3sm/k3sm version    # always works, the binary itself
 ```
 
 - **The link is there but the shell does not see it.** A terminal opened *before* the install may
@@ -141,11 +141,22 @@ See [kubectl access](kubectl-access.md) for the full resolution order.
 
 ### The Data Root Is Declared But Not Mounted
 
-If you keep `/var/lib/k3sm` on its own APFS volume, that volume is declared in `/etc/fstab` and must
-be mounted **before** the daemons start. When it is not, writes land on the boot disk in the bare
-mountpoint and shadow the real volume, which looks exactly like an empty cluster. `k3sm status`
-reports the data root as `not-mounted` and the verdict as `stopped`, because the daemons refuse to
-run against an unmounted mountpoint rather than build a second, empty datastore on top of your data.
+If you keep `/var/lib/k3sm` on its own APFS volume, declared either in `/etc/fstab` or by `sudo k3sm
+install --data-volume`, that volume must be mounted **before** the daemons start. When it is not,
+writes land on the boot disk in the bare mountpoint and shadow the real volume, which looks exactly
+like an empty cluster. `k3sm status` reports the data root as `not-mounted` and the verdict as
+`stopped`, because the daemons refuse to run against an unmounted mountpoint rather than build a
+second, empty datastore on top of your data.
+
+```sh
+sudo k3sm datavol mount
+sudo launchctl kickstart -k system/io.k3sm.netd
+sudo launchctl kickstart -k system/io.k3sm.server
+```
+
+If the volume was never declared with a k3sm record (an `/etc/fstab` line you wrote yourself, with
+no `sudo k3sm install --data-volume` run since), `datavol mount` has nothing to work from and you
+mount it by hand instead:
 
 ```sh
 diskutil info /var/lib/k3sm                     # the Device Node line names the volume

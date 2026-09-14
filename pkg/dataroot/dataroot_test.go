@@ -58,6 +58,7 @@ type fakeMount struct{ on, fstype, from string }
 // for real (a declared-but-unmounted APFS volume, a root-owned data root).
 type fakeFS struct {
 	fstab   string // "" means /etc/fstab is absent
+	record  string // "" means the data-volume record is absent
 	stat    map[string]fakeInfo
 	statfs  map[string]fakeMount
 	entries map[string][]string
@@ -82,10 +83,13 @@ func (f fakeFS) Statfs(path string, st *unix.Statfs_t) error {
 }
 
 func (f fakeFS) ReadFile(path string) ([]byte, error) {
-	if path != FstabPath || f.fstab == "" {
-		return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	switch {
+	case path == FstabPath && f.fstab != "":
+		return []byte(f.fstab), nil
+	case path == DefaultRecordPath && f.record != "":
+		return []byte(f.record), nil
 	}
-	return []byte(f.fstab), nil
+	return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
 }
 
 func (f fakeFS) ReadDir(path string) ([]fs.DirEntry, error) {
@@ -127,7 +131,7 @@ func TestRead(t *testing.T) {
 			},
 			dir: testRoot,
 			want: State{
-				Exists: true, DeclaredMount: true, Mounted: true,
+				Exists: true, DeclaredMount: true, DeclaredBy: []string{"fstab"}, Mounted: true,
 				FSType: "apfs", VolumeName: "disk3s7",
 				OwnerUID: 250, OwnerWritable: true,
 			},
@@ -144,7 +148,7 @@ func TestRead(t *testing.T) {
 			},
 			dir: testRoot,
 			want: State{
-				Exists: true, DeclaredMount: true, Mounted: true,
+				Exists: true, DeclaredMount: true, DeclaredBy: []string{"fstab"}, Mounted: true,
 				FSType: "apfs", VolumeName: "disk3s7",
 				OwnerUID: 250, OwnerWritable: true,
 			},
@@ -162,7 +166,7 @@ func TestRead(t *testing.T) {
 			},
 			dir: testRoot,
 			want: State{
-				Exists: true, DeclaredMount: true, Mounted: false,
+				Exists: true, DeclaredMount: true, DeclaredBy: []string{"fstab"}, Mounted: false,
 				OwnerUID: 0, OwnerWritable: true, ShadowEntries: []string{"run"},
 			},
 		},
@@ -176,7 +180,7 @@ func TestRead(t *testing.T) {
 			},
 			dir: testRoot,
 			want: State{
-				Exists: true, DeclaredMount: true, Mounted: false,
+				Exists: true, DeclaredMount: true, DeclaredBy: []string{"fstab"}, Mounted: false,
 				OwnerUID: 0, OwnerWritable: true,
 				ShadowEntries: []string{"run", "server"},
 			},
@@ -202,7 +206,7 @@ func TestRead(t *testing.T) {
 			name: "absent directory is not an error",
 			fsys: fakeFS{fstab: declared},
 			dir:  testRoot,
-			want: State{Exists: false, DeclaredMount: true},
+			want: State{Exists: false, DeclaredMount: true, DeclaredBy: []string{"fstab"}},
 		},
 		{
 			name: "no fstab means nothing was declared",
@@ -223,7 +227,7 @@ func TestRead(t *testing.T) {
 			},
 			dir: testRoot,
 			want: State{
-				Exists: true, DeclaredMount: true, Mounted: true,
+				Exists: true, DeclaredMount: true, DeclaredBy: []string{"fstab"}, Mounted: true,
 				FSType: "apfs", VolumeName: "disk3s7",
 				OwnerUID: 250, OwnerWritable: true,
 			},
@@ -263,7 +267,7 @@ func TestRefusalWrapsErrNotMounted(t *testing.T) {
 	if !errors.Is(err, ErrNotMounted) {
 		t.Fatalf("Refusal does not wrap ErrNotMounted: %v", err)
 	}
-	for _, want := range []string{testRoot, "diskutil mount", "io.k3sm.server"} {
+	for _, want := range []string{testRoot, "datavol mount", "io.k3sm.server"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("Refusal message lost %q: %v", want, err)
 		}

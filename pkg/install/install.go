@@ -47,6 +47,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -59,6 +60,11 @@ const (
 	NetdLabel = "io.k3sm.netd"
 	// ServerLabel is the control-plane LaunchDaemon (UserName=_k3sm).
 	ServerLabel = "io.k3sm.server"
+	// DatavolLabel is the data-volume mount LaunchDaemon. It is root, it is a
+	// ONESHOT (`k3sm datavol mount` mounts and exits), and it exists because
+	// launchd offers no ordering: netd and the server would otherwise race disk
+	// arbitration for the volume their data root lives on. See DatavolPlist.
+	DatavolLabel = "io.k3sm.datavol"
 )
 
 // Default install locations.
@@ -69,6 +75,12 @@ const (
 	// DefaultInstallDir is the root-owned (root:wheel 0755) directory the binary
 	// and supporting files are copied into.
 	DefaultInstallDir = "/Library/k3sm"
+	// DatavolStagingDir is the mount point Install stages a data-root migration
+	// on: the new volume is mounted HERE, filled, and verified before anything
+	// at the real data root is touched. It lives under the install dir because
+	// that tree is already root-owned, already swept by uninstall, and is never
+	// the volume being migrated onto.
+	DatavolStagingDir = DefaultInstallDir + "/" + datavolStagingName
 	// DefaultLinkDir is the directory the installer lays the `k3sm` launcher
 	// SYMLINK into, pointing back at installedBinary(). It exists because
 	// nothing about copying the binary into DefaultInstallDir puts `k3sm` on a
@@ -169,6 +181,11 @@ const (
 	ContainerLogDirGID  int         = 0
 )
 
+// datavolStagingName is the leaf name of the migration staging mount point. It
+// is stated once and joined onto whichever install dir a Config names, so
+// DatavolStagingDir and Config.datavolStaging can never spell it differently.
+const datavolStagingName = "datavol-staging"
+
 // ServerLogPath returns the control-plane daemon's combined stdout/stderr log path.
 // The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
 // message) name it, so the two can never drift apart.
@@ -178,6 +195,12 @@ func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
 // The netd plist points at it, so — like ServerLogPath — the plist and any
 // diagnostic that names the file cannot drift apart.
 func NetdLogPath() string { return filepath.Join(LogDir, "netd.log") }
+
+// DatavolLogPath returns the data-volume mount daemon's combined stdout/stderr
+// log path. The datavol plist points at it and `k3sm status` names the file on
+// the datavol row, so — like NetdLogPath — the plist and the diagnostic that
+// names it cannot drift apart.
+func DatavolLogPath() string { return filepath.Join(LogDir, "datavol.log") }
 
 // refuseShadowedDataRoot returns dataroot.Refusal when dir is declared in
 // /etc/fstab as a mount point but nothing is mounted there. Installing into that
@@ -319,6 +342,46 @@ type System interface {
 	// directory left root-owned by an earlier build is repaired rather than
 	// silently keeping every vm pod unbootable. See VMRunDir.
 	EnsureVMRunDir(dir string, uid uint32) error
+	// EnsureRootDir creates dir root-owned at mode (idempotent, re-applying the
+	// mode on an existing directory). It is the seam the data-volume migration
+	// carves its staging mount point with: unlike the Ensure*Dir methods above
+	// it hands the directory to NOBODY — a staging mount point is root's for the
+	// minutes the copy takes, and the volume's own ownership is applied at the
+	// real mount point afterwards.
+	EnsureRootDir(dir string, mode fs.FileMode) error
+	// CopyTree copies the whole tree at src into dst preserving ownership,
+	// modes, extended attributes and ACLs (ditto). It is the data-root
+	// migration's copy: APFS cloning cannot cross a volume boundary, so this is
+	// always a full byte copy, and every attribute it preserves is one the
+	// migration's verification then compares.
+	CopyTree(src, dst string) error
+	// Rename moves old to new within one filesystem. The migration uses it for
+	// the one irreversible-looking step that is in fact the safe one: the old
+	// data root is RENAMED aside to <dir>.pre-volume, never deleted in place.
+	Rename(old, new string) error
+	// RemoveTree deletes path and everything under it. It is deliberately
+	// separate from RemoveAll, which uninstall drives through its own
+	// unsafe-path guard: this one is reached only by the data-volume paths (the
+	// emptied staging mount point, and the .pre-volume copy under
+	// --remove-old-data-root), so a future change to either caller's guarding
+	// cannot silently widen the other's.
+	RemoveTree(path string) error
+	// LookupServiceUID resolves the named service account's uid, reporting
+	// false when the account does not exist yet. It is three-valued in
+	// practice: install may run BEFORE EnsureServiceUser has created _k3sm, and
+	// a data volume mounted at that moment is left to root rather than chowned
+	// to a uid nobody has been assigned.
+	LookupServiceUID(name string) (int, bool)
+	// WriteDataVolumeRecord writes the data-volume record at path, atomically
+	// and root-owned 0644.
+	//
+	// It takes the RECORD, not bytes, because pkg/dataroot owns the record's
+	// encoding, its version stamp and its temp-and-rename — a seam that took
+	// bytes would need a second encoder here, and two encoders of one
+	// declaration is the drift this whole feature exists to end. The seam
+	// exists at all so a unit test can observe the write and so nothing writes
+	// the record before its volume is proven mounted.
+	WriteDataVolumeRecord(path string, rec dataroot.Record) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
 	// ReadFile reads a root-readable file: the installed server plist, whose
@@ -445,7 +508,33 @@ type Config struct {
 	// keeps the single-node insecure-skip-tls-verify posture, which is the only
 	// correct one against a self-signed serving cert.
 	ClusterCA []byte
-	Logger    *slog.Logger
+	// DataVolume asks install to create, adopt or migrate onto a dedicated APFS
+	// volume for the data root. Nil is the default posture: the data root is a
+	// plain directory (or a volume an operator declared in /etc/fstab by hand),
+	// and install touches no disk.
+	DataVolume *datavol.Options
+	// DataVolumeDeps are the diskutil / keychain / indexing seams the
+	// data-volume work runs through. An incomplete value is filled with
+	// datavol.NewDarwin() by withDefaults, so production callers say nothing and
+	// tests inject datavoltest.Fake.Deps().
+	DataVolumeDeps datavol.Deps
+	// RemoveOldDataRoot deletes the .pre-volume copy a migration leaves beside
+	// the data root, once the copy has been verified. It is REQUIRED for an
+	// encrypted volume (an encrypted volume beside a plaintext duplicate of the
+	// same secrets is not encryption) and optional otherwise.
+	RemoveOldDataRoot bool
+	// DataRootFS is the read-only filesystem the data-root posture is read
+	// through (the record, /etc/fstab, the mount state). It defaults to the real
+	// filesystem; a test injects a fake so the sequencing can be exercised
+	// against a mount posture no unprivileged process could create.
+	DataRootFS dataroot.FS
+	Logger     *slog.Logger
+	// dataVolumeDeclared reports that this Mac has a data volume to manage --
+	// either a record already declares one, or --data-volume asked for one. It
+	// is what puts the io.k3sm.datavol daemon and the record into the artifact
+	// manifest, and Install and Uninstall each set it from the record before
+	// they build that manifest.
+	dataVolumeDeclared bool
 }
 
 func (c Config) withDefaults() Config {
@@ -476,6 +565,15 @@ func (c Config) withDefaults() Config {
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
 	}
+	if c.DataRootFS == nil {
+		c.DataRootFS = dataroot.OSFS{}
+	}
+	// All three seams or none: datavol refuses a partially filled Deps rather
+	// than calling through a nil interface, so a caller that supplied two of
+	// them would fail at the first operation instead of here.
+	if c.DataVolumeDeps.Volumes == nil || c.DataVolumeDeps.Keychain == nil || c.DataVolumeDeps.Indexing == nil {
+		c.DataVolumeDeps = datavol.NewDarwin()
+	}
 	if c.ExecShimSource == "" && c.BinarySource != "" {
 		c.ExecShimSource = filepath.Join(filepath.Dir(c.BinarySource), ExecShimName)
 	}
@@ -504,6 +602,11 @@ func (c Config) runDir() string { return RunDir(c.DataRoot) }
 // control plane wrote there; it is a Config accessor so the leaf name is not
 // re-typed at each use.
 func (c Config) serverWorkDir() string { return filepath.Join(c.DataRoot, "server") }
+
+// datavolStaging is the migration staging mount point for this Config's install
+// dir (see DatavolStagingDir). It is an accessor rather than a second literal so
+// a Config pointing at another install dir stages inside it.
+func (c Config) datavolStaging() string { return filepath.Join(c.InstallDir, datavolStagingName) }
 
 // meshIP returns the --mesh-ip value carried in ExtraServerArgs, or "" when the
 // server runs single-node. It is the discriminator between the two apiserver
@@ -613,6 +716,12 @@ type artifact struct {
 	// proves the disposition (InstallDir-covered), not on-disk presence — that
 	// follow-up lights them up with no manifest change.
 	assertExists bool
+	// oneshot marks a kindDaemon that RUNS AND EXITS rather than staying up
+	// (io.k3sm.datavol). It changes two things and nothing else: the restart
+	// sequence waits for the job to be LOADED rather than for a live pid, and
+	// the post-restart verification does not demand a pid it was never going to
+	// have.
+	oneshot bool
 }
 
 // artifactManifest is the single source of truth for what install lays down and
@@ -682,6 +791,18 @@ func artifactManifest(cfg Config) []artifact {
 		// Bootout(label) then RemoveAll(plistPath). Removing the plist is the fix for
 		// a leak — previously the label was booted out but the plist leaked, leaving a
 		// phantom KeepAlive respawn-throttle root job pointing at a deleted binary.
+	}...)
+	// The data-volume mount daemon goes IMMEDIATELY BEFORE netd, present only
+	// when this Mac has a data volume to manage. Its position is its contract:
+	// install lays plists down and restarts jobs in manifest order, so the
+	// mount is attempted before the two daemons that refuse an unmounted data
+	// root, and the reverse uninstall walk boots it out last of the three.
+	// assertExists is false because a Mac that never asked for a volume has no
+	// such plist, and one that just asked for its first has none yet either.
+	if cfg.dataVolumeDeclared {
+		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: DatavolLabel, path: cfg.plistPath(DatavolLabel), oneshot: true, assertExists: false})
+	}
+	items = append(items, []artifact{
 		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
 		{kind: kindDaemon, disp: dispRemove, label: ServerLabel, path: cfg.plistPath(ServerLabel), assertExists: true},
 
@@ -693,7 +814,18 @@ func artifactManifest(cfg Config) []artifact {
 		// daemon LogDir. Both survive an uninstall→reinstall.
 		{kind: kindDir, disp: dispPreserve, path: cfg.DataRoot, assertExists: false},
 		{kind: kindDir, disp: dispPreserve, path: LogDir, assertExists: false},
-
+	}...)
+	// The data-volume record, beside the data root it declares and preserved for
+	// the same reason: an uninstall keeps the volume mounted and its data
+	// intact, so deleting the declaration would leave the next `k3sm install`
+	// unable to tell a k3sm volume from an operator's. It lives outside
+	// InstallDir precisely so the uninstall sweep cannot reach it; the entry is
+	// here to say that is deliberate. `k3sm datavol delete --yes` is the one
+	// thing that removes it.
+	if cfg.dataVolumeDeclared {
+		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: dataroot.DefaultRecordPath, assertExists: false})
+	}
+	items = append(items, []artifact{
 		// The container-log tree is REMOVED on uninstall, unlike the daemon LogDir
 		// above and unlike DataRoot. It holds no state a reinstall wants and no
 		// record anyone is keeping: every file in it belongs to a pod that no
@@ -716,6 +848,8 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 		return NetdPlist(cfg), nil
 	case ServerLabel:
 		return ServerPlist(cfg), nil
+	case DatavolLabel:
+		return DatavolPlist(cfg), nil
 	default:
 		return nil, fmt.Errorf("no plist renderer for daemon %s", label)
 	}
@@ -741,10 +875,27 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		cfg.AdminToken = tok
 	}
 
+	// 0. The data volume, BEFORE everything else -- see ensureDataVolume for why
+	//    this block cannot sit anywhere later. It also decides
+	//    cfg.dataVolumeDeclared, which the manifest below reads.
+	st, err := dataroot.Read(cfg.DataRootFS, cfg.DataRoot)
+	if err != nil {
+		return fmt.Errorf("install: inspect the data root %s: %w", cfg.DataRoot, err)
+	}
+	cfg.dataVolumeDeclared = st.Volume != nil || cfg.DataVolume != nil
+
 	// The manifest is the single source of truth for the artifacts laid down (and,
 	// on uninstall, torn down): daemon plist paths + install order come from it, so
-	// there is no second hardcoded list to diverge from the teardown.
+	// there is no second hardcoded list to diverge from the teardown. It is built
+	// AFTER the declaration above, because the datavol daemon and the record are
+	// in it only when there is a data volume to manage.
 	m := artifactManifest(cfg)
+
+	if cfg.DataVolume != nil {
+		if err := ensureDataVolume(ctx, sys, cfg, m, st); err != nil {
+			return err
+		}
+	}
 
 	// 1. The service user must exist before the server LaunchDaemon (UserName=_k3sm)
 	//    can resolve it and before its _k3sm-owned data root is usable.
@@ -1016,6 +1167,18 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 		}
 		return sys.RemoveAll(cleaned)
 	}
+	// The record decides whether this Mac has a datavol daemon to tear down. It
+	// is read BEFORE the manifest is built, for the same reason Install reads
+	// it first: the manifest carries the datavol plist only when there is one,
+	// and a teardown that did not know about it would leave a root LaunchDaemon
+	// pointing at a deleted binary -- the exact leak the shared manifest exists
+	// to prevent. The record itself, the fstab line and the volume all STAY.
+	st, sterr := dataroot.Read(cfg.DataRootFS, cfg.DataRoot)
+	if sterr != nil {
+		cfg.Logger.Warn("could not inspect the data root; the data-volume daemon is not torn down", "path", cfg.DataRoot, "err", sterr)
+	}
+	cfg.dataVolumeDeclared = st.Volume != nil
+
 	m := artifactManifest(cfg)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
@@ -1085,6 +1248,16 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("uninstall: %w", firstErr)
 	}
 	cfg.Logger.Info("k3sm uninstalled", "install-dir", cfg.InstallDir)
+	if st.Volume != nil {
+		// The volume is data, not an artifact: it holds the datastore, the image
+		// blobs and every PersistentVolume, so uninstall leaves it mounted and
+		// declared. Saying so -- with both of the commands that act on it next --
+		// is the difference between an operator who knows their data is intact and
+		// one who goes looking for it with diskutil.
+		cfg.Logger.Info(fmt.Sprintf("data volume %s (%s) is kept and mounted at %s", st.Volume.Name, st.Volume.UUID, st.Volume.Mountpoint),
+			"reinstall", "sudo k3sm install --data-volume",
+			"remove-for-good", "sudo k3sm datavol delete --yes")
+	}
 	return nil
 }
 
@@ -1233,6 +1406,17 @@ type launchdPlist struct {
 	ProgramArguments []string
 	RunAtLoad        bool
 	KeepAlive        bool
+	// KeepAliveOnFailure renders KeepAlive as the dict {SuccessfulExit: false}
+	// instead of a bare boolean: launchd then relaunches the job ONLY when it
+	// exits non-zero. It is what a oneshot needs — `k3sm datavol mount` mounts
+	// and exits 0, and a bare KeepAlive would respawn it forever. It is
+	// mutually exclusive with KeepAlive, and renderPlist emits one or the other.
+	KeepAliveOnFailure bool
+	// ThrottleInterval, when > 0, is launchd's minimum seconds between spawns.
+	// For the datavol oneshot it bounds how fast a failing mount is retried,
+	// against the in-process retry MountRecorded already performs. 0 omits the
+	// key (launchd's own 10s default applies).
+	ThrottleInterval int
 	WorkingDirectory string
 	StdoutPath       string
 	StderrPath       string
@@ -1272,7 +1456,18 @@ func renderPlist(p launchdPlist) []byte {
 	b.WriteString("  </array>\n")
 
 	writeKeyBool(&b, "RunAtLoad", p.RunAtLoad)
-	writeKeyBool(&b, "KeepAlive", p.KeepAlive)
+	// KeepAlive is EITHER the boolean the two long-running daemons carry or the
+	// {SuccessfulExit: false} dict the oneshot carries, never both: launchd
+	// reads one KeepAlive key, and emitting two would leave which one binds to
+	// the parser's order rather than to this decision.
+	if p.KeepAliveOnFailure {
+		b.WriteString("  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n")
+	} else {
+		writeKeyBool(&b, "KeepAlive", p.KeepAlive)
+	}
+	if p.ThrottleInterval > 0 {
+		writeKeyInt(&b, "ThrottleInterval", p.ThrottleInterval)
+	}
 	if p.ExitTimeOut > 0 {
 		writeKeyInt(&b, "ExitTimeOut", p.ExitTimeOut)
 	}

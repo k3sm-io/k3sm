@@ -22,16 +22,30 @@ limitations under the License.
 //   - a DECLARED but UNMOUNTED volume — refuse, because anything written now
 //     lands in the bare mountpoint on the boot disk and shadows the real data.
 //
-// The only sanctioned way to put the data root on its own volume is an
-// /etc/fstab line whose mount-point field is the data root itself:
+// A volume is declared by either of exactly two sources, and this package reads
+// both:
 //
-//	UUID=<volume-uuid> /var/lib/k3sm apfs rw
+//   - an /etc/fstab line whose mount-point field is the data root itself:
 //
-// That file is therefore the one declaration this package reads. Any other
-// mechanism for mounting a volume there (a login item, a hand-run diskutil, an
-// automounter map) is out of contract: k3sm cannot distinguish "the operator
-// meant this to be a volume" from "this is a plain directory", so it will treat
-// an unmounted root as plain and populate it.
+//     UUID=<volume-uuid> /var/lib/k3sm apfs rw,nobrowse,nosuid,nodev
+//
+//   - the k3sm data-volume record at DefaultRecordPath, whose "mountpoint"
+//     field names the data root (see Record).
+//
+// Any other mechanism for mounting a volume there (a login item, a hand-run
+// diskutil, an automounter map) is out of contract: k3sm cannot distinguish
+// "the operator meant this to be a volume" from "this is a plain directory",
+// so it will treat an unmounted root as plain and populate it.
+//
+// Why a second source is safe. The record is not operator input: it is written
+// only by k3sm (pkg/datavol), only AFTER a mount has been verified, and it is
+// always paired with an fstab line k3sm keeps on adoption and writes on
+// creation. So the record can only ever widen the refusal, never narrow it, and
+// a k3sm binary too old to know about records still perceives the volume
+// through fstab and still refuses an unmounted root. That pairing is what makes
+// rolling back to an older binary safe. The record earns its place by carrying
+// what an fstab line cannot: the APFS volume label, its quota, and whether it
+// is encrypted, all of which `k3sm status` reports.
 //
 // The shadow posture is not hypothetical. On 2026-09-05 the declared volume
 // failed to mount at boot; the root netd helper created <root>/run inside the

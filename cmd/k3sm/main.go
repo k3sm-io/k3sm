@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "certificate", "snapshot", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", "token", "certificate", "snapshot", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -37,6 +37,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "token", "c
   netd        run the root privileged-network helper (launched by the io.k3sm.netd LaunchDaemon)
   install     install the netd + server launchd daemons (run as root via sudo)
   uninstall   remove the netd + server launchd daemons (run as root via sudo)
+  datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
@@ -96,6 +97,11 @@ func main() {
 	case "uninstall":
 		if err := runUninstall(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm uninstall:", err)
+			os.Exit(1)
+		}
+	case "datavol":
+		if err := runDatavol(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm datavol:", err)
 			os.Exit(1)
 		}
 	case "token":

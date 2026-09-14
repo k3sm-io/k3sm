@@ -24,13 +24,36 @@ import (
 	"io"
 	"io/fs"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 )
+
+// TestMain points the two GLOBAL data-root declaration paths at a scratch
+// directory for the whole package's tests.
+//
+// Without it every test that runs Install would read the running Mac's own
+// /etc/fstab and /Library/Preferences/io.k3sm.datavol.json, and a developer
+// whose Mac actually has a k3sm data volume would watch unrelated tests change
+// verdict. The two are vars precisely so a test can do this; nothing in the
+// product writes them.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "k3sm-install-decl-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "create the scratch declaration dir:", err)
+		os.Exit(1)
+	}
+	dataroot.FstabPath = filepath.Join(dir, "fstab")
+	dataroot.DefaultRecordPath = filepath.Join(dir, "io.k3sm.datavol.json")
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 // fakeSystem records every privileged seam call in order so a test can assert
 // the install orchestration without any real privilege.
@@ -80,6 +103,15 @@ type fakeSystem struct {
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
 	// states the failure explicitly with putEntitlement.
 	entitlement map[string]error
+	// serviceUID is what LookupServiceUID answers. Nil — the zero value — is the
+	// FIRST-INSTALL posture: the account does not exist yet, so a data volume
+	// mounted before EnsureServiceUser is left to root. A test that wants an
+	// owner sets it, and then the mount really chowns, which needs privilege.
+	serviceUID *int
+	// records is every data-volume record WriteDataVolumeRecord was handed,
+	// keyed by path. It is the fake's whole model of /Library/Preferences: the
+	// real write is pkg/dataroot's, and a unit test must not perform it.
+	records map[string]dataroot.Record
 }
 
 // putDrain makes the fake launchd keep label in the domain for reads
@@ -320,6 +352,91 @@ func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) err
 func (f *fakeSystem) RemoveAll(path string) error {
 	f.calls = append(f.calls, "RemoveAll:"+path)
 	return nil
+}
+
+// The four data-volume filesystem seams below RECORD the call and then really
+// perform it, unlike every other method on this fake.
+//
+// That is deliberate and it is what keeps the migration test non-vacuous:
+// datavol.Migrate verifies its own copy by walking both trees on the real
+// filesystem and hashing the datastore, so a seam that only remembered "a copy
+// was requested" would leave the verification comparing an empty directory
+// against a full one and the test would assert nothing about the sequence it
+// exists to pin. The paths are the test's own t.TempDir()s, so nothing
+// privileged happens.
+
+func (f *fakeSystem) EnsureRootDir(dir string, mode fs.FileMode) error {
+	f.calls = append(f.calls, "EnsureRootDir:"+dir)
+	return os.MkdirAll(dir, mode)
+}
+
+func (f *fakeSystem) CopyTree(src, dst string) error {
+	f.calls = append(f.calls, "CopyTree:"+src+"->"+dst)
+	return copyTreeForTest(src, dst)
+}
+
+func (f *fakeSystem) Rename(old, new string) error {
+	f.calls = append(f.calls, "Rename:"+old+"->"+new)
+	return os.Rename(old, new)
+}
+
+func (f *fakeSystem) RemoveTree(path string) error {
+	f.calls = append(f.calls, "RemoveTree:"+path)
+	return os.RemoveAll(path)
+}
+
+// LookupServiceUID answers the first-install posture (no account yet) unless a
+// test said otherwise with putServiceUID.
+func (f *fakeSystem) LookupServiceUID(name string) (int, bool) {
+	f.calls = append(f.calls, "LookupServiceUID:"+name)
+	if f.serviceUID == nil {
+		return 0, false
+	}
+	return *f.serviceUID, true
+}
+
+// putServiceUID makes LookupServiceUID report an existing account.
+func (f *fakeSystem) putServiceUID(uid int) { f.serviceUID = &uid }
+
+func (f *fakeSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) error {
+	f.calls = append(f.calls, "WriteDataVolumeRecord:"+path)
+	if f.records == nil {
+		f.records = map[string]dataroot.Record{}
+	}
+	f.records[path] = rec
+	return nil
+}
+
+// copyTreeForTest is ditto(1)'s contract as far as an unprivileged test can
+// honour it: the tree's shape, its file contents and its permission bits.
+// Ownership is whatever the test process is on both sides, which is what makes
+// Migrate's uid/gid comparison pass rather than vacuous.
+func copyTreeForTest(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, info.Mode().Perm())
+	})
 }
 
 func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
