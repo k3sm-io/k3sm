@@ -136,11 +136,11 @@ run_test "b248.2" 7 TestReadDeclaresFromRecord ./pkg/dataroot/ "$K3SM_ROOT" 1
 # a stranger's volume or creates a second one over a live data root.
 run_test "b248.3" 15 TestEnsureCreatesOrAdopts ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 7 TestMountRecordedIsIdempotent ./pkg/datavol/ "$K3SM_ROOT" 1
-run_test "b248.3" 2 TestMountRecordedRefuses ./pkg/datavol/ "$K3SM_ROOT" 1
+run_test "b248.3" 3 TestMountRecordedRefuses ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 9 TestMigrateFailsSafe ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 5 TestEnsureFstabLine ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 4 TestRemoveFstabLine ./pkg/datavol/ "$K3SM_ROOT" 1
-run_test "b248.3" 7 TestDeleteRefuses ./pkg/datavol/ "$K3SM_ROOT" 1
+run_test "b248.3" 8 TestDeleteRefuses ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 6 TestDeleteSequence ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 14 TestParseSize ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 7 TestPlistDictReader ./pkg/datavol/ "$K3SM_ROOT" 1
