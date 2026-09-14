@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -76,8 +77,10 @@ func TestMountRecordedIsIdempotent(t *testing.T) {
 		if err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil); err != nil {
 			t.Fatalf("MountRecorded: %v", err)
 		}
-		if len(f.Calls) != 0 {
-			t.Fatalf("MountRecorded acted on an already-mounted volume: %v", f.Calls)
+		// The fast path costs exactly one Info: it confirms that what is
+		// mounted there is the record's own volume, and does nothing else.
+		if want := []string{"info " + rigUUID}; !reflect.DeepEqual(f.Calls, want) {
+			t.Fatalf("calls %v, want %v", f.Calls, want)
 		}
 	})
 
@@ -107,13 +110,13 @@ func TestMountRecordedIsIdempotent(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(mp, datavol.MarkerName)); err != nil {
 			t.Fatalf("the provenance marker was not written: %v", err)
 		}
-		// A second run is a no-op, including the marker write.
+		// A second run does nothing but confirm what is mounted there.
 		before := len(f.Calls)
 		if err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil); err != nil {
 			t.Fatalf("MountRecorded (second): %v", err)
 		}
-		if len(f.Calls) != before {
-			t.Fatalf("the second run acted: %v", f.Calls[before:])
+		if got, want := f.Calls[before:], []string{"info " + rigUUID}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("the second run did %v, want %v", got, want)
 		}
 	})
 
@@ -253,6 +256,30 @@ func TestMountRecordedRefuses(t *testing.T) {
 			if len(f.Calls) != 0 {
 				t.Fatalf("MountRecorded(%q) acted: %v", mp, f.Calls)
 			}
+		}
+	})
+
+	t.Run("a different volume mounted at the mountpoint is refused", func(t *testing.T) {
+		f := datavoltest.New()
+		mp := t.TempDir()
+		// The record's volume exists but is not mounted; somebody else's is
+		// mounted at the data root.
+		f.Add(datavoltest.Volume{UUID: rigUUID, Name: "k3sm", Container: "disk3", CaseSensitive: true})
+		f.Add(datavoltest.Volume{UUID: "STRANGER", Name: "Scratch", Container: "disk3", Mountpoint: mp, CaseSensitive: true})
+		rec := dataroot.Record{UUID: rigUUID, Name: "k3sm", Mountpoint: mp}
+
+		err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil)
+		if !errors.Is(err, datavol.ErrRecordMismatch) {
+			t.Fatalf("MountRecorded = %v, want ErrRecordMismatch", err)
+		}
+		if f.Mounted(rigUUID) {
+			t.Fatal("the record's volume was mounted over the one already there")
+		}
+		if !f.Mounted("STRANGER") {
+			t.Fatal("somebody else's volume was disturbed")
+		}
+		if _, err := os.Stat(filepath.Join(mp, datavol.MarkerName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("k3sm claimed a volume it does not own: %v", err)
 		}
 	})
 

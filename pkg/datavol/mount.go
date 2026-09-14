@@ -73,9 +73,11 @@ var RetryPolicy = Retry{Poll: 2 * time.Second, Budget: 90 * time.Second}
 // acceptance gate all call it, so there is one definition of a correctly
 // mounted k3sm data volume.
 //
-// It is idempotent. A volume already mounted there -- by this daemon, by
-// diskarbitrationd from the fstab line, or by hand -- returns immediately, and
-// a partial previous run is completed rather than redone.
+// It is idempotent. The RECORD'S volume already mounted there -- by this
+// daemon, by diskarbitrationd from the fstab line, or by hand -- returns
+// immediately, and a partial previous run is completed rather than redone.
+// Some OTHER filesystem mounted there is not the same thing and is refused:
+// "a filesystem is mounted" is not the question the caller is asking.
 //
 // It refuses two postures outright, both of which come from the record being a
 // file that can be wrong: a mount point no data root could be at
@@ -103,6 +105,21 @@ func MountRecorded(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroo
 		return fmt.Errorf("inspect the data root %s: %w", rec.Mountpoint, err)
 	}
 	if st.Mounted {
+		// Something is mounted there, but "something" is not the question.
+		// The fast path is the one every boot and every re-run takes, so it
+		// is also the one place a wrong volume would be accepted silently and
+		// then written to as the data root.
+		info, err := deps.Volumes.Info(ctx, rec.UUID)
+		if err != nil {
+			return fmt.Errorf("inspect the data volume %s: %w", rec.UUID, err)
+		}
+		if err := verifyRecord(info, rec); err != nil {
+			return err
+		}
+		if !samePath(info.MountPoint, rec.Mountpoint) {
+			return fmt.Errorf("%s has a filesystem mounted on it, but volume %s (%s) is mounted at %q: %w",
+				rec.Mountpoint, rec.Name, rec.UUID, info.MountPoint, ErrRecordMismatch)
+		}
 		return nil
 	}
 

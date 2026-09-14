@@ -190,6 +190,34 @@ func TestDeleteRefuses(t *testing.T) {
 		}
 	})
 
+	t.Run("another filesystem at the mountpoint is never unmounted", func(t *testing.T) {
+		rec, recPath, fstabPath, f := deleteRig(t, false)
+		// The record's volume came unmounted and something else took the
+		// path: a stranger's filesystem must not be unmounted on the strength
+		// of a file.
+		f.Vols[rigUUID].Mountpoint = ""
+		f.Add(datavoltest.Volume{UUID: "STRANGER", Name: "Scratch", Container: "disk3", Mountpoint: rec.Mountpoint, CaseSensitive: true})
+
+		err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{Yes: true, FstabPath: fstabPath})
+		if !errors.Is(err, datavol.ErrRecordMismatch) {
+			t.Fatalf("Delete = %v, want ErrRecordMismatch", err)
+		}
+		if !strings.Contains(err.Error(), rec.Mountpoint) {
+			t.Fatalf("the message does not name the mount point: %v", err)
+		}
+		for _, c := range f.Calls {
+			if strings.HasPrefix(c, "unmount") || strings.HasPrefix(c, "deletevolume") {
+				t.Fatalf("Delete acted on a filesystem it did not verify: %v", f.Calls)
+			}
+		}
+		if !f.Mounted("STRANGER") {
+			t.Fatal("somebody else's filesystem was unmounted")
+		}
+		if _, err := os.Stat(recPath); err != nil {
+			t.Fatalf("the record was removed despite the mismatch: %v", err)
+		}
+	})
+
 	t.Run("a busy volume names the known cause and keeps the record", func(t *testing.T) {
 		rec, recPath, fstabPath, f := deleteRig(t, false)
 		f.SetErr("unmount", errors.New("Resource busy -- try again"))

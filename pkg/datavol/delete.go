@@ -106,12 +106,20 @@ func Delete(ctx context.Context, deps Deps, fsys dataroot.FS, ld Launchd, record
 		return fmt.Errorf("the record puts volume %s (%s) at %s but it is mounted at %s: %w",
 			rec.Name, rec.UUID, rec.Mountpoint, info.MountPoint, ErrRecordMismatch)
 	}
+	ours := info.MountPoint != "" && samePath(info.MountPoint, rec.Mountpoint)
 
 	st, err := dataroot.Read(fsys, rec.Mountpoint)
 	if err != nil {
 		return fmt.Errorf("inspect the data root %s: %w", rec.Mountpoint, err)
 	}
-	if st.Mounted {
+	switch {
+	case st.Mounted && !ours:
+		// The record's own volume is not mounted, yet something is mounted at
+		// the path the record names. Unmounting it would be unmounting a
+		// stranger's filesystem on the strength of a file.
+		return fmt.Errorf("%s has a %s filesystem (%s) mounted on it, which is not volume %s (%s): %w",
+			rec.Mountpoint, st.FSType, st.VolumeName, rec.Name, rec.UUID, ErrRecordMismatch)
+	case st.Mounted:
 		if err := deps.Volumes.Unmount(ctx, rec.Mountpoint); err != nil {
 			return fmt.Errorf("unmount the data volume at %s: %w — a process still holding it open keeps it busy; the known one is an orphaned k3sm-vmhost, which `sudo pkill -f k3sm-vmhost` clears", rec.Mountpoint, err)
 		}
