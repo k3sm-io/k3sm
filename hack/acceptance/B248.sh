@@ -430,7 +430,11 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 	if [ "$l6" = ok ]; then
 		mountedAt "$SRC" || { echo "    $SRC is not a mount point after the migration"; l6=no; }
 		sudo test -d "$SRC.pre-volume" || { echo "    $SRC.pre-volume is missing — the old data root was not preserved"; l6=no; }
-		got_files="$(sudo find "$SRC" -type f ! -name .k3sm-datavol ! -name .metadata_never_index | wc -l | tr -d ' ')"
+		# The migrated tree is now a mounted volume, and macOS puts .Trashes,
+		# .fseventsd and friends at its root; .Trashes is unreadable even by
+		# root (EPERM), which under set -e would abort the gate mid-rung. Prune
+		# the metadata entries the product's verify walk also ignores.
+		got_files="$(sudo find "$SRC" \( -name .Trashes -o -name .fseventsd -o -name .Spotlight-V100 -o -name .TemporaryItems -o -name .DocumentRevisions-V100 \) -prune -o -type f ! -name .k3sm-datavol ! -name .metadata_never_index ! -name .DS_Store -print 2>/dev/null | wc -l | tr -d ' ')"
 		[ "$got_files" = "$want_files" ] || { echo "    $got_files files on the volume, $want_files at the source"; l6=no; }
 		got_sha="$(sudo shasum -a 256 "$SRC/server/db/state.db" | awk '{print $1}')"
 		[ "$got_sha" = "$want_sha" ] || { echo "    state.db hashes $got_sha on the volume, $want_sha at the source"; l6=no; }
