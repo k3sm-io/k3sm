@@ -134,7 +134,7 @@ run_test "b248.2" 7 TestReadDeclaresFromRecord ./pkg/dataroot/ "$K3SM_ROOT" 1
 # TestEnsureCreatesOrAdopts is the leg that matters most: it is the decision
 # table for "is this volume k3sm's", and every wrong answer in it either adopts
 # a stranger's volume or creates a second one over a live data root.
-run_test "b248.3" 15 TestEnsureCreatesOrAdopts ./pkg/datavol/ "$K3SM_ROOT" 1
+run_test "b248.3" 17 TestEnsureCreatesOrAdopts ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 7 TestMountRecordedIsIdempotent ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 3 TestMountRecordedRefuses ./pkg/datavol/ "$K3SM_ROOT" 1
 run_test "b248.3" 9 TestMigrateFailsSafe ./pkg/datavol/ "$K3SM_ROOT" 1
