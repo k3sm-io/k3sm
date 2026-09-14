@@ -21,8 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 )
@@ -60,18 +58,15 @@ var (
 	// under a running control plane is how a datastore gets truncated; a
 	// scratch volume elsewhere is nobody's business but the operator's.
 	ErrDaemonsLoaded = errors.New("the k3sm daemons are still loaded")
-	// ErrImplausibleMountpoint is returned for a mount point no k3sm data
-	// volume could be at. It is the guard against a corrupted or
-	// hand-edited record turning `datavol delete` into a system-wide unmount.
-	ErrImplausibleMountpoint = errors.New("that mount point is not a plausible k3sm data root")
 )
 
 // Delete destroys the data volume rec describes and every declaration of it.
 //
 // It is deliberately hard to reach: it refuses without an explicit
 // confirmation, it refuses while either daemon is loaded AND the record names
-// the live data root (o.ProtectedMountpoint), and it refuses a mount point
-// that could not be a k3sm data root. What it removes, in order,
+// the live data root (o.ProtectedMountpoint), it refuses a mount point that
+// could not be a k3sm data root, and it refuses a record that does not match
+// the volume actually there. What it removes, in order,
 // is the mount, the volume, the keychain item, the fstab line, the record and
 // an empty mount point. It never touches the .pre-volume copy of a migrated
 // data root -- that is the operator's rollback and only the operator deletes
@@ -92,6 +87,24 @@ func Delete(ctx context.Context, deps Deps, fsys dataroot.FS, ld Launchd, record
 	}
 	if implausibleMountpoint(rec.Mountpoint) {
 		return fmt.Errorf("%s: %w", rec.Mountpoint, ErrImplausibleMountpoint)
+	}
+
+	// Cross-check the record against the disk before anything destructive.
+	// The record is a file; the volume is the thing that gets destroyed, and
+	// the two are only assumed to correspond. An APFS UUID freed by a delete
+	// can be handed to a new volume, and a hand-run diskutil can move a
+	// volume out from under a record, so a stale record must not be able to
+	// aim deleteVolume at whatever now answers to that UUID.
+	info, err := deps.Volumes.Info(ctx, rec.UUID)
+	if err != nil {
+		return fmt.Errorf("inspect the data volume %s: %w", rec.UUID, err)
+	}
+	if err := verifyRecord(info, rec); err != nil {
+		return err
+	}
+	if info.MountPoint != "" && !samePath(info.MountPoint, rec.Mountpoint) {
+		return fmt.Errorf("the record puts volume %s (%s) at %s but it is mounted at %s: %w",
+			rec.Name, rec.UUID, rec.Mountpoint, info.MountPoint, ErrRecordMismatch)
 	}
 
 	st, err := dataroot.Read(fsys, rec.Mountpoint)
@@ -136,41 +149,4 @@ func removeIfEmpty(dir string) {
 		return
 	}
 	_ = os.Remove(dir)
-}
-
-// implausibleMountpoint reports a mount point no k3sm data volume could be at.
-//
-// The guard exists because everything after it is destructive and the mount
-// point comes from a file on disk: a truncated, hand-edited or corrupted
-// record must not be able to aim `diskutil unmount` at the boot volume or a
-// home directory. The rule is deliberately coarse -- at least two path
-// segments, and not inside the places a data root is never allowed to be.
-func implausibleMountpoint(p string) bool {
-	if p == "" || !filepath.IsAbs(p) {
-		return true
-	}
-	clean := filepath.Clean(p)
-	segments := strings.Split(strings.Trim(clean, "/"), "/")
-	// "/" and every single-segment path: /var, /System, /Library, /Users.
-	if clean == "/" || len(segments) < 2 {
-		return true
-	}
-	// A home directory itself, though a directory inside one is fine.
-	if segments[0] == "Users" && len(segments) == 2 {
-		return true
-	}
-	// These and everything inside them.
-	for _, forbidden := range []string{"/System", "/Library/k3sm"} {
-		if clean == forbidden || strings.HasPrefix(clean, forbidden+"/") {
-			return true
-		}
-	}
-	// These exactly: they are roots other filesystems hang off, not data
-	// roots. A directory inside them is allowed.
-	for _, forbidden := range []string{"/private", "/private/var", "/private/etc", "/Volumes"} {
-		if clean == forbidden {
-			return true
-		}
-	}
-	return false
 }

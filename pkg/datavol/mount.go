@@ -77,6 +77,11 @@ var RetryPolicy = Retry{Poll: 2 * time.Second, Budget: 90 * time.Second}
 // diskarbitrationd from the fstab line, or by hand -- returns immediately, and
 // a partial previous run is completed rather than redone.
 //
+// It refuses two postures outright, both of which come from the record being a
+// file that can be wrong: a mount point no data root could be at
+// (ErrImplausibleMountpoint), and a UUID whose volume is not the one the
+// record names (ErrRecordMismatch).
+//
 // logger may be nil, in which case slog.Default is used. It records only the
 // two best-effort steps (Spotlight, Time Machine), whose failure leaves a
 // working data root and must not fail the mount.
@@ -87,6 +92,11 @@ func MountRecorded(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroo
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// Before anything is created, mounted or chowned: the mount point comes
+	// from a record on disk, and every step below acts on it as root.
+	if implausibleMountpoint(rec.Mountpoint) {
+		return fmt.Errorf("%s: %w", rec.Mountpoint, ErrImplausibleMountpoint)
+	}
 
 	st, err := dataroot.Read(fsys, rec.Mountpoint)
 	if err != nil {
@@ -94,11 +104,6 @@ func MountRecorded(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroo
 	}
 	if st.Mounted {
 		return nil
-	}
-	if !st.Exists {
-		if err := os.MkdirAll(rec.Mountpoint, 0o755); err != nil {
-			return fmt.Errorf("create the mount point %s: %w", rec.Mountpoint, err)
-		}
 	}
 
 	if err := mountWithRetry(ctx, deps, fsys, rec); err != nil {
@@ -145,7 +150,7 @@ func mountWithRetry(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataro
 		if last == nil {
 			return nil
 		}
-		if errors.Is(last, errPassphraseUnavailable) || !time.Now().Add(RetryPolicy.Poll).Before(deadline) {
+		if errors.Is(last, errPassphraseUnavailable) || errors.Is(last, ErrRecordMismatch) || !time.Now().Add(RetryPolicy.Poll).Before(deadline) {
 			return fmt.Errorf("mount the data volume %s at %s (attempt %d): %w", rec.UUID, rec.Mountpoint, attempt, last)
 		}
 		select {
@@ -156,9 +161,11 @@ func mountWithRetry(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataro
 	}
 }
 
-// errPassphraseUnavailable marks the one failure mountWithRetry must not
-// retry: the keychain does not race with boot, so a missing or unreadable
-// passphrase will not become readable in ninety seconds.
+// errPassphraseUnavailable marks a failure mountWithRetry must not retry: the
+// keychain does not race with boot, so a missing or unreadable passphrase will
+// not become readable in ninety seconds. ErrRecordMismatch is the other:
+// a record that names the wrong volume will still name the wrong volume in
+// ninety seconds.
 var errPassphraseUnavailable = errors.New("the data volume passphrase is unavailable")
 
 // mountOnce is a single attempt: inspect, unlock if locked, mount, confirm.
@@ -166,6 +173,18 @@ func mountOnce(ctx context.Context, deps Deps, fsys dataroot.FS, rec dataroot.Re
 	info, err := deps.Volumes.Info(ctx, rec.UUID)
 	if err != nil {
 		return err
+	}
+	// A record naming a volume that is not the one there must not be mounted
+	// at the data root: the daemons would then write a cluster's state onto
+	// somebody else's volume.
+	if err := verifyRecord(info, rec); err != nil {
+		return err
+	}
+	// The mount point is created only once the record has been shown to
+	// describe the volume, so a refusal leaves no empty directory behind.
+	// MkdirAll is idempotent, so a retry costs nothing.
+	if err := os.MkdirAll(rec.Mountpoint, 0o755); err != nil {
+		return fmt.Errorf("create the mount point %s: %w", rec.Mountpoint, err)
 	}
 	if info.Locked && rec.Encrypted {
 		passphrase, err := deps.Keychain.Lookup(ctx, rec.UUID)

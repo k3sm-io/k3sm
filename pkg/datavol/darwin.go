@@ -35,7 +35,9 @@ import (
 const systemKeychain = "/Library/Keychains/System.keychain"
 
 // keychainAccount is the account every k3sm keychain item is filed under; the
-// service is the volume UUID.
+// service is the volume UUID. Every lookup and delete names it too, so they
+// select exactly the item Store wrote rather than whatever else in the System
+// keychain happens to share the service.
 const keychainAccount = "k3sm"
 
 // keychainLabel is what the item shows as in Keychain Access.
@@ -164,6 +166,7 @@ func (Darwin) Store(ctx context.Context, uuid, passphrase string) error {
 func (Darwin) Lookup(ctx context.Context, uuid string) (string, error) {
 	cmd := strings.Join([]string{
 		"find-generic-password",
+		"-a", securityQuote(keychainAccount),
 		"-s", securityQuote(uuid),
 		"-w", securityQuote(systemKeychain),
 	}, " ")
@@ -183,6 +186,7 @@ func (Darwin) Lookup(ctx context.Context, uuid string) (string, error) {
 func (Darwin) Delete(ctx context.Context, uuid string) error {
 	cmd := strings.Join([]string{
 		"delete-generic-password",
+		"-a", securityQuote(keychainAccount),
 		"-s", securityQuote(uuid),
 		securityQuote(systemKeychain),
 	}, " ")

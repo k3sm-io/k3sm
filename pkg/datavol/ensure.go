@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -77,8 +78,9 @@ var (
 	// behind a flag that says encrypted.
 	ErrEncryptRequiresFresh = errors.New("an existing data volume cannot be encrypted in place")
 	// ErrForeignVolume is returned when a volume with the requested name
-	// exists but shows no sign of being k3sm's. k3sm refuses it by name
-	// rather than taking ownership of an operator's data.
+	// exists but carries no proof of being k3sm's. k3sm refuses it by name
+	// rather than taking ownership of an operator's data -- including when it
+	// happens to be empty, because emptiness is not provenance.
 	ErrForeignVolume = errors.New("a volume with that name exists and is not k3sm's")
 	// ErrQuotaNotApplied is returned when a freshly created volume does not
 	// report the quota that was asked for. The volume is deleted first: a
@@ -88,11 +90,6 @@ var (
 	// ErrQuotaTooSmall is returned for a requested quota below MinQuotaBytes.
 	ErrQuotaTooSmall = errors.New("the requested data volume quota is below the supported minimum")
 )
-
-// emptyVolumeBytes is how much a brand-new APFS volume may hold and still count
-// as empty for adoption. A freshly created volume reports a few tens of
-// kilobytes of filesystem metadata, never a megabyte.
-const emptyVolumeBytes uint64 = 1 << 20
 
 // quotaTolerance is how far the observed quota may sit from the requested one
 // before Ensure calls it a failure, as a divisor: 100 means one percent. APFS
@@ -156,8 +153,8 @@ func Ensure(ctx context.Context, deps Deps, fsys dataroot.FS, recordPath string,
 			return dataroot.Record{}, Plan{}, err
 		}
 		if !ours {
-			return dataroot.Record{}, Plan{}, fmt.Errorf("volume %q (%s) holds %s of data, is not mounted at %s and carries no %s marker: %w",
-				o.Name, info.VolumeUUID, FormatSize(capacity.InUse), o.Mountpoint, MarkerName, ErrForeignVolume)
+			return dataroot.Record{}, Plan{}, fmt.Errorf("volume %q (%s) holds %s of data, is not mounted at %s and carries no %s marker: %w — pick another name with --data-volume-name, or remove that volume yourself with `diskutil apfs deleteVolume %s`",
+				o.Name, info.VolumeUUID, FormatSize(capacity.InUse), o.Mountpoint, MarkerName, ErrForeignVolume, info.VolumeUUID)
 		}
 		record, err := adopt(ctx, deps, info, o)
 		if err != nil {
@@ -266,26 +263,75 @@ func destroy(ctx context.Context, deps Deps, uuid string, cause error) error {
 	return cause
 }
 
-// isOurs decides whether a same-named volume may be adopted. Any one of three
-// signs is enough: it is already mounted at the data root, it carries the
-// provenance marker MountRecorded writes, or it is effectively empty. A
-// same-named volume with foreign content is refused rather than taken over.
+// isOurs decides whether a same-named volume may be adopted. It is ours when
+// it is already mounted at the requested data root, or when it carries the
+// provenance marker MountRecorded writes -- read where it is mounted, or
+// through a temporary mount when it is not mounted at all.
+//
+// There is deliberately no "it looks empty, so take it" rule. Emptiness is not
+// provenance: a volume someone else made moments ago, or emptied, is
+// indistinguishable from one k3sm made, and adopting it makes k3sm the thing
+// that destroyed it at the next `datavol delete`. The marker is cheap to
+// produce for a volume that really is k3sm's (mount it and re-run), and a
+// wrong adoption is not recoverable.
 func isOurs(ctx context.Context, deps Deps, fsys dataroot.FS, info Info, o Options) (bool, Capacity, error) {
 	capacity, err := deps.Volumes.Capacity(ctx, info.ContainerReference, info.VolumeUUID)
 	if err != nil {
 		return false, Capacity{}, fmt.Errorf("read the usage of volume %s: %w", info.VolumeUUID, err)
 	}
-	if info.MountPoint != "" && samePath(info.MountPoint, o.Mountpoint) {
-		return true, capacity, nil
-	}
 	if info.MountPoint != "" {
-		if _, err := fsys.Stat(filepath.Join(info.MountPoint, MarkerName)); err == nil {
+		if samePath(info.MountPoint, o.Mountpoint) {
 			return true, capacity, nil
-		} else if !errors.Is(err, fs.ErrNotExist) {
+		}
+		marked, err := hasMarker(fsys, info.MountPoint)
+		if err != nil {
 			return false, capacity, fmt.Errorf("look for the %s marker on volume %s: %w", MarkerName, info.VolumeUUID, err)
 		}
+		return marked, capacity, nil
 	}
-	return capacity.InUse < emptyVolumeBytes, capacity, nil
+	marked, err := markedViaTempMount(ctx, deps, fsys, info.VolumeUUID)
+	if err != nil {
+		return false, capacity, err
+	}
+	return marked, capacity, nil
+}
+
+// markedViaTempMount mounts an unmounted volume somewhere private, looks for
+// the provenance marker, and unmounts it again. It is the only way to read a
+// volume's contents without first committing it to the data root, which is
+// exactly the commitment the answer is supposed to license.
+//
+// The staging directory is a fresh 0700 directory under the system temp dir,
+// so the volume's contents are never browsable while the probe runs.
+func markedViaTempMount(ctx context.Context, deps Deps, fsys dataroot.FS, uuid string) (bool, error) {
+	staging, err := os.MkdirTemp(os.TempDir(), "k3sm-datavol-probe-")
+	if err != nil {
+		return false, fmt.Errorf("create a staging directory to inspect volume %s: %w", uuid, err)
+	}
+	defer func() { _ = os.Remove(staging) }()
+
+	if err := deps.Volumes.Mount(ctx, uuid, staging); err != nil {
+		return false, fmt.Errorf("inspect volume %s before adopting it: %w", uuid, err)
+	}
+	defer func() { _ = deps.Volumes.Unmount(ctx, staging) }()
+
+	marked, err := hasMarker(fsys, staging)
+	if err != nil {
+		return false, fmt.Errorf("look for the %s marker on volume %s: %w", MarkerName, uuid, err)
+	}
+	return marked, nil
+}
+
+// hasMarker reports whether the provenance marker is at the root of the tree
+// mounted at mountpoint.
+func hasMarker(fsys dataroot.FS, mountpoint string) (bool, error) {
+	if _, err := fsys.Stat(filepath.Join(mountpoint, MarkerName)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // quotaApplied reports whether an observed quota is the requested one within
@@ -331,23 +377,3 @@ func newPassphrase() (string, error) {
 // now is the record timestamp, RFC 3339 in UTC. It is a var so a test can pin
 // it.
 var now = func() string { return time.Now().UTC().Format(time.RFC3339) }
-
-// samePath reports whether two paths name the same directory, resolving
-// symlinks on both sides when both resolve. It is the same rule
-// pkg/dataroot applies to a record's mountpoint, and it exists for the same
-// reason: macOS reports /private/var where k3sm writes /var.
-func samePath(a, b string) bool {
-	a, b = filepath.Clean(a), filepath.Clean(b)
-	if a == b {
-		return true
-	}
-	ra, err := filepath.EvalSymlinks(a)
-	if err != nil {
-		return false
-	}
-	rb, err := filepath.EvalSymlinks(b)
-	if err != nil {
-		return false
-	}
-	return filepath.Clean(ra) == filepath.Clean(rb)
-}

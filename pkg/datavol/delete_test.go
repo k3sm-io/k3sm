@@ -144,6 +144,52 @@ func TestDeleteRefuses(t *testing.T) {
 		}
 	})
 
+	t.Run("a record whose uuid names a different volume is refused", func(t *testing.T) {
+		rec, recPath, fstabPath, f := deleteRig(t, false)
+		// The UUID still answers -- APFS hands a freed one out again -- but
+		// the volume behind it is somebody else's now.
+		f.Vols[rigUUID].Name = "someone-elses"
+
+		err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{Yes: true, FstabPath: fstabPath})
+		if !errors.Is(err, datavol.ErrRecordMismatch) {
+			t.Fatalf("Delete = %v, want ErrRecordMismatch", err)
+		}
+		for _, name := range []string{rec.Name, rec.UUID, "someone-elses"} {
+			if !strings.Contains(err.Error(), name) {
+				t.Fatalf("the message does not name %q: %v", name, err)
+			}
+		}
+		if _, ok := f.Vols[rigUUID]; !ok {
+			t.Fatal("a volume the record does not describe was destroyed")
+		}
+		for _, c := range f.Calls {
+			if strings.HasPrefix(c, "unmount") || strings.HasPrefix(c, "deletevolume") {
+				t.Fatalf("Delete acted on an unverified volume: %v", f.Calls)
+			}
+		}
+	})
+
+	t.Run("a record whose mountpoint is not where the volume is mounted is refused", func(t *testing.T) {
+		rec, recPath, fstabPath, f := deleteRig(t, false)
+		// The volume moved under the record, e.g. a hand-run diskutil mount.
+		elsewhere := t.TempDir()
+		f.Vols[rigUUID].Mountpoint = elsewhere
+
+		err := datavol.Delete(ctx, f.Deps(), f.FS(), f, recPath, rec, datavol.DeleteOptions{Yes: true, FstabPath: fstabPath})
+		if !errors.Is(err, datavol.ErrRecordMismatch) {
+			t.Fatalf("Delete = %v, want ErrRecordMismatch", err)
+		}
+		if !strings.Contains(err.Error(), elsewhere) || !strings.Contains(err.Error(), rec.Mountpoint) {
+			t.Fatalf("the message does not name both mount points: %v", err)
+		}
+		if _, ok := f.Vols[rigUUID]; !ok {
+			t.Fatal("the volume was destroyed despite the mismatch")
+		}
+		if _, err := os.Stat(recPath); err != nil {
+			t.Fatalf("the record was removed despite the mismatch: %v", err)
+		}
+	})
+
 	t.Run("a busy volume names the known cause and keeps the record", func(t *testing.T) {
 		rec, recPath, fstabPath, f := deleteRig(t, false)
 		f.SetErr("unmount", errors.New("Resource busy -- try again"))
@@ -177,7 +223,9 @@ func TestDeleteSequence(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
-		want := []string{"unmount " + rec.Mountpoint, "deletevolume " + rigUUID}
+		// Info comes first: nothing is unmounted or destroyed before the
+		// record has been checked against the volume that is actually there.
+		want := []string{"info " + rigUUID, "unmount " + rec.Mountpoint, "deletevolume " + rigUUID}
 		if len(f.Calls) != len(want) {
 			t.Fatalf("calls %v, want %v", f.Calls, want)
 		}

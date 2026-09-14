@@ -149,6 +149,65 @@ func TestEnsureCreatesOrAdopts(t *testing.T) {
 		}
 	})
 
+	t.Run("an unmounted marked volume is adopted through a temporary mount", func(t *testing.T) {
+		f := datavoltest.New()
+		v := k3smVolume("")
+		v.HasMarker = true
+		f.Add(v)
+
+		got, plan, err := datavol.Ensure(ctx, f.Deps(), f.FS(), recordPath, base)
+		if err != nil {
+			t.Fatalf("Ensure: %v", err)
+		}
+		if !plan.Adopted {
+			t.Fatalf("Plan = %+v, want Adopted", plan)
+		}
+		if got.UUID != rigUUID {
+			t.Fatalf("record = %+v", got)
+		}
+		// The probe mount is private and temporary: it happens somewhere
+		// under the system temp dir, never at the data root, and it is undone.
+		var probe string
+		for _, c := range f.Calls {
+			if rest, ok := strings.CutPrefix(c, "mount "+rigUUID+" "); ok {
+				probe = rest
+			}
+		}
+		if probe == "" {
+			t.Fatalf("the volume was never mounted to be inspected: %v", f.Calls)
+		}
+		if !strings.HasPrefix(probe, os.TempDir()) || probe == testRoot {
+			t.Fatalf("the probe mounted at %q, want a private path under %q", probe, os.TempDir())
+		}
+		if !contains(f.Calls, "unmount "+probe) {
+			t.Fatalf("the probe mount was left behind: %v", f.Calls)
+		}
+		if _, err := os.Stat(probe); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the staging directory survived: %v", err)
+		}
+		if f.Mounted(rigUUID) {
+			t.Fatal("Ensure left the volume mounted; mounting is MountRecorded's job")
+		}
+	})
+
+	t.Run("an unmounted empty volume with no marker is refused", func(t *testing.T) {
+		f := datavoltest.New()
+		v := k3smVolume("")
+		v.InUse = 24576 // a brand-new APFS volume: empty is not provenance
+		f.Add(v)
+
+		_, _, err := datavol.Ensure(ctx, f.Deps(), f.FS(), recordPath, base)
+		if !errors.Is(err, datavol.ErrForeignVolume) {
+			t.Fatalf("Ensure = %v, want ErrForeignVolume", err)
+		}
+		if !strings.Contains(err.Error(), "--data-volume-name") {
+			t.Fatalf("the message does not tell the operator what to do: %v", err)
+		}
+		if f.Mounted(rigUUID) {
+			t.Fatal("the refused volume was left mounted")
+		}
+	})
+
 	t.Run("a same-named volume with foreign data is refused, not taken over", func(t *testing.T) {
 		f := datavoltest.New()
 		f.Add(k3smVolume(t.TempDir()))

@@ -68,6 +68,11 @@ type Volume struct {
 	FilesystemType string
 	// Passphrase is what Unlock demands, when AddVolume created it with one.
 	Passphrase string
+	// HasMarker makes the volume carry k3sm's provenance marker at its root:
+	// FS().Stat reports the marker present wherever the volume is mounted,
+	// including a temporary probe mount. It is how a test describes a volume
+	// k3sm made on an earlier run.
+	HasMarker bool
 }
 
 // Fake implements every seam pkg/datavol takes.
@@ -527,11 +532,28 @@ func (s fakeFS) Stat(path string) (fs.FileInfo, error) {
 	if s.isMountpoint(path) {
 		return fakeInfo{name: filepath.Base(path), mode: fs.ModeDir | 0o755, dev: mountedDevice}, nil
 	}
+	if s.hasMarkerAt(path) {
+		return fakeInfo{name: filepath.Base(path), mode: 0o644, dev: mountedDevice}, nil
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
 	return fakeInfo{name: fi.Name(), mode: fi.Mode(), size: fi.Size(), dev: parentDevice}, nil
+}
+
+// hasMarkerAt reports whether path is the provenance marker of a mounted
+// volume the test declared as carrying one.
+func (s fakeFS) hasMarkerAt(path string) bool {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	clean := filepath.Clean(path)
+	for _, v := range s.f.Vols {
+		if v.HasMarker && v.Mountpoint != "" && filepath.Join(v.Mountpoint, datavol.MarkerName) == clean {
+			return true
+		}
+	}
+	return false
 }
 
 func (s fakeFS) Statfs(path string, st *unix.Statfs_t) error {

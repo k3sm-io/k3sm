@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,27 @@ func shrinkRetry(t *testing.T) {
 	saved := datavol.RetryPolicy
 	datavol.RetryPolicy = datavol.Retry{Poll: time.Millisecond, Budget: 50 * time.Millisecond}
 	t.Cleanup(func() { datavol.RetryPolicy = saved })
+}
+
+// flakyVolumes fails the first failures Mount calls and then delegates, the
+// way disk arbitration is transiently unready at boot.
+type flakyVolumes struct {
+	*datavoltest.Fake
+	mu       sync.Mutex
+	failures int
+	attempts int
+}
+
+func (v *flakyVolumes) Mount(ctx context.Context, uuid, mountpoint string) error {
+	v.mu.Lock()
+	v.attempts++
+	if v.failures > 0 {
+		v.failures--
+		v.mu.Unlock()
+		return errors.New("could not mount: disk arbitration is not ready")
+	}
+	v.mu.Unlock()
+	return v.Fake.Mount(ctx, uuid, mountpoint)
 }
 
 // TestMountRecordedIsIdempotent pins the one mount routine the installer, the
@@ -100,33 +122,21 @@ func TestMountRecordedIsIdempotent(t *testing.T) {
 		f := datavoltest.New()
 		mp := filepath.Join(t.TempDir(), "k3sm")
 		f.Add(datavoltest.Volume{UUID: rigUUID, Name: "k3sm", Container: "disk3", CaseSensitive: true})
-		f.SetErr("mount", errors.New("could not mount: disk arbitration is not ready"))
+		// The first mount fails the way early-boot disk arbitration does; the
+		// second succeeds. Deterministic, so the test is not a stopwatch.
+		vols := &flakyVolumes{Fake: f, failures: 1}
+		deps := f.Deps()
+		deps.Volumes = vols
 		rec := dataroot.Record{UUID: rigUUID, Name: "k3sm", Mountpoint: mp}
 
-		done := make(chan error, 1)
-		go func() {
-			// Clear the injected failure after the first attempt, the way
-			// arbitration settles a moment after boot.
-			time.Sleep(5 * time.Millisecond)
-			f.SetErr("mount", nil)
-			done <- nil
-		}()
-		err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil)
-		<-done
-		if err != nil {
+		if err := datavol.MountRecorded(ctx, deps, f.FS(), rec, datavol.Owner{}, nil); err != nil {
 			t.Fatalf("MountRecorded: %v", err)
 		}
 		if !f.Mounted(rigUUID) {
 			t.Fatal("the volume is not mounted after the retry")
 		}
-		attempts := 0
-		for _, c := range f.Calls {
-			if c == "mount "+rigUUID+" "+mp {
-				attempts++
-			}
-		}
-		if attempts < 2 {
-			t.Fatalf("mount was attempted %d time(s), want a retry: %v", attempts, f.Calls)
+		if vols.attempts < 2 {
+			t.Fatalf("mount was attempted %d time(s), want a retry", vols.attempts)
 		}
 	})
 
@@ -220,6 +230,60 @@ func TestMountRecordedIsIdempotent(t *testing.T) {
 		}
 		if err == nil {
 			t.Fatal("an unprivileged chown of the data root reported success")
+		}
+	})
+}
+
+// TestMountRecordedRefuses pins the two postures MountRecorded will not act
+// on, both of which arise from the record being a file that can be wrong. Both
+// refusals happen before anything is created, mounted or chowned.
+func TestMountRecordedRefuses(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a mount point no data root could be at", func(t *testing.T) {
+		for _, mp := range []string{"", "relative/path", "/", "/System/Volumes/Data", "/Users/someone", "/private/var"} {
+			f := datavoltest.New()
+			f.Add(datavoltest.Volume{UUID: rigUUID, Name: "k3sm", Container: "disk3", CaseSensitive: true})
+			rec := dataroot.Record{UUID: rigUUID, Name: "k3sm", Mountpoint: mp}
+
+			err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil)
+			if !errors.Is(err, datavol.ErrImplausibleMountpoint) {
+				t.Fatalf("MountRecorded(%q) = %v, want ErrImplausibleMountpoint", mp, err)
+			}
+			if len(f.Calls) != 0 {
+				t.Fatalf("MountRecorded(%q) acted: %v", mp, f.Calls)
+			}
+		}
+	})
+
+	t.Run("a record naming a volume that is not the one there", func(t *testing.T) {
+		shrinkRetry(t)
+		f := datavoltest.New()
+		mp := filepath.Join(t.TempDir(), "k3sm")
+		// The UUID answers, but it is somebody else's volume now.
+		f.Add(datavoltest.Volume{UUID: rigUUID, Name: "someone-elses", Container: "disk3", CaseSensitive: true})
+		rec := dataroot.Record{UUID: rigUUID, Name: "k3sm", Mountpoint: mp}
+
+		err := datavol.MountRecorded(ctx, f.Deps(), f.FS(), rec, datavol.Owner{}, nil)
+		if !errors.Is(err, datavol.ErrRecordMismatch) {
+			t.Fatalf("MountRecorded = %v, want ErrRecordMismatch", err)
+		}
+		if f.Mounted(rigUUID) {
+			t.Fatal("a volume the record does not describe was mounted at the data root")
+		}
+		// A record that names the wrong volume will name the wrong volume in
+		// ninety seconds too, so it is not retried.
+		attempts := 0
+		for _, c := range f.Calls {
+			if c == "info "+rigUUID {
+				attempts++
+			}
+		}
+		if attempts != 1 {
+			t.Fatalf("the mismatch was retried %d times: %v", attempts, f.Calls)
+		}
+		if _, err := os.Stat(mp); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the mount point was created before the record was verified: %v", err)
 		}
 	})
 }
