@@ -24,17 +24,38 @@ import (
 // Row names. They are the tokens `-o json` consumers key on, so they are stable
 // and lowercase, and Aggregate reads three of them by name.
 const (
-	RowInstall    = "install"
-	RowNetd       = "netd"
-	RowServer     = "server"
-	RowAPIServer  = "apiserver"
-	RowNode       = "node"
-	RowWorkloads  = "workloads"
-	RowDataRoot   = "data-root"
+	RowInstall   = "install"
+	RowNetd      = "netd"
+	RowServer    = "server"
+	RowAPIServer = "apiserver"
+	RowNode      = "node"
+	RowWorkloads = "workloads"
+	RowDataRoot  = "data-root"
+	// RowPreVolume is the copy a data-root migration left behind. The row
+	// exists only while the copy does.
+	RowPreVolume = "pre-volume"
+	// RowDatavol is the data-volume mount oneshot. The row exists only on a Mac
+	// that has a data volume.
+	RowDatavol    = "datavol"
 	RowDatastore  = "datastore"
 	RowKubeconfig = "kubeconfig"
 	RowRuntimed   = "runtimed"
 )
+
+// advisoryRows are the rows whose WARN is a note to the operator rather than a
+// claim about the cluster, and which therefore do not move the verdict off
+// running. There is exactly one, and it earns the exemption:
+//
+// pre-volume reports a leftover copy of the data root after a successful
+// migration. It is housekeeping — disk an operator may reclaim once they are
+// satisfied — and a cluster that is serving every request is not degraded
+// because a backup directory exists. Reporting it as degraded would teach an
+// operator that "degraded" does not mean anything, which is how a health
+// signal stops being read. The row itself still warns, in the table, with its
+// remedy; only the headline verdict is unmoved.
+//
+// A FAIL is never exempt, on any row.
+var advisoryRows = map[string]bool{RowPreVolume: true}
 
 // runningNext is the one suggestion a healthy cluster gets: there is nothing to
 // fix, so the next thing to run is the thing you came here to do.
@@ -79,7 +100,7 @@ func Aggregate(rows []Row, installed bool) (Verdict, string, []string) {
 	}
 	for _, sev := range []Severity{SeverityFail, SeverityWarn} {
 		for _, r := range rows {
-			if r.Severity == sev {
+			if r.Severity == sev && !(sev == SeverityWarn && advisoryRows[r.Name]) {
 				return VerdictDegraded, fmt.Sprintf("%s: %s", r.Name, r.Detail), nextSteps(rows, VerdictDegraded)
 			}
 		}

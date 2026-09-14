@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -65,12 +66,16 @@ type fakeFileInfo struct {
 	name string
 	mode fs.FileMode
 	uid  uint32
+	// size and mod are read by the pre-volume row, which reports how big the
+	// leftover copy is and how long it has been there.
+	size int64
+	mod  time.Time
 }
 
 func (f fakeFileInfo) Name() string       { return f.name }
-func (f fakeFileInfo) Size() int64        { return 0 }
+func (f fakeFileInfo) Size() int64        { return f.size }
 func (f fakeFileInfo) Mode() fs.FileMode  { return f.mode }
-func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeFileInfo) ModTime() time.Time { return f.mod }
 func (f fakeFileInfo) IsDir() bool        { return f.mode.IsDir() }
 func (f fakeFileInfo) Sys() any           { return &syscall.Stat_t{Uid: f.uid} }
 
@@ -176,9 +181,25 @@ type fakeDataRootFS struct {
 	missing bool
 	mounted bool
 	entries []string
+	// record is the data-volume record JSON served at
+	// dataroot.DefaultRecordPath; empty means this Mac has none.
+	record string
+	// blocks, bfree and bsize are what Statfs reports for a mounted data root,
+	// which is where the data-root row's "used" figure comes from. Zero blocks
+	// means the probe cannot answer, the posture the row must not dress up as
+	// an empty volume.
+	blocks, bfree, bsize uint64
+	// files are extra paths Stat answers for, e.g. the .pre-volume copy.
+	files map[string]fakeFileInfo
+	// tree is what ReadDir answers, by directory. The data root itself falls
+	// back to entries (the shadow listing) when it is not in here.
+	tree map[string][]fakeFileInfo
 }
 
 func (f fakeDataRootFS) Stat(path string) (fs.FileInfo, error) {
+	if info, ok := f.files[path]; ok {
+		return info, nil
+	}
 	if f.missing || path != f.dir {
 		return nil, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
 	}
@@ -193,17 +214,34 @@ func (f fakeDataRootFS) Statfs(path string, st *unix.Statfs_t) error {
 	copy(st.Mntonname[:], f.dir+"\x00")
 	copy(st.Fstypename[:], "apfs\x00")
 	copy(st.Mntfromname[:], "/dev/disk3s7\x00")
+	st.Blocks, st.Bfree, st.Bsize = f.blocks, f.bfree, uint32(f.bsize)
 	return nil
 }
 
+// ReadFile serves the two declaration sources by PATH. Serving one file for
+// every path would make the record and /etc/fstab indistinguishable, which is
+// the whole distinction the data-root row now reports on.
 func (f fakeDataRootFS) ReadFile(path string) ([]byte, error) {
-	if f.fstab == "" {
-		return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	switch {
+	case path == dataroot.FstabPath && f.fstab != "":
+		return []byte(f.fstab), nil
+	case path == dataroot.DefaultRecordPath && f.record != "":
+		return []byte(f.record), nil
 	}
-	return []byte(f.fstab), nil
+	return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
 }
 
-func (f fakeDataRootFS) ReadDir(string) ([]fs.DirEntry, error) {
+func (f fakeDataRootFS) ReadDir(path string) ([]fs.DirEntry, error) {
+	if listing, ok := f.tree[path]; ok {
+		out := make([]fs.DirEntry, 0, len(listing))
+		for _, info := range listing {
+			out = append(out, fs.FileInfoToDirEntry(info))
+		}
+		return out, nil
+	}
+	if path != f.dir {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	}
 	out := make([]fs.DirEntry, 0, len(f.entries))
 	for _, name := range f.entries {
 		out = append(out, fs.FileInfoToDirEntry(fakeFileInfo{name: name, mode: fs.ModeDir}))

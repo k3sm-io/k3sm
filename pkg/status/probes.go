@@ -134,11 +134,17 @@ type Paths struct {
 	LaunchDaemonDir string
 	NetdLabel       string
 	ServerLabel     string
-	DataRoot        string
-	WorkDir         string
-	NetdSocket      string
-	NetdLog         string
-	ServerLog       string
+	// DatavolLabel and DatavolLog are the data-volume mount oneshot's launchd
+	// label and log file. They are reported only on a Mac that has a data
+	// volume, which is the same condition under which `k3sm install` puts the
+	// daemon on disk at all.
+	DatavolLabel string
+	DatavolLog   string
+	DataRoot     string
+	WorkDir      string
+	NetdSocket   string
+	NetdLog      string
+	ServerLog    string
 }
 
 // tokenFlags are the argv flags whose VALUE is a credential. A log line that

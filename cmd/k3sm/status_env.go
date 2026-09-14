@@ -164,6 +164,8 @@ func statusPaths(workDir string) status.Paths {
 		LaunchDaemonDir: install.DefaultLaunchDaemonDir,
 		NetdLabel:       install.NetdLabel,
 		ServerLabel:     install.ServerLabel,
+		DatavolLabel:    install.DatavolLabel,
+		DatavolLog:      install.DatavolLogPath(),
 		DataRoot:        install.DefaultDataRoot,
 		WorkDir:         workDir,
 		NetdSocket:      install.DefaultNetdSocket,
