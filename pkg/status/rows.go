@@ -530,7 +530,7 @@ func (c Collector) dataRootRow() (Row, *dataroot.Record) {
 		}
 	case st.Mounted:
 		row.State, row.Severity = StateOK, SeverityOK
-		row.Detail = fmt.Sprintf("%s (%s volume %s, mounted)", c.Paths.DataRoot, st.FSType, st.VolumeName)
+		row.Detail = fmt.Sprintf("%s (%s device %s, mounted)", c.Paths.DataRoot, st.FSType, st.VolumeName)
 	default:
 		row.State, row.Severity = StateOK, SeverityOK
 		row.Detail = c.Paths.DataRoot + " (plain directory)"
@@ -639,14 +639,21 @@ func (c Collector) preVolumeRow() (Row, bool) {
 	if err != nil || !info.IsDir() {
 		return Row{}, false
 	}
-	size := c.treeBytes(path, preVolumeWalkBudget)
+	size, partial := c.treeBytes(path, preVolumeWalkBudget)
+	sizeText := datavol.FormatSize(size)
+	if partial {
+		// An unreadable subtree (an unprivileged run against a root-owned copy)
+		// or an exhausted budget under-counts; say so rather than print a
+		// smaller number as if it were the whole.
+		sizeText = "at least " + sizeText + ", re-run with sudo for the full size"
+	}
 	row := Row{
 		Name:     RowPreVolume,
 		State:    StateOK,
 		Severity: SeverityWarn,
-		Detail:   fmt.Sprintf("%s holds the pre-migration copy (%s, %s)", path, datavol.FormatSize(size), ageText(c.since(info.ModTime()))),
+		Detail:   fmt.Sprintf("%s holds the pre-migration copy (%s, %s)", path, sizeText, ageText(c.since(info.ModTime()))),
 		Remedy:   "sudo rm -r " + path + "   # once you are satisfied with the migrated cluster",
-		Wide:     map[string]string{"path": path, "bytes": fmt.Sprint(size)},
+		Wide:     map[string]string{"path": path, "bytes": fmt.Sprint(size), "partial": fmt.Sprint(partial)},
 	}
 	return row, true
 }
@@ -662,21 +669,25 @@ const preVolumeWalkBudget = 20000
 // treeBytes totals the regular files under root through the FS seam, visiting
 // at most budget entries. An unreadable subtree contributes nothing: the number
 // tells an operator whether the copy is worth reclaiming, and a permission
-// error on one directory must not turn that into no answer at all.
-func (c Collector) treeBytes(root string, budget int) uint64 {
-	var total uint64
+// error on one directory must not turn that into no answer at all. partial
+// reports that the total is a lower bound, because a directory could not be
+// read or the budget ran out.
+func (c Collector) treeBytes(root string, budget int) (total uint64, partial bool) {
 	visited := 0
 	var walk func(dir string, depth int)
 	walk = func(dir string, depth int) {
 		if visited >= budget || depth > preVolumeWalkDepth {
+			partial = true
 			return
 		}
 		entries, err := c.DataRoot.ReadDir(dir)
 		if err != nil {
+			partial = true
 			return
 		}
 		for _, e := range entries {
 			if visited >= budget {
+				partial = true
 				return
 			}
 			visited++
@@ -693,7 +704,7 @@ func (c Collector) treeBytes(root string, budget int) uint64 {
 		}
 	}
 	walk(root, 0)
-	return total
+	return total, partial
 }
 
 // preVolumeWalkDepth bounds the walk's recursion. A data root is shallow; a

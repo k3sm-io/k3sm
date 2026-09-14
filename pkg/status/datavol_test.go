@@ -63,7 +63,7 @@ func volumeFS(t *testing.T, dir, name string, quota, totalBytes, usedBytes uint6
 
 // TestDataRootRowNamesVolume is the gate for what `k3sm status` says about a
 // data root that lives on a k3sm-owned APFS volume. The old row could say only
-// "apfs volume disk3s7, mounted" — a device node and no bound — which is
+// "apfs device disk3s7, mounted" — a device node and no bound — which is
 // precisely the sentence the user docs' capacity claim rested on.
 func TestDataRootRowNamesVolume(t *testing.T) {
 	const dir = "/var/lib/k3sm"
@@ -319,5 +319,86 @@ func TestOneshotRow(t *testing.T) {
 				t.Errorf("wide log-path = %q, want %q", row.Wide["log-path"], logPath)
 			}
 		})
+	}
+}
+
+// TestPreVolumeRowPartialWalk pins that a size the walk could not finish is
+// reported as a lower bound, never as the whole: an unprivileged `k3sm status`
+// against a root-owned copy sees only what it may read (540M on the rig, for a
+// 1.8G tree), and printing that number bare would understate what the operator
+// is about to reclaim.
+func TestPreVolumeRowPartialWalk(t *testing.T) {
+	const dir = "/var/lib/k3sm"
+	preVolume := dir + ".pre-volume"
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name string
+		tree map[string][]fakeFileInfo
+		want string
+	}{
+		{
+			name: "an unreadable subtree makes the size a lower bound",
+			tree: map[string][]fakeFileInfo{
+				preVolume:             {{name: "server", mode: fs.ModeDir | 0o750}, {name: "top", size: 1 << 30}},
+				preVolume + "/server": nil, // present but its children are not readable: absent from the tree
+			},
+			want: "at least 1G, re-run with sudo",
+		},
+		{
+			name: "a fully readable tree is reported whole",
+			tree: map[string][]fakeFileInfo{
+				preVolume: {{name: "top", size: 1 << 30}},
+			},
+			want: "(1G, ",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys := volumeFS(t, dir, "k3sm", 100<<30, 100<<30, 30<<30)
+			fsys.files = map[string]fakeFileInfo{
+				preVolume: {name: ".pre-volume", mode: fs.ModeDir | 0o750, mod: now.Add(-50 * time.Hour)},
+			}
+			// A directory listed as a child but absent from tree answers ReadDir with
+			// an error, which is exactly what EACCES looks like through the seam.
+			tree := map[string][]fakeFileInfo{}
+			for k, v := range tc.tree {
+				if v != nil {
+					tree[k] = v
+				}
+			}
+			fsys.tree = tree
+			c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271, Now: func() time.Time { return now }}
+			row, ok := c.preVolumeRow()
+			if !ok {
+				t.Fatal("no pre-volume row")
+			}
+			if !strings.Contains(row.Detail, tc.want) {
+				t.Errorf("detail %q does not contain %q", row.Detail, tc.want)
+			}
+		})
+	}
+}
+
+// TestDataRootRowLegacyDevice pins the wording for a volume k3sm did not
+// declare: with no record there is no label to print, only the device node, and
+// the row must not call a device node a volume name.
+func TestDataRootRowLegacyDevice(t *testing.T) {
+	const dir = "/var/lib/k3sm"
+	fsys := volumeFS(t, dir, "k3sm", 0, 100<<30, 30<<30)
+	fsys.record = ""
+	fsys.fstab = "UUID=6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD " + dir + " apfs rw\n"
+	c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271}
+	row, rec := c.dataRootRow()
+	if rec != nil {
+		t.Fatal("a fstab-only data root reported a record")
+	}
+	if !strings.Contains(row.Detail, "apfs device disk3s7, mounted") {
+		t.Errorf("detail %q does not name the device node as a device", row.Detail)
+	}
+	if strings.Contains(row.Detail, "volume disk3s7") {
+		t.Errorf("detail %q calls a device node a volume", row.Detail)
+	}
+	if row.Wide["declared-by"] != "fstab" {
+		t.Errorf("wide declared-by = %q, want fstab", row.Wide["declared-by"])
 	}
 }
