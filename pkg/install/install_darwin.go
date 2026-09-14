@@ -461,6 +461,75 @@ func (darwinSystem) VerifyVirtualizationEntitlement(path string) error {
 	return nil
 }
 
+// EnsureRootDir creates dir root-owned at mode and re-applies both on an
+// existing directory, so a staging mount point left behind by an interrupted
+// migration is repaired rather than reused at whatever mode it was found with.
+func (darwinSystem) EnsureRootDir(dir string, mode fs.FileMode) error {
+	if err := os.MkdirAll(dir, mode); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	if err := os.Chown(dir, 0, 0); err != nil {
+		return fmt.Errorf("chown %s root:wheel: %w", dir, err)
+	}
+	// MkdirAll skips an existing directory, so the chmod is what repairs one.
+	if err := os.Chmod(dir, mode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", dir, mode, err)
+	}
+	return nil
+}
+
+// CopyTree copies src into dst with ditto(1), the same tool CopyToRootOwned
+// uses and for the same reason: it preserves ownership, modes, extended
+// attributes and ACLs, every one of which the migration's verification then
+// compares. The trailing separators matter — `ditto <src>/ <dst>/` copies the
+// CONTENTS of src into dst, where `ditto <src> <dst>` would copy src as a child
+// of dst on some argument shapes.
+func (darwinSystem) CopyTree(src, dst string) error {
+	out, err := exec.Command("ditto", filepath.Clean(src)+"/", filepath.Clean(dst)+"/").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ditto %s/ -> %s/: %w: %s", src, dst, err, out)
+	}
+	return nil
+}
+
+// Rename moves old to new within one filesystem.
+func (darwinSystem) Rename(old, new string) error {
+	if err := os.Rename(old, new); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", old, new, err)
+	}
+	return nil
+}
+
+// RemoveTree deletes path and everything under it. See the System interface for
+// why it is separate from RemoveAll.
+func (darwinSystem) RemoveTree(path string) error {
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+	return nil
+}
+
+// LookupServiceUID resolves the service account's uid. A user that does not
+// exist is (0, false), not an error: install legitimately reaches this before
+// EnsureServiceUser has created _k3sm.
+func (darwinSystem) LookupServiceUID(name string) (int, bool) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return 0, false
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, false
+	}
+	return uid, true
+}
+
+// WriteDataVolumeRecord writes the record through pkg/dataroot, which owns its
+// encoding, its version stamp, its 0644 mode and its temp-and-rename.
+func (darwinSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) error {
+	return dataroot.WriteRecord(path, rec)
+}
+
 // WriteLaunchDaemon writes the plist root:wheel 0644.
 func (darwinSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {

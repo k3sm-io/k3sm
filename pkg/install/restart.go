@@ -104,7 +104,7 @@ func restartDaemons(ctx context.Context, sys System, m []artifact, logger *slog.
 		// does, so a failure anywhere in the sequence — including in the bootout
 		// itself — can have left this label down.
 		touched = append(touched, a.label)
-		if err := restartDaemon(ctx, sys, a.label, logger); err != nil {
+		if err := restartDaemon(ctx, sys, a.label, a.oneshot, logger); err != nil {
 			recovery := recoverBootedOut(sys, touched)
 			states, _ := daemonStates(sys)
 			return fmt.Errorf("%w; %s; daemon state: %s", err, recovery, strings.Join(states, ", "))
@@ -114,7 +114,14 @@ func restartDaemons(ctx context.Context, sys System, m []artifact, logger *slog.
 }
 
 // restartDaemon runs one label's bootout → await-unloaded → bootstrap → await-running.
-func restartDaemon(ctx context.Context, sys System, label string, logger *slog.Logger) error {
+//
+// A ONESHOT (io.k3sm.datavol) ends at await-LOADED instead. It mounts and exits,
+// so waiting for a live pid would be waiting for a state the job is designed not
+// to be in: on a fast machine it has already finished by the time the wait
+// starts, and the install would fail on a job that did exactly what it was asked
+// to do. Loaded is the whole claim install makes about it -- the mount itself was
+// performed, synchronously and with its own retry, before any of this ran.
+func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, logger *slog.Logger) error {
 	b := restartBudgetFor(label)
 	if err := sys.LaunchctlBootout(label); err != nil {
 		return fmt.Errorf("bootout stale %s before (re)bootstrap: %w", label, err)
@@ -125,12 +132,68 @@ func restartDaemon(ctx context.Context, sys System, label string, logger *slog.L
 	if err := bootstrapWithRetry(ctx, sys, label, b); err != nil {
 		return err
 	}
+	if oneshot {
+		if err := awaitLoaded(ctx, sys, label, b); err != nil {
+			return err
+		}
+		logger.Info("oneshot daemon loaded on the freshly installed binary", "label", label)
+		return nil
+	}
 	pid, err := awaitRunning(ctx, sys, label, b)
 	if err != nil {
 		return err
 	}
 	logger.Info("daemon restarted on the freshly installed binary", "label", label, "pid", pid)
 	return nil
+}
+
+// bootoutDaemons stops the long-running daemons, in REVERSE manifest order --
+// the server before the netd helper it drives -- and waits for each to leave the
+// system domain. A label that is not loaded is a no-op success, so it is safe on
+// a first install.
+//
+// The data-root migration needs it: copying a live datastore is copying a file
+// being written, and the verification that follows would be comparing a moving
+// target. Oneshots are skipped; there is nothing to stop.
+func bootoutDaemons(ctx context.Context, sys System, m []artifact, logger *slog.Logger) error {
+	for i := len(m) - 1; i >= 0; i-- {
+		a := m[i]
+		if a.kind != kindDaemon || a.oneshot {
+			continue
+		}
+		if err := sys.LaunchctlBootout(a.label); err != nil {
+			return fmt.Errorf("bootout %s: %w", a.label, err)
+		}
+		if err := awaitUnloaded(ctx, sys, a.label, restartBudgetFor(a.label)); err != nil {
+			return err
+		}
+		logger.Info("daemon stopped for the data-root migration", "label", a.label)
+	}
+	return nil
+}
+
+// awaitLoaded blocks until launchd has the label in the system domain, whether
+// or not it has a process. It is the oneshot's success condition: pid 0 is the
+// ordinary state of a job that ran and exited, and LaunchctlServicePID's ERROR
+// is the only thing that means "not there".
+func awaitLoaded(ctx context.Context, sys System, label string, b restartBudget) error {
+	deadline := time.Now().Add(b.running)
+	var last error
+	for {
+		_, err := sys.LaunchctlServicePID(label)
+		if err == nil {
+			return nil
+		}
+		last = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s was not loaded within %s of its bootstrap: %w", label, b.running, last)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(b.poll):
+		}
+	}
 }
 
 // awaitUnloaded blocks until launchd no longer has the label in the system domain.
@@ -296,6 +359,11 @@ func awaitPath(ctx context.Context, sys System, path string, b restartBudget) er
 // used both by the post-restart verification and by the mid-restart failure path,
 // so an operator reading either error reads the same sentence about the same
 // machine and never has to guess which daemon survived.
+//
+// It names the two LONG-RUNNING daemons only. The datavol oneshot is deliberately
+// absent: its healthy state is "ran and exited", which this function would report
+// as DOWN and verifyDaemons would then fail the install over. `k3sm status` reads
+// its last exit code, which is the question that actually has an answer.
 func daemonStates(sys System) ([]string, bool) {
 	states := make([]string, 0, 2)
 	healthy := true

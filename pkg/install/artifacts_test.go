@@ -17,10 +17,13 @@ limitations under the License.
 package install
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 )
 
@@ -97,4 +100,88 @@ func TestVMHostNameMatchesRuntimed(t *testing.T) {
 	if VMHostName != "k3sm-vmhost" {
 		t.Errorf("VMHostName = %q, want k3sm-vmhost (runtimed's sandbox.VMHostName)", VMHostName)
 	}
+}
+
+// TestManifestDataVolumeEntries pins the two CONDITIONAL manifest entries the
+// data volume adds, and the one property the manifest exists to hold: whatever
+// install lays down, uninstall tears down.
+//
+// Conditional entries are the interesting case precisely because they are easy
+// to get half right. An entry that appears when it should not makes uninstall
+// boot out a label that was never installed; one that is missing when it should
+// be there leaks a root LaunchDaemon pointing at a deleted binary, which is the
+// original leak this manifest was written to end.
+func TestManifestDataVolumeEntries(t *testing.T) {
+	plain := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}.withDefaults()
+	declared := withDeclaredVolume(plain)
+
+	t.Run("absent on a Mac with no data volume", func(t *testing.T) {
+		for _, a := range artifactManifest(plain) {
+			if a.label == DatavolLabel {
+				t.Errorf("the datavol daemon is in the manifest of a Mac with no data volume: %+v", a)
+			}
+			if a.path == dataroot.DefaultRecordPath {
+				t.Errorf("the record is in the manifest of a Mac with no data volume: %+v", a)
+			}
+		}
+	})
+
+	t.Run("the daemon sits immediately before netd", func(t *testing.T) {
+		m := artifactManifest(declared)
+		var daemons []string
+		for _, a := range m {
+			if a.kind == kindDaemon {
+				daemons = append(daemons, a.label)
+			}
+		}
+		want := []string{DatavolLabel, NetdLabel, ServerLabel}
+		if strings.Join(daemons, ",") != strings.Join(want, ",") {
+			t.Fatalf("daemon order = %v, want %v (install writes plists and restarts jobs in this order, so the mount is attempted before the two daemons that refuse an unmounted data root)", daemons, want)
+		}
+	})
+
+	t.Run("the daemon is a removable oneshot and the record is preserved", func(t *testing.T) {
+		var daemon, record artifact
+		for _, a := range artifactManifest(declared) {
+			switch {
+			case a.label == DatavolLabel:
+				daemon = a
+			case a.path == dataroot.DefaultRecordPath:
+				record = a
+			}
+		}
+		if daemon.label == "" || record.path == "" {
+			t.Fatalf("manifest is missing the datavol entries: daemon=%+v record=%+v", daemon, record)
+		}
+		if !daemon.oneshot {
+			t.Error("the datavol daemon is not marked oneshot; the restart would wait for a pid it never has")
+		}
+		if daemon.disp != dispRemove {
+			t.Errorf("datavol disposition = %v, want dispRemove", daemon.disp)
+		}
+		if daemon.assertExists {
+			t.Error("the datavol plist's existence must not be asserted: a Mac asking for its first volume has none yet")
+		}
+		if record.disp != dispPreserve {
+			t.Errorf("record disposition = %v, want dispPreserve (uninstall keeps the volume, so it must keep the declaration)", record.disp)
+		}
+	})
+
+	t.Run("uninstall still covers everything install lays down", func(t *testing.T) {
+		r := newDatavolRig(t)
+		r.seedRecord(t, "6DEAE471-0000-0000-0000-00000000BBBB")
+		if err := os.MkdirAll(r.cfg.DataRoot, 0o750); err != nil {
+			t.Fatalf("create the mount point: %v", err)
+		}
+		if err := Install(context.Background(), r.sys, r.cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		un := &fakeSystem{}
+		if err := Uninstall(context.Background(), un, r.cfg); err != nil {
+			t.Fatalf("Uninstall: %v", err)
+		}
+		if gaps := uninstallGaps(withDeclaredVolume(r.cfg), r.sys.calls, un.calls); len(gaps) != 0 {
+			t.Errorf("uninstall leaves install artifacts behind: %v", gaps)
+		}
+	})
 }
