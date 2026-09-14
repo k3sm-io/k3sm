@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/install"
@@ -227,6 +229,80 @@ func TestDatavolStatusJSONShape(t *testing.T) {
 		var text bytes.Buffer
 		if err := runDatavolStatus([]string{"--record", recordPath, "-o", "yaml"}, &text); err == nil {
 			t.Fatal("datavol status accepted an output format it cannot render")
+		}
+	})
+}
+
+// TestDatavolStatusUsedSource is the gate for which probe the reported usage
+// comes from. It exists because statfs(2) answers the question WRONG on a
+// quota-less APFS volume -- it reports the container's block counts, so its
+// "used" is the whole disk's, which on the lab rig read 790G for a volume
+// holding 34.8G. The bug is invisible in the output, so the test asserts the
+// SOURCE alongside the number.
+func TestDatavolStatusUsedSource(t *testing.T) {
+	const block = 4096
+	// A 1 TB container that is 790G full, holding a much smaller k3sm volume.
+	sfs := &unix.Statfs_t{
+		Bsize:  block,
+		Blocks: (1000 << 30) / block,
+		Bfree:  (210 << 30) / block,
+		Bavail: (210 << 30) / block,
+	}
+	const volumeInUse = 37357522944 // 34.8G, what diskutil says about the volume
+	apfs := func(string) (uint64, bool) { return volumeInUse, true }
+	unreachable := func(string) (uint64, bool) { return 0, false }
+
+	t.Run("with a quota, statfs is the source", func(t *testing.T) {
+		rec := &dataroot.Record{UUID: "u", QuotaBytes: 100 << 30}
+		got := volumeCapacity(sfs, rec, apfs)
+		if got.UsedSource != "statfs" {
+			t.Errorf("usedSource = %q, want statfs: a quota'd volume's statfs reports the volume, and it is what the reclaim ladder reads", got.UsedSource)
+		}
+		if got.UsedBytes == nil || *got.UsedBytes != (790<<30) {
+			t.Errorf("usedBytes = %v, want the statfs figure", got.UsedBytes)
+		}
+	})
+
+	t.Run("without a quota, APFS capacity is the source", func(t *testing.T) {
+		rec := &dataroot.Record{UUID: "u"}
+		got := volumeCapacity(sfs, rec, apfs)
+		if got.UsedSource != "apfs" {
+			t.Errorf("usedSource = %q, want apfs", got.UsedSource)
+		}
+		if got.UsedBytes == nil || *got.UsedBytes != volumeInUse {
+			t.Errorf("usedBytes = %v, want the volume's own %d and never the container's", got.UsedBytes, uint64(volumeInUse))
+		}
+		// total and avail stay statfs's, which is what the brief and the kernel
+		// both mean by them.
+		if got.TotalBytes != 1000<<30 || got.AvailBytes != 210<<30 {
+			t.Errorf("total/avail = %d/%d, want the statfs figures unchanged", got.TotalBytes, got.AvailBytes)
+		}
+	})
+
+	t.Run("without a quota and without diskutil, usage is omitted", func(t *testing.T) {
+		rec := &dataroot.Record{UUID: "u"}
+		got := volumeCapacity(sfs, rec, unreachable)
+		if got.UsedBytes != nil {
+			t.Errorf("usedBytes = %d, want it omitted: nothing measured this volume", *got.UsedBytes)
+		}
+		if got.UsedSource != "unknown" {
+			t.Errorf("usedSource = %q, want unknown", got.UsedSource)
+		}
+		// A consumer that reads usedBytes without reading usedSource must find
+		// nothing there rather than a container-wide number.
+		data, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if strings.Contains(string(data), "usedBytes") {
+			t.Errorf("the JSON carries usedBytes for an unmeasured volume: %s", data)
+		}
+	})
+
+	t.Run("no record, no usage claim", func(t *testing.T) {
+		got := volumeCapacity(sfs, nil, apfs)
+		if got.UsedBytes != nil || got.UsedSource != "unknown" {
+			t.Errorf("capacity = %+v, want no usage claim without a record", got)
 		}
 	})
 }

@@ -17,14 +17,18 @@ limitations under the License.
 package status
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/datavol/datavoltest"
 )
 
 // recordJSON is a data-volume record declaring dir, as it would sit on disk.
@@ -32,7 +36,7 @@ func recordJSON(t *testing.T, dir, name string, quota uint64) string {
 	t.Helper()
 	data, err := json.Marshal(dataroot.Record{
 		Version:    dataroot.RecordVersion,
-		UUID:       "6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD",
+		UUID:       recordUUID,
 		Name:       name,
 		Mountpoint: dir,
 		QuotaBytes: quota,
@@ -44,6 +48,22 @@ func recordJSON(t *testing.T, dir, name string, quota uint64) string {
 	}
 	return string(data)
 }
+
+// volumeSeam is a diskutil read surface reporting one k3sm volume using inUse
+// bytes -- the figure a quota-less volume's row must take from here rather than
+// from statfs.
+func volumeSeam(t *testing.T, inUse uint64) datavol.Volumes {
+	t.Helper()
+	fake := datavoltest.New()
+	fake.Add(datavoltest.Volume{
+		UUID: recordUUID, Name: "k3sm-pods", Container: "disk3", Device: "disk3s7",
+		InUse: inUse, CaseSensitive: true,
+	})
+	return fake
+}
+
+// recordUUID is the volume every record in this file declares.
+const recordUUID = "6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD"
 
 // volumeFS is a mounted data volume of the given size, used fraction and quota.
 func volumeFS(t *testing.T, dir, name string, quota, totalBytes, usedBytes uint64) fakeDataRootFS {
@@ -74,7 +94,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, rec := c.dataRootRow()
+		row, rec := c.dataRootRow(context.Background())
 		if rec == nil {
 			t.Fatal("dataRootRow did not report the record, so no datavol row would be shown")
 		}
@@ -94,15 +114,25 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 		}
 	})
 
-	t.Run("a volume with no quota never reads 'of 0'", func(t *testing.T) {
+	t.Run("no quota: usage comes from APFS capacity, never statfs", func(t *testing.T) {
+		// The statfs numbers describe a 790G container, which is what the kernel
+		// reports for a quota-less APFS volume and what the row used to print as
+		// the volume's usage. The volume itself holds 34.8G, and only diskutil
+		// knows that.
+		fsys := volumeFS(t, dir, "k3sm-pods", 0, 1000<<30, 790<<30)
+		const inUse = 37357522944 // 34.8G
 		c := Collector{
-			DataRoot:   volumeFS(t, dir, "k3sm-pods", 0, 500<<30, 30<<30),
+			DataRoot:   fsys,
+			Volumes:    volumeSeam(t, inUse),
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, _ := c.dataRootRow()
-		if !strings.Contains(row.Detail, "30G used") {
-			t.Errorf("detail %q does not report the usage", row.Detail)
+		row, _ := c.dataRootRow(context.Background())
+		if !strings.Contains(row.Detail, "34.8G used, no quota") {
+			t.Errorf("detail %q does not report the VOLUME's usage", row.Detail)
+		}
+		if strings.Contains(row.Detail, "790") {
+			t.Errorf("detail %q reports the container's usage as the volume's", row.Detail)
 		}
 		if strings.Contains(row.Detail, "of 0") {
 			t.Errorf("detail %q claims a bound the volume does not have", row.Detail)
@@ -113,6 +143,34 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 		if row.Wide["quota"] != "none" {
 			t.Errorf("wide quota = %q, want none", row.Wide["quota"])
 		}
+		if row.Wide["used-source"] != usedFromAPFS || row.Wide["used"] != "34.8G" {
+			t.Errorf("wide used=%q source=%q, want 34.8G from apfs", row.Wide["used"], row.Wide["used-source"])
+		}
+	})
+
+	t.Run("no quota and no probe: usage omitted, never guessed", func(t *testing.T) {
+		c := Collector{
+			DataRoot:   volumeFS(t, dir, "k3sm-pods", 0, 1000<<30, 790<<30),
+			Paths:      testPaths(""),
+			ServiceUID: 271,
+		}
+		row, _ := c.dataRootRow(context.Background())
+		if !strings.Contains(row.Detail, "apfs volume k3sm-pods, no quota, mounted") {
+			t.Errorf("detail = %q, want the volume named with no usage figure at all", row.Detail)
+		}
+		// The whole point: with no way to measure the volume, the row says
+		// nothing rather than repeating what statfs said about the container.
+		for _, wrong := range []string{"used", "790"} {
+			if strings.Contains(row.Detail, wrong) {
+				t.Errorf("detail %q contains %q, but nothing measured this volume", row.Detail, wrong)
+			}
+		}
+		if row.Wide["used-source"] != usedFromNowhere {
+			t.Errorf("wide used-source = %q, want %q", row.Wide["used-source"], usedFromNowhere)
+		}
+		if _, ok := row.Wide["used"]; ok {
+			t.Errorf("wide carries used = %q for a volume nothing measured", row.Wide["used"])
+		}
 	})
 
 	t.Run("at 90 percent of quota the row warns and says what reclaim frees", func(t *testing.T) {
@@ -121,7 +179,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, _ := c.dataRootRow()
+		row, _ := c.dataRootRow(context.Background())
 		if row.Severity != SeverityWarn {
 			t.Errorf("severity = %v, want warn at 92%% of the quota", row.Severity)
 		}
@@ -147,7 +205,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			entries: []string{"run"},
 		}
 		c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271}
-		row, _ := c.dataRootRow()
+		row, _ := c.dataRootRow(context.Background())
 		if row.State != StateNotMounted || row.Severity != SeverityFail {
 			t.Fatalf("row = %s/%v, want not-mounted/fail", row.State, row.Severity)
 		}
@@ -171,7 +229,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			entries: []string{"run"},
 		}
 		c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: RuntimeReachableUnknownUID}
-		row, rec := c.dataRootRow()
+		row, rec := c.dataRootRow(context.Background())
 		if rec != nil {
 			t.Error("an fstab line is not a k3sm record")
 		}
@@ -388,7 +446,7 @@ func TestDataRootRowLegacyDevice(t *testing.T) {
 	fsys.record = ""
 	fsys.fstab = "UUID=6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD " + dir + " apfs rw\n"
 	c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271}
-	row, rec := c.dataRootRow()
+	row, rec := c.dataRootRow(context.Background())
 	if rec != nil {
 		t.Fatal("a fstab-only data root reported a record")
 	}
@@ -401,4 +459,60 @@ func TestDataRootRowLegacyDevice(t *testing.T) {
 	if row.Wide["declared-by"] != "fstab" {
 		t.Errorf("wide declared-by = %q, want fstab", row.Wide["declared-by"])
 	}
+}
+
+// TestInstallRowCountsDatavolPlist is the gate for the install row's count of
+// LaunchDaemons, which was a hard-coded "2" and therefore became a lie the
+// moment `k3sm install --data-volume` wrote a third plist into the same
+// directory. An operator reading "2 LaunchDaemons" while three sit there
+// cannot tell whether the tool or the machine is wrong.
+func TestInstallRowCountsDatavolPlist(t *testing.T) {
+	paths := testPaths("")
+	paths.DatavolLabel = "io.k3sm.datavol"
+	paths.DatavolLog = "/var/log/k3sm/datavol.log"
+	datavolPlist := filepath.Join(paths.LaunchDaemonDir, paths.DatavolLabel+".plist")
+
+	t.Run("a third plist on disk is counted", func(t *testing.T) {
+		fsys := installedFS(paths)
+		fsys.present[datavolPlist] = true
+		c := Collector{FS: fsys, Paths: paths}
+
+		row, installed := c.installRow(true)
+		if !installed || row.State != StateOK {
+			t.Fatalf("row = %s (installed=%t), want a complete install", row.State, installed)
+		}
+		if !strings.Contains(row.Detail, "3 LaunchDaemons") {
+			t.Errorf("detail = %q, want it to count the three plists that are there", row.Detail)
+		}
+	})
+
+	t.Run("no data volume: two, exactly as before", func(t *testing.T) {
+		c := Collector{FS: installedFS(paths), Paths: paths}
+		row, installed := c.installRow(false)
+		if !installed || row.State != StateOK {
+			t.Fatalf("row = %s (installed=%t), want a complete install", row.State, installed)
+		}
+		if !strings.Contains(row.Detail, "2 LaunchDaemons") {
+			t.Errorf("detail = %q, want the unchanged two-daemon sentence", row.Detail)
+		}
+	})
+
+	t.Run("a record with no plist reports the plist missing", func(t *testing.T) {
+		c := Collector{FS: installedFS(paths), Paths: paths}
+		row, _ := c.installRow(true)
+		if row.State != StatePartial || row.Severity != SeverityWarn {
+			t.Fatalf("row = %s/%v, want partial/warn: the record says this Mac should have the mount daemon", row.State, row.Severity)
+		}
+		if !strings.Contains(row.Detail, paths.DatavolLabel+".plist") {
+			t.Errorf("detail = %q does not name the missing plist", row.Detail)
+		}
+	})
+
+	t.Run("no record and no plist is not missing anything", func(t *testing.T) {
+		c := Collector{FS: installedFS(paths), Paths: paths}
+		row, _ := c.installRow(false)
+		if row.State != StateOK {
+			t.Errorf("row = %s, want ok: a Mac with no data volume is complete without the mount daemon", row.State)
+		}
+	})
 }

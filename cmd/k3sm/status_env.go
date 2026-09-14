@@ -40,6 +40,7 @@ import (
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 
+	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
@@ -106,6 +107,10 @@ func newStatusCollector() status.Collector {
 		Procs:      procTable{},
 		Runtimed:   runtimedFor(euid, serviceUID, runtimed.DefaultSocketPath),
 		DataRoot:   dataRootFS{},
+		// The diskutil read surface, for the one figure statfs cannot answer:
+		// how much a quota-less data volume is using. `diskutil apfs list` needs
+		// no privilege, so this is wired for every caller, not just root.
+		Volumes:    datavol.NewDarwin().Volumes,
 		Paths:      statusPaths(workDir),
 		EUID:       euid,
 		ServiceUID: serviceUID,

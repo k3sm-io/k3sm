@@ -27,6 +27,7 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -206,6 +207,18 @@ type Collector struct {
 	Procs      Procs
 	Runtimed   Runtimed
 	DataRoot   dataroot.FS
+	// Volumes is the diskutil read surface, and it is OPTIONAL: a nil Volumes
+	// simply means one figure goes unreported.
+	//
+	// It exists for exactly one question -- how much a data volume that carries
+	// NO quota is using. statfs(2) cannot answer it: on a quota-less APFS
+	// volume the kernel reports the whole CONTAINER's block counts, so the
+	// "used" it yields is the entire disk's usage and not the volume's (on the
+	// lab rig, 790G against a 34.8G volume). diskutil's container listing is the
+	// only source of the volume's own figure, and it needs no privilege to read.
+	// A volume WITH a quota is exempt: statfs reports the quota there, which is
+	// the bound the reclaim ladder reads, so it stays the source.
+	Volumes    datavol.Volumes
 	Paths      Paths
 	EUID       int
 	ServiceUID int

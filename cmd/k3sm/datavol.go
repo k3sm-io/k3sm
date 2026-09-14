@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -128,13 +129,24 @@ type datavolStatusReport struct {
 	PreVolume datavolPreVolume `json:"preVolume"`
 }
 
-// datavolStatfs is what statfs(2) says about the mounted volume. It is the
-// number the reclaim ladder and the DiskPressure floor actually read, which is
-// why status reports it rather than the quota alone.
+// datavolStatfs is the mounted volume's capacity. Total and avail are what
+// statfs(2) says -- the numbers the reclaim ladder and the DiskPressure floor
+// actually read, which is why status reports them rather than the quota alone.
+//
+// Used is not always statfs's, and UsedSource says so. On a quota-less APFS
+// volume statfs reports the whole CONTAINER's block counts, so its "used" is
+// the entire disk's usage wearing the volume's name; diskutil's container
+// listing is the only source of the volume's own figure there. A consumer reads
+// usedSource before it trusts usedBytes.
 type datavolStatfs struct {
 	TotalBytes uint64 `json:"totalBytes"`
 	AvailBytes uint64 `json:"availBytes"`
-	UsedBytes  uint64 `json:"usedBytes"`
+	// UsedBytes is absent when no probe could measure it. It is a pointer so
+	// that absence cannot be read as an empty volume: a report that says a full
+	// volume is empty is worse than one that says nothing.
+	UsedBytes *uint64 `json:"usedBytes,omitempty"`
+	// UsedSource is "statfs", "apfs" or "unknown".
+	UsedSource string `json:"usedSource"`
 }
 
 // datavolPreVolume reports the copy a migration left beside the data root.
@@ -182,13 +194,9 @@ func runDatavolStatus(args []string, out io.Writer) error {
 		if err := unix.Statfs(dir, &sfs); err != nil {
 			return fmt.Errorf("statfs %s: %w", dir, err)
 		}
-		total := sfs.Blocks * uint64(sfs.Bsize)
-		avail := sfs.Bavail * uint64(sfs.Bsize)
-		report.Statfs = &datavolStatfs{
-			TotalBytes: total,
-			AvailBytes: avail,
-			UsedBytes:  (sfs.Blocks - sfs.Bfree) * uint64(sfs.Bsize),
-		}
+		report.Statfs = volumeCapacity(&sfs, rec, func(uuid string) (uint64, bool) {
+			return apfsVolumeUsed(context.Background(), uuid)
+		})
 	}
 	preVolume := dir + datavol.PreVolumeSuffix
 	if info, err := os.Stat(preVolume); err == nil && info.IsDir() {
@@ -225,8 +233,10 @@ func writeDatavolStatusText(out io.Writer, dir string, r datavolStatusReport) er
 		{"mounted", fmt.Sprint(r.Mounted)},
 	}
 	if r.Statfs != nil {
+		if r.Statfs.UsedBytes != nil {
+			lines = append(lines, [2]string{"used", datavol.FormatSize(*r.Statfs.UsedBytes) + " (from " + r.Statfs.UsedSource + ")"})
+		}
 		lines = append(lines,
-			[2]string{"used", datavol.FormatSize(r.Statfs.UsedBytes)},
 			[2]string{"avail", datavol.FormatSize(r.Statfs.AvailBytes)},
 			[2]string{"total", datavol.FormatSize(r.Statfs.TotalBytes)},
 		)
@@ -241,6 +251,72 @@ func writeDatavolStatusText(out io.Writer, dir string, r datavolStatusReport) er
 	}
 	return nil
 }
+
+// volumeCapacity assembles the capacity block, choosing the source of the USED
+// figure by whether the volume carries a quota.
+//
+// With a quota, statfs reports the volume's own bound and usage, which is also
+// what runtimed's reclaim ladder reads, so it stays the source. Without one,
+// statfs reports the CONTAINER's block counts -- its "used" is the whole disk's
+// -- and diskutil is the only source of the volume's own figure. When that
+// cannot be reached the figure is omitted, because printing the container's
+// usage under the volume's name is worse than printing nothing.
+//
+// apfsUsed is a parameter so this decision is testable without a disk.
+func volumeCapacity(sfs *unix.Statfs_t, rec *dataroot.Record, apfsUsed func(uuid string) (uint64, bool)) *datavolStatfs {
+	capacity := &datavolStatfs{
+		TotalBytes: sfs.Blocks * uint64(sfs.Bsize),
+		AvailBytes: sfs.Bavail * uint64(sfs.Bsize),
+		UsedSource: usedFromNowhere,
+	}
+	switch {
+	case rec == nil:
+		// No record: nothing claims this directory is a k3sm volume, so there is
+		// no volume whose usage could be asked for.
+	case rec.QuotaBytes > 0:
+		used := (sfs.Blocks - sfs.Bfree) * uint64(sfs.Bsize)
+		capacity.UsedBytes, capacity.UsedSource = &used, usedFromStatfs
+	default:
+		if used, ok := apfsUsed(rec.UUID); ok {
+			capacity.UsedBytes, capacity.UsedSource = &used, usedFromAPFS
+		}
+	}
+	return capacity
+}
+
+// The three answers to "where did the used figure come from". They are the same
+// tokens `k3sm status` puts in its used-source column, stated here because the
+// JSON is a machine interface and the two must not drift.
+const (
+	usedFromStatfs  = "statfs"
+	usedFromAPFS    = "apfs"
+	usedFromNowhere = "unknown"
+)
+
+// apfsVolumeUsed asks diskutil how much the volume itself is using: one Info to
+// learn its container, one Capacity to read its usage inside it. Both are
+// unprivileged, and both are bounded -- a status command that hangs on a disk
+// probe is a status command nobody runs twice.
+func apfsVolumeUsed(ctx context.Context, uuid string) (uint64, bool) {
+	if uuid == "" {
+		return 0, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, datavolProbeBudget)
+	defer cancel()
+	volumes := datavol.NewDarwin().Volumes
+	info, err := volumes.Info(ctx, uuid)
+	if err != nil || info.ContainerReference == "" {
+		return 0, false
+	}
+	capacity, err := volumes.Capacity(ctx, info.ContainerReference, uuid)
+	if err != nil {
+		return 0, false
+	}
+	return capacity.InUse, true
+}
+
+// datavolProbeBudget bounds the two diskutil reads together.
+const datavolProbeBudget = 3 * time.Second
 
 // treeBytes totals the regular files under root. It is best effort by design:
 // an unreadable subtree contributes nothing rather than failing a status

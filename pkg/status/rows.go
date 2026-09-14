@@ -53,13 +53,13 @@ func (c Collector) Collect(ctx context.Context) Report {
 		now = c.Now
 	}
 
-	install, installed := c.installRow()
+	dataRoot, volume := c.dataRootRow(ctx)
+	install, installed := c.installRow(volume != nil)
 	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
 	server, serverPID := c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
 	c.crashLoop(&server)
 	apiserver := c.apiserverRow(ctx)
 	serving := apiserver.Severity == SeverityOK
-	dataRoot, volume := c.dataRootRow()
 
 	rows := []Row{install}
 	// The mount oneshot goes before netd, mirroring the order install lays the
@@ -122,11 +122,17 @@ func (c Collector) plistPath(label string) string {
 // the BINARY plus the SERVER plist, not on all four parts, because a machine
 // with those two has a cluster to report on even if the launcher link was
 // removed by hand.
-func (c Collector) installRow() (Row, bool) {
+func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
 	row := Row{Name: RowInstall, Remedy: "sudo k3sm install"}
 	binary := c.exists(c.Paths.Binary)
 	netdPlist := c.exists(c.plistPath(c.Paths.NetdLabel))
 	serverPlist := c.exists(c.plistPath(c.Paths.ServerLabel))
+	// The mount oneshot is counted when it is THERE and demanded when a record
+	// says it should be. Those are different conditions on purpose: a Mac with
+	// no data volume is complete without it, and a plist left behind by a
+	// deleted volume is still a plist in that directory, so saying "2
+	// LaunchDaemons" while three sit there would be a count nobody can verify.
+	datavolPlist := c.Paths.DatavolLabel != "" && c.exists(c.plistPath(c.Paths.DatavolLabel))
 
 	link := false
 	if c.FS != nil {
@@ -149,12 +155,26 @@ func (c Collector) installRow() (Row, bool) {
 	if !serverPlist {
 		missing = append(missing, c.Paths.ServerLabel+".plist")
 	}
+	// parts is how many pieces a COMPLETE install has here, so the all-missing
+	// arm below stays "every piece is gone" rather than a hard-coded four that a
+	// fifth artifact silently falsified.
+	parts := 4
+	if hasDataVolume {
+		parts = 5
+		if !datavolPlist {
+			missing = append(missing, c.Paths.DatavolLabel+".plist")
+		}
+	}
+	daemons := 2
+	if datavolPlist {
+		daemons = 3
+	}
 
 	switch {
 	case len(missing) == 0:
 		row.State, row.Severity, row.Remedy = StateOK, SeverityOK, ""
-		row.Detail = fmt.Sprintf("%s · launcher %s · 2 LaunchDaemons in %s", c.Paths.Binary, c.Paths.Link, c.Paths.LaunchDaemonDir)
-	case len(missing) == 4:
+		row.Detail = fmt.Sprintf("%s · launcher %s · %d LaunchDaemons in %s", c.Paths.Binary, c.Paths.Link, daemons, c.Paths.LaunchDaemonDir)
+	case len(missing) == parts:
 		row.State, row.Severity = StateAbsent, SeverityFail
 		row.Detail = "no k3sm install found on this Mac"
 	default:
@@ -478,8 +498,9 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 // on the boot disk and hides the real volume. It looks exactly like an empty
 // cluster, which is why the remedy is spelled out in full rather than reduced to
 // "re-install" — `sudo k3sm install` refuses this posture on purpose.
-func (c Collector) dataRootRow() (Row, *dataroot.Record) {
+func (c Collector) dataRootRow(ctx context.Context) (Row, *dataroot.Record) {
 	row := Row{Name: RowDataRoot}
+	var usage volumeUsage
 	if c.DataRoot == nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "the data root was not probed"
@@ -518,8 +539,9 @@ func (c Collector) dataRootRow() (Row, *dataroot.Record) {
 		row.Remedy = "sudo launchctl kickstart -k system/" + c.Paths.NetdLabel + "   # realigns it\nsudo k3sm install"
 	case st.Mounted && st.Volume != nil:
 		row.State, row.Severity = StateOK, SeverityOK
-		row.Detail = fmt.Sprintf("%s (%s volume %s, %s, mounted)", c.Paths.DataRoot, st.FSType, st.Volume.Name, c.usageClause(st.Volume))
-		if c.nearlyFull(st.Volume) {
+		usage = c.volumeUsage(ctx, st.Volume)
+		row.Detail = fmt.Sprintf("%s (%s volume %s, %s, mounted)", c.Paths.DataRoot, st.FSType, st.Volume.Name, usage.clause(st.Volume))
+		if usage.nearlyFull(st.Volume) {
 			// State stays ok: the cluster is serving, and it is the TREND that
 			// needs attention. The clause says what reclaim can and cannot free,
 			// because the obvious next command frees only images -- the datastore
@@ -546,29 +568,75 @@ func (c Collector) dataRootRow() (Row, *dataroot.Record) {
 	if st.Volume != nil {
 		row.Wide["volume"] = st.Volume.Name
 		row.Wide["quota"] = quotaText(st.Volume.QuotaBytes)
+		// used-source is reported even when used is not, because "which probe
+		// answered" is the fact that makes the number trustworthy -- and the
+		// absence of a number legible.
+		row.Wide["used-source"] = usage.source
+		if usage.known {
+			row.Wide["used"] = datavol.FormatSize(usage.bytes)
+		}
 	}
 	return row, st.Volume
 }
 
-// nearlyFullFraction is the share of a volume's quota at which the data-root row
-// starts warning. Ninety percent is the point at which the remaining headroom
-// is comparable to what a single image pull or a few hours of datastore growth
-// consumes, i.e. the last moment a warning is still an early one.
-const nearlyFullFraction = 0.9
+// volumeUsage is how much a data volume is using, and WHICH probe said so.
+//
+// The source is carried rather than discarded because the two probes are not
+// interchangeable and one of them is wrong in a specific, invisible way. See
+// Collector.Volumes: statfs on a quota-less APFS volume reports the container's
+// numbers, so a figure taken from it there is the whole disk's usage wearing
+// the volume's name.
+type volumeUsage struct {
+	bytes uint64
+	known bool
+	// source is "statfs", "apfs" or "unknown" -- the last meaning no probe
+	// could answer, which is reported as an absence and never as a zero.
+	source string
+}
 
-// usageClause renders the "29.9G of 100G used" half of the data-root detail, or
-// "29.9G used" for a volume that carries no quota. It never prints "of 0": a
-// volume with no quota can grow to fill its container, and saying it is using
-// some of nothing would be worse than saying nothing about the bound.
-func (c Collector) usageClause(rec *dataroot.Record) string {
-	used, ok := c.usedBytes()
+// The three answers to "where did this number come from".
+const (
+	usedFromStatfs  = "statfs"
+	usedFromAPFS    = "apfs"
+	usedFromNowhere = "unknown"
+)
+
+// volumeUsage measures the data volume, choosing the probe by whether the
+// volume carries a quota.
+//
+// With a quota, statfs is correct and is what the reclaim ladder itself reads,
+// so it stays the source. Without one, statfs describes the container and the
+// only honest source is diskutil's own container listing. If that cannot be
+// reached -- no seam wired, or the command failed -- the answer is UNKNOWN, and
+// the row prints no usage at all. Falling back to statfs there would be
+// printing the wrong number rather than no number, which is the defect this
+// function exists to fix.
+func (c Collector) volumeUsage(ctx context.Context, rec *dataroot.Record) volumeUsage {
+	if rec.QuotaBytes > 0 {
+		if used, ok := c.statfsUsed(); ok {
+			return volumeUsage{bytes: used, known: true, source: usedFromStatfs}
+		}
+		return volumeUsage{source: usedFromNowhere}
+	}
+	if used, ok := c.apfsUsed(ctx, rec.UUID); ok {
+		return volumeUsage{bytes: used, known: true, source: usedFromAPFS}
+	}
+	return volumeUsage{source: usedFromNowhere}
+}
+
+// clause renders the usage half of the data-root detail: "30G of 100G used"
+// with a quota, "34.8G used, no quota" without one, and "no quota" when nothing
+// could measure it. It never prints "of 0" -- a volume with no quota can grow
+// to fill its container, and saying it is using some of nothing would be worse
+// than saying nothing about the bound.
+func (u volumeUsage) clause(rec *dataroot.Record) string {
 	switch {
-	case ok && rec.QuotaBytes > 0:
-		return fmt.Sprintf("%s of %s used", datavol.FormatSize(used), datavol.FormatSize(rec.QuotaBytes))
-	case ok:
-		return datavol.FormatSize(used) + " used"
+	case rec.QuotaBytes > 0 && u.known:
+		return fmt.Sprintf("%s of %s used", datavol.FormatSize(u.bytes), datavol.FormatSize(rec.QuotaBytes))
 	case rec.QuotaBytes > 0:
 		return datavol.FormatSize(rec.QuotaBytes) + " quota"
+	case u.known:
+		return datavol.FormatSize(u.bytes) + " used, no quota"
 	default:
 		return "no quota"
 	}
@@ -576,21 +644,57 @@ func (c Collector) usageClause(rec *dataroot.Record) string {
 
 // nearlyFull reports whether the volume has passed nearlyFullFraction of its
 // quota. A volume with no quota is never nearly full: there is no bound to be
-// near, which is exactly what the warning would otherwise be claiming.
-func (c Collector) nearlyFull(rec *dataroot.Record) bool {
-	if rec.QuotaBytes == 0 {
+// near, which is exactly what the warning would otherwise be claiming. An
+// unmeasured volume is not nearly full either -- the warning has to rest on a
+// number somebody actually read.
+func (u volumeUsage) nearlyFull(rec *dataroot.Record) bool {
+	if rec.QuotaBytes == 0 || !u.known {
 		return false
 	}
-	used, ok := c.usedBytes()
-	return ok && float64(used) >= float64(rec.QuotaBytes)*nearlyFullFraction
+	return float64(u.bytes) >= float64(rec.QuotaBytes)*nearlyFullFraction
 }
 
-// usedBytes is the data root's consumption as statfs(2) reports it:
+// apfsUsed asks diskutil what the volume itself is using: one Info to learn the
+// container the volume lives in, one Capacity to read its usage inside it.
+// Both are unprivileged reads, and both are bounded, because `k3sm status` is
+// the command an operator runs when something is already wrong and a probe that
+// hangs makes the tool part of the problem.
+func (c Collector) apfsUsed(ctx context.Context, uuid string) (uint64, bool) {
+	if c.Volumes == nil || uuid == "" {
+		return 0, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, volumeProbeBudget)
+	defer cancel()
+	info, err := c.Volumes.Info(ctx, uuid)
+	if err != nil || info.ContainerReference == "" {
+		return 0, false
+	}
+	capacity, err := c.Volumes.Capacity(ctx, info.ContainerReference, uuid)
+	if err != nil {
+		return 0, false
+	}
+	return capacity.InUse, true
+}
+
+// volumeProbeBudget bounds the two diskutil reads together.
+const volumeProbeBudget = 3 * time.Second
+
+// nearlyFullFraction is the share of a volume's quota at which the data-root row
+// starts warning. Ninety percent is the point at which the remaining headroom
+// is comparable to what a single image pull or a few hours of datastore growth
+// consumes, i.e. the last moment a warning is still an early one.
+const nearlyFullFraction = 0.9
+
+// statfsUsed is the data root's consumption as statfs(2) reports it:
 // (blocks - free) * block size, the same arithmetic `k3sm datavol status` does
 // and the same numbers runtimed's reclaim ladder reads. It is unavailable
 // rather than zero when the probe cannot answer, because a report that says a
 // full volume is empty is worse than one that says nothing.
-func (c Collector) usedBytes() (uint64, bool) {
+//
+// It is correct ONLY for a volume that carries a quota; see Collector.Volumes
+// for what it reports on one that does not, and why that is not a number this
+// row may print.
+func (c Collector) statfsUsed() (uint64, bool) {
 	if c.DataRoot == nil {
 		return 0, false
 	}
