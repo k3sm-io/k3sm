@@ -143,6 +143,51 @@ func TestMigrateFailsSafe(t *testing.T) {
 		}
 	})
 
+	t.Run("the metadata macOS puts on a mounted volume is not content", func(t *testing.T) {
+		f := datavoltest.New()
+		root := plainDataRoot(t)
+		staging := t.TempDir()
+		rec := stagedVolume(f, root)
+		sys := mutatingSys{Fake: f, t: t, after: func(t *testing.T, dst string) {
+			// What a real mounted APFS volume carries at its root. .Trashes
+			// is mode 0000 even for root, which is how the lab run failed:
+			// the walk could not open it at all.
+			trashes := filepath.Join(dst, ".Trashes")
+			if err := os.Mkdir(trashes, 0o755); err != nil {
+				t.Fatalf("mkdir .Trashes: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(trashes, "501"), []byte("x"), 0o600); err != nil {
+				t.Fatalf("write into .Trashes: %v", err)
+			}
+			if err := os.Chmod(trashes, 0o000); err != nil {
+				t.Fatalf("chmod .Trashes: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(trashes, 0o755) })
+			if err := os.Mkdir(filepath.Join(dst, ".fseventsd"), 0o755); err != nil {
+				t.Fatalf("mkdir .fseventsd: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dst, ".fseventsd", "fseventsd-uuid"), []byte("u"), 0o644); err != nil {
+				t.Fatalf("write into .fseventsd: %v", err)
+			}
+			for _, name := range []string{".DS_Store", ".metadata_never_index", datavol.MarkerName} {
+				if err := os.WriteFile(filepath.Join(dst, name), nil, 0o644); err != nil {
+					t.Fatalf("write %s: %v", name, err)
+				}
+			}
+		}}
+
+		stats, err := datavol.Migrate(ctx, f.Deps(), f.FS(), sys, rec, root, staging, datavol.MigrateOptions{})
+		if err != nil {
+			t.Fatalf("Migrate: %v", err)
+		}
+		if stats.Files != 3 {
+			t.Fatalf("Files = %d, want 3 (volume metadata is not the operator's data)", stats.Files)
+		}
+		if _, err := os.Stat(root + datavol.PreVolumeSuffix); err != nil {
+			t.Fatalf("the migration did not complete: %v", err)
+		}
+	})
+
 	t.Run("remove-old deletes the copy after verification", func(t *testing.T) {
 		f := datavoltest.New()
 		root := plainDataRoot(t)

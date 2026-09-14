@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -209,20 +210,23 @@ type fileMeta struct {
 func walkTree(root string) (treeSummary, error) {
 	out := treeSummary{meta: map[string]fileMeta{}}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		// Checked BEFORE err, because some of these entries cannot even be
+		// opened by root: on a real mounted volume .Trashes is mode 0000, and
+		// WalkDir surfaces that as a walk error rather than as content.
+		if isVolumeMetadata(rel) {
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		if isVolumeMarker(rel) {
-			// k3sm's own markers are written on the destination volume and
-			// are never part of the copy, so counting them would make every
-			// verification report one extra file.
 			return nil
 		}
 		fi, err := d.Info()
@@ -309,10 +313,42 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// isVolumeMarker reports whether a path relative to a tree root is one of the
-// files k3sm itself puts at the root of a volume it owns: the provenance
-// marker MountRecorded writes, and the Spotlight opt-out SpotlightOff writes
-// before anything is copied onto a staging mount.
-func isVolumeMarker(rel string) bool {
-	return rel == MarkerName || rel == spotlightMarkerName
+// volumeMetadataEntries are the names that appear at the ROOT of a mounted
+// volume without being anybody's content: macOS creates most of them the
+// moment a volume is mounted, and k3sm writes the last two itself. They are
+// excluded from both sides of the verification, from the counts and from the
+// per-file comparison alike.
+//
+// This is not tidiness. macOS creates .Trashes mode 0000, so a walk that does
+// not skip it fails outright with "operation not permitted" even as root --
+// which is how a real migration on the lab rig failed. And since the
+// destination is a freshly mounted volume while the source is a plain
+// directory, the two sides never carry the same set of them, so counting any
+// of them would fail every migration.
+var volumeMetadataEntries = map[string]bool{
+	".Trashes":                true,
+	".fseventsd":              true,
+	".Spotlight-V100":         true,
+	".TemporaryItems":         true,
+	".DocumentRevisions-V100": true,
+	".DS_Store":               true,
+	spotlightMarkerName:       true, // .metadata_never_index, written by SpotlightOff
+	MarkerName:                true, // .k3sm-datavol, written by MountRecorded
+}
+
+// isVolumeMetadata reports whether a path relative to a tree root is one of
+// those entries. The named set applies at the root only, because a directory
+// the operator called .Trashes three levels down is their data; .DS_Store is
+// the exception, being Finder debris wherever it appears.
+func isVolumeMetadata(rel string) bool {
+	if rel == "." {
+		return false
+	}
+	if filepath.Base(rel) == ".DS_Store" {
+		return true
+	}
+	if strings.ContainsRune(rel, filepath.Separator) {
+		return false
+	}
+	return volumeMetadataEntries[rel]
 }
