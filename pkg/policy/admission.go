@@ -307,11 +307,11 @@ func deniedLocalPortClause(p string, denied []int) string {
 //
 // There is deliberately NO spec.type gate — the one structural difference from
 // reservedLBPortExpr, and the reason this is a second expression rather than an
-// argument to that one. The sandbox denies connect() BY PORT NUMBER (Seatbelt
-// cannot filter by address), and a ClusterIP VIP is an lo0 alias on this very
-// host, so a ClusterIP, a NodePort and a LoadBalancer Service published on the
-// port are equally unreachable from a confined pod. Gating on type would leave
-// the most common Service shape silently broken.
+// argument to that one. The sandbox denies connect() BY PORT NUMBER, whatever
+// ADDRESS is dialed (Seatbelt cannot filter by address at all), so nothing about
+// a Service escapes it: not a ClusterIP VIP, not a wildcard LoadBalancer bind,
+// and not a headless Service whose clients dial a pod IP directly. Gating on type
+// would leave the most common Service shape silently broken.
 //
 // It keys on spec.ports[].port ONLY — never targetPort, never nodePort.
 // targetPort is the port a pod LISTENS on inside its own sandbox, which the deny
@@ -351,7 +351,8 @@ func deniedLocalPortMessageExpr(denied []int) string {
 		`string(object.spec.ports.filter(p, ` + deniedLocalPortClause("p", denied) + `)[0].port) + ` +
 		`' is the loopback datastore (kine) listener port of this node, and EVERY confined pod sandbox DENIES connect() to it by PORT NUMBER ` +
 		`(Seatbelt filters by port, not by address). A Service published on that number would be created, get Ready endpoints, and still be ` +
-		`unreachable from every pod — the Service type does not save it, because a ClusterIP VIP is an lo0 alias on the same host the deny applies to. ` +
+		`unreachable from every pod: the deny holds WHATEVER ADDRESS the pod dials, so no Service type escapes it, and neither does a headless Service, ` +
+		`whose clients dial a pod IP directly. ` +
 		`Either publish the Service on a different spec.ports[].port, or start the server with a different --kine-port. ` +
 		`Caveat: this policy is ONE cluster-scoped object carrying the denied ports of the server that provisioned it, while --kine-port is per-server ` +
 		`— a peer server started with a different --kine-port denies a port number this rejection does not name.'`

@@ -56,6 +56,16 @@ func serviceTargeting(svcType string, port, targetPort int) map[string]any {
 	}
 }
 
+// headlessService builds a Service with clusterIP: None — no VIP at all, so its
+// clients dial a pod IP directly. It is the case that proves the rejection does
+// not rest on the VIP being a host loopback alias: the sandbox denies the port
+// whatever address is dialed.
+func headlessService(port int) map[string]any {
+	svc := service("ClusterIP", port)
+	svc["spec"].(map[string]any)["clusterIP"] = "None"
+	return svc
+}
+
 // TestReservedPortClauseRejectsDeniedLocalPorts is the B301 gate. It EVALUATES the
 // Deny policy's CEL (it does not grep the string) and pins the four decisions the
 // policy exists to make:
@@ -91,6 +101,7 @@ func TestReservedPortClauseRejectsDeniedLocalPorts(t *testing.T) {
 		{"a Service with one good and one denied port is REJECTED", service("ClusterIP", 8080, kinePort), false},
 		{"targetPort on the denied port is admitted (port 8080 is what clients dial)", serviceTargeting("ClusterIP", 8080, kinePort), true},
 		{"a LoadBalancer Service in the NodePort range is admitted HERE (the sibling policy owns it)", service("LoadBalancer", 30500), true},
+		{"a HEADLESS Service on the denied port is REJECTED (its clients dial a pod IP, which the deny covers too)", headlessService(kinePort), false},
 		{"a Service with no ports is admitted", map[string]any{"spec": map[string]any{"type": "ClusterIP"}}, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -131,6 +142,10 @@ func TestReservedPortClauseRejectsDeniedLocalPorts(t *testing.T) {
 			"PORT NUMBER", // and it is by number, not by address
 			"--kine-port", // remedy 2 (remedy 1 is spec.ports[].port, below)
 			"per-server",  // the HA caveat: one cluster object, per-server ports
+			// The reason must NOT rest on the ClusterIP VIP being a loopback
+			// alias: a headless Service has no VIP and is denied all the same.
+			"WHATEVER ADDRESS",
+			"headless",
 		} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("message must mention %q, got: %s", want, msg)

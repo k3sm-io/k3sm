@@ -97,6 +97,46 @@ still-permitted path after it):
 There is no `--force` and no exemption. A policy that tolerated a pre-existing offender would leave
 the collision silently in place, along with the `kubectl logs`/`exec` outage it can cause.
 
+## Upgrading Into the Denied-Local-Port Policy
+
+Every pod's sandbox denies `connect()` to the node's datastore (kine) listener port. The deny is by
+port **number**, whatever address the pod dials, so a Service published on that port is unreachable
+from pods no matter its type. The release that added the deny also provisions a
+`ValidatingAdmissionPolicy` that **rejects** such a Service, so you meet the problem at
+`kubectl apply` rather than inside a pod.
+
+Two things it does differently from the reserved-port policy above:
+
+- **No type scope.** ClusterIP, NodePort, LoadBalancer and headless are all rejected. A headless
+  Service is not an exception: its clients dial a pod IP, which the deny covers too.
+- **Only `spec.ports[].port` is matched.** A `targetPort` on the datastore port is fine (that is the
+  port a pod listens on, not one another pod dials), and so is an allocated `nodePort`.
+
+Like the reserved-port policy, it matches CREATE **and** UPDATE and does **not** ratchet on
+`oldObject`, so an existing Service on that port is not grandfathered: it keeps working as an object,
+and every subsequent write to it is denied.
+
+Check before you upgrade. `2379` is the default datastore port; use your `--kine-port` value if you
+moved it:
+
+```sh
+kubectl get svc -A -o json | jq -r '
+  .items[] | select(.spec.ports[]? | .port==2379)
+  | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Anything listed has two ways out:
+
+- Publish it on a different `spec.ports[].port`. This is the intended fix, since no pod can reach the
+  Service on the current one.
+- Start the server with a different `--kine-port`, which moves the denied number. That is a server
+  restart, and it changes the port anything else of yours uses to reach the datastore.
+
+One limit: the policy is a single cluster-scoped object carrying the ports of the server that
+provisioned it, while `--kine-port` is per server. In an HA set whose servers use different datastore
+ports, the policy names one of them. A Service on another server's port is admitted by the API and is
+still unreachable from the pods on that server's node.
+
 ## Rollback
 
 Rollback means reverting to the previous binary, plus the daemon restart that comes with it. There is
@@ -150,6 +190,20 @@ does **not** revert them; you have to.
 
    Leaving them in place is also a valid choice, because the policy reflects a real collision on the
    old binary too.
+
+3. **The denied-local-port Deny policy.** The same release provisions
+   `k3sm-reject-service-denied-local-port`, which also lives in the datastore and **survives the
+   downgrade**, so a Service published on the datastore port stays rejected at `kubectl apply`. Delete
+   both objects if you want the old behaviour back:
+
+   ```sh
+   kubectl delete validatingadmissionpolicybinding k3sm-reject-service-denied-local-port-binding
+   kubectl delete validatingadmissionpolicy        k3sm-reject-service-denied-local-port
+   ```
+
+   Check what you are getting back first. If the binary you rolled back to still denies that port in
+   every pod sandbox, deleting the policy only hides the problem: the Service is created, its endpoints
+   go Ready, and no pod can reach it.
 
 ## Next
 
