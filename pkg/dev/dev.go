@@ -285,7 +285,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// Pre-flight reclaim: self-heal a crashed prior run under this name — reap a
 	// stale pid, flush its lo0 aliases, and re-assert ports. Reads the old
 	// manifest if present; a missing one is a clean first boot.
-	if err := m.preflightReclaim(name); err != nil {
+	if err := m.preflightReclaim(ctx, name); err != nil {
 		return Instance{}, err
 	}
 
@@ -360,7 +360,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	m.kubeMg.path = opts.Kubeconfig
 	kubePath, err := m.kubeMg.dest()
 	if err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 
@@ -391,11 +391,11 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// leaks.
 	kc := executor.KubeconfigPath(workDir)
 	if err := m.awaitOrExit(ctx, proc, m.awaitKubeconfig(ctx, kc, serverLogPath(workDir))); err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 	if err := m.kubeMg.merge(kc, inst.KubeContext); err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, fmt.Errorf("merge kubeconfig: %w", err)
 	}
 
@@ -414,7 +414,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 		wait = m.awaitDefaultNamespaceBootstrap
 	}
 	if err := m.awaitOrExit(ctx, proc, wait(ctx, kc)); err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 
@@ -428,7 +428,7 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// can actually run something.
 	nodeWait := m.nodeRegistrationWait()
 	if err := m.awaitOrExit(ctx, proc, nodeWait(ctx, kc)); err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 
@@ -447,11 +447,11 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// of signals rather than of a process. A dead server gets no manifest and no
 	// success line.
 	if err := m.awaitOrExit(ctx, proc, nil); err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 	if err := m.reg.Save(inst); err != nil {
-		_ = m.sys.TerminateProcess(proc.pid, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, proc.pid, terminateGrace)
 		return Instance{}, err
 	}
 	if m.kubeMg.chownUID >= 0 {
@@ -482,7 +482,7 @@ func (m *Manager) Down(ctx context.Context, opts DownOptions) error {
 	if opts.Kubeconfig != "" { // explicit override of the recorded merge target
 		inst.Kubeconfig = opts.Kubeconfig
 	}
-	return m.teardown(inst)
+	return m.teardown(ctx, inst)
 }
 
 // downAll sweeps every registered instance, then a belt-and-braces global lo0
@@ -495,7 +495,7 @@ func (m *Manager) downAll(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, inst := range insts {
-		if terr := m.teardown(inst); terr != nil && firstErr == nil {
+		if terr := m.teardown(ctx, inst); terr != nil && firstErr == nil {
 			firstErr = terr
 		}
 	}
@@ -517,9 +517,9 @@ func (m *Manager) downAll(ctx context.Context) error {
 // kubeconfig context, and deletes its registry entry. Best-effort per step: a
 // step failure is reported but never blocks the rest (a wedged instance must
 // still be reclaimable).
-func (m *Manager) teardown(inst Instance) error {
+func (m *Manager) teardown(ctx context.Context, inst Instance) error {
 	if inst.PID > 0 && m.sys.ProcessLiveness(inst.PID).Exists() {
-		if err := m.sys.TerminateProcess(inst.PID, terminateGrace); err != nil {
+		if err := m.sys.TerminateProcess(ctx, inst.PID, terminateGrace); err != nil {
 			fmt.Fprintf(m.out, "warning: terminate %q pid %d: %v\n", inst.Name, inst.PID, err)
 		}
 	}
@@ -644,7 +644,7 @@ func (m *Manager) Load(path string) (string, error) {
 // its kubeconfig context, so the fresh boot starts clean. A missing manifest is a
 // clean first boot (nil). Idempotent and best-effort — a reclaim step failure is
 // reported, not fatal.
-func (m *Manager) preflightReclaim(name string) error {
+func (m *Manager) preflightReclaim(ctx context.Context, name string) error {
 	inst, err := m.reg.Load(name)
 	if errors.Is(err, ErrNotFound) {
 		return nil
@@ -654,7 +654,7 @@ func (m *Manager) preflightReclaim(name string) error {
 	}
 	if inst.PID > 0 && m.sys.ProcessLiveness(inst.PID).Exists() {
 		fmt.Fprintf(m.out, "reclaiming prior instance %q (pid %d)\n", name, inst.PID)
-		_ = m.sys.TerminateProcess(inst.PID, terminateGrace)
+		_ = m.sys.TerminateProcess(ctx, inst.PID, terminateGrace)
 	}
 	if inst.Datapath == DatapathDirect && m.euid == 0 {
 		if _, ferr := lo0FlushCIDRs(m.sys, inst.ServiceCIDR, inst.PodCIDR); ferr != nil {

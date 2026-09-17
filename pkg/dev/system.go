@@ -17,6 +17,7 @@ limitations under the License.
 package dev
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -54,7 +55,14 @@ type System interface {
 	// it to exit, then SIGKILLs. The supervised control plane runs each component
 	// in its own process group (executor.spawnEnv Setpgid), so signalling the
 	// group tears the whole tree down.
-	TerminateProcess(pid int, grace time.Duration) error
+	//
+	// ctx shortens the grace WAIT; it never cancels the kill. SIGTERM is sent
+	// unconditionally, and a cancelled ctx escalates to SIGKILL before returning,
+	// so this function never returns leaving a half-killed process behind. That
+	// asymmetry is deliberate: every caller is a cleanup path, and a cleanup that
+	// honours cancellation by abandoning the process leaks the very server it was
+	// asked to reap.
+	TerminateProcess(ctx context.Context, pid int, grace time.Duration) error
 	// PortFree reports whether TCP 127.0.0.1:port can be bound right now (probe an
 	// actual listen so allocation never hands out a squatted port).
 	PortFree(port int) bool
@@ -173,23 +181,43 @@ func (realSystem) ProcessLiveness(pid int) Liveness {
 	}
 }
 
-// TerminateProcess SIGTERMs the process group, waits grace, then SIGKILLs.
-func (realSystem) TerminateProcess(pid int, grace time.Duration) error {
+// terminatePoll is how often TerminateProcess re-probes the pid while waiting out
+// the grace period.
+const terminatePoll = 100 * time.Millisecond
+
+// TerminateProcess SIGTERMs the process group, waits grace, then SIGKILLs. A
+// cancelled ctx shortens the wait and escalates immediately — it does NOT abandon
+// the kill (see the System interface doc).
+func (realSystem) TerminateProcess(ctx context.Context, pid int, grace time.Duration) error {
 	if pid <= 0 {
 		return nil
 	}
 	// Signal the whole process group (the child was started Setpgid, so -pid is
-	// its group). Best-effort: an already-dead process yields ESRCH.
+	// its group). Unconditional: ctx governs the wait below, never this.
+	// Best-effort: an already-dead process yields ESRCH.
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
+
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	tick := time.NewTicker(terminatePoll)
+	defer tick.Stop()
+	for {
 		if syscall.Kill(pid, 0) != nil {
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			// The caller has given up waiting, so stop waiting — but finish the
+			// job first. Returning here without the escalation would leave a
+			// process that ignored SIGTERM running forever.
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			return nil
+		case <-deadline.C:
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			return nil
+		case <-tick.C:
+		}
 	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-	return nil
 }
 
 // PortFree probes a bind of 127.0.0.1:port.

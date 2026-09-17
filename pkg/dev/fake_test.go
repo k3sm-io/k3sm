@@ -17,6 +17,7 @@ limitations under the License.
 package dev
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -104,7 +105,7 @@ func (f *fakeSystem) ProcessLiveness(pid int) Liveness {
 	return LivenessDead
 }
 
-func (f *fakeSystem) TerminateProcess(pid int, _ time.Duration) error {
+func (f *fakeSystem) TerminateProcess(_ context.Context, pid int, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.terminated = append(f.terminated, pid)
