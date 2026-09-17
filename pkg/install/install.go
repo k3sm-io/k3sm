@@ -1942,8 +1942,32 @@ func keptArtifacts(cfg Config, m []artifact) []string {
 // UserName) — it is the only irreducibly-root component — execing `k3sm netd`
 // with the Service CIDR (so proxy VIP binds are authorizable), the socket, the
 // mesh key dir, and a read kubeconfig (the PortAuthorizer's Service informer).
+//
+// The kubeconfig is the ONE argument that follows the node's role, because the
+// two roles hold different credentials in different places. A RoleServer node
+// runs the control plane, so netd reads the admin kubeconfig in the server work
+// dir. A RoleAgent node has no server work dir at all: the credential a worker
+// owns is the node kubeconfig `k3sm agent` writes when its join succeeds
+// (AgentCredentialPath), and that is what its netd is handed. Handing a worker
+// the server path is not a cosmetic mismatch — buildServiceSet's informer is the
+// authorizer's only source of truth, so a kubeconfig that cannot load leaves
+// every <1024 bind denied for the daemon's whole life, and on a Mac that was
+// once a server the file still exists and is a STALE credential.
+//
+// It deliberately passes NO --node-pod-cidr on either role. The node's pod /24
+// is not knowable at install time — it is decided by the join — so netd starts
+// on the flag's own pre-adoption default and adopts the real prefix from the
+// agent's ConfigureMesh RPC. Writing the install-time value into the launchd job
+// would pin a guess that the next netd restart comes back on, dropping every pod
+// alias and route the adopted prefix had established. It passes no --node-ip for
+// the separate reason TestNetdPlistXML records (the node-address authorizer
+// branch is dormant by configuration).
 func NetdPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
+	kubeconfig := filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig")
+	if cfg.Role == RoleAgent {
+		kubeconfig = AgentCredentialPath(cfg.DataRoot)
+	}
 	return renderPlist(launchdPlist{
 		Label: NetdLabel,
 		ProgramArguments: []string{
@@ -1951,7 +1975,7 @@ func NetdPlist(cfg Config) []byte {
 			"--socket", cfg.NetdSocket,
 			"--service-cidr", cfg.ServiceCIDR,
 			"--mesh-key-dir", MeshKeyDir,
-			"--kubeconfig", filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig"),
+			"--kubeconfig", kubeconfig,
 		},
 		RunAtLoad:  true,
 		KeepAlive:  true,

@@ -70,11 +70,11 @@ func runNetd(args []string) error {
 	fs := flag.NewFlagSet("netd", flag.ExitOnError)
 	opts := netdOptions{}
 	fs.StringVar(&opts.socket, "socket", netd.DefaultSocketPath, "unix socket to listen on")
-	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", "100.64.0.0/24", "this node's pod /24 (a pod-IP alias must fall within it)")
+	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", "100.64.0.0/24", "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION DEFAULT ONLY — the node's real prefix is decided by the join, and a ConfigureMesh may replace this value, so the installed plist passes no --node-pod-cidr")
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
-	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses (empty denies every <1024 bind)")
+	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
 	_ = fs.Parse(args)
 
@@ -177,6 +177,11 @@ func canonicalLBService() netdsvc.ServiceRef {
 // the socket group. With no kubeconfig both predicates are nil, so the daemon
 // denies every <1024 bind (fail safe). The informer runs until ctx ends; the
 // predicates read its synced cache.
+//
+// The kubeconfig is whichever credential this NODE holds, not the server's: on a
+// worker the installed plist passes the node kubeconfig the join wrote, because
+// nothing on a worker ever writes the control plane's admin kubeconfig and a
+// credential that never loads is indistinguishable here from deny-all.
 func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger) (declares func(int) bool, lbDeclarers func(int) []netdsvc.ServiceRef, gid int) {
 	gid = serviceGID()
 	if kubeconfig == "" {
