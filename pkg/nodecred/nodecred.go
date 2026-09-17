@@ -120,14 +120,19 @@ type Assignment struct {
 	// APIServers are the advertised apiserver endpoints (host:port) the node's
 	// kubeconfig targets; empty against a single-node server.
 	APIServers []string `json:"apiServers,omitempty"`
-	// Peers is the peer snapshot as of the last join. It is the SEED only, and it
-	// never advances: a resume writes these same bytes back on every start, so an
-	// entry can name a peer the cluster removed or re-keyed arbitrarily long ago.
-	// The resume path therefore programs only the SERVER peer out of it — the one
-	// tunnel the live MeshPeer list must be fetched over — and uses the rest as the
-	// FALLBACK if that list does not arrive within the bring-up's first-sync bound;
-	// the MeshPeer watch then replaces whatever was programmed with live state. See
-	// programResumedPeers in cmd/k3sm for both.
+	// Peers is a peer snapshot, and it is the SEED only: what a resuming node has
+	// before it has asked the cluster anything. It is written at the join, and
+	// REWRITTEN on every resume that obtains a live MeshPeer list — so it is as
+	// old as this node's last successful start, not as old as its join, but it is
+	// never authoritative: between two starts an entry can name a peer the cluster
+	// has since removed or re-keyed.
+	//
+	// So it is used for exactly two things. Before the live list, only the SERVER
+	// peer is programmed out of it — the one tunnel that list must be fetched
+	// over. After the bring-up's first-sync bound expires without one, the rest is
+	// the FALLBACK, until the MeshPeer watch replaces whatever was programmed with
+	// live state. See programResumedPeers in cmd/k3sm for both, and
+	// nodeCredentialStore.SaveAssignmentPeers there for the rewrite.
 	Peers []netv1.MeshPeerSpec `json:"peers,omitempty"`
 }
 

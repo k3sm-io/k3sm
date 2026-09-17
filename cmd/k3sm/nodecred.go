@@ -25,6 +25,8 @@ import (
 	"os"
 	"time"
 
+	netv1 "k3sm.io/apis/net/v1"
+
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/nodecred"
 )
@@ -132,6 +134,69 @@ func (s nodeCredentialStore) Save(apiserverURL, nodeName string, res *bootstrap.
 		return fmt.Errorf("persist node assignment: %w", err)
 	}
 	return nil
+}
+
+// SaveAssignmentPeers replaces the stored mesh-peer seed with peers, leaving
+// every other value in the assignment — and every other artifact in the store —
+// exactly as it was.
+//
+// It exists because Save is the wrong writer for this. Save persists a JOIN
+// OUTCOME, and on a restart that outcome is rebuilt from the credential just
+// loaded (joinResultFrom), so it writes the join-time peer snapshot back over
+// itself on every start: the seed a resuming node picks its server peer and its
+// fallback out of never moves, however many times the node has since seen the
+// live list. The resume path DOES obtain that live list (programResumedPeers),
+// and this is how it is kept.
+//
+// Deliberately narrow, in three ways. It opens ONE file: the four credential
+// artifacts are certificate material this function has no business rewriting,
+// and never touching them is a stronger guarantee than writing them identically.
+// It replaces ONLY Peers: PodCIDR, MeshIP and APIServers are the server's
+// assignment for this node and are not re-derivable from a MeshPeer list. And it
+// reads the file back before writing rather than reconstructing it from
+// in-memory state, so a field added to the assignment later survives a writer
+// that predates it, and an assignment that cannot be parsed is left alone rather
+// than replaced by a synthesized one.
+//
+// The write is the same atomic, no-op-on-identical-content install every other
+// artifact gets (writeStoreFile), at the same 0644 Save uses for this file — it
+// is the server's assignment, not a secret.
+func (s nodeCredentialStore) SaveAssignmentPeers(peers []netv1.MeshPeerSpec) error {
+	path := s.assignmentPath()
+	// Read through the READ half's path, and into the read half's type: there is
+	// one on-disk shape for this file and pkg/nodecred owns it.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read node assignment: %w", err)
+	}
+	var assignment nodecred.Assignment
+	if err := json.Unmarshal(raw, &assignment); err != nil {
+		return fmt.Errorf("parse node assignment %s: %w", path, err)
+	}
+	assignment.Peers = peers
+	blob, err := json.MarshalIndent(assignment, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal node assignment: %w", err)
+	}
+	if err := writeStoreFile(path, append(blob, '\n'), 0o644); err != nil {
+		return fmt.Errorf("persist node assignment: %w", err)
+	}
+	return nil
+}
+
+// resumeSeedWriteback is the meshBringUp.onLivePeers hook for a start that began
+// from the stored credential, and nil for any other start.
+//
+// It is a function rather than an inline conditional so the one rule it encodes
+// — only a RESUME advances the seed — has a name and a home next to the writer it
+// binds. A token join already persisted the live snapshot its join returned, and
+// re-writing that same list a second time would only widen the window in which
+// the file is open.
+func resumeSeedWriteback(mode startMode, store nodeCredentialStore) func([]netv1.MeshPeerSpec) error {
+	if mode != startModeReuseCredential {
+		return nil
+	}
+	return store.SaveAssignmentPeers
 }
 
 // storeTmpSuffix is appended to a target's name for the staging file an atomic

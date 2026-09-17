@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -354,6 +355,13 @@ func runAgent(args []string) error {
 			// rewritten to startModeTokenJoin above, and that join's peers are live.
 			resume:    plan == startModeReuseCredential,
 			listPeers: meshPeerLister(kubeconfigPath),
+			// ...and the list it waits for becomes the stored seed. Without this the
+			// assignment keeps the join-time snapshot for the life of the node: the
+			// Save above rewrites it from the credential it was just loaded from, so
+			// every restart programs its server peer and its fallback out of state
+			// that only ever gets older. The join path leaves this nil — its Save
+			// carried a live snapshot already.
+			onLivePeers: resumeSeedWriteback(plan, store),
 		}, mode, logger)
 		meshDown = down
 		if err != nil {
@@ -644,10 +652,11 @@ var activeMeshSeam = productionMeshSeam
 //
 // The initial program depends on WHERE the peer snapshot came from. A join just
 // happened, so in.peers is live and is programmed whole. A RESUME (in.resume) is
-// programmed from the stored credential's seed, which is as old as the last join
-// and is only ever written back unchanged — see the Peers field on
-// nodecred.Assignment for that contract — so it is NOT programmed whole:
-// programResumedPeers programs the server peer alone and waits for a live LIST.
+// programmed from the stored credential's seed, which is as old as this node's
+// last successful live list — see the Peers field on nodecred.Assignment for that
+// contract — so it is NOT programmed whole: programResumedPeers programs the
+// server peer alone, waits for a live LIST, and hands that list to in.onLivePeers
+// so the seed the NEXT start reads is this start's, not the original join's.
 //
 // It RETURNS a teardown handle, and that return is the point. Nothing used to hold
 // the mesh, so the only Close was the last act of the watcher goroutine — which
@@ -770,11 +779,10 @@ const meshPeerAttemptTimeout = 5 * time.Second
 
 // programResumedPeers performs the initial peer program on the RESUME path.
 //
-// The seed in the stored credential is a snapshot of the ORIGINAL join and never
-// advances (the resume path writes the same bytes back on every start), so
-// programming it whole means programming, into the kernel device, whatever the
-// cluster looked like when this node first joined — for the whole window until the
-// MeshPeer watcher's first sync. A peer removed or re-keyed since then is
+// The seed in the stored credential is a snapshot taken at this node's last join
+// or last successful resume, so programming it whole means programming, into the
+// kernel device, whatever the cluster looked like then — for the whole window
+// until the MeshPeer watcher's first sync. A peer removed or re-keyed since then is
 // programmed anyway, and because the enroller's free-index scan recycles a removed
 // node's index (lowestFreeNodeIndex), a stale entry can name the OLD node's public
 // key for a pod /24 a DIFFERENT node now owns: traffic for that /24 is encrypted to
@@ -792,6 +800,10 @@ const meshPeerAttemptTimeout = 5 * time.Second
 //   - the FALLBACK, after the bound expires, because a node with a possibly-stale
 //     peer set is still better than a node with none, and the watcher — started
 //     immediately after this returns — replaces it on its first sync.
+//
+// When the live list DOES arrive it is also handed to in.onLivePeers, which
+// persists it as the new seed, so both of those uses are made from progressively
+// fresher state on each restart instead of from a snapshot that never moves.
 //
 // It does not return an error: every failure here degrades to a peer set the
 // watcher will correct, and none of them is a reason to refuse a mesh that is
@@ -820,6 +832,19 @@ func programResumedPeers(ctx context.Context, m meshDatapath, in meshBringUp, ap
 	}
 	if err := m.Reconcile(ctx, live); err != nil {
 		logger.Error("initial mesh reconcile of the live MeshPeer list", "err", err)
+	}
+	// The same live list becomes the stored seed, so the NEXT start's server-peer
+	// selection and its fallback are made from what the cluster looked like at
+	// this start rather than at the original join. It runs after the Reconcile and
+	// only on this branch: a list that was never obtained is not a seed, and a
+	// device that is already correct must not be held up by a file write. The copy
+	// is defensive — the slice is handed to a writer that outlives this call only
+	// as bytes, but the device holds the original.
+	if in.onLivePeers != nil {
+		if err := in.onLivePeers(slices.Clone(live)); err != nil {
+			logger.Warn("could not persist the live MeshPeer list as this node's stored seed; the mesh is correct, but the next start falls back to the older seed",
+				"livePeers", len(live), "err", err)
+		}
 	}
 	logger.Info("programmed the live MeshPeer list on resume",
 		"window", time.Since(startedAt), "seedPeers", len(in.peers), "livePeers", len(live),
