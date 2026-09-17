@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"regexp"
 	"strings"
 	"time"
 
@@ -37,9 +38,93 @@ import (
 // values over would pin a stale credential into the daemon a reinstall exists to
 // refresh. Every OTHER argument on the installed plist is the operator's and is
 // preserved verbatim.
-var managedServerFlags = map[string]bool{
-	"runtime": true,
-	"token":   true,
+//
+// The NAMES come from dataroot.ManagedServerFlags rather than being typed here,
+// because the same list decides two things that must agree: which flags this
+// package filters out of a carry-over, and which flags make pkg/dataroot reject
+// a server-arguments record outright. Two copies would let a flag be refused in
+// a file and silently accepted from a plist, or the reverse.
+var managedServerFlags = func() map[string]bool {
+	m := make(map[string]bool, len(dataroot.ManagedServerFlags))
+	for _, name := range dataroot.ManagedServerFlags {
+		m[name] = true
+	}
+	return m
+}()
+
+// credentialServerFlags are the flag names whose VALUE is a secret, for
+// redaction only. It is deliberately WIDER than managedServerFlags: the managed
+// set is what the installer refuses to carry, while this one is what must never
+// reach a log line or an error message even though it can legitimately be there
+// (an operator's own --agent-token on a joined node). A flag in either set is
+// masked.
+var credentialServerFlags = map[string]bool{
+	"token":        true,
+	"agent-token":  true,
+	"server-token": true,
+}
+
+// redactedValue replaces a masked flag value. It is a fixed word, never a
+// prefix-preserving mask — showing the first characters of a credential is
+// showing part of a credential.
+const redactedValue = "<redacted>"
+
+// urlCredentials matches the userinfo half of a URL that carries a password:
+// scheme://user:secret@host. The password is what is replaced; the user name
+// and the host stay, because a redaction that hides which endpoint was
+// configured hides the thing the operator was reading the line for.
+//
+// It is anchored on "://" and stops at the first @, so an ordinary flag value
+// containing a colon (a host:port, a duration) never matches.
+var urlCredentials = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+):[^\s@/]*@`)
+
+// redactServerArgs returns args with every credential masked, for printing.
+//
+// It is applied to EVERY place the carried arguments are written out — the two
+// install log lines, the un-carried warning, and the unparsable-plist error —
+// because those arguments are the operator's own and k3sm has no idea what is in
+// them. The one shape that is certainly a secret is a DSN:
+// `--datastore-endpoint postgres://user:password@host/db` is a supported
+// argument, and it would otherwise be echoed into /var/log/k3sm on every
+// install.
+//
+// The returned slice is a copy; the arguments actually rendered into the plist
+// and written to the record are never the redacted ones.
+func redactServerArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	maskNext := false
+	for _, arg := range args {
+		if maskNext {
+			out, maskNext = append(out, redactedValue), false
+			continue
+		}
+		name, _, inline := splitFlag(arg)
+		if credentialServerFlags[name] || managedServerFlags[name] {
+			switch {
+			case inline:
+				// Keep the operator's own spelling of the flag (--token=, -token=),
+				// replacing only what follows the =.
+				if i := strings.IndexByte(arg, '='); i >= 0 {
+					out = append(out, arg[:i+1]+redactedValue)
+					continue
+				}
+				out = append(out, redactedValue)
+			default:
+				// The value is the NEXT argument, whatever it turns out to be.
+				out = append(out, arg)
+				maskNext = true
+			}
+			continue
+		}
+		out = append(out, urlCredentials.ReplaceAllString(arg, "$1:***@"))
+	}
+	return out
+}
+
+// redactedServerArgsText is the one-line, redacted rendering of args that every
+// log line and error message uses.
+func redactedServerArgsText(args []string) string {
+	return strings.Join(redactServerArgs(args), " ")
 }
 
 // installedServerArgs returns the operator-supplied `k3sm server` arguments the
@@ -51,15 +136,15 @@ var managedServerFlags = map[string]bool{
 //  1. the server plist ALREADY INSTALLED — authoritative, because it is what
 //     launchd is running right now. This is the in-place-upgrade path and it is
 //     unchanged;
-//  2. the server-arguments record inside the data root, consulted only when
-//     there is no plist to read.
+//  2. the server-arguments record in root-owned /Library/Preferences
+//     (Config.ServerArgsRecord), consulted only when there is no plist to read.
 //
 // The second source exists because `k3sm uninstall` removes the plist. Before
 // it, uninstall-then-install — the clean cutover the install docs recommend
 // between channels — re-rendered the stock template over an operator's
 // configuration, dropping --mesh-ip and --registry-port with no log line and
-// bringing the cluster back single-node. The data root is preserved by the same
-// uninstall, so a record kept there bridges exactly that gap.
+// bringing the cluster back single-node. The record is preserved by that same
+// uninstall (it is a dispPreserve manifest artifact), so it bridges the gap.
 //
 // It fails the install on a plist that exists but cannot be parsed, rather than
 // proceeding with an empty carry-over: proceeding would be the same silent
@@ -99,8 +184,8 @@ func OperatorServerArgs(plist []byte) ([]string, error) {
 	return preservedServerArgs(args), nil
 }
 
-// recordedServerArgs returns the arguments the server-arguments record inside
-// the data root carries, or nil when there is no record.
+// recordedServerArgs returns the arguments the server-arguments record carries,
+// or nil when there is no record.
 //
 // A record that cannot be read is an ERROR, never an empty answer: the whole
 // reason it exists is that "no arguments" and "the arguments could not be read"
@@ -109,20 +194,26 @@ func OperatorServerArgs(plist []byte) ([]string, error) {
 // flags it lists) and not something an installer may take on an operator's
 // behalf.
 func recordedServerArgs(sys System, cfg Config) ([]string, error) {
-	path := dataroot.ServerArgsRecordPath(cfg.DataRoot)
+	path := cfg.ServerArgsRecord
 	rec, err := dataroot.ReadServerArgsRecord(systemFiles{sys}, path)
 	if err != nil {
-		return nil, fmt.Errorf("install: %w (`rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
+		return nil, fmt.Errorf("install: %w (`sudo rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
 	}
 	if rec == nil {
 		warnNothingCarried(cfg)
 		return nil, nil
 	}
-	if len(rec.Args) > 0 {
+	// Through the SAME filter the plist path uses. dataroot already refuses a
+	// record naming a managed flag, so this cannot silently drop one — it is the
+	// belt to that brace, and it means the two sources cannot disagree about what
+	// "the operator's arguments" are even if the record's rules and this
+	// package's ever diverge.
+	args := filterManagedServerArgs(rec.Args)
+	if len(args) > 0 {
 		cfg.Logger.Info("carried the operator-supplied server arguments over from the recorded ones (the installed plist is gone, as after an uninstall)",
-			"args", strings.Join(rec.Args, " "), "record", path, "recorded-at", rec.CreatedAt.Format(time.RFC3339), "recorded-by", rec.CreatedBy)
+			"args", redactedServerArgsText(args), "record", path, "recorded-at", rec.CreatedAt.Format(time.RFC3339), "recorded-by", rec.CreatedBy)
 	}
-	return rec.Args, nil
+	return args, nil
 }
 
 // warnNothingCarried says, once, that a data root with prior cluster state in it
@@ -148,12 +239,21 @@ func warnNothingCarried(cfg Config) {
 // next move — remove the plist and reinstall — has a different outcome depending
 // on whether anything is left to carry over.
 func unreadablePlistError(sys System, cfg Config, path string, cause error) error {
-	recPath := dataroot.ServerArgsRecordPath(cfg.DataRoot)
-	if rec, err := dataroot.ReadServerArgsRecord(systemFiles{sys}, recPath); err == nil && rec != nil {
+	recPath := cfg.ServerArgsRecord
+	rec, recErr := dataroot.ReadServerArgsRecord(systemFiles{sys}, recPath)
+	switch {
+	case recErr != nil:
+		// BOTH sources are unreadable. Naming only the plist here would send the
+		// operator to remove it and hit the record's refusal on the very next
+		// run, having been told nothing about it.
+		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w — and the recorded arguments are unreadable too: %v (remove %s AND fix or `sudo rm %s`; with both gone the next install renders the stock template)",
+			path, cause, recErr, path, recPath)
+	case rec != nil:
 		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove %s to reinstall; the recorded operator arguments (%s) from %s in %s will be carried over)",
-			path, cause, path, strings.Join(rec.Args, " "), rec.CreatedAt.Format(time.RFC3339), recPath)
+			path, cause, path, redactedServerArgsText(rec.Args), rec.CreatedAt.Format(time.RFC3339), recPath)
+	default:
+		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove the file to reinstall from the stock template — doing so discards any --mesh-ip/--registry-port it carried)", path, cause)
 	}
-	return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove the file to reinstall from the stock template — doing so discards any --mesh-ip/--registry-port it carried)", path, cause)
 }
 
 // writeServerArgsRecord records the arguments this install rendered, so the next
@@ -164,7 +264,7 @@ func unreadablePlistError(sys System, cfg Config, path string, cause error) erro
 // "everything the installer does not own", and a record that kept only the
 // famous two would lose the next flag an operator adds.
 func writeServerArgsRecord(sys System, cfg Config) error {
-	path := dataroot.ServerArgsRecordPath(cfg.DataRoot)
+	path := cfg.ServerArgsRecord
 	rec := dataroot.ServerArgsRecord{
 		Args: cfg.ExtraServerArgs,
 		// "k3sm <version>", the same one-line provenance the data-volume record
@@ -203,11 +303,24 @@ func (s systemFiles) ReadFile(path string) ([]byte, error) { return s.sys.ReadFi
 // an argument merely because it did not start with a dash would be the same
 // silent loss in a different shape.
 func preservedServerArgs(installed []string) []string {
+	if len(installed) < 2 {
+		return nil
+	}
+	return filterManagedServerArgs(installed[2:])
+}
+
+// filterManagedServerArgs drops the install-managed flags (and their separated
+// values) from a bare argument list, keeping everything else in order.
+//
+// It is split out of preservedServerArgs because the record path needs the same
+// filter WITHOUT the two leading positions: a record holds arguments, not an
+// argv, so it has no binary path or subcommand to skip.
+func filterManagedServerArgs(args []string) []string {
 	var out []string
-	for i := 2; i < len(installed); i++ {
-		name, _, inline := splitFlag(installed[i])
+	for i := 0; i < len(args); i++ {
+		name, _, inline := splitFlag(args[i])
 		if name == "" || !managedServerFlags[name] {
-			out = append(out, installed[i])
+			out = append(out, args[i])
 			continue
 		}
 		if !inline {

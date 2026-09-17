@@ -34,8 +34,8 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 )
 
-// TestMain points the two GLOBAL data-root declaration paths at a scratch
-// directory for the whole package's tests.
+// TestMain points the three GLOBAL declaration paths at a scratch directory for
+// the whole package's tests.
 //
 // Without it every test that runs Install would read the running Mac's own
 // /etc/fstab and /Library/Preferences/io.k3sm.datavol.json, and a developer
@@ -50,6 +50,7 @@ func TestMain(m *testing.M) {
 	}
 	dataroot.FstabPath = filepath.Join(dir, "fstab")
 	dataroot.DefaultRecordPath = filepath.Join(dir, "io.k3sm.datavol.json")
+	dataroot.DefaultServerArgsRecordPath = filepath.Join(dir, "io.k3sm.server-args.json")
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -578,12 +579,12 @@ func TestInstallOrchestration(t *testing.T) {
 		// The installed server plist is read BEFORE the plists are rendered, so a
 		// reinstall carries the operator's own arguments into the new render.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
-		// There is none here (a first install), so the second source is read:
-		// the record in the data root, which is what survives an uninstall.
-		"ReadFile:/var/lib/k3sm/server-args.json",
+		// There is none here (a first install), so the second source is read: the
+		// root-owned record that survives an uninstall.
+		"ReadFile:" + dataroot.DefaultServerArgsRecordPath,
 		// And whatever was carried — nothing, on a first install — is recorded
 		// again, before the plist that will not survive the next uninstall.
-		"WriteServerArgsRecord:/var/lib/k3sm/server-args.json",
+		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is

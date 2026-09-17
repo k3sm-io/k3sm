@@ -531,11 +531,13 @@ func (darwinSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) erro
 }
 
 // WriteServerArgsRecord writes the server-arguments record through pkg/dataroot,
-// which owns its encoding, its version stamp, its 0644 mode and its
-// temp-and-rename. The file lands root-owned (install runs as root) inside the
-// service user's data root, which is the same posture the plist it mirrors has
-// and is safe because the record carries no credential: --token and --runtime
-// are install-managed and never written here.
+// which owns its encoding, its version stamp, its 0600 mode and its
+// temp-and-rename (the same atomic helper the data-volume record uses).
+//
+// The file lands root:wheel in /Library/Preferences, and both halves of that
+// matter: only root may rewrite what the next install splices into the server
+// LaunchDaemon's argv, and only root may read it, because an operator argument
+// can carry a credential (--datastore-endpoint carries a DSN password).
 func (darwinSystem) WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error {
 	return dataroot.WriteServerArgsRecord(path, rec)
 }

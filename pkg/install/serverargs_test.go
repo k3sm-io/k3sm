@@ -20,12 +20,25 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-
-	"k3sm.io/k3sm/pkg/dataroot"
 )
+
+// testConfig is an install pointed entirely at scratch: a data root and a
+// server-arguments record that exist only for this test, so nothing reads or
+// writes the running Mac's /var/lib/k3sm or /Library/Preferences.
+func testConfig(t *testing.T) Config {
+	t.Helper()
+	dir := t.TempDir()
+	return Config{
+		BinarySource:     "/tmp/k3sm",
+		TargetUser:       "alice",
+		DataRoot:         filepath.Join(dir, "data"),
+		ServerArgsRecord: filepath.Join(dir, "io.k3sm.server-args.json"),
+	}
+}
 
 // configureServerArgs is the operator's own edit to the installed plist: the
 // two flags whose loss is the whole defect, applied the way `PlistBuddy` would.
@@ -78,7 +91,7 @@ func TestUninstallThenInstallPreservesServerArgs(t *testing.T) {
 	f := &fakeSystem{}
 	// A scratch data root: the record lives inside it, and nothing here may
 	// touch the running Mac's /var/lib/k3sm.
-	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: t.TempDir()}
+	cfg := testConfig(t)
 	plist := cfg.withDefaults().plistPath(ServerLabel)
 
 	// (1) The first install renders the stock template; the operator then
@@ -108,7 +121,7 @@ func TestUninstallThenInstallPreservesServerArgs(t *testing.T) {
 	if _, ok := f.files[plist]; ok {
 		t.Fatal("uninstall left the server plist behind; the fake must model the removal or this gate proves nothing")
 	}
-	if _, ok := f.files[dataroot.ServerArgsRecordPath(cfg.DataRoot)]; !ok {
+	if _, ok := f.files[cfg.withDefaults().ServerArgsRecord]; !ok {
 		t.Fatal("uninstall removed the server-arguments record; it lives in the preserved data root")
 	}
 
@@ -136,13 +149,11 @@ func TestUninstallThenInstallPreservesServerArgs(t *testing.T) {
 // TestServerArgsRecordSources pins which source wins when both the plist and the
 // record have an opinion, and what happens when one of them cannot be read.
 func TestServerArgsRecordSources(t *testing.T) {
-	recordPath := func(cfg Config) string {
-		return dataroot.ServerArgsRecordPath(cfg.withDefaults().DataRoot)
-	}
+	recordPath := func(cfg Config) string { return cfg.withDefaults().ServerArgsRecord }
 
 	t.Run("the plist wins over the record, and the record is rewritten from it", func(t *testing.T) {
 		f := &fakeSystem{}
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: t.TempDir()}
+		cfg := testConfig(t)
 		// A stale record from an earlier configuration, and a plist the operator
 		// has since edited. The plist is what launchd actually runs.
 		putServerArgsRecord(t, f, recordPath(cfg), "--registry-port", "5000")
@@ -168,7 +179,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 
 	t.Run("an unreadable plist names the record and the arguments it holds", func(t *testing.T) {
 		f := &fakeSystem{}
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: t.TempDir()}
+		cfg := testConfig(t)
 		putServerArgsRecord(t, f, recordPath(cfg), "--mesh-ip", "100.64.0.1")
 		f.putFile(cfg.withDefaults().plistPath(ServerLabel), []byte("<plist><dict></dict></plist>"))
 
@@ -185,7 +196,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 
 	t.Run("a record from a newer k3sm fails the install and names its path", func(t *testing.T) {
 		f := &fakeSystem{}
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: t.TempDir()}
+		cfg := testConfig(t)
 		f.putFile(recordPath(cfg), []byte(`{"version":99,"args":["--mesh-ip","100.64.0.1"]}`))
 
 		err := Install(context.Background(), f, cfg)
@@ -199,7 +210,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 
 	t.Run("a record that is not json fails the install and names its path", func(t *testing.T) {
 		f := &fakeSystem{}
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: t.TempDir()}
+		cfg := testConfig(t)
 		f.putFile(recordPath(cfg), []byte("{ this is not json"))
 
 		err := Install(context.Background(), f, cfg)
@@ -222,11 +233,11 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 
 	t.Run("a used data root with neither source warns and names both flags", func(t *testing.T) {
 		f := &fakeSystem{}
-		root := t.TempDir()
-		// Prior cluster state: the datastore an earlier install left behind.
-		writeFileForTest(t, root+"/server/db/state.db", "SQLite format 3\x00")
 		var log bytes.Buffer
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: root, Logger: testLogger(&log)}
+		cfg := testConfig(t)
+		cfg.Logger = testLogger(&log)
+		// Prior cluster state: the datastore an earlier install left behind.
+		writeFileForTest(t, cfg.DataRoot+"/server/db/state.db", "SQLite format 3\x00")
 
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -235,7 +246,7 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 		if !strings.Contains(out, warnKey) {
 			t.Fatalf("no warning about the un-carried arguments; log =\n%s", out)
 		}
-		for _, want := range []string{"--mesh-ip", "--registry-port", root} {
+		for _, want := range []string{"--mesh-ip", "--registry-port", cfg.DataRoot} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the warning must name %q; log =\n%s", want, out)
 			}
@@ -245,7 +256,8 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 	t.Run("a first install on an empty data root says nothing", func(t *testing.T) {
 		f := &fakeSystem{}
 		var log bytes.Buffer
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: t.TempDir(), Logger: testLogger(&log)}
+		cfg := testConfig(t)
+		cfg.Logger = testLogger(&log)
 
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -257,11 +269,11 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 
 	t.Run("a record present on a used data root says nothing", func(t *testing.T) {
 		f := &fakeSystem{}
-		root := t.TempDir()
-		writeFileForTest(t, root+"/server/db/state.db", "SQLite format 3\x00")
 		var log bytes.Buffer
-		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: root, Logger: testLogger(&log)}
-		putServerArgsRecord(t, f, dataroot.ServerArgsRecordPath(root), "--mesh-ip", "100.64.0.1")
+		cfg := testConfig(t)
+		cfg.Logger = testLogger(&log)
+		writeFileForTest(t, cfg.DataRoot+"/server/db/state.db", "SQLite format 3\x00")
+		putServerArgsRecord(t, f, cfg.withDefaults().ServerArgsRecord, "--mesh-ip", "100.64.0.1")
 
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -279,7 +291,8 @@ func TestInstallWarnsWhenNothingIsCarriedOverAUsedDataRoot(t *testing.T) {
 // where they left off.
 func TestUninstallNamesWhatItKeeps(t *testing.T) {
 	var log bytes.Buffer
-	cfg := Config{DataRoot: t.TempDir(), Logger: testLogger(&log)}
+	cfg := testConfig(t)
+	cfg.Logger = testLogger(&log)
 	if err := Uninstall(context.Background(), &fakeSystem{}, cfg); err != nil {
 		t.Fatalf("Uninstall: %v", err)
 	}
@@ -288,7 +301,7 @@ func TestUninstallNamesWhatItKeeps(t *testing.T) {
 		DefaultServiceUser,
 		"kubeconfig",
 		cfg.DataRoot,
-		dataroot.ServerArgsRecordPath(cfg.DataRoot),
+		cfg.withDefaults().ServerArgsRecord,
 		LogDir,
 	} {
 		if !strings.Contains(out, want) {
@@ -301,4 +314,171 @@ func TestUninstallNamesWhatItKeeps(t *testing.T) {
 // assert on what an operator would have seen on their terminal.
 func testLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
+
+// TestRecordCanNeverSetAManagedFlag is the gate on the record as an INPUT: the
+// file decides a root LaunchDaemon's argv, so a forged one must not be able to
+// hand the daemon a credential of its own choosing.
+//
+// Two layers, both asserted, because either alone would be enough to pass a
+// weaker test: pkg/dataroot refuses to read the record at all, and the carry-over
+// filters managed flags even from arguments that did get through.
+func TestRecordCanNeverSetAManagedFlag(t *testing.T) {
+	t.Run("a forged record fails the install and nothing is rendered", func(t *testing.T) {
+		f := &fakeSystem{}
+		cfg := testConfig(t)
+		plist := cfg.withDefaults().plistPath(ServerLabel)
+		// Plausible, with one flag appended after the operator's own pair.
+		f.putFile(cfg.withDefaults().ServerArgsRecord,
+			[]byte(`{"version":1,"args":["--mesh-ip","100.64.0.1","--token=evil"],"createdBy":"k3sm 0.0.0","createdAt":"2026-09-14T12:00:00Z"}`))
+
+		err := Install(context.Background(), f, cfg)
+		if err == nil {
+			t.Fatal("Install accepted a record naming a managed flag")
+		}
+		if !strings.Contains(err.Error(), cfg.withDefaults().ServerArgsRecord) || !strings.Contains(err.Error(), "token") {
+			t.Errorf("error %q must name the record and the offending flag", err)
+		}
+		if raw, ok := f.files[plist]; ok && strings.Contains(string(raw), "evil") {
+			t.Fatal("the forged token reached the rendered server plist")
+		}
+	})
+
+	t.Run("the carry-over filters a managed flag even if one got through", func(t *testing.T) {
+		// The second layer, exercised directly: whatever the record holds, the
+		// arguments handed to the renderer never name a managed flag.
+		got := filterManagedServerArgs([]string{"--mesh-ip", "100.64.0.1", "--token=evil", "--registry-port", "5000"})
+		want := []string{"--mesh-ip", "100.64.0.1", "--registry-port", "5000"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("filterManagedServerArgs = %v, want %v", got, want)
+		}
+		// And the render carries only the token this install minted.
+		argv, err := parseProgramArguments(ServerPlist(Config{AdminToken: "k3sm-minted", ExtraServerArgs: got}))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if tok := flagValue(argv, "token"); tok != "k3sm-minted" {
+			t.Errorf("rendered --token = %q, want the re-minted one", tok)
+		}
+		if strings.Contains(strings.Join(argv, " "), "evil") {
+			t.Errorf("the rendered argv carries the forged value: %v", argv)
+		}
+	})
+}
+
+// TestBothSourcesUnreadableNamesBothFiles covers the double fault: an unparsable
+// plist AND a record that cannot be read. Naming only the plist would send the
+// operator to remove it and walk straight into the record's refusal on the next
+// run, having been told nothing about it.
+func TestBothSourcesUnreadableNamesBothFiles(t *testing.T) {
+	f := &fakeSystem{}
+	cfg := testConfig(t)
+	plist := cfg.withDefaults().plistPath(ServerLabel)
+	record := cfg.withDefaults().ServerArgsRecord
+	f.putFile(plist, []byte("<plist><dict></dict></plist>"))
+	f.putFile(record, []byte("{ this is not json"))
+
+	err := Install(context.Background(), f, cfg)
+	if err == nil {
+		t.Fatal("Install must refuse when neither source can be read")
+	}
+	for _, want := range []string{plist, record} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must name %q: the operator has to fix or remove both", err, want)
+		}
+	}
+}
+
+// TestServerArgsAreCarriedVerbatimAndPrintedRedacted is the credential gate on
+// the whole path. --datastore-endpoint carries a DSN password, so the argument
+// has to reach the daemon EXACTLY as the operator wrote it while never appearing
+// intact in anything k3sm prints.
+func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
+	const (
+		dsn    = "postgres://u:s3cret@h/db"
+		secret = "s3cret"
+	)
+	var log bytes.Buffer
+	f := &fakeSystem{}
+	cfg := testConfig(t)
+	cfg.Logger = testLogger(&log)
+
+	// Install, configure the endpoint, reinstall: the second install is the one
+	// that carries the DSN and records it.
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("first Install: %v", err)
+	}
+	configureServerArgs(f, cfg, tokenOf(t, f, cfg), "--datastore-endpoint", dsn)
+	if err := Install(context.Background(), f, cfg); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+
+	t.Run("verbatim where it has to work", func(t *testing.T) {
+		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint", dsn}; !slices.Equal(got, want) {
+			t.Errorf("rendered args = %v, want %v (a masked DSN would not connect)", got, want)
+		}
+		rec, ok := f.serverArgs[cfg.withDefaults().ServerArgsRecord]
+		if !ok {
+			t.Fatal("no record was written")
+		}
+		if !slices.Contains(rec.Args, dsn) {
+			t.Errorf("record args = %v, want the DSN verbatim", rec.Args)
+		}
+	})
+
+	t.Run("masked in every line the install printed", func(t *testing.T) {
+		if strings.Contains(log.String(), secret) {
+			t.Fatalf("the install log leaked the DSN password:\n%s", log.String())
+		}
+		if !strings.Contains(log.String(), "postgres://u:***@h/db") {
+			t.Errorf("the log must still say which endpoint was configured:\n%s", log.String())
+		}
+	})
+
+	t.Run("masked after an uninstall, on the record's own log line", func(t *testing.T) {
+		log.Reset()
+		if err := Uninstall(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Uninstall: %v", err)
+		}
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("install after uninstall: %v", err)
+		}
+		if strings.Contains(log.String(), secret) {
+			t.Fatalf("the carried-from-record log line leaked the DSN password:\n%s", log.String())
+		}
+		// And it was really carried, from the record, verbatim.
+		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint", dsn}; !slices.Equal(got, want) {
+			t.Errorf("after uninstall then install the args are %v, want %v", got, want)
+		}
+	})
+
+	t.Run("masked in the unparsable-plist error", func(t *testing.T) {
+		g := &fakeSystem{}
+		gcfg := testConfig(t)
+		putServerArgsRecord(t, g, gcfg.withDefaults().ServerArgsRecord, "--datastore-endpoint", dsn)
+		g.putFile(gcfg.withDefaults().plistPath(ServerLabel), []byte("<plist><dict></dict></plist>"))
+
+		err := Install(context.Background(), g, gcfg)
+		if err == nil {
+			t.Fatal("Install must refuse an unparsable plist")
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the error leaked the DSN password: %v", err)
+		}
+		if !strings.Contains(err.Error(), "postgres://u:***@h/db") {
+			t.Errorf("the error must still name the endpoint: %v", err)
+		}
+	})
+
+	t.Run("the token is masked too, in either spelling", func(t *testing.T) {
+		got := redactedServerArgsText([]string{"--agent-token", "k3sm-secret-value", "--token=k3sm-other", "--mesh-ip", "100.64.0.1"})
+		for _, leaked := range []string{"k3sm-secret-value", "k3sm-other"} {
+			if strings.Contains(got, leaked) {
+				t.Errorf("redaction leaked %q: %s", leaked, got)
+			}
+		}
+		if !strings.Contains(got, "--mesh-ip 100.64.0.1") {
+			t.Errorf("redaction ate an ordinary flag: %s", got)
+		}
+	})
 }
