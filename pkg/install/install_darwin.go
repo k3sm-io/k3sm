@@ -354,13 +354,28 @@ func ownedEntry(path string, fi fs.FileInfo) (OwnedEntry, error) {
 		return OwnedEntry{}, fmt.Errorf("cannot read the ownership of %s", path)
 	}
 	return OwnedEntry{
-		Path:    path,
-		UID:     int(st.Uid),
-		GID:     int(st.Gid),
-		Mode:    fi.Mode().Perm(),
-		IsDir:   fi.IsDir(),
-		Regular: fi.Mode().IsRegular(),
+		Path: path,
+		UID:  int(st.Uid),
+		GID:  int(st.Gid),
+		Mode: fi.Mode().Perm(),
+		Kind: entryKind(fi.Mode()),
 	}, nil
+}
+
+// entryKind names what the mode bits say the entry is. The symlink arm is first
+// because fs.FileMode reports a symlink as its own type and never as a regular
+// file, and because the one caller that acts on this distinction has to be able
+// to SAY "a symlink" when it refuses.
+func entryKind(mode fs.FileMode) EntryKind {
+	switch {
+	case mode&fs.ModeSymlink != 0:
+		return EntrySymlink
+	case mode.IsDir():
+		return EntryDir
+	case mode.IsRegular():
+		return EntryRegular
+	}
+	return EntryOther
 }
 
 // Chown sets path's owner to uid:gid and touches nothing else — no chmod, so

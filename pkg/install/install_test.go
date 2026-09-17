@@ -151,11 +151,16 @@ type fakeSystem struct {
 // putOwned seeds the fake's ownership table with one entry. It is how a test
 // describes what an OLDER install left on disk — root:wheel 0600 files in the
 // agent work dir — without needing the privilege to create such a file for real.
-func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, isDir bool) {
+//
+// The kind is EXPLICIT rather than inferred from anything else, because the
+// entry a test most needs to be able to plant is a symlink wearing an artifact's
+// name, and a fake that could only say "file or directory" could not express the
+// case the refusal exists for.
+func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, kind EntryKind) {
 	if f.owners == nil {
 		f.owners = map[string]OwnedEntry{}
 	}
-	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, IsDir: isDir, Regular: !isDir}
+	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, Kind: kind}
 }
 
 // Owner answers from the ownership table. A path with no entry is ABSENT with
@@ -180,7 +185,7 @@ func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
 	if !ok {
 		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
 	}
-	if !self.IsDir {
+	if self.Kind != EntryDir {
 		return nil, fmt.Errorf("open %s: not a directory", dir)
 	}
 	var out []OwnedEntry
