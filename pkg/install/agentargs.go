@@ -73,6 +73,39 @@ func installedAgentArgs(sys System, cfg Config) ([]string, error) {
 	}
 }
 
+// AgentJoinServer returns the control-plane host the INSTALLED agent daemon
+// joins: the --server value of the agent plist on disk.
+//
+// It reads the plist rather than the agent-arguments record on purpose. The
+// record deliberately does not carry --server (managedAgentFlags filters it out,
+// because the renderer re-derives it from the operator's flags on every
+// install), so the plist is the only place the installed join target is written
+// down. An uninstall needs it to reach the bootstrap listener at <host>:9345,
+// which is the same address the join dialed and the same one the agent
+// republishes its endpoint to.
+//
+// Every failure is an ERROR rather than an empty answer, including the absent
+// plist: "this Mac does not carry the agent daemon" and "the join target could
+// not be read" lead to the same skipped deregistration but mean different
+// things, and only the caller can tell which one deserves a sentence.
+func AgentJoinServer(sys System, cfg Config) (string, error) {
+	cfg = cfg.withDefaults()
+	path := cfg.plistPath(AgentLabel)
+	raw, err := sys.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("install: read the installed agent plist %s: %w", path, err)
+	}
+	args, err := parseProgramArguments(raw)
+	if err != nil {
+		return "", fmt.Errorf("install: cannot read the arguments of the installed agent plist %s: %w", path, err)
+	}
+	host := flagValue(args, "server")
+	if host == "" {
+		return "", fmt.Errorf("install: the installed agent plist %s names no --server, so the control plane this node joined is unknown", path)
+	}
+	return host, nil
+}
+
 // recordedAgentArgs returns the arguments the agent-arguments record carries,
 // or nil when there is no record. A record that cannot be read is an ERROR,
 // never an empty answer — "no arguments" and "the arguments could not be read"

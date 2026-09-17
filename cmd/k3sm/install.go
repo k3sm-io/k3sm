@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/install"
@@ -301,6 +302,14 @@ const fileVaultNote = "FileVault is on and the data volume is not passphrase-pro
 
 // runUninstall boots out both LaunchDaemons (the netd helper flushes lo0/pf/utun
 // on SIGTERM) and removes the install dir. It requires root and is idempotent.
+//
+// On a WORKER it first asks the cluster to forget this node, presenting the
+// node's own certificate to the control plane's deregistration verb, so the Macs
+// it leaves behind stop carrying a wireguard entry for it (see
+// uninstalldereg.go). The closure is built here, where the credential store and
+// the bootstrap client live; install decides when to call it and never lets it
+// block the teardown. A worker with nothing to deregister with says so once, in
+// one line, and the uninstall carries on.
 func runUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	_ = fs.Parse(args)
@@ -309,5 +318,14 @@ func runUninstall(args []string) error {
 		return fmt.Errorf("k3sm uninstall must run as root — use 'sudo k3sm uninstall'")
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return install.Uninstall(context.Background(), install.NewDarwinSystem(), install.Config{Logger: logger})
+	sys := install.NewDarwinSystem()
+	deregister, why := agentDeregister(sys, install.DefaultDataRoot, time.Now())
+	if deregister == nil && why != "" {
+		logger.Warn("not asking the cluster to forget this node: "+why,
+			"remedy", "on the control plane: kubectl delete meshpeer/<node> node/<node>")
+	}
+	return install.Uninstall(context.Background(), sys, install.Config{
+		Logger:     logger,
+		Deregister: deregister,
+	})
 }
