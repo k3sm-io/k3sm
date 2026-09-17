@@ -263,10 +263,14 @@ func unreadablePlistError(sys System, cfg Config, path string, cause error) erro
 // --registry-port are the two that made the defect visible, but the contract is
 // "everything the installer does not own", and a record that kept only the
 // famous two would lose the next flag an operator adds.
+//
+// It records cfg.resolvedExtraServerArgs(), not cfg.ExtraServerArgs directly, so
+// an explicit `k3sm install --mesh-ip` on THIS install is what a LATER reinstall
+// (with no flag of its own) carries forward — not the address it replaced.
 func writeServerArgsRecord(sys System, cfg Config) error {
 	path := cfg.ServerArgsRecord
 	rec := dataroot.ServerArgsRecord{
-		Args: cfg.ExtraServerArgs,
+		Args: cfg.resolvedExtraServerArgs(),
 		// "k3sm <version>", the same one-line provenance the data-volume record
 		// carries. Info.String() is the multi-line `k3sm version` screen and would
 		// put a paragraph in a json field.
@@ -342,6 +346,27 @@ func splitFlag(arg string) (name, value string, inline bool) {
 		return n, v, true
 	}
 	return trimmed, "", false
+}
+
+// setMeshIPArg returns args with any existing --mesh-ip entry (either spelling,
+// -mesh-ip/--mesh-ip, inline or separate value) removed and a single
+// "--mesh-ip <meshIP>" pair appended in its place — never a second, shadowed
+// occurrence. It is the merge Config.resolvedExtraServerArgs uses to let an
+// explicit `k3sm install --mesh-ip` replace whatever address a carried plist or
+// ServerArgsRecord held.
+func setMeshIPArg(args []string, meshIP string) []string {
+	out := make([]string, 0, len(args)+2)
+	for i := 0; i < len(args); i++ {
+		name, _, inline := splitFlag(args[i])
+		if name == "mesh-ip" {
+			if !inline {
+				i++ // drop the separate value too
+			}
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return append(out, "--mesh-ip", meshIP)
 }
 
 // flagValue returns the value of the named flag (dashes stripped) in args, in

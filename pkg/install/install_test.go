@@ -950,6 +950,86 @@ func TestPlistEscaping(t *testing.T) {
 	mustContain(t, x, "a&amp;b&lt;c")
 }
 
+// meshIPOccurrences returns how many times --mesh-ip (either spelling) appears
+// in the rendered plist's ProgramArguments, and the value of the last one — so
+// a test can assert BOTH "exactly once" and "the right value" without decoding
+// the argv twice.
+func meshIPOccurrences(t *testing.T, plist []byte) (count int, value string) {
+	t.Helper()
+	argv, err := parseProgramArguments(plist)
+	if err != nil {
+		t.Fatalf("parseProgramArguments: %v", err)
+	}
+	for i, a := range argv {
+		name, v, inline := splitFlag(a)
+		if name != "mesh-ip" {
+			continue
+		}
+		count++
+		if inline {
+			value = v
+			continue
+		}
+		if i+1 < len(argv) {
+			value = argv[i+1]
+		}
+	}
+	return count, value
+}
+
+// TestInstallPlistCarriesMeshIP is the gate for Config.MeshIP: an explicit
+// `k3sm install --mesh-ip` must render into the server plist's argv exactly
+// once, must REPLACE whatever --mesh-ip a carried plist/record already held,
+// and must leave the plist byte-for-byte unchanged when no --mesh-ip is
+// involved at all — a defect here either drops the operator's mesh address or
+// silently duplicates the flag, and launchd's flag package takes the LAST
+// occurrence, so a duplicate is a silent value flip, not an error.
+func TestInstallPlistCarriesMeshIP(t *testing.T) {
+	t.Run("an explicit MeshIP renders --mesh-ip exactly once", func(t *testing.T) {
+		x := ServerPlist(Config{MeshIP: "100.64.0.1"})
+		count, value := meshIPOccurrences(t, x)
+		if count != 1 || value != "100.64.0.1" {
+			t.Errorf("--mesh-ip occurrences = %d, value = %q; want 1 occurrence of 100.64.0.1", count, value)
+		}
+	})
+
+	t.Run("no MeshIP and no carried args renders identically to before this change", func(t *testing.T) {
+		// Pinned in memory rather than as a golden file (the package has no
+		// testdata convention): this is exactly TestServerPlistXML's Config{},
+		// asserted byte-for-byte so an empty MeshIP can never perturb the
+		// existing render.
+		before := ServerPlist(Config{})
+		after := ServerPlist(Config{})
+		if !bytes.Equal(before, after) {
+			t.Errorf("ServerPlist(Config{}) is non-deterministic:\n--- a ---\n%s\n--- b ---\n%s", before, after)
+		}
+		if count, _ := meshIPOccurrences(t, after); count != 0 {
+			t.Errorf("ServerPlist(Config{}) must render no --mesh-ip at all, got %d", count)
+		}
+	})
+
+	t.Run("an explicit MeshIP replaces a carried --mesh-ip, not beside it", func(t *testing.T) {
+		x := ServerPlist(Config{
+			ExtraServerArgs: []string{"--mesh-ip", "100.64.0.9", "--registry-port", "5000"},
+			MeshIP:          "100.64.0.1",
+		})
+		count, value := meshIPOccurrences(t, x)
+		if count != 1 || value != "100.64.0.1" {
+			t.Errorf("--mesh-ip occurrences = %d, value = %q; want the single carried 100.64.0.9 replaced by 100.64.0.1", count, value)
+		}
+		mustContain(t, string(x), "--registry-port")
+		mustContain(t, string(x), "5000")
+	})
+
+	t.Run("no MeshIP flag leaves a carried --mesh-ip untouched", func(t *testing.T) {
+		x := ServerPlist(Config{ExtraServerArgs: []string{"--mesh-ip", "100.64.0.9"}})
+		count, value := meshIPOccurrences(t, x)
+		if count != 1 || value != "100.64.0.9" {
+			t.Errorf("--mesh-ip occurrences = %d, value = %q; want the carried 100.64.0.9 unchanged", count, value)
+		}
+	})
+}
+
 // recorded returns the arguments of every fake seam call whose "Op:arg" string
 // carries prefix (e.g. "RemoveAll:").
 func recorded(calls []string, prefix string) []string {

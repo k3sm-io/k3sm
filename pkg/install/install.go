@@ -561,6 +561,19 @@ type Config struct {
 	// source, leaves it empty. AdminKubeconfig reads --mesh-ip out of it to
 	// address the apiserver where it actually binds.
 	ExtraServerArgs []string
+	// MeshIP is this node's wireguard mesh address, from `k3sm install --mesh-ip`
+	// — the CLI's own request, distinct from ExtraServerArgs (which is what a
+	// PRIOR install left behind). When set, it REPLACES whatever --mesh-ip the
+	// carried ExtraServerArgs holds rather than sitting beside it as a second,
+	// shadowed flag: an operator repointing which mesh address this node's
+	// server binds wins over history. Empty leaves a carried --mesh-ip (if any)
+	// untouched. See resolvedExtraServerArgs, the one place the two are merged;
+	// meshIP(), ServerPlist and writeServerArgsRecord all read the merge through
+	// it, so the address that decides bind/kubeconfig posture, the address
+	// actually rendered into the daemon's argv, and the address persisted to
+	// ServerArgsRecord can never disagree. The CLI parses and refuses the
+	// unspecified, loopback and multicast forms before Install ever sees it.
+	MeshIP string
 	// ServerArgsRecord is where the operator's own server arguments are recorded
 	// so they survive the uninstall that removes the plist they were read from.
 	// Empty takes dataroot.DefaultServerArgsRecordPath — root-owned
@@ -676,13 +689,28 @@ func (c Config) serverWorkDir() string { return filepath.Join(c.DataRoot, "serve
 // a Config pointing at another install dir stages inside it.
 func (c Config) datavolStaging() string { return filepath.Join(c.InstallDir, datavolStagingName) }
 
-// meshIP returns the --mesh-ip value carried in ExtraServerArgs, or "" when the
-// server runs single-node. It is the discriminator between the two apiserver
-// postures the admin kubeconfig must address: a mesh server binds its wireguard
-// IP ONLY and serves a cluster-CA-signed leaf, so a loopback URL reaches nothing
-// and the cluster CA is the right anchor; single-node binds loopback and
-// self-signs, for which no CA on disk is the anchor.
-func (c Config) meshIP() string { return flagValue(c.ExtraServerArgs, "mesh-ip") }
+// resolvedExtraServerArgs returns ExtraServerArgs with MeshIP merged in: when
+// MeshIP is set it REPLACES any --mesh-ip already in ExtraServerArgs (an
+// explicit `k3sm install --mesh-ip` on THIS install wins over whatever a carried
+// plist or ServerArgsRecord held); when it is empty, ExtraServerArgs comes back
+// unchanged. This is the ONE place the two are merged — meshIP(), ServerPlist
+// and writeServerArgsRecord all call it rather than reading ExtraServerArgs
+// directly, so the bind/kubeconfig decision, the rendered daemon argv, and the
+// persisted record can never disagree about which address won.
+func (c Config) resolvedExtraServerArgs() []string {
+	if c.MeshIP == "" {
+		return c.ExtraServerArgs
+	}
+	return setMeshIPArg(c.ExtraServerArgs, c.MeshIP)
+}
+
+// meshIP returns the effective --mesh-ip value (resolvedExtraServerArgs), or ""
+// when the server runs single-node. It is the discriminator between the two
+// apiserver postures the admin kubeconfig must address: a mesh server binds its
+// wireguard IP ONLY and serves a cluster-CA-signed leaf, so a loopback URL
+// reaches nothing and the cluster CA is the right anchor; single-node binds
+// loopback and self-signs, for which no CA on disk is the anchor.
+func (c Config) meshIP() string { return flagValue(c.resolvedExtraServerArgs(), "mesh-ip") }
 
 // installedBinary is the path the k3sm binary is copied to.
 func (c Config) installedBinary() string {
@@ -1123,6 +1151,14 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if len(extra) > 0 {
 		cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", redactedServerArgsText(extra))
 	}
+	// 2d″. An explicit --mesh-ip on THIS install replaces whatever --mesh-ip was
+	//      just carried over — see Config.MeshIP and resolvedExtraServerArgs,
+	//      which every downstream reader (the record write below, ServerPlist,
+	//      the cluster-CA read at 2e, AdminKubeconfig) goes through, so this is
+	//      log-only: nothing here needs to mutate cfg.ExtraServerArgs itself.
+	if old := flagValue(cfg.ExtraServerArgs, "mesh-ip"); cfg.MeshIP != "" && old != "" && old != cfg.MeshIP {
+		cfg.Logger.Info("--mesh-ip replaces the mesh address carried over from the previous install", "old", old, "new", cfg.MeshIP)
+	}
 	// 2d′. Record them, on EVERY install and whatever the source was — including
 	//      an empty set, which is the truthful record of a node that has none.
 	//      The plist this install is about to write will not survive the next
@@ -1457,7 +1493,7 @@ func ServerPlist(cfg Config) []byte {
 		"--runtime", "runtimed",
 		"--token", cfg.AdminToken,
 	}
-	args = append(args, cfg.ExtraServerArgs...)
+	args = append(args, cfg.resolvedExtraServerArgs()...)
 	return renderPlist(launchdPlist{
 		Label:            ServerLabel,
 		UserName:         cfg.ServiceUser,
