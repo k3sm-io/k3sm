@@ -77,6 +77,59 @@ const drainGrace = 5 * time.Second
 // the whole (token-bearing) log into the returned error.
 const exitLogTailLines = 20
 
+// BringUpError is a control-plane bring-up failure carrying the component it
+// happened to and the phase it happened in. Every failure path out of provision
+// and bringUp returns one, which is what lets the daemon record WHICH component
+// never came up on its crash-loop breaker (cmd/k3sm) instead of counting an
+// anonymous "start control plane" failure it cannot name.
+//
+// Error returns the wrapped error's text UNCHANGED, and Unwrap keeps the chain:
+// the type adds structure for errors.As and nothing else. That is deliberate —
+// the bring-up messages an operator reads in /var/log/k3sm/server.log (and the
+// tests that pin them) are the product of this package's existing fail-fast
+// work, and a wrapper that re-prefixed them would degrade the diagnostic it is
+// only meant to classify.
+type BringUpError struct {
+	// Component is the control-plane component that failed — "kine",
+	// "kube-apiserver", "kube-scheduler", "kube-controller-manager" (the same
+	// names OnComponentExit reports) — or, in the provision phase, the step that
+	// did, as "provision/<step>".
+	Component string
+	// Phase is PhaseProvision or PhaseBringUp.
+	Phase string
+	// Err is the error as it was already formatted, including any redacted log
+	// tail.
+	Err error
+}
+
+// The two phases a bring-up failure can happen in: laying the work dir down, and
+// starting the children over it.
+const (
+	PhaseProvision = "provision"
+	PhaseBringUp   = "bring-up"
+)
+
+// Error returns the wrapped error's message, byte-for-byte.
+func (e *BringUpError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the wrapped error so errors.Is/As see through the classification.
+func (e *BringUpError) Unwrap() error { return e.Err }
+
+// bringUpErr classifies err as a bring-up failure of component in phase. A nil
+// err stays nil (never a non-nil interface holding a nil pointer).
+func bringUpErr(component, phase string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &BringUpError{Component: component, Phase: phase, Err: err}
+}
+
+// provisionStep classifies a provision step's error under "provision/<name>",
+// leaving its message untouched.
+func provisionStep(name string, err error) error {
+	return bringUpErr("provision/"+name, PhaseProvision, err)
+}
+
 // component is one supervised control-plane child process. exited is closed by
 // the reaper goroutine spawnEnv starts the moment the child exits; waitErr is
 // the cmd.Wait result, written strictly before exited closes and read only
@@ -293,7 +346,7 @@ func (s *Supervised) releaseStartClaim() {
 
 // provision lays down everything the components need on disk.
 func (s *Supervised) provision(ctx context.Context) error {
-	if err := ensureWorkDirs(s.cfg.WorkDir); err != nil {
+	if err := provisionStep("workdirs", ensureWorkDirs(s.cfg.WorkDir)); err != nil {
 		return err
 	}
 	// Before anything replaces the staged kine binary or lets the new pin touch the
@@ -304,40 +357,40 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// binary the rollback path preserves. A refusal (no space, an undrained WAL) stops
 	// the boot rather than migrating unprotected.
 	if s.cfg.DatastoreEndpoint == "" {
-		if err := snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
+		if err := provisionStep("snapshot", snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 			return err
 		}
 	}
 	// Seed the workdir bin from a staged install payload first, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
-	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion); err != nil {
+	if err := provisionStep("seed-bin", seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
-	if err := ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion); err != nil {
+	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
 		return err
 	}
-	if err := ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
+	if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
-	if err := writeServiceAccountKeys(ctx, s.cfg.WorkDir); err != nil {
+	if err := provisionStep("sa-keys", writeServiceAccountKeys(ctx, s.cfg.WorkDir)); err != nil {
 		return err
 	}
 	token := s.currentToken()
-	if err := writeTokenFile(s.cfg.WorkDir, token); err != nil {
+	if err := provisionStep("token-file", writeTokenFile(s.cfg.WorkDir, token)); err != nil {
 		return err
 	}
-	if err := writeKubeconfig(s.cfg, token); err != nil {
+	if err := provisionStep("kubeconfig", writeKubeconfig(s.cfg, token)); err != nil {
 		return err
 	}
 	// The audit policy + admission-control config the apiserver argv
 	// references must exist before startAPIServer — a missing file would wedge
 	// bring-up opaquely until the healthz timeout. Overwritten every boot (the
 	// files track the binary).
-	if err := writeConformanceConfig(s.cfg.WorkDir, s.cfg.PSAEnforceBaseline); err != nil {
+	if err := provisionStep("conformance-config", writeConformanceConfig(s.cfg.WorkDir, s.cfg.PSAEnforceBaseline)); err != nil {
 		return err
 	}
-	if err := s.provisionComponentCerts(); err != nil {
+	if err := provisionStep("certs", s.provisionComponentCerts()); err != nil {
 		return err
 	}
 	return nil
@@ -444,17 +497,17 @@ func (s *Supervised) markSupervised(c *component) error {
 	}
 	// Safe without the lock: waitErr is written strictly before exited closes,
 	// and the select above observed that close.
-	return fmt.Errorf("%s exited during bring-up: %v; last log lines (%s):\n%s",
-		c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath))
+	return bringUpErr(c.name, PhaseBringUp, fmt.Errorf("%s exited during bring-up: %v; last log lines (%s):\n%s",
+		c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath)))
 }
 
 func (s *Supervised) bringUp(ctx context.Context) error {
 	kine, err := s.startKine(ctx)
 	if err != nil {
-		return fmt.Errorf("start kine: %w", err)
+		return bringUpErr("kine", PhaseBringUp, fmt.Errorf("start kine: %w", err))
 	}
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
-		return fmt.Errorf("kine not listening: %w", err)
+		return bringUpErr(kine.name, PhaseBringUp, fmt.Errorf("kine not listening: %w", err))
 	}
 	if err := s.markSupervised(kine); err != nil {
 		return err
@@ -464,15 +517,15 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	// provision time) is what makes the pre-migration snapshot survive a boot that dies
 	// before the datastore ever came up; recordKinePin itself skips the external-
 	// datastore posture.
-	if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint); err != nil {
+	if err := bringUpErr(kine.name, PhaseBringUp, recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint)); err != nil {
 		return err
 	}
 	api, err := s.startAPIServer(ctx)
 	if err != nil {
-		return fmt.Errorf("start apiserver: %w", err)
+		return bringUpErr("kube-apiserver", PhaseBringUp, fmt.Errorf("start apiserver: %w", err))
 	}
 	if err := s.waitHealthz(ctx, api); err != nil {
-		return fmt.Errorf("apiserver not healthy: %w", err)
+		return bringUpErr(api.name, PhaseBringUp, fmt.Errorf("apiserver not healthy: %w", err))
 	}
 	if err := s.markSupervised(api); err != nil {
 		return err
@@ -498,15 +551,15 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 	// Fail closed before the spawn if the port is already held: the wait below
 	// would be satisfied by the incumbent's listener, so a component that lost
 	// its bind would leave bring-up reporting success (see preflightComponentPort).
-	if err := preflightComponentPort(ctx, name, port); err != nil {
+	if err := bringUpErr(name, PhaseBringUp, preflightComponentPort(ctx, name, port)); err != nil {
 		return err
 	}
 	c, err := start(ctx)
 	if err != nil {
-		return fmt.Errorf("start %s: %w", name, err)
+		return bringUpErr(name, PhaseBringUp, fmt.Errorf("start %s: %w", name, err))
 	}
 	if err := awaitHealthy(ctx, c.name, c.exited, c.exitedNow, tcpReady(port), componentReadyTimeout, 300*time.Millisecond, c.exitDetail); err != nil {
-		return fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err)
+		return bringUpErr(c.name, PhaseBringUp, fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err))
 	}
 	// This component is up; its own death from here is a crash, reported even
 	// though the components after it are still coming up — unless it died in the
