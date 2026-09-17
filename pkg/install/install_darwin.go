@@ -56,19 +56,29 @@ const (
 )
 
 // EnsureServiceUser idempotently creates name as a hidden, no-login system user
-// whose home is DefaultDataRoot, and ensures that data root exists owned by it
-// (so the _k3sm control plane can write its work-dir there). It returns the uid.
-func (darwinSystem) EnsureServiceUser(name string) (uint32, error) {
+// whose home is dataRoot, and ensures that data root exists owned by it (so the
+// _k3sm control plane can write its work-dir there). It returns the uid.
+func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 	// Never create or chown into a data root that is declared as a mount point
 	// but is not mounted: that would hand the service user the bare mountpoint
 	// on the boot disk and let the control plane build an empty datastore over
 	// the real volume's.
-	if err := refuseShadowedDataRoot(dataroot.OSFS{}, DefaultDataRoot); err != nil {
+	if err := refuseShadowedDataRoot(dataroot.OSFS{}, dataRoot); err != nil {
 		return 0, err
 	}
+	record := "/Users/" + name
 	if u, err := user.Lookup(name); err == nil {
 		uid, _ := strconv.Atoi(u.Uid)
-		if err := EnsureDataRoot(DefaultDataRoot, uid); err != nil {
+		// A reinstall may name a different data root than the account record
+		// still carries; keep the two in agreement, same as the creation path
+		// below.
+		if u.HomeDir != dataRoot {
+			out, err := exec.Command("dscl", ".", "-create", record, "NFSHomeDirectory", dataRoot).CombinedOutput()
+			if err != nil {
+				return 0, fmt.Errorf("update service user home (dscl . -create %s NFSHomeDirectory %s): %w: %s", record, dataRoot, err, out)
+			}
+		}
+		if err := EnsureDataRoot(dataRoot, uid); err != nil {
 			return 0, err
 		}
 		return uint32(uid), nil
@@ -78,14 +88,13 @@ func (darwinSystem) EnsureServiceUser(name string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	record := "/Users/" + name
 	steps := [][]string{
 		{"dscl", ".", "-create", record},
 		{"dscl", ".", "-create", record, "UserShell", "/usr/bin/false"},
 		{"dscl", ".", "-create", record, "RealName", "k3sm service user"},
 		{"dscl", ".", "-create", record, "UniqueID", strconv.Itoa(uid)},
 		{"dscl", ".", "-create", record, "PrimaryGroupID", "20"}, // staff
-		{"dscl", ".", "-create", record, "NFSHomeDirectory", DefaultDataRoot},
+		{"dscl", ".", "-create", record, "NFSHomeDirectory", dataRoot},
 		{"dscl", ".", "-create", record, "IsHidden", "1"},
 	}
 	for _, s := range steps {
@@ -93,7 +102,7 @@ func (darwinSystem) EnsureServiceUser(name string) (uint32, error) {
 			return 0, fmt.Errorf("create service user (%s): %w: %s", strings.Join(s, " "), err, out)
 		}
 	}
-	if err := EnsureDataRoot(DefaultDataRoot, uid); err != nil {
+	if err := EnsureDataRoot(dataRoot, uid); err != nil {
 		return 0, err
 	}
 	return uint32(uid), nil
@@ -111,8 +120,9 @@ func freeSystemUID() (int, error) {
 
 // EnsureDataRoot creates dir with the data-root policy (idempotent) and chowns
 // it to uid:staff so the service user owns it. Exported because `k3sm install`
-// is not the only writer of that policy — the root netd helper applies the same
-// one when it finds a drifted root at boot — and the two must agree.
+// is not the only place that policy applies — the root netd helper applies the
+// same ownership rule inline when it finds a drifted root at boot — and the two
+// must agree.
 func EnsureDataRoot(dir string, uid int) error { return ensureOwnedDir(dir, uid) }
 
 // ensureOwnedDir creates dir DataRootMode (idempotent) and chowns it to

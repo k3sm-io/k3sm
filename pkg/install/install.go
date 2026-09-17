@@ -244,8 +244,8 @@ func RunDir(dataRoot string) string {
 // the orchestration runs without privilege.
 type System interface {
 	// EnsureServiceUser idempotently creates name as a no-login system user
-	// (home = DefaultDataRoot, owned by it) and returns its uid.
-	EnsureServiceUser(name string) (uid uint32, err error)
+	// (home = the configured data root, owned by it) and returns its uid.
+	EnsureServiceUser(name, dataRoot string) (uid uint32, err error)
 	// CopyToRootOwned copies src to exactly dst (creating dst's parent dir
 	// root:wheel 0755), leaving dst root:wheel 0755 with signature/xattrs
 	// preserved. dst is the full installed path — never derived from src's
@@ -946,7 +946,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 
 	// 1. The service user must exist before the server LaunchDaemon (UserName=_k3sm)
 	//    can resolve it and before its _k3sm-owned data root is usable.
-	uid, err := sys.EnsureServiceUser(cfg.ServiceUser)
+	uid, err := sys.EnsureServiceUser(cfg.ServiceUser, cfg.DataRoot)
 	if err != nil {
 		return fmt.Errorf("install: ensure service user %s: %w", cfg.ServiceUser, err)
 	}

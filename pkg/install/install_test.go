@@ -208,8 +208,8 @@ func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
-func (f *fakeSystem) EnsureServiceUser(name string) (uint32, error) {
-	f.calls = append(f.calls, "EnsureServiceUser:"+name)
+func (f *fakeSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
+	f.calls = append(f.calls, "EnsureServiceUser:"+name+":"+dataRoot)
 	return 271, nil
 }
 
@@ -547,7 +547,7 @@ func TestInstallOrchestration(t *testing.T) {
 	}
 
 	want := []string{
-		"EnsureServiceUser:_k3sm",
+		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
 		"EnsureLogDir:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
 		// node refuses to start without it, and only root can create it owned by
@@ -638,6 +638,40 @@ func TestInstallOrchestration(t *testing.T) {
 	}
 	if !strings.Contains(f.kubeContent, "token:") {
 		t.Error("admin kubeconfig must carry the shared bearer token")
+	}
+}
+
+// TestEnsureServiceUserCreatesTheConfiguredDataRoot proves the service user's
+// home tracks Config.DataRoot, not the DefaultDataRoot constant — no shipped
+// flag sets a non-default root today, but the seam must carry whatever value
+// the config holds, and it must still fall back to the default when the
+// config leaves DataRoot empty (the common case, exercised the same way by
+// TestInstallOrchestration).
+func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
+	cases := []struct {
+		name     string
+		dataRoot string
+		want     string
+	}{
+		{name: "configured data root", dataRoot: filepath.Join(t.TempDir(), "custom-root"), want: ""},
+		{name: "empty data root falls back to the default", dataRoot: "", want: DefaultDataRoot},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.want
+			if want == "" {
+				want = tc.dataRoot
+			}
+			f := &fakeSystem{}
+			cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice", DataRoot: tc.dataRoot}
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+			wantCall := "EnsureServiceUser:_k3sm:" + want
+			if len(f.calls) == 0 || f.calls[0] != wantCall {
+				t.Fatalf("first call = %v, want %q", f.calls, wantCall)
+			}
+		})
 	}
 }
 
