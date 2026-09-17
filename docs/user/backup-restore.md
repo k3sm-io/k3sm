@@ -156,7 +156,7 @@ objects you expected came back**:
 k3sm kubectl get --raw='/readyz?verbose'      # every check ok
 k3sm kubectl get nodes                        # your node(s), Ready
 k3sm kubectl get pods -A                      # the workloads the backup should contain
-k3sm doctor                                   # datastore check: journal_mode=wal, kine pin reported
+k3sm doctor                                   # the datastore row: journal_mode=wal, kine pin reported
 ```
 
 If the objects are missing or the datastore check reports a non-WAL journal, stop, keep
