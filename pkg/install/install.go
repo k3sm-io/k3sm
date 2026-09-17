@@ -152,6 +152,30 @@ const (
 	VMRunDir = DefaultRunDir + "/vm"
 	// LogDir is where the daemons' stdout/stderr are written.
 	LogDir = "/var/log/k3sm"
+	// LogDirMode, LogDirGID and LogFileMode are the ownership POLICY for that
+	// directory and for the three daemon logs inside it: service-user-owned,
+	// group ADMIN (gid 80), directory 0750, files 0640.
+	//
+	// The group is `admin` and deliberately NOT the `staff` of DataRootGID.
+	// staff is the primary group of every ordinary macOS account, so a
+	// staff-readable log tree is a world-readable one under another name, and
+	// tightening the mode over it would buy nothing. `admin` is the
+	// sudo-capable tier docs/privilege-model.md already treats as k3sm's
+	// administrative boundary (the one-time-admin install, the netd control
+	// socket's root-owned 0660 group), which is the right audience for a log
+	// that carries daemon argv, cluster endpoints and failure detail.
+	//
+	// 0750/0640 is the tightest pair launchd still works with. launchd opens a
+	// UserName=_k3sm job's StandardOut/ErrorPath AS _k3sm, so the service user
+	// must be able to traverse the directory and append to its own file; the
+	// root jobs (netd, datavol) bypass the mode entirely. Per launchd.plist(5)
+	// a path that ALREADY exists is simply opened, and only a missing one is
+	// created from the job's identity and umask — which is why EnsureLogDir
+	// pre-creates all three files rather than leaving their mode to the umask
+	// in force when a daemon first spawned.
+	LogDirMode  fs.FileMode = 0o750
+	LogDirGID   int         = 80
+	LogFileMode fs.FileMode = 0o640
 	// PodLogsDir is the root of the CRI container-log tree the node writes pod
 	// output into (<dir>/<ns>_<pod>_<uid>/<container>/<n>.log). It is the
 	// kubelet's own default path, taken from the package that defines the layout
@@ -165,17 +189,17 @@ const (
 // ContainerLogDirMode and ContainerLogDirGID are the ownership POLICY for the
 // container-log tree: service-user-owned, group WHEEL (gid 0), mode 0700.
 //
-// Deliberately NOT the `staff 0755` of EnsureLogDir above, and the difference is
-// the whole point. That directory holds the daemons' own stdout, which is
-// low-sensitivity and must be openable by launchd on the _k3sm job's behalf. This
-// one holds every pod's output — application logs, stack traces, whatever a
-// workload prints — and upstream's /var/log/pods is root-owned, i.e. readable
-// only by root. _k3sm's primary group is `staff`, which is the default group of
-// every ordinary macOS account, so copying upstream's numeric 0755 across would
-// silently turn "root only" into "any local user can read every pod's output".
-// 0700 with group wheel is the closest honest equivalent of upstream's posture on
-// this platform: the node reads it, `kubectl logs` serves it, and a human reads it
-// with sudo.
+// Deliberately tighter than the `admin 0750` of LogDirMode above, and the
+// difference is the whole point. That directory holds the daemons' own stdout,
+// which an administrator of the Mac is entitled to read while diagnosing the
+// cluster. This one holds every pod's output — application logs, stack traces,
+// whatever a workload prints — and upstream's /var/log/pods is root-owned, i.e.
+// readable only by root. _k3sm's primary group is `staff`, which is the default
+// group of every ordinary macOS account, so copying upstream's numeric 0755
+// across would silently turn "root only" into "any local user can read every
+// pod's output". 0700 with group wheel is the closest honest equivalent of
+// upstream's posture on this platform: the node reads it, `kubectl logs` serves
+// it, and a human reads it with sudo.
 const (
 	ContainerLogDirMode fs.FileMode = 0o700
 	ContainerLogDirGID  int         = 0
@@ -289,12 +313,16 @@ type System interface {
 	// interprets, never a failure this seam decides.
 	VerifyVirtualizationEntitlement(path string) error
 	// EnsureLogDir creates (or repairs) the daemons' log directory owned by the
-	// service uid (group staff, 0755) so launchd can open the UserName=_k3sm
-	// server job's StandardOut/ErrorPath as _k3sm. launchd auto-creates a missing
-	// log dir with root-only perms when the root netd job spawns first — the
-	// _k3sm server job then fails "Service could not initialize" and never
-	// spawns (an observed live-hardware failure this fixes). Idempotent: perms/owner are
-	// re-applied on every install, repairing a previously mis-created dir.
+	// service uid (group admin, LogDirMode) so launchd can open the
+	// UserName=_k3sm server job's StandardOut/ErrorPath as _k3sm. launchd
+	// auto-creates a missing log dir with root-only perms when the root netd job
+	// spawns first — the _k3sm server job then fails "Service could not
+	// initialize" and never spawns (an observed live-hardware failure this
+	// fixes). It also pre-creates the three daemon logs inside it at
+	// LogFileMode, because a file launchd creates for itself takes the spawning
+	// job's umask and has been landing world-readable. Idempotent: perms/owner
+	// are re-applied to the directory AND to those files on every install,
+	// repairing a previously mis-created or over-permissive tree.
 	EnsureLogDir(dir string, uid uint32) error
 	// EnsureContainerLogDir creates (or repairs) one directory of the container-log
 	// tree — /var/log/pods and /var/log/containers — owned by the service uid,

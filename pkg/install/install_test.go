@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -537,6 +538,52 @@ func (f *fakeSystem) FlushMeshPFAnchor() error {
 }
 
 // TestInstallOrchestration proves the install drives the seam in the right
+// TestLogDirIsNotWorldReadable pins the daemon log tree's ownership policy and
+// the fact that install applies it.
+//
+// The policy is the point. /var/log/k3sm holds the control plane's, the network
+// helper's and the data-volume daemon's stdout: argv, cluster endpoints, and
+// the failure detail a crash prints. The directory used to be group `staff`
+// 0755 and the files were whatever umask the spawning launchd job had, which on
+// a Mac means every local account could read all of it. `staff` is the primary
+// group of every ordinary account, so the group had to move too: tightening the
+// mode over `staff` would have changed nothing.
+//
+// The on-disk half of this, against a real directory, is
+// TestLogDirIsNotWorldReadableOnDisk in install_darwin_test.go.
+func TestLogDirIsNotWorldReadable(t *testing.T) {
+	t.Run("the policy is a 0750 admin-group dir with 0640 files", func(t *testing.T) {
+		if LogDirMode != 0o750 {
+			t.Errorf("LogDirMode = %#o, want 0750 (daemon logs are not readable by every local account)", LogDirMode)
+		}
+		if LogFileMode != 0o640 {
+			t.Errorf("LogFileMode = %#o, want 0640 (launchd reuses a pre-created file's mode)", LogFileMode)
+		}
+		if LogDirGID != 80 {
+			t.Errorf("LogDirGID = %d, want 80 (admin, the sudo-capable tier)", LogDirGID)
+		}
+		// Not staff. DataRootGID is staff, and staff is the default primary
+		// group of every ordinary macOS account — a staff-readable log tree is
+		// a world-readable one with extra steps.
+		if LogDirGID == DataRootGID {
+			t.Errorf("LogDirGID = %d = DataRootGID (staff); staff is every local account's primary group", LogDirGID)
+		}
+		if LogDirMode.Perm()&0o007 != 0 || LogFileMode.Perm()&0o007 != 0 {
+			t.Errorf("mode %#o/%#o grants `other` access to the daemon logs", LogDirMode, LogFileMode)
+		}
+	})
+
+	t.Run("install ensures the log dir", func(t *testing.T) {
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !slices.Contains(f.calls, "EnsureLogDir:"+LogDir) {
+			t.Errorf("install never ensured %s (calls: %v)", LogDir, f.calls)
+		}
+	})
+}
+
 // ORDER: ensure _k3sm → copy binary root-owned → write both plists → bootstrap
 // netd BEFORE server → write the admin kubeconfig to the HUMAN (not root).
 func TestInstallOrchestration(t *testing.T) {
