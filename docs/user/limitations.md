@@ -537,7 +537,7 @@ including headless-Service and per-pod DNS name resolution, does not reach a `vm
 its Service's ClusterIP instead, which does work. Cross-node traffic to or from a `vm` Pod is out of
 scope for this release.
 
-Two further properties of the guest network:
+Three further properties of the guest network:
 
 - **Guest-to-guest reachability was found to be blocked on the tested rig.** Two `vm` Pods on the same
   node could not address each other at all, at the network layer, under the tested configuration. That
@@ -550,6 +550,12 @@ Two further properties of the guest network:
   `vm` Pods, traffic arriving from that guest-network segment that cannot be attributed to a known source
   is **denied**, not silently allowed, at any destination a NetworkPolicy selects, and the resulting
   deny is logged plainly, naming what was denied and why.
+- **A `vm` Pod's Service can start accepting connections a few seconds after the Pod reports Ready.**
+  The proxy learns the guest's live address from a lease the runtime polls every 5 seconds, and in that
+  window a dial to the Service fails just as an unreachable backend does. An admission or conversion
+  webhook with `failurePolicy: Fail` backed by a `vm` Pod rejects every matching request in that window.
+  Give the backend a readiness probe and wait on it, and prefer `failurePolicy: Ignore` or a longer
+  `timeoutSeconds` where the chart allows. Withholding Ready until the lease is live is tracked as a fix.
 
 ### `vm` Pods: What Attach Carries, and What It Does Not
 
