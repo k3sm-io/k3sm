@@ -176,6 +176,9 @@ type runtimedRuntime struct {
 	// clk, dial, and probeTransport are the provider-served probe seams:
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
 	// Production defaults are wired in newRuntimedWith; tests inject fakes.
+	// EVERY probe dial converges on dial: a prober's http transport is built per
+	// pod over it (probeSeamsFor), so probeTransport itself now serves only the
+	// httpGet lifecycle hooks.
 	clk            clock.Clock
 	dial           dialFunc
 	probeTransport http.RoundTripper
