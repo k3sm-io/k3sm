@@ -24,13 +24,17 @@ import (
 // Row names. They are the tokens `-o json` consumers key on, so they are stable
 // and lowercase, and Aggregate reads three of them by name.
 const (
-	RowInstall   = "install"
-	RowNetd      = "netd"
-	RowServer    = "server"
-	RowAPIServer = "apiserver"
-	RowNode      = "node"
-	RowWorkloads = "workloads"
-	RowDataRoot  = "data-root"
+	RowInstall = "install"
+	RowNetd    = "netd"
+	RowServer  = "server"
+	// RowServerArgs is the operator-supplied `k3sm server` arguments the
+	// installed daemon runs with. The row exists only when a server plist is
+	// there to read and a parser was wired in.
+	RowServerArgs = "server-args"
+	RowAPIServer  = "apiserver"
+	RowNode       = "node"
+	RowWorkloads  = "workloads"
+	RowDataRoot   = "data-root"
 	// RowPreVolume is the copy a data-root migration left behind. The row
 	// exists only while the copy does.
 	RowPreVolume = "pre-volume"

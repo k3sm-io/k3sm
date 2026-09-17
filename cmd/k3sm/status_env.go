@@ -110,7 +110,10 @@ func newStatusCollector() status.Collector {
 		// The diskutil read surface, for the one figure statfs cannot answer:
 		// how much a quota-less data volume is using. `diskutil apfs list` needs
 		// no privilege, so this is wired for every caller, not just root.
-		Volumes:    datavol.NewDarwin().Volumes,
+		Volumes: datavol.NewDarwin().Volumes,
+		// The installer's own reader of the server plist's argv, so the row
+		// reports exactly what a reinstall would carry over.
+		ServerArgs: install.OperatorServerArgs,
 		Paths:      statusPaths(workDir),
 		EUID:       euid,
 		ServiceUID: serviceUID,

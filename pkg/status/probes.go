@@ -218,7 +218,17 @@ type Collector struct {
 	// only source of the volume's own figure, and it needs no privilege to read.
 	// A volume WITH a quota is exempt: statfs reports the quota there, which is
 	// the bound the reclaim ladder reads, so it stays the source.
-	Volumes    datavol.Volumes
+	Volumes datavol.Volumes
+	// ServerArgs parses the operator-supplied `k3sm server` arguments out of an
+	// installed server plist's bytes, and it is OPTIONAL: a nil ServerArgs
+	// simply leaves that row out of the report.
+	//
+	// It is a seam rather than a direct call because the parse lives in
+	// pkg/install, and pkg/status is a reporting leaf — importing the installer
+	// would pull the certs, datavol, podnet and sandbox stack in behind one row.
+	// cmd/k3sm wires install.OperatorServerArgs here, so there is still exactly
+	// one reader of that plist's argv.
+	ServerArgs func(plist []byte) ([]string, error)
 	Paths      Paths
 	EUID       int
 	ServiceUID int

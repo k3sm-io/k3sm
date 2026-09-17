@@ -72,6 +72,14 @@ func (c Collector) Collect(ctx context.Context) Report {
 	rows = append(rows,
 		netd,
 		server,
+	)
+	// Immediately after the server it describes, and only when there is a plist
+	// to read it from: on a Mac with no install the row would say nothing the
+	// install row has not already said.
+	if args, ok := c.serverArgsRow(); ok {
+		rows = append(rows, args)
+	}
+	rows = append(rows,
 		apiserver,
 		c.nodeRow(ctx, serving),
 		c.workloadsRow(ctx, serving, serverPID),
@@ -187,6 +195,52 @@ func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
 		"plists": c.Paths.LaunchDaemonDir,
 	}
 	return row, installed
+}
+
+// serverArgsRow reports the operator-supplied `k3sm server` arguments the
+// installed daemon is configured with — everything on its argv that the
+// installer does not render itself. It reports ok=false when there is nothing to
+// report about: no parser was wired, or no server plist exists.
+//
+// It is read-only and it never moves the verdict. An install whose flags this
+// account cannot read is not a degraded cluster, it is an unprivileged report,
+// so an unreadable or unparsable plist is UNKNOWN rather than a warning — the
+// same posture every other "could not see it from here" row takes.
+//
+// The row exists because these arguments were, until now, only knowable by
+// reading LaunchDaemon XML: --registry-port in particular disables the node
+// registry by its ABSENCE, with no log line either way, so "is it set" had no
+// answer an operator could ask for.
+func (c Collector) serverArgsRow() (Row, bool) {
+	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
+		return Row{}, false
+	}
+	path := c.plistPath(c.Paths.ServerLabel)
+	row := Row{Name: RowServerArgs, Wide: map[string]string{"plist": path}}
+	raw, err := c.FS.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return Row{}, false // no install to report arguments for
+	case err != nil:
+		row.State, row.Severity = StateUnknown, SeverityUnknown
+		row.Detail = "unreadable as this user: " + path
+		return row, true
+	}
+	args, err := c.ServerArgs(raw)
+	if err != nil {
+		row.State, row.Severity = StateUnknown, SeverityUnknown
+		row.Detail = "unreadable: " + path + " carries no argument list this k3sm can parse"
+		return row, true
+	}
+	row.State, row.Severity = StateOK, SeverityOK
+	if len(args) == 0 {
+		row.Detail = "none (the stock template: no --mesh-ip, no --registry-port)"
+		return row, true
+	}
+	// Redacted for the same reason the quoted server log line is: the argv is
+	// where a credential would be if one ever reached this row.
+	row.Detail = Redact(strings.Join(args, " "))
+	return row, true
 }
 
 // daemonRow reports one LaunchDaemon. It returns the row and the job's pid (0

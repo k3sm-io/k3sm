@@ -32,6 +32,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -547,5 +548,33 @@ func TestReadTail(t *testing.T) {
 
 	if _, err := readTail(filepath.Join(dir, "absent.log"), 5); err == nil {
 		t.Fatal("readTail on an absent file returned no error")
+	}
+}
+
+// TestStatusCollectorParsesServerArgs proves the production collector wires the
+// INSTALLER's reader of the server plist, not a second one: the row reports
+// exactly what a reinstall would carry over, and the install-managed --token is
+// excluded there for the same reason it is excluded here.
+func TestStatusCollectorParsesServerArgs(t *testing.T) {
+	c := newStatusCollector()
+	if c.ServerArgs == nil {
+		t.Fatal("the status collector must be wired with a server-argument parser")
+	}
+	plist := install.ServerPlist(install.Config{
+		AdminToken:      "k3sm-notarealtokenatall000000",
+		ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1", "--registry-port", "5000"},
+	})
+	got, err := c.ServerArgs(plist)
+	if err != nil {
+		t.Fatalf("parse a rendered server plist: %v", err)
+	}
+	want := []string{"--mesh-ip", "100.64.0.1", "--registry-port", "5000"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("server args = %v, want %v", got, want)
+	}
+	for _, arg := range got {
+		if strings.Contains(arg, "k3sm-notarealtokenatall") {
+			t.Errorf("the reported arguments carry the install-managed token: %v", got)
+		}
 	}
 }
