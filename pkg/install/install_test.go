@@ -833,6 +833,13 @@ func TestInstallOrchestration(t *testing.T) {
 		// the service user at a mode that keeps pod output off every local account.
 		"EnsureContainerLogDir:/var/log/pods",
 		"EnsureContainerLogDir:/var/log/containers",
+		// ...and the walk that hands the PER-POD directories inside that tree
+		// over, for BOTH roles, because a single-node server writes the same
+		// tree. It lists the two roots and stops: there is nothing under them on
+		// a first install, which is the only reason this is two calls and not a
+		// walk (B327).
+		"ListOwned:/var/log/pods",
+		"ListOwned:/var/log/containers",
 		// Before any daemon bootstraps: root netd would otherwise create the run
 		// dir root-owned and the _k3sm server could not bind runtimed.sock in it.
 		"EnsureRunDir:/var/lib/k3sm/run",

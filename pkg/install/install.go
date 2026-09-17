@@ -1308,6 +1308,223 @@ func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
 	return nil
 }
 
+// podLogWalkMaxDepth bounds the pod-log adoption walk below the tree's root.
+// The layout podlogs defines is exactly
+// <root>/<ns>_<pod>_<uid>/<container>/<n>.log — three levels — so this bound is
+// never reached by a tree k3sm itself wrote, and it is what keeps a walk run as
+// root from descending forever into whatever a hand-run mkdir, a half-finished
+// restore, or a rotation tool left behind. It bounds DEPTH rather than entries
+// because the walk never follows a symlink: the only way down is for the
+// directories to really be there.
+const podLogWalkMaxDepth = 8
+
+// podLogAdoption is one run of the container-log-tree adoption: the seam it acts
+// through, the identity entries are handed to, and a tally of what happened, so
+// the operator gets one summary line instead of a line per pod directory on a
+// node that has run hundreds of them.
+type podLogAdoption struct {
+	sys      System
+	log      *slog.Logger
+	uid, gid int
+	adopted  int
+	skipped  int
+}
+
+// chown hands one entry over, counting it. A FAILED chown is a skip and never a
+// refusal: this tree is GC-pending debris by nature — pkg/provider/podlogs is
+// its only deleter, and a directory can vanish under the walk at any moment —
+// so an entry that cannot be moved is reported and stepped over.
+func (a *podLogAdoption) chown(e OwnedEntry) {
+	if err := a.sys.Chown(e.Path, a.uid, a.gid); err != nil {
+		a.skip(e.Path, fmt.Sprintf("it could not be handed over (%v)", err))
+		return
+	}
+	a.adopted++
+}
+
+// skip records an entry the adoption stepped over, and says so at Info with the
+// path. The path only: a log directory's NAME is namespace/pod/container, which
+// the operator already knows, and nothing here ever reads a byte of a pod's
+// output.
+func (a *podLogAdoption) skip(path, why string) {
+	a.skipped++
+	a.log.Info("left an entry in the container-log tree alone", "path", path, "reason", why)
+}
+
+// adoptPodDirs walks the pod-log root one level down and hands every root-owned
+// per-pod directory — and everything inside it — to the service user.
+//
+// An entry that is already the service user's own is left completely alone,
+// including its contents: it was created by the service-user node, which is the
+// posture this step exists to reach, and re-walking every healthy pod directory
+// on every install would be a chown storm over a tree whose size is the node's
+// pod history.
+func (a *podLogAdoption) adoptPodDirs(root string) {
+	entries, ok := a.list(root)
+	if !ok {
+		return
+	}
+	for _, e := range entries {
+		if e.UID != 0 {
+			continue
+		}
+		switch e.Kind {
+		case EntryDir:
+			// Parent BEFORE child, which is the opposite of the agent work dir's
+			// order and safe for a different reason. There the concern was a
+			// window in which the service user owned a directory while a
+			// credential inside it was still root's. Here every entry is
+			// lstat-ed (ListOwned) and every chown is an lchown (the Chown
+			// seam), so an entry swapped for a symlink mid-walk is skipped if
+			// the walk sees it as a link and, if it is swapped after the lstat,
+			// moves the LINK rather than its target. Nothing in this tree is a
+			// credential, and the service user is the intended owner of all of
+			// it.
+			a.chown(e)
+			a.adoptTree(e.Path, 1)
+		case EntryRegular:
+			// Not part of the kubelet layout, but root-owned debris in a
+			// directory the service user must be able to unlink in. Handing it
+			// over costs nothing (the mode is untouched) and leaving it behind
+			// is how a GC pass later fails on a single file.
+			a.chown(e)
+		default:
+			a.skip(e.Path, "it is "+e.Kind.String()+", which k3sm does not follow or chown here")
+		}
+	}
+}
+
+// adoptTree hands everything inside an already-adopted pod directory over,
+// recursively, depth-first and parent-before-child.
+//
+// Only directories and regular files are touched. A symlink is REPORTED and
+// stepped over rather than adopted: inside the pod-log tree a link is not part
+// of the layout k3sm writes, so it is something else's, and the one thing a
+// root-run walk must never do is follow it.
+func (a *podLogAdoption) adoptTree(dir string, depth int) {
+	if depth > podLogWalkMaxDepth {
+		a.skip(dir, fmt.Sprintf("it is deeper than the %d levels k3sm walks", podLogWalkMaxDepth))
+		return
+	}
+	entries, ok := a.list(dir)
+	if !ok {
+		return
+	}
+	for _, e := range entries {
+		switch e.Kind {
+		case EntryDir:
+			if e.UID == 0 {
+				a.chown(e)
+			}
+			a.adoptTree(e.Path, depth+1)
+		case EntryRegular:
+			if e.UID == 0 {
+				a.chown(e)
+			}
+		default:
+			a.skip(e.Path, "it is "+e.Kind.String()+", which k3sm does not follow or chown here")
+		}
+	}
+}
+
+// adoptContainerLinks hands the root-owned entries of the flat per-container
+// symlink directory over.
+//
+// Here — and only here — a SYMLINK is the thing to adopt rather than the thing
+// to step over: the directory holds nothing else by design (each entry is the
+// kubelet-shaped link a log shipper globs), and the node that must be able to
+// replace and unlink those links runs as the service user. The Chown seam is an
+// lchown, so the link itself moves and its target is never touched.
+func (a *podLogAdoption) adoptContainerLinks(dir string) {
+	entries, ok := a.list(dir)
+	if !ok {
+		return
+	}
+	for _, e := range entries {
+		if e.UID != 0 {
+			continue
+		}
+		switch e.Kind {
+		case EntrySymlink, EntryRegular:
+			a.chown(e)
+		default:
+			a.skip(e.Path, "it is "+e.Kind.String()+", which is not a container log link")
+		}
+	}
+}
+
+// list reads one directory through the seam. An ABSENT directory is a posture
+// and not a problem (a node that has never run a pod has no tree), so it is
+// silent; anything else that cannot be listed is reported and stepped over,
+// because this step never refuses an install.
+func (a *podLogAdoption) list(dir string) ([]OwnedEntry, bool) {
+	entries, err := a.sys.ListOwned(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, false
+	case err != nil:
+		a.skip(dir, fmt.Sprintf("it could not be listed (%v)", err))
+		return nil, false
+	}
+	return entries, true
+}
+
+// adoptPodLogTree hands the per-pod log directories an OLDER install left
+// root-owned over to the service user, on a reinstall over a node whose agent
+// once ran as root.
+//
+// It is adoptLegacyAgentFiles' sibling for the one tree that step deliberately
+// does not touch, and it closes the failure that survived it: the log-dir step
+// above chowns the ROOT of the tree, and only the root, so a node whose
+// root-era agent had already created <root>/<ns>_<pod>_<uid> directories (0700,
+// root-owned) came back up as _k3sm and failed every CreatePod with
+//
+//	failed to create container log directory
+//	/var/log/pods/<ns>_<pod>_<uid>/<container>: permission denied
+//
+// — a per-pod directory it can traverse to and not write in. Only root can hand
+// those directories over and only the installer runs as root, which is the same
+// reason EnsureContainerLogDir is an install step rather than something the node
+// does for itself.
+//
+// This is a MIGRATION to the posture a fresh install already produces — service
+// uid, group wheel (ContainerLogDirGID), the mode carried across verbatim — and
+// widens nothing: a 0700 directory is readable by exactly one account before and
+// after, and what moves is which uid that is.
+//
+// Four properties, all deliberate, and all different from the agent work dir's:
+//
+//   - It is a WALK, because this tree is dynamic (<ns>_<pod>_<uid>/<container>/
+//     <n>.log) rather than the fixed handful of credential names that dir holds.
+//   - It NEVER refuses the install. The tree is GC-pending debris by nature —
+//     pkg/provider/podlogs GC is its sole deleter and runs asynchronously — so
+//     an unreadable directory or an entry k3sm cannot account for is reported
+//     and stepped over, not turned into a failed install of an otherwise healthy
+//     node.
+//   - It DELETES nothing, for the same reason: the GC owns removal, and an
+//     installer that also removed would be a second deleter racing it.
+//   - It never follows a symlink. Every entry is lstat-ed and every chown is an
+//     lchown, so a link planted anywhere in the tree moves nothing but itself —
+//     and inside the pod tree it is not even moved, only reported.
+func adoptPodLogTree(sys System, cfg Config, uid uint32) {
+	svcUID := int(uid)
+	if svcUID == 0 {
+		// Nothing to migrate TO: the service user is root, so the tree already
+		// names the account the node runs as.
+		return
+	}
+	a := &podLogAdoption{sys: sys, log: cfg.Logger, uid: svcUID, gid: ContainerLogDirGID}
+	a.adoptPodDirs(PodLogsDir)
+	a.adoptContainerLinks(ContainerLogsDir)
+	if a.adopted > 0 || a.skipped > 0 {
+		// One line, with counts rather than paths: a node with a long pod
+		// history has thousands of entries, and the per-entry lines above are
+		// already there for the ones that were NOT adopted.
+		a.log.Info("adopted container-log entries left root-owned by an install that predates the service user (modes unchanged; only the uid the entries name moves)",
+			"user", cfg.ServiceUser, "uid", svcUID, "gid", ContainerLogDirGID, "adopted", a.adopted, "skipped", a.skipped)
+	}
+}
+
 // serverTokenPath is where Install stages the static admin token for the
 // control-plane daemon to read: <DataRoot>/server/token, service-user-owned
 // 0600 (see ServerTokenFileMode).
@@ -1968,6 +2185,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 			return fmt.Errorf("install: ensure container log dir %s: %w", dir, err)
 		}
 	}
+
+	// 1b″. ...and the PER-POD directories inside that tree, on a node whose
+	//     daemon once ran as root. The step above repairs the root and only the
+	//     root; the directories a root-era node created under it stay root-owned
+	//     0700, and the service-user node then fails every CreatePod with
+	//     "failed to create container log directory ...: permission denied".
+	//     Unconditional, exactly like the step it repairs: a single-node server
+	//     runs pods and writes this same tree, so a role gate here would leave
+	//     one of the two roles with the failure. See adoptPodLogTree for why
+	//     this one walks, never refuses, and never deletes. It returns nothing:
+	//     a tree whose sole deleter is an asynchronous GC is not something to
+	//     fail an install over.
+	adoptPodLogTree(sys, cfg, uid)
 
 	// 1c. The run dir, BEFORE either daemon bootstraps — because whichever daemon
 	//     starts first creates it, and that is root netd, which left it root:wheel
