@@ -894,6 +894,24 @@ func (c Config) runDir() string { return RunDir(c.DataRoot) }
 // re-typed at each use.
 func (c Config) serverWorkDir() string { return filepath.Join(c.DataRoot, "server") }
 
+// agentWorkDir is the joining worker's state root under the data root — the
+// directory `k3sm agent --work-dir` defaults to, holding the node credential,
+// the node-password, the mesh key and the agent's crash-loop record.
+//
+// It is serverWorkDir's sibling and exists for the same reason: the installer
+// reads what the daemon wrote there (the credential a join produces, and the
+// record a start failure leaves), and a second spelling of the path would be a
+// verifier watching a directory nothing writes. The empty-data-root default
+// mirrors AgentCredentialPath's, so the two can never disagree about which
+// tree they are looking at.
+func (c Config) agentWorkDir() string {
+	root := c.DataRoot
+	if root == "" {
+		root = DefaultDataRoot
+	}
+	return filepath.Join(root, agentWorkSubdir)
+}
+
 // datavolStaging is the migration staging mount point for this Config's install
 // dir (see DatavolStagingDir). It is an accessor rather than a second literal so
 // a Config pointing at another install dir stages inside it.

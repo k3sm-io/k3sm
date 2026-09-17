@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // crashLoopPollInterval is how often a PARKED daemon looks for its marker to be
@@ -118,6 +119,49 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 		"component", component, "err", err)
 	if b.recordBringUp(component, err.Error()) {
 		logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
+			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+	}
+}
+
+// noted reports whether THIS process has already recorded a failure. It is what
+// keeps the agent's single funnel from counting one start failure twice: the
+// terminal paths record before they back off (agentTerminal), and runAgent then
+// records only what did not already pass through one of them.
+func (b *crashBreaker) noted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.crashed
+}
+
+// agentComponent is the component name the agent records its start failures
+// under. A worker has no supervised components to name — its start is one
+// sequence (token join or credential resume, then the mesh and the datapath) —
+// so the role IS the component, and an installer reading the record learns
+// which daemon failed without knowing the agent's internal stages.
+const agentComponent = "agent"
+
+// noteAgentStartFailure records one agent start failure as a BRING-UP failure,
+// under agentComponent. It is noteBringUpFailure's sibling for the worker role,
+// and differs from it in exactly two ways, both of which belong to the role:
+//
+//   - It never parks and never asks the caller to. `k3sm agent` already waits
+//     agentTerminalBackoff between terminal start attempts, so the unthrottled
+//     spawn loop the server's park exists to stop cannot happen here. The record
+//     is kept for its OTHER reader — `k3sm install`, which cannot otherwise tell
+//     a join that happened during this install from a credential an earlier one
+//     left behind.
+//   - The detail is redacted HERE. A server's bring-up error arrives already
+//     redacted from pkg/executor; an agent's start error is this command's own
+//     text and can quote a token it was handed, so it passes through
+//     pkg/status's redactor on its way into a file an operator will read.
+func noteAgentStartFailure(b *crashBreaker, logger *slog.Logger, err error) {
+	logger.Error("this agent did not start; recording it on the crash-loop record",
+		"component", agentComponent, "path", b.path, "err", err)
+	if b.recordBringUp(agentComponent, status.Redact(err.Error())) {
+		// Logged, not acted on: the threshold is what `k3sm status` and an
+		// operator read as "this has been failing for a while", and the agent
+		// keeps retrying either way.
+		logger.Error("the agent's crash-loop record reached the threshold; it keeps retrying rather than parking",
 			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
 	}
 }

@@ -22,11 +22,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // The daemon restart sequence, and why it is a sequence at all.
@@ -357,7 +360,7 @@ func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact, st
 	if err := verifyServerNotParked(sys, cfg, m, startedAt); err != nil {
 		return err
 	}
-	if err := verifyAgentJoined(ctx, sys, cfg); err != nil {
+	if err := verifyAgentJoined(ctx, sys, cfg, startedAt); err != nil {
 		return err
 	}
 	cfg.Logger.Info("verified the daemons after the restart", "state", strings.Join(states, "; "))
@@ -475,31 +478,212 @@ func parkedSummary(last executor.Crash) string {
 //
 // `k3sm agent` treats its terminal start failures as things to back off from
 // rather than to die of: a token the cluster rejects, a token file that is not
-// there when no credential is either, a corrupt credential. That is right for a
-// KeepAlive daemon (the alternative is a spawn loop), and it means a broken
-// worker presents launchd with a perfectly healthy pid for 30 seconds at a
-// time. An install that verified the pid alone would report success and hand
-// the operator a node that never appears in `kubectl get nodes`.
+// there when no credential is either, a corrupt credential, a node-password it
+// cannot persist. That is right for a KeepAlive daemon (the alternative is a
+// spawn loop), and it means a broken worker presents launchd with a perfectly
+// healthy pid for 30 seconds at a time. An install that verified the pid alone
+// would report success and hand the operator a node that never appears in
+// `kubectl get nodes`.
 //
-// So when THIS install staged a token — i.e. the operator asked for a join to
-// happen now — it waits for the first externally visible product of that join,
-// the node credential the agent writes (AgentCredentialPath). When no token was
-// staged, there is nothing to wait for: either the node already holds a
-// credential, in which case the pid IS the whole claim, or it holds none and
-// the daemon is backing off with an error the log names, which is not something
-// this install caused and not something it can fix.
-func verifyAgentJoined(ctx context.Context, sys System, cfg Config) error {
+// THE PRESENCE OF A FILE IS NOT A WITNESS. This check used to wait only for
+// AgentCredentialPath to exist — and a credential is exactly what a Mac that
+// has been installed before already has. On 2026-09-17 that passed instantly on
+// a reinstall while the agent was crash-looping on "persist node-password:
+// permission denied", so the install reported "the agent joined the cluster"
+// about a daemon that had joined nothing. A file says only that SOME start, at
+// some point in the past, succeeded; it cannot attest this install's daemon.
+//
+// So the claim is made from two witnesses instead, polled together over the
+// join budget:
+//
+//   - THE CRASH RECORD, the same evidence the server role already uses
+//     (verifyServerNotParked). The agent now records every start failure it
+//     backs off from as a bring-up entry under its work dir, so a failure dated
+//     at or after THIS install's start is this install's to report and fails it
+//     immediately, quoting what the daemon recorded. Older entries fail
+//     nothing — they are the fault an operator may well be reinstalling to fix.
+//     It is FAIL-OPEN on everything else (absent, unreadable, malformed), for
+//     the reason the server's is: bookkeeping is not a verdict.
+//   - THE CREDENTIAL'S CLUSTER, not its existence. The credential counts only
+//     when it parses as a complete node credential (pkg/nodecred — the same
+//     reader the daemon and `k3sm status` use) AND its cluster-CA pin is the one
+//     the token this install staged pins. A credential with a different pin is a
+//     leftover from another cluster, so the wait continues: the daemon will
+//     re-join over it.
+//
+// The second witness is also what keeps a REINSTALL honest in the other
+// direction. A worker that is simply being upgraded resumes from the credential
+// it already holds and writes nothing new, so requiring a fresh write would
+// fail every reinstall; requiring the right CLUSTER passes that case without
+// accepting a stale file.
+//
+// When no token was staged there is nothing to verify: either the node already
+// holds a credential, in which case the pid IS the whole claim, or it holds none
+// and the daemon is backing off with an error the log names, which is not
+// something this install caused and not something it can fix.
+func verifyAgentJoined(ctx context.Context, sys System, cfg Config, startedAt time.Time) error {
 	if cfg.Role != RoleAgent || cfg.TokenFile == "" {
 		return nil
 	}
 	cred := AgentCredentialPath(cfg.DataRoot)
-	if err := awaitPath(ctx, sys, cred, "the agent has not written the credential a completed join produces", agentJoinBudget); err != nil {
-		return fmt.Errorf("the agent daemon is running but has not joined the cluster: %v (it backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the reason is the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one)",
-			err, agentTerminalBackoffNote, AgentLogPath())
+	pin, pinned := stagedTokenPin(sys, cfg)
+	deadline := time.Now().Add(agentJoinBudget.running)
+	for {
+		if err := freshAgentStartFailure(sys, cfg, startedAt); err != nil {
+			return err
+		}
+		joined, why := agentCredentialProvesJoin(sys, cfg, pin, pinned)
+		if joined {
+			cfg.Logger.Info("the agent joined the cluster", "credential", cred)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the agent daemon is running but has not joined the cluster within %s: %s (it backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the reason is the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one)",
+				agentJoinBudget.running, why, agentTerminalBackoffNote, AgentLogPath())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(agentJoinBudget.poll):
+		}
 	}
-	cfg.Logger.Info("the agent joined the cluster", "credential", cred)
-	return nil
 }
+
+// freshAgentStartFailure fails the install when the agent's own record holds a
+// start failure dated at or after this install began. It is
+// verifyServerNotParked's counterpart for the worker role and shares its
+// timestamp rule and its fail-open posture; what it does NOT share is the park
+// check, because the agent never parks — it backs off in process, so a tripped
+// record changes nothing about what launchd reports and adds nothing this check
+// can act on.
+func freshAgentStartFailure(sys System, cfg Config, startedAt time.Time) error {
+	path := executor.CrashLoopPath(cfg.agentWorkDir())
+	raw, err := sys.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		cfg.Logger.Warn("could not read the agent's crash-loop record", "path", path, "err", err)
+		return nil
+	}
+	rec, err := executor.ParseCrashRecord(raw)
+	if err != nil {
+		cfg.Logger.Warn("the agent's crash-loop record is unreadable; treating it as empty", "path", path, "err", err)
+		return nil
+	}
+	// The daemon and this process read the same machine's clock, so comparing
+	// the record's timestamps with this install's start compares a clock with
+	// itself.
+	fresh, last := freshBringUpFailures(rec, startedAt)
+	if fresh == 0 {
+		return nil
+	}
+	return fmt.Errorf("the agent daemon is running but did not join the cluster: it failed to start %d times since this install began (last at %s: %s). It backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the rest is in the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one. The agent's own record is %s",
+		fresh, last.At.Format(time.RFC3339), agentFailureDetail(last), agentTerminalBackoffNote, AgentLogPath(), path)
+}
+
+// agentFailureDetail is the recorded, already-redacted reason the agent could
+// not start, or a stand-in when the entry carried none (a record left by a
+// build that did not write details).
+func agentFailureDetail(c executor.Crash) string {
+	if strings.TrimSpace(c.Detail) == "" {
+		return "no detail recorded"
+	}
+	return c.Detail
+}
+
+// agentCredentialProvesJoin reports whether the stored node credential is proof
+// that this node belongs to the cluster the staged token names, and — when it is
+// not — the clause the failure message quotes.
+//
+// The validation is pkg/nodecred's, never a second looser reader: `k3sm status`
+// and the daemon already reach a verdict about these five files, and an
+// installer that reached a different one about the same directory would send an
+// operator to the wrong Mac.
+//
+// A credential that parses but is out of date still counts. Expiry is the
+// daemon's decision — it re-joins with the staged token, or it fails and the
+// record says so on the next tick — and an installer that failed here would be
+// pre-empting a daemon that is about to fix it.
+func agentCredentialProvesJoin(sys System, cfg Config, pin string, pinned bool) (joined bool, why string) {
+	path := AgentCredentialPath(cfg.DataRoot)
+	state, cred, err := nodecred.Status(sysFS{sys: sys}, cfg.agentWorkDir(), time.Now())
+	switch {
+	case cred == nil && err != nil:
+		return false, fmt.Sprintf("%s did not parse as a node credential (%v)", path, err)
+	case cred == nil:
+		return false, fmt.Sprintf("%s is ABSENT (the agent has not written the credential a completed join produces)", path)
+	case pinned && cred.ClusterCAPin != pin:
+		return false, fmt.Sprintf("%s is a credential for a DIFFERENT cluster (it pins cluster CA %s; the token this install staged pins %s), so it is a file an earlier install left behind rather than proof of this join", path, cred.ClusterCAPin, pin)
+	}
+	if state != nodecred.Valid {
+		cfg.Logger.Warn("the agent's stored credential is for this cluster but is not in date; the daemon re-joins with the staged token or reports why",
+			"credential", path, "state", state)
+	}
+	return true, ""
+}
+
+// stagedTokenPin returns the cluster-CA pin carried by the join token THIS
+// install staged, and whether it could be determined.
+//
+// It reads the operator's token file (the root-only source, which only the
+// installer can open) and takes the pin with pkg/bootstrap's own parser — the
+// hash is never recomputed here, because a second implementation of a pin is a
+// second answer to "which cluster is this".
+//
+// It is fail-open: a token this installer could not read or parse leaves the
+// credential check with existence-and-parse only, which is what the check did
+// before the pin was added. A refusal here would fail an install over a
+// bookkeeping read, and the token itself was already validated where it is
+// staged.
+func stagedTokenPin(sys System, cfg Config) (string, bool) {
+	raw, err := sys.ReadFile(cfg.TokenFile)
+	if err != nil {
+		cfg.Logger.Warn("could not re-read the staged join token; the credential check cannot tell which cluster it is for", "path", cfg.TokenFile, "err", err)
+		return "", false
+	}
+	tok, err := bootstrap.ParseToken(string(raw))
+	if err != nil {
+		cfg.Logger.Warn("the staged join token does not parse; the credential check cannot tell which cluster it is for", "path", cfg.TokenFile, "err", err)
+		return "", false
+	}
+	return tok.CAHash, true
+}
+
+// sysFS adapts the installer's privileged file seam to pkg/nodecred's read
+// surface, so the credential is validated by that package rather than by a
+// second reader written here.
+//
+// Stat is answered by READING, because System exposes no stat and its
+// PathExists deliberately answers without opening the file — which is the wrong
+// question for a credential: one that cannot be read has not been verified. The
+// five artifacts are a few kilobytes between them and the poll is a quarter of a
+// second, so reading twice costs nothing worth a seam change.
+type sysFS struct{ sys System }
+
+func (s sysFS) Stat(name string) (fs.FileInfo, error) {
+	b, err := s.sys.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	return statResult{name: filepath.Base(name), size: int64(len(b))}, nil
+}
+
+func (s sysFS) ReadFile(name string) ([]byte, error) { return s.sys.ReadFile(name) }
+
+// statResult is the minimum fs.FileInfo pkg/nodecred's existence check consumes:
+// it asks whether Stat succeeded, never what it said.
+type statResult struct {
+	name string
+	size int64
+}
+
+func (s statResult) Name() string       { return s.name }
+func (s statResult) Size() int64        { return s.size }
+func (s statResult) Mode() fs.FileMode  { return 0 }
+func (s statResult) ModTime() time.Time { return time.Time{} }
+func (s statResult) IsDir() bool        { return false }
+func (s statResult) Sys() any           { return nil }
 
 // agentTerminalBackoffNote is how long `k3sm agent` waits between terminal start
 // attempts, quoted in the message above so an operator reading it knows why the
@@ -513,9 +697,11 @@ const agentTerminalBackoffNote = "30s"
 // pid clauses rather than wrapping it.
 //
 // absent is what the caller says the absence MEANS — the file is generic, the
-// conclusion is not. It is a parameter rather than a sentence baked in here
-// because there are now two waits with nothing in common but the polling: a
-// netd socket that is not being served, and a join that has not happened.
+// conclusion is not. It stays a parameter rather than a sentence baked in here
+// because the conclusion belongs to whoever is waiting: the netd socket is the
+// only such wait today (the agent join is no longer one — a credential file's
+// presence is not proof of a join; see verifyAgentJoined), and the next one
+// will not be about a socket.
 func awaitPath(ctx context.Context, sys System, path, absent string, b restartBudget) error {
 	deadline := time.Now().Add(b.running)
 	for {
