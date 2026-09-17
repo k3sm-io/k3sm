@@ -165,16 +165,13 @@ func (c Collector) agentRow(now time.Time) (Row, int, CredentialState) {
 	case CredentialAbsent:
 		row.State, row.Severity = StateWaiting, SeverityWarn
 		row.Detail += " · waiting for a join: this Mac holds no node credential yet"
-		row.Remedy = c.joinRemedy()
 	case CredentialExpired:
 		row.State, row.Severity = StateExpired, SeverityWarn
 		row.Detail += " · the node credential expired on " + notAfter.UTC().Format("2006-01-02") +
 			", so this worker can no longer authenticate"
-		row.Remedy = c.joinRemedy()
 	case CredentialCorrupt:
 		row.State, row.Severity = StateCorrupt, SeverityFail
 		row.Detail += " · the stored node credential in " + c.Paths.AgentCredentialDir + " does not parse"
-		row.Remedy = "k3sm status logs " + RowAgent + "\n" + c.joinRemedy()
 	default:
 		// Unknown: the store is service-user-owned, so an ordinary account is
 		// EXPECTED not to read it. That is not a healthy verdict and not a
@@ -182,9 +179,34 @@ func (c Collector) agentRow(now time.Time) (Row, int, CredentialState) {
 		// reports honestly.
 		row.Severity = SeverityUnknown
 		row.Detail += " · node credential state unknown (not readable as this user)"
-		row.Remedy = "sudo k3sm status"
 	}
+	row.Remedy = c.credentialRemedy(state)
 	return row, pid, state
+}
+
+// credentialRemedy is what an operator does about a node credential in a given
+// state. It is ONE function because two rows read it: the agent row, which
+// describes the credential, and the apiserver row, whose probe target lives
+// inside that same credential. Sending a reader of one row to `k3sm token
+// create` and a reader of the other to `sudo k3sm status` about the same
+// directory is how a report teaches an operator to re-join a perfectly healthy
+// worker — so the two cannot be allowed to drift apart.
+//
+// The Unknown arm is the one that matters most and is the least obvious: the
+// store is service-user-owned and mode 0700, so an ordinary `k3sm status` is
+// EXPECTED to fail to read it. Nothing is wrong there, and the only thing that
+// would change the answer is running the same command with sudo.
+func (c Collector) credentialRemedy(state CredentialState) string {
+	switch state {
+	case CredentialValid:
+		return ""
+	case CredentialAbsent, CredentialExpired:
+		return c.joinRemedy()
+	case CredentialCorrupt:
+		return "k3sm status logs " + RowAgent + "\n" + c.joinRemedy()
+	default:
+		return "sudo k3sm status"
+	}
 }
 
 // credentialState reads the node credential store this report is about.

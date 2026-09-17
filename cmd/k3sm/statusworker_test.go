@@ -144,9 +144,28 @@ type nodeMac struct{ paths status.Paths }
 // install left behind — and a worker that probes it is the defect.
 const staleServerKubeconfigURL = "https://127.0.0.1:6444"
 
+// macOpts describes the Mac to stage: which role's plist(s) are on disk, and
+// which of the two state directories a previous life left behind.
+type macOpts struct {
+	role install.Role
+	// joined stages a complete node credential store under the data root.
+	joined bool
+	// serverWorkDir stages a control-plane work dir with an admin kubeconfig —
+	// on an agent Mac, the stale leftover this gate is about.
+	serverWorkDir bool
+	// bothRoles additionally lays down the OTHER role's plist, the posture
+	// `k3sm install` refuses to create and RoleFromPlists resolves to server.
+	bothRoles bool
+	// unreadableCredential makes the staged credential store unreadable by
+	// this account: the ordinary posture of an unprivileged `k3sm status`
+	// against a service-user-owned store.
+	unreadableCredential bool
+}
+
 // stageNodeMac writes an install tree for one role under a temp dir.
-func stageNodeMac(t *testing.T, role install.Role, joined, serverWorkDir bool) nodeMac {
+func stageNodeMac(t *testing.T, opts macOpts) nodeMac {
 	t.Helper()
+	role := opts.role
 	root := t.TempDir()
 	mkdir := func(parts ...string) string {
 		t.Helper()
@@ -182,11 +201,18 @@ func stageNodeMac(t *testing.T, role install.Role, joined, serverWorkDir bool) n
 		nodeLabel = install.AgentLabel
 	}
 	touch(filepath.Join(ldDir, nodeLabel+".plist"))
+	if opts.bothRoles {
+		other := install.ServerLabel
+		if nodeLabel == install.ServerLabel {
+			other = install.AgentLabel
+		}
+		touch(filepath.Join(ldDir, other+".plist"))
+	}
 	socket := filepath.Join(runDir, "netd.sock")
 	touch(socket)
 
 	workDir := filepath.Join(dataRoot, "server")
-	if serverWorkDir {
+	if opts.serverWorkDir {
 		kc := executor.KubeconfigPath(workDir)
 		mkdirAll := filepath.Dir(kc)
 		if err := os.MkdirAll(mkdirAll, 0o700); err != nil {
@@ -194,7 +220,7 @@ func stageNodeMac(t *testing.T, role install.Role, joined, serverWorkDir bool) n
 		}
 		writeAdminKubeconfig(t, kc, staleServerKubeconfigURL)
 	}
-	if joined {
+	if opts.joined {
 		store := nodeCredentialStore{dir: filepath.Dir(install.AgentCredentialPath(dataRoot))}
 		if err := os.MkdirAll(store.dir, 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", store.dir, err)
@@ -202,6 +228,15 @@ func stageNodeMac(t *testing.T, role install.Role, joined, serverWorkDir bool) n
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, res); err != nil {
 			t.Fatalf("save the node credential: %v", err)
+		}
+		if opts.unreadableCredential {
+			// 0000 on the DIRECTORY, so every path inside it answers EACCES —
+			// which is what an ordinary account gets against the real store,
+			// whose owner is the service user.
+			if err := os.Chmod(store.dir, 0o000); err != nil {
+				t.Fatalf("chmod %s: %v", store.dir, err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(store.dir, 0o700) })
 		}
 	}
 
@@ -303,7 +338,7 @@ func collectFrom(t *testing.T, mac nodeMac, role install.Role, ready bool) (stat
 // control plane on this Mac to be down.
 func TestStatusOnAWorkerNeverProbesTheLoopbackApiserver(t *testing.T) {
 	t.Run("a worker with a stale server directory probes only its own credential's apiserver", func(t *testing.T) {
-		mac := stageNodeMac(t, install.RoleAgent, true, true)
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true, serverWorkDir: true})
 		rep, dialled, err := collectFrom(t, mac, install.RoleAgent, false)
 		if err != nil {
 			t.Fatalf("a joined worker could not resolve its own credentials: %v", err)
@@ -354,7 +389,7 @@ func TestStatusOnAWorkerNeverProbesTheLoopbackApiserver(t *testing.T) {
 	})
 
 	t.Run("a worker that has not joined names nothing to probe", func(t *testing.T) {
-		mac := stageNodeMac(t, install.RoleAgent, false, true)
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, serverWorkDir: true})
 		rep, dialled, err := collectFrom(t, mac, install.RoleAgent, false)
 		if err == nil {
 			t.Fatal("an unjoined worker resolved credentials; it holds none")
@@ -375,7 +410,7 @@ func TestStatusOnAWorkerNeverProbesTheLoopbackApiserver(t *testing.T) {
 	})
 
 	t.Run("a control plane is unchanged: the loopback apiserver and the work dir kubeconfig", func(t *testing.T) {
-		mac := stageNodeMac(t, install.RoleServer, false, true)
+		mac := stageNodeMac(t, macOpts{role: install.RoleServer, serverWorkDir: true})
 		rep, dialled, err := collectFrom(t, mac, install.RoleServer, true)
 		if err != nil {
 			t.Fatalf("a control plane could not resolve its own kubeconfig: %v", err)
@@ -404,8 +439,75 @@ func TestStatusOnAWorkerNeverProbesTheLoopbackApiserver(t *testing.T) {
 		}
 	})
 
+	t.Run("a credential store this account may not read names sudo, never a rejoin", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads every directory regardless of mode")
+		}
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true, unreadableCredential: true})
+		rep, dialled, err := collectFrom(t, mac, install.RoleAgent, false)
+		if err == nil {
+			t.Fatal("an unreadable credential store resolved credentials")
+		}
+		if !strings.Contains(err.Error(), "not readable") || !strings.Contains(err.Error(), "sudo") {
+			t.Errorf("resolution error = %q, want it to name the permission problem and sudo", err)
+		}
+		if len(dialled) != 0 {
+			t.Errorf("a report that could not read the credential dialled %v", dialled)
+		}
+		api, ok := rep.Row(status.RowAPIServer)
+		if !ok {
+			t.Fatal("no apiserver row")
+		}
+		if api.Remedy != "sudo k3sm status" {
+			t.Errorf("apiserver remedy = %q, want the sudo re-run", api.Remedy)
+		}
+		if strings.Contains(api.Remedy, "k3sm token create") {
+			t.Errorf("an unreadable credential store was answered with a rejoin: %q", api.Remedy)
+		}
+	})
+
+	t.Run("an absent credential store is answered with the join", func(t *testing.T) {
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent})
+		rep, _, err := collectFrom(t, mac, install.RoleAgent, false)
+		if err == nil {
+			t.Fatal("an unjoined worker resolved credentials")
+		}
+		api, ok := rep.Row(status.RowAPIServer)
+		if !ok {
+			t.Fatal("no apiserver row")
+		}
+		if !strings.Contains(api.Remedy, "k3sm token create") {
+			t.Errorf("apiserver remedy = %q, want the join remedy", api.Remedy)
+		}
+	})
+
+	t.Run("a Mac carrying both node daemons reports the server's credentials", func(t *testing.T) {
+		// RoleFromPlists resolves both-plists to the server — the posture
+		// `k3sm install` refuses to create — so the credential choice must
+		// follow it and take the work dir's admin kubeconfig, even though a
+		// node credential is sitting right there.
+		role, installed := install.RoleFromPlists(true, true)
+		if role != install.RoleServer || !installed {
+			t.Fatalf("RoleFromPlists(true, true) = %q/%t, want the server role", role, installed)
+		}
+		mac := stageNodeMac(t, macOpts{role: install.RoleServer, joined: true, serverWorkDir: true, bothRoles: true})
+		rep, dialled, err := collectFrom(t, mac, role, true)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		for _, url := range dialled {
+			if !strings.HasPrefix(url, staleServerKubeconfigURL) {
+				t.Errorf("dialled %q, want the server's own apiserver %s", url, staleServerKubeconfigURL)
+			}
+		}
+		kc, _ := rep.Row(status.RowKubeconfig)
+		if want := executor.KubeconfigPath(mac.paths.WorkDir); !strings.Contains(kc.Detail, want) {
+			t.Errorf("kubeconfig row = %q, want the work dir's admin kubeconfig %s", kc.Detail, want)
+		}
+	})
+
 	t.Run("a worker whose apiserver answers is running", func(t *testing.T) {
-		mac := stageNodeMac(t, install.RoleAgent, true, false)
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true})
 		rep, dialled, err := collectFrom(t, mac, install.RoleAgent, true)
 		if err != nil {
 			t.Fatalf("resolve: %v", err)
@@ -421,4 +523,58 @@ func TestStatusOnAWorkerNeverProbesTheLoopbackApiserver(t *testing.T) {
 			t.Errorf("verdict = %v (%s)\n%s", rep.Verdict, rep.Summary, status.Render(rep, status.Style{}))
 		}
 	})
+}
+
+// TestStatusKubeconfigDistinguishesAbsentFromUnreadable pins the credential
+// choice's three answers on the agent role. fileExists cannot tell a missing
+// file from one this account may not stat, and the two have opposite remedies:
+// one is a worker that never joined, the other is a perfectly joined worker
+// being read by an unprivileged command.
+func TestStatusKubeconfigDistinguishesAbsentFromUnreadable(t *testing.T) {
+	t.Parallel()
+
+	const nodeKubeconfig = "/var/lib/k3sm/agent/node.kubeconfig"
+	tests := []struct {
+		name     string
+		stat     func(string) error
+		wantPath string
+		wantErr  []string
+	}{
+		{"a readable credential is the kubeconfig", func(string) error { return nil }, nodeKubeconfig, nil},
+		{"an absent credential says so",
+			func(p string) error { return &fs.PathError{Op: "stat", Path: p, Err: fs.ErrNotExist} },
+			"", []string{"no node credential", nodeKubeconfig}},
+		{"an unreadable credential names sudo",
+			func(p string) error { return &fs.PathError{Op: "stat", Path: p, Err: fs.ErrPermission} },
+			"", []string{"not readable", "sudo", nodeKubeconfig}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := statusKubeconfig(statusKubeInputs{
+				role:           install.RoleAgent,
+				nodeKubeconfig: nodeKubeconfig,
+				workDir:        "/var/lib/k3sm/server",
+				exists:         func(string) bool { return true },
+				stat:           tc.stat,
+			})
+			if tc.wantPath != "" {
+				if err != nil {
+					t.Fatalf("resolve: %v", err)
+				}
+				if cfg.kubeconfig != tc.wantPath {
+					t.Errorf("kubeconfig = %q, want %q", cfg.kubeconfig, tc.wantPath)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("resolved %+v, want an error", cfg)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
 }

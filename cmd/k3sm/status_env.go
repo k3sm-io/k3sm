@@ -405,6 +405,23 @@ type statusKubeInputs struct {
 	home            string
 	// exists reports whether a path is present (fileExists in production).
 	exists func(string) bool
+	// stat reports WHY a path is unusable, which exists cannot: fileExists
+	// swallows EACCES into the same false a missing file produces, and on the
+	// agent work dir — service-user-owned, mode 0700 — EACCES is the ordinary
+	// answer for an unprivileged run. Reporting that as "no node credential"
+	// would tell an operator to re-join a worker that is perfectly joined.
+	// A nil stat means os.Stat.
+	stat func(string) error
+}
+
+// statPath reports why a path is unusable, or nil when it is there and
+// readable.
+func (in statusKubeInputs) statPath(path string) error {
+	if in.stat != nil {
+		return in.stat(path)
+	}
+	_, err := os.Stat(path)
+	return err
 }
 
 // statusKubeInputsFor gathers the credential choice's inputs for the role this
@@ -444,10 +461,17 @@ func statusKubeInputsFor(role install.Role, paths status.Paths) statusKubeInputs
 // several endpoints into one row is a different shape than the row has.
 func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
 	if in.role == install.RoleAgent {
-		if in.nodeKubeconfig == "" || !in.exists(in.nodeKubeconfig) {
+		if in.nodeKubeconfig == "" {
+			return kubectlConfig{}, errors.New("no node credential path for this Mac")
+		}
+		switch err := in.statPath(in.nodeKubeconfig); {
+		case err == nil:
+			return kubectlConfig{kubeconfig: in.nodeKubeconfig}, nil
+		case errors.Is(err, fs.ErrPermission):
+			return kubectlConfig{}, fmt.Errorf("node credential %s is not readable by this account (re-run with sudo)", in.nodeKubeconfig)
+		default:
 			return kubectlConfig{}, fmt.Errorf("no node credential at %s", in.nodeKubeconfig)
 		}
-		return kubectlConfig{kubeconfig: in.nodeKubeconfig}, nil
 	}
 	return resolveKubectlConfig(kubectlInputs{
 		workDirOverride: in.workDirOverride,
