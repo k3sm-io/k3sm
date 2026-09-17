@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -85,6 +86,7 @@ func runInstall(args []string) error {
 		ServiceCIDR:       opts.serviceCIDR,
 		DataVolume:        volume,
 		RemoveOldDataRoot: opts.removeOldDataRoot,
+		MeshIP:            opts.meshIP,
 		Logger:            logger,
 	})
 }
@@ -102,6 +104,7 @@ type installFlags struct {
 	dataVolumeSize    string
 	dataVolumeEncrypt bool
 	removeOldDataRoot bool
+	meshIP            string
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -117,10 +120,42 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.StringVar(&o.dataVolumeSize, "data-volume-size", defaultDataVolumeSize, "the data volume's quota (m, g or t suffix). APFS fixes it at creation: changing it later means delete, reinstall and restore")
 	fs.BoolVar(&o.dataVolumeEncrypt, "data-volume-encrypt", false, "encrypt the data volume with a random passphrase kept in the System keychain (a volume k3sm creates only)")
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
+	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
+	if o.meshIP != "" {
+		if err := validateMeshIP(o.meshIP); err != nil {
+			return installFlags{}, err
+		}
+	}
 	return o, nil
+}
+
+// validateMeshIP refuses a --mesh-ip this install can never serve from: an
+// address that fails to parse at all, and the three IP shapes that are always
+// wrong for a server's own bind address — unspecified (0.0.0.0/::), loopback,
+// and multicast. It runs at flag-parse time, before root/privilege checks, so a
+// typo is reported immediately rather than after `sudo` and the rest of a
+// (possibly slow) install has already run.
+func validateMeshIP(raw string) error {
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return fmt.Errorf("--mesh-ip %q is not an IP address: %w", raw, err)
+	}
+	switch {
+	case !addr.Is4():
+		return fmt.Errorf("--mesh-ip %q is not an IPv4 address; the mesh is IPv4 only (100.64.0.0/10 by default)", raw)
+	case addr.IsLinkLocalUnicast():
+		return fmt.Errorf("--mesh-ip %q is a link-local address; give this Mac's own wireguard mesh address, not an interface's self-assigned one", raw)
+	case addr.IsUnspecified():
+		return fmt.Errorf("--mesh-ip %q is the unspecified address and cannot be bound; give this Mac's own wireguard mesh address", raw)
+	case addr.IsLoopback():
+		return fmt.Errorf("--mesh-ip %q is a loopback address; give the mesh address other nodes reach this Mac at", raw)
+	case addr.IsMulticast():
+		return fmt.Errorf("--mesh-ip %q is a multicast address and cannot be bound", raw)
+	}
+	return nil
 }
 
 // The data-volume flag defaults.

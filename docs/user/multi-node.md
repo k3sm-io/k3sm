@@ -12,6 +12,26 @@ One Mac runs the control plane (`k3sm server`); additional Macs join as **agents
 Kubelet node. Nodes are connected by a **wireguard mesh** (the `MeshPeer` model), so Pods and Services
 can be reached across machines.
 
+## Serving the control plane from this Mac
+
+The Mac that runs `k3sm server` needs to know its own wireguard mesh address before other nodes
+can join it. Set it with `--mesh-ip` at install time:
+
+```sh
+sudo k3sm install --mesh-ip <this-macs-mesh-address>
+
+The mesh address is IPv4 (the default mesh range is 100.64.0.0/10); a link-local or IPv6 address is refused at install time.
+```
+
+This writes the address into the server daemon's arguments and restarts it. A plain `sudo k3sm
+install` re-run already boots the daemons out and back in, so it always picks up the address you
+gave it; there is no need to edit the installed launchd plist by hand, and doing so would not
+survive the next install anyway (`launchctl kickstart` alone never re-reads a plist, only a
+bootout and bootstrap does, which is what install performs).
+
+Running `sudo k3sm install --mesh-ip <new-address>` again later replaces the stored address with
+the new one. Leaving `--mesh-ip` off a later reinstall keeps whatever address was set before.
+
 ## Joining an Agent
 
 On the server, mint a join token:
