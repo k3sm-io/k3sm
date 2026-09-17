@@ -236,6 +236,22 @@ type nodeOptions struct {
 	// paths keep their exact current shape. It is never called on the hostprocess
 	// runtime, which has no runtimed to ask.
 	attachRuntimeInfo func(operator.RuntimeInfoSource)
+
+	// onExitBegin, when non-nil, is called ONCE at the very start of this node's
+	// teardown — before the embedded runtime close, on both of startNode's exit
+	// paths and on the early returns the deferred close covers.
+	//
+	// It is the seam a caller with teardown work of its OWN uses to run that work
+	// CONCURRENTLY with the node's, instead of queueing it behind the close inside
+	// launchd's single ExitTimeOut. It must START work and return, never block: the
+	// caller waits for its own work itself, after startNode returns (see
+	// controlPlaneStopper, and exitoverlap.go for why the two stages may overlap).
+	//
+	// `k3sm server` is the only bring-up that sets one — its control-plane stop is
+	// the other long stage of a stopping daemon. `k3sm agent`, `k3sm dev` and the
+	// standalone `k3sm node` leave it nil, which is exactly the behaviour they had
+	// before the hook existed.
+	onExitBegin func()
 }
 
 // serverKubeletListen is the kubelet HTTP API listen address the in-process node
@@ -847,6 +863,14 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// (which is what runs it on the two normal exit paths) cannot double-stop; the
 	// defer is what covers the paths that return before the node is ever ready.
 	stopRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	// ADDITIVE, and it moves nothing: the close above is the same closure, deferred
+	// in the same place, run by awaitNodeExit on the same two paths. The wrapper
+	// only prefixes it with opts.onExitBegin, so a caller with its own teardown
+	// (`k3sm server`, whose control-plane stop is the other long stage of a stopping
+	// daemon) gets that stage STARTED before the vm helpers come down and overlaps
+	// the two instead of paying their sum inside one ExitTimeOut. nil on every other
+	// bring-up, where this returns stopRuntime unchanged. See exitoverlap.go.
+	stopRuntime = teardownWithConcurrentExit(opts.onExitBegin, stopRuntime)
 	defer stopRuntime()
 
 	// The kubelet HTTP API's TLS + auth posture. Both halves are built together and

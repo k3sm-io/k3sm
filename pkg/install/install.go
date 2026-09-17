@@ -2357,36 +2357,47 @@ func ServerPlist(cfg Config) []byte {
 //
 // launchd SIGTERMs the job at `bootout`/`kickstart -k` and SIGKILLs it
 // ExitTimeOut seconds later (its default is 20). Everything a k3sm daemon does on
-// its way out runs SERIALLY inside that ONE number, and each stage's bound is
-// owned by a different package — so a hand-picked literal here is wrong the first
-// time any of them moves, and the failure is silent and bad: a SIGKILL mid-stop
-// orphans exactly the children the stop exists to reap (kine and the apiserver on
-// the server path, a vm host helper on either).
+// its way out happens inside that ONE number, and each stage's bound is owned by a
+// different package — so a hand-picked literal here is wrong the first time any of
+// them moves, and the failure is silent and bad: a SIGKILL mid-stop orphans
+// exactly the children the stop exists to reap (kine and the apiserver on the
+// server path, a vm host helper on either).
 //
 // The stages, each with the symbol that owns its bound:
 //
 //	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
 //	                        runtimed pkg/runtime/close.go — the embedded runtime's
 //	                        concurrent vm-helper stop, deferred by startNode.
+//	control-plane stop 35s  executor.StopBound (30s) — four components drained
+//	                        serially at drainGrace each, plus the post-SIGKILL reap
+//	                        — plus the 5s outer margin runServer's WAIT for it adds
+//	                        (cmd/k3sm's controlPlaneStopWaitMargin). SERVER ONLY: a
+//	                        worker runs no control plane.
+//	                        It runs CONCURRENTLY with the runtimed close above (the
+//	                        node fires the server's stop from the very start of its
+//	                        own teardown — cmd/k3sm/exitoverlap.go), so the two
+//	                        together cost the LARGER of them, never their sum.
 //	control socket      5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
-//	control-plane stop 30s  executor.StopBound — SERVER ONLY (a worker runs none):
-//	                        four components drained serially at drainGrace each,
-//	                        plus the post-SIGKILL reap.
 //	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go — both roles.
 //	headroom           10s  launchd's own signal/reap latency and the log flush.
 //
 // Every bound is a LITERAL here so the table above can be read in one place, and
 // each literal is bound back to its owner by a test rather than by trust:
-// TestExitTimeOutCoversTheSerialTeardown compares the control-plane stage with
+// TestExitTimeOutCoversTheDaemonTeardown compares the control-plane stage with
 // executor.StopBound (the one owner this package can import), and
 // hack/acceptance/B253.sh's CI tier reads runtimed's two constants out of its
-// module and compares them with the close stage. The remaining stage
-// (runtimedSocketShutdownGrace, package main in cmd/k3sm) has no importable owner
-// and no gate — it is 5s of a 90s budget, and the headroom absorbs it.
+// module and compares them with the close stage. The two stages whose owners live
+// in package main (runtimedSocketShutdownGrace and controlPlaneStopWaitMargin)
+// have no importable owner and no gate — 10s of a 60s budget between them, and the
+// headroom absorbs a drift in either.
 //
 // The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
-// read by operators in a plist and 90 is legible where 87 invites the question of
+// read by operators in a plist and 60 is legible where 57 invites the question of
 // what the 7 was for. Rounding up can only add headroom.
+//
+// Both roles land on the same 60s today, and that is a RESULT, not a coincidence
+// to lean on: the server's extra stage is now overlapped with a longer one, so it
+// adds nothing until the control-plane stop outgrows the runtimed close.
 const (
 	teardownRuntimedClose = 37
 	teardownControlSocket = 5
@@ -2394,7 +2405,22 @@ const (
 	teardownMesh          = 5
 	teardownHeadroom      = 10
 
-	serverTeardownBudget = teardownRuntimedClose + teardownControlSocket + teardownControlPlane + teardownMesh + teardownHeadroom
+	// teardownStopWaitMargin is the slack runServer's WAIT for the control-plane
+	// stop adds on top of that stop's own budget — cmd/k3sm's
+	// controlPlaneStopWaitMargin, which lives in package main and so, like
+	// runtimedSocketShutdownGrace, cannot be imported and asserted here.
+	teardownStopWaitMargin = 5
+
+	// serverConcurrentTeardown is the cost of the server's two LONGEST stages,
+	// which overlap rather than queue: the node starts the control-plane stop at
+	// the very beginning of its own teardown and closes its embedded runtime while
+	// that stop drains (cmd/k3sm/exitoverlap.go). They contend for nothing — vm
+	// host helpers on one side, control-plane children on the other — so the budget
+	// is the larger of the two, and the day either one grows past the other this
+	// arithmetic follows it without being re-chosen.
+	serverConcurrentTeardown = max(teardownRuntimedClose, teardownControlPlane+teardownStopWaitMargin)
+
+	serverTeardownBudget = serverConcurrentTeardown + teardownControlSocket + teardownMesh + teardownHeadroom
 	agentTeardownBudget  = teardownRuntimedClose + teardownControlSocket + teardownMesh + teardownHeadroom
 
 	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every stage
