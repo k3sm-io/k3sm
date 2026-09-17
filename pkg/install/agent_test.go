@@ -121,7 +121,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 			"<key>RunAtLoad</key>\n  <true/>",
 			"<key>KeepAlive</key>\n  <true/>",
 			"<key>ThrottleInterval</key>\n  <integer>10</integer>",
-			"<key>ExitTimeOut</key>\n  <integer>45</integer>",
+			"<key>ExitTimeOut</key>\n  <integer>60</integer>",
 			"<key>StandardOutPath</key>\n  <string>/var/log/k3sm/agent.log</string>",
 			// The same fd-table raise the control plane gets: a worker hosts the
 			// Service proxy and the UDP relay, whose flow budget sizes against

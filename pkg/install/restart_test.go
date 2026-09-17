@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // transientBootstrapErr is what the darwin System returns when launchd rejects a
@@ -194,7 +195,7 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		f := &fakeSystem{}
 		f.putLoaded(NetdLabel) // the server never came up
 		cfg := installCfg().withDefaults()
-		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), time.Now())
 		if err == nil {
 			t.Fatal("verifyDaemons must fail when a daemon is down")
 		}
@@ -243,19 +244,23 @@ func TestInstallVerifiesDaemonsAfterRestart(t *testing.T) {
 //
 // The budget is not a tuning knob: it is how long the install waits for a label
 // to leave launchd's system domain before it refuses to bootstrap into a
-// draining job. A daemon whose plist sets ExitTimeOut 45 can legitimately take
+// draining job. A daemon whose plist raises ExitTimeOut can legitimately take
 // longer than netd's 30s to go, so giving it the short budget would fail the
 // install on precisely the slow-but-healthy shutdown the wait exists to
-// tolerate. Both NODE daemons set that ExitTimeOut, so both are in the long
-// class; netd, which has no orderly teardown at all, is not.
+// tolerate. Both NODE daemons raise it, so both are in the long class; netd,
+// which has no orderly teardown at all, is not.
+//
+// The last assertion is the one that keeps this honest as the daemons' teardown
+// grows: the budget must stay ABOVE the SIGTERM-to-SIGKILL grace it is waiting
+// out, or the wait times out on a daemon that was going to stop cleanly.
 func TestRestartBudgetByLabel(t *testing.T) {
 	for _, tc := range []struct {
 		label string
 		want  restartBudget
 		why   string
 	}{
-		{ServerLabel, serverRestartBudget, "the control plane tears its components down serially inside ExitTimeOut 45"},
-		{AgentLabel, serverRestartBudget, "the agent closes the mesh device and drains the Service proxy inside the same ExitTimeOut 45"},
+		{ServerLabel, serverRestartBudget, "the control plane tears its components down serially inside the plist's ExitTimeOut"},
+		{AgentLabel, serverRestartBudget, "the agent stops its vm guests, closes the mesh device and drains the Service proxy inside its own ExitTimeOut"},
 		{NetdLabel, netdRestartBudget, "netd is a single process with nothing to reap"},
 		{DatavolLabel, netdRestartBudget, "a daemon added later inherits the conservative default"},
 	} {
@@ -266,5 +271,11 @@ func TestRestartBudgetByLabel(t *testing.T) {
 	if serverRestartBudget.unload <= netdRestartBudget.unload {
 		t.Fatalf("the long budget (%v) is not longer than the short one (%v); the distinction this test pins would be vacuous",
 			serverRestartBudget.unload, netdRestartBudget.unload)
+	}
+	for _, grace := range []int{serverExitTimeOut, agentExitTimeOut} {
+		if serverRestartBudget.unload <= time.Duration(grace)*time.Second {
+			t.Errorf("the node unload budget (%v) is at or below a node plist's ExitTimeOut (%ds); the install would give up on a daemon still stopping cleanly",
+				serverRestartBudget.unload, grace)
+		}
 	}
 }

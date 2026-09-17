@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/mesh"
@@ -124,7 +125,36 @@ type meshBringUp struct {
 	// mode.
 	keyRef string
 	// peers is the initial peer snapshot programmed before the watch takes over.
+	// On the RESUME path (see resume) it is a stored seed of unknown age and is
+	// deliberately NOT programmed whole.
 	peers []netv1.MeshPeerSpec
+	// resume marks a bring-up whose peers came from the stored node credential
+	// rather than from a join that just happened, which changes what may be
+	// programmed before the MeshPeer watch exists. See bringUpMesh.
+	resume bool
+	// listPeers is a one-shot LIST of the cluster's MeshPeers, used only on the
+	// resume path to replace the stored seed with live state before the watcher
+	// starts. Production is meshPeerLister over this node's kubeconfig; nil (or a
+	// failing lister) degrades to the seed after firstSyncTimeout.
+	listPeers func(ctx context.Context) ([]netv1.MeshPeerSpec, error)
+	// firstSyncTimeout bounds the wait for that live list. Zero means
+	// meshFirstSyncTimeout; tests inject a small value.
+	firstSyncTimeout time.Duration
+	// onLivePeers persists the live list the resume path just programmed, so the
+	// stored seed advances instead of staying pinned to the original join.
+	//
+	// It is a HOOK rather than a store reference because this struct is the
+	// device's input and knows nothing about credential files — and because only
+	// one of the three bring-up paths has anything to persist: the server
+	// synthesizes its peers locally and holds no node credential, and a token
+	// join has already written the live snapshot the join returned. Nil on both,
+	// which is also what every device-level unit test wants.
+	//
+	// It is called at most ONCE per bring-up, on the live list, and its error is
+	// logged rather than returned: the device is already programmed correctly by
+	// the time it runs, so a failure costs only a staler fallback on the NEXT
+	// start, which is exactly the state this hook exists to improve on.
+	onLivePeers func(peers []netv1.MeshPeerSpec) error
 	// listenPort is the UDP port this node's wireguard binds.
 	listenPort int
 	// kubeconfig authenticates the MeshPeer watch that keeps the peer set

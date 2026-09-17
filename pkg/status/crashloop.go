@@ -86,23 +86,46 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 	}
 	last, _ := rec.Last()
 	if rec.Tripped() {
+		n := rec.Recent(*rec.TrippedAt)
+		detail := fmt.Sprintf("crash-loop breaker tripped at %s: %s crashed %d times within %s; the daemon is parked and serves nothing",
+			rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow)
+		if neverCameUp(last) {
+			detail = fmt.Sprintf("crash-loop breaker tripped at %s: the control plane never came up (last: %s), %d failures within %s; the daemon is parked and serves nothing",
+				rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow)
+		}
 		return CrashLoopVerdict{
 			Posture: PostureParked,
-			Detail: fmt.Sprintf("crash-loop breaker tripped at %s: %s crashed %d times within %s; the daemon is parked and serves nothing",
-				rec.TrippedAt.Format(time.RFC3339), last.Component, rec.Recent(*rec.TrippedAt), executor.CrashLoopWindow),
-			Remedy: "sudo k3sm server --clear-crashloop   # after fixing the fault named in " + path + "; the parked daemon restarts itself",
+			Detail:  detail,
+			Remedy:  "sudo k3sm server --clear-crashloop   # after fixing the fault named in " + path + "; the parked daemon restarts itself",
 		}
 	}
 	if n := rec.Recent(now); n >= restartingFloor {
+		detail := fmt.Sprintf("restarted %d times in the last %s (last crash: %s at %s); trips at %d",
+			n, executor.CrashLoopWindow, last.Component, last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
+		if neverCameUp(last) {
+			detail = fmt.Sprintf("the control plane never came up (last: %s), %d failures in the last %s (latest at %s); trips at %d",
+				last.Component, n, executor.CrashLoopWindow, last.At.Format(time.RFC3339), executor.CrashLoopThreshold)
+		}
 		return CrashLoopVerdict{
 			Posture: PostureRestarting,
-			Detail: fmt.Sprintf("restarted %d times in the last %s (last crash: %s at %s); trips at %d",
-				n, executor.CrashLoopWindow, last.Component, last.At.Format(time.RFC3339), executor.CrashLoopThreshold),
-			Remedy: "sudo tail -n 50 " + path + "   # the crashes, with redacted log tails",
+			Detail:  detail,
+			Remedy:  "sudo tail -n 50 " + path + "   # the failures, with redacted log tails",
 		}
 	}
 	return CrashLoopVerdict{Posture: PostureQuiet}
 }
+
+// neverCameUp reports whether the record's last entry was a BRING-UP failure
+// rather than a crash. The breaker counts two different failures now, and they
+// send an operator to different places: a crash has a component log with a fatal
+// line at the end of it, while a control plane that never came up often has no
+// component log at all, and the reason is in the daemon's own log instead. A row
+// that called the second one a crash would cost the operator that first step.
+//
+// An entry with no origin reads as a crash: records written before the daemon
+// counted bring-up failures hold only crashes, and the row must not invent a
+// distinction the file does not carry.
+func neverCameUp(last executor.Crash) bool { return last.Origin == executor.CrashOriginBringUp }
 
 // applyCrashLoop folds the verdict into the server row. A parked daemon is a
 // FAIL whatever launchd says (it is running, and serving nothing); restarting

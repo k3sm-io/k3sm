@@ -212,10 +212,20 @@ else
 	# path, so a string match on $DATA_ROOT silently fails on every Mac).
 	mounted() { [ "$(stat -f %d "$DATA_ROOT" 2>/dev/null)" != "$(stat -f %d "$(dirname "$DATA_ROOT")" 2>/dev/null)" ]; }
 	loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
+	# Every wait below is sized off the SERVER PLIST'S OWN ExitTimeOut (launchd's
+	# SIGTERM -> SIGKILL grace, which pkg/install derives from the daemon's serial
+	# teardown stages) plus 10s of margin, read from the INSTALLED plist rather than
+	# from a constant here. A fixed wait shorter than that grace fails a daemon that
+	# was stopping correctly, which is the one verdict these rungs must never give.
+	EXIT_TIMEOUT="$(plutil -extract ExitTimeOut raw -o - "$SERVER_PLIST" 2>/dev/null || true)"
+	case "$EXIT_TIMEOUT" in
+		''|*[!0-9]*) EXIT_TIMEOUT=90 ;;  # this tree's derived serverExitTimeOut
+	esac
+	TEARDOWN_DEADLINE=$((EXIT_TIMEOUT + 10))
 	# bootout returns before launchd finishes tearing the job down; a bootstrap
 	# issued inside that window fails with errno 37/5 (the documented race). So:
 	# wait for the label to leave the domain, then bootstrap with a bounded retry.
-	await_unloaded() { for _ in $(seq 1 15); do loaded "$1" || return 0; sleep 2; done; return 1; }
+	await_unloaded() { for _ in $(seq 1 $((TEARDOWN_DEADLINE / 2))); do loaded "$1" || return 0; sleep 2; done; return 1; }
 	bootstrap_job() {
 		local label="$1" plist="$2"
 		for _ in $(seq 1 10); do
@@ -243,15 +253,36 @@ else
 		await_unloaded io.k3sm.server || true
 		await_unloaded io.k3sm.netd || true
 		# A k3sm-vmhost that outlives the booted-out server keeps the volume busy
-		# (observed 2026-09-06: "dissented by PID <n> (/Library/k3sm/k3sm-vmhost)").
-		# That is a product observation the gate records rather than hides; the
-		# reproduction still needs the volume, so the orphan is terminated here.
-		orphans="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
+		# (observed 2026-09-06: "dissented by PID <n> (/Library/k3sm/k3sm-vmhost)")
+		# — its cwd IS the data root, which is the server plist's WorkingDirectory.
+		#
+		# It is a RUNG, not a note. The node now stops its embedded runtime on the
+		# way out (B253, and hack/acceptance/B253.sh is that fix's own gate), so an
+		# orphan here is the bug having returned, and a gate that cannot go red on
+		# it protects nothing. The kill stays: the reproduction below still needs
+		# the volume, and leaving the rig unable to unmount would be a worse
+		# outcome than a red rung.
+		#
+		# The poll runs for the whole TEARDOWN_DEADLINE, not a fixed few seconds:
+		# the helpers' own stop is bounded by runtimed's 35s vm sweep, which is one
+		# stage of that same ExitTimeOut, so anything shorter would red-flag a
+		# correct-but-slow teardown — a false alarm on the rung that exists to
+		# catch a real one.
+		orphans=""
+		waited=0
+		while :; do
+			orphans="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
+			[ -n "$orphans" ] || break
+			[ "$waited" -lt "$TEARDOWN_DEADLINE" ] || break
+			sleep 2; waited=$((waited + 2))
+		done
 		if [ -n "$orphans" ]; then
-			echo "NOTE  s.D0  k3sm-vmhost outlived io.k3sm.server (pids: $orphans) — terminated so the volume can unmount; see the run log for the follow-up"
+			ladder no "s.D0  [destructive] k3sm-vmhost outlived io.k3sm.server by ${TEARDOWN_DEADLINE}s (pids: $orphans) — terminated so the volume can unmount; see hack/acceptance/B253.sh"
 			for pid in $orphans; do sudo kill "$pid" 2>/dev/null || true; done
 			sleep 3
 			for pid in $orphans; do sudo kill -9 "$pid" 2>/dev/null || true; done
+		else
+			ladder ok "s.D0  [destructive] no k3sm-vmhost outlived the booted-out server (waited ${waited}s of ${TEARDOWN_DEADLINE}s)"
 		fi
 		# The volume is busy until the daemons' files close; bounded retry, then a
 		# loud FAIL that names the cause -- and NOTHING below runs against a

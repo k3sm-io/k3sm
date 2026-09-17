@@ -176,6 +176,9 @@ type runtimedRuntime struct {
 	// clk, dial, and probeTransport are the provider-served probe seams:
 	// the clock that schedules probe loops and the http/tcp I/O the checks use.
 	// Production defaults are wired in newRuntimedWith; tests inject fakes.
+	// EVERY probe dial converges on dial: a prober's http transport is built per
+	// pod over it (probeSeamsFor), so probeTransport itself now serves only the
+	// httpGet lifecycle hooks.
 	clk            clock.Clock
 	dial           dialFunc
 	probeTransport http.RoundTripper
@@ -1900,6 +1903,13 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// built, because the live address must never reach status.podIP, the
 	// EndpointSlice or DNS (see observeTransport).
 	r.observeTransport(string(pod.UID), rs)
+	// AFTER the observation above, never before: the gate is a read of the very
+	// lease map that call just updated, so PodReady reflects THIS status rather
+	// than trailing it by one. A vm pod whose override is not installed is
+	// undialable at the address its EndpointSlice carries, so its POD-LEVEL
+	// PodReady is withheld (its ContainersReady and container Ready flags are
+	// untouched — see transportGate).
+	transport := r.transportGateFor(pod)
 	t.readyMu.Lock()
 	prior := t.lastReady
 	t.readyMu.Unlock()
@@ -1909,7 +1919,7 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 		// so toPodStatus's carry-forward excludes it — no duplication.
 		pod.Status.Conditions = append(pod.Status.Conditions, prior)
 	}
-	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps)
+	st := toPodStatus(pod, rs, r.nodeIP, t.startTime, ps, transport)
 	// terminationMessagePolicy: FallbackToLogsOnError, from the terminated
 	// instance's own log file. First, so every overlay below sees the final
 	// message the way a kubelet's status assembly does.
@@ -1921,7 +1931,7 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// LAST, so its readiness re-derivation sees every other overlay's verdict: a
 	// container whose postStart has not completed is NotReady, and the pod's
 	// ContainersReady/PodReady follow.
-	r.applyPostStartOverlay(pod, t, st)
+	r.applyPostStartOverlay(pod, t, st, transport)
 	if c := findPodCondition(st.Conditions, corev1.PodReady); c != nil {
 		t.readyMu.Lock()
 		t.lastReady = *c

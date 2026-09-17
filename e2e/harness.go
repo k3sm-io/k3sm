@@ -32,14 +32,21 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 // Cluster is a handle to the running acceptance cluster.
 type Cluster struct {
 	Client kubernetes.Interface
+	// Config is the rest.Config Client was built from. It is kept so a suite can
+	// build the OTHER typed clients it needs against the same kubeconfig —
+	// apiextensions (CRDs) and dynamic (custom resources) — without re-reading and
+	// re-parsing $KUBECONFIG and risking a second, subtly different config.
+	Config *rest.Config
 }
 
 // Up connects to the cluster the acceptance script brought up (via $KUBECONFIG). Pre-M1
@@ -59,7 +66,7 @@ func Up(t *testing.T) *Cluster {
 	if err != nil {
 		t.Fatalf("build client: %v", err)
 	}
-	return &Cluster{Client: cs}
+	return &Cluster{Client: cs, Config: cfg}
 }
 
 // Healthz returns the apiserver /healthz body (e.g. "ok"), proving the control
@@ -140,5 +147,74 @@ func (c *Cluster) WaitPodPhase(t *testing.T, ns, name string, want corev1.PodPha
 				ns, name, want, pod.Status.Phase, podFailureDetail(pod))
 		}
 		time.Sleep(time.Second)
+	}
+}
+
+// WaitPodReady polls until the pod's Ready condition is True (a serving pod's
+// readiness, as opposed to WaitPodPhase's one-shot terminal verdict), failing FAST
+// if the pod settles into a terminal phase — a Succeeded or Failed pod will never
+// become Ready, so burning the whole timeout only cascades into the binary-wide
+// test timeout. Failures carry podFailureDetail.
+//
+// A pod with no readiness probe is Ready as soon as its containers run, which on
+// the `vm` path is BEFORE the process inside the guest has bound its port. Callers
+// that need the server itself must follow this with their own reachability poll.
+func (c *Cluster) WaitPodReady(t *testing.T, ns, name string, timeout time.Duration) *corev1.Pod {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		pod, err := c.Client.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
+		if err == nil {
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					return pod
+				}
+			}
+			if terminalPhase(pod.Status.Phase) {
+				t.Fatalf("pod %s/%s: want Ready, reached terminal %s — %s",
+					ns, name, pod.Status.Phase, podFailureDetail(pod))
+			}
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("pod %s/%s: want Ready, last get failed: %v", ns, name, err)
+			}
+			t.Fatalf("pod %s/%s: not Ready within %s — %s", ns, name, timeout, podFailureDetail(pod))
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// WaitServiceReadyEndpoints polls until at least one address is marked Ready across
+// the Service's EndpointSlices — the set darwin-net's userspace proxy will
+// load-balance to — and returns those addresses. An empty set means the proxy has
+// no backend and every dial of the ClusterIP would be refused, so waiting here
+// separates "the Service has no endpoint yet" from "the backend does not answer".
+func (c *Cluster) WaitServiceReadyEndpoints(t *testing.T, ns, svc string, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		slices, err := c.Client.DiscoveryV1().EndpointSlices(ns).List(context.Background(), metav1.ListOptions{
+			LabelSelector: discoveryv1.LabelServiceName + "=" + svc,
+		})
+		lastErr = err
+		if err == nil {
+			var addrs []string
+			for i := range slices.Items {
+				for _, ep := range slices.Items[i].Endpoints {
+					if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+						addrs = append(addrs, ep.Addresses...)
+					}
+				}
+			}
+			if len(addrs) > 0 {
+				return addrs
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("service %s/%s has no Ready endpoint within %s (last list error: %v)", ns, svc, timeout, lastErr)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }

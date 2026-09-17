@@ -728,6 +728,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"ServicePID:io.k3sm.netd",
 		"ServicePID:io.k3sm.server",
 		"PathExists:/var/lib/k3sm/run/netd.sock",
+		// ...and the server's crash-loop record read, because a daemon parked by
+		// its breaker reports a healthy pid while serving nothing.
+		"ReadFile:/var/lib/k3sm/server/crashloop.json",
 		"WriteUserKubeconfig:alice",
 	}
 	if len(f.calls) != len(want) {
@@ -975,9 +978,13 @@ func TestServerPlistXML(t *testing.T) {
 	mustContain(t, x, "<string>runtimed</string>")
 	mustContain(t, x, "<key>RunAtLoad</key>\n  <true/>")
 	mustContain(t, x, "<key>KeepAlive</key>\n  <true/>")
-	// ExitTimeOut > launchd's 20s default so Stop()'s serial control-plane
-	// teardown finishes before SIGKILL (else the stragglers orphan).
-	mustContain(t, x, "<key>ExitTimeOut</key>\n  <integer>45</integer>")
+	// ExitTimeOut > launchd's 20s default so the daemon's SERIAL teardown — the
+	// embedded runtime's vm stop, the control socket, Stop()'s control-plane
+	// drain, the mesh teardown — finishes before SIGKILL (else the stragglers
+	// orphan). The number is derived; TestExitTimeOutCoversTheSerialTeardown owns
+	// the arithmetic, and this golden is what pins the derivation to the rendered
+	// plist.
+	mustContain(t, x, "<key>ExitTimeOut</key>\n  <integer>90</integer>")
 	if strings.Contains(string(NetdPlist(Config{})), "ExitTimeOut") {
 		t.Error("netd plist should NOT set ExitTimeOut (it has no child processes to reap)")
 	}

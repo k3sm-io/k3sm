@@ -32,6 +32,18 @@ func TestClassifyCrashLoop(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	path := "/var/lib/k3sm/server/crashloop.json"
 	crash := func(ago time.Duration, comp string) executor.Crash {
+		return executor.Crash{At: now.Add(-ago), Component: comp, Origin: executor.CrashOriginCrash,
+			Detail: "token=REDACTED secret material"}
+	}
+	// A component that never came up at all: the origin cmd/k3sm records from
+	// executor.Start's error, which the row must not describe as a crash.
+	bringUp := func(ago time.Duration, comp string) executor.Crash {
+		return executor.Crash{At: now.Add(-ago), Component: comp, Origin: executor.CrashOriginBringUp,
+			Detail: "token=REDACTED secret material"}
+	}
+	// A record written before the daemon counted bring-up failures: no origin
+	// key at all, and it must keep reading as a crash.
+	legacy := func(ago time.Duration, comp string) executor.Crash {
 		return executor.Crash{At: now.Add(-ago), Component: comp, Detail: "token=REDACTED secret material"}
 	}
 	tripped := now.Add(-time.Minute)
@@ -56,6 +68,17 @@ func TestClassifyCrashLoop(t *testing.T) {
 		{"tripped is parked whatever the clock says now",
 			executor.CrashRecord{Crashes: []executor.Crash{crash(time.Minute, "kube-apiserver")}, TrippedAt: &tripped}, nil,
 			PostureParked, []string{"tripped", "kube-apiserver", "parked", "--clear-crashloop", path}, nil},
+		{"two bring-up failures say the control plane never came up",
+			executor.CrashRecord{Crashes: []executor.Crash{bringUp(3*time.Minute, "kine"), bringUp(time.Minute, "provision/certs")}}, nil,
+			PostureRestarting, []string{"never came up (last: provision/certs)", "2 failures", "trips at"},
+			[]string{"crashed", "restarted"}},
+		{"a tripped bring-up record says never came up, not crashed",
+			executor.CrashRecord{Crashes: []executor.Crash{bringUp(time.Minute, "kube-apiserver")}, TrippedAt: &tripped}, nil,
+			PostureParked, []string{"never came up (last: kube-apiserver)", "parked", "--clear-crashloop", path},
+			[]string{"crashed"}},
+		{"a pre-origin record still reads as a crash",
+			executor.CrashRecord{Crashes: []executor.Crash{legacy(3*time.Minute, "kine"), legacy(time.Minute, "kine")}}, nil,
+			PostureRestarting, []string{"restarted 2 times", "last crash: kine"}, []string{"never came up"}},
 		{"permission denied is unreadable, named as the user's posture",
 			executor.CrashRecord{}, os.ErrPermission, PostureUnreadable, []string{"not readable by this user"}, nil},
 		{"any other read error is unreadable with the error",

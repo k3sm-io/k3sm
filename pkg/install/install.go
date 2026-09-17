@@ -310,34 +310,33 @@ func RunDir(dataRoot string) string {
 }
 
 // Role is which k3sm node this install lays down: the control plane, or a
-// worker that joins one. It is a closed pair because a Mac is one or the other:
-// the server IS a node (it runs its own Virtual Kubelet), so a machine carrying
-// both daemons would register twice and fight itself over the same data root,
-// the same run dir and the same netd helper.
+// worker that joins one.
 //
-// The empty Role is RoleServer, so every existing caller — and every Config a
-// test writes without thinking about roles — keeps describing the install k3sm
-// has always performed.
-type Role string
+// The type, its two values and the on-disk decision live in pkg/dataroot — the
+// leaf package that already owns the facts a Mac carries on disk — so a
+// reporting caller can reach the same verdict without importing the installer.
+// They are re-exported here because this package is where roles are ACTED on,
+// and every existing caller says install.RoleServer.
+type Role = dataroot.Role
 
 const (
 	// RoleServer lays down the control plane (io.k3sm.server). The default.
-	RoleServer Role = "server"
+	RoleServer = dataroot.RoleServer
 	// RoleAgent lays down a joining worker (io.k3sm.agent) instead.
-	RoleAgent Role = "agent"
+	RoleAgent = dataroot.RoleAgent
 )
 
-// other returns the role this one is not — the one whose daemon must not be on
-// disk when this one is installed.
-func (r Role) other() Role {
-	if r == RoleAgent {
-		return RoleServer
-	}
-	return RoleAgent
+// RoleFromPlists decides which role a Mac carries from the two node-daemon
+// plists on disk. See dataroot.RoleFromPlists for the decision and why the disk
+// — never a running pid — is what answers it.
+func RoleFromPlists(serverPresent, agentPresent bool) (Role, bool) {
+	return dataroot.RoleFromPlists(serverPresent, agentPresent)
 }
 
-// daemonLabel is the LaunchDaemon label a role's node daemon carries.
-func (r Role) daemonLabel() string {
+// daemonLabel is the LaunchDaemon label a role's node daemon carries. It is a
+// function rather than a method because Role is an alias for a type this
+// package does not define, and the LABELS are this package's own.
+func daemonLabel(r Role) string {
 	if r == RoleAgent {
 		return AgentLabel
 	}
@@ -1129,7 +1128,7 @@ func artifactManifest(cfg Config) []artifact {
 	// depend on the helper netd bootstraps first.
 	items = append(items, []artifact{
 		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
-		{kind: kindDaemon, disp: dispRemove, label: cfg.Role.daemonLabel(), path: cfg.plistPath(cfg.Role.daemonLabel()), assertExists: true},
+		{kind: kindDaemon, disp: dispRemove, label: daemonLabel(cfg.Role), path: cfg.plistPath(daemonLabel(cfg.Role)), assertExists: true},
 
 		// The admin kubeconfig in the human's home — preserved (it may hold other
 		// clusters; k3sm never owns the whole file).
@@ -1197,6 +1196,10 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 // the admin kubeconfig to the human's home. The caller has already verified root.
 func Install(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
+	// Taken before anything is written, and carried to the post-restart
+	// verification: it is what separates a failure THIS install caused from one
+	// the machine was already living with (see verifyServerNotParked).
+	startedAt := time.Now()
 	if cfg.BinarySource == "" {
 		return fmt.Errorf("install: BinarySource (the k3sm binary to install) is required")
 	}
@@ -1486,7 +1489,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     reports success having left a daemon down is worse than one that fails:
 	//     the operator walks away, and the breakage surfaces later as something
 	//     else entirely (a cluster whose DNS stopped answering).
-	if err := verifyDaemons(ctx, sys, cfg, m); err != nil {
+	if err := verifyDaemons(ctx, sys, cfg, m, startedAt); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 
@@ -1850,12 +1853,11 @@ func ServerPlist(cfg Config) []byte {
 		StdoutPath:       ServerLogPath(),
 		StderrPath:       ServerLogPath(),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
-		// Give Stop() room to reap the serial control-plane teardown before launchd
-		// SIGKILLs the job (default 20s ≈ the worst-case 4×drainGrace, which orphans
-		// the not-yet-reaped children). 45s clears it with margin. The server's mesh
-		// teardown runs after that, serially, for at most its own 5s bound
-		// (meshTeardownTimeout), which the 45s still covers.
-		ExitTimeOut: 45,
+		// Derived from the stages the server actually runs on its way out — see
+		// serverExitTimeOut. Never a hand-picked number: every stage's bound lives
+		// in its own package, and a literal here would be wrong the first time one
+		// of them moved.
+		ExitTimeOut: serverExitTimeOut,
 		// Raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes against a real
 		// fd table, not launchd's 256 default (the agent plist does the same; netd
 		// is not a relay host). Binds at bootstrap, not on kickstart -k — see the
@@ -1863,6 +1865,58 @@ func ServerPlist(cfg Config) []byte {
 		SoftFileLimit: serverFileLimit,
 	})
 }
+
+// The teardown budget, and why ExitTimeOut is derived rather than chosen.
+//
+// launchd SIGTERMs the job at `bootout`/`kickstart -k` and SIGKILLs it
+// ExitTimeOut seconds later (its default is 20). Everything a k3sm daemon does on
+// its way out runs SERIALLY inside that ONE number, and each stage's bound is
+// owned by a different package — so a hand-picked literal here is wrong the first
+// time any of them moves, and the failure is silent and bad: a SIGKILL mid-stop
+// orphans exactly the children the stop exists to reap (kine and the apiserver on
+// the server path, a vm host helper on either).
+//
+// The stages, each with the symbol that owns its bound:
+//
+//	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
+//	                        runtimed pkg/runtime/close.go — the embedded runtime's
+//	                        concurrent vm-helper stop, deferred by startNode.
+//	control socket      5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
+//	control-plane stop 30s  executor.StopBound — SERVER ONLY (a worker runs none):
+//	                        four components drained serially at drainGrace each,
+//	                        plus the post-SIGKILL reap.
+//	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go — both roles.
+//	headroom           10s  launchd's own signal/reap latency and the log flush.
+//
+// Every bound is a LITERAL here so the table above can be read in one place, and
+// each literal is bound back to its owner by a test rather than by trust:
+// TestExitTimeOutCoversTheSerialTeardown compares the control-plane stage with
+// executor.StopBound (the one owner this package can import), and
+// hack/acceptance/B253.sh's CI tier reads runtimed's two constants out of its
+// module and compares them with the close stage. The remaining stage
+// (runtimedSocketShutdownGrace, package main in cmd/k3sm) has no importable owner
+// and no gate — it is 5s of a 90s budget, and the headroom absorbs it.
+//
+// The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
+// read by operators in a plist and 90 is legible where 87 invites the question of
+// what the 7 was for. Rounding up can only add headroom.
+const (
+	teardownRuntimedClose = 37
+	teardownControlSocket = 5
+	teardownControlPlane  = 30
+	teardownMesh          = 5
+	teardownHeadroom      = 10
+
+	serverTeardownBudget = teardownRuntimedClose + teardownControlSocket + teardownControlPlane + teardownMesh + teardownHeadroom
+	agentTeardownBudget  = teardownRuntimedClose + teardownControlSocket + teardownMesh + teardownHeadroom
+
+	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every stage
+	// above, rounded up to the next multiple of ten.
+	serverExitTimeOut = ((serverTeardownBudget + 9) / 10) * 10
+	// agentExitTimeOut is the io.k3sm.agent plist's, on the same derivation minus
+	// the control-plane stop a worker never runs.
+	agentExitTimeOut = ((agentTeardownBudget + 9) / 10) * 10
+)
 
 // agentThrottleInterval is launchd's minimum seconds between spawns of the
 // agent job. The agent's terminal start failures — no credential and no token,
@@ -1889,12 +1943,13 @@ const agentThrottleInterval = 10
 // start, and is theirs to delete once the node has joined. A node that has
 // already joined needs neither: it starts from its stored credential.
 //
-// ExitTimeOut is the server's 45 seconds and for the same class of reason —
-// launchd's 20s default is a SIGKILL deadline, and the agent's teardown is not
-// instantaneous: it drains the Service proxy's listeners and then runs the same
-// deferred mesh teardown the server does, bounded by meshTeardownTimeout, and a
-// SIGKILL part-way through leaves a utun and its routes behind on a node that
-// looks stopped.
+// ExitTimeOut is derived the same way the server's is (see serverExitTimeOut),
+// from the stages an AGENT runs: it stops its embedded runtime's vm guests, tears
+// down the runtimed control socket, drains the Service proxy's listeners and runs
+// the same deferred mesh teardown the server does — everything except the
+// control-plane stop, which a worker has no control plane to run. A SIGKILL
+// part-way through leaves vm helpers, or a utun and its routes, behind on a node
+// that looks stopped.
 func AgentPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
 	args := []string{
@@ -1921,7 +1976,7 @@ func AgentPlist(cfg Config) []byte {
 		StdoutPath:       AgentLogPath(),
 		StderrPath:       AgentLogPath(),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
-		ExitTimeOut:      45,
+		ExitTimeOut:      agentExitTimeOut,
 		// The same RLIMIT_NOFILE raise the control plane gets, for the same
 		// reason and with the same reload contract: a worker hosts the Service
 		// proxy and the UDP relay, whose flow budget darwin-net sizes as

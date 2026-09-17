@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -78,10 +79,28 @@ const (
 
 // checkFunc performs one probe attempt against an already-resolved target,
 // bounded by timeout. A nil error is success (httpGet 2xx-3xx, a successful tcp
-// dial, an exec exit 0); any error — including a timeout — is failure. It is the
-// seam tests fake to drive outcomes deterministically; the real checks
+// dial, an exec exit 0); any error — including a timeout — is failure, EXCEPT an
+// error wrapping errProbeTargetPending, which is NOT EVALUATED (see below). It is
+// the seam tests fake to drive outcomes deterministically; the real checks
 // (httpProbe/tcpProbe/exec) are built in probe_handlers.go.
 type checkFunc func(ctx context.Context, timeout time.Duration) error
+
+// errProbeTargetPending is the check contract's third answer: the attempt was NOT
+// MADE, because the target is not dialable yet for a reason the NODE owns rather
+// than the container. Today that is exactly one condition — a vm pod whose guest
+// has not reported the DHCP lease its probes must be dialed at (probeDialFor) —
+// and the wrapping error names the pod.
+//
+// It is neither success nor failure, and it is deliberately not a probeOutcome:
+// an outcome is something a gauge counts, and counting this one is precisely the
+// bug. Counted as failure it restarts a healthy guest three ticks into a window
+// the runtime is still opening; counted as success it would report a container
+// ready that nothing has verified. So the gauge does not move at all and the
+// verdict is withheld (containerMonitor.verdict), leaving the pod-level
+// GuestTransportNotReady — the condition that actually describes this state — as
+// the reason an operator reads, instead of a ContainersNotReady pointing at
+// containers that are fine.
+var errProbeTargetPending = errors.New("probe target is not dialable yet")
 
 // probeSchedule is the timing of one probe.
 type probeSchedule struct {
@@ -165,6 +184,18 @@ type containerMonitor struct {
 	mu       sync.Mutex
 	restarts int32 // probe(liveness)-driven container restarts
 
+	// The NOT-EVALUATED window (errProbeTargetPending). pending is set by an
+	// attempt that could not be made and cleared by the next one that was;
+	// evaluated latches the first attempt that ever produced a real outcome.
+	// While pending && !evaluated this monitor has NOTHING to say about its
+	// container and publishes no verdict at all (see verdict) — which is
+	// different from, and must not be confused with, a container whose probes
+	// have simply not ticked yet (a young NATIVE pod: not pending, so its
+	// readiness verdict stands at its initial failure exactly as the kubelet
+	// seeds it).
+	pending   bool
+	evaluated bool
+
 	startup   *probeSpec // nil if the container has no startup probe
 	readiness *probeSpec // nil if the container has no readiness probe
 	liveness  *probeSpec // nil if the container has no liveness probe
@@ -207,6 +238,10 @@ func (m *containerMonitor) shouldProbe(kind probeKind) bool {
 func (m *containerMonitor) observe(kind probeKind, raw probeOutcome) probeReaction {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// An attempt was made and answered: the target is dialable again (or always
+	// was), and this monitor has a verdict from here on — even when the gate
+	// below discards this particular outcome.
+	m.pending, m.evaluated = false, true
 	switch kind {
 	case probeStartup:
 		if m.startedLocked() {
@@ -237,6 +272,20 @@ func (m *containerMonitor) observe(kind probeKind, raw probeOutcome) probeReacti
 	return reactNone
 }
 
+// noteNotEvaluated records that an attempt could not be made (the check returned
+// errProbeTargetPending). No gauge moves — that is the whole point — and no
+// reaction is owed: nothing about the container changed, only what this node can
+// currently find out about it.
+//
+// It does NOT clear evaluated: a pod that was probed for hours and then lost its
+// guest lease keeps its last committed verdict (frozen, not reverted), because
+// the last thing this node actually observed is still the best answer it has.
+func (m *containerMonitor) noteNotEvaluated() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = true
+}
+
 // onRestart applies a container restart: it bumps the monitor's restart tally
 // (internal bookkeeping — the surfaced RestartCount is runtimed's) and resets
 // every gauge so the startup gate must re-open (and liveness/readiness
@@ -256,17 +305,27 @@ func (m *containerMonitor) onRestart() {
 	}
 }
 
-// verdict snapshots the monitor's state for the status overlay (applyProbeOverlay).
-func (m *containerMonitor) verdict() probeVerdict {
+// verdict snapshots the monitor's state for the status overlay
+// (applyProbeOverlay). ok is false while the container's probes are NOT EVALUABLE
+// and never have been — the pending window above — in which case the overlay
+// leaves the RUNTIME's container status exactly as reported, the same
+// pass-through a container with no probes at all gets. That is the honest
+// rendering: this node has verified nothing, so it asserts nothing, and the
+// pod-level transport gate (which is False for precisely this window) is what
+// keeps the pod out of its Services meanwhile.
+func (m *containerMonitor) verdict() (probeVerdict, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.pending && !m.evaluated {
+		return probeVerdict{}, false
+	}
 	return probeVerdict{
 		hasReadiness: m.readiness != nil,
 		hasStartup:   m.startup != nil,
 		ready:        m.readyLocked(),
 		started:      m.startedLocked(),
 		restarts:     m.restarts,
-	}
+	}, true
 }
 
 // eachSpec invokes fn for each probe the container actually defines.
@@ -302,7 +361,9 @@ type probeVerdict struct {
 // probeState (a pod with no probes) leaves the status untouched.
 type probeState interface {
 	// verdict returns the probe state for the named container; ok is false when
-	// the container has no probes (its status passes through unchanged).
+	// the container has no probes, or when its probes cannot be evaluated yet and
+	// never could (containerMonitor.verdict) — in both cases its status passes
+	// through unchanged.
 	verdict(container string) (probeVerdict, bool)
 }
 
@@ -490,7 +551,17 @@ func (pp *podProber) tick(ctx context.Context, m *containerMonitor, kind probeKi
 	if !m.shouldProbe(kind) {
 		return
 	}
-	switch m.observe(kind, pp.runCheck(ctx, m.name, kind, s)) {
+	raw, evaluated := pp.runCheck(ctx, m.name, kind, s)
+	if !evaluated {
+		// The attempt was not made (errProbeTargetPending). Record the window and
+		// return: no gauge moves, so no threshold advances in either direction and
+		// no reaction is owed. The next status build renders the withheld verdict;
+		// firing a re-publish from here would announce a non-event on every tick of
+		// a window that can last as long as a guest takes to lease.
+		m.noteNotEvaluated()
+		return
+	}
+	switch m.observe(kind, raw) {
 	case reactPublish:
 		pp.fire()
 	case reactRestart:
@@ -503,34 +574,47 @@ func (pp *podProber) tick(ctx context.Context, m *containerMonitor, kind probeKi
 // runCheck runs one probe attempt and maps it to a committable outcome, failing
 // CLOSED on every abnormal path: a nil check, a check that returns an error, or a
 // check that PANICS all yield outcomeFailure (so an unverifiable container is
-// never falsely committed healthy). The panic recovery is mandatory and not
+// never falsely committed healthy). evaluated is false for the ONE non-abnormal
+// exception — errProbeTargetPending, an attempt that was never made — whose
+// outcome is meaningless and must not be committed in either direction. The panic recovery is mandatory and not
 // defensive paranoia — the prober runs inside the one k3sm binary that co-hosts
 // the embedded control plane, kine, and every other pod, so a panic in a single
 // container's check (mirroring the kubelet's runtime.HandleCrash) must be
 // contained here rather than crash the process. A check error is surfaced to the
 // logger — the diagnosable cause of a never-Ready/restarting pod — instead of
 // being reduced to a silent boolean as it was before.
-func (pp *podProber) runCheck(ctx context.Context, container string, kind probeKind, s *probeSpec) (outcome probeOutcome) {
+func (pp *podProber) runCheck(ctx context.Context, container string, kind probeKind, s *probeSpec) (outcome probeOutcome, evaluated bool) {
 	if s.check == nil {
 		// Defense in depth: buildCheck now never returns nil, but a nil check must
 		// fail closed, never be invoked (a nil call would panic the process).
 		pp.log.Error("probe has no runnable check; failing closed",
 			"pod", pp.podID, "container", container, "kind", kind)
-		return outcomeFailure
+		return outcomeFailure, true
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			outcome = outcomeFailure
+			outcome, evaluated = outcomeFailure, true
 			pp.log.Error("probe check panicked; recovered and treating as a failed probe",
 				"pod", pp.podID, "container", container, "kind", kind, "panic", r)
 		}
 	}()
 	if err := s.check(ctx, s.sched.timeout); err != nil {
+		// The attempt was not made: the target is not dialable yet for a reason the
+		// node owns (errProbeTargetPending). It is reported, not counted — a
+		// certain-failure dial against a window this node has not finished opening
+		// would restart a healthy container. errors.Is, not an equality check: the
+		// sentinel travels wrapped (through http.Transport and *url.Error on the
+		// httpGet path) by the time it arrives here.
+		if errors.Is(err, errProbeTargetPending) {
+			pp.log.Debug("probe not evaluated; its target is not dialable yet",
+				"pod", pp.podID, "container", container, "kind", kind, "err", err)
+			return outcomeUnknown, false
+		}
 		pp.log.Warn("probe failed",
 			"pod", pp.podID, "container", container, "kind", kind, "err", err)
-		return outcomeFailure
+		return outcomeFailure, true
 	}
-	return outcomeSuccess
+	return outcomeSuccess, true
 }
 
 // fire signals a status change to the owner (runs outside all monitor locks).
@@ -561,5 +645,5 @@ func (pp *podProber) verdict(container string) (probeVerdict, bool) {
 	if !ok {
 		return probeVerdict{}, false
 	}
-	return m.verdict(), true
+	return m.verdict()
 }

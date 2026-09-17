@@ -45,6 +45,13 @@ import (
 
 // --- test helpers -----------------------------------------------------------
 
+// vd is the monitor's verdict for a test that only reads its fields: the
+// evaluability flag is the subject of the B318 gate, not of the FSM cases here.
+func vd(m *containerMonitor) probeVerdict {
+	v, _ := m.verdict()
+	return v
+}
+
 // noopCheckFactory builds a check that always succeeds; the FSM/gating tests
 // drive outcomes via observe directly, so the check itself is never run.
 func noopCheckFactory(*corev1.Container, *corev1.Probe) checkFunc {
@@ -254,7 +261,7 @@ func TestM2_StartupGatesLiveness(t *testing.T) {
 			t.Fatalf("liveness reaction %v before startup; want none", react)
 		}
 	}
-	if got := m.verdict().restarts; got != 0 {
+	if got := vd(m).restarts; got != 0 {
 		t.Fatalf("restarts=%d before startup, want 0", got)
 	}
 
@@ -262,7 +269,7 @@ func TestM2_StartupGatesLiveness(t *testing.T) {
 	if react := feed(m, probeStartup, outcomeSuccess); react != reactPublish {
 		t.Fatalf("startup success reaction %v, want publish (gate opened)", react)
 	}
-	if !m.verdict().started {
+	if !vd(m).started {
 		t.Fatal("started must be true after the startup probe succeeds")
 	}
 	if !m.shouldProbe(probeLiveness) {
@@ -276,7 +283,7 @@ func TestM2_StartupGatesLiveness(t *testing.T) {
 	if react := feed(m, probeLiveness, outcomeFailure); react != reactRestart {
 		t.Fatalf("3rd liveness failure reaction %v, want restart", react)
 	}
-	if got := m.verdict().restarts; got != 1 {
+	if got := vd(m).restarts; got != 1 {
 		t.Fatalf("restarts=%d after startup+liveness fail, want 1", got)
 	}
 }
@@ -302,7 +309,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 			t.Fatalf("passing liveness reaction %v, want none", react)
 		}
 	}
-	if got := m.verdict().restarts; got != 0 {
+	if got := vd(m).restarts; got != 0 {
 		t.Fatalf("restarts=%d after passing liveness, want 0", got)
 	}
 
@@ -312,7 +319,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 	if react := feed(m, probeLiveness, outcomeFailure); react != reactRestart {
 		t.Fatalf("3rd failure reaction %v, want restart", react)
 	}
-	if got := m.verdict().restarts; got != 1 {
+	if got := vd(m).restarts; got != 1 {
 		t.Fatalf("restarts=%d, want 1", got)
 	}
 
@@ -321,7 +328,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 	// count on the RestartContainer RPC; adding here would double-count).
 	proto := runningProto("uid-liveness", "c0")
 	proto.ContainerStatuses[0].RestartCount = 1 // runtimed's count after the re-exec
-	st := toPodStatus(nil, proto, "192.168.1.10", metav1.Now(), pp)
+	st := toPodStatus(nil, proto, "192.168.1.10", metav1.Now(), pp, transportReady)
 	if st.ContainerStatuses[0].RestartCount != 1 {
 		t.Fatalf("status RestartCount=%d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
@@ -332,7 +339,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 	if react := feed(m, probeLiveness, outcomeFailure); react != reactRestart {
 		t.Fatalf("second cycle 3rd failure reaction %v, want restart", react)
 	}
-	if got := m.verdict().restarts; got != 2 {
+	if got := vd(m).restarts; got != 2 {
 		t.Fatalf("restarts=%d after two cycles, want 2", got)
 	}
 }
@@ -380,7 +387,7 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 		pp.tick(ctx, m, probeLiveness, m.liveness)
 	}
 
-	if got := m.verdict().restarts; got != 1 {
+	if got := vd(m).restarts; got != 1 {
 		t.Fatalf("probe-driven restarts = %d, want 1", got)
 	}
 	// Since B26 the seam schedules through the SHARED restart authority's worker
@@ -404,7 +411,7 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 	// monitor's tally is never added on top (the single-count-authority rule).
 	proto := runningProto("uid-live", "c0")
 	proto.ContainerStatuses[0].RestartCount = 1 // what runtimed reports after the RPC
-	st := toPodStatus(nil, proto, r.nodeIP, metav1.Now(), pp)
+	st := toPodStatus(nil, proto, r.nodeIP, metav1.Now(), pp, transportReady)
 	if st.ContainerStatuses[0].RestartCount != 1 {
 		t.Errorf("status RestartCount = %d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
@@ -426,10 +433,10 @@ func TestM2_ReadinessGatesEndpoints(t *testing.T) {
 	m := pp.monitors["c0"]
 
 	ready := func() corev1.ConditionStatus {
-		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.PodReady)
+		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp, transportReady), corev1.PodReady)
 	}
 	containersReady := func() corev1.ConditionStatus {
-		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.ContainersReady)
+		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp, transportReady), corev1.ContainersReady)
 	}
 
 	// Until the readiness probe first succeeds, the container is NOT ready (so it
@@ -557,7 +564,9 @@ func TestM2_ProbeHandlers(t *testing.T) {
 		r.probeTransport = rt
 		c := &corev1.Container{Name: "c0", Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}
 		p := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/h", Port: intstr.FromString("http")}}}
-		check := r.buildCheck("uid", "10.0.0.5", c, p)
+		// The seams a prober would hand in, with the fake round-tripper standing in
+		// for the pod's own transport (a real one would dial the resolved target).
+		check := r.buildCheck("uid", "10.0.0.5", probeSeams{dial: r.dial, transport: rt}, c, p)
 		if err := check(ctx, time.Second); err != nil {
 			t.Fatalf("named-port httpGet check: %v", err)
 		}
@@ -701,7 +710,7 @@ func TestBuildCheckGRPCProbeNoPanic(t *testing.T) {
 		const svc = "grpc.example.Svc"
 		c := &corev1.Container{Name: "c0"}
 		p := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 50051, Service: ptr(svc)}}}
-		check := r.buildCheck("uid", "10.0.0.5", c, p)
+		check := r.buildCheck("uid", "10.0.0.5", r.probeSeamsFor("uid", false), c, p)
 		if check == nil {
 			t.Fatal("gRPC probe must build a NON-nil check (nil → runner invokes nil → node-DoS panic)")
 		}
@@ -723,7 +732,7 @@ func TestBuildCheckGRPCProbeNoPanic(t *testing.T) {
 		}
 		c := &corev1.Container{Name: "c0"}
 		p := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{GRPC: &corev1.GRPCAction{Port: 50051}}}
-		check := r.buildCheck("uid", "10.0.0.5", c, p)
+		check := r.buildCheck("uid", "10.0.0.5", r.probeSeamsFor("uid", false), c, p)
 		if check == nil {
 			t.Fatal("gRPC probe must build a NON-nil check")
 		}
@@ -735,7 +744,7 @@ func TestBuildCheckGRPCProbeNoPanic(t *testing.T) {
 	t.Run("handler-less probe builds a fail-closed check with a surfaced reason", func(t *testing.T) {
 		r, _ := newRuntimedFake(t)
 		c := &corev1.Container{Name: "c0"}
-		check := r.buildCheck("uid", "10.0.0.5", c, &corev1.Probe{}) // zero Probe: no handler
+		check := r.buildCheck("uid", "10.0.0.5", r.probeSeamsFor("uid", false), c, &corev1.Probe{}) // zero Probe: no handler
 		if check == nil {
 			t.Fatal("handler-less probe must build a NON-nil check (nil → spec built → nil-check panic)")
 		}
@@ -764,7 +773,7 @@ func TestBuildCheckGRPCProbeNoPanic(t *testing.T) {
 		// binary. Reaching the assertions at all proves recovery; restarts==1 proves
 		// the panic was committed as a failed liveness probe (not swallowed as pass).
 		pp.tick(ctx, m, probeLiveness, m.liveness)
-		if got := m.verdict().restarts; got != 1 {
+		if got := vd(m).restarts; got != 1 {
 			t.Fatalf("panicking liveness check → restarts=%d, want 1 (panic must be a failed probe)", got)
 		}
 		if !strings.Contains(buf.String(), "panicked") {

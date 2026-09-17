@@ -20,9 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
+
+	"k3sm.io/k3sm/pkg/executor"
 )
 
 // The daemon restart sequence, and why it is a sequence at all.
@@ -66,14 +70,20 @@ type restartBudget struct {
 // them to microseconds; nothing in the product writes them.
 //
 // netd is a single Go process with no orderly teardown to perform, so 30s is
-// generous. A node daemon is not: its plist sets ExitTimeOut 45 (launchd's SIGTERM →
-// SIGKILL grace), and the control plane tears its components down serially inside
-// that window, so any unload budget at or below 45s would time out on precisely
-// the slow-but-healthy shutdown the wait exists to tolerate. 60s clears it with
-// margin.
+// generous. A node daemon is not: its plist sets the ExitTimeOut derived above
+// (launchd's SIGTERM → SIGKILL grace), and it runs its whole teardown serially
+// inside that window, so any unload budget at or below the grace would time out
+// on precisely the slow-but-healthy shutdown the wait exists to tolerate.
+//
+// So the node budget is DERIVED from that same grace rather than chosen: the
+// larger of the two node plists (the server's) plus a margin for launchd to
+// finish removing the label from its domain after the process is gone. Pinned by
+// TestRestartBudgetByLabel, which is what catches a grace that grows past it.
+const nodeUnloadMargin = 15 * time.Second
+
 var (
 	netdRestartBudget   = restartBudget{unload: 30 * time.Second, running: 30 * time.Second, poll: 250 * time.Millisecond}
-	serverRestartBudget = restartBudget{unload: 60 * time.Second, running: 60 * time.Second, poll: 250 * time.Millisecond}
+	serverRestartBudget = restartBudget{unload: time.Duration(serverExitTimeOut)*time.Second + nodeUnloadMargin, running: 60 * time.Second, poll: 250 * time.Millisecond}
 	// agentJoinBudget bounds the wait for a FIRST join to produce a credential
 	// (see verifyDaemons). It is a different question from a restart, so it is a
 	// different budget: nothing is being unloaded, and the clock is the join
@@ -90,9 +100,10 @@ var (
 // added to the manifest later inherits the conservative default rather than the
 // node's.
 //
-// The agent is in the long class for the reason its own plist sets ExitTimeOut
-// 45: its teardown is not instantaneous either (it closes the mesh device and
-// drains the Service proxy's listeners), so any unload budget at or below that
+// The agent is in the long class for the reason its own plist sets a raised
+// ExitTimeOut: its teardown is not instantaneous either (it stops its embedded
+// runtime's vm guests, closes the mesh device and drains the Service proxy's
+// listeners), so any unload budget at or below that
 // SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
 // shutdown the wait exists to tolerate — and the install would then refuse to
 // bootstrap into a label it had just asked to stop.
@@ -329,7 +340,7 @@ func recoverBootedOut(sys System, labels []string) string {
 // startup, so a single read immediately after the bootstrap tests the wrong thing.
 // The error names the state of EVERY component, not just the first bad one — an
 // operator needs to know what IS running as much as what is not.
-func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact) error {
+func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact, startedAt time.Time) error {
 	states, healthy := daemonStates(sys, longRunningDaemonLabels(m))
 	switch err := awaitPath(ctx, sys, cfg.NetdSocket, "netd is not serving the helper socket the control plane dials", restartBudgetFor(NetdLabel)); {
 	case err == nil:
@@ -341,11 +352,122 @@ func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact) er
 	if !healthy {
 		return fmt.Errorf("the restarted daemons are not all healthy: %s", strings.Join(states, "; "))
 	}
+	// A live pid is not the whole claim on the server role either: a daemon whose
+	// crash-loop breaker has tripped is resident, idle, and serving nothing.
+	if err := verifyServerNotParked(sys, cfg, m, startedAt); err != nil {
+		return err
+	}
 	if err := verifyAgentJoined(ctx, sys, cfg); err != nil {
 		return err
 	}
 	cfg.Logger.Info("verified the daemons after the restart", "state", strings.Join(states, "; "))
 	return nil
+}
+
+// ErrServerParked marks an install that restarted the server daemon into its
+// crash-loop give-up: the breaker is tripped, so the daemon parks instead of
+// bringing the control plane up. It is a sentinel so a caller can tell this
+// verdict from an ordinary "daemon is down" one — the remedy is an operator
+// action, not a retry.
+var ErrServerParked = errors.New("the k3sm server daemon is parked by its crash-loop breaker")
+
+// ErrServerNotComingUp marks an install whose OWN restart produced at least one
+// bring-up failure: the control plane this install started did not come up, and
+// launchd is respawning it into the same fault. The breaker has not given up
+// yet, and that is precisely why this is a separate sentinel — install does not
+// wait for it to.
+var ErrServerNotComingUp = errors.New("the k3sm server daemon did not bring the control plane up")
+
+// verifyServerNotParked is the assertion a pid cannot make on the server role,
+// and it makes it in two tenses.
+//
+// A control plane that keeps failing trips its own breaker, and a tripped daemon
+// does not exit — it PARKS: resident, idle, answering nothing, because the
+// server plist's KeepAlive is a bare `true` and any exit would just be another
+// lap of the loop (pkg/executor's crash-loop record). launchd reports a perfectly
+// healthy pid for it. So an install that verified the pid alone would report
+// success over a cluster that is not running and will not start, which is the
+// same class of lie the netd socket check exists to prevent.
+//
+// But a trip is a state that takes MINUTES to reach: five failures inside the
+// window. A fault that fails SLOWLY — a component that times out after 30s on
+// every attempt — has produced one or two entries by the time the 60s restart
+// budget is up, so an install that asked only "is it tripped?" would pass on
+// exactly the persistent fault it exists to catch, and the daemon would give up
+// unattended some minutes later with nobody watching. Hence the second, stricter
+// question: has the control plane failed to come up AT ALL since this install
+// began? One bring-up failure dated at or after startedAt fails the install,
+// tripped or not — this install restarted that daemon, so that failure is this
+// install's to report.
+//
+// The timestamp is what keeps a reinstall honest in the other direction: an
+// OLDER record, from the very fault an operator may be reinstalling to fix, does
+// not fail anything by itself. Only a trip does, because a tripped daemon is
+// parked right now whatever its history. Crash-origin entries are not counted
+// by the fresh check either way: a component that came up and later died is a
+// different and survivable story, and launchd's restart of it is the design.
+//
+// It is FAIL-OPEN on everything else: an absent record is the ordinary case, and
+// an unreadable or malformed one is bookkeeping, not a verdict — refusing an
+// install over a corrupt marker would be a second way to lose a control plane,
+// the same reason the daemon treats it as empty.
+func verifyServerNotParked(sys System, cfg Config, m []artifact, startedAt time.Time) error {
+	if !slices.Contains(longRunningDaemonLabels(m), ServerLabel) {
+		return nil // an agent-only install runs no control plane of its own
+	}
+	path := executor.CrashLoopPath(cfg.serverWorkDir())
+	raw, err := sys.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		cfg.Logger.Warn("could not read the server's crash-loop record", "path", path, "err", err)
+		return nil
+	}
+	rec, err := executor.ParseCrashRecord(raw)
+	if err != nil {
+		cfg.Logger.Warn("the server's crash-loop record is unreadable; treating it as empty", "path", path, "err", err)
+		return nil
+	}
+	if rec.Tripped() {
+		last, _ := rec.Last()
+		return fmt.Errorf("%w: %s, so it is resident and serving nothing (tripped at %s; %s: %s; record: %s). Clear it and reinstall: sudo k3sm server --clear-crashloop",
+			ErrServerParked, parkedSummary(last), rec.TrippedAt.Format(time.RFC3339), last.Origin, last.Component, path)
+	}
+	// The daemon and this process read the same machine's clock, so comparing
+	// the record's timestamps with this install's start compares a clock with
+	// itself.
+	fresh, last := freshBringUpFailures(rec, startedAt)
+	if fresh == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: the control plane failed to come up %d times since this install began (last: %s at %s); launchd keeps respawning it into the same fault and the breaker parks the daemon after %d. The reason is the last lines of %s, with the redacted tails in %s; fix it and reinstall (clear a parked daemon first: sudo k3sm server --clear-crashloop)",
+		ErrServerNotComingUp, fresh, last.Component, last.At.Format(time.RFC3339), executor.CrashLoopThreshold, ServerLogPath(), path)
+}
+
+// freshBringUpFailures counts the bring-up failures dated at or after since, and
+// returns the last of them.
+func freshBringUpFailures(rec executor.CrashRecord, since time.Time) (int, executor.Crash) {
+	n := 0
+	var last executor.Crash
+	for _, c := range rec.Crashes {
+		if c.Origin != executor.CrashOriginBringUp || c.At.Before(since) {
+			continue
+		}
+		n++
+		last = c
+	}
+	return n, last
+}
+
+// parkedSummary says which of the two failures the breaker counted last, in the
+// words an operator needs to start looking: a control plane that came up and
+// then died is a different search through the log than one that never came up.
+func parkedSummary(last executor.Crash) string {
+	if last.Origin == executor.CrashOriginBringUp {
+		return "the control plane never came up (last: " + last.Component + ")"
+	}
+	return "the control plane kept crashing (last: " + last.Component + ")"
 }
 
 // verifyAgentJoined is the extra assertion an agent install needs, and the

@@ -72,10 +72,81 @@ const healthTimeout = 90 * time.Second
 // escalating to SIGKILL.
 const drainGrace = 5 * time.Second
 
+// StopBound is the budget a daemon gives the whole control-plane teardown.
+//
+// The components are stopped SERIALLY in shutdown order, each costing at most
+// drainGrace before the SIGKILL escalation, so four components spend 4×drainGrace
+// = 20s in the bounded part; the rest covers the post-SIGKILL reap and the
+// reapers.Wait that follows it.
+//
+// It is exported because it is NOT only this package's business: it is one stage
+// of the single ExitTimeOut launchd gives the daemon, and pkg/install derives that
+// number from this symbol rather than from a literal that would drift the moment
+// drainGrace or the component count changed.
+//
+// It is a BUDGET, not an enforced deadline — Stop does not select on its context,
+// and the wait after a SIGKILL is unbounded. A component whose process refuses to
+// die overruns this, which is exactly why the ExitTimeOut derived from it carries
+// headroom rather than being the sum to the second.
+const StopBound = 30 * time.Second
+
 // exitLogTailLines is how many trailing log lines an early-exit error carries —
 // enough to name the fatal apiserver/kine flag or config error without dumping
 // the whole (token-bearing) log into the returned error.
 const exitLogTailLines = 20
+
+// BringUpError is a control-plane bring-up failure carrying the component it
+// happened to and the phase it happened in. Every failure path out of provision
+// and bringUp returns one, which is what lets the daemon record WHICH component
+// never came up on its crash-loop breaker (cmd/k3sm) instead of counting an
+// anonymous "start control plane" failure it cannot name.
+//
+// Error returns the wrapped error's text UNCHANGED, and Unwrap keeps the chain:
+// the type adds structure for errors.As and nothing else. That is deliberate —
+// the bring-up messages an operator reads in /var/log/k3sm/server.log (and the
+// tests that pin them) are the product of this package's existing fail-fast
+// work, and a wrapper that re-prefixed them would degrade the diagnostic it is
+// only meant to classify.
+type BringUpError struct {
+	// Component is the control-plane component that failed — "kine",
+	// "kube-apiserver", "kube-scheduler", "kube-controller-manager" (the same
+	// names OnComponentExit reports) — or, in the provision phase, the step that
+	// did, as "provision/<step>".
+	Component string
+	// Phase is PhaseProvision or PhaseBringUp.
+	Phase string
+	// Err is the error as it was already formatted, including any redacted log
+	// tail.
+	Err error
+}
+
+// The two phases a bring-up failure can happen in: laying the work dir down, and
+// starting the children over it.
+const (
+	PhaseProvision = "provision"
+	PhaseBringUp   = "bring-up"
+)
+
+// Error returns the wrapped error's message, byte-for-byte.
+func (e *BringUpError) Error() string { return e.Err.Error() }
+
+// Unwrap returns the wrapped error so errors.Is/As see through the classification.
+func (e *BringUpError) Unwrap() error { return e.Err }
+
+// bringUpErr classifies err as a bring-up failure of component in phase. A nil
+// err stays nil (never a non-nil interface holding a nil pointer).
+func bringUpErr(component, phase string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &BringUpError{Component: component, Phase: phase, Err: err}
+}
+
+// provisionStep classifies a provision step's error under "provision/<name>",
+// leaving its message untouched.
+func provisionStep(name string, err error) error {
+	return bringUpErr("provision/"+name, PhaseProvision, err)
+}
 
 // component is one supervised control-plane child process. exited is closed by
 // the reaper goroutine spawnEnv starts the moment the child exits; waitErr is
@@ -97,14 +168,30 @@ type component struct {
 	// death is a crash (the callback's to report) or a bring-up failure
 	// (awaitHealthy's, with the name and log tail the fail-fast path produces).
 	supervised bool
+	// reported is set, under Supervised.mu, by whichever of the two observers of
+	// this component's death gets there first — the reaper (which then fires
+	// OnComponentExit) or markSupervised (which then returns the death as a
+	// bring-up error). It makes the two paths exclusive, so a crash both can see
+	// is reported exactly once and never as both a bring-up failure and a
+	// post-bring-up crash.
+	reported bool
 }
 
 // exitDetail describes an early child exit for the fail-fast bring-up error:
 // the Wait error (exit status) plus the last ~20 lines of the component's 0600
 // log file, so the operator sees the fatal flag/config error immediately
-// instead of an opaque healthz timeout. Call only after <-c.exited.
+// instead of an opaque healthz timeout.
+//
+// The tail is REDACTED, for the same reason the reaper's is: this string is
+// formatted into the error EVERY awaitHealthy fail-fast path returns, and
+// bringUp propagates that out of Start to the daemon's stderr, which launchd
+// captures into /var/log/k3sm/server.log — a file the whole admin group reads,
+// where the component log it was quoted from is 0600 to the service user alone.
+// The unredacted original stays at logPath, which travels with the tail.
+//
+// Call only after <-c.exited.
 func (c *component) exitDetail() string {
-	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, LogTail(c.logPath, exitLogTailLines))
+	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, RedactedLogTail(c.logPath))
 }
 
 // exitedNow reports whether the child has left the running state, asked of the
@@ -277,7 +364,7 @@ func (s *Supervised) releaseStartClaim() {
 
 // provision lays down everything the components need on disk.
 func (s *Supervised) provision(ctx context.Context) error {
-	if err := ensureWorkDirs(s.cfg.WorkDir); err != nil {
+	if err := provisionStep("workdirs", ensureWorkDirs(s.cfg.WorkDir)); err != nil {
 		return err
 	}
 	// Before anything replaces the staged kine binary or lets the new pin touch the
@@ -288,40 +375,40 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// binary the rollback path preserves. A refusal (no space, an undrained WAL) stops
 	// the boot rather than migrating unprotected.
 	if s.cfg.DatastoreEndpoint == "" {
-		if err := snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
+		if err := provisionStep("snapshot", snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 			return err
 		}
 	}
 	// Seed the workdir bin from a staged install payload first, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
-	if err := seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion); err != nil {
+	if err := provisionStep("seed-bin", seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
-	if err := ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion); err != nil {
+	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
 		return err
 	}
-	if err := ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion); err != nil {
+	if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
-	if err := writeServiceAccountKeys(ctx, s.cfg.WorkDir); err != nil {
+	if err := provisionStep("sa-keys", writeServiceAccountKeys(ctx, s.cfg.WorkDir)); err != nil {
 		return err
 	}
 	token := s.currentToken()
-	if err := writeTokenFile(s.cfg.WorkDir, token); err != nil {
+	if err := provisionStep("token-file", writeTokenFile(s.cfg.WorkDir, token)); err != nil {
 		return err
 	}
-	if err := writeKubeconfig(s.cfg, token); err != nil {
+	if err := provisionStep("kubeconfig", writeKubeconfig(s.cfg, token)); err != nil {
 		return err
 	}
 	// The audit policy + admission-control config the apiserver argv
 	// references must exist before startAPIServer — a missing file would wedge
 	// bring-up opaquely until the healthz timeout. Overwritten every boot (the
 	// files track the binary).
-	if err := writeConformanceConfig(s.cfg.WorkDir, s.cfg.PSAEnforceBaseline); err != nil {
+	if err := provisionStep("conformance-config", writeConformanceConfig(s.cfg.WorkDir, s.cfg.PSAEnforceBaseline)); err != nil {
 		return err
 	}
-	if err := s.provisionComponentCerts(); err != nil {
+	if err := provisionStep("certs", s.provisionComponentCerts()); err != nil {
 		return err
 	}
 	return nil
@@ -395,37 +482,72 @@ const componentReadyTimeout = 30 * time.Second
 // → scheduler → controller-manager are awaited in sequence, so a scheduler that
 // dies after its own port opens, while the controller-manager is still coming
 // up, would otherwise be dropped.
-func (s *Supervised) markSupervised(c *component) {
+//
+// It also closes the narrower window BETWEEN that readiness gate and this mark.
+// A child that dies in those few statements is seen by its reaper while the
+// component is still unmarked, so the reaper reports it to nobody — and
+// awaitHealthy has already returned success, so bring-up reports it to nobody
+// either: the silent wedge again, in the smallest window there is. So a
+// markSupervised that finds the child already dead returns that death itself, in
+// awaitHealthy's shape (the component name, the Wait error, the log path and a
+// redacted tail), for bringUp to propagate as the bring-up failure it is. The
+// callback stays silent for it, as it does for every other death during bring-up
+// (see the supervising doc comment): whichever observer claims the death sets
+// reported, and the other skips it.
+func (s *Supervised) markSupervised(c *component) error {
 	s.mu.Lock()
 	c.supervised = true
+	claimed := false
+	select {
+	case <-c.exited:
+		// It died between its readiness gate and this mark. Claim the report
+		// unless the reaper already took it (which it can only have done via the
+		// supervising backstop, since this component was unmarked until now).
+		if !c.reported {
+			c.reported = true
+			claimed = true
+		}
+	default:
+	}
 	s.mu.Unlock()
+	if !claimed {
+		return nil
+	}
+	// Safe without the lock: waitErr is written strictly before exited closes,
+	// and the select above observed that close.
+	return bringUpErr(c.name, PhaseBringUp, fmt.Errorf("%s exited during bring-up: %v; last log lines (%s):\n%s",
+		c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath)))
 }
 
 func (s *Supervised) bringUp(ctx context.Context) error {
 	kine, err := s.startKine(ctx)
 	if err != nil {
-		return fmt.Errorf("start kine: %w", err)
+		return bringUpErr("kine", PhaseBringUp, fmt.Errorf("start kine: %w", err))
 	}
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
-		return fmt.Errorf("kine not listening: %w", err)
+		return bringUpErr(kine.name, PhaseBringUp, fmt.Errorf("kine not listening: %w", err))
 	}
-	s.markSupervised(kine)
+	if err := s.markSupervised(kine); err != nil {
+		return err
+	}
 	// kine is serving, so this pin has now genuinely opened this database — stamp it,
 	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
 	// provision time) is what makes the pre-migration snapshot survive a boot that dies
 	// before the datastore ever came up; recordKinePin itself skips the external-
 	// datastore posture.
-	if err := recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint); err != nil {
+	if err := bringUpErr(kine.name, PhaseBringUp, recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint)); err != nil {
 		return err
 	}
 	api, err := s.startAPIServer(ctx)
 	if err != nil {
-		return fmt.Errorf("start apiserver: %w", err)
+		return bringUpErr("kube-apiserver", PhaseBringUp, fmt.Errorf("start apiserver: %w", err))
 	}
 	if err := s.waitHealthz(ctx, api); err != nil {
-		return fmt.Errorf("apiserver not healthy: %w", err)
+		return bringUpErr(api.name, PhaseBringUp, fmt.Errorf("apiserver not healthy: %w", err))
 	}
-	s.markSupervised(api)
+	if err := s.markSupervised(api); err != nil {
+		return err
+	}
 	if err := s.startAndAwaitListening(ctx, "scheduler", s.startScheduler, s.cfg.SchedulerPort); err != nil {
 		return err
 	}
@@ -447,19 +569,23 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 	// Fail closed before the spawn if the port is already held: the wait below
 	// would be satisfied by the incumbent's listener, so a component that lost
 	// its bind would leave bring-up reporting success (see preflightComponentPort).
-	if err := preflightComponentPort(ctx, name, port); err != nil {
+	if err := bringUpErr(name, PhaseBringUp, preflightComponentPort(ctx, name, port)); err != nil {
 		return err
 	}
 	c, err := start(ctx)
 	if err != nil {
-		return fmt.Errorf("start %s: %w", name, err)
+		return bringUpErr(name, PhaseBringUp, fmt.Errorf("start %s: %w", name, err))
 	}
 	if err := awaitHealthy(ctx, c.name, c.exited, c.exitedNow, tcpReady(port), componentReadyTimeout, 300*time.Millisecond, c.exitDetail); err != nil {
-		return fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err)
+		return bringUpErr(c.name, PhaseBringUp, fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err))
 	}
 	// This component is up; its own death from here is a crash, reported even
-	// though the components after it are still coming up.
-	s.markSupervised(c)
+	// though the components after it are still coming up — unless it died in the
+	// statements between the wait above and this mark, which markSupervised
+	// returns as the bring-up failure it is.
+	if err := s.markSupervised(c); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -837,14 +963,20 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 		// for a component bringUp forgot to mark.
 		s.mu.Lock()
 		live := c.supervised || s.supervising
+		// reported keeps this exclusive with markSupervised, the other observer
+		// of a death in the window just before the mark: one death, one report.
+		fire := live && s.cfg.OnComponentExit != nil && !c.reported
+		if fire {
+			c.reported = true
+		}
 		s.mu.Unlock()
-		if live && s.cfg.OnComponentExit != nil {
+		if fire {
 			// The tail is REDACTED and byte-capped here, inside the package that
 			// owns the 0600 log, because the consumer logs it to the daemon's
 			// logger and launchd captures that into a world-readable file. The
 			// logPath goes with it so the operator is pointed at the 0600
 			// original rather than left with only the safe extract.
-			s.cfg.OnComponentExit(c.name, c.waitErr, c.logPath, redactedLogTail(c.logPath))
+			s.cfg.OnComponentExit(c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath))
 		}
 	}()
 
@@ -917,9 +1049,10 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exit
 
 // LogTail returns the last n lines of the file at path (best-effort: an
 // unreadable file yields a placeholder so the caller's error stays actionable).
-// Exported because a bring-up that times out OUTSIDE this package — `k3sm dev`
-// waiting on a detached server it spawned — owes its operator the same evidence
-// this package's own fail-fast errors carry, and there should be one tail.
+// It is the RAW tail, for a caller whose sink is as protected as the log itself;
+// anything that quotes a log into an operator-facing error wants RedactedLogTail
+// instead, which is what the out-of-package consumer (`k3sm dev`, waiting on a
+// detached server it spawned) takes, so there is still one tail.
 func LogTail(path string, n int) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -975,19 +1108,23 @@ var (
 	mintedTokens = regexp.MustCompile(`k3sm-[A-Za-z0-9._~+/=-]{12,}|K10[0-9a-fA-F]{16,}(?:::\S+)?`)
 )
 
-// redactedLogTail reads the tail of a component's 0600 log and returns it with
+// RedactedLogTail reads the tail of a component's 0600 log and returns it with
 // credential material removed and its size bounded, fit to hand to a consumer
 // that will put it somewhere less protected. The daemon logger is exactly that
-// consumer: launchd captures it into /var/log/k3sm/server.log, which is
-// world-readable on an installed cluster.
+// consumer: launchd captures it into /var/log/k3sm/server.log, which on an
+// installed cluster is mode 0640, group `admin` (pkg/install's LogFileMode) —
+// not world-readable, but read by every admin-group user on the Mac, where the
+// component log it was quoted from is read by the service user alone.
 //
 // The full, unredacted log stays at the 0600 path, which is what OnComponentExit
-// receives alongside this — so redaction here can afford to be blunt.
-func redactedLogTail(path string) string {
+// receives alongside this — so redaction here can afford to be blunt. Exported
+// because `k3sm dev` quotes the same server log into operator-facing errors from
+// outside this package and owes it the same treatment.
+func RedactedLogTail(path string) string {
 	return redactLogTail(LogTail(path, exitLogTailLines))
 }
 
-// redactLogTail is the pure half of redactedLogTail, over already-read text.
+// redactLogTail is the pure half of RedactedLogTail, over already-read text.
 func redactLogTail(tail string) string {
 	tail = credentialAssignments.ReplaceAllString(tail, "${1}${2}"+redactedTokenPlaceholder)
 	tail = authHeaders.ReplaceAllString(tail, "${1}${2}"+redactedTokenPlaceholder)
@@ -1037,6 +1174,10 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	s.supervising = false
 	for _, c := range comps {
 		c.supervised = false
+		// spawnEnv builds a fresh component per child today, so this reset is
+		// unobservable; it keeps the once-only report contract true if a
+		// component object is ever reused across a restart.
+		c.reported = false
 	}
 	s.mu.Unlock()
 

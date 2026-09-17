@@ -26,15 +26,16 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -45,6 +46,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netserve"
 )
 
@@ -87,7 +89,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
-	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
@@ -162,6 +164,15 @@ func runAgent(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// runtimed's on-disk root — the image cache, the pod dirs, every PVC bound on
+	// this node — resolved once, here, before anything under it is touched. An
+	// empty --pod-root derives the work-dir's parent (the same rule `k3sm server`
+	// applies), except on a worker that already holds data under the legacy
+	// temp-dir root, which is kept in place and warned about rather than migrated.
+	podRoot := resolveAgentPodRoot(opts.podRoot, opts.workDir, legacyAgentPodRoot(), podRootHasData)
+	opts.podRoot = podRoot.root
+	logAgentPodRoot(logger, podRoot)
+
 	// --token-file, before anything reads opts.token. A file that is there and
 	// cannot be used is a terminal start failure like the others (it recurs
 	// identically on the next start), so it backs off rather than letting
@@ -214,7 +225,7 @@ func runAgent(args []string) error {
 		}
 	}
 	if cred != nil {
-		storedCAHash = cred.clusterCAPin
+		storedCAHash = cred.ClusterCAPin
 	}
 	plan, err := agentStartPlan(status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
 	if err != nil {
@@ -337,6 +348,20 @@ func runAgent(args []string) error {
 			listenPort:    opts.meshPort,
 			kubeconfig:    kubeconfigPath,
 			refresher:     refresher,
+			// On a RESTART res.Peers is the stored credential's seed, not a list the
+			// cluster just handed out, so the bring-up programs the server peer and
+			// then waits for this LIST instead of trusting the snapshot. plan is the
+			// path actually taken: a resume that fell back to a token join has been
+			// rewritten to startModeTokenJoin above, and that join's peers are live.
+			resume:    plan == startModeReuseCredential,
+			listPeers: meshPeerLister(kubeconfigPath),
+			// ...and the list it waits for becomes the stored seed. Without this the
+			// assignment keeps the join-time snapshot for the life of the node: the
+			// Save above rewrites it from the credential it was just loaded from, so
+			// every restart programs its server peer and its fallback out of state
+			// that only ever gets older. The join path leaves this nil — its Save
+			// carried a live snapshot already.
+			onLivePeers: resumeSeedWriteback(plan, store),
 		}, mode, logger)
 		meshDown = down
 		if err != nil {
@@ -436,17 +461,17 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 		return nil, "", err
 	}
 
-	client, err := bootstrap.NodeIdentityClient(cred.clusterCAPEM, cred.clientCertPEM, cred.clientKeyPEM)
+	client, err := bootstrap.NodeIdentityClient(cred.ClusterCAPEM, cred.ClientCertPEM, cred.ClientKeyPEM)
 	if err != nil {
 		return nil, "", err
 	}
 	logger.Info("resuming from the stored node credential", "node", opts.nodeName,
-		"meshEndpoint", meshEndpoint, "podCIDR", cred.assignment.PodCIDR,
-		"clientCertExpires", cred.clientNotAfter.UTC().Format(time.RFC3339))
+		"meshEndpoint", meshEndpoint, "podCIDR", cred.Assignment.PodCIDR,
+		"clientCertExpires", cred.ClientNotAfter.UTC().Format(time.RFC3339))
 	if err := bootstrap.RefreshMeshEndpoint(ctx, client, "https://"+joinHost, opts.nodeName, meshEndpoint); err != nil {
 		return nil, "", err
 	}
-	res := cred.joinResult(opts.nodeName, meshPriv, meshPub)
+	res := joinResultFrom(cred, opts.nodeName, meshPriv, meshPub)
 	logger.Info("resumed", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	return res, meshEndpoint, nil
 }
@@ -625,6 +650,14 @@ var activeMeshSeam = productionMeshSeam
 // (enrollSelfAndBringUpMesh). See meshBringUp for why the wire DTO does not
 // travel down here.
 //
+// The initial program depends on WHERE the peer snapshot came from. A join just
+// happened, so in.peers is live and is programmed whole. A RESUME (in.resume) is
+// programmed from the stored credential's seed, which is as old as this node's
+// last successful live list — see the Peers field on nodecred.Assignment for that
+// contract — so it is NOT programmed whole: programResumedPeers programs the
+// server peer alone, waits for a live LIST, and hands that list to in.onLivePeers
+// so the seed the NEXT start reads is this start's, not the original join's.
+//
 // It RETURNS a teardown handle, and that return is the point. Nothing used to hold
 // the mesh, so the only Close was the last act of the watcher goroutine — which
 // runs after ctx is already cancelled and therefore races process death: on a
@@ -661,17 +694,32 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	if err := m.Start(ctx); err != nil {
 		return noMeshTeardown, fmt.Errorf("start mesh device: %w", err)
 	}
+	startedAt := time.Now()
 	// The device is UP from here, so every remaining failure hands the caller a
 	// REAL teardown rather than the no-op: a half-built bring-up still owns a utun,
 	// and the caller's deferred handle is the only thing that will release it.
 	teardown := meshTeardown(m.Close)
-	if err := m.Reconcile(ctx, in.peers); err != nil {
+
+	// The watcher's REST config is loaded BEFORE the initial program because the
+	// resume path needs the host the resumed kubeconfig targets to pick the server
+	// peer out of the seed. Its error is CARRIED rather than returned here: on the
+	// join path the initial program has always run before a bad kubeconfig ends the
+	// bring-up, and that order is preserved exactly.
+	restCfg, restErr := clientcmd.BuildConfigFromFlags("", in.kubeconfig)
+	if in.resume {
+		// The resume path reports it IMMEDIATELY. A kubeconfig that will not load is
+		// a bring-up that cannot list peers and cannot start a watcher, so spending
+		// the whole first-sync bound discovering that would only delay the same
+		// failure — and the pre-B308 code returned it here, before any wait existed.
+		if restErr != nil {
+			return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", restErr)
+		}
+		programResumedPeers(ctx, m, in, restConfigHost(restCfg), startedAt, logger)
+	} else if err := m.Reconcile(ctx, in.peers); err != nil {
 		logger.Error("initial mesh reconcile", "err", err)
 	}
-
-	restCfg, err := clientcmd.BuildConfigFromFlags("", in.kubeconfig)
-	if err != nil {
-		return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", err)
+	if restErr != nil {
+		return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", restErr)
 	}
 	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger)
 	if err != nil {
@@ -701,6 +749,238 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	return teardown, nil
 }
 
+// meshFirstSyncTimeout bounds how long a RESUMING node waits for a live MeshPeer
+// list before it falls back to programming its stored seed.
+//
+// It is a BOUND, not a budget: the list is one GET against an apiserver this node
+// is already about to watch, and it normally answers in milliseconds. 30s is
+// generous because the thing being waited for is the whole reason the wait exists
+// — the apiserver may only become reachable once the server peer programmed a
+// moment earlier has completed its handshake — and because the cost of waiting is
+// a delayed node registration, while the cost of not waiting is programming a
+// stale peer set into the kernel.
+const meshFirstSyncTimeout = 30 * time.Second
+
+// meshPeerPollInterval is the retry cadence inside that bound. One second is the
+// same order as the handshake it is usually waiting on; a tighter loop would only
+// spend dials on an apiserver that is not yet reachable.
+const meshPeerPollInterval = time.Second
+
+// meshPeerAttemptTimeout bounds ONE list attempt — both as the REST client's own
+// request timeout (meshPeerLister) and as the per-attempt context deadline
+// (listMeshPeersOnce). Without it the bound above is a promise the code cannot
+// keep: the agent's signal context carries no deadline, so a connection that is
+// accepted and then never answered blocks node start indefinitely, which is the
+// failure shape a bound exists to convert into a retry.
+//
+// 5s is a bound, not a budget: this is one GET against a LAN apiserver one
+// wireguard hop away, and it leaves the 30s bound room for several attempts.
+const meshPeerAttemptTimeout = 5 * time.Second
+
+// programResumedPeers performs the initial peer program on the RESUME path.
+//
+// The seed in the stored credential is a snapshot taken at this node's last join
+// or last successful resume, so programming it whole means programming, into the
+// kernel device, whatever the cluster looked like then — for the whole window
+// until the MeshPeer watcher's first sync. A peer removed or re-keyed since then is
+// programmed anyway, and because the enroller's free-index scan recycles a removed
+// node's index (lowestFreeNodeIndex), a stale entry can name the OLD node's public
+// key for a pod /24 a DIFFERENT node now owns: traffic for that /24 is encrypted to
+// a key nobody holds.
+//
+// So the seed is used for exactly two things, both narrow:
+//
+//   - the SERVER peer, programmed alone, because the live list has to be fetched
+//     from the apiserver and on a mesh-posture cluster that apiserver is reachable
+//     only through the tunnel to the server. It is selected by serverPeerFromSeed,
+//     which is a structural match (whose AllowedIPs cover the apiserver host), not
+//     a name; an entry that stale would be a server that changed key, which is a
+//     rejoin, not a restart. When nothing matches, nothing is programmed and the
+//     apiserver is reached over the underlay.
+//   - the FALLBACK, after the bound expires, because a node with a possibly-stale
+//     peer set is still better than a node with none, and the watcher — started
+//     immediately after this returns — replaces it on its first sync.
+//
+// When the live list DOES arrive it is also handed to in.onLivePeers, which
+// persists it as the new seed, so both of those uses are made from progressively
+// fresher state on each restart instead of from a snapshot that never moves.
+//
+// It does not return an error: every failure here degrades to a peer set the
+// watcher will correct, and none of them is a reason to refuse a mesh that is
+// already up.
+func programResumedPeers(ctx context.Context, m meshDatapath, in meshBringUp, apiserverHost string, startedAt time.Time, logger *slog.Logger) {
+	if server, ok := serverPeerFromSeed(in.peers, apiserverHost); ok {
+		if err := m.Reconcile(ctx, []netv1.MeshPeerSpec{server}); err != nil {
+			logger.Error("initial mesh reconcile of the server peer from the stored seed", "err", err)
+		}
+	} else {
+		logger.Info("the stored peer seed names no peer covering this node's apiserver; programming no peers until the live MeshPeer list arrives",
+			"apiserver", apiserverHost, "seedPeers", len(in.peers))
+	}
+	bound := in.firstSyncTimeout
+	if bound <= 0 {
+		bound = meshFirstSyncTimeout
+	}
+	live, err := pollMeshPeers(ctx, in.listPeers, bound)
+	if err != nil {
+		logger.Warn("no live MeshPeer list within the first-sync bound; programming the stored seed as the fallback until the MeshPeer watcher's first sync replaces it",
+			"bound", bound, "seedPeers", len(in.peers), "err", err)
+		if err := m.Reconcile(ctx, in.peers); err != nil {
+			logger.Error("fallback mesh reconcile of the stored seed", "err", err)
+		}
+		return
+	}
+	if err := m.Reconcile(ctx, live); err != nil {
+		logger.Error("initial mesh reconcile of the live MeshPeer list", "err", err)
+	}
+	// The same live list becomes the stored seed, so the NEXT start's server-peer
+	// selection and its fallback are made from what the cluster looked like at
+	// this start rather than at the original join. It runs after the Reconcile and
+	// only on this branch: a list that was never obtained is not a seed, and a
+	// device that is already correct must not be held up by a file write. The copy
+	// is defensive — the slice is handed to a writer that outlives this call only
+	// as bytes, but the device holds the original.
+	if in.onLivePeers != nil {
+		if err := in.onLivePeers(slices.Clone(live)); err != nil {
+			logger.Warn("could not persist the live MeshPeer list as this node's stored seed; the mesh is correct, but the next start falls back to the older seed",
+				"livePeers", len(live), "err", err)
+		}
+	}
+	logger.Info("programmed the live MeshPeer list on resume",
+		"window", time.Since(startedAt), "seedPeers", len(in.peers), "livePeers", len(live),
+		"staleSeedPeers", staleSeedPeers(in.peers, live))
+}
+
+// pollMeshPeers calls list until it answers or bound elapses, retrying every
+// meshPeerPollInterval.
+//
+// Both waits are CLAMPED to the time left. The sleep is, so a bound shorter than
+// the interval still retries once at the bound rather than returning early; and
+// every ATTEMPT is, because the caller's ctx is the agent's signal context and has
+// no deadline of its own — a single TCP or TLS attempt against an apiserver that
+// accepts and then never answers would otherwise hang here forever and hold node
+// start past a bound this function's whole contract is to enforce. "The bound" must
+// have one meaning: how long a resuming node runs with only its server peer
+// programmed.
+//
+// A nil list is an immediate failure, not a nil-deref: a bring-up wired without a
+// lister is one that must fall back to its seed.
+func pollMeshPeers(ctx context.Context, list func(context.Context) ([]netv1.MeshPeerSpec, error), bound time.Duration) ([]netv1.MeshPeerSpec, error) {
+	if list == nil {
+		return nil, errors.New("no MeshPeer lister wired for this bring-up")
+	}
+	deadline := time.Now().Add(bound)
+	var err error
+	for {
+		var peers []netv1.MeshPeerSpec
+		if peers, err = listMeshPeersOnce(ctx, list, deadline); err == nil {
+			return peers, nil
+		}
+		// The CALLER's cancellation is terminal — retrying it would spin until the
+		// bound on a context that will never recover. A per-attempt deadline is not:
+		// that is the retry this loop exists for.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, err
+		}
+		wait := min(remaining, meshPeerPollInterval)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// listMeshPeersOnce runs one attempt under its own deadline: meshPeerAttemptTimeout,
+// or the time left until the poll's deadline when that is sooner — an attempt is
+// never allowed to outlive the bound it is being made inside.
+func listMeshPeersOnce(ctx context.Context, list func(context.Context) ([]netv1.MeshPeerSpec, error), deadline time.Time) ([]netv1.MeshPeerSpec, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, min(meshPeerAttemptTimeout, time.Until(deadline)))
+	defer cancel()
+	return list(attemptCtx)
+}
+
+// serverPeerFromSeed picks, out of a stored peer seed, the peer whose mesh
+// addresses cover the apiserver this node's kubeconfig targets — the one peer a
+// resuming node must program before it can ask the cluster anything.
+//
+// The match is on AllowedIPs (falling back to the peer's pod /24 when a spec
+// carries none), because that is the routing fact in question: the peer that
+// carries traffic for the apiserver's address is by definition the one whose
+// tunnel the LIST must traverse. Matching on a name or an index would encode a
+// convention; this encodes the route.
+//
+// Containment is a UNIQUE selector because mesh index 0 belongs to the
+// control-plane node alone: EnrollSelf pins it (meshEnroller, enroll.go) and
+// lowestFreeNodeIndex only ever hands out indices ≥ 1, so the index recycling that
+// makes a stale worker entry dangerous can never produce a worker /24 overlapping
+// the server's AllowedIPs. At most one seed entry can cover the apiserver's
+// address.
+//
+// A host that is not an IP literal — a DNS name, an empty kubeconfig host — matches
+// nothing, deliberately: resolving it would need the very tunnel being programmed.
+func serverPeerFromSeed(peers []netv1.MeshPeerSpec, apiserverHost string) (netv1.MeshPeerSpec, bool) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(apiserverHost))
+	if err != nil {
+		return netv1.MeshPeerSpec{}, false
+	}
+	for _, peer := range peers {
+		ranges := peer.AllowedIPs
+		if len(ranges) == 0 && peer.PodCIDR != "" {
+			ranges = []string{peer.PodCIDR}
+		}
+		for _, cidr := range ranges {
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(cidr))
+			if err != nil {
+				continue
+			}
+			if prefix.Contains(addr) {
+				return peer, true
+			}
+		}
+	}
+	return netv1.MeshPeerSpec{}, false
+}
+
+// staleSeedPeers counts the seed entries the live list does not name — the size of
+// the divergence the resume path exists to avoid programming. It is reported, not
+// acted on: the live list is programmed whole either way.
+func staleSeedPeers(seed, live []netv1.MeshPeerSpec) int {
+	current := make(map[string]struct{}, len(live))
+	for _, peer := range live {
+		current[peer.NodeName] = struct{}{}
+	}
+	stale := 0
+	for _, peer := range seed {
+		if _, ok := current[peer.NodeName]; !ok {
+			stale++
+		}
+	}
+	return stale
+}
+
+// restConfigHost returns the bare host of the apiserver a REST config targets,
+// or "" when there is none to read. It tolerates both forms clientcmd can leave
+// behind — a full URL and a bare host:port — because the caller only wants the
+// address, and a parse failure here must degrade to "no server peer", never panic
+// a bring-up.
+func restConfigHost(cfg *rest.Config) string {
+	if cfg == nil || strings.TrimSpace(cfg.Host) == "" {
+		return ""
+	}
+	if u, err := url.Parse(cfg.Host); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	if host, _, err := net.SplitHostPort(cfg.Host); err == nil {
+		return host
+	}
+	return cfg.Host
+}
+
 // startWorkerNetserve brings up the joined worker's node-local datapath — the
 // userspace Service proxy (ClusterIP + NodePort, sourced from this node's
 // mesh-egress /32) and the per-node cluster DNS resolver bound to the DNS VIP — as
@@ -713,13 +993,9 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 // a guest's two-address identity and this is the proxy that must learn the live
 // one.
 func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, kubeconfigPath string, logger *slog.Logger) (*netserve.Server, error) {
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	_, cs, err := kubeclient.FromPath(kubeconfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("load node kubeconfig for node-local datapath: %w", err)
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, fmt.Errorf("build client for node-local datapath: %w", err)
 	}
 	// The vm-capability question is asked HERE, before the datapath is built and
 	// before the VK node exists — through runtimed's own safe host probe, the same

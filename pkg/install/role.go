@@ -48,8 +48,8 @@ import (
 // role change costs an operator one extra command and no state.
 func refuseCrossRole(sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
-	other := cfg.Role.other()
-	path := cfg.plistPath(other.daemonLabel())
+	other := cfg.Role.Other()
+	path := cfg.plistPath(daemonLabel(other))
 	switch _, err := sys.ReadFile(path); {
 	case err == nil:
 		return fmt.Errorf("install: this Mac is already installed as a k3sm %s (%s is on disk) and a node is one role or the other, never both: run `k3sm uninstall` first, then install the %s role (uninstall keeps the data root, the logs and the arguments you configured)",
@@ -79,8 +79,8 @@ func refuseCrossRole(sys System, cfg Config) error {
 func uninstallManifest(sys System, cfg Config) []artifact {
 	cfg = cfg.withDefaults()
 	m := artifactManifest(cfg)
-	other := cfg.Role.other()
-	path := cfg.plistPath(other.daemonLabel())
+	other := cfg.Role.Other()
+	path := cfg.plistPath(daemonLabel(other))
 	switch _, err := sys.ReadFile(path); {
 	case errors.Is(err, fs.ErrNotExist):
 		return m

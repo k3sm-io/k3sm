@@ -35,7 +35,6 @@ import (
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 
 	crdconfig "k3sm.io/apis/config/crd"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -49,6 +48,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
@@ -337,8 +337,7 @@ func runServer(args []string) (err error) {
 	defer stop()
 	if rec := breaker.load(); rec.Tripped() {
 		last, _ := rec.Last()
-		logger.Error("crash-loop breaker tripped; parking the control plane until an operator clears the record",
-			"path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
+		logger.Error(parkReason(last), "path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
 			"last-component", last.Component, "crashes-in-window", rec.Recent(time.Now()),
 			"clear-with", "k3sm server --clear-crashloop")
 		return parkUntilCleared(ctx, breaker.path, crashLoopPollInterval, logger)
@@ -549,10 +548,22 @@ func runServer(args []string) (err error) {
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
+		// A bring-up failure never reaches OnComponentExit — the callback fires
+		// only for a component that was already marked supervised, and Start
+		// returns here only after it has torn every component down — so this is
+		// the ONE place a control plane that never came up gets counted. Without
+		// it the breaker saw post-mark crashes only, and a persistent bring-up
+		// fault (a kine that cannot open its database, an apiserver whose flags
+		// no longer parse) looped under the plist's bare KeepAlive forever. The
+		// recording happens here rather than in pkg/executor because the breaker
+		// is the daemon's memory, not the executor's.
+		noteBringUpFailure(breaker, logger, err)
 		return fmt.Errorf("start control plane: %w", err)
 	}
 	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		// executor.StopBound, not a literal: it is one named stage of the plist's
+		// ExitTimeOut, which pkg/install derives from this same symbol.
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executor.StopBound)
 		defer cancel()
 		if err := exec.Stop(shutCtx); err != nil {
 			logger.Error("control-plane shutdown", "err", err)
@@ -565,13 +576,9 @@ func runServer(args []string) (err error) {
 	defer healthyReset.Stop()
 
 	// 2. Client for the post-bring-up provisioning + Service watch.
-	restCfg, err := clientcmd.BuildConfigFromFlags("", exec.Kubeconfig())
+	restCfg, cs, err := kubeclient.FromPath(exec.Kubeconfig())
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return fmt.Errorf("build client: %w", err)
 	}
 
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.

@@ -53,15 +53,26 @@ func (c Collector) Collect(ctx context.Context) Report {
 		now = c.Now
 	}
 
+	// Which node this Mac IS decides which daemon is probed and which rows the
+	// report carries. It is read from the plists on disk before anything else,
+	// because every row below is about one role or the other.
+	role, _, bothRoles := c.installedRole()
+
 	dataRoot, volume := c.dataRootRow(ctx)
-	install, installed := c.installRow(volume != nil)
+	instRow, installed := c.installRow(volume != nil, role, bothRoles)
 	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
-	server, serverPID := c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
-	c.crashLoop(&server)
+	var node Row
+	var nodePID int
+	if role == dataroot.RoleAgent {
+		node, nodePID = c.agentRow(now())
+	} else {
+		node, nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
+		c.crashLoop(&node)
+	}
 	apiserver := c.apiserverRow(ctx)
 	serving := apiserver.Severity == SeverityOK
 
-	rows := []Row{install}
+	rows := []Row{instRow}
 	// The mount oneshot goes before netd, mirroring the order install lays the
 	// three daemons down in, and exists only on a Mac that has a data volume:
 	// every other Mac would get a row saying "not loaded" about a daemon it was
@@ -71,7 +82,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	}
 	rows = append(rows,
 		netd,
-		server,
+		node,
 	)
 	// Immediately after the server it describes, and only when there is a plist
 	// to read it from: on a Mac with no install the row would say nothing the
@@ -82,7 +93,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	rows = append(rows,
 		apiserver,
 		c.nodeRow(ctx, serving),
-		c.workloadsRow(ctx, serving, serverPID),
+		c.workloadsRow(ctx, serving, nodePID),
 		dataRoot,
 	)
 	// Immediately after the data root it sits beside, and only while it is
@@ -97,9 +108,10 @@ func (c Collector) Collect(ctx context.Context) Report {
 		c.runtimedRow(ctx),
 	)
 
-	verdict, summary, next := Aggregate(rows, installed)
+	verdict, summary, next := Aggregate(rows, installed, role)
 	return Report{
 		Verdict:   verdict,
+		Role:      role,
 		Summary:   summary,
 		Rows:      rows,
 		Next:      next,
@@ -124,17 +136,20 @@ func (c Collector) plistPath(label string) string {
 }
 
 // installRow reports the on-disk install: the binary, the /usr/local/bin
-// launcher symlink, and the two LaunchDaemon plists.
+// launcher symlink, and the LaunchDaemon plists of the role this Mac carries.
 //
 // It also decides `installed`, which gates the whole verdict — and does so on
-// the BINARY plus the SERVER plist, not on all four parts, because a machine
-// with those two has a cluster to report on even if the launcher link was
-// removed by hand.
-func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
+// the BINARY plus THIS ROLE's node-daemon plist, not on all four parts, because
+// a machine with those two has a node to report on even if the launcher link
+// was removed by hand. Keying it on the server plist alone is what made a
+// perfectly good worker report "not installed": an agent Mac has no
+// io.k3sm.server.plist and never will.
+func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles bool) (Row, bool) {
 	row := Row{Name: RowInstall, Remedy: "sudo k3sm install"}
 	binary := c.exists(c.Paths.Binary)
 	netdPlist := c.exists(c.plistPath(c.Paths.NetdLabel))
-	serverPlist := c.exists(c.plistPath(c.Paths.ServerLabel))
+	nodeLabel := c.nodeLabel(role)
+	nodePlist := c.exists(c.plistPath(nodeLabel))
 	// The mount oneshot is counted when it is THERE and demanded when a record
 	// says it should be. Those are different conditions on purpose: a Mac with
 	// no data volume is complete without it, and a plist left behind by a
@@ -148,7 +163,7 @@ func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
 			link = target == c.Paths.Binary
 		}
 	}
-	installed := binary && serverPlist
+	installed := binary && nodePlist
 
 	var missing []string
 	if !binary {
@@ -160,8 +175,8 @@ func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
 	if !netdPlist {
 		missing = append(missing, c.Paths.NetdLabel+".plist")
 	}
-	if !serverPlist {
-		missing = append(missing, c.Paths.ServerLabel+".plist")
+	if !nodePlist {
+		missing = append(missing, nodeLabel+".plist")
 	}
 	// parts is how many pieces a COMPLETE install has here, so the all-missing
 	// arm below stays "every piece is gone" rather than a hard-coded four that a
@@ -173,9 +188,18 @@ func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
 			missing = append(missing, c.Paths.DatavolLabel+".plist")
 		}
 	}
-	daemons := 2
+	// The count is of the plists actually on disk, so a Mac that somehow
+	// carries both node daemons is not described with a number that quietly
+	// omits one of them.
+	daemons := 1 // netd
+	if nodePlist {
+		daemons++
+	}
+	if bothRoles {
+		daemons++
+	}
 	if datavolPlist {
-		daemons = 3
+		daemons++
 	}
 
 	switch {
@@ -189,10 +213,20 @@ func (c Collector) installRow(hasDataVolume bool) (Row, bool) {
 		row.State, row.Severity = StatePartial, SeverityWarn
 		row.Detail = "missing: " + strings.Join(missing, ", ")
 	}
+	// A Mac carrying BOTH node daemons is a posture `k3sm install` refuses to
+	// create, so it is said out loud rather than hidden behind a role the
+	// report picked: the operator has to know which daemon is being described.
+	// The severity is left where the missing-parts arms put it — the row
+	// describes an install, and neither daemon is missing here.
+	if bothRoles {
+		row.Detail += fmt.Sprintf(" · both node daemons are on disk (%s as well); reporting the %s role",
+			c.Paths.AgentLabel, dataroot.RoleServer)
+	}
 	row.Wide = map[string]string{
 		"binary": c.Paths.Binary,
 		"link":   c.Paths.Link,
 		"plists": c.Paths.LaunchDaemonDir,
+		"role":   string(role),
 	}
 	return row, installed
 }

@@ -49,7 +49,7 @@ func TestCrashRecordTripsAtThresholdInsideWindow(t *testing.T) {
 			now := t0
 			for i := 0; i < tc.crashes; i++ {
 				now = t0.Add(time.Duration(i) * tc.spacing)
-				if r.Record(now, "kine", "tail") {
+				if r.Record(now, CrashOriginCrash, "kine", "tail") {
 					tripped = true
 				}
 			}
@@ -67,7 +67,7 @@ func TestCrashRecordTripPersistsThroughPruneUntilCleared(t *testing.T) {
 	t0 := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	var r CrashRecord
 	for i := 0; i < CrashLoopThreshold; i++ {
-		r.Record(t0.Add(time.Duration(i)*time.Second), "kube-apiserver", "tail")
+		r.Record(t0.Add(time.Duration(i)*time.Second), CrashOriginCrash, "kube-apiserver", "tail")
 	}
 	if !r.Tripped() {
 		t.Fatal("not tripped after the threshold")
@@ -82,7 +82,7 @@ func TestCrashRecordTripPersistsThroughPruneUntilCleared(t *testing.T) {
 		t.Fatal("Prune cleared the trip; only ClearCrashRecord may")
 	}
 	// Recording again while tripped does not report a second trip.
-	if r.Record(t0.Add(25*time.Hour), "kine", "tail") {
+	if r.Record(t0.Add(25*time.Hour), CrashOriginCrash, "kine", "tail") {
 		t.Fatal("Record reported a trip on an already-tripped record")
 	}
 }
@@ -100,6 +100,49 @@ func TestCrashRecordKeepsFutureDatedCrashes(t *testing.T) {
 	}
 }
 
+// TestParseCrashRecordReadsAPreOriginRecord is the compatibility case that
+// matters on upgrade: a record written by a daemon that predates the origin
+// field has no "origin" key at all, and every reader of it — the daemon's park
+// message, `k3sm status`, the installer's post-restart check — must treat those
+// entries as crashes rather than inventing a distinction the file does not
+// carry. The JSON is hand-written on purpose: marshalling a Crash here would
+// test the round trip of today's struct, not yesterday's file.
+func TestParseCrashRecordReadsAPreOriginRecord(t *testing.T) {
+	const preB315 = `{
+  "crashes": [
+    {
+      "at": "2026-09-09T12:00:00Z",
+      "component": "kube-apiserver",
+      "detail": "E0909 apiserver: boom"
+    }
+  ],
+  "tripped_at": "2026-09-09T12:00:00Z"
+}`
+	rec, err := ParseCrashRecord([]byte(preB315))
+	if err != nil {
+		t.Fatalf("a record written before the origin field must still parse: %v", err)
+	}
+	if len(rec.Crashes) != 1 || !rec.Tripped() {
+		t.Fatalf("parse lost the record's shape: %+v", rec)
+	}
+	last, ok := rec.Last()
+	if !ok {
+		t.Fatal("no last entry")
+	}
+	if last.Component != "kube-apiserver" || last.Detail != "E0909 apiserver: boom" {
+		t.Fatalf("parse lost the entry: %+v", last)
+	}
+	// The absent key reads as the zero value, and every consumer compares
+	// against CrashOriginBringUp — so an old record is a crash, which is what it
+	// is: the daemon that wrote it counted nothing else.
+	if last.Origin != "" {
+		t.Errorf("origin = %q for a record that has no origin key, want the zero value", last.Origin)
+	}
+	if last.Origin == CrashOriginBringUp {
+		t.Error("a pre-origin record must never read as a bring-up failure")
+	}
+}
+
 func TestCrashRecordFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := CrashLoopPath(dir)
@@ -114,7 +157,7 @@ func TestCrashRecordFileRoundTrip(t *testing.T) {
 	}
 
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	r.Record(now, "kube-scheduler", "E0909 scheduler: boom")
+	r.Record(now, CrashOriginBringUp, "kube-scheduler", "E0909 scheduler: boom")
 	if err := WriteCrashRecord(path, r); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +179,11 @@ func TestCrashRecordFileRoundTrip(t *testing.T) {
 	last, ok := back.Last()
 	if !ok || last.Component != "kube-scheduler" || !last.At.Equal(now) || last.Detail != "E0909 scheduler: boom" {
 		t.Fatalf("round trip lost the crash: %+v", back)
+	}
+	// The origin survives the round trip: a parked daemon's message says whether
+	// the control plane died or never came up, and it reads that from here.
+	if last.Origin != CrashOriginBringUp {
+		t.Fatalf("round trip lost the origin: %q, want %q", last.Origin, CrashOriginBringUp)
 	}
 
 	// Clear removes it, and clearing twice is still success.

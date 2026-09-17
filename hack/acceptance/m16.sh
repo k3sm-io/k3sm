@@ -23,7 +23,14 @@
 #   m16.1b  rbac         the operator ClusterRole re-asserted LIVE against the
 #                        pinned grant (no wildcard verb/resource, no stray secrets).
 #   m16.2   conversion   a v1alpha1 read of a v1beta1 object answers through the
-#                        conversion webhook's ClusterIP.
+#                        conversion webhook's ClusterIP. Its proof already exists,
+#                        as the two e2e tests the plan's R14 names — they carry no
+#                        TestM16 prefix by design, so this rung selects them with
+#                        the -run pattern verbatim:
+#                          go test -tags e2e -run '^Test(Admission|Conversion)WebhookDeliveryThroughProxy$' -timeout 20m ./e2e/
+#                        TestAdmissionWebhookDeliveryThroughProxy covers the
+#                        operator's OTHER service-referenced webhook (validating
+#                        admission) over the same path; both back a vm Pod.
 #   m16.3   worker       fleet.yaml applied, the worker Running, mlx.k3sm.io/gpu in
 #                        requests == limits and memory request == limit.
 #   m16.4   discovery    the worker is named in the discovery metadata.

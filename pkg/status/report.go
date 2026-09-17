@@ -19,6 +19,7 @@ package status
 import (
 	"time"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -46,9 +47,17 @@ const (
 	StatePartial    RowState = "partial"
 	StateMissing    RowState = "missing"
 	StateSkip       RowState = "skip"
-	StateUnknown    RowState = "unknown"
-	StateHealthy    RowState = "healthy"
-	StateUnhealthy  RowState = "unhealthy"
+	// StateWaiting, StateExpired and StateCorrupt are the joining worker's
+	// credential words: a daemon that is up and has never joined, one whose
+	// node certificate has run out, and one whose stored credential does not
+	// parse. They describe the CREDENTIAL, not the launchd job, which is why
+	// they are distinct from stopped/failed — the pid is fine in all three.
+	StateWaiting   RowState = "waiting"
+	StateExpired   RowState = "expired"
+	StateCorrupt   RowState = "corrupt"
+	StateUnknown   RowState = "unknown"
+	StateHealthy   RowState = "healthy"
+	StateUnhealthy RowState = "unhealthy"
 )
 
 // Row is one subsystem's line in the report.
@@ -83,14 +92,19 @@ type PeerStatus struct {
 // `k3sm status -o json`; the text screen is rendered FROM it and never the
 // other way round, so the two can never disagree.
 type Report struct {
-	Verdict   Verdict      `json:"verdict"`
-	Summary   string       `json:"summary"`
-	Rows      []Row        `json:"rows"`
-	Next      []string     `json:"next,omitempty"`
-	Peers     []PeerStatus `json:"peers,omitempty"`
-	Version   version.Info `json:"version"`
-	Host      string       `json:"host"`
-	Timestamp time.Time    `json:"timestamp"`
+	Verdict Verdict `json:"verdict"`
+	// Role is which node this Mac is installed as, decided from the two
+	// node-daemon plists on disk (dataroot.RoleFromPlists). It picks the rows
+	// the screens render and the daemon the verdict is about, so it is part of
+	// the machine interface rather than a decoration.
+	Role      dataroot.Role `json:"role"`
+	Summary   string        `json:"summary"`
+	Rows      []Row         `json:"rows"`
+	Next      []string      `json:"next,omitempty"`
+	Peers     []PeerStatus  `json:"peers,omitempty"`
+	Version   version.Info  `json:"version"`
+	Host      string        `json:"host"`
+	Timestamp time.Time     `json:"timestamp"`
 }
 
 // Row returns the named row and whether it was present.

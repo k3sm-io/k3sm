@@ -17,9 +17,14 @@ limitations under the License.
 package provider
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync"
+
+	corev1 "k8s.io/api/core/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -130,6 +135,45 @@ func (f *transportFeed) drop(podID string) {
 	f.republishLocked()
 }
 
+// has reports whether podID currently holds an override — the exact predicate
+// observeTransport maintains, read back under the same lock, so the readiness
+// gate and the Service proxy can never disagree about whether a pod is dialable.
+//
+// A nil (inert) feed holds no leases and answers false. The readiness gate's
+// no-sink case is decided at its own call site (transportGateFor) rather than
+// here, because "this node runs no Service proxy" and "this pod has no lease"
+// are different facts and only the latter belongs in the lease map.
+func (f *transportFeed) has(podID string) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.leases[podID]
+	return ok
+}
+
+// live returns podID's LIVE transport address — the lease the guest reported and
+// the value the Service proxy's override map carries for it — and whether one is
+// held at all. It reads the SAME map has and republishLocked read, under the same
+// lock, so the probe dial (probeDialFor), the readiness gate and the proxy can
+// never disagree about where a pod is dialable.
+//
+// A nil (inert) feed holds no leases and answers false; its callers decide what
+// that means for them, exactly as has documents.
+func (f *transportFeed) live(podID string) (netip.Addr, bool) {
+	if f == nil {
+		return netip.Addr{}, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	l, ok := f.leases[podID]
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return l.live, true
+}
+
 // republishLocked derives the FULL current map from the tracked lease state and
 // hands it to the sink. Callers hold mu.
 func (f *transportFeed) republishLocked() {
@@ -219,4 +263,105 @@ func (r *runtimedRuntime) observeTransport(podID string, rs *runtimev1.PodStatus
 		return
 	}
 	r.transport.observe(podID, gn.PodIP.Unmap(), live)
+}
+
+// transportGateFor computes the pod-level readiness precondition for pod: whether
+// the Service proxy can dial it at the published address its EndpointSlice will
+// carry. It is the SAME predicate observeTransport maintains — one lease map,
+// read back — so the window it closes cannot reopen through a second notion of
+// "installed".
+//
+// It answers transportReady for everything that is not a vm pod waiting on a
+// lease, in three cases that are each a different fact:
+//   - no sink is configured (the --network none / no-datapath posture): there is
+//     no dial path to withhold readiness for, and gating on a feed nothing will
+//     ever fill would strand every vm pod NotReady forever;
+//   - the pod is not vm-backed: its published /32 is live on lo0 and is dialed
+//     directly, with no override in the picture at any point in its life;
+//   - its RuntimeClass does not resolve: CreatePod already refused such a pod, so
+//     there is no running workload to gate — fail toward the pre-existing
+//     behaviour rather than inventing a NotReady for a pod that cannot exist. That
+//     upstream refusal is pinned by TestToPodBoxUnknownRuntimeClassFailsClosed
+//     (translate_test.go); a change to toPodBox's error path re-opens this branch
+//     and must re-audit it.
+func (r *runtimedRuntime) transportGateFor(pod *corev1.Pod) transportGate {
+	if pod == nil || r.transport == nil {
+		return transportReady
+	}
+	backend, err := podSandboxBackend(pod)
+	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		return transportReady
+	}
+	if r.transport.has(string(pod.UID)) {
+		return transportReady
+	}
+	return transportPending
+}
+
+// probeDialFor returns the dial one pod's probes use — the third consumer of the
+// two-address model, after the Service proxy's override map and the readiness
+// gate, and the one that dials on this node's own behalf.
+//
+// WHY A PROBE CANNOT USE THE PUBLISHED ADDRESS. Every probe target is resolved
+// once, at CreatePod (buildCheck), and defaults to the pod's published /32. For a
+// vm pod that /32 is live on NO interface — it is the pod's cluster identity, not
+// a route — and the address that carries bytes is the guest's DHCP lease, which
+// arrives LATER (through the status stream) and changes on every guest restart. A
+// probe dialed at the published address therefore never answers: readiness would
+// stay false forever and liveness would restart a perfectly healthy guest. The
+// resolution is made PER ATTEMPT rather than at build time for the same reason
+// the override map is rebuilt per observation — a lease is not an identity.
+//
+// A native pod gets r.dial verbatim, so its probes are byte-identical to what they
+// were before this seam existed. So does a vm pod on a node with no feed (the
+// --network none / no-datapath posture): there is no lease map to resolve
+// through, and withholding every probe on a feed nothing will ever fill would
+// strand the pod — the same carve-out, for the same reason, as transportGateFor's
+// no-sink case.
+//
+// The PENDING window is reported, never dialed and never guessed: while the pod
+// holds no lease the returned dial answers errProbeTargetPending, which the probe
+// runner treats as NOT EVALUATED (no success, no failureThreshold progress — see
+// runCheck). Dialing the published address "just to see" would count a certain
+// failure against a window this node owns, and substituting the node IP would
+// probe the wrong process entirely.
+//
+// Only the pod's OWN address is rewritten: a probe carrying an explicit
+// tcpSocket.Host / httpGet.Host names some other target and is dialed verbatim.
+// The comparison is against the node's own guest record — the same authority
+// observeTransport keys the override on — so the probe and the proxy translate
+// one identity to one lease.
+func (r *runtimedRuntime) probeDialFor(podID string, vmBacked bool) dialFunc {
+	if !vmBacked || r.transport == nil {
+		return r.dial
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		live, ok := r.transport.live(podID)
+		if !ok {
+			return nil, fmt.Errorf("pod %s: the guest has not reported its transport address yet, "+
+				"so %s is not dialable: %w", podID, address, errProbeTargetPending)
+		}
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			// Not a host:port target (no probe handler builds one), so there is
+			// nothing to translate — dial it exactly as asked.
+			return r.dial(ctx, network, address)
+		}
+		// SINGLE-ADDRESS ASSUMPTION, stated because it is load-bearing and silent
+		// if it ever stops holding: a pod has exactly ONE published address here —
+		// the single /32 SetupGuest allocated (sandbox.GuestNetworkConfig.PodIP) —
+		// and exactly one lease, so "the pod's own address" is an equality test.
+		// The day a pod carries several (a second family for dual-stack, or a
+		// multi-homed guest), status.podIPs and the lease both become lists, and
+		// this comparison must be revisited into a per-family match rather than
+		// quietly matching only whichever address happens to be first. It fails
+		// toward today's behaviour — an unmatched host is dialed verbatim — so the
+		// symptom would be an unresolved probe, not a misdirected one.
+		if gn, recorded := r.guestNetwork(podID); recorded && gn.PodIP.IsValid() {
+			if h, perr := netip.ParseAddr(host); perr == nil && h.Unmap() == gn.PodIP.Unmap() {
+				address = net.JoinHostPort(live.String(), port)
+			}
+		}
+		return r.dial(ctx, network, address)
+	}
 }

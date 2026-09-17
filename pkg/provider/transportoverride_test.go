@@ -62,18 +62,27 @@ type leaseRuntimeServer struct {
 	// default so this file's own cases keep an EMPTY pod_ip: the override key must
 	// come from the node's guest record, never from a status the test could shape.
 	echoPodIP bool
+	// createStatus makes CreatePod ANSWER with a status, the way the real runtimed
+	// does (its CreatePod returns podStatus, whose pod_ip is the created box's) —
+	// which is what puts a pod's PUBLISHED /32 in front of startProber. OFF by
+	// default for this file's own cases, whose lease-free create snapshot would
+	// race a pushed lease (see the type comment).
+	createStatus bool
 
-	mu     sync.Mutex
-	live   map[string]struct{}
-	boxIPs map[string]string // pod id -> the PodBox.pod_ip the provider sent
+	mu         sync.Mutex
+	live       map[string]struct{}
+	boxIPs     map[string]string // pod id -> the PodBox.pod_ip the provider sent
+	transports map[string]string // pod id -> the LAST lease pushed for it
+	restarts   int               // RestartContainer RPCs received
 }
 
 func newLeaseRuntimeServer(echoPodIP bool) *leaseRuntimeServer {
 	return &leaseRuntimeServer{
-		events:    make(chan *runtimev1.PodStatusEvent, 16),
-		echoPodIP: echoPodIP,
-		live:      map[string]struct{}{},
-		boxIPs:    map[string]string{},
+		events:     make(chan *runtimev1.PodStatusEvent, 16),
+		echoPodIP:  echoPodIP,
+		live:       map[string]struct{}{},
+		boxIPs:     map[string]string{},
+		transports: map[string]string{},
 	}
 }
 
@@ -81,8 +90,31 @@ func (s *leaseRuntimeServer) CreatePod(_ context.Context, req *runtimev1.CreateP
 	s.mu.Lock()
 	s.live[req.GetPod().GetPodId()] = struct{}{}
 	s.boxIPs[req.GetPod().GetPodId()] = req.GetPod().GetPodIp()
+	create := s.createStatus
 	s.mu.Unlock()
-	return &runtimev1.CreatePodResponse{}, nil
+	if !create {
+		return &runtimev1.CreatePodResponse{}, nil
+	}
+	return &runtimev1.CreatePodResponse{
+		Status: leaseStatus(req.GetPod().GetPodId(), req.GetPod().GetPodIp(), ""),
+	}, nil
+}
+
+// RestartContainer records the single restart authority's RPC — the one call a
+// committed liveness failure ends in — so a test can assert that a container was
+// NOT restarted.
+func (s *leaseRuntimeServer) RestartContainer(_ context.Context, _ *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
+	s.mu.Lock()
+	s.restarts++
+	s.mu.Unlock()
+	return &runtimev1.RestartContainerResponse{}, nil
+}
+
+// restartCount is how many RestartContainer RPCs the provider has issued.
+func (s *leaseRuntimeServer) restartCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restarts
 }
 
 // boxPodIP returns the PodBox.pod_ip the provider sent for podID — the value
@@ -109,8 +141,17 @@ func (s *leaseRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeleteP
 	return &runtimev1.DeletePodResponse{}, nil
 }
 
+// GetPodStatus answers with the pod's CURRENT lease — the last one pushed — not
+// an empty one: a real runtimed reports the lease it is holding on every status
+// path, and a direct GetPodStatus that answered "no lease" would retract an
+// override the stream had just installed (the provider observes transport on
+// every status it builds, by design).
 func (s *leaseRuntimeServer) GetPodStatus(_ context.Context, req *runtimev1.GetPodStatusRequest) (*runtimev1.GetPodStatusResponse, error) {
-	return &runtimev1.GetPodStatusResponse{Status: leaseStatus(req.GetPodId(), s.reportedPodIP(req.GetPodId()), "")}, nil
+	id := req.GetPodId()
+	s.mu.Lock()
+	transport := s.transports[id]
+	s.mu.Unlock()
+	return &runtimev1.GetPodStatusResponse{Status: leaseStatus(id, s.reportedPodIP(id), transport)}, nil
 }
 
 // WatchPodStatus forwards pushed events until the stream ends.
@@ -131,6 +172,9 @@ func (s *leaseRuntimeServer) WatchPodStatus(_ *runtimev1.WatchPodStatusRequest, 
 // transport address ("" = the guest holds no lease).
 func (s *leaseRuntimeServer) push(t *testing.T, podID, transport string) {
 	t.Helper()
+	s.mu.Lock()
+	s.transports[podID] = transport
+	s.mu.Unlock()
 	select {
 	case s.events <- &runtimev1.PodStatusEvent{
 		Type:   runtimev1.PodStatusEventType_POD_STATUS_EVENT_TYPE_MODIFIED,
@@ -214,8 +258,9 @@ type leaseNode struct {
 	sink   *recordingSink
 	table  *proxy.RoutingTable
 	mu     sync.Mutex
-	seen   map[string]int    // pod id -> status callbacks delivered
-	podIPs map[string]string // pod id -> the LAST status.podIP VK was told
+	seen   map[string]int                   // pod id -> status callbacks delivered
+	podIPs map[string]string                // pod id -> the LAST status.podIP VK was told
+	conds  map[string][]corev1.PodCondition // pod id -> the LAST conditions VK was told
 	notify chan struct{}
 }
 
@@ -243,7 +288,8 @@ func newLeaseNodeWith(t *testing.T, echoPodIP bool) *leaseNode {
 	sink := &recordingSink{table: table}
 	n := &leaseNode{
 		ipam: ipam, adapt: adapt, rt: rt, sink: sink, table: table,
-		seen: map[string]int{}, podIPs: map[string]string{}, notify: make(chan struct{}, 64),
+		seen: map[string]int{}, podIPs: map[string]string{}, conds: map[string][]corev1.PodCondition{},
+		notify: make(chan struct{}, 64),
 	}
 	n.r = newRuntimedWith(rt, RuntimedConfig{
 		NodeName: guestNodeName,
@@ -266,6 +312,9 @@ func (n *leaseNode) watch(t *testing.T) {
 		n.mu.Lock()
 		n.seen[string(pod.UID)]++
 		n.podIPs[string(pod.UID)] = pod.Status.PodIP
+		// Copied, not aliased: the provider owns the status it just published and
+		// the next observation replaces the slice under a reader.
+		n.conds[string(pod.UID)] = slices.Clone(pod.Status.Conditions)
 		n.mu.Unlock()
 		select {
 		case n.notify <- struct{}{}:

@@ -21,6 +21,8 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+
+	"k3sm.io/k3sm/pkg/dataroot"
 )
 
 // Screen geometry. The name and state columns are fixed rather than computed so
@@ -46,19 +48,49 @@ const (
 	ansiDim    = "\x1b[2m"
 )
 
-// overviewRows are the rows the default screen shows, in order. runtimed is
-// deliberately absent: it is the row an ordinary account can almost never
-// answer, and it would spend a line saying so on every healthy cluster. It is
-// still in the JSON, still in the cluster view, and still in the verdict.
-var overviewRows = []string{
+// serverOverviewRows are the rows the default screen shows on a control plane,
+// in order. runtimed is deliberately absent: it is the row an ordinary account
+// can almost never answer, and it would spend a line saying so on every healthy
+// cluster. It is still in the JSON, still in the cluster view, and still in the
+// verdict.
+var serverOverviewRows = []string{
 	RowInstall, RowNetd, RowServer, RowServerArgs, RowAPIServer,
 	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
-// daemonViewRows are the rows `k3sm status daemons` expands. datavol leads,
-// mirroring install's own order: it is the job that has to have run before the
-// other two can do anything with the data root.
-var daemonViewRows = []string{RowInstall, RowDatavol, RowNetd, RowServer, RowServerArgs, RowDataRoot}
+// agentOverviewRows are the same screen on a joining worker: the agent row
+// stands exactly where the server row does, and the server-args row is gone
+// with the daemon it described.
+var agentOverviewRows = []string{
+	RowInstall, RowNetd, RowAgent, RowAPIServer,
+	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
+}
+
+// serverDaemonViewRows are the rows `k3sm status daemons` expands on a control
+// plane. datavol leads, mirroring install's own order: it is the job that has to
+// have run before the other two can do anything with the data root.
+var serverDaemonViewRows = []string{RowInstall, RowDatavol, RowNetd, RowServer, RowServerArgs, RowDataRoot}
+
+// agentDaemonViewRows is the same view on a worker.
+var agentDaemonViewRows = []string{RowInstall, RowDatavol, RowNetd, RowAgent, RowDataRoot}
+
+// overviewRows and daemonViewRows pick the screen for the role the report
+// describes. They are chosen by ROLE rather than by which rows happen to be in
+// the report, so a screen never renders a row the role does not have — the
+// server-role screens are byte-identical to what they have always been.
+func overviewRows(role dataroot.Role) []string {
+	if role == dataroot.RoleAgent {
+		return agentOverviewRows
+	}
+	return serverOverviewRows
+}
+
+func daemonViewRows(role dataroot.Role) []string {
+	if role == dataroot.RoleAgent {
+		return agentDaemonViewRows
+	}
+	return serverDaemonViewRows
+}
 
 // clusterViewRows are the rows `k3sm status cluster` expands.
 //
@@ -76,7 +108,7 @@ func Render(r Report, s Style) string {
 	var b strings.Builder
 	b.WriteString(headline(r, s))
 	b.WriteString("\n\n")
-	for _, name := range overviewRows {
+	for _, name := range overviewRows(r.Role) {
 		row, ok := r.Row(name)
 		if !ok {
 			continue
@@ -98,7 +130,7 @@ func Render(r Report, s Style) string {
 // view an operator opens when the overview says a daemon is down and the next
 // question is "since when, and how many times".
 func RenderDaemons(r Report, s Style) string {
-	return renderDetail(r, s, daemonViewRows, "daemons")
+	return renderDetail(r, s, daemonViewRows(r.Role), "daemons")
 }
 
 // RenderCluster returns the control-plane detail view: readiness, the node, the
