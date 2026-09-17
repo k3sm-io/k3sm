@@ -393,9 +393,16 @@ func TestBothSourcesUnreadableNamesBothFiles(t *testing.T) {
 }
 
 // TestServerArgsAreCarriedVerbatimAndPrintedRedacted is the credential gate on
-// the whole path. --datastore-endpoint carries a DSN password, so the argument
-// has to reach the daemon EXACTLY as the operator wrote it while never appearing
+// the whole path. --datastore-endpoint carries a DSN password, so the VALUE has
+// to reach the daemon exactly as the operator wrote it while never appearing
 // intact in anything k3sm prints.
+//
+// Since B295 the value reaches the daemon through a staged file rather than
+// through the argv (see TestServerPlistCarriesNoDatastorePassword), so
+// "verbatim" is now a property of the staged file's contents and the carried
+// argument is the flag that names it. What did not change is the other half:
+// the DSN the install READ is still redacted in every line it prints, including
+// the one that says what was carried over.
 func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 	const (
 		dsn    = "postgres://u:s3cret@h/db"
@@ -416,16 +423,25 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 		t.Fatalf("reinstall: %v", err)
 	}
 
+	staged := stagedEndpointPath(cfg)
+
 	t.Run("verbatim where it has to work", func(t *testing.T) {
-		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint", dsn}; !slices.Equal(got, want) {
-			t.Errorf("rendered args = %v, want %v (a masked DSN would not connect)", got, want)
+		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint-file", staged}; !slices.Equal(got, want) {
+			t.Errorf("rendered args = %v, want %v", got, want)
+		}
+		// The file is where "verbatim" now lives: a masked DSN would not connect.
+		if got := strings.TrimSpace(string(f.files[staged])); got != dsn {
+			t.Errorf("staged DSN = %q, want the operator's own %q", got, dsn)
 		}
 		rec, ok := f.serverArgs[cfg.withDefaults().ServerArgsRecord]
 		if !ok {
 			t.Fatal("no record was written")
 		}
-		if !slices.Contains(rec.Args, dsn) {
-			t.Errorf("record args = %v, want the DSN verbatim", rec.Args)
+		if slices.Contains(rec.Args, dsn) || strings.Contains(strings.Join(rec.Args, " "), secret) {
+			t.Errorf("record args = %v, want no DSN in them at all", rec.Args)
+		}
+		if !slices.Contains(rec.Args, staged) {
+			t.Errorf("record args = %v, want the staged path %q", rec.Args, staged)
 		}
 	})
 
@@ -449,9 +465,14 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 		if strings.Contains(log.String(), secret) {
 			t.Fatalf("the carried-from-record log line leaked the DSN password:\n%s", log.String())
 		}
-		// And it was really carried, from the record, verbatim.
-		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint", dsn}; !slices.Equal(got, want) {
+		// And it was really carried, from the record: the flag naming the staged
+		// file, whose contents the uninstall preserved with the rest of the data
+		// root because k3sm cannot re-derive an operator's DSN.
+		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint-file", staged}; !slices.Equal(got, want) {
 			t.Errorf("after uninstall then install the args are %v, want %v", got, want)
+		}
+		if got := strings.TrimSpace(string(f.files[staged])); got != dsn {
+			t.Errorf("staged DSN after uninstall then install = %q, want it preserved (%q)", got, dsn)
 		}
 	})
 

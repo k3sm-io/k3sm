@@ -281,6 +281,14 @@ const (
 	// without dragging the other with it.
 	ServerTokenDirMode  fs.FileMode = 0o700
 	ServerTokenFileMode fs.FileMode = 0o600
+	// DatastoreEndpointFileMode is the mode of the staged HA datastore DSN, the
+	// other credential the control-plane daemon is handed as a file. Stated
+	// separately from ServerTokenFileMode for the reason that one is stated
+	// separately from the agent's: it is a decision about a different file, whose
+	// contents are the OPERATOR's Postgres password rather than a token k3sm
+	// minted, and the two may move independently. The directory is the server
+	// work dir, so its mode is ServerTokenDirMode's — one directory, one answer.
+	DatastoreEndpointFileMode fs.FileMode = 0o600
 	// agentWorkSubdir is the agent's state root under the data root, the same
 	// directory `k3sm agent --work-dir` defaults to, so the token the installer
 	// stages and the state the agent keeps are one tree rather than two.
@@ -292,6 +300,10 @@ const (
 	// sits in the agent work dir: the credential a daemon presents lives in
 	// that daemon's own state tree.
 	serverTokenName = "token"
+	// datastoreEndpointName is the leaf name of the staged HA datastore DSN,
+	// beside the admin token in the server work dir for the same reason: what a
+	// daemon must read lives in that daemon's own state tree.
+	datastoreEndpointName = "datastore-endpoint"
 	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
 	// writes on a successful join — see AgentCredentialPath.
 	agentNodeKubeconfigName = "node.kubeconfig"
@@ -1543,6 +1555,24 @@ func (c Config) serverTokenPath() string {
 	return filepath.Join(c.serverWorkDir(), serverTokenName)
 }
 
+// datastoreEndpointPath is where Install stages the HA datastore DSN for the
+// control-plane daemon to read: <DataRoot>/server/datastore-endpoint,
+// service-user-owned 0600 (see DatastoreEndpointFileMode).
+//
+// It is serverTokenPath's sibling and exists for the same reason, against a
+// credential that is not k3sm's to mint. A Postgres DSN carries a password, and
+// rendering it as a VALUE on the server LaunchDaemon's argv published it twice
+// over even after B249 narrowed the plist to 0600: `ps` shows a running job's
+// arguments to every account on the Mac for the daemon's whole life, and
+// launchd echoes them back from its own job description. Neither is affected by
+// the plist's mode.
+//
+// The path is derived rather than configured, exactly as the token's is: it is
+// the one path the installer writes and the one path it renders onto the argv.
+func (c Config) datastoreEndpointPath() string {
+	return filepath.Join(c.serverWorkDir(), datastoreEndpointName)
+}
+
 // stageTokenFile writes token at dst, owned by the service uid at mode inside a
 // directory at dirMode, so the unprivileged daemon that must present it can read
 // it and nothing else on the Mac can. what names the credential for the error
@@ -2148,6 +2178,21 @@ func artifactManifest(cfg Config) []artifact {
 	// such file until the next install stages one.
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
+		// The staged HA datastore DSN, beside it and with the OPPOSITE
+		// disposition: PRESERVED, like everything else under the data root.
+		//
+		// The token is a credential this install minted and can mint again, so
+		// leaving it behind would leave a cluster-admin secret on a machine
+		// somebody just uninstalled k3sm from. The DSN is the OPERATOR's: k3sm
+		// cannot re-derive it, the flag naming it is carried across a reinstall
+		// out of the preserved arguments record, and an uninstall that deleted
+		// the file would turn the next install into the refusal
+		// requireDatastoreEndpointFile exists to raise. It is no more exposed
+		// there than the rest of the preserved data root, which holds the
+		// cluster's signing keys.
+		//
+		// assertExists is false: a single-node server stages no DSN at all.
+		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.datastoreEndpointPath(), assertExists: false})
 	}
 	// This node's wireguard identity: the role's work-dir copy, the root-only
 	// key dir, and the copy inside it that netd's MeshKeyResolver reads. All
@@ -2539,6 +2584,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      log-only: nothing here needs to mutate cfg.ExtraServerArgs itself.
 	if old := flagValue(cfg.ExtraServerArgs, "mesh-ip"); cfg.MeshIP != "" && old != "" && old != cfg.MeshIP {
 		cfg.Logger.Info("--mesh-ip replaces the mesh address carried over from the previous install", "old", old, "new", cfg.MeshIP)
+	}
+	// 2d‴. Move a password-bearing datastore DSN off the daemon's command line,
+	//      into a service-user-owned 0600 file the argv then merely names. It sits
+	//      HERE and nowhere else: after the carry-over has decided the arguments,
+	//      and before both the record below and the plist at step 3 are written
+	//      from them, so the two on-disk copies of the argv agree and neither
+	//      holds the password. It also refuses an install whose carried
+	//      --datastore-endpoint-file names a file that is gone — see
+	//      stageDatastoreEndpoint.
+	if cfg.Role == RoleServer {
+		if err := stageDatastoreEndpoint(sys, &cfg, uid); err != nil {
+			return err
+		}
 	}
 	// 2d′. Record them, on EVERY install and whatever the source was — including
 	//      an empty set, which is the truthful record of a node that has none.

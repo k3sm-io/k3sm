@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -97,9 +99,13 @@ type serverOptions struct {
 	network               string // host-network backend: auto (default) | none | direct | helper
 
 	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite
-	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
-	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (HA server-join)
-	token             string // static admin bearer token (standalone) or the server-class join token (HA server-join)
+	// datastoreEndpointFile is a file holding that DSN, read once at start. It is
+	// how the INSTALLED daemon is given an HA datastore: the password never
+	// appears on the argv `ps` publishes. See resolveDatastoreEndpoint.
+	datastoreEndpointFile string
+	serverJoin            bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
+	joinServer            string // existing server's mesh host to fetch the identical-CA bundle from (HA server-join)
+	token                 string // static admin bearer token (standalone) or the server-class join token (HA server-join)
 	// tokenFile is a file holding that token, read once at start. It is how the
 	// INSTALLED daemon is given its static admin token: the value never appears
 	// on the argv a plist publishes. See resolveTokenFile.
@@ -233,6 +239,16 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// k3sm's own argv (mirrors --token/$K3SM_TOKEN). k3sm relocates the password off
 	// the kine child's argv too (a 0600 PGPASSFILE), so `ps` never sees the secret.
 	fs.StringVar(&opts.datastoreEndpoint, "datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "kine datastore DSN (postgres://user:pass@host:port/db?sslmode=…) for HA multi-writer; empty = single-node kine→SQLite (or $K3SM_DATASTORE_ENDPOINT)")
+	// The DSN as a FILE, and the only way the installed daemon is given one. A
+	// LaunchDaemon's argv is published to every account on the Mac by `ps` for
+	// the life of the job, and by launchd's own job description, whatever the
+	// plist's mode is — so an operator's Postgres password on it was readable by
+	// any local process. `k3sm install` stages the DSN at
+	// <data-root>/server/datastore-endpoint (0600, owned by the daemon's user)
+	// and renders this flag pointing at it. The value then flows exactly where
+	// the inline flag's did, including the relocation of the password off the
+	// kine child's argv into a 0600 PGPASSFILE.
+	fs.StringVar(&opts.datastoreEndpointFile, "datastore-endpoint-file", "", "a file holding the datastore DSN, read once at start. This is how a supervised server is given an HA datastore: the daemon is told where its DSN is and never what it is. Mutually exclusive with --datastore-endpoint; a file that is not there is a start error, never a silent fall back to the single-node datastore")
 	fs.BoolVar(&opts.serverJoin, "server-join", false, "this server joins/forms an HA control plane — REQUIRES --datastore-endpoint (split-brain guard) and sets the HA leader-election. With --server it also fetches the identical-CA bundle from an existing server")
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
@@ -252,6 +268,75 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// warning, rather than silently reinterpreted as a join credential.
 	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding the static admin token, read once at start and preferred over --token and $K3SM_TOKEN. It must not be group- or world-readable. This is how a supervised server is given its token: the daemon is told where the token is and never what it is. Not used by the HA server-join, which takes --token")
 	return workDirErr
+}
+
+// resolveDatastoreEndpoint returns the kine datastore DSN the two endpoint
+// flags describe: the inline --datastore-endpoint when that is how it was
+// given, or the contents of the file --datastore-endpoint-file names.
+//
+// The file exists because an argv is public. A LaunchDaemon's arguments are
+// readable by every account on the Mac through `ps` for as long as the job
+// runs, and through launchd's own job description, neither of which the plist's
+// mode affects — so a Postgres password rendered as a value there was a
+// credential handed to any local process. The installer stages the DSN in a
+// 0600 file owned by the daemon's user and names the PATH on the argv instead.
+//
+// Three refusals, and each is deliberate:
+//
+//   - BOTH flags set is an error rather than a precedence. They are two
+//     spellings of one value and nothing can tell which one an operator meant
+//     to win; note that --datastore-endpoint also takes $K3SM_DATASTORE_ENDPOINT
+//     as its default, so an exported variable is one of the two.
+//   - A file that cannot be read is TERMINAL, and this is the one place this
+//     contract differs from the token file's, where absence is a posture. An
+//     empty endpoint is not "no opinion" here: it is the single-node SQLite
+//     default, so coming up past a missing file would silently give an HA
+//     control-plane Mac its own private datastore, and the split only surfaces
+//     later as objects the other servers cannot see.
+//   - An empty file is an error for the same reason, rather than an empty DSN.
+//   - A file its group or other accounts can read is refused, through the mask
+//     the join token file is judged by (tokenFileMask). The file IS the
+//     credential for as long as it exists, so a group-readable copy is a
+//     password shared with a group, and without this check "the DSN is in a
+//     file" would mean the password sat readable on disk instead of readable
+//     in `ps`.
+//
+// The value is trimmed (the installer writes a trailing newline) and returned;
+// everything downstream of it — the HA leader election, and the relocation of
+// the password off the kine child's argv into a PGPASSFILE — is unchanged by
+// which of the two flags carried it.
+func resolveDatastoreEndpoint(endpoint, path string) (string, error) {
+	if path == "" {
+		return endpoint, nil
+	}
+	if endpoint != "" {
+		return "", fmt.Errorf("--datastore-endpoint and --datastore-endpoint-file %s are mutually exclusive: pass the DSN one way or the other (--datastore-endpoint also defaults to $K3SM_DATASTORE_ENDPOINT, so an exported variable counts as passing it)", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read the datastore endpoint file %s: %w (the server will not fall back to its own single-node datastore: write the DSN into the file, or drop --datastore-endpoint-file if this node is meant to be single-node)", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	// The mode is read from the OPEN FILE rather than from the path, for
+	// readJoinTokenFile's reason: the bytes that are returned are then the bytes
+	// that were judged, where a stat-then-open would decide about one file and
+	// read another if the path were replaced in between.
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("inspect the datastore endpoint file %s: %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&tokenFileMask != 0 {
+		return "", fmt.Errorf("the datastore endpoint file %s is mode %#o: a datastore DSN carries a password, so the file must not be readable by its group or by other accounts — `chmod 600 %s`", path, perm, path)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", fmt.Errorf("read the datastore endpoint file %s: %w", path, err)
+	}
+	dsn := strings.TrimSpace(string(data))
+	if dsn == "" {
+		return "", fmt.Errorf("the datastore endpoint file %s is empty: write the datastore DSN into it (mode 0600, owned by this daemon's user), or drop --datastore-endpoint-file if this node is meant to be single-node", path)
+	}
+	return dsn, nil
 }
 
 // refuseShadowedWorkDir refuses to bring the control plane up when workDir sits
@@ -318,6 +403,17 @@ func runServer(args []string) (err error) {
 				"path", opts.tokenFile)
 		}
 	}
+
+	// The HA datastore DSN, from the file the installed daemon is pointed at,
+	// and resolved here for the same reason the token is: before any state is
+	// touched, because every failure mode of that file is terminal (see
+	// resolveDatastoreEndpoint). From this point on nothing downstream can tell
+	// which of the two flags carried the value.
+	dsn, derr := resolveDatastoreEndpoint(opts.datastoreEndpoint, opts.datastoreEndpointFile)
+	if derr != nil {
+		return derr
+	}
+	opts.datastoreEndpoint = dsn
 
 	if opts.ingressHTTPPort < 0 || opts.ingressHTTPPort > 65535 {
 		return fmt.Errorf("--ingress-http-port %d out of range 0-65535", opts.ingressHTTPPort)

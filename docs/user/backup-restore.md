@@ -201,6 +201,10 @@ your cluster. It detects Postgres from the server's `--datastore-endpoint` (or
 `$K3SM_DATASTORE_ENDPOINT`) and from the `.pgpass` file the server writes in the work directory. If a
 node no longer uses Postgres, remove that file and the commands work again.
 
+When a DSN carries a password, `k3sm install` keeps it in a file only the daemon's user can read
+(`/var/lib/k3sm/server/datastore-endpoint`, mode 0600) and puts `--datastore-endpoint-file <path>` on
+the daemon's command line, so the password is not visible to other accounts in `ps`.
+
 ## Next
 
 - [Upgrade](upgrade.md) covers what happens to the datastore across a version move.
