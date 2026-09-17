@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -48,6 +49,38 @@ func writeChild(t *testing.T, wd, name, script string) {
 	}
 	if err := os.WriteFile(filepath.Join(binDir(wd), name), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// writeHeldChild drops an executable script that BLOCKS until the returned
+// release func is called, and only then runs body. It is what makes the crash
+// tests deterministic: the child cannot die before the test has put the
+// executor into the state under test, so the reaper's supervision decision is
+// never racing the test's own setup. The alternative — a child that dies at
+// spawn and a test that hopes the mark lands first — is the race that made
+// TestOnComponentExitFiresWhenAComponentCrashes wait out its whole 10s bound
+// whenever the mark lost.
+//
+// The gate is a FIFO: the child's `read` blocks until a writer opens it, and
+// the release opens it for writing. Releasing is asynchronous so that a child
+// which never reached its read (a spawn that failed) cannot wedge the test in
+// an open() that blocks forever — the caller's own bound reports that instead.
+func writeHeldChild(t *testing.T, wd, name, body string) (release func()) {
+	t.Helper()
+	fifo := filepath.Join(wd, name+".gate")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeChild(t, wd, name, "#!/bin/sh\nread _ < \""+fifo+"\"\n"+body)
+	return func() {
+		go func() {
+			f, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+			if err != nil {
+				return
+			}
+			_, _ = f.WriteString("go\n")
+			_ = f.Close()
+		}()
 	}
 }
 
@@ -84,7 +117,11 @@ func (r *exitRecorder) count() int {
 // the component came up, then its child died on its own.
 func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 	wd := t.TempDir()
-	writeChild(t, wd, "crasher", "#!/bin/sh\necho boom-detail-line\nexit 7\n")
+	// Held until Start has returned, so the crash lands squarely in the state
+	// under test: the component marked, bring-up over. A crasher that raced the
+	// mark instead would be reported to nobody and the test would wait out its
+	// whole bound for a callback that was never owed.
+	crash := writeHeldChild(t, wd, "crasher", "echo boom-detail-line\nexit 7\n")
 
 	rec := newExitRecorder()
 	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
@@ -95,7 +132,9 @@ func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		s.markSupervised(c) // stands in for the component's own readiness gate
+		if err := s.markSupervised(c); err != nil { // stands in for the component's own readiness gate
+			return err
+		}
 		child = c
 		return nil
 	})
@@ -104,6 +143,7 @@ func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() { _ = s.Stop(context.Background()) }()
+	crash()
 
 	select {
 	case <-rec.fired:
@@ -142,7 +182,10 @@ func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 // miss it.
 func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) {
 	wd := t.TempDir()
-	writeChild(t, wd, "early", "#!/bin/sh\necho early-boom\nexit 9\n")
+	// Held like the crasher above, but released from INSIDE bring-up: Start does
+	// not return until the stub does, so a release after Start would deadlock
+	// against the stub's own wait on the child.
+	crashEarly := writeHeldChild(t, wd, "early", "echo early-boom\nexit 9\n")
 	writeChild(t, wd, "late", "#!/bin/sh\nsleep 30\n")
 
 	rec := newExitRecorder()
@@ -157,8 +200,11 @@ func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) 
 		early = c
 		// "early" has passed its own readiness gate. Everything after this point
 		// is the window under test.
-		s.markSupervised(c)
-		<-c.exited // it dies immediately, mid-sequence
+		if err := s.markSupervised(c); err != nil {
+			return err
+		}
+		crashEarly()
+		<-c.exited // it dies mid-sequence, with the mark already in place
 
 		// The LATER component is still coming up. Bring-up has not returned, so
 		// no end-of-sequence flip has happened or will happen before the crash
@@ -192,6 +238,66 @@ func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) 
 		t.Errorf("log tail %q does not carry the crashed component's output", tail)
 	}
 	<-early.exited
+}
+
+// TestBringUpReportsAComponentThatDiesBeforeItsMark pins the NARROWEST window:
+// the statements between a component's own readiness gate returning and its
+// markSupervised call. A child that dies there is seen by a reaper that reads it
+// as still unmarked — so the reaper reports it to nobody — while awaitHealthy has
+// already returned success, so bring-up would report it to nobody either. That
+// combination is the silent wedge with no observer at all, and the only place it
+// can be closed is the mark itself.
+//
+// So markSupervised returns that death, and bring-up fails with it. The callback
+// must stay OUT of it: a bring-up failure is reported by Start's error, and
+// firing the callback as well would cancel the server's root context on top of a
+// Start that is already tearing down.
+func TestBringUpReportsAComponentThatDiesBeforeItsMark(t *testing.T) {
+	wd := t.TempDir()
+	writeChild(t, wd, "crasher", "#!/bin/sh\necho boom-before-the-mark\nexit 7\n")
+
+	rec := newExitRecorder()
+	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+
+	var child *component
+	stubBoot(t, func(s *Supervised, ctx context.Context) error {
+		c, err := s.spawnEnv(ctx, "crasher", nil)
+		if err != nil {
+			return err
+		}
+		child = c
+		// The component passed its readiness gate and then died before the mark:
+		// waiting for exited here IS that window, held open deterministically.
+		<-c.exited
+		return s.markSupervised(c)
+	})
+
+	err := s.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start: want the bring-up error for a component that died before its mark, got nil — " +
+			"its death was reported to nobody")
+	}
+	if !strings.Contains(err.Error(), "crasher") {
+		t.Errorf("Start error %q does not name the component that died", err)
+	}
+	// The operator's evidence of WHY, the same as every other bring-up failure.
+	if !strings.Contains(err.Error(), "boom-before-the-mark") {
+		t.Errorf("Start error %q does not carry the child's output", err)
+	}
+	if !strings.Contains(err.Error(), child.logPath) {
+		t.Errorf("Start error %q does not point at the component's log %q", err, child.logPath)
+	}
+
+	// The callback is bring-up's to stay out of. Give the reaper a grace window
+	// it would comfortably fire in, then assert silence.
+	select {
+	case <-rec.fired:
+		t.Fatal("OnComponentExit fired for a component that died during bring-up; Start already reported it")
+	case <-time.After(250 * time.Millisecond):
+	}
+	if n := rec.count(); n != 0 {
+		t.Fatalf("OnComponentExit fired %d times for a bring-up failure, want 0", n)
+	}
 }
 
 // TestStartAndAwaitListeningMarksTheComponentSupervised pins the marking on the
@@ -358,7 +464,9 @@ func TestOnComponentExitStaysSilentDuringStop(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			s.markSupervised(c) // all three are up, as after a real bring-up
+			if err := s.markSupervised(c); err != nil { // all three are up, as after a real bring-up
+				return err
+			}
 			comps = append(comps, c)
 		}
 		return nil
