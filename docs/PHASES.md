@@ -1084,6 +1084,127 @@ phases:
             met: false
             check: "hack/site.sh verify green with the new sentence; the graduation bar recorded in docs/m15-plan.md"
             method: unit
+  - id: M16
+    title: MLX serving fleet — an upstream-compatible inference control plane over native MLX workers
+    status: todo
+    strategy: hard cut
+    depends_on:
+      - k3sm:M8
+      - k3sm:M11
+    note: "Authoritative input: docs/m16-plan.md (workspace) — Phase C encodes ONLY from that doc; its research findings F1-F9 and its BINDING resolutions R1-R16 are the inputs, and nothing in this block is re-derived from upstream by hand. M16 is a SIBLING of M8, not its successor: MLXModel stays the one-object way to serve one model, and this is the fleet layer above it (a native-Darwin mlx-worker running the M8 engine in-process behind the upstream backend contract, a node capacity policy for mlx.k3sm.io/gpu, four conformance and confinement proofs k3sm owes anyway, and the install recipe/example/doc/gate for running the upstream control plane as vm Pods with native workers beneath). THE RIG (R16): M16 develops and gates on the laptop dev Mac running as its OWN single-node k3sm server, reached over key-auth ssh through K3SM_M16_HOST; the workstation cluster is never a target, and every performance figure is taken on that laptop against hack/acceptance/m8.sh run on the same machine, never against a bigger Mac's numbers. Its 8 GiB budget is planned rather than discovered: system reserve max(2Gi, 10%), the operator and frontend vm guests at the M11 idle figure, two workers at the slot floor S0(2) measures. THE SINGLE-SLOT EDGE: if two engines do not fit beside the control plane, R5 clamps capacity to 1 on this rig, and the warm-prefix routing rung then needs a second node — so on that branch ONLY it is conditionally behind k3sm:M14; on the two-slot branch it runs on this one node and is required. DEPLOY CONTRACT (hard cut): no proto, no CRD field, no datastore encoding and no mesh change anywhere in M16 — the upstream framework's CRDs are additive objects owned by its own operator, and k3sm's one behavior change is a per-node capacity policy on the existing mlx.k3sm.io/gpu extended resource, which a single node takes with launchctl kickstart -k io.k3sm.server; rollback is revert plus reinstall, and helm uninstall removes the operator and frontend but NOT the CRDs or surviving CRs, which the user doc's finalizer runbook covers. TRUST: human_gate is none on every M16 item — R11 takes the two decisions once, here (the upstream operator's cluster-scoped RBAC grant, pinned as a golden test by B289 and re-asserted live by the gate's RBAC rung, and its conversion-webhook cert-controller, which is machine-minted internal PKI no human chooses or supplies) — and the only two human touches are public-REGISTRY WRITES, not gates: the mirror push (R12) and the mlx-worker publish (M16.3-d2). The k3sm leaves filed against this block are B285, B286, B287 and B289; B288 is the runtimed leaf."
+    subphases:
+      - id: M16.0
+        title: spikes S0-S4 — preconditions, the Darwin build, the control plane, the engine, the worker
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "AGENT-RUN over ssh on the R16 rig, never a human lab session: method is integration, requires dev-mac + apple-gpu + vz + network, and the phases.json M16.0 row is manual:false with hack/spike/m16/run.sh as its gate, so the spikes ARE the acceptance and the findings are the write-back. Scripts live in hack/spike/m16/ in the M8 spike shape (a driver ships a lab-side payload over ssh; K3SM_M16_HOST is required and has no default, because naming an operator's machine here would put a private host in a public repo), with one findings-s<n>.md per rung. Two contracts make the ladder reviewable and honest: --plan is parsed BEFORE anything that requires the host, so the shape of every rung is readable on a machine with no GPU and no cluster; and the exit contract is 0 PASS / 1 FAIL / 2 RECORDED (a measurement with no verdict), defined once in hack/spike/m16/lib.sh. EVERY HALT IS BINDING AND EVERY HALT'S SUBSTITUTION IS PRE-DECIDED, so no halt needs a human to continue and the next cycle sees an unambiguous ledger."
+        deliverables:
+          - id: M16.0-d1
+            done: false
+            desc: "S0 — k3sm preconditions, no framework. (1) a trivial ClusterIP-backed VALIDATING webhook AND a trivial CRD CONVERSION webhook, both registered with clientConfig.service (never url) and both backed by a runtimeClassName: vm pod, so the path under test is the apiserver's ClusterIP service resolver into darwin-net's proxy; the apiserver reaches both and failurePolicy: Fail behaves. (2) TWO vllm-mlx engines as HOST PROCESSES (the M8 S5 bake-off method — no scratch binary, no reinstall) on the smallest pinned model class that fits two engines beside the control plane on 8 GiB, driven through the S3 sustained 1 200-token methodology at N = the engine's --max-num-seqs ceiling, recording aggregate tok/s, PER-REQUEST LATENCY PERCENTILES and wired memory against the one-engine control; IOKit/Metal cross-process interference is recorded as not evaluated if it is not measured. (3) a vm guest dials a native pod's own lo0-alias pod IP:port directly, AND the reverse (native pod to the vm guest's published IP), each recorded — both outcomes are consequential, because reachable also means the guest bypasses the proxy and the NetworkPolicy L4 hint, which is a trust-domain fact to document. HALTS: (1) fails goes to R4(a), v1alpha1 only with no conversion in the path; (2) thrashes or doubles p99 raises R5's slot floor (a smaller model or a larger slot) and re-runs S0(2), single-slot only if no small model fits two; (3) blocked goes to R4(b), the native-Darwin control plane per F2."
+          - id: M16.0-d2
+            done: false
+            desc: "S1 — Darwin build plus infrastructure-free smoke. The documented macOS flow (cmake + protobuf, rustup, uv venv, maturin develop) run in the spike prefix with the RUST TOOLCHAIN AND MATURIN VERSION RECORDED, not defaulted; python3 -m dynamo.frontend --help answers; a frontend plus the in-tree mocker with --discovery-backend file returns tokens for one completion. Records the resolved upstream commit (this is the pin R2 promotes), the built wheel's sha256, and whether the maturin-built extension arrives linker-ad-hoc-signed, which is what hack/images/*/walk-verify.sh assumes. HALT: if dynamo-memory / nixl-sys will not build on darwin/arm64, the worker re-plans on the Rust backend contract (which does not pull dynamo-memory) BEFORE any build wave starts."
+          - id: M16.0-d3
+            done: false
+            desc: "S2 — the upstream control plane on k3sm, GPU-free. The pinned chart installed from the mirror (R12; until the mirror push lands it runs against the upstream registry BY DIGEST, so nothing in M16.0 waits on a human) with etcd.install=false, nats.install=false, discoveryBackend=kubernetes and the operator on runtimeClassName: vm; findings-s2.md RECORDS THE OPERATOR ClusterRole's FULL verb/resource set (R11's input, and what B289 pins); the nine CRDs reach Established; the conversion webhook answers a v1alpha1 read of a v1beta1 object; the CPU-only mocker deployment serves a completion THROUGH THE FRONTEND'S ClusterIP; and the frontend's dial to the worker's PUBLISHED address is observed in the worker's own logs, because the request plane dials addresses, not VIPs. HALT: discovery or that dial fails goes to R4(b)."
+          - id: M16.0-d4
+            done: false
+            desc: "S3 — the engine decision. (1) vllm-mlx's AsyncEngineCore driven from TOKEN IDs outside the server process, constructed with continuous batching and the pinned max_kv_size / max_num_seqs the M8 sizing formula yields, aborting mid-stream, observing block hashes stored and evicted, and MEASURING the cost of the KV push call on the hot path (sync versus async) — the number that decides whether routing metadata can ride the request path at all. (2) vllm-metal run against the M8 baseline on the same rig as a control, RECORDED and never gating. HALT: (1) fails goes to R3's HTTP sidecar shape onto mlx-serve, where the block size is unset, routing degrades to round-robin by contract, and the user doc says so."
+          - id: M16.0-d5
+            done: false
+            desc: "S4 — the worker end to end. An MLXEngine in S3's shape behind the upstream backend contract, its conformance kit green, and frontend to worker to tokens through the ClusterIP with mlx.k3sm.io/gpu: 1 requested. Stretch, recorded rather than required here: the router preferring the warm worker. M16.3 productizes exactly this shape; nothing S4 leaves undecided is decided later by a build wave."
+        acceptance:
+          - id: M16.0-a1
+            met: false
+            check: "hack/spike/m16/run.sh exits 0 on the R16 rig with K3SM_M16_HOST set (the phases.json M16.0 row, manual:false), every rung reaching a verdict rather than a bare recording, and findings-s0.md through findings-s4.md written back with each halt's pre-decided substitution landed in the same write-back; hack/spike/m16/run.sh --plan exits 0 with no host set"
+            method: integration
+      - id: M16.2
+        title: node capacity, the two webhook proofs, the memory-medium verdict, and the fleet status row
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Starts BEFORE M16.0 completes — only d3's slot-floor constant waits on S0(2), and it is a constant a follow-up commit may revise, not a blocker on the policy function. These are conformance and confinement proofs k3sm owes whether or not the fleet ships; the leaves B285, B286, B287 and B289 carry them, and B288 (the kine-port deny) is runtimed's."
+        deliverables:
+          - id: M16.2-d1
+            done: false
+            desc: "B285 (R14): BOTH webhook delivery paths, proven, not inferred — TestAdmissionWebhookDeliveryThroughProxy AND TestConversionWebhookDeliveryThroughProxy, both with a clientConfig.service ref (so the apiserver's ClusterIP service resolver is what runs, which is the mechanism the proof is about) and both backed by a runtimeClassName: vm pod (a native backend would pass without exercising the guest leg). The two conformance-register rows flip TOGETHER with the tests named: the admission row loses its deferred-verification caveat and the CRD-conversion row loses its unqualified static verdict, because proving one dispatch path proves nothing about the other's failure surface."
+          - id: M16.2-d2
+            done: false
+            desc: "B286: the emptyDir medium: Memory verdict on the NATIVE path — today it is silently disk-backed there while the vm path classifies it as tmpfs, a pre-existing cluster-wide conformance gap that M16 only makes more visible. Honor it or refuse it with a reason; TestTranslateEmptyDirMemoryMedium is the proof, and the outcome is what lets R6's sharedMemory: 0 be revisited."
+          - id: M16.2-d3
+            done: false
+            desc: "B287 (R5): the literal gpuDeviceCount is replaced on BOTH branches by a TESTED policy function over GPUFacts — N = min(2, floor(ceiling / slot floor)), where the ceiling is recommended_max_working_set_bytes falling back to iogpu_wired_limit_bytes and NEVER mem_bytes (the proto's own comment names the binding constraint, and ValidateFit already checks it, so two headroom models over one physical resource would let the scheduler admit what the Degraded condition refuses), and a 0-sentinel ceiling yields 1. Admission gains a CUMULATIVE FIT beside ValidateFit: the sum of admitted GPU pods' memory requests stays under the ceiling, because the extended resource is a count and not a byte budget. TestGPUCapacityPolicy covers the table including the clamp, the fallback order and the 0 sentinel. The doc-comment states what N = 2 claims: a MEASURED-WORKLOAD capacity under BENIGN CO-TENANCY (one operator, one trust boundary), NOT an isolated slot — co-resident workers are not isolated from each other. Raising N above 2 is a later spike, never a constant edit."
+          - id: M16.2-d4
+            done: false
+            desc: "pkg/mlxfleet: ONE home for the upstream GVK strings the status path needs (they are literals today wherever they appear), pinned by TestFleetGVKsMatchPin against the recorded chart version so a re-pin that moves a group or version goes red instead of silently reading nothing; plus the k3sm status fleet row — control plane detected, workers registered, and the node's CAPACITY N together with the per-slot memory floor, so the number the scheduler is using is readable without reading the code."
+        acceptance:
+          - id: M16.2-a1
+            met: false
+            check: "k3sm::TestGPUCapacityPolicy, k3sm::TestTranslateEmptyDirMemoryMedium, k3sm::TestFleetGVKsMatchPin and k3sm::TestFleetOperatorRBACPinned pass -race; hack/acceptance/status.sh asserts the `k3sm status` fleet row with capacity N and the slot floor; hack/ci.sh green"
+            method: unit
+          - id: M16.2-a2
+            met: false
+            check: "k3sm::TestAdmissionWebhookDeliveryThroughProxy and k3sm::TestConversionWebhookDeliveryThroughProxy pass against a running cluster on a dev-mac (integration tier, so the leaf lands lab-pending and this rung is what discharges it), and the two conformance-register rows name those tests"
+            method: integration
+      - id: M16.3
+        title: the mlx-worker image — shared staging logic, the pinned wheel, and the digest-pinned publish
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "Depends on M16.0-d2 (the Darwin build flow and the wheel's recorded sha256) and M16.0-d4 (the in-process engine shape). The wheel hash is a REPRODUCIBILITY RECORD, not independent provenance — no published darwin wheel exists to pin against — and the user doc must say exactly that rather than implying a supply-chain guarantee the artifact does not carry."
+        deliverables:
+          - id: M16.3-d1
+            done: false
+            desc: "hack/images/lib/pybuild.sh FIRST — the staging logic mlx-serve already carries (python-build-standalone with its asserted interpreter pin, the hashed wheel closure, the Mach-O entrypoint, walk-verify) factored out before a second image copies it, because two copies drift and the lockfiles are the thing that must not. Then hack/images/mlx-worker/build.sh: python-build-standalone plus the vllm-mlx closure installed with --require-hashes (TestMLXImagesEnginePinLockstep pins BOTH images' lockfiles to ONE vllm-mlx version, so the fleet worker and the single-model server can never serve different engines); plus the darwin-built upstream runtime wheel (R2) built from the pinned tag and its Cargo.lock with a PINNED Rust toolchain and maturin version (RUST_TOOLCHAIN / MATURIN_MIN, asserted the way the interpreter pin already is, because a compiled extension's behavior depends on the compiler and not only on the source), with assert_wheel_pin comparing the just-built sha256 to the recorded one BEFORE staging, fail-closed; plus the upstream framework package; plus the mlx_worker package at hack/images/mlx-worker/src/mlx_worker/, whose OWN tests run from selftest.sh and assert the continuous-batching and pinned-KV invariants on the in-process path (the CLI flags that carry those invariants for mlx-serve are bypassed entirely when the engine is constructed in-process, so without these tests the invariants have no gate at all)."
+          - id: M16.3-d2
+            done: false
+            desc: "the operator-run digest-pinned publish — HUMAN TOUCH 2, staged by the build as a single command and run by the operator because it is a public-registry write while Actions are dormant. The published digest is what the example and the gate consume; the built runtime wheel's sha256 rides the image as LABEL io.k3sm.mlx-worker.runtime-wheel, so the artifact carries its own reproducibility record. The publish is a MERGE PRECONDITION on M16.4, not a gate on this subphase: the wave is done on the build plus selftest.sh."
+        acceptance:
+          - id: M16.3-a1
+            met: false
+            check: "hack/images/mlx-worker/build.sh completes on the R16 rig with assert_wheel_pin and the interpreter/toolchain assertions green, hack/images/mlx-worker/selftest.sh exits 0 (including the mlx_worker package's own continuous-batching and pinned-KV invariant tests), walk-verify.sh reports every Mach-O signed, and k3sm::TestMLXImagesEnginePinLockstep passes"
+            method: integration
+      - id: M16.4
+        title: example manifests, the user doc, the paragraph M8 owed, and the pin register's reader
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "The naming rule is load-bearing throughout this subphase: the k3sm feature is the MLX fleet (mlx-worker, mlx-fleet.md, examples/mlx-fleet/, pkg/mlxfleet, m16.sh), and THE UPSTREAM FRAMEWORK IS NAMED ONCE AS A COMPATIBILITY FACT, NEVER AS THE FEATURE — the way OpenAI-compatible is used — with its licence stated only as Apache-2.0. R10 bounds the claims: no page says disaggregated, KV offload, or autoscaling as a k3sm capability."
+        deliverables:
+          - id: M16.4-d1
+            done: false
+            desc: "examples/mlx-fleet/values-k3sm.yaml: mirror image refs BY DIGEST (R12 — m16.0 asserts digests, never tags, because a tag can be repointed and these images carry cluster RBAC), etcd and NATS install off, kubernetes discovery, runtimeClassName: vm plus the placement stanza on the operator and the frontend, EXPLICIT MEMORY REQUESTS on both (the system-reserved carve-out is scheduling-only and jetsam picks the largest RSS, not the most important process, so a zero-request control-plane pod is admitted for free and then killed first), and sharedMemory: 0 until B286 records the medium: Memory verdict (R6). And examples/mlx-fleet/fleet.yaml: the guardrail stanza with mlx.k3sm.io/gpu in requests AND limits (the M8.5-d1 lesson) and memory request == limit == R5's slot floor, both gate-asserted."
+          - id: M16.4-d2
+            done: false
+            desc: "docs/user/mlx-fleet.md, with R7's security section written honestly IN ITS OWN WORDS: the worker's grant is allow_network, which renders UNFILTERED network-outbound, -bind and -inbound under deny default (not the gloss that it dials one ClusterIP); same-node pods share one trust domain; co-resident workers on a multi-slot node are NOT isolated from each other; the vm control plane contains a compromised CONTROL-PLANE PROCESS only, and since every request crosses the native worker, END-TO-END UNTRUSTED-TENANT SERVING IS OUT OF SCOPE; and kine's port stays reachable from every networked pod until B288 lands. Plus the round-robin fallback under R3's substitution, the vm Service-only rule, the helm-uninstall and CRD-leftover runbook, and the upstream framework named once as a compatibility fact, never as the feature. AND the paragraph M8 called launch-critical and never shipped: the trusted-workloads-only statement written into docs/user/limitations.md and docs/user/mlx-quickstart.md, where limitations.md today disclaims MLX to its own page and the quickstart carries none of it."
+          - id: M16.4-d3
+            done: false
+            desc: "ROADMAP.md: the public Future bullet this block's encoding lands (beside the autoscaling and distributed-inference bullets, stating its relation to both) is rewritten for what actually shipped, under R10's claim rules — and the site sentences land only after the M16 gate is green on the rig, never on the strength of a merged wave."
+          - id: M16.4-d4
+            done: false
+            desc: "the upstream pin register is a WORKSPACE register (frontmatter pinned_upstream_commit, pinned_chart_version, pinned_runtime_wheel_sha256; advisory-only, no new sweep, re-pinning is an operator act under R2), so it is NOT written in this repo. The deliverable HERE is the k3sm-side reader that surfaces those three pins in the workspace Versions table, so a drifted pin is visible where every other external pin already is."
+        acceptance:
+          - id: M16.4-a1
+            met: false
+            check: "hack/verify-examples.sh --lint-only green over examples/mlx-fleet/; hack/verify-image-pins.sh accepts the values file (digests, never tags); docs/user/mlx-fleet.md carries the allow_network grant sentence, the co-resident-workers sentence and the out-of-scope sentence, and names the upstream framework exactly once as a compatibility fact; docs/user/limitations.md and docs/user/mlx-quickstart.md both carry the trusted-workloads paragraph; hack/ci.sh green"
+            method: unit
+      - id: M16.5
+        title: the gate — the real m16.sh ladder, and the conditional lab row
+        status: todo
+        strategy: hard cut
+        depends_on: []
+        note: "The phases.json M16 row ships in this block's encoding as an honest always-red skeleton (manual:false, skeleton:true, the # K3SM-SKELETON sentinel pinned by TestNonManualSkeletonsAlwaysRed, because a CI-runnable gate's exit 0 is trusted as milestone proven); M16.5 replaces the body with the real ladder and flips skeleton to false IN THE SAME CHANGE, the M11.5/M15.3 precedent. The M16-lab row and hack/lab/m16.sh are written ONLY on the single-slot branch, where the routing rung needs a second node; on the two-slot branch no lab row is added and the milestone never reports complete-pending-lab."
+        deliverables:
+          - id: M16.5-d1
+            done: false
+            desc: "hack/acceptance/m16.sh gets its real ten-rung ladder, replacing the skeleton and flipping the phases.json skeleton flag in the same change: m16.0 preflight (a GPU node, the vm class, the examples on disk, and the MIRROR DIGESTS resolving); m16.1 chart install with the nine CRDs Established, the operator Ready as a vm pod, and memory requests present on the operator and the frontend; m16.1b the RBAC assertion re-asserted LIVE against the pinned grant (R11); m16.2 conversion — a v1alpha1 read of a v1beta1 object; m16.3 fleet.yaml applied, the worker Running, mlx.k3sm.io/gpu requests == limits and memory request == limit; m16.4 the worker named in the discovery metadata; m16.5 /v1/models; m16.6 a chat completion through the ClusterIP within a PLACEHOLDER BUDGET (TTFT at most 3x and tok/s at least 0.5x the hack/acceptance/m8.sh direct figure ON THE SAME MACHINE, tightened by a later milestone) with per-hop timing recorded (client to frontend, frontend to worker, engine), because a measured-but-unbounded metric is documentation and not a gate; m16.7 the conformance kit plus the in-process invariants test; m16.8 REQUIRED on the two-slot branch (SKIP-class only under R3's sidecar substitution, where round-robin is the documented contract) — scale the worker to 2 replicas on this node, both Running, which proves R5 live, then send a repeated prefix and assert FROM ROUTER METRICS that the second request went to the warm pod and that its TTFT beat the cold pod's by a recorded margin; m16.9 delete, with every fleet object gone, zero Terminating, and the M8 PVC untouched; m16.10 launchctl kickstart, re-run m16.1 through m16.6, and record the time to serving, because a kickstart kills every vm Pod and the restart cost is part of the deploy contract."
+        acceptance:
+          - id: M16.5-a1
+            met: false
+            check: "hack/acceptance/m16.sh exits 0 on the R16 rig (rungs m16.0 through m16.10, with m16.8 required unless R3's substitution was taken), the phases.json M16 row reads skeleton:false so TestNonManualSkeletonsAlwaysRed no longer selects it, and the run is recorded; hack/ci.sh green"
+            method: integration
 ---
 
 # k3sm — Phase roadmap
@@ -1451,3 +1572,77 @@ out of the docs-only roadmap encoding). Lab legs per `docs/m11-plan.md` §M11.5 
 Service-consumed guest leg and the amd64 fail-closed leg; measured per-VM footprint files the B24
 overhead reconcile. `hack/lab/m5.sh` graduates per the M4-lab precedent (re-point + skeleton flip +
 old-script delete + B34 tombstone in one change).
+
+## M16 — MLX serving fleet ⬜
+`docs/m16-plan.md` is authoritative (encoded 2026-09-16). M16 makes k3sm a place where an
+**upstream inference-serving control plane** — OpenAI-compatible frontend, worker discovery,
+KV-cache-aware routing, multi-model deployment objects — runs over **native Apple-Silicon MLX
+workers**. It is a **sibling of M8, not its successor**: `MLXModel` stays the one-object way to
+serve one model, and the fleet layer sits above it. **Hard cut** — no proto, CRD-field, datastore
+or mesh change anywhere in the milestone; the upstream CRDs are additive objects owned by their own
+operator, and k3sm's single behavior change is a per-node capacity policy on the existing
+`mlx.k3sm.io/gpu` extended resource. The whole ladder develops and gates on **one 8 GiB laptop
+running its own single-node `k3sm server`** (the plan's R16), driven over ssh; every figure is
+compared against `hack/acceptance/m8.sh` on that same machine, never against a bigger Mac's numbers.
+
+What M16 demonstrates by "two workers sharing routing" is stated plainly, because the two are
+easily blurred: it is **prefix-cache-aware routing** — two `mlx-worker` pods each hold their own
+warm prefixes and the router steers a repeated prefix to the pod that already has it. One
+sequence's KV cache shared between two processes mid-request is prefill/decode disaggregation,
+which is NIXL-bound, Linux-only, and **out of M16** with only its seam named.
+
+### M16.0 — spikes S0–S4 ⬜
+Agent-run over ssh, `method: integration`, **never a lab session**: the `phases.json` `M16.0` row
+is `manual: false` with `hack/spike/m16/run.sh` as its gate, so the spikes *are* the acceptance and
+`findings-s0.md`…`findings-s4.md` are the write-back. **S0** proves the k3sm preconditions with no
+framework in the picture: both webhook paths (validating **and** CRD conversion) through a
+`clientConfig.service` ref onto a `runtimeClassName: vm` backend; two `vllm-mlx` engines as host
+processes under a sustained 1 200-token load with percentiles; and the `vm`-guest → native-pod-IP
+dial in both directions, whose two outcomes are equally consequential (reachable also means the
+guest bypasses the proxy and the NetworkPolicy hint). **S1** is the documented macOS build with a
+recorded Rust/maturin toolchain and an infrastructure-free `--discovery-backend file` smoke.
+**S2** puts the control plane on k3sm GPU-free and records the operator `ClusterRole` verbatim.
+**S3** decides the engine shape from the in-process `AsyncEngineCore`. **S4** is the worker end to
+end. Every halt is binding and **every halt's substitution is pre-decided**, so no rung needs a
+human to continue.
+
+### M16.2 — node capacity + the conformance proofs ⬜
+The leaves k3sm owes whether or not the fleet ships: **B285** both webhook-delivery tests with the
+two register rows flipped together (proving one dispatch path proves nothing about the other's
+failure surface), **B286** the `emptyDir{medium: Memory}` verdict on the native path, **B287** the
+literal `gpuDeviceCount` replaced by a tested policy function over `GPUFacts` against the **wired**
+ceiling with a cumulative fit check, and **B289** the operator RBAC grant pinned as a golden test.
+`pkg/mlxfleet` gives the upstream GVK strings one home, and `k3sm status` gains a fleet row that
+prints the capacity `N` and the per-slot memory floor. `B288` (the kine-port deny) is `runtimed`'s.
+
+### M16.3 — the `mlx-worker` image ⬜
+`hack/images/lib/pybuild.sh` is factored out of `mlx-serve` **first**, because two copies of the
+staging logic drift and the lockfiles are what must not: `TestMLXImagesEnginePinLockstep` pins both
+images to one `vllm-mlx` version. The upstream runtime wheel is **built on darwin** from the pinned
+tag under a pinned Rust toolchain and maturin, with `assert_wheel_pin` comparing the just-built
+sha256 to the recorded one **before** staging. That hash is a **reproducibility record, not
+independent provenance** — no published darwin wheel exists to pin against — and the user doc says
+so. The publish is the operator's, and its digest is what the example and the gate consume.
+
+### M16.4 — example, docs, and the pin register ⬜
+`examples/mlx-fleet/` carries digest-pinned mirror images, explicit memory requests on the
+control-plane `vm` Pods (the system-reserved carve-out is scheduling-only; jetsam picks the largest
+RSS, not the most important process), and `mlx.k3sm.io/gpu` in requests **and** limits with memory
+request == limit. `docs/user/mlx-fleet.md` states the security posture in its own words — the
+worker's grant is `allow_network`, which renders unfiltered network access under `(deny default)`;
+co-resident workers are not isolated from each other; every request crosses the native worker, so
+**end-to-end untrusted-tenant serving is out of scope** — and the trusted-workloads paragraph M8
+called launch-critical, and never shipped, finally lands in `limitations.md` and
+`mlx-quickstart.md`. The upstream framework is **named once as a compatibility fact, never as the
+feature**.
+
+### M16.5 — gate ⬜
+`hack/acceptance/m16.sh` ships in this encoding as an honest always-red skeleton (`manual: false`,
+`skeleton: true`, the `# K3SM-SKELETON` sentinel pinned by `TestNonManualSkeletonsAlwaysRed`) and
+M16.5 replaces it with the real ten-rung ladder, flipping `skeleton` to `false` in the same change
+— the M11.5 / M15.3 precedent. The ladder runs from preflight and mirror-digest resolution through
+the chart install, the live RBAC re-assertion, conversion, the worker's guardrails, discovery,
+`/v1/models`, a completion **inside a placeholder budget with per-hop timing**, the conformance
+kit, the warm-prefix routing rung, deletion with zero `Terminating` objects, and a `kickstart`
+re-run that records the time back to serving. The `M16-lab` row and `hack/lab/m16.sh` are written
+**only** on the single-slot branch, where the routing rung needs a second node.

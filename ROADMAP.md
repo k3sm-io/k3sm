@@ -122,6 +122,13 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
 - **De-EXPERIMENTAL HA.** The v0.3 headline, once it has been run on two Macs with Postgres.
 - **ANE.** Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA.** Dynamic Resource Allocation for GPUs, once extended resources have shipped.
+- **A serving fleet for MLX models.** Multi-model, multi-worker inference above `MLXModel`: an
+  OpenAI-compatible frontend, worker discovery, and routing that prefers the worker already
+  holding a request's prefix. The control plane is the upstream NVIDIA Dynamo serving stack
+  (Apache-2.0) run as `vm` Pods, with the workers native beneath it on the GPU. It is the layer
+  the two bullets below would attach to: distributed inference is what a fleet would route
+  across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
+  serve a single model.
 - **JACCL / distributed inference.** Multi-Mac model sharding (the reserved `MLXModel.Distributed`
   seam + the already-rendered headless governing Service).
 - **Autoscaling.** Scale-to-zero / activator-fronted model serving.
