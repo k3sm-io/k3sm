@@ -105,14 +105,39 @@ var clusterViewRows = []string{RowAPIServer, RowNode, RowWorkloads, RowDatastore
 // provenance right-aligned beside it, one line per subsystem, the server's last
 // log line when it is crash-looping, and the ordered next commands.
 func Render(r Report, s Style) string {
+	rows := make([]Row, 0, len(r.Rows))
+	for _, name := range overviewRows(r.Role) {
+		if row, ok := r.Row(name); ok {
+			rows = append(rows, row)
+		}
+	}
+	return renderScreen(r, rows, s)
+}
+
+// RenderRows returns the same screen as Render for a report whose rows are the
+// caller's own, rendered in the order the report carries them rather than
+// filtered through the shipped row vocabulary.
+//
+// It exists for `k3sm doctor`, whose rows are preflight checks (arch, macos,
+// sip, …) and therefore match none of the subsystem names Render's screens
+// select by. The alternative — a second renderer in cmd/k3sm — would give the
+// two commands separately-maintained ideas of what a row looks like, and the
+// first divergence an operator would notice is the one thing both screens are
+// for: which column the health word is in.
+//
+// This package still knows nothing about preflight: it lays out Rows a caller
+// built, exactly as it lays out the ones Collect builds.
+func RenderRows(r Report, s Style) string {
+	return renderScreen(r, r.Rows, s)
+}
+
+// renderScreen is the overview body: the headline, the given rows in order,
+// each one's quoted log line, and the Next block.
+func renderScreen(r Report, rows []Row, s Style) string {
 	var b strings.Builder
 	b.WriteString(headline(r, s))
 	b.WriteString("\n\n")
-	for _, name := range overviewRows(r.Role) {
-		row, ok := r.Row(name)
-		if !ok {
-			continue
-		}
+	for _, row := range rows {
 		b.WriteString(renderRow(row, s))
 		if log := row.Wide["log"]; log != "" {
 			b.WriteString(logIndent + "log: " + log + repeatSuffix(row.Wide["log-repeats"]) + "\n")

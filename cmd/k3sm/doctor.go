@@ -17,9 +17,12 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -31,6 +34,7 @@ import (
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
+	"k3sm.io/k3sm/pkg/version"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -68,12 +72,20 @@ func (s doctorStatus) String() string {
 	}
 }
 
-// checkResult is the outcome of one check: a stable name, a status verdict, and a
-// human-readable detail explaining the verdict.
+// checkResult is the outcome of one check: a stable name, a status verdict, a
+// human-readable detail explaining the verdict, and the remedy that repairs it.
+//
+// detail says WHAT IS TRUE; remedy says WHAT TO RUN, one step per line, and is
+// empty only when there is nothing to do — a PASS, or a SKIP the operator
+// cannot act on. Every FAIL and every WARN carries one, because the rows are
+// rolled up by status.Aggregate, which builds the screen's `Next:` block out of
+// exactly these lines: a non-pass row with no remedy is a complaint with no
+// answer, and it silently shortens the block an operator reads.
 type checkResult struct {
 	name   string
 	status doctorStatus
 	detail string
+	remedy string
 }
 
 // doctorEnv is the set of fakeable seams the pure check functions read. The real
@@ -125,26 +137,47 @@ func doctorChecks() []doctorCheck {
 // Apple-Silicon-only, so a non-arm64 arch is a hard FAIL.
 func checkArch(env doctorEnv) checkResult {
 	if env.goarch == "arm64" {
-		return checkResult{"arch", statusPass, "arm64 (Apple Silicon)"}
+		return checkResult{name: "arch", status: statusPass, detail: "arm64 (Apple Silicon)"}
 	}
-	return checkResult{"arch", statusFail, fmt.Sprintf("%s — k3sm is Apple-Silicon-only (arm64)", env.goarch)}
+	return checkResult{
+		name:   "arch",
+		status: statusFail,
+		detail: fmt.Sprintf("%s — k3sm is Apple-Silicon-only (arm64)", env.goarch),
+		remedy: "run k3sm on an Apple Silicon Mac — there is no Intel build of it",
+	}
 }
 
 // checkMacOS verifies macOS is at or above the supported floor. Below the floor is
 // a FAIL; a probe/parse error is a WARN (could not determine, not proven bad).
 func checkMacOS(env doctorEnv) checkResult {
+	const readByHand = "read the version by hand: sysctl -n kern.osproductversion"
 	ver, err := env.macOSVersion()
 	if err != nil {
-		return checkResult{"macos", statusWarn, fmt.Sprintf("could not determine macOS version: %v", err)}
+		return checkResult{
+			name:   "macos",
+			status: statusWarn,
+			detail: fmt.Sprintf("could not determine macOS version: %v", err),
+			remedy: readByHand,
+		}
 	}
 	major, perr := majorVersion(ver)
 	if perr != nil {
-		return checkResult{"macos", statusWarn, fmt.Sprintf("unparseable macOS version %q: %v", ver, perr)}
+		return checkResult{
+			name:   "macos",
+			status: statusWarn,
+			detail: fmt.Sprintf("unparseable macOS version %q: %v", ver, perr),
+			remedy: readByHand,
+		}
 	}
 	if major >= supportedMacOSFloor {
-		return checkResult{"macos", statusPass, fmt.Sprintf("macOS %s (>= %d)", ver, supportedMacOSFloor)}
+		return checkResult{name: "macos", status: statusPass, detail: fmt.Sprintf("macOS %s (>= %d)", ver, supportedMacOSFloor)}
 	}
-	return checkResult{"macos", statusFail, fmt.Sprintf("macOS %s is below the supported floor (macOS %d)", ver, supportedMacOSFloor)}
+	return checkResult{
+		name:   "macos",
+		status: statusFail,
+		detail: fmt.Sprintf("macOS %s is below the supported floor (macOS %d)", ver, supportedMacOSFloor),
+		remedy: fmt.Sprintf("upgrade this Mac to macOS %d or later", supportedMacOSFloor),
+	}
 }
 
 // checkSIP reports System Integrity Protection posture. k3sm needs no SIP-off
@@ -153,12 +186,22 @@ func checkMacOS(env doctorEnv) checkResult {
 func checkSIP(env doctorEnv) checkResult {
 	on, err := env.sipEnabled()
 	if err != nil {
-		return checkResult{"sip", statusWarn, fmt.Sprintf("could not determine SIP status: %v", err)}
+		return checkResult{
+			name:   "sip",
+			status: statusWarn,
+			detail: fmt.Sprintf("could not determine SIP status: %v", err),
+			remedy: "read the posture by hand: csrutil status",
+		}
 	}
 	if on {
-		return checkResult{"sip", statusPass, "System Integrity Protection enabled (k3sm needs no SIP-off)"}
+		return checkResult{name: "sip", status: statusPass, detail: "System Integrity Protection enabled (k3sm needs no SIP-off)"}
 	}
-	return checkResult{"sip", statusWarn, "SIP disabled — unexpected; k3sm does not require it and this is a weaker posture"}
+	return checkResult{
+		name:   "sip",
+		status: statusWarn,
+		detail: "SIP disabled — unexpected; k3sm does not require it and this is a weaker posture",
+		remedy: "re-enable it from Recovery (Startup Security Utility, or csrutil enable) — nothing in k3sm needs it off",
+	}
 }
 
 // checkHelper reports the k3sm-netd root helper's launchd state. Installed and
@@ -170,11 +213,21 @@ func checkHelper(env doctorEnv) checkResult {
 	installed, running := env.helperState()
 	switch {
 	case installed && running:
-		return checkResult{"netd-helper", statusPass, install.NetdLabel + " installed and running"}
+		return checkResult{name: "netd-helper", status: statusPass, detail: install.NetdLabel + " installed and running"}
 	case installed:
-		return checkResult{"netd-helper", statusWarn, install.NetdLabel + " installed but not running — the default runtimed runtime and the datapath need it (sudo launchctl kickstart -k system/" + install.NetdLabel + ")"}
+		return checkResult{
+			name:   "netd-helper",
+			status: statusWarn,
+			detail: install.NetdLabel + " installed but not running — the default runtimed runtime and the datapath need it",
+			remedy: "sudo launchctl kickstart -k system/" + install.NetdLabel,
+		}
 	default:
-		return checkResult{"netd-helper", statusWarn, install.NetdLabel + " not detected — either not installed, or not readable without privilege (a system-domain launchctl print may need root); the default runtimed runtime (unprivileged) and the datapath need it — an unprivileged node without it refuses to start (run `sudo k3sm install`, or pass --runtime hostprocess for rootless dev). Re-run doctor with sudo to confirm it is truly absent"}
+		return checkResult{
+			name:   "netd-helper",
+			status: statusWarn,
+			detail: install.NetdLabel + " not detected — either not installed, or not readable without privilege (a system-domain launchctl print may need root); the default runtimed runtime (unprivileged) and the datapath need it, and an unprivileged node without it refuses to start",
+			remedy: "sudo k3sm doctor   # confirm it is truly absent rather than unreadable\nsudo k3sm install   # or pass --runtime hostprocess for rootless dev",
+		}
 	}
 }
 
@@ -182,9 +235,14 @@ func checkHelper(env doctorEnv) checkResult {
 // runtime dependency, so absence is a WARN.
 func checkBrew(env doctorEnv) checkResult {
 	if env.brewPresent() {
-		return checkResult{"brew", statusPass, "Homebrew present"}
+		return checkResult{name: "brew", status: statusPass, detail: "Homebrew present"}
 	}
-	return checkResult{"brew", statusWarn, "Homebrew not found — an install vector, not required at runtime"}
+	return checkResult{
+		name:   "brew",
+		status: statusWarn,
+		detail: "Homebrew not found — an install vector, not required at runtime",
+		remedy: "install Homebrew from https://brew.sh only if you want the brew install path; nothing k3sm runs needs it",
+	}
 }
 
 // checkDatastore reports the kine SQLite datastore posture. It is a pure REPORTER:
@@ -200,19 +258,29 @@ func checkBrew(env doctorEnv) checkResult {
 func checkDatastore(env doctorEnv) checkResult {
 	present, uv, jm, err := env.datastorePosture()
 	if err != nil {
-		return checkResult{"datastore", statusWarn, fmt.Sprintf("could not read datastore posture: %v", err)}
+		return checkResult{
+			name:   "datastore",
+			status: statusWarn,
+			detail: fmt.Sprintf("could not read datastore posture: %v", err),
+			remedy: "sudo k3sm doctor   # the datastore is root-owned; an ordinary account cannot read it",
+		}
 	}
 	if !present {
 		if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
-			return checkResult{"datastore", statusSkip, "no state.db, and none is expected: this Mac is installed as a k3sm worker, which runs no control plane and no kine datastore"}
+			return checkResult{name: "datastore", status: statusSkip, detail: "no state.db, and none is expected: this Mac is installed as a k3sm worker, which runs no control plane and no kine datastore"}
 		}
-		return checkResult{"datastore", statusSkip, "no state.db yet (fresh node — the control plane has not initialized the kine SQLite datastore)"}
+		return checkResult{name: "datastore", status: statusSkip, detail: "no state.db yet (fresh node — the control plane has not initialized the kine SQLite datastore)"}
 	}
 	detail := fmt.Sprintf("kine %s, user_version=%d, journal_mode=%s", executor.DefaultKineVersion, uv, jm)
 	if jm != "wal" {
-		return checkResult{"datastore", statusWarn, detail + " (expected journal_mode=wal)"}
+		return checkResult{
+			name:   "datastore",
+			status: statusWarn,
+			detail: detail + " (expected journal_mode=wal)",
+			remedy: "sudo launchctl kickstart -k system/" + install.ServerLabel + "   # let the control plane re-open the datastore",
+		}
 	}
-	return checkResult{"datastore", statusPass, detail}
+	return checkResult{name: "datastore", status: statusPass, detail: detail}
 }
 
 // checkXcodeToolchain reports what the k3sm.io/xcode-toolchain annotation grants
@@ -240,21 +308,29 @@ func checkXcodeToolchain(env doctorEnv) checkResult {
 	const (
 		name   = "toolchain"
 		once   = "The directory is resolved once, when the node daemon starts, so a later `xcode-select --switch` is invisible until it restarts."
-		remedy = "For the Xcode toolchain run `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`."
+		remedy = "sudo xcode-select -s /Applications/Xcode.app/Contents/Developer   # then restart the node daemon"
 	)
 	dir, err := env.developerDir()
 	if err != nil {
-		return checkResult{name, statusWarn, fmt.Sprintf(
-			"no developer toolchain on this node (%v), so %s grants nothing here. %s %s",
-			err, runtimev1.AnnotationXcodeToolchain, remedy, once)}
+		return checkResult{
+			name:   name,
+			status: statusWarn,
+			detail: fmt.Sprintf("no developer toolchain on this node (%v), so %s grants nothing here. %s",
+				err, runtimev1.AnnotationXcodeToolchain, once),
+			remedy: remedy,
+		}
 	}
 	granted, verr := sandbox.ValidateXcodeToolchainDir(dir, sandbox.Posture{})
 	if verr != nil {
-		return checkResult{name, statusWarn, fmt.Sprintf(
-			"%s is not a directory the toolchain grant accepts, so %s grants nothing here — and needs to grant nothing if it is a Command Line Tools root, which a pod already reads. %s %s",
-			dir, runtimev1.AnnotationXcodeToolchain, remedy, once)}
+		return checkResult{
+			name:   name,
+			status: statusWarn,
+			detail: fmt.Sprintf("%s is not a directory the toolchain grant accepts, so %s grants nothing here — and needs to grant nothing if it is a Command Line Tools root, which a pod already reads. %s",
+				dir, runtimev1.AnnotationXcodeToolchain, once),
+			remedy: remedy,
+		}
 	}
-	return checkResult{name, statusPass, fmt.Sprintf(
+	return checkResult{name: name, status: statusPass, detail: fmt.Sprintf(
 		"%s — %s grants a pod read access to this toolchain. %s",
 		granted, runtimev1.AnnotationXcodeToolchain, once)}
 }
@@ -272,40 +348,63 @@ func checkXcodeToolchain(env doctorEnv) checkResult {
 // with it.
 func checkAgentDaemon(env doctorEnv) checkResult {
 	const name = "agent-daemon"
+	// rejoin is the two-Mac repair, one step per line: the token is minted on
+	// the CONTROL PLANE and only then can this Mac be reinstalled with it.
+	rejoin := fmt.Sprintf(
+		"k3sm token create   # on the control-plane Mac\nsudo k3sm install --role agent --server <control-plane> --token-file <file>   # here (staged at %s)\nsudo k3sm status logs agent   # read %s",
+		agentStagedTokenPath(), install.AgentLogPath())
 	role, installed := env.nodeRole()
 	if !installed || role != install.RoleAgent {
-		return checkResult{name, statusSkip, fmt.Sprintf(
+		return checkResult{name: name, status: statusSkip, detail: fmt.Sprintf(
 			"this Mac is not installed as a k3sm worker (%s is not on disk), so there is no %s daemon to check",
 			install.AgentLabel+".plist", install.AgentLabel)}
 	}
 	daemonInstalled, running := env.agentState()
 	if !daemonInstalled || !running {
-		return checkResult{name, statusFail, fmt.Sprintf(
-			"%s is not running, so this worker is not serving pods — run `sudo launchctl kickstart -k system/%s` and read %s",
-			install.AgentLabel, install.AgentLabel, install.AgentLogPath())}
+		return checkResult{
+			name:   name,
+			status: statusFail,
+			detail: fmt.Sprintf("%s is not running, so this worker is not serving pods", install.AgentLabel),
+			remedy: fmt.Sprintf("sudo launchctl kickstart -k system/%s\nsudo k3sm status logs agent   # read %s",
+				install.AgentLabel, install.AgentLogPath()),
+		}
 	}
 	state, notAfter := env.agentCredential()
 	switch state {
 	case status.CredentialAbsent:
-		return checkResult{name, statusWarn, fmt.Sprintf(
-			"%s is running but this Mac holds no node credential yet, so it has not joined a cluster: read %s, then mint a token on the control-plane Mac (`k3sm token create`), stage it here and re-run `sudo k3sm install --role agent --server <control-plane> --token-file <file>` (the join token is read from %s)",
-			install.AgentLabel, install.AgentLogPath(), agentStagedTokenPath())}
+		return checkResult{
+			name:   name,
+			status: statusWarn,
+			detail: fmt.Sprintf("%s is running but this Mac holds no node credential yet, so it has not joined a cluster", install.AgentLabel),
+			remedy: rejoin,
+		}
 	case status.CredentialExpired:
-		return checkResult{name, statusWarn, fmt.Sprintf(
-			"the node credential expired on %s, so this worker can no longer authenticate: mint a token on the control-plane Mac (`k3sm token create`) and re-run `sudo k3sm install --role agent --server <control-plane> --token-file <file>` here to rejoin",
-			notAfter.UTC().Format("2006-01-02"))}
+		return checkResult{
+			name:   name,
+			status: statusWarn,
+			detail: fmt.Sprintf("the node credential expired on %s, so this worker can no longer authenticate",
+				notAfter.UTC().Format("2006-01-02")),
+			remedy: rejoin,
+		}
 	case status.CredentialCorrupt:
-		return checkResult{name, statusWarn, fmt.Sprintf(
-			"the stored node credential in %s does not parse; read %s, remove the offending file to force a fresh token join, and rejoin with a token minted on the control-plane Mac",
-			agentCredentialDir(), install.AgentLogPath())}
+		return checkResult{
+			name:   name,
+			status: statusWarn,
+			detail: fmt.Sprintf("the stored node credential in %s does not parse", agentCredentialDir()),
+			remedy: fmt.Sprintf("remove the unparseable credential under %s to force a fresh token join\n%s", agentCredentialDir(), rejoin),
+		}
 	case status.CredentialValid:
-		return checkResult{name, statusPass, fmt.Sprintf(
+		return checkResult{name: name, status: statusPass, detail: fmt.Sprintf(
 			"%s is running and this node's credential is valid until %s",
 			install.AgentLabel, notAfter.UTC().Format("2006-01-02"))}
 	default:
-		return checkResult{name, statusSkip, fmt.Sprintf(
-			"%s is running; the node credential in %s is not readable as this user (re-run with sudo)",
-			install.AgentLabel, agentCredentialDir())}
+		return checkResult{
+			name:   name,
+			status: statusSkip,
+			detail: fmt.Sprintf("%s is running; the node credential in %s is not readable as this user",
+				install.AgentLabel, agentCredentialDir()),
+			remedy: "sudo k3sm doctor",
+		}
 	}
 }
 
@@ -337,33 +436,205 @@ func majorVersion(v string) (int, error) {
 	return strconv.Atoi(v)
 }
 
-// runDoctor runs the preflight environment + datastore-posture checks and prints a
-// ladder. It exits non-zero (returns an error) iff any check is statusFail; WARN
-// and SKIP are surfaced but do not fail the command.
-func runDoctor(args []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+// doctorUsage is the canonical home of the `k3sm doctor` exit-code table. It is
+// printed by `k3sm doctor --help`, and nothing else restates the numbers.
+const doctorUsage = `k3sm doctor — preflight checks for this Mac
+
+Usage: k3sm doctor [flags]
+
+It reports what k3sm needs from the machine — the CPU, the macOS floor, SIP, the
+` + "`" + install.NetdLabel + "`" + ` helper, Homebrew, the kine datastore, the Xcode toolchain
+grant, and (on a worker) the agent daemon and its node credential. Every row
+that is not a pass carries the command that repairs it, collected under ` + "`Next:`" + `.
+
+Flags:
+  -work-dir <dir>     control-plane state root (the kine state.db lives here)
+  --json              print the report as JSON — the same shape as ` + "`k3sm status -o json`" + `
+  --no-color          never emit colour or glyphs
+
+Exit codes:
+  0  every check passes (or is deliberately skipped)
+  1  at least one check FAILED — the code ` + "`k3sm doctor`" + ` has always returned for this
+  2  usage — a bad flag
+  4  WARN only: nothing is broken, something is off. This is ` + "`k3sm status`" + `'s
+     "degraded" code, because it is the same verdict about the same machine
+`
+
+// Doctor's own exit code for a failed check.
+//
+// It is 1, and deliberately NOT status.VerdictDegraded's 4: `k3sm doctor` has
+// returned 1 for a failed check since it shipped, the release instructions tell
+// an operator to run it and read that, and a preflight FAIL is not the same
+// event as a degraded cluster. Every OTHER doctor code comes from
+// status.Verdict.ExitCode, so a WARN-only run reports 4 exactly as `k3sm
+// status` does. The cost of the carve-out is that 1 means "a check failed" here
+// and "an internal error" in `k3sm status`; the two tables are printed in full
+// by their own --help, which is where an operator reads them.
+const exitDoctorCheckFailed = 1
+
+// doctorSeverity maps a preflight verdict onto the row severity and STATE word
+// `k3sm status` renders. The words are the ones the status screens already use,
+// so one glyph column means one thing across both commands.
+func doctorSeverity(s doctorStatus) (status.Severity, status.RowState) {
+	switch s {
+	case statusPass:
+		return status.SeverityOK, status.StateOK
+	case statusWarn:
+		return status.SeverityWarn, doctorStateWarn
+	case statusFail:
+		return status.SeverityFail, status.StateFailed
+	default:
+		return status.SeveritySkip, status.StateSkip
+	}
+}
+
+// doctorStateWarn is the STATE word a warning check renders. The shipped status
+// vocabulary has no plain "warn" — its rows name what is wrong with the
+// subsystem (crash-loop, wrong-owner, not-mounted) — but a preflight check's
+// warning is exactly and only "this is off", so the word is the severity's.
+const doctorStateWarn status.RowState = "warn"
+
+// doctorRow converts one check result into a report row.
+func doctorRow(r checkResult) status.Row {
+	severity, state := doctorSeverity(r.status)
+	return status.Row{Name: r.name, State: state, Severity: severity, Detail: r.detail, Remedy: r.remedy}
+}
+
+// doctorReport runs every check and folds the results into the same report
+// shape `k3sm status` produces: a verdict, a summary, the rows, and the ordered
+// remedies. It is PURE — every probe is behind the doctorEnv seam — so the gate
+// drives it with fakes.
+//
+// installed is passed to Aggregate as TRUE unconditionally, which is the one
+// place doctor deliberately differs from status. Aggregate answers
+// "not-installed" first and outright, because a status report about a Mac with
+// no k3sm on it has nothing to say; a PREFLIGHT report about that Mac is the
+// whole point of the command — it answers "will k3sm work here" before there is
+// an install. The install-shaped rows (netd-helper, agent-daemon) carry that
+// fact themselves.
+func doctorReport(env doctorEnv, ver version.Info, now time.Time) status.Report {
+	checks := doctorChecks()
+	rows := make([]status.Row, 0, len(checks))
+	var passed, skipped int
+	for _, c := range checks {
+		r := c.fn(env)
+		switch r.status {
+		case statusPass:
+			passed++
+		case statusSkip:
+			skipped++
+		}
+		rows = append(rows, doctorRow(r))
+	}
+	role, _ := env.nodeRole()
+	verdict, summary, next := status.Aggregate(rows, true, role)
+	if verdict == status.VerdictRunning {
+		// Aggregate's healthy summary and its one next step are claims about a
+		// SERVING control plane, which a preflight has not established and is
+		// not about. A clean doctor run says what it actually checked.
+		summary = fmt.Sprintf("%d preflight checks pass, %d skipped", passed, skipped)
+		next = nil
+	}
+	host, err := env.macOSVersion()
+	if err != nil {
+		host = ""
+	}
+	return status.Report{
+		Verdict:   verdict,
+		Role:      role,
+		Summary:   summary,
+		Rows:      rows,
+		Next:      next,
+		Version:   ver,
+		Host:      host,
+		Timestamp: now,
+	}
+}
+
+// doctorExitCode is the process exit status for a doctor report: 1 when any
+// check failed, and the verdict's own code otherwise. See exitDoctorCheckFailed
+// for why the failure code is not the verdict's.
+func doctorExitCode(rep status.Report) int {
+	for _, row := range rep.Rows {
+		if row.Severity == status.SeverityFail {
+			return exitDoctorCheckFailed
+		}
+	}
+	return rep.Verdict.ExitCode()
+}
+
+// doctorOptions is the parsed doctor command line.
+type doctorOptions struct {
+	workDir string
+	json    bool
+	noColor bool
+}
+
+// parseDoctorArgs parses the doctor command line.
+func parseDoctorArgs(args []string, errOut io.Writer) (doctorOptions, error) {
 	// Posture-aware default (the _k3sm control plane writes <home>/server, not the
 	// root-only const); a resolve failure falls back to the const, overridable.
 	defaultWorkDir, err := executor.ResolveWorkDir()
 	if err != nil {
 		defaultWorkDir = executor.DefaultWorkDir
 	}
-	workDir := fs.String("work-dir", defaultWorkDir, "control-plane state root (the kine state.db lives here)")
-	_ = fs.Parse(args)
+	o := doctorOptions{workDir: defaultWorkDir}
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+	fs.Usage = func() { fmt.Fprint(errOut, doctorUsage) }
+	fs.StringVar(&o.workDir, "work-dir", o.workDir, "control-plane state root (the kine state.db lives here)")
+	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
+	fs.BoolVar(&o.noColor, "no-color", false, "never emit colour or glyphs")
+	if err := fs.Parse(args); err != nil {
+		return o, err
+	}
+	if fs.NArg() > 0 {
+		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return o, nil
+}
 
-	env := realDoctorEnv(*workDir)
-	var failed bool
-	for _, c := range doctorChecks() {
-		r := c.fn(env)
-		fmt.Printf("[%s] %-12s %s\n", r.status, r.name, r.detail)
-		if r.status == statusFail {
-			failed = true
+// emitDoctorReport writes one report in the requested format and returns its
+// exit code. The JSON is status.Report's own encoding, produced by the same
+// encoder `k3sm status -o json` uses, so a consumer parses one shape.
+func emitDoctorReport(rep status.Report, o doctorOptions, out, errOut io.Writer, color bool) int {
+	if o.json {
+		encoded, err := json.MarshalIndent(rep, "", "  ")
+		if err != nil {
+			fmt.Fprintln(errOut, "k3sm doctor: encode report:", err)
+			return exitInternalError
 		}
+		if _, err := fmt.Fprintln(out, string(encoded)); err != nil {
+			fmt.Fprintln(errOut, "k3sm doctor: write report:", err)
+			return exitInternalError
+		}
+		return doctorExitCode(rep)
 	}
-	if failed {
-		return errors.New("one or more preflight checks failed")
+	if _, err := io.WriteString(out, status.RenderRows(rep, status.Style{Color: color, Glyphs: color})); err != nil {
+		fmt.Fprintln(errOut, "k3sm doctor: write report:", err)
+		return exitInternalError
 	}
-	return nil
+	return doctorExitCode(rep)
+}
+
+// runDoctor is the `k3sm doctor` entry point. It runs the preflight checks,
+// renders them on the status screen's columns, and returns the process exit
+// code — its own, rather than an error, because the exit code IS the verdict
+// here (see doctorUsage's table).
+func runDoctor(args []string) int {
+	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
+		fmt.Print(doctorUsage)
+		return 0
+	}
+	o, err := parseDoctorArgs(args, os.Stderr)
+	if err != nil {
+		if !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, "k3sm doctor:", err)
+		}
+		return exitUsage
+	}
+	rep := doctorReport(realDoctorEnv(o.workDir), version.Get(), time.Now())
+	return emitDoctorReport(rep, o, os.Stdout, os.Stderr, status.ColorEnabled(os.Stdout, o.noColor, os.Getenv))
 }
 
 // realDoctorEnv wires the real probes for a given work dir. This is the only place

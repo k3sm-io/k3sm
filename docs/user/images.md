@@ -210,7 +210,8 @@ sends anything. Pods are fenced off it separately, by the sandbox profile every 
 share the daemon's account, so file permissions alone would not keep them out.
 
 If a command reports that it cannot dial the socket, the node is not running, or it is running with
-a different runtime root. `k3sm doctor` reports the former; the latter is a `--socket` away.
+a different runtime root. `k3sm doctor` reports the former in its daemon rows, with the command that
+repairs it under `Next:`; the latter is a `--socket` away.
 
 ## Working With the Store: `pull`, `tag`, `untag`, `inspect`, `save`
 

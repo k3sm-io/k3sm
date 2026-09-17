@@ -135,10 +135,10 @@ func main() {
 		// wrapper the other verbs use would throw the answer away.
 		os.Exit(runStatus(os.Args[2:]))
 	case "doctor":
-		if err := runDoctor(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "k3sm doctor:", err)
-			os.Exit(1)
-		}
+		// doctor returns its own exit code for the same reason status does: the
+		// code is the verdict (1 for a failed check, 4 for a WARN-only run),
+		// and the generic exit-1 wrapper would collapse the two.
+		os.Exit(runDoctor(os.Args[2:]))
 	case "dev":
 		if err := runDev(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm dev:", err)

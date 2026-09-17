@@ -237,9 +237,14 @@ func TestDoctorChecksTable(t *testing.T) {
 		if got.status == statusPass {
 			t.Fatalf("a worker with no node credential read as PASS: %q", got.detail)
 		}
+		// The two-Mac repair is in the REMEDY, which is the field the report's
+		// Next: block is built from; the detail states the condition. What
+		// matters is that the operator is told all three, so the assertion is
+		// over the pair.
+		told := got.detail + "\n" + got.remedy
 		for _, want := range []string{"k3sm token create", "--token-file", "agent.log"} {
-			if !strings.Contains(got.detail, want) {
-				t.Errorf("detail does not name %q — the remedy spans two Macs and has to say so:\n%s", want, got.detail)
+			if !strings.Contains(told, want) {
+				t.Errorf("neither detail nor remedy names %q — the repair spans two Macs and has to say so:\n%s", want, told)
 			}
 		}
 	})

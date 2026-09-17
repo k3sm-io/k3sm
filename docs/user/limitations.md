@@ -116,7 +116,8 @@ Two things follow that are easy to trip over. The node's developer directory is 
 node daemon starts**, so running `sudo xcode-select -s …` changes nothing for a running node until
 the daemon restarts. And a Pod whose request is not granted **starts and reports healthy**, building
 against whatever it can already reach. To see which case a node is in, run
-`k3sm doctor` on it and read the `toolchain` row; a Pod that asked and got nothing also carries a
+`k3sm doctor` on it and read the `toolchain` row, whose fix is repeated under `Next:` when it warns;
+a Pod that asked and got nothing also carries a
 `XcodeToolchainUngranted` warning Event in `kubectl describe pod`.
 
 Whichever case you are in, every `xcrun` invocation inside a Pod prints

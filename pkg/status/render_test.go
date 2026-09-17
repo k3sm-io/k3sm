@@ -301,3 +301,34 @@ func TestRenderWideAddsColumnsOnly(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderRowsKeepsTheCallersRows pins the one property that distinguishes
+// RenderRows from Render: it lays out the rows the report carries, in order,
+// including names that are in no shipped screen — which is the whole reason
+// `k3sm doctor` can share this renderer. The headline, the state column and the
+// Next block are the same ones Render produces.
+func TestRenderRowsKeepsTheCallersRows(t *testing.T) {
+	t.Parallel()
+
+	rows := []Row{
+		{Name: "arch", State: StateOK, Severity: SeverityOK, Detail: "arm64 (Apple Silicon)"},
+		{Name: "macos", State: StateFailed, Severity: SeverityFail, Detail: "macOS 15.5 is below the floor", Remedy: "upgrade this Mac"},
+	}
+	v, summary, next := Aggregate(rows, true, dataroot.RoleServer)
+	r := Report{Verdict: v, Role: dataroot.RoleServer, Summary: summary, Rows: rows, Next: next, Version: goldenVersion, Host: goldenHost, Timestamp: goldenTime}
+
+	screen := RenderRows(r, Style{})
+	for _, want := range []string{"arch", "macos", "arm64 (Apple Silicon)", "below the floor", "Next: upgrade this Mac"} {
+		if !strings.Contains(screen, want) {
+			t.Errorf("screen does not carry %q:\n%s", want, screen)
+		}
+	}
+	if !strings.HasPrefix(screen, "k3sm "+v.String()+": ") {
+		t.Errorf("screen does not lead with the shared headline:\n%s", screen)
+	}
+	// Render, which selects by the shipped vocabulary, shows none of them —
+	// the difference the helper exists for.
+	if overview := Render(r, Style{}); strings.Contains(overview, "arm64 (Apple Silicon)") {
+		t.Errorf("Render rendered a row that is in no screen's vocabulary:\n%s", overview)
+	}
+}
