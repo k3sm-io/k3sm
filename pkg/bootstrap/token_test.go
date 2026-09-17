@@ -127,16 +127,16 @@ func TestFileTokenStoreRoundTrip(t *testing.T) {
 	// A different store instance over the same file verifies it (separate process).
 	verifier := bootstrap.NewFileTokenStore(path, clock.Now)
 	tok := bootstrap.FormatToken("deadbeef", user, secret)
-	if err := verifier.VerifyToken(tok); err != nil {
+	if err := verifier.VerifyToken(t.Context(), tok); err != nil {
 		t.Errorf("verify across instances: %v", err)
 	}
-	if err := verifier.VerifyToken(bootstrap.FormatToken("deadbeef", user, "wrong")); !errors.Is(err, bootstrap.ErrTokenMismatch) {
+	if err := verifier.VerifyToken(t.Context(), bootstrap.FormatToken("deadbeef", user, "wrong")); !errors.Is(err, bootstrap.ErrTokenMismatch) {
 		t.Errorf("wrong secret err = %v, want ErrTokenMismatch", err)
 	}
 
 	// Expired after the TTL.
 	clock.now = clock.now.Add(2 * time.Hour)
-	if err := verifier.VerifyToken(tok); !errors.Is(err, bootstrap.ErrTokenExpired) {
+	if err := verifier.VerifyToken(t.Context(), tok); !errors.Is(err, bootstrap.ErrTokenExpired) {
 		t.Errorf("expired err = %v, want ErrTokenExpired", err)
 	}
 }

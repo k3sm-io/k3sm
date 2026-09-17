@@ -256,7 +256,7 @@ func bufLogger(b *bytes.Buffer) *slog.Logger {
 
 type stubTokens struct{}
 
-func (stubTokens) VerifyToken(string) error { return nil }
+func (stubTokens) VerifyToken(context.Context, string) error { return nil }
 
 type stubNodePasswords struct{}
 

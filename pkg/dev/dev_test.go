@@ -92,7 +92,7 @@ func TestUpDatapathSingletonLockHeld(t *testing.T) {
 func TestPreflightReclaimNoManifest(t *testing.T) {
 	m := newTestManager(t, newFakeSystem(), 501)
 	// A missing manifest is a clean first boot — no error, nothing reaped.
-	if err := m.preflightReclaim("fresh"); err != nil {
+	if err := m.preflightReclaim(t.Context(), "fresh"); err != nil {
 		t.Fatalf("preflightReclaim on absent manifest = %v, want nil", err)
 	}
 }
@@ -110,7 +110,7 @@ func TestPreflightReclaimReapsStalePidAndAliases(t *testing.T) {
 		t.Fatalf("seed prior manifest: %v", err)
 	}
 
-	if err := m.preflightReclaim("crashed"); err != nil {
+	if err := m.preflightReclaim(t.Context(), "crashed"); err != nil {
 		t.Fatalf("preflightReclaim: %v", err)
 	}
 	// The stale pid was terminated.
@@ -137,7 +137,7 @@ func TestPreflightReclaimRootlessSkipsFlush(t *testing.T) {
 	if err := m.reg.Save(prior); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := m.preflightReclaim("rl"); err != nil {
+	if err := m.preflightReclaim(t.Context(), "rl"); err != nil {
 		t.Fatalf("preflightReclaim: %v", err)
 	}
 	// Rootless reclaim never removes lo0 aliases (it allocates none; removal needs root).
@@ -383,7 +383,7 @@ func TestTeardownRemovesPodRoot(t *testing.T) {
 		if err := m.reg.Save(inst); err != nil {
 			t.Fatalf("seed manifest: %v", err)
 		}
-		if err := m.teardown(inst); err != nil {
+		if err := m.teardown(t.Context(), inst); err != nil {
 			t.Fatalf("teardown: %v", err)
 		}
 		if _, err := os.Stat(inst.PodRoot); !os.IsNotExist(err) {
@@ -756,7 +756,7 @@ func TestUnprobeableInstanceIsNotReaped(t *testing.T) {
 	if err := m.reg.Save(Instance{Version: registryVersion, Name: "rootowned", PID: pid, Tier: "root", Datapath: DatapathDirect}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := m.teardown(Instance{Name: "rootowned", PID: pid, Tier: "root", Datapath: DatapathDirect}); err != nil {
+	if err := m.teardown(t.Context(), Instance{Name: "rootowned", PID: pid, Tier: "root", Datapath: DatapathDirect}); err != nil {
 		t.Fatalf("teardown: %v", err)
 	}
 	if !slices.Contains(sys.terminated, pid) {
