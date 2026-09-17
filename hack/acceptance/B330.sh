@@ -248,6 +248,123 @@ v5=ok
 [ -f "$SCRATCH/prefix/logs/pip-venv-s1-maturin.log" ] || v5=no
 ladder "$v5" "b330.7  the pip log name derives from BOTH the venv dir (venv-s1) and the package (maturin), never the package alone"
 
+
+# ---- b330.8 — load.py resolves the model id from /v1/models, never "m" ----
+# The regression this closes: hack/spike/m16/s0.sh's load.py posted a hardcoded
+# "model": "m", and vllm-mlx 0.4.1 answers /v1/chat/completions with a 404 "The
+# model `m` does not exist" for anything but the model it was launched with — a
+# LIVE S0 rerun on an arm64 venv (B330's own fix working) got exactly this 404
+# on every request, counted as a generic "failed" with no hint why. This rung
+# extracts the SHIPPED load.py straight out of s0.sh (never a copy maintained
+# here) and drives it against a tiny fake HTTP server that only answers
+# /v1/chat/completions when the posted model equals the id /v1/models handed
+# back, asserting one ok request and zero failures.
+l8=ok
+if ! command -v python3 >/dev/null; then
+	l8=no
+	echo "    python3 is not on PATH — b330.8 needs it to run load.py and the fake server"
+else
+	LOAD_PY="$SCRATCH/load.py"
+	start_line="$(grep -nF 'cat > "$W/load.py"' "$S0" | head -1 | cut -d: -f1)"
+	if [ -z "$start_line" ]; then
+		l8=no
+		echo "    could not find the load.py heredoc in $S0"
+	else
+		body_start=$((start_line + 1))
+		end_line="$(awk -v s="$body_start" 'NR>=s && /^PY$/ {print NR; exit}' "$S0")"
+		if [ -z "$end_line" ]; then
+			l8=no
+			echo "    could not find the load.py heredoc's closing PY in $S0"
+		else
+			sed -n "${body_start},$((end_line - 1))p" "$S0" > "$LOAD_PY"
+			python3 -m py_compile "$LOAD_PY" >/dev/null 2>&1 || l8=no
+			[ "$l8" = ok ] || echo "    the extracted load.py does not compile — see $LOAD_PY"
+		fi
+	fi
+fi
+
+if [ "$l8" = ok ]; then
+	FAKESRV="$SCRATCH/fake_server.py"
+	cat > "$FAKESRV" <<'PYSRV'
+import http.server, json, sys
+
+MODEL_ID = "b330-mock-model"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+	def log_message(self, *a):
+		pass
+
+	def do_GET(self):
+		if self.path == "/v1/models":
+			body = json.dumps({"data": [{"id": MODEL_ID}]}).encode()
+			self.send_response(200)
+			self.send_header("content-type", "application/json")
+			self.send_header("content-length", str(len(body)))
+			self.end_headers()
+			self.wfile.write(body)
+		else:
+			self.send_response(404)
+			self.end_headers()
+
+	def do_POST(self):
+		length = int(self.headers.get("content-length", 0))
+		try:
+			payload = json.loads(self.rfile.read(length) or b"{}")
+		except Exception:
+			payload = {}
+		if payload.get("model") != MODEL_ID:
+			body = ("model mismatch: got %r" % payload.get("model")).encode()
+			self.send_response(404)
+			self.send_header("content-length", str(len(body)))
+			self.end_headers()
+			self.wfile.write(body)
+			return
+		self.send_response(200)
+		self.send_header("content-type", "text/event-stream")
+		self.end_headers()
+		for i in range(3):
+			self.wfile.write(("data: tok%d\n\n" % i).encode())
+			self.wfile.flush()
+		self.wfile.write(b"data: [DONE]\n\n")
+
+if __name__ == "__main__":
+	srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+	print(srv.server_address[1], flush=True)
+	srv.serve_forever()
+PYSRV
+
+	PORT_FILE="$SCRATCH/port.txt"
+	: > "$PORT_FILE"
+	python3 "$FAKESRV" > "$PORT_FILE" 2>"$SCRATCH/server.log" &
+	SRV_PID=$!
+	PORT=""
+	for i in $(seq 1 50); do
+		PORT="$(head -1 "$PORT_FILE" 2>/dev/null)"
+		[ -n "$PORT" ] && break
+		sleep 0.1
+	done
+	if [ -z "$PORT" ]; then
+		l8=no
+		echo "    the fake /v1/models server never reported a port — see $SCRATCH/server.log"
+	else
+		LOAD_OUT="$(python3 "$LOAD_PY" "http://127.0.0.1:$PORT" 1 1 5 2>"$SCRATCH/load.err")" || true
+	fi
+	kill "$SRV_PID" 2>/dev/null || true
+	wait "$SRV_PID" 2>/dev/null || true
+fi
+
+if [ "$l8" = ok ]; then
+	printf '%s\n' "$LOAD_OUT" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception as exc:
+    print("    load.py did not print JSON: %s" % exc); sys.exit(1)
+if d.get("ok") != 1 or d.get("failed") != 0:
+    print("    load.py reported ok=%r failed=%r errors=%r (want ok=1 failed=0)" % (d.get("ok"), d.get("failed"), d.get("errors"))); sys.exit(1)
+' || l8=no
+fi
+ladder "$l8" "b330.8  load.py resolves the model id from GET /v1/models and the fake engine answers it: one ok request, zero failures"
 echo "----------------------------------------"
 echo "B330: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
