@@ -19,6 +19,8 @@ package status
 import (
 	"reflect"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // row is a terse Row constructor for the verdict tables.
@@ -32,6 +34,32 @@ func serverRow(state RowState, sev Severity, detail, remedy string) Row {
 	r := row(RowServer, state, sev, detail, remedy)
 	r.Wide = map[string]string{"label": "io.k3sm.server"}
 	return r
+}
+
+// agentRowFor builds a worker's node-daemon row carrying its launchd label,
+// which is what the stopped summary names.
+func agentRowFor(state RowState, sev Severity, detail, remedy string) Row {
+	r := row(RowAgent, state, sev, detail, remedy)
+	r.Wide = map[string]string{"label": "io.k3sm.agent", "credential": string(CredentialValid)}
+	return r
+}
+
+// healthyAgentRows is a joined worker with nothing wrong: its daemon is up with
+// a valid credential, and the two control-plane rows say what they always say
+// on a Mac that runs no control plane.
+func healthyAgentRows() []Row {
+	return []Row{
+		row(RowInstall, StateOK, SeverityOK, "installed", ""),
+		row(RowNetd, StateRunning, SeverityOK, "pid 1292", ""),
+		agentRowFor(StateRunning, SeverityOK, "pid 903 · joined, node credential valid until 2027-09-05", ""),
+		row(RowAPIServer, StateUnknown, SeverityUnknown, "no kubeconfig: no k3sm context in ~/.kube/config", ""),
+		row(RowNode, StateUnknown, SeverityUnknown, "apiserver unreachable", ""),
+		row(RowWorkloads, StateUnknown, SeverityUnknown, "apiserver unreachable", ""),
+		row(RowDataRoot, StateOK, SeverityOK, "/var/lib/k3sm (apfs volume k3sm, mounted)", ""),
+		row(RowDatastore, StateSkip, SeveritySkip, "no state.db yet", ""),
+		row(RowKubeconfig, StateMissing, SeverityWarn, "no k3sm context in ~/.kube/config", "k3sm kubeconfig --write"),
+		row(RowRuntimed, StateHealthy, SeverityOK, "k3sm-runtimed healthy", ""),
+	}
 }
 
 // healthyRows is the row set of a cluster with nothing wrong, reused as the base
@@ -70,9 +98,13 @@ func TestAggregateVerdicts(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		rows        []Row
-		installed   bool
+		name      string
+		rows      []Row
+		installed bool
+		// role is the node this Mac is installed as. The zero value is the
+		// server, so every control-plane case below reads exactly as it did
+		// before roles existed.
+		role        install.Role
 		wantVerdict Verdict
 		wantSummary string
 		wantNext    []string
@@ -177,12 +209,48 @@ func TestAggregateVerdicts(t *testing.T) {
 			wantSummary: "could not determine cluster state as this user (re-run with sudo)",
 			wantNext:    []string{"k3sm kubeconfig --write", "sudo k3sm status"},
 		},
+		{
+			// A worker is healthy on its OWN two facts: the agent daemon is up
+			// and its node credential is valid. The datastore and kubeconfig
+			// rows describe a control plane it does not run, so neither may
+			// make it permanently degraded.
+			name:        "running — a joined worker with a valid credential",
+			rows:        healthyAgentRows(),
+			installed:   true,
+			role:        install.RoleAgent,
+			wantVerdict: VerdictRunning,
+			wantSummary: "this Mac is a joined worker: the agent daemon is running with a valid node credential",
+			wantNext:    []string{"k3sm kubectl get pods -A"},
+		},
+		{
+			name: "degraded — the agent is up and has never joined",
+			rows: replace(healthyAgentRows(), agentRowFor(StateWaiting, SeverityWarn,
+				"pid 903 · waiting for a join: this Mac holds no node credential yet", "k3sm token create   # on the control-plane Mac")),
+			installed:   true,
+			role:        install.RoleAgent,
+			wantVerdict: VerdictDegraded,
+			wantSummary: "agent: pid 903 · waiting for a join: this Mac holds no node credential yet",
+			// The kubeconfig row's own remedy still rides along: its WARN is
+			// advisory on a worker, which keeps it out of the VERDICT, not out
+			// of the list of things an operator might do next.
+			wantNext: []string{"k3sm token create   # on the control-plane Mac", "k3sm kubeconfig --write"},
+		},
+		{
+			name: "stopped — the worker's own daemon is not running",
+			rows: replace(healthyAgentRows(), agentRowFor(StateStopped, SeverityFail,
+				"loaded but not running (3 runs)", "sudo launchctl kickstart -k system/io.k3sm.agent")),
+			installed:   true,
+			role:        install.RoleAgent,
+			wantVerdict: VerdictStopped,
+			wantSummary: "io.k3sm.agent is stopped, so this Mac is not serving pods",
+			wantNext:    []string{"sudo launchctl kickstart -k system/io.k3sm.agent", "k3sm kubeconfig --write"},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			gotV, gotSummary, gotNext := Aggregate(tc.rows, tc.installed)
+			gotV, gotSummary, gotNext := Aggregate(tc.rows, tc.installed, tc.role)
 			if gotV != tc.wantVerdict {
 				t.Errorf("verdict = %v, want %v", gotV, tc.wantVerdict)
 			}

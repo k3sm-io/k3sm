@@ -135,6 +135,17 @@ type Paths struct {
 	LaunchDaemonDir string
 	NetdLabel       string
 	ServerLabel     string
+	// AgentLabel is the joining worker's LaunchDaemon label, and AgentLog its
+	// log file. They are reported only on a Mac whose installed role is the
+	// agent — the same condition under which `k3sm install` writes that plist
+	// at all — so a control plane never gets a row about a daemon it was never
+	// meant to have.
+	AgentLabel string
+	AgentLog   string
+	// AgentCredentialDir is the directory the joined worker's node credential
+	// lives in (the agent work dir under the data root). It is where the report
+	// answers the question a pid cannot: has this Mac actually joined.
+	AgentCredentialDir string
 	// DatavolLabel and DatavolLog are the data-volume mount oneshot's launchd
 	// label and log file. They are reported only on a Mac that has a data
 	// volume, which is the same condition under which `k3sm install` puts the

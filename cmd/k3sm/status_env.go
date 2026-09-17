@@ -69,6 +69,7 @@ const (
 // real filesystem, the resolved apiserver client, and the real clock.
 func newStatusRunner(o statusOptions) statusRunner {
 	color := status.ColorEnabled(os.Stdout, o.noColor, os.Getenv)
+	role, _ := installedRole()
 	return statusRunner{
 		out:       os.Stdout,
 		errOut:    os.Stderr,
@@ -78,8 +79,31 @@ func newStatusRunner(o statusOptions) statusRunner {
 		color:     color,
 		sleep:     sleepUntil,
 		readLog:   readTail,
-		logPaths:  map[string]string{"netd": install.NetdLogPath(), "server": install.ServerLogPath()},
+		logPaths: map[string]string{
+			"netd":   install.NetdLogPath(),
+			"server": install.ServerLogPath(),
+			"agent":  install.AgentLogPath(),
+		},
+		logTargets: defaultLogTargets(role),
 	}
+}
+
+// installedRole reports which node THIS Mac is installed as, read from the two
+// node-daemon plists on disk, plus whether it is installed at all.
+//
+// It is the cmd-side reader of the same decision `k3sm status` makes from its
+// own FS seam (install.RoleFromPlists): the verbs that cannot build a Collector
+// — `status logs`, which reads a file, and `doctor`, which predicts — need the
+// role too, and a second rule for it would eventually disagree with the report.
+func installedRole() (install.Role, bool) {
+	server := fileExists(installedPlistPath(install.ServerLabel))
+	agent := fileExists(installedPlistPath(install.AgentLabel))
+	return install.RoleFromPlists(server, agent)
+}
+
+// installedPlistPath is the LaunchDaemon plist a label is installed as.
+func installedPlistPath(label string) string {
+	return filepath.Join(install.DefaultLaunchDaemonDir, label+".plist")
 }
 
 // sleepUntil waits for d, reporting false when the context ended first — which
@@ -177,13 +201,19 @@ func statusPaths(workDir string) status.Paths {
 		LaunchDaemonDir: install.DefaultLaunchDaemonDir,
 		NetdLabel:       install.NetdLabel,
 		ServerLabel:     install.ServerLabel,
-		DatavolLabel:    install.DatavolLabel,
-		DatavolLog:      install.DatavolLogPath(),
-		DataRoot:        install.DefaultDataRoot,
-		WorkDir:         workDir,
-		NetdSocket:      install.DefaultNetdSocket,
-		NetdLog:         install.NetdLogPath(),
-		ServerLog:       install.ServerLogPath(),
+		AgentLabel:      install.AgentLabel,
+		AgentLog:        install.AgentLogPath(),
+		// The node credential store is the agent work dir — the directory the
+		// first file a successful join writes lives in — so the report and the
+		// installer's own verifier are looking at exactly one place.
+		AgentCredentialDir: filepath.Dir(install.AgentCredentialPath(install.DefaultDataRoot)),
+		DatavolLabel:       install.DatavolLabel,
+		DatavolLog:         install.DatavolLogPath(),
+		DataRoot:           install.DefaultDataRoot,
+		WorkDir:            workDir,
+		NetdSocket:         install.DefaultNetdSocket,
+		NetdLog:            install.NetdLogPath(),
+		ServerLog:          install.ServerLogPath(),
 	}
 }
 

@@ -126,3 +126,39 @@ func mergeManifests(primary, other []artifact) []artifact {
 	}
 	return out
 }
+
+// RoleFromPlists decides which k3sm node a Mac IS from the two node-daemon
+// plists on disk, and whether it is installed at all. It is pure so the whole
+// decision — including the two postures that are not a plain "one plist, one
+// role" — is table-tested, and so every caller reaches the same verdict from
+// the same two booleans.
+//
+// The disk is the only honest source. A running pid is not: the server daemon
+// and the agent daemon are both `k3sm` processes under launchd, so a probe that
+// asked the process table which one this Mac is would report "neither" on a Mac
+// whose daemon is merely stopped, and would report a role from a crash-looping
+// job that launchd is about to give up on. The plist is what `k3sm install`
+// wrote and what `k3sm uninstall` removes, so it says what this Mac was set up
+// to be regardless of what it is doing right now.
+//
+// Two postures decide the shape:
+//
+//   - BOTH plists present → RoleServer, installed. It is a posture install
+//     refuses to create (refuseCrossRole), so it only arises from a hand-edited
+//     /Library/LaunchDaemons or an interrupted role change — and there the
+//     control plane is the role a report must lead with, because it is the one
+//     that owns the datastore. A caller that wants to SAY both are there still
+//     can: it holds both booleans.
+//   - NEITHER plist present → not installed, and the role returned is the zero
+//     Role (RoleServer), which is what every uninstalled path already assumes.
+//     The bool, not the role, is what a caller must branch on.
+func RoleFromPlists(serverPresent, agentPresent bool) (Role, bool) {
+	switch {
+	case serverPresent:
+		return RoleServer, true
+	case agentPresent:
+		return RoleAgent, true
+	default:
+		return RoleServer, false
+	}
+}
