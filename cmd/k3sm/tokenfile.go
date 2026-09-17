@@ -73,17 +73,36 @@ const tokenFileMask fs.FileMode = 0o077
 // operator believes is in play, and starting past it would silently ignore what
 // they configured.
 func applyTokenFile(opts *agentOptions) (absent bool, err error) {
-	if opts.tokenFile == "" {
+	return resolveTokenFile(opts.tokenFile, &opts.token)
+}
+
+// resolveTokenFile is applyTokenFile's body, taking the path and the token to
+// fill rather than the agent's options struct, because BOTH node roles are given
+// their credential this way and there must be exactly one reader of it.
+//
+// `k3sm server` reads its static admin token through this too (server.go). Its
+// file is not the operator's but the installer's: a 0600 copy staged in the
+// server work dir, named on the daemon's argv as a path so the system:masters
+// bearer token is not published by the plist, by `ps`, or by launchd. Every
+// sentence of applyTokenFile's contract above holds unchanged for it — the
+// precedence, the non-terminal absence, and the terminal refusal of a file that
+// is there and cannot be used.
+//
+// The message vocabulary stays the agent's ("join token file"), because it is
+// the same class of file holding the same class of credential and a second
+// phrasing would mean a second reader.
+func resolveTokenFile(path string, token *string) (absent bool, err error) {
+	if path == "" {
 		return false, nil
 	}
-	token, err := readJoinTokenFile(opts.tokenFile)
+	value, err := readJoinTokenFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return true, nil
 	case err != nil:
 		return false, err
 	}
-	opts.token = token
+	*token = value
 	return false, nil
 }
 

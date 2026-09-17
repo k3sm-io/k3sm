@@ -98,7 +98,11 @@ type serverOptions struct {
 	datastoreEndpoint string // kine datastore DSN (postgres://… => HA multi-writer); empty = single-node SQLite
 	serverJoin        bool   // declare HA control-plane intent (requires --datastore-endpoint; split-brain guard)
 	joinServer        string // existing server's mesh host to fetch the identical-CA bundle from (HA server-join)
-	token             string // server-class join token (K10<caHash>::server:<secret>) for the HA server-join
+	token             string // static admin bearer token (standalone) or the server-class join token (HA server-join)
+	// tokenFile is a file holding that token, read once at start. It is how the
+	// INSTALLED daemon is given its static admin token: the value never appears
+	// on the argv a plist publishes. See resolveTokenFile.
+	tokenFile string
 
 	psaEnforceBaseline bool // flip the PSA cluster-default enforce level privileged→baseline (the baseline-enforce cutover; default = warn-only)
 
@@ -234,6 +238,18 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
 	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join; requires --server-join --mesh-ip --token)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
+	// The static admin token as a FILE, and the only way the installed daemon is
+	// given one. A LaunchDaemon plist is read by launchd as root but the token on
+	// its argv was readable by every account on the Mac — in the plist, in `ps`,
+	// and in launchd's own job description — and this one authenticates as
+	// system:masters. `k3sm install` stages the value at <data-root>/server/token
+	// (0600, owned by the daemon's user) and renders this flag pointing at it.
+	//
+	// It resolves the STANDALONE static admin token only. The HA server-join path
+	// takes its server-class join token on --token / $K3SM_TOKEN exactly as
+	// before; a --token-file passed alongside --server-join is ignored, with a
+	// warning, rather than silently reinterpreted as a join credential.
+	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding the static admin token, read once at start and preferred over --token and $K3SM_TOKEN. It must not be group- or world-readable. This is how a supervised server is given its token: the daemon is told where the token is and never what it is. Not used by the HA server-join, which takes --token")
 	return workDirErr
 }
 
@@ -273,6 +289,34 @@ func runServer(args []string) (err error) {
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// The static admin token, from the file the installed daemon is pointed at.
+	// Resolved BEFORE any state is touched, because a token file that is there
+	// and cannot be used (group-readable, empty, unreadable) is terminal: it
+	// names a credential the operator believes is in play, and coming up past it
+	// would mint a different one and leave every `kubectl` call Unauthorized.
+	//
+	// An ABSENT file is not terminal, exactly as it is not for the agent: the
+	// executor then generates a token and writes its own kubeconfig, which is
+	// what a bare `k3sm server` has always done.
+	switch {
+	case opts.serverJoin && opts.tokenFile != "":
+		// The HA server-join path is untouched by this flag: its --token is a
+		// server-class JOIN token, not the static admin credential, and quietly
+		// swapping one for the other is the kind of substitution that surfaces as
+		// a CA mismatch three steps later.
+		logger.Warn("ignoring --token-file: the HA server-join takes its server-class join token on --token / $K3SM_TOKEN",
+			"token-file", opts.tokenFile)
+	default:
+		absent, terr := resolveTokenFile(opts.tokenFile, &opts.token)
+		if terr != nil {
+			return terr
+		}
+		if absent {
+			logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
+				"path", opts.tokenFile)
+		}
+	}
 
 	if opts.ingressHTTPPort < 0 || opts.ingressHTTPPort > 65535 {
 		return fmt.Errorf("--ingress-http-port %d out of range 0-65535", opts.ingressHTTPPort)
