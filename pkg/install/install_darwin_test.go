@@ -259,7 +259,7 @@ func TestLogDirIsNotWorldReadableOnDisk(t *testing.T) {
 	if err := os.WriteFile(server, []byte("an existing line\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A file in the directory that is NOT one of the three daemon logs. k3sm
+	// A file in the directory that is NOT one of the daemon logs. k3sm
 	// does not own it and must not touch it.
 	stranger := filepath.Join(dir, "someone-elses.log")
 	if err := os.WriteFile(stranger, []byte("not ours\n"), 0o644); err != nil {

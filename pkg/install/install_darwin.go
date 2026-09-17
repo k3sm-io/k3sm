@@ -141,7 +141,7 @@ func ensureOwnedDir(dir string, uid int) error {
 // admin, LogDirMode — so launchd, opening the UserName=_k3sm server job's
 // StandardOut/ErrorPath AS _k3sm, can traverse it and append to server.log (the
 // root netd and datavol jobs are unaffected by perms) — and pre-creates the
-// three daemon logs inside it at LogFileMode. Owner+mode are re-applied even
+// daemon logs inside it at LogFileMode. Owner+mode are re-applied even
 // when the dir and the files already exist, repairing a dir auto-created
 // root-only by a prior netd spawn AND an install whose logs were left
 // world-readable by the spawning job's umask.
@@ -155,7 +155,7 @@ func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
 // machine where chowning to _k3sm, to root, or to group admin needs privilege
 // the standards forbid a unit test from having.
 type logOwnership struct {
-	// serviceUID owns the directory and server.log: launchd opens the
+	// serviceUID owns the directory and the server/agent logs: launchd opens a
 	// UserName=_k3sm job's log AS that user, so it must be able to append.
 	serviceUID int
 	// rootUID owns netd.log and datavol.log, whose jobs run as root.
@@ -170,7 +170,7 @@ type logFile struct {
 	uid  int
 }
 
-// logFiles returns the three daemon logs inside dir, in a fixed order. The leaf
+// logFiles returns the daemon logs inside dir, in a fixed order. The leaf
 // names come from the exported path helpers the plists already use rather than
 // from three more literals, so the file the installer prepares is by
 // construction the one launchd is pointed at; only the directory is rebased,
@@ -178,6 +178,13 @@ type logFile struct {
 func logFiles(dir string, own logOwnership) []logFile {
 	return []logFile{
 		{filepath.Join(dir, filepath.Base(ServerLogPath())), own.serviceUID},
+		// The agent log is pre-created on EVERY install, whichever role this Mac
+		// carries. The file's mode is what a role change must not get wrong: launchd
+		// reuses an existing file rather than re-creating it, so a log left behind by
+		// a previous install is the one the next daemon appends to, and preparing it
+		// unconditionally costs an empty 0640 file on a machine that never runs the
+		// agent. Owned like server.log, because both jobs run as the service user.
+		{filepath.Join(dir, filepath.Base(AgentLogPath())), own.serviceUID},
 		{filepath.Join(dir, filepath.Base(NetdLogPath())), own.rootUID},
 		{filepath.Join(dir, filepath.Base(DatavolLogPath())), own.rootUID},
 	}
@@ -624,6 +631,91 @@ func (darwinSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) erro
 // can carry a credential (--datastore-endpoint carries a DSN password).
 func (darwinSystem) WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error {
 	return dataroot.WriteServerArgsRecord(path, rec)
+}
+
+// WriteAgentArgsRecord writes the agent-arguments record through pkg/dataroot,
+// with WriteServerArgsRecord's contract and for the same reasons: root:wheel
+// 0600 in /Library/Preferences, so only root can change what the next install
+// splices into the agent LaunchDaemon's argv and only root can read it.
+func (darwinSystem) WriteAgentArgsRecord(path string, rec dataroot.AgentArgsRecord) error {
+	return dataroot.WriteAgentArgsRecord(path, rec)
+}
+
+// WriteServiceUserFile writes contents at path owned by the service uid at
+// mode, creating the parent directory owned by the same uid at dirMode.
+//
+// The write is temp-and-rename INSIDE the parent directory, and the mode and
+// owner are applied to the temp file before the rename, so no reader ever sees
+// the file at a wider mode or a different owner than the one asked for — which
+// matters because the only thing written this way is a credential.
+//
+// The group is the data root's (DataRootGID): the file lands in the service
+// user's own tree, and its mode grants the group nothing, so the group is a
+// consistency choice rather than an access one.
+func (darwinSystem) WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error {
+	return writeServiceUserFile(path, contents, int(uid), DataRootGID, mode, dirMode)
+}
+
+// writeServiceUserFile is the method above with the owner taken explicitly.
+//
+// The split exists for the same reason ensureLogDir's does: chowning to _k3sm
+// or to a group the test process is not in needs privilege these tests never
+// take, and what has to be exercised against a real filesystem is the MODE, the
+// repair of an existing tree, and the temp-and-rename — not whether this
+// process may hand a file to another user.
+func writeServiceUserFile(path string, contents []byte, uid, gid int, mode, dirMode fs.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	// MkdirAll skips an existing directory, so owner and mode are re-applied:
+	// an install over a tree an earlier build left root-owned must repair it,
+	// not leave the daemon unable to read what was just written into it.
+	if err := os.Chown(dir, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", dir, uid, gid, err)
+	}
+	if err := os.Chmod(dir, dirMode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", dir, dirMode, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".k3sm-*")
+	if err != nil {
+		return fmt.Errorf("create a temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
+	if _, err := tmp.Write(contents); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+	if err := os.Chown(tmpName, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", tmpName, uid, gid, err)
+	}
+	if err := os.Chmod(tmpName, mode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", tmpName, mode, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpName, path, err)
+	}
+	return nil
+}
+
+// FileMode reports the permission bits of the file at path. A missing file
+// returns an error satisfying errors.Is(err, fs.ErrNotExist), which callers
+// read as a posture rather than a failure — the same contract ReadFile has.
+//
+// It exists because the installer has to JUDGE one file it does not own: the
+// operator's join token, which is a credential and must not be group- or
+// world-readable. Bytes alone cannot answer that, and os.Stat cannot be called
+// from the orchestration without making it untestable.
+func (darwinSystem) FileMode(path string) (fs.FileMode, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Mode().Perm(), nil
 }
 
 // WriteLaunchDaemon writes the plist root:wheel 0644.

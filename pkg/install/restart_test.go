@@ -193,7 +193,8 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
 		f.putLoaded(NetdLabel) // the server never came up
-		err := verifyDaemons(context.Background(), f, installCfg().withDefaults())
+		cfg := installCfg().withDefaults()
+		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg))
 		if err == nil {
 			t.Fatal("verifyDaemons must fail when a daemon is down")
 		}
@@ -236,4 +237,34 @@ func TestInstallVerifiesDaemonsAfterRestart(t *testing.T) {
 			t.Errorf("kubeconfig written to %q despite an unverified install", f.kubeUser)
 		}
 	})
+}
+
+// TestRestartBudgetByLabel pins which daemons get the long restart budget.
+//
+// The budget is not a tuning knob: it is how long the install waits for a label
+// to leave launchd's system domain before it refuses to bootstrap into a
+// draining job. A daemon whose plist sets ExitTimeOut 45 can legitimately take
+// longer than netd's 30s to go, so giving it the short budget would fail the
+// install on precisely the slow-but-healthy shutdown the wait exists to
+// tolerate. Both NODE daemons set that ExitTimeOut, so both are in the long
+// class; netd, which has no orderly teardown at all, is not.
+func TestRestartBudgetByLabel(t *testing.T) {
+	for _, tc := range []struct {
+		label string
+		want  restartBudget
+		why   string
+	}{
+		{ServerLabel, serverRestartBudget, "the control plane tears its components down serially inside ExitTimeOut 45"},
+		{AgentLabel, serverRestartBudget, "the agent closes the mesh device and drains the Service proxy inside the same ExitTimeOut 45"},
+		{NetdLabel, netdRestartBudget, "netd is a single process with nothing to reap"},
+		{DatavolLabel, netdRestartBudget, "a daemon added later inherits the conservative default"},
+	} {
+		if got := restartBudgetFor(tc.label); got != tc.want {
+			t.Errorf("restartBudgetFor(%s) = %v, want %v: %s", tc.label, got, tc.want, tc.why)
+		}
+	}
+	if serverRestartBudget.unload <= netdRestartBudget.unload {
+		t.Fatalf("the long budget (%v) is not longer than the short one (%v); the distinction this test pins would be vacuous",
+			serverRestartBudget.unload, netdRestartBudget.unload)
+	}
 }

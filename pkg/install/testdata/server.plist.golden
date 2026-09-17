@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.k3sm.server</string>
+  <key>UserName</key>
+  <string>_k3sm</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/k3sm/k3sm</string>
+    <string>server</string>
+    <string>--runtime</string>
+    <string>runtimed</string>
+    <string>--token</string>
+    <string>k3sm-fixed</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ExitTimeOut</key>
+  <integer>45</integer>
+  <key>SoftResourceLimits</key>
+  <dict>
+      <key>NumberOfFiles</key>
+  <integer>131072</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+      <key>NumberOfFiles</key>
+  <integer>131072</integer>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/var/lib/k3sm</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/k3sm/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/k3sm/server.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+      <key>HOME</key>
+  <string>/var/lib/k3sm</string>
+  </dict>
+</dict>
+</plist>

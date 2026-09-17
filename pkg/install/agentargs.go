@@ -1,0 +1,208 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package install
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"strings"
+	"time"
+
+	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/version"
+)
+
+// managedAgentFlags are the `k3sm agent` flags AgentPlist renders ITSELF, by
+// flag name with the leading dashes stripped — the ones a carry-over must drop
+// so the next render cannot end up with the same flag twice.
+//
+// It is deliberately WIDER than dataroot.ManagedAgentFlags, and the difference
+// is what each list decides. dataroot's list is the REFUSAL set: a record that
+// names --token is rejected outright, because a file trying to put a credential
+// on a root daemon's argv is not a stale record. This list is the FILTER set:
+// --server, --node-ip and --token-file are legitimate things for a plist to
+// carry — this renderer put them there — but they are re-derived from the
+// operator's flags on every install, so carrying the installed values over
+// would re-render a join target the operator has just changed, or a token file
+// they have already deleted.
+var managedAgentFlags = func() map[string]bool {
+	m := map[string]bool{"server": true, "node-ip": true, "token-file": true}
+	for _, name := range dataroot.ManagedAgentFlags {
+		m[name] = true
+	}
+	return m
+}()
+
+// installedAgentArgs returns the operator-supplied `k3sm agent` arguments the
+// next render must carry over, or nil when there are none.
+//
+// It is installedServerArgs's contract for the other role, with the same two
+// sources in the same precedence: the agent plist ALREADY INSTALLED (what
+// launchd is running right now), and — only when there is no plist, which is
+// every install that follows an uninstall — the agent-arguments record in
+// root-owned /Library/Preferences. It reads neither of the server role's files.
+func installedAgentArgs(sys System, cfg Config) ([]string, error) {
+	path := cfg.plistPath(AgentLabel)
+	raw, err := sys.ReadFile(path)
+	switch {
+	case err == nil:
+		args, perr := parseProgramArguments(raw)
+		if perr != nil {
+			return nil, fmt.Errorf("install: cannot read the arguments of the installed agent plist %s: %w (remove the file to reinstall from the stock template — doing so discards any agent flags it carried)", path, perr)
+		}
+		return preservedAgentArgs(args), nil
+	case errors.Is(err, fs.ErrNotExist):
+		return recordedAgentArgs(sys, cfg)
+	default:
+		return nil, fmt.Errorf("install: read installed agent plist %s: %w", path, err)
+	}
+}
+
+// recordedAgentArgs returns the arguments the agent-arguments record carries,
+// or nil when there is no record. A record that cannot be read is an ERROR,
+// never an empty answer — "no arguments" and "the arguments could not be read"
+// render identically, and only one of them is safe to render.
+func recordedAgentArgs(sys System, cfg Config) ([]string, error) {
+	path := cfg.AgentArgsRecord
+	rec, err := dataroot.ReadAgentArgsRecord(systemFiles{sys}, path)
+	if err != nil {
+		return nil, fmt.Errorf("install: %w (`sudo rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
+	}
+	if rec == nil {
+		return nil, nil
+	}
+	// Through the SAME filter the plist path uses: dataroot already refuses a
+	// record naming --token, and this drops the flags the renderer owns.
+	args := filterManagedAgentArgs(rec.Args)
+	if len(args) > 0 {
+		cfg.Logger.Info("carried the operator-supplied agent arguments over from the recorded ones (the installed plist is gone, as after an uninstall)",
+			"args", redactedServerArgsText(args), "record", path, "recorded-at", rec.CreatedAt.Format(time.RFC3339), "recorded-by", rec.CreatedBy)
+	}
+	return args, nil
+}
+
+// writeArgsRecord records the arguments this install rendered, in the record
+// belonging to the role it installed. It is the one write point for both
+// records, so a role can never write the other's file.
+func writeArgsRecord(sys System, cfg Config) error {
+	if cfg.Role == RoleAgent {
+		return writeAgentArgsRecord(sys, cfg)
+	}
+	return writeServerArgsRecord(sys, cfg)
+}
+
+// writeAgentArgsRecord records the agent arguments this install rendered, so
+// the next one can carry them over with no plist to read.
+func writeAgentArgsRecord(sys System, cfg Config) error {
+	path := cfg.AgentArgsRecord
+	rec := dataroot.AgentArgsRecord{
+		Args:      cfg.ExtraAgentArgs,
+		CreatedBy: "k3sm " + version.Get().Version,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := sys.WriteAgentArgsRecord(path, rec); err != nil {
+		return fmt.Errorf("install: write the agent arguments record %s: %w", path, err)
+	}
+	return nil
+}
+
+// preservedAgentArgs returns the arguments of an installed agent plist the next
+// render must carry over. The first two elements are dropped by position (the
+// installed binary path and the `agent` subcommand, both re-derived from the
+// Config); the rest is walked by flag NAME, so an operator who reordered the
+// argv still gets the same answer.
+func preservedAgentArgs(installed []string) []string {
+	if len(installed) < 2 {
+		return nil
+	}
+	return filterManagedAgentArgs(installed[2:])
+}
+
+// filterManagedAgentArgs drops the install-managed agent flags (and their
+// separated values) from a bare argument list, keeping everything else in
+// order.
+func filterManagedAgentArgs(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		name, _, inline := splitFlag(args[i])
+		if name == "" || !managedAgentFlags[name] {
+			out = append(out, args[i])
+			continue
+		}
+		if !inline {
+			i++ // the managed flag's value is a separate argument
+		}
+	}
+	return out
+}
+
+// stageJoinToken copies the operator's join token to where the agent daemon can
+// read it: agentTokenPath(), owned by the service uid at AgentTokenFileMode
+// inside a directory at AgentTokenDirMode.
+//
+// The copy exists because of a privilege asymmetry that has no other fix. The
+// operator writes the token as root, so their file is root-owned and, on the
+// obvious choice of /var/root, sits under a directory the service user cannot
+// even traverse. The daemon runs as that user. Pointing it at the operator's
+// path would produce a worker that fails to read a token that is plainly there,
+// reported as a permission error in a log nobody is watching yet.
+//
+// The token is validated here rather than at the daemon, because here is where
+// an operator is still looking at a terminal: a file anyone can read, and an
+// empty one, are mistakes worth one sentence now instead of a backoff loop
+// later. The mode refusal is the agent's own (readJoinTokenFile), applied to
+// the SOURCE as well: a token that sat world-readable in /tmp is a token that
+// has to be re-minted, and copying it to a 0600 destination would launder that
+// rather than report it. The value itself is never logged or echoed.
+func stageJoinToken(sys System, cfg Config, uid uint32) error {
+	// The mode BEFORE the bytes: a credential this Mac should not have accepted
+	// is refused without being read anywhere else first.
+	switch perm, err := sys.FileMode(cfg.TokenFile); {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("install: the join token file %s is not there: write the token `k3sm token create` printed on the server into it, or drop --token-file on a node that has already joined", cfg.TokenFile)
+	case err != nil:
+		return fmt.Errorf("install: inspect the join token file %s: %w", cfg.TokenFile, err)
+	case perm&tokenFileMask != 0:
+		return fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
+	}
+	raw, err := sys.ReadFile(cfg.TokenFile)
+	if err != nil {
+		return fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the agent daemon to present)", cfg.TokenFile, err, cfg.agentTokenPath())
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return fmt.Errorf("install: the join token file %s is empty: write the token `k3sm token create` printed on the server into it", cfg.TokenFile)
+	}
+	dst := cfg.agentTokenPath()
+	if err := sys.WriteServiceUserFile(dst, []byte(token+"\n"), uid, AgentTokenFileMode, AgentTokenDirMode); err != nil {
+		return fmt.Errorf("install: stage the join token at %s: %w", dst, err)
+	}
+	cfg.Logger.Info("staged the join token for the agent daemon (your own copy is untouched and yours to delete once the node is Ready)",
+		"from", cfg.TokenFile, "to", dst)
+	return nil
+}
+
+// tokenFileMask is the permission bits a join-token file may not carry: any
+// group or other access at all. It is ssh(1)'s rule for a private key, for the
+// same reason — the file IS the credential for as long as it exists.
+//
+// The agent applies the identical mask to the file it is pointed at
+// (cmd/k3sm's own tokenFileMask). The two are separate because the packages
+// cannot import each other, and they are the same number because the question
+// is the same one asked of the same kind of file.
+const tokenFileMask fs.FileMode = 0o077

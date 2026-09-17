@@ -81,6 +81,10 @@ func runInstall(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx := context.Background()
 	return install.Install(ctx, install.NewDarwinSystem(), install.Config{
+		Role:              opts.role(),
+		JoinServer:        opts.server,
+		NodeIP:            opts.nodeIP,
+		TokenFile:         opts.tokenFile,
 		BinarySource:      self,
 		TargetUser:        opts.targetUser,
 		ServiceCIDR:       opts.serviceCIDR,
@@ -96,6 +100,18 @@ func runInstall(args []string) error {
 // defaults, the size floor, the flag that requires another flag -- is decidable
 // in a unit test, where the install itself can never run.
 type installFlags struct {
+	// agent selects the WORKER role: this Mac joins an existing cluster and runs
+	// the io.k3sm.agent LaunchDaemon instead of io.k3sm.server.
+	agent     bool
+	server    string
+	nodeIP    string
+	tokenFile string
+	// set is the names of the flags the operator actually passed, from
+	// flag.FlagSet.Visit. It is what makes "--agent with a server-only flag" a
+	// decidable refusal: --service-cidr has a non-empty default, so its VALUE
+	// cannot distinguish "the operator asked for this" from "nobody said
+	// anything", and refusing on the value would refuse every agent install.
+	set               map[string]bool
 	targetUser        string
 	serviceCIDR       string
 	printRequired     bool
@@ -114,6 +130,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.StringVar(&o.targetUser, "user", os.Getenv("SUDO_USER"), "the human whose ~/.kube/config receives the admin kubeconfig (default $SUDO_USER)")
 	fs.StringVar(&o.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR")
+	fs.BoolVar(&o.agent, "agent", false, "install this Mac as a WORKER that joins an existing cluster (the io.k3sm.agent daemon) instead of as the control plane; needs --server and --node-ip")
+	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join, an UNDERLAY address (a LAN IP or DNS name, no scheme, no port) because the join dials <host>:9345 before this node has any mesh")
+	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: this Mac's own mesh InternalIP, bound into the certificates the join issues")
+	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token, read once at each daemon start (a joined node needs none). It must not be group- or world-readable, and it is yours to delete once the node is Ready")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
 	fs.StringVar(&o.dataVolumeName, "data-volume-name", defaultDataVolumeName, "the APFS volume label to create or adopt")
@@ -128,6 +148,11 @@ func parseInstallFlags(args []string) (installFlags, error) {
 		if err := validateMeshIP(o.meshIP); err != nil {
 			return installFlags{}, err
 		}
+	}
+	o.set = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
+	if err := o.validateRole(); err != nil {
+		return installFlags{}, err
 	}
 	return o, nil
 }
@@ -154,6 +179,59 @@ func validateMeshIP(raw string) error {
 		return fmt.Errorf("--mesh-ip %q is a loopback address; give the mesh address other nodes reach this Mac at", raw)
 	case addr.IsMulticast():
 		return fmt.Errorf("--mesh-ip %q is a multicast address and cannot be bound", raw)
+	}
+	return nil
+}
+
+// serverOnlyInstallFlags configure the CONTROL PLANE and mean nothing on a
+// worker: the Service CIDR the control plane pins, the mesh address its
+// apiserver binds, and the data volume the datastore lives on. Passing one with
+// --agent is a misunderstanding worth stopping rather than silently ignoring,
+// because every one of them would otherwise look configured and do nothing.
+var serverOnlyInstallFlags = []string{
+	"service-cidr",
+	"mesh-ip",
+	"data-volume",
+	"data-volume-name",
+	"data-volume-size",
+	"data-volume-encrypt",
+	"remove-old-data-root",
+}
+
+// agentOnlyInstallFlags describe a JOIN and mean nothing on a control plane.
+var agentOnlyInstallFlags = []string{"server", "node-ip", "token-file"}
+
+// role is the install role these flags select.
+func (o installFlags) role() install.Role {
+	if o.agent {
+		return install.RoleAgent
+	}
+	return install.RoleServer
+}
+
+// validateRole is the flag-level contract of the two roles, decided before any
+// privilege is taken: an agent install must say where to join and as what
+// address, and neither role may be given the other's flags.
+//
+// The refusals are separate sentences rather than one "invalid combination"
+// because each names a different mistake, and the operator is at a terminal
+// with a machine they are about to change.
+func (o installFlags) validateRole() error {
+	if !o.agent {
+		for _, name := range agentOnlyInstallFlags {
+			if o.set[name] {
+				return fmt.Errorf("--%s needs --agent: it configures a node joining an existing cluster, and without --agent this Mac is being installed as the control plane", name)
+			}
+		}
+		return nil
+	}
+	if o.server == "" || o.nodeIP == "" {
+		return fmt.Errorf("--agent needs --server (the control-plane host to join, an underlay address) and --node-ip (this Mac's own mesh address)")
+	}
+	for _, name := range serverOnlyInstallFlags {
+		if o.set[name] {
+			return fmt.Errorf("--%s cannot be combined with --agent: it configures the control plane, and a worker runs none of it", name)
+		}
 	}
 	return nil
 }

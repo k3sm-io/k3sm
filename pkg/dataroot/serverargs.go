@@ -128,36 +128,19 @@ type ServerArgsRecord struct {
 // It is applied on WRITE as well as on read, so the installer can never produce
 // a record its own next run would refuse.
 func ValidateServerArgs(args []string) error {
-	if len(args) > MaxServerArgs {
-		return fmt.Errorf("%w: %d arguments, the limit is %d", ErrServerArgsRejected, len(args), MaxServerArgs)
-	}
-	for _, arg := range args {
-		if len(arg) > MaxServerArgLen {
-			return fmt.Errorf("%w: an argument of %d bytes, the limit is %d", ErrServerArgsRejected, len(arg), MaxServerArgLen)
-		}
-		if strings.ContainsAny(arg, "\x00\n\r") {
-			return fmt.Errorf("%w: an argument contains a NUL or a newline", ErrServerArgsRejected)
-		}
-		name := serverArgFlagName(arg)
-		for _, managed := range ManagedServerFlags {
-			if name == managed {
-				return fmt.Errorf("%w: --%s is rendered by the installer and may not come from a file", ErrServerArgsRejected, managed)
-			}
-		}
-	}
-	return nil
+	return validateRecordArgs(args, ManagedServerFlags, ErrServerArgsRejected)
 }
 
-// serverArgFlagName is the flag name an argument names, with leading dashes
+// recordArgFlagName is the flag name an argument names, with leading dashes
 // stripped and any inline =value removed, or "" for a non-flag argument. Both
 // spellings collapse to one name (Go's flag package accepts -x and --x), and
-// --token=… is the same name as --token.
+// --token=… is the same name as --token. It serves both argument records.
 //
 // pkg/install has a richer splitter for walking an argv (it needs the value and
 // whether it was inline); this one exists because pkg/dataroot cannot import the
 // package that imports it. The NAMES the two decide about are single-sourced in
-// ManagedServerFlags above, which is the part that must not drift.
-func serverArgFlagName(arg string) string {
+// ManagedServerFlags / ManagedAgentFlags, which is the part that must not drift.
+func recordArgFlagName(arg string) string {
 	if !strings.HasPrefix(arg, "-") {
 		return ""
 	}
