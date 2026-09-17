@@ -94,7 +94,11 @@ It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes th
 `/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
 left exactly as it is. It also clears the mesh's pf anchor rule, so a later tunnel never inherits a
 stale MSS clamp. Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
-reinstall picks up where you left off. The command prints the full list of what it kept. If you
+reinstall picks up where you left off. The server's admin token is removed, because a reinstall
+mints a new one, but if you run the control plane against an external database, the file holding
+that database's connection string is kept with your cluster data at
+`/var/lib/k3sm/server/datastore-endpoint`. It contains the database password, and k3sm cannot
+recreate it, so removing it is left to you. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
 
@@ -115,10 +119,16 @@ The installed daemon wins while it is there, so a reset means clearing both sour
 ```sh
 sudo k3sm uninstall                                          # removes the daemon and its flags
 sudo rm /Library/Preferences/io.k3sm.server-args.json        # discards the recorded ones
+sudo rm /var/lib/k3sm/server/datastore-endpoint              # only if you used an external database
 sudo k3sm install                                            # renders the stock template
 ```
 
-That discards the flags the file lists, and nothing else. Your cluster data is untouched.
+That discards the flags the file lists, and nothing else. Your cluster data is untouched. The third
+line removes the database connection string a server with an external database was configured with,
+which is the one piece of that configuration k3sm keeps outside the record; skip it if you intend to
+keep using that database. Remove it only together with the record, and in that order: while the
+recorded flags still name the file, an install that cannot find it stops and says so rather than
+quietly bringing the server up on its own local database.
 
 Install warns when it finds neither source on a data root that already holds cluster state, which is
 what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install
