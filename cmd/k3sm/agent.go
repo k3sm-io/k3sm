@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -78,7 +80,7 @@ type agentOptions struct {
 // node` — is unit-testable without parsing argv through a live join.
 func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.server, "server", "", "control-plane host to join — in practice an UNDERLAY address (a LAN IP or DNS name), because the join must reach <host>:9345 before this node has any mesh to route over")
-	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN)")
+	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN) — required for a node's FIRST join only; a node that has already joined starts from its stored credential, and a token for the same cluster is ignored")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
@@ -94,19 +96,63 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.domain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain")
 }
 
-// runAgent joins this Mac to an existing cluster: it CA-pins the server (via the
-// token's cluster-CA hash), submits a node-password + CSRs, receives a node-scoped
-// system:node credential (NOT the admin kubeconfig), enrolls into the wireguard mesh,
-// and registers as a Virtual Kubelet node off its node cert. The mesh bring-up (root
-// utun) and the live two-Mac round-trip are the K3SM_LAB gate.
+// agentTerminalBackoff is how long runAgent waits before returning a start
+// failure that will recur identically on the next start — no credential and no
+// token, an expired credential and no token, a corrupt file.
+//
+// It exists because of how the agent is supervised: a LaunchDaemon with
+// KeepAlive restarts an exited process immediately, so a terminal fault becomes a
+// spawn loop that floods the log and burns CPU while looking, from the outside,
+// like an agent that is running. Backing off turns that into one line every half
+// minute, which is legible and survivable. It is a fixed sleep rather than an
+// escalating one deliberately: nothing here recovers by waiting longer, and an
+// operator who fixes the cause should not then wait minutes for the retry.
+//
+// (There is no agent LaunchDaemon renderer in this repo yet; the supervisor is
+// whatever the operator wrote. The backoff costs nothing when it is a shell.)
+const agentTerminalBackoff = 30 * time.Second
+
+// agentTerminalDelay is the backoff actually applied. Tests shorten it; nothing
+// else writes it.
+var agentTerminalDelay = agentTerminalBackoff
+
+// agentTerminal logs a terminal start failure, waits out the backoff (or until
+// the context is cancelled — a SIGTERM during the wait must still stop the
+// process promptly), and returns the error unchanged.
+func agentTerminal(ctx context.Context, logger *slog.Logger, err error) error {
+	logger.Error("this agent cannot start", "err", err, "backoff", agentTerminalDelay)
+	t := time.NewTimer(agentTerminalDelay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+	return err
+}
+
+// runAgent brings this Mac up as a WORKER node of an existing cluster.
+//
+// It has two start paths, chosen by agentStartPlan from what the agent work dir
+// already holds. A FIRST start runs the token join: CA-pin the server (via the
+// token's cluster-CA hash), submit a node-password + CSRs, receive a node-scoped
+// system:node credential (NOT the admin kubeconfig), enroll into the wireguard
+// mesh, and persist the whole outcome. A RESTART presents that stored credential
+// and only re-publishes this node's wireguard endpoint — no token, no re-issued
+// certificates. Both paths converge on the same mesh bring-up, the same
+// node-local datapath and the same Virtual Kubelet registration; the mesh
+// bring-up (root utun) and the live two-Mac round-trip are the K3SM_LAB gate.
 func runAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	opts := agentOptions{}
 	registerAgentFlags(fs, &opts)
 	_ = fs.Parse(args)
 
-	if opts.server == "" || opts.token == "" || opts.nodeIP == "" {
-		return fmt.Errorf("--server, --token, and --node-ip are required")
+	// --token is deliberately NOT required. A join token is TTL-bounded, so an
+	// agent that re-ran its join on every start stopped being able to start a day
+	// after it was installed; a node that has already joined presents what it
+	// holds instead.
+	if opts.server == "" || opts.nodeIP == "" {
+		return fmt.Errorf("--server and --node-ip are required")
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -130,6 +176,34 @@ func runAgent(args []string) error {
 		return fmt.Errorf("create agent work dir: %w", err)
 	}
 
+	// How this start obtains its identity, decided BEFORE anything is minted or
+	// joined, from what the work dir already holds. Every terminal verdict backs
+	// off (agentTerminal) so a supervised agent reports it once per interval
+	// instead of spawn-looping.
+	store := nodeCredentialStore{dir: opts.workDir}
+	status, cred, err := store.Status(time.Now())
+	if err != nil {
+		return agentTerminal(ctx, logger, err)
+	}
+	tokenPresent := strings.TrimSpace(opts.token) != ""
+	tokenCAHash, storedCAHash := "", ""
+	tokenParses := false
+	if tokenPresent {
+		if tok, perr := bootstrap.ParseToken(opts.token); perr == nil {
+			tokenCAHash, tokenParses = tok.CAHash, true
+		} else {
+			logger.Warn("the supplied join token is not a K10 join token", "err", perr)
+		}
+	}
+	if cred != nil {
+		storedCAHash = cred.clusterCAPin
+	}
+	plan, err := agentStartPlan(status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
+	if err != nil {
+		return agentTerminal(ctx, logger, err)
+	}
+	logStartPlan(logger, plan, status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
+
 	// node-password: mint once, persist 0600, reuse across restarts so the
 	// first-write-wins binding keeps matching.
 	password, err := loadOrCreateNodePassword(opts.workDir)
@@ -147,50 +221,35 @@ func runAgent(args []string) error {
 	}
 	logger.Info("mesh identity", "node", opts.nodeName, "publicKey", meshPub, "keyRef", meshKeyRef)
 
-	// The join client is built HERE rather than left to bootstrap.Join so its dialer
-	// can report which of this Mac's addresses reaches the control plane — the one
-	// fact the mesh endpoint below has to be derived from. It is still the CA-pinned
-	// client; pinnedJoinClient layers only the dialer onto it.
-	tok, err := bootstrap.ParseToken(opts.token)
-	if err != nil {
-		return err
-	}
-	joinClient, joinDialer, err := pinnedJoinClient(tok.CAHash)
-	if err != nil {
-		return err
-	}
 	joinHost := net.JoinHostPort(opts.server, strconv.Itoa(bootstrapPort))
-	joinDialer.probe(ctx, joinHost)
 
-	// The advertised wireguard endpoint is an UNDERLAY address, never opts.nodeIP:
-	// that flag carries this node's MESH InternalIP, and a peer must dial the
-	// underlay to open the handshake that creates the mesh in the first place.
-	meshEndpoint, err := underlayMeshEndpoint(joinDialer.localIP(), opts.nodeIP, opts.meshPort)
-	if err != nil {
-		return err
+	var res *bootstrap.JoinResult
+	var meshEndpoint string
+	if plan == startModeReuseCredential {
+		res, meshEndpoint, err = agentResumeFromCredential(ctx, opts, cred, joinHost, meshPriv, meshPub, logger)
+		switch {
+		case errors.Is(err, bootstrap.ErrNoMeshPeer) && tokenPresent:
+			// The server no longer knows this node — its MeshPeer, and with it the
+			// podCIDR assignment, is gone. The stored credential still
+			// authenticates, but it describes an assignment the cluster has
+			// forgotten, so the only honest recovery is a fresh join, and the
+			// operator already supplied the means.
+			logger.Warn("the cluster has no mesh peer for this node; falling back to a full token join", "err", err)
+			plan = startModeTokenJoin
+		case errors.Is(err, bootstrap.ErrNoMeshPeer):
+			return agentTerminal(ctx, logger, fmt.Errorf("the cluster has no mesh peer for this node; rejoin with a fresh token (k3sm token create on the server): %w", err))
+		case err != nil:
+			return err
+		}
+	}
+	if plan == startModeTokenJoin {
+		res, meshEndpoint, err = agentTokenJoin(ctx, opts, password, meshPriv, joinHost, logger)
+		if err != nil {
+			return err
+		}
 	}
 
-	bootstrapURL := "https://" + joinHost
-	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
-		"nodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
-	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
-		Server:       bootstrapURL,
-		Token:        opts.token,
-		NodeName:     opts.nodeName,
-		NodeIP:       opts.nodeIP,
-		NodePassword: password,
-		MeshEndpoint: meshEndpoint,
-		HTTPClient:   joinClient,
-		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
-		// back as exactly this value and is what bringUpMesh programs below.
-		WGPrivateKeyB64: meshPriv,
-	})
-	if err != nil {
-		return fmt.Errorf("join: %w", err)
-	}
-	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
-
-	// Refuse a join that delivered no kubelet SERVING keypair, BEFORE anything
+	// Refuse a credential that carries no kubelet SERVING keypair, BEFORE anything
 	// starts. A joined worker's apiserver runs with
 	// --kubelet-certificate-authority=<cluster CA>, so a self-signed fallback here
 	// would leave this node's :10250 unusable (x509: unknown authority) while the node
@@ -202,15 +261,19 @@ func runAgent(args []string) error {
 	}
 
 	// The apiserver this worker targets is the SERVER'S MESH address, not the
-	// underlay --server it just joined over (see workerAPIServerURL). Writing the
-	// kubeconfig here — before bringUpMesh — is only a file write; every dial
+	// underlay --server it just joined over (see workerAPIServerURL). Persisting
+	// the credential here — before bringUpMesh — is only a file write; every dial
 	// against this URL happens after the tunnel exists (the MeshPeer watcher's
 	// informer starts after mesh.Start, and the datapath + node clients are built
 	// later still), which is the ordering the mesh-IP URL requires.
+	//
+	// Both paths save: a token join persists newly issued material, a reuse start
+	// rewrites the same bytes (and picks up an `--api-port` change), so there is
+	// exactly one writer of the on-disk shape.
 	apiserverURL := workerAPIServerURL(res, opts.server, opts.apiPort)
-	kubeconfigPath := filepath.Join(opts.workDir, "node.kubeconfig")
+	kubeconfigPath := store.kubeconfigPath()
 	logger.Info("apiserver target for this node", "url", apiserverURL, "advertised", res.APIServers)
-	if err := writeNodeKubeconfig(kubeconfigPath, apiserverURL, opts.nodeName, res); err != nil {
+	if err := store.Save(apiserverURL, opts.nodeName, res); err != nil {
 		return err
 	}
 
@@ -226,8 +289,8 @@ func runAgent(args []string) error {
 		// The endpoint this node just published goes stale the moment its LAN
 		// address changes, so the refresher carries that value forward and
 		// republishes it when the derivation changes. A construction failure is
-		// SURVIVABLE — the mesh is up and the join-time endpoint is correct
-		// today — so it is logged with what is lost rather than failing the
+		// SURVIVABLE — the mesh is up and the endpoint published at start is
+		// correct today — so it is logged with what is lost rather than failing the
 		// agent.
 		refresher, err := newWorkerEndpointRefresher(opts, res, joinHost, meshEndpoint, logger)
 		if err != nil {
@@ -248,9 +311,10 @@ func runAgent(args []string) error {
 		}
 		// Built AFTER join+mesh: the proxy's mesh-egress source is this node's
 		// assigned /32 (res.MeshIP, now an lo0 alias plumbed by mesh.Start) and the
-		// routing-table locality is its assigned pod /24 (res.PodCIDR) — neither is
-		// known before enroll. Without this a joined worker has no Service proxy and
-		// no DNS, so a pod on it can't resolve names or reach the API VIP.
+		// routing-table locality is its assigned pod /24 (res.PodCIDR); on a restart
+		// both come from the stored assignment, which is the same pair the server
+		// assigned. Without this a joined worker has no Service proxy and no DNS, so
+		// a pod on it can't resolve names or reach the API VIP.
 		datapath, err = startWorkerNetserve(ctx, opts, res, mode, kubeconfigPath, logger)
 		if err != nil {
 			return err
@@ -262,6 +326,96 @@ func runAgent(args []string) error {
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
 	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
 	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode, datapath))
+}
+
+// agentTokenJoin runs the credential-issuing join and returns the result plus the
+// wireguard endpoint it published.
+//
+// The join client is built HERE rather than left to bootstrap.Join so its dialer
+// can report which of this Mac's addresses reaches the control plane — the one
+// fact the mesh endpoint has to be derived from. It is still the CA-pinned
+// client; pinnedJoinClient layers only the dialer onto it.
+func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, joinHost string, logger *slog.Logger) (*bootstrap.JoinResult, string, error) {
+	tok, err := bootstrap.ParseToken(opts.token)
+	if err != nil {
+		return nil, "", err
+	}
+	joinClient, joinDialer, err := pinnedJoinClient(tok.CAHash)
+	if err != nil {
+		return nil, "", err
+	}
+	joinDialer.probe(ctx, joinHost)
+
+	// The advertised wireguard endpoint is an UNDERLAY address, never opts.nodeIP:
+	// that flag carries this node's MESH InternalIP, and a peer must dial the
+	// underlay to open the handshake that creates the mesh in the first place.
+	meshEndpoint, err := underlayMeshEndpoint(joinDialer.localIP(), opts.nodeIP, opts.meshPort)
+	if err != nil {
+		return nil, "", err
+	}
+
+	bootstrapURL := "https://" + joinHost
+	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
+		"nodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
+	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
+		Server:       bootstrapURL,
+		Token:        opts.token,
+		NodeName:     opts.nodeName,
+		NodeIP:       opts.nodeIP,
+		NodePassword: password,
+		MeshEndpoint: meshEndpoint,
+		HTTPClient:   joinClient,
+		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
+		// back as exactly this value and is what bringUpMesh programs.
+		WGPrivateKeyB64: meshPriv,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("join: %w", err)
+	}
+	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
+	return res, meshEndpoint, nil
+}
+
+// agentResumeFromCredential is the restart path: it rebuilds the join outcome
+// from the stored credential and re-publishes this node's wireguard endpoint,
+// without a token and without re-issuing a certificate.
+//
+// The endpoint is re-derived (not read back) because the address that reaches the
+// control plane is exactly what a restart may have changed — a new DHCP lease, a
+// move between Wi-Fi and Ethernet, a dock. It is published through the
+// node-certificate-authenticated refresh verb, whose whole point is that a joined
+// node can write its own endpoint with the credential it already holds; the
+// TTL-bounded token is not needed and deliberately not retained.
+//
+// A 404 comes back as bootstrap.ErrNoMeshPeer and is returned as-is: only the
+// caller knows whether a token is available to recover with.
+func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nodeCredential, joinHost, meshPriv, meshPub string, logger *slog.Logger) (*bootstrap.JoinResult, string, error) {
+	if cred == nil {
+		return nil, "", errors.New("resume: no stored node credential")
+	}
+	// A FRESH dialer, and a probe against the same destination the join used, so
+	// the kernel's route lookup answers the endpoint question the same way it did
+	// at join time.
+	d := &localAddrDialer{dialer: net.Dialer{Timeout: 10 * time.Second}}
+	d.probe(ctx, joinHost)
+	meshEndpoint, err := underlayMeshEndpoint(d.localIP(), opts.nodeIP, opts.meshPort)
+	if err != nil {
+		return nil, "", err
+	}
+
+	client, err := bootstrap.NodeIdentityClient(cred.clusterCAPEM, cred.clientCertPEM, cred.clientKeyPEM)
+	if err != nil {
+		return nil, "", err
+	}
+	logger.Info("resuming from the stored node credential", "node", opts.nodeName,
+		"meshEndpoint", meshEndpoint, "podCIDR", cred.assignment.PodCIDR,
+		"clientCertExpires", cred.clientNotAfter.UTC().Format(time.RFC3339))
+	if err := bootstrap.RefreshMeshEndpoint(ctx, client, "https://"+joinHost, opts.nodeName, meshEndpoint); err != nil {
+		return nil, "", err
+	}
+	res := cred.joinResult(opts.nodeName, meshPriv, meshPub)
+	logger.Info("resumed", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
+	return res, meshEndpoint, nil
 }
 
 // agentNodeOptions builds the joined worker's in-process node options from the
@@ -601,7 +755,10 @@ users:
 		b64(res.NodeClientCertPEM),
 		b64(res.NodeClientKeyPEM),
 	)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	// Installed atomically (and skipped when unchanged) like every other artifact
+	// of the credential store this belongs to: a restart rewrites this file, and a
+	// half-written kubeconfig is a node that cannot authenticate.
+	if err := writeStoreFile(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write node kubeconfig: %w", err)
 	}
 	return nil

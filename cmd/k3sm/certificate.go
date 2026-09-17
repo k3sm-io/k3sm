@@ -58,8 +58,10 @@ Caveats:
   * Rotation does NOT revoke. k3sm publishes no CRL/OCSP and --client-ca-file trust
     is CA-wide, so a superseded certificate stays valid until it expires. This is
     renewal hygiene, NOT a response to a compromised credential.
-  * Worker/agent node certs are out of scope. They are re-issued when an agent
-    restarts and re-runs its join, which needs a fresh join token (k3sm token create).
+  * Worker/agent node certs are out of scope, and a restart no longer touches them:
+    an agent REUSES the credential it stored at join instead of re-joining. A node
+    client cert is issued for one year, so rotating one means forcing a rejoin before
+    it expires (a fresh join token, or remove the agent's stored credential files).
   * The apiserver's own self-signed cert dir is not rotated (it is also the
     controller-manager --root-ca-file and every pod's projected kube-root-ca.crt).
 `
@@ -206,8 +208,14 @@ Rotation does not revoke. k3sm publishes no CRL/OCSP and --client-ca-file trust 
 CA-wide, so a superseded certificate stays valid until it expires — this is renewal
 hygiene, not a response to a compromised credential.
 
-Worker/agent node certs are out of scope: they are re-issued when an agent restarts
-and re-runs its join, which needs a fresh join token (k3sm token create).
+Worker/agent node certs are out of scope, and an agent RESTART no longer refreshes
+them: a joined agent presents the credential it stored at join rather than re-running
+the join, so its certificates are not re-issued. A node client cert is issued for one
+year (bootstrap.DefaultNodeCertTTL). Rotating one today means forcing a rejoin before
+it expires — start the agent with a fresh token (k3sm token create), or remove its
+stored credential files (node.kubeconfig, kubelet-serving.crt, kubelet-serving.key,
+kubelet-client-ca.crt) from the agent work dir. In-process node-cert rotation is not
+implemented.
 `)
 
 	fmt.Fprintf(w, `
