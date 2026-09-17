@@ -49,10 +49,12 @@ import (
 	"time"
 
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -148,6 +150,37 @@ const (
 	// service user — see EnsureRunDir for what that ownership does and does not
 	// fence off.
 	MeshKeyDir = DefaultRunDir + "/keys"
+	// MeshKeyRefServer and MeshKeyRefAgent are the BARE file names each node role
+	// stores its wireguard private key under — both in that role's work dir (the
+	// copy the unprivileged daemon loads) and in MeshKeyDir (the root-only copy
+	// the netd MeshKeyResolver resolves in helper mode).
+	//
+	// They live here, exported, because three parties must agree on them and only
+	// one of the three can see the other two: `k3sm install` provisions both
+	// copies, `k3sm server`/`k3sm agent` load the work-dir copy and pass the ref
+	// over the netd socket, and netd resolves that ref inside MeshKeyDir. A
+	// second spelling in cmd would be a daemon naming a key nothing provisioned —
+	// which is the state this pair replaced, and which fails at mesh bring-up
+	// rather than at install.
+	//
+	// The two are DISTINCT so a control plane and a joined worker on one Mac (the
+	// single-host acceptance posture) never overwrite each other's identity in
+	// the one key dir. Each is a bare file name: the resolver rejects anything
+	// with a separator in it.
+	MeshKeyRefServer = "server.key"
+	MeshKeyRefAgent  = "node.key"
+	// MeshKeyDirMode and MeshKeyFileMode are the ownership POLICY for the
+	// root-only key dir and the key inside it: root:wheel, 0700 on the directory
+	// and 0600 on the file, and never the service user's.
+	//
+	// That is the whole point of the helper copy. The unprivileged daemon already
+	// holds the same bytes in its own work dir, so a helper copy readable by
+	// _k3sm would buy nothing; what it buys root-owned is that netd — which runs
+	// as root and is the only party that has to open it — reads a key no other
+	// account on the Mac can. See provisionMeshKey for the residual this does NOT
+	// cover.
+	MeshKeyDirMode  fs.FileMode = 0o700
+	MeshKeyFileMode fs.FileMode = 0o600
 	// VMRunDir is the per-pod guest-agent socket directory runtimed binds under,
 	// as the SERVICE USER. It is pre-created by the installer for the same reason
 	// the run dir itself is: only root can hand the service user a directory
@@ -261,6 +294,21 @@ const (
 	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
 	// writes on a successful join — see AgentCredentialPath.
 	agentNodeKubeconfigName = "node.kubeconfig"
+	// agentNodePasswordName is the leaf name of the node-password `k3sm agent`
+	// mints once and reuses on every restart, so the control plane's
+	// first-write-wins anti-impersonation binding keeps matching
+	// (cmd/k3sm's loadOrCreateNodePassword).
+	agentNodePasswordName = "node-password"
+	// agentMeshKeyName is the leaf name of the worker's persisted wireguard
+	// private key (cmd/k3sm's meshKeyRef). Like the node-password it is minted
+	// once and MUST survive: a re-minted key rotates the node's mesh identity
+	// and blackholes it until every peer re-reconciles.
+	//
+	// Both names are stated here rather than imported because pkg/install cannot
+	// import cmd/k3sm. They are the on-disk contract between the agent that
+	// writes them and the installer that has to hand them over; adoptLegacyAgentFiles
+	// documents what goes wrong when the two spellings drift.
+	agentMeshKeyName = "node.key"
 )
 
 // datavolStagingName is the leaf name of the migration staging mount point. It
@@ -358,6 +406,62 @@ func daemonLabel(r Role) string {
 		return AgentLabel
 	}
 	return ServerLabel
+}
+
+// EntryKind is what an OwnedEntry IS, stated explicitly rather than left to a
+// caller to re-derive from the type bits.
+//
+// It is an explicit enum, and not a pair of booleans, because the decision that
+// reads it is a security decision: an ownership verdict reached about a name is
+// applied to whatever that name resolves to, so "this is a symlink" has to be a
+// value the code must handle rather than the absence of two other values.
+type EntryKind int
+
+const (
+	// EntryOther is a socket, a device, a fifo — anything with no other name
+	// here. It is the ZERO value on purpose: a kind nobody set is the one this
+	// package refuses to act on, never "an ordinary file".
+	EntryOther EntryKind = iota
+	// EntryRegular is a regular file.
+	EntryRegular
+	// EntryDir is a directory.
+	EntryDir
+	// EntrySymlink is a symbolic link — the entry itself, never its target, since
+	// the seam lstats.
+	EntrySymlink
+)
+
+// String names the kind as an error message needs it ("a symlink", "a
+// directory"), so a refusal says what it found rather than what it did not.
+func (k EntryKind) String() string {
+	switch k {
+	case EntryRegular:
+		return "a regular file"
+	case EntryDir:
+		return "a directory"
+	case EntrySymlink:
+		return "a symlink"
+	}
+	return "neither a file nor a directory"
+}
+
+// OwnedEntry is one filesystem entry as an ownership decision sees it: where it
+// is, who owns it, what it permits, and what kind of entry it is. It is what the
+// System seam's Owner and ListOwned answer with.
+//
+// Mode carries the permission bits ONLY (fs.FileMode.Perm); the kind is in Kind,
+// so no caller has to re-derive it from the type bits and get the derivation
+// subtly different from the next caller's.
+type OwnedEntry struct {
+	// Path is the full path of the entry, so an error or a chown built from an
+	// entry never has to re-join a directory and a name.
+	Path string
+	// UID and GID are the numeric owner and group.
+	UID, GID int
+	// Mode is the permission bits.
+	Mode fs.FileMode
+	// Kind is what the entry is.
+	Kind EntryKind
 }
 
 // System is the privileged-operation seam install/uninstall drive. The real
@@ -467,6 +571,22 @@ type System interface {
 	// directory left root-owned by an earlier build is repaired rather than
 	// silently keeping every vm pod unbootable. See VMRunDir.
 	EnsureVMRunDir(dir string, uid uint32) error
+	// EnsureMeshKeyDir creates (or repairs) the root-only mesh key directory at
+	// mode, owned by root:wheel — MeshKeyDir, which netd's MeshKeyResolver reads
+	// this node's wireguard private key out of in helper mode.
+	//
+	// It is the ONE directory under the run dir that is NOT handed to the service
+	// user, which is why it has its own method rather than riding EnsureRunDir's:
+	// the two answers must not be able to drift into one. Its parent is
+	// service-user-owned (EnsureRunDir), so a root-owned child inside it is
+	// exactly what the mode has to say, and re-applying owner and mode on every
+	// install repairs a directory an earlier build — or the daemon's own
+	// best-effort runtime write — left at looser terms.
+	//
+	// The mode is a PARAMETER for WriteServiceUserFile's reason: the policy a
+	// caller applied is then visible at the seam, and a unit test can assert it
+	// without a real filesystem or privilege.
+	EnsureMeshKeyDir(dir string, mode fs.FileMode) error
 	// EnsureRootDir creates dir root-owned at mode (idempotent, re-applying the
 	// mode on an existing directory). It is the seam the data-volume migration
 	// carves its staging mount point with: unlike the Ensure*Dir methods above
@@ -534,11 +654,51 @@ type System interface {
 	// inside the implementation, so the policy a caller applied is visible at
 	// the seam and a test can assert it without touching a real filesystem.
 	WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error
+	// WriteRootOnlyFile writes contents at path root:wheel at mode, atomically,
+	// without creating or re-owning path's parent (the caller ensures that
+	// directory through its own seam, so one write cannot silently loosen a
+	// directory another step decided).
+	//
+	// It is WriteServiceUserFile's opposite number and exists for exactly one
+	// file today: the root-only copy of this node's wireguard private key in
+	// MeshKeyDir. The service-user seam cannot be reused for it, because handing
+	// that copy to _k3sm would erase the only difference between the two copies —
+	// see MeshKeyDirMode.
+	//
+	// The mode is a PARAMETER, as on every other write seam here, so the policy
+	// is visible at the call site and assertable without privilege.
+	WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error
 	// FileMode reports the permission bits of the file at path, with ReadFile's
 	// missing-file contract (an error satisfying errors.Is(err, fs.ErrNotExist)).
 	// The installer needs it for exactly one judgement: whether the operator's
 	// join token file is readable by anyone but its owner.
 	FileMode(path string) (fs.FileMode, error)
+	// Owner reports who owns the entry at path, what it permits, and what kind
+	// of entry it is — an lstat, so a symlink is described rather than followed.
+	// A missing entry has ReadFile's contract (an error satisfying
+	// errors.Is(err, fs.ErrNotExist)): absence is a posture the caller reads,
+	// never a failure this seam decides.
+	//
+	// FileMode above answers only "what does this file permit"; ownership is a
+	// separate question and the legacy-file adoption cannot be asked in terms of
+	// the mode alone, because root:wheel 0600 and _k3sm:staff 0600 are the same
+	// mode and opposite outcomes for the daemon that has to read the file.
+	Owner(path string) (OwnedEntry, error)
+	// ListOwned lists the entries DIRECTLY inside dir, each described exactly as
+	// Owner describes it, and never descends into a subdirectory. A missing dir
+	// has Owner's missing-entry contract.
+	//
+	// The shallow contract is the point, not a simplification: its one caller
+	// judges the agent work dir, which holds a fixed handful of credential
+	// files, and a seam that walked would invite the same judgement to be
+	// applied to trees (the pod-log tree) where it does not belong.
+	ListOwned(dir string) ([]OwnedEntry, error)
+	// Chown sets the owner of path to uid:gid and changes NOTHING else. The mode
+	// is deliberately left exactly as it was found — the files this is used on
+	// are already 0600 and re-deciding their mode here would be a second,
+	// unreviewed policy sitting next to the one WriteServiceUserFile applies.
+	// It does not follow a symlink, for the reason Owner does not.
+	Chown(path string, uid, gid int) error
 	// WriteLaunchDaemon writes a launchd plist root:wheel at plistPath, at mode.
 	//
 	// The mode is a PARAMETER rather than a constant inside the implementation
@@ -547,6 +707,20 @@ type System interface {
 	// the one call site that takes it, and lets a test assert the mode a given
 	// daemon was laid down at without a real filesystem.
 	WriteLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode) error
+	// ReadRegularFile reads a root-readable file, refusing to follow a symlink and
+	// refusing anything that is not a REGULAR file (an error matching
+	// ErrNotRegularFile); a missing file keeps ReadFile's fs.ErrNotExist contract.
+	//
+	// It exists because of one file whose directory the installer does not own.
+	// The mesh key's work-dir copy lives under the service-user-owned data root,
+	// and install reads it AS ROOT and copies its bytes into a root-only
+	// directory. With an ordinary read, the service uid could replace that file
+	// with a symlink to anything on the Mac and have root copy the target out for
+	// it — a confused-deputy read that hands the attacker's own uid nothing, but
+	// hands root's reach to whatever it points at. The refusal, not the mode, is
+	// what closes that: the file is opened O_NOFOLLOW and its type checked on the
+	// open descriptor, so there is no window between the check and the read.
+	ReadRegularFile(path string) ([]byte, error)
 	// ReadFile reads a root-readable file: the installed server plist, whose
 	// operator-supplied arguments a reinstall must carry over; the
 	// server-arguments record that carries those same arguments when no plist
@@ -969,7 +1143,181 @@ func AgentCredentialPath(dataRoot string) string {
 // on the daemon's argv and the one path the installer writes, and a second
 // spelling of either would be a daemon pointed at a file nobody wrote.
 func (c Config) agentTokenPath() string {
-	return filepath.Join(c.DataRoot, agentWorkSubdir, agentTokenName)
+	return filepath.Join(c.agentWorkDir(), agentTokenName)
+}
+
+// legacyAgentArtifacts is the FIXED table of leaf names the agent work dir is
+// known to hold: the five artifacts of a stored node credential, plus the three
+// this package and cmd/k3sm name themselves.
+//
+// The credential names come from nodecred.Store rather than being retyped, so
+// the directory the installer repairs and the directory the daemon reads can
+// never disagree about what lives in it. The dir value is irrelevant — only the
+// leaf names are taken.
+func legacyAgentArtifacts() map[string]bool {
+	store := nodecred.Store{Dir: "."}
+	known := make(map[string]bool, len(store.Paths())+3)
+	for _, p := range store.Paths() {
+		known[filepath.Base(p)] = true
+	}
+	for _, name := range []string{agentNodePasswordName, agentMeshKeyName, agentTokenName} {
+		known[name] = true
+	}
+	return known
+}
+
+// serviceCanRead reports whether the service user can open e.
+//
+// Three ways, and the middle one is the trap this predicate exists to avoid.
+// The owner can always read its own 0600 file. An other-read bit lets everyone
+// read it, the service user included. A GROUP-read bit only helps when the group
+// is one the service user is IN — and the only group this installer can assert
+// that about is DataRootGID (staff), the service user's primary group. A
+// root:wheel 0640 file carries a group-read bit and is still unreadable to
+// _k3sm, so a predicate that took any group-read bit as "readable" would wave
+// exactly the file an operator most needs to be told about straight through.
+func serviceCanRead(e OwnedEntry, svcUID, svcGID int) bool {
+	switch {
+	case e.UID == svcUID:
+		return true
+	case e.Mode&0o004 != 0:
+		return true
+	case e.Mode&0o040 != 0 && e.GID == svcGID:
+		return true
+	}
+	return false
+}
+
+// adoptLegacyAgentFiles hands the agent work dir and the known artifacts inside
+// it to the service user, on a reinstall over a worker that was installed before
+// the node daemon moved from root to _k3sm.
+//
+// This is a MIGRATION to the posture a fresh install already produces — service
+// uid, group staff, the mode untouched, which is exactly what
+// WriteServiceUserFile writes the staged join token at — and NOT a widening of
+// anything. Nothing becomes readable to an account that could not read it
+// before: every file involved is 0600 both before and after, and the mode is
+// carried across verbatim rather than re-decided. What changes is only WHICH
+// single uid the 0600 names, from root to the unprivileged user the daemon now
+// runs as.
+//
+// Without it, such a node crash-loops: `k3sm agent` starts as _k3sm, finds a
+// root-owned 0600 node-password it cannot rewrite, and dies on "persist
+// node-password: permission denied" — with the same fate waiting behind it for
+// the mesh key and the node credential. Only root can hand those files over and
+// only the installer runs as root, which is why this is an install step and not
+// something the node does for itself at start-up (the reasoning EnsureRunDir and
+// EnsureContainerLogDir already record for their own directories).
+//
+// Three limits, all deliberate:
+//
+//   - Only the entries in legacyAgentArtifacts are adopted. A file k3sm does not
+//     recognise is never chowned, because giving an unknown file to the service
+//     user IS the widening this function is careful not to be.
+//   - An unrecognised regular file the service user cannot read REFUSES the
+//     install, before a single chown happens. It would otherwise be a silent
+//     landmine: the daemon may need it, nothing here can know, and an install
+//     that reported success over it would hand back the crash-loop it was run to
+//     fix. The operator is told the file and both remedies.
+//   - An entry under one of the KNOWN names that is not a regular file refuses
+//     the install too. An adoption is decided about a name and applied to what
+//     the name resolves to, so a symlink standing in for node.key is not a file
+//     to hand over.
+//   - Nothing is walked. Subdirectories are not descended into and not judged:
+//     this is the five-artifact credential directory, not a tree.
+//
+// The chowns are ordered files-first, directory-last, so the service user never
+// owns the directory while a root-owned artifact inside it is still pending.
+func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
+	dir := cfg.agentWorkDir()
+	svcUID, svcGID := int(uid), DataRootGID
+	self, err := sys.Owner(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// No work dir yet: a first install, or one whose token staging is still
+		// to create it. Nothing to migrate.
+		return nil
+	case err != nil:
+		return fmt.Errorf("install: inspect the agent work dir %s: %w", dir, err)
+	case self.Kind != EntryDir:
+		return fmt.Errorf("install: the agent work dir %s is not a directory: the agent daemon keeps this node's credential there, so move whatever is at that path aside before reinstalling", dir)
+	}
+	entries, err := sys.ListOwned(dir)
+	if err != nil {
+		return fmt.Errorf("install: list the agent work dir %s: %w", dir, err)
+	}
+
+	// Two passes, and the split is the contract: everything is CLASSIFIED before
+	// anything is changed, so a refusal leaves the directory exactly as it was
+	// found rather than half-migrated.
+	known := legacyAgentArtifacts()
+	var adopt []OwnedEntry
+	var unreadable, notRegular, ignored []string
+	for _, e := range entries {
+		switch {
+		case known[filepath.Base(e.Path)]:
+			switch {
+			case e.Kind != EntryRegular:
+				notRegular = append(notRegular, fmt.Sprintf("%s (%s)", e.Path, e.Kind))
+			case e.UID == 0 && svcUID != 0:
+				adopt = append(adopt, e)
+			}
+		case e.Kind != EntryRegular:
+			// A subdirectory, a symlink, a socket under a name k3sm does not
+			// claim: not this step's business, and never chowned.
+		case !serviceCanRead(e, svcUID, svcGID):
+			unreadable = append(unreadable, e.Path)
+		default:
+			ignored = append(ignored, e.Path)
+		}
+	}
+	// The known-name-wrong-kind refusal comes first because it is the sharper
+	// one. An adoption is a decision made about a NAME and applied to whatever
+	// that name resolves to; a symlink at node.key, plantable by anything that
+	// can write in this directory, would aim a root-run chown at a file
+	// somewhere else on the Mac. Lchown means the link itself would move rather
+	// than its target, so this is a refusal out of caution rather than a repair
+	// of a live escalation — but "the artifact k3sm was about to hand over is
+	// not the artifact" is never something to continue past.
+	if len(notRegular) > 0 {
+		return fmt.Errorf("install: the agent work dir %s holds an entry under one of this node's own state file names that is not a regular file; remove it and let the agent write its state afresh: %s — k3sm hands ownership of a state file to %s, never of something standing in for one",
+			dir, strings.Join(notRegular, ", "), cfg.ServiceUser)
+	}
+	if len(unreadable) > 0 {
+		return fmt.Errorf("install: the agent work dir %s holds file(s) the %s service user the node daemon runs as cannot read, and k3sm does not recognise them: %s — `sudo chown %s <file>` if the file belongs to this node's agent, or remove it if it is not k3sm's; k3sm will not hand a file it cannot account for to the service user on its own",
+			dir, cfg.ServiceUser, strings.Join(unreadable, ", "), cfg.ServiceUser)
+	}
+	for _, path := range ignored {
+		// The PATH only, never a byte of the file: an unrecognised file in a
+		// credential directory is exactly the thing not to echo into a log. It is
+		// still worth one line each, because "k3sm saw this and chose to leave it"
+		// is the record an operator needs when they later wonder why it was not
+		// repaired.
+		cfg.Logger.Info("left an unrecognised file in the agent work dir alone: the service user can already read it, and k3sm does not adopt files it cannot account for", "path", path)
+	}
+	// The files FIRST and the directory LAST. In between, the directory is still
+	// root's while its contents move — never the reverse. Handing the directory
+	// over first would give the service user a 0700 directory it owns (and so
+	// may rename or unlink within) for the duration of the remaining chowns,
+	// while root-owned artifacts inside were still pending; ending with the
+	// directory means that window does not exist.
+	if self.UID == 0 && svcUID != 0 {
+		adopt = append(adopt, self)
+	}
+	for _, e := range adopt {
+		if err := sys.Chown(e.Path, svcUID, svcGID); err != nil {
+			return fmt.Errorf("install: hand the agent state %s over to %s (uid %d): %w", e.Path, cfg.ServiceUser, svcUID, err)
+		}
+	}
+	if len(adopt) > 0 {
+		paths := make([]string, len(adopt))
+		for i, e := range adopt {
+			paths[i] = e.Path
+		}
+		cfg.Logger.Info("adopted agent state left root-owned by an install that predates the service user (the mode is unchanged; only the uid the 0600 names moves)",
+			"user", cfg.ServiceUser, "uid", svcUID, "paths", strings.Join(paths, ","))
+	}
+	return nil
 }
 
 // serverTokenPath is where Install stages the static admin token for the
@@ -1012,6 +1360,194 @@ func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMo
 	if err := sys.WriteServiceUserFile(dst, []byte(token+"\n"), uid, mode, dirMode); err != nil {
 		return fmt.Errorf("install: stage the %s at %s: %w", what, dst, err)
 	}
+	return nil
+}
+
+// meshKeyRef is the bare file name THIS role stores its wireguard private key
+// under, in both copies. It is an accessor rather than a branch at each use so
+// no code path can provision one role's identity under the other's name.
+func (c Config) meshKeyRef() string {
+	if c.Role == RoleAgent {
+		return MeshKeyRefAgent
+	}
+	return MeshKeyRefServer
+}
+
+// meshKeyWorkPath is the role's WORK-DIR copy of that key: the file `k3sm
+// server`/`k3sm agent` loads (or, on a node this installer never reached,
+// mints) as the unprivileged service user, inside the same state tree that
+// role's token is staged in.
+func (c Config) meshKeyWorkPath() string {
+	if c.Role == RoleAgent {
+		return filepath.Join(c.DataRoot, agentWorkSubdir, MeshKeyRefAgent)
+	}
+	return filepath.Join(c.serverWorkDir(), MeshKeyRefServer)
+}
+
+// meshKeyHelperPath is the ROOT-ONLY copy of that key, inside MeshKeyDir.
+//
+// The directory is the MeshKeyDir constant rather than a derivation from this
+// Config's data root, deliberately and for the same reason VMRunDir is: the
+// netd plist this very install renders puts that constant on the helper's
+// `--mesh-key-dir` argv, so provisioning anywhere else would write a key at a
+// path netd is not reading.
+func (c Config) meshKeyHelperPath() string { return filepath.Join(MeshKeyDir, c.meshKeyRef()) }
+
+// ErrNotRegularFile is what ReadRegularFile reports for a path that exists but
+// is a symlink, a directory, a device or a fifo. It is a sentinel because the
+// callers must tell it apart from "absent": absence is a posture (nothing has
+// been provisioned yet), while a non-regular file where a key belongs is
+// somebody having put it there, and the two lead to opposite actions.
+var ErrNotRegularFile = errors.New("not a regular file")
+
+// readMeshKey reads one copy of this node's wireguard identity and returns
+// (nil, nil) when that copy does not exist — the only absence this step treats
+// as a posture rather than a failure.
+//
+// Everything else is refused, and refused LOUDLY, because both copies sit in
+// directories root does not own outright: the work-dir copy is the service
+// user's, and the root-only copy's PARENT is (the run dir). So a file there is
+// not automatically this node's identity — it is whatever the last writer put
+// there. Two things are therefore checked before any byte is copied anywhere:
+// the path is a regular file that was opened without following a symlink, and
+// the bytes decode as a usable Curve25519 private key. what names the copy in
+// the error, so the operator is told which of the two to look at.
+//
+// The validation is not decoration. The whole step exists to copy one file's
+// bytes into a root-only file netd hands to wireguard; bytes that are not a key
+// would fail there, at mesh bring-up, as an opaque device error on a node that
+// installed cleanly.
+func readMeshKey(sys System, path, what string) ([]byte, error) {
+	b, err := sys.ReadRegularFile(path)
+	switch {
+	case err == nil:
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("install: read the %s mesh key %s: %w", what, path, err)
+	}
+	if _, err := bootstrap.WireguardPublicKey(string(b)); err != nil {
+		return nil, fmt.Errorf("install: the %s mesh key %s is not a usable wireguard private key: %w "+
+			"(remove it only if you accept that this node's mesh identity changes and every peer must re-learn it)", what, path, err)
+	}
+	return b, nil
+}
+
+// provisionMeshKey makes this node's wireguard identity exist, in both places
+// it has to exist, before either daemon starts — for whichever role is being
+// installed.
+//
+// The WORK-DIR copy is the source of truth whenever it exists, because the node
+// daemon is what owns the identity: it loads that file on every start and
+// derives the public key its MeshPeer advertises from it, so a key minted
+// anywhere else would have to agree with it byte for byte or rotate the node's
+// identity. This step reads it and copies exactly its bytes into MeshKeyDir.
+//
+// When it does NOT exist the root-only copy is consulted before anything is
+// minted, and if it holds a usable key the work-dir copy is RESTORED from it.
+// That order is the point: the two copies are one identity, and a node whose
+// work dir was wiped (a data-root repair, a hand-deleted file) still has every
+// peer holding the public half of the key in the key dir. Minting there would
+// silently orphan the node — its MeshPeer would advertise a public key no peer's
+// AllowedIPs carries, and the mesh would stay dark on an install that reported
+// success. A key is minted ONLY when neither copy exists, and then both are
+// written from the same bytes: the work-dir one through the service-user seam,
+// so the daemon finds it and never mints a second, different key of its own.
+//
+// The step exists at all because the daemon's own best-effort write into
+// MeshKeyDir cannot work in the posture k3sm ships: that directory is
+// root-owned, the daemon runs as _k3sm, and until this step existed a fresh
+// install did not create it — so a worker in helper mode asked netd for a key
+// ref that resolved to nothing and the mesh never came up. Provisioning is the
+// privileged installer's job because only the privileged installer can do it.
+//
+// A re-run is a no-op when the two copies already agree, and a REPAIR when they
+// do not: a root-only copy that differs, or that is unusable while the work dir
+// holds a good key, is overwritten from the work dir (logged), because a stale
+// copy is a key netd would hand wireguard while the node advertises the public
+// half of a different one. An unusable copy with NO work-dir key to repair from
+// is a hard failure — see readMeshKey.
+//
+// What this does NOT buy, stated plainly: MeshKeyDir's PARENT is the run dir,
+// which is service-user-owned by necessity (EnsureRunDir), so _k3sm can rename,
+// replace or unlink the key dir and anything beneath it. Root ownership here
+// protects the key's CONFIDENTIALITY — no other account on the Mac can read the
+// bytes — and not its integrity against the one account that already drives
+// netd over its socket. Every read below is O_NOFOLLOW and type-checked for
+// that reason, and every write is a temp-and-rename, so neither operation can be
+// redirected by something planted at the path. Per-uid isolation of that account
+// is the vm RuntimeClass's job, not this directory's.
+func provisionMeshKey(sys System, cfg Config, uid uint32) error {
+	if err := sys.EnsureMeshKeyDir(MeshKeyDir, MeshKeyDirMode); err != nil {
+		return fmt.Errorf("install: ensure the root-only mesh key dir %s: %w", MeshKeyDir, err)
+	}
+	workPath, helperPath := cfg.meshKeyWorkPath(), cfg.meshKeyHelperPath()
+	work, err := readMeshKey(sys, workPath, "work-dir")
+	if err != nil {
+		return err
+	}
+	helper, herr := readMeshKey(sys, helperPath, "root-only")
+	if herr != nil {
+		// A root-only copy that cannot be read or is not a key is repairable
+		// EXACTLY when the work dir holds the identity to repair it from.
+		// Otherwise it is the only thing standing between this node and a new
+		// identity, and overwriting it is the one outcome that cannot be undone.
+		if work == nil {
+			return herr
+		}
+		cfg.Logger.Warn("the root-only mesh key is unusable; re-provisioning it from this node's work-dir key", "path", helperPath, "err", herr)
+		helper = nil
+	}
+
+	key := work
+	switch {
+	case key != nil:
+		// The node's own copy decides; nothing is minted or restored.
+	case helper != nil:
+		// Restore rather than mint: these bytes are the identity every peer
+		// already knows this node by.
+		key = helper
+		workDirMode := ServerTokenDirMode
+		if cfg.Role == RoleAgent {
+			workDirMode = AgentTokenDirMode
+		}
+		if err := sys.WriteServiceUserFile(workPath, key, uid, MeshKeyFileMode, workDirMode); err != nil {
+			return fmt.Errorf("install: restore this node's mesh key at %s: %w", workPath, err)
+		}
+		cfg.Logger.Info("restored this node's mesh key into the daemon's work dir from the root-only copy (the identity its peers already know)",
+			"path", workPath, "source", helperPath, "keyRef", cfg.meshKeyRef())
+	default:
+		priv, pub, gerr := bootstrap.GenerateWireguardKey()
+		if gerr != nil {
+			return fmt.Errorf("install: mint this node's mesh key: %w", gerr)
+		}
+		key = []byte(priv)
+		// The work dir IS the directory this role's token is staged in, so its
+		// mode is read from that decision rather than restated under a third name.
+		workDirMode := ServerTokenDirMode
+		if cfg.Role == RoleAgent {
+			workDirMode = AgentTokenDirMode
+		}
+		if werr := sys.WriteServiceUserFile(workPath, key, uid, MeshKeyFileMode, workDirMode); werr != nil {
+			return fmt.Errorf("install: write this node's mesh key at %s: %w", workPath, werr)
+		}
+		// The PUBLIC half is logged and the private half never is: the public key
+		// is what every peer programs into its wireguard device, so having it in
+		// the install log is what makes a mesh that did not come up diagnosable.
+		cfg.Logger.Info("minted this node's wireguard identity (neither copy existed)", "path", workPath, "keyRef", cfg.meshKeyRef(), "publicKey", pub)
+	}
+
+	if helper != nil && bytes.Equal(helper, key) {
+		return nil
+	}
+	if helper != nil {
+		cfg.Logger.Info("the root-only mesh key did not match this node's identity; re-provisioning it from the work dir", "path", helperPath)
+	}
+	if err := sys.WriteRootOnlyFile(helperPath, key, MeshKeyFileMode); err != nil {
+		return fmt.Errorf("install: provision the root-only mesh key at %s: %w", helperPath, err)
+	}
+	cfg.Logger.Info("provisioned this node's mesh key for the netd helper (root-only; the daemon passes netd the ref, never the key)",
+		"path", helperPath, "keyRef", cfg.meshKeyRef())
 	return nil
 }
 
@@ -1271,6 +1807,29 @@ func artifactManifest(cfg Config) []artifact {
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 	}
+	// This node's wireguard identity: the role's work-dir copy, the root-only
+	// key dir, and the copy inside it that netd's MeshKeyResolver reads. All
+	// three are PRESERVED, which is the disposition of everything else under the
+	// data root that is state rather than a credential in transit:
+	//
+	//   - the work-dir key IS the node's mesh identity. Removing it would rotate
+	//     the public key every peer has in its AllowedIPs on the next install,
+	//     which is the failure loadOrCreateMeshKey exists to prevent, and it is
+	//     already covered by DataRoot's own preserve entry ("kine state.db + mesh
+	//     keys").
+	//   - the helper copy and its directory sit under the run dir, so they follow
+	//     the run dir's disposition — preserved with DataRoot. Removing just this
+	//     copy would buy nothing while the work-dir copy of the SAME bytes stays,
+	//     and a reinstall re-provisions it from there regardless.
+	//
+	// Neither path's existence is asserted: a data root an older build installed
+	// has no key until the install that provisions one, and a node that has never
+	// run has no work-dir copy either.
+	items = append(items,
+		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyWorkPath(), assertExists: false},
+		artifact{kind: kindDir, disp: dispPreserve, path: MeshKeyDir, assertExists: false},
+		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyHelperPath(), assertExists: false},
+	)
 	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
 	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is
 	// ever in a manifest — a Mac that carried both would register two nodes out
@@ -1453,6 +2012,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 
+	// 1e′. Hand any agent state an OLDER install left root-owned over to the
+	//     service user — after the step above, which is what may have just
+	//     created the work dir, and well before step 4 restarts the daemon that
+	//     has to write in it. See adoptLegacyAgentFiles for why a node installed
+	//     before the daemon moved to _k3sm otherwise crash-loops on its own
+	//     node-password, and for why this is a migration to the fresh-install
+	//     posture rather than a widening of it.
+	if cfg.Role == RoleAgent {
+		if err := adoptLegacyAgentFiles(sys, cfg, uid); err != nil {
+			return err
+		}
+	}
+
 	// 1f. The control plane's static admin token, staged the same way and for a
 	//     stronger version of the same reason: it authenticates as
 	//     system:masters, and it used to be rendered as a VALUE on the server
@@ -1467,6 +2039,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 			return err
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+	}
+
+	// 1g. This node's wireguard identity, in both copies, for BOTH roles — see
+	//     provisionMeshKey. It sits with the token stagings because it is the
+	//     same kind of step (root hands the unprivileged daemon a credential it
+	//     could not place for itself), and after EnsureRunDir at 1c because the
+	//     root-only key dir is carved inside the run dir.
+	if err := provisionMeshKey(sys, cfg, uid); err != nil {
+		return err
 	}
 
 	// 2. Copy the binary to the exact path the plists exec (installedBinary()),
@@ -1960,8 +2541,32 @@ func keptArtifacts(cfg Config, m []artifact) []string {
 // UserName) — it is the only irreducibly-root component — execing `k3sm netd`
 // with the Service CIDR (so proxy VIP binds are authorizable), the socket, the
 // mesh key dir, and a read kubeconfig (the PortAuthorizer's Service informer).
+//
+// The kubeconfig is the ONE argument that follows the node's role, because the
+// two roles hold different credentials in different places. A RoleServer node
+// runs the control plane, so netd reads the admin kubeconfig in the server work
+// dir. A RoleAgent node has no server work dir at all: the credential a worker
+// owns is the node kubeconfig `k3sm agent` writes when its join succeeds
+// (AgentCredentialPath), and that is what its netd is handed. Handing a worker
+// the server path is not a cosmetic mismatch — buildServiceSet's informer is the
+// authorizer's only source of truth, so a kubeconfig that cannot load leaves
+// every <1024 bind denied for the daemon's whole life, and on a Mac that was
+// once a server the file still exists and is a STALE credential.
+//
+// It deliberately passes NO --node-pod-cidr on either role. The node's pod /24
+// is not knowable at install time — it is decided by the join — so netd starts
+// on the flag's own pre-adoption default and adopts the real prefix from the
+// agent's ConfigureMesh RPC. Writing the install-time value into the launchd job
+// would pin a guess that the next netd restart comes back on, dropping every pod
+// alias and route the adopted prefix had established. It passes no --node-ip for
+// the separate reason TestNetdPlistXML records (the node-address authorizer
+// branch is dormant by configuration).
 func NetdPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
+	kubeconfig := filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig")
+	if cfg.Role == RoleAgent {
+		kubeconfig = AgentCredentialPath(cfg.DataRoot)
+	}
 	return renderPlist(launchdPlist{
 		Label: NetdLabel,
 		ProgramArguments: []string{
@@ -1969,7 +2574,7 @@ func NetdPlist(cfg Config) []byte {
 			"--socket", cfg.NetdSocket,
 			"--service-cidr", cfg.ServiceCIDR,
 			"--mesh-key-dir", MeshKeyDir,
-			"--kubeconfig", filepath.Join(cfg.serverWorkDir(), "k3sm.kubeconfig"),
+			"--kubeconfig", kubeconfig,
 		},
 		RunAtLoad:  true,
 		KeepAlive:  true,

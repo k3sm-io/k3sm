@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -304,6 +305,90 @@ func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 	return nil
 }
 
+// Owner reports the ownership, permission bits and kind of path. See the System
+// interface for the contract.
+//
+// Lstat, not Stat: a symlink is described as itself. Following it would let a
+// link planted in the agent work dir point the ownership judgement — and then
+// the Chown below — at a file somewhere else entirely.
+func (darwinSystem) Owner(path string) (OwnedEntry, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return OwnedEntry{}, err
+	}
+	return ownedEntry(path, fi)
+}
+
+// ListOwned lists the entries directly inside dir, each as Owner describes it.
+// os.ReadDir's per-entry Info is itself lstat-derived, so a symlink in the
+// directory is described rather than followed, exactly as in Owner.
+func (darwinSystem) ListOwned(dir string) ([]OwnedEntry, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]OwnedEntry, 0, len(ents))
+	for _, e := range ents {
+		fi, err := e.Info()
+		if err != nil {
+			// The entry went away between the read and the stat. A directory
+			// being judged before a chown must be described completely or not at
+			// all, so this is an error rather than a skipped entry.
+			return nil, fmt.Errorf("stat %s: %w", filepath.Join(dir, e.Name()), err)
+		}
+		owned, err := ownedEntry(filepath.Join(dir, e.Name()), fi)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, owned)
+	}
+	return out, nil
+}
+
+// ownedEntry projects an fs.FileInfo onto OwnedEntry. The unix ownership comes
+// from the syscall.Stat_t behind it, which is the only place uid/gid live; an
+// fs.FileInfo that carries none is an ERROR rather than a zero uid, because
+// "owned by root" is precisely the verdict a zero value would fabricate.
+func ownedEntry(path string, fi fs.FileInfo) (OwnedEntry, error) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return OwnedEntry{}, fmt.Errorf("cannot read the ownership of %s", path)
+	}
+	return OwnedEntry{
+		Path: path,
+		UID:  int(st.Uid),
+		GID:  int(st.Gid),
+		Mode: fi.Mode().Perm(),
+		Kind: entryKind(fi.Mode()),
+	}, nil
+}
+
+// entryKind names what the mode bits say the entry is. The symlink arm is first
+// because fs.FileMode reports a symlink as its own type and never as a regular
+// file, and because the one caller that acts on this distinction has to be able
+// to SAY "a symlink" when it refuses.
+func entryKind(mode fs.FileMode) EntryKind {
+	switch {
+	case mode&fs.ModeSymlink != 0:
+		return EntrySymlink
+	case mode.IsDir():
+		return EntryDir
+	case mode.IsRegular():
+		return EntryRegular
+	}
+	return EntryOther
+}
+
+// Chown sets path's owner to uid:gid and touches nothing else — no chmod, so
+// the mode the file was found at is the mode it keeps.
+//
+// Lchown rather than Chown, for Owner's reason: the ownership judgement was made
+// about the entry itself, and following a symlink here would apply that verdict
+// to a different file than the one it was made about.
+func (darwinSystem) Chown(path string, uid, gid int) error {
+	return os.Lchown(path, uid, gid)
+}
+
 // CopyToRootOwned copies src to exactly dst (parent dir created root:wheel 0755)
 // using ditto (preserves the signature/extended attributes the notarized binary
 // needs). dst is the caller's contract — never derived from src's basename, so a
@@ -556,6 +641,22 @@ func (darwinSystem) VerifyVirtualizationEntitlement(path string) error {
 // existing directory, so a staging mount point left behind by an interrupted
 // migration is repaired rather than reused at whatever mode it was found with.
 func (darwinSystem) EnsureRootDir(dir string, mode fs.FileMode) error {
+	return ensureRootOwnedDir(dir, mode)
+}
+
+// EnsureMeshKeyDir creates (or repairs) the root-only mesh key dir at mode,
+// owned by root:wheel. See the System interface for why it is its own method
+// rather than a call on the run dir's, and provisionMeshKey for what the
+// ownership does and does not fence off.
+func (darwinSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
+	return ensureRootOwnedDir(dir, mode)
+}
+
+// ensureRootOwnedDir creates dir and re-applies owner root:wheel and mode on
+// EVERY call — the root-owned counterpart of ensureServiceOwnedDir, and the one
+// implementation both root-directory seams above are spelled in, so the two
+// cannot drift into different answers to "what does root-owned mean here".
+func ensureRootOwnedDir(dir string, mode fs.FileMode) error {
 	if err := os.MkdirAll(dir, mode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
@@ -702,6 +803,51 @@ func writeServiceUserFile(path string, contents []byte, uid, gid int, mode, dirM
 	return nil
 }
 
+// WriteRootOnlyFile writes contents at path root:wheel at mode. The parent
+// directory is NOT created or re-owned here — the caller ensured it through its
+// own seam, and a write that also decided a directory's terms could quietly
+// loosen what that seam decided.
+//
+// The write is temp-and-rename inside the parent, with owner and mode applied to
+// the temp file BEFORE the rename, so no reader ever observes the file at wider
+// terms than the ones asked for. That matters for the only file written this way:
+// a wireguard private key.
+func (darwinSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
+	return writeRootOnlyFile(path, contents, 0, 0, mode)
+}
+
+// writeRootOnlyFile is the method above with the owner taken explicitly, the
+// same split writeServiceUserFile and writeLaunchDaemon carry and for the same
+// reason: chowning a file to root needs privilege these tests never take, while
+// the MODE, the atomicity and the overwrite of an existing file are exactly what
+// has to be exercised against a real filesystem.
+func writeRootOnlyFile(path string, contents []byte, uid, gid int, mode fs.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".k3sm-*")
+	if err != nil {
+		return fmt.Errorf("create a temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
+	if _, err := tmp.Write(contents); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+	if err := os.Chown(tmpName, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", tmpName, uid, gid, err)
+	}
+	if err := os.Chmod(tmpName, mode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", tmpName, mode, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpName, path, err)
+	}
+	return nil
+}
+
 // FileMode reports the permission bits of the file at path. A missing file
 // returns an error satisfying errors.Is(err, fs.ErrNotExist), which callers
 // read as a posture rather than a failure — the same contract ReadFile has.
@@ -754,6 +900,49 @@ func writeLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode, uid,
 		return fmt.Errorf("chown %s to %d:%d: %w", plistPath, uid, gid, err)
 	}
 	return nil
+}
+
+// ReadRegularFile reads path without following a symlink and refuses anything
+// that is not a regular file. See the System interface for the confused-deputy
+// read it exists to prevent.
+func (darwinSystem) ReadRegularFile(path string) ([]byte, error) {
+	return readRegularFile(path)
+}
+
+// readRegularFile is the method above, split out so the on-disk test can
+// exercise it directly — the same split the other privileged writers carry.
+//
+// Three details are load-bearing:
+//
+//   - O_NOFOLLOW makes the kernel refuse the open when the LAST path component
+//     is a symlink (ELOOP), which is the swap this read has to survive. It says
+//     nothing about a symlinked parent directory; nothing here can, and the
+//     parent's ownership is the control that covers it.
+//   - O_NONBLOCK keeps a planted fifo from parking the installer forever on the
+//     open. A regular file is unaffected by it.
+//   - the type is checked on the open DESCRIPTOR (f.Stat), never with a
+//     path-based stat beforehand, so there is no window in which the thing
+//     checked and the thing read could be two different files.
+func readRegularFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		// A missing file keeps ReadFile's contract (callers read fs.ErrNotExist as
+		// a posture); a symlink is reported as the refusal it is, because ELOOP
+		// alone reads like a link cycle rather than a swap somebody performed.
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+		}
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("open %s: %w: it is a %s", path, ErrNotRegularFile, fi.Mode().Type())
+	}
+	return io.ReadAll(f)
 }
 
 // ReadFile reads a root-readable file, propagating os.ReadFile's error verbatim

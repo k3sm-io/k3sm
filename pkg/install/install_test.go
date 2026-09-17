@@ -111,6 +111,11 @@ type fakeSystem struct {
 	// entry but present in files is 0600, so an unconfigured fake describes a
 	// credential nobody else can read.
 	modes map[string]fs.FileMode
+	// kinds is what a path IS, for the one seam that cares: ReadRegularFile. The
+	// zero value (no entry) is a regular file, so every pre-existing test keeps
+	// describing an ordinary tree, and a test that wants the swap this seam
+	// refuses states it with putSymlink/putIrregular.
+	kinds map[string]fakeFileKind
 	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
 	// path. The zero value (no entry) means "signed and entitled" so that every
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
@@ -140,6 +145,17 @@ type fakeSystem struct {
 	// writes something while the installer is polling for it — a join that
 	// completes during the join budget — without a goroutine racing these maps.
 	delayed map[string]*delayedFile
+	// owners is the fake's model of unix ownership, keyed by path: what Owner
+	// and ListOwned answer from, and what Chown MUTATES. It is deliberately
+	// independent of files above — ownership is not derivable from content, and
+	// the whole question the legacy-file adoption asks is one only this table
+	// can answer.
+	//
+	// Nil (the zero value) means every path is ABSENT, which is the first-install
+	// posture: no agent work dir, nothing to migrate. So an unconfigured fake
+	// describes a Mac with no prior agent state, and only a test that cares about
+	// the migration has to say anything at all.
+	owners map[string]OwnedEntry
 }
 
 // delayedFile is one file of the fake root filesystem that is not there yet.
@@ -157,6 +173,71 @@ func (f *fakeSystem) putFileAfterReads(path string, content []byte, absentReads 
 		f.delayed = map[string]*delayedFile{}
 	}
 	f.delayed[path] = &delayedFile{content: content, absentReads: absentReads}
+}
+
+// putOwned seeds the fake's ownership table with one entry. It is how a test
+// describes what an OLDER install left on disk — root:wheel 0600 files in the
+// agent work dir — without needing the privilege to create such a file for real.
+//
+// The kind is EXPLICIT rather than inferred from anything else, because the
+// entry a test most needs to be able to plant is a symlink wearing an artifact's
+// name, and a fake that could only say "file or directory" could not express the
+// case the refusal exists for.
+func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, kind EntryKind) {
+	if f.owners == nil {
+		f.owners = map[string]OwnedEntry{}
+	}
+	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, Kind: kind}
+}
+
+// Owner answers from the ownership table. A path with no entry is ABSENT with
+// ReadFile's contract, which is what makes an unconfigured fake describe a Mac
+// that has never joined.
+func (f *fakeSystem) Owner(path string) (OwnedEntry, error) {
+	f.calls = append(f.calls, "Owner:"+path)
+	if e, ok := f.owners[path]; ok {
+		return e, nil
+	}
+	return OwnedEntry{}, fmt.Errorf("lstat %s: %w", path, fs.ErrNotExist)
+}
+
+// ListOwned answers the entries whose parent is dir, sorted by path so the
+// classification a test asserts on does not ride Go's map iteration order. It is
+// SHALLOW, matching the real implementation: an entry two levels down is not
+// listed, so a test cannot accidentally describe a tree walk this package does
+// not do.
+func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
+	f.calls = append(f.calls, "ListOwned:"+dir)
+	self, ok := f.owners[dir]
+	if !ok {
+		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
+	}
+	if self.Kind != EntryDir {
+		return nil, fmt.Errorf("open %s: not a directory", dir)
+	}
+	var out []OwnedEntry
+	for path, e := range f.owners {
+		if path != dir && filepath.Dir(path) == dir {
+			out = append(out, e)
+		}
+	}
+	slices.SortFunc(out, func(a, b OwnedEntry) int { return strings.Compare(a.Path, b.Path) })
+	return out, nil
+}
+
+// Chown records the call AND really moves the entry in the ownership table, so a
+// test asserts the STATE the installer left behind rather than the sequence of
+// calls it made. The mode is carried across untouched — the contract the seam
+// states, and the one thing a caller could quietly get wrong.
+func (f *fakeSystem) Chown(path string, uid, gid int) error {
+	f.calls = append(f.calls, fmt.Sprintf("Chown:%s:%d:%d", path, uid, gid))
+	e, ok := f.owners[path]
+	if !ok {
+		return fmt.Errorf("lchown %s: %w", path, fs.ErrNotExist)
+	}
+	e.UID, e.GID = uid, gid
+	f.owners[path] = e
+	return nil
 }
 
 // putDrain makes the fake launchd keep label in the domain for reads
@@ -261,6 +342,52 @@ func (f *fakeSystem) FileMode(path string) (fs.FileMode, error) {
 		return 0o600, nil
 	}
 	return 0, fmt.Errorf("stat %s: %w", path, fs.ErrNotExist)
+}
+
+// fakeFileKind is what the fake filesystem says a path is. Only ReadRegularFile
+// consults it: every other seam here is path-based and has no type to observe.
+type fakeFileKind int
+
+const (
+	// fakeRegular is the zero value: an ordinary file.
+	fakeRegular fakeFileKind = iota
+	// fakeSymlink is a symlink at the path — what a service-uid writer plants to
+	// make a root read copy somebody else's bytes out.
+	fakeSymlink
+	// fakeIrregular is a directory/fifo/device at the path.
+	fakeIrregular
+)
+
+// putSymlink makes ReadRegularFile refuse path as a symlink (the fake's ELOOP).
+// The bytes, if any, are still in files — which is the point: a seam that
+// followed the link would return them and the test would go green.
+func (f *fakeSystem) putSymlink(path string) { f.putKind(path, fakeSymlink) }
+
+// putIrregular makes ReadRegularFile refuse path as a non-regular file.
+func (f *fakeSystem) putIrregular(path string) { f.putKind(path, fakeIrregular) }
+
+func (f *fakeSystem) putKind(path string, k fakeFileKind) {
+	if f.kinds == nil {
+		f.kinds = map[string]fakeFileKind{}
+	}
+	f.kinds[path] = k
+}
+
+// ReadRegularFile answers ReadFile's bytes for an ordinary path, and the
+// ErrNotRegularFile refusal for one a test has said is a symlink or a
+// non-regular file — the two verdicts the real O_NOFOLLOW open reaches.
+func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
+	f.calls = append(f.calls, "ReadRegularFile:"+path)
+	switch f.kinds[path] {
+	case fakeSymlink:
+		return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+	case fakeIrregular:
+		return nil, fmt.Errorf("open %s: %w: it is a directory", path, ErrNotRegularFile)
+	}
+	if content, ok := f.files[path]; ok {
+		return content, nil
+	}
+	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
@@ -577,6 +704,25 @@ func (f *fakeSystem) WriteServiceUserFile(path string, contents []byte, uid uint
 	return nil
 }
 
+// EnsureMeshKeyDir records the directory AND the mode the installer asked for.
+// It performs no mkdir: the real one is root's, and the only thing a unit test
+// can meaningfully assert about it is the policy the caller applied.
+func (f *fakeSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("EnsureMeshKeyDir:%s:%#o", dir, mode))
+	return nil
+}
+
+// WriteRootOnlyFile records the path and the MODE — the two things that decide
+// whether the root-only copy of a key stays root-only — and lands the bytes in
+// the fake root filesystem, so a later read (this install's idempotence check,
+// or the next install's) sees exactly what was written. No uid is recorded
+// because the seam takes none: root:wheel is the whole contract.
+func (f *fakeSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("WriteRootOnlyFile:%s:%#o", path, mode))
+	f.putFile(path, contents)
+	return nil
+}
+
 // putServerArgsRecord seeds a server-arguments record an EARLIER install left
 // behind, in the bytes that install would have written.
 func putServerArgsRecord(t *testing.T, f *fakeSystem, path string, args ...string) {
@@ -727,6 +873,23 @@ func TestInstallOrchestration(t *testing.T) {
 		// cannot precede EnsureServiceUser, and it precedes the plist that names
 		// it: the daemon must never be pointed at a file nobody has written.
 		"WriteServiceUserFile:/var/lib/k3sm/server/token:0600:0700:271",
+		// This node's wireguard identity, provisioned by the party that can: the
+		// root-only key dir carved inside the (service-user-owned) run dir, the
+		// role's work-dir key read to see whether the node already has one — it
+		// does not, on a first install — so one is minted and written to BOTH the
+		// work dir (service-user 0600, where the daemon loads it) and the key dir
+		// (root 0600, where netd resolves the ref). Before any daemon starts.
+		"EnsureMeshKeyDir:/var/lib/k3sm/run/keys:0700",
+		// BOTH copies are read before anything is written, and read through the
+		// seam that refuses a symlink: whether a key already exists decides
+		// between copying, restoring and minting, and only a mint is destructive.
+		// Neither exists here (a first install), so one is minted and written to
+		// the work dir (service-user 0600, where the daemon loads it) and the key
+		// dir (root 0600, where netd resolves the ref).
+		"ReadRegularFile:/var/lib/k3sm/server/server.key",
+		"ReadRegularFile:/var/lib/k3sm/run/keys/server.key",
+		"WriteServiceUserFile:/var/lib/k3sm/server/server.key:0600:0700:271",
+		"WriteRootOnlyFile:/var/lib/k3sm/run/keys/server.key:0600",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		// The launcher link goes down immediately after the binary it points at,
 		// and long before any daemon work: copying into /Library/k3sm never put
@@ -1026,6 +1189,83 @@ func TestNetdPlistXML(t *testing.T) {
 	// consumer. Adding it must redden HERE.
 	if strings.Contains(x, "--node-ip") {
 		t.Error("netd plist must NOT render --node-ip: the node-address authorizer branch is dormant by configuration (B116/B133); re-arming it needs a deliberate decision, not a plist edit")
+	}
+}
+
+// TestAgentInstallRendersNetdWithTheNodeIdentity proves the netd plist's
+// --kubeconfig follows the node's ROLE, and that neither role's argv carries a
+// pod CIDR or a node IP.
+//
+// netd's Service informer is the privileged-port authorizer's only source of
+// truth (cmd/k3sm/netd.go buildServiceSet): a kubeconfig it can never load
+// leaves the authorizer deny-all for the daemon's whole life, so EVERY <1024
+// bind — the DNS VIP :53, the apiserver ClusterIP :443 — is denied. A worker
+// has no server work dir (the control plane's k3sm.kubeconfig is written on the
+// SERVER, and nothing on a worker ever creates it), so a role-blind plist
+// pointed a worker's netd at a file that does not exist; on a Mac that was once
+// a server the file DOES exist and is a stale credential, which is worse than
+// absent. The agent's node credential (AgentCredentialPath — the kubeconfig
+// `k3sm agent` writes on a successful join) is the only identity a worker has.
+//
+// The negative half is as load-bearing as the positive one. --node-pod-cidr is
+// not knowable at install time on a worker: the allocation is made by the join,
+// and netd learns it from the agent's ConfigureMesh RPC. A plist that re-stated
+// it would pin the pre-adoption default into launchd's job definition, so the
+// next netd restart would come back on the wrong /24 and drop every pod alias
+// and route. --node-ip re-arms the dormant node-address authorizer branch
+// (TestNetdPlistXML owns that reasoning).
+func TestAgentInstallRendersNetdWithTheNodeIdentity(t *testing.T) {
+	// A NON-default data root: every path below must be DERIVED from it, so a
+	// hard-coded default would fail here rather than pass by coincidence.
+	const dataRoot = "/opt/k3sm-b326"
+	serverWork := filepath.Join(dataRoot, "server")
+
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		// wantKubeconfig is the exact --kubeconfig value the rendered argv must
+		// carry; forbid, when non-empty, is a substring no argv element may hold.
+		wantKubeconfig string
+		forbid         string
+	}{
+		{
+			name:           "agent is handed its own node credential",
+			cfg:            Config{Role: RoleAgent, DataRoot: dataRoot},
+			wantKubeconfig: AgentCredentialPath(dataRoot),
+			forbid:         serverWork,
+		},
+		{
+			name:           "server keeps the control-plane kubeconfig",
+			cfg:            Config{Role: RoleServer, DataRoot: dataRoot},
+			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
+		},
+		{
+			name:           "the zero-value role is the server",
+			cfg:            Config{DataRoot: dataRoot},
+			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := parseProgramArguments(NetdPlist(tc.cfg))
+			if err != nil {
+				t.Fatalf("parse netd ProgramArguments: %v", err)
+			}
+			if got := flagValue(args, "kubeconfig"); got != tc.wantKubeconfig {
+				t.Errorf("netd --kubeconfig = %q, want %q (argv: %v)", got, tc.wantKubeconfig, args)
+			}
+			if tc.forbid != "" {
+				for _, a := range args {
+					if strings.Contains(a, tc.forbid) {
+						t.Errorf("netd argv element %q names the server work dir %q, which does not exist on a worker (argv: %v)", a, tc.forbid, args)
+					}
+				}
+			}
+			for _, flag := range []string{"--node-pod-cidr", "--node-ip"} {
+				if slices.Contains(args, flag) {
+					t.Errorf("netd argv must NOT carry %s (argv: %v)", flag, args)
+				}
+			}
+		})
 	}
 }
 

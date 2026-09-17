@@ -86,6 +86,10 @@ class `vmnetd` and `socket_vmnet` have lived through. `k3sm-netd` is built to a 
   signed release the helper is notarized with a hardened runtime, minimal entitlements, and a
   designated requirement pinned to its identifier and team, so it cannot be downgraded or
   substituted.
+- A node's mesh private key is kept in two places: the node daemon's own work directory, and a
+  root-only directory the helper reads it from, both under the data root. `k3sm install` writes
+  both copies from the same key, and `k3sm uninstall` preserves the data root, so decommissioning
+  a Mac means removing the data root as well as uninstalling.
 - The helper emits file descriptors outward only, and never accepts an inbound descriptor or path.
   Per-connection resource caps are sized to a node's `/24` Pod capacity. The decoder is
   allocation-bounded, returns errors and never panics. Every rejection and lifecycle event is logged.
