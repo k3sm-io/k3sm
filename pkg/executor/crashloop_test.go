@@ -49,7 +49,7 @@ func TestCrashRecordTripsAtThresholdInsideWindow(t *testing.T) {
 			now := t0
 			for i := 0; i < tc.crashes; i++ {
 				now = t0.Add(time.Duration(i) * tc.spacing)
-				if r.Record(now, "kine", "tail") {
+				if r.Record(now, CrashOriginCrash, "kine", "tail") {
 					tripped = true
 				}
 			}
@@ -67,7 +67,7 @@ func TestCrashRecordTripPersistsThroughPruneUntilCleared(t *testing.T) {
 	t0 := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	var r CrashRecord
 	for i := 0; i < CrashLoopThreshold; i++ {
-		r.Record(t0.Add(time.Duration(i)*time.Second), "kube-apiserver", "tail")
+		r.Record(t0.Add(time.Duration(i)*time.Second), CrashOriginCrash, "kube-apiserver", "tail")
 	}
 	if !r.Tripped() {
 		t.Fatal("not tripped after the threshold")
@@ -82,7 +82,7 @@ func TestCrashRecordTripPersistsThroughPruneUntilCleared(t *testing.T) {
 		t.Fatal("Prune cleared the trip; only ClearCrashRecord may")
 	}
 	// Recording again while tripped does not report a second trip.
-	if r.Record(t0.Add(25*time.Hour), "kine", "tail") {
+	if r.Record(t0.Add(25*time.Hour), CrashOriginCrash, "kine", "tail") {
 		t.Fatal("Record reported a trip on an already-tripped record")
 	}
 }
@@ -114,7 +114,7 @@ func TestCrashRecordFileRoundTrip(t *testing.T) {
 	}
 
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	r.Record(now, "kube-scheduler", "E0909 scheduler: boom")
+	r.Record(now, CrashOriginBringUp, "kube-scheduler", "E0909 scheduler: boom")
 	if err := WriteCrashRecord(path, r); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +136,11 @@ func TestCrashRecordFileRoundTrip(t *testing.T) {
 	last, ok := back.Last()
 	if !ok || last.Component != "kube-scheduler" || !last.At.Equal(now) || last.Detail != "E0909 scheduler: boom" {
 		t.Fatalf("round trip lost the crash: %+v", back)
+	}
+	// The origin survives the round trip: a parked daemon's message says whether
+	// the control plane died or never came up, and it reads that from here.
+	if last.Origin != CrashOriginBringUp {
+		t.Fatalf("round trip lost the origin: %q, want %q", last.Origin, CrashOriginBringUp)
 	}
 
 	// Clear removes it, and clearing twice is still success.

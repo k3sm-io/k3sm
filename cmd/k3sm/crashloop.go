@@ -68,15 +68,58 @@ func (b *crashBreaker) load() executor.CrashRecord {
 // record appends one component crash and reports whether it tripped the
 // breaker. Detail is the redacted, capped tail the callback received.
 func (b *crashBreaker) record(component, detail string) (tripped bool) {
+	return b.recordOrigin(executor.CrashOriginCrash, component, detail)
+}
+
+// recordBringUp appends one BRING-UP failure — a control plane that never came
+// up at all, which the component-exit callback never sees because the child
+// either never started or died before it was marked supervised. Detail is the
+// bring-up error text, already redacted by pkg/executor before it was formatted.
+//
+// The two record sites are exclusive by construction, so a single failure is
+// never counted twice: a bring-up failure returns from executor.Start, and Start
+// returns only after it has torn every component down, while OnComponentExit
+// fires only for a component that was already marked supervised — which is to
+// say for a crash that by definition did not return from Start.
+func (b *crashBreaker) recordBringUp(component, detail string) (tripped bool) {
+	return b.recordOrigin(executor.CrashOriginBringUp, component, detail)
+}
+
+func (b *crashBreaker) recordOrigin(origin, component, detail string) (tripped bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.crashed = true
 	r := b.load()
-	tripped = r.Record(b.now(), component, detail)
+	tripped = r.Record(b.now(), origin, component, detail)
 	if err := executor.WriteCrashRecord(b.path, r); err != nil {
 		b.logger.Error("could not persist the crash-loop record", "path", b.path, "err", err)
 	}
 	return tripped
+}
+
+// noteBringUpFailure records a failed control-plane bring-up on the breaker,
+// under the component that failed. It is the whole of the daemon's answer to a
+// PERSISTENT bring-up fault: every bring-up failure used to return from
+// executor.Start, exit the daemon 1, and be respawned by the server plist's bare
+// KeepAlive with no throttle and no give-up — so a kine that could not open its
+// database looped forever, and `k3sm install` was satisfied by any resident pid.
+// Counting it here puts it under the same threshold a crash loop already has.
+//
+// A failure executor.Start did not classify (a Config validation error, a token
+// it could not mint) is still recorded, under "control-plane": the loop it would
+// otherwise produce is the same loop, and an unnamed count is better than none.
+func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
+	component := "control-plane"
+	var bu *executor.BringUpError
+	if errors.As(err, &bu) {
+		component = bu.Component
+	}
+	logger.Error("the control plane did not come up; recording it on the crash-loop breaker",
+		"component", component, "err", err)
+	if b.recordBringUp(component, err.Error()) {
+		logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
+			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+	}
 }
 
 // resetIfHealthy clears the record when this process has seen no crash. It is
@@ -93,6 +136,20 @@ func (b *crashBreaker) resetIfHealthy() {
 		return
 	}
 	b.logger.Info("control plane healthy for the crash-loop window; crash record cleared", "window", executor.CrashLoopWindow)
+}
+
+// parkReason is the park message, which says which of the two failures the
+// breaker counted last. The distinction is the operator's first diagnostic step:
+// a control plane that came up and then died is a different search through the
+// log than one that never came up at all, and the record is the only place that
+// difference survives the restart. The remedy is the same either way and is
+// logged beside this.
+func parkReason(last executor.Crash) string {
+	if last.Origin == executor.CrashOriginBringUp {
+		return "crash-loop breaker tripped; the control plane never came up (last: " + last.Component +
+			"); parking until an operator clears the record"
+	}
+	return "crash-loop breaker tripped; parking the control plane until an operator clears the record"
 }
 
 // parkUntilCleared is the give-up. It is called INSTEAD of bring-up when the
