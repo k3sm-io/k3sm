@@ -351,10 +351,10 @@ export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF
 
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$PREFIX/bin" sh >/dev/null 2>&1
 export PATH="$PREFIX/bin:$PATH"
-[ -x "$PREFIX/venv/bin/python" ] || uv venv --python 3.12 "$PREFIX/venv" >/dev/null 2>&1
+spike_venv "$PREFIX/venv" "s0.2-setup"
 V="$PREFIX/venv/bin/python"
-"$V" -c 'import vllm_mlx' 2>/dev/null || uv pip install --python "$V" "vllm-mlx==$ENGINE_VERSION" >/dev/null 2>&1
-"$V" -c 'import vllm_mlx' 2>/dev/null || { verdict FAIL "s0.2-setup  vllm-mlx==$ENGINE_VERSION did not install"; exit 0; }
+"$V" -c 'import vllm_mlx' 2>/dev/null || spike_pip "$V" "vllm-mlx==$ENGINE_VERSION"
+"$V" -c 'import vllm_mlx' 2>/dev/null || { verdict FAIL "s0.2-setup  vllm-mlx==$ENGINE_VERSION did not install: $(tail -1 "$PREFIX/logs/pip-venv-vllm-mlx.log" 2>/dev/null)"; exit 0; }
 
 MP=$("$V" - <<PY
 from huggingface_hub import snapshot_download

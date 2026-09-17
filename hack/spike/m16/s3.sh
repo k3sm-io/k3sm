@@ -230,9 +230,9 @@ set -uo pipefail
 W="$PREFIX/s3"; mkdir -p "$W"
 export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF_HOME="$PREFIX/hf"
 export PATH="$PREFIX/bin:$PATH"
-[ -x "$PREFIX/venv-metal/bin/python" ] || uv venv --python 3.12 "$PREFIX/venv-metal" >/dev/null 2>&1
+spike_venv "$PREFIX/venv-metal" "s3.5 control"
 VM="$PREFIX/venv-metal/bin/python"
-if ! uv pip install --python "$VM" vllm-metal >/dev/null 2>&1; then
+if ! spike_pip "$VM" vllm-metal; then
   recorded "s3.5 control  the alternative engine did not install on this rig — recorded, not gating: it is the negative space around the engine choice, never a criterion"
   exit 0
 fi

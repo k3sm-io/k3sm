@@ -157,6 +157,63 @@ run_timeout() {
 verdict()  { echo "VERDICT $1 $2"; }
 recorded() { echo "RECORD $*"; }
 
+# spike_venv <dir> <label> — ensure an arm64 cpython 3.12 venv at <dir>, creating it
+# via uv when absent, THEN assert the interpreter it produced is actually arm64.
+#
+# The bug this closes: a Mac carrying both an Apple-Silicon and an x86_64 Homebrew
+# (or any other stray amd64 python 3.12 earlier on PATH) makes `uv venv --python
+# 3.12 <dir>` resolve to whichever one uv's own version-match finds first — on the
+# affected rig that was the x86_64 interpreter, so vllm-mlx's platform-tagged wheels
+# (built only for macosx_*_arm64) had nothing to resolve against, and s0.sh reported
+# a generic "did not install" that read as a tooling flake rather than the wrong
+# venv it actually was. Naming the EXACT build (cpython-3.12-macos-aarch64-none)
+# removes the ambiguity a bare "3.12" version match leaves; the machine assertion
+# below is the backstop for every other way a wrong interpreter could still land.
+#
+# On failure this halts the CURRENT lab payload (verdict FAIL + exit 0) — the same
+# contract every other criterion in these rungs already uses — naming the label,
+# the interpreter path and the machine it actually reported.
+spike_venv() {
+  local dir="$1" label="$2" pyid="cpython-3.12-macos-aarch64-none" mach
+  if [ ! -x "$dir/bin/python" ]; then
+    uv python install "$pyid" >/dev/null 2>&1
+    uv venv --python "$pyid" "$dir" >/dev/null 2>&1
+  fi
+  mach="$("$dir/bin/python" -c 'import platform, sys; print(platform.machine())' 2>/dev/null)" || mach=""
+  if [ "$mach" != "arm64" ]; then
+    verdict FAIL "$label  the venv at $dir is not arm64 (interpreter $dir/bin/python, machine reported '${mach:-unreadable}')"
+    exit 0
+  fi
+}
+
+# spike_pip <venv-python> <spec...> — uv pip install into an existing venv, its
+# output captured (never silently discarded, the way every prior `>/dev/null 2>&1`
+# uv pip install did) to $PREFIX/logs/pip-<venv>-<pkg>.log. <venv> is the venv
+# directory's own basename (venv / venv-s1 / venv-metal — three venvs share this
+# helper, several installs land in each, so the log name carries BOTH or a second
+# install into the same venv silently overwrites the first's evidence) and <pkg>
+# is the first spec's leading name, stripped of a version pin or a .whl path. On
+# failure it prints the log's last 8 lines to the transcript and returns non-zero;
+# the caller composes the rung's own verdict text and may quote the log's own last
+# line into it (e.g. `tail -1 "$PREFIX/logs/pip-<venv>-<pkg>.log"`).
+spike_pip() {
+  local py="$1"; shift
+  local venv="${py%/bin/python}"
+  venv="${venv##*/}"
+  local pkg="${1##*/}"
+  pkg="${pkg%%[<>=]*}"
+  pkg="${pkg%.whl}"
+  local label="$venv-$pkg"
+  mkdir -p "$PREFIX/logs"
+  local log="$PREFIX/logs/pip-$label.log"
+  if uv pip install --python "$py" "$@" >"$log" 2>&1; then
+    return 0
+  fi
+  echo "spike_pip: uv pip install $* (--python $py) failed — last 8 lines of $log:"
+  tail -8 "$log" 2>/dev/null
+  return 1
+}
+
 kc() { kubectl --kubeconfig "$KUBECONFIG_RIG" --request-timeout=30s "$@"; }
 
 spike_preflight() {

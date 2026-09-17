@@ -71,9 +71,9 @@ case "$RUSTC_V" in
   *) verdict FAIL "s1.1 toolchain  rustc is '$RUSTC_V', not the pinned $RUST_TOOLCHAIN — a wheel built by an unpinned compiler is a different artifact with no assertion to catch it"; exit 0 ;;
 esac
 
-[ -x "$PREFIX/venv-s1/bin/python" ] || uv venv --python 3.12 "$PREFIX/venv-s1" >/dev/null 2>&1
+spike_venv "$PREFIX/venv-s1" "s1.1 toolchain"
 V="$PREFIX/venv-s1/bin/python"
-uv pip install --python "$V" "maturin>=$MATURIN_MIN" >/dev/null 2>&1
+spike_pip "$V" "maturin>=$MATURIN_MIN"
 MATURIN_V=$("$PREFIX/venv-s1/bin/maturin" --version 2>/dev/null)
 [ -n "$MATURIN_V" ] || { verdict FAIL "s1.1 toolchain  maturin >= $MATURIN_MIN did not install"; exit 0; }
 recorded "s1.1 pins: $RUSTC_V | $MATURIN_V | $("$V" -V) | floor MATURIN_MIN=$MATURIN_MIN"
@@ -113,7 +113,7 @@ WHEEL=$(ls -t "$W/wheels"/*.whl 2>/dev/null | head -1)
 SHA=$(shasum -a 256 "$WHEEL" | awk '{print $1}')
 recorded "s1.3 wheel: $(basename "$WHEEL") sha256=$SHA — a REPRODUCIBILITY RECORD, not provenance: no published darwin wheel exists to pin against"
 
-uv pip install --python "$V" "$WHEEL" >/dev/null 2>&1
+spike_pip "$V" "$WHEEL"
 SO=$("$V" - <<'PY'
 import glob, os, sysconfig
 sp = sysconfig.get_paths()["purelib"]
@@ -133,7 +133,7 @@ else
 fi
 
 # ---- s1.4 the infrastructure-free smoke ------------------------------------------
-uv pip install --python "$V" ai-dynamo >/dev/null 2>&1
+spike_pip "$V" ai-dynamo
 if "$V" -m dynamo.frontend --help >"$W/frontend-help.txt" 2>&1; then
   verdict PASS "s1.4 frontend  python3 -m dynamo.frontend --help answers from the darwin build"
 else
