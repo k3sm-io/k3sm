@@ -27,6 +27,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// FileReader is the single-method read seam the record readers need: one small
+// file, by absolute path. FS satisfies it, so a caller that already has an FS
+// passes it unchanged; a caller that reads through some other privileged seam
+// (the installer's System) adapts that one method instead of implementing a
+// mount-inspection interface it has no use for.
+type FileReader interface {
+	ReadFile(path string) ([]byte, error)
+}
+
 // FS is the read-only filesystem seam Read needs, defined here at the consumer
 // so unit tests can describe a mount posture no unprivileged test could create.
 // OSFS is the production implementation.
