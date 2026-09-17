@@ -187,7 +187,7 @@ run_test "b253.3" 0 TestNodeExitReportsAFailedRuntimeClose
 run_test "b253.4" 0 TestStopEmbeddedRuntimeWithoutARuntimeIsANoop
 # The budget the stage above has to fit inside: derived, not chosen, and asserted
 # to cover the sum of every serial stage.
-run_test "b253.5" 2 TestExitTimeOutCoversTheSerialTeardown ./pkg/install/
+run_test "b253.5" 2 TestExitTimeOutCoversTheDaemonTeardown ./pkg/install/
 
 # ---- b253.L — the lab tier --------------------------------------------------
 if [ "${K3SM_LAB:-}" != 1 ]; then
@@ -209,7 +209,7 @@ else
 	# is this tree's derived server value, used only when plutil cannot read it.
 	EXIT_TIMEOUT="$(plutil -extract ExitTimeOut raw -o - "$SERVER_PLIST" 2>/dev/null || true)"
 	case "$EXIT_TIMEOUT" in
-		''|*[!0-9]*) EXIT_TIMEOUT=90 ;;  # this tree's derived serverExitTimeOut, pinned by b253.1
+		''|*[!0-9]*) EXIT_TIMEOUT=60 ;;  # this tree's derived serverExitTimeOut, pinned by b253.1
 	esac
 	DEADLINE=$((EXIT_TIMEOUT + 10))
 

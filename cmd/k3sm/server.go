@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -604,12 +605,20 @@ func runServer(args []string) (err error) {
 		noteBringUpFailure(breaker, logger, err)
 		return fmt.Errorf("start control plane: %w", err)
 	}
+	// The control-plane teardown, as a stage that OVERLAPS the node's embedded
+	// runtime close instead of queueing behind it: the node fires cpStop.begin at
+	// the very start of its own teardown (nodeOpts.onExitBegin below), and this
+	// defer waits for what that began. If the node never got that far — a bring-up
+	// that failed before startNode's teardown ran — finish runs the stop itself,
+	// which is exactly what this defer did before. Its budget is still
+	// executor.StopBound, one named stage of the plist's ExitTimeOut, which
+	// pkg/install derives from that same symbol; see exitoverlap.go.
+	cpStop := newControlPlaneStopper(ctx, exec.Stop, logger)
 	defer func() {
-		// executor.StopBound, not a literal: it is one named stage of the plist's
-		// ExitTimeOut, which pkg/install derives from this same symbol.
-		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executor.StopBound)
-		defer cancel()
-		if err := exec.Stop(shutCtx); err != nil {
+		// A wait that timed out has already reported itself, with the stage and the
+		// launchd consequence in its fields; logging it again here would double-report
+		// one event under two messages.
+		if err := cpStop.finish(); err != nil && !errors.Is(err, errControlPlaneStopTimeout) {
 			logger.Error("control-plane shutdown", "err", err)
 		}
 	}()
@@ -1014,6 +1023,10 @@ func runServer(args []string) (err error) {
 		// facts off it. A hostprocess node never calls it, leaving the fit check
 		// skipped — the honest answer where there is no runtimed to ask.
 		attachRuntimeInfo: mlxGPU.Attach,
+		// Start this server's control-plane stop the moment the node begins tearing
+		// down, so it drains while the node closes its embedded runtime rather than
+		// after it. The defer above is what waits for it.
+		onExitBegin: cpStop.begin,
 		// The Service proxy this same process just built (step 4) is where the
 		// provider publishes a vm pod's live guest lease, so a Service backed by a
 		// guest is dialed at the address that carries bytes while everything else

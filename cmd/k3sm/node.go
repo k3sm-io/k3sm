@@ -236,6 +236,22 @@ type nodeOptions struct {
 	// paths keep their exact current shape. It is never called on the hostprocess
 	// runtime, which has no runtimed to ask.
 	attachRuntimeInfo func(operator.RuntimeInfoSource)
+
+	// onExitBegin, when non-nil, is called ONCE at the very start of this node's
+	// teardown — before the embedded runtime close, on both of startNode's exit
+	// paths and on the early returns the deferred close covers.
+	//
+	// It is the seam a caller with teardown work of its OWN uses to run that work
+	// CONCURRENTLY with the node's, instead of queueing it behind the close inside
+	// launchd's single ExitTimeOut. It must START work and return, never block: the
+	// caller waits for its own work itself, after startNode returns (see
+	// controlPlaneStopper, and exitoverlap.go for why the two stages may overlap).
+	//
+	// `k3sm server` is the only bring-up that sets one — its control-plane stop is
+	// the other long stage of a stopping daemon. `k3sm agent`, `k3sm dev` and the
+	// standalone `k3sm node` leave it nil, which is exactly the behaviour they had
+	// before the hook existed.
+	onExitBegin func()
 }
 
 // serverKubeletListen is the kubelet HTTP API listen address the in-process node
@@ -847,6 +863,24 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// (which is what runs it on the two normal exit paths) cannot double-stop; the
 	// defer is what covers the paths that return before the node is ever ready.
 	stopRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	// nodeExited closes once BOTH of this node's loops have returned — the Virtual
+	// Kubelet run loop and the node-status loop, which are what is still writing to
+	// the apiserver when a signal arrives. It is declared HERE, ahead of the
+	// teardown wiring below, and assigned where those loops start; a path that
+	// returns before they ever do leaves it nil, which the wrapper reads as "nothing
+	// to drain". Both the write and the read happen on startNode's own goroutine.
+	var nodeExited <-chan struct{}
+	// ADDITIVE, and it moves nothing: the close above is the same closure, deferred
+	// in the same place, run by awaitNodeExit on the same two paths. The wrapper
+	// only prefixes it with opts.onExitBegin, so a caller with its own teardown
+	// (`k3sm server`, whose control-plane stop is the other long stage of a stopping
+	// daemon) gets that stage started while the vm helpers come down and overlaps
+	// the two instead of paying their sum inside one ExitTimeOut — but not before
+	// this node's loops have drained (or nodeDrainGrace has passed), so the
+	// apiserver does not go away under a run loop still publishing status. nil on
+	// every other bring-up, where this returns stopRuntime unchanged. See
+	// exitoverlap.go.
+	stopRuntime = teardownWithConcurrentExit(opts.onExitBegin, func() <-chan struct{} { return nodeExited }, nodeDrainGrace, stopRuntime)
 	defer stopRuntime()
 
 	// The kubelet HTTP API's TLS + auth posture. Both halves are built together and
@@ -916,12 +950,21 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	}
 
 	errc := make(chan error, 1)
-	go func() { errc <- n.Run(ctx) }()
+	// Both loops report their return through nodeLoops, which is what closes the
+	// nodeExited signal declared above: the exit hook waits on it (bounded) so a
+	// caller's teardown — `k3sm server` stopping its control plane — does not take
+	// the apiserver away while this node is still writing to it.
+	var nodeLoops sync.WaitGroup
+	nodeLoops.Add(2)
+	go func() { defer nodeLoops.Done(); errc <- n.Run(ctx) }()
 	// The status loop's first publication is what marks the node Ready (supplying a
 	// node provider disables VK's own ready callback), so it must run for the whole
 	// life of the node, not only after startup succeeds. Its first UpdateStatus
 	// blocks until VK registers the notify callback, so starting it here is safe.
-	go func() { _ = nodeStatus.Run(ctx) }()
+	go func() { defer nodeLoops.Done(); _ = nodeStatus.Run(ctx) }()
+	loopsDone := make(chan struct{})
+	go func() { nodeLoops.Wait(); close(loopsDone) }()
+	nodeExited = loopsDone
 
 	if err := awaitNodeReady(ctx, n.Ready(), errc, nodeStartupTimeout, opts.nodeName, opts.listen); err != nil {
 		return err

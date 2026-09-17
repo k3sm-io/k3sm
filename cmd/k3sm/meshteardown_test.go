@@ -218,21 +218,24 @@ func TestAgentMeshTeardownReleasesUtun(t *testing.T) {
 
 	t.Run("the server tears its mesh down after the control plane", func(t *testing.T) {
 		// Registration order IS run order, reversed. The mesh teardown must be
-		// registered BEFORE exec.Stop's defer so LIFO runs it AFTER: in the mesh
+		// registered BEFORE the control-plane stop's defer so LIFO runs it AFTER: in the mesh
 		// posture the apiserver binds and advertises the mesh IP, so releasing the
 		// utun and its alias first would pull the interface out from under a control
 		// plane still draining its components. The agent has no such constraint —
 		// its mesh teardown is simply last, after startNode returns.
 		body := funcBodyInFile(t, "server.go", "runServer")
 		mesh := deferPos(body, "meshDown")
-		stop := deferOfSelector(body, "exec", "Stop")
+		// The control-plane stop's defer WAITS for a stop the node already began
+		// (cpStop.finish, exitoverlap.go) instead of calling exec.Stop itself — the
+		// anchor moved with it, the ordering it pins did not.
+		stop := deferOfSelector(body, "cpStop", "finish")
 		switch {
 		case mesh == token.NoPos:
 			t.Fatal("runServer defers no mesh teardown")
 		case stop == token.NoPos:
-			t.Fatal("runServer defers no exec.Stop — the ordering this row pins has no anchor")
+			t.Fatal("runServer defers no control-plane stop (cpStop.finish) — the ordering this row pins has no anchor")
 		case mesh > stop:
-			t.Error("runServer registers its mesh teardown AFTER exec.Stop's defer, so LIFO tears the mesh down FIRST — the apiserver binds the mesh IP, and pulling it out from under a draining control plane is exactly the fault this ordering exists to prevent")
+			t.Error("runServer registers its mesh teardown AFTER the control-plane stop's defer, so LIFO tears the mesh down FIRST — the apiserver binds the mesh IP, and pulling it out from under a draining control plane is exactly the fault this ordering exists to prevent")
 		}
 	})
 }
