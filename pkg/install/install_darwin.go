@@ -138,19 +138,92 @@ func ensureOwnedDir(dir string, uid int) error {
 }
 
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
-// staff, mode 0755 — so launchd, opening the UserName=_k3sm server job's
-// StandardOut/ErrorPath AS _k3sm, can create/append server.log (the root netd
-// job is unaffected by perms). Owner+mode are re-applied even when the dir
-// already exists, repairing one auto-created root-only by a prior netd spawn.
+// admin, LogDirMode — so launchd, opening the UserName=_k3sm server job's
+// StandardOut/ErrorPath AS _k3sm, can traverse it and append to server.log (the
+// root netd and datavol jobs are unaffected by perms) — and pre-creates the
+// three daemon logs inside it at LogFileMode. Owner+mode are re-applied even
+// when the dir and the files already exist, repairing a dir auto-created
+// root-only by a prior netd spawn AND an install whose logs were left
+// world-readable by the spawning job's umask.
 func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	return ensureLogDir(dir, logOwnership{serviceUID: int(uid), rootUID: 0, gid: LogDirGID})
+}
+
+// logOwnership is who owns the daemon log tree. The three fields are taken
+// explicitly — rather than read from the constants and from a hard-coded 0 —
+// so the policy can be exercised with the test process's own identity, on a
+// machine where chowning to _k3sm, to root, or to group admin needs privilege
+// the standards forbid a unit test from having.
+type logOwnership struct {
+	// serviceUID owns the directory and server.log: launchd opens the
+	// UserName=_k3sm job's log AS that user, so it must be able to append.
+	serviceUID int
+	// rootUID owns netd.log and datavol.log, whose jobs run as root.
+	rootUID int
+	// gid is the group of every path in the tree: LogDirGID (admin).
+	gid int
+}
+
+// logFile is one daemon log and the uid of the launchd job that writes it.
+type logFile struct {
+	path string
+	uid  int
+}
+
+// logFiles returns the three daemon logs inside dir, in a fixed order. The leaf
+// names come from the exported path helpers the plists already use rather than
+// from three more literals, so the file the installer prepares is by
+// construction the one launchd is pointed at; only the directory is rebased,
+// which is what lets an unprivileged test exercise the policy in a temp dir.
+func logFiles(dir string, own logOwnership) []logFile {
+	return []logFile{
+		{filepath.Join(dir, filepath.Base(ServerLogPath())), own.serviceUID},
+		{filepath.Join(dir, filepath.Base(NetdLogPath())), own.rootUID},
+		{filepath.Join(dir, filepath.Base(DatavolLogPath())), own.rootUID},
+	}
+}
+
+// ensureLogDir applies the daemon-log ownership policy to dir and to the three
+// logs inside it.
+func ensureLogDir(dir string, own logOwnership) error {
+	if err := os.MkdirAll(dir, LogDirMode); err != nil {
 		return fmt.Errorf("create log dir %s: %w", dir, err)
 	}
-	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
-		return fmt.Errorf("chown log dir %s to %d:staff: %w", dir, uid, err)
+	if err := os.Chown(dir, own.serviceUID, own.gid); err != nil {
+		return fmt.Errorf("chown log dir %s to %d:%d: %w", dir, own.serviceUID, own.gid, err)
 	}
-	if err := os.Chmod(dir, 0o755); err != nil { // repair a mis-created mode (MkdirAll skips existing)
-		return fmt.Errorf("chmod log dir %s 0755: %w", dir, err)
+	// MkdirAll skips an existing directory, so the chmod is what repairs one an
+	// earlier build created 0755 — i.e. readable by every account on the Mac.
+	if err := os.Chmod(dir, LogDirMode); err != nil {
+		return fmt.Errorf("chmod log dir %s %#o: %w", dir, LogDirMode, err)
+	}
+	for _, f := range logFiles(dir, own) {
+		if err := ensureLogFile(f.path, f.uid, own.gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureLogFile makes path exist with the log-file policy WITHOUT truncating
+// it: launchd only creates a StandardOut/ErrorPath that is missing (see
+// launchd.plist(5)), so a file that is already there is opened as it stands and
+// keeps the mode set here. O_CREATE without O_TRUNC is what preserves the
+// history of an install being repaired, and the explicit chmod is what tightens
+// a file an earlier daemon spawn created at its own umask.
+func ensureLogFile(path string, uid, gid int) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, LogFileMode)
+	if err != nil {
+		return fmt.Errorf("create log file %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close log file %s: %w", path, err)
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		return fmt.Errorf("chown log file %s to %d:%d: %w", path, uid, gid, err)
+	}
+	if err := os.Chmod(path, LogFileMode); err != nil {
+		return fmt.Errorf("chmod log file %s %#o: %w", path, LogFileMode, err)
 	}
 	return nil
 }
@@ -158,7 +231,7 @@ func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
 // EnsureContainerLogDir creates (or repairs) one directory of the container-log
 // tree owned by the service uid, group wheel, mode 0700. See the System
 // interface for why the installer, not the node, must create it, and see
-// ContainerLogDirMode for why the mode is not EnsureLogDir's 0755.
+// ContainerLogDirMode for why the mode is tighter than EnsureLogDir's.
 func (darwinSystem) EnsureContainerLogDir(dir string, uid uint32) error {
 	return ensureContainerLogDir(dir, int(uid), ContainerLogDirGID)
 }

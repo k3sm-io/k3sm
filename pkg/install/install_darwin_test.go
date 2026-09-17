@@ -240,6 +240,68 @@ func TestEnsureDataRoot(t *testing.T) {
 	}
 }
 
+// TestLogDirIsNotWorldReadableOnDisk is the on-disk half of
+// TestLogDirIsNotWorldReadable (install_test.go, which pins the constants): it
+// runs the real ensureLogDir against a real directory, unprivileged, in a
+// t.TempDir().
+//
+// It uses the test process's own uid for BOTH owners and its own gid for the
+// group: chowning to _k3sm, to root, or to group admin needs privilege this
+// file's package comment says these tests never take, and what is under test is
+// the MODE and the repair of an existing tree, not whether this process may
+// hand a file to another user.
+func TestLogDirIsNotWorldReadableOnDisk(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "k3sm")
+	// The state an earlier build leaves behind: a 0755 directory whose logs
+	// were created by launchd at the spawning job's umask.
+	mkdir(t, dir, 0o755)
+	server := filepath.Join(dir, filepath.Base(ServerLogPath()))
+	if err := os.WriteFile(server, []byte("an existing line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A file in the directory that is NOT one of the three daemon logs. k3sm
+	// does not own it and must not touch it.
+	stranger := filepath.Join(dir, "someone-elses.log")
+	if err := os.WriteFile(stranger, []byte("not ours\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	own := logOwnership{serviceUID: os.Getuid(), rootUID: os.Getuid(), gid: os.Getgid()}
+	if err := ensureLogDir(dir, own); err != nil {
+		t.Fatalf("ensureLogDir: %v", err)
+	}
+
+	assertMode(t, dir, LogDirMode)
+	for _, f := range logFiles(dir, own) {
+		assertMode(t, f.path, LogFileMode)
+		fi, err := os.Stat(f.path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", f.path, err)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if int(st.Uid) != f.uid {
+				t.Errorf("%s owner uid = %d, want %d", f.path, st.Uid, f.uid)
+			}
+			if int(st.Gid) != own.gid {
+				t.Errorf("%s owner gid = %d, want %d", f.path, st.Gid, own.gid)
+			}
+		}
+	}
+
+	// O_CREATE without O_TRUNC: repairing an install must not throw away the
+	// log lines that are the reason someone is repairing it.
+	if content, err := os.ReadFile(server); err != nil || string(content) != "an existing line\n" {
+		t.Errorf("server.log content = %q (err %v), want it preserved", content, err)
+	}
+	assertMode(t, stranger, 0o644)
+
+	// Idempotent: asking again for an already-correct tree is a no-op success.
+	if err := ensureLogDir(dir, own); err != nil {
+		t.Errorf("second ensureLogDir must be a no-op success, got %v", err)
+	}
+	assertMode(t, dir, LogDirMode)
+}
+
 func TestRemoveSymlink(t *testing.T) {
 	sys := darwinSystem{}
 

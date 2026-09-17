@@ -42,9 +42,10 @@ func TestPodLogsDirsAreRootEquivalent(t *testing.T) {
 			t.Errorf("ContainerLogDirGID = %d, want 0 (wheel, not staff — staff is every ordinary account's primary group)", ContainerLogDirGID)
 		}
 		// And it is NOT the daemon LogDir's policy, which is deliberately laxer
-		// because that directory holds only the daemons' own stdout.
-		if ContainerLogDirMode == 0o755 {
-			t.Error("the container-log tree must not use EnsureLogDir's 0755")
+		// because that directory holds only the daemons' own stdout, which an
+		// administrator of the Mac may read.
+		if ContainerLogDirMode == LogDirMode {
+			t.Error("the container-log tree must not use the daemon log dir's mode")
 		}
 	})
 
