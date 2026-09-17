@@ -239,11 +239,11 @@ func msgFailedImagePlatform(err error) string {
 // the field and take a disk-backed directory, or move the pod to the runtime that
 // has a real tmpfs.
 func msgFailedEmptyDirMedium(volume, medium string) string {
-	return fmt.Sprintf("Error: volume %q requests emptyDir medium %q, which the default runtime "+
-		"cannot provide — its pods are native processes with no tmpfs, so the directory would be "+
-		"disk-backed with no notice. Remove the medium field to take an ordinary disk-backed "+
-		"directory, or schedule the pod with runtimeClassName: %s, whose Linux guest honours "+
-		"medium: Memory as a tmpfs.",
+	return fmt.Sprintf("Error: volume %q sets spec.volumes[].emptyDir.medium to %q, which the "+
+		"default runtime cannot provide: its pods are native processes with no tmpfs, so the "+
+		"directory would be disk-backed with no notice. Remove the medium field to take an "+
+		"ordinary disk-backed directory, or schedule the pod with runtimeClassName: %s, whose "+
+		"Linux guest honours medium: Memory as a tmpfs.",
 		volume, medium, runtimeclass.Name)
 }
 
