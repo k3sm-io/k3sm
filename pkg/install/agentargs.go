@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -196,12 +197,22 @@ func filterManagedAgentArgs(args []string) []string {
 // reported as a permission error in a log nobody is watching yet.
 //
 // The token is validated here rather than at the daemon, because here is where
-// an operator is still looking at a terminal: a file anyone can read, and an
-// empty one, are mistakes worth one sentence now instead of a backoff loop
-// later. The mode refusal is the agent's own (readJoinTokenFile), applied to
-// the SOURCE as well: a token that sat world-readable in /tmp is a token that
-// has to be re-minted, and copying it to a 0600 destination would launder that
-// rather than report it. The value itself is never logged or echoed.
+// an operator is still looking at a terminal: a file anyone can read, an empty
+// one, and one whose contents are not a K10 join token at all are mistakes
+// worth one sentence now instead of a backoff loop later. The mode refusal is
+// the agent's own (readJoinTokenFile), applied to the SOURCE as well: a token
+// that sat world-readable in /tmp is a token that has to be re-minted, and
+// copying it to a 0600 destination would launder that rather than report it.
+//
+// The SHAPE check is pkg/bootstrap's own parser, and it is a refusal rather
+// than a warning for two reasons. A token that does not parse can never
+// complete a join, so staging it installs a worker that is guaranteed to back
+// off forever. And the installer reads the same token back to decide which
+// CLUSTER the node credential must belong to (verifyAgentJoined): a token with
+// no readable CA pin would leave that comparison with nothing to compare, which
+// is how a stale credential from another cluster came to count as a join.
+//
+// Nothing here logs or echoes the value — not the token, not a prefix of it.
 func stageJoinToken(sys System, cfg Config, uid uint32) error {
 	// The mode BEFORE the bytes: a credential this Mac should not have accepted
 	// is refused without being read anywhere else first.
@@ -220,6 +231,13 @@ func stageJoinToken(sys System, cfg Config, uid uint32) error {
 	token := strings.TrimSpace(string(raw))
 	if token == "" {
 		return fmt.Errorf("install: the join token file %s is empty: write the token `k3sm token create` printed on the server into it", cfg.TokenFile)
+	}
+	// The shape, before a byte is written anywhere. The parse error is quoted
+	// and the token is not: pkg/bootstrap's errors describe the STRUCTURE that
+	// is missing (the K10 prefix, the `::`, the user:secret) and never the
+	// value, which is what makes it safe to put in front of an operator.
+	if _, err := bootstrap.ParseToken(token); err != nil {
+		return fmt.Errorf("install: the contents of the join token file %s are not a k3sm join token (%v): a join token is `K10<cluster-CA hash>::<user>:<secret>`, exactly as `k3sm token create` prints it on the server — mint a fresh one rather than editing this file", cfg.TokenFile, err)
 	}
 	dst := cfg.agentTokenPath()
 	if err := stageTokenFile(sys, uid, token, dst, "join token", AgentTokenFileMode, AgentTokenDirMode); err != nil {

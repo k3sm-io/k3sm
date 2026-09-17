@@ -28,6 +28,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -263,6 +264,215 @@ func ensureContainerLogDir(dir string, uid, gid int) error {
 	return nil
 }
 
+// AdoptTree performs the container-log adoption walk. See the System interface
+// for the contract, and for why every step of it is descriptor-relative.
+//
+// The ownership it hands entries TO is a parameter and the ownership it takes
+// them FROM is root, because root-owned is exactly what "written before the
+// daemon moved to _k3sm" means. adoptTree below takes both explicitly, for the
+// same reason ensureContainerLogDir does: the policy is then exercisable by a
+// test process with its own identity, on a machine where chowning to another
+// uid needs privilege this package's unit tests must not have.
+func (darwinSystem) AdoptTree(root string, uid, gid, maxDepth int, policy AdoptPolicy) (TreeAdoption, error) {
+	return adoptTree(root, 0, uid, gid, maxDepth, policy)
+}
+
+// treeWalk is one adoptTree run: who it takes from, who it gives to, how deep it
+// goes, which top-level rule applies, and what it has done so far.
+type treeWalk struct {
+	fromUID  int
+	uid, gid int
+	maxDepth int
+	policy   AdoptPolicy
+	rep      TreeAdoption
+}
+
+// adoptTree opens root without following it and walks from that descriptor.
+//
+// A missing root is returned as an error carrying the errno, so the caller's
+// errors.Is(err, fs.ErrNotExist) sees it; a root that is a SYMLINK fails the
+// O_NOFOLLOW open with ELOOP, which is the correct answer rather than an
+// inconvenience — /var/log/pods being a link is not a tree to adopt.
+func adoptTree(root string, fromUID, uid, gid, maxDepth int, policy AdoptPolicy) (TreeAdoption, error) {
+	fd, err := openDirNoFollow(root)
+	if err != nil {
+		return TreeAdoption{}, err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	w := &treeWalk{fromUID: fromUID, uid: uid, gid: gid, maxDepth: maxDepth, policy: policy}
+	w.walk(fd, root, 1)
+	return w.rep, nil
+}
+
+// walk lists one directory THROUGH ITS DESCRIPTOR and visits each child. depth
+// is the level of the children being listed: 1 is the top of the tree, where the
+// policy applies.
+//
+// dirPath is carried for reporting ONLY. Nothing in this walk resolves it: it is
+// what an operator reads in a log line, never an argument to a syscall.
+func (w *treeWalk) walk(dirfd int, dirPath string, depth int) {
+	if depth > w.maxDepth {
+		w.skip(dirPath, fmt.Sprintf("it is deeper than the %d levels k3sm walks", w.maxDepth))
+		return
+	}
+	names, err := readDirNames(dirfd, dirPath)
+	if err != nil {
+		w.skip(dirPath, fmt.Sprintf("it could not be listed (%v)", err))
+		return
+	}
+	// Sorted so a walk over the same tree reports and acts in the same order
+	// twice, which is what makes the order assertable at all.
+	slices.Sort(names)
+	for _, name := range names {
+		var st unix.Stat_t
+		if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			w.skip(filepath.Join(dirPath, name), fmt.Sprintf("it could not be inspected (%v)", err))
+			continue
+		}
+		w.visit(dirfd, dirPath, name, st, depth)
+	}
+}
+
+// visit decides what happens to one child, having just classified it against its
+// parent's descriptor.
+func (w *treeWalk) visit(dirfd int, dirPath, name string, st unix.Stat_t, depth int) {
+	path := filepath.Join(dirPath, name)
+	kind := statKind(st.Mode)
+	mine := int(st.Uid) == w.fromUID
+	if depth > 1 {
+		// Inside a pod directory already adopted: the layout's own files and
+		// subdirectories, whatever they are named.
+		switch kind {
+		case EntryDir:
+			w.descend(dirfd, name, path, depth)
+		case EntryRegular:
+			if mine {
+				w.chownat(dirfd, name, path)
+			}
+		default:
+			w.skip(path, "it is "+kind.String()+", which k3sm does not follow or chown here")
+		}
+		return
+	}
+	if !mine {
+		// Already the service user's (or somebody else's entirely): not this
+		// step's business, and not worth a line on a node with a long pod
+		// history where every healthy directory would produce one.
+		return
+	}
+	switch w.policy {
+	case AdoptLogLinks:
+		if kind != EntrySymlink && kind != EntryRegular {
+			w.skip(path, "it is "+kind.String()+", which is not a container log link")
+			return
+		}
+		w.chownat(dirfd, name, path)
+	default: // AdoptPodDirs
+		switch {
+		case kind != EntryDir:
+			w.skip(path, "it is "+kind.String()+" at the root of the pod log tree, which k3sm did not write")
+			return
+		case !isPodLogDirName(name):
+			w.skip(path, "its name is not the <namespace>_<pod>_<uid> shape k3sm writes, so k3sm does not descend into it")
+			return
+		}
+		w.descend(dirfd, name, path, depth)
+	}
+}
+
+// descend opens a subdirectory without following it, hands it over if it is
+// still the old owner's, and walks INSIDE THE DESCRIPTOR it opened.
+//
+// The chown is on the open descriptor (fchown) and comes BEFORE the children, so
+// the object handed over is exactly the object about to be walked — a rename
+// underneath the walk changes which name leads here and nothing about what is
+// being changed — and nothing is left inside a directory the service user cannot
+// yet traverse.
+func (w *treeWalk) descend(dirfd int, name, path string, depth int) {
+	childfd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		w.skip(path, fmt.Sprintf("it could not be opened (%v)", err))
+		return
+	}
+	defer func() { _ = unix.Close(childfd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(childfd, &st); err != nil {
+		w.skip(path, fmt.Sprintf("it could not be inspected (%v)", err))
+		return
+	}
+	if int(st.Uid) == w.fromUID {
+		if err := unix.Fchown(childfd, w.uid, w.gid); err != nil {
+			w.skip(path, fmt.Sprintf("it could not be handed over (%v)", err))
+			return
+		}
+		w.rep.Adopted++
+	}
+	w.walk(childfd, path, depth+1)
+}
+
+// chownat hands one non-directory entry over by name AGAINST ITS PARENT'S
+// DESCRIPTOR, never following a symlink — so in the link directory the link
+// itself moves and its target is untouched, and anywhere else a name that has
+// become a link since it was classified moves the link and nothing beyond it.
+func (w *treeWalk) chownat(dirfd int, name, path string) {
+	if err := unix.Fchownat(dirfd, name, w.uid, w.gid, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		w.skip(path, fmt.Sprintf("it could not be handed over (%v)", err))
+		return
+	}
+	w.rep.Adopted++
+}
+
+// skip records an entry the walk stepped over. A failed chown is a skip and
+// never an error: this tree is GC-pending debris whose entries can vanish
+// mid-walk, and no install fails over it.
+func (w *treeWalk) skip(path, reason string) {
+	w.rep.Skipped = append(w.rep.Skipped, SkippedEntry{Path: path, Reason: reason})
+}
+
+// openDirNoFollow opens a directory without following a final symlink, keeping
+// ReadFile's missing-entry contract for the caller.
+func openDirNoFollow(path string) (int, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	return fd, nil
+}
+
+// readDirNames lists a directory through a descriptor.
+//
+// It reads through a DUP because os.File owns the descriptor it is handed and
+// would close the caller's on Close — and the caller still needs it for the
+// fstatat/openat/fchownat calls that make this walk safe. The dup shares the
+// directory offset, which costs nothing here: each descriptor is listed exactly
+// once.
+func readDirNames(dirfd int, path string) ([]string, error) {
+	dup, err := unix.Dup(dirfd)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(dup)
+	f := os.NewFile(uintptr(dup), path)
+	defer func() { _ = f.Close() }()
+	return f.Readdirnames(-1)
+}
+
+// statKind projects a stat's type bits onto EntryKind. It is entryKind's sibling
+// for the walk, which classifies from a raw fstatat rather than from an
+// fs.FileInfo — the projection has to happen somewhere, and doing it once here
+// keeps the two spellings of "is this a symlink" from drifting apart.
+func statKind(mode uint16) EntryKind {
+	switch mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		return EntryDir
+	case unix.S_IFREG:
+		return EntryRegular
+	case unix.S_IFLNK:
+		return EntrySymlink
+	}
+	return EntryOther
+}
+
 // EnsureRunDir creates (or repairs) the runtime run dir owned by the service
 // uid, group staff, mode 0700 — the directory the _k3sm node binds its runtimed
 // control socket in. See the System interface for why the installer, not a
@@ -303,6 +513,90 @@ func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 		return fmt.Errorf("chmod %s %s 0700: %w", what, dir, err)
 	}
 	return nil
+}
+
+// Owner reports the ownership, permission bits and kind of path. See the System
+// interface for the contract.
+//
+// Lstat, not Stat: a symlink is described as itself. Following it would let a
+// link planted in the agent work dir point the ownership judgement — and then
+// the Chown below — at a file somewhere else entirely.
+func (darwinSystem) Owner(path string) (OwnedEntry, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return OwnedEntry{}, err
+	}
+	return ownedEntry(path, fi)
+}
+
+// ListOwned lists the entries directly inside dir, each as Owner describes it.
+// os.ReadDir's per-entry Info is itself lstat-derived, so a symlink in the
+// directory is described rather than followed, exactly as in Owner.
+func (darwinSystem) ListOwned(dir string) ([]OwnedEntry, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]OwnedEntry, 0, len(ents))
+	for _, e := range ents {
+		fi, err := e.Info()
+		if err != nil {
+			// The entry went away between the read and the stat. A directory
+			// being judged before a chown must be described completely or not at
+			// all, so this is an error rather than a skipped entry.
+			return nil, fmt.Errorf("stat %s: %w", filepath.Join(dir, e.Name()), err)
+		}
+		owned, err := ownedEntry(filepath.Join(dir, e.Name()), fi)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, owned)
+	}
+	return out, nil
+}
+
+// ownedEntry projects an fs.FileInfo onto OwnedEntry. The unix ownership comes
+// from the syscall.Stat_t behind it, which is the only place uid/gid live; an
+// fs.FileInfo that carries none is an ERROR rather than a zero uid, because
+// "owned by root" is precisely the verdict a zero value would fabricate.
+func ownedEntry(path string, fi fs.FileInfo) (OwnedEntry, error) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return OwnedEntry{}, fmt.Errorf("cannot read the ownership of %s", path)
+	}
+	return OwnedEntry{
+		Path: path,
+		UID:  int(st.Uid),
+		GID:  int(st.Gid),
+		Mode: fi.Mode().Perm(),
+		Kind: entryKind(fi.Mode()),
+	}, nil
+}
+
+// entryKind names what the mode bits say the entry is. The symlink arm is first
+// because fs.FileMode reports a symlink as its own type and never as a regular
+// file, and because the one caller that acts on this distinction has to be able
+// to SAY "a symlink" when it refuses.
+func entryKind(mode fs.FileMode) EntryKind {
+	switch {
+	case mode&fs.ModeSymlink != 0:
+		return EntrySymlink
+	case mode.IsDir():
+		return EntryDir
+	case mode.IsRegular():
+		return EntryRegular
+	}
+	return EntryOther
+}
+
+// Chown sets path's owner to uid:gid and touches nothing else — no chmod, so
+// the mode the file was found at is the mode it keeps.
+//
+// Lchown rather than Chown, for Owner's reason: the ownership judgement was made
+// about the entry itself, and following a symlink here would apply that verdict
+// to a different file than the one it was made about.
+func (darwinSystem) Chown(path string, uid, gid int) error {
+	return os.Lchown(path, uid, gid)
 }
 
 // CopyToRootOwned copies src to exactly dst (parent dir created root:wheel 0755)

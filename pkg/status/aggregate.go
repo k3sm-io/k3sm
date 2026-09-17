@@ -78,10 +78,26 @@ var advisoryRows = map[string]bool{RowPreVolume: true}
 // "degraded", which is how a health signal stops being read — the same argument
 // the pre-volume exemption above rests on.
 //
+// The apiserver and node rows are here for the same reason, one step further
+// out: on a worker they report a control plane on ANOTHER Mac, reached over the
+// mesh. A worker keeps serving the pods already scheduled on it straight through
+// a control-plane restart or a mesh blip — the pods are host processes this
+// node's own daemon supervises — so "I could not reach the apiserver from here"
+// is a note about reachability, not a claim that this Mac is unhealthy. The rows
+// still say so, with their remedy; only the headline verdict is unmoved.
+//
 // What is NOT exempt is the worker's own health: the agent daemon and its node
 // credential (RowAgent) carry the verdict here exactly as the server row does
-// on a control plane, and a FAIL is never exempt on any row.
-var workerAdvisoryRows = map[string]bool{RowDatastore: true, RowKubeconfig: true}
+// on a control plane, and a FAIL is never exempt on any row — which is why the
+// two rows above report a worker's unreachable control plane as a WARN at the
+// source (see Collector.apiserverRow and Collector.nodeRow) rather than leaning
+// on an exemption this map does not grant.
+var workerAdvisoryRows = map[string]bool{
+	RowDatastore:  true,
+	RowKubeconfig: true,
+	RowAPIServer:  true,
+	RowNode:       true,
+}
 
 // advisory reports whether a row's WARN is a note rather than a claim about
 // this node, for the role being reported.

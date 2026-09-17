@@ -736,3 +736,178 @@ func TestReadRegularFileOnDisk(t *testing.T) {
 		}
 	})
 }
+
+// TestAdoptTreeWalksByDescriptorAndNeverFollowsASymlink exercises the REAL
+// adoption walk against a REAL filesystem, unprivileged.
+//
+// It is the half of B327 a fake cannot assert. The fake in install_test.go
+// models the policy — which entries are adopted, in which order — but it has no
+// descriptors, so the property this walk exists for (the object acted on is the
+// object that was classified, even though a pod running as the service user can
+// rename and re-link underneath it) is only observable here.
+//
+// Privilege is avoided the way ensureContainerLogDir's tests avoid it: adoptTree
+// takes the uid it takes FROM and the uid it gives TO explicitly, so this test
+// hands the tree from the test process to the test process. Every syscall on the
+// path — openat, fstatat, fchown, fchownat — runs exactly as it does at install
+// time; only the numbers are the caller's own.
+//
+// The symlink property is asserted by COUNT rather than by ownership, because a
+// chown to one's own uid is invisible: the link points at a directory holding a
+// file that WOULD be adopted if the walk followed it, so a walk that followed
+// reports one more adoption than a walk that did not.
+func TestAdoptTreeWalksByDescriptorAndNeverFollowsASymlink(t *testing.T) {
+	me, myGroup := os.Getuid(), os.Getgid()
+
+	t.Run("a pod tree is adopted parent-first and a planted symlink is stepped over", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, "pods")
+		// What a walk that followed the link would reach: a directory outside
+		// the tree, holding a file that satisfies every adoption rule.
+		outside := filepath.Join(base, "outside")
+		mkdirAllT(t, filepath.Join(outside, "container"))
+		writeFileT(t, filepath.Join(outside, "container", "0.log"), "not yours")
+
+		podDir := filepath.Join(root, "default_web-0_9f1c")
+		mkdirAllT(t, filepath.Join(podDir, "web"))
+		writeFileT(t, filepath.Join(podDir, "web", "0.log"), "hello")
+		// Plantable by any process running as the service user, which every
+		// native pod is, for the whole of an install.
+		if err := os.Symlink(outside, filepath.Join(podDir, "escape")); err != nil {
+			t.Fatalf("plant the symlink: %v", err)
+		}
+		// Debris at the root: neither is the <ns>_<pod>_<uid> shape.
+		writeFileT(t, filepath.Join(root, "rotation.state"), "x")
+		mkdirAllT(t, filepath.Join(root, "not-a-pod-dir", "deep"))
+
+		rep, err := adoptTree(root, me, me, myGroup, podLogWalkMaxDepth, AdoptPodDirs)
+		if err != nil {
+			t.Fatalf("adoptTree: %v", err)
+		}
+		// The pod dir, its container dir and the log file. Not the escape link,
+		// not anything through it, not the debris at the root.
+		if rep.Adopted != 3 {
+			t.Errorf("adopted %d entries, want 3 (the pod dir, its container dir, its log file); skipped = %v", rep.Adopted, rep.Skipped)
+		}
+		for _, want := range []string{
+			filepath.Join(podDir, "escape"),
+			filepath.Join(root, "rotation.state"),
+			filepath.Join(root, "not-a-pod-dir"),
+		} {
+			if !skipReported(rep, want) {
+				t.Errorf("%s was not reported to the operator; skipped = %v", want, rep.Skipped)
+			}
+		}
+		// The link is still a link, pointing where it did: the walk neither
+		// followed it nor replaced it.
+		if got, err := os.Readlink(filepath.Join(podDir, "escape")); err != nil || got != outside {
+			t.Errorf("the escape link is now %q (err %v), want %q untouched", got, err, outside)
+		}
+		// And nothing inside the tree was removed — this step is not a deleter.
+		if _, err := os.Stat(filepath.Join(podDir, "web", "0.log")); err != nil {
+			t.Errorf("the log file is gone: %v", err)
+		}
+	})
+
+	t.Run("a symlink at the root of the tree is refused by O_NOFOLLOW rather than followed", func(t *testing.T) {
+		base := t.TempDir()
+		real := filepath.Join(base, "real")
+		mkdirAllT(t, filepath.Join(real, "default_web-0_9f1c"))
+		root := filepath.Join(base, "pods")
+		if err := os.Symlink(real, root); err != nil {
+			t.Fatalf("link the root: %v", err)
+		}
+		if _, err := adoptTree(root, me, me, myGroup, podLogWalkMaxDepth, AdoptPodDirs); err == nil {
+			t.Fatal("adoptTree walked a tree whose root is a symlink")
+		}
+	})
+
+	t.Run("the link directory hands over the links themselves and nothing they point at", func(t *testing.T) {
+		base := t.TempDir()
+		dir := filepath.Join(base, "containers")
+		mkdirAllT(t, dir)
+		target := filepath.Join(base, "pods", "default_web-0_9f1c", "web")
+		mkdirAllT(t, target)
+		writeFileT(t, filepath.Join(target, "0.log"), "hello")
+		if err := os.Symlink(filepath.Join(target, "0.log"), filepath.Join(dir, "web-0_default_web-abc123.log")); err != nil {
+			t.Fatalf("link: %v", err)
+		}
+		// A directory has no business here and is not a log link.
+		mkdirAllT(t, filepath.Join(dir, "stray"))
+
+		rep, err := adoptTree(dir, me, me, myGroup, 1, AdoptLogLinks)
+		if err != nil {
+			t.Fatalf("adoptTree: %v", err)
+		}
+		if rep.Adopted != 1 {
+			t.Errorf("adopted %d entries, want 1 (the link itself); skipped = %v", rep.Adopted, rep.Skipped)
+		}
+		if !skipReported(rep, filepath.Join(dir, "stray")) {
+			t.Errorf("the stray directory was not reported; skipped = %v", rep.Skipped)
+		}
+		// The link still resolves, and its target still exists: an lchown moves
+		// the link, and nothing here ever touched the file it names.
+		if _, err := os.Stat(filepath.Join(target, "0.log")); err != nil {
+			t.Errorf("the link's target is gone: %v", err)
+		}
+	})
+
+	t.Run("an absent tree keeps the missing-entry contract", func(t *testing.T) {
+		_, err := adoptTree(filepath.Join(t.TempDir(), "nope"), me, me, myGroup, podLogWalkMaxDepth, AdoptPodDirs)
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("adoptTree on a missing tree = %v, want an fs.ErrNotExist", err)
+		}
+	})
+
+	t.Run("the depth bound stops a tree deeper than k3sm walks", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, "pods")
+		deep := filepath.Join(root, "default_web-0_9f1c")
+		for i := 0; i < 6; i++ {
+			deep = filepath.Join(deep, "d")
+		}
+		mkdirAllT(t, deep)
+		writeFileT(t, filepath.Join(deep, "0.log"), "hello")
+
+		rep, err := adoptTree(root, me, me, myGroup, 3, AdoptPodDirs)
+		if err != nil {
+			t.Fatalf("adoptTree: %v", err)
+		}
+		// The pod dir and two levels below it, and then a report instead of a
+		// descent.
+		if rep.Adopted != 3 {
+			t.Errorf("adopted %d entries, want 3 under a depth bound of 3; skipped = %v", rep.Adopted, rep.Skipped)
+		}
+		if len(rep.Skipped) != 1 || !strings.Contains(rep.Skipped[0].Reason, "deeper than") {
+			t.Errorf("skipped = %v, want one entry reported as too deep", rep.Skipped)
+		}
+	})
+}
+
+// skipReported reports whether path is one of the entries the walk told the
+// operator about.
+func skipReported(rep TreeAdoption, path string) bool {
+	for _, s := range rep.Skipped {
+		if s.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// mkdirAllT and writeFileT are the two-line fixtures these cases build trees
+// from; they fail the test rather than returning an error, because a fixture
+// that cannot be laid down is not a result.
+func mkdirAllT(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+}
+
+func writeFileT(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}

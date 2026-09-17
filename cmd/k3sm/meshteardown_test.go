@@ -197,13 +197,16 @@ func TestAgentMeshTeardownReleasesUtun(t *testing.T) {
 
 	t.Run("both node roles defer the teardown", func(t *testing.T) {
 		// bringUpMesh returning a handle is worth nothing if no caller holds it, and
-		// neither runAgent nor runServer can be called from a unit test (both boot a
-		// real node). The wiring is asserted structurally instead, which is what the
-		// well-meaning later edit that drops the defer would trip.
+		// neither role's start can be called from a unit test (both boot a real
+		// node). The wiring is asserted structurally instead, which is what the
+		// well-meaning later edit that drops the defer would trip. The agent's
+		// body is agentStart — runAgent is the thin wrapper that records a start
+		// failure on the crash-loop record — so that is the function that must
+		// hold the handle.
 		for _, tc := range []struct {
 			file, fn, why string
 		}{
-			{"agent.go", "runAgent", "a worker's mesh teardown must run after startNode returns, before the process exits"},
+			{"agent.go", "agentStart", "a worker's mesh teardown must run after startNode returns, before the process exits"},
 			{"server.go", "runServer", "the control-plane node's mesh must come down on the way out, not be left to a goroutine racing process death"},
 		} {
 			body := funcBodyInFile(t, tc.file, tc.fn)
