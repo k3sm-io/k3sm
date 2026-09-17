@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	netv1 "k3sm.io/apis/net/v1"
@@ -285,6 +286,13 @@ func runAgent(args []string) error {
 	// datapath is the Server the in-process node feeds vm-pod transport overrides
 	// into; it stays nil under `--network none`, where there is no proxy to feed.
 	var datapath *netserve.Server
+	// The mesh teardown handle. It is declared — and its deferred run registered —
+	// BEFORE anything is brought up, so it covers a half-built bring-up too, and it
+	// stays a no-op under `--network none`. Running it here rather than leaving it
+	// to the watcher goroutine is what guarantees the per-peer routes and the
+	// MSS-clamp anchor are gone before this process exits.
+	meshDown := meshTeardown(noMeshTeardown)
+	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 	if mode.DataPath() {
 		// The endpoint this node just published goes stale the moment its LAN
 		// address changes, so the refresher carries that value forward and
@@ -297,7 +305,7 @@ func runAgent(args []string) error {
 			logger.Warn("this node will not republish its wireguard endpoint if its address changes; peers would keep dialing the address it joined from until it rejoins",
 				"endpoint", meshEndpoint, "err", err)
 		}
-		if err := bringUpMesh(ctx, meshBringUp{
+		down, err := bringUpMesh(ctx, meshBringUp{
 			podCIDR:       res.PodCIDR,
 			meshIP:        res.MeshIP,
 			privateKeyB64: res.WGPrivateKeyB64,
@@ -306,7 +314,9 @@ func runAgent(args []string) error {
 			listenPort:    opts.meshPort,
 			kubeconfig:    kubeconfigPath,
 			refresher:     refresher,
-		}, mode, logger); err != nil {
+		}, mode, logger)
+		meshDown = down
+		if err != nil {
 			return fmt.Errorf("mesh bring-up: %w", err)
 		}
 		// Built AFTER join+mesh: the proxy's mesh-egress source is this node's
@@ -489,6 +499,98 @@ func requireJoinedServingPair(res *bootstrap.JoinResult) error {
 	return nil
 }
 
+// meshDatapath is the consumer-side view of the wireguard mesh bringUpMesh
+// drives — darwin-net's *mesh.Mesh in production. The interface is declared HERE,
+// at the consumer, because darwin-net's device-injection option is unexported:
+// without a seam on this side there is no way to exercise the bring-up/teardown
+// ORDERING without a root utun, and that ordering is the whole point of the
+// teardown handle below.
+type meshDatapath interface {
+	MeshIP() netip.Addr
+	Start(ctx context.Context) error
+	Reconcile(ctx context.Context, peers []netv1.MeshPeerSpec) error
+	Close(ctx context.Context) error
+}
+
+// meshWatch is the consumer-side view of darwin-net's MeshPeer watcher: the
+// goroutine that keeps the peer set converging after the initial program.
+type meshWatch interface {
+	Run(ctx context.Context) error
+}
+
+// meshTeardown releases a mesh brought up by bringUpMesh. It is darwin-net's
+// Mesh.Close, whose only act is the device's Down, so what it releases is whatever
+// the selected backend's Down releases:
+//
+//   - direct mode (WGDevice): the per-peer kernel routes are deleted, the
+//     utun-scoped MSS-clamp pf anchor is flushed, the mesh-egress alias is removed
+//     and the wireguard utun is closed;
+//   - helper mode (netdDevice): a RemoveMesh to the root netd daemon, which owns
+//     the datapath. The device is rebuilt on the next start — bringUpMesh's Start
+//     is what recreates it — so a torn-down helper mesh is not a lost one.
+//
+// It is idempotent: Mesh.Close returns nil once the device is down (the started
+// flag is cleared under the mesh's own mutex), so the caller's exit path and the
+// watcher goroutine's fallback may both run it and the device comes down exactly
+// once.
+type meshTeardown func(ctx context.Context) error
+
+// noMeshTeardown is the handle for a mesh that was never brought up. Every failure
+// path returns it, so a caller can register its deferred teardown unconditionally.
+func noMeshTeardown(context.Context) error { return nil }
+
+// meshTeardownTimeout bounds the synchronous teardown on a node's exit path. The
+// exit is normally SIGTERM, so the node ctx is already cancelled and the teardown
+// runs on a detached context; without a bound, a wedged route removal would hold
+// the process open — the opposite of the leak the teardown exists to prevent.
+//
+// 5s is a bound, not a budget: a handful of route deletes plus an anchor flush
+// plus a device close (or one RemoveMesh RPC) is sub-second. It is deliberately
+// small because it is SERIAL with the control plane's own 30s shutdown inside the
+// server's launchd ExitTimeOut — see the ExitTimeOut comment in pkg/install.
+const meshTeardownTimeout = 5 * time.Second
+
+// meshTeardownOnExit runs a mesh teardown on the node's way out. Both roles defer
+// it, so the sequence lives in one place: the exit is normally SIGTERM, which has
+// already cancelled the node ctx, so the teardown runs on a DETACHED context —
+// with the node ctx it would return immediately and tear nothing down — bounded by
+// meshTeardownTimeout so a wedged route removal cannot hold the process open.
+func meshTeardownOnExit(ctx context.Context, down meshTeardown, logger *slog.Logger) {
+	downCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), meshTeardownTimeout)
+	defer cancel()
+	if err := down(downCtx); err != nil {
+		logger.Error("mesh teardown", "err", err)
+	}
+}
+
+// meshSeam is how bringUpMesh constructs its mesh and its MeshPeer watcher. The
+// production values are the darwin-net constructors; tests replace it to drive the
+// bring-up-then-teardown sequence with no privilege and no apiserver.
+type meshSeam struct {
+	newMesh  func(self netip.Prefix, opts ...mesh.Option) (meshDatapath, error)
+	newWatch func(cfg *rest.Config, m meshDatapath, logger *slog.Logger) (meshWatch, error)
+}
+
+// productionMeshSeam builds the real wireguard mesh and its watcher. The watcher
+// constructor takes darwin-net's concrete *mesh.Mesh, so the assertion here is the
+// price of the consumer-side interface; it cannot fail for a mesh this seam built.
+var productionMeshSeam = meshSeam{
+	newMesh: func(self netip.Prefix, opts ...mesh.Option) (meshDatapath, error) {
+		return mesh.New(self, opts...)
+	},
+	newWatch: func(cfg *rest.Config, m meshDatapath, logger *slog.Logger) (meshWatch, error) {
+		wg, ok := m.(*mesh.Mesh)
+		if !ok {
+			return nil, fmt.Errorf("mesh watcher needs darwin-net's *mesh.Mesh, got %T", m)
+		}
+		return mesh.NewWatcher(cfg, wg, logger)
+	},
+}
+
+// activeMeshSeam is the seam bringUpMesh reads. It is a variable only so a test
+// can swap it; nothing in the shipped paths writes it.
+var activeMeshSeam = productionMeshSeam
+
 // bringUpMesh constructs a node's wireguard mesh for its assigned pod /24, brings
 // the device up (root utun), programs the initial peer snapshot, and starts the
 // MeshPeer watch so endpoint/key changes reconverge. The device Up/Apply calls are
@@ -499,10 +601,18 @@ func requireJoinedServingPair(res *bootstrap.JoinResult) error {
 // JoinResult, and the control-plane node off values it synthesizes locally
 // (enrollSelfAndBringUpMesh). See meshBringUp for why the wire DTO does not
 // travel down here.
-func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger *slog.Logger) error {
+//
+// It RETURNS a teardown handle, and that return is the point. Nothing used to hold
+// the mesh, so the only Close was the last act of the watcher goroutine — which
+// runs after ctx is already cancelled and therefore races process death: on a
+// SIGTERM the process could exit with the per-peer routes and the pf anchor still
+// installed. A caller now defers this handle, so the teardown completes BEFORE it
+// returns; the watcher's Close remains as the fallback for a path that never
+// reaches the deferred call.
+func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger *slog.Logger) (meshTeardown, error) {
 	self, err := netip.ParsePrefix(in.podCIDR)
 	if err != nil {
-		return fmt.Errorf("parse assigned podCIDR %q: %w", in.podCIDR, err)
+		return noMeshTeardown, fmt.Errorf("parse assigned podCIDR %q: %w", in.podCIDR, err)
 	}
 	meshOpts := []mesh.Option{mesh.WithListenPort(in.listenPort), mesh.WithLogger(logger)}
 	if mode.UsesHelper() {
@@ -514,37 +624,44 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	} else {
 		meshOpts = append(meshOpts, mesh.WithPrivateKey(in.privateKeyB64))
 	}
-	m, err := mesh.New(self, meshOpts...)
+	m, err := activeMeshSeam.newMesh(self, meshOpts...)
 	if err != nil {
-		return fmt.Errorf("build mesh: %w", err)
+		return noMeshTeardown, fmt.Errorf("build mesh: %w", err)
 	}
 	// The mesh derives its own mesh-egress /32 from the self prefix. If that
 	// disagrees with the /32 the enroll assigned, this node's routing locality and
 	// its mesh identity have diverged — fail rather than plumb an lo0 alias the
 	// proxy will never source from.
 	if in.meshIP != "" && m.MeshIP().String() != in.meshIP {
-		return fmt.Errorf("mesh device derives mesh-egress %s from podCIDR %s, but the enroll assigned %s", m.MeshIP(), in.podCIDR, in.meshIP)
+		return noMeshTeardown, fmt.Errorf("mesh device derives mesh-egress %s from podCIDR %s, but the enroll assigned %s", m.MeshIP(), in.podCIDR, in.meshIP)
 	}
 	if err := m.Start(ctx); err != nil {
-		return fmt.Errorf("start mesh device: %w", err)
+		return noMeshTeardown, fmt.Errorf("start mesh device: %w", err)
 	}
+	// The device is UP from here, so every remaining failure hands the caller a
+	// REAL teardown rather than the no-op: a half-built bring-up still owns a utun,
+	// and the caller's deferred handle is the only thing that will release it.
+	teardown := meshTeardown(m.Close)
 	if err := m.Reconcile(ctx, in.peers); err != nil {
 		logger.Error("initial mesh reconcile", "err", err)
 	}
 
 	restCfg, err := clientcmd.BuildConfigFromFlags("", in.kubeconfig)
 	if err != nil {
-		return fmt.Errorf("load kubeconfig for mesh watch: %w", err)
+		return teardown, fmt.Errorf("load kubeconfig for mesh watch: %w", err)
 	}
-	watcher, err := mesh.NewWatcher(restCfg, m, logger)
+	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger)
 	if err != nil {
-		return fmt.Errorf("build mesh watcher: %w", err)
+		return teardown, fmt.Errorf("build mesh watcher: %w", err)
 	}
 	go func() {
 		if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("mesh watcher", "err", err)
 		}
-		_ = m.Close(context.WithoutCancel(ctx))
+		// The FALLBACK teardown, kept for a path that never reaches the caller's
+		// deferred handle. After the deferred one has run this is a no-op (Close is
+		// idempotent), so the device still comes down exactly once.
+		_ = teardown(context.WithoutCancel(ctx))
 	}()
 
 	// The endpoint refresher, for BOTH roles. It starts after the device is up
@@ -558,7 +675,7 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 			}
 		}()
 	}
-	return nil
+	return teardown, nil
 }
 
 // startWorkerNetserve brings up the joined worker's node-local datapath — the

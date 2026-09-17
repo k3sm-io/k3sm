@@ -533,6 +533,19 @@ func runServer(args []string) (err error) {
 		err = fmt.Errorf("control-plane component %q exited; restarting the daemon: %w", *name, err)
 	}()
 
+	// The control-plane node's mesh teardown handle, declared and deferred HERE —
+	// BEFORE the control plane's own shutdown defer below — so LIFO runs it LAST,
+	// once exec.Stop has signalled and reaped every component. The order is not
+	// cosmetic: in the mesh posture the apiserver BINDS and advertises the mesh IP,
+	// so tearing the utun and its alias down first would pull the interface out
+	// from under a control plane that is still draining.
+	//
+	// It stays a no-op until step 4b's enroll assigns it, and forever under
+	// `--network none`, so registering it this early costs nothing on the paths
+	// that never bring a mesh up.
+	meshDown := meshTeardown(noMeshTeardown)
+	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
+
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
@@ -730,9 +743,18 @@ func runServer(args []string) (err error) {
 			return fmt.Errorf("build mesh enroller: %w", err)
 		}
 		enroller = e
-		if res, err := enrollSelfAndBringUpMesh(ctx, enroller, opts, mode, exec.Kubeconfig(), logger); err != nil {
+		if res, down, err := enrollSelfAndBringUpMesh(ctx, enroller, opts, mode, exec.Kubeconfig(), logger); err != nil {
 			logger.Error("server mesh bring-up failed; this node is NOT on its own mesh, so cross-node pod traffic to it has no path and its Service proxy will source backend dials from the kernel default", "err", err)
+			// A bring-up that failed part-way still owns a utun, so the handle is
+			// armed even here; it is a no-op when nothing came up.
+			meshDown = down
 		} else {
+			// Arms the teardown deferred above, which runs SYNCHRONOUSLY on the way
+			// out and after the control plane has stopped. The mesh watcher's own
+			// Close is only a fallback — it runs after ctx is cancelled and races
+			// process death, which on SIGTERM leaves the per-peer routes and the
+			// MSS-clamp pf anchor installed.
+			meshDown = down
 			serverPodCIDR = res.PodCIDR
 			if mode.DataPath() {
 				serverMeshEgressIP = res.MeshIP
