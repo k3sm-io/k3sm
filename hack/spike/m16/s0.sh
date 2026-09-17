@@ -351,10 +351,10 @@ export UV_CACHE_DIR="$PREFIX/cache" UV_PYTHON_INSTALL_DIR="$PREFIX/pyinstall" HF
 
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$PREFIX/bin" sh >/dev/null 2>&1
 export PATH="$PREFIX/bin:$PATH"
-[ -x "$PREFIX/venv/bin/python" ] || uv venv --python 3.12 "$PREFIX/venv" >/dev/null 2>&1
+spike_venv "$PREFIX/venv" "s0.2-setup"
 V="$PREFIX/venv/bin/python"
-"$V" -c 'import vllm_mlx' 2>/dev/null || uv pip install --python "$V" "vllm-mlx==$ENGINE_VERSION" >/dev/null 2>&1
-"$V" -c 'import vllm_mlx' 2>/dev/null || { verdict FAIL "s0.2-setup  vllm-mlx==$ENGINE_VERSION did not install"; exit 0; }
+"$V" -c 'import vllm_mlx' 2>/dev/null || spike_pip "$V" "vllm-mlx==$ENGINE_VERSION"
+"$V" -c 'import vllm_mlx' 2>/dev/null || { verdict FAIL "s0.2-setup  vllm-mlx==$ENGINE_VERSION did not install: $(tail -1 "$PREFIX/logs/pip-venv-vllm-mlx.log" 2>/dev/null)"; exit 0; }
 
 MP=$("$V" - <<PY
 from huggingface_hub import snapshot_download
@@ -368,10 +368,38 @@ recorded "s0.2 model: $MODEL_REPO @ ${MODEL_REV:0:12} at $MP"
 # formula was calibrated from: a burst ends before the peak the headroom exists for,
 # and two engines each oscillate with the buffer cache.
 cat > "$W/load.py" <<'PY'
-import json, statistics, sys, threading, time, urllib.request
+import json, statistics, sys, threading, time, urllib.error, urllib.request
 
-def one(base, prompt, max_tokens, out):
-    body = json.dumps({"model": "m", "max_tokens": max_tokens, "stream": True,
+# resolve_model <base> — GET <base>/v1/models and return its first data[].id.
+# vllm-mlx 0.4.1 (like upstream vLLM) answers /v1/chat/completions with a 404
+# "The model `<x>` does not exist" for any id it was not started with, and the
+# id it WILL answer to is the model path it was launched against, not a fixed
+# literal — so the id is resolved once per base URL from the server itself,
+# never hardcoded. A non-200 or an empty list is returned as an error STRING,
+# never raised: the caller turns it into a failed request naming the status
+# text, so a broken /v1/models never reads as a silent 404 buried in the
+# aggregate "failed" count.
+def resolve_model(base):
+    try:
+        with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
+            status = r.status
+            payload = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return None, "GET /v1/models: HTTP %d %s" % (exc.code, exc.reason)
+    except Exception as exc:
+        return None, "GET /v1/models: %s: %s" % (type(exc).__name__, str(exc)[:120])
+    if status != 200:
+        return None, "GET /v1/models: HTTP %d" % status
+    try:
+        ids = [m.get("id") for m in json.loads(payload).get("data", []) if m.get("id")]
+    except Exception as exc:
+        return None, "GET /v1/models: unparseable body (%s)" % str(exc)[:120]
+    if not ids:
+        return None, "GET /v1/models: empty model list"
+    return ids[0], None
+
+def one(base, model, prompt, max_tokens, out):
+    body = json.dumps({"model": model, "max_tokens": max_tokens, "stream": True,
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(base + "/v1/chat/completions", data=body,
                                  headers={"content-type": "application/json"})
@@ -388,18 +416,27 @@ def one(base, prompt, max_tokens, out):
                     ttft = time.time() - t0
                 toks += 1
         out.append({"ok": True, "ttft": ttft or 0.0, "wall": time.time() - t0, "tokens": toks})
+    except urllib.error.HTTPError as exc:
+        out.append({"ok": False, "error": "HTTP %d %s" % (exc.code, exc.reason),
+                    "wall": time.time() - t0})
     except Exception as exc:  # a rejection is DATA, not a crash
         out.append({"ok": False, "error": type(exc).__name__ + ": " + str(exc)[:120],
                     "wall": time.time() - t0})
 
 def run(bases, conc, rounds, max_tokens):
+    models, errors = {}, {}
+    for base in bases:
+        models[base], errors[base] = resolve_model(base)
     out = []
     for r in range(rounds):
         threads = []
         for i in range(conc):
             base = bases[i % len(bases)]
+            if models[base] is None:
+                out.append({"ok": False, "error": errors[base], "wall": 0.0})
+                continue
             prompt = "Round %d request %d. Explain, at length, how a filesystem journal works." % (r, i)
-            t = threading.Thread(target=one, args=(base, prompt, max_tokens, out))
+            t = threading.Thread(target=one, args=(base, models[base], prompt, max_tokens, out))
             t.start(); threads.append(t)
         for t in threads:
             t.join()
