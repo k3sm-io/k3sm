@@ -1413,8 +1413,24 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // updates in place); other changes need a recreate and are reported by the
 // runtime as a typed precondition failure, surfaced here as an error.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
-	// Same identity binding as CreatePod, in case the runtime re-materializes
-	// volumes on an in-place update.
+	// Identity binding kept for the SAME in-process seam CreatePod uses, but
+	// UpdatePod never mints a token or re-reads a ConfigMap/Secret through it:
+	// runtimed's UpdatePod applies labels/annotations only (its updatableOnly
+	// check rejects any other field change as NOT_UPDATABLE; pinned there by
+	// TestUpdatePodNeverMaterializes in pkg/runtime), and volumes
+	// materialize exactly once, at create — nothing on any path re-resolves
+	// ConfigMap, Secret, or projected ServiceAccount-token DATA afterward (the
+	// provider's periodic loop is status-only). Consequence: a pod created
+	// before a ConfigMap/Secret change, or before the --root-ca-file fix, keeps
+	// its creation-time data until it is recreated, and a default projected SA
+	// token (the admission plugin's ~3607s TTL passes through translate.go
+	// unchanged) expires about an hour after creation, so in-cluster clients
+	// using the mounted token start failing authentication until the pod is
+	// recreated — upstream's periodic projected-volume refresh has no analog
+	// here (B234; not fixed by this comment). The binding stays because
+	// env-source resolution in buildBox (resolvePodBoxEnv → ConfigMap/Secret key
+	// refs) legitimately re-runs on every box build, and this seam is kept
+	// uniform for CreatePod and UpdatePod rather than split (B233).
 	ctx = withPodIdentity(ctx, pod)
 	id := string(pod.UID)
 	r.mu.Lock()

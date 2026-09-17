@@ -115,8 +115,10 @@ func (f *tokenMintingRuntime) CreatePod(ctx context.Context, req *runtimev1.Crea
 	return f.fakeRuntimeServer.CreatePod(ctx, req)
 }
 
-// UpdatePod mints the pod's token on ctx (the in-place re-materialize case),
-// then delegates to the recording fake.
+// UpdatePod mints the pod's token on ctx, then delegates to the recording fake.
+// This is a FORWARD GUARD, not a real scenario: it proves the identity binding
+// would survive a hypothetical re-materializing update. Real runtimed never
+// issues this call on UpdatePod — volumes materialize once, at create (B233).
 func (f *tokenMintingRuntime) UpdatePod(ctx context.Context, req *runtimev1.UpdatePodRequest) (*runtimev1.UpdatePodResponse, error) {
 	f.mint(ctx, req.GetPod().GetNamespace())
 	return &runtimev1.UpdatePodResponse{}, nil
