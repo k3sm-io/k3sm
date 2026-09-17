@@ -201,6 +201,21 @@ func TestBuildConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("the adopted-identity file is threaded into the mesh key dir", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg, err := BuildConfig(Options{NodePodCIDR: nodeCIDR, ServiceCIDR: svcCIDR, MeshKeyDir: dir})
+		if err != nil {
+			t.Fatalf("BuildConfig: %v", err)
+		}
+		want := filepath.Join(dir, NodeIdentityFileName)
+		if cfg.IdentityPath != want {
+			t.Errorf("IdentityPath = %q, want %q — netd persists the /24 it adopted there and re-reads it at start, so a restart the agent did not drive does not revert the node's identity", cfg.IdentityPath, want)
+		}
+		if filepath.Dir(cfg.IdentityPath) != dir {
+			t.Errorf("IdentityPath must live INSIDE the root-only mesh key dir %q, got %q — a directory an unprivileged writer can reach would let it dictate the pod-alias policy boundary at the next start", dir, cfg.IdentityPath)
+		}
+	})
+
 	t.Run("missing service CIDR errors", func(t *testing.T) {
 		if _, err := BuildConfig(Options{NodePodCIDR: nodeCIDR}); err == nil {
 			t.Error("BuildConfig must require a Service CIDR (else proxy VIPs are denied)")
@@ -218,6 +233,16 @@ func TestBuildConfig(t *testing.T) {
 		}
 		if cfg.MeshKeyResolver != nil {
 			t.Error("an unset MeshKeyDir must leave MeshKeyResolver nil so ConfigureMesh fails fast")
+		}
+		// No root-only directory means no place to persist the identity. Empty is
+		// the honest answer (netd then persists nothing); a path derived from
+		// somewhere else would put the node's policy boundary in a directory the
+		// installer never made 0700.
+		if cfg.IdentityPath != "" {
+			t.Errorf("an unset MeshKeyDir must leave IdentityPath empty, got %q", cfg.IdentityPath)
+		}
+		if got := NodeIdentityPath(""); got != "" {
+			t.Errorf("NodeIdentityPath(\"\") = %q, want \"\"", got)
 		}
 	})
 }

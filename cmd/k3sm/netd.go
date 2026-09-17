@@ -61,22 +61,39 @@ type netdOptions struct {
 	nodeIP      string
 }
 
+// netdFlags registers `k3sm netd`'s flags against opts and returns the set. It
+// is split out of runNetd so the DEFAULTS are reachable without running the
+// daemon (which requires root): the node-pod-CIDR default is a cross-command
+// invariant, and a test that re-derives it by hand would pin the derivation
+// rather than the value the flag actually carries.
+func netdFlags(opts *netdOptions) *flag.FlagSet {
+	fs := flag.NewFlagSet("netd", flag.ExitOnError)
+	fs.StringVar(&opts.socket, "socket", netd.DefaultSocketPath, "unix socket to listen on")
+	// The pre-adoption node /24 default is DERIVED, never typed: it is the same
+	// index-0 carve of the cluster pod CIDR the server gives itself
+	// (defaultNodePodCIDR), and the two must be the SAME value. netd's adoption
+	// treats "the identity already in force" as a no-op and refuses a DIFFERENT
+	// identity once anything is live, so on a server — whose ConfigureMesh carries
+	// exactly that index-0 carve — a literal here that drifted from the carve would
+	// turn a silent no-op into a refused adoption on a node that already holds
+	// aliases. One derivation, so drift is not expressible.
+	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", defaultNodePodCIDR(), "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION DEFAULT ONLY — the node's real prefix is decided by the join, and a ConfigureMesh may replace this value, so the installed plist passes no --node-pod-cidr")
+	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
+	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
+	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
+	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
+	return fs
+}
+
 // runNetd runs the root k3sm-netd helper: it serves the only irreducibly-root
 // network operations (lo0 aliases, utun/wireguard/routes, pf MSS anchor,
 // privileged-port binds) over a unix socket the unprivileged _k3sm control plane
 // drives. It is the SAME binary re-exec'd in netd mode (the root LaunchDaemon
 // runs `k3sm netd …`), preserving the one-binary doctrine. It requires root.
 func runNetd(args []string) error {
-	fs := flag.NewFlagSet("netd", flag.ExitOnError)
 	opts := netdOptions{}
-	fs.StringVar(&opts.socket, "socket", netd.DefaultSocketPath, "unix socket to listen on")
-	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", "100.64.0.0/24", "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION DEFAULT ONLY — the node's real prefix is decided by the join, and a ConfigureMesh may replace this value, so the installed plist passes no --node-pod-cidr")
-	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
-	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
-	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
-	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
-	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
-	_ = fs.Parse(args)
+	_ = netdFlags(&opts).Parse(args)
 
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("k3sm netd must run as root (it owns lo0/utun/pf/privileged-port ops); it is launched by the io.k3sm.netd LaunchDaemon")
@@ -132,7 +149,10 @@ func runNetd(args []string) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid, "node-ip", opts.nodeIP)
+	// identity-path is logged because it is the one input whose ABSENCE is silent:
+	// with no mesh key dir the daemon persists nothing, so an adopted /24 is lost
+	// on the next restart and the only evidence is this field being empty.
+	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid, "node-ip", opts.nodeIP, "identity-path", cfg.IdentityPath)
 
 	srv := netd.NewServer(cfg)
 	if err := srv.Serve(ctx, l); err != nil && ctx.Err() == nil {
