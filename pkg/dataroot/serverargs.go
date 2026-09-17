@@ -21,7 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -33,23 +33,55 @@ import (
 // template without saying so.
 const ServerArgsRecordVersion = 1
 
-// serverArgsRecordName is the record's leaf name inside the data root. It is
-// stated once and joined onto whichever data root a caller names, so no second
-// literal can spell it differently.
-const serverArgsRecordName = "server-args.json"
-
-// ServerArgsRecordPath is where k3sm keeps the server-arguments record for a
-// data root: <dataRoot>/server-args.json.
+// DefaultServerArgsRecordPath is where k3sm keeps the server-arguments record:
+// beside the data-volume record, in root-owned /Library/Preferences.
 //
-// Inside the data root is deliberate. The data root is what `k3sm uninstall`
-// preserves and what a `--data-volume` migration carries across, so a record
-// kept here survives exactly the two events the record exists for — and a
-// deliberate reset of the data root discards the carried arguments along with
-// the cluster state they belonged to, which is the model an operator already
-// holds about that directory.
-func ServerArgsRecordPath(dataRoot string) string {
-	return filepath.Join(dataRoot, serverArgsRecordName)
-}
+// NOT inside the data root, and the difference is a privilege boundary rather
+// than a filing preference. The data root is owned by the unprivileged _k3sm
+// uid, so that uid can replace any file in it — including a record a later
+// root-run `k3sm install` would read and splice straight into the server
+// LaunchDaemon's argv. Keeping the record in a directory only root can write
+// means the only thing that can change the daemon's arguments is something that
+// was already root.
+//
+// It is a var only so tests can point it at a fixture; production never changes
+// it.
+var DefaultServerArgsRecordPath = "/Library/Preferences/io.k3sm.server-args.json"
+
+// serverArgsRecordMode is the record's file mode: root-owned, ROOT-ONLY.
+//
+// 0600 rather than the data-volume record's 0644 because an operator argument
+// can carry a credential — `--datastore-endpoint postgres://user:password@host`
+// is the obvious one — and a world-readable copy of a datastore password is a
+// leak no amount of redaction in the logs would undo.
+const serverArgsRecordMode fs.FileMode = 0o600
+
+// ManagedServerFlags are the `k3sm server` flag names (leading dashes stripped)
+// that the INSTALLER renders itself and a record may therefore never carry.
+//
+// This is the one home of that vocabulary: pkg/install builds its own
+// managed-flag set from this slice rather than re-typing it, so the flags the
+// installer refuses to preserve and the flags a record is refused for are the
+// same list by construction. A record carrying one is rejected outright rather
+// than filtered, because a file that tries to set --token is not a stale record,
+// it is an attempt to hand the daemon a credential.
+var ManagedServerFlags = []string{"runtime", "token"}
+
+// The bounds a server-arguments record must satisfy. They are not tuning knobs:
+// the record is re-rendered into a root LaunchDaemon's ProgramArguments, so
+// every one of them is a bound on what a file can make launchd exec.
+const (
+	// MaxServerArgs is the most arguments a record may carry. A real
+	// configuration is a handful of flags; hundreds is a file nobody wrote by
+	// hand.
+	MaxServerArgs = 64
+	// MaxServerArgLen is the longest single argument, in bytes.
+	MaxServerArgLen = 4096
+)
+
+// ErrServerArgsRejected is the sentinel every content refusal wraps. Match it
+// with errors.Is, never by string.
+var ErrServerArgsRejected = errors.New("server arguments record carries arguments k3sm refuses to render")
 
 // ServerArgsRecord is k3sm's note of the operator-supplied `k3sm server`
 // arguments the installed control plane was last configured with — everything
@@ -59,15 +91,13 @@ func ServerArgsRecordPath(dataRoot string) string {
 // uninstall` removes the LaunchDaemon it laid down, so a later `k3sm install`
 // found no plist to read the operator's arguments off and silently re-rendered
 // the stock template. The record is the second copy that survives that gap.
-//
-// It holds no secret: the install-managed flags (--token, --runtime) are
-// re-derived on every install and are never written here.
 type ServerArgsRecord struct {
 	// Version is the schema version; always ServerArgsRecordVersion on write.
 	Version int `json:"version"`
 	// Args are the operator-supplied arguments, in their original order and
 	// verbatim — never a distilled subset, because the next install renders
-	// exactly what is here.
+	// exactly what is here. They are validated on both write and read; see
+	// ValidateServerArgs for what they may not be.
 	Args []string `json:"args"`
 	// CreatedBy names the k3sm version that wrote the record.
 	CreatedBy string `json:"createdBy"`
@@ -77,13 +107,73 @@ type ServerArgsRecord struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+// ValidateServerArgs reports why args may not be rendered into a server
+// LaunchDaemon, or nil when they may.
+//
+// The record is the ONE input to the installed daemon's command line that is not
+// derived from the installer's own Config, so it is treated as input rather than
+// as data k3sm wrote: the file could have been restored from a backup, synced
+// from another Mac, or replaced by anything that once had root. Four refusals,
+// each closing a way a file could turn into an argv k3sm never intended:
+//
+//   - a MANAGED flag (ManagedServerFlags) — the record trying to set --token
+//     would hand the daemon a credential of the file's choosing, in place of the
+//     one this install just minted;
+//   - more than MaxServerArgs arguments, or one longer than MaxServerArgLen —
+//     bounds on what a file can make launchd exec;
+//   - a NUL or a newline in any argument — neither can occur in an argument
+//     k3sm rendered, and both are the shapes that break the plist encoding and
+//     anything downstream that reads a line at a time.
+//
+// It is applied on WRITE as well as on read, so the installer can never produce
+// a record its own next run would refuse.
+func ValidateServerArgs(args []string) error {
+	if len(args) > MaxServerArgs {
+		return fmt.Errorf("%w: %d arguments, the limit is %d", ErrServerArgsRejected, len(args), MaxServerArgs)
+	}
+	for _, arg := range args {
+		if len(arg) > MaxServerArgLen {
+			return fmt.Errorf("%w: an argument of %d bytes, the limit is %d", ErrServerArgsRejected, len(arg), MaxServerArgLen)
+		}
+		if strings.ContainsAny(arg, "\x00\n\r") {
+			return fmt.Errorf("%w: an argument contains a NUL or a newline", ErrServerArgsRejected)
+		}
+		name := serverArgFlagName(arg)
+		for _, managed := range ManagedServerFlags {
+			if name == managed {
+				return fmt.Errorf("%w: --%s is rendered by the installer and may not come from a file", ErrServerArgsRejected, managed)
+			}
+		}
+	}
+	return nil
+}
+
+// serverArgFlagName is the flag name an argument names, with leading dashes
+// stripped and any inline =value removed, or "" for a non-flag argument. Both
+// spellings collapse to one name (Go's flag package accepts -x and --x), and
+// --token=… is the same name as --token.
+//
+// pkg/install has a richer splitter for walking an argv (it needs the value and
+// whether it was inline); this one exists because pkg/dataroot cannot import the
+// package that imports it. The NAMES the two decide about are single-sourced in
+// ManagedServerFlags above, which is the part that must not drift.
+func serverArgFlagName(arg string) string {
+	if !strings.HasPrefix(arg, "-") {
+		return ""
+	}
+	name, _, _ := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+	return name
+}
+
 // ReadServerArgsRecord reads the server-arguments record at path.
 //
 // A missing record is not an error: it reports (nil, nil), which is both the
 // first-install posture and the posture of any Mac installed before records
-// existed. A record that does not parse, or that carries an unknown version, IS
-// an error — mistaking one for "no arguments were configured" is precisely the
-// silent re-render this record exists to end.
+// existed. A record that does not parse, that carries an unknown version, or
+// whose arguments ValidateServerArgs refuses IS an error — mistaking any of
+// those for "no arguments were configured" is precisely the silent re-render
+// this record exists to end, and quietly dropping a rejected argument would hide
+// the more interesting fact that something put it there.
 //
 // It takes a FileReader rather than the package's FS because reading one small
 // file is all it does, and the installer reaches the record through its own
@@ -102,6 +192,9 @@ func ReadServerArgsRecord(fsys FileReader, path string) (*ServerArgsRecord, erro
 	}
 	if r.Version != ServerArgsRecordVersion {
 		return nil, fmt.Errorf("server arguments record %s: unknown version %d, this k3sm understands %d", path, r.Version, ServerArgsRecordVersion)
+	}
+	if err := ValidateServerArgs(r.Args); err != nil {
+		return nil, fmt.Errorf("server arguments record %s: %w", path, err)
 	}
 	return &r, nil
 }
@@ -124,12 +217,19 @@ func EncodeServerArgsRecord(r ServerArgsRecord) ([]byte, error) {
 
 // WriteServerArgsRecord writes r to path atomically — the same temp-and-rename
 // WriteRecord uses, through the same helper — so a reader never observes a
-// half-written record. The file is 0644 (root-owned in production, like the
-// plist it mirrors) because it carries nothing secret.
+// half-written record. The file is 0600 and root-owned in production; see
+// serverArgsRecordMode for why it is not the sibling record's 0644.
+//
+// The arguments are validated FIRST: a record this package would refuse to read
+// is one it must refuse to write, or an install would succeed and leave the next
+// one failing on a file it produced itself.
 func WriteServerArgsRecord(path string, r ServerArgsRecord) error {
+	if err := ValidateServerArgs(r.Args); err != nil {
+		return fmt.Errorf("write server arguments record %s: %w", path, err)
+	}
 	data, err := EncodeServerArgsRecord(r)
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, ".io.k3sm.serverargs-*.json", data, "server arguments record")
+	return writeFileAtomic(path, ".io.k3sm.server-args-*.json", serverArgsRecordMode, data, "server arguments record")
 }

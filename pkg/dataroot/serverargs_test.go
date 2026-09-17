@@ -18,6 +18,7 @@ package dataroot
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -27,22 +28,29 @@ import (
 	"time"
 )
 
-// TestServerArgsRecordPath pins where the record lives: inside the data root, so
-// an uninstall (which preserves that directory) and a --data-volume migration
-// (which copies it) both carry it, and a deliberate reset of the data root
-// discards it with the cluster state it belonged to.
-func TestServerArgsRecordPath(t *testing.T) {
-	if got, want := ServerArgsRecordPath("/var/lib/k3sm"), "/var/lib/k3sm/server-args.json"; got != want {
-		t.Errorf("ServerArgsRecordPath = %q, want %q", got, want)
+// TestServerArgsRecordDefaultPath pins where the record lives, which is a
+// privilege boundary and not a filing preference: a root-only directory, beside
+// the data-volume record, and NOT in the _k3sm-owned data root where the
+// unprivileged service user could replace what a later root-run install splices
+// into the daemon's argv.
+func TestServerArgsRecordDefaultPath(t *testing.T) {
+	// Read the package's own default, not the test-scoped var, so a test that
+	// repoints it cannot make this assertion vacuous.
+	const want = "/Library/Preferences/io.k3sm.server-args.json"
+	if got := defaultServerArgsRecordPathForTest; got != want {
+		t.Errorf("the default record path is %q, want %q", got, want)
 	}
-	if got := ServerArgsRecordPath("/opt/lab"); !strings.HasPrefix(got, "/opt/lab/") {
-		t.Errorf("ServerArgsRecordPath(%q) = %q, want it inside the data root it was given", "/opt/lab", got)
+	if strings.HasPrefix(want, "/var/lib/k3sm") {
+		t.Error("the record must not live in the service-user-owned data root")
+	}
+	if filepath.Dir(want) != filepath.Dir(defaultDataVolumeRecordPathForTest) {
+		t.Errorf("the two records must be siblings: %q vs %q", want, defaultDataVolumeRecordPathForTest)
 	}
 }
 
 func TestServerArgsRecordRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	path := ServerArgsRecordPath(dir)
+	path := filepath.Join(dir, "io.k3sm.server-args.json")
 	want := ServerArgsRecord{
 		Args:      []string{"--mesh-ip", "100.64.0.1", "--registry-port", "5000"},
 		CreatedBy: "k3sm v0.1.0",
@@ -76,13 +84,15 @@ func TestServerArgsRecordRoundTrip(t *testing.T) {
 		}
 	})
 
-	t.Run("the file is 0644 and carries the json field names", func(t *testing.T) {
+	t.Run("the file is 0600 and carries the json field names", func(t *testing.T) {
 		fi, err := os.Stat(path)
 		if err != nil {
 			t.Fatalf("stat: %v", err)
 		}
-		if fi.Mode().Perm() != 0o644 {
-			t.Fatalf("mode = %v, want 0644 (the record carries no credential)", fi.Mode().Perm())
+		// 0600, not the data-volume record's 0644: an operator argument can carry
+		// a credential (--datastore-endpoint postgres://user:password@host).
+		if fi.Mode().Perm() != 0o600 {
+			t.Fatalf("mode = %v, want 0600 (an argument can carry a credential)", fi.Mode().Perm())
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -167,4 +177,101 @@ func TestServerArgsRecordRoundTrip(t *testing.T) {
 			}
 		}
 	})
+}
+
+// defaultServerArgsRecordPathForTest and defaultDataVolumeRecordPathForTest pin
+// the shipped defaults against a test that repoints the vars. They are literals
+// on purpose: the point of TestServerArgsRecordDefaultPath is that the DEFAULT
+// is a root-only directory, and reading it out of the var it is asserting would
+// prove nothing.
+const (
+	defaultServerArgsRecordPathForTest = "/Library/Preferences/io.k3sm.server-args.json"
+	defaultDataVolumeRecordPathForTest = "/Library/Preferences/io.k3sm.datavol.json"
+)
+
+// TestValidateServerArgs is the content gate on a file that decides a root
+// LaunchDaemon's command line. Every case is a way a record could otherwise turn
+// into an argv k3sm never intended.
+func TestValidateServerArgs(t *testing.T) {
+	long := strings.Repeat("x", MaxServerArgLen+1)
+	many := make([]string, MaxServerArgs+1)
+	for i := range many {
+		many[i] = "--flag"
+	}
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantErr bool
+	}{
+		{name: "the ordinary case", args: []string{"--mesh-ip", "100.64.0.1", "--registry-port", "5000"}},
+		{name: "a DSN with a password is an ordinary argument", args: []string{"--datastore-endpoint", "postgres://u:s3cret@h/db"}},
+		{name: "nothing at all", args: nil},
+		{name: "exactly the argument limit", args: many[:MaxServerArgs]},
+		{name: "exactly the length limit", args: []string{strings.Repeat("x", MaxServerArgLen)}},
+		{name: "--token", args: []string{"--mesh-ip", "100.64.0.1", "--token", "evil"}, wantErr: true},
+		{name: "--token= inline", args: []string{"--token=evil"}, wantErr: true},
+		{name: "-token, single dash", args: []string{"-token", "evil"}, wantErr: true},
+		{name: "--runtime", args: []string{"--runtime", "somethingelse"}, wantErr: true},
+		{name: "too many arguments", args: many, wantErr: true},
+		{name: "an argument over the byte limit", args: []string{long}, wantErr: true},
+		{name: "a NUL", args: []string{"--mesh-ip\x00--token"}, wantErr: true},
+		{name: "a newline", args: []string{"--mesh-ip\n--token"}, wantErr: true},
+		{name: "a carriage return", args: []string{"--mesh-ip\r--token"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateServerArgs(tc.args)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ValidateServerArgs(%q) = %v, want error: %t", tc.args, err, tc.wantErr)
+			}
+			if err != nil && !errors.Is(err, ErrServerArgsRejected) {
+				t.Errorf("error %v must wrap ErrServerArgsRejected so callers can match it", err)
+			}
+		})
+	}
+}
+
+// TestServerArgsRecordRefusesRejectedContent proves the validation is on BOTH
+// sides of the file: a record carrying a managed flag is refused on read (so it
+// can never be rendered) and refused on write (so an install can never produce a
+// record its own next run would reject).
+func TestServerArgsRecordRefusesRejectedContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "forged.json")
+
+	// Written by hand, the way anything with root could: a plausible record with
+	// one extra flag on the end.
+	forged := `{"version":1,"args":["--mesh-ip","100.64.0.1","--token=evil"],"createdBy":"k3sm 0.0.0","createdAt":"2026-09-14T12:00:00Z"}`
+	if err := os.WriteFile(path, []byte(forged), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := ReadServerArgsRecord(OSFS{}, path)
+	if err == nil {
+		t.Fatalf("ReadServerArgsRecord accepted a record naming --token: %+v", got)
+	}
+	if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "token") {
+		t.Errorf("error %q must name the record and the offending flag", err)
+	}
+
+	out := filepath.Join(dir, "refused.json")
+	if err := WriteServerArgsRecord(out, ServerArgsRecord{Args: []string{"--token", "evil"}}); err == nil {
+		t.Error("WriteServerArgsRecord wrote a record its own reader would refuse")
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Errorf("the refused write left a file behind: %v", err)
+	}
+}
+
+// TestManagedServerFlagsIsTheOneList pins the vocabulary this package shares
+// with the installer. pkg/install builds its managed-flag set from this slice;
+// if an entry is added here it must be a flag the installer renders itself.
+func TestManagedServerFlagsIsTheOneList(t *testing.T) {
+	want := []string{"runtime", "token"}
+	if strings.Join(ManagedServerFlags, ",") != strings.Join(want, ",") {
+		t.Errorf("ManagedServerFlags = %v, want %v", ManagedServerFlags, want)
+	}
+	for _, name := range ManagedServerFlags {
+		if err := ValidateServerArgs([]string{"--" + name, "x"}); err == nil {
+			t.Errorf("a record naming --%s must be rejected", name)
+		}
+	}
 }

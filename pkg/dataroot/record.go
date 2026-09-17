@@ -103,7 +103,7 @@ func WriteRecord(path string, r Record) error {
 		return fmt.Errorf("encode data volume record: %w", err)
 	}
 	data = append(data, '\n')
-	return writeFileAtomic(path, ".io.k3sm.datavol-*.json", data, "data volume record")
+	return writeFileAtomic(path, ".io.k3sm.datavol-*.json", 0o644, data, "data volume record")
 }
 
 // writeFileAtomic installs data at path through a temp file in the SAME
@@ -114,9 +114,14 @@ func WriteRecord(path string, r Record) error {
 // get it subtly different.
 //
 // pattern is the os.CreateTemp pattern (it must keep the .json suffix, so a
-// crash leaves something an operator can recognise), and what names the record
-// in every error message.
-func writeFileAtomic(path, pattern string, data []byte, what string) error {
+// crash leaves something an operator can recognise); mode is the installed
+// file's permission bits, which differ per record (0644 for the data-volume
+// declaration, 0600 for the server arguments, which can carry a credential);
+// what names the record in every error message.
+//
+// The temp file is created 0600 by os.CreateTemp and only widened at the end, so
+// a record that must stay root-only is never briefly readable.
+func writeFileAtomic(path, pattern string, mode fs.FileMode, data []byte, what string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
@@ -132,7 +137,7 @@ func writeFileAtomic(path, pattern string, data []byte, what string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp %s %s: %w", what, name, err)
 	}
-	if err := os.Chmod(name, 0o644); err != nil {
+	if err := os.Chmod(name, mode); err != nil {
 		return fmt.Errorf("chmod temp %s %s: %w", what, name, err)
 	}
 	if err := os.Rename(name, path); err != nil {
