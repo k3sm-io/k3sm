@@ -35,7 +35,6 @@ import (
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 
 	crdconfig "k3sm.io/apis/config/crd"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -49,6 +48,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
@@ -565,13 +565,9 @@ func runServer(args []string) (err error) {
 	defer healthyReset.Stop()
 
 	// 2. Client for the post-bring-up provisioning + Service watch.
-	restCfg, err := clientcmd.BuildConfigFromFlags("", exec.Kubeconfig())
+	restCfg, cs, err := kubeclient.FromPath(exec.Kubeconfig())
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return fmt.Errorf("build client: %w", err)
 	}
 
 	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
