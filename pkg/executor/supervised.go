@@ -109,9 +109,18 @@ type component struct {
 // exitDetail describes an early child exit for the fail-fast bring-up error:
 // the Wait error (exit status) plus the last ~20 lines of the component's 0600
 // log file, so the operator sees the fatal flag/config error immediately
-// instead of an opaque healthz timeout. Call only after <-c.exited.
+// instead of an opaque healthz timeout.
+//
+// The tail is REDACTED, for the same reason the reaper's is: this string is
+// formatted into the error EVERY awaitHealthy fail-fast path returns, and
+// bringUp propagates that out of Start to the daemon's stderr, which launchd
+// captures into /var/log/k3sm/server.log — a file the whole admin group reads,
+// where the component log it was quoted from is 0600 to the service user alone.
+// The unredacted original stays at logPath, which travels with the tail.
+//
+// Call only after <-c.exited.
 func (c *component) exitDetail() string {
-	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, LogTail(c.logPath, exitLogTailLines))
+	return fmt.Sprintf("%v; last log lines (%s):\n%s", c.waitErr, c.logPath, RedactedLogTail(c.logPath))
 }
 
 // exitedNow reports whether the child has left the running state, asked of the
@@ -436,7 +445,7 @@ func (s *Supervised) markSupervised(c *component) error {
 	// Safe without the lock: waitErr is written strictly before exited closes,
 	// and the select above observed that close.
 	return fmt.Errorf("%s exited during bring-up: %v; last log lines (%s):\n%s",
-		c.name, c.waitErr, c.logPath, redactedLogTail(c.logPath))
+		c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath))
 }
 
 func (s *Supervised) bringUp(ctx context.Context) error {
@@ -896,7 +905,7 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 			// logger and launchd captures that into a world-readable file. The
 			// logPath goes with it so the operator is pointed at the 0600
 			// original rather than left with only the safe extract.
-			s.cfg.OnComponentExit(c.name, c.waitErr, c.logPath, redactedLogTail(c.logPath))
+			s.cfg.OnComponentExit(c.name, c.waitErr, c.logPath, RedactedLogTail(c.logPath))
 		}
 	}()
 
@@ -969,9 +978,10 @@ func awaitHealthy(ctx context.Context, name string, exited <-chan struct{}, exit
 
 // LogTail returns the last n lines of the file at path (best-effort: an
 // unreadable file yields a placeholder so the caller's error stays actionable).
-// Exported because a bring-up that times out OUTSIDE this package — `k3sm dev`
-// waiting on a detached server it spawned — owes its operator the same evidence
-// this package's own fail-fast errors carry, and there should be one tail.
+// It is the RAW tail, for a caller whose sink is as protected as the log itself;
+// anything that quotes a log into an operator-facing error wants RedactedLogTail
+// instead, which is what the out-of-package consumer (`k3sm dev`, waiting on a
+// detached server it spawned) takes, so there is still one tail.
 func LogTail(path string, n int) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1027,19 +1037,23 @@ var (
 	mintedTokens = regexp.MustCompile(`k3sm-[A-Za-z0-9._~+/=-]{12,}|K10[0-9a-fA-F]{16,}(?:::\S+)?`)
 )
 
-// redactedLogTail reads the tail of a component's 0600 log and returns it with
+// RedactedLogTail reads the tail of a component's 0600 log and returns it with
 // credential material removed and its size bounded, fit to hand to a consumer
 // that will put it somewhere less protected. The daemon logger is exactly that
-// consumer: launchd captures it into /var/log/k3sm/server.log, which is
-// world-readable on an installed cluster.
+// consumer: launchd captures it into /var/log/k3sm/server.log, which on an
+// installed cluster is mode 0640, group `admin` (pkg/install's LogFileMode) —
+// not world-readable, but read by every admin-group user on the Mac, where the
+// component log it was quoted from is read by the service user alone.
 //
 // The full, unredacted log stays at the 0600 path, which is what OnComponentExit
-// receives alongside this — so redaction here can afford to be blunt.
-func redactedLogTail(path string) string {
+// receives alongside this — so redaction here can afford to be blunt. Exported
+// because `k3sm dev` quotes the same server log into operator-facing errors from
+// outside this package and owes it the same treatment.
+func RedactedLogTail(path string) string {
 	return redactLogTail(LogTail(path, exitLogTailLines))
 }
 
-// redactLogTail is the pure half of redactedLogTail, over already-read text.
+// redactLogTail is the pure half of RedactedLogTail, over already-read text.
 func redactLogTail(tail string) string {
 	tail = credentialAssignments.ReplaceAllString(tail, "${1}${2}"+redactedTokenPlaceholder)
 	tail = authHeaders.ReplaceAllString(tail, "${1}${2}"+redactedTokenPlaceholder)

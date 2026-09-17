@@ -464,7 +464,10 @@ func TestDevUpSurfacesColdCacheBootTimeout(t *testing.T) {
 	})
 
 	t.Run("the quoted tail is bounded", func(t *testing.T) {
-		lines := make([]string, 0, bootLogTailLines*3)
+		// Comfortably more lines than the tail executor.RedactedLogTail keeps,
+		// which owns that bound now.
+		const logLines = 60
+		lines := make([]string, 0, logLines)
 		for i := range cap(lines) {
 			lines = append(lines, "line-"+strconv.Itoa(i))
 		}
@@ -758,5 +761,46 @@ func TestUnprobeableInstanceIsNotReaped(t *testing.T) {
 	}
 	if !slices.Contains(sys.terminated, pid) {
 		t.Errorf("teardown terminated %v, want it to signal the unprobeable pid %d — an EPERM probe is not permission to walk away from a live server", sys.terminated, pid)
+	}
+}
+
+// TestServerExitErrorRedactsTheLogTail: `k3sm dev` quotes the detached server's
+// log into the error it hands the operator, and that server log carries the same
+// bearer tokens and datastore DSNs a daemon's does — the error is printed to a
+// terminal, pasted into issues, and captured by whatever spawned the command. So
+// the quote goes through executor.RedactedLogTail, and the unredacted original
+// stays at the path the error names.
+func TestServerExitErrorRedactsTheLogTail(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	const secret = "abcdef0123456789"
+	body := "time=2026-09-17T09:00:00Z level=INFO msg=\"starting k3sm server\"\n" +
+		"flag provided but not defined: --token=" + secret + "\n"
+	if err := os.WriteFile(logPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &serverProc{
+		name:    "default",
+		pid:     4242,
+		logPath: logPath,
+		waitErr: errors.New("exit status 1"),
+		exited:  make(chan struct{}),
+	}
+	close(p.exited)
+
+	got := p.exitError().Error()
+	if strings.Contains(got, secret) {
+		t.Errorf("the token survived into the operator-facing exit error:\n%s", got)
+	}
+	// The placeholder executor.RedactedLogTail leaves behind, so the reader can
+	// tell material was removed rather than never logged.
+	if !strings.Contains(got, "<redacted>") {
+		t.Errorf("nothing in the exit error is marked as redacted:\n%s", got)
+	}
+	if !strings.Contains(got, "starting k3sm server") {
+		t.Errorf("redaction ate the diagnostic context, leaving:\n%s", got)
+	}
+	if !strings.Contains(got, logPath) {
+		t.Errorf("exit error %q does not name the log holding the unredacted original", got)
 	}
 }
