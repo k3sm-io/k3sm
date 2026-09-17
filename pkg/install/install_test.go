@@ -101,6 +101,11 @@ type fakeSystem struct {
 	// SECOND Install over the same fake describes the real "already correct"
 	// reinstall rather than a fresh lay-down.
 	links map[string]string
+	// linkDirTrust is the verdict LinkDirTrust returns, keyed by launcher path.
+	// The zero value (no entry) is a TRUSTED launcher directory, so every
+	// pre-existing test keeps describing an ordinary Mac whose /usr/local/bin is
+	// root-owned; a test that wants the refusal states it with putLinkDirTrust.
+	linkDirTrust map[string]error
 	// plistModes is the mode each LaunchDaemon plist was last written at, keyed
 	// by plist path. It is the fake's whole model of the file's permissions: the
 	// real chmod is the darwin implementation's, and a unit test must not need
@@ -560,6 +565,24 @@ func (f *fakeSystem) EnsureSymlink(target, link string) error {
 	return nil
 }
 
+// putLinkDirTrust makes LinkDirTrust refuse link with err — the Mac whose
+// launcher directory is user-owned (an Intel-prefix Homebrew at /usr/local).
+func (f *fakeSystem) putLinkDirTrust(link string, err error) {
+	if f.linkDirTrust == nil {
+		f.linkDirTrust = map[string]error{}
+	}
+	f.linkDirTrust[link] = err
+}
+
+// LinkDirTrust records the READ and answers from the table. It is recorded so a
+// test can assert the preflight happened at all and happened before the first
+// write; the recorded call names the launcher path the installer asked about,
+// which is the only input the real seam takes.
+func (f *fakeSystem) LinkDirTrust(link string) error {
+	f.calls = append(f.calls, "LinkDirTrust:"+link)
+	return f.linkDirTrust[link]
+}
+
 // RemoveSymlink records the link and reports it removed — the healthy uninstall
 // of a link this install laid down. A test that needs the "not ours" verdict
 // asserts on the real implementation's table in install_darwin_test.go, where the
@@ -957,6 +980,11 @@ func TestInstallOrchestration(t *testing.T) {
 		// Before anything is written: is the OTHER role's daemon already on this
 		// Mac? A node is a control plane or a worker, never both.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.agent.plist",
+		// ...and, still before the first write: is the directory that will hold
+		// the `k3sm` launcher root-owned? A read, like the probe above it; the
+		// link itself is not laid down until step 2b, and a refusal there would
+		// arrive with the whole tree already on disk.
+		"LinkDirTrust:/usr/local/bin/k3sm",
 		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
 		"EnsureLogDir:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
@@ -1117,16 +1145,19 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
-			// The FIRST privileged call — the cross-role probe ahead of it is a
-			// read, and install performs nothing else before the service user
-			// exists: the data root is its home, and every later step writes into it.
+			// The FIRST privileged call — the two refuse-before-write probes
+			// ahead of it (the cross-role plist read and the launcher-directory
+			// trust read) are reads, and install performs nothing else before the
+			// service user exists: the data root is its home, and every later
+			// step writes into it.
 			wantCall := "EnsureServiceUser:_k3sm:" + want
 			var first string
 			for _, c := range f.calls {
-				if !strings.HasPrefix(c, "ReadFile:") {
-					first = c
-					break
+				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") {
+					continue
 				}
+				first = c
+				break
 			}
 			if first != wantCall {
 				t.Fatalf("first privileged call = %q (calls %v), want %q", first, f.calls, wantCall)
@@ -1903,6 +1934,232 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		}
 		if unlink > sweep {
 			t.Errorf("the link (%d) must be judged before its target is deleted (%d): after the sweep it is a dangling link whose identity can no longer be read", unlink, sweep)
+		}
+	})
+}
+
+// TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir pins the two halves of
+// the launcher-directory refusal that a live Mac with an Intel-prefix Homebrew
+// exposed: WHAT the refusal says, and WHEN it happens.
+//
+// The what: /usr/local/bin on such a Mac is owned by the admin user Homebrew was
+// installed as, and root's PATH searches it ahead of /usr/bin — so linking a
+// launcher there would let that user leave a `k3sm` for the next `sudo k3sm …`
+// to run as root. k3sm refuses, and since the operator has to repair a directory
+// they did not create, the refusal has to name the path, the property that is
+// wrong and the literal command that fixes it; the old message named only the
+// rule. The verdict is asserted through the PURE function so the root-ownership
+// arm is reachable at all: an unprivileged test cannot chown a temp dir to root.
+//
+// The when: the refusal used to arrive from EnsureSymlink at install step 2b,
+// by which time the service user, the log trees, the run dir, the staged
+// credentials, the binary and the shims were all on disk — a correct refusal
+// that left a half-installed Mac behind. It is now also a read-only preflight
+// beside refuseCrossRole, and the two Install cases below are what say so.
+func TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir(t *testing.T) {
+	const bin = "/usr/local/bin"
+
+	t.Run("verdict", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			dir  string
+			// launcher is the directory the launcher is wanted in. Empty means
+			// it IS dir (the ordinary, unescalated case); a different value is
+			// the escalated one, where dir is only an ancestor.
+			launcher string
+			facts    linkDirFacts
+			euid     int
+			// want are substrings the refusal must carry; empty means the
+			// directory must be ACCEPTED.
+			want []string
+			// notWant are substrings the refusal must NOT carry — the remedies
+			// that would be actively harmful to follow.
+			notWant []string
+		}{
+			{
+				// The Homebrew-on-Intel-prefix Mac this whole check exists for.
+				name:  "user-owned directory, running as root",
+				dir:   bin,
+				facts: linkDirFacts{UID: 501, Mode: 0o755 | fs.ModeDir, IsDir: true},
+				euid:  0,
+				want: []string{
+					bin,
+					"uid 501",
+					"root's PATH",
+					"sudo chown root:wheel " + bin + " && sudo chmod 755 " + bin,
+				},
+			},
+			{
+				name:  "root-owned but group-writable",
+				dir:   bin,
+				facts: linkDirFacts{UID: 0, Mode: 0o775 | fs.ModeDir, IsDir: true},
+				euid:  0,
+				want:  []string{bin, "group-writable", "0775", "root's PATH", "sudo chmod 755 " + bin},
+			},
+			{
+				name:  "root-owned but world-writable",
+				dir:   bin,
+				facts: linkDirFacts{UID: 0, Mode: 0o757 | fs.ModeDir, IsDir: true},
+				euid:  0,
+				want:  []string{bin, "world-writable", "0757", "root's PATH", "sudo chmod 755 " + bin},
+			},
+			{
+				// Lstat, never Stat: whoever can re-point the symlink chooses
+				// where the launcher lands, so the destination's mode says
+				// nothing about the trust of the path.
+				name:  "symlink to a directory",
+				dir:   bin,
+				facts: linkDirFacts{UID: 0, Mode: 0o755 | fs.ModeSymlink, IsDir: true, IsSymlink: true},
+				euid:  0,
+				want:  []string{bin, "is a symlink", "remove " + bin},
+			},
+			{
+				name:  "not a directory",
+				dir:   bin,
+				facts: linkDirFacts{UID: 0, Mode: 0o644},
+				euid:  0,
+				want:  []string{bin, "not a directory", "remove " + bin},
+			},
+			{
+				// ESCALATED: /usr/local/bin is absent, so /usr/local is judged —
+				// and it is a symlink. "remove /usr/local" would be advice to
+				// delete a base system directory (and on a stock Mac /usr/local
+				// may well be a symlink an operator put there deliberately), so
+				// the remedy must be to CREATE the launcher directory instead.
+				name:     "a symlink ancestor is never told to remove itself",
+				dir:      "/usr/local",
+				launcher: bin,
+				facts:    linkDirFacts{UID: 0, Mode: 0o755 | fs.ModeSymlink, IsDir: true, IsSymlink: true},
+				euid:     0,
+				want: []string{
+					bin,
+					"its parent /usr/local",
+					"is a symlink",
+					"sudo mkdir -p " + bin,
+					"sudo chown root:wheel " + bin,
+				},
+				notWant: []string{"remove /usr/local"},
+			},
+			{
+				// The ancestor is not there either. That used to escape as a bare
+				// lstat ENOENT naming a path the operator never asked about; it
+				// is a refusal like any other, and its remedy is the same mkdir.
+				name:     "an absent ancestor is a refusal with a mkdir remedy",
+				dir:      "/usr/local",
+				launcher: bin,
+				facts:    linkDirFacts{Absent: true},
+				euid:     0,
+				want: []string{
+					bin,
+					"/usr/local does not exist",
+					"sudo mkdir -p " + bin,
+					"sudo chmod 755 " + bin,
+				},
+				notWant: []string{"remove /usr/local", "no such file"},
+			},
+			{
+				name:  "root-owned 0755 directory is what install wants",
+				dir:   bin,
+				facts: linkDirFacts{UID: 0, Mode: 0o755 | fs.ModeDir, IsDir: true},
+				euid:  0,
+			},
+			{
+				// The euid arm: an unprivileged caller cannot chown anything, so
+				// demanding root ownership of a directory it could not repair
+				// would refuse installs that are not being performed.
+				name:  "user-owned directory, running unprivileged",
+				dir:   bin,
+				facts: linkDirFacts{UID: 501, Mode: 0o755 | fs.ModeDir, IsDir: true},
+				euid:  501,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := linkDirVerdict(tc.dir, tc.launcher, tc.facts, tc.euid)
+				if len(tc.want) == 0 {
+					if err != nil {
+						t.Fatalf("linkDirVerdict(%q, %q, %+v, %d) = %v, want nil", tc.dir, tc.launcher, tc.facts, tc.euid, err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("linkDirVerdict(%q, %q, %+v, %d) = nil, want a refusal", tc.dir, tc.launcher, tc.facts, tc.euid)
+				}
+				for _, w := range tc.want {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("refusal %q does not name %q", err, w)
+					}
+				}
+				for _, w := range tc.notWant {
+					if strings.Contains(err.Error(), w) {
+						t.Errorf("refusal %q tells the operator to %q", err, w)
+					}
+				}
+			})
+		}
+	})
+
+	// The parent-absent → grandparent rule: when /usr/local/bin does not exist,
+	// the directory whose permissions decide who could create it is /usr/local,
+	// so that is the directory judged and the one the refusal must name.
+	t.Run("absent launcher dir is judged by its parent", func(t *testing.T) {
+		dir, parentAbsent := linkDirTrustTarget(bin+"/k3sm", false)
+		if dir != "/usr/local" || !parentAbsent {
+			t.Fatalf("linkDirTrustTarget(%q, false) = (%q, %v), want (\"/usr/local\", true)", bin+"/k3sm", dir, parentAbsent)
+		}
+		err := linkDirVerdict(dir, bin, linkDirFacts{UID: 501, Mode: 0o755 | fs.ModeDir, IsDir: true}, 0)
+		if err == nil {
+			t.Fatal("a user-owned /usr/local must be refused: that user could create /usr/local/bin and own it")
+		}
+		for _, w := range []string{"/usr/local", "uid 501", "sudo chown root:wheel /usr/local"} {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("refusal %q does not name %q", err, w)
+			}
+		}
+	})
+
+	// The ordering half: a refused launcher directory must stop the install
+	// before it has written anything at all.
+	t.Run("a refused launcher dir leaves nothing on disk", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putLinkDirTrust("/usr/local/bin/k3sm", fmt.Errorf("refusing to link the k3sm launcher into /usr/local/bin: it is owned by uid 501, not root"))
+		err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
+		if err == nil {
+			t.Fatal("Install accepted an untrusted launcher directory")
+		}
+		if !strings.Contains(err.Error(), "uid 501") {
+			t.Errorf("Install error = %v, want the launcher-directory refusal", err)
+		}
+		for _, prefix := range []string{"EnsureServiceUser:", "CopyToRootOwned:", "WriteLaunchDaemon:", "EnsureLogDir:", "EnsureRunDir:", "WriteServiceUserFile:", "EnsureSymlink:"} {
+			for _, c := range f.calls {
+				if strings.HasPrefix(c, prefix) {
+					t.Errorf("install wrote %q after refusing the launcher directory; calls = %v", c, f.calls)
+				}
+			}
+		}
+	})
+
+	// ...and the preflight is a READ, so a healthy Mac — including one being
+	// reinstalled over — passes it and proceeds, twice.
+	t.Run("a healthy install records the read and proceeds", func(t *testing.T) {
+		f := &fakeSystem{}
+		cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+		for _, run := range []string{"install", "reinstall"} {
+			before := len(f.calls)
+			if err := Install(context.Background(), f, cfg); err != nil {
+				t.Fatalf("%s: %v", run, err)
+			}
+			calls := f.calls[before:]
+			probe := idx(calls, "LinkDirTrust:/usr/local/bin/k3sm")
+			if probe < 0 {
+				t.Fatalf("%s never asked about the launcher directory; calls = %v", run, calls)
+			}
+			user := idx(calls, "EnsureServiceUser:_k3sm:"+DefaultDataRoot)
+			if user < 0 || probe >= user {
+				t.Errorf("%s asked about the launcher directory at %d, after the first write at %d; the refusal must precede every write", run, probe, user)
+			}
+			if link := idx(calls, "EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm"); link < 0 {
+				t.Errorf("%s never laid down the launcher; calls = %v", run, calls)
+			}
 		}
 	})
 }
