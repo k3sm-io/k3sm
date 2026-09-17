@@ -50,13 +50,37 @@ On the agent Mac, put the token in a file only root can read, then install the a
 sudo sh -c 'umask 077; cat > /var/root/k3sm-join-token'   # paste the token, then press Ctrl-D
 sudo k3sm install --agent \
   --server <server-underlay-ip> \
-  --node-ip <this-macs-underlay-ip> \
+  --node-ip <this-macs-mesh-address> \
   --token-file /var/root/k3sm-join-token
 ```
 
 `--server` is the control-plane Mac's **underlay** address (a LAN IP or DNS name, no scheme, no
-port). The join dials `<server>:9345`, not the apiserver's `:6443`. `--node-ip` is **required**. It
-is this Mac's own underlay address, bound into the certs the join issues.
+port). The join dials `<server>:9345`, not the apiserver's `:6443`. `--node-ip` is **required**,
+and unlike `--server` it does not name this Mac's own LAN address at all: it is the **mesh**
+address the server is going to assign this node once it joins, the address the node will hold
+inside the cluster's wireguard mesh range (100.64.0.0/10 by default; there is no flag to change
+that range). Today you have to work that address out and supply it yourself, because it gets
+bound into the certificate the join issues; a future release will remove this step by letting the
+join pick the address itself.
+
+Work it out on the server Mac before running the install above:
+
+```sh
+k3sm kubectl get meshpeers
+```
+
+Every node already in the mesh shows up here with a `PODCIDR` column, a /24 carved out of the mesh
+range in the order nodes joined: the first node holds `100.64.0.0/24`, the second `100.64.1.0/24`,
+and so on. Find the lowest number in the third position that is **not** already listed, that is
+this new node's index, and its mesh address is the first host address in that node's /24 (the
+address ending in `.1`). For example: if `get meshpeers` lists one existing peer at
+`100.64.0.0/24`, the new node is index 1, its pod range is `100.64.1.0/24`, and its mesh address
+is `100.64.1.1`, so you would pass `--node-ip 100.64.1.1`.
+
+Getting this wrong does not fail the install: the join still succeeds, but it mints a certificate
+for an address this node does not actually hold on the mesh. If the node can't be reached over the
+mesh once it is up, that is the first thing to check; re-run the install with the correct
+`--node-ip`.
 
 `--agent` installs the `io.k3sm.agent` LaunchDaemon, so the worker starts at boot and is restarted
 if it exits, exactly as the control plane is on the server Mac. A Mac is one role or the other: an
