@@ -531,6 +531,11 @@ func (f *fakeSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	return nil
 }
 
+func (f *fakeSystem) FlushMeshPFAnchor() error {
+	f.calls = append(f.calls, "FlushMeshPFAnchor")
+	return nil
+}
+
 // TestInstallOrchestration proves the install drives the seam in the right
 // ORDER: ensure _k3sm → copy binary root-owned → write both plists → bootstrap
 // netd BEFORE server → write the admin kubeconfig to the HUMAN (not root).
@@ -730,6 +735,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveSymlink:/usr/local/bin/k3sm",
 		"RemoveAll:/Library/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
+		// The mesh pf anchor flush (B274) is the uninstall backstop for the
+		// MSS-clamp rule netd's own shutdown path never reaches.
+		"FlushMeshPFAnchor",
 		// The lo0 flush covers the pinned pod aggregate + the Service CIDR — the
 		// pod /32s, the API/DNS VIPs, and the node mesh-egress .1 (which the pod
 		// stale-sweep deliberately never touches) all fall inside these two.
@@ -741,6 +749,27 @@ func TestUninstallIdempotent(t *testing.T) {
 	// Second run is safe (bootout of a not-loaded label is a no-op in the real impl).
 	if err := Uninstall(context.Background(), &fakeSystem{}, Config{}); err != nil {
 		t.Errorf("second Uninstall must be idempotent, got %v", err)
+	}
+}
+
+// TestUninstallFlushesTheMeshPFAnchor proves Uninstall calls FlushMeshPFAnchor
+// exactly once — the B274 backstop for the mesh MSS-clamp pf anchor, which
+// outlives netd (only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no
+// signal path ever calls it) and would otherwise survive scoped to a utun
+// number macOS recycles onto an unrelated tunnel.
+func TestUninstallFlushesTheMeshPFAnchor(t *testing.T) {
+	f := &fakeSystem{}
+	if err := Uninstall(context.Background(), f, Config{}); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	n := 0
+	for _, c := range f.calls {
+		if c == "FlushMeshPFAnchor" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("FlushMeshPFAnchor called %d times, want exactly 1 (calls: %v)", n, f.calls)
 	}
 }
 

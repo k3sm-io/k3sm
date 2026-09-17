@@ -448,6 +448,17 @@ type System interface {
 	// It inspects the live interface (ifconfig) rather than walking ranges, so it
 	// removes exactly what exists. A no-op when nothing matches.
 	FlushLo0Aliases(prefixes []netip.Prefix) error
+	// FlushMeshPFAnchor is the uninstall backstop for the mesh's MSS-clamp pf
+	// anchor (darwin-net's mesh.PFAnchor, "io.k3sm.mesh"), which outlives netd:
+	// the anchor is loaded against a utun interface number, and only the
+	// RemoveMesh RPC — not a daemon shutdown — ever reaches mesh.WGDevice.Down,
+	// which flushes it. Left in place, the rule survives the booted-out daemon
+	// scoped to a utun that no longer exists, and macOS recycles utun numbers —
+	// so the next tunnel that is assigned that same number silently inherits a
+	// stale MSS clamp. Best-effort like FlushLo0Aliases: an anchor that was
+	// never loaded is a no-op (pfctl succeeds flushing zero rules), and a
+	// pfctl failure is reported but never stops the rest of uninstall.
+	FlushMeshPFAnchor() error
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1178,21 +1189,26 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 // used to assert the opposite — "netd's SIGTERM handler then flushes lo0/pf/utun"
 // — and believing it is how the residue below went unaccounted for.
 //
-// So a booted-out netd leaves durable kernel state, and uninstall removes exactly
-// one class of it:
+// So a booted-out netd leaves durable kernel state, and uninstall removes two
+// classes of it:
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
-//   - the mesh MSS-clamp pf anchor — NOT removed. It survives netd, scoped to a
-//     utun that is gone, until something flushes the anchor or the host reboots.
+//   - the mesh MSS-clamp pf anchor — SWEPT, by the FlushMeshPFAnchor backstop
+//     below (B274). Left alone it survives netd, scoped to a utun that is gone,
+//     and macOS recycles utun numbers — the next tunnel assigned that number
+//     silently inherits the stale clamp. A daemon-shutdown-path fix was
+//     considered and rejected: a restart already self-heals, because Up
+//     reloads the anchor for the current interface on every daemon start, so
+//     the uninstall backstop is the only place the residue is user-visible.
 //   - the wireguard utun and its routes — NOT explicitly removed. The interface
 //     is created in-process (tun.CreateTUN) and goes away with netd, and the
 //     kernel drops routes whose interface has vanished; nothing here proves the
 //     routing table is clean, only that no rule keeps it dirty.
 //
-// Flushing those on the way out is a darwin-net change (a shutdown hook that
-// reaches Down), not an installer one, and is filed separately. Uninstall makes
-// no claim to do it.
+// Flushing the utun/routes class on the way out (if it ever proves necessary)
+// is a darwin-net change (a shutdown hook that reaches Down), not an installer
+// one, and would be filed separately. Uninstall makes no claim to do it.
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
 	var firstErr error
@@ -1277,6 +1293,11 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
 	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
+	// Backstop: flush the mesh MSS-clamp pf anchor (B274). It outlives netd —
+	// only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no signal path
+	// ever calls it — so a booted-out daemon leaves the anchor loaded against a
+	// utun number macOS will eventually recycle onto an unrelated tunnel.
+	note(sys.FlushMeshPFAnchor())
 	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
 	// no daemon removes on the way out — netd tracks per-connection alias caps
 	// (not cleanup), the server's pod teardown misses anything a failed run
