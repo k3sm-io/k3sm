@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/k3sm/pkg/certs"
@@ -1167,6 +1168,10 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 // the admin kubeconfig to the human's home. The caller has already verified root.
 func Install(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
+	// Taken before anything is written, and carried to the post-restart
+	// verification: it is what separates a failure THIS install caused from one
+	// the machine was already living with (see verifyServerNotParked).
+	startedAt := time.Now()
 	if cfg.BinarySource == "" {
 		return fmt.Errorf("install: BinarySource (the k3sm binary to install) is required")
 	}
@@ -1456,7 +1461,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     reports success having left a daemon down is worse than one that fails:
 	//     the operator walks away, and the breakage surfaces later as something
 	//     else entirely (a cluster whose DNS stopped answering).
-	if err := verifyDaemons(ctx, sys, cfg, m); err != nil {
+	if err := verifyDaemons(ctx, sys, cfg, m, startedAt); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 

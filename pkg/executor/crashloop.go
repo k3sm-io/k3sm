@@ -72,10 +72,29 @@ const (
 	crashLoopFile = "crashloop.json"
 )
 
-// Crash is one component exit the breaker counted.
+// The two ways the daemon can fail, which the record keeps apart because the
+// remedy conversation differs: a component that came up and later died is a
+// crash, and one that never came up at all is a bring-up failure an operator
+// will look for in a different part of the log. The give-up is the same for
+// both — the breaker counts them together and the park ends the same way.
+const (
+	// CrashOriginCrash is a component that was supervised and then exited
+	// (OnComponentExit's path).
+	CrashOriginCrash = "crash"
+	// CrashOriginBringUp is a bring-up that never reached supervision: a
+	// provision step or a component that would not start, listen, or stay up
+	// (BringUpError's path).
+	CrashOriginBringUp = "bring-up"
+)
+
+// Crash is one control-plane failure the breaker counted.
 type Crash struct {
 	At        time.Time `json:"at"`
 	Component string    `json:"component"`
+	// Origin is CrashOriginCrash or CrashOriginBringUp. It is omitempty, and an
+	// empty value reads as a crash: records written before the daemon counted
+	// bring-up failures hold only crashes.
+	Origin string `json:"origin,omitempty"`
 	// Detail is the redacted, byte-capped log tail OnComponentExit received —
 	// the same bytes that reach the daemon logger, never the raw component log.
 	Detail string `json:"detail,omitempty"`
@@ -92,6 +111,19 @@ type CrashRecord struct {
 // CrashLoopPath is the record's path for a control-plane work dir.
 func CrashLoopPath(workDir string) string { return filepath.Join(workDir, crashLoopFile) }
 
+// ParseCrashRecord decodes a record from its on-disk bytes. It is exported for
+// the readers that reach the file through a filesystem seam of their own — the
+// installer's root-privileged System.ReadFile, which is how `k3sm install`
+// checks that the server it just restarted is not parked — so those readers
+// share this decoder instead of re-deriving the shape.
+func ParseCrashRecord(b []byte) (CrashRecord, error) {
+	var r CrashRecord
+	if err := json.Unmarshal(b, &r); err != nil {
+		return CrashRecord{}, err
+	}
+	return r, nil
+}
+
 // ReadCrashRecord loads the record at path. An absent file is an empty record,
 // not an error; an unreadable or malformed one is returned as an error so a
 // caller can decide (the daemon treats a malformed record as empty and logs it,
@@ -106,7 +138,8 @@ func ReadCrashRecord(path string) (CrashRecord, error) {
 	if err != nil {
 		return r, err
 	}
-	if err := json.Unmarshal(b, &r); err != nil {
+	r, err = ParseCrashRecord(b)
+	if err != nil {
 		return CrashRecord{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return r, nil
@@ -155,10 +188,13 @@ func (r *CrashRecord) Prune(now time.Time) {
 	r.Crashes = kept
 }
 
-// Record appends one crash, prunes, and trips the breaker when the window now
-// holds the threshold. It reports whether THIS call tripped it.
-func (r *CrashRecord) Record(now time.Time, component, detail string) (tripped bool) {
-	r.Crashes = append(r.Crashes, Crash{At: now, Component: component, Detail: detail})
+// Record appends one failure, prunes, and trips the breaker when the window now
+// holds the threshold. It reports whether THIS call tripped it. origin is
+// CrashOriginCrash or CrashOriginBringUp — a required argument rather than a
+// default, because the caller is the only one that knows which of the two it
+// observed.
+func (r *CrashRecord) Record(now time.Time, origin, component, detail string) (tripped bool) {
+	r.Crashes = append(r.Crashes, Crash{At: now, Origin: origin, Component: component, Detail: detail})
 	r.Prune(now)
 	if r.TrippedAt == nil && len(r.Crashes) >= CrashLoopThreshold {
 		t := now
