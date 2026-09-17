@@ -1440,6 +1440,10 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// A pod that asked for the developer toolchain and got none still runs; say so
 	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
 	r.warnXcodeToolchainUngranted(ctx, pod, box)
+	// A container whose entrypoint is a macOS platform binary silently loses the
+	// DNS shim it was given; say so on the pod, once, at create. Degrade-not-fail,
+	// same shape as the toolchain warning above.
+	r.warnRestrictedShellEntrypoint(ctx, pod, box)
 
 	// The GPU memory fit is sized BEFORE the lock, because the ceiling costs an RPC
 	// and a blocking call inside r.mu would stall every other pod operation on this

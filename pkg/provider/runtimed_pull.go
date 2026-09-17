@@ -1103,10 +1103,11 @@ func (r *runtimedRuntime) attemptPull(ctx context.Context, t *podTrack, podID, i
 // completes it exactly as CreatePod would have.
 //
 // It repeats CreatePod's address allocation and translation rather than sharing
-// its whole body on purpose: the three refusals CreatePod makes BEFORE the RPC —
-// the emptyDir-medium preflight, the image-platform preflight and the
-// Xcode-toolchain warning — are decided by this pod's spec and annotations and
-// this node's capabilities, none of which a retry can have changed, and the preflight's contract is that a pod it refuses leaves
+// its whole body on purpose: the four checks CreatePod makes BEFORE the RPC —
+// the emptyDir-medium preflight, the image-platform preflight, the
+// Xcode-toolchain warning and the restricted-shell-entrypoint warning — are
+// decided by this pod's spec and annotations and this node's capabilities,
+// none of which a retry can have changed, and the preflight's contract is that a pod it refuses leaves
 // no track at all. Re-running them here would either re-warn on every retry or
 // have to un-track a pod that is already tracked.
 //
