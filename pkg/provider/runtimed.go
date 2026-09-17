@@ -1416,7 +1416,8 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod never mints a token or re-reads a ConfigMap/Secret through it:
 	// runtimed's UpdatePod applies labels/annotations only (its updatableOnly
-	// check rejects any other field change as NOT_UPDATABLE), and volumes
+	// check rejects any other field change as NOT_UPDATABLE; pinned there by
+	// TestUpdatePodNeverMaterializes in pkg/runtime), and volumes
 	// materialize exactly once, at create — nothing on any path re-resolves
 	// ConfigMap, Secret, or projected ServiceAccount-token DATA afterward (the
 	// provider's periodic loop is status-only). Consequence: a pod created

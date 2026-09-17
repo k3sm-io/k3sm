@@ -117,10 +117,16 @@ func rematerializePod(ns, name string) *corev1.Pod {
 	}
 }
 
-// TestUpdatePodDoesNotRematerializeVolumes pins B233's contract: an UpdatePod
-// that changes only labels/annotations must reach the runtime with a PodBox
-// that is byte-identical to the one CreatePod sent, save for those two fields —
-// and must not touch the apiserver at all on the volume path.
+// TestUpdatePodDoesNotRematerializeVolumes pins the PROVIDER half of B233's
+// contract: an UpdatePod that changes only labels/annotations must reach the
+// runtime with a PodBox that is byte-identical to the one CreatePod sent, save
+// for those two fields, must issue no further CreatePod, and must not mint a
+// token or read a ConfigMap/Secret through the apiserver on the way. The other
+// half — that runtimed itself never re-materializes on update — is pinned where
+// the materializer lives, by TestUpdatePodNeverMaterializes in runtimed's
+// pkg/runtime, whose spy records the create-time resolution and asserts it does
+// not move; this test's apiserver assertions are the provider-side fence for a
+// future buildBox change, not that proof.
 func TestUpdatePodDoesNotRematerializeVolumes(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	// A minimal TokenRequest reactor. It exists ONLY so that the B233 brief's
