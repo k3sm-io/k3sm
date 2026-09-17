@@ -185,3 +185,33 @@ func TestManifestDataVolumeEntries(t *testing.T) {
 		}
 	})
 }
+
+// TestManifestServerArgsRecordEntry pins the server-arguments record's place in
+// the manifest: present on EVERY Mac (every install writes one), preserved (an
+// uninstall that removed it would put the next install back to re-rendering the
+// stock template), and outside every tree the uninstall sweep removes.
+func TestManifestServerArgsRecordEntry(t *testing.T) {
+	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}.withDefaults()
+
+	var entry artifact
+	for _, a := range artifactManifest(cfg) {
+		if a.path == cfg.ServerArgsRecord {
+			entry = a
+		}
+	}
+	if entry.path == "" {
+		t.Fatalf("the manifest has no entry for the server-arguments record %q", cfg.ServerArgsRecord)
+	}
+	if entry.kind != kindFile {
+		t.Errorf("kind = %v, want kindFile", entry.kind)
+	}
+	if entry.disp != dispPreserve {
+		t.Errorf("disposition = %v, want dispPreserve (uninstall keeps the operator's flags)", entry.disp)
+	}
+	if entry.assertExists {
+		t.Error("existence must not be asserted: a Mac installed by an older k3sm has no record")
+	}
+	if strings.HasPrefix(cfg.ServerArgsRecord, cfg.InstallDir+"/") || strings.HasPrefix(cfg.ServerArgsRecord, cfg.DataRoot+"/") {
+		t.Errorf("the record at %q must live outside both the swept install dir and the service-user-owned data root", cfg.ServerArgsRecord)
+	}
+}

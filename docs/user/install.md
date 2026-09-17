@@ -86,9 +86,35 @@ It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes th
 `/usr/local/bin/k3sm` launcher, but only that link, and only while it still points at
 `/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
 left exactly as it is. Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
-reinstall picks up where you left off. If you installed a data volume, it stays mounted and
-declared; the command prints `sudo k3sm install --data-volume` to reinstall onto it and `sudo k3sm
-datavol delete --yes` to remove it for good.
+reinstall picks up where you left off. The command prints the full list of what it kept. If you
+installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
+--data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
+
+### Server Flags Across A Reinstall
+
+Any flag you added to the server daemon yourself, such as `--mesh-ip` or `--registry-port`, is
+carried into the plist every install renders. Install reads them from the installed daemon, and
+records them in `/Library/Preferences/io.k3sm.server-args.json`, so they survive an uninstall too.
+That file is root-owned and root-readable only, because a flag can carry a credential. `k3sm status`
+shows what the installed server is running with, on the `server-args` row.
+
+The record is written at install time. A flag you edit directly into the daemon's plist is picked up
+by the next `sudo k3sm install`, and until then it exists only in the plist, so an uninstall before
+that install loses it. Running `sudo k3sm install` after an edit is what makes it durable.
+
+The installed daemon wins while it is there, so a reset means clearing both sources:
+
+```sh
+sudo k3sm uninstall                                          # removes the daemon and its flags
+sudo rm /Library/Preferences/io.k3sm.server-args.json        # discards the recorded ones
+sudo k3sm install                                            # renders the stock template
+```
+
+That discards the flags the file lists, and nothing else. Your cluster data is untouched.
+
+Install warns when it finds neither source on a data root that already holds cluster state, which is
+what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install
+says so rather than starting single-node in silence.
 
 ## Verifying
 

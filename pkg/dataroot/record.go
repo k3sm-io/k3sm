@@ -103,27 +103,45 @@ func WriteRecord(path string, r Record) error {
 		return fmt.Errorf("encode data volume record: %w", err)
 	}
 	data = append(data, '\n')
+	return writeFileAtomic(path, ".io.k3sm.datavol-*.json", 0o644, data, "data volume record")
+}
 
+// writeFileAtomic installs data at path through a temp file in the SAME
+// directory and a rename, at mode 0644. It is the one atomic-write this package
+// has: both records it writes are declarations another process reads without
+// coordination, so a reader must see either the old file or the new one and
+// never a partial write — and two copies of that dance would be two chances to
+// get it subtly different.
+//
+// pattern is the os.CreateTemp pattern (it must keep the .json suffix, so a
+// crash leaves something an operator can recognise); mode is the installed
+// file's permission bits, which differ per record (0644 for the data-volume
+// declaration, 0600 for the server arguments, which can carry a credential);
+// what names the record in every error message.
+//
+// The temp file is created 0600 by os.CreateTemp and only widened at the end, so
+// a record that must stay root-only is never briefly readable.
+func writeFileAtomic(path, pattern string, mode fs.FileMode, data []byte, what string) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".io.k3sm.datavol-*.json")
+	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
-		return fmt.Errorf("create temp data volume record in %s: %w", dir, err)
+		return fmt.Errorf("create temp %s in %s: %w", what, dir, err)
 	}
 	name := tmp.Name()
 	defer func() { _ = os.Remove(name) }() // no-op once the rename succeeded
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("write temp data volume record %s: %w", name, err)
+		return fmt.Errorf("write temp %s %s: %w", what, name, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp data volume record %s: %w", name, err)
+		return fmt.Errorf("close temp %s %s: %w", what, name, err)
 	}
-	if err := os.Chmod(name, 0o644); err != nil {
-		return fmt.Errorf("chmod temp data volume record %s: %w", name, err)
+	if err := os.Chmod(name, mode); err != nil {
+		return fmt.Errorf("chmod temp %s %s: %w", what, name, err)
 	}
 	if err := os.Rename(name, path); err != nil {
-		return fmt.Errorf("install data volume record %s: %w", path, err)
+		return fmt.Errorf("install %s %s: %w", what, path, err)
 	}
 	return nil
 }

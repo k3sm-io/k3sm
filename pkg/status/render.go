@@ -51,14 +51,14 @@ const (
 // answer, and it would spend a line saying so on every healthy cluster. It is
 // still in the JSON, still in the cluster view, and still in the verdict.
 var overviewRows = []string{
-	RowInstall, RowNetd, RowServer, RowAPIServer,
+	RowInstall, RowNetd, RowServer, RowServerArgs, RowAPIServer,
 	RowNode, RowWorkloads, RowDataRoot, RowPreVolume, RowDatastore, RowKubeconfig,
 }
 
 // daemonViewRows are the rows `k3sm status daemons` expands. datavol leads,
 // mirroring install's own order: it is the job that has to have run before the
 // other two can do anything with the data root.
-var daemonViewRows = []string{RowInstall, RowDatavol, RowNetd, RowServer, RowDataRoot}
+var daemonViewRows = []string{RowInstall, RowDatavol, RowNetd, RowServer, RowServerArgs, RowDataRoot}
 
 // clusterViewRows are the rows `k3sm status cluster` expands.
 //
