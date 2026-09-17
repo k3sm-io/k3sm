@@ -140,6 +140,21 @@ type meshBringUp struct {
 	// firstSyncTimeout bounds the wait for that live list. Zero means
 	// meshFirstSyncTimeout; tests inject a small value.
 	firstSyncTimeout time.Duration
+	// onLivePeers persists the live list the resume path just programmed, so the
+	// stored seed advances instead of staying pinned to the original join.
+	//
+	// It is a HOOK rather than a store reference because this struct is the
+	// device's input and knows nothing about credential files — and because only
+	// one of the three bring-up paths has anything to persist: the server
+	// synthesizes its peers locally and holds no node credential, and a token
+	// join has already written the live snapshot the join returned. Nil on both,
+	// which is also what every device-level unit test wants.
+	//
+	// It is called at most ONCE per bring-up, on the live list, and its error is
+	// logged rather than returned: the device is already programmed correctly by
+	// the time it runs, so a failure costs only a staler fallback on the NEXT
+	// start, which is exactly the state this hook exists to improve on.
+	onLivePeers func(peers []netv1.MeshPeerSpec) error
 	// listenPort is the UDP port this node's wireguard binds.
 	listenPort int
 	// kubeconfig authenticates the MeshPeer watch that keeps the peer set
