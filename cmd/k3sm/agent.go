@@ -202,6 +202,61 @@ func runAgent(args []string) error {
 	return err
 }
 
+// netdProbeGrace and netdProbeInterval bound the wait for the root netd helper
+// at the top of an agent start.
+//
+// A worker dials the helper socket before it does anything else, and on
+// 2026-09-17 an install bootstrapped io.k3sm.netd and io.k3sm.agent 24ms apart:
+// the agent's dial failed with "no such file", the start was recorded as a
+// bring-up failure, and launchd's own throttle brought it back ten seconds
+// later against a netd that was by then listening. The cluster was fine; the
+// record was not, and `k3sm install` reads that record to decide whether this
+// node joined.
+//
+// `k3sm install` now waits for the socket before it starts this daemon
+// (pkg/install's awaitNetdServing), so the two orderings agree. This grace is
+// the daemon's own half, and it matters for the starts install is not driving:
+// a reboot, a `launchctl kickstart`, a helper an operator restarted underneath
+// a running worker. Ten seconds is deliberately shorter than the terminal
+// backoff a start failure would cost (30s) and shorter still than launchd's
+// respawn throttle — a helper that is merely a second late costs a few polls
+// instead of a recorded failure, and one that is genuinely not coming back is
+// still reported inside the same minute.
+const (
+	netdProbeGrace    = 10 * time.Second
+	netdProbeInterval = 500 * time.Millisecond
+)
+
+// awaitNetdHelper retries probe until it succeeds or grace runs out, and
+// returns the LAST failure so the start reports why the helper never answered
+// rather than why one arbitrary attempt did not.
+//
+// The probe is a parameter rather than a hostnet.Mode so a test can state "the
+// helper answers on the third attempt" without a socket; the production caller
+// passes Mode.Probe, which is a no-op for the backends that run no helper, so
+// this costs those postures exactly one call.
+func awaitNetdHelper(ctx context.Context, probe func(context.Context) error, grace, interval time.Duration, logger *slog.Logger) error {
+	deadline := time.Now().Add(grace)
+	for attempt := 1; ; attempt++ {
+		err := probe(ctx)
+		if err == nil {
+			if attempt > 1 {
+				logger.Info("the netd helper answered", "attempts", attempt)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w (waited %s across %d attempts; the helper is io.k3sm.netd and its log is %s)", err, grace, attempt, install.NetdLogPath())
+		}
+		logger.Info("the netd helper is not answering yet; waiting for it rather than failing this start", "err", err, "attempt", attempt, "grace", grace)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
 // agentStart is runAgent's body: everything from the pod-root resolution to the
 // Virtual Kubelet registration that blocks for the life of the node. It returns
 // every start failure to runAgent rather than recording them itself, so there is
@@ -241,7 +296,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		return err
 	}
 	logger.Info("host-network backend", "network", opts.network, "backend", mode.Backend.String())
-	if err := mode.Probe(ctx); err != nil {
+	if err := awaitNetdHelper(ctx, mode.Probe, netdProbeGrace, netdProbeInterval, logger); err != nil {
 		return err
 	}
 

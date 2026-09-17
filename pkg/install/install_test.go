@@ -93,6 +93,15 @@ type fakeSystem struct {
 	// It is consulted after the queue, so a test can describe "transient twice,
 	// then permanently broken" if it needs to.
 	bootstrapAlways map[string]error
+	// netdRefusals[path] is how many ProbeNetd attempts are refused before netd
+	// is listening. It is 0 by default, so an unconfigured fake describes a
+	// helper that is already serving and no pre-existing test has to say
+	// anything about it.
+	netdRefusals map[string]int
+	// wedgedSockets are sockets that CONNECT and never answer — bound by a netd
+	// that is not serving. They are the case a connect-only probe cannot see, so
+	// the fake has to be able to state it.
+	wedgedSockets map[string]bool
 	// missingPaths are paths PathExists reports absent. The zero value reports
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
@@ -680,6 +689,47 @@ func (f *fakeSystem) PathExists(path string) (bool, error) {
 	return !f.missingPaths[path], nil
 }
 
+// ProbeNetd answers SERVING for every socket a test has not said otherwise
+// about, so an unconfigured fake keeps describing a helper that is already up.
+// A socket hidden with putMissingPath cannot be probed at all (nothing is on
+// disk to connect to), and a WEDGED one connects and never answers — the state
+// a dial-only probe could not tell from a healthy daemon.
+func (f *fakeSystem) ProbeNetd(path string) error {
+	f.calls = append(f.calls, "ProbeNetd:"+path)
+	if f.missingPaths[path] {
+		return fmt.Errorf("dial unix %s: %w", path, fs.ErrNotExist)
+	}
+	if f.wedgedSockets[path] {
+		return fmt.Errorf("accepted the connection but did not answer within 1s (a socket that is bound while its daemon is not serving)")
+	}
+	if n := f.netdRefusals[path]; n > 0 {
+		f.netdRefusals[path] = n - 1
+		return fmt.Errorf("dial unix %s: connection refused", path)
+	}
+	return nil
+}
+
+// putNetdRefusals makes the next refusals probes of path fail before netd is
+// listening at all — the window between launchd spawning the helper and the
+// helper binding its socket, which is the ordinary reason the node daemon waits.
+func (f *fakeSystem) putNetdRefusals(path string, refusals int) {
+	if f.netdRefusals == nil {
+		f.netdRefusals = map[string]int{}
+	}
+	f.netdRefusals[path] = refusals
+}
+
+// putWedgedSocket makes path connect and never answer: netd bound its socket and
+// then stopped serving. The kernel completes a connect into the listen backlog
+// with no involvement from the daemon, so this is precisely the state a
+// dial-only probe reports as healthy.
+func (f *fakeSystem) putWedgedSocket(path string) {
+	if f.wedgedSockets == nil {
+		f.wedgedSockets = map[string]bool{}
+	}
+	f.wedgedSockets[path] = true
+}
+
 func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) error {
 	f.calls = append(f.calls, "WriteUserKubeconfig:"+targetUser)
 	f.kubeUser = targetUser
@@ -1075,6 +1125,13 @@ func TestInstallOrchestration(t *testing.T) {
 		"ServicePID:io.k3sm.netd",
 		"Bootstrap:io.k3sm.netd",
 		"ServicePID:io.k3sm.netd",
+		// ...and then the wait the node daemon's own start depends on: netd must
+		// ANSWER on the helper socket before io.k3sm.server is bootstrapped into
+		// it. A pid says the helper process was spawned and a connect says only
+		// that the kernel queued it; one framed round trip is what says netd is
+		// serving, and a node daemon that starts before that records the refusal
+		// as a bring-up failure of its own.
+		"ProbeNetd:/var/lib/k3sm/run/netd.sock",
 		"Bootout:io.k3sm.server",
 		"ServicePID:io.k3sm.server",
 		"Bootstrap:io.k3sm.server",

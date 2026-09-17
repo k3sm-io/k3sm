@@ -125,23 +125,95 @@ func restartBudgetFor(label string) restartBudget {
 // every such label best-effort and names the outcome in the error, so an operator
 // reading one sentence knows which daemons are running — the state-honesty the old
 // mid-loop return had none of.
-func restartDaemons(ctx context.Context, sys System, m []artifact, logger *slog.Logger) error {
+func restartDaemons(ctx context.Context, sys System, cfg Config, m []artifact) error {
+	logger := cfg.Logger
 	var touched []string
+	// stateHonestly turns any failure in this sequence into the one-sentence
+	// report the whole function exists for: what went wrong, what was
+	// re-bootstrapped, and which daemons are up right now.
+	stateHonestly := func(err error) error {
+		recovery := recoverBootedOut(sys, touched)
+		states, _ := daemonStates(sys, longRunningDaemonLabels(m))
+		return fmt.Errorf("%w; %s; daemon state: %s", err, recovery, strings.Join(states, ", "))
+	}
+	netdRestarted := false
 	for _, a := range m {
 		if a.kind != kindDaemon {
 			continue
+		}
+		// The node daemon dials netd before it does anything else, so it does not
+		// go until netd ANSWERS. Nothing used to wait here at all: the only socket
+		// check was verifyDaemons', which runs after both daemons are already up.
+		if netdRestarted && isNodeDaemon(a.label) {
+			if err := awaitNetdServing(ctx, sys, cfg.NetdSocket, a.label, restartBudgetFor(NetdLabel)); err != nil {
+				return stateHonestly(err)
+			}
+			logger.Info("netd answered on the helper socket; starting the node daemon", "socket", cfg.NetdSocket, "label", a.label)
 		}
 		// Recorded BEFORE the attempt: the bootout is the first thing restartDaemon
 		// does, so a failure anywhere in the sequence — including in the bootout
 		// itself — can have left this label down.
 		touched = append(touched, a.label)
 		if err := restartDaemon(ctx, sys, a.label, a.oneshot, logger); err != nil {
-			recovery := recoverBootedOut(sys, touched)
-			states, _ := daemonStates(sys, longRunningDaemonLabels(m))
-			return fmt.Errorf("%w; %s; daemon state: %s", err, recovery, strings.Join(states, ", "))
+			return stateHonestly(err)
+		}
+		if a.label == NetdLabel {
+			netdRestarted = true
 		}
 	}
 	return nil
+}
+
+// isNodeDaemon reports whether label is the role's node daemon — the one that
+// dials netd on the way up. It is derived from the two labels rather than from
+// the manifest position, because the manifest carries whichever of the two this
+// role installs and a positional rule would silently mean something else on the
+// other role.
+func isNodeDaemon(label string) bool { return label == ServerLabel || label == AgentLabel }
+
+// awaitNetdServing blocks until the netd helper ANSWERS on its unix socket, and
+// is the gap between the two daemons the restart sequence used to leave open.
+//
+// On 2026-09-17 an install bootstrapped io.k3sm.netd and then io.k3sm.agent 24ms
+// later. The agent's first start dialed the helper socket, got "no such file",
+// recorded a bring-up failure and backed off; launchd's KeepAlive retry brought
+// it up ten seconds later against a netd that by then was listening. Nothing was
+// broken afterwards — but the install had recorded a failure it caused, and the
+// join verification reads that record. The server role never hit it only because
+// its own bring-up takes some 37 seconds, which is luck, not ordering.
+//
+// NEITHER PRESENCE NOR A CONNECT IS THE QUESTION. verifyDaemons' awaitPath
+// (which still runs, on the far side of both restarts) asks whether the socket
+// file is there; a bound socket exists on the filesystem from the moment netd
+// binds it, which is before it accepts. And a connect is barely better: the
+// kernel completes it into the listen backlog with no involvement from the
+// process that bound the socket, so a netd that is listening and wedged passes a
+// dial-only check while serving nothing. So this wait asks netd to ANSWER — one
+// framed request, one reply (System.ProbeNetd) — and only an answer ends it.
+//
+// The bound is netd's own restart budget — the same window the caller already
+// allows that daemon to come up in — so a helper that never answers fails the
+// install here, naming the socket and the log that says why, instead of letting
+// the node daemon start into the failure and record it as its own.
+func awaitNetdServing(ctx context.Context, sys System, socket, label string, b restartBudget) error {
+	deadline := time.Now().Add(b.running)
+	var last error
+	for {
+		err := sys.ProbeNetd(socket)
+		if err == nil {
+			return nil
+		}
+		last = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s did not answer on %s within %s of its restart, so %s would start against a helper that is not serving and record the bring-up failure as its own (last probe: %v); the reason is the last lines of %s",
+				NetdLabel, socket, b.running, label, last, NetdLogPath())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(b.poll):
+		}
+	}
 }
 
 // restartDaemon runs one label's bootout → await-unloaded → bootstrap → await-running.
