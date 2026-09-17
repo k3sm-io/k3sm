@@ -42,9 +42,10 @@ func testConfig(t *testing.T) Config {
 
 // configureServerArgs is the operator's own edit to the installed plist: the
 // two flags whose loss is the whole defect, applied the way `PlistBuddy` would.
-func configureServerArgs(f *fakeSystem, cfg Config, token string, args ...string) {
+// It takes no token, because the render carries none: the admin token reaches
+// the daemon as the staged file --token-file names.
+func configureServerArgs(f *fakeSystem, cfg Config, args ...string) {
 	f.putFile(cfg.withDefaults().plistPath(ServerLabel), ServerPlist(Config{
-		AdminToken:      token,
 		ExtraServerArgs: args,
 	}))
 }
@@ -67,15 +68,11 @@ func serverArgsOf(t *testing.T, f *fakeSystem, cfg Config) []string {
 // tokenOf returns the --token the fake's installed server plist carries.
 func tokenOf(t *testing.T, f *fakeSystem, cfg Config) string {
 	t.Helper()
-	raw, ok := f.files[cfg.withDefaults().plistPath(ServerLabel)]
+	raw, ok := f.files[cfg.withDefaults().serverTokenPath()]
 	if !ok {
-		t.Fatal("no server plist was written")
+		t.Fatal("install staged no admin token")
 	}
-	args, err := parseProgramArguments(raw)
-	if err != nil {
-		t.Fatalf("parse the installed server plist: %v", err)
-	}
-	return flagValue(args, "token")
+	return strings.TrimSpace(string(raw))
 }
 
 // TestUninstallThenInstallPreservesServerArgs is the gate.
@@ -106,7 +103,7 @@ func TestUninstallThenInstallPreservesServerArgs(t *testing.T) {
 		t.Fatalf("first Install: %v", err)
 	}
 	firstToken := tokenOf(t, f, cfg)
-	configureServerArgs(f, cfg, firstToken, "--mesh-ip", "100.64.0.1", "--registry-port", "5000")
+	configureServerArgs(f, cfg, "--mesh-ip", "100.64.0.1", "--registry-port", "5000")
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("reinstall: %v", err)
 	}
@@ -135,11 +132,12 @@ func TestUninstallThenInstallPreservesServerArgs(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("after uninstall then install the server plist carries %v, want %v", got, want)
 	}
-	// --token stays install-managed: re-minted in lockstep with the kubeconfig,
-	// never carried over from either source.
+	// The admin token stays install-managed: re-minted in lockstep with the
+	// kubeconfig, never carried over from either source, and staged in a file
+	// rather than rendered onto the argv.
 	newToken := tokenOf(t, f, cfg)
 	if newToken == "" || newToken == firstToken {
-		t.Errorf("--token must be re-minted (was %q, now %q)", firstToken, newToken)
+		t.Errorf("the staged admin token must be re-minted (was %q, now %q)", firstToken, newToken)
 	}
 	if !strings.Contains(f.kubeContent, newToken) {
 		t.Error("the admin kubeconfig must carry the re-minted token")
@@ -157,7 +155,7 @@ func TestServerArgsRecordSources(t *testing.T) {
 		// A stale record from an earlier configuration, and a plist the operator
 		// has since edited. The plist is what launchd actually runs.
 		putServerArgsRecord(t, f, recordPath(cfg), "--registry-port", "5000")
-		configureServerArgs(f, cfg, "k3sm-old-token", "--mesh-ip", "100.64.0.2")
+		configureServerArgs(f, cfg, "--mesh-ip", "100.64.0.2")
 
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -352,13 +350,18 @@ func TestRecordCanNeverSetAManagedFlag(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Fatalf("filterManagedServerArgs = %v, want %v", got, want)
 		}
-		// And the render carries only the token this install minted.
-		argv, err := parseProgramArguments(ServerPlist(Config{AdminToken: "k3sm-minted", ExtraServerArgs: got}))
+		// And the render names the staged token file this install wrote, carrying
+		// no token value of any provenance.
+		cfg := Config{AdminToken: "k3sm-minted", ExtraServerArgs: got}
+		argv, err := parseProgramArguments(ServerPlist(cfg))
 		if err != nil {
 			t.Fatalf("parse: %v", err)
 		}
-		if tok := flagValue(argv, "token"); tok != "k3sm-minted" {
-			t.Errorf("rendered --token = %q, want the re-minted one", tok)
+		if path := flagValue(argv, "token-file"); path != cfg.withDefaults().serverTokenPath() {
+			t.Errorf("rendered --token-file = %q, want the staged path", path)
+		}
+		if strings.Contains(strings.Join(argv, " "), "k3sm-minted") {
+			t.Errorf("the rendered argv carries the token VALUE: %v", argv)
 		}
 		if strings.Contains(strings.Join(argv, " "), "evil") {
 			t.Errorf("the rendered argv carries the forged value: %v", argv)
@@ -408,7 +411,7 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
-	configureServerArgs(f, cfg, tokenOf(t, f, cfg), "--datastore-endpoint", dsn)
+	configureServerArgs(f, cfg, "--datastore-endpoint", dsn)
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("reinstall: %v", err)
 	}

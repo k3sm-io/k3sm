@@ -235,12 +235,26 @@ const (
 	// AgentTokenFileMode is the mode of the copy itself: the credential is
 	// readable by exactly the uid that must present it.
 	AgentTokenFileMode fs.FileMode = 0o600
+	// ServerTokenDirMode and ServerTokenFileMode are the same two values for the
+	// control plane's staged static admin token, stated separately rather than
+	// reused under the agent's names because they are a decision about a
+	// DIFFERENT file: the admin token is a system:masters bearer token, so the
+	// posture it needs is if anything stricter than the join token's, never
+	// looser. They are equal by policy, not by accident, and either may move
+	// without dragging the other with it.
+	ServerTokenDirMode  fs.FileMode = 0o700
+	ServerTokenFileMode fs.FileMode = 0o600
 	// agentWorkSubdir is the agent's state root under the data root, the same
 	// directory `k3sm agent --work-dir` defaults to, so the token the installer
 	// stages and the state the agent keeps are one tree rather than two.
 	agentWorkSubdir = "agent"
 	// agentTokenName is the leaf name of the staged token.
 	agentTokenName = "join-token"
+	// serverTokenName is the leaf name of the control plane's staged static
+	// admin token, inside the server work dir for the same reason the agent's
+	// sits in the agent work dir: the credential a daemon presents lives in
+	// that daemon's own state tree.
+	serverTokenName = "token"
 	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
 	// writes on a successful join — see AgentCredentialPath.
 	agentNodeKubeconfigName = "node.kubeconfig"
@@ -522,8 +536,14 @@ type System interface {
 	// The installer needs it for exactly one judgement: whether the operator's
 	// join token file is readable by anyone but its owner.
 	FileMode(path string) (fs.FileMode, error)
-	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
-	WriteLaunchDaemon(plistPath string, contents []byte) error
+	// WriteLaunchDaemon writes a launchd plist root:wheel at plistPath, at mode.
+	//
+	// The mode is a PARAMETER rather than a constant inside the implementation
+	// because it is not one policy: the server plist is 0600 (see plistMode) and
+	// every other plist is PlistMode. Passing it makes the decision visible at
+	// the one call site that takes it, and lets a test assert the mode a given
+	// daemon was laid down at without a real filesystem.
+	WriteLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode) error
 	// ReadFile reads a root-readable file: the installed server plist, whose
 	// operator-supplied arguments a reinstall must carry over; the
 	// server-arguments record that carries those same arguments when no plist
@@ -670,7 +690,13 @@ type Config struct {
 	// owned by. Required for the kubeconfig step; empty skips it with an error.
 	TargetUser string
 	// AdminToken is the static bearer token shared between the server LaunchDaemon
-	// (--token) and the admin kubeconfig. Generated when empty.
+	// and the admin kubeconfig. Generated when empty.
+	//
+	// The daemon is given it as a FILE: Install stages the value at
+	// serverTokenPath() and the plist carries --token-file, so the token itself
+	// is on no argv. The admin kubeconfig still carries the value, by design —
+	// it is a 0600 file in the human's own home and the credential is what
+	// `kubectl` presents.
 	AdminToken string
 	// ExtraServerArgs are operator-supplied `k3sm server` arguments appended to
 	// the fixed set ServerPlist renders (--mesh-ip, --registry-port, …).
@@ -885,6 +911,49 @@ func (c Config) agentTokenPath() string {
 	return filepath.Join(c.DataRoot, agentWorkSubdir, agentTokenName)
 }
 
+// serverTokenPath is where Install stages the static admin token for the
+// control-plane daemon to read: <DataRoot>/server/token, service-user-owned
+// 0600 (see ServerTokenFileMode).
+//
+// It is agentTokenPath's sibling and exists for the same reason the agent's
+// does, one privilege level up. The token is a system:masters bearer token, and
+// rendering it as a VALUE on the server LaunchDaemon's argv published it three
+// ways at once: the plist was root-owned 0644, `ps` shows a running job's argv
+// to every account, and launchd echoes it back from its own job description. The
+// daemon is now told where its token is and never what it is.
+//
+// Like the agent's, the path is derived rather than configured: it is the one
+// path the renderer puts on the argv and the one path the installer writes, and
+// a second spelling of either would be a daemon pointed at a file nobody wrote.
+func (c Config) serverTokenPath() string {
+	return filepath.Join(c.serverWorkDir(), serverTokenName)
+}
+
+// stageTokenFile writes token at dst, owned by the service uid at mode inside a
+// directory at dirMode, so the unprivileged daemon that must present it can read
+// it and nothing else on the Mac can. what names the credential for the error
+// message ("join token", "admin token").
+//
+// It is ONE function for both roles because the two stagings are one decision
+// made twice: a daemon's argv publishes whatever is on it, so the credential
+// goes to a file and the path goes on the argv, and the file is worth preferring
+// only because of the owner and the mode applied here. Two copies of that write
+// would be two chances for one role to stage a credential at a mode the other
+// would have refused.
+//
+// The modes stay PARAMETERS, as they are on the WriteServiceUserFile seam below
+// it and for the same reason: each role's policy is then visible at its own call
+// site rather than decided inside a shared helper neither role reads.
+//
+// The token is written with a trailing newline (both readers trim), and it is
+// never logged or echoed: callers log the PATH.
+func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMode fs.FileMode) error {
+	if err := sys.WriteServiceUserFile(dst, []byte(token+"\n"), uid, mode, dirMode); err != nil {
+		return fmt.Errorf("install: stage the %s at %s: %w", what, dst, err)
+	}
+	return nil
+}
+
 // argsRecordPath is the arguments record THIS role reads and writes: the
 // server record on a control plane, the agent record on a worker. It is an
 // accessor rather than a branch at each use so no code path can pick up the
@@ -937,6 +1006,44 @@ func (c Config) installedVMHost() string {
 // plistPath is the LaunchDaemon plist path for a label.
 func (c Config) plistPath(label string) string {
 	return filepath.Join(c.LaunchDaemonDir, label+".plist")
+}
+
+// The two LaunchDaemon plist modes, and why the control plane's is not the
+// other one.
+//
+// PlistMode is launchd's conventional 0644: root writes it, launchd reads it as
+// root, and anyone may look at it. That is right for a plist whose argv is a set
+// of paths and ports.
+//
+// ServerPlistMode is 0600, because the server plist's argv is the one that
+// carries credentials. Not the admin token any more — that moved to a staged
+// file — but the OPERATOR's preserved arguments, which legitimately include
+// `--datastore-endpoint postgres://user:password@host/db`. pkg/dataroot already
+// keeps the server-arguments record root-only 0600 for exactly that reason
+// (serverArgsRecordMode), and the plist holds the same string, so leaving it
+// 0644 kept a world-readable second copy of what the record is careful about.
+// Nothing but root needs to read it: launchd is root, and `k3sm install` and
+// `k3sm status` read it as root when they can.
+//
+// One consequence is deliberate and visible: `k3sm status` run as an ordinary
+// user can no longer read the server plist, so its server-arguments row reports
+// "unreadable as this user" instead of listing the flags. That row already had
+// that state for exactly this case and it never moves the verdict; `sudo k3sm
+// status` still shows them.
+const (
+	PlistMode       fs.FileMode = 0o644
+	ServerPlistMode fs.FileMode = 0o600
+)
+
+// plistMode is the mode the labelled daemon's plist is written at. It is a
+// function of the LABEL rather than a field on the artifact so a new daemon
+// cannot be added with no decision taken about its mode: it lands on the 0644
+// default, and only a label named here is treated as carrying secrets.
+func plistMode(label string) fs.FileMode {
+	if label == ServerLabel {
+		return ServerPlistMode
+	}
+	return PlistMode
 }
 
 // artifactKind classifies a manifest entry so install/uninstall can perform the
@@ -1092,6 +1199,16 @@ func artifactManifest(cfg Config) []artifact {
 	// assertExists is false: an install that staged no token wrote no file.
 	if cfg.Role == RoleAgent {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.agentTokenPath(), assertExists: false})
+	}
+	// The control plane's staged admin token, the same entry for the other role
+	// and in the same position, for the same reason: it is a system:masters
+	// bearer token with no use once this Mac is no longer a k3sm server, so it
+	// is REMOVED rather than preserved with the rest of the data root, and it is
+	// removed after the daemon that reads it has been booted out.
+	// assertExists is false because a data root an older build installed has no
+	// such file until the next install stages one.
+	if cfg.Role == RoleServer {
+		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 	}
 	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
 	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is
@@ -1275,6 +1392,22 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 
+	// 1f. The control plane's static admin token, staged the same way and for a
+	//     stronger version of the same reason: it authenticates as
+	//     system:masters, and it used to be rendered as a VALUE on the server
+	//     LaunchDaemon's argv, where the 0644 plist, `ps` and launchd's own job
+	//     description each handed it to every account on the Mac. Unlike the
+	//     agent's it is staged on EVERY install, because it is not an operator's
+	//     optional input: it is minted (or carried) by this install and has to be
+	//     the same value the admin kubeconfig written below carries, or every
+	//     admin request is Unauthorized.
+	if cfg.Role == RoleServer {
+		if err := stageTokenFile(sys, uid, cfg.AdminToken, cfg.serverTokenPath(), "admin token", ServerTokenFileMode, ServerTokenDirMode); err != nil {
+			return err
+		}
+		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+	}
+
 	// 2. Copy the binary to the exact path the plists exec (installedBinary()),
 	//    regardless of the source artifact's name. It lands under InstallDir, so
 	//    the InstallDir sweep covers it on uninstall.
@@ -1436,7 +1569,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		if err != nil {
 			return fmt.Errorf("install: %w", err)
 		}
-		if err := sys.WriteLaunchDaemon(a.path, content); err != nil {
+		if err := sys.WriteLaunchDaemon(a.path, content, plistMode(a.label)); err != nil {
 			return fmt.Errorf("install: write %s plist: %w", a.label, err)
 		}
 	}
@@ -1749,7 +1882,14 @@ func ServerPlist(cfg Config) []byte {
 	args := []string{
 		cfg.installedBinary(), "server",
 		"--runtime", "runtimed",
-		"--token", cfg.AdminToken,
+		// The STAGED copy's PATH, never the token value — the agent plist's
+		// contract, applied to the credential that matters most. The token this
+		// names is the static admin bearer token: it authenticates as
+		// system:masters, so a copy of it on a world-readable argv is a copy of
+		// cluster-admin. Install writes the file (serverTokenPath, 0600, owned by
+		// the service user) before this plist is laid down, and the server reads
+		// it once at start through the same reader the agent uses.
+		"--token-file", cfg.serverTokenPath(),
 	}
 	args = append(args, cfg.resolvedExtraServerArgs()...)
 	return renderPlist(launchdPlist{

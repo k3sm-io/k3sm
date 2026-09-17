@@ -12,8 +12,8 @@
     <string>server</string>
     <string>--runtime</string>
     <string>runtimed</string>
-    <string>--token</string>
-    <string>k3sm-fixed</string>
+    <string>--token-file</string>
+    <string>/var/lib/k3sm/server/token</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

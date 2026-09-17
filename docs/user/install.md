@@ -39,7 +39,14 @@ and one residual limitation remains (no per-pod uid isolation).
   profile edit; a terminal that was already open may need `hash -r` or simply a new window. Because
   it is a symlink rather than a copy, the daemons and your shell always run the same binary. If
   something other than a symlink already sits at that path, install refuses to replace it and says so.
-- LaunchDaemons under the `io.k3sm.*` reverse-DNS labels.
+- LaunchDaemons under the `io.k3sm.*` reverse-DNS labels. The control plane's plist is `0600`
+  (root-only), since the arguments it carries can include a datastore password.
+- The cluster admin token in **`/var/lib/k3sm/server/token`**, mode `0600` and owned by the
+  `_k3sm` service account. The daemon is told where its token is, never what it is, so the token
+  does not appear in the plist, in `ps`, or in `launchctl print`. `k3sm uninstall` removes it.
+  Because that plist is `0600`, `k3sm status` run without `sudo` reports the server's launchd
+  arguments row as unreadable as this user, which never changes the verdict, and `sudo k3sm status`
+  shows it.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
 
 ## Install Channels

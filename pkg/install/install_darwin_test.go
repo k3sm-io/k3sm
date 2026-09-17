@@ -627,3 +627,50 @@ func TestWriteServiceUserFileOnDisk(t *testing.T) {
 		}
 	})
 }
+
+// TestWriteLaunchDaemonMode pins the plist writer's MODE half against a real
+// filesystem: the mode asked for is the mode on disk, and a REWRITE tightens an
+// existing wider mode rather than inheriting it.
+//
+// The rewrite case is the one that matters. os.WriteFile applies its mode only
+// when it creates the file, so without the explicit chmod every Mac installed by
+// an earlier build would have kept its 0644 server plist through the install
+// that was supposed to tighten it, with nothing to show for the change.
+//
+// Ownership (root:wheel) is the one-line method above and is not exercised here:
+// chowning a file to root needs privilege these tests never take.
+func TestWriteLaunchDaemonMode(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+
+	t.Run("a fresh plist is written at the mode asked for", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "daemons", ServerLabel+".plist")
+		if err := writeLaunchDaemon(path, []byte("<plist/>"), ServerPlistMode, uid, gid); err != nil {
+			t.Fatalf("writeLaunchDaemon: %v", err)
+		}
+		assertMode(t, path, ServerPlistMode)
+	})
+
+	t.Run("a rewrite over a world-readable plist tightens it", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), ServerLabel+".plist")
+		// The file an earlier build left: the admin token on the argv, 0644.
+		if err := os.WriteFile(path, []byte("<plist>--token k3sm-old</plist>"), PlistMode); err != nil {
+			t.Fatalf("seed the legacy plist: %v", err)
+		}
+		if err := writeLaunchDaemon(path, []byte("<plist/>"), ServerPlistMode, uid, gid); err != nil {
+			t.Fatalf("writeLaunchDaemon: %v", err)
+		}
+		assertMode(t, path, ServerPlistMode)
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != "<plist/>" {
+			t.Errorf("content = %q (err %v), want the rewritten plist", got, err)
+		}
+	})
+
+	t.Run("every other daemon keeps the conventional mode", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), NetdLabel+".plist")
+		if err := writeLaunchDaemon(path, []byte("<plist/>"), plistMode(NetdLabel), uid, gid); err != nil {
+			t.Fatalf("writeLaunchDaemon: %v", err)
+		}
+		assertMode(t, path, PlistMode)
+	})
+}

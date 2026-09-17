@@ -189,8 +189,8 @@ func stageJoinToken(sys System, cfg Config, uid uint32) error {
 		return fmt.Errorf("install: the join token file %s is empty: write the token `k3sm token create` printed on the server into it", cfg.TokenFile)
 	}
 	dst := cfg.agentTokenPath()
-	if err := sys.WriteServiceUserFile(dst, []byte(token+"\n"), uid, AgentTokenFileMode, AgentTokenDirMode); err != nil {
-		return fmt.Errorf("install: stage the join token at %s: %w", dst, err)
+	if err := stageTokenFile(sys, uid, token, dst, "join token", AgentTokenFileMode, AgentTokenDirMode); err != nil {
+		return err
 	}
 	cfg.Logger.Info("staged the join token for the agent daemon (your own copy is untouched and yours to delete once the node is Ready)",
 		"from", cfg.TokenFile, "to", dst)
