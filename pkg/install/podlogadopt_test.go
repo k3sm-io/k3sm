@@ -72,9 +72,11 @@ type podLogEntry struct {
 //   - a symlink inside the tree is reported and stepped over, and its target is
 //     never chowned: a walk running as root must not follow a link planted in a
 //     directory the service user can write in;
-//   - an entry k3sm cannot account for does NOT refuse the install — unlike the
-//     credential directory, this tree is GC-pending debris by nature, and a
-//     worker with a stale file under /var/log/pods must still install;
+//   - an entry k3sm cannot account for at the root of the tree — not a
+//     directory, or a directory whose name is not the <ns>_<pod>_<uid> shape
+//     k3sm writes — is REPORTED and left alone, and does not refuse the install:
+//     unlike the credential directory, this tree is GC-pending debris by nature,
+//     and a node with a stale file under /var/log/pods must still install;
 //   - the flat per-container link directory is adopted too, by lchown on the
 //     LINK, because there the symlink IS the artifact the node must replace;
 //   - a node that has never run a pod has no tree, and that is a posture rather
@@ -189,15 +191,36 @@ func TestAgentInstallAdoptsThePodLogTree(t *testing.T) {
 			wantLog:       []string{"left an entry in the container-log tree alone", pod("0.log"), "a symlink"},
 		},
 		{
-			name: "an unaccountable root-owned file at the root of the tree is adopted and the install proceeds",
+			name: "an unaccountable root-owned entry at the root of the tree is reported, not adopted, and the install proceeds",
 			pods: []podLogEntry{
 				podsRoot,
+				// Neither of these is a pod log directory k3sm wrote: one is not
+				// a directory at all, the other's name is not the
+				// <ns>_<pod>_<uid> shape. A root-run walk descends into the
+				// shape it wrote and reports the rest — adopting an unaccountable
+				// entry would be handing the service user something k3sm cannot
+				// account for, and refusing would fail the install of an
+				// otherwise healthy node over GC-pending debris.
 				{rel: "rotation.state", mode: 0o600, kind: EntryRegular},
+				{rel: "not-a-pod-dir", mode: 0o700, kind: EntryDir},
 				{rel: podDirName, mode: 0o700, kind: EntryDir},
 			},
 			want: []wantOwner{
-				{filepath.Join(PodLogsDir, "rotation.state"), legacyServiceUID, ContainerLogDirGID, 0o600},
+				{filepath.Join(PodLogsDir, "rotation.state"), 0, 0, 0o600},
+				{filepath.Join(PodLogsDir, "not-a-pod-dir"), 0, 0, 0o700},
+				// The pod directory beside them is still adopted: one
+				// unaccountable entry does not stop the walk.
 				{pod(), legacyServiceUID, ContainerLogDirGID, 0o700},
+			},
+			wantChownOrder: []string{chownCall(pod())},
+			wantNoChownOf: []string{
+				filepath.Join(PodLogsDir, "rotation.state"),
+				filepath.Join(PodLogsDir, "not-a-pod-dir"),
+			},
+			wantLog: []string{
+				filepath.Join(PodLogsDir, "rotation.state"),
+				filepath.Join(PodLogsDir, "not-a-pod-dir"),
+				"is not the <namespace>_<pod>_<uid> shape",
 			},
 		},
 		{
