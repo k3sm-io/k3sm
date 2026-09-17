@@ -135,14 +135,17 @@ func (c Collector) nodeLabel(role dataroot.Role) string {
 }
 
 // agentRow reports the joining worker's daemon AND the credential that makes it
-// a cluster member. It returns the row and the daemon's pid.
+// a cluster member. It returns the row, the daemon's pid, and the credential
+// state — which the apiserver row needs too, because on a worker the apiserver
+// URL to probe lives IN that credential: with no credential there is nothing to
+// probe rather than something down.
 //
 // The launchd verdict comes first and is never softened: a daemon that is not
 // loaded, is disabled or is crash-looping is that, whatever the store holds.
 // The credential only re-states a row whose daemon is otherwise healthy —
 // which is the one case launchd cannot see past, and the reason this row is not
 // just another daemonRow.
-func (c Collector) agentRow(now time.Time) (Row, int) {
+func (c Collector) agentRow(now time.Time) (Row, int, CredentialState) {
 	row, pid := c.daemonRow(RowAgent, c.Paths.AgentLabel, c.Paths.AgentLog, true)
 	state, notAfter := c.credentialState(now)
 	row.Wide["credential"] = string(state)
@@ -153,7 +156,7 @@ func (c Collector) agentRow(now time.Time) (Row, int) {
 		row.Wide["credential-expires"] = notAfter.UTC().Format(time.RFC3339)
 	}
 	if row.State != StateRunning || row.Severity != SeverityOK {
-		return row, pid
+		return row, pid, state
 	}
 
 	switch state {
@@ -181,7 +184,7 @@ func (c Collector) agentRow(now time.Time) (Row, int) {
 		row.Detail += " · node credential state unknown (not readable as this user)"
 		row.Remedy = "sudo k3sm status"
 	}
-	return row, pid
+	return row, pid, state
 }
 
 // credentialState reads the node credential store this report is about.

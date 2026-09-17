@@ -125,7 +125,14 @@ func newStatusCollector() status.Collector {
 	euid := os.Geteuid()
 	serviceUID := lookupServiceUID()
 	workDir := statusWorkDir(euid, serviceUID)
-	kube, source, kubeErr := newStatusKube(workDir)
+	// The installed ROLE is read before the credentials, because it decides
+	// which credentials there are to read: a worker holds a node credential
+	// pointing at another Mac, and no admin kubeconfig and no loopback
+	// apiserver of its own. Resolving on the euid alone is what made a worker
+	// probe a control plane it does not run.
+	role, _ := installedRole()
+	paths := statusPaths(workDir)
+	kube, source, kubeErr := newStatusKube(statusKubeInputsFor(role, paths))
 
 	return status.Collector{
 		Launchd:    launchctlProbe{},
@@ -143,7 +150,7 @@ func newStatusCollector() status.Collector {
 		// The installer's own reader of the server plist's argv, so the row
 		// reports exactly what a reinstall would carry over.
 		ServerArgs: install.OperatorServerArgs,
-		Paths:      statusPaths(workDir),
+		Paths:      paths,
 		EUID:       euid,
 		ServiceUID: serviceUID,
 		Version:    version.Get(),
@@ -377,21 +384,90 @@ func (k restKube) Server() string { return k.server }
 // TLSPosture says how the connection trusts the apiserver.
 func (k restKube) TLSPosture() string { return k.tls }
 
-// newStatusKube resolves credentials exactly as `k3sm kubectl` does — the work
-// dir's admin kubeconfig for root and the service user, the invoking user's own
-// ~/.kube/config with the k3sm context otherwise — and builds a client with a
-// short timeout. A nil Kube with a non-nil error is a reportable posture, not a
-// failure: the report says which credentials were missing.
-func newStatusKube(workDir string) (status.Kube, string, error) {
+// statusKubeInputs is everything the report's credential choice reads, injected
+// so the choice is a pure function of the role and the installed paths rather
+// than of this process.
+type statusKubeInputs struct {
+	// role is the node THIS Mac is installed as, and it is the first thing the
+	// choice reads: the two roles hold different credentials and address
+	// different apiservers.
+	role install.Role
+	// nodeKubeconfig is the joined worker's own credential — the kubeconfig
+	// `k3sm agent` writes on a successful join (install.AgentCredentialPath).
+	nodeKubeconfig string
+	// workDir is the control-plane work dir, read on the SERVER role only.
+	workDir string
+	// workDirOverride is K3SM_WORK_DIR verbatim, kubeconfigEnv is $KUBECONFIG,
+	// and home is the invoking user's home — the three environment facts
+	// resolveKubectlConfig reads for a control plane.
+	workDirOverride string
+	kubeconfigEnv   string
+	home            string
+	// exists reports whether a path is present (fileExists in production).
+	exists func(string) bool
+}
+
+// statusKubeInputsFor gathers the credential choice's inputs for the role this
+// Mac is installed as.
+func statusKubeInputsFor(role install.Role, paths status.Paths) statusKubeInputs {
 	home, _ := os.UserHomeDir()
-	cfg, err := resolveKubectlConfig(kubectlInputs{
+	return statusKubeInputs{
+		role:            role,
+		nodeKubeconfig:  install.AgentCredentialPath(paths.DataRoot),
+		workDir:         paths.WorkDir,
 		workDirOverride: os.Getenv("K3SM_WORK_DIR"),
-		workDir:         workDir,
 		kubeconfigEnv:   os.Getenv("KUBECONFIG"),
 		home:            home,
-		contextName:     installedContextName,
 		exists:          fileExists,
+	}
+}
+
+// statusKubeconfig picks the credentials `k3sm status` reports on and probes the
+// apiserver with, keyed on the installed ROLE.
+//
+// A worker is why this is not simply resolveKubectlConfig. It holds exactly one
+// credential — the node kubeconfig a join wrote — and no control plane of its
+// own, so the server work dir's admin kubeconfig is not its kubeconfig even
+// when a stale one is sitting there from an earlier server-era install, and the
+// loopback apiserver that kubeconfig names is not a thing this Mac serves.
+// Reporting either would tell an operator their worker is degraded for a reason
+// a worker cannot have. The role therefore wins outright here, K3SM_WORK_DIR
+// included: that variable names a control-plane work dir, and this node has
+// none.
+//
+// The probe target follows from the file: the client is built from the node
+// kubeconfig, so the URL it dials is that kubeconfig's own cluster server —
+// the same string nodecred.Credential.APIServerURL reports, because both read
+// the cluster entry of this one file. It is deliberately NOT the assignment's
+// APIServers list: that is every advertised endpoint of an HA control plane,
+// and this row names ONE probe target and says whether it answered. Aggregating
+// several endpoints into one row is a different shape than the row has.
+func statusKubeconfig(in statusKubeInputs) (kubectlConfig, error) {
+	if in.role == install.RoleAgent {
+		if in.nodeKubeconfig == "" || !in.exists(in.nodeKubeconfig) {
+			return kubectlConfig{}, fmt.Errorf("no node credential at %s", in.nodeKubeconfig)
+		}
+		return kubectlConfig{kubeconfig: in.nodeKubeconfig}, nil
+	}
+	return resolveKubectlConfig(kubectlInputs{
+		workDirOverride: in.workDirOverride,
+		workDir:         in.workDir,
+		kubeconfigEnv:   in.kubeconfigEnv,
+		home:            in.home,
+		contextName:     installedContextName,
+		exists:          in.exists,
 	})
+}
+
+// newStatusKube resolves the report's credentials (statusKubeconfig) and builds
+// a client with a short timeout. A nil Kube with a non-nil error is a reportable
+// posture, not a failure: the report says which credentials were missing.
+//
+// On a control plane the resolution is exactly `k3sm kubectl`'s — the work dir's
+// admin kubeconfig for root and the service user, the invoking user's own
+// ~/.kube/config with the k3sm context otherwise.
+func newStatusKube(in statusKubeInputs) (status.Kube, string, error) {
+	cfg, err := statusKubeconfig(in)
 	if err != nil {
 		return nil, "", err
 	}
