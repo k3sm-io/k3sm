@@ -40,6 +40,14 @@ const (
 	// authenticated by the node's own client certificate rather than the join
 	// token (see MeshEndpointRefreshRequest).
 	MeshEndpointPath = "/v1-k3sm/mesh/endpoint"
+	// DeregisterPath is the deregistration verb: a node being uninstalled asks
+	// the supervisor to remove it from the cluster, so the peers it leaves
+	// behind stop carrying a wireguard entry for a Mac that will never answer
+	// again. It is authenticated exactly as MeshEndpointPath is — by the node's
+	// own client certificate, never the join token — and it is self-scoped by
+	// the same guard, so a node can deregister itself and nothing else (see
+	// DeregisterRequest).
+	DeregisterPath = "/v1-k3sm/mesh/deregister"
 )
 
 // JoinSchemaVersion stamps the k3sm-internal join exchange payloads (JoinRequest /
@@ -104,6 +112,21 @@ type MeshEndpointRefreshRequest struct {
 	// with this node — an UNDERLAY address, for the same reason the join-time
 	// endpoint is one.
 	Endpoint string `json:"endpoint"`
+}
+
+// DeregisterRequest is the payload a node being uninstalled POSTs to
+// DeregisterPath.
+//
+// It carries the node name and nothing else, for the same reason the endpoint
+// refresh carries one string: the name is present only so the server can check
+// it against the certificate that authenticated the request, and it is never
+// trusted on its own (see Server.handleDeregister). There is no field a caller
+// could use to name a DIFFERENT object to delete.
+type DeregisterRequest struct {
+	// NodeName is the node asking to be removed. It MUST equal the
+	// authenticated certificate's system:node:<name> identity; a mismatch is a
+	// 403.
+	NodeName string `json:"nodeName"`
 }
 
 // JoinResponse is the bootstrap endpoint's reply: the cluster CA the node now trusts
@@ -173,4 +196,15 @@ type Enroller interface {
 	// AllowedIPs behind it. That case returns ErrNoMeshPeer, which the handler
 	// maps to 404 — the signal for the agent to rejoin.
 	RefreshEndpoint(ctx context.Context, nodeName, endpoint string) error
+	// Deregister removes the node from the cluster: its MeshPeer FIRST, so the
+	// remaining peers drop the tunnel entry for a Mac that is going away, and
+	// then its Node object. An object that is already gone is not an error —
+	// deregistration is idempotent, because an uninstall can be re-run and an
+	// operator may have deleted one half by hand.
+	//
+	// It is driven by the SERVER's own privileged client, never by the node's
+	// credential: a node holds no delete verb on either object, and this verb
+	// deliberately does not give it one. What authenticates the request is the
+	// node's certificate; what performs the write is the supervisor.
+	Deregister(ctx context.Context, nodeName string) error
 }

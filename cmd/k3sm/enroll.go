@@ -66,7 +66,12 @@ type meshEnroller struct {
 	// the core client could not be built, in which case the refresh still writes
 	// the MeshPeer and only the Event is lost.
 	events typedcorev1.EventInterface
-	mu     sync.Mutex
+	// nodes is the core Node client Deregister deletes through. It comes from the
+	// same clientset as events and is nil for the same reason; unlike an Event,
+	// a Node that cannot be deleted is reported, because a left-behind Node is
+	// half the state deregistration exists to remove.
+	nodes typedcorev1.NodeInterface
+	mu    sync.Mutex
 }
 
 // newMeshEnroller builds the enroller over the cluster REST config (the typed
@@ -81,9 +86,10 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 	// record events still enrolls, and refusing to build one here would turn an
 	// observability dependency into a join outage.
 	if cs, err := kubernetes.NewForConfig(cfg); err != nil {
-		log.Warn("mesh endpoint changes will not be recorded as Node Events", "err", err)
+		log.Warn("mesh endpoint changes will not be recorded as Node Events, and a deregistering node's Node object cannot be deleted", "err", err)
 	} else {
 		e.events = cs.CoreV1().Events(metav1.NamespaceDefault)
+		e.nodes = cs.CoreV1().Nodes()
 	}
 	return e, nil
 }
@@ -314,6 +320,52 @@ func (e *meshEnroller) recordEndpointChange(ctx context.Context, nodeName, old, 
 
 // meshEndpointChangedReason is the Event reason an endpoint refresh records.
 const meshEndpointChangedReason = "MeshEndpointChanged"
+
+// Deregister implements bootstrap.Enroller: it removes a node from the cluster,
+// its MeshPeer first and its Node second.
+//
+// THE ORDER IS THE POINT. The MeshPeer is what every remaining node's wireguard
+// device is programmed from, so deleting it first makes the peers drop the
+// tunnel entry for a Mac that is going away; deleting the Node first would leave
+// a peer entry alive for a node that no longer exists in the cluster, which is
+// precisely the residue this verb exists to remove. Freeing the peer also frees
+// its pod /24, which lowestFreeNodeIndex hands to the next node that joins.
+//
+// A NotFound on either object is SUCCESS. Deregistration is idempotent by
+// construction: an uninstall can be re-run, an operator may have deleted one
+// half by hand, and a node that the cluster has already forgotten is in exactly
+// the state this asks for.
+//
+// The node's coordination Lease is deliberately NOT deleted here. Virtual
+// Kubelet's lease controller (v1.12.0 node/lease_controller_v1.go newLease) sets
+// an OwnerReference to the Node — name and UID — on the lease it creates and
+// re-asserts it on every renew until it sticks, so kube-controller-manager's
+// garbage collector (which k3sm leaves enabled; see the executor's
+// --controllers value) reaps kube-node-lease/<node> when the Node goes. Deleting
+// it here would be a second, racing writer of state that already has an owner.
+//
+// It runs under the SAME mutex as Enroll/EnrollSelf, so a deregistration cannot
+// interleave with a join's list-then-write and leave that write re-creating the
+// peer this call just deleted.
+func (e *meshEnroller) Deregister(ctx context.Context, nodeName string) error {
+	if nodeName == "" {
+		return errors.New("deregister: no node name")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.client.Delete().Resource(meshPeerResource).Name(nodeName).Do(ctx).Error(); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete mesh peer %q: %w", nodeName, err)
+	}
+	if e.nodes == nil {
+		return fmt.Errorf("delete node %q: this supervisor has no core apiserver client, so only the MeshPeer was removed (`kubectl delete node %s` removes the rest)", nodeName, nodeName)
+	}
+	if err := e.nodes.Delete(ctx, nodeName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete node %q: %w", nodeName, err)
+	}
+	e.log.Info("node deregistered", "node", nodeName)
+	return nil
+}
 
 // lowestFreeNodeIndex returns the lowest node index ≥ 1 whose /24 no existing peer
 // holds.

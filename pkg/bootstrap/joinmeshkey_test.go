@@ -18,6 +18,7 @@ package bootstrap_test
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -55,6 +56,13 @@ func (c *capturingEnroller) Enroll(_ context.Context, nodeName string, req netv1
 // the "rejoin" error rather than silently succeeding.
 func (c *capturingEnroller) RefreshEndpoint(_ context.Context, _, _ string) error {
 	return bootstrap.ErrNoMeshPeer
+}
+
+// Deregister satisfies bootstrap.Enroller. This fixture exercises the JOIN path
+// only; a deregistration reaching it would be a test wiring mistake, so it fails
+// loudly rather than reporting a deletion that never happened.
+func (c *capturingEnroller) Deregister(_ context.Context, nodeName string) error {
+	return fmt.Errorf("the join fixture's enroller was asked to deregister %q", nodeName)
 }
 
 func (c *capturingEnroller) captured() []netv1.MeshEnrollRequest {
