@@ -1,10 +1,11 @@
 # S0 findings — k3sm preconditions, no framework (M16.0-d1)
 
-> **Status: NOT YET RUN.** This file is the write-back target for
-> `hack/spike/m16/s0.sh`; nothing below is a result until a run fills it in, and a
-> half-run rung records what it did and did not measure rather than leaving a row
-> blank. Re-running the script overwrites rig state under `$PREFIX`; it does not
-> rewrite this file.
+> **Status: RUN 2026-09-17** on the single-node dev Mac named under Rig. Criteria (1)
+> and (3) hold; criterion (2) fails on this rig and its pre-decided substitution is
+> applied below. Two earlier attempts the same day never reached the measurement
+> (an x86_64 venv on a two-Homebrew Mac, then a load client sending a placeholder
+> model id); both are fixed in the scripts that produced this run. Re-running the
+> script overwrites rig state under `$PREFIX`; it does not rewrite this file.
 
 ## Question
 
@@ -46,23 +47,23 @@ guest, and a `vm` guest listener dialled from a native pod.
 
 | criterion | verdict | evidence |
 |---|---|---|
-| s0.1a admission (allow / deny / backend reviews) | | |
-| s0.1a `failurePolicy: Fail` is fail-closed | | |
-| s0.1b CRD conversion | | |
-| s0.2 two-engine co-residency (aggregate tok/s, p50/p95/p99, wired) | | |
-| s0.3 guest → native pod IP | | |
-| s0.3 native → guest published IP (recorded) | | |
+| s0.1a admission (allow / deny / backend reviews) | PASS | the apiserver reached the service-ref webhook on a vm-backed ClusterIP: allow admitted, deny rejected with the webhook's own message, 2 AdmissionReviews in the backend's log |
+| s0.1a `failurePolicy: Fail` is fail-closed | PASS | a CREATE was rejected while the webhook Service was unresolvable |
+| s0.1b CRD conversion | PASS | a v1alpha1 read of a v1beta1 object was answered by the service-ref conversion webhook (spec.size=4096, 2 ConversionReviews in the backend's log) |
+| s0.2 two-engine co-residency (aggregate tok/s, p50/p95/p99, wired) | FAIL | control (1 engine, conc 4, 3 rounds, 1 200 tok): 12/12 ok, 168.1 tok/s, p50 24.9 s, p95 29.7 s, p99 29.7 s, engine RSS 730 MB, wired 429 MB (baseline 429 MB). Two engines (conc 8 across 2, 3 rounds): 24/24 ok, 105.7 tok/s, p50 85.7 s, p95 105.7 s, p99 105.7 s, RSS 104 MB + 502 MB, peak wired 1 139 MB. p99 rose 3.6x and aggregate throughput fell by a third. Per-process GPU accounting not evaluated |
+| s0.3 guest → native pod IP | PASS | a vm guest reached the native pod's own lo0-alias pod IP (100.64.0.13:8099) directly |
+| s0.3 native → guest published IP (recorded) | BLOCKED | the inbound direction `docs/user/limitations.md` already documents; recorded, not required |
 
 ## Rig
 
 | | |
 |---|---|
 | host | the M16 rig, reached over the harness's ssh path (`K3SM_M16_HOST`) |
-| SoC / memory | |
-| macOS | |
-| date (UTC) | |
-| engine pin | |
-| model pin | |
+| SoC / memory | Apple M2, 8 GiB (Mac14,2); the rig also hosted the control plane and four vm pods during the run |
+| macOS | 26.6.2 |
+| date (UTC) | 2026-09-17 |
+| engine pin | vllm-mlx 0.4.1 on an arm64 CPython 3.12 venv |
+| model pin | mlx-community/Qwen3-0.6B-4bit @ 73e3e38d981303bc594367cd910ea6eb48349da8 |
 
 ## Consequences recorded here
 
@@ -70,4 +71,11 @@ guest, and a `vm` guest listener dialled from a native pod.
   guest dialing a native pod IP bypasses the Service proxy and the NetworkPolicy L4
   hint, exactly as any same-node process does.
 - The slot floor the capacity policy uses comes from (2)'s measurement, not from the
-  planning estimate.
+  planning estimate. **Applied substitution (2026-09-17):** the pinned class is already
+  the smallest that fits beside the control plane on 8 GiB, so the halt's "single-slot
+  only if no small model fits two" arm applies: on an 8 GiB Mac the capacity policy
+  starts at ONE engine slot per node. The second engine's 104 MB RSS and the 1 139 MB
+  peak wired figure read as paging under memory pressure, so the two-slot question is
+  re-measured on a 16 GiB or larger Mac before the floor is fixed for that class.
+- (3) is open in the guest→native direction, so the trust-domain sentence goes in
+  `docs/user/mlx-fleet.md` when that document is written.
