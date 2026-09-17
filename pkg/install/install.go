@@ -382,6 +382,17 @@ type System interface {
 	// exists at all so a unit test can observe the write and so nothing writes
 	// the record before its volume is proven mounted.
 	WriteDataVolumeRecord(path string, rec dataroot.Record) error
+	// WriteServerArgsRecord writes the server-arguments record at path,
+	// atomically and root-owned 0644 — the operator's own `k3sm server` flags,
+	// kept inside the data root so they survive the uninstall that removes the
+	// plist they were read from.
+	//
+	// It takes the RECORD for the same reason WriteDataVolumeRecord does:
+	// pkg/dataroot owns the encoding, the version stamp and the
+	// temp-and-rename. The seam exists so a unit test can observe the write —
+	// and so the write happens at ONE point in the install, after the carried
+	// arguments have been decided.
+	WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
 	// ReadFile reads a root-readable file: the installed server plist, whose
@@ -1031,13 +1042,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName))
 
-	// 2d. Carry over the operator-supplied server arguments from the plist ALREADY
-	//     ON DISK. ServerPlist renders a fixed template, so before this a reinstall
-	//     silently dropped every argument a human had added (--mesh-ip,
-	//     --registry-port) and the cluster came back single-node on loopback until
-	//     someone repaired the plist by hand. A first install finds no plist and
-	//     preserves nothing; --token is deliberately NOT preserved (it is
-	//     install-managed and re-minted here, in lockstep with the kubeconfig).
+	// 2d. Carry over the operator-supplied server arguments — from the plist
+	//     ALREADY ON DISK, or, when there is none, from the record the previous
+	//     install left in the data root. ServerPlist renders a fixed template, so
+	//     without this a reinstall silently dropped every argument a human had
+	//     added (--mesh-ip, --registry-port) and the cluster came back single-node
+	//     on loopback until someone repaired the plist by hand. A genuine first
+	//     install finds neither source and preserves nothing; --token is
+	//     deliberately NOT preserved (it is install-managed and re-minted here, in
+	//     lockstep with the kubeconfig).
 	extra, err := installedServerArgs(sys, cfg)
 	if err != nil {
 		return err
@@ -1045,6 +1058,14 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	cfg.ExtraServerArgs = extra
 	if len(extra) > 0 {
 		cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", strings.Join(extra, " "))
+	}
+	// 2d′. Record them, on EVERY install and whatever the source was — including
+	//      an empty set, which is the truthful record of a node that has none.
+	//      The plist this install is about to write will not survive the next
+	//      `k3sm uninstall`; the record lives in the preserved data root and
+	//      does.
+	if err := writeServerArgsRecord(sys, cfg); err != nil {
+		return err
 	}
 
 	// 2e. On a mesh install the apiserver serves a CLUSTER-CA-SIGNED leaf, so the
@@ -1248,6 +1269,12 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("uninstall: %w", firstErr)
 	}
 	cfg.Logger.Info("k3sm uninstalled", "install-dir", cfg.InstallDir)
+	// What was KEPT, named. An uninstall that lists only what it removed leaves
+	// the operator guessing whether their datastore, their kubeconfig and the
+	// server flags they configured are still there — and guessing wrong in the
+	// safe direction means restoring a backup nobody needed to take.
+	cfg.Logger.Info("kept, so a reinstall picks up where you left off: "+strings.Join(keptArtifacts(cfg, m), ", "),
+		"remove-the-carried-server-arguments", "rm "+dataroot.ServerArgsRecordPath(cfg.DataRoot))
 	if st.Volume != nil {
 		// The volume is data, not an artifact: it holds the datastore, the image
 		// blobs and every PersistentVolume, so uninstall leaves it mounted and
@@ -1259,6 +1286,36 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			"remove-for-good", "sudo k3sm datavol delete --yes")
 	}
 	return nil
+}
+
+// keptArtifacts describes, in manifest order, what an uninstall deliberately
+// leaves on disk. It is derived from the manifest's dispPreserve entries rather
+// than hand-listed, so an artifact that becomes preserved (or stops being)
+// cannot quietly fall out of the sentence an operator reads.
+func keptArtifacts(cfg Config, m []artifact) []string {
+	var kept []string
+	for _, a := range m {
+		switch {
+		case a.disp != dispPreserve:
+			continue
+		case a.kind == kindServiceUser:
+			kept = append(kept, "the "+a.user+" service user")
+		case a.kind == kindKubeconfig:
+			kept = append(kept, "your admin kubeconfig")
+		case a.path == cfg.DataRoot:
+			// Named with its record, because that file is the one preserved
+			// thing whose existence is not obvious: it is why the next install
+			// still knows this node's --mesh-ip.
+			kept = append(kept, "the data root "+a.path+" (cluster state, and the recorded server arguments in "+dataroot.ServerArgsRecordPath(cfg.DataRoot)+")")
+		case a.path == LogDir:
+			kept = append(kept, "the daemon log dir "+a.path)
+		case a.path == dataroot.DefaultRecordPath:
+			kept = append(kept, "the data-volume record "+a.path)
+		default:
+			kept = append(kept, a.path)
+		}
+	}
+	return kept
 }
 
 // NetdPlist renders the io.k3sm.netd LaunchDaemon plist. It runs as ROOT (no

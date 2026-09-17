@@ -24,6 +24,10 @@ import (
 	"io"
 	"io/fs"
 	"strings"
+	"time"
+
+	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/version"
 )
 
 // managedServerFlags are the `k3sm server` flags ServerPlist renders ITSELF, by
@@ -38,31 +42,151 @@ var managedServerFlags = map[string]bool{
 	"token":   true,
 }
 
-// installedServerArgs returns the operator-supplied `k3sm server` arguments
-// carried on the server plist ALREADY INSTALLED, or nil when there is none (a
-// first install).
+// installedServerArgs returns the operator-supplied `k3sm server` arguments the
+// next render must carry over, or nil when there are none (a genuine first
+// install).
+//
+// It has TWO sources, in this precedence:
+//
+//  1. the server plist ALREADY INSTALLED — authoritative, because it is what
+//     launchd is running right now. This is the in-place-upgrade path and it is
+//     unchanged;
+//  2. the server-arguments record inside the data root, consulted only when
+//     there is no plist to read.
+//
+// The second source exists because `k3sm uninstall` removes the plist. Before
+// it, uninstall-then-install — the clean cutover the install docs recommend
+// between channels — re-rendered the stock template over an operator's
+// configuration, dropping --mesh-ip and --registry-port with no log line and
+// bringing the cluster back single-node. The data root is preserved by the same
+// uninstall, so a record kept there bridges exactly that gap.
 //
 // It fails the install on a plist that exists but cannot be parsed, rather than
-// proceeding with an empty carry-over. Proceeding would silently re-render the
-// bare template over an operator's configuration — precisely the defect this
-// exists to fix, and invisible until the cluster came back single-node. The
-// error names the file and the remedy, so the operator can delete it and
-// reinstall deliberately.
+// proceeding with an empty carry-over: proceeding would be the same silent
+// re-render in a different shape. The error names the file, the remedy, and —
+// when there is one — the record whose arguments a deliberate reinstall would
+// then carry instead.
 func installedServerArgs(sys System, cfg Config) ([]string, error) {
 	path := cfg.plistPath(ServerLabel)
 	raw, err := sys.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil // first install: nothing to carry over
+	switch {
+	case err == nil:
+		args, perr := parseProgramArguments(raw)
+		if perr != nil {
+			return nil, unreadablePlistError(sys, cfg, path, perr)
 		}
+		return preservedServerArgs(args), nil
+	case errors.Is(err, fs.ErrNotExist):
+		return recordedServerArgs(sys, cfg)
+	default:
 		return nil, fmt.Errorf("install: read installed server plist %s: %w", path, err)
 	}
-	args, err := parseProgramArguments(raw)
+}
+
+// OperatorServerArgs returns the operator-supplied `k3sm server` arguments an
+// installed server plist carries — everything on its argv that the installer
+// does not render itself, in the original order.
+//
+// It is exported for `k3sm status`, which reports the same answer read-only so
+// an operator can see what the daemon is configured with without reading XML.
+// The parse lives here rather than being re-implemented there: two readers of
+// one plist would be two chances to disagree about what is preserved.
+func OperatorServerArgs(plist []byte) ([]string, error) {
+	args, err := parseProgramArguments(plist)
 	if err != nil {
-		return nil, fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove the file to reinstall from the stock template — doing so discards any --mesh-ip/--registry-port it carried)", path, err)
+		return nil, err
 	}
 	return preservedServerArgs(args), nil
 }
+
+// recordedServerArgs returns the arguments the server-arguments record inside
+// the data root carries, or nil when there is no record.
+//
+// A record that cannot be read is an ERROR, never an empty answer: the whole
+// reason it exists is that "no arguments" and "the arguments could not be read"
+// look identical in the rendered plist, and only one of them is safe to render.
+// The remedy names the file, because deleting it is a decision (it discards the
+// flags it lists) and not something an installer may take on an operator's
+// behalf.
+func recordedServerArgs(sys System, cfg Config) ([]string, error) {
+	path := dataroot.ServerArgsRecordPath(cfg.DataRoot)
+	rec, err := dataroot.ReadServerArgsRecord(systemFiles{sys}, path)
+	if err != nil {
+		return nil, fmt.Errorf("install: %w (`rm %s` to reinstall from the stock template, which discards the arguments it lists)", err, path)
+	}
+	if rec == nil {
+		warnNothingCarried(cfg)
+		return nil, nil
+	}
+	if len(rec.Args) > 0 {
+		cfg.Logger.Info("carried the operator-supplied server arguments over from the recorded ones (the installed plist is gone, as after an uninstall)",
+			"args", strings.Join(rec.Args, " "), "record", path, "recorded-at", rec.CreatedAt.Format(time.RFC3339), "recorded-by", rec.CreatedBy)
+	}
+	return rec.Args, nil
+}
+
+// warnNothingCarried says, once, that a data root with prior cluster state in it
+// is being given a stock server plist.
+//
+// It is keyed on the DATA ROOT HAVING CONTENT, never on the record being absent:
+// a Mac installed before records existed, and uninstalled since, has no record
+// and never will — that is exactly the machine this warning is for, and one
+// keyed on the record would stay silent on it. An empty data root is a first
+// install and gets nothing to read.
+func warnNothingCarried(cfg Config) {
+	used, err := dataRootHasContent(cfg.DataRootFS, cfg.DataRoot)
+	if err != nil || !used {
+		return
+	}
+	cfg.Logger.Warn("no operator-supplied server arguments were carried over: neither the installed server plist nor a recorded set is on disk, so the server is being rendered from the stock template — any --mesh-ip or --registry-port this node had is NOT set",
+		"data-root", cfg.DataRoot,
+		"set-them", "add the flags to ProgramArguments in "+cfg.plistPath(ServerLabel)+", then `sudo launchctl kickstart -k system/"+ServerLabel+"`; the next install carries them over by itself")
+}
+
+// unreadablePlistError is the refusal for a server plist that is there and
+// cannot be parsed. It names the record when one exists, because the operator's
+// next move — remove the plist and reinstall — has a different outcome depending
+// on whether anything is left to carry over.
+func unreadablePlistError(sys System, cfg Config, path string, cause error) error {
+	recPath := dataroot.ServerArgsRecordPath(cfg.DataRoot)
+	if rec, err := dataroot.ReadServerArgsRecord(systemFiles{sys}, recPath); err == nil && rec != nil {
+		return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove %s to reinstall; the recorded operator arguments (%s) from %s in %s will be carried over)",
+			path, cause, path, strings.Join(rec.Args, " "), rec.CreatedAt.Format(time.RFC3339), recPath)
+	}
+	return fmt.Errorf("install: cannot read the arguments of the installed server plist %s: %w (remove the file to reinstall from the stock template — doing so discards any --mesh-ip/--registry-port it carried)", path, cause)
+}
+
+// writeServerArgsRecord records the arguments this install rendered, so the next
+// one can carry them over even with no plist to read.
+//
+// It writes the FULL preserved set, never a distilled one: --mesh-ip and
+// --registry-port are the two that made the defect visible, but the contract is
+// "everything the installer does not own", and a record that kept only the
+// famous two would lose the next flag an operator adds.
+func writeServerArgsRecord(sys System, cfg Config) error {
+	path := dataroot.ServerArgsRecordPath(cfg.DataRoot)
+	rec := dataroot.ServerArgsRecord{
+		Args: cfg.ExtraServerArgs,
+		// "k3sm <version>", the same one-line provenance the data-volume record
+		// carries. Info.String() is the multi-line `k3sm version` screen and would
+		// put a paragraph in a json field.
+		CreatedBy: "k3sm " + version.Get().Version,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := sys.WriteServerArgsRecord(path, rec); err != nil {
+		return fmt.Errorf("install: write the server arguments record %s: %w", path, err)
+	}
+	return nil
+}
+
+// systemFiles adapts the installer's privileged read seam to the one method
+// pkg/dataroot's record readers need. The installer reads as root through
+// System, not through a dataroot.FS, and a unit test's fake System is what makes
+// the carry-over testable without privilege.
+type systemFiles struct{ sys System }
+
+// ReadFile implements dataroot.FileReader.
+func (s systemFiles) ReadFile(path string) ([]byte, error) { return s.sys.ReadFile(path) }
 
 // preservedServerArgs returns the arguments of an installed server plist that
 // the next render must carry over: everything that is not install-managed, in

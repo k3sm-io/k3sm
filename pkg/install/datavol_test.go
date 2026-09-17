@@ -102,13 +102,24 @@ func (r *datavolRig) wantVolume(encrypt bool) {
 	}
 }
 
-// seedDataRoot creates a plain, non-empty data root: a kine datastore and one
-// other file, which is what a migration has to carry across and verify.
+// seedDataRoot creates a plain, non-empty data root: a kine datastore, the
+// server-arguments record, and one other file — what a migration has to carry
+// across and verify.
 func (r *datavolRig) seedDataRoot(t *testing.T) {
 	t.Helper()
+	argsRecord, err := dataroot.EncodeServerArgsRecord(dataroot.ServerArgsRecord{
+		Args: []string{"--mesh-ip", "100.64.0.1"}, CreatedBy: "k3sm test",
+	})
+	if err != nil {
+		t.Fatalf("encode the server arguments record: %v", err)
+	}
 	files := map[string]string{
 		"server/db/state.db": "SQLite format 3\x00 pretend datastore",
 		"agent/etc/hosts":    "127.0.0.1 localhost\n",
+		// The record rides in the data root precisely so a migration onto a
+		// volume carries it; seeding it here puts it inside the tree Migrate
+		// copies and then verifies file-for-file.
+		"server-args.json": string(argsRecord),
 	}
 	for rel, content := range files {
 		path := filepath.Join(r.cfg.DataRoot, rel)
@@ -257,6 +268,18 @@ func TestInstallWithDataVolumeSequencing(t *testing.T) {
 		preVolume := r.cfg.DataRoot + datavol.PreVolumeSuffix
 		if _, err := os.Stat(filepath.Join(preVolume, "server", "db", "state.db")); err != nil {
 			t.Errorf("the pre-migration copy is not at %s: %v", preVolume, err)
+		}
+		// The server-arguments record went across with everything else. What
+		// this asserts, precisely: it was in the tree Migrate copied and then
+		// VERIFIED file-for-file (a missing file fails that verification, and
+		// the install above would have failed), and it is in the rollback copy.
+		// What this harness cannot assert is the record sitting on the mounted
+		// volume afterwards: the fake diskutil does not materialise a volume on
+		// disk, and the staging copy is removed once the migration succeeds, so
+		// the only copies a test can stat are the pre-volume one and what the
+		// verification already compared.
+		if _, err := os.Stat(filepath.Join(preVolume, "server-args.json")); err != nil {
+			t.Errorf("the migration lost the server-arguments record: %v", err)
 		}
 		// And the staging mount point is gone, so nothing looks half-finished.
 		if _, err := os.Stat(r.cfg.withDefaults().datavolStaging()); !errors.Is(err, os.ErrNotExist) {

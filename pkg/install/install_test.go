@@ -112,6 +112,12 @@ type fakeSystem struct {
 	// keyed by path. It is the fake's whole model of /Library/Preferences: the
 	// real write is pkg/dataroot's, and a unit test must not perform it.
 	records map[string]dataroot.Record
+	// serverArgs is every server-arguments record WriteServerArgsRecord was
+	// handed, keyed by path. The write ALSO lands in files, encoded exactly as
+	// the real writer would encode it, because the whole point of that record is
+	// that a LATER install reads it back — a fake that only remembered the
+	// struct would leave the uninstall-then-install gate asserting nothing.
+	serverArgs map[string]dataroot.ServerArgsRecord
 }
 
 // putDrain makes the fake launchd keep label in the domain for reads
@@ -349,8 +355,39 @@ func (f *fakeSystem) WriteUserKubeconfig(targetUser string, contents []byte) err
 	return nil
 }
 
+// RemoveAll records the call and REALLY removes the path from the fake root
+// filesystem — the file itself and everything under it, plus any symlink or
+// record keyed there.
+//
+// It used to only record, which made every uninstall in this package a no-op on
+// the state a following install reads back. An uninstall-then-install test could
+// then "pass" while the installed plist was still sitting in f.files, i.e. while
+// the sequence under test had not actually happened. Deletion is what makes the
+// fake describe a real teardown.
 func (f *fakeSystem) RemoveAll(path string) error {
 	f.calls = append(f.calls, "RemoveAll:"+path)
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	under := func(p string) bool { return p == path || strings.HasPrefix(p, prefix) }
+	for p := range f.files {
+		if under(p) {
+			delete(f.files, p)
+		}
+	}
+	for p := range f.links {
+		if under(p) {
+			delete(f.links, p)
+		}
+	}
+	for p := range f.records {
+		if under(p) {
+			delete(f.records, p)
+		}
+	}
+	for p := range f.serverArgs {
+		if under(p) {
+			delete(f.serverArgs, p)
+		}
+	}
 	return nil
 }
 
@@ -405,6 +442,51 @@ func (f *fakeSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) err
 	}
 	f.records[path] = rec
 	return nil
+}
+
+// WriteServerArgsRecord remembers the record AND lands its real encoding in the
+// fake root filesystem, so the next install's ReadFile of that path decodes what
+// a real installer would have written (dataroot owns the encoding; the fake does
+// not get a second one).
+func (f *fakeSystem) WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error {
+	f.calls = append(f.calls, "WriteServerArgsRecord:"+path)
+	if f.serverArgs == nil {
+		f.serverArgs = map[string]dataroot.ServerArgsRecord{}
+	}
+	rec.Version = dataroot.ServerArgsRecordVersion
+	f.serverArgs[path] = rec
+	data, err := dataroot.EncodeServerArgsRecord(rec)
+	if err != nil {
+		return err
+	}
+	f.putFile(path, data)
+	return nil
+}
+
+// putServerArgsRecord seeds a server-arguments record an EARLIER install left
+// behind, in the bytes that install would have written.
+func putServerArgsRecord(t *testing.T, f *fakeSystem, path string, args ...string) {
+	t.Helper()
+	data, err := dataroot.EncodeServerArgsRecord(dataroot.ServerArgsRecord{
+		Args: args, CreatedBy: "k3sm test", CreatedAt: time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("encode the server arguments record: %v", err)
+	}
+	f.putFile(path, data)
+}
+
+// writeFileForTest writes content at path, creating the parent directories. It
+// seeds the REAL scratch data root a test hands the installer, which is what
+// the "is there prior cluster state here" probe reads.
+func writeFileForTest(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("seed %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("seed %s: %v", path, err)
+	}
 }
 
 // copyTreeForTest is ditto(1)'s contract as far as an unprivileged test can
@@ -496,6 +578,12 @@ func TestInstallOrchestration(t *testing.T) {
 		// The installed server plist is read BEFORE the plists are rendered, so a
 		// reinstall carries the operator's own arguments into the new render.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
+		// There is none here (a first install), so the second source is read:
+		// the record in the data root, which is what survives an uninstall.
+		"ReadFile:/var/lib/k3sm/server-args.json",
+		// And whatever was carried — nothing, on a first install — is recorded
+		// again, before the plist that will not survive the next uninstall.
+		"WriteServerArgsRecord:/var/lib/k3sm/server-args.json",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is

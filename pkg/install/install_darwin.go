@@ -530,6 +530,16 @@ func (darwinSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) erro
 	return dataroot.WriteRecord(path, rec)
 }
 
+// WriteServerArgsRecord writes the server-arguments record through pkg/dataroot,
+// which owns its encoding, its version stamp, its 0644 mode and its
+// temp-and-rename. The file lands root-owned (install runs as root) inside the
+// service user's data root, which is the same posture the plist it mirrors has
+// and is safe because the record carries no credential: --token and --runtime
+// are install-managed and never written here.
+func (darwinSystem) WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error {
+	return dataroot.WriteServerArgsRecord(path, rec)
+}
+
 // WriteLaunchDaemon writes the plist root:wheel 0644.
 func (darwinSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
