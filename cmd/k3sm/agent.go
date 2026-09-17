@@ -56,12 +56,13 @@ const meshKeyRef = "node.key"
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.
 type agentOptions struct {
-	server   string // control-plane UNDERLAY host (the join target; apiserver fallback only)
-	token    string // K10<caHash>::<user>:<secret>
-	nodeName string
-	nodeIP   string // this node's mesh InternalIP (bound into the issued certs)
-	workDir  string
-	podRoot  string
+	server    string // control-plane UNDERLAY host (the join target; apiserver fallback only)
+	token     string // K10<caHash>::<user>:<secret>
+	tokenFile string // a file holding that token, read once at start (see applyTokenFile)
+	nodeName  string
+	nodeIP    string // this node's mesh InternalIP (bound into the issued certs)
+	workDir   string
+	podRoot   string
 	// logs is the container-log flag group, passed through to the node this
 	// agent brings up.
 	logs      containerLogOptions
@@ -82,6 +83,7 @@ type agentOptions struct {
 func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.server, "server", "", "control-plane host to join — in practice an UNDERLAY address (a LAN IP or DNS name), because the join must reach <host>:9345 before this node has any mesh to route over")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN) — required for a node's FIRST join only; a node that has already joined starts from its stored credential, and a token for the same cluster is ignored")
+	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding the K10 join token, read once at start and preferred over --token and $K3SM_TOKEN. It must not be group- or world-readable. This is how a supervised agent is given a token: a LaunchDaemon plist is world-readable, so the daemon is told where the token is and never what it is")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
@@ -160,6 +162,21 @@ func runAgent(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// --token-file, before anything reads opts.token. A file that is there and
+	// cannot be used is a terminal start failure like the others (it recurs
+	// identically on the next start), so it backs off rather than letting
+	// KeepAlive spawn-loop on it. A file that is simply GONE is not a failure at
+	// all: the token is a first-join credential the operator is told to delete
+	// once the node is Ready, so this is the steady state of a joined worker and
+	// the start plan decides from the stored credential.
+	tokenFileAbsent, err := applyTokenFile(&opts)
+	if err != nil {
+		return agentTerminal(ctx, logger, err)
+	}
+	if tokenFileAbsent {
+		logger.Info("the join token file is not there; this start presents the stored node credential instead", "path", opts.tokenFile)
+	}
+
 	// ONE construction-time decision (the `--network` backend): auto routes the mesh
 	// datapath through the root netd helper when unprivileged / uses the direct utun
 	// device as root; none skips the mesh datapath (and the probe) entirely. Fail
@@ -201,6 +218,12 @@ func runAgent(args []string) error {
 	}
 	plan, err := agentStartPlan(status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
 	if err != nil {
+		// The plan's refusals are about the credential and the token. When a token
+		// file was named and is not there, that is the missing half, and the error
+		// says so rather than leaving the operator to infer it from the argv.
+		if tokenFileAbsent {
+			err = missingTokenFileNote(err, opts.tokenFile)
+		}
 		return agentTerminal(ctx, logger, err)
 	}
 	logStartPlan(logger, plan, status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
