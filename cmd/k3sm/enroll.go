@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -373,8 +374,18 @@ const nodePodCIDRBits = 24
 
 // listPeers returns the current MeshPeer specs from the apiserver.
 func (e *meshEnroller) listPeers(ctx context.Context) ([]netv1.MeshPeerSpec, error) {
+	return listMeshPeers(ctx, e.client)
+}
+
+// listMeshPeers is the one-shot LIST of every MeshPeer spec in the cluster. It is
+// a free function over the REST client rather than a method because the enroller
+// is not its only caller: a resuming worker's mesh bring-up lists the same
+// resource through the same client construction before it programs anything (see
+// meshPeerLister), and a second copy of the list-and-project would be a second
+// place for the projection to drift.
+func listMeshPeers(ctx context.Context, client rest.Interface) ([]netv1.MeshPeerSpec, error) {
 	var list netv1.MeshPeerList
-	if err := e.client.Get().Resource(meshPeerResource).Do(ctx).Into(&list); err != nil {
+	if err := client.Get().Resource(meshPeerResource).Do(ctx).Into(&list); err != nil {
 		return nil, err
 	}
 	specs := make([]netv1.MeshPeerSpec, 0, len(list.Items))
@@ -382,6 +393,39 @@ func (e *meshEnroller) listPeers(ctx context.Context) ([]netv1.MeshPeerSpec, err
 		specs = append(specs, list.Items[i].Spec)
 	}
 	return specs, nil
+}
+
+// meshPeerLister returns a one-shot MeshPeer LIST bound to a kubeconfig — the
+// production value of meshBringUp.listPeers.
+//
+// The REST client is built ONCE, here, and its construction error is carried into
+// the returned function: client construction is pure (it opens no connection), so
+// building it before the wireguard device exists is safe, while re-building it per
+// poll attempt would churn a transport for every retry. A failure to build is
+// reported on every call rather than at wiring time, because the caller's contract
+// is a lister that can fail — the bring-up degrades to the stored seed, it does not
+// refuse to bring the mesh up.
+func meshPeerLister(kubeconfig string) func(context.Context) ([]netv1.MeshPeerSpec, error) {
+	var client rest.Interface
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		err = fmt.Errorf("load kubeconfig for the MeshPeer list: %w", err)
+	} else {
+		// A REQUEST timeout, on THIS client only (the enroller's serves a running
+		// control plane and keeps its own posture): clientcmd leaves Timeout at zero,
+		// so without it a connection the apiserver accepts and never answers hangs
+		// the resuming node's poll past its own bound. The poll's per-attempt context
+		// covers the same hazard; both are cheap and the client-side one also bounds
+		// every later caller of this lister.
+		cfg.Timeout = meshPeerAttemptTimeout
+		client, err = meshPeerRESTClient(cfg)
+	}
+	return func(ctx context.Context) ([]netv1.MeshPeerSpec, error) {
+		if err != nil {
+			return nil, err
+		}
+		return listMeshPeers(ctx, client)
+	}
 }
 
 // writePeer creates the MeshPeer, or updates it in place on a rejoin (AlreadyExists).

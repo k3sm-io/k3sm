@@ -49,6 +49,11 @@ type fakeMeshDatapath struct {
 	started bool
 	downs   int
 	closes  int
+	// programs records the peer set of every Reconcile, in order. The RESUME
+	// gate reads it: what a bring-up programs into the kernel device, and when,
+	// is the whole behaviour under test there (see
+	// TestAgentResumeSeedsPeersFromALiveList).
+	programs [][]netv1.MeshPeerSpec
 }
 
 func (f *fakeMeshDatapath) MeshIP() netip.Addr { return f.meshIP }
@@ -60,7 +65,23 @@ func (f *fakeMeshDatapath) Start(context.Context) error {
 	return nil
 }
 
-func (f *fakeMeshDatapath) Reconcile(context.Context, []netv1.MeshPeerSpec) error { return nil }
+func (f *fakeMeshDatapath) Reconcile(_ context.Context, peers []netv1.MeshPeerSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// COPY: the caller owns the slice and may reuse its backing array, so keeping
+	// the header would record whatever it holds later, not what was programmed.
+	f.programs = append(f.programs, append([]netv1.MeshPeerSpec(nil), peers...))
+	return nil
+}
+
+// programmed returns the recorded peer sets, in reconcile order.
+func (f *fakeMeshDatapath) programmed() [][]netv1.MeshPeerSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]netv1.MeshPeerSpec, len(f.programs))
+	copy(out, f.programs)
+	return out
+}
 
 func (f *fakeMeshDatapath) Close(context.Context) error {
 	f.mu.Lock()
