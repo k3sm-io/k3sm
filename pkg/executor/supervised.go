@@ -1225,6 +1225,17 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	// never dies would otherwise re-open the unbounded wait the loop above just
 	// closed.
 	reaped := awaitReapers(ctx, &s.reapers)
+	if !reaped {
+		// Names only — never argv, never a log line. When a component was witnessed
+		// exiting but its reaper is still in flight, Stop cannot tell WHOSE, so it
+		// names every component it stopped rather than guessing one.
+		late := alive
+		if len(late) == 0 {
+			late = componentNames(comps)
+		}
+		s.cfg.Logger.Warn("control-plane reaper goroutines did not finish inside the teardown budget",
+			"components", strings.Join(late, ","))
+	}
 
 	switch {
 	case len(alive) > 0:
@@ -1233,6 +1244,16 @@ func (s *Supervised) Stop(ctx context.Context) error {
 		return fmt.Errorf("%w: every component was signalled and reaped, but a reaper goroutine is still in flight", ErrStopBudgetExceeded)
 	}
 	return nil
+}
+
+// componentNames returns the components' names, in the order given. Names only:
+// the teardown's reports name children, never their argv or their log content.
+func componentNames(comps []*component) []string {
+	names := make([]string, 0, len(comps))
+	for _, c := range comps {
+		names = append(names, c.name)
+	}
+	return names
 }
 
 // awaitReapers waits for every live reaper goroutine to finish, bounded by ctx,

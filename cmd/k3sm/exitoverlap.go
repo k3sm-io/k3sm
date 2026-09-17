@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -50,6 +51,25 @@ import (
 // that sets one, and its hook launches the control-plane stop so the stop is
 // already draining while the vm helpers come down. runServer's own defer then
 // WAITS for that stop instead of starting it.
+//
+// One thing the overlap must NOT do is pull the apiserver out from under the node
+// that is still talking to it. The Virtual Kubelet run loop and the node-status
+// loop keep writing (a last status publication, a pod status flush) until they
+// return, and on the SIGTERM path awaitNodeExit returns on ctx.Done without waiting
+// for them. So the hook does not fire the moment teardown starts: it fires once
+// both node loops have returned, or after nodeDrainGrace, whichever comes first.
+// The runtime close runs the whole time either way, so the overlap is preserved
+// minus at most that grace.
+
+// nodeDrainGrace bounds how long the exit hook waits for the node's own loops to
+// return before letting the caller's teardown begin anyway.
+//
+// It is a DRAIN, not a deadline the loops are expected to need: a cancelled VK run
+// loop returns in milliseconds, and this only has to cover the write already in
+// flight when the signal arrived. It is bounded because a wedged run loop must not
+// be able to hold the control-plane stop past the point where launchd SIGKILLs the
+// daemon — pkg/install budgets this stage explicitly (teardownNodeDrain).
+const nodeDrainGrace = 5 * time.Second
 
 // controlPlaneStopWaitMargin is how much longer than the stop's own budget
 // runServer is willing to wait for it.
@@ -83,9 +103,18 @@ type controlPlaneStopper struct {
 	waitBound time.Duration
 	log       *slog.Logger
 
-	mu   sync.Mutex
-	done chan error // non-nil once begin has launched the stop
+	mu sync.Mutex
+	// begun is claimed by whichever of begin and finish gets there first, so a
+	// hook that fires late (its drain wait outlived a teardown that had already
+	// reached finish) cannot start a second stop over the first.
+	begun bool
+	done  chan error // non-nil once begin has launched the stop
 }
+
+// errControlPlaneStopTimeout is what finish returns when its outer bound expires
+// with the stop still running. It is reported HERE, at the wait that owns the
+// decision, so the caller does not log it a second time.
+var errControlPlaneStopTimeout = errors.New("control-plane stop did not return within its wait bound")
 
 // newControlPlaneStopper returns the stopper `k3sm server` uses: the executor's
 // own StopBound for the stop, that plus the margin for the wait.
@@ -105,10 +134,11 @@ func newControlPlaneStopper(base context.Context, stop func(context.Context) err
 // close, which is what makes the two overlap. Calls after the first are no-ops.
 func (s *controlPlaneStopper) begin() {
 	s.mu.Lock()
-	if s.done != nil {
+	if s.begun {
 		s.mu.Unlock()
 		return
 	}
+	s.begun = true
 	done := make(chan error, 1)
 	s.done = done
 	s.mu.Unlock()
@@ -127,16 +157,23 @@ func (s *controlPlaneStopper) begin() {
 // the teardown is still reaping.
 func (s *controlPlaneStopper) finish() error {
 	s.mu.Lock()
-	done := s.done
-	s.mu.Unlock()
-	if done == nil {
+	if !s.begun {
+		// Claim it, so a hook still inside its drain wait finds the work done
+		// rather than starting a second stop behind this one.
+		s.begun = true
+		s.mu.Unlock()
 		return s.runStop()
 	}
+	done := s.done
+	s.mu.Unlock()
+
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(s.waitBound):
-		return fmt.Errorf("control-plane stop still running %s after it began; leaving it to launchd and the next start", s.waitBound)
+		s.log.Error("the control-plane stop is still running past its wait bound; launchd's ExitTimeOut will reap whatever is left of it",
+			"stage", "control-plane-stop", "still_running", true, "wait_bound", s.waitBound)
+		return fmt.Errorf("%w: control-plane stop still running %s after it began", errControlPlaneStopTimeout, s.waitBound)
 	}
 }
 
@@ -154,22 +191,51 @@ func (s *controlPlaneStopper) runStop() error {
 	return s.stop(ctx)
 }
 
-// teardownWithConcurrentExit composes the node's teardown: onExitBegin first, then
-// closeRuntime. The point is what onExitBegin is allowed to do — start work and
-// return — so that whatever it started runs WHILE the runtime close does, instead
-// of after it.
+// teardownWithConcurrentExit composes the node's teardown: it starts the wait for
+// onExitBegin's turn and then runs closeRuntime, so the caller's teardown stage
+// overlaps the runtime close instead of following it.
+//
+// onExitBegin fires on its own goroutine, once, as soon as nodeExited closes or
+// grace elapses — the node's loops get to finish their last apiserver writes before
+// the control plane starts going away, and a loop that never returns cannot hold
+// the stop past its budget. nodeExited is a SUPPLIER because the channel does not
+// exist yet when startNode wires this up; it is read on the caller's goroutine at
+// teardown time, and nil (or a nil channel) means there is nothing to drain — the
+// paths that return before the node's loops ever start.
 //
 // It wraps the close rather than moving it: closeRuntime is the same closure
 // stopEmbeddedRuntime built, still deferred in the same position, still the thing
 // awaitNodeExit runs on both exit paths. A nil onExitBegin (every bring-up but
 // `k3sm server`) returns closeRuntime untouched.
-func teardownWithConcurrentExit(onExitBegin func(), closeRuntime func()) func() {
+func teardownWithConcurrentExit(onExitBegin func(), nodeExited func() <-chan struct{}, grace time.Duration, closeRuntime func()) func() {
 	if onExitBegin == nil {
 		return closeRuntime
 	}
 	var once sync.Once
 	return func() {
-		once.Do(onExitBegin)
+		once.Do(func() {
+			var drained <-chan struct{}
+			if nodeExited != nil {
+				drained = nodeExited()
+			}
+			go func() {
+				awaitNodeDrain(drained, grace)
+				onExitBegin()
+			}()
+		})
 		closeRuntime()
+	}
+}
+
+// awaitNodeDrain blocks until drained closes or grace elapses. A nil channel is
+// "already drained": the node's loops never started, so there is nothing whose last
+// write could be cut off.
+func awaitNodeDrain(drained <-chan struct{}, grace time.Duration) {
+	if drained == nil {
+		return
+	}
+	select {
+	case <-drained:
+	case <-time.After(grace):
 	}
 }

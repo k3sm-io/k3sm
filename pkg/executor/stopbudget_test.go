@@ -17,14 +17,56 @@ limitations under the License.
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// logCapture is a concurrency-safe slog handler: the teardown logs from the
+// caller's goroutine and the reapers from theirs, so a test reading the lines
+// needs the writes serialized.
+type logCapture struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	text slog.Handler
+}
+
+func newLogCapture() *logCapture {
+	c := &logCapture{}
+	c.text = slog.NewTextHandler(&c.buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	return c
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(ctx context.Context, r slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.text.Handle(ctx, r)
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+func (c *logCapture) logger() *slog.Logger               { return slog.New(c) }
+
+// line returns the first logged line containing want, or "".
+func (c *logCapture) line(want string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, l := range strings.Split(c.buf.String(), "\n") {
+		if strings.Contains(l, want) {
+			return l
+		}
+	}
+	return ""
+}
 
 // fakeReapedComponent builds a component backed by a REAL child in its own process
 // group, with the same single-reaper wiring spawnEnv gives a production component:
@@ -132,6 +174,45 @@ func TestStopHonoursItsContextAfterSIGKILL(t *testing.T) {
 		// though the budget was already spent when its turn came.
 		if !processGone(t, stuck.cmd.Process.Pid) {
 			t.Errorf("the stuck component's child is still running; Stop stopped signalling once its budget expired")
+		}
+	})
+
+	t.Run("a reaper still in flight is named at WARN", func(t *testing.T) {
+		// The second way the budget can expire: every CHILD was witnessed exiting,
+		// but a reaper goroutine has not finished its post-exit work (its supervision
+		// decision, a crash callback). Stop must not park on it either, and the
+		// give-up is reported at WARN naming components — names only, never argv or
+		// a log line — because an Error here would read as a failed teardown when the
+		// children are in fact all reaped.
+		logs := newLogCapture()
+		s := NewSupervised(Config{WorkDir: t.TempDir(), Logger: logs.logger()})
+		s.comps = []*component{fakeReapedComponent(t, "kine")}
+		s.started = true
+		// A reaper that never finishes. Released on the way out so the goroutine
+		// awaitReapers left behind ends with the test.
+		s.reapers.Add(1)
+		t.Cleanup(func() { s.reapers.Done() })
+
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		start := time.Now()
+		err := s.Stop(ctx)
+		elapsed := time.Since(start)
+
+		if !errors.Is(err, ErrStopBudgetExceeded) {
+			t.Fatalf("Stop = %v, want an error wrapping ErrStopBudgetExceeded", err)
+		}
+		if elapsed > budget+margin {
+			t.Fatalf("Stop returned after %s, want it back by its %s deadline — the reapers.Wait is still unbounded", elapsed, budget)
+		}
+		line := logs.line("components=")
+		switch {
+		case line == "":
+			t.Errorf("the give-up logged no line naming the components; logged:\n%s", logs.line(""))
+		case !strings.Contains(line, "level=WARN"):
+			t.Errorf("the give-up logged %q, want it at WARN", line)
+		case !strings.Contains(line, "components=kine"):
+			t.Errorf("the give-up logged %q, want it to name kine", line)
 		}
 	})
 

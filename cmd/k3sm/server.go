@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -614,7 +615,10 @@ func runServer(args []string) (err error) {
 	// pkg/install derives from that same symbol; see exitoverlap.go.
 	cpStop := newControlPlaneStopper(ctx, exec.Stop, logger)
 	defer func() {
-		if err := cpStop.finish(); err != nil {
+		// A wait that timed out has already reported itself, with the stage and the
+		// launchd consequence in its fields; logging it again here would double-report
+		// one event under two messages.
+		if err := cpStop.finish(); err != nil && !errors.Is(err, errControlPlaneStopTimeout) {
 			logger.Error("control-plane shutdown", "err", err)
 		}
 	}()

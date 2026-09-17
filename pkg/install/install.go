@@ -2368,15 +2368,18 @@ func ServerPlist(cfg Config) []byte {
 //	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
 //	                        runtimed pkg/runtime/close.go — the embedded runtime's
 //	                        concurrent vm-helper stop, deferred by startNode.
-//	control-plane stop 35s  executor.StopBound (30s) — four components drained
+//	control-plane stop 40s  executor.StopBound (30s) — four components drained
 //	                        serially at drainGrace each, plus the post-SIGKILL reap
 //	                        — plus the 5s outer margin runServer's WAIT for it adds
-//	                        (cmd/k3sm's controlPlaneStopWaitMargin). SERVER ONLY: a
-//	                        worker runs no control plane.
+//	                        (cmd/k3sm's controlPlaneStopWaitMargin), plus the 5s the
+//	                        stop waits for the node's own loops to drain first
+//	                        (cmd/k3sm's nodeDrainGrace), so the apiserver does not go
+//	                        away under a run loop still publishing status. SERVER
+//	                        ONLY: a worker runs no control plane.
 //	                        It runs CONCURRENTLY with the runtimed close above (the
-//	                        node fires the server's stop from the very start of its
-//	                        own teardown — cmd/k3sm/exitoverlap.go), so the two
-//	                        together cost the LARGER of them, never their sum.
+//	                        node starts the server's stop from its own teardown —
+//	                        cmd/k3sm/exitoverlap.go), so the two together cost the
+//	                        LARGER of them, never their sum.
 //	control socket      5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
 //	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go — both roles.
 //	headroom           10s  launchd's own signal/reap latency and the log flush.
@@ -2386,18 +2389,19 @@ func ServerPlist(cfg Config) []byte {
 // TestExitTimeOutCoversTheDaemonTeardown compares the control-plane stage with
 // executor.StopBound (the one owner this package can import), and
 // hack/acceptance/B253.sh's CI tier reads runtimed's two constants out of its
-// module and compares them with the close stage. The two stages whose owners live
-// in package main (runtimedSocketShutdownGrace and controlPlaneStopWaitMargin)
-// have no importable owner and no gate — 10s of a 60s budget between them, and the
-// headroom absorbs a drift in either.
+// module and compares them with the close stage. The three stages whose owners live
+// in package main (runtimedSocketShutdownGrace, controlPlaneStopWaitMargin and
+// nodeDrainGrace) have no importable owner and no gate — 15s of a 60s budget
+// between them, and the headroom absorbs a drift in any of them.
 //
 // The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
 // read by operators in a plist and 60 is legible where 57 invites the question of
 // what the 7 was for. Rounding up can only add headroom.
 //
 // Both roles land on the same 60s today, and that is a RESULT, not a coincidence
-// to lean on: the server's extra stage is now overlapped with a longer one, so it
-// adds nothing until the control-plane stop outgrows the runtimed close.
+// to lean on: the server's extra stage is overlapped with the runtimed close, so
+// only the 3s by which it now exceeds that close reaches the total, and the
+// rounding absorbs them.
 const (
 	teardownRuntimedClose = 37
 	teardownControlSocket = 5
@@ -2410,6 +2414,12 @@ const (
 	// controlPlaneStopWaitMargin, which lives in package main and so, like
 	// runtimedSocketShutdownGrace, cannot be imported and asserted here.
 	teardownStopWaitMargin = 5
+	// teardownNodeDrain is how long the control-plane stop waits, before it starts
+	// at all, for the node's Virtual Kubelet and status loops to return —
+	// cmd/k3sm's nodeDrainGrace, another package-main bound. It is part of the
+	// concurrent stage rather than a stage of its own: it is spent inside the same
+	// window the runtimed close occupies.
+	teardownNodeDrain = 5
 
 	// serverConcurrentTeardown is the cost of the server's two LONGEST stages,
 	// which overlap rather than queue: the node starts the control-plane stop at
@@ -2417,8 +2427,10 @@ const (
 	// that stop drains (cmd/k3sm/exitoverlap.go). They contend for nothing — vm
 	// host helpers on one side, control-plane children on the other — so the budget
 	// is the larger of the two, and the day either one grows past the other this
-	// arithmetic follows it without being re-chosen.
-	serverConcurrentTeardown = max(teardownRuntimedClose, teardownControlPlane+teardownStopWaitMargin)
+	// arithmetic follows it without being re-chosen. The control-plane side counts
+	// its own drain wait, because the clock on it starts when the node's teardown
+	// does, not when the stop finally begins.
+	serverConcurrentTeardown = max(teardownRuntimedClose, teardownNodeDrain+teardownControlPlane+teardownStopWaitMargin)
 
 	serverTeardownBudget = serverConcurrentTeardown + teardownControlSocket + teardownMesh + teardownHeadroom
 	agentTeardownBudget  = teardownRuntimedClose + teardownControlSocket + teardownMesh + teardownHeadroom

@@ -36,12 +36,13 @@ import (
 // helper on either, the exact failure the teardown exists to prevent.
 //
 // The server's two longest stages — the embedded runtime's close and the
-// control-plane stop — no longer queue: the node begins the stop at the very start
-// of its own teardown and closes the runtime while it drains
-// (cmd/k3sm/exitoverlap.go), so the pair costs the LARGER of them. That is the one
-// structural change to this budget since it was first derived, and the case below
-// asserts it as an invariant (the pair's budget covers each of them) rather than as
-// the subtraction the serial model used.
+// control-plane stop, the latter preceded by the drain that lets the node's own
+// loops finish writing — no longer queue: the node starts the stop from its own
+// teardown and closes the runtime while that runs (cmd/k3sm/exitoverlap.go), so the
+// pair costs the LARGER of them. That is the one structural change to this budget
+// since it was first derived, and the case below asserts it as an invariant (the
+// pair's budget covers each of them) rather than as the subtraction the serial
+// model used.
 //
 // HONEST SCOPE. The "at least the sum" assertion is structural today — the
 // ExitTimeOut is computed from those same stages, so it cannot currently fail; it
@@ -50,8 +51,8 @@ import (
 // assertions that can actually go red are the ones binding a stage LITERAL to the
 // owner of that bound: executor.StopBound here, and — for runtimed's two, which
 // are unexported — hack/acceptance/B253.sh, which reads them out of the runtimed
-// module and compares. Two stages have no gate at all: runtimedSocketShutdownGrace
-// and controlPlaneStopWaitMargin both live in package main.
+// module and compares. Three stages have no gate at all: runtimedSocketShutdownGrace,
+// controlPlaneStopWaitMargin and nodeDrainGrace all live in package main.
 func TestExitTimeOutCoversTheDaemonTeardown(t *testing.T) {
 	// launchd's own default, stated so the "> 20" assertions below read as the
 	// claim they are: the default is a SIGKILL deadline k3sm cannot live inside.
@@ -78,7 +79,7 @@ func TestExitTimeOutCoversTheDaemonTeardown(t *testing.T) {
 				name  string
 				bound int
 			}{
-				{"runtimed close + control-plane stop, CONCURRENT (the larger of them)", serverConcurrentTeardown},
+				{"runtimed close + node drain/control-plane stop, CONCURRENT (the larger of them)", serverConcurrentTeardown},
 				{"runtimed control socket (runtimedSocketShutdownGrace)", teardownControlSocket},
 				{"mesh teardown (meshTeardownTimeout)", teardownMesh},
 				{"launchd signal/reap headroom", teardownHeadroom},
@@ -127,8 +128,8 @@ func TestExitTimeOutCoversTheDaemonTeardown(t *testing.T) {
 	if serverConcurrentTeardown < teardownRuntimedClose {
 		t.Errorf("the concurrent stage budgets %ds but the runtimed close alone costs %ds", serverConcurrentTeardown, teardownRuntimedClose)
 	}
-	if want := teardownControlPlane + teardownStopWaitMargin; serverConcurrentTeardown < want {
-		t.Errorf("the concurrent stage budgets %ds but the control-plane stop plus its wait margin costs %ds", serverConcurrentTeardown, want)
+	if want := teardownNodeDrain + teardownControlPlane + teardownStopWaitMargin; serverConcurrentTeardown < want {
+		t.Errorf("the concurrent stage budgets %ds but the control-plane stop costs %ds — its node drain, its own bound and the wait margin", serverConcurrentTeardown, want)
 	}
 
 	// The server's budget must exceed the agent's by exactly what its extra,
