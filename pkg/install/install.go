@@ -53,6 +53,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -261,6 +262,21 @@ const (
 	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
 	// writes on a successful join — see AgentCredentialPath.
 	agentNodeKubeconfigName = "node.kubeconfig"
+	// agentNodePasswordName is the leaf name of the node-password `k3sm agent`
+	// mints once and reuses on every restart, so the control plane's
+	// first-write-wins anti-impersonation binding keeps matching
+	// (cmd/k3sm's loadOrCreateNodePassword).
+	agentNodePasswordName = "node-password"
+	// agentMeshKeyName is the leaf name of the worker's persisted wireguard
+	// private key (cmd/k3sm's meshKeyRef). Like the node-password it is minted
+	// once and MUST survive: a re-minted key rotates the node's mesh identity
+	// and blackholes it until every peer re-reconciles.
+	//
+	// Both names are stated here rather than imported because pkg/install cannot
+	// import cmd/k3sm. They are the on-disk contract between the agent that
+	// writes them and the installer that has to hand them over; adoptLegacyAgentFiles
+	// documents what goes wrong when the two spellings drift.
+	agentMeshKeyName = "node.key"
 )
 
 // datavolStagingName is the leaf name of the migration staging mount point. It
@@ -358,6 +374,27 @@ func daemonLabel(r Role) string {
 		return AgentLabel
 	}
 	return ServerLabel
+}
+
+// OwnedEntry is one filesystem entry as an ownership decision sees it: where it
+// is, who owns it, what it permits, and what kind of entry it is. It is what the
+// System seam's Owner and ListOwned answer with.
+//
+// Mode carries the permission bits ONLY (fs.FileMode.Perm) — the kind is in
+// IsDir/Regular, so no caller has to re-derive it from the type bits and get the
+// derivation subtly different from the next caller's.
+type OwnedEntry struct {
+	// Path is the full path of the entry, so an error or a chown built from an
+	// entry never has to re-join a directory and a name.
+	Path string
+	// UID and GID are the numeric owner and group.
+	UID, GID int
+	// Mode is the permission bits.
+	Mode fs.FileMode
+	// IsDir and Regular are the two kinds this package judges. Both false means
+	// something else entirely — a symlink, a socket, a device — which the
+	// legacy-file adoption deliberately declines to have an opinion about.
+	IsDir, Regular bool
 }
 
 // System is the privileged-operation seam install/uninstall drive. The real
@@ -539,6 +576,32 @@ type System interface {
 	// The installer needs it for exactly one judgement: whether the operator's
 	// join token file is readable by anyone but its owner.
 	FileMode(path string) (fs.FileMode, error)
+	// Owner reports who owns the entry at path, what it permits, and what kind
+	// of entry it is — an lstat, so a symlink is described rather than followed.
+	// A missing entry has ReadFile's contract (an error satisfying
+	// errors.Is(err, fs.ErrNotExist)): absence is a posture the caller reads,
+	// never a failure this seam decides.
+	//
+	// FileMode above answers only "what does this file permit"; ownership is a
+	// separate question and the legacy-file adoption cannot be asked in terms of
+	// the mode alone, because root:wheel 0600 and _k3sm:staff 0600 are the same
+	// mode and opposite outcomes for the daemon that has to read the file.
+	Owner(path string) (OwnedEntry, error)
+	// ListOwned lists the entries DIRECTLY inside dir, each described exactly as
+	// Owner describes it, and never descends into a subdirectory. A missing dir
+	// has Owner's missing-entry contract.
+	//
+	// The shallow contract is the point, not a simplification: its one caller
+	// judges the agent work dir, which holds a fixed handful of credential
+	// files, and a seam that walked would invite the same judgement to be
+	// applied to trees (the pod-log tree) where it does not belong.
+	ListOwned(dir string) ([]OwnedEntry, error)
+	// Chown sets the owner of path to uid:gid and changes NOTHING else. The mode
+	// is deliberately left exactly as it was found — the files this is used on
+	// are already 0600 and re-deciding their mode here would be a second,
+	// unreviewed policy sitting next to the one WriteServiceUserFile applies.
+	// It does not follow a symlink, for the reason Owner does not.
+	Chown(path string, uid, gid int) error
 	// WriteLaunchDaemon writes a launchd plist root:wheel at plistPath, at mode.
 	//
 	// The mode is a PARAMETER rather than a constant inside the implementation
@@ -951,7 +1014,132 @@ func AgentCredentialPath(dataRoot string) string {
 // on the daemon's argv and the one path the installer writes, and a second
 // spelling of either would be a daemon pointed at a file nobody wrote.
 func (c Config) agentTokenPath() string {
-	return filepath.Join(c.DataRoot, agentWorkSubdir, agentTokenName)
+	return filepath.Join(c.agentWorkDir(), agentTokenName)
+}
+
+// agentWorkDir is the agent's state root under the data root — the directory
+// `k3sm agent --work-dir` defaults to, holding this node's whole persisted
+// identity: its node credential, its node-password, its mesh key and the staged
+// join token.
+func (c Config) agentWorkDir() string { return filepath.Join(c.DataRoot, agentWorkSubdir) }
+
+// legacyAgentArtifacts is the FIXED table of leaf names the agent work dir is
+// known to hold: the five artifacts of a stored node credential, plus the three
+// this package and cmd/k3sm name themselves.
+//
+// The credential names come from nodecred.Store rather than being retyped, so
+// the directory the installer repairs and the directory the daemon reads can
+// never disagree about what lives in it. The dir value is irrelevant — only the
+// leaf names are taken.
+func legacyAgentArtifacts() map[string]bool {
+	store := nodecred.Store{Dir: "."}
+	known := make(map[string]bool, len(store.Paths())+3)
+	for _, p := range store.Paths() {
+		known[filepath.Base(p)] = true
+	}
+	for _, name := range []string{agentNodePasswordName, agentMeshKeyName, agentTokenName} {
+		known[name] = true
+	}
+	return known
+}
+
+// legacyUnreadableMask is the read access that makes an UNRECOGNISED file in the
+// agent work dir harmless: any group or other read bit. A file carrying one of
+// them is readable by the service user whoever owns it, so the daemon is not
+// blocked by it and the installer has no reason to have an opinion about it.
+const legacyUnreadableMask fs.FileMode = 0o044
+
+// adoptLegacyAgentFiles hands the agent work dir and the known artifacts inside
+// it to the service user, on a reinstall over a worker that was installed before
+// the node daemon moved from root to _k3sm.
+//
+// This is a MIGRATION to the posture a fresh install already produces — service
+// uid, group staff, the mode untouched, which is exactly what
+// WriteServiceUserFile writes the staged join token at — and NOT a widening of
+// anything. Nothing becomes readable to an account that could not read it
+// before: every file involved is 0600 both before and after, and the mode is
+// carried across verbatim rather than re-decided. What changes is only WHICH
+// single uid the 0600 names, from root to the unprivileged user the daemon now
+// runs as.
+//
+// Without it, such a node crash-loops: `k3sm agent` starts as _k3sm, finds a
+// root-owned 0600 node-password it cannot rewrite, and dies on "persist
+// node-password: permission denied" — with the same fate waiting behind it for
+// the mesh key and the node credential. Only root can hand those files over and
+// only the installer runs as root, which is why this is an install step and not
+// something the node does for itself at start-up (the reasoning EnsureRunDir and
+// EnsureContainerLogDir already record for their own directories).
+//
+// Three limits, all deliberate:
+//
+//   - Only the entries in legacyAgentArtifacts are adopted. A file k3sm does not
+//     recognise is never chowned, because giving an unknown file to the service
+//     user IS the widening this function is careful not to be.
+//   - An unrecognised regular file the service user cannot read REFUSES the
+//     install, before a single chown happens. It would otherwise be a silent
+//     landmine: the daemon may need it, nothing here can know, and an install
+//     that reported success over it would hand back the crash-loop it was run to
+//     fix. The operator is told the file and both remedies.
+//   - Nothing is walked. Subdirectories are not descended into and not judged:
+//     this is the five-artifact credential directory, not a tree.
+func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
+	dir := cfg.agentWorkDir()
+	svcUID, svcGID := int(uid), DataRootGID
+	self, err := sys.Owner(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// No work dir yet: a first install, or one whose token staging is still
+		// to create it. Nothing to migrate.
+		return nil
+	case err != nil:
+		return fmt.Errorf("install: inspect the agent work dir %s: %w", dir, err)
+	case !self.IsDir:
+		return fmt.Errorf("install: the agent work dir %s is not a directory: the agent daemon keeps this node's credential there, so move whatever is at that path aside before reinstalling", dir)
+	}
+	entries, err := sys.ListOwned(dir)
+	if err != nil {
+		return fmt.Errorf("install: list the agent work dir %s: %w", dir, err)
+	}
+
+	// Two passes, and the split is the contract: everything is CLASSIFIED before
+	// anything is changed, so a refusal leaves the directory exactly as it was
+	// found rather than half-migrated.
+	known := legacyAgentArtifacts()
+	var adopt []OwnedEntry
+	var refuse []string
+	if self.UID == 0 && svcUID != 0 {
+		adopt = append(adopt, self)
+	}
+	for _, e := range entries {
+		switch {
+		case known[filepath.Base(e.Path)]:
+			if e.UID == 0 && svcUID != 0 {
+				adopt = append(adopt, e)
+			}
+		case !e.Regular:
+			// A subdirectory, a symlink, a socket: not this step's business.
+		case e.UID != svcUID && e.Mode&legacyUnreadableMask == 0:
+			refuse = append(refuse, e.Path)
+		}
+	}
+	if len(refuse) > 0 {
+		return fmt.Errorf("install: the agent work dir %s holds file(s) the %s service user the node daemon runs as cannot read, and k3sm does not recognise them: %s — `sudo chown %s <file>` if the file belongs to this node's agent, or remove it if it is not k3sm's; k3sm will not hand a file it cannot account for to the service user on its own",
+			dir, cfg.ServiceUser, strings.Join(refuse, ", "), cfg.ServiceUser)
+	}
+	for _, e := range adopt {
+		if err := sys.Chown(e.Path, svcUID, svcGID); err != nil {
+			return fmt.Errorf("install: hand the agent state %s over to %s (uid %d): %w", e.Path, cfg.ServiceUser, svcUID, err)
+		}
+	}
+	if len(adopt) > 0 {
+		paths := make([]string, len(adopt))
+		for i, e := range adopt {
+			paths[i] = e.Path
+		}
+		cfg.Logger.Info("adopted agent state left root-owned by an install that predates the service user (the mode is unchanged; only the uid the 0600 names moves)",
+			"user", cfg.ServiceUser, "uid", svcUID, "paths", strings.Join(paths, ","))
+	}
+	return nil
 }
 
 // serverTokenPath is where Install stages the static admin token for the
@@ -1431,6 +1619,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     joined node presents its stored credential and needs no token.
 	if cfg.Role == RoleAgent && cfg.TokenFile != "" {
 		if err := stageJoinToken(sys, cfg, uid); err != nil {
+			return err
+		}
+	}
+
+	// 1e′. Hand any agent state an OLDER install left root-owned over to the
+	//     service user — after the step above, which is what may have just
+	//     created the work dir, and well before step 4 restarts the daemon that
+	//     has to write in it. See adoptLegacyAgentFiles for why a node installed
+	//     before the daemon moved to _k3sm otherwise crash-loops on its own
+	//     node-password, and for why this is a migration to the fresh-install
+	//     posture rather than a widening of it.
+	if cfg.Role == RoleAgent {
+		if err := adoptLegacyAgentFiles(sys, cfg, uid); err != nil {
 			return err
 		}
 	}

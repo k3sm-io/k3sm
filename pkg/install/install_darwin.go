@@ -304,6 +304,75 @@ func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 	return nil
 }
 
+// Owner reports the ownership, permission bits and kind of path. See the System
+// interface for the contract.
+//
+// Lstat, not Stat: a symlink is described as itself. Following it would let a
+// link planted in the agent work dir point the ownership judgement — and then
+// the Chown below — at a file somewhere else entirely.
+func (darwinSystem) Owner(path string) (OwnedEntry, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return OwnedEntry{}, err
+	}
+	return ownedEntry(path, fi)
+}
+
+// ListOwned lists the entries directly inside dir, each as Owner describes it.
+// os.ReadDir's per-entry Info is itself lstat-derived, so a symlink in the
+// directory is described rather than followed, exactly as in Owner.
+func (darwinSystem) ListOwned(dir string) ([]OwnedEntry, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]OwnedEntry, 0, len(ents))
+	for _, e := range ents {
+		fi, err := e.Info()
+		if err != nil {
+			// The entry went away between the read and the stat. A directory
+			// being judged before a chown must be described completely or not at
+			// all, so this is an error rather than a skipped entry.
+			return nil, fmt.Errorf("stat %s: %w", filepath.Join(dir, e.Name()), err)
+		}
+		owned, err := ownedEntry(filepath.Join(dir, e.Name()), fi)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, owned)
+	}
+	return out, nil
+}
+
+// ownedEntry projects an fs.FileInfo onto OwnedEntry. The unix ownership comes
+// from the syscall.Stat_t behind it, which is the only place uid/gid live; an
+// fs.FileInfo that carries none is an ERROR rather than a zero uid, because
+// "owned by root" is precisely the verdict a zero value would fabricate.
+func ownedEntry(path string, fi fs.FileInfo) (OwnedEntry, error) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return OwnedEntry{}, fmt.Errorf("cannot read the ownership of %s", path)
+	}
+	return OwnedEntry{
+		Path:    path,
+		UID:     int(st.Uid),
+		GID:     int(st.Gid),
+		Mode:    fi.Mode().Perm(),
+		IsDir:   fi.IsDir(),
+		Regular: fi.Mode().IsRegular(),
+	}, nil
+}
+
+// Chown sets path's owner to uid:gid and touches nothing else — no chmod, so
+// the mode the file was found at is the mode it keeps.
+//
+// Lchown rather than Chown, for Owner's reason: the ownership judgement was made
+// about the entry itself, and following a symlink here would apply that verdict
+// to a different file than the one it was made about.
+func (darwinSystem) Chown(path string, uid, gid int) error {
+	return os.Lchown(path, uid, gid)
+}
+
 // CopyToRootOwned copies src to exactly dst (parent dir created root:wheel 0755)
 // using ditto (preserves the signature/extended attributes the notarized binary
 // needs). dst is the caller's contract — never derived from src's basename, so a
