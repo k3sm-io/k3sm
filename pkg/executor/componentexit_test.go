@@ -54,8 +54,55 @@ func writeChild(t *testing.T, wd, name, script string) {
 	}
 }
 
+// The bounds in this file are load-bearing, not decoration. A crash test stacks
+// TWO gates on one child — the FIFO the child blocks on, and the release that
+// opens it — and on 2026-09-17 a loaded 8 GiB host starved a child before it ever
+// reached its read. The release exhausted its own (bounded) deadline and recorded
+// exactly that, but the boot stub was waiting on <-c.exited with no deadline at
+// all: Start never returned, the recorded reason was never printed, and the whole
+// package died at `go test`'s 10-minute alarm with no attribution to any test. So
+// every wait a boot stub does on a held child carries a deadline (childStartBound),
+// and giving up RETURNS the release's recorded reason as a bring-up error rather
+// than calling t.Fatal — a stub runs synchronously inside Start on the test
+// goroutine, so a Fatal's runtime.Goexit would skip Start's teardown and leave the
+// held child running.
+
+// childBound is the pair of deadlines a FIFO-gated crash test waits on: how long
+// the release retries the gate open, and how long a boot stub then waits for the
+// held child to die. stub is the longer of the two by construction, so a stub that
+// gives up can quote the release's recorded reason instead of racing it.
+type childBound struct {
+	release time.Duration
+	stub    time.Duration
+}
+
+// newChildBound derives the pair from a release deadline, tripled under the race
+// detector: instrumented spawn-and-exec on a loaded host is where the starvation
+// was actually observed, and a bound that is tight there is a flake.
+func newChildBound(release time.Duration) childBound {
+	if raceEnabled {
+		release *= 3
+	}
+	return childBound{release: release, stub: 2 * release}
+}
+
+// childStartBound is the production-sized pair the FIFO-gated crash tests use.
+func childStartBound() childBound { return newChildBound(10 * time.Second) }
+
+// heldChild is the handle over a child held on a FIFO gate.
+type heldChild struct {
+	name string
+	// release opens the gate — asynchronously and boundedly, see writeHeldChild.
+	release func()
+	// failure reports the release's recorded failure, waiting up to grace for the
+	// release goroutine to finish, and CONSUMES it so the cleanup below does not
+	// report the same failure a second time. "" means the release succeeded. It is
+	// meaningful only after release has been called.
+	failure func(grace time.Duration) string
+}
+
 // writeHeldChild drops an executable script that BLOCKS until the returned
-// release func is called, and only then runs body. It is what makes the crash
+// handle's release is called, and only then runs body. It is what makes the crash
 // tests deterministic: the child cannot die before the test has put the
 // executor into the state under test, so the reaper's supervision decision is
 // never racing the test's own setup. The alternative — a child that dies at
@@ -72,49 +119,109 @@ func writeChild(t *testing.T, wd, name, script string) {
 // failure. Cleanup joins the goroutine and surfaces it, so no open outlives the
 // test and a child that never reached its read is a named failure rather than a
 // bound waited out somewhere else.
-func writeHeldChild(t *testing.T, wd, name, body string) (release func()) {
+func writeHeldChild(t *testing.T, wd, name, body string) heldChild {
 	t.Helper()
-	fifo := filepath.Join(wd, name+".gate")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+	return heldChildOn(t, wd, name, body, name+".gate", childStartBound())
+}
+
+// writeStarvedChild is writeHeldChild with the two ends of the gate DELIBERATELY
+// disconnected: the child blocks on a FIFO nothing ever opens for writing, so the
+// release is certain to exhaust its deadline on the FIFO it does open. It
+// manufactures on demand the starvation that otherwise only appears under load.
+func writeStarvedChild(t *testing.T, wd, name, body string, b childBound) heldChild {
+	t.Helper()
+	return heldChildOn(t, wd, name, body, name+".unreachable-gate", b)
+}
+
+// heldChildOn is the shared core: childGate names the FIFO the CHILD reads, equal
+// to the release's gate for a real hold and different for a starved one.
+func heldChildOn(t *testing.T, wd, name, body, childGate string, b childBound) heldChild {
+	t.Helper()
+	gate := filepath.Join(wd, name+".gate")
+	read := filepath.Join(wd, childGate)
+	if err := syscall.Mkfifo(gate, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeChild(t, wd, name, "#!/bin/sh\nread _ < \""+fifo+"\"\n"+body)
+	if read != gate {
+		if err := syscall.Mkfifo(read, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeChild(t, wd, name, "#!/bin/sh\nread _ < \""+read+"\"\n"+body)
 
 	var wg sync.WaitGroup
 	failed := make(chan string, 1)
+	done := make(chan struct{})
 	t.Cleanup(func() {
-		wg.Wait() // bounded by the deadline below
+		wg.Wait() // bounded by b.release below
 		select {
 		case msg := <-failed:
 			t.Errorf("%s", msg)
 		default:
 		}
 	})
-	return func() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			deadline := time.Now().Add(10 * time.Second)
-			for {
-				f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-				if err == nil {
-					_, _ = f.WriteString("go\n")
-					_ = f.Close()
-					return
+	return heldChild{
+		name: name,
+		release: func() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer close(done)
+				deadline := time.Now().Add(b.release)
+				for {
+					f, err := os.OpenFile(gate, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+					if err == nil {
+						_, _ = f.WriteString("go\n")
+						_ = f.Close()
+						return
+					}
+					if !errors.Is(err, syscall.ENXIO) {
+						failed <- fmt.Sprintf("release %s: open its gate FIFO: %v", name, err)
+						return
+					}
+					if time.Now().After(deadline) {
+						failed <- fmt.Sprintf("release %s: its gate FIFO had no reader within the deadline (%s) — "+
+							"the child never reached its read", name, b.release)
+						return
+					}
+					time.Sleep(20 * time.Millisecond)
 				}
-				if !errors.Is(err, syscall.ENXIO) {
-					failed <- fmt.Sprintf("release %s: open its gate FIFO: %v", name, err)
-					return
-				}
-				if time.Now().After(deadline) {
-					failed <- fmt.Sprintf("release %s: its gate FIFO had no reader within the deadline — "+
-						"the child never reached its read", name)
-					return
-				}
-				time.Sleep(20 * time.Millisecond)
+			}()
+		},
+		failure: func(grace time.Duration) string {
+			select {
+			case <-done:
+			case <-time.After(grace):
+				return fmt.Sprintf("release %s: still retrying its gate FIFO after %s", name, grace)
 			}
-		}()
+			select {
+			case msg := <-failed:
+				return msg
+			default:
+				return ""
+			}
+		},
 	}
+}
+
+// awaitHeldChild is the bounded wait a boot stub does on a held child, and the
+// reason the stub can report a starved gate at all. It never touches *testing.T:
+// it runs inside Start, on the test goroutine, so a t.Fatal here would Goexit
+// past Start's teardown and leak the held child. It returns a bring-up error
+// carrying the release's recorded reason instead; Start's own failure path then
+// runs Stop, whose SIGTERM (escalating to SIGKILL) interrupts the child's
+// blocking FIFO open, and the test asserts on Start's error.
+func awaitHeldChild(c *component, h heldChild, b childBound) error {
+	select {
+	case <-c.exited:
+		return nil
+	case <-time.After(b.stub):
+	}
+	reason := h.failure(b.stub - b.release)
+	if reason == "" {
+		reason = fmt.Sprintf("release %s: the gate was opened but the child never died", h.name)
+	}
+	return fmt.Errorf("held child %s did not exit within %s: %s", h.name, b.stub, reason)
 }
 
 // exitRecorder collects callback invocations.
@@ -176,7 +283,7 @@ func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() { _ = s.Stop(context.Background()) }()
-	crash()
+	crash.release()
 
 	select {
 	case <-rec.fired:
@@ -215,6 +322,7 @@ func TestOnComponentExitFiresWhenAComponentCrashes(t *testing.T) {
 // miss it.
 func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) {
 	wd := t.TempDir()
+	b := childStartBound()
 	// Held like the crasher above, but released from INSIDE bring-up: Start does
 	// not return until the stub does, so a release after Start would deadlock
 	// against the stub's own wait on the child.
@@ -236,8 +344,12 @@ func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) 
 		if err := s.markSupervised(c); err != nil {
 			return err
 		}
-		crashEarly()
-		<-c.exited // it dies mid-sequence, with the mark already in place
+		crashEarly.release()
+		// It dies mid-sequence, with the mark already in place — waited on with a
+		// deadline, because this receive runs inside Start (see the file note).
+		if err := awaitHeldChild(c, crashEarly, b); err != nil {
+			return err
+		}
 
 		// The LATER component is still coming up. Bring-up has not returned, so
 		// no end-of-sequence flip has happened or will happen before the crash
@@ -271,6 +383,71 @@ func TestOnComponentExitFiresForACrashWhileALaterComponentComesUp(t *testing.T) 
 		t.Errorf("log tail %q does not carry the crashed component's output", tail)
 	}
 	<-early.exited
+}
+
+// TestHeldChildReleaseFailureIsBounded pins the bound itself — the property the
+// test above depends on but, on its happy path, never exercises. It stages the
+// 2026-09-17 starvation deliberately (a child gated on a FIFO nothing ever opens),
+// on a deadline short enough to assert against, and requires the four things that
+// were all missing when it happened for real: Start RETURNS, it returns an error,
+// the error carries the release's own recorded reason rather than an opaque
+// timeout, and the held child is gone rather than left behind by a Goexit.
+//
+// Without the bound this test does not fail — it hangs, and takes the package's
+// whole 10-minute alarm with it, which is precisely the defect.
+func TestHeldChildReleaseFailureIsBounded(t *testing.T) {
+	wd := t.TempDir()
+	// Deliberately short: this is the one test that WAITS OUT the bound, so the
+	// bound is injected rather than the production-sized childStartBound().
+	b := newChildBound(300 * time.Millisecond)
+	starved := writeStarvedChild(t, wd, "early", "echo early-boom\nexit 9\n", b)
+
+	rec := newExitRecorder()
+	s := NewSupervised(Config{WorkDir: wd, OnComponentExit: rec.fn})
+
+	var pid int
+	stubBoot(t, func(s *Supervised, ctx context.Context) error {
+		c, err := s.spawnEnv(ctx, "early", nil)
+		if err != nil {
+			return err
+		}
+		pid = c.cmd.Process.Pid
+		// Marked, exactly as in the test above: the stub is in the same state, and
+		// only the gate is broken.
+		if err := s.markSupervised(c); err != nil {
+			return err
+		}
+		starved.release()
+		return awaitHeldChild(c, starved, b)
+	})
+
+	began := time.Now()
+	err := s.Start(context.Background())
+	elapsed := time.Since(began)
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	if err == nil {
+		t.Fatal("Start: want the bring-up error for a child that never reached its gate, got nil")
+	}
+	// The bound plus Stop's own teardown of the held child; generous, because what
+	// is under test is that it returns at all, not how fast.
+	if limit := b.stub + 2*time.Second; elapsed > limit {
+		t.Errorf("Start took %s to give up on a starved child, want at most %s", elapsed, limit)
+	}
+	if !strings.Contains(err.Error(), "no reader within the deadline") {
+		t.Errorf("Start error %q does not carry the release's recorded reason — the operator of this test "+
+			"gets a bare timeout and has to guess which of the two gates starved", err)
+	}
+	// Goexit from inside the stub would have skipped Start's teardown; the child
+	// would still be blocked on its read, and the reaper still waiting on it.
+	if kerr := syscall.Kill(pid, 0); kerr == nil {
+		t.Errorf("the held child (pid %d) is still alive after Start returned; its teardown was skipped", pid)
+	}
+	// A bring-up failure is Start's to report. Stop clears both supervision gates
+	// before it signals anything, so killing the held child must fire nothing.
+	if n := rec.count(); n != 0 {
+		t.Fatalf("OnComponentExit fired %d times for a bring-up failure, want 0", n)
+	}
 }
 
 // TestBringUpReportsAComponentThatDiesBeforeItsMark pins the NARROWEST window:
