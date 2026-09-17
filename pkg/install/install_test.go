@@ -140,6 +140,11 @@ type fakeSystem struct {
 	// separate because the two records are separate files that never cross
 	// roles, and a fake that pooled them could not tell the difference.
 	agentArgs map[string]dataroot.AgentArgsRecord
+	// delayed are files that APPEAR part-way through a test: absent for their
+	// first few reads, then present. It is how a test describes a daemon that
+	// writes something while the installer is polling for it — a join that
+	// completes during the join budget — without a goroutine racing these maps.
+	delayed map[string]*delayedFile
 	// owners is the fake's model of unix ownership, keyed by path: what Owner
 	// and ListOwned answer from, and what Chown MUTATES. It is deliberately
 	// independent of files above — ownership is not derivable from content, and
@@ -151,6 +156,23 @@ type fakeSystem struct {
 	// describes a Mac with no prior agent state, and only a test that cares about
 	// the migration has to say anything at all.
 	owners map[string]OwnedEntry
+}
+
+// delayedFile is one file of the fake root filesystem that is not there yet.
+type delayedFile struct {
+	content []byte
+	// absentReads is how many more reads report it missing. It is decremented by
+	// ReadFile, on ReadFile's own goroutine, so the fake stays single-threaded.
+	absentReads int
+}
+
+// putFileAfterReads seeds a file that reads as ABSENT for the next absentReads
+// reads and is present from then on.
+func (f *fakeSystem) putFileAfterReads(path string, content []byte, absentReads int) {
+	if f.delayed == nil {
+		f.delayed = map[string]*delayedFile{}
+	}
+	f.delayed[path] = &delayedFile{content: content, absentReads: absentReads}
 }
 
 // putOwned seeds the fake's ownership table with one entry. It is how a test
@@ -370,6 +392,13 @@ func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadFile:"+path)
+	if d, ok := f.delayed[path]; ok {
+		if d.absentReads > 0 {
+			d.absentReads--
+			return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
+		}
+		return d.content, nil
+	}
 	if content, ok := f.files[path]; ok {
 		return content, nil
 	}

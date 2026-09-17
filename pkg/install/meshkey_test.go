@@ -99,7 +99,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 	t.Run("a fresh agent install mints one key and writes both copies", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
@@ -152,7 +152,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 			t.Fatalf("mint a key for the fixture: %v", err)
 		}
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		f.putFile(agentWork, []byte(priv))
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -179,7 +179,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 			t.Fatalf("mint the stale key for the fixture: %v", err)
 		}
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		f.putFile(agentWork, []byte(priv))
 		f.putFile(agentHelper, []byte(stale))
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
@@ -194,7 +194,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 	t.Run("a second install changes neither copy", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("first Install: %v", err)
@@ -256,7 +256,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 			t.Fatalf("mint a key for the fixture: %v", err)
 		}
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		// The identity every peer knows this node by survives only in the key
 		// dir: the work dir was wiped (a data-root repair, a hand-deleted file).
 		f.putFile(agentHelper, []byte(priv))
@@ -343,7 +343,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 			t.Fatalf("mint a key for the fixture: %v", err)
 		}
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		f.putFile(agentWork, []byte(priv))
 		f.putFile(agentHelper, []byte("not a wireguard key at all"))
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {

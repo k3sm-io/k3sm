@@ -63,6 +63,20 @@ func seedOperatorToken(f *fakeSystem) {
 	f.putFile(operatorTokenFile, []byte(theJoinToken+"\n"))
 }
 
+// seedJoinedAgent is seedOperatorToken plus the credential a completed join
+// leaves in the agent work dir — the posture a SUCCESSFUL agent install is in
+// by the time the verification runs. It returns the token the operator's file
+// holds, which is the token that pins that credential's cluster: install checks
+// the two against each other (verifyAgentJoined), so a token and a credential
+// minted independently would correctly read as a worker that never joined.
+func seedJoinedAgent(t *testing.T, f *fakeSystem) string {
+	t.Helper()
+	cred := mintNodeCredential(t, Config{}.withDefaults().agentWorkDir())
+	cred.seed(f)
+	f.putFile(operatorTokenFile, []byte(cred.token+"\n"))
+	return cred.token
+}
+
 // TestInstallRendersAgentDaemonWhenJoining is the gate for the agent role: a
 // Mac that joins an existing cluster gets a supervised io.k3sm.agent
 // LaunchDaemon from `k3sm install --agent`, instead of the hand-daemonized
@@ -83,7 +97,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	t.Run("an agent install renders netd and io.k3sm.agent, never the server", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -143,7 +157,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	t.Run("the token is staged where the unprivileged daemon can read it", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		joinToken := seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -159,7 +173,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		if !ok {
 			t.Fatal("nothing was written at the staged token path")
 		}
-		if strings.TrimSpace(string(staged)) != theJoinToken {
+		if strings.TrimSpace(string(staged)) != joinToken {
 			t.Errorf("staged token = %q, want the operator's token, trimmed", staged)
 		}
 		// Staged BEFORE the plist that names it is written, and before the
@@ -212,6 +226,35 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		}
 	})
 
+	t.Run("a token file that is not a join token is refused before anything is staged", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		// A plausible mistake: the operator pasted the node-password, a
+		// kubeconfig line, or half a token. It can never complete a join, and
+		// it carries no cluster-CA pin — which is what the installer compares
+		// the stored node credential against — so it is refused here, where a
+		// human is still watching, rather than backed off from forever.
+		f.putFile(operatorTokenFile, []byte("K10-no-separator-here\n"))
+		err := Install(context.Background(), f, agentCfg(t))
+		if err == nil {
+			t.Fatal("install accepted a token file that does not hold a join token")
+		}
+		for _, want := range []string{operatorTokenFile, "K10<cluster-CA hash>::<user>:<secret>"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q must carry %q — the operator needs the file and the shape it should hold", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "no-separator-here") {
+			t.Errorf("the refusal echoes the contents of the token file: %q", err)
+		}
+		// Refused BEFORE a byte of it is written anywhere.
+		for _, c := range f.calls {
+			if strings.HasPrefix(c, "WriteServiceUserFile:") || strings.HasPrefix(c, "WriteLaunchDaemon:") {
+				t.Errorf("a malformed token was staged anyway: %q", c)
+			}
+		}
+	})
+
 	t.Run("an operator token file anyone can read is refused", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
@@ -241,9 +284,8 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		cfg := agentCfg(t)
 		// The daemon is up and the join never completes: a rejected token puts
 		// `k3sm agent` in its terminal backoff, where launchd reports a healthy
-		// pid indefinitely. The credential is the first fact that says the join
-		// actually happened, so its absence must fail the install.
-		f.putMissingPath(AgentCredentialPath(cfg.DataRoot))
+		// pid indefinitely. Nothing seeds a credential here, so this Mac has
+		// never joined anything and the install must say so.
 		err := Install(context.Background(), f, cfg)
 		if err == nil {
 			t.Fatal("install reported success with an agent that never joined")
@@ -258,21 +300,24 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	t.Run("a join that produces a credential is a success", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
-		// The fake reports every unhidden path present, so this is the healthy
-		// first join: the credential appears and the install completes.
+		seedJoinedAgent(t, f)
+		// The healthy first join: the node holds a credential for the cluster
+		// the staged token pins, and nothing was recorded against this install.
 		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
-		if !slices.Contains(f.calls, "PathExists:"+AgentCredentialPath("")) {
-			t.Errorf("install never looked for the node credential (calls: %v)", f.calls)
+		// READ, not stat. The credential is verified by parsing it and
+		// comparing its cluster CA with the token's pin — a file that merely
+		// exists is what the 2026-09-17 install was satisfied by.
+		if !slices.Contains(f.calls, "ReadFile:"+AgentCredentialPath("")) {
+			t.Errorf("install never read the node credential (calls: %v)", f.calls)
 		}
 	})
 
 	t.Run("the plist carries a token PATH and no token", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		// The token exists on this Mac, in the operator's file and in the
 		// environment the install was run from. Neither may reach the plist.
@@ -296,7 +341,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	t.Run("uninstall removes the agent daemon and keeps the record", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
@@ -363,7 +408,7 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 	t.Run("the agent record round-trips across uninstall then install", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}
-		seedOperatorToken(f)
+		seedJoinedAgent(t, f)
 		cfg := agentCfg(t)
 		// An operator's own flag, arriving the only way one can: on the agent
 		// plist already installed, which is what they edit and kickstart.

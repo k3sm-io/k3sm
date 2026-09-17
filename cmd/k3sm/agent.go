@@ -45,6 +45,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
@@ -127,10 +128,18 @@ const agentTerminalBackoff = 30 * time.Second
 // else writes it.
 var agentTerminalDelay = agentTerminalBackoff
 
-// agentTerminal logs a terminal start failure, waits out the backoff (or until
-// the context is cancelled — a SIGTERM during the wait must still stop the
-// process promptly), and returns the error unchanged.
-func agentTerminal(ctx context.Context, logger *slog.Logger, err error) error {
+// agentTerminal records a terminal start failure on the crash-loop record, logs
+// it, waits out the backoff (or until the context is cancelled — a SIGTERM
+// during the wait must still stop the process promptly), and returns the error
+// unchanged.
+//
+// The record is written BEFORE the sleep, and that ordering is the whole point
+// of recording here rather than at runAgent's funnel: `k3sm install` waits one
+// join budget for this node to appear, and the agent sleeps half a minute
+// between attempts. A record written after the sleep would arrive after the
+// install had already given up with nothing to say about why.
+func agentTerminal(ctx context.Context, b *crashBreaker, logger *slog.Logger, err error) error {
+	noteAgentStartFailure(b, logger, err)
 	logger.Error("this agent cannot start", "err", err, "backoff", agentTerminalDelay)
 	t := time.NewTimer(agentTerminalDelay)
 	defer t.Stop()
@@ -152,6 +161,16 @@ func agentTerminal(ctx context.Context, logger *slog.Logger, err error) error {
 // certificates. Both paths converge on the same mesh bring-up, the same
 // node-local datapath and the same Virtual Kubelet registration; the mesh
 // bring-up (root utun) and the live two-Mac round-trip are the K3SM_LAB gate.
+//
+// It is a thin wrapper around agentStart because of what an agent's start
+// failure has to leave behind. This daemon backs off instead of exiting, so
+// launchd reports a healthy pid whatever happened, and until k3sm#B322 the only
+// trace of a worker that could not join was a log line — which `k3sm install`
+// cannot read a verdict out of. So EVERY start failure is recorded on the same
+// crash-loop record the server keeps (pkg/executor's CrashRecord, under the
+// agent work dir), and that record is what the installer polls. The agent does
+// not park on it: unlike the server it already throttles itself, so the record
+// here is evidence, not a brake.
 func runAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ExitOnError)
 	opts := agentOptions{}
@@ -170,6 +189,25 @@ func runAgent(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	breaker := newCrashBreaker(opts.workDir, logger)
+	err := agentStart(ctx, opts, breaker, logger)
+	// The terminal paths record BEFORE they back off (agentTerminal), so an
+	// installer polling the record sees the reason within its own join budget
+	// rather than half a minute later; everything else — a node-password that
+	// could not be persisted, a join the server refused, a mesh that would not
+	// come up — is recorded here, once, on the way out.
+	if err != nil && !breaker.noted() {
+		noteAgentStartFailure(breaker, logger, err)
+	}
+	return err
+}
+
+// agentStart is runAgent's body: everything from the pod-root resolution to the
+// Virtual Kubelet registration that blocks for the life of the node. It returns
+// every start failure to runAgent rather than recording them itself, so there is
+// exactly ONE place a failure is counted and no path can be added that forgets
+// to count.
+func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, logger *slog.Logger) error {
 	// runtimed's on-disk root — the image cache, the pod dirs, every PVC bound on
 	// this node — resolved once, here, before anything under it is touched. An
 	// empty --pod-root derives the work-dir's parent (the same rule `k3sm server`
@@ -188,7 +226,7 @@ func runAgent(args []string) error {
 	// the start plan decides from the stored credential.
 	tokenFileAbsent, err := applyTokenFile(&opts)
 	if err != nil {
-		return agentTerminal(ctx, logger, err)
+		return agentTerminal(ctx, breaker, logger, err)
 	}
 	if tokenFileAbsent {
 		logger.Info("the join token file is not there; this start presents the stored node credential instead", "path", opts.tokenFile)
@@ -218,7 +256,7 @@ func runAgent(args []string) error {
 	store := nodeCredentialStore{dir: opts.workDir}
 	status, cred, err := store.Status(time.Now())
 	if err != nil {
-		return agentTerminal(ctx, logger, err)
+		return agentTerminal(ctx, breaker, logger, err)
 	}
 	tokenPresent := strings.TrimSpace(opts.token) != ""
 	tokenCAHash, storedCAHash := "", ""
@@ -241,7 +279,7 @@ func runAgent(args []string) error {
 		if tokenFileAbsent {
 			err = missingTokenFileNote(err, opts.tokenFile)
 		}
-		return agentTerminal(ctx, logger, err)
+		return agentTerminal(ctx, breaker, logger, err)
 	}
 	logStartPlan(logger, plan, status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
 
@@ -278,7 +316,7 @@ func runAgent(args []string) error {
 			logger.Warn("the cluster has no mesh peer for this node; falling back to a full token join", "err", err)
 			plan = startModeTokenJoin
 		case errors.Is(err, bootstrap.ErrNoMeshPeer):
-			return agentTerminal(ctx, logger, fmt.Errorf("the cluster has no mesh peer for this node; rejoin with a fresh token (k3sm token create on the server): %w", err))
+			return agentTerminal(ctx, breaker, logger, fmt.Errorf("the cluster has no mesh peer for this node; rejoin with a fresh token (k3sm token create on the server): %w", err))
 		case err != nil:
 			return err
 		}
@@ -386,6 +424,15 @@ func runAgent(args []string) error {
 	} else {
 		logger.Info("network datapath disabled (--network none): skipping wireguard mesh + node-local datapath")
 	}
+
+	// Everything that can terminally fail has now succeeded: this node holds a
+	// credential for this cluster, its mesh is up and its datapath is serving. A
+	// start that stays here for the whole crash-loop window has proved whatever
+	// was recorded before it was transient, so the record is cleared on exactly
+	// the server's terms (crashBreaker.resetIfHealthy — a no-op if THIS process
+	// recorded a failure of its own).
+	healthyReset := time.AfterFunc(executor.CrashLoopWindow, breaker.resetIfHealthy)
+	defer healthyReset.Stop()
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
 	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
