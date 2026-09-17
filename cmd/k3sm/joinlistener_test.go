@@ -269,3 +269,5 @@ func (stubEnroller) Enroll(context.Context, string, netv1.MeshEnrollRequest) (ne
 }
 
 func (stubEnroller) RefreshEndpoint(context.Context, string, string) error { return nil }
+
+func (stubEnroller) Deregister(context.Context, string) error { return nil }

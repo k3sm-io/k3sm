@@ -346,6 +346,10 @@ func keyPairNotAfter(certPEM, keyPEM []byte) (time.Time, error) {
 }
 
 // decodeCertPEM decodes a single CERTIFICATE PEM block.
+// DecodeCertPEM parses the first CERTIFICATE block of b. Exported for the
+// agent-side callers that read the stored node client certificate.
+func DecodeCertPEM(b []byte) (*x509.Certificate, error) { return decodeCertPEM(b) }
+
 func decodeCertPEM(b []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(b)
 	if block == nil || block.Type != "CERTIFICATE" {

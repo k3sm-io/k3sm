@@ -59,6 +59,12 @@ type fakeEnroller struct {
 	// A denial test asserts it stayed zero: "the request was refused" and "the
 	// write never happened" are different claims, and only the second one matters.
 	refreshes int
+	// deregistered is the node name of every Deregister call, in order. A denial
+	// test asserts it stayed empty for the same reason refreshes does.
+	deregistered []string
+	// deregisterErr is what Deregister returns, so a row can drive the handler's
+	// 500 arm.
+	deregisterErr error
 }
 
 func (f *fakeEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
@@ -79,6 +85,26 @@ func (f *fakeEnroller) RefreshEndpoint(_ context.Context, _, endpoint string) er
 	}
 	f.peer.Endpoint = endpoint
 	return nil
+}
+
+// Deregister records the node name and drops the stored peer, which is what the
+// real enroller's MeshPeer delete does to the state a later snapshot reads.
+func (f *fakeEnroller) Deregister(_ context.Context, nodeName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deregistered = append(f.deregistered, nodeName)
+	if f.deregisterErr != nil {
+		return f.deregisterErr
+	}
+	f.peer = nil
+	return nil
+}
+
+// deregisters returns the node names Deregister was called with, in order.
+func (f *fakeEnroller) deregisters() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deregistered...)
 }
 
 // snapshot returns the stored peer spec and the refresh call count.

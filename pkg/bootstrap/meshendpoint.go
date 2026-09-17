@@ -92,26 +92,73 @@ func ListenerTLSConfig(serving tls.Certificate, clientCAPEM []byte) (*tls.Config
 	}, nil
 }
 
+// meshEndpointVerb names the endpoint-refresh verb in its rejection logs.
+const meshEndpointVerb = "mesh endpoint refresh"
+
+// verifiedNodeLeaf returns the VERIFIED client leaf that authenticated r, or nil
+// after writing a 401. verb names the caller in the rejection log.
+//
+// It reads r.TLS.VerifiedChains and never PeerCertificates, so a listener
+// refactored back to tls.RequestClientCert denies everything instead of trusting
+// an unchecked leaf. Both node-certificate-authenticated verbs (the endpoint
+// refresh and the deregistration) start here, so the posture is stated once: the
+// listener's mTLS is OPTIONAL by necessity — join must keep working for a node
+// that holds no certificate — and optional mTLS mistaken for enforced mTLS is how
+// such a verb quietly becomes anonymous.
+func (s *Server) verifiedNodeLeaf(w http.ResponseWriter, r *http.Request, verb string) *x509.Certificate {
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
+		s.cfg.Logger.Warn(verb+" rejected", "reason", "no-verified-client-cert", "remote", r.RemoteAddr)
+		http.Error(w, "a verified node client certificate is required", http.StatusUnauthorized)
+		return nil
+	}
+	return r.TLS.VerifiedChains[0][0]
+}
+
+// authorizeNodeSelf reports whether leaf is the node identity of bodyNode,
+// writing a 403 and returning false when it is not. verb names the caller in the
+// rejection log.
+//
+// Three checks, each denying a different thing:
+//
+//  1. the leaf must carry O=system:nodes — the group the cluster PKI mints only
+//     for node identities, so the apiserver's own kubelet client (no
+//     Organization) cannot drive these verbs;
+//  2. the leaf's CN must be system:node:<name> — a chain that merely verifies
+//     proves only that SOME cluster identity is calling;
+//  3. AuthorizeMeshPeerWrite, the same permanent self-scoping guard the join path
+//     runs, so a node acts on its own MeshPeer and on no other. Every joined
+//     worker holds a signing-CA-issued certificate, which is exactly why chain
+//     validity alone can never be the authorization.
+func (s *Server) authorizeNodeSelf(w http.ResponseWriter, leaf *x509.Certificate, bodyNode, verb string) bool {
+	if !containsGroup(leaf.Subject.Organization, systemNodesGroup) {
+		s.cfg.Logger.Warn(verb+" rejected", "reason", "not-a-node-identity",
+			"cn", leaf.Subject.CommonName, "o", leaf.Subject.Organization)
+		http.Error(w, "the presented identity is not a node", http.StatusForbidden)
+		return false
+	}
+	certNode := strings.TrimPrefix(leaf.Subject.CommonName, systemNodePrefix)
+	if certNode == leaf.Subject.CommonName || certNode == "" {
+		s.cfg.Logger.Warn(verb+" rejected", "reason", "not-a-node-cn", "cn", leaf.Subject.CommonName)
+		http.Error(w, "the presented identity is not a node", http.StatusForbidden)
+		return false
+	}
+	if err := AuthorizeMeshPeerWrite(certNode, bodyNode); err != nil {
+		s.cfg.Logger.Warn(verb+" rejected", "reason", "mesh-peer-guard",
+			"cert-node", certNode, "body-node", bodyNode, "err", err)
+		http.Error(w, "the request names a different node", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
 // handleMeshEndpoint serves the endpoint-refresh verb.
 //
 // Authentication is the NODE'S OWN CLIENT CERTIFICATE, not the join token. The
 // token is TTL-bounded (24 h by default), so a refresh gated on it would stop
 // working after a day and silently restore the staleness this verb exists to
 // remove; the node's system:node certificate is the credential that lives as long
-// as the node does. Four checks, in order, and each denies a different thing:
-//
-//  1. a VERIFIED chain must exist — r.TLS.VerifiedChains, never PeerCertificates,
-//     so a listener refactored back to tls.RequestClientCert denies everything
-//     instead of trusting an unchecked leaf (401);
-//  2. the leaf must carry O=system:nodes — the group the cluster PKI mints only
-//     for node identities, so the apiserver's own kubelet client (no Organization)
-//     cannot drive this verb (403);
-//  3. the leaf's CN must be system:node:<the node named in the body> — every
-//     joined worker holds a signing-CA-issued certificate, so chain validity alone
-//     would let any node move any other node's endpoint (403);
-//  4. AuthorizeMeshPeerWrite, the same permanent self-scoping guard the join path
-//     runs, because this is the second write path into a node's MeshPeer and the
-//     guard is what makes both of them self-scoped (403).
+// as the node does. The identity checks are verifiedNodeLeaf (401) then
+// authorizeNodeSelf (403), which this verb shares with the deregistration verb.
 //
 // Only then is the endpoint written, and only spec.endpoint of an EXISTING peer.
 func (s *Server) handleMeshEndpoint(w http.ResponseWriter, r *http.Request) {
@@ -119,12 +166,10 @@ func (s *Server) handleMeshEndpoint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
-		s.cfg.Logger.Warn("mesh endpoint refresh rejected", "reason", "no-verified-client-cert", "remote", r.RemoteAddr)
-		http.Error(w, "a verified node client certificate is required", http.StatusUnauthorized)
+	leaf := s.verifiedNodeLeaf(w, r, meshEndpointVerb)
+	if leaf == nil {
 		return
 	}
-	leaf := r.TLS.VerifiedChains[0][0]
 
 	var req MeshEndpointRefreshRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
@@ -132,22 +177,7 @@ func (s *Server) handleMeshEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !containsGroup(leaf.Subject.Organization, systemNodesGroup) {
-		s.cfg.Logger.Warn("mesh endpoint refresh rejected", "reason", "not-a-node-identity",
-			"cn", leaf.Subject.CommonName, "o", leaf.Subject.Organization)
-		http.Error(w, "the presented identity is not a node", http.StatusForbidden)
-		return
-	}
-	certNode := strings.TrimPrefix(leaf.Subject.CommonName, systemNodePrefix)
-	if certNode == leaf.Subject.CommonName || certNode == "" {
-		s.cfg.Logger.Warn("mesh endpoint refresh rejected", "reason", "not-a-node-cn", "cn", leaf.Subject.CommonName)
-		http.Error(w, "the presented identity is not a node", http.StatusForbidden)
-		return
-	}
-	if err := AuthorizeMeshPeerWrite(certNode, req.NodeName); err != nil {
-		s.cfg.Logger.Warn("mesh endpoint refresh rejected", "reason", "mesh-peer-guard",
-			"cert-node", certNode, "body-node", req.NodeName, "err", err)
-		http.Error(w, "the request names a different node", http.StatusForbidden)
+	if !s.authorizeNodeSelf(w, leaf, req.NodeName, meshEndpointVerb) {
 		return
 	}
 	if err := ValidateMeshEndpoint(req.Endpoint); err != nil {

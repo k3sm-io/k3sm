@@ -777,6 +777,34 @@ type Config struct {
 	// encrypted volume (an encrypted volume beside a plaintext duplicate of the
 	// same secrets is not encryption) and optional otherwise.
 	RemoveOldDataRoot bool
+	// Deregister removes this node from the cluster it joined, and is called by
+	// Uninstall on a WORKER teardown only. Nil — the zero value — skips it, and
+	// is what every server-role uninstall and every caller that has no stored
+	// node credential to authenticate with passes.
+	//
+	// It is a closure rather than a set of fields because everything the call
+	// needs is a cmd-layer concern this package must not acquire: the stored
+	// node credential, the node-identity HTTP client built from it, and the
+	// bootstrap URL of the control plane. What install owns is WHEN the call
+	// happens (before the daemons are booted out, while the credential and the
+	// mesh are still intact) and that it can never block the teardown.
+	//
+	// It is BEST EFFORT by contract. A control plane that is off, asleep, or on
+	// another network is the ordinary case for a Mac being retired, so a failure
+	// is logged once with the manual remedy and the local teardown continues.
+	// The error the closure returns is what names the node, so it is logged
+	// verbatim beside the remedy.
+	//
+	// The stored node credential under <DataRoot>/agent is PRESERVED either way
+	// — the documented reinstall invariant, which deregistering does not change.
+	// The consequence is worth stating: a same-Mac reinstall after a successful
+	// deregistration resumes with a credential the cluster no longer has a
+	// MeshPeer for. `k3sm agent` already handles exactly that case, because it
+	// is the same one a node hits when its peer is deleted by hand — with a
+	// token it falls back to a full token join, and without one it stops with a
+	// terminal error naming the remedy (mint a token on the server and start the
+	// agent with it).
+	Deregister func(ctx context.Context) error
 	// DataRootFS is the read-only filesystem the data-root posture is read
 	// through (the record, /etc/fstab, the mount state). It defaults to the real
 	// filesystem; a test injects a fake so the sequencing can be exercised
@@ -1721,6 +1749,14 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// default role would leave the other one's KeepAlive plist behind pointing
 	// at a deleted binary — the exact leak the shared manifest exists to prevent.
 	m := uninstallManifest(sys, cfg)
+	// Leave the cluster BEFORE anything local is torn down. Everything the call
+	// depends on is alive right now and stops being alive a few lines below: the
+	// agent daemon still holds the mesh up, the stored credential is still on
+	// disk, and the control plane still has a MeshPeer to delete. It is
+	// best-effort and never note()d — a Mac being retired is often being retired
+	// because the cluster is gone, and an uninstall that refused to finish over
+	// that would leave the operator with a half-installed machine.
+	deregisterNode(ctx, cfg, m)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
 		switch a.disp {
@@ -1811,6 +1847,61 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			"remove-for-good", "sudo k3sm datavol delete --yes")
 	}
 	return nil
+}
+
+// deregisterTimeout is the outer bound on the whole deregistration attempt.
+//
+// The call itself is already bounded on the wire (bootstrap.DeregisterTimeout),
+// so this is the backstop for everything that is not the wire: a DNS lookup that
+// hangs, a TLS handshake against a Mac that answers the SYN and nothing else, a
+// closure that retries. Fifteen seconds is a pause an operator will wait through
+// at a terminal, and a teardown that cannot be delayed longer than that by a
+// cluster it is leaving.
+const deregisterTimeout = 15 * time.Second
+
+// deregisterRemedy is the command that finishes the job by hand when the
+// deregistration could not be delivered. The node name is a placeholder because
+// this package does not know it; the error logged beside this line does, because
+// the closure that produced it named the node.
+const deregisterRemedy = "on the control plane: kubectl delete meshpeer/<node> node/<node>"
+
+// deregisterNode asks the cluster to forget this node, on a WORKER teardown and
+// on no other.
+//
+// The role question is answered from the MANIFEST rather than from cfg.Role, and
+// that is what makes `sudo k3sm uninstall` work with no flags: the CLI passes a
+// Config that says nothing about which role is installed, and uninstallManifest
+// has already read the disk to find out. A Mac carrying the agent daemon is a
+// worker, whatever the Config claims.
+//
+// Every failure is one Warn line carrying the error and the manual remedy, and
+// then the teardown continues. The nil closure — a server, or a worker with no
+// usable credential — is silent here: the CLI has already said why it passed
+// nothing, and repeating it from a package that does not know the reason would
+// only guess.
+func deregisterNode(ctx context.Context, cfg Config, m []artifact) {
+	if cfg.Deregister == nil || !carriesAgentDaemon(m) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deregisterTimeout)
+	defer cancel()
+	if err := cfg.Deregister(ctx); err != nil {
+		cfg.Logger.Warn("could not remove this node from the cluster; it will still be listed there, and its peers will keep a wireguard entry for it until it is deleted",
+			"err", err, "remedy", deregisterRemedy)
+		return
+	}
+	cfg.Logger.Info("removed this node from the cluster: its MeshPeer and Node are gone, so the remaining nodes drop their wireguard entry for it")
+}
+
+// carriesAgentDaemon reports whether the manifest tears down the worker daemon,
+// which is the one durable fact that says this Mac is a worker.
+func carriesAgentDaemon(m []artifact) bool {
+	for _, a := range m {
+		if a.kind == kindDaemon && a.label == AgentLabel {
+			return true
+		}
+	}
+	return false
 }
 
 // keptArtifacts describes, in manifest order, what an uninstall deliberately
