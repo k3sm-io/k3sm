@@ -31,6 +31,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // The restart gate: a joined agent that restarts must present the credential it
@@ -137,24 +138,24 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			what      string
 			got, want []byte
 		}{
-			{"cluster CA", cred.clusterCAPEM, res.ClusterCAPEM},
-			{"node client cert", cred.clientCertPEM, res.NodeClientCertPEM},
-			{"node client key", cred.clientKeyPEM, res.NodeClientKeyPEM},
-			{"kubelet serving cert", cred.servingCertPEM, res.KubeletServingCertPEM},
-			{"kubelet serving key", cred.servingKeyPEM, res.KubeletServingKeyPEM},
-			{"kubelet client CA", cred.clientCAPEM, res.ClientCAPEM},
+			{"cluster CA", cred.ClusterCAPEM, res.ClusterCAPEM},
+			{"node client cert", cred.ClientCertPEM, res.NodeClientCertPEM},
+			{"node client key", cred.ClientKeyPEM, res.NodeClientKeyPEM},
+			{"kubelet serving cert", cred.ServingCertPEM, res.KubeletServingCertPEM},
+			{"kubelet serving key", cred.ServingKeyPEM, res.KubeletServingKeyPEM},
+			{"kubelet client CA", cred.ClientCAPEM, res.ClientCAPEM},
 		} {
 			if !bytes.Equal(c.got, c.want) {
 				t.Errorf("loaded %s does not match what was saved", c.what)
 			}
 		}
-		if cred.apiserverURL != nodeCredTestAPI {
-			t.Errorf("apiserverURL = %q, want %q", cred.apiserverURL, nodeCredTestAPI)
+		if cred.APIServerURL != nodeCredTestAPI {
+			t.Errorf("apiserverURL = %q, want %q", cred.APIServerURL, nodeCredTestAPI)
 		}
-		if cred.clusterCAPin != clusterCA.PinHash() {
-			t.Errorf("clusterCAPin = %q, want the cluster CA's pin %q", cred.clusterCAPin, clusterCA.PinHash())
+		if cred.ClusterCAPin != clusterCA.PinHash() {
+			t.Errorf("clusterCAPin = %q, want the cluster CA's pin %q", cred.ClusterCAPin, clusterCA.PinHash())
 		}
-		if cred.clusterCAPin == signingCA.PinHash() {
+		if cred.ClusterCAPin == signingCA.PinHash() {
 			t.Error("clusterCAPin equals the SIGNING CA's pin: a token is compared against the CLUSTER CA")
 		}
 
@@ -162,16 +163,16 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		// start (the worker's kubeconfig points at the server's mesh address,
 		// reachable only once the mesh these values build is up), so losing it
 		// would make the reuse path impossible however good the certs were.
-		if cred.assignment.PodCIDR != res.PodCIDR || cred.assignment.MeshIP != res.MeshIP {
+		if cred.Assignment.PodCIDR != res.PodCIDR || cred.Assignment.MeshIP != res.MeshIP {
 			t.Errorf("assignment = %s/%s, want %s/%s",
-				cred.assignment.PodCIDR, cred.assignment.MeshIP, res.PodCIDR, res.MeshIP)
+				cred.Assignment.PodCIDR, cred.Assignment.MeshIP, res.PodCIDR, res.MeshIP)
 		}
-		if len(cred.assignment.APIServers) != 1 || cred.assignment.APIServers[0] != res.APIServers[0] {
-			t.Errorf("assignment APIServers = %v, want %v", cred.assignment.APIServers, res.APIServers)
+		if len(cred.Assignment.APIServers) != 1 || cred.Assignment.APIServers[0] != res.APIServers[0] {
+			t.Errorf("assignment APIServers = %v, want %v", cred.Assignment.APIServers, res.APIServers)
 		}
-		if len(cred.assignment.Peers) != 1 || cred.assignment.Peers[0].NodeName != res.Peers[0].NodeName ||
-			cred.assignment.Peers[0].Endpoint != res.Peers[0].Endpoint {
-			t.Errorf("assignment Peers = %+v, want the join snapshot %+v", cred.assignment.Peers, res.Peers)
+		if len(cred.Assignment.Peers) != 1 || cred.Assignment.Peers[0].NodeName != res.Peers[0].NodeName ||
+			cred.Assignment.Peers[0].Endpoint != res.Peers[0].Endpoint {
+			t.Errorf("assignment Peers = %+v, want the join snapshot %+v", cred.Assignment.Peers, res.Peers)
 		}
 
 		// The secret halves are 0600; a CA certificate is public material at 0644.
@@ -204,7 +205,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		}
 
 		// What agentResumeFromCredential feeds downstream, minus the network leg.
-		resumed := cred.joinResult(nodeCredTestNode, "restart-time-private-key", "restart-time-public-key")
+		resumed := joinResultFrom(cred, nodeCredTestNode, "restart-time-private-key", "restart-time-public-key")
 
 		// The refusal runAgent applies to both paths must pass on a resumed
 		// credential: a restart that lost the serving pair would register Ready with
@@ -258,8 +259,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		t.Parallel()
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		for _, missing := range []string{
-			nodeKubeconfigFile, kubeletServingCertFile, kubeletServingKeyFile,
-			kubeletClientCAFile, nodeAssignmentFile,
+			nodecred.KubeconfigFile, nodecred.ServingCertFile, nodecred.ServingKeyFile,
+			nodecred.ClientCAFile, nodecred.NodeAssignmentFile,
 		} {
 			t.Run("without "+missing, func(t *testing.T) {
 				t.Parallel()
@@ -339,7 +340,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			if status != credentialCorrupt || cred != nil {
 				t.Errorf("Status = %s (cred!=nil: %v), want corrupt with no credential", status, cred != nil)
 			}
-			if !strings.Contains(err.Error(), kubeletServingCertFile) && !strings.Contains(err.Error(), kubeletServingKeyFile) {
+			if !strings.Contains(err.Error(), nodecred.ServingCertFile) && !strings.Contains(err.Error(), nodecred.ServingKeyFile) {
 				t.Errorf("error %q names neither serving file", err)
 			}
 			if !strings.Contains(err.Error(), "remove it to force a fresh token join") {
@@ -360,8 +361,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			if status != credentialCorrupt {
 				t.Errorf("Status = %s, want corrupt", status)
 			}
-			if !strings.Contains(err.Error(), nodeKubeconfigFile) {
-				t.Errorf("error %q does not name %s", err, nodeKubeconfigFile)
+			if !strings.Contains(err.Error(), nodecred.KubeconfigFile) {
+				t.Errorf("error %q does not name %s", err, nodecred.KubeconfigFile)
 			}
 		})
 
@@ -376,8 +377,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			if err == nil || status != credentialCorrupt {
 				t.Fatalf("Status = %s, err = %v; want corrupt with an error", status, err)
 			}
-			if !strings.Contains(err.Error(), nodeAssignmentFile) {
-				t.Errorf("error %q does not name %s", err, nodeAssignmentFile)
+			if !strings.Contains(err.Error(), nodecred.NodeAssignmentFile) {
+				t.Errorf("error %q does not name %s", err, nodecred.NodeAssignmentFile)
 			}
 		})
 	})
@@ -392,7 +393,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		// file that is not touched cannot be damaged by a crash, and a credential
 		// rewritten thousands of times for no reason is thousands of chances to be.
 		backdated := time.Now().Add(-48 * time.Hour)
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			if err := os.Chtimes(p, backdated, backdated); err != nil {
 				t.Fatalf("backdate %s: %v", p, err)
 			}
@@ -400,7 +401,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, res); err != nil {
 			t.Fatalf("second Save: %v", err)
 		}
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			fi, err := os.Stat(p)
 			if err != nil {
 				t.Fatalf("stat %s: %v", p, err)
@@ -419,8 +420,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
-		if cred.apiserverURL != "https://100.64.1.1:6666" {
-			t.Errorf("apiserverURL = %q, want the newly saved one", cred.apiserverURL)
+		if cred.APIServerURL != "https://100.64.1.1:6666" {
+			t.Errorf("apiserverURL = %q, want the newly saved one", cred.APIServerURL)
 		}
 	})
 
@@ -454,15 +455,15 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		}
 
 		// Every artifact is WHOLLY one generation or the other, never a prefix.
-		if !bytes.Equal(cred.clientCAPEM, first.ClientCAPEM) {
+		if !bytes.Equal(cred.ClientCAPEM, first.ClientCAPEM) {
 			t.Error("the artifact whose write failed is not the one that was there before it")
 		}
-		if !bytes.Equal(cred.servingCertPEM, second.KubeletServingCertPEM) ||
-			!bytes.Equal(cred.servingKeyPEM, second.KubeletServingKeyPEM) {
+		if !bytes.Equal(cred.ServingCertPEM, second.KubeletServingCertPEM) ||
+			!bytes.Equal(cred.ServingKeyPEM, second.KubeletServingKeyPEM) {
 			t.Error("an artifact written before the failure is neither the old nor the new one: a write was torn")
 		}
-		if cred.assignment.PodCIDR != first.PodCIDR {
-			t.Errorf("assignment podCIDR = %q; the write after the failure must not have run", cred.assignment.PodCIDR)
+		if cred.Assignment.PodCIDR != first.PodCIDR {
+			t.Errorf("assignment podCIDR = %q; the write after the failure must not have run", cred.Assignment.PodCIDR)
 		}
 
 		// And the retry converges: nothing about the interruption is sticky.
@@ -476,10 +477,10 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil || status != credentialValid {
 			t.Fatalf("Status after the retry = %s, err %v", status, err)
 		}
-		if !bytes.Equal(cred.clientCAPEM, second.ClientCAPEM) || !bytes.Equal(cred.clientCertPEM, second.NodeClientCertPEM) {
+		if !bytes.Equal(cred.ClientCAPEM, second.ClientCAPEM) || !bytes.Equal(cred.ClientCertPEM, second.NodeClientCertPEM) {
 			t.Error("the retried Save did not converge the store on the new credential")
 		}
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			if _, err := os.Stat(p + storeTmpSuffix); err == nil {
 				t.Errorf("%s%s survived a successful save", filepath.Base(p), storeTmpSuffix)
 			}
@@ -490,7 +491,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		t.Parallel()
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		store := savedStore(t, res)
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			if err := os.WriteFile(p+storeTmpSuffix, []byte("half a file"), 0o600); err != nil {
 				t.Fatalf("plant a leftover for %s: %v", p, err)
 			}
@@ -499,7 +500,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status with leftover staging files: %v", err)
 		}
-		if status != credentialValid || !bytes.Equal(cred.clientCertPEM, res.NodeClientCertPEM) {
+		if status != credentialValid || !bytes.Equal(cred.ClientCertPEM, res.NodeClientCertPEM) {
 			t.Errorf("Status = %s; a leftover staging file must never be read as part of the credential", status)
 		}
 	})
@@ -594,7 +595,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse a token for this cluster: %v", err)
 		}
-		mode, err := agentStartPlan(credentialValid, true, true, sameCluster.CAHash, cred.clusterCAPin)
+		mode, err := agentStartPlan(credentialValid, true, true, sameCluster.CAHash, cred.ClusterCAPin)
 		if err != nil || mode != startModeReuseCredential {
 			t.Errorf("a token for THIS cluster gave (%s, %v), want reuse", mode, err)
 		}
@@ -607,7 +608,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse a token for another cluster: %v", err)
 		}
-		mode, err = agentStartPlan(credentialValid, true, true, otherCluster.CAHash, cred.clusterCAPin)
+		mode, err = agentStartPlan(credentialValid, true, true, otherCluster.CAHash, cred.ClusterCAPin)
 		if err != nil || mode != startModeTokenJoin {
 			t.Errorf("a token for ANOTHER cluster gave (%s, %v), want a token join", mode, err)
 		}

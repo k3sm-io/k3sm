@@ -159,7 +159,7 @@ func TestAgentTokenFileMissingIsNotTerminal(t *testing.T) {
 		if opts.token != "" {
 			t.Errorf("token = %q, want none: an absent file contributes no token", opts.token)
 		}
-		plan, err := agentStartPlan(status, strings.TrimSpace(opts.token) != "", false, "", cred.clusterCAPin)
+		plan, err := agentStartPlan(status, strings.TrimSpace(opts.token) != "", false, "", cred.ClusterCAPin)
 		if err != nil {
 			t.Fatalf("agentStartPlan: %v", err)
 		}

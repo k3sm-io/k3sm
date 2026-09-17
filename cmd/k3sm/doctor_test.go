@@ -18,7 +18,13 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/status"
 )
 
 // healthyDoctorEnv returns a fully-passing fake doctorEnv. Each table case
@@ -35,7 +41,23 @@ func healthyDoctorEnv() doctorEnv {
 		brewPresent:      func() bool { return true },
 		datastorePosture: func() (bool, int, string, error) { return true, 3, "wal", nil },
 		developerDir:     func() (string, error) { return "/Applications/Xcode.app/Contents/Developer", nil },
+		// The healthy baseline is a control plane, which is what a Mac running
+		// `k3sm doctor` is unless it was installed as a worker — so the
+		// agent-daemon check SKIPs here, and each agent case opts in.
+		nodeRole:   func() (install.Role, bool) { return install.RoleServer, true },
+		agentState: func() (bool, bool) { return true, true },
+		agentCredential: func() (status.CredentialState, time.Time) {
+			return status.CredentialValid, time.Now().Add(90 * 24 * time.Hour)
+		},
 	}
+}
+
+// agentEnv is the healthy baseline as a JOINED WORKER: the role this Mac is
+// installed as, its daemon up, and a credential in date.
+func agentEnv() doctorEnv {
+	e := healthyDoctorEnv()
+	e.nodeRole = func() (install.Role, bool) { return install.RoleAgent, true }
+	return e
 }
 
 func TestDoctorChecksTable(t *testing.T) {
@@ -104,6 +126,10 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"datastore/warn-probe-error", checkDatastore, func(e *doctorEnv) {
 			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", errors.New("io error") }
 		}, statusWarn},
+		{"datastore/skip-absent-on-a-worker", checkDatastore, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		}, statusSkip},
 
 		// toolchain: the three node classes. A full Xcode developer dir is the one
 		// the annotation grants; the other two grant nothing and are WARN, never
@@ -120,6 +146,48 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"toolchain/warn-no-developer-dir", checkXcodeToolchain, func(e *doctorEnv) {
 			e.developerDir = func() (string, error) { return "", errors.New("xcode-select -p: no developer tools") }
 		}, statusWarn},
+
+		// agent-daemon: SKIP on anything that is not a worker (a control plane
+		// has no agent daemon and never will — a WARN there would teach an
+		// operator to ignore the row). On a worker: a daemon that is not
+		// running is a FAIL, and a running daemon whose credential is absent or
+		// expired is a WARN, because the pid alone says nothing about whether
+		// this Mac ever joined.
+		{"agent-daemon/skip-on-a-server", checkAgentDaemon, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleServer, true }
+		}, statusSkip},
+		{"agent-daemon/skip-when-nothing-is-installed", checkAgentDaemon, func(e *doctorEnv) {
+			e.nodeRole = func() (install.Role, bool) { return install.RoleServer, false }
+		}, statusSkip},
+		{"agent-daemon/pass-running-with-a-valid-credential", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+		}, statusPass},
+		{"agent-daemon/fail-daemon-not-running", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.agentState = func() (bool, bool) { return true, false }
+		}, statusFail},
+		{"agent-daemon/fail-daemon-not-installed", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.agentState = func() (bool, bool) { return false, false }
+		}, statusFail},
+		{"agent-daemon/warn-running-but-never-joined", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.agentCredential = func() (status.CredentialState, time.Time) { return status.CredentialAbsent, time.Time{} }
+		}, statusWarn},
+		{"agent-daemon/warn-credential-expired", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.agentCredential = func() (status.CredentialState, time.Time) {
+				return status.CredentialExpired, time.Now().Add(-24 * time.Hour)
+			}
+		}, statusWarn},
+		{"agent-daemon/warn-credential-corrupt", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.agentCredential = func() (status.CredentialState, time.Time) { return status.CredentialCorrupt, time.Time{} }
+		}, statusWarn},
+		{"agent-daemon/skip-credential-unreadable-as-this-user", checkAgentDaemon, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.agentCredential = func() (status.CredentialState, time.Time) { return status.CredentialUnknown, time.Time{} }
+		}, statusSkip},
 	}
 
 	for _, c := range cases {
@@ -157,6 +225,73 @@ func TestDoctorChecksTable(t *testing.T) {
 		}
 	})
 
+	// The highest-value agent property: a worker whose daemon is UP but has
+	// never joined must not read as healthy. launchd keeps that pid alive
+	// forever, so PASS there would be the report agreeing with the one fact
+	// that does not matter.
+	t.Run("agent-daemon/a-running-daemon-that-never-joined-is-not-a-pass", func(t *testing.T) {
+		t.Parallel()
+		e := agentEnv()
+		e.agentCredential = func() (status.CredentialState, time.Time) { return status.CredentialAbsent, time.Time{} }
+		got := checkAgentDaemon(e)
+		if got.status == statusPass {
+			t.Fatalf("a worker with no node credential read as PASS: %q", got.detail)
+		}
+		for _, want := range []string{"k3sm token create", "--token-file", "agent.log"} {
+			if !strings.Contains(got.detail, want) {
+				t.Errorf("detail does not name %q — the remedy spans two Macs and has to say so:\n%s", want, got.detail)
+			}
+		}
+	})
+
+	// A control plane never gets a warning about a daemon it is not supposed to
+	// have: the row is SKIP, and SKIP is neither PASS nor FAIL.
+	t.Run("agent-daemon/a-server-is-skipped-not-warned", func(t *testing.T) {
+		t.Parallel()
+		got := checkAgentDaemon(healthyDoctorEnv())
+		if got.status != statusSkip {
+			t.Fatalf("status = %v, want SKIP on a control plane (detail: %q)", got.status, got.detail)
+		}
+	})
+
+	// A worker is not a control plane that has not started yet: its datastore
+	// row must not describe a wait that will never end.
+	t.Run("datastore/a-worker-is-told-it-runs-no-datastore", func(t *testing.T) {
+		t.Parallel()
+		e := agentEnv()
+		e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		got := checkDatastore(e)
+		if got.status != statusSkip {
+			t.Fatalf("status = %v, want SKIP", got.status)
+		}
+		if strings.Contains(got.detail, "has not initialized") {
+			t.Errorf("a worker is told to wait for a control plane it does not run: %q", got.detail)
+		}
+		if !strings.Contains(got.detail, "worker") {
+			t.Errorf("detail does not say why there is no datastore here: %q", got.detail)
+		}
+		// And a control plane's sentence is unchanged.
+		server := healthyDoctorEnv()
+		server.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		if detail := checkDatastore(server).detail; !strings.Contains(detail, "has not initialized") {
+			t.Errorf("the control-plane sentence changed: %q", detail)
+		}
+	})
+
+	// The two paths the agent lines quote are derived from the installer, not
+	// spelled out in the doctor: the credential store is the directory the
+	// install verifier watches, and the staged join token sits beside it.
+	t.Run("agent-daemon/the-paths-it-names-come-from-the-installer", func(t *testing.T) {
+		t.Parallel()
+		want := filepath.Dir(install.AgentCredentialPath(install.DefaultDataRoot))
+		if got := agentCredentialDir(); got != want {
+			t.Errorf("credential dir = %q, want %q", got, want)
+		}
+		if got := agentStagedTokenPath(); filepath.Dir(got) != want {
+			t.Errorf("staged token path = %q, want it inside %q", got, want)
+		}
+	})
+
 	// The registry the gate iterates must cover every check, and each fn must
 	// return a checkResult whose name matches its registry entry (so the ladder
 	// label and the result agree — a mismatch would mislabel a verdict).
@@ -173,7 +308,7 @@ func TestDoctorChecksTable(t *testing.T) {
 				t.Errorf("registry entry %q returns checkResult.name %q — must match", dc.name, r.name)
 			}
 		}
-		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "brew", "datastore", "toolchain"} {
+		for _, want := range []string{"arch", "macos", "sip", "netd-helper", "brew", "datastore", "toolchain", "agent-daemon"} {
 			if !seen[want] {
 				t.Errorf("registry missing check %q", want)
 			}

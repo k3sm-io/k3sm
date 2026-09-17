@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -43,7 +44,9 @@ Views:
   (none)      the one screen: install, daemons, apiserver, node, workloads, data root
   daemons     per-LaunchDaemon detail — state, pid, run count, last exit, plist and log paths
   cluster     control-plane detail — readyz, node, workloads by phase, datastore, runtime daemon
-  logs [job]  tail the daemons' log files; job is netd or server, both when omitted
+  logs [job]  tail the daemons' log files; job is netd, server or agent — when
+              omitted, the two this Mac is installed with (netd and the node
+              daemon of its role)
 
 Flags:
   -o text|json|wide   output format (default text; json is the machine interface)
@@ -140,8 +143,22 @@ func (w *watchFlag) IsBoolFlag() bool { return true }
 // statusViews are the accepted first positional arguments.
 var statusViews = map[string]bool{"daemons": true, "cluster": true, "logs": true}
 
-// statusLogTargets are the accepted `status logs` arguments.
-var statusLogTargets = map[string]bool{"netd": true, "server": true}
+// statusLogTargets are the accepted `status logs` arguments. All three are
+// accepted on any Mac: naming a log this node does not have is a question with
+// an answer ("there is no such file here"), and refusing the argument on a
+// worker would make `k3sm status logs server` a usage error instead.
+var statusLogTargets = map[string]bool{"netd": true, "server": true, "agent": true}
+
+// defaultLogTargets is what `k3sm status logs` tails when no job is named: netd
+// plus the node daemon of the role this Mac is installed as. A control plane
+// has no agent.log and a worker has no server.log, so a fixed pair would print
+// an error about a file that was never meant to exist.
+func defaultLogTargets(role install.Role) []string {
+	if role == install.RoleAgent {
+		return []string{"netd", "agent"}
+	}
+	return []string{"netd", "server"}
+}
 
 // parseStatusArgs parses the command line into options.
 //
@@ -187,7 +204,7 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 			return o, fmt.Errorf("unexpected argument %q", positional[0])
 		}
 		if !statusLogTargets[positional[0]] {
-			return o, fmt.Errorf("unknown log %q — expected netd or server", positional[0])
+			return o, fmt.Errorf("unknown log %q — expected netd, server or agent", positional[0])
 		}
 		o.target = positional[0]
 		positional = positional[1:]
@@ -223,6 +240,10 @@ type statusRunner struct {
 	sleep    func(context.Context, time.Duration) bool
 	readLog  func(path string, lines int) ([]string, error)
 	logPaths map[string]string
+	// logTargets is the default `status logs` job list for the role this Mac is
+	// installed as. An empty list means the control-plane default, so a runner
+	// assembled without one still tails something rather than nothing.
+	logTargets []string
 }
 
 // run executes a parsed command and returns the process exit code.
@@ -331,8 +352,15 @@ func (r statusRunner) runWatch(ctx context.Context, o statusOptions) int {
 // output is not a report, so it carries the file headers on stderr: a caller
 // redirecting stdout gets log lines and nothing else.
 func (r statusRunner) runLogs(o statusOptions) int {
-	names := []string{"netd", "server"}
-	if o.target != "" {
+	names := r.logTargets
+	if len(names) == 0 {
+		names = defaultLogTargets(install.RoleServer)
+	}
+	// A job the caller NAMED is a job they expect to exist, so a missing file is
+	// an error. A job on the default list is not: this Mac carries one node
+	// daemon, and a log the other role would have written is simply not there.
+	explicit := o.target != ""
+	if explicit {
 		names = []string{o.target}
 	}
 	code := 0
@@ -340,6 +368,9 @@ func (r statusRunner) runLogs(o statusOptions) int {
 		path := r.logPaths[name]
 		lines, err := r.readLog(path, o.lines)
 		if err != nil {
+			if !explicit && errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			if errors.Is(err, fs.ErrPermission) {
 				fmt.Fprintf(r.errOut, "k3sm status logs: %s is not readable as this user — run: sudo k3sm status logs %s\n", path, name)
 				code = status.VerdictUnknown.ExitCode()
