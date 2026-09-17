@@ -21,6 +21,8 @@ import (
 	"net/netip"
 	"sync"
 
+	corev1 "k8s.io/api/core/v1"
+
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
@@ -130,6 +132,24 @@ func (f *transportFeed) drop(podID string) {
 	f.republishLocked()
 }
 
+// has reports whether podID currently holds an override — the exact predicate
+// observeTransport maintains, read back under the same lock, so the readiness
+// gate and the Service proxy can never disagree about whether a pod is dialable.
+//
+// A nil (inert) feed holds no leases and answers false. The readiness gate's
+// no-sink case is decided at its own call site (transportGateFor) rather than
+// here, because "this node runs no Service proxy" and "this pod has no lease"
+// are different facts and only the latter belongs in the lease map.
+func (f *transportFeed) has(podID string) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.leases[podID]
+	return ok
+}
+
 // republishLocked derives the FULL current map from the tracked lease state and
 // hands it to the sink. Callers hold mu.
 func (f *transportFeed) republishLocked() {
@@ -219,4 +239,37 @@ func (r *runtimedRuntime) observeTransport(podID string, rs *runtimev1.PodStatus
 		return
 	}
 	r.transport.observe(podID, gn.PodIP.Unmap(), live)
+}
+
+// transportGateFor computes the pod-level readiness precondition for pod: whether
+// the Service proxy can dial it at the published address its EndpointSlice will
+// carry. It is the SAME predicate observeTransport maintains — one lease map,
+// read back — so the window it closes cannot reopen through a second notion of
+// "installed".
+//
+// It answers transportReady for everything that is not a vm pod waiting on a
+// lease, in three cases that are each a different fact:
+//   - no sink is configured (the --network none / no-datapath posture): there is
+//     no dial path to withhold readiness for, and gating on a feed nothing will
+//     ever fill would strand every vm pod NotReady forever;
+//   - the pod is not vm-backed: its published /32 is live on lo0 and is dialed
+//     directly, with no override in the picture at any point in its life;
+//   - its RuntimeClass does not resolve: CreatePod already refused such a pod, so
+//     there is no running workload to gate — fail toward the pre-existing
+//     behaviour rather than inventing a NotReady for a pod that cannot exist. That
+//     upstream refusal is pinned by TestToPodBoxUnknownRuntimeClassFailsClosed
+//     (translate_test.go); a change to toPodBox's error path re-opens this branch
+//     and must re-audit it.
+func (r *runtimedRuntime) transportGateFor(pod *corev1.Pod) transportGate {
+	if pod == nil || r.transport == nil {
+		return transportReady
+	}
+	backend, err := podSandboxBackend(pod)
+	if err != nil || backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		return transportReady
+	}
+	if r.transport.has(string(pod.UID)) {
+		return transportReady
+	}
+	return transportPending
 }

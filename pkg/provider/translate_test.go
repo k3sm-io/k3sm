@@ -823,7 +823,7 @@ func TestToPodStatusRunning(t *testing.T) {
 	stable := metav1.NewTime(time.Unix(1000, 0))
 	rs := runningRS("uid-web", time.Unix(2000, 0))
 
-	st := toPodStatus(nil, rs, "192.168.1.10", stable, nil)
+	st := toPodStatus(nil, rs, "192.168.1.10", stable, nil, transportReady)
 
 	if st.Phase != corev1.PodRunning {
 		t.Errorf("phase = %s, want Running", st.Phase)
@@ -880,7 +880,7 @@ func TestToPodStatusTerminatedVerbatim(t *testing.T) {
 			},
 		}},
 	}
-	st := toPodStatus(nil, rs, "10.0.0.1", metav1.Now(), nil)
+	st := toPodStatus(nil, rs, "10.0.0.1", metav1.Now(), nil, transportReady)
 
 	if st.Phase != corev1.PodFailed {
 		t.Errorf("phase = %s, want Failed", st.Phase)
@@ -1153,7 +1153,7 @@ func TestToContainerStatusMirror(t *testing.T) {
 			User: &runtimev1.ContainerUser{Linux: &runtimev1.LinuxContainerUser{Uid: 1000, Gid: 2000, SupplementalGroups: []int64{999}}},
 		}},
 	}
-	st := toPodStatus(nil, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+	st := toPodStatus(nil, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 
 	cs := st.ContainerStatuses[0]
 	if len(cs.VolumeMounts) != 2 {
@@ -1189,7 +1189,7 @@ func TestToPodStatusOOMKilled(t *testing.T) {
 			}},
 		}},
 	}
-	st := toPodStatus(nil, rs, "10.0.0.1", metav1.Now(), nil)
+	st := toPodStatus(nil, rs, "10.0.0.1", metav1.Now(), nil, transportReady)
 
 	if st.Phase != corev1.PodFailed {
 		t.Errorf("phase = %s, want Failed", st.Phase)
@@ -1311,7 +1311,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 
 	t.Run("derive Guaranteed: cpu+memory, requests==limits, both explicit", func(t *testing.T) {
 		pod := podWith("g", "", nil, []corev1.Container{guaranteedContainer("c0")})
-		st := toPodStatus(pod, runningRS("uid-g", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		st := toPodStatus(pod, runningRS("uid-g", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil, transportReady)
 		if st.QOSClass != corev1.PodQOSGuaranteed {
 			t.Errorf("QOSClass = %q, want Guaranteed", st.QOSClass)
 		}
@@ -1322,7 +1322,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 			Name:      "c0",
 			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: q("128Mi")}},
 		}})
-		st := toPodStatus(pod, runningRS("uid-b", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		st := toPodStatus(pod, runningRS("uid-b", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil, transportReady)
 		if st.QOSClass != corev1.PodQOSBurstable {
 			t.Errorf("QOSClass = %q, want Burstable", st.QOSClass)
 		}
@@ -1330,7 +1330,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 
 	t.Run("derive BestEffort: no resources at all", func(t *testing.T) {
 		pod := podWith("be", "", nil, []corev1.Container{{Name: "c0"}})
-		st := toPodStatus(pod, runningRS("uid-be", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		st := toPodStatus(pod, runningRS("uid-be", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil, transportReady)
 		if st.QOSClass != corev1.PodQOSBestEffort {
 			t.Errorf("QOSClass = %q, want BestEffort", st.QOSClass)
 		}
@@ -1345,7 +1345,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: q("250m")}},
 		}}
 		pod := podWith("i", "", init, []corev1.Container{guaranteedContainer("c0")})
-		st := toPodStatus(pod, runningRS("uid-i", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		st := toPodStatus(pod, runningRS("uid-i", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil, transportReady)
 		if st.QOSClass != corev1.PodQOSBurstable {
 			t.Errorf("QOSClass = %q, want Burstable (the init container must count)", st.QOSClass)
 		}
@@ -1363,7 +1363,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 		if got := computePodQOS(pod); got != corev1.PodQOSBurstable {
 			t.Fatalf("precondition: spec derives %q, want Burstable (so carry-forward differs)", got)
 		}
-		st := toPodStatus(pod, runningRS("uid-cf", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		st := toPodStatus(pod, runningRS("uid-cf", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil, transportReady)
 		if st.QOSClass != corev1.PodQOSGuaranteed {
 			t.Errorf("QOSClass = %q, want Guaranteed (apiserver value carried forward, not re-derived)", st.QOSClass)
 		}
@@ -1371,7 +1371,7 @@ func TestPodStatusQOSClass(t *testing.T) {
 
 	t.Run("derive fallback when the apiserver value is blank", func(t *testing.T) {
 		pod := podWith("fb", "", nil, []corev1.Container{guaranteedContainer("c0")})
-		st := toPodStatus(pod, runningRS("uid-fb", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil)
+		st := toPodStatus(pod, runningRS("uid-fb", time.Unix(2000, 0)), "192.168.1.10", metav1.Now(), nil, transportReady)
 		if st.QOSClass != corev1.PodQOSGuaranteed {
 			t.Errorf("QOSClass = %q, want Guaranteed (derived because the apiserver value was blank)", st.QOSClass)
 		}

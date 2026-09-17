@@ -1265,7 +1265,11 @@ func derefInt64(p *int64) int64 {
 // probe-driven restart count is added — applied before the conditions are derived
 // so the readiness signal propagates. A nil probes leaves the runtime status
 // untouched (a pod with no probes).
-func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState) *corev1.PodStatus {
+//
+// transport is the caller's network-path precondition on POD-LEVEL PodReady (see
+// transportGate). It is transportReady for every native pod, so their status is
+// byte-identical to one built before the gate existed.
+func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startTime metav1.Time, probes probeState, transport transportGate) *corev1.PodStatus {
 	cs := toContainerStatuses(rs.GetContainerStatuses())
 	initCS := toContainerStatuses(rs.GetInitContainerStatuses())
 	applyProbeOverlay(cs, probes)
@@ -1309,7 +1313,7 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	// this status write and stays observable to computeReadiness.
 	out.Conditions = []corev1.PodCondition{
 		computeInitialized(pod, initCS),
-		computeReadiness(pod, containersReady),
+		computeReadiness(pod, containersReady, transport),
 		{Type: corev1.ContainersReady, Status: crStatus},
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 	}
@@ -1350,7 +1354,12 @@ func containersReadyFrom(cs []corev1.ContainerStatus) bool {
 // ready. PodReady goes back through computeReadiness (readinessGates + the stable
 // LastTransitionTime prior), so a refreshed condition is indistinguishable from
 // one derived with the gate applied in the first place.
-func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus) {
+//
+// transport is threaded through unchanged so the postStart gate and the guest
+// transport gate COMPOSE: an overlay that re-derives readiness must not discard
+// the network-path precondition toPodStatus was built with, or the first
+// postStart refresh would publish PodReady=True for an undialable vm pod.
+func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus, transport transportGate) {
 	ready := containersReadyFrom(st.ContainerStatuses)
 	crStatus := corev1.ConditionFalse
 	if ready {
@@ -1359,12 +1368,49 @@ func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus) {
 	for i := range st.Conditions {
 		switch st.Conditions[i].Type {
 		case corev1.PodReady:
-			st.Conditions[i] = computeReadiness(pod, ready)
+			st.Conditions[i] = computeReadiness(pod, ready, transport)
 		case corev1.ContainersReady:
 			st.Conditions[i].Status = crStatus
 		}
 	}
 }
+
+// transportGate is the provider-internal NETWORK-PATH precondition on POD-LEVEL
+// PodReady. It exists because a vm pod's two addresses are installed at different
+// moments: the pod's containers can be running and Ready while the Service proxy
+// still has no published->live override for it (transportoverride.go), so the
+// EndpointSlice would list a backend nothing can dial — and a failurePolicy=Fail
+// webhook behind that Service rejects every request for as long as the window
+// lasts (runtimed polls the guest's lease roughly every five seconds).
+//
+// IT GATES THE POD-LEVEL CONDITION ONLY. ContainersReady and every container's
+// Ready flag are statements ABOUT THE CONTAINERS and are left exactly as computed
+// — the containers really are ready; it is the node's path to them that is not.
+// It is deliberately NOT a spec.readinessGate and NOT a new condition type: the
+// fact is the provider's own and no external controller patches it.
+//
+// A gate that was satisfied can go back to transportPending — a guest that loses
+// its lease is undialable again, and an undialable backend must leave the
+// EndpointSlice — so PodReady flips back to False with the same reason. That is
+// correct under the two-address model, not a flap to suppress.
+type transportGate bool
+
+const (
+	// transportReady is the satisfied gate: the pod is dialable at its published
+	// address. Every native (host-process) pod is born this way — its published
+	// /32 IS live on lo0 — as is every build path with no vm pod in scope.
+	transportReady transportGate = true
+	// transportPending is the withheld gate: this node provisioned a guest for the
+	// pod and the Service proxy holds no override for it yet.
+	transportPending transportGate = false
+)
+
+// reasonGuestTransportNotReady is the PodReady reason a vm pod carries while its
+// gate is transportPending. It sits beside the two kubelet-shaped reasons
+// computeReadiness emits ("ContainersNotReady", "ReadinessGatesNotReady") and is
+// deliberately k3sm-specific: no upstream reason names this window, and reusing
+// one would tell an operator to go look at the containers, which are fine.
+const reasonGuestTransportNotReady = "GuestTransportNotReady"
 
 // computeReadiness derives the PodReady condition, honoring spec.readinessGates. It
 // is the single pure authority every status-build path (toPodStatus, and
@@ -1375,6 +1421,15 @@ func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus) {
 //   - containersReady is the precondition: when the containers are not ready the
 //     gates are short-circuited and PodReady is False/"ContainersNotReady" (the
 //     kubelet short-circuits gates behind ContainersReady).
+//   - then k3sm's own transport gate: a vm pod whose live transport address the
+//     Service proxy does not hold yet is False/"GuestTransportNotReady". It is
+//     ordered AFTER containersReady — when both withhold, ContainersNotReady wins,
+//     because a container that has not come up is the more actionable fact and the
+//     transport window is a consequence of the pod being young — and BEFORE the
+//     readinessGates, because an undialable pod cannot satisfy any consumer of the
+//     Service regardless of what a gate condition says. The precedence chooses the
+//     REASON STRING ONLY: PodReady is False under either order whenever two of
+//     these withhold, so no ordering here can leak a Ready pod.
 //   - otherwise PodReady = ContainersReady AND (every readinessGate whose condition
 //     is present on the pod is True): a gate present-and-True is satisfied; a gate
 //     present-and-not-True (False/Unknown) blocks with "ReadinessGatesNotReady"
@@ -1389,13 +1444,23 @@ func refreshReadinessConditions(pod *corev1.Pod, st *corev1.PodStatus) {
 // NotReady forever — strictly worse than advancing a rolling update too early.
 // k3sm therefore honors observable gates only; the informer feedback loop that
 // would let the provider react to external gate patches is a deferred follow-up.
-func computeReadiness(pod *corev1.Pod, containersReady bool) corev1.PodCondition {
+func computeReadiness(pod *corev1.Pod, containersReady bool, transport transportGate) corev1.PodCondition {
 	cond := corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue}
 	switch {
 	case !containersReady:
 		cond.Status = corev1.ConditionFalse
 		cond.Reason = "ContainersNotReady"
 		cond.Message = "containers are not ready"
+	case transport == transportPending:
+		cond.Status = corev1.ConditionFalse
+		cond.Reason = reasonGuestTransportNotReady
+		// One sentence covering BOTH states the gate withholds for: a guest that
+		// never reported a lease and a guest that lost one it had. A message
+		// written only for start-up would read as jitter on a pod that was Ready
+		// for hours, which is when it matters most.
+		cond.Message = "the guest has not reported its transport address yet, or lost the lease " +
+			"it had; the runtime polls the guest agent every 5 s and this pod joins its " +
+			"Services as soon as a lease is reported"
 	case pod != nil:
 		for i := range pod.Spec.ReadinessGates {
 			gate := pod.Spec.ReadinessGates[i].ConditionType

@@ -321,7 +321,7 @@ func TestM2_LivenessRestarts(t *testing.T) {
 	// count on the RestartContainer RPC; adding here would double-count).
 	proto := runningProto("uid-liveness", "c0")
 	proto.ContainerStatuses[0].RestartCount = 1 // runtimed's count after the re-exec
-	st := toPodStatus(nil, proto, "192.168.1.10", metav1.Now(), pp)
+	st := toPodStatus(nil, proto, "192.168.1.10", metav1.Now(), pp, transportReady)
 	if st.ContainerStatuses[0].RestartCount != 1 {
 		t.Fatalf("status RestartCount=%d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
@@ -404,7 +404,7 @@ func TestProbeRestartInvokesRPC(t *testing.T) {
 	// monitor's tally is never added on top (the single-count-authority rule).
 	proto := runningProto("uid-live", "c0")
 	proto.ContainerStatuses[0].RestartCount = 1 // what runtimed reports after the RPC
-	st := toPodStatus(nil, proto, r.nodeIP, metav1.Now(), pp)
+	st := toPodStatus(nil, proto, r.nodeIP, metav1.Now(), pp, transportReady)
 	if st.ContainerStatuses[0].RestartCount != 1 {
 		t.Errorf("status RestartCount = %d, want 1 (runtimed's count verbatim, not doubled by the probe tally)", st.ContainerStatuses[0].RestartCount)
 	}
@@ -426,10 +426,10 @@ func TestM2_ReadinessGatesEndpoints(t *testing.T) {
 	m := pp.monitors["c0"]
 
 	ready := func() corev1.ConditionStatus {
-		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.PodReady)
+		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp, transportReady), corev1.PodReady)
 	}
 	containersReady := func() corev1.ConditionStatus {
-		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp), corev1.ContainersReady)
+		return condStatus(toPodStatus(nil, runningProto("uid-ready", "c0"), "192.168.1.10", metav1.Now(), pp, transportReady), corev1.ContainersReady)
 	}
 
 	// Until the readiness probe first succeeds, the container is NOT ready (so it

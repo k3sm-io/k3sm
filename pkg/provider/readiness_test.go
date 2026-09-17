@@ -66,7 +66,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 
 	// (a) gate PRESENT+True & containersReady=true → PodReady True.
 	t.Run("present-true gate is ready", func(t *testing.T) {
-		got := computeReadiness(gatedPod([]string{"example.com/g"}, trueCond("example.com/g")), true)
+		got := computeReadiness(gatedPod([]string{"example.com/g"}, trueCond("example.com/g")), true, transportReady)
 		if got.Status != corev1.ConditionTrue {
 			t.Fatalf("PodReady = %s/%s, want True", got.Status, got.Reason)
 		}
@@ -74,7 +74,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 
 	// (b) gate PRESENT+False → PodReady False, Reason "ReadinessGatesNotReady".
 	t.Run("present-false gate blocks", func(t *testing.T) {
-		got := computeReadiness(gatedPod([]string{"example.com/g"}, falseCond("example.com/g")), true)
+		got := computeReadiness(gatedPod([]string{"example.com/g"}, falseCond("example.com/g")), true, transportReady)
 		if got.Status != corev1.ConditionFalse {
 			t.Fatalf("PodReady = %s, want False", got.Status)
 		}
@@ -90,10 +90,10 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 	// legs — the common-path regression guard).
 	t.Run("no gates tracks containersReady", func(t *testing.T) {
 		pod := newPod("default", "p")
-		if got := computeReadiness(pod, true); got.Status != corev1.ConditionTrue {
+		if got := computeReadiness(pod, true, transportReady); got.Status != corev1.ConditionTrue {
 			t.Errorf("containersReady=true → PodReady = %s, want True", got.Status)
 		}
-		got := computeReadiness(pod, false)
+		got := computeReadiness(pod, false, transportReady)
 		if got.Status != corev1.ConditionFalse {
 			t.Errorf("containersReady=false → PodReady = %s, want False", got.Status)
 		}
@@ -105,11 +105,11 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 	// (d) two gates both present-True → True; one present-False → False.
 	t.Run("multiple gates AND", func(t *testing.T) {
 		bothTrue := gatedPod([]string{"a/x", "b/y"}, trueCond("a/x"), trueCond("b/y"))
-		if got := computeReadiness(bothTrue, true); got.Status != corev1.ConditionTrue {
+		if got := computeReadiness(bothTrue, true, transportReady); got.Status != corev1.ConditionTrue {
 			t.Errorf("both gates True → PodReady = %s, want True", got.Status)
 		}
 		oneFalse := gatedPod([]string{"a/x", "b/y"}, trueCond("a/x"), falseCond("b/y"))
-		if got := computeReadiness(oneFalse, true); got.Status != corev1.ConditionFalse {
+		if got := computeReadiness(oneFalse, true, transportReady); got.Status != corev1.ConditionFalse {
 			t.Errorf("one gate False → PodReady = %s, want False", got.Status)
 		}
 	})
@@ -117,7 +117,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 	// (e) containersReady=false short-circuits gates: PodReady False regardless of
 	// a satisfied gate.
 	t.Run("containers not ready short-circuits gates", func(t *testing.T) {
-		got := computeReadiness(gatedPod([]string{"example.com/g"}, trueCond("example.com/g")), false)
+		got := computeReadiness(gatedPod([]string{"example.com/g"}, trueCond("example.com/g")), false, transportReady)
 		if got.Status != corev1.ConditionFalse {
 			t.Fatalf("PodReady = %s, want False (ContainersReady short-circuit)", got.Status)
 		}
@@ -131,7 +131,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 	// conditions; without the carry-forward the gate condition would be clobbered.
 	t.Run("external condition survives toPodStatus rebuild", func(t *testing.T) {
 		pod := gatedPod([]string{"example.com/g"}, trueCond("example.com/g"))
-		out := toPodStatus(pod, runningRS("uid-p", time.Unix(2000, 0)), "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+		out := toPodStatus(pod, runningRS("uid-p", time.Unix(2000, 0)), "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 		ext := findPodCondition(out.Conditions, corev1.PodConditionType("example.com/g"))
 		if ext == nil {
 			t.Fatal("external readinessGate condition was clobbered by the status rebuild")
@@ -156,7 +156,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: past},
 		}
 		// unchanged status → LTT preserved (no per-tick churn).
-		same := computeReadiness(pod, true)
+		same := computeReadiness(pod, true, transportReady)
 		if same.Status != corev1.ConditionTrue {
 			t.Fatalf("status = %s, want True", same.Status)
 		}
@@ -164,7 +164,7 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 			t.Errorf("unchanged status churned LTT: %v, want preserved %v", same.LastTransitionTime, past)
 		}
 		// real flip → LTT advances off the prior value.
-		flip := computeReadiness(pod, false)
+		flip := computeReadiness(pod, false, transportReady)
 		if flip.Status != corev1.ConditionFalse {
 			t.Fatalf("status = %s, want False", flip.Status)
 		}
@@ -178,12 +178,12 @@ func TestRollingUpdateSurfacesReadyGates(t *testing.T) {
 	// stall safety rule; the provider cannot observe external gate patches).
 	t.Run("absent gate does not stall", func(t *testing.T) {
 		pod := gatedPod([]string{"example.com/never-observed"}) // gate declared, no condition
-		if got := computeReadiness(pod, true); got.Status != corev1.ConditionTrue {
+		if got := computeReadiness(pod, true, transportReady); got.Status != corev1.ConditionTrue {
 			t.Fatalf("absent gate → PodReady = %s/%s, want True (no permanent stall)", got.Status, got.Reason)
 		}
 		// Same through toPodStatus (the live path): a running pod with an
 		// unobservable gate is Ready, not stuck NotReady forever.
-		out := toPodStatus(pod, runningRS("uid-p", time.Unix(2000, 0)), "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+		out := toPodStatus(pod, runningRS("uid-p", time.Unix(2000, 0)), "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 		if r, ok := readyStatusOf(out.Conditions); !ok || r.Status != corev1.ConditionTrue {
 			t.Fatalf("toPodStatus PodReady = %+v, want True (absent gate must not stall)", r)
 		}
