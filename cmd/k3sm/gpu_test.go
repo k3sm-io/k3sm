@@ -234,7 +234,12 @@ func TestNodeAdvertisesGPUExtendedResource(t *testing.T) {
 				if !tc.wantAdvertised {
 					wantNothingAdvertised(t, n)
 				} else {
-					wantGPUQuantity(t, n, gpuDeviceCount)
+					// 2, not 1: the capable host's 96GiB recommended working set
+					// holds far more than two slot floors, so the advertised count
+					// is the clamp. The arithmetic itself is pinned by pkg/mlx's
+					// TestGPUCapacityPolicy; what this row proves is that the node
+					// advertises what that arithmetic says rather than a literal.
+					wantGPUQuantity(t, n, 2)
 					wantLabel(t, n, mlxv1alpha1.LabelGPUPresent, runtimeclass.LabelTrue)
 					// The SLUG, not the raw fact: "Apple M4 Max" is not a legal label
 					// value, and a consumer comparing the label to the raw chip_brand
@@ -308,14 +313,73 @@ func TestNodeAdvertisesGPUExtendedResource(t *testing.T) {
 		n.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: *resource.NewQuantity(8, resource.DecimalSI)}
 		n.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: *resource.NewQuantity(8, resource.DecimalSI)}
 		applyGPUAdvertisement(n, capableFacts())
-		wantGPUQuantity(t, n, gpuDeviceCount)
+		wantGPUQuantity(t, n, 2)
 		if _, ok := n.Status.Capacity[corev1.ResourceCPU]; !ok {
 			t.Errorf("Capacity lost cpu; list=%v", n.Status.Capacity)
 		}
 		// A node with NIL lists must not panic and must end up advertising.
 		bare := &corev1.Node{}
 		applyGPUAdvertisement(bare, capableFacts())
-		wantGPUQuantity(t, bare, gpuDeviceCount)
+		wantGPUQuantity(t, bare, 2)
+	})
+
+	// THE ADVERTISED COUNT FOLLOWS THE HOST'S GPU MEMORY CEILING, not a constant.
+	// Both directions are here because a count wired to a literal passes whichever
+	// single row matches it: a Mac whose usable ceiling holds one slot must advertise
+	// 1 even though its Metal device and sandbox are both fine, and a large one must
+	// advertise the clamp rather than a slot per floor.
+	t.Run("advertised_count_follows_the_memory_ceiling", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			facts func() *runtimev1.GPUFacts
+			want  int64
+		}{
+			{
+				name: "small_ceiling_advertises_one",
+				facts: func() *runtimev1.GPUFacts {
+					f := capableFacts()
+					f.RecommendedMaxWorkingSetBytes = 1 * 1024 * 1024 * 1024
+					return f
+				},
+				want: 1,
+			},
+			{
+				// The iogpu wired limit is the TIGHTER of the two ceilings here, and
+				// it is the one that must decide — a node reading the 96GiB working
+				// set alone would advertise two slots its wired limit cannot hold.
+				name: "tight_wired_limit_advertises_one",
+				facts: func() *runtimev1.GPUFacts {
+					f := capableFacts()
+					f.IogpuWiredLimitBytes = 2 * 1024 * 1024 * 1024
+					return f
+				},
+				want: 1,
+			},
+			{
+				name:  "large_ceiling_advertises_the_clamp",
+				facts: capableFacts,
+				want:  2,
+			},
+			{
+				// No ceiling readable at all: one slot, because the provider's
+				// cumulative fit check has no number to admit a second one against.
+				name: "unknown_ceiling_advertises_one",
+				facts: func() *runtimev1.GPUFacts {
+					f := capableFacts()
+					f.RecommendedMaxWorkingSetBytes = 0
+					f.IogpuWiredLimitBytes = 0
+					return f
+				},
+				want: 1,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				n := &corev1.Node{}
+				applyGPUAdvertisement(n, tc.facts())
+				wantGPUQuantity(t, n, tc.want)
+				wantLabel(t, n, mlxv1alpha1.LabelGPUPresent, runtimeclass.LabelTrue)
+			})
+		}
 	})
 
 	// The four keys are DISTINCT strings. Reusing one for two purposes would make a
@@ -417,7 +481,7 @@ func TestNodeAdvertisesGPUExtendedResource(t *testing.T) {
 		caps := provider.NodeCapabilities{GPU: facts}
 		n := &corev1.Node{}
 		applyGPUAdvertisement(n, caps.GPU)
-		wantGPUQuantity(t, n, gpuDeviceCount)
+		wantGPUQuantity(t, n, 2)
 		if facts.GetChipBrand() != "Apple M4 Max" {
 			t.Errorf("the advertiser must not mutate the raw facts: chip_brand = %q", facts.GetChipBrand())
 		}

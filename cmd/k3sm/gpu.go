@@ -26,6 +26,8 @@ import (
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"k3sm.io/k3sm/pkg/mlx"
 )
 
 // gpuResourceName is the mlx.k3sm.io/gpu extended resource as a corev1.ResourceName.
@@ -34,13 +36,6 @@ import (
 // the exact byte string, and a literal in one consumer is a second source of truth
 // that compiles perfectly while being wrong.
 const gpuResourceName = corev1.ResourceName(mlxv1alpha1.ResourceGPU)
-
-// gpuDeviceCount is how many units of mlx.k3sm.io/gpu a capable node advertises.
-// Apple Silicon exposes ONE integrated GPU per host — GPUFacts carries no device
-// count because there is nothing to count — so this is 1 by construction, not a
-// tunable. Advertising 1 makes the resource a MUTEX: the second GPU pod stays
-// Pending rather than contending for the same Metal device with the first.
-const gpuDeviceCount int64 = 1
 
 // bytesPerGiB converts GPUFacts.mem_bytes to the whole-gibibyte label value.
 const bytesPerGiB = 1 << 30
@@ -68,6 +63,12 @@ const maxLabelValueLen = 63
 // another), so advertising on metal_available alone would attract MLX workloads to a
 // node whose sandbox denies every one of them at admission — a fail-OPEN mislabel.
 //
+// HOW MANY is a separate question from WHETHER, and it is not answered here: the
+// count comes from mlx.GPUSlots over the same facts (N is 1 or 2, from the host's
+// usable GPU memory ceiling). The one arithmetic serves both this advertiser and the
+// provider's admission-time fit check, which is what keeps the scheduler from binding
+// a pod the node then refuses.
+//
 // facts nil means the daemon reports no GPU facts at all (a daemon predating them),
 // which is DISTINCT from a report of a host with no usable GPU. Both advertise
 // nothing here, but only because "unknown" and "known absent" happen to share the
@@ -75,7 +76,8 @@ const maxLabelValueLen = 63
 // the two is fixed by upgrading the daemon.
 func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 	present := gpuAdvertisable(facts)
-	setGPUResource(n, present)
+	slots := mlx.GPUSlots(facts)
+	setGPUResource(n, present, slots)
 	setLabelPresence(n, mlxv1alpha1.LabelGPUPresent, present)
 	// The three descriptive labels ride the SAME verdict as the presence label rather
 	// than their own emptiness checks: a node that is not advertising a GPU must not
@@ -86,7 +88,8 @@ func applyGPUAdvertisement(n *corev1.Node, facts *runtimev1.GPUFacts) {
 	setLabelValue(n, mlxv1alpha1.LabelMemoryGB, gpuLabelValue(present, memoryGiBLabel(facts.GetMemBytes())))
 	if present {
 		slog.Debug("node GPU advertised",
-			"resource", mlxv1alpha1.ResourceGPU, "count", gpuDeviceCount,
+			"resource", mlxv1alpha1.ResourceGPU, "count", slots,
+			"gpu_ceiling_bytes", mlx.GPUCeilingBytes(facts),
 			"chip_brand", facts.GetChipBrand(), "chip_family", facts.GetChipFamily())
 		return
 	}
@@ -118,15 +121,30 @@ func gpuLabelValue(present bool, value string) string {
 	return value
 }
 
-// setGPUResource adds gpuDeviceCount of mlx.k3sm.io/gpu to the node's Capacity AND
+// setGPUResource adds slots units of mlx.k3sm.io/gpu to the node's Capacity AND
 // Allocatable, or deletes it from both. Both lists matter: the scheduler fits pods
 // against Allocatable, while Capacity is what an operator reads — advertising only
 // one makes `kubectl describe node` and the scheduler disagree.
 //
+// SLOTS ARE CO-TENANTS, NOT DEVICES. N (1 or 2, see mlx.GPUSlots) says this node's
+// GPU memory holds N floor-sized workloads under benign co-tenancy; it does not say
+// the workloads are isolated from each other, because there is one integrated GPU and
+// they share it. That is the same distinction DESIGN §5a draws for CPU, and it is why
+// the memory fit is re-checked at admission rather than being trusted to the slot
+// count alone.
+//
 // Allocatable gets the FULL count with no hold-back, unlike memory (see
-// nodeAllocatable): there is exactly one integrated GPU and no co-located control
-// plane component reserves a share of it, so any carve-out would simply strand it.
-func setGPUResource(n *corev1.Node, present bool) {
+// nodeAllocatable): no co-located control-plane component reserves a share of GPU
+// memory, so a carve-out here would strand capacity nothing else is going to claim.
+// The reasoning does not rest on N being 1 — it holds at any N, because the thing
+// being reserved for is absent, not small.
+//
+// A DAEMON RESTART MAY LOWER N below what is already bound (a changed iogpu limit, a
+// working set that now reads smaller). Kubernetes tolerates an Allocatable that drops
+// below what is committed: the bound pods keep running and the scheduler simply stops
+// fitting new ones until the arithmetic works again. That is the same direction as the
+// delete-on-loss discipline above, one step short of it.
+func setGPUResource(n *corev1.Node, present bool, slots int64) {
 	if !present {
 		// delete on a nil map is a no-op, so this needs no guard — and it is what
 		// makes a node that LOST the capability stop advertising it.
@@ -134,8 +152,8 @@ func setGPUResource(n *corev1.Node, present bool) {
 		delete(n.Status.Allocatable, gpuResourceName)
 		return
 	}
-	n.Status.Capacity = withResource(n.Status.Capacity, gpuResourceName, gpuDeviceCount)
-	n.Status.Allocatable = withResource(n.Status.Allocatable, gpuResourceName, gpuDeviceCount)
+	n.Status.Capacity = withResource(n.Status.Capacity, gpuResourceName, slots)
+	n.Status.Allocatable = withResource(n.Status.Allocatable, gpuResourceName, slots)
 }
 
 // withResource sets name=count (DecimalSI, the form an integer extended resource is
