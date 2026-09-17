@@ -70,14 +70,20 @@ type restartBudget struct {
 // them to microseconds; nothing in the product writes them.
 //
 // netd is a single Go process with no orderly teardown to perform, so 30s is
-// generous. A node daemon is not: its plist sets ExitTimeOut 45 (launchd's SIGTERM →
-// SIGKILL grace), and the control plane tears its components down serially inside
-// that window, so any unload budget at or below 45s would time out on precisely
-// the slow-but-healthy shutdown the wait exists to tolerate. 60s clears it with
-// margin.
+// generous. A node daemon is not: its plist sets the ExitTimeOut derived above
+// (launchd's SIGTERM → SIGKILL grace), and it runs its whole teardown serially
+// inside that window, so any unload budget at or below the grace would time out
+// on precisely the slow-but-healthy shutdown the wait exists to tolerate.
+//
+// So the node budget is DERIVED from that same grace rather than chosen: the
+// larger of the two node plists (the server's) plus a margin for launchd to
+// finish removing the label from its domain after the process is gone. Pinned by
+// TestRestartBudgetByLabel, which is what catches a grace that grows past it.
+const nodeUnloadMargin = 15 * time.Second
+
 var (
 	netdRestartBudget   = restartBudget{unload: 30 * time.Second, running: 30 * time.Second, poll: 250 * time.Millisecond}
-	serverRestartBudget = restartBudget{unload: 60 * time.Second, running: 60 * time.Second, poll: 250 * time.Millisecond}
+	serverRestartBudget = restartBudget{unload: time.Duration(serverExitTimeOut)*time.Second + nodeUnloadMargin, running: 60 * time.Second, poll: 250 * time.Millisecond}
 	// agentJoinBudget bounds the wait for a FIRST join to produce a credential
 	// (see verifyDaemons). It is a different question from a restart, so it is a
 	// different budget: nothing is being unloaded, and the clock is the join
@@ -94,9 +100,10 @@ var (
 // added to the manifest later inherits the conservative default rather than the
 // node's.
 //
-// The agent is in the long class for the reason its own plist sets ExitTimeOut
-// 45: its teardown is not instantaneous either (it closes the mesh device and
-// drains the Service proxy's listeners), so any unload budget at or below that
+// The agent is in the long class for the reason its own plist sets a raised
+// ExitTimeOut: its teardown is not instantaneous either (it stops its embedded
+// runtime's vm guests, closes the mesh device and drains the Service proxy's
+// listeners), so any unload budget at or below that
 // SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
 // shutdown the wait exists to tolerate — and the install would then refuse to
 // bootstrap into a label it had just asked to stop.

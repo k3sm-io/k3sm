@@ -1762,12 +1762,11 @@ func ServerPlist(cfg Config) []byte {
 		StdoutPath:       ServerLogPath(),
 		StderrPath:       ServerLogPath(),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
-		// Give Stop() room to reap the serial control-plane teardown before launchd
-		// SIGKILLs the job (default 20s ≈ the worst-case 4×drainGrace, which orphans
-		// the not-yet-reaped children). 45s clears it with margin. The server's mesh
-		// teardown runs after that, serially, for at most its own 5s bound
-		// (meshTeardownTimeout), which the 45s still covers.
-		ExitTimeOut: 45,
+		// Derived from the stages the server actually runs on its way out — see
+		// serverExitTimeOut. Never a hand-picked number: every stage's bound lives
+		// in its own package, and a literal here would be wrong the first time one
+		// of them moved.
+		ExitTimeOut: serverExitTimeOut,
 		// Raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes against a real
 		// fd table, not launchd's 256 default (the agent plist does the same; netd
 		// is not a relay host). Binds at bootstrap, not on kickstart -k — see the
@@ -1775,6 +1774,58 @@ func ServerPlist(cfg Config) []byte {
 		SoftFileLimit: serverFileLimit,
 	})
 }
+
+// The teardown budget, and why ExitTimeOut is derived rather than chosen.
+//
+// launchd SIGTERMs the job at `bootout`/`kickstart -k` and SIGKILLs it
+// ExitTimeOut seconds later (its default is 20). Everything a k3sm daemon does on
+// its way out runs SERIALLY inside that ONE number, and each stage's bound is
+// owned by a different package — so a hand-picked literal here is wrong the first
+// time any of them moves, and the failure is silent and bad: a SIGKILL mid-stop
+// orphans exactly the children the stop exists to reap (kine and the apiserver on
+// the server path, a vm host helper on either).
+//
+// The stages, each with the symbol that owns its bound:
+//
+//	runtimed close     37s  vmShutdownBound (35s) + defaultCloseGrace (2s), both
+//	                        runtimed pkg/runtime/close.go — the embedded runtime's
+//	                        concurrent vm-helper stop, deferred by startNode.
+//	control socket      5s  runtimedSocketShutdownGrace, cmd/k3sm/runtimedsocket.go.
+//	control-plane stop 30s  executor.StopBound — SERVER ONLY (a worker runs none):
+//	                        four components drained serially at drainGrace each,
+//	                        plus the post-SIGKILL reap.
+//	mesh teardown       5s  meshTeardownTimeout, cmd/k3sm/agent.go — both roles.
+//	headroom           10s  launchd's own signal/reap latency and the log flush.
+//
+// Every bound is a LITERAL here so the table above can be read in one place, and
+// each literal is bound back to its owner by a test rather than by trust:
+// TestExitTimeOutCoversTheSerialTeardown compares the control-plane stage with
+// executor.StopBound (the one owner this package can import), and
+// hack/acceptance/B253.sh's CI tier reads runtimed's two constants out of its
+// module and compares them with the close stage. The remaining stage
+// (runtimedSocketShutdownGrace, package main in cmd/k3sm) has no importable owner
+// and no gate — it is 5s of a 90s budget, and the headroom absorbs it.
+//
+// The sums are rounded UP to the next multiple of ten, because an ExitTimeOut is
+// read by operators in a plist and 90 is legible where 87 invites the question of
+// what the 7 was for. Rounding up can only add headroom.
+const (
+	teardownRuntimedClose = 37
+	teardownControlSocket = 5
+	teardownControlPlane  = 30
+	teardownMesh          = 5
+	teardownHeadroom      = 10
+
+	serverTeardownBudget = teardownRuntimedClose + teardownControlSocket + teardownControlPlane + teardownMesh + teardownHeadroom
+	agentTeardownBudget  = teardownRuntimedClose + teardownControlSocket + teardownMesh + teardownHeadroom
+
+	// serverExitTimeOut is the io.k3sm.server plist's ExitTimeOut: every stage
+	// above, rounded up to the next multiple of ten.
+	serverExitTimeOut = ((serverTeardownBudget + 9) / 10) * 10
+	// agentExitTimeOut is the io.k3sm.agent plist's, on the same derivation minus
+	// the control-plane stop a worker never runs.
+	agentExitTimeOut = ((agentTeardownBudget + 9) / 10) * 10
+)
 
 // agentThrottleInterval is launchd's minimum seconds between spawns of the
 // agent job. The agent's terminal start failures — no credential and no token,
@@ -1801,12 +1852,13 @@ const agentThrottleInterval = 10
 // start, and is theirs to delete once the node has joined. A node that has
 // already joined needs neither: it starts from its stored credential.
 //
-// ExitTimeOut is the server's 45 seconds and for the same class of reason —
-// launchd's 20s default is a SIGKILL deadline, and the agent's teardown is not
-// instantaneous: it drains the Service proxy's listeners and then runs the same
-// deferred mesh teardown the server does, bounded by meshTeardownTimeout, and a
-// SIGKILL part-way through leaves a utun and its routes behind on a node that
-// looks stopped.
+// ExitTimeOut is derived the same way the server's is (see serverExitTimeOut),
+// from the stages an AGENT runs: it stops its embedded runtime's vm guests, tears
+// down the runtimed control socket, drains the Service proxy's listeners and runs
+// the same deferred mesh teardown the server does — everything except the
+// control-plane stop, which a worker has no control plane to run. A SIGKILL
+// part-way through leaves vm helpers, or a utun and its routes, behind on a node
+// that looks stopped.
 func AgentPlist(cfg Config) []byte {
 	cfg = cfg.withDefaults()
 	args := []string{
@@ -1833,7 +1885,7 @@ func AgentPlist(cfg Config) []byte {
 		StdoutPath:       AgentLogPath(),
 		StderrPath:       AgentLogPath(),
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
-		ExitTimeOut:      45,
+		ExitTimeOut:      agentExitTimeOut,
 		// The same RLIMIT_NOFILE raise the control plane gets, for the same
 		// reason and with the same reload contract: a worker hosts the Service
 		// proxy and the UDP relay, whose flow budget darwin-net sizes as
