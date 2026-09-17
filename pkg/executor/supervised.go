@@ -1089,6 +1089,10 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	s.supervising = false
 	for _, c := range comps {
 		c.supervised = false
+		// spawnEnv builds a fresh component per child today, so this reset is
+		// unobservable; it keeps the once-only report contract true if a
+		// component object is ever reused across a restart.
+		c.reported = false
 	}
 	s.mu.Unlock()
 

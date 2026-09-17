@@ -18,6 +18,8 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -64,7 +66,12 @@ func writeChild(t *testing.T, wd, name, script string) {
 // The gate is a FIFO: the child's `read` blocks until a writer opens it, and
 // the release opens it for writing. Releasing is asynchronous so that a child
 // which never reached its read (a spawn that failed) cannot wedge the test in
-// an open() that blocks forever — the caller's own bound reports that instead.
+// an open() that blocks forever — but it is BOUNDED, not merely detached: a
+// blocking open on a readerless FIFO never returns, so the release opens
+// O_NONBLOCK (ENXIO = no reader yet) and retries to a deadline, then records the
+// failure. Cleanup joins the goroutine and surfaces it, so no open outlives the
+// test and a child that never reached its read is a named failure rather than a
+// bound waited out somewhere else.
 func writeHeldChild(t *testing.T, wd, name, body string) (release func()) {
 	t.Helper()
 	fifo := filepath.Join(wd, name+".gate")
@@ -72,14 +79,40 @@ func writeHeldChild(t *testing.T, wd, name, body string) (release func()) {
 		t.Fatal(err)
 	}
 	writeChild(t, wd, name, "#!/bin/sh\nread _ < \""+fifo+"\"\n"+body)
+
+	var wg sync.WaitGroup
+	failed := make(chan string, 1)
+	t.Cleanup(func() {
+		wg.Wait() // bounded by the deadline below
+		select {
+		case msg := <-failed:
+			t.Errorf("%s", msg)
+		default:
+		}
+	})
 	return func() {
+		wg.Add(1)
 		go func() {
-			f, err := os.OpenFile(fifo, os.O_WRONLY, 0)
-			if err != nil {
-				return
+			defer wg.Done()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+				if err == nil {
+					_, _ = f.WriteString("go\n")
+					_ = f.Close()
+					return
+				}
+				if !errors.Is(err, syscall.ENXIO) {
+					failed <- fmt.Sprintf("release %s: open its gate FIFO: %v", name, err)
+					return
+				}
+				if time.Now().After(deadline) {
+					failed <- fmt.Sprintf("release %s: its gate FIFO had no reader within the deadline — "+
+						"the child never reached its read", name)
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
 			}
-			_, _ = f.WriteString("go\n")
-			_ = f.Close()
 		}()
 	}
 }
