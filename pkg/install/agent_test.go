@@ -406,6 +406,11 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		// every operator with a control plane installed re-renders byte-for-byte
 		// what they already have, so `k3sm install` on an existing server is still
 		// the no-op-shaped upgrade it was.
+		//
+		// It moved ONCE since, deliberately: the admin token left the argv for a
+		// staged file, so the golden now shows --token-file and the path (B249,
+		// gated by TestServerPlistCarriesNoToken). A render that moves for any
+		// other reason is still the regression this pins.
 		want, err := os.ReadFile(filepath.Join("testdata", "server.plist.golden"))
 		if err != nil {
 			t.Fatalf("read the server plist golden: %v", err)

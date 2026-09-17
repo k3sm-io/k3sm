@@ -101,6 +101,11 @@ type fakeSystem struct {
 	// SECOND Install over the same fake describes the real "already correct"
 	// reinstall rather than a fresh lay-down.
 	links map[string]string
+	// plistModes is the mode each LaunchDaemon plist was last written at, keyed
+	// by plist path. It is the fake's whole model of the file's permissions: the
+	// real chmod is the darwin implementation's, and a unit test must not need
+	// privilege to ask what mode root would have left behind.
+	plistModes map[string]fs.FileMode
 	// modes is what FileMode answers, keyed by path — the operator's join token
 	// file being the only thing the installer judges by mode. A path with no
 	// entry but present in files is 0600, so an unconfigured fake describes a
@@ -307,8 +312,17 @@ func (f *fakeSystem) RemoveSymlink(link, target string) (bool, error) {
 	return true, nil
 }
 
-func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
+// WriteLaunchDaemon records the write and REMEMBERS THE MODE, keyed by path, so
+// a test can assert the posture a plist was laid down at. The mode rides a map
+// rather than the call string because the call log is asserted verbatim
+// elsewhere, and because a reinstall must be able to show the mode it ENDED at:
+// the second write overwrites the first entry exactly as the real chmod does.
+func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode) error {
 	f.calls = append(f.calls, "WriteLaunchDaemon:"+plistPath)
+	if f.plistModes == nil {
+		f.plistModes = map[string]fs.FileMode{}
+	}
+	f.plistModes[plistPath] = mode
 	f.putFile(plistPath, contents)
 	return nil
 }
@@ -679,6 +693,11 @@ func TestInstallOrchestration(t *testing.T) {
 		// Same reason, one level down: runtimed binds each vm pod's guest-agent
 		// socket under here as _k3sm. Missing it makes every vm pod fail to boot.
 		"EnsureVMRunDir:/var/lib/k3sm/run/vm",
+		// The control plane's static admin token, staged where the _k3sm daemon
+		// can read it and nothing else can. It needs the service uid, so it
+		// cannot precede EnsureServiceUser, and it precedes the plist that names
+		// it: the daemon must never be pointed at a file nobody has written.
+		"WriteServiceUserFile:/var/lib/k3sm/server/token:0600:0700:271",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		// The launcher link goes down immediately after the binary it points at,
 		// and long before any daemon work: copying into /Library/k3sm never put
@@ -900,6 +919,11 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The staged admin token, removed with the daemons rather than preserved
+		// with the rest of the data root: it is a system:masters credential with
+		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
+		// daemon that reads it has been booted out.
+		"RemoveAll:/var/lib/k3sm/server/token",
 		// The launcher link is judged BEFORE the sweep deletes its target: after
 		// the sweep it is a dangling link whose identity can no longer be read.
 		"RemoveSymlink:/usr/local/bin/k3sm",
@@ -1034,14 +1058,29 @@ func TestServerPlistRaisesFileLimit(t *testing.T) {
 	}
 }
 
-// TestPlistEscaping proves string values are XML-escaped (a token with an &
+// TestPlistEscaping proves string values are XML-escaped (a value with an &
 // cannot corrupt the plist).
+//
+// It pins the DATA ROOT rather than the admin token, because the token is no
+// longer rendered: the server plist carries the PATH of the staged token file,
+// which is derived from Config.DataRoot and is therefore the value on that argv
+// an operator can still choose the bytes of.
 func TestPlistEscaping(t *testing.T) {
-	x := string(ServerPlist(Config{AdminToken: "a&b<c", BinarySource: "/tmp/k3sm", TargetUser: "alice"}))
+	cfg := Config{DataRoot: "/var/lib/a&b<c", BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	x := string(ServerPlist(cfg))
 	if strings.Contains(x, "a&b<c") {
 		t.Error("plist string values must be XML-escaped")
 	}
 	mustContain(t, x, "a&amp;b&lt;c")
+	// And the round trip gives the path back unescaped, so the escaping is a
+	// transport detail and not a corrupted argument.
+	argv, err := parseProgramArguments(ServerPlist(cfg))
+	if err != nil {
+		t.Fatalf("parseProgramArguments: %v", err)
+	}
+	if got, want := flagValue(argv, "token-file"), cfg.withDefaults().serverTokenPath(); got != want {
+		t.Errorf("--token-file = %q, want %q", got, want)
+	}
 }
 
 // meshIPOccurrences returns how many times --mesh-ip (either spelling) appears
@@ -1337,6 +1376,16 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// down. The bidirectional property is unchanged: a RemoveAll of a path
 		// NOTHING in installCalls produced is still a failure.
 		for _, path := range recorded(installCalls, "EnsureContainerLogDir:") {
+			created[path] = true
+		}
+		// The staged credentials (the server's admin token, a worker's join
+		// token) come through the service-user write seam, whose record carries
+		// the modes after the path — so the path is the head of the record.
+		for _, call := range recorded(installCalls, "WriteServiceUserFile:") {
+			path, _, ok := strings.Cut(call, ":")
+			if !ok {
+				t.Fatalf("unparsable WriteServiceUserFile record: %s", call)
+			}
 			created[path] = true
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {

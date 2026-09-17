@@ -44,8 +44,18 @@ import (
 // package filters out of a carry-over, and which flags make pkg/dataroot reject
 // a server-arguments record outright. Two copies would let a flag be refused in
 // a file and silently accepted from a plist, or the reverse.
+//
+// --token-file is added on top of that list, the same way managedAgentFlags is
+// deliberately wider than dataroot.ManagedAgentFlags, and for the same reason.
+// dataroot's list is the REFUSAL set: a record naming --token is rejected
+// outright because a file putting a credential on a root daemon's argv is not a
+// stale record. This is the FILTER set: --token-file is a legitimate thing for
+// an installed plist to carry, since this renderer put it there, but it is
+// re-derived from the data root on every install, so carrying the installed
+// value over would render the flag twice.
 var managedServerFlags = func() map[string]bool {
-	m := make(map[string]bool, len(dataroot.ManagedServerFlags))
+	m := make(map[string]bool, len(dataroot.ManagedServerFlags)+1)
+	m["token-file"] = true
 	for _, name := range dataroot.ManagedServerFlags {
 		m[name] = true
 	}

@@ -194,9 +194,16 @@ func TestInstallPreservesServerArgsAcrossReinstall(t *testing.T) {
 	if got := preservedServerArgs(first); len(got) != 0 {
 		t.Errorf("a fresh install must render the bare template, got extra args %v", got)
 	}
-	firstToken := flagValue(first, "token")
+	// The token is read out of the STAGED FILE, not off the argv: the plist
+	// carries only the path to it. The two must agree, which is the render half
+	// of the same property TestServerPlistCarriesNoToken gates.
+	tokenPath := cfg.withDefaults().serverTokenPath()
+	if got := flagValue(first, "token-file"); got != tokenPath {
+		t.Fatalf("the rendered plist must carry --token-file %s, got %q", tokenPath, got)
+	}
+	firstToken := strings.TrimSpace(string(f.files[tokenPath]))
 	if firstToken == "" {
-		t.Fatal("the rendered plist must carry a --token")
+		t.Fatal("install must stage the admin token at the path the plist names")
 	}
 
 	// (2) The operator configures the node — the PlistBuddy repair that had to be
@@ -220,11 +227,18 @@ func TestInstallPreservesServerArgsAcrossReinstall(t *testing.T) {
 	if got := flagValue(second, "mesh-ip"); got != "100.64.0.1" {
 		t.Errorf("reinstalled plist --mesh-ip = %q, want 100.64.0.1", got)
 	}
-	// --token is install-managed: re-minted, never carried over, and in lockstep
-	// with the kubeconfig the same run writes.
-	newToken := flagValue(second, "token")
+	// The admin token is install-managed: re-minted, never carried over, and in
+	// lockstep with the kubeconfig the same run writes. It is re-minted in the
+	// STAGED FILE now; the argv only ever names the path, which does not change.
+	newToken := strings.TrimSpace(string(f.files[tokenPath]))
 	if newToken == "" || newToken == firstToken {
-		t.Errorf("--token must be re-minted on reinstall (was %q, now %q)", firstToken, newToken)
+		t.Errorf("the staged admin token must be re-minted on reinstall (was %q, now %q)", firstToken, newToken)
+	}
+	if got := flagValue(second, "token-file"); got != tokenPath {
+		t.Errorf("reinstalled plist --token-file = %q, want %s (rendered exactly once)", got, tokenPath)
+	}
+	if flagValue(second, "token") != "" {
+		t.Error("the reinstalled plist carries a --token value: the admin token must never be on the argv")
 	}
 	if strings.Contains(f.kubeContent, firstToken) || !strings.Contains(f.kubeContent, newToken) {
 		t.Error("the admin kubeconfig must carry the re-minted token, not the superseded one")
@@ -264,11 +278,12 @@ func TestInstallRefusesUnparsableServerPlist(t *testing.T) {
 func TestParseProgramArguments(t *testing.T) {
 	t.Run("round-trips the renderer's output, escaping included", func(t *testing.T) {
 		args := []string{"--mesh-ip", "100.64.0.1", "--label", "a&b<c"}
-		got, err := parseProgramArguments(ServerPlist(Config{AdminToken: "k3sm-tok", ExtraServerArgs: args}))
+		cfg := Config{AdminToken: "k3sm-tok", ExtraServerArgs: args}
+		got, err := parseProgramArguments(ServerPlist(cfg))
 		if err != nil {
 			t.Fatalf("parseProgramArguments: %v", err)
 		}
-		want := []string{"/Library/k3sm/k3sm", "server", "--runtime", "runtimed", "--token", "k3sm-tok"}
+		want := []string{"/Library/k3sm/k3sm", "server", "--runtime", "runtimed", "--token-file", cfg.withDefaults().serverTokenPath()}
 		want = append(want, args...)
 		if !slices.Equal(got, want) {
 			t.Errorf("round trip = %v, want %v", got, want)

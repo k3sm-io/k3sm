@@ -718,16 +718,40 @@ func (darwinSystem) FileMode(path string) (fs.FileMode, error) {
 	return fi.Mode().Perm(), nil
 }
 
-// WriteLaunchDaemon writes the plist root:wheel 0644.
-func (darwinSystem) WriteLaunchDaemon(plistPath string, contents []byte) error {
+// WriteLaunchDaemon writes the plist root:wheel at mode (PlistMode for every
+// daemon but the control plane, which is ServerPlistMode).
+//
+// The chmod is explicit rather than left to os.WriteFile because WriteFile
+// applies the mode only when it CREATES the file: a reinstall over an existing
+// 0644 plist would otherwise keep the old, wider mode, which is precisely the
+// file a tightening install exists to replace.
+func (darwinSystem) WriteLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode) error {
+	return writeLaunchDaemon(plistPath, contents, mode, 0, 0)
+}
+
+// writeLaunchDaemon is the method above with the owner taken explicitly.
+//
+// The split is writeServiceUserFile's, for the same reason: chowning a file to
+// root needs privilege these tests never take, and what has to be exercised
+// against a real filesystem is the MODE and its repair on a rewrite, not
+// whether this process may give a file away.
+//
+// The chmod is explicit rather than left to os.WriteFile because WriteFile
+// applies the mode only when it CREATES the file. Without it, a reinstall over
+// the 0644 plist an earlier build laid down would keep that wider mode — which
+// is precisely the file the tightening exists to replace.
+func writeLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode, uid, gid int) error {
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		return fmt.Errorf("create launchd dir: %w", err)
 	}
-	if err := os.WriteFile(plistPath, contents, 0o644); err != nil {
+	if err := os.WriteFile(plistPath, contents, mode); err != nil {
 		return fmt.Errorf("write %s: %w", plistPath, err)
 	}
-	if err := os.Chown(plistPath, 0, 0); err != nil {
-		return fmt.Errorf("chown %s root:wheel: %w", plistPath, err)
+	if err := os.Chmod(plistPath, mode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", plistPath, mode, err)
+	}
+	if err := os.Chown(plistPath, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", plistPath, uid, gid, err)
 	}
 	return nil
 }
