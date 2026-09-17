@@ -18,180 +18,81 @@ package main
 
 import (
 	"bytes"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"time"
 
-	"k8s.io/client-go/tools/clientcmd"
-
-	netv1 "k3sm.io/apis/net/v1"
-
 	"k3sm.io/k3sm/pkg/bootstrap"
-	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
-// The node credential store: everything a joined worker must keep so a RESTART is
-// not a rejoin.
+// The node credential store, WRITE half: the agent is the only process with a
+// join outcome to persist, so Save lives here beside the join that produces it.
 //
-// A join is a credential-issuing event — it costs a join token, which is
-// TTL-bounded (bootstrap.DefaultTokenTTL), and it re-mints this node's certs. Yet
-// `k3sm agent` used to re-run the whole join on every start and persist only the
-// kubeconfig, so a restart after the token expired failed with "join rejected
-// (401)" and a KeepAlive daemon respawned it into a loop. The kubelet's own answer
-// is the one taken here: persist the credential, and on restart present it.
-//
-// What is persisted is the WHOLE join outcome, in five files under the agent work
-// dir, because the two halves are useless apart:
-//
-//   - node.kubeconfig        the cluster CA + this node's system:node client keypair
-//   - kubelet-serving.crt    the cluster-CA-issued :10250 serving cert
-//   - kubelet-serving.key    its private key (generated here, never on the wire)
-//   - kubelet-client-ca.crt  the client-identity CA this node's :10250 verifies the apiserver against
-//   - node-assignment.json   the mesh/apiserver assignment: pod /24, mesh-egress /32, peer snapshot, apiserver endpoints
-//
-// The assignment file is the non-obvious one. The three certificate artifacts
-// reconstruct this node's IDENTITY, but a worker also needs the values the server
-// ASSIGNED it — the pod /24 the mesh device is built from and the mesh-egress /32
-// the Service proxy sources — and those arrive only in a join response. They
-// cannot be re-read from the apiserver at start either: a joined worker's
-// kubeconfig points at the server's MESH address, which is reachable only once the
-// mesh this data is needed to build is already up. So they are persisted with the
-// certs, and the MeshPeer watch reconverges the peer list after bring-up.
+// Everything about READING the store — the five file names, the validation, the
+// expiry rule and the Status verdict — is pkg/nodecred, because `k3sm status`
+// and `k3sm doctor` must reach exactly the same verdict about the same
+// directory as this daemon does. A report that called a credential valid while
+// the daemon refused to start with it would send an operator to the wrong Mac.
 //
 // File ownership is implicit and deliberate: these are written by the agent
 // process, so they are owned by the uid it runs as, and the secret halves are
 // 0600. Nothing here chowns, and no path outside the agent's own work dir is
 // touched.
-const (
-	nodeKubeconfigFile     = "node.kubeconfig"
-	kubeletServingCertFile = "kubelet-serving.crt"
-	kubeletServingKeyFile  = "kubelet-serving.key"
-	kubeletClientCAFile    = "kubelet-client-ca.crt"
-	nodeAssignmentFile     = "node-assignment.json"
+
+// The store's types, as this package has always spelled them. They are aliases
+// and re-exports of pkg/nodecred, so the start decision below reads unchanged
+// while there is only one implementation of the verdict.
+type (
+	credentialStatus = nodecred.State
+	nodeCredential   = nodecred.Credential
 )
 
-// credentialExpiryMargin is how far ahead of a node client cert's NotAfter the
-// stored credential is already treated as expired.
-//
-// It is not a renewal window — nothing renews in process yet (see the rotation
-// caveat in certificateUsage). It is the margin that decides WHICH failure an
-// operator gets: a restart inside the margin still has a working token path
-// available and reports "supply a token", whereas a restart past NotAfter with no
-// token has already lost the node. A day is the smallest margin that survives a
-// Mac being asleep over a weekend evening and still being restarted on Monday
-// with the same answer.
-const credentialExpiryMargin = 24 * time.Hour
-
-// credentialStatus is what the store holds, as the start decision sees it.
-type credentialStatus int
-
 const (
-	// credentialAbsent: at least one of the five artifacts is missing — this node
-	// has never completed a join, or its state was wiped.
-	credentialAbsent credentialStatus = iota
-	// credentialCorrupt: every artifact is present but one of them does not parse,
-	// or the client key does not match the client cert. Always accompanied by an
-	// error naming the file.
-	credentialCorrupt
-	// credentialExpired: the credential is intact but no longer usable — the node
-	// client cert is within credentialExpiryMargin of NotAfter, or the kubelet
-	// serving cert is already past it.
-	credentialExpired
-	// credentialValid: present, parseable, matched, and in date.
-	credentialValid
+	credentialAbsent  = nodecred.Absent
+	credentialCorrupt = nodecred.Corrupt
+	credentialExpired = nodecred.Expired
+	credentialValid   = nodecred.Valid
+
+	// credentialExpiryMargin is how far ahead of a node client cert's NotAfter
+	// the stored credential is already treated as expired. See
+	// nodecred.ExpiryMargin for why a day.
+	credentialExpiryMargin = nodecred.ExpiryMargin
+
+	nodeKubeconfigFile     = nodecred.KubeconfigFile
+	kubeletServingCertFile = nodecred.ServingCertFile
+	kubeletServingKeyFile  = nodecred.ServingKeyFile
+	kubeletClientCAFile    = nodecred.ClientCAFile
+	nodeAssignmentFile     = nodecred.NodeAssignmentFile
 )
-
-// String renders the status for logs.
-func (s credentialStatus) String() string {
-	switch s {
-	case credentialAbsent:
-		return "absent"
-	case credentialCorrupt:
-		return "corrupt"
-	case credentialExpired:
-		return "expired"
-	case credentialValid:
-		return "valid"
-	}
-	return fmt.Sprintf("credentialStatus(%d)", int(s))
-}
-
-// nodeAssignment is the non-credential half of a join outcome — the values the
-// SERVER decided and this node cannot re-derive locally. Its JSON is the on-disk
-// shape of nodeAssignmentFile.
-type nodeAssignment struct {
-	// PodCIDR is the /24 assigned to this node: the mesh device's own prefix and
-	// the pod IPAM range, which are one value by design.
-	PodCIDR string `json:"podCIDR"`
-	// MeshIP is this node's mesh-egress /32 — the source address its Service proxy
-	// re-originates cross-node dials from.
-	MeshIP string `json:"meshIP"`
-	// APIServers are the advertised apiserver endpoints (host:port) the node's
-	// kubeconfig targets; empty against a single-node server.
-	APIServers []string `json:"apiServers,omitempty"`
-	// Peers is the peer snapshot as of the last join. It is the SEED only: the
-	// MeshPeer watch replaces it with live state moments after bring-up, so a
-	// stale entry here costs one reconcile, not correctness.
-	Peers []netv1.MeshPeerSpec `json:"peers,omitempty"`
-}
-
-// nodeCredential is a loaded, parsed, self-consistent stored join outcome.
-type nodeCredential struct {
-	apiserverURL   string
-	clusterCAPEM   []byte
-	clusterCAPin   string // certs.CertPin over clusterCAPEM — the pin a token is compared against
-	clientCertPEM  []byte
-	clientKeyPEM   []byte
-	servingCertPEM []byte
-	servingKeyPEM  []byte
-	clientCAPEM    []byte
-	assignment     nodeAssignment
-
-	clientNotAfter  time.Time
-	servingNotAfter time.Time
-}
 
 // nodeCredentialStore is the agent work dir viewed as the home of one node's
-// persisted join outcome. It owns path derivation, the save, the load, and the
-// Status verdict — so no caller open-codes a file name or an expiry rule.
+// persisted join outcome. It is the WRITER; every read goes through the
+// pkg/nodecred store it wraps.
 type nodeCredentialStore struct {
 	dir string
 }
 
-func (s nodeCredentialStore) kubeconfigPath() string {
-	return filepath.Join(s.dir, nodeKubeconfigFile)
-}
-func (s nodeCredentialStore) servingCertPath() string {
-	return filepath.Join(s.dir, kubeletServingCertFile)
-}
-func (s nodeCredentialStore) servingKeyPath() string {
-	return filepath.Join(s.dir, kubeletServingKeyFile)
-}
-func (s nodeCredentialStore) clientCAPath() string {
-	return filepath.Join(s.dir, kubeletClientCAFile)
-}
-func (s nodeCredentialStore) assignmentPath() string {
-	return filepath.Join(s.dir, nodeAssignmentFile)
+// reader is the read half of this same directory.
+func (s nodeCredentialStore) reader() nodecred.Store { return nodecred.Store{Dir: s.dir} }
+
+// Status reports whether this store holds a usable node credential. It is
+// pkg/nodecred's verdict verbatim — the same one `k3sm status` reports.
+func (s nodeCredentialStore) Status(now time.Time) (credentialStatus, *nodeCredential, error) {
+	return s.reader().Status(now)
 }
 
-// paths lists every artifact a complete credential consists of, in the order a
-// missing one is reported.
-func (s nodeCredentialStore) paths() []string {
-	return []string{
-		s.kubeconfigPath(),
-		s.servingCertPath(),
-		s.servingKeyPath(),
-		s.clientCAPath(),
-		s.assignmentPath(),
-	}
-}
+func (s nodeCredentialStore) kubeconfigPath() string  { return s.reader().KubeconfigPath() }
+func (s nodeCredentialStore) servingCertPath() string { return s.reader().ServingCertPath() }
+func (s nodeCredentialStore) servingKeyPath() string  { return s.reader().ServingKeyPath() }
+func (s nodeCredentialStore) clientCAPath() string    { return s.reader().ClientCAPath() }
+func (s nodeCredentialStore) assignmentPath() string  { return s.reader().AssignmentPath() }
+
+// paths lists every artifact a complete credential consists of.
+func (s nodeCredentialStore) paths() []string { return s.reader().Paths() }
 
 // Save persists a join outcome: the kubeconfig that authenticates as the issued
 // system:node identity, the kubelet serving pair, the client-identity CA, and the
@@ -232,7 +133,7 @@ func (s nodeCredentialStore) Save(apiserverURL, nodeName string, res *bootstrap.
 	if err := writeStoreFile(s.clientCAPath(), res.ClientCAPEM, 0o644); err != nil {
 		return fmt.Errorf("persist kubelet client CA: %w", err)
 	}
-	blob, err := json.MarshalIndent(nodeAssignment{
+	blob, err := json.MarshalIndent(nodecred.Assignment{
 		PodCIDR:    res.PodCIDR,
 		MeshIP:     res.MeshIP,
 		APIServers: res.APIServers,
@@ -317,191 +218,26 @@ func cleanUpTmp(f *os.File, tmp string, err error) error {
 	return err
 }
 
-// Status reports whether this store holds a usable node credential, returning the
-// loaded credential whenever one could be parsed.
-//
-// A corrupt credential is a hard ERROR, never a silent re-join: the same posture
-// loadOrCreateMeshKey takes for the mesh key. Overwriting unreadable state would
-// destroy the evidence of whatever damaged it, and would turn a fault into a
-// silent re-issue of this node's identity.
-//
-// now is a parameter so the expiry rule is testable without waiting a year.
-func (s nodeCredentialStore) Status(now time.Time) (credentialStatus, *nodeCredential, error) {
-	for _, p := range s.paths() {
-		if _, err := os.Stat(p); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return credentialAbsent, nil, nil
-			}
-			return credentialCorrupt, nil, corruptCredential(p, err)
-		}
-	}
-	cred, err := s.load()
-	if err != nil {
-		return credentialCorrupt, nil, err
-	}
-	switch {
-	case !cred.servingNotAfter.After(now):
-		return credentialExpired, cred, nil
-	case !cred.clientNotAfter.After(now.Add(credentialExpiryMargin)):
-		return credentialExpired, cred, nil
-	}
-	return credentialValid, cred, nil
-}
-
-// load reads and validates every artifact. Every failure names the file that
-// caused it, because the remedy is per-file.
-func (s nodeCredentialStore) load() (*nodeCredential, error) {
-	kubeconfigPath := s.kubeconfigPath()
-	server, caPEM, clientCertPEM, clientKeyPEM, err := loadNodeKubeconfig(kubeconfigPath)
-	if err != nil {
-		return nil, corruptCredential(kubeconfigPath, err)
-	}
-	pin, err := certs.CertPin(caPEM)
-	if err != nil {
-		return nil, corruptCredential(kubeconfigPath, fmt.Errorf("cluster CA: %w", err))
-	}
-	// X509KeyPair is the check that matters: it parses both halves AND proves the
-	// private key belongs to the certificate. A mismatched pair authenticates as
-	// nothing, and would otherwise surface as an opaque TLS handshake failure
-	// against the apiserver long after start.
-	clientNotAfter, err := keyPairNotAfter(clientCertPEM, clientKeyPEM)
-	if err != nil {
-		return nil, corruptCredential(kubeconfigPath, fmt.Errorf("node client keypair: %w", err))
-	}
-
-	servingCertPEM, err := os.ReadFile(s.servingCertPath())
-	if err != nil {
-		return nil, corruptCredential(s.servingCertPath(), err)
-	}
-	servingKeyPEM, err := os.ReadFile(s.servingKeyPath())
-	if err != nil {
-		return nil, corruptCredential(s.servingKeyPath(), err)
-	}
-	servingNotAfter, err := keyPairNotAfter(servingCertPEM, servingKeyPEM)
-	if err != nil {
-		return nil, corruptCredential(s.servingCertPath(), fmt.Errorf("kubelet serving keypair: %w", err))
-	}
-
-	clientCAPEM, err := os.ReadFile(s.clientCAPath())
-	if err != nil {
-		return nil, corruptCredential(s.clientCAPath(), err)
-	}
-	if _, err := decodeCertPEM(clientCAPEM); err != nil {
-		return nil, corruptCredential(s.clientCAPath(), err)
-	}
-
-	blob, err := os.ReadFile(s.assignmentPath())
-	if err != nil {
-		return nil, corruptCredential(s.assignmentPath(), err)
-	}
-	var assignment nodeAssignment
-	if err := json.Unmarshal(blob, &assignment); err != nil {
-		return nil, corruptCredential(s.assignmentPath(), err)
-	}
-	if assignment.PodCIDR == "" {
-		return nil, corruptCredential(s.assignmentPath(), errors.New("no assigned podCIDR: the mesh device and the pod IPAM are both built from it"))
-	}
-
-	return &nodeCredential{
-		apiserverURL:    server,
-		clusterCAPEM:    caPEM,
-		clusterCAPin:    pin,
-		clientCertPEM:   clientCertPEM,
-		clientKeyPEM:    clientKeyPEM,
-		servingCertPEM:  servingCertPEM,
-		servingKeyPEM:   servingKeyPEM,
-		clientCAPEM:     clientCAPEM,
-		assignment:      assignment,
-		clientNotAfter:  clientNotAfter,
-		servingNotAfter: servingNotAfter,
-	}, nil
-}
-
-// joinResult rebuilds the join outcome downstream wiring consumes (the node
+// joinResultFrom rebuilds the join outcome downstream wiring consumes (the node
 // options, the mesh bring-up, the datapath config) from stored state plus the
 // node's persisted wireguard identity — so a reuse start and a fresh join feed
 // exactly the same structure into exactly the same code.
-func (c *nodeCredential) joinResult(nodeName, wgPrivB64, wgPubB64 string) *bootstrap.JoinResult {
+func joinResultFrom(c *nodeCredential, nodeName, wgPrivB64, wgPubB64 string) *bootstrap.JoinResult {
 	return &bootstrap.JoinResult{
 		NodeName:              nodeName,
-		ClusterCAPEM:          c.clusterCAPEM,
-		ClientCAPEM:           c.clientCAPEM,
-		NodeClientCertPEM:     c.clientCertPEM,
-		NodeClientKeyPEM:      c.clientKeyPEM,
-		KubeletServingCertPEM: c.servingCertPEM,
-		KubeletServingKeyPEM:  c.servingKeyPEM,
-		PodCIDR:               c.assignment.PodCIDR,
-		MeshIP:                c.assignment.MeshIP,
-		Peers:                 c.assignment.Peers,
+		ClusterCAPEM:          c.ClusterCAPEM,
+		ClientCAPEM:           c.ClientCAPEM,
+		NodeClientCertPEM:     c.ClientCertPEM,
+		NodeClientKeyPEM:      c.ClientKeyPEM,
+		KubeletServingCertPEM: c.ServingCertPEM,
+		KubeletServingKeyPEM:  c.ServingKeyPEM,
+		PodCIDR:               c.Assignment.PodCIDR,
+		MeshIP:                c.Assignment.MeshIP,
+		Peers:                 c.Assignment.Peers,
 		WGPrivateKeyB64:       wgPrivB64,
 		WGPublicKeyB64:        wgPubB64,
-		APIServers:            c.assignment.APIServers,
+		APIServers:            c.Assignment.APIServers,
 	}
-}
-
-// corruptCredential wraps a per-file fault with the remedy. The remedy is
-// deliberately manual: an agent that deleted the file itself would re-issue this
-// node's identity on the strength of a parse error.
-func corruptCredential(path string, err error) error {
-	return fmt.Errorf("stored node credential %s is unusable: %w; remove it to force a fresh token join", path, err)
-}
-
-// keyPairNotAfter proves certPEM and keyPEM are a matching pair and returns the
-// leaf's NotAfter.
-func keyPairNotAfter(certPEM, keyPEM []byte) (time.Time, error) {
-	pair, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return time.Time{}, err
-	}
-	if len(pair.Certificate) == 0 {
-		return time.Time{}, errors.New("keypair carries no certificate")
-	}
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	if err != nil {
-		return time.Time{}, err
-	}
-	return leaf.NotAfter, nil
-}
-
-// decodeCertPEM decodes a single CERTIFICATE PEM block.
-func decodeCertPEM(b []byte) (*x509.Certificate, error) {
-	block, _ := pem.Decode(b)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, errors.New("no CERTIFICATE PEM block")
-	}
-	return x509.ParseCertificate(block.Bytes)
-}
-
-// loadNodeKubeconfig reads back what writeNodeKubeconfig wrote: the apiserver URL,
-// the cluster CA, and this node's client keypair, resolved through the file's
-// current context so it stays the inverse of the writer rather than a second
-// assumption about names.
-func loadNodeKubeconfig(path string) (server string, caPEM, certPEM, keyPEM []byte, err error) {
-	cfg, err := clientcmd.LoadFromFile(path)
-	if err != nil {
-		return "", nil, nil, nil, err
-	}
-	ctx, ok := cfg.Contexts[cfg.CurrentContext]
-	if !ok || ctx == nil {
-		return "", nil, nil, nil, fmt.Errorf("no context %q", cfg.CurrentContext)
-	}
-	cluster, ok := cfg.Clusters[ctx.Cluster]
-	if !ok || cluster == nil {
-		return "", nil, nil, nil, fmt.Errorf("no cluster %q", ctx.Cluster)
-	}
-	user, ok := cfg.AuthInfos[ctx.AuthInfo]
-	if !ok || user == nil {
-		return "", nil, nil, nil, fmt.Errorf("no user %q", ctx.AuthInfo)
-	}
-	switch {
-	case cluster.Server == "":
-		return "", nil, nil, nil, errors.New("the cluster entry names no apiserver")
-	case len(cluster.CertificateAuthorityData) == 0:
-		return "", nil, nil, nil, errors.New("the cluster entry carries no certificate-authority-data")
-	case len(user.ClientCertificateData) == 0 || len(user.ClientKeyData) == 0:
-		return "", nil, nil, nil, errors.New("the user entry carries no client keypair")
-	}
-	return cluster.Server, cluster.CertificateAuthorityData, user.ClientCertificateData, user.ClientKeyData, nil
 }
 
 // startMode is how `k3sm agent` obtains the identity it runs as.

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package install
+package dataroot
 
 import "testing"
 
@@ -22,7 +22,8 @@ import "testing"
 // are not "one plist, one role": both plists (the hand-made cross-role Mac) and
 // neither (no install). It is a pure table because every caller — the installer
 // and `k3sm status` alike — must reach the same verdict from the same two
-// booleans.
+// booleans. Its readers are the installer (which acts on the role) and
+// `k3sm status` (which reports it), and they must never disagree.
 func TestRoleFromPlists(t *testing.T) {
 	t.Parallel()
 

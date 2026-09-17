@@ -19,7 +19,7 @@ package status
 import (
 	"time"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -94,17 +94,17 @@ type PeerStatus struct {
 type Report struct {
 	Verdict Verdict `json:"verdict"`
 	// Role is which node this Mac is installed as, decided from the two
-	// node-daemon plists on disk (install.RoleFromPlists). It picks the rows
+	// node-daemon plists on disk (dataroot.RoleFromPlists). It picks the rows
 	// the screens render and the daemon the verdict is about, so it is part of
 	// the machine interface rather than a decoration.
-	Role      install.Role `json:"role"`
-	Summary   string       `json:"summary"`
-	Rows      []Row        `json:"rows"`
-	Next      []string     `json:"next,omitempty"`
-	Peers     []PeerStatus `json:"peers,omitempty"`
-	Version   version.Info `json:"version"`
-	Host      string       `json:"host"`
-	Timestamp time.Time    `json:"timestamp"`
+	Role      dataroot.Role `json:"role"`
+	Summary   string        `json:"summary"`
+	Rows      []Row         `json:"rows"`
+	Next      []string      `json:"next,omitempty"`
+	Peers     []PeerStatus  `json:"peers,omitempty"`
+	Version   version.Info  `json:"version"`
+	Host      string        `json:"host"`
+	Timestamp time.Time     `json:"timestamp"`
 }
 
 // Row returns the named row and whether it was present.

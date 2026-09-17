@@ -309,34 +309,33 @@ func RunDir(dataRoot string) string {
 }
 
 // Role is which k3sm node this install lays down: the control plane, or a
-// worker that joins one. It is a closed pair because a Mac is one or the other:
-// the server IS a node (it runs its own Virtual Kubelet), so a machine carrying
-// both daemons would register twice and fight itself over the same data root,
-// the same run dir and the same netd helper.
+// worker that joins one.
 //
-// The empty Role is RoleServer, so every existing caller — and every Config a
-// test writes without thinking about roles — keeps describing the install k3sm
-// has always performed.
-type Role string
+// The type, its two values and the on-disk decision live in pkg/dataroot — the
+// leaf package that already owns the facts a Mac carries on disk — so a
+// reporting caller can reach the same verdict without importing the installer.
+// They are re-exported here because this package is where roles are ACTED on,
+// and every existing caller says install.RoleServer.
+type Role = dataroot.Role
 
 const (
 	// RoleServer lays down the control plane (io.k3sm.server). The default.
-	RoleServer Role = "server"
+	RoleServer = dataroot.RoleServer
 	// RoleAgent lays down a joining worker (io.k3sm.agent) instead.
-	RoleAgent Role = "agent"
+	RoleAgent = dataroot.RoleAgent
 )
 
-// other returns the role this one is not — the one whose daemon must not be on
-// disk when this one is installed.
-func (r Role) other() Role {
-	if r == RoleAgent {
-		return RoleServer
-	}
-	return RoleAgent
+// RoleFromPlists decides which role a Mac carries from the two node-daemon
+// plists on disk. See dataroot.RoleFromPlists for the decision and why the disk
+// — never a running pid — is what answers it.
+func RoleFromPlists(serverPresent, agentPresent bool) (Role, bool) {
+	return dataroot.RoleFromPlists(serverPresent, agentPresent)
 }
 
-// daemonLabel is the LaunchDaemon label a role's node daemon carries.
-func (r Role) daemonLabel() string {
+// daemonLabel is the LaunchDaemon label a role's node daemon carries. It is a
+// function rather than a method because Role is an alias for a type this
+// package does not define, and the LABELS are this package's own.
+func daemonLabel(r Role) string {
 	if r == RoleAgent {
 		return AgentLabel
 	}
@@ -1100,7 +1099,7 @@ func artifactManifest(cfg Config) []artifact {
 	// depend on the helper netd bootstraps first.
 	items = append(items, []artifact{
 		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
-		{kind: kindDaemon, disp: dispRemove, label: cfg.Role.daemonLabel(), path: cfg.plistPath(cfg.Role.daemonLabel()), assertExists: true},
+		{kind: kindDaemon, disp: dispRemove, label: daemonLabel(cfg.Role), path: cfg.plistPath(daemonLabel(cfg.Role)), assertExists: true},
 
 		// The admin kubeconfig in the human's home — preserved (it may hold other
 		// clusters; k3sm never owns the whole file).

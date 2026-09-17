@@ -33,7 +33,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // agentPaths is an agent-role install laid out exactly like a real one: the
@@ -64,25 +65,35 @@ func agentInstalledFS(p Paths) fakeFS {
 	}
 }
 
-// withCredential adds a node credential store to a fake filesystem: the three
-// artifacts the report reads, with a node client certificate that expires at
-// notAfter.
+// withCredential stages a COMPLETE node credential store in a fake filesystem:
+// all five artifacts the agent writes, with matching keypairs, so the report's
+// verdict is produced by the same validation the daemon runs — not by a fixture
+// that only looks complete.
 func withCredential(t *testing.T, fsys fakeFS, dir string, notAfter time.Time) fakeFS {
 	t.Helper()
-	kubeconfig := filepath.Join(dir, nodeKubeconfigName)
-	fsys.present[kubeconfig] = true
-	fsys.present[filepath.Join(dir, kubeletServingCertName)] = true
-	fsys.present[filepath.Join(dir, kubeletServingKeyName)] = true
-	fsys.contents[kubeconfig] = nodeKubeconfigBytes(t, notAfter)
+	certPEM, keyPEM := selfSigned(t, notAfter)
+	files := map[string][]byte{
+		nodecred.KubeconfigFile:     nodeKubeconfigBytes(t, certPEM, keyPEM),
+		nodecred.ServingCertFile:    certPEM,
+		nodecred.ServingKeyFile:     keyPEM,
+		nodecred.ClientCAFile:       certPEM,
+		nodecred.NodeAssignmentFile: []byte(`{"podCIDR":"100.64.2.0/24","meshIP":"100.64.2.1"}`),
+	}
+	for name, blob := range files {
+		path := filepath.Join(dir, name)
+		fsys.present[path] = true
+		fsys.contents[path] = blob
+	}
 	return fsys
 }
 
-// nodeKubeconfigBytes builds the file `k3sm agent` persists after a join: a
-// kubeconfig whose user entry carries this node's client certificate. The
-// certificate is minted here rather than loaded from testdata so its NotAfter
-// is the value under test — a fixture certificate would expire and turn this
-// gate into a time bomb.
-func nodeKubeconfigBytes(t *testing.T, notAfter time.Time) []byte {
+// selfSigned mints a certificate and its matching private key, expiring at
+// notAfter. It is minted per case rather than loaded from testdata because the
+// expiry is the value under test — a fixture certificate would expire and turn
+// this gate into a time bomb — and because the keypair must genuinely MATCH:
+// the store proves every pair with tls.X509KeyPair, and a fixture that faked
+// the key would be testing a validation the daemon does not run.
+func selfSigned(t *testing.T, notAfter time.Time) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -93,16 +104,28 @@ func nodeKubeconfigBytes(t *testing.T, notAfter time.Time) []byte {
 		Subject:      pkix.Name{CommonName: "system:node:k3sm-worker", Organization: []string{"system:nodes"}},
 		NotBefore:    notAfter.Add(-365 * 24 * time.Hour),
 		NotAfter:     notAfter,
+		IsCA:         true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatalf("create certificate: %v", err)
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	der8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der8})
+}
 
+// nodeKubeconfigBytes builds the file `k3sm agent` persists after a join: a
+// kubeconfig whose user entry carries this node's client keypair and whose
+// cluster entry carries the CA it was issued under.
+func nodeKubeconfigBytes(t *testing.T, certPEM, keyPEM []byte) []byte {
+	t.Helper()
 	cfg := clientcmdapi.NewConfig()
 	cfg.Clusters["k3sm"] = &clientcmdapi.Cluster{Server: "https://10.42.0.1:6443", CertificateAuthorityData: certPEM}
-	cfg.AuthInfos["node"] = &clientcmdapi.AuthInfo{ClientCertificateData: certPEM, ClientKeyData: []byte("key")}
+	cfg.AuthInfos["node"] = &clientcmdapi.AuthInfo{ClientCertificateData: certPEM, ClientKeyData: keyPEM}
 	cfg.Contexts["k3sm"] = &clientcmdapi.Context{Cluster: "k3sm", AuthInfo: "node"}
 	cfg.CurrentContext = "k3sm"
 	raw, err := clientcmd.Write(*cfg)
@@ -152,8 +175,8 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 		fsys := withCredential(t, agentInstalledFS(p), p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour))
 		rep := agentCollector(t, p, fsys).Collect(context.Background())
 
-		if rep.Role != install.RoleAgent {
-			t.Fatalf("role = %q, want %q", rep.Role, install.RoleAgent)
+		if rep.Role != dataroot.RoleAgent {
+			t.Fatalf("role = %q, want %q", rep.Role, dataroot.RoleAgent)
 		}
 		if rep.Verdict == VerdictNotInstalled {
 			t.Fatalf("verdict = not-installed on a Mac with the agent plist and the binary on disk\n%s", Render(rep, Style{}))
@@ -236,7 +259,7 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 				name: "corrupt — the kubeconfig is there and does not parse",
 				stage: func(t *testing.T, p Paths, fsys fakeFS) fakeFS {
 					fsys = withCredential(t, fsys, p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour))
-					fsys.contents[filepath.Join(p.AgentCredentialDir, nodeKubeconfigName)] = []byte("not a kubeconfig")
+					fsys.contents[filepath.Join(p.AgentCredentialDir, nodecred.KubeconfigFile)] = []byte("not a kubeconfig")
 					return fsys
 				},
 				wantState: StateCorrupt, wantSev: SeverityFail, wantCred: CredentialCorrupt,
@@ -246,7 +269,7 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 				name: "unknown — the store is not readable as this user, which is not a fault",
 				stage: func(t *testing.T, p Paths, fsys fakeFS) fakeFS {
 					fsys = withCredential(t, fsys, p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour))
-					fsys.denied = map[string]bool{filepath.Join(p.AgentCredentialDir, nodeKubeconfigName): true}
+					fsys.denied = map[string]bool{filepath.Join(p.AgentCredentialDir, nodecred.KubeconfigFile): true}
 					return fsys
 				},
 				wantState: StateRunning, wantSev: SeverityUnknown, wantCred: CredentialUnknown,
@@ -324,8 +347,8 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 		unaware.Paths = withoutAgent
 
 		rep := roleAware.Collect(context.Background())
-		if rep.Role != install.RoleServer {
-			t.Fatalf("role = %q, want %q", rep.Role, install.RoleServer)
+		if rep.Role != dataroot.RoleServer {
+			t.Fatalf("role = %q, want %q", rep.Role, dataroot.RoleServer)
 		}
 		if _, ok := rep.Row(RowAgent); ok {
 			t.Error("a control plane's report carries an agent row")
@@ -353,7 +376,7 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 		}}
 		rep := c.Collect(context.Background())
 
-		if rep.Role != install.RoleServer {
+		if rep.Role != dataroot.RoleServer {
 			t.Fatalf("role = %q, want the server to lead", rep.Role)
 		}
 		if _, ok := rep.Row(RowAgent); ok {

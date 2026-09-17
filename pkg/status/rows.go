@@ -36,7 +36,6 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
-	"k3sm.io/k3sm/pkg/install"
 )
 
 // logTailLines is how far back the server row reads for the line it quotes. A
@@ -64,7 +63,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
 	var node Row
 	var nodePID int
-	if role == install.RoleAgent {
+	if role == dataroot.RoleAgent {
 		node, nodePID = c.agentRow(now())
 	} else {
 		node, nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
@@ -145,7 +144,7 @@ func (c Collector) plistPath(label string) string {
 // was removed by hand. Keying it on the server plist alone is what made a
 // perfectly good worker report "not installed": an agent Mac has no
 // io.k3sm.server.plist and never will.
-func (c Collector) installRow(hasDataVolume bool, role install.Role, bothRoles bool) (Row, bool) {
+func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles bool) (Row, bool) {
 	row := Row{Name: RowInstall, Remedy: "sudo k3sm install"}
 	binary := c.exists(c.Paths.Binary)
 	netdPlist := c.exists(c.plistPath(c.Paths.NetdLabel))
@@ -221,7 +220,7 @@ func (c Collector) installRow(hasDataVolume bool, role install.Role, bothRoles b
 	// describes an install, and neither daemon is missing here.
 	if bothRoles {
 		row.Detail += fmt.Sprintf(" · both node daemons are on disk (%s as well); reporting the %s role",
-			c.Paths.AgentLabel, install.RoleServer)
+			c.Paths.AgentLabel, dataroot.RoleServer)
 	}
 	row.Wide = map[string]string{
 		"binary": c.Paths.Binary,

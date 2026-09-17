@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"testing"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/dataroot"
 )
 
 // row is a terse Row constructor for the verdict tables.
@@ -104,7 +104,7 @@ func TestAggregateVerdicts(t *testing.T) {
 		// role is the node this Mac is installed as. The zero value is the
 		// server, so every control-plane case below reads exactly as it did
 		// before roles existed.
-		role        install.Role
+		role        dataroot.Role
 		wantVerdict Verdict
 		wantSummary string
 		wantNext    []string
@@ -217,7 +217,7 @@ func TestAggregateVerdicts(t *testing.T) {
 			name:        "running — a joined worker with a valid credential",
 			rows:        healthyAgentRows(),
 			installed:   true,
-			role:        install.RoleAgent,
+			role:        dataroot.RoleAgent,
 			wantVerdict: VerdictRunning,
 			wantSummary: "this Mac is a joined worker: the agent daemon is running with a valid node credential",
 			wantNext:    []string{"k3sm kubectl get pods -A"},
@@ -227,7 +227,7 @@ func TestAggregateVerdicts(t *testing.T) {
 			rows: replace(healthyAgentRows(), agentRowFor(StateWaiting, SeverityWarn,
 				"pid 903 · waiting for a join: this Mac holds no node credential yet", "k3sm token create   # on the control-plane Mac")),
 			installed:   true,
-			role:        install.RoleAgent,
+			role:        dataroot.RoleAgent,
 			wantVerdict: VerdictDegraded,
 			wantSummary: "agent: pid 903 · waiting for a join: this Mac holds no node credential yet",
 			// The kubeconfig row's own remedy still rides along: its WARN is
@@ -240,7 +240,7 @@ func TestAggregateVerdicts(t *testing.T) {
 			rows: replace(healthyAgentRows(), agentRowFor(StateStopped, SeverityFail,
 				"loaded but not running (3 runs)", "sudo launchctl kickstart -k system/io.k3sm.agent")),
 			installed:   true,
-			role:        install.RoleAgent,
+			role:        dataroot.RoleAgent,
 			wantVerdict: VerdictStopped,
 			wantSummary: "io.k3sm.agent is stopped, so this Mac is not serving pods",
 			wantNext:    []string{"sudo launchctl kickstart -k system/io.k3sm.agent", "k3sm kubeconfig --write"},

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/status"
 )
 
@@ -141,16 +142,31 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 	})
 }
 
-// TestAgentCredentialPathsMatchTheStore binds the report's read of the node
-// credential to the store that WRITES it.
+// TestAgentCredentialPathsMatchTheStore binds `k3sm status`'s verdict about a
+// node credential to the AGENT's verdict about the same directory.
 //
-// The two are deliberately not one package — pkg/status is a reporting leaf and
-// the store lives beside the join that fills it — so the file names and the
-// expiry margin exist twice. This test is what makes that safe: if either copy
-// drifts, `k3sm status` is describing a credential the daemon does not use, and
-// the row would be green on a Mac that cannot start.
+// They are one implementation now (pkg/nodecred), which is exactly what makes
+// this test cheap to state and worth keeping: it walks every way a store can be
+// incomplete or damaged and asserts the two answers are equal every time. The
+// defect it forecloses is a report that says "valid" about a credential the
+// daemon refuses to start with — a green row on a Mac that is not in the
+// cluster, which sends an operator to the wrong machine.
 func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 	t.Parallel()
+
+	// agree asserts the report and the agent reach the same verdict about dir,
+	// and returns it.
+	agree := func(t *testing.T, store nodeCredentialStore, now time.Time, want status.CredentialState) {
+		t.Helper()
+		got, _ := status.NodeCredentialState(osStatusFS{}, store.dir, now)
+		if got != want {
+			t.Errorf("the report says %q, want %q", got, want)
+		}
+		own, _, err := store.Status(now)
+		if reported := reportWord(own); reported != got {
+			t.Errorf("the report says %q and the agent says %s (err %v) — they must not disagree", got, own, err)
+		}
+	}
 
 	t.Run("a store the agent just wrote reads as valid", func(t *testing.T) {
 		t.Parallel()
@@ -159,30 +175,91 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 
 		state, notAfter := status.NodeCredentialState(osStatusFS{}, store.dir, time.Now())
 		if state != status.CredentialValid {
-			t.Fatalf("NodeCredentialState = %q, want %q — the report is reading different files than the store writes",
-				state, status.CredentialValid)
+			t.Fatalf("NodeCredentialState = %q, want %q", state, status.CredentialValid)
 		}
 		if notAfter.IsZero() {
 			t.Error("no expiry read from the node client certificate")
 		}
-		// The agent's own verdict on the same directory, so the two answers are
-		// compared rather than merely both being plausible.
-		if own, _, err := store.Status(time.Now()); err != nil || own != credentialValid {
-			t.Fatalf("the store's own Status = %s (err %v), want valid", own, err)
-		}
+		agree(t, store, time.Now(), status.CredentialValid)
 	})
 
-	t.Run("removing any artifact the report reads makes it absent", func(t *testing.T) {
+	t.Run("removing ANY of the five artifacts makes it absent", func(t *testing.T) {
 		t.Parallel()
-		for _, name := range []string{nodeKubeconfigFile, kubeletServingCertFile, kubeletServingKeyFile} {
+		// Every file the store consists of, by construction rather than by
+		// sampling: a report that checked only three of them would call a
+		// credential valid while the agent found it incomplete.
+		for _, name := range []string{
+			nodeKubeconfigFile, kubeletServingCertFile, kubeletServingKeyFile,
+			kubeletClientCAFile, nodeAssignmentFile,
+		} {
 			res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 			store := savedStore(t, res)
 			if err := os.Remove(filepath.Join(store.dir, name)); err != nil {
 				t.Fatalf("remove %s: %v", name, err)
 			}
-			if state, _ := status.NodeCredentialState(osStatusFS{}, store.dir, time.Now()); state != status.CredentialAbsent {
-				t.Errorf("without %s the report says %q, want %q", name, state, status.CredentialAbsent)
-			}
+			t.Run("without "+name, func(t *testing.T) {
+				agree(t, store, time.Now(), status.CredentialAbsent)
+			})
+		}
+	})
+
+	t.Run("content that does not validate is corrupt, not valid", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name   string
+			damage func(*testing.T, nodeCredentialStore)
+		}{
+			{
+				// The file is there and is a certificate; it is simply not the
+				// key's certificate. Only tls.X509KeyPair catches this, and a
+				// report that merely stat'ed the pair would call it valid.
+				name: "a serving pair whose halves do not match",
+				damage: func(t *testing.T, store nodeCredentialStore) {
+					other, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+					write(t, filepath.Join(store.dir, kubeletServingCertFile), other.KubeletServingCertPEM)
+				},
+			},
+			{
+				name: "a truncated serving key",
+				damage: func(t *testing.T, store nodeCredentialStore) {
+					path := filepath.Join(store.dir, kubeletServingKeyFile)
+					blob, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatalf("read %s: %v", path, err)
+					}
+					write(t, path, blob[:len(blob)/2])
+				},
+			},
+			{
+				name: "a client CA that is not a certificate",
+				damage: func(t *testing.T, store nodeCredentialStore) {
+					write(t, filepath.Join(store.dir, kubeletClientCAFile), []byte("-----BEGIN CERTIFICATE-----\nnope\n"))
+				},
+			},
+			{
+				// The mesh device and the pod IPAM are both built from the
+				// assigned podCIDR, so an assignment without one is a
+				// credential the agent cannot start from.
+				name: "an assignment with no podCIDR",
+				damage: func(t *testing.T, store nodeCredentialStore) {
+					write(t, filepath.Join(store.dir, nodeAssignmentFile), []byte(`{"meshIP":"100.64.1.2"}`))
+				},
+			},
+			{
+				name: "a kubeconfig that does not parse",
+				damage: func(t *testing.T, store nodeCredentialStore) {
+					write(t, filepath.Join(store.dir, nodeKubeconfigFile), []byte("not a kubeconfig"))
+				},
+			},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+				store := savedStore(t, res)
+				c.damage(t, store)
+				agree(t, store, time.Now(), status.CredentialCorrupt)
+			})
 		}
 	})
 
@@ -194,15 +271,11 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 		}
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		store := savedStore(t, res)
-		// One hour inside the margin: both the report and the agent must call
-		// it expired at the same moment.
+		// One hour inside the margin: both must call it expired at the same
+		// moment, and one hour before that, neither may.
 		inside := time.Now().Add(nodeCredClientTTL - credentialExpiryMargin + time.Hour)
-		if state, _ := status.NodeCredentialState(osStatusFS{}, store.dir, inside); state != status.CredentialExpired {
-			t.Errorf("inside the margin the report says %q, want %q", state, status.CredentialExpired)
-		}
-		if own, _, err := store.Status(inside); err != nil || own != credentialExpired {
-			t.Errorf("inside the margin the agent says %s (err %v), want expired", own, err)
-		}
+		agree(t, store, inside, status.CredentialExpired)
+		agree(t, store, inside.Add(-2*time.Hour), status.CredentialValid)
 	})
 
 	t.Run("the reported directory is the one the installer verifies", func(t *testing.T) {
@@ -216,4 +289,27 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 			t.Fatalf("agent label/log = %q/%q, want %q/%q", paths.AgentLabel, paths.AgentLog, install.AgentLabel, install.AgentLogPath())
 		}
 	})
+}
+
+// reportWord is the agent's own credential state in the report's vocabulary, so
+// the two verdicts can be compared as values rather than as prose.
+func reportWord(s nodecred.State) status.CredentialState {
+	switch s {
+	case nodecred.Valid:
+		return status.CredentialValid
+	case nodecred.Absent:
+		return status.CredentialAbsent
+	case nodecred.Expired:
+		return status.CredentialExpired
+	default:
+		return status.CredentialCorrupt
+	}
+}
+
+// write replaces a file in a credential store, keeping its mode.
+func write(t *testing.T, path string, blob []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, blob, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }

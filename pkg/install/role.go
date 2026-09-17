@@ -48,8 +48,8 @@ import (
 // role change costs an operator one extra command and no state.
 func refuseCrossRole(sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
-	other := cfg.Role.other()
-	path := cfg.plistPath(other.daemonLabel())
+	other := cfg.Role.Other()
+	path := cfg.plistPath(daemonLabel(other))
 	switch _, err := sys.ReadFile(path); {
 	case err == nil:
 		return fmt.Errorf("install: this Mac is already installed as a k3sm %s (%s is on disk) and a node is one role or the other, never both: run `k3sm uninstall` first, then install the %s role (uninstall keeps the data root, the logs and the arguments you configured)",
@@ -79,8 +79,8 @@ func refuseCrossRole(sys System, cfg Config) error {
 func uninstallManifest(sys System, cfg Config) []artifact {
 	cfg = cfg.withDefaults()
 	m := artifactManifest(cfg)
-	other := cfg.Role.other()
-	path := cfg.plistPath(other.daemonLabel())
+	other := cfg.Role.Other()
+	path := cfg.plistPath(daemonLabel(other))
 	switch _, err := sys.ReadFile(path); {
 	case errors.Is(err, fs.ErrNotExist):
 		return m
@@ -125,40 +125,4 @@ func mergeManifests(primary, other []artifact) []artifact {
 		out = append(out, a)
 	}
 	return out
-}
-
-// RoleFromPlists decides which k3sm node a Mac IS from the two node-daemon
-// plists on disk, and whether it is installed at all. It is pure so the whole
-// decision — including the two postures that are not a plain "one plist, one
-// role" — is table-tested, and so every caller reaches the same verdict from
-// the same two booleans.
-//
-// The disk is the only honest source. A running pid is not: the server daemon
-// and the agent daemon are both `k3sm` processes under launchd, so a probe that
-// asked the process table which one this Mac is would report "neither" on a Mac
-// whose daemon is merely stopped, and would report a role from a crash-looping
-// job that launchd is about to give up on. The plist is what `k3sm install`
-// wrote and what `k3sm uninstall` removes, so it says what this Mac was set up
-// to be regardless of what it is doing right now.
-//
-// Two postures decide the shape:
-//
-//   - BOTH plists present → RoleServer, installed. It is a posture install
-//     refuses to create (refuseCrossRole), so it only arises from a hand-edited
-//     /Library/LaunchDaemons or an interrupted role change — and there the
-//     control plane is the role a report must lead with, because it is the one
-//     that owns the datastore. A caller that wants to SAY both are there still
-//     can: it holds both booleans.
-//   - NEITHER plist present → not installed, and the role returned is the zero
-//     Role (RoleServer), which is what every uninstalled path already assumes.
-//     The bool, not the role, is what a caller must branch on.
-func RoleFromPlists(serverPresent, agentPresent bool) (Role, bool) {
-	switch {
-	case serverPresent:
-		return RoleServer, true
-	case agentPresent:
-		return RoleAgent, true
-	default:
-		return RoleServer, false
-	}
 }

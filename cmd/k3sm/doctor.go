@@ -192,12 +192,20 @@ func checkBrew(env doctorEnv) checkResult {
 // pass); a present, readable db → PASS reporting the bundled kine pin, user_version,
 // and journal_mode. A non-WAL journal is a WARN; a read error is a WARN. Migration
 // and remediation logic stays in executor, not here.
+//
+// The absent arm says WHY it is absent, and that depends on the role: a worker
+// runs no control plane and therefore no kine at all, so telling its operator
+// "the control plane has not initialized the datastore" would describe a wait
+// that is never going to end.
 func checkDatastore(env doctorEnv) checkResult {
 	present, uv, jm, err := env.datastorePosture()
 	if err != nil {
 		return checkResult{"datastore", statusWarn, fmt.Sprintf("could not read datastore posture: %v", err)}
 	}
 	if !present {
+		if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+			return checkResult{"datastore", statusSkip, "no state.db, and none is expected: this Mac is installed as a k3sm worker, which runs no control plane and no kine datastore"}
+		}
 		return checkResult{"datastore", statusSkip, "no state.db yet (fresh node — the control plane has not initialized the kine SQLite datastore)"}
 	}
 	detail := fmt.Sprintf("kine %s, user_version=%d, journal_mode=%s", executor.DefaultKineVersion, uv, jm)

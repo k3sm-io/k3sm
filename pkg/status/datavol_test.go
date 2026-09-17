@@ -29,7 +29,6 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/datavol/datavoltest"
-	"k3sm.io/k3sm/pkg/install"
 )
 
 // recordJSON is a data-volume record declaring dir, as it would sit on disk.
@@ -276,7 +275,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			{Name: RowAPIServer, State: StateReady, Severity: SeverityOK},
 			{Name: RowNode, State: StateReady, Severity: SeverityOK, Detail: "1/1 nodes ready"},
 			row,
-		}, true, install.RoleServer)
+		}, true, dataroot.RoleServer)
 		if verdict != VerdictRunning {
 			t.Errorf("verdict = %v, want running: a pre-volume copy is housekeeping, not a fault", verdict)
 		}
@@ -478,7 +477,7 @@ func TestInstallRowCountsDatavolPlist(t *testing.T) {
 		fsys.present[datavolPlist] = true
 		c := Collector{FS: fsys, Paths: paths}
 
-		row, installed := c.installRow(true, install.RoleServer, false)
+		row, installed := c.installRow(true, dataroot.RoleServer, false)
 		if !installed || row.State != StateOK {
 			t.Fatalf("row = %s (installed=%t), want a complete install", row.State, installed)
 		}
@@ -489,7 +488,7 @@ func TestInstallRowCountsDatavolPlist(t *testing.T) {
 
 	t.Run("no data volume: two, exactly as before", func(t *testing.T) {
 		c := Collector{FS: installedFS(paths), Paths: paths}
-		row, installed := c.installRow(false, install.RoleServer, false)
+		row, installed := c.installRow(false, dataroot.RoleServer, false)
 		if !installed || row.State != StateOK {
 			t.Fatalf("row = %s (installed=%t), want a complete install", row.State, installed)
 		}
@@ -500,7 +499,7 @@ func TestInstallRowCountsDatavolPlist(t *testing.T) {
 
 	t.Run("a record with no plist reports the plist missing", func(t *testing.T) {
 		c := Collector{FS: installedFS(paths), Paths: paths}
-		row, _ := c.installRow(true, install.RoleServer, false)
+		row, _ := c.installRow(true, dataroot.RoleServer, false)
 		if row.State != StatePartial || row.Severity != SeverityWarn {
 			t.Fatalf("row = %s/%v, want partial/warn: the record says this Mac should have the mount daemon", row.State, row.Severity)
 		}
@@ -511,7 +510,7 @@ func TestInstallRowCountsDatavolPlist(t *testing.T) {
 
 	t.Run("no record and no plist is not missing anything", func(t *testing.T) {
 		c := Collector{FS: installedFS(paths), Paths: paths}
-		row, _ := c.installRow(false, install.RoleServer, false)
+		row, _ := c.installRow(false, dataroot.RoleServer, false)
 		if row.State != StateOK {
 			t.Errorf("row = %s, want ok: a Mac with no data volume is complete without the mount daemon", row.State)
 		}

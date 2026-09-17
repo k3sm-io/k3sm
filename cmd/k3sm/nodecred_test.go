@@ -137,24 +137,24 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			what      string
 			got, want []byte
 		}{
-			{"cluster CA", cred.clusterCAPEM, res.ClusterCAPEM},
-			{"node client cert", cred.clientCertPEM, res.NodeClientCertPEM},
-			{"node client key", cred.clientKeyPEM, res.NodeClientKeyPEM},
-			{"kubelet serving cert", cred.servingCertPEM, res.KubeletServingCertPEM},
-			{"kubelet serving key", cred.servingKeyPEM, res.KubeletServingKeyPEM},
-			{"kubelet client CA", cred.clientCAPEM, res.ClientCAPEM},
+			{"cluster CA", cred.ClusterCAPEM, res.ClusterCAPEM},
+			{"node client cert", cred.ClientCertPEM, res.NodeClientCertPEM},
+			{"node client key", cred.ClientKeyPEM, res.NodeClientKeyPEM},
+			{"kubelet serving cert", cred.ServingCertPEM, res.KubeletServingCertPEM},
+			{"kubelet serving key", cred.ServingKeyPEM, res.KubeletServingKeyPEM},
+			{"kubelet client CA", cred.ClientCAPEM, res.ClientCAPEM},
 		} {
 			if !bytes.Equal(c.got, c.want) {
 				t.Errorf("loaded %s does not match what was saved", c.what)
 			}
 		}
-		if cred.apiserverURL != nodeCredTestAPI {
-			t.Errorf("apiserverURL = %q, want %q", cred.apiserverURL, nodeCredTestAPI)
+		if cred.APIServerURL != nodeCredTestAPI {
+			t.Errorf("apiserverURL = %q, want %q", cred.APIServerURL, nodeCredTestAPI)
 		}
-		if cred.clusterCAPin != clusterCA.PinHash() {
-			t.Errorf("clusterCAPin = %q, want the cluster CA's pin %q", cred.clusterCAPin, clusterCA.PinHash())
+		if cred.ClusterCAPin != clusterCA.PinHash() {
+			t.Errorf("clusterCAPin = %q, want the cluster CA's pin %q", cred.ClusterCAPin, clusterCA.PinHash())
 		}
-		if cred.clusterCAPin == signingCA.PinHash() {
+		if cred.ClusterCAPin == signingCA.PinHash() {
 			t.Error("clusterCAPin equals the SIGNING CA's pin: a token is compared against the CLUSTER CA")
 		}
 
@@ -162,16 +162,16 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		// start (the worker's kubeconfig points at the server's mesh address,
 		// reachable only once the mesh these values build is up), so losing it
 		// would make the reuse path impossible however good the certs were.
-		if cred.assignment.PodCIDR != res.PodCIDR || cred.assignment.MeshIP != res.MeshIP {
+		if cred.Assignment.PodCIDR != res.PodCIDR || cred.Assignment.MeshIP != res.MeshIP {
 			t.Errorf("assignment = %s/%s, want %s/%s",
-				cred.assignment.PodCIDR, cred.assignment.MeshIP, res.PodCIDR, res.MeshIP)
+				cred.Assignment.PodCIDR, cred.Assignment.MeshIP, res.PodCIDR, res.MeshIP)
 		}
-		if len(cred.assignment.APIServers) != 1 || cred.assignment.APIServers[0] != res.APIServers[0] {
-			t.Errorf("assignment APIServers = %v, want %v", cred.assignment.APIServers, res.APIServers)
+		if len(cred.Assignment.APIServers) != 1 || cred.Assignment.APIServers[0] != res.APIServers[0] {
+			t.Errorf("assignment APIServers = %v, want %v", cred.Assignment.APIServers, res.APIServers)
 		}
-		if len(cred.assignment.Peers) != 1 || cred.assignment.Peers[0].NodeName != res.Peers[0].NodeName ||
-			cred.assignment.Peers[0].Endpoint != res.Peers[0].Endpoint {
-			t.Errorf("assignment Peers = %+v, want the join snapshot %+v", cred.assignment.Peers, res.Peers)
+		if len(cred.Assignment.Peers) != 1 || cred.Assignment.Peers[0].NodeName != res.Peers[0].NodeName ||
+			cred.Assignment.Peers[0].Endpoint != res.Peers[0].Endpoint {
+			t.Errorf("assignment Peers = %+v, want the join snapshot %+v", cred.Assignment.Peers, res.Peers)
 		}
 
 		// The secret halves are 0600; a CA certificate is public material at 0644.
@@ -204,7 +204,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		}
 
 		// What agentResumeFromCredential feeds downstream, minus the network leg.
-		resumed := cred.joinResult(nodeCredTestNode, "restart-time-private-key", "restart-time-public-key")
+		resumed := joinResultFrom(cred, nodeCredTestNode, "restart-time-private-key", "restart-time-public-key")
 
 		// The refusal runAgent applies to both paths must pass on a resumed
 		// credential: a restart that lost the serving pair would register Ready with
@@ -419,8 +419,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status: %v", err)
 		}
-		if cred.apiserverURL != "https://100.64.1.1:6666" {
-			t.Errorf("apiserverURL = %q, want the newly saved one", cred.apiserverURL)
+		if cred.APIServerURL != "https://100.64.1.1:6666" {
+			t.Errorf("apiserverURL = %q, want the newly saved one", cred.APIServerURL)
 		}
 	})
 
@@ -454,15 +454,15 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		}
 
 		// Every artifact is WHOLLY one generation or the other, never a prefix.
-		if !bytes.Equal(cred.clientCAPEM, first.ClientCAPEM) {
+		if !bytes.Equal(cred.ClientCAPEM, first.ClientCAPEM) {
 			t.Error("the artifact whose write failed is not the one that was there before it")
 		}
-		if !bytes.Equal(cred.servingCertPEM, second.KubeletServingCertPEM) ||
-			!bytes.Equal(cred.servingKeyPEM, second.KubeletServingKeyPEM) {
+		if !bytes.Equal(cred.ServingCertPEM, second.KubeletServingCertPEM) ||
+			!bytes.Equal(cred.ServingKeyPEM, second.KubeletServingKeyPEM) {
 			t.Error("an artifact written before the failure is neither the old nor the new one: a write was torn")
 		}
-		if cred.assignment.PodCIDR != first.PodCIDR {
-			t.Errorf("assignment podCIDR = %q; the write after the failure must not have run", cred.assignment.PodCIDR)
+		if cred.Assignment.PodCIDR != first.PodCIDR {
+			t.Errorf("assignment podCIDR = %q; the write after the failure must not have run", cred.Assignment.PodCIDR)
 		}
 
 		// And the retry converges: nothing about the interruption is sticky.
@@ -476,7 +476,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil || status != credentialValid {
 			t.Fatalf("Status after the retry = %s, err %v", status, err)
 		}
-		if !bytes.Equal(cred.clientCAPEM, second.ClientCAPEM) || !bytes.Equal(cred.clientCertPEM, second.NodeClientCertPEM) {
+		if !bytes.Equal(cred.ClientCAPEM, second.ClientCAPEM) || !bytes.Equal(cred.ClientCertPEM, second.NodeClientCertPEM) {
 			t.Error("the retried Save did not converge the store on the new credential")
 		}
 		for _, p := range store.paths() {
@@ -499,7 +499,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status with leftover staging files: %v", err)
 		}
-		if status != credentialValid || !bytes.Equal(cred.clientCertPEM, res.NodeClientCertPEM) {
+		if status != credentialValid || !bytes.Equal(cred.ClientCertPEM, res.NodeClientCertPEM) {
 			t.Errorf("Status = %s; a leftover staging file must never be read as part of the credential", status)
 		}
 	})
@@ -594,7 +594,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse a token for this cluster: %v", err)
 		}
-		mode, err := agentStartPlan(credentialValid, true, true, sameCluster.CAHash, cred.clusterCAPin)
+		mode, err := agentStartPlan(credentialValid, true, true, sameCluster.CAHash, cred.ClusterCAPin)
 		if err != nil || mode != startModeReuseCredential {
 			t.Errorf("a token for THIS cluster gave (%s, %v), want reuse", mode, err)
 		}
@@ -607,7 +607,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse a token for another cluster: %v", err)
 		}
-		mode, err = agentStartPlan(credentialValid, true, true, otherCluster.CAHash, cred.clusterCAPin)
+		mode, err = agentStartPlan(credentialValid, true, true, otherCluster.CAHash, cred.ClusterCAPin)
 		if err != nil || mode != startModeTokenJoin {
 			t.Errorf("a token for ANOTHER cluster gave (%s, %v), want a token join", mode, err)
 		}

@@ -22,7 +22,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/dataroot"
 )
 
 // Screen geometry. The name and state columns are fixed rather than computed so
@@ -78,15 +78,15 @@ var agentDaemonViewRows = []string{RowInstall, RowDatavol, RowNetd, RowAgent, Ro
 // describes. They are chosen by ROLE rather than by which rows happen to be in
 // the report, so a screen never renders a row the role does not have — the
 // server-role screens are byte-identical to what they have always been.
-func overviewRows(role install.Role) []string {
-	if role == install.RoleAgent {
+func overviewRows(role dataroot.Role) []string {
+	if role == dataroot.RoleAgent {
 		return agentOverviewRows
 	}
 	return serverOverviewRows
 }
 
-func daemonViewRows(role install.Role) []string {
-	if role == install.RoleAgent {
+func daemonViewRows(role dataroot.Role) []string {
+	if role == dataroot.RoleAgent {
 		return agentDaemonViewRows
 	}
 	return serverDaemonViewRows

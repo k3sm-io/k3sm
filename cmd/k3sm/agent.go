@@ -214,7 +214,7 @@ func runAgent(args []string) error {
 		}
 	}
 	if cred != nil {
-		storedCAHash = cred.clusterCAPin
+		storedCAHash = cred.ClusterCAPin
 	}
 	plan, err := agentStartPlan(status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
 	if err != nil {
@@ -436,17 +436,17 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 		return nil, "", err
 	}
 
-	client, err := bootstrap.NodeIdentityClient(cred.clusterCAPEM, cred.clientCertPEM, cred.clientKeyPEM)
+	client, err := bootstrap.NodeIdentityClient(cred.ClusterCAPEM, cred.ClientCertPEM, cred.ClientKeyPEM)
 	if err != nil {
 		return nil, "", err
 	}
 	logger.Info("resuming from the stored node credential", "node", opts.nodeName,
-		"meshEndpoint", meshEndpoint, "podCIDR", cred.assignment.PodCIDR,
-		"clientCertExpires", cred.clientNotAfter.UTC().Format(time.RFC3339))
+		"meshEndpoint", meshEndpoint, "podCIDR", cred.Assignment.PodCIDR,
+		"clientCertExpires", cred.ClientNotAfter.UTC().Format(time.RFC3339))
 	if err := bootstrap.RefreshMeshEndpoint(ctx, client, "https://"+joinHost, opts.nodeName, meshEndpoint); err != nil {
 		return nil, "", err
 	}
-	res := cred.joinResult(opts.nodeName, meshPriv, meshPub)
+	res := joinResultFrom(cred, opts.nodeName, meshPriv, meshPub)
 	logger.Info("resumed", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	return res, meshEndpoint, nil
 }

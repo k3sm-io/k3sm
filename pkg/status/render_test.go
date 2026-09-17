@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -42,12 +42,12 @@ const goldenHost = "26.1"
 // Aggregate — so a golden can never show a summary or a Next block the real
 // command would not produce.
 func report(rows []Row, installed bool) Report {
-	return roleReport(rows, installed, install.RoleServer)
+	return roleReport(rows, installed, dataroot.RoleServer)
 }
 
 // roleReport is report for a Mac whose installed role is not the default: the
 // same assembly, with the role the screens pick their rows from.
-func roleReport(rows []Row, installed bool, role install.Role) Report {
+func roleReport(rows []Row, installed bool, role dataroot.Role) Report {
 	v, summary, next := Aggregate(rows, installed, role)
 	return Report{
 		Verdict:   v,

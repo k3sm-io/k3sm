@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/dataroot"
 )
 
 // Row names. They are the tokens `-o json` consumers key on, so they are stable
@@ -85,18 +85,18 @@ var workerAdvisoryRows = map[string]bool{RowDatastore: true, RowKubeconfig: true
 
 // advisory reports whether a row's WARN is a note rather than a claim about
 // this node, for the role being reported.
-func advisory(role install.Role, name string) bool {
+func advisory(role dataroot.Role, name string) bool {
 	if advisoryRows[name] {
 		return true
 	}
-	return role == install.RoleAgent && workerAdvisoryRows[name]
+	return role == dataroot.RoleAgent && workerAdvisoryRows[name]
 }
 
 // nodeRowName is the row that carries this Mac's node daemon: the control plane
 // on a server, the joining worker on an agent. Every verdict that reads "the
 // daemon" reads this row.
-func nodeRowName(role install.Role) string {
-	if role == install.RoleAgent {
+func nodeRowName(role dataroot.Role) string {
+	if role == dataroot.RoleAgent {
 		return RowAgent
 	}
 	return RowServer
@@ -133,7 +133,7 @@ var downStates = map[RowState]bool{
 //     claim in the headline that nothing observed supports.
 //  4. Any Fail, then any Warn, is DEGRADED, naming the first one.
 //  5. Otherwise RUNNING.
-func Aggregate(rows []Row, installed bool, role install.Role) (Verdict, string, []string) {
+func Aggregate(rows []Row, installed bool, role dataroot.Role) (Verdict, string, []string) {
 	if !installed {
 		return VerdictNotInstalled, "k3sm is not installed on this Mac", nextSteps(rows, VerdictNotInstalled)
 	}
@@ -157,7 +157,7 @@ func Aggregate(rows []Row, installed bool, role install.Role) (Verdict, string, 
 // cause, or ok=false when this Mac's node daemon is not stopped. Which daemon that is
 // comes from the role: the control plane on a server, the joining worker on an
 // agent.
-func stoppedVerdict(rows []Row, role install.Role) (Verdict, string, bool) {
+func stoppedVerdict(rows []Row, role dataroot.Role) (Verdict, string, bool) {
 	node, haveNode := rowByName(rows, nodeRowName(role))
 	if !haveNode {
 		return 0, "", false
@@ -180,7 +180,7 @@ func stoppedVerdict(rows []Row, role install.Role) (Verdict, string, bool) {
 	// A WORKER's own daemon being down is the whole stop: there is no apiserver
 	// on this Mac to corroborate it with, and the agent's kubeconfig points at a
 	// server it can only reach once it is running.
-	if role == install.RoleAgent {
+	if role == dataroot.RoleAgent {
 		return VerdictStopped, fmt.Sprintf("%s is %s, so this Mac is not serving pods", name, node.State), true
 	}
 	if api, ok := rowByName(rows, RowAPIServer); ok && api.State == StateDown {
@@ -198,13 +198,13 @@ func stoppedVerdict(rows []Row, role install.Role) (Verdict, string, bool) {
 // about the probe and a misleading headline for a Mac that is joined and
 // running. There it falls back to what this report DID establish: the agent
 // daemon is up and its node credential is valid.
-func runningSummary(rows []Row, role install.Role) string {
+func runningSummary(rows []Row, role dataroot.Role) string {
 	node, ok := rowByName(rows, RowNode)
-	if ok && node.Detail != "" && (role != install.RoleAgent || node.Severity == SeverityOK) {
+	if ok && node.Detail != "" && (role != dataroot.RoleAgent || node.Severity == SeverityOK) {
 		head, _, _ := strings.Cut(node.Detail, " · ")
 		return head
 	}
-	if role == install.RoleAgent {
+	if role == dataroot.RoleAgent {
 		return "this Mac is a joined worker: the agent daemon is running with a valid node credential"
 	}
 	return "the control plane is serving"

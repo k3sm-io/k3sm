@@ -126,6 +126,10 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"datastore/warn-probe-error", checkDatastore, func(e *doctorEnv) {
 			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", errors.New("io error") }
 		}, statusWarn},
+		{"datastore/skip-absent-on-a-worker", checkDatastore, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		}, statusSkip},
 
 		// toolchain: the three node classes. A full Xcode developer dir is the one
 		// the annotation grants; the other two grant nothing and are WARN, never
@@ -247,6 +251,30 @@ func TestDoctorChecksTable(t *testing.T) {
 		got := checkAgentDaemon(healthyDoctorEnv())
 		if got.status != statusSkip {
 			t.Fatalf("status = %v, want SKIP on a control plane (detail: %q)", got.status, got.detail)
+		}
+	})
+
+	// A worker is not a control plane that has not started yet: its datastore
+	// row must not describe a wait that will never end.
+	t.Run("datastore/a-worker-is-told-it-runs-no-datastore", func(t *testing.T) {
+		t.Parallel()
+		e := agentEnv()
+		e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		got := checkDatastore(e)
+		if got.status != statusSkip {
+			t.Fatalf("status = %v, want SKIP", got.status)
+		}
+		if strings.Contains(got.detail, "has not initialized") {
+			t.Errorf("a worker is told to wait for a control plane it does not run: %q", got.detail)
+		}
+		if !strings.Contains(got.detail, "worker") {
+			t.Errorf("detail does not say why there is no datastore here: %q", got.detail)
+		}
+		// And a control plane's sentence is unchanged.
+		server := healthyDoctorEnv()
+		server.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		if detail := checkDatastore(server).detail; !strings.Contains(detail, "has not initialized") {
+			t.Errorf("the control-plane sentence changed: %q", detail)
 		}
 	})
 
