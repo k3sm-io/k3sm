@@ -97,6 +97,13 @@ type component struct {
 	// death is a crash (the callback's to report) or a bring-up failure
 	// (awaitHealthy's, with the name and log tail the fail-fast path produces).
 	supervised bool
+	// reported is set, under Supervised.mu, by whichever of the two observers of
+	// this component's death gets there first — the reaper (which then fires
+	// OnComponentExit) or markSupervised (which then returns the death as a
+	// bring-up error). It makes the two paths exclusive, so a crash both can see
+	// is reported exactly once and never as both a bring-up failure and a
+	// post-bring-up crash.
+	reported bool
 }
 
 // exitDetail describes an early child exit for the fail-fast bring-up error:
@@ -395,10 +402,41 @@ const componentReadyTimeout = 30 * time.Second
 // → scheduler → controller-manager are awaited in sequence, so a scheduler that
 // dies after its own port opens, while the controller-manager is still coming
 // up, would otherwise be dropped.
-func (s *Supervised) markSupervised(c *component) {
+//
+// It also closes the narrower window BETWEEN that readiness gate and this mark.
+// A child that dies in those few statements is seen by its reaper while the
+// component is still unmarked, so the reaper reports it to nobody — and
+// awaitHealthy has already returned success, so bring-up reports it to nobody
+// either: the silent wedge again, in the smallest window there is. So a
+// markSupervised that finds the child already dead returns that death itself, in
+// awaitHealthy's shape (the component name, the Wait error, the log path and a
+// redacted tail), for bringUp to propagate as the bring-up failure it is. The
+// callback stays silent for it, as it does for every other death during bring-up
+// (see the supervising doc comment): whichever observer claims the death sets
+// reported, and the other skips it.
+func (s *Supervised) markSupervised(c *component) error {
 	s.mu.Lock()
 	c.supervised = true
+	claimed := false
+	select {
+	case <-c.exited:
+		// It died between its readiness gate and this mark. Claim the report
+		// unless the reaper already took it (which it can only have done via the
+		// supervising backstop, since this component was unmarked until now).
+		if !c.reported {
+			c.reported = true
+			claimed = true
+		}
+	default:
+	}
 	s.mu.Unlock()
+	if !claimed {
+		return nil
+	}
+	// Safe without the lock: waitErr is written strictly before exited closes,
+	// and the select above observed that close.
+	return fmt.Errorf("%s exited during bring-up: %v; last log lines (%s):\n%s",
+		c.name, c.waitErr, c.logPath, redactedLogTail(c.logPath))
 }
 
 func (s *Supervised) bringUp(ctx context.Context) error {
@@ -409,7 +447,9 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
 		return fmt.Errorf("kine not listening: %w", err)
 	}
-	s.markSupervised(kine)
+	if err := s.markSupervised(kine); err != nil {
+		return err
+	}
 	// kine is serving, so this pin has now genuinely opened this database — stamp it,
 	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
 	// provision time) is what makes the pre-migration snapshot survive a boot that dies
@@ -425,7 +465,9 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 	if err := s.waitHealthz(ctx, api); err != nil {
 		return fmt.Errorf("apiserver not healthy: %w", err)
 	}
-	s.markSupervised(api)
+	if err := s.markSupervised(api); err != nil {
+		return err
+	}
 	if err := s.startAndAwaitListening(ctx, "scheduler", s.startScheduler, s.cfg.SchedulerPort); err != nil {
 		return err
 	}
@@ -458,8 +500,12 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 		return fmt.Errorf("%s not serving on 127.0.0.1:%d: %w", c.name, port, err)
 	}
 	// This component is up; its own death from here is a crash, reported even
-	// though the components after it are still coming up.
-	s.markSupervised(c)
+	// though the components after it are still coming up — unless it died in the
+	// statements between the wait above and this mark, which markSupervised
+	// returns as the bring-up failure it is.
+	if err := s.markSupervised(c); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -837,8 +883,14 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 		// for a component bringUp forgot to mark.
 		s.mu.Lock()
 		live := c.supervised || s.supervising
+		// reported keeps this exclusive with markSupervised, the other observer
+		// of a death in the window just before the mark: one death, one report.
+		fire := live && s.cfg.OnComponentExit != nil && !c.reported
+		if fire {
+			c.reported = true
+		}
 		s.mu.Unlock()
-		if live && s.cfg.OnComponentExit != nil {
+		if fire {
 			// The tail is REDACTED and byte-capped here, inside the package that
 			// owns the 0600 log, because the consumer logs it to the daemon's
 			// logger and launchd captures that into a world-readable file. The
