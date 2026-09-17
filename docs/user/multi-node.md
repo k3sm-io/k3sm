@@ -39,6 +39,18 @@ The agent authenticates with the bootstrap token, receives its node credentials,
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
 the node. The `MeshPeer` records carry public keys only.
 
+### Restarting a node
+
+A joined agent keeps its credential in its work dir, so restarting it needs no token. It presents the
+certificates it already holds, republishes its wireguard endpoint, and carries on as the same node.
+Supply a token again only in three cases: the stored credential is missing, it has expired, or you are
+moving this Mac to a different cluster. In that last case the token wins: a token that pins a different
+cluster CA makes the agent join the cluster the token came from and replace what it had stored. A token
+for the cluster the node is already in is ignored, so leaving one in a start script is harmless.
+
+The node certificate an agent receives at join is valid for one year. Nothing renews it in place, so
+renewing it means rejoining with a fresh token before it expires.
+
 ### If a node's address changes
 
 The endpoint a node publishes is the address its peers dial to open a wireguard handshake, and on a
