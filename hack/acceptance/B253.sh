@@ -227,7 +227,10 @@ else
 	# A mount point is a directory whose device differs from its parent's — the one
 	# test that survives /var -> /private/var (mount(8) prints the resolved path).
 	mounted() { [ "$(stat -f %d "$DATA_ROOT" 2>/dev/null)" != "$(stat -f %d "$(dirname "$DATA_ROOT")" 2>/dev/null)" ]; }
-	VOLUME="$(diskutil info "$DATA_ROOT" 2>/dev/null | awk -F': *' '/Device Node/ {print $2}' | tr -d ' ')"
+	# A plain-directory data root has no volume: diskutil exits non-zero, which
+	# under pipefail would end the tier before the helper leg ran. Empty means
+	# "not a separate volume" and the L2 rung reports itself pending below.
+	VOLUME="$( (diskutil info "$DATA_ROOT" 2>/dev/null || true) | awk -F': *' '/Device Node/ {print $2}' | tr -d ' ')"
 
 	restore() {
 		echo "--- restoring $DATA_ROOT and the daemons"
