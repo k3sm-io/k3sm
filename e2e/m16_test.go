@@ -21,13 +21,16 @@ package e2e
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -46,8 +49,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic"
-
-	"k3sm.io/k3sm/pkg/certs"
 )
 
 // M16 webhook-delivery criteria — the two tests the M16 plan's R14 names, and the
@@ -69,9 +70,12 @@ import (
 //
 //	TestConversionWebhookDeliveryThroughProxy  the apiserver DELIVERS a
 //	    ConversionReview to the same kind of backend for a CRD whose two versions
-//	    have DISJOINT schemas, in both directions. Only the webhook can bridge
-//	    v1beta1 `spec.greeting` and v1alpha1 `spec.message`, so a read that answers
-//	    with the converted field is a delivery proof, not a no-op round-trip.
+//	    have DISJOINT schemas. Its two cases are the apiserver's two conversion
+//	    CALL SITES, not a symmetry: with v1beta1 as the storage version, reading a
+//	    stored object as v1alpha1 is the READ-path call, and creating through
+//	    v1alpha1 is the WRITE-path call. Only the webhook can bridge v1beta1
+//	    `spec.greeting` and v1alpha1 `spec.message`, so a field carrying the
+//	    handler's transform is a delivery proof, not a no-op round-trip.
 //
 // THE PATH EXERCISED. `k3sm server` runs the embedded apiserver with
 // --service-cluster-ip-range 10.43.0.0/16 (pkg/executor/supervised.go:579), and
@@ -88,8 +92,8 @@ import (
 // lag — otherwise the first admission call races the transport override and a
 // Fail-policy webhook turns the race into a flake.
 //
-// TLS. The serving pair is minted in-test with pkg/certs.SelfSignedServing
-// (pkg/certs/serving.go:65) carrying DNS SANs <svc>.<ns>.svc and
+// TLS. The serving pair is minted in-test (mintWebhookServingPair, which does NOT
+// borrow pkg/certs) carrying DNS SANs <svc>.<ns>.svc and
 // <svc>.<ns>.svc.cluster.local, and the same PEM is the clientConfig.caBundle.
 // That works because the apiserver's webhook client sets the TLS ServerName to the
 // service hostname and only then dials the resolved ClusterIP:
@@ -435,32 +439,62 @@ func startWebhookBackend(t *testing.T, c *Cluster) *webhookBackend {
 	return b
 }
 
-// mintWebhookServingPair returns the PEM cert/key for the backend. The DNS SANs are
-// the two names a service-referenced webhook can be verified under; the ClusterIP
-// rides along as an IP SAN (see the file comment — belt and braces, not required,
-// since the apiserver sets ServerName to the hostname).
+// mintWebhookServingPair returns the PEM cert/key for the backend: a self-signed
+// ECDSA P-256 leaf good for 24 hours, whose SANs are the two names a
+// service-referenced webhook can be verified under plus the ClusterIP as an IP SAN
+// (see the file comment — belt and braces, not required, since the apiserver sets
+// ServerName to the hostname).
+//
+// It is minted HERE rather than through pkg/certs.SelfSignedServing on purpose.
+// That helper's doc comment scopes it to the single-node, dev and standalone
+// `k3sm node` kubelet serving path and says in as many words that using it
+// elsewhere is a defect. A test fixture borrowing it would make that scope
+// statement false, and would couple this file to SAN and lifetime choices made for
+// a different consumer — choices that could be tightened for that consumer's sake
+// and silently break a webhook backend nobody was thinking about.
+//
+// The certificate is its own trust anchor: the same PEM goes into every caBundle
+// here, and Go accepts a self-signed leaf that is present in the verifier's root
+// pool, which is why no CA bit is set and no separate issuer is minted.
 func mintWebhookServingPair(t *testing.T, b *webhookBackend) (certPEM, keyPEM []byte) {
 	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate serving key: %v", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("generate serial: %v", err)
+	}
 	ips := []net.IP{}
 	if ip := net.ParseIP(b.clusterIP); ip != nil {
 		ips = append(ips, ip)
 	}
-	pair, err := certs.SelfSignedServing([]string{b.hostname(), b.hostname() + ".cluster.local"}, ips)
+	now := time.Now()
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "b286-webhook"},
+		// Backdated a few minutes for clock skew between this process, the
+		// apiserver and the guest; the lifetime itself is 24h, which outlives any
+		// run of this suite by a wide margin and expires long before a leaked
+		// Secret could matter.
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{b.hostname(), b.hostname() + ".cluster.local"},
+		IPAddresses:           ips,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {
-		t.Fatalf("mint serving pair: %v", err)
-	}
-	if len(pair.Certificate) == 0 {
-		t.Fatal("minted serving pair carries no certificate")
-	}
-	key, ok := pair.PrivateKey.(*ecdsa.PrivateKey)
-	if !ok {
-		t.Fatalf("minted serving key is %T, want *ecdsa.PrivateKey", pair.PrivateKey)
+		t.Fatalf("create serving certificate: %v", err)
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		t.Fatalf("marshal serving key: %v", err)
 	}
-	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]})
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	return certPEM, keyPEM
 }
@@ -684,8 +718,14 @@ func TestAdmissionWebhookDeliveryThroughProxy(t *testing.T) {
 		_, err := dyn.Resource(gvr).Namespace(b.ns).Create(ctx, probeObject(b, name, 7), metav1.CreateOptions{})
 		if err == nil {
 			// Admitted: the configuration has not reached the admission chain yet.
+			// The object is deleted rather than left behind, and a failure to delete
+			// it is LOGGED, not swallowed: it would leave a Probe this test never
+			// meant to persist, and it is the first thing worth knowing if the
+			// namespace later refuses to finish terminating.
 			lastErr = "create was ADMITTED (webhook configuration not yet in effect)"
-			_ = dyn.Resource(gvr).Namespace(b.ns).Delete(ctx, name, metav1.DeleteOptions{})
+			if derr := dyn.Resource(gvr).Namespace(b.ns).Delete(ctx, name, metav1.DeleteOptions{}); derr != nil {
+				t.Logf("delete prematurely admitted Probe %s/%s: %v", b.ns, name, derr)
+			}
 			return false
 		}
 		lastErr = err.Error()
@@ -785,6 +825,14 @@ func probeWebhookConfig(b *webhookBackend, name string) *admissionregistrationv1
 				CABundle: b.caPEM,
 			},
 			Rules: []admissionregistrationv1.RuleWithOperations{{
+				// CREATE only, and that is a teardown invariant, not a minimalism
+				// preference. Matching Update or Delete would put this Fail-policy
+				// webhook in the path of the CRD finalizer's own instance deletes
+				// during cleanup, by which time the backend Pod and its namespace are
+				// going away: the finalizer's deletes would fail against an
+				// unreachable webhook, the CRD would never finish deleting, and the
+				// namespace would wedge in Terminating. Everything this test asserts
+				// is observable on CREATE, so nothing is bought by widening it.
 				Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{b.group},
@@ -805,15 +853,27 @@ func probeWebhookConfig(b *webhookBackend, name string) *admissionregistrationv1
 
 // TestConversionWebhookDeliveryThroughProxy proves the embedded kube-apiserver
 // delivers a ConversionReview to a `service:`-referenced conversion webhook backed
-// by a `runtimeClassName: vm` Pod, in BOTH directions, through darwin-net's
-// userspace Service proxy — the same path, TLS finding and run command as the
-// admission test (see the file comment).
+// by a `runtimeClassName: vm` Pod, through darwin-net's userspace Service proxy —
+// the same path, TLS finding and run command as the admission test (see the file
+// comment).
+//
+// TWO CALL SITES, NOT TWO DIRECTIONS. v1beta1 is the storage version, so the two
+// cases below are not mirror images of one another; each exercises exactly one of
+// the apiserver's two conversion call sites, and neither exercises both.
+//
+//   - The FORWARD case creates a v1beta1 object, which is already the storage
+//     version and so is written with NO conversion call at all, and then reads it
+//     as v1alpha1. That read is the READ-path conversion.
+//   - The REVERSE case creates through v1alpha1, which must be converted on its
+//     way into storage: that create is the WRITE-path conversion. The v1beta1 read
+//     that checks the result is of the storage version and needs no conversion.
 //
 // WHY IT CANNOT PASS WITHOUT DELIVERY. The CRD's two versions have DISJOINT
 // schemas: v1beta1 (served + storage) has spec.greeting, v1alpha1 (served only) has
 // spec.message. Nothing in the apiserver can map one onto the other — no default,
-// no schema rule, no client-side round-trip — so a v1alpha1 read that answers with
-// "converted:<greeting>" can only have come from the handler inside the guest.
+// no schema rule, no client-side round-trip — and an unconverted field is PRUNED
+// against the reading version's schema, so a field carrying the handler's
+// "converted:" transform can only have come from the handler inside the guest.
 func TestConversionWebhookDeliveryThroughProxy(t *testing.T) {
 	c := Up(t)
 
@@ -824,7 +884,8 @@ func TestConversionWebhookDeliveryThroughProxy(t *testing.T) {
 	beta := schema.GroupVersionResource{Group: b.group, Version: "v1beta1", Resource: "greetings"}
 	alpha := schema.GroupVersionResource{Group: b.group, Version: "v1alpha1", Resource: "greetings"}
 
-	// FORWARD: write the storage version, read the served one.
+	// FORWARD, the READ-path call site: the create needs no conversion (v1beta1 IS
+	// storage), so the v1alpha1 read is the only place the webhook can have run.
 	forwardName := "fwd-" + b.suffix
 	greeting := "hello-" + b.suffix
 	createGreeting(t, dyn, beta, greetingObject(b, "v1beta1", forwardName, "greeting", greeting))
@@ -835,8 +896,10 @@ func TestConversionWebhookDeliveryThroughProxy(t *testing.T) {
 	}
 	t.Logf("v1beta1 spec.greeting=%q read back as v1alpha1 spec.message=%q", greeting, got)
 
-	// REVERSE: write the served version, read the storage one. The handler strips
-	// its own prefix, so the assertion is on a value the write never contained.
+	// REVERSE, the WRITE-path call site: the create through v1alpha1 is converted on
+	// its way into storage, and the v1beta1 read that checks it needs no conversion.
+	// The handler strips its own prefix, so the assertion is on a value the write
+	// never contained and no read-path transform could have introduced.
 	reverseName := "rev-" + b.suffix
 	bare := "hola-" + b.suffix
 	createGreeting(t, dyn, alpha, greetingObject(b, "v1alpha1", reverseName, "message", "converted:"+bare))
