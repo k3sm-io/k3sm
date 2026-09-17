@@ -265,11 +265,21 @@ func checkBrew(env doctorEnv) checkResult {
 // and journal_mode. A non-WAL journal is a WARN; a read error is a WARN. Migration
 // and remediation logic stays in executor, not here.
 //
-// The absent arm says WHY it is absent, and that depends on the role: a worker
-// runs no control plane and therefore no kine at all, so telling its operator
-// "the control plane has not initialized the datastore" would describe a wait
-// that is never going to end.
+// The ROLE is read first and decides everything, because on a worker there is no
+// datastore of this node's to have a posture at all: an agent runs no control
+// plane and therefore no kine. A Mac installed as an agent after a server-era
+// install still carries the old <DataRoot>/server directory, and reading the
+// dead database inside it answered with THAT file's posture — a PASS when it was
+// readable, and in the ordinary unprivileged run "could not read datastore
+// posture … sudo k3sm doctor", a repair for a datastore this Mac does not own.
+// So the worker arm returns before any posture read, and it says the one
+// sentence `k3sm status`'s datastore row says (status.WorkerDatastoreDetail):
+// one sentence for both the absent and the present case, in both commands, is
+// one that cannot drift into four.
 func checkDatastore(env doctorEnv) checkResult {
+	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
+		return checkResult{name: "datastore", status: statusSkip, detail: status.WorkerDatastoreDetail}
+	}
 	present, uv, jm, err := env.datastorePosture()
 	if err != nil {
 		return checkResult{
@@ -280,9 +290,6 @@ func checkDatastore(env doctorEnv) checkResult {
 		}
 	}
 	if !present {
-		if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
-			return checkResult{name: "datastore", status: statusSkip, detail: "no state.db, and none is expected: this Mac is installed as a k3sm worker, which runs no control plane and no kine datastore"}
-		}
 		return checkResult{name: "datastore", status: statusSkip, detail: "no state.db yet (fresh node — the control plane has not initialized the kine SQLite datastore)"}
 	}
 	detail := fmt.Sprintf("kine %s, user_version=%d, journal_mode=%s", executor.DefaultKineVersion, uv, jm)

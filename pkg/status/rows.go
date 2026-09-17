@@ -62,7 +62,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	// because every row below is about one role or the other.
 	role, _, bothRoles := c.installedRole()
 
-	dataRoot, volume := c.dataRootRow(ctx)
+	dataRoot, volume := c.dataRootRow(ctx, role)
 	instRow, installed := c.installRow(volume != nil, role, bothRoles)
 	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
 	var node Row
@@ -112,9 +112,9 @@ func (c Collector) Collect(ctx context.Context) Report {
 		rows = append(rows, pre)
 	}
 	rows = append(rows,
-		c.datastoreRow(),
+		c.datastoreRow(role),
 		c.kubeconfigRow(),
-		c.runtimedRow(ctx),
+		c.runtimedRow(ctx, role),
 	)
 
 	verdict, summary, next := Aggregate(rows, installed, role)
@@ -552,7 +552,16 @@ func (c Collector) controlPlaneRemedy(role dataroot.Role) string {
 	if role == dataroot.RoleAgent {
 		return "k3sm status logs " + RowAgent + "\nk3sm status   # on the control-plane Mac"
 	}
-	return "sudo launchctl kickstart -k system/" + c.Paths.ServerLabel + "\nk3sm status logs " + RowServer
+	return c.nodeKickstart(role) + "\nk3sm status logs " + RowServer
+}
+
+// nodeKickstart is the one home of "restart this Mac's node daemon": the control
+// plane on a server, the joining worker on an agent. Every remedy that restarts
+// a node daemon goes through it, because the label is decided by the role and a
+// remedy that hard-codes the server's sends a worker's operator to a launchd job
+// their Mac does not have (io.k3sm.server is never installed there).
+func (c Collector) nodeKickstart(role dataroot.Role) string {
+	return "sudo launchctl kickstart -k system/" + c.nodeLabel(role)
 }
 
 // nodeLogRemedy names the log of the node daemon THIS Mac runs.
@@ -724,7 +733,7 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 // on the boot disk and hides the real volume. It looks exactly like an empty
 // cluster, which is why the remedy is spelled out in full rather than reduced to
 // "re-install" — `sudo k3sm install` refuses this posture on purpose.
-func (c Collector) dataRootRow(ctx context.Context) (Row, *dataroot.Record) {
+func (c Collector) dataRootRow(ctx context.Context, role dataroot.Role) (Row, *dataroot.Record) {
 	row := Row{Name: RowDataRoot}
 	var usage volumeUsage
 	if c.DataRoot == nil {
@@ -739,7 +748,11 @@ func (c Collector) dataRootRow(ctx context.Context) (Row, *dataroot.Record) {
 		row.Remedy = "sudo k3sm status"
 		return row, nil
 	}
-	kick := "sudo launchctl kickstart -k system/" + c.Paths.NetdLabel + " && sudo launchctl kickstart -k system/" + c.Paths.ServerLabel
+	// The two daemons that have to re-open the data root once it is mounted:
+	// netd, and THIS Mac's node daemon — which on a worker is the agent. Naming
+	// the server there sent an operator to a launchd job that does not exist on
+	// their machine.
+	kick := "sudo launchctl kickstart -k system/" + c.Paths.NetdLabel + " && " + c.nodeKickstart(role)
 	switch {
 	case st.Shadowed():
 		row.State, row.Severity = StateNotMounted, SeverityFail
@@ -1142,11 +1155,33 @@ func shadowText(entries []string) string {
 	return strings.Join(sorted, ", ")
 }
 
+// WorkerDatastoreDetail is what the datastore row says on a worker, and what
+// `k3sm doctor`'s datastore check says there too. It is exported so the two
+// commands report the same subsystem with the same sentence rather than with
+// two copies that drift.
+const WorkerDatastoreDetail = "not this node's: the control plane's datastore lives on another Mac"
+
 // datastoreRow reports the kine SQLite datastore's posture. The db lives inside
 // the service user's mode-0700 home, so an ordinary account is EXPECTED to be
 // unable to read it — that is an unknown row, never a fault.
-func (c Collector) datastoreRow() Row {
+//
+// On a WORKER there is no such db to report on: an agent runs no control plane
+// and therefore no kine. The row stays — it is a stable `-o json` key, and a key
+// that appears and disappears with the role is worse to consume than one that
+// says it does not apply — but it is a SKIP that names the other Mac, and it
+// reads nothing. That last part is the defect this arm exists for: a Mac
+// installed as a worker after a server-era install still has the old
+// <DataRoot>/server directory sitting there, and probing it reported that dead
+// database's journal mode and user_version as this node's datastore, with a
+// remedy pointing at a server log no daemon on this Mac writes. The row is
+// returned BEFORE the path is even built, so nothing opens the stale db.
+func (c Collector) datastoreRow(role dataroot.Role) Row {
 	row := Row{Name: RowDatastore}
+	if role == dataroot.RoleAgent {
+		row.State, row.Severity = StateSkip, SeveritySkip
+		row.Detail = WorkerDatastoreDetail
+		return row
+	}
 	path := executor.StateDBPath(c.Paths.WorkDir)
 	row.Wide = map[string]string{"path": path}
 	present, uv, jm, err := DatastorePosture(path)
@@ -1194,7 +1229,7 @@ func (c Collector) kubeconfigRow() Row {
 // the cluster view and by JSON — the overview has no room for it and it is the
 // row an ordinary account can least often answer — but it still participates in
 // the verdict, because a node whose runtime is unhealthy runs no pods.
-func (c Collector) runtimedRow(ctx context.Context) Row {
+func (c Collector) runtimedRow(ctx context.Context, role dataroot.Role) Row {
 	row := Row{Name: RowRuntimed}
 	// The uid test is repeated here, not just in the adapter that builds the
 	// seam: a caller that wires a Runtimed anyway must still not have this
@@ -1208,7 +1243,7 @@ func (c Collector) runtimedRow(ctx context.Context) Row {
 	if err != nil {
 		row.State, row.Severity = StateDown, SeverityWarn
 		row.Detail = "runtime daemon did not answer: " + errText(err)
-		row.Remedy = "sudo launchctl kickstart -k system/" + c.Paths.ServerLabel
+		row.Remedy = c.nodeKickstart(role)
 		return row
 	}
 	row.Wide = map[string]string{"runtime": info.GetRuntimeName(), "version": info.GetRuntimeVersion(), "api": info.GetApiVersion()}
@@ -1219,7 +1254,7 @@ func (c Collector) runtimedRow(ctx context.Context) Row {
 	}
 	row.State, row.Severity = StateUnhealthy, SeverityWarn
 	row.Detail = fmt.Sprintf("%s reports unhealthy: %s", info.GetRuntimeName(), conditionSummary(info.GetConditions()))
-	row.Remedy = "sudo launchctl kickstart -k system/" + c.Paths.ServerLabel
+	row.Remedy = c.nodeKickstart(role)
 	return row
 }
 
