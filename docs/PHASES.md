@@ -1142,7 +1142,7 @@ phases:
         acceptance:
           - id: M16.2-a1
             met: false
-            check: "k3sm::TestGPUCapacityPolicy, k3sm::TestTranslateEmptyDirMemoryMedium, k3sm::TestFleetGVKsMatchPin and k3sm::TestFleetOperatorRBACPinned pass -race; hack/acceptance/status.sh shows the fleet row with capacity N and the slot floor; hack/ci.sh green"
+            check: "k3sm::TestGPUCapacityPolicy, k3sm::TestTranslateEmptyDirMemoryMedium, k3sm::TestFleetGVKsMatchPin and k3sm::TestFleetOperatorRBACPinned pass -race; hack/acceptance/status.sh asserts the `k3sm status` fleet row with capacity N and the slot floor; hack/ci.sh green"
             method: unit
           - id: M16.2-a2
             met: false
