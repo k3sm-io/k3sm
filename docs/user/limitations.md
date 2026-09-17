@@ -162,6 +162,24 @@ container mounts it.
 Treat a `hostPath` in a manifest as "will not be there", and use a PVC instead. An outright refusal at
 admission or translation time, and an allowlisted exception after it, are follow-ups.
 
+### `emptyDir` with `medium: Memory` Is Refused, Not Silently Disk-Backed
+
+On the default (native) runtime, a Pod that declares an `emptyDir` with a non-empty `medium` is
+**refused at creation**, with a Warning Event whose reason is `FailedEmptyDirMedium` and whose
+message names the volume and the medium. Native Pods are ordinary Darwin processes with no mount
+namespace and no `tmpfs`, so a `medium: Memory` volume could only ever be an ordinary directory on
+disk, and a workload has no way to tell that it got one.
+
+- `medium: Memory`, `medium: HugePages`, and `medium: HugePages-<size>` are all refused. The empty
+  (default) medium is the only one this path serves.
+- Two ways out: remove the `medium` field and take an ordinary disk-backed directory, or schedule
+  the Pod with `runtimeClassName: vm`, whose Linux guest honors `medium: Memory` as a real `tmpfs`
+  (see [the `vm` RuntimeClass](vm-runtimeclass.md)).
+- `sizeLimit` is **not enforced** on any native `emptyDir`. The directory is disk-backed with no
+  quota, so nothing stops a Pod from writing past what it asked for.
+- The `hostprocess` opt-out runtime has no volume handling at all, so neither `emptyDir` nor this
+  refusal applies there.
+
 ### NetworkPolicy Is a Policy Hint, Not a Security Boundary
 
 NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with
