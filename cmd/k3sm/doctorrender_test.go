@@ -18,7 +18,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -225,6 +229,289 @@ func TestDoctorRendersRemedies(t *testing.T) {
 			t.Errorf("the decoded report lost the arch row's remedy: %+v", row)
 		}
 	})
+
+	// (d) --report writes a bundle whose every component has been through
+	// status.Redact, and whose launchd view is the four parsed scalars and
+	// nothing else — never the raw `launchctl print` text, which carries the
+	// job's argv and environment.
+	t.Run("report-writes-a-redacted-bundle", func(t *testing.T) {
+		t.Parallel()
+		// Non-vacuity first: if the seeds were not shapes Redact recognises,
+		// every "the secret is absent" assertion below would pass on a bundle
+		// that redacts nothing at all.
+		if status.Redact(seededJoinToken) == seededJoinToken || status.Redact(seededDSN) == seededDSN {
+			t.Fatal("the seeded credentials are not shapes status.Redact removes")
+		}
+		files := map[string]string{}
+		env := bundleEnv(files)
+		rep := doctorReport(env, doctorTestVersion, doctorTestTime)
+
+		dir, written, err := writeDoctorBundle(context.Background(), env, rep, "")
+		if err != nil {
+			t.Fatalf("writeDoctorBundle: %v", err)
+		}
+		if dir != fakeBundleDir {
+			t.Errorf("bundle dir = %q, want the injected %q", dir, fakeBundleDir)
+		}
+		for _, name := range []string{reportDoctorFile, reportStatusFile, reportLaunchdFile, reportServerLog, reportAgentLog} {
+			if _, ok := files[name]; !ok {
+				t.Errorf("the bundle is missing %s (wrote %v)", name, written)
+			}
+		}
+		if len(written) != len(files) {
+			t.Errorf("wrote %d names for %d files", len(written), len(files))
+		}
+
+		// Nothing in the bundle carries the seeded credentials, in any file.
+		for name, body := range files {
+			for _, secret := range []string{"K10", seededJoinToken, "hunter2"} {
+				if strings.Contains(body, secret) {
+					t.Errorf("%s carries the secret %q:\n%s", name, secret, body)
+				}
+			}
+			// Nor anything only raw launchctl output would have.
+			for _, leak := range []string{"ProgramArguments", "argv", "environment"} {
+				if strings.Contains(body, leak) {
+					t.Errorf("%s carries %q — the bundle must never hold raw launchctl output:\n%s", name, leak, body)
+				}
+			}
+		}
+		// The redaction is not vacuous: the seeded lines are there, minus the
+		// secrets.
+		if !strings.Contains(files[reportServerLog], "control plane exited") {
+			t.Errorf("the log tail lost the line it was quoted for:\n%s", files[reportServerLog])
+		}
+
+		// The launchd view is exactly the four parsed keys, plus the label
+		// naming which daemon they belong to.
+		var view []map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(files[reportLaunchdFile]), &view); err != nil {
+			t.Fatalf("launchd view does not parse: %v\n%s", err, files[reportLaunchdFile])
+		}
+		if len(view) == 0 {
+			t.Fatal("the launchd view is empty")
+		}
+		want := map[string]bool{"label": true, "state": true, "pid": true, "runs": true, "last_exit": true}
+		for _, entry := range view {
+			if len(entry) != len(want) {
+				t.Errorf("launchd entry has %d keys, want %d: %v", len(entry), len(want), entry)
+			}
+			for key := range entry {
+				if !want[key] {
+					t.Errorf("launchd entry carries an unexpected key %q", key)
+				}
+			}
+		}
+	})
+
+	// (e) With no directory named, the bundle lands under the system temp dir
+	// — never the working directory, which is usually a checkout.
+	t.Run("report-never-writes-under-the-working-directory", func(t *testing.T) {
+		t.Parallel()
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatalf("getwd: %v", err)
+		}
+		dir, err := makeReportDir("")
+		if err != nil {
+			t.Fatalf("makeReportDir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+		if !filepath.IsAbs(dir) {
+			t.Errorf("bundle dir %q is relative — it would resolve against the caller's cwd", dir)
+		}
+		if strings.HasPrefix(dir, cwd+string(filepath.Separator)) || dir == cwd {
+			t.Errorf("bundle dir %q is inside the working directory %q", dir, cwd)
+		}
+		if !strings.HasPrefix(dir, strings.TrimSuffix(os.TempDir(), string(filepath.Separator))) {
+			t.Errorf("bundle dir %q is not under the system temp dir %q", dir, os.TempDir())
+		}
+		if !strings.Contains(filepath.Base(dir), reportDirPrefix) {
+			t.Errorf("bundle dir %q is not a k3sm bundle directory", dir)
+		}
+	})
+
+	// A bundle is written as root often enough that an operator-named
+	// directory is a trust decision: every refusal below is a way somebody
+	// else could read or replace the bundle after it lands.
+	t.Run("report-refuses-a-directory-it-does-not-trust", func(t *testing.T) {
+		t.Parallel()
+		const me = 501
+		cases := []struct {
+			name       string
+			facts      dirFacts
+			wantRefuse string // a substring of the refusal, "" means accept
+		}{
+			{"missing-is-created-by-the-caller", dirFacts{}, ""},
+			{"mine-and-private", dirFacts{exists: true, dir: true, uid: me, perm: 0o700}, ""},
+			{"mine-and-group-readable", dirFacts{exists: true, dir: true, uid: me, perm: 0o750}, ""},
+			{"symlink", dirFacts{exists: true, symlink: true, uid: me, perm: 0o777}, "is a symlink"},
+			{"not-a-directory", dirFacts{exists: true, uid: me, perm: 0o600}, "is not a directory"},
+			{"owned-by-another-account", dirFacts{exists: true, dir: true, uid: 0, perm: 0o700}, "owned by uid 0"},
+			{"group-writable", dirFacts{exists: true, dir: true, uid: me, perm: 0o770}, "group- or other-writable"},
+			{"world-writable", dirFacts{exists: true, dir: true, uid: me, perm: 0o777}, "group- or other-writable"},
+		}
+		for _, c := range cases {
+			err := checkReportDir("/named/by/the/operator", c.facts, me)
+			switch {
+			case c.wantRefuse == "" && err != nil:
+				t.Errorf("%s: refused a directory it should accept: %v", c.name, err)
+			case c.wantRefuse != "" && err == nil:
+				t.Errorf("%s: accepted a directory it must refuse", c.name)
+			case c.wantRefuse != "" && !strings.Contains(err.Error(), c.wantRefuse):
+				t.Errorf("%s: refusal does not name the property %q: %v", c.name, c.wantRefuse, err)
+			case c.wantRefuse != "" && !strings.Contains(err.Error(), "choose a directory you own"):
+				t.Errorf("%s: refusal does not carry the remedy: %v", c.name, err)
+			}
+		}
+	})
+
+	// The same guard against the real filesystem, where the symlink and the
+	// mode bits are the ones the kernel sees rather than the ones a table says.
+	t.Run("report-refuses-an-untrusted-directory-on-disk", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+
+		// A fresh, private directory the caller owns is accepted, and a missing
+		// one is created 0700.
+		fresh := filepath.Join(root, "fresh")
+		got, err := makeReportDir(fresh)
+		if err != nil {
+			t.Fatalf("refused a directory it should have created: %v", err)
+		}
+		if got != fresh {
+			t.Errorf("dir = %q, want %q", got, fresh)
+		}
+		if info, err := os.Stat(fresh); err != nil {
+			t.Errorf("stat the created dir: %v", err)
+		} else if info.Mode().Perm() != 0o700 {
+			t.Errorf("created dir mode = %04o, want 0700", info.Mode().Perm())
+		}
+
+		link := filepath.Join(root, "link")
+		if err := os.Symlink(fresh, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if _, err := makeReportDir(link); err == nil {
+			t.Error("a symlinked bundle directory was accepted")
+		} else if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("refusal does not name the symlink: %v", err)
+		}
+
+		shared := filepath.Join(root, "shared")
+		if err := os.Mkdir(shared, 0o777); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Chmod(shared, 0o777); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := makeReportDir(shared); err == nil {
+			t.Error("a world-writable bundle directory was accepted")
+		}
+
+		// A component never overwrites, and never follows a symlink planted
+		// under the name it is about to write.
+		if err := writeReportFile(fresh, reportDoctorFile, []byte("first")); err != nil {
+			t.Fatalf("write the first component: %v", err)
+		}
+		if err := writeReportFile(fresh, reportDoctorFile, []byte("second")); err == nil {
+			t.Error("a bundle component overwrote an existing file")
+		} else if !strings.Contains(err.Error(), reportDoctorFile) {
+			t.Errorf("the refusal does not name the file: %v", err)
+		}
+		if body, err := os.ReadFile(filepath.Join(fresh, reportDoctorFile)); err != nil {
+			t.Errorf("read back: %v", err)
+		} else if string(body) != "first" {
+			t.Errorf("the existing file changed: %q", body)
+		}
+		target := filepath.Join(root, "elsewhere")
+		if err := os.Symlink(target, filepath.Join(fresh, "planted")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if err := writeReportFile(fresh, "planted", []byte("through the link")); err == nil {
+			t.Error("a bundle component was written through a planted symlink")
+		}
+		if _, err := os.Stat(target); err == nil {
+			t.Errorf("%s was created — O_NOFOLLOW did not hold", target)
+		}
+	})
+
+	// The log tails are bounded by BOTH limits, and the end of the log is what
+	// survives: that is the part that explains the failure.
+	t.Run("the-log-tails-are-bounded", func(t *testing.T) {
+		t.Parallel()
+		many := make([]string, 1000)
+		for i := range many {
+			many[i] = fmt.Sprintf("line %d %s", i, strings.Repeat("x", 40))
+		}
+		out := boundTail(many, reportLogLines, reportLogBytes)
+		if got := strings.Count(string(out), "\n"); got > reportLogLines {
+			t.Errorf("%d lines survived, want at most %d", got, reportLogLines)
+		}
+		if !strings.Contains(string(out), "line 999 ") {
+			t.Error("the bound dropped the END of the log")
+		}
+
+		long := []string{strings.Repeat("a", 10), strings.Repeat("b", 10), strings.Repeat("c", 10)}
+		if out := boundTail(long, reportLogLines, 22); len(out) > 22 {
+			t.Errorf("byte bound not applied: %d bytes for a 22-byte budget", len(out))
+		} else if !strings.Contains(string(out), "cccc") {
+			t.Errorf("the byte bound dropped the end of the log: %q", out)
+		}
+	})
+}
+
+// fakeBundleDir is the directory the injected factory hands back: a path that
+// is not created and never written to, which is the point — the bundle gate
+// proves CONTENT without touching the filesystem.
+const fakeBundleDir = "/fake/bundle/dir"
+
+// seededJoinToken and seededDSN are the two credential shapes a daemon log can
+// echo: the CA-pinned bootstrap token and a datastore DSN's password.
+const (
+	seededJoinToken = "K10abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567::server:deadbeef"
+	seededDSN       = "postgres://kine:hunter2@db.example:5432/k3sm"
+)
+
+// bundleEnv is a healthy Mac with the bundle seams faked: a status report and
+// two log tails that BOTH carry seeded credentials, launchd scalars that stand
+// in for a parsed print, and a writer that records into files.
+func bundleEnv(files map[string]string) doctorEnv {
+	env := healthyDoctorEnv()
+	env.statusReport = func(context.Context) status.Report {
+		return status.Report{
+			Verdict: status.VerdictDegraded,
+			Summary: "server: started with --datastore-endpoint " + seededDSN,
+			Rows: []status.Row{
+				{Name: "server", State: status.StateCrashLoop, Severity: status.SeverityFail,
+					Detail: "497 runs, last exit 1", Remedy: "sudo launchctl kickstart -k system/io.k3sm.server"},
+			},
+			Version: doctorTestVersion,
+		}
+	}
+	env.logTail = func(path string) ([]string, error) {
+		return []string{
+			"level=INFO msg=\"joining\" --token " + seededJoinToken,
+			"level=INFO msg=\"datastore\" endpoint=" + seededDSN,
+			"level=ERROR msg=\"control plane exited\" err=\"bind: address already in use\"",
+		}, nil
+	}
+	env.daemonInfo = func(string) status.DaemonInfo {
+		exit := 1
+		return status.DaemonInfo{Loaded: true, State: "running", PID: 4242, Runs: 497, LastExit: &exit}
+	}
+	env.reportDir = func(requested string) (string, error) {
+		if requested != "" {
+			return requested, nil
+		}
+		return fakeBundleDir, nil
+	}
+	env.writeReport = func(_, name string, contents []byte) error {
+		files[name] = string(contents)
+		return nil
+	}
+	return env
 }
 
 // brokenDoctorEnv is a Mac where every check that can warn or fail does: the

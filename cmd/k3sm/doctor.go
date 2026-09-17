@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -109,6 +110,19 @@ type doctorEnv struct {
 	nodeRole        func() (install.Role, bool)
 	agentState      func() (installed, running bool)
 	agentCredential func() (status.CredentialState, time.Time)
+	// The --report bundle's seams. They are here, beside the check seams, for
+	// the same reason: the bundle is assembled by a pure function that reads
+	// them, so the gate proves what a bundle CONTAINS without writing a byte to
+	// the real filesystem.
+	//
+	// daemonInfo returns pkg/status's PARSED launchd scalars and never the text
+	// they came from (see daemonSnapshot). writeReport is the one write path,
+	// and reportDir decides where — never the working directory by default.
+	statusReport func(context.Context) status.Report
+	logTail      func(path string) ([]string, error)
+	daemonInfo   func(label string) status.DaemonInfo
+	reportDir    func(requested string) (string, error)
+	writeReport  func(dir, name string, contents []byte) error
 }
 
 // doctorCheck is a registry entry: a stable name and its pure check function. The
@@ -451,6 +465,13 @@ Flags:
   -work-dir <dir>     control-plane state root (the kine state.db lives here)
   --json              print the report as JSON — the same shape as ` + "`k3sm status -o json`" + `
   --no-color          never emit colour or glyphs
+  --report [dir]      write a redacted bug-report bundle (this report, the
+                      runtime status report, the launchd state of each daemon,
+                      and the bounded tails of the server and agent logs) to
+                      dir, or to a fresh directory under the system temp dir.
+                      Credentials are removed, but the bundle still names this
+                      Mac's host name and its peers — read it before attaching
+                      it to a public issue
 
 Exit codes:
   0  every check passes (or is deliberately skipped)
@@ -568,6 +589,10 @@ type doctorOptions struct {
 	workDir string
 	json    bool
 	noColor bool
+	// report asks for the bug-report bundle, and reportDir is the directory
+	// the operator named for it (empty means a fresh temp directory).
+	report    bool
+	reportDir string
 }
 
 // parseDoctorArgs parses the doctor command line.
@@ -585,11 +610,21 @@ func parseDoctorArgs(args []string, errOut io.Writer) (doctorOptions, error) {
 	fs.StringVar(&o.workDir, "work-dir", o.workDir, "control-plane state root (the kine state.db lives here)")
 	fs.BoolVar(&o.json, "json", false, "print the report as JSON")
 	fs.BoolVar(&o.noColor, "no-color", false, "never emit colour or glyphs")
+	fs.BoolVar(&o.report, "report", false, "write a redacted bug-report bundle")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
+	// The one positional is the bundle's directory, and it is accepted ONLY
+	// with --report: a stray argument anywhere else is a typo, and silently
+	// ignoring it would leave an operator believing they asked for something.
 	if fs.NArg() > 0 {
-		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		if !o.report {
+			return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		}
+		o.reportDir = fs.Arg(0)
+	}
+	if fs.NArg() > 1 {
+		return o, fmt.Errorf("unexpected argument %q — --report takes at most one directory", fs.Arg(1))
 	}
 	return o, nil
 }
@@ -633,8 +668,32 @@ func runDoctor(args []string) int {
 		}
 		return exitUsage
 	}
-	rep := doctorReport(realDoctorEnv(o.workDir), version.Get(), time.Now())
+	env := realDoctorEnv(o.workDir)
+	rep := doctorReport(env, version.Get(), time.Now())
+	if o.report {
+		return emitDoctorBundle(context.Background(), env, rep, o, os.Stdout, os.Stderr)
+	}
 	return emitDoctorReport(rep, o, os.Stdout, os.Stderr, status.ColorEnabled(os.Stdout, o.noColor, os.Getenv))
+}
+
+// emitDoctorBundle writes the bug-report bundle and prints what it wrote, with
+// the directory LAST — it is the one line the operator has to act on.
+//
+// The exit code is still the report's: --report changes what is written, not
+// what the checks found, so a script that runs doctor with it branches on the
+// same numbers.
+func emitDoctorBundle(ctx context.Context, env doctorEnv, rep status.Report, o doctorOptions, out, errOut io.Writer) int {
+	dir, written, err := writeDoctorBundle(ctx, env, rep, o.reportDir)
+	for _, name := range written {
+		fmt.Fprintln(out, "  "+name)
+	}
+	if err != nil {
+		fmt.Fprintln(errOut, "k3sm doctor:", err)
+		return exitInternalError
+	}
+	fmt.Fprintf(out, "\nbug-report bundle: %s\n", dir)
+	fmt.Fprintln(out, "credentials are redacted, but it still names this Mac's host name and its peers — read it before attaching it to a public issue")
+	return doctorExitCode(rep)
 }
 
 // realDoctorEnv wires the real probes for a given work dir. This is the only place
@@ -656,6 +715,11 @@ func realDoctorEnv(workDir string) doctorEnv {
 		agentCredential: func() (status.CredentialState, time.Time) {
 			return status.NodeCredentialState(osStatusFS{}, agentCredentialDir(), time.Now())
 		},
+		statusReport: func(ctx context.Context) status.Report { return newStatusCollector().Collect(ctx) },
+		logTail:      func(path string) ([]string, error) { return readTail(path, reportLogLines) },
+		daemonInfo:   probeDaemonInfo,
+		reportDir:    makeReportDir,
+		writeReport:  writeReportFile,
 	}
 }
 

@@ -47,6 +47,7 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", 
   kubeconfig  print the admin kubeconfig, or --write/merge it into ~/.kube/config
   status      show what is running (daemons, apiserver, node, workloads, data root) — the exit code is the verdict, see k3sm status --help
   doctor      run preflight environment + datastore-posture checks
+              (--report writes a redacted bug-report bundle)
   snapshot    back up and restore the kine SQLite datastore (snapshot save|restore)
   version     print version
 
