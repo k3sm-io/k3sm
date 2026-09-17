@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // TestDeregisterEligibility pins the expiry rule an uninstall decides on.
@@ -28,7 +29,7 @@ import (
 // The rule is the certificate's RAW NotAfter, and the case that matters is the
 // one where it DISAGREES with the credential store: a node whose certificate
 // expires in an hour is `credentialExpired` to an agent START (inside
-// credentialExpiryMargin, so the operator is told to supply a token), and that
+// nodecred.ExpiryMargin, so the operator is told to supply a token), and that
 // verdict has nothing to do with a deregistration, which needs the certificate
 // to authenticate one request lasting a few seconds. Deciding this on the
 // store's verdict would silently skip the deregistration for every node in its
@@ -56,10 +57,10 @@ func TestDeregisterEligibility(t *testing.T) {
 	}
 	// The disagreement stated as the property, not as an example: inside the
 	// store's margin the credential is EXPIRED for a start and ELIGIBLE here.
-	inMargin := now.Add(credentialExpiryMargin / 2)
+	inMargin := now.Add(nodecred.ExpiryMargin / 2)
 	if !deregisterEligible(inMargin, now) {
 		t.Errorf("a certificate %s from expiry must still deregister: the %s store margin decides which START failure to report, not whether a certificate can authenticate one request",
-			credentialExpiryMargin/2, credentialExpiryMargin)
+			nodecred.ExpiryMargin/2, nodecred.ExpiryMargin)
 	}
 }
 

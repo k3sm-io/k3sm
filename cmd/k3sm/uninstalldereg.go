@@ -29,6 +29,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // Leaving the cluster on `sudo k3sm uninstall`.
@@ -78,7 +79,7 @@ func deregisterEligible(clientNotAfter, now time.Time) bool {
 // certificate is what the server checks the request body against. A Mac renamed
 // since it joined still deregisters the node it actually is.
 func nodeNameFromClientCert(certPEM []byte) (string, error) {
-	leaf, err := decodeCertPEM(certPEM)
+	leaf, err := nodecred.DecodeCertPEM(certPEM)
 	if err != nil {
 		return "", fmt.Errorf("parse the stored node client certificate: %w", err)
 	}
@@ -126,15 +127,15 @@ func agentDeregister(sys install.System, dataRoot string, now time.Time) (func(c
 		return nil, fmt.Sprintf("this node's stored credential cannot be read (%v), so it cannot authenticate a deregistration", err)
 	case cred == nil:
 		return nil, fmt.Sprintf("this node holds no usable credential (%s), so there is nothing to deregister with", status)
-	case !deregisterEligible(cred.clientNotAfter, now):
-		return nil, fmt.Sprintf("this node's certificate expired at %s, so the control plane would refuse a deregistration", cred.clientNotAfter.UTC().Format(time.RFC3339))
+	case !deregisterEligible(cred.ClientNotAfter, now):
+		return nil, fmt.Sprintf("this node's certificate expired at %s, so the control plane would refuse a deregistration", cred.ClientNotAfter.UTC().Format(time.RFC3339))
 	}
 
-	nodeName, err := nodeNameFromClientCert(cred.clientCertPEM)
+	nodeName, err := nodeNameFromClientCert(cred.ClientCertPEM)
 	if err != nil {
 		return nil, err.Error()
 	}
-	client, err := bootstrap.NodeIdentityClient(cred.clusterCAPEM, cred.clientCertPEM, cred.clientKeyPEM)
+	client, err := bootstrap.NodeIdentityClient(cred.ClusterCAPEM, cred.ClientCertPEM, cred.ClientKeyPEM)
 	if err != nil {
 		return nil, fmt.Sprintf("this node's credential cannot be presented (%v), so it cannot authenticate a deregistration", err)
 	}
