@@ -509,7 +509,10 @@ func parkedSummary(last executor.Crash) string {
 //     reader the daemon and `k3sm status` use) AND its cluster-CA pin is the one
 //     the token this install staged pins. A credential with a different pin is a
 //     leftover from another cluster, so the wait continues: the daemon will
-//     re-join over it.
+//     re-join over it. This half is FAIL-CLOSED: if the staged token cannot be
+//     read back or does not parse, the install fails rather than falling back to
+//     existence-and-parse, because a comparison with nothing to compare against
+//     is exactly the check this function was written to stop making.
 //
 // The second witness is also what keeps a REINSTALL honest in the other
 // direction. A worker that is simply being upgraded resumes from the credential
@@ -526,13 +529,16 @@ func verifyAgentJoined(ctx context.Context, sys System, cfg Config, startedAt ti
 		return nil
 	}
 	cred := AgentCredentialPath(cfg.DataRoot)
-	pin, pinned := stagedTokenPin(sys, cfg)
+	pin, err := stagedTokenPin(sys, cfg)
+	if err != nil {
+		return err
+	}
 	deadline := time.Now().Add(agentJoinBudget.running)
 	for {
 		if err := freshAgentStartFailure(sys, cfg, startedAt); err != nil {
 			return err
 		}
-		joined, why := agentCredentialProvesJoin(sys, cfg, pin, pinned)
+		joined, why := agentCredentialProvesJoin(sys, cfg, pin)
 		if joined {
 			cfg.Logger.Info("the agent joined the cluster", "credential", cred)
 			return nil
@@ -605,7 +611,7 @@ func agentFailureDetail(c executor.Crash) string {
 // daemon's decision — it re-joins with the staged token, or it fails and the
 // record says so on the next tick — and an installer that failed here would be
 // pre-empting a daemon that is about to fix it.
-func agentCredentialProvesJoin(sys System, cfg Config, pin string, pinned bool) (joined bool, why string) {
+func agentCredentialProvesJoin(sys System, cfg Config, pin string) (joined bool, why string) {
 	path := AgentCredentialPath(cfg.DataRoot)
 	state, cred, err := nodecred.Status(sysFS{sys: sys}, cfg.agentWorkDir(), time.Now())
 	switch {
@@ -613,7 +619,7 @@ func agentCredentialProvesJoin(sys System, cfg Config, pin string, pinned bool) 
 		return false, fmt.Sprintf("%s did not parse as a node credential (%v)", path, err)
 	case cred == nil:
 		return false, fmt.Sprintf("%s is ABSENT (the agent has not written the credential a completed join produces)", path)
-	case pinned && cred.ClusterCAPin != pin:
+	case cred.ClusterCAPin != pin:
 		return false, fmt.Sprintf("%s is a credential for a DIFFERENT cluster (it pins cluster CA %s; the token this install staged pins %s), so it is a file an earlier install left behind rather than proof of this join", path, cred.ClusterCAPin, pin)
 	}
 	if state != nodecred.Valid {
@@ -624,30 +630,40 @@ func agentCredentialProvesJoin(sys System, cfg Config, pin string, pinned bool) 
 }
 
 // stagedTokenPin returns the cluster-CA pin carried by the join token THIS
-// install staged, and whether it could be determined.
+// install staged, read from the STAGED COPY (agentTokenPath) rather than from
+// the operator's source file.
 //
-// It reads the operator's token file (the root-only source, which only the
-// installer can open) and takes the pin with pkg/bootstrap's own parser — the
-// hash is never recomputed here, because a second implementation of a pin is a
-// second answer to "which cluster is this".
+// The copy is the right source for two reasons. It is the exact bytes the agent
+// daemon reads, so the pin compared against the credential is the pin the join
+// was actually attempted with. And it is a file this install wrote and owns:
+// the operator's own token is theirs to delete the moment they like — they are
+// told to, once the node is Ready — so reading it here would make the
+// verification fail on a file that legitimately vanished mid-run. The SOURCE is
+// still parsed, once, at staging time (stageJoinToken), which is where a
+// malformed token is refused before anything is written.
 //
-// It is fail-open: a token this installer could not read or parse leaves the
-// credential check with existence-and-parse only, which is what the check did
-// before the pin was added. A refusal here would fail an install over a
-// bookkeeping read, and the token itself was already validated where it is
-// staged.
-func stagedTokenPin(sys System, cfg Config) (string, bool) {
-	raw, err := sys.ReadFile(cfg.TokenFile)
+// The pin comes from pkg/bootstrap's own parser; the hash is never recomputed
+// here, because a second implementation of a pin is a second answer to "which
+// cluster is this".
+//
+// It is FAIL-CLOSED, and deliberately not symmetric with the crash record's
+// fail-open. An unreadable record costs a diagnostic; an unreadable token costs
+// the comparison itself — without a pin, every self-consistent credential on
+// the disk satisfies the check, including the one from the cluster this Mac
+// used to belong to. That is the 2026-09-17 failure restored by a side door, so
+// it is an error rather than a warning, and it names both files: the copy that
+// could not be used and the source it was made from.
+func stagedTokenPin(sys System, cfg Config) (string, error) {
+	staged := cfg.agentTokenPath()
+	raw, err := sys.ReadFile(staged)
 	if err != nil {
-		cfg.Logger.Warn("could not re-read the staged join token; the credential check cannot tell which cluster it is for", "path", cfg.TokenFile, "err", err)
-		return "", false
+		return "", fmt.Errorf("cannot verify this node's join: the staged join token %s could not be read back (%v), so there is nothing to compare the stored node credential's cluster against — a credential left by an earlier install would otherwise pass for a join that never happened (it is staged from %s on every install)", staged, err, cfg.TokenFile)
 	}
 	tok, err := bootstrap.ParseToken(string(raw))
 	if err != nil {
-		cfg.Logger.Warn("the staged join token does not parse; the credential check cannot tell which cluster it is for", "path", cfg.TokenFile, "err", err)
-		return "", false
+		return "", fmt.Errorf("cannot verify this node's join: the staged join token %s is not a k3sm join token (%v), so there is no cluster-CA pin to compare the stored node credential against — it is staged from %s, so write the token `k3sm token create` printed on the server into that file and reinstall", staged, err, cfg.TokenFile)
 	}
-	return tok.CAHash, true
+	return tok.CAHash, nil
 }
 
 // sysFS adapts the installer's privileged file seam to pkg/nodecred's read

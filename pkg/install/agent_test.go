@@ -215,6 +215,35 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		}
 	})
 
+	t.Run("a token file that is not a join token is refused before anything is staged", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		// A plausible mistake: the operator pasted the node-password, a
+		// kubeconfig line, or half a token. It can never complete a join, and
+		// it carries no cluster-CA pin — which is what the installer compares
+		// the stored node credential against — so it is refused here, where a
+		// human is still watching, rather than backed off from forever.
+		f.putFile(operatorTokenFile, []byte("K10-no-separator-here\n"))
+		err := Install(context.Background(), f, agentCfg(t))
+		if err == nil {
+			t.Fatal("install accepted a token file that does not hold a join token")
+		}
+		for _, want := range []string{operatorTokenFile, "K10<cluster-CA hash>::<user>:<secret>"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q must carry %q — the operator needs the file and the shape it should hold", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "no-separator-here") {
+			t.Errorf("the refusal echoes the contents of the token file: %q", err)
+		}
+		// Refused BEFORE a byte of it is written anywhere.
+		for _, c := range f.calls {
+			if strings.HasPrefix(c, "WriteServiceUserFile:") || strings.HasPrefix(c, "WriteLaunchDaemon:") {
+				t.Errorf("a malformed token was staged anyway: %q", c)
+			}
+		}
+	})
+
 	t.Run("an operator token file anyone can read is refused", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}

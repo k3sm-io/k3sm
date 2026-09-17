@@ -151,6 +151,10 @@ func agentStartFailure(at time.Time, detail string) executor.Crash {
 func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 	installStart := time.Date(2026, 9, 17, 11, 0, 0, 0, time.UTC)
 	dir := Config{}.withDefaults().agentWorkDir()
+	// The verification reads the token install STAGED, not the operator's
+	// source: that copy is the bytes the daemon reads, and it is a file this
+	// install owns rather than one the operator may delete at any moment.
+	staged := agentCfg(t).withDefaults().agentTokenPath()
 
 	cases := []struct {
 		name string
@@ -234,6 +238,24 @@ func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 			},
 		},
 		{
+			// (g) The pin is the comparison, so a token that cannot supply one
+			// is a refusal and never a fallback to "the file is there". Without
+			// this the 2026-09-17 failure comes back through a side door: a
+			// self-consistent credential from any cluster would pass.
+			name: "a staged token that does not parse fails the install rather than skipping the comparison",
+			seed: func(t *testing.T, f *fakeSystem, cfg Config) string {
+				mintNodeCredential(t, dir).seed(f)
+				return "not-a-k3sm-join-token"
+			},
+			wantErr: true,
+			wantPhrase: []string{
+				staged,            // the copy that could not be used
+				operatorTokenFile, // and the source it is made from
+				"not a k3sm join token",
+				"cluster-CA pin",
+			},
+		},
+		{
 			// (f) Bookkeeping is not a verdict: an unreadable record must not
 			// fail an install that has every other reason to pass, for the same
 			// reason the daemon treats a corrupt record as empty.
@@ -252,7 +274,7 @@ func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 			shrinkRestartBudgets(t)
 			f := &fakeSystem{}
 			cfg := agentCfg(t).withDefaults()
-			f.putFile(cfg.TokenFile, []byte(tc.seed(t, f, cfg)+"\n"))
+			f.putFile(cfg.agentTokenPath(), []byte(tc.seed(t, f, cfg)+"\n"))
 
 			err := verifyAgentJoined(context.Background(), f, cfg, installStart)
 			if !tc.wantErr {
