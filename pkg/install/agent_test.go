@@ -19,6 +19,8 @@ package install
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,6 +28,7 @@ import (
 	"testing"
 
 	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // agentCfg is the Config an agent install is asked for: the role, where to
@@ -439,4 +442,279 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 			t.Errorf("server-role daemons = %v, want netd then the control plane", labels)
 		}
 	})
+}
+
+// legacyServiceUID is the uid the fake's EnsureServiceUser hands out. The
+// adoption's whole verdict is "which uid does the 0600 name", so the tests below
+// have to be able to say that uid out loud.
+const legacyServiceUID = 271
+
+// seedLegacyEntry is how a test describes one entry an OLDER install left in the
+// agent work dir: owner, group, mode, and what kind of entry it is.
+//
+// kind is deliberately not defaulted to "a regular file": EntryOther is the zero
+// value, so a row that means "a regular file" has to say EntryRegular, and a row
+// that forgets describes something the adoption refuses rather than something it
+// silently adopts.
+type seedLegacyEntry struct {
+	name string
+	uid  int
+	gid  int
+	mode fs.FileMode
+	kind EntryKind
+}
+
+// TestAgentInstallAdoptsLegacyRootOwnedFiles is the gate for B323: a reinstall
+// over a worker installed BEFORE the node daemon moved from root to the _k3sm
+// service user hands that node's state over to the service user, so the daemon
+// can write it.
+//
+// The failure it closes is a crash-loop, not a warning. `k3sm agent` runs as
+// _k3sm, finds a root-owned 0600 node-password it cannot rewrite, and dies on
+// "persist node-password: permission denied" — with the mesh key and the node
+// credential waiting behind it. Only root can hand those files over and only the
+// installer is root.
+//
+// What it asserts is STATE, not calls: the fake carries a per-path ownership
+// table that Chown really mutates, so each row says what the directory looks
+// like after the install rather than which methods were invoked.
+//
+// The four properties, each a way to get this wrong:
+//
+//   - the known artifacts are adopted, and their MODE is carried across
+//     untouched — this is a migration to the posture a fresh install already
+//     produces, not a re-decision of what the files permit;
+//   - a file already owned by the service user is not touched at all, so a
+//     healthy reinstall performs no ownership change whatsoever;
+//   - a file k3sm does not recognise is never adopted — handing an unknown file
+//     to the service user IS the widening this step is careful not to be — and
+//     when the service user cannot read it, the install REFUSES before a single
+//     chown, naming the file and both remedies;
+//   - an unrecognised file the service user CAN read is simply left alone.
+func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
+	workDir := agentCfg(t).withDefaults().agentWorkDir()
+	at := func(name string) string { return filepath.Join(workDir, name) }
+	// The work dir as a healthy install already has it: the service user's own,
+	// 0700. Rows that are about the FILES start from this so the directory is
+	// never the thing under test by accident.
+	adoptedDir := seedLegacyEntry{name: "", uid: legacyServiceUID, gid: DataRootGID, mode: AgentTokenDirMode, kind: EntryDir}
+	legacyDir := seedLegacyEntry{name: "", uid: 0, gid: 0, mode: AgentTokenDirMode, kind: EntryDir}
+
+	type wantOwner struct {
+		path string
+		uid  int
+		gid  int
+		mode fs.FileMode
+	}
+
+	cases := []struct {
+		name string
+		// seed is the agent work dir an older install left behind. An empty
+		// name is the work dir itself; nil means there is no work dir at all.
+		seed []seedLegacyEntry
+		// wantRefuse are the substrings the refusal must carry. Empty means the
+		// install must SUCCEED.
+		wantRefuse []string
+		// want is the ownership each path must have once the install is done.
+		want []wantOwner
+		// wantNoChown asserts the install changed no ownership at all.
+		wantNoChown bool
+		// wantChownOrder is the exact sequence of Chown calls the install must
+		// have made. It is the ONE property in this table that is about the
+		// order of operations rather than the end state, because the hazard it
+		// pins is a WINDOW and not an outcome.
+		wantChownOrder []string
+		// wantLog are substrings the operator must have been shown.
+		wantLog []string
+	}{
+		{
+			name: "a root-owned node-password is handed to the service user at the mode it had",
+			seed: []seedLegacyEntry{adoptedDir, {name: agentNodePasswordName, mode: 0o600, kind: EntryRegular}},
+			want: []wantOwner{{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600}},
+		},
+		{
+			name: "the mesh key and the node credential are adopted too, each keeping its own mode",
+			seed: []seedLegacyEntry{
+				adoptedDir,
+				{name: agentMeshKeyName, mode: 0o600, kind: EntryRegular},
+				// Deliberately NOT 0600: a mode the adoption re-decided rather
+				// than preserved would show up here as 0600.
+				{name: agentNodeKubeconfigName, mode: 0o640, kind: EntryRegular},
+			},
+			want: []wantOwner{
+				{at(agentMeshKeyName), legacyServiceUID, DataRootGID, 0o600},
+				{at(agentNodeKubeconfigName), legacyServiceUID, DataRootGID, 0o640},
+			},
+		},
+		{
+			name: "the work dir itself is adopted when an older install left it root-owned, and LAST",
+			seed: []seedLegacyEntry{legacyDir, {name: agentNodePasswordName, mode: 0o600, kind: EntryRegular}},
+			want: []wantOwner{
+				{workDir, legacyServiceUID, DataRootGID, AgentTokenDirMode},
+				{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600},
+			},
+			// The directory goes over last, so no moment exists in which the
+			// service user owns a 0700 directory — and so may rename or unlink
+			// inside it — while a root-owned artifact in it is still pending.
+			wantChownOrder: []string{
+				fmt.Sprintf("Chown:%s:%d:%d", at(agentNodePasswordName), legacyServiceUID, DataRootGID),
+				fmt.Sprintf("Chown:%s:%d:%d", workDir, legacyServiceUID, DataRootGID),
+			},
+		},
+		{
+			name: "a directory already the service user's own is left completely alone",
+			seed: []seedLegacyEntry{
+				adoptedDir,
+				{name: agentNodePasswordName, uid: legacyServiceUID, gid: DataRootGID, mode: 0o600, kind: EntryRegular},
+				{name: agentMeshKeyName, uid: legacyServiceUID, gid: DataRootGID, mode: 0o600, kind: EntryRegular},
+				{name: nodecred.ServingKeyFile, uid: legacyServiceUID, gid: DataRootGID, mode: 0o600, kind: EntryRegular},
+			},
+			wantNoChown: true,
+			want: []wantOwner{
+				{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600},
+				{at(nodecred.ServingKeyFile), legacyServiceUID, DataRootGID, 0o600},
+			},
+		},
+		{
+			name: "an unrecognised file the service user cannot read refuses the install before anything is chowned",
+			seed: []seedLegacyEntry{
+				adoptedDir,
+				{name: agentNodePasswordName, mode: 0o600, kind: EntryRegular},
+				{name: "operator-notes.txt", mode: 0o600, kind: EntryRegular},
+			},
+			wantRefuse:  []string{"operator-notes.txt", "chown _k3sm"},
+			wantNoChown: true,
+			// The refusal is before the chowns, so the artifact that WOULD have
+			// been adopted is still root's.
+			want: []wantOwner{{at(agentNodePasswordName), 0, 0, 0o600}},
+		},
+		{
+			name: "an unrecognised file the service user can read is ignored, and the install proceeds",
+			seed: []seedLegacyEntry{
+				adoptedDir,
+				{name: agentNodePasswordName, mode: 0o600, kind: EntryRegular},
+				{name: "README", mode: 0o644, kind: EntryRegular},
+			},
+			want: []wantOwner{
+				{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600},
+				// Ignored means UNTOUCHED, not adopted: k3sm does not hand a file
+				// it cannot account for to the service user.
+				{at("README"), 0, 0, 0o644},
+			},
+			// Ignored, but said out loud. "k3sm saw this and chose to leave it"
+			// is what an operator needs when they later wonder why the file was
+			// not repaired — and it is the PATH only, never a byte of a file
+			// sitting in a credential directory.
+			wantLog: []string{"left an unrecognised file in the agent work dir alone", at("README")},
+		},
+		{
+			name: "a symlink wearing an artifact's name refuses the install rather than being adopted",
+			seed: []seedLegacyEntry{
+				adoptedDir,
+				{name: agentNodePasswordName, mode: 0o600, kind: EntryRegular},
+				// Plantable by anything that can write in this directory once the
+				// directory is the service user's. An adoption is decided about a
+				// NAME and applied to what the name resolves to, so the one thing
+				// a root-run chown must not accept under node.key is a stand-in.
+				{name: agentMeshKeyName, uid: legacyServiceUID, gid: DataRootGID, mode: 0o777, kind: EntrySymlink},
+			},
+			wantRefuse:  []string{at(agentMeshKeyName), "is not a regular file; remove it", "a symlink"},
+			wantNoChown: true,
+			want:        []wantOwner{{at(agentNodePasswordName), 0, 0, 0o600}},
+		},
+		{
+			name: "a group-readable file in a group the service user is not in is still unreadable",
+			seed: []seedLegacyEntry{
+				adoptedDir,
+				{name: agentNodePasswordName, mode: 0o600, kind: EntryRegular},
+				// root:wheel 0640. The group-read bit is set and buys _k3sm
+				// nothing, because _k3sm is not in wheel — the case a predicate
+				// that took any group-read bit as "readable" would wave through.
+				{name: "operator-notes.txt", uid: 0, gid: 0, mode: 0o640, kind: EntryRegular},
+			},
+			wantRefuse:  []string{"operator-notes.txt", "chown _k3sm"},
+			wantNoChown: true,
+			want:        []wantOwner{{at(agentNodePasswordName), 0, 0, 0o600}},
+		},
+		{
+			name:        "artifacts this node has not written yet are simply absent",
+			seed:        []seedLegacyEntry{adoptedDir},
+			wantNoChown: true,
+		},
+		{
+			name:        "a Mac with no agent work dir at all has nothing to migrate",
+			seed:        nil,
+			wantNoChown: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkRestartBudgets(t)
+			f := &fakeSystem{}
+			seedOperatorToken(f)
+			for _, e := range tc.seed {
+				path := workDir
+				if e.name != "" {
+					path = at(e.name)
+				}
+				f.putOwned(path, e.uid, e.gid, e.mode, e.kind)
+			}
+			// No --token-file: the B323 shape is a reinstall over a node that has
+			// ALREADY joined, which stages nothing and so repairs nothing on its
+			// way past.
+			cfg := agentCfg(t)
+			cfg.TokenFile = ""
+			var log bytes.Buffer
+			cfg.Logger = testLogger(&log)
+
+			err := Install(context.Background(), f, cfg)
+			if len(tc.wantRefuse) > 0 {
+				if err == nil {
+					t.Fatal("install accepted an agent work dir holding a file the service user cannot read")
+				}
+				for _, want := range tc.wantRefuse {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not name %q, so it does not say which file or what to do about it", err, want)
+					}
+				}
+			} else if err != nil {
+				t.Fatalf("Install: %v", err)
+			}
+
+			if tc.wantNoChown {
+				for _, c := range f.calls {
+					if strings.HasPrefix(c, "Chown:") {
+						t.Errorf("the install changed ownership when it had no reason to: %q", c)
+					}
+				}
+			}
+			if tc.wantChownOrder != nil {
+				var got []string
+				for _, c := range f.calls {
+					if strings.HasPrefix(c, "Chown:") {
+						got = append(got, c)
+					}
+				}
+				if !slices.Equal(got, tc.wantChownOrder) {
+					t.Errorf("ownership was handed over as %v, want %v", got, tc.wantChownOrder)
+				}
+			}
+			for _, want := range tc.wantLog {
+				if !strings.Contains(log.String(), want) {
+					t.Errorf("the operator was never told %q; log =\n%s", want, log.String())
+				}
+			}
+			for _, w := range tc.want {
+				got, ok := f.owners[w.path]
+				if !ok {
+					t.Errorf("%s is gone from the work dir", w.path)
+					continue
+				}
+				if got.UID != w.uid || got.GID != w.gid || got.Mode != w.mode {
+					t.Errorf("%s is %d:%d %#o, want %d:%d %#o", w.path, got.UID, got.GID, got.Mode, w.uid, w.gid, w.mode)
+				}
+			}
+		})
+	}
 }

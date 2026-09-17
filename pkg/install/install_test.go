@@ -140,6 +140,82 @@ type fakeSystem struct {
 	// separate because the two records are separate files that never cross
 	// roles, and a fake that pooled them could not tell the difference.
 	agentArgs map[string]dataroot.AgentArgsRecord
+	// owners is the fake's model of unix ownership, keyed by path: what Owner
+	// and ListOwned answer from, and what Chown MUTATES. It is deliberately
+	// independent of files above — ownership is not derivable from content, and
+	// the whole question the legacy-file adoption asks is one only this table
+	// can answer.
+	//
+	// Nil (the zero value) means every path is ABSENT, which is the first-install
+	// posture: no agent work dir, nothing to migrate. So an unconfigured fake
+	// describes a Mac with no prior agent state, and only a test that cares about
+	// the migration has to say anything at all.
+	owners map[string]OwnedEntry
+}
+
+// putOwned seeds the fake's ownership table with one entry. It is how a test
+// describes what an OLDER install left on disk — root:wheel 0600 files in the
+// agent work dir — without needing the privilege to create such a file for real.
+//
+// The kind is EXPLICIT rather than inferred from anything else, because the
+// entry a test most needs to be able to plant is a symlink wearing an artifact's
+// name, and a fake that could only say "file or directory" could not express the
+// case the refusal exists for.
+func (f *fakeSystem) putOwned(path string, uid, gid int, mode fs.FileMode, kind EntryKind) {
+	if f.owners == nil {
+		f.owners = map[string]OwnedEntry{}
+	}
+	f.owners[path] = OwnedEntry{Path: path, UID: uid, GID: gid, Mode: mode, Kind: kind}
+}
+
+// Owner answers from the ownership table. A path with no entry is ABSENT with
+// ReadFile's contract, which is what makes an unconfigured fake describe a Mac
+// that has never joined.
+func (f *fakeSystem) Owner(path string) (OwnedEntry, error) {
+	f.calls = append(f.calls, "Owner:"+path)
+	if e, ok := f.owners[path]; ok {
+		return e, nil
+	}
+	return OwnedEntry{}, fmt.Errorf("lstat %s: %w", path, fs.ErrNotExist)
+}
+
+// ListOwned answers the entries whose parent is dir, sorted by path so the
+// classification a test asserts on does not ride Go's map iteration order. It is
+// SHALLOW, matching the real implementation: an entry two levels down is not
+// listed, so a test cannot accidentally describe a tree walk this package does
+// not do.
+func (f *fakeSystem) ListOwned(dir string) ([]OwnedEntry, error) {
+	f.calls = append(f.calls, "ListOwned:"+dir)
+	self, ok := f.owners[dir]
+	if !ok {
+		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
+	}
+	if self.Kind != EntryDir {
+		return nil, fmt.Errorf("open %s: not a directory", dir)
+	}
+	var out []OwnedEntry
+	for path, e := range f.owners {
+		if path != dir && filepath.Dir(path) == dir {
+			out = append(out, e)
+		}
+	}
+	slices.SortFunc(out, func(a, b OwnedEntry) int { return strings.Compare(a.Path, b.Path) })
+	return out, nil
+}
+
+// Chown records the call AND really moves the entry in the ownership table, so a
+// test asserts the STATE the installer left behind rather than the sequence of
+// calls it made. The mode is carried across untouched — the contract the seam
+// states, and the one thing a caller could quietly get wrong.
+func (f *fakeSystem) Chown(path string, uid, gid int) error {
+	f.calls = append(f.calls, fmt.Sprintf("Chown:%s:%d:%d", path, uid, gid))
+	e, ok := f.owners[path]
+	if !ok {
+		return fmt.Errorf("lchown %s: %w", path, fs.ErrNotExist)
+	}
+	e.UID, e.GID = uid, gid
+	f.owners[path] = e
+	return nil
 }
 
 // putDrain makes the fake launchd keep label in the domain for reads
