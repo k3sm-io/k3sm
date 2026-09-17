@@ -35,7 +35,6 @@ import (
 	"syscall"
 	"time"
 
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -46,6 +45,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netserve"
 )
 
@@ -968,13 +968,9 @@ func restConfigHost(cfg *rest.Config) string {
 // a guest's two-address identity and this is the proxy that must learn the live
 // one.
 func startWorkerNetserve(ctx context.Context, opts agentOptions, res *bootstrap.JoinResult, mode hostnet.Mode, kubeconfigPath string, logger *slog.Logger) (*netserve.Server, error) {
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	_, cs, err := kubeclient.FromPath(kubeconfigPath)
 	if err != nil {
 		return nil, fmt.Errorf("load node kubeconfig for node-local datapath: %w", err)
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, fmt.Errorf("build client for node-local datapath: %w", err)
 	}
 	// The vm-capability question is asked HERE, before the datapath is built and
 	// before the VK node exists — through runtimed's own safe host probe, the same

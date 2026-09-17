@@ -31,11 +31,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
 // Cluster CIDRs whose lo0 /32 aliases the datapath teardown + pre-flight sweep
@@ -935,13 +934,9 @@ const defaultNamespaceBootstrapTimeout = 90 * time.Second
 // Both are polled with a typed client built from the instance's own kubeconfig.
 // Each is latched once seen, so a transient error on one never re-tests the other.
 func (m *Manager) awaitDefaultNamespaceBootstrap(ctx context.Context, kubeconfig string) error {
-	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	_, cs, err := kubeclient.FromPath(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client config from %s: %w", kubeconfig, err)
-	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("build clientset for %s: %w", kubeconfig, err)
 	}
 	return awaitBootstrapObjects(ctx, defaultNamespaceBootstrapTimeout, kubeconfig,
 		func(ctx context.Context) bool {
@@ -1029,13 +1024,9 @@ func (m *Manager) nodeRegistrationWait() func(ctx context.Context, kubeconfig st
 // instance's apiserver and reports Ready, polled with a typed client built from
 // the instance's own kubeconfig.
 func (m *Manager) awaitNodeRegistered(ctx context.Context, kubeconfig string) error {
-	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	_, cs, err := kubeclient.FromPath(kubeconfig)
 	if err != nil {
 		return fmt.Errorf("build client config from %s: %w", kubeconfig, err)
-	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return fmt.Errorf("build clientset for %s: %w", kubeconfig, err)
 	}
 	return awaitReadyNode(ctx, nodeRegistrationTimeout, kubeconfig,
 		func(ctx context.Context) (registered, ready int, err error) {

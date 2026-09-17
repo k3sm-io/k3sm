@@ -40,13 +40,13 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/darwin-net/pkg/netd"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netdsvc"
 )
 
@@ -269,13 +269,9 @@ func startServiceInformer(ctx context.Context, kubeconfig string) (corev1listers
 	if _, err := os.Stat(kubeconfig); err != nil {
 		return nil, fmt.Errorf("stat kubeconfig: %w", err)
 	}
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	_, cs, err := kubeclient.FromPath(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, fmt.Errorf("build client: %w", err)
 	}
 	return runServiceInformer(ctx, cs, serviceInformerSyncTimeout)
 }

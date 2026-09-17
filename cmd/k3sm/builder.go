@@ -25,10 +25,10 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"k3sm.io/k3sm/pkg/builder"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/kubeclient"
 )
 
 const builderUsage = `k3sm builder — manage the in-cluster buildkitd engine that powers RUN-capable builds
@@ -143,13 +143,9 @@ func newBuilderManager(opts builderOptions) (*builder.Manager, error) {
 	if !fileExists(kc) {
 		return nil, fmt.Errorf("kubeconfig %s not found — run `k3sm server` first (set --work-dir or K3SM_WORK_DIR if you used a non-default `k3sm server --work-dir`)", kc)
 	}
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kc)
+	restCfg, cs, err := kubeclient.FromPath(kc)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig %s: %w", kc, err)
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, fmt.Errorf("build kube client: %w", err)
 	}
 	return builderManagerFrom(restCfg, cs, opts), nil
 }
