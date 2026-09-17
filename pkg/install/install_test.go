@@ -1000,6 +1000,83 @@ func TestNetdPlistXML(t *testing.T) {
 	}
 }
 
+// TestAgentInstallRendersNetdWithTheNodeIdentity proves the netd plist's
+// --kubeconfig follows the node's ROLE, and that neither role's argv carries a
+// pod CIDR or a node IP.
+//
+// netd's Service informer is the privileged-port authorizer's only source of
+// truth (cmd/k3sm/netd.go buildServiceSet): a kubeconfig it can never load
+// leaves the authorizer deny-all for the daemon's whole life, so EVERY <1024
+// bind — the DNS VIP :53, the apiserver ClusterIP :443 — is denied. A worker
+// has no server work dir (the control plane's k3sm.kubeconfig is written on the
+// SERVER, and nothing on a worker ever creates it), so a role-blind plist
+// pointed a worker's netd at a file that does not exist; on a Mac that was once
+// a server the file DOES exist and is a stale credential, which is worse than
+// absent. The agent's node credential (AgentCredentialPath — the kubeconfig
+// `k3sm agent` writes on a successful join) is the only identity a worker has.
+//
+// The negative half is as load-bearing as the positive one. --node-pod-cidr is
+// not knowable at install time on a worker: the allocation is made by the join,
+// and netd learns it from the agent's ConfigureMesh RPC. A plist that re-stated
+// it would pin the pre-adoption default into launchd's job definition, so the
+// next netd restart would come back on the wrong /24 and drop every pod alias
+// and route. --node-ip re-arms the dormant node-address authorizer branch
+// (TestNetdPlistXML owns that reasoning).
+func TestAgentInstallRendersNetdWithTheNodeIdentity(t *testing.T) {
+	// A NON-default data root: every path below must be DERIVED from it, so a
+	// hard-coded default would fail here rather than pass by coincidence.
+	const dataRoot = "/opt/k3sm-b326"
+	serverWork := filepath.Join(dataRoot, "server")
+
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		// wantKubeconfig is the exact --kubeconfig value the rendered argv must
+		// carry; forbid, when non-empty, is a substring no argv element may hold.
+		wantKubeconfig string
+		forbid         string
+	}{
+		{
+			name:           "agent is handed its own node credential",
+			cfg:            Config{Role: RoleAgent, DataRoot: dataRoot},
+			wantKubeconfig: AgentCredentialPath(dataRoot),
+			forbid:         serverWork,
+		},
+		{
+			name:           "server keeps the control-plane kubeconfig",
+			cfg:            Config{Role: RoleServer, DataRoot: dataRoot},
+			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
+		},
+		{
+			name:           "the zero-value role is the server",
+			cfg:            Config{DataRoot: dataRoot},
+			wantKubeconfig: filepath.Join(serverWork, "k3sm.kubeconfig"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := parseProgramArguments(NetdPlist(tc.cfg))
+			if err != nil {
+				t.Fatalf("parse netd ProgramArguments: %v", err)
+			}
+			if got := flagValue(args, "kubeconfig"); got != tc.wantKubeconfig {
+				t.Errorf("netd --kubeconfig = %q, want %q (argv: %v)", got, tc.wantKubeconfig, args)
+			}
+			if tc.forbid != "" {
+				for _, a := range args {
+					if strings.Contains(a, tc.forbid) {
+						t.Errorf("netd argv element %q names the server work dir %q, which does not exist on a worker (argv: %v)", a, tc.forbid, args)
+					}
+				}
+			}
+			for _, flag := range []string{"--node-pod-cidr", "--node-ip"} {
+				if slices.Contains(args, flag) {
+					t.Errorf("netd argv must NOT carry %s (argv: %v)", flag, args)
+				}
+			}
+		})
+	}
+}
+
 // TestServerPlistXML proves the server plist runs as the _k3sm user (UserName
 // present), execs `k3sm server --runtime runtimed`, and is boot-surviving.
 func TestServerPlistXML(t *testing.T) {

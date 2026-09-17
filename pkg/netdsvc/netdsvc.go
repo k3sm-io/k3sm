@@ -88,6 +88,17 @@ type Options struct {
 	// MeshKeyDir is the root-only directory the MeshKeyResolver reads the node's
 	// wireguard private key from. Empty disables ConfigureMesh (a nil resolver,
 	// which fails fast — there is no embedded key).
+	//
+	// It is ALSO the home of the adopted-identity file (NodeIdentityFileName):
+	// netd writes the node pod CIDR it adopted there and re-reads it at start, so
+	// the identity the join handed over survives a restart the agent did not
+	// drive. The two uses share one directory deliberately — it is the only
+	// root-only (0700) directory the helper is given, and a root-written identity
+	// file needs exactly that posture: a path an unprivileged writer could reach
+	// would let it dictate the daemon's pod-alias policy boundary at the next
+	// start. Empty therefore disables persistence too (BuildConfig leaves
+	// netd.Config.IdentityPath empty), which is the same fail-quiet posture netd
+	// applies to an unreadable file.
 	MeshKeyDir string
 	// Logger is the structured logger threaded into the daemon; nil uses
 	// slog.Default via netd.NewServer.
@@ -97,8 +108,9 @@ type Options struct {
 // BuildConfig validates opts and assembles the netd.Config: it pins the node pod
 // /24 and the Service CIDR (so the proxy's VIP aliases are admitted), the service
 // uid (peer auth), the PortAuthorizer (privileged-port confirmation against the
-// Service set), and the MeshKeyResolver (root-only key path). The cluster
-// aggregate and NodePort range keep their darwin-net defaults.
+// Service set), the MeshKeyResolver (root-only key path) and the adopted-identity
+// file beside it (NodeIdentityPath). The cluster aggregate and NodePort range
+// keep their darwin-net defaults.
 func BuildConfig(opts Options) (netd.Config, error) {
 	if !opts.NodePodCIDR.IsValid() {
 		return netd.Config{}, fmt.Errorf("netdsvc: node pod CIDR is required and must be valid, got %q", opts.NodePodCIDR)
@@ -121,8 +133,29 @@ func BuildConfig(opts Options) (netd.Config, error) {
 	}
 	if opts.MeshKeyDir != "" {
 		cfg.MeshKeyResolver = MeshKeyResolver(opts.MeshKeyDir)
+		cfg.IdentityPath = NodeIdentityPath(opts.MeshKeyDir)
 	}
 	return cfg, nil
+}
+
+// NodeIdentityFileName is the leaf name of the file netd persists its ADOPTED
+// node pod CIDR to, inside the mesh key dir. It is named once here — rather than
+// spelled at the call site — because two processes agree on it across a restart:
+// the daemon that writes it after a ConfigureMesh adoption and the daemon that
+// reads it back at start are the same file path or they are nothing, and a
+// second spelling would silently degrade to "no persisted identity", which is
+// exactly the failure the file exists to prevent.
+const NodeIdentityFileName = "node-pod-cidr"
+
+// NodeIdentityPath returns the adopted-identity file inside meshKeyDir, or "" for
+// an empty dir (persistence off — there is no other root-only directory to put
+// it in, and inventing one here would put the node's policy boundary somewhere
+// the installer never made 0700).
+func NodeIdentityPath(meshKeyDir string) string {
+	if meshKeyDir == "" {
+		return ""
+	}
+	return filepath.Join(meshKeyDir, NodeIdentityFileName)
 }
 
 // ServiceRef identifies a Service by namespace and name. It is the
