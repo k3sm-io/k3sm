@@ -561,7 +561,9 @@ func runServer(args []string) (err error) {
 		return fmt.Errorf("start control plane: %w", err)
 	}
 	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		// executor.StopBound, not a literal: it is one named stage of the plist's
+		// ExitTimeOut, which pkg/install derives from this same symbol.
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executor.StopBound)
 		defer cancel()
 		if err := exec.Stop(shutCtx); err != nil {
 			logger.Error("control-plane shutdown", "err", err)

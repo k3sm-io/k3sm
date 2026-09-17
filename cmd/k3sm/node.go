@@ -834,11 +834,14 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// talk to, adopt or stop (runtimed pkg/runtime/close.go).
 	//
 	// ORDERING IS LOAD-BEARING, and it is why this defer is registered AFTER the
-	// control socket's: defers are LIFO, so this one runs FIRST. Close's vm sweep
-	// is bounded at 35s against launchd's 45s ExitTimeOut, so it must not spend any
-	// of that budget queued behind the socket's own shutdown grace — and a blown
-	// ExitTimeOut is answered with SIGKILL of the daemon, which strands exactly the
-	// helpers this stop exists to reap.
+	// control socket's: defers are LIFO, so this one runs FIRST. It is also a new
+	// STAGE of a fixed budget — every teardown a k3sm daemon runs happens serially
+	// inside the plist's single ExitTimeOut, which pkg/install now derives from
+	// this close's own bound plus the socket, the control-plane stop and the mesh
+	// teardown. A blown ExitTimeOut is answered with SIGKILL of the daemon, which
+	// strands exactly the helpers this stop exists to reap (and, on the server,
+	// orphans kine and the apiserver mid-stop), so this stop runs first and the
+	// budget that covers it is derived rather than guessed.
 	//
 	// The closure is idempotent, so this defer and awaitNodeExit's call below
 	// (which is what runs it on the two normal exit paths) cannot double-stop; the

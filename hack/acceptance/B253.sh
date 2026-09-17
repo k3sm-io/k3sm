@@ -27,10 +27,13 @@
 #   function's behaviour: the teardown is wired into startNode, its defer is
 #   registered AFTER the control socket's (LIFO runs it first, so the vm stop does
 #   not queue its 35s bound behind the socket's shutdown grace inside launchd's
-#   45s ExitTimeOut), the stop takes no context (threading the node's already
+#   single ExitTimeOut), the stop takes no context (threading the node's already
 #   cancelled context in would make the vm sweep return instantly having stopped
-#   nothing — the bug, reintroduced in a shape that looks like care), and the
-#   startup orphan reap that backstops it is still wired.
+#   nothing — the bug, reintroduced in a shape that looks like care), the startup
+#   orphan reap that backstops it is still wired, and — the rung no Go test can
+#   carry — the 37 seconds pkg/install BUDGETS for this stage still equal the
+#   bounds runtimed actually ships (its two constants are unexported, so the
+#   budget is a literal on the k3sm side and this is its drift alarm).
 #   RED BEFORE: on the unmodified tree stopEmbeddedRuntime and awaitNodeExit do
 #   not exist, so the Go leg fails to build and every structural pin fails.
 #
@@ -86,9 +89,9 @@ ladder "$w" "b253.1  startNode builds the embedded-runtime teardown, defers it, 
 
 # LIFO: the LATER defer runs FIRST, so the runtime's vm stop is registered AFTER
 # the control socket's teardown. Reversing these two lines silently gives the 35s
-# vm sweep whatever is left of launchd's ExitTimeOut after the socket's own
-# shutdown grace — and launchd answers a blown ExitTimeOut with SIGKILL, stranding
-# exactly the helpers the sweep exists to stop.
+# vm sweep whatever is left of the ExitTimeOut after the socket's own shutdown
+# grace — and launchd answers a blown ExitTimeOut with SIGKILL, stranding exactly
+# the helpers the sweep exists to stop.
 o=ok
 sock_line="$(grep -nE '^\s*defer stopControlSocket\(\)$' "$NODE_GO" | head -1 | cut -d: -f1)"
 rt_line="$(grep -nE '^\s*defer stopRuntime\(\)$' "$NODE_GO" | head -1 | cut -d: -f1)"
@@ -110,6 +113,43 @@ r=ok
 grep -qF 'if err := rt.ReapOrphanedPods(); err != nil {' "$PROVIDER_GO" || r=no
 ladder "$r" "b253.1  the startup pod reap is still wired into provider.NewRuntimed (the backstop for a helper that misses the bound)"
 
+# ---- b253.1 — the BUDGET, and the two copies that must not drift -----------
+# The node's close is now a named stage of the plist's ExitTimeOut, which
+# pkg/install derives (serverExitTimeOut / agentExitTimeOut). Two of the stage
+# bounds are runtimed's, and runtimed does not export them — so the k3sm side
+# carries a literal, and this is the only thing that notices when runtimed moves
+# it. Reading runtimed's source through `go list` rather than a relative path
+# keeps it correct in a lane, a module cache, or a sibling checkout.
+b=ok
+grep -qE '^\s*teardownRuntimedClose = 37$' "$K3SM_ROOT/pkg/install/install.go" || b=no
+grep -qF 'ExitTimeOut: serverExitTimeOut,' "$K3SM_ROOT/pkg/install/install.go" || b=no
+grep -qF 'ExitTimeOut:      agentExitTimeOut,' "$K3SM_ROOT/pkg/install/install.go" || b=no
+grep -qE '^\s*teardownControlPlane  = 30$' "$K3SM_ROOT/pkg/install/install.go" || b=no
+# The stage literals are bound to their owners by assertions, not by trust. This
+# one has an importable owner, so the binding lives in the Go test; the rung below
+# is the binding for runtimed's two, which are unexported.
+grep -qF 'int(executor.StopBound/time.Second)' "$K3SM_ROOT/pkg/install/exittimeout_test.go" || b=no
+ladder "$b" "b253.1  both node plists render a DERIVED ExitTimeOut and the control-plane stage is bound to executor.StopBound by a test"
+
+d=ok
+RUNTIMED_DIR="$(cd "$K3SM_ROOT" && go list -m -f '{{.Dir}}' k3sm.io/runtimed 2>/dev/null || true)"
+if [ -z "$RUNTIMED_DIR" ] || [ ! -f "$RUNTIMED_DIR/pkg/runtime/close.go" ]; then
+	d=no
+	echo "    could not locate runtimed's pkg/runtime/close.go (go list -m said '${RUNTIMED_DIR:-<nothing>}')"
+else
+	vm_bound="$(grep -oE 'vmShutdownBound = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go" | grep -oE '[0-9]+' || true)"
+	close_grace="$(grep -oE 'defaultCloseGrace = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go" | grep -oE '[0-9]+' || true)"
+	budget="$(grep -oE 'teardownRuntimedClose = [0-9]+' "$K3SM_ROOT/pkg/install/install.go" | grep -oE '[0-9]+' || true)"
+	if [ -z "$vm_bound" ] || [ -z "$close_grace" ] || [ -z "$budget" ]; then
+		d=no
+		echo "    could not read one of the bounds (vmShutdownBound='${vm_bound:-}' defaultCloseGrace='${close_grace:-}' budget='${budget:-}')"
+	elif [ "$((vm_bound + close_grace))" -ne "$budget" ]; then
+		d=no
+		echo "    runtimed close costs $((vm_bound + close_grace))s (${vm_bound}+${close_grace}) but pkg/install budgets ${budget}s"
+	fi
+fi
+ladder "$d" "b253.1  pkg/install's runtimed-close budget still equals runtimed's own vmShutdownBound + defaultCloseGrace"
+
 # ---- Go leg runner ---------------------------------------------------------
 # GOARCH is pinned to arm64: a Mac whose Go toolchain is itself x86_64-under-
 # Rosetta would otherwise build the wrong arch for a darwin/arm64-only product.
@@ -118,7 +158,7 @@ ladder "$r" "b253.1  the startup pod reap is still wired into provider.NewRuntim
 # Asserts the leg actually RAN: `go test -run <filter>` EXITS 0 on a zero-match
 # filter, so a renamed test would read PASS forever.
 run_test() {
-	local id="$1" min="$2" name="$3" pkg="./cmd/k3sm/" out rc=0 ran
+	local id="$1" min="$2" name="$3" pkg="${4:-./cmd/k3sm/}" out rc=0 ran
 	out="$(cd "$K3SM_ROOT" && env GOARCH=arm64 CGO_ENABLED=1 go test -count=1 -v -run "^${name}\$" "$pkg" 2>&1)" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		printf '%s\n' "$out" | tail -30
@@ -145,6 +185,9 @@ run_test() {
 run_test "b253.2" 2 TestNodeExitClosesTheEmbeddedRuntime
 run_test "b253.3" 0 TestNodeExitReportsAFailedRuntimeClose
 run_test "b253.4" 0 TestStopEmbeddedRuntimeWithoutARuntimeIsANoop
+# The budget the stage above has to fit inside: derived, not chosen, and asserted
+# to cover the sum of every serial stage.
+run_test "b253.5" 2 TestExitTimeOutCoversTheSerialTeardown ./pkg/install/
 
 # ---- b253.L — the lab tier --------------------------------------------------
 if [ "${K3SM_LAB:-}" != 1 ]; then
@@ -161,7 +204,13 @@ else
 	# The plist's ExitTimeOut is the budget the daemon has to stop its helpers;
 	# the assertion below is given that budget plus a small margin for launchd
 	# itself, and no more — a helper that outlives it is stranded.
-	EXIT_TIMEOUT="$(plutil -extract ExitTimeOut raw -o - "$SERVER_PLIST" 2>/dev/null || echo 45)"
+	# Read from the INSTALLED plist, never from a constant in this checkout: the
+	# rig's daemon is stopping on the budget launchd actually gave it. The fallback
+	# is this tree's derived server value, used only when plutil cannot read it.
+	EXIT_TIMEOUT="$(plutil -extract ExitTimeOut raw -o - "$SERVER_PLIST" 2>/dev/null || true)"
+	case "$EXIT_TIMEOUT" in
+		''|*[!0-9]*) EXIT_TIMEOUT=90 ;;  # this tree's derived serverExitTimeOut, pinned by b253.1
+	esac
 	DEADLINE=$((EXIT_TIMEOUT + 10))
 
 	loaded() { launchctl print "system/$1" >/dev/null 2>&1; }

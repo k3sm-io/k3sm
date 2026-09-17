@@ -79,8 +79,9 @@ var errRunLoop = errors.New("virtual kubelet run loop failed")
 // The cases are the two ways startNode's wait ends. Each asserts the close on
 // awaitNodeExit's RETURN — not after the teardown stack below it — so a stop that
 // only ever happened because the test itself deferred it would read red. The
-// ordering claim (the vm stop must not queue its 35-second bound behind the
-// socket's shutdown grace inside launchd's 45-second ExitTimeOut) follows from
+// ordering claim (the vm stop must not queue its own bound behind the socket's
+// shutdown grace inside the plist's single ExitTimeOut, which pkg/install derives
+// from these stages — see TestExitTimeOutCoversTheSerialTeardown) follows from
 // that: the wait closes the runtime before it returns, and the control socket
 // comes down later, when startNode returns to its defers. That the defers in
 // production are REGISTERED in the order LIFO needs is the one fact this test

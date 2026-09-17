@@ -20,7 +20,7 @@
   <key>KeepAlive</key>
   <true/>
   <key>ExitTimeOut</key>
-  <integer>45</integer>
+  <integer>90</integer>
   <key>SoftResourceLimits</key>
   <dict>
       <key>NumberOfFiles</key>

@@ -72,6 +72,24 @@ const healthTimeout = 90 * time.Second
 // escalating to SIGKILL.
 const drainGrace = 5 * time.Second
 
+// StopBound is the budget a daemon gives the whole control-plane teardown.
+//
+// The components are stopped SERIALLY in shutdown order, each costing at most
+// drainGrace before the SIGKILL escalation, so four components spend 4×drainGrace
+// = 20s in the bounded part; the rest covers the post-SIGKILL reap and the
+// reapers.Wait that follows it.
+//
+// It is exported because it is NOT only this package's business: it is one stage
+// of the single ExitTimeOut launchd gives the daemon, and pkg/install derives that
+// number from this symbol rather than from a literal that would drift the moment
+// drainGrace or the component count changed.
+//
+// It is a BUDGET, not an enforced deadline — Stop does not select on its context,
+// and the wait after a SIGKILL is unbounded. A component whose process refuses to
+// die overruns this, which is exactly why the ExitTimeOut derived from it carries
+// headroom rather than being the sum to the second.
+const StopBound = 30 * time.Second
+
 // exitLogTailLines is how many trailing log lines an early-exit error carries —
 // enough to name the fatal apiserver/kine flag or config error without dumping
 // the whole (token-bearing) log into the returned error.
