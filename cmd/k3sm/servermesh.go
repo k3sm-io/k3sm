@@ -39,7 +39,11 @@ import (
 // key. It is DISTINCT from the agent's meshKeyRef so a server and a joined
 // worker on one Mac (the single-host acceptance posture) never overwrite each
 // other's identity in install.MeshKeyDir.
-const serverMeshKeyRef = "server.key"
+//
+// Like the agent's, it is pkg/install's constant: the privileged install
+// provisions both copies under this name, and cmd must not spell it a second
+// time.
+const serverMeshKeyRef = install.MeshKeyRefServer
 
 // serverMeshListenPort is the UDP port the control-plane node's wireguard
 // listens on. It is the SAME default `k3sm agent --mesh-port` carries, and is
@@ -171,13 +175,25 @@ type meshBringUp struct {
 }
 
 // provisionHelperKey writes the private key to the root-only path the netd
-// MeshKeyResolver reads, best-effort: in the pure _k3sm posture that directory
-// is privileged, so a privileged install/netd step owns provisioning and this
-// process passes only the ref.
+// MeshKeyResolver reads — best-effort, and no longer the mechanism anything
+// depends on.
+//
+// `k3sm install` provisions that copy as root (pkg/install's provisionMeshKey),
+// from the very work-dir key this process just loaded, so on an installed node
+// the file is already there with these exact bytes. This write survives for the
+// one case install does not cover: a node run out of a shell, where the process
+// may itself be privileged enough for it to succeed.
+//
+// It cannot clobber a good copy with a bad one, because there is no other key it
+// could write: the bytes are this node's persisted identity, which is what
+// install copied. And it deliberately does not READ the existing file first — in
+// the _k3sm posture it cannot (the directory is root-only), so a read would add a
+// permission failure on the path that is already handled by the write failing.
 func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 	path := filepath.Join(install.MeshKeyDir, in.keyRef)
 	if err := os.WriteFile(path, []byte(in.privateKeyB64), 0o600); err != nil {
-		logger.Warn("could not provision mesh private key to the root-only path (provision it via the privileged install step)", "path", path, "err", err)
+		logger.Warn("could not write the mesh private key to the root-only path; `k3sm install` provisions it as root, so this matters only on a node installed by other means",
+			"path", path, "err", err)
 	}
 }
 

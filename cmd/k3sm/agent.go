@@ -46,14 +46,20 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/netserve"
 )
 
-// meshKeyRef is the conventional file name (under the root-only mesh key dir)
-// the netd helper resolves to this node's wireguard private key in helper mode;
-// the key itself never crosses the socket.
-const meshKeyRef = "node.key"
+// meshKeyRef is the file name (under both this node's work dir and the root-only
+// mesh key dir) the netd helper resolves to this node's wireguard private key in
+// helper mode; the key itself never crosses the socket.
+//
+// It is pkg/install's constant rather than a literal here because the privileged
+// install provisions BOTH copies under that name — the work-dir one this process
+// loads, and the root-only one netd reads — so a second spelling in cmd would be
+// a daemon naming a key nothing provisioned.
+const meshKeyRef = install.MeshKeyRefAgent
 
 // agentOptions configures `k3sm agent` — joining this Mac to an existing cluster as a
 // WORKER node.

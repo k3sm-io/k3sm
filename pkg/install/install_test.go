@@ -548,6 +548,25 @@ func (f *fakeSystem) WriteServiceUserFile(path string, contents []byte, uid uint
 	return nil
 }
 
+// EnsureMeshKeyDir records the directory AND the mode the installer asked for.
+// It performs no mkdir: the real one is root's, and the only thing a unit test
+// can meaningfully assert about it is the policy the caller applied.
+func (f *fakeSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("EnsureMeshKeyDir:%s:%#o", dir, mode))
+	return nil
+}
+
+// WriteRootOnlyFile records the path and the MODE — the two things that decide
+// whether the root-only copy of a key stays root-only — and lands the bytes in
+// the fake root filesystem, so a later read (this install's idempotence check,
+// or the next install's) sees exactly what was written. No uid is recorded
+// because the seam takes none: root:wheel is the whole contract.
+func (f *fakeSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("WriteRootOnlyFile:%s:%#o", path, mode))
+	f.putFile(path, contents)
+	return nil
+}
+
 // putServerArgsRecord seeds a server-arguments record an EARLIER install left
 // behind, in the bytes that install would have written.
 func putServerArgsRecord(t *testing.T, f *fakeSystem, path string, args ...string) {
@@ -698,6 +717,17 @@ func TestInstallOrchestration(t *testing.T) {
 		// cannot precede EnsureServiceUser, and it precedes the plist that names
 		// it: the daemon must never be pointed at a file nobody has written.
 		"WriteServiceUserFile:/var/lib/k3sm/server/token:0600:0700:271",
+		// This node's wireguard identity, provisioned by the party that can: the
+		// root-only key dir carved inside the (service-user-owned) run dir, the
+		// role's work-dir key read to see whether the node already has one — it
+		// does not, on a first install — so one is minted and written to BOTH the
+		// work dir (service-user 0600, where the daemon loads it) and the key dir
+		// (root 0600, where netd resolves the ref). Before any daemon starts.
+		"EnsureMeshKeyDir:/var/lib/k3sm/run/keys:0700",
+		"ReadFile:/var/lib/k3sm/server/server.key",
+		"WriteServiceUserFile:/var/lib/k3sm/server/server.key:0600:0700:271",
+		"ReadFile:/var/lib/k3sm/run/keys/server.key",
+		"WriteRootOnlyFile:/var/lib/k3sm/run/keys/server.key:0600",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		// The launcher link goes down immediately after the binary it points at,
 		// and long before any daemon work: copying into /Library/k3sm never put

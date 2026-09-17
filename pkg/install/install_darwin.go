@@ -556,6 +556,22 @@ func (darwinSystem) VerifyVirtualizationEntitlement(path string) error {
 // existing directory, so a staging mount point left behind by an interrupted
 // migration is repaired rather than reused at whatever mode it was found with.
 func (darwinSystem) EnsureRootDir(dir string, mode fs.FileMode) error {
+	return ensureRootOwnedDir(dir, mode)
+}
+
+// EnsureMeshKeyDir creates (or repairs) the root-only mesh key dir at mode,
+// owned by root:wheel. See the System interface for why it is its own method
+// rather than a call on the run dir's, and provisionMeshKey for what the
+// ownership does and does not fence off.
+func (darwinSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
+	return ensureRootOwnedDir(dir, mode)
+}
+
+// ensureRootOwnedDir creates dir and re-applies owner root:wheel and mode on
+// EVERY call — the root-owned counterpart of ensureServiceOwnedDir, and the one
+// implementation both root-directory seams above are spelled in, so the two
+// cannot drift into different answers to "what does root-owned mean here".
+func ensureRootOwnedDir(dir string, mode fs.FileMode) error {
 	if err := os.MkdirAll(dir, mode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
@@ -677,6 +693,51 @@ func writeServiceUserFile(path string, contents []byte, uid, gid int, mode, dirM
 	if err := os.Chmod(dir, dirMode); err != nil {
 		return fmt.Errorf("chmod %s %#o: %w", dir, dirMode, err)
 	}
+	tmp, err := os.CreateTemp(dir, ".k3sm-*")
+	if err != nil {
+		return fmt.Errorf("create a temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
+	if _, err := tmp.Write(contents); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+	if err := os.Chown(tmpName, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", tmpName, uid, gid, err)
+	}
+	if err := os.Chmod(tmpName, mode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", tmpName, mode, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpName, path, err)
+	}
+	return nil
+}
+
+// WriteRootOnlyFile writes contents at path root:wheel at mode. The parent
+// directory is NOT created or re-owned here — the caller ensured it through its
+// own seam, and a write that also decided a directory's terms could quietly
+// loosen what that seam decided.
+//
+// The write is temp-and-rename inside the parent, with owner and mode applied to
+// the temp file BEFORE the rename, so no reader ever observes the file at wider
+// terms than the ones asked for. That matters for the only file written this way:
+// a wireguard private key.
+func (darwinSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error {
+	return writeRootOnlyFile(path, contents, 0, 0, mode)
+}
+
+// writeRootOnlyFile is the method above with the owner taken explicitly, the
+// same split writeServiceUserFile and writeLaunchDaemon carry and for the same
+// reason: chowning a file to root needs privilege these tests never take, while
+// the MODE, the atomicity and the overwrite of an existing file are exactly what
+// has to be exercised against a real filesystem.
+func writeRootOnlyFile(path string, contents []byte, uid, gid int, mode fs.FileMode) error {
+	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".k3sm-*")
 	if err != nil {
 		return fmt.Errorf("create a temp file in %s: %w", dir, err)

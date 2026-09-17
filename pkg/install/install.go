@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
@@ -148,6 +149,37 @@ const (
 	// service user — see EnsureRunDir for what that ownership does and does not
 	// fence off.
 	MeshKeyDir = DefaultRunDir + "/keys"
+	// MeshKeyRefServer and MeshKeyRefAgent are the BARE file names each node role
+	// stores its wireguard private key under — both in that role's work dir (the
+	// copy the unprivileged daemon loads) and in MeshKeyDir (the root-only copy
+	// the netd MeshKeyResolver resolves in helper mode).
+	//
+	// They live here, exported, because three parties must agree on them and only
+	// one of the three can see the other two: `k3sm install` provisions both
+	// copies, `k3sm server`/`k3sm agent` load the work-dir copy and pass the ref
+	// over the netd socket, and netd resolves that ref inside MeshKeyDir. A
+	// second spelling in cmd would be a daemon naming a key nothing provisioned —
+	// which is the state this pair replaced, and which fails at mesh bring-up
+	// rather than at install.
+	//
+	// The two are DISTINCT so a control plane and a joined worker on one Mac (the
+	// single-host acceptance posture) never overwrite each other's identity in
+	// the one key dir. Each is a bare file name: the resolver rejects anything
+	// with a separator in it.
+	MeshKeyRefServer = "server.key"
+	MeshKeyRefAgent  = "node.key"
+	// MeshKeyDirMode and MeshKeyFileMode are the ownership POLICY for the
+	// root-only key dir and the key inside it: root:wheel, 0700 on the directory
+	// and 0600 on the file, and never the service user's.
+	//
+	// That is the whole point of the helper copy. The unprivileged daemon already
+	// holds the same bytes in its own work dir, so a helper copy readable by
+	// _k3sm would buy nothing; what it buys root-owned is that netd — which runs
+	// as root and is the only party that has to open it — reads a key no other
+	// account on the Mac can. See provisionMeshKey for the residual this does NOT
+	// cover.
+	MeshKeyDirMode  fs.FileMode = 0o700
+	MeshKeyFileMode fs.FileMode = 0o600
 	// VMRunDir is the per-pod guest-agent socket directory runtimed binds under,
 	// as the SERVICE USER. It is pre-created by the installer for the same reason
 	// the run dir itself is: only root can hand the service user a directory
@@ -467,6 +499,22 @@ type System interface {
 	// directory left root-owned by an earlier build is repaired rather than
 	// silently keeping every vm pod unbootable. See VMRunDir.
 	EnsureVMRunDir(dir string, uid uint32) error
+	// EnsureMeshKeyDir creates (or repairs) the root-only mesh key directory at
+	// mode, owned by root:wheel — MeshKeyDir, which netd's MeshKeyResolver reads
+	// this node's wireguard private key out of in helper mode.
+	//
+	// It is the ONE directory under the run dir that is NOT handed to the service
+	// user, which is why it has its own method rather than riding EnsureRunDir's:
+	// the two answers must not be able to drift into one. Its parent is
+	// service-user-owned (EnsureRunDir), so a root-owned child inside it is
+	// exactly what the mode has to say, and re-applying owner and mode on every
+	// install repairs a directory an earlier build — or the daemon's own
+	// best-effort runtime write — left at looser terms.
+	//
+	// The mode is a PARAMETER for WriteServiceUserFile's reason: the policy a
+	// caller applied is then visible at the seam, and a unit test can assert it
+	// without a real filesystem or privilege.
+	EnsureMeshKeyDir(dir string, mode fs.FileMode) error
 	// EnsureRootDir creates dir root-owned at mode (idempotent, re-applying the
 	// mode on an existing directory). It is the seam the data-volume migration
 	// carves its staging mount point with: unlike the Ensure*Dir methods above
@@ -534,6 +582,20 @@ type System interface {
 	// inside the implementation, so the policy a caller applied is visible at
 	// the seam and a test can assert it without touching a real filesystem.
 	WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error
+	// WriteRootOnlyFile writes contents at path root:wheel at mode, atomically,
+	// without creating or re-owning path's parent (the caller ensures that
+	// directory through its own seam, so one write cannot silently loosen a
+	// directory another step decided).
+	//
+	// It is WriteServiceUserFile's opposite number and exists for exactly one
+	// file today: the root-only copy of this node's wireguard private key in
+	// MeshKeyDir. The service-user seam cannot be reused for it, because handing
+	// that copy to _k3sm would erase the only difference between the two copies —
+	// see MeshKeyDirMode.
+	//
+	// The mode is a PARAMETER, as on every other write seam here, so the policy
+	// is visible at the call site and assertable without privilege.
+	WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error
 	// FileMode reports the permission bits of the file at path, with ReadFile's
 	// missing-file contract (an error satisfying errors.Is(err, fs.ErrNotExist)).
 	// The installer needs it for exactly one judgement: whether the operator's
@@ -997,6 +1059,119 @@ func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMo
 	return nil
 }
 
+// meshKeyRef is the bare file name THIS role stores its wireguard private key
+// under, in both copies. It is an accessor rather than a branch at each use so
+// no code path can provision one role's identity under the other's name.
+func (c Config) meshKeyRef() string {
+	if c.Role == RoleAgent {
+		return MeshKeyRefAgent
+	}
+	return MeshKeyRefServer
+}
+
+// meshKeyWorkPath is the role's WORK-DIR copy of that key: the file `k3sm
+// server`/`k3sm agent` loads (or, on a node this installer never reached,
+// mints) as the unprivileged service user, inside the same state tree that
+// role's token is staged in.
+func (c Config) meshKeyWorkPath() string {
+	if c.Role == RoleAgent {
+		return filepath.Join(c.DataRoot, agentWorkSubdir, MeshKeyRefAgent)
+	}
+	return filepath.Join(c.serverWorkDir(), MeshKeyRefServer)
+}
+
+// meshKeyHelperPath is the ROOT-ONLY copy of that key, inside MeshKeyDir.
+//
+// The directory is the MeshKeyDir constant rather than a derivation from this
+// Config's data root, deliberately and for the same reason VMRunDir is: the
+// netd plist this very install renders puts that constant on the helper's
+// `--mesh-key-dir` argv, so provisioning anywhere else would write a key at a
+// path netd is not reading.
+func (c Config) meshKeyHelperPath() string { return filepath.Join(MeshKeyDir, c.meshKeyRef()) }
+
+// provisionMeshKey makes this node's wireguard identity exist, in both places
+// it has to exist, before either daemon starts — for whichever role is being
+// installed.
+//
+// The WORK-DIR copy is the source of truth, because the node daemon is what
+// owns the identity: it loads that file on every start and derives the public
+// key its MeshPeer advertises from it, so a key minted anywhere else would have
+// to agree with it byte for byte or rotate the node's identity. So this step
+// reads it and copies exactly its bytes into MeshKeyDir; only when it does not
+// exist (a first install, before the daemon has ever run) is a key minted here,
+// and then BOTH copies are written from the same bytes — the work-dir one
+// through the service-user seam, so the daemon finds it and never mints a
+// second, different key of its own.
+//
+// It exists because the daemon's own best-effort write into MeshKeyDir cannot
+// work in the posture k3sm actually ships: that directory is root-owned, the
+// daemon runs as _k3sm, and until this step existed a fresh install did not
+// create it at all — so a worker in helper mode asked netd for a key ref that
+// resolved to nothing, and the mesh never came up. Provisioning is the
+// privileged installer's job because only the privileged installer can do it.
+//
+// A re-run is a no-op when the two copies already agree, and a REPAIR when they
+// do not: a helper copy whose bytes differ is overwritten from the work dir
+// (logged at Info), because a stale copy is a key netd would hand wireguard
+// while the node advertises the public half of a different one.
+//
+// What this does NOT buy, stated plainly: MeshKeyDir's PARENT is the run dir,
+// which is service-user-owned by necessity (EnsureRunDir), so _k3sm can rename,
+// replace or unlink the key dir and anything beneath it. Root ownership here
+// protects the key's CONFIDENTIALITY — no other account on the Mac can read the
+// bytes — and not its integrity against the one account that already drives
+// netd over its socket. Per-uid isolation of that account is the vm
+// RuntimeClass's job, not this directory's.
+func provisionMeshKey(sys System, cfg Config, uid uint32) error {
+	if err := sys.EnsureMeshKeyDir(MeshKeyDir, MeshKeyDirMode); err != nil {
+		return fmt.Errorf("install: ensure the root-only mesh key dir %s: %w", MeshKeyDir, err)
+	}
+	workPath := cfg.meshKeyWorkPath()
+	key, err := sys.ReadFile(workPath)
+	switch {
+	case err == nil:
+		// The node already has an identity. Its bytes are what get copied — never
+		// re-derived, never re-minted.
+	case errors.Is(err, fs.ErrNotExist):
+		priv, pub, gerr := bootstrap.GenerateWireguardKey()
+		if gerr != nil {
+			return fmt.Errorf("install: mint this node's mesh key: %w", gerr)
+		}
+		key = []byte(priv)
+		// The work dir IS the directory this role's token is staged in, so its
+		// mode is read from that decision rather than restated under a third name.
+		workDirMode := ServerTokenDirMode
+		if cfg.Role == RoleAgent {
+			workDirMode = AgentTokenDirMode
+		}
+		if werr := sys.WriteServiceUserFile(workPath, key, uid, MeshKeyFileMode, workDirMode); werr != nil {
+			return fmt.Errorf("install: write this node's mesh key at %s: %w", workPath, werr)
+		}
+		// The PUBLIC half is logged and the private half never is: the public key
+		// is what every peer programs into its wireguard device, so having it in
+		// the install log is what makes a mesh that did not come up diagnosable.
+		cfg.Logger.Info("minted this node's wireguard identity", "path", workPath, "keyRef", cfg.meshKeyRef(), "publicKey", pub)
+	default:
+		return fmt.Errorf("install: read this node's mesh key %s: %w", workPath, err)
+	}
+	helperPath := cfg.meshKeyHelperPath()
+	existing, rerr := sys.ReadFile(helperPath)
+	switch {
+	case rerr == nil && bytes.Equal(existing, key):
+		return nil
+	case rerr == nil:
+		cfg.Logger.Info("the root-only mesh key did not match this node's identity; re-provisioning it from the work dir", "path", helperPath)
+	case !errors.Is(rerr, fs.ErrNotExist):
+		return fmt.Errorf("install: read the root-only mesh key %s: %w", helperPath, rerr)
+	}
+	if err := sys.WriteRootOnlyFile(helperPath, key, MeshKeyFileMode); err != nil {
+		return fmt.Errorf("install: provision the root-only mesh key at %s: %w", helperPath, err)
+	}
+	cfg.Logger.Info("provisioned this node's mesh key for the netd helper (root-only; the daemon passes netd the ref, never the key)",
+		"path", helperPath, "keyRef", cfg.meshKeyRef())
+	return nil
+}
+
 // argsRecordPath is the arguments record THIS role reads and writes: the
 // server record on a control plane, the agent record on a worker. It is an
 // accessor rather than a branch at each use so no code path can pick up the
@@ -1253,6 +1428,29 @@ func artifactManifest(cfg Config) []artifact {
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
 	}
+	// This node's wireguard identity: the role's work-dir copy, the root-only
+	// key dir, and the copy inside it that netd's MeshKeyResolver reads. All
+	// three are PRESERVED, which is the disposition of everything else under the
+	// data root that is state rather than a credential in transit:
+	//
+	//   - the work-dir key IS the node's mesh identity. Removing it would rotate
+	//     the public key every peer has in its AllowedIPs on the next install,
+	//     which is the failure loadOrCreateMeshKey exists to prevent, and it is
+	//     already covered by DataRoot's own preserve entry ("kine state.db + mesh
+	//     keys").
+	//   - the helper copy and its directory sit under the run dir, so they follow
+	//     the run dir's disposition — preserved with DataRoot. Removing just this
+	//     copy would buy nothing while the work-dir copy of the SAME bytes stays,
+	//     and a reinstall re-provisions it from there regardless.
+	//
+	// Neither path's existence is asserted: a data root an older build installed
+	// has no key until the install that provisions one, and a node that has never
+	// run has no work-dir copy either.
+	items = append(items,
+		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyWorkPath(), assertExists: false},
+		artifact{kind: kindDir, disp: dispPreserve, path: MeshKeyDir, assertExists: false},
+		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyHelperPath(), assertExists: false},
+	)
 	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
 	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is
 	// ever in a manifest — a Mac that carried both would register two nodes out
@@ -1449,6 +1647,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 			return err
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+	}
+
+	// 1g. This node's wireguard identity, in both copies, for BOTH roles — see
+	//     provisionMeshKey. It sits with the token stagings because it is the
+	//     same kind of step (root hands the unprivileged daemon a credential it
+	//     could not place for itself), and after EnsureRunDir at 1c because the
+	//     root-only key dir is carved inside the run dir.
+	if err := provisionMeshKey(sys, cfg, uid); err != nil {
+		return err
 	}
 
 	// 2. Copy the binary to the exact path the plists exec (installedBinary()),

@@ -38,8 +38,15 @@ import (
 // ref is the BARE file name — the same token the netd MeshKeyResolver resolves
 // inside the root-only key dir in helper mode, so a node names its identity once
 // and both the unprivileged work-dir copy and the privileged provisioned copy
-// agree. Both node roles call this: the control-plane node via
-// loadOrCreateServerMeshKey, and a joined worker with meshKeyRef.
+// agree. It comes from pkg/install (MeshKeyRefServer / MeshKeyRefAgent), which is
+// also what `k3sm install` provisions both copies under. Both node roles call
+// this: the control-plane node via loadOrCreateServerMeshKey, and a joined worker
+// with meshKeyRef.
+//
+// On an installed node the file this reads was written by the root installer,
+// from the same bytes it put in the root-only key dir — so the mint below is the
+// first-run path for a node started by other means, and the reload path is the
+// one an installed daemon takes on every start.
 //
 // An unreadable or unusable key file is an ERROR, never a re-mint: falling back to
 // a fresh key would rotate the identity for exactly the reason this function

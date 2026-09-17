@@ -176,7 +176,15 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
+		// No TOKEN is staged. The mesh key written through the same seam is not a
+		// token and is provisioned on every install by design (provisionMeshKey),
+		// so it is named here rather than swept up by a prefix match that would
+		// otherwise make this assertion about the wrong file.
+		meshKey := cfg.withDefaults().meshKeyWorkPath()
 		for _, c := range f.calls {
+			if strings.HasPrefix(c, "WriteServiceUserFile:"+meshKey+":") {
+				continue
+			}
 			if strings.HasPrefix(c, "WriteServiceUserFile:") {
 				t.Errorf("an install with no --token-file wrote %q", c)
 			}
