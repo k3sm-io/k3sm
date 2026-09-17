@@ -158,6 +158,18 @@ var tokenFlags = regexp.MustCompile(`(--(?:token|agent-token|server-token|server
 // reaches a log line has already escaped the argv it came from.
 var tokenLiterals = regexp.MustCompile(`(?:k3sm-[A-Za-z0-9._~+/=-]{12,}|K10[0-9a-fA-F]{16,}(?:::\S+)?)`)
 
+// urlCredentials matches the userinfo half of a URL that carries a password:
+// scheme://user:secret@host. It is the shape a datastore DSN has
+// (`--datastore-endpoint postgres://user:password@host/db`), and a server that
+// was started with one echoes it into its own log and carries it on the argv the
+// server-args row reports.
+//
+// Only the PASSWORD is replaced. The user name and the host stay, because a line
+// that no longer says which endpoint was configured has lost the thing the
+// operator was reading it for. The pattern mirrors pkg/install's
+// redactServerArgs, which masks the same shape on the install side.
+var urlCredentials = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+):[^\s@/]*@`)
+
 // redacted is what replaces a matched secret. It is a fixed word, never a
 // prefix-preserving mask: showing the first characters of a token is showing
 // part of a token.
@@ -171,6 +183,7 @@ const redacted = "<redacted>"
 // with, and that log tail IS quoted into the row.
 func Redact(s string) string {
 	s = tokenFlags.ReplaceAllString(s, "$1 "+redacted)
+	s = urlCredentials.ReplaceAllString(s, "$1:***@")
 	return tokenLiterals.ReplaceAllString(s, redacted)
 }
 
