@@ -728,6 +728,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"ServicePID:io.k3sm.netd",
 		"ServicePID:io.k3sm.server",
 		"PathExists:/var/lib/k3sm/run/netd.sock",
+		// ...and the server's crash-loop record read, because a daemon parked by
+		// its breaker reports a healthy pid while serving nothing.
+		"ReadFile:/var/lib/k3sm/server/crashloop.json",
 		"WriteUserKubeconfig:alice",
 	}
 	if len(f.calls) != len(want) {

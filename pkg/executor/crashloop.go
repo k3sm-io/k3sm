@@ -111,6 +111,19 @@ type CrashRecord struct {
 // CrashLoopPath is the record's path for a control-plane work dir.
 func CrashLoopPath(workDir string) string { return filepath.Join(workDir, crashLoopFile) }
 
+// ParseCrashRecord decodes a record from its on-disk bytes. It is exported for
+// the readers that reach the file through a filesystem seam of their own — the
+// installer's root-privileged System.ReadFile, which is how `k3sm install`
+// checks that the server it just restarted is not parked — so those readers
+// share this decoder instead of re-deriving the shape.
+func ParseCrashRecord(b []byte) (CrashRecord, error) {
+	var r CrashRecord
+	if err := json.Unmarshal(b, &r); err != nil {
+		return CrashRecord{}, err
+	}
+	return r, nil
+}
+
 // ReadCrashRecord loads the record at path. An absent file is an empty record,
 // not an error; an unreadable or malformed one is returned as an error so a
 // caller can decide (the daemon treats a malformed record as empty and logs it,
@@ -125,7 +138,8 @@ func ReadCrashRecord(path string) (CrashRecord, error) {
 	if err != nil {
 		return r, err
 	}
-	if err := json.Unmarshal(b, &r); err != nil {
+	r, err = ParseCrashRecord(b)
+	if err != nil {
 		return CrashRecord{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return r, nil

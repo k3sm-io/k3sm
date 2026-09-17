@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // transientBootstrapErr is what the darwin System returns when launchd rejects a
@@ -194,7 +195,7 @@ func TestInstallReportsWhichDaemonIsDown(t *testing.T) {
 		f := &fakeSystem{}
 		f.putLoaded(NetdLabel) // the server never came up
 		cfg := installCfg().withDefaults()
-		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+		err := verifyDaemons(context.Background(), f, cfg, artifactManifest(cfg), time.Now())
 		if err == nil {
 			t.Fatal("verifyDaemons must fail when a daemon is down")
 		}
