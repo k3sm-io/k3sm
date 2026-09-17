@@ -183,7 +183,7 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				pod := crashPod("raw-"+strings.ToLower(string(tc.policy)), tc.policy)
-				st := toPodStatus(pod, crashStatus(pod, 1, 0), "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+				st := toPodStatus(pod, crashStatus(pod, 1, 0), "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 				if st.Phase != tc.want {
 					t.Errorf("phase = %s, want %s", st.Phase, tc.want)
 				}
@@ -201,7 +201,7 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 					rtRunning("c1"),
 				},
 			}
-			st := toPodStatus(pod, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+			st := toPodStatus(pod, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 			if st.Phase != corev1.PodRunning {
 				t.Errorf("phase = %s, want Running (upstream never reports Failed while a container runs)", st.Phase)
 			}
@@ -512,7 +512,7 @@ func TestRestartOnExitCrashLoopSurface(t *testing.T) {
 					Phase:                 runtimev1.PodPhase_POD_PHASE_PENDING,
 					InitContainerStatuses: tc.initCS,
 				}
-				st := toPodStatus(tc.pod, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+				st := toPodStatus(tc.pod, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 				c := findPodCondition(st.Conditions, corev1.PodInitialized)
 				if c == nil {
 					t.Fatal("no PodInitialized condition")

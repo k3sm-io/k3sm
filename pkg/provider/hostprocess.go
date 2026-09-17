@@ -198,7 +198,9 @@ func (p *HostProcess) startPod(pod *corev1.Pod) ([]podEvent, error) {
 	// condition on the incoming pod so a readinessGate condition survives this write.
 	conds := []corev1.PodCondition{
 		{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
-		computeReadiness(rec.pod, containersReady),
+		// HostProcess pods are never vm-backed: their published address is the node
+		// IP, live on lo0, so the transport gate is satisfied by construction.
+		computeReadiness(rec.pod, containersReady, transportReady),
 		{Type: corev1.ContainersReady, Status: crStatus},
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 	}
@@ -257,7 +259,7 @@ func (p *HostProcess) reap(k, cname string, cmd *exec.Cmd, lf *os.File) {
 	// (containersReady=false ⇒ False/"ContainersNotReady") so CreatePod, reap, and
 	// toPodStatus have a single readiness authority; setPodCondition carries the
 	// reason so it surfaces in kubectl describe.
-	setPodCondition(&rec.pod.Status, computeReadiness(rec.pod, false))
+	setPodCondition(&rec.pod.Status, computeReadiness(rec.pod, false, transportReady))
 	setCond(&rec.pod.Status, corev1.ContainersReady, corev1.ConditionFalse)
 	p.dispatch(rec.pod)
 }

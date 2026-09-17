@@ -86,7 +86,7 @@ func TestContainerStatusIdentityForwarded(t *testing.T) {
 		},
 	}
 
-	st := toPodStatus(nil, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil)
+	st := toPodStatus(nil, rs, "192.168.1.10", metav1.NewTime(time.Unix(1000, 0)), nil, transportReady)
 	if len(st.ContainerStatuses) != 2 {
 		t.Fatalf("ContainerStatuses = %d, want 2", len(st.ContainerStatuses))
 	}

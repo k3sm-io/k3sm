@@ -321,10 +321,15 @@ func (r *runtimedRuntime) rerunPostStart(t *podTrack, podID, container string) {
 // names are unique across a pod's containers and initContainers, so nothing an init
 // status carries could match anyway.
 //
+// transport is the guest-transport gate buildStatus computed for this pod; it is
+// threaded through the re-derivation so the two gates COMPOSE rather than the
+// later one clearing the earlier. When both withhold, computeReadiness reports
+// ContainersNotReady — a container mid-postStart is the more actionable fact.
+//
 // Locking: the gate set is snapshotted under hookMu and the status mutated outside
 // it, so no callback can run under the lock. hookMu is never held together with
 // restartMu or r.mu.
-func (r *runtimedRuntime) applyPostStartOverlay(pod *corev1.Pod, t *podTrack, st *corev1.PodStatus) {
+func (r *runtimedRuntime) applyPostStartOverlay(pod *corev1.Pod, t *podTrack, st *corev1.PodStatus, transport transportGate) {
 	gated := t.gatedContainers()
 	if len(gated) == 0 {
 		return
@@ -336,5 +341,5 @@ func (r *runtimedRuntime) applyPostStartOverlay(pod *corev1.Pod, t *podTrack, st
 		st.ContainerStatuses[i].Ready = false
 		st.ContainerStatuses[i].Started = ptr(false)
 	}
-	refreshReadinessConditions(pod, st)
+	refreshReadinessConditions(pod, st, transport)
 }

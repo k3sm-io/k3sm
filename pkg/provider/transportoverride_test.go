@@ -214,8 +214,9 @@ type leaseNode struct {
 	sink   *recordingSink
 	table  *proxy.RoutingTable
 	mu     sync.Mutex
-	seen   map[string]int    // pod id -> status callbacks delivered
-	podIPs map[string]string // pod id -> the LAST status.podIP VK was told
+	seen   map[string]int                   // pod id -> status callbacks delivered
+	podIPs map[string]string                // pod id -> the LAST status.podIP VK was told
+	conds  map[string][]corev1.PodCondition // pod id -> the LAST conditions VK was told
 	notify chan struct{}
 }
 
@@ -243,7 +244,8 @@ func newLeaseNodeWith(t *testing.T, echoPodIP bool) *leaseNode {
 	sink := &recordingSink{table: table}
 	n := &leaseNode{
 		ipam: ipam, adapt: adapt, rt: rt, sink: sink, table: table,
-		seen: map[string]int{}, podIPs: map[string]string{}, notify: make(chan struct{}, 64),
+		seen: map[string]int{}, podIPs: map[string]string{}, conds: map[string][]corev1.PodCondition{},
+		notify: make(chan struct{}, 64),
 	}
 	n.r = newRuntimedWith(rt, RuntimedConfig{
 		NodeName: guestNodeName,
@@ -266,6 +268,9 @@ func (n *leaseNode) watch(t *testing.T) {
 		n.mu.Lock()
 		n.seen[string(pod.UID)]++
 		n.podIPs[string(pod.UID)] = pod.Status.PodIP
+		// Copied, not aliased: the provider owns the status it just published and
+		// the next observation replaces the slice under a reader.
+		n.conds[string(pod.UID)] = slices.Clone(pod.Status.Conditions)
 		n.mu.Unlock()
 		select {
 		case n.notify <- struct{}{}:
