@@ -56,17 +56,6 @@ const (
 	credentialCorrupt = nodecred.Corrupt
 	credentialExpired = nodecred.Expired
 	credentialValid   = nodecred.Valid
-
-	// credentialExpiryMargin is how far ahead of a node client cert's NotAfter
-	// the stored credential is already treated as expired. See
-	// nodecred.ExpiryMargin for why a day.
-	credentialExpiryMargin = nodecred.ExpiryMargin
-
-	nodeKubeconfigFile     = nodecred.KubeconfigFile
-	kubeletServingCertFile = nodecred.ServingCertFile
-	kubeletServingKeyFile  = nodecred.ServingKeyFile
-	kubeletClientCAFile    = nodecred.ClientCAFile
-	nodeAssignmentFile     = nodecred.NodeAssignmentFile
 )
 
 // nodeCredentialStore is the agent work dir viewed as the home of one node's
@@ -90,9 +79,6 @@ func (s nodeCredentialStore) servingCertPath() string { return s.reader().Servin
 func (s nodeCredentialStore) servingKeyPath() string  { return s.reader().ServingKeyPath() }
 func (s nodeCredentialStore) clientCAPath() string    { return s.reader().ClientCAPath() }
 func (s nodeCredentialStore) assignmentPath() string  { return s.reader().AssignmentPath() }
-
-// paths lists every artifact a complete credential consists of.
-func (s nodeCredentialStore) paths() []string { return s.reader().Paths() }
 
 // Save persists a join outcome: the kubeconfig that authenticates as the issued
 // system:node identity, the kubelet serving pair, the client-identity CA, and the

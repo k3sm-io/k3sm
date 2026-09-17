@@ -189,8 +189,8 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 		// sampling: a report that checked only three of them would call a
 		// credential valid while the agent found it incomplete.
 		for _, name := range []string{
-			nodeKubeconfigFile, kubeletServingCertFile, kubeletServingKeyFile,
-			kubeletClientCAFile, nodeAssignmentFile,
+			nodecred.KubeconfigFile, nodecred.ServingCertFile, nodecred.ServingKeyFile,
+			nodecred.ClientCAFile, nodecred.NodeAssignmentFile,
 		} {
 			res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 			store := savedStore(t, res)
@@ -216,13 +216,13 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 				name: "a serving pair whose halves do not match",
 				damage: func(t *testing.T, store nodeCredentialStore) {
 					other, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
-					write(t, filepath.Join(store.dir, kubeletServingCertFile), other.KubeletServingCertPEM)
+					write(t, filepath.Join(store.dir, nodecred.ServingCertFile), other.KubeletServingCertPEM)
 				},
 			},
 			{
 				name: "a truncated serving key",
 				damage: func(t *testing.T, store nodeCredentialStore) {
-					path := filepath.Join(store.dir, kubeletServingKeyFile)
+					path := filepath.Join(store.dir, nodecred.ServingKeyFile)
 					blob, err := os.ReadFile(path)
 					if err != nil {
 						t.Fatalf("read %s: %v", path, err)
@@ -233,7 +233,7 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 			{
 				name: "a client CA that is not a certificate",
 				damage: func(t *testing.T, store nodeCredentialStore) {
-					write(t, filepath.Join(store.dir, kubeletClientCAFile), []byte("-----BEGIN CERTIFICATE-----\nnope\n"))
+					write(t, filepath.Join(store.dir, nodecred.ClientCAFile), []byte("-----BEGIN CERTIFICATE-----\nnope\n"))
 				},
 			},
 			{
@@ -242,13 +242,13 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 				// credential the agent cannot start from.
 				name: "an assignment with no podCIDR",
 				damage: func(t *testing.T, store nodeCredentialStore) {
-					write(t, filepath.Join(store.dir, nodeAssignmentFile), []byte(`{"meshIP":"100.64.1.2"}`))
+					write(t, filepath.Join(store.dir, nodecred.NodeAssignmentFile), []byte(`{"meshIP":"100.64.1.2"}`))
 				},
 			},
 			{
 				name: "a kubeconfig that does not parse",
 				damage: func(t *testing.T, store nodeCredentialStore) {
-					write(t, filepath.Join(store.dir, nodeKubeconfigFile), []byte("not a kubeconfig"))
+					write(t, filepath.Join(store.dir, nodecred.KubeconfigFile), []byte("not a kubeconfig"))
 				},
 			},
 		}
@@ -265,15 +265,15 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 
 	t.Run("the expiry margin is the agent's own", func(t *testing.T) {
 		t.Parallel()
-		if status.CredentialExpiryMargin != credentialExpiryMargin {
+		if status.CredentialExpiryMargin != nodecred.ExpiryMargin {
 			t.Fatalf("status.CredentialExpiryMargin = %s, the agent uses %s — a report and a start decision that disagree about expiry send an operator to the wrong remedy",
-				status.CredentialExpiryMargin, credentialExpiryMargin)
+				status.CredentialExpiryMargin, nodecred.ExpiryMargin)
 		}
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		store := savedStore(t, res)
 		// One hour inside the margin: both must call it expired at the same
 		// moment, and one hour before that, neither may.
-		inside := time.Now().Add(nodeCredClientTTL - credentialExpiryMargin + time.Hour)
+		inside := time.Now().Add(nodeCredClientTTL - nodecred.ExpiryMargin + time.Hour)
 		agree(t, store, inside, status.CredentialExpired)
 		agree(t, store, inside.Add(-2*time.Hour), status.CredentialValid)
 	})

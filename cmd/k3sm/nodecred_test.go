@@ -31,6 +31,7 @@ import (
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/nodecred"
 )
 
 // The restart gate: a joined agent that restarts must present the credential it
@@ -258,8 +259,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		t.Parallel()
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		for _, missing := range []string{
-			nodeKubeconfigFile, kubeletServingCertFile, kubeletServingKeyFile,
-			kubeletClientCAFile, nodeAssignmentFile,
+			nodecred.KubeconfigFile, nodecred.ServingCertFile, nodecred.ServingKeyFile,
+			nodecred.ClientCAFile, nodecred.NodeAssignmentFile,
 		} {
 			t.Run("without "+missing, func(t *testing.T) {
 				t.Parallel()
@@ -339,7 +340,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			if status != credentialCorrupt || cred != nil {
 				t.Errorf("Status = %s (cred!=nil: %v), want corrupt with no credential", status, cred != nil)
 			}
-			if !strings.Contains(err.Error(), kubeletServingCertFile) && !strings.Contains(err.Error(), kubeletServingKeyFile) {
+			if !strings.Contains(err.Error(), nodecred.ServingCertFile) && !strings.Contains(err.Error(), nodecred.ServingKeyFile) {
 				t.Errorf("error %q names neither serving file", err)
 			}
 			if !strings.Contains(err.Error(), "remove it to force a fresh token join") {
@@ -360,8 +361,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			if status != credentialCorrupt {
 				t.Errorf("Status = %s, want corrupt", status)
 			}
-			if !strings.Contains(err.Error(), nodeKubeconfigFile) {
-				t.Errorf("error %q does not name %s", err, nodeKubeconfigFile)
+			if !strings.Contains(err.Error(), nodecred.KubeconfigFile) {
+				t.Errorf("error %q does not name %s", err, nodecred.KubeconfigFile)
 			}
 		})
 
@@ -376,8 +377,8 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			if err == nil || status != credentialCorrupt {
 				t.Fatalf("Status = %s, err = %v; want corrupt with an error", status, err)
 			}
-			if !strings.Contains(err.Error(), nodeAssignmentFile) {
-				t.Errorf("error %q does not name %s", err, nodeAssignmentFile)
+			if !strings.Contains(err.Error(), nodecred.NodeAssignmentFile) {
+				t.Errorf("error %q does not name %s", err, nodecred.NodeAssignmentFile)
 			}
 		})
 	})
@@ -392,7 +393,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		// file that is not touched cannot be damaged by a crash, and a credential
 		// rewritten thousands of times for no reason is thousands of chances to be.
 		backdated := time.Now().Add(-48 * time.Hour)
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			if err := os.Chtimes(p, backdated, backdated); err != nil {
 				t.Fatalf("backdate %s: %v", p, err)
 			}
@@ -400,7 +401,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, res); err != nil {
 			t.Fatalf("second Save: %v", err)
 		}
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			fi, err := os.Stat(p)
 			if err != nil {
 				t.Fatalf("stat %s: %v", p, err)
@@ -479,7 +480,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		if !bytes.Equal(cred.ClientCAPEM, second.ClientCAPEM) || !bytes.Equal(cred.ClientCertPEM, second.NodeClientCertPEM) {
 			t.Error("the retried Save did not converge the store on the new credential")
 		}
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			if _, err := os.Stat(p + storeTmpSuffix); err == nil {
 				t.Errorf("%s%s survived a successful save", filepath.Base(p), storeTmpSuffix)
 			}
@@ -490,7 +491,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		t.Parallel()
 		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
 		store := savedStore(t, res)
-		for _, p := range store.paths() {
+		for _, p := range store.reader().Paths() {
 			if err := os.WriteFile(p+storeTmpSuffix, []byte("half a file"), 0o600); err != nil {
 				t.Fatalf("plant a leftover for %s: %v", p, err)
 			}
