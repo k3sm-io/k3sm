@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/runtimeclass"
 )
 
 // Pod lifecycle Event reasons. They match the kubelet's UpperCamelCase reason
@@ -63,6 +64,15 @@ const (
 	// would tell a consumer the pod failed at a stage it never reached. The name
 	// keeps the UpperCamelCase shape the rest of the vocabulary uses.
 	reasonFailedImagePlatform = "FailedImagePlatform"
+	// reasonFailedEmptyDirMedium is recorded when a pod on the NATIVE runtime
+	// declares an emptyDir with a non-empty medium, so the pod is refused BEFORE
+	// the CreatePod RPC (preflightEmptyDirMedium).
+	//
+	// Like FailedImagePlatform it has no upstream analogue: a kubelet with a
+	// medium it cannot serve is not a state upstream models, so there is no reason
+	// to mirror, and borrowing `Failed` would place the failure at container start,
+	// a stage this pod never reaches.
+	reasonFailedEmptyDirMedium = "FailedEmptyDirMedium"
 	// reasonXcodeToolchainUngranted is recorded when a pod carries the
 	// k3sm.io/xcode-toolchain annotation but this node's developer-directory
 	// selection yields no grant — the node has none, or the one it has is not a
@@ -213,6 +223,28 @@ func msgFailedStart(name string) string {
 // image.Platform.String(), the sanitising choke point.
 func msgFailedImagePlatform(err error) string {
 	return "Error: " + err.Error()
+}
+
+// msgFailedEmptyDirMedium is the FailedEmptyDirMedium-event message for a native
+// pod whose emptyDir asks for a storage medium this runtime cannot provide.
+//
+// It DOES carry the volume name and the medium, for the same reason
+// msgFailedImagePlatform carries its error: both values are the pod's own spec,
+// not env, args, or a registry response, and an operator cannot find the offending
+// volume among several without being told which one it is. The medium is bounded
+// by the caller and rendered with %q, so a value that ever stops being one of the
+// closed set upstream validates still prints as printable ASCII.
+//
+// Both ways out are stated, because the refusal is only actionable with them: drop
+// the field and take a disk-backed directory, or move the pod to the runtime that
+// has a real tmpfs.
+func msgFailedEmptyDirMedium(volume, medium string) string {
+	return fmt.Sprintf("Error: volume %q sets spec.volumes[].emptyDir.medium to %q, which the "+
+		"default runtime cannot provide: its pods are native processes with no tmpfs, so the "+
+		"directory would be disk-backed with no notice. Remove the medium field to take an "+
+		"ordinary disk-backed directory, or schedule the pod with runtimeClassName: %s, whose "+
+		"Linux guest honours medium: Memory as a tmpfs.",
+		volume, medium, runtimeclass.Name)
 }
 
 // msgXcodeToolchainUngranted is the XcodeToolchainUngranted-event message for a
