@@ -94,15 +94,20 @@ installed a data volume, it stays mounted and declared; the command prints `sudo
 
 Any flag you added to the server daemon yourself, such as `--mesh-ip` or `--registry-port`, is
 carried into the plist every install renders. Install reads them from the installed daemon, and
-records them in `/var/lib/k3sm/server-args.json` inside the data root, so they survive an uninstall
-too. `k3sm status` shows what the installed server is running with, on the `server-args` row.
+records them in `/Library/Preferences/io.k3sm.server-args.json`, so they survive an uninstall too.
+That file is root-owned and root-readable only, because a flag can carry a credential. `k3sm status`
+shows what the installed server is running with, on the `server-args` row.
+
+The record is written at install time. A flag you edit directly into the daemon's plist is picked up
+by the next `sudo k3sm install`, and until then it exists only in the plist, so an uninstall before
+that install loses it. Running `sudo k3sm install` after an edit is what makes it durable.
 
 The installed daemon wins while it is there, so a reset means clearing both sources:
 
 ```sh
-sudo k3sm uninstall                          # removes the daemon and its flags
-sudo rm /var/lib/k3sm/server-args.json       # discards the recorded ones
-sudo k3sm install                            # renders the stock template
+sudo k3sm uninstall                                          # removes the daemon and its flags
+sudo rm /Library/Preferences/io.k3sm.server-args.json        # discards the recorded ones
+sudo k3sm install                                            # renders the stock template
 ```
 
 That discards the flags the file lists, and nothing else. Your cluster data is untouched.
