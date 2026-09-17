@@ -19,6 +19,7 @@ package executor
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -84,10 +85,13 @@ const drainGrace = 5 * time.Second
 // number from this symbol rather than from a literal that would drift the moment
 // drainGrace or the component count changed.
 //
-// It is a BUDGET, not an enforced deadline — Stop does not select on its context,
-// and the wait after a SIGKILL is unbounded. A component whose process refuses to
-// die overruns this, which is exactly why the ExitTimeOut derived from it carries
-// headroom rather than being the sum to the second.
+// It is a budget Stop KEEPS: every wait in the teardown selects on the caller's
+// context, so a daemon that calls Stop under this bound gets it back at the
+// deadline with ErrStopBudgetExceeded naming whatever it could not witness reaped
+// (B321). What the deadline does not promise is that the child is gone — it has
+// been SIGKILLed, and a process refusing to die is left for launchd's own kill and
+// the next start's reap — which is why the ExitTimeOut derived from this still
+// carries headroom rather than being the sum to the second.
 const StopBound = 30 * time.Second
 
 // exitLogTailLines is how many trailing log lines an early-exit error carries —
@@ -1158,10 +1162,33 @@ func (s *Supervised) Ready(ctx context.Context) bool {
 	return resp.StatusCode == http.StatusOK && string(buf[:n]) == "ok"
 }
 
+// ErrStopBudgetExceeded is returned by Stop when its context ended before every
+// control-plane child had been witnessed reaped. It is a REPORT, not a failure to
+// act: every component has been signalled and escalated to SIGKILL by then, and
+// the error names the ones whose exit Stop could not observe inside the budget, so
+// the daemon's shutdown log says which child may be left for launchd's own SIGKILL
+// and the next start's reap.
+var ErrStopBudgetExceeded = errors.New("control-plane teardown exceeded its budget")
+
 // Stop tears the control plane down in reverse dependency order: the components
 // were appended in start order (kine, apiserver, scheduler, controller-manager),
 // so walking the slice in reverse stops the apiserver and the controllers first
 // and kine last, after which the SQLite DB is no longer in use. Idempotent.
+//
+// It HONOURS ctx, and that is the whole of B321. The daemon calls it under
+// context.WithTimeout(…, StopBound) and pkg/install derives the plist's
+// ExitTimeOut from that same symbol — but Stop used to ignore the context
+// entirely, waiting on a component's exited channel without a bound once the
+// SIGKILL was out. A child that would not die, or a reaper that never observed the
+// death, therefore parked the teardown forever, launchd answered the blown
+// ExitTimeOut with a SIGKILL of the DAEMON, and that orphaned exactly the children
+// the stop exists to reap.
+//
+// On expiry Stop keeps going rather than returning early: every remaining
+// component is still signalled and escalated (an unwitnessed kill is better than
+// no kill), and the returned error wraps ErrStopBudgetExceeded naming the
+// components — names only, never argv or log content — whose reap it could not
+// witness.
 func (s *Supervised) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	comps := s.comps
@@ -1184,15 +1211,50 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	// Reverse start order = correct shutdown order, but kine (index 0) must die
 	// last. Build the explicit order: apiserver, scheduler, controller-manager,
 	// then kine.
+	var alive []string
 	for _, c := range shutdownOrder(comps) {
-		s.stopComponent(c)
+		if !s.stopComponent(ctx, c) {
+			alive = append(alive, c.name)
+		}
 	}
 	// Every reaper has closed its exited channel by now (stopComponent waits on
 	// it), but closing is not the last thing a reaper does — it still has its
 	// supervision decision to take and, on a crash, a callback to run. Wait for
-	// them outside mu so Stop does not return while one is still in flight.
-	s.reapers.Wait()
+	// them outside mu so Stop does not return while one is still in flight —
+	// bounded by the same ctx, because a reaper parked in wait4 on a child that
+	// never dies would otherwise re-open the unbounded wait the loop above just
+	// closed.
+	reaped := awaitReapers(ctx, &s.reapers)
+
+	switch {
+	case len(alive) > 0:
+		return fmt.Errorf("%w: %s still unreaped after SIGKILL", ErrStopBudgetExceeded, strings.Join(alive, ", "))
+	case !reaped:
+		return fmt.Errorf("%w: every component was signalled and reaped, but a reaper goroutine is still in flight", ErrStopBudgetExceeded)
+	}
 	return nil
+}
+
+// awaitReapers waits for every live reaper goroutine to finish, bounded by ctx,
+// and reports whether they all did.
+//
+// The helper goroutine outlives a ctx-bounded give-up, by construction: a
+// sync.WaitGroup cannot be waited on with a deadline. It ends when the last reaper
+// does and holds nothing but the WaitGroup, and the only caller is a teardown on a
+// process that is exiting — so the leak is bounded by the process, which is the
+// same backstop the reaper it is waiting for already relies on.
+func awaitReapers(ctx context.Context, reapers *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		reapers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // shutdownOrder returns comps ordered for a clean teardown: the apiserver drains
@@ -1221,9 +1283,21 @@ func shutdownOrder(comps []*component) []*component {
 // exit, then SIGKILLs if it has not, and closes its log file. An
 // already-exited child (the fail-fast path) makes this a no-op signal + an
 // immediate return on the closed exited channel.
-func (s *Supervised) stopComponent(c *component) {
+//
+// It reports whether the exit was WITNESSED — the reaper closed exited — inside
+// ctx. Both waits select on ctx: a context that ends during the drain escalates
+// to the SIGKILL immediately rather than spending a grace the caller no longer
+// has, and the wait after the SIGKILL gives up with the budget instead of parking
+// forever (B321).
+//
+// A false verdict is deliberately CONSERVATIVE. Stop reports it by name, and a
+// component SIGKILLed at the very edge of the budget is named even though the
+// signal has almost certainly landed: the report exists so an operator knows which
+// child may need reaping by hand, and over-naming a child whose death nobody
+// witnessed is the honest direction for that.
+func (s *Supervised) stopComponent(ctx context.Context, c *component) bool {
 	if c == nil || c.cmd == nil || c.cmd.Process == nil {
-		return
+		return true
 	}
 	// Whether this child was ALREADY gone before the signal, asked before it is
 	// sent. A crashed component has just been reported by name on the crash path;
@@ -1241,20 +1315,42 @@ func (s *Supervised) stopComponent(c *component) {
 	// can still hold grandchildren the dead component left behind.
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 
+	witnessed := true
 	select {
 	case <-c.exited:
+	case <-ctx.Done():
+		// The budget is already spent: escalate now rather than draining into a
+		// grace nobody is left to wait out.
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		witnessed = awaitExit(ctx, c)
 	case <-time.After(drainGrace):
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		<-c.exited
+		witnessed = awaitExit(ctx, c)
 	}
 	if c.log != nil {
 		_ = c.log.Close()
 	}
-	if alreadyExited {
+	switch {
+	case !witnessed:
+		s.cfg.Logger.Warn("control-plane component was SIGKILLed but its exit was not observed before the teardown budget expired; it is left for launchd and the next start",
+			"component", c.name, "pid", pid)
+	case alreadyExited:
 		s.cfg.Logger.Debug("control-plane component had already exited before teardown", "component", c.name)
-		return
+	default:
+		s.cfg.Logger.Info("stopped control-plane component", "component", c.name)
 	}
-	s.cfg.Logger.Info("stopped control-plane component", "component", c.name)
+	return witnessed
+}
+
+// awaitExit blocks until the component's reaper closes exited, or ctx ends. It is
+// the ONE wait that used to be unbounded (the post-SIGKILL `<-c.exited`).
+func awaitExit(ctx context.Context, c *component) bool {
+	select {
+	case <-c.exited:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // tcpReady returns a bring-up ready func (for awaitHealthy) reporting whether
