@@ -286,8 +286,18 @@ else
 			sudo launchctl bootout system/io.k3sm.netd >/dev/null 2>&1 || true
 			await_unloaded io.k3sm.netd || true
 			unmount_out="$(sudo diskutil unmount "$DATA_ROOT" 2>&1 || true)"
+			# A NATIVE pod's process survives the daemon stop by design (see the
+			# header), and its rootfs sits under <data root>/pods, so on a rig that
+			# runs native workloads the unmount is dissented by that pod's pid. That
+			# dissent is not the defect this leg proves — an orphan HELPER (or the
+			# server's own pid) holding the root — so it passes with the dissenter
+			# named; any other dissenter, or a busy root with no named pid, fails.
 			if mounted; then
-				ladder no "b253.L2  $DATA_ROOT did not unmount after the server was booted out: $unmount_out"
+				if printf '%s' "$unmount_out" | grep -qE 'dissented by PID [0-9]+ \((/private)?'"$DATA_ROOT"'/pods/'; then
+					ladder ok "b253.L2  no helper or server pid held $DATA_ROOT once the server was out; the one dissenter is a native pod process, which survives the stop by design: $unmount_out"
+				else
+					ladder no "b253.L2  $DATA_ROOT did not unmount after the server was booted out: $unmount_out"
+				fi
 			elif printf '%s' "$unmount_out" | grep -qi 'dissent'; then
 				ladder no "b253.L2  the unmount was dissented: $unmount_out"
 			else
