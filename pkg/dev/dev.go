@@ -814,10 +814,15 @@ type serverProc struct {
 // exitError describes the server's exit: the Wait result (its exit status) plus
 // the tail of the log it died writing, so the operator sees the fatal line rather
 // than an assertion that something is wrong. Call only after <-p.exited.
+//
+// The tail is REDACTED (executor.RedactedLogTail): a dev server's log carries the
+// same bearer tokens and datastore DSNs a daemon's does, and this error is printed
+// to a terminal, copied into issues and captured by whatever spawned `k3sm dev`.
+// The unredacted log stays at logPath, which the error names.
 func (p *serverProc) exitError() error {
 	return fmt.Errorf("%w: instance %q server (pid %d): %v; last log lines (%s):\n%s",
 		ErrServerExited, p.name, p.pid, p.waitErr, p.logPath,
-		executor.LogTail(p.logPath, bootLogTailLines))
+		executor.RedactedLogTail(p.logPath))
 }
 
 // exitReportGrace bounds how long awaitOrExit waits for the reaper to publish an
@@ -878,10 +883,6 @@ func devPodLogsDir(podRoot string) string { return filepath.Join(podRoot, "log",
 // for.
 const kubeconfigWait = 90 * time.Second
 
-// bootLogTailLines is how many trailing server-log lines a bring-up timeout carries —
-// enough to show what the boot was doing without dumping a whole log into an error.
-const bootLogTailLines = 20
-
 // awaitKubeconfig blocks until the detached server has written its admin
 // kubeconfig (its readiness signal for the merge), bounded so a wedged bring-up
 // fails with an actionable error instead of hanging.
@@ -897,7 +898,8 @@ func (m *Manager) awaitKubeconfig(ctx context.Context, kc, logPath string) error
 // operator who has to already know the file exists learns nothing from the failure:
 // the observed case was a boot whose log held nothing but `go: downloading` lines —
 // the datastore binary was being built, progress was real, and the error said only
-// that a file had not appeared.
+// that a file had not appeared. The quote is redacted and bounded by
+// executor.RedactedLogTail, which owns how much of a log an error may carry.
 func awaitKubeconfigFile(ctx context.Context, timeout time.Duration, kc, logPath string) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -906,7 +908,7 @@ func awaitKubeconfigFile(ctx context.Context, timeout time.Duration, kc, logPath
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("k3sm server did not write %s within %s; last log lines (%s):\n%s",
-				kc, timeout, logPath, executor.LogTail(logPath, bootLogTailLines))
+				kc, timeout, logPath, executor.RedactedLogTail(logPath))
 		}
 		select {
 		case <-ctx.Done():
