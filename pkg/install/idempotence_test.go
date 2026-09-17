@@ -17,11 +17,14 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"net"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
 )
@@ -418,6 +421,166 @@ func TestInstallKubeconfigFollowsThePreservedMeshIP(t *testing.T) {
 		}
 		if !strings.Contains(f.kubeContent, "insecure-skip-tls-verify: true") {
 			t.Errorf("an absent CA must degrade to skip-verify, not fail the install:\n%s", f.kubeContent)
+		}
+	})
+}
+
+// selfSignedAPIServerCert mints what kube-apiserver writes into its own --cert-dir
+// when nothing hands it a serving keypair: a leaf carrying ipSANs, followed by the
+// self-signed CA that issued it. It is a REAL certificate, not a PEM-shaped string,
+// because the installer parses it to decide whether pinning it would leave kubectl
+// able to connect — a fixture that cannot be parsed would prove nothing about that.
+func selfSignedAPIServerCert(t *testing.T, ipSANs ...string) []byte {
+	t.Helper()
+	ca, err := certs.NewCA("kube-apiserver-self-signed")
+	if err != nil {
+		t.Fatalf("mint the self-signed CA: %v", err)
+	}
+	var ips []net.IP
+	for _, s := range ipSANs {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("bad fixture IP SAN %q", s)
+		}
+		ips = append(ips, ip)
+	}
+	leaf, _, err := ca.IssueServing("kube-apiserver", []string{"localhost"}, ips, time.Hour)
+	if err != nil {
+		t.Fatalf("issue the serving leaf: %v", err)
+	}
+	return append(leaf, ca.CertPEM...)
+}
+
+// TestAdminKubeconfigPinsServingCA is the gate on the loopback endpoint's trust
+// anchor: a single-node admin kubeconfig VERIFIES the apiserver instead of trusting
+// whatever answers on the port.
+//
+// The port matters because it is bindable by any unprivileged local user — the
+// control plane itself runs as the unprivileged service user — so a kubeconfig that
+// skipped verification would hand the admin bearer token to whoever grabbed the port
+// during an outage, and believe that impostor's readiness. Which certificate to pin
+// is settled by the posture: single-node, nothing supplies --tls-cert-file, so
+// kube-apiserver self-signs into its own --cert-dir and that file (leaf + its
+// issuing CA) is the only anchor for what the listener presents.
+//
+// The two fallback rows are as load-bearing as the pin: an install that wrote a
+// kubeconfig kubectl cannot connect through is worse than an unverified one, so
+// "no certificate yet" and "the certificate does not name the loopback address"
+// both keep skip-verify, loudly.
+func TestAdminKubeconfigPinsServingCA(t *testing.T) {
+	cfg := Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}
+	anchorPath := apiServerSelfSignedCertPath(cfg.withDefaults().serverWorkDir())
+
+	t.Run("a reinstall pins the certificate the loopback listener serves", func(t *testing.T) {
+		anchor := selfSignedAPIServerCert(t, "127.0.0.1")
+		f := &fakeSystem{}
+		f.putFile(anchorPath, anchor)
+		var log bytes.Buffer
+		c := cfg
+		c.Logger = testLogger(&log)
+		if err := Install(context.Background(), f, c); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if idx(f.calls, "ReadFile:"+anchorPath) < 0 {
+			t.Errorf("the install must read the apiserver's self-signed certificate at %s; calls =\n%v", anchorPath, f.calls)
+		}
+		want := "certificate-authority-data: " + base64.StdEncoding.EncodeToString(anchor)
+		if !strings.Contains(f.kubeContent, want) {
+			t.Errorf("the loopback kubeconfig must pin the serving certificate:\n%s", f.kubeContent)
+		}
+		if strings.Contains(f.kubeContent, "insecure-skip-tls-verify") {
+			t.Errorf("a pinned kubeconfig must not also skip verification (whoever holds the port would still be trusted):\n%s", f.kubeContent)
+		}
+		if !strings.Contains(f.kubeContent, "https://127.0.0.1:6444") {
+			t.Errorf("the single-node kubeconfig must still address loopback:\n%s", f.kubeContent)
+		}
+	})
+
+	t.Run("a first install has nothing to pin and says so", func(t *testing.T) {
+		f := &fakeSystem{}
+		var log bytes.Buffer
+		c := cfg
+		c.Logger = testLogger(&log)
+		if err := Install(context.Background(), f, c); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !strings.Contains(f.kubeContent, "insecure-skip-tls-verify: true") {
+			t.Errorf("an absent certificate must degrade to skip-verify, not fail the install:\n%s", f.kubeContent)
+		}
+		if strings.Contains(f.kubeContent, "certificate-authority-data") {
+			t.Errorf("nothing on disk anchors this endpoint yet:\n%s", f.kubeContent)
+		}
+		if out := log.String(); !strings.Contains(out, "has not self-signed") || !strings.Contains(out, anchorPath) {
+			t.Errorf("the operator must be told which file is missing and that the next install picks it up; log =\n%s", out)
+		}
+	})
+
+	t.Run("a certificate that does not name loopback is not pinned", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(anchorPath, selfSignedAPIServerCert(t, "10.0.0.7"))
+		var log bytes.Buffer
+		c := cfg
+		c.Logger = testLogger(&log)
+		if err := Install(context.Background(), f, c); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if !strings.Contains(f.kubeContent, "insecure-skip-tls-verify: true") {
+			t.Errorf("a leaf without the loopback SAN must keep skip-verify — pinning it would make kubectl fail the SAN check:\n%s", f.kubeContent)
+		}
+		if strings.Contains(f.kubeContent, "certificate-authority-data") {
+			t.Errorf("the certificate on disk does not anchor this endpoint:\n%s", f.kubeContent)
+		}
+		if out := log.String(); !strings.Contains(out, "missing-ip-san=127.0.0.1") {
+			t.Errorf("the warning must name the SAN that is missing; log =\n%s", out)
+		}
+	})
+
+	t.Run("only a later block naming loopback does not make the leaf name it", func(t *testing.T) {
+		// The file's FIRST certificate is what the listener presents and what a
+		// client checks its address against; a trailing block is an anchor at most.
+		// A check that scanned the whole file would pin this one and leave kubectl
+		// failing the SAN check against a leaf that names 10.0.0.7 only.
+		f := &fakeSystem{}
+		f.putFile(anchorPath, slices.Concat(
+			selfSignedAPIServerCert(t, "10.0.0.7"),
+			selfSignedAPIServerCert(t, "127.0.0.1"),
+		))
+		var log bytes.Buffer
+		c := cfg
+		c.Logger = testLogger(&log)
+		if err := Install(context.Background(), f, c); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if strings.Contains(f.kubeContent, "certificate-authority-data") {
+			t.Errorf("the presented leaf does not name loopback; a later block that does is not the identity kubectl checks:\n%s", f.kubeContent)
+		}
+		if !strings.Contains(f.kubeContent, "insecure-skip-tls-verify: true") {
+			t.Errorf("this must keep skip-verify:\n%s", f.kubeContent)
+		}
+		if out := log.String(); !strings.Contains(out, "missing-ip-san=127.0.0.1") {
+			t.Errorf("the warning must name the SAN that is missing; log =\n%s", out)
+		}
+	})
+
+	t.Run("a mesh install reads the cluster CA, never the self-signed file", func(t *testing.T) {
+		f := &fakeSystem{}
+		dc := cfg.withDefaults()
+		f.putFile(dc.plistPath(ServerLabel), ServerPlist(Config{
+			AdminToken:      "k3sm-old",
+			ExtraServerArgs: []string{"--mesh-ip", "100.64.0.1"},
+		}))
+		ca := []byte("-----BEGIN CERTIFICATE-----\nclusterca\n-----END CERTIFICATE-----\n")
+		f.putFile(certs.ClusterCACertPath(dc.serverWorkDir()), ca)
+		f.putFile(anchorPath, selfSignedAPIServerCert(t, "127.0.0.1"))
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if idx(f.calls, "ReadFile:"+anchorPath) >= 0 {
+			t.Error("a mesh apiserver never self-signs; that file anchors nothing it presents")
+		}
+		want := "certificate-authority-data: " + base64.StdEncoding.EncodeToString(ca)
+		if !strings.Contains(f.kubeContent, want) {
+			t.Errorf("the mesh kubeconfig must still pin the cluster CA:\n%s", f.kubeContent)
 		}
 	})
 }

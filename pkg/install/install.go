@@ -31,8 +31,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -41,6 +43,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -716,11 +719,23 @@ type Config struct {
 	// constant for the privilege reason. A test points it at a scratch file.
 	ServerArgsRecord string
 	// ClusterCA is the cluster CA certificate PEM the admin kubeconfig pins as
-	// certificate-authority-data. Install reads it off disk on a mesh install (the
-	// only posture in which the apiserver serves a cluster-CA-signed leaf); empty
-	// keeps the single-node insecure-skip-tls-verify posture, which is the only
-	// correct one against a self-signed serving cert.
+	// certificate-authority-data on a MESH install — the posture in which the
+	// apiserver presents a cluster-CA-signed leaf (--tls-cert-file). Install reads
+	// it off disk at step 2e; empty degrades that kubeconfig to
+	// insecure-skip-tls-verify, which a first install does before the control plane
+	// has minted anything. The single-node loopback endpoint has its own anchor —
+	// see LoopbackCA.
 	ClusterCA []byte
+	// LoopbackCA is the trust anchor the admin kubeconfig pins for the SINGLE-NODE
+	// loopback endpoint: the certificate kube-apiserver self-signs into its own
+	// --cert-dir (executor.APIServerCertDir), leaf followed by the self-signed CA
+	// that issued it. That file is the ONLY anchor for what the loopback listener
+	// presents, and pinning it is what stops an unprivileged local process that
+	// grabs the apiserver port during an outage from collecting the admin bearer
+	// token. Install reads it off disk at step 2e, and leaves it empty — keeping
+	// the skip-verify fallback — when the file is absent or its leaf does not name
+	// the loopback address.
+	LoopbackCA []byte
 	// DataVolume asks install to create, adopt or migrate onto a dedicated APFS
 	// volume for the data root. Nil is the default posture: the data root is a
 	// plain directory (or a volume an operator declared in /etc/fstab by hand),
@@ -1409,11 +1424,21 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return err
 	}
 
-	// 2e. On a mesh install the apiserver serves a CLUSTER-CA-SIGNED leaf, so the
-	//     admin kubeconfig can and must verify it. Read that CA (install runs as
-	//     root; the file is the _k3sm control plane's). Absent on a first install,
-	//     where the control plane has not booted yet — the kubeconfig then falls
-	//     back to the skip-verify posture and the next reinstall picks the CA up.
+	// 2e. Read the trust anchor for the endpoint the admin kubeconfig is about to
+	//     name. WHICH certificate that endpoint presents is decided by the posture
+	//     this install renders, so the anchor is read per posture (install runs as
+	//     root; both files are the _k3sm control plane's, and both are PUBLIC 0644
+	//     certificates, so this is not a credential read):
+	//
+	//       - MESH: cmd/k3sm issues a CLUSTER-CA-SIGNED leaf into the PKI dir and
+	//         hands it to the apiserver as --tls-cert-file, so the cluster CA is
+	//         the anchor.
+	//       - SINGLE-NODE: nothing supplies a serving keypair, so kube-apiserver
+	//         self-signs into its own --cert-dir instead — see readLoopbackAnchor.
+	//
+	//     Either anchor is absent on a first install, where the control plane has
+	//     not booted yet; the kubeconfig then falls back to the skip-verify posture
+	//     and the next reinstall picks the anchor up.
 	if mesh := cfg.meshIP(); mesh != "" {
 		caPath := certs.ClusterCACertPath(cfg.serverWorkDir())
 		ca, err := sys.ReadFile(caPath)
@@ -1425,6 +1450,8 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		default:
 			return fmt.Errorf("install: read cluster CA %s: %w", caPath, err)
 		}
+	} else if err := readLoopbackAnchor(sys, &cfg); err != nil {
+		return err
 	}
 
 	// 3. Render + write both plists, in manifest (install) order.
@@ -1848,6 +1875,91 @@ func AgentPlist(cfg Config) []byte {
 // configured. A mesh install overrides it with the mesh IP — see AdminKubeconfig.
 const adminLoopbackHost = "127.0.0.1"
 
+// apiServerSelfSignedCertPath is the serving certificate the SINGLE-NODE apiserver
+// self-signs into its own --cert-dir. The basename is kube-apiserver's own fixed
+// choice; the directory is executor.APIServerCertDir, which is also the
+// controller-manager's --root-ca-file source on that posture. The file holds the
+// leaf followed by the self-signed CA that issued it, which is what makes it usable
+// as a trust anchor. cmd/k3sm names the same file for its post-rotation health probe
+// (apiServerTrustAnchor).
+//
+// NOT certs.APIServerServingCertPath: that is the mesh path's cluster-CA-signed leaf
+// under the PKI dir, re-issued on every boot, and the apiserver only presents it when
+// a serving keypair was supplied.
+func apiServerSelfSignedCertPath(workDir string) string {
+	return filepath.Join(executor.APIServerCertDir(workDir), "apiserver.crt")
+}
+
+// readLoopbackAnchor reads the trust anchor for the single-node loopback apiserver
+// endpoint into cfg.LoopbackCA, so the admin kubeconfig VERIFIES the listener it
+// talks to instead of trusting whatever answers on the port.
+//
+// That matters because the apiserver's port is bindable by any unprivileged local
+// user (the control plane itself runs as the unprivileged service user), so a
+// kubeconfig carrying insecure-skip-tls-verify hands the admin bearer token to
+// whoever holds the port during an outage, and accepts that impostor's readiness.
+//
+// Two conditions keep the old skip-verify posture, because both describe a pin that
+// would break kubectl rather than secure it, and an install that cannot talk to its
+// own cluster is worse than an unverified one:
+//
+//   - the file is absent — a first install, before the control plane has ever
+//     booted and self-signed. The next `k3sm install` picks it up.
+//   - its leaf does not name the loopback address, so a verifying client would
+//     reject the connection on the SAN check before trust ever came into it.
+func readLoopbackAnchor(sys System, cfg *Config) error {
+	path := apiServerSelfSignedCertPath(cfg.serverWorkDir())
+	anchor, err := sys.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		cfg.Logger.Warn("the apiserver has not self-signed its serving certificate yet; admin kubeconfig keeps insecure-skip-tls-verify until the next install", "path", path)
+		return nil
+	case err != nil:
+		return fmt.Errorf("install: read apiserver serving certificate %s: %w", path, err)
+	}
+	if !certPEMHasIPSAN(anchor, adminLoopbackHost) {
+		cfg.Logger.Warn("the apiserver's serving certificate does not name the loopback address; admin kubeconfig keeps insecure-skip-tls-verify rather than pin an anchor kubectl could not connect through", "path", path, "missing-ip-san", adminLoopbackHost)
+		return nil
+	}
+	cfg.LoopbackCA = anchor
+	return nil
+}
+
+// certPEMHasIPSAN reports whether the LEAF in pemBytes carries ip among its IP SANs.
+//
+// The leaf is the FIRST certificate block: that is the order kube-apiserver writes
+// its self-signed pair in (leaf, then the CA that issued it), and it is the
+// certificate a TLS client is presented and checks its address against. Only that
+// one certificate can answer the question asked — "does what this listener presents
+// name the address the kubeconfig is about to name". A trailing CA block carrying
+// the address would be an anchor, never the presented identity, and letting it
+// answer yes would pin a file through which kubectl still fails the SAN check.
+//
+// Anything unparseable answers NO: a certificate this cannot read is one the caller
+// must not pin, and the caller's fallback is the safe-but-unverified posture.
+func certPEMHasIPSAN(pemBytes []byte, ip string) bool {
+	want := net.ParseIP(ip)
+	if want == nil {
+		return false
+	}
+	for rest := pemBytes; len(rest) > 0; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return false
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		crt, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return false
+		}
+		return slices.ContainsFunc(crt.IPAddresses, want.Equal)
+	}
+	return false
+}
+
 // AdminKubeconfig renders the admin kubeconfig (the apiserver's EFFECTIVE
 // address + the shared static token) written to the human's home so `kubectl`
 // works once the server is up.
@@ -1862,19 +1974,25 @@ const adminLoopbackHost = "127.0.0.1"
 //     disk by Install) is pinned as certificate-authority-data so the connection
 //     is actually verified. An absent CA falls back to skip-verify, because a
 //     first install writes this file before the control plane has minted one.
-//   - SINGLE-NODE: loopback, and insecure-skip-tls-verify — the apiserver
-//     self-signs its serving cert there, so no CA on disk anchors it and pinning
-//     one would break kubectl rather than secure it. This mirrors the executor's
-//     own posture split (writeComponentKubeconfig's verifyClusterCA).
+//   - SINGLE-NODE: loopback, and the certificate the apiserver SELF-SIGNS into its
+//     own --cert-dir (Config.LoopbackCA, read off disk by Install) pinned as
+//     certificate-authority-data. No cluster CA anchors that listener, but the
+//     self-signed file holds the leaf and its issuing CA, so it anchors itself. The
+//     loopback port is bindable by any unprivileged local user, so an unverified
+//     kubeconfig there would surrender the admin bearer token to whatever holds the
+//     port while the control plane is down. An absent or non-loopback-SAN anchor
+//     falls back to skip-verify, for the same first-install reason as the mesh case.
 func AdminKubeconfig(cfg Config) []byte {
 	cfg = cfg.withDefaults()
 	host := adminLoopbackHost
 	clusterTLS := "    insecure-skip-tls-verify: true"
+	anchor := cfg.LoopbackCA
 	if mesh := cfg.meshIP(); mesh != "" {
 		host = mesh
-		if len(cfg.ClusterCA) > 0 {
-			clusterTLS = "    certificate-authority-data: " + base64.StdEncoding.EncodeToString(cfg.ClusterCA)
-		}
+		anchor = cfg.ClusterCA
+	}
+	if len(anchor) > 0 {
+		clusterTLS = "    certificate-authority-data: " + base64.StdEncoding.EncodeToString(anchor)
 	}
 	server := "https://" + net.JoinHostPort(host, strconv.Itoa(cfg.APIServerPort))
 	return []byte(fmt.Sprintf(`apiVersion: v1
