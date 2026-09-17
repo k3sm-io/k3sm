@@ -135,6 +135,21 @@ func (opts serverOptions) executorConfig(logger *slog.Logger) executor.Config {
 	}
 }
 
+// deniedLocalPorts is the set of loopback TCP ports every confined pod's sandbox
+// on this node denies connect() to. It is a METHOD, not a literal at each use,
+// because the set has exactly two consumers that must never disagree: the node's
+// provider config (nodeOptions.deniedLocalPorts, which becomes each pod's SBPL)
+// and the cluster admission policy that rejects a Service published on one of
+// these ports (policy.EnsureRejectServiceDeniedLocalPort). A second literal is how
+// the guard and the thing it guards drift: the policy would reject Services on a
+// port nothing denies, while the port that IS denied stayed publishable.
+//
+// Today that is the kine listener alone — the plaintext datastore socket on
+// 127.0.0.1, which no pod has any business reaching.
+func (opts serverOptions) deniedLocalPorts() []int {
+	return []int{opts.kinePort}
+}
+
 // registerServerFlags binds `k3sm server`'s flags onto fs and returns the error
 // (if any) from resolving the posture-aware --work-dir DEFAULT, which the caller
 // surfaces after Parse so an explicit --work-dir can still override it.
@@ -551,7 +566,7 @@ func runServer(args []string) (err error) {
 	// binary provisions is a posture-INDEPENDENT product decision, and a silently
 	// absent policy is otherwise invisible until a real cluster admits something it
 	// should have rejected.
-	provisionClusterPolicies(ctx, cs, mode, os.Geteuid(), logger)
+	provisionClusterPolicies(ctx, cs, mode, os.Geteuid(), opts.deniedLocalPorts(), logger)
 
 	// 3b. Provision the RBAC graph BEFORE the VK node (step 5) and the
 	// worker-join supervisor (step 4d) start, so a joining worker's system:node
@@ -945,7 +960,7 @@ func runServer(args []string) (err error) {
 		// connect() to the node's plaintext datastore listener. The deny is by
 		// port, not address (Seatbelt cannot filter by IP), so a Service that
 		// reuses this port number is also unreachable from confined pods.
-		deniedLocalPorts: []int{opts.kinePort},
+		deniedLocalPorts: opts.deniedLocalPorts(),
 	}
 
 	// 4f-bis. The control-plane node's OWN kubelet serving cert.
@@ -1196,7 +1211,7 @@ func writeAPIServerServingCert(workDir string, clusterCA *certs.CA, meshIP strin
 // euid is the effective uid of this process; the foreign-user policy's allowed
 // identity is derived from it by provider.PodExecutionUID, which answers "what uid
 // do pods here actually execute as" rather than "what uid is the server".
-func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode hostnet.Mode, euid int, logger *slog.Logger) {
+func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode hostnet.Mode, euid int, deniedLocalPorts []int, logger *slog.Logger) {
 	allowedUID := provider.PodExecutionUID(euid)
 	logger.Info("provisioning cluster admission policies",
 		"network-backend", mode.Backend.String(), "pod-execution-uid", allowedUID)
@@ -1223,6 +1238,17 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	// (svclb still refuses the bind — that is the datapath half of the guard).
 	if err := policy.EnsureRejectReservedLoadBalancerPort(ctx, cs); err != nil {
 		logger.Error("provision reserved-loadbalancer-port DENY policy: a LoadBalancer Service declaring a k3sm-reserved port (NodePort range / kubelet API port) will now be ACCEPTED by the API instead of rejected; svclb still refuses to bind it, so such a Service stays <pending> with only a log line to explain it", "err", err)
+	}
+	// DENY a Service published on one of this node's DENIED LOCAL PORTS — the
+	// loopback ports every confined pod's sandbox denies connect() to (the kine
+	// listener), stamped onto the node from the SAME opts.deniedLocalPorts() value
+	// passed here. No type gate: the deny is by port number, so a ClusterIP is as
+	// unreachable as a LoadBalancer. Log-and-continue like every sibling Ensure*,
+	// and the message names the consequence, because the failure this rejects is
+	// invisible: the Service is created, its endpoints go Ready, and every pod's
+	// connect() is refused inside its own sandbox with nothing in the cluster to say so.
+	if err := policy.EnsureRejectServiceDeniedLocalPort(ctx, cs, deniedLocalPorts); err != nil {
+		logger.Error("provision denied-local-port DENY policy: a Service published on a port every confined pod's sandbox denies (the node's loopback datastore listener) will now be ACCEPTED by the API; it will be created with Ready endpoints and still be unreachable from every pod, with no cluster-level event to explain it", "err", err, "denied-local-ports", deniedLocalPorts)
 	}
 	// Honest-gap Warn advisory on Pods: a pod with no toleration for the
 	// provider taint (k3sm.io/provider:NoSchedule, on EVERY node) is left

@@ -23,6 +23,7 @@ import (
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -86,6 +87,14 @@ const (
 const (
 	reservedLBPortPolicyName  = "k3sm-reject-loadbalancer-reserved-port"
 	reservedLBPortBindingName = "k3sm-reject-loadbalancer-reserved-port-binding"
+)
+
+// deniedLocalPortPolicyName / deniedLocalPortBindingName name the deny policy
+// that rejects a Service published on one of the node's denied local ports —
+// the loopback ports every confined pod's sandbox denies connect() to.
+const (
+	deniedLocalPortPolicyName  = "k3sm-reject-service-denied-local-port"
+	deniedLocalPortBindingName = "k3sm-reject-service-denied-local-port-binding"
 )
 
 // egressAnnotationPolicyName / egressAnnotationBindingName name the Warn policy
@@ -266,6 +275,198 @@ func EnsureRejectReservedLoadBalancerPort(ctx context.Context, cs kubernetes.Int
 	}
 	if err := ensureValidatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
 		return fmt.Errorf("reserved-loadbalancer-port admission binding: %w", err)
+	}
+	return nil
+}
+
+// deniedLocalPortClause is the CEL sub-expression testing whether the port of the
+// Service port bound to variable p is one of the node's denied local ports. The
+// numbers are interpolated from the argument — cmd/k3sm's ONE denied-local-port
+// value, the same one it stamps onto the node — so no port literal is ever written
+// into CEL by hand.
+//
+// It is written fresh rather than on reservedPortClause: that helper renders a
+// RANGE plus one singleton (the NodePort range, the kubelet API port), which is
+// not the shape of an arbitrary denied-port set, and it is reached only from an
+// expression that gates on type: LoadBalancer — the one gate this policy must NOT
+// inherit (see deniedLocalPortExpr).
+//
+// Defined only for a NON-EMPTY set: an empty disjunction is not a CEL expression,
+// so both callers below return early on one.
+func deniedLocalPortClause(p string, denied []int) string {
+	eq := make([]string, 0, len(denied))
+	for _, port := range denied {
+		eq = append(eq, fmt.Sprintf("%s.port == %d", p, port))
+	}
+	return "(" + strings.Join(eq, " || ") + ")"
+}
+
+// deniedLocalPortExpr is the CEL the Deny policy enforces on Service create and
+// update. It admits (evaluates true) unless a Service declares a
+// spec.ports[].port equal to one of the node's denied local ports.
+//
+// There is deliberately NO spec.type gate — the one structural difference from
+// reservedLBPortExpr, and the reason this is a second expression rather than an
+// argument to that one. The sandbox denies connect() BY PORT NUMBER, whatever
+// ADDRESS is dialed (Seatbelt cannot filter by address at all), so nothing about
+// a Service escapes it: not a ClusterIP VIP, not a wildcard LoadBalancer bind,
+// and not a headless Service whose clients dial a pod IP directly. Gating on type
+// would leave the most common Service shape silently broken.
+//
+// It keys on spec.ports[].port ONLY — never targetPort, never nodePort.
+// targetPort is the port a pod LISTENS on inside its own sandbox, which the deny
+// (an outbound connect() filter) does not touch; and a nodePort is allocated by
+// the apiserver out of the NodePort range, which the loopback datastore port is
+// not in. Rejecting on either would reject Services that work.
+//
+// An empty denied set yields the constant `true` — nothing is denied, so nothing
+// is rejected (and EnsureRejectServiceDeniedLocalPort provisions no object at all).
+// The has() guard tolerates a Service that omits ports.
+func deniedLocalPortExpr(denied []int) string {
+	if len(denied) == 0 {
+		return "true"
+	}
+	return "!has(object.spec.ports) || " +
+		"object.spec.ports.all(p, !" + deniedLocalPortClause("p", denied) + ")"
+}
+
+// deniedLocalPortMessageExpr renders the rejection message, naming the first
+// colliding port. It is evaluated only when the validation fails, so the filtered
+// list is non-empty.
+//
+// It is this policy's OWN message, not reservedLBPortMessageExpr's: the two
+// rejections have different causes (a host listener k3sm owns vs. a sandbox rule
+// every pod carries) and different remedies, and an operator handed the wrong one
+// would go looking for a wildcard listener that is not the problem.
+//
+// The closing sentence is the HA caveat, stated where the operator meets the
+// rejection: a ValidatingAdmissionPolicy is cluster-scoped while --kine-port is
+// per-server, so this one object carries the ports of the server that provisioned
+// it and cannot speak for a peer started with a different one.
+func deniedLocalPortMessageExpr(denied []int) string {
+	if len(denied) == 0 {
+		return ""
+	}
+	return `'k3sm: Service port ' + ` +
+		`string(object.spec.ports.filter(p, ` + deniedLocalPortClause("p", denied) + `)[0].port) + ` +
+		`' is the loopback datastore (kine) listener port of this node, and EVERY confined pod sandbox DENIES connect() to it by PORT NUMBER ` +
+		`(Seatbelt filters by port, not by address). A Service published on that number would be created, get Ready endpoints, and still be ` +
+		`unreachable from every pod: the deny holds WHATEVER ADDRESS the pod dials, so no Service type escapes it, and neither does a headless Service, ` +
+		`whose clients dial a pod IP directly. ` +
+		`Either publish the Service on a different spec.ports[].port, or start the server with a different --kine-port. ` +
+		`Caveat: this policy is ONE cluster-scoped object carrying the denied ports of the server that provisioned it, while --kine-port is per-server ` +
+		`— a peer server started with a different --kine-port denies a port number this rejection does not name.'`
+}
+
+// EnsureRejectServiceDeniedLocalPort idempotently provisions the deny
+// ValidatingAdmissionPolicy (+ binding) that rejects a Service published on one of
+// the node's DENIED LOCAL PORTS: the loopback ports every confined pod's sandbox
+// denies connect() to, which cmd/k3sm derives once and both stamps onto the node
+// (nodeOptions.deniedLocalPorts) and hands to this function.
+//
+// Why admission: the deny is by PORT NUMBER, because Seatbelt cannot filter
+// connect() by address. So a Service published on that number fails the worst way
+// available — it is created, its endpoints go Ready, kubectl reports nothing wrong,
+// and every pod's connect() is refused inside its own sandbox with no cluster-level
+// event to explain it. This policy moves that discovery to `kubectl apply`.
+//
+// NO type gate, and port-only matching: see deniedLocalPortExpr for both, and for
+// why targetPort and nodePort are deliberately not matched.
+//
+// Create AND update: a port edit on an already-admitted Service is an ordinary
+// update, and the sandbox deny is evaluated live on every connect().
+//
+// MatchConstraints pins `services` only — deliberately not `services/status`, or
+// svclb's and the ingress host's UpdateStatus writes would be evaluated by it on
+// every reconcile.
+//
+// FailurePolicy is Ignore: a CEL/machinery evaluation error must not turn into a
+// cluster-wide denial of Service writes. The trade is explicit — this guard can
+// fail open, and when it does the operator is back to the silent unreachability
+// above, which is bad but is exactly the status quo this policy improves on.
+//
+// HA caveat (the honest ceiling, also stated in the rejection message): a
+// ValidatingAdmissionPolicy is CLUSTER-scoped while --kine-port is PER-SERVER.
+// This one object therefore carries the ports of whichever server provisioned it
+// last — every k3sm server lays down the same objects at start — so a peer server
+// started with a different --kine-port denies a port number this policy does not
+// reject, and pods on THAT node would still be unable to reach such a Service.
+// Closing it needs a per-node policy parameter the VAP model does not offer.
+//
+// An empty denied set REMOVES the objects instead of provisioning them: a server
+// that denies no local port must not leave a policy behind rejecting Services on a
+// port number nothing denies any more. It is the one delete in this package, and
+// it is confined to the two objects this function owns.
+func EnsureRejectServiceDeniedLocalPort(ctx context.Context, cs kubernetes.Interface, denied []int) error {
+	if len(denied) == 0 {
+		return removeRejectServiceDeniedLocalPort(ctx, cs)
+	}
+	ignore := admissionregistrationv1.Ignore
+	policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   deniedLocalPortPolicyName,
+			Labels: map[string]string{managedLabel: "true"},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: &ignore,
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{{
+					RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+						Operations: []admissionregistrationv1.OperationType{
+							admissionregistrationv1.Create,
+							admissionregistrationv1.Update,
+						},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{""},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"services"},
+						},
+					},
+				}},
+			},
+			Validations: []admissionregistrationv1.Validation{{
+				Expression:        deniedLocalPortExpr(denied),
+				MessageExpression: deniedLocalPortMessageExpr(denied),
+				Message:           "k3sm: this Service declares a port every confined pod's sandbox denies connect() to (the node's loopback datastore listener), so it would be unreachable from pods; publish it on a different spec.ports[].port, or start the server with a different --kine-port",
+				Reason:            reasonInvalid(),
+			}},
+		},
+	}
+	if err := ensureValidatingAdmissionPolicy(ctx, cs, policy); err != nil {
+		return fmt.Errorf("denied-local-port admission policy: %w", err)
+	}
+
+	deny := admissionregistrationv1.Deny
+	binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   deniedLocalPortBindingName,
+			Labels: map[string]string{managedLabel: "true"},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        deniedLocalPortPolicyName,
+			ValidationActions: []admissionregistrationv1.ValidationAction{deny},
+		},
+	}
+	if err := ensureValidatingAdmissionPolicyBinding(ctx, cs, binding); err != nil {
+		return fmt.Errorf("denied-local-port admission binding: %w", err)
+	}
+	return nil
+}
+
+// removeRejectServiceDeniedLocalPort deletes the denied-local-port policy and its
+// binding, tolerating absence (the ordinary case: a cluster that never had them).
+//
+// The BINDING goes first. A binding that outlives its policy names a policy that
+// no longer resolves; deleting in the other order would leave that window open
+// instead of the harmless one — a policy no binding points at, which is evaluated
+// by nothing.
+func removeRejectServiceDeniedLocalPort(ctx context.Context, cs kubernetes.Interface) error {
+	c := cs.AdmissionregistrationV1()
+	if err := c.ValidatingAdmissionPolicyBindings().Delete(ctx, deniedLocalPortBindingName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete stale denied-local-port admission binding: %w", err)
+	}
+	if err := c.ValidatingAdmissionPolicies().Delete(ctx, deniedLocalPortPolicyName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete stale denied-local-port admission policy: %w", err)
 	}
 	return nil
 }
