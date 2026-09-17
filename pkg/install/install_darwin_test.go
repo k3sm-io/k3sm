@@ -19,6 +19,7 @@ limitations under the License.
 package install
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,4 +424,206 @@ func assertNoTemps(t *testing.T, dir string) {
 			t.Errorf("leaked temp link %s in %s", e.Name(), dir)
 		}
 	}
+}
+
+// stagingSystem is the System seam with the three methods stageJoinToken drives
+// backed by the REAL filesystem, at the test process's own identity.
+//
+// The rest of the seam comes from the package's fake, which is never reached
+// here: staging reads a file, judges its mode, and writes a copy, and all three
+// of those are filesystem judgements a fake could only assert its own model of.
+// The owner is this process because chowning to _k3sm needs privilege these
+// tests never take, and what is under test is the mode, the repair and the
+// temp-and-rename rather than whether this process may give a file away.
+type stagingSystem struct {
+	*fakeSystem
+	uid, gid int
+}
+
+func (s stagingSystem) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+func (s stagingSystem) FileMode(path string) (fs.FileMode, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Mode().Perm(), nil
+}
+
+func (s stagingSystem) WriteServiceUserFile(path string, contents []byte, _ uint32, mode, dirMode fs.FileMode) error {
+	return writeServiceUserFile(path, contents, s.uid, s.gid, mode, dirMode)
+}
+
+// TestWriteServiceUserFileOnDisk is the on-disk half of the staged-token write.
+//
+// The fake records what the installer ASKED for; only this proves the darwin
+// implementation does it. Everything it checks is a property a credential
+// depends on: the directory and the file end up at the modes the caller named,
+// a tree an earlier build left open is repaired rather than trusted, the
+// temp-and-rename leaves nothing behind, and a parent that cannot be created is
+// an error rather than a half-written token.
+//
+// Unprivileged, in a per-case t.TempDir(), with the process's own uid and gid —
+// see stagingSystem for why the owner is not _k3sm.
+func TestWriteServiceUserFileOnDisk(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+	const token = "K10abc123::node:s3cr3t\n"
+
+	assertOwner := func(t *testing.T, path string) {
+		t.Helper()
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return
+		}
+		if int(st.Uid) != uid || int(st.Gid) != gid {
+			t.Errorf("%s owner = %d:%d, want %d:%d", path, st.Uid, st.Gid, uid, gid)
+		}
+	}
+	// noTempLeft asserts the directory holds exactly the names given. The
+	// temp-and-rename creates a .k3sm-* file in the SAME directory (a rename
+	// cannot cross a filesystem), so a leaked temp is a second copy of a
+	// credential sitting beside the one that was wanted.
+	noTempLeft := func(t *testing.T, dir string, want ...string) {
+		t.Helper()
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		var got []string
+		for _, e := range entries {
+			got = append(got, e.Name())
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s holds %v, want exactly %v (a leaked temp file is a second copy of the token)", dir, got, want)
+		}
+	}
+
+	t.Run("a fresh tree gets the directory and the file at the modes asked for", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, agentWorkSubdir)
+		path := filepath.Join(dir, agentTokenName)
+
+		if err := writeServiceUserFile(path, []byte(token), uid, gid, AgentTokenFileMode, AgentTokenDirMode); err != nil {
+			t.Fatalf("writeServiceUserFile: %v", err)
+		}
+		assertMode(t, dir, AgentTokenDirMode)
+		assertMode(t, path, AgentTokenFileMode)
+		assertOwner(t, dir)
+		assertOwner(t, path)
+		content, err := os.ReadFile(path)
+		if err != nil || string(content) != token {
+			t.Errorf("content = %q (err %v), want the token", content, err)
+		}
+		noTempLeft(t, dir, agentTokenName)
+	})
+
+	t.Run("an open tree from an earlier build is repaired, not trusted", func(t *testing.T) {
+		root := t.TempDir()
+		dir := filepath.Join(root, agentWorkSubdir)
+		path := filepath.Join(dir, agentTokenName)
+		// What a hand-run mkdir, or a build that wrote the token with the
+		// prevailing umask, leaves behind: a directory every account can enter
+		// and a credential every account can read.
+		mkdir(t, dir, 0o755)
+		if err := os.WriteFile(path, []byte("K10stale::node:old\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := writeServiceUserFile(path, []byte(token), uid, gid, AgentTokenFileMode, AgentTokenDirMode); err != nil {
+			t.Fatalf("writeServiceUserFile: %v", err)
+		}
+		assertMode(t, dir, AgentTokenDirMode)
+		assertMode(t, path, AgentTokenFileMode)
+		content, err := os.ReadFile(path)
+		if err != nil || string(content) != token {
+			t.Errorf("content = %q (err %v), want the new token to have replaced the stale one", content, err)
+		}
+		noTempLeft(t, dir, agentTokenName)
+	})
+
+	t.Run("a parent that cannot be created is an error and changes nothing", func(t *testing.T) {
+		root := t.TempDir()
+		// A regular file exactly where the directory has to go. MkdirAll cannot
+		// proceed, and the one thing that must not happen is a partial write or
+		// a mangled file in its place.
+		blocker := filepath.Join(root, agentWorkSubdir)
+		const notADir = "someone else's file\n"
+		if err := os.WriteFile(blocker, []byte(notADir), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(blocker, agentTokenName)
+
+		if err := writeServiceUserFile(path, []byte(token), uid, gid, AgentTokenFileMode, AgentTokenDirMode); err == nil {
+			t.Fatal("writeServiceUserFile succeeded with a regular file where the directory belongs")
+		}
+		content, err := os.ReadFile(blocker)
+		if err != nil || string(content) != notADir {
+			t.Errorf("the blocking file is now %q (err %v), want it untouched", content, err)
+		}
+		assertMode(t, blocker, 0o600)
+	})
+
+	t.Run("staging never modifies the operator's own file", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "operator-token")
+		if err := os.WriteFile(src, []byte(token), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(src, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{DataRoot: filepath.Join(root, "data"), TokenFile: src}.withDefaults()
+		sys := stagingSystem{fakeSystem: &fakeSystem{}, uid: uid, gid: gid}
+
+		if err := stageJoinToken(sys, cfg, uint32(uid)); err != nil {
+			t.Fatalf("stageJoinToken: %v", err)
+		}
+		staged, err := os.ReadFile(cfg.agentTokenPath())
+		if err != nil || strings.TrimSpace(string(staged)) != strings.TrimSpace(token) {
+			t.Fatalf("staged copy = %q (err %v), want the token", staged, err)
+		}
+		assertMode(t, cfg.agentTokenPath(), AgentTokenFileMode)
+		// The operator's file is theirs: same bytes, same mode, still there. The
+		// installer reads it and nothing else — deleting it is the operator's
+		// decision, after the node is Ready.
+		content, err := os.ReadFile(src)
+		if err != nil || string(content) != token {
+			t.Errorf("the operator's file = %q (err %v), want it untouched", content, err)
+		}
+		assertMode(t, src, 0o600)
+	})
+
+	t.Run("staging refuses an operator file anyone can read", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "operator-token")
+		if err := os.WriteFile(src, []byte(token), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{DataRoot: filepath.Join(root, "data"), TokenFile: src}.withDefaults()
+		sys := stagingSystem{fakeSystem: &fakeSystem{}, uid: uid, gid: gid}
+
+		err := stageJoinToken(sys, cfg, uint32(uid))
+		if err == nil {
+			t.Fatal("stageJoinToken accepted a world-readable join token file")
+		}
+		if !strings.Contains(err.Error(), "chmod 600") {
+			t.Errorf("error %q does not name the remedy", err)
+		}
+		if strings.Contains(err.Error(), strings.TrimSpace(token)) {
+			t.Errorf("the refusal echoed the token: %q", err)
+		}
+		if _, statErr := os.Stat(cfg.agentTokenPath()); statErr == nil {
+			t.Error("a refused token was staged anyway")
+		}
+	})
 }
