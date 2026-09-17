@@ -30,7 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// The LIVE half of the B284 gate: a joined agent, killed and restarted with NO
+// The LIVE half of the restart gate: a joined agent, killed and restarted with NO
 // token anywhere, comes back as the same node.
 //
 // The hermetic gate (TestAgentRestartReusesItsNodeCredential) proves the store
@@ -58,8 +58,8 @@ import (
 //	sudo K3SM_LAB=1 go test -tags 'integration darwin' -timeout 30m \
 //	    -run TestIntegrationAgentRestartReusesItsNodeCredential ./cmd/k3sm/
 const (
-	restartTestServerNode = "k3sm-b284-server"
-	restartTestAgentNode  = "k3sm-b284-agent"
+	restartTestServerNode = "k3sm-restart-server"
+	restartTestAgentNode  = "k3sm-restart-agent"
 	// restartSettle is how long the restarted agent is watched before its files
 	// are hashed: long enough for the resume, the endpoint refresh and the node
 	// registration, short enough to stay inside a lab session.
@@ -72,10 +72,10 @@ func TestIntegrationAgentRestartReusesItsNodeCredential(t *testing.T) {
 	if os.Getenv("K3SM_LAB") != "1" {
 		// LOUD, never silent: this is the only proof that a restart does not need a
 		// join token, so a reader of a green run must be able to tell it did not run.
-		t.Skip("B284 RESTART LEG NOT RUN: set K3SM_LAB=1 (it builds the repo, downloads a control plane and runs two daemons for minutes)")
+		t.Skip("AGENT RESTART LEG NOT RUN: set K3SM_LAB=1 (it builds the repo, downloads a control plane and runs two daemons for minutes)")
 	}
 	if os.Geteuid() != 0 {
-		t.Skip("B284 RESTART LEG NOT RUN: needs root — the runtimed posture stages pod-readable artifacts under /Library")
+		t.Skip("AGENT RESTART LEG NOT RUN: needs root — the runtimed posture stages pod-readable artifacts under /Library")
 	}
 
 	res := bringUpAndRestartAgent(t)
