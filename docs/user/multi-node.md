@@ -44,16 +44,43 @@ Run it with `sudo`, because the cluster CA whose hash the token pins lives in th
 state root, which belongs to the `_k3sm` service user. Without `sudo` the work dir resolves to your
 own home and the command exits non-zero rather than inventing a CA there.
 
-On the agent Mac:
+On the agent Mac, put the token in a file only root can read, then install the agent:
 
 ```sh
-sudo k3sm install
-k3sm agent --server <server-underlay-ip> --node-ip <this-macs-underlay-ip> --token <token>
+sudo sh -c 'umask 077; cat > /var/root/k3sm-join-token'   # paste the token, then press Ctrl-D
+sudo k3sm install --agent \
+  --server <server-underlay-ip> \
+  --node-ip <this-macs-underlay-ip> \
+  --token-file /var/root/k3sm-join-token
 ```
 
 `--server` is the control-plane Mac's **underlay** address (a LAN IP or DNS name, no scheme, no
 port). The join dials `<server>:9345`, not the apiserver's `:6443`. `--node-ip` is **required**. It
 is this Mac's own underlay address, bound into the certs the join issues.
+
+`--agent` installs the `io.k3sm.agent` LaunchDaemon, so the worker starts at boot and is restarted
+if it exits, exactly as the control plane is on the server Mac. A Mac is one role or the other: an
+install that would put the agent on a machine already running the control plane, or the other way
+round, is refused. Change a node's role with `sudo k3sm uninstall` and then install again. Uninstall
+keeps the data root, the logs and the flags you configured.
+
+`--token-file` names your own file holding the token. It can be anywhere root can read, because
+`k3sm install` runs as root and reads it once: the daemon runs as the unprivileged `_k3sm` user and
+could not open a file in root's home, so the installer copies the token to
+`/var/lib/k3sm/agent/join-token`, owned by that user and readable by nobody else. That copy is what
+the daemon reads, and it is the only token on the Mac the daemon ever sees. No token is written into
+the LaunchDaemon plist, which is readable by every account.
+
+The install waits for the join to finish before it reports success: it watches for the node
+credential the agent writes, so a token the server rejects fails the install with a message instead
+of leaving a daemon that retries every 30 seconds behind a healthy process.
+
+Once the node shows up `Ready` in `kubectl get nodes` on the server you can delete **both** copies:
+your own file and `/var/lib/k3sm/agent/join-token`. Neither is needed again. A joined node presents
+the credential it stored at the join, and a missing token file is not an error at start, so the
+daemon keeps restarting normally with both gone. `sudo k3sm uninstall` deletes the staged copy for
+you. A node that has already joined needs no token at all, so `--token-file` can be dropped from a
+later install.
 
 The agent authenticates with the bootstrap token, receives its node credentials, and its wireguard peer
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
