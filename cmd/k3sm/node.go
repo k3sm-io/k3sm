@@ -216,6 +216,14 @@ type nodeOptions struct {
 	// a loopback spelling nor one of clusterRegistries, so the two travel together.
 	localRegistryHost string
 
+	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
+	// connect() to — this node's EFFECTIVE kine (etcd shim) port, so a networked
+	// native pod sharing the node's _k3sm uid cannot dial the plaintext
+	// control-plane datastore. `k3sm server` sets it from the resolved
+	// executor kine port; a standalone `k3sm node`/`k3sm agent` runs no kine on
+	// this node and sets nothing.
+	deniedLocalPorts []int
+
 	// attachRuntimeInfo, when non-nil, is called ONCE with the node's in-process
 	// runtime as soon as it is built, so a consumer started EARLIER in the same
 	// process can read runtime-info facts off the SAME runtime this node drives.
@@ -1217,6 +1225,11 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// connect() to the privileged daemon. Denied regardless of run-as-root vs
 		// helper mode (a pod must never drive netd).
 		DeniedUnixSocketPaths: []string{netd.DefaultSocketPath},
+		// Fence every pod off the node's kine port at the sandbox, for the same
+		// reason: kine listens in plaintext on loopback and pods share the node's
+		// uid. Empty on a bring-up that runs no kine on this node (a standalone
+		// `k3sm node` or `k3sm agent`).
+		DeniedLocalPorts: opts.deniedLocalPorts,
 		// The Service proxy's transport-override seam. A vm pod
 		// publishes the /32 its guest was allocated, and the guest's macOS-assigned
 		// vmnet lease is what actually carries bytes; the provider is the only

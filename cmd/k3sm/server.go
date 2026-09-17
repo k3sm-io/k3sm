@@ -940,6 +940,12 @@ func runServer(args []string) (err error) {
 		// peer-mirror brokering. Zero on a node with no registry.
 		localRegistryHost: registryPuller.LocalHost,
 		clusterRegistries: registryPuller.ClusterRegistries,
+		// This server's own kine port — the SAME resolved value (flag or default)
+		// that reaches executor.Config.KinePort above — so every pod's SBPL denies
+		// connect() to the node's plaintext datastore listener. The deny is by
+		// port, not address (Seatbelt cannot filter by IP), so a Service that
+		// reuses this port number is also unreachable from confined pods.
+		deniedLocalPorts: []int{opts.kinePort},
 	}
 
 	// 4f-bis. The control-plane node's OWN kubelet serving cert.

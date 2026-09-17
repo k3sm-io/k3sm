@@ -112,7 +112,24 @@ type runtimedRuntime struct {
 	// RuntimedConfig.DeniedUnixSocketPaths — sorted and deduplicated once, at
 	// construction, so buildBox stamps a settled value.
 	deniedSocks []string
-	log         *slog.Logger
+	// deniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
+	// connect() to — this node's EFFECTIVE kine (etcd shim) port, which listens
+	// in plaintext on 127.0.0.1: pods run as the same _k3sm uid as kine, so a
+	// networked pod could otherwise dial the control-plane datastore directly.
+	// Threaded as data, exactly like deniedSocks: the SBPL generator does not
+	// know what listens on a given port, it only denies (apis
+	// SandboxProfile.denied_local_ports, field 7).
+	//
+	// It is the sorted, deduplicated normalization of
+	// RuntimedConfig.DeniedLocalPorts (normalizeLocalPortDenies) — computed once
+	// at construction, so buildBox stamps a settled value. An out-of-range entry
+	// fails NewRuntimed closed rather than reaching a pod's rendered profile.
+	//
+	// PORT-ONLY CEILING: this denies the port, not the service — a Service that
+	// happens to be published on the same port is also unreachable from a
+	// confined pod (see the proto field's own doc comment).
+	deniedLocalPorts []uint32
+	log              *slog.Logger
 
 	// developerDir is this node's active developer directory (`xcode-select -p`),
 	// resolved ONCE at construction and stamped onto the SandboxProfile of every
@@ -318,6 +335,23 @@ type RuntimedConfig struct {
 	// derives for itself (baseSocketDenies) — an empty value still yields a
 	// profile that denies the runtimed control socket.
 	DeniedUnixSocketPaths []string
+	// DeniedLocalPorts are loopback-only TCP ports every pod's SBPL denies
+	// connect() to — notably this node's EFFECTIVE kine (etcd shim) port,
+	// 127.0.0.1:<KinePort>: pods run as the same _k3sm uid as kine, so without
+	// this a networked native pod could dial the control-plane datastore
+	// directly. The SBPL generator does not know what listens on a given port,
+	// it only denies, so the caller (cmd/k3sm) supplies the node's resolved
+	// port here. Threaded as data for the same reason as
+	// DeniedUnixSocketPaths: runtimed cannot import the distribution.
+	//
+	// Every value MUST be a valid TCP port (1-65535); NewRuntimed rejects an
+	// out-of-range value and fails construction closed rather than silently
+	// stamping pods with a garbage deny. An empty list denies nothing.
+	//
+	// PORT-ONLY CEILING: the generator can only deny the port, not the
+	// service — a Service published on the same port is equally unreachable
+	// from a confined pod.
+	DeniedLocalPorts []int
 	// Network is the pod-IP seam (the podnet adapter over darwin-net's IPAM,
 	// shared verbatim with the embedded runtimed daemon (Deps.Network) so
 	// there is exactly ONE allocator: the provider's CreatePod resolves the pod's
@@ -427,6 +461,13 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
+	}
+	// Validated FIRST, before any real construction below: an out-of-range
+	// denied local port is a config bug, and this node must fail closed rather
+	// than build a runtime whose pods carry a silently-wrong (or silently
+	// empty) deny stanza for the control-plane datastore port.
+	if _, err := normalizeLocalPortDenies(cfg.DeniedLocalPorts); err != nil {
+		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
 	// runtimed never talks to the apiserver: the provider (which holds the client)
 	// supplies the volume Resolver + imagePullSecret CredentialResolver. nil client
@@ -559,6 +600,16 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		"cluster_domain", cfg.ClusterDomain)
 	podLogsDir := podLogsDirOf(cfg)
 	locks := podlogs.NewDirLocks()
+	// NewRuntimed already fails construction closed on an out-of-range entry
+	// (validated before it ever calls this helper), so the only caller that can
+	// reach an error here is a test injecting newRuntimedWith directly with a
+	// bad value — treat that the same way an unresolved toolchain dir is
+	// treated: log it and carry no denial, rather than panicking a helper with
+	// no error return.
+	deniedLocalPorts, err := normalizeLocalPortDenies(cfg.DeniedLocalPorts)
+	if err != nil {
+		log.Error("denied local ports config invalid, denying none", "err", err)
+	}
 	r := &runtimedRuntime{
 		rt:            rt,
 		nodeName:      cfg.NodeName,
@@ -571,6 +622,9 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		// tests share, so no caller can construct a provider whose pods are missing
 		// the base deny-set.
 		deniedSocks: unionSocketDenies(baseSocketDenies(cfg.Root), cfg.DeniedUnixSocketPaths),
+		// Computed HERE for the same reason: a node fact the pod path must
+		// never re-derive per pod.
+		deniedLocalPorts: deniedLocalPorts,
 		// Resolved HERE, in the one constructor production and the fake-injected
 		// tests share, for the same reason as the deny-set above: a node fact the
 		// pod path must never re-derive per pod.
@@ -770,6 +824,49 @@ func unionSocketDenies(sets ...[]string) []string {
 	}
 	slices.Sort(out)
 	return slices.Compact(out)
+}
+
+// stampLocalPortDenies merges the node's denied-local-port set onto sp,
+// UNCONDITIONALLY — for every pod, exactly like stampSocketDenies, and for the
+// same reason: the SBPL generator (not this method) is what decides whether a
+// pod that requested no network gets a deny stanza emitted at all, and the
+// provider must not pre-empt that by omitting the field for a "plain" pod. A
+// nil profile is a no-op.
+func (r *runtimedRuntime) stampLocalPortDenies(sp *runtimev1.SandboxProfile) {
+	if sp == nil {
+		return
+	}
+	sp.DeniedLocalPorts = unionLocalPortDenies(sp.GetDeniedLocalPorts(), r.deniedLocalPorts)
+}
+
+// unionLocalPortDenies returns the sorted, deduplicated union of the port
+// sets. Union — never replace — for the same additivity reason as
+// unionSocketDenies.
+func unionLocalPortDenies(sets ...[]uint32) []uint32 {
+	var out []uint32
+	for _, set := range sets {
+		out = append(out, set...)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// normalizeLocalPortDenies validates and returns the sorted, deduplicated set
+// of RuntimedConfig.DeniedLocalPorts as the apis wire type (uint32). Every
+// value MUST be a valid TCP port (1-65535); an out-of-range value is rejected
+// with an error rather than silently dropped or clamped, so a misconfigured
+// node fails construction closed instead of stamping pods with a deny stanza
+// that reads as protection it never applied.
+func normalizeLocalPortDenies(ports []int) ([]uint32, error) {
+	out := make([]uint32, 0, len(ports))
+	for _, p := range ports {
+		if p < 1 || p > 65535 {
+			return nil, fmt.Errorf("denied local port %d out of range 1-65535", p)
+		}
+		out = append(out, uint32(p))
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }
 
 // ConditionVMArtifactsAvailable is the NAME the guest-artifact capability is
@@ -1264,6 +1361,7 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	}
 	box.LogDirectory = logDir
 	r.stampSocketDenies(box.SandboxProfile)
+	r.stampLocalPortDenies(box.SandboxProfile)
 	// Xcode-toolchain opt-in: stamp the node's developer dir onto a pod that asked
 	// for it. Applied HERE and not inside toPodBox because the grant is a node
 	// fact (this node's `xcode-select -p`), which the pure pod translation does not
