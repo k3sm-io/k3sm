@@ -629,57 +629,72 @@ func (darwinSystem) CopyToRootOwned(src, dst string) error {
 	return nil
 }
 
-// linkDirMaxMode is the permission bits a link directory may NOT carry: group or
-// other write. A directory anyone in the `admin` group (or any local user) can
-// write is a directory in which the launcher can be swapped for something else,
-// and the launcher is what a human types.
-const linkDirMaxMode = 0o022
-
-// checkLinkDirTrust reports whether dir is a directory k3sm is willing to write a
-// launcher symlink into: a REAL directory (not a symlink to one), not group- or
-// other-writable, and — when we are actually running as root, which is the only
-// posture in which the answer is meaningful — owned by uid 0.
+// checkLinkDirTrust reads dir off the disk and hands the facts that decide its
+// trust to linkDirVerdict, which owns the judgement and the refusal message
+// (install.go — including the reason the judgement exists at all: the launcher
+// directory is on root's PATH). launcherDir is the directory the launcher is
+// actually wanted in, which differs from dir only when the judgement has been
+// escalated to an ancestor; the verdict needs it to choose a remedy that does
+// not tell an operator to delete a system directory.
 //
-// This is the one deliberate exception to the privilege model's "the binary and
-// plist live in /Library/k3sm, never a Homebrew, /usr/local or /Applications
-// prefix an `admin`-group member could overwrite" rule (docs/privilege-model.md
-// §Root-owned everything). The exception is narrow and is trusted ONLY because
-// this check holds: nothing executable is placed in /usr/local/bin, only a
-// symlink back into the root-owned tree, and the link is refused outright unless
-// the directory holding it is itself root-owned and unwritable by anyone else —
-// i.e. unless /usr/local/bin has the same trust properties /Library does. On a
-// host where Homebrew has taken /usr/local/bin for the admin group, install
-// refuses to link rather than quietly creating a hijackable entry point.
-//
-// The uid-0 half is conditional on os.Geteuid()==0 on purpose: an unprivileged
-// caller (the unit table, a dry run) cannot chown anything anyway, and demanding
-// root ownership of a temp dir it just made would make the function untestable
-// without proving anything about the production path.
-func checkLinkDirTrust(dir string) error {
+// An ABSENT dir is routed through the verdict table too, rather than returned as
+// the raw Lstat error: ENOENT on a path the operator never named says nothing
+// about what k3sm wanted. This wrapper is only the Lstat and the euid read; it
+// creates nothing, which is what lets LinkDirTrust be called in Install's
+// refuse-before-write phase.
+func checkLinkDirTrust(dir, launcherDir string) error {
 	fi, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	reason := ""
 	switch {
-	case fi.Mode()&fs.ModeSymlink != 0:
-		reason = "is a symlink"
-	case !fi.IsDir():
-		reason = "not a directory"
-	case fi.Mode().Perm()&linkDirMaxMode != 0:
-		reason = fmt.Sprintf("group/other writable (mode %04o)", fi.Mode().Perm())
-	case os.Geteuid() == 0:
-		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok {
-			reason = "cannot read its ownership"
-		} else if st.Uid != 0 {
-			reason = fmt.Sprintf("owned by uid %d, not root", st.Uid)
+	case errors.Is(err, fs.ErrNotExist):
+		return linkDirVerdict(dir, launcherDir, linkDirFacts{Absent: true}, os.Geteuid())
+	case err != nil:
+		return fmt.Errorf("stat link dir %s: %w", dir, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("refusing to link the k3sm launcher into %s: its ownership cannot be read, and an owner that cannot be read cannot be trusted", dir)
+	}
+	return linkDirVerdict(dir, launcherDir, linkDirFacts{
+		UID:       st.Uid,
+		Mode:      fi.Mode(),
+		IsDir:     fi.IsDir(),
+		IsSymlink: fi.Mode()&fs.ModeSymlink != 0,
+	}, os.Geteuid())
+}
+
+// linkDirTrustFor applies that check for a launcher path, resolving which
+// directory is actually judged (linkDirTrustTarget's parent-absent → grandparent
+// rule) and reporting whether link's parent has still to be created.
+//
+// READ-ONLY, by contract: two Lstats and nothing else. Both callers depend on
+// that — LinkDirTrust because it runs before install has written a single byte,
+// EnsureSymlink because it must not create the parent before the directory that
+// would hold it has been trusted.
+func linkDirTrustFor(link string) (parentAbsent bool, err error) {
+	parent := filepath.Dir(link)
+	parentExists := true
+	if _, err := os.Lstat(parent); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return false, fmt.Errorf("stat link dir %s: %w", parent, err)
 		}
+		parentExists = false
 	}
-	if reason == "" {
-		return nil
+	trustDir, parentAbsent := linkDirTrustTarget(link, parentExists)
+	// parent is passed as the launcher directory in BOTH cases: when the
+	// judgement escalates, the verdict has to name the directory k3sm actually
+	// wants (and would create) rather than the ancestor it is judging, or its
+	// remedy reads as "delete /usr/local".
+	if err := checkLinkDirTrust(trustDir, parent); err != nil {
+		return parentAbsent, err
 	}
-	return fmt.Errorf("refusing to link into %s: %s — k3sm only installs a launcher into a root-owned, non-world-writable directory", dir, reason)
+	return parentAbsent, nil
+}
+
+// LinkDirTrust reports whether the launcher directory for link is trusted. See
+// the System interface for the contract, and linkDirVerdict for the judgement.
+func (darwinSystem) LinkDirTrust(link string) error {
+	_, err := linkDirTrustFor(link)
+	return err
 }
 
 // EnsureSymlink lays down (or repairs) the `k3sm` launcher symlink at link,
@@ -701,19 +716,13 @@ func checkLinkDirTrust(dir string) error {
 // asserted — only root can be that writer, and root is who we already are.
 func (darwinSystem) EnsureSymlink(target, link string) error {
 	parent := filepath.Dir(link)
-	// Trust the directory that will hold the link. When the parent does not exist
-	// yet we must trust its GRANDPARENT instead, because that is the directory
-	// whose permissions decide who could have created the parent before us.
-	trustDir := parent
-	parentAbsent := false
-	if _, err := os.Lstat(parent); err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("stat link dir %s: %w", parent, err)
-		}
-		parentAbsent = true
-		trustDir = filepath.Dir(parent)
-	}
-	if err := checkLinkDirTrust(trustDir); err != nil {
+	// Trust the directory that will hold the link, BEFORE any write. Install has
+	// already asked the same question through System.LinkDirTrust, in its
+	// refuse-before-write phase; asking it again here is defense in depth over
+	// one function rather than a second rule, and it is this call — not the
+	// preflight — that guards the write.
+	parentAbsent, err := linkDirTrustFor(link)
+	if err != nil {
 		return err
 	}
 	if parentAbsent {

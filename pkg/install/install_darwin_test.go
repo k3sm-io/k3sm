@@ -38,11 +38,14 @@ import (
 // branches and manipulate directory modes, and t.TempDir() cleanup of a mode-
 // stripped directory is easier to reason about serially.
 //
-// One branch this table cannot reach: the uid-0 half of the directory-trust
-// check (checkLinkDirTrust's "owned by uid N, not root"). It is gated on
+// One branch this table cannot reach on a live filesystem: the uid-0 half of the
+// directory-trust check ("owned by uid N, not root"). It is gated on
 // os.Geteuid()==0 precisely because an unprivileged run cannot chown a temp dir
-// to root; it is covered by the live release-gate install, which runs as root
-// against the real /usr/local/bin.
+// to root. That arm — and the wording of every refusal, which an operator has to
+// act on — is asserted against the pure linkDirVerdict in
+// TestEnsureSymlinkNamesTheRemedyForAnUntrustedLinkDir instead; what this table
+// still owns is that the real Lstat-driven wrapper reaches those verdicts from
+// an actual directory.
 
 func TestEnsureSymlink(t *testing.T) {
 	sys := darwinSystem{}
@@ -128,7 +131,7 @@ func TestEnsureSymlink(t *testing.T) {
 				mkdir(t, filepath.Join(root, "bin"), 0o775)
 				return filepath.Join(root, "bin", "k3sm"), filepath.Join(root, "Library", "k3sm")
 			},
-			wantErr: "refusing to link into",
+			wantErr: "refusing to link the k3sm launcher into",
 		},
 		{
 			name: "a world-writable link dir is refused",
@@ -136,7 +139,7 @@ func TestEnsureSymlink(t *testing.T) {
 				mkdir(t, filepath.Join(root, "bin"), 0o757)
 				return filepath.Join(root, "bin", "k3sm"), filepath.Join(root, "Library", "k3sm")
 			},
-			wantErr: "refusing to link into",
+			wantErr: "refusing to link the k3sm launcher into",
 		},
 		{
 			name: "a link dir that is itself a symlink to a dir is refused",
@@ -147,7 +150,7 @@ func TestEnsureSymlink(t *testing.T) {
 				}
 				return filepath.Join(root, "bin", "k3sm"), filepath.Join(root, "Library", "k3sm")
 			},
-			wantErr: "refusing to link into",
+			wantErr: "refusing to link the k3sm launcher into",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -190,7 +193,7 @@ func TestEnsureSymlink(t *testing.T) {
 				t.Errorf("link dir mode = %04o, want no group/other write", perm)
 			}
 			if os.Geteuid() == 0 {
-				if err := checkLinkDirTrust(parent); err != nil {
+				if err := checkLinkDirTrust(parent, parent); err != nil {
 					t.Errorf("link dir must satisfy the trust check after creation: %v", err)
 				}
 			}
