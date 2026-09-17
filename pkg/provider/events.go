@@ -277,6 +277,22 @@ func msgFailedGPUFit(want, admitted, ceiling int64) string {
 		gpuFitGiB(want), gpuFitGiB(admitted), gpuFitGiB(ceiling), mlxv1alpha1.ResourceGPU)
 }
 
+// msgFailedGPUUnbounded is the FailedGPUFit-event message for a GPU pod that
+// declares no enforceable memory limit on a node that knows its GPU ceiling.
+//
+// It shares the reason with msgFailedGPUFit because it is the same refusal from
+// the operator's side (this pod will not start on this node for want of a GPU
+// memory budget), but the text is a different one: naming the three byte counts
+// would be misleading here, since the missing number is the pod's own. The way
+// out is stated as the field to set, because that is the whole fix, and every
+// MLXModel-rendered pod already carries it.
+func msgFailedGPUUnbounded(ceiling int64) string {
+	return fmt.Sprintf("Error: this pod requests %s but declares no memory limit on every container, so the node "+
+		"cannot fit it against its %s of usable GPU memory and would be overcommitting the GPU by an amount "+
+		"nothing can measure. Set spec.containers[].resources.limits.memory on every container.",
+		mlxv1alpha1.ResourceGPU, gpuFitGiB(ceiling))
+}
+
 // gpuFitGiB renders a byte count as the binary quantity a pod's memory limit is
 // written in, so the message compares its three numbers in the notation the
 // offending spec used rather than in raw bytes.

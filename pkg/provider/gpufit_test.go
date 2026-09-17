@@ -19,6 +19,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -258,27 +259,105 @@ func TestCreatePodGPUCumulativeFit(t *testing.T) {
 		}
 	})
 
-	// A GPU POD WITH NO ENFORCEABLE MEMORY LIMIT contributes nothing and is
-	// refused by nothing: podMemoryLimitBytes reports 0 for it, the provider has
-	// no number to budget with, and substituting a guess would refuse pods against
-	// a total nothing measured. It is admitted, and it does not squeeze the next
-	// pod out either.
-	t.Run("unlimited_gpu_pod_neither_refused_nor_counted", func(t *testing.T) {
+	// A GPU POD WITH NO ENFORCEABLE MEMORY LIMIT IS REFUSED on a node that knows
+	// its ceiling, and this is the one refusal that is NOT about this pod being
+	// too big. podMemoryLimitBytes measures such a pod as 0, so admitting it would
+	// let it contribute nothing to the admitted total for its whole life: every
+	// later pod would then be fit against a node that looks emptier than it is,
+	// and the GPU would be overcommitted by exactly the amount nothing could
+	// measure. The check would still be green while being permanently defeated.
+	t.Run("unlimited_gpu_pod_refused_under_a_known_ceiling", func(t *testing.T) {
 		t.Parallel()
 		ctx := context.Background()
-		r, _, _ := gpuFitRuntime(t, 4*testGiB)
+		r, f, rec := gpuFitRuntime(t, 4*testGiB)
 
-		unlimited := gpuFitPod("unlimited", 0, true)
-		unlimited.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
-			corev1.ResourceName(mlxv1alpha1.ResourceGPU): *resource.NewQuantity(1, resource.DecimalSI),
+		err := r.CreatePod(ctx, unlimitedGPUPod("unlimited"))
+		if err == nil {
+			t.Fatal("CreatePod(unlimited) = nil, want a refusal — an unmeasurable GPU pod defeats every later fit")
 		}
-		if err := r.CreatePod(ctx, unlimited); err != nil {
-			t.Fatalf("CreatePod(unlimited) = %v, want it admitted", err)
+		if !errors.Is(err, mlx.ErrGPUMemoryUnbounded) {
+			t.Errorf("CreatePod error %v does not wrap mlx.ErrGPUMemoryUnbounded", err)
 		}
+		if _, creates := f.counts(); creates != 0 {
+			t.Errorf("CreatePod RPC calls = %d, want 0 — the refusal must land BEFORE the RPC", creates)
+		}
+		if r.trackByID("uid-unlimited") != nil {
+			t.Error("the refused pod was tracked; an untracked refusal is what keeps it out of the admitted total")
+		}
+		ev := findEvent(rec.Events, reasonFailedGPUFit)
+		if ev == "" {
+			t.Fatal("no FailedGPUFit Event recorded")
+		}
+		// The message names the FIELD TO SET, not three byte counts: the number
+		// that is missing is the pod's own, so echoing the node's would misdirect.
+		for _, want := range []string{"limits.memory", mlxv1alpha1.ResourceGPU, "4Gi"} {
+			if !strings.Contains(ev, want) {
+				t.Errorf("Event %q does not name %q", ev, want)
+			}
+		}
+		// The refusal did not consume budget either: the whole ceiling is free.
 		if err := r.CreatePod(ctx, gpuFitPod("sized", 4*testGiB, true)); err != nil {
-			t.Fatalf("CreatePod(sized) = %v, want the whole ceiling still available", err)
+			t.Fatalf("CreatePod(sized) = %v, want the whole ceiling still available after the refusal", err)
 		}
 	})
+
+	// The SAME pod on a node with no readable ceiling is admitted: there is no
+	// budget for it to defeat, and refusing would turn an unreadable fact into a
+	// node no GPU pod can be scheduled on.
+	t.Run("unlimited_gpu_pod_admitted_under_an_unknown_ceiling", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		r, f, rec := gpuFitRuntime(t, 0)
+
+		if err := r.CreatePod(ctx, unlimitedGPUPod("unlimited")); err != nil {
+			t.Fatalf("CreatePod(unlimited) = %v, want it admitted against an unknown ceiling", err)
+		}
+		if _, creates := f.counts(); creates != 1 {
+			t.Errorf("CreatePod RPC calls = %d, want 1", creates)
+		}
+		if ev := findEvent(rec.Events, reasonFailedGPUFit); ev != "" {
+			t.Errorf("recorded %q against an unknown ceiling, want no %s event", ev, reasonFailedGPUFit)
+		}
+	})
+
+	// THE ADMITTED SUM SATURATES RATHER THAN WRAPPING. Memory limits come off pod
+	// specs, which are validated for shape and not for sanity, so two of them near
+	// MaxInt64 can carry the running sum past it. A wrapped sum is NEGATIVE, and a
+	// negative admitted total turns every later comparison into a pass — the check
+	// would admit everything on exactly the node whose bookkeeping overflowed, and
+	// report nothing. Saturating fails toward the refusal instead.
+	t.Run("a_pathological_admitted_sum_refuses_rather_than_wrapping", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		r, f, _ := gpuFitRuntime(t, 4*testGiB)
+
+		for _, name := range []string{"huge-a", "huge-b"} {
+			p := gpuFitPod(name, math.MaxInt64-1, true)
+			r.mu.Lock()
+			r.track[string(p.UID)] = &podTrack{pod: p}
+			r.mu.Unlock()
+		}
+		err := r.CreatePod(ctx, gpuFitPod("next", testGiB, true))
+		if err == nil {
+			t.Fatal("CreatePod(next) = nil, want a refusal — an overflowed admitted total must not read as free capacity")
+		}
+		if !errors.Is(err, mlx.ErrGPUMemoryOverCeiling) {
+			t.Errorf("CreatePod error %v does not wrap mlx.ErrGPUMemoryOverCeiling", err)
+		}
+		if _, creates := f.counts(); creates != 0 {
+			t.Errorf("CreatePod RPC calls = %d, want 0", creates)
+		}
+	})
+}
+
+// unlimitedGPUPod builds a pod that requests the GPU and sets NO memory limit on
+// its container, which is what podMemoryLimitBytes measures as 0.
+func unlimitedGPUPod(name string) *corev1.Pod {
+	pod := gpuFitPod(name, 0, true)
+	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+		corev1.ResourceName(mlxv1alpha1.ResourceGPU): *resource.NewQuantity(1, resource.DecimalSI),
+	}
+	return pod
 }
 
 // TestAdmittedGPUMemoryLocked pins the summing rule the CreatePod check depends

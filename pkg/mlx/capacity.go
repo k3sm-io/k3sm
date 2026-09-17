@@ -64,6 +64,14 @@ const MaxGPUSlots = 2
 // deletion fixes — from a transient create failure.
 var ErrGPUMemoryOverCeiling = errors.New("pod does not fit in the node's GPU memory ceiling beside the pods already admitted")
 
+// ErrGPUMemoryUnbounded is the sibling sentinel for a GPU pod refused because it
+// declares no enforceable memory limit at all, on a node that DOES know its GPU
+// memory ceiling. It is a separate sentinel rather than a second spelling of
+// ErrGPUMemoryOverCeiling because the operator's fix is different in kind: the
+// over-ceiling pod is too big and must shrink or wait for room, while this one is
+// unmeasurable and must declare a limit before any budget can hold it.
+var ErrGPUMemoryUnbounded = errors.New("pod requests the GPU without an enforceable memory limit, so it cannot be fit against the node's GPU memory ceiling")
+
 // GPUCeilingBytes reports the node's USABLE GPU memory ceiling in bytes, or 0
 // when no ceiling is known.
 //
@@ -134,12 +142,27 @@ func GPUSlots(f *runtimev1.GPUFacts) int64 {
 // against, and refusing on an unknown would make every GPU pod on a node whose
 // Metal working set could not be read unschedulable.
 //
-// The comparison is written as want ≤ ceiling-admitted rather than
+// A want of 0 on a KNOWN ceiling is refused, with ErrGPUMemoryUnbounded. 0 is
+// what a pod with no enforceable memory limit measures (podMemoryLimitBytes
+// returns it when any container is unbounded), and admitting it is the one
+// outcome that defeats this whole check permanently: the pod contributes 0 to
+// the admitted total for as long as it lives, so every later pod is fit against
+// a node that looks emptier than it is, and the GPU is overcommitted by exactly
+// the amount nobody could measure. Refusing is also the actionable answer — the
+// operator adds a memory limit, which every MLXModel-rendered pod already
+// carries — whereas admitting it fails later, mid-load, with no reason attached
+// to any object.
+//
+// The fit comparison is written as want ≤ ceiling-admitted rather than
 // admitted+want ≤ ceiling so that a pathological admitted sum cannot overflow
 // into a pass.
 func GPUFits(ceiling, admitted, want int64) error {
 	if ceiling <= 0 {
 		return nil
+	}
+	if want <= 0 {
+		return fmt.Errorf("%w: the node's usable GPU memory ceiling is %s, with %s already admitted",
+			ErrGPUMemoryUnbounded, humanBytes(ceiling), humanBytes(admitted))
 	}
 	if want <= ceiling-admitted {
 		return nil

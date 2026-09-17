@@ -182,6 +182,10 @@ func TestGPUCapacityPolicy(t *testing.T) {
 			admitted int64
 			want     int64
 			wantErr  bool
+			// wantUnbounded picks WHICH refusal: the unmeasurable pod carries a
+			// different sentinel from the too-big one, because the operator's fix
+			// differs in kind.
+			wantUnbounded bool
 		}{
 			{
 				// THE REFUSAL this whole file exists for: 3 GiB is already admitted
@@ -217,11 +221,20 @@ func TestGPUCapacityPolicy(t *testing.T) {
 				name: "unknown_ceiling_admits", ceiling: 0, admitted: 64 * gib, want: 64 * gib,
 			},
 			{
-				// A pod with no enforceable memory limit (podMemoryLimitBytes returns
-				// 0) is counted as wanting nothing rather than as wanting everything:
-				// the provider has no number for it, and inventing one would refuse
-				// it on a node with plenty of room.
-				name: "zero_want_always_fits", ceiling: 4 * gib, admitted: 4 * gib, want: 0,
+				// A POD WITH NO ENFORCEABLE MEMORY LIMIT IS REFUSED on a node that
+				// knows its ceiling. podMemoryLimitBytes measures it as 0, and
+				// admitting a 0 is the one outcome that defeats this check for
+				// good: the pod contributes nothing to the admitted total for its
+				// whole life, so every later pod is fit against a node that looks
+				// emptier than it is.
+				name: "unbounded_want_refused_under_a_known_ceiling", ceiling: 4 * gib, admitted: 0, want: 0,
+				wantErr: true, wantUnbounded: true,
+			},
+			{
+				// The SAME pod on a node with no known ceiling is admitted: there is
+				// no budget for it to defeat, and refusing would turn an unreadable
+				// fact into an unschedulable node.
+				name: "unbounded_want_admitted_under_an_unknown_ceiling", ceiling: 0, admitted: 0, want: 0,
 			},
 			{
 				// An already-overcommitted node (a smaller ceiling after a daemon
@@ -238,6 +251,15 @@ func TestGPUCapacityPolicy(t *testing.T) {
 				if tc.wantErr {
 					if err == nil {
 						t.Fatalf("GPUFits(%d, %d, %d) = nil, want a refusal", tc.ceiling, tc.admitted, tc.want)
+					}
+					if tc.wantUnbounded {
+						if !errors.Is(err, ErrGPUMemoryUnbounded) {
+							t.Errorf("GPUFits error %v does not wrap ErrGPUMemoryUnbounded; the caller cannot tell an unmeasurable pod from one that is merely too big", err)
+						}
+						if errors.Is(err, ErrGPUMemoryOverCeiling) {
+							t.Errorf("GPUFits error %v also wraps ErrGPUMemoryOverCeiling; the two refusals have different fixes and must stay distinguishable", err)
+						}
+						return
 					}
 					if !errors.Is(err, ErrGPUMemoryOverCeiling) {
 						t.Errorf("GPUFits error %v does not wrap ErrGPUMemoryOverCeiling; a caller cannot tell it from a transient failure", err)

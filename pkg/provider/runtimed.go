@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -1470,8 +1471,14 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 				"namespace", pod.Namespace, "name", pod.Name,
 				"want_bytes", gpuWant, "admitted_bytes", admitted, "ceiling_bytes", gpuCeiling,
 				"err", err)
-			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit,
-				msgFailedGPUFit(gpuWant, admitted, gpuCeiling))
+			// One reason, two messages: a pod with no memory limit at all is the
+			// same refusal from the operator's side, but the three byte counts
+			// would be misleading when the missing number is the pod's own.
+			msg := msgFailedGPUFit(gpuWant, admitted, gpuCeiling)
+			if errors.Is(err, mlx.ErrGPUMemoryUnbounded) {
+				msg = msgFailedGPUUnbounded(gpuCeiling)
+			}
+			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msg)
 			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
@@ -1578,7 +1585,18 @@ func (r *runtimedRuntime) admittedGPUMemoryLocked(excludeID string) int64 {
 		if !podRequestsGPU(t.pod) {
 			continue
 		}
-		sum += podMemoryLimitBytes(t.pod)
+		// SATURATING, never wrapping. Limits come off pod specs, which are
+		// operator-authored and validated only for shape, so a pathological pair
+		// of them can carry the running sum past MaxInt64 — and a wrapped sum is
+		// NEGATIVE, which turns every subsequent fit comparison into a pass. That
+		// failure is silent and permanent: the check would admit everything on
+		// exactly the node whose bookkeeping had overflowed. Saturating fails the
+		// other way, refusing, which is the direction a capacity check must fail.
+		v := podMemoryLimitBytes(t.pod)
+		if v > math.MaxInt64-sum {
+			return math.MaxInt64
+		}
+		sum += v
 	}
 	return sum
 }

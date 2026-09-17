@@ -26,6 +26,10 @@ A free slot is not enough on its own. A second model also has to fit in GPU memo
 or the node refuses it and records a `FailedGPUFit` event on the pod naming what it wanted, what is
 already committed, and the ceiling. Lower one model's `memory`, or delete the other, and it starts.
 
+A pod that requests the GPU has to declare a container memory limit. One without a limit on every
+container is refused on any node that knows its ceiling, because the node cannot budget for it. An
+`MLXModel` always carries one, derived from `memory`.
+
 ## 2. Apply a Model
 
 [`examples/mlxmodel.yaml`](../../examples/mlxmodel.yaml) serves a small pinned model and is the fastest
