@@ -590,7 +590,7 @@ phases:
         acceptance:
           - id: M10.0-a1
             met: true
-            check: "INTEGRATION-PENDING (needs a dev Mac; boots only `k3sm server`, no root/GPU/reboot, so it runs in hack/ci.sh --integration). The M10.0 §-gate enforcement e2e is the MILESTONE PROOF (Res.6/9), not the B70 argv unit test: apply a privileged pod → expect 403; grep the audit file for the event at the asserted LEVEL; a negative control asserts k3sm system pods + a baseline reference workload are still ADMITTED; the apiserver boot smoke-test asserts it starts. The supplementary build checks are pkg/executor::TestApiserverArgs_AuditPolicyWired (asserting the level) + pkg/policy::TestPSADefaultLevel + pkg/policy::TestDefaultLimitRangeMemoryOnly."
+            check: "PROVEN 2026-09-17 on a single-node dev Mac (recorded in the maintainers' run log): TestM10_AuditLogLevel as root (the audit file is 0600 by design), TestM10_PSADefaultWarn, and the argv-reversible enforce cutover TestM10_PSAEnforceCutover under K3SM_PSA_ENFORCE=1, all PASS, with webhook delivery through the proxy (TestAdmissionWebhookDeliveryThroughProxy and TestConversionWebhookDeliveryThroughProxy, vm-backed) green on the same rig. It boots only `k3sm server` (no GPU/reboot), so it also runs in hack/ci.sh --integration. The M10.0 §-gate enforcement e2e is the MILESTONE PROOF (Res.6/9), not the B70 argv unit test: apply a privileged pod → expect 403; grep the audit file for the event at the asserted LEVEL; a negative control asserts k3sm system pods + a baseline reference workload are still ADMITTED; the apiserver boot smoke-test asserts it starts. The supplementary build checks are pkg/executor::TestApiserverArgs_AuditPolicyWired (asserting the level) + pkg/policy::TestPSADefaultLevel + pkg/policy::TestDefaultLimitRangeMemoryOnly."
             method: integration
       - id: M10.1
         title: per-pod IP + DNS/StatefulSet identity — podnet adapter, converge on runtimed, default-runtime-flip decision
@@ -1486,7 +1486,7 @@ logging + the PSA cluster-default level + memory-only default objects, **not** "
 ceiling. **Strategy: hard cut** for the docs/ledger encoding; each runtime sub-phase carries its own anchor.
 Every sub-phase is driven by the release/build process. Pull-forward M10.0/M10.1 (interleave with M7/M8, v0.1.1);
 M10.2/M10.3/M10.4 are the post-launch **v0.2** headline.
-- ⬜ **M10.0** — apiserver conformance config (**hard cut (binary) + a PSA-enforce cutover**, Res.2): audit logging
+- ✅ **M10.0** — apiserver conformance config (**hard cut (binary) + a PSA-enforce cutover**, Res.2): audit logging
   (a shipped policy at `level: Metadata`, `secrets`/`configmaps` pinned to Metadata/None as an ordered first-match
   rule → no Secret cleartext at rest; the gate asserts the LEVEL; 0600 + Seatbelt-denied + off the datastore
   volume, Res.4); PSA **baseline-warn first → enforce after a clean pre-flight scan** (argv-reversible cutover;
