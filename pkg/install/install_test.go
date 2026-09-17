@@ -52,6 +52,7 @@ func TestMain(m *testing.M) {
 	dataroot.FstabPath = filepath.Join(dir, "fstab")
 	dataroot.DefaultRecordPath = filepath.Join(dir, "io.k3sm.datavol.json")
 	dataroot.DefaultServerArgsRecordPath = filepath.Join(dir, "io.k3sm.server-args.json")
+	dataroot.DefaultAgentArgsRecordPath = filepath.Join(dir, "io.k3sm.agent-args.json")
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -100,6 +101,11 @@ type fakeSystem struct {
 	// SECOND Install over the same fake describes the real "already correct"
 	// reinstall rather than a fresh lay-down.
 	links map[string]string
+	// modes is what FileMode answers, keyed by path — the operator's join token
+	// file being the only thing the installer judges by mode. A path with no
+	// entry but present in files is 0600, so an unconfigured fake describes a
+	// credential nobody else can read.
+	modes map[string]fs.FileMode
 	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
 	// path. The zero value (no entry) means "signed and entitled" so that every
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
@@ -120,6 +126,10 @@ type fakeSystem struct {
 	// that a LATER install reads it back — a fake that only remembered the
 	// struct would leave the uninstall-then-install gate asserting nothing.
 	serverArgs map[string]dataroot.ServerArgsRecord
+	// agentArgs is the same for the agent role's record. The two maps are
+	// separate because the two records are separate files that never cross
+	// roles, and a fake that pooled them could not tell the difference.
+	agentArgs map[string]dataroot.AgentArgsRecord
 }
 
 // putDrain makes the fake launchd keep label in the domain for reads
@@ -174,9 +184,11 @@ func (f *fakeSystem) putMissingPath(path string) {
 func shrinkRestartBudgets(t *testing.T) {
 	t.Helper()
 	tiny := restartBudget{unload: 50 * time.Millisecond, running: 50 * time.Millisecond, poll: time.Microsecond}
-	netdOrig, serverOrig := netdRestartBudget, serverRestartBudget
-	netdRestartBudget, serverRestartBudget = tiny, tiny
-	t.Cleanup(func() { netdRestartBudget, serverRestartBudget = netdOrig, serverOrig })
+	netdOrig, serverOrig, joinOrig := netdRestartBudget, serverRestartBudget, agentJoinBudget
+	netdRestartBudget, serverRestartBudget, agentJoinBudget = tiny, tiny, tiny
+	t.Cleanup(func() {
+		netdRestartBudget, serverRestartBudget, agentJoinBudget = netdOrig, serverOrig, joinOrig
+	})
 }
 
 // putEntitlement makes the faked codesign probe report err for path — the seam at
@@ -199,6 +211,29 @@ func (f *fakeSystem) putFile(path string, content []byte) {
 		f.files = map[string][]byte{}
 	}
 	f.files[path] = content
+}
+
+// putFileMode makes FileMode report perm for path — how a test describes an
+// operator's token file that anyone can read.
+func (f *fakeSystem) putFileMode(path string, perm fs.FileMode) {
+	if f.modes == nil {
+		f.modes = map[string]fs.FileMode{}
+	}
+	f.modes[path] = perm
+}
+
+// FileMode answers 0600 for any seeded file a test has not said otherwise
+// about, so an unconfigured fake describes a well-permissioned credential and
+// only a test that cares states the exposure.
+func (f *fakeSystem) FileMode(path string) (fs.FileMode, error) {
+	f.calls = append(f.calls, "FileMode:"+path)
+	if perm, ok := f.modes[path]; ok {
+		return perm, nil
+	}
+	if _, ok := f.files[path]; ok {
+		return 0o600, nil
+	}
+	return 0, fmt.Errorf("stat %s: %w", path, fs.ErrNotExist)
 }
 
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
@@ -390,6 +425,11 @@ func (f *fakeSystem) RemoveAll(path string) error {
 			delete(f.serverArgs, p)
 		}
 	}
+	for p := range f.agentArgs {
+		if under(p) {
+			delete(f.agentArgs, p)
+		}
+	}
 	return nil
 }
 
@@ -462,6 +502,35 @@ func (f *fakeSystem) WriteServerArgsRecord(path string, rec dataroot.ServerArgsR
 		return err
 	}
 	f.putFile(path, data)
+	return nil
+}
+
+// WriteAgentArgsRecord is WriteServerArgsRecord's sibling for the agent role:
+// it remembers the record AND lands its real encoding in the fake root
+// filesystem, so a later install's ReadFile of that path decodes exactly what a
+// real installer would have written.
+func (f *fakeSystem) WriteAgentArgsRecord(path string, rec dataroot.AgentArgsRecord) error {
+	f.calls = append(f.calls, "WriteAgentArgsRecord:"+path)
+	if f.agentArgs == nil {
+		f.agentArgs = map[string]dataroot.AgentArgsRecord{}
+	}
+	rec.Version = dataroot.AgentArgsRecordVersion
+	f.agentArgs[path] = rec
+	data, err := dataroot.EncodeAgentArgsRecord(rec)
+	if err != nil {
+		return err
+	}
+	f.putFile(path, data)
+	return nil
+}
+
+// WriteServiceUserFile records the path, the MODE, the directory mode and the
+// uid the installer asked for — the four things that decide whether the
+// unprivileged daemon can read what root just wrote — and lands the bytes in
+// the fake root filesystem so a later read sees them.
+func (f *fakeSystem) WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("WriteServiceUserFile:%s:%#o:%#o:%d", path, mode, dirMode, uid))
+	f.putFile(path, contents)
 	return nil
 }
 
@@ -594,6 +663,9 @@ func TestInstallOrchestration(t *testing.T) {
 	}
 
 	want := []string{
+		// Before anything is written: is the OTHER role's daemon already on this
+		// Mac? A node is a control plane or a worker, never both.
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.agent.plist",
 		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
 		"EnsureLogDir:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
@@ -714,9 +786,19 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
+			// The FIRST privileged call — the cross-role probe ahead of it is a
+			// read, and install performs nothing else before the service user
+			// exists: the data root is its home, and every later step writes into it.
 			wantCall := "EnsureServiceUser:_k3sm:" + want
-			if len(f.calls) == 0 || f.calls[0] != wantCall {
-				t.Fatalf("first call = %v, want %q", f.calls, wantCall)
+			var first string
+			for _, c := range f.calls {
+				if !strings.HasPrefix(c, "ReadFile:") {
+					first = c
+					break
+				}
+			}
+			if first != wantCall {
+				t.Fatalf("first privileged call = %q (calls %v), want %q", first, f.calls, wantCall)
 			}
 		})
 	}
@@ -800,6 +882,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		t.Fatalf("Uninstall: %v", err)
 	}
 	want := []string{
+		// Uninstall asks the disk which roles are installed before it tears
+		// anything down, so a Mac that was installed as a worker has its agent
+		// daemon swept by the same run.
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.agent.plist",
 		// The container-log tree goes FIRST (the manifest is walked in reverse
 		// install order) and it goes at all, unlike DataRoot and the daemon
 		// LogDir: every file in it belongs to a pod that will not exist once k3sm
@@ -932,9 +1018,10 @@ func TestServerPlistRaisesFileLimit(t *testing.T) {
 		mustContain(t, s, needle)
 	}
 
-	// (3) Server-ONLY: netd is not the UDP-relay host, so its plist carries no
-	// resource limits. This also proves SoftFileLimit is conditional (not emitted
-	// for every plist) — the field is honored, not hard-wired into renderPlist.
+	// (3) NODE daemons only: netd is not a relay host, so its plist carries no
+	// resource limits (the agent's does — it runs the same Service proxy). This
+	// also proves SoftFileLimit is conditional (not emitted for every plist) —
+	// the field is honored, not hard-wired into renderPlist.
 	if n := string(NetdPlist(Config{})); strings.Contains(n, "SoftResourceLimits") {
 		t.Error("NetdPlist must NOT raise file limits (the raise is server-only)")
 	}
@@ -1121,6 +1208,25 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 		}
 		if !removed[a.path] {
 			gaps = append(gaps, "plist leaked: "+a.path)
+		}
+	}
+
+	// Files handed to the service user (the staged join token). They live under
+	// the PRESERVED data root, which no sweep reaches, so uninstall must name
+	// each one: a credential install wrote and uninstall forgot would sit on the
+	// machine after k3sm is gone.
+	for _, call := range recorded(installCalls, "WriteServiceUserFile:") {
+		path, _, ok := strings.Cut(call, ":")
+		if !ok {
+			gaps = append(gaps, "unparsable WriteServiceUserFile record: "+call)
+			continue
+		}
+		disp, known := fileDispByPath(m, path)
+		switch {
+		case !known:
+			gaps = append(gaps, "off-manifest service-user file: "+path)
+		case disp == dispRemove && !removed[path]:
+			gaps = append(gaps, "artifact not removed: "+path)
 		}
 	}
 

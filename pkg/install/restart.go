@@ -66,7 +66,7 @@ type restartBudget struct {
 // them to microseconds; nothing in the product writes them.
 //
 // netd is a single Go process with no orderly teardown to perform, so 30s is
-// generous. The server is not: its plist sets ExitTimeOut 45 (launchd's SIGTERM →
+// generous. A node daemon is not: its plist sets ExitTimeOut 45 (launchd's SIGTERM →
 // SIGKILL grace), and the control plane tears its components down serially inside
 // that window, so any unload budget at or below 45s would time out on precisely
 // the slow-but-healthy shutdown the wait exists to tolerate. 60s clears it with
@@ -74,13 +74,30 @@ type restartBudget struct {
 var (
 	netdRestartBudget   = restartBudget{unload: 30 * time.Second, running: 30 * time.Second, poll: 250 * time.Millisecond}
 	serverRestartBudget = restartBudget{unload: 60 * time.Second, running: 60 * time.Second, poll: 250 * time.Millisecond}
+	// agentJoinBudget bounds the wait for a FIRST join to produce a credential
+	// (see verifyDaemons). It is a different question from a restart, so it is a
+	// different budget: nothing is being unloaded, and the clock is the join
+	// round-trip — a bootstrap dial, two CSRs signed by the control plane, and
+	// the write. 60s is the same order as the server's, and comfortably longer
+	// than the agent's own 30s terminal backoff, so a token the server rejects
+	// is observed as the failure it is rather than as an install that ran out of
+	// patience.
+	agentJoinBudget = restartBudget{unload: 60 * time.Second, running: 60 * time.Second, poll: 250 * time.Millisecond}
 )
 
-// restartBudgetFor returns the budget for a label. Only the server gets the long
-// one; every other daemon (netd today) gets the short one, so a daemon added to
-// the manifest later inherits the conservative default rather than the server's.
+// restartBudgetFor returns the budget for a label. The two NODE daemons get the
+// long one; every other daemon (netd today) gets the short one, so a daemon
+// added to the manifest later inherits the conservative default rather than the
+// node's.
+//
+// The agent is in the long class for the reason its own plist sets ExitTimeOut
+// 45: its teardown is not instantaneous either (it closes the mesh device and
+// drains the Service proxy's listeners), so any unload budget at or below that
+// SIGTERM-to-SIGKILL grace would time out on precisely the slow-but-healthy
+// shutdown the wait exists to tolerate — and the install would then refuse to
+// bootstrap into a label it had just asked to stop.
 func restartBudgetFor(label string) restartBudget {
-	if label == ServerLabel {
+	if label == ServerLabel || label == AgentLabel {
 		return serverRestartBudget
 	}
 	return netdRestartBudget
@@ -106,7 +123,7 @@ func restartDaemons(ctx context.Context, sys System, m []artifact, logger *slog.
 		touched = append(touched, a.label)
 		if err := restartDaemon(ctx, sys, a.label, a.oneshot, logger); err != nil {
 			recovery := recoverBootedOut(sys, touched)
-			states, _ := daemonStates(sys)
+			states, _ := daemonStates(sys, longRunningDaemonLabels(m))
 			return fmt.Errorf("%w; %s; daemon state: %s", err, recovery, strings.Join(states, ", "))
 		}
 	}
@@ -312,9 +329,9 @@ func recoverBootedOut(sys System, labels []string) string {
 // startup, so a single read immediately after the bootstrap tests the wrong thing.
 // The error names the state of EVERY component, not just the first bad one — an
 // operator needs to know what IS running as much as what is not.
-func verifyDaemons(ctx context.Context, sys System, cfg Config) error {
-	states, healthy := daemonStates(sys)
-	switch err := awaitPath(ctx, sys, cfg.NetdSocket, restartBudgetFor(NetdLabel)); {
+func verifyDaemons(ctx context.Context, sys System, cfg Config, m []artifact) error {
+	states, healthy := daemonStates(sys, longRunningDaemonLabels(m))
+	switch err := awaitPath(ctx, sys, cfg.NetdSocket, "netd is not serving the helper socket the control plane dials", restartBudgetFor(NetdLabel)); {
 	case err == nil:
 		states = append(states, cfg.NetdSocket+" present")
 	default:
@@ -322,16 +339,62 @@ func verifyDaemons(ctx context.Context, sys System, cfg Config) error {
 		healthy = false
 	}
 	if !healthy {
-		return fmt.Errorf("the restarted daemons are not both healthy: %s", strings.Join(states, "; "))
+		return fmt.Errorf("the restarted daemons are not all healthy: %s", strings.Join(states, "; "))
 	}
-	cfg.Logger.Info("verified both daemons after the restart", "state", strings.Join(states, "; "))
+	if err := verifyAgentJoined(ctx, sys, cfg); err != nil {
+		return err
+	}
+	cfg.Logger.Info("verified the daemons after the restart", "state", strings.Join(states, "; "))
 	return nil
 }
 
+// verifyAgentJoined is the extra assertion an agent install needs, and the
+// reason a pid is not enough on this role.
+//
+// `k3sm agent` treats its terminal start failures as things to back off from
+// rather than to die of: a token the cluster rejects, a token file that is not
+// there when no credential is either, a corrupt credential. That is right for a
+// KeepAlive daemon (the alternative is a spawn loop), and it means a broken
+// worker presents launchd with a perfectly healthy pid for 30 seconds at a
+// time. An install that verified the pid alone would report success and hand
+// the operator a node that never appears in `kubectl get nodes`.
+//
+// So when THIS install staged a token — i.e. the operator asked for a join to
+// happen now — it waits for the first externally visible product of that join,
+// the node credential the agent writes (AgentCredentialPath). When no token was
+// staged, there is nothing to wait for: either the node already holds a
+// credential, in which case the pid IS the whole claim, or it holds none and
+// the daemon is backing off with an error the log names, which is not something
+// this install caused and not something it can fix.
+func verifyAgentJoined(ctx context.Context, sys System, cfg Config) error {
+	if cfg.Role != RoleAgent || cfg.TokenFile == "" {
+		return nil
+	}
+	cred := AgentCredentialPath(cfg.DataRoot)
+	if err := awaitPath(ctx, sys, cred, "the agent has not written the credential a completed join produces", agentJoinBudget); err != nil {
+		return fmt.Errorf("the agent daemon is running but has not joined the cluster: %v (it backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the reason is the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one)",
+			err, agentTerminalBackoffNote, AgentLogPath())
+	}
+	cfg.Logger.Info("the agent joined the cluster", "credential", cred)
+	return nil
+}
+
+// agentTerminalBackoffNote is how long `k3sm agent` waits between terminal start
+// attempts, quoted in the message above so an operator reading it knows why the
+// log repeats on a fixed interval. It is prose, not a control: the agent owns
+// the value (cmd/k3sm's agentTerminalBackoff), and this is the installer saying
+// what it observed rather than setting it.
+const agentTerminalBackoffNote = "30s"
+
 // awaitPath polls for path to appear, within the budget's running window. Its
-// error text is a state clause, because verifyDaemons reports it alongside the two
+// error text is a state clause, because verifyDaemons reports it alongside the
 // pid clauses rather than wrapping it.
-func awaitPath(ctx context.Context, sys System, path string, b restartBudget) error {
+//
+// absent is what the caller says the absence MEANS — the file is generic, the
+// conclusion is not. It is a parameter rather than a sentence baked in here
+// because there are now two waits with nothing in common but the polling: a
+// netd socket that is not being served, and a join that has not happened.
+func awaitPath(ctx context.Context, sys System, path, absent string, b restartBudget) error {
 	deadline := time.Now().Add(b.running)
 	for {
 		ok, err := sys.PathExists(path)
@@ -344,7 +407,7 @@ func awaitPath(ctx context.Context, sys System, path string, b restartBudget) er
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s ABSENT after %s (netd is not serving the helper socket the control plane dials)", path, b.running)
+			return fmt.Errorf("%s ABSENT after %s (%s)", path, b.running, absent)
 		}
 		select {
 		case <-ctx.Done():
@@ -360,14 +423,20 @@ func awaitPath(ctx context.Context, sys System, path string, b restartBudget) er
 // so an operator reading either error reads the same sentence about the same
 // machine and never has to guess which daemon survived.
 //
-// It names the two LONG-RUNNING daemons only. The datavol oneshot is deliberately
+// The labels come from the caller, which derives them from the MANIFEST
+// (longRunningDaemonLabels) rather than from a list typed here: the node daemon
+// is io.k3sm.server on a control plane and io.k3sm.agent on a worker, and a
+// hard-coded pair would report an agent install as a control plane that never
+// came up, failing the install over a daemon it was never asked to lay down.
+//
+// It names the LONG-RUNNING daemons only. The datavol oneshot is deliberately
 // absent: its healthy state is "ran and exited", which this function would report
 // as DOWN and verifyDaemons would then fail the install over. `k3sm status` reads
 // its last exit code, which is the question that actually has an answer.
-func daemonStates(sys System) ([]string, bool) {
-	states := make([]string, 0, 2)
+func daemonStates(sys System, labels []string) ([]string, bool) {
+	states := make([]string, 0, len(labels))
 	healthy := true
-	for _, label := range []string{NetdLabel, ServerLabel} {
+	for _, label := range labels {
 		pid, err := sys.LaunchctlServicePID(label)
 		switch {
 		case err != nil:
@@ -381,4 +450,18 @@ func daemonStates(sys System) ([]string, bool) {
 		}
 	}
 	return states, healthy
+}
+
+// longRunningDaemonLabels returns the labels of the manifest's long-running
+// daemons, in manifest order: netd, then the role's node daemon. The oneshot
+// (io.k3sm.datavol) is excluded, because it is designed to exit and "has a live
+// pid" is therefore not its health.
+func longRunningDaemonLabels(m []artifact) []string {
+	out := make([]string, 0, 2)
+	for _, a := range m {
+		if a.kind == kindDaemon && !a.oneshot {
+			out = append(out, a.label)
+		}
+	}
+	return out
 }

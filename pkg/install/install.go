@@ -60,6 +60,12 @@ const (
 	NetdLabel = "io.k3sm.netd"
 	// ServerLabel is the control-plane LaunchDaemon (UserName=_k3sm).
 	ServerLabel = "io.k3sm.server"
+	// AgentLabel is the joining-worker LaunchDaemon (UserName=_k3sm): `k3sm
+	// agent`, the node half of the distribution on a Mac that has no control
+	// plane of its own. It is the SIBLING of ServerLabel, never its companion —
+	// a node carries one or the other, which is what RoleServer/RoleAgent
+	// decide and what Install refuses to blur.
+	AgentLabel = "io.k3sm.agent"
 	// DatavolLabel is the data-volume mount LaunchDaemon. It is root, it is a
 	// ONESHOT (`k3sm datavol mount` mounts and exits), and it exists because
 	// launchd offers no ordering: netd and the server would otherwise race disk
@@ -153,7 +159,7 @@ const (
 	// LogDir is where the daemons' stdout/stderr are written.
 	LogDir = "/var/log/k3sm"
 	// LogDirMode, LogDirGID and LogFileMode are the ownership POLICY for that
-	// directory and for the three daemon logs inside it: service-user-owned,
+	// directory and for the daemon logs inside it: service-user-owned,
 	// group ADMIN (gid 80), directory 0750, files 0640.
 	//
 	// The group is `admin` and deliberately NOT the `staff` of DataRootGID.
@@ -171,7 +177,7 @@ const (
 	// root jobs (netd, datavol) bypass the mode entirely. Per launchd.plist(5)
 	// a path that ALREADY exists is simply opened, and only a missing one is
 	// created from the job's identity and umask — which is why EnsureLogDir
-	// pre-creates all three files rather than leaving their mode to the umask
+	// pre-creates every one of those files rather than leaving their mode to the umask
 	// in force when a daemon first spawned.
 	LogDirMode  fs.FileMode = 0o750
 	LogDirGID   int         = 80
@@ -205,6 +211,40 @@ const (
 	ContainerLogDirGID  int         = 0
 )
 
+// The join-token copy's ownership POLICY, and why the installer makes a copy at
+// all.
+//
+// The agent daemon runs as the unprivileged service user. The file an operator
+// writes the join token into is theirs: it is created by a root shell, it lives
+// wherever they chose (/var/root is the obvious place), and root-owned 0600
+// under a 0750 home is a file the service user cannot open, nor even traverse
+// to. Rendering that path into the daemon's argv would have produced a worker
+// that could never read the token it was pointed at, and nothing in the install
+// would have said so.
+//
+// So Install, which IS root, reads the operator's file once and writes the
+// token where the daemon can reach it: inside the agent's own work dir, owned
+// by the service user, 0600 in a 0700 directory. The operator's file is never
+// referenced again and stays theirs to delete.
+const (
+	// AgentTokenDirMode is the mode of the agent work dir the copy lives in:
+	// service-user-owned, nobody else, because the node credential the agent
+	// stores after its join lives in the same directory.
+	AgentTokenDirMode fs.FileMode = 0o700
+	// AgentTokenFileMode is the mode of the copy itself: the credential is
+	// readable by exactly the uid that must present it.
+	AgentTokenFileMode fs.FileMode = 0o600
+	// agentWorkSubdir is the agent's state root under the data root, the same
+	// directory `k3sm agent --work-dir` defaults to, so the token the installer
+	// stages and the state the agent keeps are one tree rather than two.
+	agentWorkSubdir = "agent"
+	// agentTokenName is the leaf name of the staged token.
+	agentTokenName = "join-token"
+	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
+	// writes on a successful join — see AgentCredentialPath.
+	agentNodeKubeconfigName = "node.kubeconfig"
+)
+
 // datavolStagingName is the leaf name of the migration staging mount point. It
 // is stated once and joined onto whichever install dir a Config names, so
 // DatavolStagingDir and Config.datavolStaging can never spell it differently.
@@ -214,6 +254,11 @@ const datavolStagingName = "datavol-staging"
 // The server plist points at it and diagnostics (`k3sm certificate rotate`'s failure
 // message) name it, so the two can never drift apart.
 func ServerLogPath() string { return filepath.Join(LogDir, "server.log") }
+
+// AgentLogPath returns the joining worker's combined stdout/stderr log path.
+// The agent plist points at it and EnsureLogDir pre-creates it, so the file
+// launchd opens and the one the installer prepares cannot drift apart.
+func AgentLogPath() string { return filepath.Join(LogDir, "agent.log") }
 
 // NetdLogPath returns the root network helper's combined stdout/stderr log path.
 // The netd plist points at it, so — like ServerLogPath — the plist and any
@@ -261,6 +306,41 @@ func RunDir(dataRoot string) string {
 		dataRoot = sandbox.DefaultWorkDir
 	}
 	return filepath.Join(dataRoot, sandbox.RunSubdir)
+}
+
+// Role is which k3sm node this install lays down: the control plane, or a
+// worker that joins one. It is a closed pair because a Mac is one or the other:
+// the server IS a node (it runs its own Virtual Kubelet), so a machine carrying
+// both daemons would register twice and fight itself over the same data root,
+// the same run dir and the same netd helper.
+//
+// The empty Role is RoleServer, so every existing caller — and every Config a
+// test writes without thinking about roles — keeps describing the install k3sm
+// has always performed.
+type Role string
+
+const (
+	// RoleServer lays down the control plane (io.k3sm.server). The default.
+	RoleServer Role = "server"
+	// RoleAgent lays down a joining worker (io.k3sm.agent) instead.
+	RoleAgent Role = "agent"
+)
+
+// other returns the role this one is not — the one whose daemon must not be on
+// disk when this one is installed.
+func (r Role) other() Role {
+	if r == RoleAgent {
+		return RoleServer
+	}
+	return RoleAgent
+}
+
+// daemonLabel is the LaunchDaemon label a role's node daemon carries.
+func (r Role) daemonLabel() string {
+	if r == RoleAgent {
+		return AgentLabel
+	}
+	return ServerLabel
 }
 
 // System is the privileged-operation seam install/uninstall drive. The real
@@ -318,7 +398,7 @@ type System interface {
 	// auto-creates a missing log dir with root-only perms when the root netd job
 	// spawns first — the _k3sm server job then fails "Service could not
 	// initialize" and never spawns (an observed live-hardware failure this
-	// fixes). It also pre-creates the three daemon logs inside it at
+	// fixes). It also pre-creates the daemon logs inside it at
 	// LogFileMode, because a file launchd creates for itself takes the spawning
 	// job's umask and has been landing world-readable. Idempotent: perms/owner
 	// are re-applied to the directory AND to those files on every install,
@@ -422,6 +502,26 @@ type System interface {
 	// and so the write happens at ONE point in the install, after the carried
 	// arguments have been decided.
 	WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error
+	// WriteAgentArgsRecord writes the agent-arguments record at path, atomically
+	// and root-owned 0600 — the same contract WriteServerArgsRecord has, for the
+	// sibling record a RoleAgent install carries its operator-supplied `k3sm
+	// agent` flags in. The two records are separate files and never cross roles.
+	WriteAgentArgsRecord(path string, rec dataroot.AgentArgsRecord) error
+	// WriteServiceUserFile writes contents at path owned by the service uid at
+	// mode, creating path's parent directory owned by the same uid at dirMode.
+	// It is how the root installer hands a file to the unprivileged user a
+	// daemon runs as — today the staged join token, whose whole problem is that
+	// the operator's own copy is root-only (see AgentTokenFileMode).
+	//
+	// The mode and the directory mode are PARAMETERS rather than constants read
+	// inside the implementation, so the policy a caller applied is visible at
+	// the seam and a test can assert it without touching a real filesystem.
+	WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error
+	// FileMode reports the permission bits of the file at path, with ReadFile's
+	// missing-file contract (an error satisfying errors.Is(err, fs.ErrNotExist)).
+	// The installer needs it for exactly one judgement: whether the operator's
+	// join token file is readable by anyone but its owner.
+	FileMode(path string) (fs.FileMode, error)
 	// WriteLaunchDaemon writes a launchd plist (root:wheel 0644) at plistPath.
 	WriteLaunchDaemon(plistPath string, contents []byte) error
 	// ReadFile reads a root-readable file: the installed server plist, whose
@@ -491,6 +591,29 @@ type System interface {
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
 type Config struct {
+	// Role is which node this Mac becomes: the control plane (RoleServer, the
+	// zero value) or a worker joining an existing cluster (RoleAgent). It
+	// selects which node daemon the manifest carries and which arguments record
+	// is written; everything else install lays down is identical, because a
+	// worker runs the same binary, the same shims and the same netd helper.
+	Role Role
+	// JoinServer is the control-plane host a RoleAgent node joins — an UNDERLAY
+	// address, because the join dials <host>:9345 before this node has any mesh
+	// to route over. Required for RoleAgent, ignored otherwise.
+	JoinServer string
+	// NodeIP is the joining worker's own mesh InternalIP, bound into the certs
+	// its join issues. Required for RoleAgent, ignored otherwise.
+	NodeIP string
+	// TokenFile is the OPERATOR's join-token file, read once by Install (which
+	// is root) and copied to agentTokenPath() for the daemon. It is not what the
+	// daemon reads and is never named on its argv: the operator's file is
+	// root-only by construction, and the service user the agent runs as could
+	// not open it.
+	//
+	// It is optional. A node that has already joined starts from its stored
+	// credential and needs no token at all, so a reinstall with no --token-file
+	// stages nothing and leaves whatever is already there.
+	TokenFile       string
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
 	LinkDir         string // /usr/local/bin
@@ -574,6 +697,18 @@ type Config struct {
 	// ServerArgsRecord can never disagree. The CLI parses and refuses the
 	// unspecified, loopback and multicast forms before Install ever sees it.
 	MeshIP string
+	// ExtraAgentArgs are operator-supplied `k3sm agent` arguments appended to the
+	// fixed set AgentPlist renders (--mesh-port, --dns-vip, …). Install
+	// populates it exactly as it populates ExtraServerArgs: from the agent plist
+	// already on disk, and — when there is none, which is every install that
+	// follows an uninstall — from the agent-arguments record.
+	ExtraAgentArgs []string
+	// AgentArgsRecord is where those arguments are recorded so they survive the
+	// uninstall that removes the plist they were read from. Empty takes
+	// dataroot.DefaultAgentArgsRecordPath. It is a SEPARATE file from
+	// ServerArgsRecord and is read only by a RoleAgent install, so the two
+	// records can never cross roles.
+	AgentArgsRecord string
 	// ServerArgsRecord is where the operator's own server arguments are recorded
 	// so they survive the uninstall that removes the plist they were read from.
 	// Empty takes dataroot.DefaultServerArgsRecordPath — root-owned
@@ -649,6 +784,12 @@ func (c Config) withDefaults() Config {
 	if c.ServerArgsRecord == "" {
 		c.ServerArgsRecord = dataroot.DefaultServerArgsRecordPath
 	}
+	if c.AgentArgsRecord == "" {
+		c.AgentArgsRecord = dataroot.DefaultAgentArgsRecordPath
+	}
+	if c.Role == "" {
+		c.Role = RoleServer
+	}
 	// All three seams or none: datavol refuses a partially filled Deps rather
 	// than calling through a nil interface, so a caller that supplied two of
 	// them would fail at the first operation instead of here.
@@ -711,6 +852,49 @@ func (c Config) resolvedExtraServerArgs() []string {
 // reaches nothing and the cluster CA is the right anchor; single-node binds
 // loopback and self-signs, for which no CA on disk is the anchor.
 func (c Config) meshIP() string { return flagValue(c.resolvedExtraServerArgs(), "mesh-ip") }
+
+// AgentCredentialPath is the first file `k3sm agent` writes when a token join
+// succeeds: the node kubeconfig in the agent work dir under dataRoot. An empty
+// dataRoot means the default.
+//
+// It is what makes an agent install VERIFIABLE. The daemon's pid says only that
+// launchd spawned it; an agent whose token was wrong sits in its own terminal
+// backoff with a perfectly healthy pid, and an install that reported success
+// there would have handed the operator a worker that never joins. This file
+// appearing is the first externally visible fact that the join actually
+// happened.
+//
+// The name is stated here because pkg/install cannot import cmd/k3sm, and the
+// two are bound by a test on the cmd side that asserts this path equals the
+// credential store's own kubeconfig path. If that test goes red, the verifier
+// is watching a file nothing writes.
+func AgentCredentialPath(dataRoot string) string {
+	if dataRoot == "" {
+		dataRoot = DefaultDataRoot
+	}
+	return filepath.Join(dataRoot, agentWorkSubdir, agentNodeKubeconfigName)
+}
+
+// agentTokenPath is where Install stages the join token for the agent daemon to
+// read: <DataRoot>/agent/join-token, service-user-owned 0600 (see
+// AgentTokenFileMode). It is derived from the data root rather than configured,
+// because it is not an operator's choice: it is the one path the renderer puts
+// on the daemon's argv and the one path the installer writes, and a second
+// spelling of either would be a daemon pointed at a file nobody wrote.
+func (c Config) agentTokenPath() string {
+	return filepath.Join(c.DataRoot, agentWorkSubdir, agentTokenName)
+}
+
+// argsRecordPath is the arguments record THIS role reads and writes: the
+// server record on a control plane, the agent record on a worker. It is an
+// accessor rather than a branch at each use so no code path can pick up the
+// other role's file by forgetting the role it is in.
+func (c Config) argsRecordPath() string {
+	if c.Role == RoleAgent {
+		return c.AgentArgsRecord
+	}
+	return c.ServerArgsRecord
+}
 
 // installedBinary is the path the k3sm binary is copied to.
 func (c Config) installedBinary() string {
@@ -898,9 +1082,25 @@ func artifactManifest(cfg Config) []artifact {
 	if cfg.dataVolumeDeclared {
 		items = append(items, artifact{kind: kindDaemon, disp: dispRemove, label: DatavolLabel, path: cfg.plistPath(DatavolLabel), oneshot: true, assertExists: false})
 	}
+	// The staged join token, for an agent node only, and REMOVED on uninstall
+	// unlike everything else under the preserved data root. It is a credential
+	// with no further use once the node has joined (the stored node credential
+	// is what every later start presents), so leaving it behind would leave a
+	// cluster-joining secret on a machine somebody just uninstalled k3sm from.
+	// It sits before the daemon entries so the reverse uninstall walk removes it
+	// AFTER the agent has been booted out, never from under a running daemon.
+	// assertExists is false: an install that staged no token wrote no file.
+	if cfg.Role == RoleAgent {
+		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.agentTokenPath(), assertExists: false})
+	}
+	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
+	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is
+	// ever in a manifest — a Mac that carried both would register two nodes out
+	// of one data root — and the position is the same either way, because both
+	// depend on the helper netd bootstraps first.
 	items = append(items, []artifact{
 		{kind: kindDaemon, disp: dispRemove, label: NetdLabel, path: cfg.plistPath(NetdLabel), assertExists: true},
-		{kind: kindDaemon, disp: dispRemove, label: ServerLabel, path: cfg.plistPath(ServerLabel), assertExists: true},
+		{kind: kindDaemon, disp: dispRemove, label: cfg.Role.daemonLabel(), path: cfg.plistPath(cfg.Role.daemonLabel()), assertExists: true},
 
 		// The admin kubeconfig in the human's home — preserved (it may hold other
 		// clusters; k3sm never owns the whole file).
@@ -921,13 +1121,15 @@ func artifactManifest(cfg Config) []artifact {
 	if cfg.dataVolumeDeclared {
 		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: dataroot.DefaultRecordPath, assertExists: false})
 	}
-	// The server-arguments record, UNCONDITIONALLY and preserved: every install
+	// The role's arguments record, UNCONDITIONALLY and preserved: every install
 	// writes one (an empty set is the truthful record of a node with no operator
 	// flags), and an uninstall must keep it or the next install is back to
 	// re-rendering the stock template over an operator's configuration. It lives
 	// outside InstallDir so the sweep cannot reach it; the entry is here to say
-	// that is deliberate, and to put it in the list uninstall prints.
-	items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.ServerArgsRecord, assertExists: false})
+	// that is deliberate, and to put it in the list uninstall prints. A server
+	// install names the server record and an agent install the agent one, so
+	// neither role can ever be handed the other's flags.
+	items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.argsRecordPath(), assertExists: false})
 	items = append(items, []artifact{
 		// The container-log tree is REMOVED on uninstall, unlike the daemon LogDir
 		// above and unlike DataRoot. It holds no state a reinstall wants and no
@@ -951,6 +1153,8 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 		return NetdPlist(cfg), nil
 	case ServerLabel:
 		return ServerPlist(cfg), nil
+	case AgentLabel:
+		return AgentPlist(cfg), nil
 	case DatavolLabel:
 		return DatavolPlist(cfg), nil
 	default:
@@ -969,6 +1173,15 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	}
 	if cfg.TargetUser == "" {
 		return fmt.Errorf("install: TargetUser (the kubeconfig owner, e.g. $SUDO_USER) is required")
+	}
+	// BEFORE anything is written, and before a single byte is copied: a Mac
+	// carries one role. Installing the other one over it would leave two node
+	// daemons bootstrapped out of one data root, one run dir and one netd
+	// socket — two Kubernetes nodes claiming the same machine — and the
+	// half-overwritten state would outlive whichever install failed second.
+	// Refusing here costs an operator one command and nothing else.
+	if err := refuseCrossRole(sys, cfg); err != nil {
+		return err
 	}
 	if cfg.AdminToken == "" {
 		tok, err := generateToken()
@@ -1045,6 +1258,17 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     vm-RuntimeClass pod fails to boot.
 	if err := sys.EnsureVMRunDir(VMRunDir, uid); err != nil {
 		return fmt.Errorf("install: ensure vm run dir %s: %w", VMRunDir, err)
+	}
+
+	// 1e. The join token, staged where the daemon can actually read it. It needs
+	//     the service uid, so it cannot happen before EnsureServiceUser, and it
+	//     happens before the plist that names it is written. A reinstall with no
+	//     --token-file stages nothing and leaves any previous copy alone: a
+	//     joined node presents its stored credential and needs no token.
+	if cfg.Role == RoleAgent && cfg.TokenFile != "" {
+		if err := stageJoinToken(sys, cfg, uid); err != nil {
+			return err
+		}
 	}
 
 	// 2. Copy the binary to the exact path the plists exec (installedBinary()),
@@ -1143,13 +1367,26 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     install finds neither source and preserves nothing; --token is
 	//     deliberately NOT preserved (it is install-managed and re-minted here, in
 	//     lockstep with the kubeconfig).
-	extra, err := installedServerArgs(sys, cfg)
-	if err != nil {
-		return err
-	}
-	cfg.ExtraServerArgs = extra
-	if len(extra) > 0 {
-		cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", redactedServerArgsText(extra))
+	//     An agent install does the same for `k3sm agent`, through its own plist
+	//     and its own record; the two roles never read each other's.
+	if cfg.Role == RoleAgent {
+		extra, err := installedAgentArgs(sys, cfg)
+		if err != nil {
+			return err
+		}
+		cfg.ExtraAgentArgs = extra
+		if len(extra) > 0 {
+			cfg.Logger.Info("preserved operator-supplied agent arguments across reinstall", "args", redactedServerArgsText(extra))
+		}
+	} else {
+		extra, err := installedServerArgs(sys, cfg)
+		if err != nil {
+			return err
+		}
+		cfg.ExtraServerArgs = extra
+		if len(extra) > 0 {
+			cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", redactedServerArgsText(extra))
+		}
 	}
 	// 2d″. An explicit --mesh-ip on THIS install replaces whatever --mesh-ip was
 	//      just carried over — see Config.MeshIP and resolvedExtraServerArgs,
@@ -1164,7 +1401,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      The plist this install is about to write will not survive the next
 	//      `k3sm uninstall`; the record lives in the preserved data root and
 	//      does.
-	if err := writeServerArgsRecord(sys, cfg); err != nil {
+	if err := writeArgsRecord(sys, cfg); err != nil {
 		return err
 	}
 
@@ -1220,13 +1457,21 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     reports success having left a daemon down is worse than one that fails:
 	//     the operator walks away, and the breakage surfaces later as something
 	//     else entirely (a cluster whose DNS stopped answering).
-	if err := verifyDaemons(ctx, sys, cfg); err != nil {
+	if err := verifyDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 
-	// 5. Write the admin kubeconfig to the human's home (owned by them, not root).
-	if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
-		return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
+	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
+	//    — on a CONTROL PLANE only. A worker has no apiserver of its own and no
+	//    admin credential to carry: writing one there would point kubectl at a
+	//    loopback address nothing serves, with a token no cluster honours, over
+	//    whatever the operator's ~/.kube/config already said about the real
+	//    cluster. An operator administers a k3sm cluster from the server's
+	//    kubeconfig (or a copy of it), never from the worker's.
+	if cfg.Role != RoleAgent {
+		if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
+			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
+		}
 	}
 	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
 	return nil
@@ -1305,7 +1550,13 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	}
 	cfg.dataVolumeDeclared = st.Volume != nil
 
-	m := artifactManifest(cfg)
+	// Whatever is actually on this Mac, not merely what this Config describes:
+	// uninstall tears down the role it was asked about AND the other role's
+	// daemon when that one's plist is on disk. A node changes role by
+	// uninstalling and installing again, and an uninstall that swept only the
+	// default role would leave the other one's KeepAlive plist behind pointing
+	// at a deleted binary — the exact leak the shared manifest exists to prevent.
+	m := uninstallManifest(sys, cfg)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
 		switch a.disp {
@@ -1384,7 +1635,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// server flags they configured are still there — and guessing wrong in the
 	// safe direction means restoring a backup nobody needed to take.
 	cfg.Logger.Info("kept, so a reinstall picks up where you left off: "+strings.Join(keptArtifacts(cfg, m), ", "),
-		"remove-the-carried-server-arguments", "sudo rm "+cfg.ServerArgsRecord)
+		"remove-the-carried-arguments", "sudo rm "+cfg.argsRecordPath())
 	if st.Volume != nil {
 		// The volume is data, not an artifact: it holds the datastore, the image
 		// blobs and every PersistentVolume, so uninstall leaves it mounted and
@@ -1421,6 +1672,8 @@ func keptArtifacts(cfg Config, m []artifact) []string {
 			kept = append(kept, "the daemon log dir "+a.path)
 		case a.path == cfg.ServerArgsRecord:
 			kept = append(kept, "the server arguments you configured, in "+a.path)
+		case a.path == cfg.AgentArgsRecord:
+			kept = append(kept, "the agent arguments you configured, in "+a.path)
 		case a.path == dataroot.DefaultRecordPath:
 			kept = append(kept, "the data-volume record "+a.path)
 		default:
@@ -1454,8 +1707,9 @@ func NetdPlist(cfg Config) []byte {
 }
 
 // serverFileLimit is the soft+hard RLIMIT_NOFILE (launchd NumberOfFiles) the
-// server LaunchDaemon requests. The server process hosts the Service proxy / UDP
-// relay, whose flow budget darwin-net sizes as max(8192, rl.Cur/2)
+// server AND agent LaunchDaemons request — both host a node, and a worker runs
+// the same Service proxy the control plane does. The process hosts the proxy /
+// UDP relay, whose flow budget darwin-net sizes as max(8192, rl.Cur/2)
 // (defaultUDPFlowBudget) — so the fd table it reads must be raised above launchd's
 // 256 default, which floors the budget at 8192 with NO headroom for the
 // co-resident apiserver/kine.
@@ -1510,9 +1764,77 @@ func ServerPlist(cfg Config) []byte {
 		// teardown runs after that, serially, for at most its own 5s bound
 		// (meshTeardownTimeout), which the 45s still covers.
 		ExitTimeOut: 45,
-		// Server-only: raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes
-		// against a real fd table, not launchd's 256 default. Binds at bootstrap,
-		// not on kickstart -k — see the serverFileLimit reload contract above.
+		// Raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes against a real
+		// fd table, not launchd's 256 default (the agent plist does the same; netd
+		// is not a relay host). Binds at bootstrap, not on kickstart -k — see the
+		// serverFileLimit reload contract above.
+		SoftFileLimit: serverFileLimit,
+	})
+}
+
+// agentThrottleInterval is launchd's minimum seconds between spawns of the
+// agent job. The agent's terminal start failures — no credential and no token,
+// an expired credential, a cluster that has forgotten this node's MeshPeer —
+// recur identically on the next start, and KeepAlive respawns an exited job
+// immediately, so without a throttle a node that cannot join burns a core and
+// floods agent.log while looking, from the outside, like an agent that is
+// running. 10 is launchd's own default, stated explicitly because it is a
+// decision here rather than an inherited one: the agent already backs off
+// in-process (agentTerminalBackoff) and this is the supervisor-side floor
+// under it.
+const agentThrottleInterval = 10
+
+// AgentPlist renders the io.k3sm.agent LaunchDaemon plist — the joining
+// worker's daemon, the sibling of ServerPlist on a Mac that has no control
+// plane of its own. It runs as the same unprivileged _k3sm user, with the same
+// data root as its working directory and HOME, and reaches the root helper over
+// the same netd socket.
+//
+// The join credential is rendered as a --token-file PATH and NEVER as a token
+// value. A LaunchDaemon plist is root-owned 0644, so a token on this argv would
+// be readable by every account on the Mac and visible in `ps` for the life of
+// the process; the file the path names is the operator's, is read once at
+// start, and is theirs to delete once the node has joined. A node that has
+// already joined needs neither: it starts from its stored credential.
+//
+// ExitTimeOut is the server's 45 seconds and for the same class of reason —
+// launchd's 20s default is a SIGKILL deadline, and the agent's teardown is not
+// instantaneous: it drains the Service proxy's listeners and then runs the same
+// deferred mesh teardown the server does, bounded by meshTeardownTimeout, and a
+// SIGKILL part-way through leaves a utun and its routes behind on a node that
+// looks stopped.
+func AgentPlist(cfg Config) []byte {
+	cfg = cfg.withDefaults()
+	args := []string{
+		cfg.installedBinary(), "agent",
+		"--server", cfg.JoinServer,
+		"--node-ip", cfg.NodeIP,
+		// The STAGED copy, unconditionally — never Config.TokenFile, which is a
+		// root-only file this user cannot open, and never a token value. The
+		// path is rendered even on an install that staged nothing: the agent
+		// treats a missing token file as "no token" and starts from its stored
+		// credential, so this is the one durable place a token is ever read
+		// from, and the argv does not churn between installs.
+		"--token-file", cfg.agentTokenPath(),
+	}
+	args = append(args, cfg.ExtraAgentArgs...)
+	return renderPlist(launchdPlist{
+		Label:            AgentLabel,
+		UserName:         cfg.ServiceUser,
+		ProgramArguments: args,
+		RunAtLoad:        true,
+		KeepAlive:        true,
+		ThrottleInterval: agentThrottleInterval,
+		WorkingDirectory: cfg.DataRoot,
+		StdoutPath:       AgentLogPath(),
+		StderrPath:       AgentLogPath(),
+		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
+		ExitTimeOut:      45,
+		// The same RLIMIT_NOFILE raise the control plane gets, for the same
+		// reason and with the same reload contract: a worker hosts the Service
+		// proxy and the UDP relay, whose flow budget darwin-net sizes as
+		// max(8192, rl.Cur/2), so under launchd's 256-fd default the budget
+		// floors with no headroom for the node's own watches and pod streams.
 		SoftFileLimit: serverFileLimit,
 	})
 }
