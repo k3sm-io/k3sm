@@ -17,6 +17,7 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -184,7 +185,16 @@ func (s *TokenStore) Verify(user, secret string) error {
 
 // VerifyToken parses tok and verifies its credential against the store (the
 // convenience the server uses on the raw token string a joining node sends).
-func (s *TokenStore) VerifyToken(tok string) error {
+//
+// ctx is checked EAGERLY, before any work, and the check fails closed: a
+// cancelled or expired request is denied with the context error. The bcrypt
+// compare below is deliberately NOT run under a goroutine+select — an
+// unauthenticated route must not gain a goroutine-per-cancelled-request
+// primitive — so ctx bounds when verification STARTS, not how long it runs.
+func (s *TokenStore) VerifyToken(ctx context.Context, tok string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t, err := ParseToken(tok)
 	if err != nil {
 		return err

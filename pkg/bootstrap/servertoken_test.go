@@ -64,13 +64,13 @@ func TestServerTokenDistinctFromWorker(t *testing.T) {
 	// The StaticServerSecret authorizer: right secret allowed, wrong secret rejected,
 	// worker token rejected (constant-time compare, server-class only).
 	auth := bootstrap.NewStaticServerSecret("s3cr3t")
-	if err := auth.AuthorizeServerToken(serverTok); err != nil {
+	if err := auth.AuthorizeServerToken(t.Context(), serverTok); err != nil {
 		t.Errorf("authorize correct server token: %v", err)
 	}
-	if err := auth.AuthorizeServerToken(bootstrap.FormatServerToken(caHash, "wrong")); !errors.Is(err, bootstrap.ErrServerTokenMismatch) {
+	if err := auth.AuthorizeServerToken(t.Context(), bootstrap.FormatServerToken(caHash, "wrong")); !errors.Is(err, bootstrap.ErrServerTokenMismatch) {
 		t.Errorf("wrong-secret err = %v, want ErrServerTokenMismatch", err)
 	}
-	if err := auth.AuthorizeServerToken(workerTok); !errors.Is(err, bootstrap.ErrNotServerToken) {
+	if err := auth.AuthorizeServerToken(t.Context(), workerTok); !errors.Is(err, bootstrap.ErrNotServerToken) {
 		t.Errorf("worker-token authorize err = %v, want ErrNotServerToken", err)
 	}
 }

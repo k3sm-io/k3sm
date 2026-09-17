@@ -144,7 +144,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	req = req.WithDefaults()
 
 	// 1. Bootstrap token (authorizes the join; NOT the admin identity).
-	if err := s.cfg.Tokens.VerifyToken(req.Token); err != nil {
+	if err := s.cfg.Tokens.VerifyToken(r.Context(), req.Token); err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "token", "node", req.NodeName, "err", err)
 		http.Error(w, "invalid join token", http.StatusUnauthorized)
 		return
@@ -240,7 +240,7 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing server bootstrap token", http.StatusUnauthorized)
 		return
 	}
-	if err := s.cfg.ServerAuth.AuthorizeServerToken(token); err != nil {
+	if err := s.cfg.ServerAuth.AuthorizeServerToken(r.Context(), token); err != nil {
 		s.cfg.Logger.Warn("server-bootstrap rejected", "reason", "server-token", "err", err)
 		http.Error(w, "server bootstrap token rejected", http.StatusForbidden)
 		return

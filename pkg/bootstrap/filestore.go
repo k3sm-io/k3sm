@@ -17,6 +17,7 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -105,7 +106,14 @@ func (s *FileTokenStore) Create(ttl time.Duration) (user, secret string, expiry 
 
 // VerifyToken parses tok and verifies its credential against an unexpired persisted
 // record (constant-time bcrypt compare).
-func (s *FileTokenStore) VerifyToken(tok string) error {
+//
+// ctx is checked EAGERLY and fails closed (see TokenStore.VerifyToken): the small
+// file read and the bcrypt compare stay synchronous, so ctx bounds when
+// verification starts, not how long it runs.
+func (s *FileTokenStore) VerifyToken(ctx context.Context, tok string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t, err := ParseToken(tok)
 	if err != nil {
 		return err

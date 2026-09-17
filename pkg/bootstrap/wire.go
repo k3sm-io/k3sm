@@ -146,8 +146,9 @@ type JoinResponse struct {
 // *TokenStore satisfies it).
 type TokenVerifier interface {
 	// VerifyToken parses and verifies tok, returning nil iff it is a minted,
-	// unexpired bootstrap token.
-	VerifyToken(tok string) error
+	// unexpired bootstrap token. ctx is checked eagerly and fails closed: a
+	// cancelled request is denied, never granted.
+	VerifyToken(ctx context.Context, tok string) error
 }
 
 // BundleSource yields the AES-256-GCM-sealed CA bootstrap bundle the server-bootstrap

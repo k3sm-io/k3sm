@@ -17,6 +17,7 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -118,8 +119,9 @@ func SaveServerSecret(path, secret string) error {
 // server-class token whose secret matches is authorized; a worker token is rejected.
 type ServerAuthorizer interface {
 	// AuthorizeServerToken returns nil iff token is a server-class join token whose
-	// secret matches the server-bootstrap secret.
-	AuthorizeServerToken(token string) error
+	// secret matches the server-bootstrap secret. ctx is checked eagerly and fails
+	// closed: a cancelled request is denied, never authorized.
+	AuthorizeServerToken(ctx context.Context, token string) error
 }
 
 // StaticServerSecret authorizes against a single persisted server-bootstrap secret (the
@@ -136,7 +138,13 @@ func NewStaticServerSecret(secret string) *StaticServerSecret {
 // AuthorizeServerToken parses token as a SERVER-class token and constant-time-compares
 // its secret. A worker token (wrong user class) → ErrNotServerToken; a wrong secret →
 // ErrServerTokenMismatch.
-func (s *StaticServerSecret) AuthorizeServerToken(token string) error {
+//
+// ctx is checked EAGERLY and fails closed (see TokenStore.VerifyToken): the
+// constant-time compare stays synchronous and unwrapped.
+func (s *StaticServerSecret) AuthorizeServerToken(ctx context.Context, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t, err := ParseServerToken(token)
 	if err != nil {
 		return err
