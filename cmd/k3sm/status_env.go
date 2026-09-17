@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -58,6 +59,10 @@ const (
 	// report quotes, and reading the whole file to find them would be the most
 	// expensive thing this command does.
 	logTailBudget = 64 << 10
+	// logUnreadableLine is what the status report quotes instead of a log tail
+	// this account may not read. The daemon logs are install.LogFileMode, group
+	// admin, so an ordinary account gets EACCES on every one of them.
+	logUnreadableLine = "not readable by this account; run with sudo or as a member of admin"
 )
 
 // newStatusRunner wires the production statusRunner: the real launchctl, the
@@ -249,13 +254,31 @@ func (osStatusFS) Stat(path string) (fs.FileInfo, error) { return os.Stat(path) 
 // Readlink reads a symlink's target.
 func (osStatusFS) Readlink(path string) (string, error) { return os.Readlink(path) }
 
-// ReadTail reads the last lines of a file.
-func (osStatusFS) ReadTail(path string, lines int) ([]string, error) { return readTail(path, lines) }
-func (osStatusFS) ReadFile(path string) ([]byte, error)              { return os.ReadFile(path) }
+// ReadTail reads the last lines of a file for the STATUS REPORT, degrading a
+// permission error to logUnreadableLine rather than propagating it.
+//
+// The daemon logs are install.LogFileMode, group admin, so an ordinary account
+// gets EACCES on every one of them; that is the intended posture, not a fault,
+// and a report that quotes the reason in the row is more use than one that
+// drops the row. The `k3sm status logs` view does NOT come through here — it
+// calls readTail directly, because a command whose whole job is to print a log
+// must still exit non-zero and name the sudo that would work.
+func (osStatusFS) ReadTail(path string, lines int) ([]string, error) {
+	out, err := readTail(path, lines)
+	if errors.Is(err, fs.ErrPermission) {
+		return []string{logUnreadableLine}, nil
+	}
+	return out, err
+}
+func (osStatusFS) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
 
 // readTail returns the last n lines of path without reading the whole file: it
 // seeks to the last logTailBudget bytes and drops the first (necessarily
 // partial) line when it did seek.
+//
+// Every error, permission included, is the caller's to interpret: `k3sm status
+// logs` turns EACCES into a sudo hint and a non-zero exit, while the report
+// seam above turns it into a row.
 func readTail(path string, n int) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {

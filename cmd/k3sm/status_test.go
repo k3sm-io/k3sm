@@ -549,6 +549,32 @@ func TestReadTail(t *testing.T) {
 	if _, err := readTail(filepath.Join(dir, "absent.log"), 5); err == nil {
 		t.Fatal("readTail on an absent file returned no error")
 	}
+
+	// A log this account may not read is a ROW in the report, not an error: the
+	// daemon logs are 0640 group admin, so `k3sm status` run by an ordinary
+	// account hits this on every one of them and must still report the rest of
+	// the cluster. `k3sm status logs`, which reads the file directly, keeps the
+	// error — it owes the caller a sudo hint and a non-zero exit.
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every file regardless of mode")
+	}
+	denied := filepath.Join(dir, "denied.log")
+	if err := os.WriteFile(denied, []byte("secret\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(denied, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	lines, err = osStatusFS{}.ReadTail(denied, 5)
+	if err != nil {
+		t.Fatalf("the report seam must not fail on an unreadable log, got %v", err)
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], "not readable by this account") {
+		t.Fatalf("ReadTail on an unreadable file = %q, want the placeholder line", lines)
+	}
+	if _, err := readTail(denied, 5); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("readTail on an unreadable file = %v, want a permission error for `status logs`", err)
+	}
 }
 
 // TestStatusCollectorParsesServerArgs proves the production collector wires the

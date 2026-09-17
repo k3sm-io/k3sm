@@ -80,6 +80,12 @@ Not everything lands there. The server process's own structured logs (the LoadBa
 ingress host, the control-plane supervisor) go to **stderr**, which launchd routes to
 **`/var/log/k3sm/server.log`**. The unified-log predicate above shows none of them.
 
+The `/var/log/k3sm` directory and the daemon log files in it (`server.log`, `netd.log`,
+`datavol.log`) are readable by root and by members of the `admin` group only, because they carry
+daemon arguments, cluster endpoints and failure detail. Read them with `sudo` if your account is not
+an administrator of the Mac. `k3sm status` prints "not readable by this account" in place of a log
+tail it cannot read.
+
 ## `k3sm: command not found` After Install
 
 Install links `/usr/local/bin/k3sm` → `/Library/k3sm/k3sm`. If the shell cannot find it:
