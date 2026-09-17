@@ -214,10 +214,18 @@ else
 	DEADLINE=$((EXIT_TIMEOUT + 10))
 
 	loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
-	await_unloaded() { for _ in $(seq 1 15); do loaded "$1" || return 0; sleep 2; done; return 1; }
+	# await_unloaded waits for a job to leave launchd; the optional second argument
+	# is the bound in seconds (default 30). The server's serial teardown can take
+	# most of its ExitTimeOut, so its callers pass the deadline.
+	await_unloaded() { local n=$(( ${2:-30} / 2 )); for _ in $(seq 1 "$n"); do loaded "$1" || return 0; sleep 2; done; return 1; }
+	# await_exited waits for the server PROCESS itself to be gone: the job can be
+	# unloaded while the process is still inside its teardown, and a diskutil
+	# unmount in that window is dissented by the server's own pid, not by an
+	# orphan helper, which is a different fact from the one L2 proves.
+	await_exited() { for _ in $(seq 1 "${1:-30}"); do pgrep -f "^/Library/k3sm/k3sm server" >/dev/null 2>&1 || return 0; sleep 1; done; return 1; }
 	bootstrap_job() {
 		local label="$1" plist="$2"
-		for _ in $(seq 1 10); do
+		for _ in $(seq 1 $(( DEADLINE / 2 ))); do
 			if loaded "$label"; then return 0; fi
 			sudo launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
 			sleep 2
@@ -271,6 +279,10 @@ else
 		elif ! mounted; then
 			lab_pending "b253.L2  skipped — $DATA_ROOT is not mounted"
 		else
+			# The server must be fully out before the unmount: its own pid holds the
+			# data root as its cwd until the last stage of its teardown returns.
+			await_unloaded io.k3sm.server "$DEADLINE" || true
+			await_exited "$DEADLINE" || echo "--- the server process is still alive ${DEADLINE}s after the bootout (pids: $(pgrep -f '^/Library/k3sm/k3sm server' | tr '\n' ' '))"
 			sudo launchctl bootout system/io.k3sm.netd >/dev/null 2>&1 || true
 			await_unloaded io.k3sm.netd || true
 			unmount_out="$(sudo diskutil unmount "$DATA_ROOT" 2>&1 || true)"
