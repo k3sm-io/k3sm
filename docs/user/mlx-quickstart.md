@@ -18,9 +18,17 @@ kubectl get nodes -L mlx.k3sm.io/chip,mlx.k3sm.io/chip-family,mlx.k3sm.io/memory
 kubectl get nodes -o jsonpath='{.items[*].status.allocatable.mlx\.k3sm\.io/gpu}{"\n"}'
 ```
 
-The count is `1`, because a Mac has one integrated GPU, so **one model serves per node at a time**. A second
-`MLXModel` on the same Mac stays Pending until the first is deleted, rather than contending for the
-same device.
+The count is `1` or `2`. The node advertises two slots when its usable GPU memory ceiling holds two
+1.5 GiB slots, and one otherwise. The slots share the Mac's one integrated GPU; they do not isolate it,
+so two models on one node contend for the same device.
+
+A free slot is not enough on its own. A second model also has to fit in GPU memory alongside the first,
+or the node refuses it and records a `FailedGPUFit` event on the pod naming what it wanted, what is
+already committed, and the ceiling. Lower one model's `memory`, or delete the other, and it starts.
+
+A pod that requests the GPU has to declare a container memory limit. One without a limit on every
+container is refused on any node that knows its ceiling, because the node cannot budget for it. An
+`MLXModel` always carries one, derived from `memory`.
 
 ## 2. Apply a Model
 

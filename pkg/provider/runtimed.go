@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -41,6 +42,7 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/k3sm/pkg/mlx"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	"k3sm.io/k3sm/pkg/version"
@@ -1439,8 +1441,47 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
 	r.warnXcodeToolchainUngranted(ctx, pod, box)
 
+	// The GPU memory fit is sized BEFORE the lock, because the ceiling costs an RPC
+	// and a blocking call inside r.mu would stall every other pod operation on this
+	// node. Only the comparison and the insert need to be atomic, and they are.
+	wantsGPU := podRequestsGPU(pod)
+	var gpuCeiling, gpuWant int64
+	if wantsGPU {
+		gpuCeiling = r.gpuCeilingBytes(ctx)
+		gpuWant = podMemoryLimitBytes(pod)
+	}
+
 	r.mu.Lock()
 	old := r.track[id]
+	if wantsGPU {
+		// CHECK AND INSERT IN ONE CRITICAL SECTION. Two concurrent GPU creates that
+		// each read the admitted total before either wrote its own track would both
+		// see room and both be admitted — the node would then run a pair that does
+		// not fit, which is exactly the outcome this check exists to prevent.
+		//
+		// The total is DERIVED from r.track on every call rather than carried in a
+		// counter, so a deleted pod releases its share with no bookkeeping of its own
+		// and no counter to drift. An idempotent re-create excludes this pod's own
+		// old entry (by id), or the pod would be refused for the memory it already
+		// holds.
+		admitted := r.admittedGPUMemoryLocked(id)
+		if err := mlx.GPUFits(gpuCeiling, admitted, gpuWant); err != nil {
+			r.mu.Unlock()
+			r.log.Error("CreatePod: the pod does not fit in this node's GPU memory beside the pods already admitted",
+				"namespace", pod.Namespace, "name", pod.Name,
+				"want_bytes", gpuWant, "admitted_bytes", admitted, "ceiling_bytes", gpuCeiling,
+				"err", err)
+			// One reason, two messages: a pod with no memory limit at all is the
+			// same refusal from the operator's side, but the three byte counts
+			// would be misleading when the missing number is the pod's own.
+			msg := msgFailedGPUFit(gpuWant, admitted, gpuCeiling)
+			if errors.Is(err, mlx.ErrGPUMemoryUnbounded) {
+				msg = msgFailedGPUUnbounded(gpuCeiling)
+			}
+			r.recorder.Event(pod, corev1.EventTypeWarning, reasonFailedGPUFit, msg)
+			return fmt.Errorf("create pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+	}
 	if old != nil {
 		start = old.startTime // idempotent: keep the original start time
 	}
@@ -1492,6 +1533,72 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return nil
+}
+
+// gpuCeilingBytes reports this node's usable GPU memory ceiling in bytes, or 0
+// when it is not known — the number the cumulative admission fit compares against.
+//
+// It reads the facts off the SAME GetRuntimeInfo RPC every other node fact comes
+// from, freshly, rather than caching a copy: the ceiling moves with the host's
+// iogpu configuration and with which sandbox backend the daemon selected, and a
+// cached value would keep admitting pods against a ceiling the node no longer has.
+// The interpretation of the two fact fields is mlx.GPUCeilingBytes's, never
+// re-derived here — the node advertiser sizes its slot count with that same
+// function, and a second reading would let the advertised count and the admission
+// check disagree.
+//
+// A failed probe reports 0, which ADMITS: 0 is the unknown-ceiling sentinel, and
+// refusing every GPU pod because one RPC did not answer would turn a transient
+// daemon hiccup into an unschedulable node. The pod still faces every other
+// preflight, and runtimed still enforces the pod's own memory limit.
+func (r *runtimedRuntime) gpuCeilingBytes(ctx context.Context) int64 {
+	info, err := r.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
+	if err != nil {
+		r.log.Warn("GPU-ceiling probe failed; admitting the pod against an unknown ceiling", "err", err)
+		return 0
+	}
+	return mlx.GPUCeilingBytes(info.GetGpu())
+}
+
+// admittedGPUMemoryLocked sums the memory limits of every tracked GPU pod except
+// excludeID, the bytes already committed on this node's GPU. r.mu MUST be held.
+//
+// excludeID is the pod being admitted: an idempotent re-create of an
+// already-tracked pod must not be measured against its own previous entry, or a
+// pod that fits perfectly would be refused the second time VK sends it.
+//
+// Non-GPU pods are not counted. They use the same unified memory, but they are
+// budgeted by the node's ordinary memory Allocatable (which already carries the
+// control-plane reserve); counting them here would charge them twice and refuse
+// GPU pods on account of workloads that never touch the GPU.
+//
+// A pod whose containers do not all set a memory limit contributes 0
+// (podMemoryLimitBytes's "no enforceable ceiling"). That is the honest reading:
+// the provider has no number for it, and substituting a guess would refuse pods
+// against a total nothing measured.
+func (r *runtimedRuntime) admittedGPUMemoryLocked(excludeID string) int64 {
+	var sum int64
+	for trackedID, t := range r.track {
+		if trackedID == excludeID || t == nil || t.pod == nil {
+			continue
+		}
+		if !podRequestsGPU(t.pod) {
+			continue
+		}
+		// SATURATING, never wrapping. Limits come off pod specs, which are
+		// operator-authored and validated only for shape, so a pathological pair
+		// of them can carry the running sum past MaxInt64 — and a wrapped sum is
+		// NEGATIVE, which turns every subsequent fit comparison into a pass. That
+		// failure is silent and permanent: the check would admit everything on
+		// exactly the node whose bookkeeping had overflowed. Saturating fails the
+		// other way, refusing, which is the direction a capacity check must fail.
+		v := podMemoryLimitBytes(t.pod)
+		if v > math.MaxInt64-sum {
+			return math.MaxInt64
+		}
+		sum += v
+	}
+	return sum
 }
 
 // completeCreate performs the wiring a successful create owes, whether it was

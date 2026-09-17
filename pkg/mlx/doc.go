@@ -78,6 +78,12 @@ limitations under the License.
 // the Ready condition rather than a second computation beside it, and the
 // endpoint is published only while the model is Ready — see DeriveStatus.
 //
+// One file stands outside that framing and says so at its top: capacity.go
+// carries the node-wide GPU capacity policy — the advertised mlx.k3sm.io/gpu
+// slot count and the cumulative memory fit an admitting node checks — which
+// belongs beside the GPU vocabulary here even though its consumers (the node
+// command, the pod provider) never see an MLXModel.
+//
 // Every identifier that crosses a process boundary — the GPU resource name, the
 // GPU presence label, the provider taint key — is taken from its owning package
 // (k3sm.io/apis/mlx/v1alpha1, k3sm.io/k3sm/pkg/policy) and never respelled here.

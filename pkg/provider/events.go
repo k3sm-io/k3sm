@@ -21,9 +21,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 
+	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/runtimeclass"
 )
@@ -73,6 +75,15 @@ const (
 	// to mirror, and borrowing `Failed` would place the failure at container start,
 	// a stage this pod never reaches.
 	reasonFailedEmptyDirMedium = "FailedEmptyDirMedium"
+	// reasonFailedGPUFit is recorded when a pod requesting the GPU extended
+	// resource does not fit in this node's GPU memory beside the GPU pods already
+	// admitted, so the pod is refused BEFORE the CreatePod RPC.
+	//
+	// Like FailedImagePlatform it has no upstream analogue: the GPU slot count is a
+	// memory-derived co-tenancy budget, not a device count, so there is no kubelet
+	// reason to mirror, and `OutOfmlx.k3sm.io/gpu` (the scheduler's own out-of-resource
+	// reason) would be a lie — the slot was available, the memory beside it was not.
+	reasonFailedGPUFit = "FailedGPUFit"
 	// reasonXcodeToolchainUngranted is recorded when a pod carries the
 	// k3sm.io/xcode-toolchain annotation but this node's developer-directory
 	// selection yields no grant — the node has none, or the one it has is not a
@@ -245,6 +256,48 @@ func msgFailedEmptyDirMedium(volume, medium string) string {
 		"ordinary disk-backed directory, or schedule the pod with runtimeClassName: %s, whose "+
 		"Linux guest honours medium: Memory as a tmpfs.",
 		volume, medium, runtimeclass.Name)
+}
+
+// msgFailedGPUFit is the FailedGPUFit-event message for a GPU pod refused for
+// want of GPU memory beside the pods already admitted.
+//
+// It carries all THREE byte counts, in GiB, because no two of them are enough to
+// act on: the ceiling alone does not say how much is spoken for, the admitted
+// total alone does not say by how much this pod misses, and neither says which
+// number the operator controls. And it states both ways out, for the same reason
+// msgFailedEmptyDirMedium does: a refusal an operator cannot act on is barely
+// better than the overcommit it replaces.
+//
+// The numbers are this node's own arithmetic over pod specs and runtimed's facts
+// — no env, no args, no registry response — so there is nothing here to sanitise.
+func msgFailedGPUFit(want, admitted, ceiling int64) string {
+	return fmt.Sprintf("Error: this pod needs %s of GPU memory, but %s of the node's %s usable GPU memory "+
+		"is already committed to admitted GPU pods, so it cannot be started without overcommitting the GPU. "+
+		"Delete or shrink another pod requesting %s, or lower this pod's memory limit to fit in what is left.",
+		gpuFitGiB(want), gpuFitGiB(admitted), gpuFitGiB(ceiling), mlxv1alpha1.ResourceGPU)
+}
+
+// msgFailedGPUUnbounded is the FailedGPUFit-event message for a GPU pod that
+// declares no enforceable memory limit on a node that knows its GPU ceiling.
+//
+// It shares the reason with msgFailedGPUFit because it is the same refusal from
+// the operator's side (this pod will not start on this node for want of a GPU
+// memory budget), but the text is a different one: naming the three byte counts
+// would be misleading here, since the missing number is the pod's own. The way
+// out is stated as the field to set, because that is the whole fix, and every
+// MLXModel-rendered pod already carries it.
+func msgFailedGPUUnbounded(ceiling int64) string {
+	return fmt.Sprintf("Error: this pod requests %s but declares no memory limit on every container, so the node "+
+		"cannot fit it against its %s of usable GPU memory and would be overcommitting the GPU by an amount "+
+		"nothing can measure. Set spec.containers[].resources.limits.memory on every container.",
+		mlxv1alpha1.ResourceGPU, gpuFitGiB(ceiling))
+}
+
+// gpuFitGiB renders a byte count as the binary quantity a pod's memory limit is
+// written in, so the message compares its three numbers in the notation the
+// offending spec used rather than in raw bytes.
+func gpuFitGiB(bytes int64) string {
+	return resource.NewQuantity(bytes, resource.BinarySI).String()
 }
 
 // msgXcodeToolchainUngranted is the XcodeToolchainUngranted-event message for a
