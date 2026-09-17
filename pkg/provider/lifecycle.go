@@ -115,7 +115,7 @@ func (r *runtimedRuntime) runHook(ctx context.Context, podID, podIP, container s
 	case h.Exec != nil:
 		return runExecProbe(ctx, r.rt, podID, container, h.Exec.Command, timeout)
 	case h.HTTPGet != nil:
-		return r.httpGetCheck(podIP, container, ports, h.HTTPGet)(ctx, timeout)
+		return r.httpGetCheck(r.probeTransport, podIP, container, ports, h.HTTPGet)(ctx, timeout)
 	case h.Sleep != nil:
 		return r.sleepHook(ctx, time.Duration(h.Sleep.Seconds)*time.Second, timeout)
 	default:
