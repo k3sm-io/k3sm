@@ -21,9 +21,11 @@ import (
 	"flag"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/k3sm/pkg/executor"
@@ -87,6 +89,14 @@ type doctorEnv struct {
 	brewPresent      func() bool                                                           // exec.LookPath("brew")
 	datastorePosture func() (present bool, userVersion int, journalMode string, err error) // read-only sqlite header
 	developerDir     func() (string, error)                                                // xcode-select -p
+	// nodeRole is which node this Mac is installed as, from the two
+	// node-daemon plists (install.RoleFromPlists), and whether it is installed
+	// at all. agentState is the agent LaunchDaemon's launchd state, and
+	// agentCredential is what the node credential store holds and when this
+	// node's client certificate runs out.
+	nodeRole        func() (install.Role, bool)
+	agentState      func() (installed, running bool)
+	agentCredential func() (status.CredentialState, time.Time)
 }
 
 // doctorCheck is a registry entry: a stable name and its pure check function. The
@@ -107,6 +117,7 @@ func doctorChecks() []doctorCheck {
 		{"brew", checkBrew},
 		{"datastore", checkDatastore},
 		{"toolchain", checkXcodeToolchain},
+		{"agent-daemon", checkAgentDaemon},
 	}
 }
 
@@ -240,6 +251,75 @@ func checkXcodeToolchain(env doctorEnv) checkResult {
 		granted, runtimev1.AnnotationXcodeToolchain, once)}
 }
 
+// checkAgentDaemon reports the joining worker's daemon and the credential that
+// makes this Mac a cluster member. On anything that is not a worker it is a
+// SKIP: a control plane has no agent daemon and never will, and a WARN there
+// would teach an operator to ignore the row on the Macs where it matters.
+//
+// On a worker it answers the question a pid cannot. launchd keeps the `k3sm
+// agent` process alive whether or not the join ever succeeded, so a running
+// daemon with no stored credential is a Mac that is NOT in the cluster — the
+// one failure this check exists for. Its remedy spans two Macs, because the
+// token is minted on the control plane and only then can this one be reinstalled
+// with it.
+func checkAgentDaemon(env doctorEnv) checkResult {
+	const name = "agent-daemon"
+	role, installed := env.nodeRole()
+	if !installed || role != install.RoleAgent {
+		return checkResult{name, statusSkip, fmt.Sprintf(
+			"this Mac is not installed as a k3sm worker (%s is not on disk), so there is no %s daemon to check",
+			install.AgentLabel+".plist", install.AgentLabel)}
+	}
+	daemonInstalled, running := env.agentState()
+	if !daemonInstalled || !running {
+		return checkResult{name, statusFail, fmt.Sprintf(
+			"%s is not running, so this worker is not serving pods — run `sudo launchctl kickstart -k system/%s` and read %s",
+			install.AgentLabel, install.AgentLabel, install.AgentLogPath())}
+	}
+	state, notAfter := env.agentCredential()
+	switch state {
+	case status.CredentialAbsent:
+		return checkResult{name, statusWarn, fmt.Sprintf(
+			"%s is running but this Mac holds no node credential yet, so it has not joined a cluster: read %s, then mint a token on the control-plane Mac (`k3sm token create`), stage it here and re-run `sudo k3sm install --role agent --server <control-plane> --token-file <file>` (the join token is read from %s)",
+			install.AgentLabel, install.AgentLogPath(), agentStagedTokenPath())}
+	case status.CredentialExpired:
+		return checkResult{name, statusWarn, fmt.Sprintf(
+			"the node credential expired on %s, so this worker can no longer authenticate: mint a token on the control-plane Mac (`k3sm token create`) and re-run `sudo k3sm install --role agent --server <control-plane> --token-file <file>` here to rejoin",
+			notAfter.UTC().Format("2006-01-02"))}
+	case status.CredentialCorrupt:
+		return checkResult{name, statusWarn, fmt.Sprintf(
+			"the stored node credential in %s does not parse; read %s, remove the offending file to force a fresh token join, and rejoin with a token minted on the control-plane Mac",
+			agentCredentialDir(), install.AgentLogPath())}
+	case status.CredentialValid:
+		return checkResult{name, statusPass, fmt.Sprintf(
+			"%s is running and this node's credential is valid until %s",
+			install.AgentLabel, notAfter.UTC().Format("2006-01-02"))}
+	default:
+		return checkResult{name, statusSkip, fmt.Sprintf(
+			"%s is running; the node credential in %s is not readable as this user (re-run with sudo)",
+			install.AgentLabel, agentCredentialDir())}
+	}
+}
+
+// agentCredentialDir is the directory the node credential store lives in, named
+// once so the checks and the status report quote the same path.
+func agentCredentialDir() string {
+	return filepath.Dir(install.AgentCredentialPath(install.DefaultDataRoot))
+}
+
+// agentStagedTokenPath is the join token `k3sm install --token-file` stages for
+// the agent daemon to read: the agent work dir's join-token, beside the node
+// credential the join writes.
+//
+// The leaf name is spelled here because the installer's own accessor for it is
+// unexported, and a doctor line that named no file would send an operator
+// looking for a credential they staged and cannot find. The directory comes
+// from install, so only the leaf could ever drift, and the check that catches
+// it is TestAgentCredentialPathsMatchTheStore.
+func agentStagedTokenPath() string {
+	return filepath.Join(agentCredentialDir(), "join-token")
+}
+
 // majorVersion parses the leading integer of a dotted version string ("26.1" → 26).
 func majorVersion(v string) (int, error) {
 	v = strings.TrimSpace(v)
@@ -292,6 +372,11 @@ func realDoctorEnv(workDir string) doctorEnv {
 			return probeDatastorePosture(executor.StateDBPath(workDir))
 		},
 		developerDir: probeDeveloperDir,
+		nodeRole:     installedRole,
+		agentState:   func() (bool, bool) { return probeDaemonState(install.AgentLabel) },
+		agentCredential: func() (status.CredentialState, time.Time) {
+			return status.NodeCredentialState(osStatusFS{}, agentCredentialDir(), time.Now())
+		},
 	}
 }
 
@@ -314,10 +399,19 @@ func probeSIPEnabled() (bool, error) {
 }
 
 // probeHelperState reports whether the io.k3sm.netd LaunchDaemon is bootstrapped
-// (installed) and running, via `launchctl print system/<label>`. A non-zero exit
-// means the job is not bootstrapped (not installed).
+// (installed) and running.
 func probeHelperState() (installed, running bool) {
-	out, err := exec.Command("launchctl", "print", "system/"+install.NetdLabel).CombinedOutput()
+	return probeDaemonState(install.NetdLabel)
+}
+
+// probeDaemonState reports whether a LaunchDaemon is bootstrapped (installed)
+// and running, via `launchctl print system/<label>`. A non-zero exit means the
+// job is not bootstrapped (not installed).
+//
+// The output is never carried into a result: `launchctl print` echoes the job's
+// whole argv, and a node daemon's argv is where a join token would be.
+func probeDaemonState(label string) (installed, running bool) {
+	out, err := exec.Command("launchctl", "print", "system/"+label).CombinedOutput()
 	if err != nil {
 		return false, false
 	}
