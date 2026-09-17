@@ -24,12 +24,17 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net"
+	"net/url"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
@@ -390,4 +395,294 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 			t.Errorf("install detail = %q, want it to count the plist it found", inst.Detail)
 		}
 	})
+}
+
+// TestWorkerStatusIsNotDegradedByItsControlPlane is the pkg half of the B324
+// gate: on a worker, the apiserver and node rows describe a control plane on
+// ANOTHER Mac, so they warn and never carry the verdict — and a leftover
+// control-plane work dir is named as a leftover rather than reported on. The
+// cmd half (which credentials are resolved, and what is dialled) is
+// cmd/k3sm's TestStatusOnAWorkerNeverProbesTheLoopbackApiserver.
+func TestWorkerStatusIsNotDegradedByItsControlPlane(t *testing.T) {
+	t.Parallel()
+
+	// worker is a joined worker whose credential is in date, with whatever
+	// apiserver seam the case describes.
+	worker := func(t *testing.T, kube Kube, stale bool) Report {
+		t.Helper()
+		p := agentPaths(t.TempDir())
+		fsys := withCredential(t, agentInstalledFS(p), p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour))
+		if stale {
+			fsys.present[p.WorkDir] = true
+		}
+		c := agentCollector(t, p, fsys)
+		c.Kube = kube
+		return c.Collect(context.Background())
+	}
+
+	unreachable := fakeKube{
+		rawErr: map[string]error{"/readyz": errors.New("dial tcp: connect: connection refused")},
+		server: "https://100.64.1.1:6444",
+		tls:    "ca pinned",
+	}
+
+	t.Run("an unreachable control plane warns and leaves the verdict at the worker's own health", func(t *testing.T) {
+		t.Parallel()
+		rep := worker(t, unreachable, false)
+
+		api, ok := rep.Row(RowAPIServer)
+		if !ok {
+			t.Fatalf("no apiserver row\n%s", Render(rep, Style{}))
+		}
+		if api.Severity != SeverityWarn {
+			t.Errorf("apiserver row severity = %v, want warn: a worker does not run the control plane it could not reach", api.Severity)
+		}
+		if !strings.Contains(api.Detail, "another Mac") {
+			t.Errorf("apiserver row = %q, want it to say the control plane is elsewhere", api.Detail)
+		}
+		if strings.Contains(api.Remedy, "launchctl kickstart") {
+			t.Errorf("apiserver remedy restarts a control plane this Mac does not have: %q", api.Remedy)
+		}
+		if rep.Verdict != VerdictRunning {
+			t.Errorf("verdict = %v (%s), want running\n%s", rep.Verdict, rep.Summary, Render(rep, Style{}))
+		}
+	})
+
+	t.Run("a cluster whose nodes are not ready does not degrade the worker", func(t *testing.T) {
+		t.Parallel()
+		notReady := readyNode("other-mac")
+		notReady.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+		rep := worker(t, fakeKube{
+			raw:    map[string][]byte{"/readyz": []byte("ok")},
+			nodes:  []corev1.Node{notReady},
+			server: "https://100.64.1.1:6444",
+			tls:    "ca pinned",
+		}, false)
+
+		node, ok := rep.Row(RowNode)
+		if !ok {
+			t.Fatal("no node row")
+		}
+		if node.Severity != SeverityWarn {
+			t.Errorf("node row severity = %v, want warn on a worker", node.Severity)
+		}
+		if rep.Verdict != VerdictRunning {
+			t.Errorf("verdict = %v (%s), want running\n%s", rep.Verdict, rep.Summary, Render(rep, Style{}))
+		}
+	})
+
+	t.Run("a leftover control-plane work dir is named as a leftover", func(t *testing.T) {
+		t.Parallel()
+		rep := worker(t, unreachable, true)
+
+		inst, ok := rep.Row(RowInstall)
+		if !ok {
+			t.Fatal("no install row")
+		}
+		if !strings.Contains(inst.Detail, "control-plane data directory") {
+			t.Errorf("install row = %q, want the stale control-plane directory named", inst.Detail)
+		}
+		if inst.Severity != SeverityOK {
+			t.Errorf("install row severity = %v; the note is advisory and must not move the verdict", inst.Severity)
+		}
+		if rep.Verdict != VerdictRunning {
+			t.Errorf("verdict = %v (%s), want running\n%s", rep.Verdict, rep.Summary, Render(rep, Style{}))
+		}
+	})
+
+	t.Run("a worker that has never joined says so, and is sent to the join", func(t *testing.T) {
+		t.Parallel()
+		p := agentPaths(t.TempDir())
+		c := agentCollector(t, p, agentInstalledFS(p))
+		rep := c.Collect(context.Background())
+
+		api, ok := rep.Row(RowAPIServer)
+		if !ok {
+			t.Fatal("no apiserver row")
+		}
+		if !strings.Contains(api.Detail, "has not joined") {
+			t.Errorf("apiserver row = %q, want it to say this Mac has not joined", api.Detail)
+		}
+		if api.Wide["server"] != "" {
+			t.Errorf("apiserver row names a server on a Mac that has never joined: %q", api.Wide["server"])
+		}
+		if want := c.joinRemedy(); api.Remedy != want {
+			t.Errorf("apiserver remedy = %q, want the join remedy %q", api.Remedy, want)
+		}
+		agent, _ := rep.Row(RowAgent)
+		if agent.Remedy != api.Remedy {
+			t.Errorf("the agent row says %q and the apiserver row says %q about the same credential", agent.Remedy, api.Remedy)
+		}
+	})
+
+	t.Run("a credential this account may not read sends the operator to sudo, never to a rejoin", func(t *testing.T) {
+		t.Parallel()
+		p := agentPaths(t.TempDir())
+		fsys := agentInstalledFS(p)
+		fsys.denied = map[string]bool{filepath.Join(p.AgentCredentialDir, nodecred.KubeconfigFile): true}
+		rep := agentCollector(t, p, fsys).Collect(context.Background())
+
+		api, ok := rep.Row(RowAPIServer)
+		if !ok {
+			t.Fatal("no apiserver row")
+		}
+		// The whole point of the state-keyed remedy: an ordinary `k3sm status`
+		// cannot read the service-user-owned store, and telling that operator
+		// to re-join a healthy worker is the defect.
+		if api.Remedy != "sudo k3sm status" {
+			t.Errorf("apiserver remedy = %q, want the sudo re-run", api.Remedy)
+		}
+		if strings.Contains(api.Remedy, "k3sm token create") {
+			t.Errorf("an unreadable credential store was answered with a rejoin: %q", api.Remedy)
+		}
+		if !strings.Contains(api.Detail, "not readable") {
+			t.Errorf("apiserver row = %q, want it to say the credential was not readable", api.Detail)
+		}
+		agent, _ := rep.Row(RowAgent)
+		if agent.Remedy != api.Remedy {
+			t.Errorf("the agent row says %q and the apiserver row says %q about the same credential", agent.Remedy, api.Remedy)
+		}
+	})
+
+	t.Run("a control plane is unchanged: its own apiserver being down is a failure", func(t *testing.T) {
+		t.Parallel()
+		p := testPaths(t.TempDir())
+		c := Collector{
+			Launchd: fakeLaunchd{out: map[string][]byte{
+				p.NetdLabel:   fixture(t, "launchctl_netd_running.txt"),
+				p.ServerLabel: fixture(t, "launchctl_netd_running.txt"),
+			}},
+			FS:         installedFS(p),
+			Kube:       fakeKube{rawErr: map[string]error{"/readyz": errors.New("connection refused")}, server: "https://127.0.0.1:6444", tls: "ca pinned"},
+			Procs:      fakeProcs{live: LivenessRunning},
+			DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+			Paths:      p,
+			EUID:       0,
+			ServiceUID: 250,
+			Now:        func() time.Time { return goldenTime },
+			Version:    goldenVersion,
+			Host:       goldenHost,
+		}
+		rep := c.Collect(context.Background())
+
+		api, ok := rep.Row(RowAPIServer)
+		if !ok {
+			t.Fatal("no apiserver row")
+		}
+		if api.Severity != SeverityFail {
+			t.Errorf("apiserver row severity = %v on a control plane, want fail", api.Severity)
+		}
+		if rep.Verdict != VerdictDegraded {
+			t.Errorf("verdict = %v (%s), want degraded\n%s", rep.Verdict, rep.Summary, Render(rep, Style{}))
+		}
+	})
+}
+
+// TestApiserverRowNamesTheFailingLayer pins the worker detail's error-class
+// map: a refused connection or a TLS fault proves the far end answered (its
+// server daemon), a timeout or an unreachable host proves nothing did (the mesh
+// path), and an error of neither class names no layer at all rather than
+// guessing one.
+func TestApiserverRowNamesTheFailingLayer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"connection refused is the server daemon",
+			&url.Error{Op: "Get", URL: "https://100.64.1.1:6444/readyz", Err: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}},
+			"check its k3sm server daemon"},
+		{"a TLS verification failure is the server daemon",
+			&url.Error{Op: "Get", URL: "https://100.64.1.1:6444/readyz", Err: x509.UnknownAuthorityError{}},
+			"check its k3sm server daemon"},
+		{"a dial timeout is the mesh",
+			&url.Error{Op: "Get", URL: "https://100.64.1.1:6444/readyz", Err: &net.OpError{Op: "dial", Err: timeoutError{}}},
+			"check the mesh to it"},
+		{"an unreachable host is the mesh",
+			&url.Error{Op: "Get", URL: "https://100.64.1.1:6444/readyz", Err: &net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH}},
+			"check the mesh to it"},
+		{"an unreachable network is the mesh",
+			&url.Error{Op: "Get", URL: "https://100.64.1.1:6444/readyz", Err: &net.OpError{Op: "dial", Err: syscall.ENETUNREACH}},
+			"check the mesh to it"},
+		{"an unrecognised error names no layer", errors.New("EOF"), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := controlPlaneLayer(tc.err)
+			if !strings.Contains(got, "the control plane is on another Mac") {
+				t.Errorf("controlPlaneLayer = %q, want it to still say the control plane is elsewhere", got)
+			}
+			if tc.want == "" {
+				if strings.Contains(got, "check") {
+					t.Errorf("controlPlaneLayer = %q, want no layer named for an unrecognised error", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("controlPlaneLayer = %q, want it to say %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// timeoutError is a net.Error that is a timeout, which is what a dial deadline
+// produces and what the mesh arm keys on.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// TestRoleKeyedRemediesAreStable pins the EXACT remedy text of the two rows the
+// role now keys, for both roles.
+//
+// The server-role strings are the ones that existed before the role reached
+// these rows, spelled out here so that a refactor of controlPlaneRemedy or
+// nodeLogRemedy that quietly changes what a control-plane operator is told goes
+// red instead of shipping.
+func TestRoleKeyedRemediesAreStable(t *testing.T) {
+	t.Parallel()
+
+	p := testPaths(t.TempDir())
+	down := Collector{
+		Kube:  fakeKube{rawErr: map[string]error{"/readyz": errors.New("connection refused")}, server: "https://127.0.0.1:6444"},
+		Paths: p,
+	}
+	notReady := Collector{
+		Kube:  fakeKube{raw: map[string][]byte{"/readyz": []byte("[-]etcd failed")}, server: "https://127.0.0.1:6444"},
+		Paths: p,
+	}
+
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"a control plane's unreachable apiserver",
+			down.apiserverRow(context.Background(), dataroot.RoleServer, CredentialUnknown).Remedy,
+			"sudo launchctl kickstart -k system/io.k3sm.server\nk3sm status logs server"},
+		{"a control plane's apiserver that is not ready",
+			notReady.apiserverRow(context.Background(), dataroot.RoleServer, CredentialUnknown).Remedy,
+			"k3sm status logs server"},
+		{"a control plane's node row",
+			down.nodeRow(context.Background(), false, dataroot.RoleServer).Remedy,
+			"k3sm status logs server"},
+		{"a worker's unreachable apiserver points at the other Mac, never at a local daemon",
+			down.apiserverRow(context.Background(), dataroot.RoleAgent, CredentialValid).Remedy,
+			"k3sm status logs agent\nk3sm status   # on the control-plane Mac"},
+		{"a worker's node row tails its own daemon",
+			down.nodeRow(context.Background(), false, dataroot.RoleAgent).Remedy,
+			"k3sm status logs agent"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.got != tc.want {
+				t.Errorf("remedy = %q, want %q", tc.got, tc.want)
+			}
+		})
+	}
 }

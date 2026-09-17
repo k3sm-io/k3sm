@@ -18,14 +18,18 @@ package status
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -63,13 +67,18 @@ func (c Collector) Collect(ctx context.Context) Report {
 	netd, _ := c.daemonRow(RowNetd, c.Paths.NetdLabel, c.Paths.NetdLog, false)
 	var node Row
 	var nodePID int
+	// credential is the worker's node credential state, read once: the agent
+	// row reports it, and the apiserver row needs it to tell "this Mac has not
+	// joined" apart from "the control plane is down". It stays unknown on a
+	// server, which holds no such credential.
+	credential := CredentialUnknown
 	if role == dataroot.RoleAgent {
-		node, nodePID = c.agentRow(now())
+		node, nodePID, credential = c.agentRow(now())
 	} else {
 		node, nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
 		c.crashLoop(&node)
 	}
-	apiserver := c.apiserverRow(ctx)
+	apiserver := c.apiserverRow(ctx, role, credential)
 	serving := apiserver.Severity == SeverityOK
 
 	rows := []Row{instRow}
@@ -92,7 +101,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	}
 	rows = append(rows,
 		apiserver,
-		c.nodeRow(ctx, serving),
+		c.nodeRow(ctx, serving, role),
 		c.workloadsRow(ctx, serving, nodePID),
 		dataRoot,
 	)
@@ -221,6 +230,19 @@ func (c Collector) installRow(hasDataVolume bool, role dataroot.Role, bothRoles 
 	if bothRoles {
 		row.Detail += fmt.Sprintf(" · both node daemons are on disk (%s as well); reporting the %s role",
 			c.Paths.AgentLabel, dataroot.RoleServer)
+	}
+	// A control-plane work dir sitting beside an AGENT install is a leftover:
+	// `k3sm install --role agent` never creates one, so it is an earlier
+	// server-era install whose state directory outlived its daemon. It is said
+	// out loud because an operator who finds that directory reasonably concludes
+	// this Mac still runs a control plane, and because until B324 the report
+	// itself drew that conclusion — it read the stale admin kubeconfig and
+	// probed the loopback apiserver. Nothing reads it now, so the note is
+	// advisory: like the bothRoles clause above it leaves the severity where the
+	// missing-parts arms put it, and never moves the verdict.
+	if role == dataroot.RoleAgent && !bothRoles && c.Paths.WorkDir != "" && c.exists(c.Paths.WorkDir) {
+		row.Detail += fmt.Sprintf(" · a control-plane data directory is on disk beside the agent role (%s); it is not used by this node",
+			c.Paths.WorkDir)
 	}
 	row.Wide = map[string]string{
 		"binary": c.Paths.Binary,
@@ -418,12 +440,32 @@ func lastDistinctLine(lines []string) (string, int) {
 	return last, count
 }
 
-// apiserverRow reports whether the control plane is serving, which is the single
-// fact the verdict turns on.
-func (c Collector) apiserverRow(ctx context.Context) Row {
+// apiserverRow reports whether the control plane is serving, which on a SERVER
+// is the single fact the verdict turns on.
+//
+// On a worker it is a different row about a different machine. The apiserver it
+// names is the one this node's own credential targets, reached over the mesh,
+// and this Mac does not run it: an unreachable control plane is reported as a
+// WARN, not a failure of the node reading the report. See workerAdvisoryRows.
+func (c Collector) apiserverRow(ctx context.Context, role dataroot.Role, credential CredentialState) Row {
 	row := Row{Name: RowAPIServer}
+	worker := role == dataroot.RoleAgent
 	if c.Kube == nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
+		if worker {
+			// A worker's apiserver URL is IN the credential a join writes, so
+			// with no credential there is nothing to probe rather than
+			// something down — and WHICH of those sentences is true, and what
+			// to do about it, is the credential's state, not this row's guess.
+			// The remedy comes from credentialRemedy for exactly that reason:
+			// the ordinary unprivileged invocation cannot read the
+			// service-user-owned store at all, and telling that operator to
+			// re-join a healthy worker (as a single joinRemedy arm here did)
+			// contradicts the agent row two lines above it.
+			row.Detail = credentialClause(credential) + ": " + errText(c.KubeErr)
+			row.Remedy = c.credentialRemedy(credential)
+			return row
+		}
 		row.Detail = "no kubeconfig: " + errText(c.KubeErr)
 		row.Remedy = "sudo k3sm install\nk3sm kubeconfig --write"
 		return row
@@ -433,13 +475,17 @@ func (c Collector) apiserverRow(ctx context.Context) Row {
 	if err != nil {
 		row.State, row.Severity = StateDown, SeverityFail
 		row.Detail = fmt.Sprintf("%s: %s", c.Kube.Server(), errText(err))
-		row.Remedy = "sudo launchctl kickstart -k system/" + c.Paths.ServerLabel + "\nk3sm status logs server"
+		row.Remedy = c.controlPlaneRemedy(role)
+		if worker {
+			row.Severity = SeverityWarn
+			row.Detail += " · " + controlPlaneLayer(err)
+		}
 		return row
 	}
 	if strings.TrimSpace(string(body)) != "ok" {
 		row.State, row.Severity = StateNotReady, SeverityWarn
 		row.Detail = fmt.Sprintf("%s readyz: %s", c.Kube.Server(), firstLine(string(body)))
-		row.Remedy = "k3sm status logs server"
+		row.Remedy = c.nodeLogRemedy(role)
 		return row
 	}
 	row.State, row.Severity = StateReady, SeverityOK
@@ -455,8 +501,8 @@ func (c Collector) apiserverRow(ctx context.Context) Row {
 // Which node is "this Mac" is answered by PickNode, from the hostname. When it
 // cannot answer, the row reports the ready/total counts alone rather than naming
 // a node it did not identify.
-func (c Collector) nodeRow(ctx context.Context, serving bool) Row {
-	row := Row{Name: RowNode, Remedy: "k3sm status logs server"}
+func (c Collector) nodeRow(ctx context.Context, serving bool, role dataroot.Role) Row {
+	row := Row{Name: RowNode, Remedy: c.nodeLogRemedy(role)}
 	if c.Kube == nil || !serving {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "apiserver unreachable"
@@ -488,7 +534,99 @@ func (c Collector) nodeRow(ctx context.Context, serving bool) Row {
 	default:
 		row.State, row.Severity, row.Remedy = StateReady, SeverityOK, ""
 	}
+	// A WORKER reading this row is reading about the CLUSTER, not about itself:
+	// a node that is not Ready is not necessarily this node, and even when it
+	// is, the fact came from an apiserver on another Mac. Reported as a WARN
+	// there, so the exemption in workerAdvisoryRows never has to exempt a FAIL.
+	if role == dataroot.RoleAgent && row.Severity == SeverityFail {
+		row.Severity = SeverityWarn
+	}
 	return row
+}
+
+// controlPlaneRemedy is what an operator does about a control plane that is not
+// answering, from the node they are standing on. On a server it is that Mac's
+// own daemon; on a worker there is no control plane here to restart, so the
+// remedy points at this node's log and at the other Mac.
+func (c Collector) controlPlaneRemedy(role dataroot.Role) string {
+	if role == dataroot.RoleAgent {
+		return "k3sm status logs " + RowAgent + "\nk3sm status   # on the control-plane Mac"
+	}
+	return "sudo launchctl kickstart -k system/" + c.Paths.ServerLabel + "\nk3sm status logs " + RowServer
+}
+
+// nodeLogRemedy names the log of the node daemon THIS Mac runs.
+func (c Collector) nodeLogRemedy(role dataroot.Role) string {
+	return "k3sm status logs " + nodeRowName(role)
+}
+
+// credentialClause is the first half of a worker's apiserver-row detail when
+// there is nothing to probe: what the node credential's state means for the
+// question "which apiserver would this node talk to".
+//
+// It is separate from the agent row's own wording because the two rows answer
+// different questions about one fact — that row reports the credential, this
+// one reports the consequence — but they are driven by the SAME state value, so
+// they can never disagree about which case they are in.
+func credentialClause(credential CredentialState) string {
+	switch credential {
+	case CredentialAbsent:
+		return "this Mac has not joined a cluster, so there is no apiserver to probe"
+	case CredentialExpired:
+		return "the node credential has expired, so this worker can no longer reach its apiserver"
+	case CredentialCorrupt:
+		return "the stored node credential does not parse, so no apiserver URL could be read from it"
+	default:
+		// Unknown: the store was not readable from this account, which is the
+		// ordinary posture for an unprivileged run and NOT a fault.
+		return "the node credential was not readable, so no apiserver URL could be read from it"
+	}
+}
+
+// controlPlaneLayer names the layer a worker's failed apiserver probe points
+// at, from the error class.
+//
+// A worker reaches its control plane over the mesh, so a failure has two very
+// different repairs and the row that does not distinguish them sends half its
+// readers to the wrong Mac. A refused connection or a TLS fault means the path
+// carried the packets and something answered (or refused) at the far end: that
+// is the server daemon. A timeout or an unreachable host/network means nothing
+// answered at all, which on this topology is the wireguard path — netd and the
+// peer programming — far more often than a dead daemon.
+//
+// An unrecognised error deliberately names NEITHER layer: a guess printed as a
+// diagnosis is worse than the honest "it is on another Mac", which is the one
+// thing every arm here still says.
+func controlPlaneLayer(err error) string {
+	const elsewhere = "the control plane is on another Mac"
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return elsewhere + "; the probe timed out, so check the mesh to it (netd and the mesh peer)"
+	}
+	switch {
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		return elsewhere + "; it is unreachable, so check the mesh to it (netd and the mesh peer)"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return elsewhere + "; the connection was refused, so check its k3sm server daemon"
+	case isTLSError(err):
+		return elsewhere + "; the TLS handshake failed, so check its k3sm server daemon"
+	}
+	return elsewhere
+}
+
+// isTLSError reports whether err is a certificate or TLS-record fault — the
+// class that proves the far end answered, which is what makes it a statement
+// about the server daemon rather than about the path.
+func isTLSError(err error) bool {
+	var (
+		verify   *tls.CertificateVerificationError
+		record   tls.RecordHeaderError
+		unknown  x509.UnknownAuthorityError
+		invalid  x509.CertificateInvalidError
+		hostname x509.HostnameError
+	)
+	return errors.As(err, &verify) || errors.As(err, &record) ||
+		errors.As(err, &unknown) || errors.As(err, &invalid) || errors.As(err, &hostname)
 }
 
 // PickNode picks THIS Mac's node out of a cluster's node list.

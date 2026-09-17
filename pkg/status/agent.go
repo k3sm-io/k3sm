@@ -135,14 +135,17 @@ func (c Collector) nodeLabel(role dataroot.Role) string {
 }
 
 // agentRow reports the joining worker's daemon AND the credential that makes it
-// a cluster member. It returns the row and the daemon's pid.
+// a cluster member. It returns the row, the daemon's pid, and the credential
+// state — which the apiserver row needs too, because on a worker the apiserver
+// URL to probe lives IN that credential: with no credential there is nothing to
+// probe rather than something down.
 //
 // The launchd verdict comes first and is never softened: a daemon that is not
 // loaded, is disabled or is crash-looping is that, whatever the store holds.
 // The credential only re-states a row whose daemon is otherwise healthy —
 // which is the one case launchd cannot see past, and the reason this row is not
 // just another daemonRow.
-func (c Collector) agentRow(now time.Time) (Row, int) {
+func (c Collector) agentRow(now time.Time) (Row, int, CredentialState) {
 	row, pid := c.daemonRow(RowAgent, c.Paths.AgentLabel, c.Paths.AgentLog, true)
 	state, notAfter := c.credentialState(now)
 	row.Wide["credential"] = string(state)
@@ -153,7 +156,7 @@ func (c Collector) agentRow(now time.Time) (Row, int) {
 		row.Wide["credential-expires"] = notAfter.UTC().Format(time.RFC3339)
 	}
 	if row.State != StateRunning || row.Severity != SeverityOK {
-		return row, pid
+		return row, pid, state
 	}
 
 	switch state {
@@ -162,16 +165,13 @@ func (c Collector) agentRow(now time.Time) (Row, int) {
 	case CredentialAbsent:
 		row.State, row.Severity = StateWaiting, SeverityWarn
 		row.Detail += " · waiting for a join: this Mac holds no node credential yet"
-		row.Remedy = c.joinRemedy()
 	case CredentialExpired:
 		row.State, row.Severity = StateExpired, SeverityWarn
 		row.Detail += " · the node credential expired on " + notAfter.UTC().Format("2006-01-02") +
 			", so this worker can no longer authenticate"
-		row.Remedy = c.joinRemedy()
 	case CredentialCorrupt:
 		row.State, row.Severity = StateCorrupt, SeverityFail
 		row.Detail += " · the stored node credential in " + c.Paths.AgentCredentialDir + " does not parse"
-		row.Remedy = "k3sm status logs " + RowAgent + "\n" + c.joinRemedy()
 	default:
 		// Unknown: the store is service-user-owned, so an ordinary account is
 		// EXPECTED not to read it. That is not a healthy verdict and not a
@@ -179,9 +179,34 @@ func (c Collector) agentRow(now time.Time) (Row, int) {
 		// reports honestly.
 		row.Severity = SeverityUnknown
 		row.Detail += " · node credential state unknown (not readable as this user)"
-		row.Remedy = "sudo k3sm status"
 	}
-	return row, pid
+	row.Remedy = c.credentialRemedy(state)
+	return row, pid, state
+}
+
+// credentialRemedy is what an operator does about a node credential in a given
+// state. It is ONE function because two rows read it: the agent row, which
+// describes the credential, and the apiserver row, whose probe target lives
+// inside that same credential. Sending a reader of one row to `k3sm token
+// create` and a reader of the other to `sudo k3sm status` about the same
+// directory is how a report teaches an operator to re-join a perfectly healthy
+// worker — so the two cannot be allowed to drift apart.
+//
+// The Unknown arm is the one that matters most and is the least obvious: the
+// store is service-user-owned and mode 0700, so an ordinary `k3sm status` is
+// EXPECTED to fail to read it. Nothing is wrong there, and the only thing that
+// would change the answer is running the same command with sudo.
+func (c Collector) credentialRemedy(state CredentialState) string {
+	switch state {
+	case CredentialValid:
+		return ""
+	case CredentialAbsent, CredentialExpired:
+		return c.joinRemedy()
+	case CredentialCorrupt:
+		return "k3sm status logs " + RowAgent + "\n" + c.joinRemedy()
+	default:
+		return "sudo k3sm status"
+	}
 }
 
 // credentialState reads the node credential store this report is about.
