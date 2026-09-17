@@ -299,7 +299,7 @@ func registerNodeFlags(fs *flag.FlagSet, opts *nodeOptions) {
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig for the cluster")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.listen, "listen", nodeKubeletListen, "address for the kubelet HTTP API (logs/exec)")
-	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "runtimed on-disk root (image cache + pod dirs); the standalone dev default is under the temp dir, which macOS may purge — set it to keep data across a purge")
 	registerContainerLogFlags(fs, &opts.logs)
 	fs.StringVar(&opts.nodeIP, "node-ip", "127.0.0.1", "node/pod IP to advertise")
 	addRuntimeFlag(fs, &opts.runtime)
