@@ -30,9 +30,17 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/provider"
 )
+
+// testDeniedLocalPorts is the denied-local-port set a default server hands to
+// provisionClusterPolicies, derived through the production method so these tests
+// cannot drift from what bring-up actually passes.
+func testDeniedLocalPorts() []int {
+	return serverOptions{kinePort: executor.DefaultKinePort}.deniedLocalPorts()
+}
 
 // wantClusterPolicies is the COMPLETE set of ValidatingAdmissionPolicy names
 // bring-up must lay down, in EVERY posture. It is written out by name rather than
@@ -54,9 +62,16 @@ import (
 // opt-in advisory, listed here for the same reason as the first: the two annotations
 // are provisioned side by side in bring-up, and this list is what keeps one of them
 // from being dropped while the other's tests stay green.
+//
+// k3sm-reject-service-denied-local-port is the B301 member: the Service-side half
+// of the sandbox local-port deny. It is provisioned from the SAME
+// opts.deniedLocalPorts() value the node stamps onto every pod's SBPL, so its
+// absence means a Service can be published on a port every pod is denied
+// connect() to — created, Ready, and unreachable, with nothing to say why.
 var wantClusterPolicies = []string{
 	"k3sm-reject-foreign-user",
 	"k3sm-reject-loadbalancer-reserved-port",
+	"k3sm-reject-service-denied-local-port",
 	"k3sm-require-os-darwin",
 	"k3sm-warn-pod-hand-set-internet-egress",
 	"k3sm-warn-pod-hand-set-xcode-toolchain",
@@ -102,7 +117,7 @@ func TestBringupProvisionsPolicies(t *testing.T) {
 			}
 			cs := fake.NewClientset()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			provisionClusterPolicies(context.Background(), cs, mode, tt.euid, logger)
+			provisionClusterPolicies(context.Background(), cs, mode, tt.euid, testDeniedLocalPorts(), logger)
 
 			list, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().List(context.Background(), metav1.ListOptions{})
 			if err != nil {
@@ -167,7 +182,8 @@ func TestBringupForeignUserPolicyPinsThePodExecutionUID(t *testing.T) {
 				t.Fatalf("hostnet.ResolveFor: %v", err)
 			}
 			cs := fake.NewClientset()
-			provisionClusterPolicies(context.Background(), cs, mode, tt.euid, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			provisionClusterPolicies(context.Background(), cs, mode, tt.euid, testDeniedLocalPorts(),
+				slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 			pol, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(context.Background(), "k3sm-reject-foreign-user", metav1.GetOptions{})
 			if err != nil {
@@ -234,7 +250,7 @@ func TestServerProvisionsTheEgressWarnVAP(t *testing.T) {
 				t.Fatalf("hostnet.ResolveFor(%q, %d): %v", tt.network, tt.euid, err)
 			}
 			cs := fake.NewClientset()
-			provisionClusterPolicies(context.Background(), cs, mode, tt.euid,
+			provisionClusterPolicies(context.Background(), cs, mode, tt.euid, testDeniedLocalPorts(),
 				slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 			pol, err := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().

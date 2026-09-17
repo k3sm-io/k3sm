@@ -66,7 +66,10 @@ limitations under the License.
 // policy's CEL — and the foreign-user policy's allowed uid — at whatever shape the
 // cluster was first provisioned with, making any later fix inert on an existing
 // datastore. The k3sm.io/managed label is stamped at create and is otherwise
-// untouched: this package selects on nothing and deletes nothing.
+// untouched: this package selects on nothing, and the ONE delete it performs is
+// confined to the two objects EnsureRejectServiceDeniedLocalPort owns, on the
+// empty denied-port set — a guard for a port number nothing denies any more must
+// not outlive the deny it was provisioned for.
 //
 // POSTURE INDEPENDENCE: every policy here is provisioned in EVERY --network
 // posture. The foreign-user ceiling used to be gated on the netd-helper backend
