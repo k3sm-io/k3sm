@@ -88,7 +88,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
-	fs.StringVar(&opts.podRoot, "pod-root", filepath.Join(os.TempDir(), "k3sm-pods"), "directory for per-pod logs/state")
+	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
 	addRuntimeFlag(fs, &opts.rtName)
 	fs.StringVar(&opts.dnsShim, "dns-shim", "", "getaddrinfo DNS shim dylib path (runtimed runtime only)")
@@ -162,6 +162,15 @@ func runAgent(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// runtimed's on-disk root — the image cache, the pod dirs, every PVC bound on
+	// this node — resolved once, here, before anything under it is touched. An
+	// empty --pod-root derives the work-dir's parent (the same rule `k3sm server`
+	// applies), except on a worker that already holds data under the legacy
+	// temp-dir root, which is kept in place and warned about rather than migrated.
+	podRoot := resolveAgentPodRoot(opts.podRoot, opts.workDir, legacyAgentPodRoot(), podRootHasData)
+	opts.podRoot = podRoot.root
+	logAgentPodRoot(logger, podRoot)
 
 	// --token-file, before anything reads opts.token. A file that is there and
 	// cannot be used is a terminal start failure like the others (it recurs
