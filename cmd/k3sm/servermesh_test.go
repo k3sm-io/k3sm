@@ -217,7 +217,7 @@ func TestBringUpMeshRefusesAMeshIPTheCIDRDoesNotDerive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateWireguardKey: %v", err)
 	}
-	err = bringUpMesh(context.Background(), meshBringUp{
+	_, err = bringUpMesh(context.Background(), meshBringUp{
 		podCIDR:       "100.64.0.0/24",
 		meshIP:        "100.64.7.1", // NOT the .1 of the pod /24
 		privateKeyB64: priv,

@@ -159,7 +159,9 @@ func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 //
 // It returns the enrolled identity so the caller can seed the node-local
 // datapath with the mesh-egress source the proxy binds and the peer mesh-egress
-// /32s the NetworkPolicy table always-allows.
+// /32s the NetworkPolicy table always-allows, plus the mesh teardown handle the
+// caller defers so this node's routes and pf anchor are released on the server's
+// way out instead of by a goroutine racing process death (see meshTeardown).
 //
 // It is SYNCHRONOUS and returns only once the enroll has been list-back
 // verified, because the caller must not open the worker-join listener until this
@@ -171,14 +173,14 @@ func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 // index-0 claim is what keeps a worker's assignment off this node's /24, and that
 // is true whether or not this process plumbs a wireguard device. Only the DEVICE
 // bring-up is gated on the datapath.
-func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverOptions, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, error) {
+func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverOptions, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
 	priv, pub, err := loadOrCreateServerMeshKey(opts.workDir)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, err
+		return netv1.MeshEnrollResponse{}, noMeshTeardown, err
 	}
 	endpoint, err := serverMeshEndpoint(opts.nodeIP, opts.meshIP, serverMeshListenPort)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, err
+		return netv1.MeshEnrollResponse{}, noMeshTeardown, err
 	}
 	res, err := e.EnrollSelf(ctx, opts.nodeName, netv1.MeshEnrollRequest{
 		NodeName:  opts.nodeName,
@@ -186,15 +188,15 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverO
 		Endpoint:  endpoint,
 	})
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, err
+		return netv1.MeshEnrollResponse{}, noMeshTeardown, err
 	}
 	logger.Info("enrolled this control-plane node into its own mesh",
 		"node", opts.nodeName, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	if !mode.DataPath() {
 		logger.Info("network datapath disabled (--network none): the index-0 MeshPeer is written, but this process brings up no wireguard device")
-		return res, nil
+		return res, noMeshTeardown, nil
 	}
-	if err := bringUpMesh(ctx, meshBringUp{
+	down, err := bringUpMesh(ctx, meshBringUp{
 		podCIDR:       res.PodCIDR,
 		meshIP:        res.MeshIP,
 		privateKeyB64: priv,
@@ -207,8 +209,12 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverO
 		// worker that joined before the move dials the old one on its next full
 		// resync. The write is in-process through the same locked enroller.
 		refresher: newServerEndpointRefresher(e, opts, endpoint, logger),
-	}, mode, logger); err != nil {
-		return netv1.MeshEnrollResponse{}, err
+	}, mode, logger)
+	if err != nil {
+		// The handle is returned even on a failed bring-up: a device that came up
+		// before the failure still holds a utun, and the caller's deferred teardown
+		// is what releases it.
+		return netv1.MeshEnrollResponse{}, down, err
 	}
-	return res, nil
+	return res, down, nil
 }

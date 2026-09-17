@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -462,11 +463,75 @@ type bootstrapServerDeps struct {
 	serverAuth    bootstrap.ServerAuthorizer
 	bundle        bootstrap.BundleSource
 	apiServers    []string
+	// listen binds the supervisor's address. Nil is net.Listen — the shipped
+	// value; it is a field so a test can drive the rebind retry without racing a
+	// real port.
+	listen listenFunc
+}
+
+// listenFunc binds a listening socket. It is the seam startBootstrapServer binds
+// through instead of http.Server.ListenAndServeTLS, which folds the bind into the
+// serve and so cannot be retried.
+type listenFunc func(network, addr string) (net.Listener, error)
+
+const (
+	// joinListenerAttempts bounds the rebind retry. It is a BOUND, not a
+	// supervisor that keeps trying: an address still busy after the whole window
+	// is not transient, and reporting that is more useful than a goroutine
+	// retrying forever behind a healthy-looking daemon.
+	joinListenerAttempts = 8
+	// joinListenerBackoff is the fixed wait between attempts. 8 attempts with 7
+	// waits is about 10s — long enough to outlast the two transient causes seen
+	// (a previous supervisor's socket still draining, a stale port-forward being
+	// torn down), short enough that a worker retrying its join still finds the
+	// endpoint on its next attempt.
+	joinListenerBackoff = 1500 * time.Millisecond
+)
+
+// listenJoinAddr binds addr, retrying ONLY a transiently busy address.
+//
+// The discrimination is the whole point: EADDRINUSE on this port means something
+// else holds it right now (the previous supervisor's socket draining through
+// TIME_WAIT, a leftover forwarder), which clears on its own; any other bind error
+// — a bad address, a permission denial — will not clear by waiting, so retrying it
+// only delays the report. Before this, the bind was inside ListenAndServeTLS, so
+// the transient case was terminal too: the supervisor goroutine logged once and
+// the worker-join endpoint stayed dead until the daemon was restarted by hand.
+func listenJoinAddr(ctx context.Context, listen listenFunc, addr string, attempts int, backoff time.Duration, log *slog.Logger) (net.Listener, error) {
+	if listen == nil {
+		listen = net.Listen
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		ln, err := listen("tcp", addr)
+		if err == nil {
+			if attempt > 1 {
+				log.Info("worker-join listener bound after the address freed", "addr", addr, "attempts", attempt)
+			}
+			return ln, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, fmt.Errorf("bind worker-join listener on %s: %w", addr, err)
+		}
+		lastErr = err
+		log.Warn("worker-join listener address is busy; retrying", "addr", addr, "attempt", attempt, "attempts", attempts, "backoff", backoff, "err", err)
+		if attempt == attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("bind worker-join listener on %s: %w", addr, ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+	return nil, fmt.Errorf("bind worker-join listener on %s: still in use after %d attempts over %s: %w",
+		addr, attempts, time.Duration(attempts-1)*backoff, lastErr)
 }
 
 // startBootstrapServer serves the worker-join endpoint (and, in HA, the CA-bundle
 // endpoint) at bootstrapListenAddr over a TLS listener presenting [serving-leaf,
-// cluster-CA] so a joining node's CA-hash pin verifies. It blocks until ctx is
+// cluster-CA] so a joining node's CA-hash pin verifies. The bind is retried for a
+// bounded window when the address is transiently busy (listenJoinAddr). It blocks until ctx is
 // cancelled, then shuts down. This is the live, mesh-bound supervisor — its end-to-end
 // exercise is the two-Mac K3SM_LAB gate. The MeshPeer CRD the enroller's write lands
 // in is ensured fail-closed by runServer's step 4a before this listener exists, so a
@@ -520,8 +585,18 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 		defer cancel()
 		_ = hs.Shutdown(shutCtx)
 	}()
+	// Bind first, with the bounded retry, THEN serve. ServeTLS is what
+	// ListenAndServeTLS does once it holds a listener (same TLSConfig, same h2
+	// NextProtos negotiation), so the served surface is unchanged — only the bind
+	// is now survivable. The shutdown goroutine above is already armed, and an
+	// http.Server whose Shutdown ran returns ErrServerClosed from Serve, so a ctx
+	// cancelled during the retry window still ends in a clean exit.
+	ln, err := listenJoinAddr(ctx, deps.listen, hs.Addr, joinListenerAttempts, joinListenerBackoff, log)
+	if err != nil {
+		return err
+	}
 	log.Info("bootstrap supervisor listening", "addr", hs.Addr)
-	if err := hs.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+	if err := hs.ServeTLS(ln, "", ""); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("bootstrap server: %w", err)
 	}
 	return nil

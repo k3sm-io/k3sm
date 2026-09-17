@@ -1506,7 +1506,9 @@ func ServerPlist(cfg Config) []byte {
 		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
 		// Give Stop() room to reap the serial control-plane teardown before launchd
 		// SIGKILLs the job (default 20s ≈ the worst-case 4×drainGrace, which orphans
-		// the not-yet-reaped children). 45s clears it with margin.
+		// the not-yet-reaped children). 45s clears it with margin. The server's mesh
+		// teardown runs after that, serially, for at most its own 5s bound
+		// (meshTeardownTimeout), which the 45s still covers.
 		ExitTimeOut: 45,
 		// Server-only: raise RLIMIT_NOFILE so darwin-net's UDP flow budget sizes
 		// against a real fd table, not launchd's 256 default. Binds at bootstrap,
