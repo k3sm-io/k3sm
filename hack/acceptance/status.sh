@@ -243,15 +243,29 @@ else
 		await_unloaded io.k3sm.server || true
 		await_unloaded io.k3sm.netd || true
 		# A k3sm-vmhost that outlives the booted-out server keeps the volume busy
-		# (observed 2026-09-06: "dissented by PID <n> (/Library/k3sm/k3sm-vmhost)").
-		# That is a product observation the gate records rather than hides; the
-		# reproduction still needs the volume, so the orphan is terminated here.
-		orphans="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
+		# (observed 2026-09-06: "dissented by PID <n> (/Library/k3sm/k3sm-vmhost)")
+		# — its cwd IS the data root, which is the server plist's WorkingDirectory.
+		#
+		# It is a RUNG, not a note. The node now stops its embedded runtime on the
+		# way out (B253, and hack/acceptance/B253.sh is that fix's own gate), so an
+		# orphan here is the bug having returned, and a gate that cannot go red on
+		# it protects nothing. The kill stays: the reproduction below still needs
+		# the volume, and leaving the rig unable to unmount would be a worse
+		# outcome than a red rung. A short grace first, because the helpers stop
+		# concurrently with the daemon's own exit.
+		orphans=""
+		for _ in $(seq 1 5); do
+			orphans="$(pgrep -x k3sm-vmhost 2>/dev/null | tr '\n' ' ' || true)"
+			[ -n "$orphans" ] || break
+			sleep 2
+		done
 		if [ -n "$orphans" ]; then
-			echo "NOTE  s.D0  k3sm-vmhost outlived io.k3sm.server (pids: $orphans) — terminated so the volume can unmount; see the run log for the follow-up"
+			ladder no "s.D0  [destructive] k3sm-vmhost outlived io.k3sm.server (pids: $orphans) — terminated so the volume can unmount; see hack/acceptance/B253.sh"
 			for pid in $orphans; do sudo kill "$pid" 2>/dev/null || true; done
 			sleep 3
 			for pid in $orphans; do sudo kill -9 "$pid" 2>/dev/null || true; done
+		else
+			ladder ok "s.D0  [destructive] no k3sm-vmhost outlived the booted-out server"
 		fi
 		# The volume is busy until the daemons' files close; bounded retry, then a
 		# loud FAIL that names the cause -- and NOTHING below runs against a
