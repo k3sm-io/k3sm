@@ -58,6 +58,10 @@ the API surface. See [Concepts](concepts.md).
 ## Auth Model
 
 Access is authenticated via the kubeconfig credentials generated at install time and scoped by RBAC.
+The kubeconfig also pins the apiserver's own certificate, so your `kubectl` verifies the control
+plane it hands that credential to rather than trusting whatever answers on the port; on a first
+install, before the control plane has minted that certificate, the kubeconfig falls back to
+unverified TLS until the next `sudo k3sm install` picks the certificate up.
 The bootstrap/join credentials for adding nodes are separate; see [Multi-node](multi-node.md).
 
 ## Things That Behave Differently Through kubectl

@@ -728,6 +728,14 @@ func TestInstallOrchestration(t *testing.T) {
 		// And whatever was carried — nothing, on a first install — is recorded
 		// again, before the plist that will not survive the next uninstall.
 		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
+		// The trust anchor for the endpoint the admin kubeconfig will name, read
+		// AFTER the arguments are resolved (they decide the posture, so they decide
+		// which certificate the apiserver serves) and BEFORE the daemons restart, so
+		// this install pins what the PREVIOUS boot left on disk rather than racing
+		// the one it is about to start. Single-node here, so it is the certificate
+		// the apiserver self-signs into its own --cert-dir; a first install finds
+		// nothing and the kubeconfig keeps skip-verify.
+		"ReadFile:/var/lib/k3sm/server/apiserver-certs/apiserver.crt",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is
