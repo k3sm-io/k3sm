@@ -115,6 +115,34 @@ join token is not involved and is not kept on the node after the join; it expire
 default, so an update that depended on it would stop working after a day. `kubectl describe node
 <name>` shows a `MeshEndpointChanged` event with the old and new values whenever this happens.
 
+### Removing a worker
+
+`sudo k3sm uninstall` on a worker asks the cluster to forget the node before it tears the local
+install down. Its `MeshPeer` record and its `Node` object are both deleted, so the Macs that stay in
+the cluster drop the wireguard entry and the route they were holding for it, and it stops appearing
+in `kubectl get nodes`.
+
+The node authenticates that request with its own node certificate, the same credential the endpoint
+update uses, and it can only ever remove itself. The control plane performs the deletion on its
+behalf, so a worker is granted no new permission anywhere in the cluster.
+
+This needs the control plane to be reachable, and often it is not: the cluster may be off, asleep, or
+on another network by the time a Mac is retired. That never blocks the uninstall. It prints what went
+wrong and carries on, and you finish the job from the control plane:
+
+```sh
+kubectl delete meshpeer/<node> node/<node>
+```
+
+Run that same command for a worker whose disk was wiped, or which was uninstalled by a k3sm release
+older than this one. A node with no stored credential, or one whose certificate has already expired,
+cannot deregister itself either, and the uninstall says so.
+
+Uninstall keeps the stored credential, as it keeps the rest of the data root. Reinstalling the same
+Mac after a deregistration therefore resumes into a cluster that no longer has a `MeshPeer` for it:
+supply `--token-file` and it joins again as a new node, and without a token the agent stops and says
+it must rejoin.
+
 ## What Crosses Nodes
 
 - Services resolve cluster-wide via the userspace Service proxy.
