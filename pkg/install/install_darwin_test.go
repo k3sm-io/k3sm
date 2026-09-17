@@ -19,6 +19,7 @@ limitations under the License.
 package install
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -672,5 +673,66 @@ func TestWriteLaunchDaemonMode(t *testing.T) {
 			t.Fatalf("writeLaunchDaemon: %v", err)
 		}
 		assertMode(t, path, PlistMode)
+	})
+}
+
+// TestReadRegularFileOnDisk exercises the no-follow read against a REAL
+// filesystem, because the one thing it has to do cannot be observed through a
+// fake: whether the kernel refuses the open. A fake asserts the test's own model
+// of O_NOFOLLOW; only a real symlink proves the flag is on the open call.
+//
+// Unprivileged and serial, like every other on-disk table here.
+func TestReadRegularFileOnDisk(t *testing.T) {
+	t.Run("a regular file reads back verbatim", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "node.key")
+		if err := os.WriteFile(path, []byte("the key bytes"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		got, err := readRegularFile(path)
+		if err != nil {
+			t.Fatalf("readRegularFile: %v", err)
+		}
+		if string(got) != "the key bytes" {
+			t.Errorf("read %q, want %q", got, "the key bytes")
+		}
+	})
+
+	t.Run("a symlink is refused and its target never read", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "somebody-elses-secret")
+		if err := os.WriteFile(target, []byte("not this node's key"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		path := filepath.Join(dir, "node.key")
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		got, err := readRegularFile(path)
+		if err == nil {
+			t.Fatalf("readRegularFile followed the symlink and returned %q", got)
+		}
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("error %v does not match ErrNotRegularFile (callers tell this apart from absence)", err)
+		}
+		if strings.Contains(string(got), "not this node's key") {
+			t.Errorf("the target's bytes were returned: %q", got)
+		}
+	})
+
+	t.Run("a directory is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "node.key")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if _, err := readRegularFile(path); !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("readRegularFile on a directory = %v, want ErrNotRegularFile", err)
+		}
+	})
+
+	t.Run("a missing file keeps the fs.ErrNotExist posture", func(t *testing.T) {
+		_, err := readRegularFile(filepath.Join(t.TempDir(), "node.key"))
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("readRegularFile on a missing path = %v, want an fs.ErrNotExist (absence is a posture, not a failure)", err)
+		}
 	})
 }

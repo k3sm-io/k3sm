@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -815,6 +816,49 @@ func writeLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode, uid,
 		return fmt.Errorf("chown %s to %d:%d: %w", plistPath, uid, gid, err)
 	}
 	return nil
+}
+
+// ReadRegularFile reads path without following a symlink and refuses anything
+// that is not a regular file. See the System interface for the confused-deputy
+// read it exists to prevent.
+func (darwinSystem) ReadRegularFile(path string) ([]byte, error) {
+	return readRegularFile(path)
+}
+
+// readRegularFile is the method above, split out so the on-disk test can
+// exercise it directly — the same split the other privileged writers carry.
+//
+// Three details are load-bearing:
+//
+//   - O_NOFOLLOW makes the kernel refuse the open when the LAST path component
+//     is a symlink (ELOOP), which is the swap this read has to survive. It says
+//     nothing about a symlinked parent directory; nothing here can, and the
+//     parent's ownership is the control that covers it.
+//   - O_NONBLOCK keeps a planted fifo from parking the installer forever on the
+//     open. A regular file is unaffected by it.
+//   - the type is checked on the open DESCRIPTOR (f.Stat), never with a
+//     path-based stat beforehand, so there is no window in which the thing
+//     checked and the thing read could be two different files.
+func readRegularFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		// A missing file keeps ReadFile's contract (callers read fs.ErrNotExist as
+		// a posture); a symlink is reported as the refusal it is, because ELOOP
+		// alone reads like a link cycle rather than a swap somebody performed.
+		if errors.Is(err, unix.ELOOP) {
+			return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+		}
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("open %s: %w: it is a %s", path, ErrNotRegularFile, fi.Mode().Type())
+	}
+	return io.ReadAll(f)
 }
 
 // ReadFile reads a root-readable file, propagating os.ReadFile's error verbatim

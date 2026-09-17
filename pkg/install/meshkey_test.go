@@ -249,6 +249,111 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		}
 	})
 
+	t.Run("the root-only copy restores a wiped work dir instead of minting", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		priv, _, err := bootstrap.GenerateWireguardKey()
+		if err != nil {
+			t.Fatalf("mint a key for the fixture: %v", err)
+		}
+		f := &fakeSystem{}
+		seedOperatorToken(f)
+		// The identity every peer knows this node by survives only in the key
+		// dir: the work dir was wiped (a data-root repair, a hand-deleted file).
+		f.putFile(agentHelper, []byte(priv))
+		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if got := string(f.files[agentWork]); got != priv {
+			t.Errorf("work-dir key = %q, want the root-only copy %q restored (a mint here orphans the node from every peer's AllowedIPs)", got, priv)
+		}
+		if got := string(f.files[agentHelper]); got != priv {
+			t.Errorf("the root-only copy was rewritten: %q, want it untouched at %q", got, priv)
+		}
+		wantCall(t, f, fmt.Sprintf("WriteServiceUserFile:%s:%#o:%#o:%d", agentWork, MeshKeyFileMode, AgentTokenDirMode, 271))
+		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"); len(calls) != 0 {
+			t.Errorf("the restore rewrote the root-only copy it read from: %v", calls)
+		}
+	})
+
+	t.Run("a symlinked work-dir key is refused, never followed", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		seedOperatorToken(f)
+		// What a service-uid writer plants in its own work dir: a link whose
+		// target root can read. The target holds a PERFECTLY VALID key — somebody
+		// else's — so nothing but the refusal to follow the link can catch this.
+		// A validate-only check would see a usable key and copy it in as "the
+		// existing identity".
+		planted, _, err := bootstrap.GenerateWireguardKey()
+		if err != nil {
+			t.Fatalf("mint the planted key for the fixture: %v", err)
+		}
+		f.putFile(agentWork, []byte(planted))
+		f.putSymlink(agentWork)
+		if err := Install(context.Background(), f, agentCfg(t)); err == nil {
+			t.Fatal("install accepted a symlinked work-dir mesh key")
+		} else if !strings.Contains(err.Error(), agentWork) {
+			t.Errorf("error %q does not name the path to look at", err)
+		}
+		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"); len(calls) != 0 {
+			t.Errorf("install wrote the root-only copy anyway: %v", calls)
+		}
+		if _, ok := f.files[agentHelper]; ok {
+			t.Errorf("the symlink target's bytes reached the root-only copy: %q", f.files[agentHelper])
+		}
+	})
+
+	t.Run("undecodable work-dir bytes are refused, never minted over", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		seedOperatorToken(f)
+		f.putFile(agentWork, []byte("not a wireguard key at all"))
+		err := Install(context.Background(), f, agentCfg(t))
+		if err == nil {
+			t.Fatal("install accepted a work-dir mesh key that is not a key")
+		}
+		if !strings.Contains(err.Error(), agentWork) {
+			t.Errorf("error %q does not name the path to look at", err)
+		}
+		// Refusing is the whole point: minting here would replace whatever that
+		// file actually was, and a corrupted key file is evidence.
+		if got := string(f.files[agentWork]); got != "not a wireguard key at all" {
+			t.Errorf("install rewrote the unusable file: %q", got)
+		}
+	})
+
+	t.Run("an unusable root-only copy with no work dir to repair from is refused", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		seedOperatorToken(f)
+		f.putFile(agentHelper, []byte("not a wireguard key at all"))
+		err := Install(context.Background(), f, agentCfg(t))
+		if err == nil {
+			t.Fatal("install minted over an unusable root-only copy with no work-dir key to repair from")
+		}
+		if !strings.Contains(err.Error(), agentHelper) {
+			t.Errorf("error %q does not name the path to look at", err)
+		}
+	})
+
+	t.Run("an unusable root-only copy IS repaired when the work dir holds the identity", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		priv, _, err := bootstrap.GenerateWireguardKey()
+		if err != nil {
+			t.Fatalf("mint a key for the fixture: %v", err)
+		}
+		f := &fakeSystem{}
+		seedOperatorToken(f)
+		f.putFile(agentWork, []byte(priv))
+		f.putFile(agentHelper, []byte("not a wireguard key at all"))
+		if err := Install(context.Background(), f, agentCfg(t)); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if got := string(f.files[agentHelper]); got != priv {
+			t.Errorf("root-only copy = %q, want it repaired from the work-dir key %q", got, priv)
+		}
+	})
+
 	t.Run("the refs are distinct bare file names pkg/install owns", func(t *testing.T) {
 		if MeshKeyRefServer == MeshKeyRefAgent {
 			t.Fatalf("both roles name their key %q: a server and a worker on one Mac would overwrite each other's identity", MeshKeyRefAgent)

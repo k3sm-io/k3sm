@@ -609,6 +609,20 @@ type System interface {
 	// the one call site that takes it, and lets a test assert the mode a given
 	// daemon was laid down at without a real filesystem.
 	WriteLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode) error
+	// ReadRegularFile reads a root-readable file, refusing to follow a symlink and
+	// refusing anything that is not a REGULAR file (an error matching
+	// ErrNotRegularFile); a missing file keeps ReadFile's fs.ErrNotExist contract.
+	//
+	// It exists because of one file whose directory the installer does not own.
+	// The mesh key's work-dir copy lives under the service-user-owned data root,
+	// and install reads it AS ROOT and copies its bytes into a root-only
+	// directory. With an ordinary read, the service uid could replace that file
+	// with a symlink to anything on the Mac and have root copy the target out for
+	// it — a confused-deputy read that hands the attacker's own uid nothing, but
+	// hands root's reach to whatever it points at. The refusal, not the mode, is
+	// what closes that: the file is opened O_NOFOLLOW and its type checked on the
+	// open descriptor, so there is no window between the check and the read.
+	ReadRegularFile(path string) ([]byte, error)
 	// ReadFile reads a root-readable file: the installed server plist, whose
 	// operator-supplied arguments a reinstall must carry over; the
 	// server-arguments record that carries those same arguments when no plist
@@ -1089,50 +1103,130 @@ func (c Config) meshKeyWorkPath() string {
 // path netd is not reading.
 func (c Config) meshKeyHelperPath() string { return filepath.Join(MeshKeyDir, c.meshKeyRef()) }
 
+// ErrNotRegularFile is what ReadRegularFile reports for a path that exists but
+// is a symlink, a directory, a device or a fifo. It is a sentinel because the
+// callers must tell it apart from "absent": absence is a posture (nothing has
+// been provisioned yet), while a non-regular file where a key belongs is
+// somebody having put it there, and the two lead to opposite actions.
+var ErrNotRegularFile = errors.New("not a regular file")
+
+// readMeshKey reads one copy of this node's wireguard identity and returns
+// (nil, nil) when that copy does not exist — the only absence this step treats
+// as a posture rather than a failure.
+//
+// Everything else is refused, and refused LOUDLY, because both copies sit in
+// directories root does not own outright: the work-dir copy is the service
+// user's, and the root-only copy's PARENT is (the run dir). So a file there is
+// not automatically this node's identity — it is whatever the last writer put
+// there. Two things are therefore checked before any byte is copied anywhere:
+// the path is a regular file that was opened without following a symlink, and
+// the bytes decode as a usable Curve25519 private key. what names the copy in
+// the error, so the operator is told which of the two to look at.
+//
+// The validation is not decoration. The whole step exists to copy one file's
+// bytes into a root-only file netd hands to wireguard; bytes that are not a key
+// would fail there, at mesh bring-up, as an opaque device error on a node that
+// installed cleanly.
+func readMeshKey(sys System, path, what string) ([]byte, error) {
+	b, err := sys.ReadRegularFile(path)
+	switch {
+	case err == nil:
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("install: read the %s mesh key %s: %w", what, path, err)
+	}
+	if _, err := bootstrap.WireguardPublicKey(string(b)); err != nil {
+		return nil, fmt.Errorf("install: the %s mesh key %s is not a usable wireguard private key: %w "+
+			"(remove it only if you accept that this node's mesh identity changes and every peer must re-learn it)", what, path, err)
+	}
+	return b, nil
+}
+
 // provisionMeshKey makes this node's wireguard identity exist, in both places
 // it has to exist, before either daemon starts — for whichever role is being
 // installed.
 //
-// The WORK-DIR copy is the source of truth, because the node daemon is what
-// owns the identity: it loads that file on every start and derives the public
-// key its MeshPeer advertises from it, so a key minted anywhere else would have
-// to agree with it byte for byte or rotate the node's identity. So this step
-// reads it and copies exactly its bytes into MeshKeyDir; only when it does not
-// exist (a first install, before the daemon has ever run) is a key minted here,
-// and then BOTH copies are written from the same bytes — the work-dir one
-// through the service-user seam, so the daemon finds it and never mints a
-// second, different key of its own.
+// The WORK-DIR copy is the source of truth whenever it exists, because the node
+// daemon is what owns the identity: it loads that file on every start and
+// derives the public key its MeshPeer advertises from it, so a key minted
+// anywhere else would have to agree with it byte for byte or rotate the node's
+// identity. This step reads it and copies exactly its bytes into MeshKeyDir.
 //
-// It exists because the daemon's own best-effort write into MeshKeyDir cannot
-// work in the posture k3sm actually ships: that directory is root-owned, the
-// daemon runs as _k3sm, and until this step existed a fresh install did not
-// create it at all — so a worker in helper mode asked netd for a key ref that
-// resolved to nothing, and the mesh never came up. Provisioning is the
+// When it does NOT exist the root-only copy is consulted before anything is
+// minted, and if it holds a usable key the work-dir copy is RESTORED from it.
+// That order is the point: the two copies are one identity, and a node whose
+// work dir was wiped (a data-root repair, a hand-deleted file) still has every
+// peer holding the public half of the key in the key dir. Minting there would
+// silently orphan the node — its MeshPeer would advertise a public key no peer's
+// AllowedIPs carries, and the mesh would stay dark on an install that reported
+// success. A key is minted ONLY when neither copy exists, and then both are
+// written from the same bytes: the work-dir one through the service-user seam,
+// so the daemon finds it and never mints a second, different key of its own.
+//
+// The step exists at all because the daemon's own best-effort write into
+// MeshKeyDir cannot work in the posture k3sm ships: that directory is
+// root-owned, the daemon runs as _k3sm, and until this step existed a fresh
+// install did not create it — so a worker in helper mode asked netd for a key
+// ref that resolved to nothing and the mesh never came up. Provisioning is the
 // privileged installer's job because only the privileged installer can do it.
 //
 // A re-run is a no-op when the two copies already agree, and a REPAIR when they
-// do not: a helper copy whose bytes differ is overwritten from the work dir
-// (logged at Info), because a stale copy is a key netd would hand wireguard
-// while the node advertises the public half of a different one.
+// do not: a root-only copy that differs, or that is unusable while the work dir
+// holds a good key, is overwritten from the work dir (logged), because a stale
+// copy is a key netd would hand wireguard while the node advertises the public
+// half of a different one. An unusable copy with NO work-dir key to repair from
+// is a hard failure — see readMeshKey.
 //
 // What this does NOT buy, stated plainly: MeshKeyDir's PARENT is the run dir,
 // which is service-user-owned by necessity (EnsureRunDir), so _k3sm can rename,
 // replace or unlink the key dir and anything beneath it. Root ownership here
 // protects the key's CONFIDENTIALITY — no other account on the Mac can read the
 // bytes — and not its integrity against the one account that already drives
-// netd over its socket. Per-uid isolation of that account is the vm
-// RuntimeClass's job, not this directory's.
+// netd over its socket. Every read below is O_NOFOLLOW and type-checked for
+// that reason, and every write is a temp-and-rename, so neither operation can be
+// redirected by something planted at the path. Per-uid isolation of that account
+// is the vm RuntimeClass's job, not this directory's.
 func provisionMeshKey(sys System, cfg Config, uid uint32) error {
 	if err := sys.EnsureMeshKeyDir(MeshKeyDir, MeshKeyDirMode); err != nil {
 		return fmt.Errorf("install: ensure the root-only mesh key dir %s: %w", MeshKeyDir, err)
 	}
-	workPath := cfg.meshKeyWorkPath()
-	key, err := sys.ReadFile(workPath)
+	workPath, helperPath := cfg.meshKeyWorkPath(), cfg.meshKeyHelperPath()
+	work, err := readMeshKey(sys, workPath, "work-dir")
+	if err != nil {
+		return err
+	}
+	helper, herr := readMeshKey(sys, helperPath, "root-only")
+	if herr != nil {
+		// A root-only copy that cannot be read or is not a key is repairable
+		// EXACTLY when the work dir holds the identity to repair it from.
+		// Otherwise it is the only thing standing between this node and a new
+		// identity, and overwriting it is the one outcome that cannot be undone.
+		if work == nil {
+			return herr
+		}
+		cfg.Logger.Warn("the root-only mesh key is unusable; re-provisioning it from this node's work-dir key", "path", helperPath, "err", herr)
+		helper = nil
+	}
+
+	key := work
 	switch {
-	case err == nil:
-		// The node already has an identity. Its bytes are what get copied — never
-		// re-derived, never re-minted.
-	case errors.Is(err, fs.ErrNotExist):
+	case key != nil:
+		// The node's own copy decides; nothing is minted or restored.
+	case helper != nil:
+		// Restore rather than mint: these bytes are the identity every peer
+		// already knows this node by.
+		key = helper
+		workDirMode := ServerTokenDirMode
+		if cfg.Role == RoleAgent {
+			workDirMode = AgentTokenDirMode
+		}
+		if err := sys.WriteServiceUserFile(workPath, key, uid, MeshKeyFileMode, workDirMode); err != nil {
+			return fmt.Errorf("install: restore this node's mesh key at %s: %w", workPath, err)
+		}
+		cfg.Logger.Info("restored this node's mesh key into the daemon's work dir from the root-only copy (the identity its peers already know)",
+			"path", workPath, "source", helperPath, "keyRef", cfg.meshKeyRef())
+	default:
 		priv, pub, gerr := bootstrap.GenerateWireguardKey()
 		if gerr != nil {
 			return fmt.Errorf("install: mint this node's mesh key: %w", gerr)
@@ -1150,19 +1244,14 @@ func provisionMeshKey(sys System, cfg Config, uid uint32) error {
 		// The PUBLIC half is logged and the private half never is: the public key
 		// is what every peer programs into its wireguard device, so having it in
 		// the install log is what makes a mesh that did not come up diagnosable.
-		cfg.Logger.Info("minted this node's wireguard identity", "path", workPath, "keyRef", cfg.meshKeyRef(), "publicKey", pub)
-	default:
-		return fmt.Errorf("install: read this node's mesh key %s: %w", workPath, err)
+		cfg.Logger.Info("minted this node's wireguard identity (neither copy existed)", "path", workPath, "keyRef", cfg.meshKeyRef(), "publicKey", pub)
 	}
-	helperPath := cfg.meshKeyHelperPath()
-	existing, rerr := sys.ReadFile(helperPath)
-	switch {
-	case rerr == nil && bytes.Equal(existing, key):
+
+	if helper != nil && bytes.Equal(helper, key) {
 		return nil
-	case rerr == nil:
+	}
+	if helper != nil {
 		cfg.Logger.Info("the root-only mesh key did not match this node's identity; re-provisioning it from the work dir", "path", helperPath)
-	case !errors.Is(rerr, fs.ErrNotExist):
-		return fmt.Errorf("install: read the root-only mesh key %s: %w", helperPath, rerr)
 	}
 	if err := sys.WriteRootOnlyFile(helperPath, key, MeshKeyFileMode); err != nil {
 		return fmt.Errorf("install: provision the root-only mesh key at %s: %w", helperPath, err)

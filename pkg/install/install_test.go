@@ -111,6 +111,11 @@ type fakeSystem struct {
 	// entry but present in files is 0600, so an unconfigured fake describes a
 	// credential nobody else can read.
 	modes map[string]fs.FileMode
+	// kinds is what a path IS, for the one seam that cares: ReadRegularFile. The
+	// zero value (no entry) is a regular file, so every pre-existing test keeps
+	// describing an ordinary tree, and a test that wants the swap this seam
+	// refuses states it with putSymlink/putIrregular.
+	kinds map[string]fakeFileKind
 	// entitlement is the verdict VerifyVirtualizationEntitlement returns, keyed by
 	// path. The zero value (no entry) means "signed and entitled" so that every
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
@@ -239,6 +244,52 @@ func (f *fakeSystem) FileMode(path string) (fs.FileMode, error) {
 		return 0o600, nil
 	}
 	return 0, fmt.Errorf("stat %s: %w", path, fs.ErrNotExist)
+}
+
+// fakeFileKind is what the fake filesystem says a path is. Only ReadRegularFile
+// consults it: every other seam here is path-based and has no type to observe.
+type fakeFileKind int
+
+const (
+	// fakeRegular is the zero value: an ordinary file.
+	fakeRegular fakeFileKind = iota
+	// fakeSymlink is a symlink at the path — what a service-uid writer plants to
+	// make a root read copy somebody else's bytes out.
+	fakeSymlink
+	// fakeIrregular is a directory/fifo/device at the path.
+	fakeIrregular
+)
+
+// putSymlink makes ReadRegularFile refuse path as a symlink (the fake's ELOOP).
+// The bytes, if any, are still in files — which is the point: a seam that
+// followed the link would return them and the test would go green.
+func (f *fakeSystem) putSymlink(path string) { f.putKind(path, fakeSymlink) }
+
+// putIrregular makes ReadRegularFile refuse path as a non-regular file.
+func (f *fakeSystem) putIrregular(path string) { f.putKind(path, fakeIrregular) }
+
+func (f *fakeSystem) putKind(path string, k fakeFileKind) {
+	if f.kinds == nil {
+		f.kinds = map[string]fakeFileKind{}
+	}
+	f.kinds[path] = k
+}
+
+// ReadRegularFile answers ReadFile's bytes for an ordinary path, and the
+// ErrNotRegularFile refusal for one a test has said is a symlink or a
+// non-regular file — the two verdicts the real O_NOFOLLOW open reaches.
+func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
+	f.calls = append(f.calls, "ReadRegularFile:"+path)
+	switch f.kinds[path] {
+	case fakeSymlink:
+		return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+	case fakeIrregular:
+		return nil, fmt.Errorf("open %s: %w: it is a directory", path, ErrNotRegularFile)
+	}
+	if content, ok := f.files[path]; ok {
+		return content, nil
+	}
+	return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 }
 
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
@@ -724,9 +775,15 @@ func TestInstallOrchestration(t *testing.T) {
 		// work dir (service-user 0600, where the daemon loads it) and the key dir
 		// (root 0600, where netd resolves the ref). Before any daemon starts.
 		"EnsureMeshKeyDir:/var/lib/k3sm/run/keys:0700",
-		"ReadFile:/var/lib/k3sm/server/server.key",
+		// BOTH copies are read before anything is written, and read through the
+		// seam that refuses a symlink: whether a key already exists decides
+		// between copying, restoring and minting, and only a mint is destructive.
+		// Neither exists here (a first install), so one is minted and written to
+		// the work dir (service-user 0600, where the daemon loads it) and the key
+		// dir (root 0600, where netd resolves the ref).
+		"ReadRegularFile:/var/lib/k3sm/server/server.key",
+		"ReadRegularFile:/var/lib/k3sm/run/keys/server.key",
 		"WriteServiceUserFile:/var/lib/k3sm/server/server.key:0600:0700:271",
-		"ReadFile:/var/lib/k3sm/run/keys/server.key",
 		"WriteRootOnlyFile:/var/lib/k3sm/run/keys/server.key:0600",
 		"CopyToRootOwned:/Library/k3sm/k3sm",
 		// The launcher link goes down immediately after the binary it points at,
