@@ -240,6 +240,108 @@ func (f *fakeSystem) Chown(path string, uid, gid int) error {
 	return nil
 }
 
+// AdoptTree walks the fake ownership table with the SAME rules the darwin
+// implementation applies to a real tree: the top-level policy, the
+// <ns>_<pod>_<uid> shape filter, parent-before-child, no descent through a
+// symlink, and a failed entry recorded rather than returned.
+//
+// It cannot model the hazard the real one exists for — a fake has no descriptors
+// and nothing races it — so what it pins here is the POLICY, and the descriptor
+// discipline is pinned against a real filesystem in install_darwin_test.go. The
+// chowns go through Chown, so every existing assertion about which paths moved,
+// in which order, keeps reading the same call log.
+func (f *fakeSystem) AdoptTree(root string, uid, gid, maxDepth int, policy AdoptPolicy) (TreeAdoption, error) {
+	f.calls = append(f.calls, "AdoptTree:"+root)
+	self, ok := f.owners[root]
+	if !ok {
+		return TreeAdoption{}, fmt.Errorf("open %s: %w", root, fs.ErrNotExist)
+	}
+	if self.Kind != EntryDir {
+		return TreeAdoption{}, fmt.Errorf("open %s: not a directory", root)
+	}
+	w := &fakeAdopt{f: f, uid: uid, gid: gid, maxDepth: maxDepth, policy: policy}
+	w.walk(root, 1)
+	return w.rep, nil
+}
+
+// fakeAdopt is one AdoptTree run over the ownership table.
+type fakeAdopt struct {
+	f        *fakeSystem
+	uid, gid int
+	maxDepth int
+	policy   AdoptPolicy
+	rep      TreeAdoption
+}
+
+func (w *fakeAdopt) walk(dir string, depth int) {
+	if depth > w.maxDepth {
+		w.skip(dir, "too deep")
+		return
+	}
+	var children []OwnedEntry
+	for path, e := range w.f.owners {
+		if path != dir && filepath.Dir(path) == dir {
+			children = append(children, e)
+		}
+	}
+	slices.SortFunc(children, func(a, b OwnedEntry) int { return strings.Compare(a.Path, b.Path) })
+	for _, e := range children {
+		w.visit(e, depth)
+	}
+}
+
+func (w *fakeAdopt) visit(e OwnedEntry, depth int) {
+	if depth > 1 {
+		switch e.Kind {
+		case EntryDir:
+			if e.UID == 0 {
+				w.adopt(e)
+			}
+			w.walk(e.Path, depth+1)
+		case EntryRegular:
+			if e.UID == 0 {
+				w.adopt(e)
+			}
+		default:
+			w.skip(e.Path, "it is "+e.Kind.String()+", which k3sm does not follow or chown here")
+		}
+		return
+	}
+	if e.UID != 0 {
+		return
+	}
+	switch w.policy {
+	case AdoptLogLinks:
+		if e.Kind != EntrySymlink && e.Kind != EntryRegular {
+			w.skip(e.Path, "it is "+e.Kind.String()+", which is not a container log link")
+			return
+		}
+		w.adopt(e)
+	default:
+		switch {
+		case e.Kind != EntryDir:
+			w.skip(e.Path, "it is "+e.Kind.String()+" at the root of the pod log tree, which k3sm did not write")
+		case !isPodLogDirName(filepath.Base(e.Path)):
+			w.skip(e.Path, "its name is not the <namespace>_<pod>_<uid> shape k3sm writes, so k3sm does not descend into it")
+		default:
+			w.adopt(e)
+			w.walk(e.Path, depth+1)
+		}
+	}
+}
+
+func (w *fakeAdopt) adopt(e OwnedEntry) {
+	if err := w.f.Chown(e.Path, w.uid, w.gid); err != nil {
+		w.skip(e.Path, err.Error())
+		return
+	}
+	w.rep.Adopted++
+}
+
+func (w *fakeAdopt) skip(path, reason string) {
+	w.rep.Skipped = append(w.rep.Skipped, SkippedEntry{Path: path, Reason: reason})
+}
+
 // putDrain makes the fake launchd keep label in the domain for reads
 // LaunchctlServicePID answers after its bootout — the bootout-returns-early race.
 func (f *fakeSystem) putDrain(label string, reads int) {
@@ -862,6 +964,13 @@ func TestInstallOrchestration(t *testing.T) {
 		// the service user at a mode that keeps pod output off every local account.
 		"EnsureContainerLogDir:/var/log/pods",
 		"EnsureContainerLogDir:/var/log/containers",
+		// ...and the descriptor-relative walk that hands the PER-POD directories
+		// inside that tree over, for BOTH roles, because a single-node server
+		// writes the same tree. Each root is opened once and found absent on a
+		// first install, which is the only reason this is two calls and not a
+		// walk (B327).
+		"AdoptTree:/var/log/pods",
+		"AdoptTree:/var/log/containers",
 		// Before any daemon bootstraps: root netd would otherwise create the run
 		// dir root-owned and the _k3sm server could not bind runtimed.sock in it.
 		"EnsureRunDir:/var/lib/k3sm/run",
