@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -197,9 +198,19 @@ func (s nodeCredentialStore) paths() []string {
 // server-assigned mesh/apiserver values.
 //
 // It is idempotent and is called on BOTH start paths — a fresh token join writes
-// the newly issued material, a reuse start rewrites byte-identical content (or
-// updates only the apiserver URL when `--api-port` moved). Writing on reuse keeps
-// exactly one place where the on-disk shape is produced.
+// the newly issued material, a reuse start would rewrite byte-identical content
+// (or update only the apiserver URL when `--api-port` moved). Writing on reuse
+// keeps exactly one place where the on-disk shape is produced, and because every
+// write goes through writeStoreFile, an ordinary restart re-writes nothing at all.
+//
+// Atomicity is PER FILE, not per store: each artifact is installed by a rename, so
+// no reader ever sees a half-written file and a crash mid-Save leaves every
+// artifact either wholly old or wholly new. It is deliberately not a transaction
+// over the five, because the alternative (a staging dir swapped in one rename)
+// buys little here: the store is only ever rewritten in full right after a join,
+// so the worst mix is two generations of leaves from the same two CAs, each of
+// which is individually usable and none of which is torn. The rejoin that follows
+// converges it.
 func (s nodeCredentialStore) Save(apiserverURL, nodeName string, res *bootstrap.JoinResult) error {
 	if res == nil {
 		return errors.New("save node credential: no join result")
@@ -210,15 +221,15 @@ func (s nodeCredentialStore) Save(apiserverURL, nodeName string, res *bootstrap.
 	// 0600 for both halves of the serving pair. The certificate is public material,
 	// but it is only ever read beside its key by this same process, and a uniform
 	// mode is one fewer thing to get wrong than a split one.
-	if err := os.WriteFile(s.servingCertPath(), res.KubeletServingCertPEM, 0o600); err != nil {
+	if err := writeStoreFile(s.servingCertPath(), res.KubeletServingCertPEM, 0o600); err != nil {
 		return fmt.Errorf("persist kubelet serving certificate: %w", err)
 	}
-	if err := os.WriteFile(s.servingKeyPath(), res.KubeletServingKeyPEM, 0o600); err != nil {
+	if err := writeStoreFile(s.servingKeyPath(), res.KubeletServingKeyPEM, 0o600); err != nil {
 		return fmt.Errorf("persist kubelet serving key: %w", err)
 	}
 	// The client-identity CA is a CA certificate: public, world-readable, and the
 	// same 0644 it has on the server.
-	if err := os.WriteFile(s.clientCAPath(), res.ClientCAPEM, 0o644); err != nil {
+	if err := writeStoreFile(s.clientCAPath(), res.ClientCAPEM, 0o644); err != nil {
 		return fmt.Errorf("persist kubelet client CA: %w", err)
 	}
 	blob, err := json.MarshalIndent(nodeAssignment{
@@ -230,10 +241,80 @@ func (s nodeCredentialStore) Save(apiserverURL, nodeName string, res *bootstrap.
 	if err != nil {
 		return fmt.Errorf("marshal node assignment: %w", err)
 	}
-	if err := os.WriteFile(s.assignmentPath(), append(blob, '\n'), 0o644); err != nil {
+	if err := writeStoreFile(s.assignmentPath(), append(blob, '\n'), 0o644); err != nil {
 		return fmt.Errorf("persist node assignment: %w", err)
 	}
 	return nil
+}
+
+// storeTmpSuffix is appended to a target's name for the staging file an atomic
+// install renames over it. It is a FIXED suffix rather than a random one so a
+// crash leaves one recognisable leftover per artifact instead of accumulating
+// them, and so the next write reuses it. It sits beside its target, in the same
+// directory, because rename is only atomic within a filesystem.
+const storeTmpSuffix = ".tmp"
+
+// writeStoreFile installs data at path atomically, and skips the write entirely
+// when the file already holds exactly those bytes at exactly that mode.
+//
+// Both halves matter, for different reasons. ATOMICITY: this runs on every agent
+// start, including restarts that change nothing, so an interrupted write is no
+// longer a rare event confined to first-join — and a truncated credential file is
+// precisely the corrupt state Status refuses to repair on its own. Writing a
+// sibling temp file, fsyncing it and renaming over the target means a reader
+// (this process on its next start, or an operator) sees the old file or the new
+// one, never a prefix of either. NO-OP ON IDENTICAL CONTENT: the common case by
+// far is a restart whose credential has not changed, and a store that is not
+// touched cannot be damaged by a crash in the first place.
+//
+// The mode is compared as well as the bytes, so a credential file that somehow
+// acquired the wrong permissions is corrected rather than left because its
+// content matched.
+func writeStoreFile(path string, data []byte, mode os.FileMode) error {
+	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm() == mode {
+		if current, err := os.ReadFile(path); err == nil && bytes.Equal(current, data) {
+			return nil
+		}
+	}
+	tmp := path + storeTmpSuffix
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmp, err)
+	}
+	// O_CREATE's mode is masked by the process umask, so the bits a secret needs
+	// are set explicitly instead of assumed. Done BEFORE the write: the file must
+	// never be readable by anyone else, not even briefly.
+	if err := f.Chmod(mode); err != nil {
+		return cleanUpTmp(f, tmp, fmt.Errorf("set the mode of %s: %w", tmp, err))
+	}
+	if _, err := f.Write(data); err != nil {
+		return cleanUpTmp(f, tmp, fmt.Errorf("write %s: %w", tmp, err))
+	}
+	// fsync before the rename: without it the rename can be durable while the
+	// bytes it points at are not, which on a power loss is exactly the truncated
+	// file this function exists to make impossible.
+	if err := f.Sync(); err != nil {
+		return cleanUpTmp(f, tmp, fmt.Errorf("sync %s: %w", tmp, err))
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("install %s: %w", path, err)
+	}
+	return nil
+}
+
+// cleanUpTmp closes and removes a failed staging file and returns the original
+// error. The removal is best-effort: a leftover temp file is harmless (nothing
+// reads one, and the next write truncates it), whereas masking the real failure
+// with a cleanup error would hide why the credential was not written.
+func cleanUpTmp(f *os.File, tmp string, err error) error {
+	_ = f.Close()
+	_ = os.Remove(tmp)
+	return err
 }
 
 // Status reports whether this store holds a usable node credential, returning the

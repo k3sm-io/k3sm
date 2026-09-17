@@ -755,7 +755,10 @@ users:
 		b64(res.NodeClientCertPEM),
 		b64(res.NodeClientKeyPEM),
 	)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	// Installed atomically (and skipped when unchanged) like every other artifact
+	// of the credential store this belongs to: a restart rewrites this file, and a
+	// half-written kubeconfig is a node that cannot authenticate.
+	if err := writeStoreFile(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write node kubeconfig: %w", err)
 	}
 	return nil

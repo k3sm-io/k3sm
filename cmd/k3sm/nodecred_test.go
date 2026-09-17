@@ -33,7 +33,7 @@ import (
 	"k3sm.io/k3sm/pkg/hostnet"
 )
 
-// The B284 gate: a joined agent that restarts must present the credential it
+// The restart gate: a joined agent that restarts must present the credential it
 // already holds, not re-run its join.
 //
 // The defect: runAgent ran the full token join on EVERY start and persisted only
@@ -53,7 +53,7 @@ import (
 // decision is the intended one.
 
 const (
-	nodeCredTestNode  = "k3sm-b284-worker"
+	nodeCredTestNode  = "k3sm-restart-worker"
 	nodeCredTestAPI   = "https://100.64.1.1:6444"
 	nodeCredPodCIDR   = "100.64.2.0/24"
 	nodeCredMeshIP    = "100.64.2.1"
@@ -67,11 +67,11 @@ const (
 // does. It returns the result and both CAs so a test can compare pins.
 func nodeCredFixture(t *testing.T, clientTTL, servingTTL time.Duration) (*bootstrap.JoinResult, *certs.CA, *certs.CA) {
 	t.Helper()
-	clusterCA, err := certs.NewCA("k3sm-b284-cluster-ca")
+	clusterCA, err := certs.NewCA("k3sm-restart-cluster-ca")
 	if err != nil {
 		t.Fatalf("mint the cluster CA: %v", err)
 	}
-	signingCA, err := certs.NewCA("k3sm-b284-signing-ca")
+	signingCA, err := certs.NewCA("k3sm-restart-signing-ca")
 	if err != nil {
 		t.Fatalf("mint the signing CA: %v", err)
 	}
@@ -97,7 +97,7 @@ func nodeCredFixture(t *testing.T, clientTTL, servingTTL time.Duration) (*bootst
 		PodCIDR:               nodeCredPodCIDR,
 		MeshIP:                nodeCredMeshIP,
 		Peers: []netv1.MeshPeerSpec{
-			{NodeName: "k3sm-b284-server", PodCIDR: "100.64.1.0/24", MeshIP: "100.64.1.1", Endpoint: "192.0.2.10:51820"},
+			{NodeName: "k3sm-restart-server", PodCIDR: "100.64.1.0/24", MeshIP: "100.64.1.1", Endpoint: "192.0.2.10:51820"},
 		},
 		WGPrivateKeyB64: "join-time-private-key",
 		APIServers:      []string{"100.64.1.1:6444"},
@@ -382,6 +382,128 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 		})
 	})
 
+	t.Run("a restart that changes nothing rewrites nothing", func(t *testing.T) {
+		t.Parallel()
+		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+		store := savedStore(t, res)
+
+		// Backdate every artifact, then re-save exactly what is already there. Save
+		// runs on EVERY start now, so the routine case must be a no-op on disk: a
+		// file that is not touched cannot be damaged by a crash, and a credential
+		// rewritten thousands of times for no reason is thousands of chances to be.
+		backdated := time.Now().Add(-48 * time.Hour)
+		for _, p := range store.paths() {
+			if err := os.Chtimes(p, backdated, backdated); err != nil {
+				t.Fatalf("backdate %s: %v", p, err)
+			}
+		}
+		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, res); err != nil {
+			t.Fatalf("second Save: %v", err)
+		}
+		for _, p := range store.paths() {
+			fi, err := os.Stat(p)
+			if err != nil {
+				t.Fatalf("stat %s: %v", p, err)
+			}
+			if !fi.ModTime().Equal(backdated) {
+				t.Errorf("%s was rewritten by a Save of identical content (mtime moved to %s)",
+					filepath.Base(p), fi.ModTime())
+			}
+		}
+
+		// A changed apiserver URL (an `--api-port` move) still lands.
+		if err := store.Save("https://100.64.1.1:6666", nodeCredTestNode, res); err != nil {
+			t.Fatalf("Save with a new apiserver URL: %v", err)
+		}
+		_, cred, err := store.Status(time.Now())
+		if err != nil {
+			t.Fatalf("Status: %v", err)
+		}
+		if cred.apiserverURL != "https://100.64.1.1:6666" {
+			t.Errorf("apiserverURL = %q, want the newly saved one", cred.apiserverURL)
+		}
+	})
+
+	t.Run("a save interrupted partway leaves a readable credential", func(t *testing.T) {
+		t.Parallel()
+		first, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+		store := savedStore(t, first)
+		second, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+
+		// Fail the fourth of the five writes, deterministically and without a seam
+		// in the production path: a DIRECTORY sitting where that artifact's staging
+		// file must be created cannot be opened as a file. What the save has done by
+		// then is what an interruption would have left.
+		blocked := store.clientCAPath() + storeTmpSuffix
+		if err := os.Mkdir(blocked, 0o755); err != nil {
+			t.Fatalf("block the client CA write: %v", err)
+		}
+		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, second); err == nil {
+			t.Fatal("Save reported success while one artifact could not be written")
+		}
+
+		// The store is still a credential: parseable, self-consistent, in date. The
+		// atomic install is what buys this — a torn file would be corrupt, and a
+		// corrupt store is a node that will not start.
+		status, cred, err := store.Status(time.Now())
+		if err != nil {
+			t.Fatalf("Status after an interrupted Save: %v", err)
+		}
+		if status != credentialValid {
+			t.Fatalf("Status after an interrupted Save = %s, want valid", status)
+		}
+
+		// Every artifact is WHOLLY one generation or the other, never a prefix.
+		if !bytes.Equal(cred.clientCAPEM, first.ClientCAPEM) {
+			t.Error("the artifact whose write failed is not the one that was there before it")
+		}
+		if !bytes.Equal(cred.servingCertPEM, second.KubeletServingCertPEM) ||
+			!bytes.Equal(cred.servingKeyPEM, second.KubeletServingKeyPEM) {
+			t.Error("an artifact written before the failure is neither the old nor the new one: a write was torn")
+		}
+		if cred.assignment.PodCIDR != first.PodCIDR {
+			t.Errorf("assignment podCIDR = %q; the write after the failure must not have run", cred.assignment.PodCIDR)
+		}
+
+		// And the retry converges: nothing about the interruption is sticky.
+		if err := os.Remove(blocked); err != nil {
+			t.Fatalf("unblock: %v", err)
+		}
+		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, second); err != nil {
+			t.Fatalf("Save after unblocking: %v", err)
+		}
+		status, cred, err = store.Status(time.Now())
+		if err != nil || status != credentialValid {
+			t.Fatalf("Status after the retry = %s, err %v", status, err)
+		}
+		if !bytes.Equal(cred.clientCAPEM, second.ClientCAPEM) || !bytes.Equal(cred.clientCertPEM, second.NodeClientCertPEM) {
+			t.Error("the retried Save did not converge the store on the new credential")
+		}
+		for _, p := range store.paths() {
+			if _, err := os.Stat(p + storeTmpSuffix); err == nil {
+				t.Errorf("%s%s survived a successful save", filepath.Base(p), storeTmpSuffix)
+			}
+		}
+	})
+
+	t.Run("a leftover staging file from a crash is ignored", func(t *testing.T) {
+		t.Parallel()
+		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+		store := savedStore(t, res)
+		for _, p := range store.paths() {
+			if err := os.WriteFile(p+storeTmpSuffix, []byte("half a file"), 0o600); err != nil {
+				t.Fatalf("plant a leftover for %s: %v", p, err)
+			}
+		}
+		status, cred, err := store.Status(time.Now())
+		if err != nil {
+			t.Fatalf("Status with leftover staging files: %v", err)
+		}
+		if status != credentialValid || !bytes.Equal(cred.clientCertPEM, res.NodeClientCertPEM) {
+			t.Errorf("Status = %s; a leftover staging file must never be read as part of the credential", status)
+		}
+	})
+
 	t.Run("the start plan", func(t *testing.T) {
 		t.Parallel()
 		const storedPin = "aa11"
@@ -477,7 +599,7 @@ func TestAgentRestartReusesItsNodeCredential(t *testing.T) {
 			t.Errorf("a token for THIS cluster gave (%s, %v), want reuse", mode, err)
 		}
 
-		otherCA, err := certs.NewCA("k3sm-b284-other-cluster-ca")
+		otherCA, err := certs.NewCA("k3sm-restart-other-cluster-ca")
 		if err != nil {
 			t.Fatalf("mint another cluster's CA: %v", err)
 		}
