@@ -113,8 +113,10 @@ var errNoPodIdentity = errors.New("no pod identity bound to the request context;
 // ref, or one without the UID, is a strictly weaker and different binding.
 //
 // FAIL-CLOSED: a call with no pod identity on the context returns
-// errNoPodIdentity rather than minting an unbound token. Every legitimate caller
-// reaches here inside CreatePod/UpdatePod, which bind the identity.
+// errNoPodIdentity rather than minting an unbound token. Both CreatePod and
+// UpdatePod bind the identity on their context, but only the create path
+// actually materializes volumes and mints a token today (B233) — the binding on
+// UpdatePod is a uniformity/forward guard, not a live minting path.
 func (k *kubeResolver) ServiceAccountToken(ctx context.Context, namespace, audience string, expirationSeconds int64) (string, error) {
 	id, ok := podIdentityFromContext(ctx)
 	if !ok {
