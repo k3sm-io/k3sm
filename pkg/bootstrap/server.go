@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +78,10 @@ type ServerConfig struct {
 	Bundle BundleSource
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
+	// Now is the clock the per-token join rate limiter refills against — this
+	// package's injected-clock idiom, the one NewTokenStore takes. time.Now when
+	// nil; a test advances it instead of sleeping out a refill window.
+	Now func() time.Time
 }
 
 // Server is the supervisor-side bootstrap endpoint a joining worker hits over a
@@ -87,6 +92,9 @@ type ServerConfig struct {
 // to the authenticated node + that assigned address.
 type Server struct {
 	cfg ServerConfig
+	// joins bounds how fast ONE token may drive the expensive, post-authentication
+	// half of handleJoin (see joinRateLimiter).
+	joins *joinRateLimiter
 }
 
 // NewServer validates cfg and returns the bootstrap Server. It errors if any
@@ -117,7 +125,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		// per-request line would bury it. Loud here beats silent everywhere.
 		cfg.Logger.Warn("the bootstrap server has no SelfNodeName: a join claiming this control plane's own node name is not refused by name, leaving only the node-password binding and the enroller's index guard behind it")
 	}
-	return &Server{cfg: cfg}, nil
+	return &Server{cfg: cfg, joins: newJoinRateLimiter(cfg.Now)}, nil
 }
 
 // Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +
@@ -208,6 +216,36 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		// knows the name it sent; it learns nothing here about which names are
 		// taken, what this node is called, or how far the request got.
 		http.Error(w, "join refused: that node name is not available", http.StatusForbidden)
+		return
+	}
+
+	// 1b. PER-TOKEN RATE LIMIT. Everything below this line is the expensive half
+	// of a join — the node-password bind, the CSR parse and policy checks, the
+	// mesh enroll's index carve and the release that gives it back, and up to two
+	// signatures. A holder of one valid worker token could otherwise drive that
+	// round trip as fast as the network allows, enrolling and releasing without
+	// bound, and every one of those requests is authenticated, so nothing above
+	// would refuse it.
+	//
+	// The POSITION is the design, in both directions:
+	//   - AFTER the token verification and the self-node-name refusal. That
+	//     refusal is a string compare that costs nothing, and charging a
+	//     legitimate token's budget for someone else's refused request would let
+	//     the limiter be turned into the denial of service it exists to prevent.
+	//   - BEFORE NodePasswords.Ensure, so a refusal can never take the
+	//     first-write-wins name binding, and nothing downstream of it runs.
+	//
+	// The key is the token id ALONE (joinTokenID): the node name is the caller's
+	// to rotate per request, so including it would hand out a fresh bucket every
+	// time and limit nothing.
+	tokenID := joinTokenID(req.Token)
+	if ok, retryAfter := s.joins.allow(tokenID); !ok {
+		secs := retryAfterSeconds(retryAfter)
+		s.cfg.Logger.Warn("join rejected", "reason", "rate-limit", "node", req.NodeName,
+			"token", tokenID, "retryAfterSeconds", secs, "remote", r.RemoteAddr)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		http.Error(w, fmt.Sprintf("join refused: too many join attempts for this token; retry in %ds", secs),
+			http.StatusTooManyRequests)
 		return
 	}
 

@@ -54,6 +54,12 @@ type joinServerRig struct {
 	// signingCA is the issuer of the system:node client cert, kept so a test can
 	// verify what an ALLOWED join received.
 	signingCA *certs.CA
+	// tokens is the server's token store, so a test can mint a SECOND token
+	// against the same server — the only way to ask whether two tokens share a
+	// rate-limit bucket.
+	tokens *bootstrap.TokenStore
+	// caHash is the pin every token this rig mints carries.
+	caHash string
 }
 
 // newNodeAddressRig is the fixed-assignment rig the address gates use: every node
@@ -77,6 +83,19 @@ func newJoinServerRig(t *testing.T, enroller bootstrap.Enroller) *joinServerRig 
 // selfNodeName — the one join-server fixture, parameterised rather than copied.
 func newSelfNameJoinServerRig(t *testing.T, enroller bootstrap.Enroller, selfNodeName string) *joinServerRig {
 	t.Helper()
+	return newClockedJoinServerRig(t, enroller, selfNodeName, nil)
+}
+
+// newClockedJoinServerRig is the same fixture with the server's clock injected,
+// which is what a rate-limit test needs: the join limiter refills against it, so
+// a window can be advanced instead of slept through. A nil clock is the shipped
+// time.Now.
+//
+// The TOKEN store keeps the real clock deliberately. Only the limiter's refill
+// is under test, and a fake clock shared with the store would tie every token's
+// TTL to it for no benefit.
+func newClockedJoinServerRig(t *testing.T, enroller bootstrap.Enroller, selfNodeName string, now func() time.Time) *joinServerRig {
+	t.Helper()
 	clusterCA, err := certs.NewCA("k3sm-cluster-ca")
 	if err != nil {
 		t.Fatalf("cluster CA: %v", err)
@@ -98,6 +117,7 @@ func newSelfNameJoinServerRig(t *testing.T, enroller bootstrap.Enroller, selfNod
 		NodePasswords: passwords,
 		Enroller:      enroller,
 		SelfNodeName:  selfNodeName,
+		Now:           now,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -109,11 +129,32 @@ func newSelfNameJoinServerRig(t *testing.T, enroller bootstrap.Enroller, selfNod
 		token:     bootstrap.FormatToken(clusterCA.PinHash(), user, secret),
 		passwords: passwords,
 		signingCA: signingCA,
+		tokens:    tokens,
+		caHash:    clusterCA.PinHash(),
 	}
+}
+
+// mintToken mints another token against the same server, so a test can compare
+// what two DIFFERENT tokens are allowed to do.
+func (r *joinServerRig) mintToken(t *testing.T) string {
+	t.Helper()
+	user, secret, _, err := r.tokens.Create(time.Hour)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	return bootstrap.FormatToken(r.caHash, user, secret)
 }
 
 // post sends req and returns the status and the trimmed body.
 func (r *joinServerRig) post(t *testing.T, req bootstrap.JoinRequest) (int, string) {
+	t.Helper()
+	status, body, _ := r.postWithHeaders(t, req)
+	return status, body
+}
+
+// postWithHeaders is post plus the response headers, for the one refusal whose
+// header carries the answer (Retry-After on a rate-limited join).
+func (r *joinServerRig) postWithHeaders(t *testing.T, req bootstrap.JoinRequest) (int, string, http.Header) {
 	t.Helper()
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -128,7 +169,7 @@ func (r *joinServerRig) post(t *testing.T, req bootstrap.JoinRequest) (int, stri
 	if err != nil {
 		t.Fatalf("read join response: %v", err)
 	}
-	return resp.StatusCode, strings.TrimSpace(string(raw))
+	return resp.StatusCode, strings.TrimSpace(string(raw)), resp.Header
 }
 
 // TestJoinIssuesForTheAssignedNodeAddress is the server half of B338: the

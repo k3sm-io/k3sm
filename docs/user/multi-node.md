@@ -105,6 +105,14 @@ The install waits for the join to finish before it reports success: it watches f
 credential the agent writes, so a token the server rejects fails the install with a message instead
 of leaving a daemon that retries every 30 seconds behind a healthy process.
 
+**Onboarding several Macs at once:** mint a token per Mac. The server bounds how fast one token may
+join, because a join costs it real work (a node-password binding, two signatures, and a mesh address
+carved out of the cluster's range), and a token that has spent its budget is answered with a wait
+rather than a refusal. An agent waits that out inside its own start, so two or three Macs sharing
+one token still come up; a longer batch runs the install out of patience and says so. Running
+`sudo k3sm token create` once per Mac costs nothing, and each token gets its own budget. The tokens
+expire on their own after 24 hours whether or not you use them.
+
 Once the node shows up `Ready` in `kubectl get nodes` on the server you can delete **both** copies:
 your own file and `/var/lib/k3sm/agent/join-token`. Neither is needed again. A joined node presents
 the credential it stored at the join, and a missing token file is not an error at start, so the
