@@ -25,8 +25,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
+	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/nodecred"
 )
@@ -47,10 +49,38 @@ func agentCfg(t *testing.T) Config {
 	}
 }
 
+// testClusterFixture is the ONE cluster this package's default fixtures belong
+// to: its CA PEM is what the fake's join endpoint serves, and its pin is what
+// theJoinToken carries. The two have to come from one place, because the
+// join-endpoint preflight compares them and a fixture whose token pinned a
+// cluster the fixture endpoint does not serve would describe a wrong-cluster
+// install in every test that never meant to.
+type testClusterFixture struct {
+	caPEM []byte
+	pin   string
+}
+
+// testCluster mints that cluster once per test binary. A crypto failure here is
+// not a test result — nothing can be described without a CA — so it stops the
+// binary rather than failing one case.
+var testCluster = sync.OnceValue(func() testClusterFixture {
+	ca, err := certs.NewCA("k3sm-test-cluster-ca")
+	if err != nil {
+		panic("mint the test cluster CA: " + err.Error())
+	}
+	pin, err := certs.CertPin(ca.CertPEM)
+	if err != nil {
+		panic("pin the test cluster CA: " + err.Error())
+	}
+	return testClusterFixture{caPEM: ca.CertPEM, pin: pin}
+})
+
 // theJoinToken is a token value a test plants where a token must never appear.
-// It is deliberately a realistic K10 shape, so a renderer that put the token on
-// the argv would be caught by its own spelling rather than by a placeholder.
-const theJoinToken = "K10abc123::node:s3cr3t"
+// It is a real K10 shape over testCluster()'s CA — so a renderer that put the
+// token on the argv is caught by its own spelling rather than by a placeholder,
+// and an install driven with it reaches the join-endpoint preflight's cluster
+// comparison the way a live one does.
+var theJoinToken = "K10" + testCluster().pin + "::node:s3cr3t"
 
 // operatorTokenFile is the path the OPERATOR writes their token to: root-owned,
 // in root's home, which is exactly the file the service user cannot read and

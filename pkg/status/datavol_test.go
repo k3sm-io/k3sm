@@ -94,7 +94,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, rec := c.dataRootRow(context.Background())
+		row, rec := c.dataRootRow(context.Background(), dataroot.RoleServer)
 		if rec == nil {
 			t.Fatal("dataRootRow did not report the record, so no datavol row would be shown")
 		}
@@ -127,7 +127,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, _ := c.dataRootRow(context.Background())
+		row, _ := c.dataRootRow(context.Background(), dataroot.RoleServer)
 		if !strings.Contains(row.Detail, "34.8G used, no quota") {
 			t.Errorf("detail %q does not report the VOLUME's usage", row.Detail)
 		}
@@ -154,7 +154,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, _ := c.dataRootRow(context.Background())
+		row, _ := c.dataRootRow(context.Background(), dataroot.RoleServer)
 		if !strings.Contains(row.Detail, "apfs volume k3sm-pods, no quota, mounted") {
 			t.Errorf("detail = %q, want the volume named with no usage figure at all", row.Detail)
 		}
@@ -179,7 +179,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			Paths:      testPaths(""),
 			ServiceUID: 271,
 		}
-		row, _ := c.dataRootRow(context.Background())
+		row, _ := c.dataRootRow(context.Background(), dataroot.RoleServer)
 		if row.Severity != SeverityWarn {
 			t.Errorf("severity = %v, want warn at 92%% of the quota", row.Severity)
 		}
@@ -205,7 +205,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			entries: []string{"run"},
 		}
 		c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271}
-		row, _ := c.dataRootRow(context.Background())
+		row, _ := c.dataRootRow(context.Background(), dataroot.RoleServer)
 		if row.State != StateNotMounted || row.Severity != SeverityFail {
 			t.Fatalf("row = %s/%v, want not-mounted/fail", row.State, row.Severity)
 		}
@@ -229,7 +229,7 @@ func TestDataRootRowNamesVolume(t *testing.T) {
 			entries: []string{"run"},
 		}
 		c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: RuntimeReachableUnknownUID}
-		row, rec := c.dataRootRow(context.Background())
+		row, rec := c.dataRootRow(context.Background(), dataroot.RoleServer)
 		if rec != nil {
 			t.Error("an fstab line is not a k3sm record")
 		}
@@ -446,7 +446,7 @@ func TestDataRootRowLegacyDevice(t *testing.T) {
 	fsys.record = ""
 	fsys.fstab = "UUID=6DEAE471-6CDE-4A4E-88A1-6A7B4DEF2DDD " + dir + " apfs rw\n"
 	c := Collector{DataRoot: fsys, Paths: testPaths(""), ServiceUID: 271}
-	row, rec := c.dataRootRow(context.Background())
+	row, rec := c.dataRootRow(context.Background(), dataroot.RoleServer)
 	if rec != nil {
 		t.Fatal("a fstab-only data root reported a record")
 	}

@@ -586,7 +586,13 @@ func TestWriteServiceUserFileOnDisk(t *testing.T) {
 		cfg := Config{DataRoot: filepath.Join(root, "data"), TokenFile: src}.withDefaults()
 		sys := stagingSystem{fakeSystem: &fakeSystem{}, uid: uid, gid: gid}
 
-		if err := stageJoinToken(sys, cfg, uint32(uid)); err != nil {
+		// Read the way Install reads it — once, at the preflight — and stage those
+		// bytes: the two halves are separate functions now, and this is the pair.
+		tokenText, _, err := operatorJoinToken(sys, cfg)
+		if err != nil {
+			t.Fatalf("operatorJoinToken: %v", err)
+		}
+		if err := stageJoinToken(sys, cfg, uint32(uid), tokenText); err != nil {
 			t.Fatalf("stageJoinToken: %v", err)
 		}
 		staged, err := os.ReadFile(cfg.agentTokenPath())
@@ -616,9 +622,12 @@ func TestWriteServiceUserFileOnDisk(t *testing.T) {
 		cfg := Config{DataRoot: filepath.Join(root, "data"), TokenFile: src}.withDefaults()
 		sys := stagingSystem{fakeSystem: &fakeSystem{}, uid: uid, gid: gid}
 
-		err := stageJoinToken(sys, cfg, uint32(uid))
+		// The mode refusal belongs to the ONE reader of the operator's file, which
+		// runs at the preflight before anything is written; staging never sees the
+		// bytes of a file that was refused there.
+		_, _, err := operatorJoinToken(sys, cfg)
 		if err == nil {
-			t.Fatal("stageJoinToken accepted a world-readable join token file")
+			t.Fatal("operatorJoinToken accepted a world-readable join token file")
 		}
 		if !strings.Contains(err.Error(), "chmod 600") {
 			t.Errorf("error %q does not name the remedy", err)

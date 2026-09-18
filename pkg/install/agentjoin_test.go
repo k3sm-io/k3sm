@@ -40,6 +40,12 @@ import (
 type nodeCredentialFixture struct {
 	files map[string][]byte
 	token string
+	// caPEM is that cluster's CA, kept so seeding the fixture can also make the
+	// fake's join endpoint serve it: an install's join-endpoint preflight
+	// compares the endpoint's CA against the token's pin, and a fixture that
+	// seeded only the credential would describe a worker being pointed at
+	// another cluster.
+	caPEM []byte
 }
 
 // mintNodeCredential issues a cluster CA and the material a completed join
@@ -86,6 +92,7 @@ users:
     client-key-data: %s
 `, b64(ca.CertPEM), b64(clientCert), b64(clientKey))
 	return nodeCredentialFixture{
+		caPEM: ca.CertPEM,
 		files: map[string][]byte{
 			filepath.Join(dir, nodecred.KubeconfigFile):     []byte(kubeconfig),
 			filepath.Join(dir, nodecred.ServingCertFile):    servingCert,
@@ -97,11 +104,14 @@ users:
 	}
 }
 
-// seed writes the whole credential into the fake root filesystem.
+// seed writes the whole credential into the fake root filesystem, and points the
+// fake's join endpoint at the same cluster — the Mac being reinstalled is a
+// worker of the cluster whose CA it holds.
 func (c nodeCredentialFixture) seed(f *fakeSystem) {
 	for path, content := range c.files {
 		f.putFile(path, content)
 	}
+	f.putJoinCA("", c.caPEM)
 }
 
 // seedAppearingDuringThePoll writes the credential with its KUBECONFIG held back
@@ -117,6 +127,7 @@ func (c nodeCredentialFixture) seedAppearingDuringThePoll(f *fakeSystem, dir str
 		}
 		f.putFile(path, content)
 	}
+	f.putJoinCA("", c.caPEM)
 }
 
 // seedAgentCrashRecord writes a crash-loop record where the AGENT daemon keeps

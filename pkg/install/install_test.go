@@ -115,6 +115,29 @@ type fakeSystem struct {
 	// pre-existing test keeps describing an ordinary Mac whose /usr/local/bin is
 	// root-owned; a test that wants the refusal states it with putLinkDirTrust.
 	linkDirTrust map[string]error
+	// joinAddrs is what ResolveJoinHost answers, keyed by the host asked about.
+	// No entry means the host resolves to ITSELF — the ordinary single-address
+	// control plane — so an unconfigured fake describes a reachable cluster and
+	// only a test about multi-address resolution has to say anything.
+	joinAddrs map[string][]string
+	// joinDialErrs are the addresses DialJoinServer REFUSES, keyed by host:port.
+	// The zero value answers on every address, for the reason above: a test that
+	// wants the crash-loop this preflight prevents states the refusal itself.
+	joinDialErrs map[string]error
+	// joinCA is the cluster CA PEM FetchJoinCA serves, keyed by host:port; the
+	// EMPTY key is the answer for every address. Unset, the fake serves
+	// testCluster()'s CA — the one theJoinToken pins — so an unconfigured agent
+	// install passes the identity half of the preflight exactly as one against
+	// the right control plane does.
+	joinCA map[string][]byte
+	// joinCAErrs are the addresses whose CA cannot be fetched (an endpoint that
+	// answers TCP but is not a k3sm control plane), keyed by host:port.
+	joinCAErrs map[string]error
+	// swapAfterRead is the content a path takes on AFTER its next read, keyed by
+	// path — a file replaced between two readers. It exists for exactly one
+	// question: the install reads the operator's join token once, so a token file
+	// swapped after that read must not change what is staged.
+	swapAfterRead map[string][]byte
 	// plistModes is the mode each LaunchDaemon plist was last written at, keyed
 	// by plist path. It is the fake's whole model of the file's permissions: the
 	// real chmod is the darwin implementation's, and a unit test must not need
@@ -532,6 +555,15 @@ func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadFile:"+path)
+	// A file whose content changes AFTER this read: the swap is applied once the
+	// current read has been answered, so the caller sees the old bytes and every
+	// later reader sees the new ones. See putFileSwappedAfterRead.
+	if next, ok := f.swapAfterRead[path]; ok {
+		defer func() {
+			f.putFile(path, next)
+			delete(f.swapAfterRead, path)
+		}()
+	}
 	if d, ok := f.delayed[path]; ok {
 		if d.absentReads > 0 {
 			d.absentReads--
@@ -617,6 +649,87 @@ func (f *fakeSystem) putLinkDirTrust(link string, err error) {
 func (f *fakeSystem) LinkDirTrust(link string) error {
 	f.calls = append(f.calls, "LinkDirTrust:"+link)
 	return f.linkDirTrust[link]
+}
+
+// putFileSwappedAfterRead seeds a file holding first, which becomes then the
+// moment it has been read once — an operator (or somebody else) replacing the
+// token between the preflight that validated it and the staging that copies it.
+func (f *fakeSystem) putFileSwappedAfterRead(path string, first, then []byte) {
+	f.putFile(path, first)
+	if f.swapAfterRead == nil {
+		f.swapAfterRead = map[string][]byte{}
+	}
+	f.swapAfterRead[path] = then
+}
+
+// putJoinAddrs makes the join host resolve to addrs, in order — the Mac whose
+// name carries both a LAN address and a public one.
+func (f *fakeSystem) putJoinAddrs(host string, addrs ...string) {
+	if f.joinAddrs == nil {
+		f.joinAddrs = map[string][]string{}
+	}
+	f.joinAddrs[host] = addrs
+}
+
+// putJoinDialErr makes the bootstrap listener at addr refuse the dial — the
+// unreachable address the 2026-09-17 install wrote a whole tree for.
+func (f *fakeSystem) putJoinDialErr(addr string, err error) {
+	if f.joinDialErrs == nil {
+		f.joinDialErrs = map[string]error{}
+	}
+	f.joinDialErrs[addr] = err
+}
+
+// putJoinCA makes FetchJoinCA serve pem; an empty addr answers for every
+// address, which is what a fixture minting its own cluster uses.
+func (f *fakeSystem) putJoinCA(addr string, pem []byte) {
+	if f.joinCA == nil {
+		f.joinCA = map[string][]byte{}
+	}
+	f.joinCA[addr] = pem
+}
+
+// putJoinCAErr makes the endpoint at addr answer TCP but fail to serve a cluster
+// CA — something that is listening on 9345 and is not a k3sm control plane.
+func (f *fakeSystem) putJoinCAErr(addr string, err error) {
+	if f.joinCAErrs == nil {
+		f.joinCAErrs = map[string]error{}
+	}
+	f.joinCAErrs[addr] = err
+}
+
+// ResolveJoinHost records the question and answers from the table, defaulting to
+// the host itself.
+func (f *fakeSystem) ResolveJoinHost(host string, _ time.Duration) ([]string, error) {
+	f.calls = append(f.calls, "ResolveJoinHost:"+host)
+	if addrs, ok := f.joinAddrs[host]; ok {
+		return addrs, nil
+	}
+	return []string{host}, nil
+}
+
+// DialJoinServer records the address dialed, IN ORDER — the record a test reads
+// to say the preflight tried every address the host resolved to and stopped at
+// the first one that answered.
+func (f *fakeSystem) DialJoinServer(addr string, _ time.Duration) error {
+	f.calls = append(f.calls, "DialJoinServer:"+addr)
+	return f.joinDialErrs[addr]
+}
+
+// FetchJoinCA records the address and serves the configured CA: the per-address
+// entry, then the every-address one, then this package's own test cluster.
+func (f *fakeSystem) FetchJoinCA(addr string, _ time.Duration) ([]byte, error) {
+	f.calls = append(f.calls, "FetchJoinCA:"+addr)
+	if err := f.joinCAErrs[addr]; err != nil {
+		return nil, err
+	}
+	if pem, ok := f.joinCA[addr]; ok {
+		return pem, nil
+	}
+	if pem, ok := f.joinCA[""]; ok {
+		return pem, nil
+	}
+	return testCluster().caPEM, nil
 }
 
 // RemoveSymlink records the link and reports it removed — the healthy uninstall
@@ -1061,6 +1174,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// the `k3sm` launcher root-owned? A read, like the probe above it; the
 		// link itself is not laid down until step 2b, and a refusal there would
 		// arrive with the whole tree already on disk.
+		//
+		// A THIRD refuse-before-write probe sits after this one on a worker — the
+		// join endpoint's reachability and cluster identity — and is absent here
+		// because a control plane joins nothing (TestAgentInstallPreflightsTheJoinEndpoint).
 		"LinkDirTrust:/usr/local/bin/k3sm",
 		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
 		"EnsureLogDir:/var/log/k3sm",

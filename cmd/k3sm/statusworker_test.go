@@ -18,11 +18,13 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +33,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
@@ -109,6 +113,28 @@ type aliveProcs struct{}
 func (aliveProcs) Liveness(int) status.Liveness { return status.LivenessRunning }
 func (aliveProcs) VMHosts(int) (int, error)     { return 0, nil }
 
+// deadRuntimed is a runtime daemon that does not answer. It is the arm of the
+// runtimed row that carries a remedy, which is why the worker gate wires it:
+// the remedy names a launchd job, and on a worker that job is the agent.
+type deadRuntimed struct{}
+
+func (deadRuntimed) Info(context.Context) (*runtimev1.GetRuntimeInfoResponse, error) {
+	return nil, errors.New("dial unix: connect: no such file or directory")
+}
+
+// shadowedDataRoot is a data root DECLARED in /etc/fstab with nothing mounted
+// there — the shadow, whose remedy ends in a kickstart of netd and this Mac's
+// node daemon. No unprivileged test can create the posture for real, so the
+// declaration is served through the seam.
+type shadowedDataRoot struct{ plainDataRoot }
+
+func (d shadowedDataRoot) ReadFile(path string) ([]byte, error) {
+	if path == dataroot.FstabPath {
+		return []byte("UUID=1234-ABCD " + d.dir + " apfs rw 0 0\n"), nil
+	}
+	return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+}
+
 // plainDataRoot is a data root that is an ordinary directory owned by the
 // service user: the posture that keeps the data-root row out of this gate's
 // way, since what is under test is the apiserver and kubeconfig rows.
@@ -160,6 +186,15 @@ type macOpts struct {
 	// this account: the ordinary posture of an unprivileged `k3sm status`
 	// against a service-user-owned store.
 	unreadableCredential bool
+	// stateDB stages a kine state.db inside the control-plane work dir, with
+	// this SQLite write-format byte in its header (2 = wal, 1 = rollback).
+	// Zero stages none. On an agent Mac it is the dead database the stale
+	// directory carries, which is what B333 is about.
+	stateDB byte
+	// unreadableStateDB makes that staged database unreadable by this account.
+	// It changes nothing a report may print — which is the point: a row that
+	// reads the file cannot help printing something different.
+	unreadableStateDB bool
 }
 
 // stageNodeMac writes an install tree for one role under a temp dir.
@@ -220,6 +255,19 @@ func stageNodeMac(t *testing.T, opts macOpts) nodeMac {
 		}
 		writeAdminKubeconfig(t, kc, staleServerKubeconfigURL)
 	}
+	if opts.stateDB != 0 {
+		db := executor.StateDBPath(workDir)
+		if err := os.MkdirAll(filepath.Dir(db), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(db), err)
+		}
+		writeSQLiteHeader(t, db, opts.stateDB, staleUserVersion)
+		if opts.unreadableStateDB {
+			if err := os.Chmod(db, 0o000); err != nil {
+				t.Fatalf("chmod %s: %v", db, err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(db, 0o600) })
+		}
+	}
 	if opts.joined {
 		store := nodeCredentialStore{dir: filepath.Dir(install.AgentCredentialPath(dataRoot))}
 		if err := os.MkdirAll(store.dir, 0o700); err != nil {
@@ -259,6 +307,26 @@ func stageNodeMac(t *testing.T, opts macOpts) nodeMac {
 	}
 }
 
+// staleUserVersion is the schema version the staged database's header carries.
+// It is a value a report would have to have READ the file to know, so it is what
+// the worker rows below assert never appears.
+const staleUserVersion = 7
+
+// writeSQLiteHeader writes a minimal 100-byte SQLite database header: the magic
+// at offset 0, the write-format byte at 18 (2 = wal, 1 = rollback) and the
+// user_version at 60. It is not a database — DatastorePosture reads the header
+// and nothing else, which is how it stays a read-only probe.
+func writeSQLiteHeader(t *testing.T, path string, writeVersion byte, userVersion uint32) {
+	t.Helper()
+	var hdr [100]byte
+	copy(hdr[0:16], "SQLite format 3\x00")
+	hdr[18], hdr[19] = writeVersion, writeVersion
+	binary.BigEndian.PutUint32(hdr[60:64], userVersion)
+	if err := os.WriteFile(path, hdr[:], 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // writeAdminKubeconfig writes a control-plane admin kubeconfig targeting server.
 func writeAdminKubeconfig(t *testing.T, path, server string) {
 	t.Helper()
@@ -287,7 +355,7 @@ users:
 
 // collectFrom runs a whole report for a staged Mac, resolving its credentials
 // through the production path and recording every URL the report dials.
-func collectFrom(t *testing.T, mac nodeMac, role install.Role, ready bool) (status.Report, []string, error) {
+func collectFrom(t *testing.T, mac nodeMac, role install.Role, ready bool, tweak ...func(*status.Collector)) (status.Report, []string, error) {
 	t.Helper()
 	t.Setenv("K3SM_WORK_DIR", "")
 	t.Setenv("KUBECONFIG", "")
@@ -322,6 +390,9 @@ func collectFrom(t *testing.T, mac nodeMac, role install.Role, ready bool) (stat
 		Version:    version.Get(),
 		Host:       "macOS 26.1",
 		Hostname:   "k3sm-mac",
+	}
+	for _, f := range tweak {
+		f(&c)
 	}
 	return c.Collect(context.Background()), dialled, kubeErr
 }
@@ -577,4 +648,285 @@ func TestStatusKubeconfigDistinguishesAbsentFromUnreadable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStatusOnAWorkerRendersNoControlPlaneRows is the B333 gate.
+//
+// The defect, seen on the two-Mac rig after a worker rejoin and a residual of
+// B324: a Mac installed as an agent still carried the <DataRoot>/server
+// directory an earlier server-era install left behind, and `k3sm status` PROBED
+// the dead kine database inside it. The report then read "datastore ok kine
+// sqlite, wal, user_version 0" — a fact about a database no daemon on this Mac
+// has opened since the install changed role — and the datastore row's own
+// non-wal arm offered "k3sm status logs server", a log no daemon here writes.
+//
+// The row that carried that remedy is the DATASTORE row (pkg/status/rows.go,
+// the `jm != "wal"` arm); the worker-advisory map only kept it from moving the
+// verdict. A worker runs no control plane and therefore no kine, so the row now
+// says so and reads nothing at all.
+func TestStatusOnAWorkerRendersNoControlPlaneRows(t *testing.T) {
+	// serverLog is the remedy string the stale directory used to produce here,
+	// and serverLabel the daemon this Mac does not run. Neither may appear
+	// anywhere in a worker's report.
+	const serverLog = "k3sm status logs server"
+	serverLabel := install.ServerLabel
+
+	t.Run("a worker with a stale server database reports no datastore of its own", func(t *testing.T) {
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true, serverWorkDir: true, stateDB: 2})
+		rep, _, err := collectFrom(t, mac, install.RoleAgent, false)
+		if err != nil {
+			t.Fatalf("a joined worker could not resolve its own credentials: %v", err)
+		}
+
+		ds, ok := rep.Row(status.RowDatastore)
+		if !ok {
+			// The row NAME stays on a worker: it is a stable `-o json` key, and
+			// a key that comes and goes with the role is worse to consume than
+			// one that says the subsystem is not this node's.
+			t.Fatalf("the datastore row is gone from a worker's report; it must remain as a stable JSON key\n%s",
+				status.Render(rep, status.Style{}))
+		}
+		if ds.State != status.StateSkip || ds.Severity != status.SeveritySkip {
+			t.Errorf("datastore row = %s/%v (%q), want skip/skip", ds.State, ds.Severity, ds.Detail)
+		}
+		if ds.Detail != status.WorkerDatastoreDetail {
+			t.Errorf("datastore detail = %q, want %q", ds.Detail, status.WorkerDatastoreDetail)
+		}
+		if ds.Remedy != "" {
+			t.Errorf("datastore remedy = %q; there is nothing here to repair", ds.Remedy)
+		}
+		for k, v := range ds.Wide {
+			if strings.Contains(v, mac.paths.WorkDir) {
+				t.Errorf("datastore wide %q names the stale control-plane directory: %q", k, v)
+			}
+		}
+
+		// Every remedy in the report, because the Next block is nothing but the
+		// rows' remedies deduped in severity order: a worker whose rows name no
+		// server daemon can never offer one as a next step, in any verdict.
+		for _, row := range rep.Rows {
+			if strings.Contains(row.Remedy, serverLog) || strings.Contains(row.Remedy, serverLabel) {
+				t.Errorf("row %q offers a remedy naming the server daemon on a worker: %q", row.Name, row.Remedy)
+			}
+		}
+		for _, step := range rep.Next {
+			if strings.Contains(step, serverLog) || strings.Contains(step, serverLabel) {
+				t.Errorf("the Next block names the server daemon on a worker: %q", step)
+			}
+		}
+
+		// The rendered screens, overview and cluster: the cluster view prints
+		// every row's fix lines, so it is where a stale remedy shows up
+		// regardless of the verdict.
+		for name, screen := range map[string]string{
+			"overview": status.Render(rep, status.Style{}),
+			"cluster":  status.RenderCluster(rep, status.Style{}),
+		} {
+			for _, unwanted := range []string{"kine sqlite", serverLog, serverLabel, fmt.Sprintf("user_version %d", staleUserVersion)} {
+				if strings.Contains(screen, unwanted) {
+					t.Errorf("the %s screen on a worker contains %q:\n%s", name, unwanted, screen)
+				}
+			}
+			if !strings.Contains(screen, status.WorkerDatastoreDetail) {
+				t.Errorf("the %s screen does not say the datastore is not this node's:\n%s", name, screen)
+			}
+		}
+	})
+
+	t.Run("the worker's datastore row does not depend on the file, so nothing opened it", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads every file regardless of mode")
+		}
+		// The probe is os.Stat + os.Open (DatastorePosture), not an FS seam, so
+		// "was it opened" is asserted the only way that is honest here: the
+		// same Mac with the database made UNREADABLE must produce a
+		// byte-identical row. A row that read the file could not: it would fall
+		// into the permission arm ("state.db not readable as this user") and
+		// offer the sudo re-run.
+		readable := workerDatastoreRow(t, false)
+		unreadable := workerDatastoreRow(t, true)
+		if !reflect.DeepEqual(readable, unreadable) {
+			t.Errorf("the datastore row changed when the stale database became unreadable, so the row reads it:\n readable   = %+v\n unreadable = %+v",
+				readable, unreadable)
+		}
+		if unreadable.Detail != status.WorkerDatastoreDetail || unreadable.Remedy != "" {
+			t.Errorf("datastore row = %q / remedy %q, want the worker sentence and no remedy", unreadable.Detail, unreadable.Remedy)
+		}
+	})
+
+	t.Run("a control plane is unchanged: it reports and repairs its own datastore", func(t *testing.T) {
+		wal := stageNodeMac(t, macOpts{role: install.RoleServer, serverWorkDir: true, stateDB: 2})
+		rep, _, err := collectFrom(t, wal, install.RoleServer, true)
+		if err != nil {
+			t.Fatalf("a control plane could not resolve its own kubeconfig: %v", err)
+		}
+		ds, ok := rep.Row(status.RowDatastore)
+		if !ok {
+			t.Fatal("no datastore row on a control plane")
+		}
+		want := status.Row{
+			Name:     status.RowDatastore,
+			State:    status.StateOK,
+			Severity: status.SeverityOK,
+			Detail:   fmt.Sprintf("kine sqlite, wal, user_version %d", staleUserVersion),
+			Wide:     map[string]string{"path": executor.StateDBPath(wal.paths.WorkDir)},
+		}
+		if !reflect.DeepEqual(ds, want) {
+			t.Errorf("server datastore row =\n %+v\nwant\n %+v", ds, want)
+		}
+		// The whole server overview, pinned: states and remedies, in order. A
+		// healthy control plane repairs nothing, so every remedy is empty and
+		// the single next step is the one a running cluster gets.
+		wantRows := []struct{ name, state string }{
+			{status.RowInstall, "ok"}, {status.RowNetd, "running"}, {status.RowServer, "running"},
+			{status.RowAPIServer, "ready"}, {status.RowNode, "ready"}, {status.RowWorkloads, "ok"},
+			{status.RowDataRoot, "ok"}, {status.RowDatastore, "ok"}, {status.RowKubeconfig, "ok"},
+		}
+		for _, w := range wantRows {
+			row, ok := rep.Row(w.name)
+			if !ok {
+				t.Errorf("server row %q missing", w.name)
+				continue
+			}
+			if string(row.State) != w.state {
+				t.Errorf("server row %q state = %q, want %q (%s)", w.name, row.State, w.state, row.Detail)
+			}
+			if row.Remedy != "" {
+				t.Errorf("server row %q carries a remedy on a healthy control plane: %q", w.name, row.Remedy)
+			}
+		}
+		if got := rep.Next; len(got) != 1 || got[0] != "k3sm kubectl get pods -A" {
+			t.Errorf("server Next = %q, want the running step", got)
+		}
+
+		// And the non-wal arm, which is where "k3sm status logs server" comes
+		// from: on a control plane it is exactly right, and it is unchanged.
+		rollback := stageNodeMac(t, macOpts{role: install.RoleServer, serverWorkDir: true, stateDB: 1})
+		rep, _, err = collectFrom(t, rollback, install.RoleServer, true)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		ds, _ = rep.Row(status.RowDatastore)
+		want = status.Row{
+			Name:     status.RowDatastore,
+			State:    status.StateNotReady,
+			Severity: status.SeverityWarn,
+			Detail:   fmt.Sprintf("kine sqlite, rollback, user_version %d (expected wal)", staleUserVersion),
+			Remedy:   serverLog,
+			Wide:     map[string]string{"path": executor.StateDBPath(rollback.paths.WorkDir)},
+		}
+		if !reflect.DeepEqual(ds, want) {
+			t.Errorf("server datastore row (non-wal) =\n %+v\nwant\n %+v", ds, want)
+		}
+	})
+
+	t.Run("a worker's repairs name its own daemon, never the server's", func(t *testing.T) {
+		// The two rows whose remedies restart a node daemon: the runtime daemon
+		// that did not answer, and the shadowed data root that has to be
+		// re-opened once it is mounted. Both used to name io.k3sm.server, a
+		// launchd job a worker's Mac does not have — `k3sm install --role agent`
+		// never writes that plist, so the operator's kickstart fails with
+		// "could not find service".
+		mac := stageNodeMac(t, macOpts{role: install.RoleAgent, joined: true, serverWorkDir: true, stateDB: 2})
+		rep, _, err := collectFrom(t, mac, install.RoleAgent, false, func(c *status.Collector) {
+			c.Runtimed = deadRuntimed{}
+			c.DataRoot = shadowedDataRoot{plainDataRoot{dir: mac.paths.DataRoot}}
+		})
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		rt, ok := rep.Row(status.RowRuntimed)
+		if !ok || rt.Remedy == "" {
+			t.Fatalf("the runtimed row carries no remedy, so this case proves nothing: %+v", rt)
+		}
+		dr, ok := rep.Row(status.RowDataRoot)
+		if !ok || dr.Remedy == "" {
+			t.Fatalf("the data-root row carries no remedy, so this case proves nothing: %+v", dr)
+		}
+		if want := "sudo launchctl kickstart -k system/" + install.AgentLabel; rt.Remedy != want {
+			t.Errorf("runtimed remedy on a worker = %q, want %q", rt.Remedy, want)
+		}
+		if !strings.Contains(dr.Remedy, "sudo launchctl kickstart -k system/"+install.AgentLabel) {
+			t.Errorf("data-root remedy on a worker = %q, want it to kickstart %s", dr.Remedy, install.AgentLabel)
+		}
+		for _, row := range rep.Rows {
+			if strings.Contains(row.Remedy, serverLabel) || strings.Contains(row.Remedy, serverLog) {
+				t.Errorf("row %q names the server daemon on a worker: %q", row.Name, row.Remedy)
+			}
+		}
+		for _, step := range rep.Next {
+			if strings.Contains(step, serverLabel) || strings.Contains(step, serverLog) {
+				t.Errorf("the Next block names the server daemon on a worker: %q", step)
+			}
+		}
+		if screen := status.RenderCluster(rep, status.Style{}); strings.Contains(screen, serverLabel) {
+			t.Errorf("the cluster screen on a worker names the server daemon:\n%s", screen)
+		}
+	})
+
+	t.Run("a control plane's repairs are byte-identical", func(t *testing.T) {
+		// The same two arms on a server, pinned as exact strings: this is the
+		// output the role-aware helper must not have changed.
+		mac := stageNodeMac(t, macOpts{role: install.RoleServer, serverWorkDir: true, stateDB: 2})
+		rep, _, err := collectFrom(t, mac, install.RoleServer, true, func(c *status.Collector) {
+			c.Runtimed = deadRuntimed{}
+			c.DataRoot = shadowedDataRoot{plainDataRoot{dir: mac.paths.DataRoot}}
+		})
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		rt, _ := rep.Row(status.RowRuntimed)
+		if want := "sudo launchctl kickstart -k system/" + install.ServerLabel; rt.Remedy != want {
+			t.Errorf("runtimed remedy on a control plane = %q, want %q", rt.Remedy, want)
+		}
+		dr, _ := rep.Row(status.RowDataRoot)
+		want := fmt.Sprintf("sudo rm -r %s/run && sudo diskutil mount -mountPoint %s <volume>   # the shadow holds only the netd socket\nsudo launchctl kickstart -k system/%s && sudo launchctl kickstart -k system/%s",
+			mac.paths.DataRoot, mac.paths.DataRoot, install.NetdLabel, install.ServerLabel)
+		if dr.Remedy != want {
+			t.Errorf("data-root shadow remedy on a control plane =\n %q\nwant\n %q", dr.Remedy, want)
+		}
+	})
+
+	t.Run("k3sm doctor says the same sentence about a worker's stale database", func(t *testing.T) {
+		present := func() (bool, int, string, error) { return true, staleUserVersion, "wal", nil }
+
+		worker := agentEnv()
+		worker.datastorePosture = present
+		got := checkDatastore(worker)
+		if got.status != statusSkip {
+			t.Errorf("doctor datastore on a worker = %v (%q), want skip", got.status, got.detail)
+		}
+		if got.detail != status.WorkerDatastoreDetail {
+			t.Errorf("doctor datastore detail = %q, want %q", got.detail, status.WorkerDatastoreDetail)
+		}
+		if got.remedy != "" {
+			t.Errorf("doctor datastore remedy = %q on a worker; there is nothing here to repair", got.remedy)
+		}
+
+		server := healthyDoctorEnv()
+		server.datastorePosture = present
+		if got := checkDatastore(server); got.status != statusPass || !strings.Contains(got.detail, "kine") {
+			t.Errorf("doctor datastore on a control plane = %v (%q), want the unchanged pass", got.status, got.detail)
+		}
+	})
+}
+
+// workerDatastoreRow collects a whole report for a worker whose stale
+// control-plane directory holds a WAL database, readable or not, and returns
+// its datastore row.
+func workerDatastoreRow(t *testing.T, unreadable bool) status.Row {
+	t.Helper()
+	mac := stageNodeMac(t, macOpts{
+		role: install.RoleAgent, joined: true, serverWorkDir: true,
+		stateDB: 2, unreadableStateDB: unreadable,
+	})
+	rep, _, err := collectFrom(t, mac, install.RoleAgent, false)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	row, ok := rep.Row(status.RowDatastore)
+	if !ok {
+		t.Fatal("no datastore row")
+	}
+	return row
 }
