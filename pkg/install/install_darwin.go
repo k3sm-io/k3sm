@@ -1004,6 +1004,136 @@ func (darwinSystem) RemoveTree(path string) error {
 	return nil
 }
 
+// LockInstall takes the exclusive install-wide lock at path. See the System
+// interface for why it exists and why it never waits.
+//
+// flock(2) rather than an O_CREAT|O_EXCL sentinel, deliberately: a sentinel file
+// is not released when the process holding it is killed, so a `sudo k3sm
+// install` stopped with ^C or by a panic would lock every later install out
+// until somebody deleted a file they have no reason to know about. A flock is
+// held by the open file description and the kernel drops it when the process
+// dies, whatever killed it. The lock file itself is left on disk on purpose —
+// it is empty, it is the lock's name, and removing it would race the next
+// acquirer onto a different inode.
+func (darwinSystem) LockInstall(path string) (func() error, error) {
+	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, uint32(installLockMode))
+	if err != nil {
+		return nil, fmt.Errorf("open the install lock %s: %w", path, err)
+	}
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = unix.Close(fd)
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w (its lock is held at %s; wait for it to finish, or check for a stopped `k3sm install`)", ErrInstallInProgress, path)
+		}
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	return func() error {
+		// Closing the descriptor releases the lock; the explicit unlock is here
+		// so a close that fails still leaves the lock dropped rather than held
+		// to process exit.
+		if err := unix.Flock(fd, unix.LOCK_UN); err != nil {
+			_ = unix.Close(fd)
+			return fmt.Errorf("unlock %s: %w", path, err)
+		}
+		if err := unix.Close(fd); err != nil {
+			return fmt.Errorf("close the install lock %s: %w", path, err)
+		}
+		return nil
+	}, nil
+}
+
+// SwapInstallRoot exchanges the staged tree with the live install root. See the
+// System interface for the contract, including what the atomicity claim is and
+// is not.
+//
+// renamex_np(2) with RENAME_SWAP is the only primitive on darwin that publishes
+// a directory over an existing one in a single step: plain rename(2) refuses a
+// non-empty destination directory (ENOTEMPTY), and the remove-then-rename
+// sequence it would otherwise take leaves a window with NO install root at all —
+// during which launchd's KeepAlive would find the daemons' executable missing.
+//
+// An ENOENT destination is the first install and is the one case that falls back
+// to a plain rename. The fallback is reached by ATTEMPTING the swap rather than
+// by testing for the directory first, so there is no window between the test and
+// the act in which the destination could appear.
+func (darwinSystem) SwapInstallRoot(staging, live string) (bool, error) {
+	err := unix.RenamexNp(staging, live, unix.RENAME_SWAP)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, unix.ENOENT):
+		// Either the destination is absent (a first install) or the staged tree
+		// itself is — and the plain rename below distinguishes them by failing
+		// with a message that names both paths.
+		if rerr := os.Rename(staging, live); rerr != nil {
+			return false, fmt.Errorf("rename the staged install root %s to %s: %w", staging, live, rerr)
+		}
+		return false, nil
+	case errors.Is(err, unix.EXDEV):
+		return false, fmt.Errorf("%w: %s and %s", ErrInstallRootCrossDevice, staging, live)
+	default:
+		return false, fmt.Errorf("swap the staged install root %s with %s: %w", staging, live, err)
+	}
+}
+
+// InstallSpace reports the free space on dir's filesystem and the size of the
+// sources an install would stage onto it. See the System interface: it takes two
+// stat families and makes no judgement.
+//
+// An absent source contributes zero rather than failing: the preflight runs
+// before the copies, and a missing artifact is the copy's message to give, with
+// the build command that produces it.
+func (darwinSystem) InstallSpace(dir string, sources []string) (uint64, uint64, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(dir, &st); err != nil {
+		return 0, 0, fmt.Errorf("statfs %s: %w", dir, err)
+	}
+	free := uint64(st.Bavail) * uint64(st.Bsize)
+	var need uint64
+	for _, src := range sources {
+		if src == "" {
+			continue
+		}
+		n, err := treeBytes(src)
+		if err != nil {
+			return 0, 0, err
+		}
+		need += n
+	}
+	return free, need, nil
+}
+
+// treeBytes is the total size of the regular files at path, which may be one
+// file or a whole directory. A missing path is zero bytes, not an error — see
+// InstallSpace. Symlinks are not followed, for the reason every other read in
+// this file does not follow one.
+func treeBytes(path string) (uint64, error) {
+	var total uint64
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil
+		case err != nil:
+			return err
+		case !d.Type().IsRegular():
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		total += uint64(info.Size())
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("size %s: %w", path, err)
+	}
+	return total, nil
+}
+
 // LookupServiceUID resolves the service account's uid. A user that does not
 // exist is (0, false), not an error: install legitimately reaches this before
 // EnsureServiceUser has created _k3sm.

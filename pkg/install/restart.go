@@ -375,6 +375,50 @@ func awaitRunning(ctx context.Context, sys System, label string, b restartBudget
 	}
 }
 
+// revertInstallRoot is the rollback for a failure that happened AFTER the staged
+// install root was published and BEFORE the previous tree was reaped — the one
+// window in which a rollback is both possible and correct.
+//
+// It does two things, in order, and both are best-effort: one reverse swap, which
+// puts the previous tree back at the live path and this install's tree back at
+// the staging path, and then a re-run of the restart against the reverted tree,
+// because the daemons may already have been booted out (or worse, bootstrapped)
+// onto the new binary. Neither failure is returned on its own — the caller is
+// already failing, and this function's only job is to make the failure state
+// truthful.
+//
+// The report is stateHonestly's shape deliberately, not a second vocabulary: one
+// sentence carrying the original cause, what was rolled back, and which daemons
+// are running right now. An operator reading an upgrade that failed needs those
+// three facts and no others.
+//
+// previous is the publish's own answer to "was there a tree here before". When it
+// is false the publish was a plain rename onto an absent install root — a first
+// install — so there is nothing to revert TO, and saying so is more useful than
+// swapping the new tree out and leaving the Mac with no install root at all.
+func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact, previous bool, cause error) error {
+	states := func() string {
+		s, _ := daemonStates(sys, longRunningDaemonLabels(m))
+		return strings.Join(s, ", ")
+	}
+	if !previous {
+		return fmt.Errorf("%w; the install root %s is this install's tree and there is no previous one to roll back to (first install); daemon state: %s", cause, cfg.InstallDir, states())
+	}
+	staging := cfg.stagingDir()
+	if _, err := sys.SwapInstallRoot(staging, filepath.Clean(cfg.InstallDir)); err != nil {
+		return fmt.Errorf("%w; ROLLBACK FAILED, the install root %s still holds the NEW tree and the previous one is at %s: %v; daemon state: %s", cause, cfg.InstallDir, staging, err, states())
+	}
+	cfg.Logger.Warn("rolled the install root back to the previous tree", "live", filepath.Clean(cfg.InstallDir), "failed-tree", staging, "cause", cause)
+	// The daemons are restarted against what is live NOW. Whatever the failure
+	// was, this install may have booted a label out, or bootstrapped it onto the
+	// tree that has just been swapped away; only a restart makes the running
+	// processes agree with the tree on disk again.
+	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
+		return fmt.Errorf("%w; rolled back to the previous install root (the failed tree is at %s), but restarting the daemons on it also failed: %v; daemon state: %s", cause, staging, err, states())
+	}
+	return fmt.Errorf("%w; rolled back to the previous install root and restarted the daemons on it (the failed tree is at %s, remove it with `sudo rm -rf %s`); daemon state: %s", cause, staging, staging, states())
+}
+
 // recoverBootedOut re-bootstraps, best effort, every label this install booted out
 // that launchd no longer has loaded, and returns one clause describing what it
 // found and did. A label that is still loaded is skipped: this install took

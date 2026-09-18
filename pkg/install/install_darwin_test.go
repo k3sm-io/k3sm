@@ -923,3 +923,170 @@ func writeFileT(t *testing.T, path, contents string) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+// The staged-install-root primitives, exercised against a REAL filesystem —
+// unprivileged, in a per-case t.TempDir(). Both are single syscalls whose whole
+// value is what the kernel does, so a fake would be asserting the test's own
+// model: renamex_np's RENAME_SWAP either exchanges two directories in one step
+// or it does not, and flock either refuses the second holder or it does not.
+//
+// t.TempDir() sits on the Data volume, which is where /Library is firmlinked
+// to, so the same-filesystem posture the swap depends on is the real one.
+
+// TestSwapInstallRootOnDisk pins both publish branches and the exchange itself.
+func TestSwapInstallRootOnDisk(t *testing.T) {
+	sys := darwinSystem{}
+
+	t.Run("a destination that exists is EXCHANGED, in one step", func(t *testing.T) {
+		root := t.TempDir()
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		mustTree(t, live, map[string]string{"k3sm": "old binary", "bin/kine": "old kine"})
+		mustTree(t, staging, map[string]string{"k3sm": "new binary", "bin/kine": "new kine", "k3sm-vmhost": "new helper"})
+
+		previous, err := sys.SwapInstallRoot(staging, live)
+		if err != nil {
+			t.Fatalf("SwapInstallRoot: %v", err)
+		}
+		if !previous {
+			t.Error("previous = false over an existing install root, want true")
+		}
+		// The new tree is live under the SAME name the plists exec...
+		if got := mustRead(t, filepath.Join(live, "k3sm")); got != "new binary" {
+			t.Errorf("the live binary is %q, want the staged one", got)
+		}
+		if got := mustRead(t, filepath.Join(live, "k3sm-vmhost")); got != "new helper" {
+			t.Errorf("the live helper is %q, want the staged one", got)
+		}
+		// ...and the previous tree is intact at the staging path, which is what
+		// makes the rollback possible until the reap.
+		if got := mustRead(t, filepath.Join(staging, "k3sm")); got != "old binary" {
+			t.Errorf("the previous binary is %q, want it preserved at the staging path", got)
+		}
+		if _, err := os.Lstat(filepath.Join(staging, "k3sm-vmhost")); !errors.Is(err, fs.ErrNotExist) {
+			t.Error("the previous tree gained a file from the new one: this was a merge, not a swap")
+		}
+
+		// One more swap puts both back — the revert.
+		if _, err := sys.SwapInstallRoot(staging, live); err != nil {
+			t.Fatalf("reverse SwapInstallRoot: %v", err)
+		}
+		if got := mustRead(t, filepath.Join(live, "k3sm")); got != "old binary" {
+			t.Errorf("after the reverse swap the live binary is %q, want the original", got)
+		}
+	})
+
+	t.Run("an absent destination is a first install and takes a plain rename", func(t *testing.T) {
+		root := t.TempDir()
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		mustTree(t, staging, map[string]string{"k3sm": "new binary"})
+
+		previous, err := sys.SwapInstallRoot(staging, live)
+		if err != nil {
+			t.Fatalf("SwapInstallRoot: %v", err)
+		}
+		if previous {
+			t.Error("previous = true with no install root on the Mac, want false")
+		}
+		if got := mustRead(t, filepath.Join(live, "k3sm")); got != "new binary" {
+			t.Errorf("the live binary is %q, want the staged one", got)
+		}
+		// Nothing is left at the staging path, so there is nothing to reap.
+		if _, err := os.Lstat(staging); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the staging path survived a plain-rename publish: %v", err)
+		}
+	})
+
+	t.Run("a missing staged tree fails and leaves the live one alone", func(t *testing.T) {
+		root := t.TempDir()
+		live, staging := filepath.Join(root, "k3sm"), filepath.Join(root, "k3sm.staging")
+		mustTree(t, live, map[string]string{"k3sm": "old binary"})
+
+		if _, err := sys.SwapInstallRoot(staging, live); err == nil {
+			t.Fatal("SwapInstallRoot succeeded with nothing staged")
+		}
+		if got := mustRead(t, filepath.Join(live, "k3sm")); got != "old binary" {
+			t.Errorf("a failed publish changed the live tree: %q", got)
+		}
+	})
+}
+
+// TestLockInstallOnDisk pins the real mutual exclusion: the second acquirer is
+// refused immediately (never queued), and the release lets it through.
+func TestLockInstallOnDisk(t *testing.T) {
+	sys := darwinSystem{}
+	path := filepath.Join(t.TempDir(), "k3sm.lock")
+
+	unlock, err := sys.LockInstall(path)
+	if err != nil {
+		t.Fatalf("LockInstall: %v", err)
+	}
+	if _, err := sys.LockInstall(path); !errors.Is(err, ErrInstallInProgress) {
+		t.Fatalf("the second acquisition = %v, want ErrInstallInProgress", err)
+	}
+	if err := unlock(); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	second, err := sys.LockInstall(path)
+	if err != nil {
+		t.Fatalf("LockInstall after the release: %v", err)
+	}
+	if err := second(); err != nil {
+		t.Fatalf("second unlock: %v", err)
+	}
+	// The lock file itself stays: it IS the lock's name, and removing it would
+	// race the next acquirer onto a different inode.
+	if _, err := os.Lstat(path); err != nil {
+		t.Errorf("the lock file did not survive the release: %v", err)
+	}
+}
+
+// TestInstallSpaceOnDisk pins the two stat families: the free space is a real
+// number, a source directory contributes its whole tree, and an absent source
+// contributes nothing rather than failing.
+func TestInstallSpaceOnDisk(t *testing.T) {
+	sys := darwinSystem{}
+	root := t.TempDir()
+	mustTree(t, filepath.Join(root, "cp-payload"), map[string]string{"kine": strings.Repeat("x", 4096), "kubectl": strings.Repeat("y", 2048)})
+	binary := filepath.Join(root, "k3sm")
+	if err := os.WriteFile(binary, []byte(strings.Repeat("z", 1024)), 0o644); err != nil {
+		t.Fatalf("seed the binary: %v", err)
+	}
+
+	free, need, err := sys.InstallSpace(root, []string{binary, filepath.Join(root, "cp-payload"), filepath.Join(root, "not-built-yet")})
+	if err != nil {
+		t.Fatalf("InstallSpace: %v", err)
+	}
+	if free == 0 {
+		t.Error("free = 0 on a writable temp dir")
+	}
+	if want := uint64(4096 + 2048 + 1024); need != want {
+		t.Errorf("need = %d, want %d (the binary + the whole payload tree + nothing for the absent source)", need, want)
+	}
+}
+
+// mustTree writes a tree of relative path -> content under root.
+func mustTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("create %s: %v", root, err)
+	}
+	for rel, content := range files {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+}
+
+// mustRead reads a file the test has just asserted should be there.
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}

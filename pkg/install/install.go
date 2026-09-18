@@ -667,9 +667,58 @@ type System interface {
 	// separate from RemoveAll, which uninstall drives through its own
 	// unsafe-path guard: this one is reached only by the data-volume paths (the
 	// emptied staging mount point, and the .pre-volume copy under
-	// --remove-old-data-root), so a future change to either caller's guarding
-	// cannot silently widen the other's.
+	// --remove-old-data-root) and by the install root's staging tree (which
+	// carries its own root-owned-real-directory check, stagingTrustVerdict), so
+	// a future change to any caller's guarding cannot silently widen another's.
 	RemoveTree(path string) error
+	// LockInstall takes the exclusive, install-wide lock at path and returns the
+	// release. A lock another install already holds is refused IMMEDIATELY with
+	// an error matching ErrInstallInProgress — never waited on: an operator who
+	// started a second `sudo k3sm install` wants to be told, not queued behind a
+	// run they cannot see.
+	//
+	// It exists because nothing else in this package serialises two installs,
+	// and two of them interleaving their copies into ONE staging tree is the
+	// hazard the staging exists to remove, one level up: the swap would then
+	// atomically publish a mixture of two builds, which is worse than the
+	// half-written tree it replaced, because it looks complete.
+	//
+	// The lock is advisory (flock) and is held for the whole install, through
+	// the reap. Its file lives BESIDE the install root, never inside it: a lock
+	// on a file in the tree being swapped would travel with that tree.
+	LockInstall(path string) (unlock func() error, err error)
+	// SwapInstallRoot publishes the staged install tree by exchanging it with
+	// whatever is at live, in ONE filesystem operation, and reports whether
+	// there was a previous tree.
+	//
+	//	previous == true   live held a tree; it is now at staging, the staged
+	//	                   tree is live, and calling this again with the same
+	//	                   arguments puts both back
+	//	previous == false  live was ABSENT — a first install — and the staged
+	//	                   tree was renamed into place; there is nothing to reap
+	//	                   and nothing to revert to
+	//
+	// Every other failure is returned with the live tree UNCHANGED, and the
+	// caller must not attempt a reverse swap on one: a swap that did not happen
+	// has nothing to undo, and a second attempt on a failing path is how a
+	// half-published tree would actually get created. EXDEV is reported as
+	// ErrInstallRootCrossDevice.
+	//
+	// What it guarantees, precisely: no observer ever sees a partially published
+	// install root, because the exchange is one operation. Durability across a
+	// power loss is an INFERENCE from APFS's transactional metadata design and
+	// not a documented property of the swap — rename(2) states atomicity for the
+	// plain form only — so nothing here or in its callers claims it as one.
+	SwapInstallRoot(staging, live string) (previous bool, err error)
+	// InstallSpace reports the bytes currently free on the filesystem holding
+	// dir, and the total bytes the named sources occupy — a source that is
+	// absent contributing zero, because the copy that needs it owns that
+	// message, and a source that is a directory contributing its whole tree.
+	//
+	// Two stat families and no judgement: the verdict is freeSpaceVerdict's, so
+	// the policy is testable without a filesystem and the seam cannot grow a
+	// second opinion about what "enough room" means.
+	InstallSpace(dir string, sources []string) (free, need uint64, err error)
 	// LookupServiceUID resolves the named service account's uid, reporting
 	// false when the account does not exist yet. It is three-valued in
 	// practice: install may run BEFORE EnsureServiceUser has created _k3sm, and
@@ -2411,6 +2460,32 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := sys.VerifyVirtualizationEntitlement(cfg.VMHostSource); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("install: staged %s does not carry the %s entitlement: %w (install copies the helper verbatim and never re-signs it, so an unentitled helper installs unentitled and every vm-RuntimeClass pod then stays Pending on an opaque node-affinity message; sign a dev build with `codesign --force --sign - --entitlements runtimed/cmd/k3sm-vmhost/vmhost.entitlements %s` — release artifacts already carry it)", cfg.VMHostSource, VirtualizationEntitlement, err, cfg.VMHostSource)
 	}
+	// The last input-only refusal, and the one that is a courtesy rather than a
+	// correctness gate: is there room on this volume for a second copy of the
+	// install root? Staging means the new tree and the old one coexist until the
+	// reap, so an install now needs the space twice over. The copies themselves
+	// remain the authority on whether they fit — this exists so a Mac with no
+	// room says so in one sentence, before anything is written, instead of
+	// failing part-way through the payload with an ENOSPC from ditto.
+	if err := preflightInstallSpace(sys, cfg); err != nil {
+		return err
+	}
+	// NOTHING BELOW THIS LINE IS WRITTEN BY TWO INSTALLS AT ONCE. The lock is
+	// taken here — after every input-only refusal, so a refusal never has to
+	// take it, and before the first write, so everything that follows is
+	// serialised — and it is held until this function returns, which is past the
+	// reap. See System.LockInstall for why two concurrent installs are the one
+	// hazard the staging below cannot contain by itself.
+	unlock, err := sys.LockInstall(cfg.installLockPath())
+	if err != nil {
+		return fmt.Errorf("install: %w", err)
+	}
+	defer func() {
+		if err := unlock(); err != nil {
+			cfg.Logger.Warn("could not release the install lock", "path", cfg.installLockPath(), "err", err)
+		}
+	}()
+
 	if cfg.AdminToken == "" {
 		tok, err := generateToken()
 		if err != nil {
@@ -2570,47 +2645,45 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return err
 	}
 
-	// 2. Copy the binary to the exact path the plists exec (installedBinary()),
-	//    regardless of the source artifact's name. It lands under InstallDir, so
-	//    the InstallDir sweep covers it on uninstall.
-	if err := sys.CopyToRootOwned(cfg.BinarySource, cfg.installedBinary()); err != nil {
-		return fmt.Errorf("install: copy binary to %s: %w", cfg.installedBinary(), err)
+	// 2. THE STAGED INSTALL ROOT BEGINS HERE. Every artifact below lands in
+	//    <InstallDir>.staging, not in the live tree, and the whole set is
+	//    published in one step at 2f. See stage.go for the hazard that buys: the
+	//    copies used to go straight into /Library/k3sm one after another, so any
+	//    fault part-way through left the new binary beside old helpers while
+	//    launchd's KeepAlive re-execs whatever is at the fixed paths those plists
+	//    name.
+	if err := prepareStagingDir(sys, cfg); err != nil {
+		return err
 	}
-	// 2b. Put `k3sm` on PATH, from the manifest's kindSymlink entries — right
-	//     after the binary they point at, and before anything else, so the
-	//     launcher exists the moment its target does. Copying the binary into
-	//     /Library/k3sm never made `k3sm` a command a shell could find, yet every
-	//     post-install instruction (and install.sh's closing hint) assumes it is
-	//     one; the link is the whole of that fix and is therefore a hard install
-	//     failure when it cannot be laid down, not a best-effort nicety.
-	for _, a := range m {
-		if a.kind != kindSymlink {
-			continue
-		}
-		if err := sys.EnsureSymlink(a.target, a.path); err != nil {
-			return fmt.Errorf("install: link %s -> %s: %w", a.path, a.target, err)
-		}
+
+	// 2a. Copy the binary to the exact path the plists will exec
+	//    (installedBinary()), regardless of the source artifact's name — staged
+	//    at its counterpart under the staging tree, so the name it is published
+	//    under is still the fixed one. It lands under InstallDir, so the
+	//    InstallDir sweep covers it on uninstall.
+	if err := sys.CopyToRootOwned(cfg.BinarySource, cfg.stagedBinary()); err != nil {
+		return fmt.Errorf("install: copy binary to %s: %w", cfg.stagedBinary(), err)
 	}
 	// 2b′. Copy the k3sm-execshim Seatbelt helper beside it. Fail fast when the
 	//     source shim is absent: the server plist hardcodes --runtime runtimed,
 	//     whose backend resolves the shim next to the executable — without it the
 	//     server dies at boot in an invisible KeepAlive crash-loop (the live
 	//     live-hardware failure mode), so a missing shim is an install-time error.
-	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.installedExecShim()); err != nil {
-		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.installedExecShim(), err)
+	if err := sys.CopyToRootOwned(cfg.ExecShimSource, cfg.stagedExecShim()); err != nil {
+		return fmt.Errorf("install: copy k3sm-execshim to %s: %w (build k3sm.io/runtimed/cmd/k3sm-execshim, codesign it, and place it next to the k3sm binary — the runtimed Seatbelt backend cannot boot without it)", cfg.stagedExecShim(), err)
 	}
 	// 2b″. Copy the path-rebase DYLD shim beside the binary. runtimed resolves it
 	//      next to the executable and injects it into a mounting pod so an absolute
 	//      volume mount resolves under the pod data volume (build it with
 	//      runtimed/hack/build-pathshim.sh and ad-hoc sign it).
-	if err := sys.CopyToRootOwned(cfg.PathShimSource, cfg.installedPathShim()); err != nil {
-		return fmt.Errorf("install: copy path-rebase shim to %s: %w (build it with runtimed/hack/build-pathshim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedPathShim(), err)
+	if err := sys.CopyToRootOwned(cfg.PathShimSource, cfg.stagedPathShim()); err != nil {
+		return fmt.Errorf("install: copy path-rebase shim to %s: %w (build it with runtimed/hack/build-pathshim.sh, codesign it, and place it next to the k3sm binary)", cfg.stagedPathShim(), err)
 	}
 	// 2b‴. Copy the getaddrinfo DNS shim beside the binary. The provider resolves it
 	//      next to the executable and injects it into each pod so in-pod cluster DNS
 	//      reaches the per-node resolver (build it with darwin-net/hack/build-shim.sh).
-	if err := sys.CopyToRootOwned(cfg.DNSShimSource, cfg.installedDNSShim()); err != nil {
-		return fmt.Errorf("install: copy getaddrinfo DNS shim to %s: %w (build it with darwin-net/hack/build-shim.sh, codesign it, and place it next to the k3sm binary)", cfg.installedDNSShim(), err)
+	if err := sys.CopyToRootOwned(cfg.DNSShimSource, cfg.stagedDNSShim()); err != nil {
+		return fmt.Errorf("install: copy getaddrinfo DNS shim to %s: %w (build it with darwin-net/hack/build-shim.sh, codesign it, and place it next to the k3sm binary)", cfg.stagedDNSShim(), err)
 	}
 	// 2b⁗. Copy the k3sm-vmhost VM-host helper beside the binary. runtimed's
 	//      sandbox.FindVMHost resolves it next to the executable for
@@ -2624,8 +2697,8 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      there for why waiting until immediately before this one copy was
 	//      itself the defect: it let every other artifact land first. This copy
 	//      can therefore only fail on an I/O error, not on the entitlement.
-	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.installedVMHost()); err != nil {
-		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.installedVMHost(), err)
+	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.stagedVMHost()); err != nil {
+		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.stagedVMHost(), err)
 	}
 	// 2c. Stage the control-plane payload into InstallDir/bin. Fail fast when a
 	//     payload binary is absent: the daemon boot otherwise falls back to
@@ -2634,7 +2707,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     `k3sm payload <dir>` in a shell that has gh + go.
 	for _, name := range executor.PayloadBinaries() {
 		src := filepath.Join(cfg.PayloadSource, name)
-		dst := filepath.Join(cfg.InstallDir, "bin", name)
+		dst := cfg.stagedPayloadFile(name)
 		if err := sys.CopyToRootOwned(src, dst); err != nil {
 			return fmt.Errorf("install: stage control-plane payload %s: %w (run `k3sm payload %s` first — the launchd daemon cannot acquire binaries itself)", name, err, cfg.PayloadSource)
 		}
@@ -2646,7 +2719,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     seed refuses to trust (it rebuilds, or reports), rather than one it stamps
 	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
-		filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName))
+		cfg.stagedPayloadFile(executor.KineMarkerName))
 
 	// 2d. Carry over the operator-supplied server arguments — from the plist
 	//     ALREADY ON DISK, or, when there is none, from the record the previous
@@ -2738,7 +2811,83 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return err
 	}
 
-	// 3. Render + write both plists, in manifest (install) order.
+	// 2f. PUBLISH. One filesystem operation exchanges the staged tree with the
+	//     live install root, so no observer ever sees a partial one. Everything
+	//     above this line wrote either into the staging tree or outside the
+	//     install root entirely, which is why a failure up to here leaves the
+	//     previous install byte-for-byte as it was and has nothing to undo.
+	//
+	//     From here to the reap at 4c, the previous tree is intact at the
+	//     staging path and every failure routes through revertInstallRoot.
+	previous, err := publishStagedRoot(sys, cfg)
+	if err != nil {
+		return err
+	}
+
+	// 3. The launcher link and the plists, in that order, and BOTH after the
+	//    publish: each names a fixed absolute path inside the install root, and
+	//    that path holds this install's binary only now. The link used to go
+	//    down immediately after the binary copy, which under staging would have
+	//    pointed `k3sm` at a path a first install had not created yet.
+	//
+	//    Neither needs rewriting BECAUSE the paths are fixed: the swap moves
+	//    inodes, not names, so the plists' ProgramArguments and the launcher's
+	//    target mean the new tree the moment it is live.
+	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
+		return revertInstallRoot(ctx, sys, cfg, m, previous, err)
+	}
+
+	// 4c. REAP, and not one step earlier. The previous install root is still
+	//     sitting at the staging path, and it has been the rollback target for
+	//     every failure since the publish; only now that the daemons have
+	//     restarted on the new tree AND been verified healthy is it safe to let
+	//     go of it. Nothing after this line can be rolled back, which is why the
+	//     kubeconfig write below is deliberately on this side of it: an install
+	//     whose daemons are up and verified is a successful install, and undoing
+	//     it because a file in a home directory could not be written would be the
+	//     wrong trade.
+	if previous {
+		reapPreviousRoot(sys, cfg)
+	}
+
+	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
+	//    — on a CONTROL PLANE only. A worker has no apiserver of its own and no
+	//    admin credential to carry: writing one there would point kubectl at a
+	//    loopback address nothing serves, with a token no cluster honours, over
+	//    whatever the operator's ~/.kube/config already said about the real
+	//    cluster. An operator administers a k3sm cluster from the server's
+	//    kubeconfig (or a copy of it), never from the worker's.
+	if cfg.Role != RoleAgent {
+		if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
+			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
+		}
+	}
+	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
+	return nil
+}
+
+// publishedWiring is everything an install does once the new tree is live: the
+// launcher link, the plists, the restart, and the verification that the
+// daemons came back. It is one function rather than four statements in Install
+// so that the caller has exactly one error path to route through
+// revertInstallRoot — the window in which a rollback is both possible and
+// correct is precisely this function's extent.
+func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, startedAt time.Time) error {
+	// 3a. Put `k3sm` on PATH, from the manifest's kindSymlink entries. Copying
+	//     the binary into /Library/k3sm never made `k3sm` a command a shell
+	//     could find, yet every post-install instruction (and install.sh's
+	//     closing hint) assumes it is one; the link is the whole of that fix and
+	//     is therefore a hard install failure when it cannot be laid down, not a
+	//     best-effort nicety.
+	for _, a := range m {
+		if a.kind != kindSymlink {
+			continue
+		}
+		if err := sys.EnsureSymlink(a.target, a.path); err != nil {
+			return fmt.Errorf("install: link %s -> %s: %w", a.path, a.target, err)
+		}
+	}
+	// 3b. Render + write both plists, in manifest (install) order.
 	for _, a := range m {
 		if a.kind != kindDaemon {
 			continue
@@ -2775,20 +2924,6 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := verifyDaemons(ctx, sys, cfg, m, startedAt); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
-
-	// 5. Write the admin kubeconfig to the human's home (owned by them, not root)
-	//    — on a CONTROL PLANE only. A worker has no apiserver of its own and no
-	//    admin credential to carry: writing one there would point kubectl at a
-	//    loopback address nothing serves, with a token no cluster honours, over
-	//    whatever the operator's ~/.kube/config already said about the real
-	//    cluster. An operator administers a k3sm cluster from the server's
-	//    kubeconfig (or a copy of it), never from the worker's.
-	if cfg.Role != RoleAgent {
-		if err := sys.WriteUserKubeconfig(cfg.TargetUser, AdminKubeconfig(cfg)); err != nil {
-			return fmt.Errorf("install: write admin kubeconfig for %s: %w", cfg.TargetUser, err)
-		}
-	}
-	cfg.Logger.Info("k3sm installed", "install-dir", cfg.InstallDir, "link", cfg.installedLink(), "kubeconfig-owner", cfg.TargetUser)
 	return nil
 }
 
