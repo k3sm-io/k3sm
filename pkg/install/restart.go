@@ -700,7 +700,10 @@ func verifyAgentJoinedOn(ctx context.Context, sys System, cfg Config, startedAt 
 		joined, credWhy, state := agentCredentialProvesJoin(sys, cfg, pin)
 		if joined && state != nodecred.Valid && state != loggedState {
 			loggedState = state
-			cfg.Logger.Warn("the agent's stored credential is for this cluster but is not in date; the daemon re-joins with the staged token or reports why",
+			// The state is named rather than described, because it is no longer
+			// only about dates: a credential can also be complete and in date
+			// and name an address this node is not assigned.
+			cfg.Logger.Warn("the agent's stored credential is for this cluster but is not usable as it stands; the daemon re-joins with the staged token or reports why",
 				"credential", cred, "state", state)
 		}
 		steady := !aliveSince.IsZero() && clk.now().Sub(aliveSince) >= agentRecoveryObservation

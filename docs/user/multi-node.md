@@ -64,6 +64,12 @@ and issues the node's certificates for it, so there is nothing you have to suppl
 from the one the server assigns fails the join with a message naming both, instead of bringing the
 node up on an address it does not hold.
 
+A node that joined with a wrong `--node-ip` before this release still holds a certificate issued for
+that address, and the control plane cannot reach its kubelet, so `kubectl logs` and `kubectl exec`
+against it fail. `k3sm status` on that Mac now reports the agent row as an address mismatch and
+names the two addresses in the agent log. The fix is to rejoin with a fresh token, which re-issues
+the certificate for the address the server assigns.
+
 To predict the address before you join, run this on the server Mac:
 
 ```sh

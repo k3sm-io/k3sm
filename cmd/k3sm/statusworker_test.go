@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -182,6 +183,12 @@ type macOpts struct {
 	// bothRoles additionally lays down the OTHER role's plist, the posture
 	// `k3sm install` refuses to create and RoleFromPlists resolves to server.
 	bothRoles bool
+	// credentialAddress issues the staged kubelet serving certificate for THIS
+	// address instead of the one the assignment names. It is the on-disk shape
+	// of a node that joined asserting a `--node-ip` the control plane did not
+	// assign: the node registers the assigned address, and its certificate
+	// names another one (B340).
+	credentialAddress string
 	// unreadableCredential makes the staged credential store unreadable by
 	// this account: the ordinary posture of an unprivileged `k3sm status`
 	// against a service-user-owned store.
@@ -273,7 +280,16 @@ func stageNodeMac(t *testing.T, opts macOpts) nodeMac {
 		if err := os.MkdirAll(store.dir, 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", store.dir, err)
 		}
-		res, _, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+		res, clusterCA, _ := nodeCredFixture(t, nodeCredClientTTL, nodeCredClientTTL)
+		if opts.credentialAddress != "" {
+			cert, key, err := clusterCA.IssueServing(nodeCredTestNode,
+				[]string{nodeCredTestNode, "localhost"},
+				[]net.IP{net.ParseIP(opts.credentialAddress)}, nodeCredClientTTL)
+			if err != nil {
+				t.Fatalf("issue a kubelet serving pair for %s: %v", opts.credentialAddress, err)
+			}
+			res.KubeletServingCertPEM, res.KubeletServingKeyPEM = cert, key
+		}
 		if err := store.Save(nodeCredTestAPI, nodeCredTestNode, res); err != nil {
 			t.Fatalf("save the node credential: %v", err)
 		}

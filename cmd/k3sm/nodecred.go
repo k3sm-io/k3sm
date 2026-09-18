@@ -54,10 +54,11 @@ type (
 )
 
 const (
-	credentialAbsent  = nodecred.Absent
-	credentialCorrupt = nodecred.Corrupt
-	credentialExpired = nodecred.Expired
-	credentialValid   = nodecred.Valid
+	credentialAbsent          = nodecred.Absent
+	credentialCorrupt         = nodecred.Corrupt
+	credentialExpired         = nodecred.Expired
+	credentialValid           = nodecred.Valid
+	credentialAddressMismatch = nodecred.AddressMismatch
 )
 
 // nodeCredentialStore is the agent work dir viewed as the home of one node's
@@ -338,6 +339,15 @@ var (
 //
 //   - valid, no token → reuse. The restart case this exists for: a joined node
 //     comes back without a credential-issuing event.
+//   - address-mismatch → exactly as valid, on every arm. The stored certificate
+//     names an address this node is not assigned, which breaks the apiserver's
+//     dial to :10250 while the stale certificate goes on answering for the
+//     address it does name on the wildcard kubelet listener. Refusing to start
+//     would take a running worker down over a fault it has carried since its
+//     join, and would not retire the certificate either; only a rejoin does
+//     that. So the start says so loudly (warnCredentialAddressMismatch), `k3sm
+//     status` reports the node degraded until it rejoins, and both tell the
+//     operator to rejoin soon.
 //   - valid + a token whose CA pin MATCHES the stored cluster CA → reuse, and the
 //     token is ignored. A daemon plist or a shell profile that still carries the
 //     original token must not make every restart a rejoin.
@@ -359,7 +369,7 @@ var (
 // cannot.
 func agentStartPlan(status credentialStatus, tokenPresent bool, tokenParses bool, tokenCAHash, storedCAHash string) (startMode, error) {
 	switch status {
-	case credentialValid:
+	case credentialValid, credentialAddressMismatch:
 		if tokenPresent && tokenParses && tokenCAHash != storedCAHash {
 			return startModeTokenJoin, nil
 		}
@@ -392,7 +402,7 @@ func logStartPlan(logger *slog.Logger, mode startMode, status credentialStatus, 
 		logger.Warn("ignoring an unparseable join token: this node already holds a valid credential, so a bad token does not stop it starting")
 	case mode == startModeReuseCredential:
 		logger.Info("reusing the stored node credential: no join token needed")
-	case mode == startModeTokenJoin && status == credentialValid:
+	case mode == startModeTokenJoin && (status == credentialValid || status == credentialAddressMismatch):
 		logger.Warn("the supplied join token pins a DIFFERENT cluster CA than this node's stored credential: joining the token's cluster and OVERWRITING the stored credential",
 			"tokenCAPin", tokenCAHash, "storedCAPin", storedCAHash)
 	case mode == startModeTokenJoin:

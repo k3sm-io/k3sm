@@ -41,8 +41,8 @@ import (
 // json` carries the word rather than an integer whose meaning lives in a file.
 type CredentialState string
 
-// The credential vocabulary. The first four are nodecred's states verbatim; the
-// fifth is this report's own.
+// The credential vocabulary. The first five are nodecred's states verbatim; the
+// last is this report's own.
 const (
 	// CredentialValid: every artifact is present, parses, and is in date.
 	CredentialValid CredentialState = "valid"
@@ -56,6 +56,10 @@ const (
 	// CredentialCorrupt: an artifact is present and does not parse, or a
 	// private key does not match its certificate.
 	CredentialCorrupt CredentialState = "corrupt"
+	// CredentialAddressMismatch: every artifact is present and in date, but
+	// the kubelet serving certificate does not name the mesh address this node
+	// is assigned, so the apiserver cannot verify this node's :10250.
+	CredentialAddressMismatch CredentialState = "address-mismatch"
 	// CredentialUnknown: the store could not be READ from this account (the
 	// agent work dir is service-user-owned), or no store was configured. It is
 	// deliberately distinct from absent: "I could not look" is not "it is not
@@ -104,6 +108,8 @@ func NodeCredentialState(fsys FS, dir string, now time.Time) (CredentialState, t
 		return CredentialAbsent, time.Time{}
 	case nodecred.Expired:
 		return CredentialExpired, notAfter
+	case nodecred.AddressMismatch:
+		return CredentialAddressMismatch, notAfter
 	default:
 		if errors.Is(err, fs.ErrPermission) {
 			return CredentialUnknown, time.Time{}
@@ -172,6 +178,15 @@ func (c Collector) agentRow(now time.Time) (Row, int, CredentialState) {
 	case CredentialCorrupt:
 		row.State, row.Severity = StateCorrupt, SeverityFail
 		row.Detail += " · the stored node credential in " + c.Paths.AgentCredentialDir + " does not parse"
+	case CredentialAddressMismatch:
+		// FAIL, not WARN, and a running daemon does not soften it: this node
+		// looks Ready to the cluster while every kubectl logs/exec against it
+		// fails the TLS handshake, which is the failure an operator runs this
+		// command to find. The agent daemon itself is fine, so only the
+		// credential words change.
+		row.State, row.Severity = StateAddressMismatch, SeverityFail
+		row.Detail += " · the kubelet serving certificate in " + c.Paths.AgentCredentialDir +
+			" names a different address than the one this node is assigned, so the control plane cannot reach this node's :10250 (kubectl logs/exec fail)"
 	default:
 		// Unknown: the store is service-user-owned, so an ordinary account is
 		// EXPECTED not to read it. That is not a healthy verdict and not a
@@ -200,7 +215,9 @@ func (c Collector) credentialRemedy(state CredentialState) string {
 	switch state {
 	case CredentialValid:
 		return ""
-	case CredentialAbsent, CredentialExpired:
+	case CredentialAbsent, CredentialExpired, CredentialAddressMismatch:
+		// A mismatch shares the remedy: only a fresh join re-issues this node's
+		// certificate, and it is re-issued for the address the server assigns.
 		return c.joinRemedy()
 	case CredentialCorrupt:
 		return "k3sm status logs " + RowAgent + "\n" + c.joinRemedy()

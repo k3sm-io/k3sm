@@ -26,6 +26,7 @@ import (
 	"errors"
 	"io/fs"
 	"math/big"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -66,22 +67,38 @@ func (m mapFS) ReadFile(name string) ([]byte, error) {
 
 const testDir = "/var/lib/k3sm/agent"
 
+// testMeshIP is the mesh address the staged assignment names — the address the
+// server assigned this node, and therefore the one its serving certificate has
+// to carry as an IP SAN.
+const testMeshIP = "100.64.2.1"
+
 // storeFiles builds a complete, self-consistent store whose certificates expire
 // at notAfter. The keypairs genuinely match, because proving that is the check
-// this package exists for.
+// this package exists for, and the serving certificate names the assigned
+// address, because that is the shape a join produces.
 func storeFiles(t *testing.T, notAfter time.Time) map[string][]byte {
 	t.Helper()
+	return storeFilesServing(t, notAfter, net.ParseIP(testMeshIP))
+}
+
+// storeFilesServing is storeFiles with the serving certificate issued for
+// servingIPs rather than for the assigned address. No IP at all is a third
+// case, and a deliberate one: it is the shape of a certificate this cluster's
+// join cannot produce.
+func storeFilesServing(t *testing.T, notAfter time.Time, servingIPs ...net.IP) map[string][]byte {
+	t.Helper()
 	certPEM, keyPEM := selfSigned(t, notAfter)
+	servingCertPEM, servingKeyPEM := selfSigned(t, notAfter, servingIPs...)
 	return map[string][]byte{
 		filepath.Join(testDir, KubeconfigFile):     kubeconfigBytes(t, certPEM, keyPEM),
-		filepath.Join(testDir, ServingCertFile):    certPEM,
-		filepath.Join(testDir, ServingKeyFile):     keyPEM,
+		filepath.Join(testDir, ServingCertFile):    servingCertPEM,
+		filepath.Join(testDir, ServingKeyFile):     servingKeyPEM,
 		filepath.Join(testDir, ClientCAFile):       certPEM,
-		filepath.Join(testDir, NodeAssignmentFile): []byte(`{"podCIDR":"100.64.2.0/24","meshIP":"100.64.2.1"}`),
+		filepath.Join(testDir, NodeAssignmentFile): []byte(`{"podCIDR":"100.64.2.0/24","meshIP":"` + testMeshIP + `"}`),
 	}
 }
 
-func selfSigned(t *testing.T, notAfter time.Time) (certPEM, keyPEM []byte) {
+func selfSigned(t *testing.T, notAfter time.Time, ips ...net.IP) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -93,6 +110,7 @@ func selfSigned(t *testing.T, notAfter time.Time) (certPEM, keyPEM []byte) {
 		NotBefore:    notAfter.Add(-365 * 24 * time.Hour),
 		NotAfter:     notAfter,
 		IsCA:         true,
+		IPAddresses:  ips,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -165,6 +183,72 @@ func TestStatusOverTheReadSeam(t *testing.T) {
 		}
 	})
 
+	// The B340 verdict: a credential that is complete, matched and in date and
+	// still cannot serve :10250 to the apiserver, because its certificate names
+	// an address this node was not assigned.
+	t.Run("a serving certificate for another address is an address mismatch", func(t *testing.T) {
+		t.Parallel()
+		notAfter := now.Add(90 * 24 * time.Hour)
+		cases := []struct {
+			name  string
+			files map[string][]byte
+			want  State
+		}{
+			{
+				name:  "the assigned address",
+				files: storeFilesServing(t, notAfter, net.ParseIP(testMeshIP)),
+				want:  Valid,
+			},
+			{
+				name:  "another address entirely",
+				files: storeFilesServing(t, notAfter, net.ParseIP("100.64.9.9")),
+				want:  AddressMismatch,
+			},
+			{
+				name:  "the assigned address among others",
+				files: storeFilesServing(t, notAfter, net.ParseIP("127.0.0.1"), net.ParseIP(testMeshIP)),
+				want:  Valid,
+			},
+			{
+				// A LAN-shaped address, which is the realistic mistake: an
+				// operator asserted this Mac's own underlay address. The
+				// verdict is about the address not being the ASSIGNED one, so
+				// nothing here may turn on its shape or its range.
+				name:  "a LAN address rather than a mesh one",
+				files: storeFilesServing(t, notAfter, net.ParseIP("192.168.0.122")),
+				want:  AddressMismatch,
+			},
+			{
+				// Not judged here: the join binds exactly the assigned address,
+				// so a certificate with no IP SAN is a different fault, and
+				// calling it the wrong address would name the wrong remedy.
+				name:  "no IP SAN at all",
+				files: storeFilesServing(t, notAfter),
+				want:  Valid,
+			},
+			{
+				// Expiry wins: the two share a remedy, and an expired
+				// credential is the one an agent start can still recover from
+				// on its own with a token.
+				name:  "expired as well as mismatched",
+				files: storeFilesServing(t, now.Add(-time.Hour), net.ParseIP("100.64.9.9")),
+				want:  Expired,
+			},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				state, cred, err := Status(mapFS{files: c.files}, testDir, now)
+				if state != c.want || err != nil {
+					t.Fatalf("Status = %s (err %v), want %s", state, err, c.want)
+				}
+				if cred == nil {
+					t.Fatal("no credential returned: every one of these parses, and a caller has to be able to name the addresses")
+				}
+			})
+		}
+	})
+
 	t.Run("a missing artifact is absent, whichever one it is", func(t *testing.T) {
 		t.Parallel()
 		for _, name := range []string{KubeconfigFile, ServingCertFile, ServingKeyFile, ClientCAFile, NodeAssignmentFile} {
@@ -206,7 +290,7 @@ func TestStatusOverTheReadSeam(t *testing.T) {
 	t.Run("the state words are distinct", func(t *testing.T) {
 		t.Parallel()
 		seen := map[string]bool{}
-		for _, s := range []State{Absent, Corrupt, Expired, Valid} {
+		for _, s := range []State{Absent, Corrupt, Expired, Valid, AddressMismatch} {
 			if seen[s.String()] {
 				t.Fatalf("two states print %q", s.String())
 			}

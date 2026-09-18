@@ -47,17 +47,22 @@ const (
 	StatePartial    RowState = "partial"
 	StateMissing    RowState = "missing"
 	StateSkip       RowState = "skip"
-	// StateWaiting, StateExpired and StateCorrupt are the joining worker's
-	// credential words: a daemon that is up and has never joined, one whose
-	// node certificate has run out, and one whose stored credential does not
-	// parse. They describe the CREDENTIAL, not the launchd job, which is why
-	// they are distinct from stopped/failed — the pid is fine in all three.
-	StateWaiting   RowState = "waiting"
-	StateExpired   RowState = "expired"
-	StateCorrupt   RowState = "corrupt"
-	StateUnknown   RowState = "unknown"
-	StateHealthy   RowState = "healthy"
-	StateUnhealthy RowState = "unhealthy"
+	// StateWaiting, StateExpired, StateCorrupt and StateAddressMismatch are the
+	// joining worker's credential words: a daemon that is up and has never
+	// joined, one whose node certificate has run out, one whose stored
+	// credential does not parse, and one whose serving certificate names an
+	// address this node is not assigned. They describe the CREDENTIAL, not the
+	// launchd job, which is why they are distinct from stopped/failed — the pid
+	// is fine in all four.
+	StateWaiting RowState = "waiting"
+	StateExpired RowState = "expired"
+	StateCorrupt RowState = "corrupt"
+	// StateAddressMismatch is the fourth: the credential is complete and in
+	// date, and names an address this node is not assigned.
+	StateAddressMismatch RowState = "address-mismatch"
+	StateUnknown         RowState = "unknown"
+	StateHealthy         RowState = "healthy"
+	StateUnhealthy       RowState = "unhealthy"
 )
 
 // Row is one subsystem's line in the report.
