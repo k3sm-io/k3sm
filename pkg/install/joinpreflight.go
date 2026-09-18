@@ -143,7 +143,7 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 		if untried > 0 {
 			tried += fmt.Sprintf("; %d more addresses not tried", untried)
 		}
-		return "", fmt.Errorf("install: the control plane at %s cannot be reached, so this node could not join it: %s. Nothing has been written. Use the control-plane Mac's LAN address, check that its firewall lets %d through, and check that io.k3sm.server is running there (`sudo launchctl print system/%s` on that Mac)",
+		return "", fmt.Errorf("install: the control plane at %s cannot be reached, so this node could not join it: %s. Nothing has been written. Use the control-plane Mac's LAN address, check that its firewall lets %d through, and check that io.k3sm.server is running there (`sudo launchctl print system/%s` on that Mac); if that Mac was installed only moments ago, its join listener may still be starting, so wait a minute and run this install again",
 			host, tried, joinBootstrapPort, ServerLabel)
 	}
 	if len(refusals) > 0 {

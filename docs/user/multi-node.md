@@ -44,6 +44,10 @@ Run it with `sudo`, because the cluster CA whose hash the token pins lives in th
 state root, which belongs to the `_k3sm` service user. Without `sudo` the work dir resolves to your
 own home and the command exits non-zero rather than inventing a CA there.
 
+The control plane only starts accepting joins once its own mesh enrolment has finished, which can
+take up to a minute after `k3sm install` returns, so a join attempted immediately afterward may need
+a retry.
+
 On the agent Mac, put the token in a file only root can read, then install the agent:
 
 ```sh

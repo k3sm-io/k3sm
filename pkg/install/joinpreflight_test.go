@@ -119,6 +119,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 			"firewall",     // ...check the firewall
 			ServerLabel,    // ...and that the control plane is running there
 			"Nothing has been written",
+			"wait a minute and run this install again", // a just-installed control plane may still be opening its join listener
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("refusal %q does not carry %q", err, want)
