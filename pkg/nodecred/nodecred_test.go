@@ -215,7 +215,7 @@ func TestStatusOverTheReadSeam(t *testing.T) {
 				// verdict is about the address not being the ASSIGNED one, so
 				// nothing here may turn on its shape or its range.
 				name:  "a LAN address rather than a mesh one",
-				files: storeFilesServing(t, notAfter, net.ParseIP("192.168.0.122")),
+				files: storeFilesServing(t, notAfter, net.ParseIP("192.0.2.122")),
 				want:  AddressMismatch,
 			},
 			{
