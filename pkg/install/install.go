@@ -518,6 +518,36 @@ type System interface {
 	// function, deliberately twice: this one keeps the tree clean, that one
 	// guards the write itself.
 	LinkDirTrust(link string) error
+	// ResolveJoinHost returns every address the join host resolves to, in the
+	// order the resolver returned them. An IP literal resolves to itself.
+	//
+	// The addresses are PLURAL on purpose: a control-plane Mac's name commonly
+	// carries both a LAN address and a public or stale one, and the join reaches
+	// the cluster iff at least ONE of them answers. A seam that resolved to a
+	// single address would make the preflight's verdict depend on which record
+	// the resolver happened to return first, which is the opposite of what it is
+	// for. It is READ-ONLY, like the two probes beside it.
+	ResolveJoinHost(host string, timeout time.Duration) ([]string, error)
+	// DialJoinServer opens and immediately closes a TCP connection to addr (a
+	// host:port, the bootstrap listener), returning the dial error when it does
+	// not answer inside timeout. It proves reachability and nothing else — the
+	// cluster's identity is FetchJoinCA's question.
+	DialJoinServer(addr string, timeout time.Duration) error
+	// FetchJoinCA returns the cluster CA PEM the bootstrap listener at addr
+	// serves on bootstrap.CACertPath — the unauthenticated, deliberately public
+	// endpoint a node with no credential reads to learn which cluster it is
+	// talking to.
+	//
+	// The fetch does NOT verify the server's certificate chain against the
+	// token's pin the way bootstrap.PinnedClient does, and that is the point:
+	// a pinned client reports a wrong-cluster endpoint as a TLS handshake
+	// failure, indistinguishable from a broken listener. Fetching the CA
+	// unverified and comparing its hash HERE is what lets the installer say
+	// "that address is a different cluster" instead of "handshake failed", and
+	// it trusts nothing: the bytes are hashed and compared, never used as a
+	// trust anchor, and the install is refused unless they match the pin the
+	// operator's own token carries.
+	FetchJoinCA(addr string, timeout time.Duration) ([]byte, error)
 	// RemoveSymlink removes link ONLY when it is a symlink that still points at
 	// target, and reports whether it did. Anything else — absent, a regular file,
 	// a symlink someone re-pointed — is (false, nil): not ours, never touched.
@@ -2321,6 +2351,19 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err := sys.LinkDirTrust(cfg.installedLink()); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
+	// ...and the last thing asked before the first write, on a worker: can the
+	// control plane this node is being pointed at actually be reached, and is it
+	// the cluster the operator's token names? Both answers are available now and
+	// neither is available later without a half-installed Mac to unpick — see
+	// preflightJoinEndpoint for the install that made this necessary. A server
+	// install joins nothing and returns immediately.
+	// It returns the operator's join token — the exact bytes it validated and
+	// compared against the endpoint's cluster — so staging writes those and the
+	// file is read once, with no privileged write between the check and the copy.
+	joinToken, err := preflightJoinEndpoint(sys, cfg)
+	if err != nil {
+		return err
+	}
 	if cfg.AdminToken == "" {
 		tok, err := generateToken()
 		if err != nil {
@@ -2417,7 +2460,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     --token-file stages nothing and leaves any previous copy alone: a
 	//     joined node presents its stored credential and needs no token.
 	if cfg.Role == RoleAgent && cfg.TokenFile != "" {
-		if err := stageJoinToken(sys, cfg, uid); err != nil {
+		if err := stageJoinToken(sys, cfg, uid, joinToken); err != nil {
 			return err
 		}
 	}
