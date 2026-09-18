@@ -132,6 +132,22 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 			podCIDR = p.PodCIDR
 		}
 	}
+	// THE JOIN PATH NEVER TOUCHES THE CONTROL-PLANE NODE'S OWN PEER. The peer
+	// that would be reused here is the one this write is about to replace, so
+	// an existing assignment at serverNodeIndex means this enroll would hand the
+	// caller the control plane's mesh identity: its public key, its endpoint, its
+	// AllowedIPs. EnrollSelf is the only writer of that object, and it does not
+	// come through Enroll.
+	//
+	// The test is the EXISTING object's index, not a copy of the server's name.
+	// A name would need a second source of truth to be threaded here and kept in
+	// step with the process's own; the index is already in the object being
+	// overwritten, so this guard holds even when the name guard in front of it is
+	// absent or bypassed.
+	if idx, ok := nodeIndexOf(e.clusterPod, podCIDR); ok && idx == serverNodeIndex {
+		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{},
+			fmt.Errorf("%w: %q holds %s", ErrServerPeerOverwrite, nodeName, podCIDR)
+	}
 	alloc := bootstrap.Allocation{EnrollID: enrollID}
 	if podCIDR == "" {
 		alloc.Fresh = true
@@ -161,7 +177,7 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 	stampEnrollID(peer, enrollID)
 	// Past this point the peer may exist, so the real allocation is reported: the
 	// failures below are the ones whose orphan a caller has to be able to reap.
-	if err := e.writePeer(ctx, peer); err != nil {
+	if err := e.writePeer(ctx, peer, false); err != nil {
 		return netv1.MeshEnrollResponse{}, alloc, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
 	}
 
@@ -304,6 +320,13 @@ const serverNodeIndex = 0
 // index-0 pod /24 is already held by a DIFFERENT node. Compare with errors.Is.
 var ErrMeshIndexClaimed = errors.New("enroll: the control-plane mesh index is claimed by another node")
 
+// ErrServerPeerOverwrite is returned by the WORKER-JOIN enroll path when the
+// MeshPeer it would write over holds the control-plane node's pod index. It is
+// the last of the three layers that keep a join from taking the control plane's
+// mesh identity, and the only one that reads the object being overwritten rather
+// than the name being claimed. Compare with errors.Is.
+var ErrServerPeerOverwrite = errors.New("enroll: a join may not overwrite the mesh peer holding the control-plane node's index")
+
 // EnrollSelf asserts-or-creates the CONTROL-PLANE node's own MeshPeer at index 0
 // and returns the resulting peer snapshot, so the server participates in the mesh
 // it hosts rather than only brokering other nodes into it.
@@ -359,7 +382,11 @@ func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, req netv
 		return netv1.MeshEnrollResponse{}, err
 	}
 	stampEnrollID(peer, enrollID)
-	if err := e.writePeer(ctx, peer); err != nil {
+	// The ONE write allowed over the control-plane index: this is the process
+	// whose peer that is. The permission is an explicit argument rather than a
+	// field or a package-level flag, so it is visible at the call site and cannot
+	// be left set for a later join.
+	if err := e.writePeer(ctx, peer, true); err != nil {
 		return netv1.MeshEnrollResponse{}, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
 	}
 
@@ -628,9 +655,22 @@ func meshPeerLister(kubeconfig string) func(context.Context) ([]netv1.MeshPeerSp
 }
 
 // writePeer creates the MeshPeer, or updates it in place on a rejoin (AlreadyExists).
-func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer) error {
+//
+// allowServerIndex is the permission to overwrite a peer holding the
+// CONTROL-PLANE node's pod index (serverNodeIndex). Only EnrollSelf passes true,
+// because only that call is the control-plane process writing its own peer; the
+// worker-join path passes false and is refused with ErrServerPeerOverwrite.
+//
+// The decision is made on the object READ BACK from the apiserver, which is what
+// makes this the last line rather than a duplicate of Enroll's check: the list
+// Enroll scanned can be stale or racing, while the object fetched here is the one
+// the PUT is about to replace.
+func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer, allowServerIndex bool) error {
 	err := e.client.Post().Resource(meshPeerResource).Body(peer).Do(ctx).Into(&netv1.MeshPeer{})
 	if err == nil {
+		// A CREATE cannot overwrite anything, and the join path is never assigned
+		// serverNodeIndex (lowestFreeNodeIndex starts at 1), so there is nothing
+		// for the guard to decide on this arm.
 		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
@@ -639,6 +679,11 @@ func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer) erro
 	var cur netv1.MeshPeer
 	if err := e.client.Get().Resource(meshPeerResource).Name(peer.Name).Do(ctx).Into(&cur); err != nil {
 		return err
+	}
+	if !allowServerIndex {
+		if idx, ok := nodeIndexOf(e.clusterPod, cur.Spec.PodCIDR); ok && idx == serverNodeIndex {
+			return fmt.Errorf("%w: %q holds %s", ErrServerPeerOverwrite, cur.Name, cur.Spec.PodCIDR)
+		}
 	}
 	peer.ResourceVersion = cur.ResourceVersion
 	// The peer is assembled fresh from the enroll, so an update would otherwise
@@ -711,8 +756,13 @@ func bootstrapListenAddr(meshIP string) string {
 // (ServerAuth + Bundle + APIServers) are set only in the HA posture, where they light up
 // the CA-bundle endpoint.
 type bootstrapServerDeps struct {
-	hierarchy     *certs.Hierarchy
-	meshIP        string
+	hierarchy *certs.Hierarchy
+	meshIP    string
+	// selfNodeName is THIS process's node name, which the join handler refuses to
+	// issue anything for (bootstrap.ServerConfig.SelfNodeName). It is carried
+	// per-process, from the supervisor's own options, so an HA sibling protects
+	// its own name and no server needs a list of the others'.
+	selfNodeName  string
 	tokens        bootstrap.TokenVerifier
 	nodePasswords bootstrap.NodePasswordStore
 	enroller      bootstrap.Enroller
@@ -800,6 +850,7 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 		SigningCA:     h.Signing,
 		Tokens:        deps.tokens,
 		NodePasswords: deps.nodePasswords,
+		SelfNodeName:  deps.selfNodeName,
 		Enroller:      deps.enroller,
 		APIServers:    deps.apiServers,
 		ServerAuth:    deps.serverAuth,
