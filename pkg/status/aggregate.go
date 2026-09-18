@@ -93,6 +93,9 @@ var advisoryRows = map[string]bool{RowPreVolume: true}
 // source (see Collector.apiserverRow and Collector.nodeRow) rather than leaning
 // on an exemption this map does not grant.
 var workerAdvisoryRows = map[string]bool{
+	// Since B333 the datastore row is a SKIP on a worker, which no verdict test
+	// reads, so this entry can no longer fire; it stays as the guard for any
+	// future arm that gives the row a severity there.
 	RowDatastore:  true,
 	RowKubeconfig: true,
 	RowAPIServer:  true,

@@ -113,7 +113,8 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"brew/pass-present", checkBrew, func(e *doctorEnv) { e.brewPresent = func() bool { return true } }, statusPass},
 		{"brew/warn-absent", checkBrew, func(e *doctorEnv) { e.brewPresent = func() bool { return false } }, statusWarn},
 
-		// datastore: present+wal → PASS, absent → SKIP, non-wal → WARN, error → WARN.
+		// datastore: present+wal → PASS, absent → SKIP, non-wal → WARN, error → WARN;
+		// and on a worker SKIP either way — a worker runs no kine.
 		{"datastore/pass-present-wal", checkDatastore, func(e *doctorEnv) {
 			e.datastorePosture = func() (bool, int, string, error) { return true, 3, "wal", nil }
 		}, statusPass},
@@ -129,6 +130,21 @@ func TestDoctorChecksTable(t *testing.T) {
 		{"datastore/skip-absent-on-a-worker", checkDatastore, func(e *doctorEnv) {
 			*e = agentEnv()
 			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+		}, statusSkip},
+		// A state.db that IS there on a worker is the stale <DataRoot>/server
+		// directory of an earlier server-era install, never this node's (B333).
+		// Nor is a posture the worker arm could even fail to read: the role is
+		// consulted first, so an unreadable stale database is still a SKIP and
+		// never the "sudo k3sm doctor" repair of a datastore this Mac lacks.
+		{"datastore/skip-present-on-a-worker", checkDatastore, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.datastorePosture = func() (bool, int, string, error) { return true, 3, "wal", nil }
+		}, statusSkip},
+		{"datastore/skip-unreadable-on-a-worker", checkDatastore, func(e *doctorEnv) {
+			*e = agentEnv()
+			e.datastorePosture = func() (bool, int, string, error) {
+				return false, 0, "", errors.New("permission denied")
+			}
 		}, statusSkip},
 
 		// toolchain: the three node classes. A full Xcode developer dir is the one
@@ -260,21 +276,46 @@ func TestDoctorChecksTable(t *testing.T) {
 	})
 
 	// A worker is not a control plane that has not started yet: its datastore
-	// row must not describe a wait that will never end.
+	// row must not describe a wait that will never end — and it must not
+	// describe the stale <DataRoot>/server database an earlier server-era
+	// install left behind either, readable or not. All three worker cases say
+	// ONE sentence, the one `k3sm status` says, and none of them reads a
+	// posture: the seam is asserted never to have been called (B333).
 	t.Run("datastore/a-worker-is-told-it-runs-no-datastore", func(t *testing.T) {
 		t.Parallel()
-		e := agentEnv()
-		e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
-		got := checkDatastore(e)
-		if got.status != statusSkip {
-			t.Fatalf("status = %v, want SKIP", got.status)
+		cases := map[string]func() (bool, int, string, error){
+			"absent":     func() (bool, int, string, error) { return false, 0, "", nil },
+			"present":    func() (bool, int, string, error) { return true, 3, "wal", nil },
+			"unreadable": func() (bool, int, string, error) { return false, 0, "", errors.New("permission denied") },
 		}
-		if strings.Contains(got.detail, "has not initialized") {
-			t.Errorf("a worker is told to wait for a control plane it does not run: %q", got.detail)
+		for name, posture := range cases {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				probes := 0
+				e := agentEnv()
+				e.datastorePosture = func() (bool, int, string, error) {
+					probes++
+					return posture()
+				}
+				got := checkDatastore(e)
+				if got.status != statusSkip {
+					t.Fatalf("status = %v (%q), want SKIP", got.status, got.detail)
+				}
+				if got.detail != status.WorkerDatastoreDetail {
+					t.Errorf("detail = %q, want the shared sentence %q", got.detail, status.WorkerDatastoreDetail)
+				}
+				if got.remedy != "" {
+					t.Errorf("remedy = %q; there is no datastore here to repair", got.remedy)
+				}
+				if strings.Contains(got.detail, "has not initialized") {
+					t.Errorf("a worker is told to wait for a control plane it does not run: %q", got.detail)
+				}
+				if probes != 0 {
+					t.Errorf("the datastore posture was read %d time(s) on a worker; the role decides before any probe", probes)
+				}
+			})
 		}
-		if !strings.Contains(got.detail, "worker") {
-			t.Errorf("detail does not say why there is no datastore here: %q", got.detail)
-		}
+
 		// And a control plane's sentence is unchanged.
 		server := healthyDoctorEnv()
 		server.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
