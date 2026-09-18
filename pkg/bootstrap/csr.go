@@ -49,14 +49,24 @@ var (
 	ErrCrossNodeSAN = errors.New("bootstrap: CSR requests a SAN bound to a different node")
 	// ErrUnsupportedCSRKey is returned when a CSR's public key is not one a node
 	// credential may be issued over: an unknown algorithm, a curve outside the NIST
-	// set the rest of the stack speaks, or an undersized RSA modulus.
+	// set the rest of the stack speaks, or an RSA modulus outside the accepted
+	// size range.
 	ErrUnsupportedCSRKey = errors.New("bootstrap: CSR public key is not an acceptable node key")
 )
 
-// minRSAKeyBits is the smallest RSA modulus a node CSR may carry. k3sm's own
-// client mints P-256 (join.go generateCSR); the bound exists for a CSR this
-// server did not generate.
-const minRSAKeyBits = 2048
+// The RSA modulus bounds a node CSR may carry. k3sm's own client mints P-256
+// (join.go generateCSR); the bounds exist for a CSR this server did not generate.
+//
+// The UPPER bound is not a cryptographic judgement — a larger modulus is stronger
+// — it is a cost one. Verifying a CSR's self-signature is work the server does for
+// an unauthenticated caller, and it grows steeply with the modulus, so an
+// unbounded key size is an amount of CPU per request that the request chooses.
+// 4096 is well above anything a node will present and far below the sizes that
+// make the verification expensive.
+const (
+	minRSAKeyBits = 2048
+	maxRSAKeyBits = 4096
+)
 
 // CheckNodeCSR validates everything about a joining node's CSR that can be judged
 // WITHOUT the mesh address the enroll has not yet assigned: the self-signature
@@ -75,11 +85,15 @@ func CheckNodeCSR(csr *x509.CertificateRequest, nodeName string) error {
 	if csr == nil || nodeName == "" {
 		return ErrEmptyIdentity
 	}
-	if err := csr.CheckSignature(); err != nil {
-		return fmt.Errorf("verify CSR self-signature: %w", err)
-	}
+	// The KEY is judged before the SIGNATURE, deliberately. Verifying the
+	// self-signature is the expensive step and its cost is set by the key the
+	// caller chose; refusing an unacceptable key first means an oversized modulus
+	// costs a bit-length comparison rather than a verification.
 	if err := checkCSRKey(csr.PublicKey); err != nil {
 		return err
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return fmt.Errorf("verify CSR self-signature: %w", err)
 	}
 	if err := checkDNSSANs(csr.DNSNames, nodeName); err != nil {
 		return err
@@ -91,9 +105,11 @@ func CheckNodeCSR(csr *x509.CertificateRequest, nodeName string) error {
 }
 
 // checkCSRKey accepts the key types a node credential may be issued over: NIST
-// ECDSA, Ed25519, and RSA at or above minRSAKeyBits. Anything else is refused
-// rather than handed to the CA, because a key the signer accepts but the kubelet's
-// TLS stack cannot use fails much later and much less legibly.
+// ECDSA, Ed25519, and RSA between minRSAKeyBits and maxRSAKeyBits. Anything else
+// is refused rather than handed to the CA, because a key the signer accepts but
+// the kubelet's TLS stack cannot use fails much later and much less legibly — and
+// because an oversized modulus is CPU the request is spending on the server's
+// behalf (see the bounds).
 func checkCSRKey(pub any) error {
 	switch k := pub.(type) {
 	case *ecdsa.PublicKey:
@@ -105,8 +121,12 @@ func checkCSRKey(pub any) error {
 	case ed25519.PublicKey:
 		return nil
 	case *rsa.PublicKey:
-		if bits := k.N.BitLen(); bits < minRSAKeyBits {
+		bits := k.N.BitLen()
+		if bits < minRSAKeyBits {
 			return fmt.Errorf("%w: the RSA key is %d bits, below the %d-bit minimum", ErrUnsupportedCSRKey, bits, minRSAKeyBits)
+		}
+		if bits > maxRSAKeyBits {
+			return fmt.Errorf("%w: the RSA key is %d bits, above the %d-bit maximum", ErrUnsupportedCSRKey, bits, maxRSAKeyBits)
 		}
 		return nil
 	default:

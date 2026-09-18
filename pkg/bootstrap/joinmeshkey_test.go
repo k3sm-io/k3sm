@@ -48,12 +48,12 @@ func (c *capturingEnroller) Enroll(_ context.Context, nodeName string, req netv1
 		NodeName: nodeName,
 		PodCIDR:  "100.64.1.0/24",
 		MeshIP:   "100.64.1.1",
-	}.WithDefaults(), bootstrap.AllocationReused, nil
+	}.WithDefaults(), bootstrap.Allocation{}, nil
 }
 
 // ReleaseAllocation satisfies bootstrap.Enroller. This fixture's assignment is
 // fixed, so it carves nothing and nothing may be reaped from it.
-func (c *capturingEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+func (c *capturingEnroller) ReleaseAllocation(_ context.Context, nodeName string, _ bootstrap.Allocation) error {
 	return fmt.Errorf("the join fixture's enroller was asked to release %q, an allocation it never carved", nodeName)
 }
 

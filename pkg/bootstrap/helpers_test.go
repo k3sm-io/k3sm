@@ -78,13 +78,13 @@ func (f *fakeEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEn
 		PodCIDR:  f.podCIDR,
 		MeshIP:   f.meshIP,
 		Peers:    f.peers,
-	}.WithDefaults(), bootstrap.AllocationReused, nil
+	}.WithDefaults(), bootstrap.Allocation{}, nil
 }
 
 // ReleaseAllocation satisfies bootstrap.Enroller. Nothing here is ever a fresh
 // allocation, so a reap reaching this fixture is a wiring mistake — or a handler
-// that reaps a REUSED allocation, which is the defect the B339 gate forbids.
-func (f *fakeEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+// that reaps a REUSED allocation, which the failed-join gate forbids.
+func (f *fakeEnroller) ReleaseAllocation(_ context.Context, nodeName string, _ bootstrap.Allocation) error {
 	return fmt.Errorf("the join fixture's enroller was asked to release %q, an allocation it never carved", nodeName)
 }
 

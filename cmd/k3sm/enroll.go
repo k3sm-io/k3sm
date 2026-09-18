@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -97,18 +99,30 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 
 // Enroll implements bootstrap.Enroller.
 //
-// The reported bootstrap.Allocation is the reuse-vs-carve decision below, carried
-// out to the caller: only a join that knows it carved a FRESH index can give that
-// index back when it fails afterwards (bootstrap.Enroller.ReleaseAllocation). It
-// is reported on the error paths that follow the write too — an enroll whose
-// snapshot LIST fails has still written the peer.
+// The reported bootstrap.Allocation is the reuse-vs-carve decision below plus the
+// id of the write this call made, carried out to the caller: only a join that
+// knows it carved a FRESH index can give that index back when it fails afterwards,
+// and only a join that knows WHICH peer it wrote can tell that peer apart from the
+// one a later enroll of the same node name has since written
+// (bootstrap.Enroller.ReleaseAllocation). It is reported on the error paths that
+// follow the write too — an enroll whose snapshot LIST fails has still written the
+// peer.
+//
+// The id is stamped on EVERY successful write, fresh or reused, so any later
+// enroll of this name replaces it: a peer's id names the last enroll that wrote
+// it, which is exactly the question a release has to answer.
 func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	enrollID, err := newEnrollID()
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, err
+	}
+
 	existing, err := e.listPeers(ctx)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("list mesh peers: %w", err)
+		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("list mesh peers: %w", err)
 	}
 
 	// Reuse this node's already-assigned CIDR on a rejoin; else assign the next /24.
@@ -118,32 +132,33 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 			podCIDR = p.PodCIDR
 		}
 	}
-	alloc := bootstrap.AllocationReused
+	alloc := bootstrap.Allocation{EnrollID: enrollID}
 	if podCIDR == "" {
-		alloc = bootstrap.AllocationFresh
+		alloc.Fresh = true
 		index, err := lowestFreeNodeIndex(e.clusterPod, existing)
 		if err != nil {
-			return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("assign podCIDR: %w", err)
+			return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("assign podCIDR: %w", err)
 		}
 		cidr, err := podnet.NodeCIDR(e.clusterPod, index)
 		if err != nil {
-			return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("assign podCIDR: %w", err)
+			return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("assign podCIDR: %w", err)
 		}
 		podCIDR = cidr.String()
 	}
 	prefix, err := netip.ParsePrefix(podCIDR)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("parse assigned podCIDR %q: %w", podCIDR, err)
+		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("parse assigned podCIDR %q: %w", podCIDR, err)
 	}
 	meshIP, err := podnet.MeshEgressIP(prefix)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("derive mesh-egress IP: %w", err)
+		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("derive mesh-egress IP: %w", err)
 	}
 
 	peer, err := bootstrap.BuildMeshPeer(nodeName, podCIDR, meshIP.String(), req)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, err
+		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, err
 	}
+	stampEnrollID(peer, enrollID)
 	// Past this point the peer may exist, so the real allocation is reported: the
 	// failures below are the ones whose orphan a caller has to be able to reap.
 	if err := e.writePeer(ctx, peer); err != nil {
@@ -169,29 +184,75 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 // is a separate, unimplemented concern; this is only the undo of an allocation the
 // same request just made.
 //
+// It deletes the peer THIS join wrote and no other. The node name does not
+// identify that peer: a second join of the same name — a launchd-orphaned retry is
+// the ordinary case — overwrites it between this join's enroll and its failure,
+// and the overwrite can be byte-identical, since the retry presents the same
+// persisted wireguard public key and the same endpoint. So the write is stamped
+// (alloc.EnrollID, mirrored in the peer's meshPeerEnrollIDAnnotation) and the
+// release compares the stamp: a peer carrying a different id, or none, belongs to
+// a later enroll and is KEPT. An empty alloc.EnrollID names no write at all and is
+// an error rather than an unfenced delete.
+//
+// The two mechanisms answer two different questions, and both are needed. The
+// mutex gives SINGLE-PROCESS ordering: this supervisor's own enrolls, self-enroll,
+// refreshes and releases cannot interleave with each other. The annotation compare
+// plus the server-side delete Preconditions (UID + resourceVersion) give the
+// CROSS-PROCESS guarantee: any other writer of this object — another supervisor,
+// an operator, a future controller — invalidates the precondition, and the
+// apiserver refuses the delete rather than this process racing it.
+//
 // It removes the MeshPeer and NOTHING else — unlike Deregister, which also deletes
 // the Node. A join that failed at its CSR never registered a Node, and one that
 // exists under that name belongs to an earlier join this call has no business
 // touching.
 //
-// It LIST-BACK VERIFIES, for the reason EnrollSelf does: returning nil here is the
-// claim that the index is assignable again, and that has to be read from the
-// apiserver rather than inferred from a delete that returned no error. A NotFound
-// on the delete is success — the reap is idempotent, and a peer that is already
-// gone is exactly the state asked for.
-//
-// It runs under the SAME mutex as Enroll, so a concurrent join cannot be handed
-// this index between the failure and the release.
-func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string) error {
+// It LIST-BACK VERIFIES after an ACTUAL delete, for the reason EnrollSelf does:
+// reporting success is the claim that the index is assignable again, and that has
+// to be read from the apiserver rather than inferred from a delete that returned
+// no error. A peer that was never this join's is not verified against, because the
+// index is legitimately still held — by its new owner. A NotFound is success — the
+// reap is idempotent, and a peer that is already gone is exactly the state asked
+// for.
+func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string, alloc bootstrap.Allocation) error {
 	if nodeName == "" {
 		return errors.New("release allocation: no node name")
+	}
+	if alloc.EnrollID == "" {
+		return errors.New("release allocation: no enroll id")
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.client.Delete().Resource(meshPeerResource).Name(nodeName).Do(ctx).Error(); err != nil && !apierrors.IsNotFound(err) {
+	var cur netv1.MeshPeer
+	if err := e.client.Get().Resource(meshPeerResource).Name(nodeName).Do(ctx).Into(&cur); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read mesh peer %q: %w", nodeName, err)
+	}
+	if got := cur.Annotations[meshPeerEnrollIDAnnotation]; got != alloc.EnrollID {
+		e.log.Info("kept the mesh peer of a newer join", "node", nodeName,
+			"releasing", alloc.EnrollID, "peerEnroll", got)
+		return nil
+	}
+
+	pre := &metav1.Preconditions{ResourceVersion: &cur.ResourceVersion}
+	if cur.UID != "" {
+		pre.UID = &cur.UID
+	}
+	if err := e.client.Delete().Resource(meshPeerResource).Name(nodeName).
+		Body(&metav1.DeleteOptions{Preconditions: pre}).Do(ctx).Error(); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			// Someone else wrote or removed the object between the read and the
+			// delete. Either way it is no longer the peer this join wrote, which
+			// is the only peer this call may remove.
+			e.log.Info("kept the mesh peer of a newer join", "node", nodeName, "err", err)
+			return nil
+		}
 		return fmt.Errorf("delete mesh peer %q: %w", nodeName, err)
 	}
+
 	peers, err := e.listPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("verify the release of mesh peer %q: %w", nodeName, err)
@@ -203,6 +264,32 @@ func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string) e
 	}
 	e.log.Info("released the mesh allocation of a failed join", "node", nodeName)
 	return nil
+}
+
+// meshPeerEnrollIDAnnotation carries the id of the enroll that last wrote a
+// MeshPeer. It is the fence ReleaseAllocation compares against, and it is written
+// on the MeshPeer only: nothing outside this supervisor reads it, and the mesh
+// programming ignores annotations entirely.
+const meshPeerEnrollIDAnnotation = "net.k3sm.io/enroll-id"
+
+// newEnrollID mints the per-enroll nonce. It is random rather than derived from
+// the peer's content precisely because two enrolls of one node can produce
+// identical content — same persisted wireguard key, same endpoint — and a fence
+// that cannot tell those apart is no fence.
+func newEnrollID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate enroll id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// stampEnrollID sets the enroll-id annotation on a peer about to be written.
+func stampEnrollID(peer *netv1.MeshPeer, enrollID string) {
+	if peer.Annotations == nil {
+		peer.Annotations = map[string]string{}
+	}
+	peer.Annotations[meshPeerEnrollIDAnnotation] = enrollID
 }
 
 // serverNodeIndex is the node index the CONTROL-PLANE node's pod /24 is carved
@@ -264,6 +351,14 @@ func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, req netv
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, err
 	}
+	// Stamped like every other enroll, so no id an earlier enroll of this name
+	// handed out survives this write — a release holding one must find a stranger's
+	// peer and keep it, which is the invariant the fence rests on.
+	enrollID, err := newEnrollID()
+	if err != nil {
+		return netv1.MeshEnrollResponse{}, err
+	}
+	stampEnrollID(peer, enrollID)
 	if err := e.writePeer(ctx, peer); err != nil {
 		return netv1.MeshEnrollResponse{}, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
 	}
@@ -546,6 +641,19 @@ func (e *meshEnroller) writePeer(ctx context.Context, peer *netv1.MeshPeer) erro
 		return err
 	}
 	peer.ResourceVersion = cur.ResourceVersion
+	// The peer is assembled fresh from the enroll, so an update would otherwise
+	// DROP every annotation the object carries. The caller's own keys win (the
+	// enroll id is the point of the write); everything else is carried forward,
+	// because this write is about the spec and has no opinion on metadata another
+	// writer put there.
+	for k, v := range cur.Annotations {
+		if _, set := peer.Annotations[k]; !set {
+			if peer.Annotations == nil {
+				peer.Annotations = map[string]string{}
+			}
+			peer.Annotations[k] = v
+		}
+	}
 	return e.client.Put().Resource(meshPeerResource).Name(peer.Name).Body(peer).Do(ctx).Into(&netv1.MeshPeer{})
 }
 

@@ -165,7 +165,7 @@ func TestMeshEnrollerCreatesAndRejoinsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Enroll: %v", err)
 	}
-	if alloc != bootstrap.AllocationFresh {
+	if !alloc.Fresh {
 		t.Errorf("first enroll reported %v, want fresh: a join that fails afterwards can only give this index back if the enroll says it carved one", alloc)
 	}
 	if got.PodCIDR != "100.64.1.0/24" {
@@ -199,7 +199,7 @@ func TestMeshEnrollerCreatesAndRejoinsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rejoin Enroll: %v", err)
 	}
-	if rejoinAlloc != bootstrap.AllocationReused {
+	if rejoinAlloc.Fresh {
 		t.Errorf("rejoin reported %v, want reused: a rejoin's peer belongs to the earlier successful join and must never be reaped", rejoinAlloc)
 	}
 	if again.PodCIDR != got.PodCIDR {

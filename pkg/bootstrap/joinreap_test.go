@@ -36,31 +36,48 @@ import (
 // so a test can observe the one thing this gate is about, which is whether a join
 // that failed left its index burned.
 //
+// It also models the shipped enroller's FENCE: every Enroll stamps a distinct id
+// on the node's entry, and a release deletes only while the stamp it carries is
+// still the one on that entry. The stamp is what distinguishes this join's write
+// from a later one under the same node name, which the name alone cannot do.
+//
 // Locking discipline: mu guards every field; httptest serves each join on its own
 // goroutine.
 type allocatingEnroller struct {
 	mu      sync.Mutex
 	byNode  map[string]int
 	byIndex map[int]string
+	// enrollID is the id of the enroll that last wrote each node's entry — the
+	// fixture's stand-in for the MeshPeer's enroll-id annotation.
+	enrollID map[string]string
 	// enrolls counts EVERY Enroll call. "The request was refused" and "the enroll
 	// never ran" are different claims, and the ordering rows assert the second.
 	enrolls int
 	// releases is the node name of every ReleaseAllocation call, in order.
 	releases []string
+	// releaseAllocs is the Allocation of every ReleaseAllocation call, in order,
+	// so a row can assert WHAT the handler released with and not merely that it
+	// released something.
+	releaseAllocs []bootstrap.Allocation
 	// releaseErr is what ReleaseAllocation returns, so a row can drive the
 	// handler's reap-failure arm.
 	releaseErr error
+	// beforeRelease runs at the top of ReleaseAllocation, before the lock, so a
+	// row can interleave a whole second join between this join's enroll and its
+	// release deterministically — no sleeps, no goroutine ordering to guess at.
+	// It fires once.
+	beforeRelease func()
 }
 
 func (e *allocatingEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.byNode == nil {
-		e.byNode, e.byIndex = map[string]int{}, map[int]string{}
+		e.byNode, e.byIndex, e.enrollID = map[string]int{}, map[int]string{}, map[string]string{}
 	}
 	e.enrolls++
 	index, held := e.byNode[nodeName]
-	alloc := bootstrap.AllocationReused
+	alloc := bootstrap.Allocation{EnrollID: fmt.Sprintf("enroll-%d", e.enrolls)}
 	if !held {
 		for index = 1; ; index++ {
 			if _, taken := e.byIndex[index]; !taken {
@@ -68,8 +85,11 @@ func (e *allocatingEnroller) Enroll(_ context.Context, nodeName string, _ netv1.
 			}
 		}
 		e.byNode[nodeName], e.byIndex[index] = index, nodeName
-		alloc = bootstrap.AllocationFresh
+		alloc.Fresh = true
 	}
+	// Stamped on every write, fresh or reused: the id names the LAST enroll of
+	// this node, which is what a release has to compare against.
+	e.enrollID[nodeName] = alloc.EnrollID
 	return netv1.MeshEnrollResponse{
 		NodeName: nodeName,
 		PodCIDR:  fmt.Sprintf("100.64.%d.0/24", index),
@@ -78,19 +98,57 @@ func (e *allocatingEnroller) Enroll(_ context.Context, nodeName string, _ netv1.
 }
 
 // ReleaseAllocation frees the node's index, which is what the real enroller's
-// MeshPeer delete does to the state the next assignment reads.
-func (e *allocatingEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+// MeshPeer delete does to the state the next assignment reads — but only while the
+// entry is still the one alloc wrote. An entry a LATER enroll has re-stamped is
+// kept, exactly as the real enroller keeps a MeshPeer whose annotation has moved
+// on, and an empty id is refused rather than released by name.
+func (e *allocatingEnroller) ReleaseAllocation(_ context.Context, nodeName string, alloc bootstrap.Allocation) error {
+	if hook := e.hook(); hook != nil {
+		hook()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.releases = append(e.releases, nodeName)
+	e.releaseAllocs = append(e.releaseAllocs, alloc)
+	if alloc.EnrollID == "" {
+		return fmt.Errorf("release allocation: no enroll id")
+	}
 	if e.releaseErr != nil {
 		return e.releaseErr
+	}
+	if e.enrollID[nodeName] != alloc.EnrollID {
+		return nil
 	}
 	if index, held := e.byNode[nodeName]; held {
 		delete(e.byNode, nodeName)
 		delete(e.byIndex, index)
+		delete(e.enrollID, nodeName)
 	}
 	return nil
+}
+
+// hook takes the one-shot beforeRelease callback, clearing it so a row's
+// interleaving runs exactly once.
+func (e *allocatingEnroller) hook() func() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	hook := e.beforeRelease
+	e.beforeRelease = nil
+	return hook
+}
+
+// stampOf returns the id of the enroll that last wrote the node's entry.
+func (e *allocatingEnroller) stampOf(nodeName string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.enrollID[nodeName]
+}
+
+// releasedWith returns the Allocation of every ReleaseAllocation call, in order.
+func (e *allocatingEnroller) releasedWith() []bootstrap.Allocation {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]bootstrap.Allocation(nil), e.releaseAllocs...)
 }
 
 // RefreshEndpoint satisfies bootstrap.Enroller. This fixture exercises the JOIN
