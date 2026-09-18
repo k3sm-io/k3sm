@@ -389,6 +389,43 @@ const (
 	datastoreEndpointFileFlag = "datastore-endpoint-file"
 )
 
+// preflightServerArgs reads, for a control-plane install only, the operator's
+// carried `k3sm server` arguments — the SAME two sources installedServerArgs
+// always has, in the same precedence (the installed plist, then the
+// survives-uninstall record) — and refuses here, before Install has written
+// anything, when the carried set names a --datastore-endpoint-file that is no
+// longer on disk. See requireDatastoreEndpointFile for why that refusal cannot
+// wait: rendering the plist anyway hands an HA control plane a daemon that
+// silently falls back to its own single-node datastore.
+//
+// It returns the SAME slice step 2d assigns to cfg.ExtraServerArgs later, so
+// the plist/record carry-over reads the installed state exactly once per
+// install rather than once here and once more downstream — a second read
+// would also re-emit installedServerArgs' own "preserved" log line.
+// requireDatastoreEndpointFile itself takes no uid: the write half of this
+// decision (stageDatastoreEndpoint's inline-DSN case) stays at its original,
+// post-copy point, because THAT path needs the service uid this preflight
+// point does not have yet.
+//
+// An agent install returns (nil, nil) immediately: --datastore-endpoint-file is
+// a `k3sm server` flag only.
+func preflightServerArgs(sys System, cfg Config) ([]string, error) {
+	if cfg.Role != RoleServer {
+		return nil, nil
+	}
+	extra, err := installedServerArgs(sys, cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ExtraServerArgs = extra
+	if named := flagValue(cfg.resolvedExtraServerArgs(), datastoreEndpointFileFlag); named != "" {
+		if err := requireDatastoreEndpointFile(sys, cfg, named); err != nil {
+			return nil, err
+		}
+	}
+	return extra, nil
+}
+
 // stageDatastoreEndpoint moves a credentialed datastore DSN off the server
 // daemon's command line: the DSN goes into a service-user-owned 0600 file in
 // the server work dir and cfg.ExtraServerArgs comes back naming that file
