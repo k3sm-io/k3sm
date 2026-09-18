@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -182,6 +183,34 @@ type fakeSystem struct {
 	// writes something while the installer is polling for it — a join that
 	// completes during the join budget — without a goroutine racing these maps.
 	delayed map[string]*delayedFile
+	// tree is the fake's model of the ROOT-OWNED ARTIFACT TREE: every path
+	// CopyToRootOwned has laid down, mapped to the source it was copied from.
+	//
+	// It exists because the staged-root swap is a statement about a TREE, not
+	// about a sequence of calls: "a failure part-way through staging leaves the
+	// live root byte-identical" and "the reverse swap put the previous tree
+	// back" are both assertions about what is at which path afterwards, and a
+	// fake that only remembered the calls could not express either. It is
+	// deliberately separate from files above — nothing reads an installed
+	// artifact back, and pooling the two would let an unrelated ReadFile
+	// assertion start depending on the copy log.
+	tree map[string]string
+	// copyErrs are the destinations CopyToRootOwned FAILS on, keyed by dst: the
+	// full disk or the I/O error part-way through the copy block. The zero value
+	// copies everything, so no pre-existing test has to say anything.
+	copyErrs map[string]error
+	// locked are the lock paths LockInstall currently holds. A second
+	// acquisition of a held path is refused with ErrInstallInProgress, which is
+	// how a test describes the other install this one must not interleave with.
+	locked map[string]bool
+	// swapErr is the failure SwapInstallRoot returns instead of publishing. It
+	// is the one fault that must leave the live root untouched AND must not be
+	// followed by a reverse swap.
+	swapErr error
+	// space is what InstallSpace answers: free bytes, then needed bytes. Nil —
+	// the zero value — is a volume with room for anything, so only a test about
+	// the preflight has to state a number.
+	space *fakeSpace
 	// owners is the fake's model of unix ownership, keyed by path: what Owner
 	// and ListOwned answer from, and what Chown MUTATES. It is deliberately
 	// independent of files above — ownership is not derivable from content, and
@@ -208,6 +237,63 @@ type delayedFile struct {
 	// a crash record needs (it is there throughout, and the daemon appends an
 	// entry to it while the verification is watching).
 	before []byte
+}
+
+// fakeSpace is what InstallSpace reports: the bytes free on the volume and the
+// bytes the sources occupy. err, when set, is returned instead — the posture in
+// which the preflight cannot be taken at all and must not fail the install.
+type fakeSpace struct {
+	free, need uint64
+	err        error
+}
+
+// putSpace makes InstallSpace answer free/need.
+func (f *fakeSystem) putSpace(free, need uint64) { f.space = &fakeSpace{free: free, need: need} }
+
+// putSpaceErr makes InstallSpace fail — the estimate that cannot be taken.
+func (f *fakeSystem) putSpaceErr(err error) { f.space = &fakeSpace{err: err} }
+
+// putCopyErr makes CopyToRootOwned fail on dst: the disk that filled up in the
+// middle of the copy block.
+func (f *fakeSystem) putCopyErr(dst string, err error) {
+	if f.copyErrs == nil {
+		f.copyErrs = map[string]error{}
+	}
+	f.copyErrs[dst] = err
+}
+
+// putTree records one copied artifact in the fake's root-owned tree.
+func (f *fakeSystem) putTree(dst, src string) {
+	if f.tree == nil {
+		f.tree = map[string]string{}
+	}
+	f.tree[dst] = src
+}
+
+// treeUnder lists the tree entries at or under dir, relative to it — the fake's
+// answer to "what is in this install root, exactly".
+func (f *fakeSystem) treeUnder(dir string) map[string]string {
+	out := map[string]string{}
+	prefix := strings.TrimSuffix(dir, "/") + "/"
+	for p, src := range f.tree {
+		if p == dir {
+			out["."] = src
+			continue
+		}
+		if strings.HasPrefix(p, prefix) {
+			out[strings.TrimPrefix(p, prefix)] = src
+		}
+	}
+	return out
+}
+
+// dirExists is the fake's model of "there is a directory here": something was
+// copied into it, or a root-owned directory was ensured at it.
+func (f *fakeSystem) dirExists(dir string) bool {
+	if _, ok := f.owners[dir]; ok {
+		return true
+	}
+	return len(f.treeUnder(dir)) > 0
 }
 
 // putFileAfterReads seeds a file that reads as ABSENT for the next absentReads
@@ -617,7 +703,130 @@ func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
 	// /Library/k3sm/k3sm-m2 while the plists exec'd /Library/k3sm/k3sm, and
 	// launchd invalidated both daemons with "Missing executable").
 	f.calls = append(f.calls, "CopyToRootOwned:"+dst)
+	if err := f.copyErrs[dst]; err != nil {
+		return err
+	}
+	// ...and record the artifact in the fake's tree, so a test can ask what is
+	// at a path rather than only which calls were made. The value is the source
+	// it came from, which is what makes "the live root is the ORIGINAL tree
+	// again" after a reverse swap an assertion with content.
+	f.putTree(dst, src)
 	return nil
+}
+
+// LockInstall models the install-wide lock: the first acquisition succeeds, a
+// second one on the same path is refused with ErrInstallInProgress (never
+// queued), and the release drops it.
+func (f *fakeSystem) LockInstall(path string) (func() error, error) {
+	f.calls = append(f.calls, "LockInstall:"+path)
+	if f.locked[path] {
+		return nil, fmt.Errorf("%w (its lock is held at %s)", ErrInstallInProgress, path)
+	}
+	if f.locked == nil {
+		f.locked = map[string]bool{}
+	}
+	f.locked[path] = true
+	return func() error {
+		f.calls = append(f.calls, "UnlockInstall:"+path)
+		delete(f.locked, path)
+		return nil
+	}, nil
+}
+
+// SwapInstallRoot exchanges the two trees in the fake's own model and reports
+// which branch the real seam would have taken, in the recorded call itself:
+// `:swap` when the destination held a tree, `:rename` when it did not.
+//
+// The branch is not cosmetic — it is the value the installer acts on (whether
+// there is a previous tree to reap and to roll back to) — so it is stated in
+// the call log where a sequence assertion can see it.
+func (f *fakeSystem) SwapInstallRoot(staging, live string) (bool, error) {
+	previous := f.dirExists(live)
+	verb := "rename"
+	if previous {
+		verb = "swap"
+	}
+	f.calls = append(f.calls, fmt.Sprintf("SwapInstallRoot:%s<->%s:%s", staging, live, verb))
+	if f.swapErr != nil {
+		return false, f.swapErr
+	}
+	f.exchangeTrees(staging, live)
+	return previous, nil
+}
+
+// exchangeTrees moves everything under a to b and everything under b to a,
+// including the directory entries the ownership table holds for them — a
+// directory that has content but was never ensured is given the root:wheel 0755
+// entry the real install root carries, so a reap's trust check sees what it
+// would see on a Mac.
+func (f *fakeSystem) exchangeTrees(a, b string) {
+	moved := map[string]string{}
+	rebase := func(from, to string) {
+		for rel, src := range f.treeUnder(from) {
+			if rel == "." {
+				moved[to] = src
+				continue
+			}
+			moved[filepath.Join(to, rel)] = src
+		}
+		for p := range f.tree {
+			if p == from || strings.HasPrefix(p, strings.TrimSuffix(from, "/")+"/") {
+				delete(f.tree, p)
+			}
+		}
+	}
+	aExists, bExists := f.dirExists(a), f.dirExists(b)
+	rebase(a, b)
+	rebase(b, a)
+	for p, src := range moved {
+		f.putTree(p, src)
+	}
+	ea, aOwned := f.owners[a]
+	eb, bOwned := f.owners[b]
+	delete(f.owners, a)
+	delete(f.owners, b)
+	rootDir := func(path string) OwnedEntry {
+		return OwnedEntry{Path: path, UID: 0, GID: 0, Mode: 0o755 | fs.ModeDir, Kind: EntryDir}
+	}
+	if aExists {
+		if aOwned {
+			ea.Path = b
+			f.putOwnedEntry(b, ea)
+		} else {
+			f.putOwnedEntry(b, rootDir(b))
+		}
+	}
+	if bExists {
+		if bOwned {
+			eb.Path = a
+			f.putOwnedEntry(a, eb)
+		} else {
+			f.putOwnedEntry(a, rootDir(a))
+		}
+	}
+}
+
+// putOwnedEntry stores a prepared ownership entry (putOwned's sibling, for the
+// swap, which moves entries rather than describing new ones).
+func (f *fakeSystem) putOwnedEntry(path string, e OwnedEntry) {
+	if f.owners == nil {
+		f.owners = map[string]OwnedEntry{}
+	}
+	e.Path = path
+	f.owners[path] = e
+}
+
+// InstallSpace answers the free/needed pair a test stated, and describes a
+// volume with room for anything when it stated none.
+func (f *fakeSystem) InstallSpace(dir string, sources []string) (uint64, uint64, error) {
+	f.calls = append(f.calls, "InstallSpace:"+dir)
+	if f.space == nil {
+		return 1 << 40, 0, nil
+	}
+	if f.space.err != nil {
+		return 0, 0, f.space.err
+	}
+	return f.space.free, f.space.need, nil
 }
 
 // EnsureSymlink records the requested link and models idempotence: a second call
@@ -915,6 +1124,11 @@ func (f *fakeSystem) RemoveAll(path string) error {
 			delete(f.agentArgs, p)
 		}
 	}
+	for p := range f.tree {
+		if under(p) {
+			delete(f.tree, p)
+		}
+	}
 	return nil
 }
 
@@ -929,9 +1143,23 @@ func (f *fakeSystem) RemoveAll(path string) error {
 // exists to pin. The paths are the test's own t.TempDir()s, so nothing
 // privileged happens.
 
+// EnsureRootDir records the call, REGISTERS the directory in the ownership
+// table as root:wheel at mode (what the real seam leaves behind, and what the
+// staging path's trust check then reads), and really creates it.
+//
+// A permission error from the real mkdir is tolerated, and only that one: an
+// unprivileged unit test legitimately asks for /Library/k3sm.staging, which it
+// cannot create and does not need to — the ownership table above is the model
+// those tests assert against. A test that needs a real directory (the data-root
+// migration, which really copies trees) names one under its own t.TempDir(),
+// where permission is never the answer.
 func (f *fakeSystem) EnsureRootDir(dir string, mode fs.FileMode) error {
 	f.calls = append(f.calls, "EnsureRootDir:"+dir)
-	return os.MkdirAll(dir, mode)
+	f.putOwned(dir, 0, 0, mode|fs.ModeDir, EntryDir)
+	if err := os.MkdirAll(dir, mode); err != nil && !errors.Is(err, fs.ErrPermission) {
+		return err
+	}
+	return nil
 }
 
 func (f *fakeSystem) CopyTree(src, dst string) error {
@@ -944,8 +1172,25 @@ func (f *fakeSystem) Rename(old, new string) error {
 	return os.Rename(old, new)
 }
 
+// RemoveTree records the call, drops everything the fake models under path (the
+// artifact tree and the ownership entries), and really removes the directory.
+// The model has to move with the call for the same reason RemoveAll's does: a
+// reap that only recorded itself would leave a later assertion looking at a
+// tree the install had already deleted.
 func (f *fakeSystem) RemoveTree(path string) error {
 	f.calls = append(f.calls, "RemoveTree:"+path)
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	under := func(p string) bool { return p == path || strings.HasPrefix(p, prefix) }
+	for p := range f.tree {
+		if under(p) {
+			delete(f.tree, p)
+		}
+	}
+	for p := range f.owners {
+		if under(p) {
+			delete(f.owners, p)
+		}
+	}
 	return os.RemoveAll(path)
 }
 
@@ -1187,6 +1432,15 @@ func TestInstallOrchestration(t *testing.T) {
 		// leaving a mix of new and old artifacts beside the still-running old
 		// daemon (TestInstallVerifiesTheVMHostBeforeWritingTheRoot).
 		"VerifyVirtualizationEntitlement:/tmp/k3sm-vmhost",
+		// ...and the last input-only probe: is there room on this volume for a
+		// second copy of the install root? Staging means the new tree and the
+		// old one coexist until the reap. It is a courtesy, not a correctness
+		// gate — a seam failure here never refuses an install.
+		"InstallSpace:/Library",
+		// NOTHING BELOW THIS LINE RUNS IN TWO INSTALLS AT ONCE. The lock is
+		// taken after every refusal (so a refusal never takes it) and before
+		// the first write, and it is released at the very end, past the reap.
+		"LockInstall:/Library/k3sm.lock",
 		// The installed server plist, read here for the SAME reason and to
 		// answer a different refusal: does the argument set this install would
 		// carry over name a --datastore-endpoint-file that is no longer there?
@@ -1238,26 +1492,28 @@ func TestInstallOrchestration(t *testing.T) {
 		"ReadRegularFile:/var/lib/k3sm/run/keys/server.key",
 		"WriteServiceUserFile:/var/lib/k3sm/server/server.key:0600:0700:271",
 		"WriteRootOnlyFile:/var/lib/k3sm/run/keys/server.key:0600",
-		"CopyToRootOwned:/Library/k3sm/k3sm",
-		// The launcher link goes down immediately after the binary it points at,
-		// and long before any daemon work: copying into /Library/k3sm never put
-		// `k3sm` on a shell's PATH, which every post-install instruction assumes.
-		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
-		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
-		"CopyToRootOwned:/Library/k3sm/libk3sm_pathrebase_shim.dylib",
-		"CopyToRootOwned:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
+		// THE STAGED INSTALL ROOT. The sibling directory is inspected (absent on
+		// a first install, so nothing is removed) and created, and every
+		// artifact below lands in it rather than in the tree the daemons are
+		// executing out of.
+		"Owner:/Library/k3sm.staging",
+		"EnsureRootDir:/Library/k3sm.staging",
+		"CopyToRootOwned:/Library/k3sm.staging/k3sm",
+		"CopyToRootOwned:/Library/k3sm.staging/k3sm-execshim",
+		"CopyToRootOwned:/Library/k3sm.staging/libk3sm_pathrebase_shim.dylib",
+		"CopyToRootOwned:/Library/k3sm.staging/libk3sm_getaddrinfo_shim.dylib",
 		// The helper's entitlement was already verified, in the preflight block
 		// before any of these copies ran (see above) — this copy can now only
 		// fail on an I/O error.
-		"CopyToRootOwned:/Library/k3sm/k3sm-vmhost",
-		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
-		"CopyToRootOwned:/Library/k3sm/bin/kube-scheduler",
-		"CopyToRootOwned:/Library/k3sm/bin/kube-controller-manager",
-		"CopyToRootOwned:/Library/k3sm/bin/kubectl",
-		"CopyToRootOwned:/Library/k3sm/bin/kine",
+		"CopyToRootOwned:/Library/k3sm.staging/k3sm-vmhost",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-apiserver",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-scheduler",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
-		"CopyToRootOwned:/Library/k3sm/bin/" + executor.KineMarkerName,
+		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
 		// over below reuses that answer — nothing, on a first install — rather
@@ -1273,6 +1529,17 @@ func TestInstallOrchestration(t *testing.T) {
 		// the apiserver self-signs into its own --cert-dir; a first install finds
 		// nothing and the kubeconfig keeps skip-verify.
 		"ReadFile:/var/lib/k3sm/server/apiserver-certs/apiserver.crt",
+		// PUBLISH. One operation makes the whole staged tree live; `:rename` is
+		// the first-install branch (there was no tree at /Library/k3sm to
+		// exchange with), so there is nothing to reap afterwards.
+		"SwapInstallRoot:/Library/k3sm.staging<->/Library/k3sm:rename",
+		// The launcher link and the plists come AFTER it, and only after it:
+		// each names a fixed absolute path inside the install root, and that
+		// path holds this install's binary only now. Copying into /Library/k3sm
+		// never put `k3sm` on a shell's PATH, which every post-install
+		// instruction assumes, so the link is still a hard install failure when
+		// it cannot be laid down.
+		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is
@@ -1302,7 +1569,12 @@ func TestInstallOrchestration(t *testing.T) {
 		// ...and the server's crash-loop record read, because a daemon parked by
 		// its breaker reports a healthy pid while serving nothing.
 		"ReadFile:/var/lib/k3sm/server/crashloop.json",
+		// No reap: this is a first install, so the publish was a plain rename
+		// and there is no previous tree at the staging path. A reinstall has
+		// one, and removes it HERE and not a step earlier
+		// (TestInstallStagesTheRootAndPublishesItOnce).
 		"WriteUserKubeconfig:alice",
+		"UnlockInstall:/Library/k3sm.lock",
 	}
 	if len(f.calls) != len(want) {
 		t.Fatalf("call sequence = %v, want %v", f.calls, want)
@@ -1362,14 +1634,17 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			}
 			// The FIRST privileged call — the refuse-before-write probes ahead of
 			// it (the cross-role plist read, the launcher-directory trust read,
-			// the staged vmhost helper's entitlement, and the carried server
-			// arguments' datastore-endpoint-file check) are all reads, and
-			// install performs nothing else before the service user exists: the
-			// data root is its home, and every later step writes into it.
+			// the staged vmhost helper's entitlement, the carried server
+			// arguments' datastore-endpoint-file check and the free-space
+			// estimate) are all reads, the install-wide lock creates no state
+			// the install owns, and install performs nothing else before the
+			// service user exists: the data root is its home, and every later
+			// step writes into it.
 			wantCall := "EnsureServiceUser:_k3sm:" + want
 			var first string
 			for _, c := range f.calls {
-				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") || strings.HasPrefix(c, "VerifyVirtualizationEntitlement:") {
+				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") || strings.HasPrefix(c, "VerifyVirtualizationEntitlement:") ||
+					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") {
 					continue
 				}
 				first = c
@@ -1400,7 +1675,13 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 			dsts = append(dsts, strings.TrimPrefix(c, "CopyToRootOwned:"))
 		}
 	}
-	fixedHead := []string{"/Library/k3sm/k3sm", "/Library/k3sm/k3sm-execshim", "/Library/k3sm/" + PathShimName, "/Library/k3sm/" + DNSShimName, "/Library/k3sm/" + VMHostName}
+	// The destinations are the STAGING tree's, and the fixed name is what makes
+	// that safe: the publish exchanges the whole directory, so a staged
+	// `k3sm-m2` would arrive under the live root under that same wrong name.
+	// The head is therefore stated as the staged counterpart of each fixed
+	// installed path, which is exactly what the swap then republishes.
+	stage := "/Library/k3sm" + installStagingSuffix
+	fixedHead := []string{stage + "/k3sm", stage + "/k3sm-execshim", stage + "/" + PathShimName, stage + "/" + DNSShimName, stage + "/" + VMHostName}
 	if len(dsts) < len(fixedHead) {
 		t.Fatalf("only %d copies %v, want at least the fixed head %v (never the source basename)", len(dsts), dsts, fixedHead)
 	}
@@ -1417,10 +1698,25 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the kine marker)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
-		if got, want := dsts[head+i], "/Library/k3sm/bin/"+name; got != want {
+		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {
 			t.Errorf("payload copy %d landed at %q, want %q", i, got, want)
 		}
 	}
+	// ...and the publish puts every one of them under the fixed installed name:
+	// the whole point of the staged copy is that it is republished verbatim, so
+	// a source basename that leaked into a destination would arrive in the live
+	// root just as surely as it used to.
+	dc := cfg.withDefaults()
+	live := f.treeUnder(dc.InstallDir)
+	for _, want := range []string{"k3sm", "k3sm-execshim", PathShimName, DNSShimName, VMHostName, "bin/kine"} {
+		if _, ok := live[want]; !ok {
+			t.Errorf("%s is not in the published install root %v", want, live)
+		}
+	}
+	if _, ok := live["k3sm-m2"]; ok {
+		t.Error("the source basename reached the published install root")
+	}
+
 	// The shim/payload sources default to SIBLINGS of BinarySource — the
 	// gate/goreleaser stage all artifacts side by side.
 	if got := cfg.withDefaults().ExecShimSource; got != "/tmp/build/k3sm-execshim" {
@@ -1838,6 +2134,23 @@ func fileDispByPath(m []artifact, path string) (disposition, bool) {
 	return 0, false
 }
 
+// publishedPath maps a copy destination in the staging tree back to the path
+// the publish puts it at. A path outside the staging tree is returned unchanged
+// — which is what keeps the rogue-artifact RED case below red, and what lets one
+// helper classify every recorded write.
+//
+// It is the test's model of the swap, and it is deliberately the inverse of
+// Config.stagedPath rather than a second reading of the same rule: if the two
+// ever disagree, the manifest coverage gate goes red, which is the outcome you
+// want from a drifting redirection.
+func publishedPath(cfg Config, p string) string {
+	prefix := cfg.stagingDir() + "/"
+	if !strings.HasPrefix(p, prefix) {
+		return p
+	}
+	return filepath.Join(cfg.InstallDir, strings.TrimPrefix(p, prefix))
+}
+
 // uninstallGaps returns, for a REAL Install run (installCalls) and a REAL
 // Uninstall run (uninstallCalls) recorded by the fake, the install-created
 // artifacts the uninstall FAILS to tear down — classified through the manifest.
@@ -1853,8 +2166,11 @@ func uninstallGaps(cfg Config, installCalls, uninstallCalls []string) []string {
 
 	var gaps []string
 
-	// Files copied in by CopyToRootOwned (the recorded value IS the installed path).
+	// Files copied in by CopyToRootOwned. The recorded value is where the copy
+	// LANDED — the staging tree — so it is mapped back through publishedPath to
+	// where the swap puts it, which is the tree the manifest describes.
 	for _, path := range recorded(installCalls, "CopyToRootOwned:") {
+		path = publishedPath(cfg, path)
 		disp, known := fileDispByPath(m, path)
 		if !known {
 			gaps = append(gaps, "off-manifest install: "+path)
@@ -2002,7 +2318,10 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// RemoveAll reaching into /Library or a home dir for a path k3sm never made.
 		created := toSet(recorded(installCalls, "WriteLaunchDaemon:"))
 		for _, path := range recorded(installCalls, "CopyToRootOwned:") {
-			created[filepath.Dir(path)] = true // the InstallDir tree (the sweep root)
+			// Through the swap, as above: the copy landed in the staging tree
+			// and the publish put it under InstallDir, which is the sweep root
+			// uninstall removes.
+			created[filepath.Dir(publishedPath(dc, path))] = true
 		}
 		// The container-log tree is created through its own seam method rather
 		// than by a copy, so it enters the created set the same way it is laid
@@ -2122,9 +2441,16 @@ func TestInstallLinksK3smOntoPath(t *testing.T) {
 		if link < 0 {
 			t.Fatalf("install never linked k3sm onto PATH; calls = %v", f.calls)
 		}
-		// After its target: a link laid before the binary points at nothing.
-		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm/k3sm"); binary < 0 || link < binary {
+		// After its target — a link laid before the binary points at nothing.
+		// Under staging that means after the PUBLISH, not merely after the copy:
+		// the copy puts the binary in the sibling tree, and /Library/k3sm/k3sm
+		// (the path this link names) exists only once the publish has run.
+		publish := idx(f.calls, "SwapInstallRoot:/Library/k3sm.staging<->/Library/k3sm:rename")
+		if binary := idx(f.calls, "CopyToRootOwned:/Library/k3sm.staging/k3sm"); binary < 0 || link < binary {
 			t.Errorf("link (%d) must be laid down after the binary copy (%d)", link, binary)
+		}
+		if publish < 0 || link < publish {
+			t.Errorf("link (%d) must be laid down after the publish (%d) that makes its target exist", link, publish)
 		}
 		// Before any daemon work, so a failure to link fails the install early
 		// rather than after the cluster is running.

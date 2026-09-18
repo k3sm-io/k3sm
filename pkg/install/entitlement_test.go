@@ -79,7 +79,7 @@ func TestInstallGatesOnVMHostEntitlement(t *testing.T) {
 			f.putEntitlement(src, tc.probe)
 			err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"})
 
-			copied := slices.Contains(f.calls, "CopyToRootOwned:/Library/k3sm/"+VMHostName)
+			copied := slices.Contains(f.calls, "CopyToRootOwned:/Library/k3sm"+installStagingSuffix+"/"+VMHostName)
 			if !tc.refuse {
 				if err != nil {
 					t.Fatalf("Install: %v, want success", err)
@@ -177,7 +177,7 @@ func TestInstallVerifiesTheVMHostBeforeWritingTheRoot(t *testing.T) {
 		if err := Install(context.Background(), f, Config{BinarySource: "/tmp/k3sm", TargetUser: "alice"}); err != nil {
 			t.Fatalf("Install: %v, want success (a missing helper is not this gate's business)", err)
 		}
-		if !slices.Contains(f.calls, "CopyToRootOwned:/Library/k3sm/"+VMHostName) {
+		if !slices.Contains(f.calls, "CopyToRootOwned:/Library/k3sm"+installStagingSuffix+"/"+VMHostName) {
 			t.Errorf("the vmhost copy itself did not run; calls = %v", f.calls)
 		}
 	})
