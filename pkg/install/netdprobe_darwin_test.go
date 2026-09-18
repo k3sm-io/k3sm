@@ -145,6 +145,34 @@ func TestProbeNetdRequiresAnAnswer(t *testing.T) {
 		}
 	})
 
+	t.Run("a daemon that closes before the write lands has answered", func(t *testing.T) {
+		// The reject can also land on the WRITE side of the round trip: netd's
+		// peer check can close the connection before the probe's frame is
+		// even delivered, and the write then fails with EPIPE rather than
+		// the read ever seeing the close. That race is what reproduced 2/30
+		// against the fake daemon above (its close sometimes beats the
+		// write) — this row forces the ordering every time so the assertion
+		// does not depend on scheduling luck.
+		closed := make(chan struct{})
+		path := listenUnix(t, func(ln net.Listener) {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+				close(closed)
+			}
+		})
+		orig := netdProbeBeforeWrite
+		netdProbeBeforeWrite = func() { <-closed }
+		t.Cleanup(func() { netdProbeBeforeWrite = orig })
+
+		if err := sys.ProbeNetd(path); err != nil {
+			t.Fatalf("a netd that closes before the write is delivered has still answered it: %v", err)
+		}
+	})
+
 	t.Run("nothing bound is not serving", func(t *testing.T) {
 		if err := sys.ProbeNetd(filepath.Join(shortTempDir(t), "absent")); err == nil {
 			t.Fatal("ProbeNetd must fail when there is no socket at all")
