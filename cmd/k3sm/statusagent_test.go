@@ -263,6 +263,12 @@ func TestAgentCredentialPathsMatchTheStore(t *testing.T) {
 		}
 	})
 
+	t.Run("a certificate for another address is a mismatch to both of them", func(t *testing.T) {
+		t.Parallel()
+		store := savedStore(t, credentialForAddresses(t, assignedAddress, certAddress))
+		agree(t, store, time.Now(), status.CredentialAddressMismatch)
+	})
+
 	t.Run("the expiry margin is the agent's own", func(t *testing.T) {
 		t.Parallel()
 		if status.CredentialExpiryMargin != nodecred.ExpiryMargin {
@@ -301,6 +307,8 @@ func reportWord(s nodecred.State) status.CredentialState {
 		return status.CredentialAbsent
 	case nodecred.Expired:
 		return status.CredentialExpired
+	case nodecred.AddressMismatch:
+		return status.CredentialAddressMismatch
 	default:
 		return status.CredentialCorrupt
 	}

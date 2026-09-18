@@ -45,7 +45,8 @@ limitations under the License.
 // that says "valid" about a credential the daemon refuses to start with, which
 // sends an operator to the wrong Mac. So the five path names, the validation
 // (both keypairs proven against their certificates, the client CA decoded, a
-// non-empty assigned podCIDR) and the ExpiryMargin live here exactly once.
+// non-empty assigned podCIDR, and the serving certificate's IP SANs compared
+// with the assigned mesh address) and the ExpiryMargin live here exactly once.
 //
 // The WRITE half stays with the agent: it is the only process that has a join
 // outcome to persist, and persisting it needs the join types this package is

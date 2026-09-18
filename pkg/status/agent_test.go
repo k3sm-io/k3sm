@@ -70,19 +70,33 @@ func agentInstalledFS(p Paths) fakeFS {
 	}
 }
 
+// credentialMeshIP is the mesh address the staged assignment names: what the
+// server assigned this worker, and so the address its serving certificate has
+// to carry as an IP SAN for the apiserver to reach its :10250.
+const credentialMeshIP = "100.64.2.1"
+
 // withCredential stages a COMPLETE node credential store in a fake filesystem:
 // all five artifacts the agent writes, with matching keypairs, so the report's
 // verdict is produced by the same validation the daemon runs — not by a fixture
 // that only looks complete.
 func withCredential(t *testing.T, fsys fakeFS, dir string, notAfter time.Time) fakeFS {
 	t.Helper()
+	return withCredentialFor(t, fsys, dir, notAfter, credentialMeshIP)
+}
+
+// withCredentialFor is withCredential with the kubelet serving certificate
+// issued for certIP instead of the assigned address — the on-disk shape of a
+// worker that joined asserting a `--node-ip` the control plane did not assign.
+func withCredentialFor(t *testing.T, fsys fakeFS, dir string, notAfter time.Time, certIP string) fakeFS {
+	t.Helper()
 	certPEM, keyPEM := selfSigned(t, notAfter)
+	servingCertPEM, servingKeyPEM := selfSigned(t, notAfter, net.ParseIP(certIP))
 	files := map[string][]byte{
 		nodecred.KubeconfigFile:     nodeKubeconfigBytes(t, certPEM, keyPEM),
-		nodecred.ServingCertFile:    certPEM,
-		nodecred.ServingKeyFile:     keyPEM,
+		nodecred.ServingCertFile:    servingCertPEM,
+		nodecred.ServingKeyFile:     servingKeyPEM,
 		nodecred.ClientCAFile:       certPEM,
-		nodecred.NodeAssignmentFile: []byte(`{"podCIDR":"100.64.2.0/24","meshIP":"100.64.2.1"}`),
+		nodecred.NodeAssignmentFile: []byte(`{"podCIDR":"100.64.2.0/24","meshIP":"` + credentialMeshIP + `"}`),
 	}
 	for name, blob := range files {
 		path := filepath.Join(dir, name)
@@ -98,7 +112,7 @@ func withCredential(t *testing.T, fsys fakeFS, dir string, notAfter time.Time) f
 // this gate into a time bomb — and because the keypair must genuinely MATCH:
 // the store proves every pair with tls.X509KeyPair, and a fixture that faked
 // the key would be testing a validation the daemon does not run.
-func selfSigned(t *testing.T, notAfter time.Time) (certPEM, keyPEM []byte) {
+func selfSigned(t *testing.T, notAfter time.Time, ips ...net.IP) (certPEM, keyPEM []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -110,6 +124,7 @@ func selfSigned(t *testing.T, notAfter time.Time) (certPEM, keyPEM []byte) {
 		NotBefore:    notAfter.Add(-365 * 24 * time.Hour),
 		NotAfter:     notAfter,
 		IsCA:         true,
+		IPAddresses:  ips,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -271,6 +286,17 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 				wantIn: "does not parse",
 			},
 			{
+				// B340: complete, matched and in date, and still unusable —
+				// the apiserver dials this node's :10250 at the address it was
+				// assigned and the certificate names another one.
+				name: "address-mismatch — the certificate names an address this node is not assigned",
+				stage: func(t *testing.T, p Paths, fsys fakeFS) fakeFS {
+					return withCredentialFor(t, fsys, p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour), "100.64.9.9")
+				},
+				wantState: StateAddressMismatch, wantSev: SeverityFail, wantCred: CredentialAddressMismatch,
+				wantIn: "names a different address",
+			},
+			{
 				name: "unknown — the store is not readable as this user, which is not a fault",
 				stage: func(t *testing.T, p Paths, fsys fakeFS) fakeFS {
 					fsys = withCredential(t, fsys, p.AgentCredentialDir, goldenTime.Add(90*24*time.Hour))
@@ -303,7 +329,7 @@ func TestStatusReportsTheAgentDaemon(t *testing.T) {
 				}
 				// Every unhealthy credential names what to do about it, and the
 				// remedy spans two Macs: the token is minted on the server.
-				if c.wantSev == SeverityWarn && !strings.Contains(agent.Remedy, "k3sm token create") {
+				if (c.wantSev == SeverityWarn || c.wantSev == SeverityFail) && !strings.Contains(agent.Remedy, "k3sm token create") {
 					t.Errorf("remedy = %q, want it to name the token the operator mints on the control plane", agent.Remedy)
 				}
 			})

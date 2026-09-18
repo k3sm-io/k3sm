@@ -341,6 +341,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		return agentTerminal(ctx, breaker, logger, err)
 	}
 	logStartPlan(logger, plan, status, tokenPresent, tokenParses, tokenCAHash, storedCAHash)
+	warnCredentialAddressMismatch(logger, plan, status, cred, opts.server, opts.tokenFile)
 
 	// node-password: mint once, persist 0600, reuse across restarts so the
 	// first-write-wins binding keeps matching.
@@ -482,6 +483,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		}
 	} else {
 		logger.Info("network datapath disabled (--network none): skipping wireguard mesh + node-local datapath")
+		warnNoDatapathInternalIP(logger, mode, agentInternalIP(opts.nodeIP, res))
 	}
 
 	// Everything that can terminally fail has now succeeded: this node holds a
@@ -697,6 +699,81 @@ func credInternalIP(cred *nodeCredential, flagIP string) string {
 		return cred.Assignment.MeshIP
 	}
 	return flagIP
+}
+
+// warnCredentialAddressMismatch names a stored kubelet serving certificate that
+// does not carry the address this node is assigned, and says what to do about
+// it. It is the only report of a fault that is otherwise completely silent.
+//
+// The shape of the fault: a node that joined while asserting a --node-ip the
+// control plane did not assign holds a certificate whose only IP SAN is that
+// asserted address. Its InternalIP is the ASSIGNED mesh address (the join
+// response, or on this path the stored assignment — see credInternalIP), and
+// the apiserver dials a node's :10250 at the InternalIP with
+// --kubelet-certificate-authority set to the cluster CA. So the dial fails the
+// TLS handshake, `kubectl logs` and `kubectl exec` against this node fail with
+// an x509 error about the address, and the node is Ready throughout. Nothing in
+// the cluster names the certificate as the cause.
+//
+// It logs at ERROR and the agent STILL STARTS, because refusing would take a
+// running worker down over a fault it has carried since its join. That is a
+// trade, not a safe state, and the log says so: the kubelet API listens on the
+// WILDCARD *:10250 (serverKubeletListen — see the security note on
+// nodeAddressForListen in node.go), so until the rejoin the stale certificate
+// is still a live TLS identity for the address it was wrongly issued for, on
+// every interface this Mac answers on. The asserted address is often a real LAN
+// address rather than a mesh one, which is exactly the case where something
+// else can reach that port. What holds the door is the client certificate the
+// provider routes require (provider.KubeletEndpointAuth), not this certificate
+// and not the mismatch. So the line reads "rejoin soon", `k3sm status` reports
+// the node degraded until it does (pkg/status's address-mismatch credential
+// row), and the operator chooses when.
+//
+// A start that is about to run a TOKEN JOIN says nothing: that join re-issues
+// this node's certificates for whatever address the server assigns, so the
+// stored mismatch is about to stop existing.
+func warnCredentialAddressMismatch(logger *slog.Logger, plan startMode, state credentialStatus, cred *nodeCredential, server, tokenFile string) {
+	if state != credentialAddressMismatch || cred == nil || plan != startModeReuseCredential {
+		return
+	}
+	logger.Error("this node's stored kubelet serving certificate does not name the address this node is assigned: the control plane's own dial to this node fails, and until you rejoin the old certificate still answers for the address it names on this Mac's kubelet port. Rejoin soon. The agent still starts, because refusing would take this worker down over a fault it has carried since its join",
+		"assignedAddress", cred.Assignment.MeshIP,
+		"certificateAddresses", strings.Join(cred.ServingIPSANs, ","),
+		"remedy", credentialRejoinRemedy(server, tokenFile))
+}
+
+// credentialRejoinRemedy is the command an operator runs to have this node's
+// certificates re-issued for the address it is actually assigned. The values
+// are THIS daemon's own argv where it has them, so the line can be run as
+// printed rather than translated first.
+func credentialRejoinRemedy(server, tokenFile string) string {
+	if server == "" {
+		server = "<control-plane>"
+	}
+	if tokenFile == "" {
+		tokenFile = "<token-file>"
+	}
+	return "rejoin with a fresh token (k3sm token create on the control-plane Mac): " +
+		"sudo k3sm install --agent --server " + server + " --token-file " + tokenFile +
+		", which re-issues this node's certificate for the assigned address"
+}
+
+// warnNoDatapathInternalIP says out loud what address a `--network none` worker
+// has just registered, on the one backend that plumbs nothing to reach it with.
+//
+// Every other backend brings the wireguard mesh up, so the InternalIP a node
+// advertises is an address that exists on this Mac. Under `--network none`
+// (control-plane-only / CI joins) it is the assigned mesh address and nothing
+// on this Mac holds or routes it: the apiserver's :10250 dial and cross-node
+// Service traffic both arrive over a tunnel this process did not start. The
+// node still registers, which is what the mode is for, so this is a WARN
+// naming the address rather than a refusal.
+func warnNoDatapathInternalIP(logger *slog.Logger, mode hostnet.Mode, internalIP string) {
+	if mode.DataPath() {
+		return
+	}
+	logger.Warn("this node registers its assigned MESH address as its InternalIP, and --network none brings up no mesh: that address is reachable only over the wireguard tunnel this process is not running, so the apiserver's :10250 dial (kubectl logs/exec) and cross-node Service traffic do not arrive here",
+		"internalIP", internalIP, "network", "none")
 }
 
 // meshDatapath is the consumer-side view of the wireguard mesh bringUpMesh

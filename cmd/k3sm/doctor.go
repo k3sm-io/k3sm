@@ -414,6 +414,18 @@ func checkAgentDaemon(env doctorEnv) checkResult {
 			detail: fmt.Sprintf("the stored node credential in %s does not parse", agentCredentialDir()),
 			remedy: fmt.Sprintf("remove the unparseable credential under %s to force a fresh token join\n%s", agentCredentialDir(), rejoin),
 		}
+	case status.CredentialAddressMismatch:
+		// WARN like every other credential fault here (statusFail is reserved
+		// for a daemon that is not running); the `k3sm status` agent row is the
+		// one that carries the FAIL, because it is the row an operator reads
+		// when a node they can see is a node they cannot exec into.
+		return checkResult{
+			name:   name,
+			status: statusWarn,
+			detail: fmt.Sprintf("the kubelet serving certificate in %s names a different address than the one this node is assigned: the control plane's own dial to this node fails, and until you rejoin the old certificate still answers for that address on this Mac's kubelet port; rejoin soon",
+				agentCredentialDir()),
+			remedy: rejoin,
+		}
 	case status.CredentialValid:
 		return checkResult{name: name, status: statusPass, detail: fmt.Sprintf(
 			"%s is running and this node's credential is valid until %s",

@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -73,6 +74,14 @@ const (
 	Expired
 	// Valid: present, parseable, matched, and in date.
 	Valid
+	// AddressMismatch: present, parseable, matched and in date, but the kubelet
+	// serving certificate does not name the mesh address the server assigned
+	// this node. The credential still authenticates to the apiserver; what fails
+	// is the apiserver's dial BACK to this node's :10250, which it verifies
+	// against the cluster CA and the Node's InternalIP. It is appended after
+	// Valid because the four states above are the ones every caller already
+	// switches on, and the numbers behind them are read out of stored reports.
+	AddressMismatch
 )
 
 // String renders the state for logs and reports.
@@ -86,6 +95,8 @@ func (s State) String() string {
 		return "expired"
 	case Valid:
 		return "valid"
+	case AddressMismatch:
+		return "address-mismatch"
 	}
 	return fmt.Sprintf("State(%d)", int(s))
 }
@@ -152,6 +163,44 @@ type Credential struct {
 
 	ClientNotAfter  time.Time
 	ServingNotAfter time.Time
+	// ServingIPSANs are the IP SANs of the stored kubelet serving certificate,
+	// in the certificate's own order. They are the addresses the apiserver can
+	// verify this node's :10250 as, so they are carried out of the load rather
+	// than re-parsed by every caller that needs to compare one.
+	ServingIPSANs []string
+}
+
+// AddressMismatch reports whether the stored kubelet serving certificate names
+// an address, but not the one the server assigned this node.
+//
+// It is the on-disk form of a fault an operator cannot otherwise see. The
+// apiserver dials a node's :10250 at the InternalIP the Node object advertises,
+// with --kubelet-certificate-authority set to the cluster CA, so the
+// certificate must carry that exact address as an IP SAN. A node that joined
+// while asserting a --node-ip the server did not assign holds a certificate for
+// the address it asserted; since the resume path registers the ASSIGNED address
+// as the InternalIP, every kubectl logs/exec against that node fails the TLS
+// handshake, and nothing in the cluster names the cause.
+//
+// Two arms are deliberately NOT a mismatch. An assignment with no mesh address
+// leaves nothing to compare against, and a certificate with no IP SAN at all is
+// a shape this cluster's join cannot produce (the approver binds exactly the
+// assigned address), so both are left to the checks that own them rather than
+// reported as the wrong address.
+func (c *Credential) AddressMismatch() bool {
+	if c == nil || c.Assignment.MeshIP == "" || len(c.ServingIPSANs) == 0 {
+		return false
+	}
+	assigned := net.ParseIP(c.Assignment.MeshIP)
+	if assigned == nil {
+		return false
+	}
+	for _, san := range c.ServingIPSANs {
+		if ip := net.ParseIP(san); ip != nil && ip.Equal(assigned) {
+			return false
+		}
+	}
+	return true
 }
 
 // Store is the agent work dir viewed as the home of one node's persisted join
@@ -237,6 +286,11 @@ func (s Store) Status(now time.Time) (State, *Credential, error) {
 		return Expired, cred, nil
 	case !cred.ClientNotAfter.After(now.Add(ExpiryMargin)):
 		return Expired, cred, nil
+	case cred.AddressMismatch():
+		// AFTER expiry, because the two share a remedy (rejoin with a fresh
+		// token) and an expired credential is the one an agent start can still
+		// recover from on its own.
+		return AddressMismatch, cred, nil
 	}
 	return Valid, cred, nil
 }
@@ -268,7 +322,7 @@ func (s Store) load(fsys FS) (*Credential, error) {
 	// the private key belongs to the certificate. A mismatched pair
 	// authenticates as nothing, and would otherwise surface as an opaque TLS
 	// handshake failure against the apiserver long after start.
-	clientNotAfter, err := keyPairNotAfter(clientCertPEM, clientKeyPEM)
+	clientLeaf, err := keyPairLeaf(clientCertPEM, clientKeyPEM)
 	if err != nil {
 		return nil, corruptCredential(kubeconfigPath, fmt.Errorf("node client keypair: %w", err))
 	}
@@ -281,7 +335,7 @@ func (s Store) load(fsys FS) (*Credential, error) {
 	if err != nil {
 		return nil, corruptCredential(s.ServingKeyPath(), err)
 	}
-	servingNotAfter, err := keyPairNotAfter(servingCertPEM, servingKeyPEM)
+	servingLeaf, err := keyPairLeaf(servingCertPEM, servingKeyPEM)
 	if err != nil {
 		return nil, corruptCredential(s.ServingCertPath(), fmt.Errorf("kubelet serving keypair: %w", err))
 	}
@@ -316,8 +370,9 @@ func (s Store) load(fsys FS) (*Credential, error) {
 		ServingKeyPEM:   servingKeyPEM,
 		ClientCAPEM:     clientCAPEM,
 		Assignment:      assignment,
-		ClientNotAfter:  clientNotAfter,
-		ServingNotAfter: servingNotAfter,
+		ClientNotAfter:  clientLeaf.NotAfter,
+		ServingNotAfter: servingLeaf.NotAfter,
+		ServingIPSANs:   ipSANs(servingLeaf),
 	}, nil
 }
 
@@ -328,21 +383,31 @@ func corruptCredential(path string, err error) error {
 	return fmt.Errorf("stored node credential %s is unusable: %w; remove it to force a fresh token join", path, err)
 }
 
-// keyPairNotAfter proves certPEM and keyPEM are a matching pair and returns the
-// leaf's NotAfter.
-func keyPairNotAfter(certPEM, keyPEM []byte) (time.Time, error) {
+// keyPairLeaf proves certPEM and keyPEM are a matching pair and returns the
+// parsed leaf — its NotAfter is the expiry rule's input, and its IP SANs are
+// the addresses it can be served on.
+func keyPairLeaf(certPEM, keyPEM []byte) (*x509.Certificate, error) {
 	pair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	if len(pair.Certificate) == 0 {
-		return time.Time{}, errors.New("keypair carries no certificate")
+		return nil, errors.New("keypair carries no certificate")
 	}
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	if err != nil {
-		return time.Time{}, err
+	return x509.ParseCertificate(pair.Certificate[0])
+}
+
+// ipSANs renders a leaf's IP SANs as strings, so a comparison and a log line
+// read the same list.
+func ipSANs(leaf *x509.Certificate) []string {
+	if len(leaf.IPAddresses) == 0 {
+		return nil
 	}
-	return leaf.NotAfter, nil
+	out := make([]string, 0, len(leaf.IPAddresses))
+	for _, ip := range leaf.IPAddresses {
+		out = append(out, ip.String())
+	}
+	return out
 }
 
 // decodeCertPEM decodes a single CERTIFICATE PEM block.
