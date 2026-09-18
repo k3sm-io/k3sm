@@ -46,6 +46,14 @@ type joinServerRig struct {
 	ts       *httptest.Server
 	token    string
 	assigned string
+	// passwords is the server's node-password store, so a test can ask what a
+	// refused join did NOT bind. "The request was refused" and "no name was
+	// bound" are different claims (the fakeEnroller's counters make the same
+	// distinction), and for the self-name guard the second one is the point.
+	passwords *bootstrap.MemoryNodePasswords
+	// signingCA is the issuer of the system:node client cert, kept so a test can
+	// verify what an ALLOWED join received.
+	signingCA *certs.CA
 }
 
 // newNodeAddressRig is the fixed-assignment rig the address gates use: every node
@@ -57,8 +65,17 @@ func newNodeAddressRig(t *testing.T, assignedMeshIP string) *joinServerRig {
 	return rig
 }
 
-// newJoinServerRig stands the bootstrap server up over enroller.
+// newJoinServerRig stands the bootstrap server up over enroller, with NO
+// self-node-name configured (the posture every gate but the self-name one is
+// about).
 func newJoinServerRig(t *testing.T, enroller bootstrap.Enroller) *joinServerRig {
+	t.Helper()
+	return newSelfNameJoinServerRig(t, enroller, "")
+}
+
+// newSelfNameJoinServerRig stands the same server up as the control-plane node
+// selfNodeName — the one join-server fixture, parameterised rather than copied.
+func newSelfNameJoinServerRig(t *testing.T, enroller bootstrap.Enroller, selfNodeName string) *joinServerRig {
 	t.Helper()
 	clusterCA, err := certs.NewCA("k3sm-cluster-ca")
 	if err != nil {
@@ -73,19 +90,26 @@ func newJoinServerRig(t *testing.T, enroller bootstrap.Enroller) *joinServerRig 
 	if err != nil {
 		t.Fatalf("create token: %v", err)
 	}
+	passwords := bootstrap.NewMemoryNodePasswords()
 	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
 		ClusterCA:     clusterCA,
 		SigningCA:     signingCA,
 		Tokens:        tokens,
-		NodePasswords: bootstrap.NewMemoryNodePasswords(),
+		NodePasswords: passwords,
 		Enroller:      enroller,
+		SelfNodeName:  selfNodeName,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return &joinServerRig{ts: ts, token: bootstrap.FormatToken(clusterCA.PinHash(), user, secret)}
+	return &joinServerRig{
+		ts:        ts,
+		token:     bootstrap.FormatToken(clusterCA.PinHash(), user, secret),
+		passwords: passwords,
+		signingCA: signingCA,
+	}
 }
 
 // post sends req and returns the status and the trimmed body.

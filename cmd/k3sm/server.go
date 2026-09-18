@@ -884,6 +884,21 @@ func runServer(args []string) (err error) {
 	// listener (EnrollSelf list-back verifies the index-0 claim, so no worker can be
 	// assigned index 0 in the window).
 	var enroller *meshEnroller
+	// The node-password store is built HERE, ahead of this node's own enroll, and
+	// the SAME instance is handed to the join supervisor at step 4d. One instance
+	// is the point: the binding this server takes for its OWN name has to live in
+	// the store the join handler checks, and a MemoryNodePasswords constructed
+	// twice would bind in an instance nobody reads.
+	//
+	// In HA the binding must be SHARED across servers (a name bound on A is
+	// enforced on B), so it is datastore-backed — a kube-system Secret on the one
+	// Postgres. A single multi-node server keeps the in-memory store, which is
+	// durable enough for a binding no other process has to see.
+	ha := opts.datastoreEndpoint != "" || opts.serverJoin
+	var nodePasswords bootstrap.NodePasswordStore = bootstrap.NewMemoryNodePasswords()
+	if ha {
+		nodePasswords = newSecretNodePasswords(cs)
+	}
 	// serverPodCIDR is the control-plane node's pod /24: the reserved index-0 carve
 	// of the cluster pod CIDR — the ONE value the routing-table locality (step 4c)
 	// and the node's podnet adapter (step 5) both allocate against.
@@ -899,7 +914,7 @@ func runServer(args []string) (err error) {
 			return fmt.Errorf("build mesh enroller: %w", err)
 		}
 		enroller = e
-		if res, down, err := enrollSelfAndBringUpMesh(ctx, enroller, opts, mode, exec.Kubeconfig(), logger); err != nil {
+		if res, down, err := enrollSelfAndBringUpMesh(ctx, enroller, nodePasswords, opts, mode, exec.Kubeconfig(), logger); err != nil {
 			logger.Error("server mesh bring-up failed; this node is NOT on its own mesh, so cross-node pod traffic to it has no path and its Service proxy will source backend dials from the kernel default", "err", err)
 			// A bring-up that failed part-way still owns a utun, so the handle is
 			// armed even here; it is a no-op when nothing came up.
@@ -977,19 +992,17 @@ func runServer(args []string) (err error) {
 	// index 0 through this same enroller).
 	if enroller != nil {
 		tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
-		// In HA the node-password binding must be SHARED across
-		// servers (a name bound on A is enforced on B), so it is datastore-backed (a
-		// kube-system Secret on the shared Postgres). A single multi-node server keeps
-		// the in-memory store.
-		ha := opts.datastoreEndpoint != "" || opts.serverJoin
-		var nodePasswords bootstrap.NodePasswordStore = bootstrap.NewMemoryNodePasswords()
-		if ha {
-			nodePasswords = newSecretNodePasswords(cs)
-		}
 		deps := bootstrapServerDeps{
-			hierarchy:     hierarchy,
-			meshIP:        opts.meshIP,
-			tokens:        tokens,
+			hierarchy: hierarchy,
+			meshIP:    opts.meshIP,
+			// THIS process's own node name, which the join handler refuses to serve
+			// any request for. It is opts.nodeName and never a cluster-wide value:
+			// in HA every server protects its own name here, and its siblings'
+			// names are protected by their own processes plus the shared
+			// node-password bindings step 4b takes.
+			selfNodeName: opts.nodeName,
+			tokens:       tokens,
+			// The store step 4b already bound this node's own name in.
 			nodePasswords: nodePasswords,
 			enroller:      enroller,
 			apiServers:    []string{fmt.Sprintf("%s:%d", opts.meshIP, opts.apiPort)},

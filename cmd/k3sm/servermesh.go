@@ -24,12 +24,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/podnet"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -58,6 +60,77 @@ const serverMeshListenPort = mesh.DefaultListenPort
 // share a key file (serverMeshKeyRef).
 func loadOrCreateServerMeshKey(workDir string) (privB64, pubB64 string, err error) {
 	return loadOrCreateMeshKey(workDir, serverMeshKeyRef)
+}
+
+// serverNodePasswordRef is the file name, under the server work dir, holding the
+// CONTROL-PLANE node's own node-password. It is spelled differently from the
+// agent's node-password file for the reason serverMeshKeyRef is: a server and a
+// joined worker can share one Mac, and two roles must never read each other's
+// credential because a directory was pointed at both.
+const serverNodePasswordRef = "server.node-password"
+
+// loadOrCreateServerNodePassword returns the CONTROL-PLANE node's persisted
+// node-password, minting a fresh high-entropy one 0600 under workDir on first
+// run — the server-side twin of the agent's loadOrCreateNodePassword.
+//
+// LOAD-OR-CREATE, not create: the node-password store binds a name to the FIRST
+// password it is shown and verifies every later presentation against that bcrypt
+// hash. In the HA posture that store is a Secret on the shared datastore, so it
+// outlives this process. A value re-minted on each start would therefore bind on
+// the first boot and be REFUSED on the second — this node's own name would be
+// unusable to it, and the failure would surface as a mesh bring-up error on a
+// daemon restart, long after the change that caused it. Persisting the value is
+// what makes the binding survive `launchctl kickstart`.
+//
+// An unreadable file is an ERROR, never a re-mint, for the same reason: a fresh
+// password would walk straight into the mismatch above and destroy the evidence
+// of whatever damaged the file.
+func loadOrCreateServerNodePassword(workDir string) (string, error) {
+	path := filepath.Join(workDir, serverNodePasswordRef)
+	if b, err := os.ReadFile(path); err == nil {
+		pw := strings.TrimSpace(string(b))
+		if pw == "" {
+			return "", fmt.Errorf("read the control-plane node-password %s: the file is empty", path)
+		}
+		return pw, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("read the control-plane node-password %s: %w", path, err)
+	}
+	pw, err := bootstrap.GenerateNodePassword()
+	if err != nil {
+		return "", fmt.Errorf("mint the control-plane node-password: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(pw), 0o600); err != nil {
+		return "", fmt.Errorf("persist the control-plane node-password: %w", err)
+	}
+	return pw, nil
+}
+
+// bindSelfNodePassword takes the first-write-wins node-password binding for this
+// control-plane node's OWN name, so no join can take it.
+//
+// The server enrolls itself directly and never passes through the join handler,
+// so before this its own name was simply UNBOUND: the first join to present that
+// name bound it and was then treated as that node for the rest of the exchange.
+// Binding it here closes that, and closes it for the case the join handler's name
+// guard cannot see — an HA sibling, whose SelfNodeName is its own and not this
+// one's, reads the SAME datastore-backed store and refuses the claim on the hash.
+//
+// A failure is returned, not logged: not holding your own name is exactly the
+// state this exists to prevent, and the caller's own posture (a logged,
+// survivable mesh bring-up failure) is the right place for it to land.
+func bindSelfNodePassword(ctx context.Context, passwords bootstrap.NodePasswordStore, nodeName, workDir string) error {
+	if passwords == nil {
+		return fmt.Errorf("bind the node-password of %q: no node-password store", nodeName)
+	}
+	pw, err := loadOrCreateServerNodePassword(workDir)
+	if err != nil {
+		return err
+	}
+	if err := passwords.Ensure(ctx, nodeName, pw); err != nil {
+		return fmt.Errorf("bind the node-password of this control-plane node %q: %w", nodeName, err)
+	}
+	return nil
 }
 
 // serverMeshEndpoint is the address:port a joining worker dials to reach this
@@ -197,11 +270,12 @@ func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 	}
 }
 
-// enrollSelfAndBringUpMesh is the control-plane node's own mesh join: it loads
-// (or mints) this node's persistent wireguard identity, asserts-or-creates its
-// index-0 MeshPeer through the SAME locked enroller the worker-join RPC uses,
-// and brings the wireguard device up against the peer snapshot the enroll
-// returned.
+// enrollSelfAndBringUpMesh is the control-plane node's own mesh join: it binds
+// this node's name in the node-password store no worker join can then claim,
+// loads (or mints) this node's persistent wireguard identity,
+// asserts-or-creates its index-0 MeshPeer through the SAME locked enroller the
+// worker-join RPC uses, and brings the wireguard device up against the peer
+// snapshot the enroll returned.
 //
 // It returns the enrolled identity so the caller can seed the node-local
 // datapath with the mesh-egress source the proxy binds and the peer mesh-egress
@@ -219,7 +293,13 @@ func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 // index-0 claim is what keeps a worker's assignment off this node's /24, and that
 // is true whether or not this process plumbs a wireguard device. Only the DEVICE
 // bring-up is gated on the datapath.
-func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, opts serverOptions, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
+func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bootstrap.NodePasswordStore, opts serverOptions, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
+	// The name binding comes FIRST, before this node has written anything of its
+	// own: it is the claim on this node's identity, and the store it lands in is
+	// the one every worker join is checked against.
+	if err := bindSelfNodePassword(ctx, passwords, opts.nodeName, opts.workDir); err != nil {
+		return netv1.MeshEnrollResponse{}, noMeshTeardown, err
+	}
 	priv, pub, err := loadOrCreateServerMeshKey(opts.workDir)
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, noMeshTeardown, err

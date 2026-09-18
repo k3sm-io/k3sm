@@ -48,6 +48,19 @@ type ServerConfig struct {
 	Tokens TokenVerifier
 	// NodePasswords binds + verifies the anti-impersonation node-password.
 	NodePasswords NodePasswordStore
+	// SelfNodeName is the node name of the CONTROL-PLANE PROCESS SERVING THIS
+	// ENDPOINT, and a join claiming it is refused outright (handleJoin).
+	//
+	// It is per-process on purpose. Every control-plane process protects ITS OWN
+	// name, so in HA each server carries a different value here and none of them
+	// needs a cluster-wide list of server names to keep its own identity: a
+	// sibling's name is protected by that sibling's binding, not by this one.
+	//
+	// Empty leaves the name guard OFF (NewServer says so once at start). It is
+	// deliberately not a hard construction error, because a supervisor that
+	// refuses to serve is a worse failure than one whose first layer is absent
+	// while the node-password binding and the enroller's index guard still stand.
+	SelfNodeName string
 	// Enroller performs the controller-mediated mesh enroll (MeshPeer write + peer
 	// snapshot).
 	Enroller Enroller
@@ -97,6 +110,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
+	if strings.TrimSpace(cfg.SelfNodeName) == "" {
+		// Said ONCE, at construction, rather than per request: an unconfigured
+		// guard is a wiring defect that does not vary with traffic, and a
+		// per-request line would bury it. Loud here beats silent everywhere.
+		cfg.Logger.Warn("the bootstrap server has no SelfNodeName: a join claiming this control plane's own node name is not refused by name, leaving only the node-password binding and the enroller's index guard behind it")
 	}
 	return &Server{cfg: cfg}, nil
 }
@@ -158,6 +177,37 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.NodeName == "" {
 		http.Error(w, "join request missing nodeName", http.StatusBadRequest)
+		return
+	}
+
+	// 1a. THIS CONTROL PLANE'S OWN NAME IS NOT JOINABLE, and that is decided
+	// before anything identity-bearing happens — before the node-password store
+	// is consulted, before the enroll writes a MeshPeer, before a certificate is
+	// signed.
+	//
+	// The server's node name is derived from its hostname and is not a secret, so
+	// without this a holder of an ordinary worker join token could simply ask to
+	// BE the control plane: nothing had ever bound the server's own name in the
+	// node-password store (the server enrolls itself directly and never goes
+	// through this handler), so first-write-wins would hand the binding to the
+	// caller, the enroll would reuse the server's existing index-0 assignment,
+	// the MeshPeer write would replace the control plane's public key and
+	// endpoint with the caller's, and the handler would then sign a
+	// system:node:<server> client certificate for it.
+	//
+	// The refusal is by NAME, so it costs nothing and cannot be raced. The other
+	// two layers — the server binding its own node-password at start, and the
+	// enroller refusing a join-path write over the peer that holds the
+	// control-plane index — stand behind it for the cases a name cannot see: an
+	// HA sibling's name, and any path that ever reaches the enroller without
+	// passing here.
+	if selfNameClaimed(s.cfg.SelfNodeName, req.NodeName) {
+		s.cfg.Logger.Warn("join rejected", "reason", "self-node-name",
+			"node", req.NodeName, "selfNodeName", s.cfg.SelfNodeName, "remote", r.RemoteAddr)
+		// The body says only that the name cannot be joined. The caller already
+		// knows the name it sent; it learns nothing here about which names are
+		// taken, what this node is called, or how far the request got.
+		http.Error(w, "join refused: that node name is not available", http.StatusForbidden)
 		return
 	}
 
@@ -391,6 +441,22 @@ func bearerToken(r *http.Request) string {
 		return strings.TrimSpace(strings.TrimPrefix(h, prefix))
 	}
 	return h
+}
+
+// selfNameClaimed reports whether a join request claims the control plane's own
+// node name. An empty selfNodeName matches nothing — the guard is off, which
+// NewServer has already said out loud.
+//
+// The comparison is trimmed and CASE-INSENSITIVE because it is a refusal, not a
+// lookup: a Kubernetes node name is lowercase RFC-1123 by rule, so a request
+// differing only in case is never a legitimate second node, and matching it
+// exactly would leave the cheapest possible bypass of this whole guard.
+func selfNameClaimed(selfNodeName, requested string) bool {
+	self := strings.TrimSpace(selfNodeName)
+	if self == "" {
+		return false
+	}
+	return strings.EqualFold(self, strings.TrimSpace(requested))
 }
 
 // parseCSR decodes a PEM CERTIFICATE REQUEST and parses it.
