@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,18 +34,31 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 )
 
-// nodeAddressRig is a bootstrap server whose enroller assigns a fixed mesh
-// address, plus the raw HTTP means to POST a hand-built JoinRequest at it — which
-// is how a claim about ORDER ("refused before any CSR is parsed") is made
-// observable: only a request carrying a deliberately unparseable CSR can tell the
-// two orderings apart.
-type nodeAddressRig struct {
+// joinServerRig is a live bootstrap server over httptest — the REAL handler, real
+// CAs, a real token store and a caller-supplied enroller — plus the raw HTTP means
+// to POST a hand-built JoinRequest at it. The hand-built request is what makes a
+// claim about ORDER observable: only a request whose CSR is deliberately bad can
+// tell "refused before the enroll" from "refused after it".
+//
+// It is the one join-server fixture in this package; a test that needs different
+// allocator behaviour supplies a different enroller, never a second harness.
+type joinServerRig struct {
 	ts       *httptest.Server
 	token    string
 	assigned string
 }
 
-func newNodeAddressRig(t *testing.T, assignedMeshIP string) *nodeAddressRig {
+// newNodeAddressRig is the fixed-assignment rig the address gates use: every node
+// is assigned assignedMeshIP.
+func newNodeAddressRig(t *testing.T, assignedMeshIP string) *joinServerRig {
+	t.Helper()
+	rig := newJoinServerRig(t, &fakeEnroller{podCIDR: "100.64.1.0/24", meshIP: assignedMeshIP})
+	rig.assigned = assignedMeshIP
+	return rig
+}
+
+// newJoinServerRig stands the bootstrap server up over enroller.
+func newJoinServerRig(t *testing.T, enroller bootstrap.Enroller) *joinServerRig {
 	t.Helper()
 	clusterCA, err := certs.NewCA("k3sm-cluster-ca")
 	if err != nil {
@@ -64,18 +78,18 @@ func newNodeAddressRig(t *testing.T, assignedMeshIP string) *nodeAddressRig {
 		SigningCA:     signingCA,
 		Tokens:        tokens,
 		NodePasswords: bootstrap.NewMemoryNodePasswords(),
-		Enroller:      &fakeEnroller{podCIDR: "100.64.1.0/24", meshIP: assignedMeshIP},
+		Enroller:      enroller,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return &nodeAddressRig{ts: ts, token: bootstrap.FormatToken(clusterCA.PinHash(), user, secret), assigned: assignedMeshIP}
+	return &joinServerRig{ts: ts, token: bootstrap.FormatToken(clusterCA.PinHash(), user, secret)}
 }
 
 // post sends req and returns the status and the trimmed body.
-func (r *nodeAddressRig) post(t *testing.T, req bootstrap.JoinRequest) (int, string) {
+func (r *joinServerRig) post(t *testing.T, req bootstrap.JoinRequest) (int, string) {
 	t.Helper()
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -131,7 +145,7 @@ func TestJoinIssuesForTheAssignedNodeAddress(t *testing.T) {
 		}
 	})
 
-	t.Run("a mismatching nodeIP is refused before the CSR is parsed", func(t *testing.T) {
+	t.Run("a mismatching nodeIP is refused before any certificate is issued", func(t *testing.T) {
 		t.Parallel()
 		rig := newNodeAddressRig(t, "100.64.1.1")
 		status, reason := rig.post(t, bootstrap.JoinRequest{
@@ -140,9 +154,11 @@ func TestJoinIssuesForTheAssignedNodeAddress(t *testing.T) {
 			NodeName:      "worker-1",
 			NodeIP:        "100.64.7.7",
 			NodePassword:  "pw",
-			// Unparseable on purpose: if the handler ever reads the CSR first, this
-			// comes back as a 400 about the CSR and the row goes red.
-			ClientCSRPEM: "-----BEGIN CERTIFICATE REQUEST-----\nnot base64\n-----END CERTIFICATE REQUEST-----",
+			// A CSR the server would happily sign, so the only thing that can refuse
+			// this request is the address gate: if it ever stopped firing, the row
+			// comes back 200 with a certificate naming an address the allocator gave
+			// no one.
+			ClientCSRPEM: nodeCSRPEM(t, "worker-1", []string{"worker-1"}, []net.IP{net.ParseIP("100.64.7.7")}),
 			Mesh:         netv1.MeshEnrollRequest{NodeName: "worker-1"}.WithDefaults(),
 		})
 		if status != http.StatusConflict {
@@ -154,7 +170,10 @@ func TestJoinIssuesForTheAssignedNodeAddress(t *testing.T) {
 			}
 		}
 		if strings.Contains(strings.ToUpper(reason), "CSR") {
-			t.Errorf("refusal %q names the CSR, so the CSR was read first", reason)
+			t.Errorf("refusal %q names the CSR, so the address gate is not what refused this", reason)
+		}
+		if strings.Contains(reason, "CERTIFICATE") {
+			t.Errorf("refusal %q carries a certificate", reason)
 		}
 		// Nothing about the allocator beyond the two addresses in play.
 		if strings.Contains(reason, "100.64.1.0/24") || strings.Contains(strings.ToLower(reason), "peer") {
@@ -189,7 +208,10 @@ func TestJoinIssuesForTheAssignedNodeAddress(t *testing.T) {
 			NodeName:      "worker-1",
 			NodeIP:        "100.64.7.7",
 			NodePassword:  "pw",
-			Mesh:          netv1.MeshEnrollRequest{NodeName: "worker-1"}.WithDefaults(),
+			// Well-formed, so the request reaches the enroll that has nothing to
+			// assign — which is the arm under test.
+			ClientCSRPEM: nodeCSRPEM(t, "worker-1", []string{"worker-1"}, nil),
+			Mesh:         netv1.MeshEnrollRequest{NodeName: "worker-1"}.WithDefaults(),
 		})
 		if status != http.StatusInternalServerError {
 			t.Fatalf("status = %d (%s), want 500: an enroll with no assigned address cannot yield a certificate", status, reason)

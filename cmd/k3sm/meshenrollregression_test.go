@@ -161,9 +161,12 @@ func TestMeshEnrollerCreatesAndRejoinsUnchanged(t *testing.T) {
 		Endpoint:  "192.0.2.10:51820",
 	}
 
-	got, err := enroller.Enroll(context.Background(), "worker-a", req)
+	got, alloc, err := enroller.Enroll(context.Background(), "worker-a", req)
 	if err != nil {
 		t.Fatalf("first Enroll: %v", err)
+	}
+	if alloc != bootstrap.AllocationFresh {
+		t.Errorf("first enroll reported %v, want fresh: a join that fails afterwards can only give this index back if the enroll says it carved one", alloc)
 	}
 	if got.PodCIDR != "100.64.1.0/24" {
 		t.Errorf("first enroll podCIDR = %q, want 100.64.1.0/24 (index 0 is the control-plane node)", got.PodCIDR)
@@ -192,9 +195,12 @@ func TestMeshEnrollerCreatesAndRejoinsUnchanged(t *testing.T) {
 	// would strand every route the peers already programmed) and the write must be
 	// an update, not a failed create.
 	req.Endpoint = "192.0.2.11:51820"
-	again, err := enroller.Enroll(context.Background(), "worker-a", req)
+	again, rejoinAlloc, err := enroller.Enroll(context.Background(), "worker-a", req)
 	if err != nil {
 		t.Fatalf("rejoin Enroll: %v", err)
+	}
+	if rejoinAlloc != bootstrap.AllocationReused {
+		t.Errorf("rejoin reported %v, want reused: a rejoin's peer belongs to the earlier successful join and must never be reaped", rejoinAlloc)
 	}
 	if again.PodCIDR != got.PodCIDR {
 		t.Errorf("rejoin podCIDR = %q, want the original %q", again.PodCIDR, got.PodCIDR)
@@ -211,11 +217,12 @@ func TestMeshEnrollerCreatesAndRejoinsUnchanged(t *testing.T) {
 }
 
 // meshPeerAPIStub is an in-memory stand-in for the apiserver's meshpeers REST
-// surface: list, create (409 on a duplicate), get by name, and update.
+// surface: list, create (409 on a duplicate), get by name, update, and delete
+// (404 when absent — the shape ReleaseAllocation's idempotence reads).
 type meshPeerAPIStub struct {
-	mu               sync.Mutex
-	peers            map[string]*netv1.MeshPeer
-	creates, updates int
+	mu                        sync.Mutex
+	peers                     map[string]*netv1.MeshPeer
+	creates, updates, deletes int
 }
 
 func newMeshPeerAPIStub() *meshPeerAPIStub {
@@ -275,6 +282,14 @@ func (s *meshPeerAPIStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.peers[name] = &in
 		s.updates++
 		writeJSON(w, http.StatusOK, &in)
+	case r.Method == http.MethodDelete:
+		if _, ok := s.peers[name]; !ok {
+			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound)
+			return
+		}
+		delete(s.peers, name)
+		s.deletes++
+		writeStatus(w, http.StatusOK, metav1.StatusReasonUnknown)
 	default:
 		writeStatus(w, http.StatusMethodNotAllowed, metav1.StatusReasonMethodNotAllowed)
 	}

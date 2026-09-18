@@ -196,13 +196,61 @@ type BundleSource interface {
 	SealedBundle(ctx context.Context) ([]byte, error)
 }
 
+// Allocation says what an Enroll did with the cluster's pod-CIDR index space for
+// the node it enrolled: it ALLOCATED a fresh index, or it REUSED the one an
+// earlier join already assigned that name.
+//
+// The distinction exists for exactly one caller — a join that fails on the far
+// side of the enroll (see Server.releaseFresh). A fresh allocation belongs to the
+// failing join and nothing else, so it is released; a reused one belongs to an
+// earlier SUCCESSFUL join, and deleting it would strand a live node's pod network
+// on a failure that never touched it.
+type Allocation int
+
+const (
+	// AllocationReused is the node's existing assignment, carried forward. It is
+	// the ZERO VALUE deliberately: an enroller that cannot tell the two apart
+	// reports "reused", and a reused allocation is never reaped — so the failure
+	// mode of an unconverted implementation is a leaked index, never a deleted
+	// peer belonging to a running node.
+	AllocationReused Allocation = iota
+	// AllocationFresh is an index this Enroll carved for a name that held none.
+	AllocationFresh
+)
+
+// String renders the allocation for logs.
+func (a Allocation) String() string {
+	if a == AllocationFresh {
+		return "fresh"
+	}
+	return "reused"
+}
+
 // Enroller performs the controller-mediated mesh enroll: it assigns the node's
 // podCIDR + mesh-egress IP, writes the node's MeshPeer (named == nodeName, so the
 // write-guard holds), and returns the current peer snapshot for the node to program
 // immediately. The implementation (cmd wiring) holds the apiserver client + the
 // podnet allocator, keeping that dependency out of this package.
 type Enroller interface {
-	Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error)
+	// Enroll assigns and writes the node's MeshPeer, reporting whether the
+	// assignment was FRESH or REUSED (see Allocation). The report is part of the
+	// contract rather than a detail: it is the only thing that tells a failing
+	// join whether the peer it is looking at is its own to release.
+	Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, Allocation, error)
+	// ReleaseAllocation deletes the MeshPeer a FRESH Enroll wrote for nodeName,
+	// after the join that carved it failed — freeing the pod /24 for the next node
+	// instead of burning it. It is idempotent (an already-absent peer is success)
+	// and it VERIFIES by list-back that the index is free again, because "the
+	// delete returned nil" and "the index can be assigned again" are different
+	// claims and only the second one is the point.
+	//
+	// It removes the MeshPeer ONLY. Unlike Deregister it never touches the Node
+	// object: a join that failed at its CSR never got far enough to register one,
+	// and a Node that does exist under that name belongs to some earlier join.
+	//
+	// It runs under the SAME lock as Enroll, so a concurrent join of another node
+	// cannot be handed this index between the failure and the release.
+	ReleaseAllocation(ctx context.Context, nodeName string) error
 	// RefreshEndpoint updates ONLY spec.endpoint on the node's EXISTING MeshPeer.
 	// It never creates one: a node whose peer is gone has lost its podCIDR
 	// assignment too, and inventing a peer here would hand it an endpoint with no

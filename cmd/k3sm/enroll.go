@@ -96,13 +96,19 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 }
 
 // Enroll implements bootstrap.Enroller.
-func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
+//
+// The reported bootstrap.Allocation is the reuse-vs-carve decision below, carried
+// out to the caller: only a join that knows it carved a FRESH index can give that
+// index back when it fails afterwards (bootstrap.Enroller.ReleaseAllocation). It
+// is reported on the error paths that follow the write too — an enroll whose
+// snapshot LIST fails has still written the peer.
+func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	existing, err := e.listPeers(ctx)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("list mesh peers: %w", err)
+		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("list mesh peers: %w", err)
 	}
 
 	// Reuse this node's already-assigned CIDR on a rejoin; else assign the next /24.
@@ -112,45 +118,91 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 			podCIDR = p.PodCIDR
 		}
 	}
+	alloc := bootstrap.AllocationReused
 	if podCIDR == "" {
+		alloc = bootstrap.AllocationFresh
 		index, err := lowestFreeNodeIndex(e.clusterPod, existing)
 		if err != nil {
-			return netv1.MeshEnrollResponse{}, fmt.Errorf("assign podCIDR: %w", err)
+			return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("assign podCIDR: %w", err)
 		}
 		cidr, err := podnet.NodeCIDR(e.clusterPod, index)
 		if err != nil {
-			return netv1.MeshEnrollResponse{}, fmt.Errorf("assign podCIDR: %w", err)
+			return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("assign podCIDR: %w", err)
 		}
 		podCIDR = cidr.String()
 	}
 	prefix, err := netip.ParsePrefix(podCIDR)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("parse assigned podCIDR %q: %w", podCIDR, err)
+		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("parse assigned podCIDR %q: %w", podCIDR, err)
 	}
 	meshIP, err := podnet.MeshEgressIP(prefix)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("derive mesh-egress IP: %w", err)
+		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, fmt.Errorf("derive mesh-egress IP: %w", err)
 	}
 
 	peer, err := bootstrap.BuildMeshPeer(nodeName, podCIDR, meshIP.String(), req)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, err
+		return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, err
 	}
+	// Past this point the peer may exist, so the real allocation is reported: the
+	// failures below are the ones whose orphan a caller has to be able to reap.
 	if err := e.writePeer(ctx, peer); err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
+		return netv1.MeshEnrollResponse{}, alloc, fmt.Errorf("write mesh peer %q: %w", nodeName, err)
 	}
 
 	// Snapshot the (now-current) peer set for the joining node to program immediately.
 	peers, err := e.listPeers(ctx)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, fmt.Errorf("snapshot mesh peers: %w", err)
+		return netv1.MeshEnrollResponse{}, alloc, fmt.Errorf("snapshot mesh peers: %w", err)
 	}
 	return netv1.MeshEnrollResponse{
 		NodeName: nodeName,
 		PodCIDR:  podCIDR,
 		MeshIP:   meshIP.String(),
 		Peers:    peers,
-	}.WithDefaults(), nil
+	}.WithDefaults(), alloc, nil
+}
+
+// ReleaseAllocation implements bootstrap.Enroller: it deletes the MeshPeer a FRESH
+// Enroll wrote for a join that then failed, so the pod /24 it carved goes back to
+// lowestFreeNodeIndex instead of being burned. Index recycling across node DELETES
+// is a separate, unimplemented concern; this is only the undo of an allocation the
+// same request just made.
+//
+// It removes the MeshPeer and NOTHING else — unlike Deregister, which also deletes
+// the Node. A join that failed at its CSR never registered a Node, and one that
+// exists under that name belongs to an earlier join this call has no business
+// touching.
+//
+// It LIST-BACK VERIFIES, for the reason EnrollSelf does: returning nil here is the
+// claim that the index is assignable again, and that has to be read from the
+// apiserver rather than inferred from a delete that returned no error. A NotFound
+// on the delete is success — the reap is idempotent, and a peer that is already
+// gone is exactly the state asked for.
+//
+// It runs under the SAME mutex as Enroll, so a concurrent join cannot be handed
+// this index between the failure and the release.
+func (e *meshEnroller) ReleaseAllocation(ctx context.Context, nodeName string) error {
+	if nodeName == "" {
+		return errors.New("release allocation: no node name")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if err := e.client.Delete().Resource(meshPeerResource).Name(nodeName).Do(ctx).Error(); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete mesh peer %q: %w", nodeName, err)
+	}
+	peers, err := e.listPeers(ctx)
+	if err != nil {
+		return fmt.Errorf("verify the release of mesh peer %q: %w", nodeName, err)
+	}
+	for _, p := range peers {
+		if p.NodeName == nodeName {
+			return fmt.Errorf("verify the release of mesh peer %q: it still holds %s", nodeName, p.PodCIDR)
+		}
+	}
+	e.log.Info("released the mesh allocation of a failed join", "node", nodeName)
+	return nil
 }
 
 // serverNodeIndex is the node index the CONTROL-PLANE node's pod /24 is carved

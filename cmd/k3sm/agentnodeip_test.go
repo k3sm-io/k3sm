@@ -19,7 +19,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -52,24 +56,35 @@ type assigningEnroller struct {
 	next     int
 }
 
-func (e *assigningEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
+func (e *assigningEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.assigned == nil {
 		e.assigned = map[string]string{}
 		e.next = 1
 	}
+	alloc := bootstrap.AllocationReused
 	cidr, ok := e.assigned[nodeName]
 	if !ok {
 		cidr = fmt.Sprintf("100.64.%d.0/24", e.next)
 		e.assigned[nodeName] = cidr
 		e.next++
+		alloc = bootstrap.AllocationFresh
 	}
 	return netv1.MeshEnrollResponse{
 		NodeName: nodeName,
 		PodCIDR:  cidr,
 		MeshIP:   strings.TrimSuffix(cidr, ".0/24") + ".1",
-	}.WithDefaults(), nil
+	}.WithDefaults(), alloc, nil
+}
+
+// ReleaseAllocation drops the node's assignment, mirroring the shipped enroller's
+// reap of a join that failed after the enroll carved its index.
+func (e *assigningEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.assigned, nodeName)
+	return nil
 }
 
 func (e *assigningEnroller) RefreshEndpoint(context.Context, string, string) error { return nil }
@@ -131,6 +146,25 @@ func (r *joinRig) join(ctx context.Context, nodeName, nodeIP string) (*bootstrap
 }
 
 // certIPSANs parses a PEM certificate and returns its IP SANs as strings.
+// nodeCSRPEM mints a keypair and returns the PEM CSR a joining node submits — one
+// this server would sign, so a refusal of a request carrying it is a refusal by
+// something other than the CSR.
+func nodeCSRPEM(t *testing.T, nodeName string) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject:  pkix.Name{CommonName: "system:node:" + nodeName, Organization: []string{"system:nodes"}},
+		DNSNames: []string{nodeName},
+	}, key)
+	if err != nil {
+		t.Fatalf("create CSR: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))
+}
+
 func certIPSANs(t *testing.T, certPEM []byte) []string {
 	t.Helper()
 	block, _ := pem.Decode(certPEM)
@@ -215,15 +249,16 @@ func TestAgentJoinDerivesTheNodeIPFromTheAssignment(t *testing.T) {
 			}
 		}
 
-		// The refusal lands BEFORE any CSR is parsed: a request whose CSR is
-		// unparseable garbage is still refused for the address, not for the CSR.
+		// The refusal lands BEFORE anything is signed: a request carrying a CSR the
+		// server would otherwise sign is still refused for the address, and comes
+		// back with no certificate in it.
 		body, merr := json.Marshal(bootstrap.JoinRequest{
 			SchemaVersion: bootstrap.JoinSchemaVersion,
 			Token:         rig.token,
 			NodeName:      "worker-a",
 			NodeIP:        "100.64.9.9",
 			NodePassword:  "node-secret-worker-a",
-			ClientCSRPEM:  "not a CSR at all",
+			ClientCSRPEM:  nodeCSRPEM(t, "worker-a"),
 			Mesh:          netv1.MeshEnrollRequest{NodeName: "worker-a"}.WithDefaults(),
 		})
 		if merr != nil {
@@ -238,10 +273,13 @@ func TestAgentJoinDerivesTheNodeIPFromTheAssignment(t *testing.T) {
 		n, _ := resp.Body.Read(raw)
 		reason := strings.TrimSpace(string(raw[:n]))
 		if resp.StatusCode != http.StatusConflict {
-			t.Errorf("status = %s (%s), want 409 Conflict: the address mismatch is decided before the CSR is read", resp.Status, reason)
+			t.Errorf("status = %s (%s), want 409 Conflict: the address mismatch is what refuses this join", resp.Status, reason)
 		}
 		if strings.Contains(reason, "CSR") {
-			t.Errorf("refusal %q reports the CSR: the join must be refused before any CSR is parsed", reason)
+			t.Errorf("refusal %q reports the CSR: the address gate is not what refused this", reason)
+		}
+		if strings.Contains(reason, "CERTIFICATE") {
+			t.Errorf("refusal %q carries a certificate", reason)
 		}
 	})
 

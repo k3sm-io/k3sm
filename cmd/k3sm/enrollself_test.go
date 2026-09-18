@@ -32,6 +32,8 @@ import (
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/podnet"
+
+	"k3sm.io/k3sm/pkg/bootstrap"
 )
 
 // This file is M14.2 d3's unit tier: the control-plane node's own index-0 enroll,
@@ -199,7 +201,7 @@ func TestEnrollAssignsLowestFreeIndexAboveZero(t *testing.T) {
 	e, api := enrollerOverStub(t)
 	seedPeer(t, api, "k3sm-server", "100.64.0.0/24")
 
-	first, err := e.Enroll(context.Background(), "worker-a", enrollRequest("worker-a"))
+	first, _, err := e.Enroll(context.Background(), "worker-a", enrollRequest("worker-a"))
 	if err != nil {
 		t.Fatalf("first worker Enroll: %v", err)
 	}
@@ -210,7 +212,7 @@ func TestEnrollAssignsLowestFreeIndexAboveZero(t *testing.T) {
 		t.Errorf("first worker meshIP = %q, want 100.64.1.1", first.MeshIP)
 	}
 
-	second, err := e.Enroll(context.Background(), "worker-b", enrollRequest("worker-b"))
+	second, _, err := e.Enroll(context.Background(), "worker-b", enrollRequest("worker-b"))
 	if err != nil {
 		t.Fatalf("second worker Enroll: %v", err)
 	}
@@ -222,12 +224,60 @@ func TestEnrollAssignsLowestFreeIndexAboveZero(t *testing.T) {
 	api.mu.Lock()
 	delete(api.peers, "worker-a")
 	api.mu.Unlock()
-	third, err := e.Enroll(context.Background(), "worker-c", enrollRequest("worker-c"))
+	third, _, err := e.Enroll(context.Background(), "worker-c", enrollRequest("worker-c"))
 	if err != nil {
 		t.Fatalf("third worker Enroll: %v", err)
 	}
 	if third.PodCIDR != "100.64.1.0/24" {
 		t.Errorf("third worker podCIDR = %q, want the reclaimed 100.64.1.0/24", third.PodCIDR)
+	}
+}
+
+// TestEnrollReleaseAllocationFreesTheIndex is B339's enroller half: the undo of an
+// allocation a join carved and then failed to use. The enroll is what DECIDES a
+// node's address, so it runs before the certificates are signed; without a release
+// every join that dies at its CSR leaves a MeshPeer holding a /24 that
+// lowestFreeNodeIndex will never hand out again, and index recycling across node
+// deletes does not exist to reclaim it.
+//
+// The list-back is the assertion that matters: "the delete returned nil" and "the
+// index can be assigned again" are different claims, and only the second one is
+// what the next node needs.
+func TestEnrollReleaseAllocationFreesTheIndex(t *testing.T) {
+	e, api := enrollerOverStub(t)
+	seedPeer(t, api, "k3sm-server", "100.64.0.0/24")
+
+	first, alloc, err := e.Enroll(context.Background(), "worker-a", enrollRequest("worker-a"))
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if alloc != bootstrap.AllocationFresh || first.PodCIDR != "100.64.1.0/24" {
+		t.Fatalf("precondition: enroll reported (%v, %q), want (fresh, 100.64.1.0/24)", alloc, first.PodCIDR)
+	}
+
+	if err := e.ReleaseAllocation(context.Background(), "worker-a"); err != nil {
+		t.Fatalf("ReleaseAllocation: %v", err)
+	}
+	if p := api.peer("worker-a"); p != nil {
+		t.Errorf("the MeshPeer survived the release: %+v", p)
+	}
+
+	// Free in the sense that matters: the next node is assigned the same index.
+	next, alloc, err := e.Enroll(context.Background(), "worker-b", enrollRequest("worker-b"))
+	if err != nil {
+		t.Fatalf("the enroll after the release: %v", err)
+	}
+	if next.PodCIDR != "100.64.1.0/24" || alloc != bootstrap.AllocationFresh {
+		t.Errorf("the next node was assigned (%q, %v), want the freed (100.64.1.0/24, fresh)", next.PodCIDR, alloc)
+	}
+
+	// Idempotent: a peer that is already gone is the state the reap asks for, and
+	// a re-run of a failed join's cleanup must not become an error of its own.
+	if err := e.ReleaseAllocation(context.Background(), "worker-c"); err != nil {
+		t.Errorf("releasing an absent allocation must be success, got %v", err)
+	}
+	if err := e.ReleaseAllocation(context.Background(), ""); err == nil {
+		t.Error("releasing an unnamed node must be refused")
 	}
 }
 
@@ -375,7 +425,7 @@ func TestSelfEnrollRacesConcurrentJoinsWithoutSharingAnIndex(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if _, err := e.Enroll(context.Background(), name, enrollRequest(name)); err != nil {
+			if _, _, err := e.Enroll(context.Background(), name, enrollRequest(name)); err != nil {
 				errs <- fmt.Errorf("Enroll %s: %w", name, err)
 			}
 		}()

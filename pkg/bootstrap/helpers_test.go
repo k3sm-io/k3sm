@@ -25,6 +25,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -67,13 +68,24 @@ type fakeEnroller struct {
 	deregisterErr error
 }
 
-func (f *fakeEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
+// Enroll hands out the SAME fixed assignment to every node, so it carves no index
+// and reports every enroll as a reuse — which is the honest answer for a fixture
+// that has no index space, and the one that keeps the failed-join reap (scoped to
+// a FRESH allocation) out of these rows.
+func (f *fakeEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	return netv1.MeshEnrollResponse{
 		NodeName: nodeName,
 		PodCIDR:  f.podCIDR,
 		MeshIP:   f.meshIP,
 		Peers:    f.peers,
-	}.WithDefaults(), nil
+	}.WithDefaults(), bootstrap.AllocationReused, nil
+}
+
+// ReleaseAllocation satisfies bootstrap.Enroller. Nothing here is ever a fresh
+// allocation, so a reap reaching this fixture is a wiring mistake — or a handler
+// that reaps a REUSED allocation, which is the defect the B339 gate forbids.
+func (f *fakeEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+	return fmt.Errorf("the join fixture's enroller was asked to release %q, an allocation it never carved", nodeName)
 }
 
 func (f *fakeEnroller) RefreshEndpoint(_ context.Context, _, endpoint string) error {
@@ -138,6 +150,27 @@ func newTestCSR(t *testing.T, subject pkix.Name, dnsNames []string, ips []net.IP
 		t.Fatalf("parse CSR: %v", err)
 	}
 	return csr
+}
+
+// nodeCSRPEM mints an ECDSA P-256 keypair and returns the PEM CSR a joining node
+// submits, carrying the subject a kubelet asks for plus the given SANs. It is the
+// PEM form of newTestCSR, for the tests that POST a hand-built JoinRequest rather
+// than call the Join client.
+func nodeCSRPEM(t *testing.T, nodeName string, dnsNames []string, ips []net.IP) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject:     pkix.Name{CommonName: "system:node:" + nodeName, Organization: []string{"system:nodes"}},
+		DNSNames:    dnsNames,
+		IPAddresses: ips,
+	}, key)
+	if err != nil {
+		t.Fatalf("create CSR: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))
 }
 
 // parseCertPEM parses the first CERTIFICATE block of certPEM.
