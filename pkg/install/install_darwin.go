@@ -1331,6 +1331,15 @@ func (darwinSystem) PathExists(path string) (bool, error) {
 // answers. The one thing that is not an answer is silence, and silence is the
 // wedged case.
 //
+// The reject can also land on the WRITE side of the round trip: if netd's peer
+// check closes the connection before the probe's single frame is delivered,
+// the write itself fails with EPIPE, ECONNRESET or ENOTCONN (which of the three
+// depends on how far the peer's close had progressed when the write was
+// attempted; all three were observed on macOS 26). That is the same proof as a close seen
+// on the read — the handler ran and acted on the connection — so it is
+// likewise counted as an answer rather than surfaced as the probe's own
+// failure.
+//
 // The verb is unknown ON PURPOSE: every verb netd does implement mutates
 // privileged host state (an lo0 alias, the mesh, a pf anchor, a bound port), and
 // a liveness probe must not be able to change the machine it is asking about.
@@ -1347,7 +1356,13 @@ func (darwinSystem) ProbeNetd(path string) error {
 	if err := conn.SetDeadline(time.Now().Add(netdProbeTimeout)); err != nil {
 		return fmt.Errorf("arm the netd probe deadline: %w", err)
 	}
+	netdProbeBeforeWrite()
 	if err := wire.WriteFrame(conn, payload); err != nil {
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ENOTCONN) {
+			// The peer closed before our write was delivered — the same
+			// proof as a close seen on the read side. It acted, so it is up.
+			return nil
+		}
 		return fmt.Errorf("send the netd probe request: %w", err)
 	}
 	_, err = wire.ReadFrame(conn, netdProbeMaxReply)
@@ -1377,6 +1392,13 @@ const netdProbeVerb = "k3sm-install-probe"
 // probes a wedged listener does not spend a real second per case; nothing in the
 // product writes it.
 var netdProbeTimeout = time.Second
+
+// netdProbeBeforeWrite runs immediately before ProbeNetd writes its request
+// frame. It is a var, not a const, so a unit test can force the write to wait
+// until a peer close has already landed on the connection — the ordering a
+// real accept-then-reject race only sometimes produces — and so deterministically
+// exercise the EPIPE path above. Nothing in the product sets it.
+var netdProbeBeforeWrite = func() {}
 
 // netdProbeMaxReply caps the reply this reads. netd's error response is a few
 // hundred bytes; the cap exists so a desynced or hostile stream cannot make the
