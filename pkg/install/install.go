@@ -969,12 +969,14 @@ type Config struct {
 	//
 	// Because the copy can only propagate whatever the build produced, install
 	// FAILS CLOSED on a helper that does not already carry the entitlement
-	// (VerifyVirtualizationEntitlement, run immediately before the copy). Without
-	// that gate a dev helper built with a plain `go build` installs unentitled and
-	// the consequence surfaces nowhere near the cause: runtimed withholds
-	// VMBackendAvailable, the server deletes the node's k3sm.io/virtualization
-	// label, and every vm-RuntimeClass pod stays Pending behind the RuntimeClass's
-	// own node selector — reported only as "didn't match node affinity/selector".
+	// (VerifyVirtualizationEntitlement, run in Install's preflight block before
+	// anything is written — see there for why it moved off "immediately before
+	// the copy"). Without that gate a dev helper built with a plain `go build`
+	// installs unentitled and the consequence surfaces nowhere near the cause:
+	// runtimed withholds VMBackendAvailable, the server deletes the node's
+	// k3sm.io/virtualization label, and every vm-RuntimeClass pod stays Pending
+	// behind the RuntimeClass's own node selector — reported only as "didn't
+	// match node affinity/selector".
 	//
 	// Defaults to the VMHostName sibling of BinarySource.
 	VMHostSource string
@@ -2390,6 +2392,25 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	// Also before anything is written: does the staged k3sm-vmhost helper carry
+	// the entitlement runtimed's sandbox backend requires? CopyToRootOwned (the
+	// step that lays this helper down, at 2b⁗ below) preserves whatever
+	// signature the build produced VERBATIM and never re-signs it, so this is
+	// the only point in the whole install that can decline an unentitled
+	// helper — and it is read-only, so making that judgement here rather than
+	// immediately before that copy costs nothing and avoids exactly the failure
+	// this preflight block exists to prevent: a real 2026-09-17 upgrade refused
+	// on this very check AFTER the new binary and every other sibling helper
+	// had already been copied into the install root, leaving them beside the
+	// OLD helper while the daemons still ran the old build — an availability
+	// hazard, not just untidiness, since launchd's KeepAlive execs whatever is
+	// on disk and a crash in that window promotes an untested mix.
+	//
+	// A MISSING helper is not this gate's business — the probe reports
+	// fs.ErrNotExist and the copy at 2b⁗ keeps its existing message.
+	if err := sys.VerifyVirtualizationEntitlement(cfg.VMHostSource); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("install: staged %s does not carry the %s entitlement: %w (install copies the helper verbatim and never re-signs it, so an unentitled helper installs unentitled and every vm-RuntimeClass pod then stays Pending on an opaque node-affinity message; sign a dev build with `codesign --force --sign - --entitlements runtimed/cmd/k3sm-vmhost/vmhost.entitlements %s` — release artifacts already carry it)", cfg.VMHostSource, VirtualizationEntitlement, err, cfg.VMHostSource)
+	}
 	if cfg.AdminToken == "" {
 		tok, err := generateToken()
 		if err != nil {
@@ -2418,6 +2439,26 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		if err := ensureDataVolume(ctx, sys, cfg, m, st); err != nil {
 			return err
 		}
+	}
+
+	// 0b. Still before anything else is written: on a control-plane install,
+	//     does the carried `k3sm server` argument set (the installed plist, or
+	//     the survives-uninstall record when there is none) name a
+	//     --datastore-endpoint-file that is no longer on disk? Rendering the
+	//     plist anyway would bring an HA control plane up on its own
+	//     single-node datastore with no log line — a split cluster whose only
+	//     symptom is objects the other servers cannot see — so this refuses
+	//     before the copies below rather than after them. It returns the SAME
+	//     carried arguments step 2d assigns to cfg.ExtraServerArgs, so the
+	//     installed plist/record is read exactly once per install. Runs after
+	//     the data volume above: the carry-over's "nothing was carried" warning
+	//     inspects the data root for prior cluster state, which only ensureDataVolume
+	//     has made available at cfg.DataRoot by this point. An agent install (or
+	//     one with no operator server arguments) gets back a nil slice and no
+	//     error.
+	serverArgs, err := preflightServerArgs(sys, cfg)
+	if err != nil {
+		return err
 	}
 
 	// 1. The service user must exist before the server LaunchDaemon (UserName=_k3sm)
@@ -2578,20 +2619,11 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//      (ditto) carries that signature through verbatim — install never
 	//      re-signs it, matching every other sibling binary here.
 	//
-	//      Which is exactly why the entitlement is verified FIRST. Copying verbatim
-	//      means install can only propagate what the build produced, and a helper
-	//      built with a plain `go build` carries no entitlement at all. Installed
-	//      that way it fails silently and remotely: runtimed withholds
-	//      VMBackendAvailable, the server deletes the node's k3sm.io/virtualization
-	//      label, and every vm-RuntimeClass pod sits Pending reporting only the
-	//      RuntimeClass selector it no longer matches. Refusing here turns that into
-	//      one legible sentence at the one moment the fix is trivial.
-	//
-	//      A MISSING helper is not this gate's business — the probe reports
-	//      fs.ErrNotExist and the copy below keeps its existing message.
-	if err := sys.VerifyVirtualizationEntitlement(cfg.VMHostSource); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("install: staged %s does not carry the %s entitlement: %w (install copies the helper verbatim and never re-signs it, so an unentitled helper installs unentitled and every vm-RuntimeClass pod then stays Pending on an opaque node-affinity message; sign a dev build with `codesign --force --sign - --entitlements runtimed/cmd/k3sm-vmhost/vmhost.entitlements %s` — release artifacts already carry it)", cfg.VMHostSource, VirtualizationEntitlement, err, cfg.VMHostSource)
-	}
+	//      The entitlement itself was already verified, in the preflight block
+	//      before ANY of the copies in this function ran — see the comment
+	//      there for why waiting until immediately before this one copy was
+	//      itself the defect: it let every other artifact land first. This copy
+	//      can therefore only fail on an I/O error, not on the entitlement.
 	if err := sys.CopyToRootOwned(cfg.VMHostSource, cfg.installedVMHost()); err != nil {
 		return fmt.Errorf("install: copy k3sm-vmhost to %s: %w (build k3sm.io/runtimed/cmd/k3sm-vmhost, ad-hoc sign it with the com.apple.security.virtualization entitlement, and place it next to the k3sm binary — vm-RuntimeClass pods cannot boot without it)", cfg.installedVMHost(), err)
 	}
@@ -2637,13 +2669,13 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 			cfg.Logger.Info("preserved operator-supplied agent arguments across reinstall", "args", redactedServerArgsText(extra))
 		}
 	} else {
-		extra, err := installedServerArgs(sys, cfg)
-		if err != nil {
-			return err
-		}
-		cfg.ExtraServerArgs = extra
-		if len(extra) > 0 {
-			cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", redactedServerArgsText(extra))
+		// Already read, in the preflight block above (preflightServerArgs) — the
+		// same call, reused rather than repeated, so the installed plist/record
+		// is read exactly once per install and this does not re-emit its own
+		// "preserved" log line.
+		cfg.ExtraServerArgs = serverArgs
+		if len(serverArgs) > 0 {
+			cfg.Logger.Info("preserved operator-supplied server arguments across reinstall", "args", redactedServerArgsText(serverArgs))
 		}
 	}
 	// 2d″. An explicit --mesh-ip on THIS install replaces whatever --mesh-ip was

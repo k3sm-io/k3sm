@@ -1179,6 +1179,23 @@ func TestInstallOrchestration(t *testing.T) {
 		// join endpoint's reachability and cluster identity — and is absent here
 		// because a control plane joins nothing (TestAgentInstallPreflightsTheJoinEndpoint).
 		"LinkDirTrust:/usr/local/bin/k3sm",
+		// The staged k3sm-vmhost helper's entitlement, checked here rather than
+		// immediately before its copy (far below): copying it verbatim is the
+		// only chance to decline an unentitled helper, and checking it AFTER the
+		// binary and every other sibling helper had already been copied is
+		// exactly the defect this ordering fixes — a real upgrade refused there,
+		// leaving a mix of new and old artifacts beside the still-running old
+		// daemon (TestInstallVerifiesTheVMHostBeforeWritingTheRoot).
+		"VerifyVirtualizationEntitlement:/tmp/k3sm-vmhost",
+		// The installed server plist, read here for the SAME reason and to
+		// answer a different refusal: does the argument set this install would
+		// carry over name a --datastore-endpoint-file that is no longer there?
+		// (See requireDatastoreEndpointFile.) There is none here (a first
+		// install), so the second source is read next: the root-owned record
+		// that survives an uninstall. Both reads are reused later, at the carry-
+		// over step below, rather than repeated.
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
+		"ReadFile:" + dataroot.DefaultServerArgsRecordPath,
 		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
 		"EnsureLogDir:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
@@ -1229,10 +1246,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm/k3sm-execshim",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_pathrebase_shim.dylib",
 		"CopyToRootOwned:/Library/k3sm/libk3sm_getaddrinfo_shim.dylib",
-		// The helper's entitlement is read BEFORE it is copied: the copy preserves
-		// the signature verbatim, so this is the last moment install can still
-		// decline to lay down a helper that cannot boot a VM.
-		"VerifyVirtualizationEntitlement:/tmp/k3sm-vmhost",
+		// The helper's entitlement was already verified, in the preflight block
+		// before any of these copies ran (see above) — this copy can now only
+		// fail on an I/O error.
 		"CopyToRootOwned:/Library/k3sm/k3sm-vmhost",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-apiserver",
 		"CopyToRootOwned:/Library/k3sm/bin/kube-scheduler",
@@ -1242,12 +1258,10 @@ func TestInstallOrchestration(t *testing.T) {
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm/bin/" + executor.KineMarkerName,
-		// The installed server plist is read BEFORE the plists are rendered, so a
-		// reinstall carries the operator's own arguments into the new render.
-		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
-		// There is none here (a first install), so the second source is read: the
-		// root-owned record that survives an uninstall.
-		"ReadFile:" + dataroot.DefaultServerArgsRecordPath,
+		// The installed server plist and args record were already read, in the
+		// preflight block before any of these copies ran (see above); the carry-
+		// over below reuses that answer — nothing, on a first install — rather
+		// than reading either file a second time.
 		// And whatever was carried — nothing, on a first install — is recorded
 		// again, before the plist that will not survive the next uninstall.
 		"WriteServerArgsRecord:" + dataroot.DefaultServerArgsRecordPath,
@@ -1346,15 +1360,16 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			if err := Install(context.Background(), f, cfg); err != nil {
 				t.Fatalf("Install: %v", err)
 			}
-			// The FIRST privileged call — the two refuse-before-write probes
-			// ahead of it (the cross-role plist read and the launcher-directory
-			// trust read) are reads, and install performs nothing else before the
-			// service user exists: the data root is its home, and every later
-			// step writes into it.
+			// The FIRST privileged call — the refuse-before-write probes ahead of
+			// it (the cross-role plist read, the launcher-directory trust read,
+			// the staged vmhost helper's entitlement, and the carried server
+			// arguments' datastore-endpoint-file check) are all reads, and
+			// install performs nothing else before the service user exists: the
+			// data root is its home, and every later step writes into it.
 			wantCall := "EnsureServiceUser:_k3sm:" + want
 			var first string
 			for _, c := range f.calls {
-				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") {
+				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") || strings.HasPrefix(c, "VerifyVirtualizationEntitlement:") {
 					continue
 				}
 				first = c
