@@ -592,72 +592,222 @@ func parkedSummary(last executor.Crash) string {
 // fail every reinstall; requiring the right CLUSTER passes that case without
 // accepting a stale file.
 //
+// A FRESH FAILURE IS NOT A VERDICT ON ITS OWN, and this is the half that
+// changed. The check used to return on the first tick that saw a bring-up entry
+// dated at or after this install began — before the daemon's own retry could
+// land. But the agent is a KeepAlive job that backs off rather than exiting, so
+// a failure is the beginning of a story launchd finishes: on 2026-09-17 the
+// worker failed its first start 1.3s after the install bootstrapped it (netd
+// was not yet serving), and launchd's retry ten seconds later joined the
+// cluster. The install had already failed. So a fresh failure is now REMEMBERED
+// — its detail is kept for the message — and the verification waits for the
+// recovery it might be the start of: the join must be proved AND the daemon's
+// pid must be observed alive on two ticks at least agentRecoveryObservation
+// apart with no further entry appearing between them. A pid that goes away, or
+// that comes back as a different process, restarts that window; another entry
+// restarts it too. At the budget's end the newest failure is what the error
+// quotes.
+//
+// The one thing that still fails at once is a TRIPPED record: the breaker has
+// counted CrashLoopThreshold failures inside its window, which is not a start
+// that is about to recover but a loop, and waiting out a budget on it only
+// delays the same answer.
+//
 // When no token was staged there is nothing to verify: either the node already
 // holds a credential, in which case the pid IS the whole claim, or it holds none
 // and the daemon is backing off with an error the log names, which is not
 // something this install caused and not something it can fix.
 func verifyAgentJoined(ctx context.Context, sys System, cfg Config, startedAt time.Time) error {
+	return verifyAgentJoinedOn(ctx, sys, cfg, startedAt, wallClock())
+}
+
+// agentJoinClock is the time verifyAgentJoinedOn reads and the way it waits
+// between ticks. Production reads the wall clock and sleeps; a test supplies a
+// clock it steps itself, so the observation window is crossed by ticks rather
+// than by the scheduler.
+//
+// The seam exists because the alternative is a test whose verdict depends on how
+// busy the machine is. Shrinking the window to a millisecond and racing it
+// against a real poll loop made the "the daemon failed again and went away" row
+// pass under -race: the window elapsed before the fake had delivered the failure
+// and the pid drop. A window measured in the verification's OWN time cannot be
+// won by a fast machine or lost by a slow one.
+type agentJoinClock struct {
+	now func() time.Time
+	// tick waits d, or returns ctx's error. It is the only place this
+	// verification blocks.
+	tick func(ctx context.Context, d time.Duration) error
+}
+
+// wallClock is the production clock: real time, real sleeps.
+func wallClock() agentJoinClock {
+	return agentJoinClock{
+		now: time.Now,
+		tick: func(ctx context.Context, d time.Duration) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+				return nil
+			}
+		},
+	}
+}
+
+func verifyAgentJoinedOn(ctx context.Context, sys System, cfg Config, startedAt time.Time, clk agentJoinClock) error {
 	if cfg.Role != RoleAgent || cfg.TokenFile == "" {
 		return nil
 	}
 	cred := AgentCredentialPath(cfg.DataRoot)
+	record := executor.CrashLoopPath(cfg.agentWorkDir())
 	pin, err := stagedTokenPin(sys, cfg)
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(agentJoinBudget.running)
+	deadline := clk.now().Add(agentJoinBudget.running)
+	var (
+		seen        agentFailureWitness // the fresh bring-up failures observed so far
+		aliveSince  time.Time           // when the current uninterrupted run of this pid began
+		alivePID    int
+		why         string // why the last tick was not yet a join
+		loggedState nodecred.State
+	)
 	for {
-		if err := freshAgentStartFailure(sys, cfg, startedAt); err != nil {
-			return err
+		rec, fresh := readAgentFailures(sys, cfg, startedAt)
+		if rec.Tripped() {
+			return fmt.Errorf("the agent daemon is not joining the cluster: its crash-loop breaker tripped at %s after %d start failures inside %s (last: %s), so this is a loop rather than a start that is about to recover. The reason is the last lines of %s; the agent's own record is %s",
+				rec.TrippedAt.Format(time.RFC3339), executor.CrashLoopThreshold, executor.CrashLoopWindow, agentFailureDetail(lastCrash(rec)), AgentLogPath(), record)
 		}
-		joined, why := agentCredentialProvesJoin(sys, cfg, pin)
-		if joined {
-			cfg.Logger.Info("the agent joined the cluster", "credential", cred)
+		if fresh.newerThan(seen) {
+			// The daemon failed again while this verification was watching, so
+			// whatever run of live pids preceded it did not survive.
+			seen = fresh
+			aliveSince = time.Time{}
+			cfg.Logger.Warn("the agent recorded a start failure during this install; waiting for the retry launchd will make rather than failing on it",
+				"detail", agentFailureDetail(fresh.last), "failures", fresh.count, "record", record)
+		}
+		switch pid, perr := sys.LaunchctlServicePID(AgentLabel); {
+		case perr != nil:
+			aliveSince, alivePID = time.Time{}, 0
+		case pid == 0:
+			aliveSince, alivePID = time.Time{}, 0
+		case pid != alivePID:
+			// A pid this verification has not seen before: either the first
+			// observation, or launchd respawning the daemon after a start that
+			// gave up. Either way the run starts here.
+			aliveSince, alivePID = clk.now(), pid
+		}
+		joined, credWhy, state := agentCredentialProvesJoin(sys, cfg, pin)
+		if joined && state != nodecred.Valid && state != loggedState {
+			loggedState = state
+			cfg.Logger.Warn("the agent's stored credential is for this cluster but is not in date; the daemon re-joins with the staged token or reports why",
+				"credential", cred, "state", state)
+		}
+		steady := !aliveSince.IsZero() && clk.now().Sub(aliveSince) >= agentRecoveryObservation
+		switch {
+		case joined && steady:
+			if seen.count > 0 {
+				cfg.Logger.Warn("the agent recovered from a start failure recorded during this install",
+					"credential", cred, "failures", seen.count, "detail", agentFailureDetail(seen.last), "observedRunningFor", agentRecoveryObservation, "pid", alivePID)
+			}
+			cfg.Logger.Info("the agent joined the cluster", "credential", cred, "pid", alivePID)
 			return nil
+		case !joined:
+			why = credWhy
+		case aliveSince.IsZero():
+			why = fmt.Sprintf("%s is a credential for this cluster, but the agent daemon is not running (launchd reports no live process for %s), so nothing has presented it", cred, AgentLabel)
+		default:
+			why = fmt.Sprintf("%s is a credential for this cluster, but the agent daemon (pid %d) has not yet been running steadily for %s", cred, alivePID, agentRecoveryObservation)
 		}
-		if time.Now().After(deadline) {
+		if clk.now().After(deadline) {
+			if seen.count > 0 {
+				return fmt.Errorf("the agent daemon did not recover from a start failure this install caused: it failed to start %d times since this install began (last at %s: %s), and %s within %s. It backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the rest is in the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one. The agent's own record is %s",
+					seen.count, seen.last.At.Format(time.RFC3339), agentFailureDetail(seen.last), why, agentJoinBudget.running, agentTerminalBackoffNote, AgentLogPath(), record)
+			}
 			return fmt.Errorf("the agent daemon is running but has not joined the cluster within %s: %s (it backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the reason is the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one)",
 				agentJoinBudget.running, why, agentTerminalBackoffNote, AgentLogPath())
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(agentJoinBudget.poll):
+		if err := clk.tick(ctx, agentJoinBudget.poll); err != nil {
+			return err
 		}
 	}
 }
 
-// freshAgentStartFailure fails the install when the agent's own record holds a
-// start failure dated at or after this install began. It is
-// verifyServerNotParked's counterpart for the worker role and shares its
-// timestamp rule and its fail-open posture; what it does NOT share is the park
-// check, because the agent never parks — it backs off in process, so a tripped
-// record changes nothing about what launchd reports and adds nothing this check
-// can act on.
-func freshAgentStartFailure(sys System, cfg Config, startedAt time.Time) error {
+// agentRecoveryObservation is how long the agent daemon must be observed
+// running as ONE uninterrupted process — two ticks at least this far apart,
+// with no new bring-up entry between them — before its credential is accepted
+// as proof of a join.
+//
+// It is the thing a single tick cannot tell apart: an agent that failed once
+// and was restarted by launchd into a healthy run looks, at any one instant,
+// exactly like an agent that is about to fail again. Ten seconds is chosen
+// against launchd's own respawn throttle (about ten seconds between KeepAlive
+// restarts): a daemon that survives longer than the interval at which it would
+// be relaunched has got past its start, and a daemon that has not will be
+// caught by the next entry it writes. It is comfortably inside the 60s join
+// budget, so the ordinary install pays it once and still has fifty seconds of
+// patience left for the join itself.
+//
+// It is a var, not a const, so a unit test can shrink it; nothing in the
+// product writes it.
+var agentRecoveryObservation = 10 * time.Second
+
+// agentFailureWitness is what one tick learned about the agent's fresh start
+// failures: how many there have been since this install began, and the newest.
+type agentFailureWitness struct {
+	count int
+	last  executor.Crash
+}
+
+// newerThan reports whether w holds a bring-up entry the previously observed
+// witness did not. The count alone is not sufficient on its own — the record is
+// pruned, so an entry can age out of the window while another arrives — so the
+// newest timestamp decides whenever the count has not grown.
+func (w agentFailureWitness) newerThan(prev agentFailureWitness) bool {
+	if w.count == 0 {
+		return false
+	}
+	return w.count > prev.count || w.last.At.After(prev.last.At)
+}
+
+// readAgentFailures reads the agent's crash-loop record and reports it together
+// with the bring-up failures dated at or after this install began.
+//
+// It is FAIL-OPEN on everything that is not a failure the daemon recorded — an
+// absent record is the ordinary case, and an unreadable or malformed one is
+// bookkeeping rather than a verdict, for the same reason the daemon treats a
+// corrupt record as empty: refusing an install over a marker nobody can parse
+// would be a second way to lose a node.
+func readAgentFailures(sys System, cfg Config, startedAt time.Time) (executor.CrashRecord, agentFailureWitness) {
 	path := executor.CrashLoopPath(cfg.agentWorkDir())
 	raw, err := sys.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return nil
+		return executor.CrashRecord{}, agentFailureWitness{}
 	case err != nil:
 		cfg.Logger.Warn("could not read the agent's crash-loop record", "path", path, "err", err)
-		return nil
+		return executor.CrashRecord{}, agentFailureWitness{}
 	}
 	rec, err := executor.ParseCrashRecord(raw)
 	if err != nil {
 		cfg.Logger.Warn("the agent's crash-loop record is unreadable; treating it as empty", "path", path, "err", err)
-		return nil
+		return executor.CrashRecord{}, agentFailureWitness{}
 	}
 	// The daemon and this process read the same machine's clock, so comparing
 	// the record's timestamps with this install's start compares a clock with
 	// itself.
-	fresh, last := freshBringUpFailures(rec, startedAt)
-	if fresh == 0 {
-		return nil
+	n, last := freshBringUpFailures(rec, startedAt)
+	return rec, agentFailureWitness{count: n, last: last}
+}
+
+// lastCrash is the newest entry of any origin, for the tripped message — which
+// is about the breaker rather than about this install, so it quotes what the
+// breaker last counted.
+func lastCrash(rec executor.CrashRecord) executor.Crash {
+	if len(rec.Crashes) == 0 {
+		return executor.Crash{}
 	}
-	return fmt.Errorf("the agent daemon is running but did not join the cluster: it failed to start %d times since this install began (last at %s: %s). It backs off for %s between attempts rather than exiting, so launchd reports a healthy pid either way; the rest is in the last lines of %s — a rejected or expired token is the common one, and `k3sm token create` on the server mints a fresh one. The agent's own record is %s",
-		fresh, last.At.Format(time.RFC3339), agentFailureDetail(last), agentTerminalBackoffNote, AgentLogPath(), path)
+	return rec.Crashes[len(rec.Crashes)-1]
 }
 
 // agentFailureDetail is the recorded, already-redacted reason the agent could
@@ -671,8 +821,12 @@ func agentFailureDetail(c executor.Crash) string {
 }
 
 // agentCredentialProvesJoin reports whether the stored node credential is proof
-// that this node belongs to the cluster the staged token names, and — when it is
-// not — the clause the failure message quotes.
+// that this node belongs to the cluster the staged token names, the clause the
+// failure message quotes when it is not, and the credential's own state.
+//
+// The state is RETURNED rather than logged here because the caller polls this
+// several times a second: a warning emitted per tick would print the same
+// sentence forty times over one join budget, so the caller logs each state once.
 //
 // The validation is pkg/nodecred's, never a second looser reader: `k3sm status`
 // and the daemon already reach a verdict about these five files, and an
@@ -683,22 +837,18 @@ func agentFailureDetail(c executor.Crash) string {
 // daemon's decision — it re-joins with the staged token, or it fails and the
 // record says so on the next tick — and an installer that failed here would be
 // pre-empting a daemon that is about to fix it.
-func agentCredentialProvesJoin(sys System, cfg Config, pin string) (joined bool, why string) {
+func agentCredentialProvesJoin(sys System, cfg Config, pin string) (joined bool, why string, state nodecred.State) {
 	path := AgentCredentialPath(cfg.DataRoot)
 	state, cred, err := nodecred.Status(sysFS{sys: sys}, cfg.agentWorkDir(), time.Now())
 	switch {
 	case cred == nil && err != nil:
-		return false, fmt.Sprintf("%s did not parse as a node credential (%v)", path, err)
+		return false, fmt.Sprintf("%s did not parse as a node credential (%v)", path, err), state
 	case cred == nil:
-		return false, fmt.Sprintf("%s is ABSENT (the agent has not written the credential a completed join produces)", path)
+		return false, fmt.Sprintf("%s is ABSENT (the agent has not written the credential a completed join produces)", path), state
 	case cred.ClusterCAPin != pin:
-		return false, fmt.Sprintf("%s is a credential for a DIFFERENT cluster (it pins cluster CA %s; the token this install staged pins %s), so it is a file an earlier install left behind rather than proof of this join", path, cred.ClusterCAPin, pin)
+		return false, fmt.Sprintf("%s is a credential for a DIFFERENT cluster (it pins cluster CA %s; the token this install staged pins %s), so it is a file an earlier install left behind rather than proof of this join", path, cred.ClusterCAPin, pin), state
 	}
-	if state != nodecred.Valid {
-		cfg.Logger.Warn("the agent's stored credential is for this cluster but is not in date; the daemon re-joins with the staged token or reports why",
-			"credential", path, "state", state)
-	}
-	return true, ""
+	return true, "", state
 }
 
 // stagedTokenPin returns the cluster-CA pin carried by the join token THIS

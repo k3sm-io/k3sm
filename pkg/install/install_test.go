@@ -172,12 +172,19 @@ type fakeSystem struct {
 	owners map[string]OwnedEntry
 }
 
-// delayedFile is one file of the fake root filesystem that is not there yet.
+// delayedFile is one file of the fake root filesystem that CHANGES part-way
+// through a test: a daemon writing while the installer polls.
 type delayedFile struct {
 	content []byte
-	// absentReads is how many more reads report it missing. It is decremented by
-	// ReadFile, on ReadFile's own goroutine, so the fake stays single-threaded.
+	// absentReads is how many more reads answer with before (or report it
+	// missing, when before is nil). It is decremented by ReadFile, on ReadFile's
+	// own goroutine, so the fake stays single-threaded.
 	absentReads int
+	// before is what those first reads return. Nil — the zero value — is ABSENT,
+	// which is the file-appears case; non-nil is the file-CHANGES case, the one
+	// a crash record needs (it is there throughout, and the daemon appends an
+	// entry to it while the verification is watching).
+	before []byte
 }
 
 // putFileAfterReads seeds a file that reads as ABSENT for the next absentReads
@@ -187,6 +194,16 @@ func (f *fakeSystem) putFileAfterReads(path string, content []byte, absentReads 
 		f.delayed = map[string]*delayedFile{}
 	}
 	f.delayed[path] = &delayedFile{content: content, absentReads: absentReads}
+}
+
+// putFileChangingAfterReads seeds a file that reads as before for the next
+// reads reads and as after from then on — a record the daemon appends to while
+// the installer is polling it.
+func (f *fakeSystem) putFileChangingAfterReads(path string, before, after []byte, reads int) {
+	if f.delayed == nil {
+		f.delayed = map[string]*delayedFile{}
+	}
+	f.delayed[path] = &delayedFile{content: after, before: before, absentReads: reads}
 }
 
 // putOwned seeds the fake's ownership table with one entry. It is how a test
@@ -410,8 +427,15 @@ func shrinkRestartBudgets(t *testing.T) {
 	tiny := restartBudget{unload: 50 * time.Millisecond, running: 50 * time.Millisecond, poll: time.Microsecond}
 	netdOrig, serverOrig, joinOrig := netdRestartBudget, serverRestartBudget, agentJoinBudget
 	netdRestartBudget, serverRestartBudget, agentJoinBudget = tiny, tiny, tiny
+	// The agent's steady-run observation shrinks with them, and by the same
+	// ratio: it is a fraction of the join budget in production and must stay one
+	// here, or every agent install in this package would time out waiting for a
+	// window the budget cannot contain.
+	observationOrig := agentRecoveryObservation
+	agentRecoveryObservation = time.Millisecond
 	t.Cleanup(func() {
 		netdRestartBudget, serverRestartBudget, agentJoinBudget = netdOrig, serverOrig, joinOrig
+		agentRecoveryObservation = observationOrig
 	})
 }
 
@@ -511,6 +535,9 @@ func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	if d, ok := f.delayed[path]; ok {
 		if d.absentReads > 0 {
 			d.absentReads--
+			if d.before != nil {
+				return d.before, nil
+			}
 			return nil, fmt.Errorf("open %s: %w", path, fs.ErrNotExist)
 		}
 		return d.content, nil

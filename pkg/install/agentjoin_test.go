@@ -148,6 +148,12 @@ func agentStartFailure(at time.Time, detail string) executor.Crash {
 // that can are the ones asserted here: the crash record the agent writes when a
 // start fails, and whether the credential names the cluster this install's token
 // pins.
+//
+// Every row that PASSES seeds a live io.k3sm.agent pid, because the credential
+// is proof only of a join some process made: since B332 the verification also
+// requires the daemon to have been observed running steadily
+// (agentRecoveryObservation). The rows that fail deliberately leave the daemon
+// down — a credential nothing is presenting is the shape this test exists for.
 func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 	installStart := time.Date(2026, 9, 17, 11, 0, 0, 0, time.UTC)
 	dir := Config{}.withDefaults().agentWorkDir()
@@ -211,6 +217,7 @@ func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 			seed: func(t *testing.T, f *fakeSystem, cfg Config) string {
 				cred := mintNodeCredential(t, dir)
 				cred.seed(f)
+				f.putLoaded(AgentLabel) // and the daemon presenting it is up
 				return cred.token
 			},
 		},
@@ -221,6 +228,7 @@ func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 			seed: func(t *testing.T, f *fakeSystem, cfg Config) string {
 				cred := mintNodeCredential(t, dir)
 				cred.seedAppearingDuringThePoll(f, dir, 3)
+				f.putLoaded(AgentLabel)
 				return cred.token
 			},
 		},
@@ -234,6 +242,7 @@ func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 				seedAgentCrashRecord(t, f, cfg, executor.CrashRecord{Crashes: []executor.Crash{
 					agentStartFailure(installStart.Add(-30*time.Minute), "join: the server rejected this token"),
 				}})
+				f.putLoaded(AgentLabel)
 				return cred.token
 			},
 		},
@@ -264,6 +273,7 @@ func TestVerifyAgentJoinedIgnoresAPreExistingCredential(t *testing.T) {
 				cred := mintNodeCredential(t, dir)
 				cred.seed(f)
 				f.putFile(executor.CrashLoopPath(cfg.agentWorkDir()), []byte("{not json"))
+				f.putLoaded(AgentLabel)
 				return cred.token
 			},
 		},
