@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -276,6 +277,17 @@ func postJSON(ctx context.Context, client *http.Client, url string, body JoinReq
 		if httpResp.StatusCode == http.StatusBadRequest && body.NodeIP == "" && strings.Contains(reason, oldServerNodeIPRefusal) {
 			return nil, fmt.Errorf("%w (the server answered: %s)", ErrServerRequiresNodeIP, reason)
 		}
+		// A rate-limited join is NOT a rejection, and collapsing it into one
+		// would fail the install it is meant to protect (see
+		// JoinRateLimitedError). It is the one non-2xx this client hands back as
+		// a retry-later condition carrying the wait the server named.
+		if httpResp.StatusCode == http.StatusTooManyRequests {
+			return nil, &JoinRateLimitedError{
+				RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+				Status:     httpResp.Status,
+				Reason:     reason,
+			}
+		}
 		return nil, fmt.Errorf("join rejected (%s): %s", httpResp.Status, reason)
 	}
 	var resp JoinResponse
@@ -292,6 +304,59 @@ func postJSON(ctx context.Context, client *http.Client, url string, body JoinReq
 // both the operator's. Compare with errors.Is.
 var ErrServerRequiresNodeIP = errors.New(
 	"this control plane predates assignment-derived node addresses; pass --node-ip <mesh address> or upgrade the control plane first")
+
+// ErrJoinRateLimited is the sentinel a rate-limited join carries. It is a
+// RETRY-LATER condition, not a refusal of this node: the token is valid and the
+// request was well formed, and the control plane is bounding how fast one token
+// may drive the expensive half of a join (see joinRateLimiter). Compare with
+// errors.Is; recover the wait with errors.As on *JoinRateLimitedError.
+var ErrJoinRateLimited = errors.New("the control plane is rate-limiting joins for this token")
+
+// JoinRateLimitedError is the 429 a join received, carrying the Retry-After the
+// server named so a caller waits the amount it was asked for rather than a
+// guess of its own.
+//
+// It exists as a DISTINCT condition because of what the caller does next. An
+// agent calls Join once per process start and `k3sm install` waits one bounded
+// budget for the credential that join writes, so a rate-limited attempt read as
+// a rejected token fails the install — on precisely the case the limit is there
+// to protect, several Macs onboarded at once against one token. A caller that
+// can tell the two apart waits instead.
+type JoinRateLimitedError struct {
+	// RetryAfter is the wait the server named, or zero when it named none this
+	// client could read. A caller that gets zero applies a wait of its own
+	// rather than retrying immediately.
+	RetryAfter time.Duration
+	// Status is the HTTP status line; Reason is the server's message.
+	Status string
+	Reason string
+}
+
+func (e *JoinRateLimitedError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("join rate-limited (%s): %s (retry after %s)", e.Status, e.Reason, e.RetryAfter)
+	}
+	return fmt.Sprintf("join rate-limited (%s): %s", e.Status, e.Reason)
+}
+
+// Unwrap makes errors.Is(err, ErrJoinRateLimited) the way callers ask "is this
+// worth waiting for", without reaching for the concrete type unless they want
+// the wait.
+func (e *JoinRateLimitedError) Unwrap() error { return ErrJoinRateLimited }
+
+// parseRetryAfter reads a Retry-After header. Only the delta-seconds form is
+// understood, which is the form this control plane sends; an absent, HTTP-date
+// or unreadable value yields zero, which a caller reads as "the server named no
+// wait I can use" and answers with its own. Erring in that direction costs one
+// more request the server refuses again, never a node that waits out a number
+// it was handed.
+func parseRetryAfter(v string) time.Duration {
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
 
 // oldServerNodeIPRefusal is the exact 400 body such a server answers with. It is
 // matched as a substring because that is the only signal on the wire: the refusal

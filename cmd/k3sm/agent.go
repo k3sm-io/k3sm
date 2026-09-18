@@ -532,7 +532,7 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 	// on the shipped path where the control plane assigns the address.
 	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
 		"assertedNodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
-	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
+	res, err := awaitJoin(ctx, bootstrap.Join, bootstrap.JoinOptions{
 		Server:       bootstrapURL,
 		Token:        opts.token,
 		NodeName:     opts.nodeName,
@@ -543,12 +543,90 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
 		// back as exactly this value and is what bringUpMesh programs.
 		WGPrivateKeyB64: meshPriv,
-	})
+	}, logger)
 	if err != nil {
 		return nil, "", fmt.Errorf("join: %w", err)
 	}
 	logger.Info("joined", "nodeIP", res.NodeIP, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	return res, meshEndpoint, nil
+}
+
+// joinRateLimitGrace bounds how long ONE agent start keeps re-trying a join the
+// control plane is rate-limiting, instead of failing the start.
+//
+// That refusal is the one join failure which is neither the operator's fault
+// nor terminal. The control plane bounds how fast a single token may drive the
+// expensive half of a join, so several Macs onboarded at once against one token
+// take turns and each is told when to come back. Read as a rejection it would
+// fail `k3sm install` on exactly the case the server-side limit exists to
+// protect, so this start waits it out instead.
+//
+// Thirty seconds is chosen against the INSTALLER's patience, not the limiter's
+// refill: `k3sm install` allows one 60s budget for this node's credential to
+// appear, and a start may already have spent up to 10s waiting for the netd
+// helper. Ten plus thirty leaves the join twenty seconds inside that budget,
+// and the refusals it absorbs are about twelve seconds apart, so an ordinary
+// queue of two or three Macs clears here. A longer queue fails the install with
+// the refusal named and the cheap fix in the message: mint a token per Mac.
+//
+// It is a var, not a const, so a unit test can shrink it; nothing in the
+// product writes it.
+var joinRateLimitGrace = 30 * time.Second
+
+// joinRateLimitFallbackWait is how long to wait before the next attempt when a
+// rate-limited refusal named no Retry-After this client could read. It is
+// shorter than the server's refill on purpose: one wasted request that is
+// refused again is cheaper than a node idling past its install budget.
+const joinRateLimitFallbackWait = 5 * time.Second
+
+// joinFunc is the join client awaitJoin drives — bootstrap.Join in production,
+// and a stub in a test, so the retry can be asserted without standing a
+// control plane up.
+type joinFunc func(context.Context, bootstrap.JoinOptions) (*bootstrap.JoinResult, error)
+
+// awaitJoin runs the join, re-trying within joinRateLimitGrace for as long as
+// the control plane answers that this token is rate-limited, and returning
+// every other outcome — success or failure — on the spot. A rejected token, a
+// refused CSR and an unreachable server all come straight back, because nothing
+// about waiting changes any of them.
+//
+// The wait between attempts is the server's own Retry-After when it named one,
+// so the node comes back when it was asked to rather than on a schedule of its
+// own. An attempt is not started at all if its wait would run past the grace:
+// the caller is inside a bounded install budget, and a node that overruns it
+// reports nothing useful.
+func awaitJoin(ctx context.Context, join joinFunc, opts bootstrap.JoinOptions, logger *slog.Logger) (*bootstrap.JoinResult, error) {
+	deadline := time.Now().Add(joinRateLimitGrace)
+	for attempt := 1; ; attempt++ {
+		res, err := join(ctx, opts)
+		var limited *bootstrap.JoinRateLimitedError
+		if !errors.As(err, &limited) {
+			return res, err
+		}
+		// A daemon asked to stop stops, and that is decided BEFORE the grace: a
+		// cancelled start must report the shutdown it was given, not the
+		// rate-limit reasoning it happened to be in the middle of.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		wait := limited.RetryAfter
+		if wait <= 0 {
+			wait = joinRateLimitFallbackWait
+		}
+		if left := time.Until(deadline); left <= 0 || wait > left {
+			return nil, fmt.Errorf("the control plane is still rate-limiting joins for this token after %s (attempts: %d); it last asked this node to wait %s. It bounds how fast ONE token may join, so onboarding several Macs at once goes faster with a token per Mac (`sudo k3sm token create` on the server): %w",
+				joinRateLimitGrace, attempt, wait, err)
+		}
+		logger.Warn("the control plane is rate-limiting joins for this token; waiting and retrying inside this start",
+			"attempt", attempt, "wait", wait, "err", err)
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, ctx.Err()
+		case <-t.C:
+		}
+	}
 }
 
 // agentResumeFromCredential is the restart path: it rebuilds the join outcome
