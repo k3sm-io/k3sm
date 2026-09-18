@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"log/slog"
 	"net"
@@ -1300,10 +1301,19 @@ func peerMeshEgressIPs(peers []netv1.MeshPeerSpec) []string {
 // loadOrCreateNodePassword reads the node's persisted node-password (0600), minting
 // and persisting a fresh one on first run. Reusing it across restarts keeps the
 // server's first-write-wins binding matching.
+//
+// An unreadable file is an ERROR, never a re-mint: the server's node-password store
+// binds a name to the FIRST password it was shown, so a freshly minted value here
+// would present as a mismatch on the very next join, and the operator would have to
+// clear the binding by hand to let this node reclaim its own name. A transient or
+// permission read fault is recoverable; a silently rotated identity is not — so this
+// only mints for the genuinely-absent case and fails loudly for everything else.
 func loadOrCreateNodePassword(workDir string) (string, error) {
 	path := filepath.Join(workDir, "node-password")
 	if b, err := os.ReadFile(path); err == nil {
 		return string(b), nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("read node-password %s: %w", path, err)
 	}
 	pw, err := bootstrap.GenerateNodePassword()
 	if err != nil {
