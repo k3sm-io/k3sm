@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -67,8 +68,9 @@ type ServerConfig struct {
 // Server is the supervisor-side bootstrap endpoint a joining worker hits over a
 // mesh-reachable TLS listener that presents [serving-leaf, ClusterCA] (so the join
 // client's CA-hash pin verifies). It authenticates the join token, binds the
-// node-password, signs the node's CSRs into a system:node identity bound to the
-// authenticated node + InternalIP, and drives the controller-mediated mesh enroll.
+// node-password, drives the controller-mediated mesh enroll — which ASSIGNS this
+// node's mesh address — and signs the node's CSRs into a system:node identity bound
+// to the authenticated node + that assigned address.
 type Server struct {
 	cfg ServerConfig
 }
@@ -133,8 +135,8 @@ func (s *Server) handleCACert(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleJoin runs the worker-join exchange. Every rejection is logged at its boundary
-// with the failure category (token / node-password / csr / enroll) — the four join
-// failures otherwise present identically as "node never Ready".
+// with the failure category (token / node-password / enroll / node-ip-mismatch /
+// csr) — the join failures otherwise present identically as "node never Ready".
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -153,8 +155,8 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid join token", http.StatusUnauthorized)
 		return
 	}
-	if req.NodeName == "" || req.NodeIP == "" {
-		http.Error(w, "join request missing nodeName or nodeIP", http.StatusBadRequest)
+	if req.NodeName == "" {
+		http.Error(w, "join request missing nodeName", http.StatusBadRequest)
 		return
 	}
 
@@ -165,8 +167,6 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := NodeIdentity{NodeName: req.NodeName, InternalIP: req.NodeIP}
-
 	// The mesh-enroll must name the same node (cross-node write-guard).
 	if err := AuthorizeMeshPeerWrite(req.NodeName, req.Mesh.NodeName); err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "mesh-peer-guard", "node", req.NodeName, "err", err)
@@ -174,7 +174,51 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. HTTP-CSR → system:node client cert (SAN-bound to the authenticated node).
+	// 3. Controller-mediated mesh enroll (writes THIS node's MeshPeer + peer
+	// snapshot). It runs BEFORE any certificate is signed because it is what
+	// DECIDES this node's mesh address — reusing the assignment already held under
+	// this node name, else carving the lowest free index — and that address, not
+	// anything the client asked for, is the InternalIP the issued certificates
+	// name. Signing first would mean signing for an address the allocator had not
+	// yet agreed to.
+	meshResp, err := s.cfg.Enroller.Enroll(r.Context(), req.NodeName, req.Mesh)
+	if err != nil {
+		s.cfg.Logger.Error("join rejected", "reason", "enroll-write", "node", req.NodeName, "err", err)
+		http.Error(w, "mesh enroll failed", http.StatusInternalServerError)
+		return
+	}
+	assignedIP, err := netip.ParseAddr(strings.TrimSpace(meshResp.MeshIP))
+	if err != nil {
+		s.cfg.Logger.Error("join rejected", "reason", "no-assigned-address", "node", req.NodeName, "meshIP", meshResp.MeshIP, "err", err)
+		http.Error(w, "mesh enroll assigned no usable node address", http.StatusInternalServerError)
+		return
+	}
+
+	// 3a. The OPTIONAL equality gate on the client's declared address. The
+	// assignment above is authoritative either way: this is not where the address
+	// is chosen, it is where an operator's stated expectation is checked against
+	// the choice. A mismatch is refused HERE — before a CSR is parsed, let alone
+	// signed — so a client can never obtain a certificate naming an address the
+	// allocator gave some other node. The message names the two addresses in play
+	// and nothing else about the allocator's state.
+	if req.NodeIP != "" {
+		requested, perr := netip.ParseAddr(strings.TrimSpace(req.NodeIP))
+		if perr != nil {
+			http.Error(w, fmt.Sprintf("nodeIP %q is not an IP address", req.NodeIP), http.StatusBadRequest)
+			return
+		}
+		if requested != assignedIP {
+			s.cfg.Logger.Warn("join rejected", "reason", "node-ip-mismatch", "node", req.NodeName, "requested", requested.String(), "assigned", assignedIP.String())
+			http.Error(w, fmt.Sprintf(
+				"join refused: this node's address is assigned by the control plane: %s was requested, but this node is assigned %s (drop --node-ip, or pass %s)",
+				requested, assignedIP, assignedIP), http.StatusConflict)
+			return
+		}
+	}
+
+	id := NodeIdentity{NodeName: req.NodeName, InternalIP: assignedIP.String()}
+
+	// 4. HTTP-CSR → system:node client cert (SAN-bound to the authenticated node).
 	clientCSR, err := parseCSR(req.ClientCSRPEM)
 	if err != nil {
 		http.Error(w, "parse client CSR: "+err.Error(), http.StatusBadRequest)
@@ -187,7 +231,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3b. Optional kubelet-serving cert (cluster CA → --kubelet-certificate-authority).
+	// 4b. Optional kubelet-serving cert (cluster CA → --kubelet-certificate-authority).
 	var servingCert []byte
 	if req.ServingCSRPEM != "" {
 		servingCSR, err := parseCSR(req.ServingCSRPEM)
@@ -203,17 +247,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Controller-mediated mesh enroll (writes THIS node's MeshPeer + peer snapshot).
-	meshResp, err := s.cfg.Enroller.Enroll(r.Context(), req.NodeName, req.Mesh)
-	if err != nil {
-		s.cfg.Logger.Error("join rejected", "reason", "enroll-write", "node", req.NodeName, "err", err)
-		http.Error(w, "mesh enroll failed", http.StatusInternalServerError)
-		return
-	}
-
 	resp := JoinResponse{
 		SchemaVersion:         JoinSchemaVersion,
 		NodeName:              req.NodeName,
+		NodeIP:                assignedIP.String(),
 		ClusterCAPEM:          string(s.cfg.ClusterCA.CertPEM),
 		ClientCAPEM:           string(s.cfg.SigningCA.CertPEM),
 		NodeClientCertPEM:     string(clientCert),
@@ -226,7 +263,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.Error("encode join response", "node", req.NodeName, "err", err)
 		return
 	}
-	s.cfg.Logger.Info("node joined", "node", req.NodeName, "nodeIP", req.NodeIP, "podCIDR", meshResp.PodCIDR)
+	s.cfg.Logger.Info("node joined", "node", req.NodeName, "nodeIP", assignedIP.String(), "podCIDR", meshResp.PodCIDR)
 }
 
 // handleBundle serves the AES-256-GCM-sealed CA bootstrap bundle to a joining

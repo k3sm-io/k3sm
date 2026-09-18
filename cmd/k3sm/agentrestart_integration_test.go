@@ -125,7 +125,9 @@ func TestIntegrationAgentRestartReusesItsNodeCredential(t *testing.T) {
 // shell so the harness's own pids and paths stay in scope (and so cluster_down
 // reaps the restarted process — AGENT_PID is reassigned to it).
 //
-// The restart deliberately re-runs the same argv agent_up used, minus the token:
+// The restart deliberately re-runs the same argv agent_up used, minus the token
+// (and, since B338, with no --node-ip: the address is the server's assignment,
+// read back from the stored credential on a restart):
 // `env -u K3SM_TOKEN` guarantees the joined credential is the only thing the
 // process can start from.
 func bringUpAndRestartAgent(t *testing.T) map[string]string {
@@ -161,7 +163,7 @@ n=0; while kill -0 "$AGENT_PID" 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 60
 
 printf 'RESULT RESTART_EPOCH=%%s\n' "$(date +%%s)"
 nohup env -u K3SM_TOKEN CGO_ENABLED=1 "${K3SM_CMD[@]}" agent \
-  --server 127.0.0.1 --node-name %[5]q --node-ip 127.0.0.1 \
+  --server 127.0.0.1 --node-name %[5]q \
   --work-dir "$AGENT_WORKDIR" --pod-root "$AGENT_POD_ROOT" \
   --runtime runtimed --network none --api-port "$APISERVER_PORT" \
   > "$K3SM_WORKDIR/agent-restart.log" 2>&1 &

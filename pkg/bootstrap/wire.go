@@ -67,9 +67,13 @@ type JoinRequest struct {
 	Token string `json:"token"`
 	// NodeName is the name this node claims (bound by the node-password).
 	NodeName string `json:"nodeName"`
-	// NodeIP is the node's advertised InternalIP (the only IP SAN the CSR approver
-	// permits).
-	NodeIP string `json:"nodeIP"`
+	// NodeIP is OPTIONAL, and it is an ASSERTION, not a choice: the server assigns
+	// this node's mesh address itself (the mesh enroll's reuse-by-name, else the
+	// lowest free index) and names THAT in the issued certificates. When this field
+	// is set and differs from the assignment the join is refused before any CSR is
+	// parsed; when it is empty the assignment is used. A client therefore cannot
+	// obtain a certificate naming an address the allocator gave another node.
+	NodeIP string `json:"nodeIP,omitempty"`
 	// NodePassword is the anti-impersonation secret (stored hashed + first-write-wins
 	// server-side).
 	NodePassword string `json:"nodePassword"`
@@ -137,6 +141,14 @@ type JoinResponse struct {
 	SchemaVersion int32 `json:"schemaVersion"`
 	// NodeName is the joining node's name (echoed back).
 	NodeName string `json:"nodeName"`
+	// NodeIP is the InternalIP the issued certificates NAME: this node's
+	// server-assigned mesh address (the same value as Mesh.MeshIP, carried
+	// separately because it is a statement about the certificates, not about the
+	// mesh snapshot). The joining node advertises it as its Node InternalIP and
+	// binds its serving endpoint to it, so the address in its certificates and the
+	// address the cluster knows it by are one value. Empty only against a server
+	// that predates the field, where the node's own --node-ip was that value.
+	NodeIP string `json:"nodeIP,omitempty"`
 	// ClusterCAPEM is the cluster CA the node embeds in its kubeconfig's
 	// certificate-authority-data to verify the apiserver going forward.
 	ClusterCAPEM string `json:"clusterCAPEM"`

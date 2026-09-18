@@ -69,7 +69,7 @@ type agentOptions struct {
 	token     string // K10<caHash>::<user>:<secret>
 	tokenFile string // a file holding that token, read once at start (see applyTokenFile)
 	nodeName  string
-	nodeIP    string // this node's mesh InternalIP (bound into the issued certs)
+	nodeIP    string // OPTIONAL assertion of this node's mesh InternalIP; the join assigns it
 	workDir   string
 	podRoot   string
 	// logs is the container-log flag group, passed through to the node this
@@ -94,7 +94,7 @@ func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN) — required for a node's FIRST join only; a node that has already joined starts from its stored credential, and a token for the same cluster is ignored")
 	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding the K10 join token, read once at start and preferred over --token and $K3SM_TOKEN. It must not be group- or world-readable. This is how a supervised agent is given a token: a LaunchDaemon plist is world-readable, so the daemon is told where the token is and never what it is")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
-	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's mesh InternalIP (required; bound into the issued certs)")
+	fs.StringVar(&opts.nodeIP, "node-ip", "", "optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold)")
 	fs.StringVar(&opts.workDir, "work-dir", "/var/lib/k3sm/agent", "agent state root (node kubeconfig, node-password, certs)")
 	fs.StringVar(&opts.podRoot, "pod-root", "", "runtimed on-disk root (image cache + pod dirs); empty derives <work-dir parent> so the SBPL work-dir resides under the daemon home — set this to move PVCs off /Users, which the sandbox always denies")
 	registerContainerLogFlags(fs, &opts.logs)
@@ -181,8 +181,12 @@ func runAgent(args []string) error {
 	// agent that re-ran its join on every start stopped being able to start a day
 	// after it was installed; a node that has already joined presents what it
 	// holds instead.
-	if opts.server == "" || opts.nodeIP == "" {
-		return fmt.Errorf("--server and --node-ip are required")
+	// --node-ip is deliberately NOT required either. This node's mesh address is
+	// the control plane's to assign, and the join now carries it back, so an
+	// operator who does not pass one is not guessing at an address only the
+	// allocator knows.
+	if opts.server == "" {
+		return fmt.Errorf("--server is required")
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -521,8 +525,10 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 	}
 
 	bootstrapURL := "https://" + joinHost
+	// --node-ip is logged as what it now is: an assertion the server checks, empty
+	// on the shipped path where the control plane assigns the address.
 	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
-		"nodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
+		"assertedNodeIP", opts.nodeIP, "meshEndpoint", meshEndpoint)
 	res, err := bootstrap.Join(ctx, bootstrap.JoinOptions{
 		Server:       bootstrapURL,
 		Token:        opts.token,
@@ -538,7 +544,7 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 	if err != nil {
 		return nil, "", fmt.Errorf("join: %w", err)
 	}
-	logger.Info("joined", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
+	logger.Info("joined", "nodeIP", res.NodeIP, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	return res, meshEndpoint, nil
 }
 
@@ -564,7 +570,10 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 	// at join time.
 	d := &localAddrDialer{dialer: net.Dialer{Timeout: 10 * time.Second}}
 	d.probe(ctx, joinHost)
-	meshEndpoint, err := underlayMeshEndpoint(d.localIP(), opts.nodeIP, opts.meshPort)
+	// The mesh address to exclude from the endpoint candidates is the STORED
+	// assignment, not the flag: a resuming node has the server's answer on disk and
+	// the flag is optional.
+	meshEndpoint, err := underlayMeshEndpoint(d.localIP(), credInternalIP(cred, opts.nodeIP), opts.meshPort)
 	if err != nil {
 		return nil, "", err
 	}
@@ -599,7 +608,7 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		listen:     serverKubeletListen,
 		podRoot:    opts.podRoot,
 		logs:       opts.logs,
-		nodeIP:     opts.nodeIP,
+		nodeIP:     agentInternalIP(opts.nodeIP, res),
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
@@ -653,6 +662,41 @@ func requireJoinedServingPair(res *bootstrap.JoinResult) error {
 		return fmt.Errorf("join delivered a kubelet serving certificate with no private key: %w", errHalfKubeletServingPair)
 	}
 	return nil
+}
+
+// agentInternalIP is the address this worker holds inside the cluster: the one
+// its Node object advertises, its kubelet serving certificate is bound to, and
+// its Service proxy sources cross-node dials from.
+//
+// It comes from the JOIN, not from --node-ip, and the order is the point. The
+// server assigns the address and issues the certificates for it, so the join
+// result (or, on a restart, the stored assignment it was rebuilt from) is the
+// only value that is guaranteed to match what this node's certificates say. The
+// flag is an assertion the server has already checked for equality — a
+// mismatching one never gets this far — so it is the last resort here, kept for
+// the one server that cannot answer: one that predates the response field.
+//
+// It is pure so the wiring it decides is unit-tested without a live join.
+func agentInternalIP(flagIP string, res *bootstrap.JoinResult) string {
+	if res != nil {
+		if res.NodeIP != "" {
+			return res.NodeIP
+		}
+		if res.MeshIP != "" {
+			return res.MeshIP
+		}
+	}
+	return flagIP
+}
+
+// credInternalIP is agentInternalIP for the restart path, where the stored
+// assignment stands in for the join response: the mesh-egress /32 the server
+// assigned IS the address its certificates name.
+func credInternalIP(cred *nodeCredential, flagIP string) string {
+	if cred != nil && cred.Assignment.MeshIP != "" {
+		return cred.Assignment.MeshIP
+	}
+	return flagIP
 }
 
 // meshDatapath is the consumer-side view of the wireguard mesh bringUpMesh
@@ -1131,7 +1175,7 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		WorkDir:           opts.workDir,
 		DNSVIP:            opts.clusterIP,
 		ClusterDomain:     opts.domain,
-		NodeIP:            opts.nodeIP,
+		NodeIP:            agentInternalIP(opts.nodeIP, res),
 		PodCIDR:           res.PodCIDR,
 		MeshEgressIP:      res.MeshIP,
 		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),

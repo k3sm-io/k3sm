@@ -184,6 +184,19 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		}
 	})
 
+	t.Run("no --node-ip renders no --node-ip", func(t *testing.T) {
+		// B338: the mesh address is the control plane's to assign, so an install
+		// that asserts none must leave the flag off the daemon's argv entirely.
+		// Rendering it with an empty value is not "no assertion" but an
+		// unparseable one, discovered a join later.
+		cfg := Config{Role: RoleAgent, JoinServer: "192.0.2.10"}
+		plist := string(AgentPlist(cfg))
+		if strings.Contains(plist, "--node-ip") {
+			t.Errorf("the agent plist renders --node-ip with none asserted:\n%s", plist)
+		}
+		mustContain(t, plist, "<string>--server</string>")
+	})
+
 	t.Run("the token is staged where the unprivileged daemon can read it", func(t *testing.T) {
 		shrinkRestartBudgets(t)
 		f := &fakeSystem{}

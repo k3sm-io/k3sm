@@ -131,9 +131,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.StringVar(&o.targetUser, "user", os.Getenv("SUDO_USER"), "the human whose ~/.kube/config receives the admin kubeconfig (default $SUDO_USER)")
 	fs.StringVar(&o.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR")
-	fs.BoolVar(&o.agent, "agent", false, "install this Mac as a WORKER that joins an existing cluster (the io.k3sm.agent daemon) instead of as the control plane; needs --server and --node-ip")
+	fs.BoolVar(&o.agent, "agent", false, "install this Mac as a WORKER that joins an existing cluster (the io.k3sm.agent daemon) instead of as the control plane; needs --server")
 	fs.StringVar(&o.server, "server", "", "with --agent: the control-plane host to join, an UNDERLAY address (a LAN IP or DNS name, no scheme, no port) because the join dials <host>:9345 before this node has any mesh")
-	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: this Mac's own mesh InternalIP, bound into the certificates the join issues")
+	fs.StringVar(&o.nodeIP, "node-ip", "", "with --agent: optional; the join assigns this Mac's mesh address, pass it only to assert the expected value (a value that differs from the assignment fails the join instead of minting a certificate for an address this node does not hold)")
 	fs.StringVar(&o.tokenFile, "token-file", "", "with --agent: a file holding the join token, read once at each daemon start (a joined node needs none). It must not be group- or world-readable, and it is yours to delete once the node is Ready")
 	fs.BoolVar(&o.printRequired, "print-required-artifacts", false, "print the artifacts that must sit beside this binary (one per line, relative) and exit; needs no privilege")
 	fs.BoolVar(&o.dataVolume, "data-volume", false, "keep the data root on a dedicated, size-capped APFS volume: create it, adopt an existing one, or migrate onto it")
@@ -211,8 +211,13 @@ func (o installFlags) role() install.Role {
 }
 
 // validateRole is the flag-level contract of the two roles, decided before any
-// privilege is taken: an agent install must say where to join and as what
-// address, and neither role may be given the other's flags.
+// privilege is taken: an agent install must say where to join, and neither role
+// may be given the other's flags.
+//
+// It does NOT require --node-ip. The address this Mac holds inside the mesh is
+// the control plane's to assign, and the join returns it; requiring it here made
+// every agent install start by guessing at a value only the server's allocator
+// knew. It stays accepted as an assertion, which the server checks.
 //
 // The refusals are separate sentences rather than one "invalid combination"
 // because each names a different mistake, and the operator is at a terminal
@@ -226,8 +231,8 @@ func (o installFlags) validateRole() error {
 		}
 		return nil
 	}
-	if o.server == "" || o.nodeIP == "" {
-		return fmt.Errorf("--agent needs --server (the control-plane host to join, an underlay address) and --node-ip (this Mac's own mesh address)")
+	if o.server == "" {
+		return fmt.Errorf("--agent needs --server (the control-plane host to join, an underlay address)")
 	}
 	for _, name := range serverOnlyInstallFlags {
 		if o.set[name] {

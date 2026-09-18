@@ -275,7 +275,12 @@ func cleanUpTmp(f *os.File, tmp string, err error) error {
 // exactly the same structure into exactly the same code.
 func joinResultFrom(c *nodeCredential, nodeName, wgPrivB64, wgPubB64 string) *bootstrap.JoinResult {
 	return &bootstrap.JoinResult{
-		NodeName:              nodeName,
+		NodeName: nodeName,
+		// The stored assignment IS the address the stored certificates name: the
+		// server issues them for the mesh address it assigned, so a restart reads
+		// this node's InternalIP back rather than re-deriving it from an argv the
+		// operator no longer has to pass.
+		NodeIP:                c.Assignment.MeshIP,
 		ClusterCAPEM:          c.ClusterCAPEM,
 		ClientCAPEM:           c.ClientCAPEM,
 		NodeClientCertPEM:     c.ClientCertPEM,
