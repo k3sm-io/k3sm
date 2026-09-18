@@ -40,7 +40,7 @@ type capturingEnroller struct {
 	reqs []netv1.MeshEnrollRequest
 }
 
-func (c *capturingEnroller) Enroll(_ context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
+func (c *capturingEnroller) Enroll(_ context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	c.mu.Lock()
 	c.reqs = append(c.reqs, req)
 	c.mu.Unlock()
@@ -48,7 +48,13 @@ func (c *capturingEnroller) Enroll(_ context.Context, nodeName string, req netv1
 		NodeName: nodeName,
 		PodCIDR:  "100.64.1.0/24",
 		MeshIP:   "100.64.1.1",
-	}.WithDefaults(), nil
+	}.WithDefaults(), bootstrap.AllocationReused, nil
+}
+
+// ReleaseAllocation satisfies bootstrap.Enroller. This fixture's assignment is
+// fixed, so it carves nothing and nothing may be reaped from it.
+func (c *capturingEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+	return fmt.Errorf("the join fixture's enroller was asked to release %q, an allocation it never carved", nodeName)
 }
 
 // RefreshEndpoint satisfies bootstrap.Enroller. This fixture exercises the JOIN

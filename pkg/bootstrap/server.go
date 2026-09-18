@@ -17,6 +17,7 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -174,40 +175,85 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Controller-mediated mesh enroll (writes THIS node's MeshPeer + peer
+	// 3. The CSRs, as far as they can be judged WITHOUT an address: structure,
+	// proof of possession, key, and the SAN policy fixed by the node's NAME
+	// (CheckNodeCSR). Everything decidable here is decided HERE, before the
+	// enroll, because the enroll ALLOCATES: a rejection on its far side leaves a
+	// MeshPeer and a pod /24 behind, and index recycling across node deletes does
+	// not exist — so a token holder could burn the cluster's index space with
+	// joins that abort at a CSR it never meant to have signed. All that is left
+	// after the enroll is the signer's own judgement about the assigned address.
+	clientCSR, err := parseCSR(req.ClientCSRPEM)
+	if err != nil {
+		s.cfg.Logger.Warn("join rejected", "reason", "csr-parse", "node", req.NodeName, "err", err)
+		http.Error(w, "parse client CSR: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := CheckNodeCSR(clientCSR, req.NodeName); err != nil {
+		s.cfg.Logger.Warn("join rejected", "reason", "csr-denied", "node", req.NodeName, "err", err)
+		http.Error(w, "client CSR denied", http.StatusForbidden)
+		return
+	}
+	var servingCSR *x509.CertificateRequest
+	if req.ServingCSRPEM != "" {
+		servingCSR, err = parseCSR(req.ServingCSRPEM)
+		if err != nil {
+			s.cfg.Logger.Warn("join rejected", "reason", "serving-csr-parse", "node", req.NodeName, "err", err)
+			http.Error(w, "parse serving CSR: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := CheckNodeCSR(servingCSR, req.NodeName); err != nil {
+			s.cfg.Logger.Warn("join rejected", "reason", "serving-csr-denied", "node", req.NodeName, "err", err)
+			http.Error(w, "serving CSR denied", http.StatusForbidden)
+			return
+		}
+	}
+
+	// 4. Controller-mediated mesh enroll (writes THIS node's MeshPeer + peer
 	// snapshot). It runs BEFORE any certificate is signed because it is what
 	// DECIDES this node's mesh address — reusing the assignment already held under
 	// this node name, else carving the lowest free index — and that address, not
 	// anything the client asked for, is the InternalIP the issued certificates
 	// name. Signing first would mean signing for an address the allocator had not
 	// yet agreed to.
-	meshResp, err := s.cfg.Enroller.Enroll(r.Context(), req.NodeName, req.Mesh)
+	//
+	// From here to the response, EVERY failure path releases a FRESH allocation
+	// (see releaseFresh): the index this join carved is the index this join must
+	// give back when it does not finish.
+	meshResp, alloc, err := s.cfg.Enroller.Enroll(r.Context(), req.NodeName, req.Mesh)
 	if err != nil {
+		// An enroll can fail with the peer already written (its own list-back, say),
+		// in which case it reports the fresh allocation it made — so this is a reap
+		// site like every other one below, not a no-op.
+		s.releaseFresh(r, req.NodeName, alloc, "enroll-write")
 		s.cfg.Logger.Error("join rejected", "reason", "enroll-write", "node", req.NodeName, "err", err)
 		http.Error(w, "mesh enroll failed", http.StatusInternalServerError)
 		return
 	}
 	assignedIP, err := netip.ParseAddr(strings.TrimSpace(meshResp.MeshIP))
 	if err != nil {
+		s.releaseFresh(r, req.NodeName, alloc, "no-assigned-address")
 		s.cfg.Logger.Error("join rejected", "reason", "no-assigned-address", "node", req.NodeName, "meshIP", meshResp.MeshIP, "err", err)
 		http.Error(w, "mesh enroll assigned no usable node address", http.StatusInternalServerError)
 		return
 	}
 
-	// 3a. The OPTIONAL equality gate on the client's declared address. The
+	// 4a. The OPTIONAL equality gate on the client's declared address. The
 	// assignment above is authoritative either way: this is not where the address
 	// is chosen, it is where an operator's stated expectation is checked against
-	// the choice. A mismatch is refused HERE — before a CSR is parsed, let alone
-	// signed — so a client can never obtain a certificate naming an address the
-	// allocator gave some other node. The message names the two addresses in play
-	// and nothing else about the allocator's state.
+	// the choice. A mismatch is refused HERE — before anything is signed — so a
+	// client can never obtain a certificate naming an address the allocator gave
+	// some other node. The message names the two addresses in play and nothing
+	// else about the allocator's state.
 	if req.NodeIP != "" {
 		requested, perr := netip.ParseAddr(strings.TrimSpace(req.NodeIP))
 		if perr != nil {
+			s.releaseFresh(r, req.NodeName, alloc, "node-ip-unparseable")
 			http.Error(w, fmt.Sprintf("nodeIP %q is not an IP address", req.NodeIP), http.StatusBadRequest)
 			return
 		}
 		if requested != assignedIP {
+			s.releaseFresh(r, req.NodeName, alloc, "node-ip-mismatch")
 			s.cfg.Logger.Warn("join rejected", "reason", "node-ip-mismatch", "node", req.NodeName, "requested", requested.String(), "assigned", assignedIP.String())
 			http.Error(w, fmt.Sprintf(
 				"join refused: this node's address is assigned by the control plane: %s was requested, but this node is assigned %s (drop --node-ip, or pass %s)",
@@ -218,29 +264,24 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	id := NodeIdentity{NodeName: req.NodeName, InternalIP: assignedIP.String()}
 
-	// 4. HTTP-CSR → system:node client cert (SAN-bound to the authenticated node).
-	clientCSR, err := parseCSR(req.ClientCSRPEM)
-	if err != nil {
-		http.Error(w, "parse client CSR: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+	// 5. The CSRs → a system:node client cert (signing CA) and an optional
+	// kubelet-serving cert (cluster CA → --kubelet-certificate-authority), both
+	// SAN-bound to the assigned address. This is all that is left of the CSRs:
+	// they were parsed and shape-checked in step 3, so what can still fail here is
+	// the address-dependent SAN check and the signer itself.
 	clientCert, err := ApproveAndSignNodeCSR(s.cfg.SigningCA, clientCSR, id, s.cfg.NodeCertTTL)
 	if err != nil {
+		s.releaseFresh(r, req.NodeName, alloc, "csr-denied")
 		s.cfg.Logger.Warn("join rejected", "reason", "csr-denied", "node", req.NodeName, "err", err)
 		http.Error(w, "client CSR denied", http.StatusForbidden)
 		return
 	}
 
-	// 4b. Optional kubelet-serving cert (cluster CA → --kubelet-certificate-authority).
 	var servingCert []byte
-	if req.ServingCSRPEM != "" {
-		servingCSR, err := parseCSR(req.ServingCSRPEM)
-		if err != nil {
-			http.Error(w, "parse serving CSR: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	if servingCSR != nil {
 		servingCert, err = ApproveAndSignKubeletServing(s.cfg.ClusterCA, servingCSR, id, s.cfg.NodeCertTTL)
 		if err != nil {
+			s.releaseFresh(r, req.NodeName, alloc, "serving-csr-denied")
 			s.cfg.Logger.Warn("join rejected", "reason", "serving-csr-denied", "node", req.NodeName, "err", err)
 			http.Error(w, "serving CSR denied", http.StatusForbidden)
 			return
@@ -264,6 +305,41 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.Logger.Info("node joined", "node", req.NodeName, "nodeIP", assignedIP.String(), "podCIDR", meshResp.PodCIDR)
+}
+
+// releaseTimeout bounds the reap of a failed join's mesh allocation. It is short
+// because the join it belongs to has already failed and the handler is holding the
+// response open; it is not zero because the delete + list-back is a real apiserver
+// round trip.
+const releaseTimeout = 10 * time.Second
+
+// releaseFresh gives back the mesh index a failing join carved — and only that: a
+// REUSED allocation belongs to an earlier SUCCESSFUL join, and deleting its peer
+// because a later join's CSR was bad would strand a live node's pod network on a
+// failure that never touched it. AllocationReused is the zero value, so an enroller
+// that cannot tell the two apart leaks an index rather than deleting someone's peer.
+//
+// The release runs through the enroller, under the SAME lock the assignment took,
+// so a concurrent join of another node cannot be handed this index between the
+// failure and the release.
+//
+// It deliberately does NOT inherit the request's cancellation. A client that hangs
+// up the instant its CSR is refused would otherwise defeat its own reap and keep
+// the index — which is precisely the burn this exists to prevent, performed on
+// purpose. A reap that still fails is LOGGED and nothing more: the join is already
+// failing, and the caller must see its own error, not this one.
+func (s *Server) releaseFresh(r *http.Request, nodeName string, alloc Allocation, reason string) {
+	if alloc != AllocationFresh {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), releaseTimeout)
+	defer cancel()
+	if err := s.cfg.Enroller.ReleaseAllocation(ctx, nodeName); err != nil {
+		s.cfg.Logger.Error("the mesh allocation of a failed join was not released",
+			"node", nodeName, "reason", reason, "err", err)
+		return
+	}
+	s.cfg.Logger.Info("released the mesh allocation of a failed join", "node", nodeName, "reason", reason)
 }
 
 // handleBundle serves the AES-256-GCM-sealed CA bootstrap bundle to a joining

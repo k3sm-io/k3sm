@@ -264,9 +264,11 @@ func (stubNodePasswords) Ensure(context.Context, string, string) error { return 
 
 type stubEnroller struct{}
 
-func (stubEnroller) Enroll(context.Context, string, netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, error) {
-	return netv1.MeshEnrollResponse{}, nil
+func (stubEnroller) Enroll(context.Context, string, netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
+	return netv1.MeshEnrollResponse{}, bootstrap.AllocationReused, nil
 }
+
+func (stubEnroller) ReleaseAllocation(context.Context, string) error { return nil }
 
 func (stubEnroller) RefreshEndpoint(context.Context, string, string) error { return nil }
 

@@ -17,6 +17,10 @@ limitations under the License.
 package bootstrap
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
@@ -43,7 +47,87 @@ var (
 	// that is not bound to the authenticated node — the approver refuses to mint a
 	// certificate naming a node other than the one the bootstrap identity proved.
 	ErrCrossNodeSAN = errors.New("bootstrap: CSR requests a SAN bound to a different node")
+	// ErrUnsupportedCSRKey is returned when a CSR's public key is not one a node
+	// credential may be issued over: an unknown algorithm, a curve outside the NIST
+	// set the rest of the stack speaks, or an undersized RSA modulus.
+	ErrUnsupportedCSRKey = errors.New("bootstrap: CSR public key is not an acceptable node key")
 )
+
+// minRSAKeyBits is the smallest RSA modulus a node CSR may carry. k3sm's own
+// client mints P-256 (join.go generateCSR); the bound exists for a CSR this
+// server did not generate.
+const minRSAKeyBits = 2048
+
+// CheckNodeCSR validates everything about a joining node's CSR that can be judged
+// WITHOUT the mesh address the enroll has not yet assigned: the self-signature
+// (the proof that the requester holds the private key), the public key, and the
+// half of the SAN policy that does not depend on the address — no DNS SAN naming
+// another identity, and no more IP SANs than the one a node may assert about
+// itself.
+//
+// It exists to be called BEFORE the enroll. The enroll ALLOCATES this node's pod
+// /24, so every rejection on its far side leaves a MeshPeer and an index behind;
+// a token holder could otherwise burn the cluster's index space with joins that
+// abort at a CSR it never intended to be signed. What this cannot judge — whether
+// an IP SAN is the address the allocator actually assigned — stays with the
+// approver (NodeIdentity.checkSANs), which is the only thing left on the far side.
+func CheckNodeCSR(csr *x509.CertificateRequest, nodeName string) error {
+	if csr == nil || nodeName == "" {
+		return ErrEmptyIdentity
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return fmt.Errorf("verify CSR self-signature: %w", err)
+	}
+	if err := checkCSRKey(csr.PublicKey); err != nil {
+		return err
+	}
+	if err := checkDNSSANs(csr.DNSNames, nodeName); err != nil {
+		return err
+	}
+	if len(csr.IPAddresses) > 1 {
+		return fmt.Errorf("%w: %d IP SANs requested, and a node asserts at most its own address", ErrCrossNodeSAN, len(csr.IPAddresses))
+	}
+	return nil
+}
+
+// checkCSRKey accepts the key types a node credential may be issued over: NIST
+// ECDSA, Ed25519, and RSA at or above minRSAKeyBits. Anything else is refused
+// rather than handed to the CA, because a key the signer accepts but the kubelet's
+// TLS stack cannot use fails much later and much less legibly.
+func checkCSRKey(pub any) error {
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		switch k.Curve {
+		case elliptic.P256(), elliptic.P384(), elliptic.P521():
+			return nil
+		}
+		return fmt.Errorf("%w: the ECDSA curve is outside P-256/P-384/P-521", ErrUnsupportedCSRKey)
+	case ed25519.PublicKey:
+		return nil
+	case *rsa.PublicKey:
+		if bits := k.N.BitLen(); bits < minRSAKeyBits {
+			return fmt.Errorf("%w: the RSA key is %d bits, below the %d-bit minimum", ErrUnsupportedCSRKey, bits, minRSAKeyBits)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: %T", ErrUnsupportedCSRKey, pub)
+	}
+}
+
+// checkDNSSANs rejects any DNS SAN not bound to nodeName. The permitted set — the
+// bare node name, its system:node: form, and localhost — is fixed by the node's
+// NAME alone, which is what makes this half of the SAN policy decidable before the
+// enroll assigns an address (see CheckNodeCSR).
+func checkDNSSANs(names []string, nodeName string) error {
+	for _, d := range names {
+		switch d {
+		case nodeName, systemNodePrefix + nodeName, "localhost":
+		default:
+			return fmt.Errorf("%w: DNS SAN %q is not node %q", ErrCrossNodeSAN, d, nodeName)
+		}
+	}
+	return nil
+}
 
 // NodeIdentity is the authenticated bootstrap context a CSR is approved against: the
 // node name the node-password bound and the node's InternalIP. The approver binds
@@ -79,14 +163,7 @@ func (id NodeIdentity) checkSANs(csr *x509.CertificateRequest, ip net.IP) error 
 			return fmt.Errorf("%w: IP SAN %s is not node %q InternalIP %s", ErrCrossNodeSAN, reqIP, id.NodeName, id.InternalIP)
 		}
 	}
-	for _, d := range csr.DNSNames {
-		switch d {
-		case id.NodeName, systemNodePrefix + id.NodeName, "localhost":
-		default:
-			return fmt.Errorf("%w: DNS SAN %q is not node %q", ErrCrossNodeSAN, d, id.NodeName)
-		}
-	}
-	return nil
+	return checkDNSSANs(csr.DNSNames, id.NodeName)
 }
 
 // ApproveAndSignNodeCSR validates csr against id (rejecting any cross-node SAN) and,
