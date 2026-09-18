@@ -251,11 +251,11 @@ func TestEnrollReleaseAllocationFreesTheIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enroll: %v", err)
 	}
-	if alloc != bootstrap.AllocationFresh || first.PodCIDR != "100.64.1.0/24" {
+	if !alloc.Fresh || first.PodCIDR != "100.64.1.0/24" {
 		t.Fatalf("precondition: enroll reported (%v, %q), want (fresh, 100.64.1.0/24)", alloc, first.PodCIDR)
 	}
 
-	if err := e.ReleaseAllocation(context.Background(), "worker-a"); err != nil {
+	if err := e.ReleaseAllocation(context.Background(), "worker-a", alloc); err != nil {
 		t.Fatalf("ReleaseAllocation: %v", err)
 	}
 	if p := api.peer("worker-a"); p != nil {
@@ -263,21 +263,117 @@ func TestEnrollReleaseAllocationFreesTheIndex(t *testing.T) {
 	}
 
 	// Free in the sense that matters: the next node is assigned the same index.
-	next, alloc, err := e.Enroll(context.Background(), "worker-b", enrollRequest("worker-b"))
+	next, nextAlloc, err := e.Enroll(context.Background(), "worker-b", enrollRequest("worker-b"))
 	if err != nil {
 		t.Fatalf("the enroll after the release: %v", err)
 	}
-	if next.PodCIDR != "100.64.1.0/24" || alloc != bootstrap.AllocationFresh {
-		t.Errorf("the next node was assigned (%q, %v), want the freed (100.64.1.0/24, fresh)", next.PodCIDR, alloc)
+	if next.PodCIDR != "100.64.1.0/24" || !nextAlloc.Fresh {
+		t.Errorf("the next node was assigned (%q, %v), want the freed (100.64.1.0/24, fresh)", next.PodCIDR, nextAlloc)
 	}
 
 	// Idempotent: a peer that is already gone is the state the reap asks for, and
 	// a re-run of a failed join's cleanup must not become an error of its own.
-	if err := e.ReleaseAllocation(context.Background(), "worker-c"); err != nil {
+	if err := e.ReleaseAllocation(context.Background(), "worker-c", alloc); err != nil {
 		t.Errorf("releasing an absent allocation must be success, got %v", err)
 	}
-	if err := e.ReleaseAllocation(context.Background(), ""); err == nil {
+	if err := e.ReleaseAllocation(context.Background(), "", alloc); err == nil {
 		t.Error("releasing an unnamed node must be refused")
+	}
+}
+
+// TestEnrollStampsEveryWriteAndTheReleaseObeysIt is the enroller half of the
+// fence: a join gives back the peer IT wrote, identified by the id its own enroll
+// stamped, and keeps a peer a LATER enroll of the same node name has re-stamped.
+//
+// The node name cannot make that distinction and neither can the peer's content:
+// a retrying node presents the wireguard key it persisted and the endpoint it
+// still owns, so the second write is byte-identical to the first. The id is the
+// only thing that differs, which is why it is minted per enroll rather than
+// derived from what was written.
+func TestEnrollStampsEveryWriteAndTheReleaseObeysIt(t *testing.T) {
+	e, api := enrollerOverStub(t)
+	seedPeer(t, api, "k3sm-server", "100.64.0.0/24")
+	ctx := context.Background()
+
+	first, firstAlloc, err := e.Enroll(ctx, "worker-a", enrollRequest("worker-a"))
+	if err != nil {
+		t.Fatalf("first Enroll: %v", err)
+	}
+	if firstAlloc.EnrollID == "" {
+		t.Fatal("the enroll reported no id; a join that fails afterwards has nothing to identify its own peer by")
+	}
+	if !firstAlloc.Fresh || first.PodCIDR != "100.64.1.0/24" {
+		t.Fatalf("precondition: first enroll reported (%v, %q), want (fresh, 100.64.1.0/24)", firstAlloc, first.PodCIDR)
+	}
+	stored := api.peer("worker-a")
+	if stored == nil {
+		t.Fatal("no MeshPeer named worker-a after the enroll")
+	}
+	if got := stored.Annotations[meshPeerEnrollIDAnnotation]; got != firstAlloc.EnrollID {
+		t.Fatalf("the written peer carries %s=%q, want the reported %q", meshPeerEnrollIDAnnotation, got, firstAlloc.EnrollID)
+	}
+
+	// An annotation this enroller did not write must survive the next update: the
+	// peer is reassembled from the enroll, so a blind write would drop it.
+	api.mu.Lock()
+	api.peers["worker-a"].Annotations["example.com/kept"] = "yes"
+	api.mu.Unlock()
+
+	// The retry: same node, same key, same endpoint. A REUSED allocation, and a
+	// new id — any later enroll re-stamps the object, which is what makes an older
+	// id a reliable "this is no longer mine".
+	_, secondAlloc, err := e.Enroll(ctx, "worker-a", enrollRequest("worker-a"))
+	if err != nil {
+		t.Fatalf("second Enroll: %v", err)
+	}
+	if secondAlloc.Fresh {
+		t.Error("the second enroll of a node that already holds an index reported fresh")
+	}
+	if secondAlloc.EnrollID == firstAlloc.EnrollID {
+		t.Fatal("two enrolls of the same node reported the same id; an identical retry would be indistinguishable from the join it replaced")
+	}
+	stored = api.peer("worker-a")
+	if got := stored.Annotations[meshPeerEnrollIDAnnotation]; got != secondAlloc.EnrollID {
+		t.Errorf("after the second enroll the peer carries %q, want %q", got, secondAlloc.EnrollID)
+	}
+	if got := stored.Annotations["example.com/kept"]; got != "yes" {
+		t.Errorf("the update dropped an annotation it did not write (example.com/kept = %q)", got)
+	}
+
+	// The FIRST join's failure arrives now. Its peer is gone — replaced by the
+	// second enroll's — so the release must keep what it finds.
+	api.mu.Lock()
+	deletesBefore := api.deletes
+	api.mu.Unlock()
+	if err := e.ReleaseAllocation(ctx, "worker-a", firstAlloc); err != nil {
+		t.Fatalf("releasing a superseded allocation must be success, got %v", err)
+	}
+	if api.peer("worker-a") == nil {
+		t.Fatal("the stale release deleted the peer the newer enroll wrote: a node that joined loses its pod network to an earlier request's failure")
+	}
+	api.mu.Lock()
+	deletesAfter := api.deletes
+	api.mu.Unlock()
+	if deletesAfter != deletesBefore {
+		t.Errorf("the stale release issued %d deletes, want none", deletesAfter-deletesBefore)
+	}
+
+	// An unidentified release is refused outright rather than falling back to a
+	// delete by name, which is the unfenced behaviour this exists to remove.
+	if err := e.ReleaseAllocation(ctx, "worker-a", bootstrap.Allocation{Fresh: true}); err == nil {
+		t.Error("a release carrying no enroll id must be refused")
+	}
+	if api.peer("worker-a") == nil {
+		t.Fatal("a release carrying no enroll id deleted the peer anyway")
+	}
+
+	// The CURRENT owner's release still works: the fence aims the release, it does
+	// not switch it off.
+	if err := e.ReleaseAllocation(ctx, "worker-a", secondAlloc); err != nil {
+		t.Fatalf("releasing the current allocation: %v", err)
+	}
+	if p := api.peer("worker-a"); p != nil {
+		t.Errorf("the MeshPeer survived its own join's release: %+v", p)
 	}
 }
 

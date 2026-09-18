@@ -316,8 +316,14 @@ const releaseTimeout = 10 * time.Second
 // releaseFresh gives back the mesh index a failing join carved — and only that: a
 // REUSED allocation belongs to an earlier SUCCESSFUL join, and deleting its peer
 // because a later join's CSR was bad would strand a live node's pod network on a
-// failure that never touched it. AllocationReused is the zero value, so an enroller
-// that cannot tell the two apart leaks an index rather than deleting someone's peer.
+// failure that never touched it. A reused allocation is the zero value, so an
+// enroller that cannot tell the two apart leaks an index rather than deleting
+// someone's peer.
+//
+// The whole Allocation is handed back to the enroller, not just the node name: it
+// carries the id of the write this join made, which is the only thing that
+// distinguishes the peer this join wrote from the one a LATER enroll of the same
+// node name wrote in the meantime (see Allocation).
 //
 // The release runs through the enroller, under the SAME lock the assignment took,
 // so a concurrent join of another node cannot be handed this index between the
@@ -329,12 +335,12 @@ const releaseTimeout = 10 * time.Second
 // purpose. A reap that still fails is LOGGED and nothing more: the join is already
 // failing, and the caller must see its own error, not this one.
 func (s *Server) releaseFresh(r *http.Request, nodeName string, alloc Allocation, reason string) {
-	if alloc != AllocationFresh {
+	if !alloc.Fresh {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), releaseTimeout)
 	defer cancel()
-	if err := s.cfg.Enroller.ReleaseAllocation(ctx, nodeName); err != nil {
+	if err := s.cfg.Enroller.ReleaseAllocation(ctx, nodeName, alloc); err != nil {
 		s.cfg.Logger.Error("the mesh allocation of a failed join was not released",
 			"node", nodeName, "reason", reason, "err", err)
 		return

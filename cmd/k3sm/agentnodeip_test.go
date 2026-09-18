@@ -54,6 +54,8 @@ type assigningEnroller struct {
 	mu       sync.Mutex
 	assigned map[string]string // nodeName -> podCIDR index
 	next     int
+	// enrolls counts Enroll calls, so each one reports a distinct allocation id.
+	enrolls int
 }
 
 func (e *assigningEnroller) Enroll(_ context.Context, nodeName string, _ netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
@@ -63,13 +65,14 @@ func (e *assigningEnroller) Enroll(_ context.Context, nodeName string, _ netv1.M
 		e.assigned = map[string]string{}
 		e.next = 1
 	}
-	alloc := bootstrap.AllocationReused
+	e.enrolls++
+	alloc := bootstrap.Allocation{EnrollID: fmt.Sprintf("enroll-%d", e.enrolls)}
 	cidr, ok := e.assigned[nodeName]
 	if !ok {
 		cidr = fmt.Sprintf("100.64.%d.0/24", e.next)
 		e.assigned[nodeName] = cidr
 		e.next++
-		alloc = bootstrap.AllocationFresh
+		alloc.Fresh = true
 	}
 	return netv1.MeshEnrollResponse{
 		NodeName: nodeName,
@@ -80,7 +83,7 @@ func (e *assigningEnroller) Enroll(_ context.Context, nodeName string, _ netv1.M
 
 // ReleaseAllocation drops the node's assignment, mirroring the shipped enroller's
 // reap of a join that failed after the enroll carved its index.
-func (e *assigningEnroller) ReleaseAllocation(_ context.Context, nodeName string) error {
+func (e *assigningEnroller) ReleaseAllocation(_ context.Context, nodeName string, _ bootstrap.Allocation) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.assigned, nodeName)

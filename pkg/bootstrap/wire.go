@@ -197,30 +197,42 @@ type BundleSource interface {
 }
 
 // Allocation says what an Enroll did with the cluster's pod-CIDR index space for
-// the node it enrolled: it ALLOCATED a fresh index, or it REUSED the one an
-// earlier join already assigned that name.
+// the node it enrolled — whether it ALLOCATED a fresh index or REUSED the one an
+// earlier join already assigned that name — and WHICH write it was.
 //
-// The distinction exists for exactly one caller — a join that fails on the far
-// side of the enroll (see Server.releaseFresh). A fresh allocation belongs to the
-// failing join and nothing else, so it is released; a reused one belongs to an
-// earlier SUCCESSFUL join, and deleting it would strand a live node's pod network
-// on a failure that never touched it.
-type Allocation int
-
-const (
-	// AllocationReused is the node's existing assignment, carried forward. It is
-	// the ZERO VALUE deliberately: an enroller that cannot tell the two apart
-	// reports "reused", and a reused allocation is never reaped — so the failure
-	// mode of an unconverted implementation is a leaked index, never a deleted
-	// peer belonging to a running node.
-	AllocationReused Allocation = iota
-	// AllocationFresh is an index this Enroll carved for a name that held none.
-	AllocationFresh
-)
+// It exists for exactly one caller: a join that fails on the far side of the
+// enroll (see Server.releaseFresh). Both fields answer a question that caller
+// cannot answer for itself:
+//
+//   - Fresh says whether there is anything to give back at all. A fresh
+//     allocation belongs to the failing join and nothing else; a reused one
+//     belongs to an earlier SUCCESSFUL join, and deleting it would strand a live
+//     node's pod network on a failure that never touched it.
+//   - EnrollID says WHICH peer object the failing join wrote, so a release can
+//     refuse to delete the peer a LATER enroll of the same node name has since
+//     written. The node name alone cannot distinguish the two, and neither can
+//     the peer's content: a launchd-orphaned retry of one node presents the same
+//     wireguard public key and the same endpoint, so the later write can be
+//     byte-identical to the earlier one.
+//
+// The ZERO VALUE is deliberately "reused, with nothing to release": an enroller
+// that cannot tell the two apart reports the zero value, and neither half of the
+// release fires on it — so the failure mode of an unconverted implementation is a
+// leaked index, never a deleted peer belonging to a running node.
+type Allocation struct {
+	// Fresh is true iff this Enroll carved an index for a name that held none.
+	Fresh bool
+	// EnrollID is the nonce this Enroll stamped on the peer it wrote. It is
+	// per-Enroll and CONTENT-INDEPENDENT — two enrolls of the same node with the
+	// same key and endpoint carry different ids — so a release can prove the peer
+	// in front of it is still the one its own join wrote. Empty means the enroll
+	// wrote no peer it can claim, and a release refuses to act on it.
+	EnrollID string
+}
 
 // String renders the allocation for logs.
 func (a Allocation) String() string {
-	if a == AllocationFresh {
+	if a.Fresh {
 		return "fresh"
 	}
 	return "reused"
@@ -237,12 +249,19 @@ type Enroller interface {
 	// contract rather than a detail: it is the only thing that tells a failing
 	// join whether the peer it is looking at is its own to release.
 	Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, Allocation, error)
-	// ReleaseAllocation deletes the MeshPeer a FRESH Enroll wrote for nodeName,
-	// after the join that carved it failed — freeing the pod /24 for the next node
-	// instead of burning it. It is idempotent (an already-absent peer is success)
-	// and it VERIFIES by list-back that the index is free again, because "the
-	// delete returned nil" and "the index can be assigned again" are different
-	// claims and only the second one is the point.
+	// ReleaseAllocation deletes the MeshPeer the FRESH Enroll reported by alloc
+	// wrote for nodeName, after the join that carved it failed — freeing the pod
+	// /24 for the next node instead of burning it. It is idempotent (an
+	// already-absent peer is success) and it VERIFIES by list-back that the index
+	// is free again, because "the delete returned nil" and "the index can be
+	// assigned again" are different claims and only the second one is the point.
+	//
+	// It is FENCED to the peer its own join wrote: alloc.EnrollID identifies that
+	// write, and a peer carrying any other id belongs to a later enroll of the
+	// same node name and is KEPT. Without the fence a failing join deletes the
+	// peer a concurrent rejoin of the same node is already relying on, because
+	// the two writes are indistinguishable by name and can be identical in
+	// content. An empty alloc.EnrollID is an error, never a delete.
 	//
 	// It removes the MeshPeer ONLY. Unlike Deregister it never touches the Node
 	// object: a join that failed at its CSR never got far enough to register one,
@@ -250,7 +269,7 @@ type Enroller interface {
 	//
 	// It runs under the SAME lock as Enroll, so a concurrent join of another node
 	// cannot be handed this index between the failure and the release.
-	ReleaseAllocation(ctx context.Context, nodeName string) error
+	ReleaseAllocation(ctx context.Context, nodeName string, alloc Allocation) error
 	// RefreshEndpoint updates ONLY spec.endpoint on the node's EXISTING MeshPeer.
 	// It never creates one: a node whose peer is gone has lost its podCIDR
 	// assignment too, and inventing a peer here would hand it an endpoint with no

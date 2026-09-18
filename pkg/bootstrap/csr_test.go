@@ -17,10 +17,18 @@ limitations under the License.
 package bootstrap_test
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,5 +117,105 @@ func TestKubeletServingFromClusterCA(t *testing.T) {
 	cross := newTestCSR(t, pkix.Name{}, nil, []net.IP{net.ParseIP("10.9.9.9")})
 	if _, err := bootstrap.ApproveAndSignKubeletServing(clusterCA, cross, id, time.Hour); !errors.Is(err, bootstrap.ErrCrossNodeSAN) {
 		t.Errorf("cross-node serving SAN err = %v, want ErrCrossNodeSAN", err)
+	}
+}
+
+// TestCheckNodeCSRKeyPolicy is the key table CheckNodeCSR applies before it spends
+// anything on a CSR: which key types and sizes a node credential may be issued
+// over, and — the last two rows — that an unacceptable key is refused BEFORE the
+// self-signature is verified.
+//
+// The ordering is the load-bearing half. Verifying a CSR's signature is the
+// expensive step and its cost is chosen by the unauthenticated caller who picked
+// the key, so an oversized modulus must cost a bit-length comparison and not a
+// verification. The refusable rows below are therefore built WITHOUT a valid
+// signature: reaching ErrUnsupportedCSRKey at all proves the key was judged first.
+//
+// The oversized row uses a 4097-bit modulus assembled directly rather than a
+// generated 8192-bit key: generation would add seconds to the package's tests to
+// exercise one BitLen comparison, and the bound is a comparison against
+// maxRSAKeyBits, not a property of a well-formed key.
+func TestCheckNodeCSRKeyPolicy(t *testing.T) {
+	t.Parallel()
+
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("P-256 key: %v", err)
+	}
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519 key: %v", err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("RSA-2048 key: %v", err)
+	}
+	smallRSAKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("RSA-1024 key: %v", err)
+	}
+	// 2^4096 + 1: 4097 bits, one over the maximum.
+	hugeModulus := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 4096), big.NewInt(1))
+
+	cases := []struct {
+		name string
+		csr  *x509.CertificateRequest
+		want error
+	}{
+		{"P-256, what the k3sm client mints", signedCSR(t, ecKey), nil},
+		{"ed25519", signedCSR(t, edKey), nil},
+		{"RSA at the minimum", signedCSR(t, rsaKey), nil},
+		{"RSA below the minimum", signedCSR(t, smallRSAKey), bootstrap.ErrUnsupportedCSRKey},
+		{"an ECDSA curve outside the NIST set", unsignedCSR(&ecdsa.PublicKey{Curve: elliptic.P224()}), bootstrap.ErrUnsupportedCSRKey},
+		{"a key type nothing in the stack speaks", unsignedCSR(struct{}{}), bootstrap.ErrUnsupportedCSRKey},
+		{"RSA above the maximum", unsignedCSR(&rsa.PublicKey{N: hugeModulus, E: 65537}), bootstrap.ErrUnsupportedCSRKey},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := bootstrap.CheckNodeCSR(tc.csr, "worker-a")
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("CheckNodeCSR = %v, want it accepted", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("CheckNodeCSR = %v, want %v", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "self-signature") {
+				t.Errorf("CheckNodeCSR spent a signature verification on an unacceptable key: %v", err)
+			}
+		})
+	}
+}
+
+// signedCSR mints a real, self-signed CSR over key — the form a joining node
+// submits, signature and all.
+func signedCSR(t *testing.T, key crypto.Signer) *x509.CertificateRequest {
+	t.Helper()
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject:  pkix.Name{CommonName: "system:node:worker-a"},
+		DNSNames: []string{"worker-a"},
+	}, key)
+	if err != nil {
+		t.Fatalf("create CSR: %v", err)
+	}
+	csr, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		t.Fatalf("parse CSR: %v", err)
+	}
+	return csr
+}
+
+// unsignedCSR is a CSR carrying pub and NO valid signature — a key nobody could
+// have proved possession of. Every check that runs after the key policy fails on
+// it, so an ErrUnsupportedCSRKey from one of these is proof the key was judged
+// first.
+func unsignedCSR(pub any) *x509.CertificateRequest {
+	return &x509.CertificateRequest{
+		Subject:   pkix.Name{CommonName: "system:node:worker-a"},
+		DNSNames:  []string{"worker-a"},
+		PublicKey: pub,
 	}
 }
