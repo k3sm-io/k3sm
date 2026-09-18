@@ -62,17 +62,25 @@ func TestInstallAgentFlags(t *testing.T) {
 	t.Run("--agent without a join target is refused", func(t *testing.T) {
 		for _, args := range [][]string{
 			{"--agent"},
-			{"--agent", "--server", "192.0.2.10"},
 			{"--agent", "--node-ip", "100.64.0.7"},
 		} {
 			_, err := parseInstallFlags(args)
 			if err == nil {
-				t.Errorf("%v was accepted; --agent needs both --server and --node-ip", args)
+				t.Errorf("%v was accepted; --agent needs --server", args)
 				continue
 			}
-			if !strings.Contains(err.Error(), "--server") || !strings.Contains(err.Error(), "--node-ip") {
-				t.Errorf("error %q must name both missing flags", err)
+			if !strings.Contains(err.Error(), "--server") {
+				t.Errorf("error %q must name the missing flag", err)
 			}
+		}
+	})
+
+	t.Run("--node-ip is optional on an agent", func(t *testing.T) {
+		// B338: this Mac's mesh address is the control plane's to assign and the
+		// join returns it, so requiring the flag here made every agent install
+		// start by guessing a value only the server's allocator knew.
+		if _, err := parseInstallFlags([]string{"--agent", "--server", "192.0.2.10"}); err != nil {
+			t.Fatalf("an agent install without --node-ip was refused: %v", err)
 		}
 	})
 

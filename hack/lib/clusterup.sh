@@ -666,8 +666,14 @@ agent_up() {
 		return 1 ;;
 	esac
 
+	# NO --node-ip: since B338 the SERVER assigns this node's address and issues
+	# its certificates for that assignment, so a join asserting 127.0.0.1 is
+	# refused (it names an address the allocator did not give this node). The
+	# joined node therefore registers with its assigned mesh address, which under
+	# `--network none` nothing plumbs — fine for a gate that watches Ready and
+	# runs pods, not for one that needs apiserver-to-kubelet reachability.
 	nohup env CGO_ENABLED=1 K3SM_TOKEN="$token" "${K3SM_CMD[@]}" agent \
-		--server 127.0.0.1 --node-name "$node_name" --node-ip 127.0.0.1 \
+		--server 127.0.0.1 --node-name "$node_name" \
 		--work-dir "$AGENT_WORKDIR" --pod-root "$AGENT_POD_ROOT" \
 		--runtime "$runtime" --network "$network" --api-port "$APISERVER_PORT" \
 		> "$K3SM_WORKDIR/agent.log" 2>&1 &

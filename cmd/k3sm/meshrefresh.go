@@ -176,7 +176,10 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 			// underlayMeshEndpoint falls back to its interface scan.
 			d := &localAddrDialer{dialer: net.Dialer{Timeout: 5 * time.Second}}
 			d.probe(ctx, joinHost)
-			return underlayMeshEndpoint(d.localIP(), opts.nodeIP, opts.meshPort)
+			// The mesh address the candidates are filtered against is the
+			// ASSIGNED one (agentInternalIP), so a node that passed no --node-ip
+			// still excludes its own mesh /32 from the endpoints it advertises.
+			return underlayMeshEndpoint(d.localIP(), agentInternalIP(opts.nodeIP, res), opts.meshPort)
 		},
 		publish: func(ctx context.Context, endpoint string) error {
 			return bootstrap.RefreshMeshEndpoint(ctx, client, serverURL, opts.nodeName, endpoint)

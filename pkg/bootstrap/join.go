@@ -28,6 +28,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -50,7 +51,12 @@ type JoinOptions struct {
 	Token string
 	// NodeName is the name this node claims.
 	NodeName string
-	// NodeIP is the node's advertised InternalIP (the SAN bound into the certs).
+	// NodeIP is OPTIONAL and is an ASSERTION of the address this node expects to be
+	// assigned, never a request for one: the server assigns the mesh address and
+	// issues the certificates for it (see JoinRequest.NodeIP). Empty lets the
+	// assignment stand, which is the shipped path; a value that differs from the
+	// assignment fails the join rather than minting a certificate for an address
+	// this node does not hold.
 	NodeIP string
 	// NodePassword is the anti-impersonation secret (the agent mints + persists it at
 	// 0600 once, then reuses it so the first-write-wins binding keeps matching).
@@ -81,7 +87,15 @@ type JoinOptions struct {
 // issued certs paired with the private keys the node kept, the assigned pod network,
 // the peer snapshot, and the node's wireguard keypair.
 type JoinResult struct {
-	NodeName     string
+	NodeName string
+	// NodeIP is the InternalIP the issued certificates name — this node's
+	// server-assigned mesh address. It is the response's value, falling back to the
+	// JoinOptions value only against a server that predates the field (which is
+	// exactly the server that required one). Every consumer of "what address is
+	// this node" takes it from here rather than from the flag, so the Node object,
+	// the kubelet serving cert and the mesh datapath cannot disagree with the
+	// certificate.
+	NodeIP       string
 	ClusterCAPEM []byte
 	// ClientCAPEM is the cluster's client-identity (signing) CA certificate — the
 	// anchor this node's OWN kubelet endpoint verifies the apiserver's client cert
@@ -143,23 +157,32 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if opts.NodeName == "" || opts.NodeIP == "" {
-		return nil, fmt.Errorf("bootstrap join: NodeName and NodeIP are required")
+	if opts.NodeName == "" {
+		return nil, fmt.Errorf("bootstrap join: NodeName is required")
 	}
-	ip := net.ParseIP(opts.NodeIP)
-	if ip == nil {
-		return nil, fmt.Errorf("bootstrap join: NodeIP %q is not an IP", opts.NodeIP)
+	// The CSRs carry an IP SAN only when this node ASSERTS an address. With no
+	// assertion there is nothing truthful to put there — the address is the
+	// server's to assign — and none is needed: the approver ignores the CSR's
+	// subject and SANs and stamps the assignment itself, while an IP SAN naming
+	// anything else is exactly what it refuses (csr.go checkSANs).
+	var ips []net.IP
+	if opts.NodeIP != "" {
+		ip := net.ParseIP(opts.NodeIP)
+		if ip == nil {
+			return nil, fmt.Errorf("bootstrap join: NodeIP %q is not an IP", opts.NodeIP)
+		}
+		ips = []net.IP{ip}
 	}
 
 	clientKeyPEM, clientCSRPEM, err := generateCSR(
 		pkix.Name{CommonName: systemNodePrefix + opts.NodeName, Organization: []string{systemNodesGroup}},
-		[]string{opts.NodeName}, []net.IP{ip})
+		[]string{opts.NodeName}, ips)
 	if err != nil {
 		return nil, fmt.Errorf("generate client CSR: %w", err)
 	}
 	servingKeyPEM, servingCSRPEM, err := generateCSR(
 		pkix.Name{CommonName: opts.NodeName},
-		[]string{opts.NodeName, "localhost"}, []net.IP{ip})
+		[]string{opts.NodeName, "localhost"}, ips)
 	if err != nil {
 		return nil, fmt.Errorf("generate serving CSR: %w", err)
 	}
@@ -199,8 +222,16 @@ func Join(ctx context.Context, opts JoinOptions) (*JoinResult, error) {
 		return nil, err
 	}
 
+	// The address the certificates name. A server that answers with one is
+	// authoritative about its own issuance; a server that predates the field
+	// required opts.NodeIP, and issued for exactly that.
+	nodeIP := resp.NodeIP
+	if nodeIP == "" {
+		nodeIP = opts.NodeIP
+	}
 	return &JoinResult{
 		NodeName:              resp.NodeName,
+		NodeIP:                nodeIP,
 		ClusterCAPEM:          []byte(resp.ClusterCAPEM),
 		ClientCAPEM:           []byte(resp.ClientCAPEM),
 		NodeClientCertPEM:     []byte(resp.NodeClientCertPEM),
@@ -236,7 +267,16 @@ func postJSON(ctx context.Context, client *http.Client, url string, body JoinReq
 	if httpResp.StatusCode/100 != 2 {
 		msg := make([]byte, 512)
 		n, _ := httpResp.Body.Read(msg)
-		return nil, fmt.Errorf("join rejected (%s): %s", httpResp.Status, strings.TrimSpace(string(msg[:n])))
+		reason := strings.TrimSpace(string(msg[:n]))
+		// A server that predates assignment-derived addresses refuses an absent
+		// nodeIP with this one 400. Left as the raw refusal it reads as a malformed
+		// request, and the operator's only move — supply the address by hand, or
+		// upgrade the control plane — is invisible. So it is named here, once, at
+		// the boundary that can still tell WHY the field was absent.
+		if httpResp.StatusCode == http.StatusBadRequest && body.NodeIP == "" && strings.Contains(reason, oldServerNodeIPRefusal) {
+			return nil, fmt.Errorf("%w (the server answered: %s)", ErrServerRequiresNodeIP, reason)
+		}
+		return nil, fmt.Errorf("join rejected (%s): %s", httpResp.Status, reason)
 	}
 	var resp JoinResponse
 	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
@@ -244,6 +284,20 @@ func postJSON(ctx context.Context, client *http.Client, url string, body JoinReq
 	}
 	return &resp, nil
 }
+
+// ErrServerRequiresNodeIP is returned by Join when the control plane refuses a
+// join that carries no nodeIP — the answer of a server built before the address
+// became the control plane's to assign. It is a TERMINAL condition for this
+// agent: nothing about waiting or retrying changes it, and the two ways out are
+// both the operator's. Compare with errors.Is.
+var ErrServerRequiresNodeIP = errors.New(
+	"this control plane predates assignment-derived node addresses; pass --node-ip <mesh address> or upgrade the control plane first")
+
+// oldServerNodeIPRefusal is the exact 400 body such a server answers with. It is
+// matched as a substring because that is the only signal on the wire: the refusal
+// predates any machine-readable error shape, and inventing one here would not
+// reach the servers that emit it.
+const oldServerNodeIPRefusal = "missing nodeName or nodeIP"
 
 // generateCSR mints a fresh ECDSA P-256 keypair and a PEM CSR for subject + SANs,
 // returning the PEM private key (kept by the node) and the PEM CSR (sent to the

@@ -857,8 +857,11 @@ type Config struct {
 	// address, because the join dials <host>:9345 before this node has any mesh
 	// to route over. Required for RoleAgent, ignored otherwise.
 	JoinServer string
-	// NodeIP is the joining worker's own mesh InternalIP, bound into the certs
-	// its join issues. Required for RoleAgent, ignored otherwise.
+	// NodeIP is an OPTIONAL assertion of the joining worker's own mesh
+	// InternalIP. The control plane assigns that address and issues the node's
+	// certificates for it, so a worker needs none; when set it is rendered onto
+	// the daemon's argv and the join refuses a value that differs from the
+	// assignment. Ignored outside RoleAgent.
 	NodeIP string
 	// TokenFile is the OPERATOR's join-token file, read once by Install (which
 	// is root) and copied to agentTokenPath() for the daemon. It is not what the
@@ -3206,7 +3209,6 @@ func AgentPlist(cfg Config) []byte {
 	args := []string{
 		cfg.installedBinary(), "agent",
 		"--server", cfg.JoinServer,
-		"--node-ip", cfg.NodeIP,
 		// The STAGED copy, unconditionally — never Config.TokenFile, which is a
 		// root-only file this user cannot open, and never a token value. The
 		// path is rendered even on an install that staged nothing: the agent
@@ -3214,6 +3216,12 @@ func AgentPlist(cfg Config) []byte {
 		// credential, so this is the one durable place a token is ever read
 		// from, and the argv does not churn between installs.
 		"--token-file", cfg.agentTokenPath(),
+	}
+	// --node-ip ONLY when the operator asserted one. Rendering an empty value
+	// would put `--node-ip ""` on the daemon's argv, which is not "no assertion"
+	// but an unparseable one, and the join is the wrong place to discover it.
+	if cfg.NodeIP != "" {
+		args = append(args, "--node-ip", cfg.NodeIP)
 	}
 	args = append(args, cfg.ExtraAgentArgs...)
 	return renderPlist(launchdPlist{
