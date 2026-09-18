@@ -842,6 +842,29 @@ type System interface {
 	// here. A false verdict is not an error; an error means the check itself
 	// could not be made (a permission or IO failure on the parent tree).
 	PathExists(path string) (bool, error)
+	// ProbeNetd reports whether the netd helper at path is SERVING: it connects,
+	// sends one framed request, and requires the daemon to act on it inside a
+	// bounded timeout. It is the question PathExists cannot answer — a listening
+	// socket is created on the filesystem before its server accepts, so the node
+	// daemon can find the file there and still be refused when it dials (the
+	// 2026-09-17 install, where the agent started 24ms after netd and died on
+	// "k3sm-netd helper unreachable").
+	//
+	// A CONNECT IS NOT AN ANSWER EITHER, which is why this is a round trip rather
+	// than a dial. connect(2) on a unix socket completes as soon as the listen
+	// backlog has room, with no involvement from the process that bound it: a netd
+	// that is listening but wedged — stuck in its own start-up, deadlocked, paused —
+	// accepts every connection the kernel queues and answers none of them. Only a
+	// reply proves the accept loop and the handler behind it are running.
+	//
+	// The bar is "the daemon ANSWERED", not "the daemon said yes": a rejection is a
+	// perfectly good answer, and the installer is not netd's client. An empty reply
+	// (the peer closed the connection after its own checks) counts for the same
+	// reason.
+	//
+	// A refusal, a wedged peer, or a path that is not a socket is an ERROR, never a
+	// verdict this seam interprets: the caller decides whether to keep waiting.
+	ProbeNetd(path string) error
 	// WriteUserKubeconfig writes the admin kubeconfig into targetUser's
 	// ~/.kube/config, owned by targetUser (not root).
 	WriteUserKubeconfig(targetUser string, contents []byte) error
@@ -2706,7 +2729,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//    removed the label, so an immediate bootstrap races the teardown and loses.
 	//    restart.go sequences them — see its file comment for the failure this cost
 	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
-	if err := restartDaemons(ctx, sys, m, cfg.Logger); err != nil {
+	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
 

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/darwin-net/pkg/mesh"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/dataroot"
 )
@@ -1308,6 +1310,78 @@ func (darwinSystem) PathExists(path string) (bool, error) {
 	}
 	return true, nil
 }
+
+// ProbeNetd asks the netd helper at path to ANSWER, and is deliberately a round
+// trip rather than a dial.
+//
+// A connect proves nothing about the process that bound the socket. connect(2)
+// on a unix socket succeeds the moment the listen backlog has room — the kernel
+// queues it — so a netd that is listening and wedged (still starting, deadlocked,
+// stopped) accepts every attempt and serves none. A dial-only probe would
+// therefore end the installer's wait in exactly one of the two states it exists
+// to distinguish.
+//
+// So the probe writes one framed request whose verb is not in netd's set and
+// waits for the daemon to do something about it. netd's dispatch answers an
+// unknown verb with an error response (darwin-net's netd.Server), which is the
+// reply this looks for; a netd that instead REJECTS the connection — the
+// ordinary case, because the socket authorizes the service uid and `k3sm
+// install` runs as root — closes it after its peer check, and that close is
+// equally proof the accept loop and the handler behind it are running. Both are
+// answers. The one thing that is not an answer is silence, and silence is the
+// wedged case.
+//
+// The verb is unknown ON PURPOSE: every verb netd does implement mutates
+// privileged host state (an lo0 alias, the mesh, a pf anchor, a bound port), and
+// a liveness probe must not be able to change the machine it is asking about.
+func (darwinSystem) ProbeNetd(path string) error {
+	payload, err := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: netdProbeVerb})
+	if err != nil {
+		return fmt.Errorf("encode the netd probe request: %w", err)
+	}
+	conn, err := net.DialTimeout("unix", path, netdProbeTimeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(netdProbeTimeout)); err != nil {
+		return fmt.Errorf("arm the netd probe deadline: %w", err)
+	}
+	if err := wire.WriteFrame(conn, payload); err != nil {
+		return fmt.Errorf("send the netd probe request: %w", err)
+	}
+	_, err = wire.ReadFrame(conn, netdProbeMaxReply)
+	switch {
+	case err == nil:
+		return nil // netd answered
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		// The handler ran and closed the connection — netd's own peer check
+		// declining a root client is the common shape. It acted, so it is up.
+		return nil
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return fmt.Errorf("accepted the connection but did not answer within %s (a socket that is bound while its daemon is not serving)", netdProbeTimeout)
+	default:
+		return fmt.Errorf("reading netd's reply: %w", err)
+	}
+}
+
+// netdProbeVerb is the verb ProbeNetd sends. It is deliberately outside
+// wire's closed set: netd answers it with an error response and changes nothing,
+// which is the whole contract a liveness probe wants.
+const netdProbeVerb = "k3sm-install-probe"
+
+// netdProbeTimeout bounds one probe: the connect, the write and the wait for the
+// answer. A unix round trip against a live daemon is microseconds, so a second is
+// generous; it is a wedged-peer bound, not a patience budget (the caller's restart
+// budget is that). It is a var, not a const, so a unit test that deliberately
+// probes a wedged listener does not spend a real second per case; nothing in the
+// product writes it.
+var netdProbeTimeout = time.Second
+
+// netdProbeMaxReply caps the reply this reads. netd's error response is a few
+// hundred bytes; the cap exists so a desynced or hostile stream cannot make the
+// installer allocate.
+const netdProbeMaxReply = 64 << 10
 
 // LaunchctlBootout unloads the daemon. A not-loaded label (exit 113/3) is treated
 // as success so uninstall is idempotent.

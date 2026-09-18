@@ -279,3 +279,135 @@ func TestRestartBudgetByLabel(t *testing.T) {
 		}
 	}
 }
+
+// firstCall returns the index of want in the recorded call log, or -1.
+func firstCall(f *fakeSystem, want string) int {
+	for i, c := range f.calls {
+		if c == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastCall returns the index of the LAST occurrence of want, or -1.
+func lastCall(f *fakeSystem, want string) int {
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if f.calls[i] == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestAgentRestartWaitsForTheNetdSocket is the regression for the 2026-09-17
+// install that bootstrapped io.k3sm.netd at 19:03:11.969 and io.k3sm.agent 24ms
+// later: the agent dialed the helper socket, got "no such file", recorded a
+// bring-up failure and backed off until launchd's KeepAlive retried it ten
+// seconds on.
+//
+// Nothing in the restart sequence waited for that socket. restartDaemon's
+// success condition is a launchd PID, which says the process was spawned and
+// nothing about whether netd is serving; the only socket check was
+// verifyDaemons', on the far side of BOTH restarts. The server role never hit it
+// because its own bring-up takes some 37 seconds — luck, not ordering — which is
+// why both roles are asserted here.
+//
+// The wait asks netd to ANSWER rather than stat'ing the socket or merely
+// connecting to it. A bound unix socket is on the filesystem before its server
+// accepts, and connect(2) completes into the listen backlog with no involvement
+// from the process that bound it — so both of the cheaper checks end the wait in
+// exactly the windows the node daemon is refused in.
+func TestAgentRestartWaitsForTheNetdSocket(t *testing.T) {
+	roles := []struct {
+		name  string
+		cfg   func(t *testing.T) Config
+		label string
+	}{
+		{"the control plane", func(*testing.T) Config { return installCfg() }, ServerLabel},
+		{"a worker", func(t *testing.T) Config { return agentCfg(t) }, AgentLabel},
+	}
+
+	for _, r := range roles {
+		t.Run(r.name+" does not start its node daemon until netd answers", func(t *testing.T) {
+			shrinkRestartBudgets(t)
+			cfg := r.cfg(t).withDefaults()
+			f := &fakeSystem{}
+			f.putLoaded(NetdLabel, r.label) // a reinstall over a running pair
+			// netd is spawned and only then binds and serves: the first three
+			// probes after its bootstrap are refused.
+			f.putNetdRefusals(cfg.NetdSocket, 3)
+
+			if err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg)); err != nil {
+				t.Fatalf("restartDaemons: %v", err)
+			}
+
+			netdBootstrap := firstCall(f, "Bootstrap:"+NetdLabel)
+			nodeBootstrap := firstCall(f, "Bootstrap:"+r.label)
+			firstDial := firstCall(f, "ProbeNetd:"+cfg.NetdSocket)
+			lastDial := lastCall(f, "ProbeNetd:"+cfg.NetdSocket)
+			switch {
+			case netdBootstrap < 0 || nodeBootstrap < 0:
+				t.Fatalf("both daemons must be bootstrapped (calls: %v)", f.calls)
+			case firstDial < 0:
+				t.Fatalf("the restart never probed %s, so it never waited for the helper (calls: %v)", cfg.NetdSocket, f.calls)
+			case firstDial < netdBootstrap:
+				t.Errorf("the wait for %s began before netd was bootstrapped", cfg.NetdSocket)
+			case lastDial > nodeBootstrap:
+				t.Errorf("%s was bootstrapped before %s answered: the daemon starts into a helper that is not serving", r.label, cfg.NetdSocket)
+			}
+			// Four probes: the three refusals plus the one that was answered. A
+			// sequence that probed once and went on would satisfy the ordering
+			// above while waiting for nothing.
+			if n := countCalls(f, "ProbeNetd:"+cfg.NetdSocket); n != 4 {
+				t.Errorf("probes of %s = %d, want 4 (three refusals then the answer)", cfg.NetdSocket, n)
+			}
+		})
+
+		t.Run(r.name+" fails the install when netd accepts but never answers", func(t *testing.T) {
+			shrinkRestartBudgets(t)
+			cfg := r.cfg(t).withDefaults()
+			f := &fakeSystem{}
+			f.putLoaded(NetdLabel, r.label)
+			// The socket is bound and the kernel queues every connect; netd
+			// itself is serving nothing. This is the state a dial-only wait
+			// reports as healthy, and the node daemon would be started into it.
+			f.putWedgedSocket(cfg.NetdSocket)
+
+			err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+			if err == nil {
+				t.Fatal("restartDaemons must fail on a socket that accepts and never answers: a connect proves the kernel queued it, not that netd is serving")
+			}
+			for _, want := range []string{cfg.NetdSocket, NetdLabel, NetdLogPath(), "did not answer"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must name %q — the operator needs the socket, the helper and where its reason is", err, want)
+				}
+			}
+			if firstCall(f, "Bootstrap:"+r.label) >= 0 {
+				t.Errorf("%s was bootstrapped into a wedged helper (calls: %v)", r.label, f.calls)
+			}
+		})
+
+		t.Run(r.name+" fails the install when netd never answers", func(t *testing.T) {
+			shrinkRestartBudgets(t)
+			cfg := r.cfg(t).withDefaults()
+			f := &fakeSystem{}
+			f.putLoaded(NetdLabel, r.label)
+			f.putMissingPath(cfg.NetdSocket) // bootstrapped, never serving
+
+			err := restartDaemons(context.Background(), f, cfg, artifactManifest(cfg))
+			if err == nil {
+				t.Fatal("restartDaemons must fail rather than start the node daemon against a helper that never came up")
+			}
+			for _, want := range []string{cfg.NetdSocket, NetdLabel, NetdLogPath(), r.label} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q must name %q — the operator needs the socket, the helper and where its reason is", err, want)
+				}
+			}
+			// The node daemon was never started into the failure.
+			if firstCall(f, "Bootstrap:"+r.label) >= 0 {
+				t.Errorf("%s was bootstrapped despite netd never answering (calls: %v)", r.label, f.calls)
+			}
+		})
+	}
+}
