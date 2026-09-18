@@ -196,48 +196,26 @@ func filterManagedAgentArgs(args []string) []string {
 // path would produce a worker that fails to read a token that is plainly there,
 // reported as a permission error in a log nobody is watching yet.
 //
-// The token is validated here rather than at the daemon, because here is where
-// an operator is still looking at a terminal: a file anyone can read, an empty
-// one, and one whose contents are not a K10 join token at all are mistakes
-// worth one sentence now instead of a backoff loop later. The mode refusal is
-// the agent's own (readJoinTokenFile), applied to the SOURCE as well: a token
-// that sat world-readable in /tmp is a token that has to be re-minted, and
-// copying it to a 0600 destination would launder that rather than report it.
-//
-// The SHAPE check is pkg/bootstrap's own parser, and it is a refusal rather
-// than a warning for two reasons. A token that does not parse can never
-// complete a join, so staging it installs a worker that is guaranteed to back
-// off forever. And the installer reads the same token back to decide which
-// CLUSTER the node credential must belong to (verifyAgentJoined): a token with
-// no readable CA pin would leave that comparison with nothing to compare, which
-// is how a stale credential from another cluster came to count as a join.
+// The token is validated before an operator leaves the terminal rather than at
+// the daemon — a file anyone can read, an empty one, and one whose contents are
+// not a K10 join token at all are mistakes worth one sentence now instead of a
+// backoff loop later — but that validation happens in operatorJoinToken, at the
+// join-endpoint preflight, which is where those refusals can still cost nothing.
+// This function receives the bytes that reading produced and does one thing with
+// them: write them where the daemon can read them.
 //
 // Nothing here logs or echoes the value — not the token, not a prefix of it.
-func stageJoinToken(sys System, cfg Config, uid uint32) error {
-	// The mode BEFORE the bytes: a credential this Mac should not have accepted
-	// is refused without being read anywhere else first.
-	switch perm, err := sys.FileMode(cfg.TokenFile); {
-	case errors.Is(err, fs.ErrNotExist):
-		return fmt.Errorf("install: the join token file %s is not there: write the token `k3sm token create` printed on the server into it, or drop --token-file on a node that has already joined", cfg.TokenFile)
-	case err != nil:
-		return fmt.Errorf("install: inspect the join token file %s: %w", cfg.TokenFile, err)
-	case perm&tokenFileMask != 0:
-		return fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
-	}
-	raw, err := sys.ReadFile(cfg.TokenFile)
-	if err != nil {
-		return fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the agent daemon to present)", cfg.TokenFile, err, cfg.agentTokenPath())
-	}
-	token := strings.TrimSpace(string(raw))
-	if token == "" {
-		return fmt.Errorf("install: the join token file %s is empty: write the token `k3sm token create` printed on the server into it", cfg.TokenFile)
-	}
-	// The shape, before a byte is written anywhere. The parse error is quoted
-	// and the token is not: pkg/bootstrap's errors describe the STRUCTURE that
-	// is missing (the K10 prefix, the `::`, the user:secret) and never the
-	// value, which is what makes it safe to put in front of an operator.
-	if _, err := bootstrap.ParseToken(token); err != nil {
-		return fmt.Errorf("install: the contents of the join token file %s are not a k3sm join token (%v): a join token is `K10<cluster-CA hash>::<user>:<secret>`, exactly as `k3sm token create` prints it on the server — mint a fresh one rather than editing this file", cfg.TokenFile, err)
+func stageJoinToken(sys System, cfg Config, uid uint32, token string) error {
+	// The BYTES come from the caller, not from a fresh read of the operator's
+	// file: Install's join-endpoint preflight read that file once, judged its
+	// mode, parsed it and pinned the control plane against it, all before the
+	// first write. Re-reading here would put the service user, the log trees and
+	// the run dir between the bytes that were checked and the bytes that are
+	// staged, so a file replaced in that window would reach the daemon
+	// unvalidated and pinned to nothing. An empty token is a programmer error —
+	// this function is reached only on the path the preflight has already run.
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("install: no join token was read before staging (the join-endpoint preflight is what reads %s)", cfg.TokenFile)
 	}
 	dst := cfg.agentTokenPath()
 	if err := stageTokenFile(sys, uid, token, dst, "join token", AgentTokenFileMode, AgentTokenDirMode); err != nil {
@@ -246,6 +224,45 @@ func stageJoinToken(sys System, cfg Config, uid uint32) error {
 	cfg.Logger.Info("staged the join token for the agent daemon (your own copy is untouched and yours to delete once the node is Ready)",
 		"from", cfg.TokenFile, "to", dst)
 	return nil
+}
+
+// operatorJoinToken reads the OPERATOR's join-token file and returns its text
+// and the parsed token, refusing a file that is missing, readable by anyone but
+// its owner, empty, or not a k3sm join token.
+//
+// It is one function rather than a check at each caller because both callers ask
+// the identical question of the identical file — the join-endpoint preflight
+// needs the token's cluster-CA pin before anything is written, and staging needs
+// the bytes — and two readers of one credential file would eventually disagree
+// about which files are acceptable.
+func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) {
+	// The mode BEFORE the bytes: a credential this Mac should not have accepted
+	// is refused without being read anywhere else first.
+	switch perm, err := sys.FileMode(cfg.TokenFile); {
+	case errors.Is(err, fs.ErrNotExist):
+		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not there: write the token `k3sm token create` printed on the server into it, or drop --token-file on a node that has already joined", cfg.TokenFile)
+	case err != nil:
+		return "", bootstrap.Token{}, fmt.Errorf("install: inspect the join token file %s: %w", cfg.TokenFile, err)
+	case perm&tokenFileMask != 0:
+		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
+	}
+	raw, err := sys.ReadFile(cfg.TokenFile)
+	if err != nil {
+		return "", bootstrap.Token{}, fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the agent daemon to present)", cfg.TokenFile, err, cfg.agentTokenPath())
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is empty: write the token `k3sm token create` printed on the server into it", cfg.TokenFile)
+	}
+	// The shape, before a byte is written anywhere. The parse error is quoted
+	// and the token is not: pkg/bootstrap's errors describe the STRUCTURE that
+	// is missing (the K10 prefix, the `::`, the user:secret) and never the
+	// value, which is what makes it safe to put in front of an operator.
+	tok, err := bootstrap.ParseToken(token)
+	if err != nil {
+		return "", bootstrap.Token{}, fmt.Errorf("install: the contents of the join token file %s are not a k3sm join token (%v): a join token is `K10<cluster-CA hash>::<user>:<secret>`, exactly as `k3sm token create` prints it on the server — mint a fresh one rather than editing this file", cfg.TokenFile, err)
+	}
+	return token, tok, nil
 }
 
 // tokenFileMask is the permission bits a join-token file may not carry: any

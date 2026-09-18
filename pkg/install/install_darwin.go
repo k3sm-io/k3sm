@@ -18,10 +18,14 @@ package install
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -32,10 +36,12 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"k3sm.io/darwin-net/pkg/mesh"
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/dataroot"
 )
 
@@ -695,6 +701,82 @@ func linkDirTrustFor(link string) (parentAbsent bool, err error) {
 func (darwinSystem) LinkDirTrust(link string) error {
 	_, err := linkDirTrustFor(link)
 	return err
+}
+
+// ResolveJoinHost resolves the join host to every address it names. See the
+// System interface for why the answer is plural. An IP literal resolves to
+// itself, which net.Resolver already does — there is no special case here,
+// because a special case is where "the operator typed an address" and "the
+// operator typed a name that happens to look like one" would drift apart.
+func (darwinSystem) ResolveJoinHost(host string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
+// DialJoinServer opens and immediately closes a TCP connection to addr. The
+// close error is ignored deliberately: the connection proved what it was opened
+// to prove the moment it was established, and a failure tearing it down says
+// nothing about whether the control plane is reachable.
+func (darwinSystem) DialJoinServer(addr string, timeout time.Duration) error {
+	conn, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", addr)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+// FetchJoinCA reads the cluster CA PEM the bootstrap listener at addr serves.
+//
+// The TLS posture is InsecureSkipVerify with NO replacement verification, which
+// is the one place in k3sm that is true and is why the System interface states
+// the reason at the seam: the join's own first hop (bootstrap.PinnedClient) does
+// the opposite — it disables the default verification and re-imposes pinned-CA
+// verification — because it is about to present a credential. This fetch
+// presents nothing and trusts nothing. It reads a deliberately public document
+// (the same bytes any client on the LAN can GET from /cacert), hashes it, and
+// hands the hash to a comparison against the operator's token. A hostile
+// listener can make that comparison FAIL; it cannot make it pass, because it
+// would need the cluster CA whose hash the token carries, and it learns nothing
+// from us either way.
+func (darwinSystem) FetchJoinCA(addr string, timeout time.Duration) ([]byte, error) {
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: timeout}).DialContext,
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				// Nothing is trusted on the strength of this handshake — see the
+				// doc comment above. The bytes it returns are hashed and compared.
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+bootstrap.CACertPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build the cluster-CA request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s answered %s", bootstrap.CACertPath, resp.Status)
+	}
+	// Bounded: the CA is a couple of kilobytes, and an installer must not read an
+	// unbounded body from a host it has not identified yet.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read the cluster CA: %w", err)
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, fmt.Errorf("%s served an empty body", bootstrap.CACertPath)
+	}
+	return body, nil
 }
 
 // EnsureSymlink lays down (or repairs) the `k3sm` launcher symlink at link,
