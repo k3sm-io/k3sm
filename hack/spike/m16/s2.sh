@@ -79,7 +79,39 @@ nats:
 discoveryBackend: kubernetes
 YAML
 [ -n "${K3SM_M16_VALUES:-}" ] && [ -r "$K3SM_M16_VALUES" ] && cat "$K3SM_M16_VALUES" >> "$W/values.yaml"
-recorded "s2.1 values: $(tr '\n' ' ' < "$W/values.yaml")"
+
+# SUBSTITUTION, recorded when taken (K3SM_M16_WEBHOOK_CERT=external): the
+# operator's built-in cert-controller creates its webhook Secret and then waits
+# for the kubelet to project it into the mounted volume. k3sm materializes a
+# Secret volume once, at pod creation, and never refreshes it, so the mount stays
+# empty and the operator never starts. The chart's external-certificate mode
+# expects the Secret BEFORE install, which puts the files in the mount from the
+# first boot; the spike mints that certificate here (a CA and a server cert for
+# the webhook Service's in-cluster names, 30 days) and passes the CA bundle the
+# admission registrations need. The conversion CA is injected by the operator
+# from the same Secret. Off by default: the plan's rung is the chart as shipped.
+if [ "${K3SM_M16_WEBHOOK_CERT:-}" = external ]; then
+  WH_SVC="m16-dynamo-operator-webhook-service"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+    -subj "/CN=m16 spike webhook ca" -keyout "$W/ca.key" -out "$W/ca.crt" >/dev/null 2>&1
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=$WH_SVC.$NS.svc" \
+    -addext "subjectAltName=DNS:$WH_SVC.$NS.svc,DNS:$WH_SVC.$NS.svc.cluster.local,DNS:$WH_SVC.$NS" \
+    -keyout "$W/tls.key" -out "$W/tls.csr" >/dev/null 2>&1
+  openssl x509 -req -in "$W/tls.csr" -CA "$W/ca.crt" -CAkey "$W/ca.key" -CAcreateserial -days 30 \
+    -copy_extensions copy -out "$W/tls.crt" >/dev/null 2>&1
+  kc -n "$NS" delete secret webhook-server-cert >/dev/null 2>&1 || true
+  kc -n "$NS" create secret generic webhook-server-cert \
+    --from-file=tls.crt="$W/tls.crt" --from-file=tls.key="$W/tls.key" --from-file=ca.crt="$W/ca.crt" >/dev/null
+  cat >> "$W/values.yaml" <<YAML
+dynamo-operator:
+  webhook:
+    certificateSecret:
+      external: true
+    caBundle: $(base64 < "$W/ca.crt" | tr -d '\n')
+YAML
+  recorded "s2.1 SUBSTITUTION webhook certificate external — k3sm does not refresh a Secret volume after pod creation, so the chart's cert-controller never sees the Secret it created; the spike minted the certificate (CN=$WH_SVC.$NS.svc, 30 d) and installed with the chart's external mode"
+fi
+recorded "s2.1 values: $(tr '\n' ' ' < "$W/values.yaml" | sed -E 's/caBundle: [A-Za-z0-9+\/=]+/caBundle: <ca>/')"
 
 # No --wait here, on purpose: k3sm's require-os-darwin admission policy refuses
 # every Pod without nodeSelector kubernetes.io/os=darwin, the chart's pods carry
