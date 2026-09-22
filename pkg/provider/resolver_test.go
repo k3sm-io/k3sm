@@ -138,6 +138,7 @@ func TestResolvePodBoxEnv(t *testing.T) {
 				{Name: "NODE", ValueFrom: &runtimev1.EnvVarSource{FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
 				{Name: "POD", ValueFrom: &runtimev1.EnvVarSource{FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 				{Name: "IP", ValueFrom: &runtimev1.EnvVarSource{FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+				{Name: "SA", ValueFrom: &runtimev1.EnvVarSource{FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "spec.serviceAccountName"}}},
 				{Name: "K", ValueFrom: &runtimev1.EnvVarSource{ConfigMapKeyRef: &runtimev1.ConfigMapKeySelector{Name: "single", Key: "only"}}},
 				{Name: "S", ValueFrom: &runtimev1.EnvVarSource{SecretKeyRef: &runtimev1.SecretKeySelector{Name: "env-secret", Key: "API_KEY"}}},
 				{Name: "LIT", Value: "literal"},
@@ -145,7 +146,7 @@ func TestResolvePodBoxEnv(t *testing.T) {
 			},
 		}},
 	}
-	if err := resolvePodBoxEnv(ctx, box, "node-7", "192.168.1.10", newKubeResolver(cs)); err != nil {
+	if err := resolvePodBoxEnv(ctx, box, podFacts{nodeName: "node-7", nodeIP: "192.168.1.10", serviceAccount: "api-sa"}, newKubeResolver(cs)); err != nil {
 		t.Fatalf("resolvePodBoxEnv: %v", err)
 	}
 
@@ -167,6 +168,7 @@ func TestResolvePodBoxEnv(t *testing.T) {
 		"NODE":        "node-7",   // downward spec.nodeName (provider-supplied)
 		"POD":         "api",      // downward metadata.name
 		"IP":          "10.0.0.7", // downward status.podIP
+		"SA":          "api-sa",   // downward spec.serviceAccountName (provider-supplied)
 		"K":           "one",      // configMapKeyRef
 		"S":           "xyz",      // secretKeyRef
 		"LIT":         "literal",  // literal
@@ -180,6 +182,23 @@ func TestResolvePodBoxEnv(t *testing.T) {
 
 // TestResolvePodBoxEnvOptional confirms an optional missing source is skipped and a
 // required missing one fails closed.
+// TestResolvePodBoxEnvRefusesAnUnknownFieldPath pins the closed set: a downward
+// field the provider cannot supply fails the pod at translation, by name, rather
+// than resolving to an empty string the workload would read as a value.
+func TestResolvePodBoxEnvRefusesAnUnknownFieldPath(t *testing.T) {
+	box := &runtimev1.PodBox{
+		Namespace: "prod",
+		Containers: []*runtimev1.Container{{
+			Name: "c0",
+			Env:  []*runtimev1.EnvVar{{Name: "X", ValueFrom: &runtimev1.EnvVarSource{FieldRef: &runtimev1.ObjectFieldSelector{FieldPath: "spec.hostNetwork"}}}},
+		}},
+	}
+	err := resolvePodBoxEnv(context.Background(), box, podFacts{}, nil)
+	if err == nil || !strings.Contains(err.Error(), `unsupported downward-API field path "spec.hostNetwork"`) {
+		t.Fatalf("err = %v, want the unsupported field path named", err)
+	}
+}
+
 func TestResolvePodBoxEnvOptional(t *testing.T) {
 	ctx := context.Background()
 	r := newKubeResolver(fake.NewSimpleClientset())
@@ -193,7 +212,7 @@ func TestResolvePodBoxEnvOptional(t *testing.T) {
 			},
 		}},
 	}
-	if err := resolvePodBoxEnv(ctx, optBox, "n", "ip", r); err != nil {
+	if err := resolvePodBoxEnv(ctx, optBox, podFacts{nodeName: "n", nodeIP: "ip"}, r); err != nil {
 		t.Fatalf("optional missing source should not error: %v", err)
 	}
 	if len(optBox.GetContainers()[0].GetEnv()) != 0 {
@@ -209,7 +228,7 @@ func TestResolvePodBoxEnvOptional(t *testing.T) {
 			},
 		}},
 	}
-	if err := resolvePodBoxEnv(ctx, reqBox, "n", "ip", r); err == nil {
+	if err := resolvePodBoxEnv(ctx, reqBox, podFacts{nodeName: "n", nodeIP: "ip"}, r); err == nil {
 		t.Fatal("required missing source must fail closed")
 	}
 }

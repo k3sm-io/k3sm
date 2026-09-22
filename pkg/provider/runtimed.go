@@ -1372,7 +1372,8 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// fact (this node's `xcode-select -p`), which the pure pod translation does not
 	// and should not carry — the same split as the socket denies above.
 	applyXcodeToolchain(box.SandboxProfile, pod, r.developerDir)
-	if err := resolvePodBoxEnv(ctx, box, r.nodeName, r.nodeIP, r.resolver); err != nil {
+	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: pod.Spec.ServiceAccountName}
+	if err := resolvePodBoxEnv(ctx, box, facts, r.resolver); err != nil {
 		return nil, err
 	}
 	// In-pod cluster-DNS visibility: log the FINAL injected state (after

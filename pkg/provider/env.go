@@ -35,17 +35,16 @@ import (
 // mutates the box's containers in place (clearing value_from / env_from) and is
 // idempotent on an already-literal box.
 //
-// nodeName / nodeIP supply the spec.nodeName / status.hostIP downward-API values
-// the PodBox itself cannot carry (the provider knows the node it runs on).
-func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, nodeName, nodeIP string, r mount.Resolver) error {
+// facts supplies the downward-API values the PodBox itself cannot carry.
+func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, facts podFacts, r mount.Resolver) error {
 	ns := box.GetNamespace()
 	for _, c := range box.GetInitContainers() {
-		if err := resolveContainerEnv(ctx, c, ns, nodeName, nodeIP, box, r); err != nil {
+		if err := resolveContainerEnv(ctx, c, ns, facts, box, r); err != nil {
 			return fmt.Errorf("init container %s: %w", c.GetName(), err)
 		}
 	}
 	for _, c := range box.GetContainers() {
-		if err := resolveContainerEnv(ctx, c, ns, nodeName, nodeIP, box, r); err != nil {
+		if err := resolveContainerEnv(ctx, c, ns, facts, box, r); err != nil {
 			return fmt.Errorf("container %s: %w", c.GetName(), err)
 		}
 	}
@@ -56,7 +55,16 @@ func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, nodeName, node
 // source order), then explicit env vars (which OVERRIDE envFrom on a name
 // collision — the kubelet precedence). It clears value_from/env_from afterwards so
 // the box carries only literal values.
-func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns, nodeName, nodeIP string, box *runtimev1.PodBox, r mount.Resolver) error {
+// podFacts is what the downward API can name about a pod that the PodBox does
+// not carry: the node it runs on, that node's address, and the service account
+// it runs as. The provider knows all three at translation time.
+type podFacts struct {
+	nodeName       string
+	nodeIP         string
+	serviceAccount string
+}
+
+func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string, facts podFacts, box *runtimev1.PodBox, r mount.Resolver) error {
 	var ordered []*runtimev1.EnvVar
 	idx := make(map[string]int)
 	upsert := func(name, value string) {
@@ -75,7 +83,7 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns, nodeNa
 		}
 	}
 	for _, e := range c.GetEnv() {
-		val, skip, err := resolveEnvValue(ctx, e, ns, nodeName, nodeIP, box, r)
+		val, skip, err := resolveEnvValue(ctx, e, ns, facts, box, r)
 		if err != nil {
 			return err
 		}
@@ -130,14 +138,14 @@ func applySorted(data map[string][]byte, prefix string, upsert func(name, value 
 
 // resolveEnvValue resolves a single EnvVar to its literal value. skip is true when
 // the var sources from an optional ConfigMap/Secret/key that is absent.
-func resolveEnvValue(ctx context.Context, e *runtimev1.EnvVar, ns, nodeName, nodeIP string, box *runtimev1.PodBox, r mount.Resolver) (value string, skip bool, err error) {
+func resolveEnvValue(ctx context.Context, e *runtimev1.EnvVar, ns string, facts podFacts, box *runtimev1.PodBox, r mount.Resolver) (value string, skip bool, err error) {
 	vf := e.GetValueFrom()
 	if vf == nil {
 		return e.GetValue(), false, nil
 	}
 	switch {
 	case vf.GetFieldRef() != nil:
-		v, err := resolveDownwardEnv(box, nodeName, nodeIP, vf.GetFieldRef().GetFieldPath())
+		v, err := resolveDownwardEnv(box, facts, vf.GetFieldRef().GetFieldPath())
 		return v, false, err
 	case vf.GetConfigMapKeyRef() != nil:
 		sel := vf.GetConfigMapKeyRef()
@@ -207,7 +215,7 @@ func fetchData(ctx context.Context, r mount.Resolver, kind, ns, name string, opt
 // namespace/uid, metadata.labels['k']/annotations['k'], spec.nodeName,
 // status.podIP(s), status.hostIP. An unknown path errors (fail loud, not silent
 // empty).
-func resolveDownwardEnv(box *runtimev1.PodBox, nodeName, nodeIP, fieldPath string) (string, error) {
+func resolveDownwardEnv(box *runtimev1.PodBox, facts podFacts, fieldPath string) (string, error) {
 	if key, ok := subscript(fieldPath, "metadata.labels"); ok {
 		return box.GetLabels()[key], nil
 	}
@@ -222,11 +230,13 @@ func resolveDownwardEnv(box *runtimev1.PodBox, nodeName, nodeIP, fieldPath strin
 	case "metadata.uid":
 		return box.GetPodId(), nil
 	case "spec.nodeName":
-		return nodeName, nil
+		return facts.nodeName, nil
+	case "spec.serviceAccountName":
+		return facts.serviceAccount, nil
 	case "status.podIP", "status.podIPs":
 		return box.GetPodIp(), nil
 	case "status.hostIP", "status.hostIPs":
-		return nodeIP, nil
+		return facts.nodeIP, nil
 	default:
 		return "", fmt.Errorf("unsupported downward-API field path %q", fieldPath)
 	}
