@@ -141,12 +141,24 @@ else
   tail -20 "$W/frontend-help.txt"; exit 0
 fi
 
+# The file backend takes its directory from DYN_FILE_KV (there is no path flag at
+# v1.5.0; the frontend rejects --discovery-path), and the mocker names its model
+# with --model-name while --model-path supplies the tokenizer it mocks tokens with
+# (--model alone is ambiguous between the two at this ref).
 mkdir -p "$W/discovery"
-nohup "$V" -m dynamo.frontend --discovery-backend file --discovery-path "$W/discovery" \
+export DYN_FILE_KV="$W/discovery"
+# Both processes are on this host, so keep the request plane and the response
+# stream on loopback; the default is the resolved LAN address, which a Mac's
+# application firewall refuses for an ad-hoc-signed python. The request-plane
+# variable is an ADDRESS; the response-stream one is an INTERFACE NAME, resolved
+# against the host's AF_INET interfaces (an address there is "Interface not
+# found"). This is the pair upstream's own tests set on macOS.
+export DYN_TCP_RPC_HOST=127.0.0.1 DYN_TCP_RESPONSE_STREAM_HOST=lo0
+nohup "$V" -m dynamo.frontend --discovery-backend file \
   --http-port 8111 > "$W/frontend.log" 2>&1 &
 FE=$!
-nohup "$V" -m dynamo.mocker --discovery-backend file --discovery-path "$W/discovery" \
-  --model mock-model > "$W/mocker.log" 2>&1 &
+nohup "$V" -m dynamo.mocker --discovery-backend file \
+  --model-name mock-model --model-path "$MODEL_REPO" > "$W/mocker.log" 2>&1 &
 MK=$!
 READY=no
 for i in $(seq 1 60); do
