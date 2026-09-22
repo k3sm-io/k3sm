@@ -347,13 +347,11 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		}
 
 		// The pod IP came from the node's real 253-address pool, via SetupGuest —
-		// not from the node IP, and not from the host-process Setup.
-		allocated, ok := n.ipam.allocations()[id]
-		if !ok {
+		// not from the node IP, and not from the host-process Setup. The pool no
+		// longer holds it: the refusal released it (the leg below), so the
+		// address is read off the spec the backend received.
+		if !spec.Network.PodIP.IsValid() {
 			t.Fatal("no address allocated for the vm pod — SetupGuest never drew from the node pool")
-		}
-		if spec.Network.PodIP != allocated {
-			t.Errorf("VMSpec.Network.PodIP = %v, want the allocated %v", spec.Network.PodIP, allocated)
 		}
 		if !netip.MustParsePrefix(guestPodCIDR).Contains(spec.Network.PodIP) {
 			t.Errorf("VMSpec.Network.PodIP = %v, want an address inside the node podCIDR %s", spec.Network.PodIP, guestPodCIDR)
@@ -377,8 +375,8 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 				t.Errorf("SetupGuest called for %q, want only %q", c, id)
 			}
 		}
-		if got := len(n.ipam.allocations()); got != 1 {
-			t.Errorf("the node pool holds %d allocations, want exactly 1 — SetupGuest must be idempotent per podID", got)
+		if got := len(n.ipam.allocations()); got != 0 {
+			t.Errorf("the node pool holds %d allocations after the refusal, want 0 — the refused create returns what it drew", got)
 		}
 		// And no lo0 /32 was plumbed for it: a guest owns its address inside its
 		// own netstack, so the host must never answer for it.
@@ -454,38 +452,38 @@ func TestGuestNetworkWiredToRuntimed(t *testing.T) {
 		}
 	})
 
-	t.Run("DeletePod clears the guest config and returns the address after a failed create", func(t *testing.T) {
+	t.Run("a failed create returns the address and clears the guest config itself", func(t *testing.T) {
 		n := newGuestNode(t)
 		pod := vmPod("team-a", "churn")
 		id := string(pod.UID)
 
 		// CreatePod fails at the lab-gated boot — AFTER SetupGuest allocated. This
 		// is the leak shape: the pod never existed to runtimed, so only the
-		// provider-side release can reclaim what the provider-side produce took.
+		// provider-side release can reclaim what the provider-side produce took,
+		// and it must happen HERE. VK records the failed create as ProviderFailed
+		// and retries it; it never issues a DeletePod for a pod it could not
+		// create, so a release that waited for one would wait forever, and a
+		// pod left tracked would turn that retry into an UpdatePod no-op.
 		if err := n.r.CreatePod(context.Background(), pod); err == nil {
 			t.Fatal("CreatePod: want the lab-gated vm boot failure, got nil")
 		}
-		if _, ok := n.adapter.GuestNetwork(id); !ok {
-			t.Fatal("no guest config recorded for the vm pod; there is nothing for the teardown leg to clear")
-		}
-		before, ok := n.adapter.GuestNetwork(id)
-		if !ok || !before.PodIP.IsValid() {
-			t.Fatalf("recorded guest config = %+v, want one carrying the allocated pod IP", before)
-		}
-
-		if err := n.r.DeletePod(context.Background(), pod); err != nil {
-			t.Fatalf("DeletePod: %v", err)
+		if calls := n.ipam.guestSetupCalls(); len(calls) == 0 {
+			t.Fatal("SetupGuest was never called; the pod allocated nothing and the release below proves nothing")
 		}
 		if cfg, ok := n.adapter.GuestNetwork(id); ok {
-			t.Errorf("the adapter still holds %+v for a deleted pod — the guest carrier leaked", cfg)
+			t.Errorf("the adapter still holds %+v for a refused pod — the guest carrier leaked", cfg)
 		}
 		if _, ok := n.ipam.allocations()[id]; ok {
 			t.Error("the pod's address was not released; a churned vm pod would burn one of the 253")
 		}
+		if tr := n.r.trackByID(id); tr != nil {
+			t.Error("the refused pod is still tracked; VK's retry would update it instead of creating it")
+		}
 
-		// A second delete is a no-op success (VK deletes are retried).
+		// A DeletePod for the refused pod is a no-op success (VK deletes are
+		// retried, and a user may delete the Pending pod by hand).
 		if err := n.r.DeletePod(context.Background(), pod); err != nil {
-			t.Errorf("second DeletePod: %v, want idempotent success", err)
+			t.Errorf("DeletePod after a refused create: %v, want idempotent success", err)
 		}
 	})
 

@@ -34,6 +34,7 @@ import (
 	testclock "k8s.io/utils/clock/testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -1004,8 +1005,29 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 		if err := r.CreatePod(context.Background(), pod); err == nil {
 			t.Fatal("CreatePod = nil, want an error — a pod-level failure is not an image the node can retry")
 		}
-		if tr := r.trackByID(string(pod.UID)); tr != nil && tr.parkedFailure() != nil {
-			t.Error("a pod-level failure parked the pod; only container-class image failures park")
+		// The refused pod is NOT tracked. VK retries a failed create only after
+		// GetPod says the pod is absent (a present pod takes the UpdatePod path),
+		// and a tracked pod the runtime does not hold would answer GetPodStatus
+		// with a synthesized ContainerCreating that overwrites the ProviderFailed
+		// VK recorded — a pod stuck creating forever, never re-created.
+		if tr := r.trackByID(string(pod.UID)); tr != nil {
+			t.Fatal("a pod-level refusal left the pod tracked; VK will update instead of re-create, and the status sync will report it ContainerCreating")
+		}
+		if pods, err := r.GetPods(context.Background()); err != nil || len(pods) != 0 {
+			t.Errorf("GetPods = %d pods, %v; want none, so VK's retry reaches CreatePod", len(pods), err)
+		}
+		if _, err := r.GetPodStatus(context.Background(), "default", "podlevel"); !vkadapter.IsNotFound(err) {
+			t.Errorf("GetPodStatus = %v, want NotFound for a pod runtimed never created", err)
+		}
+		// VK's retry is a second CreatePod, and with the FIFO exhausted it succeeds.
+		if err := r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod retry = %v, want the pod created", err)
+		}
+		if n := f.createCount(); n != 2 {
+			t.Errorf("CreatePod RPCs = %d, want 2 (the refusal and the retry)", n)
+		}
+		if tr := r.trackByID(string(pod.UID)); tr == nil {
+			t.Error("the retried pod is not tracked")
 		}
 	})
 }

@@ -1536,10 +1536,44 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		}
 		r.log.Error("CreatePod: runtimed rejected the pod", "namespace", pod.Namespace, "name", pod.Name,
 			"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
+		// A pod-level refusal goes back to VK as the create's error; VK records
+		// ProviderFailed and retries on its back-off. That retry reaches
+		// CreatePod only if this pod is no longer tracked: VK asks GetPod first
+		// and takes the UpdatePod path for a pod the provider still lists, and a
+		// tracked pod the runtime does not hold answers GetPodStatus with a
+		// synthesized ContainerCreating that overwrites the ProviderFailed VK
+		// just wrote — a pod stuck creating, never re-created. Runtimed has said
+		// it holds nothing, so the track goes the way a preflight refusal's does.
+		//
+		// An idempotent re-create (old != nil) keeps its track: runtimed's answer
+		// is about this attempt, and the old track's pod may be the one it holds.
+		if old == nil {
+			r.untrackRejectedCreate(pod, t)
+		}
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return nil
+}
+
+// untrackRejectedCreate forgets a pod runtimed refused to create at the pod
+// level. It is the CreatePod-side mirror of DeletePod's bookkeeping for a pod
+// that never existed in the runtime: the track is removed so VK's retry reaches
+// CreatePod again, the goroutines the track could own are cancelled, and the
+// pod's /32 and log tree are released. Only the track this create installed is
+// removed — a track replaced since (a concurrent re-create) is left alone.
+func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
+	id := string(pod.UID)
+	r.mu.Lock()
+	if r.track[id] == t {
+		delete(r.track, id)
+	}
+	r.mu.Unlock()
+	t.cancelRestarts()
+	t.cancelPulls()
+	t.cancelPostStart()
+	r.releasePodNetwork(pod)
+	r.removePodLogs(pod)
 }
 
 // gpuCeilingBytes reports this node's usable GPU memory ceiling in bytes, or 0
