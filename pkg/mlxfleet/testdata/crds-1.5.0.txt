@@ -1,0 +1,6 @@
+dynamocomponentdeployments.nvidia.com kind=DynamoComponentDeployment served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamographdeploymentrequests.nvidia.com kind=DynamoGraphDeploymentRequest served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamographdeployments.nvidia.com kind=DynamoGraphDeployment served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamographdeploymentscalingadapters.nvidia.com kind=DynamoGraphDeploymentScalingAdapter served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamomodels.nvidia.com kind=DynamoModel served=v1alpha1 storage=v1alpha1 conversion=None
+dynamoworkermetadatas.nvidia.com kind=DynamoWorkerMetadata served=v1alpha1 storage=v1alpha1 conversion=None
