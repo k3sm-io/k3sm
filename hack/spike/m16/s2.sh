@@ -240,12 +240,14 @@ if [ -z "$DGD" ] || [ ! -r "$DGD" ]; then
 fi
 recorded "s2.5 manifest: $DGD"
 python3 - "$DGD" "$W/dgd.yaml" "$NS" <<'PY'
+import os
 import sys
 try:
     import yaml
 except ImportError:
     sys.exit("PyYAML is required on the rig to patch the example manifest")
 src, dst, ns = sys.argv[1], sys.argv[2], sys.argv[3]
+runasuser = os.environ.get("K3SM_M16_POD_RUNASUSER", "")
 patched = []
 
 def walk(node, path):
@@ -261,6 +263,16 @@ def walk(node, path):
                 r = c.setdefault("resources", {})
                 r.setdefault("requests", {})["memory"] = "512Mi"
                 r.setdefault("limits", {})["memory"] = "512Mi"
+            # SUBSTITUTION, recorded when taken (K3SM_M16_POD_RUNASUSER=<uid>); the
+            # note at the recorded line below says why.
+            if runasuser:
+                node.setdefault("securityContext", {})["runAsUser"] = int(runasuser)
+                for c in node["containers"]:
+                    env = c.setdefault("env", [])
+                    have = {e.get("name") for e in env}
+                    for k, v in (("HOME", "/dev/shm/home"), ("TMPDIR", "/dev/shm"), ("HF_HOME", "/dev/shm/hf")):
+                        if k not in have:
+                            env.append({"name": k, "value": v})
             patched.append(path or "<root>")
         for k, v in node.items():
             walk(v, path + "." + k)
@@ -275,6 +287,22 @@ for d in docs:
 yaml.safe_dump_all(docs, open(dst, "w"), default_flow_style=False)
 print("patched pod specs at: " + (", ".join(patched) if patched else "NONE — the example carries no inline pod spec, so the operator's own defaulting decides the runtime class"))
 PY
+# SUBSTITUTION, recorded when taken (K3SM_M16_POD_RUNASUSER=<uid>): the image runs
+# as the named user "dynamo" (uid 1000, home 0755) and the operator, given no
+# securityContext, stamps fsGroup=1000. k3sm refuses both on the vm class: the
+# foreign-user guard takes no uid/gid but the node's pod-execution identity, and
+# runtimed refuses a named user it cannot resolve (guest/v1 carries numbers only)
+# and any fsGroup at all (Apple's virtiofs has no idmapped mounts). A template
+# that supplies any securityContext gets no operator defaults, so setting
+# runAsUser to the node's uid answers all three at once. That uid then owns
+# nothing in the image: the vm rootfs lower carries the host tree's ownership
+# and modes (the ownership sidecar is written beside the snapshot and applied
+# nowhere), so /tmp arrives root-owned 0755 and Python finds no usable temp
+# dir, and the frontend's model-card cache ($HOME/.cache/dynamo/mdc) cannot be
+# created. The chart's Memory emptyDir at /dev/shm is a guest tmpfs, the one
+# writable place, so HOME, TMPDIR and HF_HOME point into it. Off by default:
+# the rung is the example as shipped.
+[ -n "${K3SM_M16_POD_RUNASUSER:-}" ] && recorded "s2.5 SUBSTITUTION pod runAsUser=$K3SM_M16_POD_RUNASUSER, HOME=/dev/shm/home, TMPDIR=/dev/shm and HF_HOME=/dev/shm/hf on the example's pod templates — the image's user is the name \"dynamo\" (uid 1000), which runtimed cannot resolve for a vm pod; the operator's default fsGroup=1000 is refused by the foreign-user guard and by runtimed on the vm class; a template-supplied securityContext suppresses the operator's default and the node's own uid satisfies every layer; the rootfs lower keeps the host tree's root ownership and 0755 modes (the ownership sidecar is never applied in-guest), so the Memory emptyDir is the only writable directory"
 # The example's decode pod reads hf-token-secret through a required envFrom, so the
 # Secret is the example's prerequisite, not the spike's invention. The mocker needs
 # no token and huggingface_hub treats an empty HF_TOKEN as unset, so the value is
