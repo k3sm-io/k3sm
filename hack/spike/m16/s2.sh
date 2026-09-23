@@ -223,16 +223,7 @@ else
 import json, sys
 r = json.load(sys.stdin)
 print([v for v in r["served"] if v not in r["storage"]][0])')
-  FIRST=$(kc -n "$NS" get "$CRD_NAME" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-  if [ -n "$FIRST" ]; then
-    OUT=$(kc -n "$NS" get "${CRD_NAME%%.*}.$ALT.${CRD_NAME#*.}" "$FIRST" -o jsonpath='{.apiVersion}' 2>&1)
-    case "$OUT" in
-      *"$ALT"*) verdict PASS "s2.4 conversion  a $ALT read of $FIRST was answered live by the chart's conversion webhook (apiVersion=$OUT)" ;;
-      *)        verdict FAIL "s2.4 conversion  the $ALT read of $FIRST failed: $(printf '%s' "$OUT" | head -c 200)" ;;
-    esac
-  else
-    recorded "s2.4 conversion  no object of $CRD_NAME exists yet; the live conversion read is re-tried after s2.5 creates one"
-  fi
+  recorded "s2.4 conversion  $CRD_NAME serves $ALT beside its storage version behind a webhook; the live read is taken once s2.5's graph has produced an object"
 fi
 
 # ---- s2.5 the mocker deployment, from the upstream checkout ----------------------
@@ -285,6 +276,28 @@ yaml.safe_dump_all(docs, open(dst, "w"), default_flow_style=False)
 print("patched pod specs at: " + (", ".join(patched) if patched else "NONE — the example carries no inline pod spec, so the operator's own defaulting decides the runtime class"))
 PY
 kc apply -f "$W/dgd.yaml" > "$W/dgd-apply.log" 2>&1 || { verdict FAIL "s2.5 serve  the mocker deployment was rejected: $(tail -3 "$W/dgd-apply.log")"; exit 0; }
+
+# ---- s2.4 conversion, live, now that the graph exists ----------------------------
+# The operator derives the component objects from the graph, and the first of them is
+# what the alternate-version read converts. Taken before the serve wait so a red at
+# s2.5 cannot cost the conversion answer.
+if [ -n "$CONV_CRD" ]; then
+  FIRST=""
+  for i in $(seq 1 30); do
+    FIRST=$(kc -n "$NS" get "$CRD_NAME" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    [ -n "$FIRST" ] && break
+    sleep 2
+  done
+  if [ -n "$FIRST" ]; then
+    OUT=$(kc -n "$NS" get "${CRD_NAME%%.*}.$ALT.${CRD_NAME#*.}" "$FIRST" -o jsonpath='{.apiVersion}' 2>&1)
+    case "$OUT" in
+      *"$ALT"*) verdict PASS "s2.4 conversion  a $ALT read of $FIRST was answered live by the chart's conversion webhook (apiVersion=$OUT)" ;;
+      *)        verdict FAIL "s2.4 conversion  the $ALT read of $FIRST failed: $(printf '%s' "$OUT" | head -c 200)" ;;
+    esac
+  else
+    verdict FAIL "s2.4 conversion  the operator derived no $CRD_NAME from the graph within 60 s"
+  fi
+fi
 
 FE_SVC=""
 for i in $(seq 1 90); do
