@@ -347,17 +347,29 @@ FE_IP=$(kc -n "$NS" get svc "$FE_SVC" -o jsonpath='{.spec.clusterIP}')
 FE_PORT=$(kc -n "$NS" get svc "$FE_SVC" -o jsonpath='{.spec.ports[0].port}')
 recorded "s2.5 frontend Service: $FE_SVC at $FE_IP:$FE_PORT"
 
-MODELS=""
+# The frontend answers /v1/models as soon as its HTTP service is up, with an empty
+# list until Kubernetes discovery has delivered a worker. Discovery is what this
+# criterion measures, so the wait is for the first model, not the first 200; the
+# first 200 is recorded on its own because it dates the frontend's readiness.
+MODELS=""; MODEL_ID=""; ANSWERED=""
 for i in $(seq 1 90); do
   MODELS=$(curl -fsS -m 5 "http://$FE_IP:$FE_PORT/v1/models" 2>/dev/null)
-  [ -n "$MODELS" ] && break
+  if [ -n "$MODELS" ]; then
+    [ -n "$ANSWERED" ] || { ANSWERED=$i; recorded "s2.5 frontend  /v1/models first answered after $((i * 5)) s: $(printf '%s' "$MODELS" | head -c 160)"; }
+    MODEL_ID=$(printf '%s' "$MODELS" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"][0]["id"])' 2>/dev/null)
+    [ -n "$MODEL_ID" ] && break
+  fi
   sleep 5
 done
 if [ -z "$MODELS" ]; then
-  verdict FAIL "s2.5 serve  the frontend's ClusterIP never answered /v1/models — discovery did not complete; the plan's HALT applies (R4(b))"
+  verdict FAIL "s2.5 serve  the frontend's ClusterIP never answered /v1/models — the frontend never came up; the plan's HALT applies (R4(b))"
   kc -n "$NS" get pods; exit 0
 fi
-MODEL_ID=$(printf '%s' "$MODELS" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["data"][0]["id"])' 2>/dev/null)
+if [ -z "$MODEL_ID" ]; then
+  verdict FAIL "s2.5 serve  /v1/models answered but listed no model within $((90 * 5)) s — discovery did not deliver the worker; the plan's HALT applies (R4(b))"
+  kc -n "$NS" get pods; kc -n "$NS" get dynamoworkermetadata,endpointslices 2>&1 | head -20; exit 0
+fi
+recorded "s2.5 discovery  the frontend listed $MODEL_ID after $((i * 5)) s"
 OUT=$(curl -fsS -m 120 "http://$FE_IP:$FE_PORT/v1/chat/completions" -H 'content-type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}" 2>&1)
 case "$OUT" in
