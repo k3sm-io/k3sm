@@ -275,6 +275,12 @@ for d in docs:
 yaml.safe_dump_all(docs, open(dst, "w"), default_flow_style=False)
 print("patched pod specs at: " + (", ".join(patched) if patched else "NONE — the example carries no inline pod spec, so the operator's own defaulting decides the runtime class"))
 PY
+# The example's decode pod reads hf-token-secret through a required envFrom, so the
+# Secret is the example's prerequisite, not the spike's invention. The mocker needs
+# no token and huggingface_hub treats an empty HF_TOKEN as unset, so the value is
+# empty rather than a real credential.
+kc -n "$NS" create secret generic hf-token-secret --from-literal=HF_TOKEN= --dry-run=client -o yaml | kc apply -f - > /dev/null
+recorded "s2.5 prerequisite  hf-token-secret created with an empty HF_TOKEN (the decode pod's envFrom requires it; without it k3sm reports ProviderFailed 'secret $NS/hf-token-secret: file does not exist')"
 kc apply -f "$W/dgd.yaml" > "$W/dgd-apply.log" 2>&1 || { verdict FAIL "s2.5 serve  the mocker deployment was rejected: $(tail -3 "$W/dgd-apply.log")"; exit 0; }
 
 # ---- s2.4 conversion, live, now that the graph exists ----------------------------
