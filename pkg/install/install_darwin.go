@@ -514,11 +514,34 @@ func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s %s: %w", what, dir, err)
 	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("%s %s: %w", what, dir, err)
+	}
 	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
 		return fmt.Errorf("chown %s %s to %d:staff: %w", what, dir, uid, err)
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return fmt.Errorf("chmod %s %s 0700: %w", what, dir, err)
+	}
+	return nil
+}
+
+// refuseSymlinkAt lstats path and refuses it if it is a symlink. It exists for
+// every caller here that is about to Chown/Chmod BY PATH — both of which follow
+// a symlink to whatever it points at — right after an os.MkdirAll that is a
+// no-op against a path that already exists. Without this, a directory replaced
+// by a symlink between two runs (or one a lower-privileged writer plants ahead
+// of a root-run repair) would have its target chowned/chmodded instead of being
+// refused, the same confused-deputy shape Owner's own doc comment describes for
+// a single file, applied here to a directory MkdirAll believes it already
+// created. Found during the 2026-09-23 A1 audit.
+func refuseSymlinkAt(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("lstat: %w", err)
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return errors.New("is a symlink: refusing to chown/chmod through it")
 	}
 	return nil
 }
@@ -962,6 +985,9 @@ func (darwinSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
 func ensureRootOwnedDir(dir string, mode fs.FileMode) error {
 	if err := os.MkdirAll(dir, mode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("%s: %w", dir, err)
 	}
 	if err := os.Chown(dir, 0, 0); err != nil {
 		return fmt.Errorf("chown %s root:wheel: %w", dir, err)

@@ -749,6 +749,59 @@ func TestReadRegularFileOnDisk(t *testing.T) {
 	})
 }
 
+// TestEnsureOwnedDirRefusesASymlink exercises ensureServiceOwnedDir and
+// ensureRootOwnedDir against a REAL filesystem: os.MkdirAll no-ops against a
+// path that already exists — including one that exists as a symlink — so the
+// only thing standing between a planted symlink and a root-run Chown/Chmod
+// following it to wherever it points is the Lstat guard added in each
+// function. A fake asserting "MkdirAll was called, then Chown, then Chmod"
+// would pass whether or not that guard existed; only a real symlink proves it.
+//
+// Unprivileged and serial, like every other on-disk table here: both functions
+// chown to the CURRENT process's own uid/gid (a permitted no-op chown), which
+// is enough to exercise the guard without needing root.
+func TestEnsureOwnedDirRefusesASymlink(t *testing.T) {
+	uid := os.Getuid()
+
+	t.Run("ensureServiceOwnedDir", func(t *testing.T) {
+		root := t.TempDir()
+		elsewhere := filepath.Join(root, "elsewhere")
+		mkdir(t, elsewhere, 0o755)
+		dir := filepath.Join(root, "service-dir")
+		if err := os.Symlink(elsewhere, dir); err != nil {
+			t.Fatal(err)
+		}
+
+		err := ensureServiceOwnedDir(dir, uint32(uid), "test dir")
+		if err == nil {
+			t.Fatal("ensureServiceOwnedDir followed a symlink instead of refusing it")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("error %q does not name the refusal", err)
+		}
+		assertMode(t, elsewhere, 0o755) // untouched: the target was never chowned/chmodded
+	})
+
+	t.Run("ensureRootOwnedDir", func(t *testing.T) {
+		root := t.TempDir()
+		elsewhere := filepath.Join(root, "elsewhere")
+		mkdir(t, elsewhere, 0o755)
+		dir := filepath.Join(root, "root-dir")
+		if err := os.Symlink(elsewhere, dir); err != nil {
+			t.Fatal(err)
+		}
+
+		err := ensureRootOwnedDir(dir, 0o700)
+		if err == nil {
+			t.Fatal("ensureRootOwnedDir followed a symlink instead of refusing it")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("error %q does not name the refusal", err)
+		}
+		assertMode(t, elsewhere, 0o755)
+	})
+}
+
 // TestAdoptTreeWalksByDescriptorAndNeverFollowsASymlink exercises the REAL
 // adoption walk against a REAL filesystem, unprivileged.
 //
