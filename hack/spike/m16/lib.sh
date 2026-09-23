@@ -243,6 +243,8 @@ lab() {
 		 CHART_REF=${K3SM_M16_CHART:-} OPERATOR_IMAGE=${K3SM_M16_OPERATOR_IMAGE:-} \
 		 FRONTEND_IMAGE=${K3SM_M16_FRONTEND_IMAGE:-} MOCKER_IMAGE=${K3SM_M16_MOCKER_IMAGE:-} \
 		 WORKER_IMAGE=${K3SM_M16_WORKER_IMAGE:-} \
+		 K3SM_M16_VALUES=${K3SM_M16_VALUES:-} K3SM_M16_DGD_MANIFEST=${K3SM_M16_DGD_MANIFEST:-} \
+		 K3SM_M16_WEBHOOK_CERT=${K3SM_M16_WEBHOOK_CERT:-} K3SM_M16_POD_RUNASUSER=${K3SM_M16_POD_RUNASUSER:-} \
 		 bash -s" 2>&1 | tee "$out" || rc=$?
 	if [ "$rc" != 0 ]; then
 		fail "the rig-side payload exited non-zero (ssh/bash rc=$rc) — read the transcript above before reading the scoreboard"
