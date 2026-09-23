@@ -345,7 +345,7 @@ phases:
         title: HA server-join + identical-CA bootstrap bundle
         status: in-progress
         strategy: phased (named exception: kine/SQLite datastore migration)
-        note: "CODE-COMPLETE + unit-proven; the live 2-Mac + Postgres server-join/failover is the lab acceptance (M6.1-a1 met:false). The crypto core + the fail-closed server-join are the must-haves and are done; the client-side apiserver LB is BUILT (pkg/loadbalancer: server-set + health-check + pick-healthy + TCP-forward, unit-proven) with APIServers plumbed through the join result — the live cross-Mac kubeconfig-retarget/failover is the lab leg."
+        note: "CODE-COMPLETE + unit-proven; the live 2-Mac + Postgres server-join/failover is the lab acceptance (M6.1-a1 met:false). The crypto core + the fail-closed server-join are the must-haves and are done; the client-side apiserver LB is BUILT (pkg/loadbalancer: server-set + health-check + pick-healthy + TCP-forward, unit-proven) but NOT YET WIRED TO A CALLER — it has zero importers in the tree today (see docs/audits/open-items.md #3). APIServers is separately plumbed through the join result and consumed by a simpler first-dialable-endpoint picker in cmd/k3sm/agent.go (advertisedAPIServerHost), not by pkg/loadbalancer — the live cross-Mac kubeconfig-retarget/failover is the lab leg."
         deliverables:
           - id: M6.1-d1
             done: true
