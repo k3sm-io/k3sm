@@ -446,12 +446,8 @@ type stagingSystem struct {
 
 func (s stagingSystem) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
 
-func (s stagingSystem) FileMode(path string) (fs.FileMode, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	return fi.Mode().Perm(), nil
+func (s stagingSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
+	return readRegularFileWithMode(path)
 }
 
 func (s stagingSystem) WriteServiceUserFile(path string, contents []byte, _ uint32, mode, dirMode fs.FileMode) error {
@@ -637,6 +633,39 @@ func TestWriteServiceUserFileOnDisk(t *testing.T) {
 		}
 		if _, statErr := os.Stat(cfg.agentTokenPath()); statErr == nil {
 			t.Error("a refused token was staged anyway")
+		}
+	})
+
+	t.Run("operatorJoinToken refuses a symlinked token file rather than following it", func(t *testing.T) {
+		// Reproduces the 2026-09-23 A1 audit finding: a separate FileMode-then-
+		// ReadFile pair (the shape before this test existed) is two path-based
+		// syscalls with no descriptor binding them together, so --token-file
+		// pointed at a symlink got its MODE judged against the link (0600, if the
+		// link itself is tightly permissioned) while its BYTES were read from
+		// whatever the link resolved to. ReadRegularFileWithMode closes that by
+		// getting both from one open, O_NOFOLLOW descriptor — this test proves the
+		// symlink itself is refused outright, never resolved at all.
+		root := t.TempDir()
+		real := filepath.Join(root, "real-secret")
+		if err := os.WriteFile(real, []byte("not a join token, just a file root can read"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "operator-token")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{DataRoot: filepath.Join(root, "data"), TokenFile: link}.withDefaults()
+		sys := stagingSystem{fakeSystem: &fakeSystem{}, uid: uid, gid: gid}
+
+		_, _, err := operatorJoinToken(sys, cfg)
+		if err == nil {
+			t.Fatal("operatorJoinToken followed a symlink instead of refusing it")
+		}
+		if !errors.Is(err, ErrNotRegularFile) {
+			t.Errorf("error = %v, want it to satisfy ErrNotRegularFile", err)
+		}
+		if strings.Contains(err.Error(), "not a join token, just a file root can read") {
+			t.Errorf("the refusal echoed the symlink target's content: %q", err)
 		}
 	})
 }
