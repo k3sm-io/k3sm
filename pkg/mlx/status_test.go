@@ -661,4 +661,26 @@ func TestDeriveStatusIgnoresOldRevisionReplicas(t *testing.T) {
 			}
 		})
 	}
+
+	// The table above matches messages by substring. This pins the one a roll
+	// shows operators verbatim: the stale-template Pending message names the
+	// replica still on the old template, so a reworded message is a deliberate
+	// change and never a silent one.
+	t.Run("stale_template_pending_message_is_verbatim", func(t *testing.T) {
+		m := newModel()
+		m.Spec.Replicas = ptr.To(int32(1))
+		obs := Observation{
+			CurrentRevision: testPodRevision,
+			Pods:            []PodState{old(serving("qwen3-0"))},
+		}
+		got := DeriveStatus(m, obs, statusOptions(), statusBase)
+		c := meta.FindStatusCondition(got.Conditions, mlxv1alpha1.MLXModelConditionReady)
+		if c == nil {
+			t.Fatalf("DeriveStatus() published no Ready condition; got %+v", got.Conditions)
+		}
+		const want = "replica qwen3-0 is not on the current pod template yet (0 of 1 replicas ready)"
+		if c.Reason != ReasonPending || c.Message != want {
+			t.Errorf("Ready condition = %s %q, want %s %q", c.Reason, c.Message, ReasonPending, want)
+		}
+	})
 }
