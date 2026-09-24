@@ -78,9 +78,10 @@ type ServerConfig struct {
 	Bundle BundleSource
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
-	// Now is the clock the per-token join rate limiter refills against — this
-	// package's injected-clock idiom, the one NewTokenStore takes. time.Now when
-	// nil; a test advances it instead of sleeping out a refill window.
+	// Now is the clock the join rate limiters (per-token and pre-auth) refill
+	// against — this package's injected-clock idiom, the one NewTokenStore
+	// takes. time.Now when nil; a test advances it instead of sleeping out a
+	// refill window.
 	Now func() time.Time
 }
 
@@ -95,6 +96,9 @@ type Server struct {
 	// joins bounds how fast ONE token may drive the expensive, post-authentication
 	// half of handleJoin (see joinRateLimiter).
 	joins *joinRateLimiter
+	// preauth bounds anonymous join volume per source address and in total,
+	// ahead of the token verification's bcrypt cost (see preAuthLimiter).
+	preauth *preAuthLimiter
 }
 
 // NewServer validates cfg and returns the bootstrap Server. It errors if any
@@ -125,7 +129,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		// per-request line would bury it. Loud here beats silent everywhere.
 		cfg.Logger.Warn("the bootstrap server has no SelfNodeName: a join claiming this control plane's own node name is not refused by name, leaving only the node-password binding and the enroller's index guard behind it")
 	}
-	return &Server{cfg: cfg, joins: newJoinRateLimiter(cfg.Now)}, nil
+	return &Server{cfg: cfg, joins: newJoinRateLimiter(cfg.Now), preauth: newPreAuthLimiter(cfg.Now)}, nil
 }
 
 // Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +
@@ -170,6 +174,29 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// 0. PRE-AUTHENTICATION BOUND, identity-blind: per source address and in
+	// total (preAuthLimiter). Step 1 pays a bcrypt compare for every well-formed
+	// token, and the per-token limiter at step 1b bounds only the
+	// POST-authentication work — it cannot key a request until its token is
+	// verified. Without this, anonymous volume buys bcrypt CPU without limit.
+	//
+	// ORDERING INVARIANT: this must stay ahead of the body decode and ahead of
+	// VerifyToken. A later "cheaper checks first" reorder that moves it below
+	// step 1 reopens the flood cost, and one that moves it below the decode lets
+	// a flood buy a 1 MiB JSON parse per request. The key is RemoteAddr only,
+	// never a client-settable header. Refusals log at Debug: a flood refused
+	// here must not turn into a log flood.
+	if ok, retryAfter := s.preauth.allow(preAuthSourceKey(r.RemoteAddr)); !ok {
+		secs := retryAfterSeconds(retryAfter)
+		s.cfg.Logger.Debug("join rejected", "reason", "pre-auth-rate-limit",
+			"retryAfterSeconds", secs, "remote", r.RemoteAddr)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		http.Error(w, fmt.Sprintf("join refused: too many join requests; retry in %ds", secs),
+			http.StatusTooManyRequests)
+		return
+	}
+
 	var req JoinRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "decode join request: "+err.Error(), http.StatusBadRequest)
