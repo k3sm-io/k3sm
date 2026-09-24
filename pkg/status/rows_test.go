@@ -712,3 +712,105 @@ func mustRow(t *testing.T, rep Report, name string) Row {
 	}
 	return r
 }
+
+// TestWorkloadsRowReportsStuckTerminating pins the stuck-terminating report: a
+// pod with a deletion timestamp is counted as terminating and never under its
+// phase, and only a pod on a node that has been NotReady past the debounce
+// warns, with the out-of-service taint for THAT node as the remedy.
+func TestWorkloadsRowReportsStuckTerminating(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	notReadyFor := func(name string, d time.Duration) corev1.Node {
+		n := readyNode(name)
+		n.Status.Conditions[0].Status = corev1.ConditionUnknown
+		n.Status.Conditions[0].LastTransitionTime = metav1.NewTime(now.Add(-d))
+		return n
+	}
+	terminatingOn := func(node string) corev1.Pod {
+		p := podIn(corev1.PodRunning)
+		ts := metav1.NewTime(now.Add(-time.Hour))
+		p.DeletionTimestamp = &ts
+		p.Spec.NodeName = node
+		return p
+	}
+	running := func(node string) corev1.Pod {
+		p := podIn(corev1.PodRunning)
+		p.Spec.NodeName = node
+		return p
+	}
+	remedyFor := func(node string) string {
+		return "kubectl taint node " + node + " node.kubernetes.io/out-of-service=nodeshutdown:NoExecute\n" +
+			"# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac"
+	}
+	tests := []struct {
+		name       string
+		hostname   string
+		nodes      []corev1.Node
+		pods       []corev1.Pod
+		wantSev    Severity
+		wantDetail string
+		wantRemedy string
+		wantWide   map[string]string
+	}{
+		{
+			name:       "terminating on a Ready node is counted and does not warn",
+			nodes:      []corev1.Node{readyNode("k3sm-mac")},
+			pods:       []corev1.Pod{running("k3sm-mac"), terminatingOn("k3sm-mac")},
+			wantSev:    SeverityOK,
+			wantDetail: "1 running · 1 terminating",
+		},
+		{
+			name:       "terminating on a NotReady node inside the debounce does not warn",
+			nodes:      []corev1.Node{notReadyFor("k3sm-mac", time.Minute)},
+			pods:       []corev1.Pod{terminatingOn("k3sm-mac")},
+			wantSev:    SeverityOK,
+			wantDetail: "0 running · 1 terminating",
+		},
+		{
+			name:       "terminating on a NotReady node past the debounce warns with the taint",
+			nodes:      []corev1.Node{notReadyFor("k3sm-mac", 10*time.Minute)},
+			pods:       []corev1.Pod{running("k3sm-mac"), terminatingOn("k3sm-mac")},
+			wantSev:    SeverityWarn,
+			wantDetail: "1 running · 1 terminating (1 stuck on NotReady k3sm-mac)",
+			wantRemedy: remedyFor("k3sm-mac"),
+			wantWide:   map[string]string{"stuckNode": "k3sm-mac", "stuckPods": "1"},
+		},
+		{
+			name:     "the stuck pod on a worker names the worker, not the server the report runs on",
+			hostname: "server",
+			nodes:    []corev1.Node{readyNode("k3sm-server"), notReadyFor("k3sm-worker", 10*time.Minute)},
+			pods: []corev1.Pod{
+				running("k3sm-server"), running("k3sm-server"),
+				terminatingOn("k3sm-worker"), terminatingOn("k3sm-worker"), terminatingOn("k3sm-server"),
+			},
+			wantSev:    SeverityWarn,
+			wantDetail: "2 running · 3 terminating (2 stuck on NotReady k3sm-worker)",
+			wantRemedy: remedyFor("k3sm-worker"),
+			wantWide:   map[string]string{"stuckNode": "k3sm-worker", "stuckPods": "2"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := Collector{Kube: fakeKube{nodes: tc.nodes, pods: tc.pods}, Hostname: tc.hostname}
+			row := c.workloadsRow(context.Background(), true, 0, tc.nodes, now)
+			if row.Severity != tc.wantSev {
+				t.Errorf("severity = %s, want %s", row.Severity, tc.wantSev)
+			}
+			if row.Detail != tc.wantDetail {
+				t.Errorf("detail = %q, want %q", row.Detail, tc.wantDetail)
+			}
+			if row.Remedy != tc.wantRemedy {
+				t.Errorf("remedy = %q, want %q", row.Remedy, tc.wantRemedy)
+			}
+			if len(row.Wide) != len(tc.wantWide) {
+				t.Errorf("wide = %v, want %v", row.Wide, tc.wantWide)
+			}
+			for k, v := range tc.wantWide {
+				if row.Wide[k] != v {
+					t.Errorf("wide[%s] = %q, want %q", k, row.Wide[k], v)
+				}
+			}
+		})
+	}
+}

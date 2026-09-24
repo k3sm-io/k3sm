@@ -694,13 +694,13 @@ func TestRoleKeyedRemediesAreStable(t *testing.T) {
 			notReady.apiserverRow(context.Background(), dataroot.RoleServer, CredentialUnknown).Remedy,
 			"k3sm status logs server"},
 		{"a control plane's node row",
-			down.nodeRow(context.Background(), false, dataroot.RoleServer).Remedy,
+			down.nodeRow(false, dataroot.RoleServer, nil, nil).Remedy,
 			"k3sm status logs server"},
 		{"a worker's unreachable apiserver points at the other Mac, never at a local daemon",
 			down.apiserverRow(context.Background(), dataroot.RoleAgent, CredentialValid).Remedy,
 			"k3sm status logs agent\nk3sm status   # on the control-plane Mac"},
 		{"a worker's node row tails its own daemon",
-			down.nodeRow(context.Background(), false, dataroot.RoleAgent).Remedy,
+			down.nodeRow(false, dataroot.RoleAgent, nil, nil).Remedy,
 			"k3sm status logs agent"},
 	}
 	for _, tc := range tests {
