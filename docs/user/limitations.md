@@ -661,6 +661,17 @@ dev-Mac churn soak). Until that soak is signed off, treat heavy-churn watch sema
 accepted-with-known-issue rather than guaranteed. See [Backup & restore](backup-restore.md) for the
 datastore operational model.
 
+### Mesh MTU Spread and the UDP Segmentation Gap
+
+A k3sm node presents a wide MTU spread: loopback pod aliases sit at 16384, and the mesh
+WireGuard tunnel sits at 1380. TCP flows crossing the mesh are MSS-clamped by a pf rule the
+mesh loads, so they stay inside the tunnel MTU. UDP gets no such clamp by design, because the
+scrub rule is TCP-only, so a UDP datagram sized for the loopback path can still exceed the
+tunnel MTU when it crosses the mesh. One unattributed host kernel panic in the segmentation-
+offload path is on record on macOS 26.6.2 with the mesh active; the evidence collected at the
+time was insufficient to name the flow that triggered it. If it recurs, the audit gate collects
+the snapshot needed to attribute it.
+
 ## MLX / Apple-GPU Workloads
 
 MLX and Apple-GPU workloads (the `MLXModel` CRD and the `mlx.k3sm.io/gpu` extended resource) have
