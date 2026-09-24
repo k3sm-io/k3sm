@@ -178,11 +178,18 @@ type JoinResponse struct {
 }
 
 // TokenVerifier verifies a raw K10 join token (the seam the bootstrap server uses;
-// *TokenStore satisfies it).
+// *TokenStore and *FileTokenStore satisfy it).
 type TokenVerifier interface {
 	// VerifyToken parses and verifies tok, returning nil iff it is a minted,
 	// unexpired bootstrap token. ctx is checked eagerly and fails closed: a
 	// cancelled request is denied, never granted.
+	//
+	// Cost equalization is part of the contract: an implementation must perform
+	// equivalent verification work whether or not the token's id exists, and
+	// whether the token is unknown, expired, mismatched, or valid, so response
+	// timing never confirms that an id exists. Both shipped stores do one
+	// bcrypt compare on every such outcome, against a dummy hash for an unknown
+	// id.
 	VerifyToken(ctx context.Context, tok string) error
 }
 
