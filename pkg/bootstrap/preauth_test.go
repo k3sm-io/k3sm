@@ -122,6 +122,15 @@ const wellFormedJoin = `{"token":"K10abc::id.secret","nodeName":"worker"}`
 // bound absent, or placed after VerifyToken, every request reaches the verifier
 // and the counts equal the sends; with it placed after the decode, the
 // garbage-body row answers 400 instead of 429.
+// trackedSources reports how many per-source buckets are held; the tests
+// assert the hard cap with it (test-only so the shipped type carries no
+// unused surface).
+func (l *preAuthLimiter) trackedSources() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.sources)
+}
+
 func TestJoinPreAuthBoundRefusesFloods(t *testing.T) {
 	t.Parallel()
 

@@ -230,14 +230,6 @@ func (l *preAuthLimiter) sweepLocked(now time.Time) {
 	}
 }
 
-// trackedSources reports how many per-source buckets are held (tests assert
-// the hard cap with it).
-func (l *preAuthLimiter) trackedSources() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.sources)
-}
-
 // preAuthSourceKey is the per-source key for a request's RemoteAddr: its host
 // part, so every connection from one address shares a bucket whatever its
 // ephemeral port. RemoteAddr is set by net/http from the accepted connection,
