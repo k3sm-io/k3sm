@@ -915,7 +915,8 @@ func runServer(args []string) (err error) {
 		}
 		enroller = e
 		if res, down, err := enrollSelfAndBringUpMesh(ctx, enroller, nodePasswords, opts, mode, exec.Kubeconfig(), logger); err != nil {
-			logger.Error("server mesh bring-up failed; this node is NOT on its own mesh, so cross-node pod traffic to it has no path and its Service proxy will source backend dials from the kernel default", "err", err)
+			msg, attrs := serverMeshBringUpFailure(opts, err)
+			logger.Error(msg, attrs...)
 			// A bring-up that failed part-way still owns a utun, so the handle is
 			// armed even here; it is a no-op when nothing came up.
 			meshDown = down

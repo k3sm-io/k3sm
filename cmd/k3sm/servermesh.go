@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -268,6 +269,29 @@ func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 		logger.Warn("could not write the mesh private key to the root-only path; `k3sm install` provisions it as root, so this matters only on a node installed by other means",
 			"path", path, "err", err)
 	}
+}
+
+// serverMeshBringUpFailure is the message and attributes the caller logs, at its
+// survivable posture (logged, never fatal), when enrollSelfAndBringUpMesh fails.
+//
+// A node-password mismatch on this node's OWN name gets its own diagnosis. It is
+// not an impostor: it is this node's persisted password file disagreeing with the
+// binding the store took on an earlier boot — a reinstall that re-minted the file,
+// or a restore that brought back the datastore without it. The generic wording
+// hides that behind a mesh error, so the operator is told which file, which name,
+// and that restoring the original file is the recovery. The diagnosis names the
+// remedy without its mechanics and never prints the password or its hash.
+func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
+	if errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
+		return "server mesh bring-up failed: this control-plane node's stored node-password file no longer matches the binding the datastore holds for its node name, usually because the node was reinstalled or its datastore restored without that file; this node is NOT on its own mesh until it is resolved. To recover, restore the original node-password file to the path below and restart; otherwise a cluster administrator can clear the stale binding for this node name by the documented recovery procedure",
+			[]any{
+				"node", opts.nodeName,
+				"nodePasswordFile", filepath.Join(opts.workDir, serverNodePasswordRef),
+				"err", err,
+			}
+	}
+	return "server mesh bring-up failed; this node is NOT on its own mesh, so cross-node pod traffic to it has no path and its Service proxy will source backend dials from the kernel default",
+		[]any{"err", err}
 }
 
 // enrollSelfAndBringUpMesh is the control-plane node's own mesh join: it binds
