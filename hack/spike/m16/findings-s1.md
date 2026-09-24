@@ -1,13 +1,16 @@
 # S1 findings — the Darwin build and an infrastructure-free smoke (M16.0-d2)
 
 > **Status: RUN 2026-09-24** on the M16 rig named under Rig, at the plan's default
-> pins (upstream `ref=main`). s1.1 to s1.3 and the frontend `--help` hold; the
-> infrastructure-free smoke fails on a harness defect, not on the darwin build, so the
-> binding halt (a `nixl-sys` link failure) does NOT apply: `nixl-sys` and the memory
-> crate built. An earlier attempt the same day failed s1.4 `--help` because the smoke
-> resolved the top-level package from the index, whose runtime has no darwin wheel;
-> that is fixed in the script that produced this run. Re-running the script overwrites
-> rig state under `$PREFIX`; it does not rewrite this file.
+> pins (upstream `ref=main`), exit 1 (3 passed, 1 failed, 4 recorded). s1.1 to s1.3
+> and the frontend `--help` hold, and file discovery connects the frontend to the
+> mocker, but the frontend never materializes the mocker's model, so no completion is
+> served. The binding halt (a `nixl-sys` link failure) does NOT apply: `nixl-sys` and
+> the memory crate built. Two earlier runs the same day stopped on harness defects
+> written against an older upstream CLI (the smoke resolved the top-level package from
+> the index, whose runtime has no darwin wheel; then it passed a discovery-path flag
+> and an ambiguous model flag the resolved commit does not accept); both are fixed in
+> the script that produced this run. Re-running the script overwrites rig state under
+> `$PREFIX`; it does not rewrite this file.
 
 ## Question
 
@@ -37,9 +40,9 @@ wave starts.
 |---|---|---|
 | s1.1 toolchain pinned (rustc, maturin, interpreter) | PASS | rustc 1.90.0 (1159e78c4 2025-09-14) is the rustup default; maturin 1.15.0; CPython 3.12.14 (arm64). See Findings: upstream's `rust-toolchain.toml` selected 1.96.1 for the actual build |
 | s1.2 build completes; resolved commit recorded | PASS | the python bindings built from source on darwin/arm64 with the CUDA-bearing defaults off, at `2be370d1510979953e7447796ffafc3f87fed3a0` (`v1.4.0-inkling-dev.1-1366-g2be370d15`); `nixl-sys` and the memory crate compiled and linked |
-| s1.3 wheel sha256; extension signature state | RECORDED | `ai_dynamo_runtime-1.6.0-cp310-abi3-macosx_11_0_arm64.whl` sha256 `8c99585d323f26fbb7a84283702ae286d899d66e38db5c35788231268d9631ec`; `dynamo/_core.abi3.so` arrives `adhoc,linker-signed` (flags 0x20002), which is what `hack/images/*/walk-verify.sh` assumes |
+| s1.3 wheel sha256; extension signature state | RECORDED | `ai_dynamo_runtime-1.6.0-cp310-abi3-macosx_11_0_arm64.whl` sha256 `d52f058dcf83973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352`; `dynamo/_core.abi3.so` arrives `adhoc,linker-signed` (flags 0x20002), which is what `hack/images/*/walk-verify.sh` assumes |
 | s1.4 `dynamo.frontend --help` | PASS | answers from the top-level package installed from the clone against the locally built wheel |
-| s1.4 frontend + mocker, file discovery, one completion | FAIL (harness) | neither process started: the frontend rejected `--discovery-path` as an unknown argument, and the mocker rejected `--model` as ambiguous (`--model-path`, `--model-name`). At this commit both take `--discovery-backend file` but not the rung's path flag, so the smoke's invocation has drifted from upstream. No completion was attempted |
+| s1.4 frontend + mocker, file discovery, one completion | FAIL | both processes started with `--discovery-backend file` and the root in `DYN_FILE_KV`, and the frontend discovered the mocker's `mock-model` endpoint through the file store, but every materialization attempt failed with `chat pipeline requires preprocessed routing` (8 attempts over two minutes), so `/v1/models` never listed the model and no completion was attempted. The mocker was started with `--model-name` only and no `--model-path`, so it offers no tokenizer to preprocess against; that is the likely cause, not established here |
 
 ## Pins this rung sets
 
@@ -47,7 +50,7 @@ wave starts.
 |---|---|
 | upstream commit (R2 promotes it to the first tag containing it) | `2be370d1510979953e7447796ffafc3f87fed3a0` |
 | chart version built from that commit | not built by this rung (S2 installs the chart) |
-| runtime wheel sha256 (a **reproducibility record**, not provenance) | `8c99585d323f26fbb7a84283702ae286d899d66e38db5c35788231268d9631ec` (see Findings: not stable across rebuilds) |
+| runtime wheel sha256 (a **reproducibility record**, not provenance) | `d52f058dcf83973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352` (see Findings: not stable across rebuilds) |
 | Rust toolchain / maturin | rustc 1.90.0 asserted, 1.96.1 built (see Findings) / maturin 1.15.0 |
 
 ## Rig
@@ -74,7 +77,14 @@ wave starts.
   (`91116f57007b59fcc1dcfffc6804abc40cbcffa3c419c578b815e91d5fb25e73`, then
   `8c99585d323f26fbb7a84283702ae286d899d66e38db5c35788231268d9631ec`). The sha256 is a
   record of one artifact, not a value a rebuild can be checked against.
-- **The smoke's invocation has drifted from upstream.** At this commit the frontend
-  takes no `--discovery-path`, and the mocker's `--model` is an ambiguous prefix. The
-  file-discovery smoke cannot run until the rung's flags match the checkout; that is a
-  harness fix, and the infrastructure-free question stays open until it lands.
+- **The final run's wheel differs again.** The build that produced this run's
+  scoreboard gave `d52f058dcf83973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352`, a
+  third sha256 for the same commit on the same rig.
+- **File discovery works; model materialization does not.** At the resolved commit
+  the file backend takes its root from `DYN_FILE_KV` (there is no path flag), and with
+  it set the frontend found the mocker's endpoint in the store. It then refused to
+  build a chat pipeline for the model (`chat pipeline requires preprocessed routing`).
+  The infrastructure-free question is therefore half-answered: two processes and a
+  directory do discover each other with no etcd and no NATS, but no completion has
+  been served. Closing it needs a mocker started with a model path the frontend can
+  preprocess against, which is a further change to the smoke and is not made here.
