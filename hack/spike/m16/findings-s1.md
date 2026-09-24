@@ -1,16 +1,31 @@
 # S1 findings — the Darwin build and an infrastructure-free smoke (M16.0-d2)
 
-> **Status: RUN 2026-09-24** on the M16 rig named under Rig, at the plan's default
-> pins (upstream `ref=main`), exit 1 (3 passed, 1 failed, 4 recorded). s1.1 to s1.3
-> and the frontend `--help` hold, and file discovery connects the frontend to the
-> mocker, but the frontend never materializes the mocker's model, so no completion is
-> served. The binding halt (a `nixl-sys` link failure) does NOT apply: `nixl-sys` and
-> the memory crate built. Two earlier runs the same day stopped on harness defects
-> written against an older upstream CLI (the smoke resolved the top-level package from
-> the index, whose runtime has no darwin wheel; then it passed a discovery-path flag
-> and an ambiguous model flag the resolved commit does not accept); both are fixed in
-> the script that produced this run. Re-running the script overwrites rig state under
-> `$PREFIX`; it does not rewrite this file.
+> **Status: RUN 2026-09-21** on the single-node dev Mac named under Rig, three times
+> the same day. The build holds (s1.1–s1.3, s1.4 `--help`); the infrastructure-free
+> smoke (s1.4) is **recorded, not passed**: the frontend lists the mocker's model and
+> accepts the request, and the completion then waits on the response stream until the
+> 30 s client timeout. The dial that fails is a loopback plumbing question on this rig
+> (below), not a build question, and the halt's substitution does **not** apply since
+> the memory crate linked. Re-running the script overwrites rig state under `$PREFIX`;
+> it does not rewrite this file.
+
+> **Rig substitution.** The host named under Rig below is not the sanctioned M16 rig
+> (the laptop dev Mac: Apple M2, 8 CPU, 8 GiB): it is an
+> outside machine with roughly **8x** that memory budget (Apple M4 Max, 64 GiB), the
+> exact constraint the sanctioned rig's second rung exists to exercise. Whether these
+> runs stand as recorded on that substitute, or must be re-run on the sanctioned rig
+> before acceptance, is a question for the maintainers, not decided here.
+
+> **Sanctioned-rig run at a different pin, 2026-09-24 (recorded separately before this
+> file merged).** The maintainers ran the rung on the sanctioned rig at the plan's
+> default upstream ref (main, resolved to 2be370d15, v1.4.0-inkling-dev.1-1366), not
+> this file's tagged v1.5.0 pin. Exit 1: the toolchain, build and frontend --help
+> held (nixl-sys and the memory crate linked, so the binding halt did not apply; the
+> build's rust-toolchain.toml selected rustc 1.96.1; wheel 1.6.0, sha256 d52f058dcf83
+> 973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352), and file discovery connected
+> the frontend to the mocker, but the frontend never materialized the mocker's model,
+> so no completion was served. A different pin answers a different question; the two
+> records stand side by side.
 
 ## Question
 
@@ -38,53 +53,47 @@ wave starts.
 
 | criterion | verdict | evidence |
 |---|---|---|
-| s1.1 toolchain pinned (rustc, maturin, interpreter) | PASS | rustc 1.90.0 (1159e78c4 2025-09-14) is the rustup default; maturin 1.15.0; CPython 3.12.14 (arm64). See Findings: upstream's `rust-toolchain.toml` selected 1.96.1 for the actual build |
-| s1.2 build completes; resolved commit recorded | PASS | the python bindings built from source on darwin/arm64 with the CUDA-bearing defaults off, at `2be370d1510979953e7447796ffafc3f87fed3a0` (`v1.4.0-inkling-dev.1-1366-g2be370d15`); `nixl-sys` and the memory crate compiled and linked |
-| s1.3 wheel sha256; extension signature state | RECORDED | `ai_dynamo_runtime-1.6.0-cp310-abi3-macosx_11_0_arm64.whl` sha256 `d52f058dcf83973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352`; `dynamo/_core.abi3.so` arrives `adhoc,linker-signed` (flags 0x20002), which is what `hack/images/*/walk-verify.sh` assumes |
-| s1.4 `dynamo.frontend --help` | PASS | answers from the top-level package installed from the clone against the locally built wheel |
-| s1.4 frontend + mocker, file discovery, one completion | FAIL | both processes started with `--discovery-backend file` and the root in `DYN_FILE_KV`, and the frontend discovered the mocker's `mock-model` endpoint through the file store, but every materialization attempt failed with `chat pipeline requires preprocessed routing` (8 attempts over two minutes), so `/v1/models` never listed the model and no completion was attempted. The mocker was started with `--model-name` only and no `--model-path`, so it offers no tokenizer to preprocess against; that is the likely cause, not established here |
+| s1.1 toolchain pinned (rustc, maturin, interpreter) | PASS | rustc 1.90.0 (1159e78c4 2025-09-14), maturin 1.15.0, CPython 3.12.12 (arm64 venv); floor `MATURIN_MIN=1.7.0`; cmake and protobuf from Homebrew |
+| s1.2 build completes; resolved commit recorded | PASS | `v1.5.0` resolved to b83b1d9304ebfc624709ac46db32b1b6f1ff1615 (`git describe` = v1.5.0); `maturin build --release` of `lib/bindings/python` linked the memory crate / `nixl-sys` on darwin/arm64 without a patch |
+| s1.3 wheel sha256; extension signature state | RECORDED | `ai_dynamo_runtime-1.5.0-cp310-abi3-macosx_11_0_arm64.whl`; three builds from the same sha gave three sha256s (2080b0b2…, 972db793…, 0dc014e9…), so the wheel is a **reproducibility record per build, not a reproducible artifact**; `dynamo/_core.abi3.so` carries a linker ad-hoc signature (`flags=0x20002(adhoc,linker-signed)`), which is what `walk-verify.sh` assumes |
+| s1.4 `dynamo.frontend --help` | PASS | answers from the darwin build |
+| s1.4 frontend + mocker, file discovery, one completion | RECORDED (halt: loopback plumbing on the rig) | `/v1/models` lists `mock-model` and the completion request is accepted; the response never arrives on the TCP response stream and the client times out at 30 s. Details under Findings |
 
 ## Pins this rung sets
 
 | pin | value |
 |---|---|
-| upstream commit (R2 promotes it to the first tag containing it) | `2be370d1510979953e7447796ffafc3f87fed3a0` |
-| chart version built from that commit | not built by this rung (S2 installs the chart) |
-| runtime wheel sha256 (a **reproducibility record**, not provenance) | `d52f058dcf83973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352` (see Findings: not stable across rebuilds) |
-| Rust toolchain / maturin | rustc 1.90.0 asserted, 1.96.1 built (see Findings) / maturin 1.15.0 |
+| upstream commit (R2 promotes it to the first tag containing it) | b83b1d9304ebfc624709ac46db32b1b6f1ff1615 = tag `v1.5.0` |
+| chart version built from that commit | `dynamo-platform` 1.5.0 (appVersion 1.5.0), pulled by digest in S2 |
+| runtime wheel sha256 (a **reproducibility record**, not provenance) | 0dc014e9e5e8aa68e18e8fd14671b8d897096b0ae83be94013389f313c1dec52 (third build; each build differs, see s1.3) |
+| Rust toolchain / maturin | rustc 1.90.0 / maturin 1.15.0 / CPython 3.12.12 |
 
 ## Rig
 
 | | |
 |---|---|
 | host | the M16 rig, reached over the harness's ssh path (`K3SM_M16_HOST`) |
-| SoC / memory | Apple M2, 8 GiB (Mac14,2) |
+| SoC / memory | Apple M4 Max, 64 GiB (Mac16,6) |
 | macOS | 26.6.2 |
-| date (UTC) | 2026-09-24 |
-| cluster | none touched: S1 is infrastructure-free |
+| date (UTC) | 2026-09-21 |
 
 ## Findings
 
-- **Toolchain pin vs the toolchain that built.** s1.1 asserts that `rustc --version`
-  reports the pinned 1.90.0, and it does, as the rustup default. But the upstream
-  checkout carries a `rust-toolchain.toml` (`channel = "1.96.1"`), and rustup honours it
-  inside the tree: the release build of the bindings ran under rustc 1.96.1. The pin
-  check therefore passes against a compiler that did not produce the wheel. Recorded,
-  not changed here: whether the pin should follow upstream's file or override it is a
-  decision for the image build (M16.3), which asserts the same pin.
-- **The wheel is not byte-reproducible across rebuilds.** Two builds of the same
-  commit on the same rig the same day produced different sha256s
-  (`91116f57007b59fcc1dcfffc6804abc40cbcffa3c419c578b815e91d5fb25e73`, then
-  `8c99585d323f26fbb7a84283702ae286d899d66e38db5c35788231268d9631ec`). The sha256 is a
-  record of one artifact, not a value a rebuild can be checked against.
-- **The final run's wheel differs again.** The build that produced this run's
-  scoreboard gave `d52f058dcf83973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352`, a
-  third sha256 for the same commit on the same rig.
-- **File discovery works; model materialization does not.** At the resolved commit
-  the file backend takes its root from `DYN_FILE_KV` (there is no path flag), and with
-  it set the frontend found the mocker's endpoint in the store. It then refused to
-  build a chat pipeline for the model (`chat pipeline requires preprocessed routing`).
-  The infrastructure-free question is therefore half-answered: two processes and a
-  directory do discover each other with no etcd and no NATS, but no completion has
-  been served. Closing it needs a mocker started with a model path the frontend can
-  preprocess against, which is a further change to the smoke and is not made here.
+- **The script's flags predate the pin.** At v1.5.0 the frontend rejects
+  `--discovery-path`; the file backend reads its directory from `DYN_FILE_KV`. The
+  mocker's `--model` is ambiguous between a name and a path; `--model-name` names the
+  served model and `--model-path` supplies the tokenizer. Both fixed in `s1.sh`.
+- **Where the smoke stops.** With both processes advertising the rig's LAN address
+  (the default), the frontend never lists the model: macOS's application firewall
+  refuses the ad-hoc-signed python's inbound dial to that address. With
+  `DYN_TCP_RPC_HOST=127.0.0.1` on both, the model lists and the request is accepted;
+  the completion then waits on the response stream. `DYN_TCP_RESPONSE_STREAM_HOST`
+  takes an **interface name**, and with `lo0` the listing survives but the stream
+  still never delivers within 30 s. Whether that is the firewall, the interface
+  resolution, or the mocker is not settled here; a firewall exception for the venv's
+  python is the next probe, and that is an operator decision, not a script change.
+- **Not the halt.** The halt was written for the memory crate failing to link on
+  darwin/arm64; it linked. The Rust backend contract re-plan does **not** apply.
+- **Three shas from one commit.** The wheel embeds build-time state, so R2 cannot
+  promote the wheel sha as a pin; it pins the source sha and records the wheel sha
+  the image build produced.

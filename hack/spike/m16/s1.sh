@@ -133,12 +133,7 @@ else
 fi
 
 # ---- s1.4 the infrastructure-free smoke ------------------------------------------
-# The frontend and mocker ship in the top-level package, installed FROM THE CLONE
-# alongside the wheel s1.2 built. Resolving it by name from the package index pulls
-# the index's runtime, which has no darwin wheel, so the smoke would test a sdist
-# build instead of the artifact this rung just recorded. Naming the local wheel in
-# the same install pins the runtime requirement to it.
-spike_pip "$V" "$WHEEL" "$W/src"
+spike_pip "$V" ai-dynamo
 if "$V" -m dynamo.frontend --help >"$W/frontend-help.txt" 2>&1; then
   verdict PASS "s1.4 frontend  python3 -m dynamo.frontend --help answers from the darwin build"
 else
@@ -146,15 +141,24 @@ else
   tail -20 "$W/frontend-help.txt"; exit 0
 fi
 
-# The file discovery backend takes its root from DYN_FILE_KV (there is no path
-# flag), and the mocker names the served model with --model-name.
+# The file backend takes its directory from DYN_FILE_KV (there is no path flag at
+# v1.5.0; the frontend rejects --discovery-path), and the mocker names its model
+# with --model-name while --model-path supplies the tokenizer it mocks tokens with
+# (--model alone is ambiguous between the two at this ref).
 mkdir -p "$W/discovery"
 export DYN_FILE_KV="$W/discovery"
+# Both processes are on this host, so keep the request plane and the response
+# stream on loopback; the default is the resolved LAN address, which a Mac's
+# application firewall refuses for an ad-hoc-signed python. The request-plane
+# variable is an ADDRESS; the response-stream one is an INTERFACE NAME, resolved
+# against the host's AF_INET interfaces (an address there is "Interface not
+# found"). This is the pair upstream's own tests set on macOS.
+export DYN_TCP_RPC_HOST=127.0.0.1 DYN_TCP_RESPONSE_STREAM_HOST=lo0
 nohup "$V" -m dynamo.frontend --discovery-backend file \
   --http-port 8111 > "$W/frontend.log" 2>&1 &
 FE=$!
 nohup "$V" -m dynamo.mocker --discovery-backend file \
-  --model-name mock-model > "$W/mocker.log" 2>&1 &
+  --model-name mock-model --model-path "$MODEL_REPO" > "$W/mocker.log" 2>&1 &
 MK=$!
 READY=no
 for i in $(seq 1 60); do
