@@ -1548,10 +1548,66 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		}
 		r.log.Error("CreatePod: runtimed rejected the pod", "namespace", pod.Namespace, "name", pod.Name,
 			"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
+		// A pod-level refusal goes back to VK as the create's error; VK records
+		// ProviderFailed and retries on its back-off. That retry reaches
+		// CreatePod only if this pod is no longer tracked: VK asks GetPod first
+		// and takes the UpdatePod path for a pod the provider still lists, and a
+		// tracked pod the runtime does not hold answers GetPodStatus with a
+		// synthesized ContainerCreating that overwrites the ProviderFailed VK
+		// just wrote — a pod stuck creating, never re-created. Runtimed has said
+		// it holds nothing, so the track goes the way a preflight refusal's does.
+		//
+		// On an idempotent re-create (old != nil) the refusal alone does not say
+		// whether runtimed holds the pod: its CreatePod validates the box before
+		// it looks the pod up, so a refusal can come from validation while the
+		// old track's pod is still held, or from creation because it was not. The
+		// runtime is asked. A pod it holds keeps its track, since forgetting it
+		// would release the /32 and log tree of a pod that is running; a pod it
+		// does not hold goes the way a first create's refusal does.
+		if old == nil || !r.runtimeHoldsPod(ctx, id) {
+			r.untrackRejectedCreate(pod, t)
+		}
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
 	}
 	r.completeCreate(pod, t, resp.GetStatus())
 	return nil
+}
+
+// untrackRejectedCreate forgets a pod runtimed refused to create at the pod
+// level. It is the CreatePod-side mirror of DeletePod's bookkeeping for a pod
+// that never existed in the runtime: the track is removed so VK's retry reaches
+// CreatePod again, the goroutines the track could own are cancelled, and the
+// pod's /32 and log tree are released. Only the track this create installed is
+// removed — a track replaced since (a concurrent re-create) is left alone.
+func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
+	id := string(pod.UID)
+	r.mu.Lock()
+	// Identity, not presence: a concurrent CreatePod for the same pod may have
+	// replaced this track between this create's RPC and its refusal, and that
+	// replacement is running its own attempt. Only the track this create
+	// installed is removed.
+	if r.track[id] == t {
+		delete(r.track, id)
+	}
+	r.mu.Unlock()
+	t.cancelRestarts()
+	t.cancelPulls()
+	t.cancelPostStart()
+	r.releasePodNetwork(pod)
+	r.removePodLogs(pod)
+}
+
+// runtimeHoldsPod reports whether runtimed knows the pod, the question a refused
+// re-create leaves open. A transport failure answers true: forgetting a pod the
+// runtime may hold is the one irreversible outcome here, and the status sync
+// re-asks on its own cadence.
+func (r *runtimedRuntime) runtimeHoldsPod(ctx context.Context, id string) bool {
+	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
+	if err != nil {
+		return true
+	}
+	e := resp.GetError()
+	return e == nil || e.GetCode() == 0
 }
 
 // gpuCeilingBytes reports this node's usable GPU memory ceiling in bytes, or 0
