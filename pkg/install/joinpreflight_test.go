@@ -258,7 +258,7 @@ func TestAgentInstallPreflightsTheJoinEndpoint(t *testing.T) {
 		// ...and it was read exactly once, which is what makes the swap harmless.
 		reads := 0
 		for _, c := range f.calls {
-			if c == "ReadFile:"+cfg.TokenFile {
+			if c == "ReadRegularFileWithMode:"+cfg.TokenFile {
 				reads++
 			}
 		}

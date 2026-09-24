@@ -776,11 +776,6 @@ type System interface {
 	// The mode is a PARAMETER, as on every other write seam here, so the policy
 	// is visible at the call site and assertable without privilege.
 	WriteRootOnlyFile(path string, contents []byte, mode fs.FileMode) error
-	// FileMode reports the permission bits of the file at path, with ReadFile's
-	// missing-file contract (an error satisfying errors.Is(err, fs.ErrNotExist)).
-	// The installer needs it for exactly one judgement: whether the operator's
-	// join token file is readable by anyone but its owner.
-	FileMode(path string) (fs.FileMode, error)
 	// Owner reports who owns the entry at path, what it permits, and what kind
 	// of entry it is — an lstat, so a symlink is described rather than followed.
 	// A missing entry has ReadFile's contract (an error satisfying
@@ -859,6 +854,15 @@ type System interface {
 	// what closes that: the file is opened O_NOFOLLOW and its type checked on the
 	// open descriptor, so there is no window between the check and the read.
 	ReadRegularFile(path string) ([]byte, error)
+	// ReadRegularFileWithMode is ReadRegularFile plus the permission bits, both
+	// read off the SAME open descriptor as the content — unlike a separate
+	// FileMode-then-ReadFile (or FileMode-then-ReadRegularFile) pair, there is
+	// no window in which the mode judged and the bytes read could belong to two
+	// different files. It exists for operatorJoinToken, the one reader in this
+	// package that has to judge a credential's mode before trusting its
+	// content, the same way ReadRegularFile already judges the mesh key's TYPE
+	// before trusting it.
+	ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error)
 	// ReadFile reads a root-readable file: the installed server plist, whose
 	// operator-supplied arguments a reinstall must carry over; the
 	// server-arguments record that carries those same arguments when no plist
