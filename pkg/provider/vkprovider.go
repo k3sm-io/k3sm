@@ -69,8 +69,13 @@ func (v *VKProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	return v.rt.DeletePod(ctx, pod)
 }
 
-// GetPod returns the named pod from the Runtime, NotFound if it is unknown.
+// GetPod returns the named pod from the Runtime, NotFound if it is unknown. A
+// Runtime with the PodGetter capability resolves same-name churn itself; any
+// other is walked through GetPods, first match.
 func (v *VKProvider) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	if g, ok := v.rt.(PodGetter); ok {
+		return g.GetPod(ctx, namespace, name)
+	}
 	pods, err := v.rt.GetPods(ctx)
 	if err != nil {
 		return nil, err

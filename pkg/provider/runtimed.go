@@ -1866,24 +1866,30 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 
 	out := make([]*corev1.Pod, 0, len(tracks))
 	for i, t := range tracks {
-		pod := pods[i].DeepCopy()
-		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
-		switch {
-		case err != nil:
-			// A transport failure says nothing about the pod; leave the status it
-			// already carries rather than replacing it with a guess.
-		case resp.GetError() != nil && resp.GetError().GetCode() != 0:
-			// The same synthesis GetPodStatus does for a pod the runtime does not
-			// know — the create window, or a parked create. Leaving the status
-			// empty here would publish a phase-less Pod on every backstop tick for
-			// a pod that is legitimately waiting.
-			pod.Status = r.buildStatus(pod, t, r.synthesizedStatus(pod, t), r.proberFor(string(pod.UID)))
-		default:
-			pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
-		}
-		out = append(out, pod)
+		out = append(out, r.podWithStatus(ctx, pods[i], t))
 	}
 	return out, nil
+}
+
+// podWithStatus returns a DeepCopy of tracked (t's pod pointer, snapshotted by
+// the caller under r.mu) carrying its reconstructed status. It runs OUTSIDE r.mu.
+func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod, t *podTrack) *corev1.Pod {
+	pod := tracked.DeepCopy()
+	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
+	switch {
+	case err != nil:
+		// A transport failure says nothing about the pod; leave the status it
+		// already carries rather than replacing it with a guess.
+	case resp.GetError() != nil && resp.GetError().GetCode() != 0:
+		// The same synthesis GetPodStatus does for a pod the runtime does not
+		// know — the create window, or a parked create. Leaving the status
+		// empty here would publish a phase-less Pod on every backstop tick for
+		// a pod that is legitimately waiting.
+		pod.Status = r.buildStatus(pod, t, r.synthesizedStatus(pod, t), r.proberFor(string(pod.UID)))
+	default:
+		pod.Status = r.buildStatus(pod, t, resp.GetStatus(), r.proberFor(string(pod.UID)))
+	}
+	return pod
 }
 
 // buildStatus reconstructs the pod's corev1 status via toPodStatus, threading the
@@ -2103,15 +2109,105 @@ func (r *runtimedRuntime) callback() func(*corev1.Pod) {
 // only the id discard it. The returned *corev1.Pod is the tracked object, which is
 // immutable once stored (CreatePod/UpdatePod replace the pointer under r.mu, never
 // mutate the object in place), so reading it after the lock is released is safe.
+//
+// Two tracks can share a (namespace, name) during same-name churn — a
+// StatefulSet replica or a delete-and-recreate whose successor is created before
+// the predecessor's DeletePod finishes. The name alone cannot say which is meant
+// and no caller has a UID to offer, so the choice is lookupTrackLocked's
+// deterministic one (see preferTrack), never map order.
 func (r *runtimedRuntime) lookup(namespace, name string) (string, metav1.Time, *corev1.Pod, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	id, t := r.lookupTrackLocked(namespace, name)
+	if t == nil {
+		return "", metav1.Time{}, nil, false
+	}
+	return id, t.startTime, t.pod, true
+}
+
+// lookupTrackLocked returns the id and track a (namespace, name) read resolves
+// to, or ("", nil) when no track carries that name. Every same-name candidate is
+// weighed through preferTrack, so the answer is independent of map iteration
+// order. The caller holds r.mu.
+func (r *runtimedRuntime) lookupTrackLocked(namespace, name string) (string, *podTrack) {
+	var (
+		bestID string
+		best   *podTrack
+	)
 	for id, t := range r.track {
-		if t.pod.Namespace == namespace && t.pod.Name == name {
-			return id, t.startTime, t.pod, true
+		if t.pod.Namespace != namespace || t.pod.Name != name {
+			continue
+		}
+		if best == nil || preferTrack(t, best) == t {
+			bestID, best = id, t
 		}
 	}
-	return "", metav1.Time{}, nil, false
+	return bestID, best
+}
+
+// preferTrack picks which of two same-name tracks a name-keyed read resolves to:
+//
+//  1. the track that is NOT being deleted (t.deleting) — the terminating one is
+//     the predecessor whose DeletePod is in flight, and a read aimed at it would
+//     exec into, attach to, or report a pod the apiserver has already replaced;
+//  2. among two with the same terminating state, the YOUNGEST by the
+//     apiserver-stamped CreationTimestamp — the successor of a churn;
+//  3. on identical timestamps, the lexicographically smaller UID, so even a full
+//     tie has one answer.
+//
+// t.deleting is the signal, not pod.DeletionTimestamp: DeletePod sets the flag
+// the instant it begins, and the tracked object is not refreshed with the
+// apiserver's deletion stamp on that path.
+//
+// LOCKING: the caller holds r.mu (t.pod is read). Each candidate's restartMu is
+// taken briefly and in turn, INSIDE r.mu — the documented r.mu → restartMu order
+// (podTrack.restartMu), never the reverse — and two restartMu are never held at
+// once, since no order is defined between tracks.
+func preferTrack(a, b *podTrack) *podTrack {
+	if ad, bd := trackDeleting(a), trackDeleting(b); ad != bd {
+		if ad {
+			return b
+		}
+		return a
+	}
+	ac, bc := a.pod.CreationTimestamp, b.pod.CreationTimestamp
+	if !ac.Equal(&bc) {
+		if ac.After(bc.Time) {
+			return a
+		}
+		return b
+	}
+	if b.pod.UID < a.pod.UID {
+		return b
+	}
+	return a
+}
+
+// trackDeleting reads t.deleting under its guard, restartMu. See preferTrack for
+// the lock order it is called under.
+func trackDeleting(t *podTrack) bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.deleting
+}
+
+// GetPod returns the pod a (namespace, name) read resolves to — the same
+// discriminated choice lookup makes — with its status reconstructed as GetPods
+// would, or NotFound. It is the PodGetter capability VKProvider.GetPod prefers
+// over walking GetPods, which could only return whichever same-name pod the
+// map yielded first.
+func (r *runtimedRuntime) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	r.mu.Lock()
+	_, t := r.lookupTrackLocked(namespace, name)
+	var pod *corev1.Pod
+	if t != nil {
+		pod = t.pod // the pointer only, under r.mu; see GetPods
+	}
+	r.mu.Unlock()
+	if t == nil {
+		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
+	}
+	return r.podWithStatus(ctx, pod, t), nil
 }
 
 // StatsSummary builds the kubelet Summary API snapshot kubectl top reads,
