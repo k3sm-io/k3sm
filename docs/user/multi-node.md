@@ -19,9 +19,9 @@ can join it. Set it with `--mesh-ip` at install time:
 
 ```sh
 sudo k3sm install --mesh-ip <this-macs-mesh-address>
+```
 
 The mesh address is IPv4 (the default mesh range is 100.64.0.0/10); a link-local or IPv6 address is refused at install time.
-```
 
 This writes the address into the server daemon's arguments and restarts it. A plain `sudo k3sm
 install` re-run already boots the daemons out and back in, so it always picks up the address you

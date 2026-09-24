@@ -17,6 +17,7 @@ k3sm ships as a single binary. Its subcommands:
 | `agent` | Join this Mac to an existing cluster as a worker node |
 | `node` | Run a Virtual Kubelet node against an existing control plane |
 | `install` / `uninstall` | Install or remove the netd and server launchd daemons (run as root) |
+| `datavol` | Manage the APFS volume the data root lives on (`datavol mount\|status\|delete`) |
 | `token` | Mint cluster join tokens |
 | `certificate` | Re-issue the control-plane leaf certificates over the existing CA |
 | `snapshot` | Back up and restore the kine SQLite datastore |
