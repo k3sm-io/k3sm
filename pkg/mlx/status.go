@@ -42,8 +42,9 @@ const (
 	// readiness probe, which is exactly the condition under which the ClusterIP
 	// Service carries traffic to them.
 	ReasonServing = "Serving"
-	// ReasonPending means no replica is running yet: the pods are unscheduled,
-	// scheduled but not started, or gone.
+	// ReasonPending means no replica is running the current pod template yet:
+	// the pods are unscheduled, scheduled but not started, gone, or still on an
+	// older pod-template revision a roll has not replaced.
 	ReasonPending = "Pending"
 	// ReasonScaledToZero means spec.replicas is 0. It is a distinct reason from
 	// ReasonPending because it is a requested state, not a wait — nothing will
@@ -107,6 +108,20 @@ type PodState struct {
 	Ready bool
 	// Probe is the serving-surface verdict for this replica, if one was taken.
 	Probe ProbeVerdict
+	// Revision is the replica's POD-TEMPLATE revision: the value of the
+	// controller-revision-hash label the upstream StatefulSet controller stamps
+	// on every pod it creates. It is not the model-weights revision (that is
+	// Observation.ResolvedRevision); see the MLXModelStatus doc in apis.
+	//
+	// Empty means the pod carries no such label, and such a pod is counted as
+	// OLD-revision. That is the safe direction on upgrade: a pod that cannot
+	// prove it runs the current template never counts toward readiness, where
+	// the reverse would let any unlabelled pod stand in for a finished roll.
+	Revision string
+	// Terminating reports that the pod has a deletionTimestamp. A terminating
+	// pod never counts as ready, even while its Ready condition is still true:
+	// it is on its way out and the Service is already draining it.
+	Terminating bool
 }
 
 // Observation is the injected state one status derivation reads: the replicas
@@ -118,6 +133,12 @@ type PodState struct {
 type Observation struct {
 	// Pods are the serving replicas observed for this MLXModel.
 	Pods []PodState
+	// CurrentRevision is the owned StatefulSet's status.updateRevision: the
+	// upstream controller's own name for the pod-template revision it is rolling
+	// replicas TO. Only a pod whose Revision equals it counts as updated. Empty
+	// means not known yet (no StatefulSet, or one its controller has not synced),
+	// and then no pod counts as updated, because none can be shown to be.
+	CurrentRevision string
 	// ResolvedRevision is the exact model revision the weights were fetched from,
 	// once the operator knows it. Empty means "not known yet", never "none": the
 	// derivation keeps any previously recorded value rather than erasing it (see
@@ -153,9 +174,15 @@ type StatusOptions struct {
 //     would destroy the only record of what is really running, which for a
 //     mutable default branch is the only thing that makes drift observable.
 //
-// Endpoint is published ONLY in the Ready phase and cleared otherwise. An
-// endpoint on a model that is not serving is an address a client will connect
-// to and hang on.
+// The replica counts are pod-template counts in the upstream StatefulSet sense
+// (see deriveReady): Replicas is every observed pod, UpdatedReplicas those on
+// Observation.CurrentRevision, ReadyReplicas those also Ready and not
+// terminating. They say nothing about the model-weights ResolvedRevision.
+//
+// Endpoint is published in the Ready phase, and stays published while a
+// pod-template roll is in progress as long as some replica is still serving
+// (see servingDuringRoll). Otherwise it is cleared: an endpoint on a model that
+// is not serving is an address a client will connect to and hang on.
 func DeriveStatus(m *mlxv1alpha1.MLXModel, obs Observation, opts StatusOptions, now time.Time) mlxv1alpha1.MLXModelStatus {
 	if m == nil {
 		return mlxv1alpha1.MLXModelStatus{}
@@ -163,7 +190,10 @@ func DeriveStatus(m *mlxv1alpha1.MLXModel, obs Observation, opts StatusOptions, 
 	status := *m.Status.DeepCopy()
 	status.ObservedGeneration = m.Generation
 
-	ready, reason, message := deriveReady(m, obs)
+	ready, counts, reason, message := deriveReady(m, obs)
+	status.Replicas = counts.replicas
+	status.UpdatedReplicas = counts.updated
+	status.ReadyReplicas = counts.ready
 	condStatus := metav1.ConditionFalse
 	if ready {
 		condStatus = metav1.ConditionTrue
@@ -183,11 +213,41 @@ func DeriveStatus(m *mlxv1alpha1.MLXModel, obs Observation, opts StatusOptions, 
 		status.ResolvedRevision = obs.ResolvedRevision
 	}
 
+	// The endpoint is ADVISORY. It names the ClusterIP Service, and that Service
+	// is revision-blind by design: it routes to every Ready, non-terminating
+	// replica whatever pod template it runs. So status.endpoint never gated
+	// traffic, and clearing it just because a roll made the strict revision-aware
+	// count dip would imply a control over routing the operator does not have.
 	status.Endpoint = ""
-	if status.Phase == mlxv1alpha1.MLXModelPhaseReady {
+	if status.Phase == mlxv1alpha1.MLXModelPhaseReady || servingDuringRoll(obs) {
 		status.Endpoint = endpoint(m, opts)
 	}
 	return status
+}
+
+// servingDuringRoll reports that a pod-template roll is in progress (some
+// observed pod is not on the current revision) AND at least one replica, of
+// any revision, is Ready and not terminating, which is exactly a replica the
+// revision-blind Service still routes to. A roll with nothing serving is not
+// covered: publishing then would hand clients an address that routes nowhere.
+func servingDuringRoll(obs Observation) bool {
+	rolling, serving := false, false
+	for _, p := range obs.Pods {
+		if !isCurrent(p, obs.CurrentRevision) {
+			rolling = true
+		}
+		if p.Ready && !p.Terminating && p.Phase != corev1.PodFailed {
+			serving = true
+		}
+	}
+	return rolling && serving
+}
+
+// isCurrent reports whether p runs the current pod-template revision. An
+// unknown current revision, or a pod without the hash label, is never current
+// (see PodState.Revision).
+func isCurrent(p PodState, current string) bool {
+	return current != "" && p.Revision == current
 }
 
 // PhaseFromConditions derives the single-word printer column from the Ready
@@ -240,11 +300,17 @@ const (
 	stageReady
 )
 
-// stageOf ranks one observed replica. Readiness decides stageReady on its own:
-// it is what puts the replica's address into the ClusterIP Service's endpoints,
-// so a probe verdict may refine a not-ready replica's stage and never promote it.
-func stageOf(p PodState) replicaStage {
+// stageOf ranks one observed replica. Readiness on the CURRENT pod-template
+// revision, while not terminating, decides stageReady on its own; a probe
+// verdict may refine a not-ready replica's stage and never promote it.
+//
+// An old-revision or terminating replica ranks as pending whatever its own
+// state: it has not begun running the current template, and the roll has yet
+// to replace it, so it is the furthest of all from what the spec asks for.
+func stageOf(p PodState, current string) replicaStage {
 	switch {
+	case p.Terminating || !isCurrent(p, current):
+		return stagePending
 	case p.Ready:
 		return stageReady
 	case p.Phase == corev1.PodRunning && (p.Probe == ProbeLoading || p.Probe == ProbeServing):
@@ -254,6 +320,14 @@ func stageOf(p PodState) replicaStage {
 	default:
 		return stagePending
 	}
+}
+
+// replicaCounts are the pod-template counts one derivation publishes, in the
+// upstream StatefulSet sense of "current": replicas is every observed pod,
+// updated is those on the current revision (ready or not), and ready is those
+// also Ready and not terminating. Only ready decides whether the model serves.
+type replicaCounts struct {
+	replicas, updated, ready int32
 }
 
 // deriveReady is the whole state machine, in precedence order. The order is the
@@ -269,52 +343,67 @@ func stageOf(p PodState) replicaStage {
 //  3. failure before progress — a terminal pod outranks a sibling that is merely
 //     starting, because waiting on the sibling hides the fault;
 //  4. otherwise the LAGGARD's stage, per replicaStage above.
-func deriveReady(m *mlxv1alpha1.MLXModel, obs Observation) (ready bool, reason, message string) {
+//
+// "Ready" here is REVISION-AWARE: a replica counts only when it is Ready, not
+// terminating, and on obs.CurrentRevision (the pod-template revision, not the
+// model-weights ResolvedRevision). Without that, a roll to a new template would
+// report Serving the moment it began, off the strength of the old pods still
+// answering.
+func deriveReady(m *mlxv1alpha1.MLXModel, obs Observation) (ready bool, counts replicaCounts, reason, message string) {
 	desired := int32(1)
 	if m.Spec.Replicas != nil {
 		desired = *m.Spec.Replicas
 	}
 
-	var readyCount int32
+	counts.replicas = int32(len(obs.Pods))
 	var failed, laggardName string
+	laggardStale := false
 	laggard := stageReady
 	for _, p := range obs.Pods {
+		current := isCurrent(p, obs.CurrentRevision)
+		if current {
+			counts.updated++
+		}
 		if p.Phase == corev1.PodFailed {
 			if failed == "" {
 				failed = p.Name
 			}
 			continue
 		}
-		s := stageOf(p)
+		s := stageOf(p, obs.CurrentRevision)
 		if s == stageReady {
-			readyCount++
+			counts.ready++
 			continue
 		}
 		if s < laggard {
 			laggard, laggardName = s, p.Name
+			laggardStale = p.Terminating || !current
 		}
 	}
+	readyCount := counts.ready
 	// A replica the StatefulSet has not created yet is observed by its absence.
 	missing := desired - int32(len(obs.Pods))
 	if missing > 0 && stagePending < laggard {
-		laggard, laggardName = stagePending, ""
+		laggard, laggardName, laggardStale = stagePending, "", false
 	}
 
 	switch {
 	case desired <= 0:
-		return false, ReasonScaledToZero, "spec.replicas is 0: no replica is serving"
+		return false, counts, ReasonScaledToZero, "spec.replicas is 0: no replica is serving"
 	case readyCount >= desired:
-		return true, ReasonServing, fmt.Sprintf("%d of %d replicas ready", readyCount, desired)
+		return true, counts, ReasonServing, fmt.Sprintf("%d of %d replicas ready", readyCount, desired)
 	case failed != "":
-		return false, ReasonPodFailed, fmt.Sprintf("replica %s failed (%d of %d replicas ready)", failed, readyCount, desired)
+		return false, counts, ReasonPodFailed, fmt.Sprintf("replica %s failed (%d of %d replicas ready)", failed, readyCount, desired)
 	case laggard == stageLoading:
-		return false, ReasonLoading, fmt.Sprintf("replica %s is loading the model (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonLoading, fmt.Sprintf("replica %s is loading the model (%d of %d replicas ready)", laggardName, readyCount, desired)
 	case laggard == stageDownloading:
-		return false, ReasonDownloading, fmt.Sprintf("replica %s has not answered its serving surface yet (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonDownloading, fmt.Sprintf("replica %s has not answered its serving surface yet (%d of %d replicas ready)", laggardName, readyCount, desired)
+	case laggardStale:
+		return false, counts, ReasonPending, fmt.Sprintf("replica %s is not on the current pod template yet (%d of %d replicas ready)", laggardName, readyCount, desired)
 	case laggardName != "":
-		return false, ReasonPending, fmt.Sprintf("replica %s is not running (%d of %d replicas ready)", laggardName, readyCount, desired)
+		return false, counts, ReasonPending, fmt.Sprintf("replica %s is not running (%d of %d replicas ready)", laggardName, readyCount, desired)
 	default:
-		return false, ReasonPending, fmt.Sprintf("%d of %d replicas ready, %d not created yet", readyCount, desired, missing)
+		return false, counts, ReasonPending, fmt.Sprintf("%d of %d replicas ready, %d not created yet", readyCount, desired, missing)
 	}
 }
 

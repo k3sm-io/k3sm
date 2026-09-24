@@ -157,9 +157,12 @@ Seatbelt-confined. The consequences:
   release. See [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
 - **Uninstall.** `sudo k3sm uninstall` boots out both daemons, removes the `lo0` aliases, and removes
   `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd, because the
-  kernel reaps a `utun` when the process holding it exits. **The `io.k3sm.*` `pf` anchor is not
-  removed**: it stays in the packet filter until an explicit `pfctl` flush or the next reboot, so
-  uninstall does *not* flush all privileged state. If that matters to you, flush the anchor by hand.
+  kernel reaps a `utun` when the process holding it exits. Uninstall also flushes the mesh's
+  MSS-clamp `io.k3sm.mesh` `pf` anchor as a best-effort backstop, since the anchor is loaded against
+  a `utun` interface number that outlives netd and macOS will eventually recycle onto an unrelated
+  tunnel: a `pfctl` failure is reported but never stops the rest of uninstall. Whether `pf` itself
+  stays enabled afterward is deliberately not described here until the wiring work decides who owns
+  that state.
 
 ## Explicitly out of scope
 

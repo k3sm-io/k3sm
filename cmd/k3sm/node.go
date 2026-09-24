@@ -692,15 +692,32 @@ func runtimePreflight(ctx context.Context, opts nodeOptions) error {
 // a loopback apiserver watching one node's pods.
 const nodeAPIRequestTimeout = 90 * time.Second
 
-// nodeRESTConfig loads the node's kubeconfig and applies nodeAPIRequestTimeout.
-// It exists as a named seam so the timeout on the config the node's clientset is
-// built from is unit-testable — startNode itself needs a live apiserver.
+// nodeRESTConfig loads the node's kubeconfig and applies nodeAPIRequestTimeout
+// and the kubelet's client-side request budget. It exists as a named seam so the
+// values on the config the node's clientset is built from are unit-testable —
+// startNode itself needs a live apiserver.
+//
+// The budget is QPS 50 / Burst 100, the upstream kubelet's kubeAPIQPS and
+// kubeAPIBurst defaults (k8s v1.36.2), which is the fidelity target: the node
+// stands in for a kubelet and should pace itself like one. BuildConfigFromFlags
+// leaves both fields at zero, which client-go turns into 5/10 — one bucket the
+// node's status writes, informers, leases, events, and volume reads all share,
+// so three pod creates drain the burst and throttle everything behind them.
+//
+// The budget is deliberately UNIFORM across the embedded-server node and a
+// standalone worker: upstream single-node control planes run a stock kubelet
+// with the stock budget, the loopback path the embedded node dials (see
+// nodeAPIRequestTimeout) makes a burst cheap locally, and kine's WAL absorbs
+// the writes, so a smaller embedded-only budget would buy nothing but a second
+// code path.
 func nodeRESTConfig(kubeconfig string) (*rest.Config, error) {
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
 	cfg.Timeout = nodeAPIRequestTimeout
+	cfg.QPS = 50
+	cfg.Burst = 100
 	return cfg, nil
 }
 

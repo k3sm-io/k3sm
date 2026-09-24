@@ -1,0 +1,63 @@
+# k3sm upstream-image mirror — STAGED entries (not yet consumed by any pin constant).
+#
+# Same entry schema as mirror.yaml (name, upstream, mirror, tag, platforms). Entries sit
+# here, and NOT in mirror.yaml, because mirror.yaml is held 1:1 against the pin constants
+# in pkg/images by TestLockstepShippedManifest: an entry there with no paired constant is
+# an ORPHAN and reds `go test ./pkg/images/...`, and the manifest is parsed strictly, so a
+# marked sub-block inside mirror.yaml would be a schema error rather than an ignored one.
+# This file is read by hack/images/mirror-images.sh (so the copy can run before any
+# product code consumes the digest) and by nothing in Go.
+#
+# PROMOTION: when product code consumes one of these (for M16: values-k3sm.yaml pins the
+# chart and the three images, and m16.0 asserts the digests), move the entry into
+# mirror.yaml in the SAME PR that adds its pkg/images constant. The chart entry carries
+# no platforms (a Helm chart is a single OCI manifest, not an index), which mirror.yaml's
+# schema does not yet admit; promoting it is a schema decision for that PR.
+#
+# Every digest below was resolved anonymously against nvcr.io on 2026-09-24 with the
+# registry v2 manifests endpoint, and cross-checked by sha256 of the returned body
+# (the chart also by `helm pull oci://...@sha256:...`). The same bump rules apply as in
+# mirror.yaml's header, including the reviewer's independent re-resolution.
+
+images:
+  # M16 R12: the upstream serving control plane's Helm chart. It is published as an OCI
+  # chart at nvcr.io/nvidia/ai-dynamo/dynamo-platform, NOT under .../charts/ (that path
+  # has no repository: the anonymous token endpoint answers 400).
+  - name: dynamo-platform
+    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-platform:1.4.2@sha256:089299c70a31d2e79c933d149a686d04df0965822c4a93d632de9d52701e62a5
+    mirror: ghcr.io/k3sm-io/mirror/dynamo-platform@sha256:089299c70a31d2e79c933d149a686d04df0965822c4a93d632de9d52701e62a5
+    tag: 1.4.2
+
+  # M16 R12: the operator. The index also carries two attestation manifests
+  # (unknown/unknown); a full-index copy keeps them, which is what preserves the digest.
+  - name: kubernetes-operator
+    upstream: nvcr.io/nvidia/ai-dynamo/kubernetes-operator:1.4.2@sha256:94e9127882ee30a937a009ae5af0a000047093d5ba5ccefdfbe942c394a020e3
+    mirror: ghcr.io/k3sm-io/mirror/kubernetes-operator@sha256:94e9127882ee30a937a009ae5af0a000047093d5ba5ccefdfbe942c394a020e3
+    tag: 1.4.2
+    platforms:
+      - platform: linux/arm64
+        digest: sha256:74e5420fe016e4bd91db3f70b8630dc24bf8777e09bb9b8d9a44db0406a14a03
+      - platform: linux/amd64
+        digest: sha256:bd6ecb64c7a20438494db08d39d2cf7de6897890c752d8283e37a1206c1730ff
+
+  # M16 R12: the frontend.
+  - name: dynamo-frontend
+    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.2@sha256:80589311c904b82927ae95703c1bc59c49eb7ac10d25925c0e457260da915bc7
+    mirror: ghcr.io/k3sm-io/mirror/dynamo-frontend@sha256:80589311c904b82927ae95703c1bc59c49eb7ac10d25925c0e457260da915bc7
+    tag: 1.4.2
+    platforms:
+      - platform: linux/arm64
+        digest: sha256:02c716366162b148d8885669f8921ae85c36c6161b58c022ac532f9a2af9e5e6
+      - platform: linux/amd64
+        digest: sha256:4d6435ad3893487e7e5a8751eb2381199464f80248284bb98c5e0998f09a91c0
+
+  # M16 R12: the planner image, the mocker vehicle.
+  - name: dynamo-planner
+    upstream: nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.4.2@sha256:6a0303be5ae6cd4e1a07d7c1d16d5d5d0d692cad28538de97e640e3893952328
+    mirror: ghcr.io/k3sm-io/mirror/dynamo-planner@sha256:6a0303be5ae6cd4e1a07d7c1d16d5d5d0d692cad28538de97e640e3893952328
+    tag: 1.4.2
+    platforms:
+      - platform: linux/arm64
+        digest: sha256:8a9d5ac9407418011a4014f1222e60f909f3f19825daf9a2d87a89cd0f5578bc
+      - platform: linux/amd64
+        digest: sha256:0892ac2c93a4abf0634a1d0828e735ca55f39c763ae31824b19c86e61ce9fa0a

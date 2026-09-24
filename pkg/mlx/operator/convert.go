@@ -53,7 +53,7 @@ func toModel(u *unstructured.Unstructured) (*mlxv1alpha1.MLXModel, error) {
 func toUnstructured(m *mlxv1alpha1.MLXModel) (*unstructured.Unstructured, error) {
 	out := m.DeepCopy()
 	out.APIVersion = mlxv1alpha1.SchemeGroupVersion.String()
-	out.Kind = "MLXModel"
+	out.Kind = mlxModelKind
 
 	raw, err := json.Marshal(out)
 	if err != nil {

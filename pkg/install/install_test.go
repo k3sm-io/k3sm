@@ -144,10 +144,10 @@ type fakeSystem struct {
 	// real chmod is the darwin implementation's, and a unit test must not need
 	// privilege to ask what mode root would have left behind.
 	plistModes map[string]fs.FileMode
-	// modes is what FileMode answers, keyed by path — the operator's join token
-	// file being the only thing the installer judges by mode. A path with no
-	// entry but present in files is 0600, so an unconfigured fake describes a
-	// credential nobody else can read.
+	// modes is what ReadRegularFileWithMode answers alongside a file's content,
+	// keyed by path — the operator's join token file being the only thing the
+	// installer judges by mode. A path with no entry defaults to 0600 there, so
+	// an unconfigured fake describes a credential nobody else can read.
 	modes map[string]fs.FileMode
 	// kinds is what a path IS, for the one seam that cares: ReadRegularFile. The
 	// zero value (no entry) is a regular file, so every pre-existing test keeps
@@ -570,27 +570,13 @@ func (f *fakeSystem) putFile(path string, content []byte) {
 	f.files[path] = content
 }
 
-// putFileMode makes FileMode report perm for path — how a test describes an
-// operator's token file that anyone can read.
+// putFileMode makes ReadRegularFileWithMode report perm for path — how a test
+// describes an operator's token file that anyone can read.
 func (f *fakeSystem) putFileMode(path string, perm fs.FileMode) {
 	if f.modes == nil {
 		f.modes = map[string]fs.FileMode{}
 	}
 	f.modes[path] = perm
-}
-
-// FileMode answers 0600 for any seeded file a test has not said otherwise
-// about, so an unconfigured fake describes a well-permissioned credential and
-// only a test that cares states the exposure.
-func (f *fakeSystem) FileMode(path string) (fs.FileMode, error) {
-	f.calls = append(f.calls, "FileMode:"+path)
-	if perm, ok := f.modes[path]; ok {
-		return perm, nil
-	}
-	if _, ok := f.files[path]; ok {
-		return 0o600, nil
-	}
-	return 0, fmt.Errorf("stat %s: %w", path, fs.ErrNotExist)
 }
 
 // fakeFileKind is what the fake filesystem says a path is. Only ReadRegularFile
@@ -627,6 +613,42 @@ func (f *fakeSystem) putKind(path string, k fakeFileKind) {
 // non-regular file — the two verdicts the real O_NOFOLLOW open reaches.
 func (f *fakeSystem) ReadRegularFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadRegularFile:"+path)
+	return f.readRegularFileContent(path)
+}
+
+// ReadRegularFileWithMode is ReadRegularFile's verdict plus FileMode's mode
+// lookup, from the same seeded state — exercising the real seam's promise that
+// both come from one look, not two. Shares readRegularFileContent with
+// ReadRegularFile rather than calling it directly, so this logs exactly one
+// call, matching one real open(2).
+func (f *fakeSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
+	f.calls = append(f.calls, "ReadRegularFileWithMode:"+path)
+	b, err := f.readRegularFileContent(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Same swap-after-read semantics ReadFile has (see putFileSwappedAfterRead):
+	// the caller of THIS read sees the current bytes; a later reader sees the
+	// swap. operatorJoinToken is this seam's one caller and the test asserting
+	// "read once, swap afterward changes nothing" needs it here now that the
+	// token read goes through this method instead of ReadFile.
+	if next, ok := f.swapAfterRead[path]; ok {
+		defer func() {
+			f.putFile(path, next)
+			delete(f.swapAfterRead, path)
+		}()
+	}
+	perm, ok := f.modes[path]
+	if !ok {
+		perm = 0o600
+	}
+	return b, perm, nil
+}
+
+// readRegularFileContent is ReadRegularFile's verdict with no call-log entry
+// of its own, so ReadRegularFile and ReadRegularFileWithMode can each log
+// exactly once despite sharing this lookup.
+func (f *fakeSystem) readRegularFileContent(path string) ([]byte, error) {
 	switch f.kinds[path] {
 	case fakeSymlink:
 		return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)

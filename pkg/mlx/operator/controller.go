@@ -24,12 +24,14 @@ import (
 	"net/http"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
@@ -81,6 +83,11 @@ const probeTimeout = 2 * time.Second
 // path the API server does not serve.
 var mlxModelResource = mlxv1alpha1.SchemeGroupVersion.WithResource("mlxmodels")
 
+// mlxModelKind is the MLXModel kind: the TypeMeta the dynamic client needs on
+// every write, and the owner kind a StatefulSet's controller ownerReference must
+// name before its events are mapped back to a model.
+const mlxModelKind = "MLXModel"
+
 // Config is everything the controller needs from its caller.
 type Config struct {
 	// Client is the typed clientset used to apply the serving objects, read the
@@ -117,7 +124,7 @@ type Config struct {
 
 // Controller reconciles MLXModels into the objects that serve them.
 //
-// Concurrency: two informers feed ONE workqueue drained by a SINGLE worker, so
+// Concurrency: three informers feed ONE workqueue drained by a SINGLE worker, so
 // every reconcile is serialized by model key and no field below needs a lock. No
 // Context is stored — the one Run receives is threaded down.
 type Controller struct {
@@ -206,10 +213,12 @@ func (c *Controller) Run(ctx context.Context) error {
 
 	// The pod informer is what makes readiness visible promptly. Without it the
 	// status would only catch up on the resync, so a model that became ready
-	// would report Downloading for up to a full resync period.
-	podFactory := informers.NewSharedInformerFactoryWithOptions(c.client, resyncPeriod,
-		informers.WithTweakListOptions(func(o *metav1.ListOptions) { o.LabelSelector = managedPodSelector() }))
-	podInformer := podFactory.Core().V1().Pods().Informer()
+	// would report Downloading for up to a full resync period. Pods and the
+	// StatefulSets share ONE factory and ONE selector: both carry the render's
+	// labels, and a second selector would be a second place for them to drift.
+	kubeFactory := informers.NewSharedInformerFactoryWithOptions(c.client, resyncPeriod,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) { o.LabelSelector = managedSelector() }))
+	podInformer := kubeFactory.Core().V1().Pods().Informer()
 	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { c.enqueueOwningModel(obj) },
 		UpdateFunc: func(_, obj any) { c.enqueueOwningModel(obj) },
@@ -218,9 +227,22 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("mlx operator: add pod handler: %w", err)
 	}
 
+	// The StatefulSet informer closes the revision gap the pod informer cannot
+	// see: a roll moves the owned StatefulSet's status.updateRevision BEFORE any
+	// pod changes, and until a pod does, a Ready old-revision replica keeps the
+	// model reading Serving. Only updates are handled: the reconcile that applied
+	// the StatefulSet is the one that saw it created, and garbage collection owns
+	// its deletion.
+	stsInformer := kubeFactory.Apps().V1().StatefulSets().Informer()
+	if _, err := stsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: c.enqueueStatefulSetOwner,
+	}); err != nil {
+		return fmt.Errorf("mlx operator: add statefulset handler: %w", err)
+	}
+
 	modelFactory.Start(ctx.Done())
-	podFactory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), modelInformer.HasSynced, podInformer.HasSynced) {
+	kubeFactory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), modelInformer.HasSynced, podInformer.HasSynced, stsInformer.HasSynced) {
 		if ctx.Err() != nil {
 			return nil // ctx cancelled mid-sync — a clean shutdown, not a failure
 		}
@@ -240,11 +262,11 @@ func (c *Controller) Run(ctx context.Context) error {
 	return nil
 }
 
-// managedPodSelector is the label selector narrowing the pod informer to pods
-// this operator's own render produced. Watching every pod in the cluster to find
-// the handful serving models would make a Mac-sized control plane cache the whole
-// pod population for nothing.
-func managedPodSelector() string {
+// managedSelector is the label selector narrowing the pod and StatefulSet
+// informers to objects this operator's own render produced. Watching every pod
+// in the cluster to find the handful serving models would make a Mac-sized
+// control plane cache the whole pod population for nothing.
+func managedSelector() string {
 	sel := labels.Set{"app.kubernetes.io/name": "mlx-model", "app.kubernetes.io/managed-by": "k3sm"}
 	return labels.SelectorFromSet(sel).String()
 }
@@ -267,6 +289,12 @@ func (c *Controller) enqueue(obj any) {
 // model — walking to the model would need a second lookup on every pod event.
 // A DeletedFinalStateUnknown tombstone is unwrapped: dropping it would lose the
 // last event about a replica going away.
+//
+// Trust surface: labels are caller-writable, so anyone who can create a pod in
+// the namespace can make this enqueue any key there. That is harmless by
+// construction: the key only schedules a reconcile, which re-reads the model
+// from the API server and no-ops when it does not exist, and nothing is ever
+// written from the pod's contents.
 func (c *Controller) enqueueOwningModel(obj any) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
@@ -280,6 +308,48 @@ func (c *Controller) enqueueOwningModel(obj any) {
 		return
 	}
 	c.queue.Add(pod.Namespace + "/" + instance)
+}
+
+// enqueueStatefulSetOwner maps an update to an owned StatefulSet back to the
+// MLXModel that controls it and enqueues THAT, but only when the update moved
+// status.updateRevision or metadata.generation. Every other StatefulSet update
+// (a replica count ticking, a periodic resync re-delivering an unchanged object)
+// carries nothing the revision-aware status reads, and would only churn the
+// queue.
+//
+// The model is found through the StatefulSet's CONTROLLER ownerReference, never
+// by its name: the render names the StatefulSet after the model, but that is a
+// private convention of the render that could drift without any compile error,
+// and a StatefulSet someone else created under a model's name must not be
+// mistaken for one this operator owns.
+//
+// Trust surface: unlike a label, an ownerReference the garbage collector honors
+// needs the owner's real UID, so a forged reference cannot adopt a model it did
+// not come from. And even a bogus key is harmless: it only schedules a
+// reconcile, which re-reads the model and no-ops when it does not exist.
+func (c *Controller) enqueueStatefulSetOwner(oldObj, newObj any) {
+	oldSts, ok := oldObj.(*appsv1.StatefulSet)
+	if !ok {
+		return
+	}
+	sts, ok := newObj.(*appsv1.StatefulSet)
+	if !ok {
+		return
+	}
+	if oldSts.Status.UpdateRevision == sts.Status.UpdateRevision && oldSts.Generation == sts.Generation {
+		return
+	}
+	owner := metav1.GetControllerOfNoCopy(sts)
+	if owner == nil || owner.Kind != mlxModelKind {
+		return
+	}
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	if err != nil || gv.Group != mlxv1alpha1.SchemeGroupVersion.Group {
+		return
+	}
+	// An ownerReference is namespace-local: the owner lives in the
+	// StatefulSet's own namespace.
+	c.queue.Add(sts.Namespace + "/" + owner.Name)
 }
 
 // processNext dequeues one model key and reconciles it, re-queueing with
@@ -384,6 +454,14 @@ func (c *Controller) gpuFacts(ctx context.Context) *runtimev1.GPUFacts {
 // refine WHY a replica is not ready (still fetching weights versus loading them)
 // and must never promote one. Probing ready replicas would spend a round trip per
 // reconcile to learn nothing.
+//
+// The pod-template revision signal is the upstream StatefulSet controller's own,
+// never one this operator mints: the owned StatefulSet's status.updateRevision
+// is the current revision, and each pod's controller-revision-hash label is the
+// revision it was created from. (This is the POD-TEMPLATE revision; the
+// model-weights revision is Observation.ResolvedRevision, a separate thing.) A
+// StatefulSet that does not exist yet leaves the current revision empty, which
+// the derivation reads as "no pod is confirmed current".
 func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.Observation, error) {
 	pods, err := c.client.CoreV1().Pods(m.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(mlx.Labels(m.Name)).String(),
@@ -392,13 +470,22 @@ func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.
 		return mlx.Observation{}, fmt.Errorf("list pods for mlxmodel %s/%s: %w", m.Namespace, m.Name, err)
 	}
 
-	obs := mlx.Observation{Pods: make([]mlx.PodState, 0, len(pods.Items))}
+	current, err := c.currentRevision(ctx, m)
+	if err != nil {
+		return mlx.Observation{}, err
+	}
+
+	obs := mlx.Observation{Pods: make([]mlx.PodState, 0, len(pods.Items)), CurrentRevision: current}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		state := mlx.PodState{
 			Name:  pod.Name,
 			Phase: pod.Status.Phase,
 			Ready: podReady(pod),
+			// A pod created before the label existed reads as "" and so counts as
+			// old-revision: the safe direction (see mlx.PodState.Revision).
+			Revision:    pod.Labels[appsv1.ControllerRevisionHashLabelKey],
+			Terminating: pod.DeletionTimestamp != nil,
 		}
 		if !state.Ready && state.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			state.Probe = c.probe(ctx, m, pod.Status.PodIP)
@@ -406,6 +493,20 @@ func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.
 		obs.Pods = append(obs.Pods, state)
 	}
 	return obs, nil
+}
+
+// currentRevision reads the owned StatefulSet's status.updateRevision, the
+// pod-template revision its controller is rolling replicas to. A missing
+// StatefulSet is not an error: it yields "", so no replica counts as current.
+func (c *Controller) currentRevision(ctx context.Context, m *mlxv1alpha1.MLXModel) (string, error) {
+	sts, err := c.client.AppsV1().StatefulSets(m.Namespace).Get(ctx, mlx.StatefulSetName(m.Name), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get statefulset for mlxmodel %s/%s: %w", m.Namespace, m.Name, err)
+	}
+	return sts.Status.UpdateRevision, nil
 }
 
 // probe takes one replica's serving-surface verdict. A probe failure is a

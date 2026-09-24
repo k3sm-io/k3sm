@@ -199,6 +199,9 @@ it must rejoin.
 - A cluster upgrade is a **node-by-node** rolling restart of the launchd daemons; see
   [Upgrade](upgrade.md).
 - For a highly-available control plane, see [HA](ha.md) (also EXPERIMENTAL).
+- A node that drops offline while running Pods leaves them stuck terminating; see
+  [Troubleshooting](troubleshooting.md#a-node-went-offline-and-pods-are-stuck-terminating) for the
+  out-of-service taint that unsticks them.
 
 ## Next
 
