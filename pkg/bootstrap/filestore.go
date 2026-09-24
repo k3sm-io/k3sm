@@ -67,6 +67,7 @@ func NewFileTokenStore(path string, now func() time.Time) *FileTokenStore {
 	if now == nil {
 		now = time.Now
 	}
+	dummyTokenHash()
 	return &FileTokenStore{path: path, now: now}
 }
 
@@ -105,7 +106,7 @@ func (s *FileTokenStore) Create(ttl time.Duration) (user, secret string, expiry 
 }
 
 // VerifyToken parses tok and verifies its credential against an unexpired persisted
-// record (constant-time bcrypt compare).
+// record (constant-time bcrypt compare, performed once on every outcome).
 //
 // ctx is checked EAGERLY and fails closed (see TokenStore.VerifyToken): the small
 // file read and the bcrypt compare stay synchronous, so ctx bounds when
@@ -124,19 +125,31 @@ func (s *FileTokenStore) VerifyToken(ctx context.Context, tok string) error {
 	if err != nil {
 		return err
 	}
-	for _, r := range recs {
-		if r.User != t.User {
-			continue
+	// Exactly one bcrypt compare on every outcome, before the outcome is
+	// decided (the TokenVerifier contract; see TokenStore.Verify). The first
+	// record for the id wins, as before.
+	var rec *fileToken
+	for i := range recs {
+		if recs[i].User == t.User {
+			rec = &recs[i]
+			break
 		}
-		if !s.now().Before(r.Expiry) {
-			return ErrTokenExpired
-		}
-		if err := bcrypt.CompareHashAndPassword([]byte(r.SecretHash), []byte(t.Secret)); err != nil {
-			return ErrTokenMismatch
-		}
-		return nil
 	}
-	return ErrTokenUnknown
+	hash := dummyTokenHash()
+	if rec != nil {
+		hash = []byte(rec.SecretHash)
+	}
+	cmpErr := compareHash(hash, []byte(t.Secret))
+	if rec == nil {
+		return ErrTokenUnknown
+	}
+	if !s.now().Before(rec.Expiry) {
+		return ErrTokenExpired
+	}
+	if cmpErr != nil {
+		return ErrTokenMismatch
+	}
+	return nil
 }
 
 // load reads the persisted records, treating a missing file as empty.

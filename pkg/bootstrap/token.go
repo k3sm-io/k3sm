@@ -108,6 +108,36 @@ func ParseToken(s string) (Token, error) {
 	return t, nil
 }
 
+// compareHash is the one bcrypt compare every token verification performs. It
+// is a package var only so the cost-equalization gate can COUNT the compares
+// each outcome performs, which asserts the property without a timing test.
+var compareHash = bcrypt.CompareHashAndPassword
+
+// dummyTokenHash returns a bcrypt hash, at the cost real token secrets are
+// hashed at, of a fixed literal that is never a minted secret. Both token
+// stores compare an unknown id's secret against it, so an unknown id costs the
+// same bcrypt work as a known one and response timing never confirms that an
+// id exists.
+//
+// The trade, taken deliberately: every unauthenticated request carrying a
+// well-formed token now costs one bcrypt compare, garbage ids included, where
+// before an unknown id was refused for the price of a map lookup. Bounding that
+// cost per source, ahead of verification, is a separate decision that this
+// equalization does not make (see joinRateLimiter, which bounds only
+// post-authentication work).
+//
+// Minted once, lazily, so importing the package costs nothing; the stores warm
+// it at construction so the first request does not pay the mint. A mint error
+// (a crypto/rand failure) yields a nil hash, whose compare fails fast: the
+// request is still denied, only the equalization is lost.
+var dummyTokenHash = sync.OnceValue(func() []byte {
+	h, err := bcrypt.GenerateFromPassword([]byte("k3sm-bootstrap-dummy-token-secret"), bcrypt.DefaultCost)
+	if err != nil {
+		return nil
+	}
+	return h
+})
+
 // tokenRecord is one minted bootstrap token: the bcrypt hash of its secret (never
 // the cleartext) and its expiry.
 type tokenRecord struct {
@@ -134,6 +164,7 @@ func NewTokenStore(now func() time.Time) *TokenStore {
 	if now == nil {
 		now = time.Now
 	}
+	dummyTokenHash()
 	return &TokenStore{now: now, byUser: map[string]tokenRecord{}}
 }
 
@@ -167,17 +198,27 @@ func (s *TokenStore) Create(ttl time.Duration) (user, secret string, expiry time
 // Verify checks (user, secret) against a minted, unexpired token. The secret
 // comparison is constant-time (bcrypt). It returns ErrTokenUnknown, ErrTokenExpired,
 // or ErrTokenMismatch on failure, nil on success.
+//
+// Every outcome performs exactly one bcrypt compare BEFORE the outcome is
+// decided: an unknown id is compared against dummyTokenHash, an expired one
+// against its real hash, so the cost of a refusal never says whether the id
+// exists (the TokenVerifier contract).
 func (s *TokenStore) Verify(user, secret string) error {
 	s.mu.Lock()
 	rec, ok := s.byUser[user]
 	s.mu.Unlock()
+	hash := rec.secretHash
+	if !ok {
+		hash = dummyTokenHash()
+	}
+	cmpErr := compareHash(hash, []byte(secret))
 	if !ok {
 		return ErrTokenUnknown
 	}
 	if !s.now().Before(rec.expiry) {
 		return ErrTokenExpired
 	}
-	if err := bcrypt.CompareHashAndPassword(rec.secretHash, []byte(secret)); err != nil {
+	if cmpErr != nil {
 		return ErrTokenMismatch
 	}
 	return nil
