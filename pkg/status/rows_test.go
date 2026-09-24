@@ -884,6 +884,20 @@ func TestWorkloadsRowFlagsPodsOnDeletedNodes(t *testing.T) {
 			wantDetail: "0 running · 1 terminating",
 		},
 		{
+			// Spec.NodeName is only set by binding to a Node that existed, so an
+			// empty healthy list plus an old bound terminating pod IS the
+			// all-nodes-deleted case, never bootstrap; pinned so nobody "fixes"
+			// it into suppression later.
+			name:       "an empty healthy node list still flags an old terminating pod",
+			nodes:      nil,
+			pods:       []corev1.Pod{terminating("web", "b", "k3sm-gone", time.Hour)},
+			wantSev:    SeverityWarn,
+			wantDetail: "0 running · 1 terminating (1 stuck on deleted node k3sm-gone)",
+			wantRemedy: "kubectl delete pod -n web b --grace-period=0 --force\n" +
+				"# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac",
+			wantWide: map[string]string{"deletedNode": "k3sm-gone", "deletedNodePods": "1"},
+		},
+		{
 			name:       "a pod on a NotReady node still gets the taint, not the force delete",
 			nodes:      []corev1.Node{notReadyFor("k3sm-mac", 10*time.Minute)},
 			pods:       []corev1.Pod{terminating("web", "b", "k3sm-mac", time.Hour)},

@@ -722,17 +722,16 @@ const stuckTerminatingCaveat = "# only after confirming the Mac is truly off, no
 // from the node list must have been terminating before it is reported as stuck
 // on a deleted node.
 //
-// It is not zero because one node list read is not proof the node is gone: the
-// apiserver's list-consistency posture (ConsistentListFromCache) is not yet
-// soaked, so a single stale read could omit a node that exists. The debounce
-// makes one bad read insufficient; the same absence has to hold across a
-// window a stale read does not span.
-//
-// The clock is the pod's deletion timestamp, not the moment the node was first
-// seen absent: status is a one-shot command with no memory between runs, so
-// the deletion age is the only durable clock it has. That costs nothing in
-// practice, because a real deleted-node stall is minutes old by the time a
-// human runs status to find it.
+// It is not zero because the apiserver's list-consistency posture
+// (ConsistentListFromCache) is not yet soaked, so a single stale read could
+// omit a node that exists. A one-shot command cannot re-observe, so this is a
+// grace proxy rather than a repeated-confirmation window: the clock is the
+// pod's own deletion timestamp, the only durable clock a memoryless command
+// has, and a genuinely deleted node's stall is minutes old by the time a
+// human runs status. Deliberately far shorter than stuckTerminatingDebounce:
+// a missing Node object is a rarer, more deliberate event than a NotReady
+// blip from sleep or reboot, so it merits less patience. Revisit alongside
+// the list-consistency soak's close.
 const deletedNodeDebounce = 15 * time.Second
 
 // workloadsRow counts pods by phase across every namespace, plus the vm hosts
