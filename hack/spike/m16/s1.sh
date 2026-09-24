@@ -133,7 +133,12 @@ else
 fi
 
 # ---- s1.4 the infrastructure-free smoke ------------------------------------------
-spike_pip "$V" ai-dynamo
+# The frontend and mocker ship in the top-level package, installed FROM THE CLONE
+# alongside the wheel s1.2 built. Resolving it by name from the package index pulls
+# the index's runtime, which has no darwin wheel, so the smoke would test a sdist
+# build instead of the artifact this rung just recorded. Naming the local wheel in
+# the same install pins the runtime requirement to it.
+spike_pip "$V" "$WHEEL" "$W/src"
 if "$V" -m dynamo.frontend --help >"$W/frontend-help.txt" 2>&1; then
   verdict PASS "s1.4 frontend  python3 -m dynamo.frontend --help answers from the darwin build"
 else
@@ -141,12 +146,15 @@ else
   tail -20 "$W/frontend-help.txt"; exit 0
 fi
 
+# The file discovery backend takes its root from DYN_FILE_KV (there is no path
+# flag), and the mocker names the served model with --model-name.
 mkdir -p "$W/discovery"
-nohup "$V" -m dynamo.frontend --discovery-backend file --discovery-path "$W/discovery" \
+export DYN_FILE_KV="$W/discovery"
+nohup "$V" -m dynamo.frontend --discovery-backend file \
   --http-port 8111 > "$W/frontend.log" 2>&1 &
 FE=$!
-nohup "$V" -m dynamo.mocker --discovery-backend file --discovery-path "$W/discovery" \
-  --model mock-model > "$W/mocker.log" 2>&1 &
+nohup "$V" -m dynamo.mocker --discovery-backend file \
+  --model-name mock-model > "$W/mocker.log" 2>&1 &
 MK=$!
 READY=no
 for i in $(seq 1 60); do
