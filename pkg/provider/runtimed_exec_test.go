@@ -52,10 +52,11 @@ type fakeStreamRuntime struct {
 	exitCode int32             // exit code Exec/Attach report
 	execErr  *rpcstatus.Status // optional structured exec failure
 
-	mu      sync.Mutex
-	execCmd []string // command the last Exec received
-	stdin   []byte   // stdin bytes Exec/Attach collected
-	pfData  []byte   // bytes PortForward proxied pod-ward
+	mu        sync.Mutex
+	execCmd   []string // command the last Exec received
+	execPodID string   // pod id the last Exec addressed
+	stdin     []byte   // stdin bytes Exec/Attach collected
+	pfData    []byte   // bytes PortForward proxied pod-ward
 }
 
 func (f *fakeStreamRuntime) CreatePod(_ context.Context, req *runtimev1.CreatePodRequest) (*runtimev1.CreatePodResponse, error) {
@@ -75,6 +76,7 @@ func (f *fakeStreamRuntime) Exec(s grpc.BidiStreamingServer[runtimev1.ExecReques
 	}
 	f.mu.Lock()
 	f.execCmd = first.GetCommand()
+	f.execPodID = first.GetPodId()
 	f.mu.Unlock()
 	if err := s.Send(&runtimev1.ExecResponse{Stdout: []byte("ran:" + strings.Join(first.GetCommand(), " "))}); err != nil {
 		return err
