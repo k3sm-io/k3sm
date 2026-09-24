@@ -449,7 +449,9 @@ Work through this in order.
   ```
 
   A force-deleted Pod may still be running on the partitioned Mac. The cluster starts a
-  replacement, and two copies can run at once until the Mac returns and is cleaned up.
+  replacement, and two copies can run at once until the Mac returns and is cleaned up. For a Pod
+  with attached storage the stakes are higher: check the volume's node binding first, because two
+  writers on one volume corrupt data where two stateless copies merely waste cycles.
 - **Prevent one offline node from freezing a rollout.** A DaemonSet's default `RollingUpdate`
   strategy waits for every existing Pod to be replaced in place, so a node that never reports back
   holds up the whole rollout. Set `maxSurge: 1` and `maxUnavailable: 0` on the DaemonSet's
