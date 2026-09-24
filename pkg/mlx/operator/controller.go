@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -384,6 +385,14 @@ func (c *Controller) gpuFacts(ctx context.Context) *runtimev1.GPUFacts {
 // refine WHY a replica is not ready (still fetching weights versus loading them)
 // and must never promote one. Probing ready replicas would spend a round trip per
 // reconcile to learn nothing.
+//
+// The pod-template revision signal is the upstream StatefulSet controller's own,
+// never one this operator mints: the owned StatefulSet's status.updateRevision
+// is the current revision, and each pod's controller-revision-hash label is the
+// revision it was created from. (This is the POD-TEMPLATE revision; the
+// model-weights revision is Observation.ResolvedRevision, a separate thing.) A
+// StatefulSet that does not exist yet leaves the current revision empty, which
+// the derivation reads as "no pod is confirmed current".
 func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.Observation, error) {
 	pods, err := c.client.CoreV1().Pods(m.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(mlx.Labels(m.Name)).String(),
@@ -392,13 +401,22 @@ func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.
 		return mlx.Observation{}, fmt.Errorf("list pods for mlxmodel %s/%s: %w", m.Namespace, m.Name, err)
 	}
 
-	obs := mlx.Observation{Pods: make([]mlx.PodState, 0, len(pods.Items))}
+	current, err := c.currentRevision(ctx, m)
+	if err != nil {
+		return mlx.Observation{}, err
+	}
+
+	obs := mlx.Observation{Pods: make([]mlx.PodState, 0, len(pods.Items)), CurrentRevision: current}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		state := mlx.PodState{
 			Name:  pod.Name,
 			Phase: pod.Status.Phase,
 			Ready: podReady(pod),
+			// A pod created before the label existed reads as "" and so counts as
+			// old-revision: the safe direction (see mlx.PodState.Revision).
+			Revision:    pod.Labels[appsv1.ControllerRevisionHashLabelKey],
+			Terminating: pod.DeletionTimestamp != nil,
 		}
 		if !state.Ready && state.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			state.Probe = c.probe(ctx, m, pod.Status.PodIP)
@@ -406,6 +424,20 @@ func (c *Controller) observe(ctx context.Context, m *mlxv1alpha1.MLXModel) (mlx.
 		obs.Pods = append(obs.Pods, state)
 	}
 	return obs, nil
+}
+
+// currentRevision reads the owned StatefulSet's status.updateRevision, the
+// pod-template revision its controller is rolling replicas to. A missing
+// StatefulSet is not an error: it yields "", so no replica counts as current.
+func (c *Controller) currentRevision(ctx context.Context, m *mlxv1alpha1.MLXModel) (string, error) {
+	sts, err := c.client.AppsV1().StatefulSets(m.Namespace).Get(ctx, mlx.StatefulSetName(m.Name), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get statefulset for mlxmodel %s/%s: %w", m.Namespace, m.Name, err)
+	}
+	return sts.Status.UpdateRevision, nil
 }
 
 // probe takes one replica's serving-surface verdict. A probe failure is a
