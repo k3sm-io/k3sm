@@ -30,6 +30,17 @@ limitations under the License.
 //
 // Every value here was read from the chart at ChartVersion, installed on a k3sm
 // node in the M16.0 S2 spike (hack/spike/m16/findings-s2.md is the write-back).
+// ChartVersion 1.5.0 is the chart built from upstream tag v1.5.0, commit
+// b83b1d9304ebfc624709ac46db32b1b6f1ff1615; the records were taken on
+// 2026-09-21 to 2026-09-23. A re-pin re-records every file below from a tagged
+// upstream release and updates this commit alongside ChartVersion.
+//
+// The pinned set is six custom resources, and the tests assert that count:
+// DynamoComponentDeployment, DynamoGraphDeploymentRequest,
+// DynamoGraphDeployment, DynamoGraphDeploymentScalingAdapter, DynamoModel and
+// DynamoWorkerMetadata. That is the whole of the operator's
+// config/crd/bases at the commit above.
+//
 // Two records in testdata/ carry the version in their file name, so bumping
 // ChartVersion without re-recording them fails the tests that read them:
 //
@@ -51,7 +62,7 @@ limitations under the License.
 //
 // No client, no reads, no status derivation. The status row that reports the
 // fleet and the gate rung that asserts the grant live are consumers; this
-// package is the vocabulary they share. The chart's digest-pinned reference and
-// the upstream commit it was built from are recorded in the spike findings and
-// the example values, not here: nothing in product code pulls the chart.
+// package is the vocabulary they share. The chart's digest-pinned reference is
+// recorded in the spike findings and the example values, not here: nothing in
+// product code pulls the chart.
 package mlxfleet

@@ -41,13 +41,31 @@ func recorded(t *testing.T, stem, ext string) []byte {
 	return b
 }
 
+// recordLines returns a text record's lines with its '#' provenance header
+// dropped, so the header names the upstream commit without joining the record.
+func recordLines(t *testing.T, stem string) []string {
+	t.Helper()
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(string(recorded(t, stem, ".txt"))), "\n") {
+		if !strings.HasPrefix(line, "#") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// pinnedCRDCount is the number of custom resources the operator ships at
+// ChartVersion. It is stated here as well as implied by the record so that a
+// plan or a doc citing a different count is contradicted by a test, not a read.
+const pinnedCRDCount = 6
+
 // TestFleetGVKsMatchPin pins Resources to the CRD set recorded from the chart at
 // ChartVersion: a re-pin that moves a group, a version or a kind, or that adds or
 // drops a CRD, goes red here instead of a status row silently reading nothing.
 func TestFleetGVKsMatchPin(t *testing.T) {
 	t.Parallel()
 
-	want := strings.Split(strings.TrimSpace(string(recorded(t, "crds", ".txt"))), "\n")
+	want := recordLines(t, "crds")
 	var got []string
 	for _, r := range Resources() {
 		got = append(got, r.Record())
@@ -55,6 +73,9 @@ func TestFleetGVKsMatchPin(t *testing.T) {
 	// Positive control: an empty record would make an empty package pass.
 	if len(want) == 0 || want[0] == "" {
 		t.Fatal("the CRD record is empty — it measures nothing")
+	}
+	if len(want) != pinnedCRDCount || len(got) != pinnedCRDCount {
+		t.Errorf("the pinned set is %d CRDs; the record holds %d and Resources() returns %d", pinnedCRDCount, len(want), len(got))
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("Resources() does not match the CRD set recorded at chart %s\n got: %s\nwant: %s",
@@ -102,7 +123,7 @@ func TestFleetOperatorRBACPinned(t *testing.T) {
 
 	t.Run("grant_matches_the_reviewed_list", func(t *testing.T) {
 		t.Parallel()
-		want := strings.Split(strings.TrimSpace(string(recorded(t, "operator-grant", ".txt"))), "\n")
+		want := recordLines(t, "operator-grant")
 		got := flatten(role)
 		if !slices.Equal(got, want) {
 			t.Errorf("the ClusterRole flattens to %d grants, the reviewed list has %d; diff the two files under testdata/", len(got), len(want))
