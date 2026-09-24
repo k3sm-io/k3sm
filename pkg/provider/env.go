@@ -51,17 +51,54 @@ func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, facts podFacts
 	return nil
 }
 
-// resolveContainerEnv builds c's final literal env: envFrom-sourced vars first (in
-// source order), then explicit env vars (which OVERRIDE envFrom on a name
-// collision — the kubelet precedence). It clears value_from/env_from afterwards so
+// resolveContainerEnv builds c's final literal env: the service environment
+// first, then envFrom-sourced vars (in source order), then explicit env vars —
+// each layer OVERRIDING the one before on a name collision, the kubelet
+// precedence. It clears value_from/env_from afterwards so
 // the box carries only literal values.
-// podFacts is what the downward API can name about a pod that the PodBox does
-// not carry: the node it runs on, that node's address, and the service account
-// it runs as. The provider knows all three at translation time.
+// podFacts is what the pod's environment can name that the PodBox does not
+// carry: the node it runs on, that node's address, the service account it runs
+// as (the downward API), and the kubernetes Service VIP (the service
+// environment). The provider knows all four at translation time.
 type podFacts struct {
 	nodeName       string
 	nodeIP         string
 	serviceAccount string
+	apiServerVIP   string
+}
+
+// apiServerServicePort is the port the kubernetes Service in the default
+// namespace serves the API on. The apiserver's own reconciler publishes that
+// Service with port 443 whatever its secure port is (k3sm's is 6444, behind the
+// Service proxy), and the kubelet renders the variables below from the Service,
+// not from the endpoint.
+const apiServerServicePort = "443"
+
+// apiServerEnv is the service environment the kubelet gives EVERY container for
+// the kubernetes Service, whatever enableServiceLinks says: the master service
+// is always injected. It is what client-go's InClusterConfig reads
+// (KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT), so a container without
+// it cannot use in-cluster config at all, however reachable the VIP is. The
+// docker-links spelling rides along because the kubelet emits it and a workload
+// may read it.
+//
+// An empty VIP yields nothing: a node that publishes no API Service (a rootless
+// dev tier) must not invent one.
+func apiServerEnv(vip string) []*runtimev1.EnvVar {
+	if vip == "" {
+		return nil
+	}
+	link := "tcp://" + vip + ":" + apiServerServicePort
+	return []*runtimev1.EnvVar{
+		{Name: "KUBERNETES_SERVICE_HOST", Value: vip},
+		{Name: "KUBERNETES_SERVICE_PORT", Value: apiServerServicePort},
+		{Name: "KUBERNETES_SERVICE_PORT_HTTPS", Value: apiServerServicePort},
+		{Name: "KUBERNETES_PORT", Value: link},
+		{Name: "KUBERNETES_PORT_443_TCP", Value: link},
+		{Name: "KUBERNETES_PORT_443_TCP_PROTO", Value: "tcp"},
+		{Name: "KUBERNETES_PORT_443_TCP_PORT", Value: apiServerServicePort},
+		{Name: "KUBERNETES_PORT_443_TCP_ADDR", Value: vip},
+	}
 }
 
 func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string, facts podFacts, box *runtimev1.PodBox, r mount.Resolver) error {
@@ -77,6 +114,9 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string,
 		ordered = append(ordered, &runtimev1.EnvVar{Name: name, Value: value})
 	}
 
+	for _, e := range apiServerEnv(facts.apiServerVIP) {
+		upsert(e.GetName(), e.GetValue())
+	}
 	for _, ef := range c.GetEnvFrom() {
 		if err := expandEnvFrom(ctx, ef, ns, r, upsert); err != nil {
 			return err

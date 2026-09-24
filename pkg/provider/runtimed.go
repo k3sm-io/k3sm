@@ -79,6 +79,9 @@ type runtimedRuntime struct {
 	// .ClusterDomain.
 	resolverVIP   string
 	clusterDomain string
+	// apiServerVIP is the kubernetes Service ClusterIP every container is told
+	// about through the kubelet's service environment (apiServerEnv).
+	apiServerVIP string
 	// podLogsDir is the root of the CRI container-log tree
 	// (<dir>/<ns>_<pod>_<uid>/<container>/<n>.log) — the kubelet's --pod-logs-dir,
 	// defaulted to /var/log/pods. The provider CREATES the directories, READS the
@@ -623,6 +626,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		dyldShim:      cfg.DyldShim,
 		resolverVIP:   cfg.ResolverVIP,
 		clusterDomain: cfg.ClusterDomain,
+		apiServerVIP:  cfg.APIServerVIP,
 		// Derived HERE, in the one constructor production and the fake-injected
 		// tests share, so no caller can construct a provider whose pods are missing
 		// the base deny-set.
@@ -1372,7 +1376,7 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// fact (this node's `xcode-select -p`), which the pure pod translation does not
 	// and should not carry — the same split as the socket denies above.
 	applyXcodeToolchain(box.SandboxProfile, pod, r.developerDir)
-	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: pod.Spec.ServiceAccountName}
+	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: pod.Spec.ServiceAccountName, apiServerVIP: r.apiServerVIP}
 	if err := resolvePodBoxEnv(ctx, box, facts, r.resolver); err != nil {
 		return nil, err
 	}

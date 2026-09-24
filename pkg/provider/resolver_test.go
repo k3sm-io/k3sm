@@ -182,6 +182,85 @@ func TestResolvePodBoxEnv(t *testing.T) {
 
 // TestResolvePodBoxEnvOptional confirms an optional missing source is skipped and a
 // required missing one fails closed.
+// TestResolvePodBoxEnvInjectsTheAPIServerService pins the kubelet's service
+// environment for the kubernetes Service: every container, init containers
+// included, gets the variables client-go's InClusterConfig reads, an explicit
+// env var of the same name still wins, and a node with no API VIP injects
+// nothing rather than a fabricated address.
+//
+// Non-vacuity: without the injection an operator image's init container that
+// calls controller-runtime's GetConfig dies inside a vm guest with "unable to
+// load in-cluster configuration, KUBERNETES_SERVICE_HOST and
+// KUBERNETES_SERVICE_PORT must be defined", before the guest agent is served.
+func TestResolvePodBoxEnvInjectsTheAPIServerService(t *testing.T) {
+	envOf := func(c *runtimev1.Container) map[string]string {
+		m := map[string]string{}
+		for _, e := range c.GetEnv() {
+			m[e.GetName()] = e.GetValue()
+		}
+		return m
+	}
+	want := map[string]string{
+		"KUBERNETES_SERVICE_HOST":       "10.43.0.1",
+		"KUBERNETES_SERVICE_PORT":       "443",
+		"KUBERNETES_SERVICE_PORT_HTTPS": "443",
+		"KUBERNETES_PORT":               "tcp://10.43.0.1:443",
+		"KUBERNETES_PORT_443_TCP":       "tcp://10.43.0.1:443",
+		"KUBERNETES_PORT_443_TCP_PROTO": "tcp",
+		"KUBERNETES_PORT_443_TCP_PORT":  "443",
+		"KUBERNETES_PORT_443_TCP_ADDR":  "10.43.0.1",
+	}
+
+	t.Run("every container gets the service environment", func(t *testing.T) {
+		box := &runtimev1.PodBox{
+			Namespace:      "prod",
+			InitContainers: []*runtimev1.Container{{Name: "crd-apply"}},
+			Containers:     []*runtimev1.Container{{Name: "manager", Env: []*runtimev1.EnvVar{{Name: "LIT", Value: "x"}}}},
+		}
+		if err := resolvePodBoxEnv(context.Background(), box, podFacts{apiServerVIP: "10.43.0.1"}, nil); err != nil {
+			t.Fatalf("resolvePodBoxEnv: %v", err)
+		}
+		for _, c := range append(box.GetInitContainers(), box.GetContainers()...) {
+			env := envOf(c)
+			for k, v := range want {
+				if env[k] != v {
+					t.Errorf("%s: env[%q] = %q, want %q", c.GetName(), k, env[k], v)
+				}
+			}
+		}
+		if env := envOf(box.GetContainers()[0]); env["LIT"] != "x" {
+			t.Errorf("the container's own env was lost: %v", env)
+		}
+	})
+
+	t.Run("an explicit env var of the same name wins", func(t *testing.T) {
+		box := &runtimev1.PodBox{
+			Namespace:  "prod",
+			Containers: []*runtimev1.Container{{Name: "c0", Env: []*runtimev1.EnvVar{{Name: "KUBERNETES_SERVICE_HOST", Value: "proxy.internal"}}}},
+		}
+		if err := resolvePodBoxEnv(context.Background(), box, podFacts{apiServerVIP: "10.43.0.1"}, nil); err != nil {
+			t.Fatalf("resolvePodBoxEnv: %v", err)
+		}
+		env := envOf(box.GetContainers()[0])
+		if env["KUBERNETES_SERVICE_HOST"] != "proxy.internal" {
+			t.Errorf("KUBERNETES_SERVICE_HOST = %q, want the pod's own value to win", env["KUBERNETES_SERVICE_HOST"])
+		}
+		if env["KUBERNETES_SERVICE_PORT"] != "443" {
+			t.Errorf("KUBERNETES_SERVICE_PORT = %q, want the untouched variables still injected", env["KUBERNETES_SERVICE_PORT"])
+		}
+	})
+
+	t.Run("no API VIP injects nothing", func(t *testing.T) {
+		box := &runtimev1.PodBox{Namespace: "prod", Containers: []*runtimev1.Container{{Name: "c0"}}}
+		if err := resolvePodBoxEnv(context.Background(), box, podFacts{}, nil); err != nil {
+			t.Fatalf("resolvePodBoxEnv: %v", err)
+		}
+		if env := envOf(box.GetContainers()[0]); len(env) != 0 {
+			t.Errorf("env = %v, want none on a node that publishes no API Service", env)
+		}
+	})
+}
+
 // TestResolvePodBoxEnvRefusesAnUnknownFieldPath pins the closed set: a downward
 // field the provider cannot supply fails the pod at translation, by name, rather
 // than resolving to an empty string the workload would read as a value.
