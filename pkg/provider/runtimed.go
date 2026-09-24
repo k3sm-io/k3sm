@@ -1545,7 +1545,6 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// just wrote — a pod stuck creating, never re-created. Runtimed has said
 		// it holds nothing, so the track goes the way a preflight refusal's does.
 		//
-		//
 		// On an idempotent re-create (old != nil) the refusal alone does not say
 		// whether runtimed holds the pod: its CreatePod validates the box before
 		// it looks the pod up, so a refusal can come from validation while the
