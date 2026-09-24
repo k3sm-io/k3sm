@@ -805,12 +805,16 @@ func TestEnsureOwnedDirRefusesASymlink(t *testing.T) {
 		if err == nil {
 			t.Fatal("ensureServiceOwnedDir followed a symlink instead of refusing it")
 		}
-		if !strings.Contains(err.Error(), "symlink") {
-			t.Errorf("error %q does not name the refusal", err)
+		if !errors.Is(err, errSymlinkRefused) {
+			t.Errorf("error %q is not the symlink refusal", err)
 		}
 		assertMode(t, elsewhere, 0o755) // untouched: the target was never chowned/chmodded
 	})
 
+	// ensureRootOwnedDir is driven through ensureDirOwnedBy, the one body it is
+	// spelled in, with the test process's own identity: chowning to root fails
+	// EPERM unprivileged, which would refuse the symlink with or without the
+	// guard and leave the target untouched for the wrong reason.
 	t.Run("ensureRootOwnedDir", func(t *testing.T) {
 		root := t.TempDir()
 		elsewhere := filepath.Join(root, "elsewhere")
@@ -820,15 +824,111 @@ func TestEnsureOwnedDirRefusesASymlink(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err := ensureRootOwnedDir(dir, 0o700)
+		err := ensureDirOwnedBy(dir, os.Getuid(), os.Getgid(), 0o700)
 		if err == nil {
 			t.Fatal("ensureRootOwnedDir followed a symlink instead of refusing it")
 		}
-		if !strings.Contains(err.Error(), "symlink") {
-			t.Errorf("error %q does not name the refusal", err)
+		if !errors.Is(err, errSymlinkRefused) {
+			t.Errorf("error %q is not the symlink refusal", err)
 		}
 		assertMode(t, elsewhere, 0o755)
 	})
+}
+
+// TestEnsureHelpersRefuseASymlink is TestEnsureOwnedDirRefusesASymlink for the
+// sibling ensure-then-chown-by-path helpers: each case plants a symlink where
+// the helper expects a directory (or, for the log file, a regular file) and
+// asserts the refusal AND that the link's target kept its mode. Every helper
+// takes the owner explicitly and is called with the test process's own
+// identity, so without its guard each one succeeds by following the link: the
+// nil-error check and the mode check both fail, not just the message.
+func TestEnsureHelpersRefuseASymlink(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+
+	for _, tc := range []struct {
+		name string
+		// run plants its link under root, pointing at elsewhere (a 0755 dir),
+		// and calls the helper.
+		run func(t *testing.T, root, elsewhere string) error
+		// victim is the path under elsewhere whose mode must survive, and its
+		// mode as planted.
+		victim     string
+		victimMode os.FileMode
+	}{
+		{
+			name: "data root",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "data-root")
+				symlinkT(t, elsewhere, dir)
+				return EnsureDataRoot(dir, uid)
+			},
+			victimMode: 0o755,
+		},
+		{
+			name: "log dir",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "k3sm")
+				symlinkT(t, elsewhere, dir)
+				return ensureLogDir(dir, logOwnership{serviceUID: uid, rootUID: uid, gid: gid})
+			},
+			victimMode: 0o755,
+		},
+		{
+			name: "log file",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "k3sm")
+				mkdir(t, dir, LogDirMode)
+				victim := filepath.Join(elsewhere, "victim")
+				if err := os.WriteFile(victim, []byte("not a log\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				symlinkT(t, victim, filepath.Join(dir, filepath.Base(ServerLogPath())))
+				return ensureLogDir(dir, logOwnership{serviceUID: uid, rootUID: uid, gid: gid})
+			},
+			victim:     "victim",
+			victimMode: 0o644,
+		},
+		{
+			name: "container log dir",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "containers")
+				symlinkT(t, elsewhere, dir)
+				return ensureContainerLogDir(dir, uid, gid)
+			},
+			victimMode: 0o755,
+		},
+		{
+			name: "service-user file parent",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "creds")
+				symlinkT(t, elsewhere, dir)
+				return writeServiceUserFile(filepath.Join(dir, "token"), []byte("secret\n"), uid, gid, 0o600, 0o700)
+			},
+			victimMode: 0o755,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			elsewhere := filepath.Join(root, "elsewhere")
+			mkdir(t, elsewhere, 0o755)
+
+			err := tc.run(t, root, elsewhere)
+			if err == nil {
+				t.Fatal("followed a symlink instead of refusing it")
+			}
+			if !errors.Is(err, errSymlinkRefused) {
+				t.Errorf("error %q is not the symlink refusal", err)
+			}
+			assertMode(t, filepath.Join(elsewhere, tc.victim), tc.victimMode)
+		})
+	}
+}
+
+func symlinkT(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestAdoptTreeWalksByDescriptorAndNeverFollowsASymlink exercises the REAL
