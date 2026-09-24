@@ -133,7 +133,12 @@ else
 fi
 
 # ---- s1.4 the infrastructure-free smoke ------------------------------------------
-spike_pip "$V" ai-dynamo
+# The frontend and mocker ship in the top-level package, installed FROM THE CLONE
+# alongside the wheel s1.2 built. Resolving it by name from the package index pulls
+# the index's runtime, which has no darwin wheel, so the smoke would test a sdist
+# build instead of the artifact this rung just recorded. Naming the local wheel in
+# the same install pins the runtime requirement to it.
+spike_pip "$V" "$WHEEL" "$W/src"
 if "$V" -m dynamo.frontend --help >"$W/frontend-help.txt" 2>&1; then
   verdict PASS "s1.4 frontend  python3 -m dynamo.frontend --help answers from the darwin build"
 else
