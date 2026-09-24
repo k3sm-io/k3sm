@@ -733,3 +733,23 @@ func TestNodeRESTClientHasTimeout(t *testing.T) {
 		}
 	})
 }
+
+// TestNodeRESTConfigHasKubeletBudget pins the upstream kubelet's client-side
+// request budget (kubeAPIQPS 50, kubeAPIBurst 100) on the rest.Config the
+// node's clientset is built from (B360). BuildConfigFromFlags leaves QPS and
+// Burst at zero, which client-go turns into its 5/10 default — one bucket the
+// node's status writes, informers, leases, events, and volume reads all share.
+// client-go exposes no public accessor for the limiter it builds, so the gate
+// asserts the config fields the limiter is constructed from.
+func TestNodeRESTConfigHasKubeletBudget(t *testing.T) {
+	cfg, err := nodeRESTConfig(writeNodeRESTKubeconfig(t, "https://127.0.0.1:6443"))
+	if err != nil {
+		t.Fatalf("nodeRESTConfig: %v", err)
+	}
+	if cfg.QPS != 50 {
+		t.Errorf("rest.Config.QPS = %v, want 50 (the kubelet's kubeAPIQPS default)", cfg.QPS)
+	}
+	if cfg.Burst != 100 {
+		t.Errorf("rest.Config.Burst = %d, want 100 (the kubelet's kubeAPIBurst default)", cfg.Burst)
+	}
+}
