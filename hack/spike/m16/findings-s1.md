@@ -16,6 +16,17 @@
 > runs stand as recorded on that substitute, or must be re-run on the sanctioned rig
 > before acceptance, is a question for the maintainers, not decided here.
 
+> **Sanctioned-rig run at a different pin, 2026-09-24 (recorded separately before this
+> file merged).** The maintainers ran the rung on the sanctioned rig at the plan's
+> default upstream ref (main, resolved to 2be370d15, v1.4.0-inkling-dev.1-1366), not
+> this file's tagged v1.5.0 pin. Exit 1: the toolchain, build and frontend --help
+> held (nixl-sys and the memory crate linked, so the binding halt did not apply; the
+> build's rust-toolchain.toml selected rustc 1.96.1; wheel 1.6.0, sha256 d52f058dcf83
+> 973f6cae466a072cae9f67344de5fd575d2f4ced1aa73e36d352), and file discovery connected
+> the frontend to the mocker, but the frontend never materialized the mocker's model,
+> so no completion was served. A different pin answers a different question; the two
+> records stand side by side.
+
 ## Question
 
 Does the upstream serving framework (Apache-2.0) build from source on darwin/arm64

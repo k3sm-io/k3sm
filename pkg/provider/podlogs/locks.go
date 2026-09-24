@@ -27,6 +27,15 @@ import "sync"
 // operation see a stable directory listing, and it keeps a slow gzip on one pod
 // from stalling rotation on another.
 //
+// The key MUST be the pod directory — <podLogsDir>/<ns>_<pod>_<uid>, i.e.
+// BuildPodLogsDirectory's result — never a container directory one level below
+// it. Every caller keying on anything but that exact string gets its own private
+// mutex and no exclusion at all against the others: found during the 2026-09-23
+// A1 audit, where the rotator's two call sites keyed on the container directory
+// (filepath.Dir of a container log file) while the GC correctly keyed on the pod
+// directory, so GC's os.RemoveAll(podDir) and the rotator's rename/gzip inside
+// that same tree ran fully concurrently with no lock ever actually shared.
+//
 // The map only grows within a node's lifetime, bounded by the number of pod
 // directories the node has ever held; an entry is a zero-sized mutex, so
 // reclaiming them would cost more synchronisation than it saves.

@@ -73,6 +73,26 @@ type ContainerLogRef struct {
 	Path string
 }
 
+// podDirOfContainerLog returns the pod log directory that owns a container log
+// file's path — two levels up, per paths.go's BuildContainerLogsPath shape:
+// <podLogsDir>/<ns>_<pod>_<uid>/<container>/<n>.log. This is the ONLY correct
+// way to compute a DirLocks key from a container log path: DirLocks' own doc
+// comment says "one mutex per pod log directory", and gc.go keys on the same
+// pod directory (via BuildPodLogsDirectory) for its os.RemoveAll of that tree.
+// Both Clean and processContainer below call this rather than each inlining
+// filepath.Dir twice, specifically so there is one place, not two, that can
+// drift from gc.go's key shape. Found during the 2026-09-23 A1 audit: before
+// this helper existed, Clean and processContainer each independently keyed on
+// the CONTAINER directory (filepath.Dir once, not twice) — a different string
+// from gc.go's pod-directory key, so DirLocks handed out two different mutexes
+// and rotation/GC ran fully concurrently on the same tree with no exclusion at
+// all. Pinned per call site by TestCleanLocksOnThePodDirectoryGCUses and
+// TestProcessContainerLocksOnThePodDirectoryGCUses; the concurrent
+// reproduction is TestRotationAndGCSerializeOnSharedPodLock.
+func podDirOfContainerLog(containerLogPath string) string {
+	return filepath.Dir(filepath.Dir(containerLogPath))
+}
+
 // Runtime is the consumer-side seam the rotator drives. The provider implements
 // it over runtimed's in-process status and ReopenContainerLog RPCs; a test
 // implements it over a temp directory.
@@ -226,6 +246,7 @@ func (c *containerLogManager) Start(ctx context.Context) {
 // Clean removes every file of one container log path — the current file and each
 // rotated or compressed sibling. It is called after a container's instance is
 // pruned, so the glob is the authority on what belonged to it.
+// Not yet wired: nothing in the tree calls Clean from instance pruning.
 func (c *containerLogManager) Clean(_ context.Context, logPath string) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
@@ -235,7 +256,7 @@ func (c *containerLogManager) Clean(_ context.Context, logPath string) error {
 		return fmt.Errorf("failed to list all log files with pattern %q: %w", pattern, err)
 	}
 	var firstErr error
-	c.locks.Do(filepath.Dir(logPath), func() {
+	c.locks.Do(podDirOfContainerLog(logPath), func() {
 		for _, l := range logs {
 			if err := os.Remove(l); err != nil && !errors.Is(err, fs.ErrNotExist) && firstErr == nil {
 				firstErr = fmt.Errorf("failed to remove container log %q: %w", l, err)
@@ -312,7 +333,7 @@ func (c *containerLogManager) processContainer(ctx context.Context, worker int) 
 	if info.Size() < c.policy.MaxSize {
 		return
 	}
-	c.locks.Do(filepath.Dir(path), func() {
+	c.locks.Do(podDirOfContainerLog(path), func() {
 		if err := c.rotateLog(ctx, key, path); err != nil {
 			c.log.Error("failed to rotate container log", "worker", worker, "container", key, "path", path, "size", info.Size(), "max", c.policy.MaxSize, "err", err)
 		}

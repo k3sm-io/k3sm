@@ -34,6 +34,7 @@ import (
 	testclock "k8s.io/utils/clock/testing"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/k3sm/pkg/provider/vkadapter"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -183,6 +184,14 @@ func (f *fakeRuntimeServer) pushDeleteErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteFIFO = append(f.deleteFIFO, err)
+}
+
+// pushStatusErr queues one GetPodStatus transport failure; an exhausted FIFO
+// answers from f.created as usual.
+func (f *fakeRuntimeServer) pushStatusErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statusFIFO = append(f.statusFIFO, err)
 }
 
 // deleteRecords is every pod id DeletePod has been called with, in order.
@@ -995,6 +1004,125 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 		}
 	})
 
+	// A re-create's refusal leaves open whether runtimed still holds the pod
+	// from the first create (its CreatePod validates the box before it looks
+	// the pod up), so untrackRejectedCreate asks. Three ways that question can
+	// come back drive three different outcomes, tabled together so the
+	// variation — what changes between rows, and what does not — is explicit.
+	recreateCases := []struct {
+		name string
+		// podID names the fake's underlying pod so each row gets its own
+		// tracked pod despite sharing the provider-construction boilerplate.
+		podID string
+		// forgetAfterFirstCreate simulates the runtime having lost the pod (a
+		// guest that died and was reaped) before the re-create is attempted.
+		forgetAfterFirstCreate bool
+		// statusErr, when set, makes the ONE GetPodStatus call
+		// untrackRejectedCreate's runtimeHoldsPod issues fail at the transport
+		// rather than answer — the branch this table exists to pin.
+		statusErr error
+		refusal   *runtimev1.CreatePodResponse
+		// wantKept is the fail-toward-keeping property under test: true unless
+		// the query definitively said the runtime does not hold the pod.
+		wantKept bool
+	}{
+		{
+			name:  "pod held",
+			podID: "recreate-held",
+			// runtimed still holds the pod from the first create; the fake
+			// answers the query truthfully and keeps the pod created.
+			refusal: createRefusal(runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				"invalid pod box: sandbox_profile is required"),
+			wantKept: true,
+		},
+		{
+			name:                   "pod lost",
+			podID:                  "recreate-lost",
+			forgetAfterFirstCreate: true,
+			// The re-create that should bring the guest back is refused too;
+			// the fake truthfully answers that it holds nothing.
+			refusal: createRefusal(runtimev1.FailureReason_FAILURE_REASON_SANDBOX_SETUP,
+				"create vm for pod: guest did not come up"),
+			wantKept: false,
+		},
+		{
+			name:      "transport error",
+			podID:     "recreate-transport-err",
+			statusErr: errors.New("runtimed unavailable"),
+			refusal: createRefusal(runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX,
+				"invalid pod box: sandbox_profile is required"),
+			// The query itself failed — no verdict at all — so the track is
+			// kept rather than risk releasing a pod the runtime may still hold.
+			wantKept: true,
+		},
+	}
+	for _, tc := range recreateCases {
+		t.Run("a pod-level refusal on a re-create: "+tc.name, func(t *testing.T) {
+			pod := pullPod(tc.podID)
+			r, f, _, _ := newPullProvider(t)
+			if err := r.CreatePod(context.Background(), pod); err != nil {
+				t.Fatalf("CreatePod #1 = %v", err)
+			}
+			if old := r.trackByID(string(pod.UID)); old == nil || !f.hasCreated(string(pod.UID)) {
+				t.Fatal("setup: the first create did not leave a tracked, runtime-held pod")
+			}
+			if tc.forgetAfterFirstCreate {
+				f.forget(string(pod.UID))
+			}
+			if tc.statusErr != nil {
+				f.pushStatusErr(tc.statusErr)
+			}
+			f.pushCreate(tc.refusal)
+			if err := r.CreatePod(context.Background(), pod); err == nil {
+				t.Fatal("CreatePod #2 = nil, want the refusal")
+			}
+
+			tr := r.trackByID(string(pod.UID))
+			if tc.wantKept {
+				// The pod stays visible: forgetting it here would release the
+				// /32 and log tree of a pod runtimed may still hold.
+				if tr == nil {
+					t.Fatal("a refused re-create forgot the track; want it kept")
+				}
+				if pods, err := r.GetPods(context.Background()); err != nil || len(pods) != 1 {
+					t.Errorf("GetPods = %d pods, %v; want the held pod listed", len(pods), err)
+				}
+				// A later sync converges on the runtime's truth, not a
+				// synthesized ContainerCreating — this GetPodStatus call is
+				// unaffected by tc.statusErr, which the FIFO already spent on
+				// untrackRejectedCreate's own query.
+				st, err := r.GetPodStatus(context.Background(), "default", tc.podID)
+				if err != nil {
+					t.Fatalf("GetPodStatus after the refused re-create: %v", err)
+				}
+				if st.Phase != corev1.PodRunning {
+					t.Errorf("phase = %s, want Running from the pod runtimed holds", st.Phase)
+				}
+				if n := f.createCount(); n != 2 {
+					t.Errorf("CreatePod RPCs = %d, want 2", n)
+				}
+				return
+			}
+			if tr != nil {
+				t.Fatal("a refused re-create kept the track of a pod runtimed does not hold; VK will update instead of re-create")
+			}
+			if _, err := r.GetPodStatus(context.Background(), "default", tc.podID); !vkadapter.IsNotFound(err) {
+				t.Errorf("GetPodStatus = %v, want NotFound so VK's retry reaches CreatePod", err)
+			}
+			// VK's retry is a CreatePod, and with the FIFO exhausted it succeeds.
+			if err := r.CreatePod(context.Background(), pod); err != nil {
+				t.Fatalf("CreatePod #3 = %v, want the pod re-created", err)
+			}
+			if n := f.createCount(); n != 3 {
+				t.Errorf("CreatePod RPCs = %d, want 3", n)
+			}
+			st, err := r.GetPodStatus(context.Background(), "default", tc.podID)
+			if err != nil || st.Phase != corev1.PodRunning {
+				t.Errorf("after the retry: phase=%v err=%v, want Running", st, err)
+			}
+		})
+	}
+
 	t.Run("a pod-level refusal still fails the create", func(t *testing.T) {
 		pod := pullPod("podlevel")
 		r, f, _, _ := newPullProvider(t)
@@ -1004,8 +1132,29 @@ func TestParkedCreateForAnUnresolvableImage(t *testing.T) {
 		if err := r.CreatePod(context.Background(), pod); err == nil {
 			t.Fatal("CreatePod = nil, want an error — a pod-level failure is not an image the node can retry")
 		}
-		if tr := r.trackByID(string(pod.UID)); tr != nil && tr.parkedFailure() != nil {
-			t.Error("a pod-level failure parked the pod; only container-class image failures park")
+		// The refused pod is NOT tracked. VK retries a failed create only after
+		// GetPod says the pod is absent (a present pod takes the UpdatePod path),
+		// and a tracked pod the runtime does not hold would answer GetPodStatus
+		// with a synthesized ContainerCreating that overwrites the ProviderFailed
+		// VK recorded — a pod stuck creating forever, never re-created.
+		if tr := r.trackByID(string(pod.UID)); tr != nil {
+			t.Fatal("a pod-level refusal left the pod tracked; VK will update instead of re-create, and the status sync will report it ContainerCreating")
+		}
+		if pods, err := r.GetPods(context.Background()); err != nil || len(pods) != 0 {
+			t.Errorf("GetPods = %d pods, %v; want none, so VK's retry reaches CreatePod", len(pods), err)
+		}
+		if _, err := r.GetPodStatus(context.Background(), "default", "podlevel"); !vkadapter.IsNotFound(err) {
+			t.Errorf("GetPodStatus = %v, want NotFound for a pod runtimed never created", err)
+		}
+		// VK's retry is a second CreatePod, and with the FIFO exhausted it succeeds.
+		if err := r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod retry = %v, want the pod created", err)
+		}
+		if n := f.createCount(); n != 2 {
+			t.Errorf("CreatePod RPCs = %d, want 2 (the refusal and the retry)", n)
+		}
+		if tr := r.trackByID(string(pod.UID)); tr == nil {
+			t.Error("the retried pod is not tracked")
 		}
 	})
 }

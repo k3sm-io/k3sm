@@ -1,0 +1,9 @@
+# Recorded at chart dynamo-platform 1.5.0, upstream tag v1.5.0,
+# commit b83b1d9304ebfc624709ac46db32b1b6f1ff1615, on 2026-09-21..23 (M16.0 S2).
+# Lines starting with '#' are provenance, not part of the record.
+dynamocomponentdeployments.nvidia.com kind=DynamoComponentDeployment served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamographdeploymentrequests.nvidia.com kind=DynamoGraphDeploymentRequest served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamographdeployments.nvidia.com kind=DynamoGraphDeployment served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamographdeploymentscalingadapters.nvidia.com kind=DynamoGraphDeploymentScalingAdapter served=v1alpha1,v1beta1 storage=v1beta1 conversion=Webhook
+dynamomodels.nvidia.com kind=DynamoModel served=v1alpha1 storage=v1alpha1 conversion=None
+dynamoworkermetadatas.nvidia.com kind=DynamoWorkerMetadata served=v1alpha1 storage=v1alpha1 conversion=None

@@ -17,6 +17,16 @@
 > runs stand as recorded on that substitute, or must be re-run on the sanctioned rig
 > before acceptance, is a question for the maintainers, not decided here.
 
+> **Sanctioned-rig attempt, 2026-09-24 (recorded separately before this file merged).**
+> The maintainers ran the same rung on the sanctioned rig at upstream digests. It
+> exited 1 at s2.1 after 10m06s: the operator Deployment never created a Pod, because
+> the rung patches the pod specs onto the darwin node only after the helm wait, and
+> the cluster's admission policy rejects every Pod not selecting the darwin os label,
+> so the wait can only end in the progress deadline. No later criterion ran, and the
+> plan's halt condition was not reached. That attempt therefore neither confirms nor
+> contradicts the runs recorded here; it shows the rung's patch ordering must move
+> before the wait for a sanctioned-rig rerun to answer anything.
+
 ## Question
 
 Does the upstream serving control plane install and run on k3sm with its operator and

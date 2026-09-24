@@ -236,19 +236,26 @@ func stageJoinToken(sys System, cfg Config, uid uint32, token string) error {
 // the bytes — and two readers of one credential file would eventually disagree
 // about which files are acceptable.
 func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) {
-	// The mode BEFORE the bytes: a credential this Mac should not have accepted
-	// is refused without being read anywhere else first.
-	switch perm, err := sys.FileMode(cfg.TokenFile); {
+	// One open, one descriptor: the mode judged and the bytes read are
+	// GUARANTEED to be the same file, and a symlink at cfg.TokenFile is refused
+	// outright rather than followed. A separate FileMode-then-ReadFile pair
+	// (the shape before the 2026-09-23 A1 audit) checked and read the path
+	// twice with no window closed between them — the confused-deputy read
+	// ReadRegularFile's own doc comment describes, applied to this file's mode
+	// as well as its type.
+	raw, perm, err := sys.ReadRegularFileWithMode(cfg.TokenFile)
+	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not there: write the token `k3sm token create` printed on the server into it, or drop --token-file on a node that has already joined", cfg.TokenFile)
+	case errors.Is(err, ErrNotRegularFile):
+		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not a regular file (%w): a join token is a credential and belongs in an ordinary file, mode 600", cfg.TokenFile, err)
 	case err != nil:
-		return "", bootstrap.Token{}, fmt.Errorf("install: inspect the join token file %s: %w", cfg.TokenFile, err)
-	case perm&tokenFileMask != 0:
-		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
-	}
-	raw, err := sys.ReadFile(cfg.TokenFile)
-	if err != nil {
 		return "", bootstrap.Token{}, fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the agent daemon to present)", cfg.TokenFile, err, cfg.agentTokenPath())
+	}
+	// The mode BEFORE the bytes are trusted: a credential this Mac should not
+	// have accepted is refused before anything below parses raw.
+	if perm&tokenFileMask != 0 {
+		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is mode %#o: a join token is a credential, so the file must not be readable by its group or by other accounts — `chmod 600 %s`, and mint a fresh token if it has been exposed", cfg.TokenFile, perm, cfg.TokenFile)
 	}
 	token := strings.TrimSpace(string(raw))
 	if token == "" {

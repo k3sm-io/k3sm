@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -80,6 +81,16 @@ func (c Collector) Collect(ctx context.Context) Report {
 	}
 	apiserver := c.apiserverRow(ctx, role, credential)
 	serving := apiserver.Severity == SeverityOK
+	// The node list is read ONCE and handed to both rows that use it, so the
+	// node row and the workloads row describe the same snapshot: two reads
+	// could straddle a Ready transition and have one report say a node is up
+	// while the other calls it stuck. It is one unpaginated List: k3sm
+	// clusters are a handful of Macs, so a single page always holds them all.
+	var nodes []corev1.Node
+	var nodesErr error
+	if c.Kube != nil && serving {
+		nodes, nodesErr = c.Kube.Nodes(ctx)
+	}
 
 	rows := []Row{instRow}
 	// The mount oneshot goes before netd, mirroring the order install lays the
@@ -101,8 +112,8 @@ func (c Collector) Collect(ctx context.Context) Report {
 	}
 	rows = append(rows,
 		apiserver,
-		c.nodeRow(ctx, serving, role),
-		c.workloadsRow(ctx, serving, nodePID),
+		c.nodeRow(serving, role, nodes, nodesErr),
+		c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()),
 		dataRoot,
 	)
 	// Immediately after the data root it sits beside, and only while it is
@@ -501,17 +512,19 @@ func (c Collector) apiserverRow(ctx context.Context, role dataroot.Role, credent
 // Which node is "this Mac" is answered by PickNode, from the hostname. When it
 // cannot answer, the row reports the ready/total counts alone rather than naming
 // a node it did not identify.
-func (c Collector) nodeRow(ctx context.Context, serving bool, role dataroot.Role) Row {
+//
+// nodes and nodesErr are the one node list Collect read; the row never lists
+// nodes itself, so it cannot disagree with the workloads row about them.
+func (c Collector) nodeRow(serving bool, role dataroot.Role, nodes []corev1.Node, nodesErr error) Row {
 	row := Row{Name: RowNode, Remedy: c.nodeLogRemedy(role)}
 	if c.Kube == nil || !serving {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "apiserver unreachable"
 		return row
 	}
-	nodes, err := c.Kube.Nodes(ctx)
-	if err != nil {
+	if nodesErr != nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
-		row.Detail = "could not list nodes: " + errText(err)
+		row.Detail = "could not list nodes: " + errText(nodesErr)
 		return row
 	}
 	ready := 0
@@ -686,10 +699,63 @@ func nodeReady(n corev1.Node) bool {
 	return false
 }
 
+// stuckTerminatingDebounce is how long a node must have been NotReady before a
+// pod still terminating on it is reported as stuck.
+//
+// A Mac that sleeps, has its lid closed, or reboots for an update drops its
+// node to NotReady for a minute or so and then comes back and finishes the
+// deletion on its own. Warning inside that window would tell the operator to
+// force a node out of service that is about to return, so the warning waits
+// until the node has been gone longer than an ordinary reboot or lid close.
+const stuckTerminatingDebounce = 2 * time.Minute
+
+// outOfServiceTaint is the upstream taint that lets the control plane finish
+// deleting the pods of a node that is not coming back (non-graceful node
+// shutdown). k3sm only prints the command; applying it is the operator's call.
+const outOfServiceTaint = "node.kubernetes.io/out-of-service=nodeshutdown:NoExecute"
+
+// stuckTerminatingCaveat is the line printed under the taint command: the taint
+// is only safe for a Mac that is really off.
+const stuckTerminatingCaveat = "# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac"
+
+// deletedNodeDebounce is how long a terminating pod whose node object is absent
+// from the node list must have been terminating before it is reported as stuck
+// on a deleted node.
+//
+// It is not zero because the apiserver's list-consistency posture
+// (ConsistentListFromCache) is not yet soaked, so a single stale read could
+// omit a node that exists. A one-shot command cannot re-observe, so this is a
+// grace proxy rather than a repeated-confirmation window: the clock is the
+// pod's own deletion timestamp, the only durable clock a memoryless command
+// has, and a genuinely deleted node's stall is minutes old by the time a
+// human runs status. Deliberately far shorter than stuckTerminatingDebounce:
+// a missing Node object is a rarer, more deliberate event than a NotReady
+// blip from sleep or reboot, so it merits less patience. Revisit alongside
+// the list-consistency soak's close.
+const deletedNodeDebounce = 15 * time.Second
+
 // workloadsRow counts pods by phase across every namespace, plus the vm hosts
 // the control plane has spawned (the one workload kind that is a host process
 // rather than a pod entry).
-func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int) Row {
+//
+// A pod with a deletion timestamp is counted as terminating and NOT under its
+// phase, since its phase still reads Running until the kubelet confirms the
+// kill. When the node it runs on has been NotReady for longer than
+// stuckTerminatingDebounce, the kubelet that would confirm it is gone and the
+// pod will stay terminating indefinitely; that is a warning, and the remedy
+// prints the out-of-service taint for that node. nodes is the FULL node list
+// Collect read (never PickNode's answer: the stuck pod is usually on another
+// Mac), and now is the report's clock.
+//
+// A terminating pod whose node object is not in the list at all (the node was
+// deleted while the pod was on it) is a separate case: there is no kubelet and
+// no node to taint, so once its deletion is older than deletedNodeDebounce the
+// row warns and the remedy force-deletes each such pod by name. When nodesErr
+// says the node list could not be read, this check is skipped for the whole
+// snapshot, as unknown pods are: an empty list from a failed read would
+// otherwise make every terminating pod look orphaned. A Mac that rejoins under
+// the same hostname re-parents the check to its new node object by design.
+func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int, nodes []corev1.Node, nodesErr error, now time.Time) Row {
 	row := Row{Name: RowWorkloads, Remedy: "k3sm kubectl get pods -A"}
 	if c.Kube == nil || !serving {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
@@ -702,8 +768,30 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 		row.Detail = "could not list pods: " + errText(err)
 		return row
 	}
+	gone := goneNodes(nodes, now)
+	present := make(map[string]bool, len(nodes))
+	for i := range nodes {
+		present[nodes[i].Name] = true
+	}
 	byPhase := map[corev1.PodPhase]int{}
+	terminating := 0
+	stuckOn := map[string]int{}
+	orphanOn := map[string]bool{}
+	var orphans []*corev1.Pod
 	for i := range pods {
+		if pods[i].DeletionTimestamp != nil {
+			terminating++
+			node := pods[i].Spec.NodeName
+			switch {
+			case gone[node]:
+				stuckOn[node]++
+			case nodesErr == nil && node != "" && !present[node] &&
+				now.Sub(pods[i].DeletionTimestamp.Time) > deletedNodeDebounce:
+				orphanOn[node] = true
+				orphans = append(orphans, &pods[i])
+			}
+			continue
+		}
 		byPhase[pods[i].Status.Phase]++
 	}
 	clauses := []string{fmt.Sprintf("%d running", byPhase[corev1.PodRunning])}
@@ -712,18 +800,94 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 			clauses = append(clauses, fmt.Sprintf("%d %s", n, strings.ToLower(string(phase))))
 		}
 	}
+	stuckNodes := make([]string, 0, len(stuckOn))
+	stuck := 0
+	for name, n := range stuckOn {
+		stuckNodes = append(stuckNodes, name)
+		stuck += n
+	}
+	sort.Strings(stuckNodes)
+	deletedNodes := make([]string, 0, len(orphanOn))
+	for name := range orphanOn {
+		deletedNodes = append(deletedNodes, name)
+	}
+	sort.Strings(deletedNodes)
+	sort.Slice(orphans, func(i, j int) bool {
+		if orphans[i].Namespace != orphans[j].Namespace {
+			return orphans[i].Namespace < orphans[j].Namespace
+		}
+		return orphans[i].Name < orphans[j].Name
+	})
+	if terminating > 0 {
+		clause := fmt.Sprintf("%d terminating", terminating)
+		var why []string
+		if stuck > 0 {
+			why = append(why, fmt.Sprintf("%d stuck on NotReady %s", stuck, strings.Join(stuckNodes, ", ")))
+		}
+		if len(orphans) > 0 {
+			why = append(why, fmt.Sprintf("%d stuck on deleted node %s", len(orphans), strings.Join(deletedNodes, ", ")))
+		}
+		if len(why) > 0 {
+			clause += " (" + strings.Join(why, "; ") + ")"
+		}
+		clauses = append(clauses, clause)
+	}
 	if c.Procs != nil && serverPID > 0 {
 		if n, verr := c.Procs.VMHosts(serverPID); verr == nil && n > 0 {
 			clauses = append(clauses, fmt.Sprintf("%d vm", n))
 		}
 	}
 	row.Detail = strings.Join(clauses, " · ")
+	if stuck > 0 || len(orphans) > 0 {
+		steps := make([]string, 0, len(stuckNodes)+len(orphans)+1)
+		row.Wide = map[string]string{}
+		if stuck > 0 {
+			for _, name := range stuckNodes {
+				steps = append(steps, "kubectl taint node "+name+" "+outOfServiceTaint)
+			}
+			row.Wide["stuckNode"] = strings.Join(stuckNodes, ",")
+			row.Wide["stuckPods"] = strconv.Itoa(stuck)
+		}
+		if len(orphans) > 0 {
+			// No node object means no node to taint: each pod is force-deleted
+			// by name instead.
+			for _, p := range orphans {
+				steps = append(steps, "kubectl delete pod -n "+p.Namespace+" "+p.Name+" --grace-period=0 --force")
+			}
+			row.Wide["deletedNode"] = strings.Join(deletedNodes, ",")
+			row.Wide["deletedNodePods"] = strconv.Itoa(len(orphans))
+		}
+		row.Remedy = strings.Join(append(steps, stuckTerminatingCaveat), "\n")
+		row.State, row.Severity = StateNotReady, SeverityWarn
+		return row
+	}
 	if byPhase[corev1.PodPending] > 0 || byPhase[corev1.PodFailed] > 0 {
 		row.State, row.Severity = StateNotReady, SeverityWarn
 		return row
 	}
 	row.State, row.Severity, row.Remedy = StateOK, SeverityOK, ""
 	return row
+}
+
+// goneNodes names the nodes whose Ready condition is False or Unknown and has
+// been so for longer than stuckTerminatingDebounce at now. A node with no Ready
+// condition at all, or no transition time, is left out: without a transition
+// time there is no way to tell a long outage from a lid close.
+func goneNodes(nodes []corev1.Node, now time.Time) map[string]bool {
+	gone := map[string]bool{}
+	for i := range nodes {
+		for _, cond := range nodes[i].Status.Conditions {
+			if cond.Type != corev1.NodeReady {
+				continue
+			}
+			if cond.Status != corev1.ConditionTrue && !cond.LastTransitionTime.IsZero() &&
+				now.Sub(cond.LastTransitionTime.Time) > stuckTerminatingDebounce {
+				gone[nodes[i].Name] = true
+			}
+			break
+		}
+	}
+	return gone
 }
 
 // dataRootRow reports the posture of /var/lib/k3sm.

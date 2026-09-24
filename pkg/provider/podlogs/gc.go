@@ -122,6 +122,11 @@ func (g *GC) Run(ctx context.Context) {
 
 // RunOnce performs one sweep: prune dead instances, drop orphan pod directories,
 // and remove dangling symlinks.
+//
+// Its latency depends on rotation. Each pod is swept under the same DirLocks
+// mutex the rotator holds while it renames, gzips and asks the writer to reopen
+// (logmanager.go, processContainer), so a slow gzip or a stalled reopen delays
+// the sweep pod by pod, with no bound. A slow cleanup starts there.
 func (g *GC) RunOnce(ctx context.Context) {
 	known, synced := g.Pods.KnownPodUIDs(ctx)
 	if !synced {

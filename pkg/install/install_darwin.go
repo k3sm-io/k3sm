@@ -141,6 +141,9 @@ func ensureOwnedDir(dir string, uid int) error {
 	if err := os.MkdirAll(dir, DataRootMode); err != nil {
 		return fmt.Errorf("create data root %s: %w", dir, err)
 	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("data root %s: %w", dir, err)
+	}
 	if err := os.Chown(dir, uid, DataRootGID); err != nil {
 		return fmt.Errorf("chown data root %s to %d: %w", dir, uid, err)
 	}
@@ -206,6 +209,9 @@ func ensureLogDir(dir string, own logOwnership) error {
 	if err := os.MkdirAll(dir, LogDirMode); err != nil {
 		return fmt.Errorf("create log dir %s: %w", dir, err)
 	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("log dir %s: %w", dir, err)
+	}
 	if err := os.Chown(dir, own.serviceUID, own.gid); err != nil {
 		return fmt.Errorf("chown log dir %s to %d:%d: %w", dir, own.serviceUID, own.gid, err)
 	}
@@ -227,9 +233,14 @@ func ensureLogDir(dir string, own logOwnership) error {
 // launchd.plist(5)), so a file that is already there is opened as it stands and
 // keeps the mode set here. O_CREATE without O_TRUNC is what preserves the
 // history of an install being repaired, and the explicit chmod is what tightens
-// a file an earlier daemon spawn created at its own umask.
+// a file an earlier daemon spawn created at its own umask. O_NOFOLLOW makes
+// the open itself the symlink guard: a log planted as a link fails with ELOOP
+// instead of creating or opening its target for the chown/chmod that follow.
 func ensureLogFile(path string, uid, gid int) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, LogFileMode)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_NOFOLLOW, LogFileMode)
+	if errors.Is(err, unix.ELOOP) {
+		return fmt.Errorf("log file %s: %w", path, errSymlinkRefused)
+	}
 	if err != nil {
 		return fmt.Errorf("create log file %s: %w", path, err)
 	}
@@ -260,6 +271,9 @@ func (darwinSystem) EnsureContainerLogDir(dir string, uid uint32) error {
 func ensureContainerLogDir(dir string, uid, gid int) error {
 	if err := os.MkdirAll(dir, ContainerLogDirMode); err != nil {
 		return fmt.Errorf("create container log dir %s: %w", dir, err)
+	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("container log dir %s: %w", dir, err)
 	}
 	if err := os.Chown(dir, uid, gid); err != nil {
 		return fmt.Errorf("chown container log dir %s to %d:%d: %w", dir, uid, gid, err)
@@ -514,6 +528,9 @@ func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create %s %s: %w", what, dir, err)
 	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("%s %s: %w", what, dir, err)
+	}
 	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
 		return fmt.Errorf("chown %s %s to %d:staff: %w", what, dir, uid, err)
 	}
@@ -522,6 +539,35 @@ func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
 	}
 	return nil
 }
+
+// refuseSymlinkAt lstats path and refuses it if it is a symlink. It exists for
+// every caller here that is about to Chown/Chmod BY PATH — both of which follow
+// a symlink to whatever it points at — right after an os.MkdirAll that is a
+// no-op against a path that already exists. Without this, a directory replaced
+// by a symlink between two runs (or one a lower-privileged writer plants ahead
+// of a root-run repair) would have its target chowned/chmodded instead of being
+// refused, the same confused-deputy shape Owner's own doc comment describes for
+// a single file, applied here to a directory MkdirAll believes it already
+// created. Found during the 2026-09-23 A1 audit.
+//
+// It is a check followed by path-based Chown/Chmod, so a narrower window remains
+// between the Lstat and those calls; that is acceptable for the pre-planted
+// threat model it closes. The race-free shape is the descriptor-bound one
+// adoptTree uses (openDirNoFollow, then Fchown/Fchmod on the fd).
+func refuseSymlinkAt(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("lstat: %w", err)
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		return errSymlinkRefused
+	}
+	return nil
+}
+
+// errSymlinkRefused is refuseSymlinkAt's (and ensureLogFile's) refusal, a
+// sentinel so callers and tests match it with errors.Is, never by message.
+var errSymlinkRefused = errors.New("is a symlink: refusing to chown/chmod through it")
 
 // Owner reports the ownership, permission bits and kind of path. See the System
 // interface for the contract.
@@ -619,11 +665,17 @@ func (darwinSystem) CopyToRootOwned(src, dst string) error {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return fmt.Errorf("create install dir %s: %w", dstDir, err)
 	}
+	if err := refuseSymlinkAt(dstDir); err != nil {
+		return fmt.Errorf("install dir %s: %w", dstDir, err)
+	}
 	if err := os.Chown(dstDir, 0, 0); err != nil {
 		return fmt.Errorf("chown install dir %s root:wheel: %w", dstDir, err)
 	}
 	if out, err := exec.Command("ditto", src, dst).CombinedOutput(); err != nil {
 		return fmt.Errorf("ditto %s -> %s: %w: %s", src, dst, err, out)
+	}
+	if err := refuseSymlinkAt(dst); err != nil {
+		return fmt.Errorf("installed binary %s: %w", dst, err)
 	}
 	if err := os.Chown(dst, 0, 0); err != nil {
 		return fmt.Errorf("chown %s root:wheel: %w", dst, err)
@@ -960,11 +1012,21 @@ func (darwinSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
 // implementation both root-directory seams above are spelled in, so the two
 // cannot drift into different answers to "what does root-owned mean here".
 func ensureRootOwnedDir(dir string, mode fs.FileMode) error {
+	return ensureDirOwnedBy(dir, 0, 0, mode)
+}
+
+// ensureDirOwnedBy is ensureRootOwnedDir with the owner taken explicitly, for
+// ensureLogDir's reason: an unprivileged test cannot chown to root, so without
+// the split a chown EPERM would mask whether the symlink guard ran at all.
+func ensureDirOwnedBy(dir string, uid, gid int, mode fs.FileMode) error {
 	if err := os.MkdirAll(dir, mode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	if err := os.Chown(dir, 0, 0); err != nil {
-		return fmt.Errorf("chown %s root:wheel: %w", dir, err)
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("%s: %w", dir, err)
+	}
+	if err := os.Chown(dir, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", dir, uid, gid, err)
 	}
 	// MkdirAll skips an existing directory, so the chmod is what repairs one.
 	if err := os.Chmod(dir, mode); err != nil {
@@ -1202,6 +1264,9 @@ func writeServiceUserFile(path string, contents []byte, uid, gid int, mode, dirM
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
+	if err := refuseSymlinkAt(dir); err != nil {
+		return fmt.Errorf("%s: %w", dir, err)
+	}
 	// MkdirAll skips an existing directory, so owner and mode are re-applied:
 	// an install over a tree an earlier build left root-owned must repair it,
 	// not leave the daemon unable to read what was just written into it.
@@ -1281,22 +1346,6 @@ func writeRootOnlyFile(path string, contents []byte, uid, gid int, mode fs.FileM
 	return nil
 }
 
-// FileMode reports the permission bits of the file at path. A missing file
-// returns an error satisfying errors.Is(err, fs.ErrNotExist), which callers
-// read as a posture rather than a failure — the same contract ReadFile has.
-//
-// It exists because the installer has to JUDGE one file it does not own: the
-// operator's join token, which is a credential and must not be group- or
-// world-readable. Bytes alone cannot answer that, and os.Stat cannot be called
-// from the orchestration without making it untestable.
-func (darwinSystem) FileMode(path string) (fs.FileMode, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	return fi.Mode().Perm(), nil
-}
-
 // WriteLaunchDaemon writes the plist root:wheel at mode (PlistMode for every
 // daemon but the control plane, which is ServerPlistMode).
 //
@@ -1342,6 +1391,12 @@ func (darwinSystem) ReadRegularFile(path string) ([]byte, error) {
 	return readRegularFile(path)
 }
 
+// ReadRegularFileWithMode is ReadRegularFile plus the permission bits, both
+// read off the same open descriptor as the content. See the System interface.
+func (darwinSystem) ReadRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
+	return readRegularFileWithMode(path)
+}
+
 // readRegularFile is the method above, split out so the on-disk test can
 // exercise it directly — the same split the other privileged writers carry.
 //
@@ -1357,25 +1412,41 @@ func (darwinSystem) ReadRegularFile(path string) ([]byte, error) {
 //     path-based stat beforehand, so there is no window in which the thing
 //     checked and the thing read could be two different files.
 func readRegularFile(path string) ([]byte, error) {
+	b, _, err := readRegularFileWithMode(path)
+	return b, err
+}
+
+// readRegularFileWithMode is readRegularFile plus the permission bits, both
+// read off the SAME open descriptor as the content. It exists for exactly one
+// caller: operatorJoinToken, which has to judge a credential's mode before
+// trusting its content the way every other reader here judges only the type
+// (ReadRegularFile) or only the bytes (ReadFile). Getting the mode from a
+// separate os.Stat call — the original shape, before the 2026-09-23 A1 audit —
+// reopened the exact confused-deputy window readRegularFile's own doc comment
+// describes: two path-based syscalls, no fd binding them together, so a
+// symlink swapped in between them lets the mode judged and the bytes read
+// belong to two different files.
+func readRegularFileWithMode(path string) ([]byte, fs.FileMode, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		// A missing file keeps ReadFile's contract (callers read fs.ErrNotExist as
 		// a posture); a symlink is reported as the refusal it is, because ELOOP
 		// alone reads like a link cycle rather than a swap somebody performed.
 		if errors.Is(err, unix.ELOOP) {
-			return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+			return nil, 0, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", path, err)
+		return nil, 0, fmt.Errorf("stat %s: %w", path, err)
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("open %s: %w: it is a %s", path, ErrNotRegularFile, fi.Mode().Type())
+		return nil, 0, fmt.Errorf("open %s: %w: it is a %s", path, ErrNotRegularFile, fi.Mode().Type())
 	}
-	return io.ReadAll(f)
+	b, err := io.ReadAll(f)
+	return b, fi.Mode().Perm(), err
 }
 
 // ReadFile reads a root-readable file, propagating os.ReadFile's error verbatim
@@ -1609,6 +1680,11 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 	kubeDir := filepath.Join(u.HomeDir, ".kube")
 	if err := os.MkdirAll(kubeDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", kubeDir, err)
+	}
+	// ~/.kube is owned by the target user, so it is the most reachable plant of
+	// all: refuse a link before the (best-effort) chown and the writes below.
+	if err := refuseSymlinkAt(kubeDir); err != nil {
+		return fmt.Errorf("%s: %w", kubeDir, err)
 	}
 	_ = os.Chown(kubeDir, uid, gid)
 	path := filepath.Join(kubeDir, "config")

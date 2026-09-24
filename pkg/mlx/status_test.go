@@ -32,6 +32,10 @@ import (
 const (
 	testRevision = "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567"
 	testEndpoint = "qwen3.models.svc.cluster.local:9123"
+	// testPodRevision is a POD-TEMPLATE revision (a controller-revision-hash
+	// value), deliberately shaped nothing like the model-weights testRevision
+	// so the two cannot be confused in a failure message.
+	testPodRevision = "qwen3-6d4f8b9c7"
 )
 
 // statusBase is the derivation clock's origin. Every step below stamps its own
@@ -77,11 +81,11 @@ type step struct {
 }
 
 func running(name string, v ProbeVerdict) PodState {
-	return PodState{Name: name, Phase: corev1.PodRunning, Probe: v}
+	return PodState{Name: name, Phase: corev1.PodRunning, Probe: v, Revision: testPodRevision}
 }
 
 func serving(name string) PodState {
-	return PodState{Name: name, Phase: corev1.PodRunning, Ready: true, Probe: ProbeServing}
+	return PodState{Name: name, Phase: corev1.PodRunning, Ready: true, Probe: ProbeServing, Revision: testPodRevision}
 }
 
 // runSteps applies each step in order to the running status, asserting the whole
@@ -160,7 +164,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "pending_pod_scheduled_not_started",
 				gen:  1, at: statusBase.Add(1 * time.Minute),
-				obs:              Observation{Pods: []PodState{{Name: "qwen3-0", Phase: corev1.PodPending}}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{{Name: "qwen3-0", Phase: corev1.PodPending, Revision: testPodRevision}}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonPending,
 				wantPhase:        mlxv1alpha1.MLXModelPhasePending,
@@ -170,6 +174,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 				name: "downloading_running_but_surface_silent",
 				gen:  1, at: statusBase.Add(2 * time.Minute),
 				obs: Observation{
+					CurrentRevision:  testPodRevision,
 					Pods:             []PodState{running("qwen3-0", ProbeUnreachable)},
 					ResolvedRevision: testRevision,
 				},
@@ -182,7 +187,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "loading_surface_answers_readiness_has_not_passed",
 				gen:  1, at: statusBase.Add(3 * time.Minute),
-				obs:              Observation{Pods: []PodState{running("qwen3-0", ProbeLoading)}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeLoading)}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonLoading,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseLoading,
@@ -192,7 +197,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "ready_readiness_passing",
 				gen:  1, at: statusBase.Add(4 * time.Minute),
-				obs:              Observation{Pods: []PodState{serving("qwen3-0")}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}},
 				wantReady:        metav1.ConditionTrue,
 				wantReason:       ReasonServing,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseReady,
@@ -203,7 +208,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "ready_again_generation_bumped_transition_time_preserved",
 				gen:  2, at: statusBase.Add(5 * time.Minute),
-				obs:              Observation{Pods: []PodState{serving("qwen3-0")}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}},
 				wantReady:        metav1.ConditionTrue,
 				wantReason:       ReasonServing,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseReady,
@@ -214,7 +219,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "ready_to_loading_regression_on_readiness_loss",
 				gen:  2, at: statusBase.Add(6 * time.Minute),
-				obs:              Observation{Pods: []PodState{running("qwen3-0", ProbeLoading)}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeLoading)}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonLoading,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseLoading,
@@ -224,7 +229,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "regression_to_downloading_when_the_surface_goes_silent",
 				gen:  2, at: statusBase.Add(7 * time.Minute),
-				obs:              Observation{Pods: []PodState{running("qwen3-0", ProbeUnreachable)}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeUnreachable)}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonDownloading,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseDownloading,
@@ -234,7 +239,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "failed_from_pod_failure",
 				gen:  2, at: statusBase.Add(8 * time.Minute),
-				obs:              Observation{Pods: []PodState{{Name: "qwen3-0", Phase: corev1.PodFailed}}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{{Name: "qwen3-0", Phase: corev1.PodFailed, Revision: testPodRevision}}},
 				wantReady:        metav1.ConditionFalse,
 				wantReason:       ReasonPodFailed,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseFailed,
@@ -244,7 +249,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			{
 				name: "recovers_to_ready_and_republishes_the_endpoint",
 				gen:  3, at: statusBase.Add(9 * time.Minute),
-				obs:              Observation{Pods: []PodState{serving("qwen3-0")}},
+				obs:              Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}},
 				wantReady:        metav1.ConditionTrue,
 				wantReason:       ReasonServing,
 				wantPhase:        mlxv1alpha1.MLXModelPhaseReady,
@@ -261,7 +266,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		// address into the Service's endpoints, so anything else would publish an
 		// endpoint that routes nowhere.
 		m := singleReplicaModel()
-		got := DeriveStatus(m, Observation{Pods: []PodState{running("qwen3-0", ProbeServing)}}, statusOptions(), statusBase)
+		got := DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeServing)}}, statusOptions(), statusBase)
 		if got.Phase != mlxv1alpha1.MLXModelPhaseLoading {
 			t.Errorf("status.phase = %q, want %q for a running replica whose readiness has not passed", got.Phase, mlxv1alpha1.MLXModelPhaseLoading)
 		}
@@ -275,7 +280,8 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		m := newModel()
 		m.Generation = 4
 		got := DeriveStatus(m, Observation{
-			Pods: []PodState{serving("qwen3-0"), running("qwen3-1", ProbeLoading)},
+			CurrentRevision: testPodRevision,
+			Pods:            []PodState{serving("qwen3-0"), running("qwen3-1", ProbeLoading)},
 		}, statusOptions(), statusBase)
 		if got.Phase != mlxv1alpha1.MLXModelPhaseLoading {
 			t.Errorf("status.phase = %q, want %q with 1 of 2 replicas ready", got.Phase, mlxv1alpha1.MLXModelPhaseLoading)
@@ -301,7 +307,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 			t.Run(order.name, func(t *testing.T) {
 				m := newModel()
 				m.Generation = 7
-				got := DeriveStatus(m, Observation{Pods: order.pods}, statusOptions(), statusBase)
+				got := DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: order.pods}, statusOptions(), statusBase)
 				if got.Phase != mlxv1alpha1.MLXModelPhaseDownloading {
 					t.Errorf("status.phase = %q, want %q: the replica still fetching weights decides when the model serves",
 						got.Phase, mlxv1alpha1.MLXModelPhaseDownloading)
@@ -322,7 +328,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		// replica outranks the serving one: reporting Ready here would publish an
 		// endpoint for half the requested capacity.
 		m := newModel()
-		got := DeriveStatus(m, Observation{Pods: []PodState{serving("qwen3-0")}}, statusOptions(), statusBase)
+		got := DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}}, statusOptions(), statusBase)
 		if got.Phase != mlxv1alpha1.MLXModelPhasePending {
 			t.Errorf("status.phase = %q, want %q with 1 of 2 replicas created", got.Phase, mlxv1alpha1.MLXModelPhasePending)
 		}
@@ -334,7 +340,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		// has not begun, so the model is further from serving than the observed
 		// one suggests. Pod management is Parallel, so this is an informer-lag
 		// window rather than a steady state.
-		got = DeriveStatus(m, Observation{Pods: []PodState{running("qwen3-0", ProbeLoading)}}, statusOptions(), statusBase)
+		got = DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeLoading)}}, statusOptions(), statusBase)
 		if got.Phase != mlxv1alpha1.MLXModelPhasePending {
 			t.Errorf("status.phase = %q, want %q: an uncreated replica outranks a loading one",
 				got.Phase, mlxv1alpha1.MLXModelPhasePending)
@@ -346,7 +352,8 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		// say "this will not recover" about a model currently serving traffic.
 		m := singleReplicaModel()
 		got := DeriveStatus(m, Observation{
-			Pods: []PodState{serving("qwen3-0"), {Name: "qwen3-1", Phase: corev1.PodFailed}},
+			CurrentRevision: testPodRevision,
+			Pods:            []PodState{serving("qwen3-0"), {Name: "qwen3-1", Phase: corev1.PodFailed, Revision: testPodRevision}},
 		}, statusOptions(), statusBase)
 		if got.Phase != mlxv1alpha1.MLXModelPhaseReady {
 			t.Errorf("status.phase = %q, want %q", got.Phase, mlxv1alpha1.MLXModelPhaseReady)
@@ -378,7 +385,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		m := singleReplicaModel()
 		m.Status.ResolvedRevision = testRevision
 
-		got := DeriveStatus(m, Observation{Pods: []PodState{running("qwen3-0", ProbeUnreachable)}}, statusOptions(), statusBase)
+		got := DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeUnreachable)}}, statusOptions(), statusBase)
 		if got.ResolvedRevision != testRevision {
 			t.Errorf("status.resolvedRevision = %q, want %q preserved when the observation no longer knows it",
 				got.ResolvedRevision, testRevision)
@@ -387,6 +394,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		const next = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		m.Status = got
 		got = DeriveStatus(m, Observation{
+			CurrentRevision:  testPodRevision,
 			Pods:             []PodState{running("qwen3-0", ProbeLoading)},
 			ResolvedRevision: next,
 		}, statusOptions(), statusBase)
@@ -401,7 +409,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 		m.Spec.Port = 0 // fall back to the operator default, exactly as Render does
 		opts := statusOptions()
 		opts.ClusterDomain = "k3sm.internal"
-		got := DeriveStatus(m, Observation{Pods: []PodState{serving("qwen3-0")}}, opts, statusBase)
+		got := DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}}, opts, statusBase)
 		want := ServiceName(m.Name) + ".models.svc.k3sm.internal:8080"
 		if got.Endpoint != want {
 			t.Errorf("status.endpoint = %q, want %q", got.Endpoint, want)
@@ -411,7 +419,7 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 	t.Run("no_endpoint_when_the_port_cannot_be_resolved", func(t *testing.T) {
 		m := singleReplicaModel()
 		m.Spec.Port = 0
-		got := DeriveStatus(m, Observation{Pods: []PodState{serving("qwen3-0")}}, StatusOptions{}, statusBase)
+		got := DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}}, StatusOptions{}, statusBase)
 		if got.Endpoint != "" {
 			t.Errorf("status.endpoint = %q, want empty: an unresolvable port must not become :0", got.Endpoint)
 		}
@@ -419,10 +427,10 @@ func TestStatusConditionsDerivedFromPodProbeState(t *testing.T) {
 
 	t.Run("derivation_does_not_mutate_the_model", func(t *testing.T) {
 		m := singleReplicaModel()
-		m.Status = DeriveStatus(m, Observation{Pods: []PodState{serving("qwen3-0")}}, statusOptions(), statusBase)
+		m.Status = DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{serving("qwen3-0")}}, statusOptions(), statusBase)
 		before := m.DeepCopy()
 
-		_ = DeriveStatus(m, Observation{Pods: []PodState{running("qwen3-0", ProbeLoading)}}, statusOptions(), statusBase.Add(time.Minute))
+		_ = DeriveStatus(m, Observation{CurrentRevision: testPodRevision, Pods: []PodState{running("qwen3-0", ProbeLoading)}}, statusOptions(), statusBase.Add(time.Minute))
 
 		if !equalStatus(m.Status, before.Status) {
 			t.Errorf("DeriveStatus() mutated the input model status: got %+v, want %+v", m.Status, before.Status)
@@ -499,6 +507,7 @@ func TestPhaseFromConditionsIsAProjectionOfTheReadyCondition(t *testing.T) {
 func equalStatus(a, b mlxv1alpha1.MLXModelStatus) bool {
 	if a.Phase != b.Phase || a.Endpoint != b.Endpoint ||
 		a.ResolvedRevision != b.ResolvedRevision || a.ObservedGeneration != b.ObservedGeneration ||
+		a.Replicas != b.Replicas || a.UpdatedReplicas != b.UpdatedReplicas || a.ReadyReplicas != b.ReadyReplicas ||
 		len(a.Conditions) != len(b.Conditions) {
 		return false
 	}
@@ -511,4 +520,167 @@ func equalStatus(a, b mlxv1alpha1.MLXModelStatus) bool {
 		}
 	}
 	return true
+}
+
+// TestDeriveStatusIgnoresOldRevisionReplicas pins revision-aware readiness: a
+// replica counts toward the Ready condition and status.readyReplicas only when
+// it is Ready, not terminating, AND on the owned StatefulSet's current
+// pod-template revision (its updateRevision, matched against each pod's
+// controller-revision-hash label). Without that, a roll to a new template reads
+// as Serving from its first instant, on the strength of the old pods alone.
+func TestDeriveStatusIgnoresOldRevisionReplicas(t *testing.T) {
+	const oldPodRevision = "qwen3-55c7d9f6b8"
+
+	current := func(p PodState) PodState { p.Revision = testPodRevision; return p }
+	old := func(p PodState) PodState { p.Revision = oldPodRevision; return p }
+	unlabelled := func(p PodState) PodState { p.Revision = ""; return p }
+	terminating := func(p PodState) PodState { p.Terminating = true; return p }
+
+	tests := []struct {
+		name     string
+		replicas int32
+		obs      Observation
+
+		wantReady    metav1.ConditionStatus
+		wantReason   string
+		wantMessage  string
+		wantEndpoint string
+		wantReplicas int32
+		wantUpdated  int32
+		wantReadyN   int32
+	}{
+		{
+			name:     "an_old_revision_ready_pod_does_not_satisfy_readiness",
+			replicas: 1,
+			obs: Observation{
+				CurrentRevision: testPodRevision,
+				Pods:            []PodState{old(serving("qwen3-0"))},
+			},
+			wantReady:   metav1.ConditionFalse,
+			wantReason:  ReasonPending,
+			wantMessage: "0 of 1 replicas ready",
+			// The Service still routes to the old replica, so the advisory
+			// endpoint stays published through the roll.
+			wantEndpoint: testEndpoint,
+			wantReplicas: 1, wantUpdated: 0, wantReadyN: 0,
+		},
+		{
+			name:     "a_pod_without_the_hash_label_counts_as_old",
+			replicas: 1,
+			obs: Observation{
+				CurrentRevision: testPodRevision,
+				Pods:            []PodState{unlabelled(serving("qwen3-0"))},
+			},
+			wantReady:    metav1.ConditionFalse,
+			wantReason:   ReasonPending,
+			wantMessage:  "0 of 1 replicas ready",
+			wantEndpoint: testEndpoint,
+			wantReplicas: 1, wantUpdated: 0, wantReadyN: 0,
+		},
+		{
+			name:     "a_terminating_pod_is_excluded_even_while_ready",
+			replicas: 1,
+			obs: Observation{
+				CurrentRevision: testPodRevision,
+				Pods:            []PodState{terminating(current(serving("qwen3-0")))},
+			},
+			wantReady:   metav1.ConditionFalse,
+			wantReason:  ReasonPending,
+			wantMessage: "0 of 1 replicas ready",
+			// No roll and nothing the Service still routes to: no endpoint.
+			wantEndpoint: "",
+			wantReplicas: 1, wantUpdated: 1, wantReadyN: 0,
+		},
+		{
+			name:     "an_unknown_current_revision_confirms_no_pod",
+			replicas: 1,
+			obs:      Observation{Pods: []PodState{current(serving("qwen3-0"))}},
+
+			wantReady:    metav1.ConditionFalse,
+			wantReason:   ReasonPending,
+			wantMessage:  "0 of 1 replicas ready",
+			wantEndpoint: testEndpoint,
+			wantReplicas: 1, wantUpdated: 0, wantReadyN: 0,
+		},
+		{
+			name:     "mixed_set_counts_are_exact",
+			replicas: 3,
+			obs: Observation{
+				CurrentRevision: testPodRevision,
+				Pods: []PodState{
+					current(serving("qwen3-0")),                                  // counts
+					old(serving("qwen3-1")),                                      // ready, old template
+					unlabelled(serving("qwen3-2")),                               // ready, pre-label
+					terminating(current(serving("qwen3-3"))),                     // current, draining
+					current(running("qwen3-4", ProbeLoading)),                    // current, not ready
+					current(PodState{Name: "qwen3-5", Phase: corev1.PodPending}), // current, pending
+				},
+			},
+			wantReady:    metav1.ConditionFalse,
+			wantReason:   ReasonPending,
+			wantMessage:  "1 of 3 replicas ready",
+			wantEndpoint: testEndpoint,
+			wantReplicas: 6, wantUpdated: 4, wantReadyN: 1,
+		},
+		{
+			name:     "a_finished_roll_serves",
+			replicas: 2,
+			obs: Observation{
+				CurrentRevision: testPodRevision,
+				Pods:            []PodState{current(serving("qwen3-0")), current(serving("qwen3-1"))},
+			},
+			wantReady:    metav1.ConditionTrue,
+			wantReason:   ReasonServing,
+			wantMessage:  "2 of 2 replicas ready",
+			wantEndpoint: testEndpoint,
+			wantReplicas: 2, wantUpdated: 2, wantReadyN: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newModel()
+			m.Spec.Replicas = ptr.To(tt.replicas)
+			got := DeriveStatus(m, tt.obs, statusOptions(), statusBase)
+
+			c := meta.FindStatusCondition(got.Conditions, mlxv1alpha1.MLXModelConditionReady)
+			if c == nil {
+				t.Fatalf("DeriveStatus() published no Ready condition; got %+v", got.Conditions)
+			}
+			if c.Status != tt.wantReady || c.Reason != tt.wantReason {
+				t.Errorf("Ready condition = %s/%s, want %s/%s (message %q)", c.Status, c.Reason, tt.wantReady, tt.wantReason, c.Message)
+			}
+			if !strings.Contains(c.Message, tt.wantMessage) {
+				t.Errorf("Ready condition message = %q, want it to contain %q", c.Message, tt.wantMessage)
+			}
+			if got.Replicas != tt.wantReplicas || got.UpdatedReplicas != tt.wantUpdated || got.ReadyReplicas != tt.wantReadyN {
+				t.Errorf("status replicas/updated/ready = %d/%d/%d, want %d/%d/%d",
+					got.Replicas, got.UpdatedReplicas, got.ReadyReplicas, tt.wantReplicas, tt.wantUpdated, tt.wantReadyN)
+			}
+			if got.Endpoint != tt.wantEndpoint {
+				t.Errorf("status.endpoint = %q, want %q", got.Endpoint, tt.wantEndpoint)
+			}
+		})
+	}
+
+	// The table above matches messages by substring. This pins the one a roll
+	// shows operators verbatim: the stale-template Pending message names the
+	// replica still on the old template, so a reworded message is a deliberate
+	// change and never a silent one.
+	t.Run("stale_template_pending_message_is_verbatim", func(t *testing.T) {
+		m := newModel()
+		m.Spec.Replicas = ptr.To(int32(1))
+		obs := Observation{
+			CurrentRevision: testPodRevision,
+			Pods:            []PodState{old(serving("qwen3-0"))},
+		}
+		got := DeriveStatus(m, obs, statusOptions(), statusBase)
+		c := meta.FindStatusCondition(got.Conditions, mlxv1alpha1.MLXModelConditionReady)
+		if c == nil {
+			t.Fatalf("DeriveStatus() published no Ready condition; got %+v", got.Conditions)
+		}
+		const want = "replica qwen3-0 is not on the current pod template yet (0 of 1 replicas ready)"
+		if c.Reason != ReasonPending || c.Message != want {
+			t.Errorf("Ready condition = %s %q, want %s %q", c.Reason, c.Message, ReasonPending, want)
+		}
+	})
 }

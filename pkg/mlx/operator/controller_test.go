@@ -46,6 +46,10 @@ const (
 	testModelName = "qwen"
 	testImage     = "ghcr.io/k3sm-io/mlx-serve@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 	testPort      = int32(8080)
+	// testPodRevision is the pod-template revision the seeded StatefulSet
+	// reports as its updateRevision and servingPod stamps as each pod's
+	// controller-revision-hash, i.e. the upstream controller's steady state.
+	testPodRevision = "qwen-7f9c6d5b48"
 )
 
 // fixedNow pins condition timestamps so a status comparison is about content.
@@ -187,14 +191,32 @@ func (*net0Error) Error() string   { return "connection refused" }
 func (*net0Error) Timeout() bool   { return false }
 func (*net0Error) Temporary() bool { return false }
 
+// seedCurrentRevision creates the owned StatefulSet with status.updateRevision
+// set, standing in for the upstream StatefulSet controller (which the fake
+// clientset does not run). Without it no pod can be confirmed current and no
+// model reaches Ready.
+func (h *harness) seedCurrentRevision(t *testing.T, revision string) {
+	t.Helper()
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: mlx.StatefulSetName(testModelName), Namespace: testNamespace},
+		Status:     appsv1.StatefulSetStatus{UpdateRevision: revision},
+	}
+	if _, err := h.kube.AppsV1().StatefulSets(testNamespace).Create(context.Background(), sts, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed statefulset: %v", err)
+	}
+}
+
 // servingPod builds a pod carrying the render's own labels, so the reconcile's
-// selector-based observation finds it.
+// selector-based observation finds it, and the controller-revision-hash label
+// of the current pod template (testPodRevision).
 func servingPod(name string, phase corev1.PodPhase, ready bool) *corev1.Pod {
+	labels := mlx.Labels(testModelName)
+	labels[appsv1.ControllerRevisionHashLabelKey] = testPodRevision
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: testNamespace,
-			Labels:    mlx.Labels(testModelName),
+			Labels:    labels,
 		},
 		Status: corev1.PodStatus{Phase: phase, PodIP: "10.42.0.9"},
 	}
@@ -316,6 +338,7 @@ func TestReconcileWritesStatusConditionsFirst(t *testing.T) {
 // status contract, with a ready replica present.
 func TestReconcilePublishesTheEndpointOnlyWhenServing(t *testing.T) {
 	h := newHarness(t, model(), nil)
+	h.seedCurrentRevision(t, testPodRevision)
 	if _, err := h.kube.CoreV1().Pods(testNamespace).
 		Create(context.Background(), servingPod(testModelName+"-0", corev1.PodRunning, true), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("seed pod: %v", err)
@@ -354,6 +377,7 @@ func TestReconcileSplitsDownloadingFromLoadingWithTheProbe(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, model(), func(c *Config) { c.ProbeTransport = tc.transport })
+			h.seedCurrentRevision(t, testPodRevision)
 			if _, err := h.kube.CoreV1().Pods(testNamespace).
 				Create(context.Background(), servingPod(testModelName+"-0", corev1.PodRunning, false), metav1.CreateOptions{}); err != nil {
 				t.Fatalf("seed pod: %v", err)
@@ -646,6 +670,82 @@ func TestObserveProbesOnlyNotReadyReplicas(t *testing.T) {
 	if counter.hosts() == 0 {
 		t.Error("no probe request was made at all")
 	}
+}
+
+// TestObserveReadsTheStatefulSetRevisionSignal pins the wiring behind
+// revision-aware readiness: observe() takes the current pod-template revision
+// from the owned StatefulSet's status.updateRevision, each replica's revision
+// from its controller-revision-hash label (never a label this operator mints),
+// and Terminating from its deletionTimestamp. The pure derivation's gate alone
+// cannot catch these fields being left empty; this one does.
+func TestObserveReadsTheStatefulSetRevisionSignal(t *testing.T) {
+	const oldPodRevision = "qwen-5d8b7c9f64"
+
+	t.Run("revision_and_terminating_populated", func(t *testing.T) {
+		h := newHarness(t, model(), nil)
+		h.seedCurrentRevision(t, testPodRevision)
+
+		oldPod := servingPod(testModelName+"-1", corev1.PodRunning, true)
+		oldPod.Labels[appsv1.ControllerRevisionHashLabelKey] = oldPodRevision
+		unlabelled := servingPod(testModelName+"-2", corev1.PodRunning, true)
+		delete(unlabelled.Labels, appsv1.ControllerRevisionHashLabelKey)
+		draining := servingPod(testModelName+"-3", corev1.PodRunning, true)
+		deleted := metav1.NewTime(fixedNow)
+		draining.DeletionTimestamp = &deleted
+		draining.Finalizers = []string{"example.com/hold"}
+
+		for _, pod := range []*corev1.Pod{
+			servingPod(testModelName+"-0", corev1.PodRunning, true), oldPod, unlabelled, draining,
+		} {
+			if _, err := h.kube.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("seed pod %s: %v", pod.Name, err)
+			}
+		}
+
+		obs, err := h.ctrl.observe(context.Background(), model())
+		if err != nil {
+			t.Fatalf("observe: %v", err)
+		}
+		if obs.CurrentRevision != testPodRevision {
+			t.Errorf("observation current revision = %q, want the StatefulSet's updateRevision %q", obs.CurrentRevision, testPodRevision)
+		}
+		want := map[string]struct {
+			revision    string
+			terminating bool
+		}{
+			testModelName + "-0": {testPodRevision, false},
+			testModelName + "-1": {oldPodRevision, false},
+			testModelName + "-2": {"", false},
+			testModelName + "-3": {testPodRevision, true},
+		}
+		if len(obs.Pods) != len(want) {
+			t.Fatalf("observed %d pods, want %d", len(obs.Pods), len(want))
+		}
+		for _, p := range obs.Pods {
+			w, ok := want[p.Name]
+			if !ok {
+				t.Errorf("observed unexpected pod %s", p.Name)
+				continue
+			}
+			if p.Revision != w.revision {
+				t.Errorf("pod %s revision = %q, want %q (its controller-revision-hash label)", p.Name, p.Revision, w.revision)
+			}
+			if p.Terminating != w.terminating {
+				t.Errorf("pod %s terminating = %t, want %t (deletionTimestamp set: %t)", p.Name, p.Terminating, w.terminating, w.terminating)
+			}
+		}
+	})
+
+	t.Run("no_statefulset_leaves_the_current_revision_unknown", func(t *testing.T) {
+		h := newHarness(t, model(), nil)
+		obs, err := h.ctrl.observe(context.Background(), model())
+		if err != nil {
+			t.Fatalf("observe: %v", err)
+		}
+		if obs.CurrentRevision != "" {
+			t.Errorf("observation current revision = %q with no StatefulSet, want empty", obs.CurrentRevision)
+		}
+	})
 }
 
 type countingTransport struct {

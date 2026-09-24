@@ -143,6 +143,16 @@ type HealthReporter interface {
 	Healthy(ctx context.Context) bool
 }
 
+// PodGetter is an OPTIONAL Runtime capability: a Runtime that resolves a
+// (namespace, name) to one pod itself, deterministically, when several tracked
+// pods share that name during same-name churn. VKProvider.GetPod — the read VK
+// uses to decide create-vs-update and to reap orphans — prefers it over walking
+// GetPods, whose order says nothing about which same-name pod is current.
+type PodGetter interface {
+	// GetPod returns the resolved pod with its status, or a NotFound error.
+	GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error)
+}
+
 // ControlSocketSource is an OPTIONAL Runtime capability: a Runtime backed by an
 // in-process runtimed runtime that can additionally be SERVED on runtimed's gRPC
 // control socket. VKProvider exposes it through ServableRuntime, which the node

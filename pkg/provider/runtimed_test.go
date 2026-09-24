@@ -95,6 +95,11 @@ type fakeRuntimeServer struct {
 	// runtime at all" is assertable (a parked pod has nothing to update in
 	// place, because the runtime holds nothing for it).
 	updateCalls int
+	// statusFIFO queues GetPodStatus transport failures ahead of the fake's
+	// default (a status derived from f.created): a non-nil entry is returned as
+	// the RPC's error, the shape runtimeHoldsPod's fail-toward-keeping branch
+	// exists for — a queried pod that answers with no verdict at all.
+	statusFIFO []error
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
@@ -240,6 +245,11 @@ func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePo
 func (f *fakeRuntimeServer) GetPodStatus(_ context.Context, req *runtimev1.GetPodStatusRequest) (*runtimev1.GetPodStatusResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.statusFIFO) > 0 {
+		var err error
+		err, f.statusFIFO = f.statusFIFO[0], f.statusFIFO[1:]
+		return nil, err
+	}
 	if _, ok := f.created[req.GetPodId()]; !ok {
 		return &runtimev1.GetPodStatusResponse{
 			Error: &rpcstatus.Status{Code: int32(codes.NotFound), Message: "not found"},
