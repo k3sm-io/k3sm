@@ -18,6 +18,7 @@ package executor
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,107 @@ func TestPersistentVolumeControllersKept(t *testing.T) {
 		if disabled[keep] {
 			t.Errorf("controller %q must stay ENABLED (M3.2 provisioner + StatefulSet binding needs it), found disabled in %q", keep, flag)
 		}
+	}
+}
+
+// kcmControllersGolden is the controller registry captured from the pinned
+// kube-controller-manager binary (see the file's header for the capture command).
+const kcmControllersGolden = "testdata/kcm-controllers-v1.36.2.txt"
+
+// TestNodeFailureControllersKept is the B366 tripwire for the controllers that
+// rescue a Pod from a failed node: node-lifecycle-controller (marks the node
+// NotReady and taints it), taint-eviction-controller (evicts Pods off the
+// NoExecute taint; its own registry entry at this minor), and
+// pod-garbage-collector-controller (force-deletes Pods bound to a gone or
+// out-of-service node). k3sm keeps them by the "*" wildcard, so a future
+// tightening of kcmDisabledControllers that drops one would silently strand Pods
+// on a dead node.
+//
+// The token names are pinned against the controller registry of Kubernetes
+// v1.36.2, captured from the pinned binary with `kube-controller-manager --help`
+// ("All controllers" and "Disabled-by-default controllers") into
+// testdata/kcm-controllers-v1.36.2.txt. Asserting membership there is what keeps
+// the absent-from-the-minus-set check from passing vacuously on a misspelled or
+// renamed token, and asserting the token is not disabled-by-default is what makes
+// "kept by the wildcard" true.
+//
+// NodeOutOfServiceVolumeDetach needs no pin here: its enforcement lives in the
+// attach-detach controller, which k3sm deliberately disables (see
+// kcmDisabledControllers); the end-to-end post-heal reaper flow is covered by its
+// own item, not by this argv-level test.
+func TestNodeFailureControllersKept(t *testing.T) {
+	vals := flagValues(controllerManagerArgs(Config{}.withDefaults()), "--controllers")
+	if len(vals) != 1 {
+		t.Fatalf("--controllers must appear exactly once in the controller-manager argv (the last value wins), got %d: %q", len(vals), vals)
+	}
+	flag := vals[0]
+	tokens := strings.Split(flag, ",")
+	if tokens[0] != "*" {
+		t.Fatalf("--controllers must start with * (enable on-by-default), got %q", flag)
+	}
+	disabled := map[string]bool{}
+	for _, tok := range tokens[1:] {
+		name, ok := strings.CutPrefix(tok, "-")
+		if !ok {
+			t.Fatalf("--controllers token %q after * is not a -<name> disable; rendered %q", tok, flag)
+		}
+		disabled[name] = true
+	}
+
+	raw, err := os.ReadFile(kcmControllersGolden)
+	if err != nil {
+		t.Fatalf("read controller registry golden: %v", err)
+	}
+	var header strings.Builder
+	registry := map[string]bool{} // name -> on by default
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case strings.HasPrefix(line, "#"):
+			header.WriteString(line + "\n")
+		default:
+			fields := strings.Fields(line)
+			registry[fields[0]] = !(len(fields) > 1 && fields[1] == "disabled-by-default")
+		}
+	}
+	for _, want := range []string{"`kube-controller-manager --help`", "v1.36.2"} {
+		if !strings.Contains(header.String(), want) {
+			t.Fatalf("%s header must name the capture provenance %q, got:\n%s", kcmControllersGolden, want, header.String())
+		}
+	}
+
+	// The mirror-image hazard: a kcmDisabledControllers entry that is not a real
+	// registry name silently no-ops its "-<name>" token, leaving that controller
+	// ON while the code reads as disabling it. Same vacuousness class as the kept
+	// checks below, so it is pinned here against the same golden registry.
+	t.Run("every disabled entry is a real registry name", func(t *testing.T) {
+		for _, d := range kcmDisabledControllers {
+			if _, known := registry[d]; !known {
+				t.Errorf("kcmDisabledControllers entry %q is not in the v1.36.2 registry: its -token silently does nothing", d)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name, why string
+	}{
+		{"node-lifecycle-controller", "it marks a failed node NotReady and applies the NoExecute taint"},
+		{"taint-eviction-controller", "it evicts Pods off a NoExecute-tainted node"},
+		{"pod-garbage-collector-controller", "it force-deletes Pods bound to a gone or out-of-service node"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			onByDefault, known := registry[tc.name]
+			if !known {
+				t.Fatalf("controller %q is not in the v1.36.2 registry %s: the token is misspelled or renamed, so the kept check below would pass vacuously", tc.name, kcmControllersGolden)
+			}
+			if !onByDefault {
+				t.Fatalf("controller %q is disabled-by-default at v1.36.2, so the * wildcard does not keep it", tc.name)
+			}
+			if disabled[tc.name] {
+				t.Errorf("controller %q must stay ENABLED (%s), found disabled in --controllers %q", tc.name, tc.why, flag)
+			}
+		})
 	}
 }
 
