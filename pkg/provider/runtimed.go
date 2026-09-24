@@ -1545,9 +1545,15 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 		// just wrote — a pod stuck creating, never re-created. Runtimed has said
 		// it holds nothing, so the track goes the way a preflight refusal's does.
 		//
-		// An idempotent re-create (old != nil) keeps its track: runtimed's answer
-		// is about this attempt, and the old track's pod may be the one it holds.
-		if old == nil {
+		//
+		// On an idempotent re-create (old != nil) the refusal alone does not say
+		// whether runtimed holds the pod: its CreatePod validates the box before
+		// it looks the pod up, so a refusal can come from validation while the
+		// old track's pod is still held, or from creation because it was not. The
+		// runtime is asked. A pod it holds keeps its track, since forgetting it
+		// would release the /32 and log tree of a pod that is running; a pod it
+		// does not hold goes the way a first create's refusal does.
+		if old == nil || !r.runtimeHoldsPod(ctx, id) {
 			r.untrackRejectedCreate(pod, t)
 		}
 		return fmt.Errorf("runtimed create pod %s/%s rejected: %s (%s)", pod.Namespace, pod.Name, e.GetMessage(), resp.GetFailureReason().String())
@@ -1565,6 +1571,10 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	id := string(pod.UID)
 	r.mu.Lock()
+	// Identity, not presence: a concurrent CreatePod for the same pod may have
+	// replaced this track between this create's RPC and its refusal, and that
+	// replacement is running its own attempt. Only the track this create
+	// installed is removed.
 	if r.track[id] == t {
 		delete(r.track, id)
 	}
@@ -1574,6 +1584,19 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	t.cancelPostStart()
 	r.releasePodNetwork(pod)
 	r.removePodLogs(pod)
+}
+
+// runtimeHoldsPod reports whether runtimed knows the pod, the question a refused
+// re-create leaves open. A transport failure answers true: forgetting a pod the
+// runtime may hold is the one irreversible outcome here, and the status sync
+// re-asks on its own cadence.
+func (r *runtimedRuntime) runtimeHoldsPod(ctx context.Context, id string) bool {
+	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
+	if err != nil {
+		return true
+	}
+	e := resp.GetError()
+	return e == nil || e.GetCode() == 0
 }
 
 // gpuCeilingBytes reports this node's usable GPU memory ceiling in bytes, or 0
