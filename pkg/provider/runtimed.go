@@ -1376,7 +1376,14 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	// fact (this node's `xcode-select -p`), which the pure pod translation does not
 	// and should not carry — the same split as the socket denies above.
 	applyXcodeToolchain(box.SandboxProfile, pod, r.developerDir)
-	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: pod.Spec.ServiceAccountName, apiServerVIP: r.apiServerVIP}
+	// The namespace service links are resolved HERE, once per pod, where the
+	// live pod (and so spec.enableServiceLinks) is in scope; env.go only
+	// upserts the result into each container and stays free of corev1.
+	links, err := namespaceServiceLinks(ctx, r.client, pod)
+	if err != nil {
+		return nil, err
+	}
+	facts := podFacts{nodeName: r.nodeName, nodeIP: r.nodeIP, serviceAccount: pod.Spec.ServiceAccountName, apiServerVIP: r.apiServerVIP, serviceLinks: links}
 	if err := resolvePodBoxEnv(ctx, box, facts, r.resolver); err != nil {
 		return nil, err
 	}

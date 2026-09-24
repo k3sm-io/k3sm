@@ -51,20 +51,21 @@ func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, facts podFacts
 	return nil
 }
 
-// resolveContainerEnv builds c's final literal env: the service environment
-// first, then envFrom-sourced vars (in source order), then explicit env vars —
-// each layer OVERRIDING the one before on a name collision, the kubelet
-// precedence. It clears value_from/env_from afterwards so
-// the box carries only literal values.
 // podFacts is what the pod's environment can name that the PodBox does not
 // carry: the node it runs on, that node's address, the service account it runs
-// as (the downward API), and the kubernetes Service VIP (the service
-// environment). The provider knows all four at translation time.
+// as (the downward API), the kubernetes Service VIP, and the pod's namespace
+// service links (the service environment). The provider knows all of them at
+// translation time.
 type podFacts struct {
 	nodeName       string
 	nodeIP         string
 	serviceAccount string
 	apiServerVIP   string
+	// serviceLinks is the pod's namespace service-links environment, resolved
+	// once per pod at the translate boundary (namespaceServiceLinks) and
+	// already empty when spec.enableServiceLinks is false. The per-container
+	// loop only upserts it; it never lists Services itself.
+	serviceLinks []*runtimev1.EnvVar
 }
 
 // apiServerServicePort is the port the kubernetes Service in the default
@@ -101,6 +102,17 @@ func apiServerEnv(vip string) []*runtimev1.EnvVar {
 	}
 }
 
+// resolveContainerEnv builds c's final literal env in four layers, each
+// OVERRIDING the one before on a name collision: the namespace service links,
+// then the master (kubernetes) service, then envFrom-sourced vars (in source
+// order), then explicit env vars. It clears value_from/env_from afterwards so
+// the box carries only literal values.
+//
+// Layering the master service AFTER the namespace links is a stated decision:
+// a Service named "kubernetes" in the pod's own namespace renders the same
+// variable names, and here the master service deterministically wins that
+// collision. Upstream builds both into one map, so which one wins there is
+// not something a workload can rely on.
 func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string, facts podFacts, box *runtimev1.PodBox, r mount.Resolver) error {
 	var ordered []*runtimev1.EnvVar
 	idx := make(map[string]int)
@@ -114,6 +126,9 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string,
 		ordered = append(ordered, &runtimev1.EnvVar{Name: name, Value: value})
 	}
 
+	for _, e := range facts.serviceLinks {
+		upsert(e.GetName(), e.GetValue())
+	}
 	for _, e := range apiServerEnv(facts.apiServerVIP) {
 		upsert(e.GetName(), e.GetValue())
 	}
