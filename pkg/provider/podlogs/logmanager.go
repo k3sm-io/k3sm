@@ -86,7 +86,9 @@ type ContainerLogRef struct {
 // the CONTAINER directory (filepath.Dir once, not twice) — a different string
 // from gc.go's pod-directory key, so DirLocks handed out two different mutexes
 // and rotation/GC ran fully concurrently on the same tree with no exclusion at
-// all. Reproduced empirically (TestDirLocksExcludeOnMatchingKeys).
+// all. Pinned per call site by TestCleanLocksOnThePodDirectoryGCUses and
+// TestProcessContainerLocksOnThePodDirectoryGCUses; the concurrent
+// reproduction is TestRotationAndGCSerializeOnSharedPodLock.
 func podDirOfContainerLog(containerLogPath string) string {
 	return filepath.Dir(filepath.Dir(containerLogPath))
 }
@@ -244,6 +246,7 @@ func (c *containerLogManager) Start(ctx context.Context) {
 // Clean removes every file of one container log path — the current file and each
 // rotated or compressed sibling. It is called after a container's instance is
 // pruned, so the glob is the authority on what belonged to it.
+// Not yet wired: nothing in the tree calls Clean from instance pruning.
 func (c *containerLogManager) Clean(_ context.Context, logPath string) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
