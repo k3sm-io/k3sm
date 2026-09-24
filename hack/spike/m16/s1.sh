@@ -146,12 +146,15 @@ else
   tail -20 "$W/frontend-help.txt"; exit 0
 fi
 
+# The file discovery backend takes its root from DYN_FILE_KV (there is no path
+# flag), and the mocker names the served model with --model-name.
 mkdir -p "$W/discovery"
-nohup "$V" -m dynamo.frontend --discovery-backend file --discovery-path "$W/discovery" \
+export DYN_FILE_KV="$W/discovery"
+nohup "$V" -m dynamo.frontend --discovery-backend file \
   --http-port 8111 > "$W/frontend.log" 2>&1 &
 FE=$!
-nohup "$V" -m dynamo.mocker --discovery-backend file --discovery-path "$W/discovery" \
-  --model mock-model > "$W/mocker.log" 2>&1 &
+nohup "$V" -m dynamo.mocker --discovery-backend file \
+  --model-name mock-model > "$W/mocker.log" 2>&1 &
 MK=$!
 READY=no
 for i in $(seq 1 60); do
