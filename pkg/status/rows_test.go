@@ -793,7 +793,126 @@ func TestWorkloadsRowReportsStuckTerminating(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			c := Collector{Kube: fakeKube{nodes: tc.nodes, pods: tc.pods}, Hostname: tc.hostname}
-			row := c.workloadsRow(context.Background(), true, 0, tc.nodes, now)
+			row := c.workloadsRow(context.Background(), true, 0, tc.nodes, nil, now)
+			if row.Severity != tc.wantSev {
+				t.Errorf("severity = %s, want %s", row.Severity, tc.wantSev)
+			}
+			if row.Detail != tc.wantDetail {
+				t.Errorf("detail = %q, want %q", row.Detail, tc.wantDetail)
+			}
+			if row.Remedy != tc.wantRemedy {
+				t.Errorf("remedy = %q, want %q", row.Remedy, tc.wantRemedy)
+			}
+			if len(row.Wide) != len(tc.wantWide) {
+				t.Errorf("wide = %v, want %v", row.Wide, tc.wantWide)
+			}
+			for k, v := range tc.wantWide {
+				if row.Wide[k] != v {
+					t.Errorf("wide[%s] = %q, want %q", k, row.Wide[k], v)
+				}
+			}
+		})
+	}
+}
+
+// TestWorkloadsRowFlagsPodsOnDeletedNodes pins the deleted-node report: a
+// terminating pod whose node object is absent from the list warns once its
+// deletion is older than deletedNodeDebounce, and the remedy force-deletes each
+// pod by name because there is no node left to taint. It is a top-level
+// function rather than a subtest of TestWorkloadsRowReportsStuckTerminating on
+// purpose: the gate runs it by exact name with -run, and a subtest name would
+// not match that pattern.
+func TestWorkloadsRowFlagsPodsOnDeletedNodes(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	notReadyFor := func(name string, d time.Duration) corev1.Node {
+		n := readyNode(name)
+		n.Status.Conditions[0].Status = corev1.ConditionUnknown
+		n.Status.Conditions[0].LastTransitionTime = metav1.NewTime(now.Add(-d))
+		return n
+	}
+	terminating := func(ns, name, node string, age time.Duration) corev1.Pod {
+		p := podIn(corev1.PodRunning)
+		p.Namespace, p.Name = ns, name
+		ts := metav1.NewTime(now.Add(-age))
+		p.DeletionTimestamp = &ts
+		p.Spec.NodeName = node
+		return p
+	}
+	running := func(node string) corev1.Pod {
+		p := podIn(corev1.PodRunning)
+		p.Spec.NodeName = node
+		return p
+	}
+	tests := []struct {
+		name       string
+		nodes      []corev1.Node
+		nodesErr   error
+		pods       []corev1.Pod
+		wantSev    Severity
+		wantDetail string
+		wantRemedy string
+		wantWide   map[string]string
+	}{
+		{
+			name:  "a pod on an absent node past the debounce warns with a per-pod force delete",
+			nodes: []corev1.Node{readyNode("k3sm-mac")},
+			pods: []corev1.Pod{
+				running("k3sm-mac"),
+				terminating("web", "b", "k3sm-gone", time.Hour),
+				terminating("db", "a", "k3sm-gone", 10*time.Minute),
+			},
+			wantSev:    SeverityWarn,
+			wantDetail: "1 running · 2 terminating (2 stuck on deleted node k3sm-gone)",
+			wantRemedy: "kubectl delete pod -n db a --grace-period=0 --force\n" +
+				"kubectl delete pod -n web b --grace-period=0 --force\n" +
+				"# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac",
+			wantWide: map[string]string{"deletedNode": "k3sm-gone", "deletedNodePods": "2"},
+		},
+		{
+			name:       "a pod on an absent node inside the debounce does not warn",
+			nodes:      []corev1.Node{readyNode("k3sm-mac")},
+			pods:       []corev1.Pod{terminating("web", "b", "k3sm-gone", 5*time.Second)},
+			wantSev:    SeverityOK,
+			wantDetail: "0 running · 1 terminating",
+		},
+		{
+			name:       "a failed node list suppresses the check even for an old deletion",
+			nodesErr:   errors.New("the server was unable to return a response"),
+			pods:       []corev1.Pod{terminating("web", "b", "k3sm-gone", time.Hour)},
+			wantSev:    SeverityOK,
+			wantDetail: "0 running · 1 terminating",
+		},
+		{
+			// Spec.NodeName is only set by binding to a Node that existed, so an
+			// empty healthy list plus an old bound terminating pod IS the
+			// all-nodes-deleted case, never bootstrap; pinned so nobody "fixes"
+			// it into suppression later.
+			name:       "an empty healthy node list still flags an old terminating pod",
+			nodes:      nil,
+			pods:       []corev1.Pod{terminating("web", "b", "k3sm-gone", time.Hour)},
+			wantSev:    SeverityWarn,
+			wantDetail: "0 running · 1 terminating (1 stuck on deleted node k3sm-gone)",
+			wantRemedy: "kubectl delete pod -n web b --grace-period=0 --force\n" +
+				"# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac",
+			wantWide: map[string]string{"deletedNode": "k3sm-gone", "deletedNodePods": "1"},
+		},
+		{
+			name:       "a pod on a NotReady node still gets the taint, not the force delete",
+			nodes:      []corev1.Node{notReadyFor("k3sm-mac", 10*time.Minute)},
+			pods:       []corev1.Pod{terminating("web", "b", "k3sm-mac", time.Hour)},
+			wantSev:    SeverityWarn,
+			wantDetail: "0 running · 1 terminating (1 stuck on NotReady k3sm-mac)",
+			wantRemedy: "kubectl taint node k3sm-mac node.kubernetes.io/out-of-service=nodeshutdown:NoExecute\n" +
+				"# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac",
+			wantWide: map[string]string{"stuckNode": "k3sm-mac", "stuckPods": "1"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := Collector{Kube: fakeKube{nodes: tc.nodes, pods: tc.pods}}
+			row := c.workloadsRow(context.Background(), true, 0, tc.nodes, tc.nodesErr, now)
 			if row.Severity != tc.wantSev {
 				t.Errorf("severity = %s, want %s", row.Severity, tc.wantSev)
 			}

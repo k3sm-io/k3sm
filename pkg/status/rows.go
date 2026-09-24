@@ -84,7 +84,8 @@ func (c Collector) Collect(ctx context.Context) Report {
 	// The node list is read ONCE and handed to both rows that use it, so the
 	// node row and the workloads row describe the same snapshot: two reads
 	// could straddle a Ready transition and have one report say a node is up
-	// while the other calls it stuck.
+	// while the other calls it stuck. It is one unpaginated List: k3sm
+	// clusters are a handful of Macs, so a single page always holds them all.
 	var nodes []corev1.Node
 	var nodesErr error
 	if c.Kube != nil && serving {
@@ -112,7 +113,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	rows = append(rows,
 		apiserver,
 		c.nodeRow(serving, role, nodes, nodesErr),
-		c.workloadsRow(ctx, serving, nodePID, nodes, now()),
+		c.workloadsRow(ctx, serving, nodePID, nodes, nodesErr, now()),
 		dataRoot,
 	)
 	// Immediately after the data root it sits beside, and only while it is
@@ -717,6 +718,22 @@ const outOfServiceTaint = "node.kubernetes.io/out-of-service=nodeshutdown:NoExec
 // is only safe for a Mac that is really off.
 const stuckTerminatingCaveat = "# only after confirming the Mac is truly off, not asleep; a force-deleted pod may still be running on a partitioned Mac"
 
+// deletedNodeDebounce is how long a terminating pod whose node object is absent
+// from the node list must have been terminating before it is reported as stuck
+// on a deleted node.
+//
+// It is not zero because the apiserver's list-consistency posture
+// (ConsistentListFromCache) is not yet soaked, so a single stale read could
+// omit a node that exists. A one-shot command cannot re-observe, so this is a
+// grace proxy rather than a repeated-confirmation window: the clock is the
+// pod's own deletion timestamp, the only durable clock a memoryless command
+// has, and a genuinely deleted node's stall is minutes old by the time a
+// human runs status. Deliberately far shorter than stuckTerminatingDebounce:
+// a missing Node object is a rarer, more deliberate event than a NotReady
+// blip from sleep or reboot, so it merits less patience. Revisit alongside
+// the list-consistency soak's close.
+const deletedNodeDebounce = 15 * time.Second
+
 // workloadsRow counts pods by phase across every namespace, plus the vm hosts
 // the control plane has spawned (the one workload kind that is a host process
 // rather than a pod entry).
@@ -729,7 +746,16 @@ const stuckTerminatingCaveat = "# only after confirming the Mac is truly off, no
 // prints the out-of-service taint for that node. nodes is the FULL node list
 // Collect read (never PickNode's answer: the stuck pod is usually on another
 // Mac), and now is the report's clock.
-func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int, nodes []corev1.Node, now time.Time) Row {
+//
+// A terminating pod whose node object is not in the list at all (the node was
+// deleted while the pod was on it) is a separate case: there is no kubelet and
+// no node to taint, so once its deletion is older than deletedNodeDebounce the
+// row warns and the remedy force-deletes each such pod by name. When nodesErr
+// says the node list could not be read, this check is skipped for the whole
+// snapshot, as unknown pods are: an empty list from a failed read would
+// otherwise make every terminating pod look orphaned. A Mac that rejoins under
+// the same hostname re-parents the check to its new node object by design.
+func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int, nodes []corev1.Node, nodesErr error, now time.Time) Row {
 	row := Row{Name: RowWorkloads, Remedy: "k3sm kubectl get pods -A"}
 	if c.Kube == nil || !serving {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
@@ -743,14 +769,26 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 		return row
 	}
 	gone := goneNodes(nodes, now)
+	present := make(map[string]bool, len(nodes))
+	for i := range nodes {
+		present[nodes[i].Name] = true
+	}
 	byPhase := map[corev1.PodPhase]int{}
 	terminating := 0
 	stuckOn := map[string]int{}
+	orphanOn := map[string]bool{}
+	var orphans []*corev1.Pod
 	for i := range pods {
 		if pods[i].DeletionTimestamp != nil {
 			terminating++
-			if gone[pods[i].Spec.NodeName] {
-				stuckOn[pods[i].Spec.NodeName]++
+			node := pods[i].Spec.NodeName
+			switch {
+			case gone[node]:
+				stuckOn[node]++
+			case nodesErr == nil && node != "" && !present[node] &&
+				now.Sub(pods[i].DeletionTimestamp.Time) > deletedNodeDebounce:
+				orphanOn[node] = true
+				orphans = append(orphans, &pods[i])
 			}
 			continue
 		}
@@ -769,10 +807,28 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 		stuck += n
 	}
 	sort.Strings(stuckNodes)
+	deletedNodes := make([]string, 0, len(orphanOn))
+	for name := range orphanOn {
+		deletedNodes = append(deletedNodes, name)
+	}
+	sort.Strings(deletedNodes)
+	sort.Slice(orphans, func(i, j int) bool {
+		if orphans[i].Namespace != orphans[j].Namespace {
+			return orphans[i].Namespace < orphans[j].Namespace
+		}
+		return orphans[i].Name < orphans[j].Name
+	})
 	if terminating > 0 {
 		clause := fmt.Sprintf("%d terminating", terminating)
+		var why []string
 		if stuck > 0 {
-			clause += fmt.Sprintf(" (%d stuck on NotReady %s)", stuck, strings.Join(stuckNodes, ", "))
+			why = append(why, fmt.Sprintf("%d stuck on NotReady %s", stuck, strings.Join(stuckNodes, ", ")))
+		}
+		if len(orphans) > 0 {
+			why = append(why, fmt.Sprintf("%d stuck on deleted node %s", len(orphans), strings.Join(deletedNodes, ", ")))
+		}
+		if len(why) > 0 {
+			clause += " (" + strings.Join(why, "; ") + ")"
 		}
 		clauses = append(clauses, clause)
 	}
@@ -782,16 +838,26 @@ func (c Collector) workloadsRow(ctx context.Context, serving bool, serverPID int
 		}
 	}
 	row.Detail = strings.Join(clauses, " · ")
-	if stuck > 0 {
-		steps := make([]string, 0, len(stuckNodes)+1)
-		for _, name := range stuckNodes {
-			steps = append(steps, "kubectl taint node "+name+" "+outOfServiceTaint)
+	if stuck > 0 || len(orphans) > 0 {
+		steps := make([]string, 0, len(stuckNodes)+len(orphans)+1)
+		row.Wide = map[string]string{}
+		if stuck > 0 {
+			for _, name := range stuckNodes {
+				steps = append(steps, "kubectl taint node "+name+" "+outOfServiceTaint)
+			}
+			row.Wide["stuckNode"] = strings.Join(stuckNodes, ",")
+			row.Wide["stuckPods"] = strconv.Itoa(stuck)
+		}
+		if len(orphans) > 0 {
+			// No node object means no node to taint: each pod is force-deleted
+			// by name instead.
+			for _, p := range orphans {
+				steps = append(steps, "kubectl delete pod -n "+p.Namespace+" "+p.Name+" --grace-period=0 --force")
+			}
+			row.Wide["deletedNode"] = strings.Join(deletedNodes, ",")
+			row.Wide["deletedNodePods"] = strconv.Itoa(len(orphans))
 		}
 		row.Remedy = strings.Join(append(steps, stuckTerminatingCaveat), "\n")
-		row.Wide = map[string]string{
-			"stuckNode": strings.Join(stuckNodes, ","),
-			"stuckPods": strconv.Itoa(stuck),
-		}
 		row.State, row.Severity = StateNotReady, SeverityWarn
 		return row
 	}
