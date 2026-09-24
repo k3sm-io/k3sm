@@ -412,6 +412,52 @@ The node advertises a capability label only when its start-time probe said yes.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
   [Multi-node](multi-node.md).
 
+## A Node Went Offline and Pods Are Stuck Terminating
+
+A Mac that goes away while it is running Pods leaves them stuck: `kubectl get pod` shows them
+`Terminating` indefinitely, because nothing on that Mac can confirm the container is actually gone.
+Work through this in order.
+
+- **Confirm the Mac is genuinely off, not asleep or off-network.** Ping its LAN address, and check
+  how long `kubectl get node <name>` has shown it `NotReady` (the age of that condition, not the
+  node). A Mac that is asleep or briefly disconnected heals itself on wake and needs nothing below;
+  do not tell a node that is coming back that it is out of service.
+- **If the Mac is coming back**, stop after applying the taint below and remove it once the node
+  rejoins. Deleting the node is only for a Mac that is actually leaving the cluster; see
+  [Removing a worker](multi-node.md#removing-a-worker) for that flow instead.
+- **Apply the out-of-service taint** once you are sure the Mac is not coming back on its own:
+
+  ```sh
+  kubectl taint node <name> node.kubernetes.io/out-of-service=nodeshutdown:NoExecute
+  ```
+
+  `k3sm status` prints this exact command in the workloads row once a Pod has been stuck
+  terminating on a `NotReady` node for more than two minutes, so you rarely have to type it from
+  memory. The taint tells the pod garbage collector it may finish deleting Pods bound to that node.
+  It rechecks every 20 seconds (the pinned v1.36 podgc interval), so a stuck Pod clears within
+  about that long of the taint landing.
+- **Remove the taint once the node is back:**
+
+  ```sh
+  kubectl taint node <name> node.kubernetes.io/out-of-service:NoExecute-
+  ```
+- **Force-delete as a last resort**, only if a Pod is still stuck after the taint, or you cannot
+  wait for it:
+
+  ```sh
+  kubectl delete pod <name> --grace-period=0 --force
+  ```
+
+  A force-deleted Pod may still be running on the partitioned Mac. The cluster starts a
+  replacement, and two copies can run at once until the Mac returns and is cleaned up. For a Pod
+  with attached storage the stakes are higher: check the volume's node binding first, because two
+  writers on one volume corrupt data where two stateless copies merely waste cycles.
+- **Prevent one offline node from freezing a rollout.** A DaemonSet's default `RollingUpdate`
+  strategy waits for every existing Pod to be replaced in place, so a node that never reports back
+  holds up the whole rollout. Set `maxSurge: 1` and `maxUnavailable: 0` on the DaemonSet's
+  `updateStrategy.rollingUpdate` so a new Pod comes up beside the old one instead of waiting for a
+  slot an offline node will never free.
+
 ## Next
 
 - [FAQ](faq.md) has quick answers.
