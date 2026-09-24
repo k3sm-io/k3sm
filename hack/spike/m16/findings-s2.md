@@ -10,6 +10,13 @@
 > images and the example are exactly the pin's; nothing was hand-written. Re-running
 > the script overwrites rig state under `$PREFIX`; it does not rewrite this file.
 
+> **Rig substitution.** The host named under Rig below is not the sanctioned M16 rig
+> (the laptop dev Mac: Apple M2, 8 CPU, 8 GiB): it is an
+> outside machine with roughly **8x** that memory budget (Apple M4 Max, 64 GiB), the
+> exact constraint the sanctioned rig's second rung exists to exercise. Whether these
+> runs stand as recorded on that substitute, or must be re-run on the sanctioned rig
+> before acceptance, is a question for the maintainers, not decided here.
+
 ## Question
 
 Does the upstream serving control plane install and run on k3sm with its operator and
@@ -71,7 +78,7 @@ names what the node ran: `main` at c142f19, then the fixes S2 itself produced.
 | 5–6 | + untrack | mocker pods | operator Ready, 6 CRDs Established, ClusterRole dumped, graph accepted, frontend Service created — and no Pod: the operator's default `fsGroup: 1000` is refused by `k3sm-reject-foreign-user`, silently from the operator's side | gap |
 | 7 | + untrack | the node | pods reach runtimed for the first time; `fsGroup` refused outright on the vm class (`fsGroup is not supported on the vm RuntimeClass on this platform: applying it requires idmapped mounts, and this host's virtiofs rejects them`); decode also needs the example's `hf-token-secret` | M11 S3 gate; Secret created |
 | 8 | + untrack | the image | **s2.4 passes live**; runtimed refuses the image's named `USER dynamo` (`the image runs as a named user the host cannot resolve and the guest cannot be told`); the frontend's first pull loses a rename race with the decode pod's pull of the same image | named user: documented future work; **pull race: new runtimed bug** |
-| 9 | + untrack | the container | templates get `runAsUser=<node uid>`; **both containers start** and exit 1: `No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp', '/workspace']` — the image's `/tmp` is 1777 but the rootfs lower shows the host tree's `root 0755`, because the Linux dialect's ownership sidecar is written beside the snapshot and applied nowhere in-guest (ledger M11.2-d4 says "sidecar apply") | **new runtimed gap** |
+| 9 | + untrack | the container | templates get `runAsUser=<node uid>`; **both containers start** and exit 1: `No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp', '/workspace']` — the image's `/tmp` is 1777 but the rootfs lower shows the host tree's `root 0755`, because the Linux dialect's ownership sidecar is written beside the snapshot and applied nowhere in-guest (`runtimed/docs/PHASES.md` M11.2-d4 — the ownership sidecar, `ownership.jsonl`, apply step; not the native-sidecar-container concept at k3sm's own `docs/PHASES.md` M10.2) | **new runtimed gap** |
 | 10 | + untrack | the script | with `TMPDIR`/`HF_HOME` on the tmpfs the **frontend is Running and Ready** 72 s after creation, its Kubernetes discovery daemon watching EndpointSlices and DynamoWorkerMetadata; the script took the first 200 from `/v1/models` (an empty list) as discovery complete and asked for a completion against no model (404). The decode pod lost the pull race again at +42 s and k3sm's back-off retry had its container running at +88 s | script: wait for a listed model |
 | 11 | + untrack | the frontend's cache | **all three pods Running 1/1**; the worker registered (DynamoWorkerMetadata + EndpointSlice, model card published, endpoint on its guest address `192.168.64.15:42759`, not its pod IP `100.64.0.5`); the frontend saw the instance, then retried every 30 s on `creating MDC blobs dir /home/dynamo/.cache/dynamo/mdc/blobs: Permission denied` — the model-card cache is `$HOME/.cache/dynamo/mdc`, HOME only | HOME moves to the tmpfs |
 | 12 | + untrack | **the dial** | with `HOME` on the tmpfs too, the frontend materialized nothing for a different reason: every fetch of the worker's model card at `http://192.168.64.16:9090/v1/metadata/…` failed `No route to host`. The worker bound and published its guest lease (`192.168.64.16`, eth0); the frontend sits at `192.168.64.17` on the same NAT segment; darwin-net's own measurement (`pkg/podnet/doc.go:152`, `docs/user/limitations.md` "from a vm Pod's guest to another vm Pod's guest on the same node: blocked") is reproduced exactly | **HALT — R4(b)** |
@@ -102,9 +109,11 @@ fix. File:line against the trees named under Rig.
    carries numeric ids only; named as future apis work in the code.
 8. **The ownership sidecar is written and never applied in-guest**
    (`runtimed/pkg/image/unpack.go:495` writes it; `ReadOwnershipSidecar` has only test
-   callers; `pkg/guestinit` has no apply step; `docs/PHASES.md` M11.2-d4 lists "sidecar
-   apply" as delivered). Every file in a vm rootfs is root-owned with host modes, so a
-   non-root image has no writable directory in its own tree.
+   callers; `pkg/guestinit` has no apply step; `runtimed/docs/PHASES.md` M11.2-d4 — the
+   ownership sidecar (`ownership.jsonl`) apply step, not the native-sidecar-container
+   concept at k3sm's own `docs/PHASES.md` M10.2 — lists it as delivered). Every file
+   in a vm rootfs is root-owned with host modes, so a non-root image has no writable
+   directory in its own tree.
 9. **Two concurrent pulls of one reference race at the index commit**
    (`runtimed/pkg/image/index.go:437-456`: the temp name is `.index-<key>`, shared by
    both writers; the loser's rename fails ENOENT). Deterministic for a two-pod graph on

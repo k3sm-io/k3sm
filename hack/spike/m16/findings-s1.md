@@ -9,6 +9,13 @@
 > the memory crate linked. Re-running the script overwrites rig state under `$PREFIX`;
 > it does not rewrite this file.
 
+> **Rig substitution.** The host named under Rig below is not the sanctioned M16 rig
+> (the laptop dev Mac: Apple M2, 8 CPU, 8 GiB): it is an
+> outside machine with roughly **8x** that memory budget (Apple M4 Max, 64 GiB), the
+> exact constraint the sanctioned rig's second rung exists to exercise. Whether these
+> runs stand as recorded on that substitute, or must be re-run on the sanctioned rig
+> before acceptance, is a question for the maintainers, not decided here.
+
 ## Question
 
 Does the upstream serving framework (Apache-2.0) build from source on darwin/arm64
