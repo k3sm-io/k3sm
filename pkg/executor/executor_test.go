@@ -157,6 +157,18 @@ func TestNodeFailureControllersKept(t *testing.T) {
 		}
 	}
 
+	// The mirror-image hazard: a kcmDisabledControllers entry that is not a real
+	// registry name silently no-ops its "-<name>" token, leaving that controller
+	// ON while the code reads as disabling it. Same vacuousness class as the kept
+	// checks below, so it is pinned here against the same golden registry.
+	t.Run("every disabled entry is a real registry name", func(t *testing.T) {
+		for _, d := range kcmDisabledControllers {
+			if _, known := registry[d]; !known {
+				t.Errorf("kcmDisabledControllers entry %q is not in the v1.36.2 registry: its -token silently does nothing", d)
+			}
+		}
+	})
+
 	for _, tc := range []struct {
 		name, why string
 	}{
