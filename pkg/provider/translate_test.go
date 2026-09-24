@@ -410,7 +410,7 @@ func TestToPodBoxInjectsClusterDNSEnv(t *testing.T) {
 		if err != nil {
 			t.Fatalf("toPodBox: %v", err)
 		}
-		if err := resolvePodBoxEnv(context.Background(), box, "node", "10.0.0.5", nil); err != nil {
+		if err := resolvePodBoxEnv(context.Background(), box, podFacts{nodeName: "node", nodeIP: "10.0.0.5"}, nil); err != nil {
 			t.Fatalf("resolvePodBoxEnv: %v", err)
 		}
 		if got := containerEnv(box.GetContainers()[0])[dns.EnvDNSServer]; got != wantServer {

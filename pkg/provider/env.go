@@ -35,28 +35,73 @@ import (
 // mutates the box's containers in place (clearing value_from / env_from) and is
 // idempotent on an already-literal box.
 //
-// nodeName / nodeIP supply the spec.nodeName / status.hostIP downward-API values
-// the PodBox itself cannot carry (the provider knows the node it runs on).
-func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, nodeName, nodeIP string, r mount.Resolver) error {
+// facts supplies the downward-API values the PodBox itself cannot carry.
+func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, facts podFacts, r mount.Resolver) error {
 	ns := box.GetNamespace()
 	for _, c := range box.GetInitContainers() {
-		if err := resolveContainerEnv(ctx, c, ns, nodeName, nodeIP, box, r); err != nil {
+		if err := resolveContainerEnv(ctx, c, ns, facts, box, r); err != nil {
 			return fmt.Errorf("init container %s: %w", c.GetName(), err)
 		}
 	}
 	for _, c := range box.GetContainers() {
-		if err := resolveContainerEnv(ctx, c, ns, nodeName, nodeIP, box, r); err != nil {
+		if err := resolveContainerEnv(ctx, c, ns, facts, box, r); err != nil {
 			return fmt.Errorf("container %s: %w", c.GetName(), err)
 		}
 	}
 	return nil
 }
 
-// resolveContainerEnv builds c's final literal env: envFrom-sourced vars first (in
-// source order), then explicit env vars (which OVERRIDE envFrom on a name
-// collision — the kubelet precedence). It clears value_from/env_from afterwards so
+// resolveContainerEnv builds c's final literal env: the service environment
+// first, then envFrom-sourced vars (in source order), then explicit env vars —
+// each layer OVERRIDING the one before on a name collision, the kubelet
+// precedence. It clears value_from/env_from afterwards so
 // the box carries only literal values.
-func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns, nodeName, nodeIP string, box *runtimev1.PodBox, r mount.Resolver) error {
+// podFacts is what the pod's environment can name that the PodBox does not
+// carry: the node it runs on, that node's address, the service account it runs
+// as (the downward API), and the kubernetes Service VIP (the service
+// environment). The provider knows all four at translation time.
+type podFacts struct {
+	nodeName       string
+	nodeIP         string
+	serviceAccount string
+	apiServerVIP   string
+}
+
+// apiServerServicePort is the port the kubernetes Service in the default
+// namespace serves the API on. The apiserver's own reconciler publishes that
+// Service with port 443 whatever its secure port is (k3sm's is 6444, behind the
+// Service proxy), and the kubelet renders the variables below from the Service,
+// not from the endpoint.
+const apiServerServicePort = "443"
+
+// apiServerEnv is the service environment the kubelet gives EVERY container for
+// the kubernetes Service, whatever enableServiceLinks says: the master service
+// is always injected. It is what client-go's InClusterConfig reads
+// (KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT), so a container without
+// it cannot use in-cluster config at all, however reachable the VIP is. The
+// docker-links spelling rides along because the kubelet emits it and a workload
+// may read it.
+//
+// An empty VIP yields nothing: a node that publishes no API Service (a rootless
+// dev tier) must not invent one.
+func apiServerEnv(vip string) []*runtimev1.EnvVar {
+	if vip == "" {
+		return nil
+	}
+	link := "tcp://" + vip + ":" + apiServerServicePort
+	return []*runtimev1.EnvVar{
+		{Name: "KUBERNETES_SERVICE_HOST", Value: vip},
+		{Name: "KUBERNETES_SERVICE_PORT", Value: apiServerServicePort},
+		{Name: "KUBERNETES_SERVICE_PORT_HTTPS", Value: apiServerServicePort},
+		{Name: "KUBERNETES_PORT", Value: link},
+		{Name: "KUBERNETES_PORT_443_TCP", Value: link},
+		{Name: "KUBERNETES_PORT_443_TCP_PROTO", Value: "tcp"},
+		{Name: "KUBERNETES_PORT_443_TCP_PORT", Value: apiServerServicePort},
+		{Name: "KUBERNETES_PORT_443_TCP_ADDR", Value: vip},
+	}
+}
+
+func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns string, facts podFacts, box *runtimev1.PodBox, r mount.Resolver) error {
 	var ordered []*runtimev1.EnvVar
 	idx := make(map[string]int)
 	upsert := func(name, value string) {
@@ -69,13 +114,16 @@ func resolveContainerEnv(ctx context.Context, c *runtimev1.Container, ns, nodeNa
 		ordered = append(ordered, &runtimev1.EnvVar{Name: name, Value: value})
 	}
 
+	for _, e := range apiServerEnv(facts.apiServerVIP) {
+		upsert(e.GetName(), e.GetValue())
+	}
 	for _, ef := range c.GetEnvFrom() {
 		if err := expandEnvFrom(ctx, ef, ns, r, upsert); err != nil {
 			return err
 		}
 	}
 	for _, e := range c.GetEnv() {
-		val, skip, err := resolveEnvValue(ctx, e, ns, nodeName, nodeIP, box, r)
+		val, skip, err := resolveEnvValue(ctx, e, ns, facts, box, r)
 		if err != nil {
 			return err
 		}
@@ -130,14 +178,14 @@ func applySorted(data map[string][]byte, prefix string, upsert func(name, value 
 
 // resolveEnvValue resolves a single EnvVar to its literal value. skip is true when
 // the var sources from an optional ConfigMap/Secret/key that is absent.
-func resolveEnvValue(ctx context.Context, e *runtimev1.EnvVar, ns, nodeName, nodeIP string, box *runtimev1.PodBox, r mount.Resolver) (value string, skip bool, err error) {
+func resolveEnvValue(ctx context.Context, e *runtimev1.EnvVar, ns string, facts podFacts, box *runtimev1.PodBox, r mount.Resolver) (value string, skip bool, err error) {
 	vf := e.GetValueFrom()
 	if vf == nil {
 		return e.GetValue(), false, nil
 	}
 	switch {
 	case vf.GetFieldRef() != nil:
-		v, err := resolveDownwardEnv(box, nodeName, nodeIP, vf.GetFieldRef().GetFieldPath())
+		v, err := resolveDownwardEnv(box, facts, vf.GetFieldRef().GetFieldPath())
 		return v, false, err
 	case vf.GetConfigMapKeyRef() != nil:
 		sel := vf.GetConfigMapKeyRef()
@@ -207,7 +255,7 @@ func fetchData(ctx context.Context, r mount.Resolver, kind, ns, name string, opt
 // namespace/uid, metadata.labels['k']/annotations['k'], spec.nodeName,
 // status.podIP(s), status.hostIP. An unknown path errors (fail loud, not silent
 // empty).
-func resolveDownwardEnv(box *runtimev1.PodBox, nodeName, nodeIP, fieldPath string) (string, error) {
+func resolveDownwardEnv(box *runtimev1.PodBox, facts podFacts, fieldPath string) (string, error) {
 	if key, ok := subscript(fieldPath, "metadata.labels"); ok {
 		return box.GetLabels()[key], nil
 	}
@@ -222,11 +270,13 @@ func resolveDownwardEnv(box *runtimev1.PodBox, nodeName, nodeIP, fieldPath strin
 	case "metadata.uid":
 		return box.GetPodId(), nil
 	case "spec.nodeName":
-		return nodeName, nil
+		return facts.nodeName, nil
+	case "spec.serviceAccountName":
+		return facts.serviceAccount, nil
 	case "status.podIP", "status.podIPs":
 		return box.GetPodIp(), nil
 	case "status.hostIP", "status.hostIPs":
-		return nodeIP, nil
+		return facts.nodeIP, nil
 	default:
 		return "", fmt.Errorf("unsupported downward-API field path %q", fieldPath)
 	}
