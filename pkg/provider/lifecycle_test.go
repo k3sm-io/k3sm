@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -27,8 +28,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/clock"
 	testclock "k8s.io/utils/clock/testing"
 
@@ -344,5 +347,54 @@ func TestDeletePodForceDeletesFromAPIForPromptRemoval(t *testing.T) {
 	_, err := client.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("pod still in the apiserver after DeletePod (get err=%v) — it lingers the full deletionGracePeriodSeconds", err)
+	}
+}
+
+// TestDeletePodForceDeleteIsPinnedToThePodUID proves the prompt removal above
+// cannot take a pod that merely shares the name: the apiserver delete carries a
+// UID precondition for the pod being torn down, and a 409 for another UID is
+// swallowed like NotFound. A pod name is reused the moment its predecessor is
+// gone (a StatefulSet replaces web-0 as web-0), and Virtual Kubelet can tear the
+// predecessor down a second time after that moment (it re-syncs the key on the
+// predecessor's delete event, finds the replacement not yet in its lister, asks
+// the provider by name, and calls DeletePod again), so the unpinned delete
+// removed the replacement from the apiserver.
+//
+// Fails-before: the delete carried no precondition, so the fake tracker (which
+// keys by name) removed the replacement and the captured options had no UID.
+func TestDeletePodForceDeleteIsPinnedToThePodUID(t *testing.T) {
+	r, _ := newLifecycleFake(t, nil)
+	old := lifecyclePod("del", 30, corev1.Container{Name: "c0", Command: []string{"/web"}})
+	old.UID = "uid-old"
+	replacement := old.DeepCopy()
+	replacement.UID = "uid-new"
+	// The apiserver already holds the REPLACEMENT under the same name when the
+	// predecessor's second teardown runs.
+	client := fake.NewSimpleClientset(replacement)
+	var captured []metav1.DeleteOptions
+	client.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		captured = append(captured, da.GetDeleteOptions())
+		if pre := da.GetDeleteOptions().Preconditions; pre != nil && pre.UID != nil && string(*pre.UID) != string(replacement.UID) {
+			return true, nil, apierrors.NewConflict(corev1.Resource("pods"), old.Name, fmt.Errorf("uid precondition failed"))
+		}
+		return false, nil, nil
+	})
+	r.client = client
+
+	if err := r.CreatePod(context.Background(), old); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if err := r.DeletePod(context.Background(), old); err != nil {
+		t.Fatalf("DeletePod must swallow the precondition conflict, got %v", err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("captured %d deletes, want 1", len(captured))
+	}
+	if pre := captured[0].Preconditions; pre == nil || pre.UID == nil || string(*pre.UID) != string(old.UID) {
+		t.Fatalf("force-delete carried no UID precondition for the pod being torn down (got %+v); a same-name successor is not protected", captured[0].Preconditions)
+	}
+	if _, err := client.CoreV1().Pods(replacement.Namespace).Get(context.Background(), replacement.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("the replacement pod was removed from the apiserver by its predecessor's teardown: %v", err)
 	}
 }

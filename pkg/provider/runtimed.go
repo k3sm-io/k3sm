@@ -1776,13 +1776,22 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 // deletionGracePeriodSeconds under VK's delayed-delete fallback. Best-effort: a nil
 // client (unit tests) or a NotFound (already gone) is a no-op; any other error is
 // logged and swallowed so the delete path never blocks on the API.
+//
+// The delete is pinned to this pod's UID, as the kubelet's is: a pod name is
+// reused the moment its predecessor is gone, and Virtual Kubelet can drive
+// DeletePod for the predecessor after that moment, so an unpinned delete took
+// the replacement. A 409 for another UID is swallowed like NotFound: the pod
+// that is there is not the one being removed.
 func (r *runtimedRuntime) forceDeleteFromAPI(ctx context.Context, pod *corev1.Pod) {
 	if r.client == nil {
 		return
 	}
 	zero := int64(0)
-	err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
-	if err != nil && !apierrors.IsNotFound(err) {
+	err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		Preconditions:      metav1.NewUIDPreconditions(string(pod.UID)),
+	})
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		r.log.Warn("force-delete pod from apiserver after teardown",
 			"namespace", pod.Namespace, "name", pod.Name, "err", err)
 	}
