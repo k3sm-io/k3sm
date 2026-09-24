@@ -664,8 +664,10 @@ datastore operational model.
 ### Mesh MTU Spread and the UDP Segmentation Gap
 
 A k3sm node presents a wide MTU spread: loopback pod aliases sit at 16384, and the mesh
-WireGuard tunnel sits at 1380. TCP flows crossing the mesh are MSS-clamped by a pf rule the
-mesh loads, so they stay inside the tunnel MTU. UDP gets no such clamp by design, because the
+WireGuard tunnel sits at 1380. The mesh loads a TCP MSS-clamp rule into its own
+pf anchor, but a stock macOS install neither enables pf nor references that anchor from the
+main ruleset, so the clamp is not currently in effect; until that wiring lands, TCP and UDP
+flows alike can carry loopback-sized segments toward the tunnel. UDP gets no such clamp by design, because the
 scrub rule is TCP-only, so a UDP datagram sized for the loopback path can still exceed the
 tunnel MTU when it crosses the mesh. One unattributed host kernel panic in the segmentation-
 offload path is on record on macOS 26.6.2 with the mesh active; the evidence collected at the
