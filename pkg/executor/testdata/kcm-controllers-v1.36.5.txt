@@ -1,5 +1,5 @@
-# kube-controller-manager controller registry, Kubernetes v1.36.2.
-# Captured from the pinned v1.36.2 binary with `kube-controller-manager --help`:
+# kube-controller-manager controller registry, Kubernetes v1.36.5.
+# Captured from the pinned v1.36.5 binary with `kube-controller-manager --help`:
 # the "All controllers" list of the --controllers flag, one name per line.
 # A name followed by "disabled-by-default" is in the "Disabled-by-default
 # controllers" list, so the "*" wildcard does NOT enable it.

@@ -39,20 +39,23 @@ import (
 // PROVENANCE. Upstream's checksums.txt covers only the linux and windows assets.
 // The darwin binaries are Developer-ID signed after the checksummed build, so the
 // released bytes match neither that file (which omits them) nor the SLSA
-// provenance subject digest (874075…, which is the pre-signing artifact). The pin
+// provenance subject digest (efe594…, which is the pre-signing artifact). The pin
 // below is therefore the sha256 of the RELEASED darwin-arm64 asset itself,
-// recorded 2026-09-02 from
+// recorded 2026-09-25 from
 //
-//	https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.darwin-arm64
+//	https://github.com/docker/buildx/releases/download/v0.37.1/buildx-v0.37.1.darwin-arm64
 //
-// (Mach-O 64-bit arm64, 56973344 bytes, "Developer ID Application: Tonis Tiigi
-// (F32M533787)"). Re-record a bump the same way: download the asset, sha256 it,
-// and confirm `codesign -dv` still reports that Developer ID before pinning.
+// (Mach-O 64-bit arm64, 63027232 bytes, notarized, "Developer ID Application:
+// Docker Inc (9BNSXJN65R)"; the digest matches the release API's asset digest).
+// The signer changed at this bump: v0.17.1 was signed "Tonis Tiigi
+// (F32M533787)". Re-record a bump the same way: download the asset, sha256 it,
+// cross-check the release API's asset digest, and confirm `codesign -dv` reports
+// the Docker Inc Developer ID before pinning.
 const (
 	// HostBuildxAsset is the pinned host buildx asset name (the host is darwin/arm64).
 	HostBuildxAsset = "buildx-" + BuildxVersion + "." + hostBuildxPlatform
 	// HostBuildxSHA256 is the released darwin/arm64 asset's sha256.
-	HostBuildxSHA256 = "6f01a55c66edb9bc6f03c035c17f640b0edd672f2fcf0e7389440cc51c403517"
+	HostBuildxSHA256 = "c3cbbc820d578b0aa8158dd62ef1af25a0c8a75ef53331dbe4e219471e1dbe8c"
 
 	// BuilderInstanceName is the buildx builder instance k3sm owns and injects
 	// with --builder. It lives in a k3sm-owned BUILDX_CONFIG store, so the name
@@ -222,7 +225,7 @@ func HostHomeDir(cfgDir string) string {
 // not use and cannot be reached by any hint variable: buildx v0.17.1 calls
 // desktop.PrintBuildDetails unconditionally (commands/build.go, the default arm
 // of the progressMode switch), gated only on desktop.BuildBackendEnabled(),
-// which is
+// which is (unchanged at v0.37.1, where it sits at util/desktop/desktop.go:19-28)
 //
 //	home, err := os.UserHomeDir()        // util/desktop/desktop.go:21-26
 //	_, err = os.Stat(filepath.Join(home, ".docker", "desktop-build", ".lastaccess"))
