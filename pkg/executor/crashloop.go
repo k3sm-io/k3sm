@@ -44,6 +44,20 @@ import (
 // operator clears it — that is the point: a loop that quietly self-resets has no
 // operator in it.
 //
+// The trip has two tiers, and which one applies is fixed at compile time. A
+// failure the daemon cannot classify counts toward CrashLoopThreshold, because
+// it may be transient (a slow network, a port still in TIME_WAIT) and the
+// window is what gives it room to heal. A PERMANENT failure trips the breaker
+// on its first occurrence (RecordPermanent): it is deterministic under the
+// daemon's own environment, so each further lap would reproduce it exactly and
+// buy the operator nothing but a four-lap delay before the park. The only
+// permanent class is a bring-up that fails with ErrNoGoToolchain — no `go` on
+// the launchd PATH, which is the same PATH on every respawn. The classification
+// is an errors.Is against that sentinel at the record site (cmd/k3sm), never a
+// match on build output, and network failures are never permanent: the window
+// exists for them. A permanent entry carries its Remedy so a parked daemon's
+// status row can name the fix instead of pointing at this file.
+//
 // What "give up" means is decided by launchd, not here. The server plist's
 // KeepAlive is a bare `true`, which respawns the job on ANY exit, zero included;
 // there is no exit status that stops it. So a tripped daemon does not exit: it
@@ -98,6 +112,12 @@ type Crash struct {
 	// Detail is the redacted, byte-capped log tail OnComponentExit received —
 	// the same bytes that reach the daemon logger, never the raw component log.
 	Detail string `json:"detail,omitempty"`
+	// Permanent marks a failure that cannot heal on retry under the same
+	// environment; it tripped the breaker on its own (RecordPermanent).
+	Permanent bool `json:"permanent,omitempty"`
+	// Remedy is the operator's fix for a permanent failure: a fixed string this
+	// package owns (NoGoToolchainRemedy), never text taken from a log.
+	Remedy string `json:"remedy,omitempty"`
 }
 
 // CrashRecord is the persisted breaker state.
@@ -194,9 +214,22 @@ func (r *CrashRecord) Prune(now time.Time) {
 // default, because the caller is the only one that knows which of the two it
 // observed.
 func (r *CrashRecord) Record(now time.Time, origin, component, detail string) (tripped bool) {
-	r.Crashes = append(r.Crashes, Crash{At: now, Origin: origin, Component: component, Detail: detail})
+	return r.record(now, Crash{At: now, Origin: origin, Component: component, Detail: detail})
+}
+
+// RecordPermanent appends one PERMANENT failure and trips the breaker on it
+// alone, whatever the window holds — the second tier of the trip (see the
+// design comment above). remedy is the fix the status row names. It reports
+// whether THIS call tripped it: false only when the breaker was already open.
+func (r *CrashRecord) RecordPermanent(now time.Time, origin, component, detail, remedy string) (tripped bool) {
+	return r.record(now, Crash{At: now, Origin: origin, Component: component, Detail: detail,
+		Permanent: true, Remedy: remedy})
+}
+
+func (r *CrashRecord) record(now time.Time, c Crash) (tripped bool) {
+	r.Crashes = append(r.Crashes, c)
 	r.Prune(now)
-	if r.TrippedAt == nil && len(r.Crashes) >= CrashLoopThreshold {
+	if r.TrippedAt == nil && (c.Permanent || len(r.Crashes) >= CrashLoopThreshold) {
 		t := now
 		r.TrippedAt = &t
 		return true

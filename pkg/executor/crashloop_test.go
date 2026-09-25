@@ -207,3 +207,44 @@ func TestCrashRecordMalformedFileIsAnError(t *testing.T) {
 		t.Fatal("a malformed record read as empty; the caller must be told")
 	}
 }
+
+// TestRecordPermanentTripsOnFirst is the second tier of the trip: a permanent
+// failure opens the breaker on its own, an empty window notwithstanding, while
+// the threshold tier (TestCrashRecordTripsAtThresholdInsideWindow's subject) is untouched.
+func TestRecordPermanentTripsOnFirst(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	var r CrashRecord
+	if !r.RecordPermanent(now, CrashOriginBringUp, "provision/kine", "no go", NoGoToolchainRemedy) {
+		t.Fatal("a permanent failure did not trip an empty record")
+	}
+	if !r.Tripped() || !r.TrippedAt.Equal(now) {
+		t.Fatalf("TrippedAt = %v, want %v", r.TrippedAt, now)
+	}
+	last, _ := r.Last()
+	if !last.Permanent || last.Remedy != NoGoToolchainRemedy {
+		t.Errorf("last entry %+v does not carry the permanent mark and remedy", last)
+	}
+	if r.RecordPermanent(now.Add(time.Second), CrashOriginBringUp, "provision/kine", "no go", NoGoToolchainRemedy) {
+		t.Error("an already-open breaker reported tripping again")
+	}
+
+	// Round trip: the mark and the remedy survive the file, which is how the
+	// status row reads them after a respawn.
+	path := CrashLoopPath(t.TempDir())
+	if err := WriteCrashRecord(path, r); err != nil {
+		t.Fatal(err)
+	}
+	back, err := ReadCrashRecord(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bl, _ := back.Last(); !bl.Permanent || bl.Remedy != NoGoToolchainRemedy {
+		t.Errorf("round-tripped entry %+v lost the permanent mark or remedy", bl)
+	}
+
+	// A plain Record is still threshold-tier.
+	var plain CrashRecord
+	if plain.Record(now, CrashOriginBringUp, "provision/kine", "timeout") {
+		t.Error("one unclassified failure tripped the breaker")
+	}
+}
