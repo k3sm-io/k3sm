@@ -430,11 +430,15 @@ echo "    work dir  $WORKDIR"
 
 # ── s1 — the PIN gate. Nothing else runs until it holds. ─────────────────────
 echo "==> s1: kine pin witnesses"
-# $KINE_PORT, NOT the manifest's "kinePort": `k3sm dev` allocates a per-instance kine
-# port into its manifest but never passes it to the server it spawns, so the datastore
-# actually listens on the executor default. Interrogating the manifest port would find
-# nothing and refuse every run.
-if assert_pin "$WORKDIR" "$KINE_PORT"; then
+# The manifest's "kinePort" FIRST, the executor default as the fallback: `k3sm dev`
+# has passed its per-instance kine port to the server it spawns since the dev kine
+# port fix (#157), so the datastore listens on the manifest port. The fallback keeps
+# the witness working against a build older than that fix, where the manifest port
+# was allocated but never used and the datastore sat on the executor default.
+MANIFEST_KINE_PORT="$(sed -nE 's/.*"kinePort"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$INSTANCE_JSON" | head -1)"
+PROBE_KINE_PORT="${MANIFEST_KINE_PORT:-$KINE_PORT}"
+echo "    kine port under witness: ${PROBE_KINE_PORT} (manifest: ${MANIFEST_KINE_PORT:-none}; executor default: ${KINE_PORT})"
+if assert_pin "$WORKDIR" "$PROBE_KINE_PORT"; then
 	ladder ok "s1  the soak is running against the shipped kine pin $WANT_PIN (binary + staging marker + datastore stamp agree)"
 else
 	ladder no "s1  the soak is running against the shipped kine pin (witnesses disagree — see above)"
