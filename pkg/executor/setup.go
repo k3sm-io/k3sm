@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -208,24 +209,25 @@ func ensureWorkDirs(workDir string) error {
 
 // ensureControlPlaneBinaries downloads the prebuilt darwin/arm64 control-plane
 // binaries from kwok-ci/k8s (upstream does not ship them — k/k#118359) and
-// ad-hoc signs each so arm64 Mach-O can exec. It is a no-op if they already
-// exist. Mirrors clusterup.sh step 1.
-func ensureControlPlaneBinaries(ctx context.Context, workDir, kubeVersion string) error {
-	return ensureControlPlaneBinariesInto(ctx, binDir(workDir), kubeVersion)
+// ad-hoc signs each so arm64 Mach-O can exec. On a present set it checks the
+// KubeMarkerName marker instead of downloading (see ensureControlPlaneBinariesVerified).
+// Mirrors clusterup.sh step 1.
+func ensureControlPlaneBinaries(ctx context.Context, logger *slog.Logger, workDir, kubeVersion string) error {
+	return ensureControlPlaneBinariesVerified(ctx, logger, binDir(workDir), kubeVersion, false)
 }
 
-// ensureControlPlaneBinariesInto is ensureControlPlaneBinaries against an
-// explicit bin dir — shared by the boot path (the workdir bin) and StagePayload
-// (an install payload dir).
-func ensureControlPlaneBinariesInto(ctx context.Context, bd, kubeVersion string) error {
-	return ensureControlPlaneBinariesVerified(ctx, bd, kubeVersion, false)
-}
-
-// ensureControlPlaneBinariesVerified is the download path, optionally gated on
+// ensureControlPlaneBinariesVerified is the acquisition path, optionally gated on
 // the pinned digests. verify is true for the packaging producer (StagePayload),
 // whose output is about to be archived and published, and false for the dev boot
 // fallback, which may legitimately run at an unpinned kubeVersion.
-func ensureControlPlaneBinariesVerified(ctx context.Context, bd, kubeVersion string, verify bool) error {
+//
+// A PRESENT set is never re-acquired on the packaging path and never fails the boot
+// path: the boot checks the set's version marker (one small file read, never a hash
+// of the binaries — VerifyDownloadedDigests is packaging-only, because signing has
+// already rewritten the bytes) and reports what it found. A stale set is still a
+// self-consistent control plane, and serving on it beats refusing to serve; see
+// reportStagedControlPlane for the three outcomes.
+func ensureControlPlaneBinariesVerified(ctx context.Context, logger *slog.Logger, bd, kubeVersion string, verify bool) error {
 	if _, err := os.Stat(filepath.Join(bd, "kube-apiserver")); err == nil {
 		if verify {
 			// Already-present bytes are already signed, and signing rewrites the
@@ -234,26 +236,270 @@ func ensureControlPlaneBinariesVerified(ctx context.Context, bd, kubeVersion str
 			return fmt.Errorf("%w: %s already contains control-plane binaries; stage into a clean directory so downloads can be digest-verified before signing",
 				ErrPayloadDigestUnpinned, bd)
 		}
-		return signBinaries(ctx, bd, cpBinaries) // already downloaded; ensure signed
+		if err := signBinaries(ctx, bd, cpBinaries); err != nil { // already acquired; ensure signed
+			return err
+		}
+		reportStagedControlPlane(ctx, logger, bd, kubeVersion)
+		return nil
 	}
+	if err := downloadControlPlane(ctx, bd, kubeVersion, verify); err != nil {
+		return err
+	}
+	// LAST: the marker vouches for a downloaded (and, on the packaging path,
+	// digest-verified) and signed set.
+	return writeKubeMarker(bd, kubeVersion)
+}
+
+// downloadControlPlane fetches the kubeVersion release into dir, makes it
+// executable, verifies the pinned digests when verify is set, and signs the set.
+// It does not write the marker: each caller writes it once the set is where it
+// belongs.
+func downloadControlPlane(ctx context.Context, dir, kubeVersion string, verify bool) error {
 	tag := kubeVersion + "-kwok.0-darwin-arm64"
-	cmd := exec.CommandContext(ctx, "gh", "release", "download", tag,
-		"--repo", "kwok-ci/k8s", "--dir", bd, "--clobber")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runControlPlaneDownload(ctx, tag, dir); err != nil {
 		return fmt.Errorf("download control-plane binaries %s: %w: %s", tag, err, out)
 	}
-	if err := chmodExec(bd); err != nil {
+	if err := chmodExec(dir); err != nil {
 		return err
 	}
 	// BEFORE signing: codesign rewrites the binary, so this is the only moment the
 	// downloaded bytes can be compared against the digests upstream published.
 	if verify {
-		if err := VerifyDownloadedDigests(bd, kubeVersion); err != nil {
+		if err := VerifyDownloadedDigests(dir, kubeVersion); err != nil {
 			return err
 		}
 	}
-	return signBinaries(ctx, bd, cpBinaries)
+	return signBinaries(ctx, dir, cpBinaries)
 }
+
+// runControlPlaneDownload runs the release download. It is a var so a test can stand
+// in for `gh` without a network, the way runKineBuild stands in for `go install`.
+var runControlPlaneDownload = ghReleaseDownload
+
+// ghReleaseDownload runs `gh release download <tag>` from kwok-ci/k8s into dir and
+// returns the combined output so a failure carries gh's own diagnostic.
+func ghReleaseDownload(ctx context.Context, tag, dir string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "gh", "release", "download", tag,
+		"--repo", "kwok-ci/k8s", "--dir", dir, "--clobber")
+	return cmd.CombinedOutput()
+}
+
+// lookPathGh resolves the dev-shell download tool. Like lookPathGo it reads PATH at
+// call time, so a test drives it with t.Setenv rather than a seam.
+func lookPathGh() (string, error) { return exec.LookPath("gh") }
+
+// reportStagedControlPlane reads the marker beside a present set and says what it
+// means. It never fails and never parks the daemon: there is a working binary to
+// run in every branch, which is the deliberate difference from kine's toolchain-less
+// park (a kine that cannot be staged leaves nothing to run).
+//
+//   - marker vouches for kubeVersion: one Info line.
+//   - no marker: a set staged before markers existed. It boots exactly as it always
+//     did, with an Info line saying the version is unvouched; the next payload seed
+//     stamps it, so the state converges without an alarm on every existing install.
+//   - marker names another version: ERROR, with the remedy, and the boot continues
+//     on the present set. When the staged set is OLDER and `gh` is on PATH (a dev
+//     shell), the release is fetched as a fallback first; a daemon has no `gh`, so
+//     there the fallback is skipped silently, with no retries and no breaker entry.
+//     A NEWER staged set is never replaced: that would be the downgrade seedBinDir
+//     refuses.
+func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kubeVersion string) {
+	staged := readKubeMarker(bd)
+	switch {
+	case staged == kubeVersion:
+		logger.Info("control-plane binaries verified "+kubeVersion, "dir", bd)
+		return
+	case staged == "":
+		logger.Info("control-plane binaries present but their version is unvouched (no "+KubeMarkerName+" marker; staged before markers existed)",
+			"pinned", kubeVersion, "dir", bd)
+		return
+	case KubeVersionOlder(kubeVersion, staged):
+		logger.Error("control-plane binaries are NEWER than this build pins; continuing on them, because a control-plane downgrade over a datastore a newer apiserver wrote is refused",
+			"staged", staged, "pinned", kubeVersion, "dir", bd, "remedy", NewerControlPlaneRemedy)
+		return
+	}
+	attrs := []any{"staged", staged, "pinned", kubeVersion, "dir", bd, "remedy", StaleControlPlaneRemedy}
+	if _, err := lookPathGh(); err == nil {
+		dlErr := restageFromRelease(ctx, bd, kubeVersion)
+		if dlErr == nil {
+			logger.Info("control-plane binaries re-staged from the release (dev-shell fallback)",
+				"from", staged, "to", kubeVersion, "dir", bd)
+			return
+		}
+		if errors.Is(dlErr, errTornControlPlaneSet) {
+			logger.Error("control-plane re-stage failed part-way: the set in the work dir may be PARTIALLY replaced (a mix of the staged and the downloaded release) and carries no version marker; the boot continues on it",
+				"staged", staged, "pinned", kubeVersion, "dir", bd, "error", dlErr.Error(), "remedy", StaleControlPlaneRemedy)
+			return
+		}
+		attrs = append(attrs, "download-error", dlErr.Error())
+	}
+	logger.Error("control-plane binaries are STALE: the staged set is not the version this build pins; continuing on the stale set",
+		attrs...)
+}
+
+// restageFromRelease is the dev-shell fallback for a stale set: download into a
+// scratch dir beside the set, so a failed or partial download never touches the
+// working binaries, then move the four into place and write the marker last.
+//
+// The four renames are NOT shadow-staged (no swap of a whole directory), so a
+// failure between them leaves a torn set; it is reported as errTornControlPlaneSet.
+// That is acceptable only because this branch is dev-shell-only: it runs when `gh`
+// is on PATH, which a launchd daemon never has — a packaged install re-stages
+// through seedBinDir from its payload instead.
+func restageFromRelease(ctx context.Context, bd, kubeVersion string) error {
+	tmp, err := os.MkdirTemp(bd, ".kube-restage-")
+	if err != nil {
+		return fmt.Errorf("control-plane re-stage scratch dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if err := downloadControlPlane(ctx, tmp, kubeVersion, false); err != nil {
+		return err
+	}
+	for _, name := range cpBinaries {
+		if _, err := os.Stat(filepath.Join(tmp, name)); err != nil {
+			return fmt.Errorf("release %s carries no %s: %w", kubeVersion, name, err)
+		}
+	}
+	if err := clearKubeMarker(bd); err != nil {
+		return err
+	}
+	for _, name := range cpBinaries {
+		if err := os.Rename(filepath.Join(tmp, name), filepath.Join(bd, name)); err != nil {
+			return fmt.Errorf("%w: install re-staged %s: %w", errTornControlPlaneSet, name, err)
+		}
+	}
+	return writeKubeMarker(bd, kubeVersion)
+}
+
+// errTornControlPlaneSet marks a dev-shell re-stage that failed after it began
+// replacing the set, so the work dir may hold a mix of two releases.
+var errTornControlPlaneSet = errors.New("control-plane set may be partially replaced")
+
+// StaleControlPlaneRemedy is the operator's fix for a staged control-plane set older
+// than the binary's pin: a packaged install carries the pinned set in its payload,
+// and re-installing re-stages it so the next boot seeds the whole set from it.
+const StaleControlPlaneRemedy = "re-run `sudo k3sm install` so the staged payload carries this build's control-plane pin; the next boot re-seeds the whole set"
+
+// NewerControlPlaneRemedy is the operator's fix for a staged control-plane set newer
+// than the binary's pin: the k3sm binary is the older side, so it is the one to move.
+const NewerControlPlaneRemedy = "install a k3sm release whose control-plane pin is at or above the staged set; a control-plane downgrade is refused"
+
+// Control-plane marker. ONE marker covers the whole cpBinaries set, because the set
+// is acquired, verified, and shipped as one release: a presence-only check cannot tell
+// the set this build pins from the set an EARLIER release staged, so without it a
+// binary-only upgrade that moves DefaultKubeVersion would keep serving the old
+// apiserver with nothing anywhere saying so. The discipline is kine's (see
+// KineMarkerName): one line, written atomically, and written LAST — only after every
+// file in the set is in place and signed — so "the marker matches" implies "the set
+// beside it is finished". The boot-time check is a read of this file, never a hash.
+const (
+	// KubeMarkerName is the basename of the version marker written beside a staged
+	// control-plane set (in the workdir bin, in an install payload, and in the release
+	// archive). Its content is the kube version and a newline.
+	KubeMarkerName = "kube.version"
+)
+
+// kubeMarkerPath names the control-plane marker in a bin dir.
+func kubeMarkerPath(bd string) string { return filepath.Join(bd, KubeMarkerName) }
+
+// KubeMarkerPath returns the control-plane marker path for a given work dir
+// (<workDir>/bin/kube.version). Exported so `k3sm status` reads the same file the
+// seed writes (mirrors CrashLoopPath).
+func KubeMarkerPath(workDir string) string { return kubeMarkerPath(binDir(workDir)) }
+
+// kubeMarkerContent renders a marker: "<version>\n".
+func kubeMarkerContent(version string) string { return version + "\n" }
+
+// ParseKubeMarker returns the kube version a marker's content records. Anything but
+// exactly one field is malformed and yields "", which no target ever matches — the
+// same tolerant reading readKineMarker gives the kine marker.
+func ParseKubeMarker(b []byte) string {
+	f := strings.Fields(string(b))
+	if len(f) != 1 {
+		return ""
+	}
+	return f[0]
+}
+
+// readKubeMarker returns the version recorded beside a staged set; a missing,
+// unreadable, or malformed marker yields "".
+func readKubeMarker(bd string) string {
+	v, _ := readKubeMarkerState(bd)
+	return v
+}
+
+// kubeMarkerState tells the three things a marker read can find apart. The seed
+// needs the distinction: a MISSING marker is a node staged before markers existed
+// and is grandfathered (a vouching payload re-seeds it), while a PRESENT marker it
+// cannot read as a version is not "older than everything" — it is an unknown the
+// seed refuses to overwrite, because it cannot rule out a downgrade.
+type kubeMarkerState int
+
+const (
+	kubeMarkerMissing   kubeMarkerState = iota // no marker file
+	kubeMarkerMalformed                        // present, but unreadable or not a vMAJOR.MINOR.PATCH line
+	kubeMarkerValid                            // present and names a version
+)
+
+// readKubeMarkerState reads the marker and classifies it. The version is returned
+// only for kubeMarkerValid.
+func readKubeMarkerState(bd string) (string, kubeMarkerState) {
+	b, err := os.ReadFile(kubeMarkerPath(bd))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", kubeMarkerMissing
+	}
+	if err != nil {
+		return "", kubeMarkerMalformed
+	}
+	v := ParseKubeMarker(b)
+	if _, ok := parseKinePin(v); !ok {
+		return "", kubeMarkerMalformed
+	}
+	return v, kubeMarkerValid
+}
+
+// kubeSetStaged reports whether bd holds every control-plane binary AND a marker
+// vouching for exactly version.
+func kubeSetStaged(bd, version string) bool {
+	if version == "" {
+		return false
+	}
+	for _, name := range cpBinaries {
+		if _, err := os.Stat(filepath.Join(bd, name)); err != nil {
+			return false
+		}
+	}
+	return readKubeMarker(bd) == version
+}
+
+// writeKubeMarker writes the marker atomically (temp + rename) so an interrupted
+// stage can never leave a half-written marker vouching for the wrong bytes.
+func writeKubeMarker(bd, version string) error {
+	tmp := kubeMarkerPath(bd) + ".tmp"
+	if err := os.WriteFile(tmp, []byte(kubeMarkerContent(version)), 0o644); err != nil {
+		return fmt.Errorf("write control-plane version marker: %w", err)
+	}
+	if err := os.Rename(tmp, kubeMarkerPath(bd)); err != nil {
+		return fmt.Errorf("install control-plane version marker: %w", err)
+	}
+	return nil
+}
+
+// clearKubeMarker drops the marker BEFORE a re-stage touches the set: until the new
+// marker is written, the true answer to "what is staged?" is "nothing vouched for".
+func clearKubeMarker(bd string) error {
+	if err := os.Remove(kubeMarkerPath(bd)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear control-plane version marker: %w", err)
+	}
+	return nil
+}
+
+// KubeVersionOlder reports whether kube version a is strictly older than b. The
+// vMAJOR.MINOR.PATCH comparison is kine's pin comparison (the shapes are the same);
+// either side unparseable is false, so nothing is called a downgrade unless both
+// versions prove it. Exported so `k3sm status` draws the staged-vs-pinned direction
+// with the same comparison the seed's downgrade refusal uses.
+func KubeVersionOlder(a, b string) bool { return kinePinOlder(a, b) }
 
 // kine staging constants. The binary is accompanied by a VERSION MARKER, because a
 // presence-only check ("is there a file called kine?") cannot tell a correctly staged
@@ -521,11 +767,13 @@ func PayloadBinaries() []string { return append(append([]string{}, cpBinaries...
 
 // StagePayload acquires the full control-plane payload into destDir using the
 // executor's own pinned versions (DefaultKubeVersion via `gh release download`,
-// DefaultKineVersion via a CGO_ENABLED=0 `go install`, which also drops the
-// KineMarkerName marker beside the binary so a seeded workdir knows what it got). It is the packaging-side producer: run
-// it where the dev tools exist (a human shell, goreleaser), then hand destDir to
-// `k3sm install`, which stages it beside the daemon; the daemon boot seeds its
-// workdir from the staged copy and never needs gh/go (a launchd _k3sm daemon
+// DefaultKineVersion via a CGO_ENABLED=0 `go install`). Each half drops its version
+// marker beside the binaries it describes — KubeMarkerName after the four
+// kwok-ci/k8s binaries are digest-verified and signed, KineMarkerName after kine is
+// built and signed — so a seeded workdir knows what it got. It is the packaging-side
+// producer: run it where the dev tools exist (a human shell, goreleaser), then hand
+// destDir to `k3sm install`, which stages it beside the daemon; the daemon boot seeds
+// its workdir from the staged copy and never needs gh/go (a launchd _k3sm daemon
 // has neither — an observed live-hardware failure this closes).
 func StagePayload(ctx context.Context, destDir string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -536,8 +784,9 @@ func StagePayload(ctx context.Context, destDir string) error {
 	// must stop the release rather than ship. The digest check happens INSIDE the
 	// download, before ad-hoc signing rewrites the Mach-O. The boot-path callers
 	// are deliberately not gated — a dev fallback download is not a published
-	// artifact, and may run at an unpinned version.
-	if err := ensureControlPlaneBinariesVerified(ctx, destDir, DefaultKubeVersion, true); err != nil {
+	// artifact, and may run at an unpinned version. The logger is unused on this
+	// path: a present set is refused before anything would be reported.
+	if err := ensureControlPlaneBinariesVerified(ctx, slog.New(slog.DiscardHandler), destDir, DefaultKubeVersion, true); err != nil {
 		return err
 	}
 	if err := ensureKineInto(ctx, destDir, DefaultKineVersion); err != nil {
@@ -553,14 +802,23 @@ func StagePayload(ctx context.Context, destDir string) error {
 // still run and fail with their own actionable errors (dev shells keep working
 // with no payload at all).
 //
-// kine is the ONE exception to "never overwrite an existing workdir binary", and it
-// has to be: ensureKineInto now re-stages on a version-marker mismatch, and its
-// fallback is a Go toolchain a launchd _k3sm daemon does not have. So on a packaged
-// upgrade whose kine pin moved, the workdir's stale kine is REPLACED from the payload
-// (which ships in the same archive as this binary and therefore carries this binary's
-// pin) instead of being left for a build that cannot run. kineVersion is the target
-// the caller resolved (Config.KineVersion).
-func seedBinDir(workDir, payloadDir, kineVersion string) error {
+// The VERSIONED binaries are the exceptions to "never overwrite an existing workdir
+// binary": kine, and the control-plane set (kube-apiserver, kube-controller-manager,
+// kube-scheduler, kubectl). Each carries a version marker, and presence alone cannot
+// tell this release's bytes from an earlier release's, so a binary-only upgrade that
+// moved a pin would otherwise keep running the old bytes forever — kine loudly (its
+// only other re-stage is a Go toolchain a launchd _k3sm daemon does not have), the
+// control plane silently (its old set boots fine). So when the workdir's marker does
+// not vouch for the target and the payload's OWN marker does, the payload wins: kine
+// is replaced alone, the control-plane set is replaced WHOLE (every file, then the
+// marker last). The payload ships in the same archive as this binary and therefore
+// carries this binary's pins. An unmarked payload never wins — trusting it would mean
+// stamping the new pin onto bytes nothing verified — and a payload OLDER than the
+// control-plane set already staged is refused, as is any re-seed over a
+// present-but-malformed marker (see below). Every other file is
+// unversioned and is only ever filled in when absent. kineVersion and kubeVersion are
+// the targets the caller resolved (Config.KineVersion, Config.KubeVersion).
+func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersion string) error {
 	if payloadDir == "" {
 		return nil
 	}
@@ -576,9 +834,35 @@ func seedBinDir(workDir, payloadDir, kineVersion string) error {
 	// datastore engine while claiming the new one. An unmarked payload therefore falls
 	// through to ensureKineInto, which rebuilds or reports.
 	restageKine := !kineStaged(bd, kineVersion) && kineStaged(payloadDir, kineVersion)
+	// The control-plane set follows the same rule, with one refusal kine does not need
+	// here (kine's own migration path owns its downgrade story): when the workdir's
+	// marker names a NEWER version than the payload vouches for, the re-seed would
+	// run an older apiserver over a datastore a newer one has written, which is one-way
+	// and which the kine migration does not cover. The present set is left in place
+	// and the boot continues on it; ensureControlPlaneBinaries reports it too.
+	restageKube := false
+	previousKube, markerState := readKubeMarkerState(bd)
+	if !kubeSetStaged(bd, kubeVersion) && kubeSetStaged(payloadDir, kubeVersion) {
+		switch {
+		case markerState == kubeMarkerMalformed:
+			logger.Error("refusing to re-seed the control-plane binaries: the work dir's version marker is present but malformed, so a downgrade cannot be ruled out; continuing on the present set",
+				"marker", kubeMarkerPath(bd), "payload-version", kubeVersion, "remedy", "inspect the marker; delete it only if the set beside it is known to be older than "+kubeVersion+", and the next boot re-seeds")
+		case KubeVersionOlder(kubeVersion, previousKube):
+			logger.Error("refusing to re-seed the control-plane binaries: the staged payload is OLDER than the set in the work dir, and an apiserver downgrade over a datastore a newer apiserver wrote is one-way; continuing on the present set",
+				"workdir-version", previousKube, "payload-version", kubeVersion, "dir", bd, "remedy", NewerControlPlaneRemedy)
+		default:
+			restageKube = true
+		}
+	}
+	if restageKube {
+		if err := clearKubeMarker(bd); err != nil {
+			return err
+		}
+	}
 	for _, name := range PayloadBinaries() {
 		dst := filepath.Join(bd, name)
-		if _, err := os.Stat(dst); err == nil && !(name == kineBinaryName && restageKine) {
+		versioned := (name == kineBinaryName && restageKine) || (restageKube && isCPBinary(name))
+		if _, err := os.Stat(dst); err == nil && !versioned {
 			continue // already present (a prior boot seeded/acquired it)
 		}
 		src := filepath.Join(payloadDir, name)
@@ -598,7 +882,31 @@ func seedBinDir(workDir, payloadDir, kineVersion string) error {
 			return err
 		}
 	}
+	if restageKube {
+		// LAST, after the whole set. The payload's bytes were signed when it was
+		// staged and the ad-hoc signature is embedded in each Mach-O, so the copies
+		// are signed already; the ensure step re-signs them regardless.
+		if err := writeKubeMarker(bd, kubeVersion); err != nil {
+			return err
+		}
+		if previousKube == "" {
+			previousKube = "unvouched"
+		}
+		logger.Info("seeded the control-plane binaries from the staged payload",
+			"from", previousKube, "to", kubeVersion, "dir", bd)
+	}
 	return nil
+}
+
+// isCPBinary reports whether name is one of the control-plane set the kube marker
+// covers.
+func isCPBinary(name string) bool {
+	for _, b := range cpBinaries {
+		if b == name {
+			return true
+		}
+	}
+	return false
 }
 
 // fileExists reports whether path names an existing file (any stat error — including

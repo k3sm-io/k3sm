@@ -2245,6 +2245,10 @@ func artifactManifest(cfg Config) []artifact {
 	// assertExists is false — an archive produced before markers existed still installs, and
 	// the seed falls back to rebuilding rather than trusting bytes nothing vouched for.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName), assertExists: false})
+	// The control-plane version marker rides beside the four kube binaries on the same
+	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
+	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.
+	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KubeMarkerName), assertExists: false})
 	items = append(items, []artifact{
 		// Forward-declared: the cp-payload bin tree + relocated k3sm-netd land
 		// under InstallDir once the packaging follow-up moves them off DataRoot. They
@@ -2724,6 +2728,12 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		cfg.stagedPayloadFile(executor.KineMarkerName))
+	//     The control-plane version marker is staged the same way and for the same
+	//     reasons: without it the seed cannot tell this release's kube binaries from
+	//     the ones an earlier release left in the work dir, and an absent marker only
+	//     means the seed leaves the present set alone.
+	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KubeMarkerName),
+		cfg.stagedPayloadFile(executor.KubeMarkerName))
 
 	// 2d. Carry over the operator-supplied server arguments — from the plist
 	//     ALREADY ON DISK, or, when there is none, from the record the previous

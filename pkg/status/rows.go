@@ -78,6 +78,7 @@ func (c Collector) Collect(ctx context.Context) Report {
 	} else {
 		node, nodePID = c.daemonRow(RowServer, c.Paths.ServerLabel, c.Paths.ServerLog, true)
 		c.crashLoop(&node)
+		c.stagedControlPlane(&node)
 	}
 	apiserver := c.apiserverRow(ctx, role, credential)
 	serving := apiserver.Severity == SeverityOK

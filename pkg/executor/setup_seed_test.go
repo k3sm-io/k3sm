@@ -23,7 +23,7 @@ import (
 )
 
 // TestSeedBinDir proves the payload seed: staged binaries are copied 0755 into
-// the workdir bin, existing workdir binaries are never overwritten, missing
+// the workdir bin, existing unversioned workdir binaries are never overwritten, missing
 // payload entries are tolerated (the ensure* fallbacks own that error), and an
 // empty payloadDir is a no-op — so a dev shell with no payload keeps the gh/go
 // acquisition path while a packaged install never needs it.
@@ -36,7 +36,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(payload, "kine"), []byte("kine"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(work, payload, DefaultKineVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
 			t.Fatal(err)
 		}
 		got, err := os.ReadFile(filepath.Join(binDir(work), "kube-apiserver"))
@@ -53,27 +53,34 @@ func TestSeedBinDir(t *testing.T) {
 		}
 	})
 
-	t.Run("never overwrites an existing workdir binary", func(t *testing.T) {
+	// Only VERSIONED binaries are ever replaced, and only from a payload whose own
+	// marker vouches for the target. With neither side marked a file is unversioned,
+	// and an existing one is never overwritten.
+	t.Run("never overwrites an existing unversioned workdir binary", func(t *testing.T) {
 		payload, work := t.TempDir(), t.TempDir()
 		if err := os.MkdirAll(binDir(work), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(binDir(work), "kube-apiserver"), []byte("existing"), 0o755); err != nil {
+		for _, name := range PayloadBinaries() {
+			if err := os.WriteFile(filepath.Join(binDir(work), name), []byte("existing"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(payload, name), []byte("payload"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(payload, "kube-apiserver"), []byte("payload"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := seedBinDir(work, payload, DefaultKineVersion); err != nil {
-			t.Fatal(err)
-		}
-		got, _ := os.ReadFile(filepath.Join(binDir(work), "kube-apiserver"))
-		if string(got) != "existing" {
-			t.Error("seed overwrote an existing workdir binary")
+		for _, name := range PayloadBinaries() {
+			if got, _ := os.ReadFile(filepath.Join(binDir(work), name)); string(got) != "existing" {
+				t.Errorf("seed overwrote an existing unversioned %s", name)
+			}
 		}
 	})
 
-	// kine is the ONE binary the seed will replace, because ensureKineInto's fallback
+	// kine is one of the versioned binaries the seed will replace (the control-plane
+	// set is the other; kubestage_test.go), because ensureKineInto's fallback
 	// for a stale kine is a Go toolchain a launchd daemon does not have. A packaged
 	// upgrade whose pin moved must therefore get the payload's kine, not a build.
 	t.Run("re-seeds a kine whose marker does not vouch for the target pin", func(t *testing.T) {
@@ -93,7 +100,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(kineMarkerPath(payload), []byte(kineMarkerContent(DefaultKineVersion)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(work, payload, DefaultKineVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(binDir(work), "kine")); string(got) != "new-pin" {
@@ -119,7 +126,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(payload, "kine"), []byte("payload"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(work, payload, DefaultKineVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(binDir(work), "kine")); string(got) != "current" {
@@ -142,7 +149,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(payload, "kine"), []byte("unverified"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(work, payload, DefaultKineVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(binDir(work), "kine")); string(got) != "old-pin" {
@@ -155,7 +162,7 @@ func TestSeedBinDir(t *testing.T) {
 
 	t.Run("empty payloadDir is a no-op", func(t *testing.T) {
 		work := t.TempDir()
-		if err := seedBinDir(work, "", DefaultKineVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, "", DefaultKineVersion, DefaultKubeVersion); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(binDir(work)); !os.IsNotExist(err) {

@@ -386,10 +386,10 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// Seed the workdir bin from a staged install payload first, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
-	if err := provisionStep("seed-bin", seedBinDir(s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion)); err != nil {
+	if err := provisionStep("seed-bin", seedBinDir(s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion, s.cfg.KubeVersion)); err != nil {
 		return err
 	}
-	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
+	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
 		return err
 	}
 	if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {

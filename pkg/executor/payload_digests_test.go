@@ -137,7 +137,7 @@ func TestStagePayloadRefusesPrepopulatedDir(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, "kube-apiserver")
 
-	err := ensureControlPlaneBinariesVerified(t.Context(), dir, DefaultKubeVersion, true)
+	err := ensureControlPlaneBinariesVerified(t.Context(), discardLogger(), dir, DefaultKubeVersion, true)
 	if !errors.Is(err, ErrPayloadDigestUnpinned) {
 		t.Fatalf("verified staging into a pre-populated dir = %v, want a refusal", err)
 	}
