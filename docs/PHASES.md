@@ -2,8 +2,8 @@
 repo: k3sm
 schema: phases/v1
 current_phase: M6
-updated: 2026-09-13
-updated_by: B282 write-back (on-disk container logs served by the node)
+updated: 2026-09-24
+updated_by: B375 write-back (retroactive record of the shipped datavol feature)
 
 phases:
   - id: M0
@@ -1647,3 +1647,83 @@ the chart install, the live RBAC re-assertion, conversion, the worker's guardrai
 kit, the warm-prefix routing rung, deletion with zero `Terminating` objects, and a `kickstart`
 re-run that records the time back to serving. The `M16-lab` row and `hack/lab/m16.sh` are written
 **only** on the single-slot branch, where the routing rung needs a second node.
+
+## Retroactive record — `pkg/datavol`, the data-volume feature ✅
+
+**This is a retroactive record, not a forward-planned phase.** Every milestone above it was
+named in advance by a `phases:` entry and, for the larger ones, a `docs/m<n>-plan.md`. This
+feature was neither: it shipped through three ordinary reviewed PRs with no milestone number and
+no plan document of its own, and it is written up here, after the fact, only so `docs/PHASES.md`
+stops being silent about ~2,600 LOC of shipped, tested product code. It is deliberately **not** a
+numbered `M<n>` (M0–M16 are all claimed, and there is no plan to justify minting `M17`), **not** a
+`phases:` YAML entry, and it is **not** folded into M7.1's deliverable list — M7.1 is the release
+packaging phase and predates this feature; it never scoped it.
+
+**Shape.** `sudo k3sm install --data-volume[=SIZE]` puts the k3sm data root (`/var/lib/k3sm`) on a
+dedicated, k3sm-owned APFS volume instead of a plain directory on the boot disk — quota'd
+(`--data-volume-size`, 100 GiB default, 32 GiB floor) and optionally encrypted
+(`--data-volume-encrypt`, a random passphrase generated locally and kept in the login keychain).
+Three `k3sm datavol` subcommands manage the volume directly: `mount` (idempotent; what the
+`io.k3sm.datavol` oneshot LaunchDaemon runs at boot), `status` (human and `-o json`: the volume,
+its quota, its usage, and any leftover pre-migration copy), and `datavol delete --yes` (the
+package's one destructive path, gated behind an explicit confirmation and a check that neither
+`io.k3sm.netd` nor the server daemon is loaded). `k3sm status` carries a `datavol` row — `ok` once
+the volume has mounted, `fail` if the last run did not, with a `sudo k3sm datavol mount` remedy.
+See `docs/user/storage.md` §"The Data Volume" for the operator-facing description this record
+backs.
+
+**Commits** (from `git log`, not the README):
+- `2524670` (#372, 2026-09-14) `feat(install): put the data root on a k3sm-owned APFS volume` — the
+  feature's birth: `pkg/datavol` (create/adopt/mount/migrate/delete/fstab/plist/size, plus the
+  guard and indexing helpers, all over three fakeable seams — Volumes, Keychain, Indexing — with
+  `datavoltest.Fake` the one exported double), the `dataroot.Record` second-declaration source, the
+  three `k3sm datavol` subcommands (`cmd/k3sm/datavol.go`), the `install --data-volume*` flag
+  family, and every `_test.go` file this record cites.
+- `d531e55` (#391, 2026-09-17) `feat(status): report the agent daemon and its credential on a
+  worker` — a broader worker-role status change (not datavol-specific) that threaded a
+  `dataroot.Role` parameter through the datavol status surface (`dataRootRow`, `installRow`); it
+  touched `pkg/status/datavol_test.go`'s call sites but added no new datavol test function.
+- `4e742d6` (#427, 2026-09-17) `fix(status): render no control-plane rows on a worker` — the same
+  worker-status line of work, again updating `pkg/status/datavol_test.go`'s call sites for the
+  role-aware signature; also added no new datavol test function.
+
+**Evidence, per capability.** 23 test functions in total, across `pkg/datavol/*_test.go`,
+`cmd/k3sm/datavol_test.go`, `pkg/install/datavol_test.go` and `pkg/status/datavol_test.go`:
+- creating or adopting the volume, never taking over one that is not k3sm's and never leaving one
+  behind that it decided not to keep: `TestEnsureCreatesOrAdopts`.
+- the destructive path's gates (no confirmation, a loaded daemon) and its actual sequence (mount,
+  volume, fstab line, record and mount point, in that order): `TestDeleteRefuses`,
+  `TestDeleteSequence`.
+- the second, fstab, declaration — added on creation, left untouched on adoption:
+  `TestEnsureFstabLine`, `TestRemoveFstabLine`.
+- the two Spotlight/indexing markers, run against a real temp directory because the obvious tools
+  (`mdutil`, `tmutil`) do not work on a `nobrowse` volume: `TestIndexingMarkers`.
+- migrating a plain data root onto the volume, fail-safe on any verification gap — a lost file, a
+  byte mismatch, or an outright copy failure all destroy the new volume and change nothing:
+  `TestMigrateFailsSafe`.
+- the idempotent boot-time mount, including a locked encrypted volume unlocked from the keychain
+  and a transient-vs-permanent `diskutil` failure split, plus refusing an implausible or mismatched
+  mount point: `TestMountRecordedIsIdempotent`, `TestMountRecordedRefuses`.
+- the `security` CLI plist-dict parsing seam, and the `ParseSize`/`FormatSize` pair the
+  `--data-volume-size` flag and the `status` text screen both use: `TestPlistDictReader`,
+  `TestParseSize`, `TestFormatSize`.
+- the `install --data-volume*` flag contract — defaults, refusals, and "no flag touches no disk":
+  `TestInstallFlagsDataVolume`.
+- `k3sm datavol status`'s machine (`-o json`) and human shapes, and which probe (`statfs` vs. APFS
+  container capacity) its usage figure comes from — `statfs` answers the quota-less case wrong on a
+  shared APFS container: `TestDatavolStatusJSONShape`, `TestDatavolStatusUsedSource`.
+- `install`'s ordering of the data-volume block relative to `EnsureServiceUser` and the daemon
+  plists, and the `io.k3sm.datavol` oneshot LaunchDaemon's boot contract (root, `RunAtLoad`,
+  `KeepAlive` only on failure, throttled): `TestInstallWithDataVolumeSequencing`, `TestDatavolPlist`,
+  `TestRenderPlistKeepAliveOnFailure`.
+- the `k3sm status` `datavol` row across a quota'd volume, a pre-volume leftover copy, a legacy
+  fstab-only device, and the oneshot daemon's own row (which must not read a completed oneshot as a
+  failure): `TestDataRootRowNamesVolume`, `TestPreVolumeRowPartialWalk`,
+  `TestDataRootRowLegacyDevice`, `TestOneshotRow`, `TestInstallRowCountsDatavolPlist`.
+
+**Method, honestly.** All 23 tests above are **unit-tier**: they run against the
+`datavoltest.Fake` double (its `Volumes`/`Keychain`/`Indexing` seams) or an in-memory/temp-dir
+filesystem — never against a real `diskutil`, a real Keychain, or a real APFS volume. No gate in
+this repo exercises real APFS for this feature: creating, quota-ing, encrypting, or destroying an
+actual volume is unverified by CI, and there is no `hack/lab/*.sh` leg for it either. Nothing here
+is end-to-end, and this record makes no claim that it is.
