@@ -404,3 +404,68 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		t.Errorf("VerifyPayloadSet(staged payload) = %v", err)
 	}
 }
+
+// TestSeedBinDirRefusesOverMalformedControlPlaneMarker: a PRESENT marker the seed
+// cannot read as a version is not "older than everything". It might describe a
+// newer set, so overwriting it could be the one-way downgrade; the seed refuses,
+// says why, and the boot continues. (A MISSING marker is the grandfathered case,
+// TestSeedBinDirGrandfathersUnmarkedControlPlane.)
+func TestSeedBinDirRefusesOverMalformedControlPlaneMarker(t *testing.T) {
+	for _, garbage := range []string{"garbage\n", "v1.36.5 extra\n", "\n"} {
+		t.Run(strings.TrimSpace(garbage), func(t *testing.T) {
+			payload, work := t.TempDir(), t.TempDir()
+			stageCPSet(t, binDir(work), "present", "")
+			if err := os.WriteFile(kubeMarkerPath(binDir(work)), []byte(garbage), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			stageCPSet(t, payload, "payload", DefaultKubeVersion)
+			logger, buf := bufLogger()
+			if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+				t.Fatalf("a malformed marker must not fail the boot: %v", err)
+			}
+			assertCPSet(t, binDir(work), "present")
+			if got, _ := os.ReadFile(kubeMarkerPath(binDir(work))); string(got) != garbage {
+				t.Errorf("marker = %q, want the untouched %q", got, garbage)
+			}
+			out := buf.String()
+			for _, want := range []string{"level=ERROR", "malformed", kubeMarkerPath(binDir(work))} {
+				if !strings.Contains(out, want) {
+					t.Errorf("malformed-marker refusal log lacks %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+// TestRestageFromReleaseReportsATornSet: the dev-shell fallback's renames are not
+// shadow-staged, so a failure between them must be reported as a possibly
+// PARTIALLY replaced set, never as "continuing on the stale set".
+func TestRestageFromReleaseReportsATornSet(t *testing.T) {
+	fakeTool(t, "gh")
+	fakeDownload(t, "downloaded")
+	work := t.TempDir()
+	stageCPSet(t, binDir(work), "old", staleKubeVersion)
+	// kubectl is renamed last; a non-empty directory in its place makes that rename fail
+	// after the other three have landed.
+	kubectl := filepath.Join(binDir(work), "kubectl")
+	if err := os.Remove(kubectl); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(kubectl, "occupied"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logger, buf := bufLogger()
+	if err := ensureControlPlaneBinaries(t.Context(), logger, work, DefaultKubeVersion); err != nil {
+		t.Fatalf("a torn re-stage must not fail the boot: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "PARTIALLY replaced") || !strings.Contains(out, "level=ERROR") {
+		t.Errorf("torn set not reported as partially replaced:\n%s", out)
+	}
+	if strings.Contains(out, "continuing on the stale set") {
+		t.Errorf("torn set reported as an intact stale set:\n%s", out)
+	}
+	if _, err := os.Stat(kubeMarkerPath(binDir(work))); !os.IsNotExist(err) {
+		t.Error("a torn set carries a version marker")
+	}
+}

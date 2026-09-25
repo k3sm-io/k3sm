@@ -326,6 +326,11 @@ func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kube
 				"from", staged, "to", kubeVersion, "dir", bd)
 			return
 		}
+		if errors.Is(dlErr, errTornControlPlaneSet) {
+			logger.Error("control-plane re-stage failed part-way: the set in the work dir may be PARTIALLY replaced (a mix of the staged and the downloaded release) and carries no version marker; the boot continues on it",
+				"staged", staged, "pinned", kubeVersion, "dir", bd, "error", dlErr.Error(), "remedy", StaleControlPlaneRemedy)
+			return
+		}
 		attrs = append(attrs, "download-error", dlErr.Error())
 	}
 	logger.Error("control-plane binaries are STALE: the staged set is not the version this build pins; continuing on the stale set",
@@ -335,6 +340,12 @@ func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kube
 // restageFromRelease is the dev-shell fallback for a stale set: download into a
 // scratch dir beside the set, so a failed or partial download never touches the
 // working binaries, then move the four into place and write the marker last.
+//
+// The four renames are NOT shadow-staged (no swap of a whole directory), so a
+// failure between them leaves a torn set; it is reported as errTornControlPlaneSet.
+// That is acceptable only because this branch is dev-shell-only: it runs when `gh`
+// is on PATH, which a launchd daemon never has — a packaged install re-stages
+// through seedBinDir from its payload instead.
 func restageFromRelease(ctx context.Context, bd, kubeVersion string) error {
 	tmp, err := os.MkdirTemp(bd, ".kube-restage-")
 	if err != nil {
@@ -354,11 +365,15 @@ func restageFromRelease(ctx context.Context, bd, kubeVersion string) error {
 	}
 	for _, name := range cpBinaries {
 		if err := os.Rename(filepath.Join(tmp, name), filepath.Join(bd, name)); err != nil {
-			return fmt.Errorf("install re-staged %s: %w", name, err)
+			return fmt.Errorf("%w: install re-staged %s: %w", errTornControlPlaneSet, name, err)
 		}
 	}
 	return writeKubeMarker(bd, kubeVersion)
 }
+
+// errTornControlPlaneSet marks a dev-shell re-stage that failed after it began
+// replacing the set, so the work dir may hold a mix of two releases.
+var errTornControlPlaneSet = errors.New("control-plane set may be partially replaced")
 
 // StaleControlPlaneRemedy is the operator's fix for a staged control-plane set older
 // than the binary's pin: a packaged install carries the pinned set in its payload,
@@ -409,11 +424,38 @@ func ParseKubeMarker(b []byte) string {
 // readKubeMarker returns the version recorded beside a staged set; a missing,
 // unreadable, or malformed marker yields "".
 func readKubeMarker(bd string) string {
+	v, _ := readKubeMarkerState(bd)
+	return v
+}
+
+// kubeMarkerState tells the three things a marker read can find apart. The seed
+// needs the distinction: a MISSING marker is a node staged before markers existed
+// and is grandfathered (a vouching payload re-seeds it), while a PRESENT marker it
+// cannot read as a version is not "older than everything" — it is an unknown the
+// seed refuses to overwrite, because it cannot rule out a downgrade.
+type kubeMarkerState int
+
+const (
+	kubeMarkerMissing   kubeMarkerState = iota // no marker file
+	kubeMarkerMalformed                        // present, but unreadable or not a vMAJOR.MINOR.PATCH line
+	kubeMarkerValid                            // present and names a version
+)
+
+// readKubeMarkerState reads the marker and classifies it. The version is returned
+// only for kubeMarkerValid.
+func readKubeMarkerState(bd string) (string, kubeMarkerState) {
 	b, err := os.ReadFile(kubeMarkerPath(bd))
-	if err != nil {
-		return ""
+	if errors.Is(err, os.ErrNotExist) {
+		return "", kubeMarkerMissing
 	}
-	return ParseKubeMarker(b)
+	if err != nil {
+		return "", kubeMarkerMalformed
+	}
+	v := ParseKubeMarker(b)
+	if _, ok := parseKinePin(v); !ok {
+		return "", kubeMarkerMalformed
+	}
+	return v, kubeMarkerValid
 }
 
 // kubeSetStaged reports whether bd holds every control-plane binary AND a marker
@@ -772,7 +814,8 @@ func StagePayload(ctx context.Context, destDir string) error {
 // marker last). The payload ships in the same archive as this binary and therefore
 // carries this binary's pins. An unmarked payload never wins — trusting it would mean
 // stamping the new pin onto bytes nothing verified — and a payload OLDER than the
-// control-plane set already staged is refused (see below). Every other file is
+// control-plane set already staged is refused, as is any re-seed over a
+// present-but-malformed marker (see below). Every other file is
 // unversioned and is only ever filled in when absent. kineVersion and kubeVersion are
 // the targets the caller resolved (Config.KineVersion, Config.KubeVersion).
 func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersion string) error {
@@ -798,12 +841,16 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	// and which the kine migration does not cover. The present set is left in place
 	// and the boot continues on it; ensureControlPlaneBinaries reports it too.
 	restageKube := false
-	previousKube := readKubeMarker(bd)
+	previousKube, markerState := readKubeMarkerState(bd)
 	if !kubeSetStaged(bd, kubeVersion) && kubeSetStaged(payloadDir, kubeVersion) {
-		if KubeVersionOlder(kubeVersion, previousKube) {
+		switch {
+		case markerState == kubeMarkerMalformed:
+			logger.Error("refusing to re-seed the control-plane binaries: the work dir's version marker is present but malformed, so a downgrade cannot be ruled out; continuing on the present set",
+				"marker", kubeMarkerPath(bd), "payload-version", kubeVersion, "remedy", "inspect the marker; delete it only if the set beside it is known to be older than "+kubeVersion+", and the next boot re-seeds")
+		case KubeVersionOlder(kubeVersion, previousKube):
 			logger.Error("refusing to re-seed the control-plane binaries: the staged payload is OLDER than the set in the work dir, and an apiserver downgrade over a datastore a newer apiserver wrote is one-way; continuing on the present set",
 				"workdir-version", previousKube, "payload-version", kubeVersion, "dir", bd, "remedy", NewerControlPlaneRemedy)
-		} else {
+		default:
 			restageKube = true
 		}
 	}
