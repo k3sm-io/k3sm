@@ -86,12 +86,29 @@ func (b *crashBreaker) recordBringUp(component, detail string) (tripped bool) {
 	return b.recordOrigin(executor.CrashOriginBringUp, component, detail)
 }
 
+// recordBringUpPermanent appends one PERMANENT bring-up failure, which trips
+// the breaker on its own (executor.CrashRecord.RecordPermanent). remedy is the
+// fix the status row will name.
+func (b *crashBreaker) recordBringUpPermanent(component, detail, remedy string) (tripped bool) {
+	return b.write(func(r *executor.CrashRecord, now time.Time) bool {
+		return r.RecordPermanent(now, executor.CrashOriginBringUp, component, detail, remedy)
+	})
+}
+
 func (b *crashBreaker) recordOrigin(origin, component, detail string) (tripped bool) {
+	return b.write(func(r *executor.CrashRecord, now time.Time) bool {
+		return r.Record(now, origin, component, detail)
+	})
+}
+
+// write is the one locked read-modify-write of the record; add appends the
+// entry and reports whether it tripped the breaker.
+func (b *crashBreaker) write(add func(*executor.CrashRecord, time.Time) bool) (tripped bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.crashed = true
 	r := b.load()
-	tripped = r.Record(b.now(), origin, component, detail)
+	tripped = add(&r, b.now())
 	if err := executor.WriteCrashRecord(b.path, r); err != nil {
 		b.logger.Error("could not persist the crash-loop record", "path", b.path, "err", err)
 	}
@@ -109,11 +126,24 @@ func (b *crashBreaker) recordOrigin(origin, component, detail string) (tripped b
 // A failure executor.Start did not classify (a Config validation error, a token
 // it could not mint) is still recorded, under "control-plane": the loop it would
 // otherwise produce is the same loop, and an unnamed count is better than none.
+//
+// A PERMANENT failure — today only executor.ErrNoGoToolchain, matched with
+// errors.Is through BringUpError's chain — trips the breaker on this one
+// failure: the launchd PATH that lacked `go` this lap lacks it on every lap.
 func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 	component := "control-plane"
 	var bu *executor.BringUpError
 	if errors.As(err, &bu) {
 		component = bu.Component
+	}
+	if errors.Is(err, executor.ErrNoGoToolchain) {
+		logger.Error("the control plane did not come up with a fault that cannot heal on retry; parking on this failure",
+			"component", component, "err", err, "remedy", executor.NoGoToolchainRemedy)
+		if b.recordBringUpPermanent(component, err.Error(), executor.NoGoToolchainRemedy) {
+			logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
+				"path", b.path)
+		}
+		return
 	}
 	logger.Error("the control plane did not come up; recording it on the crash-loop breaker",
 		"component", component, "err", err)

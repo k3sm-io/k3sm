@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -343,6 +344,17 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	if kineStaged(bd, kineVersion) {
 		return signBinaries(ctx, bd, []string{kineBinaryName})
 	}
+	// Preflight the toolchain BEFORE anything runs `go` (the module-cache probe is the
+	// first). Its absence is the one build failure that is deterministic: a launchd
+	// PATH without `go` is the same PATH on every respawn, so the daemon's breaker
+	// parks on the first such failure instead of counting to its threshold. The
+	// sentinel is the ONLY classification; build output is never string-matched.
+	// It runs before the stale marker is dropped on purpose: a toolchain-less park
+	// then leaves the previously staged binary AND its marker untouched, instead of
+	// stranding good bytes unmarked until the operator's remedy rebuilds them.
+	if _, err := lookPathGo(); err != nil {
+		return fmt.Errorf("build kine %s: %w (%v); %s", kineVersion, ErrNoGoToolchain, err, NoGoToolchainRemedy)
+	}
 	// Drop any stale marker BEFORE touching the binary: from here until the marker is
 	// rewritten, the correct answer to "what is staged?" is "nothing trustworthy", and
 	// an interrupted re-stage must re-stage again rather than trust a marker that
@@ -418,6 +430,21 @@ func kineBuildEnv(gopath, modCache string) []string {
 	return append(os.Environ(),
 		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
 }
+
+// ErrNoGoToolchain marks a kine re-stage that cannot run because no `go` is on PATH.
+// It is a PERMANENT bring-up fault: retrying under the same environment fails the same
+// way, which is what lets the crash-loop breaker park on the first occurrence
+// (CrashRecord.RecordPermanent). Match it with errors.Is, never by message.
+var ErrNoGoToolchain = errors.New("no Go toolchain on PATH to build the pinned kine")
+
+// NoGoToolchainRemedy is the operator's fix for ErrNoGoToolchain: a packaged install
+// carries the pinned kine in its staged payload, so re-installing re-stages it and the
+// boot seeds from the payload instead of building.
+const NoGoToolchainRemedy = "a packaged install has no Go toolchain; re-run `sudo k3sm install` so the staged payload carries this pin"
+
+// lookPathGo resolves the toolchain the kine build needs. It reads PATH at call time,
+// so a test drives it with t.Setenv rather than a seam.
+func lookPathGo() (string, error) { return exec.LookPath("go") }
 
 // kineModuleCacheDir resolves the stable module cache the kine build downloads into,
 // and runKineBuild runs the build itself. Both are vars so a test can assert the build

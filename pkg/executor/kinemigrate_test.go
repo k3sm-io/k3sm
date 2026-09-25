@@ -408,3 +408,24 @@ func TestKineSnapshotRequiresSQLite3(t *testing.T) {
 		t.Error("an unverifiable snapshot was written anyway")
 	}
 }
+
+// TestKinePinOlder pins the one comparison the snapshot log uses to call a pin
+// change a downgrade: only when both versions parse and the target is older.
+func TestKinePinOlder(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"v0.17.0", "v0.17.1", true},
+		{"v0.16.9", "v0.17.0", true},
+		{"v0.17.1", "v0.17.0", false},
+		{"v0.17.1", "v0.17.1", false},
+		{"v0.17.0", "v0.17.1-rc1", true},
+		{"v0.17.0", "", false}, // unstamped database: no claim
+		{"v0.17.0", "garbage", false},
+	} {
+		if got := kinePinOlder(tc.a, tc.b); got != tc.want {
+			t.Errorf("kinePinOlder(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}

@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -193,11 +194,17 @@ func snapshotBeforeKineUpgrade(ctx context.Context, logger *slog.Logger, workDir
 	}
 
 	prev, _, _ := readKinePin(workDir)
+	msg := "datastore kine pin changed; taking a verified pre-migration snapshot"
+	if kinePinOlder(targetVersion, prev) {
+		// A rollback: the database may already carry the newer pin's migrations, which
+		// the older kine is not guaranteed to read. The snapshot is taken all the same;
+		// the log says what kind of change this is so the operator is not surprised.
+		msg = "datastore kine pin DOWNGRADE (target older than the pin that last opened this database, which may have migrated it); taking a verified snapshot"
+	}
 	if prev == "" {
 		prev = "unstamped (pre-migration k3sm)"
 	}
-	logger.Info("datastore kine pin changed; taking a verified pre-migration snapshot",
-		"previous", prev, "target", targetVersion, "db", db, "backup", backup)
+	logger.Info(msg, "previous", prev, "target", targetVersion, "db", db, "backup", backup)
 
 	// 1. Free-space floor, before anything is written.
 	if err := requireFreeSpace(dbDir(workDir), uint64(fi.Size())*snapshotFreeSpaceFactor); err != nil {
@@ -232,6 +239,47 @@ func snapshotBeforeKineUpgrade(ctx context.Context, logger *slog.Logger, workDir
 	logger.Info("pre-migration datastore snapshot complete", "backup", backup,
 		"kine-binary", kineBinaryBackupPath(workDir, targetVersion))
 	return nil
+}
+
+// kinePinOlder reports whether pin a is a strictly older vMAJOR.MINOR.PATCH than b.
+// Either side unparseable (including an absent stamp) is false: the log only says
+// "downgrade" when both versions prove it.
+func kinePinOlder(a, b string) bool {
+	pa, okA := parseKinePin(a)
+	pb, okB := parseKinePin(b)
+	if !okA || !okB {
+		return false
+	}
+	for i := range pa {
+		if pa[i] != pb[i] {
+			return pa[i] < pb[i]
+		}
+	}
+	return false
+}
+
+// parseKinePin parses a vMAJOR.MINOR.PATCH pin; a pre-release or build suffix on the
+// patch is ignored.
+func parseKinePin(v string) ([3]int, bool) {
+	var out [3]int
+	rest, ok := strings.CutPrefix(v, "v")
+	if !ok {
+		return out, false
+	}
+	parts := strings.SplitN(rest, ".", 3)
+	if len(parts) != 3 {
+		return out, false
+	}
+	parts[2], _, _ = strings.Cut(parts[2], "-")
+	parts[2], _, _ = strings.Cut(parts[2], "+")
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
 }
 
 // preserveKineBinary copies the currently staged kine binary (the OLD pin's, since this
