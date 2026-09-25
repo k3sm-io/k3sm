@@ -28,7 +28,7 @@ package images
 // procedure and the reviewer merge-precondition.
 const (
 	// Buildkitd is the BuildKit daemon image. It is the mirror of the upstream
-	// moby/buildkit v0.32.2 release index; the mirrored copy is byte-identical, so
+	// moby/buildkit v0.33.0 release index; the mirrored copy is byte-identical, so
 	// this digest is upstream's own and can be re-resolved against the upstream
 	// registry by anyone. The index carries linux/arm64 and linux/amd64, the two
 	// platforms k3sm needs.
@@ -36,14 +36,17 @@ const (
 	// A registry outage does not strand a build: the same digest is servable from
 	// upstream, so pulling it from there and side-loading the result is a complete
 	// recovery path.
-	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+	Buildkitd = "ghcr.io/k3sm-io/mirror/buildkit@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3"
 
 	// DebianToolchain is the guest-kernel build toolchain image: the mirror of the
-	// upstream debian trixie-20260824-slim release index, byte-identical, so the
+	// upstream debian trixie-20260918-slim release index, byte-identical, so the
 	// digest is upstream's own. Consumed by runtimed/hack/guest-kernel/build.sh
 	// (which pins the linux/arm64 platform manifest recorded in mirror.yaml under
 	// this index) — a build-time dependency, never pulled by product code.
-	DebianToolchain = "ghcr.io/k3sm-io/mirror/debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132"
+	// That recipe pin deliberately lags this one: each kernel release pins its own
+	// toolchain digest and records it in the release's source note, so a build.sh digest
+	// older than mirror.yaml's is designed lag, not drift.
+	DebianToolchain = "ghcr.io/k3sm-io/mirror/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a"
 )
 
 // Pin is one digest-pinned image constant, named so it can be matched against the
