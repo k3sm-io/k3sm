@@ -37,7 +37,7 @@ import (
 // nodeRestrictionAllowedLabelNamespaces below.
 //
 // Derived from k8s.io/kubelet/pkg/apis/well_known_labels.go:35-48 (`kubeletLabels`,
-// vendored v0.35.0), which the v1.36.2 NodeRestriction admission plugin consults via
+// vendored v0.36.5), which the v1.36.2 NodeRestriction admission plugin consults via
 // kubeletapis.IsKubeletLabel — see k8s.io/kubernetes@v1.36.2
 // plugin/pkg/admission/noderestriction/admission.go:601-620 (getForbiddenLabels).
 //

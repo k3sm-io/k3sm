@@ -70,7 +70,7 @@ const (
 // --admission-control-config-file content: an apiserver.config.k8s.io/v1
 // AdmissionConfiguration embedding the pod-security.admission.config.k8s.io/v1
 // PodSecurityConfiguration cluster defaults. Both apiVersions are pinned to the
-// vendored k8s v1.36.2.
+// vendored k8s v1.36.5.
 //
 // It is a PURE function and the SINGLE authority for the level tuple: enforce is
 // the caller's argument (DefaultPodSecurityEnforceLevel ships it), warn and audit

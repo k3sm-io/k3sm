@@ -97,7 +97,7 @@ import (
 // <svc>.<ns>.svc.cluster.local, and the same PEM is the clientConfig.caBundle.
 // That works because the apiserver's webhook client sets the TLS ServerName to the
 // service hostname and only then dials the resolved ClusterIP:
-// k8s.io/apiserver@v0.35.0/pkg/util/webhook/client.go:187 builds
+// k8s.io/apiserver@v0.36.5/pkg/util/webhook/client.go:187 builds
 // serverName = <name>.<namespace>.svc, :193-195 assigns it to
 // cfg.TLSClientConfig.ServerName, and :202-210 substitutes the resolved endpoint
 // address at dial time only — so the certificate is verified against the hostname,
@@ -675,7 +675,7 @@ func createCRD(t *testing.T, cl apiextensionsclient.Interface, crd *apiextension
 // delivers an AdmissionReview to a `service:`-referenced validating webhook whose
 // backend is a `runtimeClassName: vm` Pod, through darwin-net's userspace Service
 // proxy — see the file comment for the path, the TLS ServerName finding
-// (k8s.io/apiserver@v0.35.0/pkg/util/webhook/client.go:187,193-195) and the run
+// (k8s.io/apiserver@v0.36.5/pkg/util/webhook/client.go:187,193-195) and the run
 // command.
 //
 // CONTAINMENT. The webhook's rules match ONE resource in ONE API group that exists
