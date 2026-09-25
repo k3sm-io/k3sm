@@ -18,6 +18,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,6 +120,47 @@ func TestEnsureKineIntoSkipsOnMatchingMarker(t *testing.T) {
 	got, err := os.ReadFile(kinePath(bd))
 	if err != nil || string(got) != "pretend-kine" {
 		t.Errorf("staged kine was replaced: %v %q", err, got)
+	}
+}
+
+// TestEnsureKineWithoutToolchainFailsActionably is the toolchain preflight (B393). A
+// binary swap carrying a kine pin bump, on a daemon whose launchd PATH has no `go`,
+// used to reach `go env GOMODCACHE` and fail with a bare exec error five times before
+// the breaker parked. The build path must refuse BEFORE any subprocess, with an error
+// the daemon can classify (errors.Is the sentinel, never a message match) and whose
+// text names the fix.
+func TestEnsureKineWithoutToolchainFailsActionably(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // a PATH that exists and holds no `go`
+
+	origCache, origBuild := kineModuleCacheDir, runKineBuild
+	t.Cleanup(func() { kineModuleCacheDir, runKineBuild = origCache, origBuild })
+	kineModuleCacheDir = func(context.Context) (string, error) {
+		t.Error("the module-cache probe ran `go env` without a toolchain on PATH")
+		return "", errors.New("unreachable")
+	}
+	runKineBuild = func(context.Context, string, string, string) ([]byte, error) {
+		t.Error("the kine build ran `go install` without a toolchain on PATH")
+		return nil, errors.New("unreachable")
+	}
+
+	bd := t.TempDir()
+	err := ensureKineInto(t.Context(), bd, DefaultKineVersion)
+	if err == nil {
+		t.Fatal("ensureKineInto with no Go toolchain on PATH = nil, want ErrNoGoToolchain")
+	}
+	if !errors.Is(err, ErrNoGoToolchain) {
+		t.Errorf("ensureKineInto error %q does not match ErrNoGoToolchain; the breaker cannot classify it as permanent", err)
+	}
+	for _, want := range []string{"sudo k3sm install", DefaultKineVersion} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	if _, statErr := os.Stat(kinePath(bd)); !os.IsNotExist(statErr) {
+		t.Errorf("a kine binary was staged without a build: %v", statErr)
+	}
+	if kineStaged(bd, DefaultKineVersion) {
+		t.Error("the marker vouches for a kine that was never built")
 	}
 }
 
