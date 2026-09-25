@@ -101,24 +101,31 @@ func run(ctx context.Context, file string) int {
 }
 
 // fetchPinned downloads the pinned darwin asset to path exactly once, hashing the
-// bytes on their way to disk (the discipline of builder's own downloadTo), and
-// fails unless the digest equals builder.HostBuildxSHA256. The file codesign
-// inspects next is therefore the same single copy whose digest was checked.
+// bytes on their way to disk and staging through a temp name so a cancelled run
+// cannot leave a truncated file at path (the same discipline as builder's own
+// unexported downloadTo/ensureVerifiedBinary pair, deliberately duplicated here:
+// this is re-pin-time tooling, and importing it would widen pkg/builder's API for
+// a non-runtime consumer). Fails unless the digest equals builder.HostBuildxSHA256;
+// the file codesign inspects next is the same single copy whose digest was checked.
 func fetchPinned(ctx context.Context, path string) error {
 	url := builder.HostBuildxURL()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
+		return fmt.Errorf("create %s: %w", tmp, err)
 	}
 	sum, err := downloadTo(ctx, f, url)
 	if cerr := f.Close(); err == nil && cerr != nil {
-		err = fmt.Errorf("close %s: %w", path, cerr)
+		err = fmt.Errorf("close %s: %w", tmp, cerr)
 	}
 	if err != nil {
 		return err
 	}
 	if sum != builder.HostBuildxSHA256 {
 		return fmt.Errorf("sha256: %s from %s is %s, want %s", builder.HostBuildxAsset, url, sum, builder.HostBuildxSHA256)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("install %s: %w", path, err)
 	}
 	return nil
 }
