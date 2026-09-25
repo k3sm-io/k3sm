@@ -661,6 +661,14 @@ func (darwinSystem) Chown(path string, uid, gid int) error {
 // the copy somehow left dst non-executable (the alternative is launchd's
 // unrecoverable "Missing executable" job invalidation at bootstrap).
 func (darwinSystem) CopyToRootOwned(src, dst string) error {
+	return copyToRootOwned(src, dst, 0, 0)
+}
+
+// copyToRootOwned is the method above with the owner taken explicitly, the
+// split every other privileged writer here carries: chowning to root needs
+// privilege the tests never take, while the two symlink refusals are exactly
+// what has to be exercised against a real filesystem.
+func copyToRootOwned(src, dst string, uid, gid int) error {
 	dstDir := filepath.Dir(dst)
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return fmt.Errorf("create install dir %s: %w", dstDir, err)
@@ -668,17 +676,18 @@ func (darwinSystem) CopyToRootOwned(src, dst string) error {
 	if err := refuseSymlinkAt(dstDir); err != nil {
 		return fmt.Errorf("install dir %s: %w", dstDir, err)
 	}
-	if err := os.Chown(dstDir, 0, 0); err != nil {
-		return fmt.Errorf("chown install dir %s root:wheel: %w", dstDir, err)
+	if err := os.Chown(dstDir, uid, gid); err != nil {
+		return fmt.Errorf("chown install dir %s to %d:%d: %w", dstDir, uid, gid, err)
 	}
 	if out, err := exec.Command("ditto", src, dst).CombinedOutput(); err != nil {
 		return fmt.Errorf("ditto %s -> %s: %w: %s", src, dst, err, out)
 	}
+	ownershipByPathSite(dst)
 	if err := refuseSymlinkAt(dst); err != nil {
 		return fmt.Errorf("installed binary %s: %w", dst, err)
 	}
-	if err := os.Chown(dst, 0, 0); err != nil {
-		return fmt.Errorf("chown %s root:wheel: %w", dst, err)
+	if err := os.Chown(dst, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", dst, uid, gid, err)
 	}
 	if err := os.Chmod(dst, 0o755); err != nil {
 		return fmt.Errorf("chmod %s 0755: %w", dst, err)
@@ -865,6 +874,11 @@ func (darwinSystem) EnsureSymlink(target, link string) error {
 		if err := os.Mkdir(parent, 0o755); err != nil {
 			return fmt.Errorf("create link dir %s: %w", parent, err)
 		}
+		// A by-path chown, unreachable by a lower-privileged writer: parent was
+		// just created by this process under an ancestor linkDirVerdict has
+		// judged root-owned and not group/other-writable, and LockInstall
+		// serializes concurrent root installs. A non-root write grant on that
+		// ancestor, or a caller bypassing the lock, would reopen the race.
 		if os.Geteuid() == 0 {
 			if err := os.Chown(parent, 0, 0); err != nil {
 				return fmt.Errorf("chown link dir %s root:wheel: %w", parent, err)
@@ -1282,24 +1296,81 @@ func writeServiceUserFile(path string, contents []byte, uid, gid int, mode, dirM
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
+	// Owner and mode are bound to the OPEN descriptor, never re-resolved by
+	// name: dir has just been handed to uid, so by the time a path-based call
+	// ran, that principal could have replaced the temp name with a symlink and
+	// had this process chown/chmod whatever it points at.
+	if err := tmp.Chown(uid, gid); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chown %s to %d:%d: %w", tmpName, uid, gid, err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod %s %#o: %w", tmpName, mode, err)
+	}
 	if _, err := tmp.Write(contents); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("write %s: %w", tmpName, err)
 	}
+	ownershipByPathSite(tmpName)
+	return publishTemp(tmp, path)
+}
+
+// publishTemp renames tmp's name onto path, then closes tmp, but only if that
+// name still resolves to the very file tmp has open.
+//
+// The temp file sits in a directory a lower-privileged principal can write, so
+// between its creation and the rename that principal can unlink the name and
+// plant a symlink (or any other file) there. rename(2) moves whatever ENTRY the
+// name holds, with a nil error, so without this check the destination would be
+// published as the planted entry. The descriptor is kept open until after the
+// rename so its (dev, ino) stays pinned, and the name is Lstat'd, never
+// followed, immediately before the rename; os.SameFile compares exactly those
+// two fields. What remains is the single rename syscall, the same check-then-act
+// window refuseSymlinkAt leaves elsewhere in this file.
+//
+// tmp is closed on every path.
+func publishTemp(tmp *os.File, path string) error {
+	name := tmp.Name()
+	opened, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("stat %s: %w", name, err)
+	}
+	named, err := os.Lstat(name)
+	if err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("lstat %s: %w", name, err)
+	}
+	if !os.SameFile(opened, named) {
+		_ = tmp.Close()
+		return fmt.Errorf("%s: %w", name, errTempSwapped)
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("rename %s to %s: %w", name, path, err)
+	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmpName, err)
-	}
-	if err := os.Chown(tmpName, uid, gid); err != nil {
-		return fmt.Errorf("chown %s to %d:%d: %w", tmpName, uid, gid, err)
-	}
-	if err := os.Chmod(tmpName, mode); err != nil {
-		return fmt.Errorf("chmod %s %#o: %w", tmpName, mode, err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename %s to %s: %w", tmpName, path, err)
+		return fmt.Errorf("close %s: %w", name, err)
 	}
 	return nil
 }
+
+// errTempSwapped is publishTemp's refusal, errSymlinkRefused's sibling: a
+// sentinel so callers and tests match it with errors.Is, never by message.
+var errTempSwapped = errors.New("temp name no longer refers to the file written: refusing to rename it into place")
+
+// ownershipByPathSite runs at each point where an ownership or mode change BY
+// PATH once acted on (or, in copyToRootOwned, would act on) a name inside a
+// directory a lower-privileged principal can write: in writeServiceUserFile and
+// writeUserKubeconfig just before publishTemp (with the temp name), in
+// writeUserKubeconfig after the rename (with the published path), and after
+// ditto in copyToRootOwned. Production leaves it a no-op. It exists only so
+// TestOwnedWritesUseTheOpenDescriptor can swap name for a symlink to a file
+// outside the writable directory at exactly that moment and prove neither the
+// privileged calls nor the rename act on what the name now holds, the
+// netdProbeBeforeWrite idiom.
+var ownershipByPathSite = func(name string) {}
 
 // WriteRootOnlyFile writes contents at path root:wheel at mode. The parent
 // directory is NOT created or re-owned here — the caller ensured it through its
@@ -1319,6 +1390,13 @@ func (darwinSystem) WriteRootOnlyFile(path string, contents []byte, mode fs.File
 // reason: chowning a file to root needs privilege these tests never take, while
 // the MODE, the atomicity and the overwrite of an existing file are exactly what
 // has to be exercised against a real filesystem.
+//
+// Its by-path Chown/Chmod after Close is the shape writeServiceUserFile and
+// writeUserKubeconfig moved onto the descriptor, kept here deliberately: the
+// only parent it writes into is the root-owned MeshKeyDir, so no
+// lower-privileged writer can swap the temp name between the close and those
+// calls; granting any non-root principal write access to that directory would
+// reopen the race.
 func writeRootOnlyFile(path string, contents []byte, uid, gid int, mode fs.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".k3sm-*")
@@ -1372,9 +1450,17 @@ func writeLaunchDaemon(plistPath string, contents []byte, mode fs.FileMode, uid,
 	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
 		return fmt.Errorf("create launchd dir: %w", err)
 	}
+	if err := refuseSymlinkAt(plistPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s: %w", plistPath, err)
+	}
 	if err := os.WriteFile(plistPath, contents, mode); err != nil {
 		return fmt.Errorf("write %s: %w", plistPath, err)
 	}
+	// The trailing chmod/chown resolve plistPath by name, which is safe only
+	// because nothing below root can write /Library/LaunchDaemons (a fixed,
+	// root-owned directory) and LockInstall serializes concurrent root installs.
+	// Any non-root write grant under that directory, or a caller that bypasses
+	// the lock, would resurrect the swap-then-follow race.
 	if err := os.Chmod(plistPath, mode); err != nil {
 		return fmt.Errorf("chmod %s %#o: %w", plistPath, mode, err)
 	}
@@ -1677,7 +1763,24 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
-	kubeDir := filepath.Join(u.HomeDir, ".kube")
+	if err := writeUserKubeconfig(u.HomeDir, uid, gid, contents); err != nil {
+		return fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
+	}
+	return nil
+}
+
+// writeUserKubeconfig is the method above with the home directory and owner
+// taken explicitly, the split writeServiceUserFile carries: the tests exercise
+// the merge, the refusal and the descriptor-bound ownership against a
+// t.TempDir() home, and never look up a real account or touch a developer's
+// real ~/.kube/config.
+//
+// Ownership is bound to the open temp descriptor BEFORE the rename. ~/.kube
+// belongs to the target user, who can replace the published config with a
+// symlink the instant the rename lands; a chown by path after it would follow
+// that link and hand whatever it names to the target user, so there is none.
+func writeUserKubeconfig(homeDir string, uid, gid int, contents []byte) error {
+	kubeDir := filepath.Join(homeDir, ".kube")
 	if err := os.MkdirAll(kubeDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", kubeDir, err)
 	}
@@ -1703,24 +1806,24 @@ func (darwinSystem) WriteUserKubeconfig(targetUser string, contents []byte) erro
 		return fmt.Errorf("create temp kubeconfig: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
 	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("chmod temp kubeconfig: %w", err)
 	}
+	if err := tmp.Chown(uid, gid); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chown temp kubeconfig to %d:%d: %w", uid, gid, err)
+	}
 	if _, err := tmp.Write(merged); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write temp kubeconfig: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp kubeconfig: %w", err)
+	ownershipByPathSite(tmpName)
+	if err := publishTemp(tmp, path); err != nil {
+		return fmt.Errorf("publish kubeconfig: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename kubeconfig into place: %w", err)
-	}
-	if err := os.Chown(path, uid, gid); err != nil {
-		return fmt.Errorf("chown %s to %s: %w", path, targetUser, err)
-	}
+	ownershipByPathSite(path)
 	return nil
 }
 

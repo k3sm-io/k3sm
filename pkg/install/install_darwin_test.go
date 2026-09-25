@@ -708,6 +708,22 @@ func TestWriteLaunchDaemonMode(t *testing.T) {
 		}
 	})
 
+	// refuseSymlinkAt fails its Lstat on a path that does not exist yet; the
+	// writer tolerates exactly that (fs.ErrNotExist) and nothing else, so a
+	// first install into an existing directory still writes the plist.
+	t.Run("a missing plist in an existing dir passes the symlink guard", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ServerLabel+".plist")
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("precondition: %s exists (err %v)", path, err)
+		}
+		if err := writeLaunchDaemon(path, []byte("<plist/>"), ServerPlistMode, uid, gid); err != nil {
+			t.Fatalf("writeLaunchDaemon: %v", err)
+		}
+		assertRegularFile(t, path, "<plist/>")
+		assertMode(t, path, ServerPlistMode)
+	})
+
 	t.Run("every other daemon keeps the conventional mode", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), NetdLabel+".plist")
 		if err := writeLaunchDaemon(path, []byte("<plist/>"), plistMode(NetdLabel), uid, gid); err != nil {
@@ -854,6 +870,9 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 		// mode as planted.
 		victim     string
 		victimMode os.FileMode
+		// untouched, when set, runs after the refusal and asserts that no
+		// privileged operation reached elsewhere (nothing written into it).
+		untouched func(t *testing.T, elsewhere string)
 	}{
 		{
 			name: "data root",
@@ -906,6 +925,81 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 			},
 			victimMode: 0o755,
 		},
+		{
+			// The install dir is refused before ditto and before any chown, so
+			// the binary never lands in the link's target.
+			name: "root-owned copy install dir",
+			run: func(t *testing.T, root, elsewhere string) error {
+				src := plantFile(t, filepath.Join(root, "k3sm-build"), "binary\n", 0o755)
+				dir := filepath.Join(root, "bin")
+				symlinkT(t, elsewhere, dir)
+				return copyToRootOwned(src, filepath.Join(dir, "k3sm"), uid, gid)
+			},
+			victimMode: 0o755,
+			untouched:  assertEmptyDir,
+		},
+		{
+			// ditto replaces a pre-planted symlink with a regular file, so the
+			// only reachable plant at dst is one swapped in after the copy; the
+			// sabotage hook does exactly that, and the refusal must fire before
+			// the by-path chown/chmod could follow it to the victim.
+			name: "root-owned copy installed binary",
+			run: func(t *testing.T, root, elsewhere string) error {
+				src := plantFile(t, filepath.Join(root, "k3sm-build"), "binary\n", 0o755)
+				dir := filepath.Join(root, "bin")
+				mkdir(t, dir, 0o755)
+				victim := plantFile(t, filepath.Join(elsewhere, "victim"), "not a binary\n", 0o644)
+				dst := filepath.Join(dir, "k3sm")
+				sabotageAt(t, dst, victim)
+				return copyToRootOwned(src, dst, uid, gid)
+			},
+			victim:     "victim",
+			victimMode: 0o644,
+			untouched: func(t *testing.T, elsewhere string) {
+				assertContent(t, filepath.Join(elsewhere, "victim"), "not a binary\n")
+			},
+		},
+		{
+			name: "launch daemon plist",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "LaunchDaemons")
+				mkdir(t, dir, 0o755)
+				victim := plantFile(t, filepath.Join(elsewhere, "victim"), "not a plist\n", 0o644)
+				plist := filepath.Join(dir, ServerLabel+".plist")
+				symlinkT(t, victim, plist)
+				return writeLaunchDaemon(plist, []byte("<plist/>"), ServerPlistMode, uid, gid)
+			},
+			victim:     "victim",
+			victimMode: 0o644,
+			untouched: func(t *testing.T, elsewhere string) {
+				assertContent(t, filepath.Join(elsewhere, "victim"), "not a plist\n")
+			},
+		},
+		{
+			// A DANGLING link is still a link: the guard refuses it rather than
+			// let os.WriteFile create the file at the link's target.
+			name: "launch daemon plist dangling link",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "LaunchDaemons")
+				mkdir(t, dir, 0o755)
+				plist := filepath.Join(dir, ServerLabel+".plist")
+				symlinkT(t, filepath.Join(elsewhere, "created-through-the-link"), plist)
+				return writeLaunchDaemon(plist, []byte("<plist/>"), ServerPlistMode, uid, gid)
+			},
+			victimMode: 0o755,
+			untouched:  assertEmptyDir,
+		},
+		{
+			name: "user kubeconfig dir",
+			run: func(t *testing.T, root, elsewhere string) error {
+				home := filepath.Join(root, "home")
+				mkdir(t, home, 0o755)
+				symlinkT(t, elsewhere, filepath.Join(home, ".kube"))
+				return writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+			},
+			victimMode: 0o755,
+			untouched:  assertEmptyDir,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -920,7 +1014,238 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 				t.Errorf("error %q is not the symlink refusal", err)
 			}
 			assertMode(t, filepath.Join(elsewhere, tc.victim), tc.victimMode)
+			if tc.untouched != nil {
+				tc.untouched(t, elsewhere)
+			}
 		})
+	}
+}
+
+// TestOwnedWritesUseTheOpenDescriptor is B376's gate: the writers that hand a
+// freshly written credential to a lower-privileged principal must bind its
+// owner and mode to the OPEN temp descriptor, never re-resolve the file by name
+// inside a directory that principal can write, and must never publish an entry
+// that is no longer the file they wrote.
+//
+// ownershipByPathSite fires where a by-path call once ran (just before the
+// rename with the temp name, and after the rename with the published kubeconfig)
+// and swaps that name for a symlink to a victim file OUTSIDE the writable
+// directory. A same-directory victim would prove nothing: the principal already
+// owns everything in there. Two things are asserted on every row:
+//
+//   - the victim keeps its mode, owner and content, so nothing privileged
+//     followed the link;
+//   - the destination is a regular file with the content this row expects,
+//     never the planted symlink. A swapped temp name must make the write FAIL
+//     with errTempSwapped and leave the previous destination in place, because
+//     rename(2) would otherwise publish the symlink entry itself.
+//
+// Unprivileged: the owner handed over is the test process's own uid with a
+// supplementary group different from the victim's, a chown the kernel permits
+// without privilege and one that makes a followed chown observable.
+func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
+	uid := os.Getuid()
+	const oldToken = "K10old::node:old\n"
+
+	for _, tc := range []struct {
+		name string
+		// run arms the sabotage hook, runs the writer under root (handing the
+		// result to uid:gid) and asserts on the destination.
+		run func(t *testing.T, root string, gid int, victim string)
+	}{
+		{
+			name: "service-user file: temp name swapped before the rename",
+			run: func(t *testing.T, root string, gid int, victim string) {
+				dir := filepath.Join(root, "creds")
+				mkdir(t, dir, 0o700)
+				path := plantFile(t, filepath.Join(dir, "token"), oldToken, 0o600)
+				sabotageMatching(t, func(name string) bool {
+					return filepath.Dir(name) == dir && strings.HasPrefix(filepath.Base(name), ".k3sm-")
+				}, victim)
+
+				err := writeServiceUserFile(path, []byte("secret\n"), uid, gid, 0o600, 0o700)
+				if !errors.Is(err, errTempSwapped) {
+					t.Errorf("write = %v, want the swapped-temp refusal", err)
+				}
+				assertRegularFile(t, path, oldToken)
+			},
+		},
+		{
+			name: "user kubeconfig: temp name swapped before the rename",
+			run: func(t *testing.T, root string, gid int, victim string) {
+				home := filepath.Join(root, "home")
+				kubeDir := filepath.Join(home, ".kube")
+				mkdirAllT(t, kubeDir)
+				path := plantFile(t, filepath.Join(kubeDir, "config"), existingKube, 0o600)
+				sabotageMatching(t, func(name string) bool {
+					return filepath.Dir(name) == kubeDir && strings.HasPrefix(filepath.Base(name), ".k3sm-kubeconfig-")
+				}, victim)
+
+				err := writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				if !errors.Is(err, errTempSwapped) {
+					t.Errorf("write = %v, want the swapped-temp refusal", err)
+				}
+				assertRegularFile(t, path, existingKube)
+			},
+		},
+		{
+			// The by-path chown this row guards ran AFTER the rename, on the
+			// published name. Once published, the file is the target user's to
+			// replace; what must hold is that the writer published a regular
+			// file with the merged content (asserted at the moment of
+			// publication, before the swap) and then acted on nothing by name.
+			name: "user kubeconfig: published config swapped after the rename",
+			run: func(t *testing.T, root string, gid int, victim string) {
+				home := filepath.Join(root, "home")
+				mkdir(t, home, 0o755)
+				path := filepath.Join(home, ".kube", "config")
+				want, err := mergeAdminKubeconfig(nil, []byte(adminKube), adminContextName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				published := false
+				sabotageMatching(t, func(name string) bool {
+					if name != path {
+						return false
+					}
+					published = true
+					assertRegularFile(t, path, string(want))
+					assertMode(t, path, 0o600)
+					return true
+				}, victim)
+
+				if err := writeUserKubeconfig(home, uid, gid, []byte(adminKube)); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				if !published {
+					t.Error("the published config was never inspected")
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			outside := filepath.Join(root, "outside")
+			mkdir(t, outside, 0o755)
+			const victimBody = "someone else's file\n"
+			victim := plantFile(t, filepath.Join(outside, "victim"), victimBody, 0o644)
+			before := statOwner(t, victim)
+			gid := otherGroup(t, before.gid)
+
+			tc.run(t, root, gid, victim)
+
+			assertMode(t, victim, 0o644)
+			if after := statOwner(t, victim); after != before {
+				t.Errorf("victim %s owner changed %d:%d -> %d:%d: a by-path chown followed the swapped-in symlink",
+					victim, before.uid, before.gid, after.uid, after.gid)
+			}
+			assertContent(t, victim, victimBody)
+		})
+	}
+}
+
+// assertRegularFile asserts path is a regular file (Lstat, so a symlink is seen
+// as itself) holding exactly want.
+func assertRegularFile(t *testing.T, path, want string) {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("%s is %v, want a regular file: a swapped entry was published", path, fi.Mode().Type())
+	}
+	assertContent(t, path, want)
+}
+
+// sabotageAt arms ownershipByPathSite for the rest of the test: when it fires
+// for name, name is removed and replanted as a symlink to victim.
+func sabotageAt(t *testing.T, name, victim string) {
+	t.Helper()
+	sabotageMatching(t, func(n string) bool { return n == name }, victim)
+}
+
+func sabotageMatching(t *testing.T, match func(string) bool, victim string) {
+	t.Helper()
+	orig := ownershipByPathSite
+	fired := false
+	ownershipByPathSite = func(name string) {
+		if !match(name) {
+			return
+		}
+		fired = true
+		if err := os.Remove(name); err != nil {
+			t.Errorf("sabotage: remove %s: %v", name, err)
+			return
+		}
+		if err := os.Symlink(victim, name); err != nil {
+			t.Errorf("sabotage: symlink %s -> %s: %v", name, victim, err)
+		}
+	}
+	t.Cleanup(func() {
+		ownershipByPathSite = orig
+		if !fired {
+			t.Error("sabotage hook never fired: the gate exercised nothing")
+		}
+	})
+}
+
+type fileOwner struct{ uid, gid uint32 }
+
+func statOwner(t *testing.T, path string) fileOwner {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	return fileOwner{uid: st.Uid, gid: st.Gid}
+}
+
+// otherGroup returns a group the test process belongs to that is not not, so a
+// chown to it is permitted unprivileged and visible on the victim.
+func otherGroup(t *testing.T, not uint32) int {
+	t.Helper()
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range append([]int{os.Getgid()}, groups...) {
+		if uint32(g) != not {
+			return g
+		}
+	}
+	t.Skip("the test process belongs to no group other than the victim's; a followed chown would be invisible")
+	return 0
+}
+
+func plantFile(t *testing.T, path, body string, mode os.FileMode) string {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != want {
+		t.Errorf("%s = %q (err %v), want %q untouched", path, got, err, want)
+	}
+}
+
+func assertEmptyDir(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("%s holds %d entries after a refusal, want none", dir, len(entries))
 	}
 }
 
