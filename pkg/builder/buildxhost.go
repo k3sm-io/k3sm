@@ -48,14 +48,33 @@ import (
 // (Mach-O 64-bit arm64, 63027232 bytes, notarized, "Developer ID Application:
 // Docker Inc (9BNSXJN65R)"; the digest matches the release API's asset digest).
 // The signer changed at this bump: v0.17.1 was signed "Tonis Tiigi
-// (F32M533787)". Re-record a bump the same way: download the asset, sha256 it,
-// cross-check the release API's asset digest, and confirm `codesign -dv` reports
-// the Docker Inc Developer ID before pinning.
+// (F32M533787)".
+//
+// Re-record a bump the same way: download the asset, sha256 it, cross-check the
+// release API's asset digest, then run hack/verify-buildx-signer.sh. That script
+// is the mechanical half of the procedure: it downloads the pinned asset once,
+// asserts its sha256 equals HostBuildxSHA256, and asserts codesign reports a
+// strictly valid signature whose TeamIdentifier equals HostBuildxTeamID. Run it
+// after editing the constants; it exits non-zero on any mismatch, so it also
+// catches drift between the committed pin and what upstream serves.
 const (
 	// HostBuildxAsset is the pinned host buildx asset name (the host is darwin/arm64).
 	HostBuildxAsset = "buildx-" + BuildxVersion + "." + hostBuildxPlatform
 	// HostBuildxSHA256 is the released darwin/arm64 asset's sha256.
 	HostBuildxSHA256 = "c3cbbc820d578b0aa8158dd62ef1af25a0c8a75ef53331dbe4e219471e1dbe8c"
+	// HostBuildxTeamID is the Apple Developer Team ID the pinned darwin asset
+	// must be signed by: "Developer ID Application: Docker Inc". It is the ONE
+	// current expected signer, checked at re-pin time by
+	// hack/verify-buildx-signer.sh and never at runtime (runtime verification is
+	// the sha256 pin alone).
+	//
+	// Provenance: buildx darwin releases were signed by the individual
+	// maintainer "Tonis Tiigi (F32M533787)" through v0.35.0 and by Docker Inc
+	// from v0.36.0. That retired signer is recorded here for history and is
+	// deliberately NOT accepted. A future signer transition is a deliberate,
+	// reviewed change to this constant, never an append to an allowlist: a
+	// second accepted identity would let either signer's key sign a re-pin.
+	HostBuildxTeamID = "9BNSXJN65R"
 
 	// BuilderInstanceName is the buildx builder instance k3sm owns and injects
 	// with --builder. It lives in a k3sm-owned BUILDX_CONFIG store, so the name
