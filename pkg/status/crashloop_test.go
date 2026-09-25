@@ -76,6 +76,14 @@ func TestClassifyCrashLoop(t *testing.T) {
 			executor.CrashRecord{Crashes: []executor.Crash{bringUp(time.Minute, "kube-apiserver")}, TrippedAt: &tripped}, nil,
 			PostureParked, []string{"never came up (last: kube-apiserver)", "parked", "--clear-crashloop", path},
 			[]string{"crashed"}},
+		{"a permanent bring-up park names the fix, not only the record",
+			executor.CrashRecord{Crashes: []executor.Crash{func() executor.Crash {
+				c := bringUp(time.Minute, "provision/kine")
+				c.Permanent, c.Remedy = true, executor.NoGoToolchainRemedy
+				return c
+			}()}, TrippedAt: &tripped}, nil,
+			PostureParked, []string{"never came up (last: provision/kine)", "cannot heal on retry", "sudo k3sm install", "--clear-crashloop"},
+			[]string{"crashed", path}},
 		{"a pre-origin record still reads as a crash",
 			executor.CrashRecord{Crashes: []executor.Crash{legacy(3*time.Minute, "kine"), legacy(time.Minute, "kine")}}, nil,
 			PostureRestarting, []string{"restarted 2 times", "last crash: kine"}, []string{"never came up"}},
@@ -94,6 +102,11 @@ func TestClassifyCrashLoop(t *testing.T) {
 			for _, w := range tc.wantIn {
 				if !strings.Contains(v.Detail+"\n"+v.Remedy, w) {
 					t.Errorf("verdict lacks %q: %+v", w, v)
+				}
+			}
+			for _, w := range tc.wantNotIn {
+				if strings.Contains(v.Detail+"\n"+v.Remedy, w) {
+					t.Errorf("verdict carries %q: %+v", w, v)
 				}
 			}
 			// The record's detail field is never quoted: it is redacted, but the

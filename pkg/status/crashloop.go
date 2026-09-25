@@ -39,7 +39,9 @@ import (
 // `sudo k3sm status` reads it. The row NEVER quotes the record's detail field:
 // it is already redacted, but a status report is the one output an operator
 // pastes into an issue, and a component name plus a count is what the decision
-// needs.
+// needs. A parked record whose last entry is a PERMANENT bring-up failure does
+// name its fix: that is the entry's Remedy, a fixed string pkg/executor owns
+// (never log text), so the row stays paste-safe and says what to do.
 
 // CrashLoopPosture is what the record says about the server job. Exactly one
 // of the Severity-bearing states is returned; a record that is absent or empty
@@ -93,10 +95,16 @@ func ClassifyCrashLoop(rec executor.CrashRecord, readErr error, path string, now
 			detail = fmt.Sprintf("crash-loop breaker tripped at %s: the control plane never came up (last: %s), %d failures within %s; the daemon is parked and serves nothing",
 				rec.TrippedAt.Format(time.RFC3339), last.Component, n, executor.CrashLoopWindow)
 		}
+		remedy := "sudo k3sm server --clear-crashloop   # after fixing the fault named in " + path + "; the parked daemon restarts itself"
+		if neverCameUp(last) && last.Permanent && last.Remedy != "" {
+			detail = fmt.Sprintf("crash-loop breaker tripped at %s: the control plane never came up (last: %s) with a fault that cannot heal on retry; the daemon is parked and serves nothing",
+				rec.TrippedAt.Format(time.RFC3339), last.Component)
+			remedy = last.Remedy + "; then sudo k3sm server --clear-crashloop   # the parked daemon restarts itself"
+		}
 		return CrashLoopVerdict{
 			Posture: PostureParked,
 			Detail:  detail,
-			Remedy:  "sudo k3sm server --clear-crashloop   # after fixing the fault named in " + path + "; the parked daemon restarts itself",
+			Remedy:  remedy,
 		}
 	}
 	if n := rec.Recent(now); n >= restartingFloor {
