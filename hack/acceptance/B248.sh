@@ -24,11 +24,16 @@
 #   LAB TIER (K3SM_LAB=1, ONE Mac, root) — the only tier that can prove the
 #   thing the feature is about: a real APFS volume. It creates its own small
 #   scratch volumes under /Library/k3sm-acceptance-datavol/ and destroys them
-#   again. It NEVER touches /var/lib/k3sm, /Library/k3sm or /etc/fstab — the
+#   again. It NEVER writes /var/lib/k3sm, /Library/k3sm or /etc/fstab — the
 #   rig's real data volume, its record and its fstab line are out of scope by
 #   construction, and the helper it drives refuses any path outside the scratch
 #   root before it does any disk work. Announced LAB-PENDING when K3SM_LAB is
-#   unset; never silently passed.
+#   unset; never silently passed. Its last rungs load a REAL launchd oneshot,
+#   rendered like io.k3sm.datavol but under a scratch label suffixed with the
+#   run's PID, and read the datavol row of `k3sm status` scoped to that label
+#   and a scratch record (--datavol-label/--datavol-record/--datavol-root). The
+#   real io.k3sm.datavol job and /Library/LaunchDaemons are never touched; that
+#   status run only READS the installed state, as every status run does.
 #
 # Usage:  hack/acceptance/B248.sh            # CI tier only
 #         K3SM_LAB=1 hack/acceptance/B248.sh # + the one-Mac lab tier (root; prompts for sudo)
@@ -184,10 +189,16 @@ if [ "${K3SM_LAB:-}" != 1 ]; then
 	lab_pending "b248.L4  an encrypted volume's passphrase is in the System keychain and \`datavol mount\` unlocks a locked volume"
 	lab_pending "b248.L5  \`k3sm datavol delete --yes\` destroys the volume, the record, the mount point and the keychain item"
 	lab_pending "b248.L6  a plain data root migrates onto a volume with every file and the datastore's bytes intact, leaving .pre-volume behind"
+	lab_pending "b248.L7  the scratch oneshot plist carries the key fields of pkg/install's DatavolPlist template and parses as a plist"
+	lab_pending "b248.L8  a real oneshot under a PID-suffixed scratch label exits 0 and \`k3sm status --datavol-label/--datavol-record\` reports its datavol row ok from that exit"
+	lab_pending "b248.L9  the same label re-bootstrapped onto a failing invocation exits non-zero and the datavol row renders failed with that exit"
+	lab_pending "b248.L10 after cleanup no scratch launchd job, no scratch volume and no scratch tree remains"
 	echo
 	echo "  It runs on ONE Mac and needs root. Nothing it touches is the rig's: every"
 	echo "  path lives under $SCRATCH_ROOT, and /var/lib/k3sm, /Library/k3sm and"
-	echo "  /etc/fstab are never read or written (the helper refuses any other path)."
+	echo "  /etc/fstab are never written (the helper refuses any other path). L8/L9's"
+	echo "  scoped \`k3sm status\` reads the installed state the report always reads, and"
+	echo "  their launchd job is a scratch label, never io.k3sm.datavol."
 else
 	echo "----------------------------------------"
 	echo "B248 LAB tier: creating real APFS volumes under $SCRATCH_ROOT (root; each step prompts sudo as needed)"
@@ -207,13 +218,24 @@ else
 	GO_BIN="$(command -v go)"
 	GOWORK_FILE="${GOWORK:-$(go env GOWORK)}"
 	CREATED_UUIDS=""
+	# The scratch oneshot. Its label is suffixed with this run's PID and is
+	# never io.k3sm.datavol; its plist, log and failing record live in the
+	# scratch tree, not in /Library/LaunchDaemons.
+	ONESHOT_LABEL="io.k3sm.datavol.gate-$$"
+	ONESHOT_PLIST="$GATE_DIR/$ONESHOT_LABEL.plist"
+	ONESHOT_LOG="$GATE_DIR/oneshot.log"
+	BAD_REC="$GATE_DIR/record-bad.json"
 
 	# Registered BEFORE the first mutation. It unmounts and destroys every
 	# volume this run created (by UUID, and by name for one that was created
 	# but whose UUID never reached us), drops the keychain items, and removes
 	# the scratch tree. It never names a path outside $SCRATCH_ROOT.
 	cleanup() {
-		echo "--- b248 cleanup: removing this run's volumes, records and directories"
+		echo "--- b248 cleanup: removing this run's launchd job, volumes, records and directories"
+		# The scratch oneshot goes FIRST: a loaded job with KeepAlive-on-failure
+		# would otherwise respawn into the volumes being destroyed below. bootout
+		# of a label that was never bootstrapped is a harmless error.
+		sudo launchctl bootout "system/$ONESHOT_LABEL" >/dev/null 2>&1 || true
 		for u in $CREATED_UUIDS; do
 			sudo diskutil unmount force "$u" >/dev/null 2>&1 || true
 			sudo diskutil apfs deleteVolume "$u" >/dev/null 2>&1 || true
@@ -445,8 +467,219 @@ print(d if isinstance(d, int) else 0)' "$1"; }
 	fi
 	ladder "$l6" "b248.L6  $want_files files and the datastore's bytes migrated onto $VOL_M, .pre-volume preserved ($stats_line)"
 
+	# ---- b248.L7..L10 — the datavol row against a REAL launchd oneshot -----
+	# Every rung above drives the CLI directly. These load the mount oneshot
+	# into launchd — rendered as pkg/install renders io.k3sm.datavol, but under
+	# $ONESHOT_LABEL, running the staged tree build, mounting the L6 volume from
+	# its scratch record — and read the row `k3sm status` sources from the job's
+	# last exit, scoped to that label, record and data root.
+
+	# oneshot_plist <record> — the scratch oneshot's plist on stdout. It is
+	# written the way renderPlist writes DatavolPlist (L7 pins the parity):
+	# root (no UserName), `datavol mount`, RunAtLoad, KeepAlive only on a
+	# failed exit, launchd's ten-second throttle.
+	oneshot_plist() {
+		cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$ONESHOT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$K3SM_BIN</string>
+    <string>datavol</string>
+    <string>mount</string>
+    <string>--record</string>
+    <string>$1</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>$ONESHOT_LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$ONESHOT_LOG</string>
+</dict>
+</plist>
+PLIST
+	}
+
+	# oneshot_load <record> — (re)write the plist root:wheel 0644, as launchd
+	# requires of a system-domain job, and bootstrap it.
+	oneshot_load() {
+		oneshot_plist "$1" | sudo tee "$ONESHOT_PLIST" >/dev/null
+		sudo chown root:wheel "$ONESHOT_PLIST"
+		sudo chmod 0644 "$ONESHOT_PLIST"
+		sudo launchctl bootstrap system "$ONESHOT_PLIST"
+	}
+
+	# oneshot_unload — bootout, then wait until launchd has actually let go of
+	# the label: a bootstrap racing an unfinished bootout fails with EIO.
+	oneshot_unload() {
+		sudo launchctl bootout "system/$ONESHOT_LABEL" >/dev/null 2>&1 || true
+		for _ in $(seq 1 50); do
+			sudo launchctl print "system/$ONESHOT_LABEL" >/dev/null 2>&1 || return 0
+			sleep 0.2
+		done
+		return 1
+	}
+
+	# oneshot_key <key> — one `key = value` scalar from launchctl print (the
+	# first occurrence, as pkg/status's parser takes it).
+	oneshot_key() {
+		sudo launchctl print "system/$ONESHOT_LABEL" 2>/dev/null |
+			sed -n "s/^[[:space:]]*$1 = //p" | head -1 || true
+	}
+
+	# oneshot_wait <want> — poll until the job has run and exited with a code
+	# matching <want> (zero or nonzero) and is not running; 60s budget.
+	oneshot_wait() {
+		local want="$1" code state runs
+		for _ in $(seq 1 120); do
+			code="$(oneshot_key 'last exit code')"
+			state="$(oneshot_key state)"
+			runs="$(oneshot_key runs)"
+			if [ "${runs:-0}" -ge 1 ] 2>/dev/null && [ "$state" != running ] && printf '%s' "$code" | grep -qE '^-?[0-9]+$'; then
+				if [ "$want" = zero ] && [ "$code" = 0 ]; then return 0; fi
+				if [ "$want" = nonzero ] && [ "$code" != 0 ]; then return 0; fi
+			fi
+			sleep 0.5
+		done
+		echo "    launchctl: state=$state runs=$runs last exit code=$code after 60s (want $want)"
+		return 1
+	}
+
+	# datavol_row <field> — one field of the datavol row out of `k3sm status
+	# -o json` on stdin ("wide.<key>" reaches into the wide map). Prints
+	# <absent> when the report carries no datavol row at all, and <no report>
+	# when stdin is not JSON, so a broken report reddens the rung rather than
+	# aborting the gate under set -e.
+	datavol_row() { python3 -c 'import json,sys
+try: rep=json.load(sys.stdin)
+except ValueError: print("<no report>"); raise SystemExit(0)
+rows=[r for r in rep.get("rows",[]) if r.get("name")=="datavol"]
+if not rows: print("<absent>"); raise SystemExit(0)
+d=rows[0]
+for k in sys.argv[1].split(".",1):
+    d = d.get(k, "") if isinstance(d, dict) else ""
+print(d)' "$1"; }
+
+	# scoped_status — the staged build's `status -o json`, scoped to this
+	# run's oneshot label, the L6 record and the root it declares. Its exit
+	# code is the whole-Mac verdict, which this rung does not assert on.
+	scoped_status() {
+		sudo "$K3SM_BIN" status --datavol-label "$ONESHOT_LABEL" --datavol-record "$REC_M" --datavol-root "$SRC" -o json 2>/dev/null || true
+	}
+
+	# ---- b248.L7 — the scratch plist IS the product's template -------------
+	# The product has no standalone render path for a relabelled plist
+	# (DatavolPlist fixes the label and the log path), so the plist above is
+	# hand-written. Its parity with the product is asserted from both sides:
+	# the template's source still says what the plist says, and the plist
+	# carries every fragment TestDatavolPlist pins on the rendered bytes.
+	l7=ok
+	dv_src="$(sed -n '/^func DatavolPlist(/,/^}/p' "$K3SM_ROOT/pkg/install/datavol.go")"
+	for pat in 'Label:[[:space:]]+DatavolLabel' '"datavol", "mount"' 'RunAtLoad:[[:space:]]+true' \
+		'KeepAliveOnFailure:[[:space:]]+true' 'ThrottleInterval:[[:space:]]+datavolThrottleSeconds'; do
+		printf '%s' "$dv_src" | grep -qE "$pat" || { echo "    DatavolPlist no longer carries /$pat/"; l7=no; }
+	done
+	# A field line, not the "// No UserName:" comment the template carries.
+	if printf '%s' "$dv_src" | grep -qE '^[[:space:]]*UserName:'; then echo "    DatavolPlist now names a UserName; the scratch plist runs as root"; l7=no; fi
+	grep -qE 'datavolThrottleSeconds[[:space:]]*=[[:space:]]*10$' "$K3SM_ROOT/pkg/install/datavol.go" || { echo "    datavolThrottleSeconds is no longer 10"; l7=no; }
+	grep -q '<key>KeepAlive</key>\\n  <dict>\\n    <key>SuccessfulExit</key>\\n    <false/>' "$K3SM_ROOT/pkg/install/install.go" || { echo "    renderPlist no longer writes the SuccessfulExit dict"; l7=no; }
+	rendered="$(oneshot_plist "$REC_M")"
+	for frag in "<key>Label</key>|  <string>$ONESHOT_LABEL</string>" "<string>datavol</string>|    <string>mount</string>" \
+		"<key>RunAtLoad</key>|  <true/>" "<key>KeepAlive</key>|  <dict>|    <key>SuccessfulExit</key>|    <false/>|  </dict>" \
+		"<key>ThrottleInterval</key>|  <integer>10</integer>" "<string>$K3SM_BIN</string>"; do
+		want="$(printf '%s' "$frag" | tr '|' '\n')"
+		case "$rendered" in *"$want"*) ;; *) echo "    the scratch plist lacks: $frag"; l7=no ;; esac
+	done
+	case "$rendered" in *"<key>UserName</key>"*) echo "    the scratch plist names a UserName"; l7=no ;; esac
+	[ "$ONESHOT_LABEL" != "io.k3sm.datavol" ] || { echo "    the scratch label is the real one"; l7=no; }
+	# plutil -lint accepts almost anything (bare text is an OpenStep string),
+	# so the parse check reads keys back out of the plist instead.
+	p_label="$(printf '%s' "$rendered" | plutil -extract Label raw -o - - 2>/dev/null || true)"
+	p_keep="$(printf '%s' "$rendered" | plutil -extract KeepAlive.SuccessfulExit raw -o - - 2>/dev/null || true)"
+	[ "$p_label" = "$ONESHOT_LABEL" ] && [ "$p_keep" = false ] || { echo "    plutil reads Label=$p_label KeepAlive.SuccessfulExit=$p_keep"; l7=no; }
+	ladder "$l7" "b248.L7  the scratch oneshot plist carries DatavolPlist's key fields (root, datavol mount, RunAtLoad, KeepAlive{SuccessfulExit:false}, throttle 10) and parses as a plist"
+
+	# ---- b248.L8 — a clean oneshot exit is the row's ok ---------------------
+	l8=ok
+	if sudo launchctl print "system/$ONESHOT_LABEL" >/dev/null 2>&1; then
+		echo "    $ONESHOT_LABEL is already loaded before this run bootstrapped it"; l8=no
+	fi
+	if [ "$l8" = ok ]; then
+		oneshot_load "$REC_M" || { echo "    launchctl bootstrap failed"; l8=no; }
+	fi
+	if [ "$l8" = ok ]; then
+		oneshot_wait zero || l8=no
+		code="$(oneshot_key 'last exit code')"
+		[ "$code" = 0 ] || { echo "    launchctl print: last exit code = $code, want 0"; sudo tail -5 "$ONESHOT_LOG" 2>/dev/null | sed 's/^/    | /'; l8=no; }
+		mountedAt "$SRC" || { echo "    $SRC is not mounted after the oneshot ran"; l8=no; }
+		st="$(scoped_status)"
+		r_state="$(printf '%s' "$st" | datavol_row state)"
+		r_sev="$(printf '%s' "$st" | datavol_row severity)"
+		r_detail="$(printf '%s' "$st" | datavol_row detail)"
+		r_label="$(printf '%s' "$st" | datavol_row wide.label)"
+		r_exit="$(printf '%s' "$st" | datavol_row wide.last-exit)"
+		r_runs="$(printf '%s' "$st" | datavol_row wide.runs)"
+		echo "    datavol row: state=$r_state severity=$r_sev detail=\"$r_detail\" label=$r_label last-exit=$r_exit runs=$r_runs"
+		[ "$r_state" = ok ] && [ "$r_sev" = ok ] || { echo "    the datavol row is not ok"; l8=no; }
+		[ "$r_detail" = "last run exit 0" ] || { echo "    the datavol row's detail is not the exit-0 provenance"; l8=no; }
+		[ "$r_label" = "$ONESHOT_LABEL" ] || { echo "    the datavol row reports label $r_label, not the scratch job"; l8=no; }
+		[ "$r_exit" = 0 ] || { echo "    the datavol row's last-exit is $r_exit, want 0"; l8=no; }
+		[ "${r_runs:-0}" -ge 1 ] 2>/dev/null || { echo "    the datavol row counts $r_runs runs, want >= 1"; l8=no; }
+	fi
+	ladder "$l8" "b248.L8  $ONESHOT_LABEL ran \`datavol mount\` to exit 0 under launchd and \`k3sm status --datavol-label\` reports the datavol row ok, \"last run exit 0\""
+
+	# ---- b248.L9 — a failing oneshot exit is the row's failure --------------
+	# The same label, re-bootstrapped onto a record that does not parse:
+	# `datavol mount` refuses it before any disk work, so the job exits
+	# non-zero and launchd keeps it (KeepAlive on failure) at the throttle.
+	l9=ok
+	printf '{not json\n' | sudo tee "$BAD_REC" >/dev/null
+	oneshot_unload || { echo "    $ONESHOT_LABEL did not leave launchd after bootout"; l9=no; }
+	if [ "$l9" = ok ]; then
+		oneshot_load "$BAD_REC" || { echo "    launchctl bootstrap (failing variant) failed"; l9=no; }
+	fi
+	if [ "$l9" = ok ]; then
+		oneshot_wait nonzero || l9=no
+		code="$(oneshot_key 'last exit code')"
+		st="$(scoped_status)"
+		r_state="$(printf '%s' "$st" | datavol_row state)"
+		r_sev="$(printf '%s' "$st" | datavol_row severity)"
+		r_detail="$(printf '%s' "$st" | datavol_row detail)"
+		r_exit="$(printf '%s' "$st" | datavol_row wide.last-exit)"
+		r_remedy="$(printf '%s' "$st" | datavol_row remedy)"
+		echo "    launchctl last exit code = $code; datavol row: state=$r_state severity=$r_sev detail=\"$r_detail\" last-exit=$r_exit"
+		[ "$r_state" = failed ] && [ "$r_sev" = fail ] || { echo "    the datavol row is not failed/fail"; l9=no; }
+		case "$r_detail" in "last run exit $code ("*) ;; *) echo "    the datavol row's detail does not name exit $code"; l9=no ;; esac
+		[ "$r_exit" = "$code" ] || { echo "    the datavol row's last-exit is $r_exit, launchctl says $code"; l9=no; }
+		[ "$r_remedy" = "sudo k3sm datavol mount" ] || { echo "    the datavol row's remedy is \"$r_remedy\""; l9=no; }
+	fi
+	ladder "$l9" "b248.L9  $ONESHOT_LABEL re-bootstrapped onto an unparseable record exits ${code:-?} and the datavol row renders failed with that exit"
+
 	trap - EXIT
 	cleanup
+
+	# ---- b248.L10 — cleanup left nothing behind -----------------------------
+	l10=ok
+	if sudo launchctl print "system/$ONESHOT_LABEL" >/dev/null 2>&1; then
+		echo "    $ONESHOT_LABEL is still loaded in the system domain"; l10=no
+	fi
+	for n in "$VOL" "$VOL_E" "$VOL_M" $CREATED_UUIDS; do
+		if diskutil info "$n" >/dev/null 2>&1; then echo "    volume $n survived cleanup"; l10=no; fi
+	done
+	if sudo test -e "$GATE_DIR"; then echo "    $GATE_DIR survived cleanup"; l10=no; fi
+	ladder "$l10" "b248.L10 after cleanup no job $ONESHOT_LABEL, no volume $VOL/$VOL_E/$VOL_M and no $GATE_DIR remain"
 fi
 
 echo "----------------------------------------"

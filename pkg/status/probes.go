@@ -152,11 +152,16 @@ type Paths struct {
 	// daemon on disk at all.
 	DatavolLabel string
 	DatavolLog   string
-	DataRoot     string
-	WorkDir      string
-	NetdSocket   string
-	NetdLog      string
-	ServerLog    string
+	// DatavolRecord is the data-volume record the data-root row reads its
+	// declaration from. Empty means dataroot.DefaultRecordPath, the one
+	// production record; `k3sm status --datavol-record` sets it so a scratch
+	// volume can be reported on without touching the real one.
+	DatavolRecord string
+	DataRoot      string
+	WorkDir       string
+	NetdSocket    string
+	NetdLog       string
+	ServerLog     string
 }
 
 // tokenFlags are the argv flags whose VALUE is a credential. A log line that

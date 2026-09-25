@@ -73,7 +73,7 @@ func newStatusRunner(o statusOptions) statusRunner {
 	return statusRunner{
 		out:       os.Stdout,
 		errOut:    os.Stderr,
-		collect:   func(ctx context.Context) status.Report { return newStatusCollector().Collect(ctx) },
+		collect:   func(ctx context.Context) status.Report { return o.scopeDatavol(newStatusCollector()).Collect(ctx) },
 		stdoutTTY: status.IsTerminal(os.Stdout),
 		stderrTTY: status.IsTerminal(os.Stderr),
 		color:     color,

@@ -182,8 +182,10 @@ type fakeDataRootFS struct {
 	mounted bool
 	entries []string
 	// record is the data-volume record JSON served at
-	// dataroot.DefaultRecordPath; empty means this Mac has none.
-	record string
+	// dataroot.DefaultRecordPath (or at recordPath when that is set); empty
+	// means this Mac has none.
+	record     string
+	recordPath string
 	// blocks, bfree and bsize are what Statfs reports for a mounted data root,
 	// which is where the data-root row's "used" figure comes from. Zero blocks
 	// means the probe cannot answer, the posture the row must not dress up as
@@ -225,10 +227,18 @@ func (f fakeDataRootFS) ReadFile(path string) ([]byte, error) {
 	switch {
 	case path == dataroot.FstabPath && f.fstab != "":
 		return []byte(f.fstab), nil
-	case path == dataroot.DefaultRecordPath && f.record != "":
+	case path == f.recordAt() && f.record != "":
 		return []byte(f.record), nil
 	}
 	return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+}
+
+// recordAt is where this fake serves its record.
+func (f fakeDataRootFS) recordAt() string {
+	if f.recordPath != "" {
+		return f.recordPath
+	}
+	return dataroot.DefaultRecordPath
 }
 
 func (f fakeDataRootFS) ReadDir(path string) ([]fs.DirEntry, error) {

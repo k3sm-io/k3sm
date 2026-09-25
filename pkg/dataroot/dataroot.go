@@ -112,6 +112,14 @@ func Refusal(dir string) error {
 // deliberately NOT fatal here because the fstab line is the second
 // declaration; the authoring paths in pkg/datavol do treat it as fatal.
 func Read(fsys FS, dir string) (State, error) {
+	return ReadWithRecord(fsys, dir, DefaultRecordPath)
+}
+
+// ReadWithRecord is Read with the data-volume record taken from recordPath
+// instead of DefaultRecordPath. It exists for `k3sm status --datavol-record`,
+// which the acceptance gate uses to point the report at a scratch volume's
+// record; every other caller reads the one production record through Read.
+func ReadWithRecord(fsys FS, dir, recordPath string) (State, error) {
 	dir = filepath.Clean(dir)
 	var s State
 
@@ -123,7 +131,7 @@ func Read(fsys FS, dir string) (State, error) {
 			}
 		}
 	}
-	if rec, err := ReadRecord(fsys, DefaultRecordPath); err == nil && rec != nil && samePath(rec.Mountpoint, dir) {
+	if rec, err := ReadRecord(fsys, recordPath); err == nil && rec != nil && samePath(rec.Mountpoint, dir) {
 		s.DeclaredBy = append(s.DeclaredBy, "record")
 		s.Volume = rec
 	}
