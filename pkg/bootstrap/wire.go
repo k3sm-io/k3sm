@@ -190,6 +190,20 @@ type TokenVerifier interface {
 	// timing never confirms that an id exists. Both shipped stores do one
 	// bcrypt compare on every such outcome, against a dummy hash for an unknown
 	// id.
+	//
+	// Parse compatibility is part of the contract too: every token an
+	// implementation accepts must remain parseable by ParseToken, because
+	// joinTokenID keys the post-authentication join limiter (joinRateLimiter)
+	// with ParseToken's user field. An implementation that accepts a grammar
+	// ParseToken rejects sends its entire token population to one shared
+	// fallback bucket, so one holder's burst throttles every other holder.
+	// The pre-authentication limiter in preauth.go (preAuthLimiter) does NOT
+	// bound this risk: it runs before authentication and is identity-blind,
+	// keyed by request source rather than token id, so it cannot tell one
+	// token holder from another. TestJoinTokenIDMatchesEveryShippedVerifier
+	// fails for any implementation in this package that lacks a row proving it
+	// (enumerated under the build's own GOOS/GOARCH; an implementation wired
+	// from another package is outside its reach and needs its own proof).
 	VerifyToken(ctx context.Context, tok string) error
 }
 

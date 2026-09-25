@@ -158,12 +158,15 @@ func (l *joinRateLimiter) sweepLocked(now time.Time) {
 // composite — would hand any token holder a fresh bucket per request and leave
 // the limiter measuring nothing at all.
 //
-// A token this package cannot parse has no id. It cannot reach here through the
-// shipped TokenStore, whose VerifyToken parses before it verifies, so it would
-// mean a verifier admitting some other shape; those requests share one bucket
-// rather than escaping the limit.
+// A token this package cannot parse has no id. It cannot reach here through
+// either shipped verifier (TokenStore, FileTokenStore), both of which parse with
+// ParseToken before they verify, so it would mean a verifier admitting some
+// other shape; those requests share one bucket rather than escaping the limit.
+// The TokenVerifier doc makes ParseToken-compatibility part of the contract, and
+// TestJoinTokenIDMatchesEveryShippedVerifier holds every implementation to it.
 func joinTokenID(tok string) string {
 	t, err := ParseToken(tok)
+	// Defensive only: ParseToken already rejects an empty user.
 	if err != nil || t.User == "" {
 		return unparsedTokenBucket
 	}
