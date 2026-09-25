@@ -92,7 +92,9 @@ func TestPersistentVolumeControllersKept(t *testing.T) {
 
 // kcmControllersGolden is the controller registry captured from the pinned
 // kube-controller-manager binary (see the file's header for the capture command).
-const kcmControllersGolden = "testdata/kcm-controllers-v1.36.2.txt"
+// Keyed to DefaultKubeVersion so a bump cannot silently keep asserting against
+// the previous release's registry: the file must be re-captured and renamed.
+const kcmControllersGolden = "testdata/kcm-controllers-" + DefaultKubeVersion + ".txt"
 
 // TestNodeFailureControllersKept is the B366 tripwire for the controllers that
 // rescue a Pod from a failed node: node-lifecycle-controller (marks the node
@@ -103,13 +105,13 @@ const kcmControllersGolden = "testdata/kcm-controllers-v1.36.2.txt"
 // tightening of kcmDisabledControllers that drops one would silently strand Pods
 // on a dead node.
 //
-// The token names are pinned against the controller registry of Kubernetes
-// v1.36.2, captured from the pinned binary with `kube-controller-manager --help`
-// ("All controllers" and "Disabled-by-default controllers") into
-// testdata/kcm-controllers-v1.36.2.txt. Asserting membership there is what keeps
-// the absent-from-the-minus-set check from passing vacuously on a misspelled or
-// renamed token, and asserting the token is not disabled-by-default is what makes
-// "kept by the wildcard" true.
+// The token names are pinned against the controller registry of the pinned
+// Kubernetes (DefaultKubeVersion), captured from the pinned binary with
+// `kube-controller-manager --help` ("All controllers" and "Disabled-by-default
+// controllers") into testdata/kcm-controllers-<DefaultKubeVersion>.txt.
+// Asserting membership there is what keeps the absent-from-the-minus-set check
+// from passing vacuously on a misspelled or renamed token, and asserting the
+// token is not disabled-by-default is what makes "kept by the wildcard" true.
 //
 // NodeOutOfServiceVolumeDetach needs no pin here: its enforcement lives in the
 // attach-detach controller, which k3sm deliberately disables (see
@@ -151,7 +153,7 @@ func TestNodeFailureControllersKept(t *testing.T) {
 			registry[fields[0]] = !(len(fields) > 1 && fields[1] == "disabled-by-default")
 		}
 	}
-	for _, want := range []string{"`kube-controller-manager --help`", "v1.36.2"} {
+	for _, want := range []string{"`kube-controller-manager --help`", DefaultKubeVersion} {
 		if !strings.Contains(header.String(), want) {
 			t.Fatalf("%s header must name the capture provenance %q, got:\n%s", kcmControllersGolden, want, header.String())
 		}
@@ -164,7 +166,7 @@ func TestNodeFailureControllersKept(t *testing.T) {
 	t.Run("every disabled entry is a real registry name", func(t *testing.T) {
 		for _, d := range kcmDisabledControllers {
 			if _, known := registry[d]; !known {
-				t.Errorf("kcmDisabledControllers entry %q is not in the v1.36.2 registry: its -token silently does nothing", d)
+				t.Errorf("kcmDisabledControllers entry %q is not in the %s registry: its -token silently does nothing", d, DefaultKubeVersion)
 			}
 		}
 	})
@@ -179,10 +181,10 @@ func TestNodeFailureControllersKept(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			onByDefault, known := registry[tc.name]
 			if !known {
-				t.Fatalf("controller %q is not in the v1.36.2 registry %s: the token is misspelled or renamed, so the kept check below would pass vacuously", tc.name, kcmControllersGolden)
+				t.Fatalf("controller %q is not in the %s registry %s: the token is misspelled or renamed, so the kept check below would pass vacuously", tc.name, DefaultKubeVersion, kcmControllersGolden)
 			}
 			if !onByDefault {
-				t.Fatalf("controller %q is disabled-by-default at v1.36.2, so the * wildcard does not keep it", tc.name)
+				t.Fatalf("controller %q is disabled-by-default at %s, so the * wildcard does not keep it", tc.name, DefaultKubeVersion)
 			}
 			if disabled[tc.name] {
 				t.Errorf("controller %q must stay ENABLED (%s), found disabled in --controllers %q", tc.name, tc.why, flag)

@@ -59,11 +59,11 @@ import (
 // payloadDigests maps DefaultKubeVersion to each downloaded binary's sha256.
 // Keyed by version so a bump cannot silently reuse the previous release's pins.
 var payloadDigests = map[string]map[string]string{
-	"v1.36.2": {
-		"kube-apiserver":          "1afff09280a70553c72561e4c2d55ec95f8c979fa5933dba770aade5a3a93ca5",
-		"kube-controller-manager": "a2ad45b40d8a367022cd545d390469913aeef3c3b83300477e629c6af1bd2dad",
-		"kube-scheduler":          "c46f96dd961607a325482bd46f7e53fd78cf6106fcbac48315506f37a417f6ba",
-		"kubectl":                 "112ed6605c8a68d5d3e6abef5f1beb5c087309e3979dc18d7c38b018cd7758a9",
+	"v1.36.5": {
+		"kube-apiserver":          "a8432068d0c6606d33177dcf0b6d7833baa8f109fd91df32e76234619e2f20f7",
+		"kube-controller-manager": "89b631a56f458153771aebd9392557a9542b42ed137c3158d8b188dcd2e15e04",
+		"kube-scheduler":          "d36a5f6612aafb7fb51f0a8cf205e98b10d4385b75fdc908e681fad8742f1cbc",
+		"kubectl":                 "0a624cf507c11f0a6aa3ed3a23a33845bece62979276f6c5db9eded184386131",
 	},
 }
 
