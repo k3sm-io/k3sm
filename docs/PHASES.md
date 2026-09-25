@@ -1723,7 +1723,11 @@ backs.
 
 **Method, honestly.** All 23 tests above are **unit-tier**: they run against the
 `datavoltest.Fake` double (its `Volumes`/`Keychain`/`Indexing` seams) or an in-memory/temp-dir
-filesystem — never against a real `diskutil`, a real Keychain, or a real APFS volume. No gate in
-this repo exercises real APFS for this feature: creating, quota-ing, encrypting, or destroying an
-actual volume is unverified by CI, and there is no `hack/lab/*.sh` leg for it either. Nothing here
-is end-to-end, and this record makes no claim that it is.
+filesystem — never against a real `diskutil`, a real Keychain, or a real APFS volume. The real-APFS
+proof lives in `hack/acceptance/B248.sh`'s `K3SM_LAB=1` tier (rungs L0–L6: create, quota with the
+block-boundary tolerance, encrypt via the System keychain, mount, migrate a 200-file tree with a
+hash-verified datastore copy, delete — trap-armed cleanup and UUID-scoped teardown), first run
+green on the rig 2026-09-14 with a security sign-off, re-run green at head on a lab machine
+2026-09-24 (35/35, no leftover volumes). An earlier revision of this record claimed no such gate
+existed; that was wrong — the lab rungs live in `hack/acceptance/`, not `hack/lab/`, and the
+correction is this sentence. CI still runs only the unit tier; the lab tier stays opt-in.
