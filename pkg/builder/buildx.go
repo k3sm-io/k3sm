@@ -28,12 +28,12 @@ import (
 //
 // The digest is a HARD PIN, taken from the release's own checksums.txt:
 //
-//	https://github.com/docker/buildx/releases/download/v0.17.1/checksums.txt
+//	https://github.com/docker/buildx/releases/download/v0.37.1/checksums.txt
 //
 // It is verified in-pod on EVERY run, not only on download: the binary lives on
 // a PVC that outlives any single pod, so "we fetched it correctly once" is not
-// the property that matters. This exact pin was proven live on the k3sm vm path
-// on 2026-09-02.
+// the property that matters. The v0.17.1 pin was proven live on the k3sm vm
+// path on 2026-09-02; the v0.37.1 bump has not yet been run live there.
 //
 // The asset is the linux-arm64 build because buildx must match the GUEST arch —
 // a different axis from the --platform an image targets. The Linux guest that
@@ -50,11 +50,11 @@ import (
 // pin (version + tag) stays the single source of truth for both.
 const (
 	// BuildxVersion is the pinned buildx release tag.
-	BuildxVersion = "v0.17.1"
+	BuildxVersion = "v0.37.1"
 	// BuildxAsset is the pinned buildx asset name (the guest is linux/arm64).
 	BuildxAsset = "buildx-" + BuildxVersion + "." + guestBuildxPlatform
 	// BuildxSHA256 is the pinned asset's sha256, from the release checksums.txt.
-	BuildxSHA256 = "de05dccd47932eb9fd6e63781ab29d2b0b2c834bbdd19b51d7ea452b1fe378d3"
+	BuildxSHA256 = "e5cc9fe3bbff5cbc91230981f7860e06076110730a2db997082652199042a1f2"
 
 	// guestBuildxPlatform is the in-pod asset's platform suffix (the guest arch).
 	guestBuildxPlatform = "linux-arm64"
