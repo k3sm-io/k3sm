@@ -93,7 +93,7 @@ func kinePinStampPath(workDir string) string {
 }
 
 // kineBackupPath names the pre-migration backup for a target pin, e.g.
-// <workdir>/db/state.db.pre-v0.17.0.bak. It is per-target on purpose: a node that
+// <workdir>/db/state.db.pre-<version>.bak. It is per-target on purpose: a node that
 // migrates twice keeps one verified backup per pin it left behind.
 func kineBackupPath(workDir, targetVersion string) string {
 	return StateDBPath(workDir) + ".pre-" + targetVersion + ".bak"

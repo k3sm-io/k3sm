@@ -139,7 +139,7 @@ sudo mv state.db state.db.broken
 sudo rm -f state.db-wal state.db-shm
 
 # 3. Put the backup in place.
-sudo cp state.db.pre-v0.17.0.bak state.db          # or your own copy from above
+sudo cp state.db.pre-v0.17.1.bak state.db          # or your own copy from above
 sudo chown _k3sm state.db
 
 # 4. Start the control plane.
