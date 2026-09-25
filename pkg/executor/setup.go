@@ -344,20 +344,23 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	if kineStaged(bd, kineVersion) {
 		return signBinaries(ctx, bd, []string{kineBinaryName})
 	}
+	// Preflight the toolchain BEFORE anything runs `go` (the module-cache probe is the
+	// first). Its absence is the one build failure that is deterministic: a launchd
+	// PATH without `go` is the same PATH on every respawn, so the daemon's breaker
+	// parks on the first such failure instead of counting to its threshold. The
+	// sentinel is the ONLY classification; build output is never string-matched.
+	// It runs before the stale marker is dropped on purpose: a toolchain-less park
+	// then leaves the previously staged binary AND its marker untouched, instead of
+	// stranding good bytes unmarked until the operator's remedy rebuilds them.
+	if _, err := lookPathGo(); err != nil {
+		return fmt.Errorf("build kine %s: %w (%v); %s", kineVersion, ErrNoGoToolchain, err, NoGoToolchainRemedy)
+	}
 	// Drop any stale marker BEFORE touching the binary: from here until the marker is
 	// rewritten, the correct answer to "what is staged?" is "nothing trustworthy", and
 	// an interrupted re-stage must re-stage again rather than trust a marker that
 	// describes bytes we did not finish writing.
 	if err := os.Remove(kineMarkerPath(bd)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("clear kine version marker: %w", err)
-	}
-	// Preflight the toolchain BEFORE anything runs `go` (the module-cache probe is the
-	// first). Its absence is the one build failure that is deterministic: a launchd
-	// PATH without `go` is the same PATH on every respawn, so the daemon's breaker
-	// parks on the first such failure instead of counting to its threshold. The
-	// sentinel is the ONLY classification; build output is never string-matched.
-	if _, err := lookPathGo(); err != nil {
-		return fmt.Errorf("build kine %s: %w (%v); %s", kineVersion, ErrNoGoToolchain, err, NoGoToolchainRemedy)
 	}
 	// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
 	// is set ("cannot install cross-compiled binaries when GOBIN is set"), and the
