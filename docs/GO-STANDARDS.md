@@ -3,7 +3,7 @@
 The shared coding standards for every `k3sm.io/*` repo, kept identical across the four
 modules.
 
-Targets **darwin/arm64, macOS 26+**. Go **1.25.x** across all modules.
+Targets **darwin/arm64, macOS 26+**. Go **1.26.x** across all modules.
 
 ## Formatting & imports
 - `gofmt` (tabs) is non-negotiable — `gofmt -l` must be empty. `goimports` for import grouping.
