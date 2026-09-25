@@ -393,6 +393,9 @@ func TestParseStatusArgs(t *testing.T) {
 			statusOptions{format: "text", wait: true, timeout: 10 * time.Second, lines: defaultLogLines}, false},
 		{"wide", []string{"-o", "wide"},
 			statusOptions{format: "wide", timeout: defaultWaitTimeout, lines: defaultLogLines}, false},
+		{"the --datavol-* scope flags", []string{"-o", "json", "--datavol-label", "io.k3sm.datavol.gate-1", "--datavol-record", "/scratch/record.json", "--datavol-root", "/scratch/src"},
+			statusOptions{format: "json", timeout: defaultWaitTimeout, lines: defaultLogLines,
+				datavolLabel: "io.k3sm.datavol.gate-1", datavolRecord: "/scratch/record.json", datavolRoot: "/scratch/src"}, false},
 		{"an unknown view", []string{"clusters"}, statusOptions{}, true},
 		{"an unknown format", []string{"-o", "yaml"}, statusOptions{}, true},
 		{"a log target on the wrong view", []string{"daemons", "server"}, statusOptions{}, true},
@@ -420,6 +423,47 @@ func TestParseStatusArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStatusDatavolScope pins the --datavol-* seam's two halves: unset, the
+// collector keeps the installed label, record and data root (so an ordinary
+// `k3sm status` is unchanged); set, each flag lands in the one Paths field the
+// datavol row and the data-root check read.
+func TestStatusDatavolScope(t *testing.T) {
+	t.Parallel()
+	base := status.Collector{Paths: statusPaths("/tmp/does-not-matter")}
+
+	t.Run("unset flags keep the installed values", func(t *testing.T) {
+		t.Parallel()
+		o, err := parseStatusArgs(nil, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := o.scopeDatavol(base).Paths
+		if got.DatavolLabel != install.DatavolLabel || got.DataRoot != install.DefaultDataRoot || got.DatavolRecord != "" {
+			t.Errorf("paths = label %q root %q record %q, want %q, %q and the default record",
+				got.DatavolLabel, got.DataRoot, got.DatavolRecord, install.DatavolLabel, install.DefaultDataRoot)
+		}
+	})
+	t.Run("set flags reach the paths the rows read", func(t *testing.T) {
+		t.Parallel()
+		o, err := parseStatusArgs([]string{"--datavol-label", "io.k3sm.datavol.gate-1", "--datavol-record", "/scratch/record.json", "--datavol-root", "/scratch/src"}, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := o.scopeDatavol(base).Paths
+		if got.DatavolLabel != "io.k3sm.datavol.gate-1" || got.DatavolRecord != "/scratch/record.json" || got.DataRoot != "/scratch/src" {
+			t.Errorf("paths = label %q record %q root %q, want the scratch values", got.DatavolLabel, got.DatavolRecord, got.DataRoot)
+		}
+	})
+	t.Run("the help text documents all three", func(t *testing.T) {
+		t.Parallel()
+		for _, flag := range []string{"--datavol-label", "--datavol-record", "--datavol-root"} {
+			if !strings.Contains(statusUsage, flag) {
+				t.Errorf("statusUsage does not document %s", flag)
+			}
+		}
+	})
 }
 
 // TestRuntimedForRefusesUnprivileged pins the adapter half of the owner-only

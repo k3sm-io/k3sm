@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
 )
@@ -55,6 +56,15 @@ Flags:
   --timeout 90s       how long --wait waits
   --watch[=2s]        re-render in place until interrupted (requires a terminal)
   --lines 50          how many log lines ` + "`status logs`" + ` prints per file
+  --datavol-label io.k3sm.datavol
+                      the data-volume mount job the datavol row reads its last
+                      exit code from (launchctl print system/<label>)
+  --datavol-record /Library/Preferences/io.k3sm.datavol.json
+                      the data-volume record the data-root check reads, as
+                      ` + "`k3sm datavol status --record`" + ` does
+  --datavol-root /var/lib/k3sm
+                      the data root that record must declare; the datavol row
+                      appears only when the record's mountpoint is this path
 
 Exit codes (a script may branch on these; the set is ADDITIVE ONLY and a number
 is never reassigned):
@@ -99,6 +109,29 @@ type statusOptions struct {
 	timeout time.Duration
 	watch   time.Duration
 	lines   int
+	// datavolLabel, datavolRecord and datavolRoot scope the datavol row and
+	// the data-root check. Empty means the installed value, so an ordinary
+	// invocation reports on this Mac's own data volume; the acceptance gate
+	// points them at a scratch job and volume.
+	datavolLabel  string
+	datavolRecord string
+	datavolRoot   string
+}
+
+// scopeDatavol applies the --datavol-* overrides to a collector's paths. An
+// empty value leaves the installed default in place, which is what a caller
+// that never parsed a command line (doctor) gets.
+func (o statusOptions) scopeDatavol(c status.Collector) status.Collector {
+	if o.datavolLabel != "" {
+		c.Paths.DatavolLabel = o.datavolLabel
+	}
+	if o.datavolRecord != "" {
+		c.Paths.DatavolRecord = o.datavolRecord
+	}
+	if o.datavolRoot != "" {
+		c.Paths.DataRoot = o.datavolRoot
+	}
+	return c
 }
 
 // watchFlag accepts both `--watch` (the default interval) and `--watch=5s`.
@@ -180,6 +213,11 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 	fs.DurationVar(&o.timeout, "timeout", o.timeout, "how long --wait waits")
 	fs.IntVar(&o.lines, "lines", o.lines, "log lines per file for `status logs`")
 	fs.Var(&watch, "watch", "re-render in place every interval")
+	// The --datavol-* defaults are empty and mean "the installed value" (see
+	// scopeDatavol); statusUsage prints the values they resolve to.
+	fs.StringVar(&o.datavolLabel, "datavol-label", "", "the data-volume mount job the datavol row reports on (default "+install.DatavolLabel+")")
+	fs.StringVar(&o.datavolRecord, "datavol-record", "", "the data-volume record the data-root check reads (default "+dataroot.DefaultRecordPath+")")
+	fs.StringVar(&o.datavolRoot, "datavol-root", "", "the data root the data-volume record must declare (default "+install.DefaultDataRoot+")")
 
 	var positional []string
 	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {

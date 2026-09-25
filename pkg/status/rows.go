@@ -905,7 +905,11 @@ func (c Collector) dataRootRow(ctx context.Context, role dataroot.Role) (Row, *d
 		row.Detail = "the data root was not probed"
 		return row, nil
 	}
-	st, err := dataroot.Read(c.DataRoot, c.Paths.DataRoot)
+	recordPath := c.Paths.DatavolRecord
+	if recordPath == "" {
+		recordPath = dataroot.DefaultRecordPath
+	}
+	st, err := dataroot.ReadWithRecord(c.DataRoot, c.Paths.DataRoot, recordPath)
 	if err != nil {
 		row.State, row.Severity = StateUnknown, SeverityUnknown
 		row.Detail = "could not read " + c.Paths.DataRoot + ": " + errText(err)

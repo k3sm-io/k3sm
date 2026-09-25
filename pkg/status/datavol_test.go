@@ -380,6 +380,96 @@ func TestOneshotRow(t *testing.T) {
 	}
 }
 
+// TestDatavolScopeOverrides is the gate for the `k3sm status --datavol-*`
+// seam: a report scoped to a scratch job and a scratch record must read the
+// datavol row from THAT label's launchctl output and the volume from THAT
+// record, and must not fall back to the installed label or record. It is what
+// lets the lab tier observe a real oneshot without touching io.k3sm.datavol.
+func TestDatavolScopeOverrides(t *testing.T) {
+	const (
+		installedLabel = "io.k3sm.datavol"
+		scratchLabel   = "io.k3sm.datavol.gate-4242"
+		scratchRoot    = "/Library/k3sm-acceptance-datavol/gate-4242/src"
+		scratchRecord  = "/Library/k3sm-acceptance-datavol/gate-4242/record-m.json"
+	)
+	scoped := func(fsys fakeDataRootFS, launchd fakeLaunchd) Collector {
+		p := testPaths("")
+		p.DatavolLabel = scratchLabel
+		p.DatavolLog = "/var/log/k3sm/datavol.log"
+		p.DatavolRecord = scratchRecord
+		p.DataRoot = scratchRoot
+		return Collector{Launchd: launchd, FS: installedFS(p), DataRoot: fsys, Paths: p, ServiceUID: 271}
+	}
+	datavolRow := func(rep Report) (Row, bool) {
+		for _, r := range rep.Rows {
+			if r.Name == RowDatavol {
+				return r, true
+			}
+		}
+		return Row{}, false
+	}
+
+	tests := []struct {
+		name       string
+		recordPath string
+		print      map[string][]byte
+		wantRow    bool
+		wantState  RowState
+		wantDetail string
+	}{
+		{
+			name:       "the scratch label's clean exit is the row, not the installed job's failure",
+			recordPath: scratchRecord,
+			print: map[string][]byte{
+				scratchLabel:   []byte("state = not running\npid = 0\nruns = 1\nlast exit code = 0\n"),
+				installedLabel: []byte("state = not running\npid = 0\nruns = 4\nlast exit code = 1\n"),
+			},
+			wantRow:    true,
+			wantState:  StateOK,
+			wantDetail: "last run exit 0",
+		},
+		{
+			name:       "the scratch label's failure is the row, not the installed job's success",
+			recordPath: scratchRecord,
+			print: map[string][]byte{
+				scratchLabel:   []byte("state = not running\npid = 0\nruns = 2\nlast exit code = 1\n"),
+				installedLabel: []byte("state = not running\npid = 0\nruns = 1\nlast exit code = 0\n"),
+			},
+			wantRow:    true,
+			wantState:  StateFailed,
+			wantDetail: "last run exit 1",
+		},
+		{
+			name:       "a record only at the installed path does not declare the scratch root",
+			recordPath: dataroot.DefaultRecordPath,
+			print: map[string][]byte{
+				scratchLabel: []byte("state = not running\npid = 0\nruns = 1\nlast exit code = 0\n"),
+			},
+			wantRow: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys := volumeFS(t, scratchRoot, "k3sm-gate-4242m", 2<<30, 2<<30, 1<<20)
+			fsys.recordPath = tc.recordPath
+			rep := scoped(fsys, fakeLaunchd{out: tc.print}).Collect(context.Background())
+			row, ok := datavolRow(rep)
+			if ok != tc.wantRow {
+				t.Fatalf("datavol row present = %t, want %t", ok, tc.wantRow)
+			}
+			if !ok {
+				return
+			}
+			if row.State != tc.wantState || !strings.Contains(row.Detail, tc.wantDetail) {
+				t.Errorf("row = %s %q, want %s containing %q", row.State, row.Detail, tc.wantState, tc.wantDetail)
+			}
+			if row.Wide["label"] != scratchLabel {
+				t.Errorf("wide label = %q, want the scratch label %q", row.Wide["label"], scratchLabel)
+			}
+		})
+	}
+}
+
 // TestPreVolumeRowPartialWalk pins that a size the walk could not finish is
 // reported as a lower bound, never as the whole: an unprivileged `k3sm status`
 // against a root-owned copy sees only what it may read (540M on the rig, for a
