@@ -1312,25 +1312,64 @@ func writeServiceUserFile(path string, contents []byte, uid, gid int, mode, dirM
 		_ = tmp.Close()
 		return fmt.Errorf("write %s: %w", tmpName, err)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmpName, err)
-	}
 	ownershipByPathSite(tmpName)
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename %s to %s: %w", tmpName, path, err)
+	return publishTemp(tmp, path)
+}
+
+// publishTemp renames tmp's name onto path, then closes tmp, but only if that
+// name still resolves to the very file tmp has open.
+//
+// The temp file sits in a directory a lower-privileged principal can write, so
+// between its creation and the rename that principal can unlink the name and
+// plant a symlink (or any other file) there. rename(2) moves whatever ENTRY the
+// name holds, with a nil error, so without this check the destination would be
+// published as the planted entry. The descriptor is kept open until after the
+// rename so its (dev, ino) stays pinned, and the name is Lstat'd, never
+// followed, immediately before the rename; os.SameFile compares exactly those
+// two fields. What remains is the single rename syscall, the same check-then-act
+// window refuseSymlinkAt leaves elsewhere in this file.
+//
+// tmp is closed on every path.
+func publishTemp(tmp *os.File, path string) error {
+	name := tmp.Name()
+	opened, err := tmp.Stat()
+	if err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("stat %s: %w", name, err)
+	}
+	named, err := os.Lstat(name)
+	if err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("lstat %s: %w", name, err)
+	}
+	if !os.SameFile(opened, named) {
+		_ = tmp.Close()
+		return fmt.Errorf("%s: %w", name, errTempSwapped)
+	}
+	if err := os.Rename(name, path); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("rename %s to %s: %w", name, path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", name, err)
 	}
 	return nil
 }
 
+// errTempSwapped is publishTemp's refusal, errSymlinkRefused's sibling: a
+// sentinel so callers and tests match it with errors.Is, never by message.
+var errTempSwapped = errors.New("temp name no longer refers to the file written: refusing to rename it into place")
+
 // ownershipByPathSite runs at each point where an ownership or mode change BY
 // PATH once acted on (or, in copyToRootOwned, would act on) a name inside a
-// directory a lower-privileged principal can write: after the temp file is
-// closed in writeServiceUserFile, after the rename in writeUserKubeconfig, and
-// after ditto in copyToRootOwned. Production leaves it a no-op. It exists only
-// so TestOwnedWritesUseTheOpenDescriptor can swap name for a symlink to a file
-// outside the writable directory at exactly that moment and prove the
-// function's privileged calls no longer resolve name — the netdProbeBeforeWrite
-// idiom.
+// directory a lower-privileged principal can write: in writeServiceUserFile and
+// writeUserKubeconfig just before publishTemp (with the temp name), in
+// writeUserKubeconfig after the rename (with the published path), and after
+// ditto in copyToRootOwned. Production leaves it a no-op. It exists only so
+// TestOwnedWritesUseTheOpenDescriptor can swap name for a symlink to a file
+// outside the writable directory at exactly that moment and prove neither the
+// privileged calls nor the rename act on what the name now holds, the
+// netdProbeBeforeWrite idiom.
 var ownershipByPathSite = func(name string) {}
 
 // WriteRootOnlyFile writes contents at path root:wheel at mode. The parent
@@ -1780,11 +1819,9 @@ func writeUserKubeconfig(homeDir string, uid, gid int, contents []byte) error {
 		_ = tmp.Close()
 		return fmt.Errorf("write temp kubeconfig: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp kubeconfig: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("rename kubeconfig into place: %w", err)
+	ownershipByPathSite(tmpName)
+	if err := publishTemp(tmp, path); err != nil {
+		return fmt.Errorf("publish kubeconfig: %w", err)
 	}
 	ownershipByPathSite(path)
 	return nil

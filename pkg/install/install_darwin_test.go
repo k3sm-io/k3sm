@@ -708,6 +708,22 @@ func TestWriteLaunchDaemonMode(t *testing.T) {
 		}
 	})
 
+	// refuseSymlinkAt fails its Lstat on a path that does not exist yet; the
+	// writer tolerates exactly that (fs.ErrNotExist) and nothing else, so a
+	// first install into an existing directory still writes the plist.
+	t.Run("a missing plist in an existing dir passes the symlink guard", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ServerLabel+".plist")
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("precondition: %s exists (err %v)", path, err)
+		}
+		if err := writeLaunchDaemon(path, []byte("<plist/>"), ServerPlistMode, uid, gid); err != nil {
+			t.Fatalf("writeLaunchDaemon: %v", err)
+		}
+		assertRegularFile(t, path, "<plist/>")
+		assertMode(t, path, ServerPlistMode)
+	})
+
 	t.Run("every other daemon keeps the conventional mode", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), NetdLabel+".plist")
 		if err := writeLaunchDaemon(path, []byte("<plist/>"), plistMode(NetdLabel), uid, gid); err != nil {
@@ -944,6 +960,36 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 			},
 		},
 		{
+			name: "launch daemon plist",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "LaunchDaemons")
+				mkdir(t, dir, 0o755)
+				victim := plantFile(t, filepath.Join(elsewhere, "victim"), "not a plist\n", 0o644)
+				plist := filepath.Join(dir, ServerLabel+".plist")
+				symlinkT(t, victim, plist)
+				return writeLaunchDaemon(plist, []byte("<plist/>"), ServerPlistMode, uid, gid)
+			},
+			victim:     "victim",
+			victimMode: 0o644,
+			untouched: func(t *testing.T, elsewhere string) {
+				assertContent(t, filepath.Join(elsewhere, "victim"), "not a plist\n")
+			},
+		},
+		{
+			// A DANGLING link is still a link: the guard refuses it rather than
+			// let os.WriteFile create the file at the link's target.
+			name: "launch daemon plist dangling link",
+			run: func(t *testing.T, root, elsewhere string) error {
+				dir := filepath.Join(root, "LaunchDaemons")
+				mkdir(t, dir, 0o755)
+				plist := filepath.Join(dir, ServerLabel+".plist")
+				symlinkT(t, filepath.Join(elsewhere, "created-through-the-link"), plist)
+				return writeLaunchDaemon(plist, []byte("<plist/>"), ServerPlistMode, uid, gid)
+			},
+			victimMode: 0o755,
+			untouched:  assertEmptyDir,
+		},
+		{
 			name: "user kubeconfig dir",
 			run: func(t *testing.T, root, elsewhere string) error {
 				home := filepath.Join(root, "home")
@@ -978,43 +1024,102 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 // TestOwnedWritesUseTheOpenDescriptor is B376's gate: the writers that hand a
 // freshly written credential to a lower-privileged principal must bind its
 // owner and mode to the OPEN temp descriptor, never re-resolve the file by name
-// inside a directory that principal can write.
+// inside a directory that principal can write, and must never publish an entry
+// that is no longer the file they wrote.
 //
-// ownershipByPathSite fires exactly where the by-path Chown/Chmod used to run
-// (after Close in writeServiceUserFile, after the rename in writeUserKubeconfig)
+// ownershipByPathSite fires where a by-path call once ran (just before the
+// rename with the temp name, and after the rename with the published kubeconfig)
 // and swaps that name for a symlink to a victim file OUTSIDE the writable
 // directory. A same-directory victim would prove nothing: the principal already
-// owns everything in there. A by-path call would follow the link and the victim
-// would come back with the requested mode and/or group; bound to the
-// descriptor, the victim keeps its mode, owner and content.
+// owns everything in there. Two things are asserted on every row:
+//
+//   - the victim keeps its mode, owner and content, so nothing privileged
+//     followed the link;
+//   - the destination is a regular file with the content this row expects,
+//     never the planted symlink. A swapped temp name must make the write FAIL
+//     with errTempSwapped and leave the previous destination in place, because
+//     rename(2) would otherwise publish the symlink entry itself.
 //
 // Unprivileged: the owner handed over is the test process's own uid with a
 // supplementary group different from the victim's, a chown the kernel permits
 // without privilege and one that makes a followed chown observable.
 func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 	uid := os.Getuid()
+	const oldToken = "K10old::node:old\n"
 
 	for _, tc := range []struct {
 		name string
-		// write arms the sabotage hook and runs the writer under root, handing
-		// the result to uid:gid.
-		write func(t *testing.T, root string, gid int, victim string) error
+		// run arms the sabotage hook, runs the writer under root (handing the
+		// result to uid:gid) and asserts on the destination.
+		run func(t *testing.T, root string, gid int, victim string)
 	}{
 		{
-			name: "service-user file: temp name swapped after close",
-			write: func(t *testing.T, root string, gid int, victim string) error {
+			name: "service-user file: temp name swapped before the rename",
+			run: func(t *testing.T, root string, gid int, victim string) {
 				dir := filepath.Join(root, "creds")
-				sabotageMatching(t, func(name string) bool { return filepath.Dir(name) == dir }, victim)
-				return writeServiceUserFile(filepath.Join(dir, "token"), []byte("secret\n"), uid, gid, 0o600, 0o700)
+				mkdir(t, dir, 0o700)
+				path := plantFile(t, filepath.Join(dir, "token"), oldToken, 0o600)
+				sabotageMatching(t, func(name string) bool {
+					return filepath.Dir(name) == dir && strings.HasPrefix(filepath.Base(name), ".k3sm-")
+				}, victim)
+
+				err := writeServiceUserFile(path, []byte("secret\n"), uid, gid, 0o600, 0o700)
+				if !errors.Is(err, errTempSwapped) {
+					t.Errorf("write = %v, want the swapped-temp refusal", err)
+				}
+				assertRegularFile(t, path, oldToken)
 			},
 		},
 		{
-			name: "user kubeconfig: published config swapped after rename",
-			write: func(t *testing.T, root string, gid int, victim string) error {
+			name: "user kubeconfig: temp name swapped before the rename",
+			run: func(t *testing.T, root string, gid int, victim string) {
+				home := filepath.Join(root, "home")
+				kubeDir := filepath.Join(home, ".kube")
+				mkdirAllT(t, kubeDir)
+				path := plantFile(t, filepath.Join(kubeDir, "config"), existingKube, 0o600)
+				sabotageMatching(t, func(name string) bool {
+					return filepath.Dir(name) == kubeDir && strings.HasPrefix(filepath.Base(name), ".k3sm-kubeconfig-")
+				}, victim)
+
+				err := writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				if !errors.Is(err, errTempSwapped) {
+					t.Errorf("write = %v, want the swapped-temp refusal", err)
+				}
+				assertRegularFile(t, path, existingKube)
+			},
+		},
+		{
+			// The by-path chown this row guards ran AFTER the rename, on the
+			// published name. Once published, the file is the target user's to
+			// replace; what must hold is that the writer published a regular
+			// file with the merged content (asserted at the moment of
+			// publication, before the swap) and then acted on nothing by name.
+			name: "user kubeconfig: published config swapped after the rename",
+			run: func(t *testing.T, root string, gid int, victim string) {
 				home := filepath.Join(root, "home")
 				mkdir(t, home, 0o755)
-				sabotageAt(t, filepath.Join(home, ".kube", "config"), victim)
-				return writeUserKubeconfig(home, uid, gid, []byte(adminKube))
+				path := filepath.Join(home, ".kube", "config")
+				want, err := mergeAdminKubeconfig(nil, []byte(adminKube), adminContextName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				published := false
+				sabotageMatching(t, func(name string) bool {
+					if name != path {
+						return false
+					}
+					published = true
+					assertRegularFile(t, path, string(want))
+					assertMode(t, path, 0o600)
+					return true
+				}, victim)
+
+				if err := writeUserKubeconfig(home, uid, gid, []byte(adminKube)); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				if !published {
+					t.Error("the published config was never inspected")
+				}
 			},
 		},
 	} {
@@ -1027,9 +1132,7 @@ func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 			before := statOwner(t, victim)
 			gid := otherGroup(t, before.gid)
 
-			if err := tc.write(t, root, gid, victim); err != nil {
-				t.Fatalf("write: %v", err)
-			}
+			tc.run(t, root, gid, victim)
 
 			assertMode(t, victim, 0o644)
 			if after := statOwner(t, victim); after != before {
@@ -1039,6 +1142,20 @@ func TestOwnedWritesUseTheOpenDescriptor(t *testing.T) {
 			assertContent(t, victim, victimBody)
 		})
 	}
+}
+
+// assertRegularFile asserts path is a regular file (Lstat, so a symlink is seen
+// as itself) holding exactly want.
+func assertRegularFile(t *testing.T, path, want string) {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("%s is %v, want a regular file: a swapped entry was published", path, fi.Mode().Type())
+	}
+	assertContent(t, path, want)
 }
 
 // sabotageAt arms ownershipByPathSite for the rest of the test: when it fires
