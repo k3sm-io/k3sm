@@ -197,6 +197,17 @@ type runtimedRuntime struct {
 	// nil in unit tests that don't exercise the API removal.
 	client kubernetes.Interface
 
+	// podSource is the LIVE apiserver read the orphan reaper (orphanreap.go)
+	// decides from: one node-scoped List per tick, then a direct Get per
+	// candidate. It is never an informer cache. Derived from client at
+	// construction; nil (no client) disables the reaper.
+	podSource apiPodSource
+	// orphanMu guards orphanGauges, the reaper's per-pod-id consecutive
+	// not-found counters. Held only around a gauge read-modify-write, never
+	// together with mu.
+	orphanMu     sync.Mutex
+	orphanGauges map[string]*probeGauge
+
 	// recorder emits the pod lifecycle Events the runtimed path owns.
 	recorder record.EventRecorder
 
@@ -643,6 +654,8 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		transport:      newTransportFeed(cfg.TransportOverrides, log),
 		guestArtifacts: cfg.GuestArtifacts != nil,
 		client:         cfg.Client,
+		podSource:      newClientPodSource(cfg.Client),
+		orphanGauges:   map[string]*probeGauge{},
 		log:            log,
 		recorder:       recorder,
 		clk:            clock.RealClock{},
@@ -1779,22 +1792,43 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// with a typed precondition failure, but the window is closed from BOTH sides
 	// rather than either leaning on the other.
 	if t := r.trackByID(id); t != nil {
-		// Close the track to a late create BEFORE cancelling anything. A parked
-		// pod's retry may already be inside its CreatePod RPC, and cancelling its
-		// context does not un-build a guest the runtime has accepted; marking
-		// first is what makes "the delete won" decidable by the create rather
-		// than by whichever goroutine happens to run next. The create then
-		// compensates itself (retryParkedCreate).
-		t.markDeleting()
-		t.cancelPostStart()
-		t.cancelRestarts()
-		t.cancelPulls()
+		t.quiesce()
 	}
 	// Serve preStop hooks BEFORE termination: runtimed sends SIGTERM
 	// synchronously inside DeletePod, so the provider runs preStop first and passes
 	// the RESIDUAL grace (the budget minus the hook's wall-time, floored at 1s).
 	// best-effort — a failed hook is logged inside runPreStop, the delete proceeds.
 	grace := r.runPreStop(ctx, pod)
+	return r.teardownPod(ctx, pod, grace, nil)
+}
+
+// quiesce closes t to a late create and cancels every in-flight provider worker
+// it owns — the step both teardown entries (DeletePod and the orphan reaper)
+// take BEFORE the runtime RPC.
+func (t *podTrack) quiesce() {
+	// Close the track to a late create BEFORE cancelling anything. A parked
+	// pod's retry may already be inside its CreatePod RPC, and cancelling its
+	// context does not un-build a guest the runtime has accepted; marking
+	// first is what makes "the delete won" decidable by the create rather
+	// than by whichever goroutine happens to run next. The create then
+	// compensates itself (retryParkedCreate).
+	t.markDeleting()
+	t.cancelPostStart()
+	t.cancelRestarts()
+	t.cancelPulls()
+}
+
+// teardownPod is the delete path after preStop: the runtime RPC with grace, the
+// probe runner, the pod's /32, its log tree, its transport override, the track,
+// and the apiserver object. DeletePod and the orphan reaper (orphanreap.go) share
+// it, so a reaped pod is torn down exactly as a deleted one is.
+//
+// owned selects how the track is forgotten. nil forgets whatever track the pod
+// id holds (DeletePod's contract). Non-nil forgets the track only if it is still
+// owned — identity, not presence, as untrackRejectedCreate does — so a track an
+// idempotent re-create installed meanwhile is left alone.
+func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grace int64, owned *podTrack) error {
+	id := string(pod.UID)
 	_, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace})
 	if err != nil {
 		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
@@ -1817,7 +1851,14 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	r.transport.drop(id)
 	r.mu.Lock()
 	t := r.track[id]
-	delete(r.track, id)
+	switch {
+	case owned == nil, t == owned:
+		delete(r.track, id)
+	default:
+		// A track replaced since the reaper claimed its own is someone
+		// else's to forget (see owned above).
+		t = nil
+	}
 	r.mu.Unlock()
 	if t != nil {
 		// Again, now that the track is unreachable: a status observation landing
@@ -2032,7 +2073,8 @@ func (r *runtimedRuntime) trackByID(id string) *podTrack {
 
 // Watch drives the VK status callback off the runtime's streaming
 // WatchPodStatus, with resync-on-stream-break plus a periodic GetPodStatus
-// backstop. The goroutine's lifetime is bounded by ctx.
+// backstop, and starts the slower orphan reaper (orphanreap.go). Every
+// goroutine's lifetime is bounded by ctx.
 func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 	r.mu.Lock()
 	r.notify = cb
@@ -2040,6 +2082,7 @@ func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 
 	go r.runWatch(ctx)
 	go r.runBackstop(ctx)
+	go r.runOrphanReaper(ctx)
 	// ctx is the provider's run lifetime: when it ends, so does this provider.
 	// The workers with a pod behind them are cancelled by that pod's own delete;
 	// this is what ends the one that has no pod left (runtimed_pull.go's
