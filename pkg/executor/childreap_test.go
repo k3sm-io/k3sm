@@ -78,7 +78,7 @@ type trackedChild struct {
 }
 
 // track registers a STARTED child. what is a human label used only in the
-// survivor report (e.g. "kine v0.17.0 on :52431").
+// survivor report (e.g. "kine v0.17.1 on :52431").
 func (r *childReaper) track(cmd *exec.Cmd, what string) *trackedChild {
 	c := &trackedChild{reaper: r, cmd: cmd, what: what}
 	r.mu.Lock()

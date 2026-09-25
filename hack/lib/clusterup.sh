@@ -10,7 +10,7 @@
 # Requires: macOS 26+ arm64, Go, Xcode CLT (clang), gh, curl, openssl, nc.
 
 : "${KUBE_VERSION:=v1.36.2}"          # latest darwin-arm64 on kwok-ci/k8s
-: "${KINE_VERSION:=v0.17.0}"     # ONE pin, both postures (executor.DefaultKineVersion)
+: "${KINE_VERSION:=v0.17.1}"     # ONE pin, both postures (executor.DefaultKineVersion)
 : "${K3SM_WORKDIR:=/tmp/k3sm-cluster}"
 : "${APISERVER_PORT:=6444}"           # NOT 6443 — Docker Desktop's k8s squats there
 : "${KINE_PORT:=2379}"
