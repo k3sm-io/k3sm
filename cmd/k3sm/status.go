@@ -58,13 +58,16 @@ Flags:
   --lines 50          how many log lines ` + "`status logs`" + ` prints per file
   --datavol-label io.k3sm.datavol
                       the data-volume mount job the datavol row reads its last
-                      exit code from (launchctl print system/<label>)
+                      exit code from (launchctl print system/<label>);
+                      give all three --datavol-* flags together or none
   --datavol-record /Library/Preferences/io.k3sm.datavol.json
                       the data-volume record the data-root check reads, as
-                      ` + "`k3sm datavol status --record`" + ` does
+                      ` + "`k3sm datavol status --record`" + ` does;
+                      give all three --datavol-* flags together or none
   --datavol-root /var/lib/k3sm
                       the data root that record must declare; the datavol row
-                      appears only when the record's mountpoint is this path
+                      appears only when the record's mountpoint is this path;
+                      give all three --datavol-* flags together or none
 
 Exit codes (a script may branch on these; the set is ADDITIVE ONLY and a number
 is never reassigned):
@@ -116,6 +119,28 @@ type statusOptions struct {
 	datavolLabel  string
 	datavolRecord string
 	datavolRoot   string
+}
+
+// checkDatavolScope refuses a partial --datavol-* set. The row's PRESENCE is
+// decided by the record and root, and its VERDICT by the label, so scoping only
+// some of them mixes two data volumes in one row: a scratch label read against
+// the real record reports "not loaded" about a healthy production volume.
+func (o statusOptions) checkDatavolScope() error {
+	given := map[string]bool{
+		"--datavol-label":  o.datavolLabel != "",
+		"--datavol-record": o.datavolRecord != "",
+		"--datavol-root":   o.datavolRoot != "",
+	}
+	var missing []string
+	for _, name := range []string{"--datavol-label", "--datavol-record", "--datavol-root"} {
+		if !given[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 || len(missing) == len(given) {
+		return nil
+	}
+	return fmt.Errorf("the --datavol-* flags go together: missing %s", strings.Join(missing, ", "))
 }
 
 // scopeDatavol applies the --datavol-* overrides to a collector's paths. An
@@ -257,6 +282,9 @@ func parseStatusArgs(args []string, errOut io.Writer) (statusOptions, error) {
 	}
 	if o.lines <= 0 {
 		return o, fmt.Errorf("--lines must be positive, got %d", o.lines)
+	}
+	if err := o.checkDatavolScope(); err != nil {
+		return o, err
 	}
 	return o, nil
 }

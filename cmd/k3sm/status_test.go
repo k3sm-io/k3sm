@@ -396,6 +396,10 @@ func TestParseStatusArgs(t *testing.T) {
 		{"the --datavol-* scope flags", []string{"-o", "json", "--datavol-label", "io.k3sm.datavol.gate-1", "--datavol-record", "/scratch/record.json", "--datavol-root", "/scratch/src"},
 			statusOptions{format: "json", timeout: defaultWaitTimeout, lines: defaultLogLines,
 				datavolLabel: "io.k3sm.datavol.gate-1", datavolRecord: "/scratch/record.json", datavolRoot: "/scratch/src"}, false},
+		{"--datavol-label alone", []string{"--datavol-label", "io.k3sm.datavol.gate-1"}, statusOptions{}, true},
+		{"--datavol-record alone", []string{"--datavol-record", "/scratch/record.json"}, statusOptions{}, true},
+		{"--datavol-root alone", []string{"--datavol-root", "/scratch/src"}, statusOptions{}, true},
+		{"--datavol-label and --datavol-record without --datavol-root", []string{"--datavol-label", "x", "--datavol-record", "/r.json"}, statusOptions{}, true},
 		{"an unknown view", []string{"clusters"}, statusOptions{}, true},
 		{"an unknown format", []string{"-o", "yaml"}, statusOptions{}, true},
 		{"a log target on the wrong view", []string{"daemons", "server"}, statusOptions{}, true},
@@ -456,12 +460,46 @@ func TestStatusDatavolScope(t *testing.T) {
 			t.Errorf("paths = label %q record %q root %q, want the scratch values", got.DatavolLabel, got.DatavolRecord, got.DataRoot)
 		}
 	})
+	t.Run("a partial set is refused, naming the missing flags", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			args        []string
+			wantMissing []string
+			wantPresent []string
+		}{
+			{[]string{"--datavol-label", "x"}, []string{"--datavol-record", "--datavol-root"}, []string{"--datavol-label"}},
+			{[]string{"--datavol-record", "/r.json"}, []string{"--datavol-label", "--datavol-root"}, []string{"--datavol-record"}},
+			{[]string{"--datavol-root", "/s"}, []string{"--datavol-label", "--datavol-record"}, []string{"--datavol-root"}},
+			{[]string{"--datavol-label", "x", "--datavol-record", "/r.json"}, []string{"--datavol-root"}, []string{"--datavol-label", "--datavol-record"}},
+		}
+		for _, tc := range cases {
+			_, err := parseStatusArgs(tc.args, io.Discard)
+			if err == nil {
+				t.Errorf("parseStatusArgs(%q) accepted a partial --datavol-* set", tc.args)
+				continue
+			}
+			_, missing, _ := strings.Cut(err.Error(), "missing ")
+			for _, m := range tc.wantMissing {
+				if !strings.Contains(missing, m) {
+					t.Errorf("parseStatusArgs(%q) = %q, does not name missing %s", tc.args, err, m)
+				}
+			}
+			for _, p := range tc.wantPresent {
+				if strings.Contains(missing, p) {
+					t.Errorf("parseStatusArgs(%q) = %q, names the given %s as missing", tc.args, err, p)
+				}
+			}
+		}
+	})
 	t.Run("the help text documents all three", func(t *testing.T) {
 		t.Parallel()
 		for _, flag := range []string{"--datavol-label", "--datavol-record", "--datavol-root"} {
 			if !strings.Contains(statusUsage, flag) {
 				t.Errorf("statusUsage does not document %s", flag)
 			}
+		}
+		if n := strings.Count(statusUsage, "give all three --datavol-* flags together or none"); n != 3 {
+			t.Errorf("statusUsage says the --datavol-* flags go together %d times, want once per flag", n)
 		}
 	})
 }
