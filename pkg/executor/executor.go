@@ -218,7 +218,7 @@ type Config struct {
 // Pinned defaults — the versions VALIDATED by the bring-up spike.
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
-	DefaultKubeVersion = "v1.36.2"
+	DefaultKubeVersion = "v1.36.5"
 	// DefaultKineVersion is THE kine module version — one pin for BOTH datastore
 	// postures (single-node SQLite and Postgres-HA), built CGO_ENABLED=0 against
 	// kine's pure-Go modernc.org/sqlite backend (kineBuildVariant).
