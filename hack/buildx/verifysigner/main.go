@@ -70,6 +70,7 @@ func main() {
 // run performs one check and returns the process exit status. It returns
 // rather than exiting so the deferred cleanup of the download dir always runs.
 func run(ctx context.Context, file string) int {
+	fileMode := file != ""
 	path := file
 	if path == "" {
 		if err := builder.ValidateHostBuildxPin(); err != nil {
@@ -89,6 +90,11 @@ func run(ctx context.Context, file string) int {
 		fmt.Printf("--  sha256 skipped: -file inspects a local file, not the pinned asset\n")
 	}
 
+	// The identity guarantee below is DELEGATED to codesign's trust-chain
+	// evaluation against this Mac's own Apple trust store: TeamIdentifier comes
+	// from the certificate chain, so the verdict is only as trustworthy as the
+	// machine's code-signing trust settings. This tool is re-pin-time tooling for
+	// the maintainer's own Mac, never a shared-runner or CI control.
 	verifyExit, dvOut, err := inspect(ctx, path)
 	if err != nil {
 		return failf(exitError, "%v", err)
@@ -96,7 +102,11 @@ func run(ctx context.Context, file string) int {
 	if verdict := decide(verifyExit, dvOut, builder.HostBuildxTeamID); verdict != nil {
 		return failf(exitCode(verdict), "signer: %s: %v", path, verdict)
 	}
-	fmt.Printf("ok  signer: %s is strictly valid and signed by Team ID %s\n", filepath.Base(path), builder.HostBuildxTeamID)
+	if fileMode {
+		fmt.Printf("ok  signer only (sha256 NOT checked): %s is strictly valid and signed by Team ID %s\n", filepath.Base(path), builder.HostBuildxTeamID)
+	} else {
+		fmt.Printf("ok  signer + sha256: %s is strictly valid and signed by Team ID %s\n", filepath.Base(path), builder.HostBuildxTeamID)
+	}
 	return exitOK
 }
 
