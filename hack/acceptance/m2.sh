@@ -28,6 +28,7 @@ BIN="$REPO_ROOT/k3sm-m2"
 EXECSHIM="$REPO_ROOT/k3sm-execshim"
 PATHSHIM="$REPO_ROOT/libk3sm_pathrebase_shim.dylib"
 DNSSHIM="$REPO_ROOT/libk3sm_getaddrinfo_shim.dylib"
+VMHOST="$REPO_ROOT/k3sm-vmhost"
 PAYLOAD_DIR="$REPO_ROOT/cp-payload"
 INVOKING_USER="${SUDO_USER:-$(id -un)}"
 KUBECONFIG_PATH="$(eval echo "~$INVOKING_USER")/.kube/config"
@@ -63,7 +64,7 @@ cleanup() {
 	pkill -9 -f '/var/lib/k3sm/server/bin/' >/dev/null 2>&1 || true
 	reap_test_pods
 	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
-	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" "$DNSSHIM" >/dev/null 2>&1 || true
+	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" "$DNSSHIM" "$VMHOST" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -100,6 +101,18 @@ codesign -s - -f "$PATHSHIM" >/dev/null 2>&1 || true
 # cluster DNS reaches the per-node resolver on the DNS VIP. Plain clang C dylib.
 "$REPO_ROOT/../darwin-net/hack/build-shim.sh" "$REPO_ROOT" >/dev/null
 codesign -s - -f "$DNSSHIM" >/dev/null 2>&1 || true
+# Build the per-pod VM host helper BESIDE it — pkg/install.RequiredSiblings names
+# k3sm-vmhost since the vm RuntimeClass shipped, so `k3sm install` refuses a tree
+# without it. Signed with the virtualization entitlement (a dev-staged vmhost
+# without it installs cleanly and then every vm pod goes Pending), and the
+# entitlement is read BACK off the signed Mach-O: codesign attaches no
+# entitlements when AMFI's plist parser balks while still signing validly.
+( cd "$REPO_ROOT/.." && CGO_ENABLED=1 go build -trimpath -o "$VMHOST" k3sm.io/runtimed/cmd/k3sm-vmhost )
+VMHOST_ENTS="$REPO_ROOT/../runtimed/cmd/k3sm-vmhost/vmhost.entitlements"
+[ -f "$VMHOST_ENTS" ] || { echo "M2: vmhost entitlements plist missing at $VMHOST_ENTS" >&2; exit 1; }
+codesign -s - -f --entitlements "$VMHOST_ENTS" "$VMHOST" >/dev/null 2>&1
+codesign -d --entitlements - "$VMHOST" 2>/dev/null | grep -q "com.apple.security.virtualization" || {
+	echo "M2: k3sm-vmhost carries no virtualization entitlement after signing" >&2; exit 1; }
 
 # Stage the control-plane payload BESIDE it (cp-payload/: kube-apiserver etc. +
 # kine) — `k3sm install` copies it to /Library/k3sm/bin, from which the _k3sm
