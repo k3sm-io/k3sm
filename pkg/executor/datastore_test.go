@@ -185,6 +185,17 @@ func TestKineVersionSinglePin(t *testing.T) {
 	}
 }
 
+// TestDefaultKineVersionIsPinned asserts the exact kine pin. The literal is
+// deliberate: every pin bump must touch this test, which is what makes a bump's
+// gate red on the old pin and green on the new one. TestKineVersionSinglePin
+// checks the pin's shape; this test checks its value.
+func TestDefaultKineVersionIsPinned(t *testing.T) {
+	const want = "v0.17.1"
+	if DefaultKineVersion != want {
+		t.Errorf("DefaultKineVersion = %q, want %q", DefaultKineVersion, want)
+	}
+}
+
 // TestSQLiteEndpointDisablesStartupVacuum pins the DSN opt-out. kine >=0.16 VACUUMs the
 // WHOLE database on EVERY startup unless the DSN carries _kine_disable_startup_vacuum;
 // the pin k3sm left behind never did. Losing this parameter would put a full-database

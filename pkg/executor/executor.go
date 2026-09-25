@@ -227,8 +227,10 @@ const (
 	// The old SQLite pin had no corresponding upstream tag — it resolves only from a
 	// warmed module proxy, so a cold GOPROXY=direct build of the datastore could not
 	// be reproduced at all — and it predated the kine#577 watch-progress-notify fix.
-	// v0.17.0 is what k3s itself pins; it defaults --watch-progress-notify-interval
-	// to 5s and --emulated-etcd-version to 3.6.11, so the apiserver's watch cache
+	// v0.17.x is what k3s itself pins (v0.17.1 since the bump off v0.17.0: bugfixes
+	// and dependency patches only, no schema or encoding change); it defaults
+	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11,
+	// so the apiserver's watch cache
 	// stays fresh on both postures, and its no-cgo build is a real, supported variant
 	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo) rather than the
 	// SQLite-disabled stub the spike measured on the old pin.
@@ -236,7 +238,7 @@ const (
 	// Moving an EXISTING single-node state.db onto this pin is a one-way datastore
 	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
 	// (and preserves the old kine binary) before the new pin ever opens the db.
-	DefaultKineVersion = "v0.17.0"
+	DefaultKineVersion = "v0.17.1"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.
