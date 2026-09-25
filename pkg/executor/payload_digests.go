@@ -148,6 +148,11 @@ func VerifyPayloadSet(dir string) error {
 	// produced before markers existed still verify, and pkg/install stages it
 	// best-effort for the same reason.
 	allowed[KineMarkerName] = true
+	// The control-plane version marker (KubeMarkerName) rides beside the four
+	// kwok-ci/k8s binaries on the same terms: StagePayload writes it after they are
+	// digest-verified and signed, and it is what lets the workdir seed replace a stale
+	// set. Allowed, not required, for the same back-compat reason.
+	allowed[KubeMarkerName] = true
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read payload dir %s: %w", dir, err)
