@@ -313,7 +313,7 @@ func reportStagedControlPlane(ctx context.Context, logger *slog.Logger, bd, kube
 		logger.Info("control-plane binaries present but their version is unvouched (no "+KubeMarkerName+" marker; staged before markers existed)",
 			"pinned", kubeVersion, "dir", bd)
 		return
-	case kubeVersionOlder(kubeVersion, staged):
+	case KubeVersionOlder(kubeVersion, staged):
 		logger.Error("control-plane binaries are NEWER than this build pins; continuing on them, because a control-plane downgrade over a datastore a newer apiserver wrote is refused",
 			"staged", staged, "pinned", kubeVersion, "dir", bd, "remedy", NewerControlPlaneRemedy)
 		return
@@ -452,11 +452,12 @@ func clearKubeMarker(bd string) error {
 	return nil
 }
 
-// kubeVersionOlder reports whether kube version a is strictly older than b. The
+// KubeVersionOlder reports whether kube version a is strictly older than b. The
 // vMAJOR.MINOR.PATCH comparison is kine's pin comparison (the shapes are the same);
 // either side unparseable is false, so nothing is called a downgrade unless both
-// versions prove it.
-func kubeVersionOlder(a, b string) bool { return kinePinOlder(a, b) }
+// versions prove it. Exported so `k3sm status` draws the staged-vs-pinned direction
+// with the same comparison the seed's downgrade refusal uses.
+func KubeVersionOlder(a, b string) bool { return kinePinOlder(a, b) }
 
 // kine staging constants. The binary is accompanied by a VERSION MARKER, because a
 // presence-only check ("is there a file called kine?") cannot tell a correctly staged
@@ -799,7 +800,7 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	restageKube := false
 	previousKube := readKubeMarker(bd)
 	if !kubeSetStaged(bd, kubeVersion) && kubeSetStaged(payloadDir, kubeVersion) {
-		if kubeVersionOlder(kubeVersion, previousKube) {
+		if KubeVersionOlder(kubeVersion, previousKube) {
 			logger.Error("refusing to re-seed the control-plane binaries: the staged payload is OLDER than the set in the work dir, and an apiserver downgrade over a datastore a newer apiserver wrote is one-way; continuing on the present set",
 				"workdir-version", previousKube, "payload-version", kubeVersion, "dir", bd, "remedy", NewerControlPlaneRemedy)
 		} else {
