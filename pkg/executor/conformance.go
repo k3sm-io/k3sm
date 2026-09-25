@@ -52,7 +52,7 @@ func admissionConfigPath(workDir string) string {
 // cleartext payload can never land in the audit log at rest. Rules are ordered
 // first-match: secrets/configmaps are pinned at Metadata FIRST (so no later
 // edit can accidentally widen them), and an explicit Metadata catch-all is
-// LAST. The apiVersion is pinned to the vendored k8s v1.36.2's audit.k8s.io/v1
+// LAST. The apiVersion is pinned to the vendored k8s v1.36.5's audit.k8s.io/v1
 // (Res.3). TestProvisionConformanceConfigPinned walks the parsed rules and
 // enforces all of this.
 const auditPolicyDoc = `apiVersion: audit.k8s.io/v1
