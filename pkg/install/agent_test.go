@@ -506,11 +506,14 @@ func TestInstallRendersAgentDaemonWhenJoining(t *testing.T) {
 		// what they already have, so `k3sm install` on an existing server is still
 		// the no-op-shaped upgrade it was.
 		//
-		// It has moved TWICE since, both deliberately: the admin token left the argv
+		// It has moved three times since, each deliberately: the admin token left the argv
 		// for a staged file, so the golden shows --token-file and the path (B249,
 		// gated by TestServerPlistCarriesNoToken); and ExitTimeOut fell from 90s to
 		// 60s when the daemon's two longest teardown stages stopped being serial
-		// (B320, gated by TestExitTimeOutCoversTheDaemonTeardown). A render that
+		// (B320, gated by TestExitTimeOutCoversTheDaemonTeardown); and the Go
+		// module and build caches were pinned into the work dir once the data
+		// root became root-owned (B397, gated by
+		// TestMeshKeyDirLivesOutsideTheServiceUserRunDir). A render that
 		// moves for any other reason is still the regression this pins.
 		want, err := os.ReadFile(filepath.Join("testdata", "server.plist.golden"))
 		if err != nil {
@@ -587,7 +590,7 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 	// The work dir as a healthy install already has it: the service user's own,
 	// 0700. Rows that are about the FILES start from this so the directory is
 	// never the thing under test by accident.
-	adoptedDir := seedLegacyEntry{name: "", uid: legacyServiceUID, gid: DataRootGID, mode: AgentTokenDirMode, kind: EntryDir}
+	adoptedDir := seedLegacyEntry{name: "", uid: legacyServiceUID, gid: ServiceTreeGID, mode: AgentTokenDirMode, kind: EntryDir}
 	legacyDir := seedLegacyEntry{name: "", uid: 0, gid: 0, mode: AgentTokenDirMode, kind: EntryDir}
 
 	type wantOwner struct {
@@ -620,7 +623,7 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 		{
 			name: "a root-owned node-password is handed to the service user at the mode it had",
 			seed: []seedLegacyEntry{adoptedDir, {name: agentNodePasswordName, mode: 0o600, kind: EntryRegular}},
-			want: []wantOwner{{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600}},
+			want: []wantOwner{{at(agentNodePasswordName), legacyServiceUID, ServiceTreeGID, 0o600}},
 		},
 		{
 			name: "the mesh key and the node credential are adopted too, each keeping its own mode",
@@ -632,37 +635,37 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 				{name: agentNodeKubeconfigName, mode: 0o640, kind: EntryRegular},
 			},
 			want: []wantOwner{
-				{at(agentMeshKeyName), legacyServiceUID, DataRootGID, 0o600},
-				{at(agentNodeKubeconfigName), legacyServiceUID, DataRootGID, 0o640},
+				{at(agentMeshKeyName), legacyServiceUID, ServiceTreeGID, 0o600},
+				{at(agentNodeKubeconfigName), legacyServiceUID, ServiceTreeGID, 0o640},
 			},
 		},
 		{
 			name: "the work dir itself is adopted when an older install left it root-owned, and LAST",
 			seed: []seedLegacyEntry{legacyDir, {name: agentNodePasswordName, mode: 0o600, kind: EntryRegular}},
 			want: []wantOwner{
-				{workDir, legacyServiceUID, DataRootGID, AgentTokenDirMode},
-				{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600},
+				{workDir, legacyServiceUID, ServiceTreeGID, AgentTokenDirMode},
+				{at(agentNodePasswordName), legacyServiceUID, ServiceTreeGID, 0o600},
 			},
 			// The directory goes over last, so no moment exists in which the
 			// service user owns a 0700 directory — and so may rename or unlink
 			// inside it — while a root-owned artifact in it is still pending.
 			wantChownOrder: []string{
-				fmt.Sprintf("Chown:%s:%d:%d", at(agentNodePasswordName), legacyServiceUID, DataRootGID),
-				fmt.Sprintf("Chown:%s:%d:%d", workDir, legacyServiceUID, DataRootGID),
+				fmt.Sprintf("Chown:%s:%d:%d", at(agentNodePasswordName), legacyServiceUID, ServiceTreeGID),
+				fmt.Sprintf("Chown:%s:%d:%d", workDir, legacyServiceUID, ServiceTreeGID),
 			},
 		},
 		{
 			name: "a directory already the service user's own is left completely alone",
 			seed: []seedLegacyEntry{
 				adoptedDir,
-				{name: agentNodePasswordName, uid: legacyServiceUID, gid: DataRootGID, mode: 0o600, kind: EntryRegular},
-				{name: agentMeshKeyName, uid: legacyServiceUID, gid: DataRootGID, mode: 0o600, kind: EntryRegular},
-				{name: nodecred.ServingKeyFile, uid: legacyServiceUID, gid: DataRootGID, mode: 0o600, kind: EntryRegular},
+				{name: agentNodePasswordName, uid: legacyServiceUID, gid: ServiceTreeGID, mode: 0o600, kind: EntryRegular},
+				{name: agentMeshKeyName, uid: legacyServiceUID, gid: ServiceTreeGID, mode: 0o600, kind: EntryRegular},
+				{name: nodecred.ServingKeyFile, uid: legacyServiceUID, gid: ServiceTreeGID, mode: 0o600, kind: EntryRegular},
 			},
 			wantNoChown: true,
 			want: []wantOwner{
-				{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600},
-				{at(nodecred.ServingKeyFile), legacyServiceUID, DataRootGID, 0o600},
+				{at(agentNodePasswordName), legacyServiceUID, ServiceTreeGID, 0o600},
+				{at(nodecred.ServingKeyFile), legacyServiceUID, ServiceTreeGID, 0o600},
 			},
 		},
 		{
@@ -686,7 +689,7 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 				{name: "README", mode: 0o644, kind: EntryRegular},
 			},
 			want: []wantOwner{
-				{at(agentNodePasswordName), legacyServiceUID, DataRootGID, 0o600},
+				{at(agentNodePasswordName), legacyServiceUID, ServiceTreeGID, 0o600},
 				// Ignored means UNTOUCHED, not adopted: k3sm does not hand a file
 				// it cannot account for to the service user.
 				{at("README"), 0, 0, 0o644},
@@ -706,7 +709,7 @@ func TestAgentInstallAdoptsLegacyRootOwnedFiles(t *testing.T) {
 				// directory is the service user's. An adoption is decided about a
 				// NAME and applied to what the name resolves to, so the one thing
 				// a root-run chown must not accept under node.key is a stand-in.
-				{name: agentMeshKeyName, uid: legacyServiceUID, gid: DataRootGID, mode: 0o777, kind: EntrySymlink},
+				{name: agentMeshKeyName, uid: legacyServiceUID, gid: ServiceTreeGID, mode: 0o777, kind: EntrySymlink},
 			},
 			wantRefuse:  []string{at(agentMeshKeyName), "is not a regular file; remove it", "a symlink"},
 			wantNoChown: true,

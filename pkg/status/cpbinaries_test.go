@@ -118,7 +118,7 @@ func TestCollectorStagedVsPinnedMismatch(t *testing.T) {
 			Kube:       healthyKube(),
 			KubeSource: "~/.kube/config context \"k3sm\"",
 			Procs:      fakeProcs{live: LivenessRunning, vmHosts: 2},
-			DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+			DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
 			Paths:      p,
 			EUID:       501,
 			ServiceUID: 250,

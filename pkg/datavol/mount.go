@@ -39,9 +39,9 @@ const MarkerName = ".k3sm-datavol"
 const markerContent = "This APFS volume holds k3sm's data root. See docs/user/storage.md.\n"
 
 // Owner is the ownership MountRecorded applies to the mount point once the
-// volume is mounted. A zero UID means "leave it to root", which is the right
-// answer during install, where the service user may not exist yet and
-// EnsureServiceUser chowns the data root immediately afterwards.
+// volume is mounted. A zero UID means "leave it to root", which is what k3sm's
+// own callers pass: the data root is root's, and the installer and netd apply
+// its ownership (pkg/install's OwnershipOf) after the mount.
 type Owner struct {
 	UID  int
 	GID  int

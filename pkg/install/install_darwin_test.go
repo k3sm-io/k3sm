@@ -206,19 +206,20 @@ func TestEnsureSymlink(t *testing.T) {
 	}
 }
 
-// TestEnsureDataRoot exercises the data-root ownership policy against a REAL
-// temp directory, unprivileged — using the test process's own uid (it is a
-// member of the staff group DataRootGID names, so the chown needs no
-// privilege). It must NEVER call darwinSystem.EnsureServiceUser: that runs
-// dscl against the live directory service, which is exactly the privileged
-// operation this file's package comment says these tests avoid.
+// TestEnsureDataRoot exercises the data-root row of the ownership table
+// against a REAL temp directory, unprivileged. The owner is the test process's
+// own uid and gid (chowning to root needs privilege these tests never take), so
+// what it pins is the MODE the root row names and the repair of a drifted one.
+// It must NEVER call darwinSystem.EnsureServiceUser: that runs dscl against the
+// live directory service, which is exactly the privileged operation this file's
+// package comment says these tests avoid.
 func TestEnsureDataRoot(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "data-root")
-	uid := os.Getuid()
+	uid, gid := os.Getuid(), os.Getgid()
 
-	if err := EnsureDataRoot(dir, uid); err != nil {
-		t.Fatalf("EnsureDataRoot(%q, %d): %v", dir, uid, err)
+	if err := ensureDataRootOwnedBy(dir, uid, gid); err != nil {
+		t.Fatalf("ensureDataRootOwnedBy(%q): %v", dir, err)
 	}
 	fi, err := os.Stat(dir)
 	if err != nil {
@@ -227,21 +228,18 @@ func TestEnsureDataRoot(t *testing.T) {
 	if !fi.IsDir() {
 		t.Fatalf("%s is not a directory", dir)
 	}
-	if perm := fi.Mode().Perm(); perm != DataRootMode {
-		t.Errorf("mode = %04o, want %04o", perm, DataRootMode)
+	if perm := fi.Mode().Perm(); perm != StateRootMode {
+		t.Errorf("mode = %04o, want %04o", perm, StateRootMode)
 	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		if int(st.Uid) != uid {
-			t.Errorf("owner uid = %d, want %d", st.Uid, uid)
-		}
-		if int(st.Gid) != DataRootGID {
-			t.Errorf("owner gid = %d, want %d", st.Gid, DataRootGID)
-		}
+	// A root an older build left at 0750 is repaired to the table's mode.
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatalf("chmod: %v", err)
 	}
-	// Idempotent: asking again for the same, already-correct dir is a no-op
-	// success.
-	if err := EnsureDataRoot(dir, uid); err != nil {
-		t.Errorf("second EnsureDataRoot must be a no-op success, got %v", err)
+	if err := ensureDataRootOwnedBy(dir, uid, gid); err != nil {
+		t.Errorf("second ensureDataRootOwnedBy must succeed, got %v", err)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != StateRootMode {
+		t.Errorf("a drifted root was not repaired to %04o: %v %v", StateRootMode, fi.Mode(), err)
 	}
 }
 
@@ -879,7 +877,7 @@ func TestEnsureHelpersRefuseASymlink(t *testing.T) {
 			run: func(t *testing.T, root, elsewhere string) error {
 				dir := filepath.Join(root, "data-root")
 				symlinkT(t, elsewhere, dir)
-				return EnsureDataRoot(dir, uid)
+				return ensureDataRootOwnedBy(dir, uid, gid)
 			},
 			victimMode: 0o755,
 		},
@@ -1596,4 +1594,26 @@ func mustRead(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestEnsureRunDirAppliesTheRunRow is the on-disk half of the gate's (k): the
+// real EnsureRunDir, against a real temp directory, leaves exactly the mode and
+// group the ownership table's run row names. The owner is the test process's
+// own uid, which is a member of staff, so no privilege is needed.
+func TestEnsureRunDirAppliesTheRunRow(t *testing.T) {
+	row, _ := OwnershipOf(StateRun)
+	dir := filepath.Join(t.TempDir(), "run")
+	if err := (darwinSystem{}).EnsureRunDir(dir, uint32(os.Getuid())); err != nil {
+		t.Fatalf("EnsureRunDir: %v", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Mode().Perm() != row.Mode {
+		t.Errorf("mode = %04o, want the run row's %04o", fi.Mode().Perm(), row.Mode)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Gid) != row.GID {
+		t.Errorf("gid = %d, want the run row's %d", st.Gid, row.GID)
+	}
 }

@@ -103,11 +103,10 @@ func runDatavolMount(args []string) error {
 		return nil
 	}
 
-	own := datavol.Owner{GID: install.DataRootGID, Mode: install.DataRootMode}
-	if uid := lookupServiceUID(); uid > 0 {
-		own.UID = uid
-	}
-	if err := datavol.MountRecorded(context.Background(), datavol.NewDarwin(), dataroot.OSFS{}, *rec, own, logger); err != nil {
+	// The mount point IS the data root, which is root's (install.OwnershipOf),
+	// so the mount hands it to nobody: the zero Owner leaves it as the volume
+	// presents it, and netd applies the table's root row when it starts.
+	if err := datavol.MountRecorded(context.Background(), datavol.NewDarwin(), dataroot.OSFS{}, *rec, datavol.Owner{}, logger); err != nil {
 		return err
 	}
 	logger.Info("data volume mounted", "volume", rec.Name, "uuid", rec.UUID, "mountpoint", rec.Mountpoint)

@@ -37,7 +37,11 @@ type ownership interface {
 	// user does not exist — the pre-install posture, in which netd must leave
 	// ownership alone rather than guess.
 	Lookup(name string) (uid, gid int, err error)
+	// Lstat describes path without following a final symlink, so an ownership
+	// decision is made about the entry itself and never about its target.
+	Lstat(path string) (fs.FileInfo, error)
 	MkdirAll(path string, perm fs.FileMode) error
+	// Chown sets owner and group WITHOUT following a final symlink.
 	Chown(path string, uid, gid int) error
 	Chmod(path string, mode fs.FileMode) error
 	Remove(path string) error
@@ -67,8 +71,11 @@ func (osOwnership) Lookup(name string) (int, int, error) {
 // MkdirAll implements ownership.
 func (osOwnership) MkdirAll(path string, perm fs.FileMode) error { return os.MkdirAll(path, perm) }
 
-// Chown implements ownership.
-func (osOwnership) Chown(path string, uid, gid int) error { return os.Chown(path, uid, gid) }
+// Lstat implements ownership.
+func (osOwnership) Lstat(path string) (fs.FileInfo, error) { return os.Lstat(path) }
+
+// Chown implements ownership. It is lchown(2): a symlink is re-owned as itself.
+func (osOwnership) Chown(path string, uid, gid int) error { return os.Lchown(path, uid, gid) }
 
 // Chmod implements ownership.
 func (osOwnership) Chmod(path string, mode fs.FileMode) error { return os.Chmod(path, mode) }

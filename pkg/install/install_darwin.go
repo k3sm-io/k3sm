@@ -66,8 +66,10 @@ const (
 )
 
 // EnsureServiceUser idempotently creates name as a hidden, no-login system user
-// whose home is dataRoot, and ensures that data root exists owned by it (so the
-// _k3sm control plane can write its work-dir there). It returns the uid.
+// whose home is dataRoot, and ensures that data root exists with the root row
+// of the ownership table (root:wheel 0755). The home is NOT the service user's:
+// the trees it writes under it are, and Install's state-tree step hands each of
+// them over explicitly. It returns the uid.
 func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 	// Never create or chown into a data root that is declared as a mount point
 	// but is not mounted: that would hand the service user the bare mountpoint
@@ -88,7 +90,7 @@ func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 				return 0, fmt.Errorf("update service user home (dscl . -create %s NFSHomeDirectory %s): %w: %s", record, dataRoot, err, out)
 			}
 		}
-		if err := EnsureDataRoot(dataRoot, uid); err != nil {
+		if err := EnsureDataRoot(dataRoot); err != nil {
 			return 0, err
 		}
 		return uint32(uid), nil
@@ -112,7 +114,7 @@ func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 			return 0, fmt.Errorf("create service user (%s): %w: %s", strings.Join(s, " "), err, out)
 		}
 	}
-	if err := EnsureDataRoot(dataRoot, uid); err != nil {
+	if err := EnsureDataRoot(dataRoot); err != nil {
 		return 0, err
 	}
 	return uint32(uid), nil
@@ -128,26 +130,28 @@ func freeSystemUID() (int, error) {
 	return 0, fmt.Errorf("no free system uid in [%d,%d]", systemUIDFloor, systemUIDCeil)
 }
 
-// EnsureDataRoot creates dir with the data-root policy (idempotent) and chowns
-// it to uid:staff so the service user owns it. Exported because `k3sm install`
-// is not the only place that policy applies — the root netd helper applies the
-// same ownership rule inline when it finds a drifted root at boot — and the two
-// must agree.
-func EnsureDataRoot(dir string, uid int) error { return ensureOwnedDir(dir, uid) }
+// EnsureDataRoot creates dir (idempotent) and applies the root row of the
+// ownership table: root:wheel, StateRootMode. It re-applies owner and mode on an
+// existing directory, which is what heals a data root an older build left
+// owned by the service user. See OwnershipOf.
+func EnsureDataRoot(dir string) error { return ensureDataRootOwnedBy(dir, 0, StateRootGID) }
 
-// ensureOwnedDir creates dir DataRootMode (idempotent) and chowns it to
-// uid:DataRootGID so the service user owns its data root.
-func ensureOwnedDir(dir string, uid int) error {
-	if err := os.MkdirAll(dir, DataRootMode); err != nil {
-		return fmt.Errorf("create data root %s: %w", dir, err)
-	}
-	if err := refuseSymlinkAt(dir); err != nil {
-		return fmt.Errorf("data root %s: %w", dir, err)
-	}
-	if err := os.Chown(dir, uid, DataRootGID); err != nil {
-		return fmt.Errorf("chown data root %s to %d: %w", dir, uid, err)
+// ensureDataRootOwnedBy is EnsureDataRoot with the owner taken explicitly, for
+// ensureLogDir's reason: an unprivileged test cannot chown to root, and the
+// MODE and the symlink refusal are what it has to exercise.
+func ensureDataRootOwnedBy(dir string, uid, gid int) error {
+	own, _ := OwnershipOf(StateRoot)
+	if err := ensureDirOwnedBy(dir, uid, gid, own.Mode); err != nil {
+		return fmt.Errorf("data root: %w", err)
 	}
 	return nil
+}
+
+// EnsureOwnedDir creates (or repairs) one level of the state tree at exactly
+// uid:gid and mode. See the System interface for the contract, and
+// ensureStateTree for the order that makes a by-path chown safe here.
+func (darwinSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) error {
+	return ensureDirOwnedBy(dir, uid, gid, mode)
 }
 
 // EnsureLogDir creates (or repairs) the log dir owned by the service uid, group
@@ -519,23 +523,26 @@ func (darwinSystem) EnsureVMRunDir(dir string, uid uint32) error {
 	return ensureServiceOwnedDir(dir, uid, "vm run dir")
 }
 
-// ensureServiceOwnedDir creates dir and re-applies owner uid:staff and mode 0700
-// on EVERY call. MkdirAll skips an existing directory, so an install over a tree
+// ensureServiceOwnedDir creates dir and re-applies the run dir's row of the
+// ownership table (OwnershipOf(StateRun): the service user, group staff, 0700)
+// on EVERY call. The vm run dir inside it has no row of its own and takes the
+// run dir's, since it is the same kind of socket directory. MkdirAll skips an existing directory, so an install over a tree
 // an earlier build (or a root daemon that got there first) left root-owned is
 // repaired rather than silently left unwritable by the service user. what names
 // the directory in any error, so a failure says which one.
 func ensureServiceOwnedDir(dir string, uid uint32, what string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	own, _ := OwnershipOf(StateRun)
+	if err := os.MkdirAll(dir, own.Mode); err != nil {
 		return fmt.Errorf("create %s %s: %w", what, dir, err)
 	}
 	if err := refuseSymlinkAt(dir); err != nil {
 		return fmt.Errorf("%s %s: %w", what, dir, err)
 	}
-	if err := os.Chown(dir, int(uid), 20); err != nil { // group staff (_k3sm's primary)
-		return fmt.Errorf("chown %s %s to %d:staff: %w", what, dir, uid, err)
+	if err := os.Lchown(dir, own.UID(int(uid)), own.GID); err != nil {
+		return fmt.Errorf("chown %s %s to %d:%d: %w", what, dir, own.UID(int(uid)), own.GID, err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("chmod %s %s 0700: %w", what, dir, err)
+	if err := os.Chmod(dir, own.Mode); err != nil {
+		return fmt.Errorf("chmod %s %s %#o: %w", what, dir, own.Mode, err)
 	}
 	return nil
 }
@@ -1021,6 +1028,101 @@ func (darwinSystem) EnsureMeshKeyDir(dir string, mode fs.FileMode) error {
 	return ensureRootOwnedDir(dir, mode)
 }
 
+// RemoveEntry unlinks the entry name directly inside dir, descriptor-relative:
+// dir is opened O_NOFOLLOW|O_DIRECTORY, the entry is classified with fstatat
+// against that descriptor, and removed with unlinkat against the same one. See
+// the System interface for why the one-time key move needs this rather than a
+// by-path remove.
+func (darwinSystem) RemoveEntry(dir, name string) error {
+	if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
+		return fmt.Errorf("remove %q in %s: not a bare entry name", name, dir)
+	}
+	fd, err := openDirNoFollow(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove %s in %s: %w", name, dir, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return fmt.Errorf("stat %s in %s: %w", name, dir, err)
+	}
+	flags := 0
+	if statKind(st.Mode) == EntryDir {
+		flags = unix.AT_REMOVEDIR
+	}
+	if err := unix.Unlinkat(fd, name, flags); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("remove %s in %s: %w", name, dir, err)
+	}
+	return nil
+}
+
+// OpenDirNoFollow opens dir O_NOFOLLOW|O_DIRECTORY and returns a handle that
+// reads and removes entries against that one descriptor. See the System
+// interface for the contract.
+func (darwinSystem) OpenDirNoFollow(dir string) (DirHandle, error) {
+	fd, err := openDirNoFollow(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &heldDir{fd: fd, path: dir}, nil
+}
+
+// heldDir is a directory held by descriptor.
+type heldDir struct {
+	fd   int
+	path string
+}
+
+// ReadEntry opens name relative to the held descriptor with O_NOFOLLOW (a
+// symlink fails ELOOP) and O_NONBLOCK (a fifo planted under the name cannot
+// hang the install), checks on the OPEN descriptor that it is a regular file,
+// and reads it. Nothing is re-resolved by path between the check and the read.
+func (d *heldDir) ReadEntry(name string) ([]byte, error) {
+	if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
+		return nil, fmt.Errorf("read %q in %s: not a bare entry name", name, d.path)
+	}
+	path := filepath.Join(d.path, name)
+	fd, err := unix.Openat(d.fd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	switch {
+	case errors.Is(err, unix.ENOENT):
+		return nil, &fs.PathError{Op: "open", Path: path, Err: fs.ErrNotExist}
+	case errors.Is(err, unix.ELOOP):
+		return nil, fmt.Errorf("open %s: %w: it is a symlink, and this read refuses to follow one", path, ErrNotRegularFile)
+	case err != nil:
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, &fs.PathError{Op: "fstat", Path: path, Err: err}
+	}
+	if kind := statKind(st.Mode); kind != EntryRegular {
+		return nil, fmt.Errorf("open %s: %w: it is %s", path, ErrNotRegularFile, kind)
+	}
+	return io.ReadAll(f)
+}
+
+// RemoveEntry unlinks the file name relative to the held descriptor.
+func (d *heldDir) RemoveEntry(name string) error {
+	if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
+		return fmt.Errorf("remove %q in %s: not a bare entry name", name, d.path)
+	}
+	if err := unix.Unlinkat(d.fd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("remove %s in %s: %w", name, d.path, err)
+	}
+	return nil
+}
+
+// Close releases the held descriptor.
+func (d *heldDir) Close() error { return unix.Close(d.fd) }
+
 // ensureRootOwnedDir creates dir and re-applies owner root:wheel and mode on
 // EVERY call — the root-owned counterpart of ensureServiceOwnedDir, and the one
 // implementation both root-directory seams above are spelled in, so the two
@@ -1039,7 +1141,7 @@ func ensureDirOwnedBy(dir string, uid, gid int, mode fs.FileMode) error {
 	if err := refuseSymlinkAt(dir); err != nil {
 		return fmt.Errorf("%s: %w", dir, err)
 	}
-	if err := os.Chown(dir, uid, gid); err != nil {
+	if err := os.Lchown(dir, uid, gid); err != nil {
 		return fmt.Errorf("chown %s to %d:%d: %w", dir, uid, gid, err)
 	}
 	// MkdirAll skips an existing directory, so the chmod is what repairs one.
@@ -1210,21 +1312,6 @@ func treeBytes(path string) (uint64, error) {
 	return total, nil
 }
 
-// LookupServiceUID resolves the service account's uid. A user that does not
-// exist is (0, false), not an error: install legitimately reaches this before
-// EnsureServiceUser has created _k3sm.
-func (darwinSystem) LookupServiceUID(name string) (int, bool) {
-	u, err := user.Lookup(name)
-	if err != nil {
-		return 0, false
-	}
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return 0, false
-	}
-	return uid, true
-}
-
 // WriteDataVolumeRecord writes the record through pkg/dataroot, which owns its
 // encoding, its version stamp, its 0644 mode and its temp-and-rename.
 func (darwinSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) error {
@@ -1259,11 +1346,11 @@ func (darwinSystem) WriteAgentArgsRecord(path string, rec dataroot.AgentArgsReco
 // the file at a wider mode or a different owner than the one asked for — which
 // matters because the only thing written this way is a credential.
 //
-// The group is the data root's (DataRootGID): the file lands in the service
+// The group is the service trees' (ServiceTreeGID): the file lands in the service
 // user's own tree, and its mode grants the group nothing, so the group is a
 // consistency choice rather than an access one.
 func (darwinSystem) WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error {
-	return writeServiceUserFile(path, contents, int(uid), DataRootGID, mode, dirMode)
+	return writeServiceUserFile(path, contents, int(uid), ServiceTreeGID, mode, dirMode)
 }
 
 // writeServiceUserFile is the method above with the owner taken explicitly.
@@ -1408,6 +1495,13 @@ func writeRootOnlyFile(path string, contents []byte, uid, gid int, mode fs.FileM
 	if _, err := tmp.Write(contents); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+	// Durable before it is visible: the one-time key move removes the legacy
+	// copy right after this write, so a crash between the two must not leave
+	// the only copy of an identity in a page cache.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("fsync %s: %w", tmpName, err)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", tmpName, err)

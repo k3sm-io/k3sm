@@ -65,7 +65,7 @@ func serverCfg() Config {
 //
 // The defect: `k3sm install` never put this node's wireguard private key in the
 // root-only directory netd's MeshKeyResolver reads, and did not even create that
-// directory — a fresh single-node install had no <DataRoot>/run/keys at all. The
+// directory — a fresh single-node install had no root-only key dir at all. The
 // only thing that ever wrote there was the node daemon's best-effort runtime
 // write, which in the posture k3sm ships (an unprivileged _k3sm daemon, a
 // root-owned key dir) cannot succeed. So a worker in helper mode handed netd a

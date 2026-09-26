@@ -177,9 +177,13 @@ install if you were in the middle of one.
 
 ### The Data Root Has The Wrong Owner
 
-The data root belongs to the unprivileged `_k3sm` service user. If something has changed its
-ownership, the control plane cannot write to it and `k3sm status` reports the data root as
-`wrong-owner` with the uid it found. Restarting the netd helper realigns the ownership:
+The data root itself, `/var/lib/k3sm`, belongs to root (`root:wheel`, mode `0755`), the same way
+k3s keeps its data dir. The directories the daemons write under it (`run`, `server`, `agent`,
+`pods`, `storage`, the image store) belong to the unprivileged `_k3sm` service user, and the
+node's mesh keys live in `/var/lib/k3sm/keys`, which only root can read or change. If the root is
+owned by anyone else, `k3sm status` reports the data root as `wrong-owner` with the uid it found.
+A root owned by `_k3sm` is the layout older releases left behind. Restarting the netd helper
+realigns the ownership:
 
 ```sh
 sudo launchctl kickstart -k system/io.k3sm.netd

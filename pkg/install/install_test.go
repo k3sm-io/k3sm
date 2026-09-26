@@ -63,9 +63,15 @@ func TestMain(m *testing.M) {
 // fakeSystem records every privileged seam call in order so a test can assert
 // the install orchestration without any real privilege.
 type fakeSystem struct {
-	calls       []string
-	kubeUser    string
-	kubeContent string
+	calls []string
+	// handleSeq numbers the directories OpenDirNoFollow hands out, so a test can
+	// assert every read and removal went through the SAME held handle.
+	handleSeq int
+	// afterOpenDir, when set, runs right after OpenDirNoFollow has opened a
+	// directory: the moment a racing writer would swap the path.
+	afterOpenDir func(dir string)
+	kubeUser     string
+	kubeContent  string
 	// files is the fake root filesystem ReadFile answers from. WriteLaunchDaemon
 	// records into it, so running Install twice against ONE fake reproduces a real
 	// reinstall: the second run reads back the plist the first run wrote.
@@ -170,11 +176,6 @@ type fakeSystem struct {
 	// pre-existing test keeps describing a healthy staging tree; a test that cares
 	// states the failure explicitly with putEntitlement.
 	entitlement map[string]error
-	// serviceUID is what LookupServiceUID answers. Nil — the zero value — is the
-	// FIRST-INSTALL posture: the account does not exist yet, so a data volume
-	// mounted before EnsureServiceUser is left to root. A test that wants an
-	// owner sets it, and then the mount really chowns, which needs privilege.
-	serviceUID *int
 	// records is every data-volume record WriteDataVolumeRecord was handed,
 	// keyed by path. It is the fake's whole model of /Library/Preferences: the
 	// real write is pkg/dataroot's, and a unit test must not perform it.
@@ -1241,19 +1242,6 @@ func (f *fakeSystem) RemoveTree(path string) error {
 	return os.RemoveAll(path)
 }
 
-// LookupServiceUID answers the first-install posture (no account yet) unless a
-// test said otherwise with putServiceUID.
-func (f *fakeSystem) LookupServiceUID(name string) (int, bool) {
-	f.calls = append(f.calls, "LookupServiceUID:"+name)
-	if f.serviceUID == nil {
-		return 0, false
-	}
-	return *f.serviceUID, true
-}
-
-// putServiceUID makes LookupServiceUID report an existing account.
-func (f *fakeSystem) putServiceUID(uid int) { f.serviceUID = &uid }
-
 func (f *fakeSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) error {
 	f.calls = append(f.calls, "WriteDataVolumeRecord:"+path)
 	if f.records == nil {
@@ -1308,6 +1296,81 @@ func (f *fakeSystem) WriteAgentArgsRecord(path string, rec dataroot.AgentArgsRec
 func (f *fakeSystem) WriteServiceUserFile(path string, contents []byte, uid uint32, mode, dirMode fs.FileMode) error {
 	f.calls = append(f.calls, fmt.Sprintf("WriteServiceUserFile:%s:%#o:%#o:%d", path, mode, dirMode, uid))
 	f.putFile(path, contents)
+	return nil
+}
+
+// EnsureOwnedDir records the directory, the owner, the group AND the mode the
+// installer asked for — the row of the ownership table it applied — and
+// registers the directory in the ownership table, so a later Owner sees what the
+// real seam leaves behind. It performs no mkdir.
+func (f *fakeSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("EnsureOwnedDir:%s:%d:%d:%#o", dir, uid, gid, mode))
+	if e, ok := f.owners[dir]; ok && e.Kind == EntrySymlink {
+		// The real seam's refusal: it never chowns through a planted link.
+		return fmt.Errorf("%s: is a symlink: refusing to chown/chmod through it", dir)
+	}
+	f.putOwned(dir, uid, gid, mode, EntryDir)
+	return nil
+}
+
+// RemoveEntry records the call and removes the entry from the fake root
+// filesystem and the ownership table. Absence is success, as on the real seam.
+func (f *fakeSystem) RemoveEntry(dir, name string) error {
+	f.calls = append(f.calls, "RemoveEntry:"+dir+":"+name)
+	p := filepath.Join(dir, name)
+	delete(f.files, p)
+	delete(f.owners, p)
+	return nil
+}
+
+// OpenDirNoFollow records the open and hands out a numbered handle. A symlink
+// (in the ownership table) at dir is refused, as O_NOFOLLOW refuses it; a dir
+// with no ownership entry is absent. The handle keeps reading the directory it
+// opened, whatever later happens to the path's ownership entry — the property
+// a held descriptor has.
+func (f *fakeSystem) OpenDirNoFollow(dir string) (DirHandle, error) {
+	f.calls = append(f.calls, "OpenDirNoFollow:"+dir)
+	e, ok := f.owners[dir]
+	switch {
+	case !ok:
+		return nil, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
+	case e.Kind == EntrySymlink:
+		return nil, fmt.Errorf("open %s: too many levels of symbolic links (O_NOFOLLOW)", dir)
+	case e.Kind != EntryDir:
+		return nil, fmt.Errorf("open %s: not a directory", dir)
+	}
+	f.handleSeq++
+	h := &fakeDirHandle{f: f, dir: dir, id: fmt.Sprintf("h%d", f.handleSeq)}
+	if f.afterOpenDir != nil {
+		f.afterOpenDir(dir)
+	}
+	return h, nil
+}
+
+// fakeDirHandle is a directory the fake holds open.
+type fakeDirHandle struct {
+	f   *fakeSystem
+	dir string
+	id  string
+}
+
+// ReadEntry records the read against the handle and answers with
+// ReadRegularFile's verdict for the entry inside the held directory.
+func (h *fakeDirHandle) ReadEntry(name string) ([]byte, error) {
+	h.f.calls = append(h.f.calls, "ReadEntry:"+h.id+":"+name)
+	return h.f.readRegularFileContent(filepath.Join(h.dir, name))
+}
+
+// RemoveEntry records the removal against the handle and removes the entry.
+func (h *fakeDirHandle) RemoveEntry(name string) error {
+	h.f.calls = append(h.f.calls, "RemoveEntry:"+h.id+":"+name)
+	delete(h.f.files, filepath.Join(h.dir, name))
+	return nil
+}
+
+// Close records the close.
+func (h *fakeDirHandle) Close() error {
+	h.f.calls = append(h.f.calls, "Close:"+h.id)
 	return nil
 }
 
@@ -1427,11 +1490,11 @@ func TestLogDirIsNotWorldReadable(t *testing.T) {
 		if LogDirGID != 80 {
 			t.Errorf("LogDirGID = %d, want 80 (admin, the sudo-capable tier)", LogDirGID)
 		}
-		// Not staff. DataRootGID is staff, and staff is the default primary
+		// Not staff. ServiceTreeGID is staff, and staff is the default primary
 		// group of every ordinary macOS account — a staff-readable log tree is
 		// a world-readable one with extra steps.
-		if LogDirGID == DataRootGID {
-			t.Errorf("LogDirGID = %d = DataRootGID (staff); staff is every local account's primary group", LogDirGID)
+		if LogDirGID == ServiceTreeGID {
+			t.Errorf("LogDirGID = %d = ServiceTreeGID (staff); staff is every local account's primary group", LogDirGID)
 		}
 		if LogDirMode.Perm()&0o007 != 0 || LogFileMode.Perm()&0o007 != 0 {
 			t.Errorf("mode %#o/%#o grants `other` access to the daemon logs", LogDirMode, LogFileMode)
@@ -1497,7 +1560,31 @@ func TestInstallOrchestration(t *testing.T) {
 		// over step below, rather than repeated.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"ReadFile:" + dataroot.DefaultServerArgsRecordPath,
+		// The upgrade check: is any daemon an earlier install left running?
+		// Read-only probes, node daemon first; on this first install neither is
+		// loaded, so nothing is booted out before the state tree is re-owned.
+		"ServicePID:io.k3sm.server",
+		"ServicePID:io.k3sm.netd",
 		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
+		// The state tree, per the ownership table: the data root root:wheel 0755
+		// FIRST (never the service user's), then every tree the unprivileged
+		// daemons write, handed over explicitly. The key dir and the two work
+		// dirs are applied by the later steps that write into them.
+		"EnsureOwnedDir:/var/lib/k3sm:0:0:0755",
+		"EnsureOwnedDir:/var/lib/k3sm/run:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/Library:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/pods:271:20:0750",
+		"EnsureOwnedDir:/var/lib/k3sm/storage:271:20:0750",
+		"EnsureOwnedDir:/var/lib/k3sm/blobs:271:20:0750",
+		"EnsureOwnedDir:/var/lib/k3sm/unpacked:271:20:0750",
+		"EnsureOwnedDir:/var/lib/k3sm/snapshots:271:20:0750",
+		"EnsureOwnedDir:/var/lib/k3sm/guest-artifacts:271:20:0750",
+		"EnsureOwnedDir:/var/lib/k3sm/index:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/operator:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/ingest:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/sbpl:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/podreap:271:20:0700",
+		"EnsureOwnedDir:/var/lib/k3sm/vmreap:271:20:0700",
 		"EnsureLogDir:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
 		// node refuses to start without it, and only root can create it owned by
@@ -1523,12 +1610,16 @@ func TestInstallOrchestration(t *testing.T) {
 		// it: the daemon must never be pointed at a file nobody has written.
 		"WriteServiceUserFile:/var/lib/k3sm/server/token:0600:0700:271",
 		// This node's wireguard identity, provisioned by the party that can: the
-		// root-only key dir carved inside the (service-user-owned) run dir, the
+		// root-only key dir carved directly under the root-owned data root (and
+		// the legacy run-dir location inspected for a key to move: absent on a
+		// first install, so nothing is moved), the
 		// role's work-dir key read to see whether the node already has one — it
 		// does not, on a first install — so one is minted and written to BOTH the
 		// work dir (service-user 0600, where the daemon loads it) and the key dir
 		// (root 0600, where netd resolves the ref). Before any daemon starts.
-		"EnsureMeshKeyDir:/var/lib/k3sm/run/keys:0700",
+		"EnsureMeshKeyDir:/var/lib/k3sm/keys:0700",
+		"Owner:/var/lib/k3sm/run",
+		"OpenDirNoFollow:" + LegacyMeshKeyDir,
 		// BOTH copies are read before anything is written, and read through the
 		// seam that refuses a symlink: whether a key already exists decides
 		// between copying, restoring and minting, and only a mint is destructive.
@@ -1536,9 +1627,9 @@ func TestInstallOrchestration(t *testing.T) {
 		// the work dir (service-user 0600, where the daemon loads it) and the key
 		// dir (root 0600, where netd resolves the ref).
 		"ReadRegularFile:/var/lib/k3sm/server/server.key",
-		"ReadRegularFile:/var/lib/k3sm/run/keys/server.key",
+		"ReadRegularFile:/var/lib/k3sm/keys/server.key",
 		"WriteServiceUserFile:/var/lib/k3sm/server/server.key:0600:0700:271",
-		"WriteRootOnlyFile:/var/lib/k3sm/run/keys/server.key:0600",
+		"WriteRootOnlyFile:/var/lib/k3sm/keys/server.key:0600",
 		// THE STAGED INSTALL ROOT. The sibling directory is inspected (absent on
 		// a first install, so nothing is removed) and created, and every
 		// artifact below lands in it rather than in the tree the daemons are
@@ -1697,7 +1788,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			var first string
 			for _, c := range f.calls {
 				if strings.HasPrefix(c, "ReadFile:") || strings.HasPrefix(c, "LinkDirTrust:") || strings.HasPrefix(c, "VerifyVirtualizationEntitlement:") ||
-					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") {
+					strings.HasPrefix(c, "InstallSpace:") || strings.HasPrefix(c, "LockInstall:") || strings.HasPrefix(c, "ServicePID:") {
 					continue
 				}
 				first = c
@@ -1829,7 +1920,7 @@ func TestUninstallIdempotent(t *testing.T) {
 		// netd is booted out (so it cannot rewrite it) and the one leaf of the
 		// preserved mesh key dir that goes: a role change goes through
 		// uninstall, and the next role's netd must not restore this /24.
-		"RemoveAll:/var/lib/k3sm/run/keys/node-pod-cidr",
+		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
 		// The staged admin token, removed with the daemons rather than preserved
 		// with the rest of the data root: it is a system:masters credential with
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
