@@ -74,6 +74,12 @@ const (
 // 0700 tree — the same (name × euid) identity the registry work-dir encodes. The
 // /private spelling is the resolved one: Seatbelt evaluates resolved paths, and
 // /var is a symlink to /private/var.
+//
+// /private/var/tmp is world-writable (sticky), so another local user can
+// pre-create the base as a symlink into a tree they control. The base and the
+// instance root are therefore created only through mkdirNoFollow, which refuses
+// a link at either: the rootless pod-shim stage lives beneath them, and the shim
+// staged there is DYLD-injected into every pod.
 const PodRootBasePrefix = "/private/var/tmp/k3sm-dev"
 
 // terminateGrace is how long Down waits for a detached server to exit after
@@ -147,9 +153,10 @@ type Manager struct {
 	sys         System
 	builder     ExecShimBuilder
 	shimBuilder PodShimBuilder
-	// shimDir is the pod-readable directory the two pod-support DYLD shims are
-	// staged into; empty means DefaultPodShimDir. It is a field so a test stages
-	// into a temp dir instead of /Library.
+	// shimDir, when set, overrides the pod-readable directory the two pod-support
+	// DYLD shims are staged into; empty means the per-tier default (podShimDir:
+	// DefaultPodShimDir for root, <runtime root>/shims for rootless). It is a
+	// field so a test stages into a temp dir instead of /Library.
 	shimDir string
 	// podRootBase is the parent of the per-instance runtimed roots; empty means
 	// PodRootBasePrefix-<euid>. It is a field, like shimDir, so a test drives the
@@ -318,26 +325,12 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// mount path (ConfigMap/Secret/emptyDir/the projected SA token) ENOENTs in-pod
 	// without the path-rebase shim, and every cluster Service name NXDOMAINs
 	// without the getaddrinfo shim. Each is provisioned only in a posture that can
-	// stage and use it (wantsPathShim / wantsDNSShim); an unbuildable shim is a
-	// loud degrade, not a failure.
-	pathShim, dnsShim := "", ""
-	if wantsPathShim(m.euid, runtimeName) {
-		pathShim, err = m.provisionPodShim(ctx, pathShimName)
-		if err != nil {
-			return Instance{}, err
-		}
-		if pathShim == "" {
-			fmt.Fprint(m.out, "NOTE: absolute volume-mount paths unavailable in-pod (no stageable path-rebase shim) — ConfigMap/Secret/emptyDir/service-account mounts will ENOENT. Run k3sm dev from the workspace for volume mounts.\n")
-		}
-	}
-	if wantsDNSShim(m.euid, opts.Datapath, runtimeName) {
-		dnsShim, err = m.provisionPodShim(ctx, dnsShimName)
-		if err != nil {
-			return Instance{}, err
-		}
-		if dnsShim == "" {
-			fmt.Fprint(m.out, "NOTE: in-pod cluster DNS unavailable (no stageable getaddrinfo shim) — pods stay on the system resolver and cluster Service names NXDOMAIN. Run k3sm dev from the workspace for cluster DNS.\n")
-		}
+	// use it (wantsPathShim / wantsDNSShim), in a stage dir the confined pod may
+	// read (podShimDir — /Library for root, beside the runtime root for rootless);
+	// an unbuildable shim is a loud degrade, not a failure.
+	pathShim, dnsShim, err := m.stagePodShims(ctx, name, opts.Datapath, runtimeName)
+	if err != nil {
+		return Instance{}, err
 	}
 
 	// Boot a detached `k3sm server` on the shipped admission defaults (PSA
@@ -753,7 +746,9 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// Pre-create the runtime root so a base the caller cannot write (a stale tree
 	// owned by the other euid) fails here, with the path named, instead of inside
 	// the detached server's first pod create.
-	if err := os.MkdirAll(podRoot, 0o700); err != nil {
+	// Component by component with a symlink refusal: the base sits under the
+	// world-writable /private/var/tmp (see mkdirNoFollow).
+	if err := mkdirNoFollow(0o700, filepath.Dir(podRoot), podRoot); err != nil {
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
 	// The instance's container-log root. The node REFUSES to start without it
@@ -1120,7 +1115,11 @@ func (m *Manager) podRoot(name string) string {
 }
 
 // podRootBaseDir returns the configured pod-root base, defaulting to the
-// euid-scoped PodRootBasePrefix.
+// euid-scoped PodRootBasePrefix. The default sits under the world-writable
+// /private/var/tmp, so any local user can pre-plant it as a symlink; every
+// creation of it goes through mkdirNoFollow, which refuses one. That check is
+// required, not defensive: the rootless shim stage lives beneath it and the
+// staged shim is DYLD-injected into every pod.
 func (m *Manager) podRootBaseDir() string {
 	if m.podRootBase != "" {
 		return m.podRootBase

@@ -72,6 +72,11 @@ type runtimedRuntime struct {
 	nodeIP   string
 	rootfs   string
 	dyldShim string
+	// pathShim is the path-rebase DYLD shim runtimed injects into every pod
+	// (RuntimedConfig.PathShim). The provider does not inject it itself — it
+	// keeps it only to name the file in each pod's Seatbelt read allow alongside
+	// dyldShim (see stampShimReadPaths).
+	pathShim string
 	// resolverVIP and clusterDomain are the cluster DNS inputs buildBox feeds
 	// dns.PodDNSConfig (per-pod namespace) to derive the K3SM_DNS_* env the DYLD
 	// getaddrinfo shim reads — so an in-pod unqualified Service lookup expands and
@@ -320,11 +325,13 @@ type RuntimedConfig struct {
 	// runtimed default (/var/lib/k3sm).
 	Root string
 	// DyldShim, when set, is the getaddrinfo DNS shim dylib injected into each
-	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES.
+	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
+	// file is also added to every pod's Seatbelt read allow (stampShimReadPaths).
 	DyldShim string
 	// PathShim, when set, is the path-rebase DYLD shim dylib runtimed injects into a
 	// mounting container so an absolute volume mount resolves under the pod data
 	// volume (no chroot). Empty leaves a pod's absolute mount path reaching the host.
+	// Like DyldShim, the file joins every pod's Seatbelt read allow.
 	PathShim string
 	// ResolverVIP is the cluster DNS Service VIP (10.43.0.10) the per-pod Seatbelt
 	// egress allow-list is scoped to (threaded into runtimed's sandbox.Posture), so
@@ -635,6 +642,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		nodeIP:        cfg.NodeIP,
 		rootfs:        cfg.Root,
 		dyldShim:      cfg.DyldShim,
+		pathShim:      cfg.PathShim,
 		resolverVIP:   cfg.ResolverVIP,
 		clusterDomain: cfg.ClusterDomain,
 		apiServerVIP:  cfg.APIServerVIP,
@@ -859,6 +867,31 @@ func (r *runtimedRuntime) stampLocalPortDenies(sp *runtimev1.SandboxProfile) {
 		return
 	}
 	sp.DeniedLocalPorts = unionLocalPortDenies(sp.GetDeniedLocalPorts(), r.deniedLocalPorts)
+}
+
+// stampShimReadPaths adds the node's pod-support DYLD shim files to the pod's
+// Seatbelt read allow (SandboxProfile.ExtraReadPaths). dyld loads an inserted
+// library INSIDE the confined pod, so the pod profile must be able to read the
+// file, and its read baseline is only /System, /usr, /bin and /Library: a shim
+// staged anywhere else (a rootless `k3sm dev` instance stages beside its runtime
+// root) is unreadable there, and dyld fails CLOSED, killing the pod at exec.
+//
+// The grant is exactly the configured FILES, never their directory, so nothing
+// else that lands beside them becomes pod-readable. It is uniform: for a shim
+// under /Library the entry is already inside the baseline and changes nothing.
+// A union, like the deny stamps above, so a grant an earlier translation step
+// put on the profile survives. A nil profile is a no-op.
+func (r *runtimedRuntime) stampShimReadPaths(sp *runtimev1.SandboxProfile) {
+	if sp == nil {
+		return
+	}
+	paths := sp.GetExtraReadPaths()
+	for _, shim := range []string{r.dyldShim, r.pathShim} {
+		if shim != "" && !slices.Contains(paths, shim) {
+			paths = append(paths, shim)
+		}
+	}
+	sp.ExtraReadPaths = paths
 }
 
 // unionLocalPortDenies returns the sorted, deduplicated union of the port
@@ -1384,6 +1417,7 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 	box.LogDirectory = logDir
 	r.stampSocketDenies(box.SandboxProfile)
 	r.stampLocalPortDenies(box.SandboxProfile)
+	r.stampShimReadPaths(box.SandboxProfile)
 	// Xcode-toolchain opt-in: stamp the node's developer dir onto a pod that asked
 	// for it. Applied HERE and not inside toPodBox because the grant is a node
 	// fact (this node's `xcode-select -p`), which the pure pod translation does not

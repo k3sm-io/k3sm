@@ -17,11 +17,13 @@ limitations under the License.
 package dev
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -95,11 +97,11 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		m := newTestManagerWithShimBuilder(t, b)
 
 		for _, name := range shims {
-			shim, err := m.provisionPodShim(context.Background(), name)
+			shim, err := m.provisionPodShim(context.Background(), "dev", name)
 			if err != nil {
 				t.Fatalf("provisionPodShim(%s): %v", name, err)
 			}
-			want := filepath.Join(m.podShimDir(), name)
+			want := filepath.Join(m.podShimDir("dev"), name)
 			if shim != want {
 				t.Fatalf("provisionPodShim(%s) = %q, want the staged shim %q", name, shim, want)
 			}
@@ -113,14 +115,24 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 			if fi.Mode().Perm()&0o004 == 0 {
 				t.Errorf("staged %s mode = %v, want world-readable (dyld fails closed in-pod)", name, fi.Mode().Perm())
 			}
-			if !slices.Contains(b.signed, want) {
-				t.Errorf("signed = %v, want %q signed", b.signed, want)
+			if fi.Mode().Perm() != podShimMode {
+				t.Errorf("staged %s mode = %v, want %v", name, fi.Mode().Perm(), podShimMode)
+			}
+		}
+		// Each build is signed once, in its private build dir BEFORE the rename,
+		// so codesign never writes at the shared stage path.
+		if len(b.signed) != len(shims) {
+			t.Errorf("signed = %v, want one signature per built shim", b.signed)
+		}
+		for i, p := range b.signed {
+			if i < len(shims) && filepath.Base(p) != shims[i] {
+				t.Errorf("signed[%d] = %q, want the built %s", i, p, shims[i])
 			}
 		}
 		if got := b.buildNames(); !slices.Equal(got, shims) {
 			t.Errorf("built = %v, want both shims %v", got, shims)
 		}
-		di, statErr := os.Stat(m.podShimDir())
+		di, statErr := os.Stat(m.podShimDir("dev"))
 		if statErr != nil {
 			t.Fatalf("stage dir not present: %v", statErr)
 		}
@@ -161,30 +173,28 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		}
 	})
 
-	t.Run("the posture gates: staging needs root+runtimed, the DNS shim also needs a datapath", func(t *testing.T) {
+	t.Run("the posture gates: staging needs runtimed, the DNS shim also needs a datapath", func(t *testing.T) {
 		cases := []struct {
 			name              string
-			euid              int
 			datapath          bool
 			runtime           string
 			wantPath, wantDNS bool
 		}{
-			// Root + runtimed + datapath: both shims apply.
-			{"root datapath runtimed", 0, true, runtimeRuntimed, true, true},
-			// Root, no datapath: mounts still need the path shim, but no per-node
-			// resolver binds the DNS VIP, so a DNS shim would point pods at nothing.
-			{"root rootless-network runtimed", 0, false, runtimeRuntimed, true, false},
-			// Non-root cannot stage under /Library (the pod Seatbelt read baseline).
-			{"unprivileged runtimed", 501, false, runtimeRuntimed, false, false},
-			{"unprivileged datapath-request runtimed", 501, true, runtimeRuntimed, false, false},
+			// runtimed + datapath (the root tier): both shims apply.
+			{"datapath runtimed", true, runtimeRuntimed, true, true},
+			// No datapath (the rootless tier, or root without --datapath): mounts
+			// still need the path shim, but no per-node resolver binds the DNS VIP,
+			// so a DNS shim would point pods at nothing.
+			{"network=none runtimed", false, runtimeRuntimed, true, false},
 			// The hostprocess provider performs no DYLD injection at all.
-			{"root datapath hostprocess", 0, true, runtimeHostProcess, false, false},
+			{"datapath hostprocess", true, runtimeHostProcess, false, false},
+			{"network=none hostprocess", false, runtimeHostProcess, false, false},
 		}
 		for _, tc := range cases {
-			if got := wantsPathShim(tc.euid, tc.runtime); got != tc.wantPath {
+			if got := wantsPathShim(tc.runtime); got != tc.wantPath {
 				t.Errorf("wantsPathShim(%s) = %v, want %v", tc.name, got, tc.wantPath)
 			}
-			if got := wantsDNSShim(tc.euid, tc.datapath, tc.runtime); got != tc.wantDNS {
+			if got := wantsDNSShim(tc.datapath, tc.runtime); got != tc.wantDNS {
 				t.Errorf("wantsDNSShim(%s) = %v, want %v", tc.name, got, tc.wantDNS)
 			}
 		}
@@ -195,7 +205,7 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		m := newTestManagerWithShimBuilder(t, b)
 
 		for _, name := range shims {
-			shim, err := m.provisionPodShim(context.Background(), name)
+			shim, err := m.provisionPodShim(context.Background(), "dev", name)
 			if err != nil {
 				t.Fatalf("provisionPodShim(%s) on build failure = err %v, want nil (degrade, not fatal)", name, err)
 			}
@@ -214,14 +224,14 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		// artifact is invisible.
 		b := &fakePodShimBuilder{}
 		m := newTestManagerWithShimBuilder(t, b)
-		if err := os.MkdirAll(m.podShimDir(), 0o755); err != nil {
+		if err := os.MkdirAll(m.podShimDir("dev"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		staged := filepath.Join(m.podShimDir(), pathShimName)
+		staged := filepath.Join(m.podShimDir("dev"), pathShimName)
 		if err := os.WriteFile(staged, []byte("cached"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.provisionPodShim(context.Background(), pathShimName); err != nil {
+		if _, err := m.provisionPodShim(context.Background(), "dev", pathShimName); err != nil {
 			t.Fatalf("provisionPodShim: %v", err)
 		}
 		if got := b.buildNames(); !slices.Equal(got, []string{pathShimName}) {
@@ -232,7 +242,7 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		// dropping the cluster to no absolute mounts at all.
 		b2 := &fakePodShimBuilder{buildErr: errors.New("no clang")}
 		m.shimBuilder = b2
-		shim, err := m.provisionPodShim(context.Background(), pathShimName)
+		shim, err := m.provisionPodShim(context.Background(), "dev", pathShimName)
 		if err != nil {
 			t.Fatalf("provisionPodShim with a failed rebuild: %v", err)
 		}
@@ -241,6 +251,13 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		}
 		if len(b2.signed) != 1 || b2.signed[0] != staged {
 			t.Errorf("signed = %v, want the cached shim re-signed once", b2.signed)
+		}
+		// The re-sign rewrites the file and refreshes its mtime, so the notice is
+		// the ONLY thing that shows the cached shim may predate the source: it must
+		// say STALE and carry the build error.
+		out := m.out.(*bytes.Buffer).String()
+		if !strings.Contains(out, "STALE") || !strings.Contains(out, "no clang") {
+			t.Errorf("output = %q, want a STALE notice carrying the build error", out)
 		}
 	})
 
@@ -266,7 +283,7 @@ func TestDevProvisionsDNSShim(t *testing.T) {
 		// registry root (~/.k3sm/dev) is OUTSIDE the pod Seatbelt read baseline
 		// (/System, /usr, /bin, /Library), where dyld fails closed and every
 		// confined pod dies at exec.
-		if got := m.podShimDir(); got != DefaultPodShimDir {
+		if got := m.podShimDir("dev"); got != DefaultPodShimDir {
 			t.Errorf("default stage dir = %q, want %q", got, DefaultPodShimDir)
 		}
 		if filepath.Dir(DefaultPodShimDir) != "/Library" {

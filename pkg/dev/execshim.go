@@ -100,10 +100,19 @@ func (m *Manager) devBinDir() string { return filepath.Join(m.reg.root, ".bin") 
 // filesystem failure (cache dir unwritable), which IS fatal.
 func (m *Manager) provisionExecShim(ctx context.Context) (binDir string, ok bool, err error) {
 	dir := m.devBinDir()
+	// The same symlink refusal as the pod-shim stage (refuseSymlink): a root
+	// `k3sm dev up --datapath` writes and signs here, and a pre-planted link would
+	// redirect that write into a tree the planter chooses.
+	if err := refuseSymlink(dir); err != nil {
+		return "", false, err
+	}
 	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
 		return "", false, fmt.Errorf("create dev bin cache %s: %w", dir, mkErr)
 	}
 	shim := filepath.Join(dir, execShimName)
+	if err := refuseSymlink(shim); err != nil {
+		return "", false, err
+	}
 
 	cached := false
 	if info, statErr := os.Stat(shim); statErr == nil && !info.IsDir() && info.Size() > 0 {
