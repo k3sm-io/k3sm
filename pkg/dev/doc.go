@@ -45,11 +45,22 @@ limitations under the License.
 // Pod-support DYLD shims: cmd/k3sm resolves the path-rebase and getaddrinfo shims
 // as SIBLINGS of the running executable, and `k3sm dev` re-execs a `go build`
 // binary, so it found neither — absolute volume mounts ENOENT'd in-pod and cluster
-// Service names NXDOMAIN'd. The lifecycle therefore stages both into
-// DefaultPodShimDir (under /Library, the only tree inside the pod Seatbelt read
-// baseline) and passes them as --path-shim / --dns-shim. Staging needs root, and
-// the DNS shim additionally needs a live datapath (no resolver binds the DNS VIP
-// under network=none); an unstageable shim degrades with a notice, never fatally.
+// Service names NXDOMAIN'd. The lifecycle therefore stages both and passes them as
+// --path-shim / --dns-shim, into a location the confined pod may read (dyld loads
+// them inside the pod and fails closed on an unreadable one):
+//   - root tier (euid 0): DefaultPodShimDir, /Library/k3sm-dev — inside the pod
+//     Seatbelt read baseline (/System, /usr, /bin, /Library);
+//   - rootless tier: <PodRootBasePrefix>-<euid>/<instance>/shims, beside the
+//     instance's runtime root and off runtimed's protected deny-set (never under
+//     the pods root, never under /Users, so never ~/.k3sm or the execshim dev-bin
+//     cache). It is outside the read baseline, so the provider names the two
+//     staged files in every pod's SandboxProfile.ExtraReadPaths.
+//
+// The staged shims are regular-file copies with mode 0755; a stage dir or target
+// that is a symlink is refused. The DNS shim additionally needs a live datapath
+// (no resolver binds the DNS VIP under network=none), so the rootless tier stages
+// only the path-rebase shim; an unbuildable shim degrades with a notice, never
+// fatally, and a rebuild failure that falls back to a cached shim says STALE.
 //
 // Testability: every syscall the lifecycle needs (ifconfig lo0 alias listing,
 // flushing an alias, process-liveness/kill, flock) is behind the System

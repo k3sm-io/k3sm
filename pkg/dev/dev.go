@@ -147,9 +147,10 @@ type Manager struct {
 	sys         System
 	builder     ExecShimBuilder
 	shimBuilder PodShimBuilder
-	// shimDir is the pod-readable directory the two pod-support DYLD shims are
-	// staged into; empty means DefaultPodShimDir. It is a field so a test stages
-	// into a temp dir instead of /Library.
+	// shimDir, when set, overrides the pod-readable directory the two pod-support
+	// DYLD shims are staged into; empty means the per-tier default (podShimDir:
+	// DefaultPodShimDir for root, <runtime root>/shims for rootless). It is a
+	// field so a test stages into a temp dir instead of /Library.
 	shimDir string
 	// podRootBase is the parent of the per-instance runtimed roots; empty means
 	// PodRootBasePrefix-<euid>. It is a field, like shimDir, so a test drives the
@@ -318,26 +319,12 @@ func (m *Manager) Up(ctx context.Context, opts UpOptions) (Instance, error) {
 	// mount path (ConfigMap/Secret/emptyDir/the projected SA token) ENOENTs in-pod
 	// without the path-rebase shim, and every cluster Service name NXDOMAINs
 	// without the getaddrinfo shim. Each is provisioned only in a posture that can
-	// stage and use it (wantsPathShim / wantsDNSShim); an unbuildable shim is a
-	// loud degrade, not a failure.
-	pathShim, dnsShim := "", ""
-	if wantsPathShim(m.euid, runtimeName) {
-		pathShim, err = m.provisionPodShim(ctx, pathShimName)
-		if err != nil {
-			return Instance{}, err
-		}
-		if pathShim == "" {
-			fmt.Fprint(m.out, "NOTE: absolute volume-mount paths unavailable in-pod (no stageable path-rebase shim) — ConfigMap/Secret/emptyDir/service-account mounts will ENOENT. Run k3sm dev from the workspace for volume mounts.\n")
-		}
-	}
-	if wantsDNSShim(m.euid, opts.Datapath, runtimeName) {
-		dnsShim, err = m.provisionPodShim(ctx, dnsShimName)
-		if err != nil {
-			return Instance{}, err
-		}
-		if dnsShim == "" {
-			fmt.Fprint(m.out, "NOTE: in-pod cluster DNS unavailable (no stageable getaddrinfo shim) — pods stay on the system resolver and cluster Service names NXDOMAIN. Run k3sm dev from the workspace for cluster DNS.\n")
-		}
+	// use it (wantsPathShim / wantsDNSShim), in a stage dir the confined pod may
+	// read (podShimDir — /Library for root, beside the runtime root for rootless);
+	// an unbuildable shim is a loud degrade, not a failure.
+	pathShim, dnsShim, err := m.stagePodShims(ctx, name, opts.Datapath, runtimeName)
+	if err != nil {
+		return Instance{}, err
 	}
 
 	// Boot a detached `k3sm server` on the shipped admission defaults (PSA
