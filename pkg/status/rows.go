@@ -128,6 +128,16 @@ func (c Collector) Collect(ctx context.Context) Report {
 		c.kubeconfigRow(),
 		c.runtimedRow(ctx, role),
 	)
+	// The host-DNS floor and the shell set pods run through, on an installed
+	// Mac only (neither exists before `sudo k3sm install`).
+	if installed {
+		if r, ok := c.nodeResolverRow(netd); ok {
+			rows = append(rows, r)
+		}
+		if r, ok := c.shadowShellsRow(); ok {
+			rows = append(rows, r)
+		}
+	}
 
 	verdict, summary, next := Aggregate(rows, installed, role)
 	return Report{

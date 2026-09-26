@@ -96,20 +96,22 @@ const (
 	// finds, while the only other trace is a node-daemon line written at startup,
 	// possibly days before this pod was scheduled.
 	reasonXcodeToolchainUngranted = "XcodeToolchainUngranted"
-	// reasonRestrictedShellEntrypoint is recorded when a container that received
-	// the cluster DNS shim env has an entrypoint dyld treats as a macOS SIP
-	// platform binary — see restrictedPlatformEntrypoint. dyld strips every
-	// DYLD_* variable before it loads a platform binary, so the DNS
-	// getaddrinfo shim never loads and the container's cluster-name lookups
-	// silently NXDOMAIN.
+	// reasonShimInactive is recorded when runtimed reports, through the
+	// k3sm.io/shim-inactive pod condition, that a container's main process was
+	// exec'd as a restricted binary (a platform binary, CS_RESTRICT, or the
+	// hardened runtime). dyld drops DYLD_INSERT_LIBRARIES for such a process, so
+	// neither the DNS shim nor the path-rebase shim loads in it: single-label
+	// names and per-namespace DNS precedence stop working, and so does the
+	// bind/connect source discipline. FQDNs and name.ns.svc still resolve
+	// through the node resolver entry.
 	//
-	// Like XcodeToolchainUngranted it has no upstream analogue and the pod is
-	// NOT refused: most /bin/sh entrypoints exec a compiled binary that
-	// inherits the shim fine, so refusing every one would be a false positive
-	// for most of them. The Event exists because the ones that do fail
-	// otherwise show only an in-pod "no such host", with nothing pointing at
-	// the cause.
-	reasonRestrictedShellEntrypoint = "RestrictedShellEntrypoint"
+	// The verdict is the kernel's (csops on the fresh pid, read by runtimed),
+	// not a guess from the pod's argv: a /bin/sh entrypoint that runs through the
+	// node's re-signed shell keeps the shim and gets no Event, and a restricted
+	// binary under any path gets one. Recorded once per pod per reason
+	// (observeShimInactive). Like XcodeToolchainUngranted it has no upstream
+	// analogue and the pod is NOT refused.
+	reasonShimInactive = "ShimInactive"
 )
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec
@@ -341,22 +343,6 @@ func msgXcodeToolchainUngranted(developerDir string) string {
 		"toolchain grant accepts — it grants a full Xcode developer directory, and a Command Line "+
 		"Tools root needs no grant because a pod already reads that tree. %s",
 		runtimev1.AnnotationXcodeToolchain, developerDir, remedy)
-}
-
-// msgRestrictedShellEntrypoint is the RestrictedShellEntrypoint-event message for
-// a container whose entrypoint dyld treats as a macOS platform binary.
-//
-// It carries the resolved path, rendered with %q for the same reason the other
-// user-authored values in this file are: the value is the pod's own spec
-// (Command[0] or the image reference), not env, args, or a registry response,
-// and %q escapes any control byte before it reaches a namespace-readable Event.
-// It names neither a fully-qualified path list nor a resolver file — k3sm ships
-// no such thing — only the one remedy that actually restores the shim.
-func msgRestrictedShellEntrypoint(path string) string {
-	return fmt.Sprintf("This container's entrypoint %q is a macOS platform binary, which drops the DNS "+
-		"shim this pod was given, so cluster names will not resolve from it. Use a compiled binary as the "+
-		"entrypoint instead — a pod that execs its binary directly keeps the shim and resolves cluster names.",
-		path)
 }
 
 // nopRecorder is a no-op record.EventRecorder. NewHostProcess substitutes it when

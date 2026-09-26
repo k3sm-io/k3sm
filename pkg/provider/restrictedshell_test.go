@@ -18,7 +18,6 @@ package provider
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 
+	runtimev1 "k3sm.io/apis/runtime/v1"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
@@ -42,19 +42,29 @@ func restrictedShellPod(name string, policy corev1.DNSPolicy, containers ...core
 	}
 }
 
-// TestRestrictedShellEntrypointWarns is the pod-visible-signal gate: a container
-// on the host-binary route whose entrypoint is a macOS SIP platform binary, and
-// which actually received the cluster DNS shim env, must say so ON THE POD —
-// dyld silently strips the DYLD_INSERT_LIBRARIES shim before loading such a
-// binary, and without the Event the only symptom is an in-pod "no such host"
-// with nothing pointing at the cause.
-//
-// BOTH LEGS ARE LOAD-BEARING: a check exercised only on its warn leg degrades
-// into "every /bin/sh pod gets flagged", which would be a false positive for
-// the (common) case where the shell only execs a compiled binary that keeps the
-// shim fine. So the table also covers the OCI-pull arm (never the host-binary
-// route at all), a non-platform host-binary path, and a host-binary entrypoint
-// that never received the DNS env in the first place.
+// shimInactiveCondition is the condition runtimed publishes for a restricted
+// main process (runtimed/pkg/runtime shiminactive.go), with a message in its
+// shape: the container, the path, the flags, and both losses.
+func shimInactiveCondition(reason, container, path string) *runtimev1.PodCondition {
+	return &runtimev1.PodCondition{
+		Type:   runtimed.ShimInactiveConditionType,
+		Status: runtimev1.ConditionStatus_CONDITION_STATUS_TRUE,
+		Reason: reason,
+		Message: "container " + container + ": pod shim inactive for a restricted main process (" + path +
+			", CS_PLATFORM_BINARY): per-namespace DNS precedence and bind/connect source discipline are " +
+			"unavailable; FQDN and name.ns.svc resolve through the node resolver",
+	}
+}
+
+// TestRestrictedShellEntrypointWarns is B309's pod-visible-signal gate,
+// re-pointed by B243 (the name is kept so B309's gate reference stays live): a
+// container whose main process lost the DNS shim must say so ON THE POD. The
+// signal is no longer the argv heuristic B309 shipped (a SIP path prefix on
+// Command[0]) but runtimed's kernel verdict, the k3sm.io/shim-inactive
+// condition, because since B243 a /bin/sh entrypoint runs through the node's
+// re-signed shell and KEEPS the shim, while a restricted binary under any
+// other path still loses it. So the table pins both directions: the argv alone
+// no longer warns, and the condition warns whatever the argv.
 func TestRestrictedShellEntrypointWarns(t *testing.T) {
 	t.Parallel()
 
@@ -62,63 +72,33 @@ func TestRestrictedShellEntrypointWarns(t *testing.T) {
 		name       string
 		containers []corev1.Container
 		dnsPolicy  corev1.DNSPolicy
-		wantPaths  []string // one entry per container index expected to warn; "" = no warn for that container
+		condition  *runtimev1.PodCondition // what runtimed reports; nil = shim loaded
+		wantEvent  bool
 	}{
 		{
-			// The native sentinel arm: Command[0] is the path resolveBinary will
-			// actually exec, and it is a SIP platform binary that received the
-			// cluster DNS env — the exact failure this Event exists to surface.
-			name: "native_sentinel_platform_path_with_dns_env_warns",
-			containers: []corev1.Container{
-				{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/bin/sh"}},
-			},
-			wantPaths: []string{"/bin/sh"},
+			name:       "platform_shell_reported_restricted_warns",
+			containers: []corev1.Container{{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/usr/bin/python3"}}},
+			condition:  shimInactiveCondition(runtimed.ShimInactiveReason, "c0", "/usr/bin/python3"),
+			wantEvent:  true,
 		},
 		{
-			// Same entrypoint string, but the OCI-pull arm: runtimed execs an
-			// ad-hoc-resigned copy of the image's own binary, which IS re-signed
-			// and never loses the shim this way. isHostBinaryContainer must gate
-			// the predicate off this arm entirely.
-			name: "oci_pull_arm_never_flagged",
-			containers: []corev1.Container{
-				{Name: "c0", Image: "some/image", Command: []string{"/bin/sh"}},
-			},
+			// /bin/sh on the host-binary route: B309 warned on the argv; the
+			// shadow shell keeps the shim, runtimed reports nothing, no Event.
+			name:       "bin_sh_through_the_shadow_shell_no_warn",
+			containers: []corev1.Container{{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/bin/sh"}}},
 		},
 		{
-			// Host-binary route, but the path is not under any SIP platform root —
-			// an ordinary compiled binary at a non-system prefix.
-			name: "host_binary_non_platform_path_no_warn",
-			containers: []corev1.Container{
-				{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/usr/local/bin/tool"}},
-			},
+			// The OCI-pull arm, never flagged by the old heuristic: a hardened
+			// binary in an image also loses the shim, and the kernel says so.
+			name:       "oci_pull_arm_reported_hardened_warns",
+			containers: []corev1.Container{{Name: "c0", Image: "some/image", Command: []string{"/app/server"}}},
+			condition:  shimInactiveCondition(runtimed.ShimInactiveHardenedReason, "c0", "/app/server"),
+			wantEvent:  true,
 		},
 		{
-			// Host-binary route, platform path, but DNSPolicy: Default never injects
-			// the shim env in the first place — nothing was lost, so nothing to warn.
-			name: "host_binary_platform_path_no_dns_env_no_warn",
-			containers: []corev1.Container{
-				{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/bin/sh"}},
-			},
-			dnsPolicy: corev1.DNSDefault,
-		},
-		{
-			// The host-path-reference arm: an absolute-path image with no
-			// command/args. The path resolved is the image reference itself.
-			name: "host_path_reference_arm_warns",
-			containers: []corev1.Container{
-				{Name: "c0", Image: "/bin/bash"},
-			},
-			wantPaths: []string{"/bin/bash"},
-		},
-		{
-			// Two offending containers on a pod that still gets created: one Event
-			// per offender, not one for the pod, and CreatePod still succeeds.
-			name: "two_containers_one_event_each_pod_still_created",
-			containers: []corev1.Container{
-				{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/bin/sh"}},
-				{Name: "c1", Image: "/usr/sbin/tool"},
-			},
-			wantPaths: []string{"/bin/sh", "/usr/sbin/tool"},
+			name:       "dns_default_no_condition_no_warn",
+			containers: []corev1.Container{{Name: "c0", Image: runtimed.NativeImage, Command: []string{"/bin/sh"}}},
+			dnsPolicy:  corev1.DNSDefault,
 		},
 	}
 
@@ -126,7 +106,8 @@ func TestRestrictedShellEntrypointWarns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			rec := record.NewFakeRecorder(8)
-			r := newRuntimedWith(newFakeRuntimeServer(), RuntimedConfig{
+			f := newFakeRuntimeServer()
+			r := newRuntimedWith(f, RuntimedConfig{
 				NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(),
 				Recorder: rec, ResolverVIP: "10.43.0.10",
 			}, nil, nil)
@@ -135,38 +116,26 @@ func TestRestrictedShellEntrypointWarns(t *testing.T) {
 			if err := r.CreatePod(context.Background(), pod); err != nil {
 				t.Fatalf("CreatePod: %v", err)
 			}
-
-			var wantCount int
-			for _, p := range tc.wantPaths {
-				if p != "" {
-					wantCount++
-				}
+			if ev := nextLifecycleEvent(rec.Events, 100*time.Millisecond); ev != "" {
+				t.Fatalf("Event %q at create, want none: the argv no longer decides", ev)
 			}
-			if wantCount == 0 {
-				if ev := nextLifecycleEvent(rec.Events, 100*time.Millisecond); ev != "" {
+			if tc.condition != nil {
+				f.setConditions(string(pod.UID), tc.condition)
+			}
+			if _, err := r.GetPodStatus(context.Background(), pod.Namespace, pod.Name); err != nil {
+				t.Fatalf("GetPodStatus: %v", err)
+			}
+
+			ev := nextLifecycleEvent(rec.Events, 100*time.Millisecond)
+			if !tc.wantEvent {
+				if ev != "" {
 					t.Fatalf("unexpected Event %q, want none", ev)
 				}
 				return
 			}
-
-			for i, wantPath := range tc.wantPaths {
-				if wantPath == "" {
-					continue
-				}
-				ev := nextLifecycleEvent(rec.Events, 3*time.Second)
-				if ev == "" {
-					t.Fatalf("container %d: no Event recorded, want a %s Event naming %q",
-						i, reasonRestrictedShellEntrypoint, wantPath)
-				}
-				if !strings.HasPrefix(ev, corev1.EventTypeWarning+" "+reasonRestrictedShellEntrypoint+" ") {
-					t.Errorf("Event = %q, want a Warning %s event", ev, reasonRestrictedShellEntrypoint)
-				}
-				if !strings.Contains(ev, wantPath) {
-					t.Errorf("Event %q does not name the offending path %q", ev, wantPath)
-				}
-			}
-			if ev := nextLifecycleEvent(rec.Events, 100*time.Millisecond); ev != "" {
-				t.Fatalf("unexpected extra Event %q", ev)
+			want := corev1.EventTypeWarning + " " + reasonShimInactive + " " + tc.condition.GetMessage()
+			if ev != want {
+				t.Fatalf("Event = %q, want %q", ev, want)
 			}
 		})
 	}

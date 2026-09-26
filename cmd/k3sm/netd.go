@@ -43,6 +43,7 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
+	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 
 	"k3sm.io/k3sm/pkg/dataroot"
@@ -61,6 +62,12 @@ type netdOptions struct {
 	meshKeyDir  string
 	kubeconfig  string
 	nodeIP      string
+	// dnsVIP and clusterDomain are the node resolver entry's server and
+	// cluster match domain. Their defaults are the same constants the server
+	// and agent --dns-vip/--cluster-domain flags default to, and the installed
+	// plists pass neither, so the three daemons agree by construction.
+	dnsVIP        string
+	clusterDomain string
 }
 
 // netdFlags registers `k3sm netd`'s flags against opts and returns the set. It
@@ -84,6 +91,8 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
 	fs.StringVar(&opts.kubeconfig, "kubeconfig", "", "kubeconfig the privileged-port authorizer's Service informer uses — the control plane's admin kubeconfig on a server, the node credential the join wrote on a worker (empty denies every <1024 bind)")
+	fs.StringVar(&opts.dnsVIP, "dns-vip", dns.DefaultDNSVIP, "cluster DNS VIP the node resolver entry routes svc and the cluster domain to")
+	fs.StringVar(&opts.clusterDomain, "cluster-domain", dns.DefaultClusterDomain, "cluster DNS domain the node resolver entry registers as a match domain")
 	fs.StringVar(&opts.nodeIP, "node-ip", "", "this node's own InternalIP: the only non-VIP address a <1024 bind is authorized on, and only when the canonical ingress LoadBalancer Service declares the port; empty denies every node-address bind. DORMANT: ingress/svclb bind the wildcard in-process and the installed plist passes no --node-ip")
 	return fs
 }
@@ -156,11 +165,52 @@ func runNetd(args []string) error {
 	// on the next restart and the only evidence is this field being empty.
 	logger.Info("k3sm-netd serving", "socket", opts.socket, "node-pod-cidr", nodeCIDR, "service-cidr", svcCIDR, "service-uid", uid, "node-ip", opts.nodeIP, "identity-path", cfg.IdentityPath)
 
+	stopResolver := startNodeResolver(opts, logger)
+	defer stopResolver()
+
 	srv := netd.NewServer(cfg)
 	if err := srv.Serve(ctx, l); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("netd serve: %w", err)
 	}
 	return nil
+}
+
+// startNodeResolver publishes the node resolver entry (netdsvc.NodeResolver)
+// through the SystemConfiguration dynamic store and returns the function that
+// removes it at shutdown. It writes the FULL entry on every start, so a netd
+// respawned by launchd after a crash overwrites whatever configd kept.
+//
+// A failure is logged and does not stop netd: the entry is how shim-less host
+// and pod processes reach the node DNS, while netd's own verbs (lo0 aliases,
+// utun, pf, privileged binds) are what every pod needs to exist at all.
+// `k3sm status` reports an entry that is not there.
+func startNodeResolver(opts netdOptions, logger *slog.Logger) (stop func()) {
+	noop := func() {}
+	vip, err := netip.ParseAddr(opts.dnsVIP)
+	if err != nil {
+		logger.Error("node resolver entry not published: bad --dns-vip", "dns-vip", opts.dnsVIP, "err", err)
+		return noop
+	}
+	store, err := netdsvc.OpenSystemStore()
+	if err != nil {
+		logger.Error("node resolver entry not published: cannot open the dynamic store", "err", err)
+		return noop
+	}
+	nr, err := netdsvc.NewNodeResolver(store, vip, opts.clusterDomain, logger)
+	if err != nil {
+		_ = store.Close() // nothing was published; the close error adds nothing
+		logger.Error("node resolver entry not published", "err", err)
+		return noop
+	}
+	if err := nr.Start(); err != nil {
+		logger.Error("node resolver entry not published", "err", err)
+	}
+	return func() {
+		if err := nr.Stop(); err != nil {
+			logger.Error("node resolver entry not removed at shutdown", "err", err)
+		}
+		_ = store.Close() // the session holds nothing that outlives the removal above
+	}
 }
 
 // resolveServiceUID returns the explicit --service-uid when set (>= 0), else the

@@ -126,17 +126,24 @@ message described above, it is not a failure, and the compile that follows it su
 silenced from inside the Pod. `xcrun`'s documented `xcrun_nocache=1` and `--no-cache` both *refresh*
 the cache entry rather than skip it, so the write happens anyway, and so does the message.
 
-### Volume Mounts Resolve for Native Workloads, Not `/bin/sh`
+### Volume Mounts Resolve for Native Workloads and Host Shells
 
 k3sm pods run at host paths with **no chroot / mount namespace**, so a volume mounted at an
 absolute container path (e.g. `/etc/nats`) is materialized under the pod data volume and made to
 resolve there by a **`DYLD_INSERT_LIBRARIES` path-rebase shim** that rewrites the mounted prefixes.
 The shim loads into ordinary **native workloads** (Go/C binaries such as your app, `nats`, or
-`postgres`), so their absolute volume mounts work as expected. It **cannot** load into a **SIP
-platform binary** (`/bin/sh`, `/usr/bin/*`), because macOS strips `DYLD_INSERT_LIBRARIES` from those,
-so a shell script that reads a mounted file at its absolute path won't see it. For mounted
-config/secret/scratch volumes, ship your workload as a compiled binary (the native k3sm model), not a
-`/bin/sh`-driven image.
+`postgres`), so their absolute volume mounts work as expected.
+
+macOS strips `DYLD_INSERT_LIBRARIES` from a **SIP platform binary**, so on an installed node a Pod's
+`/bin/sh`, `bash`, `zsh`, `dash` and `env` run as the re-signed copies `sudo k3sm install` makes
+under `/Library/k3sm/shadow`. Those copies keep the path-rebase and DNS shims, so a shell script
+that reads a mounted file at its absolute path sees it, and so does whatever the script execs.
+
+The remaining ceiling is any other restricted or hardened main process, such as the system
+`python3`, `perl` or `swift`. dyld still strips the shim from those, so their absolute mount paths
+resolve to the unmounted host path, and the Pod gets a `ShimInactive` Warning Event saying so. We
+still prefer an entrypoint that runs your compiled binary directly when a Pod reads mounted files,
+but a shell-driven image now works too.
 
 Absolute volume-mount paths resolve **only on the root tier**. The path-rebase shim is
 **euid-gated**. It must be staged under `/Library` to sit inside the pod Seatbelt read baseline, and
@@ -357,17 +364,41 @@ depends on the runtime path it runs on (see the `restartPolicy` section above fo
   target is itself inside the cluster domain, which is `NXDOMAIN` (not re-resolved in-cluster).
 - **AAAA is never answered**, because k3sm's CIDRs are IPv4.
 
-**In-pod resolution on the default runtime is wired, with one substrate caveat.** A Pod on a
-cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) has the cluster DNS
-configuration injected into every container, and the `getaddrinfo` shim resolves unqualified Service
-names against the DNS VIP with the correct search-list / ndots expansion. Three things to know:
+**Every process on an installed node resolves cluster FQDNs.** `k3sm netd` registers one supplemental
+DNS entry in the macOS resolver configuration: `svc` and the cluster domain are routed to the DNS VIP,
+and nothing else is. mDNSResponder applies it to every process on the Mac, platform binaries
+included, the way a Linux container inherits its `resolv.conf`. So any process, in a Pod or on the
+host, resolves `<svc>.<ns>.svc.<domain>` and the partial `<svc>.<ns>.svc` (the node resolver
+completes it server-side). The entry adds no search domains: host processes do not start completing
+bare names, and `/etc/resolv.conf` is unchanged. `scutil --dns` lists it while k3sm is installed;
+`k3sm uninstall` removes it, and the `node-resolver` row of `k3sm status` says whether it is there.
 
-- **The shim cannot load into a SIP platform binary** (`/bin/sh`, `/usr/bin/*`), because macOS strips
-  `DYLD_INSERT_LIBRARIES` from those, so a shell script's lookups fall back to the **host** resolver
-  and cluster names will not resolve. This is the same constraint as the volume-mount shim above.
-  Ship a compiled binary.
-- **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver.
-  For `None` that is a gap, because a Pod's own `dnsConfig.nameservers` are not yet honored.
+While the node DNS is down (the node daemon stopped or restarting), the entry still routes `svc` and
+the cluster domain to the DNS VIP. A host lookup of a cluster-shaped name then waits about 5 seconds
+and returns the cached answer, or fails. Names outside `svc` and the cluster domain are unaffected.
+We measured this on 2026-09-26 on a Mac with the agent stopped.
+
+**Single-label names and per-namespace precedence need the `getaddrinfo` shim.** A Pod on a
+cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) gets the cluster DNS
+configuration injected into every container, and the shim applies the Pod's search list and ndots, so
+a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this:
+`<svc>` alone, `<svc>.<ns>` and `<svc>.svc` get no answer from it. The shim also carries the
+bind/connect discipline that gives a Pod its own source address and port space. What to know:
+
+- **Host shells keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a SIP platform binary, so
+  `sudo k3sm install` makes re-signed copies of `/bin/bash`, `/bin/zsh`, `/bin/dash` and `/usr/bin/env`
+  under `/Library/k3sm/shadow`, and the runtime runs those in their place: a `/bin/sh -c` entrypoint, a
+  script whose shebang names one of them, and one exec'd from inside the Pod. A macOS update replaces
+  the host binaries and the copies then lag behind. The `shadow-shells` row of `k3sm status` reports
+  the drift, and running `sudo k3sm install` again makes a fresh set.
+- **Any other restricted main process loses the shim**, for example `/usr/bin/python3` or a
+  hardened-runtime binary. The runtime reads the process's code-signing flags after it starts and the
+  Pod gets a `ShimInactive` Warning Event naming what is unavailable. Such a process still resolves
+  FQDNs and `<svc>.<ns>.svc` through the node resolver. Use fully qualified names, or a compiled
+  binary as the entrypoint.
+- **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
+  which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For
+  `None` that is a gap, because a Pod's own `dnsConfig.nameservers` are not yet honored.
 - **Under `ClusterFirst`, `dnsConfig` is merged additively**, so extra `searches` are appended and
   `ndots` is overridden. Not yet honored are `dnsConfig.nameservers`, an explicit `ndots: 0`, and
   options other than `ndots`.

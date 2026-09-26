@@ -398,6 +398,27 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, in
 	rcode := dnsmessage.RCodeSuccess
 	var ans dnsAnswer
 
+	// Server-side partial-name completion (the CoreDNS autopath precedent). The
+	// node resolver entry netd publishes routes the "svc" and cluster-domain
+	// suffixes here for EVERY host process, but macOS applies no ndots to a
+	// supplemental resolver, so a shim-less client sends name.ns.svc as-is.
+	// Completed names are answered as their FQDN; the answer keeps the client's
+	// original qname (buildResponse stamps q.Name, the same as the ExternalName
+	// flatten). Refused names sit under the reserved "svc" label but cannot be
+	// completed (name.svc is ambiguous) and never leak upstream. Forward and
+	// Passthrough fall through to the zone switch unchanged. The classifier sees
+	// the normalized name: a wire trailing dot is the DNS root, not a client
+	// declaring the name absolute. No namespace is opted in to name.ns routing
+	// (the node resolver entry registers only the static svc + cluster-domain
+	// match domains), so a two-label name is never completed.
+	switch full, verdict := dns.CompletePartialName(qname, r.domain, noPartialRoutedNamespace); verdict {
+	case dns.Completed:
+		qname = full
+	case dns.Refused:
+		resp, err := buildResponse(hdr, q, dnsAnswer{}, dnsmessage.RCodeNameError, edns)
+		return resp, negotiated, err
+	}
+
 	switch extraLabels, svc, ns, inSvcZone := parseClusterZoneName(qname, r.domain); {
 	case strings.HasSuffix(qname, ".in-addr.arpa"):
 		ans, rcode = r.respondReverse(q.Type, qname)
@@ -467,6 +488,12 @@ func (r *clusterResolver) respond(ctx context.Context, query []byte) ([]byte, in
 	resp, err := buildResponse(hdr, q, ans, rcode, edns)
 	return resp, negotiated, err
 }
+
+// noPartialRoutedNamespace is the opt-in predicate respond hands the partial-name
+// classifier: no namespace is routed as a bare <name>.<ns> suffix, because the
+// node resolver entry registers only svc and the cluster domain as match
+// domains. A two-label name therefore never completes and keeps forwarding.
+func noPartialRoutedNamespace(string) bool { return false }
 
 // ednsRequest captures the EDNS(0) parameters a query advertised in its OPT
 // pseudo-record (RFC 6891 §6.1.2): the client's UDP payload size, the EDNS

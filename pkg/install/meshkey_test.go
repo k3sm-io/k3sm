@@ -214,7 +214,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		// Nothing was rewritten at all: both copies already agreed, so the second
 		// run is a read and a no-op.
 		for _, c := range f.calls[before:] {
-			if strings.HasPrefix(c, "WriteRootOnlyFile:") || strings.HasPrefix(c, "WriteServiceUserFile:"+agentWork) {
+			if strings.HasPrefix(c, "WriteRootOnlyFile:"+MeshKeyDir) || strings.HasPrefix(c, "WriteServiceUserFile:"+agentWork) {
 				t.Errorf("the reinstall rewrote a key that had not changed: %q", c)
 			}
 		}
@@ -270,7 +270,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 			t.Errorf("the root-only copy was rewritten: %q, want it untouched at %q", got, priv)
 		}
 		wantCall(t, f, fmt.Sprintf("WriteServiceUserFile:%s:%#o:%#o:%d", agentWork, MeshKeyFileMode, AgentTokenDirMode, 271))
-		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"); len(calls) != 0 {
+		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"+MeshKeyDir); len(calls) != 0 {
 			t.Errorf("the restore rewrote the root-only copy it read from: %v", calls)
 		}
 	})
@@ -295,7 +295,7 @@ func TestAgentInstallProvisionsTheMeshHelperKey(t *testing.T) {
 		} else if !strings.Contains(err.Error(), agentWork) {
 			t.Errorf("error %q does not name the path to look at", err)
 		}
-		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"); len(calls) != 0 {
+		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"+MeshKeyDir); len(calls) != 0 {
 			t.Errorf("install wrote the root-only copy anyway: %v", calls)
 		}
 		if _, ok := f.files[agentHelper]; ok {

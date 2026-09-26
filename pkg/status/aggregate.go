@@ -51,6 +51,13 @@ const (
 	RowDatastore  = "datastore"
 	RowKubeconfig = "kubeconfig"
 	RowRuntimed   = "runtimed"
+	// RowNodeResolver is netd's supplemental DNS entry in the host resolver
+	// configuration (svc and the cluster domain routed to the node DNS). The
+	// row exists only on an installed Mac, when a reader was wired in.
+	RowNodeResolver = "node-resolver"
+	// RowShadowShells is the re-signed host shell set pods run in place of the
+	// platform shells, compared with the live host binaries. Same conditions.
+	RowShadowShells = "shadow-shells"
 )
 
 // advisoryRows are the rows whose WARN is a note to the operator rather than a
@@ -66,7 +73,13 @@ const (
 // remedy; only the headline verdict is unmoved.
 //
 // A FAIL is never exempt, on any row.
-var advisoryRows = map[string]bool{RowPreVolume: true}
+//
+// node-resolver and shadow-shells are notes of the same kind: both describe
+// how shim-less and shell-wrapped processes reach cluster DNS, and a cluster
+// whose pods run and whose Services answer is not degraded because a host
+// process cannot resolve name.ns.svc or because macOS updated /bin/bash since
+// the last install. Each row still warns with its remedy.
+var advisoryRows = map[string]bool{RowPreVolume: true, RowNodeResolver: true, RowShadowShells: true}
 
 // workerAdvisoryRows are the rows that are advisory ON A WORKER, because they
 // describe a control plane this Mac does not run.

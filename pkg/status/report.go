@@ -60,9 +60,12 @@ const (
 	// StateAddressMismatch is the fourth: the credential is complete and in
 	// date, and names an address this node is not assigned.
 	StateAddressMismatch RowState = "address-mismatch"
-	StateUnknown         RowState = "unknown"
-	StateHealthy         RowState = "healthy"
-	StateUnhealthy       RowState = "unhealthy"
+	// StateDrift is the shadow shell set's word for a copy made from a host
+	// binary macOS has since replaced.
+	StateDrift     RowState = "drift"
+	StateUnknown   RowState = "unknown"
+	StateHealthy   RowState = "healthy"
+	StateUnhealthy RowState = "unhealthy"
 )
 
 // Row is one subsystem's line in the report.
