@@ -1705,6 +1705,17 @@ func (darwinSystem) LaunchctlBootout(label string) error {
 	return nil
 }
 
+// LaunchctlEnable clears the daemon's disabled bit in the system domain. launchctl
+// enable succeeds on an already-enabled label and on one launchd has never seen,
+// so the call is safe on every install. launchctl's output is trimmed because the
+// caller surfaces this error verbatim with the remedy command.
+func (darwinSystem) LaunchctlEnable(label string) error {
+	if out, err := exec.Command("launchctl", "enable", "system/"+label).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl enable %s: %w: %s", label, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // LaunchctlKickstart force-restarts the daemon. An unloaded/absent label is an
 // ERROR here (unlike Bootout's idempotent no-op): a caller asking for a restart must
 // never be told a daemon that is not there was restarted. launchctl's output is

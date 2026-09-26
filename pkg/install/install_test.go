@@ -95,6 +95,15 @@ type fakeSystem struct {
 	// It is consulted after the queue, so a test can describe "transient twice,
 	// then permanently broken" if it needs to.
 	bootstrapAlways map[string]error
+	// disabled models launchd's per-label disabled bit in the system domain. A
+	// label present here refuses every LaunchctlBootstrap with the EIO text a
+	// real disabled label produces (which the darwin System classifies as
+	// transient) until LaunchctlEnable clears it. The zero value disables
+	// nothing, so no pre-existing test has to say anything about it.
+	disabled map[string]bool
+	// enableErrs[label] is the error LaunchctlEnable returns for label. The zero
+	// value enables everything.
+	enableErrs map[string]error
 	// netdRefusals[path] is how many ProbeNetd attempts are refused before netd
 	// is listening. It is 0 by default, so an unconfigured fake describes a
 	// helper that is already serving and no pre-existing test has to say
@@ -994,6 +1003,9 @@ func (f *fakeSystem) WriteLaunchDaemon(plistPath string, contents []byte, mode f
 // once, then succeeds" — the racing-bootstrap shape.
 func (f *fakeSystem) LaunchctlBootstrap(label string) error {
 	f.calls = append(f.calls, "Bootstrap:"+label)
+	if f.disabled[label] {
+		return fmt.Errorf("launchctl bootstrap %s: %w: exit status 5: Bootstrap failed: 5: Input/output error", label, ErrLaunchctlTransient)
+	}
 	if queued := f.bootstrapErrs[label]; len(queued) > 0 {
 		f.bootstrapErrs[label] = queued[1:]
 		return queued[0]
@@ -1018,6 +1030,16 @@ func (f *fakeSystem) LaunchctlBootout(label string) error {
 		return nil // still in the domain; ServicePID drains the counter
 	}
 	delete(f.loaded, label)
+	return nil
+}
+
+// LaunchctlEnable clears the label's disabled bit, unless the test made it fail.
+func (f *fakeSystem) LaunchctlEnable(label string) error {
+	f.calls = append(f.calls, "Enable:"+label)
+	if err := f.enableErrs[label]; err != nil {
+		return err
+	}
+	delete(f.disabled, label)
 	return nil
 }
 
@@ -1569,11 +1591,13 @@ func TestInstallOrchestration(t *testing.T) {
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is
-		// the only proof launchd finished the teardown) → bootstrap → await-running
-		// (the read that proves the fresh instance actually spawned). The bare
-		// bootout;bootstrap pair this replaced raced launchd's own removal.
+		// the only proof launchd finished the teardown) → enable (a disabled label
+		// refuses bootstrap with EIO) → bootstrap → await-running (the read that
+		// proves the fresh instance actually spawned). The bare bootout;bootstrap
+		// pair this replaced raced launchd's own removal.
 		"Bootout:io.k3sm.netd",
 		"ServicePID:io.k3sm.netd",
+		"Enable:io.k3sm.netd",
 		"Bootstrap:io.k3sm.netd",
 		"ServicePID:io.k3sm.netd",
 		// ...and then the wait the node daemon's own start depends on: netd must
@@ -1585,6 +1609,7 @@ func TestInstallOrchestration(t *testing.T) {
 		"ProbeNetd:/var/lib/k3sm/run/netd.sock",
 		"Bootout:io.k3sm.server",
 		"ServicePID:io.k3sm.server",
+		"Enable:io.k3sm.server",
 		"Bootstrap:io.k3sm.server",
 		"ServicePID:io.k3sm.server",
 		// Then the post-restart verification: both pids re-read, and the netd

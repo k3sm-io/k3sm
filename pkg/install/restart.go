@@ -232,6 +232,17 @@ func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, 
 	if err := awaitUnloaded(ctx, sys, label, b); err != nil {
 		return err
 	}
+	// Enable before bootstrap, every time. launchd refuses to bootstrap a label
+	// disabled in the system domain with EIO, the same errno it returns while a
+	// booted-out label drains, so the retry below cannot tell the two apart and
+	// would spend its whole budget on a refusal that never clears. Enabling first
+	// removes that case instead of reclassifying the errno. It is a no-op on an
+	// enabled label; on a disabled one it overrides an earlier operator disable,
+	// because running k3sm install is the newer statement of intent.
+	if err := sys.LaunchctlEnable(label); err != nil {
+		return fmt.Errorf("enable %s in the system domain before bootstrapping it (to clear it by hand, run: sudo launchctl enable system/%s): %w", label, label, err)
+	}
+	logger.Info("enabled the label in the system domain, overriding any earlier disable (a disabled label refuses bootstrap with EIO; k3sm install is the newer operator intent)", "label", label)
 	if err := bootstrapWithRetry(ctx, sys, label, b); err != nil {
 		return err
 	}
@@ -336,7 +347,7 @@ func bootstrapWithRetry(ctx context.Context, sys System, label string, b restart
 			return fmt.Errorf("bootstrap %s: %w", label, err)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("bootstrap %s: launchd kept reporting a transient system-domain state across %d attempts in %s: %w", label, attempt, b.unload, err)
+			return fmt.Errorf("bootstrap %s: launchd kept reporting a transient system-domain state across %d attempts in %s (if 'launchctl print-disabled system' lists %s, run: sudo launchctl enable system/%s): %w", label, attempt, b.unload, label, label, err)
 		}
 		select {
 		case <-ctx.Done():
