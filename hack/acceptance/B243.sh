@@ -139,6 +139,7 @@ kind: Pod
 metadata: {name: $1, namespace: $NS}
 spec:
   nodeName: $NODE_NAME
+  nodeSelector: {kubernetes.io/os: darwin}
   tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
   restartPolicy: Never
   containers:
