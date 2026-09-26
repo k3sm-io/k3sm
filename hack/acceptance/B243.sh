@@ -96,10 +96,12 @@ POD_SCRIPT="b243-script-$RUN"
 POD_ENV="b243-env-$RUN"
 POD_PY="b243-py-$RUN"
 PODS=("$POD_SH" "$POD_SCRIPT" "$POD_ENV" "$POD_PY")
+ENTRYPOINT_CM="b243-entrypoint-$RUN"
 cleanup() {
 	for p in "${PODS[@]}"; do
 		kc delete pod "$p" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	done
+	kc delete configmap "$ENTRYPOINT_CM" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -123,8 +125,11 @@ done
 
 # Fixtures: conftool (net.LookupHost through libSystem getaddrinfo, so the shim
 # applies when loaded) and hello-http (a wildcard listener the shim rebinds to
-# the pod IP), built and ad-hoc signed onto a Seatbelt-admitted path, plus the
-# #!/bin/sh entrypoint script the kernel's own shebang follow would run.
+# the pod IP), built and ad-hoc signed onto a Seatbelt-admitted path. The
+# #!/bin/sh entrypoint script is delivered the way real pods get one, from a
+# ConfigMap volume: the pod sandbox may exec the fixture dir but not read it,
+# and a mounted path also exercises the spawn-time shebang rewrite through the
+# pod's mount rebase.
 FIXTURE_BIN="${K3SM_CONFORMANCE_BIN:-/tmp/k3sm-conformance-bin}"
 mkdir -p "$FIXTURE_BIN"; chmod 755 "$FIXTURE_BIN"
 (cd "$REPO_ROOT" && go build -o "$FIXTURE_BIN/conftool" ./e2e/testdata/cmd/conftool)
@@ -136,11 +141,24 @@ codesign -s - -f "$FIXTURE_BIN/hello-http" >/dev/null 2>&1 || true
 body() {
 	echo "$FIXTURE_BIN/conftool resolve -name kubernetes.default.svc -name kubernetes && exec $FIXTURE_BIN/hello-http --id $1 --addr :$2"
 }
-printf '#!/bin/sh\n%s\n' "$(body "$POD_SCRIPT" 18432)" >"$FIXTURE_BIN/b243-entrypoint.sh"
-chmod 755 "$FIXTURE_BIN/b243-entrypoint.sh"
+kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: $ENTRYPOINT_CM, namespace: $NS}
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    $(body "$POD_SCRIPT" 18432)
+EOF
 
-# native_pod <name> <json argv> - a host-binary pod in $NS on $NODE_NAME.
+# native_pod <name> <json argv> [<configmap>] - a host-binary pod in $NS on
+# $NODE_NAME; with a ConfigMap, it is mounted at /b243 with mode 0755.
 native_pod() {
+	local mount=""
+	if [ -n "${3:-}" ]; then
+		mount="    volumeMounts: [{name: entry, mountPath: /b243}]
+  volumes: [{name: entry, configMap: {name: $3, defaultMode: 0755}}]"
+	fi
 	kc apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -154,10 +172,11 @@ spec:
   - name: c
     image: native
     command: $2
+$mount
 EOF
 }
 native_pod "$POD_SH" "[\"/bin/sh\", \"-c\", \"$(body "$POD_SH" 18431)\"]"
-native_pod "$POD_SCRIPT" "[\"$FIXTURE_BIN/b243-entrypoint.sh\"]"
+native_pod "$POD_SCRIPT" '["/b243/entrypoint.sh"]' "$ENTRYPOINT_CM"
 native_pod "$POD_ENV" "[\"/usr/bin/env\", \"B243=1\", \"/bin/sh\", \"-c\", \"$(body "$POD_ENV" 18433)\"]"
 native_pod "$POD_PY" '["/usr/bin/python3", "-c", "import time; time.sleep(3600)"]'
 
