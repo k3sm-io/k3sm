@@ -873,6 +873,13 @@ type System interface {
 	// carry-over to the record, an absent record means there is nothing to carry,
 	// and a FIRST install has none of the three.
 	ReadFile(path string) ([]byte, error)
+	// MaxFilesPerProc returns the kernel's per-process open-file ceiling
+	// (sysctl kern.maxfilesperproc). It is READ-ONLY and advisory: the kernel
+	// allocates a process at most this many descriptors whatever its plist's
+	// NumberOfFiles, and install reads it only to tell the operator when the
+	// ceiling sits below the requested limit (see warnKernelFDCap).
+	// An error is never a reason to refuse an install.
+	MaxFilesPerProc() (uint64, error)
 	// LaunchctlBootstrap loads the labelled daemon into the system domain.
 	LaunchctlBootstrap(label string) error
 	// LaunchctlBootout unloads the labelled daemon (idempotent: a not-loaded
@@ -2924,7 +2931,12 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 			return fmt.Errorf("install: link %s -> %s: %w", a.path, a.target, err)
 		}
 	}
-	// 3b. Render + write both plists, in manifest (install) order.
+	// 3b. Render + write both plists, in manifest (install) order. Before each
+	//     write, the file limit the new plist requests is checked against the
+	//     kernel ceiling, and compared with the limit the plist being replaced
+	//     requested; the reload notice that comparison produces is held until
+	//     the restart below has actually rebound the limit.
+	var limitNotices []fileLimitChange
 	for _, a := range m {
 		if a.kind != kindDaemon {
 			continue
@@ -2932,6 +2944,9 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 		content, err := plistContent(a.label, cfg)
 		if err != nil {
 			return fmt.Errorf("install: %w", err)
+		}
+		if n, ok := checkFileLimit(sys, cfg.Logger, a.label, a.path, content); ok {
+			limitNotices = append(limitNotices, n)
 		}
 		if err := sys.WriteLaunchDaemon(a.path, content, plistMode(a.label)); err != nil {
 			return fmt.Errorf("install: write %s plist: %w", a.label, err)
@@ -2952,6 +2967,10 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 	//    in the field, the transient errnos, and the rollback on a mid-loop failure.
 	if err := restartDaemons(ctx, sys, cfg, m); err != nil {
 		return fmt.Errorf("install: %w", err)
+	}
+	for _, n := range limitNotices {
+		cfg.Logger.Info("the daemon's open-file limit changed; this install booted it out and bootstrapped it again, which is what binds a new SoftResourceLimits/HardResourceLimits NumberOfFiles (launchctl kickstart -k alone would NOT: it respawns the job with the limit captured at its last bootstrap)",
+			"label", n.label, "old", n.old, "new", n.new)
 	}
 
 	// 4b. Verify the claim step 4 makes, rather than assuming it. An install that
@@ -3292,17 +3311,23 @@ func NetdPlist(cfg Config) []byte {
 // 256 default, which floors the budget at 8192 with NO headroom for the
 // co-resident apiserver/kine.
 //
-// 131072 is chosen because it is ≤ kern.maxfilesperproc (245760 on Apple Silicon)
-// so it binds. The k3s Linux value (1048576) exceeds the macOS per-process ceiling
-// and would be clamped by the kernel, voiding the budget's half-for-UDP /
-// half-for-control-plane split. 131072 yields a UDP flow budget of 65536
-// (rl.Cur/2), ~8× the 8192 floor, leaving the control plane the other half.
+// 131072 is ≤ kern.maxfilesperproc on a large Mac, so every descriptor it grants
+// can actually be allocated there. That ceiling scales with installed RAM
+// (measured on macOS 26: 245760 at 64 GB, 10240 at 8 GB); launchd still grants
+// the requested soft limit on a small Mac, but the kernel refuses opens past the
+// ceiling with EMFILE. The k3s Linux value (1048576) exceeds the macOS ceiling
+// on every Mac. 131072 yields a UDP flow budget of 65536 (rl.Cur/2), ~8× the
+// 8192 floor, leaving the control plane the other half; darwin-net derives the
+// budget from the kernel ceiling too, so a small Mac falls back toward the floor.
 //
 // Reload contract: launchd applies *ResourceLimits at process spawn from the job
 // definition captured at bootstrap — so this raised limit binds on a fresh
 // install or an uninstall→install (bootout→bootstrap), not on
 // `launchctl kickstart -k`, which respawns the existing in-memory job with the
 // old limit. Existing installs need a reinstall for the new limit to bind.
+// Install says both halves out loud (checkFileLimit): a WARN when the kernel
+// ceiling sits below this value, and a post-restart notice when the plist it
+// replaced requested a different one.
 const serverFileLimit = 131072
 
 // ServerPlist renders the io.k3sm.server LaunchDaemon plist. It runs as the

@@ -19,6 +19,17 @@ helper and the `_k3sm` server/agent jobs) onto the new version, through the `sud
 it performs. The new binary **replaces** the old one, with no side-by-side window and no flag to
 switch back, so the node is momentarily unavailable while the daemons restart.
 
+The node daemon's open-file limit (`NumberOfFiles` in its plist) binds only when launchd boots the
+job out and bootstraps it again, which `k3sm install` does. `launchctl kickstart -k` alone keeps the
+old limit, so reinstall rather than kickstart after an upgrade that changes it; the install log says
+when it did.
+
+The kernel also allocates a process at most `kern.maxfilesperproc` file descriptors, whatever limit
+launchd grants it, and that ceiling scales with installed RAM (measured on macOS 26: 245760 on a 64 GB
+Mac, 10240 on an 8 GB one). When it is below the limit k3sm requests, the install logs a warning and
+the node's UDP Service flow capacity drops toward its floor. `sudo sysctl -w kern.maxfiles=131072
+kern.maxfilesperproc=131072` raises it until the next reboot.
+
 > **Homebrew is planned; the `k3sm-io/tap` is not published yet.** When it ships, `brew upgrade
 > k3sm` will do the same job, restarting the daemons via `launchctl kickstart`.
 
