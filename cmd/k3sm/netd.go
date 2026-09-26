@@ -313,6 +313,16 @@ const authorizerRoleRemedy = "if this Mac changed role, netd still holds the pre
 // minute.
 const missingKubeconfigWarnAfter = 30
 
+// authorizerRewarnEvery is how many repeats of the SAME WARN-class error pass
+// before that error is warned again (a different WARN-class error warns at once
+// and restarts the count; a Debug-class failure in between leaves it alone, so
+// a flapping apiserver cannot turn the reminder into spam). Warning once for the
+// daemon's life would let a standing failure (a rejected credential, an
+// unusable kubeconfig, one that never appeared) scroll out of every log view
+// while privileged binds stay denied. At the 2s retry cadence 150 attempts is
+// about five minutes: one line per five minutes is a reminder, not spam.
+const authorizerRewarnEvery = 150
+
 // authorizerFailureLog decides the level of each failed authorizer attempt.
 //
 // Most failures are the boot race (netd starts before the server writes its
@@ -321,12 +331,16 @@ const missingKubeconfigWarnAfter = 30
 // leaving every privileged bind denied: a kubeconfig that cannot be loaded, and
 // a credential the apiserver rejects. Those are logged at WARN with the reason
 // and a remedy on first sighting, once per distinct error, and at Debug when
-// the same error comes back on the next retry. A kubeconfig that does not exist
+// the same error comes back on the next retry, until authorizerRewarnEvery
+// repeats have passed and it is warned again. A kubeconfig that does not exist
 // is the one member of the first class that is also the boot race, so it stays
 // at Debug until it has been missing for missingKubeconfigWarnAfter consecutive
 // attempts. It is owned by the single retry loop, so it needs no lock.
 type authorizerFailureLog struct {
 	lastWarned string
+	// sinceWarn counts repeats of lastWarned since it was last logged at
+	// WARN.
+	sinceWarn int
 	// missingStreak counts consecutive attempts that found the kubeconfig
 	// absent; any other outcome resets it.
 	missingStreak int
@@ -351,8 +365,12 @@ func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err 
 			"kubeconfig", kubeconfig, "err", err)
 		return
 	}
-	if msg := err.Error(); msg != l.lastWarned {
-		l.lastWarned = msg
+	msg := err.Error()
+	if msg == l.lastWarned {
+		l.sinceWarn++
+	}
+	if msg != l.lastWarned || l.sinceWarn >= authorizerRewarnEvery {
+		l.lastWarned, l.sinceWarn = msg, 0
 		logger.Warn("Service authorizer cannot start; <1024 binds stay denied until it does",
 			"kubeconfig", kubeconfig, "reason", reason, "remedy", authorizerRoleRemedy)
 		return

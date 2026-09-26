@@ -127,6 +127,31 @@ func TestNetdAuthorizerFailureReasonAtWarn(t *testing.T) {
 			wantWarns: 1,
 		},
 		{
+			name:      "the same 401 for 149 further attempts is not warned again",
+			errs:      repeatErr(unauthorized, 1+authorizerRewarnEvery-1),
+			wantWarns: 1,
+			wantDebug: authorizerRewarnEvery - 1,
+		},
+		{
+			name:      "the same 401 is warned again at the re-warn interval",
+			errs:      repeatErr(unauthorized, 1+authorizerRewarnEvery),
+			wantWarns: 2,
+			wantDebug: authorizerRewarnEvery - 1,
+			want:      []string{kubeconfig, "401", "sudo k3sm uninstall"},
+		},
+		{
+			name:      "a different error resets the cadence",
+			errs:      append(append(repeatErr(unauthorized, 100), forbidden), repeatErr(forbidden, authorizerRewarnEvery-1)...),
+			wantWarns: 2,
+			wantDebug: 99 + authorizerRewarnEvery - 1,
+		},
+		{
+			name:      "a kubeconfig still missing is reminded at the re-warn interval",
+			errs:      repeatErr(missingErr, missingKubeconfigWarnAfter+authorizerRewarnEvery),
+			wantWarns: 2,
+			wantDebug: missingKubeconfigWarnAfter - 1 + authorizerRewarnEvery - 1,
+		},
+		{
 			name:      "a kubeconfig missing for fewer attempts than the threshold is the boot race: Debug only",
 			errs:      repeatErr(missingErr, missingKubeconfigWarnAfter-1),
 			wantDebug: missingKubeconfigWarnAfter - 1,
