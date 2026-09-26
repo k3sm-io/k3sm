@@ -355,3 +355,91 @@ func TestNodeAddressAuthorizerAllowlist(t *testing.T) {
 		}
 	})
 }
+
+// TestWildcardAuthorizerAllowlist is the B403 gate, the wildcard twin of
+// TestNodeAddressAuthorizerAllowlist: the ingress host asks the root helper for
+// 0.0.0.0:80/443 (the k3s ServiceLB shape), and the helper grants that
+// privileged wildcard bind ONLY when the canonical kube-system/k3sm-ingress
+// Service declares the port. A same-named Service in another namespace, a
+// tenant LoadBalancer on the same port, an undeclared port, the IPv6 wildcard
+// and a non-privileged port are all refused. The arm does not depend on
+// PortPolicy.NodeIP (the installed plist renders none), and a specific-address
+// request keeps the pre-existing classes' verdicts.
+func TestWildcardAuthorizerAllowlist(t *testing.T) {
+	svcCIDR := netip.MustParsePrefix("10.43.0.0/16")
+	nodeIP := netip.MustParseAddr("192.168.7.20")
+	tenantWeb := ServiceRef{Namespace: "tenant-a", Name: "public-web"}
+	otherNSIngress := ServiceRef{Namespace: "tenant-a", Name: "k3sm-ingress"}
+
+	// policy is the production-shaped policy whose LoadBalancer Service set on
+	// every port is byPort[port]; NodeIP is ZERO, as the shipped plist leaves it.
+	policy := func(byPort map[int][]ServiceRef) PortPolicy {
+		return PortPolicy{
+			ServiceCIDR: svcCIDR,
+			Declares:    func(port int) bool { return port == 53 || len(byPort[port]) > 0 },
+			LBDeclarers: func(port int) []ServiceRef {
+				return byPort[port]
+			},
+			NodeAddressService: canonicalIngress,
+		}
+	}
+	production := map[int][]ServiceRef{80: {canonicalIngress}, 443: {canonicalIngress}}
+
+	tests := []struct {
+		name   string
+		policy PortPolicy
+		port   int
+		addr   string
+		allow  bool
+		// wantNamed, when set, must appear in the refusal.
+		wantNamed string
+	}{
+		{name: "wildcard :80 declared by the canonical ingress is allowed", policy: policy(production), port: 80, addr: "0.0.0.0", allow: true},
+		{name: "wildcard :443 declared by the canonical ingress is allowed", policy: policy(production), port: 443, addr: "0.0.0.0", allow: true},
+		{name: "an impostor does not block the canonical Service",
+			policy: policy(map[int][]ServiceRef{80: {tenantWeb, canonicalIngress}}), port: 80, addr: "0.0.0.0", allow: true},
+		{name: "wildcard :80 declared only by a tenant LoadBalancer is refused and named",
+			policy: policy(map[int][]ServiceRef{80: {tenantWeb}}), port: 80, addr: "0.0.0.0", wantNamed: "tenant-a/public-web"},
+		{name: "wildcard :80 declared only by a same-named Service in another namespace is refused and named",
+			policy: policy(map[int][]ServiceRef{80: {otherNSIngress}}), port: 80, addr: "0.0.0.0", wantNamed: "tenant-a/k3sm-ingress"},
+		{name: "wildcard on a port no LoadBalancer declares is refused", policy: policy(production), port: 22, addr: "0.0.0.0"},
+		{name: "wildcard on 53 (declared by a ClusterIP only) is refused", policy: policy(production), port: 53, addr: "0.0.0.0"},
+		{name: "the IPv6 wildcard is refused even for the canonical port", policy: policy(production), port: 80, addr: "::"},
+		{name: "a non-privileged wildcard is refused", policy: policy(map[int][]ServiceRef{8080: {canonicalIngress}}), port: 8080, addr: "0.0.0.0"},
+		{name: "nil LBDeclarers refuses the wildcard, fail-safe",
+			policy: PortPolicy{ServiceCIDR: svcCIDR, NodeAddressService: canonicalIngress}, port: 80, addr: "0.0.0.0"},
+		{name: "zero NodeAddressService refuses the wildcard, fail-safe",
+			policy: PortPolicy{ServiceCIDR: svcCIDR, LBDeclarers: func(int) []ServiceRef { return []ServiceRef{canonicalIngress} }}, port: 80, addr: "0.0.0.0"},
+		{name: "zero policy refuses the wildcard", policy: PortPolicy{}, port: 80, addr: "0.0.0.0"},
+		// A specific-address request keeps today's behavior.
+		{name: "service VIP + declared port still allowed", policy: policy(production), port: 53, addr: "10.43.0.10", allow: true},
+		{name: "service VIP + undeclared port still refused", policy: policy(production), port: 22, addr: "10.43.0.10"},
+		{name: "node address with no configured NodeIP is still refused", policy: policy(production), port: 80, addr: "192.168.7.20"},
+		{name: "node address with a configured NodeIP keeps the allowlist", policy: func() PortPolicy {
+			p := policy(production)
+			p.NodeIP = nodeIP
+			return p
+		}(), port: 80, addr: "192.168.7.20", allow: true},
+		{name: "an unrelated address is still refused", policy: policy(production), port: 80, addr: "192.168.7.99"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := PortAuthorizer(tc.policy).Authorize(context.Background(), tc.port, tc.addr)
+			if tc.allow {
+				if err != nil {
+					t.Fatalf("Authorize(%d, %s) = %v, want allow", tc.port, tc.addr, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Authorize(%d, %s) = nil, want deny", tc.port, tc.addr)
+			}
+			if tc.wantNamed != "" && !strings.Contains(err.Error(), tc.wantNamed) {
+				t.Errorf("refusal %q must NAME the declaring service %q", err, tc.wantNamed)
+			}
+			if tc.wantNamed != "" && !strings.Contains(err.Error(), canonicalIngress.String()) {
+				t.Errorf("refusal %q must name the canonical service %s", err, canonicalIngress)
+			}
+		})
+	}
+}
