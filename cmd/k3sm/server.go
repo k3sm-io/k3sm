@@ -971,6 +971,9 @@ func runServer(args []string) (err error) {
 		ClusterDomain:     opts.domain,
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
+		// The address the in-process node and the ingress host advertise: the
+		// same derivation, over the same inputs nodeOpts carries below.
+		NodeAddress:       advertisedNodeIP(nodeOptions{nodeIP: opts.nodeIP, podCIDR: serverPodCIDR, netMode: mode}),
 		PodCIDR:           serverPodCIDR,
 		MeshEgressIP:      serverMeshEgressIP,
 		PeerMeshEgressIPs: peerMeshEgress,

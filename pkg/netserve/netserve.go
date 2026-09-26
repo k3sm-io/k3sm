@@ -93,6 +93,14 @@ type Config struct {
 	APIServerEndpoint string
 	// NodeIP is the node InternalIP (reserved for future mesh wiring).
 	NodeIP string
+	// NodeAddress is the address this node ADVERTISES (the Node object's
+	// InternalIP and the address the ingress host publishes as the canonical
+	// kube-system/k3sm-ingress Service's endpoint). The proxy classifies a
+	// backend at it as on this node (proxy.WithNodeAddress) and dials it over the
+	// loopback path, not the mesh. It can differ from NodeIP: on a single-node
+	// server NodeIP is the raw loopback --node-ip default while this is the
+	// derived .1. Empty or unparseable leaves the node's address unclassified.
+	NodeAddress string
 	// PodCIDR is the node pod CIDR; empty uses defaultPodCIDR.
 	PodCIDR string
 	// MeshEgressIP, when set, is the node's reserved mesh-egress /32
@@ -230,6 +238,13 @@ func New(cfg Config) *Server {
 	if egress, err := netip.ParseAddr(cfg.MeshEgressIP); err == nil {
 		s.meshEgress = egress
 		opts = append(opts, proxy.WithMeshEgressSource(egress))
+	}
+	// An endpoint at this node's own advertised address (the ingress host's
+	// wildcard listener, published on the canonical ingress Service) is on this
+	// node: without the option it would be classified as another node's and
+	// dialed through the mesh.
+	if addr, err := netip.ParseAddr(cfg.NodeAddress); err == nil {
+		opts = append(opts, proxy.WithNodeAddress(addr))
 	}
 
 	// NetworkPolicy hosting, unconditional when the datapath runs (the
