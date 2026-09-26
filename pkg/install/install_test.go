@@ -101,9 +101,10 @@ type fakeSystem struct {
 	// transient) until LaunchctlEnable clears it. The zero value disables
 	// nothing, so no pre-existing test has to say anything about it.
 	disabled map[string]bool
-	// enableErrs[label] is the error LaunchctlEnable returns for label. The zero
-	// value enables everything.
-	enableErrs map[string]error
+	// enableErrs[label] is a queue of errors LaunchctlEnable returns for label
+	// before it succeeds, consumed one per call. The zero value enables
+	// everything.
+	enableErrs map[string][]error
 	// netdRefusals[path] is how many ProbeNetd attempts are refused before netd
 	// is listening. It is 0 by default, so an unconfigured fake describes a
 	// helper that is already serving and no pre-existing test has to say
@@ -1033,11 +1034,12 @@ func (f *fakeSystem) LaunchctlBootout(label string) error {
 	return nil
 }
 
-// LaunchctlEnable clears the label's disabled bit, unless the test made it fail.
+// LaunchctlEnable clears the label's disabled bit, unless the test queued a failure.
 func (f *fakeSystem) LaunchctlEnable(label string) error {
 	f.calls = append(f.calls, "Enable:"+label)
-	if err := f.enableErrs[label]; err != nil {
-		return err
+	if queued := f.enableErrs[label]; len(queued) > 0 {
+		f.enableErrs[label] = queued[1:]
+		return queued[0]
 	}
 	delete(f.disabled, label)
 	return nil

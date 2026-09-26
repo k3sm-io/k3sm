@@ -63,7 +63,7 @@ func TestInstallEnablesADisabledService(t *testing.T) {
 		{
 			name: "an enable failure names the label and the remedy",
 			setup: func(f *fakeSystem) {
-				f.enableErrs = map[string]error{NetdLabel: errors.New("launchctl enable io.k3sm.netd: exit status 1: Not privileged")}
+				f.enableErrs = map[string][]error{NetdLabel: {errors.New("launchctl enable io.k3sm.netd: exit status 1: Not privileged")}}
 			},
 			check: func(t *testing.T, f *fakeSystem, err error) {
 				if err == nil {
@@ -73,6 +73,40 @@ func TestInstallEnablesADisabledService(t *testing.T) {
 					if !strings.Contains(err.Error(), want) {
 						t.Errorf("error %q does not mention %q", err, want)
 					}
+				}
+			},
+		},
+		{
+			// The narrow double failure: the server is disabled AND its first enable
+			// fails, so restartDaemon stops with the server booted out. The recovery
+			// must enable before it re-bootstraps, or it reports STILL DOWN for a
+			// label it could have brought back.
+			name: "recovery enables a booted-out disabled label before re-bootstrapping it",
+			setup: func(f *fakeSystem) {
+				f.disabled = map[string]bool{ServerLabel: true}
+				f.enableErrs = map[string][]error{ServerLabel: {errors.New("launchctl enable io.k3sm.server: exit status 1")}}
+			},
+			check: func(t *testing.T, f *fakeSystem, err error) {
+				if err == nil {
+					t.Fatal("Install must still fail when the restart's enable failed")
+				}
+				if want := "re-bootstrapped after the failure: " + ServerLabel; !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not report %q", err, want)
+				}
+				if strings.Contains(err.Error(), "STILL DOWN") {
+					t.Errorf("error %q reports a daemon STILL DOWN that recovery could enable", err)
+				}
+				if n := countCalls(f, "Enable:"+ServerLabel); n != 2 {
+					t.Errorf("server enable calls = %d, want 2 (the failed restart enable, then recovery's)", n)
+				}
+				if n := countCalls(f, "Bootstrap:"+ServerLabel); n != 1 {
+					t.Errorf("server bootstrap attempts = %d, want exactly 1 (recovery's, after its enable)", n)
+				}
+				if last, boot := lastIdx(f.calls, "Enable:"+ServerLabel), idx(f.calls, "Bootstrap:"+ServerLabel); last < 0 || boot < 0 || last >= boot {
+					t.Errorf("recovery enable at %d, bootstrap at %d; want enable strictly before bootstrap (calls: %v)", last, boot, f.calls)
+				}
+				if _, ok := f.loaded[ServerLabel]; !ok {
+					t.Errorf("%s is not loaded after recovery", ServerLabel)
 				}
 			},
 		},
@@ -121,4 +155,14 @@ func TestInstallEnablesADisabledService(t *testing.T) {
 			tc.check(t, f, Install(context.Background(), f, installCfg()))
 		})
 	}
+}
+
+// lastIdx is the index of the last call equal to want, or -1.
+func lastIdx(calls []string, want string) int {
+	for i := len(calls) - 1; i >= 0; i-- {
+		if calls[i] == want {
+			return i
+		}
+	}
+	return -1
 }
