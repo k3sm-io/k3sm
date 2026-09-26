@@ -162,6 +162,9 @@ type Paths struct {
 	NetdSocket    string
 	NetdLog       string
 	ServerLog     string
+	// ShadowManifest is the shadow shell set's manifest (pkg/shadow), read by
+	// the shadow-shells row.
+	ShadowManifest string
 }
 
 // tokenFlags are the argv flags whose VALUE is a credential. A log line that
@@ -258,6 +261,14 @@ type Collector struct {
 	// cmd/k3sm wires install.OperatorServerArgs here, so there is still exactly
 	// one reader of that plist's argv.
 	ServerArgs func(plist []byte) ([]string, error)
+	// NodeResolverPresent reports whether netd's node resolver entry is in the
+	// host's dynamic store. OPTIONAL: nil leaves the node-resolver row out. A
+	// seam because the read is a SystemConfiguration call (cgo) that pkg/status,
+	// a reporting leaf, does not make itself.
+	NodeResolverPresent func() (bool, error)
+	// CDHash reads a binary's code directory hash, for the shadow-shells row's
+	// drift check. OPTIONAL: nil leaves the row out.
+	CDHash     func(path string) (string, error)
 	Paths      Paths
 	EUID       int
 	ServiceUID int

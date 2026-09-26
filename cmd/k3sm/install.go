@@ -29,6 +29,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/version"
 )
 
@@ -329,8 +330,31 @@ func runUninstall(args []string) error {
 		logger.Warn("not asking the cluster to forget this node: "+why,
 			"remedy", "on the control plane: kubectl delete meshpeer/<node> node/<node>")
 	}
-	return install.Uninstall(context.Background(), sys, install.Config{
+	if err := install.Uninstall(context.Background(), sys, install.Config{
 		Logger:     logger,
 		Deregister: deregister,
-	})
+	}); err != nil {
+		return err
+	}
+	removeNodeResolverEntry(logger)
+	return nil
+}
+
+// removeNodeResolverEntry deletes netd's node resolver entry from the dynamic
+// store after the daemons are gone. netd removes it itself on SIGTERM, so this
+// is the backstop for a netd that crashed or was killed first: configd keeps a
+// State: key after its writer exits, and an entry left behind would route svc
+// and the cluster domain to a DNS VIP nothing serves. An absent key is not an
+// error; a failure is a warning with the manual remedy, never an uninstall
+// failure.
+func removeNodeResolverEntry(logger *slog.Logger) {
+	store, err := netdsvc.OpenSystemStore()
+	if err == nil {
+		err = store.Remove(netdsvc.NodeResolverKey)
+		_ = store.Close() // the removal above is the only thing that mattered
+	}
+	if err != nil {
+		logger.Warn("could not remove the node resolver entry", "key", netdsvc.NodeResolverKey, "err", err,
+			"remedy", "printf 'remove "+netdsvc.NodeResolverKey+"\\n' | sudo scutil")
+	}
 }

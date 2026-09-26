@@ -44,6 +44,8 @@ import (
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/netdsvc"
+	"k3sm.io/k3sm/pkg/shadow"
 	"k3sm.io/k3sm/pkg/status"
 	"k3sm.io/k3sm/pkg/version"
 )
@@ -150,6 +152,13 @@ func newStatusCollector() status.Collector {
 		// The installer's own reader of the server plist's argv, so the row
 		// reports exactly what a reinstall would carry over.
 		ServerArgs: install.OperatorServerArgs,
+		// netd's node resolver entry, read from the dynamic store (no
+		// privilege needed to read a State: key).
+		NodeResolverPresent: nodeResolverPresent,
+		// The live host binaries' cdhashes, for the shadow shell drift check.
+		CDHash: func(path string) (string, error) {
+			return shadow.CDHash(context.Background(), path)
+		},
 		Paths:      paths,
 		EUID:       euid,
 		ServiceUID: serviceUID,
@@ -221,7 +230,19 @@ func statusPaths(workDir string) status.Paths {
 		NetdSocket:         install.DefaultNetdSocket,
 		NetdLog:            install.NetdLogPath(),
 		ServerLog:          install.ServerLogPath(),
+		ShadowManifest:     shadow.ManifestPath(install.DefaultInstallDir),
 	}
+}
+
+// nodeResolverPresent reports whether netd's node resolver entry is in the
+// host's dynamic store.
+func nodeResolverPresent() (bool, error) {
+	store, err := netdsvc.OpenSystemStore()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = store.Close() }() // a read-only session; nothing to flush
+	return store.Present(netdsvc.NodeResolverKey)
 }
 
 // installedBinaryPath and installedLinkPath are where `k3sm install` puts the

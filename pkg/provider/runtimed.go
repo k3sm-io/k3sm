@@ -311,6 +311,15 @@ type podTrack struct {
 	// r.mu); it is never held together with r.mu or restartMu.
 	hookMu    sync.Mutex
 	postStart map[string]*postStartHook // container name -> postStart bookkeeping
+
+	// shimMu guards shimWarned, the set of k3sm.io/shim-inactive reasons already
+	// recorded as a ShimInactive Event for this pod (observeShimInactive), so a
+	// condition present on every status build fires its Event once. Separate
+	// from r.mu for the same reason as readyMu (buildStatus runs outside r.mu);
+	// it is never held together with another lock, and the Event is recorded
+	// after it is released.
+	shimMu     sync.Mutex
+	shimWarned map[string]bool
 }
 
 // RuntimedConfig configures a runtimedRuntime.
@@ -328,6 +337,12 @@ type RuntimedConfig struct {
 	// pod via the PodBox annotation runtimed maps to DYLD_INSERT_LIBRARIES. The
 	// file is also added to every pod's Seatbelt read allow (stampShimReadPaths).
 	DyldShim string
+	// ShadowBinDir, when set, is the node's directory of ad-hoc re-signed host
+	// shell copies (pkg/shadow, made by `sudo k3sm install`). runtimed execs a
+	// copy in place of /bin/sh, /bin/bash, /bin/zsh, /bin/dash or /usr/bin/env so
+	// dyld keeps the pod shims loaded (runtime.Config.ShadowBinDir). Empty keeps
+	// the host binaries.
+	ShadowBinDir string
 	// PathShim, when set, is the path-rebase DYLD shim dylib runtimed injects into a
 	// mounting container so an absolute volume mount resolves under the pod data
 	// volume (no chroot). Empty leaves a pod's absolute mount path reaching the host.
@@ -567,6 +582,7 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 		// one value.
 		PodLogsDir:   podLogsDirOf(cfg),
 		PathShimPath: cfg.PathShim,
+		ShadowBinDir: cfg.ShadowBinDir,
 	}, deps)
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
@@ -1502,10 +1518,6 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// A pod that asked for the developer toolchain and got none still runs; say so
 	// on the pod, once, at create. Degrade-not-fail, unlike the preflight above.
 	r.warnXcodeToolchainUngranted(ctx, pod, box)
-	// A container whose entrypoint is a macOS platform binary silently loses the
-	// DNS shim it was given; say so on the pod, once, at create. Degrade-not-fail,
-	// same shape as the toolchain warning above.
-	r.warnRestrictedShellEntrypoint(ctx, pod, box)
 
 	// The GPU memory fit is sized BEFORE the lock, because the ceiling costs an RPC
 	// and a blocking call inside r.mu would stall every other pod operation on this
@@ -2061,6 +2073,10 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// built, because the live address must never reach status.podIP, the
 	// EndpointSlice or DNS (see observeTransport).
 	r.observeTransport(string(pod.UID), rs)
+	// A restricted main process lost the pod shim; runtimed says so with the
+	// k3sm.io/shim-inactive condition and the node turns it into one Warning
+	// Event per pod per reason, on whichever status path delivers it first.
+	r.observeShimInactive(pod, t, rs)
 	// AFTER the observation above, never before: the gate is a read of the very
 	// lease map that call just updated, so PodReady reflects THIS status rather
 	// than trailing it by one. A vm pod whose override is not installed is

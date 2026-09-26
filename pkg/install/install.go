@@ -493,6 +493,19 @@ type System interface {
 	// basename-derived dst bricks both daemons with launchd's unrecoverable
 	// "Missing executable" — an observed live-hardware failure this contract fixes).
 	CopyToRootOwned(src, dst string) error
+	// CloneToOwned clones src to exactly dst (APFS clonefile, falling back to
+	// a plain copy across volumes), creating dst's parent root:wheel 0755 and
+	// leaving dst owned uid:gid at mode. Unlike CopyToRootOwned the source's
+	// signature is not the point: the shadow shells are re-signed right after
+	// (AdHocSign). A missing src reports an error wrapping fs.ErrNotExist.
+	CloneToOwned(src, dst string, uid, gid int, mode fs.FileMode) error
+	// AdHocSign replaces path's code signature with an ad-hoc one, carrying no
+	// hardened runtime and no library validation (runtimed's image.AdHocSign),
+	// so the copy is neither a platform binary nor restricted and dyld keeps
+	// DYLD_INSERT_LIBRARIES in it.
+	AdHocSign(path string) error
+	// CDHash reads path's code directory hash (codesign -dvvv).
+	CDHash(path string) (string, error)
 	// EnsureSymlink idempotently makes link a symlink pointing at target — the
 	// `k3sm` launcher in LinkDir. It is the ONE thing install writes outside the
 	// root-owned trees it owns, so it is fail-closed on both halves of that
@@ -2764,6 +2777,16 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//     means the seed leaves the present set alone.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KubeMarkerName),
 		cfg.stagedPayloadFile(executor.KubeMarkerName))
+
+	// 2c′. The shadow shell set: ad-hoc re-signed copies of the host shells
+	//      under <InstallDir>/shadow, with the manifest of what they were made
+	//      from. Made HERE, by the privileged installer and nowhere else (a
+	//      daemon-writable copy would be a code-injection path into every pod),
+	//      and staged like every other artifact, so the set is published with
+	//      the binary that uses it. See makeShadowSet.
+	if err := makeShadowSet(sys, cfg); err != nil {
+		return err
+	}
 
 	// 2d. Carry over the operator-supplied server arguments — from the plist
 	//     ALREADY ON DISK, or, when there is none, from the record the previous

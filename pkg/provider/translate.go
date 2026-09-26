@@ -1317,8 +1317,55 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 		{Type: corev1.ContainersReady, Status: crStatus},
 		{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
 	}
+	out.Conditions = append(out.Conditions, runtimeConditions(rs)...)
 	out.Conditions = append(out.Conditions, carryForwardExternalConditions(pod)...)
 	return out
+}
+
+// runtimeConditions returns the node-owned conditions runtimed publishes on
+// PodStatus.conditions that the pod status carries verbatim: today only
+// k3sm.io/shim-inactive (a restricted main process lost the pod shim). The
+// runtime's own renderings of the four kubelet-owned types are NOT forwarded,
+// because toPodStatus derives those itself. A condition with an unspecified
+// status is dropped rather than published as an empty ConditionStatus.
+func runtimeConditions(rs *runtimev1.PodStatus) []corev1.PodCondition {
+	var out []corev1.PodCondition
+	for _, c := range rs.GetConditions() {
+		if c.GetType() != runtimed.ShimInactiveConditionType {
+			continue
+		}
+		st, ok := conditionStatus(c.GetStatus())
+		if !ok {
+			continue
+		}
+		out = append(out, corev1.PodCondition{
+			Type:               corev1.PodConditionType(c.GetType()),
+			Status:             st,
+			LastProbeTime:      protoTime(c.GetLastProbeTime()),
+			LastTransitionTime: protoTime(c.GetLastTransitionTime()),
+			Reason:             c.GetReason(),
+			// The same sanitization as the ShimInactive Event
+			// (observeShimInactive): one policy for both sinks, because the
+			// message carries the container's own path (pod-spec text).
+			Message: stripControl(c.GetMessage()),
+		})
+	}
+	return out
+}
+
+// conditionStatus maps a runtime ConditionStatus to its corev1 form; ok is
+// false for UNSPECIFIED (or an unknown future value).
+func conditionStatus(s runtimev1.ConditionStatus) (corev1.ConditionStatus, bool) {
+	switch s {
+	case runtimev1.ConditionStatus_CONDITION_STATUS_TRUE:
+		return corev1.ConditionTrue, true
+	case runtimev1.ConditionStatus_CONDITION_STATUS_FALSE:
+		return corev1.ConditionFalse, true
+	case runtimev1.ConditionStatus_CONDITION_STATUS_UNKNOWN:
+		return corev1.ConditionUnknown, true
+	default:
+		return "", false
+	}
 }
 
 // containersReadyFrom reports the ContainersReady predicate over the pod's MAIN
@@ -1511,6 +1558,10 @@ func readyTransitionTime(pod *corev1.Pod, newStatus corev1.ConditionStatus) meta
 func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 	switch t {
 	case corev1.PodInitialized, corev1.PodReady, corev1.ContainersReady, corev1.PodScheduled:
+		return true
+	case runtimed.ShimInactiveConditionType:
+		// Node-owned: toPodStatus re-reads it from the runtime on every build
+		// (runtimeConditions), so a carried-forward copy would duplicate it.
 		return true
 	default:
 		return false

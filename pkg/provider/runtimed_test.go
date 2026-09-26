@@ -100,6 +100,20 @@ type fakeRuntimeServer struct {
 	// the RPC's error, the shape runtimeHoldsPod's fail-toward-keeping branch
 	// exists for — a queried pod that answers with no verdict at all.
 	statusFIFO []error
+	// conditions are the pod conditions statusLocked attaches to a pod's
+	// status, keyed by pod id: the channel runtimed publishes node-owned
+	// verdicts on (k3sm.io/shim-inactive).
+	conditions map[string][]*runtimev1.PodCondition
+}
+
+// setConditions makes every subsequent status for pod id carry conds.
+func (f *fakeRuntimeServer) setConditions(id string, conds ...*runtimev1.PodCondition) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.conditions == nil {
+		f.conditions = map[string][]*runtimev1.PodCondition{}
+	}
+	f.conditions[id] = conds
 }
 
 // setRestartErr makes every subsequent RestartContainer RPC fail with err (nil
@@ -297,6 +311,7 @@ func (f *fakeRuntimeServer) statusLocked(id string) *runtimev1.PodStatus {
 				Running: &runtimev1.ContainerStateRunning{StartedAt: timestamppb.New(f.started)},
 			},
 		}},
+		Conditions: f.conditions[id],
 	}
 }
 

@@ -742,6 +742,31 @@ func (f *fakeSystem) ReapOrphans(binPrefix string) error {
 	return nil
 }
 
+// CloneToOwned records the clone with its owner and mode, and fails with
+// fs.ErrNotExist for a source listed in missingPaths (a host without that
+// shell).
+func (f *fakeSystem) CloneToOwned(src, dst string, uid, gid int, mode fs.FileMode) error {
+	f.calls = append(f.calls, fmt.Sprintf("CloneToOwned:%s->%s:%d:%d:%#o", src, dst, uid, gid, mode))
+	if f.missingPaths[src] {
+		return fmt.Errorf("shadow source %s: %w", src, fs.ErrNotExist)
+	}
+	f.putTree(dst, src)
+	return nil
+}
+
+// AdHocSign records the re-sign.
+func (f *fakeSystem) AdHocSign(path string) error {
+	f.calls = append(f.calls, "AdHocSign:"+path)
+	return nil
+}
+
+// CDHash answers a cdhash derived from the path, so the manifest's contents are
+// predictable.
+func (f *fakeSystem) CDHash(path string) (string, error) {
+	f.calls = append(f.calls, "CDHash:"+path)
+	return "cdhash-of-" + filepath.Base(path), nil
+}
+
 func (f *fakeSystem) CopyToRootOwned(src, dst string) error {
 	// Record the EXACT dst the installer requested — the contract under test: the
 	// destination must be the fixed installedBinary() path, never src's basename
@@ -1590,6 +1615,23 @@ func TestInstallOrchestration(t *testing.T) {
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
+		// The shadow shell set, staged with the binary that uses it: each host
+		// shell cloned root:wheel 0755, re-signed ad hoc, its source's cdhash
+		// read, then the manifest (TestShadowSetIsMadeAtInstall owns the detail).
+		"EnsureRootDir:/Library/k3sm.staging/shadow",
+		"CloneToOwned:/bin/bash->/Library/k3sm.staging/shadow/bash:0:0:0755",
+		"AdHocSign:/Library/k3sm.staging/shadow/bash",
+		"CDHash:/bin/bash",
+		"CloneToOwned:/bin/zsh->/Library/k3sm.staging/shadow/zsh:0:0:0755",
+		"AdHocSign:/Library/k3sm.staging/shadow/zsh",
+		"CDHash:/bin/zsh",
+		"CloneToOwned:/bin/dash->/Library/k3sm.staging/shadow/dash:0:0:0755",
+		"AdHocSign:/Library/k3sm.staging/shadow/dash",
+		"CDHash:/bin/dash",
+		"CloneToOwned:/usr/bin/env->/Library/k3sm.staging/shadow/env:0:0:0755",
+		"AdHocSign:/Library/k3sm.staging/shadow/env",
+		"CDHash:/usr/bin/env",
+		"WriteRootOnlyFile:/Library/k3sm.staging/shadow/sources.json:0644",
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
 		// over below reuses that answer — nothing, on a first install — rather
