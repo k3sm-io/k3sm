@@ -130,6 +130,7 @@ func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, netdSocket stri
 		PodCIDR:       podCIDR,
 		HTTPPort:      uint16(httpPort),
 		HTTPSPort:     uint16(httpsPort),
+		NodeName:      opts.nodeName,
 		Binder:        ingressBinder(netdSocket, httpPort, httpsPort),
 		Logger:        log,
 	}

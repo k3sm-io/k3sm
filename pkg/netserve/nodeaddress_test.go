@@ -78,4 +78,25 @@ func TestNodeAddressIsPassedToTheProxy(t *testing.T) {
 	if got := locality(t, base()); got == proxy.LocalityNode {
 		t.Errorf("with no NodeAddress the backend was classified LocalityNode: nothing else may mark it node-local")
 	}
+
+	// A loopback advertised address (the no-datapath fallback to the
+	// 127.0.0.1 --node-ip default) is deliberately NOT handed to the proxy: no
+	// peer can dial it, and it would count a 127.0.0.1 endpoint as node-local
+	// for internalTrafficPolicy: Local.
+	t.Run("a loopback node address is not passed", func(t *testing.T) {
+		loop := base()
+		loop.NodeAddress = "127.0.0.1"
+		s := New(loop)
+		lkey := proxy.PortKey{ClusterIP: "10.43.0.81", Port: 80, Protocol: "TCP"}
+		if n := s.table.SetEndpoints(lkey, []netv1.Endpoint{{IP: "127.0.0.1", Port: 80, Ready: true}}); n != 1 {
+			t.Fatalf("SetEndpoints admitted %d backends, want 1", n)
+		}
+		b, err := s.table.Pick(lkey)
+		if err != nil {
+			t.Fatalf("Pick: %v", err)
+		}
+		if b.Locality() == proxy.LocalityNode {
+			t.Errorf("a 127.0.0.1 endpoint was classified LocalityNode: a loopback node address must not reach the proxy")
+		}
+	})
 }

@@ -65,13 +65,16 @@ const (
 	httpsPortName = "https"
 )
 
-// The hand-written EndpointSlice for the canonical Service. It carries the
-// Service's own name (the pkg/registrysvc convention for a selector-less
-// Service), the standard managed-by label naming this package as its writer (a
-// label VALUE, so a reverse-DNS name, never a "/" path), and it is written by
-// server-side apply under the k3sm field manager.
+// The hand-written EndpointSlices for the canonical Service. Each node's
+// ingress host writes its OWN slice, named endpointSlicePrefix+<nodeName>
+// (EndpointSliceName), so two nodes never apply the same object and evict each
+// other's endpoint: that is how EndpointSlices are meant to shard. Consumers tie
+// every shard to the Service by the kubernetes.io/service-name label, never by
+// the slice name. The managed-by label names this package as the writer (a
+// label VALUE, so a reverse-DNS name, never a "/" path); the slices are written
+// by server-side apply under the k3sm field manager.
 const (
-	endpointSliceName    = ServiceName
+	endpointSlicePrefix  = ServiceName + "-"
 	endpointManagedBy    = "ingresshost.k3sm.io"
 	endpointFieldManager = "k3sm"
 )
@@ -117,6 +120,10 @@ type Config struct {
 	// never a fallback.
 	HTTPPort  uint16
 	HTTPSPort uint16
+	// NodeName is this node's name. It names the node's own shard of the
+	// canonical Service's EndpointSlices (EndpointSliceName), which is the only
+	// slice this host ever writes or deletes. Required.
+	NodeName string
 	// Binder opens the listeners. Nil means netbind.Direct (in-process). The
 	// assembler hands the production 80/443 listeners the root netd helper's
 	// binder when the node has one: netd holds root-owned Service-VIP sockets
@@ -173,6 +180,9 @@ func New(cfg Config) (*Host, error) {
 	}
 	if cfg.HTTPPort == 0 && cfg.HTTPSPort == 0 {
 		return nil, errors.New("ingresshost: config enables no listener (both ports zero)")
+	}
+	if cfg.NodeName == "" {
+		return nil, errors.New("ingresshost: config requires a node name (it names this node's EndpointSlice shard)")
 	}
 	log := cfg.Logger
 	if log == nil {
@@ -591,7 +601,8 @@ func (h *Host) retractStatus(ctx context.Context) {
 	}
 }
 
-// publishEndpoints writes the canonical Service's EndpointSlice: one ready
+// publishEndpoints writes this node's shard of the canonical Service's
+// EndpointSlices (EndpointSliceName): one ready
 // endpoint at AdvertiseAddr (this node's InternalIP) with one port per enabled
 // listener, named as the Service names it. The Service is selector-less, so
 // without this slice its ClusterIP has no backend and the ingress is
@@ -624,7 +635,7 @@ func (h *Host) publishEndpoints(ctx context.Context) {
 			WithProtocol(corev1.ProtocolTCP).
 			WithPort(int32(p.port)))
 	}
-	slice := discoveryv1ac.EndpointSlice(endpointSliceName, ServiceNamespace).
+	slice := discoveryv1ac.EndpointSlice(EndpointSliceName(h.cfg.NodeName), ServiceNamespace).
 		WithLabels(map[string]string{
 			"k3sm.io/managed":            "true",
 			discoveryv1.LabelServiceName: ServiceName,
@@ -643,13 +654,20 @@ func (h *Host) publishEndpoints(ctx context.Context) {
 	}
 }
 
-// retractEndpoints deletes the canonical Service's EndpointSlice, so a Service
-// whose listeners are gone has no backend rather than a dead one. It is called
+// retractEndpoints deletes THIS node's shard of the canonical Service's
+// EndpointSlices, so this node's dead listeners stop being a backend while
+// every other node's shard is left alone. It is called
 // from retractStatus, on every path that retracts the statuses. NotFound is
 // success: nothing was published, or a previous retraction already ran.
 func (h *Host) retractEndpoints(ctx context.Context) {
-	err := h.cfg.Client.DiscoveryV1().EndpointSlices(ServiceNamespace).Delete(ctx, endpointSliceName, metav1.DeleteOptions{})
+	err := h.cfg.Client.DiscoveryV1().EndpointSlices(ServiceNamespace).Delete(ctx, EndpointSliceName(h.cfg.NodeName), metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		h.log.Warn("retract canonical ingress endpointslice", "err", err)
 	}
+}
+
+// EndpointSliceName is the name of nodeName's shard of the canonical Service's
+// EndpointSlices.
+func EndpointSliceName(nodeName string) string {
+	return endpointSlicePrefix + nodeName
 }

@@ -99,7 +99,8 @@ type Config struct {
 	// backend at it as on this node (proxy.WithNodeAddress) and dials it over the
 	// loopback path, not the mesh. It can differ from NodeIP: on a single-node
 	// server NodeIP is the raw loopback --node-ip default while this is the
-	// derived .1. Empty or unparseable leaves the node's address unclassified.
+	// derived .1. Empty, unparseable or loopback leaves the node's address
+	// unclassified.
 	NodeAddress string
 	// PodCIDR is the node pod CIDR; empty uses defaultPodCIDR.
 	PodCIDR string
@@ -243,7 +244,12 @@ func New(cfg Config) *Server {
 	// wildcard listener, published on the canonical ingress Service) is on this
 	// node: without the option it would be classified as another node's and
 	// dialed through the mesh.
-	if addr, err := netip.ParseAddr(cfg.NodeAddress); err == nil {
+	//
+	// A loopback address is NOT passed. With no datapath the advertised address
+	// falls back to the 127.0.0.1 --node-ip default, and a loopback "node
+	// address" is not one any peer can dial; passing it would also reclassify
+	// every 127.0.0.1 endpoint as node-local for internalTrafficPolicy: Local.
+	if addr, err := netip.ParseAddr(cfg.NodeAddress); err == nil && !addr.Unmap().IsLoopback() {
 		opts = append(opts, proxy.WithNodeAddress(addr))
 	}
 

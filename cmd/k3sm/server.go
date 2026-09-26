@@ -965,6 +965,12 @@ func runServer(args []string) (err error) {
 	if isLoopbackDefault(opts.nodeIP) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
+	// nodeAddressing holds the only inputs advertisedNodeIP reads. The full
+	// nodeOpts cannot be built this early: it needs this netserve Server (its
+	// transportOverrides) and the MLX runtime hook, both constructed at or after
+	// this point. So the addressing half is built once here and nodeOpts
+	// copies it, rather than a second literal restating the same fields.
+	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: serverPodCIDR, netMode: mode}
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
@@ -972,9 +978,10 @@ func runServer(args []string) (err error) {
 		ClusterDomain:     opts.domain,
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
-		// The address the in-process node and the ingress host advertise: the
-		// same derivation, over the same inputs nodeOpts carries below.
-		NodeAddress:       advertisedNodeIP(nodeOptions{nodeIP: opts.nodeIP, podCIDR: serverPodCIDR, netMode: mode}),
+		// The address the in-process node and the ingress host advertise. It is
+		// derived from nodeAddressing, which nodeOpts below copies its three
+		// addressing fields from, so both read one value.
+		NodeAddress:       advertisedNodeIP(nodeAddressing),
 		PodCIDR:           serverPodCIDR,
 		MeshEgressIP:      serverMeshEgressIP,
 		PeerMeshEgressIPs: peerMeshEgress,
@@ -1120,15 +1127,15 @@ func runServer(args []string) (err error) {
 		listen:     serverKubeletListenOn(opts.kubeletPort),
 		podRoot:    opts.podRoot,
 		logs:       opts.logs,
-		nodeIP:     opts.nodeIP,
+		nodeIP:     nodeAddressing.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
-		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above)
-		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,           // serve kubelet API over TLS so logs/exec work via the proxy
+		dnsVIP:     opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:     opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
+		podCIDR:    nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality above)
+		netMode:    nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
+		serveTLS:   true,                   // serve kubelet API over TLS so logs/exec work via the proxy
 
 		kubeletClientCAPEM: kubeletClientCA, // :10250 requires the apiserver's client cert
 

@@ -349,6 +349,9 @@ func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
 			if lb.Binder != nil {
 				t.Errorf("svclb Binder = %T, want nil: the netd wildcard grant is the canonical ingress Service's alone", lb.Binder)
 			}
+			if ih.NodeName != gateNodeOptions().nodeName {
+				t.Errorf("ingress NodeName = %q, want the node's own name %q (it names the node's EndpointSlice shard)", ih.NodeName, gateNodeOptions().nodeName)
+			}
 			switch b := ih.Binder.(type) {
 			case *netbind.Netd:
 				if !tc.wantNetd {

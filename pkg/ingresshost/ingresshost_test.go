@@ -94,12 +94,16 @@ var (
 	testPodCIDR       = netip.MustParsePrefix("100.64.0.0/10")
 )
 
+// testNodeName names the fixture node's EndpointSlice shard.
+const testNodeName = "k3sm-a"
+
 // newTestHost builds a Host over cs with a buffered log sink.
 func newTestHost(t *testing.T, cs kubernetes.Interface, httpPort, httpsPort uint16) (*Host, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	h, err := New(Config{
 		Client:        cs,
+		NodeName:      testNodeName,
 		BindAddr:      testBindAddr,
 		AdvertiseAddr: testAdvertiseAddr,
 		PodCIDR:       testPodCIDR,
@@ -330,6 +334,7 @@ func TestIngressHostNewValidationAsymmetry(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := New(Config{
 				Client:        fake.NewClientset(),
+				NodeName:      testNodeName,
 				BindAddr:      tt.bind,
 				AdvertiseAddr: tt.advertise,
 				HTTPPort:      80,
@@ -340,8 +345,11 @@ func TestIngressHostNewValidationAsymmetry(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New(Config{Client: fake.NewClientset(), BindAddr: netip.AddrFrom4([4]byte{})}); err == nil {
+	if _, err := New(Config{Client: fake.NewClientset(), BindAddr: netip.AddrFrom4([4]byte{}), NodeName: testNodeName}); err == nil {
 		t.Error("New must still reject a config that enables no listener")
+	}
+	if _, err := New(Config{Client: fake.NewClientset(), BindAddr: netip.AddrFrom4([4]byte{}), HTTPPort: 80}); err == nil {
+		t.Error("New must reject a config with no node name: it names this node's EndpointSlice shard")
 	}
 }
 
@@ -355,6 +363,7 @@ func TestIngressHostDerivationFailureServesButNeverAdvertises(t *testing.T) {
 	cs := fake.NewClientset(classIngress("default", "mine", &own))
 	h, err := New(Config{
 		Client:        cs,
+		NodeName:      testNodeName,
 		BindAddr:      testBindAddr,
 		AdvertiseAddr: netip.Addr{}, // the derivation failed
 		PodCIDR:       testPodCIDR,
@@ -496,6 +505,7 @@ func TestIngressHostRetractsImmediatelyWithNoDerivableAddress(t *testing.T) {
 	cs := fake.NewClientset(mine)
 	h, err := New(Config{
 		Client:        cs,
+		NodeName:      testNodeName,
 		BindAddr:      testBindAddr,
 		AdvertiseAddr: netip.Addr{},
 		PodCIDR:       testPodCIDR,
@@ -537,13 +547,15 @@ func (b *stubBinder) Listen(_ context.Context, _ string, addr netip.AddrPort) (n
 // EndpointSlice its ClusterIP has no backend. After every enabled listener is
 // bound, the host publishes one through the client it was given, carrying the
 // node's InternalIP and ports named exactly as the Service names them; before
-// the bind there is none; and losing the listeners removes it.
+// the bind there is none; a second node publishes its own shard beside it
+// rather than evicting it; and losing the listeners removes only this node's.
 func TestCanonicalServiceEndpointsCarryTheNodeListener(t *testing.T) {
 	ctx := context.Background()
 	cs := fake.NewClientset()
 	binder := &stubBinder{}
 	h, err := New(Config{
 		Client:        cs,
+		NodeName:      testNodeName,
 		BindAddr:      testBindAddr,
 		AdvertiseAddr: testAdvertiseAddr,
 		PodCIDR:       testPodCIDR,
@@ -578,7 +590,7 @@ func TestCanonicalServiceEndpointsCarryTheNodeListener(t *testing.T) {
 	}
 	h.syncStatus(ctx)
 
-	es, err := slices.Get(ctx, ServiceName, metav1.GetOptions{})
+	es, err := slices.Get(ctx, EndpointSliceName(testNodeName), metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("after the bind: get the canonical endpointslice: %v", err)
 	}
@@ -625,10 +637,66 @@ func TestCanonicalServiceEndpointsCarryTheNodeListener(t *testing.T) {
 		t.Error("the endpointslice must be written through the provided client by server-side apply")
 	}
 
-	// Losing the listeners removes the backend on the same path as the status.
+	// A second node's ingress host publishes its OWN shard on the same
+	// cluster: one slice per node, both tied to the Service by label, so
+	// neither apply evicts the other's endpoint.
+	const otherNode = "k3sm-b"
+	otherAddr := netip.MustParseAddr("100.64.3.1")
+	h2, err := New(Config{
+		Client:        cs,
+		NodeName:      otherNode,
+		BindAddr:      testBindAddr,
+		AdvertiseAddr: otherAddr,
+		PodCIDR:       testPodCIDR,
+		HTTPPort:      80,
+		HTTPSPort:     443,
+		Binder:        &stubBinder{},
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("New (second node): %v", err)
+	}
+	for _, port := range []uint16{80, 443} {
+		if _, err := (countingBinder{h: h2}).Listen(ctx, "tcp", netip.AddrPortFrom(testBindAddr, port)); err != nil {
+			t.Fatalf("second node bind %d: %v", port, err)
+		}
+	}
+	h2.syncStatus(ctx)
+	byService, err := slices.List(ctx, metav1.ListOptions{LabelSelector: discoveryv1.LabelServiceName + "=" + ServiceName})
+	if err != nil {
+		t.Fatalf("list the canonical service's endpointslices: %v", err)
+	}
+	addrs := map[string]string{}
+	for _, item := range byService.Items {
+		for _, ep := range item.Endpoints {
+			for _, a := range ep.Addresses {
+				addrs[item.Name] = a
+			}
+		}
+	}
+	want := map[string]string{
+		EndpointSliceName(testNodeName): testAdvertiseAddr.String(),
+		EndpointSliceName(otherNode):    otherAddr.String(),
+	}
+	if len(addrs) != len(want) {
+		t.Fatalf("slices for %s = %v, want one shard per node %v", ServiceName, addrs, want)
+	}
+	for name, a := range want {
+		if addrs[name] != a {
+			t.Errorf("slice %s carries %q, want %q (a node's apply must not evict another node's endpoint)", name, addrs[name], a)
+		}
+	}
+
+	// Losing the listeners removes THIS node's backend on the same path as the
+	// status, and leaves the other node's shard alone.
 	h.serving.Store(false)
 	h.syncStatus(ctx)
-	if _, err := slices.Get(ctx, ServiceName, metav1.GetOptions{}); err == nil {
+	if _, err := slices.Get(ctx, EndpointSliceName(testNodeName), metav1.GetOptions{}); err == nil {
 		t.Error("once the listeners are lost the endpointslice must be retracted, not left pointing at a dead socket")
+	}
+	if es, err := slices.Get(ctx, EndpointSliceName(otherNode), metav1.GetOptions{}); err != nil {
+		t.Errorf("retracting one node's shard deleted the other node's: %v", err)
+	} else if len(es.Endpoints) != 1 || es.Endpoints[0].Addresses[0] != otherAddr.String() {
+		t.Errorf("the other node's shard = %+v, want it untouched at %s", es.Endpoints, otherAddr)
 	}
 }
