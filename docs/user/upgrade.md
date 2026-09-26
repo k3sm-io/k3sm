@@ -179,9 +179,13 @@ directory, finds nothing, and gives the node a new mesh identity that no peer kn
 downgrade, copy the files back by hand:
 
 ```sh
-sudo mkdir -m 0700 /var/lib/k3sm/run/keys
-sudo cp -p /var/lib/k3sm/keys/* /var/lib/k3sm/run/keys/
+sudo mkdir -p -m 0700 /var/lib/k3sm/run/keys
+sudo cp -p /var/lib/k3sm/keys/server.key /var/lib/k3sm/keys/node.key /var/lib/k3sm/keys/node-pod-cidr /var/lib/k3sm/run/keys/
 ```
+
+A node has only the key for its own role, so `cp` reports the missing one; that is expected. The
+older binary's installer also rebuilds its key copy from the node's own work-dir copy, so this step
+is a second safeguard rather than the only one.
 
 ### Durable State After Rolling Back Past the LoadBalancer Bind Change
 

@@ -234,11 +234,16 @@ func ServiceLevels() []StateLevel {
 	return out
 }
 
-// LegacyMeshKeyFiles returns the paths an older build kept this node's mesh
-// keys at under dataRoot — inside the service-user-owned run dir — so netd can
-// warn about a layout the installer has not migrated yet. The node identity is
-// not among them: it is not a key, and netd rewrites it after an adoption.
+// LegacyMeshKeyFiles returns the paths of the three files an older build kept
+// under dataRoot's run dir (the two roles' mesh keys and the node identity),
+// so netd can warn about a layout the installer has not migrated yet. Only
+// these names count: the legacy directory existing, or holding anything else,
+// is not a layout k3sm has to migrate.
 func LegacyMeshKeyFiles(dataRoot string) []string {
 	dir := filepath.Join(StateRun.Path(dataRoot), meshKeySubdir)
-	return []string{filepath.Join(dir, MeshKeyRefServer), filepath.Join(dir, MeshKeyRefAgent)}
+	var out []string
+	for _, leaf := range legacyKeyLeaves() {
+		out = append(out, filepath.Join(dir, leaf))
+	}
+	return out
 }

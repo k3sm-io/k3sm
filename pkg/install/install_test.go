@@ -1369,6 +1369,12 @@ func (f *fakeSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) 
 func (f *fakeSystem) RemoveEntry(dir, name string) error {
 	f.calls = append(f.calls, "RemoveEntry:"+dir+":"+name)
 	p := filepath.Join(dir, name)
+	// rmdir(2) semantics: a directory that still holds a file is refused.
+	for q := range f.files {
+		if strings.HasPrefix(q, p+"/") {
+			return fmt.Errorf("remove %s in %s: directory not empty", name, dir)
+		}
+	}
 	delete(f.files, p)
 	delete(f.owners, p)
 	return nil
@@ -1417,6 +1423,19 @@ func (h *fakeDirHandle) RemoveEntry(name string) error {
 	h.f.calls = append(h.f.calls, "RemoveEntry:"+h.id+":"+name)
 	delete(h.f.files, filepath.Join(h.dir, name))
 	return nil
+}
+
+// ListEntries lists the files directly inside the held directory, sorted.
+func (h *fakeDirHandle) ListEntries() ([]string, error) {
+	h.f.calls = append(h.f.calls, "ListEntries:"+h.id)
+	var names []string
+	for p := range h.f.files {
+		if filepath.Dir(p) == h.dir {
+			names = append(names, filepath.Base(p))
+		}
+	}
+	slices.Sort(names)
+	return names, nil
 }
 
 // Close records the close.

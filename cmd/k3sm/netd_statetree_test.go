@@ -125,3 +125,40 @@ func TestNetdAlignmentUsesTheOwnershipTable(t *testing.T) {
 		t.Errorf("no WARN naming `sudo k3sm install` for the legacy key %s: %s", legacyKey, out)
 	}
 }
+
+// TestNetdWarnsOnlyOnKnownLegacyLeaves is the netd half of (n): a legacy key
+// dir holding nothing k3sm knows (a hand-left file) is not warned about, while
+// any of the three known leaves — the two keys and the node identity — is.
+func TestNetdWarnsOnlyOnKnownLegacyLeaves(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		leaf string
+		warn bool
+	}{
+		{"only an unknown file", "node-pod-cidr.sep24-stale", false},
+		{"the node identity", "node-pod-cidr", true},
+		{"a key", install.MeshKeyRefAgent, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := tempRoot(t)
+			root := filepath.Join(base, "k3sm")
+			runDir := filepath.Join(root, "run")
+			legacyDir := filepath.Join(runDir, "keys")
+			own := &fakeOwn{stat: map[string]fakeStat{
+				root:                              {uid: 0, gid: 0, mode: 0o755},
+				runDir:                            {uid: testServiceUID, gid: testServiceGID, mode: 0o700},
+				legacyDir:                         {uid: 0, gid: 0, mode: 0o700},
+				filepath.Join(legacyDir, tc.leaf): {uid: 0, gid: 0, mode: 0o600, kind: fakeFile},
+			}}
+			logs := captureLogs(t)
+			l, err := listenNetd(filepath.Join(runDir, "netd.sock"), root, testServiceGID, own)
+			if err != nil {
+				t.Fatalf("listenNetd: %v", err)
+			}
+			defer l.Close()
+			if got := strings.Contains(logs.String(), "legacy run-dir location"); got != tc.warn {
+				t.Errorf("warned = %v, want %v:\n%s", got, tc.warn, logs.String())
+			}
+		})
+	}
+}
