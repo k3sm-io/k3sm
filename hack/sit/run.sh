@@ -38,6 +38,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 . "$HERE/../lib/clusterup.sh"
 . "$HERE/../lib/conformance.sh"
+. "$HERE/../lib/conformance-stage.sh"
 
 CRITERIA_ENV="$HERE/criteria.env"
 SIT_TIMEOUT="${SIT_TIMEOUT:-900s}"
@@ -306,6 +307,15 @@ run_psa_enforce_leg() {
 		return 0
 	fi
 
+	# A previous `sudo hack/sit/run.sh` leaves $SIT_PSA_WORKDIR root-owned, and a
+	# later rootless run then cannot reset it or write server.log. Name that, with
+	# the remedy, instead of booting into a permission error.
+	if ! conformance_bin_preflight "$SIT_PSA_WORKDIR" SIT_PSA_WORKDIR; then
+		echo "  RED  T2 psa-enforce: aborted before boot ($SIT_PSA_WORKDIR is not usable; remedy above)"
+		TIER_RED+=("${crits[@]}")
+		return 1
+	fi
+
 	# Start from clean state, keeping only the bin/ download cache.
 	mkdir -p "$work_dir"
 	reset_dir "$work_dir" bin || return 1
@@ -320,6 +330,9 @@ run_psa_enforce_leg() {
 	echo "  ports: api=$api kine=$kine kubelet=$kubelet scheduler=$sched controller-manager=$cm"
 	echo "  boot:  k3sm ${argv[*]}"
 
+	# Drop the previous run's log: a boot that fails must never have psa_red
+	# print another run's lines as the flagged server's last log lines.
+	rm -f "$log"
 	# K3SM_WORK_DIR is exported into the server for the same reason `k3sm dev`
 	# exports it: the M10 audit/PSA e2e read the audit log out of that workdir.
 	nohup env CGO_ENABLED=1 K3SM_WORK_DIR="$work_dir" "$BIN" "${argv[@]}" > "$log" 2>&1 &
