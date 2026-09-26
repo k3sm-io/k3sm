@@ -1335,11 +1335,11 @@ func firstNonEmpty(vals ...string) string {
 // executable when it exists as a file, else "" (graceful: a missing pod-support
 // dylib disables its feature rather than failing the node).
 func resolveSiblingDylib(name string) string {
-	exe, err := os.Executable()
+	dir, err := install.ExecutableDir()
 	if err != nil {
 		return ""
 	}
-	p := filepath.Join(filepath.Dir(exe), name)
+	p := filepath.Join(dir, name)
 	if fi, err := os.Stat(p); err != nil || fi.IsDir() {
 		return ""
 	}

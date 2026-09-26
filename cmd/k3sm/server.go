@@ -494,9 +494,9 @@ func runServer(args []string) (err error) {
 	// <install-dir>/bin beside the daemon binary; boot seeds the workdir from it
 	// so it never shells out to gh/go (absent under launchd as _k3sm). Dev shells
 	// (no bin/ sibling) keep the acquisition fallbacks.
-	if exe, err := os.Executable(); err == nil {
-		if fi, serr := os.Stat(filepath.Join(filepath.Dir(exe), "bin")); serr == nil && fi.IsDir() {
-			cfg.PayloadBinDir = filepath.Join(filepath.Dir(exe), "bin")
+	if dir, err := install.ExecutableDir(); err == nil {
+		if fi, serr := os.Stat(filepath.Join(dir, "bin")); serr == nil && fi.IsDir() {
+			cfg.PayloadBinDir = filepath.Join(dir, "bin")
 		}
 	}
 	// HA: a Postgres datastore endpoint (or --server-join) puts kine on the shared

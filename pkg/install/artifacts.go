@@ -27,7 +27,7 @@ import (
 //
 // Install resolves every supporting artifact relative to the directory holding
 // the running k3sm binary (Config.BinarySource, which cmd/k3sm sets from
-// os.Executable), and there is no CLI override for any of those paths. That
+// Executable, symlinks resolved), and there is no CLI override for any of those paths. That
 // makes the layout a contract between three parties that cannot see each other:
 // the installer that reads it, the release archive that must ship it, and the
 // gate that proves the two agree.

@@ -62,9 +62,9 @@ func runInstall(args []string) error {
 	if opts.targetUser == "" || opts.targetUser == "root" {
 		return fmt.Errorf("--user (or $SUDO_USER) must be a non-root human so the kubeconfig is not root-owned; run via 'sudo k3sm install'")
 	}
-	self, err := os.Executable()
+	self, err := install.Executable()
 	if err != nil {
-		return fmt.Errorf("resolve own binary path: %w", err)
+		return err
 	}
 
 	volume, err := opts.dataVolumeOptions(version.Get().Version)

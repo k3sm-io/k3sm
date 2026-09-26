@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/dev"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // devUsage is the `k3sm dev --help` text. It BLESSES the SAFE operator class
@@ -90,9 +91,9 @@ func newDevManager() (*dev.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	self, err := os.Executable()
+	self, err := install.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("resolve own binary path: %w", err)
+		return nil, err
 	}
 	return dev.NewManager(dev.ManagerConfig{
 		Registry: dev.NewRegistry(root),
