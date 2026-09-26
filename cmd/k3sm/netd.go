@@ -379,7 +379,7 @@ type authorizerFailureLog struct {
 // unusable kubeconfig carries a fixed reason and never the error text, and the
 // WARN for a rejected credential carries only the apiserver's status reason.
 func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err error) {
-	reason, class := authorizerFailureReason(err)
+	reason, class, window := authorizerFailureReason(err)
 	warn := false
 	switch class {
 	case failImmediate:
@@ -390,8 +390,8 @@ func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err 
 			l.streak, l.streakReason = 0, reason
 		}
 		l.streak++
-		warn = l.streak >= authorizerWarnWindow(err)
-	default:
+		warn = l.streak >= window
+	case failDebug:
 		l.streak, l.streakReason = 0, ""
 	}
 	if !warn {
@@ -412,41 +412,27 @@ func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err 
 	logger.Debug("Service authorizer still cannot start", "kubeconfig", kubeconfig, "reason", reason)
 }
 
-// authorizerWarnWindow is how many consecutive attempts a failWindowed
-// failure must hold before it is logged at WARN.
-func authorizerWarnWindow(err error) int {
-	if kubeconfigMissing(err) {
-		return missingKubeconfigWarnAfter
-	}
-	return credentialRejectedWarnAfter
-}
-
-// authorizerFailureReason classifies a startServiceInformer error. reason is
-// safe to log (it never carries kubeconfig contents or token bytes) and is
-// empty for failDebug.
-func authorizerFailureReason(err error) (reason string, class authorizerFailureClass) {
+// authorizerFailureReason classifies a startServiceInformer error and is the
+// one place a failure's class and window are decided. reason is safe to log
+// (it never carries kubeconfig contents or token bytes) and is empty for
+// failDebug. window is how many consecutive attempts a failWindowed failure
+// must hold before it is logged at WARN; it is zero for every other class.
+func authorizerFailureReason(err error) (reason string, class authorizerFailureClass, window int) {
 	switch {
 	case apierrors.IsUnauthorized(err):
-		return "the apiserver rejected netd's credential (401 Unauthorized)", failWindowed
+		return "the apiserver rejected netd's credential (401 Unauthorized)", failWindowed, credentialRejectedWarnAfter
 	case apierrors.IsForbidden(err):
-		return "the apiserver refused netd's credential access to Services (403 Forbidden)", failImmediate
+		return "the apiserver refused netd's credential access to Services (403 Forbidden)", failImmediate, 0
 	}
 	var unusable kubeconfigUnusableError
 	switch {
 	case !errors.As(err, &unusable):
-		return "", failDebug
+		return "", failDebug, 0
 	case unusable.missing:
-		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", failWindowed
+		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", failWindowed, missingKubeconfigWarnAfter
 	default:
-		return "the kubeconfig netd was handed cannot be read or is not a valid kubeconfig", failImmediate
+		return "the kubeconfig netd was handed cannot be read or is not a valid kubeconfig", failImmediate, 0
 	}
-}
-
-// kubeconfigMissing reports whether err is the existence check finding no
-// kubeconfig at all.
-func kubeconfigMissing(err error) bool {
-	var unusable kubeconfigUnusableError
-	return errors.As(err, &unusable) && unusable.missing
 }
 
 // serviceInformerSyncTimeout bounds one attempt's wait for the initial Services

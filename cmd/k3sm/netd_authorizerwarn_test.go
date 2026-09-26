@@ -107,7 +107,6 @@ type authorizerCase struct {
 	name      string
 	errs      []error
 	wantWarns int
-	// wantDebug < 0 skips the Debug count.
 	wantDebug int
 	want      []string
 	forbid    []string
@@ -129,7 +128,7 @@ func runAuthorizerCases(t *testing.T, kubeconfig string, cases []authorizerCase)
 			if got := h.count(slog.LevelWarn); got != tc.wantWarns {
 				t.Errorf("WARN records = %d, want %d\n%s", got, tc.wantWarns, h.text.String())
 			}
-			if got := h.count(slog.LevelDebug); tc.wantDebug >= 0 && got != tc.wantDebug {
+			if got := h.count(slog.LevelDebug); got != tc.wantDebug {
 				t.Errorf("Debug records = %d, want %d\n%s", got, tc.wantDebug, h.text.String())
 			}
 			out := h.text.String()
@@ -288,13 +287,13 @@ func TestNetdAuthorizerBootWindowCovers401(t *testing.T) {
 			name:      "(e) past the window the same 401 for 149 more attempts does not warn again",
 			errs:      repeatErr(f.unauthorized, w+authorizerRewarnEvery-1),
 			wantWarns: 1,
-			wantDebug: -1,
+			wantDebug: w - 1 + authorizerRewarnEvery - 1,
 		},
 		{
 			name:      "(e) past the window the same 401 warns again at 150 more attempts",
 			errs:      repeatErr(f.unauthorized, w+authorizerRewarnEvery),
 			wantWarns: 2,
-			wantDebug: -1,
+			wantDebug: w - 1 + authorizerRewarnEvery - 1,
 		},
 		{
 			name:      "(f) a 401 streak broken by a dial error restarts: 9 more 401s do not warn",
