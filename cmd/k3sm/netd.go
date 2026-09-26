@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -260,14 +262,14 @@ func buildServiceSet(ctx context.Context, kubeconfig string, logger *slog.Logger
 // race, never permanently deny.
 func activateServiceAuthorizer(ctx context.Context, kubeconfig string, logger *slog.Logger, install func(corev1listers.ServiceLister)) {
 	const retry = 2 * time.Second
+	var failures authorizerFailureLog
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		lister, err := startServiceInformer(ctx, kubeconfig)
 		if err != nil {
-			logger.Debug("Service authorizer not ready; <1024 binds denied until the server's kubeconfig + apiserver are up",
-				"kubeconfig", kubeconfig, "err", err)
+			failures.note(logger, kubeconfig, err)
 			select {
 			case <-ctx.Done():
 				return
@@ -282,6 +284,128 @@ func activateServiceAuthorizer(ctx context.Context, kubeconfig string, logger *s
 	}
 }
 
+// kubeconfigUnusableError marks a startServiceInformer failure that happened
+// before any request was made: the kubeconfig is missing, unreadable, or not a
+// kubeconfig. It is a transparent wrapper (its text is the wrapped error's), so
+// marking an error changes how it is classified and nothing about how it reads.
+// missing is set only by the existence check, so a kubeconfig that is present
+// but names a certificate file that is not is never reported as absent.
+type kubeconfigUnusableError struct {
+	err     error
+	missing bool
+}
+
+func (e kubeconfigUnusableError) Error() string { return e.err.Error() }
+func (e kubeconfigUnusableError) Unwrap() error { return e.err }
+
+// authorizerRoleRemedy is the remedy named beside a credential-shaped failure.
+// The case it is written for is a Mac that changed role by hand: netd's plist
+// still names the previous role's credential, and only an install rewrites it.
+const authorizerRoleRemedy = "if this Mac changed role, netd still holds the previous role's credential: run `sudo k3sm uninstall`, then `sudo k3sm install` for the role this Mac should have"
+
+// missingKubeconfigWarnAfter is how many CONSECUTIVE failed attempts may find
+// the kubeconfig absent before that absence is logged at WARN. netd is started
+// before the server writes the kubeconfig, so a missing file is the normal
+// state for the first seconds of every server boot and must not WARN then. At
+// the authorizer's 2s retry cadence, 30 attempts is about a minute (longer in
+// practice, since an attempt can itself take time), well past any boot window
+// and short enough that a file that is never coming is reported the same
+// minute.
+const missingKubeconfigWarnAfter = 30
+
+// authorizerRewarnEvery is how many repeats of the SAME WARN-class error pass
+// before that error is warned again (a different WARN-class error warns at once
+// and restarts the count; a Debug-class failure in between leaves it alone, so
+// a flapping apiserver cannot turn the reminder into spam). Warning once for the
+// daemon's life would let a standing failure (a rejected credential, an
+// unusable kubeconfig, one that never appeared) scroll out of every log view
+// while privileged binds stay denied. At the 2s retry cadence 150 attempts is
+// about five minutes: one line per five minutes is a reminder, not spam.
+const authorizerRewarnEvery = 150
+
+// authorizerFailureLog decides the level of each failed authorizer attempt.
+//
+// Most failures are the boot race (netd starts before the server writes its
+// kubeconfig or before the apiserver serves) and stay at Debug. Two are not
+// transient and would otherwise be invisible for the daemon's whole life,
+// leaving every privileged bind denied: a kubeconfig that cannot be loaded, and
+// a credential the apiserver rejects. Those are logged at WARN with the reason
+// and a remedy on first sighting, once per distinct error, and at Debug when
+// the same error comes back on the next retry, until authorizerRewarnEvery
+// repeats have passed and it is warned again. A kubeconfig that does not exist
+// is the one member of the first class that is also the boot race, so it stays
+// at Debug until it has been missing for missingKubeconfigWarnAfter consecutive
+// attempts. It is owned by the single retry loop, so it needs no lock.
+type authorizerFailureLog struct {
+	lastWarned string
+	// sinceWarn counts repeats of lastWarned since it was last logged at
+	// WARN.
+	sinceWarn int
+	// missingStreak counts consecutive attempts that found the kubeconfig
+	// absent; any other outcome resets it.
+	missingStreak int
+}
+
+// note logs one failed attempt. It logs the kubeconfig PATH only: a parse
+// error from a kubeconfig can quote the file's contents, so the WARN for an
+// unusable kubeconfig carries a fixed reason and never the error text, and the
+// WARN for a rejected credential carries only the apiserver's status reason.
+func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err error) {
+	reason, warn := authorizerFailureReason(err)
+	if kubeconfigMissing(err) {
+		l.missingStreak++
+		if l.missingStreak < missingKubeconfigWarnAfter {
+			warn = false
+		}
+	} else {
+		l.missingStreak = 0
+	}
+	if !warn {
+		logger.Debug("Service authorizer not ready; <1024 binds denied until the server's kubeconfig + apiserver are up",
+			"kubeconfig", kubeconfig, "err", err)
+		return
+	}
+	msg := err.Error()
+	if msg == l.lastWarned {
+		l.sinceWarn++
+	}
+	if msg != l.lastWarned || l.sinceWarn >= authorizerRewarnEvery {
+		l.lastWarned, l.sinceWarn = msg, 0
+		logger.Warn("Service authorizer cannot start; <1024 binds stay denied until it does",
+			"kubeconfig", kubeconfig, "reason", reason, "remedy", authorizerRoleRemedy)
+		return
+	}
+	logger.Debug("Service authorizer still cannot start", "kubeconfig", kubeconfig, "reason", reason)
+}
+
+// authorizerFailureReason classifies a startServiceInformer error. warn is true
+// for the two non-transient classes; reason is safe to log (it never carries
+// kubeconfig contents or token bytes).
+func authorizerFailureReason(err error) (reason string, warn bool) {
+	switch {
+	case apierrors.IsUnauthorized(err):
+		return "the apiserver rejected netd's credential (401 Unauthorized)", true
+	case apierrors.IsForbidden(err):
+		return "the apiserver refused netd's credential access to Services (403 Forbidden)", true
+	}
+	var unusable kubeconfigUnusableError
+	switch {
+	case !errors.As(err, &unusable):
+		return "", false
+	case unusable.missing:
+		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", true
+	default:
+		return "the kubeconfig netd was handed cannot be read or is not a valid kubeconfig", true
+	}
+}
+
+// kubeconfigMissing reports whether err is the existence check finding no
+// kubeconfig at all.
+func kubeconfigMissing(err error) bool {
+	var unusable kubeconfigUnusableError
+	return errors.As(err, &unusable) && unusable.missing
+}
+
 // serviceInformerSyncTimeout bounds one attempt's wait for the initial Services
 // cache sync, so a not-yet-serving apiserver is a retryable error rather than a
 // hang. activateServiceAuthorizer retries the whole attempt on its own timer.
@@ -292,11 +416,11 @@ const serviceInformerSyncTimeout = 10 * time.Second
 // absent/unreadable, the client can't be built, or the cache doesn't sync in time.
 func startServiceInformer(ctx context.Context, kubeconfig string) (corev1listers.ServiceLister, error) {
 	if _, err := os.Stat(kubeconfig); err != nil {
-		return nil, fmt.Errorf("stat kubeconfig: %w", err)
+		return nil, fmt.Errorf("stat kubeconfig: %w", kubeconfigUnusableError{err: err, missing: errors.Is(err, fs.ErrNotExist)})
 	}
 	_, cs, err := kubeclient.FromPath(kubeconfig)
 	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig: %w", err)
+		return nil, fmt.Errorf("load kubeconfig: %w", kubeconfigUnusableError{err: err})
 	}
 	return runServiceInformer(ctx, cs, serviceInformerSyncTimeout)
 }
@@ -333,10 +457,35 @@ func runServiceInformer(ctx context.Context, cs kubernetes.Interface, syncTimeou
 		factory.Shutdown()
 	}()
 
+	// The reflector's list/watch failures never reach the caller on their own:
+	// a rejected credential shows up here only as a sync timeout. Keeping the
+	// last one lets the timeout carry the real cause (a 401/403 stays an
+	// apierrors status in the chain), so the caller can tell a stale
+	// credential from an apiserver that is simply not up yet. The default
+	// handler still runs, so the reflector's own logging is unchanged.
+	var (
+		lastMu  sync.Mutex
+		lastErr error
+	)
+	if err := svcInformer.SetWatchErrorHandlerWithContext(func(ctx context.Context, r *cache.Reflector, err error) {
+		lastMu.Lock()
+		lastErr = err
+		lastMu.Unlock()
+		cache.DefaultWatchErrorHandler(ctx, r, err)
+	}); err != nil {
+		return nil, fmt.Errorf("set the service informer's watch error handler: %w", err)
+	}
+
 	factory.Start(runCtx.Done())
 	syncCtx, cancelSync := context.WithTimeout(runCtx, syncTimeout)
 	defer cancelSync()
 	if !cache.WaitForCacheSync(syncCtx.Done(), svcInformer.HasSynced) {
+		lastMu.Lock()
+		cause := lastErr
+		lastMu.Unlock()
+		if cause != nil {
+			return nil, fmt.Errorf("service cache did not sync within %s: %w", syncTimeout, cause)
+		}
 		return nil, fmt.Errorf("service cache did not sync within %s", syncTimeout)
 	}
 	keep = true

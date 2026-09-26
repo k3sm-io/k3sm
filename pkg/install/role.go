@@ -49,15 +49,48 @@ import (
 func refuseCrossRole(sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
 	other := cfg.Role.Other()
-	path := cfg.plistPath(daemonLabel(other))
-	switch _, err := sys.ReadFile(path); {
-	case err == nil:
+	path, installed, err := roleInstalled(sys, cfg, other)
+	switch {
+	case err != nil:
+		return fmt.Errorf("install: check whether this Mac already carries the %s daemon %s: %w", other, path, err)
+	case installed:
 		return fmt.Errorf("install: this Mac is already installed as a k3sm %s (%s is on disk) and a node is one role or the other, never both: run `k3sm uninstall` first, then install the %s role (uninstall keeps the data root, the logs and the arguments you configured)",
 			other, path, cfg.Role)
+	}
+	return nil
+}
+
+// PlistReader is the one disk read the role probe needs. System satisfies it,
+// and so does a caller that holds no install privilege at all: reading a
+// LaunchDaemon plist needs none.
+type PlistReader interface {
+	ReadFile(path string) ([]byte, error)
+}
+
+// RoleInstalled reports whether role's daemon plist is on this Mac, in the
+// LaunchDaemon dir an install writes it to, and returns the path it checked.
+//
+// It is the same probe refuseCrossRole and uninstallManifest make, exported
+// for a caller outside the installer that has to decide the same question: a
+// node daemon started by hand that must not run beside the other role's
+// installed one. A missing plist is (false, nil); any other read failure is
+// returned, because an unreadable plist is not evidence that the role is
+// absent.
+func RoleInstalled(sys PlistReader, role Role) (path string, installed bool, err error) {
+	return roleInstalled(sys, Config{}.withDefaults(), role)
+}
+
+// roleInstalled is the single implementation of the probe: a ReadFile of the
+// role's plist whose fs.ErrNotExist arm means "not installed".
+func roleInstalled(sys PlistReader, cfg Config, role Role) (string, bool, error) {
+	path := cfg.plistPath(daemonLabel(role))
+	switch _, err := sys.ReadFile(path); {
+	case err == nil:
+		return path, true, nil
 	case errors.Is(err, fs.ErrNotExist):
-		return nil
+		return path, false, nil
 	default:
-		return fmt.Errorf("install: check whether this Mac already carries the %s daemon %s: %w", other, path, err)
+		return path, false, err
 	}
 }
 
@@ -80,9 +113,9 @@ func uninstallManifest(sys System, cfg Config) []artifact {
 	cfg = cfg.withDefaults()
 	m := artifactManifest(cfg)
 	other := cfg.Role.Other()
-	path := cfg.plistPath(daemonLabel(other))
-	switch _, err := sys.ReadFile(path); {
-	case errors.Is(err, fs.ErrNotExist):
+	path, installed, err := roleInstalled(sys, cfg, other)
+	switch {
+	case err == nil && !installed:
 		return m
 	case err != nil:
 		cfg.Logger.Warn("could not tell whether this Mac also carries the other role's daemon; tearing it down anyway (a bootout of a label that is not loaded is a no-op)",
