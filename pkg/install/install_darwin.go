@@ -1581,6 +1581,16 @@ func transientLaunchctlOutput(out string) bool {
 		transientErrno.MatchString(out)
 }
 
+// MaxFilesPerProc reads kern.maxfilesperproc, the most descriptors the kernel
+// allocates one process whatever its RLIMIT_NOFILE.
+func (darwinSystem) MaxFilesPerProc() (uint64, error) {
+	v, err := unix.SysctlUint32("kern.maxfilesperproc")
+	if err != nil {
+		return 0, fmt.Errorf("sysctl kern.maxfilesperproc: %w", err)
+	}
+	return uint64(v), nil
+}
+
 // PathExists reports whether path exists, without opening it. Install verifies the
 // netd unix socket this way because no file read can answer for a socket: opening
 // one with the file API fails whether or not netd is listening. A not-exist stat is

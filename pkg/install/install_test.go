@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"k3sm.io/darwin-net/pkg/proxy"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
@@ -114,6 +115,15 @@ type fakeSystem struct {
 	// that is not serving. They are the case a connect-only probe cannot see, so
 	// the fake has to be able to state it.
 	wedgedSockets map[string]bool
+	// maxFilesPerProc is the kern.maxfilesperproc MaxFilesPerProc reports; 0
+	// means 245760 (the value measured on a 64 GB Mac), so an unconfigured fake
+	// never caps serverFileLimit. maxFilesPerProcErr, when set, is returned instead.
+	maxFilesPerProc    uint64
+	maxFilesPerProcErr error
+	// readErrs[path] is an error ReadFile returns for path instead of reading
+	// it: an installed file that exists but cannot be read. The zero value
+	// reads everything.
+	readErrs map[string]error
 	// missingPaths are paths PathExists reports absent. The zero value reports
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
@@ -674,6 +684,9 @@ func (f *fakeSystem) readRegularFileContent(path string) ([]byte, error) {
 
 func (f *fakeSystem) ReadFile(path string) ([]byte, error) {
 	f.calls = append(f.calls, "ReadFile:"+path)
+	if err, ok := f.readErrs[path]; ok {
+		return nil, err
+	}
 	// A file whose content changes AFTER this read: the swap is applied once the
 	// current read has been answered, so the caller sees the old bytes and every
 	// later reader sees the new ones. See putFileSwappedAfterRead.
@@ -1080,6 +1093,19 @@ func (f *fakeSystem) LaunchctlServicePID(label string) (int, error) {
 
 // PathExists answers present for every path a test has not explicitly hidden, so an
 // unconfigured fake describes a healthy install.
+// MaxFilesPerProc answers from the seeded kernel ceiling. It is not recorded in
+// calls: it reads a kernel constant, not the filesystem or launchd, and the call
+// sequences the other tests pin are about those.
+func (f *fakeSystem) MaxFilesPerProc() (uint64, error) {
+	if f.maxFilesPerProcErr != nil {
+		return 0, f.maxFilesPerProcErr
+	}
+	if f.maxFilesPerProc == 0 {
+		return maxFilesPerProc64GB, nil
+	}
+	return f.maxFilesPerProc, nil
+}
+
 func (f *fakeSystem) PathExists(path string) (bool, error) {
 	f.calls = append(f.calls, "PathExists:"+path)
 	return !f.missingPaths[path], nil
@@ -1591,6 +1617,11 @@ func TestInstallOrchestration(t *testing.T) {
 		// it cannot be laid down.
 		"EnsureSymlink:/Library/k3sm/k3sm->/usr/local/bin/k3sm",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The server plist is the one that requests an open-file limit, so the
+		// plist it replaces is read first to compare the two: a changed limit
+		// earns the post-restart reload notice. netd requests none and is not
+		// read. A first install finds nothing, which means no notice.
+		"ReadFile:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"WriteLaunchDaemon:/Library/LaunchDaemons/io.k3sm.server.plist",
 		// Each label: bootout → await-unloaded (the ServicePID read whose ERROR is
 		// the only proof launchd finished the teardown) → enable (a disabled label
@@ -2026,13 +2057,22 @@ func TestServerPlistRaisesFileLimit(t *testing.T) {
 		}
 	}
 
-	// (2) Soft + Hard NumberOfFiles = 131072, correctly nested as <integer>.
+	// (2) Soft + Hard NumberOfFiles = serverFileLimit, correctly nested as
+	// <integer> — and the number is pinned by what it is FOR rather than as a
+	// bare literal: half of it is darwin-net's default UDP flow budget
+	// (proxy.UDPFlowBudgetFor), which must clear the 8192 floor for the
+	// half-for-UDP / half-for-control-plane split to mean anything. The full
+	// coupling, and the operator notices around it, are
+	// TestServerFileLimitDeploymentUX.
+	if got := proxy.UDPFlowBudgetFor(serverFileLimit, 0); got != 65536 || serverFileLimit/2 < proxy.MaxUDPFlows {
+		t.Errorf("serverFileLimit %d yields darwin-net UDP flow budget %d, want 65536 above the %d floor", serverFileLimit, got, proxy.MaxUDPFlows)
+	}
 	s := string(x)
 	for _, needle := range []string{
 		"<key>SoftResourceLimits</key>",
 		"<key>HardResourceLimits</key>",
 		"<key>NumberOfFiles</key>",
-		"<integer>131072</integer>",
+		fmt.Sprintf("<integer>%d</integer>", serverFileLimit),
 	} {
 		mustContain(t, s, needle)
 	}
