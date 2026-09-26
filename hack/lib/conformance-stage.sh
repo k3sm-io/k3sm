@@ -7,11 +7,14 @@
 # signs them into $K3SM_CONFORMANCE_BIN on the gate host, and the pod spec bakes
 # that ABSOLUTE path in. Two consequences, one function each:
 #
-#   conformance_bin_preflight <dir>
+#   conformance_bin_preflight <dir> [<override-var>]
 #       The dir must be writable by the user running the gate, or TestMain cannot
 #       rebuild into it. A previous root-run gate (hack/acceptance/m2.sh runs under
 #       sudo) leaves a root-owned dir behind; say so loudly, with the remedy,
-#       instead of failing later inside `go test`.
+#       instead of failing later inside `go test`. The check is dir-generic: a
+#       caller guarding some OTHER fixed work dir passes the env var that
+#       overrides it (hack/sit/run.sh: SIT_PSA_WORKDIR), and the remedy names
+#       that var instead of K3SM_CONFORMANCE_BIN.
 #
 #   conformance_stage_worker <dir> <helper-name>...
 #       A pod pinned to ANOTHER Mac execs the same absolute path THERE. With
@@ -41,11 +44,12 @@ conformance_helper_names() {
 	done
 }
 
-# conformance_bin_preflight <dir> returns 0 silently when <dir> is absent or
-# writable and owned by the current user; else prints why and the remedy to stderr
-# and returns 1.
+# conformance_bin_preflight <dir> [<override-var>] returns 0 silently when <dir>
+# is absent or writable and owned by the current user; else prints why and the
+# remedy to stderr and returns 1. <override-var>, when given, is the env var that
+# relocates <dir>; the remedy names it (default: the helper dir's own var).
 conformance_bin_preflight() {
-	local dir="$1" owner me
+	local dir="$1" var="${2:-}" owner me w
 	[ -e "$dir" ] || return 0
 	owner="$(stat -f %u "$dir" 2>/dev/null || echo unknown)"
 	me="$(id -u)"
@@ -54,9 +58,21 @@ conformance_bin_preflight() {
 	if [ -w "$dir" ] && [ "$owner" = "$me" ]; then
 		return 0
 	fi
+	w="$([ -w "$dir" ] && echo yes || echo no)"
+	if [ -n "$var" ]; then
+		cat >&2 <<MSG
+!!! work dir is not usable by this user: $dir
+!!!   owner uid: $owner   current uid: $me   writable: $w
+!!!   why: a previous run as root (sudo) most likely created it, so this run
+!!!        cannot reset or write its state and logs as this user.
+!!!   remedy: sudo rm -rf $dir
+!!!       or: export $var=<a writable absolute path>
+MSG
+		return 1
+	fi
 	cat >&2 <<MSG
 !!! conformance helper dir is not usable by this user: $dir
-!!!   owner uid: $owner   current uid: $me   writable: $([ -w "$dir" ] && echo yes || echo no)
+!!!   owner uid: $owner   current uid: $me   writable: $w
 !!!   why: a previous gate run as root (sudo) most likely created it, so the e2e
 !!!        suite's TestMain cannot rebuild the helpers into it as this user.
 !!!   remedy: sudo rm -rf $dir
