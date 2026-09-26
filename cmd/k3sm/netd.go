@@ -303,6 +303,16 @@ func (e kubeconfigUnusableError) Unwrap() error { return e.err }
 // still names the previous role's credential, and only an install rewrites it.
 const authorizerRoleRemedy = "if this Mac changed role, netd still holds the previous role's credential: run `sudo k3sm uninstall`, then `sudo k3sm install` for the role this Mac should have"
 
+// missingKubeconfigWarnAfter is how many CONSECUTIVE failed attempts may find
+// the kubeconfig absent before that absence is logged at WARN. netd is started
+// before the server writes the kubeconfig, so a missing file is the normal
+// state for the first seconds of every server boot and must not WARN then. At
+// the authorizer's 2s retry cadence, 30 attempts is about a minute (longer in
+// practice, since an attempt can itself take time), well past any boot window
+// and short enough that a file that is never coming is reported the same
+// minute.
+const missingKubeconfigWarnAfter = 30
+
 // authorizerFailureLog decides the level of each failed authorizer attempt.
 //
 // Most failures are the boot race (netd starts before the server writes its
@@ -310,11 +320,16 @@ const authorizerRoleRemedy = "if this Mac changed role, netd still holds the pre
 // transient and would otherwise be invisible for the daemon's whole life,
 // leaving every privileged bind denied: a kubeconfig that cannot be loaded, and
 // a credential the apiserver rejects. Those are logged at WARN with the reason
-// and a remedy, once per distinct error, and at Debug when the same error comes
-// back on the next retry. It is owned by the single retry loop, so it needs no
-// lock.
+// and a remedy on first sighting, once per distinct error, and at Debug when
+// the same error comes back on the next retry. A kubeconfig that does not exist
+// is the one member of the first class that is also the boot race, so it stays
+// at Debug until it has been missing for missingKubeconfigWarnAfter consecutive
+// attempts. It is owned by the single retry loop, so it needs no lock.
 type authorizerFailureLog struct {
 	lastWarned string
+	// missingStreak counts consecutive attempts that found the kubeconfig
+	// absent; any other outcome resets it.
+	missingStreak int
 }
 
 // note logs one failed attempt. It logs the kubeconfig PATH only: a parse
@@ -323,6 +338,14 @@ type authorizerFailureLog struct {
 // WARN for a rejected credential carries only the apiserver's status reason.
 func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err error) {
 	reason, warn := authorizerFailureReason(err)
+	if kubeconfigMissing(err) {
+		l.missingStreak++
+		if l.missingStreak < missingKubeconfigWarnAfter {
+			warn = false
+		}
+	} else {
+		l.missingStreak = 0
+	}
 	if !warn {
 		logger.Debug("Service authorizer not ready; <1024 binds denied until the server's kubeconfig + apiserver are up",
 			"kubeconfig", kubeconfig, "err", err)
@@ -352,10 +375,17 @@ func authorizerFailureReason(err error) (reason string, warn bool) {
 	case !errors.As(err, &unusable):
 		return "", false
 	case unusable.missing:
-		return "the kubeconfig netd was handed does not exist (expected for a few seconds while a server first boots, a fault if it persists)", true
+		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", true
 	default:
 		return "the kubeconfig netd was handed cannot be read or is not a valid kubeconfig", true
 	}
+}
+
+// kubeconfigMissing reports whether err is the existence check finding no
+// kubeconfig at all.
+func kubeconfigMissing(err error) bool {
+	var unusable kubeconfigUnusableError
+	return errors.As(err, &unusable) && unusable.missing
 }
 
 // serviceInformerSyncTimeout bounds one attempt's wait for the initial Services

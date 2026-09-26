@@ -122,10 +122,26 @@ func TestNetdAuthorizerFailureReasonAtWarn(t *testing.T) {
 			forbid:    []string{"yaml:", "error loading config file"},
 		},
 		{
-			name:      "a missing kubeconfig warns",
-			errs:      []error{missingErr},
+			name:      "a 401 warns on its first sighting",
+			errs:      []error{unauthorized},
 			wantWarns: 1,
-			want:      []string{"does not exist"},
+		},
+		{
+			name:      "a kubeconfig missing for fewer attempts than the threshold is the boot race: Debug only",
+			errs:      repeatErr(missingErr, missingKubeconfigWarnAfter-1),
+			wantDebug: missingKubeconfigWarnAfter - 1,
+		},
+		{
+			name:      "a kubeconfig missing for the threshold warns exactly once, path only",
+			errs:      repeatErr(missingErr, missingKubeconfigWarnAfter+5),
+			wantWarns: 1,
+			wantDebug: missingKubeconfigWarnAfter + 4,
+			want:      []string{kubeconfig, "does not exist", "sudo k3sm uninstall"},
+		},
+		{
+			name:      "a missing streak broken by another failure starts over",
+			errs:      append(append(repeatErr(missingErr, missingKubeconfigWarnAfter-1), dial), repeatErr(missingErr, missingKubeconfigWarnAfter-1)...),
+			wantDebug: 2*(missingKubeconfigWarnAfter-1) + 1,
 		},
 		{
 			name:      "a dial error is the boot race: Debug only",
@@ -167,4 +183,13 @@ func TestNetdAuthorizerFailureReasonAtWarn(t *testing.T) {
 			}
 		})
 	}
+}
+
+// repeatErr returns n copies of err, one per consecutive failed attempt.
+func repeatErr(err error, n int) []error {
+	out := make([]error, n)
+	for i := range out {
+		out[i] = err
+	}
+	return out
 }
