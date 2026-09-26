@@ -21,9 +21,11 @@
 #       never a per-invocation temp dir, which the worker could not match.
 #
 #   conformance_helper_names <repo_root>
-#       The helper names. The directory e2e/testdata/cmd IS the list TestMain
-#       builds (conformanceHelpers in e2e/main_test.go names one subdirectory
-#       each), so it is read from there, never hand-copied.
+#       The helper names, read from the subdirectories of e2e/testdata/cmd.
+#       TestMain keeps its own literal list (conformanceHelpers in
+#       e2e/main_test.go), one entry per subdirectory; the two are kept in step
+#       by convention, and a name built by one but not the other fails loud
+#       here ("helper not built") rather than silently.
 #
 # Resolution seams (the gates inject recording fakes through these, not PATH):
 #   K3SM_SSH_BIN   ssh client (default: ssh)
