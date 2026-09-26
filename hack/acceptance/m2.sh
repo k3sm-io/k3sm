@@ -66,6 +66,22 @@ cleanup() {
 	ifconfig lo0 -alias 10.43.0.10 >/dev/null 2>&1 || true
 	rm -f "$BIN" "$EXECSHIM" "$PATHSHIM" "$DNSSHIM" "$VMHOST" >/dev/null 2>&1 || true
 	rm -rf "$PAYLOAD_DIR" >/dev/null 2>&1 || true
+	restore_conformance_bin
+}
+
+# restore_conformance_bin hands the conformance helper dir this ROOT run created back
+# to the invoking user (or removes it when there is none), so a later gate run as that
+# user (hack/lab/m3.sh) can rebuild into the same fixed path instead of hitting a
+# root-owned dir. It acts only on a dir this run created (CONFBIN_CREATED=1).
+CONFBIN_CREATED=0
+restore_conformance_bin() {
+	[ "$CONFBIN_CREATED" = 1 ] || return 0
+	[ -n "${K3SM_CONFORMANCE_BIN:-}" ] && [ -d "$K3SM_CONFORMANCE_BIN" ] || return 0
+	if [ -n "${SUDO_UID:-}" ]; then
+		chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$K3SM_CONFORMANCE_BIN" >/dev/null 2>&1 || true
+	else
+		rm -rf "$K3SM_CONFORMANCE_BIN" >/dev/null 2>&1 || true
+	fi
 }
 trap cleanup EXIT
 
@@ -286,6 +302,7 @@ export K3SM_CONFORMANCE_BIN="/tmp/k3sm-conformance-bin"
 # the criteria that use it). Recreated world-readable for the _k3sm pods' exec.
 rm -rf "$K3SM_CONFORMANCE_BIN"
 mkdir -p "$K3SM_CONFORMANCE_BIN"; chmod 755 "$K3SM_CONFORMANCE_BIN"
+CONFBIN_CREATED=1
 M2_CRITERIA=(
 	M2_ConfigMapMount M2_SecretMount M2_EmptyDir M2_DownwardAPIEnv M2_EnvFrom
 	M2_Probes M2_FsGroup M2_GracefulStop M2_ResourceLimitsOOMKilled M2_KubectlTop
