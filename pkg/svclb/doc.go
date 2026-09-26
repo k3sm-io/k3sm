@@ -51,4 +51,19 @@ limitations under the License.
 // status. Services carrying IgnoreLabel (the canonical kube-system/
 // k3sm-ingress, whose listeners the in-process ingress Server owns) are
 // skipped entirely.
+//
+// # Source ranges
+//
+// spec.loadBalancerSourceRanges (else the legacy annotation, else allow-all) is
+// enforced the k3s/klipper-lb way: on LoadBalancer traffic only, never on
+// nodePorts, as an accept-time close of a denied peer BEFORE the backend dial.
+// SourceRanges is the one home of the rule; the ingress host applies the same
+// rule to the canonical Service it owns. A set that does not parse fails closed
+// on first provisioning (no listener, status stays pending, a
+// SourceRangesInvalid Warning Event); on an edit the last valid set stays in
+// force and the listeners keep serving.
+//
+// The Events are written with the server process's client. The node-datapath
+// ClusterRole grants no events verb, which matters only if svclb or the
+// ingress host ever run under a node identity (the multi-node follow-up).
 package svclb

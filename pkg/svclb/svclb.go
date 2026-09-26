@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/darwin-net/pkg/netbind"
 )
@@ -96,9 +98,16 @@ type Config struct {
 	// kube-system/k3sm-ingress Service declares, which is the ingress host's
 	// listener, never a tenant LoadBalancer Service's.
 	Binder netbind.Binder
+	// Recorder records Warning Events on Services (EventReasonSourceRangesInvalid).
+	// Nil means Run builds its own on Client (NewEventRecorder); injectable for
+	// tests.
+	Recorder record.EventRecorder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
 }
+
+// dialFunc is the backend-dial seam a forwarder splices through.
+type dialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 // errReservedPort is the sentinel bind returns for a port k3sm's own wildcard
 // listeners own. It is distinguished from an ordinary bind failure so the
@@ -125,6 +134,20 @@ type Controller struct {
 	// declining a Service never becomes a per-reconcile status rewrite that would
 	// fight the implementation that DOES own it. Same single-goroutine ownership.
 	disclaimed map[string]bool
+	// lastRanges is each bound Service's last VALID source-range set, keyed
+	// "ns/name". An edit whose ranges do not parse keeps enforcing this set (the
+	// upstream controller keeps the LB serving while it retries). rangesErr is the
+	// last invalid-ranges message recorded as an Event per Service, so a
+	// persistent error is recorded once, not on every resync. Same
+	// single-goroutine ownership as forwarders.
+	lastRanges map[string]Ranges
+	rangesErr  map[string]string
+	// recorder records Warning Events on Services; set by New from the config or
+	// by Run before the reconcile loop starts.
+	recorder record.EventRecorder
+	// dial is the backend-dial seam handed to every forwarder; nil means a plain
+	// net.Dialer (tests inject a recording fake).
+	dial dialFunc
 	// now is the clock seam for the throttle (tests).
 	now func() time.Time
 }
@@ -164,6 +187,9 @@ func New(cfg Config) (*Controller, error) {
 		forwarders: make(map[string]map[int32]*forwarder),
 		lastWarn:   make(map[string]time.Time),
 		disclaimed: make(map[string]bool),
+		lastRanges: make(map[string]Ranges),
+		rangesErr:  make(map[string]string),
+		recorder:   cfg.Recorder,
 		now:        time.Now,
 	}, nil
 }
@@ -178,6 +204,11 @@ func (c *Controller) Run(ctx context.Context) error {
 	// way to connect it to the EXTERNAL-IP kubectl shows.
 	c.log.Info("svclb: loadbalancer controller starting",
 		"bind", c.cfg.BindAddr.String(), "advertise", c.advertiseString())
+	if c.recorder == nil {
+		rec, stop := NewEventRecorder(c.cfg.Client, "k3sm-svclb")
+		defer stop()
+		c.recorder = rec
+	}
 	factory := informers.NewSharedInformerFactory(c.cfg.Client, 30*time.Second)
 	inf := factory.Core().V1().Services().Informer()
 	trigger := make(chan struct{}, 1)
@@ -294,6 +325,16 @@ func (c *Controller) reconcile(ctx context.Context, svcs []*corev1.Service) {
 			delete(c.forwarders, key)
 		}
 	}
+	for key := range c.lastRanges {
+		if len(c.forwarders[key]) == 0 {
+			delete(c.lastRanges, key)
+		}
+	}
+	for key := range c.rangesErr {
+		if desired[key] == nil {
+			delete(c.rangesErr, key)
+		}
+	}
 
 	for key, svc := range desired {
 		c.reconcileService(ctx, key, svc)
@@ -312,6 +353,23 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 		c.clearStatus(ctx, svc)
 		return
 	}
+	// Source ranges are resolved on EVERY reconcile and pushed into every bound
+	// forwarder, so a live edit applies to the next accept without reopening a
+	// listener. A set that does not parse FAILS CLOSED on first provisioning (no
+	// listener, status stays <pending>); on an edit to an already-bound Service
+	// the last valid set stays in force and the listeners keep serving.
+	ranges, rerr := SourceRanges(svc)
+	if rerr != nil {
+		c.recordRangesInvalid(svc, key, rerr)
+		if len(c.forwarders[key]) == 0 {
+			c.clearStatus(ctx, svc)
+			return
+		}
+		ranges = c.lastRanges[key]
+	} else {
+		delete(c.rangesErr, key)
+		c.lastRanges[key] = ranges
+	}
 	tcpPorts, bound := 0, 0
 	for _, p := range svc.Spec.Ports {
 		if !isTCP(p) {
@@ -323,11 +381,12 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 			continue
 		}
 		tcpPorts++
-		if c.forwarders[key][p.Port] != nil {
+		if f := c.forwarders[key][p.Port]; f != nil {
+			f.setRanges(ranges)
 			bound++
 			continue
 		}
-		f, err := c.bind(ctx, p.Port, netip.AddrPortFrom(vip, uint16(p.Port)))
+		f, err := c.bind(ctx, p.Port, netip.AddrPortFrom(vip, uint16(p.Port)), ranges)
 		if err != nil {
 			if errors.Is(err, errReservedPort) {
 				c.throttledWarn(fmt.Sprintf("%s\x00reserved:%d", key, p.Port),
@@ -374,7 +433,7 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 // NodePort-range or kubelet-API listener for the same wildcard socket would let
 // the winner be decided by start order, and losing :10250 kills logs/exec/
 // `kubectl top` on this node.
-func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort) (*forwarder, error) {
+func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort, ranges Ranges) (*forwarder, error) {
 	if c.cfg.ReservedPorts[port] {
 		return nil, fmt.Errorf("svclb: refusing port %d: %w", port, errReservedPort)
 	}
@@ -383,9 +442,32 @@ func (c *Controller) bind(ctx context.Context, port int32, dst netip.AddrPort) (
 		return nil, err
 	}
 	fctx, cancel := context.WithCancel(ctx)
-	f := &forwarder{ln: ln, dst: dst, cancel: cancel, done: make(chan struct{}), log: c.log}
+	f := &forwarder{ln: ln, dst: dst, cancel: cancel, done: make(chan struct{}), log: c.log, dial: c.dial}
+	f.setRanges(ranges)
 	go f.run(fctx)
 	return f, nil
+}
+
+// recordRangesInvalid reports a source-range parse failure: a throttled Warn
+// every time, and a Warning Event on the Service once per distinct error.
+func (c *Controller) recordRangesInvalid(svc *corev1.Service, key string, err error) {
+	bound := len(c.forwarders[key]) > 0
+	action := "no listener opened; status stays pending"
+	if bound {
+		action = "listeners keep serving with the last valid source ranges"
+	}
+	c.throttledWarn(key+"\x00ranges", "svclb: loadbalancer source ranges invalid; "+action,
+		"service", key, "err", err)
+	c.log.Debug("svclb: invalid source ranges, raw values", append([]any{"service", key}, SourceRangesLogArgs(svc)...)...)
+	msg := err.Error()
+	if c.rangesErr[key] == msg {
+		return
+	}
+	c.rangesErr[key] = msg
+	if c.recorder != nil {
+		c.recorder.Eventf(svc, corev1.EventTypeWarning, EventReasonSourceRangesInvalid,
+			"loadBalancerSourceRanges invalid (%s): %v", action, err)
+	}
 }
 
 // closeAll drains every forwarder (shutdown).
@@ -594,6 +676,25 @@ type forwarder struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	log    *slog.Logger
+	// dial is the backend-dial seam; nil means a plain net.Dialer.
+	dial dialFunc
+	// ranges is the client source-range set enforced at accept. It is WRITTEN by
+	// the controller's reconcile goroutine (bind, then every reconcile) and READ
+	// by this forwarder's accept goroutine, so it is an atomic pointer: an edit
+	// swaps the whole set and the next accept sees it, with no lock on the
+	// accept path. A nil pointer or empty set allows every peer.
+	ranges atomic.Pointer[Ranges]
+}
+
+// setRanges installs r as the enforced source-range set.
+func (f *forwarder) setRanges(r Ranges) {
+	f.ranges.Store(&r)
+}
+
+// allows applies the current source-range set to conn's peer.
+func (f *forwarder) allows(conn net.Conn) bool {
+	r := f.ranges.Load()
+	return r == nil || r.AllowsConn(conn)
 }
 
 // stop cancels the forwarder and waits for its accept loop to drain.
@@ -618,6 +719,16 @@ func (f *forwarder) run(ctx context.Context) {
 			}
 			return
 		}
+		// Source ranges are checked BEFORE splice, because splice dials the
+		// backend first: a denied peer is closed and the backend never sees a
+		// connection. This is an accept-time close, not a firewall; the
+		// handshake has already completed.
+		if !f.allows(conn) {
+			f.log.Debug("svclb: connection denied by loadBalancerSourceRanges",
+				"addr", f.ln.Addr().String(), "peer", conn.RemoteAddr().String())
+			_ = conn.Close()
+			continue
+		}
 		go f.splice(ctx, conn)
 	}
 }
@@ -626,8 +737,12 @@ func (f *forwarder) run(ctx context.Context) {
 // half-close propagation, torn down when either side finishes or ctx cancels.
 func (f *forwarder) splice(ctx context.Context, src net.Conn) {
 	defer src.Close()
-	var d net.Dialer
-	dst, err := d.DialContext(ctx, "tcp", f.dst.String())
+	dial := f.dial
+	if dial == nil {
+		var d net.Dialer
+		dial = d.DialContext
+	}
+	dst, err := dial(ctx, "tcp", f.dst.String())
 	if err != nil {
 		f.log.Warn("svclb: dial service VIP failed", "vip", f.dst.String(), "err", err)
 		return

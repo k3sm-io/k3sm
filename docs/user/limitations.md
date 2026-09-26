@@ -277,13 +277,22 @@ Today at `main`, per port class:
   (~155 s) and then logs `ingress bind retries exhausted`, leaving Ingress disabled until the daemon
   restarts.
 
-`spec.loadBalancerSourceRanges` is **accepted and silently ignored** today, so setting it does not
-restrict anything. It is planned. When it lands it is an authorization check at the accept
-path, not a firewall: the TCP handshake still completes (so the port answers a scan and a denial
-arrives as a connection reset, not a timeout), it matches the immediate peer address so a relay or
-NAT presents the relay's address, it applies to TCP only, and an empty range set means allow-all.
-Like NetworkPolicy below, it is a hint rather than tenant isolation, because every pod runs under one
-`_k3sm` uid on a shared `lo0`, so an on-node pod can dial the backend directly and bypass it.
+`spec.loadBalancerSourceRanges` is enforced on LoadBalancer traffic only, the k3s behaviour. The
+field wins; when it is empty the legacy `service.beta.kubernetes.io/load-balancer-source-ranges`
+annotation applies; when both are empty every client is allowed. It covers the LoadBalancer
+listeners and the ingress listeners (through the ranges on `kube-system/k3sm-ingress`). A Service's
+nodePort stays unrestricted, as it does under kube-proxy and klipper-lb. Entries are trimmed of
+spaces, and one entry that does not parse fails the whole set. On a new Service that means no
+listener is opened, it stays `<pending>`, and a `SourceRangesInvalid` Warning Event is recorded on
+it. On an edit to a Service that is already serving, the last valid ranges stay in force and the
+same Event is recorded. Deleting `kube-system/k3sm-ingress` recreates it with the default spec,
+which lifts its ranges; the last ranges stay in force until the recreated Service arrives, and a
+`SourceRangesReset` Warning Event on it says they must be set again. The check is an authorization at the accept path, not a firewall: the TCP
+handshake still completes (so the port answers a scan and a denial arrives as a closed connection,
+not a timeout), it matches the immediate peer address so a relay or NAT presents the relay's
+address, it applies to TCP only, and loopback is not exempt. Like NetworkPolicy below, it is a hint
+rather than tenant isolation, because every pod runs under one `_k3sm` uid on a shared `lo0`, so an
+on-node pod can dial the backend directly and bypass it.
 
 `spec.loadBalancerClass` is honoured. k3sm claims a `type: LoadBalancer` Service only when the field
 is unset (the API's "default implementation" case) and ignores a Service that names another class
@@ -296,8 +305,9 @@ class, which is also upstream behaviour.
 
 The LB/Ingress datapath has two further consequences. The userspace splice **discards the client
 address** when it dials the backend, so a NetworkPolicy denying a pod does **not** filter traffic
-that arrives via that pod's LoadBalancer or Ingress; planned work restores this by carrying the
-source address into the policy verdict. And a failed listener bind is not visible to `kubectl`. The
+that arrives via that pod's LoadBalancer or Ingress. That client-address gap is a separate tracked
+item. Upstream behaves similarly for `externalTrafficPolicy: Cluster`, which SNATs the client, so
+only `Local` would preserve the address. And a failed listener bind is not visible to `kubectl`. The
 Service simply stays `<pending>` and the reason is only in the daemon log, because the provider has
 no `EventRecorder` yet; wiring one is planned.
 
