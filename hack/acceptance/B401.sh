@@ -150,7 +150,8 @@ for spec in 'server_up|^[[:space:]]*cluster_reset( |$)' \
 	elif ! { [ "$mk_ln" -gt "$reset_ln" ] && [ "$mk_ln" -lt "$launch_ln" ]; }; then
 		b=no; echo "  $fn: mkdir (line $mk_ln) not between reset (line $reset_ln) and launch (line $launch_ln)"
 	fi
-	ladder "$b" "b401.$n  $fn: mkdir -p of the log dir after the reset (body line ${reset_ln:-?}) and before the launch (${launch_ln:-?}), at ${mk_ln:-<none>}"
+	anchor="the reset"; [ "$fn" = agent_up ] && anchor="the pod-root assignment (agent_up has no reset of its own)"
+	ladder "$b" "b401.$n  $fn: mkdir -p of the log dir after $anchor (body line ${reset_ln:-?}) and before the launch (${launch_ln:-?}), at ${mk_ln:-<none>}"
 	n=$((n+1))
 done
 
