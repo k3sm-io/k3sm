@@ -47,6 +47,8 @@ conformance_bin_preflight() {
 	[ -e "$dir" ] || return 0
 	owner="$(stat -f %u "$dir" 2>/dev/null || echo unknown)"
 	me="$(id -u)"
+	# Root can always rebuild into the dir; the owner check only guards unprivileged runs.
+	[ "$me" -eq 0 ] && return 0
 	if [ -w "$dir" ] && [ "$owner" = "$me" ]; then
 		return 0
 	fi

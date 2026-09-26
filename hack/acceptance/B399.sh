@@ -76,7 +76,9 @@ ladder "$b1" "b399.1  preflight on a writable self-owned dir returns 0 silently 
 # ---- b399.2 — preflight: non-writable dir is refused with the remedy --------
 # chmod 555, still owned by this user: this proves the not-writable branch. The lab
 # case (a dir left root-owned by a sudo gate run) takes the same branch, via the
-# owner-uid check as well as the writability check.
+# owner-uid check as well as the writability check. A root run (uid 0) is exempt by
+# construction (root can always rebuild into the dir), so it cannot be proven here
+# without privilege and is not asserted.
 b2=ok
 RODIR="$WORKDIR/readonly"
 mkdir -p "$RODIR"; chmod 555 "$RODIR"
