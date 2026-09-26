@@ -793,7 +793,7 @@ func warnLegacyMeshKeys(own ownership, root string) {
 		if err != nil || !fi.Mode().IsRegular() {
 			continue
 		}
-		slog.Warn("netd: a mesh key is still in the legacy run-dir location, where the service user can unlink it; run `sudo k3sm install` to move it into the root-owned key dir (netd does not move it)",
+		slog.Warn("netd: a mesh key file is still in the legacy run-dir location, where the service user can unlink it; run `sudo k3sm install` to move it into the root-owned key dir (netd does not move it)",
 			"path", path, "keyDir", install.MeshKeyDir)
 	}
 }

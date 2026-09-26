@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1118,6 +1119,16 @@ func (d *heldDir) RemoveEntry(name string) error {
 		return fmt.Errorf("remove %s in %s: %w", name, d.path, err)
 	}
 	return nil
+}
+
+// ListEntries lists the held directory through its descriptor, names only.
+func (d *heldDir) ListEntries() ([]string, error) {
+	names, err := readDirNames(d.fd, d.path)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", d.path, err)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // Close releases the held descriptor.

@@ -496,6 +496,9 @@ type DirHandle interface {
 	ReadEntry(name string) ([]byte, error)
 	// RemoveEntry unlinks the file name. Absent is success.
 	RemoveEntry(name string) error
+	// ListEntries returns the names of the entries in the held directory,
+	// sorted. Names only: nothing is opened or followed.
+	ListEntries() ([]string, error)
 	// Close releases the descriptor.
 	Close() error
 }
@@ -2062,6 +2065,10 @@ func migrateLegacyMeshKeys(sys System, logger *slog.Logger) error {
 	}
 	defer func() { _ = legacyDir.Close() }()
 
+	// acted records whether this run moved or dropped a known leaf. A run that
+	// finds nothing k3sm knows in the legacy dir (the keys were moved by an
+	// earlier run) says nothing above Debug, whatever else the dir holds.
+	acted := false
 	for _, leaf := range legacyKeyLeaves() {
 		legacy := filepath.Join(LegacyMeshKeyDir, leaf)
 		dest := filepath.Join(MeshKeyDir, leaf)
@@ -2072,11 +2079,18 @@ func migrateLegacyMeshKeys(sys System, logger *slog.Logger) error {
 		case err != nil:
 			return fmt.Errorf("install: read the legacy %s: %w (refusing to move it; remove it by hand if it is not this node's, then re-run `sudo k3sm install`)", legacy, err)
 		}
-		_, err = sys.ReadRegularFile(dest)
+		cur, err := sys.ReadRegularFile(dest)
 		switch {
+		case err == nil && bytes.Equal(cur, old):
+			// Already moved, and the legacy copy is the same bytes: only the
+			// leftover goes.
+			logger.Info("dropping a legacy mesh key file the root-owned key dir already holds, byte for byte", "legacy", legacy, "path", dest)
 		case err == nil:
-			// The new tree already has this leaf: it is the node's identity, and
-			// the legacy one is stale. Nothing is copied.
+			// Both places hold this leaf and they DIFFER. The root-owned copy is
+			// never silently overwritten, and the legacy one is never silently
+			// deleted: which identity this node keeps is the operator's call.
+			return fmt.Errorf("install: %s and %s both exist and differ; the root-owned %s is what this node uses now: delete %s by hand if it is stale (or copy it over %s if it is the identity the node's peers know), then re-run `sudo k3sm install`",
+				legacy, dest, dest, legacy, dest)
 		case errors.Is(err, fs.ErrNotExist):
 			if err := validateLegacyLeaf(leaf, old); err != nil {
 				return fmt.Errorf("install: the legacy %s %w (it was not moved; remove it only if you accept that this node's mesh identity changes)", legacy, err)
@@ -2099,9 +2113,27 @@ func migrateLegacyMeshKeys(sys System, logger *slog.Logger) error {
 		if err := legacyDir.RemoveEntry(leaf); err != nil {
 			return fmt.Errorf("install: remove the legacy %s: %w", legacy, err)
 		}
+		acted = true
+	}
+	// The directory goes only when it is empty. Anything left in it is not a
+	// file k3sm wrote (the known leaves are gone by now): it is reported by
+	// name and kept, never deleted and never a reason to fail the install. k3s
+	// does not fail on unknown files in its data dir either.
+	leftovers, err := legacyDir.ListEntries()
+	if err != nil {
+		return fmt.Errorf("install: list the legacy mesh key dir %s: %w", LegacyMeshKeyDir, err)
+	}
+	if len(leftovers) > 0 {
+		level := slog.LevelDebug
+		if acted {
+			level = slog.LevelWarn
+		}
+		logger.Log(context.Background(), level, "the mesh keys were moved out of the legacy key dir, but it still holds files k3sm does not know; they are kept, and may be deleted by hand",
+			"dir", LegacyMeshKeyDir, "entries", strings.Join(leftovers, ","))
+		return nil
 	}
 	if err := sys.RemoveEntry(parent, filepath.Base(LegacyMeshKeyDir)); err != nil {
-		return fmt.Errorf("install: remove the legacy mesh key dir %s: %w (it may hold a file this install does not know; remove it by hand)", LegacyMeshKeyDir, err)
+		return fmt.Errorf("install: remove the empty legacy mesh key dir %s: %w", LegacyMeshKeyDir, err)
 	}
 	return nil
 }

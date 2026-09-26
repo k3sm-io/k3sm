@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -204,26 +205,27 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		}
 	})
 
-	t.Run("d: an existing new key wins; a stale legacy leaf is removed and nothing copied", func(t *testing.T) {
+	t.Run("d: an existing new key wins; an identical legacy leaf is removed and nothing copied", func(t *testing.T) {
+		// A legacy copy that DIFFERS from the new one is refused instead: d2.
 		shrinkRestartBudgets(t)
-		current, stale := mintKey(t), mintKey(t)
+		current := mintKey(t)
 		f := &fakeSystem{}
 		seedLegacyKeyTree(f)
 		f.putFile(serverWork, []byte(current))
 		f.putFile(serverHelper, []byte(current))
-		f.putFile(legacyServer, []byte(stale))
+		f.putFile(legacyServer, []byte(current))
 		if err := Install(context.Background(), f, serverCfg()); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
 		if got := string(f.files[serverHelper]); got != current {
-			t.Errorf("the new key was overwritten by the stale legacy copy: %q", got)
+			t.Errorf("the new key was overwritten by the legacy copy: %q", got)
 		}
 		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"); len(calls) != 0 {
 			t.Errorf("nothing should have been copied: %v", calls)
 		}
 		wantCall(t, f, "RemoveEntry:h1:"+MeshKeyRefServer)
 		if _, ok := f.files[legacyServer]; ok {
-			t.Error("the stale legacy key is still there")
+			t.Error("the identical legacy key is still there")
 		}
 	})
 
@@ -458,6 +460,98 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 			if strings.Contains(fn, literal) {
 				t.Errorf("ensureServiceOwnedDir restates the run dir's ownership (%q) instead of reading the table:\n%s", literal, fn)
 			}
+		}
+	})
+
+	t.Run("l: an unknown file in the legacy dir is warned about, kept, and never fails the install", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		server, node := mintKey(t), mintKey(t)
+		unknown := filepath.Join(LegacyMeshKeyDir, "node-pod-cidr.sep24-stale")
+		f := &fakeSystem{}
+		seedLegacyKeyTree(f)
+		f.putFile(serverWork, []byte(server))
+		f.putFile(legacyServer, []byte(server))
+		f.putFile(filepath.Join(LegacyMeshKeyDir, MeshKeyRefAgent), []byte(node))
+		f.putFile(legacyIdentity, []byte("10.42.3.0/24\n"))
+		f.putFile(unknown, []byte("10.42.9.0/24\n"))
+		var logs bytes.Buffer
+		cfg := serverCfg()
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install failed over an unknown file in the legacy dir: %v", err)
+		}
+		for leaf, want := range map[string]string{MeshKeyRefServer: server, MeshKeyRefAgent: node, netdsvc.NodeIdentityFileName: "10.42.3.0/24\n"} {
+			if got := string(f.files[filepath.Join(MeshKeyDir, leaf)]); got != want {
+				t.Errorf("%s was not moved: %q", leaf, got)
+			}
+			if _, ok := f.files[filepath.Join(LegacyMeshKeyDir, leaf)]; ok {
+				t.Errorf("the legacy %s is still there", leaf)
+			}
+		}
+		if _, ok := f.files[unknown]; !ok {
+			t.Error("the unknown file was removed; it is not k3sm's to delete")
+		}
+		var warned bool
+		for _, line := range strings.Split(logs.String(), "\n") {
+			if strings.Contains(line, "level=WARN") && strings.Contains(line, "node-pod-cidr.sep24-stale") && strings.Contains(line, LegacyMeshKeyDir) {
+				warned = true
+			}
+		}
+		if !warned {
+			t.Errorf("no WARN names the unknown file and the legacy dir:\n%s", logs.String())
+		}
+	})
+
+	t.Run("m: a run with the keys already moved and only an unknown file left is silent and succeeds", func(t *testing.T) {
+		// The state (l) leaves behind, and the lab's second run: every known
+		// leaf is at MeshKeyDir, the legacy dir holds a hand-left file only.
+		shrinkRestartBudgets(t)
+		key := mintKey(t)
+		f := &fakeSystem{}
+		seedLegacyKeyTree(f)
+		f.putFile(serverWork, []byte(key))
+		f.putFile(serverHelper, []byte(key))
+		f.putFile(newIdentity, []byte("10.42.3.0/24\n"))
+		f.putFile(filepath.Join(LegacyMeshKeyDir, "node-pod-cidr.sep24-stale"), []byte("10.42.9.0/24\n"))
+		var logs bytes.Buffer
+		cfg := serverCfg()
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		if err := Install(context.Background(), f, cfg); err != nil {
+			t.Fatalf("Install failed with nothing left to migrate: %v", err)
+		}
+		if strings.Contains(logs.String(), LegacyMeshKeyDir) {
+			t.Errorf("a run with nothing to migrate logged about the legacy dir at INFO or above:\n%s", logs.String())
+		}
+	})
+
+	t.Run("d2: a leaf in BOTH places is dropped when identical and refused when not", func(t *testing.T) {
+		shrinkRestartBudgets(t)
+		current, other := mintKey(t), mintKey(t)
+		same := &fakeSystem{}
+		seedLegacyKeyTree(same)
+		same.putFile(serverWork, []byte(current))
+		same.putFile(serverHelper, []byte(current))
+		same.putFile(legacyServer, []byte(current))
+		if err := Install(context.Background(), same, serverCfg()); err != nil {
+			t.Fatalf("an identical legacy copy failed the install: %v", err)
+		}
+		if _, ok := same.files[legacyServer]; ok {
+			t.Error("the identical legacy copy was kept")
+		}
+		differ := &fakeSystem{}
+		seedLegacyKeyTree(differ)
+		differ.putFile(serverWork, []byte(current))
+		differ.putFile(serverHelper, []byte(current))
+		differ.putFile(legacyServer, []byte(other))
+		err := Install(context.Background(), differ, serverCfg())
+		if err == nil || !strings.Contains(err.Error(), legacyServer) || !strings.Contains(err.Error(), serverHelper) {
+			t.Fatalf("a differing legacy copy must be refused naming both paths, got %v", err)
+		}
+		if got := string(differ.files[serverHelper]); got != current {
+			t.Errorf("the root-owned copy was overwritten: %q", got)
+		}
+		if _, ok := differ.files[legacyServer]; !ok {
+			t.Error("the differing legacy copy was deleted; the operator must decide")
 		}
 	})
 
