@@ -74,6 +74,12 @@ const (
 // 0700 tree — the same (name × euid) identity the registry work-dir encodes. The
 // /private spelling is the resolved one: Seatbelt evaluates resolved paths, and
 // /var is a symlink to /private/var.
+//
+// /private/var/tmp is world-writable (sticky), so another local user can
+// pre-create the base as a symlink into a tree they control. The base and the
+// instance root are therefore created only through mkdirNoFollow, which refuses
+// a link at either: the rootless pod-shim stage lives beneath them, and the shim
+// staged there is DYLD-injected into every pod.
 const PodRootBasePrefix = "/private/var/tmp/k3sm-dev"
 
 // terminateGrace is how long Down waits for a detached server to exit after
@@ -740,7 +746,9 @@ func (m *Manager) spawnServer(ctx context.Context, name, workDir, podRoot string
 	// Pre-create the runtime root so a base the caller cannot write (a stale tree
 	// owned by the other euid) fails here, with the path named, instead of inside
 	// the detached server's first pod create.
-	if err := os.MkdirAll(podRoot, 0o700); err != nil {
+	// Component by component with a symlink refusal: the base sits under the
+	// world-writable /private/var/tmp (see mkdirNoFollow).
+	if err := mkdirNoFollow(0o700, filepath.Dir(podRoot), podRoot); err != nil {
 		return nil, fmt.Errorf("create pod-root %s: %w", podRoot, err)
 	}
 	// The instance's container-log root. The node REFUSES to start without it
@@ -1107,7 +1115,11 @@ func (m *Manager) podRoot(name string) string {
 }
 
 // podRootBaseDir returns the configured pod-root base, defaulting to the
-// euid-scoped PodRootBasePrefix.
+// euid-scoped PodRootBasePrefix. The default sits under the world-writable
+// /private/var/tmp, so any local user can pre-plant it as a symlink; every
+// creation of it goes through mkdirNoFollow, which refuses one. That check is
+// required, not defensive: the rootless shim stage lives beneath it and the
+// staged shim is DYLD-injected into every pod.
 func (m *Manager) podRootBaseDir() string {
 	if m.podRootBase != "" {
 		return m.podRootBase

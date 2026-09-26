@@ -109,6 +109,21 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 		// plant creates the attacker link given the stage dir and a victim dir.
 		plant func(t *testing.T, stage, victim string)
 	}{
+		// The base sits under the world-writable /private/var/tmp: any local user
+		// can plant it (or the instance root) as a link before `up` runs.
+		{"symlinked pod-root base", func(t *testing.T, stage, victim string) {
+			if err := os.Symlink(victim, filepath.Dir(filepath.Dir(stage))); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlinked instance runtime root", func(t *testing.T, stage, victim string) {
+			if err := os.MkdirAll(filepath.Dir(filepath.Dir(stage)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(victim, filepath.Dir(stage)); err != nil {
+				t.Fatal(err)
+			}
+		}},
 		{"symlinked stage dir", func(t *testing.T, stage, victim string) {
 			if err := os.MkdirAll(filepath.Dir(stage), 0o700); err != nil {
 				t.Fatal(err)
@@ -151,8 +166,50 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 			if string(got) != "victim" || fi.Mode().Perm() != 0o600 {
 				t.Errorf("victim %s changed: %q mode %v", victimFile, got, fi.Mode().Perm())
 			}
+			if entries, _ := os.ReadDir(victim); len(entries) != 1 {
+				t.Errorf("victim dir = %v, want only the untouched victim file", entries)
+			}
 		})
 	}
+
+	t.Run("refuses a symlink planted at the cached shim before the re-sign", func(t *testing.T) {
+		m := newTestManager(t, newFakeSystem(), 501)
+		m.podRootBase = filepath.Join(t.TempDir(), "k3sm-dev-501")
+		// Seed a cached shim with one successful build.
+		m.shimBuilder = &fakePodShimBuilder{}
+		cached, err := m.provisionPodShim(context.Background(), "dev", pathShimName)
+		if err != nil || cached == "" {
+			t.Fatalf("seed provisionPodShim = %q, %v", cached, err)
+		}
+		victim := t.TempDir()
+		victimFile := filepath.Join(victim, pathShimName)
+		if err := os.WriteFile(victimFile, []byte("victim"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The rebuild fails, and while it runs the cached shim is swapped for a
+		// link: the re-sign must not follow it.
+		inner := &fakePodShimBuilder{buildErr: errors.New("no clang")}
+		m.shimBuilder = racingShimBuilder{fakePodShimBuilder: inner, during: func() {
+			if err := os.Remove(cached); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(victimFile, cached); err != nil {
+				t.Fatal(err)
+			}
+		}}
+		shim, err := m.provisionPodShim(context.Background(), "dev", pathShimName)
+		if !errors.Is(err, ErrSymlinkStage) {
+			t.Fatalf("provisionPodShim with a link planted during the rebuild = %q, %v; want ErrSymlinkStage", shim, err)
+		}
+		if len(inner.signed) != 0 {
+			t.Errorf("signed = %v, want no re-sign through the link", inner.signed)
+		}
+		got, _ := os.ReadFile(victimFile)
+		fi, _ := os.Stat(victimFile)
+		if string(got) != "victim" || fi.Mode().Perm() != 0o600 {
+			t.Errorf("victim %s changed: %q mode %v", victimFile, got, fi.Mode().Perm())
+		}
+	})
 
 	t.Run("the execshim dev-bin cache refuses a symlink too", func(t *testing.T) {
 		m := newTestManagerWithBuilder(t, &fakeBuilder{}, 501)
@@ -170,6 +227,18 @@ func TestDevStagesShimDylibsIntoAPodReadableDir(t *testing.T) {
 			t.Errorf("victim dir gained %v", entries)
 		}
 	})
+}
+
+// racingShimBuilder runs during inside Build, before delegating, to simulate a
+// concurrent change to the stage while a (slow) rebuild is in flight.
+type racingShimBuilder struct {
+	*fakePodShimBuilder
+	during func()
+}
+
+func (r racingShimBuilder) Build(ctx context.Context, name, outDir string) error {
+	r.during()
+	return r.fakePodShimBuilder.Build(ctx, name, outDir)
 }
 
 // assertStagedCopy fails unless path is a regular file (a copy, never a link)

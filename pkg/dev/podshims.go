@@ -231,6 +231,41 @@ func (m *Manager) podShimDir(instance string) string {
 	return filepath.Join(m.podRoot(instance), podShimSubdir)
 }
 
+// podShimParents returns, outermost first, the directories above instance's
+// shim stage dir that staging may have to create: for the rootless tier the
+// euid-scoped pod-root base and the instance's runtime root; otherwise just the
+// stage dir's parent (/Library, or a test override's parent).
+func (m *Manager) podShimParents(instance string) []string {
+	if m.shimDir == "" && m.euid != 0 {
+		return []string{m.podRootBaseDir(), m.podRoot(instance)}
+	}
+	return []string{filepath.Dir(m.podShimDir(instance))}
+}
+
+// mkdirNoFollow creates each dir in order (each one's parent must already exist
+// or precede it in dirs) with perm, refusing with ErrSymlinkStage any that is a
+// symlink, both before the mkdir and after it (a link planted in between makes
+// Mkdir report it as existing). An existing real directory is kept as is.
+//
+// It exists for the rootless pod-root base, <PodRootBasePrefix>-<euid>, which
+// sits under the world-writable /private/var/tmp: any local user can pre-create
+// that name as a link. MkdirAll would follow it, and staging would then write
+// the shim that is DYLD-injected into EVERY pod into the planter's tree.
+func mkdirNoFollow(perm os.FileMode, dirs ...string) error {
+	for _, d := range dirs {
+		if err := refuseSymlink(d); err != nil {
+			return err
+		}
+		if err := os.Mkdir(d, perm); err != nil && !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("create %s: %w", d, err)
+		}
+		if err := refuseSymlink(d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // stagePodShims provisions the pod-support DYLD shims instance's posture can use
 // and returns the paths to hand the node as --path-shim / --dns-shim ("" for a
 // shim not wanted or not provisionable, with a notice). A non-nil error is a
@@ -275,10 +310,13 @@ func (m *Manager) stagePodShims(ctx context.Context, instance string, datapath b
 // the staged dylibs does).
 func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (string, error) {
 	dir := m.podShimDir(instance)
-	// Create the parent first at the runtime root's own 0700, so the rootless
-	// stage dir's MkdirAll below does not create the instance's runtime root 0755.
-	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
-		return "", fmt.Errorf("create pod shim stage parent %s: %w", filepath.Dir(dir), err)
+	// Create the parents component by component, refusing a symlink at each, and
+	// at the runtime root's own 0700 so the stage dir below does not create the
+	// instance's runtime root 0755. For the rootless tier that is the euid-scoped
+	// base under the world-writable /private/var/tmp and the instance's runtime
+	// root (see mkdirNoFollow for why a planted link there matters).
+	if err := mkdirNoFollow(0o700, m.podShimParents(instance)...); err != nil {
+		return "", err
 	}
 	if err := refuseSymlink(dir); err != nil {
 		return "", err
@@ -308,6 +346,12 @@ func (m *Manager) provisionPodShim(ctx context.Context, instance, name string) (
 	if buildErr != nil {
 		if cached {
 			fmt.Fprintf(m.out, "WARNING: %s is STALE: rebuild failed (%v); reusing the cached shim from an earlier build, which may predate the current source\n", name, buildErr)
+			// The failed build may have taken a while; re-check the target right
+			// before codesign rewrites it in place, so a link planted meanwhile is
+			// refused rather than followed.
+			if err := refuseSymlink(shim); err != nil {
+				return "", err
+			}
 			_ = m.shimBuilder.Sign(ctx, shim)
 			return m.podReadable(shim)
 		}
