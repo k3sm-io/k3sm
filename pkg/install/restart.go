@@ -232,6 +232,17 @@ func restartDaemon(ctx context.Context, sys System, label string, oneshot bool, 
 	if err := awaitUnloaded(ctx, sys, label, b); err != nil {
 		return err
 	}
+	// Enable before bootstrap, every time. launchd refuses to bootstrap a label
+	// disabled in the system domain with EIO, the same errno it returns while a
+	// booted-out label drains, so the retry below cannot tell the two apart and
+	// would spend its whole budget on a refusal that never clears. Enabling first
+	// removes that case instead of reclassifying the errno. It is a no-op on an
+	// enabled label; on a disabled one it overrides an earlier operator disable,
+	// because running k3sm install is the newer statement of intent.
+	if err := sys.LaunchctlEnable(label); err != nil {
+		return fmt.Errorf("enable %s in the system domain before bootstrapping it (to clear it by hand, run: sudo launchctl enable system/%s): %w", label, label, err)
+	}
+	logger.Info("ensured the label is enabled in the system domain before bootstrap (an earlier operator disable, if any, is overridden: k3sm install is the newer intent)", "label", label)
 	if err := bootstrapWithRetry(ctx, sys, label, b); err != nil {
 		return err
 	}
@@ -336,7 +347,7 @@ func bootstrapWithRetry(ctx context.Context, sys System, label string, b restart
 			return fmt.Errorf("bootstrap %s: %w", label, err)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("bootstrap %s: launchd kept reporting a transient system-domain state across %d attempts in %s: %w", label, attempt, b.unload, err)
+			return fmt.Errorf("bootstrap %s: launchd kept reporting a transient system-domain state across %d attempts in %s (if 'launchctl print-disabled system' lists %s, run: sudo launchctl enable system/%s): %w", label, attempt, b.unload, label, label, err)
 		}
 		select {
 		case <-ctx.Done():
@@ -425,11 +436,19 @@ func revertInstallRoot(ctx context.Context, sys System, cfg Config, m []artifact
 // nothing away from it. Errors are reported, never returned — the caller is
 // already failing, and the recovery's only job is to make the failure state
 // truthful.
+//
+// Each label is enabled before its bootstrap, for the reason restartDaemon does
+// it: a label disabled in the system domain refuses bootstrap, and the recovery
+// would otherwise report STILL DOWN for a state the code can clear itself. An
+// enable failure is noted, never fatal; the bootstrap is still attempted.
 func recoverBootedOut(sys System, labels []string) string {
-	var recovered, down []string
+	var recovered, down, notEnabled []string
 	for _, l := range labels {
 		if _, err := sys.LaunchctlServicePID(l); err == nil {
 			continue
+		}
+		if err := sys.LaunchctlEnable(l); err != nil {
+			notEnabled = append(notEnabled, l)
 		}
 		if err := sys.LaunchctlBootstrap(l); err != nil {
 			down = append(down, l)
@@ -437,16 +456,21 @@ func recoverBootedOut(sys System, labels []string) string {
 		}
 		recovered = append(recovered, l)
 	}
+	var clause string
 	switch {
 	case len(recovered) == 0 && len(down) == 0:
-		return "no daemon was left booted out"
+		clause = "no daemon was left booted out"
 	case len(down) == 0:
-		return "re-bootstrapped after the failure: " + strings.Join(recovered, ", ")
+		clause = "re-bootstrapped after the failure: " + strings.Join(recovered, ", ")
 	case len(recovered) == 0:
-		return "STILL DOWN, re-bootstrap failed: " + strings.Join(down, ", ")
+		clause = "STILL DOWN, re-bootstrap failed: " + strings.Join(down, ", ")
 	default:
-		return "re-bootstrapped " + strings.Join(recovered, ", ") + "; STILL DOWN: " + strings.Join(down, ", ")
+		clause = "re-bootstrapped " + strings.Join(recovered, ", ") + "; STILL DOWN: " + strings.Join(down, ", ")
 	}
+	for _, l := range notEnabled {
+		clause += "; could not enable " + l + " (run: sudo launchctl enable system/" + l + ")"
+	}
+	return clause
 }
 
 // verifyDaemons is the assertion the install path never used to make: after the

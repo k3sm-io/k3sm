@@ -878,6 +878,13 @@ type System interface {
 	// LaunchctlBootout unloads the labelled daemon (idempotent: a not-loaded
 	// label is a no-op success).
 	LaunchctlBootout(label string) error
+	// LaunchctlEnable clears the labelled daemon's disabled bit in the system
+	// domain (launchctl enable system/<label>). It is idempotent: enabling a
+	// label that is already enabled, or that launchd has never seen, succeeds.
+	// A disabled label refuses bootstrap with the same EIO launchd returns
+	// while a label drains, so install enables before it bootstraps rather
+	// than trying to tell the two apart from the output text.
+	LaunchctlEnable(label string) error
 	// LaunchctlKickstart (re)starts the labelled daemon (launchctl kickstart -k).
 	// It returns as soon as the restart is requested — not when the old instance
 	// is gone — so a caller that must observe the new instance pairs it with
@@ -3057,6 +3064,10 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			continue
 		case dispRemove:
 			if a.kind == kindDaemon {
+				// Uninstall never touches the label's enabled/disabled bit
+				// (no launchctl enable or disable): it removes only what
+				// install created, and a disable is the operator's own act.
+				//
 				// Bootout then remove the plist — binding them so a booted-out label
 				// can never leave a leaked KeepAlive plist. But if
 				// bootout returns a real error (not the idempotent not-loaded case,
