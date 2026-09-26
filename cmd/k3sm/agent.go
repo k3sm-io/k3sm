@@ -190,6 +190,12 @@ func runAgent(args []string) error {
 		return fmt.Errorf("--server is required")
 	}
 
+	// Before anything is joined, written or recorded: a Mac installed as a
+	// server is not a worker, whatever this process was asked to be.
+	if err := refuseAgentOnServerMac(install.NewDarwinSystem()); err != nil {
+		return err
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -205,6 +211,32 @@ func runAgent(args []string) error {
 		noteAgentStartFailure(breaker, logger, err)
 	}
 	return err
+}
+
+// refuseAgentOnServerMac refuses a `k3sm agent` started on a Mac whose
+// server-role daemon plist is on disk.
+//
+// This is the hand-run counterpart of the installer's cross-role refusal. On
+// such a Mac the root netd helper was installed for the control plane: its
+// plist hands it the server's admin kubeconfig, and the pod CIDR it restores is
+// the server's. A worker started beside it would join, program the mesh
+// through that helper, and then have its privileged Service binds refused by
+// an authorizer reading another node's view. The agent is unprivileged, so it
+// cannot and must not rewrite any of that; the sanctioned role change is an
+// uninstall followed by an agent install, and the error says so.
+//
+// A plist that cannot be read is reported rather than treated as absent: the
+// check exists to stop a start that will misbehave, and an unreadable plist is
+// no evidence the server is not installed.
+func refuseAgentOnServerMac(sys install.PlistReader) error {
+	path, installed, err := install.RoleInstalled(sys, install.RoleServer)
+	switch {
+	case err != nil:
+		return fmt.Errorf("check whether this Mac is installed as a k3sm server (%s): %w", path, err)
+	case installed:
+		return fmt.Errorf("this Mac is installed as a k3sm server (%s is on disk), so its netd helper is still handed the server admin kubeconfig and would refuse this worker's privileged Service binds: run `sudo k3sm uninstall`, then `sudo k3sm install --agent --server <host> --token-file <file>` to change its role", path)
+	}
+	return nil
 }
 
 // netdProbeGrace and netdProbeInterval bound the wait for the root netd helper
@@ -251,7 +283,12 @@ func awaitNetdHelper(ctx context.Context, probe func(context.Context) error, gra
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%w (waited %s across %d attempts; the helper is io.k3sm.netd and its log is %s)", err, grace, attempt, install.NetdLogPath())
+			// The remedy is part of the error because a hand run is the common
+			// way to get here: the helper socket admits only the service user,
+			// so an operator's own uid never gets an answer however long this
+			// waits.
+			return fmt.Errorf("%w (waited %s across %d attempts; the helper is io.k3sm.netd and its log is %s; it answers only the %s service user, so run the worker under its LaunchDaemon (sudo launchctl kickstart -k system/%s) or, by hand, as `sudo -u %s k3sm agent …`)",
+				err, grace, attempt, install.NetdLogPath(), install.DefaultServiceUser, install.AgentLabel, install.DefaultServiceUser)
 		}
 		logger.Info("the netd helper is not answering yet; waiting for it rather than failing this start", "err", err, "attempt", attempt, "grace", grace)
 		select {

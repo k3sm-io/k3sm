@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // TestAgentWaitsOutALateNetdHelper is the daemon half of the 2026-09-17
@@ -70,6 +71,9 @@ func TestAgentWaitsOutALateNetdHelper(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "attempts") {
 			t.Errorf("error %q must say how long it waited and how often it asked", err)
+		}
+		if !strings.Contains(err.Error(), "sudo -u "+install.DefaultServiceUser) {
+			t.Errorf("error %q must name the hand-run remedy (run as the %s service user)", err, install.DefaultServiceUser)
 		}
 		if attempts < 2 {
 			t.Errorf("probe attempts = %d, want more than one before giving up", attempts)
