@@ -181,6 +181,35 @@ Mac after a deregistration therefore resumes into a cluster that no longer has a
 supply `--token-file` and it joins again as a new node, and without a token the agent stops and says
 it must rejoin.
 
+### Changing a Mac's role
+
+A Mac is a control plane or a worker, never both, and it changes role by uninstalling and installing
+again. To turn a server into a worker:
+
+```sh
+sudo k3sm uninstall
+sudo k3sm install --agent \
+  --server <server-underlay-ip> \
+  --token-file /var/root/k3sm-join-token
+```
+
+Going the other way is the same two steps, ending in a plain `sudo k3sm install`. An install while
+the other role is still on disk is refused and tells you to uninstall first.
+
+Uninstall keeps the data root, the daemon logs and the node's wireguard key, so the Mac keeps its
+mesh identity and nothing you configured is lost. It removes the pod address range this Mac's
+networking helper adopted from its last join. That range belongs to the role that received it, and
+the new role gets its own when it joins; keeping the old one would make the helper restore the
+previous role's range when it starts.
+
+Running `k3sm agent` by hand on a Mac that is still installed as a server is refused with the same
+remedy. The networking helper on that Mac was installed for the control plane and still holds the
+server's credentials, so it would refuse the worker's privileged Service binds.
+
+Editing the installed launchd plists does not change a role, and neither does a restart:
+`launchctl kickstart` never re-reads a plist, only a bootout and bootstrap does, which is what
+install performs.
+
 ## What Crosses Nodes
 
 - Services resolve cluster-wide via the userspace Service proxy.
