@@ -33,8 +33,12 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	discoveryv1ac "k8s.io/client-go/applyconfigurations/discovery/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	"k3sm.io/darwin-net/pkg/ingress"
 	"k3sm.io/darwin-net/pkg/netbind"
@@ -131,6 +135,10 @@ type Config struct {
 	// EADDRINUSE, and netd grants the wildcard because the canonical Service
 	// declares the port. Injectable for tests.
 	Binder netbind.Binder
+	// Recorder records Warning Events on the canonical Service
+	// (svclb.EventReasonSourceRangesInvalid). Nil means Run builds its own on
+	// Client (svclb.NewEventRecorder); injectable for tests.
+	Recorder record.EventRecorder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
 }
@@ -138,6 +146,12 @@ type Config struct {
 // Host assembles and runs the server-process ingress: RouteTable + CertStore +
 // class-filtered Watcher + Server, the k3sm IngressClass + canonical LB
 // Service provisioning, and the single auditable status writer.
+//
+// Ordering at start: the listeners are NOT opened until the canonical
+// Service's watch has synced and its loadBalancerSourceRanges are installed
+// (rangesReady). Binding first would serve every peer during the sync, an
+// allow-all window at every restart; if the sync never completes (ctx ends)
+// the listeners are never opened.
 type Host struct {
 	cfg   Config
 	log   *slog.Logger
@@ -162,6 +176,26 @@ type Host struct {
 	// statusKick coalesces status-sync triggers (reconcile events + listener
 	// transitions). Buffered 1; sends are non-blocking.
 	statusKick chan struct{}
+
+	// ranges is the canonical Service's loadBalancerSourceRanges, enforced at
+	// every listener's accept (rangedListener). It is WRITTEN only by the
+	// canonical-Service watch handler (applySourceRanges) and READ by each
+	// listener's accept goroutine; a nil pointer allows every peer. A set that
+	// does not parse never replaces it, so the last valid set stays in force.
+	ranges atomic.Pointer[svclb.Ranges]
+	// rangesReady is closed once the canonical Service's watch has synced and
+	// its ranges are installed; serveLoop binds nothing before it.
+	rangesReady chan struct{}
+	// rangesErr is the last invalid-ranges message recorded as an Event, so a
+	// persistent error is recorded once. resetPending is set when the canonical
+	// Service was deleted while ranges were in force, so the recreated object's
+	// arrival records SourceRangesReset. Both are owned by the watch handler
+	// goroutine (client-go delivers one handler's notifications serially).
+	rangesErr    string
+	resetPending bool
+	// recorder records Warning Events on the canonical Service; set by New from
+	// the config or by Run before the watch starts.
+	recorder record.EventRecorder
 }
 
 // New validates cfg and builds the Host. It starts nothing; call Run.
@@ -189,11 +223,13 @@ func New(cfg Config) (*Host, error) {
 		log = slog.Default()
 	}
 	return &Host{
-		cfg:        cfg,
-		log:        log,
-		table:      ingress.NewRouteTable(),
-		certs:      ingress.NewCertStore(),
-		statusKick: make(chan struct{}, 1),
+		cfg:         cfg,
+		log:         log,
+		table:       ingress.NewRouteTable(),
+		certs:       ingress.NewCertStore(),
+		statusKick:  make(chan struct{}, 1),
+		rangesReady: make(chan struct{}),
+		recorder:    cfg.Recorder,
 	}, nil
 }
 
@@ -209,7 +245,14 @@ func (h *Host) Run(ctx context.Context) error {
 		h.log.Error("provision canonical ingress loadbalancer service", "err", err)
 	}
 
+	if h.recorder == nil {
+		rec, stop := svclb.NewEventRecorder(h.cfg.Client, "k3sm-ingress")
+		defer stop()
+		h.recorder = rec
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return h.watchSourceRanges(gctx) })
 	// The Watcher surfaces tls[] Secret NAMES after every reconcile; the host
 	// fetches + installs them (see installCertificates) and re-syncs statuses.
 	// The callback runs outside the watcher's lock, so the synchronous fetch is
@@ -269,15 +312,151 @@ func (b countingBinder) Listen(ctx context.Context, network string, addr netip.A
 		b.h.serving.Store(true)
 		b.h.kickStatus()
 	}
-	return ln, nil
+	return rangedListener{Listener: ln, h: b.h}, nil
 }
 
+// rangedListener enforces the canonical Service's loadBalancerSourceRanges at
+// accept: a denied peer is closed INSIDE Accept, so darwin-net's server never
+// sees the connection. It is an accept-time close, not a firewall (the
+// handshake has completed), matching svclb's forwarder.
+type rangedListener struct {
+	net.Listener
+	h *Host
+}
+
+// Accept returns the next connection from an allowed peer, closing every
+// denied one on the way.
+func (l rangedListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		r := l.h.ranges.Load()
+		if r == nil || r.AllowsConn(conn) {
+			return conn, nil
+		}
+		l.h.log.Debug("ingress connection denied by loadBalancerSourceRanges",
+			"addr", l.Addr().String(), "peer", conn.RemoteAddr().String())
+		_ = conn.Close()
+	}
+}
+
+// watchSourceRanges watches the ONE canonical Service (svclb IgnoreLabel's it,
+// so svclb never enforces its ranges) and feeds applySourceRanges until ctx is
+// cancelled. It closes rangesReady once the handler has seen the initial state;
+// if ctx ends first it returns without closing it, so no listener ever opens.
+// A deleted Service does NOT lift the ranges (onCanonicalDeleted).
+func (h *Host) watchSourceRanges(ctx context.Context) error {
+	factory := informers.NewSharedInformerFactoryWithOptions(h.cfg.Client, 30*time.Second,
+		informers.WithNamespace(ServiceNamespace),
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("metadata.name", ServiceName).String()
+		}))
+	inf := factory.Core().V1().Services().Informer()
+	apply := func(obj any) {
+		if svc, ok := obj.(*corev1.Service); ok && svc.Namespace == ServiceNamespace && svc.Name == ServiceName {
+			h.applySourceRanges(svc)
+		}
+	}
+	reg, err := inf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    apply,
+		UpdateFunc: func(_, obj any) { apply(obj) },
+		DeleteFunc: func(obj any) { h.onServiceDelete(ctx, obj) },
+	})
+	if err != nil {
+		return fmt.Errorf("ingresshost: add canonical service handler: %w", err)
+	}
+	factory.Start(ctx.Done())
+	defer factory.Shutdown()
+	// The REGISTRATION's HasSynced, not the informer's: it turns true only once
+	// this handler has been delivered the initial list, i.e. once the ranges
+	// are actually installed.
+	if !cache.WaitForCacheSync(ctx.Done(), reg.HasSynced) {
+		return nil // ctx ended before the sync; rangesReady stays open, nothing binds
+	}
+	close(h.rangesReady)
+	<-ctx.Done()
+	return nil
+}
+
+// onServiceDelete routes a watch delete (including a DeletedFinalStateUnknown
+// tombstone from a missed delete) of the canonical Service to
+// onCanonicalDeleted.
+func (h *Host) onServiceDelete(ctx context.Context, obj any) {
+	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = d.Obj
+	}
+	if svc, ok := obj.(*corev1.Service); ok && svc.Namespace == ServiceNamespace && svc.Name == ServiceName {
+		h.onCanonicalDeleted(ctx)
+	}
+}
+
+// onCanonicalDeleted handles a deleted canonical Service the k3s way for an
+// addon object: re-provision it. The last valid ranges stay in force until
+// the recreated object arrives through the watch; ITS ranges (the default,
+// empty spec) then apply as usual, and if that lifted a restriction a
+// SourceRangesReset Warning Event says so on the recreated Service. Deleting
+// the Service must never silently widen who can reach the ingress.
+func (h *Host) onCanonicalDeleted(ctx context.Context) {
+	r := h.ranges.Load()
+	h.resetPending = r != nil && len(*r) > 0
+	h.rangesErr = ""
+	h.log.Warn("canonical ingress loadbalancer service deleted; keeping its last source ranges in force and recreating it")
+	if err := h.ensureLBService(ctx); err != nil {
+		h.log.Error("recreate canonical ingress loadbalancer service", "err", err)
+	}
+}
+
+// applySourceRanges installs svc's source ranges (svclb.SourceRanges, the one
+// rule). A set that does not parse keeps the last valid one (allow-all before
+// any) and records a Warning Event once per distinct error: the ingress is
+// already serving, and the upstream controller leaves an LB serving while it
+// retries.
+func (h *Host) applySourceRanges(svc *corev1.Service) {
+	r, err := svclb.SourceRanges(svc)
+	if err != nil {
+		h.log.Warn("canonical ingress service source ranges invalid; keeping the last valid set", "err", err)
+		h.log.Debug("canonical ingress service invalid source ranges, raw values", svclb.SourceRangesLogArgs(svc)...)
+		if msg := err.Error(); msg != h.rangesErr {
+			h.rangesErr = msg
+			if h.recorder != nil {
+				h.recorder.Eventf(svc, corev1.EventTypeWarning, svclb.EventReasonSourceRangesInvalid,
+					"loadBalancerSourceRanges invalid (ingress keeps the last valid source ranges): %v", err)
+			}
+		}
+		return
+	}
+	h.rangesErr = ""
+	h.ranges.Store(&r)
+	if h.resetPending {
+		h.resetPending = false
+		if len(r) == 0 {
+			h.log.Warn("canonical ingress loadbalancer service recreated with default spec; its source ranges are lifted and must be set again")
+			if h.recorder != nil {
+				h.recorder.Event(svc, corev1.EventTypeWarning, EventReasonSourceRangesReset,
+					"loadBalancerSourceRanges were lifted: the Service was deleted and recreated with the default spec; set them again")
+			}
+		}
+	}
+}
+
+// EventReasonSourceRangesReset is the reason of the Warning Event recorded on a
+// recreated canonical Service whose deletion lifted its source ranges.
+const EventReasonSourceRangesReset = "SourceRangesReset"
+
 // serveLoop runs the ingress Server, retrying a bind failure on the bounded
-// schedule. A bind failure is NON-FATAL to the server process: the helper may
+// schedule. It binds nothing until the canonical Service's source ranges are
+// installed (rangesReady), so enforcement has no allow-all window at start. A bind failure is NON-FATAL to the server process: the helper may
 // be absent or the LB-Service authorization not yet visible to netd — but
 // there is NO silent port fallback; exhausted retries disable the ingress
 // loudly until restart.
 func (h *Host) serveLoop(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-h.rangesReady:
+	}
 	srv, err := ingress.NewServer(h.table, ingress.Config{
 		Addr:      h.cfg.BindAddr,
 		HTTPPort:  h.cfg.HTTPPort,
