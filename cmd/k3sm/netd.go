@@ -313,6 +313,17 @@ const authorizerRoleRemedy = "if this Mac changed role, netd still holds the pre
 // minute.
 const missingKubeconfigWarnAfter = 30
 
+// credentialRejectedWarnAfter is how many CONSECUTIVE failed attempts may find
+// netd's credential rejected (401 Unauthorized) before that is logged at WARN.
+// The apiserver refuses even a valid admin token for the first seconds of a
+// server boot while its authenticators finish bootstrapping (observed: about
+// 2s), so a 401 on the first attempts is the boot race and must not WARN. A
+// credential that is genuinely stale (a Mac that changed role by hand) is
+// rejected forever, so a short window costs little: at the 2s retry cadence 10
+// attempts is about 20s (longer in practice, since one attempt can take up to
+// serviceInformerSyncTimeout), well past the observed race.
+const credentialRejectedWarnAfter = 10
+
 // authorizerRewarnEvery is how many repeats of the SAME WARN-class error pass
 // before that error is warned again (a different WARN-class error warns at once
 // and restarts the count; a Debug-class failure in between leaves it alone, so
@@ -323,27 +334,44 @@ const missingKubeconfigWarnAfter = 30
 // about five minutes: one line per five minutes is a reminder, not spam.
 const authorizerRewarnEvery = 150
 
+// authorizerFailureClass is how a failed authorizer attempt is logged.
+type authorizerFailureClass int
+
+const (
+	// failDebug is the ordinary boot race (a dial error, a sync timeout):
+	// always Debug.
+	failDebug authorizerFailureClass = iota
+	// failWindowed is a failure that is the boot race for the first attempts
+	// and a standing fault after them (a kubeconfig not yet written, a
+	// credential the still-bootstrapping apiserver rejects): Debug until it
+	// has held for its window of consecutive attempts, then WARN.
+	failWindowed
+	// failImmediate is never the boot race (an unusable kubeconfig; a 403,
+	// which is an authorized identity denied a verb, an RBAC fact): WARN on
+	// first sighting.
+	failImmediate
+)
+
 // authorizerFailureLog decides the level of each failed authorizer attempt.
 //
-// Most failures are the boot race (netd starts before the server writes its
-// kubeconfig or before the apiserver serves) and stay at Debug. Two are not
-// transient and would otherwise be invisible for the daemon's whole life,
-// leaving every privileged bind denied: a kubeconfig that cannot be loaded, and
-// a credential the apiserver rejects. Those are logged at WARN with the reason
-// and a remedy on first sighting, once per distinct error, and at Debug when
-// the same error comes back on the next retry, until authorizerRewarnEvery
-// repeats have passed and it is warned again. A kubeconfig that does not exist
-// is the one member of the first class that is also the boot race, so it stays
-// at Debug until it has been missing for missingKubeconfigWarnAfter consecutive
-// attempts. It is owned by the single retry loop, so it needs no lock.
+// Each failure is classified (authorizerFailureReason). failDebug failures
+// stay at Debug. failImmediate failures are logged at WARN with the reason and
+// a remedy on first sighting. failWindowed failures stay at Debug until the
+// same failure has held for its window (missingKubeconfigWarnAfter for a
+// missing kubeconfig, credentialRejectedWarnAfter for a rejected credential)
+// of consecutive attempts, then are treated like failImmediate. A WARN is
+// logged once per distinct error and at Debug when the same error comes back
+// on the next retry, until authorizerRewarnEvery repeats have passed and it is
+// warned again. It is owned by the single retry loop, so it needs no lock.
 type authorizerFailureLog struct {
 	lastWarned string
 	// sinceWarn counts repeats of lastWarned since it was last logged at
 	// WARN.
 	sinceWarn int
-	// missingStreak counts consecutive attempts that found the kubeconfig
-	// absent; any other outcome resets it.
-	missingStreak int
+	// streak counts consecutive attempts that failed with the windowed
+	// failure named by streakReason; any other outcome resets it.
+	streak       int
+	streakReason string
 }
 
 // note logs one failed attempt. It logs the kubeconfig PATH only: a parse
@@ -351,14 +379,20 @@ type authorizerFailureLog struct {
 // unusable kubeconfig carries a fixed reason and never the error text, and the
 // WARN for a rejected credential carries only the apiserver's status reason.
 func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err error) {
-	reason, warn := authorizerFailureReason(err)
-	if kubeconfigMissing(err) {
-		l.missingStreak++
-		if l.missingStreak < missingKubeconfigWarnAfter {
-			warn = false
+	reason, class := authorizerFailureReason(err)
+	warn := false
+	switch class {
+	case failImmediate:
+		l.streak, l.streakReason = 0, ""
+		warn = true
+	case failWindowed:
+		if reason != l.streakReason {
+			l.streak, l.streakReason = 0, reason
 		}
-	} else {
-		l.missingStreak = 0
+		l.streak++
+		warn = l.streak >= authorizerWarnWindow(err)
+	default:
+		l.streak, l.streakReason = 0, ""
 	}
 	if !warn {
 		logger.Debug("Service authorizer not ready; <1024 binds denied until the server's kubeconfig + apiserver are up",
@@ -378,24 +412,33 @@ func (l *authorizerFailureLog) note(logger *slog.Logger, kubeconfig string, err 
 	logger.Debug("Service authorizer still cannot start", "kubeconfig", kubeconfig, "reason", reason)
 }
 
-// authorizerFailureReason classifies a startServiceInformer error. warn is true
-// for the two non-transient classes; reason is safe to log (it never carries
-// kubeconfig contents or token bytes).
-func authorizerFailureReason(err error) (reason string, warn bool) {
+// authorizerWarnWindow is how many consecutive attempts a failWindowed
+// failure must hold before it is logged at WARN.
+func authorizerWarnWindow(err error) int {
+	if kubeconfigMissing(err) {
+		return missingKubeconfigWarnAfter
+	}
+	return credentialRejectedWarnAfter
+}
+
+// authorizerFailureReason classifies a startServiceInformer error. reason is
+// safe to log (it never carries kubeconfig contents or token bytes) and is
+// empty for failDebug.
+func authorizerFailureReason(err error) (reason string, class authorizerFailureClass) {
 	switch {
 	case apierrors.IsUnauthorized(err):
-		return "the apiserver rejected netd's credential (401 Unauthorized)", true
+		return "the apiserver rejected netd's credential (401 Unauthorized)", failWindowed
 	case apierrors.IsForbidden(err):
-		return "the apiserver refused netd's credential access to Services (403 Forbidden)", true
+		return "the apiserver refused netd's credential access to Services (403 Forbidden)", failImmediate
 	}
 	var unusable kubeconfigUnusableError
 	switch {
 	case !errors.As(err, &unusable):
-		return "", false
+		return "", failDebug
 	case unusable.missing:
-		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", true
+		return "the kubeconfig netd was handed still does not exist, long after a server boot would have written it", failWindowed
 	default:
-		return "the kubeconfig netd was handed cannot be read or is not a valid kubeconfig", true
+		return "the kubeconfig netd was handed cannot be read or is not a valid kubeconfig", failImmediate
 	}
 }
 
