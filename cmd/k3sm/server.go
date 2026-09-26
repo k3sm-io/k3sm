@@ -220,10 +220,11 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// Ingress listener ports. 80/443 is the production posture; an EXPLICIT
 	// high-port pair (e.g. 8080/8443) is the integration-tier mode. There is
 	// deliberately NO silent fallback between the two — a failed bind is logged and
-	// boundedly retried, never re-ported. The listeners bind the WILDCARD
-	// in-process (a wildcard bind is unprivileged on Darwin at any port), so no netd
-	// authorization is involved; they are started BEFORE svclb so they win a contest
-	// for these ports against a user LoadBalancer Service declaring them.
+	// boundedly retried, never re-ported. The listeners bind the WILDCARD; a
+	// privileged port goes through the root netd helper when one is present
+	// (netd authorizes it against the canonical kube-system/k3sm-ingress Service),
+	// a high port binds in-process. They are started BEFORE svclb so they win a
+	// contest for these ports against a user LoadBalancer Service declaring them.
 	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port, bound on ALL interfaces (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
 	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port, bound on ALL interfaces (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
 	// The node-local OCI ingest registry (pkg/registrysvc). DISABLED by default —
@@ -964,6 +965,12 @@ func runServer(args []string) (err error) {
 	if isLoopbackDefault(opts.nodeIP) {
 		apiServerEndpoint = "127.0.0.1:" + strconv.Itoa(opts.apiPort)
 	}
+	// nodeAddressing holds the only inputs advertisedNodeIP reads. The full
+	// nodeOpts cannot be built this early: it needs this netserve Server (its
+	// transportOverrides) and the MLX runtime hook, both constructed at or after
+	// this point. So the addressing half is built once here and nodeOpts
+	// copies it, rather than a second literal restating the same fields.
+	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: serverPodCIDR, netMode: mode}
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
@@ -971,6 +978,10 @@ func runServer(args []string) (err error) {
 		ClusterDomain:     opts.domain,
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
+		// The address the in-process node and the ingress host advertise. It is
+		// derived from nodeAddressing, which nodeOpts below copies its three
+		// addressing fields from, so both read one value.
+		NodeAddress:       advertisedNodeIP(nodeAddressing),
 		PodCIDR:           serverPodCIDR,
 		MeshEgressIP:      serverMeshEgressIP,
 		PeerMeshEgressIPs: peerMeshEgress,
@@ -1116,15 +1127,15 @@ func runServer(args []string) (err error) {
 		listen:     serverKubeletListenOn(opts.kubeletPort),
 		podRoot:    opts.podRoot,
 		logs:       opts.logs,
-		nodeIP:     opts.nodeIP,
+		nodeIP:     nodeAddressing.nodeIP,
 		runtime:    opts.rtName,
 		dnsShim:    opts.dnsShim,
 		pathShim:   opts.pathShim,
-		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:    serverPodCIDR,  // the reserved index-0 /24 (same source as the netserve locality above)
-		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,           // serve kubelet API over TLS so logs/exec work via the proxy
+		dnsVIP:     opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:     opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
+		podCIDR:    nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality above)
+		netMode:    nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
+		serveTLS:   true,                   // serve kubelet API over TLS so logs/exec work via the proxy
 
 		kubeletClientCAPEM: kubeletClientCA, // :10250 requires the apiserver's client cert
 
@@ -1201,7 +1212,7 @@ func runServer(args []string) (err error) {
 	// NOT include 80/443 — those are legitimate LoadBalancer ports — so the
 	// residual race is a documented ceiling, not a guarded invariant.
 	if mode.DataPath() {
-		lbCfg, ingressCfg, err := lbHostingConfigs(cs, nodeOpts, opts.ingressHTTPPort, opts.ingressHTTPSPort, logger)
+		lbCfg, ingressCfg, err := lbHostingConfigs(cs, nodeOpts, netdSocketFor(mode), opts.ingressHTTPPort, opts.ingressHTTPSPort, logger)
 		if err != nil {
 			logger.Error("ingress + svclb hosting disabled", "err", err)
 		} else {

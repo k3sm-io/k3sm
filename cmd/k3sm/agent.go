@@ -1369,6 +1369,7 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		DNSVIP:            opts.clusterIP,
 		ClusterDomain:     opts.domain,
 		NodeIP:            agentInternalIP(opts.nodeIP, res),
+		NodeAddress:       agentInternalIP(opts.nodeIP, res),
 		PodCIDR:           res.PodCIDR,
 		MeshEgressIP:      res.MeshIP,
 		PeerMeshEgressIPs: peerMeshEgressIPs(res.Peers),

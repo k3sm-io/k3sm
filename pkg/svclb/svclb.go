@@ -88,12 +88,13 @@ type Config struct {
 	// — only a test — passes an explicit empty map, which is a visible opt-out
 	// rather than an omission.
 	ReservedPorts map[int32]bool
-	// Binder opens every listener in-process (no privilege needed: on Darwin a
-	// WILDCARD bind below 1024 does not require root — it is the SPECIFIC-address
-	// bind that returns EACCES, inverted from Linux). Nil means netbind.Direct;
-	// injectable for tests. There is deliberately no second, privileged binder:
-	// routing a wildcard bind through the root netd helper would fail, since netd
-	// refuses the wildcard by design.
+	// Binder opens every listener in-process (on Darwin a WILDCARD bind below
+	// 1024 does not require root; it is the SPECIFIC-address bind that returns
+	// EACCES, inverted from Linux). Nil means netbind.Direct; injectable for
+	// tests. There is deliberately no second, privileged binder here: the root
+	// netd helper grants a privileged wildcard only for a port the canonical
+	// kube-system/k3sm-ingress Service declares, which is the ingress host's
+	// listener, never a tenant LoadBalancer Service's.
 	Binder netbind.Binder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
@@ -364,9 +365,10 @@ func (c *Controller) reconcileService(ctx context.Context, key string, svc *core
 }
 
 // bind opens one BindAddr:port listener through the single in-process binder and
-// starts its forwarder. There is no port-keyed binder selection any more: on
-// Darwin a wildcard bind needs no privilege at ANY port, so the netd helper is
-// off the LoadBalancer datapath entirely (and would refuse the wildcard anyway).
+// starts its forwarder. There is no port-keyed binder selection: on Darwin a
+// wildcard bind needs no privilege at ANY port, and the netd helper authorizes a
+// privileged wildcard only for the canonical ingress Service, so it stays off
+// the tenant LoadBalancer datapath.
 //
 // It REFUSES a reserved port before touching the binder: racing k3sm's own
 // NodePort-range or kubelet-API listener for the same wildcard socket would let

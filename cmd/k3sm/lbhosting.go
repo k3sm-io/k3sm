@@ -20,12 +20,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 
 	"k8s.io/client-go/kubernetes"
 
+	"k3sm.io/darwin-net/pkg/netbind"
+	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
 
+	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ingresshost"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/svclb"
@@ -58,12 +62,17 @@ func statusOwnedPodCIDR() netip.Prefix {
 //
 // The two addresses are DIFFERENT and both are decided here:
 //
-//   - BindAddr is the IPv4 wildcard. On Darwin a wildcard bind needs no privilege
-//     at any port (0.0.0.0:1023 binds as an ordinary uid; 127.0.0.1:1023 returns
-//     EACCES — inverted from Linux), so BOTH configs get the ONE in-process binder
-//     and neither is handed a privileged netd binder. netd refuses the wildcard by
-//     design (an explicit non-goal to change), so wiring it here would fail every
-//     listener.
+//   - BindAddr is the IPv4 wildcard for both. The BINDER differs, and
+//     ingressBinder owns that choice. svclb keeps the in-process netbind.Direct.
+//     The ingress host's privileged 80/443 listeners go through the root netd
+//     helper when netdSocket names one (the k3s ServiceLB shape): netd already
+//     holds root-owned Service-VIP sockets on those ports, and on Darwin a
+//     wildcard bind by a DIFFERENT uid than an existing specific-address socket
+//     on the same port fails with EADDRINUSE, so an unprivileged 0.0.0.0:80 loses
+//     to netd's VIP:80 for the daemon's whole life. netd grants that wildcard
+//     only for a port the canonical kube-system/k3sm-ingress Service declares
+//     (pkg/netdsvc). The high-port integration mode, and a node with no netd
+//     (root/direct posture), keep netbind.Direct.
 //   - AdvertiseAddr is the node's derived globally-unicast InternalIP —
 //     advertisedNodeIP, the SAME function startNode uses, called on the SAME
 //     nodeOptions value runServer passes to startNode, so the address kubectl shows
@@ -80,7 +89,10 @@ func statusOwnedPodCIDR() netip.Prefix {
 // The port-range checks keep this seam TOTAL (a uint16 conversion would otherwise
 // silently truncate 70000 to 4464). runServer also rejects an out-of-range argv at
 // flag-parse time; this one holds for any caller of the seam, argv or test.
-func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, httpPort, httpsPort int, log *slog.Logger) (svclb.Config, ingresshost.Config, error) {
+//
+// netdSocket is the root netd helper's socket, or "" when this node has none
+// (netdSocketFor derives it from the resolved --network posture).
+func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, netdSocket string, httpPort, httpsPort int, log *slog.Logger) (svclb.Config, ingresshost.Config, error) {
 	if httpPort < 0 || httpPort > 65535 {
 		return svclb.Config{}, ingresshost.Config{}, fmt.Errorf("--ingress-http-port %d is out of range (0-65535)", httpPort)
 	}
@@ -118,9 +130,73 @@ func lbHostingConfigs(cs kubernetes.Interface, opts nodeOptions, httpPort, https
 		PodCIDR:       podCIDR,
 		HTTPPort:      uint16(httpPort),
 		HTTPSPort:     uint16(httpsPort),
+		NodeName:      opts.nodeName,
+		Binder:        ingressBinder(netdSocket, httpPort, httpsPort),
 		Logger:        log,
 	}
 	return lb, ih, nil
+}
+
+// netdSocketFor returns the netd helper socket the ingress host binds through,
+// or "" when the resolved posture routes no privileged op through the helper
+// (root/direct binds 80/443 itself; --network none runs no datapath).
+func netdSocketFor(mode hostnet.Mode) string {
+	if !mode.UsesHelper() {
+		return ""
+	}
+	return mode.Socket
+}
+
+// ingressBinder selects the binder for the ingress host's wildcard listeners.
+// With no netd (netdSocket == "") every listener binds in-process
+// (netbind.Direct). With netd, a privileged (<1024) listener binds through the
+// helper and a non-privileged one stays in-process, because netd grants a
+// wildcard only below 1024: 80/443 get a netbind.Netd, the 8080/8443
+// integration pair gets netbind.Direct, and a mixed pair gets a binder that
+// splits by port. A disabled listener (port 0) does not vote.
+func ingressBinder(netdSocket string, httpPort, httpsPort int) netbind.Binder {
+	direct := netbind.Direct{}
+	if netdSocket == "" {
+		return direct
+	}
+	var priv, unpriv int
+	for _, p := range []int{httpPort, httpsPort} {
+		switch {
+		case p == 0:
+		case p < privilegedPortCeiling:
+			priv++
+		default:
+			unpriv++
+		}
+	}
+	helper := &netbind.Netd{Client: wire.NewClient(netdSocket)}
+	switch {
+	case priv == 0:
+		return direct
+	case unpriv == 0:
+		return helper
+	default:
+		return portSplitBinder{privileged: helper, unprivileged: direct}
+	}
+}
+
+// privilegedPortCeiling is the first port an unprivileged process may bind on
+// a specific address; netd brokers only the ports below it.
+const privilegedPortCeiling = 1024
+
+// portSplitBinder routes a listener below privilegedPortCeiling to privileged
+// and every other listener to unprivileged.
+type portSplitBinder struct {
+	privileged   netbind.Binder
+	unprivileged netbind.Binder
+}
+
+// Listen binds addr through the binder its port selects.
+func (b portSplitBinder) Listen(ctx context.Context, network string, addr netip.AddrPort) (net.Listener, error) {
+	if addr.Port() < privilegedPortCeiling {
+		return b.privileged.Listen(ctx, network, addr)
+	}
+	return b.unprivileged.Listen(ctx, network, addr)
 }
 
 // ensureAdvertisedNodeAlias plumbs the lo0 /32 alias for the address the
