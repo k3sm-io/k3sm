@@ -21,10 +21,13 @@ limitations under the License.
 // (controller k3sm.io/ingress) and the canonical kube-system/k3sm-ingress
 // LoadBalancer Service, and writes Ingress / LoadBalancer statuses.
 //
-// The canonical Service remains the declaring subject the netd port authorizer
-// would check a privileged NODE-ADDRESS bind against, but the ingress
-// listeners bind the WILDCARD in-process and never reach netd, so that authorizer
-// branch is dormant BY CONFIGURATION (see pkg/netdsvc) — not by removal.
+// The canonical Service is the declaring subject the netd port authorizer
+// checks the ingress host's privileged WILDCARD bind against (pkg/netdsvc):
+// netd grants 0.0.0.0:80/443 only because kube-system/k3sm-ingress declares
+// those ports. Once the listeners are bound, this host also publishes an
+// EndpointSlice for that Service carrying the node's address, so the Service's
+// ClusterIP reaches the ingress from inside the cluster (the k3s ServiceLB
+// shape).
 //
 // # TLS Secret discipline (SECURITY-BINDING)
 //
@@ -40,9 +43,11 @@ limitations under the License.
 // # Listener honesty
 //
 // The Server binds Config.BindAddr — the WILDCARD in production — through the
-// shared pkg/netbind seam, in-process: on Darwin a wildcard bind needs no
-// privilege even at 80/443 (it is the SPECIFIC-address bind that returns EACCES,
-// inverted from Linux), so no privileged binder is wired. The high-port mode
+// shared pkg/netbind seam. At 80/443 the assembler hands it the root netd
+// helper's binder: a wildcard bind needs no privilege on Darwin, but netd
+// already holds root-owned Service-VIP sockets on those ports and a
+// different-uid wildcard on the same port fails with EADDRINUSE, so the root
+// helper makes the bind. The high-port mode
 // (--ingress-http-port/--ingress-https-port) is an explicit config, never a
 // silent fallback: a failed bind surfaces as ingress.ErrBind, is logged, retried
 // on a bounded schedule, and then gives up loudly while the server keeps running.

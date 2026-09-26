@@ -27,12 +27,14 @@ import (
 	"encoding/pem"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -510,5 +512,123 @@ func TestIngressHostRetractsImmediatelyWithNoDerivableAddress(t *testing.T) {
 	got, _ := cs.NetworkingV1().Ingresses("default").Get(ctx, "mine", metav1.GetOptions{})
 	if len(got.Status.LoadBalancer.Ingress) != 1 || got.Status.LoadBalancer.Ingress[0].IP != "203.0.113.9" {
 		t.Errorf("ingress status = %+v, want the stale pod-space entry retracted and the foreign one kept", got.Status.LoadBalancer.Ingress)
+	}
+}
+
+// stubListener is a net.Listener that never accepts; the endpoint gate needs a
+// successful bind, not a socket.
+type stubListener struct{ addr netip.AddrPort }
+
+func (stubListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (stubListener) Close() error              { return nil }
+func (l stubListener) Addr() net.Addr          { return net.TCPAddrFromAddrPort(l.addr) }
+
+// stubBinder hands back a stubListener for every bind and records the ports.
+type stubBinder struct{ ports []uint16 }
+
+func (b *stubBinder) Listen(_ context.Context, _ string, addr netip.AddrPort) (net.Listener, error) {
+	b.ports = append(b.ports, addr.Port())
+	return stubListener{addr: addr}, nil
+}
+
+// TestCanonicalServiceEndpointsCarryTheNodeListener is the B403 gate for the
+// in-cluster half of the k3s ServiceLB shape: the canonical kube-system/
+// k3sm-ingress Service is selector-less, so without a hand-written
+// EndpointSlice its ClusterIP has no backend. After every enabled listener is
+// bound, the host publishes one through the client it was given, carrying the
+// node's InternalIP and ports named exactly as the Service names them; before
+// the bind there is none; and losing the listeners removes it.
+func TestCanonicalServiceEndpointsCarryTheNodeListener(t *testing.T) {
+	ctx := context.Background()
+	cs := fake.NewClientset()
+	binder := &stubBinder{}
+	h, err := New(Config{
+		Client:        cs,
+		BindAddr:      testBindAddr,
+		AdvertiseAddr: testAdvertiseAddr,
+		PodCIDR:       testPodCIDR,
+		HTTPPort:      80,
+		HTTPSPort:     443,
+		Binder:        binder,
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := h.ensureLBService(ctx); err != nil {
+		t.Fatalf("ensureLBService: %v", err)
+	}
+	slices := cs.DiscoveryV1().EndpointSlices(ServiceNamespace)
+
+	// Before the bind: the status writer may run (pre-bind kicks) but must not
+	// publish a backend nothing answers on.
+	h.syncStatus(ctx)
+	if list, err := slices.List(ctx, metav1.ListOptions{}); err != nil || len(list.Items) != 0 {
+		t.Fatalf("before the bind: endpointslices = %+v (err %v), want none", list, err)
+	}
+
+	// Bind both listeners through the host's counting seam, as ingress.Server does.
+	for _, port := range []uint16{80, 443} {
+		if _, err := (countingBinder{h: h}).Listen(ctx, "tcp", netip.AddrPortFrom(testBindAddr, port)); err != nil {
+			t.Fatalf("bind %d: %v", port, err)
+		}
+	}
+	if !h.serving.Load() {
+		t.Fatal("precondition: both listeners bound must flip serving")
+	}
+	h.syncStatus(ctx)
+
+	es, err := slices.Get(ctx, ServiceName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("after the bind: get the canonical endpointslice: %v", err)
+	}
+	if es.Labels[discoveryv1.LabelServiceName] != ServiceName {
+		t.Errorf("service-name label = %q, want %q (the label is how the proxy ties a slice to its Service)", es.Labels[discoveryv1.LabelServiceName], ServiceName)
+	}
+	if es.AddressType != discoveryv1.AddressTypeIPv4 {
+		t.Errorf("address type = %q, want IPv4", es.AddressType)
+	}
+	if len(es.Endpoints) != 1 || len(es.Endpoints[0].Addresses) != 1 || es.Endpoints[0].Addresses[0] != testAdvertiseAddr.String() {
+		t.Fatalf("endpoints = %+v, want exactly the node InternalIP %s", es.Endpoints, testAdvertiseAddr)
+	}
+	if r := es.Endpoints[0].Conditions.Ready; r == nil || !*r {
+		t.Error("the endpoint must be explicitly Ready: a nil Ready reads as not-ready to the proxy")
+	}
+	svc, err := cs.CoreV1().Services(ServiceNamespace).Get(ctx, ServiceName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get the canonical service: %v", err)
+	}
+	gotPorts := map[string]int32{}
+	for _, p := range es.Ports {
+		if p.Name == nil || p.Port == nil {
+			t.Fatalf("endpoint port %+v must carry a name and a number", p)
+		}
+		gotPorts[*p.Name] = *p.Port
+	}
+	if len(gotPorts) != len(svc.Spec.Ports) {
+		t.Errorf("endpoint ports = %v, want one per Service port %v", gotPorts, svc.Spec.Ports)
+	}
+	for _, sp := range svc.Spec.Ports {
+		if got, ok := gotPorts[sp.Name]; !ok || got != sp.Port {
+			t.Errorf("endpoint port %q = %d (present %v), want the Service's port name carrying the bound listener %d", sp.Name, got, ok, sp.Port)
+		}
+	}
+
+	// The write rode the provided client, by server-side apply.
+	applied := false
+	for _, a := range cs.Actions() {
+		if a.GetResource().Resource == "endpointslices" && a.GetVerb() == "patch" {
+			applied = true
+		}
+	}
+	if !applied {
+		t.Error("the endpointslice must be written through the provided client by server-side apply")
+	}
+
+	// Losing the listeners removes the backend on the same path as the status.
+	h.serving.Store(false)
+	h.syncStatus(ctx)
+	if _, err := slices.Get(ctx, ServiceName, metav1.GetOptions{}); err == nil {
+		t.Error("once the listeners are lost the endpointslice must be retracted, not left pointing at a dead socket")
 	}
 }

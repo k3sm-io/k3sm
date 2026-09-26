@@ -26,6 +26,8 @@ import (
 
 	"k8s.io/client-go/kubernetes/fake"
 
+	"k3sm.io/darwin-net/pkg/netbind"
+
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/ports"
 )
@@ -37,8 +39,9 @@ import (
 // resolve to netbind.Direct anyway, so a "no netd binder is wired" assertion
 // would be vacuous against exactly the wrong diff it exists to catch: a one-line
 // change of the ADDRESS that leaves the port-keyed privileged-binder selection
-// live, whereupon every <1024 LoadBalancer port and both ingress listeners would
-// route into netd — which refuses the wildcard — and fail to bind.
+// live, whereupon every <1024 tenant LoadBalancer port would route into netd,
+// which grants a privileged wildcard only to the canonical ingress Service, and
+// fail to bind.
 var helperMode = hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/var/run/k3sm/netd.sock"}
 
 // gateNodeOptions is the single-node server fixture: the shipped --node-ip
@@ -70,7 +73,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 
 	// (a) THE BIND ADDRESS is the IPv4 wildcard literal.
 	t.Run("both listeners bind the IPv4 wildcard 0.0.0.0", func(t *testing.T) {
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), 80, 443, log)
+		lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
@@ -88,28 +91,26 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		}
 	})
 
-	// (a, second half) THE BINDER SELECTION. The address and the binder are
+	// (a, second half) THE SVCLB BINDER SELECTION. The address and the binder are
 	// INDEPENDENT: a one-line address change satisfies the assert above while
-	// leaving every privileged port routed into netd.
-	t.Run("no privileged binder is wired even in the helper posture", func(t *testing.T) {
+	// leaving every tenant LoadBalancer port routed into netd, which grants a
+	// privileged wildcard only to the canonical ingress Service. The ingress
+	// host's own binder is TestIngressHostBindsThroughNetdWhenPresent's.
+	t.Run("svclb gets no privileged binder even in the helper posture", func(t *testing.T) {
 		opts := gateNodeOptions()
 		if !opts.netMode.UsesHelper() {
 			t.Fatal("fixture must be in the helper posture or the assertion below is vacuous")
 		}
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), opts, 80, 443, log)
+		lb, _, err := lbHostingConfigs(fake.NewClientset(), opts, netdSocketFor(opts.netMode), 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
-		// Nil means the packages' in-process netbind.Direct default: ONE binder,
+		// Nil means the package's in-process netbind.Direct default: ONE binder,
 		// taking every port including <1024. (The per-port behavioural proof lives
 		// in pkg/svclb's inverted "single in-process binder takes every port"
-		// subtest — the config-level assert here is what keeps the helper posture
-		// from re-acquiring a netd binder.)
+		// subtest.)
 		if lb.Binder != nil {
-			t.Errorf("svclb Binder = %T, want nil (the single in-process binder); netd refuses the wildcard, so a helper binder fails every listener", lb.Binder)
-		}
-		if ih.Binder != nil {
-			t.Errorf("ingresshost Binder = %T, want nil (the single in-process binder)", ih.Binder)
+			t.Errorf("svclb Binder = %T, want nil (the single in-process binder); netd refuses a tenant wildcard, so a helper binder fails every listener", lb.Binder)
 		}
 	})
 
@@ -117,7 +118,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 	// globally-unicast .1, not the raw loopback --node-ip default.
 	t.Run("the advertised address is the derived non-loopback node address", func(t *testing.T) {
 		opts := gateNodeOptions()
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), opts, 80, 443, log)
+		lb, ih, err := lbHostingConfigs(fake.NewClientset(), opts, "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
@@ -149,7 +150,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 		const meshIP = "100.100.0.7"
 		opts := gateNodeOptions()
 		opts.nodeIP = meshIP // runServer's mesh rewrite already ran
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), opts, 80, 443, log)
+		lb, ih, err := lbHostingConfigs(fake.NewClientset(), opts, "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
@@ -195,7 +196,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 			}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				lb, ih, err := lbHostingConfigs(fake.NewClientset(), tc.opts(), 80, 443, log)
+				lb, ih, err := lbHostingConfigs(fake.NewClientset(), tc.opts(), "", 80, 443, log)
 				if err != nil {
 					t.Fatalf("lbHostingConfigs: %v", err)
 				}
@@ -212,7 +213,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 	// The reserved-port set the datapath refusal uses is the SAME single source
 	// the admission CEL and the apiserver argv derive from.
 	t.Run("the reserved-port set is single-sourced from pkg/ports", func(t *testing.T) {
-		lb, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), 80, 443, log)
+		lb, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
@@ -231,7 +232,7 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 	// The retraction scope is the CLUSTER pod aggregate, so a node that re-enrolls
 	// into a different /24 still retracts what its previous life advertised.
 	t.Run("the retraction scope covers a previous enrollment's /24", func(t *testing.T) {
-		lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), 80, 443, log)
+		lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, 443, log)
 		if err != nil {
 			t.Fatalf("lbHostingConfigs: %v", err)
 		}
@@ -248,10 +249,10 @@ func TestLBListenersBindWildcardAdvertiseDerived(t *testing.T) {
 	// The seam is TOTAL: an out-of-range port errors rather than silently
 	// truncating through the uint16 conversion (70000 -> 4464).
 	t.Run("an out-of-range ingress port is an error, never a truncation", func(t *testing.T) {
-		if _, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), 70000, 443, log); err == nil {
+		if _, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 70000, 443, log); err == nil {
 			t.Error("--ingress-http-port 70000 must error")
 		}
-		if _, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), 80, -1, log); err == nil {
+		if _, _, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), "", 80, -1, log); err == nil {
 			t.Error("--ingress-https-port -1 must error")
 		}
 	})
@@ -313,4 +314,77 @@ func TestKubeletListenAddressesUsePortsConstant(t *testing.T) {
 	if !ports.Reserved(ports.KubeletAPIPort) {
 		t.Error("the kubelet API port must be in the reserved set: losing it to a LoadBalancer Service kills logs/exec/top on this node")
 	}
+}
+
+// TestIngressHostBindsThroughNetdWhenPresent is the B403 gate for the binder
+// decision lbHostingConfigs owns. An unprivileged 0.0.0.0:80 loses to netd's
+// root-owned Service-VIP:80 socket (a different-uid wildcard fails with
+// EADDRINUSE on Darwin), so when the node has a netd helper the ingress host's
+// privileged listeners bind through it; the high-port integration pair, and a
+// node with no helper, keep the in-process netbind.Direct.
+func TestIngressHostBindsThroughNetdWhenPresent(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	socket := helperMode.Socket
+
+	for _, tc := range []struct {
+		name            string
+		netdSocket      string
+		http, https     int
+		wantNetd        bool
+		wantDirect      bool
+		wantSplitByPort bool
+	}{
+		{name: "netd configured + 80/443 binds through netd", netdSocket: socket, http: 80, https: 443, wantNetd: true},
+		{name: "netd configured + 80 only binds through netd", netdSocket: socket, http: 80, https: 0, wantNetd: true},
+		{name: "netd configured + 8080/8443 binds in-process", netdSocket: socket, http: 8080, https: 8443, wantDirect: true},
+		{name: "no netd + 80/443 binds in-process", netdSocket: "", http: 80, https: 443, wantDirect: true},
+		{name: "no netd + 8080/8443 binds in-process", netdSocket: "", http: 8080, https: 8443, wantDirect: true},
+		{name: "netd configured + a mixed 80/8443 pair splits by port", netdSocket: socket, http: 80, https: 8443, wantSplitByPort: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lb, ih, err := lbHostingConfigs(fake.NewClientset(), gateNodeOptions(), tc.netdSocket, tc.http, tc.https, log)
+			if err != nil {
+				t.Fatalf("lbHostingConfigs: %v", err)
+			}
+			if lb.Binder != nil {
+				t.Errorf("svclb Binder = %T, want nil: the netd wildcard grant is the canonical ingress Service's alone", lb.Binder)
+			}
+			switch b := ih.Binder.(type) {
+			case *netbind.Netd:
+				if !tc.wantNetd {
+					t.Fatalf("ingress Binder = *netbind.Netd, want in-process (netd grants a wildcard only below 1024)")
+				}
+				if b.Client == nil {
+					t.Fatal("the netd binder must carry a wire client for the configured socket")
+				}
+			case netbind.Direct:
+				if !tc.wantDirect {
+					t.Fatalf("ingress Binder = netbind.Direct, want the netd helper: an unprivileged 0.0.0.0:80 loses to netd's root-owned VIP:80 socket")
+				}
+			case portSplitBinder:
+				if !tc.wantSplitByPort {
+					t.Fatalf("ingress Binder = portSplitBinder, want a single binder")
+				}
+				if _, ok := b.privileged.(*netbind.Netd); !ok {
+					t.Errorf("split binder privileged leg = %T, want *netbind.Netd", b.privileged)
+				}
+				if _, ok := b.unprivileged.(netbind.Direct); !ok {
+					t.Errorf("split binder unprivileged leg = %T, want netbind.Direct", b.unprivileged)
+				}
+			default:
+				t.Fatalf("ingress Binder = %T, want an explicit selection", ih.Binder)
+			}
+		})
+	}
+
+	t.Run("the socket follows the resolved --network posture", func(t *testing.T) {
+		if got := netdSocketFor(helperMode); got != helperMode.Socket {
+			t.Errorf("netdSocketFor(helper) = %q, want %q", got, helperMode.Socket)
+		}
+		for _, m := range []hostnet.Mode{{Backend: hostnet.BackendDirect}, {Backend: hostnet.BackendNone}} {
+			if got := netdSocketFor(m); got != "" {
+				t.Errorf("netdSocketFor(%s) = %q, want \"\" (no helper: root binds 80/443 itself)", m.Backend, got)
+			}
+		}
+	})
 }

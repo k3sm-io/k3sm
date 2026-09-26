@@ -29,9 +29,11 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	discoveryv1ac "k8s.io/client-go/applyconfigurations/discovery/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"k3sm.io/darwin-net/pkg/ingress"
@@ -52,6 +54,26 @@ const (
 	ServiceNamespace = "kube-system"
 	// ServiceName is the canonical ingress LoadBalancer Service name.
 	ServiceName = "k3sm-ingress"
+)
+
+// The canonical Service's port names. The Service and the EndpointSlice this
+// host publishes for it MUST spell them identically: the port name is what
+// darwin-net's Service proxy (like kube-proxy) matches a backend port by, so a
+// mismatch yields a Service with a VIP and no backends.
+const (
+	httpPortName  = "http"
+	httpsPortName = "https"
+)
+
+// The hand-written EndpointSlice for the canonical Service. It carries the
+// Service's own name (the pkg/registrysvc convention for a selector-less
+// Service), the standard managed-by label naming this package as its writer (a
+// label VALUE, so a reverse-DNS name, never a "/" path), and it is written by
+// server-side apply under the k3sm field manager.
+const (
+	endpointSliceName    = ServiceName
+	endpointManagedBy    = "ingresshost.k3sm.io"
+	endpointFieldManager = "k3sm"
 )
 
 // httpPortDefault / httpsPortDefault are the production listener ports — the
@@ -77,10 +99,8 @@ type Config struct {
 	// only ever live in the control-plane process (no RBAC widening).
 	Client kubernetes.Interface
 	// BindAddr is the address the HTTP/HTTPS listeners bind. It must be VALID;
-	// the WILDCARD (0.0.0.0) is the production choice and is accepted — on Darwin
-	// a wildcard bind needs no privilege at 80/443 (it is the SPECIFIC-address
-	// bind that returns EACCES, inverted from Linux), so the ingress listeners
-	// never touch the root netd helper.
+	// the WILDCARD (0.0.0.0) is the production choice and is accepted. Which
+	// process makes the bind is Binder's concern, not this field's.
 	BindAddr netip.Addr
 	// AdvertiseAddr is the address written into Ingress and canonical-LB-Service
 	// statuses. The ZERO Addr is legal and means the node's advertisable address
@@ -97,11 +117,12 @@ type Config struct {
 	// never a fallback.
 	HTTPPort  uint16
 	HTTPSPort uint16
-	// Binder opens the listeners in-process. Nil means netbind.Direct, which is
-	// the production wiring: a wildcard bind is unprivileged on Darwin, so the
-	// assembler no longer hands this host a privileged (netd) binder — netd
-	// refuses the wildcard by design and would fail every listener. Injectable
-	// for tests.
+	// Binder opens the listeners. Nil means netbind.Direct (in-process). The
+	// assembler hands the production 80/443 listeners the root netd helper's
+	// binder when the node has one: netd holds root-owned Service-VIP sockets
+	// on those ports, a different-uid wildcard on the same port fails with
+	// EADDRINUSE, and netd grants the wildcard because the canonical Service
+	// declares the port. Injectable for tests.
 	Binder netbind.Binder
 	// Logger is the structured log sink; nil means slog.Default.
 	Logger *slog.Logger
@@ -382,8 +403,8 @@ func (h *Host) ensureLBService(ctx context.Context) error {
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeLoadBalancer,
 			Ports: []corev1.ServicePort{
-				{Name: "http", Port: httpPortDefault, Protocol: corev1.ProtocolTCP},
-				{Name: "https", Port: httpsPortDefault, Protocol: corev1.ProtocolTCP},
+				{Name: httpPortName, Port: httpPortDefault, Protocol: corev1.ProtocolTCP},
+				{Name: httpsPortName, Port: httpsPortDefault, Protocol: corev1.ProtocolTCP},
 			},
 		},
 	}
@@ -420,7 +441,8 @@ func (h *Host) statusLoop(ctx context.Context) {
 // actually bound (h.serving — bind-then-advertise); the LB Service is
 // additionally advertised only when the bound ports ARE the declared 80/443
 // (the explicit high-port integration mode must not claim ports it does not
-// serve).
+// serve). Under the same bind-then-advertise condition it publishes the
+// canonical Service's EndpointSlice (publishEndpoints).
 func (h *Host) syncStatus(ctx context.Context) {
 	if !h.cfg.AdvertiseAddr.IsValid() {
 		// STATIC, so there is no race to guard against: with no derivable node
@@ -445,6 +467,8 @@ func (h *Host) syncStatus(ctx context.Context) {
 	// applied sync (some Ingresses updated, then a List/Update error) has still
 	// published this address.
 	h.advertised.Store(true)
+
+	h.publishEndpoints(ctx)
 
 	ip := h.cfg.AdvertiseAddr.String()
 	ings, err := h.cfg.Client.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
@@ -515,7 +539,9 @@ func (h *Host) advertiseString() string {
 // entry from a previous podCIDR (or an older loopback entry) is dropped even
 // though it is neither the current bind nor the current advertise address.
 // Own-class Ingresses ONLY — a foreign or classless Ingress is never touched.
+// It also removes the canonical Service's EndpointSlice (retractEndpoints).
 func (h *Host) retractStatus(ctx context.Context) {
+	h.retractEndpoints(ctx)
 	ings, err := h.cfg.Client.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		h.log.Warn("list ingresses for status retraction", "err", err)
@@ -562,5 +588,68 @@ func (h *Host) retractStatus(ctx context.Context) {
 	upd.Status.LoadBalancer.Ingress = keep
 	if _, err := h.cfg.Client.CoreV1().Services(ServiceNamespace).UpdateStatus(ctx, upd, metav1.UpdateOptions{}); err != nil {
 		h.log.Warn("retract canonical ingress loadbalancer service status", "err", err)
+	}
+}
+
+// publishEndpoints writes the canonical Service's EndpointSlice: one ready
+// endpoint at AdvertiseAddr (this node's InternalIP) with one port per enabled
+// listener, named as the Service names it. The Service is selector-less, so
+// without this slice its ClusterIP has no backend and the ingress is
+// unreachable from inside the cluster; with it, ClusterIP:80 reaches the node's
+// bound listener (the k3s ServiceLB shape).
+//
+// It runs from syncStatus only while the listeners are bound and the address is
+// derivable (bind-then-advertise, exactly like the status write), and
+// retractEndpoints removes it on the same retraction path. The port is the
+// LISTENER's port, so the explicit high-port mode publishes 8080/8443 under the
+// Service's http/https names: those are the sockets that actually answer. The
+// write rides the same admin client as the status writes, so no RBAC is added.
+func (h *Host) publishEndpoints(ctx context.Context) {
+	addr := h.cfg.AdvertiseAddr
+	if !addr.Is4() || addr.IsLoopback() || addr.IsUnspecified() {
+		// The slice is IPv4, and the apiserver refuses a loopback endpoint.
+		h.log.Warn("canonical ingress endpointslice not published: the advertised address is not a routable IPv4 address", "addr", addr.String())
+		return
+	}
+	var ports []*discoveryv1ac.EndpointPortApplyConfiguration
+	for _, p := range []struct {
+		name string
+		port uint16
+	}{{httpPortName, h.cfg.HTTPPort}, {httpsPortName, h.cfg.HTTPSPort}} {
+		if p.port == 0 {
+			continue
+		}
+		ports = append(ports, discoveryv1ac.EndpointPort().
+			WithName(p.name).
+			WithProtocol(corev1.ProtocolTCP).
+			WithPort(int32(p.port)))
+	}
+	slice := discoveryv1ac.EndpointSlice(endpointSliceName, ServiceNamespace).
+		WithLabels(map[string]string{
+			"k3sm.io/managed":            "true",
+			discoveryv1.LabelServiceName: ServiceName,
+			discoveryv1.LabelManagedBy:   endpointManagedBy,
+		}).
+		WithAddressType(discoveryv1.AddressTypeIPv4).
+		WithEndpoints(discoveryv1ac.Endpoint().
+			WithAddresses(addr.String()).
+			// Ready must be EXPLICIT: a nil Ready reads as not-ready to
+			// Kubernetes and to darwin-net's proxy alike.
+			WithConditions(discoveryv1ac.EndpointConditions().WithReady(true).WithServing(true))).
+		WithPorts(ports...)
+	if _, err := h.cfg.Client.DiscoveryV1().EndpointSlices(ServiceNamespace).Apply(ctx, slice,
+		metav1.ApplyOptions{FieldManager: endpointFieldManager, Force: true}); err != nil {
+		h.log.Warn("apply canonical ingress endpointslice", "err", err)
+	}
+}
+
+// retractEndpoints deletes the canonical Service's EndpointSlice, so a Service
+// whose listeners are gone has no backend rather than a dead one. It is called
+// from retractStatus, on every path that retracts the statuses. NotFound is
+// success: nothing was published, or a previous retraction already ran.
+func (h *Host) retractEndpoints(ctx context.Context) {
+	err := h.cfg.Client.DiscoveryV1().EndpointSlices(ServiceNamespace).Delete(ctx, endpointSliceName, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		h.log.Warn("retract canonical ingress endpointslice", "err", err)
 	}
 }

@@ -220,10 +220,11 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// Ingress listener ports. 80/443 is the production posture; an EXPLICIT
 	// high-port pair (e.g. 8080/8443) is the integration-tier mode. There is
 	// deliberately NO silent fallback between the two — a failed bind is logged and
-	// boundedly retried, never re-ported. The listeners bind the WILDCARD
-	// in-process (a wildcard bind is unprivileged on Darwin at any port), so no netd
-	// authorization is involved; they are started BEFORE svclb so they win a contest
-	// for these ports against a user LoadBalancer Service declaring them.
+	// boundedly retried, never re-ported. The listeners bind the WILDCARD; a
+	// privileged port goes through the root netd helper when one is present
+	// (netd authorizes it against the canonical kube-system/k3sm-ingress Service),
+	// a high port binds in-process. They are started BEFORE svclb so they win a
+	// contest for these ports against a user LoadBalancer Service declaring them.
 	fs.IntVar(&opts.ingressHTTPPort, "ingress-http-port", 80, "ingress HTTP listener port, bound on ALL interfaces (80 = production; an explicit high port is the integration-tier mode; 0 disables the HTTP listener)")
 	fs.IntVar(&opts.ingressHTTPSPort, "ingress-https-port", 443, "ingress HTTPS listener port, bound on ALL interfaces (443 = production; an explicit high port is the integration-tier mode; 0 disables the HTTPS listener)")
 	// The node-local OCI ingest registry (pkg/registrysvc). DISABLED by default —
@@ -1204,7 +1205,7 @@ func runServer(args []string) (err error) {
 	// NOT include 80/443 — those are legitimate LoadBalancer ports — so the
 	// residual race is a documented ceiling, not a guarded invariant.
 	if mode.DataPath() {
-		lbCfg, ingressCfg, err := lbHostingConfigs(cs, nodeOpts, opts.ingressHTTPPort, opts.ingressHTTPSPort, logger)
+		lbCfg, ingressCfg, err := lbHostingConfigs(cs, nodeOpts, netdSocketFor(mode), opts.ingressHTTPPort, opts.ingressHTTPSPort, logger)
 		if err != nil {
 			logger.Error("ingress + svclb hosting disabled", "err", err)
 		} else {
