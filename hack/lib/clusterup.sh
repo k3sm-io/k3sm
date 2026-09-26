@@ -441,7 +441,11 @@ node_up() {
 	( cd "$REPO_ROOT" && CGO_ENABLED=0 go build -o "$BIN/k3sm" ./cmd/k3sm )
 	codesign -s - -f "$BIN/k3sm" >/dev/null 2>&1 || true
 	rm -rf "$pod_root"; mkdir -p "$pod_root"
-	nohup "$BIN/k3sm" node --kubeconfig "$KUBECONFIG" --node-name "$node_name" --pod-root "$pod_root" --node-ip 127.0.0.1 --runtime hostprocess > "$K3SM_WORKDIR/node.log" 2>&1 &
+	# Every role validates its container log dir at boot, and the /var/log/pods
+	# default exists only after `k3sm install`; so each launch gets a per-run one
+	# under its pod root, the layout `k3sm dev` uses (created after the reset).
+	mkdir -p "$pod_root/log/pods"
+	nohup "$BIN/k3sm" node --kubeconfig "$KUBECONFIG" --node-name "$node_name" --pod-root "$pod_root" --pod-logs-dir "$pod_root/log/pods" --node-ip 127.0.0.1 --runtime hostprocess > "$K3SM_WORKDIR/node.log" 2>&1 &
 	NODE_PID=$!
 	local n=0
 	until [ "$(kc get node "$node_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = "True" ]; do
@@ -494,6 +498,8 @@ server_up() {
 	# the previous gate's datastore or listeners (see cluster_reset).
 	cluster_reset || return 1
 	mkdir -p "$BIN" "$SERVER_WORKDIR"
+	# The per-run container log dir (see node_up); after cluster_reset, which wipes it.
+	mkdir -p "$K3SM_WORKDIR/pods/log/pods"
 	( cd "$REPO_ROOT" && CGO_ENABLED=1 go build -o "$BIN/kubectl-dl" ./cmd/k3sm >/dev/null 2>&1 ) || true
 	# The runtimed runtime resolves three pod-support artifacts as SIBLINGS of the
 	# running executable: k3sm-execshim (sandbox.FindExecShim — also falls back to
@@ -551,6 +557,7 @@ server_up() {
 	nohup env CGO_ENABLED=1 "${K3SM_CMD[@]}" server \
 		--work-dir "$SERVER_WORKDIR" --node-name "$node_name" --node-ip 127.0.0.1 \
 		--runtime "$runtime" --pod-root "$K3SM_WORKDIR/pods" --network "$network" \
+		--pod-logs-dir "$K3SM_WORKDIR/pods/log/pods" \
 		"${extra[@]+"${extra[@]}"}" \
 		> "$K3SM_WORKDIR/server.log" 2>&1 &
 	SERVER_PID=$!
@@ -652,7 +659,8 @@ agent_up() {
 	fi
 	AGENT_WORKDIR="$K3SM_WORKDIR/agent"
 	AGENT_POD_ROOT="$K3SM_WORKDIR/agent-pods"
-	mkdir -p "$AGENT_WORKDIR" "$AGENT_POD_ROOT" || return 1
+	# The per-run container log dir (see node_up).
+	mkdir -p "$AGENT_WORKDIR" "$AGENT_POD_ROOT" "$AGENT_POD_ROOT/log/pods" || return 1
 
 	# The token is minted from the SERVER's work dir, so its K10 prefix pins the CA
 	# the server actually serves. `token create` prints the token on stdout and its
@@ -675,6 +683,7 @@ agent_up() {
 	nohup env CGO_ENABLED=1 K3SM_TOKEN="$token" "${K3SM_CMD[@]}" agent \
 		--server 127.0.0.1 --node-name "$node_name" \
 		--work-dir "$AGENT_WORKDIR" --pod-root "$AGENT_POD_ROOT" \
+		--pod-logs-dir "$AGENT_POD_ROOT/log/pods" \
 		--runtime "$runtime" --network "$network" --api-port "$APISERVER_PORT" \
 		> "$K3SM_WORKDIR/agent.log" 2>&1 &
 	AGENT_PID=$!
