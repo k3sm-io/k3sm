@@ -42,11 +42,25 @@
 #
 # Tier: lab (two-macs). Exit 0 iff every check passes (or skipped pending lab).
 #
-# Usage: K3SM_LAB=1 KUBECONFIG=~/.kube/config [K3SM_WORKER=<node>] hack/lab/m3.sh
+# Conformance helpers on the worker: the worker-pinned criterion execs the SAME
+# absolute helper path on the worker Mac ($K3SM_CONFORMANCE_BIN, default
+# /tmp/k3sm-conformance-bin -- there is no image distribution for native pods).
+# The gate pre-builds the helpers here, then stages them (hack/lib/conformance-stage.sh):
+#   K3SM_WORKER_SSH   user@host of the worker Mac; when set, the helpers are copied
+#                     to the identical path there over ssh/scp. When unset, the gate
+#                     prints the prerequisite and the operator stages them by hand.
+#   K3SM_SSH_BIN      ssh client to use (default: ssh)
+#   K3SM_SCP_BIN      scp client to use (default: scp)
+# A $K3SM_CONFORMANCE_BIN left root-owned by a sudo gate run aborts the gate with
+# the remedy, before any build.
+#
+# Usage: K3SM_LAB=1 KUBECONFIG=~/.kube/config [K3SM_WORKER=<node>] \
+#            [K3SM_WORKER_SSH=<user@worker-host>] hack/lab/m3.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 . "$HERE/../lib/conformance.sh"
+. "$HERE/../lib/conformance-stage.sh"
 
 # ── Lab guard: only run under K3SM_LAB=1 (a real two-Mac rig). ────────────────
 if [ "${K3SM_LAB:-}" != "1" ]; then
@@ -101,12 +115,35 @@ export K3SM_WORKER="$WORKER"
 # (a)+(b) also run single-node in hack/acceptance/m3.sh; (c) is two-Mac-only here.
 #
 # The conformance helper binaries (e2e/testdata/cmd) are built+ad-hoc-signed by the
-# suite's TestMain into $K3SM_CONFORMANCE_BIN on THIS host. NOTE: native pods exec a
-# host binary path, so the WORKER criterion requires the SAME helper binary to be
-# pre-staged on the worker Mac at the same $K3SM_CONFORMANCE_BIN path (there is no
-# image distribution); stage it before running this gate.
+# suite's TestMain into $K3SM_CONFORMANCE_BIN on THIS host. Native pods exec a host
+# binary path, so the WORKER criterion needs the SAME helpers at the SAME absolute
+# path on the worker Mac. The path is minted once here and reused verbatim on both.
+# Order: preflight the dir (a root-owned leftover aborts with the remedy), pre-build
+# the helpers by running the suite with no test selected (TestMain builds them
+# whenever $KUBECONFIG is set), stage them on the worker, THEN run the criteria.
+# The criteria run rebuilds the local copies from the same source into the same path.
 export K3SM_CONFORMANCE_BIN="${K3SM_CONFORMANCE_BIN:-/tmp/k3sm-conformance-bin}"
+if ! conformance_bin_preflight "$K3SM_CONFORMANCE_BIN"; then
+	echo "M3: $PASS passed, $FAIL failed (aborted: conformance helper dir unusable)"; exit 1
+fi
 mkdir -p "$K3SM_CONFORMANCE_BIN"; chmod 755 "$K3SM_CONFORMANCE_BIN"
+HELPERS=()
+while IFS= read -r h; do HELPERS+=("$h"); done < <(conformance_helper_names "$REPO_ROOT")
+if [ "${#HELPERS[@]}" -eq 0 ]; then
+	echo "M3: no conformance helpers found under $REPO_ROOT/e2e/testdata/cmd -- aborting" >&2; exit 1
+fi
+if ! (cd "$REPO_ROOT" && CGO_ENABLED=1 go test -tags e2e -count=1 -run '^$' ./e2e/... >/dev/null); then
+	ladder no "m3.S  pre-build the conformance helpers into $K3SM_CONFORMANCE_BIN"
+	echo "M3: $PASS passed, $FAIL failed"; exit 1
+fi
+stage_how="left to the operator (prerequisite notice above)"
+[ -z "${K3SM_WORKER_SSH:-}" ] || stage_how="done via $K3SM_WORKER_SSH"
+if conformance_stage_worker "$K3SM_CONFORMANCE_BIN" "${HELPERS[@]}"; then
+	ladder ok "m3.S  conformance helpers built at $K3SM_CONFORMANCE_BIN (${HELPERS[*]}); worker staging $stage_how"
+else
+	ladder no "m3.S  stage the conformance helpers on the worker ($K3SM_WORKER_SSH)"
+	echo "M3: $PASS passed, $FAIL failed"; exit 1
+fi
 M3_CRITERIA=(M3_NodePort M3_PVCPersistsAcrossRestart M3_InPodKubectlAndDNSOnWorker)
 if run_conformance_slice "$REPO_ROOT" "TestM3" 900s "${M3_CRITERIA[@]}"; then
 	ladder ok "m3.A  M3 conformance suite (NodePort, PVC persistence, in-pod kubectl + cluster DNS on the joined worker)"
