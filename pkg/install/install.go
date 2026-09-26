@@ -55,6 +55,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/runtimed/pkg/sandbox"
@@ -2332,6 +2333,21 @@ func artifactManifest(cfg Config) []artifact {
 		artifact{kind: kindDir, disp: dispPreserve, path: MeshKeyDir, assertExists: false},
 		artifact{kind: kindFile, disp: dispPreserve, path: cfg.meshKeyHelperPath(), assertExists: false},
 	)
+	// The one leaf inside that preserved key dir that is REMOVED: the node pod
+	// CIDR netd adopted from this role's join and persisted so a restart the node
+	// daemon did not drive keeps the same /24. It is state OF A ROLE, not of the
+	// machine. A role change goes through uninstall (refuseCrossRole refuses
+	// anything else), so if it survived, the returning role's netd would restore
+	// the other role's /24 at start and admit pod aliases against a boundary the
+	// cluster handed to a node that no longer exists. Removing it costs nothing:
+	// the next join hands netd its pod CIDR again. The directory, node.key and the
+	// helper key above stay exactly as they are.
+	//
+	// It sits after the key-dir entries and before the daemons, so the reverse
+	// uninstall walk removes it only once netd has been booted out and can no
+	// longer rewrite it. Install never writes it (netd does), so nothing lays it
+	// down; assertExists is false because a node that never adopted has none.
+	items = append(items, artifact{kind: kindFile, disp: dispRemove, path: netdsvc.NodeIdentityPath(MeshKeyDir), assertExists: false})
 	// The node daemon AFTER netd, and it is the ROLE's daemon: io.k3sm.server on
 	// a control plane, io.k3sm.agent on a joining worker. Exactly one of them is
 	// ever in a manifest — a Mac that carried both would register two nodes out

@@ -34,6 +34,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/netdsvc"
 )
 
 // TestMain points the three GLOBAL declaration paths at a scratch directory for
@@ -1797,6 +1798,11 @@ func TestUninstallIdempotent(t *testing.T) {
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.server.plist",
 		"Bootout:io.k3sm.netd",
 		"RemoveAll:/Library/LaunchDaemons/io.k3sm.netd.plist",
+		// The pod CIDR netd adopted from this role's join, removed only after
+		// netd is booted out (so it cannot rewrite it) and the one leaf of the
+		// preserved mesh key dir that goes: a role change goes through
+		// uninstall, and the next role's netd must not restore this /24.
+		"RemoveAll:/var/lib/k3sm/run/keys/node-pod-cidr",
 		// The staged admin token, removed with the daemons rather than preserved
 		// with the rest of the data root: it is a system:masters credential with
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
@@ -2365,6 +2371,13 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 				t.Fatalf("unparsable WriteServiceUserFile record: %s", call)
 			}
 			created[path] = true
+		}
+		// The adopted-identity leaf is written by the netd daemon this install
+		// bootstrapped, not by install itself, so it is created only when netd
+		// was. It is admitted by that exact path and no other: the rest of the
+		// key dir it sits in must never appear in the removed set.
+		if toSet(recorded(installCalls, "Bootstrap:"))[NetdLabel] {
+			created[netdsvc.NodeIdentityPath(MeshKeyDir)] = true
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {
