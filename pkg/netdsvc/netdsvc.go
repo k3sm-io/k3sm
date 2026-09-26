@@ -27,7 +27,9 @@ package netdsvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -350,6 +352,12 @@ func (r fileMeshKeyResolver) Resolve(_ context.Context, ref string) (string, err
 	}
 	path := filepath.Join(r.dir, ref)
 	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		// The node daemon sees this text as its ConfigureMesh failure, so it
+		// names the remedy: the root installer re-provisions this copy from the
+		// node's work-dir key, and never mints over an identity that exists.
+		return "", fmt.Errorf("read mesh key %s: %w (run `sudo k3sm install` to re-provision it from this node's work-dir key; it never mints over an existing identity)", path, err)
+	}
 	if err != nil {
 		return "", fmt.Errorf("read mesh key %s: %w", path, err)
 	}

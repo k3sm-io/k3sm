@@ -123,16 +123,12 @@ const (
 	DNSShimName = "libk3sm_getaddrinfo_shim.dylib"
 	// DefaultLaunchDaemonDir is where the two .plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
-	// DefaultDataRoot is the _k3sm-owned data root (the _k3sm home): the
-	// control-plane work-dir, runtimed pods/storage/image cache live under it.
+	// DefaultDataRoot is the data root (the _k3sm home): the control-plane
+	// work-dir, runtimed pods/storage/image cache and the root-only mesh keys
+	// live under it. The root itself is root:wheel 0755, as k3s's data dir is;
+	// the trees the service user writes are its own. See OwnershipOf for the
+	// one table that says which level is whose.
 	DefaultDataRoot = "/var/lib/k3sm"
-	// DataRootMode and DataRootGID are the ownership POLICY for the data root:
-	// service-user-owned, group staff (the service user's primary group), 0750.
-	// They are named because two daemons apply them — `k3sm install` when it
-	// creates the root, and the netd helper when it finds one that has drifted —
-	// and a second literal would let those two answers diverge.
-	DataRootMode fs.FileMode = 0o750
-	DataRootGID  int         = 20
 	// DefaultRunDir is the runtime run directory under the default data root: the
 	// directory half of every k3sm rendezvous socket (netd.sock, runtimed.sock,
 	// the per-pod vm agent sockets) and of the mesh key dir. It is composed from
@@ -148,10 +144,22 @@ const (
 	// proxy's ClusterIP VIP aliases are admitted.
 	DefaultServiceCIDR = "10.43.0.0/16"
 	// MeshKeyDir is the directory the netd MeshKeyResolver reads the node's
-	// wireguard private key from. It lives inside the run dir, whose owner is the
-	// service user — see EnsureRunDir for what that ownership does and does not
-	// fence off.
-	MeshKeyDir = DefaultRunDir + "/keys"
+	// wireguard private key from, and where netd persists the node identity
+	// (netdsvc.NodeIdentityPath). It sits DIRECTLY under the root-owned data
+	// root, root:wheel 0700 (OwnershipOf(StateKeys)), so no unprivileged
+	// principal owns any component of its path and nothing but root can
+	// unlink or rename it.
+	MeshKeyDir = DefaultDataRoot + "/" + meshKeySubdir
+	// LegacyMeshKeyDir is where builds before the root-owned data root kept the
+	// same files: inside the service-user-owned run dir, where the service user
+	// could rename or unlink the whole directory. `k3sm install` moves anything
+	// it finds there into MeshKeyDir once (see migrateLegacyMeshKeys) and netd
+	// warns when it still finds a key there; nothing else reads it.
+	//
+	// The move is FORWARD-ONLY. A binary older than it looks for the keys here,
+	// finds nothing, and mints a new identity; the remedy before a downgrade is
+	// to copy the files from MeshKeyDir back here by hand.
+	LegacyMeshKeyDir = DefaultRunDir + "/" + meshKeySubdir
 	// MeshKeyRefServer and MeshKeyRefAgent are the BARE file names each node role
 	// stores its wireguard private key under — both in that role's work dir (the
 	// copy the unprivileged daemon loads) and in MeshKeyDir (the root-only copy
@@ -201,7 +209,7 @@ const (
 	// directory and for the daemon logs inside it: service-user-owned,
 	// group ADMIN (gid 80), directory 0750, files 0640.
 	//
-	// The group is `admin` and deliberately NOT the `staff` of DataRootGID.
+	// The group is `admin` and deliberately NOT the `staff` of ServiceTreeGID.
 	// staff is the primary group of every ordinary macOS account, so a
 	// staff-readable log tree is a world-readable one under another name, and
 	// tightening the mode over it would buy nothing. `admin` is the
@@ -478,6 +486,20 @@ type OwnedEntry struct {
 	Kind EntryKind
 }
 
+// DirHandle is a directory held open by descriptor (System.OpenDirNoFollow).
+// Every method acts on the entry name DIRECTLY inside the held directory,
+// relative to its descriptor, and never follows a symlink.
+type DirHandle interface {
+	// ReadEntry returns the bytes of the regular file name. A symlink or any
+	// other non-regular entry is refused with ErrNotRegularFile; a missing one
+	// has ReadFile's fs.ErrNotExist contract.
+	ReadEntry(name string) ([]byte, error)
+	// RemoveEntry unlinks the file name. Absent is success.
+	RemoveEntry(name string) error
+	// Close releases the descriptor.
+	Close() error
+}
+
 // System is the privileged-operation seam install/uninstall drive. The real
 // darwin implementation performs the root syscalls/tools; tests inject a fake so
 // the orchestration runs without privilege.
@@ -616,7 +638,7 @@ type System interface {
 	// EnsureRunDir creates (or repairs) the runtime run directory owned by the
 	// service uid (group staff, 0700) — the directory the _k3sm node binds its
 	// runtimed control socket in (RunDir / provider.RuntimedSocketPath), and the
-	// parent of the vm guest-agent socket dir and the mesh key dir.
+	// parent of the vm guest-agent socket dir.
 	//
 	// It must run BEFORE either daemon bootstraps. Whichever daemon starts first
 	// creates a missing run dir, and that is root netd — which left it root:wheel,
@@ -628,13 +650,12 @@ type System interface {
 	// build left root-owned instead of silently keeping the socket unbindable.
 	//
 	// What the ownership does NOT fence off, stated plainly: root netd still
-	// creates netd.sock and reads MeshKeyDir inside a directory the service user
-	// owns (root bypasses the mode), so _k3sm — the control plane, which already
-	// drives netd over that socket — can rename or replace either. That is a
-	// smaller trust surface than it looks (netd takes its orders from _k3sm
-	// regardless), and it is the price of the service user owning the one
-	// directory it must write in; per-uid isolation is the vm RuntimeClass's job,
-	// not this directory's.
+	// creates netd.sock inside a directory the service user owns (root bypasses
+	// the mode), so _k3sm — the control plane, which already drives netd over
+	// that socket — can rename or replace it. That is a smaller trust surface
+	// than it looks (netd takes its orders from _k3sm regardless). The mesh
+	// keys are deliberately NOT in this directory: they live in MeshKeyDir,
+	// directly under the root-owned data root.
 	EnsureRunDir(dir string, uid uint32) error
 	// EnsureVMRunDir creates (or repairs) the vm guest-agent socket directory
 	// owned by the service uid (group staff, 0700). runtimed binds a per-pod
@@ -648,18 +669,51 @@ type System interface {
 	// mode, owned by root:wheel — MeshKeyDir, which netd's MeshKeyResolver reads
 	// this node's wireguard private key out of in helper mode.
 	//
-	// It is the ONE directory under the run dir that is NOT handed to the service
-	// user, which is why it has its own method rather than riding EnsureRunDir's:
-	// the two answers must not be able to drift into one. Its parent is
-	// service-user-owned (EnsureRunDir), so a root-owned child inside it is
-	// exactly what the mode has to say, and re-applying owner and mode on every
-	// install repairs a directory an earlier build — or the daemon's own
-	// best-effort runtime write — left at looser terms.
+	// It is the one level under the data root besides the root itself that is
+	// NOT handed to the service user (OwnershipOf(StateKeys)), which is why it
+	// has its own method rather than riding EnsureOwnedDir with a service uid:
+	// the two answers must not be able to drift into one. Its parent is the
+	// root-owned data root, so no unprivileged principal can rename or unlink
+	// it, and re-applying owner and mode on every install repairs a directory
+	// an earlier build — or the daemon's own best-effort runtime write — left
+	// at looser terms.
 	//
 	// The mode is a PARAMETER for WriteServiceUserFile's reason: the policy a
 	// caller applied is then visible at the seam, and a unit test can assert it
 	// without a real filesystem or privilege.
 	EnsureMeshKeyDir(dir string, mode fs.FileMode) error
+	// EnsureOwnedDir creates (or repairs) one level of the state tree at exactly
+	// uid:gid and mode, re-applying all three on an existing directory and
+	// refusing a symlink at dir rather than chowning its target. It creates the
+	// one level only: its parent is always a level ensured before it.
+	//
+	// It is the seam every row of the ownership table is applied through (see
+	// OwnershipOf and ensureStateTree): the data root with root:wheel, each
+	// service-user tree with the service uid. The owner, group and mode are
+	// PARAMETERS so the row a caller applied is visible at the seam and a test
+	// can assert that the root was never handed to the service user.
+	EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) error
+	// RemoveEntry removes the entry name DIRECTLY inside dir — a file, or an
+	// EMPTY directory — and nothing else. Absent (dir or entry) is success, so a
+	// re-run is idempotent.
+	//
+	// It is descriptor-relative (dir opened O_NOFOLLOW|O_DIRECTORY, the entry
+	// unlinked against that descriptor) because its one caller removes the
+	// legacy mesh keys from inside the run dir, which the service user owns:
+	// a by-path remove there could be redirected by a directory swapped for a
+	// symlink between the check and the unlink, and root would then delete a
+	// file of the service user's choosing.
+	RemoveEntry(dir, name string) error
+	// OpenDirNoFollow opens dir and HOLDS it: a directory whose final component
+	// is a symlink is refused (an error that is not fs.ErrNotExist), and every
+	// read and removal through the returned handle is descriptor-relative, so a
+	// rename of the path afterwards cannot redirect them. A missing dir has
+	// ReadFile's fs.ErrNotExist contract.
+	//
+	// Its one caller is the one-time key move, which reads the legacy keys out
+	// of a directory inside the service user's run dir: a by-path read there is
+	// a check-then-use race against the one account that can rename the path.
+	OpenDirNoFollow(dir string) (DirHandle, error)
 	// EnsureRootDir creates dir root-owned at mode (idempotent, re-applying the
 	// mode on an existing directory). It is the seam the data-volume migration
 	// carves its staging mount point with: unlike the Ensure*Dir methods above
@@ -733,12 +787,6 @@ type System interface {
 	// the policy is testable without a filesystem and the seam cannot grow a
 	// second opinion about what "enough room" means.
 	InstallSpace(dir string, sources []string) (free, need uint64, err error)
-	// LookupServiceUID resolves the named service account's uid, reporting
-	// false when the account does not exist yet. It is three-valued in
-	// practice: install may run BEFORE EnsureServiceUser has created _k3sm, and
-	// a data volume mounted at that moment is left to root rather than chowned
-	// to a uid nobody has been assigned.
-	LookupServiceUID(name string) (int, bool)
 	// WriteDataVolumeRecord writes the data-volume record at path, atomically
 	// and root-owned 0644.
 	//
@@ -859,7 +907,7 @@ type System interface {
 	// ErrNotRegularFile); a missing file keeps ReadFile's fs.ErrNotExist contract.
 	//
 	// It exists because of one file whose directory the installer does not own.
-	// The mesh key's work-dir copy lives under the service-user-owned data root,
+	// The mesh key's work-dir copy lives in a service-user-owned work dir,
 	// and install reads it AS ROOT and copies its bytes into a root-only
 	// directory. With an ordinary read, the service uid could replace that file
 	// with a symlink to anything on the Mac and have root copy the target out for
@@ -1113,8 +1161,9 @@ type Config struct {
 	// ServerArgsRecord is where the operator's own server arguments are recorded
 	// so they survive the uninstall that removes the plist they were read from.
 	// Empty takes dataroot.DefaultServerArgsRecordPath — root-owned
-	// /Library/Preferences, deliberately NOT the _k3sm-owned data root; see that
-	// constant for the privilege reason. A test points it at a scratch file.
+	// /Library/Preferences, deliberately NOT under the data root, whose trees
+	// the service user owns; see that constant for the privilege reason. A test
+	// points it at a scratch file.
 	ServerArgsRecord string
 	// ClusterCA is the cluster CA certificate PEM the admin kubeconfig pins as
 	// certificate-authority-data on a MESH install — the posture in which the
@@ -1370,7 +1419,7 @@ func legacyAgentArtifacts() map[string]bool {
 // The owner can always read its own 0600 file. An other-read bit lets everyone
 // read it, the service user included. A GROUP-read bit only helps when the group
 // is one the service user is IN — and the only group this installer can assert
-// that about is DataRootGID (staff), the service user's primary group. A
+// that about is ServiceTreeGID (staff), the service user's primary group. A
 // root:wheel 0640 file carries a group-read bit and is still unreadable to
 // _k3sm, so a predicate that took any group-read bit as "readable" would wave
 // exactly the file an operator most needs to be told about straight through.
@@ -1428,7 +1477,7 @@ func serviceCanRead(e OwnedEntry, svcUID, svcGID int) bool {
 // owns the directory while a root-owned artifact inside it is still pending.
 func adoptLegacyAgentFiles(sys System, cfg Config, uid uint32) error {
 	dir := cfg.agentWorkDir()
-	svcUID, svcGID := int(uid), DataRootGID
+	svcUID, svcGID := int(uid), ServiceTreeGID
 	self, err := sys.Owner(dir)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -1737,6 +1786,53 @@ func stageTokenFile(sys System, uid uint32, token, dst, what string, mode, dirMo
 	return nil
 }
 
+// ensureStateTree applies the ownership table (OwnershipOf) to the data root and
+// every service-user tree under it, in the table's order.
+//
+// The root goes FIRST, and that order is the safety argument for everything
+// after it. Each level is repaired by path, and a by-path chown is only as safe
+// as the directory the path is resolved in: once the root is root:wheel 0755,
+// no unprivileged principal can rename or replace any entry directly inside it,
+// so the service-user trees chowned next are the directories that were there
+// when they were checked (and EnsureOwnedDir refuses one that is a symlink).
+// Healing a root an older build left service-user-owned is this same first
+// step; nothing else in the installer ever hands the root to the service user.
+//
+// The trees are created as root because the service user can no longer create
+// a top-level directory of its own under a root-owned root.
+//
+// Three rows are applied by a later step instead, each through its own seam and
+// with the same row's values:
+//
+//   - the key directory is MeshKeyDir, a fixed path the netd plist names
+//     whatever this Config's data root is, and provisionMeshKey ensures it
+//     (EnsureMeshKeyDir) before it writes a key;
+//   - the two work dirs are handed over by the steps that write into them
+//     (WriteServiceUserFile creates its parent at ServerTokenDirMode or
+//     AgentTokenDirMode), and the agent's is ALSO where adoptLegacyAgentFiles
+//     migrates root-owned credentials files-first, directory-last, so the
+//     service user never owns that directory while a root-owned file in it is
+//     still pending. Chowning it here, before that step, would break the order.
+func ensureStateTree(sys System, cfg Config, uid uint32) error {
+	appliedLater := map[StateLevel]bool{
+		StateKeys:                        true,
+		StateLevel(sandbox.ServerSubdir): true,
+		StateLevel(agentWorkSubdir):      true,
+	}
+	for _, level := range StateLevels() {
+		if appliedLater[level] {
+			continue
+		}
+		own, _ := OwnershipOf(level)
+		dir := level.Path(cfg.DataRoot)
+		if err := sys.EnsureOwnedDir(dir, own.UID(int(uid)), own.GID, own.Mode); err != nil {
+			return fmt.Errorf("install: ensure %s (%d:%d %#o): %w", dir, own.UID(int(uid)), own.GID, own.Mode, err)
+		}
+	}
+	cfg.Logger.Info("ensured the data root and the service user's trees under it", "root", cfg.DataRoot, "trees", len(ServiceLevels()))
+	return nil
+}
+
 // meshKeyRef is the bare file name THIS role stores its wireguard private key
 // under, in both copies. It is an accessor rather than a branch at each use so
 // no code path can provision one role's identity under the other's name.
@@ -1778,11 +1874,10 @@ var ErrNotRegularFile = errors.New("not a regular file")
 // (nil, nil) when that copy does not exist — the only absence this step treats
 // as a posture rather than a failure.
 //
-// Everything else is refused, and refused LOUDLY, because both copies sit in
-// directories root does not own outright: the work-dir copy is the service
-// user's, and the root-only copy's PARENT is (the run dir). So a file there is
-// not automatically this node's identity — it is whatever the last writer put
-// there. Two things are therefore checked before any byte is copied anywhere:
+// Everything else is refused, and refused LOUDLY. The work-dir copy sits in a
+// directory the service user owns, so a file there is not automatically this
+// node's identity — it is whatever the last writer put there; the root-only
+// copy is held to the same checks so one reader serves both. Two things are therefore checked before any byte is copied anywhere:
 // the path is a regular file that was opened without following a symlink, and
 // the bytes decode as a usable Curve25519 private key. what names the copy in
 // the error, so the operator is told which of the two to look at.
@@ -1842,18 +1937,21 @@ func readMeshKey(sys System, path, what string) ([]byte, error) {
 // half of a different one. An unusable copy with NO work-dir key to repair from
 // is a hard failure — see readMeshKey.
 //
-// What this does NOT buy, stated plainly: MeshKeyDir's PARENT is the run dir,
-// which is service-user-owned by necessity (EnsureRunDir), so _k3sm can rename,
-// replace or unlink the key dir and anything beneath it. Root ownership here
-// protects the key's CONFIDENTIALITY — no other account on the Mac can read the
-// bytes — and not its integrity against the one account that already drives
-// netd over its socket. Every read below is O_NOFOLLOW and type-checked for
-// that reason, and every write is a temp-and-rename, so neither operation can be
-// redirected by something planted at the path. Per-uid isolation of that account
-// is the vm RuntimeClass's job, not this directory's.
+// MeshKeyDir sits directly under the root-owned data root (OwnershipOf), so no
+// unprivileged principal owns any component of its path: the root-only copy is
+// protected in its confidentiality AND against being renamed or unlinked by the
+// service user. The work-dir copy is still the service user's, so every read
+// below is O_NOFOLLOW and type-checked, and every write is a temp-and-rename.
+//
+// Before any of that, a key an older build left in LegacyMeshKeyDir is moved
+// into MeshKeyDir (migrateLegacyMeshKeys), so an upgrade reads the identity
+// the node already has rather than finding the new directory empty.
 func provisionMeshKey(sys System, cfg Config, uid uint32) error {
 	if err := sys.EnsureMeshKeyDir(MeshKeyDir, MeshKeyDirMode); err != nil {
 		return fmt.Errorf("install: ensure the root-only mesh key dir %s: %w", MeshKeyDir, err)
+	}
+	if err := migrateLegacyMeshKeys(sys, cfg.Logger); err != nil {
+		return err
 	}
 	workPath, helperPath := cfg.meshKeyWorkPath(), cfg.meshKeyHelperPath()
 	work, err := readMeshKey(sys, workPath, "work-dir")
@@ -1922,6 +2020,127 @@ func provisionMeshKey(sys System, cfg Config, uid uint32) error {
 	}
 	cfg.Logger.Info("provisioned this node's mesh key for the netd helper (root-only; the daemon passes netd the ref, never the key)",
 		"path", helperPath, "keyRef", cfg.meshKeyRef())
+	return nil
+}
+
+// legacyKeyLeaves are the files an older build kept in LegacyMeshKeyDir, and so
+// the ones the one-time move carries: both roles' mesh keys and the node
+// identity netd persists beside them.
+func legacyKeyLeaves() []string {
+	return []string{MeshKeyRefServer, MeshKeyRefAgent, netdsvc.NodeIdentityFileName}
+}
+
+// migrateLegacyMeshKeys moves the files an older build kept in
+// LegacyMeshKeyDir (inside the service-user-owned run dir) into MeshKeyDir
+// (directly under the root-owned data root). It runs once per install, after
+// MeshKeyDir exists and before provisionMeshKey reads it, and it is
+// FORWARD-ONLY: a binary older than this move looks in LegacyMeshKeyDir, finds
+// nothing, and mints a new identity, so the remedy before a downgrade is to copy
+// the files back by hand.
+//
+// Per leaf, in this order:
+//
+//  1. When MeshKeyDir has no copy, the legacy bytes are copied in root-only
+//     (WriteRootOnlyFile, fsynced), read back, and compared. A key is also
+//     validated as a wireguard private key first: the legacy directory was the
+//     service user's, so its content is whatever the last writer left.
+//  2. Only when the new copy exists (just written and verified, or already
+//     there) is the legacy leaf removed. Removal is independent of the copy: a
+//     stale legacy leaf beside an existing new copy is removed and nothing is
+//     copied, because the new copy is the identity the node already uses.
+//  3. The emptied legacy directory is removed last.
+//
+// A symlink at the legacy directory, at its parent, or at a legacy leaf is a
+// hard error and nothing is touched: those are service-user-writable places, and
+// following a link planted there would have root copy or delete a file of the
+// planter's choosing. Nothing is ever minted here; minting stays
+// provisionMeshKey's, under its rule that it happens only when neither copy
+// exists.
+func migrateLegacyMeshKeys(sys System, logger *slog.Logger) error {
+	// The run dir sits in the root-owned data root (ensured at step 1a, which
+	// refuses a symlink there), so nothing unprivileged can swap it from here
+	// on; it is checked once for a clear error.
+	parent := filepath.Dir(LegacyMeshKeyDir)
+	switch e, err := sys.Owner(parent); {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil // no run dir: a fresh install
+	case err != nil:
+		return fmt.Errorf("install: inspect %s: %w", parent, err)
+	case e.Kind != EntryDir:
+		return fmt.Errorf("install: %s is %s, not a directory; refusing to move keys through it (remove it by hand, then re-run `sudo k3sm install`)", parent, e.Kind)
+	}
+	// The keys dir itself is INSIDE the service user's run dir, so it is held
+	// by one descriptor opened without following a symlink, and every read and
+	// removal below goes through that descriptor: the service user can rename
+	// the path at any moment, but not the directory this install already holds.
+	legacyDir, err := sys.OpenDirNoFollow(LegacyMeshKeyDir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil // no legacy tree: a fresh install, or one already moved
+	case err != nil:
+		return fmt.Errorf("install: open the legacy mesh key dir %s: %w (refusing to move keys through it; remove it by hand, then re-run `sudo k3sm install`)", LegacyMeshKeyDir, err)
+	}
+	defer func() { _ = legacyDir.Close() }()
+
+	for _, leaf := range legacyKeyLeaves() {
+		legacy := filepath.Join(LegacyMeshKeyDir, leaf)
+		dest := filepath.Join(MeshKeyDir, leaf)
+		old, err := legacyDir.ReadEntry(leaf)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			continue
+		case err != nil:
+			return fmt.Errorf("install: read the legacy %s: %w (refusing to move it; remove it by hand if it is not this node's, then re-run `sudo k3sm install`)", legacy, err)
+		}
+		_, err = sys.ReadRegularFile(dest)
+		switch {
+		case err == nil:
+			// The new tree already has this leaf: it is the node's identity, and
+			// the legacy one is stale. Nothing is copied.
+		case errors.Is(err, fs.ErrNotExist):
+			if err := validateLegacyLeaf(leaf, old); err != nil {
+				return fmt.Errorf("install: the legacy %s %w (it was not moved; remove it only if you accept that this node's mesh identity changes)", legacy, err)
+			}
+			if err := sys.WriteRootOnlyFile(dest, old, MeshKeyFileMode); err != nil {
+				return fmt.Errorf("install: move the legacy %s to %s: %w", legacy, dest, err)
+			}
+			got, rerr := sys.ReadRegularFile(dest)
+			if rerr != nil {
+				return fmt.Errorf("install: verify the moved %s: %w (the legacy copy %s is kept)", dest, rerr, legacy)
+			}
+			if !bytes.Equal(got, old) {
+				return fmt.Errorf("install: verify the moved %s: its bytes differ from %s (the legacy copy is kept)", dest, legacy)
+			}
+			logger.Info("moved a mesh key file out of the service user's run dir into the root-owned key dir (one-time; a binary older than this move would not find it)",
+				"from", legacy, "to", dest)
+		default:
+			return fmt.Errorf("install: read %s: %w", dest, err)
+		}
+		if err := legacyDir.RemoveEntry(leaf); err != nil {
+			return fmt.Errorf("install: remove the legacy %s: %w", legacy, err)
+		}
+	}
+	if err := sys.RemoveEntry(parent, filepath.Base(LegacyMeshKeyDir)); err != nil {
+		return fmt.Errorf("install: remove the legacy mesh key dir %s: %w (it may hold a file this install does not know; remove it by hand)", LegacyMeshKeyDir, err)
+	}
+	return nil
+}
+
+// validateLegacyLeaf checks a legacy file's bytes before they are promoted into
+// the root-only key dir: the legacy dir was the service user's, so its content
+// is whatever the last writer left there. A key must be a usable wireguard
+// private key; the node identity must be one parseable CIDR, the only thing
+// netd ever writes there.
+func validateLegacyLeaf(leaf string, b []byte) error {
+	if leaf == netdsvc.NodeIdentityFileName {
+		if _, err := netip.ParsePrefix(strings.TrimSpace(string(b))); err != nil {
+			return fmt.Errorf("is not a parseable CIDR: %w", err)
+		}
+		return nil
+	}
+	if _, err := bootstrap.WireguardPublicKey(string(b)); err != nil {
+		return fmt.Errorf("is not a usable wireguard private key: %w", err)
+	}
 	return nil
 }
 
@@ -2347,10 +2566,11 @@ func artifactManifest(cfg Config) []artifact {
 	//     which is the failure loadOrCreateMeshKey exists to prevent, and it is
 	//     already covered by DataRoot's own preserve entry ("kine state.db + mesh
 	//     keys").
-	//   - the helper copy and its directory sit under the run dir, so they follow
-	//     the run dir's disposition — preserved with DataRoot. Removing just this
-	//     copy would buy nothing while the work-dir copy of the SAME bytes stays,
-	//     and a reinstall re-provisions it from there regardless.
+	//   - the helper copy and its directory, MeshKeyDir, are root-owned state
+	//     directly under the data root and are preserved in their own right: a
+	//     reinstall picks the identity up where it left off (provisionMeshKey
+	//     restores the work-dir copy from it rather than minting). Removing the
+	//     whole tree for good is a separate, explicit operation, not uninstall.
 	//
 	// Neither path's existence is asserted: a data root an older build installed
 	// has no key until the install that provisions one, and a node that has never
@@ -2448,7 +2668,7 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 // (run via sudo): ensure _k3sm, copy the binary root-owned, write the two
 // plists, bootstrap netd (the helper) BEFORE server (which needs it), then write
 // the admin kubeconfig to the human's home. The caller has already verified root.
-func Install(ctx context.Context, sys System, cfg Config) error {
+func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	cfg = cfg.withDefaults()
 	// Taken before anything is written, and carried to the post-restart
 	// verification: it is what separates a failure THIS install caused from one
@@ -2587,13 +2807,41 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 		return err
 	}
 
+	// 0c. An UPGRADE stops the daemons the previous install left running before
+	//     anything under the data root changes owner: EnsureServiceUser below
+	//     already applies the root row of the ownership table. See
+	//     stopRunningDaemons; on a first install nothing is loaded and nothing
+	//     is booted out.
+	stopped, err := stopRunningDaemons(ctx, sys, m, cfg.Logger)
+	// Until step 4 takes over restarting them, a failure leaves the stopped
+	// daemons stopped, and the error says so rather than leaving the operator
+	// to discover it.
+	restartOwned := false
+	defer func() {
+		if err != nil && len(stopped) > 0 && !restartOwned {
+			err = fmt.Errorf("%w (the daemons stopped before the state tree was re-owned are still stopped: %s; re-run `sudo k3sm install`)", err, strings.Join(stopped, ", "))
+		}
+	}()
+	if err != nil {
+		return fmt.Errorf("install: stop the running daemons before re-owning the state tree: %w", err)
+	}
+
 	// 1. The service user must exist before the server LaunchDaemon (UserName=_k3sm)
-	//    can resolve it and before its _k3sm-owned data root is usable.
+	//    can resolve it and before the trees it owns under the data root exist.
 	uid, err := sys.EnsureServiceUser(cfg.ServiceUser, cfg.DataRoot)
 	if err != nil {
 		return fmt.Errorf("install: ensure service user %s: %w", cfg.ServiceUser, err)
 	}
 	cfg.Logger.Info("ensured service user", "user", cfg.ServiceUser, "uid", uid)
+
+	// 1a. The state tree, per the ownership table and BEFORE anything is written
+	//     under it: the data root root:wheel 0755, then every tree the
+	//     unprivileged daemons write, handed to the service user one by one. The
+	//     root going first is what makes the rest safe and what heals a root an
+	//     older build left service-user-owned. See ensureStateTree.
+	if err := ensureStateTree(sys, cfg, uid); err != nil {
+		return err
+	}
 
 	// 1b. The log dir must be writable by the service user before either daemon
 	//     bootstraps: launchd opens a UserName job's StandardOut/ErrorPath as
@@ -2690,8 +2938,8 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	// 1g. This node's wireguard identity, in both copies, for BOTH roles — see
 	//     provisionMeshKey. It sits with the token stagings because it is the
 	//     same kind of step (root hands the unprivileged daemon a credential it
-	//     could not place for itself), and after EnsureRunDir at 1c because the
-	//     root-only key dir is carved inside the run dir.
+	//     could not place for itself), and after the state tree at 1a because the
+	//     root-only key dir is carved directly under the root-owned data root.
 	if err := provisionMeshKey(sys, cfg, uid); err != nil {
 		return err
 	}
@@ -2900,6 +3148,7 @@ func Install(ctx context.Context, sys System, cfg Config) error {
 	//    Neither needs rewriting BECAUSE the paths are fixed: the swap moves
 	//    inodes, not names, so the plists' ProgramArguments and the launcher's
 	//    target mean the new tree the moment it is live.
+	restartOwned = true // step 4 restarts, and on failure reports, every daemon
 	if err := publishedWiring(ctx, sys, cfg, m, startedAt); err != nil {
 		return revertInstallRoot(ctx, sys, cfg, m, previous, err)
 	}
@@ -3326,6 +3575,25 @@ func NetdPlist(cfg Config) []byte {
 	})
 }
 
+// daemonEnv is the environment a service-user node daemon runs under: HOME is
+// the data root (the _k3sm home), and the Go module and build caches are pinned
+// inside the role's own work dir rather than left to derive from HOME.
+//
+// The pin is what keeps the boot-time kine build working under a root-owned
+// data root. Derived from HOME, the caches land at <home>/go/pkg/mod and
+// <home>/Library/Caches/go-build, and the service user cannot create a new
+// top-level directory in a root:wheel 0755 root. The work dir is already the
+// service user's (0700, see OwnershipOf), so nothing new has to be handed over.
+// The executor's module-cache lookup (`go env GOMODCACHE`) and the kine build's
+// inherited environment honour both variables as they are.
+func daemonEnv(dataRoot, workDir string) map[string]string {
+	return map[string]string{
+		"HOME":       dataRoot,
+		"GOMODCACHE": filepath.Join(workDir, "go", "mod"),
+		"GOCACHE":    filepath.Join(workDir, "go", "build"),
+	}
+}
+
 // serverFileLimit is the soft+hard RLIMIT_NOFILE (launchd NumberOfFiles) the
 // server AND agent LaunchDaemons request — both host a node, and a worker runs
 // the same Service proxy the control plane does. The process hosts the proxy /
@@ -3390,7 +3658,7 @@ func ServerPlist(cfg Config) []byte {
 		WorkingDirectory: cfg.DataRoot,
 		StdoutPath:       ServerLogPath(),
 		StderrPath:       ServerLogPath(),
-		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
+		EnvironmentVars:  daemonEnv(cfg.DataRoot, cfg.serverWorkDir()),
 		// Derived from the stages the server actually runs on its way out — see
 		// serverExitTimeOut. Never a hand-picked number: every stage's bound lives
 		// in its own package, and a literal here would be wrong the first time one
@@ -3556,7 +3824,7 @@ func AgentPlist(cfg Config) []byte {
 		WorkingDirectory: cfg.DataRoot,
 		StdoutPath:       AgentLogPath(),
 		StderrPath:       AgentLogPath(),
-		EnvironmentVars:  map[string]string{"HOME": cfg.DataRoot},
+		EnvironmentVars:  daemonEnv(cfg.DataRoot, cfg.agentWorkDir()),
 		ExitTimeOut:      agentExitTimeOut,
 		// The same RLIMIT_NOFILE raise the control plane gets, for the same
 		// reason and with the same reload contract: a worker hosts the Service

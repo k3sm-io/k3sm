@@ -134,8 +134,14 @@ func TestMeshKeyResolver(t *testing.T) {
 		}
 	})
 	t.Run("missing key errors (no embedded default)", func(t *testing.T) {
-		if _, err := r.Resolve(context.Background(), "absent.key"); err == nil {
-			t.Error("a missing key must error, never return an embedded default")
+		_, err := r.Resolve(context.Background(), "absent.key")
+		if err == nil {
+			t.Fatal("a missing key must error, never return an embedded default")
+		}
+		// The node daemon reports this text as its mesh bring-up failure, so it
+		// must name the remedy.
+		if !strings.Contains(err.Error(), "sudo k3sm install") {
+			t.Errorf("the missing-key error does not name the remedy: %v", err)
 		}
 	})
 	t.Run("path traversal rejected", func(t *testing.T) {

@@ -41,6 +41,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // logTailLines is how far back the server row reads for the line it quotes. A
@@ -901,6 +902,12 @@ func goneNodes(nodes []corev1.Node, now time.Time) map[string]bool {
 	return gone
 }
 
+// dataRootOwnerUID is the uid the ownership table assigns the data root itself.
+func dataRootOwnerUID(serviceUID int) int {
+	own, _ := install.OwnershipOf(install.StateRoot)
+	return own.UID(serviceUID)
+}
+
 // dataRootRow reports the posture of /var/lib/k3sm.
 //
 // The failure worth the most words is the SHADOW: the root is declared in
@@ -951,9 +958,12 @@ func (c Collector) dataRootRow(ctx context.Context, role dataroot.Role) (Row, *d
 		row.State, row.Severity = StateAbsent, SeverityFail
 		row.Detail = c.Paths.DataRoot + " does not exist"
 		row.Remedy = "sudo k3sm install"
-	case c.ServiceUID >= 0 && (st.OwnerUID != c.ServiceUID || !st.OwnerWritable):
+	case c.ServiceUID >= 0 && (st.OwnerUID != dataRootOwnerUID(c.ServiceUID) || !st.OwnerWritable):
+		// The root is root's (install.OwnershipOf); only the trees under it are
+		// the service user's. A root the service user owns is the layout older
+		// builds left, in which it could rename the root-only key dir.
 		row.State, row.Severity = StateWrongOwner, SeverityFail
-		row.Detail = fmt.Sprintf("%s is owned by uid %d; the %s service user cannot write it", c.Paths.DataRoot, st.OwnerUID, serviceUserName)
+		row.Detail = fmt.Sprintf("%s is owned by uid %d; it must be root's (the %s service user owns only the trees under it)", c.Paths.DataRoot, st.OwnerUID, serviceUserName)
 		row.Remedy = "sudo launchctl kickstart -k system/" + c.Paths.NetdLabel + "   # realigns it\nsudo k3sm install"
 	case st.Mounted && st.Volume != nil:
 		row.State, row.Severity = StateOK, SeverityOK

@@ -131,7 +131,10 @@ func TestInstallStagesTheRootAndPublishesItOnce(t *testing.T) {
 			"EnsureSymlink:" + cfg.installedBinary() + "->" + cfg.installedLink(),
 			"WriteLaunchDaemon:" + cfg.plistPath(NetdLabel),
 			"WriteLaunchDaemon:" + cfg.plistPath(ServerLabel),
-			"Bootout:" + NetdLabel,
+			// The restart's BOOTSTRAP; the upgrade's bootout now comes first, before
+			// the state tree is re-owned (stopRunningDaemons), and is pinned by
+			// TestMeshKeyDirLivesOutsideTheServiceUserRunDir (j).
+			"Bootstrap:" + NetdLabel,
 		} {
 			if i := idx(calls, after); i < at {
 				t.Errorf("%s (%d) happened BEFORE the publish (%d): it names a fixed path inside the tree the publish makes live", after, i, at)
@@ -215,10 +218,15 @@ func TestInstallStagingFailureLeavesTheLiveRootUntouched(t *testing.T) {
 	if !maps.Equal(f.treeUnder(cfg.InstallDir), before) {
 		t.Errorf("the live root changed: %v, want %v", f.treeUnder(cfg.InstallDir), before)
 	}
-	// The daemons were never touched either: the restart is on the far side of
-	// the publish, so a staging failure costs no downtime at all.
-	if idx(f.calls, "Bootout:"+NetdLabel) >= 0 {
-		t.Error("a staging failure booted a daemon out")
+	// The daemons were never RESTARTED onto a partial tree: the restart is on
+	// the far side of the publish. An upgrade stops the running daemons before
+	// the state tree is re-owned (stopRunningDaemons), so a staging failure
+	// leaves them stopped, and the error has to say so.
+	if idx(f.calls, "Bootstrap:"+NetdLabel) >= 0 {
+		t.Error("a staging failure bootstrapped a daemon onto a tree that was never published")
+	}
+	if !strings.Contains(err.Error(), "still stopped") {
+		t.Errorf("error = %v, want it to name the daemons the upgrade stopped", err)
 	}
 }
 

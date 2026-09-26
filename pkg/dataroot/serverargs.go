@@ -37,8 +37,9 @@ const ServerArgsRecordVersion = 1
 // beside the data-volume record, in root-owned /Library/Preferences.
 //
 // NOT inside the data root, and the difference is a privilege boundary rather
-// than a filing preference. The data root is owned by the unprivileged _k3sm
-// uid, so that uid can replace any file in it — including a record a later
+// than a filing preference. The data root itself is root's, but the trees
+// under it (the work dirs, the run dir) are owned by the unprivileged _k3sm uid,
+// so that uid can replace any file in them — including a record a later
 // root-run `k3sm install` would read and splice straight into the server
 // LaunchDaemon's argv. Keeping the record in a directory only root can write
 // means the only thing that can change the daemon's arguments is something that

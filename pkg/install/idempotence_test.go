@@ -114,10 +114,16 @@ func TestRunDirDerivation(t *testing.T) {
 	if got := RunDir(""); got != DefaultRunDir {
 		t.Errorf("RunDir(\"\") = %q, want the default run dir %q", got, DefaultRunDir)
 	}
-	for _, path := range []string{DefaultNetdSocket, MeshKeyDir, VMRunDir} {
+	for _, path := range []string{DefaultNetdSocket, VMRunDir} {
 		if !strings.HasPrefix(path, DefaultRunDir+"/") {
 			t.Errorf("%q must live under the run dir %q", path, DefaultRunDir)
 		}
+	}
+	// The mesh key dir is deliberately NOT under the run dir: the run dir is
+	// the service user's, and a parent's owner can unlink or rename its
+	// children. TestMeshKeyDirLivesOutsideTheServiceUserRunDir pins the rest.
+	if strings.HasPrefix(MeshKeyDir, DefaultRunDir+"/") {
+		t.Errorf("MeshKeyDir %q must not live under the service user's run dir %q", MeshKeyDir, DefaultRunDir)
 	}
 	if got, want := RunDir("/opt/lab"), "/opt/lab/run"; got != want {
 		t.Errorf("RunDir(%q) = %q, want %q", "/opt/lab", got, want)

@@ -643,19 +643,20 @@ func serviceGID() int {
 // empty datastore over a perfectly good one. launchd's KeepAlive re-runs netd,
 // so this refusal repeats — one line per attempt — until the volume is mounted.
 //
-// ALIGN: otherwise netd applies the install ownership policy to what it finds.
-// The data root itself gets install.DataRootMode owned by the service user when
-// it is missing or has drifted (the second 2026-09-05 defect: netd's MkdirAll
-// created a plain root root-owned and only re-owned run/). Each directory netd
-// creates below it — and the socket dir if it has drifted — gets the run-dir
-// policy: service user, 0700, non-recursively.
+// ALIGN: otherwise netd applies the install ownership table (install.OwnershipOf)
+// to what it finds — see alignStateTree. The data root is root's, root:wheel
+// 0755, so a root an older build left owned by the service user is healed here,
+// at the next netd start, and never re-owned to the service user; the trees the
+// unprivileged daemons write under it are the service user's, and netd creates
+// any that are missing, because under a root-owned root the service user cannot.
+// The mesh key directory is root's and netd never touches it or its contents.
 //
-// netd runs as root, so it needs no ownership of these directories to create
-// its socket inside them, and it never takes them for root: that was the
-// 2026-09-02 boot-order bug in which install set _k3sm 0700, netd re-owned
+// netd runs as root, so it needs no ownership of the run directory to create
+// its socket inside it, and it never takes that directory for root: that was
+// the 2026-09-02 boot-order bug in which install set _k3sm 0700, netd re-owned
 // root:wheel on bootstrap, and the server's dial failed permission-denied in a
 // crash loop. When the service user does not exist yet (a pre-install posture)
-// netd logs and leaves ownership exactly as it is.
+// netd logs and leaves the service-user trees exactly as they are.
 func listenNetd(socket, dataRoot string, gid int, own ownership) (net.Listener, error) {
 	dir := filepath.Dir(socket)
 	root := filepath.Clean(dataRoot)
@@ -667,39 +668,35 @@ func listenNetd(socket, dataRoot string, gid int, own ownership) (net.Listener, 
 	if st.Shadowed() {
 		return nil, dataroot.Refusal(root)
 	}
-	var rootPerm fs.FileMode
-	if fi, serr := own.Stat(root); serr == nil {
-		rootPerm = fi.Mode().Perm()
-	}
 	// Which levels MkdirAll is about to create — decided BEFORE it creates them,
 	// since afterwards every level looks equally present.
 	created := missingLevels(own, root, dir)
 
-	if err := own.MkdirAll(dir, 0o755); err != nil {
+	if err := own.MkdirAll(dir, install.StateRootMode); err != nil {
 		return nil, fmt.Errorf("create socket dir %s: %w", dir, err)
 	}
-	uid, sgid, lerr := own.Lookup(install.DefaultServiceUser)
+	if err := alignStateRoot(own, root); err != nil {
+		return nil, err
+	}
+	uid, _, lerr := own.Lookup(install.DefaultServiceUser)
 	if lerr != nil {
-		slog.Error("netd: service user not found; data-root ownership left as-is",
+		slog.Error("netd: service user not found; the service user's trees are left as-is",
 			"user", install.DefaultServiceUser, "err", lerr)
 	} else {
-		if !st.Exists || st.OwnerUID != uid || rootPerm != install.DataRootMode {
-			if err := own.Chown(root, uid, install.DataRootGID); err != nil {
-				return nil, fmt.Errorf("chown data root %s to the service user: %w", root, err)
-			}
-			if err := own.Chmod(root, install.DataRootMode); err != nil {
-				return nil, fmt.Errorf("chmod data root %s %#o: %w", root, install.DataRootMode, err)
-			}
-			slog.Warn("netd: aligned data-root ownership", "dir", root,
-				"from", fmt.Sprintf("uid=%d mode=%04o", st.OwnerUID, rootPerm),
-				"to", fmt.Sprintf("uid=%d mode=%04o", uid, install.DataRootMode))
+		if err := alignServiceTrees(own, root, uid); err != nil {
+			return nil, err
 		}
+		svc, _ := install.OwnershipOf(install.StateRun)
 		for _, level := range alignTargets(own, created, dir, uid) {
-			if err := alignRunDir(own, level, uid, sgid); err != nil {
+			if isTableLevel(root, level) {
+				continue // alignServiceTrees applied the table's row
+			}
+			if err := alignDir(own, level, svc.UID(uid), svc.GID, svc.Mode); err != nil {
 				return nil, err
 			}
 		}
 	}
+	warnLegacyMeshKeys(own, root)
 	// Remove a stale socket from a previous run so Listen does not EADDRINUSE.
 	if err := own.Remove(socket); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("remove stale socket %s: %w", socket, err)
@@ -769,16 +766,120 @@ func alignTargets(own ownership, created []string, dir string, uid int) []string
 	return append(created, dir)
 }
 
-// alignRunDir applies the run-directory policy to one directory: owned by the
-// service user, 0700, non-recursive.
-func alignRunDir(own ownership, dir string, uid, sgid int) error {
-	if err := own.Chown(dir, uid, sgid); err != nil {
-		return fmt.Errorf("chown %s to the service user: %w", dir, err)
+// alignStateRoot applies the table's root row to the data root: root:wheel,
+// install.StateRootMode. A root found with any other owner, group or mode — the
+// service-user-owned root every build before the root-owned layout left behind
+// — is re-owned and warned about once; a correct one is not touched.
+//
+// It runs BEFORE any service-user tree is touched, and that order is the safety
+// argument for alignServiceTrees: once the root is root's, no unprivileged
+// principal can rename or replace an entry directly inside it.
+func alignStateRoot(own ownership, root string) error {
+	want, _ := install.OwnershipOf(install.StateRoot)
+	fi, err := own.Lstat(root)
+	if err != nil {
+		return fmt.Errorf("stat data root %s: %w", root, err)
 	}
-	if err := own.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("chmod %s 0700: %w", dir, err)
+	uid, gid := statOwner(fi)
+	if uid == want.UID(0) && gid == want.GID && fi.Mode().Perm() == want.Mode {
+		return nil
+	}
+	if err := alignDir(own, root, want.UID(0), want.GID, want.Mode); err != nil {
+		return err
+	}
+	slog.Warn("netd: aligned data-root ownership", "dir", root,
+		"from", fmt.Sprintf("uid=%d gid=%d mode=%04o", uid, gid, fi.Mode().Perm()),
+		"to", fmt.Sprintf("uid=%d gid=%d mode=%04o", want.UID(0), want.GID, want.Mode))
+	return nil
+}
+
+// alignServiceTrees applies the table's service-user rows: each tree directly
+// under the data root that an unprivileged daemon writes is created when
+// missing (under a root-owned root the service user cannot create it) and
+// re-owned when it has drifted. It never recurses, never follows a symlink (an
+// entry that is not a real directory is warned about and left alone), and never
+// touches the key directory, which is not a service-user row.
+func alignServiceTrees(own ownership, root string, serviceUID int) error {
+	for _, level := range install.ServiceLevels() {
+		want, _ := install.OwnershipOf(level)
+		path := level.Path(root)
+		fi, err := own.Lstat(path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if err := own.MkdirAll(path, want.Mode); err != nil {
+				return fmt.Errorf("create %s: %w", path, err)
+			}
+			if err := alignDir(own, path, want.UID(serviceUID), want.GID, want.Mode); err != nil {
+				return err
+			}
+			continue
+		case err != nil:
+			return fmt.Errorf("stat %s: %w", path, err)
+		case !fi.IsDir() || fi.Mode()&fs.ModeSymlink != 0:
+			slog.Warn("netd: a service-user tree is not a directory; left alone", "path", path, "mode", fi.Mode().String())
+			continue
+		}
+		uid, gid := statOwner(fi)
+		if uid == want.UID(serviceUID) && gid == want.GID && fi.Mode().Perm() == want.Mode {
+			continue
+		}
+		if err := alignDir(own, path, want.UID(serviceUID), want.GID, want.Mode); err != nil {
+			return err
+		}
+		slog.Warn("netd: aligned a service-user tree's ownership", "dir", path,
+			"from", fmt.Sprintf("uid=%d gid=%d mode=%04o", uid, gid, fi.Mode().Perm()),
+			"to", fmt.Sprintf("uid=%d gid=%d mode=%04o", want.UID(serviceUID), want.GID, want.Mode))
 	}
 	return nil
+}
+
+// warnLegacyMeshKeys warns once per key an older build left in the legacy
+// location inside the run dir. netd does not move it: the move is the root
+// installer's (it copies, verifies, and only then removes), and a daemon that
+// moved keys at start would be a second, unverified implementation of it.
+func warnLegacyMeshKeys(own ownership, root string) {
+	for _, path := range install.LegacyMeshKeyFiles(root) {
+		fi, err := own.Lstat(path)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		slog.Warn("netd: a mesh key is still in the legacy run-dir location, where the service user can unlink it; run `sudo k3sm install` to move it into the root-owned key dir (netd does not move it)",
+			"path", path, "keyDir", install.MeshKeyDir)
+	}
+}
+
+// isTableLevel reports whether dir is one of the ownership table's levels under
+// root, so the socket-dir alignment below does not apply a second policy to a
+// directory the table already decided.
+func isTableLevel(root, dir string) bool {
+	dir = filepath.Clean(dir)
+	for _, level := range install.StateLevels() {
+		if level.Path(root) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// alignDir applies one owner, group and mode to one directory, non-recursively.
+// The chown does not follow a symlink.
+func alignDir(own ownership, dir string, uid, gid int, mode fs.FileMode) error {
+	if err := own.Chown(dir, uid, gid); err != nil {
+		return fmt.Errorf("chown %s to %d:%d: %w", dir, uid, gid, err)
+	}
+	if err := own.Chmod(dir, mode); err != nil {
+		return fmt.Errorf("chmod %s %#o: %w", dir, mode, err)
+	}
+	return nil
+}
+
+// statOwner reports a FileInfo's owning uid and gid, or -1/-1 when the
+// platform payload is absent.
+func statOwner(fi fs.FileInfo) (uid, gid int) {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st != nil {
+		return int(st.Uid), int(st.Gid)
+	}
+	return -1, -1
 }
 
 // dirOwnerUID reports dir's owning uid, or -1 when it cannot be determined
