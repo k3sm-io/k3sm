@@ -87,7 +87,15 @@ fi
 kc() { kubectl "$@"; }
 kc get --raw /healthz >/dev/null || { echo "cluster at \$KUBECONFIG is not serving" >&2; exit 1; }
 
-PODS=(b243-sh b243-script b243-env b243-py)
+# Per-run pod names, so a previous run's leftover Event or a pod still being
+# deleted can never match this run's checks. The cleanup and the port table
+# below use the same names.
+RUN="$(date +%s)"
+POD_SH="b243-sh-$RUN"
+POD_SCRIPT="b243-script-$RUN"
+POD_ENV="b243-env-$RUN"
+POD_PY="b243-py-$RUN"
+PODS=("$POD_SH" "$POD_SCRIPT" "$POD_ENV" "$POD_PY")
 cleanup() {
 	for p in "${PODS[@]}"; do
 		kc delete pod "$p" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -128,7 +136,7 @@ codesign -s - -f "$FIXTURE_BIN/hello-http" >/dev/null 2>&1 || true
 body() {
 	echo "$FIXTURE_BIN/conftool resolve -name kubernetes.default.svc -name kubernetes && exec $FIXTURE_BIN/hello-http --id $1 --addr :$2"
 }
-printf '#!/bin/sh\n%s\n' "$(body b243-script 18432)" >"$FIXTURE_BIN/b243-entrypoint.sh"
+printf '#!/bin/sh\n%s\n' "$(body "$POD_SCRIPT" 18432)" >"$FIXTURE_BIN/b243-entrypoint.sh"
 chmod 755 "$FIXTURE_BIN/b243-entrypoint.sh"
 
 # native_pod <name> <json argv> - a host-binary pod in $NS on $NODE_NAME.
@@ -148,36 +156,61 @@ spec:
     command: $2
 EOF
 }
-native_pod b243-sh "[\"/bin/sh\", \"-c\", \"$(body b243-sh 18431)\"]"
-native_pod b243-script "[\"$FIXTURE_BIN/b243-entrypoint.sh\"]"
-native_pod b243-env "[\"/usr/bin/env\", \"B243=1\", \"/bin/sh\", \"-c\", \"$(body b243-env 18433)\"]"
-native_pod b243-py '["/usr/bin/python3", "-c", "import time; time.sleep(3600)"]'
+native_pod "$POD_SH" "[\"/bin/sh\", \"-c\", \"$(body "$POD_SH" 18431)\"]"
+native_pod "$POD_SCRIPT" "[\"$FIXTURE_BIN/b243-entrypoint.sh\"]"
+native_pod "$POD_ENV" "[\"/usr/bin/env\", \"B243=1\", \"/bin/sh\", \"-c\", \"$(body "$POD_ENV" 18433)\"]"
+native_pod "$POD_PY" '["/usr/bin/python3", "-c", "import time; time.sleep(3600)"]'
 
 # 1. Each wrapped pod resolved both names (conftool exits non-zero otherwise,
 #    and hello-http is exec'd only after it succeeds) and its listener is on
 #    its own pod IP.
-for spec in b243-sh:18431 b243-script:18432 b243-env:18433; do
+#    Ready comes before the wrapped process has written anything, so both
+#    checks poll (2 s steps, 30 s budget) instead of reading once.
+resolved() {
+	grep -q "resolve: kubernetes.default.svc -> " <<<"$1" && grep -q "resolve: kubernetes -> " <<<"$1"
+}
+listening() {
+	netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}' | grep -qx "$1.$2"
+}
+for spec in "$POD_SH:18431" "$POD_SCRIPT:18432" "$POD_ENV:18433"; do
 	pod="${spec%%:*}"; port="${spec##*:}"
 	ready=no
 	kc wait --for=condition=Ready "pod/$pod" -n "$NS" --timeout=120s >/dev/null 2>&1 && ready=yes
-	logs="$(kc logs "$pod" -n "$NS" 2>/dev/null || true)"
-	if [ "$ready" = yes ] && grep -q "resolve: kubernetes.default.svc -> " <<<"$logs" && grep -q "resolve: kubernetes -> " <<<"$logs"; then
+	logs=""
+	for _ in $(seq 1 15); do
+		logs="$(kc logs "$pod" -n "$NS" 2>/dev/null || true)"
+		resolved "$logs" && break
+		# A terminated container will print nothing more.
+		[ -n "$(kc get pod "$pod" -n "$NS" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null || true)" ] && break
+		sleep 2
+	done
+	if [ "$ready" = yes ] && resolved "$logs"; then
 		ladder ok "b243-1a $pod resolves kubernetes.default.svc and the single-label kubernetes"
 	else
 		ladder no "b243-1a $pod resolves kubernetes.default.svc and the single-label kubernetes (ready=$ready, logs: $(tr '\n' ' ' <<<"$logs" | cut -c1-200))"
 	fi
 	pod_ip="$(kc get pod "$pod" -n "$NS" -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
-	if [ -n "$pod_ip" ] && netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}' | grep -qx "$pod_ip.$port"; then
+	bound=no
+	if [ -n "$pod_ip" ]; then
+		for _ in $(seq 1 15); do
+			listening "$pod_ip" "$port" && { bound=yes; break; }
+			sleep 2
+		done
+	fi
+	if [ "$bound" = yes ]; then
 		ladder ok "b243-1b $pod listener bound to its own pod IP $pod_ip:$port"
 	else
 		ladder no "b243-1b $pod listener bound to its own pod IP ${pod_ip:-?}:$port (listeners on :$port: $(netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}' | grep "\.$port\$" | tr '\n' ' '))"
 	fi
 done
 
-# 2. The restricted main process is reported on the pod.
+# 2. The restricted main process is reported on THIS pod: Events are selected
+#    by the pod's uid, so nothing a previous pod of any name recorded counts.
+py_uid="$(kc get pod "$POD_PY" -n "$NS" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 ev=""
 for _ in $(seq 1 30); do
-	ev="$(kc get events -n "$NS" --field-selector "involvedObject.name=b243-py,reason=ShimInactive" -o jsonpath='{.items[*].type}' 2>/dev/null || true)"
+	[ -n "$py_uid" ] || break
+	ev="$(kc get events -n "$NS" --field-selector "involvedObject.uid=$py_uid,reason=ShimInactive" -o jsonpath='{.items[*].type}' 2>/dev/null || true)"
 	[ -n "$ev" ] && break
 	sleep 2
 done
