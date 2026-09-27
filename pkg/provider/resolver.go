@@ -21,8 +21,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
+	"sync"
 
 	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -53,38 +55,111 @@ func newKubeResolver(cs kubernetes.Interface) *kubeResolver {
 // Compile-time check that kubeResolver satisfies the runtimed seam.
 var _ mount.Resolver = (*kubeResolver)(nil)
 
-// ConfigMap returns the key→bytes data of a ConfigMap, mapping an apiserver
-// NotFound to os.ErrNotExist so the materializer can honor an optional source.
-func (k *kubeResolver) ConfigMap(ctx context.Context, namespace, name string) (map[string][]byte, error) {
-	cm, err := k.cs.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, notFoundAware(err)
-	}
-	out := make(map[string][]byte, len(cm.Data)+len(cm.BinaryData))
-	for key, v := range cm.Data {
-		out[key] = []byte(v)
-	}
-	for key, v := range cm.BinaryData {
-		out[key] = v
-	}
-	return out, nil
+// ConfigMap returns the key→bytes data of a ConfigMap and its immutable flag,
+// mapping an apiserver NotFound to os.ErrNotExist so the materializer can honor
+// an optional source. Inside a projected-volume refresh tick the read is served
+// from the tick's cache (refreshCache), so pods sharing a ConfigMap cost one GET.
+func (k *kubeResolver) ConfigMap(ctx context.Context, namespace, name string) (mount.SourceData, error) {
+	return cachedSource(ctx, kindConfigMap, namespace, name, func() (mount.SourceData, error) {
+		cm, err := k.cs.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return mount.SourceData{}, notFoundAware(err)
+		}
+		out := make(map[string][]byte, len(cm.Data)+len(cm.BinaryData))
+		for key, v := range cm.Data {
+			out[key] = []byte(v)
+		}
+		for key, v := range cm.BinaryData {
+			out[key] = v
+		}
+		return mount.SourceData{Data: out, Immutable: isImmutable(cm.Immutable)}, nil
+	})
 }
 
-// Secret returns the key→bytes data of a Secret, mapping an apiserver NotFound to
-// os.ErrNotExist.
-func (k *kubeResolver) Secret(ctx context.Context, namespace, name string) (map[string][]byte, error) {
-	s, err := k.cs.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, notFoundAware(err)
+// Secret returns the key→bytes data of a Secret and its immutable flag, mapping
+// an apiserver NotFound to os.ErrNotExist. Tick-cached like ConfigMap.
+func (k *kubeResolver) Secret(ctx context.Context, namespace, name string) (mount.SourceData, error) {
+	return cachedSource(ctx, kindSecret, namespace, name, func() (mount.SourceData, error) {
+		s, err := k.cs.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return mount.SourceData{}, notFoundAware(err)
+		}
+		out := make(map[string][]byte, len(s.Data)+len(s.StringData))
+		for key, v := range s.Data {
+			out[key] = v
+		}
+		for key, v := range s.StringData {
+			out[key] = []byte(v)
+		}
+		return mount.SourceData{Data: out, Immutable: isImmutable(s.Immutable)}, nil
+	})
+}
+
+// isImmutable reads an optional corev1 immutable flag (nil means mutable).
+func isImmutable(p *bool) bool {
+	return p != nil && *p
+}
+
+// sourceKey identifies one ConfigMap or Secret in a refreshCache.
+type sourceKey struct {
+	kind, namespace, name string
+}
+
+// sourceResult is one cached apiserver read: the data, or the error it failed with.
+type sourceResult struct {
+	data mount.SourceData
+	err  error
+}
+
+// refreshCache coalesces the ConfigMap/Secret reads of ONE projected-volume
+// refresh tick (runProjectedRefresh): N pods mounting the same object cost one
+// GET. It lives only for the tick that created it and is carried on the request
+// context, the same in-process ctx threading podIdentity rides from the provider
+// through runtimed's mount.Refresh to this resolver. A failed read is cached too,
+// so a missing object is asked about once per tick, not once per pod.
+//
+// Concurrency: mu guards m. The fetch runs under mu, which serializes the tick's
+// reads; the tick itself refreshes pods one after another, so there is no
+// parallelism to lose.
+type refreshCache struct {
+	mu sync.Mutex
+	m  map[sourceKey]sourceResult
+}
+
+// newRefreshCache returns an empty tick cache.
+func newRefreshCache() *refreshCache {
+	return &refreshCache{m: map[sourceKey]sourceResult{}}
+}
+
+// refreshCacheKey is the context key a refreshCache is bound under.
+type refreshCacheKey struct{}
+
+// withRefreshCache returns ctx carrying c for the resolver reads made under it.
+func withRefreshCache(ctx context.Context, c *refreshCache) context.Context {
+	return context.WithValue(ctx, refreshCacheKey{}, c)
+}
+
+// cachedSource runs get through the tick cache bound on ctx, or directly when
+// none is bound (pod create and env resolution always read live). Each caller
+// gets its own copy of the key map, so no consumer can alter another's view.
+func cachedSource(ctx context.Context, kind, namespace, name string, get func() (mount.SourceData, error)) (mount.SourceData, error) {
+	c, ok := ctx.Value(refreshCacheKey{}).(*refreshCache)
+	if !ok || c == nil {
+		return get()
 	}
-	out := make(map[string][]byte, len(s.Data)+len(s.StringData))
-	for key, v := range s.Data {
-		out[key] = v
+	key := sourceKey{kind: kind, namespace: namespace, name: name}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	res, hit := c.m[key]
+	if !hit {
+		data, err := get()
+		res = sourceResult{data: data, err: err}
+		c.m[key] = res
 	}
-	for key, v := range s.StringData {
-		out[key] = []byte(v)
+	if res.err != nil {
+		return mount.SourceData{}, res.err
 	}
-	return out, nil
+	return mount.SourceData{Data: maps.Clone(res.data.Data), Immutable: res.data.Immutable}, nil
 }
 
 // errNoPodIdentity is returned when ServiceAccountToken is reached with no pod
@@ -113,10 +188,11 @@ var errNoPodIdentity = errors.New("no pod identity bound to the request context;
 // ref, or one without the UID, is a strictly weaker and different binding.
 //
 // FAIL-CLOSED: a call with no pod identity on the context returns
-// errNoPodIdentity rather than minting an unbound token. Both CreatePod and
-// UpdatePod bind the identity on their context, but only the create path
-// actually materializes volumes and mints a token today (B233) — the binding on
-// UpdatePod is a uniformity/forward guard, not a live minting path.
+// errNoPodIdentity rather than minting an unbound token. CreatePod, UpdatePod
+// and the projected-volume refresh (projectedrefresh.go) bind the identity on
+// their context. The create path mints a pod's first token and the refresh
+// re-mints it once under 20% of its lifetime remains; UpdatePod never
+// materializes, so its binding is a uniformity guard, not a minting path.
 func (k *kubeResolver) ServiceAccountToken(ctx context.Context, namespace, audience string, expirationSeconds int64) (string, error) {
 	id, ok := podIdentityFromContext(ctx)
 	if !ok {

@@ -246,14 +246,14 @@ func fetchData(ctx context.Context, r mount.Resolver, kind, ns, name string, opt
 		return nil, false, fmt.Errorf("%s %s/%s: no apiserver client configured to resolve it", kind, ns, name)
 	}
 	var (
-		data map[string][]byte
-		err  error
+		src mount.SourceData
+		err error
 	)
 	switch kind {
 	case kindConfigMap:
-		data, err = r.ConfigMap(ctx, ns, name)
+		src, err = r.ConfigMap(ctx, ns, name)
 	case kindSecret:
-		data, err = r.Secret(ctx, ns, name)
+		src, err = r.Secret(ctx, ns, name)
 	}
 	if err != nil {
 		if optional && errors.Is(err, os.ErrNotExist) {
@@ -261,7 +261,7 @@ func fetchData(ctx context.Context, r mount.Resolver, kind, ns, name string, opt
 		}
 		return nil, false, fmt.Errorf("%s %s/%s: %w", kind, ns, name, err)
 	}
-	return data, false, nil
+	return src.Data, false, nil
 }
 
 // resolveDownwardEnv resolves a downward-API field path for an env var. Unlike the
