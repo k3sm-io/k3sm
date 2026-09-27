@@ -235,7 +235,7 @@ else
 	}
 	trap lab_down EXIT INT TERM
 
-	mkdir -p "$LAB_ROOT"
+	mkdir -p "$LAB_ROOT" "$LAB_ROOT/pod-logs"
 	if (cd "$K3SM_ROOT" && "${GOFLAGS_ENV[@]}" go build -o "$LAB_BIN" ./cmd/k3sm); then
 		ladder ok "b213.L0  built the k3sm binary under test"
 	else
