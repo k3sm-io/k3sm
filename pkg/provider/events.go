@@ -18,7 +18,6 @@ package provider
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -139,53 +138,14 @@ const (
 	// CPU carried from earlier instances. No upstream analogue: a kubelet restart
 	// never loses a container's pipes, because containerd's shim holds them.
 	reasonPodReattached = "PodReattached"
-	// reasonPodRecreatedAfterReattach (Warning) marks a re-attached pod whose
-	// container exited under a policy that restarts it. The kubelet would
-	// restart that container in place; a re-attached pod's sandbox profile was
-	// not rebuilt, so the node recreates the whole pod instead
-	// (recreateAdopted). Recorded once per recreate.
-	reasonPodRecreatedAfterReattach = "PodRecreatedAfterReattach"
-	// reasonPodRecreateAfterReattachFailed (Warning) marks a recreate of a
-	// re-attached pod that failed: the runtime delete (the pod is left running
-	// and the next restart it is due retries) or the create (the pod is left
-	// stopped and untracked). Recorded once per failure.
-	reasonPodRecreateAfterReattachFailed = "PodRecreateAfterReattachFailed"
 )
-
-// msgPodRecreatedAfterReattach is the PodRecreatedAfterReattach Event message,
-// naming every container whose restart triggered the recreate.
-func msgPodRecreatedAfterReattach(containers []string) string {
-	subject := "container " + strings.Join(containers, ", ") + " is"
-	if len(containers) > 1 {
-		subject = "containers " + strings.Join(containers, ", ") + " are"
-	}
-	return fmt.Sprintf("%s due a restart in a pod re-attached after a node-daemon restart; "+
-		"a re-attached pod cannot restart a container in place, so the whole pod is being recreated "+
-		"(every container stops, postStart hooks run again, the pod may get a new IP, and every "+
-		"container's restart count rises by one)", subject)
-}
-
-// msgPodRecreateDeleteFailed is the PodRecreateAfterReattachFailed Event message
-// for a recreate whose runtime delete failed.
-func msgPodRecreateDeleteFailed(err error) string {
-	return fmt.Sprintf("recreating this re-attached pod failed at the runtime delete: %v; "+
-		"the pod is left as it is and the next container restart it is due retries the recreate", err)
-}
-
-// msgPodRecreateCreateFailed is the PodRecreateAfterReattachFailed Event message
-// for a recreate whose create failed after its containers were stopped.
-func msgPodRecreateCreateFailed(err error) string {
-	return fmt.Sprintf("recreating this re-attached pod failed at the create: %v; "+
-		"its containers are stopped and the node no longer runs it, so the pod needs deleting "+
-		"and recreating by its controller or an operator", err)
-}
 
 // msgPodReattached is the PodReattached Event message: what survived the node
 // daemon's restart and what did not, in the terms an operator acts on.
 const msgPodReattached = "the node daemon restarted and re-attached this pod's running processes: " +
 	"log lines written while it was down carry the time they were read, not written, a container that " +
-	"exits reports ExitStatusUnknown (exit code -1), CPU accounting restarted from zero, and exec or a " +
-	"container restart needs the pod recreated"
+	"exits reports ExitStatusUnknown (exit code -1), CPU accounting restarted from zero, and exec needs " +
+	"the pod recreated"
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec
 // is being throttled by the CrashLoopBackOff schedule. It reproduces the
