@@ -25,10 +25,11 @@ import (
 	"syscall"
 
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/helmchart"
 )
 
 // runPayload is `k3sm payload <dir>`: stage the control-plane payload
-// (kube-apiserver/scheduler/controller-manager/kubectl + kine) into <dir> using
+// (kube-apiserver/scheduler/controller-manager/kubectl + kine + helm) into <dir> using
 // the executor's own pinned versions and acquisition code. It is the
 // packaging-side PRODUCER — run it in a shell that has `gh` and the Go toolchain
 // (a dev Mac, goreleaser); `k3sm install` then stages <dir> beside the daemon so
@@ -49,7 +50,7 @@ func runPayload(args []string) error {
 	if err := executor.StagePayload(ctx, fs.Arg(0)); err != nil {
 		return err
 	}
-	fmt.Printf("staged control-plane payload (%s + kine %s) -> %s\n",
-		executor.DefaultKubeVersion, executor.DefaultKineVersion, fs.Arg(0))
+	fmt.Printf("staged control-plane payload (%s + kine %s + %s) -> %s\n",
+		executor.DefaultKubeVersion, executor.DefaultKineVersion, helmchart.HelmBinaryName, fs.Arg(0))
 	return nil
 }

@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"k3sm.io/k3sm/pkg/helmchart"
 )
 
 // The control-plane version marker (B395). The four kwok-ci/k8s binaries used to be
@@ -390,6 +392,8 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		return nil, os.WriteFile(filepath.Join(gopath, "bin", "kine"), []byte("pretend-kine"), 0o755)
 	}
 
+	fakeHelmRelease(t, helmTarball(t, map[string]string{helmchart.HelmTarballMember: "pretend-helm"}), "")
+
 	dest := filepath.Join(t.TempDir(), "payload")
 	if err := StagePayload(t.Context(), dest); err != nil {
 		t.Fatalf("StagePayload = %v, want the staged dir to pass VerifyPayloadSet", err)
@@ -402,6 +406,9 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	}
 	if err := VerifyPayloadSet(dest); err != nil {
 		t.Errorf("VerifyPayloadSet(staged payload) = %v", err)
+	}
+	if got, err := os.ReadFile(helmchart.HelmPath(dest)); err != nil || string(got) != "pretend-helm" {
+		t.Errorf("payload helm = %q, %v; want the verified tarball's binary", got, err)
 	}
 }
 

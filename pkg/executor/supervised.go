@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/ports"
 )
 
@@ -390,6 +391,13 @@ func (s *Supervised) provision(ctx context.Context) error {
 		return err
 	}
 	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
+		return err
+	}
+	// The payload-seeded helm is ad-hoc signed like the control-plane set, so the
+	// helm controller's Jobs can exec it. Best-effort and never fatal: an absent
+	// helm is skipped here, and the helm controller owns that diagnosis (and the
+	// dev-shell download) off the bring-up path.
+	if err := provisionStep("sign-helm", signBinaries(ctx, binDir(s.cfg.WorkDir), []string{helmchart.HelmBinaryName})); err != nil {
 		return err
 	}
 	if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {

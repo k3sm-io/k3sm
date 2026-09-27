@@ -37,6 +37,7 @@ import (
 	"k3sm.io/darwin-net/pkg/proxy"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
+	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
@@ -1759,6 +1760,9 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
+		// The pinned helm the helm controller's Jobs run, a payload binary like
+		// kubectl.
+		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
