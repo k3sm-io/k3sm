@@ -346,7 +346,7 @@ if ! cluster_reset; then
 	exit 1
 fi
 rm -f "$SERVER_WORKDIR/bin"/*.cstemp
-mkdir -p "$M14_WORK"
+mkdir -p "$M14_WORK" "$M14_WORK/pod-logs"
 
 echo "----------------------------------------"
 echo "M14.2 ROOT tier: building the -race server binary"
