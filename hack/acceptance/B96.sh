@@ -132,7 +132,14 @@ print(base64.b64encode(buf.getvalue()).decode())
 PY
 )"
 
-# 1. The CRD is Established (the controller ensures it at server start).
+# 1. The CRD is Established (the controller ensures it at server start). A
+#    server restarted moments ago has not applied it yet, and `kubectl wait`
+#    fails at once on an absent object, so poll for existence first.
+n=0
+until kc get crd helmcharts.helm.k3sm.io >/dev/null 2>&1; do
+	sleep 3; n=$((n + 1))
+	[ "$n" -gt 40 ] && break
+done
 if kc wait --for=condition=Established crd/helmcharts.helm.k3sm.io --timeout=180s >/dev/null 2>&1; then
 	ladder ok "b96-1  the helmcharts.helm.k3sm.io CRD is Established"
 else
