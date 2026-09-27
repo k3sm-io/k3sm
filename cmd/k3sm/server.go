@@ -771,6 +771,25 @@ func runServer(args []string) (err error) {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
 
+	// 3c''. The HelmChart controller (the k3s helm-controller analog). Launched
+	// before 3c' so the helm.k3sm.io CRDs are being established by the time the
+	// manifest directory's first sweep can carry a HelmChart; a chart that sweep
+	// cannot map yet is retried on the next one. Same lifetime as 3c': its own
+	// goroutine, every failure logged and contained there (a missing helm, a CRD
+	// the apiserver will not take), and drained before the control plane stops
+	// (this defer runs before exec.Stop's, LIFO). Leader-elected on a Lease, so
+	// only one server of an HA pair reconciles.
+	hcCtx, hcCancel := context.WithCancel(ctx)
+	hcDone := make(chan struct{})
+	go func() {
+		defer close(hcDone)
+		runHelmController(hcCtx, restCfg, cs, opts.workDir, opts.nodeName, logger)
+	}()
+	defer func() {
+		hcCancel()
+		<-hcDone
+	}()
+
 	// 3c'. The operator's auto-deploy manifest directory (install.ManifestDir,
 	// the k3s server/manifests analog). Unlike 3c it reads from disk, so it is
 	// safe only because of three things pkg/addons documents: the directory and

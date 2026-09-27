@@ -1,0 +1,64 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package helmchart
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+
+	helmv1 "k3sm.io/apis/helm/v1"
+)
+
+// ConfigHash is the digest of everything the install Job's behaviour depends on
+// from the API: the HelmChart's spec and the three HelmChartConfig fields the
+// controller applies (valuesContent, failurePolicy, forceConflicts).
+// It is stamped on the install Job (AnnotationConfigHash), and a Job carrying a
+// different hash is replaced, which is how an edited spec or overlay reaches
+// helm.
+//
+// "sha256:" + hex of sha256(JSON(spec) || 0x00 || JSON(config fields)).
+// encoding/json sorts map keys and writes struct fields in order, so the digest
+// is stable across processes; the NUL separator keeps a spec/config pair from
+// colliding with another split of the same bytes. A nil config hashes as the
+// zero fields. Other HelmChartConfig metadata is not hashed: the controller
+// applies nothing else from it.
+func ConfigHash(spec helmv1.HelmChartSpec, cfg *helmv1.HelmChartConfig) string {
+	// A HelmChartSpec is plain data (strings, bools, ints, a map, a Duration), so
+	// its encoding does not fail. Were it ever to, the error text is hashed in its
+	// place: the digest then still differs from every real spec's, where hashing
+	// an empty encoding would collide with the zero spec.
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		raw = []byte("unencodable:" + err.Error())
+	}
+	h := sha256.New()
+	h.Write(raw)
+	h.Write([]byte{0})
+	var fields helmv1.HelmChartConfigSpec
+	if cfg != nil {
+		fields = cfg.Spec
+	}
+	// Plain strings and a bool: this encoding cannot fail.
+	overrides, _ := json.Marshal(struct {
+		ValuesContent  string `json:"valuesContent"`
+		FailurePolicy  string `json:"failurePolicy"`
+		ForceConflicts bool   `json:"forceConflicts"`
+	}{fields.ValuesContent, fields.FailurePolicy, fields.ForceConflicts})
+	h.Write(overrides)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}

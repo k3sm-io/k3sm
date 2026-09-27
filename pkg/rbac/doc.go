@@ -63,7 +63,15 @@ limitations under the License.
 // k3sm-manifests ServiceAccount in kube-system and a ClusterRole granting write on
 // a fixed list of workload and configuration kinds (create and patch only), with
 // no RBAC, admission, Secret, ServiceAccount, namespace, CRD or MeshPeer write. A manifest is therefore applied with a grant
-// the apiserver's escalation prevention bounds, never with system:masters.
+// the apiserver's escalation prevention bounds, never with system:masters. Beside
+// that role, in a ClusterRole of its own (k3sm-manifest-helm), the same identity may
+// write HelmChart and HelmChartConfig objects; that is its one indirect path to
+// cluster-admin, through the helm controller's Job (see manifestHelmRules).
+//
+// Also off the fail-closed path, ProvisionHelmJobIdentity creates each HelmChart's
+// Job identity on demand: the helm-<chart> ServiceAccount and a helm-<ns>-<chart>
+// ClusterRoleBinding to the default cluster-admin ClusterRole (referenced, never
+// authored), deleted by name when the chart's uninstall finishes (k3s parity).
 //
 // # What it deliberately does NOT touch
 //

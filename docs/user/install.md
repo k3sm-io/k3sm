@@ -83,7 +83,8 @@ write into it.
   ServiceAccounts with `kubectl`. The server applies manifests as the `kube-system/k3sm-manifests`
   ServiceAccount, which may only create and patch common workload and configuration kinds
   (Deployments, DaemonSets, StatefulSets, Jobs, CronJobs, Pods, Services, ConfigMaps, PVCs,
-  Ingresses, NetworkPolicies, StorageClasses, HPAs, PDBs, MLXModels). A Pod may run as any existing
+  Ingresses, NetworkPolicies, StorageClasses, HPAs, PDBs, MLXModels), plus HelmCharts and
+  HelmChartConfigs through a separate ClusterRole (see [Helm charts](helm.md)). A Pod may run as any existing
   ServiceAccount in its namespace, the standard ceiling for anything that can create workloads. It
   cannot create namespaces, so create one first with `kubectl`. Nothing is ever deleted, so remove
   a mistaken object with `kubectl`.

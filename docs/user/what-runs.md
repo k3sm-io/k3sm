@@ -53,6 +53,8 @@ to package:
 
 See [Images](images.md) for both conventions in full.
 
+Helm charts install through `HelmChart` objects, the k3s shape; see [Helm charts](helm.md).
+
 ## Linux Path
 
 A stock image from a public OCI registry (`nginx`, `postgres`, `redis`) carries a Linux userland

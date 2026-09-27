@@ -401,5 +401,13 @@ func ensureManifestApplier(ctx context.Context, cs kubernetes.Interface) error {
 	if _, err := api.ClusterRoleBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create the manifest applier cluster role binding: %w", err)
 	}
-	return nil
+	// The HelmChart grant rides beside the bounded role, in its OWN ClusterRole
+	// and binding (manifestHelmRules), never merged into manifestApplierRules.
+	// It is the one grant that gives this identity an indirect path to
+	// cluster-admin: a HelmChart dropped in the manifest directory makes the helm
+	// controller run a Job bound to cluster-admin. That is the k3s shape (a
+	// manifest in server/manifests already runs as the server), and the set of
+	// principals reaching cluster-admin stays {root on the node, the admin
+	// kubeconfig}, because only root can write the manifest directory.
+	return ensureManifestHelmGrant(ctx, cs)
 }

@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/helmchart"
 )
 
 // componentCertValidity is the lifetime of a per-component client cert (the scheduler /
@@ -761,9 +762,12 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // PayloadBinaries is the full control-plane payload set a packaged install must
 // stage beside the daemon (the boot path otherwise acquires them with gh/go —
 // dev-shell tools a launchd daemon does not have): the kwok-ci/k8s prebuilt
-// binaries plus kine. The single source for `k3sm payload`, `k3sm install`, and
+// binaries plus kine, and the pinned helm the helm controller's Jobs run (see
+// helm.go). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
-func PayloadBinaries() []string { return append(append([]string{}, cpBinaries...), "kine") }
+func PayloadBinaries() []string {
+	return append(append([]string{}, cpBinaries...), "kine", helmchart.HelmBinaryName)
+}
 
 // StagePayload acquires the full control-plane payload into destDir using the
 // executor's own pinned versions (DefaultKubeVersion via `gh release download`,
@@ -790,6 +794,12 @@ func StagePayload(ctx context.Context, destDir string) error {
 		return err
 	}
 	if err := ensureKineInto(ctx, destDir, DefaultKineVersion); err != nil {
+		return err
+	}
+	// helm is re-downloaded and re-verified even if present (force): these bytes
+	// are about to be published, and a copy already in the directory may have been
+	// signed, which rewrites it past any digest comparison.
+	if err := stageHelm(ctx, destDir, true); err != nil {
 		return err
 	}
 	return VerifyPayloadSet(destDir)
