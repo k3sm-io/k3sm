@@ -216,6 +216,12 @@ type runtimedRuntime struct {
 	// recorder emits the pod lifecycle Events the runtimed path owns.
 	recorder record.EventRecorder
 
+	// refresher re-renders a running pod's projected volumes
+	// (projectedrefresh.go). It is the in-process runtime behind rt, reached
+	// through a consumer-side capability rather than the runtime/v1 contract;
+	// nil (a test double) disables the refresh loop.
+	refresher projectedRefresher
+
 	mu      sync.Mutex
 	track   map[string]*podTrack  // pod id -> bookkeeping
 	probers map[string]*podProber // pod id -> provider-served probe runner
@@ -320,6 +326,13 @@ type podTrack struct {
 	// after it is released.
 	shimMu     sync.Mutex
 	shimWarned map[string]bool
+
+	// refreshWarnMu guards refreshWarned, the set of volume × failure-class
+	// pairs already recorded as a ProjectedVolumeRefreshFailed Event for this
+	// pod (projectedrefresh.go), bounded by maxRefreshWarnings. A volume's
+	// entries clear when it refreshes again. Never held with another lock.
+	refreshWarnMu sync.Mutex
+	refreshWarned map[string]bool
 }
 
 // RuntimedConfig configures a runtimedRuntime.
@@ -640,6 +653,9 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		"path_shim", cfg.PathShim,
 		"resolver_vip", cfg.ResolverVIP,
 		"cluster_domain", cfg.ClusterDomain)
+	log.Info("projected-volume refresh configured",
+		"enabled", refresherOf(rt) != nil,
+		"interval", projectedRefreshInterval)
 	podLogsDir := podLogsDirOf(cfg)
 	locks := podlogs.NewDirLocks()
 	// NewRuntimed already fails construction closed on an out-of-range entry
@@ -682,6 +698,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		orphanGauges:   map[string]*probeGauge{},
 		log:            log,
 		recorder:       recorder,
+		refresher:      refresherOf(rt),
 		clk:            clock.RealClock{},
 		dial:           (&net.Dialer{}).DialContext,
 		probeTransport: newProbeTransport(),
@@ -1758,23 +1775,20 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 // runtime as a typed precondition failure, surfaced here as an error.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
-	// UpdatePod never mints a token or re-reads a ConfigMap/Secret through it:
-	// runtimed's UpdatePod applies labels/annotations only (its updatableOnly
-	// check rejects any other field change as NOT_UPDATABLE; pinned there by
-	// TestUpdatePodNeverMaterializes in pkg/runtime), and volumes
-	// materialize exactly once, at create — nothing on any path re-resolves
-	// ConfigMap, Secret, or projected ServiceAccount-token DATA afterward (the
-	// provider's periodic loop is status-only). Consequence: a pod created
-	// before a ConfigMap/Secret change, or before the --root-ca-file fix, keeps
-	// its creation-time data until it is recreated, and a default projected SA
-	// token (the admission plugin's ~3607s TTL passes through translate.go
-	// unchanged) expires about an hour after creation, so in-cluster clients
-	// using the mounted token start failing authentication until the pod is
-	// recreated — upstream's periodic projected-volume refresh has no analog
-	// here (B234; not fixed by this comment). The binding stays because
-	// env-source resolution in buildBox (resolvePodBoxEnv → ConfigMap/Secret key
-	// refs) legitimately re-runs on every box build, and this seam is kept
-	// uniform for CreatePod and UpdatePod rather than split (B233).
+	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
+	// through it: runtimed's UpdatePod applies labels/annotations only (its
+	// updatableOnly check rejects any other field change as NOT_UPDATABLE;
+	// pinned there by TestUpdatePodNeverMaterializes in pkg/runtime) and never
+	// materializes. Projected data is re-resolved on a separate path: the
+	// provider's 60 s refresh loop (projectedrefresh.go) calls the runtime's
+	// RefreshProjectedVolumes for every running native pod, which re-renders
+	// configMap / secret / downwardAPI / projected volumes with an atomic ..data
+	// flip and re-mints a projected ServiceAccount token under 20% of its
+	// lifetime, binding the pod identity on its own context. The binding here
+	// stays because env-source resolution in buildBox (resolvePodBoxEnv →
+	// ConfigMap/Secret key refs) legitimately re-runs on every box build, and
+	// this seam is kept uniform for CreatePod and UpdatePod rather than split
+	// (B233).
 	ctx = withPodIdentity(ctx, pod)
 	id := string(pod.UID)
 	r.mu.Lock()
@@ -2123,8 +2137,9 @@ func (r *runtimedRuntime) trackByID(id string) *podTrack {
 
 // Watch drives the VK status callback off the runtime's streaming
 // WatchPodStatus, with resync-on-stream-break plus a periodic GetPodStatus
-// backstop, and starts the slower orphan reaper (orphanreap.go). Every
-// goroutine's lifetime is bounded by ctx.
+// backstop, and starts the slower orphan reaper (orphanreap.go) and the
+// projected-volume refresh (projectedrefresh.go). Every goroutine's lifetime is
+// bounded by ctx.
 func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 	r.mu.Lock()
 	r.notify = cb
@@ -2133,6 +2148,7 @@ func (r *runtimedRuntime) Watch(ctx context.Context, cb func(*corev1.Pod)) {
 	go r.runWatch(ctx)
 	go r.runBackstop(ctx)
 	go r.runOrphanReaper(ctx)
+	go r.runProjectedRefresh(ctx)
 	// ctx is the provider's run lifetime: when it ends, so does this provider.
 	// The workers with a pod behind them are cancelled by that pod's own delete;
 	// this is what ends the one that has no pod left (runtimed_pull.go's

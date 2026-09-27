@@ -112,6 +112,19 @@ const (
 	// (observeShimInactive). Like XcodeToolchainUngranted it has no upstream
 	// analogue and the pod is NOT refused.
 	reasonShimInactive = "ShimInactive"
+	// reasonProjectedVolumeRefreshFailed is recorded when the periodic
+	// projected-volume refresh (projectedrefresh.go) could not re-render a
+	// configMap / secret / downwardAPI / projected volume of a running pod, for
+	// example because its ConfigMap was deleted. The volume keeps its previous
+	// contents and the pod keeps running. Recorded once per volume per failure
+	// class; the kubelet reports the same condition as a FailedMount Event.
+	reasonProjectedVolumeRefreshFailed = "ProjectedVolumeRefreshFailed"
+	// reasonProjectedVolumeRefreshWarning is recorded when a projected-volume
+	// refresh made the new contents live but the cleanup after the swap failed
+	// (linking a new key, removing the previous generation, pruning a dropped
+	// key). The pod reads the new data; a stale generation or key may be left
+	// on disk. Recorded once per volume per failure class.
+	reasonProjectedVolumeRefreshWarning = "ProjectedVolumeRefreshWarning"
 )
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec

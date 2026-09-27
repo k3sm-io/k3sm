@@ -188,6 +188,35 @@ disk, and a workload has no way to tell that it got one.
 - The `hostprocess` opt-out runtime has no volume handling at all, so neither `emptyDir` nor this
   refusal applies there.
 
+### ConfigMap, Secret and Token Volumes Refresh About Once a Minute
+
+On the default (native) runtime, a running Pod's `configMap`, `secret`, `downwardAPI` and `projected`
+volumes are re-read from the API server about once a minute, the kubelet's own cadence. Edit a
+ConfigMap and a Pod that mounts it sees the new value within roughly a minute, without a restart.
+
+- **Atomic swap.** Each refresh writes a complete new copy of the volume beside the old one and
+  switches the volume's `..data` symlink to it in one rename, the kubelet's layout. A reader sees the
+  whole old set or the whole new set, never a mix, and a file already open keeps its old contents.
+- **`subPath` mounts are never refreshed.** A key mounted with `subPath` keeps the value it had when
+  the Pod started. This matches Kubernetes.
+- **Environment variables are never updated.** `env` and `envFrom` values are fixed when the
+  container starts, as in Kubernetes. Restart the Pod to pick up a changed value.
+- **Immutable ConfigMaps and Secrets are not re-read.** A volume whose every source is marked
+  `immutable: true` is skipped after its first read, because its data cannot change. Deleting and
+  recreating the object under the same name does not reach a running Pod; recreate the Pod.
+- **ServiceAccount tokens are re-minted at 80% of their lifetime.** A projected token is replaced
+  once less than a fifth of its `expirationSeconds` remains. After a node daemon restart every token
+  is re-minted on the first refresh.
+- **`vm` Pods are not refreshed.** Their volumes are staged into the guest once, at start. Recreate
+  a `vm` Pod to pick up a changed ConfigMap, Secret, or `kube-root-ca.crt`.
+- **A failed refresh keeps the old contents.** If a source cannot be read (a ConfigMap deleted
+  underneath a running Pod, a permission error), the volume keeps its last good copy and the Pod
+  gets a `ProjectedVolumeRefreshFailed` Warning Event naming the volume. If the new contents went
+  live but the cleanup after the swap failed, the Pod reads the new data and gets a
+  `ProjectedVolumeRefreshWarning` Warning Event naming the volume and the cleanup error instead.
+  Each Event is recorded once per volume per kind of failure, and again if the volume recovers and
+  then fails.
+
 ### NetworkPolicy Is a Policy Hint, Not a Security Boundary
 
 NetworkPolicy is enforced **only on Service-VIP-mediated ingress** at the userspace proxy, with

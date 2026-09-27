@@ -58,15 +58,15 @@ func TestKubeResolverMaterialize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConfigMap: %v", err)
 	}
-	if string(cm["app.conf"]) != "key=value" {
-		t.Errorf("configMap data = %q, want key=value", cm["app.conf"])
+	if string(cm.Data["app.conf"]) != "key=value" {
+		t.Errorf("configMap data = %q, want key=value", cm.Data["app.conf"])
 	}
 	sec, err := r.Secret(ctx, "prod", "app-secret")
 	if err != nil {
 		t.Fatalf("Secret: %v", err)
 	}
-	if string(sec["token"]) != "s3cr3t" {
-		t.Errorf("secret data = %q, want s3cr3t", sec["token"])
+	if string(sec.Data["token"]) != "s3cr3t" {
+		t.Errorf("secret data = %q, want s3cr3t", sec.Data["token"])
 	}
 
 	dataVol := t.TempDir()
@@ -453,4 +453,36 @@ func TestPullCredentialApiserverReadErrors(t *testing.T) {
 			t.Errorf("credential = %+v ok=%v, want no credential", cred, ok)
 		}
 	})
+}
+
+// TestKubeResolverReportsImmutable confirms the resolver carries the object's
+// immutable flag, which the runtime's refresh uses to stop re-reading it.
+func TestKubeResolverReportsImmutable(t *testing.T) {
+	yes := true
+	r := newKubeResolver(fake.NewSimpleClientset(
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "frozen"}, Immutable: &yes},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "live"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "frozen"}, Immutable: &yes},
+	))
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		get  func() (mount.SourceData, error)
+		want bool
+	}{
+		{"immutable configMap", func() (mount.SourceData, error) { return r.ConfigMap(ctx, "prod", "frozen") }, true},
+		{"mutable configMap", func() (mount.SourceData, error) { return r.ConfigMap(ctx, "prod", "live") }, false},
+		{"immutable secret", func() (mount.SourceData, error) { return r.Secret(ctx, "prod", "frozen") }, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.get()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Immutable != tc.want {
+				t.Fatalf("Immutable = %v, want %v", got.Immutable, tc.want)
+			}
+		})
+	}
 }
