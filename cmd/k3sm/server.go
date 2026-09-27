@@ -771,6 +771,29 @@ func runServer(args []string) (err error) {
 		logger.Error("converge embedded add-on manifests", "err", err)
 	}
 
+	// 3c'. The operator's auto-deploy manifest directory (install.ManifestDir,
+	// the k3s server/manifests analog). Unlike 3c it reads from disk, so it is
+	// safe only because of three things pkg/addons documents: the directory and
+	// every file in it must be root-owned and not group/other-writable (the
+	// service user, and so every pod, cannot write it); the applies run as the
+	// bounded k3sm-manifests ServiceAccount, never this system:masters client,
+	// which is used only to provision that identity and mint its token; and RBAC
+	// and admission objects are refused outright. Apply-only: nothing is ever
+	// deleted. It runs in its own goroutine, so a slow identity provisioning or
+	// a bad manifest never delays bring-up, logs every failure itself, and is
+	// drained before the control plane stops (this defer runs before exec.Stop's,
+	// LIFO). A missing directory is the normal case and applies nothing.
+	mdCtx, mdCancel := context.WithCancel(ctx)
+	mdDone := make(chan struct{})
+	go func() {
+		defer close(mdDone)
+		runManifestDir(mdCtx, restCfg, cs, logger)
+	}()
+	defer func() {
+		mdCancel()
+		<-mdDone
+	}()
+
 	// Whether this node can host vm guests, asked HERE — before the
 	// registry and the datapath are constructed and long before the VK node exists
 	// — through runtimed's own safe host probe rather than through the node's

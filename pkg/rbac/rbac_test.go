@@ -396,3 +396,61 @@ func TestRBACNodeDatapathUnchangedByTheRegistryGrant(t *testing.T) {
 		}
 	}
 }
+
+// TestRBACManifestApplierIsBounded proves the auto-deploy manifest identity is a
+// ServiceAccount bound to a fixed create/patch grant that holds no RBAC,
+// admission, Secret, ServiceAccount, namespace, CRD or MeshPeer write and no read
+// or delete verb, and that provisioning it is
+// idempotent and leaves the fail-closed graph's objects alone.
+func TestRBACManifestApplierIsBounded(t *testing.T) {
+	cs := fake.NewClientset()
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if err := ProvisionManifestApplier(ctx, cs); err != nil {
+			t.Fatalf("ProvisionManifestApplier #%d: %v", i+1, err)
+		}
+	}
+	if _, err := cs.CoreV1().ServiceAccounts(ManifestApplierNamespace).Get(ctx, ManifestApplierName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("service account %s/%s: %v", ManifestApplierNamespace, ManifestApplierName, err)
+	}
+	role, err := cs.RbacV1().ClusterRoles().Get(ctx, ManifestApplierName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cluster role: %v", err)
+	}
+	forbiddenGroups := map[string]bool{"rbac.authorization.k8s.io": true, "admissionregistration.k8s.io": true, "apiextensions.k8s.io": true, netv1.GroupName: true, "*": true}
+	for _, r := range role.Rules {
+		if !sameSet(r.Verbs, []string{"create", "patch"}) {
+			t.Errorf("the manifest applier's verbs on %v = %v, want exactly [create patch]", r.Resources, r.Verbs)
+		}
+		for _, g := range r.APIGroups {
+			if forbiddenGroups[g] {
+				t.Errorf("the manifest applier is granted group %q", g)
+			}
+		}
+		for _, res := range r.Resources {
+			if res == "namespaces" || res == "nodes" || res == "secrets" || res == "serviceaccounts" || res == "*" {
+				t.Errorf("the manifest applier is granted %q", res)
+			}
+		}
+		for _, v := range r.Verbs {
+			if v == "delete" || v == "deletecollection" || v == "*" || v == "escalate" || v == "bind" || v == "impersonate" {
+				t.Errorf("the manifest applier is granted verb %q on %v", v, r.Resources)
+			}
+		}
+	}
+	binding, err := cs.RbacV1().ClusterRoleBindings().Get(ctx, ManifestApplierName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("cluster role binding: %v", err)
+	}
+	if binding.RoleRef.Name != ManifestApplierName || binding.RoleRef.Kind != "ClusterRole" {
+		t.Errorf("binding roleRef = %+v, want ClusterRole %s", binding.RoleRef, ManifestApplierName)
+	}
+	s := binding.Subjects
+	if len(s) != 1 || s[0].Kind != "ServiceAccount" || s[0].Name != ManifestApplierName || s[0].Namespace != ManifestApplierNamespace {
+		t.Errorf("binding subjects = %+v, want exactly the %s/%s service account", s, ManifestApplierNamespace, ManifestApplierName)
+	}
+	assertNoSystemObjects(t, cs)
+	if _, err := cs.RbacV1().ClusterRoles().Get(ctx, nodeDatapathRole, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the manifest applier provisioned the fail-closed graph's role too, get err = %v", err)
+	}
+}

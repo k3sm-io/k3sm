@@ -555,4 +555,26 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		}
 	})
 
+	t.Run("n: the auto-deploy manifest dir is a root:wheel 0755 sibling of the work dir", func(t *testing.T) {
+		own, ok := OwnershipOf(StateManifests)
+		if !ok {
+			t.Fatal("the ownership table has no manifests row")
+		}
+		if own.Principal != PrincipalRoot || own.UID(271) != 0 || own.GID != 0 || own.Mode != 0o755 {
+			t.Errorf("manifests row = %+v, want root:wheel 0755", own)
+		}
+		if got := StateManifests.Path(DefaultDataRoot); got != ManifestDir || ManifestDir != "/var/lib/k3sm/manifests" {
+			t.Errorf("the manifests level resolves to %q, ManifestDir = %q, want /var/lib/k3sm/manifests", got, ManifestDir)
+		}
+		shrinkRestartBudgets(t)
+		f := &fakeSystem{}
+		if err := Install(context.Background(), f, serverCfg()); err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		call := fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", ManifestDir, ManifestDirMode)
+		at, rootAt := idx(f.calls, call), idx(f.calls, fmt.Sprintf("EnsureOwnedDir:%s:0:0:%#o", DefaultDataRoot, StateRootMode))
+		if at < 0 || at < rootAt {
+			t.Errorf("install did not ensure %s root-owned after the root (%s at %d, root at %d)", ManifestDir, call, at, rootAt)
+		}
+	})
 }

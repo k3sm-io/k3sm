@@ -53,6 +53,9 @@ func TestNetdAlignmentUsesTheOwnershipTable(t *testing.T) {
 		filepath.Join(keysDir, install.MeshKeyRefAgent): {uid: 0, gid: 0, mode: 0o600, kind: fakeFile},
 		// A service-user tree someone replaced with a symlink: never chowned.
 		install.StateLevel("pods").Path(root): {uid: testServiceUID, mode: 0o777, kind: fakeLink},
+		// A manifest directory the service user owns: every pod could write
+		// into it, so it is healed back to root.
+		install.StateManifests.Path(root): {uid: testServiceUID, gid: testServiceGID, mode: 0o775},
 	}}
 	logs := captureLogs(t)
 
@@ -106,6 +109,20 @@ func TestNetdAlignmentUsesTheOwnershipTable(t *testing.T) {
 			t.Errorf("%s = %d:%d %04o, want %d:%d %04o", path, st.uid, st.gid, st.mode.Perm(),
 				want.UID(testServiceUID), want.GID, want.Mode)
 		}
+	}
+
+	// The root-owned trees below the root are root's, at the table's mode.
+	for _, level := range install.RootTreeLevels() {
+		path := level.Path(root)
+		want, _ := install.OwnershipOf(level)
+		st := own.stat[path]
+		if int(st.uid) != want.UID(testServiceUID) || int(st.gid) != want.GID || st.mode.Perm() != want.Mode {
+			t.Errorf("%s = %d:%d %04o, want %d:%d %04o", path, st.uid, st.gid, st.mode.Perm(),
+				want.UID(testServiceUID), want.GID, want.Mode)
+		}
+	}
+	if got := install.RootTreeLevels(); len(got) != 1 || got[0] != install.StateManifests {
+		t.Errorf("RootTreeLevels() = %v, want exactly [%s] (never the root, never the keys)", got, install.StateManifests)
 	}
 
 	// The key dir and everything in it are untouched.

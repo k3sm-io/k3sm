@@ -1637,10 +1637,11 @@ func TestInstallOrchestration(t *testing.T) {
 		"ServicePID:io.k3sm.netd",
 		"EnsureServiceUser:_k3sm:" + DefaultDataRoot,
 		// The state tree, per the ownership table: the data root root:wheel 0755
-		// FIRST (never the service user's), then every tree the unprivileged
-		// daemons write, handed over explicitly. The key dir and the two work
+		// FIRST (never the service user's), then the root-owned manifest dir,
+		// then every tree the unprivileged daemons write, handed over explicitly. The key dir and the two work
 		// dirs are applied by the later steps that write into them.
 		"EnsureOwnedDir:/var/lib/k3sm:0:0:0755",
+		"EnsureOwnedDir:/var/lib/k3sm/manifests:0:0:0755",
 		"EnsureOwnedDir:/var/lib/k3sm/run:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/Library:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/pods:271:20:0750",

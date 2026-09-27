@@ -37,6 +37,7 @@ import (
 //
 //	/var/lib/k3sm          root:wheel 0755  (k3s's data-dir mode)
 //	/var/lib/k3sm/keys     root:wheel 0700  (the mesh keys + the node identity)
+//	/var/lib/k3sm/manifests root:wheel 0755 (the operator's auto-deploy manifests)
 //	/var/lib/k3sm/<tree>   service user     (every tree an unprivileged daemon writes)
 //
 // Because the root is root-owned, the service user can no longer create a
@@ -84,6 +85,21 @@ const LibraryMode fs.FileMode = 0o700
 // at the same mode means the installer changes their owner and nothing else.
 const serviceTreePrivateMode fs.FileMode = 0o700
 
+// ManifestDirMode is the auto-deploy manifest directory's mode: root:wheel
+// 0755. World-readable because nothing in it is secret by contract, and
+// root-writable only because every file in it is applied to the cluster: a
+// directory the service user could write would hand every pod (they all share
+// that uid) the manifest reconciler's grant.
+const ManifestDirMode fs.FileMode = 0o755
+
+// manifestsSubdir is the manifest directory's leaf name, spelled once.
+const manifestsSubdir = "manifests"
+
+// ManifestDir is the auto-deploy manifest directory under the default data
+// root, the k3s server/manifests analog. It is a SIBLING of the server work
+// dir, not a child of it, because the work dir is the service user's.
+const ManifestDir = DefaultDataRoot + "/" + manifestsSubdir
+
 // meshKeySubdir is the key directory's leaf name. It is spelled once, so the
 // new location (under the data root) and the legacy one (under the run dir)
 // cannot come to name different leaves.
@@ -124,12 +140,16 @@ func (o StateOwnership) UID(serviceUID int) int {
 // to the data root ("." is the root itself).
 type StateLevel string
 
-// The two root-owned levels. Every other level is a service-user tree.
+// The named levels. The root, the keys and the manifests are root's; every
+// other level is a service-user tree.
 const (
 	// StateRoot is the data root itself.
 	StateRoot StateLevel = "."
 	// StateKeys is the root-only mesh key directory (MeshKeyDir).
 	StateKeys StateLevel = meshKeySubdir
+	// StateManifests is the root-owned auto-deploy manifest directory
+	// (ManifestDir), which the control plane reads and never writes.
+	StateManifests StateLevel = manifestsSubdir
 	// StateRun is the service user's run dir: the daemons' control sockets.
 	StateRun StateLevel = sandbox.RunSubdir
 	// StateLibrary is the service user's home-Library (<home>/Library): the
@@ -150,7 +170,7 @@ type stateLevel struct {
 
 // stateTree is the table, in apply order: the root first (so that by the time
 // any child is touched no unprivileged principal can rename it), then the
-// keys, then every service-user tree.
+// keys and the manifest directory, then every service-user tree.
 //
 // The service-user trees are every directory an unprivileged daemon creates
 // directly under the data root today: the run dir, the control-plane and
@@ -161,12 +181,14 @@ type stateLevel struct {
 var stateTree = func() []stateLevel {
 	root := StateOwnership{Principal: PrincipalRoot, GID: StateRootGID, Mode: StateRootMode}
 	keys := StateOwnership{Principal: PrincipalRoot, GID: StateRootGID, Mode: MeshKeyDirMode}
+	manifests := StateOwnership{Principal: PrincipalRoot, GID: StateRootGID, Mode: ManifestDirMode}
 	svc := func(mode fs.FileMode) StateOwnership {
 		return StateOwnership{Principal: PrincipalServiceUser, GID: ServiceTreeGID, Mode: mode}
 	}
 	return []stateLevel{
 		{StateRoot, root},
 		{StateKeys, keys},
+		{StateManifests, manifests},
 		{StateRun, svc(RunDirMode)},
 		// The service user's home-Library. The data root IS _k3sm's home, and
 		// macOS seeds <home>/Library (Caches, Containers, Keychains, Logs, ...)
@@ -218,6 +240,21 @@ func StateLevels() []StateLevel {
 	out := make([]StateLevel, 0, len(stateTree))
 	for _, row := range stateTree {
 		out = append(out, row.level)
+	}
+	return out
+}
+
+// RootTreeLevels returns the root-owned levels BELOW the data root that netd
+// heals at start, in apply order: every root row except the root itself (which
+// alignStateRoot owns) and the key directory (which only the installer's
+// EnsureMeshKeyDir touches, and netd never does). The slice is freshly
+// allocated.
+func RootTreeLevels() []StateLevel {
+	var out []StateLevel
+	for _, row := range stateTree {
+		if row.own.Principal == PrincipalRoot && row.level != StateRoot && row.level != StateKeys {
+			out = append(out, row.level)
+		}
 	}
 	return out
 }

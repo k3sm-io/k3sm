@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	netv1 "k3sm.io/apis/net/v1"
 
 	"k3sm.io/k3sm/pkg/registrysvc"
@@ -278,6 +279,127 @@ func ensureRegistryAdvertReaderRBAC(ctx context.Context, cs kubernetes.Interface
 	}
 	if _, err := api.RoleBindings(ns).Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create the registry advertisement reader role binding in %s: %w", ns, err)
+	}
+	return nil
+}
+
+// ManifestApplierNamespace and ManifestApplierName name the ServiceAccount the
+// auto-deploy manifest reconciler (pkg/addons.ManifestDir) authenticates as, and
+// the ClusterRole + ClusterRoleBinding that bound it. They are exported so the
+// reconciler requests its token for the SAME account this package grants.
+const (
+	ManifestApplierNamespace = "kube-system"
+	ManifestApplierName      = "k3sm-manifests"
+)
+
+// manifestApplierVerbs is exactly what a server-side apply needs: an apply is a
+// PATCH that may create. No read verb (the reconciler never reads back, and a
+// read grant on a kind like Secret would be a confidentiality grant), no update,
+// and no delete: the reconciler is apply-only.
+var manifestApplierVerbs = []string{"create", "patch"}
+
+// manifestApplierRules is the ClusterRole's whole grant. It is deliberately a
+// fixed list of workload and configuration kinds:
+//
+//   - rbac.authorization.k8s.io and admissionregistration.k8s.io are ABSENT, and
+//     the reconciler refuses those groups before it ever calls the apiserver, so a
+//     manifest can neither grant authority nor change what admission enforces.
+//     Because the identity holds no RBAC write, the apiserver's escalation
+//     prevention bounds anything a manifest could still express.
+//   - secrets and serviceaccounts are ABSENT, and the reconciler refuses both kinds:
+//     creating a kubernetes.io/service-account-token Secret for an existing
+//     ServiceAccount mints that account's token, which escalation prevention does
+//     not cover.
+//   - namespaces, nodes, CustomResourceDefinitions and the net.k3sm.io MeshPeer are
+//     ABSENT. A MeshPeer write stays server-mediated (see doc.go), and a manifest
+//     that needs a namespace or a CRD gets it from the component that owns it.
+//   - events are create/patch only, for the Warning Event the reconciler records on
+//     a Pod-template object that lacks the Darwin scheduling fields.
+func manifestApplierRules() []rbacv1.PolicyRule {
+	rule := func(group string, resources ...string) rbacv1.PolicyRule {
+		return rbacv1.PolicyRule{APIGroups: []string{group}, Resources: resources, Verbs: append([]string(nil), manifestApplierVerbs...)}
+	}
+	return []rbacv1.PolicyRule{
+		rule("", "configmaps", "services", "persistentvolumeclaims", "pods"),
+		rule("apps", "deployments", "daemonsets", "statefulsets"),
+		rule("batch", "jobs", "cronjobs"),
+		rule("networking.k8s.io", "ingresses", "networkpolicies"),
+		rule("storage.k8s.io", "storageclasses"),
+		rule("autoscaling", "horizontalpodautoscalers"),
+		rule("policy", "poddisruptionbudgets"),
+		rule(mlxv1alpha1.GroupName, "mlxmodels"),
+		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
+	}
+}
+
+// ProvisionManifestApplier idempotently lays down the bounded identity the
+// auto-deploy manifest reconciler applies with: the k3sm-manifests
+// ServiceAccount in kube-system, the k3sm-manifests ClusterRole
+// (manifestApplierRules), and the ClusterRoleBinding joining them. It is never
+// system:masters and never a system:* object.
+//
+// Unlike Provision it is NOT on the fail-closed bring-up path: the manifest
+// directory is an optional operator surface, so a failure here disables that
+// surface (the caller logs it) and nothing else. It shares Provision's discipline
+// otherwise: Create-tolerate-AlreadyExists, a bounded retry for an apiserver that
+// is still warming, and no LIST to decide anything.
+func ProvisionManifestApplier(ctx context.Context, cs kubernetes.Interface) error {
+	return provisionManifestApplier(ctx, cs, provisionAttempts, provisionBackoff)
+}
+
+// provisionManifestApplier is the bounded-retry core of ProvisionManifestApplier,
+// parameterized so tests run fast.
+func provisionManifestApplier(ctx context.Context, cs kubernetes.Interface, attempts int, backoff time.Duration) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("provision manifest applier: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+		}
+		if lastErr = ensureManifestApplier(ctx, cs); lastErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("provision manifest applier after %d attempts: %w", attempts, lastErr)
+}
+
+// ensureManifestApplier creates the ServiceAccount, the ClusterRole and the
+// ClusterRoleBinding once each, tolerating AlreadyExists.
+func ensureManifestApplier(ctx context.Context, cs kubernetes.Interface) error {
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ManifestApplierNamespace, Name: ManifestApplierName, Labels: managedLabels()},
+	}
+	if _, err := cs.CoreV1().ServiceAccounts(ManifestApplierNamespace).Create(ctx, sa, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the %s/%s service account: %w", ManifestApplierNamespace, ManifestApplierName, err)
+	}
+
+	api := cs.RbacV1()
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: ManifestApplierName, Labels: managedLabels()},
+		Rules:      manifestApplierRules(),
+	}
+	if _, err := api.ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the manifest applier cluster role: %w", err)
+	}
+
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: ManifestApplierName, Labels: managedLabels()},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     ManifestApplierName,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      ManifestApplierName,
+			Namespace: ManifestApplierNamespace,
+		}},
+	}
+	if _, err := api.ClusterRoleBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create the manifest applier cluster role binding: %w", err)
 	}
 	return nil
 }
