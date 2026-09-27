@@ -42,9 +42,11 @@ import (
 // termination grace budget, best-effort (a failed hook is logged; termination
 // proceeds).
 //
-// postStart's dispatch, readiness gate, failure handling and pod-scoped lifetime
-// live in poststart.go — this file owns the shared handler dispatch (runHook)
-// and preStop.
+// postStart's dispatch, readiness gate, failure handling (a kill that restarts
+// through RestartContainer, or a terminal stop through StopContainer under Never)
+// and pod-scoped lifetime live in poststart.go — this file owns the shared handler
+// dispatch (runHook) and preStop. The terminal stop does not run preStop first
+// (upstream's killContainer does; not served here yet).
 
 // runPreStop runs each container's preStop hook BEFORE the runtimed DeletePod RPC
 // (which sends SIGTERM synchronously) and returns the residual SIGTERM→SIGKILL grace

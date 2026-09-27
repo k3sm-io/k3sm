@@ -475,6 +475,10 @@ on the default runtime too, so they inherit its behavior here.
 - The backoff schedule matches the upstream kubelet: a 10 s base, doubling, capped at 300 s, reset
   once the container has stayed up past the stabilization window. A committed liveness-probe failure
   and a failed `postStart` hook restart the container through the same path.
+- Under `Never`, a failed `postStart` hook stops the container, which stays `Terminated`, and the
+  Pod goes `Failed`, as upstream. Its `preStop` hook does not run before that stop.
+- On a `vm` Pod and on a Pod re-attached after a node-daemon restart, that stop is not available:
+  the container is held NotReady and keeps running.
 
 **Plain init containers are not restarted**, and that is the one remaining gap on the default
 runtime. A regular (non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run

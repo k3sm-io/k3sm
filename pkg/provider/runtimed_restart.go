@@ -39,6 +39,12 @@ import (
 // Three triggers, one authority: an observed exit (observeExits), a committed
 // liveness failure and a failed postStart hook (both via killAndRestart). On a
 // re-attached pod all three recreate the pod instead (beginRecreateLocked).
+// A failed postStart hook whose policy does NOT restart the container (Never)
+// never reaches this authority: it is stopped through runtimed's StopContainer
+// (killAfterPostStart, poststart.go), and its terminated status then reaches
+// observeExits like any exit, which decides no restart. Two kill verbs, one
+// decision: RestartContainer when the policy restarts, StopContainer when it does
+// not, and runtimed makes neither choice.
 //
 // Idempotency (binding): the trigger is keyed per container on the
 // termination's identity — terminationKey{restart_count, exit code,
@@ -659,6 +665,14 @@ func overlayCrashLoop(pod *corev1.Pod, cs []corev1.ContainerStatus, restarts map
 		cs[i].Started = ptr(false)
 	}
 	return restarting
+}
+
+// isAdopted reports whether the track is a re-attached pod, read under restartMu
+// (the field's documented guard).
+func (t *podTrack) isAdopted() bool {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	return t.adopted
 }
 
 // cancelRestarts aborts every in-flight re-exec for the track — called when the

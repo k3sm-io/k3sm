@@ -248,6 +248,12 @@ type runtimedRuntime struct {
 	// window before the node's watch starts).
 	lifetime     chan struct{}
 	lifetimeOnce sync.Once
+
+	// stopVerbMissingOnce limits the "upgrade runtimed" line to one per
+	// process: a runtimed that answers StopContainer with a transport
+	// Unimplemented predates the verb, and that is a node fact, not a per-pod
+	// one (killAfterPostStart, poststart.go).
+	stopVerbMissingOnce sync.Once
 }
 
 // shutdown closes the provider's lifetime channel, ending every worker bounded

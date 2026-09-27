@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -313,6 +315,49 @@ func (r *runtimedRuntime) restartContainerReason(ctx context.Context, podID, con
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
 		return fmt.Errorf("runtimed restart container %s/%s rejected: %s", podID, container, e.GetMessage())
+	}
+	return nil
+}
+
+// The two StopContainer refusals the caller must tell apart, because they call
+// for different operator action. Both leave the container running.
+var (
+	// errStopVerbMissing is the TRANSPORT Unimplemented: the runtimed this
+	// provider talks to predates StopContainer. Upgrading runtimed closes it.
+	errStopVerbMissing = errors.New("runtimed does not serve StopContainer")
+	// errStopUnsupported is the EMBEDDED refusal (codes.Unimplemented or
+	// FAILURE_REASON_UNSUPPORTED): runtimed serves the verb, but the pod's
+	// backend has no per-container stop (a vm guest). No upgrade closes it.
+	errStopUnsupported = errors.New("the pod's backend cannot stop one container")
+)
+
+// stopContainerReason is the shared StopContainer RPC call: the terminal kill of
+// ONE container with no re-spawn (the CRI StopContainer the kubelet's
+// killContainer issues). It sits beside restartContainerReason because the two
+// are the only per-container kill verbs; which one runs is the provider's
+// restart-policy decision, never runtimed's. grace_period_seconds is left 0, so
+// runtimed applies the PodBox grace, which is the kubelet's choice for a kill
+// that carries no override. The two Unimplemented channels are returned as
+// distinct sentinels (errStopVerbMissing, errStopUnsupported); any other refusal
+// or transport failure is a plain wrapped error.
+func (r *runtimedRuntime) stopContainerReason(ctx context.Context, podID, container, reason string) error {
+	resp, err := r.rt.StopContainer(ctx, &runtimev1.StopContainerRequest{
+		PodId:     podID,
+		Container: container,
+		Reason:    reason,
+	})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return fmt.Errorf("runtimed stop container %s/%s: %w", podID, container, errStopVerbMissing)
+		}
+		return fmt.Errorf("runtimed stop container %s/%s: %w", podID, container, err)
+	}
+	e := resp.GetError()
+	if e.GetCode() == int32(codes.Unimplemented) || resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED {
+		return fmt.Errorf("runtimed stop container %s/%s: %w: %s", podID, container, errStopUnsupported, e.GetMessage())
+	}
+	if e != nil && e.GetCode() != 0 {
+		return fmt.Errorf("runtimed stop container %s/%s rejected: %s", podID, container, e.GetMessage())
 	}
 	return nil
 }
