@@ -111,6 +111,28 @@ func (f *fakeIPAM) Teardown(_ context.Context, podID string) error {
 	return f.alloc.Release(ip)
 }
 
+// ReattachPod reserves exactly ip for podID, mirroring podnet's contract: an
+// address held by another pod is refused, a same-pod repeat is a no-op.
+func (f *fakeIPAM) ReattachPod(_ context.Context, podID string, ip netip.Addr) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := f.byPod[podID]; ok {
+		if cur != ip {
+			return fmt.Errorf("reattach pod %s: already bound to %s", podID, cur)
+		}
+		return nil
+	}
+	held, err := f.alloc.AllocateSpecific(ip)
+	if err != nil {
+		return err
+	}
+	if held {
+		return fmt.Errorf("reattach pod %s: %w", podID, podnet.ErrIPInUse)
+	}
+	f.byPod[podID] = ip
+	return nil
+}
+
 func (f *fakeIPAM) SweepStale(_ context.Context, known map[string]netip.Addr) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

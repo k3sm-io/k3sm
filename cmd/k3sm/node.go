@@ -823,6 +823,9 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// is not here: it lives inside provider.NewRuntimed (called from buildProvider
 	// above), so it cannot be omitted by a caller and runs before any CreatePod is
 	// served. It DEGRADES rather than failing closed; see the comment at that call.
+	// NewRuntimed re-attaches the pods that survived a daemon restart before that
+	// reap, re-reserving each one's address on this adapter, so the sweep below
+	// keeps those pods' aliases (it keeps every address the network has bound).
 	if netAdapter != nil {
 		if err := netAdapter.ReconcileStartup(ctx); err != nil {
 			return fmt.Errorf("pod network startup reconcile: %w", err)
@@ -1206,7 +1209,7 @@ func buildProvider(ctx context.Context, opts nodeOptions, cs kubernetes.Interfac
 		if adapter != nil {
 			cfg.Network = adapter
 		}
-		rt, err := provider.NewRuntimed(cfg)
+		rt, err := provider.NewRuntimed(ctx, cfg)
 		if err != nil {
 			return nil, nil, "", provider.NodeCapabilities{}, fmt.Errorf("build runtimed provider: %w", err)
 		}

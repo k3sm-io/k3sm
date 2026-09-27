@@ -46,6 +46,8 @@ import (
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/dataroot"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/supervisor"
 )
 
 // darwinSystem is the production System: it performs the privileged operations
@@ -1968,6 +1970,67 @@ func (darwinSystem) ReapOrphans(binPrefix string) error {
 		return fmt.Errorf("pkill orphaned control-plane children (%s): %w", binPrefix, err)
 	}
 	return nil
+}
+
+// ReadPodReapRecords reads the runtime's pod reap store under dataRoot through
+// the runtime's own reader, so the record shape has one home.
+func (darwinSystem) ReadPodReapRecords(dataRoot string) ([]runtimed.PodReapRecord, error) {
+	return runtimed.ReadPodReapRecords(dataRoot)
+}
+
+// ProcessGroupLeaderStart reads process group pgid's members (kern.proc.pgrp,
+// the probe the runtime's own startup reap uses) and reports the start time of
+// the one whose pid is pgid.
+func (darwinSystem) ProcessGroupLeaderStart(pgid int) (int64, bool) {
+	members, ok := supervisor.ProcGroupMembers(pgid)
+	if !ok {
+		return 0, false
+	}
+	for _, m := range members {
+		if m.Pid == pgid {
+			return m.StartUnixNano, true
+		}
+	}
+	return 0, false
+}
+
+// SignalProcessGroup sends sig to process group pgid (kill(-pgid)). ESRCH, the
+// group having already exited, is success.
+func (darwinSystem) SignalProcessGroup(pgid int, sig syscall.Signal) error {
+	if pgid <= 1 {
+		return fmt.Errorf("refusing to signal process group %d", pgid)
+	}
+	if err := unix.Kill(-pgid, sig); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("signal process group %d with %s: %w", pgid, sig, err)
+	}
+	return nil
+}
+
+// podGroupPollInterval is how often WaitProcessGroupsGone re-reads the groups.
+const podGroupPollInterval = 100 * time.Millisecond
+
+// WaitProcessGroupsGone polls each group's membership until every one is empty
+// or timeout passes. A group whose membership cannot be read counts as still
+// alive, so the caller's SIGKILL follows rather than a silent pass.
+func (darwinSystem) WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int {
+	deadline := time.Now().Add(timeout)
+	for {
+		var left []int
+		for _, pgid := range pgids {
+			if members, ok := supervisor.ProcGroupMembers(pgid); !ok || len(members) > 0 {
+				left = append(left, pgid)
+			}
+		}
+		if len(left) == 0 || !time.Now().Before(deadline) {
+			return left
+		}
+		select {
+		case <-ctx.Done():
+			return left
+		case <-time.After(podGroupPollInterval):
+		}
+		pgids = left
+	}
 }
 
 // RemoveAll removes a path tree.

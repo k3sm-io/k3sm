@@ -123,7 +123,7 @@ func TestNormalizeLocalPortDeniesRejectsOutOfRange(t *testing.T) {
 // the constructor". The check runs before any real construction, so this
 // needs no staged exec shim or runtime root.
 func TestNewRuntimedRejectsOutOfRangeLocalPort(t *testing.T) {
-	_, err := NewRuntimed(RuntimedConfig{
+	_, err := NewRuntimed(context.Background(), RuntimedConfig{
 		NodeName: "n", Root: t.TempDir(), PodLogsDir: t.TempDir(),
 		DeniedLocalPorts: []int{70000},
 	})

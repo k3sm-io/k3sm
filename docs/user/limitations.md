@@ -484,6 +484,53 @@ in place, the Pod does not proceed, and a controller replacing the Pod is what u
 once and never respawned, whatever the Pod or container policy says. If you are on that opt-out, a
 process that exits stays exited until a `Deployment`/`Job` controller replaces the Pod.
 
+### What Survives a Node-Daemon Restart
+
+A native Pod's processes outlive the node daemon. When the daemon restarts (`sudo launchctl kickstart
+-k system/io.k3sm.server`, or `io.k3sm.agent` on a worker, a crash, an upgrade), the new daemon reads
+the Pods bound to its node from the API server and re-attaches to every running Pod whose processes
+are still alive, instead of killing them and creating the Pod again. A re-attached Pod keeps its Pod
+IP, its listeners and its `restartCount`, and records one `PodReattached` Warning Event.
+
+What a re-attached Pod does not get back:
+
+- **Log timestamps during the gap.** Output the containers write while no daemon is running is kept
+  in a capture file and appended to the container log when the new daemon reads it, so nothing is
+  lost, but those lines carry the time they were read, not the time they were written. One line in
+  the log marks where the gap was. A Pod started before this capture existed (by an older k3sm) did
+  lose its output; it carries the `k3sm.io/log-stream-lost` condition with reason `RuntimeRestarted`.
+- **Exit status.** A re-attached container is no longer the daemon's child, so when it exits the
+  daemon sees the exit but not the status. The container reports terminated with reason
+  `ExitStatusUnknown` and exit code `-1`, never `0`. A container that exited while the daemon was down
+  reports the same.
+- **`kubectl exec`.** It needs the Pod's sandbox profile, which the new daemon does not rebuild, so
+  it is refused on a re-attached Pod. Delete the Pod (or let its controller replace it) to get it back.
+- **In-place container restarts.** Upstream restarts only the container that exited. k3sm cannot
+  rebuild one container's sandbox inside a re-attached Pod, so it recreates the whole Pod instead.
+  This applies when a container exits and the Pod's `restartPolicy` says to restart it, and when a
+  liveness probe or a postStart hook fails. Every container stops, postStart hooks run again, and the
+  Pod starts again under the same name and UID, possibly with a new Pod IP. Each container's
+  `restartCount` rises by one. The Pod records one `PodRecreatedAfterReattach` Warning Event naming
+  the containers due a restart. After that the Pod is an ordinary one again. A per-container restart
+  for re-attached Pods is tracked as B409.
+- **`kubectl logs --previous` after that recreate.** It reports the previous container as not found.
+  The earlier instance's log files stay on disk under the Pod's log directory.
+- **A failed recreate.** The Pod records a `PodRecreateAfterReattachFailed` Warning Event naming the
+  error. If stopping the Pod failed, it keeps running as it was and its next restart retries. If
+  starting it again failed, the Pod is left stopped; delete it so its controller (or you) creates
+  it again.
+- **CPU accounting.** CPU usage restarts from zero at the re-attachment.
+
+Some Pods are created again rather than re-attached: `vm` Pods (a guest never outlives its helper),
+Pods that were still running an init container, Pods whose processes all exited, and every Pod after
+the daemon binary itself changed (an upgrade), because a Pod is only supervised by the exact build
+that started it.
+
+`sudo k3sm uninstall` stops every recorded Pod process group (SIGTERM, then SIGKILL after 10 s) once
+the daemons are gone, so nothing k3sm started keeps running and a reinstall starts every Pod fresh. A
+group whose original leader process has already exited is left alone and logged, because nothing
+proves it still belongs to the Pod.
+
 ### `vm` RuntimeClass, Multi-Node, and HA Status
 
 - The **`vm` RuntimeClass** (running Linux images in a per-Pod micro-VM) boots and runs a Pod.

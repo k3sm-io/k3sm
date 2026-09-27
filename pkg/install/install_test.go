@@ -28,7 +28,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -36,6 +38,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 )
 
 // TestMain points the three GLOBAL declaration paths at a scratch directory for
@@ -65,6 +68,13 @@ func TestMain(m *testing.M) {
 // the install orchestration without any real privilege.
 type fakeSystem struct {
 	calls []string
+	// podReap is the runtime reap store ReadPodReapRecords answers with, and
+	// podLeaders[pgid] the live leader start of each group (absent: no leader).
+	// podLingering are the groups still alive when the SIGTERM grace ends. The
+	// zero values describe a node with no recorded pods.
+	podReap      []runtimed.PodReapRecord
+	podLeaders   map[int]int64
+	podLingering map[int]bool
 	// handleSeq numbers the directories OpenDirNoFollow hands out, so a test can
 	// assert every read and removal went through the SAME held handle.
 	handleSeq int
@@ -1535,6 +1545,35 @@ func (f *fakeSystem) FlushMeshPFAnchor() error {
 	return nil
 }
 
+func (f *fakeSystem) ReadPodReapRecords(dataRoot string) ([]runtimed.PodReapRecord, error) {
+	f.calls = append(f.calls, "ReadPodReapRecords:"+dataRoot)
+	return slices.Clone(f.podReap), nil
+}
+
+func (f *fakeSystem) ProcessGroupLeaderStart(pgid int) (int64, bool) {
+	start, ok := f.podLeaders[pgid]
+	return start, ok
+}
+
+func (f *fakeSystem) SignalProcessGroup(pgid int, sig syscall.Signal) error {
+	name := map[syscall.Signal]string{syscall.SIGTERM: "TERM", syscall.SIGKILL: "KILL"}[sig]
+	f.calls = append(f.calls, fmt.Sprintf("Signal:%d:%s", pgid, name))
+	return nil
+}
+
+func (f *fakeSystem) WaitProcessGroupsGone(_ context.Context, pgids []int, timeout time.Duration) []int {
+	strs := make([]string, len(pgids))
+	var left []int
+	for i, pgid := range pgids {
+		strs[i] = strconv.Itoa(pgid)
+		if f.podLingering[pgid] {
+			left = append(left, pgid)
+		}
+	}
+	f.calls = append(f.calls, fmt.Sprintf("WaitGone:%s:%s", strings.Join(strs, ","), timeout))
+	return left
+}
+
 // TestInstallOrchestration proves the install drives the seam in the right
 // TestLogDirIsNotWorldReadable pins the daemon log tree's ownership policy and
 // the fact that install applies it.
@@ -2023,6 +2062,9 @@ func TestUninstallIdempotent(t *testing.T) {
 		// the sweep it is a dangling link whose identity can no longer be read.
 		"RemoveSymlink:/usr/local/bin/k3sm",
 		"RemoveAll:/Library/k3sm",
+		// Every recorded pod process group is read once the daemons are gone
+		// (this node recorded none).
+		"ReadPodReapRecords:/var/lib/k3sm",
 		"ReapOrphans:/var/lib/k3sm/server/bin",
 		// The mesh pf anchor flush (B274) is the uninstall backstop for the
 		// MSS-clamp rule netd's own shutdown path never reaches.
