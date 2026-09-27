@@ -649,7 +649,10 @@ func serviceGID() int {
 // at the next netd start, and never re-owned to the service user; the trees the
 // unprivileged daemons write under it are the service user's, and netd creates
 // any that are missing, because under a root-owned root the service user cannot.
-// The mesh key directory is root's and netd never touches it or its contents.
+// The mesh key directory is root's and netd never touches it or its contents;
+// the other root-owned trees under the root (the auto-deploy manifest
+// directory) are created when missing and healed to root:wheel like the root.
+// Their contents are never touched.
 //
 // netd runs as root, so it needs no ownership of the run directory to create
 // its socket inside it, and it never takes that directory for root: that was
@@ -676,6 +679,9 @@ func listenNetd(socket, dataRoot string, gid int, own ownership) (net.Listener, 
 		return nil, fmt.Errorf("create socket dir %s: %w", dir, err)
 	}
 	if err := alignStateRoot(own, root); err != nil {
+		return nil, err
+	}
+	if err := alignRootTrees(own, root); err != nil {
 		return nil, err
 	}
 	uid, _, lerr := own.Lookup(install.DefaultServiceUser)
@@ -790,6 +796,45 @@ func alignStateRoot(own ownership, root string) error {
 	slog.Warn("netd: aligned data-root ownership", "dir", root,
 		"from", fmt.Sprintf("uid=%d gid=%d mode=%04o", uid, gid, fi.Mode().Perm()),
 		"to", fmt.Sprintf("uid=%d gid=%d mode=%04o", want.UID(0), want.GID, want.Mode))
+	return nil
+}
+
+// alignRootTrees applies the table's root-owned rows below the data root
+// (install.RootTreeLevels): each is created when missing and re-owned to root
+// when it has drifted, so a manifest directory the service user could write,
+// and so every pod could, is never left in place. Like alignServiceTrees it
+// never recurses and never follows a symlink.
+func alignRootTrees(own ownership, root string) error {
+	for _, level := range install.RootTreeLevels() {
+		want, _ := install.OwnershipOf(level)
+		path := level.Path(root)
+		fi, err := own.Lstat(path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if err := own.MkdirAll(path, want.Mode); err != nil {
+				return fmt.Errorf("create %s: %w", path, err)
+			}
+			if err := alignDir(own, path, want.UID(0), want.GID, want.Mode); err != nil {
+				return err
+			}
+			continue
+		case err != nil:
+			return fmt.Errorf("stat %s: %w", path, err)
+		case !fi.IsDir() || fi.Mode()&fs.ModeSymlink != 0:
+			slog.Warn("netd: a root-owned tree is not a directory; left alone", "path", path, "mode", fi.Mode().String())
+			continue
+		}
+		uid, gid := statOwner(fi)
+		if uid == want.UID(0) && gid == want.GID && fi.Mode().Perm() == want.Mode {
+			continue
+		}
+		if err := alignDir(own, path, want.UID(0), want.GID, want.Mode); err != nil {
+			return err
+		}
+		slog.Warn("netd: aligned a root-owned tree's ownership", "dir", path,
+			"from", fmt.Sprintf("uid=%d gid=%d mode=%04o", uid, gid, fi.Mode().Perm()),
+			"to", fmt.Sprintf("uid=%d gid=%d mode=%04o", want.UID(0), want.GID, want.Mode))
+	}
 	return nil
 }
 

@@ -53,6 +53,49 @@ and one residual limitation remains (no per-pod uid isolation).
   arguments row as unreadable as this user, which never changes the verdict, and `sudo k3sm status`
   shows it.
 - The kine/SQLite datastore under the server work directory (see [Backup & restore](backup-restore.md)).
+- An empty auto-deploy manifest directory, **`/var/lib/k3sm/manifests`**, owned by `root:wheel`,
+  mode `0755` (see below).
+
+## Auto-Deploy Manifests
+
+Like k3s's `server/manifests`, the server applies every manifest you drop into
+**`/var/lib/k3sm/manifests`**, on start and whenever the directory changes (with a sweep every
+60 seconds as a backstop). Unlike k3s, the directory sits outside the server's work directory and
+belongs to root, because every pod on a k3sm node runs as the same service user and could otherwise
+write into it.
+
+- **Ownership.** The directory and every file in it must be owned by `root` and must not be
+  writable by group or others. Anything else is skipped with a log line. Write files with `sudo`,
+  for example `sudo install -m 0644 addon.yaml /var/lib/k3sm/manifests/`.
+- **What is read.** Files ending in `.yaml`, `.yml` or `.json`. A name starting with `.` or `_` is
+  ignored, which is how you park a file without deleting it. Symlinks are ignored. Several
+  documents in one file are fine, and a `kind: List` or a top-level JSON array is applied item by
+  item (the List's own metadata is ignored).
+- **Apply-only.** Objects are applied with server-side apply under the field manager
+  `k3sm-manifest-dir`, never forced. When a field in the file is owned by another manager (for
+  example, one you changed with `kubectl edit`), that object is not applied and the server records
+  a Warning Event with reason `ManifestFieldConflict` on it, naming the file and the other manager.
+  The file is not retried until you change it. Nothing is ever deleted: removing a file, or removing an object from a file, leaves the
+  object in the cluster until you delete it with `kubectl`.
+- **Refused kinds.** RBAC objects (`rbac.authorization.k8s.io`: Roles, ClusterRoles, bindings),
+  admission objects (`admissionregistration.k8s.io`: webhooks, admission policies), Secrets and
+  ServiceAccounts are refused and logged; the rest of the file still applies. Create Secrets and
+  ServiceAccounts with `kubectl`. The server applies manifests as the `kube-system/k3sm-manifests`
+  ServiceAccount, which may only create and patch common workload and configuration kinds
+  (Deployments, DaemonSets, StatefulSets, Jobs, CronJobs, Pods, Services, ConfigMaps, PVCs,
+  Ingresses, NetworkPolicies, StorageClasses, HPAs, PDBs, MLXModels). A Pod may run as any existing
+  ServiceAccount in its namespace, the standard ceiling for anything that can create workloads. It
+  cannot create namespaces, so create one first with `kubectl`. Nothing is ever deleted, so remove
+  a mistaken object with `kubectl`.
+- **Change tracking.** Every applied object carries the annotation `manifests.k3sm.io/sha256`, the
+  checksum of the file it came from. An unchanged file is not applied again.
+- **Adapt stock manifests.** A manifest written for Linux has no `kubernetes.io/os: darwin`
+  nodeSelector and no toleration for the `k3sm.io/provider` taint. It still applies, but its pods
+  are refused or never scheduled. The server records a Warning Event with reason
+  `ManifestNeedsDarwinScheduling` on such an object, naming both fields; add them to the pod
+  template.
+
+`k3sm uninstall` keeps the directory and its contents with the rest of your cluster data.
 
 ## Install Channels
 

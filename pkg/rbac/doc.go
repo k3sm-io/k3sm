@@ -58,6 +58,13 @@ limitations under the License.
 //     the shared kube-public namespace to earn it (the KEP-1755 hosting document
 //     stays there, as the KEP requires).
 //
+// Separately, and NOT on the fail-closed path, ProvisionManifestApplier lays down
+// the bounded identity the auto-deploy manifest reconciler applies with: the
+// k3sm-manifests ServiceAccount in kube-system and a ClusterRole granting write on
+// a fixed list of workload and configuration kinds (create and patch only), with
+// no RBAC, admission, Secret, ServiceAccount, namespace, CRD or MeshPeer write. A manifest is therefore applied with a grant
+// the apiserver's escalation prevention bounds, never with system:masters.
+//
 // # What it deliberately does NOT touch
 //
 // It never creates or mutates the apiserver's auto-reconciled default system:*
