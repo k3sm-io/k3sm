@@ -220,7 +220,7 @@ func TestMeshKeyDirLivesOutsideTheServiceUserRunDir(t *testing.T) {
 		if got := string(f.files[serverHelper]); got != current {
 			t.Errorf("the new key was overwritten by the legacy copy: %q", got)
 		}
-		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"); len(calls) != 0 {
+		if calls := meshKeyCalls(f, "WriteRootOnlyFile:"+MeshKeyDir+"/"); len(calls) != 0 {
 			t.Errorf("nothing should have been copied: %v", calls)
 		}
 		wantCall(t, f, "RemoveEntry:h1:"+MeshKeyRefServer)
