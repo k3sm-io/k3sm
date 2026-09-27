@@ -380,6 +380,7 @@ nohup env CGO_ENABLED=1 "$RACE_BIN" server \
 	--work-dir "$SERVER_WORKDIR" --node-name "$M14_NODE" \
 	--mesh-ip "$SELF_MESH_IP" --network direct --runtime hostprocess \
 	--pod-root "$M14_WORK/pods" \
+	--pod-logs-dir "$M14_WORK/pod-logs" \
 	--api-port "$M14_API_PORT" --kine-port "$M14_KINE_PORT" \
 	--kubelet-port "$M14_KUBELET_PORT" \
 	--scheduler-port "$M14_SCHED_PORT" --controller-manager-port "$M14_CM_PORT" \
