@@ -516,7 +516,7 @@ What a re-attached Pod does not get back:
   Pod starts again under the same name and UID, possibly with a new Pod IP. Each container's
   `restartCount` rises by one. The Pod records one `PodRecreatedAfterReattach` Warning Event naming
   the containers due a restart. After that the Pod is an ordinary one again. A per-container restart
-  for re-attached Pods is tracked as B409.
+  for re-attached Pods is planned.
 - **`kubectl logs --previous` after that recreate.** It reports the previous container as not found.
   The earlier instance's log files stay on disk under the Pod's log directory.
 - **A failed recreate.** The Pod records a `PodRecreateAfterReattachFailed` Warning Event naming the
