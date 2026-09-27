@@ -280,6 +280,17 @@ type podTrack struct {
 	// restartMu, never the reverse.
 	restartMu sync.Mutex
 	restarts  map[string]*containerRestart // container name -> restart bookkeeping
+	// adopted marks a pod the provider re-attached after a node-daemon restart
+	// (runtimed_attach.go) rather than created. runtimed refuses RestartContainer
+	// on such a pod (its sandbox profile was not rebuilt), so a container exit
+	// that is due a restart recreates the whole pod instead (recreateAdopted).
+	// Set once at attach, before the track is published; read under restartMu.
+	adopted bool
+	// recreating latches the one recreate an adopted pod gets, so the stream
+	// and the backstop delivering the same exit (or a probe re-committing the
+	// same failure) start one recreate. Cleared again only when the recreate's
+	// runtime delete fails, so a later trigger retries. Guarded by restartMu.
+	recreating bool
 	// pulls is the per-image retry bookkeeping of the image pull-failure path
 	// (runtimed_pull.go): the schedule that paces StartContainer re-attempts for
 	// a container that never started, keyed by image reference (the track is
@@ -511,7 +522,10 @@ type RuntimedConfig struct {
 // production defaults (real image puller/signer, the exec-shim Seatbelt backend,
 // posix_spawn/kqueue supervisor). It returns an error if the runtime cannot be
 // constructed (e.g. its cache dir).
-func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
+//
+// ctx bounds the startup re-attachment (adoptNodePods), the one part of
+// construction that talks to the apiserver.
+func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -600,18 +614,25 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init runtimed: %w", err)
 	}
-	// Startup pod reap — MUST run here, in-process, before any CreatePod can be
-	// served. The embedded node drives this Runtime by direct RPC and never runs
-	// runtime.Server.Serve, so runtimed's own once-before-serve reap never fires on
-	// the shipped path: the reaper existed but was UNREACHABLE here, leaving pod
-	// process groups a prior `launchctl kickstart -k` orphaned onto launchd running
-	// (holding ports, surviving uninstall). This is the exact sibling of the
-	// network startup reconcile, and for the exact same reason — see the comment
-	// block at cmd/k3sm/node.go's netAdapter.ReconcileStartup call.
+	r := newRuntimedWith(rt, cfg, resolver, log)
+	// Startup re-attachment, then the startup pod reap — MUST run here,
+	// in-process, before any CreatePod can be served. The embedded node drives
+	// this Runtime by direct RPC and never runs runtime.Server.Serve, so
+	// runtimed's own once-before-serve reap never fires on the shipped path: the
+	// reaper existed but was UNREACHABLE here, leaving pod process groups a prior
+	// `launchctl kickstart -k` orphaned onto launchd running (holding ports,
+	// surviving uninstall). This is the exact sibling of the network startup
+	// reconcile, and for the exact same reason — see the comment block at
+	// cmd/k3sm/node.go's netAdapter.ReconcileStartup call.
 	//
-	// It is sourced HERE, in the constructor, rather than in cmd: a caller cannot
-	// omit it, and the wiring is unit-testable without a live node (cmd is a thin
-	// main).
+	// adoptNodePods first re-attaches every running pod of this node whose
+	// processes survived (runtimed_attach.go), and only then calls
+	// ReapOrphanedPods: the reap kills every recorded group no registered pod
+	// owns, so an attach after it would find nothing left to attach to. It is
+	// sourced HERE, in the constructor, rather than in cmd: a caller cannot omit
+	// it or reorder it, no create can precede it (Virtual Kubelet starts on the
+	// provider this returns), and the wiring is unit-testable without a live node
+	// (cmd is a thin main).
 	//
 	// DEGRADES, it does not fail closed — the one way it differs from that network
 	// sibling, which returns its error and aborts node startup. ReapOrphanedPods
@@ -619,11 +640,10 @@ func NewRuntimed(cfg RuntimedConfig) (*runtimedRuntime, error) {
 	// reap): a best-effort orphan store is not a scheduling precondition, and
 	// propagating its I/O fault would exit main and launchd-crash-loop the node.
 	// The returned error is therefore checked-and-logged, never propagated — do NOT
-	// "harden" this into a startup failure.
-	if err := rt.ReapOrphanedPods(); err != nil {
-		log.Error("startup pod reap reported an error (degraded, node continues)", "err", err)
-	}
-	return newRuntimedWith(rt, cfg, resolver, log), nil
+	// "harden" this into a startup failure. A failed attach degrades the same way:
+	// the pod is created again.
+	r.adoptNodePods(ctx, rt)
+	return r, nil
 }
 
 // newRuntimedWith wraps an existing runtime server (tests inject a fake) with the

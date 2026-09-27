@@ -1323,15 +1323,17 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 }
 
 // runtimeConditions returns the node-owned conditions runtimed publishes on
-// PodStatus.conditions that the pod status carries verbatim: today only
-// k3sm.io/shim-inactive (a restricted main process lost the pod shim). The
+// PodStatus.conditions that the pod status carries verbatim:
+// k3sm.io/shim-inactive (a restricted main process lost the pod shim) and
+// k3sm.io/log-stream-lost (the pod was re-attached after a node-daemon restart,
+// so output written while the daemon was down was not captured). The
 // runtime's own renderings of the four kubelet-owned types are NOT forwarded,
 // because toPodStatus derives those itself. A condition with an unspecified
 // status is dropped rather than published as an empty ConditionStatus.
 func runtimeConditions(rs *runtimev1.PodStatus) []corev1.PodCondition {
 	var out []corev1.PodCondition
 	for _, c := range rs.GetConditions() {
-		if c.GetType() != runtimed.ShimInactiveConditionType {
+		if !isRuntimeCondition(c.GetType()) {
 			continue
 		}
 		st, ok := conditionStatus(c.GetStatus())
@@ -1351,6 +1353,12 @@ func runtimeConditions(rs *runtimev1.PodStatus) []corev1.PodCondition {
 		})
 	}
 	return out
+}
+
+// isRuntimeCondition reports whether t is a node-owned condition runtimed
+// publishes and the pod status forwards (runtimeConditions).
+func isRuntimeCondition(t string) bool {
+	return t == runtimed.ShimInactiveConditionType || t == runtimed.LogStreamLostConditionType
 }
 
 // conditionStatus maps a runtime ConditionStatus to its corev1 form; ok is
@@ -1559,9 +1567,9 @@ func isProviderOwnedCondition(t corev1.PodConditionType) bool {
 	switch t {
 	case corev1.PodInitialized, corev1.PodReady, corev1.ContainersReady, corev1.PodScheduled:
 		return true
-	case runtimed.ShimInactiveConditionType:
-		// Node-owned: toPodStatus re-reads it from the runtime on every build
-		// (runtimeConditions), so a carried-forward copy would duplicate it.
+	case runtimed.ShimInactiveConditionType, runtimed.LogStreamLostConditionType:
+		// Node-owned: toPodStatus re-reads them from the runtime on every build
+		// (runtimeConditions), so a carried-forward copy would duplicate them.
 		return true
 	default:
 		return false

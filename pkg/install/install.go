@@ -47,6 +47,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"k3sm.io/darwin-net/pkg/podnet"
@@ -58,6 +59,7 @@ import (
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/nodecred"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
+	runtimed "k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -1028,6 +1030,21 @@ type System interface {
 	// never loaded is a no-op (pfctl succeeds flushing zero rules), and a
 	// pfctl failure is reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
+	// ReadPodReapRecords returns the pod process groups the runtime recorded in
+	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
+	// holds none.
+	ReadPodReapRecords(dataRoot string) ([]runtimed.PodReapRecord, error)
+	// ProcessGroupLeaderStart reports the kernel start time (unix nanoseconds)
+	// of process group pgid's leader, the member whose pid is pgid. alive is
+	// false when no such member exists: the group is empty, or only a
+	// grandchild of the leader keeps it alive.
+	ProcessGroupLeaderStart(pgid int) (startUnixNano int64, alive bool)
+	// SignalProcessGroup sends sig to every member of process group pgid. A
+	// group that no longer exists is a no-op success.
+	SignalProcessGroup(pgid int, sig syscall.Signal) error
+	// WaitProcessGroupsGone waits up to timeout for every group in pgids to
+	// have no members, and returns the groups that still have one.
+	WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -3425,6 +3442,13 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			}
 		}
 	}
+	// Stop every pod process group the runtime recorded. The node daemon's own
+	// shutdown leaves native pods running on purpose (a restart re-attaches to
+	// them), so after its bootout above they are the one thing still running
+	// k3sm workloads, and a reinstall would re-attach to them. It runs here,
+	// after every daemon is booted out (none is left to start a replacement),
+	// and reads the records from the data root, which uninstall preserves.
+	note(teardownPodGroups(ctx, sys, cfg))
 	// Backstop: reap any control-plane children that outlived the booted-out
 	// server daemon (a Stop() cut short by launchd's SIGKILL, or a crash). They
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/

@@ -77,8 +77,13 @@ type PodIPAM interface {
 	// unknown podID is a no-op success). It releases a guest allocation too — a
 	// vm pod draws from the SAME node pool.
 	Teardown(ctx context.Context, podID string) error
+	// ReattachPod re-reserves exactly ip for podID and re-ensures its lo0 alias
+	// (idempotent: the alias of a surviving pod is usually still there), without
+	// allocating. It refuses an address held by another pod.
+	ReattachPod(ctx context.Context, podID string, ip netip.Addr) error
 	// SweepStale removes every k3sm-owned lo0 alias in the node podCIDR not in
-	// the known podID->IP set (the crash-recovery orphan sweep).
+	// the known podID->IP set nor bound by ReattachPod (the crash-recovery
+	// orphan sweep).
 	SweepStale(ctx context.Context, known map[string]netip.Addr) error
 	// EnsureNodeAlias plumbs the lo0 /32 alias for the node's OWN advertised
 	// address (the mesh-egress .1) so the apiserver node-proxy can dial
@@ -273,6 +278,24 @@ func (a *PodNetAdapter) GuestNetwork(podID string) (sandbox.GuestNetworkConfig, 
 	return cfg, ok
 }
 
+// Reattach re-reserves the address a pod that survived a node-daemon restart is
+// already bound to, and re-ensures its lo0 alias, through podnet's ReattachPod:
+// that exact address, never a fresh allocation, so the surviving processes keep
+// the address they bound and no other pod can be handed it. It runs at node
+// start, before ReconcileStartup, whose sweep then keeps the reattached alias
+// (podnet's sweep keeps every bound address). A later Setup for the same pod
+// returns the same address, and Teardown releases it as it would a Setup's.
+func (a *PodNetAdapter) Reattach(ctx context.Context, podID, ip string) error {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return fmt.Errorf("podnet reattach %s: parse %q: %w", podID, ip, err)
+	}
+	if err := a.ipam.ReattachPod(ctx, podID, addr); err != nil {
+		return fmt.Errorf("podnet reattach %s: %w", podID, err)
+	}
+	return nil
+}
+
 // MarkHostNetwork records podID as a spec.hostNetwork pod so BOTH Setup callers
 // (the provider's allocate-before-translate and runtimed's host-process spine)
 // resolve it to the node IP — one authority, zero allocation. Teardown unmarks.
@@ -283,12 +306,13 @@ func (a *PodNetAdapter) MarkHostNetwork(podID string) {
 }
 
 // ReconcileStartup implements runtimed's optional runtime.NetworkReconciler: it
-// runs once, before the runtime serves any CreatePod, and sweeps EVERY
-// k3sm-owned lo0 alias in the node podCIDR. The known set is empty by design:
-// at assembly the fresh adapter/provider tracks no pods (runtimed pods are
-// in-process children with no durable podID->IP manifest to ReattachPod from,
-// so nothing survives a daemon restart) — every alias a crashed previous daemon
-// left behind is stale. A failed sweep fails the runtime closed, never serving
+// runs once, before the runtime serves any CreatePod, and sweeps every
+// k3sm-owned lo0 alias in the node podCIDR that no pod holds. The known set it
+// passes is empty; what the sweep keeps is what the network itself has bound,
+// which at this point is exactly the addresses Reattach re-reserved for the pods
+// the provider re-attached after a daemon restart (NewRuntimed runs those
+// attaches before this is called). Every other alias a previous daemon left
+// behind is stale. A failed sweep fails the runtime closed, never serving
 // allocations over an inconsistent alias table.
 //
 // EXACTLY ONCE, and enforced HERE rather than only by runtimed's own sticky

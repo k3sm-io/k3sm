@@ -37,7 +37,8 @@ import (
 // RPC — the same runtime action the liveness-probe path drives.
 //
 // Three triggers, one authority: an observed exit (observeExits), a committed
-// liveness failure and a failed postStart hook (both via killAndRestart).
+// liveness failure and a failed postStart hook (both via killAndRestart). On a
+// re-attached pod all three recreate the pod instead (beginRecreateLocked).
 //
 // Idempotency (binding): the trigger is keyed per container on the
 // termination's identity — terminationKey{restart_count, exit code,
@@ -345,9 +346,33 @@ func (r *runtimedRuntime) observeExits(pod *corev1.Pod, t *podTrack, rs *runtime
 		t.cancelRestartsLocked()
 		return
 	}
+	if t.adopted && len(due) > 0 {
+		// A re-attached pod cannot restart a container in place (runtimed refuses
+		// it); the restart is a recreate of the whole pod, started once.
+		names := make([]string, 0, len(due))
+		for _, e := range due {
+			names = append(names, e.name)
+		}
+		r.beginRecreateLocked(t, names)
+		return
+	}
 	for _, e := range due {
 		r.scheduleRestartLocked(t, rs.GetPodId(), e.name, e.key, e.term)
 	}
+}
+
+// beginRecreateLocked starts the one recreate of a re-attached pod, for the
+// containers named, unless one is already in flight. Every restart trigger on an
+// adopted track (an observed exit, a committed liveness failure, a failed
+// postStart hook) converges here and never on RestartContainer. The latch is
+// cleared by recreateAdopted when its runtime delete fails, so a later trigger
+// retries. Caller holds t.restartMu.
+func (r *runtimedRuntime) beginRecreateLocked(t *podTrack, containers []string) {
+	if t.recreating {
+		return
+	}
+	t.recreating = true
+	go r.recreateAdopted(t, containers)
 }
 
 // scheduleRestartLocked schedules one re-exec for a decided exit, under
@@ -402,6 +427,12 @@ func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, contain
 // either way, so the next restart of this container — from any trigger — is
 // throttled correctly.
 //
+// A re-attached pod is the exception: runtimed refuses RestartContainer there,
+// so retrying the RPC would loop on a standing refusal forever. Both triggers
+// route into the same one-shot recreate an observed exit takes
+// (beginRecreateLocked). There is no per-container stop verb, so the kill is the
+// recreate's runtime delete, which stops every container of the pod.
+//
 // It returns an error only when the pod is untracked; a restart already in flight is
 // a successful no-op.
 func (r *runtimedRuntime) killAndRestart(podID, container, reason string) error {
@@ -411,6 +442,10 @@ func (r *runtimedRuntime) killAndRestart(podID, container, reason string) error 
 	}
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
+	if t.adopted {
+		r.beginRecreateLocked(t, []string{container})
+		return nil
+	}
 	cr := t.restartFor(container, r.clk)
 	if cr.attempt {
 		return nil // a re-exec for this container is already in flight

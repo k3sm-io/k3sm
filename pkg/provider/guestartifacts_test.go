@@ -323,7 +323,7 @@ func TestGuestArtifactFailureBlastRadiusIsOneNode(t *testing.T) {
 // why this helper never tolerates an error.
 func mustNewRuntimed(t *testing.T, root string, art *EnsuredGuestArtifacts) *runtimedRuntime {
 	t.Helper()
-	rt, err := NewRuntimed(RuntimedConfig{
+	rt, err := NewRuntimed(context.Background(), RuntimedConfig{
 		NodeName: "n1",
 		Root:     root, PodLogsDir: root,
 		GuestArtifacts: art,
