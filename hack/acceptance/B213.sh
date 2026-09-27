@@ -255,6 +255,7 @@ else
 		nohup env CGO_ENABLED=1 "$LAB_BIN" server \
 			--work-dir "$wd" --node-name "$node" --node-ip 127.0.0.1 \
 			--runtime hostprocess --network none --pod-root "$LAB_ROOT/pods" \
+			--pod-logs-dir "$LAB_ROOT/pod-logs" \
 			--api-port "$LAB_API_PORT" --kine-port "$LAB_KINE_PORT" \
 			--kubelet-port "$LAB_KUBELET_PORT" \
 			--scheduler-port "$LAB_SCHED_PORT" --controller-manager-port "$LAB_KCM_PORT" \
