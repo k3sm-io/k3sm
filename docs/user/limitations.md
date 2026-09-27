@@ -477,8 +477,7 @@ on the default runtime too, so they inherit its behavior here.
   and a failed `postStart` hook restart the container through the same path.
 - Under `Never`, a failed `postStart` hook stops the container, which stays `Terminated`, and the
   Pod goes `Failed`, as upstream. Its `preStop` hook does not run before that stop.
-- On a `vm` Pod and on a Pod re-attached after a node-daemon restart, that stop is not available:
-  the container is held NotReady and keeps running.
+- On a `vm` Pod that stop is not available: the container is held NotReady and keeps running.
 
 **Plain init containers are not restarted**, and that is the one remaining gap on the default
 runtime. A regular (non-sidecar) init container that fails under `Always` / `OnFailure` is not re-run
@@ -507,28 +506,19 @@ What a re-attached Pod does not get back:
   daemon sees the exit but not the status. The container reports terminated with reason
   `ExitStatusUnknown` and exit code `-1`, never `0`. A container that exited while the daemon was down
   reports the same.
-- **`kubectl exec`.** It needs the Pod's sandbox profile, which the new daemon does not rebuild, so
-  it is refused on a re-attached Pod. Delete the Pod (or let its controller replace it) to get it back.
-- **In-place container restarts.** Upstream restarts only the container that exited. k3sm cannot
-  rebuild one container's sandbox inside a re-attached Pod, so it recreates the whole Pod instead.
-  This applies when a container exits and the Pod's `restartPolicy` says to restart it, and when a
-  liveness probe or a postStart hook fails. Every container stops, postStart hooks run again, and the
-  Pod starts again under the same name and UID, possibly with a new Pod IP. Each container's
-  `restartCount` rises by one. The Pod records one `PodRecreatedAfterReattach` Warning Event naming
-  the containers due a restart. After that the Pod is an ordinary one again. A per-container restart
-  for re-attached Pods is planned.
-- **`kubectl logs --previous` after that recreate.** It reports the previous container as not found.
-  The earlier instance's log files stay on disk under the Pod's log directory.
-- **A failed recreate.** The Pod records a `PodRecreateAfterReattachFailed` Warning Event naming the
-  error. If stopping the Pod failed, it keeps running as it was and its next restart retries. If
-  starting it again failed, the Pod is left stopped; delete it so its controller (or you) creates
-  it again.
+- **`kubectl exec`.** It needs a resident shim that holds the container's launch environment, and
+  k3sm runs none, so the new daemon cannot enter a running container and exec is refused on a
+  re-attached Pod. Delete the Pod (or let its controller replace it) to get it back.
 - **CPU accounting.** CPU usage restarts from zero at the re-attachment.
 
 Some Pods are created again rather than re-attached: `vm` Pods (a guest never outlives its helper),
 Pods that were still running an init container, Pods whose processes all exited, and every Pod after
 the daemon binary itself changed (an upgrade), because a Pod is only supervised by the exact build
 that started it.
+
+A change to a runtimed flag that shapes the sandbox profile (work dir, home, resolver or apiserver
+VIP, pod logs dir, shadow bin dir) makes the next daemon start recreate every Pod instead of
+re-attaching.
 
 `sudo k3sm uninstall` stops every recorded Pod process group (SIGTERM, then SIGKILL after 10 s) once
 the daemons are gone, so nothing k3sm started keeps running and a reinstall starts every Pod fresh. A

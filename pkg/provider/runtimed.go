@@ -286,17 +286,13 @@ type podTrack struct {
 	// restartMu, never the reverse.
 	restartMu sync.Mutex
 	restarts  map[string]*containerRestart // container name -> restart bookkeeping
-	// adopted marks a pod the provider re-attached after a node-daemon restart
-	// (runtimed_attach.go) rather than created. runtimed refuses RestartContainer
-	// on such a pod (its sandbox profile was not rebuilt), so a container exit
-	// that is due a restart recreates the whole pod instead (recreateAdopted).
-	// Set once at attach, before the track is published; read under restartMu.
-	adopted bool
-	// recreating latches the one recreate an adopted pod gets, so the stream
-	// and the backstop delivering the same exit (or a probe re-committing the
-	// same failure) start one recreate. Cleared again only when the recreate's
-	// runtime delete fails, so a later trigger retries. Guarded by restartMu.
-	recreating bool
+	// diedWhileDown names the containers of a re-attached pod (runtimed_attach.go)
+	// that the attach reported Terminated: they died while the node daemon was
+	// down, so no process of theirs exists under this daemon and runtimed refuses
+	// RestartContainer on them. Their next restart is StartContainer, the
+	// runtime's recovery for such an entry; a successful start removes the name.
+	// Set once at attach, before the track is published; guarded by restartMu.
+	diedWhileDown map[string]bool
 	// pulls is the per-image retry bookkeeping of the image pull-failure path
 	// (runtimed_pull.go): the schedule that paces StartContainer re-attempts for
 	// a container that never started, keyed by image reference (the track is

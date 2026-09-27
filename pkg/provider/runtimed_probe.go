@@ -298,7 +298,7 @@ func (r *runtimedRuntime) startProber(pod *corev1.Pod, podIP string) {
 
 // restartContainerReason is the shared RestartContainer RPC call — the ONE call
 // site of the runtime re-exec action, reached only from the single restart
-// authority's worker (runtimed_restart.go's runRestart), whichever TRIGGER
+// authority's worker (runtimed_restart.go's runRestart, through respawn), whichever TRIGGER
 // scheduled it. runtimed bumps ContainerStatus.restart_count on this RPC: that
 // count is the single restart authority the provider surfaces verbatim.
 // grace_period_seconds is left 0 so runtimed applies its own default window. A
@@ -315,6 +315,20 @@ func (r *runtimedRuntime) restartContainerReason(ctx context.Context, podID, con
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
 		return fmt.Errorf("runtimed restart container %s/%s rejected: %s", podID, container, e.GetMessage())
+	}
+	return nil
+}
+
+// startDiedContainer is the StartContainer RPC for a container of a re-attached
+// pod that died while the node daemon was down (respawn). The request carries no
+// reason: StartContainer records the dead run's own terminated state.
+func (r *runtimedRuntime) startDiedContainer(ctx context.Context, podID, container string) error {
+	resp, err := r.rt.StartContainer(ctx, &runtimev1.StartContainerRequest{PodId: podID, Container: container})
+	if err != nil {
+		return fmt.Errorf("runtimed start container %s/%s: %w", podID, container, err)
+	}
+	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
+		return fmt.Errorf("runtimed start container %s/%s rejected: %s", podID, container, e.GetMessage())
 	}
 	return nil
 }

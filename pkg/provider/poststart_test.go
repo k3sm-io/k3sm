@@ -198,7 +198,7 @@ func waitCond(t *testing.T, what string, cond func() bool) {
 // the stop is observed at the runtime seam (the fake re-renders the container
 // Terminated once StopContainer succeeds); that runtimed's verb really kills one
 // process group and leaves it dead is runtimed's own gate. The arms where the stop
-// cannot happen (a vm backend, a re-attached pod, a runtimed without the verb) are
+// cannot happen (a vm backend, a runtimed without the verb) are
 // TestPostStartKillFollowsRestartPolicy's rows, not this one's.
 func TestPostStartFidelity(t *testing.T) {
 	ctx := context.Background()
@@ -406,7 +406,8 @@ func hasKilling(evs []string) bool {
 // authority. Where the stop cannot happen, the honest subset stands and the two
 // Unimplemented channels stay apart: a runtimed that predates the verb
 // (transport) gets one upgrade line per process; a backend that cannot stop one
-// container (embedded, the vm shape) gets none. A re-attached pod makes no RPC.
+// container (embedded, the vm shape) gets none. A re-attached pod is stopped
+// like any other (TestAdoptedPodRestartsInPlace).
 //
 // Red on main: the fake runtime serves no StopContainer and the Never arm never
 // stops anything.
@@ -537,29 +538,6 @@ func TestPostStartKillFollowsRestartPolicy(t *testing.T) {
 		}
 		if n := countLogs(logs, logStopVerbMissing); n != 0 {
 			t.Errorf("upgrade lines = %d, want 0 (a backend ceiling is not closed by an upgrade)", n)
-		}
-		heldSubset(t, r, f, rec, pod)
-	})
-
-	t.Run("Never on a re-attached pod makes no RPC", func(t *testing.T) {
-		r, f, rec, logs := newHookFakeLogged(t)
-		f.exit = 7
-		f.release = make(chan struct{}, 1) // hold the hook until the track is marked adopted
-		pod := postStartPod("adopted", corev1.RestartPolicyNever)
-		if err := r.CreatePod(ctx, pod); err != nil {
-			t.Fatalf("CreatePod: %v", err)
-		}
-		t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
-		waitCond(t, "the postStart hook to be dispatched", func() bool { return f.execCount() == 1 })
-		tr := r.trackByID(string(pod.UID))
-		tr.restartMu.Lock()
-		tr.adopted = true
-		tr.restartMu.Unlock()
-		f.release <- struct{}{}
-
-		waitCond(t, "the container held NotReady", func() bool { return countLogs(logs, logPostStartHeld) == 1 })
-		if n, _ := f.stopState(); n != 0 {
-			t.Errorf("StopContainer calls = %d on a re-attached pod, want 0", n)
 		}
 		heldSubset(t, r, f, rec, pod)
 	})

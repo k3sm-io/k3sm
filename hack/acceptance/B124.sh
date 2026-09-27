@@ -21,10 +21,14 @@
 #      c. its listener is still bound to the same pod IP and answers,
 #      d. its log continues past the restart (a tick later than any logged
 #         before the restart appears);
-#   3. killing the re-attached container's process recreates the pod (a
-#      re-attached pod cannot restart a container in place): within 90 s the
-#      pod is Running again with a new UID or restartCount+1, a
-#      PodRecreatedAfterReattach Event is recorded, and its listener is back;
+#   3. a second, two-container pod (containers a and b, one hello-http
+#      listener each) is re-attached by the same restart; killing container
+#      a's process restarts that one container in place: within 90 s the pod
+#      UID and pod IP are unchanged, a's restartCount is one higher and b's is
+#      unchanged with the same pid, a's listener is back on the same IP and
+#      port, `kubectl logs --previous -c a` serves a tick logged before the
+#      kill, a's lastState.terminated.reason is ExitStatusUnknown, and no
+#      PodRecreatedAfterReattach Event is recorded;
 #   4. deleting the pod ends its process group;
 #   5. `sudo k3sm uninstall` with a pod still running leaves no process of that
 #      pod's group and no fixture process of this run.
@@ -76,10 +80,15 @@ echo "==> B124 acceptance (node $NODE_NAME, daemon $LABEL)"
 RUN="$(date +%s)"
 POD="b124-web-$RUN"
 POD_U="b124-uninstall-$RUN"
+POD_2="b124-pair-$RUN"
+ID_A="b124-paira-$RUN"
+ID_B="b124-pairb-$RUN"
 PORT=18441
 PORT_U=18442
+PORT_A=18443
+PORT_B=18444
 cleanup() {
-	for p in "$POD" "$POD_U"; do
+	for p in "$POD" "$POD_U" "$POD_2"; do
 		kc delete pod "$p" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	done
 }
@@ -110,6 +119,27 @@ spec:
 EOF
 }
 
+# pair_pod - the two-container pod of leg 3: containers a and b, each a
+# ticking hello-http on its own port.
+pair_pod() {
+	kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: $POD_2, namespace: $NS}
+spec:
+  nodeName: $NODE_NAME
+  nodeSelector: {kubernetes.io/os: darwin}
+  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
+  containers:
+  - name: a
+    image: native
+    command: ["/bin/sh", "-c", "(i=0; while :; do i=\$((i+1)); echo tick \$i; sleep 1; done) & exec $FIXTURE_BIN/hello-http --id $ID_A --addr :$PORT_A"]
+  - name: b
+    image: native
+    command: ["/bin/sh", "-c", "(i=0; while :; do i=\$((i+1)); echo tick \$i; sleep 1; done) & exec $FIXTURE_BIN/hello-http --id $ID_B --addr :$PORT_B"]
+EOF
+}
+
 listening() {
 	netstat -an -p tcp | awk '$NF=="LISTEN"{print $4}' | grep -qx "$1.$2"
 }
@@ -126,6 +156,10 @@ pod_pgid() {
 	fi
 }
 jp() { kc get pod "$1" -n "$NS" -o jsonpath="$2" 2>/dev/null || true; }
+# cs <pod> <container> <field> - one field of a named container's status.
+cs() { jp "$1" "{.status.containerStatuses[?(@.name==\"$2\")].$3}"; }
+# fixture_pid <id> - the pid of this run's hello-http started with --id <id>.
+fixture_pid() { pgrep -f "hello-http --id $1 " | head -n1 || true; }
 
 # 1. The pod runs and listens on its own pod IP.
 logging_pod "$POD" "$PORT"
@@ -149,6 +183,11 @@ CID0="$(jp "$POD" '{.status.containerStatuses[0].containerID}')"
 PGID="$(pod_pgid "$POD")"
 sleep 3
 TICK0="$(max_tick "$POD")"
+
+# The leg-3 pod runs through the same daemon restart, so it is re-attached too.
+pair_pod
+kc wait --for=condition=Ready "pod/$POD_2" -n "$NS" --timeout=120s >/dev/null 2>&1 || true
+UID_2="$(jp "$POD_2" '{.metadata.uid}')"
 
 # 2. Restart the node daemon under the live pod.
 echo "==> sudo launchctl kickstart -k system/$LABEL (pod pgid ${PGID:-?}, restartCount $RC0, last tick $TICK0)"
@@ -191,48 +230,83 @@ else
 	ladder no "b124-2d log continues past the restart (max tick $(max_tick "$POD"), was $TICK0)"
 fi
 
-# 3. Kill the re-attached container's process: its restart policy (Always)
-#    wants a restart, which for a re-attached pod is a recreate.
-PID_K="$(pgrep -f "hello-http --id $POD " | head -n1 || true)"
-echo "==> sudo kill -KILL ${PID_K:-?} (the re-attached hello-http of $POD)"
-[ -n "$PID_K" ] && sudo kill -KILL "$PID_K"
-T_KILL="$(date +%s)"
-recreated=no; ev_re=no; back=no
-while [ $(( $(date +%s) - T_KILL )) -lt 90 ]; do
-	uid_now="$(jp "$POD" '{.metadata.uid}')"
-	rc_now="$(jp "$POD" '{.status.containerStatuses[0].restartCount}')"
-	if [ "$(jp "$POD" '{.status.phase}')" = Running ] && [ -n "$rc_now" ] \
-		&& { [ -n "$uid_now" ] && [ "$uid_now" != "$UID_" ] || [ "$rc_now" -gt "$RC0" ]; }; then
-		recreated=yes
+# 3. Kill container a of the re-attached two-container pod: its restart policy
+#    (Always) restarts that one container in place; b keeps running.
+reattached=no
+for _ in $(seq 1 15); do
+	if [ -n "$UID_2" ] && [ -n "$(kc get events -n "$NS" --field-selector "involvedObject.uid=$UID_2,reason=PodReattached" -o jsonpath='{.items[*].type}' 2>/dev/null || true)" ]; then
+		reattached=yes; break
 	fi
-	if [ "$ev_re" = no ] && [ -n "$(kc get events -n "$NS" --field-selector "involvedObject.name=$POD,reason=PodRecreatedAfterReattach" -o jsonpath='{.items[*].type}' 2>/dev/null || true)" ]; then
-		ev_re=yes
-	fi
-	ip_now="$(jp "$POD" '{.status.podIP}')"
-	if [ "$recreated" = yes ] && [ -n "$ip_now" ] && listening "$ip_now" "$PORT" \
-		&& curl -fsS --connect-timeout 2 -m 3 "http://$ip_now:$PORT/" >/dev/null 2>&1; then
-		back=yes
-	fi
-	[ "$recreated$ev_re$back" = yesyesyes ] && break
 	sleep 2
 done
-if [ "$recreated" = yes ]; then
-	ladder ok "b124-3a $POD recreated after its re-attached container was killed (uid $(jp "$POD" '{.metadata.uid}'), restartCount $(jp "$POD" '{.status.containerStatuses[0].restartCount}'), was $RC0)"
+if [ "$reattached" = yes ]; then
+	ladder ok "b124-3a $POD_2 re-attached by the restart (PodReattached Event)"
 else
-	ladder no "b124-3a $POD recreated after its re-attached container was killed (phase $(jp "$POD" '{.status.phase}'), restartCount $(jp "$POD" '{.status.containerStatuses[0].restartCount}'), was $RC0)"
+	ladder no "b124-3a $POD_2 re-attached by the restart (no PodReattached Event for uid ${UID_2:-?})"
 fi
-if [ "$ev_re" = yes ]; then
-	ladder ok "b124-3b PodRecreatedAfterReattach Event recorded for $POD"
+IP_2="$(jp "$POD_2" '{.status.podIP}')"
+RC0_A="$(cs "$POD_2" a restartCount)"
+RC0_B="$(cs "$POD_2" b restartCount)"
+PID_B0="$(fixture_pid "$ID_B")"
+PID_A="$(fixture_pid "$ID_A")"
+TICK_A="$(kc logs "$POD_2" -c a -n "$NS" 2>/dev/null | awk '$1=="tick" && $2+0>m {m=$2+0} END {print m+0}')"
+echo "==> sudo kill -KILL ${PID_A:-?} (container a of $POD_2; restartCount a=${RC0_A:-?} b=${RC0_B:-?}, last tick $TICK_A)"
+[ -n "$PID_A" ] && sudo kill -KILL "$PID_A"
+T_KILL="$(date +%s)"
+same_pod=no; a_bumped=no; b_same=no; back=no; previous=no; unknown=no
+while [ $(( $(date +%s) - T_KILL )) -lt 90 ]; do
+	uid_ok=no; ip_ok=no; b_rc_ok=no; b_pid_ok=no
+	[ "$(jp "$POD_2" '{.metadata.uid}')" = "$UID_2" ] && uid_ok=yes
+	[ -n "$IP_2" ] && [ "$(jp "$POD_2" '{.status.podIP}')" = "$IP_2" ] && ip_ok=yes
+	[ "$uid_ok$ip_ok" = yesyes ] && same_pod=yes
+	[ -n "$RC0_A" ] && [ "$(cs "$POD_2" a restartCount)" = "$((RC0_A + 1))" ] && a_bumped=yes
+	[ -n "$RC0_B" ] && [ "$(cs "$POD_2" b restartCount)" = "$RC0_B" ] && b_rc_ok=yes
+	[ -n "$PID_B0" ] && [ "$(fixture_pid "$ID_B")" = "$PID_B0" ] && b_pid_ok=yes
+	[ "$b_rc_ok$b_pid_ok" = yesyes ] && b_same=yes
+	if [ "$a_bumped" = yes ] && listening "$IP_2" "$PORT_A" \
+		&& curl -fsS --connect-timeout 2 -m 3 "http://$IP_2:$PORT_A/" >/dev/null 2>&1; then
+		back=yes
+	fi
+	if [ "$a_bumped" = yes ] && [ "$TICK_A" -gt 0 ] \
+		&& kc logs "$POD_2" -c a --previous -n "$NS" 2>/dev/null | grep -qx "tick $TICK_A"; then
+		previous=yes
+	fi
+	[ "$(cs "$POD_2" a lastState.terminated.reason)" = ExitStatusUnknown ] && unknown=yes
+	[ "$same_pod$a_bumped$b_same$back$previous$unknown" = yesyesyesyesyesyes ] && break
+	sleep 2
+done
+recreates="$(kc get events -n "$NS" --field-selector "involvedObject.name=$POD_2,reason=PodRecreatedAfterReattach" -o jsonpath='{.items[*].type}' 2>/dev/null || true)"
+if [ "$same_pod" = yes ]; then
+	ladder ok "b124-3b $POD_2 kept its uid $UID_2 and pod IP $IP_2"
 else
-	ladder no "b124-3b PodRecreatedAfterReattach Event recorded for $POD"
+	ladder no "b124-3b $POD_2 kept its uid and pod IP (uid $(jp "$POD_2" '{.metadata.uid}') was ${UID_2:-?}, ip $(jp "$POD_2" '{.status.podIP}') was ${IP_2:-?})"
+fi
+if [ "$a_bumped" = yes ] && [ "$b_same" = yes ]; then
+	ladder ok "b124-3c only a restarted (a restartCount $((RC0_A + 1)); b restartCount $RC0_B and pid $PID_B0 unchanged)"
+else
+	ladder no "b124-3c only a restarted (a restartCount $(cs "$POD_2" a restartCount), was ${RC0_A:-?}; b restartCount $(cs "$POD_2" b restartCount), was ${RC0_B:-?}; b pid $(fixture_pid "$ID_B"), was ${PID_B0:-?})"
 fi
 if [ "$back" = yes ]; then
-	ladder ok "b124-3c listener back on $(jp "$POD" '{.status.podIP}'):$PORT and answering"
+	ladder ok "b124-3d a's listener back on $IP_2:$PORT_A and answering"
 else
-	ladder no "b124-3c listener back on the recreated pod's IP:$PORT and answering"
+	ladder no "b124-3d a's listener back on ${IP_2:-?}:$PORT_A and answering"
 fi
-# The recreated pod runs a new process group.
-PGID="$(pod_pgid "$POD")"
+if [ "$previous" = yes ]; then
+	ladder ok "b124-3e kubectl logs --previous -c a serves the pre-kill tick $TICK_A"
+else
+	ladder no "b124-3e kubectl logs --previous -c a serves the pre-kill tick $TICK_A"
+fi
+if [ "$unknown" = yes ]; then
+	ladder ok "b124-3f a's lastState.terminated.reason is ExitStatusUnknown"
+else
+	ladder no "b124-3f a's lastState.terminated.reason is ExitStatusUnknown (got '$(cs "$POD_2" a lastState.terminated.reason)')"
+fi
+if [ -z "$recreates" ]; then
+	ladder ok "b124-3g no PodRecreatedAfterReattach Event for $POD_2"
+else
+	ladder no "b124-3g no PodRecreatedAfterReattach Event for $POD_2 (got: $recreates)"
+fi
+kc delete pod "$POD_2" -n "$NS" --wait=true --timeout=90s >/dev/null 2>&1 || true
 
 # 4. Deleting the pod ends its process group.
 kc delete pod "$POD" -n "$NS" --wait=true --timeout=90s >/dev/null 2>&1 || true

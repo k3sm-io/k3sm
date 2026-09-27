@@ -54,9 +54,9 @@ import (
 //     TERMINAL: the container is stopped through runtimed's StopContainer (the
 //     CRI StopContainer the kubelet's killContainer issues), the Normal Killing
 //     event follows, and the container stays Terminated so the pod goes Failed.
-//     A re-attached pod, a vm backend, or a runtimed without the verb cannot be
-//     stopped in place; there the container is held NotReady and never reported
-//     Terminated while it runs (killAfterPostStart).
+//     A vm backend or a runtimed without the verb cannot stop one container;
+//     there the container is held NotReady and never reported Terminated while
+//     it runs (killAfterPostStart). A re-attached pod is stopped like any other.
 //
 //  3. RE-RUN ON EVERY START — the hook fires per container START, not once per pod:
 //     upstream runs it inside startContainer, which is also the restart path. So a
@@ -244,9 +244,9 @@ func (r *runtimedRuntime) completePostStart(ctx context.Context, t *podTrack, po
 //
 // Under Never the kill is TERMINAL: killAfterPostStart stops the one container
 // through runtimed's StopContainer and leaves it Terminated (the kubelet's
-// killContainer → CRI StopContainer). Where the stop cannot happen (a re-attached
-// pod, a vm backend, a runtimed that predates the verb) the container is held
-// NotReady instead and never reported Terminated while its process runs.
+// killContainer → CRI StopContainer). Where the stop cannot happen (a vm backend,
+// a runtimed that predates the verb) the container is held NotReady instead and
+// never reported Terminated while its process runs.
 func (r *runtimedRuntime) failPostStart(ctx context.Context, t *podTrack, pod *corev1.Pod, podID, key, container string, hookErr error) {
 	// The hook's own error text never reaches the Event: Events flow to a
 	// namespace-readable sink, and a handler's output can carry whatever the
@@ -266,7 +266,7 @@ func (r *runtimedRuntime) failPostStart(ctx context.Context, t *podTrack, pod *c
 	// table, so this decision cannot drift from the exit-driven one.
 	failed := &corev1.ContainerStateTerminated{ExitCode: 1, Reason: reasonFailedPostStartHook}
 	if !shouldRestartOnExit(effectivePodRestartPolicy(pod), containerPolicy, failed) {
-		r.killAfterPostStart(ctx, t, pod, podID, key, container)
+		r.killAfterPostStart(ctx, pod, podID, key, container)
 		return
 	}
 	if err := r.killAndRestart(podID, container, restartReasonPostStart); err != nil {
@@ -295,23 +295,16 @@ const (
 //
 // Where the stop cannot happen the honest subset stands: the container is held
 // NotReady for the rest of this start (the failed latch), never restarted, and
-// never reported Terminated while its process keeps running. The three causes are
+// never reported Terminated while its process keeps running. The two causes are
 // kept apart because they call for different operator action:
 //
-//   - a re-attached pod: runtimed refuses per-container verbs there, so no RPC is
-//     made (the recreate that restarts such a pod is a restart, not a stop);
 //   - a backend ceiling (errStopUnsupported, a vm guest): no upgrade closes it;
 //   - a runtimed that predates the verb (errStopVerbMissing): logged ONCE per
 //     process naming the upgrade, on top of the per-pod line.
 //
 // The event is recorded only after a successful stop: a Killing event for a
 // container that was not killed would be a reported-vs-actual divergence.
-func (r *runtimedRuntime) killAfterPostStart(ctx context.Context, t *podTrack, pod *corev1.Pod, podID, key, container string) {
-	if t.isAdopted() {
-		r.log.Error(logPostStartHeld, "pod", key, "container", container,
-			"why", "a re-attached pod's containers cannot be stopped in place")
-		return
-	}
+func (r *runtimedRuntime) killAfterPostStart(ctx context.Context, pod *corev1.Pod, podID, key, container string) {
 	err := r.stopContainerReason(ctx, podID, container, reasonFailedPostStartHook)
 	switch {
 	case err == nil:

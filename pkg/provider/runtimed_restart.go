@@ -37,8 +37,13 @@ import (
 // RPC — the same runtime action the liveness-probe path drives.
 //
 // Three triggers, one authority: an observed exit (observeExits), a committed
-// liveness failure and a failed postStart hook (both via killAndRestart). On a
-// re-attached pod all three recreate the pod instead (beginRecreateLocked).
+// liveness failure and a failed postStart hook (both via killAndRestart). A
+// re-attached pod (runtimed_attach.go) takes the same path: runtimed compiles
+// its sandbox profile at the attach and verifies it against the spawn record,
+// so one of its containers restarts in place like any other. The one
+// difference is a container the attach reported Terminated (it died while the
+// daemon was down and has no process under this one): its re-spawn is
+// StartContainer, the runtime's recovery for that entry (respawn).
 // A failed postStart hook whose policy does NOT restart the container (Never)
 // never reaches this authority: it is stopped through runtimed's StopContainer
 // (killAfterPostStart, poststart.go), and its terminated status then reaches
@@ -352,33 +357,9 @@ func (r *runtimedRuntime) observeExits(pod *corev1.Pod, t *podTrack, rs *runtime
 		t.cancelRestartsLocked()
 		return
 	}
-	if t.adopted && len(due) > 0 {
-		// A re-attached pod cannot restart a container in place (runtimed refuses
-		// it); the restart is a recreate of the whole pod, started once.
-		names := make([]string, 0, len(due))
-		for _, e := range due {
-			names = append(names, e.name)
-		}
-		r.beginRecreateLocked(t, names)
-		return
-	}
 	for _, e := range due {
 		r.scheduleRestartLocked(t, rs.GetPodId(), e.name, e.key, e.term)
 	}
-}
-
-// beginRecreateLocked starts the one recreate of a re-attached pod, for the
-// containers named, unless one is already in flight. Every restart trigger on an
-// adopted track (an observed exit, a committed liveness failure, a failed
-// postStart hook) converges here and never on RestartContainer. The latch is
-// cleared by recreateAdopted when its runtime delete fails, so a later trigger
-// retries. Caller holds t.restartMu.
-func (r *runtimedRuntime) beginRecreateLocked(t *podTrack, containers []string) {
-	if t.recreating {
-		return
-	}
-	t.recreating = true
-	go r.recreateAdopted(t, containers)
 }
 
 // scheduleRestartLocked schedules one re-exec for a decided exit, under
@@ -433,11 +414,9 @@ func (r *runtimedRuntime) restartForLiveness(ctx context.Context, podID, contain
 // either way, so the next restart of this container — from any trigger — is
 // throttled correctly.
 //
-// A re-attached pod is the exception: runtimed refuses RestartContainer there,
-// so retrying the RPC would loop on a standing refusal forever. Both triggers
-// route into the same one-shot recreate an observed exit takes
-// (beginRecreateLocked). There is no per-container stop verb, so the kill is the
-// recreate's runtime delete, which stops every container of the pod.
+// A re-attached pod is not an exception: runtimed restarts one of its
+// containers in place, under the sandbox profile it compiled at the attach, so
+// both triggers take this path there too and its siblings keep running.
 //
 // It returns an error only when the pod is untracked; a restart already in flight is
 // a successful no-op.
@@ -448,10 +427,6 @@ func (r *runtimedRuntime) killAndRestart(podID, container, reason string) error 
 	}
 	t.restartMu.Lock()
 	defer t.restartMu.Unlock()
-	if t.adopted {
-		r.beginRecreateLocked(t, []string{container})
-		return nil
-	}
 	cr := t.restartFor(container, r.clk)
 	if cr.attempt {
 		return nil // a re-exec for this container is already in flight
@@ -526,7 +501,7 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		} else if ctx.Err() != nil {
 			return
 		}
-		err := r.restartContainerReason(ctx, podID, name, reason)
+		err := r.respawn(ctx, t, podID, name, reason)
 		if err == nil {
 			// The container has been started again, so its postStart hook fires
 			// again: upstream runs the hook inside startContainer, which is
@@ -545,6 +520,31 @@ func (r *runtimedRuntime) runRestart(ctx context.Context, t *podTrack, cr *conta
 		}
 		delay = next
 	}
+}
+
+// respawn is the worker's runtime action: RestartContainer, or StartContainer
+// for a container of a re-attached pod that died while the node daemon was down
+// (podTrack.diedWhileDown). runtimed refuses RestartContainer on that entry
+// because no process of it exists to replace ("has not started; use
+// StartContainer"), and StartContainer is its named recovery: it keeps the
+// restart count the log directory implies and records the dead run as the last
+// termination state, as a restart would. A successful start clears the mark, so
+// the container's next exit is an ordinary RestartContainer. A refusal is
+// returned like any failed re-exec and retried under the same backoff.
+func (r *runtimedRuntime) respawn(ctx context.Context, t *podTrack, podID, name, reason string) error {
+	t.restartMu.Lock()
+	start := t.diedWhileDown[name]
+	t.restartMu.Unlock()
+	if !start {
+		return r.restartContainerReason(ctx, podID, name, reason)
+	}
+	if err := r.startDiedContainer(ctx, podID, name); err != nil {
+		return err
+	}
+	t.restartMu.Lock()
+	delete(t.diedWhileDown, name)
+	t.restartMu.Unlock()
+	return nil
 }
 
 // finishAttempt releases the worker slot on the bookkeeping entry the worker was
@@ -665,14 +665,6 @@ func overlayCrashLoop(pod *corev1.Pod, cs []corev1.ContainerStatus, restarts map
 		cs[i].Started = ptr(false)
 	}
 	return restarting
-}
-
-// isAdopted reports whether the track is a re-attached pod, read under restartMu
-// (the field's documented guard).
-func (t *podTrack) isAdopted() bool {
-	t.restartMu.Lock()
-	defer t.restartMu.Unlock()
-	return t.adopted
 }
 
 // cancelRestarts aborts every in-flight re-exec for the track — called when the

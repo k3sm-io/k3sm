@@ -133,10 +133,14 @@ func (r *runtimedRuntime) listPodsToAttach(ctx context.Context) []corev1.Pod {
 }
 
 // attachPod re-attaches one pod and reports whether it did. On success the pod
-// is tracked exactly as a created one is, with three differences that are the
+// is tracked exactly as a created one is, with four differences that are the
 // point: its restart counts are runtimed's attached counts, never bumped here;
-// its postStart hooks are not run again (they ran in the pod's first life); and
-// one Warning PodReattached Event says what the restart cost the pod.
+// its postStart hooks are not run again (they ran in the pod's first life); a
+// container the attach reported Terminated is restarted through StartContainer
+// rather than RestartContainer (diedWhileDown); and one Warning PodReattached
+// Event says what the restart cost the pod. Every restart trigger then takes
+// the ordinary per-container path: runtimed compiled the pod's sandbox profile
+// at the attach, so one container restarts or stops in place.
 //
 // The pod's address comes from its published status.podIP and is RE-RESERVED
 // through the pod network (podnet's ReattachPod: that exact address, and an
@@ -175,7 +179,7 @@ func (r *runtimedRuntime) attachPod(ctx context.Context, a podAttacher, pod *cor
 		// an attach does not start it again.
 		start = *pod.Status.StartTime
 	}
-	t := &podTrack{pod: pod.DeepCopy(), startTime: start, adopted: true}
+	t := &podTrack{pod: pod.DeepCopy(), startTime: start, diedWhileDown: diedWhileDown(rs)}
 	r.mu.Lock()
 	r.track[id] = t
 	r.mu.Unlock()
@@ -217,65 +221,21 @@ func (r *runtimedRuntime) reattachPodIP(ctx context.Context, pod *corev1.Pod) (s
 	return ip.String(), true
 }
 
-// recreateAdopted is what a restart is for an attached pod. The kubelet restarts
-// the exited container in place; runtimed refuses that on an attached pod,
-// because the sandbox profile a new process would run under was never rebuilt.
-// So the whole pod is recreated, every container of it and not only the ones
-// named: its containers are stopped through the runtime's delete (preStop hooks
-// first, with the pod's grace), its probe runner, address and transport override
-// are released, and it is created again through CreatePod under the same UID,
-// exactly as Virtual Kubelet would create it, so postStart hooks run again and
-// the pod may get a new address. The pod's log tree is KEPT: runtimed numbers a
-// new instance one past the highest log file on disk, so every container's
-// restartCount rises by one, as a restart would raise it, and the earlier
-// instances' log files stay on disk. `kubectl logs --previous` does not serve
-// them: the recreated pod's containers carry no last termination state, so it
-// reports the previous container as not found. Unlike DeletePod, the Pod object
-// is not deleted from the apiserver.
-//
-// A failed runtime delete leaves the pod running as it is and clears the
-// recreate latch, so the next trigger retries; a failed create leaves the pod
-// untracked with its containers stopped, which only its controller or an
-// operator can repair. Each failure records one PodRecreateAfterReattachFailed
-// Warning Event.
-//
-// It runs on its own goroutine, bounded by the provider's lifetime, because it
-// is started from under restartMu (beginRecreateLocked).
-func (r *runtimedRuntime) recreateAdopted(t *podTrack, containers []string) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-r.lifetime:
-			cancel()
-		case <-ctx.Done():
+// diedWhileDown returns the names of the containers an attach reported
+// Terminated: they died while the node daemon was down and have no process
+// under this one. nil when every container is running.
+func diedWhileDown(rs *runtimev1.PodStatus) map[string]bool {
+	var out map[string]bool
+	for _, list := range [][]*runtimev1.ContainerStatus{rs.GetContainerStatuses(), rs.GetInitContainerStatuses()} {
+		for _, cs := range list {
+			if cs.GetState().GetTerminated() == nil {
+				continue
+			}
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[cs.GetName()] = true
 		}
-	}()
-	pod := t.pod.DeepCopy()
-	id := string(pod.UID)
-	r.log.Warn("a container of a re-attached pod is due a restart; recreating the pod", "namespace", pod.Namespace, "name", pod.Name, "containers", containers)
-	r.recorder.Event(pod, corev1.EventTypeWarning, reasonPodRecreatedAfterReattach, msgPodRecreatedAfterReattach(containers))
-
-	t.quiesce()
-	grace := r.runPreStop(ctx, pod)
-	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace}); err != nil {
-		r.log.Error("recreate of a re-attached pod: runtimed delete failed; the pod is left as it is and the next restart it is due retries", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		t.restartMu.Lock()
-		t.recreating = false
-		t.restartMu.Unlock()
-		r.recorder.Event(pod, corev1.EventTypeWarning, reasonPodRecreateAfterReattachFailed, msgPodRecreateDeleteFailed(err))
-		return
 	}
-	r.stopProber(id)
-	r.releasePodNetwork(pod)
-	r.transport.drop(id)
-	r.mu.Lock()
-	if r.track[id] == t {
-		delete(r.track, id)
-	}
-	r.mu.Unlock()
-	if err := r.CreatePod(ctx, pod); err != nil {
-		r.log.Error("recreate of a re-attached pod: create failed", "namespace", pod.Namespace, "name", pod.Name, "err", err)
-		r.recorder.Event(pod, corev1.EventTypeWarning, reasonPodRecreateAfterReattachFailed, msgPodRecreateCreateFailed(err))
-	}
+	return out
 }
