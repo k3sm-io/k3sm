@@ -81,13 +81,11 @@ func ensureDataVolume(ctx context.Context, sys System, cfg Config, m []artifact,
 		}
 	}
 
-	// The service user may not exist yet on a first install, in which case the
-	// mount point stays root's and EnsureServiceUser chowns it moments later.
-	own := datavol.Owner{GID: DataRootGID, Mode: DataRootMode}
-	if uid, ok := sys.LookupServiceUID(cfg.ServiceUser); ok {
-		own.UID = uid
-	}
-	if err := datavol.MountRecorded(ctx, deps, fsys, rec, own, logger); err != nil {
+	// The mount point IS the data root, which is root's (OwnershipOf(StateRoot)),
+	// so the mount hands it to nobody: datavol.Owner's zero value leaves it as
+	// the volume presents it, and the install step that ensures the state tree
+	// (and netd, at its next start) applies the root row of the table.
+	if err := datavol.MountRecorded(ctx, deps, fsys, rec, datavol.Owner{}, logger); err != nil {
 		return fmt.Errorf("install: mount the data volume %s at %s: %w (re-run `sudo k3sm install --data-volume`: adoption is by marker, so nothing is copied twice and the mount is simply retried)", rec.UUID, rec.Mountpoint, err)
 	}
 

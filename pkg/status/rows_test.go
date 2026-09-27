@@ -346,7 +346,7 @@ func TestCollectorHealthyCluster(t *testing.T) {
 		Kube:       healthyKube(),
 		KubeSource: "~/.kube/config context \"k3sm\"",
 		Procs:      fakeProcs{live: LivenessRunning, vmHosts: 2},
-		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,
@@ -408,7 +408,7 @@ func TestCollectorCrashLoopingServer(t *testing.T) {
 		FS:         fsys,
 		KubeErr:    errors.New("connection refused"),
 		Procs:      fakeProcs{live: LivenessRunning},
-		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,
@@ -482,7 +482,9 @@ func TestCollectorShadowedDataRoot(t *testing.T) {
 }
 
 // TestCollectorWrongOwnerDataRoot pins the other data-root failure: the root
-// exists and is mounted, but the service user cannot write it.
+// exists and is mounted, but is not root's. A root owned by the service user
+// is the layout older builds left, in which it could rename the root-only key
+// dir; the table (install.OwnershipOf) makes the root root:wheel.
 func TestCollectorWrongOwnerDataRoot(t *testing.T) {
 	t.Parallel()
 	p := testPaths(t.TempDir())
@@ -490,7 +492,7 @@ func TestCollectorWrongOwnerDataRoot(t *testing.T) {
 		Launchd:    fakeLaunchd{out: map[string][]byte{p.NetdLabel: fixture(t, "launchctl_netd_running.txt")}},
 		FS:         installedFS(p),
 		Procs:      fakeProcs{live: LivenessRunning},
-		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 0, mounted: true},
+		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,
@@ -500,7 +502,7 @@ func TestCollectorWrongOwnerDataRoot(t *testing.T) {
 	if root.State != StateWrongOwner {
 		t.Fatalf("data-root state = %q, want wrong-owner (%s)", root.State, root.Detail)
 	}
-	if !strings.Contains(root.Detail, "owned by uid 0") || !strings.Contains(root.Detail, "_k3sm") {
+	if !strings.Contains(root.Detail, "owned by uid 250") || !strings.Contains(root.Detail, "_k3sm") {
 		t.Errorf("data-root detail does not name the uid and the service user: %q", root.Detail)
 	}
 }
@@ -520,7 +522,7 @@ func TestCollectorUnreadableAsOrdinaryUser(t *testing.T) {
 		}},
 		FS:         fsys,
 		KubeErr:    errors.New("no k3sm context in ~/.kube/config"),
-		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,
@@ -548,7 +550,7 @@ func TestCollectorSkipsRuntimedUnprivileged(t *testing.T) {
 		Launchd:    fakeLaunchd{out: map[string][]byte{}},
 		FS:         installedFS(p),
 		Runtimed:   fatalRuntimed{t: t},
-		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,
@@ -609,7 +611,7 @@ func TestReportNeverContainsSecrets(t *testing.T) {
 		}},
 		FS:         fsys,
 		KubeErr:    errors.New("apiserver refused the token " + fakeToken),
-		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o750, uid: 250, mounted: true},
+		DataRoot:   fakeDataRootFS{dir: p.DataRoot, mode: 0o755, uid: 0, mounted: true},
 		Paths:      p,
 		EUID:       501,
 		ServiceUID: 250,

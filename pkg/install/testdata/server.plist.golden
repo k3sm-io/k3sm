@@ -39,6 +39,10 @@
   <string>/var/log/k3sm/server.log</string>
   <key>EnvironmentVariables</key>
   <dict>
+      <key>GOCACHE</key>
+  <string>/var/lib/k3sm/server/go/build</string>
+      <key>GOMODCACHE</key>
+  <string>/var/lib/k3sm/server/go/mod</string>
       <key>HOME</key>
   <string>/var/lib/k3sm</string>
   </dict>

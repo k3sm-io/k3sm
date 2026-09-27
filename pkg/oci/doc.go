@@ -125,7 +125,8 @@ limitations under the License.
 //
 // Deliberately NOT shipped in v1, each for a recorded reason:
 //
-//   - The shared local store (/var/lib/k3sm). The store is _k3sm-owned 0750 and
+//   - The shared local store (/var/lib/k3sm). The data root is root's, but the
+//     store's trees under it (blobs, index, unpacked, ...) are _k3sm-owned and
 //     the invoking operator is a different uid; the writer-uid contract is an
 //     undecided product question (see docs/privilege-model.md). Under sudo a blob
 //     commits root:wheel 0600, which the daemon can never read — while Cache.Has

@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -141,11 +142,22 @@ func (d shadowedDataRoot) ReadFile(path string) ([]byte, error) {
 // way, since what is under test is the apiserver and kubeconfig rows.
 type plainDataRoot struct{ dir string }
 
+// rootOwnedInfo reports a real directory as root-owned, the posture the
+// ownership table gives an installed data root (install.OwnershipOf), which an
+// unprivileged test cannot create on disk.
+type rootOwnedInfo struct{ fs.FileInfo }
+
+func (rootOwnedInfo) Sys() any { return &syscall.Stat_t{Uid: 0} }
+
 func (d plainDataRoot) Stat(path string) (fs.FileInfo, error) {
 	if path != d.dir {
 		return nil, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
 	}
-	return os.Stat(path)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return rootOwnedInfo{fi}, nil
 }
 
 func (plainDataRoot) Statfs(_ string, st *unix.Statfs_t) error {

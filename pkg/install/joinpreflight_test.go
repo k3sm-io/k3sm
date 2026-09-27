@@ -30,7 +30,7 @@ import (
 // the whole claim the preflight makes.
 var writeCalls = []string{
 	"EnsureServiceUser:", "CopyToRootOwned:", "WriteLaunchDaemon:", "EnsureLogDir:",
-	"EnsureContainerLogDir:", "EnsureRunDir:", "EnsureVMRunDir:", "EnsureMeshKeyDir:",
+	"EnsureContainerLogDir:", "EnsureRunDir:", "EnsureVMRunDir:", "EnsureMeshKeyDir:", "EnsureOwnedDir:", "RemoveEntry:",
 	"WriteServiceUserFile:", "WriteRootOnlyFile:", "EnsureSymlink:", "Bootstrap:",
 	"WriteUserKubeconfig:", "WriteAgentArgsRecord:", "Chown:",
 }

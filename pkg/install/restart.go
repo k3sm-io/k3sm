@@ -286,6 +286,51 @@ func bootoutDaemons(ctx context.Context, sys System, m []artifact, logger *slog.
 	return nil
 }
 
+// stopRunningDaemons stops, before the state tree is re-owned, the long-running
+// daemons an EARLIER install left running — the k3s installer's order: stop the
+// service, then change what it runs on. It probes each long-running daemon in
+// reverse manifest order (the node daemon before the netd helper it drives) and
+// boots out only the ones launchd has loaded, so a first install makes read-only
+// probes and nothing else.
+//
+// Why it cannot wait for step 4's restart: the old binaries keep running while
+// this install re-owns the data root and moves the keys, and launchd's KeepAlive
+// respawns them in that window. An old netd re-chowns the root to the service
+// user (its old alignment) and reads its keys from the legacy path this install
+// is emptying; an old server that has to rebuild kine creates <home>/go under a
+// root it can no longer write. Step 4's restartDaemons bootstraps the new ones
+// exactly as before; its bootout of a label that is no longer loaded is a no-op.
+//
+// It returns the labels it stopped. A failure between here and step 4 leaves
+// them stopped (restarting the OLD binaries over a half re-owned tree is the
+// hazard this exists to avoid); Install names them in its error, and re-running
+// `sudo k3sm install` is the remedy.
+func stopRunningDaemons(ctx context.Context, sys System, m []artifact, logger *slog.Logger) ([]string, error) {
+	var loaded []string
+	for i := len(m) - 1; i >= 0; i-- {
+		a := m[i]
+		if a.kind != kindDaemon || a.oneshot {
+			continue
+		}
+		if _, err := sys.LaunchctlServicePID(a.label); err == nil {
+			loaded = append(loaded, a.label)
+		}
+	}
+	if len(loaded) == 0 {
+		return nil, nil
+	}
+	logger.Info("stopping the running daemons before the state tree is re-owned", "labels", strings.Join(loaded, ","))
+	for i, label := range loaded {
+		if err := sys.LaunchctlBootout(label); err != nil {
+			return loaded[:i+1], fmt.Errorf("bootout %s: %w", label, err)
+		}
+		if err := awaitUnloaded(ctx, sys, label, restartBudgetFor(label)); err != nil {
+			return loaded[:i+1], err
+		}
+	}
+	return loaded, nil
+}
+
 // awaitLoaded blocks until launchd has the label in the system domain, whether
 // or not it has a process. It is the oneshot's success condition: pid 0 is the
 // ordinary state of a job that ran and exited, and LaunchctlServicePID's ERROR

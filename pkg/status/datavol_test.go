@@ -71,8 +71,8 @@ func volumeFS(t *testing.T, dir, name string, quota, totalBytes, usedBytes uint6
 	const block = 4096
 	return fakeDataRootFS{
 		dir:     dir,
-		mode:    0o750,
-		uid:     271,
+		mode:    0o755,
+		uid:     0,
 		mounted: true,
 		record:  recordJSON(t, dir, name, quota),
 		blocks:  totalBytes / block,

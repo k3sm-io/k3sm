@@ -170,6 +170,23 @@ anything, and prints the verification step you must then run; see
 [Backup & restore](backup-restore.md). Rolling the binary back without restoring the backup leaves an
 older k3sm pointed at a database a newer engine has migrated.
 
+### Mesh Keys After Rolling Back Past the Key Directory Move
+
+The release that made `/var/lib/k3sm` root-owned also moved each node's mesh keys and pod address
+record from `/var/lib/k3sm/run/keys` to `/var/lib/k3sm/keys`. `sudo k3sm install` makes that move
+once and removes the old copy, and the move is one-way: an older binary looks only in the old
+directory, finds nothing, and gives the node a new mesh identity that no peer knows. Before you
+downgrade, copy the files back by hand:
+
+```sh
+sudo mkdir -p -m 0700 /var/lib/k3sm/run/keys
+sudo cp -p /var/lib/k3sm/keys/server.key /var/lib/k3sm/keys/node.key /var/lib/k3sm/keys/node-pod-cidr /var/lib/k3sm/run/keys/
+```
+
+A node has only the key for its own role, so `cp` reports the missing one; that is expected. The
+older binary's installer also rebuilds its key copy from the node's own work-dir copy, so this step
+is a second safeguard rather than the only one.
+
 ### Durable State After Rolling Back Past the LoadBalancer Bind Change
 
 The release that moved LoadBalancer/Ingress listeners to the wildcard also changed **what k3sm writes

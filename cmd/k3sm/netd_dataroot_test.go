@@ -40,18 +40,38 @@ const (
 	testServiceGID = 20
 )
 
-// fakeStat is one directory as the fake ownership seam reports it.
+// fakeKind is what a fakeStat entry is. The zero value is a directory, which is
+// what every pre-existing case describes.
+type fakeKind int
+
+const (
+	fakeDir fakeKind = iota
+	fakeFile
+	fakeLink
+)
+
+// fakeStat is one entry as the fake ownership seam reports it.
 type fakeStat struct {
 	uid  uint32
+	gid  uint32
 	mode fs.FileMode
+	kind fakeKind
 }
 
-func (f fakeStat) Name() string       { return "" }
-func (f fakeStat) Size() int64        { return 0 }
-func (f fakeStat) Mode() fs.FileMode  { return f.mode | fs.ModeDir }
+func (f fakeStat) Name() string { return "" }
+func (f fakeStat) Size() int64  { return 0 }
+func (f fakeStat) Mode() fs.FileMode {
+	switch f.kind {
+	case fakeFile:
+		return f.mode
+	case fakeLink:
+		return f.mode | fs.ModeSymlink
+	}
+	return f.mode | fs.ModeDir
+}
 func (f fakeStat) ModTime() time.Time { return time.Time{} }
-func (f fakeStat) IsDir() bool        { return true }
-func (f fakeStat) Sys() any           { return &syscall.Stat_t{Uid: f.uid} }
+func (f fakeStat) IsDir() bool        { return f.kind == fakeDir }
+func (f fakeStat) Sys() any           { return &syscall.Stat_t{Uid: f.uid, Gid: f.gid} }
 
 // fakeOwn is the ownership seam: it FAKES everything privileged (ownership,
 // mount state, the user database) and performs for real only what the listen
@@ -70,6 +90,10 @@ func (f *fakeOwn) Stat(path string) (fs.FileInfo, error) {
 	}
 	return nil, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
 }
+
+// Lstat answers from the same table as Stat; a fakeLink entry is described as
+// the link itself.
+func (f *fakeOwn) Lstat(path string) (fs.FileInfo, error) { return f.Stat(path) }
 
 func (f *fakeOwn) Statfs(path string, st *unix.Statfs_t) error {
 	on, ok := f.mounts[path]
@@ -120,7 +144,7 @@ func (f *fakeOwn) MkdirAll(path string, perm fs.FileMode) error {
 func (f *fakeOwn) Chown(path string, uid, gid int) error {
 	f.calls = append(f.calls, fmt.Sprintf("chown %s %d:%d", path, uid, gid))
 	if st, ok := f.stat[path]; ok {
-		st.uid = uint32(uid)
+		st.uid, st.gid = uint32(uid), uint32(gid)
 		f.stat[path] = st
 	}
 	return nil
@@ -205,13 +229,18 @@ func TestListenNetdGuardsDataRoot(t *testing.T) {
 
 		for _, want := range []string{
 			"mkdirall " + filepath.Join(root, "run"),
-			fmt.Sprintf("chown %s %d:%d", root, testServiceUID, install.DataRootGID),
-			fmt.Sprintf("chmod %s %04o", root, install.DataRootMode.Perm()),
 			fmt.Sprintf("chown %s %d:%d", filepath.Join(root, "run"), testServiceUID, testServiceGID),
 			fmt.Sprintf("chmod %s 0700", filepath.Join(root, "run")),
 		} {
 			if !own.has(want) {
 				t.Fatalf("missing call %q in %v", want, own.calls)
+			}
+		}
+		// A root netd itself just created is root:wheel 0755 already, which
+		// is the table's row: it is never handed to the service user.
+		for _, c := range own.touching(root) {
+			if strings.HasPrefix(c, fmt.Sprintf("chown %s %d:", root, testServiceUID)) {
+				t.Fatalf("the data root was handed to the service user: %v", own.calls)
 			}
 		}
 	})
@@ -225,7 +254,7 @@ func TestListenNetdGuardsDataRoot(t *testing.T) {
 		}
 		socket := filepath.Join(runDir, "netd.sock")
 		own := &fakeOwn{stat: map[string]fakeStat{
-			root:   {uid: 0, mode: 0o755},
+			root:   {uid: testServiceUID, gid: testServiceGID, mode: 0o750},
 			runDir: {uid: 0, mode: 0o755},
 		}}
 		logs := captureLogs(t)
@@ -237,8 +266,8 @@ func TestListenNetdGuardsDataRoot(t *testing.T) {
 		defer l.Close()
 
 		for _, want := range []string{
-			fmt.Sprintf("chown %s %d:%d", root, testServiceUID, install.DataRootGID),
-			fmt.Sprintf("chmod %s %04o", root, install.DataRootMode.Perm()),
+			fmt.Sprintf("chown %s 0:%d", root, install.StateRootGID),
+			fmt.Sprintf("chmod %s %04o", root, install.StateRootMode.Perm()),
 			fmt.Sprintf("chown %s %d:%d", runDir, testServiceUID, testServiceGID),
 			fmt.Sprintf("chmod %s 0700", runDir),
 		} {
@@ -260,8 +289,8 @@ func TestListenNetdGuardsDataRoot(t *testing.T) {
 		}
 		socket := filepath.Join(runDir, "netd.sock")
 		own := &fakeOwn{stat: map[string]fakeStat{
-			root:   {uid: testServiceUID, mode: install.DataRootMode},
-			runDir: {uid: testServiceUID, mode: 0o700},
+			root:   {uid: 0, gid: uint32(install.StateRootGID), mode: install.StateRootMode},
+			runDir: {uid: testServiceUID, gid: testServiceGID, mode: 0o700},
 		}}
 		logs := captureLogs(t)
 

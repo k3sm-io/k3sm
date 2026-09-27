@@ -44,6 +44,7 @@ import (
 // root:wheel. The old behavior locked _k3sm out of its own socket dir on every
 // boot. This is a source-shape pin (the unit tier cannot chown as non-root):
 // the root:wheel chown is gone, and the service-user alignment is present.
+// The behavior is pinned by TestNetdAlignmentUsesTheOwnershipTable.
 func TestListenNetdNeverTakesTheSharedDirForRoot(t *testing.T) {
 	src, err := os.ReadFile("netd.go")
 	if err != nil {
@@ -53,7 +54,9 @@ func TestListenNetdNeverTakesTheSharedDirForRoot(t *testing.T) {
 	if strings.Contains(s, "Chown(dir, 0, 0)") {
 		t.Fatalf("listenNetd chowns the shared run dir root:wheel again — that re-introduces the boot-order lockout the 2026-09-02 fix removed")
 	}
-	for _, want := range []string{"install.DefaultServiceUser", "Chmod(dir, 0o700)"} {
+	// The run dir's owner and mode come from the ownership table's run row
+	// (the service user's, 0700), never a second literal here.
+	for _, want := range []string{"install.DefaultServiceUser", "install.OwnershipOf(install.StateRun)", "alignServiceTrees("} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("listenNetd lost the service-user alignment (%q missing)", want)
 		}
