@@ -18,12 +18,16 @@ package provider
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -91,12 +95,21 @@ func (h *hookRuntime) canceledCount() int {
 // Warning event a failed hook must record is observable.
 func newHookFake(t *testing.T) (*runtimedRuntime, *hookRuntime, *record.FakeRecorder) {
 	t.Helper()
+	r, f, rec, _ := newHookFakeLogged(t)
+	return r, f, rec
+}
+
+// newHookFakeLogged is newHookFake with the provider's node log captured, so the
+// lines the terminal postStart arm writes are countable.
+func newHookFakeLogged(t *testing.T) (*runtimedRuntime, *hookRuntime, *record.FakeRecorder, *captureHandler) {
+	t.Helper()
 	f := &hookRuntime{fakeRuntimeServer: newFakeRuntimeServer()}
 	rec := record.NewFakeRecorder(32)
+	logs := newCaptureHandler()
 	r := newRuntimedWith(f, RuntimedConfig{
 		NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir(), Recorder: rec,
-	}, nil, nil)
-	return r, f, rec
+	}, nil, slog.New(logs))
+	return r, f, rec, logs
 }
 
 // postStartPod is a single-container ("c0" — the name the shared fake's status
@@ -167,10 +180,10 @@ func waitCond(t *testing.T, what string, cond func() bool) {
 //  1. READY-GATING — a container whose hook has not returned must not publish
 //     Ready, and the pod must not publish Ready/ContainersReady. Red on B10's
 //     dispatch-only hook, which publishes the runtime's Ready verbatim.
-//  2. restartPolicy: Never — a failed hook must not be silently continued: the
-//     container never becomes Ready and the failure reaches the pod's Events. Red
-//     on a log-and-continue implementation (a Ready pod, no event). It must also
-//     never be restarted (Never restarts nothing).
+//  2. restartPolicy: Never — a failed hook kills the container, which stays
+//     Terminated: one StopContainer, no restart, the pod Failed, the failure on
+//     the pod's Events. Red on a log-and-continue implementation (a Ready pod, no
+//     event) and on a hold-NotReady-only one (the process still running).
 //  3. RE-RUN ON RESTART — the hook fires on every container START. Red on a
 //     once-per-pod implementation (exec count stuck at 1 across a restart).
 //  4. CANCELABLE LIFETIME — a hook still running at pod deletion is cancelled with
@@ -182,12 +195,11 @@ func waitCond(t *testing.T, what string, cond func() bool) {
 // beyond bounded polling.
 //
 // CEILING (row 2, stated so the gate cannot be mistaken for more than it proves):
-// upstream KILLS a container whose postStart hook failed. Under a policy that
-// restarts it, that kill is a re-exec and the provider performs it (row 3's path).
-// Under Never the kill is terminal, and no runtime verb stops one live container
-// without re-spawning it — so the provider holds the container NotReady and surfaces
-// the failure instead of reporting a Terminated container whose process is still
-// running. Row 2 asserts exactly that honest subset.
+// the stop is observed at the runtime seam (the fake re-renders the container
+// Terminated once StopContainer succeeds); that runtimed's verb really kills one
+// process group and leaves it dead is runtimed's own gate. The arms where the stop
+// cannot happen (a vm backend, a re-attached pod, a runtimed without the verb) are
+// TestPostStartKillFollowsRestartPolicy's rows, not this one's.
 func TestPostStartFidelity(t *testing.T) {
 	ctx := context.Background()
 
@@ -236,7 +248,7 @@ func TestPostStartFidelity(t *testing.T) {
 		}
 	})
 
-	t.Run("restartPolicy Never: a failed hook is surfaced, never silently continued", func(t *testing.T) {
+	t.Run("restartPolicy Never: a failed hook kills the container, which stays Terminated", func(t *testing.T) {
 		r, f, rec := newHookFake(t)
 		f.exit = 7 // the hook fails
 		pod := postStartPod("never", corev1.RestartPolicyNever)
@@ -270,6 +282,18 @@ func TestPostStartFidelity(t *testing.T) {
 		settleRestartCalls(t, f.fakeRuntimeServer, 0)
 		if n := f.execCount(); n != 1 {
 			t.Errorf("postStart hook ran %d times under restartPolicy Never, want 1 (no restart, no re-run)", n)
+		}
+		// ...but it is KILLED: one terminal stop, and the container stays down.
+		waitCond(t, "the terminal stop", func() bool { n, _ := f.stopState(); return n >= 1 })
+		if n, _ := f.stopState(); n != 1 {
+			t.Errorf("StopContainer calls = %d, want 1 (upstream kills a container whose postStart hook failed)", n)
+		}
+		st = hookStatus(t, r, pod)
+		if term := st.ContainerStatuses[0].State.Terminated; term == nil {
+			t.Errorf("c0 state = %+v, want Terminated after the postStart kill", st.ContainerStatuses[0].State)
+		}
+		if st.Phase != corev1.PodFailed {
+			t.Errorf("phase = %s, want Failed (Never, the only container killed)", st.Phase)
 		}
 	})
 
@@ -334,5 +358,209 @@ func TestPostStartFidelity(t *testing.T) {
 		waitCond(t, "the in-flight hook to be cancelled by the pod deletion", func() bool {
 			return f.canceledCount() == 1
 		})
+	})
+}
+
+// --- TestPostStartKillFollowsRestartPolicy ------------------------------------
+
+// countLogs counts captured records whose message is msg.
+func countLogs(h *captureHandler, msg string) int {
+	n := 0
+	for _, rec := range h.captured() {
+		if rec.message == msg {
+			n++
+		}
+	}
+	return n
+}
+
+// pendingEvents returns every event recorded so far, without waiting.
+func pendingEvents(ch <-chan string) []string {
+	var out []string
+	for {
+		select {
+		case ev := <-ch:
+			out = append(out, ev)
+		default:
+			return out
+		}
+	}
+}
+
+// hasKilling reports whether any of evs is a Normal Killing event.
+func hasKilling(evs []string) bool {
+	for _, ev := range evs {
+		if strings.HasPrefix(ev, corev1.EventTypeNormal+" "+reasonKilling+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPostStartKillFollowsRestartPolicy is the provider half of the terminal
+// postStart kill: a container whose postStart hook fails is KILLED and then
+// handled by its restart policy (k8s.io/api core/v1 Lifecycle.PostStart), which
+// the kubelet implements as killContainer → CRI StopContainer. Under Never that
+// is the new StopContainer verb and the container stays Terminated; under
+// OnFailure/Always it stays RestartContainer through the single restart
+// authority. Where the stop cannot happen, the honest subset stands and the two
+// Unimplemented channels stay apart: a runtimed that predates the verb
+// (transport) gets one upgrade line per process; a backend that cannot stop one
+// container (embedded, the vm shape) gets none. A re-attached pod makes no RPC.
+//
+// Red on main: the fake runtime serves no StopContainer and the Never arm never
+// stops anything.
+func TestPostStartKillFollowsRestartPolicy(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name   string
+		policy corev1.RestartPolicy
+	}{
+		{"OnFailure restarts, never stops", corev1.RestartPolicyOnFailure},
+		{"Always restarts, never stops", corev1.RestartPolicyAlways},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, f, _ := newHookFake(t)
+			f.exit = 7
+			pod := postStartPod("restart-"+strings.ToLower(string(tc.policy)), tc.policy)
+			if err := r.CreatePod(ctx, pod); err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+			waitCond(t, "the postStart re-exec", func() bool { n, _ := f.restartState(); return n >= 1 })
+			settleRestartCalls(t, f.fakeRuntimeServer, 1)
+			if n, _ := f.stopState(); n != 0 {
+				t.Errorf("StopContainer calls = %d under %s, want 0 (the kill is a re-exec)", n, tc.policy)
+			}
+		})
+	}
+
+	t.Run("Never stops the container, which stays Terminated", func(t *testing.T) {
+		r, f, rec := newHookFake(t)
+		f.exit = 7
+		pod := postStartPod("never-stop", corev1.RestartPolicyNever)
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+
+		if ev := nextLifecycleEvent(rec.Events, 3*time.Second); !strings.HasPrefix(ev, corev1.EventTypeWarning+" "+reasonFailedPostStartHook+" ") {
+			t.Fatalf("first event = %q, want the Warning %s", ev, reasonFailedPostStartHook)
+		}
+		want := corev1.EventTypeNormal + " " + reasonKilling + " " + msgKillingPostStart
+		if ev := nextLifecycleEvent(rec.Events, 3*time.Second); ev != want {
+			t.Fatalf("second event = %q, want %q (recorded after the stop)", ev, want)
+		}
+		n, last := f.stopState()
+		if n != 1 {
+			t.Errorf("StopContainer calls = %d, want 1", n)
+		}
+		if last.podID != string(pod.UID) || last.container != "c0" || last.grace != 0 || last.reason != reasonFailedPostStartHook {
+			t.Errorf("StopContainer args = %+v, want pod %s, c0, grace 0 (the PodBox grace), reason %s", last, pod.UID, reasonFailedPostStartHook)
+		}
+		settleRestartCalls(t, f.fakeRuntimeServer, 0)
+
+		st := hookStatus(t, r, pod)
+		cs := st.ContainerStatuses[0]
+		if cs.State.Terminated == nil || cs.State.Terminated.Reason != "Error" || cs.State.Terminated.ExitCode != 137 {
+			t.Errorf("c0 state = %+v, want Terminated{137, Error} (runtimed's reason passed through)", cs.State)
+		}
+		if cs.Ready {
+			t.Error("c0 Ready after the postStart kill")
+		}
+		if st.Phase != corev1.PodFailed {
+			t.Errorf("phase = %s, want Failed", st.Phase)
+		}
+		settleRestartCalls(t, f.fakeRuntimeServer, 0)
+	})
+
+	// heldSubset asserts the honest subset: the container is still running, held
+	// NotReady, never Terminated, never restarted, and no Killing event exists.
+	heldSubset := func(t *testing.T, r *runtimedRuntime, f *hookRuntime, rec *record.FakeRecorder, pod *corev1.Pod) {
+		t.Helper()
+		st := hookStatus(t, r, pod)
+		cs := st.ContainerStatuses[0]
+		if cs.State.Running == nil || cs.State.Terminated != nil {
+			t.Errorf("c0 state = %+v, want Running (never reported Terminated while it runs)", cs.State)
+		}
+		if cs.Ready {
+			t.Error("c0 Ready after a failed postStart hook")
+		}
+		if st.Phase != corev1.PodRunning {
+			t.Errorf("phase = %s, want Running", st.Phase)
+		}
+		settleRestartCalls(t, f.fakeRuntimeServer, 0)
+		if hasKilling(pendingEvents(rec.Events)) {
+			t.Error("a Killing event was recorded for a container that was not stopped")
+		}
+	}
+
+	t.Run("Never against a runtimed without the verb: honest subset, one upgrade line per process", func(t *testing.T) {
+		r, f, rec, logs := newHookFakeLogged(t)
+		f.exit = 7
+		f.setStopErr(status.Error(codes.Unimplemented, "unknown method StopContainer"))
+		pods := []*corev1.Pod{postStartPod("old-a", corev1.RestartPolicyNever), postStartPod("old-b", corev1.RestartPolicyNever)}
+		for _, pod := range pods {
+			if err := r.CreatePod(ctx, pod); err != nil {
+				t.Fatalf("CreatePod: %v", err)
+			}
+			t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+		}
+		waitCond(t, "both pods held NotReady", func() bool { return countLogs(logs, logPostStartHeld) == 2 })
+		if n, _ := f.stopState(); n != 2 {
+			t.Errorf("StopContainer calls = %d, want 2 (one attempt per pod)", n)
+		}
+		if n := countLogs(logs, logStopVerbMissing); n != 1 {
+			t.Errorf("upgrade lines = %d across two pods, want exactly 1 per process", n)
+		}
+		for _, pod := range pods {
+			heldSubset(t, r, f, rec, pod)
+		}
+	})
+
+	t.Run("Never on a backend that cannot stop one container: honest subset, no upgrade line", func(t *testing.T) {
+		r, f, rec, logs := newHookFakeLogged(t)
+		f.exit = 7
+		f.setStopResp(&runtimev1.StopContainerResponse{
+			Error:         &rpcstatus.Status{Code: int32(codes.Unimplemented), Message: "vm pods have no per-container stop"},
+			FailureReason: runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED,
+		})
+		pod := postStartPod("vm-like", corev1.RestartPolicyNever)
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+		waitCond(t, "the container held NotReady", func() bool { return countLogs(logs, logPostStartHeld) == 1 })
+		if n, _ := f.stopState(); n != 1 {
+			t.Errorf("StopContainer calls = %d, want 1", n)
+		}
+		if n := countLogs(logs, logStopVerbMissing); n != 0 {
+			t.Errorf("upgrade lines = %d, want 0 (a backend ceiling is not closed by an upgrade)", n)
+		}
+		heldSubset(t, r, f, rec, pod)
+	})
+
+	t.Run("Never on a re-attached pod makes no RPC", func(t *testing.T) {
+		r, f, rec, logs := newHookFakeLogged(t)
+		f.exit = 7
+		f.release = make(chan struct{}, 1) // hold the hook until the track is marked adopted
+		pod := postStartPod("adopted", corev1.RestartPolicyNever)
+		if err := r.CreatePod(ctx, pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		t.Cleanup(func() { _ = r.DeletePod(ctx, pod) })
+		waitCond(t, "the postStart hook to be dispatched", func() bool { return f.execCount() == 1 })
+		tr := r.trackByID(string(pod.UID))
+		tr.restartMu.Lock()
+		tr.adopted = true
+		tr.restartMu.Unlock()
+		f.release <- struct{}{}
+
+		waitCond(t, "the container held NotReady", func() bool { return countLogs(logs, logPostStartHeld) == 1 })
+		if n, _ := f.stopState(); n != 0 {
+			t.Errorf("StopContainer calls = %d on a re-attached pod, want 0", n)
+		}
+		heldSubset(t, r, f, rec, pod)
 	})
 }

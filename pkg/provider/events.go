@@ -45,7 +45,11 @@ const (
 	reasonPulled  = "Pulled"  // image (or host binary) resolved for the container
 	reasonCreated = "Created" // container object created, before process start
 	reasonStarted = "Started" // container process started successfully
-	reasonKilling = "Killing" // container process is being stopped (DeletePod)
+	// reasonKilling is recorded when a container process is being stopped: by
+	// DeletePod on the HostProcess path, and on the runtimed path after a
+	// container whose postStart hook failed under a non-restarting policy was
+	// stopped (msgKillingPostStart).
+	reasonKilling = "Killing"
 	reasonFailed  = "Failed"  // container process failed to start
 	reasonBackOff = "BackOff" // container re-exec is throttled by CrashLoopBackOff
 	// reasonInspectFailed is recorded when a container's image reference cannot
@@ -296,6 +300,11 @@ func msgCreatedContainer(name string) string { return "Created container " + nam
 
 // msgStartedContainer is the Started-event message.
 func msgStartedContainer(name string) string { return "Started container " + name }
+
+// msgKillingPostStart is the Killing-event message for a container stopped
+// because its postStart hook failed. Kubelet-verbatim: upstream's killContainer
+// is handed the message "FailedPostStartHook" for this cause and records it as-is.
+const msgKillingPostStart = "FailedPostStartHook"
 
 // msgStoppingContainer is the Killing-event message.
 func msgStoppingContainer(name string) string { return "Stopping container " + name }

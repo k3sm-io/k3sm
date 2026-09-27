@@ -54,6 +54,17 @@ type fakeRuntimeServer struct {
 	lastRestart  restartRecord     // args of the last RestartContainer RPC
 	restartErr   error             // when set, RestartContainer fails (the B26 retry path)
 
+	// The StopContainer seam of the terminal postStart kill: a call tally, the
+	// last call's arguments, a transport error (stopErr, e.g. an old runtimed's
+	// Unimplemented) and an embedded refusal (stopResp, e.g. a vm pod's
+	// UNSUPPORTED). A successful stop re-renders that container Terminated
+	// (exit 137, reason Error) so the provider's observed-exit path runs.
+	stopCalls int
+	lastStop  stopRecord
+	stopErr   error
+	stopResp  *runtimev1.StopContainerResponse
+	stopped   map[string]map[string]bool // pod id -> container name -> stopped
+
 	// The StartContainer seam of the B119 pull-retry path (see pullfailure_test.go):
 	// a FIFO of queued outcomes, a call tally, and an optional hold channel that
 	// parks the handler so a test can observe the provider inside its attempt
@@ -130,6 +141,61 @@ type restartRecord struct {
 	podID     string
 	container string
 	reason    string
+}
+
+// stopRecord captures the arguments of a StopContainer RPC.
+type stopRecord struct {
+	podID     string
+	container string
+	grace     int64
+	reason    string
+}
+
+// setStopErr makes every subsequent StopContainer RPC fail at the transport with
+// err (nil restores success).
+func (f *fakeRuntimeServer) setStopErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopErr = err
+}
+
+// setStopResp makes every subsequent StopContainer RPC answer resp (an embedded
+// refusal) instead of stopping (nil restores success).
+func (f *fakeRuntimeServer) setStopResp(resp *runtimev1.StopContainerResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopResp = resp
+}
+
+// stopState snapshots the fake's StopContainer bookkeeping under its lock.
+func (f *fakeRuntimeServer) stopState() (int, stopRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stopCalls, f.lastStop
+}
+
+// StopContainer records the terminal per-container kill and, on success, marks
+// the container stopped so every later status renders it Terminated.
+func (f *fakeRuntimeServer) StopContainer(_ context.Context, req *runtimev1.StopContainerRequest) (*runtimev1.StopContainerResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls++
+	f.lastStop = stopRecord{podID: req.GetPodId(), container: req.GetContainer(), grace: req.GetGracePeriodSeconds(), reason: req.GetReason()}
+	if f.stopErr != nil {
+		return nil, f.stopErr
+	}
+	if f.stopResp != nil {
+		return f.stopResp, nil
+	}
+	if f.stopped == nil {
+		f.stopped = map[string]map[string]bool{}
+	}
+	if f.stopped[req.GetPodId()] == nil {
+		f.stopped[req.GetPodId()] = map[string]bool{}
+	}
+	f.stopped[req.GetPodId()][req.GetContainer()] = true
+	st := f.statusLocked(req.GetPodId())
+	return &runtimev1.StopContainerResponse{Status: st.GetContainerStatuses()[0]}, nil
 }
 
 func newFakeRuntimeServer() *fakeRuntimeServer {
@@ -297,6 +363,30 @@ func (f *fakeRuntimeServer) WatchPodStatus(_ *runtimev1.WatchPodStatusRequest, s
 // (mimicking runtimed's lossy renderer) so the provider's STABLE-StartTime
 // handling is actually exercised.
 func (f *fakeRuntimeServer) statusLocked(id string) *runtimev1.PodStatus {
+	if f.stopped[id]["c0"] {
+		// The one container was stopped: runtimed renders it Terminated with the
+		// reaped SIGKILL and its generic reason, and the pod's mains-only phase
+		// Failed.
+		return &runtimev1.PodStatus{
+			PodId:     id,
+			Phase:     runtimev1.PodPhase_POD_PHASE_FAILED,
+			PodIp:     "10.0.0.5",
+			StartTime: timestamppb.New(time.Now()),
+			ContainerStatuses: []*runtimev1.ContainerStatus{{
+				Name:  "c0",
+				Image: "web",
+				State: &runtimev1.ContainerState{
+					Terminated: &runtimev1.ContainerStateTerminated{
+						ExitCode:   137,
+						Reason:     "Error",
+						StartedAt:  timestamppb.New(f.started),
+						FinishedAt: timestamppb.New(f.started.Add(time.Second)),
+					},
+				},
+			}},
+			Conditions: f.conditions[id],
+		}
+	}
 	return &runtimev1.PodStatus{
 		PodId: id,
 		Phase: runtimev1.PodPhase_POD_PHASE_RUNNING,
