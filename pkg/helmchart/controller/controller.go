@@ -437,12 +437,12 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	if state == helmchart.JobFailed && !failedFor(chart.Status, helmchart.ReasonJobFailed, "") {
 		c.warn(raw, EventReasonInstallFailed, fmt.Sprintf(
 			"install Job %s/%s failed (backoffLimit or activeDeadlineSeconds reached); failurePolicy %s; see `kubectl logs -n %s job/%s`",
-			job.Namespace, job.Name, helmchart.EffectiveFailurePolicy(chart.Spec), job.Namespace, job.Name))
+			job.Namespace, job.Name, helmchart.EffectiveFailurePolicy(chart.Spec, cfg), job.Namespace, job.Name))
 	}
 	if err := c.writeStatus(ctx, raw, chart, status); err != nil {
 		return err
 	}
-	if helmchart.ShouldReinstall(chart.Spec, state) {
+	if helmchart.ShouldReinstall(chart.Spec, cfg, state) {
 		// The status above records the failure first; the next reconcile, driven
 		// by this Job's delete event, runs the install again.
 		return c.deleteJob(ctx, job)

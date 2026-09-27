@@ -84,6 +84,7 @@ func TestStageHelm(t *testing.T) {
 	})
 
 	t.Run("verified download is extracted under the versioned name", func(t *testing.T) {
+		fakeTool(t, "gh") // a dev shell: the download gate is open
 		calls := fakeHelmRelease(t, good, "")
 		bd := t.TempDir()
 		path, err := EnsureHelm(t.Context(), bd)
@@ -118,6 +119,7 @@ func TestStageHelm(t *testing.T) {
 	})
 
 	t.Run("digest mismatch fails closed and stages nothing", func(t *testing.T) {
+		fakeTool(t, "gh") // a dev shell: the download gate is open
 		fakeHelmRelease(t, good, strings.Repeat("0", 64))
 		bd := t.TempDir()
 		if _, err := EnsureHelm(t.Context(), bd); !errors.Is(err, ErrHelmDigestMismatch) {
@@ -129,6 +131,7 @@ func TestStageHelm(t *testing.T) {
 	})
 
 	t.Run("a tarball without the binary is an error", func(t *testing.T) {
+		fakeTool(t, "gh") // a dev shell: the download gate is open
 		fakeHelmRelease(t, helmTarball(t, map[string]string{"linux-arm64/helm": "wrong"}), "")
 		bd := t.TempDir()
 		if _, err := EnsureHelm(t.Context(), bd); err == nil || !strings.Contains(err.Error(), helmchart.HelmTarballMember) {
@@ -136,6 +139,51 @@ func TestStageHelm(t *testing.T) {
 		}
 		if fileExists(helmchart.HelmPath(bd)) {
 			t.Error("a binary was staged from a tarball that has none")
+		}
+	})
+
+	t.Run("a daemon without gh gets ErrHelmNotStaged and never downloads", func(t *testing.T) {
+		calls := fakeHelmRelease(t, good, "")
+		t.Setenv("PATH", t.TempDir()) // no gh: the launchd daemon's environment
+		bd := t.TempDir()
+		if _, err := EnsureHelm(t.Context(), bd); !errors.Is(err, ErrHelmNotStaged) {
+			t.Fatalf("EnsureHelm = %v, want ErrHelmNotStaged", err)
+		}
+		if *calls != 0 {
+			t.Errorf("downloads = %d, want 0 (the gate is closed)", *calls)
+		}
+		if fileExists(helmchart.HelmPath(bd)) {
+			t.Error("a helm was staged with the gate closed")
+		}
+	})
+
+	t.Run("a daemon without gh still uses a staged helm", func(t *testing.T) {
+		calls := fakeHelmRelease(t, good, "")
+		t.Setenv("PATH", t.TempDir())
+		bd := t.TempDir()
+		if err := os.WriteFile(helmchart.HelmPath(bd), []byte("payload-helm"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if path, err := EnsureHelm(t.Context(), bd); err != nil || path != helmchart.HelmPath(bd) {
+			t.Fatalf("EnsureHelm = %q, %v", path, err)
+		}
+		if *calls != 0 {
+			t.Errorf("downloads = %d, want 0", *calls)
+		}
+	})
+
+	t.Run("a body over the download bound is truncated and fails the digest", func(t *testing.T) {
+		fakeTool(t, "gh")
+		fakeHelmRelease(t, good, "") // the pin is the digest of the whole body
+		orig := maxHelmTarballBytes
+		t.Cleanup(func() { maxHelmTarballBytes = orig })
+		maxHelmTarballBytes = int64(len(good)) - 1
+		bd := t.TempDir()
+		if _, err := EnsureHelm(t.Context(), bd); !errors.Is(err, ErrHelmDigestMismatch) {
+			t.Fatalf("EnsureHelm = %v, want ErrHelmDigestMismatch (the bound truncates the body)", err)
+		}
+		if fileExists(helmchart.HelmPath(bd)) {
+			t.Error("truncated bytes were staged")
 		}
 	})
 

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/dynamic"
@@ -41,16 +42,16 @@ import (
 // returned to bring-up or to the control plane's tear-down.
 //
 // helm normally arrives in the payload and is seeded into the work dir's bin at
-// boot. When it is absent (a dev shell with no payload, or a payload staged by
-// an older release) EnsureHelm downloads and verifies the pin, off the bring-up
-// path because this runs in its own goroutine.
+// boot. When it is absent, awaitHelm keeps re-checking every helmRetryInterval
+// until it is staged: a daemon re-checks the work dir only (EnsureHelm never
+// fetches without `gh`), a dev shell retries the verified download. This runs
+// in its own goroutine, off the bring-up path.
 func runHelmController(ctx context.Context, adminCfg *rest.Config, admin kubernetes.Interface, workDir, nodeName string, logger *slog.Logger) {
-	helmPath, err := executor.EnsureHelm(ctx, executor.BinDir(workDir))
+	bd := executor.BinDir(workDir)
+	helmPath, err := awaitHelm(ctx, func(ctx context.Context) (string, error) {
+		return executor.EnsureHelm(ctx, bd)
+	}, helmRetryInterval, logger)
 	if err != nil {
-		if ctx.Err() == nil {
-			logger.Error("helm controller disabled: stage the pinned helm", "err", err,
-				"remedy", "re-run `sudo k3sm install` with a payload staged by `k3sm payload`, which carries helm")
-		}
 		return
 	}
 	dyn, err := dynamic.NewForConfig(adminCfg)
@@ -77,5 +78,42 @@ func runHelmController(ctx context.Context, adminCfg *rest.Config, admin kuberne
 	}
 	if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
 		logger.Error("helm controller", "err", err)
+	}
+}
+
+// helmRetryInterval is how often awaitHelm re-checks for a staged helm.
+const helmRetryInterval = 60 * time.Second
+
+// awaitHelm calls ensure until it succeeds or ctx is done, waiting interval
+// between tries. A one-shot failure would disable HelmCharts for the life of
+// the process over a transient fault (a dropped download, a payload restaged
+// after boot), so it retries. Each distinct error is logged once, not on every
+// tick, so a daemon waiting on a reinstall does not flood its log. The error it
+// returns is ctx's.
+func awaitHelm(ctx context.Context, ensure func(context.Context) (string, error), interval time.Duration, logger *slog.Logger) (string, error) {
+	var last string
+	for {
+		path, err := ensure(ctx)
+		if err == nil {
+			if last != "" {
+				logger.Info("helm staged; starting the helm controller", "path", path)
+			}
+			return path, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if msg := err.Error(); msg != last {
+			last = msg
+			logger.Error("helm controller waiting: stage the pinned helm", "err", err, "retry", interval,
+				"remedy", "re-run `sudo k3sm install` with a payload staged by `k3sm payload`, which carries helm")
+		}
+		t := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return "", ctx.Err()
+		case <-t.C:
+		}
 	}
 }

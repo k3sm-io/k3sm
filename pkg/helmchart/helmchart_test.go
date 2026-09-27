@@ -106,6 +106,19 @@ func TestRenderJob(t *testing.T) {
 			volumes:  []string{"helm-home", "chart"},
 		},
 		{
+			name:     "HelmChartConfig forceConflicts overrides the chart's",
+			chart:    chart(),
+			cfg:      &helmv1.HelmChartConfig{Spec: helmv1.HelmChartConfigSpec{ForceConflicts: true}},
+			wantName: "helm-install-podinfo",
+			wantArgs: []string{"upgrade", "--install", "podinfo", "podinfo", "--namespace", "kube-system",
+				"--repo", "https://stefanprodan.github.io/podinfo", "-f", "/chart/values.yaml",
+				"--timeout", "5m0s", "--wait", "--force-conflicts"},
+			egress:   true,
+			deadline: 600,
+			backoff:  1000,
+			volumes:  []string{"helm-home", "chart"},
+		},
+		{
 			name: "chartContent wins over chart: no egress, no repo, archive under /chart",
 			chart: chart(func(c *helmv1.HelmChart) {
 				c.Spec.ChartContent = "H4sI"
@@ -305,6 +318,8 @@ func TestConfigHash(t *testing.T) {
 		{"overlay", base, &helmv1.HelmChartConfig{Spec: helmv1.HelmChartConfigSpec{ValuesContent: "a: 2\n"}}},
 		{"overlay removed", base, nil},
 		{"set", set(map[string]intstr.IntOrString{"k": intstr.FromInt32(1)}), cfg},
+		{"config failurePolicy", base, &helmv1.HelmChartConfig{Spec: helmv1.HelmChartConfigSpec{ValuesContent: "a: 1\n", FailurePolicy: "abort"}}},
+		{"config forceConflicts", base, &helmv1.HelmChartConfig{Spec: helmv1.HelmChartConfigSpec{ValuesContent: "a: 1\n", ForceConflicts: true}}},
 	}
 	for _, tc := range changed {
 		t.Run(tc.name, func(t *testing.T) {
@@ -312,11 +327,6 @@ func TestConfigHash(t *testing.T) {
 				t.Errorf("changing the %s did not change the hash", tc.name)
 			}
 		})
-	}
-	// The overlay's other fields are not applied, so they do not move the hash.
-	ignored := &helmv1.HelmChartConfig{Spec: helmv1.HelmChartConfigSpec{ValuesContent: "a: 1\n", FailurePolicy: "abort"}}
-	if ConfigHash(base, ignored) != h {
-		t.Error("an overlay field the controller does not apply changed the hash")
 	}
 }
 
@@ -392,19 +402,26 @@ func TestStatusConditions(t *testing.T) {
 
 	t.Run("failure policy", func(t *testing.T) {
 		for _, tc := range []struct {
-			policy string
-			state  JobState
-			want   bool
+			policy, cfgPolicy string
+			state             JobState
+			want              bool
 		}{
-			{"", JobFailed, true},
-			{helmv1.FailurePolicyReinstall, JobFailed, true},
-			{helmv1.FailurePolicyAbort, JobFailed, false},
-			{"", JobRunning, false},
-			{"", JobComplete, false},
+			{"", "", JobFailed, true},
+			{helmv1.FailurePolicyReinstall, "", JobFailed, true},
+			{helmv1.FailurePolicyAbort, "", JobFailed, false},
+			{"", "", JobRunning, false},
+			{"", "", JobComplete, false},
+			// The same-named HelmChartConfig's failurePolicy wins when set.
+			{helmv1.FailurePolicyReinstall, helmv1.FailurePolicyAbort, JobFailed, false},
+			{helmv1.FailurePolicyAbort, helmv1.FailurePolicyReinstall, JobFailed, true},
 		} {
 			spec := helmv1.HelmChartSpec{FailurePolicy: tc.policy}
-			if got := ShouldReinstall(spec, tc.state); got != tc.want {
-				t.Errorf("ShouldReinstall(%q, %v) = %v, want %v", tc.policy, tc.state, got, tc.want)
+			var cfg *helmv1.HelmChartConfig
+			if tc.cfgPolicy != "" {
+				cfg = &helmv1.HelmChartConfig{Spec: helmv1.HelmChartConfigSpec{FailurePolicy: tc.cfgPolicy}}
+			}
+			if got := ShouldReinstall(spec, cfg, tc.state); got != tc.want {
+				t.Errorf("ShouldReinstall(%q, config %q, %v) = %v, want %v", tc.policy, tc.cfgPolicy, tc.state, got, tc.want)
 			}
 		}
 	})

@@ -209,6 +209,16 @@ func configValues(cfg *helmv1.HelmChartConfig) string {
 	return cfg.Spec.ValuesContent
 }
 
+// ForceConflicts is whether the install passes --force-conflicts: the
+// HelmChartConfig's forceConflicts when set, else the chart's (k3s semantics,
+// the config wins when set; a bool field can only be set to true).
+func ForceConflicts(spec helmv1.HelmChartSpec, cfg *helmv1.HelmChartConfig) bool {
+	if cfg != nil && cfg.Spec.ForceConflicts {
+		return true
+	}
+	return spec.ForceConflicts
+}
+
 // RenderJob renders the Job that runs helm for c: the install Job while c is
 // live, the delete Job once c carries a deletionTimestamp. helmPath is the
 // staged helm binary (HelmPath under the work dir's bin); hash is ConfigHash of
@@ -275,7 +285,7 @@ func RenderJob(c *helmv1.HelmChart, cfg *helmv1.HelmChartConfig, helmPath, hash 
 			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: sources}},
 		})
 		mounts = append(mounts, corev1.VolumeMount{Name: "chart", MountPath: chartMountPath, ReadOnly: true})
-		args = InstallArgs(c, configValues(cfg) != "")
+		args = InstallArgs(c, cfg)
 	}
 
 	job.Spec.Template = corev1.PodTemplateSpec{
@@ -331,11 +341,12 @@ func backOffLimit(spec helmv1.HelmChartSpec) int32 {
 //
 // The release is named after the HelmChart (k3s). --repo and --version apply
 // only to a fetched chart; a chartContent install names the archive under
-// /chart. The HelmChartConfig overlay is a second values file, after the
-// chart's own, so it wins; --set overrides both. --set follows k3s exactly:
+// /chart. cfg is the same-named HelmChartConfig, or nil: its values overlay is
+// a second values file, after the chart's own, so it wins (--set overrides
+// both), and its forceConflicts overrides the chart's (ForceConflicts). --set follows k3s exactly:
 // integers, booleans and null use --set, every other string --set-string with
 // its unescaped commas escaped, keys in sorted order.
-func InstallArgs(c *helmv1.HelmChart, overlay bool) []string {
+func InstallArgs(c *helmv1.HelmChart, cfg *helmv1.HelmChartConfig) []string {
 	spec := c.Spec
 	chart := spec.Chart
 	if spec.ChartContent != "" {
@@ -354,7 +365,7 @@ func InstallArgs(c *helmv1.HelmChart, overlay bool) []string {
 		}
 	}
 	args = append(args, "-f", chartMountPath+"/"+ValuesFile)
-	if overlay {
+	if configValues(cfg) != "" {
 		args = append(args, "-f", chartMountPath+"/"+ConfigValuesFile)
 	}
 	keys := make([]string, 0, len(spec.Set))
@@ -371,7 +382,7 @@ func InstallArgs(c *helmv1.HelmChart, overlay bool) []string {
 		}
 	}
 	args = append(args, "--timeout", Timeout(spec).String(), "--wait")
-	if spec.ForceConflicts {
+	if ForceConflicts(spec, cfg) {
 		args = append(args, "--force-conflicts")
 	}
 	if spec.TakeOwnership {

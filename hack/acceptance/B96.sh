@@ -28,7 +28,9 @@
 #      podinfo with replicaCount 0, so no Linux pod is ever scheduled.
 #
 # Nothing is pinned to a node: the Job's own nodeSelector and toleration decide.
-# Names carry a per-run suffix; everything created is removed on exit.
+# Names carry a per-run suffix; everything created is removed on exit, and a
+# chart the controller has not finalized within 120 s of exit has its finalizer,
+# ClusterRoleBinding and ServiceAccount removed by hand.
 #
 # Requires: kubectl, python3, sudo (to write the root-owned manifest directory).
 set -euo pipefail
@@ -63,6 +65,27 @@ cleanup() {
 	sudo rm -f "$MANIFEST" 2>/dev/null || true
 	for c in "$CHART" "$INSECURE" "$ONLINE"; do
 		kc delete helmchart "$c" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	done
+	# Wait up to 120 s for the controller to finalize every chart this run
+	# created. A chart still present after that (a failing run, no controller)
+	# gets the documented manual remedy, so a red run never leaves a
+	# cluster-admin binding behind: null the finalizer, then delete the
+	# ClusterRoleBinding and ServiceAccount the skipped finalize would have.
+	local deadline=$(( $(date +%s) + 120 )) left c
+	while :; do
+		left=""
+		for c in "$CHART" "$INSECURE" "$ONLINE"; do
+			kc get helmchart "$c" -n "$NS" >/dev/null 2>&1 && left="$left $c"
+		done
+		[ -z "$left" ] && break
+		[ "$(date +%s)" -ge "$deadline" ] && break
+		sleep 3
+	done
+	for c in $left; do
+		echo "cleanup: HelmChart $NS/$c was not finalized in 120 s; removing its finalizer, binding and ServiceAccount by hand" >&2
+		kc patch helmchart "$c" -n "$NS" --type merge -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1 || true
+		kc delete clusterrolebinding "helm-$NS-$c" --ignore-not-found >/dev/null 2>&1 || true
+		kc delete serviceaccount "helm-$c" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
 	done
 	kc delete configmap "$CM" -n "$TARGET" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	rm -rf "$WORK"

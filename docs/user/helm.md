@@ -43,6 +43,8 @@ k3s's `server/manifests`.
 - `kubectl get helmcharts -A` shows the Job and whether the last run failed.
 - Only one server runs the controller at a time. It holds the `kube-system/k3sm-helm-controller`
   Lease.
+- During a Lease partition an HA pair can briefly run two controllers. Every write is idempotent or
+  guarded by the HelmChart's UID, so the overlap is harmless.
 
 ## Chart Sources
 
@@ -83,10 +85,9 @@ k3s's `server/manifests`.
 
 - A `HelmChartConfig` with the same name and namespace as a HelmChart overlays values on it. Its
   `valuesContent` is applied after the HelmChart's own values, so it wins.
-- Only `valuesContent` is applied today. Its `failurePolicy` and `forceConflicts` are accepted and
-  ignored.
-- Changing either object reruns the install: the Job is replaced when the HelmChart spec or the
-  overlay changes.
+- Its `failurePolicy` and `forceConflicts` override the HelmChart's when set (k3s semantics).
+- Changing either object reruns the install: the Job is replaced when the HelmChart spec or any of
+  those three HelmChartConfig fields changes.
 
 ## Failures
 
@@ -117,6 +118,10 @@ k3s's `server/manifests`.
 
 ## Limits
 
+- The server never downloads `helm` while it runs as the launchd daemon. When the payload lacks it,
+  the controller logs the missing binary, re-checks the work dir every minute, and starts once a
+  reinstall stages it. A server started from a development shell (one with `gh` on `PATH`) fetches
+  the pinned release instead and verifies it against the pinned digest.
 - `helm` is ad hoc signed, like every binary k3sm stages. A node whose signature policy requires
   notarized binaries cannot run it, and HelmCharts do not install there.
 - The Job runs on the native path. A chart's own workloads still need the Darwin scheduling fields
@@ -133,9 +138,15 @@ reverting to a k3sm release without HelmChart support, check that no HelmChart i
 kubectl get helmcharts -A
 ```
 
-If one is stuck after a rollback, remove the finalizer by hand. The release is not uninstalled, so
-run `helm uninstall` for it first if you want it gone:
+If one is stuck after a rollback, clear it by hand. Removing the finalizer skips the controller's
+cleanup, so also delete the chart's cluster-admin ClusterRoleBinding and its ServiceAccount, or both
+stay in the cluster for good:
 
 ```sh
 kubectl patch helmchart <name> -n <namespace> --type merge -p '{"metadata":{"finalizers":null}}'
+kubectl delete clusterrolebinding helm-<namespace>-<name>
+kubectl delete serviceaccount helm-<name> -n <namespace>
 ```
+
+The release is not uninstalled either. Run `helm uninstall <name> -n <targetNamespace>` first if
+you want it gone.

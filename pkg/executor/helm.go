@@ -46,8 +46,10 @@ import (
 // bump stages a new file beside the old one rather than trusting it.
 //
 // EnsureHelm is the dev-shell fallback, the analog of the control plane's `gh`
-// re-stage: it downloads only when the work dir has no staged helm, which on a
-// packaged install means the payload lacked it.
+// re-stage: it downloads only when the work dir has no staged helm AND `gh` is
+// on PATH. A launchd daemon never has `gh`, so a packaged install whose payload
+// lacked helm gets ErrHelmNotStaged and never reaches the network from the
+// daemon; a dev shell (which has `gh`) fetches and verifies the pin.
 
 // helmTarballURL and helmTarballSHA256 are the pinned download. They are vars so
 // a test can point them at a local server and its bytes' digest.
@@ -55,6 +57,11 @@ var (
 	helmTarballURL    = helmchart.HelmURL()
 	helmTarballSHA256 = helmchart.HelmSHA256
 )
+
+// maxHelmTarballBytes bounds the download, so a server that streams without end
+// cannot fill the disk; a truncated stream then fails the digest check. The
+// release tarball is about 20 MB. A var so a test can lower it.
+var maxHelmTarballBytes int64 = 256 << 20
 
 // maxHelmBinaryBytes bounds the extracted binary, so a tarball whose member
 // claims an absurd size cannot fill the disk. helm v4.3.0 is about 63 MB.
@@ -64,10 +71,22 @@ const maxHelmBinaryBytes = 512 << 20
 // bytes. Fatal by design, as ErrPayloadDigestMismatch is for the control plane.
 var ErrHelmDigestMismatch = errors.New("helm tarball digest mismatch")
 
-// EnsureHelm returns the path of a staged helm in binDir, downloading and
-// verifying the pinned release when none is staged. A staged copy is used as
-// is (see the note above on why presence suffices) and re-signed.
+// ErrHelmNotStaged means the work dir has no staged helm and this process may
+// not download one: it is not a dev shell (no `gh` on PATH), so it is a daemon
+// whose payload lacked helm. The remedy is a reinstall with a current payload.
+var ErrHelmNotStaged = errors.New("helm is not staged and this process does not download it (no `gh` on PATH: not a dev shell)")
+
+// EnsureHelm returns the path of a staged helm in binDir. A staged copy is used
+// as is (see the note above on why presence suffices) and re-signed. When none
+// is staged it downloads and verifies the pinned release only in a dev shell
+// (`gh` on PATH, the same gate as the control plane's re-stage); otherwise it
+// returns ErrHelmNotStaged without touching the network.
 func EnsureHelm(ctx context.Context, binDir string) (string, error) {
+	if !fileExists(helmchart.HelmPath(binDir)) {
+		if _, err := lookPathGh(); err != nil {
+			return "", fmt.Errorf("%w: %s", ErrHelmNotStaged, helmchart.HelmPath(binDir))
+		}
+	}
 	if err := stageHelm(ctx, binDir, false); err != nil {
 		return "", err
 	}
@@ -83,6 +102,9 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 		return err
 	}
 	dst := helmchart.HelmPath(bd)
+	// Presence is trusted as the version marker because BinDir is root-owned
+	// 0755 under the daemon: only root (install and the payload seed) can place
+	// a file under the versioned name.
 	if !force && fileExists(dst) {
 		return signBinaries(ctx, bd, []string{helmchart.HelmBinaryName})
 	}
@@ -119,7 +141,8 @@ func stageHelm(ctx context.Context, bd string, force bool) error {
 }
 
 // downloadHashed streams url into w and returns the lowercase hex sha256 of the
-// bytes written, taken on the way to disk.
+// bytes written, taken on the way to disk. At most maxHelmTarballBytes are read;
+// a longer body is truncated there and so fails the caller's digest check.
 func downloadHashed(ctx context.Context, w io.Writer, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -134,7 +157,7 @@ func downloadHashed(ctx context.Context, w io.Writer, url string) (string, error
 		return "", fmt.Errorf("fetch %s: unexpected status %s", url, resp.Status)
 	}
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(w, h), io.LimitReader(resp.Body, maxHelmTarballBytes)); err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

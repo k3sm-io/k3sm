@@ -96,6 +96,10 @@ func run(ctx context.Context, download bool) int {
 	return exitPass
 }
 
+// maxTarballBytes bounds the tarball download so a server that streams without
+// end cannot hang the check; a truncated body fails the digest comparison.
+const maxTarballBytes = 256 << 20
+
 // fetch GETs url and returns its sha256; with keep it also returns the body
 // (the checksum file is small; the tarball is hashed as it streams).
 func fetch(ctx context.Context, url string, keep bool) ([]byte, string, error) {
@@ -116,7 +120,7 @@ func fetch(ctx context.Context, url string, keep bool) ([]byte, string, error) {
 	if keep {
 		body, err = io.ReadAll(io.TeeReader(io.LimitReader(resp.Body, 1<<16), h))
 	} else {
-		_, err = io.Copy(h, resp.Body)
+		_, err = io.Copy(h, io.LimitReader(resp.Body, maxTarballBytes))
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("read %s: %w", url, err)

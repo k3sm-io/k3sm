@@ -25,16 +25,18 @@ import (
 )
 
 // ConfigHash is the digest of everything the install Job's behaviour depends on
-// from the API: the HelmChart's spec and the HelmChartConfig's values overlay.
+// from the API: the HelmChart's spec and the three HelmChartConfig fields the
+// controller applies (valuesContent, failurePolicy, forceConflicts).
 // It is stamped on the install Job (AnnotationConfigHash), and a Job carrying a
 // different hash is replaced, which is how an edited spec or overlay reaches
 // helm.
 //
-// "sha256:" + hex of sha256(JSON(spec) || 0x00 || overlay). encoding/json sorts
-// map keys, so the digest is stable across processes; the NUL separator keeps a
-// spec/overlay pair from colliding with another split of the same bytes. Only
-// the overlay's valuesContent is hashed, because it is the only
-// HelmChartConfig field the controller applies.
+// "sha256:" + hex of sha256(JSON(spec) || 0x00 || JSON(config fields)).
+// encoding/json sorts map keys and writes struct fields in order, so the digest
+// is stable across processes; the NUL separator keeps a spec/config pair from
+// colliding with another split of the same bytes. A nil config hashes as the
+// zero fields. Other HelmChartConfig metadata is not hashed: the controller
+// applies nothing else from it.
 func ConfigHash(spec helmv1.HelmChartSpec, cfg *helmv1.HelmChartConfig) string {
 	// A HelmChartSpec is plain data (strings, bools, ints, a map, a Duration), so
 	// its encoding does not fail. Were it ever to, the error text is hashed in its
@@ -47,6 +49,16 @@ func ConfigHash(spec helmv1.HelmChartSpec, cfg *helmv1.HelmChartConfig) string {
 	h := sha256.New()
 	h.Write(raw)
 	h.Write([]byte{0})
-	h.Write([]byte(configValues(cfg)))
+	var fields helmv1.HelmChartConfigSpec
+	if cfg != nil {
+		fields = cfg.Spec
+	}
+	// Plain strings and a bool: this encoding cannot fail.
+	overrides, _ := json.Marshal(struct {
+		ValuesContent  string `json:"valuesContent"`
+		FailurePolicy  string `json:"failurePolicy"`
+		ForceConflicts bool   `json:"forceConflicts"`
+	}{fields.ValuesContent, fields.FailurePolicy, fields.ForceConflicts})
+	h.Write(overrides)
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }

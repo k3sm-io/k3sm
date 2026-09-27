@@ -89,11 +89,15 @@ func StateOf(job *batchv1.Job) JobState {
 	return JobRunning
 }
 
-// EffectiveFailurePolicy is the chart's failure policy, defaulting to
-// reinstall (k3s). HelmChartConfig's override is not applied: the controller
-// takes only the values overlay from a HelmChartConfig.
-func EffectiveFailurePolicy(spec helmv1.HelmChartSpec) string {
-	if spec.FailurePolicy == helmv1.FailurePolicyAbort {
+// EffectiveFailurePolicy is the failure policy for a chart with spec and its
+// same-named HelmChartConfig cfg (nil when there is none): the config's
+// failurePolicy when set, else the chart's, defaulting to reinstall (k3s).
+func EffectiveFailurePolicy(spec helmv1.HelmChartSpec, cfg *helmv1.HelmChartConfig) string {
+	policy := spec.FailurePolicy
+	if cfg != nil && cfg.Spec.FailurePolicy != "" {
+		policy = cfg.Spec.FailurePolicy
+	}
+	if policy == helmv1.FailurePolicyAbort {
 		return helmv1.FailurePolicyAbort
 	}
 	return helmv1.FailurePolicyReinstall
@@ -102,8 +106,8 @@ func EffectiveFailurePolicy(spec helmv1.HelmChartSpec) string {
 // ShouldReinstall reports whether a failed install Job is deleted so the next
 // reconcile runs the install again. Under abort the failed Job (and its pods'
 // logs) is left for the operator; under reinstall it is replaced.
-func ShouldReinstall(spec helmv1.HelmChartSpec, state JobState) bool {
-	return state == JobFailed && EffectiveFailurePolicy(spec) == helmv1.FailurePolicyReinstall
+func ShouldReinstall(spec helmv1.HelmChartSpec, cfg *helmv1.HelmChartConfig, state JobState) bool {
+	return state == JobFailed && EffectiveFailurePolicy(spec, cfg) == helmv1.FailurePolicyReinstall
 }
 
 // InstallStatus is the status of chart c whose install Job job is in state.
