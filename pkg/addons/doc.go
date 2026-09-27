@@ -88,6 +88,19 @@ limitations under the License.
 //     never a LIST diff, never keyed on k3sm.io/managed).
 //     A mistaken object is removed with kubectl.
 //
+// HelmCharts: the one indirect path to cluster-admin. The same identity may also
+// create, patch and get helm.k3sm.io HelmChart and HelmChartConfig objects, through a
+// ClusterRole of its own (pkg/rbac's k3sm-manifest-helm, never merged into the
+// bounded list above). A HelmChart dropped here makes the helm controller run a Job
+// as a per-chart ServiceAccount bound to cluster-admin, which installs whatever the
+// chart holds, RBAC and admission objects included. That is the k3s shape (a file in
+// server/manifests already acts as the server). The directory is root-only, so the
+// principals that can author such a chart stay {root on the node, the admin
+// kubeconfig}; what the chart adds is its Job identity, which any pod in the
+// HelmChart's namespace could also run as for the chart's lifetime (docs/user/helm.md
+// says to keep untrusted pods out of that namespace). The escalation-prevention bound
+// above holds for every kind this reconciler applies EXCEPT what a HelmChart installs.
+//
 // It sweeps on start, on every fsnotify event (debounced), and every
 // ManifestSweepInterval as the backstop. A file whose sha256 matches its last settled
 // apply is skipped; the sha256 is also stamped as ManifestChecksumAnnotation on every
