@@ -108,12 +108,12 @@ func TestNodeNameCanonicalizedOnce(t *testing.T) {
 			{"64-byte label", strings.Repeat("a", 64), ""},
 			{"empty", "", ""},
 			{"all spaces", "   ", ""},
-			{"kelvin sign", "K3sm-host", ""},
-			{"long s", "k3ſm-host", ""},
-			{"dotted capital i", "İnfra", ""},
-			{"cyrillic o", "k3sm-hоst", ""},
-			{"nbsp", "k3sm-host ", ""},
-			{"fullwidth", "ｋ3sm-host", ""},
+			{"kelvin sign", "\u212a3sm-host", ""},
+			{"long s", "k3\u017fm-host", ""},
+			{"dotted capital i", "\u0130nfra", ""},
+			{"cyrillic o", "k3sm-h\u043est", ""},
+			{"nbsp", "k3sm-host\u00a0", ""},
+			{"fullwidth", "\uff4b3sm-host", ""},
 		} {
 			got, err := bootstrap.CanonicalNodeName(tc.in)
 			if tc.want == "" {
@@ -183,7 +183,7 @@ func TestNodeNameCanonicalizedOnce(t *testing.T) {
 		}
 
 		// Names with no canonical form at all.
-		for _, n := range []string{"k3sm-host.", "K3sm-host", "k3sm-host\n"} {
+		for _, n := range []string{"k3sm-host.", "\u212a3sm-host", "k3sm-host\n"} {
 			if status, body := post(n); status != http.StatusBadRequest {
 				t.Errorf("invalid %q: status = %d (%s), want 400", n, status, body)
 			}
@@ -229,7 +229,7 @@ func TestNodeNameCanonicalizedOnce(t *testing.T) {
 
 	t.Run("newserver", func(t *testing.T) {
 		t.Parallel()
-		for _, self := range []string{"k3sm_host", "k3sm-host.", "K3sm-host", "k3sm-host\n"} {
+		for _, self := range []string{"k3sm_host", "k3sm-host.", "\u212a3sm-host", "k3sm-host\n"} {
 			_, err := bootstrap.NewServer(nodeNameServerConfig(t, newPeerStoreEnroller("100.64.1.0/24", "100.64.1.1"),
 				bootstrap.NewMemoryNodePasswords(), nil, self))
 			if !errors.Is(err, bootstrap.ErrInvalidNodeName) {
