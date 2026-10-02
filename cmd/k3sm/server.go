@@ -425,6 +425,14 @@ func runServer(args []string) (err error) {
 	if opts.registryPort < 0 || opts.registryPort > 65535 {
 		return fmt.Errorf("--registry-port %d out of range 0-65535 (0 disables)", opts.registryPort)
 	}
+	// The node name is checked ONCE, here, before anything keys on it: from this
+	// point opts.nodeName is canonical for the self-name guard, this node's own
+	// node-password binding, its certificates and its Node object alike.
+	nodeName, nerr := canonicalServerNodeName(opts.nodeName)
+	if nerr != nil {
+		return nerr
+	}
+	opts.nodeName = nodeName
 	if opts.workDir == "" {
 		if workDirErr != nil {
 			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
@@ -1570,4 +1578,20 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := runtimeclass.Provision(ctx, cs); err != nil {
 		logger.Error("provision vm runtime class", "err", err)
 	}
+}
+
+// canonicalServerNodeName checks the server's --node-name. A name with no
+// canonical form is refused, and so is one that only differs from its canonical
+// form (case, surrounding spaces): an operator's explicit flag is never renamed
+// silently, because the node's Node object, certificates and node-password
+// binding would then carry a name the operator did not choose.
+func canonicalServerNodeName(given string) (string, error) {
+	name, err := bootstrap.CanonicalNodeName(given)
+	if err != nil {
+		return "", fmt.Errorf("--node-name: %w", err)
+	}
+	if name != given {
+		return "", fmt.Errorf("--node-name %q is not in canonical form; pass --node-name %s", given, name)
+	}
+	return name, nil
 }
