@@ -255,10 +255,11 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	// (NodePasswordSecretSuffix), so a name the datastore would refuse is refused
 	// HERE, before the store is touched: otherwise it would surface as a store
 	// error, which step 2 answers as "retry later", and a malformed name never
-	// stops being malformed. It sits after the self-name refusal so a near-miss
-	// spelling of this control plane's name (case, surrounding space) is still
-	// answered as that refusal, and before the rate limit so a malformed request
-	// spends no token budget.
+	// stops being malformed. A near-miss spelling of this control plane's name
+	// (case, surrounding space, a trailing dot) never reaches this point: the
+	// canonical-form check at the top of the handler answers it with its own 400
+	// first. It sits before the rate limit so a malformed request spends no
+	// token budget.
 	if err := ValidateNodeName(req.NodeName); err != nil {
 		s.cfg.Logger.Warn("join rejected", "reason", "node-name", "err", err, "remote", r.RemoteAddr)
 		http.Error(w, "join refused: "+err.Error(), http.StatusBadRequest)
