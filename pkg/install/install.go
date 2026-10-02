@@ -1087,12 +1087,18 @@ type System interface {
 	// KillProcess sends SIGKILL to pid. A process that is already gone is
 	// success.
 	KillProcess(pid int) error
+	// BootoutUserDomain boots out uid's per-user launchd domain (launchctl
+	// bootout user/<uid>), stopping every agent launchd runs there and keeps
+	// respawning. A domain that is already gone is success. The subprocess is
+	// bounded by ctx.
+	BootoutUserDomain(ctx context.Context, uid uint32) error
 	// ServiceUser reads the named user's directory-service record. A user that
 	// does not exist is Exists=false with a nil error. Subprocesses are bounded
 	// by ctx.
 	ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error)
 	// DeleteServiceUser deletes the named user's record (dscl . -delete
-	// /Users/<name>). It deletes no group.
+	// /Users/<name>). It deletes no group. The subprocess is bounded by ctx
+	// alone; a kill at ctx's deadline returns an error wrapping ctx.Err().
 	DeleteServiceUser(ctx context.Context, name string) error
 	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping

@@ -217,7 +217,7 @@ func TestPurgeOrderIsBootoutsThenProcessesThenVolumeThenTreesThenUser(t *testing
 	r := newPurgeRig(t, RoleServer, true)
 	r.f.putLoaded("io.k3sm.server", "io.k3sm.stray")
 	r.f.purge.procs = []int{4242}
-	args := r.cfg.withDefaults().argsRecordPath()
+	d := r.cfg.withDefaults()
 	if err := r.run(); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
@@ -226,6 +226,7 @@ func TestPurgeOrderIsBootoutsThenProcessesThenVolumeThenTreesThenUser(t *testing
 		"FlushLo0Aliases:",       // ...ran to its end
 		"LoadedLabels:io.k3sm.",  // then every k3sm job is listed
 		"Bootout:io.k3sm.stray",  // and the one it did not know is booted out
+		"BootoutUserDomain:271",  // _k3sm's own launchd domain is booted out
 		"ProcessesOfUID:271",     // no process may still run as _k3sm
 		"KillProcess:4242",       // the one that would not exit is killed once
 		"datavol.unmount",        // the volume is unmounted
@@ -233,9 +234,11 @@ func TestPurgeOrderIsBootoutsThenProcessesThenVolumeThenTreesThenUser(t *testing
 		// then the trees: the bare mount point the volume left, then the logs
 		"RemoveEntry:"+filepath.Dir(r.cfg.DataRoot)+":"+filepath.Base(r.cfg.DataRoot),
 		"PurgeTree:"+LogDir,
-		"RemoveEntry:"+filepath.Dir(args)+":"+filepath.Base(args), // the files outside them
-		"RemoveAdminKubeconfigContext:",                           // the kubeconfig context
-		"DeleteServiceUser:_k3sm",                                 // and the user last
+		// the files outside them, both arguments records included
+		"RemoveEntry:"+filepath.Dir(d.ServerArgsRecord)+":"+filepath.Base(d.ServerArgsRecord),
+		"RemoveEntry:"+filepath.Dir(d.AgentArgsRecord)+":"+filepath.Base(d.AgentArgsRecord),
+		"RemoveAdminKubeconfigContext:", // the kubeconfig context
+		"DeleteServiceUser:_k3sm",       // and the user last
 	)
 }
 
@@ -340,6 +343,11 @@ func TestPurgeRefusals(t *testing.T) {
 		{name: "a _k3sm process survives SIGKILL", reason: "after SIGKILL: 4242", want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			r.f.purge.procs = []int{4242}
 			r.f.purge.unkillable = map[int]bool{4242: true}
+		}},
+		{name: "a _k3sm process survives SIGKILL after a failed domain bootout", reason: "after SIGKILL: 4242 (launchctl bootout user/271: boom)", want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.procs = []int{4242}
+			r.f.purge.unkillable = map[int]bool{4242: true}
+			r.f.purge.domainBootoutErr = fmt.Errorf("launchctl bootout user/271: %w", errBoom)
 		}},
 		{name: "datavol.Delete fails", reason: "delete the data volume", volume: true, want: errBoom, edit: func(r *purgeRig) {
 			r.disk.SetErr("deletevolume", errBoom)
@@ -561,6 +569,127 @@ func TestPurgeGuardPathRules(t *testing.T) {
 		err := purgePathRules(tc.target, tc.resolved, home)
 		if (err == nil) != tc.ok {
 			t.Errorf("purgePathRules(%s -> %s) = %v, want ok=%v", tc.target, tc.resolved, err, tc.ok)
+		}
+	}
+}
+
+// TestPurgeBootsOutTheServiceUserDomain pins the user-domain step: launchd
+// keeps a per-user domain for the service account and respawns its agents
+// (distnoted among them) after a SIGKILL, so the domain is booted out before
+// the process sweep, and the sweep's verdict, not the bootout's exit, decides.
+func TestPurgeBootsOutTheServiceUserDomain(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(r *purgeRig)
+	}{
+		{"a respawning domain agent is ended by the bootout", func(r *purgeRig) {
+			r.f.purge.procs = []int{4242}
+			r.f.purge.domainProcs = []int{4242}
+		}},
+		{"a bootout error whose domain still ends is tolerated", func(r *purgeRig) {
+			r.f.purge.procs = []int{4242}
+			r.f.purge.domainProcs = []int{4242}
+			r.f.purge.domainBootoutErr = errors.New("Boot-out failed: 5: Input/output error")
+		}},
+		{"a killed process reaped by the re-check is not a survivor", func(r *purgeRig) {
+			r.f.purge.procs = []int{4242}
+			r.f.purge.slowDeath = map[int]int{4242: 1}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPurgeRig(t, RoleServer, false)
+			tc.edit(r)
+			if err := r.run(); err != nil {
+				t.Fatalf("purge: %v\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+			}
+			assertOrder(t, r.f.calls, "LoadedLabels:io.k3sm.", "BootoutUserDomain:271", "ProcessesOfUID:271", "PurgeTree:"+DefaultDataRoot, "DeleteServiceUser:_k3sm")
+		})
+	}
+
+	t.Run("no service uid, no domain bootout", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, false)
+		r.f.purge.user = &ServiceUserRecord{}
+		if err := r.run(); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if r.anyCall("BootoutUserDomain:") {
+			t.Fatalf("a purge with no service user booted out a user domain:\n%s", strings.Join(r.f.calls, "\n"))
+		}
+	})
+
+	for _, out := range []struct {
+		text string
+		gone bool
+	}{
+		{"Boot-out failed: 3: No such process", true},
+		{"Could not find domain for user 271", true},
+		{"Boot-out failed: 113: Could not find specified service", true},
+		{"Boot-out failed: 5: Input/output error", false},
+		{"Boot-out failed: 1: Operation not permitted", false},
+	} {
+		if got := launchctlDomainGone(out.text); got != out.gone {
+			t.Errorf("launchctlDomainGone(%q) = %v, want %v", out.text, got, out.gone)
+		}
+	}
+}
+
+// TestPurgeServiceUserDeletionBound pins the deletion's own bound: dscl waits
+// on opendirectoryd far past purgeCommandTimeout, so the deletion runs under
+// purgeUserDeleteTimeout, and a deletion killed at it is a refusal naming the
+// step that a re-run finishes.
+func TestPurgeServiceUserDeletionBound(t *testing.T) {
+	if purgeUserDeleteTimeout <= purgeCommandTimeout {
+		t.Fatalf("purgeUserDeleteTimeout %s must exceed purgeCommandTimeout %s", purgeUserDeleteTimeout, purgeCommandTimeout)
+	}
+	r := newPurgeRig(t, RoleServer, false)
+	if err := r.run(); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if b := r.f.purge.deleteBound; b <= purgeCommandTimeout || b > purgeUserDeleteTimeout {
+		t.Fatalf("the user deletion ran under a %s bound, want purgeUserDeleteTimeout (%s)", b, purgeUserDeleteTimeout)
+	}
+
+	t.Run("a deletion killed at the bound refuses, and a re-run finishes", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, false)
+		r.f.purge.deleteErr = fmt.Errorf("dscl . -delete /Users/_k3sm: signal: killed: %w", context.DeadlineExceeded)
+		err := r.run()
+		if !errors.Is(err, ErrPurgeRefused) || !strings.Contains(err.Error(), "delete the _k3sm user: not finished within 3m0s") {
+			t.Fatalf("purge = %v, want a refusal naming the user deletion", err)
+		}
+		r.f.purge.deleteErr = nil
+		r.f.calls = nil
+		if err := r.run(); err != nil {
+			t.Fatalf("re-run after a partial purge: %v\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+		}
+		if !r.called("DeleteServiceUser:_k3sm") || !r.f.purge.userDeleted {
+			t.Fatal("the re-run did not delete the service user")
+		}
+	})
+}
+
+// TestPurgeRemovesBothArgsRecordsWithoutTheManifest pins that both arguments
+// records go whatever the manifest names: a server purge's manifest carries
+// only the server record (no agent plist is on disk), and a re-run over a
+// partially purged Mac still removes, and tolerates the absence of, both.
+func TestPurgeRemovesBothArgsRecordsWithoutTheManifest(t *testing.T) {
+	r := newPurgeRig(t, RoleServer, false)
+	d := r.cfg.withDefaults()
+	if slices.ContainsFunc(r.manifest(), func(a artifact) bool { return a.path == d.AgentArgsRecord }) {
+		t.Fatal("the server manifest names the agent record; the case is vacuous")
+	}
+	r.f.files = map[string][]byte{d.ServerArgsRecord: []byte("{}"), d.AgentArgsRecord: []byte("{}")}
+	for run := 1; run <= 2; run++ {
+		r.f.calls = nil
+		if err := r.run(); err != nil {
+			t.Fatalf("purge run %d: %v\ncalls:\n%s", run, err, strings.Join(r.f.calls, "\n"))
+		}
+		for _, p := range []string{d.ServerArgsRecord, d.AgentArgsRecord} {
+			if !r.called("RemoveEntry:" + filepath.Dir(p) + ":" + filepath.Base(p)) {
+				t.Errorf("purge run %d did not remove %s", run, p)
+			}
+			if _, ok := r.f.files[p]; ok {
+				t.Errorf("purge run %d left %s", run, p)
+			}
 		}
 	}
 }

@@ -43,15 +43,20 @@ import (
 //  2. the ordinary uninstall. Any error in it stops the purge: nothing
 //     preserved is removed.
 //  3. every loaded io.k3sm.* launchd job is booted out, and must be gone.
-//  4. no process may still run as the service user: a bounded wait, one
-//     SIGKILL of exactly those pids, and a refusal naming any survivor.
+//  4. the service user's own launchd domain (user/<uid>) is booted out, so
+//     launchd stops respawning the per-user agents it keeps there; then no
+//     process may still run as the service user: a bounded wait, one SIGKILL
+//     of exactly those pids, one short re-check, and a refusal naming any
+//     survivor.
 //  5. the data volume, if one is recorded, through datavol.Delete (unmount,
 //     deleteVolume, keychain item, fstab line, record) — never by deleting
 //     into the mounted tree.
 //  6. the data root and the log dir, through purgeGuard again and PurgeTree.
-//  7. the preserved files outside those trees (the arguments record).
+//  7. the preserved files outside those trees, and both arguments records
+//     whether or not the manifest names them.
 //  8. the k3sm context in the human's kubeconfig, and nothing else in it.
-//  9. the service user record, last, and only if every step above succeeded.
+//  9. the service user record, last, and only if every step above succeeded,
+//     under its own bound (purgeUserDeleteTimeout).
 
 // ErrPurgeNotConfirmed is returned by a purge that was not confirmed with
 // --yes. It is returned before any system call.
@@ -67,8 +72,15 @@ var ErrPurgeRefused = errors.New("purge refused")
 // aborts rather than going on to the next step.
 var ErrPurgeTreeChanged = errors.New("the tree is no longer the directory that was checked")
 
-// purgeCommandTimeout bounds each subprocess the purge runs (launchctl, dscl).
+// purgeCommandTimeout bounds each subprocess the purge runs (launchctl, the
+// dscl reads), except the user deletion.
 const purgeCommandTimeout = 30 * time.Second
+
+// purgeUserDeleteTimeout bounds the service user's deletion (dscl . -delete).
+// dscl waits on opendirectoryd, and on a real Mac the deletion outlived
+// purgeCommandTimeout every time, leaving the record behind; a deletion still
+// running at this bound is killed and the purge refuses, naming the step.
+const purgeUserDeleteTimeout = 3 * time.Minute
 
 // purgeLabelPrefix is the launchd label namespace every k3sm job lives in.
 const purgeLabelPrefix = "io.k3sm."
@@ -82,7 +94,11 @@ var (
 	purgeGrace = 10 * time.Second
 	// purgeKillWait bounds the wait for the killed processes to be reaped.
 	purgeKillWait = 5 * time.Second
-	// purgePoll is the re-check interval for all three waits.
+	// purgeRecheck is the one further wait before a process that outlived
+	// purgeKillWait is a refusal: launchd tearing down the service user's
+	// domain can still be reaping its agents.
+	purgeRecheck = 3 * time.Second
+	// purgePoll is the re-check interval for the polled waits.
 	purgePoll = 200 * time.Millisecond
 )
 
@@ -346,6 +362,16 @@ func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dat
 			return plan, fmt.Errorf("a preserved %v artifact (%s%s) has no purge handler: %w", a.kind, a.path, a.label, ErrPurgeRefused)
 		}
 	}
+	// The arguments records are removed whatever the manifest says. It names
+	// only the configured role's record, and the other role's only while that
+	// role's plist is on disk, so a purge re-run after a partial one (plists
+	// gone) would otherwise leave a record behind for the next install to
+	// carry over.
+	for _, f := range []string{cfg.ServerArgsRecord, cfg.AgentArgsRecord} {
+		if f != "" {
+			files = append(files, f)
+		}
+	}
 	for _, d := range dirs {
 		if !coveredBy(d, dirs) && !slices.Contains(plan.roots, d) {
 			plan.roots = append(plan.roots, d)
@@ -575,14 +601,22 @@ func settleLaunchd(ctx context.Context, sys System) error {
 	return nil
 }
 
-// assertNoServiceProcesses waits for every process running as the service
-// user (real or effective uid) to exit, kills exactly the ones that do not,
-// once, and refuses if any survives. Deleting the data root, or the account,
-// from under a live process is what this prevents.
+// assertNoServiceProcesses boots out the service user's launchd domain, then
+// waits for every process running as the service user (real or effective uid)
+// to exit, kills exactly the ones that do not, once, re-checks once after
+// purgeRecheck, and refuses if any survives. Deleting the data root, or the
+// account, from under a live process is what this prevents.
+//
+// The domain bootout comes first because launchd keeps a per-user domain for
+// the account (distnoted and the other per-user system agents) and respawns
+// its agents after a SIGKILL; a sweep without it refuses on every real Mac. A
+// bootout error is not the verdict, for the same reason as in settleLaunchd:
+// whether a process survives is, and the error only explains a refusal.
 func assertNoServiceProcesses(ctx context.Context, sys System, name string, uid uint32) error {
 	if err := checkServiceUID(name, uid); err != nil {
 		return fmt.Errorf("uninstall --purge: %w", err)
 	}
+	domainErr := sys.BootoutUserDomain(ctx, uid)
 	list := func() ([]string, error) {
 		pids, err := sys.ProcessesOfUID(uid)
 		out := make([]string, 0, len(pids))
@@ -605,14 +639,36 @@ func assertNoServiceProcesses(ctx context.Context, sys System, name string, uid 
 		}
 	}
 	survivors, err := pollUntilEmpty(ctx, purgeKillWait, list)
+	if err == nil && len(survivors) > 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(purgeRecheck):
+		}
+		survivors, err = list()
+	}
 	if err != nil {
 		return fmt.Errorf("uninstall --purge: list the %s processes: %w", name, err)
 	}
 	if len(survivors) > 0 {
-		return fmt.Errorf("uninstall --purge: processes still running as %s after SIGKILL: %s: %w (nothing the uninstall keeps was removed)",
-			name, strings.Join(survivors, ", "), ErrPurgeRefused)
+		cause := ""
+		if domainErr != nil {
+			cause = " (" + domainErr.Error() + ")"
+		}
+		return fmt.Errorf("uninstall --purge: processes still running as %s after SIGKILL: %s%s: %w (nothing the uninstall keeps was removed)",
+			name, strings.Join(survivors, ", "), cause, ErrPurgeRefused)
 	}
 	return nil
+}
+
+// launchctlDomainGone reports whether launchctl's output for a failed
+// `bootout user/<uid>` says the domain is already gone, which is success.
+func launchctlDomainGone(out string) bool {
+	for _, s := range []string{"Could not find", "No such process", "not found"} {
+		if strings.Contains(out, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // pollUntilEmpty calls list until it returns nothing or budget passes, and
@@ -688,7 +744,13 @@ func deleteServiceUser(ctx context.Context, sys System, name, dataRoot string) (
 	if err := checkServiceUser(name, rec, dataRoot); err != nil {
 		return false, err
 	}
-	if err := sys.DeleteServiceUser(ctx, name); err != nil {
+	dctx, cancel := context.WithTimeout(ctx, purgeUserDeleteTimeout)
+	defer cancel()
+	if err := sys.DeleteServiceUser(dctx, name); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return false, fmt.Errorf("delete the %s user: not finished within %s (%v): %w (everything else was removed; re-run to delete the user)",
+				name, purgeUserDeleteTimeout, err, ErrPurgeRefused)
+		}
 		return false, fmt.Errorf("delete the %s user: %w", name, err)
 	}
 	return true, nil

@@ -2441,10 +2441,31 @@ func (darwinSystem) DeleteServiceUser(ctx context.Context, name string) error {
 	if name == "" || strings.ContainsAny(name, "/ ") {
 		return fmt.Errorf("refusing to delete user %q", name)
 	}
+	// Bounded by ctx alone: the purge hands it purgeUserDeleteTimeout, since
+	// dscl waits on opendirectoryd far longer than purgeCommandTimeout.
+	if out, err := exec.CommandContext(ctx, "dscl", ".", "-delete", "/Users/"+name).CombinedOutput(); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("dscl . -delete /Users/%s: %v: %w", name, err, cerr)
+		}
+		return fmt.Errorf("dscl . -delete /Users/%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// BootoutUserDomain boots out uid's per-user launchd domain. See the System
+// interface.
+func (darwinSystem) BootoutUserDomain(ctx context.Context, uid uint32) error {
+	if uid == 0 {
+		return errors.New("refusing to boot out user/0")
+	}
 	ctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
 	defer cancel()
-	if out, err := exec.CommandContext(ctx, "dscl", ".", "-delete", "/Users/"+name).CombinedOutput(); err != nil {
-		return fmt.Errorf("dscl . -delete /Users/%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	domain := "user/" + strconv.FormatUint(uint64(uid), 10)
+	if out, err := exec.CommandContext(ctx, "launchctl", "bootout", domain).CombinedOutput(); err != nil {
+		if launchctlDomainGone(string(out)) {
+			return nil
+		}
+		return fmt.Errorf("launchctl bootout %s: %w: %s", domain, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

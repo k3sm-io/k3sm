@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 )
@@ -46,12 +47,27 @@ type fakePurge struct {
 	purgeErrs map[string]error
 	// user, when set, is the service user record; nil is the k3sm-created one.
 	user *ServiceUserRecord
-	// userDeleted is set by DeleteServiceUser.
+	// userDeleted is set by DeleteServiceUser. deleteErr, when set, is what
+	// DeleteServiceUser returns instead, deleting nothing. deleteBound is the
+	// time left on the context DeleteServiceUser was handed, 0 for none.
 	userDeleted bool
+	deleteErr   error
+	deleteBound time.Duration
 	// procs are the pids running as the service user; unkillable survive
 	// KillProcess.
 	procs      []int
 	unkillable map[int]bool
+	// domainProcs are pids of agents in the service user's launchd domain:
+	// BootoutUserDomain ends them, and until it has run launchd respawns each
+	// one KillProcess kills (the same pid, which is enough for the fake).
+	// domainBootoutErr is what BootoutUserDomain returns; the domain's agents
+	// still end, the error race settleLaunchd also tolerates.
+	domainProcs      []int
+	domainBootedOut  bool
+	domainBootoutErr error
+	// slowDeath[pid] is how many ProcessesOfUID answers a pid still appears in
+	// after it is killed, before it is reaped.
+	slowDeath map[int]int
 	// bootoutErrs makes LaunchctlBootout fail for a label; stuck labels are
 	// accepted for bootout and never leave the loaded list.
 	bootoutErrs map[string]error
@@ -185,16 +201,38 @@ func (f *fakeSystem) LoadedLabels(_ context.Context, prefix string) ([]string, e
 
 func (f *fakeSystem) ProcessesOfUID(uid uint32) ([]int, error) {
 	f.calls = append(f.calls, "ProcessesOfUID:"+strconv.Itoa(int(uid)))
-	return slices.Clone(f.purge.procs), nil
+	out := slices.Clone(f.purge.procs)
+	for pid, n := range f.purge.slowDeath {
+		if n <= 0 || slices.Contains(f.purge.procs, pid) {
+			continue // not killed yet: listed through procs
+		}
+		out = append(out, pid)
+		if f.purge.slowDeath[pid] = n - 1; n == 1 {
+			delete(f.purge.slowDeath, pid)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
-// KillProcess records the kill and removes the pid, unless it is unkillable.
+// KillProcess records the kill and removes the pid, unless it is unkillable
+// or a domain agent launchd respawns. A pid in slowDeath leaves procs but is
+// still listed until its count runs out.
 func (f *fakeSystem) KillProcess(pid int) error {
 	f.calls = append(f.calls, "KillProcess:"+strconv.Itoa(pid))
-	if !f.purge.unkillable[pid] {
+	respawned := !f.purge.domainBootedOut && slices.Contains(f.purge.domainProcs, pid)
+	if !f.purge.unkillable[pid] && !respawned {
 		f.purge.procs = slices.DeleteFunc(f.purge.procs, func(p int) bool { return p == pid })
 	}
 	return nil
+}
+
+// BootoutUserDomain records the bootout and ends the domain's agents.
+func (f *fakeSystem) BootoutUserDomain(_ context.Context, uid uint32) error {
+	f.calls = append(f.calls, "BootoutUserDomain:"+strconv.Itoa(int(uid)))
+	f.purge.domainBootedOut = true
+	f.purge.procs = slices.DeleteFunc(f.purge.procs, func(p int) bool { return slices.Contains(f.purge.domainProcs, p) })
+	return f.purge.domainBootoutErr
 }
 
 func (f *fakeSystem) ServiceUser(_ context.Context, name string) (ServiceUserRecord, error) {
@@ -208,8 +246,14 @@ func (f *fakeSystem) ServiceUser(_ context.Context, name string) (ServiceUserRec
 	return ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: DefaultDataRoot}, nil
 }
 
-func (f *fakeSystem) DeleteServiceUser(_ context.Context, name string) error {
+func (f *fakeSystem) DeleteServiceUser(ctx context.Context, name string) error {
 	f.calls = append(f.calls, "DeleteServiceUser:"+name)
+	if d, ok := ctx.Deadline(); ok {
+		f.purge.deleteBound = time.Until(d)
+	}
+	if f.purge.deleteErr != nil {
+		return f.purge.deleteErr
+	}
 	f.purge.userDeleted = true
 	return nil
 }
@@ -222,7 +266,9 @@ func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser string) error {
 // shrinkPurgeBudgets makes every purge wait end at its first re-check.
 func shrinkPurgeBudgets(t *testing.T) {
 	t.Helper()
-	settle, grace, kill, poll := purgeSettle, purgeGrace, purgeKillWait, purgePoll
-	purgeSettle, purgeGrace, purgeKillWait, purgePoll = 0, 0, 0, 0
-	t.Cleanup(func() { purgeSettle, purgeGrace, purgeKillWait, purgePoll = settle, grace, kill, poll })
+	settle, grace, kill, recheck, poll := purgeSettle, purgeGrace, purgeKillWait, purgeRecheck, purgePoll
+	purgeSettle, purgeGrace, purgeKillWait, purgeRecheck, purgePoll = 0, 0, 0, 0, 0
+	t.Cleanup(func() {
+		purgeSettle, purgeGrace, purgeKillWait, purgeRecheck, purgePoll = settle, grace, kill, recheck, poll
+	})
 }
