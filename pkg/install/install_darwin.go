@@ -2124,7 +2124,11 @@ func (darwinSystem) StatNoFollow(path string) (PathStat, error) {
 }
 
 // statDev is st's device as the unsigned value every comparison here uses.
-func statDev(st *unix.Stat_t) uint64 { return uint64(uint32(st.Dev)) }
+// dev_t is an int32 on darwin. The value is only ever compared for equality,
+// so reinterpreting its 32 bits as unsigned cannot overflow into a wrong answer.
+func statDev(st *unix.Stat_t) uint64 {
+	return uint64(uint32(st.Dev)) // #nosec G115 -- bit reinterpretation of dev_t, equality-compared only
+}
 
 // ReadDataRootMarker reads dir's purge marker off one O_NOFOLLOW descriptor.
 func (darwinSystem) ReadDataRootMarker(dir string) (dataroot.MarkerFacts, error) {
