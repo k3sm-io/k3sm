@@ -41,7 +41,7 @@ and one residual limitation remains (no per-pod uid isolation).
   something other than a symlink already sits at that path, install refuses to replace it and says so.
   The directory holding the launcher must be owned by `root` and not writable by anyone else,
   because root's PATH searches it: anyone who can write there could leave a `k3sm` of their own for
-  a later `sudo k3sm …` to run. A Mac with an Intel-prefix Homebrew usually has a `/usr/local/bin`
+  a later `sudo k3sm …` to run. A Mac whose Homebrew uses the x86_64 `/usr/local` prefix usually has a `/usr/local/bin`
   owned by the user who installed Homebrew, so install stops before writing anything and prints the
   exact `chown`/`chmod` to run (`sudo chown root:wheel /usr/local/bin && sudo chmod 755 /usr/local/bin`).
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels. The control plane's plist is `0600`

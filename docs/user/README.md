@@ -33,7 +33,7 @@ directory is the front door to the user-facing docs; read them roughly in the jo
 15. [Linux images](vm-runtimeclass.md) describes the intended isolation boundary for untrusted
     workloads; it boots `linux/arm64` images per Pod today.
 16. [MLX serving](mlx-quickstart.md) walks through serving a model on the Mac's GPU through an
-    OpenAI-compatible endpoint.
+    `/v1/chat/completions` endpoint.
 17. [Limitations](limitations.md) lists the gaps.
 18. [Troubleshooting](troubleshooting.md) covers the node's own daemon logs, common failures, and
     recovery.

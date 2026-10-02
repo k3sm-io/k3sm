@@ -70,12 +70,12 @@ release engineering. What ships:
   is **not** a CNCF `[Conformance]` pass (the default path, which the suite targets, runs no Linux
   containers). [`docs/conformance-profile.md`](docs/conformance-profile.md) is the self-assessment,
   mapping targeted feature classes to a passing criterion or a documented ceiling.
-- **Native Apple-Silicon ML serving with MLX (the NVIDIA-GPU-Operator analog for Mac).** Schedule
+- **Native Apple-Silicon ML serving with MLX (the GPU-operator analog for Mac).** Schedule
   and serve ML models on Apple GPUs / unified memory with first-class Kubernetes semantics: an
   **`MLXModel` CRD** (`mlx.k3sm.io/v1alpha1`), an `mlx.k3sm.io/gpu` **extended resource**, and an
   in-binary operator that reconciles a model to a StatefulSet + Service serving an
-  OpenAI-compatible API. *(22 of 22 checks pass on an
-  Apple GPU, including a Hugging Face weight
+  `/v1/chat/completions` API. *(22 of 22 checks pass on an
+  Apple GPU, including a model-hub weight
   download under a default-deny Seatbelt profile and a clean deletion)*
 
 ## v0.1.0, the public release (shipped 2026-09-01)
@@ -98,7 +98,7 @@ release engineering. What ships:
   published performance figures and the remaining gaps ship in v0.2, below)*
 - linux/amd64 images do not run on any path yet. Running them needs Rosetta-for-Linux
   translation inside the guest, cut from the first release so the arm64 path could
-  ship on its own. There is no emulation fallback, because no qemu exists for a Darwin host. An
+  ship on its own. There is no emulation fallback, because no user-mode x86 emulator exists for a Darwin host. An
   amd64-only image is refused at pull with a no-matching-platform error rather than started and
   left to crash, and a node that cannot translate does not advertise that it can.
   *(scheduled for a v0.1.x follow-up)*
@@ -123,8 +123,8 @@ v0.1.1 followed on 2026-09-02; see [CHANGELOG.md](CHANGELOG.md) for what it adds
 - **ANE.** Apple Neural Engine serving, pending a stable public API (CoreML-only today).
 - **DRA.** Dynamic Resource Allocation for GPUs, once extended resources have shipped.
 - **A serving fleet for MLX models.** Multi-model, multi-worker inference above `MLXModel`: an
-  OpenAI-compatible frontend, worker discovery, and routing that prefers the worker already
-  holding a request's prefix. The control plane is the upstream NVIDIA Dynamo serving stack
+  `/v1/chat/completions` frontend, worker discovery, and routing that prefers the worker already
+  holding a request's prefix. The control plane is an upstream open-source inference-serving stack
   (Apache-2.0) run as `vm` Pods, with the workers native beneath it on the GPU. It is the layer
   the two bullets below would attach to: distributed inference is what a fleet would route
   across, and autoscaling is a planner sitting above one. `MLXModel` stays the one-object way to
