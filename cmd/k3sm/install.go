@@ -93,6 +93,7 @@ func runInstall(args []string) error {
 		DataVolume:        volume,
 		RemoveOldDataRoot: opts.removeOldDataRoot,
 		MeshIP:            opts.meshIP,
+		SecretsEncryption: opts.secretsEncryption,
 		Logger:            logger,
 	})
 }
@@ -123,6 +124,7 @@ type installFlags struct {
 	dataVolumeEncrypt bool
 	removeOldDataRoot bool
 	meshIP            string
+	secretsEncryption bool
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -143,6 +145,7 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.dataVolumeEncrypt, "data-volume-encrypt", false, "encrypt the data volume with a random passphrase kept in the System keychain (a volume k3sm creates only)")
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
+	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
@@ -198,6 +201,7 @@ var serverOnlyInstallFlags = []string{
 	"data-volume-size",
 	"data-volume-encrypt",
 	"remove-old-data-root",
+	"secrets-encryption",
 }
 
 // agentOnlyInstallFlags describe a JOIN and mean nothing on a control plane.

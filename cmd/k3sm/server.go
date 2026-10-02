@@ -485,6 +485,18 @@ func runServer(args []string) (err error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Secrets encryption at rest, decided from the credential pair under the
+	// work dir BEFORE any CA-bundle import or datastore start: a datastore
+	// opened under the wrong key (or none) serves Secrets it cannot read, or
+	// writes plaintext beside ciphertext. A refusal PARKS, for the crash-loop
+	// park's reason: launchd would respawn an exit straight back into it.
+	haDatastore := opts.datastoreEndpoint != "" || opts.serverJoin
+	encryptionConfig, encErr := executor.EncryptionAtStart(executor.OSEncryptionStore{}, opts.workDir, haDatastore, uint32(os.Geteuid()))
+	if encErr != nil {
+		logger.Error("refusing to start the control plane: "+encErr.Error(),
+			"key-file", executor.EncryptionConfigPath(opts.workDir), "status-with", "k3sm secrets-encrypt status")
+		return parkWhileEncryptionRefused(ctx, opts.workDir, haDatastore, uint32(os.Geteuid()), crashLoopPollInterval, logger)
+	}
 	if rec := breaker.load(); rec.Tripped() {
 		last, _ := rec.Last()
 		logger.Error(parkReason(last), "path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
@@ -514,6 +526,10 @@ func runServer(args []string) (err error) {
 	// requested without the endpoint — never a silent per-server SQLite (split-brain).
 	cfg.DatastoreEndpoint = opts.datastoreEndpoint
 	cfg.ServerJoin = opts.serverJoin
+	cfg.EncryptionProviderConfig = encryptionConfig
+	if encryptionConfig != "" {
+		logger.Info("secrets encryption at rest is on", "provider", executor.EncryptionProviderName, "config", encryptionConfig)
+	}
 	if opts.datastoreEndpoint != "" || opts.serverJoin {
 		logger.Info("HA datastore mode: kine→Postgres (shared multi-writer datastore); scheduler/KCM leader-elected", "server-join", opts.serverJoin)
 	}

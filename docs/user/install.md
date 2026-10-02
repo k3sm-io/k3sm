@@ -132,6 +132,66 @@ Every channel manages the same `/Library/k3sm`. Once more than one has shipped, 
 `sudo k3sm install` after switching so the daemons run the newly delivered binary, or run
 `sudo k3sm uninstall` first for a clean cutover.
 
+## Secrets Encryption at Rest
+
+Secrets are stored unencrypted in the datastore by default. To encrypt them at rest, ask for it
+on the install that creates the cluster:
+
+```sh
+sudo k3sm install --secrets-encryption
+```
+
+The install generates a random 32-byte key on this Mac and writes two files before the control
+plane first starts, both owned by `_k3sm` with mode `0600` in a `0700` directory:
+
+- `/var/lib/k3sm/server/cred/encryption-config.yaml`, the API server's encryption configuration,
+  which holds the key,
+- `/var/lib/k3sm/server/cred/encryption-config.sha256`, a fingerprint of that key.
+
+The API server then encrypts every Secret it writes with the `secretbox` provider
+(XSalsa20-Poly1305). k3s offers `secretbox` too; its default is `aescbc`, which the Kubernetes
+documentation no longer recommends. The configuration lists no plaintext (`identity`) provider, so
+the API server does not read or write unencrypted Secrets. Other resources, such as ConfigMaps, are
+not encrypted.
+
+Check the state at any time:
+
+```sh
+sudo k3sm secrets-encrypt status
+```
+
+It prints `enabled`, `disabled`, or `refused` with the reason, the provider, the configuration
+path and its mode. It never prints the key. It exits non-zero when the files are in a state that
+stops the control plane from starting.
+
+**Back up the key with the datastore.** Copy `/var/lib/k3sm/server/cred` every time you back up
+`state.db` or take a snapshot, and keep the two copies together.
+
+- Losing the key makes every Secret unreadable, including node passwords and bootstrap tokens.
+- A snapshot does not contain the key.
+- Restoring a snapshot taken under another key, or before encryption was enabled, leaves Secrets
+  unreadable.
+
+**There is no way back.** An older k3sm, or this one with the files removed, cannot read the
+encrypted Secrets. This release has no key rotation and no command to decrypt the datastore.
+
+**Refusals.** The install stops, before it changes anything, when:
+
+- this data root already holds a datastore (an existing cluster cannot be switched over in this
+  release; encryption is for a fresh install only),
+- the server is configured to join another server or to use an external datastore (every server
+  would need the same key, and k3sm does not distribute one),
+- the install is a worker (`--agent`).
+
+A later `sudo k3sm install` without the option keeps the key and the encryption. Passing the
+option again once the cluster has started is refused. To enable encryption on a cluster that has
+never held workloads, remove the data root and reinstall with the option. The `.bak` copies k3sm
+keeps beside `state.db` hold encrypted Secrets and are useless without the key. The control
+plane refuses to start, and stays parked until the files are fixed, when the configuration is
+present without its fingerprint, when the fingerprint is present without the configuration, or
+when the two do not match. Restore both files from the backup taken with `state.db`. `k3sm
+uninstall` keeps both files with the rest of your cluster data.
+
 ## Uninstalling
 
 ```sh

@@ -180,6 +180,14 @@ type Config struct {
 	// here is conformance-surface + defense-in-depth, NOT the privilege boundary
 	// (the foreign-uid VAP + Seatbelt stay that).
 	PSAEnforceBaseline bool
+	// EncryptionProviderConfig, when non-empty, is the path of the apiserver
+	// EncryptionConfiguration, passed as --encryption-provider-config so Secrets
+	// are encrypted at rest. The caller sets it only after EncryptionAtStart has
+	// accepted the credential pair under the work dir. It is a single-server
+	// option: Validate refuses it together with ServerJoin or a
+	// DatastoreEndpoint, because every server of an HA control plane would need
+	// the same key and nothing distributes one.
+	EncryptionProviderConfig string
 	// LeaderElect, when non-nil, forces the scheduler + controller-manager --leader-elect
 	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (a Postgres
 	// multi-writer datastore — so only one server's scheduler/KCM is active; two active
@@ -364,6 +372,9 @@ func (c Config) Validate() error {
 	}
 	if c.RootCAFile != "" && !c.meshServingCert() {
 		return ErrRootCAWithoutServingCert
+	}
+	if c.EncryptionProviderConfig != "" && c.isHA() {
+		return ErrEncryptionHA
 	}
 	return nil
 }

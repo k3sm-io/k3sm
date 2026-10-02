@@ -816,6 +816,12 @@ func apiServerArgs(cfg Config) []string {
 	if cfg.meshServingCert() {
 		args = append(args, "--tls-cert-file", cfg.ServingCertFile, "--tls-private-key-file", cfg.ServingKeyFile)
 	}
+	// Secrets encryption at rest: present only when the start accepted the
+	// credential pair (see EncryptionAtStart). The path names a file; the key
+	// itself never reaches the argv.
+	if cfg.EncryptionProviderConfig != "" {
+		args = append(args, "--encryption-provider-config", cfg.EncryptionProviderConfig)
+	}
 	return args
 }
 
