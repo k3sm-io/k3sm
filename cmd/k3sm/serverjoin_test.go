@@ -42,8 +42,8 @@ func TestNodePasswordSharedAcrossServersInHA(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	cs := fake.NewClientset() // one fake datastore, two stores (server A + server B)
-	a := newSecretNodePasswords(cs)
-	b := newSecretNodePasswords(cs)
+	a := newSecretNodePasswords(cs, nil)
+	b := newSecretNodePasswords(cs, nil)
 
 	// A binds worker-1; B (sharing the datastore) verifies the SAME password and rejects
 	// a different one.

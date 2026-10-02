@@ -216,3 +216,51 @@ func TestAgentWaitsOutARateLimitedJoin(t *testing.T) {
 		}
 	})
 }
+
+// TestAgentWaitsOutANodePasswordStoreOutage: a 503 is the control plane failing
+// to reach a verdict on this node's name binding (its datastore did not answer),
+// not a refusal of this node, so a start waits it out under the same grace as a
+// rate-limited join instead of failing and being counted as a crash.
+func TestAgentWaitsOutANodePasswordStoreOutage(t *testing.T) {
+	unavailable := func(wait time.Duration) error {
+		return &bootstrap.JoinUnavailableError{
+			RetryAfter: wait,
+			Status:     "503 Service Unavailable",
+			Reason:     "join refused: the control plane could not check this node's name binding; retry in 5s",
+		}
+	}
+
+	t.Run("a 503 is retried within the start", func(t *testing.T) {
+		calls := 0
+		join := func(context.Context, bootstrap.JoinOptions) (*bootstrap.JoinResult, error) {
+			calls++
+			if calls == 1 {
+				return nil, unavailable(time.Millisecond)
+			}
+			return &bootstrap.JoinResult{NodeName: "worker-1"}, nil
+		}
+		res, err := awaitJoin(context.Background(), join, bootstrap.JoinOptions{}, quietLogger())
+		if err != nil {
+			t.Fatalf("a join the server could not decide must not fail the start: %v", err)
+		}
+		if res == nil || calls != 2 {
+			t.Errorf("result = %+v after %d attempts, want the second attempt's join", res, calls)
+		}
+	})
+
+	t.Run("a persistent 503 is bounded and says what it is", func(t *testing.T) {
+		restore := joinRateLimitGrace
+		joinRateLimitGrace = 30 * time.Millisecond
+		t.Cleanup(func() { joinRateLimitGrace = restore })
+		join := func(context.Context, bootstrap.JoinOptions) (*bootstrap.JoinResult, error) {
+			return nil, unavailable(10 * time.Millisecond)
+		}
+		_, err := awaitJoin(context.Background(), join, bootstrap.JoinOptions{}, quietLogger())
+		if !errors.Is(err, bootstrap.ErrJoinUnavailable) {
+			t.Fatalf("err = %v, want ErrJoinUnavailable once the grace is spent", err)
+		}
+		if strings.Contains(err.Error(), "token per Mac") {
+			t.Errorf("a datastore outage was explained as the rate limit: %v", err)
+		}
+	})
+}

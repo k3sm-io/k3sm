@@ -136,6 +136,31 @@ for the cluster the node is already in is ignored, so leaving one in a start scr
 The node certificate an agent receives at join is valid for one year. Nothing renews it in place, so
 renewing it means rejoining with a fresh token before it expires.
 
+### Node-password bindings
+
+The first join for a node name binds that name to the node's node-password, and every later join for
+the name must present the same password. That binding is what stops another holder of a join token
+from claiming an existing node's name. The server keeps each binding in the datastore as a
+`kube-system` Secret named `<node>.node-password.k3sm`, holding only a hash of the password, so
+bindings survive a server restart.
+
+- After upgrading the server to this version, or after its datastore is wiped, workers that joined
+  earlier have no binding until their next join. Rotate any join token you suspect has leaked, and
+  rejoin the workers you care about so their names are bound again.
+- Rolling back to an older version leaves the Secrets in place. A later upgrade picks them up again.
+- If the server logs that its own node-password file no longer matches the binding the datastore
+  holds, restore the original `server.node-password` file to `/var/lib/k3sm/server/` and restart
+  the server. If that file is gone, delete the server's binding and restart, and the server binds
+  its name again:
+
+  ```sh
+  kubectl -n kube-system delete secret <node>.node-password.k3sm
+  sudo launchctl kickstart -k system/io.k3sm.server
+  ```
+
+- A worker refused with a node-password mismatch after a reinstall is recovered the same way: delete
+  its Secret on the server, then rejoin it with a fresh token.
+
 ### If a node's address changes
 
 The endpoint a node publishes is the address its peers dial to open a wireguard handshake, and on a

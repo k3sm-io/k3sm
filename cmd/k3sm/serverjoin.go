@@ -93,12 +93,13 @@ func (b *liveBundleSource) SealedBundle(_ context.Context) ([]byte, error) {
 }
 
 // bootstrapStateNamespace / *Secret* names: k3sm's datastore-backed bootstrap state
-// lives as kube-system Secrets, which ride the shared Postgres in HA (the k3s
-// bootstrap-key model). A name bound on server A is therefore visible on server B.
+// lives as kube-system Secrets in the cluster datastore, which in HA is the shared
+// Postgres (the k3s bootstrap-key model). A name bound on server A is therefore
+// visible on server B, and on any server it survives a restart.
 const (
 	bootstrapStateNamespace   = "kube-system"
 	bootstrapBundleSecretName = "k3sm-bootstrap"
-	nodePasswordSecretSuffix  = ".node-password.k3sm"
+	nodePasswordSecretSuffix  = bootstrap.NodePasswordSecretSuffix
 	nodePasswordHashKey       = "hash"
 )
 
@@ -118,26 +119,60 @@ func publishBootstrapBundle(ctx context.Context, cs kubernetes.Interface, sealed
 	return err
 }
 
-// secretNodePasswords is a datastore-backed bootstrap.NodePasswordStore: each node's
-// bcrypt-hashed node-password is a kube-system Secret (mirroring k3s's
-// <node>.node-password.k3s), so the first-write-wins anti-impersonation binding is
-// SHARED across HA servers (a name bound on server A is enforced on server B — both read
-// the one Postgres). The per-process MemoryNodePasswords binds independently per server,
-// which voids anti-impersonation under HA.
+// serverNodePasswordStore is THE node-password store every control-plane server
+// uses, single server and HA alike (the k3s <node>.node-password.k3s shape).
+//
+// It takes no HA input on purpose. The binding is what stops a join-token holder
+// from claiming an existing node's name, so it has to outlive this process: an
+// in-memory store came back EMPTY after every restart, and until each worker
+// rejoined, any token holder could bind that worker's name first. Keeping it in
+// the datastore makes a restart a non-event for the binding, and in HA it is also
+// what makes a name bound on one server enforced on its siblings.
+//
+// There is no backfill. A worker that joined before this store existed (an
+// upgrade from the in-memory store) or before the datastore was wiped has no
+// binding until its next join, and nothing here invents one: a hash for a
+// password this server never saw cannot be minted.
+//
+// It must be built after the apiserver is healthy (it reads and writes Secrets
+// through cs) and before this node's own enroll and the join listener, which
+// both bind through it.
+func serverNodePasswordStore(cs kubernetes.Interface, logger *slog.Logger) bootstrap.NodePasswordStore {
+	logger.Info("node-password bindings are datastore-backed and survive a restart; a worker that joined before this version has no binding until its next join",
+		"namespace", bootstrapStateNamespace, "secretSuffix", nodePasswordSecretSuffix)
+	return newSecretNodePasswords(cs, logger)
+}
+
+// secretNodePasswords is the datastore-backed bootstrap.NodePasswordStore: each
+// node's bcrypt-hashed node-password is a kube-system Secret named
+// <node>.node-password.k3sm (mirroring k3s's <node>.node-password.k3s), so the
+// first-write-wins anti-impersonation binding survives a server restart and is
+// SHARED across HA servers (a name bound on server A is enforced on server B, both
+// read the one datastore).
 type secretNodePasswords struct {
 	secrets corev1client.SecretInterface
+	logger  *slog.Logger
 }
 
 // newSecretNodePasswords builds the datastore-backed node-password store over the
-// kube-system Secrets of cs.
-func newSecretNodePasswords(cs kubernetes.Interface) *secretNodePasswords {
-	return &secretNodePasswords{secrets: cs.CoreV1().Secrets(bootstrapStateNamespace)}
+// kube-system Secrets of cs. A nil logger discards.
+func newSecretNodePasswords(cs kubernetes.Interface, logger *slog.Logger) *secretNodePasswords {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &secretNodePasswords{secrets: cs.CoreV1().Secrets(bootstrapStateNamespace), logger: logger}
 }
 
 // Ensure binds nodeName→hash(password) on first sight (Create) and verifies on every
 // subsequent call (constant-time bcrypt). A Create that races another server resolves to
 // AlreadyExists → it re-reads and verifies, so the binding is first-write-wins across the
 // shared datastore.
+//
+// Only a hash that does not match returns ErrNodePasswordMismatch. Every datastore
+// fault (a failed Get, a failed Create) comes back as an ordinary wrapped error, so a
+// caller can tell "this is not that node" from "the datastore did not answer" and
+// retry only the latter. A Create that committed but reported an error is safe to
+// retry with the same password: the retry finds the Secret and verifies against it.
 func (s *secretNodePasswords) Ensure(ctx context.Context, nodeName, password string) error {
 	if nodeName == "" || password == "" {
 		return fmt.Errorf("bootstrap: node-password Ensure needs a non-empty name and password")
@@ -154,7 +189,10 @@ func (s *secretNodePasswords) Ensure(ctx context.Context, nodeName, password str
 			Data:       map[string][]byte{nodePasswordHashKey: hash},
 		}, metav1.CreateOptions{})
 		if cerr == nil {
-			return nil // we bound it (first write wins)
+			// We bound it (first write wins). The name only: never the password or
+			// its hash.
+			s.logger.Info("bound a node name to its node-password", "node", nodeName)
+			return nil
 		}
 		if !apierrors.IsAlreadyExists(cerr) {
 			return fmt.Errorf("create node-password secret: %w", cerr)

@@ -85,6 +85,11 @@ type ServerConfig struct {
 	Now func() time.Time
 }
 
+// nodePasswordStoreRetryAfterSeconds is the Retry-After a join is answered with
+// when the node-password store could not give a verdict. A transient datastore
+// fault clears in seconds; the joining agent waits this long before it asks again.
+const nodePasswordStoreRetryAfterSeconds = 5
+
 // Server is the supervisor-side bootstrap endpoint a joining worker hits over a
 // mesh-reachable TLS listener that presents [serving-leaf, ClusterCA] (so the join
 // client's CA-hash pin verifies). It authenticates the join token, binds the
@@ -246,6 +251,24 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1a'. THE NAME MUST BE BINDABLE. It becomes the binding's Secret name
+	// (NodePasswordSecretSuffix), so a name the datastore would refuse is refused
+	// HERE, before the store is touched: otherwise it would surface as a store
+	// error, which step 2 answers as "retry later", and a malformed name never
+	// stops being malformed. It sits after the self-name refusal so a near-miss
+	// spelling of this control plane's name (case, surrounding space) is still
+	// answered as that refusal, and before the rate limit so a malformed request
+	// spends no token budget.
+	if err := ValidateNodeName(req.NodeName); err != nil {
+		s.cfg.Logger.Warn("join rejected", "reason", "node-name", "err", err, "remote", r.RemoteAddr)
+		http.Error(w, "join refused: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.NodePassword == "" {
+		http.Error(w, "join request missing nodePassword", http.StatusBadRequest)
+		return
+	}
+
 	// 1b. PER-TOKEN RATE LIMIT. Everything below this line is the expensive half
 	// of a join — the node-password bind, the CSR parse and policy checks, the
 	// mesh enroll's index carve and the release that gives it back, and up to two
@@ -277,9 +300,24 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. node-password (anti-impersonation: first-write-wins name binding).
+	//
+	// FAIL-CLOSED either way, but the two failures are told apart. A mismatch is
+	// a verdict about this caller: it is not the node that holds the name, and a
+	// retry changes nothing (403). Any other error is the store failing to answer
+	// (a busy or restarting datastore): nothing was decided about the caller, so
+	// it is told to come back (503 + Retry-After) rather than refused, and no
+	// join proceeds without a verdict.
 	if err := s.cfg.NodePasswords.Ensure(r.Context(), req.NodeName, req.NodePassword); err != nil {
-		s.cfg.Logger.Warn("join rejected", "reason", "node-password", "node", req.NodeName, "err", err)
-		http.Error(w, "node-password rejected", http.StatusForbidden)
+		if errors.Is(err, ErrNodePasswordMismatch) {
+			s.cfg.Logger.Warn("join rejected", "reason", "node-password", "node", req.NodeName, "err", err)
+			http.Error(w, "node-password rejected", http.StatusForbidden)
+			return
+		}
+		s.cfg.Logger.Warn("join rejected", "reason", "node-password-store-unavailable", "node", req.NodeName,
+			"retryAfterSeconds", nodePasswordStoreRetryAfterSeconds, "err", err)
+		w.Header().Set("Retry-After", strconv.Itoa(nodePasswordStoreRetryAfterSeconds))
+		http.Error(w, fmt.Sprintf("join refused: the control plane could not check this node's name binding; retry in %ds", nodePasswordStoreRetryAfterSeconds),
+			http.StatusServiceUnavailable)
 		return
 	}
 
