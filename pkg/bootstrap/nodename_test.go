@@ -105,7 +105,7 @@ func TestNodeNameCanonicalizedOnce(t *testing.T) {
 			{"label ending with a hyphen", "k3sm-.host", ""},
 			{"underscore", "k3sm_host", ""},
 			{"254 bytes", name254, ""},
-			{"64-byte label", strings.Repeat("a", 64), ""},
+			{"64-byte label (Node names have no per-label cap)", strings.Repeat("a", 64), strings.Repeat("a", 64)},
 			{"empty", "", ""},
 			{"all spaces", "   ", ""},
 			{"kelvin sign", "\u212a3sm-host", ""},

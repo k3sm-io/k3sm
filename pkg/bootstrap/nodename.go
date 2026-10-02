@@ -47,9 +47,9 @@ const maxNodeNameQuote = 64
 //  3. Only ASCII spaces are trimmed from the ends.
 //  4. ASCII letters are lowercased byte by byte.
 //  5. The result must be a non-empty DNS-1123 subdomain of at most 253 bytes,
-//     which is the rule the Kubernetes Node object itself enforces, with every
-//     label at most 63 bytes, the host-name rule its certificates carry. A
-//     trailing dot is refused with its own message because it is the most
+//     which is exactly the rule the Kubernetes Node object enforces; no
+//     stricter per-label cap is added, so every name upstream accepts is
+//     accepted here. A trailing dot is refused with its own message because it is the most
 //     common way a fully-qualified hostname slips in.
 //
 // This is the canonical form only. Whether a name is short enough to also
@@ -82,13 +82,6 @@ func CanonicalNodeName(name string) (string, error) {
 	}
 	if errs := validation.IsDNS1123Subdomain(canon); len(errs) > 0 {
 		return "", fmt.Errorf("%w: %s is not a lowercase DNS-1123 subdomain", ErrInvalidNodeName, quoteNodeName(canon))
-	}
-	// IsDNS1123Subdomain checks the whole name only. A node name is also a host
-	// name in the node's certificates, where each label is capped at 63 bytes.
-	for label := range strings.SplitSeq(canon, ".") {
-		if len(label) > validation.DNS1123LabelMaxLength {
-			return "", fmt.Errorf("%w: a label of %s is longer than %d bytes", ErrInvalidNodeName, quoteNodeName(canon), validation.DNS1123LabelMaxLength)
-		}
 	}
 	return canon, nil
 }
