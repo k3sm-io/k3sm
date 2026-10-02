@@ -321,6 +321,9 @@ func TestPurgeRefusals(t *testing.T) {
 		{name: "the service user is not the account k3sm created", reason: "not the account k3sm created", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			r.f.purge.user.RealName = "Someone Else"
 		}},
+		{name: "a legacy-shaped service user with another home", reason: "not the data root", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.user.RealName, r.f.purge.user.Home = DefaultServiceUser, "/Users/alice"
+		}},
 		{name: "the service uid is root", reason: "outside the range", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			r.f.purge.user.UID = 0
 		}},
@@ -479,6 +482,61 @@ func TestPurgeSettleToleratesABootoutErrorThatUnloads(t *testing.T) {
 }
 
 // TestPurgeGuardPathRules pins the pure path half of the guard.
+func TestPurgeServiceUserIdentity(t *testing.T) {
+	const name = DefaultServiceUser
+	current := ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: DefaultDataRoot}
+	for _, tc := range []struct {
+		name   string
+		edit   func(*ServiceUserRecord)
+		reason string // "" = accepted
+	}{
+		{name: "the current shape", edit: func(*ServiceUserRecord) {}},
+		{name: "a legacy RealName equal to the account name", edit: func(r *ServiceUserRecord) { r.RealName = name }},
+		{name: "a legacy empty RealName", edit: func(r *ServiceUserRecord) { r.RealName = "" }},
+		{name: "a legacy RealName with the wrong home", reason: "not the data root", edit: func(r *ServiceUserRecord) {
+			r.RealName, r.Home = name, "/Users/alice"
+		}},
+		{name: "a legacy RealName with the wrong shell", reason: "shell", edit: func(r *ServiceUserRecord) {
+			r.RealName, r.Shell = name, "/bin/zsh"
+		}},
+		{name: "a legacy RealName with a login uid", reason: "outside the range", edit: func(r *ServiceUserRecord) {
+			r.RealName, r.UID = name, 501
+		}},
+		{name: "a legacy RealName with uid 0", reason: "outside the range", edit: func(r *ServiceUserRecord) {
+			r.RealName, r.UID = name, 0
+		}},
+		{name: "a human-looking RealName", reason: "(or, for an account an older install created, empty or \"_k3sm\")", edit: func(r *ServiceUserRecord) {
+			r.RealName = "Alice Example"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := current
+			tc.edit(&rec)
+			err := checkServiceUser(name, rec, DefaultDataRoot)
+			if tc.reason == "" {
+				if err != nil {
+					t.Fatalf("checkServiceUser = %v, want accepted", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrPurgeRefused) || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("checkServiceUser = %v, want ErrPurgeRefused mentioning %q", err, tc.reason)
+			}
+		})
+	}
+
+	t.Run("a purge deletes the account an older install created", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, false)
+		r.f.purge.user.RealName = DefaultServiceUser
+		if err := r.run(); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if !r.called("DeleteServiceUser:" + DefaultServiceUser) {
+			t.Fatalf("the legacy service user was not deleted:\n%s", strings.Join(r.f.calls, "\n"))
+		}
+	})
+}
+
 func TestPurgeGuardPathRules(t *testing.T) {
 	home := []string{"/Users/alice"}
 	for _, tc := range []struct {

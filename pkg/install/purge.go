@@ -409,11 +409,21 @@ func coveredBy(p string, dirs []string) bool {
 }
 
 // checkServiceUser refuses a user record that is not the one EnsureServiceUser
-// creates: an account that merely shares the name is never deleted.
+// creates: an account that merely shares the name is never deleted. Two
+// RealName shapes are k3sm's: the current serviceUserRealName, and the legacy
+// shape an older install left (no RealName set, which dscl reports as empty
+// or as the account name). The legacy shape carries no k3sm-specific marker,
+// so it is accepted only with a uid in the hidden range EnsureServiceUser
+// allocates from; the shell and home checks below apply to both shapes.
 func checkServiceUser(name string, rec ServiceUserRecord, dataRoot string) error {
+	legacy := rec.RealName == "" || rec.RealName == name
 	switch {
-	case rec.RealName != serviceUserRealName:
-		return fmt.Errorf("the %s user's RealName is %q, not %q; it is not the account k3sm created: %w", name, rec.RealName, serviceUserRealName, ErrPurgeRefused)
+	case rec.RealName != serviceUserRealName && !legacy:
+		return fmt.Errorf("the %s user's RealName is %q, not %q (or, for an account an older install created, empty or %q); it is not the account k3sm created: %w",
+			name, rec.RealName, serviceUserRealName, name, ErrPurgeRefused)
+	case legacy && (rec.UID < systemUIDFloor || rec.UID > systemUIDCeil):
+		return fmt.Errorf("the %s user's RealName is %q, not %q, and its uid %d is outside the range [%d,%d] an older install created it in; it is not the account k3sm created: %w",
+			name, rec.RealName, serviceUserRealName, rec.UID, systemUIDFloor, systemUIDCeil, ErrPurgeRefused)
 	case rec.Shell != serviceUserShell:
 		return fmt.Errorf("the %s user's shell is %q, not %s; it is not the account k3sm created: %w", name, rec.Shell, serviceUserShell, ErrPurgeRefused)
 	case filepath.Clean(rec.Home) != filepath.Clean(dataRoot):
