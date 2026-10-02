@@ -101,6 +101,14 @@ func ciScripts(t *testing.T) map[string]string {
 // goMod writes no go.mod at all.
 func sandboxCI(t *testing.T, realScript, goMod string, extra map[string]string) (out string, ok bool) {
 	t.Helper()
+	return sandboxCIEnv(t, realScript, goMod, extra, append(os.Environ(), "GOWORK=off", "GOFLAGS="))
+}
+
+// sandboxCIEnv is sandboxCI with the script's environment given in full: env
+// REPLACES the inherited one rather than extending it, so a caller controls
+// exactly which PATH, GOPATH and toolchain the script sees.
+func sandboxCIEnv(t *testing.T, realScript, goMod string, extra map[string]string, env []string) (out string, ok bool) {
+	t.Helper()
 	realHack := filepath.Dir(realScript)
 
 	sandbox := t.TempDir()
@@ -138,7 +146,7 @@ func sandboxCI(t *testing.T, realScript, goMod string, extra map[string]string) 
 	// from $0, and dirname does not resolve the symlink.
 	cmd := exec.Command("/usr/bin/env", "bash", filepath.Join(hack, "ci.sh"))
 	cmd.Dir = sandbox
-	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=")
+	cmd.Env = env
 	done := make(chan struct{})
 	var raw []byte
 	var runErr error
