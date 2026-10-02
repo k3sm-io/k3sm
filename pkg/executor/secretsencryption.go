@@ -264,7 +264,8 @@ type EncryptionInstallInputs struct {
 	// HA is a carried server join or datastore endpoint.
 	HA bool
 	// DatastoreResidue is any state.db* entry (the database, its WAL and
-	// shared-memory files, the kine pin stamp, a backup) in the db directory.
+	// shared-memory files, the kine pin stamp, a backup) in the db directory,
+	// or a leftover external-datastore .pgpass in the work dir.
 	DatastoreResidue bool
 	// Existing is the pair already on disk, as the start verdict reads it.
 	Existing EncryptionStartInputs
@@ -392,6 +393,14 @@ func PlanEncryptionAtInstall(store EncryptionStore, workDir string, req Encrypti
 			in.DatastoreResidue = true
 			break
 		}
+	}
+	// A leftover external-datastore credential is residue too: it is what
+	// requireLocalDatastore treats as decisive for "this node had a datastore".
+	switch _, err := store.ReadFile(pgPassPath(workDir)); {
+	case err == nil:
+		in.DatastoreResidue = true
+	case !errors.Is(err, fs.ErrNotExist):
+		return EncryptionLeave, fmt.Errorf("inspect %s: %w", pgPassPath(workDir), err)
 	}
 	existing, err := ReadEncryptionStartInputs(store, workDir, false)
 	if err != nil {

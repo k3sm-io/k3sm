@@ -153,6 +153,12 @@ func TestEncryptionEnableRefusesNonEmptyStateDB(t *testing.T) {
 			wantErr: ErrEncryptionExistingDatastore,
 		},
 		{
+			name:    "a leftover external-datastore credential is refused",
+			setup:   func(t *testing.T, wd string) { writeFile(t, pgPassPath(wd), []byte("placeholder")) },
+			req:     EncryptionInstallRequest{Requested: true},
+			wantErr: ErrEncryptionExistingDatastore,
+		},
+		{
 			name: "existing pair beside a datastore is refused",
 			setup: func(t *testing.T, wd string) {
 				writePair(t, wd, zeroKey, zeroKey)

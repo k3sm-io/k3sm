@@ -183,7 +183,10 @@ encrypted Secrets. This release has no key rotation and no command to decrypt th
   would need the same key, and k3sm does not distribute one),
 - the install is a worker (`--agent`).
 
-A later `sudo k3sm install`, with or without the option, keeps the existing key. The control
+A later `sudo k3sm install` without the option keeps the key and the encryption. Passing the
+option again once the cluster has started is refused. To enable encryption on a cluster that has
+never held workloads, remove the data root and reinstall with the option. The `.bak` copies k3sm
+keeps beside `state.db` hold encrypted Secrets and are useless without the key. The control
 plane refuses to start, and stays parked until the files are fixed, when the configuration is
 present without its fingerprint, when the fingerprint is present without the configuration, or
 when the two do not match. Restore both files from the backup taken with `state.db`. `k3sm
