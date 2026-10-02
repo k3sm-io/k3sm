@@ -123,11 +123,22 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
-	if strings.TrimSpace(cfg.SelfNodeName) == "" {
+	if strings.Trim(cfg.SelfNodeName, " ") == "" {
 		// Said ONCE, at construction, rather than per request: an unconfigured
 		// guard is a wiring defect that does not vary with traffic, and a
 		// per-request line would bury it. Loud here beats silent everywhere.
 		cfg.Logger.Warn("the bootstrap server has no SelfNodeName: a join claiming this control plane's own node name is not refused by name, leaving only the node-password binding and the enroller's index guard behind it")
+		cfg.SelfNodeName = ""
+	} else {
+		// Stored in canonical form, so the self-name refusal is a plain equality
+		// against an already-canonical request name. A name that has no
+		// canonical form is a wiring defect, and serving with it would leave the
+		// guard comparing against a name no join can ever spell: fail closed.
+		self, err := CanonicalNodeName(cfg.SelfNodeName)
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap server: SelfNodeName: %w", err)
+		}
+		cfg.SelfNodeName = self
 	}
 	return &Server{cfg: cfg, joins: newJoinRateLimiter(cfg.Now), preauth: newPreAuthLimiter(cfg.Now)}, nil
 }
@@ -210,12 +221,25 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid join token", http.StatusUnauthorized)
 		return
 	}
-	if req.NodeName == "" {
-		http.Error(w, "join request missing nodeName", http.StatusBadRequest)
+	// 1a. ONE CANONICAL NAME. The name is canonicalized exactly once, here, and
+	// a request must already spell it canonically: every non-canonical spelling
+	// (case, surrounding space) gets the same fixed 400 whatever name it is a
+	// spelling of, so the answer says nothing about this server's own name.
+	// Everything below — the self-name refusal, the node-password binding, the
+	// mesh guard, the CSR checks, the enroll — therefore keys on the one form.
+	name, err := CanonicalNodeName(req.NodeName)
+	if err != nil {
+		s.cfg.Logger.Warn("join rejected", "reason", "node-name", "err", err, "remote", r.RemoteAddr)
+		http.Error(w, "join refused: invalid node name", http.StatusBadRequest)
+		return
+	}
+	if name != req.NodeName {
+		s.cfg.Logger.Warn("join rejected", "reason", "node-name-not-canonical", "node", name, "remote", r.RemoteAddr)
+		http.Error(w, "join refused: the node name must be lowercase DNS-1123 with no surrounding spaces", http.StatusBadRequest)
 		return
 	}
 
-	// 1a. THIS CONTROL PLANE'S OWN NAME IS NOT JOINABLE, and that is decided
+	// THIS CONTROL PLANE'S OWN NAME IS NOT JOINABLE, and that is decided
 	// before anything identity-bearing happens — before the node-password store
 	// is consulted, before the enroll writes a MeshPeer, before a certificate is
 	// signed.
@@ -236,9 +260,9 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	// control-plane index — stand behind it for the cases a name cannot see: an
 	// HA sibling's name, and any path that ever reaches the enroller without
 	// passing here.
-	if selfNameClaimed(s.cfg.SelfNodeName, req.NodeName) {
+	if selfNameClaimed(s.cfg.SelfNodeName, name) {
 		s.cfg.Logger.Warn("join rejected", "reason", "self-node-name",
-			"node", req.NodeName, "selfNodeName", s.cfg.SelfNodeName, "remote", r.RemoteAddr)
+			"node", name, "selfNodeName", s.cfg.SelfNodeName, "remote", r.RemoteAddr)
 		// The body says only that the name cannot be joined. The caller already
 		// knows the name it sent; it learns nothing here about which names are
 		// taken, what this node is called, or how far the request got.
@@ -512,16 +536,13 @@ func bearerToken(r *http.Request) string {
 // node name. An empty selfNodeName matches nothing — the guard is off, which
 // NewServer has already said out loud.
 //
-// The comparison is trimmed and CASE-INSENSITIVE because it is a refusal, not a
-// lookup: a Kubernetes node name is lowercase RFC-1123 by rule, so a request
-// differing only in case is never a legitimate second node, and matching it
-// exactly would leave the cheapest possible bypass of this whole guard.
+// Both arguments are already canonical (NewServer stores the canonical self
+// name; handleJoin refuses any request name that is not canonical), so this is
+// plain equality. It must stay that way: a second, looser notion of "the same
+// name" here is exactly how a spelling that one check folds and the next does
+// not slips between them.
 func selfNameClaimed(selfNodeName, requested string) bool {
-	self := strings.TrimSpace(selfNodeName)
-	if self == "" {
-		return false
-	}
-	return strings.EqualFold(self, strings.TrimSpace(requested))
+	return selfNodeName != "" && selfNodeName == requested
 }
 
 // parseCSR decodes a PEM CERTIFICATE REQUEST and parses it.
