@@ -24,6 +24,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"os/user"
 	"strings"
 	"time"
 
@@ -316,9 +317,18 @@ const fileVaultNote = "FileVault is on and the data volume is not passphrase-pro
 // the bootstrap client live; install decides when to call it and never lets it
 // block the teardown. A worker with nothing to deregister with says so once, in
 // one line, and the uninstall carries on.
+//
+// With --purge --yes it also removes everything a plain uninstall keeps. The
+// flags are judged before anything else, so a purge that was not confirmed
+// refuses without touching the system.
 func runUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+	purgeFlag := fs.Bool("purge", false, "also remove everything a plain uninstall keeps: the cluster data (and the data volume with its keychain item), the daemon logs, the _k3sm user, the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments. Irreversible; requires --yes")
+	yes := fs.Bool("yes", false, "confirm --purge")
 	_ = fs.Parse(args)
+	if err := checkPurgeFlags(*purgeFlag, *yes); err != nil {
+		return err
+	}
 
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("k3sm uninstall must run as root — use 'sudo k3sm uninstall'")
@@ -330,14 +340,55 @@ func runUninstall(args []string) error {
 		logger.Warn("not asking the cluster to forget this node: "+why,
 			"remedy", "on the control plane: kubectl delete meshpeer/<node> node/<node>")
 	}
-	if err := install.Uninstall(context.Background(), sys, install.Config{
+	cfg := install.Config{
 		Logger:     logger,
 		Deregister: deregister,
-	}); err != nil {
+	}
+	if *purgeFlag {
+		human, home, err := purgeTarget(os.Getenv("SUDO_USER"))
+		if err != nil {
+			return err
+		}
+		cfg.Purge, cfg.PurgeConfirmed = true, true
+		cfg.TargetUser, cfg.TargetHome = human, home
+	}
+	if err := install.Uninstall(context.Background(), sys, cfg); err != nil {
 		return err
 	}
 	removeNodeResolverEntry(logger)
 	return nil
+}
+
+// purgeWarning names what `k3sm uninstall --purge` destroys, for the refusal
+// an unconfirmed purge prints.
+const purgeWarning = "k3sm uninstall --purge permanently deletes this Mac's cluster: the datastore and every image and volume under " +
+	install.DefaultDataRoot + " (and the data volume, if there is one, with its keychain item), the daemon logs in " +
+	install.LogDir + ", the " + install.DefaultServiceUser + " user, the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments"
+
+// checkPurgeFlags judges --purge and --yes together: --yes confirms a purge
+// and nothing else, and a purge is never run unconfirmed.
+func checkPurgeFlags(purge, yes bool) error {
+	switch {
+	case yes && !purge:
+		return fmt.Errorf("--yes only confirms --purge; a plain 'sudo k3sm uninstall' needs no confirmation")
+	case purge && !yes:
+		return fmt.Errorf("%s. Nothing was changed. Re-run as 'sudo k3sm uninstall --purge --yes' to do it", purgeWarning)
+	}
+	return nil
+}
+
+// purgeTarget is the human a purge cleans the kubeconfig of, and that
+// human's home, which the purge never deletes into. It must be a real,
+// non-root account: run through sudo from it.
+func purgeTarget(sudoUser string) (name, home string, err error) {
+	if sudoUser == "" || sudoUser == "root" {
+		return "", "", fmt.Errorf("run 'sudo k3sm uninstall --purge --yes' from your own account, so k3sm knows whose kubeconfig holds the k3sm context")
+	}
+	u, err := user.Lookup(sudoUser)
+	if err != nil {
+		return "", "", fmt.Errorf("look up %s: %w", sudoUser, err)
+	}
+	return u.Username, u.HomeDir, nil
 }
 
 // removeNodeResolverEntry deletes netd's node resolver entry from the dynamic

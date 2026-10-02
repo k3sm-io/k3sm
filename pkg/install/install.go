@@ -625,6 +625,11 @@ type System interface {
 	// are re-applied to the directory AND to those files on every install,
 	// repairing a previously mis-created or over-permissive tree.
 	EnsureLogDir(dir string, uid uint32) error
+	// WriteDataRootMarker writes dataroot.MarkerName into dir, root:wheel 0644,
+	// naming dir itself (dataroot.WriteMarker). Install writes one into the data
+	// root and one into the log dir on every install, and `k3sm uninstall
+	// --purge` refuses to delete a tree that does not carry one. Idempotent.
+	WriteDataRootMarker(dir string) error
 	// EnsureContainerLogDir creates (or repairs) one directory of the container-log
 	// tree — /var/log/pods and /var/log/containers — owned by the service uid,
 	// group wheel, mode 0700 (ContainerLogDirMode / ContainerLogDirGID).
@@ -1045,6 +1050,46 @@ type System interface {
 	// WaitProcessGroupsGone waits up to timeout for every group in pgids to
 	// have no members, and returns the groups that still have one.
 	WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int
+
+	// The methods below serve `k3sm uninstall --purge` only.
+
+	// ResolvePath returns path with every symlink resolved (EvalSymlinks).
+	ResolvePath(path string) (string, error)
+	// StatNoFollow lstats path. A missing path has ReadFile's fs.ErrNotExist
+	// contract.
+	StatNoFollow(path string) (PathStat, error)
+	// ReadDataRootMarker reports what dir's dataroot.MarkerName file is, read
+	// off one O_NOFOLLOW descriptor (dataroot.ReadMarker). Missing has
+	// ReadFile's fs.ErrNotExist contract.
+	ReadDataRootMarker(dir string) (dataroot.MarkerFacts, error)
+	// PurgeTree deletes the tree at root, which must still be the directory
+	// (dev, ino) the purge guard approved. It walks descriptor-relative and
+	// never follows a symlink (a symlink is unlinked, its target untouched),
+	// never enters a directory on another device (that is reported as an
+	// error, and the walk goes on), clears file flags and retries once on
+	// EPERM, collects every failure rather than stopping at the first, and
+	// unlinks root's marker and then root itself only when everything else is
+	// gone. It never uses os.RemoveAll.
+	PurgeTree(root string, dev, ino uint64) error
+	// LoadedLabels lists the launchd jobs loaded in the system domain whose
+	// label starts with prefix.
+	LoadedLabels(prefix string) ([]string, error)
+	// ProcessesOfUID lists the pids whose real or effective uid is uid.
+	ProcessesOfUID(uid uint32) ([]int, error)
+	// KillProcess sends SIGKILL to pid. A process that is already gone is
+	// success.
+	KillProcess(pid int) error
+	// ServiceUser reads the named user's directory-service record. A user that
+	// does not exist is Exists=false with a nil error.
+	ServiceUser(name string) (ServiceUserRecord, error)
+	// DeleteServiceUser deletes the named user's record (dscl . -delete
+	// /Users/<name>). It deletes no group.
+	DeleteServiceUser(name string) error
+	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
+	// and user it alone references) from targetUser's ~/.kube/config, keeping
+	// every other entry, the file's owner and its mode. An absent file or
+	// context is a no-op success.
+	RemoveAdminKubeconfigContext(targetUser string) error
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1246,6 +1291,18 @@ type Config struct {
 	// terminal error naming the remedy (mint a token on the server and start the
 	// agent with it).
 	Deregister func(ctx context.Context) error
+	// Purge makes Uninstall also remove everything it otherwise keeps: the data
+	// root (and the data volume under it), the daemon log dir, the arguments
+	// records, the k3sm context in TargetUser's kubeconfig and the service user.
+	// See purge for the order and the guards.
+	Purge bool
+	// PurgeConfirmed is the operator's --yes. A Purge without it is refused
+	// before any system call.
+	PurgeConfirmed bool
+	// TargetHome is the invoking human's home directory. A purge refuses to
+	// delete any tree that equals, contains or lies inside it. Empty skips that
+	// one rule; the /Users and /Volumes rules still hold.
+	TargetHome string
 	// DataRootFS is the read-only filesystem the data-root posture is read
 	// through (the record, /etc/fstab, the mount state). It defaults to the real
 	// filesystem; a test injects a fake so the sequencing can be exercised
@@ -2901,6 +2958,17 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
 	}
 
+	// 1b‴. The purge markers, in the two trees `k3sm uninstall --purge` deletes
+	//     whole. Both directories exist by now (the data root from step 1a, the
+	//     log dir from the step above), and the marker is rewritten on every
+	//     install, so a Mac installed before markers existed gains them on its
+	//     next install. Each names the directory it sits in.
+	for _, dir := range []string{cfg.DataRoot, LogDir} {
+		if err := sys.WriteDataRootMarker(dir); err != nil {
+			return fmt.Errorf("install: write the k3sm marker in %s: %w", dir, err)
+		}
+	}
+
 	// 1b'. The container-log tree, for the same reason and at the same moment: the
 	//     node refuses to start without it, and only root can create it owned by
 	//     the service user with a mode that does not expose every pod's output to
@@ -3345,8 +3413,25 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // Flushing the utun/routes class on the way out (if it ever proves necessary)
 // is a darwin-net change (a shutdown hook that reaches Down), not an installer
 // one, and would be filed separately. Uninstall makes no claim to do it.
+//
+// With cfg.Purge set it is `k3sm uninstall --purge`: the same teardown, then
+// every artifact this one keeps (see purge).
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
+	if cfg.Purge {
+		return purge(ctx, sys, cfg)
+	}
+	_, err := uninstall(ctx, sys, cfg, nil)
+	return err
+}
+
+// uninstall is Uninstall's teardown, and returns the manifest it walked so a
+// purge consumes that same manifest rather than one rebuilt after the state it
+// was derived from has changed. preflight, when non-nil, runs after the
+// manifest is built and BEFORE anything is torn down, and is handed the
+// data-root posture and the error reading it; an error from it is
+// returned as it stands, with nothing changed. cfg already carries its defaults.
+func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []artifact, st dataroot.State, stErr error) error) ([]artifact, error) {
 	var firstErr error
 	note := func(err error) {
 		if err != nil && firstErr == nil {
@@ -3384,6 +3469,11 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// default role would leave the other one's KeepAlive plist behind pointing
 	// at a deleted binary — the exact leak the shared manifest exists to prevent.
 	m := uninstallManifest(sys, cfg)
+	if preflight != nil {
+		if err := preflight(m, st, sterr); err != nil {
+			return m, err
+		}
+	}
 	// Leave the cluster BEFORE anything local is torn down. Everything the call
 	// depends on is alive right now and stops being alive a few lines below: the
 	// agent daemon still holds the mesh up, the stored credential is still on
@@ -3473,9 +3563,13 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	}
 	note(sys.FlushLo0Aliases(flush))
 	if firstErr != nil {
-		return fmt.Errorf("uninstall: %w", firstErr)
+		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}
 	cfg.Logger.Info("k3sm uninstalled", "install-dir", cfg.InstallDir)
+	if cfg.Purge {
+		// Nothing is kept: the purge removes it next and says what it removed.
+		return m, nil
+	}
 	// What was KEPT, named. An uninstall that lists only what it removed leaves
 	// the operator guessing whether their datastore, their kubeconfig and the
 	// server flags they configured are still there — and guessing wrong in the
@@ -3492,7 +3586,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			"reinstall", "sudo k3sm install --data-volume",
 			"remove-for-good", "sudo k3sm datavol delete --yes")
 	}
-	return nil
+	return m, nil
 }
 
 // deregisterTimeout is the outer bound on the whole deregistration attempt.

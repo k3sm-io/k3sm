@@ -36,7 +36,8 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", 
   dev         disposable single-node dev cluster (up|down|list|load) — internal dev tooling
   netd        run the root privileged-network helper (launched by the io.k3sm.netd LaunchDaemon)
   install     install the netd + server launchd daemons (run as root via sudo)
-  uninstall   remove the netd + server launchd daemons (run as root via sudo)
+  uninstall   remove the k3sm daemons, keeping cluster data (run as root via sudo;
+              --purge --yes also removes the data, logs and _k3sm user)
   datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)

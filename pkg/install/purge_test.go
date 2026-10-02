@@ -1,0 +1,362 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package install
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"k3sm.io/k3sm/pkg/dataroot"
+	"k3sm.io/k3sm/pkg/datavol/datavoltest"
+)
+
+// purgeRig is one purge test's world: the fake System, the Config the CLI
+// would hand Uninstall for `sudo k3sm uninstall --purge --yes`, and the log.
+type purgeRig struct {
+	f    *fakeSystem
+	cfg  Config
+	logs *bytes.Buffer
+	// disk is the fake diskutil when the rig carries a data volume.
+	disk *datavoltest.Fake
+}
+
+// purgeVolumeUUID is the recorded data volume in the data-volume rigs.
+const purgeVolumeUUID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+
+// newPurgeRig builds a confirmed purge of a healthy install of role, every
+// preserved tree present and marked. withVolume puts the data root on a
+// recorded, mounted k3sm data volume (and the data root under a t.TempDir(), so
+// datavol.Delete's own filesystem steps stay inside the test).
+func newPurgeRig(t *testing.T, role Role, withVolume bool) *purgeRig {
+	t.Helper()
+	shrinkPurgeBudgets(t)
+	r := &purgeRig{logs: &bytes.Buffer{}}
+	if withVolume {
+		dv := newDatavolRig(t)
+		dv.seedRecord(t, purgeVolumeUUID)
+		dv.disk.Vols[purgeVolumeUUID].Mountpoint = dv.cfg.DataRoot
+		r.f, r.cfg, r.disk = dv.sys, dv.cfg, dv.disk
+	} else {
+		r.f = &fakeSystem{}
+		// The default data root, read through a fake: the dev Mac running the
+		// tests may carry a real k3sm volume at /var/lib/k3sm.
+		r.disk = datavoltest.New()
+		r.cfg = Config{DataRootFS: r.disk.FS(), DataVolumeDeps: r.disk.Deps()}
+	}
+	r.cfg.Role = role
+	r.cfg.Purge, r.cfg.PurgeConfirmed = true, true
+	r.cfg.TargetUser, r.cfg.TargetHome = "alice", "/Users/alice"
+	r.cfg.Logger = slog.New(slog.NewTextHandler(r.logs, nil))
+	d := r.cfg.withDefaults()
+	r.f.purge.user = &ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: d.DataRoot}
+	for _, a := range r.manifest() {
+		if a.disp == dispPreserve && a.kind == kindDir {
+			r.f.seedPurgeable(a.path)
+		}
+	}
+	return r
+}
+
+// manifest is artifactManifest itself, for the Config the rig describes.
+func (r *purgeRig) manifest() []artifact {
+	d := r.cfg.withDefaults()
+	d.dataVolumeDeclared = r.f != nil && r.disk != nil && len(r.disk.Files) > 0
+	return artifactManifest(d)
+}
+
+func (r *purgeRig) run() error { return Uninstall(context.Background(), r.f, r.cfg) }
+
+// called reports whether the log holds a call with this exact text.
+func (r *purgeRig) called(c string) bool { return slices.Contains(r.f.calls, c) }
+
+// anyCall reports whether the log holds a call starting with prefix.
+func (r *purgeRig) anyCall(prefix string) bool { return callIndex(r.f.calls, prefix) >= 0 }
+
+// TestPurgeRemovesEveryPreservedArtifact is the gate's completeness half: it
+// walks artifactManifest itself and demands a removal for EVERY entry the
+// ordinary uninstall keeps, dispatched on kind. A preserved kind this test has
+// no arm for fails it, so a new kind cannot be added without deciding how the
+// purge removes it.
+func TestPurgeRemovesEveryPreservedArtifact(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		role   Role
+		volume bool
+	}{
+		{"server", RoleServer, false},
+		{"agent", RoleAgent, false},
+		{"server on a data volume", RoleServer, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPurgeRig(t, tc.role, tc.volume)
+			m := r.manifest()
+			if err := r.run(); err != nil {
+				t.Fatalf("purge: %v\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+			}
+			var purged []string
+			for _, c := range r.f.calls {
+				if p, ok := strings.CutPrefix(c, "PurgeTree:"); ok {
+					purged = append(purged, p)
+				}
+			}
+			inPurged := func(p string) bool {
+				return slices.Contains(purged, p) || coveredBy(p, purged)
+			}
+			seen := 0
+			for _, a := range m {
+				if a.disp != dispPreserve {
+					continue
+				}
+				seen++
+				switch a.kind {
+				case kindServiceUser:
+					if !r.called("DeleteServiceUser:" + a.user) {
+						t.Errorf("service user %s was not deleted", a.user)
+					}
+				case kindKubeconfig:
+					if !r.called("RemoveAdminKubeconfigContext:" + a.user) {
+						t.Errorf("the k3sm context in %s's kubeconfig was not removed", a.user)
+					}
+				case kindDir:
+					if !inPurged(a.path) {
+						t.Errorf("preserved dir %s was not purged (purged: %v)", a.path, purged)
+					}
+				case kindFile:
+					if !inPurged(a.path) && !r.called("RemoveEntry:"+filepath.Dir(a.path)+":"+filepath.Base(a.path)) {
+						t.Errorf("preserved file %s was neither removed nor inside a purged tree", a.path)
+					}
+				default:
+					t.Fatalf("preserved artifact of kind %v (%s) has no purge assertion", a.kind, a.path)
+				}
+			}
+			if seen == 0 {
+				t.Fatal("the manifest preserves nothing; the test asserted nothing")
+			}
+			if tc.volume {
+				if !r.anyCall("datavol.deletevolume " + purgeVolumeUUID) {
+					t.Errorf("the data volume was not deleted through datavol.Delete")
+				}
+				if !slices.Contains(m, artifact{kind: kindFile, disp: dispPreserve, path: dataroot.DefaultRecordPath}) {
+					t.Errorf("the data-volume config did not declare the record; the case is vacuous")
+				}
+			}
+			out := r.logs.String()
+			if strings.Contains(out, "kept, so a reinstall") || !strings.Contains(out, "k3sm purged") {
+				t.Errorf("purge output must say what it removed and not claim anything was kept:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestPurgeOrderIsBootoutsThenProcessesThenVolumeThenTreesThenUser pins the one
+// order the purge may run in, on one interleaved call log.
+func TestPurgeOrderIsBootoutsThenProcessesThenVolumeThenTreesThenUser(t *testing.T) {
+	r := newPurgeRig(t, RoleServer, true)
+	r.f.putLoaded("io.k3sm.server", "io.k3sm.stray")
+	r.f.purge.procs = []int{4242}
+	if err := r.run(); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	assertOrder(t, r.f.calls,
+		"Bootout:io.k3sm.server",        // the ordinary uninstall
+		"FlushLo0Aliases:",              // ...ran to its end
+		"LoadedLabels:io.k3sm.",         // then every k3sm job is listed
+		"Bootout:io.k3sm.stray",         // and the one it did not know is booted out
+		"ProcessesOfUID:271",            // no process may still run as _k3sm
+		"KillProcess:4242",              // the one that would not exit is killed once
+		"datavol.unmount",               // the volume is unmounted
+		"datavol.deletevolume",          // and deleted, never walked
+		"PurgeTree:"+r.cfg.DataRoot,     // then the trees
+		"PurgeTree:"+LogDir,             //
+		"RemoveEntry:",                  // the files outside them
+		"RemoveAdminKubeconfigContext:", // the kubeconfig context
+		"DeleteServiceUser:_k3sm",       // and the user last
+	)
+}
+
+// TestPurgeRefusals is the negative table: every case ends in an error with no
+// tree removed and no user deleted. Those refused in the preflight have also
+// booted nothing out: the Mac is exactly as it was.
+func TestPurgeRefusals(t *testing.T) {
+	errBoom := errors.New("boom")
+	for _, tc := range []struct {
+		name string
+		// volume puts the data root on a recorded data volume.
+		volume bool
+		edit   func(r *purgeRig)
+		// preflight cases leave the install untouched.
+		preflight bool
+		want      error
+		// reason is a fragment of the refusal, so each case fails for its own
+		// reason and not an incidental one.
+		reason string
+	}{
+		{name: "the data root is /", reason: "is a system directory", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.cfg.DataRoot = "/"
+			r.f.seedPurgeable("/")
+		}},
+		{name: "the data root is the invoking user's home", reason: "overlaps the home directory", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.cfg.TargetHome = "/opt/home/alice"
+			r.cfg.DataRoot = "/opt/home/alice"
+			r.f.seedPurgeable(r.cfg.DataRoot)
+			r.f.purge.user.Home = r.cfg.DataRoot
+		}},
+		{name: "the data root contains the invoking user's home", reason: "overlaps the home directory", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.cfg.TargetHome = "/opt/k3sm/alice"
+			r.cfg.DataRoot = "/opt/k3sm"
+			r.f.seedPurgeable(r.cfg.DataRoot)
+			r.f.purge.user.Home = r.cfg.DataRoot
+		}},
+		{name: "the data root is under /Users", reason: "under /Users or /Volumes", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.cfg.TargetHome = ""
+			r.cfg.DataRoot = "/Users/Shared/k3sm"
+			r.f.seedPurgeable(r.cfg.DataRoot)
+			r.f.purge.user.Home = r.cfg.DataRoot
+		}},
+		{name: "the data root resolves under /Users", reason: "under /Users or /Volumes", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.resolved = map[string]string{DefaultDataRoot: "/Users/alice/k3sm"}
+		}},
+		{name: "the data root is a symlink", reason: "is a symlink", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			st := r.f.purge.stats[DefaultDataRoot]
+			st.Kind = EntrySymlink
+			r.f.purge.stats[DefaultDataRoot] = st
+		}},
+		{name: "the log dir is a mount point", reason: "is a mount point", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			st := r.f.purge.stats[LogDir]
+			st.Dev = 7
+			r.f.purge.stats[LogDir] = st
+		}},
+		{name: "the data root is mounted with no k3sm record", reason: "mounted filesystem with no k3sm data-volume record", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.disk.Add(datavoltest.Volume{UUID: "FFFFFFFF-0000-0000-0000-000000000000", Name: "theirs", Mountpoint: DefaultDataRoot})
+		}},
+		{name: "the data root has no marker", reason: "run `sudo k3sm install` once", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			delete(r.f.purge.markers, DefaultDataRoot)
+		}},
+		{name: "the marker is not root-owned", reason: "not root", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			m := r.f.purge.markers[LogDir]
+			m.UID = 271
+			r.f.purge.markers[LogDir] = m
+		}},
+		{name: "the marker is group-writable", reason: "group- or world-writable", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			m := r.f.purge.markers[DefaultDataRoot]
+			m.Mode = 0o664
+			r.f.purge.markers[DefaultDataRoot] = m
+		}},
+		{name: "the marker is world-writable", reason: "group- or world-writable", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			m := r.f.purge.markers[DefaultDataRoot]
+			m.Mode = 0o646
+			r.f.purge.markers[DefaultDataRoot] = m
+		}},
+		{name: "the marker names another path", reason: "names \"/var/log/k3sm\"", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			m := r.f.purge.markers[DefaultDataRoot]
+			m.Content = dataroot.MarkerContent(LogDir)
+			r.f.purge.markers[DefaultDataRoot] = m
+		}},
+		{name: "the service user is not the account k3sm created", reason: "not the account k3sm created", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.user.RealName = "Someone Else"
+		}},
+		{name: "a bootout fails in the uninstall phase", reason: "the purge did not run", want: errBoom, edit: func(r *purgeRig) {
+			r.f.purge.bootoutErrs = map[string]error{ServerLabel: errBoom}
+		}},
+		{name: "a k3sm job never leaves launchd", reason: "still loaded after bootout: io.k3sm.stray", want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.putLoaded("io.k3sm.stray")
+			r.f.purge.stuck = map[string]bool{"io.k3sm.stray": true}
+		}},
+		{name: "a _k3sm process survives SIGKILL", reason: "after SIGKILL: 4242", want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.procs = []int{4242}
+			r.f.purge.unkillable = map[int]bool{4242: true}
+		}},
+		{name: "datavol.Delete fails", reason: "delete the data volume", volume: true, want: errBoom, edit: func(r *purgeRig) {
+			r.disk.SetErr("deletevolume", errBoom)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPurgeRig(t, RoleServer, tc.volume)
+			tc.edit(r)
+			err := r.run()
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("purge = %v, want %v\ncalls:\n%s", err, tc.want, strings.Join(r.f.calls, "\n"))
+			}
+			if !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("purge refused for the wrong reason: %v (want %q)", err, tc.reason)
+			}
+			if r.anyCall("PurgeTree:") || r.anyCall("DeleteServiceUser:") || r.anyCall("RemoveAdminKubeconfigContext:") {
+				t.Fatalf("a refused purge removed something:\n%s", strings.Join(r.f.calls, "\n"))
+			}
+			if tc.preflight && (r.anyCall("Bootout:") || r.anyCall("RemoveAll:")) {
+				t.Fatalf("a preflight refusal tore the install down:\n%s", strings.Join(r.f.calls, "\n"))
+			}
+		})
+	}
+
+	t.Run("no --yes makes no system call at all", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, false)
+		r.cfg.PurgeConfirmed = false
+		if err := r.run(); !errors.Is(err, ErrPurgeNotConfirmed) {
+			t.Fatalf("purge = %v, want ErrPurgeNotConfirmed", err)
+		}
+		if len(r.f.calls) != 0 {
+			t.Fatalf("an unconfirmed purge made system calls: %v", r.f.calls)
+		}
+	})
+
+	t.Run("a different-device child stops the purge before the user is deleted", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, false)
+		r.f.purge.purgeErrs = map[string]error{DefaultDataRoot: errors.New(DefaultDataRoot + "/pods/x is on another filesystem")}
+		if err := r.run(); err == nil || !strings.Contains(err.Error(), "another filesystem") {
+			t.Fatalf("purge = %v, want the cross-device error", err)
+		}
+		if r.anyCall("DeleteServiceUser:") {
+			t.Fatal("the service user was deleted although a tree could not be purged")
+		}
+	})
+}
+
+// TestPurgeGuardPathRules pins the pure path half of the guard.
+func TestPurgeGuardPathRules(t *testing.T) {
+	home := []string{"/Users/alice"}
+	for _, tc := range []struct {
+		target, resolved string
+		ok               bool
+	}{
+		{"/var/lib/k3sm", "/private/var/lib/k3sm", true},
+		{"/var/log/k3sm", "/private/var/log/k3sm", true},
+		{"/private/var", "/private/var", false},
+		{"/var", "/private/var", false},
+		{"/var/lib/k3sm", "/private/var", false},
+		{"/Library", "/Library", false},
+		{"/Users/Shared", "/Users/Shared", false},
+		{"/Users/alice/k3sm", "/Users/alice/k3sm", false},
+		{"/USERS/alice/k3sm", "/USERS/alice/k3sm", false},
+		{"/Volumes/k3sm", "/Volumes/k3sm", false},
+		{"/System/Volumes/Data/Users/bob", "/System/Volumes/Data/Users/bob", false},
+		{"/System/Volumes/Data/private/var/lib/k3sm", "/System/Volumes/Data/private/var/lib/k3sm", true},
+		{"/opt", "/opt", false},
+		{"/var/lib/k3sm", "/Users/alice", false},
+	} {
+		err := purgePathRules(tc.target, tc.resolved, home)
+		if (err == nil) != tc.ok {
+			t.Errorf("purgePathRules(%s -> %s) = %v, want ok=%v", tc.target, tc.resolved, err, tc.ok)
+		}
+	}
+}

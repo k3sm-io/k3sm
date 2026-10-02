@@ -105,10 +105,12 @@ func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 	}
 	steps := [][]string{
 		{"dscl", ".", "-create", record},
-		{"dscl", ".", "-create", record, "UserShell", "/usr/bin/false"},
-		{"dscl", ".", "-create", record, "RealName", "k3sm service user"},
+		{"dscl", ".", "-create", record, "UserShell", serviceUserShell},
+		{"dscl", ".", "-create", record, "RealName", serviceUserRealName},
 		{"dscl", ".", "-create", record, "UniqueID", strconv.Itoa(uid)},
-		{"dscl", ".", "-create", record, "PrimaryGroupID", "20"}, // staff
+		// staff, the group every login user shares. Install creates no group of
+		// its own, so a purge deletes the user record and never a group.
+		{"dscl", ".", "-create", record, "PrimaryGroupID", "20"},
 		{"dscl", ".", "-create", record, "NFSHomeDirectory", dataRoot},
 		{"dscl", ".", "-create", record, "IsHidden", "1"},
 	}
@@ -168,6 +170,10 @@ func (darwinSystem) EnsureOwnedDir(dir string, uid, gid int, mode fs.FileMode) e
 func (darwinSystem) EnsureLogDir(dir string, uid uint32) error {
 	return ensureLogDir(dir, logOwnership{serviceUID: int(uid), rootUID: 0, gid: LogDirGID})
 }
+
+// WriteDataRootMarker writes dir's purge marker root:wheel 0644. See the System
+// interface and dataroot.MarkerName.
+func (darwinSystem) WriteDataRootMarker(dir string) error { return dataroot.WriteMarker(dir) }
 
 // logOwnership is who owns the daemon log tree. The three fields are taken
 // explicitly — rather than read from the constants and from a hard-coded 0 —
@@ -2092,6 +2098,389 @@ func (darwinSystem) FlushMeshPFAnchor() error {
 	out, err := exec.Command("pfctl", "-a", mesh.PFAnchor, "-F", "all").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("pfctl -a %s -F all: %w\n%s", mesh.PFAnchor, err, out)
+	}
+	return nil
+}
+
+// ResolvePath resolves every symlink in path.
+func (darwinSystem) ResolvePath(path string) (string, error) { return filepath.EvalSymlinks(path) }
+
+// StatNoFollow lstats path.
+func (darwinSystem) StatNoFollow(path string) (PathStat, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return PathStat{}, &fs.PathError{Op: "lstat", Path: path, Err: err}
+	}
+	return PathStat{Kind: statKind(st.Mode), Dev: statDev(&st), Ino: st.Ino}, nil
+}
+
+// statDev is st's device as the unsigned value every comparison here uses.
+func statDev(st *unix.Stat_t) uint64 { return uint64(uint32(st.Dev)) }
+
+// ReadDataRootMarker reads dir's purge marker off one O_NOFOLLOW descriptor.
+func (darwinSystem) ReadDataRootMarker(dir string) (dataroot.MarkerFacts, error) {
+	return dataroot.ReadMarker(dir)
+}
+
+// PurgeTree deletes the tree at root. See the System interface for the
+// contract; purgeTree is the walk.
+func (darwinSystem) PurgeTree(root string, dev, ino uint64) error {
+	return purgeTree(root, dev, ino, func(_ string, st *unix.Stat_t) uint64 { return statDev(st) })
+}
+
+// purgeWalk is one PurgeTree run. devOf reports an entry's device; it is a
+// parameter so a test can describe a mount point inside the tree without the
+// privilege to mount one.
+type purgeWalk struct {
+	rootDev uint64
+	devOf   func(path string, st *unix.Stat_t) uint64
+	errs    []error
+}
+
+// purgeTree is PurgeTree with the device lookup injected.
+//
+// Everything below root is reached through a descriptor of its parent: entries
+// are classified with fstatat(AT_SYMLINK_NOFOLLOW), descended into with
+// openat(O_NOFOLLOW|O_DIRECTORY) and checked to be the entry classified, and
+// removed with unlinkat. So a symlink anywhere in the tree is unlinked and
+// never followed, and a rename racing the walk cannot redirect it outside the
+// tree. root's own marker is removed only after everything else is gone, which
+// keeps a failed purge re-runnable (the guard still finds the marker).
+func purgeTree(root string, wantDev, wantIno uint64, devOf func(string, *unix.Stat_t) uint64) error {
+	fd, err := openDirNoFollow(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", root, err)
+	}
+	if statDev(&st) != wantDev || st.Ino != wantIno {
+		return fmt.Errorf("%s is no longer the directory that was checked; nothing removed", root)
+	}
+	w := &purgeWalk{rootDev: devOf(root, &st), devOf: devOf}
+	w.empty(fd, root, true)
+	if len(w.errs) > 0 {
+		return errors.Join(w.errs...)
+	}
+	w.unlink(fd, dataroot.MarkerPath(root), dataroot.MarkerName)
+	if len(w.errs) > 0 {
+		return errors.Join(w.errs...)
+	}
+	return removeRootDir(fd, root, &st)
+}
+
+// removeRootDir removes the now-empty root through its parent's descriptor,
+// after checking the name still holds the directory that was emptied.
+func removeRootDir(rootfd int, root string, st *unix.Stat_t) error {
+	parent, base := filepath.Dir(root), filepath.Base(root)
+	pfd, err := openDirNoFollow(parent)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(pfd) }()
+	var now unix.Stat_t
+	if err := unix.Fstatat(pfd, base, &now, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("stat %s: %w", root, err)
+	}
+	if now.Dev != st.Dev || now.Ino != st.Ino {
+		return fmt.Errorf("%s was replaced during the purge; not removed", root)
+	}
+	err = unix.Unlinkat(pfd, base, unix.AT_REMOVEDIR)
+	if errors.Is(err, unix.EPERM) {
+		_ = unix.Fchflags(rootfd, 0)
+		err = unix.Unlinkat(pfd, base, unix.AT_REMOVEDIR)
+	}
+	if err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("remove %s: %w", root, err)
+	}
+	return nil
+}
+
+// empty removes everything inside the directory open at dirfd (path is for
+// messages). At the top level the marker is skipped; the caller removes it last.
+func (w *purgeWalk) empty(dirfd int, path string, top bool) {
+	names, err := readDirNames(dirfd, path)
+	if err != nil {
+		w.errs = append(w.errs, fmt.Errorf("list %s: %w", path, err))
+		return
+	}
+	for _, name := range names {
+		if top && name == dataroot.MarkerName {
+			continue
+		}
+		child := filepath.Join(path, name)
+		var st unix.Stat_t
+		if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				w.errs = append(w.errs, fmt.Errorf("stat %s: %w", child, err))
+			}
+			continue
+		}
+		if statKind(st.Mode) != EntryDir {
+			w.unlink(dirfd, child, name)
+			continue
+		}
+		if w.devOf(child, &st) != w.rootDev {
+			w.errs = append(w.errs, fmt.Errorf("%s is on another filesystem (a mount point); not entered, unmount it and re-run", child))
+			continue
+		}
+		cfd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			w.errs = append(w.errs, fmt.Errorf("open %s: %w", child, err))
+			continue
+		}
+		var opened unix.Stat_t
+		if err := unix.Fstat(cfd, &opened); err != nil || opened.Dev != st.Dev || opened.Ino != st.Ino {
+			_ = unix.Close(cfd)
+			w.errs = append(w.errs, fmt.Errorf("%s changed while it was being removed; not entered", child))
+			continue
+		}
+		before := len(w.errs)
+		w.empty(cfd, child, false)
+		if len(w.errs) == before {
+			w.unlinkDir(dirfd, cfd, child, name)
+		}
+		_ = unix.Close(cfd)
+	}
+}
+
+// unlink removes the non-directory entry name (path is for messages) from the
+// directory open at dirfd. On EPERM, which an immutable or append-only flag on
+// the entry or on its directory produces, it clears both and tries once more.
+func (w *purgeWalk) unlink(dirfd int, path, name string) {
+	err := unix.Unlinkat(dirfd, name, 0)
+	if errors.Is(err, unix.EPERM) {
+		_ = unix.Fchflags(dirfd, 0)
+		clearRegularFileFlags(dirfd, name)
+		err = unix.Unlinkat(dirfd, name, 0)
+	}
+	if err != nil && !errors.Is(err, unix.ENOENT) {
+		w.errs = append(w.errs, fmt.Errorf("remove %s: %w", path, err))
+	}
+}
+
+// unlinkDir removes the emptied directory name, open at cfd, from the directory
+// open at dirfd, with unlink's one flag-clearing retry.
+func (w *purgeWalk) unlinkDir(dirfd, cfd int, path, name string) {
+	err := unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR)
+	if errors.Is(err, unix.EPERM) {
+		_ = unix.Fchflags(dirfd, 0)
+		_ = unix.Fchflags(cfd, 0)
+		err = unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR)
+	}
+	if err != nil && !errors.Is(err, unix.ENOENT) {
+		w.errs = append(w.errs, fmt.Errorf("remove %s: %w", path, err))
+	}
+}
+
+// clearRegularFileFlags clears the file flags of name when it is a regular
+// file, through a descriptor opened O_NOFOLLOW (a symlink is never opened).
+func clearRegularFileFlags(dirfd int, name string) {
+	var st unix.Stat_t
+	if err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil || statKind(st.Mode) != EntryRegular {
+		return
+	}
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var opened unix.Stat_t
+	if unix.Fstat(fd, &opened) == nil && opened.Dev == st.Dev && opened.Ino == st.Ino {
+		_ = unix.Fchflags(fd, 0)
+	}
+}
+
+// LoadedLabels lists the system-domain jobs whose label starts with prefix,
+// from `launchctl list` (run as root, that is the system domain): one job per
+// line, "PID Status Label".
+func (darwinSystem) LoadedLabels(prefix string) ([]string, error) {
+	out, err := exec.Command("launchctl", "list").Output()
+	if err != nil {
+		return nil, fmt.Errorf("launchctl list: %w", err)
+	}
+	return parseLaunchctlList(out, prefix), nil
+}
+
+// parseLaunchctlList extracts the labels starting with prefix from `launchctl
+// list` output, sorted.
+func parseLaunchctlList(out []byte, prefix string) []string {
+	var labels []string
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		if label := fields[len(fields)-1]; strings.HasPrefix(label, prefix) {
+			labels = append(labels, label)
+		}
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+// ProcessesOfUID lists the pids whose effective (kern.proc.uid) or real
+// (kern.proc.ruid) uid is uid, sorted.
+func (darwinSystem) ProcessesOfUID(uid uint32) ([]int, error) {
+	seen := map[int]bool{}
+	for _, mib := range []string{"kern.proc.uid", "kern.proc.ruid"} {
+		procs, err := unix.SysctlKinfoProcSlice(mib, int(uid))
+		if err != nil {
+			return nil, fmt.Errorf("sysctl %s %d: %w", mib, uid, err)
+		}
+		for _, p := range procs {
+			if pid := int(p.Proc.P_pid); pid > 0 {
+				seen[pid] = true
+			}
+		}
+	}
+	pids := make([]int, 0, len(seen))
+	for pid := range seen {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids, nil
+}
+
+// KillProcess sends SIGKILL to pid; a process already gone is success.
+func (darwinSystem) KillProcess(pid int) error {
+	if pid <= 1 {
+		return fmt.Errorf("refusing to kill pid %d", pid)
+	}
+	if err := unix.Kill(pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("kill %d: %w", pid, err)
+	}
+	return nil
+}
+
+// ServiceUser reads the named user's record: the uid from the user database,
+// and RealName, UserShell and NFSHomeDirectory from the local directory node,
+// the attributes EnsureServiceUser wrote.
+func (darwinSystem) ServiceUser(name string) (ServiceUserRecord, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		var unknown user.UnknownUserError
+		if errors.As(err, &unknown) {
+			return ServiceUserRecord{}, nil
+		}
+		return ServiceUserRecord{}, fmt.Errorf("look up %s: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return ServiceUserRecord{}, fmt.Errorf("uid of %s: %w", name, err)
+	}
+	rec := ServiceUserRecord{Exists: true, UID: uint32(uid)}
+	for attr, dst := range map[string]*string{"RealName": &rec.RealName, "UserShell": &rec.Shell, "NFSHomeDirectory": &rec.Home} {
+		out, err := exec.Command("dscl", ".", "-read", "/Users/"+name, attr).Output()
+		if err != nil {
+			return ServiceUserRecord{}, fmt.Errorf("dscl . -read /Users/%s %s: %w", name, attr, err)
+		}
+		*dst = parseDsclAttr(out, attr)
+	}
+	return rec, nil
+}
+
+// parseDsclAttr extracts one attribute's value from `dscl . -read` output,
+// which is "Attr: value" or, for a value with spaces, "Attr:\n value".
+func parseDsclAttr(out []byte, attr string) string {
+	s := strings.TrimSpace(string(out))
+	s = strings.TrimPrefix(s, attr+":")
+	return strings.TrimSpace(s)
+}
+
+// DeleteServiceUser deletes the named user's record. No group is touched:
+// install never creates one (see EnsureServiceUser's PrimaryGroupID 20).
+func (darwinSystem) DeleteServiceUser(name string) error {
+	if name == "" || strings.ContainsAny(name, "/ ") {
+		return fmt.Errorf("refusing to delete user %q", name)
+	}
+	if out, err := exec.Command("dscl", ".", "-delete", "/Users/"+name).CombinedOutput(); err != nil {
+		return fmt.Errorf("dscl . -delete /Users/%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// RemoveAdminKubeconfigContext removes the k3sm context from targetUser's
+// ~/.kube/config. See the System interface.
+func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) error {
+	u, err := user.Lookup(targetUser)
+	if err != nil {
+		return fmt.Errorf("lookup target user %s: %w", targetUser, err)
+	}
+	if err := removeUserKubeconfigContext(u.HomeDir); err != nil {
+		return fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
+	}
+	return nil
+}
+
+// removeUserKubeconfigContext is the method above with the home directory
+// explicit, so a test runs it against a t.TempDir() home.
+//
+// It writes the way writeUserKubeconfig does: a temp file in ~/.kube whose
+// owner and mode are bound to its open descriptor before the rename — here
+// the ORIGINAL file's owner and mode, read off the descriptor the content was
+// read from. A symlinked ~/.kube or ~/.kube/config is refused, not followed.
+func removeUserKubeconfigContext(homeDir string) error {
+	kubeDir := filepath.Join(homeDir, ".kube")
+	if _, err := os.Lstat(kubeDir); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err := refuseSymlinkAt(kubeDir); err != nil {
+		return fmt.Errorf("%s: %w", kubeDir, err)
+	}
+	path := filepath.Join(kubeDir, "config")
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if errors.Is(err, unix.ELOOP) {
+		return fmt.Errorf("%s: %w", path, errSymlinkRefused)
+	}
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if statKind(st.Mode) != EntryRegular {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	existing, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	out, changed, err := unmergeAdminKubeconfig(existing, adminContextName)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if !changed {
+		return nil
+	}
+	tmp, err := os.CreateTemp(kubeDir, ".k3sm-kubeconfig-*")
+	if err != nil {
+		return fmt.Errorf("create temp kubeconfig: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
+	if err := tmp.Chmod(fs.FileMode(st.Mode) & fs.ModePerm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp kubeconfig: %w", err)
+	}
+	if err := tmp.Chown(int(st.Uid), int(st.Gid)); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chown temp kubeconfig to %d:%d: %w", st.Uid, st.Gid, err)
+	}
+	if _, err := tmp.Write(out); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp kubeconfig: %w", err)
+	}
+	if err := publishTemp(tmp, path); err != nil {
+		return fmt.Errorf("publish kubeconfig: %w", err)
 	}
 	return nil
 }
