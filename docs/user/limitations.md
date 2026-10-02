@@ -226,6 +226,13 @@ are never enforced**, and policies against `kube-dns` or the `kubernetes` VIP ar
 because those VIPs bypass the proxy. It is a policy hint, NOT a security boundary. Isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
+The `k3sm.io/internet-egress` annotation is the same kind of control. It records that a Pod needs to
+reach networks beyond the cluster, and admission surfaces a hand-set one, but leaving it off does not
+stop a native Pod from reaching the internet. k3sm does not manage the host's packet filter, and the
+sandbox cannot restrict network access by destination address, so nothing filters a connection a
+Pod opens on the shared host network stack. Treat egress restriction on the default runtime as
+cooperative, and run workloads you do not trust on the [`vm` RuntimeClass](vm-runtimeclass.md).
+
 ### Which Addresses Your Services Answer On
 
 Today at `main`, per port class:
@@ -410,8 +417,10 @@ We measured this on 2026-09-26 on a Mac with the agent stopped.
 **Single-label names and per-namespace precedence need the `getaddrinfo` shim.** A Pod on a
 cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) gets the cluster DNS
 configuration injected into every container, and the shim applies the Pod's search list and ndots, so
-a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this:
-`<svc>` alone, `<svc>.<ns>` and `<svc>.svc` get no answer from it. The shim also carries the
+a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this. A
+process without the shim resolves the fully qualified name and `<svc>.<ns>.svc`, but not
+`<svc>.<ns>`, `<svc>.svc` or `<svc>` alone. That matches k3s, where a process on the host resolves
+no cluster names at all. The shim also carries the
 bind/connect discipline that gives a Pod its own source address and port space. What to know:
 
 - **Host shells keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a SIP platform binary, so
