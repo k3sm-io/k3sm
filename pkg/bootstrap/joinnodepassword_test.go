@@ -219,6 +219,34 @@ func TestJoinNodePasswordVerdictsAndFaults(t *testing.T) {
 		}
 	})
 
+	t.Run("an oversized node-password is 400 and never reaches the store", func(t *testing.T) {
+		t.Parallel()
+		store := &scriptedNodePasswords{err: errors.New("bcrypt: password length exceeds 72 bytes")}
+		rig := newStoreJoinServerRig(t, store)
+		req := join(rig, "worker-1")
+		req.NodePassword = strings.Repeat("p", bootstrap.MaxNodePasswordLength+1)
+		if status, body, _ := rig.postWithHeaders(t, req); status != http.StatusBadRequest {
+			t.Fatalf("status = %d (%s), want 400: a caller-input defect is not a store outage", status, body)
+		}
+		if store.count() != 0 {
+			t.Errorf("store calls = %d, want 0", store.count())
+		}
+	})
+
+	t.Run("a node-password at the limit reaches the store", func(t *testing.T) {
+		t.Parallel()
+		store := &scriptedNodePasswords{err: bootstrap.ErrNodePasswordMismatch}
+		rig := newStoreJoinServerRig(t, store)
+		req := join(rig, "worker-1")
+		req.NodePassword = strings.Repeat("p", bootstrap.MaxNodePasswordLength)
+		if status, body, _ := rig.postWithHeaders(t, req); status != http.StatusForbidden {
+			t.Fatalf("status = %d (%s), want the store's 403", status, body)
+		}
+		if store.count() != 1 {
+			t.Errorf("store calls = %d, want 1", store.count())
+		}
+	})
+
 	t.Run("the join client reads a 503 as retry-later, not a refusal", func(t *testing.T) {
 		t.Parallel()
 		store := &scriptedNodePasswords{err: errors.New("datastore busy")}

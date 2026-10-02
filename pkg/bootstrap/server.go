@@ -268,6 +268,13 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "join request missing nodePassword", http.StatusBadRequest)
 		return
 	}
+	// bcrypt cannot hash a longer input, and the store's hashing error would
+	// otherwise be answered as the 503 "retry later" a malformed request never
+	// earns.
+	if len(req.NodePassword) > MaxNodePasswordLength {
+		http.Error(w, fmt.Sprintf("join refused: nodePassword is longer than %d bytes", MaxNodePasswordLength), http.StatusBadRequest)
+		return
+	}
 
 	// 1b. PER-TOKEN RATE LIMIT. Everything below this line is the expensive half
 	// of a join — the node-password bind, the CSR parse and policy checks, the

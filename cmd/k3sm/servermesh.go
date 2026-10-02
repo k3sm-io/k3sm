@@ -141,8 +141,11 @@ func bindSelfNodePassword(ctx context.Context, passwords bootstrap.NodePasswordS
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, bootstrap.ErrNodePasswordMismatch) || attempt >= selfBindAttempts {
+		if errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
 			return fmt.Errorf("bind the node-password of this control-plane node %q (attempts: %d): %w", nodeName, attempt, err)
+		}
+		if attempt >= selfBindAttempts {
+			return fmt.Errorf("bind the node-password of this control-plane node %q (attempts: %d): %w: %w", nodeName, attempt, errSelfBindStoreUnavailable, err)
 		}
 		t := time.NewTimer(wait)
 		select {
@@ -154,6 +157,11 @@ func bindSelfNodePassword(ctx context.Context, passwords bootstrap.NodePasswordS
 		wait *= 2
 	}
 }
+
+// errSelfBindStoreUnavailable marks a self-bind that gave up because the
+// node-password store kept failing to answer (not a mismatch), so the bring-up
+// failure can name the datastore rather than the mesh.
+var errSelfBindStoreUnavailable = errors.New("the node-password store did not answer")
 
 // selfBindAttempts is how many times bindSelfNodePassword asks the store before
 // it reports a store fault.
@@ -311,6 +319,9 @@ func (in meshBringUp) provisionHelperKey(logger *slog.Logger) {
 // hides that behind a mesh error, so the operator is told which file, which name,
 // and that restoring the original file is the recovery. The diagnosis names the
 // remedy without its mechanics and never prints the password or its hash.
+//
+// A self-bind that gave up because the store never answered gets its own
+// wording too: the fault is the datastore, and a restart retries the bind.
 func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
 	if errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
 		return "server mesh bring-up failed: this control-plane node's stored node-password file no longer matches the binding the datastore holds for its node name, usually because the node was reinstalled or its datastore restored without that file; this node is NOT on its own mesh until it is resolved. To recover, restore the original node-password file to the path below and restart; otherwise a cluster administrator can clear the stale binding for this node name and restart this server, as the multi-node guide describes under recovering from a node-password mismatch",
@@ -319,6 +330,10 @@ func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
 				"nodePasswordFile", filepath.Join(opts.workDir, serverNodePasswordRef),
 				"err", err,
 			}
+	}
+	if errors.Is(err, errSelfBindStoreUnavailable) {
+		return "server mesh bring-up failed: the datastore did not answer this control-plane node's node-password bind after its retries, so this node is NOT on its own mesh and cross-node pod traffic to it has no path. Restarting the server retries the bind",
+			[]any{"node", opts.nodeName, "err", err}
 	}
 	return "server mesh bring-up failed; this node is NOT on its own mesh, so cross-node pod traffic to it has no path and its Service proxy will source backend dials from the kernel default",
 		[]any{"err", err}

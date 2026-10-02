@@ -115,7 +115,8 @@ func TestSingleServerNodePasswordBindingSurvivesRestart(t *testing.T) {
 }
 
 // TestSingleServerStoreBuiltAfterAPIServerHealthy pins WHERE runServer builds the
-// node-password store: after the admin client exists (the store reads and writes
+// node-password store: after the control plane's health wait (exec.Start) and
+// the admin client built on it (the store reads and writes
 // Secrets through it), before this node's own enroll binds its name in it, and
 // before the join supervisor that checks every worker against it. It also pins
 // that runServer no longer builds an in-memory store at all.
@@ -140,7 +141,9 @@ func TestSingleServerStoreBuiltAfterAPIServerHealthy(t *testing.T) {
 	}
 	first["bootstrapServerDeps{}"] = depsLit
 
-	order := []string{"kubeclient.FromPath", "serverNodePasswordStore", "enrollSelfAndBringUpMesh", "bootstrapServerDeps{}"}
+	// exec.Start returns only once the control plane is healthy (the "control
+	// plane healthy" line follows it), so it anchors the health wait.
+	order := []string{"exec.Start", "kubeclient.FromPath", "serverNodePasswordStore", "enrollSelfAndBringUpMesh", "bootstrapServerDeps{}"}
 	for _, name := range order {
 		if _, ok := first[name]; !ok {
 			t.Fatalf("runServer never calls %s", name)
@@ -252,12 +255,14 @@ func TestSecretNodePasswordStoreKineBusy(t *testing.T) {
 	ctx := context.Background()
 	busy := apierrors.NewServerTimeout(corev1.Resource("secrets"), "get", 1)
 
-	// failNext makes the next n calls of verb on secrets fail with busy; commit
-	// writes the Create to the tracker first, so the call fails AFTER it landed.
+	// failNext makes the next n calls of verb on secrets fail with busy (or with
+	// err when set); commit writes the Create to the tracker first, so the call
+	// fails AFTER it landed.
 	type reactorSpec struct {
 		verb   string
 		n      int
 		commit bool
+		err    error
 	}
 	newStore := func(t *testing.T, spec reactorSpec) (*fake.Clientset, *secretNodePasswords) {
 		t.Helper()
@@ -276,6 +281,9 @@ func TestSecretNodePasswordStoreKineBusy(t *testing.T) {
 				if err := cs.Tracker().Create(corev1.SchemeGroupVersion.WithResource("secrets"), obj, action.GetNamespace()); err != nil {
 					t.Errorf("commit the create: %v", err)
 				}
+			}
+			if spec.err != nil {
+				return true, nil, spec.err
 			}
 			return true, nil, busy
 		})
@@ -314,6 +322,25 @@ func TestSecretNodePasswordStoreKineBusy(t *testing.T) {
 		}
 		if err := s.Ensure(ctx, "worker-1", "pw"); err != nil {
 			t.Fatalf("the retry: %v", err)
+		}
+		if !secretExists(t, cs) {
+			t.Error("the retry did not bind")
+		}
+	})
+
+	t.Run("a Create refused NotFound (kube-system not created yet) is an error, then a later call binds", func(t *testing.T) {
+		t.Parallel()
+		nsMissing := apierrors.NewNotFound(corev1.Resource("namespaces"), bootstrapStateNamespace)
+		cs, s := newStore(t, reactorSpec{verb: "create", n: 1, err: nsMissing})
+		err := s.Ensure(ctx, "worker-1", "pw")
+		if err == nil || errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
+			t.Fatalf("err = %v, want a transient error", err)
+		}
+		if secretExists(t, cs) {
+			t.Fatal("a refused Create left a binding")
+		}
+		if err := s.Ensure(ctx, "worker-1", "pw"); err != nil {
+			t.Fatalf("the retry once the namespace exists: %v", err)
 		}
 		if !secretExists(t, cs) {
 			t.Error("the retry did not bind")
@@ -434,5 +461,46 @@ func TestSecretNodePasswordStoreConcurrentFirstWriteWins(t *testing.T) {
 	}
 	if wins != 1 || mismatches != n-1 {
 		t.Errorf("wins = %d, mismatches = %d; want 1 and %d", wins, mismatches, n-1)
+	}
+}
+
+// TestSelfBindStoreFaultBringUpFailure: a self-bind that gave up because the
+// datastore never answered is logged as that, with the restart that retries it,
+// and neither as the mismatch diagnosis nor as the generic mesh failure.
+func TestSelfBindStoreFaultBringUpFailure(t *testing.T) {
+	shrinkSelfBindRetry(t)
+	ctx := context.Background()
+	busy := errors.New("get node-password secret: the server was unable to return a response in the time allotted")
+	opts := selfEnrollOptions(t.TempDir(), "k3sm-host")
+	logOf := func(err error) string {
+		sink := &syncBuffer{}
+		msg, attrs := serverMeshBringUpFailure(opts, err)
+		slog.New(slog.NewTextHandler(sink, nil)).Error(msg, attrs...)
+		return sink.String()
+	}
+
+	store := &countingNodePasswords{inner: bootstrap.NewMemoryNodePasswords(), fault: busy, failFirst: 1 << 30}
+	err := bindSelfNodePassword(ctx, store, opts.nodeName, opts.workDir)
+	if !errors.Is(err, errSelfBindStoreUnavailable) || !errors.Is(err, busy) {
+		t.Fatalf("err = %v, want it marked store-unavailable and carrying the store's fault", err)
+	}
+	out := logOf(err)
+	for _, want := range []string{"datastore did not answer", "Restarting the server retries the bind", opts.nodeName} {
+		if !strings.Contains(out, want) {
+			t.Errorf("store-fault failure does not contain %q:\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{genericBringUpFailure, "restore the original", "no longer matches"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("store-fault failure contains %q:\n%s", banned, out)
+		}
+	}
+
+	mismatch := &countingNodePasswords{inner: bootstrap.NewMemoryNodePasswords(), fault: bootstrap.ErrNodePasswordMismatch, failFirst: 1 << 30}
+	if err := bindSelfNodePassword(ctx, mismatch, opts.nodeName, opts.workDir); errors.Is(err, errSelfBindStoreUnavailable) {
+		t.Errorf("a mismatch was marked store-unavailable: %v", err)
+	}
+	if out := logOf(errors.New("enroll self: boom")); !strings.Contains(out, genericBringUpFailure) {
+		t.Errorf("an unrelated failure lost the generic wording:\n%s", out)
 	}
 }

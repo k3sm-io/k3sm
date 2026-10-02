@@ -57,6 +57,12 @@ const NodePasswordSecretSuffix = ".node-password.k3sm"
 // valid DNS-1123 subdomain of at most 253 characters.
 const MaxNodeNameLength = validation.DNS1123SubdomainMaxLength - len(NodePasswordSecretSuffix)
 
+// MaxNodePasswordLength is the longest node-password, in bytes, a join may
+// present: bcrypt's input limit. GenerateNodePassword's are 64 hex characters.
+// A longer one cannot be hashed, so the join handler refuses it as a malformed
+// request before the store is asked.
+const MaxNodePasswordLength = 72
+
 // ValidateNodeName reports whether name can be bound: it must be a DNS-1123
 // subdomain (the Node object's own naming rule) and short enough that its
 // binding's Secret name is one too. The join handler checks it before the store
