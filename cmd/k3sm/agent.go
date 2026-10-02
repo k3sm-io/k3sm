@@ -622,7 +622,8 @@ const joinRateLimitFallbackWait = 5 * time.Second
 type joinFunc func(context.Context, bootstrap.JoinOptions) (*bootstrap.JoinResult, error)
 
 // awaitJoin runs the join, re-trying within joinRateLimitGrace for as long as
-// the control plane answers that this token is rate-limited, and returning
+// the control plane answers that this token is rate-limited or that it could not
+// decide the join right now (a 503: its datastore did not answer), and returning
 // every other outcome — success or failure — on the spot. A rejected token, a
 // refused CSR and an unreachable server all come straight back, because nothing
 // about waiting changes any of them.
@@ -637,7 +638,18 @@ func awaitJoin(ctx context.Context, join joinFunc, opts bootstrap.JoinOptions, l
 	for attempt := 1; ; attempt++ {
 		res, err := join(ctx, opts)
 		var limited *bootstrap.JoinRateLimitedError
-		if !errors.As(err, &limited) {
+		var unavailable *bootstrap.JoinUnavailableError
+		var wait time.Duration
+		switch {
+		case errors.As(err, &limited):
+			wait = limited.RetryAfter
+		case errors.As(err, &unavailable):
+			// The control plane reached no verdict (its datastore did not answer
+			// the node-password check). Waited out under the same grace: it is
+			// not a refusal of this node, and failing the start on it would fail
+			// an install over a fault that clears in seconds.
+			wait = unavailable.RetryAfter
+		default:
 			return res, err
 		}
 		// A daemon asked to stop stops, and that is decided BEFORE the grace: a
@@ -646,16 +658,24 @@ func awaitJoin(ctx context.Context, join joinFunc, opts bootstrap.JoinOptions, l
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		wait := limited.RetryAfter
 		if wait <= 0 {
 			wait = joinRateLimitFallbackWait
 		}
 		if left := time.Until(deadline); left <= 0 || wait > left {
+			if unavailable != nil {
+				return nil, fmt.Errorf("the control plane still could not decide this join after %s (attempts: %d); it last asked this node to wait %s. Its datastore is not answering, so check the server's log; the next start retries: %w",
+					joinRateLimitGrace, attempt, wait, err)
+			}
 			return nil, fmt.Errorf("the control plane is still rate-limiting joins for this token after %s (attempts: %d); it last asked this node to wait %s. It bounds how fast ONE token may join, so onboarding several Macs at once goes faster with a token per Mac (`sudo k3sm token create` on the server): %w",
 				joinRateLimitGrace, attempt, wait, err)
 		}
-		logger.Warn("the control plane is rate-limiting joins for this token; waiting and retrying inside this start",
-			"attempt", attempt, "wait", wait, "err", err)
+		if unavailable != nil {
+			logger.Warn("the control plane could not decide this join right now; waiting and retrying inside this start",
+				"attempt", attempt, "wait", wait, "err", err)
+		} else {
+			logger.Warn("the control plane is rate-limiting joins for this token; waiting and retrying inside this start",
+				"attempt", attempt, "wait", wait, "err", err)
+		}
 		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
