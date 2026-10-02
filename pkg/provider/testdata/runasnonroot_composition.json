@@ -1,5 +1,5 @@
 {
-  "comment": "runAsNonRoot producer-rule table. Per row: pod is the pod spec's securityContext.runAsNonRoot (null = unset). Each container: kind is init | sidecar | regular | ephemeral, own is its securityContext.runAsNonRoot (null = unset), stamp is the box Container.security_context.run_as_non_root the producer must send (null = no SecurityContext message at all), effective is the kubelet's per-container verdict. podField is the box PodSecurityContext.run_as_non_root (null = no PodSecurityContext message at all). The consumer composition (container stamp OR podField) must equal effective on every row.",
+  "comment": "runAsNonRoot producer-rule table. Per row: pod is the pod spec's securityContext.runAsNonRoot (null = unset). Each container: kind is init | sidecar | regular | ephemeral, own is its securityContext.runAsNonRoot (null = unset), stamp is the box Container.security_context.run_as_non_root the producer must send (null = no SecurityContext message at all), effective is the kubelet's per-container verdict. podField is the box PodSecurityContext.run_as_non_root (null = no PodSecurityContext message at all). The consumer composition (container stamp OR podField) must equal effective on every row, except a row marked failClosed: an ephemeral container's opt-out never lowers the pod field (the field must not change mid-life), so the consumer still enforces it.",
   "rows": [
     {
       "name": "pod true, container unset: both stamped true",
@@ -71,6 +71,42 @@
         {"kind": "regular", "name": "app", "own": null, "stamp": true, "effective": true}
       ],
       "podField": false
+    },
+    {
+      "name": "an ephemeral container is stamped from the pod spec value",
+      "pod": true,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": null, "stamp": true, "effective": true},
+        {"kind": "ephemeral", "name": "dbg", "own": null, "stamp": true, "effective": true}
+      ],
+      "podField": true
+    },
+    {
+      "name": "an ephemeral container appended to a pod whose regular container opts out still resolves against the pod spec (true)",
+      "pod": true,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": false, "stamp": false, "effective": false},
+        {"kind": "ephemeral", "name": "dbg", "own": null, "stamp": true, "effective": true}
+      ],
+      "podField": false
+    },
+    {
+      "name": "an ephemeral container opting out never lowers the pod field, so it is still enforced (fail closed)",
+      "pod": true,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": null, "stamp": true, "effective": true},
+        {"kind": "ephemeral", "name": "dbg", "own": false, "stamp": false, "effective": false, "failClosed": true}
+      ],
+      "podField": true
+    },
+    {
+      "name": "pod unset, ephemeral container true: it carries its own value",
+      "pod": null,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": null, "stamp": null, "effective": false},
+        {"kind": "ephemeral", "name": "dbg", "own": true, "stamp": true, "effective": true}
+      ],
+      "podField": null
     }
   ]
 }

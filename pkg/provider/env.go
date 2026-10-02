@@ -48,6 +48,11 @@ func resolvePodBoxEnv(ctx context.Context, box *runtimev1.PodBox, facts podFacts
 			return fmt.Errorf("container %s: %w", c.GetName(), err)
 		}
 	}
+	for _, c := range box.GetEphemeralContainers() {
+		if err := resolveContainerEnv(ctx, c, ns, facts, box, r); err != nil {
+			return fmt.Errorf("ephemeral container %s: %w", c.GetName(), err)
+		}
+	}
 	return nil
 }
 

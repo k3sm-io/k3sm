@@ -174,6 +174,10 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 
 	box.InitContainers = toRuntimeContainers(pod.Spec.InitContainers, true)
 	box.Containers = toRuntimeContainers(pod.Spec.Containers, false)
+	// Ephemeral (debug) containers ride the same translation; an entry the node
+	// refuses (a targetContainerName, or any entry of a vm pod) is never sent
+	// (see ephemeral.go).
+	box.EphemeralContainers = toRuntimeEphemeralContainers(pod)
 
 	// The k3sm.io/image-platform override is parsed once here — the
 	// annotation is pod-level — and stamped onto every container as the typed
@@ -351,7 +355,7 @@ func applyXcodeToolchain(profile *runtimev1.SandboxProfile, pod *corev1.Pod, dev
 // a Default pod; for None (custom spec.dnsConfig nameservers) this is deferred
 // pending an apis/shim-ABI change.
 //
-// Scope parity: appended to both InitContainers and Containers, matching the
+// Scope parity: appended to InitContainers, Containers and EphemeralContainers, matching the
 // box-wide DYLD shim annotation.
 //
 // Precedence (infra-wins): appended after each container's user env, so
@@ -383,6 +387,9 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 		appendEnv(c)
 	}
 	for _, c := range box.GetContainers() {
+		appendEnv(c)
+	}
+	for _, c := range box.GetEphemeralContainers() {
 		appendEnv(c)
 	}
 }
@@ -437,7 +444,7 @@ func clusterCIDRs(dnsVIP string) []netip.Prefix {
 // discipline stays off rather than mis-binds.
 //
 // Precedence (infra-wins) mirrors injectClusterDNSEnv: appended after each
-// container's user env to both init and regular containers, so a workload cannot
+// container's user env to init, regular and ephemeral containers, so a workload cannot
 // override the allocated /32.
 //
 // On a host-binary route (the native sentinel, or an absolute-path image with no
@@ -473,6 +480,9 @@ func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, cidrs 
 	for _, c := range box.GetContainers() {
 		appendEnv(c)
 	}
+	for _, c := range box.GetEphemeralContainers() {
+		appendEnv(c)
+	}
 	if log == nil {
 		return
 	}
@@ -487,6 +497,9 @@ func injectBindDisciplineEnv(box *runtimev1.PodBox, podIP, nodeIP string, cidrs 
 		warn(c)
 	}
 	for _, c := range box.GetContainers() {
+		warn(c)
+	}
+	for _, c := range box.GetEphemeralContainers() {
 		warn(c)
 	}
 }
@@ -1257,6 +1270,8 @@ func derefInt64(p *int64) int64 {
 //     "Error"
 //     heuristic) — this is the path the runtimed OOMKilled reason surfaces on,
 //   - the ContainerStatus mirror (volume_mounts, user),
+//   - the ephemeral container statuses, which are reported but never decide
+//     the phase or any condition,
 //   - HostIP/HostIPs from the node IP,
 //   - Status.QOSClass: toPodStatus is the single place QOSClass is set, so
 //     all four publish paths (GetPodStatus, GetPods, the watch-stream cb, the
@@ -1297,6 +1312,12 @@ func toPodStatus(pod *corev1.Pod, rs *runtimev1.PodStatus, nodeIP string, startT
 	if ip := rs.GetPodIp(); ip != "" {
 		out.PodIPs = []corev1.PodIP{{IP: ip}}
 	}
+	// Ephemeral containers are reported and nothing more: they never feed the
+	// phase, readiness, ContainersReady, Initialized, probes, the restart
+	// authority or the pull schedules, all of which read cs/initCS above or the
+	// runtime's own container lists. The refusals this node derives (see
+	// ephemeral.go) are merged in for the names the runtime does not report.
+	out.EphemeralContainerStatuses = mergeEphemeralStatuses(toContainerStatuses(rs.GetEphemeralContainerStatuses()), pod)
 
 	// QOSClass is set here and nowhere else (see the func doc). Carry
 	// forward the apiserver's authoritative value; fall back to the hand-rolled
