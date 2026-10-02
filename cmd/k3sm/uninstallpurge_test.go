@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"os/user"
 	"strings"
 	"testing"
 )
@@ -45,10 +46,32 @@ func TestPurgeFlagValidation(t *testing.T) {
 	if err := checkPurgeFlags(true, false); !strings.Contains(err.Error(), "/var/lib/k3sm") || !strings.Contains(err.Error(), "_k3sm") {
 		t.Errorf("the refusal must say what would be destroyed: %v", err)
 	}
-	if _, _, err := purgeTarget(""); err == nil {
+	if _, _, err := purgeTarget("", "501"); err == nil {
 		t.Error("a purge with no invoking user must be refused")
 	}
-	if _, _, err := purgeTarget("root"); err == nil {
+	if _, _, err := purgeTarget("root", "0"); err == nil {
 		t.Error("a purge for root's own kubeconfig must be refused")
+	}
+}
+
+// TestPurgeTargetCrossChecksSudoUID proves SUDO_USER is believed only when the
+// account it names carries the uid sudo recorded in SUDO_UID.
+func TestPurgeTargetCrossChecksSudoUID(t *testing.T) {
+	me, err := user.Current()
+	if err != nil {
+		t.Skipf("no current user: %v", err)
+	}
+	if me.Username == "root" {
+		t.Skip("run as root: the root refusal answers first")
+	}
+	name, home, err := purgeTarget(me.Username, me.Uid)
+	if err != nil || name != me.Username || home != me.HomeDir {
+		t.Fatalf("purgeTarget(%s, %s) = %q, %q, %v", me.Username, me.Uid, name, home, err)
+	}
+	if _, _, err := purgeTarget(me.Username, me.Uid+"9"); err == nil || !strings.Contains(err.Error(), "SUDO_UID") {
+		t.Fatalf("a mismatched SUDO_UID = %v, want a refusal", err)
+	}
+	if _, _, err := purgeTarget(me.Username, ""); err == nil || !strings.Contains(err.Error(), "SUDO_UID") {
+		t.Fatalf("a missing SUDO_UID = %v, want a refusal", err)
 	}
 }

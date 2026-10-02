@@ -345,7 +345,7 @@ func runUninstall(args []string) error {
 		Deregister: deregister,
 	}
 	if *purgeFlag {
-		human, home, err := purgeTarget(os.Getenv("SUDO_USER"))
+		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
 			return err
 		}
@@ -380,13 +380,25 @@ func checkPurgeFlags(purge, yes bool) error {
 // purgeTarget is the human a purge cleans the kubeconfig of, and that
 // human's home, which the purge never deletes into. It must be a real,
 // non-root account: run through sudo from it.
-func purgeTarget(sudoUser string) (name, home string, err error) {
+//
+// sudo sets both SUDO_USER and SUDO_UID; either alone is just an environment
+// variable a caller can set. The account the name looks up must carry the uid
+// sudo recorded, so a SUDO_USER pointed at someone else's account is refused
+// rather than trusted with whose home is protected and whose kubeconfig is
+// edited.
+func purgeTarget(sudoUser, sudoUID string) (name, home string, err error) {
 	if sudoUser == "" || sudoUser == "root" {
 		return "", "", fmt.Errorf("run 'sudo k3sm uninstall --purge --yes' from your own account, so k3sm knows whose kubeconfig holds the k3sm context")
+	}
+	if sudoUID == "" {
+		return "", "", fmt.Errorf("SUDO_USER is set but SUDO_UID is not; run 'sudo k3sm uninstall --purge --yes' through sudo")
 	}
 	u, err := user.Lookup(sudoUser)
 	if err != nil {
 		return "", "", fmt.Errorf("look up %s: %w", sudoUser, err)
+	}
+	if u.Uid != sudoUID {
+		return "", "", fmt.Errorf("SUDO_USER %s has uid %s, but SUDO_UID is %s; refusing to purge on behalf of a user sudo did not record", sudoUser, u.Uid, sudoUID)
 	}
 	return u.Username, u.HomeDir, nil
 }
