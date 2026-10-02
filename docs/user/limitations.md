@@ -64,12 +64,13 @@ empty search rather than a failure. On a host whose System keychain holds certif
 both exit `0`. A workload that branches on "did I find a certificate" therefore takes the wrong
 branch silently.
 
-Anything built on the keychain inherits this. **Notarization** is out on three counts at once: the
-`notarytool` binary lives inside the Xcode application bundle, which the profile does not read; its
-stored credentials live in the keychain; and it needs outbound network, which a Pod is denied unless
-it carries the `k3sm.io/internet-egress` annotation. Signing with a Developer ID identity has the
-same keychain dependency. Sign and notarize on the host. A `vm` Pod runs Linux, so it cannot run
-this tooling either.
+Anything built on the keychain inherits this. **Notarization** is out on two counts at once: the
+`notarytool` binary lives inside the Xcode application bundle, which the profile does not read, and
+its stored credentials live in the keychain. Signing with a Developer ID identity has the same
+keychain dependency. Sign and notarize on the host. A `vm` Pod runs Linux, so it cannot run this
+tooling either. Network is not the obstacle: every native Pod may open outbound connections on the
+host network stack, and k3sm does not filter them (see "NetworkPolicy Is a Policy Hint, Not a
+Security Boundary" below).
 
 ### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
 

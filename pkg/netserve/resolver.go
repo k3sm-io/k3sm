@@ -799,12 +799,6 @@ func appendResponseOPT(b *dnsmessage.Builder, edns ednsRequest, rcode dnsmessage
 // survive the rebuild, and re-adds the response OPT it finds so a TC'd datagram
 // to an EDNS client still carries a well-formed OPT and never exceeds the size
 // that client advertised (RFC 6891 §6.2.3).
-//
-// TODO: the drop-all (vs CoreDNS's partial-packing) is a legal RFC 2181 §9
-// divergence and belongs in the tracked conformance surface, not only this
-// comment (drop-all is acceptable because k3sm's own in-pod shim + glibc both
-// TCP-refetch on TC; residual risk is a minimal-musl client that ignores TC). This repo has no
-// BACKLOG.md, so the item is filed at the workspace root.
 func truncateResponse(resp []byte) ([]byte, error) {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(resp)
