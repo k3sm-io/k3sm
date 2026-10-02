@@ -1082,6 +1082,9 @@ func (f *fakeSystem) LaunchctlBootstrap(label string) error {
 func (f *fakeSystem) LaunchctlBootout(label string) error {
 	f.calls = append(f.calls, "Bootout:"+label)
 	if err := f.purge.bootoutErrs[label]; err != nil {
+		if f.purge.unloadDespiteErr[label] {
+			delete(f.loaded, label)
+		}
 		return err
 	}
 	if f.purge.stuck[label] {

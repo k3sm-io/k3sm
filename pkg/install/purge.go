@@ -61,16 +61,17 @@ var ErrPurgeNotConfirmed = errors.New("uninstall --purge deletes the cluster's d
 // errors.Is.
 var ErrPurgeRefused = errors.New("purge refused")
 
+// ErrPurgeTreeChanged is what PurgeTree returns when the tree at the path is
+// no longer the directory the guard approved. Unlike an ordinary walk failure
+// (a busy file), it means the ground moved under the purge, so the purge
+// aborts rather than going on to the next step.
+var ErrPurgeTreeChanged = errors.New("the tree is no longer the directory that was checked")
+
+// purgeCommandTimeout bounds each subprocess the purge runs (launchctl, dscl).
+const purgeCommandTimeout = 30 * time.Second
+
 // purgeLabelPrefix is the launchd label namespace every k3sm job lives in.
 const purgeLabelPrefix = "io.k3sm."
-
-// The service-user record EnsureServiceUser creates. The purge deletes a user
-// record only when it still carries all three, so an account that merely shares
-// the name is never deleted.
-const (
-	serviceUserRealName = "k3sm service user"
-	serviceUserShell    = "/usr/bin/false"
-)
 
 // The purge's waits. They are variables so a test can shrink them.
 var (
@@ -111,6 +112,7 @@ type purgeGuardFS interface {
 	ResolvePath(path string) (string, error)
 	StatNoFollow(path string) (PathStat, error)
 	ReadDataRootMarker(dir string) (dataroot.MarkerFacts, error)
+	DirIsEmpty(dir string) (bool, error)
 }
 
 // guardedRoot is a tree purgeGuard approved, with the identity it observed so
@@ -118,6 +120,11 @@ type purgeGuardFS interface {
 type guardedRoot struct {
 	path     string
 	dev, ino uint64
+	// empty reports an EMPTY directory with no marker: a tree already purged
+	// whose final rmdir did not happen, or the mount point a deleted data
+	// volume leaves behind. There is nothing in it to protect, so it is removed
+	// with an rmdir (which refuses anything non-empty), not walked.
+	empty bool
 }
 
 // purgeDenyExact are the directories a purge never deletes, compared
@@ -209,7 +216,8 @@ func pathWithin(p, dir string) bool {
 }
 
 // purgeGuard decides whether the tree at target may be deleted whole, as root.
-// It reports exists=false (and no error) when there is nothing at target.
+// It reports exists=false (and no error) when there is nothing at target, and
+// approves an empty, unmarked directory as already purged (guardedRoot.empty).
 //
 // The rules, all of which must hold: target is absolute and clean; it is a
 // real directory, not a symlink; its resolution passes purgePathRules; it is
@@ -251,6 +259,9 @@ func purgeGuard(fsys purgeGuardFS, target string, homes []string, allowMount boo
 	}
 	facts, err := fsys.ReadDataRootMarker(target)
 	if errors.Is(err, fs.ErrNotExist) {
+		if empty, eerr := fsys.DirIsEmpty(target); eerr == nil && empty {
+			return guardedRoot{path: target, dev: st.Dev, ino: st.Ino, empty: true}, true, nil
+		}
 		return guardedRoot{}, true, fmt.Errorf("%s carries no %s marker (an install from before markers existed): run `sudo k3sm install` once, which writes it, then `sudo k3sm uninstall --purge --yes`: %w",
 			target, dataroot.MarkerName, ErrPurgeRefused)
 	}
@@ -304,7 +315,7 @@ type purgePlan struct {
 // planPurge is the preflight. It runs before the uninstall tears anything
 // down, over the manifest the uninstall is about to walk, and refuses rather
 // than plan anything it cannot carry out safely.
-func planPurge(sys System, cfg Config, m []artifact, st dataroot.State) (purgePlan, error) {
+func planPurge(ctx context.Context, sys System, cfg Config, m []artifact, st dataroot.State) (purgePlan, error) {
 	var plan purgePlan
 	plan.homes = []string{cfg.TargetHome}
 	if cfg.TargetHome != "" {
@@ -367,7 +378,7 @@ func planPurge(sys System, cfg Config, m []artifact, st dataroot.State) (purgePl
 		}
 	}
 	for _, name := range plan.serviceUsers {
-		rec, err := sys.ServiceUser(name)
+		rec, err := sys.ServiceUser(ctx, name)
 		if err != nil {
 			return plan, fmt.Errorf("read the %s user record: %v: %w", name, err, ErrPurgeRefused)
 		}
@@ -378,6 +389,9 @@ func planPurge(sys System, cfg Config, m []artifact, st dataroot.State) (purgePl
 			return plan, err
 		}
 		if name == cfg.ServiceUser {
+			if err := checkServiceUID(name, rec.UID); err != nil {
+				return plan, err
+			}
 			plan.serviceUID, plan.hasServiceUID = rec.UID, true
 		}
 	}
@@ -408,6 +422,18 @@ func checkServiceUser(name string, rec ServiceUserRecord, dataRoot string) error
 	return nil
 }
 
+// checkServiceUID refuses a service uid the purge must never enumerate or
+// kill the processes of: root, and anything outside the hidden system range
+// EnsureServiceUser allocates the account from. Killing "every process of
+// uid 0" would kill the Mac.
+func checkServiceUID(name string, uid uint32) error {
+	if uid == 0 || uid < systemUIDFloor || uid > systemUIDCeil {
+		return fmt.Errorf("the %s user has uid %d, outside the range [%d,%d] k3sm creates it in; refusing to kill its processes: %w",
+			name, uid, systemUIDFloor, systemUIDCeil, ErrPurgeRefused)
+	}
+	return nil
+}
+
 // purge is Uninstall with cfg.Purge set. See the order at the top of this file.
 func purge(ctx context.Context, sys System, cfg Config) error {
 	if !cfg.PurgeConfirmed {
@@ -420,7 +446,7 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 			// decides whether deleting it would delete into a filesystem.
 			return fmt.Errorf("inspect the data root %s: %v: %w", cfg.DataRoot, stErr, ErrPurgeRefused)
 		}
-		p, err := planPurge(sys, cfg, m, st)
+		p, err := planPurge(ctx, sys, cfg, m, st)
 		plan = p
 		return err
 	})
@@ -446,13 +472,27 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 	var removed []string
 	var errs []error
 	for _, root := range plan.roots {
+		// The guard runs again because the ground has moved since the
+		// preflight: the volume is gone, and its mount point (if any) is what
+		// is at the data root now. A refusal here, or a tree that is no longer
+		// the one the guard approved, aborts the purge: nothing further is
+		// removed and the service user is kept, so a re-run can finish.
 		g, exists, err := purgeGuard(sys, root, plan.homes, false)
 		switch {
 		case err != nil:
-			errs = append(errs, err)
+			return fmt.Errorf("uninstall --purge: %w (stopped: nothing further was removed, the service user is kept)", err)
 		case !exists:
+		case g.empty:
+			if err := sys.RemoveEntry(filepath.Dir(root), filepath.Base(root)); err != nil {
+				errs = append(errs, fmt.Errorf("remove the empty %s: %w", root, err))
+				continue
+			}
+			removed = append(removed, root)
 		default:
 			if err := sys.PurgeTree(g.path, g.dev, g.ino); err != nil {
+				if errors.Is(err, ErrPurgeTreeChanged) {
+					return fmt.Errorf("uninstall --purge: purge %s: %w (stopped: nothing further was removed, the service user is kept)", root, err)
+				}
 				errs = append(errs, fmt.Errorf("purge %s: %w", root, err))
 				continue
 			}
@@ -479,7 +519,7 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 		return fmt.Errorf("uninstall --purge: %w (the service user is kept; fix the above and re-run)", errors.Join(errs...))
 	}
 	for _, name := range plan.serviceUsers {
-		gone, err := deleteServiceUser(sys, name, cfg.DataRoot)
+		gone, err := deleteServiceUser(ctx, sys, name, cfg.DataRoot)
 		if err != nil {
 			return fmt.Errorf("uninstall --purge: %w", err)
 		}
@@ -497,21 +537,30 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 // (a job a different build installed) and waits out a bootout that returned
 // before launchd let the job go.
 func settleLaunchd(ctx context.Context, sys System) error {
-	labels, err := sys.LoadedLabels(purgeLabelPrefix)
+	labels, err := sys.LoadedLabels(ctx, purgeLabelPrefix)
 	if err != nil {
 		return fmt.Errorf("uninstall --purge: list the loaded k3sm jobs: %w", err)
 	}
+	// A bootout error is not the verdict: launchd can report a failure for a
+	// job that is on its way out (the race with a job exiting by itself). The
+	// verdict is whether the label is still loaded once the poll ends, and the
+	// errors are kept only to explain a refusal.
+	var bootoutErrs []error
 	for _, l := range labels {
 		if err := sys.LaunchctlBootout(l); err != nil {
-			return fmt.Errorf("uninstall --purge: %w", err)
+			bootoutErrs = append(bootoutErrs, err)
 		}
 	}
-	left, err := pollUntilEmpty(ctx, purgeSettle, func() ([]string, error) { return sys.LoadedLabels(purgeLabelPrefix) })
+	left, err := pollUntilEmpty(ctx, purgeSettle, func() ([]string, error) { return sys.LoadedLabels(ctx, purgeLabelPrefix) })
 	if err != nil {
 		return fmt.Errorf("uninstall --purge: list the loaded k3sm jobs: %w", err)
 	}
 	if len(left) > 0 {
-		return fmt.Errorf("uninstall --purge: still loaded after bootout: %s: %w (nothing the uninstall keeps was removed)", strings.Join(left, ", "), ErrPurgeRefused)
+		cause := ""
+		if len(bootoutErrs) > 0 {
+			cause = " (" + errors.Join(bootoutErrs...).Error() + ")"
+		}
+		return fmt.Errorf("uninstall --purge: still loaded after bootout: %s%s: %w (nothing the uninstall keeps was removed)", strings.Join(left, ", "), cause, ErrPurgeRefused)
 	}
 	return nil
 }
@@ -521,6 +570,9 @@ func settleLaunchd(ctx context.Context, sys System) error {
 // once, and refuses if any survives. Deleting the data root, or the account,
 // from under a live process is what this prevents.
 func assertNoServiceProcesses(ctx context.Context, sys System, name string, uid uint32) error {
+	if err := checkServiceUID(name, uid); err != nil {
+		return fmt.Errorf("uninstall --purge: %w", err)
+	}
 	list := func() ([]string, error) {
 		pids, err := sys.ProcessesOfUID(uid)
 		out := make([]string, 0, len(pids))
@@ -579,7 +631,11 @@ func purgeDataVolume(ctx context.Context, sys System, cfg Config, plan purgePlan
 	switch {
 	case plan.volume != nil:
 		rec := *plan.volume
-		err := datavol.Delete(ctx, cfg.DataVolumeDeps, cfg.DataRootFS, loadedJobs{sys}, dataroot.DefaultRecordPath, rec, datavol.DeleteOptions{
+		loaded := loadedJobs(func(label string) bool {
+			labels, err := sys.LoadedLabels(ctx, label)
+			return err != nil || slices.Contains(labels, label)
+		})
+		err := datavol.Delete(ctx, cfg.DataVolumeDeps, cfg.DataRootFS, loaded, dataroot.DefaultRecordPath, rec, datavol.DeleteOptions{
 			Yes:                 true,
 			FstabPath:           dataroot.FstabPath,
 			NetdLabel:           NetdLabel,
@@ -598,23 +654,21 @@ func purgeDataVolume(ctx context.Context, sys System, cfg Config, plan purgePlan
 	return nil
 }
 
-// loadedJobs answers datavol.Delete's one launchd question from the System's
-// loaded-label list. An unreadable list answers "loaded", so Delete refuses.
-type loadedJobs struct{ sys System }
+// loadedJobs answers datavol.Delete's one launchd question. purgeDataVolume
+// builds it from the System's loaded-label list, where an unreadable list
+// answers "loaded", so Delete refuses.
+type loadedJobs func(label string) bool
 
 // Loaded implements datavol.Launchd.
-func (l loadedJobs) Loaded(label string) bool {
-	labels, err := l.sys.LoadedLabels(label)
-	return err != nil || slices.Contains(labels, label)
-}
+func (l loadedJobs) Loaded(label string) bool { return l(label) }
 
 // deleteServiceUser deletes the service user's record after re-reading it and
 // confirming it is still the one k3sm created. A missing record is success
 // (gone=false). Only the user record is deleted: install creates no group
 // (the account's primary group is 20, staff, shared by every login user), and
 // no group is ever touched here.
-func deleteServiceUser(sys System, name, dataRoot string) (gone bool, err error) {
-	rec, err := sys.ServiceUser(name)
+func deleteServiceUser(ctx context.Context, sys System, name, dataRoot string) (gone bool, err error) {
+	rec, err := sys.ServiceUser(ctx, name)
 	if err != nil {
 		return false, fmt.Errorf("read the %s user record: %w", name, err)
 	}
@@ -624,7 +678,7 @@ func deleteServiceUser(sys System, name, dataRoot string) (gone bool, err error)
 	if err := checkServiceUser(name, rec, dataRoot); err != nil {
 		return false, err
 	}
-	if err := sys.DeleteServiceUser(name); err != nil {
+	if err := sys.DeleteServiceUser(ctx, name); err != nil {
 		return false, fmt.Errorf("delete the %s user: %w", name, err)
 	}
 	return true, nil

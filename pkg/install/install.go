@@ -1070,21 +1070,30 @@ type System interface {
 	// EPERM, collects every failure rather than stopping at the first, and
 	// unlinks root's marker and then root itself only when everything else is
 	// gone. It never uses os.RemoveAll.
+	//
+	// A root that is no longer the (dev, ino) handed in is refused with an
+	// error wrapping ErrPurgeTreeChanged and nothing removed.
 	PurgeTree(root string, dev, ino uint64) error
+	// DirIsEmpty reports whether dir (not followed if it is a symlink) holds no
+	// entries at all.
+	DirIsEmpty(dir string) (bool, error)
 	// LoadedLabels lists the launchd jobs loaded in the system domain whose
-	// label starts with prefix.
-	LoadedLabels(prefix string) ([]string, error)
-	// ProcessesOfUID lists the pids whose real or effective uid is uid.
+	// label starts with prefix. The subprocess is bounded by ctx.
+	LoadedLabels(ctx context.Context, prefix string) ([]string, error)
+	// ProcessesOfUID lists the pids whose real or effective uid is uid,
+	// leaving out zombies (exited, awaiting their parent's wait): they hold
+	// nothing open and no signal reaches them.
 	ProcessesOfUID(uid uint32) ([]int, error)
 	// KillProcess sends SIGKILL to pid. A process that is already gone is
 	// success.
 	KillProcess(pid int) error
 	// ServiceUser reads the named user's directory-service record. A user that
-	// does not exist is Exists=false with a nil error.
-	ServiceUser(name string) (ServiceUserRecord, error)
+	// does not exist is Exists=false with a nil error. Subprocesses are bounded
+	// by ctx.
+	ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error)
 	// DeleteServiceUser deletes the named user's record (dscl . -delete
 	// /Users/<name>). It deletes no group.
-	DeleteServiceUser(name string) error
+	DeleteServiceUser(ctx context.Context, name string) error
 	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping
 	// every other entry, the file's owner and its mode. An absent file or

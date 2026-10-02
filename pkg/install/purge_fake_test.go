@@ -17,6 +17,7 @@ limitations under the License.
 package install
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"path/filepath"
@@ -55,6 +56,13 @@ type fakePurge struct {
 	// accepted for bootout and never leave the loaded list.
 	bootoutErrs map[string]error
 	stuck       map[string]bool
+	// unloadDespiteErr labels leave launchd although their bootout reported an
+	// error: the race with a job exiting by itself.
+	unloadDespiteErr map[string]bool
+	// nonEmpty are directories DirIsEmpty reports as holding entries. Any other
+	// directory the fake knows is empty, which only matters once its marker
+	// is gone (a marked tree is walked, never asked).
+	nonEmpty map[string]bool
 	// kubeErr is what RemoveAdminKubeconfigContext returns.
 	kubeErr error
 	// ino numbers the directories seedPurgeable creates.
@@ -133,7 +141,7 @@ func (f *fakeSystem) PurgeTree(root string, dev, ino uint64) error {
 	}
 	st, ok := f.purge.stats[root]
 	if !ok || st.Dev != dev || st.Ino != ino {
-		return fmt.Errorf("%s is no longer the directory that was checked", root)
+		return fmt.Errorf("%s: %w", root, ErrPurgeTreeChanged)
 	}
 	under := func(p string) bool { return p == root || strings.HasPrefix(p, root+"/") }
 	for p := range f.purge.stats {
@@ -154,7 +162,16 @@ func (f *fakeSystem) PurgeTree(root string, dev, ino uint64) error {
 	return nil
 }
 
-func (f *fakeSystem) LoadedLabels(prefix string) ([]string, error) {
+// DirIsEmpty answers from nonEmpty; a path the fake has no stat for is absent.
+func (f *fakeSystem) DirIsEmpty(dir string) (bool, error) {
+	f.calls = append(f.calls, "DirIsEmpty:"+dir)
+	if _, ok := f.purge.stats[dir]; !ok {
+		return false, fmt.Errorf("open %s: %w", dir, fs.ErrNotExist)
+	}
+	return !f.purge.nonEmpty[dir], nil
+}
+
+func (f *fakeSystem) LoadedLabels(_ context.Context, prefix string) ([]string, error) {
 	f.calls = append(f.calls, "LoadedLabels:"+prefix)
 	var out []string
 	for l := range f.loaded {
@@ -180,7 +197,7 @@ func (f *fakeSystem) KillProcess(pid int) error {
 	return nil
 }
 
-func (f *fakeSystem) ServiceUser(name string) (ServiceUserRecord, error) {
+func (f *fakeSystem) ServiceUser(_ context.Context, name string) (ServiceUserRecord, error) {
 	f.calls = append(f.calls, "ServiceUser:"+name)
 	switch {
 	case f.purge.userDeleted:
@@ -191,7 +208,7 @@ func (f *fakeSystem) ServiceUser(name string) (ServiceUserRecord, error) {
 	return ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: DefaultDataRoot}, nil
 }
 
-func (f *fakeSystem) DeleteServiceUser(name string) error {
+func (f *fakeSystem) DeleteServiceUser(_ context.Context, name string) error {
 	f.calls = append(f.calls, "DeleteServiceUser:"+name)
 	f.purge.userDeleted = true
 	return nil

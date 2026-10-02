@@ -68,6 +68,15 @@ const (
 	systemUIDCeil  = 400
 )
 
+// The service-user record EnsureServiceUser creates, as the one copy both it
+// and the purge read: the purge deletes a user record only when it still
+// carries both (and a home equal to the data root), so an account that merely
+// shares the name is never deleted.
+const (
+	serviceUserRealName = "k3sm service user"
+	serviceUserShell    = "/usr/bin/false"
+)
+
 // EnsureServiceUser idempotently creates name as a hidden, no-login system user
 // whose home is dataRoot, and ensures that data root exists with the root row
 // of the ownership table (root:wheel 0755). The home is NOT the service user's:
@@ -2157,7 +2166,7 @@ func purgeTree(root string, wantDev, wantIno uint64, devOf func(string, *unix.St
 		return fmt.Errorf("stat %s: %w", root, err)
 	}
 	if statDev(&st) != wantDev || st.Ino != wantIno {
-		return fmt.Errorf("%s is no longer the directory that was checked; nothing removed", root)
+		return fmt.Errorf("%s: %w; nothing removed", root, ErrPurgeTreeChanged)
 	}
 	w := &purgeWalk{rootDev: devOf(root, &st), devOf: devOf}
 	w.empty(fd, root, true)
@@ -2185,7 +2194,7 @@ func removeRootDir(rootfd int, root string, st *unix.Stat_t) error {
 		return fmt.Errorf("stat %s: %w", root, err)
 	}
 	if now.Dev != st.Dev || now.Ino != st.Ino {
-		return fmt.Errorf("%s was replaced during the purge; not removed", root)
+		return fmt.Errorf("%s was replaced during the purge: %w; not removed", root, ErrPurgeTreeChanged)
 	}
 	err = unix.Unlinkat(pfd, base, unix.AT_REMOVEDIR)
 	if errors.Is(err, unix.EPERM) {
@@ -2293,11 +2302,28 @@ func clearRegularFileFlags(dirfd int, name string) {
 	}
 }
 
+// DirIsEmpty reports whether dir holds no entries, listed through a
+// descriptor opened O_NOFOLLOW (a symlink at dir is an error, never followed).
+func (darwinSystem) DirIsEmpty(dir string) (bool, error) {
+	fd, err := openDirNoFollow(dir)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	names, err := readDirNames(fd, dir)
+	if err != nil {
+		return false, fmt.Errorf("list %s: %w", dir, err)
+	}
+	return len(names) == 0, nil
+}
+
 // LoadedLabels lists the system-domain jobs whose label starts with prefix,
 // from `launchctl list` (run as root, that is the system domain): one job per
 // line, "PID Status Label".
-func (darwinSystem) LoadedLabels(prefix string) ([]string, error) {
-	out, err := exec.Command("launchctl", "list").Output()
+func (darwinSystem) LoadedLabels(ctx context.Context, prefix string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "launchctl", "list").Output()
 	if err != nil {
 		return nil, fmt.Errorf("launchctl list: %w", err)
 	}
@@ -2322,18 +2348,31 @@ func parseLaunchctlList(out []byte, prefix string) []string {
 }
 
 // ProcessesOfUID lists the pids whose effective (kern.proc.uid) or real
-// (kern.proc.ruid) uid is uid, sorted.
+// (kern.proc.ruid) uid is uid, sorted, leaving out zombies.
 func (darwinSystem) ProcessesOfUID(uid uint32) ([]int, error) {
-	seen := map[int]bool{}
+	var all []unix.KinfoProc
 	for _, mib := range []string{"kern.proc.uid", "kern.proc.ruid"} {
 		procs, err := unix.SysctlKinfoProcSlice(mib, int(uid))
 		if err != nil {
 			return nil, fmt.Errorf("sysctl %s %d: %w", mib, uid, err)
 		}
-		for _, p := range procs {
-			if pid := int(p.Proc.P_pid); pid > 0 {
-				seen[pid] = true
-			}
+		all = append(all, procs...)
+	}
+	return livePIDs(all), nil
+}
+
+// procStateZombie is SZOMB from <sys/proc.h>: a process that has exited and
+// waits for its parent to reap it. x/sys/unix does not export it.
+const procStateZombie = 5
+
+// livePIDs is the distinct, sorted pids of procs, without zombies: a zombie
+// has released everything it held and ignores every signal, so counting it as
+// a survivor would refuse a purge nothing is actually blocking.
+func livePIDs(procs []unix.KinfoProc) []int {
+	seen := map[int]bool{}
+	for _, p := range procs {
+		if pid := int(p.Proc.P_pid); pid > 0 && p.Proc.P_stat != procStateZombie {
+			seen[pid] = true
 		}
 	}
 	pids := make([]int, 0, len(seen))
@@ -2341,7 +2380,7 @@ func (darwinSystem) ProcessesOfUID(uid uint32) ([]int, error) {
 		pids = append(pids, pid)
 	}
 	sort.Ints(pids)
-	return pids, nil
+	return pids
 }
 
 // KillProcess sends SIGKILL to pid; a process already gone is success.
@@ -2358,7 +2397,7 @@ func (darwinSystem) KillProcess(pid int) error {
 // ServiceUser reads the named user's record: the uid from the user database,
 // and RealName, UserShell and NFSHomeDirectory from the local directory node,
 // the attributes EnsureServiceUser wrote.
-func (darwinSystem) ServiceUser(name string) (ServiceUserRecord, error) {
+func (darwinSystem) ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error) {
 	u, err := user.Lookup(name)
 	if err != nil {
 		var unknown user.UnknownUserError
@@ -2373,7 +2412,9 @@ func (darwinSystem) ServiceUser(name string) (ServiceUserRecord, error) {
 	}
 	rec := ServiceUserRecord{Exists: true, UID: uint32(uid)}
 	for attr, dst := range map[string]*string{"RealName": &rec.RealName, "UserShell": &rec.Shell, "NFSHomeDirectory": &rec.Home} {
-		out, err := exec.Command("dscl", ".", "-read", "/Users/"+name, attr).Output()
+		cctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
+		out, err := exec.CommandContext(cctx, "dscl", ".", "-read", "/Users/"+name, attr).Output()
+		cancel()
 		if err != nil {
 			return ServiceUserRecord{}, fmt.Errorf("dscl . -read /Users/%s %s: %w", name, attr, err)
 		}
@@ -2392,11 +2433,13 @@ func parseDsclAttr(out []byte, attr string) string {
 
 // DeleteServiceUser deletes the named user's record. No group is touched:
 // install never creates one (see EnsureServiceUser's PrimaryGroupID 20).
-func (darwinSystem) DeleteServiceUser(name string) error {
+func (darwinSystem) DeleteServiceUser(ctx context.Context, name string) error {
 	if name == "" || strings.ContainsAny(name, "/ ") {
 		return fmt.Errorf("refusing to delete user %q", name)
 	}
-	if out, err := exec.Command("dscl", ".", "-delete", "/Users/"+name).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "dscl", ".", "-delete", "/Users/"+name).CombinedOutput(); err != nil {
 		return fmt.Errorf("dscl . -delete /Users/%s: %w: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil

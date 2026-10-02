@@ -228,3 +228,18 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 		t.Fatal("a refused removal changed the file")
 	}
 }
+
+// TestPurgeLivePIDsSkipsZombies proves a zombie is neither counted as a
+// survivor nor killed, and that the two sysctl lists are merged without
+// duplicates.
+func TestPurgeLivePIDsSkipsZombies(t *testing.T) {
+	proc := func(pid int32, stat int8) unix.KinfoProc {
+		var p unix.KinfoProc
+		p.Proc.P_pid, p.Proc.P_stat = pid, stat
+		return p
+	}
+	got := livePIDs([]unix.KinfoProc{proc(300, 2), proc(200, procStateZombie), proc(300, 2), proc(100, 3), proc(0, 2)})
+	if len(got) != 2 || got[0] != 100 || got[1] != 300 {
+		t.Fatalf("livePIDs = %v, want [100 300]", got)
+	}
+}

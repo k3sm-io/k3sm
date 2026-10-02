@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"slices"
@@ -38,7 +39,23 @@ type purgeRig struct {
 	logs *bytes.Buffer
 	// disk is the fake diskutil when the rig carries a data volume.
 	disk *datavoltest.Fake
+	// leftBehind is what deleting the data volume leaves at the data root,
+	// which is never the marked tree: the marker lived on the volume.
+	leftBehind mountLeftover
 }
+
+// mountLeftover is the data root's posture once its volume is deleted.
+type mountLeftover int
+
+const (
+	// leftEmpty is the ordinary case: an empty mount point directory.
+	leftEmpty mountLeftover = iota
+	// leftAbsent: the mount point was removed with the volume.
+	leftAbsent
+	// leftNonEmpty: something sat under the mount point (shadow content), and
+	// nothing marks it as k3sm's.
+	leftNonEmpty
+)
 
 // purgeVolumeUUID is the recorded data volume in the data-volume rigs.
 const purgeVolumeUUID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
@@ -56,6 +73,25 @@ func newPurgeRig(t *testing.T, role Role, withVolume bool) *purgeRig {
 		dv.seedRecord(t, purgeVolumeUUID)
 		dv.disk.Vols[purgeVolumeUUID].Mountpoint = dv.cfg.DataRoot
 		r.f, r.cfg, r.disk = dv.sys, dv.cfg, dv.disk
+		// Deleting the volume takes its contents, marker included, with it:
+		// what remains at the data root is the bare mount point, or nothing.
+		f, dataRoot := r.f, dv.cfg.DataRoot
+		dv.disk.Log = func(line string) {
+			f.calls = append(f.calls, "datavol."+line)
+			if !strings.HasPrefix(line, "deletevolume ") {
+				return
+			}
+			delete(f.purge.markers, dataRoot)
+			switch r.leftBehind {
+			case leftAbsent:
+				delete(f.purge.stats, dataRoot)
+			case leftNonEmpty:
+				if f.purge.nonEmpty == nil {
+					f.purge.nonEmpty = map[string]bool{}
+				}
+				f.purge.nonEmpty[dataRoot] = true
+			}
+		}
 	} else {
 		r.f = &fakeSystem{}
 		// The default data root, read through a fake: the dev Mac running the
@@ -118,6 +154,13 @@ func TestPurgeRemovesEveryPreservedArtifact(t *testing.T) {
 				if p, ok := strings.CutPrefix(c, "PurgeTree:"); ok {
 					purged = append(purged, p)
 				}
+				// A root removed as an empty directory (the mount point a
+				// deleted volume left) is gone with everything that was in it.
+				if e, ok := strings.CutPrefix(c, "RemoveEntry:"); ok {
+					if dir, name, ok := strings.Cut(e, ":"); ok && slices.Contains(m, artifact{kind: kindDir, disp: dispPreserve, path: filepath.Join(dir, name)}) {
+						purged = append(purged, filepath.Join(dir, name))
+					}
+				}
 			}
 			inPurged := func(p string) bool {
 				return slices.Contains(purged, p) || coveredBy(p, purged)
@@ -138,7 +181,7 @@ func TestPurgeRemovesEveryPreservedArtifact(t *testing.T) {
 						t.Errorf("the k3sm context in %s's kubeconfig was not removed", a.user)
 					}
 				case kindDir:
-					if !inPurged(a.path) {
+					if !inPurged(a.path) && !r.called("RemoveEntry:"+filepath.Dir(a.path)+":"+filepath.Base(a.path)) {
 						t.Errorf("preserved dir %s was not purged (purged: %v)", a.path, purged)
 					}
 				case kindFile:
@@ -174,23 +217,25 @@ func TestPurgeOrderIsBootoutsThenProcessesThenVolumeThenTreesThenUser(t *testing
 	r := newPurgeRig(t, RoleServer, true)
 	r.f.putLoaded("io.k3sm.server", "io.k3sm.stray")
 	r.f.purge.procs = []int{4242}
+	args := r.cfg.withDefaults().argsRecordPath()
 	if err := r.run(); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 	assertOrder(t, r.f.calls,
-		"Bootout:io.k3sm.server",        // the ordinary uninstall
-		"FlushLo0Aliases:",              // ...ran to its end
-		"LoadedLabels:io.k3sm.",         // then every k3sm job is listed
-		"Bootout:io.k3sm.stray",         // and the one it did not know is booted out
-		"ProcessesOfUID:271",            // no process may still run as _k3sm
-		"KillProcess:4242",              // the one that would not exit is killed once
-		"datavol.unmount",               // the volume is unmounted
-		"datavol.deletevolume",          // and deleted, never walked
-		"PurgeTree:"+r.cfg.DataRoot,     // then the trees
-		"PurgeTree:"+LogDir,             //
-		"RemoveEntry:",                  // the files outside them
-		"RemoveAdminKubeconfigContext:", // the kubeconfig context
-		"DeleteServiceUser:_k3sm",       // and the user last
+		"Bootout:io.k3sm.server", // the ordinary uninstall
+		"FlushLo0Aliases:",       // ...ran to its end
+		"LoadedLabels:io.k3sm.",  // then every k3sm job is listed
+		"Bootout:io.k3sm.stray",  // and the one it did not know is booted out
+		"ProcessesOfUID:271",     // no process may still run as _k3sm
+		"KillProcess:4242",       // the one that would not exit is killed once
+		"datavol.unmount",        // the volume is unmounted
+		"datavol.deletevolume",   // and deleted, never walked
+		// then the trees: the bare mount point the volume left, then the logs
+		"RemoveEntry:"+filepath.Dir(r.cfg.DataRoot)+":"+filepath.Base(r.cfg.DataRoot),
+		"PurgeTree:"+LogDir,
+		"RemoveEntry:"+filepath.Dir(args)+":"+filepath.Base(args), // the files outside them
+		"RemoveAdminKubeconfigContext:",                           // the kubeconfig context
+		"DeleteServiceUser:_k3sm",                                 // and the user last
 	)
 }
 
@@ -249,8 +294,9 @@ func TestPurgeRefusals(t *testing.T) {
 		{name: "the data root is mounted with no k3sm record", reason: "mounted filesystem with no k3sm data-volume record", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			r.disk.Add(datavoltest.Volume{UUID: "FFFFFFFF-0000-0000-0000-000000000000", Name: "theirs", Mountpoint: DefaultDataRoot})
 		}},
-		{name: "the data root has no marker", reason: "run `sudo k3sm install` once", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+		{name: "the data root has no marker and is not empty", reason: "run `sudo k3sm install` once", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			delete(r.f.purge.markers, DefaultDataRoot)
+			r.f.purge.nonEmpty = map[string]bool{DefaultDataRoot: true}
 		}},
 		{name: "the marker is not root-owned", reason: "not root", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			m := r.f.purge.markers[LogDir]
@@ -274,6 +320,12 @@ func TestPurgeRefusals(t *testing.T) {
 		}},
 		{name: "the service user is not the account k3sm created", reason: "not the account k3sm created", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
 			r.f.purge.user.RealName = "Someone Else"
+		}},
+		{name: "the service uid is root", reason: "outside the range", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.user.UID = 0
+		}},
+		{name: "the service uid is a login user's", reason: "outside the range", preflight: true, want: ErrPurgeRefused, edit: func(r *purgeRig) {
+			r.f.purge.user.UID = 501
 		}},
 		{name: "a bootout fails in the uninstall phase", reason: "the purge did not run", want: errBoom, edit: func(r *purgeRig) {
 			r.f.purge.bootoutErrs = map[string]error{ServerLabel: errBoom}
@@ -303,7 +355,7 @@ func TestPurgeRefusals(t *testing.T) {
 			if r.anyCall("PurgeTree:") || r.anyCall("DeleteServiceUser:") || r.anyCall("RemoveAdminKubeconfigContext:") {
 				t.Fatalf("a refused purge removed something:\n%s", strings.Join(r.f.calls, "\n"))
 			}
-			if tc.preflight && (r.anyCall("Bootout:") || r.anyCall("RemoveAll:")) {
+			if tc.preflight && (r.anyCall("Bootout:") || r.anyCall("RemoveAll:") || r.anyCall("ProcessesOfUID:") || r.anyCall("KillProcess:")) {
 				t.Fatalf("a preflight refusal tore the install down:\n%s", strings.Join(r.f.calls, "\n"))
 			}
 		})
@@ -329,7 +381,101 @@ func TestPurgeRefusals(t *testing.T) {
 		if r.anyCall("DeleteServiceUser:") {
 			t.Fatal("the service user was deleted although a tree could not be purged")
 		}
+		// An ordinary walk failure is collected and the pass goes on.
+		if !r.called("PurgeTree:" + LogDir) {
+			t.Fatal("a walk failure in one tree stopped the purge of the next")
+		}
 	})
+}
+
+// TestPurgeAbortsWhenTheSecondPassRefuses pins the abort: a guard refusal, or a
+// tree that is no longer the one approved, in the removal pass stops the purge
+// there. No further root, no preserved file, no kubeconfig edit, no user delete.
+func TestPurgeAbortsWhenTheSecondPassRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		volume bool
+		edit   func(r *purgeRig)
+		want   error
+	}{
+		{"the volume left a non-empty, unmarked mount point", true, func(r *purgeRig) { r.leftBehind = leftNonEmpty }, ErrPurgeRefused},
+		{"the data root was swapped after the guard", false, func(r *purgeRig) {
+			r.f.purge.purgeErrs = map[string]error{DefaultDataRoot: fmt.Errorf("%s: %w", DefaultDataRoot, ErrPurgeTreeChanged)}
+		}, ErrPurgeTreeChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPurgeRig(t, RoleServer, tc.volume)
+			tc.edit(r)
+			args := r.cfg.withDefaults().argsRecordPath()
+			if err := r.run(); !errors.Is(err, tc.want) {
+				t.Fatalf("purge = %v, want %v", err, tc.want)
+			}
+			for _, c := range []string{"PurgeTree:" + LogDir, "RemoveEntry:" + filepath.Dir(args) + ":" + filepath.Base(args), "RemoveAdminKubeconfigContext:alice", "DeleteServiceUser:_k3sm"} {
+				if r.called(c) {
+					t.Errorf("an aborted purge went on to %s:\n%s", c, strings.Join(r.f.calls, "\n"))
+				}
+			}
+		})
+	}
+}
+
+// TestPurgeIsRerunnable pins the two postures a half-finished purge, or a
+// deleted data volume, leaves at a root: absent, or an empty directory with no
+// marker. Both count as already purged, so the purge completes.
+func TestPurgeIsRerunnable(t *testing.T) {
+	t.Run("the volume left an empty mount point", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, true)
+		r.leftBehind = leftEmpty
+		if err := r.run(); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if !r.called("RemoveEntry:"+filepath.Dir(r.cfg.DataRoot)+":"+filepath.Base(r.cfg.DataRoot)) || !r.called("DeleteServiceUser:_k3sm") {
+			t.Fatalf("the empty mount point was not removed, or the purge did not finish:\n%s", strings.Join(r.f.calls, "\n"))
+		}
+		if r.called("PurgeTree:" + r.cfg.DataRoot) {
+			t.Fatal("an empty, unmarked directory was walked rather than rmdir'd")
+		}
+	})
+	t.Run("the volume took the mount point with it", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, true)
+		r.leftBehind = leftAbsent
+		if err := r.run(); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if !r.called("DeleteServiceUser:_k3sm") {
+			t.Fatal("the purge did not finish")
+		}
+	})
+	t.Run("an empty, unmarked data root from an interrupted purge", func(t *testing.T) {
+		r := newPurgeRig(t, RoleServer, false)
+		delete(r.f.purge.markers, DefaultDataRoot)
+		if err := r.run(); err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if !r.called("RemoveEntry:/var/lib:k3sm") || r.called("PurgeTree:"+DefaultDataRoot) {
+			t.Fatalf("the empty root was not rmdir'd:\n%s", strings.Join(r.f.calls, "\n"))
+		}
+	})
+}
+
+// TestPurgeSettleToleratesABootoutErrorThatUnloads pins the bootout race: an
+// error from a bootout is not the verdict, the label still being loaded is.
+func TestPurgeSettleToleratesABootoutErrorThatUnloads(t *testing.T) {
+	r := newPurgeRig(t, RoleServer, false)
+	r.f.putLoaded("io.k3sm.stray")
+	r.f.purge.bootoutErrs = map[string]error{"io.k3sm.stray": errors.New("Boot-out failed: 5: Input/output error")}
+	r.f.purge.unloadDespiteErr = map[string]bool{"io.k3sm.stray": true}
+	if err := r.run(); err != nil {
+		t.Fatalf("purge = %v, want success: the label left launchd", err)
+	}
+
+	r = newPurgeRig(t, RoleServer, false)
+	r.f.putLoaded("io.k3sm.stray")
+	r.f.purge.bootoutErrs = map[string]error{"io.k3sm.stray": errors.New("Boot-out failed: 5: Input/output error")}
+	err := r.run()
+	if !errors.Is(err, ErrPurgeRefused) || !strings.Contains(err.Error(), "Input/output error") {
+		t.Fatalf("purge = %v, want a refusal naming the bootout error", err)
+	}
 }
 
 // TestPurgeGuardPathRules pins the pure path half of the guard.
