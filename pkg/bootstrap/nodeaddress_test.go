@@ -291,8 +291,8 @@ func TestJoinIssuesForTheAssignedNodeAddress(t *testing.T) {
 			Token:         rig.token,
 			NodePassword:  "pw",
 		})
-		if status != http.StatusBadRequest || !strings.Contains(reason, "nodeName") {
-			t.Errorf("status/%d reason %q, want 400 naming nodeName", status, reason)
+		if status != http.StatusBadRequest || !strings.Contains(reason, "invalid node name") {
+			t.Errorf("status/%d reason %q, want 400 invalid node name", status, reason)
 		}
 	})
 }
