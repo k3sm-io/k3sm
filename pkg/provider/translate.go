@@ -196,6 +196,9 @@ func toPodBox(pod *corev1.Pod, podIP, nodeIP, rootfsRoot, dyldShim string, dnsCf
 
 	box.Volumes = toVolumes(pod.Spec.Volumes)
 	box.PodSecurityContext = toPodSecurityContext(pod.Spec.SecurityContext)
+	// After every container list and the pod context are translated: the
+	// runAsNonRoot producer rule is a property of the whole pod.
+	resolveRunAsNonRoot(pod, box)
 	box.ImagePullSecrets = toLocalRefs(pod.Spec.ImagePullSecrets)
 
 	// termination_grace_period_seconds mirrors the spec (k8s 30s default applied
@@ -1040,16 +1043,19 @@ func toSecurityContext(sc *corev1.SecurityContext) *runtimev1.SecurityContext {
 }
 
 // toPodSecurityContext maps the pod-scoped securityContext (subset:
-// fsGroup/runAsUser/runAsGroup). fsGroup lives HERE (pod-level only). Returns nil
-// when none of the modeled fields is set.
+// fsGroup/runAsUser/runAsGroup/runAsNonRoot). fsGroup lives HERE (pod-level
+// only). Returns nil when none of the modeled fields is set. runAsNonRoot is
+// carried verbatim here; the producer rule that may lower it to false when a
+// container opts out is applied over the whole box by resolveRunAsNonRoot.
 func toPodSecurityContext(sc *corev1.PodSecurityContext) *runtimev1.PodSecurityContext {
-	if sc == nil || (sc.FSGroup == nil && sc.RunAsUser == nil && sc.RunAsGroup == nil) {
+	if sc == nil || (sc.FSGroup == nil && sc.RunAsUser == nil && sc.RunAsGroup == nil && sc.RunAsNonRoot == nil) {
 		return nil
 	}
 	return &runtimev1.PodSecurityContext{
-		FsGroup:    derefInt64(sc.FSGroup),
-		RunAsUser:  derefInt64(sc.RunAsUser),
-		RunAsGroup: derefInt64(sc.RunAsGroup),
+		FsGroup:      derefInt64(sc.FSGroup),
+		RunAsUser:    derefInt64(sc.RunAsUser),
+		RunAsGroup:   derefInt64(sc.RunAsGroup),
+		RunAsNonRoot: derefBool(sc.RunAsNonRoot),
 	}
 }
 

@@ -1,0 +1,76 @@
+{
+  "comment": "runAsNonRoot producer-rule table. Per row: pod is the pod spec's securityContext.runAsNonRoot (null = unset). Each container: kind is init | sidecar | regular | ephemeral, own is its securityContext.runAsNonRoot (null = unset), stamp is the box Container.security_context.run_as_non_root the producer must send (null = no SecurityContext message at all), effective is the kubelet's per-container verdict. podField is the box PodSecurityContext.run_as_non_root (null = no PodSecurityContext message at all). The consumer composition (container stamp OR podField) must equal effective on every row.",
+  "rows": [
+    {
+      "name": "pod true, container unset: both stamped true",
+      "pod": true,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": null, "stamp": true, "effective": true}
+      ],
+      "podField": true
+    },
+    {
+      "name": "pod true, one container opts out: it is false, the pod field drops, siblings stay true",
+      "pod": true,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": false, "stamp": false, "effective": false},
+        {"kind": "regular", "name": "web", "own": null, "stamp": true, "effective": true}
+      ],
+      "podField": false
+    },
+    {
+      "name": "pod unset, container true: the container carries its own value",
+      "pod": null,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": true, "stamp": true, "effective": true},
+        {"kind": "regular", "name": "web", "own": null, "stamp": null, "effective": false}
+      ],
+      "podField": null
+    },
+    {
+      "name": "pod unset, nothing set: no stamps and no pod context",
+      "pod": null,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": null, "stamp": null, "effective": false}
+      ],
+      "podField": null
+    },
+    {
+      "name": "pod false: every container stamped false",
+      "pod": false,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": null, "stamp": false, "effective": false}
+      ],
+      "podField": false
+    },
+    {
+      "name": "pod false, container true: the container's requirement stands",
+      "pod": false,
+      "containers": [
+        {"kind": "regular", "name": "app", "own": true, "stamp": true, "effective": true},
+        {"kind": "regular", "name": "web", "own": null, "stamp": false, "effective": false}
+      ],
+      "podField": false
+    },
+    {
+      "name": "init and sidecar containers are stamped like regular ones",
+      "pod": true,
+      "containers": [
+        {"kind": "init", "name": "setup", "own": null, "stamp": true, "effective": true},
+        {"kind": "sidecar", "name": "proxy", "own": null, "stamp": true, "effective": true},
+        {"kind": "regular", "name": "app", "own": null, "stamp": true, "effective": true}
+      ],
+      "podField": true
+    },
+    {
+      "name": "a sidecar opting out lowers the pod field; init and regular stay true",
+      "pod": true,
+      "containers": [
+        {"kind": "init", "name": "setup", "own": null, "stamp": true, "effective": true},
+        {"kind": "sidecar", "name": "proxy", "own": false, "stamp": false, "effective": false},
+        {"kind": "regular", "name": "app", "own": null, "stamp": true, "effective": true}
+      ],
+      "podField": false
+    }
+  ]
+}
