@@ -85,14 +85,29 @@ func runSecretsEncryptStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "k3sm secrets-encrypt status takes no positional arguments (got %q)\n", fs.Arg(0))
 		return secretsEncryptBadUsage
 	}
-	return renderSecretsEncryptStatus(stdout, *workDir, *endpoint != "" || *serverJoin)
+	return renderSecretsEncryptStatus(stdout, *workDir, *endpoint != "" || *serverJoin, daemonUID(*workDir))
+}
+
+// daemonUID is the uid the control plane runs as, which the key file must be
+// owned by. Unprivileged, status runs as that user (the server's own check
+// uses its euid). As root, the daemon is whoever owns its work dir: the
+// service user on an installed Mac, root in the run-as-root posture.
+func daemonUID(workDir string) uint32 {
+	euid := uint32(os.Geteuid())
+	if euid != 0 {
+		return euid
+	}
+	if _, uid, err := (executor.OSEncryptionStore{}).Lstat(workDir); err == nil {
+		return uid
+	}
+	return euid
 }
 
 // renderSecretsEncryptStatus prints the start verdict the server would reach
 // for workDir, from the same predicate it uses, and returns the exit code.
-func renderSecretsEncryptStatus(w io.Writer, workDir string, ha bool) int {
+func renderSecretsEncryptStatus(w io.Writer, workDir string, ha bool, expectedUID uint32) int {
 	path := executor.EncryptionConfigPath(workDir)
-	in, err := executor.ReadEncryptionStartInputs(executor.OSEncryptionStore{}, workDir, ha)
+	in, err := executor.ReadEncryptionStartInputs(executor.OSEncryptionStore{}, workDir, ha, expectedUID)
 	var enabled bool
 	if err == nil {
 		enabled, err = executor.DecideEncryptionAtStart(in)
@@ -129,7 +144,7 @@ func renderSecretsEncryptStatus(w io.Writer, workDir string, ha bool) int {
 // into the same refusal. It re-reads the credential pair every poll and
 // returns nil once the start verdict no longer refuses (an operator restored
 // the key file), so launchd starts a clean boot, or when ctx is done.
-func parkWhileEncryptionRefused(ctx context.Context, workDir string, ha bool, poll time.Duration, logger *slog.Logger) error {
+func parkWhileEncryptionRefused(ctx context.Context, workDir string, ha bool, expectedUID uint32, poll time.Duration, logger *slog.Logger) error {
 	t := time.NewTicker(poll)
 	defer t.Stop()
 	for {
@@ -138,7 +153,7 @@ func parkWhileEncryptionRefused(ctx context.Context, workDir string, ha bool, po
 			logger.Info("parked control plane received a stop; exiting")
 			return nil
 		case <-t.C:
-			if _, err := executor.EncryptionAtStart(executor.OSEncryptionStore{}, workDir, ha); err == nil {
+			if _, err := executor.EncryptionAtStart(executor.OSEncryptionStore{}, workDir, ha, expectedUID); err == nil {
 				logger.Info("the secrets encryption refusal is resolved; exiting so launchd starts a clean boot")
 				return nil
 			}

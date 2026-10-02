@@ -91,6 +91,17 @@ func TestSecretsEncryptStatus(t *testing.T) {
 			want:     []string{"secrets encryption: refused (", "key file is missing"},
 		},
 		{
+			name: "inconsistent: key file mode 0644",
+			setup: func(t *testing.T, wd string) {
+				writeEncryptionPair(t, wd, true)
+				if err := os.Chmod(executor.EncryptionConfigPath(wd), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantCode: 1,
+			want:     []string{"secrets encryption: refused (", "chmod 0600", "mode:               0644"},
+		},
+		{
 			name:     "enabled beside a server join is refused",
 			setup:    func(t *testing.T, wd string) { writeEncryptionPair(t, wd, true) },
 			args:     []string{"--server-join"},
@@ -136,7 +147,9 @@ func TestParkWhileEncryptionRefusedEndsOnRepair(t *testing.T) {
 	done := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	go func() { done <- parkWhileEncryptionRefused(ctx, wd, false, 10*time.Millisecond, logger) }()
+	go func() {
+		done <- parkWhileEncryptionRefused(ctx, wd, false, uint32(os.Geteuid()), 10*time.Millisecond, logger)
+	}()
 	select {
 	case err := <-done:
 		t.Fatalf("the park ended while the pair was still inconsistent: %v", err)

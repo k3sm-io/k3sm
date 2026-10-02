@@ -50,6 +50,24 @@ type encryptionStore struct {
 
 func (s encryptionStore) ReadFile(path string) ([]byte, error) { return s.sys.ReadRegularFile(path) }
 
+func (s encryptionStore) Lstat(path string) (fs.FileMode, uint32, error) {
+	e, err := s.sys.Owner(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	mode := e.Mode.Perm()
+	switch e.Kind {
+	case EntryRegular:
+	case EntryDir:
+		mode |= fs.ModeDir
+	case EntrySymlink:
+		mode |= fs.ModeSymlink
+	default:
+		mode |= fs.ModeIrregular
+	}
+	return mode, uint32(e.UID), nil
+}
+
 func (s encryptionStore) ReadDir(path string) ([]string, error) {
 	entries, err := s.fsys.ReadDir(path)
 	if err != nil {

@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"sigs.k8s.io/yaml"
 )
@@ -111,6 +112,12 @@ var (
 	// ErrEncryptionFingerprintMismatch refuses a start whose configuration
 	// holds a different key from the one the fingerprint records.
 	ErrEncryptionFingerprintMismatch = errors.New("the secrets encryption key does not match the fingerprint recorded when encryption was enabled: the datastore's Secrets were written under another key; restore the key file from the backup taken with state.db")
+	// ErrEncryptionKeyFileMode refuses a key file whose mode is not exactly
+	// 0600: a wider mode publishes the key to other accounts.
+	ErrEncryptionKeyFileMode = errors.New("the secrets encryption key file is not mode 0600: other accounts on this Mac may be able to read the key; run `chmod 0600` on it (a restore from backup commonly widens the mode)")
+	// ErrEncryptionKeyFileOwner refuses a key file not owned by the user the
+	// control plane runs as.
+	ErrEncryptionKeyFileOwner = errors.New("the secrets encryption key file is not owned by the user the control plane runs as; `chown` it (and the fingerprint file) to the daemon user, for example after a restore from backup")
 	// ErrEncryptionConfigInvalid refuses a configuration that is not the shape
 	// k3sm writes (one resource, one secretbox provider, one 32-byte key).
 	ErrEncryptionConfigInvalid = errors.New("the secrets encryption configuration is not the one k3sm writes; restore the key file from the backup taken with state.db")
@@ -235,6 +242,13 @@ type EncryptionStartInputs struct {
 	FingerprintMatches bool
 	// HA is a server join or an external datastore endpoint.
 	HA bool
+	// KeyFileMode is the key file's observed mode (from an lstat, so a
+	// symlink carries its type bit), KeyFileUID its owner, and ExpectedUID
+	// the user the control plane runs as. Meaningful only when both files
+	// are present.
+	KeyFileMode fs.FileMode
+	KeyFileUID  uint32
+	ExpectedUID uint32
 }
 
 // DecideEncryptionAtStart is the start-time verdict: whether this start passes
@@ -249,6 +263,10 @@ func DecideEncryptionAtStart(in EncryptionStartInputs) (enabled bool, err error)
 		return false, ErrEncryptionKeyMissing
 	case !in.FingerprintMatches:
 		return false, ErrEncryptionFingerprintMismatch
+	case in.KeyFileMode != 0o600:
+		return false, ErrEncryptionKeyFileMode
+	case in.KeyFileUID != in.ExpectedUID:
+		return false, ErrEncryptionKeyFileOwner
 	case in.HA:
 		return false, ErrEncryptionHA
 	}
@@ -304,6 +322,10 @@ func DecideEncryptionAtInstall(in EncryptionInstallInputs) (EncryptionInstallAct
 	}
 	existing := in.Existing
 	existing.HA = false
+	// The key file's mode and owner are a START check: install runs as root
+	// and the files are the service user's, so there is no expected uid to
+	// compare here, and a kept pair is re-checked at the next start anyway.
+	existing.KeyFileMode, existing.KeyFileUID, existing.ExpectedUID = 0o600, 0, 0
 	if existing.ConfigPresent || existing.FingerprintPresent {
 		if _, err := DecideEncryptionAtStart(existing); err != nil {
 			return EncryptionLeave, err
@@ -319,18 +341,39 @@ func IsDatastoreResidue(name string) bool {
 	return strings.HasPrefix(name, "state.db")
 }
 
-// EncryptionStore is the file access the encryption pair needs. ReadFile and
-// ReadDir report an absent path with an error matching fs.ErrNotExist.
+// EncryptionStore is the file access the encryption pair needs. ReadFile,
+// ReadDir and Lstat report an absent path with an error matching
+// fs.ErrNotExist. Lstat returns the entry's mode and owner uid without
+// following a symlink.
 type EncryptionStore interface {
 	ReadFile(path string) ([]byte, error)
+	Lstat(path string) (fs.FileMode, uint32, error)
 	ReadDir(path string) ([]string, error)
 	WriteFile(path string, contents []byte) error
 }
 
-// ReadEncryptionStartInputs reads the pair under workDir. A configuration that
-// cannot be parsed is ErrEncryptionConfigInvalid; any read error other than
-// absence is returned as is.
-func ReadEncryptionStartInputs(store EncryptionStore, workDir string, ha bool) (EncryptionStartInputs, error) {
+// ReadEncryptionStartInputs reads the pair under workDir, and, when both files
+// are present, the key file's mode and owner through the store's Lstat.
+// expectedUID is the user the control plane runs as (the server passes its own
+// euid). A configuration that cannot be parsed is ErrEncryptionConfigInvalid;
+// any read error other than absence is returned as is.
+func ReadEncryptionStartInputs(store EncryptionStore, workDir string, ha bool, expectedUID uint32) (EncryptionStartInputs, error) {
+	in, err := readEncryptionPair(store, workDir, ha)
+	if err != nil || !in.ConfigPresent || !in.FingerprintPresent {
+		return in, err
+	}
+	in.ExpectedUID = expectedUID
+	mode, uid, err := store.Lstat(EncryptionConfigPath(workDir))
+	if err != nil {
+		return in, fmt.Errorf("lstat the secrets encryption configuration: %w", err)
+	}
+	in.KeyFileMode, in.KeyFileUID = mode, uid
+	return in, nil
+}
+
+// readEncryptionPair reads the two files and compares the fingerprint. It is
+// the half of ReadEncryptionStartInputs an install needs.
+func readEncryptionPair(store EncryptionStore, workDir string, ha bool) (EncryptionStartInputs, error) {
 	in := EncryptionStartInputs{HA: ha}
 	config, err := store.ReadFile(EncryptionConfigPath(workDir))
 	switch {
@@ -358,8 +401,8 @@ func ReadEncryptionStartInputs(store EncryptionStore, workDir string, ha bool) (
 
 // EncryptionAtStart reads the pair and returns the configuration path to pass
 // the apiserver ("" when encryption is off), or the refusal.
-func EncryptionAtStart(store EncryptionStore, workDir string, ha bool) (string, error) {
-	in, err := ReadEncryptionStartInputs(store, workDir, ha)
+func EncryptionAtStart(store EncryptionStore, workDir string, ha bool, expectedUID uint32) (string, error) {
+	in, err := ReadEncryptionStartInputs(store, workDir, ha, expectedUID)
 	if err != nil {
 		return "", err
 	}
@@ -402,7 +445,7 @@ func PlanEncryptionAtInstall(store EncryptionStore, workDir string, req Encrypti
 	case !errors.Is(err, fs.ErrNotExist):
 		return EncryptionLeave, fmt.Errorf("inspect %s: %w", pgPassPath(workDir), err)
 	}
-	existing, err := ReadEncryptionStartInputs(store, workDir, false)
+	existing, err := readEncryptionPair(store, workDir, false)
 	if err != nil {
 		return EncryptionLeave, err
 	}
@@ -446,6 +489,19 @@ type OSEncryptionStore struct{}
 
 // ReadFile reads path.
 func (OSEncryptionStore) ReadFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
+// Lstat returns path's mode and owner uid without following a symlink.
+func (OSEncryptionStore) Lstat(path string) (fs.FileMode, uint32, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, fmt.Errorf("lstat %s: no owner information", path)
+	}
+	return fi.Mode(), st.Uid, nil
+}
 
 // ReadDir lists the entry names of path.
 func (OSEncryptionStore) ReadDir(path string) ([]string, error) {

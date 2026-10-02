@@ -242,20 +242,14 @@ func TestEncryptionEnableRefusesNonEmptyStateDB(t *testing.T) {
 				t.Errorf("cred dir mode = %v (err %v), want 0700", fi.Mode().Perm(), err)
 			}
 			// The pair the install wrote is the pair the next start accepts.
-			path, err := EncryptionAtStart(OSEncryptionStore{}, wd, false)
+			path, err := EncryptionAtStart(OSEncryptionStore{}, wd, false, testEUID())
 			if err != nil || path != EncryptionConfigPath(wd) {
 				t.Fatalf("start after install = %q, %v; want enabled", path, err)
 			}
 		})
 	}
 
-	startCases := []struct {
-		name    string
-		setup   func(t *testing.T, wd string)
-		ha      bool
-		enabled bool
-		wantErr error
-	}{
+	startCases := []startCase{
 		{name: "neither file is off"},
 		{
 			name: "config beside an existing db and no fingerprint is refused",
@@ -298,6 +292,28 @@ func TestEncryptionEnableRefusesNonEmptyStateDB(t *testing.T) {
 			setup:   func(t *testing.T, wd string) { writePair(t, wd, zeroKey, zeroKey) },
 			enabled: true,
 		},
+		{
+			name:    "key file 0640 is refused",
+			setup:   func(t *testing.T, wd string) { writePairMode(t, wd, 0o640) },
+			wantErr: ErrEncryptionKeyFileMode,
+		},
+		{
+			name:    "key file 0644 is refused",
+			setup:   func(t *testing.T, wd string) { writePairMode(t, wd, 0o644) },
+			wantErr: ErrEncryptionKeyFileMode,
+		},
+		{
+			name:    "key file owned by another user is refused",
+			setup:   func(t *testing.T, wd string) { writePair(t, wd, zeroKey, zeroKey) },
+			store:   ownerStore{uid: testEUID() + 1},
+			wantErr: ErrEncryptionKeyFileOwner,
+		},
+		{
+			name:    "key file 0600 owned by the daemon user is enabled",
+			setup:   func(t *testing.T, wd string) { writePairMode(t, wd, 0o600) },
+			store:   ownerStore{uid: testEUID()},
+			enabled: true,
+		},
 	}
 	for _, tc := range startCases {
 		t.Run("start/"+tc.name, func(t *testing.T) {
@@ -309,7 +325,7 @@ func TestEncryptionEnableRefusesNonEmptyStateDB(t *testing.T) {
 				tc.setup(t, wd)
 			}
 			before := treeSnapshot(t, wd)
-			path, err := EncryptionAtStart(OSEncryptionStore{}, wd, tc.ha)
+			path, err := EncryptionAtStart(tc.storeOrOS(), wd, tc.ha, testEUID())
 			if d := diffTrees(before, treeSnapshot(t, wd)); len(d) > 0 {
 				t.Fatalf("the start verdict wrote: %v", d)
 			}
@@ -466,6 +482,47 @@ func TestValidateRefusesEncryptionWithHA(t *testing.T) {
 				t.Fatalf("Validate = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+// startCase is one row of the start-verdict table. store nil is the real
+// filesystem.
+type startCase struct {
+	name    string
+	setup   func(t *testing.T, wd string)
+	store   EncryptionStore
+	ha      bool
+	enabled bool
+	wantErr error
+}
+
+func (c startCase) storeOrOS() EncryptionStore {
+	if c.store == nil {
+		return OSEncryptionStore{}
+	}
+	return c.store
+}
+
+// ownerStore is the real filesystem with the key file's owner replaced, so
+// an ownership refusal is tested without a chown.
+type ownerStore struct {
+	OSEncryptionStore
+	uid uint32
+}
+
+func (s ownerStore) Lstat(path string) (fs.FileMode, uint32, error) {
+	mode, _, err := s.OSEncryptionStore.Lstat(path)
+	return mode, s.uid, err
+}
+
+func testEUID() uint32 { return uint32(os.Geteuid()) }
+
+// writePairMode writes a matching pair and sets the key file's mode.
+func writePairMode(t *testing.T, wd string, mode fs.FileMode) {
+	t.Helper()
+	writePair(t, wd, zeroKey, zeroKey)
+	if err := os.Chmod(EncryptionConfigPath(wd), mode); err != nil {
+		t.Fatal(err)
 	}
 }
 

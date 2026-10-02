@@ -483,11 +483,11 @@ func runServer(args []string) (err error) {
 	// writes plaintext beside ciphertext. A refusal PARKS, for the crash-loop
 	// park's reason: launchd would respawn an exit straight back into it.
 	haDatastore := opts.datastoreEndpoint != "" || opts.serverJoin
-	encryptionConfig, encErr := executor.EncryptionAtStart(executor.OSEncryptionStore{}, opts.workDir, haDatastore)
+	encryptionConfig, encErr := executor.EncryptionAtStart(executor.OSEncryptionStore{}, opts.workDir, haDatastore, uint32(os.Geteuid()))
 	if encErr != nil {
 		logger.Error("refusing to start the control plane: "+encErr.Error(),
 			"key-file", executor.EncryptionConfigPath(opts.workDir), "status-with", "k3sm secrets-encrypt status")
-		return parkWhileEncryptionRefused(ctx, opts.workDir, haDatastore, crashLoopPollInterval, logger)
+		return parkWhileEncryptionRefused(ctx, opts.workDir, haDatastore, uint32(os.Geteuid()), crashLoopPollInterval, logger)
 	}
 	if rec := breaker.load(); rec.Tripped() {
 		last, _ := rec.Last()
