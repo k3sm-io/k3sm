@@ -34,7 +34,7 @@ profile.
 - Workloads must be adapted. A raw upstream `[Conformance]` Pod, one that assumes a Linux image,
   bind mounts, or Linux-only fields, is rejected at admission or stranded. Images are the k3sm native
   image model (see [Images](images.md)), not arbitrary OCI Linux images.
-- k3sm cannot pass CNCF `[Conformance]` / Sonobuoy. That suite assumes Linux containers, cgroups,
+- k3sm cannot pass the CNCF `[Conformance]` suite. That suite assumes Linux containers, cgroups,
   CNI, and netns; k3sm has none of them, and k3sm does not claim a
   Certified-Kubernetes badge. See [Conformance profile](../conformance-profile.md).
 

@@ -1,6 +1,7 @@
-# Running Temporal on k3sm
+# Running a Durable-Execution Server on k3sm
 
-[Temporal](https://temporal.io) is a durable-execution service: a gRPC frontend, a history and
+The `temporalio/temporal` image ([project site](https://temporal.io)) is an open-source
+durable-execution service: a gRPC frontend, a history and
 matching engine, a worker service and a Web UI over a SQL store. It ships as `linux/arm64` container
 images, so on k3sm it runs under the **`vm` RuntimeClass**, with each Pod in its own micro-VM on
 Virtualization.framework, while the node stays an ordinary Mac.
@@ -19,7 +20,7 @@ and the **client** is the native macOS `temporal` binary from Homebrew, talking 
 
 | Object | What it is |
 |---|---|
-| Pod `temporal` | `temporalio/temporal`, running `temporal server start-dev` (the Temporal Server, SQLite persistence and the Web UI in one process) |
+| Pod `temporal` | `temporalio/temporal`, running `temporal server start-dev` (the server, SQLite persistence and the Web UI in one process) |
 | Service `temporal-frontend` | NodePort: gRPC `7233` on node port `30733`, Web UI `8233` on node port `30823` |
 | Pod `temporal-ui` (optional) | `temporalio/ui`, the standalone Web UI server, reaching the frontend through its Service |
 | Service `temporal-ui` (optional) | NodePort: `8080` on node port `30808` |
@@ -28,7 +29,7 @@ Both manifests are in [`examples/temporal/`](../../examples/temporal/). The opti
 file you can skip: the dev server already serves a Web UI.
 
 A `vm` Pod runs one image. Every container in it shares one root filesystem, so a Pod naming two
-images runs the second container's command against the first container's image. Temporal's production
+images runs the second container's command against the first container's image. The service's production
 shape, with server, datastore and UI as separate images, must therefore be separate Pods here. The dev
 server collapses the service into a single image, which is why the one-Pod form is the simplest one.
 
@@ -120,7 +121,7 @@ That Pod is a second Linux guest consuming the first one through cluster DNS and
 
 ## 6. Run a Workflow
 
-A workflow needs a **worker**, which is your own code using a Temporal SDK. Run it as a native macOS
+A workflow needs a **worker**, which is your own code using one of the service's SDKs. Run it as a native macOS
 process against the same address the CLI uses:
 
 ```sh
@@ -128,7 +129,7 @@ export TEMPORAL_ADDRESS=127.0.0.1:30733
 ```
 
 Every SDK takes that host and port when it builds a client (the Go SDK's `client.Dial` with
-`HostPort`, the Python and TypeScript SDKs' `address`/`target_host`). Start from Temporal's own
+`HostPort`, the Python and TypeScript SDKs' `address`/`target_host`). Start from the project's own
 [samples](https://github.com/temporalio/samples-go) and change only the address. Once a worker is
 polling a task queue, start a workflow from the CLI:
 
@@ -138,7 +139,7 @@ temporal workflow list
 temporal workflow describe --workflow-id demo-1
 ```
 
-Nothing about the worker is k3sm-specific. It is a normal macOS process talking to a normal Temporal
+Nothing about the worker is k3sm-specific. It is a normal macOS process talking to a normal
 frontend that happens to be a Linux Pod on the same machine.
 
 ## 7. Tear It Down
@@ -154,7 +155,7 @@ in memory. Nothing is left on disk beyond the cached image.
 ## Things to Know
 
 - This is a development server. `temporal server start-dev` relaxes checks that a production
-  Temporal deployment enforces, and it is a single instance with no replication. It is the right shape
+  deployment enforces, and it is a single instance with no replication. It is the right shape
   for a demo, a local integration test or a CI job, and not for production traffic.
 - Persisting workflow state means adding `--db-filename /data/temporal.db` and mounting a
   PersistentVolumeClaim at `/data`. PVC storage works on the `vm` path, with ceilings worth reading
@@ -166,7 +167,7 @@ in memory. Nothing is left on disk beyond the cached image.
 - A container restart recreates the whole VM. There is no in-guest supervisor, because the container
   *is* the guest. The recreate is fast, and a crash-loop behaves as it would anywhere else.
 - Resources size the guest. The containers' memory limits are summed into the guest's RAM ceiling,
-  and their CPU limits are summed and rounded up to whole vCPUs. Raising the limits gives Temporal a
+  and their CPU limits are summed and rounded up to whole vCPUs. Raising the limits gives the server a
   bigger machine.
 - NetworkPolicy will not isolate this. It is enforced only on Service-mediated ingress and cannot
   yet name a `vm` Pod as an allowed traffic *source*. Treat it as a hint, not a boundary

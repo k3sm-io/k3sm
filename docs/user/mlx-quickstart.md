@@ -1,6 +1,6 @@
 # MLX quickstart
 
-Serve a language model on your Mac's GPU and call it from an OpenAI-compatible client. k3sm models the
+Serve a language model on your Mac's GPU and call it from any client of the common `/v1/chat/completions` HTTP API. k3sm models the
 workload as an **`MLXModel`** object. You declare the model and the memory it needs, and k3sm renders
 the serving workload, its Services, and its weight cache.
 
@@ -109,7 +109,7 @@ curl -sS "http://$VIP:8000/v1/chat/completions" \
       }'
 ```
 
-Any OpenAI-compatible client works. Point its base URL at `http://$VIP:8000/v1` and give it any
+Any client of that API works. Point its base URL at `http://$VIP:8000/v1` and give it any
 non-empty API key. Concurrent requests are batched by the server; the number it will batch is derived
 from `memory`.
 

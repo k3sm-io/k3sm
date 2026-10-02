@@ -2,7 +2,7 @@
 
 ## Is k3sm a Certified Kubernetes Distribution?
 
-No. k3sm **cannot pass** the CNCF `[Conformance]` / Sonobuoy suite, which assumes Linux containers,
+No. k3sm **cannot pass** the CNCF `[Conformance]` suite, which assumes Linux containers,
 cgroups, CNI, and network namespaces. k3sm has none of them. See [Limitations](limitations.md).
 
 ## Does k3sm Use a Container Engine or a VM?
