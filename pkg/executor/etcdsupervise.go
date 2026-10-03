@@ -113,11 +113,12 @@ func tcpDial(ctx context.Context, hostport string) bool {
 	return true
 }
 
-// refuseClusterInitOverSQLite is the first provision step of an init member: a
+// RefuseClusterInitOverSQLite is the first provision step of an init member: a
 // non-empty kine datastore with no etcd member beside it is a single-node cluster
 // that --cluster-init would silently abandon. A work dir that already holds a member
-// is a restart, where --cluster-init is a no-op (k3s's semantics).
-func refuseClusterInitOverSQLite(cfg Config) error {
+// is a restart, where --cluster-init is a no-op (k3s's semantics). It only reads, so
+// `k3sm server` also calls it before writing anything into the work dir.
+func RefuseClusterInitOverSQLite(cfg Config) error {
 	if cfg.Etcd == nil || cfg.Etcd.Role != EtcdInit || EtcdMemberExists(cfg.WorkDir) {
 		return nil
 	}

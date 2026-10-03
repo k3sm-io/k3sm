@@ -30,8 +30,8 @@ import (
 )
 
 // snapshotUsage is the `k3sm snapshot` help text. It states the single-node scope up
-// front: an operator on the HA/Postgres posture must be told that this command is not
-// their backup tool before they run it, not after.
+// front: an operator on the etcd HA posture must be told what this command does not
+// cover before they run it, not after.
 const snapshotUsage = `Usage: k3sm snapshot save    [--out <path>] [--work-dir <dir>]
        k3sm snapshot restore <snapshot> [--work-dir <dir>]
 
@@ -46,16 +46,14 @@ of record.
            it supersedes is preserved beside it as a .bak, never deleted.
 
 Flags:
-  --work-dir <dir>            control-plane state root (default: this posture's work dir)
-  --out <path>                save: the snapshot file, or a directory to name one in
-                              (default: %s under the work dir)
-  --datastore-endpoint <dsn>  the server's datastore DSN, when it has one
-                              (default: $K3SM_DATASTORE_ENDPOINT)
+  --work-dir <dir>  control-plane state root (default: this posture's work dir)
+  --out <path>      save: the snapshot file, or a directory to name one in
+                    (default: %s under the work dir)
 
-Scope: the single-node kine→SQLite datastore only. On the HA/Postgres posture the
-state of record is your Postgres, which k3sm does not read — back it up with pg_dump
-and restore it with pg_restore/psql. Both subcommands refuse there rather than
-produce a snapshot that does not hold the cluster.
+Scope: the single-node kine→SQLite datastore only. On an embedded etcd HA server
+the state of record is the etcd member, not a state.db: save refuses there rather
+than produce a snapshot that does not hold the cluster, and restoring an etcd
+member is not supported in this release.
 
 PersistentVolume data is NOT in a snapshot: it lives in local-path directories on each
 node and is backed up separately. See docs/user/backup-restore.md.
@@ -100,7 +98,6 @@ func runSnapshotSave(args []string) error {
 	fs := flag.NewFlagSet("snapshot save", flag.ExitOnError)
 	workDir := snapshotWorkDirFlag(fs)
 	out := fs.String("out", "", "snapshot destination: a file, or a directory to name one in (default: db/snapshots under the work dir)")
-	endpoint := fs.String("datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "the server's datastore DSN, when it has one (or $K3SM_DATASTORE_ENDPOINT)")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 {
@@ -108,9 +105,8 @@ func runSnapshotSave(args []string) error {
 	}
 
 	res, err := executor.SaveSnapshot(context.Background(), executor.SnapshotSaveOptions{
-		WorkDir:           *workDir,
-		DatastoreEndpoint: *endpoint,
-		Out:               *out,
+		WorkDir: *workDir,
+		Out:     *out,
 	})
 	if err != nil {
 		return annotateSnapshotError(err, *workDir)
@@ -123,7 +119,6 @@ func runSnapshotSave(args []string) error {
 func runSnapshotRestore(args []string) error {
 	fs := flag.NewFlagSet("snapshot restore", flag.ExitOnError)
 	workDir := snapshotWorkDirFlag(fs)
-	endpoint := fs.String("datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "the server's datastore DSN, when it has one (or $K3SM_DATASTORE_ENDPOINT)")
 	apiPort := fs.Int("apiserver-port", executor.DefaultAPIServerPort, "apiserver secure port the running-server check probes")
 	kinePort := fs.Int("datastore-port", executor.DefaultKinePort, "kine listen port the running-server check probes")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
@@ -133,10 +128,9 @@ func runSnapshotRestore(args []string) error {
 	}
 
 	res, err := executor.RestoreSnapshot(context.Background(), executor.SnapshotRestoreOptions{
-		WorkDir:           *workDir,
-		DatastoreEndpoint: *endpoint,
-		Snapshot:          fs.Arg(0),
-		Running:           liveControlPlaneProbe(install.NewDarwinSystem(), install.ServerLabel, *kinePort, *apiPort),
+		WorkDir:  *workDir,
+		Snapshot: fs.Arg(0),
+		Running:  liveControlPlaneProbe(install.NewDarwinSystem(), install.ServerLabel, *kinePort, *apiPort),
 	})
 	if err != nil {
 		return annotateSnapshotError(err, *workDir)

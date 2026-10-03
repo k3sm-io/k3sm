@@ -94,7 +94,7 @@ func (b *liveBundleSource) SealedBundle(_ context.Context) ([]byte, error) {
 
 // bootstrapStateNamespace / *Secret* names: k3sm's datastore-backed bootstrap state
 // lives as kube-system Secrets in the cluster datastore, which in HA is the shared
-// Postgres (the k3s bootstrap-key model). A name bound on server A is therefore
+// etcd cluster (the k3s bootstrap-key model). A name bound on server A is therefore
 // visible on server B, and on any server it survives a restart.
 const (
 	bootstrapStateNamespace   = "kube-system"

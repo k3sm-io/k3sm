@@ -39,10 +39,9 @@ is enabled only by 'k3sm install --secrets-encryption' on a new cluster.
            plane from starting, or cannot be read (run it with sudo).
 
 Flags:
-  --work-dir <dir>            control-plane state root (default: this posture's work dir)
-  --datastore-endpoint <dsn>  the server's datastore DSN, when it has one
-                              (default: $K3SM_DATASTORE_ENDPOINT)
-  --server-join               the server joins an HA control plane
+  --work-dir <dir>  control-plane state root (default: this posture's work dir)
+  --cluster-init    the server forms an embedded etcd HA control plane
+  --server-join     the server joins an embedded etcd HA control plane
 `
 
 // Exit codes of `k3sm secrets-encrypt`.
@@ -76,8 +75,8 @@ func runSecretsEncryptStatus(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(stderr, secretsEncryptUsage) }
 	workDir := snapshotWorkDirFlag(fs)
-	endpoint := fs.String("datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "the server's datastore DSN, when it has one (or $K3SM_DATASTORE_ENDPOINT)")
-	serverJoin := fs.Bool("server-join", false, "the server joins an HA control plane")
+	clusterInit := fs.Bool("cluster-init", false, "the server forms an embedded etcd HA control plane")
+	serverJoin := fs.Bool("server-join", false, "the server joins an embedded etcd HA control plane")
 	if err := fs.Parse(args); err != nil {
 		return secretsEncryptBadUsage
 	}
@@ -85,7 +84,7 @@ func runSecretsEncryptStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "k3sm secrets-encrypt status takes no positional arguments (got %q)\n", fs.Arg(0))
 		return secretsEncryptBadUsage
 	}
-	return renderSecretsEncryptStatus(stdout, *workDir, *endpoint != "" || *serverJoin, daemonUID(*workDir))
+	return renderSecretsEncryptStatus(stdout, *workDir, *clusterInit || *serverJoin, daemonUID(*workDir))
 }
 
 // daemonUID is the uid the control plane runs as, which the key file must be

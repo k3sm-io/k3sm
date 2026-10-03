@@ -17,8 +17,9 @@ limitations under the License.
 package executor
 
 import (
+	"errors"
 	"fmt"
-	"strconv"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -47,120 +48,17 @@ func TestDatastoreEndpointSQLiteDefault(t *testing.T) {
 	if got := flagValue(args, "--metrics-bind-address"); got != "0" {
 		t.Errorf("--metrics-bind-address = %q, want \"0\" (disabled — else kine binds *:8080 and collides with pods)", got)
 	}
-	// No Postgres pool flags leak onto the single-node path.
+	// No connection-pool flags leak onto the single-node path.
 	for _, absent := range []string{"--datastore-max-open-connections", "--datastore-max-idle-connections", "--datastore-connection-max-lifetime"} {
 		if hasArg(args, absent) || flagValue(args, absent) != "" {
 			t.Errorf("single-node SQLite path must not carry %s, args=%v", absent, args)
 		}
 	}
-	// No password file is produced for the SQLite path.
-	if _, pw, err := splitDatastorePassword(""); err != nil || pw != "" {
-		t.Errorf("splitDatastorePassword(\"\") = (_, %q, %v), want empty", pw, err)
-	}
 }
 
-// TestDatastoreEndpointPostgres proves the HA path: a Postgres DSN reaches kine's
-// --endpoint with the host/user/db intact but the PASSWORD STRIPPED (no secret on
-// argv), and the pinned pgx connection-pool bounds are present.
-func TestDatastoreEndpointPostgres(t *testing.T) {
-	const (
-		password = "s3cr3t-p@ss"
-		dsn      = "postgres://k3sm:s3cr3t-p%40ss@db.internal:5432/k3sm?sslmode=verify-full"
-	)
-	cfg := Config{WorkDir: "/wd", KinePort: 2379, DatastoreEndpoint: dsn}
-	args, err := kineArgs(cfg)
-	if err != nil {
-		t.Fatalf("kineArgs: %v", err)
-	}
-	joined := strings.Join(args, " ")
-
-	// The secret must NOT appear anywhere on argv (neither the literal nor the
-	// percent-encoded form).
-	if strings.Contains(joined, password) || strings.Contains(joined, "s3cr3t-p%40ss") {
-		t.Fatalf("Postgres password leaked onto kine argv: %v", args)
-	}
-	endpoint := flagValue(args, "--endpoint")
-	if !strings.Contains(endpoint, "db.internal:5432") {
-		t.Errorf("--endpoint = %q, want it to carry the Postgres host", endpoint)
-	}
-	if !strings.Contains(endpoint, "k3sm@") || strings.Contains(endpoint, ":s3cr3t") {
-		t.Errorf("--endpoint = %q, want the username kept but the password removed", endpoint)
-	}
-	if !strings.Contains(endpoint, "sslmode=verify-full") {
-		t.Errorf("--endpoint = %q, want the sslmode query parameter preserved", endpoint)
-	}
-
-	// The pgx connection-pool bounds are pinned (kine's own default is UNLIMITED).
-	if got := flagValue(args, "--datastore-max-open-connections"); got != strconv.Itoa(datastoreMaxOpenConns) {
-		t.Errorf("--datastore-max-open-connections = %q, want %d", got, datastoreMaxOpenConns)
-	}
-	if got := flagValue(args, "--datastore-max-idle-connections"); got != strconv.Itoa(datastoreMaxIdleConns) {
-		t.Errorf("--datastore-max-idle-connections = %q, want %d", got, datastoreMaxIdleConns)
-	}
-	if got := flagValue(args, "--datastore-connection-max-lifetime"); got != datastoreConnMaxLifetime {
-		t.Errorf("--datastore-connection-max-lifetime = %q, want %q", got, datastoreConnMaxLifetime)
-	}
-	// The HA path disables kine's :8080 metrics endpoint too (same pod-port-collision reason).
-	if got := flagValue(args, "--metrics-bind-address"); got != "0" {
-		t.Errorf("--metrics-bind-address = %q, want \"0\" (disabled)", got)
-	}
-	// 2*maxOpen must fit a documented Postgres max_connections (default 100) so two HA
-	// servers do not exhaust it.
-	if 2*datastoreMaxOpenConns > 100 {
-		t.Errorf("2*datastoreMaxOpenConns = %d exceeds the Postgres default max_connections (100)", 2*datastoreMaxOpenConns)
-	}
-}
-
-// TestDatastorePasswordRelocation proves the secret-handling primitive end-to-end:
-// the password is extracted from the DSN, the sanitized DSN keeps the username but
-// not the password, and the .pgpass line escapes the pgpass metacharacters so pgx
-// reads the literal password back.
-func TestDatastorePasswordRelocation(t *testing.T) {
-	cases := []struct {
-		name     string
-		dsn      string
-		wantPass string
-		wantUser bool // sanitized DSN keeps a username
-	}{
-		{"user+password", "postgres://k3sm:hunter2@h:5432/db", "hunter2", true},
-		{"password with metachars", "postgres://u:a%3Ab%5Cc@h/db", "a:b\\c", true},
-		{"no password (env-supplied)", "postgres://k3sm@h/db", "", true},
-		{"no userinfo", "postgres://h/db", "", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			sanitized, pass, err := splitDatastorePassword(tc.dsn)
-			if err != nil {
-				t.Fatalf("splitDatastorePassword(%q): %v", tc.dsn, err)
-			}
-			if pass != tc.wantPass {
-				t.Errorf("password = %q, want %q", pass, tc.wantPass)
-			}
-			if pass != "" && strings.Contains(sanitized, pass) {
-				t.Errorf("sanitized DSN %q must not contain the password", sanitized)
-			}
-			if tc.wantUser && !strings.Contains(sanitized, "@") {
-				t.Errorf("sanitized DSN %q must keep the username", sanitized)
-			}
-			// The .pgpass line escapes ':' and '\' and wildcards the match fields.
-			if tc.wantPass != "" {
-				line := pgPassLine(pass)
-				if !strings.HasPrefix(line, "*:*:*:*:") || !strings.HasSuffix(line, "\n") {
-					t.Errorf("pgPassLine = %q, want *:*:*:*:<escaped>\\n", line)
-				}
-				if strings.Contains(tc.wantPass, ":") && !strings.Contains(line, `\:`) {
-					t.Errorf("pgPassLine = %q must escape ':' in the password", line)
-				}
-			}
-		})
-	}
-}
-
-// TestKineVersionSinglePin proves the collapse: there is ONE kine pin, it serves both
-// datastore postures, and it is a >=0.16 release (the floor that carries the kine#577
-// watch-progress-notify fix and a real pure-Go SQLite backend). The old two-pin split
-// — v1.14.2 for SQLite, a separate HA-only constant for Postgres — is gone, so a
-// re-introduced second pin cannot compile past this test.
+// TestKineVersionSinglePin proves there is ONE kine pin, filled regardless of posture,
+// and that it is a >=0.16 release (the floor that carries the kine#577
+// watch-progress-notify fix and a real pure-Go SQLite backend).
 func TestKineVersionSinglePin(t *testing.T) {
 	if !strings.HasPrefix(DefaultKineVersion, "v0.") {
 		t.Fatalf("DefaultKineVersion = %q, want a v0.x release (the two-pin collapse targets kine >=0.16.x; the orphan v1.14.2 line is retired)", DefaultKineVersion)
@@ -177,10 +75,7 @@ func TestKineVersionSinglePin(t *testing.T) {
 	if got := (Config{}).withDefaults().KineVersion; got != DefaultKineVersion {
 		t.Errorf("withDefaults SQLite KineVersion = %q, want %q", got, DefaultKineVersion)
 	}
-	if got := (Config{DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).withDefaults().KineVersion; got != DefaultKineVersion {
-		t.Errorf("withDefaults Postgres KineVersion = %q, want %q (one pin, both postures)", got, DefaultKineVersion)
-	}
-	if got := (Config{KineVersion: "v0.99.0", DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).withDefaults().KineVersion; got != "v0.99.0" {
+	if got := (Config{KineVersion: "v0.99.0"}).withDefaults().KineVersion; got != "v0.99.0" {
 		t.Errorf("explicit KineVersion must be honored, got %q", got)
 	}
 }
@@ -225,40 +120,54 @@ func TestSQLiteEndpointDisablesStartupVacuum(t *testing.T) {
 	}
 }
 
-// TestHARequiresDatastoreEndpoint proves the split-brain guard is fail-closed: a
-// server that declares HA intent (ServerJoin) WITHOUT a datastore endpoint is
-// REJECTED (ErrHARequiresDatastore) rather than silently falling back to its own
-// SQLite — two servers each on their own SQLite is split-brain. The single-node path
-// (no HA intent) and the HA-with-endpoint path both validate clean.
-func TestHARequiresDatastoreEndpoint(t *testing.T) {
+// TestEtcdRoleMakesIllegalStatesUnrepresentable proves the HA role lives only inside
+// Config.Etcd: there is no Config value that asks to join an HA control plane without
+// the etcd posture (so no second server can fall back to its own SQLite), the zero
+// Config is single-node, and an Etcd block without a valid role is refused.
+func TestEtcdRoleMakesIllegalStatesUnrepresentable(t *testing.T) {
+	ct := reflect.TypeOf(Config{})
+	for _, retired := range []string{"ServerJoin", "DatastoreEndpoint"} {
+		if _, ok := ct.FieldByName(retired); ok {
+			t.Errorf("Config.%s exists: an HA role or datastore outside Config.Etcd makes join-without-etcd representable", retired)
+		}
+	}
+	if (Config{}).isHA() {
+		t.Error("the zero Config must be the single-node posture, not HA")
+	}
+	if err := (Config{}).Validate(); err != nil {
+		t.Errorf("the zero Config must validate, got %v", err)
+	}
 	cases := []struct {
-		name    string
-		cfg     Config
-		wantErr bool
+		name string
+		etcd EtcdConfig
+		want error
 	}{
-		{"single-node (no HA intent)", Config{}, false},
-		{"HA intent, no datastore -> SPLIT-BRAIN", Config{ServerJoin: true}, true},
-		{"HA intent + datastore", Config{ServerJoin: true, DatastoreEndpoint: "postgres://k3sm@db/k3sm"}, false},
-		{"datastore only (single server on Postgres)", Config{DatastoreEndpoint: "postgres://k3sm@db/k3sm"}, false},
+		{"missing role", EtcdConfig{Name: "n", PeerIP: "192.168.0.50"}, ErrEtcdRole},
+		{"unknown role", EtcdConfig{Role: EtcdRole(99), Name: "n", PeerIP: "192.168.0.50"}, ErrEtcdRole},
+		{"missing name", EtcdConfig{Role: EtcdJoin, PeerIP: "192.168.0.50"}, ErrEtcdRole},
+		{"init", EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}, nil},
+		{"join", EtcdConfig{Role: EtcdJoin, Name: "n", PeerIP: "192.168.0.50"}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.cfg.Validate()
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("Validate must REJECT HA intent without a datastore endpoint (split-brain)")
-				}
-				return
+			etcd := tc.etcd
+			cfg := Config{Etcd: &etcd}
+			if !cfg.isHA() {
+				t.Error("a Config carrying Etcd must be HA")
 			}
-			if err != nil {
-				t.Fatalf("Validate: unexpected error %v", err)
+			err := cfg.Validate()
+			if tc.want == nil && err != nil {
+				t.Fatalf("Validate = %v, want nil", err)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("Validate = %v, want %v", err, tc.want)
 			}
 		})
 	}
 }
 
 // TestLeaderElectHAvsSingleNode proves the leader-election posture: --leader-elect is
-// false single-node (unchanged) and true in HA (Postgres) for BOTH the scheduler and
+// false single-node (unchanged) and true in HA (the etcd posture) for BOTH the scheduler and
 // the controller-manager, so two servers never both run active schedulers/KCMs. An
 // explicit Config.LeaderElect overrides the derivation.
 func TestLeaderElectHAvsSingleNode(t *testing.T) {
@@ -273,17 +182,6 @@ func TestLeaderElectHAvsSingleNode(t *testing.T) {
 		t.Errorf("single-node KCM must carry --leader-elect=false, args=%v", controllerManagerArgs(single))
 	}
 
-	ha := Config{WorkDir: "/wd", DatastoreEndpoint: "postgres://k3sm@db/k3sm"}
-	if !ha.leaderElect() {
-		t.Error("HA (Postgres) leaderElect() must be true")
-	}
-	if !hasArg(schedulerArgs(ha), "--leader-elect=true") {
-		t.Errorf("HA scheduler must carry --leader-elect=true, args=%v", schedulerArgs(ha))
-	}
-	if !hasArg(controllerManagerArgs(ha), "--leader-elect=true") {
-		t.Errorf("HA KCM must carry --leader-elect=true, args=%v", controllerManagerArgs(ha))
-	}
-
 	// The etcd posture is HA in both roles: one active scheduler/KCM across servers.
 	for _, role := range []EtcdRole{EtcdInit, EtcdJoin} {
 		etcd := Config{WorkDir: "/wd", Etcd: &EtcdConfig{Role: role, Name: "n", PeerIP: "192.168.0.50"}}
@@ -295,17 +193,12 @@ func TestLeaderElectHAvsSingleNode(t *testing.T) {
 		}
 	}
 
-	// ServerJoin (HA intent) also turns it on.
-	if !(Config{ServerJoin: true, DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).leaderElect() {
-		t.Error("ServerJoin HA leaderElect() must be true")
-	}
-
 	// An explicit pointer overrides the derivation in both directions.
 	on, off := true, false
 	if !(Config{LeaderElect: &on}).leaderElect() {
 		t.Error("explicit LeaderElect=true must win")
 	}
-	if (Config{DatastoreEndpoint: "postgres://k3sm@db/k3sm", LeaderElect: &off}).leaderElect() {
+	if (Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}, LeaderElect: &off}).leaderElect() {
 		t.Error("explicit LeaderElect=false must win even in HA")
 	}
 }

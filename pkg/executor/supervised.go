@@ -403,7 +403,7 @@ func (s *Supervised) releaseStartClaim() {
 func (s *Supervised) provision(ctx context.Context) error {
 	// An init member over an existing single-node datastore is refused before
 	// anything in the work dir is touched.
-	if err := provisionStep("cluster-init", refuseClusterInitOverSQLite(s.cfg)); err != nil {
+	if err := provisionStep("cluster-init", RefuseClusterInitOverSQLite(s.cfg)); err != nil {
 		return err
 	}
 	if err := provisionStep("workdirs", ensureWorkDirs(s.cfg.WorkDir)); err != nil {
@@ -412,12 +412,12 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// Before anything replaces the staged kine binary or lets the new pin touch the
 	// database: take the verified pre-migration snapshot if this boot moves an existing
 	// datastore onto a kine pin that has not opened it before. It is a no-op on a fresh
-	// node, on an unchanged pin, and on the Postgres posture (no state.db). It must sit
+	// node and on an unchanged pin. It must sit
 	// ahead of seedBinDir/ensureKine, which are exactly what would destroy the old kine
 	// binary the rollback path preserves. A refusal (no space, an undrained WAL) stops
 	// the boot rather than migrating unprotected. The etcd posture has no kine
 	// datastore to protect.
-	if s.cfg.DatastoreEndpoint == "" && s.cfg.Etcd == nil {
+	if s.cfg.Etcd == nil {
 		if err := provisionStep("snapshot", snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 			return err
 		}
@@ -624,9 +624,8 @@ func (s *Supervised) bringUpKine(ctx context.Context) error {
 	// kine is serving, so this pin has now genuinely opened this database — stamp it,
 	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
 	// provision time) is what makes the pre-migration snapshot survive a boot that dies
-	// before the datastore ever came up; recordKinePin itself skips the external-
-	// datastore posture.
-	return bringUpErr(kine.name, PhaseBringUp, recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint))
+	// before the datastore ever came up; recordKinePin itself skips the etcd posture.
+	return bringUpErr(kine.name, PhaseBringUp, recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.Etcd != nil))
 }
 
 // startAndAwaitListening starts a component and does not return until its own
@@ -661,11 +660,7 @@ func (s *Supervised) startAndAwaitListening(ctx context.Context, name string, st
 	return nil
 }
 
-// startKine launches the kine etcd shim. The datastore is the single-node SQLite WAL
-// DB (the single-node default) unless cfg.DatastoreEndpoint names a Postgres
-// DSN (HA multi-writer), in which case the password is relocated off argv into a
-// 0600 PGPASSFILE the kine child reads via PGPASSFILE (kineSecretEnv) and only the
-// password-stripped DSN reaches --endpoint.
+// startKine launches the kine etcd shim over the single-node SQLite WAL datastore.
 func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	// Fail closed before the spawn if the datastore port is already held: a kine we
 	// start over a foreign listener never gets the port, but the readiness probe
@@ -685,35 +680,7 @@ func (s *Supervised) startKine(ctx context.Context) (*component, error) {
 	kineVersion, kineVariant := readKineMarker(binDir(s.cfg.WorkDir))
 	s.cfg.Logger.Info("starting datastore shim", "component", "kine",
 		"version", kineVersion, "variant", kineVariant, "datastore", datastorePosture(s.cfg))
-	env, err := s.kineSecretEnv()
-	if err != nil {
-		return nil, err
-	}
-	return s.spawnEnv(ctx, "kine", env, args...)
-}
-
-// kineSecretEnv relocates a Postgres DSN password off argv. For a datastore endpoint
-// carrying a password it writes a 0600 PGPASSFILE in the work-dir and returns the
-// PGPASSFILE env var for the kine child; kine's pgx driver (pgx.ParseConfig) reads the
-// password from it as the libpq env fallback when the DSN omits it. It returns nil for
-// the SQLite path or a password-less DSN. Writing here (not in the pure kineArgs) keeps
-// the secret out of both argv and the args the tests inspect.
-func (s *Supervised) kineSecretEnv() ([]string, error) {
-	if s.cfg.DatastoreEndpoint == "" {
-		return nil, nil
-	}
-	_, password, err := splitDatastorePassword(s.cfg.DatastoreEndpoint)
-	if err != nil {
-		return nil, err
-	}
-	if password == "" {
-		return nil, nil
-	}
-	path := pgPassPath(s.cfg.WorkDir)
-	if err := os.WriteFile(path, []byte(pgPassLine(password)), 0o600); err != nil {
-		return nil, fmt.Errorf("write datastore PGPASSFILE: %w", err)
-	}
-	return []string{"PGPASSFILE=" + path}, nil
+	return s.spawn(ctx, "kine", args...)
 }
 
 // startAPIServer launches kube-apiserver against kine on the secure port. It
@@ -916,7 +883,7 @@ func (s *Supervised) startScheduler(ctx context.Context) (*component, error) {
 // apiserver's bootstrap system:kube-scheduler ClusterRoleBinding actually constrains
 // it (the k3s model). Pure so the leader-election posture is table-tested:
 // --leader-elect is false single-node (one candidate, no lease churn — the
-// single-node default) and true in HA (Postgres multi-writer) so only one server's
+// single-node default) and true in HA (the etcd posture) so only one server's
 // scheduler is active (two active schedulers double-bind pods).
 func schedulerArgs(cfg Config) []string {
 	kc := schedulerKubeconfigPath(cfg.WorkDir)
@@ -986,17 +953,15 @@ func (s *Supervised) spawn(ctx context.Context, name string, args ...string) (*c
 
 // spawnEnv starts a control-plane binary from the workdir bin as a child process in
 // its own process group, redirecting its output to a per-component log file, and
-// records it for teardown. extraEnv is appended to the inherited environment (used to
-// pass the kine child its PGPASSFILE out-of-band, keeping the Postgres secret off
-// argv). It does not block on the child — components run until Stop — but it does
-// start a reaper goroutine (`go cmd.Wait()`) that closes the component's exited
+// records it for teardown. extraEnv is appended to the inherited environment. It
+// does not block on the child — components run until Stop — but it does start a reaper goroutine (`go cmd.Wait()`) that closes the component's exited
 // channel the moment the child dies, so the bring-up waits (awaitHealthy) and
 // stopComponent can select on child-exit. That goroutine's lifetime is the child's
 // lifetime — typically the whole process life for a healthy component — and is
 // leak-free: it parks in wait4 and ends exactly when the child does.
 //
 // The log file is mode 0600 (not the umask default 0644): a component log can carry
-// bearer tokens and the kine datastore endpoint, so it must not be world-readable.
+// bearer tokens, so it must not be world-readable.
 func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []string, args ...string) (*component, error) {
 	bin := filepath.Join(binDir(s.cfg.WorkDir), name)
 	logPath := filepath.Join(s.cfg.WorkDir, name+".log")
@@ -1176,7 +1141,7 @@ var (
 	// it was logged from.
 	authHeaders = regexp.MustCompile(`(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]+`)
 	// dsnUserinfo matches the credentials embedded in a datastore URL, keeping the
-	// scheme and the host: "which Postgres?" is diagnostics, the password is not.
+	// scheme and the host: "which host?" is diagnostics, the password is not.
 	dsnUserinfo = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^\s:/@]+(?::[^\s/@]*)?@`)
 	// mintedTokens matches the credential shapes k3sm itself mints — the join
 	// token (`k3sm-<opaque>`) and the CA-pinned bootstrap token (`K10<sha256>::…`)

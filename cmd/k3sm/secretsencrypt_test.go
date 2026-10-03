@@ -108,11 +108,17 @@ func TestSecretsEncryptStatus(t *testing.T) {
 			wantCode: 1,
 			want:     []string{"secrets encryption: refused ("},
 		},
+		{
+			name:     "enabled beside a cluster init is refused",
+			setup:    func(t *testing.T, wd string) { writeEncryptionPair(t, wd, true) },
+			args:     []string{"--cluster-init"},
+			wantCode: 1,
+			want:     []string{"secrets encryption: refused ("},
+		},
 	}
 	encodedKey := base64.StdEncoding.EncodeToString(statusTestKey)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("K3SM_DATASTORE_ENDPOINT", "")
 			wd := filepath.Join(t.TempDir(), "server")
 			if tc.setup != nil {
 				tc.setup(t, wd)

@@ -156,13 +156,14 @@ func TestSnapshotSaveReportIsHonestAboutTheWAL(t *testing.T) {
 }
 
 // TestSnapshotDispatch pins the subcommand surface: no verb and an unknown verb both
-// fail with usage, and the usage states the single-node scope and the pg_dump answer.
+// fail with usage, and the usage states the single-node scope and the etcd posture's
+// limits.
 func TestSnapshotDispatch(t *testing.T) {
 	err := runSnapshot(nil)
 	if err == nil {
 		t.Fatal("k3sm snapshot with no subcommand succeeded")
 	}
-	for _, want := range []string{"snapshot save", "snapshot restore", "pg_dump", "PersistentVolume"} {
+	for _, want := range []string{"snapshot save", "snapshot restore", "etcd", "PersistentVolume"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the usage does not mention %q:\n%s", want, err)
 		}

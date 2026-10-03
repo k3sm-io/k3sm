@@ -528,8 +528,8 @@ func TestClusterInitRefusesExistingSQLiteState(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.setup(t, wd)
-			if err := refuseClusterInitOverSQLite(tc.cfg(wd)); err != nil {
-				t.Errorf("refuseClusterInitOverSQLite = %v, want nil", err)
+			if err := RefuseClusterInitOverSQLite(tc.cfg(wd)); err != nil {
+				t.Errorf("RefuseClusterInitOverSQLite = %v, want nil", err)
 			}
 		})
 	}
@@ -540,7 +540,7 @@ func TestClusterInitRefusesExistingSQLiteState(t *testing.T) {
 	if err := os.WriteFile(StateDBPath(empty), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := refuseClusterInitOverSQLite(Config{WorkDir: empty, Etcd: &EtcdConfig{Role: EtcdInit}}); err != nil {
+	if err := RefuseClusterInitOverSQLite(Config{WorkDir: empty, Etcd: &EtcdConfig{Role: EtcdInit}}); err != nil {
 		t.Errorf("an empty state.db holds no cluster; got %v", err)
 	}
 }

@@ -150,26 +150,6 @@ type Config struct {
 	// identities get a pre-provisioned datapath grant (pkg/rbac); set it
 	// to "AlwaysAllow" only for a deliberate diagnostic bring-up.
 	AuthorizationMode string
-	// DatastoreEndpoint, when non-empty, is the kine datastore endpoint — a Postgres
-	// connection URL (postgres://user[:password]@host:port/dbname?sslmode=...) for the
-	// HA multi-writer posture: 2+ control-plane servers share ONE Postgres, the
-	// single source of truth (no etcd quorum). Empty keeps the single-node kine->SQLite
-	// WAL default. The apiserver always talks to the LOCAL kine
-	// (--etcd-servers 127.0.0.1:<KinePort>); each server runs its own kine against the
-	// shared Postgres (the k3s topology). The DSN PASSWORD is kept off argv and out of
-	// the logs — it is relocated to a 0600 PGPASSFILE handed to the kine child, and only
-	// the password-stripped DSN reaches kine's --endpoint. Setting this also moves kine
-	// on the shared Postgres (see KineVersion — one pin serves both postures) and
-	// turns on leader election.
-	DatastoreEndpoint string
-	// ServerJoin marks this control-plane server as joining/forming an HA control plane
-	// (a 2nd+ apiserver). It is the split-brain guard's trigger: an HA server MUST carry
-	// a DatastoreEndpoint — Validate fails closed otherwise, so a 2nd server can NEVER
-	// silently fall back to its own SQLite (two servers each on their own SQLite is
-	// split-brain — divergent state, no single source of truth). The full HA server-join
-	// bootstrap (the identical-CA bundle, DESIGN §5c) is a separate path; this field
-	// drives only the guard + the leader-election posture.
-	ServerJoin bool
 	// Etcd, when non-nil, selects the embedded-etcd HA posture: this server runs one
 	// etcd member as a supervised child (instead of kine) and its apiserver talks to
 	// that local member over mutual TLS. Nil is the kine posture (single-node SQLite),
@@ -190,13 +170,12 @@ type Config struct {
 	// EncryptionConfiguration, passed as --encryption-provider-config so Secrets
 	// are encrypted at rest. The caller sets it only after EncryptionAtStart has
 	// accepted the credential pair under the work dir. It is a single-server
-	// option: Validate refuses it in every HA posture (Etcd, ServerJoin or a
-	// DatastoreEndpoint), because every server of an HA control plane would need
-	// the same key and nothing distributes one.
+	// option: Validate refuses it in the etcd HA posture, because every server of an
+	// HA control plane would need the same key and nothing distributes one.
 	EncryptionProviderConfig string
 	// LeaderElect, when non-nil, forces the scheduler + controller-manager --leader-elect
-	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (a Postgres
-	// multi-writer datastore — so only one server's scheduler/KCM is active; two active
+	// setting. A nil pointer DERIVES it from the datastore posture: ON in HA (the etcd
+	// posture, every server sharing one cluster — so only one server's scheduler/KCM is active; two active
 	// schedulers double-bind pods, two KCMs double-reconcile) and OFF single-node (one
 	// candidate, no lease churn — the single-node default). Only the apiserver is active/active
 	// in HA. The leader-election Leases are authorized by the apiserver's auto-created
@@ -289,21 +268,19 @@ type EtcdConfig struct {
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
 	DefaultKubeVersion = "v1.36.5"
-	// DefaultKineVersion is THE kine module version — one pin for BOTH datastore
-	// postures (single-node SQLite and Postgres-HA), built CGO_ENABLED=0 against
-	// kine's pure-Go modernc.org/sqlite backend (kineBuildVariant).
+	// DefaultKineVersion is THE kine module version for the single-node SQLite
+	// posture, built CGO_ENABLED=0 against kine's pure-Go modernc.org/sqlite backend
+	// (kineBuildVariant).
 	//
-	// It replaces the former two-pin split (v1.14.2 SQLite / v0.16.3 Postgres-HA).
-	// The old SQLite pin had no corresponding upstream tag — it resolves only from a
-	// warmed module proxy, so a cold GOPROXY=direct build of the datastore could not
-	// be reproduced at all — and it predated the kine#577 watch-progress-notify fix.
-	// v0.17.x is what k3s itself pins (v0.17.1 since the bump off v0.17.0: bugfixes
-	// and dependency patches only, no schema or encoding change); it defaults
-	// --watch-progress-notify-interval to 5s and --emulated-etcd-version to 3.6.11,
-	// so the apiserver's watch cache
-	// stays fresh on both postures, and its no-cgo build is a real, supported variant
-	// (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo) rather than the
-	// SQLite-disabled stub the spike measured on the old pin.
+	// It replaces the former v1.14.2 SQLite pin, which had no corresponding upstream
+	// tag — it resolves only from a warmed module proxy, so a cold GOPROXY=direct build
+	// of the datastore could not be reproduced at all — and which predated the kine#577
+	// watch-progress-notify fix. v0.17.x is what k3s itself pins (v0.17.1 since the bump
+	// off v0.17.0: bugfixes and dependency patches only, no schema or encoding change);
+	// it defaults --watch-progress-notify-interval to 5s and --emulated-etcd-version to
+	// 3.6.11, so the apiserver's watch cache stays fresh, and its no-cgo build is a
+	// real, supported variant (pkg/drivers/sqlite/sqlite_nocgo.go, //go:build !cgo)
+	// rather than the SQLite-disabled stub the spike measured on the old pin.
 	//
 	// Moving an EXISTING single-node state.db onto this pin is a one-way datastore
 	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
@@ -420,13 +397,6 @@ func EnsureWorkDirWritable(dir string) error {
 	return nil
 }
 
-// ErrHARequiresDatastore is returned by Validate when an HA control-plane server
-// (ServerJoin) is requested without a shared datastore endpoint. A 2nd server must
-// NEVER fall back to its own SQLite — two servers each on their own single-writer
-// SQLite is split-brain (divergent state, no single source of truth). The guard is
-// fail-closed: bring-up halts rather than silently diverging.
-var ErrHARequiresDatastore = errors.New("executor: HA server-join requires a shared datastore endpoint (a Postgres DSN); refusing to start a second server on its own SQLite (split-brain)")
-
 // ErrRootCAWithoutServingCert is returned by Validate when a RootCAFile is supplied
 // without the serving keypair it is supposed to anchor. The two are one posture, not
 // two knobs: on the single-node path the apiserver self-signs into its own --cert-dir,
@@ -436,15 +406,13 @@ var ErrHARequiresDatastore = errors.New("executor: HA server-join requires a sha
 // of silently ignored.
 var ErrRootCAWithoutServingCert = errors.New("executor: RootCAFile is set without ServingCertFile/ServingKeyFile; the published kube-root-ca.crt must anchor the apiserver serving cert, and single-node the apiserver self-signs into its own --cert-dir")
 
-// Validate checks cfg is internally consistent before bring-up. The load-bearing
-// check is the split-brain guard: an HA server (ServerJoin) MUST carry a
-// DatastoreEndpoint. It is called at the top of Start so a misconfigured HA server
-// fails fast with a clear error instead of quietly forming a divergent cluster.
-// The second check is the trust-anchor guard (see ErrRootCAWithoutServingCert).
+// Validate checks cfg is internally consistent before bring-up. It is called at the
+// top of Start so a misconfigured server fails fast with a clear error. The checks are
+// the trust-anchor guard (see ErrRootCAWithoutServingCert), the single-server-only
+// encryption guard (ErrEncryptionHA) and the etcd posture's own shape (ErrEtcdRole,
+// ErrEtcdNeedsNodeIP). There is no split-brain guard to check: an HA role exists only
+// inside Etcd, so "join without a shared datastore" has no Config value.
 func (c Config) Validate() error {
-	if c.ServerJoin && c.DatastoreEndpoint == "" {
-		return ErrHARequiresDatastore
-	}
 	if c.RootCAFile != "" && !c.meshServingCert() {
 		return ErrRootCAWithoutServingCert
 	}
@@ -540,10 +508,9 @@ func (c Config) rootCAFile() string {
 	return certs.ClusterCACertPath(c.WorkDir)
 }
 
-// isHA reports whether this server runs an HA posture: an embedded etcd member, a
-// shared datastore endpoint, or it was told to join/form an HA control plane.
+// isHA reports whether this server runs the HA posture: an embedded etcd member.
 func (c Config) isHA() bool {
-	return c.Etcd != nil || c.DatastoreEndpoint != "" || c.ServerJoin
+	return c.Etcd != nil
 }
 
 // schedulerPort resolves the kube-scheduler secure-serving port: the configured
@@ -595,9 +562,8 @@ func (c Config) withDefaults() Config {
 		c.KubeVersion = DefaultKubeVersion
 	}
 	if c.KineVersion == "" {
-		// ONE pin for both datastore postures (see DefaultKineVersion) — the
-		// SQLite/Postgres split is a driver choice inside a single kine build,
-		// never a second version.
+		// ONE kine pin (see DefaultKineVersion). The etcd posture never runs
+		// kine; it carries the field only because the default is posture-blind.
 		c.KineVersion = DefaultKineVersion
 	}
 	if c.NodeIP == "" {
