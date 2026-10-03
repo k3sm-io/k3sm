@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -347,6 +348,9 @@ func runUninstall(args []string) error {
 			"remedy", "on the control plane: kubectl delete meshpeer/<node> node/<node>")
 	}
 	cfg.Deregister = deregister
+	// On an embedded-etcd HA server, remove its etcd member first (install decides
+	// whether the installed plist is one; see uninstalletcd.go).
+	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin)
 	if *purgeFlag {
 		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
