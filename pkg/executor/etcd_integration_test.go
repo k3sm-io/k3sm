@@ -666,14 +666,23 @@ func TestEtcdChildBootsWithTLSAndServesKV(t *testing.T) {
 	if err := rawTLSRefusal(addr, h2(good)); err != nil {
 		t.Fatalf("control: the raw probe with client.crt was refused: %v", err)
 	}
-	refused := map[string]*tls.Config{
-		"no client certificate":           {RootCAs: pool, MinVersion: tls.VersionTLS12},
-		"a signing-CA system:node:x cert": {RootCAs: pool, MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{nodePair}},
+	// The node cert is presented unconditionally: Go's client would otherwise drop a
+	// certificate whose issuer is not among the CAs the server asks for, and the
+	// refusal would be "no certificate", not the server rejecting this one.
+	refused := map[string]struct {
+		cfg  *tls.Config
+		want string
+	}{
+		"no client certificate": {&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, "certificate required"},
+		"a signing-CA system:node:x cert": {&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12,
+			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &nodePair, nil },
+		}, "unknown certificate authority"},
 	}
-	for what, cfg := range refused {
+	for what, tc := range refused {
+		cfg := tc.cfg
 		err := rawTLSRefusal(addr, h2(cfg))
-		if err == nil || !strings.Contains(err.Error(), "tls:") {
-			t.Errorf("%s: the listener did not refuse the handshake (err %v)", what, err)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: the listener did not refuse the handshake with %q (err %v)", what, tc.want, err)
 		} else {
 			t.Logf("%s: refused by the handshake: %v", what, err)
 		}
