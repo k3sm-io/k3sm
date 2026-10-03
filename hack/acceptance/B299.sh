@@ -10,6 +10,8 @@
 # script answers on real hardware is whether that matters: does a SYN from an
 # lo0-bound socket to a remote pod IP carry an MSS above 1340 on the tunnel, or
 # does the kernel already derive the MSS from the route to the utun?
+# (Answered: the kernel takes the MSS from the route, 1340. The mesh has since
+# stopped loading that rule; this background describes the release measured.)
 #
 # It is READ-ONLY toward the host network configuration. It runs `pfctl -s`,
 # `pfctl -sr`, `pfctl -a io.k3sm.mesh -sr`, `route -n get`, `ifconfig` (read),
