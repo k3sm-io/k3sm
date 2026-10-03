@@ -18,9 +18,14 @@ package mlx
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -28,7 +33,7 @@ import (
 const probeTestModel = "qwen2.5-0.5b-instruct-4bit"
 
 // probeHangTimeout is the bound handed to the ONE case whose subject IS the
-// bound — a handler that never answers — plus the refused-connection case,
+// bound — a transport that never answers — plus the refused-connection case,
 // whose verdict is the same whatever the budget is. It is short so that case
 // does not make the suite slow.
 const probeHangTimeout = 100 * time.Millisecond
@@ -43,9 +48,10 @@ const probeHangTimeout = 100 * time.Millisecond
 // well inside 100ms unloaded, but on a loaded machine the round trip lost that
 // race, ProbeOpenAISurface saw a client-timeout error instead of a response and
 // correctly returned Unreachable — a verdict about the machine, asserted as if
-// it were a verdict about the fixture. The content cases below no longer touch
-// the network at all (see serveInProcess); this budget is the residual guard,
-// not a race they have to win.
+// it were a verdict about the fixture. No case in this file touches the network
+// at all (see serveInProcess, refusedTransport, hungTransport); this budget is
+// the residual guard, not a race the content cases have to win. The real-socket
+// cases live in probe_integration_test.go.
 const probeContentBudget = 30 * time.Second
 
 // TestServingProbeVerdictFromOpenAISurface is B65's gate: an httptest fake
@@ -54,21 +60,21 @@ const probeContentBudget = 30 * time.Second
 // hack/spike/m8/findings-s5.md §3–4).
 func TestServingProbeVerdictFromOpenAISurface(t *testing.T) {
 	t.Run("silent_or_refused_is_the_downloading_verdict", func(t *testing.T) {
-		// A server stood up then immediately closed: the port refuses the
-		// connection, exactly like a pod whose serving container has not
-		// bound its port yet because it is still fetching weights.
-		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-			t.Fatal("handler must not be reached: the server is closed before probing")
-		}))
-		srv.Close()
-
-		// A real socket, deliberately: a refused dial is what this case is
-		// about. The budget cannot change its verdict either way — a refusal
-		// and an elapsed budget are both "no response", both Unreachable — so
-		// the short one costs nothing here.
-		got := probeAt(t, srv.URL, probeHangTimeout)
+		// A refused connection, exactly like a pod whose serving container has
+		// not bound its port yet because it is still fetching weights. The fake
+		// returns the error a refused TCP dial produces, so the verdict is
+		// derived from the transport's answer and from nothing a loaded machine
+		// can change. The budget cannot change it either — a refusal and an
+		// elapsed budget are both "no response", both Unreachable — so the short
+		// one costs nothing here. The same case over a real closed port is in
+		// probe_integration_test.go.
+		var rt refusedTransport
+		got := probeVia(t, &rt, probeTestBaseURL, probeHangTimeout)
 		if got != ProbeUnreachable {
 			t.Fatalf("got %q, want %q (ProbeUnreachable)", got, ProbeUnreachable)
+		}
+		if rt.calls.Load() == 0 {
+			t.Fatal("the transport was never asked: Unreachable must be the answer to a refused dial, not to a request that was never made")
 		}
 	})
 
@@ -102,21 +108,6 @@ func TestServingProbeVerdictFromOpenAISurface(t *testing.T) {
 
 	t.Run("health_ok_model_listed_is_serving", func(t *testing.T) {
 		got := probeServed(t, servingHandler())
-		if got != ProbeServing {
-			t.Fatalf("got %q, want %q (ProbeServing)", got, ProbeServing)
-		}
-	})
-
-	t.Run("health_ok_model_listed_is_serving_over_a_real_socket", func(t *testing.T) {
-		// The same fixture over a real loopback listener, so the table keeps
-		// one end-to-end path through net/http's client, connection handling
-		// and body reads rather than only through the in-process transport.
-		// It runs under probeContentBudget: the budget is a liveness guard
-		// here, not a race the round trip has to win.
-		srv := httptest.NewServer(servingHandler())
-		defer srv.Close()
-
-		got := probeAt(t, srv.URL, probeContentBudget)
 		if got != ProbeServing {
 			t.Fatalf("got %q, want %q (ProbeServing)", got, ProbeServing)
 		}
@@ -180,25 +171,21 @@ func TestServingProbeVerdictFromOpenAISurface(t *testing.T) {
 	})
 
 	t.Run("timeout_is_bounded_a_hung_handler_does_not_hang_the_test", func(t *testing.T) {
-		// release is closed explicitly AFTER probeAt returns below — never on
-		// a deferred/context-cancellation path — so this test's own hygiene
-		// (srv.Close() draining the outstanding request) does not itself
-		// depend on the client-cancellation behavior under test. What IS
-		// under test is that ProbeOpenAISurface returns on its own, bounded
-		// by probeHangTimeout, while the handler is still blocked.
-		release := make(chan struct{})
-		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-			<-release
-		}))
-		defer srv.Close()
-
+		// A transport that never answers: it blocks until the request's context
+		// is done, the way a connection to a wedged server does. What is under
+		// test is that ProbeOpenAISurface returns on its own, bounded by
+		// probeHangTimeout — the client's own Timeout is the only thing that can
+		// end the request, because the helper's outer context allows a minute.
+		var rt hungTransport
 		start := time.Now()
-		got := probeAt(t, srv.URL, probeHangTimeout)
+		got := probeVia(t, &rt, probeTestBaseURL, probeHangTimeout)
 		elapsed := time.Since(start)
-		close(release) // let the handler return so the deferred srv.Close() above doesn't block
 
 		if got != ProbeUnreachable {
 			t.Fatalf("got %q, want %q (a probe that never got a response is silent, not degraded)", got, ProbeUnreachable)
+		}
+		if rt.calls.Load() == 0 {
+			t.Fatal("the transport was never asked: the bound must be the one that ended a hung request")
 		}
 		// Generous multiple of probeHangTimeout: bounded means "does not hang
 		// indefinitely", not "returns in exactly one timeout" — this asserts
@@ -238,9 +225,10 @@ func TestServingProbeVerdictFromOpenAISurface(t *testing.T) {
 // It never returns an error, which is the property the content cases need:
 // ProbeUnreachable is reachable ONLY through a transport error, so a case
 // running here cannot be handed the "silent surface" verdict by a loaded
-// machine. The two cases whose subject really is the network — a refused
-// connection and a handler that never answers — keep real httptest servers,
-// because for them the transport is the thing under test.
+// machine. The two cases whose subject is the transport's failure — a refused
+// connection and a handler that never answers — use refusedTransport and
+// hungTransport instead, which fail the way the network does without opening a
+// socket.
 type serveInProcess struct{ h http.Handler }
 
 func (s serveInProcess) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -251,32 +239,65 @@ func (s serveInProcess) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// probeServed runs ProbeOpenAISurface against h with no network in between,
-// under the liveness-only probeContentBudget. baseURL is a syntactically valid
-// absolute URL that is never resolved — serveInProcess answers before any
-// resolution would happen.
-func probeServed(t *testing.T, h http.Handler) ProbeVerdict {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	return ProbeOpenAISurface(ctx, serveInProcess{h: h}, "http://replica.mlx.invalid:8000", probeTestModel, probeContentBudget)
+// refusedTransport is an http.RoundTripper that fails every request the way a
+// dial to a port with no listener fails: a *net.OpError wrapping ECONNREFUSED
+// from connect(2), the shape net.Dialer returns. http.Client wraps it in a
+// *url.Error itself, as it would a real refusal.
+type refusedTransport struct{ calls atomic.Int32 }
+
+func (r *refusedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.calls.Add(1)
+	return nil, &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
+	}
 }
 
-// probeAt runs ProbeOpenAISurface against a real loopback server for
-// probeTestModel, using the default transport (loopback httptest servers carry
-// no TLS, so NewProbeTransport's relaxed verification is not exercised here —
-// that is covered by the transport's own construction, not by this table).
-// timeout is per-case: see probeHangTimeout / probeContentBudget.
-func probeAt(t *testing.T, baseURL string, timeout time.Duration) ProbeVerdict {
+// hungTransport is an http.RoundTripper that never answers: it blocks until the
+// request's context is done and returns that context's error, so the only thing
+// that can end a request is a deadline or a cancellation from the caller.
+type hungTransport struct{ calls atomic.Int32 }
+
+func (h *hungTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	h.calls.Add(1)
+	<-req.Context().Done()
+	err := req.Context().Err()
+	if err == nil {
+		err = errors.New("hung transport released without a context error")
+	}
+	return nil, err
+}
+
+// probeTestBaseURL is a syntactically valid absolute URL that is never resolved:
+// every fake transport answers before any resolution would happen.
+const probeTestBaseURL = "http://replica.mlx.invalid:8000"
+
+// probeServed runs ProbeOpenAISurface against h with no network in between,
+// under the liveness-only probeContentBudget.
+func probeServed(t *testing.T, h http.Handler) ProbeVerdict {
+	t.Helper()
+	return probeVia(t, serveInProcess{h: h}, probeTestBaseURL, probeContentBudget)
+}
+
+// probeVia runs ProbeOpenAISurface for probeTestModel through rt against
+// baseURL, under a one-minute outer context so a wedged run cannot hang the
+// suite. timeout is per-case: see probeHangTimeout / probeContentBudget. The
+// integration tier passes http.DefaultTransport and a real loopback URL
+// (loopback httptest servers carry no TLS, so NewProbeTransport's relaxed
+// verification is not exercised there — that is covered by the transport's own
+// construction, not by this table).
+func probeVia(t *testing.T, rt http.RoundTripper, baseURL string, timeout time.Duration) ProbeVerdict {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	return ProbeOpenAISurface(ctx, http.DefaultTransport, baseURL, probeTestModel, timeout)
+	return ProbeOpenAISurface(ctx, rt, baseURL, probeTestModel, timeout)
 }
 
 // servingHandler is the "this replica serves probeTestModel" fixture, shared by
-// the in-process and the real-socket serving cases so the two cannot drift into
-// asserting the same verdict about different bytes.
+// the in-process serving case here and the real-socket serving case in
+// probe_integration_test.go, so the two cannot drift into asserting the same
+// verdict about different bytes.
 func servingHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
