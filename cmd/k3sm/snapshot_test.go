@@ -20,7 +20,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -205,4 +208,74 @@ func TestAnnotateSnapshotErrorIsActionable(t *testing.T) {
 	if annotateSnapshotError(other, "/x") != other {
 		t.Error("an unrecognized error was rewritten")
 	}
+}
+
+// TestSnapshotSaveDispatchesByPosture pins the save dispatch: a work dir holding an
+// etcd member takes the online etcd snapshot (to the default snapshots dir, created
+// 0700, or to --out) and never the SQLite path; any other work dir takes the SQLite
+// path and never the etcd one; an etcd failure keeps its sentinel.
+func TestSnapshotSaveDispatchesByPosture(t *testing.T) {
+	at := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	newSavers := func(member bool, calls *[]string, etcdErr error) snapshotSavers {
+		return snapshotSavers{
+			etcdMember: func(string) bool { return member },
+			etcd: func(_ context.Context, _ string, dst string) error {
+				*calls = append(*calls, "etcd "+dst)
+				return etcdErr
+			},
+			sqlite: func(_ context.Context, opts executor.SnapshotSaveOptions) (*executor.SnapshotSaveResult, error) {
+				*calls = append(*calls, "sqlite "+opts.Out)
+				return &executor.SnapshotSaveResult{Path: "x", SourceDB: "y", Checkpointed: true}, nil
+			},
+			now: func() time.Time { return at },
+		}
+	}
+
+	t.Run("etcd member, default destination", func(t *testing.T) {
+		wd := t.TempDir()
+		var calls []string
+		var out strings.Builder
+		if err := saveSnapshot(context.Background(), &out, wd, "", newSavers(true, &calls, nil)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		want := filepath.Join(executor.SnapshotDir(wd), "k3sm-etcd-snapshot-20261002T120000Z.db")
+		if len(calls) != 1 || calls[0] != "etcd "+want {
+			t.Fatalf("calls = %v, want one etcd save to %s", calls, want)
+		}
+		if fi, err := os.Stat(executor.SnapshotDir(wd)); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Errorf("snapshots dir: %v %v, want 0700", fi, err)
+		}
+		if !strings.Contains(out.String(), "plaintext") {
+			t.Errorf("the report does not warn that the file holds Secrets in plaintext:\n%s", out.String())
+		}
+	})
+
+	t.Run("etcd member, --out file", func(t *testing.T) {
+		var calls []string
+		dst := filepath.Join(t.TempDir(), "snap.db")
+		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), dst, newSavers(true, &calls, nil)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(calls) != 1 || calls[0] != "etcd "+dst {
+			t.Errorf("calls = %v, want one etcd save to %s", calls, dst)
+		}
+	})
+
+	t.Run("etcd failure keeps its sentinel", func(t *testing.T) {
+		var calls []string
+		err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "", newSavers(true, &calls, executor.ErrNoEtcdClient))
+		if !errors.Is(err, executor.ErrNoEtcdClient) || !strings.Contains(err.Error(), "start the server") {
+			t.Errorf("err = %v, want ErrNoEtcdClient with the remedy", err)
+		}
+	})
+
+	t.Run("kine posture", func(t *testing.T) {
+		var calls []string
+		if err := saveSnapshot(context.Background(), io.Discard, t.TempDir(), "/x/out.db", newSavers(false, &calls, nil)); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(calls) != 1 || calls[0] != "sqlite /x/out.db" {
+			t.Errorf("calls = %v, want one SQLite save", calls)
+		}
+	})
 }
