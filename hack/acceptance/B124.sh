@@ -26,6 +26,10 @@
 #         before the restart appears),
 #      e. `kubectl exec` into the re-attached pod runs a command and returns
 #         its output with exit 0;
+#      g. a BestEffort pod (no resources) in a namespace with no LimitRange
+#         execs `/bin/echo ok` with exit 0 both before the restart and after
+#         it (the `default` namespace's LimitRange makes every pod Burstable,
+#         so the legs above never exercise the BestEffort path);
 #   3. a second, two-container pod (containers a and b, one hello-http
 #      listener each) is re-attached by the same restart; killing container
 #      a's process restarts that one container in place: within 90 s the pod
@@ -43,6 +47,8 @@
 # io.k3sm.server when this Mac carries no agent daemon; K3SM_DAEMON_LABEL
 # overrides both.
 #
+# Needs K3SM_LAB=1; without it this gate FAILS (it never skips green).
+#
 # Requires: kubectl, curl, go (builds the fixture), codesign, netstat, pgrep,
 # ps, sudo.
 set -euo pipefail
@@ -59,6 +65,10 @@ finish() {
 	echo "=========== B124 GREEN ==========="
 }
 
+if [ "${K3SM_LAB:-}" != "1" ]; then
+	echo "B124 gate: NOT RUN. It needs K3SM_LAB=1 and an installed node at \$KUBECONFIG; this is a failure, not a skip." >&2
+	exit 1
+fi
 if [ -z "${KUBECONFIG:-}" ]; then
 	echo "KUBECONFIG must point at the RUNNING cluster this installed node belongs to (this gate boots nothing itself)" >&2
 	exit 1
@@ -87,6 +97,8 @@ RUN="$(date +%s)"
 POD="b124-web-$RUN"
 POD_U="b124-uninstall-$RUN"
 POD_2="b124-pair-$RUN"
+NS_BE="b124-be-$RUN"
+POD_BE="b124-besteffort-$RUN"
 ID_A="b124-paira-$RUN"
 ID_B="b124-pairb-$RUN"
 PORT=18441
@@ -97,6 +109,7 @@ cleanup() {
 	for p in "$POD" "$POD_U" "$POD_2"; do
 		kc delete pod "$p" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	done
+	kc delete namespace "$NS_BE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -195,6 +208,47 @@ pair_pod
 kc wait --for=condition=Ready "pod/$POD_2" -n "$NS" --timeout=120s >/dev/null 2>&1 || true
 UID_2="$(jp "$POD_2" '{.metadata.uid}')"
 
+# Leg 2g fixture: a namespace with NO LimitRange and a pod with NO resources,
+# so it is BestEffort (the default namespace's LimitRange would make it Burstable).
+kc create namespace "$NS_BE" >/dev/null 2>&1 || true
+kc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata: {name: $POD_BE, namespace: $NS_BE}
+spec:
+  nodeName: $NODE_NAME
+  nodeSelector: {kubernetes.io/os: darwin}
+  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
+  containers:
+  - name: c
+    image: native
+    command: ["/bin/sh", "-c", "exec sleep 3600"]
+EOF
+kc wait --for=condition=Ready "pod/$POD_BE" -n "$NS_BE" --timeout=120s >/dev/null 2>&1 || true
+LR_BE="$(kc get limitrange -n "$NS_BE" -o name 2>/dev/null || echo unknown)"
+QOS_BE="$(kc get pod "$POD_BE" -n "$NS_BE" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)"
+# be_exec - exec /bin/echo ok in the BestEffort pod, retrying while the node settles.
+be_exec() {
+	BE_RC=1; BE_OUT=""
+	for _ in $(seq 1 15); do
+		BE_RC=0
+		BE_OUT="$(kc exec "$POD_BE" -n "$NS_BE" -- /bin/echo ok 2>&1)" || BE_RC=$?
+		[ "$BE_RC" -eq 0 ] && [ "$BE_OUT" = ok ] && break
+		sleep 2
+	done
+}
+if [ -z "$LR_BE" ] && [ "$QOS_BE" = BestEffort ]; then
+	ladder ok "b124-2g0 $NS_BE has no LimitRange and $POD_BE is BestEffort"
+else
+	ladder no "b124-2g0 $NS_BE has no LimitRange and $POD_BE is BestEffort (limitrange='$LR_BE' qosClass='${QOS_BE:-?}')"
+fi
+be_exec
+if [ "$BE_RC" -eq 0 ] && [ "$BE_OUT" = ok ]; then
+	ladder ok "b124-2g1 kubectl exec into BestEffort $POD_BE before the restart prints ok, exit 0"
+else
+	ladder no "b124-2g1 kubectl exec into BestEffort $POD_BE before the restart prints ok, exit 0 (exit $BE_RC, output '$BE_OUT')"
+fi
+
 # 2. Restart the node daemon under the live pod.
 echo "==> sudo launchctl kickstart -k system/$LABEL (pod pgid ${PGID:-?}, restartCount $RC0, last tick $TICK0)"
 sudo launchctl kickstart -k "system/$LABEL"
@@ -249,6 +303,15 @@ if [ "$exec_rc" -eq 0 ] && [ "$exec_out" = "$EXEC_WANT" ]; then
 else
 	ladder no "b124-2e kubectl exec into the re-attached $POD returns its output, exit 0 (exit $exec_rc, output '$exec_out')"
 fi
+
+# g. The same BestEffort exec after the restart.
+be_exec
+if [ "$BE_RC" -eq 0 ] && [ "$BE_OUT" = ok ]; then
+	ladder ok "b124-2g  kubectl exec into BestEffort $POD_BE after the restart prints ok, exit 0"
+else
+	ladder no "b124-2g  kubectl exec into BestEffort $POD_BE after the restart prints ok, exit 0 (exit $BE_RC, output '$BE_OUT')"
+fi
+kc delete namespace "$NS_BE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
 # 3. Kill container a of the re-attached two-container pod: its restart policy
 #    (Always) restarts that one container in place; b keeps running.
