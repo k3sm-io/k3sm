@@ -712,8 +712,7 @@ func apiServerArgs(cfg Config) []string {
 	if authzMode == "" {
 		authzMode = DefaultAuthorizationMode
 	}
-	args := []string{
-		"--etcd-servers", "http://127.0.0.1:" + strconv.Itoa(cfg.KinePort),
+	args := append(apiServerDatastoreArgs(cfg),
 		"--service-cluster-ip-range", "10.43.0.0/16",
 		// Pin the NodePort range to the standard 30000-32767 (the kube-apiserver
 		// default). k3sm's userspace Service proxy binds *:NodePort directly and
@@ -783,7 +782,7 @@ func apiServerArgs(cfg Config) []string {
 		"--cert-dir", certDir(wd),
 		"--kubelet-preferred-address-types", "InternalIP",
 		"--allow-privileged",
-	}
+	)
 	// --client-ca-file is UNCONDITIONAL (never mesh-gated): the
 	// apiserver must trust the cluster client-CA so the per-component client certs
 	// (system:kube-scheduler / system:kube-controller-manager) AND joined workers'

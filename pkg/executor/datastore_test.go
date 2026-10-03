@@ -284,6 +284,17 @@ func TestLeaderElectHAvsSingleNode(t *testing.T) {
 		t.Errorf("HA KCM must carry --leader-elect=true, args=%v", controllerManagerArgs(ha))
 	}
 
+	// The etcd posture is HA in both roles: one active scheduler/KCM across servers.
+	for _, role := range []EtcdRole{EtcdInit, EtcdJoin} {
+		etcd := Config{WorkDir: "/wd", Etcd: &EtcdConfig{Role: role, Name: "n", PeerIP: "192.168.0.50"}}
+		if !etcd.leaderElect() {
+			t.Errorf("etcd posture (%v) leaderElect() must be true", role)
+		}
+		if !hasArg(schedulerArgs(etcd), "--leader-elect=true") || !hasArg(controllerManagerArgs(etcd), "--leader-elect=true") {
+			t.Errorf("etcd posture (%v) scheduler and KCM must carry --leader-elect=true", role)
+		}
+	}
+
 	// ServerJoin (HA intent) also turns it on.
 	if !(Config{ServerJoin: true, DatastoreEndpoint: "postgres://k3sm@db/k3sm"}).leaderElect() {
 		t.Error("ServerJoin HA leaderElect() must be true")

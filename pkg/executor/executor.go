@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -169,6 +170,11 @@ type Config struct {
 	// bootstrap (the identical-CA bundle, DESIGN §5c) is a separate path; this field
 	// drives only the guard + the leader-election posture.
 	ServerJoin bool
+	// Etcd, when non-nil, selects the embedded-etcd HA posture: this server runs one
+	// etcd member as a supervised child (instead of kine) and its apiserver talks to
+	// that local member over mutual TLS. Nil is the kine posture (single-node SQLite),
+	// which nothing about this field changes. See EtcdConfig.
+	Etcd *EtcdConfig
 	// PSAEnforceBaseline, when true, flips the cluster-wide Pod Security Admission
 	// default ENFORCE level from privileged to baseline in the provisioned
 	// PodSecurityConfiguration (see admissionConfigYAML — the SINGLE authority for
@@ -184,8 +190,8 @@ type Config struct {
 	// EncryptionConfiguration, passed as --encryption-provider-config so Secrets
 	// are encrypted at rest. The caller sets it only after EncryptionAtStart has
 	// accepted the credential pair under the work dir. It is a single-server
-	// option: Validate refuses it together with ServerJoin or a
-	// DatastoreEndpoint, because every server of an HA control plane would need
+	// option: Validate refuses it in every HA posture (Etcd, ServerJoin or a
+	// DatastoreEndpoint), because every server of an HA control plane would need
 	// the same key and nothing distributes one.
 	EncryptionProviderConfig string
 	// LeaderElect, when non-nil, forces the scheduler + controller-manager --leader-elect
@@ -223,6 +229,62 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// EtcdRole is how this server's etcd member enters the cluster on its first boot.
+type EtcdRole int
+
+const (
+	// EtcdInit forms a new single-member cluster (`k3sm server --cluster-init`).
+	EtcdInit EtcdRole = iota + 1
+	// EtcdJoin joins an existing cluster as a learner that is then promoted
+	// (`k3sm server --server-join`).
+	EtcdJoin
+)
+
+// String names the role for logs.
+func (r EtcdRole) String() string {
+	switch r {
+	case EtcdInit:
+		return "init"
+	case EtcdJoin:
+		return "join"
+	}
+	return "unknown"
+}
+
+// EtcdConfig configures the embedded-etcd HA posture (Config.Etcd).
+//
+// The role matters only on a member's FIRST boot: once <WorkDir>/etcd/member exists
+// the member restarts from its own data dir, both roles behave identically, and the
+// initial-cluster fields are ignored (a restart never re-adds or re-promotes).
+type EtcdConfig struct {
+	// Role is EtcdInit or EtcdJoin.
+	Role EtcdRole
+	// Name is the member name (the node name). It must be unique in the cluster.
+	Name string
+	// PeerIP is the address the member's peer listener binds and advertises: the
+	// node's LAN address (--node-ip). Peers reach each other directly on it under the
+	// etcd peer CA's mutual TLS; the wireguard mesh carries pod traffic only. It must
+	// be a parseable, non-loopback IP (Validate: ErrEtcdNeedsNodeIP).
+	PeerIP string
+	// PeerPort is the peer listener port. Defaults to DefaultEtcdPeerPort.
+	PeerPort int
+	// MetricsPort is the loopback-only plain-HTTP metrics listener. Defaults to
+	// DefaultEtcdMetricsPort.
+	MetricsPort int
+	// InitialCluster is the `name=https://ip:port,...` set a JOINING member starts
+	// with on its first boot, as the existing server's member route returned it
+	// (every current member plus this one). Unused for EtcdInit and on a restart.
+	InitialCluster string
+	// Reset starts the member with --force-new-cluster. Only ClusterReset sets it.
+	Reset bool
+	// Promote, for an EtcdJoin member's first boot, asks an existing server to
+	// promote this learner to a voting member (a learner cannot serve that RPC
+	// itself). It is called after the learner's etcd is spawned and its client port
+	// accepts, and retried every etcdPromoteInterval with no expiry until it returns
+	// nil: a failure is logged and is never a crash. Nil skips promotion.
+	Promote func(ctx context.Context) error
+}
+
 // Pinned defaults — the versions VALIDATED by the bring-up spike.
 const (
 	// DefaultKubeVersion is the kwok-ci/k8s darwin-arm64 control-plane release.
@@ -255,8 +317,15 @@ const (
 	DefaultEtcdVersion = "v3.6.15"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
-	// DefaultKinePort is the kine etcd-shim listen port.
+	// DefaultKinePort is the kine etcd-shim listen port. In the etcd posture the etcd
+	// member's loopback client listener reuses it (KinePort): kine and etcd never run
+	// in the same posture, and the port is already per-server and preflight-guarded.
 	DefaultKinePort = 2379
+	// DefaultEtcdPeerPort is the etcd member's peer listener port (upstream's).
+	DefaultEtcdPeerPort = 2380
+	// DefaultEtcdMetricsPort is the etcd member's loopback metrics listener port (the
+	// value k3s uses).
+	DefaultEtcdMetricsPort = 2381
 	// DefaultSchedulerPort is the kube-scheduler secure-serving port (the
 	// upstream default), bound on loopback only.
 	DefaultSchedulerPort = 10259
@@ -382,7 +451,50 @@ func (c Config) Validate() error {
 	if c.EncryptionProviderConfig != "" && c.isHA() {
 		return ErrEncryptionHA
 	}
+	if c.Etcd != nil {
+		if err := c.Etcd.validate(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ErrEtcdNeedsNodeIP is returned by Validate when the etcd posture has no usable peer
+// address: an empty, unparseable or loopback PeerIP. The member advertises that
+// address to every other member, so the single-node default 127.0.0.1 would make
+// each server dial itself.
+var ErrEtcdNeedsNodeIP = errors.New("executor: the etcd HA posture needs --node-ip set to this server's LAN address (empty, unparseable or loopback addresses cannot be an etcd peer address)")
+
+// ErrEtcdRole is returned by Validate for an EtcdConfig whose Role is neither EtcdInit
+// nor EtcdJoin, or that has no member name.
+var ErrEtcdRole = errors.New("executor: the etcd HA posture needs a role (init or join) and a member name")
+
+// validate checks the etcd posture's own fields.
+func (e *EtcdConfig) validate() error {
+	if (e.Role != EtcdInit && e.Role != EtcdJoin) || e.Name == "" {
+		return ErrEtcdRole
+	}
+	ip := net.ParseIP(e.PeerIP)
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+		return fmt.Errorf("%w: got %q", ErrEtcdNeedsNodeIP, e.PeerIP)
+	}
+	return nil
+}
+
+// EtcdDataDir is the etcd member's data directory, <workDir>/etcd (mode 0700). It
+// follows the work dir, so it moves with --data-volume.
+func EtcdDataDir(workDir string) string { return filepath.Join(workDir, "etcd") }
+
+// etcdMemberDir is <workDir>/etcd/member, which etcd creates on a member's first
+// start and which marks every later start as a restart.
+func etcdMemberDir(workDir string) string { return filepath.Join(EtcdDataDir(workDir), "member") }
+
+// EtcdMemberExists reports whether workDir holds an initialized etcd member
+// (<workDir>/etcd/member is a directory). It is the restart predicate: a member that
+// exists starts from its own data dir and is never re-added or re-promoted.
+func EtcdMemberExists(workDir string) bool {
+	fi, err := os.Stat(etcdMemberDir(workDir))
+	return err == nil && fi.IsDir()
 }
 
 // meshServingCert reports whether an explicit apiserver serving keypair was supplied
@@ -428,10 +540,10 @@ func (c Config) rootCAFile() string {
 	return certs.ClusterCACertPath(c.WorkDir)
 }
 
-// isHA reports whether this server runs the HA multi-writer posture: it has a shared
-// datastore endpoint, or it was told to join/form an HA control plane.
+// isHA reports whether this server runs an HA posture: an embedded etcd member, a
+// shared datastore endpoint, or it was told to join/form an HA control plane.
 func (c Config) isHA() bool {
-	return c.DatastoreEndpoint != "" || c.ServerJoin
+	return c.Etcd != nil || c.DatastoreEndpoint != "" || c.ServerJoin
 }
 
 // schedulerPort resolves the kube-scheduler secure-serving port: the configured
@@ -504,6 +616,17 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	if c.Etcd != nil {
+		// A copy, so filling the ports never writes through the caller's pointer.
+		e := *c.Etcd
+		if e.PeerPort == 0 {
+			e.PeerPort = DefaultEtcdPeerPort
+		}
+		if e.MetricsPort == 0 {
+			e.MetricsPort = DefaultEtcdMetricsPort
+		}
+		c.Etcd = &e
 	}
 	return c
 }

@@ -92,10 +92,10 @@ func EncryptionFingerprintPath(workDir string) string {
 var (
 	// ErrEncryptionAgent refuses the option on a worker install.
 	ErrEncryptionAgent = errors.New("secrets encryption is a control-plane option: a worker holds no datastore; install without --secrets-encryption")
-	// ErrEncryptionHA refuses the option alongside a server join or an external
-	// datastore. Every server of such a cluster would need the same key, and
-	// this release does not distribute one.
-	ErrEncryptionHA = errors.New("secrets encryption is not supported with a server join or an external datastore in this release: every server would need the same key, and k3sm does not distribute one; install without --secrets-encryption, or without the join/datastore endpoint")
+	// ErrEncryptionHA refuses the option on an HA control plane (an etcd member,
+	// a server join or an external datastore). Every server of such a cluster
+	// would need the same key, and this release does not distribute one.
+	ErrEncryptionHA = errors.New("secrets encryption is not supported on an HA control plane (--cluster-init, a server join or an external datastore) in this release: every server would need the same key, and k3sm does not distribute one; install without --secrets-encryption, or as a single server")
 	// ErrEncryptionExistingDatastore refuses enabling over a datastore that
 	// already exists. Its Secrets are stored unencrypted, and moving them under
 	// a key is a migration this release does not perform.
