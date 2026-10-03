@@ -220,8 +220,9 @@ func writeEtcdChild(t *testing.T, wd, script string) {
 	writeChild(t, wd, etcdComponent, "#!/bin/sh\n"+script)
 }
 
-// argvChild records its argv beside itself, then idles until signalled.
-const argvChild = `printf '%s\n' "$@" > "$0.argv"
+// argvChild records its argv beside itself, then idles until signalled. The record is
+// written to a temp name and renamed, so waitFile never reads a half-written argv.
+const argvChild = `printf '%s\n' "$@" > "$0.argv.tmp" && mv "$0.argv.tmp" "$0.argv"
 exec sleep 600
 `
 
