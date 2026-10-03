@@ -1163,7 +1163,7 @@ type Config struct {
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
 	// (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/
-	// kubectl + kine) staged by `k3sm payload <dir>`. Install copies it to
+	// kubectl + kine + etcd) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -2640,6 +2640,9 @@ func artifactManifest(cfg Config) []artifact {
 	// assertExists is false — an archive produced before markers existed still installs, and
 	// the seed falls back to rebuilding rather than trusting bytes nothing vouched for.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName), assertExists: false})
+	// The etcd version marker rides beside the etcd binary on exactly the kine marker's
+	// terms (the work-dir seed replaces a stale etcd only from a payload it vouches for).
+	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.EtcdMarkerName), assertExists: false})
 	// The control-plane version marker rides beside the four kube binaries on the same
 	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
 	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.
@@ -3200,6 +3203,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		cfg.stagedPayloadFile(executor.KineMarkerName))
+	//     The etcd version marker is staged the same way, for the same reasons.
+	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.EtcdMarkerName),
+		cfg.stagedPayloadFile(executor.EtcdMarkerName))
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only

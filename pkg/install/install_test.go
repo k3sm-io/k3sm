@@ -1777,12 +1777,15 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/etcd",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
+		// The etcd version marker, staged the same best-effort way.
+		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
@@ -1990,10 +1993,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +2 for the two version markers (kine, then the control-plane set), staged
-	// beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 2; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the two markers)", len(dsts), want)
+	// +3 for the three version markers (kine, etcd, then the control-plane set),
+	// staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 3; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the three markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {

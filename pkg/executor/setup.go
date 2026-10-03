@@ -718,19 +718,22 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // PayloadBinaries is the full control-plane payload set a packaged install must
 // stage beside the daemon (the boot path otherwise acquires them with gh/go —
 // dev-shell tools a launchd daemon does not have): the kwok-ci/k8s prebuilt
-// binaries plus kine, and the pinned helm the helm controller's Jobs run (see
+// binaries plus kine and etcd, and the pinned helm the helm controller's Jobs run (see
 // helm.go). The single source for `k3sm payload`, `k3sm install`, and
 // the boot-time seed, so the three can never disagree on the set.
 func PayloadBinaries() []string {
-	return append(append([]string{}, cpBinaries...), "kine", helmchart.HelmBinaryName)
+	return append(append([]string{}, cpBinaries...), kineBinaryName, etcdBinaryName, helmchart.HelmBinaryName)
 }
 
 // StagePayload acquires the full control-plane payload into destDir using the
 // executor's own pinned versions (DefaultKubeVersion via `gh release download`,
-// DefaultKineVersion via a CGO_ENABLED=0 `go install`). Each half drops its version
+// DefaultKineVersion via a CGO_ENABLED=0 `go install`, DefaultEtcdVersion via a
+// CGO_ENABLED=0 build of the embedded wrapper module). Each part drops its version
 // marker beside the binaries it describes — KubeMarkerName after the four
-// kwok-ci/k8s binaries are digest-verified and signed, KineMarkerName after kine is
-// built and signed — so a seeded workdir knows what it got. It is the packaging-side
+// kwok-ci/k8s binaries are digest-verified and signed, KineMarkerName after kine and
+// EtcdMarkerName after etcd are built and signed — so a seeded workdir knows what it
+// got. etcd ships in every payload whether or not the node runs it, as k3s ships it
+// in every binary: a packaged install has no Go toolchain to build it later. It is the packaging-side
 // producer: run it where the dev tools exist (a human shell, goreleaser), then hand
 // destDir to `k3sm install`, which stages it beside the daemon; the daemon boot seeds
 // its workdir from the staged copy and never needs gh/go (a launchd _k3sm daemon
@@ -752,6 +755,9 @@ func StagePayload(ctx context.Context, destDir string) error {
 	if err := ensureKineInto(ctx, destDir, DefaultKineVersion); err != nil {
 		return err
 	}
+	if err := ensureEtcdInto(ctx, destDir, DefaultEtcdVersion); err != nil {
+		return err
+	}
 	// helm is re-downloaded and re-verified even if present (force): these bytes
 	// are about to be published, and a copy already in the directory may have been
 	// signed, which rewrites it past any digest comparison.
@@ -769,7 +775,8 @@ func StagePayload(ctx context.Context, destDir string) error {
 // with no payload at all).
 //
 // The VERSIONED binaries are the exceptions to "never overwrite an existing workdir
-// binary": kine, and the control-plane set (kube-apiserver, kube-controller-manager,
+// binary": kine, etcd (at DefaultEtcdVersion, under kine's rule), and the
+// control-plane set (kube-apiserver, kube-controller-manager,
 // kube-scheduler, kubectl). Each carries a version marker, and presence alone cannot
 // tell this release's bytes from an earlier release's, so a binary-only upgrade that
 // moved a pin would otherwise keep running the old bytes forever — kine loudly (its
@@ -800,6 +807,8 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	// datastore engine while claiming the new one. An unmarked payload therefore falls
 	// through to ensureKineInto, which rebuilds or reports.
 	restageKine := !kineStaged(bd, kineVersion) && kineStaged(payloadDir, kineVersion)
+	// etcd follows kine's rule exactly, at the one version the wrapper pins.
+	restageEtcd := !etcdStaged(bd, DefaultEtcdVersion) && etcdStaged(payloadDir, DefaultEtcdVersion)
 	// The control-plane set follows the same rule, with one refusal kine does not need
 	// here (kine's own migration path owns its downgrade story): when the workdir's
 	// marker names a NEWER version than the payload vouches for, the re-seed would
@@ -827,7 +836,8 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	}
 	for _, name := range PayloadBinaries() {
 		dst := filepath.Join(bd, name)
-		versioned := (name == kineBinaryName && restageKine) || (restageKube && isCPBinary(name))
+		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
+			(restageKube && isCPBinary(name))
 		if _, err := os.Stat(dst); err == nil && !versioned {
 			continue // already present (a prior boot seeded/acquired it)
 		}
@@ -845,6 +855,11 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	}
 	if restageKine {
 		if err := writeKineMarker(bd, kineVersion); err != nil {
+			return err
+		}
+	}
+	if restageEtcd {
+		if err := etcdChild(DefaultEtcdVersion).writeMarker(bd); err != nil {
 			return err
 		}
 	}

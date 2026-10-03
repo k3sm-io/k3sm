@@ -29,6 +29,7 @@ import (
 func stagedChildDeclarations() map[string]stagedChild {
 	return map[string]stagedChild{
 		"kine": kineChild(DefaultKineVersion),
+		"etcd": etcdChild(DefaultEtcdVersion),
 	}
 }
 

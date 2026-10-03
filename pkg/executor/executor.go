@@ -247,6 +247,12 @@ const (
 	// migration; snapshotBeforeKineUpgrade takes the verified pre-migration backup
 	// (and preserves the old kine binary) before the new pin ever opens the db.
 	DefaultKineVersion = "v0.17.1"
+	// DefaultEtcdVersion is the etcd server module version (go.etcd.io/etcd/server/v3)
+	// the executor builds CGO_ENABLED=0 from the embedded wrapper module
+	// (pkg/executor/etcdchild). It must equal the wrapper's go.mod.txt require; a bump
+	// is `hack/etcd-wrapper.sh regen <version>` plus this line, in one commit. 3.6 is
+	// the line the pinned kube-apiserver and k3sm's own etcd client are on.
+	DefaultEtcdVersion = "v3.6.15"
 	// DefaultAPIServerPort avoids Docker Desktop's :6443.
 	DefaultAPIServerPort = 6444
 	// DefaultKinePort is the kine etcd-shim listen port.

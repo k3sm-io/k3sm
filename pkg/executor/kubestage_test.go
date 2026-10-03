@@ -23,7 +23,9 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -391,6 +393,11 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 		}
 		return nil, os.WriteFile(filepath.Join(gopath, "bin", "kine"), []byte("pretend-kine"), 0o755)
 	}
+	origEtcdBuild := runEtcdBuild
+	t.Cleanup(func() { runEtcdBuild = origEtcdBuild })
+	runEtcdBuild = func(cmd *exec.Cmd) ([]byte, error) {
+		return nil, os.WriteFile(cmd.Args[slices.Index(cmd.Args, "-o")+1], []byte("pretend-etcd"), 0o755)
+	}
 
 	fakeHelmRelease(t, helmTarball(t, map[string]string{helmchart.HelmTarballMember: "pretend-helm"}), "")
 
@@ -403,6 +410,9 @@ func TestStagePayloadWritesKubeMarker(t *testing.T) {
 	}
 	if !kineStaged(dest, DefaultKineVersion) {
 		t.Error("payload kine marker missing")
+	}
+	if !etcdStaged(dest, DefaultEtcdVersion) {
+		t.Error("payload etcd marker missing")
 	}
 	if err := VerifyPayloadSet(dest); err != nil {
 		t.Errorf("VerifyPayloadSet(staged payload) = %v", err)
