@@ -1042,6 +1042,11 @@ type System interface {
 	// false when no such member exists: the group is empty, or only a
 	// grandchild of the leader keeps it alive.
 	ProcessGroupLeaderStart(pgid int) (startUnixNano int64, alive bool)
+	// ProcessGroupMemberStart reports the kernel start time (unix nanoseconds)
+	// of process pid, read as a member of process group pgid. alive is false
+	// when pid is not a live member of that group: it exited, or it now
+	// belongs to another group.
+	ProcessGroupMemberStart(pgid, pid int) (startUnixNano int64, alive bool)
 	// SignalProcessGroup sends sig to every member of process group pgid. A
 	// group that no longer exists is a no-op success.
 	SignalProcessGroup(pgid int, sig syscall.Signal) error

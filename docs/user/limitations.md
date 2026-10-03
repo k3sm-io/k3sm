@@ -503,23 +503,18 @@ A native Pod's processes outlive the node daemon. When the daemon restarts (`sud
 -k system/io.k3sm.server`, or `io.k3sm.agent` on a worker, a crash, an upgrade), the new daemon reads
 the Pods bound to its node from the API server and re-attaches to every running Pod whose processes
 are still alive, instead of killing them and creating the Pod again. A re-attached Pod keeps its Pod
-IP, its listeners and its `restartCount`, and records one `PodReattached` Warning Event.
+IP, its listeners and its `restartCount`, and records one `PodReattached` Warning Event. Each
+container runs under its own resident shim, which holds the container's output and exit status
+across the restart: the container log continues with no gap, exit codes stay real, and
+`kubectl exec` works on a re-attached Pod.
 
 What a re-attached Pod does not get back:
 
-- **Log timestamps during the gap.** Output the containers write while no daemon is running is kept
-  in a capture file and appended to the container log when the new daemon reads it, so nothing is
-  lost, but those lines carry the time they were read, not the time they were written. One line in
-  the log marks where the gap was. A Pod started before this capture existed (by an older k3sm) did
-  lose its output; it carries the `k3sm.io/log-stream-lost` condition with reason `RuntimeRestarted`.
-- **Exit status.** A re-attached container is no longer the daemon's child, so when it exits the
-  daemon sees the exit but not the status. The container reports terminated with reason
-  `ExitStatusUnknown` and exit code `-1`, never `0`. A container that exited while the daemon was down
-  reports the same.
-- **`kubectl exec`.** It needs a resident shim that holds the container's launch environment, and
-  k3sm runs none, so the new daemon cannot enter a running container and exec is refused on a
-  re-attached Pod. Delete the Pod (or let its controller replace it) to get it back.
-- **CPU accounting.** CPU usage restarts from zero at the re-attachment.
+- CPU usage restarts from zero at the re-attachment.
+- A container whose shim died reports terminated with reason `ExitStatusUnknown` and exit code `-1`
+  when it exits, never `0`. Its later output is not logged, `kubectl exec` into it is refused, and
+  the Pod carries the `k3sm.io/log-stream-lost` condition with reason `ShimCrashed`. Delete the Pod
+  (or let its controller replace it) to get it back.
 
 Some Pods are created again rather than re-attached: `vm` Pods (a guest never outlives its helper),
 Pods that were still running an init container, Pods whose processes all exited, and every Pod after

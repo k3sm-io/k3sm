@@ -18,6 +18,7 @@ package install
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -87,4 +88,87 @@ func TestUninstallTearsDownRecordedPodGroups(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestTeardownPodGroupsUsesTheChildIdentity pins the uninstall teardown of a
+// pod group whose resident shim died. Under the shim the group's leader (pid ==
+// pgid) is the shim and the container is its child in the same group; the
+// record carries both identities. When the leader is gone, the child alive in
+// that group with exactly its recorded start time still proves the group is
+// the pod's, so it is stopped (SIGTERM, grace, SIGKILL to a survivor). A child
+// whose start differs, a child no longer in that group, and a record with no
+// child identity are never signalled: nothing proves those groups ours.
+func TestTeardownPodGroupsUsesTheChildIdentity(t *testing.T) {
+	const pgid, child = 601, 602
+	tests := []struct {
+		name      string
+		rec       runtimed.PodReapRecord
+		leaders   map[int]int64
+		members   map[int]map[int]int64
+		lingering bool
+		want      []string
+	}{
+		{
+			name:    "leader alive: signalled by the leader identity, as before",
+			rec:     runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a", ChildPid: child, ChildStartUnixNano: 222},
+			leaders: map[int]int64{pgid: 111},
+			want:    []string{"Signal:601:TERM", "WaitGone:601:10s"},
+		},
+		{
+			name:    "leader gone, child alive with its recorded start: signalled",
+			rec:     runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a", ChildPid: child, ChildStartUnixNano: 222},
+			members: map[int]map[int]int64{pgid: {child: 222}},
+			want:    []string{"Signal:601:TERM", "WaitGone:601:10s"},
+		},
+		{
+			name:      "leader gone, child alive and outlives the grace: killed",
+			rec:       runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a", ChildPid: child, ChildStartUnixNano: 222},
+			members:   map[int]map[int]int64{pgid: {child: 222}},
+			lingering: true,
+			want:      []string{"Signal:601:TERM", "WaitGone:601:10s", "Signal:601:KILL"},
+		},
+		{
+			name:    "leader gone, child start mismatch: not signalled",
+			rec:     runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a", ChildPid: child, ChildStartUnixNano: 222},
+			members: map[int]map[int]int64{pgid: {child: 999}},
+		},
+		{
+			name:    "leader gone, child no longer in the group: not signalled",
+			rec:     runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a", ChildPid: child, ChildStartUnixNano: 222},
+			members: map[int]map[int]int64{700: {child: 222}},
+		},
+		{
+			name:    "leader gone, no child identity recorded: not signalled, as before",
+			rec:     runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a"},
+			members: map[int]map[int]int64{pgid: {child: 222}},
+		},
+		{
+			name:    "leader recycled to another process: not signalled, as before",
+			rec:     runtimed.PodReapRecord{PodID: "uid-a", Container: "c0", Pgid: pgid, StartUnixNano: 111, ShimDir: "/x/run/shim/0a", ChildPid: child, ChildStartUnixNano: 222},
+			leaders: map[int]int64{pgid: 333},
+			members: map[int]map[int]int64{pgid: {child: 222}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &fakeSystem{
+				podReap:      []runtimed.PodReapRecord{tt.rec},
+				podLeaders:   tt.leaders,
+				podMembers:   tt.members,
+				podLingering: map[int]bool{pgid: tt.lingering},
+			}
+			if err := teardownPodGroups(context.Background(), f, Config{Logger: slog.New(slog.DiscardHandler)}); err != nil {
+				t.Fatalf("teardownPodGroups: %v", err)
+			}
+			var got []string
+			for _, c := range f.calls {
+				if strings.HasPrefix(c, "Signal:") || strings.HasPrefix(c, "WaitGone:") {
+					got = append(got, c)
+				}
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("pod teardown = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
