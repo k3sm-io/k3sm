@@ -86,8 +86,10 @@ type fakePurge struct {
 	// directory the fake knows is empty, which only matters once its marker
 	// is gone (a marked tree is walked, never asked).
 	nonEmpty map[string]bool
-	// kubeErr is what RemoveAdminKubeconfigContext returns.
-	kubeErr error
+	// kubeErr is what RemoveAdminKubeconfigContext returns; kubeAbsent makes
+	// it report that the kubeconfig carried no k3sm context.
+	kubeErr    error
+	kubeAbsent bool
 	// ino numbers the directories seedPurgeable creates.
 	ino uint64
 }
@@ -132,6 +134,9 @@ func (f *fakeSystem) StatNoFollow(path string) (PathStat, error) {
 	f.calls = append(f.calls, "StatNoFollow:"+path)
 	if st, ok := f.purge.stats[path]; ok {
 		return st, nil
+	}
+	if _, ok := f.files[path]; ok {
+		return PathStat{Kind: EntryRegular, Dev: 1}, nil
 	}
 	return PathStat{}, fmt.Errorf("lstat %s: %w", path, fs.ErrNotExist)
 }
@@ -250,7 +255,7 @@ func (f *fakeSystem) ServiceUser(_ context.Context, name string) (ServiceUserRec
 	case f.purge.user != nil:
 		return *f.purge.user, nil
 	}
-	return ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: DefaultDataRoot}, nil
+	return ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: DefaultDataRoot, Hidden: true}, nil
 }
 
 func (f *fakeSystem) DeleteServiceUser(ctx context.Context, name string) error {
@@ -279,14 +284,17 @@ func (f *fakeSystem) DisableServiceUser(_ context.Context, name string) error {
 		u := ServiceUserRecord{Exists: true, UID: 271, Home: DefaultDataRoot}
 		f.purge.user = &u
 	}
-	f.purge.user.RealName, f.purge.user.Shell = serviceUserDisabledRealName, serviceUserShell
+	f.purge.user.RealName, f.purge.user.Shell, f.purge.user.Hidden = serviceUserDisabledRealName, serviceUserShell, true
 	f.purge.disabled = true
 	return nil
 }
 
-func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser string) error {
+func (f *fakeSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error) {
 	f.calls = append(f.calls, "RemoveAdminKubeconfigContext:"+targetUser)
-	return f.purge.kubeErr
+	if f.purge.kubeErr != nil {
+		return false, f.purge.kubeErr
+	}
+	return !f.purge.kubeAbsent, nil
 }
 
 // shrinkPurgeBudgets makes every purge wait end at its first re-check.

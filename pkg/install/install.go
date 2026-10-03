@@ -1112,8 +1112,8 @@ type System interface {
 	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping
 	// every other entry, the file's owner and its mode. An absent file or
-	// context is a no-op success.
-	RemoveAdminKubeconfigContext(targetUser string) error
+	// context is a no-op success, reported as removed=false.
+	RemoveAdminKubeconfigContext(targetUser string) (removed bool, err error)
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1344,6 +1344,10 @@ type Config struct {
 	// against a mount posture no unprivileged process could create.
 	DataRootFS dataroot.FS
 	Logger     *slog.Logger
+	// Out receives a command's result lines: what a purge removed, and what it
+	// could not and how to finish by hand. The CLI hands it stdout; Logger
+	// (stderr) carries the progress and diagnostics. Nil discards.
+	Out io.Writer
 	// dataVolumeDeclared reports that this Mac has a data volume to manage --
 	// either a record already declares one, or --data-volume asked for one. It
 	// is what puts the io.k3sm.datavol daemon and the record into the artifact
@@ -1379,6 +1383,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	if c.Out == nil {
+		c.Out = io.Discard
 	}
 	if c.DataRootFS == nil {
 		c.DataRootFS = dataroot.OSFS{}

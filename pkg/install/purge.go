@@ -56,10 +56,15 @@ import (
 //     whether or not the manifest names them.
 //  8. the k3sm context in the human's kubeconfig, and nothing else in it.
 //  9. the service user record, last, and only if every step above succeeded,
-//     under its own bound (purgeUserDeleteTimeout). macOS gates deleting a
-//     user record behind a privacy approval a person gives at the screen, so
-//     this step can fail where nothing else did. Its failure is not a purge
-//     refusal: the account is left disabled and the purge says how to finish.
+//     under its own bound (purgeUserDeleteTimeout, or purgeUserRetryTimeout
+//     for an account an earlier purge already left disabled). macOS gates
+//     deleting a user record behind a privacy approval a person gives at the
+//     screen, so this step can fail where nothing else did. Its failure is not
+//     a purge refusal: the account is left disabled and the purge says how to
+//     finish.
+//
+// The result (what this run removed, and an account it could not) is written
+// to Config.Out, the command's stdout; the progress goes to Config.Logger.
 
 // ErrPurgeNotConfirmed is returned by a purge that was not confirmed with
 // --yes. It is returned before any system call.
@@ -87,6 +92,12 @@ const purgeCommandTimeout = 30 * time.Second
 // a person at the screen to click Allow and short enough that an unattended
 // purge does not hang on a prompt nobody will answer.
 const purgeUserDeleteTimeout = 90 * time.Second
+
+// purgeUserRetryTimeout bounds the deletion of an account an earlier purge
+// already left disabled. That purge printed how to delete it by hand; a re-run
+// tries once more, briefly, and repeats the instruction rather than waiting
+// out the full bound for a prompt the operator has already been told about.
+const purgeUserRetryTimeout = 10 * time.Second
 
 // errServiceUserDeleteDenied is what DeleteServiceUser wraps when macOS
 // refused the deletion outright (eDSPermissionError, -14120): no approval
@@ -136,6 +147,8 @@ type ServiceUserRecord struct {
 	RealName string
 	Shell    string
 	Home     string
+	// Hidden reports IsHidden set as install sets it.
+	Hidden bool
 }
 
 // purgeGuardFS is the read-only seam purgeGuard judges a tree through. It is
@@ -555,18 +568,27 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 	for _, f := range plan.files {
+		// The summary names only what this run removed: the arguments records
+		// are on the list whether or not they exist, and a re-run finds them
+		// gone. The removal still runs, since an absent entry is its success.
+		_, statErr := sys.StatNoFollow(f)
 		if err := sys.RemoveEntry(filepath.Dir(f), filepath.Base(f)); err != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", f, err))
 			continue
 		}
-		removed = append(removed, f)
+		if statErr == nil {
+			removed = append(removed, f)
+		}
 	}
 	for _, u := range plan.kubeUsers {
-		if err := sys.RemoveAdminKubeconfigContext(u); err != nil {
+		had, err := sys.RemoveAdminKubeconfigContext(u)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("remove the %s context from %s's kubeconfig: %w (remedy: kubectl config delete-context %s)", adminContextName, u, err, adminContextName))
 			continue
 		}
-		removed = append(removed, "the "+adminContextName+" context in "+u+"'s kubeconfig")
+		if had {
+			removed = append(removed, "the "+adminContextName+" context in "+u+"'s kubeconfig")
+		}
 	}
 	if len(errs) > 0 {
 		// The service user is the data root's owner of record; keeping it
@@ -575,24 +597,26 @@ func purge(ctx context.Context, sys System, cfg Config) error {
 	}
 	var remains []string
 	for _, name := range plan.serviceUsers {
-		outcome, err := deleteServiceUser(ctx, sys, name, cfg.DataRoot)
+		d, err := deleteServiceUser(ctx, sys, name, cfg.DataRoot)
 		if err != nil {
 			return fmt.Errorf("uninstall --purge: %w (everything else was removed)", err)
 		}
-		switch outcome {
+		switch d.outcome {
 		case userDeleted:
 			removed = append(removed, "the "+name+" service user")
 		case userDenied, userTimedOut:
-			remains = append(remains, serviceUserLeftMessage(ctx, sys, name, outcome))
+			remains = append(remains, serviceUserLeftMessage(ctx, sys, name, d))
 		}
 	}
+	// Result lines, on the command's stdout. Write errors are not checked: the
+	// purge is done, and a closed stdout cannot undo it.
 	if len(removed) == 0 {
-		cfg.Logger.Info("k3sm purged; nothing else was left to remove")
+		_, _ = fmt.Fprintln(cfg.Out, "k3sm purged; nothing else was left to remove")
 	} else {
-		cfg.Logger.Info("k3sm purged; removed: " + strings.Join(removed, ", "))
+		_, _ = fmt.Fprintln(cfg.Out, "k3sm purged; removed: "+strings.Join(removed, ", "))
 	}
 	for _, msg := range remains {
-		cfg.Logger.Warn(msg)
+		_, _ = fmt.Fprintln(cfg.Out, msg)
 	}
 	return nil
 }
@@ -608,24 +632,42 @@ const (
 	// userDenied: macOS refused the deletion outright; no approval could be
 	// asked for.
 	userDenied
-	// userTimedOut: the deletion was still waiting at purgeUserDeleteTimeout,
-	// which is what an approval prompt nobody answered looks like.
+	// userTimedOut: the deletion was still waiting at its bound, which is
+	// what an approval prompt nobody answered looks like.
 	userTimedOut
 )
 
-// serviceUserLeftMessage disables the account the purge could not delete and
-// returns the final line that says so: which account remains, why, and the
-// command that finishes the job.
-func serviceUserLeftMessage(ctx context.Context, sys System, name string, outcome serviceUserOutcome) string {
+// userDeletion is what deleteServiceUser reports: the outcome, the bound the
+// deletion ran under, and whether the account was already in the disabled
+// shape an earlier purge leaves.
+type userDeletion struct {
+	outcome serviceUserOutcome
+	bound   time.Duration
+	// wasDisabled: the record already carried serviceUserDisabledRealName, the
+	// no-login shell and IsHidden, so there is nothing to disable again.
+	wasDisabled bool
+}
+
+// disabledShape reports whether rec is the account DisableServiceUser leaves.
+func disabledShape(rec ServiceUserRecord) bool {
+	return rec.RealName == serviceUserDisabledRealName && rec.Shell == serviceUserShell && rec.Hidden
+}
+
+// serviceUserLeftMessage disables the account the purge could not delete,
+// unless an earlier purge already did, and returns the final line that says
+// so: which account remains, why, and the command that finishes the job.
+func serviceUserLeftMessage(ctx context.Context, sys System, name string, d userDeletion) string {
 	state := "disabled: no login shell, hidden, no home directory"
-	if err := sys.DisableServiceUser(ctx, name); err != nil {
-		// The account was created hidden with no login shell, so it is
-		// harmless either way; only the relabel did not happen.
-		state = "hidden, with no login shell or home directory; relabelling it failed: " + err.Error()
+	if !d.wasDisabled {
+		if err := sys.DisableServiceUser(ctx, name); err != nil {
+			// The account was created hidden with no login shell, so it is
+			// harmless either way; only the relabel did not happen.
+			state = "hidden, with no login shell or home directory; relabelling it failed: " + err.Error()
+		}
 	}
 	why := "macOS would not let an unattended process delete it"
-	if outcome == userTimedOut {
-		why = fmt.Sprintf("macOS did not allow the deletion within %s, and an approval prompt may still be waiting on the screen", purgeUserDeleteTimeout)
+	if d.outcome == userTimedOut {
+		why = fmt.Sprintf("macOS did not allow the deletion within %s, and an approval prompt may still be waiting on the screen", d.bound)
 	}
 	return fmt.Sprintf("the %s account remains (%s): %s. Deleting a user account needs a person at the screen to approve it. "+
 		"To delete it by hand, run `sudo dscl . -delete /Users/%s` in Terminal and click Allow when macOS asks to administer your computer. "+
@@ -804,34 +846,46 @@ func (l loadedJobs) Loaded(label string) bool { return l(label) }
 // (userTimedOut) is an outcome, not an error: everything else the purge owns
 // is already gone, and the caller leaves the account disabled. A deletion that
 // reports success is believed only once the record no longer reads back.
-func deleteServiceUser(ctx context.Context, sys System, name, dataRoot string) (serviceUserOutcome, error) {
+//
+// The bound is purgeUserDeleteTimeout, or purgeUserRetryTimeout for an account
+// already in the disabled shape: a re-run after a purge that could not delete
+// it, whose operator was already told how to finish by hand.
+func deleteServiceUser(ctx context.Context, sys System, name, dataRoot string) (userDeletion, error) {
 	rec, err := sys.ServiceUser(ctx, name)
 	if err != nil {
-		return userAbsent, fmt.Errorf("read the %s user record: %w", name, err)
+		return userDeletion{}, fmt.Errorf("read the %s user record: %w", name, err)
 	}
 	if !rec.Exists {
-		return userAbsent, nil
+		return userDeletion{outcome: userAbsent}, nil
 	}
 	if err := checkServiceUser(name, rec, dataRoot); err != nil {
-		return userAbsent, err
+		return userDeletion{}, err
 	}
-	dctx, cancel := context.WithTimeout(ctx, purgeUserDeleteTimeout)
+	d := userDeletion{bound: purgeUserDeleteTimeout, wasDisabled: disabledShape(rec)}
+	if d.wasDisabled {
+		d.bound = purgeUserRetryTimeout
+	}
+	dctx, cancel := context.WithTimeout(ctx, d.bound)
 	defer cancel()
 	err = sys.DeleteServiceUser(dctx, name)
 	switch {
 	case errors.Is(err, errServiceUserDeleteDenied):
-		return userDenied, nil
+		d.outcome = userDenied
+		return d, nil
 	case errors.Is(err, context.DeadlineExceeded):
-		return userTimedOut, nil
+		d.outcome = userTimedOut
+		return d, nil
 	case err != nil:
-		return userAbsent, fmt.Errorf("delete the %s user: %w", name, err)
+		return userDeletion{}, fmt.Errorf("delete the %s user: %w", name, err)
 	}
 	after, err := sys.ServiceUser(ctx, name)
 	if err != nil {
-		return userAbsent, fmt.Errorf("read the %s user record after deleting it: %w", name, err)
+		return userDeletion{}, fmt.Errorf("read the %s user record after deleting it: %w", name, err)
 	}
 	if after.Exists {
-		return userDenied, nil
+		d.outcome = userDenied
+		return d, nil
 	}
-	return userDeleted, nil
+	d.outcome = userDeleted
+	return d, nil
 }

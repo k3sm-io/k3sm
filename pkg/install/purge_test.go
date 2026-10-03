@@ -33,11 +33,13 @@ import (
 )
 
 // purgeRig is one purge test's world: the fake System, the Config the CLI
-// would hand Uninstall for `sudo k3sm uninstall --purge --yes`, and the log.
+// would hand Uninstall for `sudo k3sm uninstall --purge --yes`, the log (the
+// command's stderr) and the result lines (its stdout).
 type purgeRig struct {
 	f    *fakeSystem
 	cfg  Config
 	logs *bytes.Buffer
+	out  *bytes.Buffer
 	// disk is the fake diskutil when the rig carries a data volume.
 	disk *datavoltest.Fake
 	// leftBehind is what deleting the data volume leaves at the data root,
@@ -68,7 +70,7 @@ const purgeVolumeUUID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
 func newPurgeRig(t *testing.T, role Role, withVolume bool) *purgeRig {
 	t.Helper()
 	shrinkPurgeBudgets(t)
-	r := &purgeRig{logs: &bytes.Buffer{}}
+	r := &purgeRig{logs: &bytes.Buffer{}, out: &bytes.Buffer{}}
 	if withVolume {
 		dv := newDatavolRig(t)
 		dv.seedRecord(t, purgeVolumeUUID)
@@ -104,8 +106,9 @@ func newPurgeRig(t *testing.T, role Role, withVolume bool) *purgeRig {
 	r.cfg.Purge, r.cfg.PurgeConfirmed = true, true
 	r.cfg.TargetUser, r.cfg.TargetHome = "alice", "/Users/alice"
 	r.cfg.Logger = slog.New(slog.NewTextHandler(r.logs, nil))
+	r.cfg.Out = r.out
 	d := r.cfg.withDefaults()
-	r.f.purge.user = &ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: d.DataRoot}
+	r.f.purge.user = &ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: d.DataRoot, Hidden: true}
 	for _, a := range r.manifest() {
 		if a.disp == dispPreserve && a.kind == kindDir {
 			r.f.seedPurgeable(a.path)
@@ -204,9 +207,12 @@ func TestPurgeRemovesEveryPreservedArtifact(t *testing.T) {
 					t.Errorf("the data-volume config did not declare the record; the case is vacuous")
 				}
 			}
-			out := r.logs.String()
-			if strings.Contains(out, "kept, so a reinstall") || !strings.Contains(out, "k3sm purged") {
+			out := r.out.String()
+			if strings.Contains(out+r.logs.String(), "kept, so a reinstall") || !strings.Contains(out, "k3sm purged") {
 				t.Errorf("purge output must say what it removed and not claim anything was kept:\n%s", out)
+			}
+			if strings.Contains(r.logs.String(), "k3sm purged") {
+				t.Errorf("the result line went to the log (stderr), not stdout:\n%s", r.logs.String())
 			}
 		})
 	}
@@ -642,6 +648,11 @@ func TestPurgeServiceUserDeletionBound(t *testing.T) {
 	if purgeUserDeleteTimeout < 60*time.Second || purgeUserDeleteTimeout > 120*time.Second {
 		t.Fatalf("purgeUserDeleteTimeout is %s, want between 1m and 2m", purgeUserDeleteTimeout)
 	}
+	// The re-run over an account a purge already left disabled tries briefly:
+	// its operator has already been told how to delete it by hand.
+	if purgeUserRetryTimeout < 5*time.Second || purgeUserRetryTimeout > 30*time.Second {
+		t.Fatalf("purgeUserRetryTimeout is %s, want between 5s and 30s", purgeUserRetryTimeout)
+	}
 	r := newPurgeRig(t, RoleServer, false)
 	if err := r.run(); err != nil {
 		t.Fatalf("purge: %v", err)
@@ -697,7 +708,11 @@ func TestPurgeServiceUserOutcomes(t *testing.T) {
 			}
 			// Every other removal happened, and before the deletion.
 			assertOrder(t, r.f.calls, "PurgeTree:"+DefaultDataRoot, "PurgeTree:"+LogDir, "RemoveAdminKubeconfigContext:alice", "DeleteServiceUser:_k3sm")
-			out := r.logs.String()
+			out := r.out.String()
+			// The result and the instruction are stdout; neither is logged.
+			if logs := r.logs.String(); strings.Contains(logs, "k3sm purged") || strings.Contains(logs, "account remains") || strings.Contains(logs, "delete it by hand") {
+				t.Fatalf("a result line went to the log (stderr):\n%s", logs)
+			}
 			if tc.deleted {
 				if !strings.Contains(out, "the _k3sm service user") || strings.Contains(out, "account remains") || r.anyCall("DisableServiceUser:") {
 					t.Fatalf("a deleted account must be reported removed, and nothing disabled:\n%s", out)
@@ -724,48 +739,87 @@ func TestPurgeServiceUserOutcomes(t *testing.T) {
 
 // TestPurgeRerunWithOnlyTheAccountLeft pins the re-run over a Mac where a
 // purge removed everything but the account it could not delete: no data root,
-// no logs, no records, no jobs. It is clean, it tries the deletion again, and
-// it reports the same way, or the normal line once the deletion is allowed.
+// no logs, no records, no jobs, no k3sm context. It is clean, it tries the
+// deletion again under the short retry bound without disabling the account a
+// second time, names nothing as removed that the first run already removed,
+// and reports the same way, or the normal line once the deletion is allowed.
 func TestPurgeRerunWithOnlyTheAccountLeft(t *testing.T) {
-	r := newPurgeRig(t, RoleServer, false)
-	r.f.purge.deleteErr = fmt.Errorf("DS Error: -14120 (eDSPermissionError): %w", errServiceUserDeleteDenied)
-	if err := r.run(); err != nil {
-		t.Fatalf("first purge: %v", err)
-	}
-	if !r.f.purge.disabled || r.f.purge.user.RealName != serviceUserDisabledRealName {
-		t.Fatal("the first purge did not leave the account disabled; the case is vacuous")
-	}
-	for _, p := range []string{DefaultDataRoot, LogDir} {
-		if _, ok := r.f.purge.stats[p]; ok {
-			t.Fatalf("the first purge left %s behind; the case is vacuous", p)
-		}
-	}
-	if len(r.f.purge.markers) != 0 {
-		t.Fatalf("the first purge left markers behind (%v); the case is vacuous", r.f.purge.markers)
-	}
-
-	for _, allowed := range []bool{false, true} {
-		r.f.calls = nil
-		r.logs.Reset()
-		if allowed {
-			r.f.purge.deleteErr = nil
-		}
-		if err := r.run(); err != nil {
-			t.Fatalf("re-run (allowed=%v) = %v, want success\ncalls:\n%s", allowed, err, strings.Join(r.f.calls, "\n"))
-		}
-		if !r.called("DeleteServiceUser:_k3sm") {
-			t.Fatalf("re-run (allowed=%v) did not try the deletion again:\n%s", allowed, strings.Join(r.f.calls, "\n"))
-		}
-		out := r.logs.String()
-		if allowed {
-			if !r.f.purge.userDeleted || !strings.Contains(out, "the _k3sm service user") || strings.Contains(out, "account remains") {
-				t.Fatalf("an allowed re-run must delete and report the account:\n%s", out)
+	denied := fmt.Errorf("DS Error: -14120 (eDSPermissionError): %w", errServiceUserDeleteDenied)
+	timedOut := fmt.Errorf("signal: killed: %w", context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name string
+		// rerunErr is what the re-run's deletion returns; nil deletes.
+		rerunErr error
+		want     []string
+	}{
+		{name: "refused again", rerunErr: denied, want: []string{"would not let an unattended process delete it"}},
+		{name: "timed out again", rerunErr: timedOut, want: []string{fmt.Sprintf("did not allow the deletion within %s", purgeUserRetryTimeout)}},
+		{name: "allowed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPurgeRig(t, RoleServer, false)
+			d := r.cfg.withDefaults()
+			r.f.files = map[string][]byte{d.ServerArgsRecord: []byte("{}")}
+			r.f.purge.deleteErr = denied
+			if err := r.run(); err != nil {
+				t.Fatalf("first purge: %v", err)
 			}
-			continue
-		}
-		if !strings.Contains(out, "the _k3sm account remains (disabled") || !strings.Contains(out, "sudo dscl . -delete /Users/_k3sm") {
-			t.Fatalf("a refused re-run must report the account the same way:\n%s", out)
-		}
+			if !r.f.purge.disabled || r.f.purge.user.RealName != serviceUserDisabledRealName || !r.f.purge.user.Hidden {
+				t.Fatal("the first purge did not leave the account disabled; the case is vacuous")
+			}
+			if b := r.f.purge.deleteBound; b <= purgeUserRetryTimeout {
+				t.Fatalf("the first purge's deletion ran under %s, want purgeUserDeleteTimeout", b)
+			}
+			if !strings.Contains(r.out.String(), d.ServerArgsRecord) || !strings.Contains(r.out.String(), "context in alice's kubeconfig") {
+				t.Fatalf("the first purge did not report the record and the context removed; the case is vacuous:\n%s", r.out.String())
+			}
+			for _, p := range []string{DefaultDataRoot, LogDir} {
+				if _, ok := r.f.purge.stats[p]; ok {
+					t.Fatalf("the first purge left %s behind; the case is vacuous", p)
+				}
+			}
+			if len(r.f.purge.markers) != 0 {
+				t.Fatalf("the first purge left markers behind (%v); the case is vacuous", r.f.purge.markers)
+			}
+
+			r.f.calls, r.f.purge.disabled, r.f.purge.deleteBound = nil, false, 0
+			r.f.purge.kubeAbsent = true // the first run took the context
+			r.logs.Reset()
+			r.out.Reset()
+			r.f.purge.deleteErr = tc.rerunErr
+			if err := r.run(); err != nil {
+				t.Fatalf("re-run = %v, want success\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+			}
+			if !r.called("DeleteServiceUser:_k3sm") {
+				t.Fatalf("re-run did not try the deletion again:\n%s", strings.Join(r.f.calls, "\n"))
+			}
+			if b := r.f.purge.deleteBound; b <= 0 || b > purgeUserRetryTimeout {
+				t.Fatalf("the re-run's deletion ran under %s, want purgeUserRetryTimeout (%s)", b, purgeUserRetryTimeout)
+			}
+			if r.anyCall("DisableServiceUser:") {
+				t.Fatalf("the re-run disabled an account that was already disabled:\n%s", strings.Join(r.f.calls, "\n"))
+			}
+			out := r.out.String()
+			for _, gone := range []string{d.ServerArgsRecord, d.AgentArgsRecord, "kubeconfig", DefaultDataRoot, LogDir} {
+				if strings.Contains(out, gone) {
+					t.Errorf("the re-run reported %q removed, which the first run already removed:\n%s", gone, out)
+				}
+			}
+			if tc.rerunErr == nil {
+				if !r.f.purge.userDeleted || out != "k3sm purged; removed: the _k3sm service user\n" {
+					t.Fatalf("an allowed re-run must delete and report only the account:\n%s", out)
+				}
+				return
+			}
+			if !strings.HasPrefix(out, "k3sm purged; nothing else was left to remove\n") {
+				t.Errorf("the re-run's summary claims removals:\n%s", out)
+			}
+			for _, w := range append([]string{"the _k3sm account remains (disabled", "sudo dscl . -delete /Users/_k3sm"}, tc.want...) {
+				if !strings.Contains(out, w) {
+					t.Errorf("the re-run's line lacks %q:\n%s", w, out)
+				}
+			}
+		})
 	}
 }
 
@@ -799,6 +853,7 @@ func TestPurgeRemovesBothArgsRecordsWithoutTheManifest(t *testing.T) {
 	r.f.files = map[string][]byte{d.ServerArgsRecord: []byte("{}"), d.AgentArgsRecord: []byte("{}")}
 	for run := 1; run <= 2; run++ {
 		r.f.calls = nil
+		r.out.Reset()
 		if err := r.run(); err != nil {
 			t.Fatalf("purge run %d: %v\ncalls:\n%s", run, err, strings.Join(r.f.calls, "\n"))
 		}
@@ -808,6 +863,10 @@ func TestPurgeRemovesBothArgsRecordsWithoutTheManifest(t *testing.T) {
 			}
 			if _, ok := r.f.files[p]; ok {
 				t.Errorf("purge run %d left %s", run, p)
+			}
+			// The summary names a record only on the run that removed it.
+			if named := strings.Contains(r.out.String(), p); named != (run == 1) {
+				t.Errorf("purge run %d: summary names %s = %v, want %v:\n%s", run, p, named, run == 1, r.out.String())
 			}
 		}
 	}

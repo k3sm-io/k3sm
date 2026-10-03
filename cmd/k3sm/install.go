@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -337,17 +338,15 @@ func runUninstall(args []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("k3sm uninstall must run as root — use 'sudo k3sm uninstall'")
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := uninstallConfig(os.Stdout, os.Stderr)
+	logger := cfg.Logger
 	sys := install.NewDarwinSystem()
 	deregister, why := agentDeregister(sys, install.DefaultDataRoot, time.Now())
 	if deregister == nil && why != "" {
 		logger.Warn("not asking the cluster to forget this node: "+why,
 			"remedy", "on the control plane: kubectl delete meshpeer/<node> node/<node>")
 	}
-	cfg := install.Config{
-		Logger:     logger,
-		Deregister: deregister,
-	}
+	cfg.Deregister = deregister
 	if *purgeFlag {
 		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
@@ -361,6 +360,16 @@ func runUninstall(args []string) error {
 	}
 	removeNodeResolverEntry(logger)
 	return nil
+}
+
+// uninstallConfig is the uninstall's output wiring: result lines (what a purge
+// removed, and an account it could not delete with how to finish by hand) to
+// stdout, progress and diagnostics through the logger to stderr.
+func uninstallConfig(stdout, stderr io.Writer) install.Config {
+	return install.Config{
+		Logger: slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Out:    stdout,
+	}
 }
 
 // purgeWarning names what `k3sm uninstall --purge` destroys, for the refusal

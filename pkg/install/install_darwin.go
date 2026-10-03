@@ -75,6 +75,8 @@ const (
 const (
 	serviceUserRealName = "k3sm service user"
 	serviceUserShell    = "/usr/bin/false"
+	// serviceUserHidden is the IsHidden value install sets.
+	serviceUserHidden = "1"
 	// serviceUserDisabledRealName is the RealName a purge leaves on an account
 	// macOS would not let it delete (see DisableServiceUser).
 	serviceUserDisabledRealName = "k3sm service user (disabled; delete by hand)"
@@ -96,6 +98,21 @@ func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 	record := "/Users/" + name
 	if u, err := user.Lookup(name); err == nil {
 		uid, _ := strconv.Atoi(u.Uid)
+		// An account a purge could not delete carries the disabled label; an
+		// install that adopts it must not run the cluster under that label.
+		rec, err := darwinSystem{}.ServiceUser(context.Background(), name)
+		if err != nil {
+			return 0, fmt.Errorf("read the service user record: %w", err)
+		}
+		if err := reviveServiceUser(rec, func(attr, value string) error {
+			out, err := exec.Command("dscl", ".", "-create", record, attr, value).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("dscl . -create %s %s %s: %w: %s", record, attr, value, err, strings.TrimSpace(string(out)))
+			}
+			return nil
+		}); err != nil {
+			return 0, fmt.Errorf("restore the service user %s: %w", name, err)
+		}
 		// A reinstall may name a different data root than the account record
 		// still carries; keep the two in agreement, same as the creation path
 		// below.
@@ -124,7 +141,7 @@ func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 		// its own, so a purge deletes the user record and never a group.
 		{"dscl", ".", "-create", record, "PrimaryGroupID", "20"},
 		{"dscl", ".", "-create", record, "NFSHomeDirectory", dataRoot},
-		{"dscl", ".", "-create", record, "IsHidden", "1"},
+		{"dscl", ".", "-create", record, "IsHidden", serviceUserHidden},
 	}
 	for _, s := range steps {
 		if out, err := exec.Command(s[0], s[1:]...).CombinedOutput(); err != nil {
@@ -135,6 +152,26 @@ func (darwinSystem) EnsureServiceUser(name, dataRoot string) (uint32, error) {
 		return 0, err
 	}
 	return uint32(uid), nil
+}
+
+// reviveServiceUser restores the attributes DisableServiceUser changed, through
+// create (one `dscl . -create <record> <attr> <value>` each), when rec carries
+// the disabled label: the install-time RealName, and IsHidden as install sets
+// it. Any other record is left as it is. The shell needs no restoring: the
+// disabled shell is the install one.
+func reviveServiceUser(rec ServiceUserRecord, create func(attr, value string) error) error {
+	if !rec.Exists || rec.RealName != serviceUserDisabledRealName {
+		return nil
+	}
+	for _, kv := range [][2]string{
+		{"RealName", serviceUserRealName},
+		{"IsHidden", serviceUserHidden},
+	} {
+		if err := create(kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // freeSystemUID returns the first uid in [floor,ceil] not already assigned.
@@ -2402,8 +2439,8 @@ func (darwinSystem) KillProcess(pid int) error {
 }
 
 // ServiceUser reads the named user's record: the uid from the user database,
-// and RealName, UserShell and NFSHomeDirectory from the local directory node,
-// the attributes EnsureServiceUser wrote.
+// and RealName, UserShell, NFSHomeDirectory and IsHidden from the local
+// directory node, the attributes EnsureServiceUser wrote.
 func (darwinSystem) ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error) {
 	u, err := user.Lookup(name)
 	if err != nil {
@@ -2418,7 +2455,8 @@ func (darwinSystem) ServiceUser(ctx context.Context, name string) (ServiceUserRe
 		return ServiceUserRecord{}, fmt.Errorf("uid of %s: %w", name, err)
 	}
 	rec := ServiceUserRecord{Exists: true, UID: uint32(uid)}
-	for attr, dst := range map[string]*string{"RealName": &rec.RealName, "UserShell": &rec.Shell, "NFSHomeDirectory": &rec.Home} {
+	var hidden string
+	for attr, dst := range map[string]*string{"RealName": &rec.RealName, "UserShell": &rec.Shell, "NFSHomeDirectory": &rec.Home, "IsHidden": &hidden} {
 		cctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
 		out, err := exec.CommandContext(cctx, "dscl", ".", "-read", "/Users/"+name, attr).Output()
 		cancel()
@@ -2427,13 +2465,21 @@ func (darwinSystem) ServiceUser(ctx context.Context, name string) (ServiceUserRe
 		}
 		*dst = parseDsclAttr(out, attr)
 	}
+	rec.Hidden = hidden == serviceUserHidden
 	return rec, nil
 }
 
 // parseDsclAttr extracts one attribute's value from `dscl . -read` output,
-// which is "Attr: value" or, for a value with spaces, "Attr:\n value".
+// which is "Attr: value" or, for a value with spaces, "Attr:\n value". An
+// attribute outside the standard set reads back with a "dsAttrTypeNative:"
+// prefix (IsHidden does), and an absent one as "No such key: Attr", with exit
+// status 0; that is the empty value.
 func parseDsclAttr(out []byte, attr string) string {
 	s := strings.TrimSpace(string(out))
+	if strings.HasPrefix(s, "No such key:") {
+		return ""
+	}
+	s = strings.TrimPrefix(s, "dsAttrTypeNative:")
 	s = strings.TrimPrefix(s, attr+":")
 	return strings.TrimSpace(s)
 }
@@ -2447,7 +2493,8 @@ func (darwinSystem) DeleteServiceUser(ctx context.Context, name string) error {
 	}
 	// Bounded by ctx alone: the purge hands it purgeUserDeleteTimeout, long
 	// enough for a person at the screen to answer the approval prompt macOS
-	// raises for a record deletion. dscl is the tool, not sysadminctl
+	// raises for a record deletion (purgeUserRetryTimeout on a re-run over an
+	// account it already left disabled). dscl is the tool, not sysadminctl
 	// -deleteUser: refused the same way, sysadminctl still exits 0.
 	out, err := exec.CommandContext(ctx, "dscl", ".", "-delete", "/Users/"+name).CombinedOutput()
 	if err == nil {
@@ -2474,7 +2521,7 @@ func (darwinSystem) DisableServiceUser(ctx context.Context, name string) error {
 	// needs, so this works unattended where the deletion did not.
 	for _, kv := range [][2]string{
 		{"UserShell", serviceUserShell},
-		{"IsHidden", "1"},
+		{"IsHidden", serviceUserHidden},
 		{"RealName", serviceUserDisabledRealName},
 	} {
 		cctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
@@ -2507,83 +2554,85 @@ func (darwinSystem) BootoutUserDomain(ctx context.Context, uid uint32) error {
 
 // RemoveAdminKubeconfigContext removes the k3sm context from targetUser's
 // ~/.kube/config. See the System interface.
-func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) error {
+func (darwinSystem) RemoveAdminKubeconfigContext(targetUser string) (bool, error) {
 	u, err := user.Lookup(targetUser)
 	if err != nil {
-		return fmt.Errorf("lookup target user %s: %w", targetUser, err)
+		return false, fmt.Errorf("lookup target user %s: %w", targetUser, err)
 	}
-	if err := removeUserKubeconfigContext(u.HomeDir); err != nil {
-		return fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
+	removed, err := removeUserKubeconfigContext(u.HomeDir)
+	if err != nil {
+		return false, fmt.Errorf("kubeconfig for %s: %w", targetUser, err)
 	}
-	return nil
+	return removed, nil
 }
 
 // removeUserKubeconfigContext is the method above with the home directory
-// explicit, so a test runs it against a t.TempDir() home.
+// explicit, so a test runs it against a t.TempDir() home. It reports whether
+// the file carried the context, and so was rewritten.
 //
 // It writes the way writeUserKubeconfig does: a temp file in ~/.kube whose
 // owner and mode are bound to its open descriptor before the rename — here
 // the ORIGINAL file's owner and mode, read off the descriptor the content was
 // read from. A symlinked ~/.kube or ~/.kube/config is refused, not followed.
-func removeUserKubeconfigContext(homeDir string) error {
+func removeUserKubeconfigContext(homeDir string) (bool, error) {
 	kubeDir := filepath.Join(homeDir, ".kube")
 	if _, err := os.Lstat(kubeDir); errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return false, nil
 	}
 	if err := refuseSymlinkAt(kubeDir); err != nil {
-		return fmt.Errorf("%s: %w", kubeDir, err)
+		return false, fmt.Errorf("%s: %w", kubeDir, err)
 	}
 	path := filepath.Join(kubeDir, "config")
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
-		return nil
+		return false, nil
 	}
 	if errors.Is(err, unix.ELOOP) {
-		return fmt.Errorf("%s: %w", path, errSymlinkRefused)
+		return false, fmt.Errorf("%s: %w", path, errSymlinkRefused)
 	}
 	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
+		return false, fmt.Errorf("open %s: %w", path, err)
 	}
 	f := os.NewFile(uintptr(fd), path)
 	defer func() { _ = f.Close() }()
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("stat %s: %w", path, err)
+		return false, fmt.Errorf("stat %s: %w", path, err)
 	}
 	if statKind(st.Mode) != EntryRegular {
-		return fmt.Errorf("%s is not a regular file", path)
+		return false, fmt.Errorf("%s is not a regular file", path)
 	}
 	existing, err := io.ReadAll(f)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", path, err)
+		return false, fmt.Errorf("read %s: %w", path, err)
 	}
 	out, changed, err := unmergeAdminKubeconfig(existing, adminContextName)
 	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return false, fmt.Errorf("%s: %w", path, err)
 	}
 	if !changed {
-		return nil
+		return false, nil
 	}
 	tmp, err := os.CreateTemp(kubeDir, ".k3sm-kubeconfig-*")
 	if err != nil {
-		return fmt.Errorf("create temp kubeconfig: %w", err)
+		return false, fmt.Errorf("create temp kubeconfig: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }() // a no-op once the rename succeeded
 	if err := tmp.Chmod(fs.FileMode(st.Mode) & fs.ModePerm); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("chmod temp kubeconfig: %w", err)
+		return false, fmt.Errorf("chmod temp kubeconfig: %w", err)
 	}
 	if err := tmp.Chown(int(st.Uid), int(st.Gid)); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("chown temp kubeconfig to %d:%d: %w", st.Uid, st.Gid, err)
+		return false, fmt.Errorf("chown temp kubeconfig to %d:%d: %w", st.Uid, st.Gid, err)
 	}
 	if _, err := tmp.Write(out); err != nil {
 		_ = tmp.Close()
-		return fmt.Errorf("write temp kubeconfig: %w", err)
+		return false, fmt.Errorf("write temp kubeconfig: %w", err)
 	}
 	if err := publishTemp(tmp, path); err != nil {
-		return fmt.Errorf("publish kubeconfig: %w", err)
+		return false, fmt.Errorf("publish kubeconfig: %w", err)
 	}
-	return nil
+	return true, nil
 }

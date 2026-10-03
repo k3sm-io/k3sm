@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -175,6 +176,62 @@ func TestPurgeLaunchctlListAndDsclParsing(t *testing.T) {
 	if v := parseDsclAttr([]byte("UserShell: /usr/bin/false\n"), "UserShell"); v != serviceUserShell {
 		t.Fatalf("UserShell = %q", v)
 	}
+	// IsHidden is outside dscl's standard attribute set and reads back with
+	// the native prefix; an absent attribute reads back as "No such key".
+	if v := parseDsclAttr([]byte("dsAttrTypeNative:IsHidden: 1\n"), "IsHidden"); v != serviceUserHidden {
+		t.Fatalf("IsHidden = %q, want %q", v, serviceUserHidden)
+	}
+	if v := parseDsclAttr([]byte("No such key: IsHidden\n"), "IsHidden"); v != "" {
+		t.Fatalf("absent IsHidden = %q, want empty", v)
+	}
+}
+
+// TestReviveServiceUser pins what an install does to an account it adopts:
+// one a purge left disabled gets the install RealName and IsHidden back (the
+// dscl -create calls, in order), and any other account is left alone.
+func TestReviveServiceUser(t *testing.T) {
+	current := ServiceUserRecord{Exists: true, UID: 271, RealName: serviceUserRealName, Shell: serviceUserShell, Home: DefaultDataRoot, Hidden: true}
+	disabled := current
+	disabled.RealName = serviceUserDisabledRealName
+	legacy := current
+	legacy.RealName, legacy.Hidden = DefaultServiceUser, false
+	for _, tc := range []struct {
+		name string
+		rec  ServiceUserRecord
+		want []string
+	}{
+		{name: "the account a purge left disabled", rec: disabled, want: []string{"RealName=" + serviceUserRealName, "IsHidden=" + serviceUserHidden}},
+		{name: "the current shape", rec: current},
+		{name: "a legacy account", rec: legacy},
+		{name: "no account", rec: ServiceUserRecord{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			err := reviveServiceUser(tc.rec, func(attr, value string) error {
+				got = append(got, attr+"="+value)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("reviveServiceUser: %v", err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("dscl -create calls = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	t.Run("a failed dscl -create is the install's error", func(t *testing.T) {
+		boom := errors.New("boom")
+		if err := reviveServiceUser(disabled, func(string, string) error { return boom }); !errors.Is(err, boom) {
+			t.Fatalf("reviveServiceUser = %v, want boom", err)
+		}
+	})
+	t.Run("the restored record passes the purge identity check", func(t *testing.T) {
+		for _, rec := range []ServiceUserRecord{current, disabled} {
+			if err := checkServiceUser(DefaultServiceUser, rec, DefaultDataRoot); err != nil {
+				t.Fatalf("checkServiceUser(%q) = %v, want accepted", rec.RealName, err)
+			}
+		}
+	})
 }
 
 // TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries runs the real removal
@@ -190,8 +247,12 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 	if err := os.WriteFile(path, kubeFixture(t, true), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeUserKubeconfigContext(home); err != nil {
-		t.Fatalf("remove: %v", err)
+	if removed, err := removeUserKubeconfigContext(home); err != nil || !removed {
+		t.Fatalf("remove = %v, %v; want removed", removed, err)
+	}
+	// Once more: the context is gone, so nothing is reported removed.
+	if removed, err := removeUserKubeconfigContext(home); err != nil || removed {
+		t.Fatalf("second remove = %v, %v; want nothing removed", removed, err)
 	}
 	fi, err := os.Stat(path)
 	if err != nil || fi.Mode().Perm() != 0o640 {
@@ -210,8 +271,8 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 	}
 
 	// Absent ~/.kube: a no-op.
-	if err := removeUserKubeconfigContext(t.TempDir()); err != nil {
-		t.Fatalf("absent ~/.kube: %v", err)
+	if removed, err := removeUserKubeconfigContext(t.TempDir()); err != nil || removed {
+		t.Fatalf("absent ~/.kube = %v, %v; want a no-op", removed, err)
 	}
 	// Symlinked ~/.kube: refused, the target untouched.
 	evil := t.TempDir()
@@ -221,7 +282,7 @@ func TestPurgeKubeconfigFileKeepsOwnerModeAndOtherEntries(t *testing.T) {
 	if err := os.WriteFile(path, kubeFixture(t, true), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeUserKubeconfigContext(evil); !errors.Is(err, errSymlinkRefused) {
+	if _, err := removeUserKubeconfigContext(evil); !errors.Is(err, errSymlinkRefused) {
 		t.Fatalf("symlinked ~/.kube = %v, want errSymlinkRefused", err)
 	}
 	if b2, _ := os.ReadFile(path); string(b2) != string(kubeFixture(t, true)) {
