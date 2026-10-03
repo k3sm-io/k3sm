@@ -1314,6 +1314,22 @@ type Config struct {
 	// terminal error naming the remedy (mint a token on the server and start the
 	// agent with it).
 	Deregister func(ctx context.Context) error
+	// DeregisterServer removes this server's own etcd member from the embedded-etcd
+	// cluster it belongs to, and is called by Uninstall on a SERVER teardown whose
+	// installed plist carries --cluster-init or --server-join, and on no other. Nil
+	// skips it.
+	//
+	// It runs at the same point as Deregister — after any purge preflight, before
+	// a single daemon is booted out — because the call needs the local etcd member
+	// still running: a member removes itself through its own loopback client, which
+	// needs only the cluster's quorum, the same condition any membership change
+	// needs. The uninstalling host holds no server-class token, so it does not ask
+	// a peer.
+	//
+	// BEST EFFORT, like Deregister: a failure (no quorum, the member already gone)
+	// is one warning with the remedy for the servers that stay, and the teardown
+	// continues. A purge the preflight refuses makes no call.
+	DeregisterServer func(ctx context.Context) error
 	// Purge makes Uninstall also remove everything it otherwise keeps: the data
 	// root (and the data volume under it), the daemon log dir, the arguments
 	// records, the k3sm context in TargetUser's kubeconfig and the service user.
@@ -3492,6 +3508,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// best-effort and never note()d — a Mac being retired is often being retired
 	// because the cluster is gone, and an uninstall that refused to finish over
 	// that would leave the operator with a half-installed machine.
+	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
@@ -3642,6 +3659,50 @@ func deregisterNode(ctx context.Context, cfg Config, m []artifact) {
 		return
 	}
 	cfg.Logger.Info("removed this node from the cluster: its MeshPeer and Node are gone, so the remaining nodes drop their wireguard entry for it")
+}
+
+// serverDeregisterRemedy is what the servers that stay do when this server's etcd
+// member could not be removed: with the member still registered, a two-server
+// cluster has lost its quorum the moment this daemon stops.
+const serverDeregisterRemedy = "on the surviving server run: sudo launchctl bootout system/" + ServerLabel +
+	" && sudo k3sm server --cluster-reset --work-dir <its work dir> --node-ip <its node IP>, then start it again; or, while the cluster still has quorum, remove the member from a surviving server"
+
+// deregisterServer removes this server's etcd member before the teardown stops it,
+// on a server whose installed plist selects the embedded-etcd posture and on no
+// other. The posture is read from the plist on disk (as the role is read from the
+// manifest), so `sudo k3sm uninstall` needs no flags. A plist that cannot be read or
+// parsed says nothing about the posture, so nothing is attempted.
+func deregisterServer(ctx context.Context, sys System, cfg Config, m []artifact) {
+	if cfg.DeregisterServer == nil || !carriesServerDaemon(m) {
+		return
+	}
+	raw, err := sys.ReadFile(cfg.plistPath(ServerLabel))
+	if err != nil {
+		return
+	}
+	args, err := parseProgramArguments(raw)
+	if err != nil || !carriesEtcdPosture(args) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deregisterTimeout)
+	defer cancel()
+	if err := cfg.DeregisterServer(ctx); err != nil {
+		cfg.Logger.Warn("could not remove this server's etcd member from the cluster; the servers that stay still count it toward quorum",
+			"err", err, "remedy", serverDeregisterRemedy)
+		return
+	}
+	cfg.Logger.Info("removed this server's etcd member from the cluster; the remaining servers no longer count it toward quorum")
+}
+
+// carriesServerDaemon reports whether the manifest tears down the control-plane
+// daemon.
+func carriesServerDaemon(m []artifact) bool {
+	for _, a := range m {
+		if a.kind == kindDaemon && a.label == ServerLabel {
+			return true
+		}
+	}
+	return false
 }
 
 // carriesAgentDaemon reports whether the manifest tears down the worker daemon,
