@@ -972,18 +972,37 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	}
 
 	errc := make(chan error, 1)
-	// Both loops report their return through nodeLoops, which is what closes the
+	// Every loop reports its return through nodeLoops, which is what closes the
 	// nodeExited signal declared above: the exit hook waits on it (bounded) so a
 	// caller's teardown — `k3sm server` stopping its control plane — does not take
 	// the apiserver away while this node is still writing to it.
 	var nodeLoops sync.WaitGroup
-	nodeLoops.Add(2)
+	nodeLoops.Add(3)
 	go func() { defer nodeLoops.Done(); errc <- n.Run(ctx) }()
 	// The status loop's first publication is what marks the node Ready (supplying a
 	// node provider disables VK's own ready callback), so it must run for the whole
 	// life of the node, not only after startup succeeds. Its first UpdateStatus
 	// blocks until VK registers the notify callback, so starting it here is safe.
 	go func() { defer nodeLoops.Done(); _ = nodeStatus.Run(ctx) }()
+	// The node-pressure eviction manager is counted in nodeLoops from here, but
+	// held until the node is Ready (startEviction, below): only then has Virtual
+	// Kubelet's pod informer synced, so the provider's pod set is the cluster's.
+	// Counting it now rather than adding it later keeps the WaitGroup's Add ahead
+	// of every Wait.
+	startEviction := make(chan struct{})
+	go func() {
+		defer nodeLoops.Done()
+		select {
+		case <-startEviction:
+			runEvictionManager(ctx, prov, provider.EvictionConfig{
+				Status:   nodeStatus,
+				Recorder: recorder,
+				NodeName: opts.nodeName,
+				Log:      slog.Default(),
+			})
+		case <-ctx.Done():
+		}
+	}()
 	loopsDone := make(chan struct{})
 	go func() { nodeLoops.Wait(); close(loopsDone) }()
 	nodeExited = loopsDone
@@ -997,6 +1016,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// earlier would let it read an empty pod set as "every pod is gone" and delete
 	// the whole log tree on every restart.
 	startContainerLogMaintenance(ctx, prov)
+	// The eviction manager starts at the same point and for the same reason as
+	// the log GC: it acts on the provider's pod set, which is not the cluster's
+	// until the node is ready.
+	close(startEviction)
 	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir)
 
 	return awaitNodeExit(ctx, errc, stopRuntime)
@@ -1101,6 +1124,21 @@ func runtimeHealthProbe(prov vkadapter.Provider) func(context.Context) bool {
 		return nil
 	}
 	return h.RuntimeHealthy
+}
+
+// evictionManagerRunner is the optional provider capability that runs the
+// node-pressure eviction manager. It is declared at this consumer, like
+// containerLogMaintainer.
+type evictionManagerRunner interface {
+	RunEvictionManager(ctx context.Context, cfg provider.EvictionConfig)
+}
+
+// runEvictionManager runs prov's eviction manager until ctx ends, or returns at
+// once when prov has none (the hostprocess runtime).
+func runEvictionManager(ctx context.Context, prov any, cfg provider.EvictionConfig) {
+	if m, ok := prov.(evictionManagerRunner); ok {
+		m.RunEvictionManager(ctx, cfg)
+	}
 }
 
 // nodeStartupTimeout bounds startNode's wait for the VK node to signal readiness.

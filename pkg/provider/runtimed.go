@@ -322,6 +322,12 @@ type podTrack struct {
 	// surface, so the check and the unpark are one critical section
 	// (commitParkedCreate).
 	deleting bool
+	// evicted, when non-nil, is the terminal status of a pod the node-pressure
+	// eviction manager evicted (evictPod). It is set BEFORE the runtime teardown
+	// starts and never cleared; every status path returns it first, so nothing the
+	// runtime reports during or after the teardown can turn an evicted pod back
+	// into a running or restarting one. Guarded by restartMu with deleting.
+	evicted *corev1.PodStatus
 
 	// hookMu guards postStart — the per-container postStart hook bookkeeping of
 	// the postStart fidelity path (poststart.go): the pending/failed readiness gate the
@@ -1514,6 +1520,16 @@ func (r *runtimedRuntime) buildBox(ctx context.Context, pod *corev1.Pod, podIP s
 // nil) when the fail-closed gate rejects the pod; CreatePod surfaces that as an
 // error so VK marks the pod failed.
 func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	// An evicted pod is terminal: it is never created again, by a resync, a
+	// daemon restart, or anything else. Virtual Kubelet already skips syncing a
+	// Failed pod; this is the provider's own fence behind it, so a restarted
+	// node cannot resurrect a restartPolicy: Always pod that was evicted for
+	// filling memory.
+	if isEvictedPod(pod) {
+		r.log.Info("CreatePod: the pod was evicted from this node; not creating it",
+			"namespace", pod.Namespace, "name", pod.Name, "uid", string(pod.UID))
+		return nil
+	}
 	// Bind the pod's identity (ServiceAccount + name + UID) to the request context
 	// so the shared volume Resolver mints the in-pod-API token (projected SA-token
 	// volume) against the RIGHT SA and pins it to THIS Pod object — runtimed
@@ -1873,8 +1889,15 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// down is a StartContainer against a pod being deleted. runtimed refuses that
 	// with a typed precondition failure, but the window is closed from BOTH sides
 	// rather than either leaning on the other.
-	if t := r.trackByID(id); t != nil {
+	t := r.trackByID(id)
+	if t != nil {
 		t.quiesce()
+	}
+	// An evicted pod's processes are already gone (evictPod stopped them), so
+	// there is nothing for a preStop hook to run in: finish the teardown it left
+	// for this call (the /32, the log tree, the track, the apiserver object).
+	if t != nil && t.evictedStatus() != nil {
+		return r.teardownPod(ctx, pod, 0, nil)
 	}
 	// Serve preStop hooks BEFORE termination: runtimed sends SIGTERM
 	// synchronously inside DeletePod, so the provider runs preStop first and passes
@@ -1882,6 +1905,82 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	// best-effort — a failed hook is logged inside runPreStop, the delete proceeds.
 	grace := r.runPreStop(ctx, pod)
 	return r.teardownPod(ctx, pod, grace, nil)
+}
+
+// evictPod is the node-pressure eviction manager's termination path (the
+// evictionTarget half the manager calls). It is NOT DeletePod: the kubelet
+// leaves an evicted pod in the apiserver for its controller and the pod GC to
+// handle, so evictPod stops the pod's processes and records the eviction, and
+// leaves the rest of the teardown (the pod's /32, its log tree, its track, the
+// apiserver object) to the DeletePod that follows when the pod is deleted.
+//
+// In order:
+//
+//  1. Mark the track evicted, with the full terminal status, BEFORE anything is
+//     stopped, so every status built from here on (stream, backstop, direct
+//     reads) reports the eviction and the restart engine never observes the
+//     teardown's exits as crashes. A second eviction of the same pod is a no-op.
+//  2. Emit the pod's Warning Evicted Event (the kubelet records it before the
+//     kill).
+//  3. Quiesce the track (cancel pending re-execs, pulls, postStart) and stop the
+//     prober, so neither a restart nor a liveness-probe restart can bring an
+//     evicted restartPolicy: Always container back.
+//  4. DeletePod by pod id with grace 0 and no preStop.
+//  5. Drop the pod's transport override (a stopped guest's lease must not keep
+//     routing).
+//  6. Persist the status to the apiserver (synchronously, UID-checked) and push
+//     it through the watch callback.
+//
+// GRACE. Upstream's hard eviction passes gracePeriodOverride 0, and killContainer
+// (pkg/kubelet/kuberuntime/kuberuntime_container.go, v1.36.2) then skips the
+// preStop hook (it runs only when the grace budget is above 0) and floors the
+// grace it hands the runtime at minimumGracePeriodInSeconds (2 s): upstream sends
+// SIGTERM and SIGKILLs two seconds later. k3sm sends grace 0, which runtimed
+// renders as an immediate SIGKILL. The skipped preStop matches upstream; the
+// missing 2 s SIGTERM window is a deliberate k3sm divergence: the pod is
+// evicted because the node is about to run out of memory, and two more seconds
+// of an incompressible fill on a Mac can carry the compressor from the trip
+// value to the kernel's own kill point.
+//
+// NO PID IS EVER SIGNALLED HERE. The only kill is runtimed's DeletePod, keyed by
+// pod id. runtimed signals only the process groups of containers it has not
+// observed terminate (liveContainersLocked), and a container's leader is reaped
+// before its state reads terminated, so a group the kernel already killed (and
+// whose pgid number could be recycled) is not signalled.
+func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evictionNotice) error {
+	id := string(pod.UID)
+	t := r.trackByID(id)
+	if t == nil {
+		return fmt.Errorf("evict pod %s/%s: not tracked on this node", pod.Namespace, pod.Name)
+	}
+	r.mu.Lock()
+	tracked := t.pod
+	r.mu.Unlock()
+	prior := r.podWithStatus(ctx, tracked, t)
+	st := evictedPodStatus(prior.Status, n.message, metav1.Now())
+	if !t.markEvicted(st) {
+		return nil
+	}
+	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
+
+	t.quiesce()
+	r.stopProber(id)
+	var delErr error
+	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: 0}); err != nil {
+		delErr = fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	r.transport.drop(id)
+
+	if err := r.persistEvictedStatus(ctx, tracked, st); err != nil {
+		r.log.Error("eviction: could not persist the evicted status to the apiserver",
+			"pod", podKey(pod.Namespace, pod.Name), "err", err)
+	}
+	if cb := r.callback(); cb != nil {
+		out := tracked.DeepCopy()
+		out.Status = *st.DeepCopy()
+		cb(out)
+	}
+	return delErr
 }
 
 // quiesce closes t to a late create and cancels every in-flight provider worker
@@ -1994,6 +2093,13 @@ func (r *runtimedRuntime) GetPodStatus(ctx context.Context, namespace, name stri
 	if !ok {
 		return nil, vkadapter.NotFoundf("pod %q not found", namespace+"/"+name)
 	}
+	// An evicted pod reports its eviction without asking the runtime, which has
+	// already forgotten it.
+	if t := r.trackByID(id); t != nil {
+		if st := t.evictedStatus(); st != nil {
+			return st, nil
+		}
+	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
 	if err != nil {
 		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, name, err)
@@ -2054,6 +2160,10 @@ func (r *runtimedRuntime) GetPods(ctx context.Context) ([]*corev1.Pod, error) {
 // the caller under r.mu) carrying its reconstructed status. It runs OUTSIDE r.mu.
 func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod, t *podTrack) *corev1.Pod {
 	pod := tracked.DeepCopy()
+	if st := t.evictedStatus(); st != nil {
+		pod.Status = *st
+		return pod
+	}
 	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: string(pod.UID)})
 	switch {
 	case err != nil:
@@ -2098,6 +2208,11 @@ func (r *runtimedRuntime) podWithStatus(ctx context.Context, tracked *corev1.Pod
 // gate rides the same convergence, so no publish path can leak a Ready container
 // whose postStart hook has not completed.
 func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev1.PodStatus, ps probeState) corev1.PodStatus {
+	// FIRST, before any observation: an evicted pod's status is final, and its
+	// teardown's exits must reach neither the restart engine nor the overlays.
+	if st := t.evictedStatus(); st != nil {
+		return *st
+	}
 	r.observeExits(pod, t, rs)
 	// The pull-failure twin of observeExits: a container runtimed could not start
 	// gets (or keeps) its retry schedule on the same convergence, so every status
@@ -2402,9 +2517,11 @@ func (r *runtimedRuntime) GetPod(ctx context.Context, namespace, name string) (*
 // carries the proc_pid_rusage working-set footprint runtimed meters
 // (ri_phys_footprint, NOT RSS), per-container; the provider maps it to the kubelet
 // Summary shape and fills the stable per-pod StartTime from its own bookkeeping
-// (the runtime sample carries only the sample timestamp). A pod runtimed does not
-// sample (no memory limit ⇒ no metering) is absent from the response and so
-// from the summary.
+// (the runtime sample carries only the sample timestamp). runtimed meters every
+// running pod (the memory limit selects OOM enforcement, not metering); a pod is
+// absent from the response, and so from the summary, only when it has no sample
+// to give (a host-process pod whose sampler was never armed, or a vm pod whose
+// guest agent answered with none).
 func (r *runtimedRuntime) StatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
 	summary := &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: r.nodeName}}
 	resp, err := r.rt.ListPodStats(ctx, &runtimev1.ListPodStatsRequest{})

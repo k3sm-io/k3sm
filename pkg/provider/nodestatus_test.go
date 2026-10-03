@@ -122,6 +122,7 @@ func newNodeStatusHarness(t *testing.T, node *corev1.Node) *nodeStatusHarness {
 		DataRoot:       "/var/lib/k3sm",
 		RuntimeHealthy: h.runtimeHealthy,
 		Interval:       time.Millisecond,
+		Log:            discardLog(),
 	})
 	if err != nil {
 		t.Fatalf("NewNodeStatusProvider: %v", err)
@@ -173,9 +174,12 @@ func (h *nodeStatusHarness) setHealthy(v bool) {
 	h.healthy = v
 }
 
-// step runs exactly one status cycle and returns the node it published.
+// step runs exactly one sample-then-publish cycle and returns the node it
+// published. The status loop takes no sample of its own, so the cycle drives the
+// pressure monitor first, exactly as its own cadence would.
 func (h *nodeStatusHarness) step() *corev1.Node {
 	h.t.Helper()
+	h.p.monitor.sampleOnce()
 	if err := h.p.publishOnce(context.Background()); err != nil {
 		h.t.Fatalf("publishOnce: %v", err)
 	}
@@ -237,8 +241,10 @@ func TestNodeProviderReportsConditionsAndReady(t *testing.T) {
 					s.MemAvailableBytes = memAvailableHardEvictionBytes - 1
 					return s
 				},
+				// Clearing needs the RELEASE level (200Mi), not merely the trip
+				// level: between the two the raised condition holds.
 				clear: func(s hostStats) hostStats {
-					s.MemAvailableBytes = memAvailableHardEvictionBytes
+					s.MemAvailableBytes = memAvailableReleaseBytes
 					return s
 				},
 			},
