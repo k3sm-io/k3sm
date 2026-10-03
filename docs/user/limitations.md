@@ -728,17 +728,19 @@ tested rig, in both possible orderings (confine-then-construct and construct-the
 RuntimeClass remains the recommended choice for untrusted or multi-tenant workloads; see
 [above](#no-per-pod-uid-isolation) for why the default native path cannot offer the same boundary.
 
-**Within one `vm` Pod, a container can read volumes it does not mount.** The guest stages the Pod's
-projected-class volumes (configMap, secret, projected, downwardAPI) into a single pooled directory and
-binds each container's declared mounts out of it, but the pooled directory itself is re-exposed inside
-every container. A container that mounts no Secret can therefore still read another container's Secret,
-and the Pod's ServiceAccount token, by reading the staging path directly. It is read-only, and it does
-not cross a Pod boundary, since a `vm` Pod cannot see another Pod's volumes. It is still narrower than
-Kubernetes promises, where a container sees only the volumes it mounts.
+Inside one `vm` Pod the boundary is the Pod, not the container:
 
-**Do not rely on container-level volume separation inside a single `vm` Pod as a trust boundary.** If
-two containers must not see each other's credentials, put them in separate Pods, where the boundary
-is the one this RuntimeClass enforces.
+- A volume that no container in the Pod mounts is not visible in any container's filesystem,
+  except to a uid 0 container that mounts the shared volume device itself (see below).
+- Every container sees every volume that any container in the Pod mounts, at that container's
+  mount path.
+- Containers inside the guest are separated by chroot only: no pid namespace, no mount namespace,
+  no capability bounding. A container can reach a sibling container's root through
+  `/proc/<pid>/root` when it runs as the same uid or as uid 0.
+- A container running as uid 0 in the guest holds `CAP_SYS_ADMIN` and can mount the Pod's shared
+  volume device, which stays attached to the guest, and so read every volume of the Pod.
+- Put credentials that must not be shared in separate Pods; the Pod is the boundary this
+  RuntimeClass enforces.
 
 ### Node Capability Labels Are Probed Once at Daemon Start
 
