@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -111,6 +112,26 @@ type memberRig struct {
 	members     *fakeMembers
 	serverToken string
 	workerToken string
+	logs        *syncBuffer
+}
+
+// syncBuffer is a goroutine-safe log sink: the handler logs on the server's
+// goroutine, the test reads on its own.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 func newMemberRig(t *testing.T, members *fakeMembers) memberRig {
@@ -122,6 +143,7 @@ func newMemberRig(t *testing.T, members *fakeMembers) memberRig {
 	if err != nil {
 		t.Fatalf("create worker token: %v", err)
 	}
+	logs := &syncBuffer{}
 	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
 		ClusterCA:     clusterCA,
 		SigningCA:     signingCA,
@@ -131,6 +153,7 @@ func newMemberRig(t *testing.T, members *fakeMembers) memberRig {
 		SelfNodeName:  "server-a",
 		ServerAuth:    bootstrap.NewStaticServerSecret(memberTestSecret),
 		Members:       members,
+		Logger:        slog.New(slog.NewTextHandler(logs, nil)),
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -142,6 +165,7 @@ func newMemberRig(t *testing.T, members *fakeMembers) memberRig {
 		members:     members,
 		serverToken: bootstrap.FormatServerToken(clusterCA.PinHash(), memberTestSecret),
 		workerToken: bootstrap.FormatToken(clusterCA.PinHash(), wUser, wSecret),
+		logs:        logs,
 	}
 }
 
@@ -276,7 +300,52 @@ func TestEtcdMemberRouteRemovesStaleMember(t *testing.T) {
 			if resp.InitialCluster != want {
 				t.Errorf("initial cluster = %q, want %q", resp.InitialCluster, want)
 			}
+			// Removing a STARTED member changes the cluster's quorum, so it is said at
+			// WARN naming what went; an unstarted entry's removal stays at INFO.
+			var warn string
+			for _, l := range strings.Split(rig.logs.String(), "\n") {
+				if strings.Contains(l, "level=WARN") && strings.Contains(l, "removed a started etcd member") {
+					warn = l
+				}
+			}
+			if tc.stale.Unstarted() {
+				if warn != "" {
+					t.Errorf("an unstarted entry's removal was logged at WARN: %s", warn)
+				}
+				return
+			}
+			for _, want := range []string{"member-id=b", "removed-name=" + tc.stale.Name, tc.stale.PeerURLs[0]} {
+				if !strings.Contains(warn, want) {
+					t.Errorf("the started-member removal WARN %q does not carry %q; logs:\n%s", warn, want, rig.logs.String())
+				}
+			}
 		})
+	}
+}
+
+// TestMemberRoutesRequireSelfNodeName: the etcd member routes refuse to be built
+// without SelfNodeName, the guard that stops a request under this server's own name
+// from removing the member serving it; the worker join alone still builds without it.
+func TestMemberRoutesRequireSelfNodeName(t *testing.T) {
+	clusterCA, _ := certs.NewCA("k3sm-cluster-ca")
+	signingCA, _ := certs.NewCA("k3sm-signing-ca")
+	cfg := func(self string, members bootstrap.MemberJoiner) bootstrap.ServerConfig {
+		return bootstrap.ServerConfig{
+			ClusterCA: clusterCA, SigningCA: signingCA, Tokens: bootstrap.NewTokenStore(nil),
+			NodePasswords: bootstrap.NewMemoryNodePasswords(), Enroller: &fakeEnroller{},
+			ServerAuth: bootstrap.NewStaticServerSecret(memberTestSecret), SelfNodeName: self, Members: members,
+		}
+	}
+	for _, self := range []string{"", "   "} {
+		if srv, err := bootstrap.NewServer(cfg(self, &fakeMembers{})); !errors.Is(err, bootstrap.ErrMembersNeedSelfNodeName) || srv != nil {
+			t.Errorf("Members with SelfNodeName %q: NewServer = %v, %v; want nil, ErrMembersNeedSelfNodeName", self, srv, err)
+		}
+	}
+	if _, err := bootstrap.NewServer(cfg("", nil)); err != nil {
+		t.Errorf("no Members, no SelfNodeName: NewServer = %v, want it built (the worker join keeps its other guards)", err)
+	}
+	if _, err := bootstrap.NewServer(cfg("server-a", &fakeMembers{})); err != nil {
+		t.Errorf("Members with SelfNodeName: NewServer = %v", err)
 	}
 }
 

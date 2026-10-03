@@ -59,9 +59,12 @@ type ServerConfig struct {
 	// sibling's name is protected by that sibling's binding, not by this one.
 	//
 	// Empty leaves the name guard OFF (NewServer says so once at start). It is
-	// deliberately not a hard construction error, because a supervisor that
-	// refuses to serve is a worse failure than one whose first layer is absent
-	// while the node-password binding and the enroller's index guard still stand.
+	// deliberately not a hard construction error for the worker join, because a
+	// supervisor that refuses to serve is a worse failure than one whose first
+	// layer is absent while the node-password binding and the enroller's index
+	// guard still stand. With Members set it IS one (ErrMembersNeedSelfNodeName):
+	// the etcd member routes have no second layer, and an empty name would let a
+	// member request under this server's own name remove the member serving it.
 	SelfNodeName string
 	// Enroller performs the controller-mediated mesh enroll (MeshPeer write + peer
 	// snapshot).
@@ -115,9 +118,17 @@ type Server struct {
 	memberMu sync.Mutex
 }
 
+// ErrMembersNeedSelfNodeName refuses a server built with the etcd member routes
+// (ServerConfig.Members) but no SelfNodeName. The self-name refusal is the only thing
+// that stops a member request under this server's own name from taking the
+// stale-member path and removing the very member serving it, so the routes must
+// never run with that guard off.
+var ErrMembersNeedSelfNodeName = errors.New("bootstrap server: the etcd member routes (Members) require SelfNodeName, the guard against removing this server's own member")
+
 // NewServer validates cfg and returns the bootstrap Server. It errors if any
 // required dependency (the CAs, token verifier, node-password store, or enroller) is
-// missing — fail fast, no embedded fallback.
+// missing — fail fast, no embedded fallback — and when the etcd member routes are
+// configured without SelfNodeName (ErrMembersNeedSelfNodeName).
 func NewServer(cfg ServerConfig) (*Server, error) {
 	switch {
 	case cfg.ClusterCA == nil:
@@ -138,6 +149,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
 	if strings.Trim(cfg.SelfNodeName, " ") == "" {
+		if cfg.Members != nil {
+			return nil, ErrMembersNeedSelfNodeName
+		}
 		// Said ONCE, at construction, rather than per request: an unconfigured
 		// guard is a wiring defect that does not vary with traffic, and a
 		// per-request line would bury it. Loud here beats silent everywhere.

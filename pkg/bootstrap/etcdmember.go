@@ -272,7 +272,14 @@ func (s *Server) handleEtcdMember(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "remove the stale etcd member: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		log.Info("removed the stale etcd member", "member-id", memberHex(m.ID))
+		if m.Unstarted() {
+			log.Info("removed the stale etcd member", "member-id", memberHex(m.ID))
+			continue
+		}
+		// A STARTED member is one that once ran and may still hold a vote: removing it
+		// changes the cluster's quorum, so it is said at WARN with what was removed.
+		log.Warn("removed a started etcd member so the joining server can re-join under its name",
+			"member-id", memberHex(m.ID), "removed-name", m.Name, "removed-peer-urls", m.PeerURLs, "learner", m.IsLearner)
 	}
 	if reuse != nil {
 		log.Info("reusing the unstarted etcd learner already registered for this server", "member-id", memberHex(reuse.ID))
