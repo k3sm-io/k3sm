@@ -203,7 +203,8 @@ It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes th
 `/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
 left exactly as it is. It also clears the mesh's pf anchor rule, so a later tunnel never inherits a
 stale MSS clamp. Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
-reinstall picks up where you left off. The server's admin token is removed, because a reinstall
+reinstall picks up where you left off; to remove those too, see
+[Remove Everything](#remove-everything). The server's admin token is removed, because a reinstall
 mints a new one, but if you run the control plane against an external database, the file holding
 that database's connection string is kept with your cluster data at
 `/var/lib/k3sm/server/datastore-endpoint`. It contains the database password, and k3sm cannot
@@ -242,6 +243,46 @@ quietly bringing the server up on its own local database.
 Install warns when it finds neither source on a data root that already holds cluster state, which is
 what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install
 says so rather than starting single-node in silence.
+
+### Remove Everything
+
+```sh
+sudo k3sm uninstall --purge --yes
+```
+
+This runs the uninstall above and then removes what it keeps:
+
+- the cluster data in `/var/lib/k3sm`: the datastore, images, volumes, and the external database
+  connection string if you had one
+- the data volume, if you installed one, together with its keychain item, its `/etc/fstab` line,
+  and `/Library/Preferences/io.k3sm.datavol.json`
+- the daemon logs in `/var/log/k3sm`
+- the recorded arguments in `/Library/Preferences/io.k3sm.server-args.json` or
+  `io.k3sm.agent-args.json`
+- the `k3sm` context in your `~/.kube/config`, and the cluster and user entries only that context
+  used; every other entry in the file is kept
+- the `_k3sm` user, if macOS allows it (see below)
+
+macOS asks a person at the screen to approve deleting a user account, so the purge may not be able
+to delete `_k3sm` by itself. It removes everything else first, then leaves the account disabled
+(hidden, no login shell, no home directory) and prints the command that finishes the job: run
+`sudo dscl . -delete Users/_k3sm` in Terminal and click Allow when macOS asks to administer your
+computer. A leftover account is harmless, and running the purge again tries the deletion again.
+
+It cannot be undone. Without `--yes` the command changes nothing and lists what it would delete.
+k3s's `k3s-uninstall.sh` removes everything with no prompt; k3sm asks for `--yes` on purpose,
+because this deletes a user account and the cluster's datastore.
+
+Run it before `brew uninstall k3sm`: the `k3sm` binary is what performs the purge.
+
+Before deleting anything it checks that the data directories are the ones install created, and it
+stops without removing anything if a check fails. Install marks each directory with a
+`.k3sm-dataroot` file; a Mac installed by an older version has no marker, so run
+`sudo k3sm install` once (it writes the markers) and then the purge. It never deletes into a
+mounted filesystem, and it stops if any k3sm daemon or `_k3sm` process is still running after it
+tries to stop them.
+
+Copies outside these paths, such as Time Machine backups or APFS snapshots, are not touched.
 
 ## Verifying
 

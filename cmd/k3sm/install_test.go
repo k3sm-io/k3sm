@@ -17,6 +17,8 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -71,6 +73,40 @@ func TestParseInstallFlagsMeshIP(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q must explain the reason (%q)", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestUninstallConfigSplitsResultsFromDiagnostics pins the uninstall's output
+// wiring: the purge's result lines (what it removed, the account it could not
+// delete and how to finish by hand) are stdout, and the progress and
+// diagnostics the logger carries are stderr.
+func TestUninstallConfigSplitsResultsFromDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		write      func(t *testing.T, stdout, stderr *bytes.Buffer)
+		wantStdout string
+		wantStderr string
+	}{
+		{name: "a result line is stdout", wantStdout: "k3sm purged; removed: x\n", write: func(t *testing.T, stdout, stderr *bytes.Buffer) {
+			cfg := uninstallConfig(stdout, stderr)
+			if _, err := fmt.Fprintln(cfg.Out, "k3sm purged; removed: x"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "a log line is stderr", wantStderr: "level=WARN msg=diagnostic", write: func(t *testing.T, stdout, stderr *bytes.Buffer) {
+			uninstallConfig(stdout, stderr).Logger.Warn("diagnostic")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			tc.write(t, &stdout, &stderr)
+			if tc.wantStdout != stdout.String() {
+				t.Errorf("stdout = %q, want %q", stdout.String(), tc.wantStdout)
+			}
+			if tc.wantStderr == "" && stderr.Len() != 0 || !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Errorf("stderr = %q, want it to hold %q", stderr.String(), tc.wantStderr)
 			}
 		})
 	}
