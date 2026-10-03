@@ -117,9 +117,10 @@ limitations under the License.
 // model, with no shared component identity). The KCM additionally runs
 // with --use-service-account-credentials=true, so each controller authenticates as its
 // own system:controller:<name> service account. --client-ca-file is set unconditionally
-// (single-node included) so those client certs authenticate. The in-process VK node, the
-// post-bring-up provisioning client, and the healthz probe still carry the system:masters
-// admin token: the embedded node cannot move to a system:node identity until the
-// Virtual-Kubelet secret/configmap informers are scoped (they LIST/WATCH cluster-wide,
-// which the Node authorizer does not grant).
+// (single-node included) so those client certs authenticate. The server's in-process VK
+// node authenticates the same way, as system:node:<node name> in system:nodes with a
+// signing-CA cert cmd/k3sm mints in memory on every boot. The post-bring-up admin client
+// (and the server-side controllers on it), kubectl, and the healthz probe still carry the
+// system:masters admin token. That narrows the node client only: the server process
+// still holds the admin kubeconfig and the signing CA.
 package executor
