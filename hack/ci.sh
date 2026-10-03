@@ -25,6 +25,13 @@ if grep -qx "module k3sm.io/k3sm" go.mod 2>/dev/null; then
 	# running it happens to have a cluster up. The server-dry-run leg is the developer's
 	# stronger check (hack/verify-examples.sh with no flags), not CI's.
 	hack/verify-examples.sh --lint-only
+	# The etcd wrapper module (pkg/executor/etcdchild) is not a module of this repo, so
+	# nothing else here verifies its lockfile or scans its dependency graph. It needs
+	# the module proxy or a warm cache, like `go mod tidy` below; there is no offline
+	# skip, for the same reason that stage has none. A missing govulncheck is a named
+	# SKIP inside the script; a finding is RED.
+	echo "==> [k3sm] etcd wrapper"
+	hack/etcd-wrapper.sh verify
 fi
 
 # Enumerate the Go packages BEFORE deciding to skip anything. Exit 0 with empty
