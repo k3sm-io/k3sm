@@ -370,10 +370,10 @@ type RuntimedConfig struct {
 	// file is also added to every pod's Seatbelt read allow (stampShimReadPaths).
 	DyldShim string
 	// ShadowBinDir, when set, is the node's directory of ad-hoc re-signed host
-	// shell copies (pkg/shadow, made by `sudo k3sm install`). runtimed execs a
-	// copy in place of /bin/sh, /bin/bash, /bin/zsh, /bin/dash or /usr/bin/env so
-	// dyld keeps the pod shims loaded (runtime.Config.ShadowBinDir). Empty keeps
-	// the host binaries.
+	// binary copies (pkg/shadow, made by `sudo k3sm install`): the shells, tar
+	// and the common coreutils of runtimed's shadowset list. runtimed execs a
+	// copy in place of the host binary so dyld keeps the pod shims loaded
+	// (runtime.Config.ShadowBinDir). Empty keeps the host binaries.
 	ShadowBinDir string
 	// PathShim, when set, is the path-rebase DYLD shim dylib runtimed injects into a
 	// mounting container so an absolute volume mount resolves under the pod data

@@ -524,7 +524,7 @@ type System interface {
 	// CloneToOwned clones src to exactly dst (APFS clonefile, falling back to
 	// a plain copy across volumes), creating dst's parent root:wheel 0755 and
 	// leaving dst owned uid:gid at mode. Unlike CopyToRootOwned the source's
-	// signature is not the point: the shadow shells are re-signed right after
+	// signature is not the point: the shadow copies are re-signed right after
 	// (AdHocSign). A missing src reports an error wrapping fs.ErrNotExist.
 	CloneToOwned(src, dst string, uid, gid int, mode fs.FileMode) error
 	// AdHocSign replaces path's code signature with an ad-hoc one, carrying no
@@ -534,6 +534,12 @@ type System interface {
 	AdHocSign(path string) error
 	// CDHash reads path's code directory hash (codesign -dvvv).
 	CDHash(path string) (string, error)
+	// VerifyShadowCopy checks a made shadow copy (shadow.CheckCopyFile and
+	// shadow.CheckCopySignature: a regular file, not SF_RESTRICTED, no
+	// setuid/setgid or group/world write, an ad-hoc signature without the
+	// hardened runtime or restrict flag and with no entitlements) and returns
+	// its size in bytes. A failing copy is an error naming the property.
+	VerifyShadowCopy(path string) (int64, error)
 	// EnsureSymlink idempotently makes link a symlink pointing at target — the
 	// `k3sm` launcher in LinkDir. It is the ONE thing install writes outside the
 	// root-owned trees it owns, so it is fail-closed on both halves of that
@@ -3209,8 +3215,8 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KubeMarkerName),
 		cfg.stagedPayloadFile(executor.KubeMarkerName))
 
-	// 2c′. The shadow shell set: ad-hoc re-signed copies of the host shells
-	//      under <InstallDir>/shadow, with the manifest of what they were made
+	// 2c′. The shadow binary set: ad-hoc re-signed copies of the host shells,
+	//      tar and the common coreutils under <InstallDir>/shadow, with the manifest of what they were made
 	//      from. Made HERE, by the privileged installer and nowhere else (a
 	//      daemon-writable copy would be a code-injection path into every pod),
 	//      and staged like every other artifact, so the set is published with

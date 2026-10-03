@@ -145,20 +145,33 @@ resolve there by a **`DYLD_INSERT_LIBRARIES` path-rebase shim** that rewrites th
 The shim loads into ordinary **native workloads** (Go/C binaries such as your app, `nats`, or
 `postgres`), so their absolute volume mounts work as expected.
 
-macOS strips `DYLD_INSERT_LIBRARIES` from a **SIP platform binary**, so on an installed node a Pod's
-`/bin/sh`, `bash`, `zsh`, `dash` and `env` run as the re-signed copies `sudo k3sm install` makes
-under `/Library/k3sm/shadow`. Those copies keep the path-rebase and DNS shims, so a shell script
-that reads a mounted file at its absolute path sees it, and so does any binary from your image that
-the script execs.
+macOS strips `DYLD_INSERT_LIBRARIES` from a **SIP platform binary**, so on an installed node the
+runtime runs re-signed copies that `sudo k3sm install` makes under `/Library/k3sm/shadow` in place of
+the host binaries. The set covers the shells (`/bin/sh`, `bash`, `zsh`, `dash`, `env`), `tar`, and
+the common file utilities: `cat`, `cp`, `mv`, `ls`, `mkdir`, `rm`, `chmod`, `ln`, `sed`, `grep`,
+`awk`, `head`, `tail`, `find`, `xargs`, `sort`, `gzip` and the rest of the usual set. Those copies
+keep the path-rebase and DNS shims, so a script's `cat /mnt/x` sees the mounted file, `kubectl cp`
+into or out of a mounted path works, and so does any binary from your image that the script execs.
 
-A **platform binary that a Pod's process spawns** is a ceiling. The shell itself runs as the
-re-signed copy, but `/bin/cat`, `/usr/bin/sed` or `/usr/bin/tar` run from a shell script are plain
-SIP platform binaries, and macOS strips the shim from them. Absolute volume-mount paths resolve to
-the unmounted host path in such a child (and in anything it runs in turn), and it also loses
-per-namespace DNS precedence and the bind/connect discipline. Workarounds, in order of preference:
+The shim rebases opens, file status, directory listings, `cd` and exec. It does **not** rebase
+`mkdir`, `rm`, `mv`, `chmod`, `ln` or timestamp changes given an absolute mount path. `cd` into the
+mount first and use relative paths, or use a relative path from the data volume as described below.
 
-- Use a shell built-in, which runs inside the shell and keeps the shim: `read`, `echo`,
-  `$(<file)` in bash, and redirections such as `while read l; do ...; done < /mnt/x`.
+A program that opens files through the C stdio library (`fopen`), such as `awk` or `sed` given a file
+name, does not see a mounted file at its absolute path. Feed it on standard input
+(`awk '...' < /mnt/x`) or use a relative path.
+
+The shadow set is a compatibility aid and adds no isolation. Pods on one node stay one trust domain;
+untrusted tenants belong on the `vm` RuntimeClass.
+
+A **platform binary outside the set** that a Pod's process spawns is a ceiling, for example
+`/usr/bin/diff`, `/usr/bin/zip` or `/usr/bin/openssl` run from a shell script. macOS strips the shim
+from it, so absolute volume-mount paths resolve to the unmounted host path in such a child (and in
+anything it runs in turn), and it also loses per-namespace DNS precedence and the bind/connect
+discipline. Workarounds, in order of preference:
+
+- Use a binary from the set, or a shell built-in, which runs inside the shell and keeps the shim:
+  `read`, `echo`, `$(<file)` in bash, and redirections such as `while read l; do ...; done < /mnt/x`.
 - Use a relative path. When the container sets no `workingDir` (and its image sets none), its
   working directory is the Pod data volume, where a volume mounted at `/P` is materialized at `./P`,
   so `cat ./mnt/sec/key` resolves without the shim.
@@ -454,17 +467,18 @@ process without the shim resolves the fully qualified name and `<svc>.<ns>.svc`,
 no cluster names at all. The shim also carries the
 bind/connect discipline that gives a Pod its own source address and port space. What to know:
 
-- **Host shells keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a SIP platform binary, so
-  `sudo k3sm install` makes re-signed copies of `/bin/bash`, `/bin/zsh`, `/bin/dash` and `/usr/bin/env`
-  under `/Library/k3sm/shadow`, and the runtime runs those in their place: a `/bin/sh -c` entrypoint, a
-  script whose shebang names one of them, and one exec'd from inside the Pod. A macOS update replaces
+- **Host shells and the common utilities keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a
+  SIP platform binary, so `sudo k3sm install` makes re-signed copies of the shells, `tar` and the
+  common file utilities under `/Library/k3sm/shadow` (the set is listed under volume mounts above), and
+  the runtime runs those in their place: a `/bin/sh -c` entrypoint, a script whose shebang names one of
+  them, and one exec'd from inside the Pod. A macOS update replaces
   the host binaries and the copies then lag behind. The `shadow-shells` row of `k3sm status` reports
   the drift, and running `sudo k3sm install` again makes a fresh set.
 - **Any other restricted main process loses the shim**, for example `/usr/bin/python3` or a
   hardened-runtime binary. The runtime reads the process's code-signing flags after it starts and the
   Pod gets a `ShimInactive` Warning Event naming what is unavailable. Such a process still resolves
   FQDNs and `<svc>.<ns>.svc` through the node resolver. Use fully qualified names, or a compiled
-  binary as the entrypoint. The same holds for a platform binary (`/bin/cat`, `/usr/bin/sed`) that a
+  binary as the entrypoint. The same holds for a platform binary outside the re-signed set that a
   Pod's shell script spawns, as described under volume mounts above.
 - **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
   which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For

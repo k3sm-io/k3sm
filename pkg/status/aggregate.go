@@ -55,8 +55,9 @@ const (
 	// configuration (svc and the cluster domain routed to the node DNS). The
 	// row exists only on an installed Mac, when a reader was wired in.
 	RowNodeResolver = "node-resolver"
-	// RowShadowShells is the re-signed host shell set pods run in place of the
-	// platform shells, compared with the live host binaries. Same conditions.
+	// RowShadowShells is the re-signed host binary set (the shells, tar and the
+	// common coreutils) pods run in place of the platform binaries, compared
+	// with the live host binaries. Same conditions.
 	RowShadowShells = "shadow-shells"
 )
 
