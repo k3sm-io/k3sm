@@ -1,0 +1,51 @@
+# Untagged test files that still open a real socket (loopback included), read by
+# TestNoUntaggedRealSocketTests. Format:
+#
+#   <module-relative path> until=YYYY-MM-DD # <why>
+#
+# This list only shrinks. When a file is converted to fakes or moved behind
+# //go:build integration, delete its line (the gate fails on a stale entry). An
+# entry past its date fails, and no entry may be dated more than 183 days out.
+
+cmd/k3sm/agentmesh_test.go until=2026-12-31 # join dialer must record the local address of a real connection
+cmd/k3sm/agentnodeip_test.go until=2026-12-31 # httptest stub of the bootstrap join endpoint
+cmd/k3sm/certificate_test.go until=2026-12-31 # TLS server for the certificate-check command
+cmd/k3sm/enrolldereg_test.go until=2026-12-31 # httptest stub apiserver for mesh deregistration
+cmd/k3sm/enrollself_test.go until=2026-12-31 # httptest stub apiserver for MeshPeer self-enrollment
+cmd/k3sm/image_test.go until=2026-12-31 # unix-socket stub of the runtimed Images service
+cmd/k3sm/imagepush_test.go until=2026-12-31 # httptest registry plus a dead-port address for push failures
+cmd/k3sm/joinlistener_test.go until=2026-12-31 # join listener bind and retry over real loopback sockets
+cmd/k3sm/meshenrollregression_test.go until=2026-12-31 # httptest stub apiserver for MeshPeer create and rejoin
+cmd/k3sm/node_test.go until=2026-12-31 # httptest server for request-cancellation on shutdown
+cmd/k3sm/snapshot_test.go until=2026-12-31 # live control-plane probe needs a held loopback port
+pkg/addons/manifestdir_test.go until=2026-12-31 # httptest server for authenticated manifest fetches
+pkg/bootstrap/bundleserver_test.go until=2026-12-31 # httptest server for the sealed bundle endpoint
+pkg/bootstrap/join_test.go until=2026-12-31 # httptest server for the join protocol
+pkg/bootstrap/joinmeshkey_test.go until=2026-12-31 # httptest server for the join mesh-key exchange
+pkg/bootstrap/joinnodepassword_test.go until=2026-12-31 # httptest server for node-password verification
+pkg/bootstrap/joinratelimit_test.go until=2026-12-31 # httptest server for join rate limiting
+pkg/bootstrap/meshendpoint_test.go until=2026-12-31 # TLS server for the mesh-endpoint route
+pkg/bootstrap/nodeaddress_test.go until=2026-12-31 # httptest server for node-address assignment
+pkg/bootstrap/nodename_test.go until=2026-12-31 # httptest server for node-name validation
+pkg/bootstrap/serverjoin_test.go until=2026-12-31 # httptest server for server-role join
+pkg/builder/buildxhost_test.go until=2026-12-31 # httptest server for the buildx download
+pkg/executor/apiserverhost_test.go until=2026-12-31 # readiness probe must hit the effective bind address
+pkg/executor/bringuperror_test.go until=2026-12-31 # held loopback port drives the bring-up port-conflict error
+pkg/executor/componentexit_test.go until=2026-12-31 # real listener satisfies the readiness gate before the crash
+pkg/executor/helm_test.go until=2026-12-31 # httptest server for the helm release download
+pkg/executor/portguard_test.go until=2026-12-31 # port guard under test needs a held loopback port (also hosts freePort)
+pkg/executor/snapshot_test.go until=2026-12-31 # control-plane port probe needs a held loopback port
+pkg/hostnet/hostnet_test.go until=2026-12-31 # reachability probe against a real unix socket
+pkg/images/live_test.go until=2026-12-31 # httptest registry fixture
+pkg/install/netdprobe_darwin_test.go until=2026-12-31 # netd probe over a real unix socket
+pkg/loadbalancer/loadbalancer_test.go until=2026-12-31 # echo upstream and front listener for the proxy data path
+pkg/netserve/dnsbind_test.go until=2026-12-31 # DNS bind over real loopback ports
+pkg/netserve/edns_test.go until=2026-12-31 # UDP and TCP exchange with the cluster resolver
+pkg/netserve/nodeport_test.go until=2026-12-31 # echo backends for the NodePort data path
+pkg/netserve/resolver_test.go until=2026-12-31 # stub upstream DNS over UDP and TCP
+pkg/provider/kubeletauth_test.go until=2026-12-31 # TLS server for kubelet authn/authz
+pkg/provider/podlogs/handler_test.go until=2026-12-31 # follow-mode streaming over a real HTTP connection
+pkg/registrysvc/relay_test.go until=2026-12-31 # relay listeners and dials over loopback
+pkg/registrysvc/service_test.go until=2026-12-31 # preflight must refuse a held loopback port
+pkg/svclb/splicebench_test.go until=2026-12-31 # splice benchmark needs real TCP connections
+pkg/svclb/splicecopy_test.go until=2026-12-31 # splice copy needs a connected TCP pair
