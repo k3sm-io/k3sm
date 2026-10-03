@@ -152,6 +152,9 @@ func stampImagePlatform(box *runtimev1.PodBox, plat *runtimev1.Platform) {
 	for _, c := range box.GetContainers() {
 		c.ImagePlatform = plat
 	}
+	for _, c := range box.GetEphemeralContainers() {
+		c.ImagePlatform = plat
+	}
 }
 
 // boxImagePlatform reads the stamped override back off a translated box. It is

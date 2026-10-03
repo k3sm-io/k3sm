@@ -1792,9 +1792,11 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 	r.dispatch(string(pod.UID), rs)
 }
 
-// UpdatePod forwards labels/annotations changes (the only fields runtimed
-// updates in place); other changes need a recreate and are reported by the
-// runtime as a typed precondition failure, surfaced here as an error.
+// UpdatePod forwards labels/annotations changes and appended ephemeral
+// containers (the only changes runtimed applies in place); other changes need a
+// recreate and are reported by the runtime as a typed precondition failure,
+// surfaced here as an error. A refused ephemeral append is the exception: it is
+// reported on the debug container, never as the pod's failure.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
@@ -1853,10 +1855,43 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		return fmt.Errorf("runtimed update pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		return fmt.Errorf("runtimed update pod %s/%s: %s", pod.Namespace, pod.Name, e.GetMessage())
+		// A refusal of an update that only APPENDED ephemeral containers is the
+		// debug container's failure, not the pod's. Returning it would let
+		// virtual-kubelet mark the running pod ProviderFailed, and Failed outright
+		// under restartPolicy: Never. The refusal is reported on the container
+		// instead: the status reads ContainerCreating for it (ephemeral.go) and
+		// the Event carries runtimed's own text.
+		//
+		// UNSUPPORTED on a pod that lists ephemeral containers is the backstop
+		// for the same case: runtimed answers it only for an ephemeral append it
+		// cannot start, which the provider no longer sends for a vm pod. Any
+		// other UNSUPPORTED is returned as before.
+		ephemeralUnsupported := resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED &&
+			len(pod.Spec.EphemeralContainers) > 0
+		if !ephemeralOnlyDelta(previous, pod) && !ephemeralUnsupported {
+			return fmt.Errorf("runtimed update pod %s/%s: %s", pod.Namespace, pod.Name, e.GetMessage())
+		}
+		r.log.Warn("UpdatePod: runtimed refused the ephemeral container append; reported on the container",
+			"namespace", pod.Namespace, "name", pod.Name,
+			"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
+		r.recordEphemeralRejections(previous, pod, e.GetMessage())
+		r.dispatchCurrent(ctx, id)
+		return nil
 	}
+	r.recordEphemeralRejections(previous, pod, "")
 	r.dispatch(id, resp.GetStatus())
 	return nil
+}
+
+// dispatchCurrent reads the pod's current status from the runtime and publishes
+// it, for a mutating call whose refusal carried no status of its own. A failed
+// read publishes nothing; the watch stream and the backstop still converge.
+func (r *runtimedRuntime) dispatchCurrent(ctx context.Context, id string) {
+	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
+	if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
+		return
+	}
+	r.dispatch(id, resp.GetStatus())
 }
 
 // DeletePod runs the pod's preStop hooks, then stops the pod's processes and
