@@ -331,6 +331,72 @@ func TestEtcdQuorumWaitNeverTripsBreaker(t *testing.T) {
 	})
 }
 
+// TestEtcdDeathReportedOnce: the etcd member is supervised before its learner check,
+// promotion and quorum waits, so its reaper and the wait both see one death. Exactly
+// one of them reports it: when the reaper took it, the wait's error wraps
+// ErrEtcdChildExited (the caller must not count it); when the wait got there first, it
+// claims the report (the reaper then stays silent) and returns the plain error.
+func TestEtcdDeathReportedOnce(t *testing.T) {
+	t.Run("the claim decides which observer reports", func(t *testing.T) {
+		s := NewSupervised(Config{WorkDir: t.TempDir()})
+		for _, reaperFirst := range []bool{true, false} {
+			c := &component{name: etcdComponent, exited: make(chan struct{}), supervised: true, reported: reaperFirst}
+			close(c.exited)
+			err := s.etcdExitedErr(c, "while waiting for quorum")
+			if got := errors.Is(err, ErrEtcdChildExited); got != reaperFirst {
+				t.Errorf("reaper reported first=%v: errors.Is(err, ErrEtcdChildExited) = %v (%v)", reaperFirst, got, err)
+			}
+			if !c.reported {
+				t.Errorf("reaper reported first=%v: the wait left the report unclaimed, so the reaper would report it too", reaperFirst)
+			}
+		}
+	})
+
+	t.Run("a real death in the quorum wait: one record across both observers", func(t *testing.T) {
+		// Repeated so both orderings of the reaper and the wait get their chance.
+		for i := range 5 {
+			fake := &fakeEtcd{status: etcdMemberStatus{MemberID: testOwnID}}
+			clk := newFakeClock(time.Hour)
+			s, _, sink := etcdTestSupervised(t, EtcdInit, fake, clk)
+			if _, err := certs.EnsureHierarchy(s.cfg.WorkDir); err != nil {
+				t.Fatal(err)
+			}
+			die := filepath.Join(s.cfg.WorkDir, "die")
+			writeEtcdChild(t, s.cfg.WorkDir, "while [ ! -f '"+die+"' ]; do sleep 0.02; done\necho 'etcd: fatal'\nexit 3\n")
+			done := make(chan error, 1)
+			go func() { done <- s.bringUpEtcdMember(t.Context()) }()
+			select {
+			case <-clk.reached:
+			case err := <-done:
+				t.Fatalf("run %d: bring-up ended early: %v", i, err)
+			case <-time.After(30 * time.Second):
+				t.Fatalf("run %d: the quorum wait never parked", i)
+			}
+			if err := os.WriteFile(die, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("run %d: bring-up did not end when the member died", i)
+			}
+			// Stop waits for the reaper, so its report (if it took it) has landed.
+			if serr := s.Stop(context.Background()); serr != nil {
+				t.Fatal(serr)
+			}
+			bringUpCounted := 0
+			if !errors.Is(err, ErrEtcdChildExited) {
+				bringUpCounted = 1
+			}
+			if got := len(sink.snapshot().Crashes) + bringUpCounted; got != 1 {
+				t.Fatalf("run %d: one etcd death was counted %d times (callback %d, bring-up error %d: %v)",
+					i, got, len(sink.snapshot().Crashes), bringUpCounted, err)
+			}
+		}
+	})
+}
+
 // lastLines returns the last n lines of s, for a readable failure.
 func lastLines(s string, n int) string {
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")

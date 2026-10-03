@@ -77,11 +77,13 @@ func (b *crashBreaker) record(component, detail string) (tripped bool) {
 // either never started or died before it was marked supervised. Detail is the
 // bring-up error text, already redacted by pkg/executor before it was formatted.
 //
-// The two record sites are exclusive by construction, so a single failure is
-// never counted twice: a bring-up failure returns from executor.Start, and Start
-// returns only after it has torn every component down, while OnComponentExit
-// fires only for a component that was already marked supervised — which is to
-// say for a crash that by definition did not return from Start.
+// The two record sites must never count one failure twice. OnComponentExit fires
+// only for a component that was already marked supervised, and for every component
+// but one that mark is the last step of its bring-up. The exception is the etcd
+// member, which is supervised BEFORE its learner promotion and quorum waits; a
+// death during those waits is seen by both observers, and pkg/executor gives the
+// report to exactly one of them — when the exit callback took it, the bring-up
+// error wraps executor.ErrEtcdChildExited and noteBringUpFailure skips it.
 func (b *crashBreaker) recordBringUp(component, detail string) (tripped bool) {
 	return b.recordOrigin(executor.CrashOriginBringUp, component, detail)
 }
@@ -135,6 +137,13 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 	var bu *executor.BringUpError
 	if errors.As(err, &bu) {
 		component = bu.Component
+	}
+	if errors.Is(err, executor.ErrEtcdChildExited) {
+		// The exit callback already recorded this death as a crash; recording the
+		// bring-up error too would count one death twice toward the threshold.
+		logger.Error("the control plane did not come up: its etcd member exited, already recorded as a crash",
+			"component", component, "err", err)
+		return
 	}
 	if errors.Is(err, executor.ErrNoGoToolchain) {
 		logger.Error("the control plane did not come up with a fault that cannot heal on retry; parking on this failure",

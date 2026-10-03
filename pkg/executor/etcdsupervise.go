@@ -72,6 +72,12 @@ var (
 	// restarting member minted or imported them on its first boot. Minting fresh ones
 	// here would split the cluster's trust.
 	ErrEtcdCAsMissing = errors.New("executor: the etcd CA pairs are missing from the PKI dir (a joining server imports them from the bootstrap bundle; an existing member must keep the ones it was created with)")
+	// ErrEtcdChildExited marks a bring-up that ended because the etcd member died
+	// during one of the waits that run after it is supervised (the learner check, the
+	// promotion, the quorum wait), when that death was ALREADY reported through
+	// Config.OnComponentExit. A caller that counts failures must not count the
+	// bring-up error again: one death, one record. Match it with errors.Is.
+	ErrEtcdChildExited = errors.New("executor: the etcd member exited during bring-up (already reported as a component exit)")
 )
 
 // clock is the time seam the etcd loops wait on, so a test drives hours of waiting
@@ -384,20 +390,51 @@ func (s *Supervised) awaitStrandedLearner(ctx context.Context, m etcdMembers, c 
 }
 
 // etcdWaitTick waits d on the etcd clock, ending early on ctx or the child exiting.
+// A ctx that ends because the child died (the daemon's exit callback cancels it)
+// reports the death, not a bare cancellation: the exited channel is closed before the
+// callback runs, so it is checked first.
 func (s *Supervised) etcdWaitTick(ctx context.Context, c *component, d time.Duration, during string) error {
 	select {
 	case <-ctx.Done():
+		select {
+		case <-c.exited:
+			return s.etcdExitedErr(c, during)
+		default:
+		}
 		return ctx.Err()
 	case <-c.exited:
-		return etcdExitedErr(c, during)
+		return s.etcdExitedErr(c, during)
 	case <-s.etcd.clock.After(d):
 		return nil
 	}
 }
 
 // etcdExitedErr is the error a no-expiry wait returns when the member died under it.
-// The death itself was already reported as a crash (the child was supervised).
-func etcdExitedErr(c *component, during string) error {
+//
+// The child is supervised by now, so two observers see the one death: its reaper,
+// which reports it through OnComponentExit, and this wait, whose error ends bring-up
+// and is counted by the caller. Exactly one of them may report it, decided under mu
+// by the component's reported flag (markSupervised's discipline): when the reaper took
+// it, the error wraps ErrEtcdChildExited so the caller does not count it again; when
+// this wait got there first, it claims the report, the reaper stays silent, and the
+// plain error is the one record.
+func (s *Supervised) etcdExitedErr(c *component, during string) error {
+	s.mu.Lock()
+	claimed := !c.reported
+	if claimed {
+		c.reported = true
+	}
+	s.mu.Unlock()
+	if claimed {
+		return etcdExitDetail(c, during)
+	}
+	return fmt.Errorf("%w: %w", ErrEtcdChildExited, etcdExitDetail(c, during))
+}
+
+// etcdExitDetail describes a dead member: the Wait error and the redacted log tail.
+// Safe without the lock: waitErr is written strictly before exited closes, and every
+// caller has observed that close.
+func etcdExitDetail(c *component, during string) error {
 	return fmt.Errorf("%s exited %s: %v; last log lines (%s):\n%s", c.name, during, c.waitErr, c.logPath, RedactedLogTail(c.logPath))
 }
 
@@ -414,12 +451,8 @@ func (s *Supervised) promoteLearner(ctx context.Context, c *component) error {
 		}
 		s.cfg.Logger.Info("etcd learner not promoted yet; retrying", "component", etcdComponent,
 			"attempt", attempt, "retry-in", etcdPromoteInterval, "err", err)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.exited:
-			return etcdExitedErr(c, "while waiting for promotion")
-		case <-s.etcd.clock.After(etcdPromoteInterval):
+		if err := s.etcdWaitTick(ctx, c, etcdPromoteInterval, "while waiting for promotion"); err != nil {
+			return err
 		}
 	}
 }
@@ -431,8 +464,8 @@ func (s *Supervised) promoteLearner(ctx context.Context, c *component) error {
 // this server waiting, logging every etcdQuorumLogEvery, and it comes up the moment
 // the peer returns — never parked by the crash-loop breaker, because a missing peer
 // is not this server's failure. It ends only on quorum, on ctx, or on the etcd child
-// exiting, which IS a crash (the child is supervised by now, so its reaper reports
-// it) and is returned so bring-up stops.
+// exiting, which IS a crash and is returned so bring-up stops — reported exactly once
+// between the reaper and the returned error (etcdExitedErr).
 func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *component) error {
 	clk := s.etcd.clock
 	start := clk.Now()
@@ -440,7 +473,7 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 	for {
 		select {
 		case <-c.exited:
-			return etcdExitedErr(c, "while waiting for quorum")
+			return s.etcdExitedErr(c, "while waiting for quorum")
 		default:
 		}
 		if etcdHasQuorum(ctx, m) {
@@ -453,12 +486,8 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 			s.cfg.Logger.Info("waiting for etcd quorum", "component", etcdComponent,
 				"reachable-members", reachable, "members", members, "waited", now.Sub(start).Round(time.Second))
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.exited:
-			return etcdExitedErr(c, "while waiting for quorum")
-		case <-clk.After(etcdQuorumPoll):
+		if err := s.etcdWaitTick(ctx, c, etcdQuorumPoll, "while waiting for quorum"); err != nil {
+			return err
 		}
 	}
 }

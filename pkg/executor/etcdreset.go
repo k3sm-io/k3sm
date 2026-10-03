@@ -160,7 +160,7 @@ func awaitSoleMember(ctx context.Context, s *Supervised, m etcdMembers, c *compo
 		case <-ctx.Done():
 			return fmt.Errorf("%w: %w", ErrClusterResetFailed, ctx.Err())
 		case <-c.exited:
-			return fmt.Errorf("%w: %w", ErrClusterResetFailed, etcdExitedErr(c, "during the reset"))
+			return fmt.Errorf("%w: %w", ErrClusterResetFailed, etcdExitDetail(c, "during the reset"))
 		case <-clk.After(etcdQuorumPoll):
 		}
 	}

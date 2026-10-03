@@ -720,15 +720,18 @@ func runServer(args []string) (err error) {
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
-		// A bring-up failure never reaches OnComponentExit — the callback fires
-		// only for a component that was already marked supervised, and Start
-		// returns here only after it has torn every component down — so this is
-		// the ONE place a control plane that never came up gets counted. Without
-		// it the breaker saw post-mark crashes only, and a persistent bring-up
-		// fault (a kine that cannot open its database, an apiserver whose flags
-		// no longer parse) looped under the plist's bare KeepAlive forever. The
-		// recording happens here rather than in pkg/executor because the breaker
-		// is the daemon's memory, not the executor's.
+		// This is the place a control plane that never came up gets counted.
+		// Without it the breaker saw post-mark crashes only, and a persistent
+		// bring-up fault (a kine that cannot open its database, an apiserver whose
+		// flags no longer parse) looped under the plist's bare KeepAlive forever.
+		// OnComponentExit fires only for a component already marked supervised,
+		// which for every component but etcd is the end of its bring-up; etcd is
+		// supervised before its promotion and quorum waits, so a death there is
+		// seen by both, and pkg/executor hands the report to exactly one of them
+		// (the bring-up error wraps executor.ErrEtcdChildExited when the callback
+		// took it, and noteBringUpFailure skips that). The recording happens here
+		// rather than in pkg/executor because the breaker is the daemon's memory,
+		// not the executor's.
 		noteBringUpFailure(breaker, logger, err)
 		return fmt.Errorf("start control plane: %w", err)
 	}
