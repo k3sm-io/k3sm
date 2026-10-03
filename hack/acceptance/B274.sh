@@ -3,7 +3,8 @@
 # k3sm B274 acceptance gate — the runnable proof that `sudo k3sm uninstall`
 # clears the mesh's MSS-clamp pf anchor (darwin-net's mesh.PFAnchor,
 # "io.k3sm.mesh"), rather than leaving it loaded against a utun interface
-# number that no longer exists.
+# number that no longer exists. (The mesh no longer loads that anchor; the
+# uninstall flush stays as the backstop for one an older release loaded.)
 #
 # The defect: netd's shutdown path flushes NOTHING — `k3sm netd` cancels its
 # context and netd.Server.Serve just closes its listener. The pf anchor is

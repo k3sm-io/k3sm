@@ -991,8 +991,7 @@ func runServer(args []string) (err error) {
 			// Arms the teardown deferred above, which runs SYNCHRONOUSLY on the way
 			// out and after the control plane has stopped. The mesh watcher's own
 			// Close is only a fallback — it runs after ctx is cancelled and races
-			// process death, which on SIGTERM leaves the per-peer routes and the
-			// MSS-clamp pf anchor installed.
+			// process death, which on SIGTERM leaves the per-peer routes installed.
 			meshDown = down
 			serverPodCIDR = res.PodCIDR
 			if mode.DataPath() {

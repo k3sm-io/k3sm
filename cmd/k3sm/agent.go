@@ -465,8 +465,8 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	// The mesh teardown handle. It is declared — and its deferred run registered —
 	// BEFORE anything is brought up, so it covers a half-built bring-up too, and it
 	// stays a no-op under `--network none`. Running it here rather than leaving it
-	// to the watcher goroutine is what guarantees the per-peer routes and the
-	// MSS-clamp anchor are gone before this process exits.
+	// to the watcher goroutine is what guarantees the per-peer routes are gone
+	// before this process exits.
 	meshDown := meshTeardown(noMeshTeardown)
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 	if mode.DataPath() {
@@ -936,7 +936,8 @@ type meshWatch interface {
 // the selected backend's Down releases:
 //
 //   - direct mode (WGDevice): the per-peer kernel routes are deleted, the
-//     utun-scoped MSS-clamp pf anchor is flushed, the mesh-egress alias is removed
+//     io.k3sm.mesh pf anchor an older release loaded is flushed (nothing loads it
+//     now), the mesh-egress alias is removed
 //     and the wireguard utun is closed;
 //   - helper mode (netdDevice): a RemoveMesh to the root netd daemon, which owns
 //     the datapath. The device is rebuilt on the next start — bringUpMesh's Start
@@ -1026,7 +1027,7 @@ var activeMeshSeam = productionMeshSeam
 // It RETURNS a teardown handle, and that return is the point. Nothing used to hold
 // the mesh, so the only Close was the last act of the watcher goroutine — which
 // runs after ctx is already cancelled and therefore races process death: on a
-// SIGTERM the process could exit with the per-peer routes and the pf anchor still
+// SIGTERM the process could exit with the per-peer routes still
 // installed. A caller now defers this handle, so the teardown completes BEFORE it
 // returns; the watcher's Close remains as the fallback for a path that never
 // reaches the deferred call.

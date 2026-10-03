@@ -35,7 +35,7 @@
 #   `k3sm server --mesh-ip 100.64.0.1 --network direct`, built WITH -race, asserting
 #   the index-0 MeshPeer object, the wireguard device artifacts, the join
 #   supervisor's UNDERLAY reachability, and the HAZARD-REGRESSION round trip. Root
-#   is required for --network direct (the utun, the lo0 aliases, the pf anchor);
+#   is required for --network direct (the utun and the lo0 aliases);
 #   K3SM_LAB gates it because it boots a real control plane and takes over host
 #   network state. Under K3SM_LAB=1 WITHOUT root the tier FAILS rather than
 #   skipping: this row is manual:true in hack/acceptance/phases.json, so the
@@ -76,6 +76,9 @@ SELF="$HERE/m14-servermesh.sh"
 # here is the point — if either derivation moves, this gate says so.
 SELF_POD_CIDR="100.64.0.0/24"
 SELF_MESH_IP="100.64.0.1"
+# The utun's own point-to-point address: podnet.MeshLinkIP of the node /24, its
+# .255 (broadcastInSlash24). Distinct from the mesh-egress .1, which lives on lo0.
+SELF_LINK_IP="100.64.0.255"
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -270,15 +273,14 @@ fi
 
 # ============================================================================
 # ROOT / INTEGRATION TIER — a live single-Mac mesh-path control plane.
-# Requires K3SM_LAB=1 AND root: --network direct owns the utun, the lo0 aliases
-# and the pf anchor.
+# Requires K3SM_LAB=1 AND root: --network direct owns the utun and the lo0 aliases.
 # ============================================================================
 if [ "${K3SM_LAB:-}" != 1 ]; then
 	echo "----------------------------------------"
 	echo "M14.2 ROOT tier (run: sudo K3SM_LAB=1 $0):"
 	lab_pending "m14.L0  \`k3sm server --mesh-ip $SELF_MESH_IP --network direct\` (built -race) reaches a healthy apiserver — a REAL mesh IP, which nothing plumbs unless bring-up ensures the lo0 alias first"
 	lab_pending "m14.L1  the index-0 MeshPeer exists: name=<node>, podCIDR=$SELF_POD_CIDR, meshIP=$SELF_MESH_IP, non-empty publicKey (RED before: no such object at all)"
-	lab_pending "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed and the io.k3sm.mesh pf anchor names a utun (the device is up)"
+	lab_pending "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed and a utun carries the mesh link address $SELF_LINK_IP (the device is up)"
 	lab_pending "m14.L3  wireguard is listening on UDP :51820 — the endpoint the index-0 MeshPeer advertises"
 	lab_pending "m14.L3b the join supervisor answers on the UNDERLAY: TCP :9345 bound to the WILDCARD, and a TLS handshake completes against this host's LAN address (RED before: bound to $SELF_MESH_IP only, so every pre-mesh worker join is refused)"
 	lab_pending "m14.L4  HAZARD REGRESSION: a same-node ClusterIP round trip completes with MeshEgressIP wired, with remote-destination dials concurrently in flight"
@@ -293,7 +295,7 @@ fi
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "----------------------------------------"
-	echo "M14.2 ROOT tier requires root for --network direct (utun + lo0 aliases + the pf anchor) — run: sudo K3SM_LAB=1 $0" >&2
+	echo "M14.2 ROOT tier requires root for --network direct (utun + lo0 aliases) — run: sudo K3SM_LAB=1 $0" >&2
 	echo "Refusing to report a K3SM_LAB run green without it: this row is manual:true in phases.json, so exit 0 here would be read as PROVEN." >&2
 	echo "M14.2: $PASS passed, $FAIL failed" >&2
 	exit 1
@@ -326,8 +328,8 @@ fi
 
 m14_down() {
 	[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
-	# Give the server its shutdown window so it removes the lo0 alias and the pf
-	# anchor itself; sweep what it left behind either way.
+	# Give the server its shutdown window so it removes the lo0 alias
+	# itself; sweep what it left behind either way.
 	sleep 3
 	# 9345 is the join supervisor's own port; it is swept explicitly because the
 	# supervisor now binds the WILDCARD, so an orphan would block the next run's
@@ -336,7 +338,8 @@ m14_down() {
 		reap_port "$port" warn || true
 	done
 	ifconfig lo0 -alias "$SELF_MESH_IP" 2>/dev/null || true
-	pfctl -a io.k3sm.mesh -F rules 2>/dev/null || true
+	# Harmless backstop: clears an anchor an older release loaded (nothing loads it now).
+	pfctl -a io.k3sm.mesh -F all 2>/dev/null || true
 }
 trap m14_down EXIT
 
@@ -454,13 +457,14 @@ if ifconfig lo0 | grep -qE "inet ${SELF_MESH_IP}( |$|/)"; then
 else
 	ladder no "m14.L2  the mesh-egress lo0 alias $SELF_MESH_IP is plumbed"
 fi
-# The pf anchor names the utun the device created. Asserting the ANCHOR rather than
-# `ifconfig | grep utun` matters: a Mac with a VPN already has utun interfaces, so
-# a bare utun grep would pass without k3sm having created anything.
-if pfctl -a io.k3sm.mesh -s rules 2>/dev/null | grep -q 'on utun'; then
-	ladder ok "m14.L2  the io.k3sm.mesh pf anchor names a utun (the mesh device is up, MSS-clamped)"
+# The device assigns its mesh link address to the utun it creates. Asserting that
+# address rather than `ifconfig | grep utun` matters: a Mac with a VPN already has
+# utun interfaces, so a bare utun grep would pass without k3sm having created
+# anything, while only the mesh device carries $SELF_LINK_IP. No pf is involved.
+if ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{u=1;next} /^[^ \t]/{u=0} u && /inet /' | grep -qF "inet ${SELF_LINK_IP} --> ${SELF_LINK_IP} "; then
+	ladder ok "m14.L2  a utun carries the mesh link address $SELF_LINK_IP (the mesh device is up)"
 else
-	ladder no "m14.L2  the io.k3sm.mesh pf anchor names a utun — the mesh device did not come up"
+	ladder no "m14.L2  a utun carries the mesh link address $SELF_LINK_IP (the mesh device did not come up)"
 fi
 if lsof -nP -iUDP:51820 2>/dev/null | grep -q k3sm; then
 	ladder ok "m14.L3  wireguard is listening on UDP :51820 — the port the index-0 MeshPeer's endpoint advertises"
