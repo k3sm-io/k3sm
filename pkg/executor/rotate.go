@@ -326,6 +326,24 @@ func reissuedArtifacts(workDir string) []RotationArtifact {
 		artifact(certs.APIServerServingKeyPath(workDir),
 			"apiserver serving key for the cert above — multi-node servers only"),
 		kubeletServingArtifact(workDir),
+		serverNodeClientArtifact(),
+	}
+}
+
+// serverNodeClientArtifact describes the control-plane node's CLIENT identity — the
+// CN=system:node:<server node name>, O=system:nodes cert its in-process node talks
+// to the apiserver with, issued by the signing CA.
+//
+// Like the kubelet serving pair above it has no path: it is minted into memory on
+// every boot and never written. Unlike that pair it is minted in EVERY posture
+// (single-node, dev, mesh), because every server runs its node under this identity,
+// so it is reported present unconditionally — a rotation's restart re-mints it
+// wherever a control plane boots.
+func serverNodeClientArtifact() RotationArtifact {
+	return RotationArtifact{
+		Path:    "(in memory — never written to disk)",
+		Detail:  "client cert CN=system:node:<this server's node name>, O=system:nodes, issued by the signing CA — the identity this server's own node talks to the apiserver with; re-minted into memory on every boot, in every posture",
+		Present: true,
 	}
 }
 

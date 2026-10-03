@@ -38,11 +38,11 @@ import (
 	"k3sm.io/k3sm/pkg/helmchart"
 )
 
-// componentCertValidity is the lifetime of a per-component client cert (the scheduler /
-// controller-manager identities). One year matches the admin client cert; the certs are
-// re-minted on every server boot (provisionComponentCerts), so the control plane never
-// runs near expiry.
-const componentCertValidity = 365 * 24 * time.Hour
+// ComponentCertValidity is the lifetime of a per-component client cert (the scheduler /
+// controller-manager identities, and the server's in-process node identity minted in
+// cmd/k3sm). One year matches the admin client cert; the certs are re-minted on every
+// server boot (provisionComponentCerts), so the control plane never runs near expiry.
+const ComponentCertValidity = 365 * 24 * time.Hour
 
 // cpBinaries are the prebuilt control-plane binaries downloaded from kwok-ci/k8s.
 var cpBinaries = []string{"kube-apiserver", "kube-scheduler", "kube-controller-manager", "kubectl"}
@@ -1036,7 +1036,7 @@ users:
 // same posture the single-node admin kubeconfig uses) while still presenting its
 // client-cert identity.
 func writeComponentKubeconfig(cfg Config, path, cn string, h *certs.Hierarchy, verifyClusterCA bool) error {
-	certPEM, keyPEM, err := h.Signing.IssueClient(cn, nil, componentCertValidity)
+	certPEM, keyPEM, err := h.Signing.IssueClient(cn, nil, ComponentCertValidity)
 	if err != nil {
 		return fmt.Errorf("issue %s client cert: %w", cn, err)
 	}
@@ -1084,7 +1084,7 @@ users:
 // Re-issued on every boot like the component kubeconfigs. That is transparent to
 // the nodes: they pin the CA, never this leaf.
 func writeAPIServerKubeletClientCert(workDir string, h *certs.Hierarchy) error {
-	certPEM, keyPEM, err := h.Signing.IssueClient(certs.APIServerKubeletClientCN, nil, componentCertValidity)
+	certPEM, keyPEM, err := h.Signing.IssueClient(certs.APIServerKubeletClientCN, nil, ComponentCertValidity)
 	if err != nil {
 		return fmt.Errorf("issue %s client cert: %w", certs.APIServerKubeletClientCN, err)
 	}

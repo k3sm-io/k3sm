@@ -122,3 +122,41 @@ func TestRotationReportsTheKubeletServingPair(t *testing.T) {
 		}
 	})
 }
+
+// TestRotationReportsTheServerNodeClientIdentity keeps the report complete for the
+// server node's system:node client cert. Every boot mints it in memory, in every
+// posture, so it must be listed, present in a single-node AND a mesh work dir, and
+// must not claim a file an operator could go read.
+func TestRotationReportsTheServerNodeClientIdentity(t *testing.T) {
+	t.Parallel()
+	mesh := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(certs.APIServerServingCertPath(mesh)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(certs.APIServerServingCertPath(mesh), []byte("witness"), 0o644); err != nil {
+		t.Fatalf("write witness: %v", err)
+	}
+	for name, wd := range map[string]string{"single-node": t.TempDir(), "mesh": mesh} {
+		t.Run(name, func(t *testing.T) {
+			var found []RotationArtifact
+			for _, a := range reissuedArtifacts(wd) {
+				if strings.Contains(a.Detail, "CN=system:node:") && strings.Contains(a.Detail, "O=system:nodes") {
+					found = append(found, a)
+				}
+			}
+			if len(found) != 1 {
+				t.Fatalf("reissuedArtifacts lists %d server node client identities, want exactly 1", len(found))
+			}
+			a := found[0]
+			if !a.Present {
+				t.Error("every server boot mints the node's client identity, so it must be reported present")
+			}
+			if strings.HasPrefix(a.Path, "/") {
+				t.Errorf("Path = %q — the identity is held in memory and must not claim a file", a.Path)
+			}
+			if !strings.Contains(a.Detail, "signing CA") {
+				t.Errorf("Detail = %q — must name its issuer, the signing CA", a.Detail)
+			}
+		})
+	}
+}

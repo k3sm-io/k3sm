@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,6 +40,7 @@ import (
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	crdconfig "k3sm.io/apis/config/crd"
 	"k3sm.io/darwin-net/pkg/dns"
@@ -1186,8 +1189,30 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("read the kubelet endpoint's client-identity CA: %w", err)
 	}
+
+	// The in-process node's CLIENT identity: system:node:<name> in the system:nodes
+	// group, minted in memory from the same signing CA, exactly what a joined worker
+	// carries. The node no longer shares the admin kubeconfig the bring-up above
+	// runs on (that client keeps system:masters, and so does everything built on
+	// it). The hierarchy is loaded here rather than reusing `hierarchy`, which is
+	// set only on the mesh path; EnsureHierarchy LOADS the existing CAs in every
+	// posture, because the executor's provisioning step created them at exec.Start.
+	nodeHierarchy, err := certs.EnsureHierarchy(opts.workDir)
+	if err != nil {
+		return fmt.Errorf("load the CA hierarchy for the server node's client identity: %w", err)
+	}
+	nodeRESTCfg, err := serverNodeRESTConfig(restCfg, nodeHierarchy, opts.nodeName)
+	if err != nil {
+		return err
+	}
+	if cn, notAfter, err := clientCertIdentity(nodeRESTCfg.CertData); err == nil {
+		logger.Info("minted the server node's client identity (in memory, never written to disk)", "cn", cn, "groups", nodesGroup, "not_after", notAfter.UTC().Format(time.RFC3339))
+	} else {
+		return fmt.Errorf("read back the server node's client identity: %w", err)
+	}
+
 	nodeOpts := nodeOptions{
-		kubeconfig: exec.Kubeconfig(),
+		restConfig: nodeRESTCfg,
 		nodeName:   opts.nodeName,
 		listen:     serverKubeletListenOn(opts.kubeletPort),
 		podRoot:    opts.podRoot,
@@ -1312,6 +1337,16 @@ func runServer(args []string) (err error) {
 	}
 
 	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
+	//
+	// First, through the ADMIN client, clear the one piece of Node metadata an
+	// upgraded server's node can no longer manage itself: a kubernetes.io/role label
+	// recorded while the node ran as system:masters. Under its system:node identity
+	// NodeRestriction would refuse the status patch that removes it, every time.
+	if stripped, err := stripStaleNodeRoleLabel(ctx, cs.CoreV1().Nodes(), opts.nodeName); err != nil {
+		return err
+	} else if stripped {
+		logger.Info("removed a stale label this node can no longer remove itself under its node identity", "node", opts.nodeName, "label", staleNodeRoleLabel)
+	}
 	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
 	// The deferred crash check above names the component on this path too.
 	return startNode(ctx, nodeOpts)
@@ -1401,6 +1436,70 @@ func setServerKubeletServing(nodeOpts *nodeOptions, hierarchy *certs.Hierarchy, 
 	nodeOpts.kubeletServingCertPEM = certPEM
 	nodeOpts.kubeletServingKeyPEM = keyPEM
 	return nil
+}
+
+// nodesGroup is the group every node client identity carries (O=system:nodes), the
+// one the Node authorizer and NodeRestriction key on beside the system:node:<name>
+// user.
+const nodesGroup = "system:nodes"
+
+// serverNodeRESTConfig builds the client config the control-plane node's in-process
+// Virtual Kubelet node runs on: CN=system:node:<nodeName>, O=system:nodes, signed
+// by the SIGNING CA the apiserver's --client-ca-file trusts. That is the identity a
+// joined worker already carries, so the server's node is authorized by the Node
+// authorizer, admitted by NodeRestriction, and granted only what pkg/rbac already
+// grants the system:nodes group; it no longer rides the admin identity.
+//
+// It starts from rest.AnonymousClientConfig(admin): the admin config's Host and its
+// server-trust half (CA, ServerName, Insecure) are kept, and EVERY credential is
+// dropped by construction (bearer token and token file, client cert and key files,
+// exec and auth providers, basic auth, impersonation), so nothing of the admin
+// identity can ride along. The minted pair is then the only credential.
+//
+// The pair is held in memory and re-minted on every boot, like the node's kubelet
+// serving pair: no key file joins the work dir. Its lifetime is the per-boot
+// component leaves' (executor.ComponentCertValidity). The admin config's rate
+// limiter is dropped too, so the node's own request budget applies.
+//
+// This narrows the node CLIENT only. The server process still holds the admin
+// kubeconfig and the signing CA; it is not a process boundary.
+//
+// It fails closed: a hierarchy without a usable signing CA is an error, never a
+// fallback to the admin identity.
+func serverNodeRESTConfig(admin *rest.Config, h *certs.Hierarchy, nodeName string) (*rest.Config, error) {
+	if admin == nil {
+		return nil, errors.New("mint the server node's client identity: no admin client config to take the apiserver address from")
+	}
+	if nodeName == "" {
+		return nil, errors.New("mint the server node's client identity: empty node name")
+	}
+	if h == nil || h.Signing == nil || h.Signing.Cert == nil || h.Signing.Key == nil {
+		return nil, errors.New("mint the server node's client identity: no usable signing CA (the work dir's PKI must carry the signing half of the CA hierarchy)")
+	}
+	certPEM, keyPEM, err := h.Signing.IssueClient(nodeSystemPrefix+nodeName, []string{nodesGroup}, executor.ComponentCertValidity)
+	if err != nil {
+		return nil, fmt.Errorf("mint the server node's client identity: %w", err)
+	}
+	cfg := rest.AnonymousClientConfig(admin)
+	cfg.RateLimiter = nil
+	cfg.TLSClientConfig.CertData = certPEM
+	cfg.TLSClientConfig.KeyData = keyPEM
+	applyNodeClientBudget(cfg)
+	return cfg, nil
+}
+
+// clientCertIdentity reads the subject CN and NotAfter off a PEM client cert, for
+// the bring-up log line. It reads the certificate only, never key material.
+func clientCertIdentity(certPEM []byte) (string, time.Time, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return "", time.Time{}, errors.New("no PEM certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("parse certificate: %w", err)
+	}
+	return cert.Subject.CommonName, cert.NotAfter, nil
 }
 
 // serverKubeletServingIPs is the IP SAN set of that cert: every address the

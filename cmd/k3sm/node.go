@@ -109,7 +109,12 @@ var _ vkadapter.Provider = (*provider.VKProvider)(nil)
 // nodeOptions configures a Virtual Kubelet node bring-up. It is shared by the
 // standalone `k3sm node` command and the in-process node `k3sm server` runs.
 type nodeOptions struct {
+	// kubeconfig and restConfig are the node's client: exactly one is set, and
+	// nodeClientConfig refuses both and neither. `k3sm agent` and `k3sm node` name a
+	// kubeconfig file; `k3sm server` hands its in-process node an in-memory
+	// system:node config (serverNodeRESTConfig) and no file at all.
 	kubeconfig string
+	restConfig *rest.Config
 	nodeName   string
 	listen     string
 	podRoot    string
@@ -717,15 +722,50 @@ func nodeRESTConfig(kubeconfig string) (*rest.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
+	applyNodeClientBudget(cfg)
+	return cfg, nil
+}
+
+// applyNodeClientBudget sets nodeAPIRequestTimeout and the kubelet's QPS/Burst on
+// cfg. It is the one place those values live, shared by the kubeconfig-loaded
+// client (nodeRESTConfig) and the server node's in-memory one
+// (serverNodeRESTConfig), so the two paths cannot pace themselves differently.
+func applyNodeClientBudget(cfg *rest.Config) {
 	cfg.Timeout = nodeAPIRequestTimeout
 	cfg.QPS = 50
 	cfg.Burst = 100
-	return cfg, nil
+}
+
+// errNodeClientAmbiguous / errNodeClientMissing are nodeClientConfig's refusals.
+// Both-set is an error rather than a precedence rule: a caller that sets both has
+// two identities in mind, and silently picking one is how a node ends up running
+// as the wrong one.
+var (
+	errNodeClientAmbiguous = errors.New("node client: both an in-memory client config and a kubeconfig path are set; exactly one must be")
+	errNodeClientMissing   = errors.New("node client: neither an in-memory client config nor a kubeconfig path is set")
+)
+
+// nodeClientConfig is the ONLY place startNode gets its client config from.
+// opts.restConfig (the server's in-memory system:node identity) is used as given,
+// and the kubeconfig path is then never opened; opts.kubeconfig (agent, `k3sm
+// node`) is loaded through nodeRESTConfig. Exactly one must be set.
+func nodeClientConfig(opts nodeOptions) (*rest.Config, error) {
+	switch {
+	case opts.restConfig != nil && opts.kubeconfig != "":
+		return nil, errNodeClientAmbiguous
+	case opts.restConfig != nil:
+		return opts.restConfig, nil
+	case opts.kubeconfig != "":
+		return nodeRESTConfig(opts.kubeconfig)
+	default:
+		return nil, errNodeClientMissing
+	}
 }
 
 // startNode builds the client, selects the runtime, registers the VK node, and
 // blocks until ctx ends or the node exits. The server calls it directly with an
-// already-built kubeconfig.
+// in-memory system:node client config (nodeOptions.restConfig); the agent and
+// `k3sm node` pass a kubeconfig path. nodeClientConfig chooses between the two.
 func startNode(ctx context.Context, opts nodeOptions) error {
 	// Posture guard: refuse to start (named error, actionable message) when
 	// the default runtimed runtime's posture is missing — BEFORE anything
@@ -771,7 +811,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 			"internal_ip", internalIP, "node_ip", opts.nodeIP, "listen", opts.listen)
 	}
 
-	restCfg, err := nodeRESTConfig(opts.kubeconfig)
+	restCfg, err := nodeClientConfig(opts)
 	if err != nil {
 		return err
 	}
