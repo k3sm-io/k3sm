@@ -132,20 +132,22 @@ const (
 
 	// reasonPodReattached (Warning) marks a pod whose running processes the node
 	// re-attached after its daemon restarted, instead of creating the pod again
-	// (runtimed_attach.go). It is recorded once, at the attach, because what the
-	// restart cost the pod is fixed at that moment: output written while the
-	// daemon was down, the exit status of a container that then exits, and the
-	// CPU carried from earlier instances. No upstream analogue: a kubelet restart
-	// never loses a container's pipes, because containerd's shim holds them.
+	// (runtimed_attach.go). It is recorded once, at the attach. Each container
+	// runs under a resident shim that holds its pipes and reaps it, the
+	// containerd-shim shape, so output, exit status and exec survive the
+	// restart; what the restart still costs is the CPU carried from earlier
+	// instances, and a container whose shim died loses its exit status and
+	// exec.
 	reasonPodReattached = "PodReattached"
 )
 
 // msgPodReattached is the PodReattached Event message: what survived the node
 // daemon's restart and what did not, in the terms an operator acts on.
-const msgPodReattached = "the node daemon restarted and re-attached this pod's running processes: " +
-	"log lines written while it was down carry the time they were read, not written, a container that " +
-	"exits reports ExitStatusUnknown (exit code -1), CPU accounting restarted from zero, and exec needs " +
-	"the pod recreated"
+const msgPodReattached = "the node daemon restarted and re-attached this pod's running processes through " +
+	"each container's resident shim: output kept being logged while it was down, exit codes stay real and " +
+	"exec works, and CPU accounting restarted from zero; a container whose shim died reports " +
+	"ExitStatusUnknown (exit code -1) when it exits and refuses exec, and the pod carries the " +
+	"k3sm.io/log-stream-lost condition"
 
 // msgBackOffRestarting is the BackOff-event message for a container whose re-exec
 // is being throttled by the CrashLoopBackOff schedule. It reproduces the
