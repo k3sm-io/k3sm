@@ -159,7 +159,7 @@ func TestSeedBinDirRestagesStaleControlPlaneBinaries(t *testing.T) {
 		stageCPSet(t, binDir(work), "old", staleKubeVersion)
 		stageCPSet(t, payload, "new", DefaultKubeVersion)
 		logger, buf := bufLogger()
-		if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		assertCPSet(t, binDir(work), "new")
@@ -185,7 +185,7 @@ func TestSeedBinDirRestagesStaleControlPlaneBinaries(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(binDir(work), "kubectl"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err == nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err == nil {
 			t.Fatal("seedBinDir succeeded over an uncopyable kubectl")
 		}
 		if _, err := os.Stat(kubeMarkerPath(binDir(work))); !os.IsNotExist(err) {
@@ -196,7 +196,7 @@ func TestSeedBinDirRestagesStaleControlPlaneBinaries(t *testing.T) {
 	t.Run("fresh workdir: seeded and marked", func(t *testing.T) {
 		payload, work := t.TempDir(), t.TempDir()
 		stageCPSet(t, payload, "new", DefaultKubeVersion)
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		assertCPSet(t, binDir(work), "new")
@@ -209,7 +209,7 @@ func TestSeedBinDirRestagesStaleControlPlaneBinaries(t *testing.T) {
 		payload, work := t.TempDir(), t.TempDir()
 		stageCPSet(t, binDir(work), "old", staleKubeVersion)
 		stageCPSet(t, payload, "previous-release", "v1.35.9")
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		assertCPSet(t, binDir(work), "old")
@@ -227,7 +227,7 @@ func TestSeedBinDirRefusesControlPlaneDowngrade(t *testing.T) {
 	stageCPSet(t, binDir(work), "newer", newer)
 	stageCPSet(t, payload, "older", DefaultKubeVersion)
 	logger, buf := bufLogger()
-	if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+	if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 		t.Fatalf("a refused downgrade must not fail the boot: %v", err)
 	}
 	assertCPSet(t, binDir(work), "newer")
@@ -253,7 +253,7 @@ func TestSeedBinDirGrandfathersUnmarkedControlPlane(t *testing.T) {
 		stageCPSet(t, binDir(work), "existing", "")
 		stageCPSet(t, payload, "payload", "")
 		logger, buf := bufLogger()
-		if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if err := ensureControlPlaneBinaries(t.Context(), logger, work, DefaultKubeVersion); err != nil {
@@ -279,7 +279,7 @@ func TestSeedBinDirGrandfathersUnmarkedControlPlane(t *testing.T) {
 		payload, work := t.TempDir(), t.TempDir()
 		stageCPSet(t, binDir(work), "existing", "")
 		stageCPSet(t, payload, "payload", DefaultKubeVersion)
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		assertCPSet(t, binDir(work), "payload")
@@ -437,7 +437,7 @@ func TestSeedBinDirRefusesOverMalformedControlPlaneMarker(t *testing.T) {
 			}
 			stageCPSet(t, payload, "payload", DefaultKubeVersion)
 			logger, buf := bufLogger()
-			if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+			if err := seedBinDir(logger, work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 				t.Fatalf("a malformed marker must not fail the boot: %v", err)
 			}
 			assertCPSet(t, binDir(work), "present")

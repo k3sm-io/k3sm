@@ -181,9 +181,9 @@ func TestPayloadSetIncludesEtcd(t *testing.T) {
 	}
 }
 
-// TestSeedBinDirReseedsEtcdUnderMarker: etcd is a versioned payload binary on kine's
-// terms — a workdir etcd whose marker does not vouch for the pin is replaced from a
-// payload whose own marker does, and never from an unmarked one.
+// TestSeedBinDirReseedsEtcdUnderMarker: in the etcd posture, etcd is a versioned
+// payload binary on kine's terms — a workdir etcd whose marker does not vouch for the
+// pin is replaced from a payload whose own marker does, and never from an unmarked one.
 func TestSeedBinDirReseedsEtcdUnderMarker(t *testing.T) {
 	marked := etcdChild(DefaultEtcdVersion)
 	for _, tc := range []struct {
@@ -211,7 +211,7 @@ func TestSeedBinDirReseedsEtcdUnderMarker(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+			if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, true); err != nil {
 				t.Fatal(err)
 			}
 			if got, _ := os.ReadFile(marked.binPath(bd)); string(got) != tc.want {

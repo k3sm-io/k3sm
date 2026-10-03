@@ -791,7 +791,11 @@ func StagePayload(ctx context.Context, destDir string) error {
 // present-but-malformed marker (see below). Every other file is
 // unversioned and is only ever filled in when absent. kineVersion and kubeVersion are
 // the targets the caller resolved (Config.KineVersion, Config.KubeVersion).
-func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersion string) error {
+//
+// withEtcd is the posture: etcd is seeded (and re-seeded under its marker) only in
+// the etcd posture. A kine-posture work dir never receives an etcd binary, even though
+// every payload carries one.
+func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersion string, withEtcd bool) error {
 	if payloadDir == "" {
 		return nil
 	}
@@ -808,7 +812,7 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 	// through to ensureKineInto, which rebuilds or reports.
 	restageKine := !kineStaged(bd, kineVersion) && kineStaged(payloadDir, kineVersion)
 	// etcd follows kine's rule exactly, at the one version the wrapper pins.
-	restageEtcd := !etcdStaged(bd, DefaultEtcdVersion) && etcdStaged(payloadDir, DefaultEtcdVersion)
+	restageEtcd := withEtcd && !etcdStaged(bd, DefaultEtcdVersion) && etcdStaged(payloadDir, DefaultEtcdVersion)
 	// The control-plane set follows the same rule, with one refusal kine does not need
 	// here (kine's own migration path owns its downgrade story): when the workdir's
 	// marker names a NEWER version than the payload vouches for, the re-seed would
@@ -835,6 +839,9 @@ func seedBinDir(logger *slog.Logger, workDir, payloadDir, kineVersion, kubeVersi
 		}
 	}
 	for _, name := range PayloadBinaries() {
+		if name == etcdBinaryName && !withEtcd {
+			continue
+		}
 		dst := filepath.Join(bd, name)
 		versioned := (name == kineBinaryName && restageKine) || (name == etcdBinaryName && restageEtcd) ||
 			(restageKube && isCPBinary(name))

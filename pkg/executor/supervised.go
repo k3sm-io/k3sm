@@ -251,6 +251,18 @@ type Supervised struct {
 	// Stop could return, and the process exit, while a reaper was still inside
 	// OnComponentExit.
 	reapers sync.WaitGroup
+
+	// etcd holds the etcd posture's seams (clock, admin dial, readiness, peer probe);
+	// NewSupervised fills the production ones.
+	etcd etcdSeams
+	// etcdAdmin, etcdWatchStop and etcdWatchDone are the etcd posture's admin client
+	// and background watcher, set by bring-up and released by Stop. Guarded by mu.
+	etcdAdmin     etcdAdmin
+	etcdWatchStop context.CancelFunc
+	etcdWatchDone chan struct{}
+	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start to
+	// Stop (see lockWorkDir). Guarded by mu.
+	unlockWorkDir func() error
 }
 
 // NewSupervised returns a Supervised executor for cfg, filling defaults.
@@ -259,6 +271,7 @@ func NewSupervised(cfg Config) *Supervised {
 	return &Supervised{
 		cfg:   cfg,
 		token: cfg.Token,
+		etcd:  defaultEtcdSeams(),
 		// The apiserver self-signs its serving cert single-node; skip verification on the
 		// loopback healthz probe (the kubeconfig does the same).
 		client: &http.Client{
@@ -319,6 +332,20 @@ func (s *Supervised) Start(ctx context.Context) error {
 	tok := s.token
 	s.mu.Unlock()
 
+	// The etcd posture holds the work-dir lock for as long as its member may run, so a
+	// `--cluster-reset` (which takes the same lock) can never start a second member
+	// over the data dir this one serves.
+	if s.cfg.Etcd != nil {
+		unlock, err := lockWorkDir(s.cfg.WorkDir)
+		if err != nil {
+			s.releaseStartClaim()
+			return err
+		}
+		s.mu.Lock()
+		s.unlockWorkDir = unlock
+		s.mu.Unlock()
+	}
+
 	if tok == "" {
 		minted, err := generateToken()
 		if err != nil {
@@ -364,11 +391,21 @@ var (
 func (s *Supervised) releaseStartClaim() {
 	s.mu.Lock()
 	s.started = false
+	unlock := s.unlockWorkDir
+	s.unlockWorkDir = nil
 	s.mu.Unlock()
+	if unlock != nil {
+		_ = unlock()
+	}
 }
 
 // provision lays down everything the components need on disk.
 func (s *Supervised) provision(ctx context.Context) error {
+	// An init member over an existing single-node datastore is refused before
+	// anything in the work dir is touched.
+	if err := provisionStep("cluster-init", refuseClusterInitOverSQLite(s.cfg)); err != nil {
+		return err
+	}
 	if err := provisionStep("workdirs", ensureWorkDirs(s.cfg.WorkDir)); err != nil {
 		return err
 	}
@@ -378,8 +415,9 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// node, on an unchanged pin, and on the Postgres posture (no state.db). It must sit
 	// ahead of seedBinDir/ensureKine, which are exactly what would destroy the old kine
 	// binary the rollback path preserves. A refusal (no space, an undrained WAL) stops
-	// the boot rather than migrating unprotected.
-	if s.cfg.DatastoreEndpoint == "" {
+	// the boot rather than migrating unprotected. The etcd posture has no kine
+	// datastore to protect.
+	if s.cfg.DatastoreEndpoint == "" && s.cfg.Etcd == nil {
 		if err := provisionStep("snapshot", snapshotBeforeKineUpgrade(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 			return err
 		}
@@ -387,7 +425,8 @@ func (s *Supervised) provision(ctx context.Context) error {
 	// Seed the workdir bin from a staged install payload first, so the ensure*
 	// steps below find the binaries present and only re-sign — a launchd _k3sm
 	// daemon has neither gh nor a Go toolchain to fall back on.
-	if err := provisionStep("seed-bin", seedBinDir(s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion, s.cfg.KubeVersion)); err != nil {
+	// etcd is seeded only in the etcd posture: a single-node work dir never stages it.
+	if err := provisionStep("seed-bin", seedBinDir(s.cfg.Logger, s.cfg.WorkDir, s.cfg.PayloadBinDir, s.cfg.KineVersion, s.cfg.KubeVersion, s.cfg.Etcd != nil)); err != nil {
 		return err
 	}
 	if err := provisionStep("binaries", ensureControlPlaneBinaries(ctx, s.cfg.Logger, s.cfg.WorkDir, s.cfg.KubeVersion)); err != nil {
@@ -400,7 +439,13 @@ func (s *Supervised) provision(ctx context.Context) error {
 	if err := provisionStep("sign-helm", signBinaries(ctx, binDir(s.cfg.WorkDir), []string{helmchart.HelmBinaryName})); err != nil {
 		return err
 	}
-	if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
+	// The datastore child: kine in the kine posture, the pinned etcd in the etcd
+	// posture. Neither posture stages the other's.
+	if s.cfg.Etcd != nil {
+		if err := provisionStep("etcd", ensureEtcdInto(ctx, binDir(s.cfg.WorkDir), DefaultEtcdVersion)); err != nil {
+			return err
+		}
+	} else if err := provisionStep("kine", ensureKine(ctx, s.cfg.WorkDir, s.cfg.KineVersion)); err != nil {
 		return err
 	}
 	if err := provisionStep("sa-keys", writeServiceAccountKeys(ctx, s.cfg.WorkDir)); err != nil {
@@ -422,6 +467,11 @@ func (s *Supervised) provision(ctx context.Context) error {
 	}
 	if err := provisionStep("certs", s.provisionComponentCerts()); err != nil {
 		return err
+	}
+	if s.cfg.Etcd != nil {
+		if err := provisionStep("etcd-certs", provisionEtcdCerts(s.cfg)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -532,22 +582,11 @@ func (s *Supervised) markSupervised(c *component) error {
 }
 
 func (s *Supervised) bringUp(ctx context.Context) error {
-	kine, err := s.startKine(ctx)
-	if err != nil {
-		return bringUpErr("kine", PhaseBringUp, fmt.Errorf("start kine: %w", err))
-	}
-	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
-		return bringUpErr(kine.name, PhaseBringUp, fmt.Errorf("kine not listening: %w", err))
-	}
-	if err := s.markSupervised(kine); err != nil {
-		return err
-	}
-	// kine is serving, so this pin has now genuinely opened this database — stamp it,
-	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
-	// provision time) is what makes the pre-migration snapshot survive a boot that dies
-	// before the datastore ever came up; recordKinePin itself skips the external-
-	// datastore posture.
-	if err := bringUpErr(kine.name, PhaseBringUp, recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint)); err != nil {
+	if s.cfg.Etcd != nil {
+		if err := s.bringUpEtcdMember(ctx); err != nil {
+			return err
+		}
+	} else if err := s.bringUpKine(ctx); err != nil {
 		return err
 	}
 	api, err := s.startAPIServer(ctx)
@@ -567,6 +606,27 @@ func (s *Supervised) bringUp(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// bringUpKine is the kine posture's datastore bring-up: spawn kine, wait for its
+// listener, mark it supervised, stamp the pin.
+func (s *Supervised) bringUpKine(ctx context.Context) error {
+	kine, err := s.startKine(ctx)
+	if err != nil {
+		return bringUpErr("kine", PhaseBringUp, fmt.Errorf("start kine: %w", err))
+	}
+	if err := awaitHealthy(ctx, kine.name, kine.exited, kine.exitedNow, tcpReady(s.cfg.KinePort), componentReadyTimeout, 300*time.Millisecond, kine.exitDetail); err != nil {
+		return bringUpErr(kine.name, PhaseBringUp, fmt.Errorf("kine not listening: %w", err))
+	}
+	if err := s.markSupervised(kine); err != nil {
+		return err
+	}
+	// kine is serving, so this pin has now genuinely opened this database — stamp it,
+	// on a fresh node's first boot as much as on a returning one. Stamping here (not at
+	// provision time) is what makes the pre-migration snapshot survive a boot that dies
+	// before the datastore ever came up; recordKinePin itself skips the external-
+	// datastore posture.
+	return bringUpErr(kine.name, PhaseBringUp, recordKinePin(s.cfg.WorkDir, s.cfg.KineVersion, s.cfg.DatastoreEndpoint))
 }
 
 // startAndAwaitListening starts a component and does not return until its own
@@ -1221,9 +1281,13 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	// Reverse start order = correct shutdown order, but kine (index 0) must die
-	// last. Build the explicit order: apiserver, scheduler, controller-manager,
-	// then kine.
+	// The etcd watcher and admin client go first: they talk to the member this Stop is
+	// about to kill.
+	s.stopEtcdWatcher(ctx)
+
+	// Reverse start order = correct shutdown order, but the datastore (index 0) must
+	// die last. Build the explicit order: apiserver, scheduler, controller-manager,
+	// then kine or etcd.
 	var alive []string
 	for _, c := range shutdownOrder(comps) {
 		if !s.stopComponent(ctx, c) {
@@ -1248,6 +1312,15 @@ func (s *Supervised) Stop(ctx context.Context) error {
 		}
 		s.cfg.Logger.Warn("control-plane reaper goroutines did not finish inside the teardown budget",
 			"components", strings.Join(late, ","))
+	}
+	// The work-dir lock is released only once every child has been signalled and
+	// reaped (or given up on), so a reset can never start beside a dying member.
+	s.mu.Lock()
+	unlock := s.unlockWorkDir
+	s.unlockWorkDir = nil
+	s.mu.Unlock()
+	if unlock != nil {
+		_ = unlock()
 	}
 
 	switch {
@@ -1292,24 +1365,24 @@ func awaitReapers(ctx context.Context, reapers *sync.WaitGroup) bool {
 }
 
 // shutdownOrder returns comps ordered for a clean teardown: the apiserver drains
-// first (it stops writing), then scheduler + controller-manager, then kine last
-// (so no component loses its datastore mid-shutdown). Components arrive in start
-// order [kine, apiserver, scheduler, controller-manager]; this pulls kine to the
-// end and keeps the rest in start order (apiserver before the controllers).
+// first (it stops writing), then scheduler + controller-manager, then the datastore
+// last (so no component loses its datastore mid-shutdown). Components arrive in start
+// order [kine|etcd, apiserver, scheduler, controller-manager]; this pulls the
+// datastore — kine or the etcd member, whichever this posture runs — to the end and
+// keeps the rest in start order (apiserver before the controllers). Both get the same
+// SIGTERM-then-drainGrace budget; etcd fsyncs its WAL before acknowledging a write,
+// so a SIGKILL after the grace loses no acknowledged write.
 func shutdownOrder(comps []*component) []*component {
-	var kine *component
+	var datastores []*component
 	out := make([]*component, 0, len(comps))
 	for _, c := range comps {
-		if c.name == "kine" {
-			kine = c
+		if c.name == kineBinaryName || c.name == etcdComponent {
+			datastores = append(datastores, c)
 			continue
 		}
 		out = append(out, c)
 	}
-	if kine != nil {
-		out = append(out, kine)
-	}
-	return out
+	return append(out, datastores...)
 }
 
 // stopComponent SIGTERMs a component's process group, waits drainGrace for the
