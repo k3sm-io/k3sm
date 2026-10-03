@@ -60,8 +60,8 @@ const (
 	// StateAddressMismatch is the fourth: the credential is complete and in
 	// date, and names an address this node is not assigned.
 	StateAddressMismatch RowState = "address-mismatch"
-	// StateDrift is the shadow shell set's word for a copy made from a host
-	// binary macOS has since replaced.
+	// StateDrift is the shadow binary set's word for a copy made from a host
+	// binary macOS has since replaced, or a set made by an older install.
 	StateDrift     RowState = "drift"
 	StateUnknown   RowState = "unknown"
 	StateHealthy   RowState = "healthy"

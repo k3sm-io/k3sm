@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"k3sm.io/k3sm/pkg/shadow"
 	"k3sm.io/runtimed/pkg/image"
 )
@@ -76,4 +78,26 @@ func (darwinSystem) CDHash(path string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)
 	defer cancel()
 	return shadow.CDHash(ctx, path)
+}
+
+// VerifyShadowCopy lstats the copy (so a symlink fails as not regular), reads
+// its BSD flags, and checks its signature through codesign.
+func (darwinSystem) VerifyShadowCopy(path string) (int64, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return 0, fmt.Errorf("lstat %s: %w", path, err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return 0, fmt.Errorf("lstat %s: %w", path, err)
+	}
+	if err := shadow.CheckCopyFile(fi.Mode(), st.Flags); err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shadowSignTimeout)
+	defer cancel()
+	if err := shadow.VerifySignature(ctx, path); err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
 }

@@ -155,7 +155,7 @@ func newStatusCollector() status.Collector {
 		// netd's node resolver entry, read from the dynamic store (no
 		// privilege needed to read a State: key).
 		NodeResolverPresent: nodeResolverPresent,
-		// The live host binaries' cdhashes, for the shadow shell drift check.
+		// The live host binaries' cdhashes, for the shadow binary drift check.
 		CDHash: func(path string) (string, error) {
 			return shadow.CDHash(context.Background(), path)
 		},

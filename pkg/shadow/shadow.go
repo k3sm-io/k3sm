@@ -26,6 +26,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"k3sm.io/runtimed/pkg/shadowset"
 )
 
 // DirName is the shadow set's directory under the install root.
@@ -40,22 +42,24 @@ func Dir(installDir string) string { return filepath.Join(installDir, DirName) }
 // ManifestPath is the manifest's path for an install root.
 func ManifestPath(installDir string) string { return filepath.Join(Dir(installDir), ManifestName) }
 
-// Shell is one member of the set: the file name of the copy under the shadow
-// directory and the host binary it is made from. The names are the contract
-// with runtimed's shadowCopies map (bash also serves /bin/sh there: Apple's
-// /bin/sh is a dispatcher that re-execs the platform shell, so it is never
-// copied itself).
-type Shell struct {
+// Copy is one member of the set: the file name of the copy under the shadow
+// directory and the host binary it is cloned from.
+type Copy struct {
 	Name   string
 	Source string
 }
 
-// Shells is the set, in the order the installer makes it.
-var Shells = []Shell{
-	{Name: "bash", Source: "/bin/bash"},
-	{Name: "zsh", Source: "/bin/zsh"},
-	{Name: "dash", Source: "/bin/dash"},
-	{Name: "env", Source: "/usr/bin/env"},
+// Copies is the set, in the order the installer makes it: one copy per entry
+// of runtimed's shadowset list, the one declaration the runtime's exec swap,
+// the installer and the status row share. Two entries may name the same
+// Source under different copy names (a binary that dispatches on argv[0]).
+func Copies() []Copy {
+	entries := shadowset.Entries()
+	out := make([]Copy, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, Copy{Name: e.Copy, Source: e.Source})
+	}
+	return out
 }
 
 // ManifestVersion is the manifest schema version this package writes and reads.
@@ -106,15 +110,47 @@ type Drifted struct {
 
 // Drift compares every manifest source with its live cdhash (cdhash is
 // CDHash in production) and returns the ones that differ or cannot be read.
+// Each distinct path is read once.
 func Drift(m Manifest, cdhash func(path string) (string, error)) []Drifted {
+	type read struct {
+		h   string
+		err error
+	}
+	seen := make(map[string]read)
 	var out []Drifted
 	for _, s := range m.Sources {
-		live, err := cdhash(s.Path)
-		if err != nil || live != s.CDHash {
-			out = append(out, Drifted{Source: s, Live: live, Err: err})
+		r, ok := seen[s.Path]
+		if !ok {
+			r.h, r.err = cdhash(s.Path)
+			seen[s.Path] = r
+		}
+		if r.err != nil || r.h != s.CDHash {
+			out = append(out, Drifted{Source: s, Live: r.h, Err: r.err})
 		}
 	}
 	return out
+}
+
+// Missing returns the copies of the current set whose source is on this host
+// (present reports that) but which the manifest does not list: the set was
+// made by an older install, before those copies were declared. A copy whose
+// source this host lacks is never missing, because the installer skips it.
+// expected is the number of copies whose source is present.
+func Missing(m Manifest, present func(source string) bool) (missing []Copy, expected int) {
+	have := make(map[string]bool, len(m.Sources))
+	for _, s := range m.Sources {
+		have[s.Name] = true
+	}
+	for _, c := range Copies() {
+		if !present(c.Source) {
+			continue
+		}
+		expected++
+		if !have[c.Name] {
+			missing = append(missing, c)
+		}
+	}
+	return missing, expected
 }
 
 // ErrNoCDHash is returned when codesign output carries no CDHash line (an

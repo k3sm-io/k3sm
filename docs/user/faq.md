@@ -38,8 +38,8 @@ container without respawning it. See
 On the default runtime, yes. Cluster Service names, headless Services, StatefulSet per-Pod names,
 SRV and PTR all resolve from inside a Pod. Two caveats apply. The resolver is k3sm's own, not CoreDNS
 (IPv4/A only, no AAAA), and the `getaddrinfo` shim that redirects a Pod's lookups cannot load into a
-restricted binary. Host shells (`/bin/sh`, `bash`, `zsh`, `dash`, `env`) run as re-signed copies that
-keep the shim; any other restricted main process (the system `python3`, for example) gets a
+restricted binary. Host shells (`/bin/sh`, `bash`, `zsh`, `dash`, `env`), `tar` and the common file
+utilities run as re-signed copies that keep the shim; any other restricted main process (the system `python3`, for example) gets a
 `ShimInactive` Event and still resolves fully qualified and `<svc>.<ns>.svc` names through the node resolver.
 In-pod cluster DNS is **not** wired on `--runtime hostprocess`; on the `vm` RuntimeClass it works. See
 [Limitations](limitations.md#dns-what-resolves-and-on-which-runtime-path).

@@ -1374,7 +1374,7 @@ func resolveDNSShim() string {
 	return resolveSiblingDylib(install.DNSShimName)
 }
 
-// resolveShadowDir returns the shadow shell directory beside the running k3sm
+// resolveShadowDir returns the shadow binary directory beside the running k3sm
 // executable (<InstallDir>/shadow for an installed node) when it is a real
 // directory, else "". runtimed verifies each copy's ownership before it execs
 // one; this only decides whether the node has a set at all.
@@ -1448,8 +1448,8 @@ func runtimedConfig(opts nodeOptions, cs kubernetes.Interface) provider.Runtimed
 		// temp dir, so the sibling lookup finds nothing there and the flag is the
 		// ONLY way the dev cluster gets absolute volume mounts.
 		PathShim: firstNonEmpty(opts.pathShim, resolvePathShim()),
-		// The shadow shell set `sudo k3sm install` makes beside the binary; a
-		// dev or from-source run has none and keeps the host shells.
+		// The shadow binary set `sudo k3sm install` makes beside the binary; a
+		// dev or from-source run has none and keeps the host binaries.
 		ShadowBinDir:  resolveShadowDir(),
 		ResolverVIP:   resolverVIP,
 		ClusterDomain: clusterDomain,

@@ -147,6 +147,9 @@ type fakeSystem struct {
 	// EVERY path present, so an unconfigured fake describes a healthy install and
 	// only a test that cares about the netd socket has to say so.
 	missingPaths map[string]bool
+	// verifyErrs[path] is the error VerifyShadowCopy reports for a made shadow
+	// copy; the zero value verifies every copy.
+	verifyErrs map[string]error
 	// links models the symlinks EnsureSymlink has laid down (link -> target), so a
 	// SECOND Install over the same fake describes the real "already correct"
 	// reinstall rather than a fresh lay-down.
@@ -777,6 +780,19 @@ func (f *fakeSystem) AdHocSign(path string) error {
 	f.calls = append(f.calls, "AdHocSign:"+path)
 	return nil
 }
+
+// VerifyShadowCopy records the check and answers verifyErrs[path], or a fixed
+// size so the logged total is predictable.
+func (f *fakeSystem) VerifyShadowCopy(path string) (int64, error) {
+	f.calls = append(f.calls, "VerifyShadowCopy:"+path)
+	if err := f.verifyErrs[path]; err != nil {
+		return 0, err
+	}
+	return fakeShadowCopySize, nil
+}
+
+// fakeShadowCopySize is the size the fake reports for every shadow copy.
+const fakeShadowCopySize = 1000
 
 // CDHash answers a cdhash derived from the path, so the manifest's contents are
 // predictable.
@@ -1651,7 +1667,7 @@ func TestInstallOrchestration(t *testing.T) {
 		t.Fatalf("Install: %v", err)
 	}
 
-	want := []string{
+	want := slices.Concat([]string{
 		// Before anything is written: is the OTHER role's daemon already on this
 		// Mac? A node is a control plane or a worker, never both.
 		"ReadFile:/Library/LaunchDaemons/io.k3sm.agent.plist",
@@ -1793,22 +1809,12 @@ func TestInstallOrchestration(t *testing.T) {
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
-		// The shadow shell set, staged with the binary that uses it: each host
-		// shell cloned root:wheel 0755, re-signed ad hoc, its source's cdhash
-		// read, then the manifest (TestShadowSetIsMadeAtInstall owns the detail).
+		// The shadow binary set, staged with the binary that uses it: each copy
+		// in the shared list cloned root:wheel 0755, re-signed ad hoc, verified,
+		// its source's cdhash read, then the manifest (TestShadowSetIsMadeAtInstall
+		// owns the detail).
 		"EnsureRootDir:/Library/k3sm.staging/shadow",
-		"CloneToOwned:/bin/bash->/Library/k3sm.staging/shadow/bash:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/bash",
-		"CDHash:/bin/bash",
-		"CloneToOwned:/bin/zsh->/Library/k3sm.staging/shadow/zsh:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/zsh",
-		"CDHash:/bin/zsh",
-		"CloneToOwned:/bin/dash->/Library/k3sm.staging/shadow/dash:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/dash",
-		"CDHash:/bin/dash",
-		"CloneToOwned:/usr/bin/env->/Library/k3sm.staging/shadow/env:0:0:0755",
-		"AdHocSign:/Library/k3sm.staging/shadow/env",
-		"CDHash:/usr/bin/env",
+	}, shadowSetCalls("/Library/k3sm.staging/shadow", nil), []string{
 		"WriteRootOnlyFile:/Library/k3sm.staging/shadow/sources.json:0644",
 		// The installed server plist and args record were already read, in the
 		// preflight block before any of these copies ran (see above); the carry-
@@ -1879,7 +1885,7 @@ func TestInstallOrchestration(t *testing.T) {
 		// (TestInstallStagesTheRootAndPublishesItOnce).
 		"WriteUserKubeconfig:alice",
 		"UnlockInstall:/Library/k3sm.lock",
-	}
+	})
 	if len(f.calls) != len(want) {
 		t.Fatalf("call sequence = %v, want %v", f.calls, want)
 	}

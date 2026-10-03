@@ -162,7 +162,7 @@ type Paths struct {
 	NetdSocket    string
 	NetdLog       string
 	ServerLog     string
-	// ShadowManifest is the shadow shell set's manifest (pkg/shadow), read by
+	// ShadowManifest is the shadow binary set's manifest (pkg/shadow), read by
 	// the shadow-shells row.
 	ShadowManifest string
 }
