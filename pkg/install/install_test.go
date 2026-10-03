@@ -71,10 +71,12 @@ type fakeSystem struct {
 	calls []string
 	// podReap is the runtime reap store ReadPodReapRecords answers with, and
 	// podLeaders[pgid] the live leader start of each group (absent: no leader).
+	// podMembers[pgid][pid] the live start of each non-leader member, and
 	// podLingering are the groups still alive when the SIGTERM grace ends. The
 	// zero values describe a node with no recorded pods.
 	podReap      []runtimed.PodReapRecord
 	podLeaders   map[int]int64
+	podMembers   map[int]map[int]int64
 	podLingering map[int]bool
 	// handleSeq numbers the directories OpenDirNoFollow hands out, so a test can
 	// assert every read and removal went through the SAME held handle.
@@ -1566,6 +1568,11 @@ func (f *fakeSystem) ReadPodReapRecords(dataRoot string) ([]runtimed.PodReapReco
 
 func (f *fakeSystem) ProcessGroupLeaderStart(pgid int) (int64, bool) {
 	start, ok := f.podLeaders[pgid]
+	return start, ok
+}
+
+func (f *fakeSystem) ProcessGroupMemberStart(pgid, pid int) (int64, bool) {
+	start, ok := f.podMembers[pgid][pid]
 	return start, ok
 }
 

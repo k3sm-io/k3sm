@@ -38,11 +38,20 @@ import (
 //
 // The identity guard is the runtime's own: a group is signalled only while its
 // leader (pid == pgid) is alive with exactly the recorded start time. A pgid the
-// kernel recycled to another process has a different start and is left alone,
-// and a group whose leader is gone is left alone too, because nothing proves it
-// is still the pod's (the runtime's recovery runbook for leaked process groups
-// covers that case). A root kill aimed by a stale record is the failure this
-// guard exists to make unreachable.
+// kernel recycled to another process has a different start and is left alone.
+// A root kill aimed by a stale record is the failure this guard exists to make
+// unreachable.
+//
+// A container runs under a resident shim that leads its group, so the group's
+// leader is the shim and the container is the shim's child in the same group.
+// The record carries the child's identity too (ChildPid, ChildStartUnixNano).
+// When the shim has died and the container has not, the leader is gone but the
+// group is still the pod's, and the child proves it: a group whose leader is
+// gone is signalled only when the recorded child is alive, still a member of
+// that group, with exactly its recorded start time. A child whose start differs
+// or that left the group, and a record with no child identity, prove nothing,
+// so those groups are left alone (the runtime's recovery runbook for leaked
+// process groups covers them).
 
 // podGroupStopGrace is how long the recorded pod groups get to exit after
 // SIGTERM before they are sent SIGKILL: the kubelet's default
@@ -65,13 +74,7 @@ func teardownPodGroups(ctx context.Context, sys System, cfg Config) error {
 			cfg.Logger.Warn("pod process record is not usable; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
 			continue
 		}
-		start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
-		switch {
-		case !alive:
-			cfg.Logger.Info("pod process group leader is gone; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
-			continue
-		case start != rec.StartUnixNano:
-			cfg.Logger.Info("pod process group id now belongs to another process; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
+		if !podGroupIsRecorded(sys, cfg, rec) {
 			continue
 		}
 		cfg.Logger.Info("stopping pod process group (SIGTERM)", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
@@ -104,4 +107,34 @@ func teardownPodGroups(ctx context.Context, sys System, cfg Config) error {
 		}
 	}
 	return err
+}
+
+// podGroupIsRecorded reports whether rec's process group is still provably the
+// recorded pod's: its leader alive with the recorded start, or, when the leader
+// is gone, the recorded child alive in that group with its recorded start. Each
+// refusal is logged.
+func podGroupIsRecorded(sys System, cfg Config, rec runtimed.PodReapRecord) bool {
+	start, alive := sys.ProcessGroupLeaderStart(rec.Pgid)
+	if alive {
+		if start != rec.StartUnixNano {
+			cfg.Logger.Info("pod process group id now belongs to another process; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
+			return false
+		}
+		return true
+	}
+	if rec.ChildPid <= 1 || rec.ChildStartUnixNano == 0 {
+		cfg.Logger.Info("pod process group leader is gone; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid)
+		return false
+	}
+	childStart, childAlive := sys.ProcessGroupMemberStart(rec.Pgid, rec.ChildPid)
+	switch {
+	case !childAlive:
+		cfg.Logger.Info("pod process group leader and container are gone; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid, "pid", rec.ChildPid)
+		return false
+	case childStart != rec.ChildStartUnixNano:
+		cfg.Logger.Info("pod process group leader is gone and its container pid now belongs to another process; not signalled", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid, "pid", rec.ChildPid)
+		return false
+	}
+	cfg.Logger.Info("pod process group leader (its shim) is gone; the container is verified by its own identity", "pod", rec.PodID, "container", rec.Container, "pgid", rec.Pgid, "pid", rec.ChildPid)
+	return true
 }

@@ -2049,6 +2049,23 @@ func (darwinSystem) ProcessGroupLeaderStart(pgid int) (int64, bool) {
 	return 0, false
 }
 
+// ProcessGroupMemberStart reads process group pgid's members (kern.proc.pgrp)
+// and reports the start time of the one whose pid is pid. Reading the group,
+// not the pid alone, is what makes membership part of the answer: a pid that
+// left the group (or was recycled outside it) is not found.
+func (darwinSystem) ProcessGroupMemberStart(pgid, pid int) (int64, bool) {
+	members, ok := supervisor.ProcGroupMembers(pgid)
+	if !ok {
+		return 0, false
+	}
+	for _, m := range members {
+		if m.Pid == pid {
+			return m.StartUnixNano, true
+		}
+	}
+	return 0, false
+}
+
 // SignalProcessGroup sends sig to process group pgid (kill(-pgid)). ESRCH, the
 // group having already exited, is success.
 func (darwinSystem) SignalProcessGroup(pgid int, sig syscall.Signal) error {
