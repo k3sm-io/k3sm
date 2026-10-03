@@ -1,0 +1,17 @@
+# Upstream bootstrap bindings a node identity is authorized through.
+#
+# Every ClusterRoleBinding or RoleBinding on a single-node k3sm server whose subjects
+# include the group system:nodes, a user system:node:<name>, the group
+# system:authenticated or the group system:unauthenticated, and that k3sm does NOT
+# manage (no k3sm.io/managed=true label). The k3sm-managed half is pinned by
+# pkg/rbac/testdata/rbac-graph.golden instead.
+#
+# Captured from a live `k3sm server` (k8s v1.36.x, the pinned control plane) built
+# from the tree before the server's in-process node moved to a system:node identity.
+# The e2e no-new-grant leg fails on any match not listed here. A Kubernetes version
+# bump that changes this set is regenerated only in a reviewed commit that says why.
+#
+# Format: <kind> <namespace or -> <name> <roleRef kind>/<roleRef name>
+ClusterRoleBinding - system:basic-user ClusterRole/system:basic-user
+ClusterRoleBinding - system:discovery ClusterRole/system:discovery
+ClusterRoleBinding - system:public-info-viewer ClusterRole/system:public-info-viewer
