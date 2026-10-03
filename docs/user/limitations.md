@@ -127,6 +127,16 @@ message described above, it is not a failure, and the compile that follows it su
 silenced from inside the Pod. `xcrun`'s documented `xcrun_nocache=1` and `--no-cache` both *refresh*
 the cache entry rather than skip it, so the write happens anyway, and so does the message.
 
+A tool in `/usr/bin` (`python3`, `git`, `clang` and the other developer-tool shims) run with no
+`DEVELOPER_DIR` set prints `xcode-select: error: unable to read data link at
+'/var/db/xcode_select_link'` on stderr, with `Operation not permitted`. The sandbox denies that link
+on purpose. The tool usually still runs, but `xcrun --find …` and other lookups routed through
+`xcrun` fail with exit code 1. Two remedies work: call the Command Line Tools binary by path, for
+example `/Library/Developer/CommandLineTools/usr/bin/python3`, which prints nothing extra, or set
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools` in the container's `env`, which makes the shims
+and `xcrun` work. `DEVELOPER_DIR` only picks which toolchain runs. It changes nothing in the
+sandbox profile: the data link and the `xcrun` cache stay denied.
+
 ### Volume Mounts Resolve for Native Workloads and Host Shells
 
 k3sm pods run at host paths with **no chroot / mount namespace**, so a volume mounted at an
