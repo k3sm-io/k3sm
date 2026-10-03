@@ -43,13 +43,19 @@ import (
 // runtimed's volume materialization, backed by the provider's apiserver client.
 // runtimed never talks to the apiserver — the provider (which holds the client)
 // resolves and supplies the data via this mount.Resolver seam.
+//
+// ConfigMaps and Secrets are read through objects, which in production is the
+// node's podRefManager: one GET by name, for an object a registered pod
+// references, and nothing else. Tokens are minted through cs.
 type kubeResolver struct {
-	cs kubernetes.Interface
+	cs      kubernetes.Interface
+	objects objectReader
 }
 
-// newKubeResolver returns a kubeResolver over cs.
-func newKubeResolver(cs kubernetes.Interface) *kubeResolver {
-	return &kubeResolver{cs: cs}
+// newKubeResolver returns a kubeResolver minting tokens through cs and reading
+// ConfigMaps and Secrets through objects.
+func newKubeResolver(cs kubernetes.Interface, objects objectReader) *kubeResolver {
+	return &kubeResolver{cs: cs, objects: objects}
 }
 
 // Compile-time check that kubeResolver satisfies the runtimed seam.
@@ -57,11 +63,12 @@ var _ mount.Resolver = (*kubeResolver)(nil)
 
 // ConfigMap returns the key→bytes data of a ConfigMap and its immutable flag,
 // mapping an apiserver NotFound to os.ErrNotExist so the materializer can honor
-// an optional source. Inside a projected-volume refresh tick the read is served
+// an optional source. An object no pod on this node references is
+// errNotReferenced, which is never mapped to os.ErrNotExist. Inside a projected-volume refresh tick the read is served
 // from the tick's cache (refreshCache), so pods sharing a ConfigMap cost one GET.
 func (k *kubeResolver) ConfigMap(ctx context.Context, namespace, name string) (mount.SourceData, error) {
 	return cachedSource(ctx, kindConfigMap, namespace, name, func() (mount.SourceData, error) {
-		cm, err := k.cs.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+		cm, err := k.objects.configMap(ctx, namespace, name)
 		if err != nil {
 			return mount.SourceData{}, notFoundAware(err)
 		}
@@ -80,7 +87,7 @@ func (k *kubeResolver) ConfigMap(ctx context.Context, namespace, name string) (m
 // an apiserver NotFound to os.ErrNotExist. Tick-cached like ConfigMap.
 func (k *kubeResolver) Secret(ctx context.Context, namespace, name string) (mount.SourceData, error) {
 	return cachedSource(ctx, kindSecret, namespace, name, func() (mount.SourceData, error) {
-		s, err := k.cs.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+		s, err := k.objects.secret(ctx, namespace, name)
 		if err != nil {
 			return mount.SourceData{}, notFoundAware(err)
 		}
@@ -293,16 +300,17 @@ func notFoundAware(err error) error {
 }
 
 // kubeCredentials resolves private-registry pull credentials from a pod's
-// imagePullSecrets, backed by the apiserver client. The resolved credential is
-// consumed ONLY by runtimed's pull client and never reaches the pod dir (the
-// pull-credential invariant); the proto carries only LocalObjectReference names.
+// imagePullSecrets, read by name through objects (the node's podRefManager in
+// production). The resolved credential is consumed ONLY by runtimed's pull
+// client and never reaches the pod dir (the pull-credential invariant); the
+// proto carries only LocalObjectReference names.
 type kubeCredentials struct {
-	cs kubernetes.Interface
+	objects objectReader
 }
 
-// newKubeCredentials returns a kubeCredentials over cs.
-func newKubeCredentials(cs kubernetes.Interface) *kubeCredentials {
-	return &kubeCredentials{cs: cs}
+// newKubeCredentials returns a kubeCredentials reading Secrets through objects.
+func newKubeCredentials(objects objectReader) *kubeCredentials {
+	return &kubeCredentials{objects: objects}
 }
 
 // Compile-time check that kubeCredentials satisfies the runtimed seam.
@@ -329,13 +337,19 @@ var (
 // PullCredential reads the referenced docker-config Secrets and returns the
 // credential whose registry matches ref's host, or ok=false for an anonymous pull
 // (no secret matched). A missing pull secret is non-fatal (the next is tried).
+// A pull secret no pod on this node references is a hard error, never skipped:
+// skipping it would turn a registration bug into a silent anonymous pull.
 func (k *kubeCredentials) PullCredential(ctx context.Context, namespace string, secrets []*runtimev1.LocalObjectReference, ref string) (*image.RegistryCredential, bool, error) {
 	host := registryHost(ref)
 	for _, s := range secrets {
-		sec, err := k.cs.CoreV1().Secrets(namespace).Get(ctx, s.GetName(), metav1.GetOptions{})
+		sec, err := k.objects.secret(ctx, namespace, s.GetName())
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
+			}
+			if errors.Is(err, errNotReferenced) {
+				return nil, false, fmt.Errorf("%w: secret %s/%s (%w)",
+					ErrPullSecretNotReadable, namespace, s.GetName(), errNotReferenced)
 			}
 			// The apiserver's error is CLASSIFIED, never wrapped: its text can
 			// carry the response body of a request for a Secret, and this error

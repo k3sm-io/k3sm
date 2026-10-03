@@ -143,7 +143,7 @@ func TestUpdatePodDoesNotRematerializeVolumes(t *testing.T) {
 		return true, &authnv1.TokenRequest{Status: authnv1.TokenRequestStatus{Token: "opaque-test-token"}}, nil
 	})
 
-	res := newKubeResolver(cs)
+	res := newTestKubeResolver(cs)
 	f := &updateRecordingRuntime{fakeRuntimeServer: newFakeRuntimeServer()}
 	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, res, nil)
 

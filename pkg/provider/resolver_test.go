@@ -52,7 +52,7 @@ func TestKubeResolverMaterialize(t *testing.T) {
 			Data:       map[string][]byte{"token": []byte("s3cr3t")},
 		},
 	)
-	r := newKubeResolver(cs)
+	r := newTestKubeResolver(cs)
 
 	cm, err := r.ConfigMap(ctx, "prod", "app-config")
 	if err != nil {
@@ -108,7 +108,7 @@ func TestKubeResolverMaterialize(t *testing.T) {
 // os.ErrNotExist so an optional source can be skipped (the materializer/env
 // resolver test this with errors.Is).
 func TestKubeResolverOptionalMissing(t *testing.T) {
-	r := newKubeResolver(fake.NewSimpleClientset())
+	r := newTestKubeResolver(fake.NewSimpleClientset())
 	_, err := r.ConfigMap(context.Background(), "prod", "absent")
 	if !os.IsNotExist(err) {
 		t.Fatalf("missing configMap err = %v, want os.ErrNotExist", err)
@@ -146,7 +146,7 @@ func TestResolvePodBoxEnv(t *testing.T) {
 			},
 		}},
 	}
-	if err := resolvePodBoxEnv(ctx, box, podFacts{nodeName: "node-7", nodeIP: "192.168.1.10", serviceAccount: "api-sa"}, newKubeResolver(cs)); err != nil {
+	if err := resolvePodBoxEnv(ctx, box, podFacts{nodeName: "node-7", nodeIP: "192.168.1.10", serviceAccount: "api-sa"}, newTestKubeResolver(cs)); err != nil {
 		t.Fatalf("resolvePodBoxEnv: %v", err)
 	}
 
@@ -280,7 +280,7 @@ func TestResolvePodBoxEnvRefusesAnUnknownFieldPath(t *testing.T) {
 
 func TestResolvePodBoxEnvOptional(t *testing.T) {
 	ctx := context.Background()
-	r := newKubeResolver(fake.NewSimpleClientset())
+	r := newTestKubeResolver(fake.NewSimpleClientset())
 
 	optBox := &runtimev1.PodBox{
 		Namespace: "prod",
@@ -323,7 +323,7 @@ func TestKubeCredentialsDockerConfig(t *testing.T) {
 		Type:       corev1.SecretTypeDockerConfigJson,
 		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(dockerCfg)},
 	})
-	k := newKubeCredentials(cs)
+	k := newTestKubeCredentials(cs)
 	refs := []*runtimev1.LocalObjectReference{{Name: "regcred"}}
 
 	cred, ok, err := k.PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
@@ -372,7 +372,7 @@ func TestPullCredentialErrorsCarryNoSecretContent(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "regcred"},
 				Data:       map[string][]byte{tt.key: []byte(tt.data)},
 			})
-			_, _, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+			_, _, err := newTestKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
 			if err == nil {
 				t.Fatal("PullCredential = nil, want a malformed-secret error")
 			}
@@ -423,7 +423,7 @@ func TestPullCredentialApiserverReadErrors(t *testing.T) {
 
 	t.Run("a Forbidden read is classified, never quoted", func(t *testing.T) {
 		cs := refuse(apierrors.NewForbidden(secrets, "regcred", errors.New(marker)))
-		_, ok, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+		_, ok, err := newTestKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
 		if err == nil {
 			t.Fatal("PullCredential = nil, want an unreadable-secret error")
 		}
@@ -445,7 +445,7 @@ func TestPullCredentialApiserverReadErrors(t *testing.T) {
 
 	t.Run("a NotFound read is skipped, not failed", func(t *testing.T) {
 		cs := refuse(apierrors.NewNotFound(secrets, "regcred"))
-		cred, ok, err := newKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
+		cred, ok, err := newTestKubeCredentials(cs).PullCredential(ctx, "prod", refs, "registry.example.com/app:latest")
 		if err != nil {
 			t.Fatalf("PullCredential = %v, want nil: a missing imagePullSecret leaves the pull anonymous", err)
 		}
@@ -459,7 +459,7 @@ func TestPullCredentialApiserverReadErrors(t *testing.T) {
 // immutable flag, which the runtime's refresh uses to stop re-reading it.
 func TestKubeResolverReportsImmutable(t *testing.T) {
 	yes := true
-	r := newKubeResolver(fake.NewSimpleClientset(
+	r := newTestKubeResolver(fake.NewSimpleClientset(
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "frozen"}, Immutable: &yes},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "live"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "frozen"}, Immutable: &yes},

@@ -187,6 +187,28 @@ func (v *VKProvider) ContainerLogBackend() (podlogs.Backend, bool) {
 	return s, true
 }
 
+// ObjectSource is the optional capability of a provider (or the Runtime behind
+// one) that reads Secrets and ConfigMaps by name for the pods on its node. The
+// node hands it to the Virtual Kubelet listers through vkadapter.NodeConfig.Objects,
+// so a by-name read through them goes where the provider's own reads go. A
+// nil ObjectGetter means the provider has none, and such a read fails.
+type ObjectSource interface {
+	Objects() vkadapter.ObjectGetter
+}
+
+var (
+	_ ObjectSource = (*VKProvider)(nil)
+	_ ObjectSource = (*runtimedRuntime)(nil)
+)
+
+// Objects returns the backing Runtime's ObjectGetter, or nil when it has none.
+func (v *VKProvider) Objects() vkadapter.ObjectGetter {
+	if s, ok := v.rt.(ObjectSource); ok {
+		return s.Objects()
+	}
+	return nil
+}
+
 // StartLogMaintenance starts container-log rotation and the log garbage
 // collector on the backing Runtime, if it keeps a CRI log tree. A Runtime without
 // one has nothing to rotate and nothing to collect, so this is a no-op rather

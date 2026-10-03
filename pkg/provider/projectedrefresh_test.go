@@ -387,7 +387,7 @@ func TestProjectedRefreshLoopCallsRuntimeAndReportsFailures(t *testing.T) {
 			defer mu.Unlock()
 			return gets[name]
 		}
-		x := newRefreshFixture(t, newKubeResolver(cs))
+		x := newRefreshFixture(t, newTestKubeResolver(cs))
 		for _, n := range []string{"a", "b", "c"} {
 			x.track(runtimedPod("default", n))
 		}
@@ -410,7 +410,7 @@ func TestProjectedRefreshLoopCallsRuntimeAndReportsFailures(t *testing.T) {
 		}
 
 		// Outside a tick every read is live.
-		res := newKubeResolver(cs)
+		res := newTestKubeResolver(cs)
 		for range 2 {
 			if _, err := res.ConfigMap(context.Background(), "default", "shared"); err != nil {
 				t.Fatal(err)
