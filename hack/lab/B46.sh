@@ -206,7 +206,9 @@ cleanup() {
 	for p in $FILL_PODS; do
 		kc delete pod -n "${p%%/*}" "${p##*/}" --grace-period=0 --force --wait=false >/dev/null 2>&1
 	done
-	if [ -n "$SSH_DEST" ] && [ "$rc" != 3 ]; then
+	# An early refusal exits before bash has read the leg helpers below, so only
+	# call them once they exist (nothing was armed or filled before that point).
+	if [ -n "$SSH_DEST" ] && [ "$rc" != 3 ] && declare -F kill_fill >/dev/null; then
 		disarm_deadman 1
 		disarm_deadman 2
 		kill_fill ""
