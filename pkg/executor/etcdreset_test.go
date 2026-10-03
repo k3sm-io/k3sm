@@ -39,7 +39,7 @@ import (
 func resetTestConfig(t *testing.T, wd string) Config {
 	t.Helper()
 	return Config{WorkDir: wd, KinePort: freePort(t), Logger: slog.New(slog.DiscardHandler),
-		Etcd: &EtcdConfig{Role: EtcdInit, Name: "studio", PeerIP: testPeerIP}}
+		Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}}
 }
 
 // resetSeams are fakes for a reset: the member answers from fake, the clock is fake,
@@ -162,11 +162,11 @@ func TestClusterResetArgsAndPostcondition(t *testing.T) {
 		leader  uint64
 	}{
 		{"a second member survived", []etcdMember{
-			{ID: testOwnID, Name: "studio", PeerURLs: []string{testOwnPeer}},
-			{ID: 0xdef, Name: "laptop", PeerURLs: []string{"https://192.168.0.11:2380"}},
+			{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
+			{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.168.0.11:2380"}},
 		}, testOwnID},
-		{"own peer URL is wrong", []etcdMember{{ID: testOwnID, Name: "studio", PeerURLs: []string{"https://192.168.0.99:2380"}}}, testOwnID},
-		{"no leader", []etcdMember{{ID: testOwnID, Name: "studio", PeerURLs: []string{testOwnPeer}}}, 0},
+		{"own peer URL is wrong", []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{"https://192.168.0.99:2380"}}}, testOwnID},
+		{"no leader", []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}}}, 0},
 	} {
 		t.Run("fails when "+tc.name, func(t *testing.T) {
 			wd := t.TempDir()

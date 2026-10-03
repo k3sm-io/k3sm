@@ -37,9 +37,9 @@ func etcdTestConfig(role EtcdRole, peerIP string) Config {
 		BindAddress: "198.51.100.10",
 		Etcd: &EtcdConfig{
 			Role:           role,
-			Name:           "studio",
+			Name:           "server-a",
 			PeerIP:         peerIP,
-			InitialCluster: "laptop=https://192.168.0.11:2380,studio=https://192.0.2.10:2380",
+			InitialCluster: "server-b=https://192.168.0.11:2380,server-a=https://192.0.2.10:2380",
 		},
 	}.withDefaults()
 }
@@ -72,13 +72,13 @@ func TestEtcdChildArgs(t *testing.T) {
 		wantState    string // "" = no initial-cluster flags at all
 		wantInitial  string
 	}{
-		{name: "init first boot forms a cluster of itself", role: EtcdInit, wantState: "new", wantInitial: "studio=https://192.0.2.10:2380"},
+		{name: "init first boot forms a cluster of itself", role: EtcdInit, wantState: "new", wantInitial: "server-a=https://192.0.2.10:2380"},
 		{name: "join first boot starts existing with the route's set", role: EtcdJoin, wantState: "existing",
-			wantInitial: "laptop=https://192.168.0.11:2380,studio=https://192.0.2.10:2380"},
+			wantInitial: "server-b=https://192.168.0.11:2380,server-a=https://192.0.2.10:2380"},
 		{name: "init restart renders no initial-cluster flag", role: EtcdInit, memberExists: true},
 		{name: "join restart renders no initial-cluster flag", role: EtcdJoin, memberExists: true},
 		{name: "reset forces a new cluster from the existing member", role: EtcdInit, memberExists: true, reset: true},
-		{name: "test-only timings are rendered when set", role: EtcdInit, heartbeat: true, wantState: "new", wantInitial: "studio=https://192.0.2.10:2380"},
+		{name: "test-only timings are rendered when set", role: EtcdInit, heartbeat: true, wantState: "new", wantInitial: "server-a=https://192.0.2.10:2380"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,7 +93,7 @@ func TestEtcdChildArgs(t *testing.T) {
 			p := certs.EtcdCertPaths("/wd")
 
 			// Identity and data dir.
-			if got := flagValue(args, "--name"); got != "studio" {
+			if got := flagValue(args, "--name"); got != "server-a" {
 				t.Errorf("--name = %q", got)
 			}
 			if got := flagValue(args, "--data-dir"); got != "/wd/etcd" {

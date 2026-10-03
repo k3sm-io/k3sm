@@ -167,7 +167,7 @@ const (
 func healthyFake() *fakeEtcd {
 	return &fakeEtcd{
 		status:  etcdMemberStatus{MemberID: testOwnID, Leader: testOwnID, DBSize: 4 << 20, DBSizeQuota: 2 << 30},
-		members: []etcdMember{{ID: testOwnID, Name: "studio", PeerURLs: []string{testOwnPeer}}},
+		members: []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}}},
 	}
 }
 
@@ -181,8 +181,8 @@ func etcdTestSupervised(t *testing.T, role EtcdRole, fake *fakeEtcd, clk *fakeCl
 	s := NewSupervised(Config{
 		WorkDir:  wd,
 		KinePort: freePort(t),
-		Etcd: &EtcdConfig{Role: role, Name: "studio", PeerIP: testPeerIP,
-			InitialCluster: "laptop=https://192.168.0.11:2380,studio=" + testOwnPeer},
+		Etcd: &EtcdConfig{Role: role, Name: "server-a", PeerIP: testPeerIP,
+			InitialCluster: "server-b=https://192.168.0.11:2380,server-a=" + testOwnPeer},
 		Logger:          slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		OnComponentExit: sink.record,
 	})
@@ -247,8 +247,8 @@ func TestEtcdQuorumWaitNeverTripsBreaker(t *testing.T) {
 		fake := &fakeEtcd{
 			status: etcdMemberStatus{MemberID: testOwnID}, // no leader
 			members: []etcdMember{
-				{ID: testOwnID, Name: "studio", PeerURLs: []string{testOwnPeer}},
-				{ID: 0xdef, Name: "laptop", PeerURLs: []string{"https://192.168.0.11:2380"}},
+				{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
+				{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.168.0.11:2380"}},
 			},
 		}
 		clk := newFakeClock(3 * CrashLoopWindow)
@@ -456,8 +456,8 @@ func TestEtcdDefragLocalOnlyNonFatal(t *testing.T) {
 func TestEtcdPeerURLDriftReported(t *testing.T) {
 	fake := healthyFake()
 	fake.members = []etcdMember{
-		{ID: testOwnID, Name: "studio", PeerURLs: []string{"https://192.168.0.99:2380"}},
-		{ID: 0xdef, Name: "laptop", PeerURLs: []string{"https://192.168.0.11:2380"}},
+		{ID: testOwnID, Name: "server-a", PeerURLs: []string{"https://192.168.0.99:2380"}},
+		{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.168.0.11:2380"}},
 	}
 	s, logs, sink := etcdTestSupervised(t, EtcdInit, fake, newFakeClock(time.Hour))
 	st := s.afterEtcdQuorum(t.Context(), fake)
@@ -482,7 +482,7 @@ func TestEtcdPeerURLDriftReported(t *testing.T) {
 		t.Error("drift must never be reported as a crash")
 	}
 
-	fake.members = []etcdMember{{ID: testOwnID, Name: "studio", PeerURLs: []string{testOwnPeer}}}
+	fake.members = []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}}}
 	if st := s.afterEtcdQuorum(t.Context(), fake); st.PeerURLDrift {
 		t.Errorf("a matching peer URL reported drift: %+v", st)
 	}
@@ -498,7 +498,7 @@ func TestClusterInitRefusesExistingSQLiteState(t *testing.T) {
 	if err := os.WriteFile(StateDBPath(wd), []byte("SQLite format 3\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdInit, Name: "studio", PeerIP: testPeerIP}}
+	cfg := Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}}
 	err := NewSupervised(cfg).provision(t.Context())
 	if !errors.Is(err, ErrClusterInitOverSQLite) {
 		t.Fatalf("provision = %v, want ErrClusterInitOverSQLite", err)
@@ -639,7 +639,7 @@ func TestSingleNodeNeverStagesEtcd(t *testing.T) {
 			wd := t.TempDir()
 			presetSAKeys(t, wd)
 			s := NewSupervised(Config{WorkDir: wd, PayloadBinDir: stageTestPayload(t, tc.payloadEtcd), Token: "tok",
-				Etcd: &EtcdConfig{Role: EtcdInit, Name: "studio", PeerIP: testPeerIP}})
+				Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
 			if err := s.provision(t.Context()); err != nil {
 				t.Fatalf("provision = %v", err)
 			}
@@ -681,7 +681,7 @@ func assertEtcdPKI(t *testing.T, wd string) {
 // with none imported, provisioning its leaves fails by name.
 func TestJoiningMemberNeedsImportedEtcdCAs(t *testing.T) {
 	wd := t.TempDir()
-	cfg := Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdJoin, Name: "laptop", PeerIP: testPeerIP}}
+	cfg := Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdJoin, Name: "server-b", PeerIP: testPeerIP}}
 	if err := provisionEtcdCerts(cfg); !errors.Is(err, ErrEtcdCAsMissing) {
 		t.Fatalf("join without imported CAs = %v, want ErrEtcdCAsMissing", err)
 	}
@@ -707,14 +707,14 @@ func TestEtcdPostureHoldsWorkDirLock(t *testing.T) {
 	supervisedBringUp = func(*Supervised, context.Context) error { return nil }
 
 	wd := t.TempDir()
-	s := NewSupervised(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "studio", PeerIP: testPeerIP}})
+	s := NewSupervised(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
 	if err := s.Start(t.Context()); err != nil {
 		t.Fatalf("Start = %v", err)
 	}
 	if _, err := lockWorkDir(wd); !errors.Is(err, ErrWorkDirLocked) {
 		t.Errorf("lock while the etcd posture runs = %v, want ErrWorkDirLocked", err)
 	}
-	second := NewSupervised(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "studio", PeerIP: testPeerIP}})
+	second := NewSupervised(Config{WorkDir: wd, Token: "tok", Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
 	if err := second.Start(t.Context()); !errors.Is(err, ErrWorkDirLocked) {
 		t.Errorf("a second etcd-posture server on the same work dir: Start = %v, want ErrWorkDirLocked", err)
 	}
