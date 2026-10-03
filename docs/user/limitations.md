@@ -562,6 +562,9 @@ always agree.
   `Evicted` Event, and the `DisruptionTarget` condition. Its containers are killed at once, with no
   `preStop` hook, and exit 137. The Pod object stays until it is deleted, so its controller replaces
   it as it would on a kubelet, and this node never starts it again.
+- **Two differences from the kubelet.** Eviction sends SIGKILL at once, with no SIGTERM grace
+  window (the kubelet gives about 2 s), and the `EvictionThresholdMet` Event is recorded once per
+  pressure episode.
 
 If a Pod fills memory faster than k3sm can react, macOS's own out-of-swap kill takes over. k3sm
 marks every Pod process so that kill picks a Pod before the control plane. The mark has limits:
