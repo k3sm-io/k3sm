@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.67.5
 	github.com/virtual-kubelet/virtual-kubelet v1.14.0
+	go.etcd.io/bbolt v1.4.3
 	go.etcd.io/etcd/api/v3 v3.6.15
 	go.etcd.io/etcd/client/v3 v3.6.15
 	go.uber.org/zap v1.27.1

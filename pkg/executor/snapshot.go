@@ -54,7 +54,8 @@ import (
 //
 // Scope: the single-node kine→SQLite datastore only. On the HA/Postgres posture the state
 // of record is the operator's Postgres, which this command cannot see, let alone restore;
-// it refuses (ErrSnapshotExternalDatastore) and names pg_dump.
+// it refuses (ErrSnapshotExternalDatastore) and names pg_dump. An etcd member is saved by
+// SnapshotEtcd (etcdreset.go), and restore refuses it (ErrEtcdRestoreUnsupported).
 
 // Snapshot failures. Each is a typed sentinel (errors.Is-comparable) so the CLI can turn
 // it into an actionable message and a non-zero exit without string matching.
@@ -249,6 +250,11 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	}
 	if opts.Snapshot == "" {
 		return nil, errors.New("executor: snapshot restore requires a snapshot to restore")
+	}
+	// An etcd member's state is not a state.db; restoring one over it would be
+	// neither its data nor a working cluster.
+	if EtcdMemberExists(opts.WorkDir) {
+		return nil, ErrEtcdRestoreUnsupported
 	}
 	if err := requireLocalDatastore(opts.WorkDir, opts.DatastoreEndpoint); err != nil {
 		return nil, err
