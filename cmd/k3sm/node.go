@@ -884,7 +884,17 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// The closure is idempotent, so this defer and awaitNodeExit's call below
 	// (which is what runs it on the two normal exit paths) cannot double-stop; the
 	// defer is what covers the paths that return before the node is ever ready.
-	stopRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	// The eviction loop acts THROUGH the runtime (it tears pods down), so it is
+	// stopped, and waited for, before the runtime closes, on every exit path:
+	// the ctx path, the run-loop-error path, and the early returns. It is
+	// created here so the closure below can name it; it starts gated and only
+	// runs once the node is Ready (open, below).
+	eviction := newGatedLoop(ctx)
+	closeRuntime := stopEmbeddedRuntime(prov, slog.Default())
+	stopRuntime := func() {
+		eviction.stop(evictionStopTimeout)
+		closeRuntime()
+	}
 	// nodeExited closes once BOTH of this node's loops have returned — the Virtual
 	// Kubelet run loop and the node-status loop, which are what is still writing to
 	// the apiserver when a signal arrives. It is declared HERE, ahead of the
@@ -980,7 +990,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	}
 
 	errc := make(chan error, 1)
-	// Both loops report their return through nodeLoops, which is what closes the
+	// Every loop reports its return through nodeLoops, which is what closes the
 	// nodeExited signal declared above: the exit hook waits on it (bounded) so a
 	// caller's teardown — `k3sm server` stopping its control plane — does not take
 	// the apiserver away while this node is still writing to it.
@@ -992,6 +1002,19 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// life of the node, not only after startup succeeds. Its first UpdateStatus
 	// blocks until VK registers the notify callback, so starting it here is safe.
 	go func() { defer nodeLoops.Done(); _ = nodeStatus.Run(ctx) }()
+	// The node-pressure eviction manager is counted in nodeLoops from here, but
+	// held until the node is Ready (eviction.open, below): only then has Virtual
+	// Kubelet's pod informer synced, so the provider's pod set is the cluster's.
+	// Counting it now rather than adding it later keeps the WaitGroup's Add ahead
+	// of every Wait.
+	eviction.start(&nodeLoops, func(ctx context.Context) {
+		runEvictionManager(ctx, prov, provider.EvictionConfig{
+			Status:   nodeStatus,
+			Recorder: recorder,
+			NodeName: opts.nodeName,
+			Log:      slog.Default(),
+		})
+	})
 	loopsDone := make(chan struct{})
 	go func() { nodeLoops.Wait(); close(loopsDone) }()
 	nodeExited = loopsDone
@@ -1005,6 +1028,10 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// earlier would let it read an empty pod set as "every pod is gone" and delete
 	// the whole log tree on every restart.
 	startContainerLogMaintenance(ctx, prov)
+	// The eviction manager starts at the same point and for the same reason as
+	// the log GC: it acts on the provider's pod set, which is not the cluster's
+	// until the node is ready.
+	eviction.open()
 	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir)
 
 	return awaitNodeExit(ctx, errc, stopRuntime)
@@ -1109,6 +1136,21 @@ func runtimeHealthProbe(prov vkadapter.Provider) func(context.Context) bool {
 		return nil
 	}
 	return h.RuntimeHealthy
+}
+
+// evictionManagerRunner is the optional provider capability that runs the
+// node-pressure eviction manager. It is declared at this consumer, like
+// containerLogMaintainer.
+type evictionManagerRunner interface {
+	RunEvictionManager(ctx context.Context, cfg provider.EvictionConfig)
+}
+
+// runEvictionManager runs prov's eviction manager until ctx ends, or returns at
+// once when prov has none (the hostprocess runtime).
+func runEvictionManager(ctx context.Context, prov any, cfg provider.EvictionConfig) {
+	if m, ok := prov.(evictionManagerRunner); ok {
+		m.RunEvictionManager(ctx, cfg)
+	}
 }
 
 // nodeStartupTimeout bounds startNode's wait for the VK node to signal readiness.
@@ -2058,4 +2100,63 @@ func nodeNameFromHostname(hostname string) string {
 		return fallbackNodeName
 	}
 	return name
+}
+
+// evictionStopTimeout bounds how long node teardown waits for the eviction loop
+// to return after cancelling it. An eviction in flight is cut short by the
+// cancelled context; the bound only keeps a wedged runtime call from holding the
+// whole shutdown.
+const evictionStopTimeout = 10 * time.Second
+
+// gatedLoop is a node loop that is counted in the node's WaitGroup from the
+// start, runs only once opened, and can be stopped and waited for
+// independently of the node's context. The eviction manager is one: it must
+// not start before the node is Ready, and it must have stopped before the
+// runtime it acts through is closed.
+type gatedLoop struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	gate     chan struct{}
+	done     chan struct{}
+	openOnce sync.Once
+	started  bool
+}
+
+// newGatedLoop returns a loop whose context is a child of parent.
+func newGatedLoop(parent context.Context) *gatedLoop {
+	ctx, cancel := context.WithCancel(parent)
+	return &gatedLoop{ctx: ctx, cancel: cancel, gate: make(chan struct{}), done: make(chan struct{})}
+}
+
+// start launches the loop's goroutine, counted in wg. run is called with the
+// loop's context once open is called, unless the loop is stopped first.
+func (g *gatedLoop) start(wg *sync.WaitGroup, run func(ctx context.Context)) {
+	g.started = true
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(g.done)
+		select {
+		case <-g.gate:
+			run(g.ctx)
+		case <-g.ctx.Done():
+		}
+	}()
+}
+
+// open lets the loop run. Idempotent.
+func (g *gatedLoop) open() { g.openOnce.Do(func() { close(g.gate) }) }
+
+// stop cancels the loop and waits for it to return, at most timeout. A loop
+// that was never started returns at once.
+func (g *gatedLoop) stop(timeout time.Duration) {
+	g.cancel()
+	if !g.started {
+		return
+	}
+	select {
+	case <-g.done:
+	case <-time.After(timeout):
+		slog.Warn("the eviction loop did not stop before the runtime closed", "timeout", timeout)
+	}
 }

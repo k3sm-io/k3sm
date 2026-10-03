@@ -115,6 +115,21 @@ type fakeRuntimeServer struct {
 	// status, keyed by pod id: the channel runtimed publishes node-owned
 	// verdicts on (k3sm.io/shim-inactive).
 	conditions map[string][]*runtimev1.PodCondition
+
+	// strict, when set, makes every call that names a pod id the fake never
+	// created fail the test (t.Errorf, safe from any goroutine): the "never
+	// touches a pod k3sm did not start" observable of the eviction gate. known is
+	// every pod id CreatePod ever accepted, so a pod deleted since is still known.
+	strict *testing.T
+	known  map[string]bool
+}
+
+// checkKnownLocked fails the test in strict mode when id names no pod the fake
+// ever created. Caller holds f.mu.
+func (f *fakeRuntimeServer) checkKnownLocked(verb, id string) {
+	if f.strict != nil && !f.known[id] {
+		f.strict.Errorf("fake runtime: %s for unknown pod id %q (strict mode)", verb, id)
+	}
 }
 
 // setConditions makes every subsequent status for pod id carry conds.
@@ -179,6 +194,7 @@ func (f *fakeRuntimeServer) stopState() (int, stopRecord) {
 func (f *fakeRuntimeServer) StopContainer(_ context.Context, req *runtimev1.StopContainerRequest) (*runtimev1.StopContainerResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.checkKnownLocked("StopContainer", req.GetPodId())
 	f.stopCalls++
 	f.lastStop = stopRecord{podID: req.GetPodId(), container: req.GetContainer(), grace: req.GetGracePeriodSeconds(), reason: req.GetReason()}
 	if f.stopErr != nil {
@@ -244,6 +260,7 @@ func (f *fakeRuntimeServer) ListPodStats(_ context.Context, req *runtimev1.ListP
 func (f *fakeRuntimeServer) RestartContainer(_ context.Context, req *runtimev1.RestartContainerRequest) (*runtimev1.RestartContainerResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.checkKnownLocked("RestartContainer", req.GetPodId())
 	f.restartCalls++
 	f.lastRestart = restartRecord{podID: req.GetPodId(), container: req.GetContainer(), reason: req.GetReason()}
 	if f.restartErr != nil {
@@ -284,6 +301,10 @@ func (f *fakeRuntimeServer) CreatePod(ctx context.Context, req *runtimev1.Create
 		return resp, nil
 	}
 	f.created[box.GetPodId()] = box
+	if f.known == nil {
+		f.known = map[string]bool{}
+	}
+	f.known[box.GetPodId()] = true
 	return &runtimev1.CreatePodResponse{Status: f.statusLocked(box.GetPodId())}, nil
 }
 
@@ -299,6 +320,7 @@ func (f *fakeRuntimeServer) UpdatePod(_ context.Context, _ *runtimev1.UpdatePodR
 
 func (f *fakeRuntimeServer) DeletePod(_ context.Context, req *runtimev1.DeletePodRequest) (*runtimev1.DeletePodResponse, error) {
 	f.mu.Lock()
+	f.checkKnownLocked("DeletePod", req.GetPodId())
 	f.deleteCalls++
 	f.deleteIDs = append(f.deleteIDs, req.GetPodId())
 	f.lastGrace = req.GetGracePeriodSeconds()

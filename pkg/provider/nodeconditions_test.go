@@ -73,7 +73,7 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 			wantMsg    string
 		}{
 			{"just below 100Mi -> pressure", thr - 1, corev1.ConditionTrue,
-				"KubeletHasInsufficientMemory", "kubelet has insufficient memory available"},
+				"KubeletHasInsufficientMemory", "kubelet has insufficient memory available: memory.available 99Mi"},
 			{"exactly 100Mi -> no pressure (strict <)", thr, corev1.ConditionFalse,
 				"KubeletHasSufficientMemory", "kubelet has sufficient memory available"},
 			{"just above 100Mi -> no pressure", thr + 1, corev1.ConditionFalse,
@@ -186,7 +186,7 @@ func TestComputeNodeConditionsPressure(t *testing.T) {
 		conds := computeNodeConditions(s, now)
 		// Sanity: the others really are True here, so this isn't vacuous.
 		checkCond(t, conds, corev1.NodeMemoryPressure, corev1.ConditionTrue,
-			"KubeletHasInsufficientMemory", "kubelet has insufficient memory available", now)
+			"KubeletHasInsufficientMemory", "kubelet has insufficient memory available: memory.available 0Mi", now)
 		checkCond(t, conds, corev1.NodeNetworkUnavailable, corev1.ConditionFalse,
 			"RouteCreated", "k3sm node network is configured", now)
 	})
