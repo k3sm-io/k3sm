@@ -171,6 +171,22 @@ func ssarAllowed(t *testing.T, cs kubernetes.Interface, ra authzv1.ResourceAttri
 // bring-up has no --client-ca-file, so node-cert auth is not wired) — the caller skips.
 func nodeIdentityClient(t *testing.T) (kubernetes.Interface, bool) {
 	t.Helper()
+	cfg, ok := nodeIdentityConfig(t, "e2e-rbac-fake")
+	if !ok {
+		return nil, false
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Fatalf("build system:node client: %v", err)
+	}
+	return cs, true
+}
+
+// nodeIdentityConfig is nodeIdentityClient's mint for any node name: a client config
+// authenticated as CN=system:node:<nodeName>, O=system:nodes, signed by the signing
+// CA under $K3SM_WORK_DIR. ok is false when no signing CA is on disk.
+func nodeIdentityConfig(t *testing.T, nodeName string) (*rest.Config, bool) {
+	t.Helper()
 	wd := os.Getenv("K3SM_WORK_DIR")
 	if wd == "" {
 		wd = defaultServerWorkDir
@@ -183,7 +199,7 @@ func nodeIdentityClient(t *testing.T) (kubernetes.Interface, bool) {
 		t.Fatalf("load CA hierarchy from %s: %v", wd, err)
 	}
 
-	const nodeName, nodeIP = "e2e-rbac-fake", "127.0.0.1"
+	const nodeIP = "127.0.0.1"
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate node key: %v", err)
@@ -232,11 +248,7 @@ func nodeIdentityClient(t *testing.T) (kubernetes.Interface, bool) {
 	cfg.TLSClientConfig.Insecure = base.TLSClientConfig.Insecure
 	cfg.TLSClientConfig.CertFile, cfg.TLSClientConfig.KeyFile = "", ""
 	cfg.TLSClientConfig.CertData, cfg.TLSClientConfig.KeyData = certPEM, keyPEM
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		t.Fatalf("build system:node client: %v", err)
-	}
-	return cs, true
+	return cfg, true
 }
 
 // tokenClient returns a clientset authenticated with a bearer token (a minted SA
