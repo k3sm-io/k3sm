@@ -149,13 +149,13 @@ func TestConfigureNodeStampsNoForbiddenLabels(t *testing.T) {
 	})
 
 	// The vendored defaults + the stamped result, both read off the SHIPPED wiring
-	// (vkadapter.NewNode → nodeutil.NewNode defaulting → cfg.ConfigureNode), so a
+	// (vkadapter.NewNode's default node spec → cfg.ConfigureNode), so a
 	// library bump changes what this test sees.
 	defaulted, stamped := stampNodeThroughProductionWiring(t, "k3sm-worker")
 
 	t.Run("every label the vendored library defaults is allowed or removed", func(t *testing.T) {
 		if len(defaulted) == 0 {
-			t.Fatal("captured no default labels from nodeutil.NewNode: the capture seam broke, " +
+			t.Fatal("captured no default labels from vkadapter.NewNode: the capture seam broke, " +
 				"so this test would pass vacuously")
 		}
 		for _, key := range sortedKeys(defaulted) {
@@ -163,7 +163,7 @@ func TestConfigureNodeStampsNoForbiddenLabels(t *testing.T) {
 				continue // NodeRestriction permits it; configureNode may keep it
 			}
 			if _, kept := stamped[key]; kept {
-				t.Errorf("nodeutil defaults label %q=%q, NodeRestriction forbids a node from "+
+				t.Errorf("the node defaults label %q=%q, NodeRestriction forbids a node from "+
 					"setting it, and configureNode did NOT remove it: a joined worker's Node "+
 					"create/patch is rejected and the node never registers. Delete the label in "+
 					"configureNode.", key, defaulted[key])
@@ -181,7 +181,7 @@ func TestConfigureNodeStampsNoForbiddenLabels(t *testing.T) {
 	})
 
 	// The multi-tick leg. configureNode itself runs exactly ONCE, at registration
-	// (nodeutil.NewNode calls newProvider once, controller.go:349-355) — but the label
+	// (vkadapter.NewNode calls ConfigureNode once, before it returns) — but the label
 	// map it leaves behind is re-asserted to the apiserver on EVERY status tick:
 	// NodeStatusProvider republishes a DeepCopy of that bootstrap node
 	// (pkg/provider/nodestatus.go:257-268), the VK node controller assigns the

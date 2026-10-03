@@ -1,0 +1,47 @@
+metadata:
+  labels:
+    k3sm.io/stamped: "true"
+    kubernetes.io/hostname: k3sm-golden
+    kubernetes.io/role: agent
+    type: virtual-kubelet
+  name: k3sm-golden
+spec: {}
+status:
+  capacity:
+    pods: "110"
+  conditions:
+  - lastHeartbeatTime: null
+    lastTransitionTime: null
+    status: ""
+    type: Ready
+  - lastHeartbeatTime: null
+    lastTransitionTime: null
+    status: ""
+    type: DiskPressure
+  - lastHeartbeatTime: null
+    lastTransitionTime: null
+    status: ""
+    type: MemoryPressure
+  - lastHeartbeatTime: null
+    lastTransitionTime: null
+    status: ""
+    type: PIDPressure
+  - lastHeartbeatTime: null
+    lastTransitionTime: null
+    status: ""
+    type: NetworkUnavailable
+  daemonEndpoints:
+    kubeletEndpoint:
+      Port: 0
+  nodeInfo:
+    architecture: ""
+    bootID: ""
+    containerRuntimeVersion: ""
+    kernelVersion: ""
+    kubeProxyVersion: ""
+    kubeletVersion: ""
+    machineID: ""
+    operatingSystem: ""
+    osImage: ""
+    systemUUID: ""
+  phase: Pending

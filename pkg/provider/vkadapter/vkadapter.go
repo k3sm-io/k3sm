@@ -26,6 +26,11 @@ limitations under the License.
 // hand VK's own AttachIO/ContainerLogOpts to the VK PodHandler over the kubelet
 // HTTP API; a structurally-identical-but-distinct wrapper type would not satisfy
 // that contract. Confinement here means "one import site", not "decoupled".
+//
+// The one owned type is Node: the adapter assembles the node from VK's node
+// package constructors itself (node.go), because nodeutil's builder starts
+// cluster-wide Secret, ConfigMap and Service informers a node identity is not
+// granted.
 package vkadapter
 
 import (
@@ -48,10 +53,6 @@ type (
 	// Provider is the full Virtual Kubelet provider contract (pod lifecycle, logs,
 	// exec/attach/port-forward, stats/metrics) the VK node drives.
 	Provider = nodeutil.Provider
-	// ProviderConfig holds the listers/Node object VK hands a provider at bootstrap.
-	ProviderConfig = nodeutil.ProviderConfig
-	// Node is a running Virtual Kubelet node (its lifecycle: Run, Ready).
-	Node = nodeutil.Node
 	// PodLifecycleHandler is the create/update/delete/get pod contract.
 	PodLifecycleHandler = vknode.PodLifecycleHandler
 	// PodNotifier is the async pod-status callback registration contract.
@@ -89,10 +90,10 @@ func NotFoundf(format string, args ...any) error { return errdefs.NotFoundf(form
 // reconcile loop uses, so provider code and VK agree on "gone".
 func IsNotFound(err error) bool { return errdefs.IsNotFound(err) }
 
-// NodeConfig is the k3sm-shaped input to NewNode. It captures exactly the wiring
-// the node command previously inlined against nodeutil: the apiserver client, the
+// NodeConfig is the k3sm-shaped input to NewNode: the apiserver client, the
 // provider, the kubelet HTTP API listen/worker settings, an optional serving-TLS
-// config, and a callback that stamps the registering Node object.
+// config, a callback that stamps the registering Node object, and the by-name
+// object reader the node's Secret/ConfigMap listers answer through.
 type NodeConfig struct {
 	// Client is the apiserver client the VK node registers and syncs through.
 	Client kubernetes.Interface
@@ -116,7 +117,7 @@ type NodeConfig struct {
 	// serves the routes is the TLS one.
 	AuthorizeHandler func(http.Handler) http.Handler
 	// ConfigureNode stamps the registering Node object (labels, capacity, taints)
-	// at bring-up. It runs inside VK's provider-bootstrap callback.
+	// at bring-up. NewNode calls it synchronously, before it returns.
 	ConfigureNode func(*corev1.Node)
 	// NodeProvider, when non-nil, builds the node-status/heartbeat provider from the
 	// registering Node object — called AFTER ConfigureNode has stamped it, so the
@@ -145,6 +146,13 @@ type NodeConfig struct {
 	// here overrides a VK route without any ordering rule for a future edit to
 	// get wrong.
 	ExtraRoutes []Route
+	// Objects, when non-nil, answers a by-name Secret or ConfigMap read made
+	// through the listers the node hands Virtual Kubelet. Nothing on k3sm's path
+	// makes one today (VK's only reader is its downward-API resolution, which
+	// the node disables); the seam exists so a future reader gets a by-name
+	// answer instead of a cluster-wide informer. nil makes such a read return
+	// an error.
+	Objects ObjectGetter
 }
 
 // Route is one extra handler registered on the kubelet HTTP API mux.
@@ -155,91 +163,11 @@ type Route struct {
 	Handler http.Handler
 }
 
-// NewNode builds a Virtual Kubelet node from a NodeConfig, encapsulating the
-// nodeutil node-builder dance (NodeConfig options + NewNode + the nil-NodeProvider
-// → NewNaiveNodeProvider auto-Ready+lease-heartbeat path) so callers import no VK.
-//
-// The kubelet HTTP API (logs/exec) only serves when cfg.TLSConfig is non-nil: a
-// mux with the provider routes is then wired behind cfg.AuthorizeHandler and
-// instrumented. Both fields are required together — see validateProviderRouteAuth,
-// which refuses to build a node whose routes would answer to anything that can
-// reach the port.
-func NewNode(nodeName string, cfg NodeConfig) (*Node, error) {
-	// Fast-fail on a nil ConfigureNode: it is invoked inside VK's node-bootstrap
-	// callback (a goroutine during bring-up), so a nil field would panic at startup
-	// rather than surface as this constructor's error.
-	if cfg.ConfigureNode == nil {
-		return nil, errors.New("vkadapter: NodeConfig.ConfigureNode is required")
-	}
-	mux := http.NewServeMux()
-	// providerRoutesEnabled is the SINGLE, security-load-bearing gate: the kubelet
-	// HTTP provider routes (logs/exec/attach/port-forward) are served — mutually
-	// authenticated and instrumented — ONLY when TLS is configured, so exec/attach
-	// never rides plain HTTP. Both wiring branches below MUST consult this predicate
-	// in lockstep so a future edit cannot expose exec on the plain-HTTP path.
-	routes := providerRoutesEnabled(cfg)
-	// And when they ARE served, they are served authenticated: refuse to build the
-	// node at all rather than serve exec to whoever can reach the port.
-	if routes {
-		if err := validateProviderRouteAuth(cfg); err != nil {
-			return nil, err
-		}
-	}
-	nodeOpts := []nodeutil.NodeOpt{
-		func(c *nodeutil.NodeConfig) error {
-			c.Client = cfg.Client
-			c.HTTPListenAddr = cfg.HTTPListenAddr
-			c.NumWorkers = cfg.NumWorkers
-			c.TLSConfig = cfg.TLSConfig // nil = plain HTTP; set = kubelet-serving TLS
-			// k3sm resolves downward-API env in the provider itself (env.go
-			// resolveDownwardEnv), AFTER the pod's /32 is allocated so status.podIP
-			// carries the real IP. the vendored virtual-kubelet's own PopulateEnvironmentVariables (checked unchanged through v1.14.0) runs
-			// BEFORE CreatePod and hard-errors on status.podIP ("unsupported
-			// fieldPath"), stranding such a pod Pending before it ever reaches the
-			// provider — so skip VK's resolution and let the provider own it.
-			c.SkipDownwardAPIResolution = true
-			if routes {
-				c.Handler = api.InstrumentHandler(cfg.AuthorizeHandler(mux))
-			}
-			return nil
-		},
-	}
-	if routes {
-		nodeOpts = append(nodeOpts, nodeutil.AttachProviderRoutes(mux))
-		// Registered directly on the same mux VK's own routes are attached to
-		// (nodeutil applies that opt later, when it builds the node). A pattern
-		// claimed twice is a ServeMux panic either way, never a silent shadow —
-		// which is the right answer, since the patterns are disjoint by design:
-		// VK registers "/" and k3sm registers subtree patterns under it.
-		for _, rt := range cfg.ExtraRoutes {
-			if rt.Pattern == "" || rt.Handler == nil {
-				return nil, fmt.Errorf("vkadapter: NodeConfig.ExtraRoutes entry %q needs both a pattern and a handler", rt.Pattern)
-			}
-			mux.Handle(rt.Pattern, rt.Handler)
-		}
-	}
-
-	return nodeutil.NewNode(nodeName,
-		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, vknode.NodeProvider, error) {
-			cfg.ConfigureNode(pc.Node)
-			if cfg.NodeProvider == nil {
-				return cfg.Provider, nil, nil // nil NodeProvider -> NewNaiveNodeProvider (auto-Ready + lease heartbeat)
-			}
-			np, err := cfg.NodeProvider(pc.Node)
-			if err != nil {
-				return nil, nil, err
-			}
-			return cfg.Provider, np, nil
-		},
-		nodeOpts...,
-	)
-}
-
 // providerRoutesEnabled reports whether NewNode serves the kubelet HTTP provider
 // routes (logs/exec/attach/port-forward). It is TRUE only when TLS is configured,
 // so the interactive exec/attach surface — which reaches the root-owned runtime —
 // is never exposed on the plain-HTTP path. This is the invariant the security
-// regression test pins; keep NewNode's two wiring branches routed through it.
+// regression test pins; keep NewNode's route wiring routed through it.
 func providerRoutesEnabled(cfg NodeConfig) bool { return cfg.TLSConfig != nil }
 
 // validateProviderRouteAuth is the fail-closed structural gate on the kubelet

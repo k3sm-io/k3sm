@@ -931,6 +931,13 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// SYNCHRONOUSLY inside NewNode — so it is set before NewNode returns and the
 	// status loop can be started right after, with no handshake.
 	var nodeStatus *provider.NodeStatusProvider
+	// The by-name Secret/ConfigMap reader behind the node's Virtual Kubelet
+	// listers: the provider's own pod-reference manager when it has one (the
+	// runtimed provider), else none, and such a read then fails loudly.
+	var objects vkadapter.ObjectGetter
+	if s, ok := prov.(provider.ObjectSource); ok {
+		objects = s.Objects()
+	}
 	n, err := vkadapter.NewNode(opts.nodeName, vkadapter.NodeConfig{
 		Client:           cs,
 		Provider:         prov,
@@ -947,6 +954,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 		// pointer intact. Empty when the runtime keeps no CRI log tree (the
 		// hostprocess node), in which case VK's route stands.
 		ExtraRoutes: containerLogRoutes(prov),
+		Objects:     objects,
 		// Replace VK's auto-Ready naive node provider with the real one: it samples
 		// this Mac for memory/disk/PID pressure and debounces the runtime's health
 		// into Ready. It receives the node AFTER configureNode stamped it, and
