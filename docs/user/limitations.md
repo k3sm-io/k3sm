@@ -795,8 +795,12 @@ datastore operational model.
   no pf rule.
 - UDP: datagrams up to 1352 bytes cross the tunnel whole. Larger ones are fragmented and delivered.
   With don't-fragment set, a larger send fails locally with `EMSGSIZE`.
-- One unattributed host kernel panic is on record on macOS 26.6.2 with the mesh active. If it
-  recurs, the audit gate collects the snapshot needed to attribute it.
+- Two unattributed host kernel panics are on record, on two Macs running a node with the mesh
+  active, both in the kernel's network packet-segmentation code. Measurements give no evidence
+  implicating TCP: connections negotiate an MSS of 1340 and the largest tunnel packet seen is
+  1380. UDP above 1352 bytes has not been exercised under load, so as a precaution avoid sustained
+  large-datagram UDP across the mesh. A panic costs a reboot of the host. If it recurs, the audit
+  gate collects the snapshot needed to attribute it.
 
 ## MLX / Apple-GPU Workloads
 
