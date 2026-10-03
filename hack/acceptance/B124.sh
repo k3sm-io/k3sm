@@ -6,11 +6,14 @@
 # driver rejoins it afterwards, this script only asserts.
 #
 # Background. A native pod's processes are session leaders that outlive the
-# node daemon. On start, the daemon lists the pods bound to its node from the
-# apiserver and re-attaches to each running pod whose processes are still
-# alive (same pod IP, same restartCount, one PodReattached Warning Event)
-# instead of killing and recreating it. Uninstall stops every recorded pod
-# process group once the daemons are gone.
+# node daemon. Each container runs under a resident shim that leads its group,
+# holds its output, reaps it for the real exit status and serves exec, so all
+# three survive a daemon restart. On start, the daemon lists the pods bound to
+# its node from the apiserver and re-attaches to each running pod whose
+# processes are still alive (same pod IP, same restartCount, one PodReattached
+# Warning Event) instead of killing and recreating it, reconnecting to each
+# container's shim. Uninstall stops every recorded pod process group once the
+# daemons are gone.
 #
 # Asserts (the m1.sh PASS/FAIL ladder pattern):
 #   1. a logging hello-http pod pinned to this node is Running, its listener
@@ -20,15 +23,18 @@
 #      b. a PodReattached Event is recorded for this pod's uid,
 #      c. its listener is still bound to the same pod IP and answers,
 #      d. its log continues past the restart (a tick later than any logged
-#         before the restart appears);
+#         before the restart appears),
+#      e. `kubectl exec` into the re-attached pod runs a command and returns
+#         its output with exit 0;
 #   3. a second, two-container pod (containers a and b, one hello-http
 #      listener each) is re-attached by the same restart; killing container
 #      a's process restarts that one container in place: within 90 s the pod
 #      UID and pod IP are unchanged, a's restartCount is one higher and b's is
 #      unchanged with the same pid, a's listener is back on the same IP and
 #      port, `kubectl logs --previous -c a` serves a tick logged before the
-#      kill, a's lastState.terminated.reason is ExitStatusUnknown, and no
-#      PodRecreatedAfterReattach Event is recorded;
+#      kill, a's lastState.terminated is the real status of the SIGKILL
+#      (exitCode 137, reason Error), and no PodRecreatedAfterReattach Event is
+#      recorded;
 #   4. deleting the pod ends its process group;
 #   5. `sudo k3sm uninstall` with a pod still running leaves no process of that
 #      pod's group and no fixture process of this run.
@@ -229,6 +235,20 @@ if [ "$continued" = yes ]; then
 else
 	ladder no "b124-2d log continues past the restart (max tick $(max_tick "$POD"), was $TICK0)"
 fi
+# e. Exec into the re-attached pod: its container's shim serves the session.
+EXEC_WANT="b124-exec-$RUN"
+exec_out=""; exec_rc=1
+for _ in $(seq 1 15); do
+	exec_rc=0
+	exec_out="$(kc exec "$POD" -n "$NS" -c c -- /bin/echo "$EXEC_WANT" 2>&1)" || exec_rc=$?
+	[ "$exec_rc" -eq 0 ] && [ "$exec_out" = "$EXEC_WANT" ] && break
+	sleep 2
+done
+if [ "$exec_rc" -eq 0 ] && [ "$exec_out" = "$EXEC_WANT" ]; then
+	ladder ok "b124-2e kubectl exec into the re-attached $POD returns its output, exit 0"
+else
+	ladder no "b124-2e kubectl exec into the re-attached $POD returns its output, exit 0 (exit $exec_rc, output '$exec_out')"
+fi
 
 # 3. Kill container a of the re-attached two-container pod: its restart policy
 #    (Always) restarts that one container in place; b keeps running.
@@ -253,7 +273,7 @@ TICK_A="$(kc logs "$POD_2" -c a -n "$NS" 2>/dev/null | awk '$1=="tick" && $2+0>m
 echo "==> sudo kill -KILL ${PID_A:-?} (container a of $POD_2; restartCount a=${RC0_A:-?} b=${RC0_B:-?}, last tick $TICK_A)"
 [ -n "$PID_A" ] && sudo kill -KILL "$PID_A"
 T_KILL="$(date +%s)"
-same_pod=no; a_bumped=no; b_same=no; back=no; previous=no; unknown=no
+same_pod=no; a_bumped=no; b_same=no; back=no; previous=no; real_exit=no
 while [ $(( $(date +%s) - T_KILL )) -lt 90 ]; do
 	uid_ok=no; ip_ok=no; b_rc_ok=no; b_pid_ok=no
 	[ "$(jp "$POD_2" '{.metadata.uid}')" = "$UID_2" ] && uid_ok=yes
@@ -271,8 +291,11 @@ while [ $(( $(date +%s) - T_KILL )) -lt 90 ]; do
 		&& kc logs "$POD_2" -c a --previous -n "$NS" 2>/dev/null | grep -qx "tick $TICK_A"; then
 		previous=yes
 	fi
-	[ "$(cs "$POD_2" a lastState.terminated.reason)" = ExitStatusUnknown ] && unknown=yes
-	[ "$same_pod$a_bumped$b_same$back$previous$unknown" = yesyesyesyesyesyes ] && break
+	if [ "$(cs "$POD_2" a lastState.terminated.exitCode)" = 137 ] \
+		&& [ "$(cs "$POD_2" a lastState.terminated.reason)" = Error ]; then
+		real_exit=yes
+	fi
+	[ "$same_pod$a_bumped$b_same$back$previous$real_exit" = yesyesyesyesyesyes ] && break
 	sleep 2
 done
 recreates="$(kc get events -n "$NS" --field-selector "involvedObject.name=$POD_2,reason=PodRecreatedAfterReattach" -o jsonpath='{.items[*].type}' 2>/dev/null || true)"
@@ -296,10 +319,10 @@ if [ "$previous" = yes ]; then
 else
 	ladder no "b124-3e kubectl logs --previous -c a serves the pre-kill tick $TICK_A"
 fi
-if [ "$unknown" = yes ]; then
-	ladder ok "b124-3f a's lastState.terminated.reason is ExitStatusUnknown"
+if [ "$real_exit" = yes ]; then
+	ladder ok "b124-3f a's lastState.terminated is the real SIGKILL status (exitCode 137, reason Error)"
 else
-	ladder no "b124-3f a's lastState.terminated.reason is ExitStatusUnknown (got '$(cs "$POD_2" a lastState.terminated.reason)')"
+	ladder no "b124-3f a's lastState.terminated is the real SIGKILL status (got exitCode '$(cs "$POD_2" a lastState.terminated.exitCode)', reason '$(cs "$POD_2" a lastState.terminated.reason)')"
 fi
 if [ -z "$recreates" ]; then
 	ladder ok "b124-3g no PodRecreatedAfterReattach Event for $POD_2"
