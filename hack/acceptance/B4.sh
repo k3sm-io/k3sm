@@ -145,7 +145,9 @@ for w in $K3SM_B4_WORKERS; do
 	for check in "list secrets" "watch configmaps"; do
 		# shellcheck disable=SC2086 # the verb and resource are two words on purpose
 		got="$("$KUBECTL" auth can-i $check --all-namespaces --as="system:node:$w" --as-group=system:nodes 2>/dev/null || true)"
-		if [ "$got" = no ]; then
+		# kubectl appends the authorizer's reason ("no - can only read namespaced
+		# object of this type"); the verdict is the first word.
+		if [ "${got%% *}" = no ]; then
 			ladder ok "b4.L2  can-i $check --all-namespaces as system:node:$w: no"
 		else
 			ladder no "b4.L2  can-i $check --all-namespaces as system:node:$w: ${got:-<no answer>} (want no)"
