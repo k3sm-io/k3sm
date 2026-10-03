@@ -78,20 +78,56 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 		}
 	})
 
-	t.Run("restart: the member exists, no route call", func(t *testing.T) {
+	t.Run("restart: the member exists, no route call, Promote still wired", func(t *testing.T) {
+		var promoted []string
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return true },
 			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
 				t.Fatal("the member route was called on a restart")
 				return bootstrap.EtcdMemberResponse{}, nil
 			},
+			promote: func(_ context.Context, name string) error {
+				promoted = append(promoted, name)
+				return nil
+			},
 		}
 		cfg, err := joinEtcdMember(context.Background(), j, "192.0.2.10", base, logger)
 		if err != nil {
 			t.Fatalf("restart: %v", err)
 		}
-		if cfg.Etcd.InitialCluster != "" || cfg.Etcd.Promote != nil {
-			t.Errorf("a restart starts with join-only settings: %+v", cfg.Etcd)
+		if cfg.Etcd.InitialCluster != "" {
+			t.Errorf("a restart starts with the join-only initial cluster: %+v", cfg.Etcd)
+		}
+		// The executor calls it only if the member still reports itself a learner
+		// (a joiner restarted before its promotion landed).
+		if cfg.Etcd.Promote == nil {
+			t.Fatal("a restart with --server/--token starts with no Promote; a learner stranded by an earlier crash could never be promoted")
+		}
+		if err := cfg.Etcd.Promote(context.Background()); err != nil || !slices.Equal(promoted, []string{"server-b"}) {
+			t.Errorf("Promote = %v, promoted %v; want the promote route called for server-b", err, promoted)
+		}
+		if base.Etcd.Promote != nil {
+			t.Error("the caller's EtcdConfig was mutated")
+		}
+	})
+
+	t.Run("restart without --server or --token: no Promote", func(t *testing.T) {
+		for _, o := range []serverOptions{
+			{serverJoin: true, token: "K10abc::server:secret", workDir: t.TempDir()},
+			{serverJoin: true, joinServer: "192.0.2.10", workDir: t.TempDir()},
+		} {
+			j := newServerEtcdJoin(o)
+			if j.promote != nil {
+				t.Errorf("--server %q, token set %v: a promote route was wired with nothing to call", o.joinServer, o.token != "")
+			}
+			j.memberExists = func() bool { return true }
+			cfg, err := joinEtcdMember(context.Background(), j, o.joinServer, base, logger)
+			if err != nil || cfg.Etcd.Promote != nil {
+				t.Errorf("restart: err=%v Promote set=%v; want nil, nil", err, cfg.Etcd.Promote != nil)
+			}
+		}
+		if j := newServerEtcdJoin(serverOptions{serverJoin: true, joinServer: "192.0.2.10", token: "K10abc::server:secret"}); j.promote == nil {
+			t.Error("--server and --token set: no promote route")
 		}
 	})
 

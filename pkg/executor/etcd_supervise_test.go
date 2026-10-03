@@ -340,8 +340,9 @@ func lastLines(s string, n int) string {
 }
 
 // TestEtcdRestartSkipsMemberAdd: a member that already exists restarts from its data
-// dir — no initial-cluster flag and no promotion — while a joining member's first
-// boot starts `existing` from the route's set and is promoted (retrying until it is).
+// dir — no initial-cluster flag, and no promotion of a member that already votes —
+// while a joining member's first boot starts `existing` from the route's set and, as
+// the learner its member reports, is promoted (retrying until it is).
 func TestEtcdRestartSkipsMemberAdd(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -354,6 +355,7 @@ func TestEtcdRestartSkipsMemberAdd(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := healthyFake()
+			fake.status.IsLearner = !tc.memberExists
 			s, logs, _ := etcdTestSupervised(t, EtcdJoin, fake, newFakeClock(time.Hour))
 			wd := s.cfg.WorkDir
 			var mu sync.Mutex
@@ -400,6 +402,103 @@ func TestEtcdRestartSkipsMemberAdd(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEtcdRestartPromotesStrandedLearner: a joiner restarted after its learner first
+// started but before the promotion landed restarts from its data dir as a LEARNER. The
+// production bring-up asks the member, finds it a learner, and promotes it before the
+// quorum wait — and with no way to promote it (no Promote on this boot) it waits,
+// logging the remedy at ERROR, rather than crashing or carrying on as a learner.
+func TestEtcdRestartPromotesStrandedLearner(t *testing.T) {
+	restartedLearner := func(t *testing.T, clk *fakeClock) (*Supervised, *fakeEtcd, *lockedBuffer, *crashSink) {
+		t.Helper()
+		fake := healthyFake()
+		fake.status.IsLearner = true
+		s, logs, sink := etcdTestSupervised(t, EtcdJoin, fake, clk)
+		if _, err := certs.EnsureHierarchy(s.cfg.WorkDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(etcdMemberDir(s.cfg.WorkDir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeEtcdChild(t, s.cfg.WorkDir, argvChild)
+		return s, fake, logs, sink
+	}
+
+	t.Run("a Promote on this boot: promoted, then the quorum wait", func(t *testing.T) {
+		s, fake, logs, _ := restartedLearner(t, newFakeClock(time.Hour))
+		var mu sync.Mutex
+		promotes := 0
+		s.cfg.Etcd.Promote = func(context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			promotes++
+			if promotes == 1 {
+				return errors.New("learner not caught up")
+			}
+			fake.mu.Lock()
+			fake.status.IsLearner = false
+			fake.mu.Unlock()
+			return nil
+		}
+		if err := s.bringUpEtcdMember(t.Context()); err != nil {
+			t.Fatalf("bringUpEtcdMember = %v\nlogs:\n%s", err, logs.String())
+		}
+		mu.Lock()
+		got := promotes
+		mu.Unlock()
+		if got != 2 {
+			t.Errorf("Promote called %d times, want 2 (one refusal, one success)", got)
+		}
+		out := logs.String()
+		promoted := strings.Index(out, "etcd learner promoted to a voting member")
+		quorum := strings.Index(out, "etcd quorum reached")
+		if promoted < 0 || quorum < 0 || promoted > quorum {
+			t.Errorf("want the promotion logged, then quorum; promoted at %d, quorum at %d\nlogs:\n%s", promoted, quorum, out)
+		}
+		args := strings.Split(strings.TrimSpace(string(waitFile(t, filepath.Join(binDir(s.cfg.WorkDir), etcdComponent+".argv")))), "\n")
+		if slices.Contains(args, "--initial-cluster") {
+			t.Errorf("a restart passed --initial-cluster: %v", args)
+		}
+	})
+
+	t.Run("no Promote on this boot: waits with the remedy at ERROR, never a crash", func(t *testing.T) {
+		clk := newFakeClock(5 * time.Minute)
+		s, _, logs, sink := restartedLearner(t, clk)
+		s.cfg.Etcd.Promote = nil
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- s.bringUpEtcdMember(ctx) }()
+		select {
+		case <-clk.reached:
+		case err := <-done:
+			t.Fatalf("bring-up ended with %v; a stranded learner must wait\nlogs:\n%s", err, logs.String())
+		case <-time.After(30 * time.Second):
+			t.Fatal("the fake clock never reached five minutes")
+		}
+		out := logs.String()
+		errLines := 0
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, "level=ERROR") && strings.Contains(l, "cannot ask for its promotion") &&
+				strings.Contains(l, "--server") && strings.Contains(l, "wipe this server's etcd data dir") {
+				errLines++
+			}
+		}
+		if errLines < 5 || errLines > 6 {
+			t.Errorf("logged the stranded-learner remedy at ERROR %d times over five minutes, want one per %s\nlogs:\n%s",
+				errLines, etcdStrandedLogEvery, lastLines(out, 5))
+		}
+		if strings.Contains(out, "etcd quorum reached") {
+			t.Error("a learner that was never promoted reached the quorum step")
+		}
+		if rec := sink.snapshot(); len(rec.Crashes) != 0 {
+			t.Errorf("crash record = %+v, want empty: an unpromoted learner is a wait", rec)
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("after cancel bring-up returned %v, want context.Canceled", err)
+		}
+	})
 }
 
 // TestShutdownOrderEtcdLast: the etcd member stops after the apiserver and the

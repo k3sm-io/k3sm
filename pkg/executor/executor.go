@@ -256,11 +256,13 @@ type EtcdConfig struct {
 	InitialCluster string
 	// Reset starts the member with --force-new-cluster. Only ClusterReset sets it.
 	Reset bool
-	// Promote, for an EtcdJoin member's first boot, asks an existing server to
-	// promote this learner to a voting member (a learner cannot serve that RPC
-	// itself). It is called after the learner's etcd is spawned and its client port
-	// accepts, and retried every etcdPromoteInterval with no expiry until it returns
-	// nil: a failure is logged and is never a crash. Nil skips promotion.
+	// Promote, for an EtcdJoin member, asks an existing server to promote this
+	// learner to a voting member (a learner cannot serve that RPC itself). On every
+	// boot of a joining member, first or restart, the executor asks its own member
+	// whether it is still a learner once the client port accepts; if it is, Promote is
+	// retried every etcdPromoteInterval with no expiry until it returns nil (a failure
+	// is logged and is never a crash). A learner with a nil Promote cannot leave that
+	// state on its own: bring-up logs the remedy at ERROR and keeps waiting.
 	Promote func(ctx context.Context) error
 }
 
@@ -459,7 +461,8 @@ func etcdMemberDir(workDir string) string { return filepath.Join(EtcdDataDir(wor
 
 // EtcdMemberExists reports whether workDir holds an initialized etcd member
 // (<workDir>/etcd/member is a directory). It is the restart predicate: a member that
-// exists starts from its own data dir and is never re-added or re-promoted.
+// exists starts from its own data dir and is never re-added (a joiner that is still
+// a learner is promoted on restart; see EtcdConfig.Promote).
 func EtcdMemberExists(workDir string) bool {
 	fi, err := os.Stat(etcdMemberDir(workDir))
 	return err == nil && fi.IsDir()

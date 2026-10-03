@@ -36,7 +36,9 @@ import (
 // which also writes the etcd CAs), then — on a first boot only — the member route on
 // the existing server, which adds it as an etcd LEARNER and answers with the
 // --initial-cluster set its member must start with. The executor then starts the
-// member `existing` and promotes it through the same existing server. Both calls ride
+// member `existing` and promotes it through the same existing server — on EVERY boot
+// whose member still reports itself a learner, so a joiner restarted before its
+// promotion landed is promoted on the restart instead of stranded. Both calls ride
 // the underlay: the existing server's bootstrap listener serves every interface, and
 // the mesh is not on this path at all (it comes up afterwards, through this server's
 // own apiserver, exactly as on any server).
@@ -63,7 +65,10 @@ type serverEtcdJoin struct {
 	// it starts from its own data dir and is never re-added.
 	memberExists func() bool
 	member       memberRoute
-	promote      promoteRoute
+	// promote is nil when this boot has no existing server to ask (no --server or
+	// no --token), which only a restart can survive: the executor then logs the
+	// stranded-learner remedy if its member is still a learner.
+	promote promoteRoute
 }
 
 // newServerEtcdJoin wires the member and promote routes against the existing
@@ -75,31 +80,37 @@ func newServerEtcdJoin(opts serverOptions) *serverEtcdJoin {
 	}
 	base := "https://" + net.JoinHostPort(opts.joinServer, strconv.Itoa(bootstrapPort))
 	token := opts.token
-	return &serverEtcdJoin{
+	j := &serverEtcdJoin{
 		memberExists: func() bool { return executor.EtcdMemberExists(opts.workDir) },
 		member: func(ctx context.Context, name, peerURL string) (bootstrap.EtcdMemberResponse, error) {
 			return bootstrap.RequestEtcdMember(ctx, base, token, name, peerURL, nil)
 		},
-		promote: func(ctx context.Context, name string) error {
-			return bootstrap.PromoteEtcdMember(ctx, base, token, name, nil)
-		},
 	}
+	if opts.joinServer != "" && token != "" {
+		j.promote = func(ctx context.Context, name string) error {
+			return bootstrap.PromoteEtcdMember(ctx, base, token, name, nil)
+		}
+	}
+	return j
 }
 
 // joinEtcdMember returns the Config the executor starts with. On a joining server's
 // FIRST boot it first asks the existing server to add this member as a learner, and
-// the returned Config carries the route's --initial-cluster set and a Promote that
-// asks the same server to promote it. A restart (the member dir exists) skips the
-// route entirely. j nil is every other server, whose Config is returned unchanged.
-// The caller's EtcdConfig is never mutated.
+// the returned Config carries the route's --initial-cluster set. On EVERY boot that
+// can reach an existing server it carries a Promote that asks that server to promote
+// this member: the executor calls it only while its member reports itself a learner,
+// which on a restart is the joiner that died between its learner's first start and
+// the promotion. A restart (the member dir exists) skips the member route entirely.
+// j nil is every other server, whose Config is returned unchanged. The caller's
+// EtcdConfig is never mutated.
 func joinEtcdMember(ctx context.Context, j *serverEtcdJoin, joinServer string, cfg executor.Config, logger *slog.Logger) (executor.Config, error) {
 	if j == nil || cfg.Etcd == nil {
 		return cfg, nil
 	}
 	if j.memberExists() {
 		logger.Info("HA server-join: this server's etcd member already exists; starting it from its data dir with no member add",
-			"member", cfg.Etcd.Name)
-		return cfg, nil
+			"member", cfg.Etcd.Name, "can-promote", j.promote != nil)
+		return withPromote(cfg, j.promote), nil
 	}
 	if joinServer == "" {
 		return cfg, fmt.Errorf("%w: the first start of a --server-join member needs --server (the existing server's address) to add it to the cluster", errEtcdMemberRoute)
@@ -119,10 +130,22 @@ func joinEtcdMember(ctx context.Context, j *serverEtcdJoin, joinServer string, c
 		"member-id", strconv.FormatUint(resp.MemberID, 16), "initial-cluster", resp.InitialCluster)
 	etcd := *cfg.Etcd
 	etcd.InitialCluster = resp.InitialCluster
-	promote := j.promote
+	cfg.Etcd = &etcd
+	return withPromote(cfg, j.promote), nil
+}
+
+// withPromote returns cfg with its EtcdConfig copied and Promote bound to promote for
+// this member's name; a nil promote leaves Promote nil. cfg's own EtcdConfig is never
+// mutated.
+func withPromote(cfg executor.Config, promote promoteRoute) executor.Config {
+	if promote == nil {
+		return cfg
+	}
+	etcd := *cfg.Etcd
+	name := etcd.Name
 	etcd.Promote = func(ctx context.Context) error { return promote(ctx, name) }
 	cfg.Etcd = &etcd
-	return cfg, nil
+	return cfg
 }
 
 // joinerPeerURL renders this member's peer URL, https://<node IP>:<peer port>, in

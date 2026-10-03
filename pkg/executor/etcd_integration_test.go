@@ -408,26 +408,22 @@ func (m *itMember) start(t *testing.T, ctx context.Context) {
 	}
 }
 
-// bringUp is start plus the rest of bringUpEtcdMember's waits: the promote loop on a
-// joining member's first boot, then the no-expiry quorum wait (bounded here by ctx).
+// bringUp is start plus the rest of bringUpEtcdMember's waits, through the SAME
+// function production calls (promoteAndAwaitQuorum): a joining member that reports
+// itself a learner — on its first boot or on any restart — is promoted, then the
+// no-expiry quorum wait runs (bounded here by ctx).
 func (m *itMember) bringUp(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), itBringUp)
 	defer cancel()
-	first := !EtcdMemberExists(m.wd)
 	m.start(t, ctx)
 	admin, err := dialEtcdAdmin(ctx, m.wd, m.clientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = admin.Close() }()
-	if m.cfg.Etcd.Role == EtcdJoin && first && m.cfg.Etcd.Promote != nil {
-		if err := m.s.promoteLearner(ctx, m.c); err != nil {
-			t.Fatalf("promote %s: %v", m.name, err)
-		}
-	}
-	if err := m.s.awaitEtcdQuorum(ctx, admin, m.c); err != nil {
-		t.Fatalf("%s quorum: %v", m.name, err)
+	if err := m.s.promoteAndAwaitQuorum(ctx, admin, m.c); err != nil {
+		t.Fatalf("%s promotion/quorum: %v", m.name, err)
 	}
 }
 
@@ -795,6 +791,54 @@ func TestEtcdThreeMemberLearnerJoinLoopback(t *testing.T) {
 		mustGet(t, one, "/k3sm-it/after-kill", "2")
 		mustGet(t, one, "/k3sm-it/before-kill", "3")
 	}
+}
+
+// TestEtcdRestartPromotesStrandedLearnerLoopback: a joiner whose learner started and
+// was then stopped before any promotion restarts from its data dir as a learner (no
+// member add, no initial cluster), and the production bring-up path promotes it: the
+// cluster ends with two voting members and the restarted member serves the data.
+func TestEtcdRestartPromotesStrandedLearnerLoopback(t *testing.T) {
+	ports, peers := &itPorts{}, itPeers{}
+	a := newITMember(t, "etcd-a", "192.0.2.10", EtcdInit, nil, ports, peers)
+	a.bringUp(t)
+	h := a.hierarchy(t)
+	route := newITRoute(t, a, h, peers)
+	putEventually(t, itClient(t, a.wd, a.clientURL()), "/k3sm-it/before-join", "a")
+
+	b := newITMember(t, "etcd-b", "192.0.2.11", EtcdJoin, h, ports, peers)
+	added := b.requestMember(t, route)
+	startCtx, cancelStart := context.WithTimeout(t.Context(), itBringUp)
+	defer cancelStart()
+	b.start(t, startCtx)
+	aadmin := localAdmin(t, a)
+	awaitMembers(t, aadmin, "a started learner "+b.name, func(ms []EtcdMember) bool {
+		for _, m := range ms {
+			if m.ID == added.MemberID {
+				return m.IsLearner && m.Name == b.name
+			}
+		}
+		return false
+	})
+
+	// The crash window: stopped after its learner started, before any promotion.
+	b.stop(t)
+	if !EtcdMemberExists(b.wd) {
+		t.Fatalf("%s has no member dir after its learner ran; the restart would not be a restart", b.name)
+	}
+	b.cfg.Etcd.Promote = func(ctx context.Context) error {
+		return bootstrap.PromoteEtcdMember(ctx, route.url, route.token, b.name, route.client)
+	}
+	b.bringUp(t)
+
+	ms := awaitMembers(t, aadmin, "two voting members", votingExactly(2))
+	for _, m := range ms {
+		if m.Name == b.name && m.ID != added.MemberID {
+			t.Fatalf("the restart re-added %s as %x instead of promoting %x", b.name, m.ID, added.MemberID)
+		}
+	}
+	bcli := itClient(t, b.wd, b.clientURL())
+	mustGet(t, bcli, "/k3sm-it/before-join", "a")
+	putEventually(t, bcli, "/k3sm-it/after-promote", "b")
 }
 
 // awaitLeader returns the leader the member reports, waiting for one.

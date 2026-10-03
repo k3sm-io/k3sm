@@ -254,7 +254,8 @@ func (s *Supervised) startEtcd(ctx context.Context, memberExists bool, extra fun
 //
 //  1. spawn, and wait (bounded, fail-fast) for the loopback client port to accept;
 //  2. mark the child supervised — from here its death is a CRASH and counts;
-//  3. on a joining member's first boot, run the promote loop (no expiry);
+//  3. on ANY boot of a joining member, ask the member whether it is still a learner
+//     and, if so, run the promote loop (no expiry);
 //  4. wait for quorum (no expiry, outside every bring-up deadline);
 //  5. the post-quorum checks (local defragment, peer-URL drift, even quorum);
 //  6. start the background watcher.
@@ -277,17 +278,121 @@ func (s *Supervised) bringUpEtcdMember(ctx context.Context) error {
 	s.mu.Lock()
 	s.etcdAdmin = admin
 	s.mu.Unlock()
-	if s.cfg.Etcd.Role == EtcdJoin && !memberExists && s.cfg.Etcd.Promote != nil {
-		if err := s.promoteLearner(ctx, etcd); err != nil {
-			return bringUpErr(etcd.name, PhaseBringUp, err)
-		}
-	}
-	if err := s.awaitEtcdQuorum(ctx, admin, etcd); err != nil {
+	if err := s.promoteAndAwaitQuorum(ctx, admin, etcd); err != nil {
 		return bringUpErr(etcd.name, PhaseBringUp, err)
 	}
 	s.afterEtcdQuorum(ctx, admin)
 	s.startEtcdWatcher(ctx, admin)
 	return nil
+}
+
+// promoteAndAwaitQuorum is bring-up steps 3 and 4 for a member whose etcd is spawned,
+// listening and supervised.
+//
+// The learner question is asked of the member itself on every boot of a joining
+// member, not inferred from whether its data dir existed: a joiner restarted after its
+// learner first started but before the promotion landed restarts from its data dir as
+// a LEARNER, and a learner never reaches quorum on its own (its apiserver would point
+// at a member that refuses it, forever). The member's Status answer carries the flag;
+// MemberList cannot be asked, because etcd refuses it on a learner (only Status and
+// serializable Range are served there).
+func (s *Supervised) promoteAndAwaitQuorum(ctx context.Context, m etcdMembers, c *component) error {
+	if s.cfg.Etcd.Role == EtcdJoin {
+		learner, err := s.etcdSelfIsLearner(ctx, m, c)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !learner:
+		case s.cfg.Etcd.Promote != nil:
+			if err := s.promoteLearner(ctx, c); err != nil {
+				return err
+			}
+		default:
+			if err := s.awaitStrandedLearner(ctx, m, c); err != nil {
+				return err
+			}
+		}
+	}
+	return s.awaitEtcdQuorum(ctx, m, c)
+}
+
+// etcdSelfIsLearner asks the local member whether it is a learner, retrying every
+// etcdQuorumPoll with no expiry until it answers (a member that has just opened its
+// client port may still be loading its backend). It ends early only on ctx or the
+// etcd child exiting.
+func (s *Supervised) etcdSelfIsLearner(ctx context.Context, m etcdMembers, c *component) (bool, error) {
+	clk := s.etcd.clock
+	var lastLog time.Time
+	for {
+		cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
+		st, err := m.Status(cctx)
+		cancel()
+		if err == nil {
+			if st.IsLearner {
+				s.cfg.Logger.Info("this etcd member is a learner; it must be promoted before the cluster counts it",
+					"component", etcdComponent, "member", s.cfg.Etcd.Name)
+			}
+			return st.IsLearner, nil
+		}
+		if now := clk.Now(); lastLog.IsZero() || now.Sub(lastLog) >= etcdQuorumLogEvery {
+			lastLog = now
+			s.cfg.Logger.Info("asking the local etcd member whether it is a learner; retrying", "component", etcdComponent,
+				"retry-in", etcdQuorumPoll, "err", err)
+		}
+		if err := s.etcdWaitTick(ctx, c, etcdQuorumPoll, "while asking whether it is a learner"); err != nil {
+			return false, err
+		}
+	}
+}
+
+// EtcdStrandedLearnerRemedy is the fix named when a joining member is still a learner
+// and this boot has no way to ask for its promotion.
+const EtcdStrandedLearnerRemedy = "this server's etcd member is a learner that was never promoted: re-run it with --server <an existing server's address> and --token <the server token> so it can ask that server for the promotion, or wipe this server's etcd data dir (<work-dir>/etcd) and re-join it"
+
+// etcdStrandedLogEvery is how often a learner with no way to be promoted says so.
+const etcdStrandedLogEvery = 60 * time.Second
+
+// awaitStrandedLearner is the wait of a learner whose boot carries no Promote (a
+// restarted joiner started without --server/--token). It is a wait, never a crash:
+// the remedy is logged at ERROR every etcdStrandedLogEvery, and the member is
+// re-asked every etcdQuorumPoll so a promotion made some other way (an operator on an
+// existing server) ends the wait. It ends early only on ctx or the etcd child exiting.
+func (s *Supervised) awaitStrandedLearner(ctx context.Context, m etcdMembers, c *component) error {
+	clk := s.etcd.clock
+	start := clk.Now()
+	var lastLog time.Time
+	for {
+		if now := clk.Now(); lastLog.IsZero() || now.Sub(lastLog) >= etcdStrandedLogEvery {
+			lastLog = now
+			s.cfg.Logger.Error("this etcd member is a learner and this boot cannot ask for its promotion; waiting",
+				"component", etcdComponent, "member", s.cfg.Etcd.Name, "waited", now.Sub(start).Round(time.Second),
+				"remedy", EtcdStrandedLearnerRemedy)
+		}
+		if err := s.etcdWaitTick(ctx, c, etcdQuorumPoll, "while waiting as an unpromoted learner"); err != nil {
+			return err
+		}
+		cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
+		st, err := m.Status(cctx)
+		cancel()
+		if err == nil && !st.IsLearner {
+			s.cfg.Logger.Info("etcd learner was promoted elsewhere; continuing", "component", etcdComponent,
+				"member", s.cfg.Etcd.Name)
+			return nil
+		}
+	}
+}
+
+// etcdWaitTick waits d on the etcd clock, ending early on ctx or the child exiting.
+func (s *Supervised) etcdWaitTick(ctx context.Context, c *component, d time.Duration, during string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.exited:
+		return etcdExitedErr(c, during)
+	case <-s.etcd.clock.After(d):
+		return nil
+	}
 }
 
 // etcdExitedErr is the error a no-expiry wait returns when the member died under it.
