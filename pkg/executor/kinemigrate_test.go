@@ -198,9 +198,9 @@ func TestKineSnapshotWriteOnce(t *testing.T) {
 	}
 }
 
-// TestKineSnapshotSkips pins the three no-op cases. Each matters on its own: a fresh
-// node has nothing to protect, an unchanged pin must not re-copy the database on every
-// boot, and the Postgres posture has no state.db at all.
+// TestKineSnapshotSkips pins the no-op cases. Each matters on its own: a fresh node has
+// nothing to protect, and an unchanged pin must not re-copy the database on every boot.
+// (The etcd posture never reaches the snapshot: provision skips it there.)
 func TestKineSnapshotSkips(t *testing.T) {
 	ctx, log := t.Context(), discardLogger()
 
