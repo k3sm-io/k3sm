@@ -27,8 +27,8 @@ import (
 // client, and refuses to connect without the work dir's etcd client identity.
 func TestLocalEtcdAdminPassesThrough(t *testing.T) {
 	members := []etcdMember{
-		{ID: 1, Name: "a", PeerURLs: []string{"https://192.168.0.50:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}},
-		{ID: 2, PeerURLs: []string{"https://192.168.0.111:2380"}, IsLearner: true},
+		{ID: 1, Name: "a", PeerURLs: []string{"https://192.0.2.10:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}},
+		{ID: 2, PeerURLs: []string{"https://192.0.2.11:2380"}, IsLearner: true},
 	}
 	fake := &fakeEtcd{status: etcdMemberStatus{MemberID: 1, Leader: 1}, members: members}
 	a := &LocalEtcdAdmin{admin: fake}
@@ -43,8 +43,8 @@ func TestLocalEtcdAdminPassesThrough(t *testing.T) {
 		t.Fatalf("MemberList: %v", err)
 	}
 	want := []EtcdMember{
-		{ID: 1, Name: "a", PeerURLs: []string{"https://192.168.0.50:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}},
-		{ID: 2, PeerURLs: []string{"https://192.168.0.111:2380"}, IsLearner: true},
+		{ID: 1, Name: "a", PeerURLs: []string{"https://192.0.2.10:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}},
+		{ID: 2, PeerURLs: []string{"https://192.0.2.11:2380"}, IsLearner: true},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("MemberList = %+v, want %+v", got, want)

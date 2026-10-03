@@ -98,7 +98,7 @@ func TestUninstallRemovesSelfBestEffort(t *testing.T) {
 	})
 
 	t.Run("no usable status record: an error, no dial", func(t *testing.T) {
-		for _, url := range []string{"", "https://192.168.0.111:2379", "http://127.0.0.1:2379"} {
+		for _, url := range []string{"", "https://192.0.2.11:2379", "http://127.0.0.1:2379"} {
 			wd := t.TempDir()
 			if url != "" {
 				writeEtcdStatusRecord(t, wd, url)

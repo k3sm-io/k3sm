@@ -288,7 +288,7 @@ func TestEtcdSnapshotSaveVerifies(t *testing.T) {
 			t.Errorf("no status record: save = %v, want ErrNoEtcdClient", err)
 		}
 		wd := t.TempDir()
-		if err := writeEtcdStatus(wd, EtcdStatus{ClientURL: "https://192.168.0.50:2379"}); err != nil {
+		if err := writeEtcdStatus(wd, EtcdStatus{ClientURL: "https://192.0.2.10:2379"}); err != nil {
 			t.Fatal(err)
 		}
 		if err := snapshotEtcd(t.Context(), wd, filepath.Join(t.TempDir(), "s"), dial); !errors.Is(err, ErrNoEtcdClient) {

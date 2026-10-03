@@ -40,7 +40,7 @@ func TestInstallRefusesCarriedDatastoreEndpoint(t *testing.T) {
 		{"--datastore-endpoint-file", "/var/lib/k3sm/server/datastore-endpoint"},
 		{"--datastore-endpoint-file=/x"},
 		{"-datastore-endpoint-file=/x"},
-		{"--mesh-ip", "100.64.0.1", "--datastore-endpoint"},
+		{"--mesh-ip", "198.51.100.10", "--datastore-endpoint"},
 	}
 	for _, args := range spellings {
 		for _, source := range []string{"plist", "record"} {
@@ -86,9 +86,9 @@ func TestSecretsEncryptionRefusedWithClusterInit(t *testing.T) {
 		{[]string{"-cluster-init"}, true},
 		{[]string{"--cluster-init=true"}, true},
 		{[]string{"--server-join"}, true},
-		{[]string{"--server-join=true", "--server", "192.168.0.50"}, true},
+		{[]string{"--server-join=true", "--server", "192.0.2.10"}, true},
 		{[]string{"--cluster-init=false"}, false},
-		{[]string{"--node-ip", "192.168.0.50"}, false},
+		{[]string{"--node-ip", "192.0.2.10"}, false},
 		{nil, false},
 	} {
 		if got := carriesEtcdPosture(tc.args); got != tc.ha {
@@ -101,7 +101,7 @@ func TestSecretsEncryptionRefusedWithClusterInit(t *testing.T) {
 		cfg := testConfig(t)
 		cfg.SecretsEncryption = true
 		cfg.KeyEntropy = placeholderEntropy()
-		configureServerArgs(f, cfg, "--cluster-init", "--node-ip", "192.168.0.50")
+		configureServerArgs(f, cfg, "--cluster-init", "--node-ip", "192.0.2.10")
 		err := Install(context.Background(), f, cfg)
 		if !errors.Is(err, executor.ErrEncryptionHA) {
 			t.Fatalf("Install = %v, want ErrEncryptionHA", err)
@@ -114,7 +114,7 @@ func TestSecretsEncryptionRefusedWithClusterInit(t *testing.T) {
 	t.Run("the role flags reach the daemon verbatim", func(t *testing.T) {
 		f := &fakeSystem{}
 		cfg := testConfig(t)
-		want := []string{"--cluster-init", "--node-ip", "192.168.0.50", "--mesh-ip", "100.64.0.1"}
+		want := []string{"--cluster-init", "--node-ip", "192.0.2.10", "--mesh-ip", "198.51.100.10"}
 		configureServerArgs(f, cfg, want...)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)

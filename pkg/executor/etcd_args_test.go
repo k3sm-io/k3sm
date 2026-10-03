@@ -34,12 +34,12 @@ func etcdTestConfig(role EtcdRole, peerIP string) Config {
 		WorkDir:     "/wd",
 		KinePort:    32379,
 		NodeIP:      peerIP,
-		BindAddress: "100.64.0.1",
+		BindAddress: "198.51.100.10",
 		Etcd: &EtcdConfig{
 			Role:           role,
 			Name:           "studio",
 			PeerIP:         peerIP,
-			InitialCluster: "laptop=https://192.168.0.11:2380,studio=https://192.168.0.50:2380",
+			InitialCluster: "laptop=https://192.168.0.11:2380,studio=https://192.0.2.10:2380",
 		},
 	}.withDefaults()
 }
@@ -61,7 +61,7 @@ func TestEtcdChildArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 	pin := ca.PinHash()
-	const peerIP = "192.168.0.50"
+	const peerIP = "192.0.2.10"
 
 	cases := []struct {
 		name         string
@@ -72,13 +72,13 @@ func TestEtcdChildArgs(t *testing.T) {
 		wantState    string // "" = no initial-cluster flags at all
 		wantInitial  string
 	}{
-		{name: "init first boot forms a cluster of itself", role: EtcdInit, wantState: "new", wantInitial: "studio=https://192.168.0.50:2380"},
+		{name: "init first boot forms a cluster of itself", role: EtcdInit, wantState: "new", wantInitial: "studio=https://192.0.2.10:2380"},
 		{name: "join first boot starts existing with the route's set", role: EtcdJoin, wantState: "existing",
-			wantInitial: "laptop=https://192.168.0.11:2380,studio=https://192.168.0.50:2380"},
+			wantInitial: "laptop=https://192.168.0.11:2380,studio=https://192.0.2.10:2380"},
 		{name: "init restart renders no initial-cluster flag", role: EtcdInit, memberExists: true},
 		{name: "join restart renders no initial-cluster flag", role: EtcdJoin, memberExists: true},
 		{name: "reset forces a new cluster from the existing member", role: EtcdInit, memberExists: true, reset: true},
-		{name: "test-only timings are rendered when set", role: EtcdInit, heartbeat: true, wantState: "new", wantInitial: "studio=https://192.168.0.50:2380"},
+		{name: "test-only timings are rendered when set", role: EtcdInit, heartbeat: true, wantState: "new", wantInitial: "studio=https://192.0.2.10:2380"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -208,7 +208,7 @@ func TestEtcdChildArgs(t *testing.T) {
 // member over TLS with the etcd client identity; the kine posture's --etcd-servers is
 // the unchanged plaintext loopback URL with no etcd TLS flag.
 func TestApiserverEtcdServersTLS(t *testing.T) {
-	cfg := etcdTestConfig(EtcdInit, "192.168.0.50")
+	cfg := etcdTestConfig(EtcdInit, "192.0.2.10")
 	args := apiServerArgs(cfg)
 	p := certs.EtcdCertPaths(cfg.WorkDir)
 	for flag, want := range map[string]string{
@@ -247,11 +247,11 @@ func TestEtcdNeedsNonLoopbackNodeIP(t *testing.T) {
 			}
 		}
 	}
-	ok := Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}}
+	ok := Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}}
 	if err := ok.Validate(); err != nil {
 		t.Errorf("a LAN peer IP must validate, got %v", err)
 	}
-	if err := (Config{Etcd: &EtcdConfig{Name: "n", PeerIP: "192.168.0.50"}}).Validate(); !errors.Is(err, ErrEtcdRole) {
+	if err := (Config{Etcd: &EtcdConfig{Name: "n", PeerIP: "192.0.2.10"}}).Validate(); !errors.Is(err, ErrEtcdRole) {
 		t.Errorf("a role-less etcd posture: Validate = %v, want ErrEtcdRole", err)
 	}
 }
@@ -262,7 +262,7 @@ func TestEncryptionRefusedWithEtcdRole(t *testing.T) {
 	for _, role := range []EtcdRole{EtcdInit, EtcdJoin} {
 		cfg := Config{
 			EncryptionProviderConfig: "/wd/encryption-config.yaml",
-			Etcd:                     &EtcdConfig{Role: role, Name: "n", PeerIP: "192.168.0.50"},
+			Etcd:                     &EtcdConfig{Role: role, Name: "n", PeerIP: "192.0.2.10"},
 		}
 		if err := cfg.Validate(); !errors.Is(err, ErrEncryptionHA) {
 			t.Errorf("role %v + encryption: Validate = %v, want ErrEncryptionHA", role, err)
@@ -272,7 +272,7 @@ func TestEncryptionRefusedWithEtcdRole(t *testing.T) {
 
 // TestEtcdConfigDefaultsDoNotWriteThrough: withDefaults fills the etcd ports on a copy.
 func TestEtcdConfigDefaultsDoNotWriteThrough(t *testing.T) {
-	e := &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}
+	e := &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}
 	c := Config{Etcd: e}.withDefaults()
 	if c.Etcd.PeerPort != DefaultEtcdPeerPort || c.Etcd.MetricsPort != DefaultEtcdMetricsPort {
 		t.Errorf("defaults = %d/%d, want %d/%d", c.Etcd.PeerPort, c.Etcd.MetricsPort, DefaultEtcdPeerPort, DefaultEtcdMetricsPort)

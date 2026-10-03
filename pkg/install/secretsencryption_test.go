@@ -69,8 +69,8 @@ func TestInstallSecretsEncryption(t *testing.T) {
 	}{
 		{name: "fresh install stages the pair"},
 		{name: "an existing datastore refuses", stateDB: true, wantErr: executor.ErrEncryptionExistingDatastore},
-		{name: "a carried cluster init refuses", args: []string{"--cluster-init", "--node-ip", "192.168.0.50"}, wantErr: executor.ErrEncryptionHA},
-		{name: "a carried server join refuses", args: []string{"--server-join", "--node-ip", "192.168.0.111"}, wantErr: executor.ErrEncryptionHA},
+		{name: "a carried cluster init refuses", args: []string{"--cluster-init", "--node-ip", "192.0.2.10"}, wantErr: executor.ErrEncryptionHA},
+		{name: "a carried server join refuses", args: []string{"--server-join", "--node-ip", "192.0.2.11"}, wantErr: executor.ErrEncryptionHA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

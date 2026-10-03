@@ -70,7 +70,7 @@ func healthyEtcd(now time.Time) executor.EtcdStatus {
 		UpdatedAt: now.Add(-30 * time.Second), ClientURL: "https://127.0.0.1:2379", MemberName: "server-a",
 		Members: 3, Learners: 0, LeaderPresent: true, LeaderID: 1,
 		DBSizeBytes: 20 << 20, QuotaBytes: 2 << 30,
-		ExpectedPeerURL: "https://192.168.0.50:2380", RegisteredPeerURLs: []string{"https://192.168.0.50:2380"},
+		ExpectedPeerURL: "https://192.0.2.10:2380", RegisteredPeerURLs: []string{"https://192.0.2.10:2380"},
 	}
 }
 
@@ -105,7 +105,7 @@ func TestEtcdRowStates(t *testing.T) {
 		{name: "peer URL drift", edit: func(s *executor.EtcdStatus) {
 			s.PeerURLDrift, s.RegisteredPeerURLs = true, []string{"https://192.168.0.49:2380"}
 		}, sev: SeverityWarn, state: StateDrift,
-			detail: []string{"https://192.168.0.49:2380", "https://192.168.0.50:2380"}, remedyIn: []string{"DHCP reservation"}},
+			detail: []string{"https://192.168.0.49:2380", "https://192.0.2.10:2380"}, remedyIn: []string{"DHCP reservation"}},
 		{name: "nearing quota", edit: func(s *executor.EtcdStatus) { s.DBSizeBytes = s.QuotaBytes * 9 / 10 }, sev: SeverityWarn, state: StateUnhealthy,
 			detail: []string{"nearing the backend quota"}, remedyIn: []string{"compact"}},
 		{name: "stale record", edit: func(s *executor.EtcdStatus) { s.UpdatedAt = now.Add(-20 * time.Minute) }, sev: SeverityUnknown, state: StateUnknown,
@@ -152,7 +152,7 @@ func TestEtcdRowCollect(t *testing.T) {
 	p := testPaths(wd)
 	recPath := executor.EtcdStatusPath(wd)
 	rec, _ := json.Marshal(healthyEtcd(now))
-	etcdArgs := []string{"--cluster-init", "--node-ip", "192.168.0.50", "--etcd-metrics-port", "12381"}
+	etcdArgs := []string{"--cluster-init", "--node-ip", "192.0.2.10", "--etcd-metrics-port", "12381"}
 	metrics := readFixture(t, "etcd-metrics.txt")
 
 	newCollector := func(fsys fakeFS, fetch func(context.Context, string) ([]byte, error)) Collector {
@@ -160,7 +160,7 @@ func TestEtcdRowCollect(t *testing.T) {
 	}
 
 	t.Run("not the etcd posture: no row", func(t *testing.T) {
-		if _, ok := newCollector(fakeFS{}, nil).etcdRow(context.Background(), []string{"--mesh-ip", "100.64.0.1"}); ok {
+		if _, ok := newCollector(fakeFS{}, nil).etcdRow(context.Background(), []string{"--mesh-ip", "198.51.100.10"}); ok {
 			t.Error("a kine server got an etcd row")
 		}
 	})

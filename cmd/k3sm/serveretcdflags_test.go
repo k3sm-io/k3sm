@@ -60,9 +60,9 @@ func TestServerEtcdFlagValidation(t *testing.T) {
 		want error // nil = accepted; errAny = any error
 	}{
 		{"single-node on the loopback default", serverOptions{nodeIP: "127.0.0.1"}, nil},
-		{"init on a LAN address", serverOptions{clusterInit: true, nodeIP: "192.168.0.50"}, nil},
-		{"join on a LAN address", serverOptions{serverJoin: true, nodeIP: "192.168.0.111"}, nil},
-		{"init and join together", serverOptions{clusterInit: true, serverJoin: true, nodeIP: "192.168.0.50"}, errAny},
+		{"init on a LAN address", serverOptions{clusterInit: true, nodeIP: "192.0.2.10"}, nil},
+		{"join on a LAN address", serverOptions{serverJoin: true, nodeIP: "192.0.2.11"}, nil},
+		{"init and join together", serverOptions{clusterInit: true, serverJoin: true, nodeIP: "192.0.2.10"}, errAny},
 		{"init on the loopback default", serverOptions{clusterInit: true, nodeIP: "127.0.0.1"}, executor.ErrEtcdNeedsNodeIP},
 		{"join with no node IP", serverOptions{serverJoin: true}, executor.ErrEtcdNeedsNodeIP},
 		{"init on the unspecified address", serverOptions{clusterInit: true, nodeIP: "0.0.0.0"}, executor.ErrEtcdNeedsNodeIP},
@@ -90,7 +90,7 @@ var errAny = errors.New("any error")
 // etcd block — the canonical node name, the --node-ip as the peer address, the two
 // etcd ports — and that neither flag leaves the kine posture (a nil block).
 func TestServerEtcdConfigFromFlags(t *testing.T) {
-	base := serverOptions{nodeName: "studio", nodeIP: "192.168.0.50", etcdPeerPort: 12380, etcdMetricsPort: 12381}
+	base := serverOptions{nodeName: "studio", nodeIP: "192.0.2.10", etcdPeerPort: 12380, etcdMetricsPort: 12381}
 	if cfg := base.executorConfig(nil); cfg.Etcd != nil {
 		t.Fatalf("no role flag: Etcd = %+v, want nil (the kine posture)", cfg.Etcd)
 	}
@@ -111,8 +111,8 @@ func TestServerEtcdConfigFromFlags(t *testing.T) {
 			if e == nil {
 				t.Fatal("Etcd = nil, want the etcd posture")
 			}
-			if e.Role != tc.want || e.Name != "studio" || e.PeerIP != "192.168.0.50" || e.PeerPort != 12380 || e.MetricsPort != 12381 {
-				t.Errorf("Etcd = %+v, want role %v, name studio, peer 192.168.0.50:12380, metrics 12381", e, tc.want)
+			if e.Role != tc.want || e.Name != "studio" || e.PeerIP != "192.0.2.10" || e.PeerPort != 12380 || e.MetricsPort != 12381 {
+				t.Errorf("Etcd = %+v, want role %v, name studio, peer 192.0.2.10:12380, metrics 12381", e, tc.want)
 			}
 		})
 	}
@@ -122,7 +122,7 @@ func TestServerEtcdConfigFromFlags(t *testing.T) {
 // the executor the daemon's own work dir and ports in the etcd posture, returns its
 // refusal unchanged in the chain, and does nothing else.
 func TestServerClusterResetRunsTheResetOnly(t *testing.T) {
-	opts := serverOptions{clusterReset: true, workDir: t.TempDir(), nodeName: "studio", nodeIP: "192.168.0.50", kinePort: 12379, etcdPeerPort: 12380, etcdMetricsPort: 12381}
+	opts := serverOptions{clusterReset: true, workDir: t.TempDir(), nodeName: "studio", nodeIP: "192.0.2.10", kinePort: 12379, etcdPeerPort: 12380, etcdMetricsPort: 12381}
 	var got executor.Config
 	calls := 0
 	clusterResetFunc = func(_ context.Context, cfg executor.Config) error {

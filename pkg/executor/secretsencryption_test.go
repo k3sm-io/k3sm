@@ -475,8 +475,8 @@ func TestValidateRefusesEncryptionWithHA(t *testing.T) {
 		want error
 	}{
 		{name: "single server", cfg: Config{EncryptionProviderConfig: "/x"}},
-		{name: "cluster init", cfg: Config{EncryptionProviderConfig: "/x", Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}}, want: ErrEncryptionHA},
-		{name: "server join", cfg: Config{EncryptionProviderConfig: "/x", Etcd: &EtcdConfig{Role: EtcdJoin, Name: "n", PeerIP: "192.168.0.50"}}, want: ErrEncryptionHA},
+		{name: "cluster init", cfg: Config{EncryptionProviderConfig: "/x", Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}}, want: ErrEncryptionHA},
+		{name: "server join", cfg: Config{EncryptionProviderConfig: "/x", Etcd: &EtcdConfig{Role: EtcdJoin, Name: "n", PeerIP: "192.0.2.10"}}, want: ErrEncryptionHA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

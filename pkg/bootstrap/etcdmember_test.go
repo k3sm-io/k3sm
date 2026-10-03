@@ -99,8 +99,8 @@ func (f *fakeMembers) callLog() []string {
 
 const (
 	memberTestSecret = "high-entropy-server-bootstrap-secret-abc123"
-	serverAPeer      = "https://192.168.0.50:2380"
-	joinerPeer       = "https://192.168.0.111:2380"
+	serverAPeer      = "https://192.0.2.10:2380"
+	joinerPeer       = "https://192.0.2.11:2380"
 )
 
 // serverA is the existing server's member as etcd lists it.
@@ -127,7 +127,7 @@ func newMemberRig(t *testing.T, members *fakeMembers) memberRig {
 		SigningCA:     signingCA,
 		Tokens:        workerTokens,
 		NodePasswords: bootstrap.NewMemoryNodePasswords(),
-		Enroller:      &fakeEnroller{podCIDR: "100.64.1.0/24", meshIP: "100.64.1.1"},
+		Enroller:      &fakeEnroller{podCIDR: "198.51.100.0/24", meshIP: "198.51.100.11"},
 		SelfNodeName:  "server-a",
 		ServerAuth:    bootstrap.NewStaticServerSecret(memberTestSecret),
 		Members:       members,
@@ -201,7 +201,7 @@ func TestEtcdMemberRouteAddsLearner(t *testing.T) {
 	// The peer URL must be canonical https://<non-loopback ip>:<port>; anything else
 	// is refused before the membership is touched.
 	before := len(rig.members.callLog())
-	for _, bad := range []string{"http://192.168.0.111:2380", "https://127.0.0.1:2380", "https://host.local:2380", "https://192.168.0.111", "https://192.168.0.111:2380/x", "https://u:p@192.168.0.111:2380"} {
+	for _, bad := range []string{"http://192.0.2.11:2380", "https://127.0.0.1:2380", "https://host.local:2380", "https://192.0.2.11", "https://192.0.2.11:2380/x", "https://u:p@192.0.2.11:2380"} {
 		r, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-c", PeerURL: bad})
 		if r.StatusCode != http.StatusBadRequest {
 			t.Errorf("peer URL %q: status %d, want 400", bad, r.StatusCode)

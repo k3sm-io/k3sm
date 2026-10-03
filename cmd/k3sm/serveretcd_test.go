@@ -41,7 +41,7 @@ import (
 func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	base := executor.Config{WorkDir: t.TempDir(), Etcd: &executor.EtcdConfig{
-		Role: executor.EtcdJoin, Name: "server-b", PeerIP: "192.168.0.111", PeerPort: 2380}}
+		Role: executor.EtcdJoin, Name: "server-b", PeerIP: "192.0.2.11", PeerPort: 2380}}
 
 	t.Run("first boot: member route, then the executor with its answer", func(t *testing.T) {
 		var order []string
@@ -50,21 +50,21 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 			memberExists: func() bool { return false },
 			member: func(_ context.Context, name, peerURL string) (bootstrap.EtcdMemberResponse, error) {
 				order = append(order, "member "+name+" "+peerURL)
-				return bootstrap.EtcdMemberResponse{MemberID: 0xb, InitialCluster: "server-a=https://192.168.0.50:2380,server-b=https://192.168.0.111:2380"}, nil
+				return bootstrap.EtcdMemberResponse{MemberID: 0xb, InitialCluster: "server-a=https://192.0.2.10:2380,server-b=https://192.0.2.11:2380"}, nil
 			},
 			promote: func(_ context.Context, name string) error {
 				promoted = append(promoted, name)
 				return nil
 			},
 		}
-		started, err := joinEtcdMember(context.Background(), j, "192.168.0.50", base, logger)
+		started, err := joinEtcdMember(context.Background(), j, "192.0.2.10", base, logger)
 		if err != nil {
 			t.Fatalf("joinEtcdMember: %v", err)
 		}
-		if want := []string{"member server-b https://192.168.0.111:2380"}; !slices.Equal(order, want) {
+		if want := []string{"member server-b https://192.0.2.11:2380"}; !slices.Equal(order, want) {
 			t.Fatalf("calls = %v, want %v", order, want)
 		}
-		if started.Etcd.InitialCluster != "server-a=https://192.168.0.50:2380,server-b=https://192.168.0.111:2380" {
+		if started.Etcd.InitialCluster != "server-a=https://192.0.2.10:2380,server-b=https://192.0.2.11:2380" {
 			t.Errorf("the executor started without the route's initial cluster: %q", started.Etcd.InitialCluster)
 		}
 		if started.Etcd.Promote == nil {
@@ -86,7 +86,7 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 				return bootstrap.EtcdMemberResponse{}, nil
 			},
 		}
-		cfg, err := joinEtcdMember(context.Background(), j, "192.168.0.50", base, logger)
+		cfg, err := joinEtcdMember(context.Background(), j, "192.0.2.10", base, logger)
 		if err != nil {
 			t.Fatalf("restart: %v", err)
 		}
@@ -102,7 +102,7 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 				return bootstrap.EtcdMemberResponse{}, errors.New("connection refused")
 			},
 		}
-		for _, server := range []string{"192.168.0.50", ""} {
+		for _, server := range []string{"192.0.2.10", ""} {
 			if _, err := joinEtcdMember(context.Background(), j, server, base, logger); !errors.Is(err, errEtcdMemberRoute) {
 				t.Errorf("--server %q: err = %v, want errEtcdMemberRoute", server, err)
 			}
@@ -135,15 +135,15 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 // member list and learner add reach the bootstrap package's MemberJoiner field for
 // field, and promote/remove pass the ID through.
 func TestLocalMemberJoinerAdapts(t *testing.T) {
-	fake := &fakeLocalMembers{members: []executor.EtcdMember{{ID: 1, Name: "a", PeerURLs: []string{"https://192.168.0.50:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}}}
+	fake := &fakeLocalMembers{members: []executor.EtcdMember{{ID: 1, Name: "a", PeerURLs: []string{"https://192.0.2.10:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}}}
 	var j bootstrap.MemberJoiner = localMemberJoiner{admin: fake}
 	ctx := context.Background()
 
 	got, err := j.MemberList(ctx)
-	if err != nil || !reflect.DeepEqual(got, []bootstrap.EtcdMember{{ID: 1, Name: "a", PeerURLs: []string{"https://192.168.0.50:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}}) {
+	if err != nil || !reflect.DeepEqual(got, []bootstrap.EtcdMember{{ID: 1, Name: "a", PeerURLs: []string{"https://192.0.2.10:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}}) {
 		t.Errorf("MemberList = %+v, %v", got, err)
 	}
-	added, after, err := j.MemberAddAsLearner(ctx, "https://192.168.0.111:2380")
+	added, after, err := j.MemberAddAsLearner(ctx, "https://192.0.2.11:2380")
 	if err != nil || added.ID != 2 || !added.IsLearner || len(after) != 2 {
 		t.Errorf("MemberAddAsLearner = %+v, %d members, %v", added, len(after), err)
 	}

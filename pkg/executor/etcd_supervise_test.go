@@ -158,8 +158,8 @@ func (f *fakeEtcd) Close() error {
 }
 
 const (
-	testPeerIP  = "192.168.0.50"
-	testOwnPeer = "https://192.168.0.50:2380"
+	testPeerIP  = "192.0.2.10"
+	testOwnPeer = "https://192.0.2.10:2380"
 	testOwnID   = 0xabc
 )
 

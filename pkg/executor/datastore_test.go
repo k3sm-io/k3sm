@@ -142,11 +142,11 @@ func TestEtcdRoleMakesIllegalStatesUnrepresentable(t *testing.T) {
 		etcd EtcdConfig
 		want error
 	}{
-		{"missing role", EtcdConfig{Name: "n", PeerIP: "192.168.0.50"}, ErrEtcdRole},
-		{"unknown role", EtcdConfig{Role: EtcdRole(99), Name: "n", PeerIP: "192.168.0.50"}, ErrEtcdRole},
-		{"missing name", EtcdConfig{Role: EtcdJoin, PeerIP: "192.168.0.50"}, ErrEtcdRole},
-		{"init", EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}, nil},
-		{"join", EtcdConfig{Role: EtcdJoin, Name: "n", PeerIP: "192.168.0.50"}, nil},
+		{"missing role", EtcdConfig{Name: "n", PeerIP: "192.0.2.10"}, ErrEtcdRole},
+		{"unknown role", EtcdConfig{Role: EtcdRole(99), Name: "n", PeerIP: "192.0.2.10"}, ErrEtcdRole},
+		{"missing name", EtcdConfig{Role: EtcdJoin, PeerIP: "192.0.2.10"}, ErrEtcdRole},
+		{"init", EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}, nil},
+		{"join", EtcdConfig{Role: EtcdJoin, Name: "n", PeerIP: "192.0.2.10"}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,7 +184,7 @@ func TestLeaderElectHAvsSingleNode(t *testing.T) {
 
 	// The etcd posture is HA in both roles: one active scheduler/KCM across servers.
 	for _, role := range []EtcdRole{EtcdInit, EtcdJoin} {
-		etcd := Config{WorkDir: "/wd", Etcd: &EtcdConfig{Role: role, Name: "n", PeerIP: "192.168.0.50"}}
+		etcd := Config{WorkDir: "/wd", Etcd: &EtcdConfig{Role: role, Name: "n", PeerIP: "192.0.2.10"}}
 		if !etcd.leaderElect() {
 			t.Errorf("etcd posture (%v) leaderElect() must be true", role)
 		}
@@ -198,7 +198,7 @@ func TestLeaderElectHAvsSingleNode(t *testing.T) {
 	if !(Config{LeaderElect: &on}).leaderElect() {
 		t.Error("explicit LeaderElect=true must win")
 	}
-	if (Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.168.0.50"}, LeaderElect: &off}).leaderElect() {
+	if (Config{Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}, LeaderElect: &off}).leaderElect() {
 		t.Error("explicit LeaderElect=false must win even in HA")
 	}
 }
