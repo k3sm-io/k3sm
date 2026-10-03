@@ -1364,11 +1364,21 @@ const WorkerDatastoreDetail = "not this node's: the control plane's datastore li
 // database's journal mode and user_version as this node's datastore, with a
 // remedy pointing at a server log no daemon on this Mac writes. The row is
 // returned BEFORE the path is even built, so nothing opens the stale db.
+//
+// On an embedded etcd HA server the datastore is the etcd member, not a state.db,
+// so an initialized member (executor.EtcdMemberExists) is reported as such rather
+// than as "no state.db yet" — which would read as a server that never came up.
 func (c Collector) datastoreRow(role dataroot.Role) Row {
 	row := Row{Name: RowDatastore}
 	if role == dataroot.RoleAgent {
 		row.State, row.Severity = StateSkip, SeveritySkip
 		row.Detail = WorkerDatastoreDetail
+		return row
+	}
+	if executor.EtcdMemberExists(c.Paths.WorkDir) {
+		row.Wide = map[string]string{"path": executor.EtcdDataDir(c.Paths.WorkDir)}
+		row.State, row.Severity = StateOK, SeverityOK
+		row.Detail = "embedded etcd member (HA); no kine state.db in this posture"
 		return row
 	}
 	path := executor.StateDBPath(c.Paths.WorkDir)

@@ -178,10 +178,9 @@ var tokenFlags = regexp.MustCompile(`(--(?:token|agent-token|server-token|server
 var tokenLiterals = regexp.MustCompile(`(?:k3sm-[A-Za-z0-9._~+/=-]{12,}|K10[0-9a-fA-F]{16,}(?:::\S+)?)`)
 
 // urlCredentials matches the userinfo half of a URL that carries a password:
-// scheme://user:secret@host. It is the shape a datastore DSN has
-// (`--datastore-endpoint postgres://user:password@host/db`), and a server that
-// was started with one echoes it into its own log and carries it on the argv the
-// server-args row reports.
+// scheme://user:secret@host. An operator argument or a component's own error
+// can carry one, and a server echoes its argv into its own log and onto the
+// server-args row.
 //
 // Only the PASSWORD is replaced. The user name and the host stay, because a line
 // that no longer says which endpoint was configured has lost the thing the
