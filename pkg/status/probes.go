@@ -267,13 +267,17 @@ type Collector struct {
 	NodeResolverPresent func() (bool, error)
 	// CDHash reads a binary's code directory hash, for the shadow-shells row's
 	// drift check. OPTIONAL: nil leaves the row out.
-	CDHash     func(path string) (string, error)
-	Paths      Paths
-	EUID       int
-	ServiceUID int
-	Now        func() time.Time
-	Version    version.Info
-	Host       string
+	CDHash func(path string) (string, error)
+	// EtcdMetrics GETs the etcd member's loopback metrics URL, for the etcd row's
+	// WAL fsync p99. OPTIONAL: nil is a plain HTTP GET with a short timeout, and an
+	// error only leaves the p99 unknown.
+	EtcdMetrics func(ctx context.Context, url string) ([]byte, error)
+	Paths       Paths
+	EUID        int
+	ServiceUID  int
+	Now         func() time.Time
+	Version     version.Info
+	Host        string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

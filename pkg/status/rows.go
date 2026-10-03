@@ -124,8 +124,15 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if pre, ok := c.preVolumeRow(); ok {
 		rows = append(rows, pre)
 	}
+	rows = append(rows, c.datastoreRow(role))
+	// The embedded etcd member, on an etcd-posture server only: quorum, alarms,
+	// size against quota and WAL fsync latency, beside the datastore row it details.
+	if role != dataroot.RoleAgent {
+		if r, ok := c.etcdRow(ctx, c.installedServerArgs()); ok {
+			rows = append(rows, r)
+		}
+	}
 	rows = append(rows,
-		c.datastoreRow(role),
 		c.kubeconfigRow(),
 		c.runtimedRow(ctx, role),
 	)
@@ -320,6 +327,23 @@ func (c Collector) serverArgsRow() (Row, bool) {
 	// where a credential would be if one ever reached this row.
 	row.Detail = Redact(strings.Join(args, " "))
 	return row, true
+}
+
+// installedServerArgs returns the operator arguments the installed server plist
+// carries, or nil when there is no plist, no parser, or it cannot be read.
+func (c Collector) installedServerArgs() []string {
+	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
+		return nil
+	}
+	raw, err := c.FS.ReadFile(c.plistPath(c.Paths.ServerLabel))
+	if err != nil {
+		return nil
+	}
+	args, err := c.ServerArgs(raw)
+	if err != nil {
+		return nil
+	}
+	return args
 }
 
 // daemonRow reports one LaunchDaemon. It returns the row and the job's pid (0
