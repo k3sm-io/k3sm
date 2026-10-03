@@ -13,6 +13,10 @@ Three things back it up. **`k3sm snapshot save`** (below) runs on your own sched
 automatic pre-upgrade backup when a release changes the datastore engine. The file-level procedure
 further down is the fallback for a node where the binary will not run.
 
+If the cluster was installed with secrets encryption, back up `/var/lib/k3sm/server/cred` with
+every backup and snapshot: neither contains the key, and without it the Secrets are unreadable. See
+[Secrets Encryption at Rest](install.md#secrets-encryption-at-rest).
+
 ## Taking a Backup with `k3sm snapshot save`
 
 ```sh

@@ -11,7 +11,10 @@ k3sm is a multi-repo Go workspace (`apis`, `runtimed`, `darwin-net`, `k3sm`).
 Each repository documents its own build and test commands in its `CLAUDE.md` and
 `docs/GO-STANDARDS.md`. The commit gate for every repository is its `hack/ci.sh`
 (`gofmt -l`, `go vet`, `go build`, `go test`, plus the per-file license-header
-check). Run it before opening a pull request.
+check, plus `staticcheck -tests=false ./...`). Run it before opening a pull request.
+The staticcheck version is pinned; install it with
+`go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`. The gate fails when
+staticcheck is missing or is any other version.
 
 ## Developer Certificate of Origin (DCO)
 

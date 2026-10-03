@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 
 CGO=1   # k3sm is CGO_ENABLED=1 — it imports runtimed (cgo syscall shims). kine is a child process, not a dependency.
+STATICCHECK_VERSION=2026.2.1   # keep equal to the install pin in docs/GO-STANDARDS.md §Commit gates
 
 echo "==> [k3sm] gofmt"
 fmt=$(gofmt -l .) || true
@@ -50,35 +51,6 @@ if [ -n "$go_pkgs" ]; then
 	# to stop repeating.
 	echo "==> [k3sm] go test -race"; CGO_ENABLED=$CGO go test -race ./...   # e2e/ is //go:build e2e — excluded here
 
-	# staticcheck, scoped to non-test code with -tests=false.
-	#
-	# The scope is deliberate and worth stating, because an unscoped run is not
-	# gateable today: it reports 55 findings, every one in a _test.go file: 50 of
-	# one mechanical deprecation (fake.NewSimpleClientset -> fake.NewClientset),
-	# four unused test helpers in pkg/executor/childreap_test.go (U1000),
-	# plus one known false positive (SA4000 at pkg/provider/probe_test.go,
-	# refuted in docs/audits/audit-findings.md — feed() mutates via m.observe(),
-	# so the two operands are different state transitions). Gating on non-test
-	# code is achievable NOW at zero findings; widening it to tests is a separate
-	# mechanical sweep, and gating on something unachievable is how a gate ends
-	# up permanently bypassed.
-	#
-	# Note for anyone adding a suppression: bare staticcheck honours
-	# `//lint:ignore <Check> <reason>` on the PRECEDING line. It does NOT honour
-	# `//nolint:...`, which is golangci-lint's spelling — this repo carried five
-	# of those and every one suppressed nothing.
-	#
-	# A missing tool is a RED, not a SKIP: a gate that can silently not run and
-	# still print green is the failure class the go-list guard above exists to
-	# stop. The pin is the version the gate was brought to zero findings with.
-	sc=$(command -v staticcheck || true)
-	[ -n "$sc" ] || sc="$(go env GOPATH)/bin/staticcheck"
-	if [ -x "$sc" ]; then
-		echo "==> [k3sm] staticcheck (non-test)"; CGO_ENABLED=$CGO "$sc" -tests=false ./...
-	else
-		echo "==> [k3sm] staticcheck: not installed; the gate needs it (go install honnef.co/go/tools/cmd/staticcheck@2026.2.1)" >&2
-		exit 1
-	fi
 	# The integration tier is NOT run here (it needs darwin + a real socket), but
 	# nothing else in this repo COMPILES the `integration` build tag, so the
 	# B116 privilege-premise canary would rot invisibly. Vet it.
@@ -89,6 +61,61 @@ if [ -n "$go_pkgs" ]; then
 	for tag in integration kinecompat e2e; do
 		echo "==> [k3sm] go vet -tags $tag"; CGO_ENABLED=$CGO go vet -tags "$tag" ./...
 	done
+
+	# staticcheck, scoped to non-test code with -tests=false.
+	#
+	# The scope is deliberate and worth stating, because an unscoped run is not
+	# gateable today: it reports 11 findings, every one in a _test.go file:
+	# three deprecations (tar.Header.Xattrs, go/parser.ParseDir), six unused
+	# test helpers (U1000), one dead store (SA4006), and one known false
+	# positive (SA4000 at pkg/provider/probe_test.go, refuted in
+	# docs/audits/audit-findings.md — feed() mutates via m.observe(), so the two
+	# operands are different state transitions). Gating on non-test code is
+	# achievable NOW at zero findings; widening it to tests is a separate
+	# mechanical sweep, and gating on something unachievable is how a gate ends
+	# up permanently bypassed.
+	#
+	# Note for anyone adding a suppression: bare staticcheck honours exactly one
+	# syntax, `//lint:ignore <Check> <reason>` on the PRECEDING line, reason
+	# required. It does NOT honour `//nolint:...`, which is golangci-lint's
+	# spelling and suppresses nothing here.
+	#
+	# The version is pinned EXACTLY (STATICCHECK_VERSION, top of file): a
+	# different staticcheck reports different findings, so an unpinned stage's
+	# verdict would depend on whichever binary the host happens to have. Each
+	# candidate (PATH first, then $(go env GOPATH)/bin) is probed and the first
+	# reporting exactly the pin is used, so a stale copy on PATH cannot shadow a
+	# correct one. Bump the pin together with the Go toolchain (an older
+	# staticcheck cannot read a newer Go's export data) and with
+	# docs/GO-STANDARDS.md, keeping it in step with the other k3sm repos.
+	#
+	# A missing or mismatched tool is a RED, not a SKIP: a gate that can silently
+	# not run and still print green is the failure class the go-list guard above
+	# exists to stop.
+	sc_hint="go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}"
+	sc=""
+	sc_seen=""
+	sc_prev=""
+	for c in "$(command -v staticcheck || true)" "$(go env GOPATH)/bin/staticcheck"; do
+		[ -n "$c" ] && [ -x "$c" ] && [ "$c" != "$sc_prev" ] || continue
+		sc_prev="$c"
+		c_ver=""
+		read -r _ c_ver _ <<<"$("$c" -version 2>/dev/null || true)" || true
+		if [ "$c_ver" = "$STATICCHECK_VERSION" ]; then
+			sc="$c"
+			break
+		fi
+		sc_seen="${sc_seen}    $c reports ${c_ver:-no version}"$'\n'
+	done
+	if [ -z "$sc" ] && [ -z "$sc_seen" ]; then
+		echo "==> [k3sm] staticcheck: not installed; the gate needs ${STATICCHECK_VERSION} (${sc_hint})" >&2
+		exit 1
+	elif [ -z "$sc" ]; then
+		echo "==> [k3sm] staticcheck: wrong version; the gate needs ${STATICCHECK_VERSION} (${sc_hint}). Found:" >&2
+		printf '%s' "$sc_seen" >&2
+		exit 1
+	fi
+	echo "==> [k3sm] staticcheck ${STATICCHECK_VERSION} (non-test)"; CGO_ENABLED=$CGO "$sc" -tests=false ./...
 else
 	echo "==> [k3sm] (no Go packages yet — skipping vet/build/test)"
 fi

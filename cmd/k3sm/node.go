@@ -54,6 +54,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 	"k3sm.io/runtimed/pkg/image"
 
+	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/clustermirror"
 	"k3sm.io/k3sm/pkg/hostnet"
@@ -1981,11 +1982,72 @@ func kubeletServingCertificate(servingCertPEM, servingKeyPEM []byte, nodeName st
 	return certs.SelfSignedServing([]string{nodeName, "localhost"}, ips)
 }
 
+// defaultNodeName is the --node-name default: "k3sm-" plus this host's name,
+// made into a valid canonical node name (nodeNameFromHostname).
 func defaultNodeName() string {
 	h, _ := os.Hostname()
-	h = strings.TrimSuffix(strings.ToLower(h), ".local")
+	return nodeNameFromHostname(h)
+}
+
+// fallbackNodeName is the default node name when nothing usable survives of the
+// hostname.
+const fallbackNodeName = "k3sm-node"
+
+// nodeNameFromHostname derives a node name from hostname that is ALWAYS a valid
+// canonical node name (bootstrap.CanonicalNodeName), whatever the hostname
+// holds: a macOS computer name such as "Alex's MacBook" or one with non-ASCII
+// letters must not hand the control plane a name it then refuses to start with.
+//
+// ASCII letters are lowercased, a trailing ".local" is dropped, every run of
+// bytes outside [a-z0-9-] within a label becomes one '-', each label is trimmed
+// of leading and trailing '-' and capped at 63 bytes, empty labels are dropped,
+// and trailing labels are dropped while the name exceeds 253 bytes. A hostname
+// that already yields a valid name ("k3sm-" + the lowercased hostname) is left
+// exactly as it was; nothing usable at all yields fallbackNodeName.
+func nodeNameFromHostname(hostname string) string {
+	b := []byte(hostname)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	h := strings.TrimSuffix(strings.TrimRight(string(b), "."), ".local")
 	if h == "" {
 		h = "node"
 	}
-	return "k3sm-" + h
+	var labels []string
+	total := -1
+	for raw := range strings.SplitSeq("k3sm-"+h, ".") {
+		var sb strings.Builder
+		invalidRun := false
+		for i := 0; i < len(raw); i++ {
+			c := raw[i]
+			if ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' {
+				if invalidRun {
+					sb.WriteByte('-')
+					invalidRun = false
+				}
+				sb.WriteByte(c)
+				continue
+			}
+			invalidRun = true
+		}
+		label := strings.Trim(sb.String(), "-")
+		if len(label) > 63 {
+			label = strings.TrimRight(label[:63], "-")
+		}
+		if label == "" {
+			continue
+		}
+		if total+1+len(label) > 253 {
+			break
+		}
+		total += 1 + len(label)
+		labels = append(labels, label)
+	}
+	name, err := bootstrap.CanonicalNodeName(strings.Join(labels, "."))
+	if err != nil || name == "k3sm" {
+		return fallbackNodeName
+	}
+	return name
 }

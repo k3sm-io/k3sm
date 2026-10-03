@@ -90,7 +90,21 @@ go build ./...              # builds
 go test ./...               # passes (CI adds -race)
 hack/verify-boilerplate.sh  # every .go file carries the Apache-2.0 header
 go mod tidy                 # no diff
+staticcheck -tests=false ./...  # clean (pinned version below)
 ```
+
+**staticcheck is pinned**, and this line is where the pin lives:
+`go install honnef.co/go/tools/cmd/staticcheck@2026.2.1`. Every repo's `hack/ci.sh` carries the
+same version as its `STATICCHECK_VERSION` constant and goes red when the installed binary is
+missing or reports any other version, because a different staticcheck reports different findings.
+- **Scope**: `-tests=false` checks non-test code only. Each repo's `hack/ci.sh` says why at the stage.
+- **Suppressions**: one syntax, on the line before the finding:
+  `//lint:ignore <Check> <reason>`. A reason is required. `//nolint:...` is golangci-lint's
+  spelling and suppresses nothing under bare staticcheck. No file- or package-wide ignores.
+- **Bumping the pin**: bump it with the Go toolchain. An older staticcheck cannot read export data
+  from a newer Go (2025.1 does not run under go1.27), so a toolchain bump can strand the old pin.
+  Change this line and every `STATICCHECK_VERSION` together, and fix the new findings in the same change.
+
 Keep commits small and focused. **Sign off every commit** for the Developer Certificate of Origin (see
 `DCO` / `CONTRIBUTING.md`): use `git commit -s`, which adds a `Signed-off-by` line certifying the DCO.
 Don't push unless asked.

@@ -34,7 +34,7 @@ profile.
 - Workloads must be adapted. A raw upstream `[Conformance]` Pod, one that assumes a Linux image,
   bind mounts, or Linux-only fields, is rejected at admission or stranded. Images are the k3sm native
   image model (see [Images](images.md)), not arbitrary OCI Linux images.
-- k3sm cannot pass CNCF `[Conformance]` / Sonobuoy. That suite assumes Linux containers, cgroups,
+- k3sm cannot pass the CNCF `[Conformance]` suite. That suite assumes Linux containers, cgroups,
   CNI, and netns; k3sm has none of them, and k3sm does not claim a
   Certified-Kubernetes badge. See [Conformance profile](../conformance-profile.md).
 
@@ -64,12 +64,13 @@ empty search rather than a failure. On a host whose System keychain holds certif
 both exit `0`. A workload that branches on "did I find a certificate" therefore takes the wrong
 branch silently.
 
-Anything built on the keychain inherits this. **Notarization** is out on three counts at once: the
-`notarytool` binary lives inside the Xcode application bundle, which the profile does not read; its
-stored credentials live in the keychain; and it needs outbound network, which a Pod is denied unless
-it carries the `k3sm.io/internet-egress` annotation. Signing with a Developer ID identity has the
-same keychain dependency. Sign and notarize on the host. A `vm` Pod runs Linux, so it cannot run
-this tooling either.
+Anything built on the keychain inherits this. **Notarization** is out on two counts at once: the
+`notarytool` binary lives inside the Xcode application bundle, which the profile does not read, and
+its stored credentials live in the keychain. Signing with a Developer ID identity has the same
+keychain dependency. Sign and notarize on the host. A `vm` Pod runs Linux, so it cannot run this
+tooling either. Network is not the obstacle: every native Pod may open outbound connections on the
+host network stack, and k3sm does not filter them (see "NetworkPolicy Is a Policy Hint, Not a
+Security Boundary" below).
 
 ### Signing Names Files by Relative Path, and SwiftPM Cannot Finish
 
@@ -225,6 +226,13 @@ headless-Service and StatefulSet traffic**, bypasses it completely. **Egress rul
 are never enforced**, and policies against `kube-dns` or the `kubernetes` VIP are unenforceable
 because those VIPs bypass the proxy. It is a policy hint, NOT a security boundary. Isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
+
+The `k3sm.io/internet-egress` annotation is the same kind of control. It records that a Pod needs to
+reach networks beyond the cluster, and admission surfaces a hand-set one, but leaving it off does not
+stop a native Pod from reaching the internet. k3sm does not manage the host's packet filter, and the
+sandbox cannot restrict network access by destination address, so nothing filters a connection a
+Pod opens on the shared host network stack. Treat egress restriction on the default runtime as
+cooperative, and run workloads you do not trust on the [`vm` RuntimeClass](vm-runtimeclass.md).
 
 ### Which Addresses Your Services Answer On
 
@@ -410,8 +418,10 @@ We measured this on 2026-09-26 on a Mac with the agent stopped.
 **Single-label names and per-namespace precedence need the `getaddrinfo` shim.** A Pod on a
 cluster-first `dnsPolicy` (`ClusterFirst`, `ClusterFirstWithHostNet`, or unset) gets the cluster DNS
 configuration injected into every container, and the shim applies the Pod's search list and ndots, so
-a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this:
-`<svc>` alone, `<svc>.<ns>` and `<svc>.svc` get no answer from it. The shim also carries the
+a bare `postgres` resolves in the Pod's own namespace first. The node resolver does not do this. A
+process without the shim resolves the fully qualified name and `<svc>.<ns>.svc`, but not
+`<svc>.<ns>`, `<svc>.svc` or `<svc>` alone. That matches k3s, where a process on the host resolves
+no cluster names at all. The shim also carries the
 bind/connect discipline that gives a Pod its own source address and port space. What to know:
 
 - **Host shells keep the shim.** macOS strips `DYLD_INSERT_LIBRARIES` from a SIP platform binary, so

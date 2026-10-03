@@ -38,6 +38,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -1278,6 +1279,17 @@ type Config struct {
 	// encrypted volume (an encrypted volume beside a plaintext duplicate of the
 	// same secrets is not encryption) and optional otherwise.
 	RemoveOldDataRoot bool
+	// SecretsEncryption is `k3sm install --secrets-encryption`: enable secrets
+	// encryption at rest on a NEW single-server control plane. The install mints
+	// a key and writes the credential pair under <DataRoot>/server/cred before
+	// the first start; it refuses on a worker, beside a carried server join or
+	// datastore endpoint, and over an existing datastore. False never touches
+	// the credential directory. See preflightSecretsEncryption.
+	SecretsEncryption bool
+	// KeyEntropy is where a minted secrets-encryption key is read from. Nil is
+	// crypto/rand.Reader; a test injects a placeholder reader so no real key
+	// material is ever produced.
+	KeyEntropy io.Reader
 	// Deregister removes this node from the cluster it joined, and is called by
 	// Uninstall on a WORKER teardown only. Nil — the zero value — skips it, and
 	// is what every server-role uninstall and every caller that has no stored
@@ -2676,6 +2688,12 @@ func artifactManifest(cfg Config) []artifact {
 		//
 		// assertExists is false: a single-node server stages no DSN at all.
 		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.datastoreEndpointPath(), assertExists: false})
+		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
+		// deleting the key would leave every Secret in the preserved state.db
+		// unreadable. assertExists is false: encryption is opt-in.
+		items = append(items,
+			artifact{kind: kindFile, disp: dispPreserve, path: executor.EncryptionConfigPath(cfg.serverWorkDir()), assertExists: false},
+			artifact{kind: kindFile, disp: dispPreserve, path: executor.EncryptionFingerprintPath(cfg.serverWorkDir()), assertExists: false})
 	}
 	// This node's wireguard identity: the role's work-dir copy, the root-only
 	// key dir, and the copy inside it that netd's MeshKeyResolver reads. All
@@ -2927,6 +2945,15 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err != nil {
 		return err
 	}
+	// 0b′. Secrets encryption, decided from reads alone and before the first
+	//      write that follows: it needs the carried arguments above (a server
+	//      join or a datastore endpoint refuses it) and the data root as the
+	//      data volume left it (a datastore already there refuses it). The
+	//      pair itself is written at 1f′, once the service uid is known.
+	encryptionAction, err := preflightSecretsEncryption(sys, cfg, serverArgs)
+	if err != nil {
+		return err
+	}
 
 	// 0c. An UPGRADE stops the daemons the previous install left running before
 	//     anything under the data root changes owner: EnsureServiceUser below
@@ -3065,6 +3092,13 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 			return err
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+	}
+
+	// 1f′. The secrets encryption pair, when 0b′ decided to write one: after
+	//      the service uid exists and before any daemon is started, so the
+	//      first start of a new cluster already encrypts.
+	if err := stageSecretsEncryption(sys, cfg, uid, encryptionAction); err != nil {
+		return err
 	}
 
 	// 1g. This node's wireguard identity, in both copies, for BOTH roles — see

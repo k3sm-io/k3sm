@@ -82,7 +82,7 @@ See [docs/user/install.md](docs/user/install.md) for what the install step does 
 ## What it does not do
 
 k3sm is not a drop-in replacement for a Linux Kubernetes cluster. It cannot pass CNCF
-`[Conformance]` (Sonobuoy assumes Linux containers, cgroups, CNI and network namespaces, none of
+`[Conformance]` (the suite assumes Linux containers, cgroups, CNI and network namespaces, none of
 which exist on Darwin). CPU `limits` are not enforced, because there is no CFS equivalent. That
 makes CPU-based autoscaling unservable and resource management best-effort. A Linux container image does
 not run on the default path at all; it is rejected at pull. Read

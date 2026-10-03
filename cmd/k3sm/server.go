@@ -425,6 +425,14 @@ func runServer(args []string) (err error) {
 	if opts.registryPort < 0 || opts.registryPort > 65535 {
 		return fmt.Errorf("--registry-port %d out of range 0-65535 (0 disables)", opts.registryPort)
 	}
+	// The node name is checked ONCE, here, before anything keys on it: from this
+	// point opts.nodeName is canonical for the self-name guard, this node's own
+	// node-password binding, its certificates and its Node object alike.
+	nodeName, nerr := canonicalServerNodeName(opts.nodeName)
+	if nerr != nil {
+		return nerr
+	}
+	opts.nodeName = nodeName
 	if opts.workDir == "" {
 		if workDirErr != nil {
 			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
@@ -477,6 +485,18 @@ func runServer(args []string) (err error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Secrets encryption at rest, decided from the credential pair under the
+	// work dir BEFORE any CA-bundle import or datastore start: a datastore
+	// opened under the wrong key (or none) serves Secrets it cannot read, or
+	// writes plaintext beside ciphertext. A refusal PARKS, for the crash-loop
+	// park's reason: launchd would respawn an exit straight back into it.
+	haDatastore := opts.datastoreEndpoint != "" || opts.serverJoin
+	encryptionConfig, encErr := executor.EncryptionAtStart(executor.OSEncryptionStore{}, opts.workDir, haDatastore, uint32(os.Geteuid()))
+	if encErr != nil {
+		logger.Error("refusing to start the control plane: "+encErr.Error(),
+			"key-file", executor.EncryptionConfigPath(opts.workDir), "status-with", "k3sm secrets-encrypt status")
+		return parkWhileEncryptionRefused(ctx, opts.workDir, haDatastore, uint32(os.Geteuid()), crashLoopPollInterval, logger)
+	}
 	if rec := breaker.load(); rec.Tripped() {
 		last, _ := rec.Last()
 		logger.Error(parkReason(last), "path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
@@ -506,6 +526,10 @@ func runServer(args []string) (err error) {
 	// requested without the endpoint — never a silent per-server SQLite (split-brain).
 	cfg.DatastoreEndpoint = opts.datastoreEndpoint
 	cfg.ServerJoin = opts.serverJoin
+	cfg.EncryptionProviderConfig = encryptionConfig
+	if encryptionConfig != "" {
+		logger.Info("secrets encryption at rest is on", "provider", executor.EncryptionProviderName, "config", encryptionConfig)
+	}
 	if opts.datastoreEndpoint != "" || opts.serverJoin {
 		logger.Info("HA datastore mode: kine→Postgres (shared multi-writer datastore); scheduler/KCM leader-elected", "server-join", opts.serverJoin)
 	}
@@ -930,18 +954,18 @@ func runServer(args []string) (err error) {
 	// The node-password store is built HERE, ahead of this node's own enroll, and
 	// the SAME instance is handed to the join supervisor at step 4d. One instance
 	// is the point: the binding this server takes for its OWN name has to live in
-	// the store the join handler checks, and a MemoryNodePasswords constructed
-	// twice would bind in an instance nobody reads.
+	// the store the join handler checks.
 	//
-	// In HA the binding must be SHARED across servers (a name bound on A is
-	// enforced on B), so it is datastore-backed — a kube-system Secret on the one
-	// Postgres. A single multi-node server keeps the in-memory store, which is
-	// durable enough for a binding no other process has to see.
+	// It is datastore-backed on EVERY server (a kube-system Secret per node), so a
+	// binding survives a restart: an in-memory store forgot every binding when the
+	// process stopped, leaving each worker's name claimable by any join-token
+	// holder until that worker rejoined. In HA the same Secrets are what make a
+	// name bound on one server enforced on its siblings. It is built after the
+	// apiserver is healthy (step 2's client) and before the join listener (step
+	// 4d). There is NO backfill: workers bound before an upgrade to this store, or
+	// before a datastore wipe, stay unbound until their next join.
+	nodePasswords := serverNodePasswordStore(cs, logger)
 	ha := opts.datastoreEndpoint != "" || opts.serverJoin
-	var nodePasswords bootstrap.NodePasswordStore = bootstrap.NewMemoryNodePasswords()
-	if ha {
-		nodePasswords = newSecretNodePasswords(cs)
-	}
 	// serverPodCIDR is the control-plane node's pod /24: the reserved index-0 carve
 	// of the cluster pod CIDR — the ONE value the routing-table locality (step 4c)
 	// and the node's podnet adapter (step 5) both allocate against.
@@ -1570,4 +1594,20 @@ func provisionClusterPolicies(ctx context.Context, cs kubernetes.Interface, mode
 	if err := runtimeclass.Provision(ctx, cs); err != nil {
 		logger.Error("provision vm runtime class", "err", err)
 	}
+}
+
+// canonicalServerNodeName checks the server's --node-name. A name with no
+// canonical form is refused, and so is one that only differs from its canonical
+// form (case, surrounding spaces): an operator's explicit flag is never renamed
+// silently, because the node's Node object, certificates and node-password
+// binding would then carry a name the operator did not choose.
+func canonicalServerNodeName(given string) (string, error) {
+	name, err := bootstrap.CanonicalNodeName(given)
+	if err != nil {
+		return "", fmt.Errorf("--node-name: %w", err)
+	}
+	if name != given {
+		return "", fmt.Errorf("--node-name %q is not in canonical form; pass --node-name %s", given, name)
+	}
+	return name, nil
 }
