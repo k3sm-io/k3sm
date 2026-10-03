@@ -154,6 +154,12 @@ type runtimedRuntime struct {
 	// materialization. nil ⇒ data-backed env/volumes fail closed.
 	resolver mount.Resolver
 
+	// refs is the pod-reference registry the resolver reads through, when the
+	// resolver is a kubeResolver over one (newRuntimedWith derives it). Every
+	// pod is registered before its first read and unregistered once torn down.
+	// nil ⇒ no registry; registration is then a no-op.
+	refs *podRefManager
+
 	// network is the per-node pod-IP seam (the podnet adapter) — the SAME
 	// instance wired into runtimed's Deps.Network, so the provider's
 	// allocate-before-translate Setup and the runtimed-side seam Setup are one
@@ -548,11 +554,18 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	// runtimed never talks to the apiserver: the provider (which holds the client)
 	// supplies the volume Resolver + imagePullSecret CredentialResolver. nil client
 	// ⇒ nil seams ⇒ data-backed volumes fail closed, pulls are anonymous.
+	//
+	// Both read Secrets and ConfigMaps through one podRefManager: by name, and
+	// only for an object a pod on this node references (podrefs.go). The
+	// runtime registers its pods with it (newRuntimedWith finds it on the
+	// resolver), so the registry and the reads are one instance by
+	// construction.
 	var resolver mount.Resolver
 	var creds runtimed.CredentialResolver
 	if cfg.Client != nil {
-		resolver = newKubeResolver(cfg.Client)
-		creds = newKubeCredentials(cfg.Client)
+		refs := newPodRefManager(cfg.Client, clock.RealClock{}, log)
+		resolver = newKubeResolver(cfg.Client, refs)
+		creds = newKubeCredentials(refs)
 	}
 	// The pod network runtimed drives: the injected podnet adapter (per-pod /32
 	// lo0 aliases + the startup stale-alias reconcile) when configured, else the
@@ -654,6 +667,26 @@ func NewRuntimed(ctx context.Context, cfg RuntimedConfig) (*runtimedRuntime, err
 	return r, nil
 }
 
+// refsOf returns the podRefManager resolver reads Secrets and ConfigMaps
+// through, or nil when it has none.
+func refsOf(resolver mount.Resolver) *podRefManager {
+	if kr, ok := resolver.(*kubeResolver); ok {
+		if m, ok := kr.objects.(*podRefManager); ok {
+			return m
+		}
+	}
+	return nil
+}
+
+// Objects returns this runtime's by-name Secret/ConfigMap reader for the
+// node's Virtual Kubelet listers, or nil when it has none.
+func (r *runtimedRuntime) Objects() vkadapter.ObjectGetter {
+	if r.refs == nil {
+		return nil
+	}
+	return r.refs
+}
+
 // newRuntimedWith wraps an existing runtime server (tests inject a fake) with the
 // volume/env Resolver. The Summary API (kubectl top) is served off the runtime's
 // typed ListPodStats RPC, so no per-pod-metrics capability is captured here.
@@ -718,6 +751,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		// pod path must never re-derive per pod.
 		developerDir:   resolveDeveloperDir(log),
 		resolver:       resolver,
+		refs:           refsOf(resolver),
 		network:        cfg.Network,
 		transport:      newTransportFeed(cfg.TransportOverrides, log),
 		guestArtifacts: cfg.GuestArtifacts != nil,
@@ -1537,6 +1571,12 @@ func (r *runtimedRuntime) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 	// is what makes the token die with the pod instead of outliving it to expiry
 	// see kubeResolver.ServiceAccountToken.
 	ctx = withPodIdentity(ctx, pod)
+	// Register the pod's Secret/ConfigMap references BEFORE anything reads
+	// one (env resolution, volume materialization, the image pull): the
+	// resolver refuses an unreferenced object. The create deadline bounds the
+	// Forbidden retry of every read this create makes, together.
+	r.refs.RegisterPod(pod)
+	ctx = r.refs.withCreateFetchBudget(ctx)
 	id := string(pod.UID)
 	start := metav1.Now()
 	r.log.Info("CreatePod", "namespace", pod.Namespace, "name", pod.Name)
@@ -1700,10 +1740,14 @@ func (r *runtimedRuntime) untrackRejectedCreate(pod *corev1.Pod, t *podTrack) {
 	// replaced this track between this create's RPC and its refusal, and that
 	// replacement is running its own attempt. Only the track this create
 	// installed is removed.
-	if r.track[id] == t {
+	removed := r.track[id] == t
+	if removed {
 		delete(r.track, id)
 	}
 	r.mu.Unlock()
+	if removed {
+		r.refs.UnregisterPod(pod.UID)
+	}
 	t.cancelRestarts()
 	t.cancelPulls()
 	t.cancelPostStart()
@@ -1808,9 +1852,11 @@ func (r *runtimedRuntime) completeCreate(pod *corev1.Pod, t *podTrack, rs *runti
 	r.dispatch(string(pod.UID), rs)
 }
 
-// UpdatePod forwards labels/annotations changes (the only fields runtimed
-// updates in place); other changes need a recreate and are reported by the
-// runtime as a typed precondition failure, surfaced here as an error.
+// UpdatePod forwards labels/annotations changes and appended ephemeral
+// containers (the only changes runtimed applies in place); other changes need a
+// recreate and are reported by the runtime as a typed precondition failure,
+// surfaced here as an error. A refused ephemeral append is the exception: it is
+// reported on the debug container, never as the pod's failure.
 func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	// Identity binding kept for the SAME in-process seam CreatePod uses, but
 	// UpdatePod itself never mints a token or re-reads a ConfigMap/Secret
@@ -1828,6 +1874,9 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	// this seam is kept uniform for CreatePod and UpdatePod rather than split
 	// (B233).
 	ctx = withPodIdentity(ctx, pod)
+	// A spec change (an ephemeral container added) can add references; the
+	// registration is replaced, so a removed reference stops being fetchable.
+	r.refs.RegisterPod(pod)
 	id := string(pod.UID)
 	r.mu.Lock()
 	t, tracked := r.track[id]
@@ -1869,10 +1918,43 @@ func (r *runtimedRuntime) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 		return fmt.Errorf("runtimed update pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
 	if e := resp.GetError(); e != nil && e.GetCode() != 0 {
-		return fmt.Errorf("runtimed update pod %s/%s: %s", pod.Namespace, pod.Name, e.GetMessage())
+		// A refusal of an update that only APPENDED ephemeral containers is the
+		// debug container's failure, not the pod's. Returning it would let
+		// virtual-kubelet mark the running pod ProviderFailed, and Failed outright
+		// under restartPolicy: Never. The refusal is reported on the container
+		// instead: the status reads ContainerCreating for it (ephemeral.go) and
+		// the Event carries runtimed's own text.
+		//
+		// UNSUPPORTED on a pod that lists ephemeral containers is the backstop
+		// for the same case: runtimed answers it only for an ephemeral append it
+		// cannot start, which the provider no longer sends for a vm pod. Any
+		// other UNSUPPORTED is returned as before.
+		ephemeralUnsupported := resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_UNSUPPORTED &&
+			len(pod.Spec.EphemeralContainers) > 0
+		if !ephemeralOnlyDelta(previous, pod) && !ephemeralUnsupported {
+			return fmt.Errorf("runtimed update pod %s/%s: %s", pod.Namespace, pod.Name, e.GetMessage())
+		}
+		r.log.Warn("UpdatePod: runtimed refused the ephemeral container append; reported on the container",
+			"namespace", pod.Namespace, "name", pod.Name,
+			"message", e.GetMessage(), "reason", resp.GetFailureReason().String())
+		r.recordEphemeralRejections(previous, pod, e.GetMessage())
+		r.dispatchCurrent(ctx, id)
+		return nil
 	}
+	r.recordEphemeralRejections(previous, pod, "")
 	r.dispatch(id, resp.GetStatus())
 	return nil
+}
+
+// dispatchCurrent reads the pod's current status from the runtime and publishes
+// it, for a mutating call whose refusal carried no status of its own. A failed
+// read publishes nothing; the watch stream and the backstop still converge.
+func (r *runtimedRuntime) dispatchCurrent(ctx context.Context, id string) {
+	resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: id})
+	if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
+		return
+	}
+	r.dispatch(id, resp.GetStatus())
 }
 
 // DeletePod runs the pod's preStop hooks, then stops the pod's processes and
@@ -2034,15 +2116,21 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	r.transport.drop(id)
 	r.mu.Lock()
 	t := r.track[id]
+	forget := false
 	switch {
 	case owned == nil, t == owned:
 		delete(r.track, id)
+		forget = true
 	default:
 		// A track replaced since the reaper claimed its own is someone
 		// else's to forget (see owned above).
 		t = nil
 	}
 	r.mu.Unlock()
+	if forget {
+		// runtimed has torn the pod down, so nothing reads for it again.
+		r.refs.UnregisterPod(pod.UID)
+	}
 	if t != nil {
 		// Again, now that the track is unreachable: a status observation landing
 		// while the RPC was in flight can file a fresh re-exec or re-attempt, and

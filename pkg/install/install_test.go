@@ -255,6 +255,10 @@ type fakeSystem struct {
 	// describes a Mac with no prior agent state, and only a test that cares about
 	// the migration has to say anything at all.
 	owners map[string]OwnedEntry
+	// purge is the fake's model of everything `uninstall --purge` reads and
+	// changes beyond the plain uninstall: markers, path stats, the service user
+	// record, the processes it runs, launchd's loaded list. See purge_fake_test.go.
+	purge fakePurge
 }
 
 // delayedFile is one file of the fake root filesystem that CHANGES part-way
@@ -1077,6 +1081,15 @@ func (f *fakeSystem) LaunchctlBootstrap(label string) error {
 // before the label has left the domain.
 func (f *fakeSystem) LaunchctlBootout(label string) error {
 	f.calls = append(f.calls, "Bootout:"+label)
+	if err := f.purge.bootoutErrs[label]; err != nil {
+		if f.purge.unloadDespiteErr[label] {
+			delete(f.loaded, label)
+		}
+		return err
+	}
+	if f.purge.stuck[label] {
+		return nil // launchd accepted the bootout and the job never leaves
+	}
 	if f.drain[label] > 0 {
 		return nil // still in the domain; ServicePID drains the counter
 	}
@@ -1697,6 +1710,10 @@ func TestInstallOrchestration(t *testing.T) {
 		"EnsureOwnedDir:/var/lib/k3sm/podreap:271:20:0700",
 		"EnsureOwnedDir:/var/lib/k3sm/vmreap:271:20:0700",
 		"EnsureLogDir:/var/log/k3sm",
+		// The purge markers, once both trees exist: `uninstall --purge` refuses
+		// to delete either tree without the marker naming it.
+		"WriteDataRootMarker:/var/lib/k3sm",
+		"WriteDataRootMarker:/var/log/k3sm",
 		// The container-log tree, at the same moment and for the same reason: the
 		// node refuses to start without it, and only root can create it owned by
 		// the service user at a mode that keeps pod output off every local account.

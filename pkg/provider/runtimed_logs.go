@@ -164,8 +164,10 @@ func (r *runtimedRuntime) containerLogPath(ctx context.Context, namespace, podNa
 }
 
 // containerStatus returns the runtime's status for one container of a tracked
-// pod, searching the regular and init container lists (an init container's logs
-// are `kubectl logs -c` addressable too).
+// pod, searching the regular, init and ephemeral container lists. All three are
+// `kubectl logs -c` addressable, as on the kubelet; the ephemeral list matters
+// most here, because interactive attach to a native process is unsupported, so
+// `kubectl debug` output reaches the user only through these logs.
 func (r *runtimedRuntime) containerStatus(ctx context.Context, namespace, podName, containerName string) (*runtimev1.ContainerStatus, error) {
 	id, _, _, ok := r.lookup(namespace, podName)
 	if !ok {
@@ -176,14 +178,11 @@ func (r *runtimedRuntime) containerStatus(ctx context.Context, namespace, podNam
 		return nil, fmt.Errorf("runtimed get pod status %s/%s: %w", namespace, podName, err)
 	}
 	st := resp.GetStatus()
-	for _, cs := range st.GetContainerStatuses() {
-		if cs.GetName() == containerName {
-			return cs, nil
-		}
-	}
-	for _, cs := range st.GetInitContainerStatuses() {
-		if cs.GetName() == containerName {
-			return cs, nil
+	for _, list := range [][]*runtimev1.ContainerStatus{st.GetContainerStatuses(), st.GetInitContainerStatuses(), st.GetEphemeralContainerStatuses()} {
+		for _, cs := range list {
+			if cs.GetName() == containerName {
+				return cs, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("container %q in pod %q is not available", containerName, podName)

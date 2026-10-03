@@ -626,6 +626,11 @@ type System interface {
 	// are re-applied to the directory AND to those files on every install,
 	// repairing a previously mis-created or over-permissive tree.
 	EnsureLogDir(dir string, uid uint32) error
+	// WriteDataRootMarker writes dataroot.MarkerName into dir, root:wheel 0644,
+	// naming dir itself (dataroot.WriteMarker). Install writes one into the data
+	// root and one into the log dir on every install, and `k3sm uninstall
+	// --purge` refuses to delete a tree that does not carry one. Idempotent.
+	WriteDataRootMarker(dir string) error
 	// EnsureContainerLogDir creates (or repairs) one directory of the container-log
 	// tree — /var/log/pods and /var/log/containers — owned by the service uid,
 	// group wheel, mode 0700 (ContainerLogDirMode / ContainerLogDirGID).
@@ -1020,16 +1025,13 @@ type System interface {
 	// It inspects the live interface (ifconfig) rather than walking ranges, so it
 	// removes exactly what exists. A no-op when nothing matches.
 	FlushLo0Aliases(prefixes []netip.Prefix) error
-	// FlushMeshPFAnchor is the uninstall backstop for the mesh's MSS-clamp pf
-	// anchor (darwin-net's mesh.PFAnchor, "io.k3sm.mesh"), which outlives netd:
-	// the anchor is loaded against a utun interface number, and only the
-	// RemoveMesh RPC — not a daemon shutdown — ever reaches mesh.WGDevice.Down,
-	// which flushes it. Left in place, the rule survives the booted-out daemon
-	// scoped to a utun that no longer exists, and macOS recycles utun numbers —
-	// so the next tunnel that is assigned that same number silently inherits a
-	// stale MSS clamp. Best-effort like FlushLo0Aliases: an anchor that was
-	// never loaded is a no-op (pfctl succeeds flushing zero rules), and a
-	// pfctl failure is reported but never stops the rest of uninstall.
+	// FlushMeshPFAnchor is the uninstall backstop for the pf anchor (darwin-net's
+	// mesh.PFAnchor, "io.k3sm.mesh") that an older release loaded the mesh MSS
+	// clamp into. Nothing loads it now (k3sm loads no pf rule), but a rule an
+	// older release left behind outlives netd, scoped to a utun that no longer
+	// exists. Best-effort like FlushLo0Aliases: an anchor that was never loaded
+	// is a no-op (pfctl succeeds flushing zero rules), and a pfctl failure is
+	// reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
@@ -1046,6 +1048,69 @@ type System interface {
 	// WaitProcessGroupsGone waits up to timeout for every group in pgids to
 	// have no members, and returns the groups that still have one.
 	WaitProcessGroupsGone(ctx context.Context, pgids []int, timeout time.Duration) []int
+
+	// The methods below serve `k3sm uninstall --purge` only.
+
+	// ResolvePath returns path with every symlink resolved (EvalSymlinks).
+	ResolvePath(path string) (string, error)
+	// StatNoFollow lstats path. A missing path has ReadFile's fs.ErrNotExist
+	// contract.
+	StatNoFollow(path string) (PathStat, error)
+	// ReadDataRootMarker reports what dir's dataroot.MarkerName file is, read
+	// off one O_NOFOLLOW descriptor (dataroot.ReadMarker). Missing has
+	// ReadFile's fs.ErrNotExist contract.
+	ReadDataRootMarker(dir string) (dataroot.MarkerFacts, error)
+	// PurgeTree deletes the tree at root, which must still be the directory
+	// (dev, ino) the purge guard approved. It walks descriptor-relative and
+	// never follows a symlink (a symlink is unlinked, its target untouched),
+	// never enters a directory on another device (that is reported as an
+	// error, and the walk goes on), clears file flags and retries once on
+	// EPERM, collects every failure rather than stopping at the first, and
+	// unlinks root's marker and then root itself only when everything else is
+	// gone. It never uses os.RemoveAll.
+	//
+	// A root that is no longer the (dev, ino) handed in is refused with an
+	// error wrapping ErrPurgeTreeChanged and nothing removed.
+	PurgeTree(root string, dev, ino uint64) error
+	// DirIsEmpty reports whether dir (not followed if it is a symlink) holds no
+	// entries at all.
+	DirIsEmpty(dir string) (bool, error)
+	// LoadedLabels lists the launchd jobs loaded in the system domain whose
+	// label starts with prefix. The subprocess is bounded by ctx.
+	LoadedLabels(ctx context.Context, prefix string) ([]string, error)
+	// ProcessesOfUID lists the pids whose real or effective uid is uid,
+	// leaving out zombies (exited, awaiting their parent's wait): they hold
+	// nothing open and no signal reaches them.
+	ProcessesOfUID(uid uint32) ([]int, error)
+	// KillProcess sends SIGKILL to pid. A process that is already gone is
+	// success.
+	KillProcess(pid int) error
+	// BootoutUserDomain boots out uid's per-user launchd domain (launchctl
+	// bootout user/<uid>), stopping every agent launchd runs there and keeps
+	// respawning. A domain that is already gone is success. The subprocess is
+	// bounded by ctx.
+	BootoutUserDomain(ctx context.Context, uid uint32) error
+	// ServiceUser reads the named user's directory-service record. A user that
+	// does not exist is Exists=false with a nil error. Subprocesses are bounded
+	// by ctx.
+	ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error)
+	// DeleteServiceUser deletes the named user's record (dscl . -delete
+	// /Users/<name>). It deletes no group. The subprocess is bounded by ctx
+	// alone; a kill at ctx's deadline returns an error wrapping ctx.Err(). A
+	// deletion macOS refused (eDSPermissionError: deleting a user record needs
+	// an approval at the screen, which an unattended process cannot get)
+	// returns an error wrapping errServiceUserDeleteDenied.
+	DeleteServiceUser(ctx context.Context, name string) error
+	// DisableServiceUser leaves the named account, which the purge could not
+	// delete, with no login shell, hidden, and a RealName that says to delete
+	// it by hand (serviceUserDisabledRealName). It changes attributes only,
+	// none of which needs the approval a deletion does.
+	DisableServiceUser(ctx context.Context, name string) error
+	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
+	// and user it alone references) from targetUser's ~/.kube/config, keeping
+	// every other entry, the file's owner and its mode. An absent file or
+	// context is a no-op success, reported as removed=false.
+	RemoveAdminKubeconfigContext(targetUser string) (removed bool, err error)
 }
 
 // Config parametrizes Install/Uninstall. Empty fields take the Default* values.
@@ -1258,12 +1323,28 @@ type Config struct {
 	// terminal error naming the remedy (mint a token on the server and start the
 	// agent with it).
 	Deregister func(ctx context.Context) error
+	// Purge makes Uninstall also remove everything it otherwise keeps: the data
+	// root (and the data volume under it), the daemon log dir, the arguments
+	// records, the k3sm context in TargetUser's kubeconfig and the service user.
+	// See purge for the order and the guards.
+	Purge bool
+	// PurgeConfirmed is the operator's --yes. A Purge without it is refused
+	// before any system call.
+	PurgeConfirmed bool
+	// TargetHome is the invoking human's home directory. A purge refuses to
+	// delete any tree that equals, contains or lies inside it. Empty skips that
+	// one rule; the /Users and /Volumes rules still hold.
+	TargetHome string
 	// DataRootFS is the read-only filesystem the data-root posture is read
 	// through (the record, /etc/fstab, the mount state). It defaults to the real
 	// filesystem; a test injects a fake so the sequencing can be exercised
 	// against a mount posture no unprivileged process could create.
 	DataRootFS dataroot.FS
 	Logger     *slog.Logger
+	// Out receives a command's result lines: what a purge removed, and what it
+	// could not and how to finish by hand. The CLI hands it stdout; Logger
+	// (stderr) carries the progress and diagnostics. Nil discards.
+	Out io.Writer
 	// dataVolumeDeclared reports that this Mac has a data volume to manage --
 	// either a record already declares one, or --data-volume asked for one. It
 	// is what puts the io.k3sm.datavol daemon and the record into the artifact
@@ -1299,6 +1380,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.DiscardHandler)
+	}
+	if c.Out == nil {
+		c.Out = io.Discard
 	}
 	if c.DataRootFS == nil {
 		c.DataRootFS = dataroot.OSFS{}
@@ -2928,6 +3012,17 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 		return fmt.Errorf("install: ensure log dir %s: %w", LogDir, err)
 	}
 
+	// 1b‴. The purge markers, in the two trees `k3sm uninstall --purge` deletes
+	//     whole. Both directories exist by now (the data root from step 1a, the
+	//     log dir from the step above), and the marker is rewritten on every
+	//     install, so a Mac installed before markers existed gains them on its
+	//     next install. Each names the directory it sits in.
+	for _, dir := range []string{cfg.DataRoot, LogDir} {
+		if err := sys.WriteDataRootMarker(dir); err != nil {
+			return fmt.Errorf("install: write the k3sm marker in %s: %w", dir, err)
+		}
+	}
+
 	// 1b'. The container-log tree, for the same reason and at the same moment: the
 	//     node refuses to start without it, and only root can create it owned by
 	//     the service user with a mode that does not expose every pod's output to
@@ -3364,13 +3459,12 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
-//   - the mesh MSS-clamp pf anchor — SWEPT, by the FlushMeshPFAnchor backstop
-//     below (B274). Left alone it survives netd, scoped to a utun that is gone,
-//     and macOS recycles utun numbers — the next tunnel assigned that number
-//     silently inherits the stale clamp. A daemon-shutdown-path fix was
-//     considered and rejected: a restart already self-heals, because Up
-//     reloads the anchor for the current interface on every daemon start, so
-//     the uninstall backstop is the only place the residue is user-visible.
+//   - the pf anchor an older release loaded the mesh MSS clamp into: SWEPT, by
+//     the FlushMeshPFAnchor backstop below. Nothing loads it now (k3sm loads no
+//     pf rule), but a rule an older release left behind would survive netd,
+//     scoped to a utun that is gone, and macOS recycles utun numbers. A
+//     daemon-shutdown-path fix was considered and rejected: the flush is a
+//     backstop for old state, not a live resource.
 //   - the wireguard utun and its routes — NOT explicitly removed. The interface
 //     is created in-process (tun.CreateTUN) and goes away with netd, and the
 //     kernel drops routes whose interface has vanished; nothing here proves the
@@ -3379,8 +3473,25 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 // Flushing the utun/routes class on the way out (if it ever proves necessary)
 // is a darwin-net change (a shutdown hook that reaches Down), not an installer
 // one, and would be filed separately. Uninstall makes no claim to do it.
+//
+// With cfg.Purge set it is `k3sm uninstall --purge`: the same teardown, then
+// every artifact this one keeps (see purge).
 func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	cfg = cfg.withDefaults()
+	if cfg.Purge {
+		return purge(ctx, sys, cfg)
+	}
+	_, err := uninstall(ctx, sys, cfg, nil)
+	return err
+}
+
+// uninstall is Uninstall's teardown, and returns the manifest it walked so a
+// purge consumes that same manifest rather than one rebuilt after the state it
+// was derived from has changed. preflight, when non-nil, runs after the
+// manifest is built and BEFORE anything is torn down, and is handed the
+// data-root posture and the error reading it; an error from it is
+// returned as it stands, with nothing changed. cfg already carries its defaults.
+func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []artifact, st dataroot.State, stErr error) error) ([]artifact, error) {
 	var firstErr error
 	note := func(err error) {
 		if err != nil && firstErr == nil {
@@ -3418,6 +3529,11 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// default role would leave the other one's KeepAlive plist behind pointing
 	// at a deleted binary — the exact leak the shared manifest exists to prevent.
 	m := uninstallManifest(sys, cfg)
+	if preflight != nil {
+		if err := preflight(m, st, sterr); err != nil {
+			return m, err
+		}
+	}
 	// Leave the cluster BEFORE anything local is torn down. Everything the call
 	// depends on is alive right now and stops being alive a few lines below: the
 	// agent daemon still holds the mesh up, the stored credential is still on
@@ -3488,10 +3604,9 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
 	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
-	// Backstop: flush the mesh MSS-clamp pf anchor (B274). It outlives netd —
-	// only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no signal path
-	// ever calls it — so a booted-out daemon leaves the anchor loaded against a
-	// utun number macOS will eventually recycle onto an unrelated tunnel.
+	// Backstop: flush the pf anchor an older release loaded the mesh MSS clamp
+	// into. Nothing loads it now, so this only clears what an older release left
+	// behind, which would outlive netd scoped to a utun that is gone.
 	note(sys.FlushMeshPFAnchor())
 	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
 	// no daemon removes on the way out — netd tracks per-connection alias caps
@@ -3507,9 +3622,13 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 	}
 	note(sys.FlushLo0Aliases(flush))
 	if firstErr != nil {
-		return fmt.Errorf("uninstall: %w", firstErr)
+		return m, fmt.Errorf("uninstall: %w", firstErr)
 	}
 	cfg.Logger.Info("k3sm uninstalled", "install-dir", cfg.InstallDir)
+	if cfg.Purge {
+		// Nothing is kept: the purge removes it next and says what it removed.
+		return m, nil
+	}
 	// What was KEPT, named. An uninstall that lists only what it removed leaves
 	// the operator guessing whether their datastore, their kubeconfig and the
 	// server flags they configured are still there — and guessing wrong in the
@@ -3526,7 +3645,7 @@ func Uninstall(ctx context.Context, sys System, cfg Config) error {
 			"reinstall", "sudo k3sm install --data-volume",
 			"remove-for-good", "sudo k3sm datavol delete --yes")
 	}
-	return nil
+	return m, nil
 }
 
 // deregisterTimeout is the outer bound on the whole deregistration attempt.

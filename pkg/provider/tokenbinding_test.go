@@ -143,7 +143,7 @@ func (f *tokenMintingRuntime) err() error {
 // request context, over a fake apiserver recording into rec.
 func newTokenBindingFake(t *testing.T, rec *tokenRecorder) (*runtimedRuntime, *tokenMintingRuntime) {
 	t.Helper()
-	res := newKubeResolver(newTokenClient(rec))
+	res := newTestKubeResolver(newTokenClient(rec))
 	f := &tokenMintingRuntime{fakeRuntimeServer: newFakeRuntimeServer(), resolver: res}
 	r := newRuntimedWith(f, RuntimedConfig{NodeName: "n", NodeIP: "192.168.1.10", Root: t.TempDir(), PodLogsDir: t.TempDir()}, res, nil)
 	return r, f
@@ -235,7 +235,7 @@ func TestB226_ProjectedTokenBoundToPod(t *testing.T) {
 
 	t.Run("no pod identity in context fails closed and mints nothing", func(t *testing.T) {
 		rec := &tokenRecorder{}
-		res := newKubeResolver(newTokenClient(rec))
+		res := newTestKubeResolver(newTokenClient(rec))
 
 		tok, err := res.ServiceAccountToken(context.Background(), ns, "", 3607)
 		if err == nil {

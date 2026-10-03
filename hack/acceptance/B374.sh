@@ -9,8 +9,8 @@
 # (pkg/install/install_darwin.go) as an unconditional, best-effort uninstall
 # backstop (pkg/install/install.go wires it into every Uninstall call). This
 # gate asserts the corrected sentence is present, the stale claim is gone, and
-# the doc now says the packet filter's own enable state is deliberately left
-# undescribed pending the wiring work that will decide its ownership.
+# the doc now says k3sm never enables, disables or configures the packet
+# filter, so its enable state is whatever the Mac's owner set.
 #
 # CI TIER ONLY — no rig, no cluster, nothing runs. Every rung but the voice
 # lint is a grep over checked-in text; content-anchored per the B336 idiom
@@ -63,17 +63,16 @@ grep -qi 'pfctl.*failure is reported' "$DOC" || fixed=no
 grep -qi 'never stops the rest of uninstall' "$DOC" || fixed=no
 ladder "$fixed" "b374.2  the corrected sentence names the best-effort pfctl flush and its failure handling"
 
-# ---- b374.3 — the pf enable-state deferral sentence -------------------------
+# ---- b374.3: the doc states who owns pf's enable state --------------------
 # Joined into one line first: the sentence legitimately wraps across the
 # markdown source's soft line breaks, and a per-line grep would be fooled by
-# reflowing prose that says nothing at all.
+# reflowing prose that says nothing at all. The resolved sentence: k3sm never
+# enables, disables or configures pf, so pf's state is the Mac owner's.
 deferred=ok
-JOINED="$(tr '\n' ' ' < "$DOC")"
-printf '%s' "$JOINED" | grep -qi 'stays enabled' || deferred=no
-printf '%s' "$JOINED" | grep -qi 'deliberately not described' || deferred=no
-printf '%s' "$JOINED" | grep -qi 'wiring work decides' || deferred=no
-printf '%s' "$JOINED" | grep -qi 'pf.\{0,20\}stays enabled' || deferred=no
-ladder "$deferred" "b374.3  the doc defers pf's own enable-state ownership to the wiring work"
+JOINED="$(tr '\n' ' ' < "$DOC" | tr -s ' ')"
+printf '%s' "$JOINED" | grep -qi 'never enables, disables or configures' || deferred=no
+printf '%s' "$JOINED" | grep -qi 'whatever the Mac.s owner set' || deferred=no
+ladder "$deferred" "b374.3  the doc states k3sm never enables or configures pf"
 
 # ---- b374.4 — the workspace voice lint, fatal-only --------------------------
 v=ok

@@ -19,13 +19,12 @@ process:
 |---|---|---|
 | `lo0` `/32` alias add/remove | per-Pod IPs, ClusterIP VIPs | `ifconfig` / `SIOCAIFADDR` on `lo0` needs root |
 | `utun` create + wireguard + routes | the multi-node mesh | interface and routing-table mutation needs root |
-| `pf` sub-anchor load | the mesh MSS clamp | `pfctl` / `/dev/pf` needs root |
 | bind a `<1024` port on a specific `lo0` VIP | the infra VIPs (`10.43.0.1:443` API, `10.43.0.10:53` DNS) and any `<1024` ClusterIP port | a reserved-port bind on a specific address needs root |
 
 The `com.apple.vm.networking` entitlement that *would* let a user-space `vmnet` client avoid all this
 is **Apple-contract-restricted**. The desktop container tools cannot obtain it either, which is why
-they ship a one-time-admin root helper too. Zero-root-ever is therefore impossible for those four
-operations. k3sm takes the route everyone else takes. The four operations happen in a minimal root
+they ship a one-time-admin root helper too. Zero-root-ever is therefore impossible for those three
+operations. k3sm takes the route everyone else takes. The three operations happen in a minimal root
 daemon, installed once, and everything else runs unprivileged.
 
 ## Process layout
@@ -39,7 +38,7 @@ daemon, installed once, and everything else runs unprivileged.
    └──────┼──────────────────────────────────────────────────────────────────────────────────────┘
           │ unix socket, uid peer-auth, a closed typed-scalar RPC
    ┌──────┴── root, minimal ─────────────────────────────────────────────────────────────────────┐
-   │  k3sm-netd:  lo0 /32 alias · utun + wireguard + routes · the io.k3sm.* pf anchor · <1024 bind │
+   │  k3sm-netd:  lo0 /32 alias · utun + wireguard + routes · <1024 bind │
    └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,13 +57,12 @@ class `vmnetd` and `socket_vmnet` have lived through. `k3sm-netd` is built to a 
 
 - The helper does networking and privileged-port binds, and nothing else. No Pod spawning, no file
   operations, no sandbox profile application; those stay in user space. The verb set is closed:
-  `EnsureAlias`, `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `LoadPFAnchor`, `BindPort`.
+  `EnsureAlias`, `RemoveAlias`, `ConfigureMesh`, `RemoveMesh`, `BindPort`.
 - The RPC carries typed scalars, never text. It passes an IP, a typed peer (`{public key, endpoint,
-  allowedIPs}`), an MSS integer, a `{port, node address}`, and never `route`, `pf` or wireguard-UAPI
+  allowedIPs}`), a `{port, node address}`, and never `route` or wireguard-UAPI
   *text*. The daemon **renders** the privileged artifact itself and **re-validates** every parameter
   against pinned policy: an alias must be a `/32` inside the pinned aggregate intersected with the
-  node's Pod CIDR; a route must pass the route-set predicate; the `pf` rule is the daemon's own
-  MSS-clamp template loaded into the `io.k3sm.*` anchor. This follows the `socket_vmnet` lesson that
+  node's Pod CIDR; a route must pass the route-set predicate. This follows the `socket_vmnet` lesson that
   caller-supplied arguments never reach a privileged tool.
 - A privileged-port bind is authorized, not merely requested, and only for **specific `lo0` VIP
   addresses**, never a wildcard. The helper's `<1024` `BindPort` serves the infra VIPs
@@ -157,16 +155,14 @@ Seatbelt-confined. The consequences:
   release. See [user/install.md](user/install.md) and [user/upgrade.md](user/upgrade.md).
 - **Uninstall.** `sudo k3sm uninstall` boots out both daemons, removes the `lo0` aliases, and removes
   `/Library/k3sm`. No orphaned root listener survives, and the `utun` goes with netd, because the
-  kernel reaps a `utun` when the process holding it exits. Uninstall also flushes the mesh's
-  MSS-clamp `io.k3sm.mesh` `pf` anchor as a best-effort backstop, since the anchor is loaded against
-  a `utun` interface number that outlives netd and macOS will eventually recycle onto an unrelated
-  tunnel: a `pfctl` failure is reported but never stops the rest of uninstall. Whether `pf` itself
-  stays enabled afterward is deliberately not described here until the wiring work decides who owns
-  that state.
+  kernel reaps a `utun` when the process holding it exits. Uninstall also flushes the mesh's `io.k3sm.mesh` `pf` anchor, which older
+  releases loaded, as a best-effort backstop: a `pfctl` failure is reported but never stops the rest of uninstall.
+  k3sm never enables, disables or configures `pf`, so whether `pf` is enabled is whatever the Mac's
+  owner set.
 
 ## Explicitly out of scope
 
-- **A fully zero-admin install.** Impossible on macOS for `lo0`, `utun`, `pf` and `<1024` binds, since
+- **A fully zero-admin install.** Impossible on macOS for `lo0`, `utun` and `<1024` binds, since
   the entitlement that would avoid them is Apple-restricted. The one-time admin step is unavoidable,
   and every desktop container tool on macOS needs it.
 - **Per-Pod uid isolation without a VM.** The helper is networking-only by decision; untrusted
