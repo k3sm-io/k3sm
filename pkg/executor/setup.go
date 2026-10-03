@@ -531,50 +531,23 @@ func kinePath(bd string) string       { return filepath.Join(bd, kineBinaryName)
 func kineMarkerPath(bd string) string { return filepath.Join(bd, KineMarkerName) }
 
 // kineMarkerContent renders a marker: "<version> <variant>\n".
-func kineMarkerContent(version string) string { return version + " " + kineBuildVariant + "\n" }
+func kineMarkerContent(version string) string { return kineChild(version).markerContent() }
 
 // readKineMarker returns the (version, variant) recorded beside a staged kine binary.
 // A missing or unreadable marker yields ("", ""), which no target ever matches — so an
 // unmarked binary (anything staged before markers existed) always re-stages.
 func readKineMarker(bd string) (version, variant string) {
-	b, err := os.ReadFile(kineMarkerPath(bd))
-	if err != nil {
-		return "", ""
-	}
-	f := strings.Fields(string(b))
-	switch len(f) {
-	case 0:
-		return "", ""
-	case 1:
-		return f[0], ""
-	default:
-		return f[0], f[1]
-	}
+	return readChildMarker(kineMarkerPath(bd))
 }
 
 // kineStaged reports whether bd holds a kine binary whose marker vouches for exactly
 // (version, kineBuildVariant). The marker is written LAST and only after the binary is
 // staged and signed, so "marker matches" implies "the binary beside it is finished".
-func kineStaged(bd, version string) bool {
-	if _, err := os.Stat(kinePath(bd)); err != nil {
-		return false
-	}
-	v, variant := readKineMarker(bd)
-	return v == version && variant == kineBuildVariant
-}
+func kineStaged(bd, version string) bool { return kineChild(version).staged(bd) }
 
 // writeKineMarker writes the marker atomically (temp + rename) so a crashed or
 // killed boot can never leave a half-written marker vouching for the wrong bytes.
-func writeKineMarker(bd, version string) error {
-	tmp := kineMarkerPath(bd) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(kineMarkerContent(version)), 0o644); err != nil {
-		return fmt.Errorf("write kine version marker: %w", err)
-	}
-	if err := os.Rename(tmp, kineMarkerPath(bd)); err != nil {
-		return fmt.Errorf("install kine version marker: %w", err)
-	}
-	return nil
-}
+func writeKineMarker(bd, version string) error { return kineChild(version).writeMarker(bd) }
 
 // ensureKine builds kine from source CGO_ENABLED=0 (kine's pure-Go
 // modernc.org/sqlite backend) into the workdir bin, ad-hoc signs it, and records the
@@ -585,50 +558,44 @@ func ensureKine(ctx context.Context, workDir, kineVersion string) error {
 }
 
 // ensureKineInto is ensureKine against an explicit bin dir — shared by the boot
-// path and StagePayload.
+// path and StagePayload. The staging choreography (marker check, toolchain
+// preflight, drop-stale-marker, temp + rename, sign, marker last) is the
+// stagedChild protocol; kineChild declares only how kine is built.
 func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
-	kine := kinePath(bd)
-	if kineStaged(bd, kineVersion) {
-		return signBinaries(ctx, bd, []string{kineBinaryName})
-	}
-	// Preflight the toolchain BEFORE anything runs `go` (the module-cache probe is the
-	// first). Its absence is the one build failure that is deterministic: a launchd
-	// PATH without `go` is the same PATH on every respawn, so the daemon's breaker
-	// parks on the first such failure instead of counting to its threshold. The
-	// sentinel is the ONLY classification; build output is never string-matched.
-	// It runs before the stale marker is dropped on purpose: a toolchain-less park
-	// then leaves the previously staged binary AND its marker untouched, instead of
-	// stranding good bytes unmarked until the operator's remedy rebuilds them.
-	if _, err := lookPathGo(); err != nil {
-		return fmt.Errorf("build kine %s: %w (%v); %s", kineVersion, ErrNoGoToolchain, err, NoGoToolchainRemedy)
-	}
-	// Drop any stale marker BEFORE touching the binary: from here until the marker is
-	// rewritten, the correct answer to "what is staged?" is "nothing trustworthy", and
-	// an interrupted re-stage must re-stage again rather than trust a marker that
-	// describes bytes we did not finish writing.
-	if err := os.Remove(kineMarkerPath(bd)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear kine version marker: %w", err)
-	}
-	// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
-	// is set ("cannot install cross-compiled binaries when GOBIN is set"), and the
-	// release stages for darwin/arm64 explicitly — which counts as cross-compiling
-	// whenever the toolchain's own GOARCH differs, as it does on a Mac running Go
-	// under Rosetta. So install into a scratch GOPATH instead of GOBIN and copy the
-	// result out. Cross-compiled installs land in bin/<goos>_<goarch>/, native ones
-	// directly in bin/, so both are probed.
-	gopath, err := os.MkdirTemp("", "k3sm-kine-gopath")
-	if err != nil {
-		return fmt.Errorf("kine build scratch dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(gopath) }()
+	return kineChild(kineVersion).ensureInto(ctx, bd)
+}
 
+// kineChild is kine's stagedChild declaration at the given pin.
+func kineChild(kineVersion string) stagedChild {
+	return stagedChild{
+		name:    kineBinaryName,
+		marker:  KineMarkerName,
+		version: kineVersion,
+		variant: kineBuildVariant,
+		build: func(ctx context.Context, gopath string) (string, error) {
+			return buildKine(ctx, kineVersion, gopath)
+		},
+	}
+}
+
+// buildKine runs the pinned `go install` (CGO_ENABLED=0, see kineBuildEnv) into the
+// scratch GOPATH and returns the built binary's path.
+//
+// `go install pkg@version` REFUSES to write a cross-compiled binary when GOBIN
+// is set ("cannot install cross-compiled binaries when GOBIN is set"), and the
+// release stages for darwin/arm64 explicitly — which counts as cross-compiling
+// whenever the toolchain's own GOARCH differs, as it does on a Mac running Go
+// under Rosetta. So install into a scratch GOPATH instead of GOBIN and copy the
+// result out. Cross-compiled installs land in bin/<goos>_<goarch>/, native ones
+// directly in bin/, so both are probed.
+func buildKine(ctx context.Context, kineVersion, gopath string) (string, error) {
 	// The scratch GOPATH is thrown away with the build; the MODULE CACHE must not be.
 	modCache, err := kineModuleCacheDir(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if out, err := runKineBuild(ctx, kineVersion, gopath, modCache); err != nil {
-		return fmt.Errorf("build kine %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
+		return "", fmt.Errorf("build kine %s (CGO_ENABLED=0): %w (a packaged install has no Go toolchain — re-run `sudo k3sm install` so the staged payload carries this pin): %s",
 			kineVersion, err, out)
 	}
 
@@ -643,19 +610,7 @@ func ensureKineInto(ctx context.Context, bd, kineVersion string) error {
 	if _, statErr := os.Stat(built); statErr != nil {
 		built = filepath.Join(gopath, "bin", "kine") // native
 	}
-	// Stage through a temp name + rename so an interrupted copy cannot leave a
-	// truncated binary at the real path.
-	if err := copyFile(built, kine+".tmp", 0o755); err != nil {
-		return fmt.Errorf("stage kine binary: %w", err)
-	}
-	if err := os.Rename(kine+".tmp", kine); err != nil {
-		return fmt.Errorf("install kine binary: %w", err)
-	}
-	if err := signBinaries(ctx, bd, []string{kineBinaryName}); err != nil {
-		return err
-	}
-	// LAST: the marker vouches for a staged, signed binary.
-	return writeKineMarker(bd, kineVersion)
+	return built, nil
 }
 
 // kineBuildEnv is the environment the pinned kine `go install` runs under.
@@ -678,18 +633,19 @@ func kineBuildEnv(gopath, modCache string) []string {
 		"CGO_ENABLED=0", "GOWORK=off", "GOBIN=", "GOPATH="+gopath, "GOMODCACHE="+modCache)
 }
 
-// ErrNoGoToolchain marks a kine re-stage that cannot run because no `go` is on PATH.
+// ErrNoGoToolchain marks a re-stage of a source-built control-plane child (kine, and
+// any other stagedChild) that cannot run because no `go` is on PATH.
 // It is a PERMANENT bring-up fault: retrying under the same environment fails the same
 // way, which is what lets the crash-loop breaker park on the first occurrence
 // (CrashRecord.RecordPermanent). Match it with errors.Is, never by message.
-var ErrNoGoToolchain = errors.New("no Go toolchain on PATH to build the pinned kine")
+var ErrNoGoToolchain = errors.New("no Go toolchain on PATH to build the pinned control-plane child")
 
 // NoGoToolchainRemedy is the operator's fix for ErrNoGoToolchain: a packaged install
-// carries the pinned kine in its staged payload, so re-installing re-stages it and the
+// carries the pinned children in its staged payload, so re-installing re-stages it and the
 // boot seeds from the payload instead of building.
 const NoGoToolchainRemedy = "a packaged install has no Go toolchain; re-run `sudo k3sm install` so the staged payload carries this pin"
 
-// lookPathGo resolves the toolchain the kine build needs. It reads PATH at call time,
+// lookPathGo resolves the toolchain the child builds need. It reads PATH at call time,
 // so a test drives it with t.Setenv rather than a seam.
 func lookPathGo() (string, error) { return exec.LookPath("go") }
 
