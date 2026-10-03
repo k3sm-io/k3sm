@@ -1,0 +1,19 @@
+// Negative-control fixture for TestRealSocketDetector: an untagged test file
+// that opens a real loopback listener. The self-test copies it into a scratch
+// module as a _test.go file and requires the walker to flag it. It is a .txt
+// file so the go tool never builds it here.
+
+package x
+
+import (
+	"net"
+	"testing"
+)
+
+func TestOpensARealSocket(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ln.Close()
+}
