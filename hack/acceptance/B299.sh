@@ -15,7 +15,7 @@
 # `pfctl -sr`, `pfctl -a io.k3sm.mesh -sr`, `route -n get`, `ifconfig` (read),
 # `ping` and `tcpdump -i <utun>`; it never enables, disables, loads or flushes
 # pf, never changes a route or an interface MTU, and toggles no system setting.
-# Its only writes are pods and a ConfigMap in the `b299` namespace it owns and
+# Its only writes are two pods in the `b299` namespace it owns and
 # deletes on exit.
 #
 # Legs (each writes its own log under the run directory):
@@ -54,10 +54,15 @@
 #   K3SM_B299_BULK_SECS     per-direction bulk duration (default 30)
 #   K3SM_B299_SOAK_SECS     soak duration (default 300, capped at 600)
 #   K3SM_ARTIFACT           the k3sm binary under test (default: the one on PATH)
+#   K3SM_B299_PYTHON        interpreter path on BOTH nodes (default: the Command
+#                           Line Tools python3, which a native pod can exec;
+#                           the /usr/bin/python3 stub cannot resolve it inside
+#                           the sandbox)
 #
 # Requires: kubectl, ssh (non-interactive) to the peer, passwordless sudo on both
-# nodes for tcpdump/pfctl reads and the panic-directory listing, /usr/bin/python3
-# on both nodes (the pods are native and use the host interpreter).
+# nodes for tcpdump/pfctl reads and the panic-directory listing, and the
+# K3SM_B299_PYTHON interpreter on both nodes (the pods are native and use the
+# host interpreter; the tool is passed inline with -c, so no file is mounted).
 set -uo pipefail
 
 GATE_NAME="B299"
@@ -70,6 +75,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PEER_SSH="${K3SM_B299_PEER_SSH:-}"
 LEGS="${K3SM_B299_LEGS:-pf,panic,mss,udp,pmtud,bulk,soak}"
 BULK_SECS="${K3SM_B299_BULK_SECS:-30}"
+PY="${K3SM_B299_PYTHON:-/Library/Developer/CommandLineTools/usr/bin/python3}"
 SOAK_SECS="${K3SM_B299_SOAK_SECS:-300}"
 [ "$SOAK_SECS" -gt 600 ] && SOAK_SECS=600
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -79,6 +85,8 @@ NS=b299
 MSS_LIMIT=1340
 PORT_SYN=18299; PORT_BULK=18302; PORT_SOAK=18303
 UDP_PORT=18301; UDP_PORT_DF=18304; UDP_PORT_SOAK=18305
+CTRL_PORT=18306  # the server reports its state here (a native pod's python stdout
+                 # does not reach kubectl logs, so state is read back over exec)
 UDP_SIZES="1200,1352,1353,1400,2000,4000,8000"
 UDP_REPEAT=5
 WORK="$(mktemp -d -t b299work)"
@@ -134,6 +142,7 @@ note_incomplete() { INCOMPLETE="$INCOMPLETE $1"; log "LEG INCOMPLETE: $1 ($2)"; 
 kc get --raw /healthz >/dev/null 2>&1 || { echo "the cluster at \$KUBECONFIG is not serving" >&2; exit 1; }
 sudo -n true 2>/dev/null || { echo "passwordless sudo is required on this node (tcpdump/pfctl reads)" >&2; exit 1; }
 rsh "sudo -n true" >/dev/null 2>&1 || { echo "ssh + passwordless sudo is required on the peer" >&2; exit 1; }
+[ -x "$PY" ] && rsh "test -x $PY" || { echo "$PY must exist on both nodes (K3SM_B299_PYTHON)" >&2; exit 1; }
 
 LOCAL_NODE=""; LOCAL_NODE_IP=""; PEER_NODE=""; PEER_NODE_IP=""
 while read -r name ip ready; do
@@ -155,7 +164,7 @@ PEER_ENDPOINT="$(kc get meshpeer "$PEER_NODE" -o jsonpath='{.spec.endpoint}' 2>/
 PEER_ENDPOINT_HOST="${PEER_ENDPOINT%:*}"
 log "local node $LOCAL_NODE ($LOCAL_NODE_IP) via $LOCAL_UTUN; peer node $PEER_NODE ($PEER_NODE_IP) via $PEER_UTUN"
 
-# ── The traffic tool (delivered by ConfigMap; also run on the hosts) ─────────────
+# ── The traffic tool (inline in the pod command; also run on the hosts) ─────────────
 cat >"$WORK/tool.py" <<'PY'
 import errno, json, os, socket, sys, threading, time
 
@@ -174,6 +183,9 @@ def maxseg(s):
         return -1
 
 
+EVENTS = []
+
+
 def tcp_conn(c, a, port):
     t0, n, mss = time.time(), 0, maxseg(c)
     try:
@@ -185,7 +197,7 @@ def tcp_conn(c, a, port):
     except OSError:
         pass
     dt = max(time.time() - t0, 1e-6)
-    out("tcp-recv port=%d peer=%s bytes=%d secs=%.2f mbps=%.1f maxseg=%d" % (port, a[0], n, dt, n * 8 / dt / 1e6, mss))
+    EVENTS.append("tcp-recv port=%d peer=%s bytes=%d secs=%.2f mbps=%.1f maxseg=%d" % (port, a[0], n, dt, n * 8 / dt / 1e6, mss))
     c.close()
 
 
@@ -210,22 +222,34 @@ def udp_srv(ip, port, counts, lock):
             counts[k] = counts.get(k, 0) + 1
 
 
-def serve(tcp_ports, udp_ports):
+def serve(tcp_ports, udp_ports, ctrl_port):
     ip = os.environ.get("POD_IP") or "0.0.0.0"
     counts, lock = {}, threading.Lock()
     for p in tcp_ports.split(","):
         threading.Thread(target=tcp_srv, args=(ip, int(p)), daemon=True).start()
     for p in udp_ports.split(","):
         threading.Thread(target=udp_srv, args=(ip, int(p), counts, lock), daemon=True).start()
-    out("b299-serve ready ip=%s" % ip)
-    last = None
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, int(ctrl_port)))
+    s.listen(8)
     while True:
-        time.sleep(2)
+        c, _ = s.accept()
         with lock:
-            snap = json.dumps(counts, sort_keys=True)
-        if snap != last:
-            out("udp-counts " + snap)
-            last = snap
+            state = {"ready": True, "ip": ip, "udp": dict(counts), "tcp": list(EVENTS)}
+        c.sendall(json.dumps(state, sort_keys=True).encode())
+        c.close()
+
+
+def query(ip, port):
+    s = socket.create_connection((ip, int(port)), timeout=10)
+    b = b""
+    while True:
+        d = s.recv(65536)
+        if not d:
+            break
+        b += d
+    out(b.decode())
 
 
 def connect(src, dst, port):
@@ -286,8 +310,8 @@ def udpstream(src, dst, port, size, secs, pps):
     out("udpstream-sent size=%s sent=%d errs=%d" % (size, sent, errs))
 
 
-cmd, args = sys.argv[1], sys.argv[2:]
-{"serve": serve, "syn": syn, "bulk": bulk, "udp": udp, "udpstream": udpstream}[cmd](*args)
+cmd, args = sys.argv[1], sys.argv[2:]  # with -c, argv[0] is "-c"
+{"serve": serve, "query": query, "syn": syn, "bulk": bulk, "udp": udp, "udpstream": udpstream}[cmd](*args)
 PY
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
@@ -373,50 +397,54 @@ panic_list() { # <tag>
 POD_L="b299-l-$RUN_ID"; POD_P="b299-p-$RUN_ID"
 POD_L=$(echo "$POD_L" | tr 'A-Z' 'a-z'); POD_P=$(echo "$POD_P" | tr 'A-Z' 'a-z')
 POD_L_IP=""; POD_P_IP=""
-pod_yaml() { # <name> <node>
-	cat <<EOF
-apiVersion: v1
-kind: Pod
-metadata: {name: $1, namespace: $NS, labels: {app: b299}}
-spec:
-  nodeName: $2
-  nodeSelector: {kubernetes.io/os: darwin}
-  tolerations: [{key: k3sm.io/provider, operator: Exists, effect: NoSchedule}]
-  restartPolicy: Never
-  containers:
-  - name: c
-    image: native
-    command: ["/usr/bin/python3", "-u", "/b299/tool.py", "serve", "$PORT_SYN,$PORT_BULK,$PORT_SOAK", "$UDP_PORT,$UDP_PORT_DF,$UDP_PORT_SOAK"]
-    env:
-    - name: POD_IP
-      valueFrom: {fieldRef: {fieldPath: status.podIP}}
-    volumeMounts:
-    - {name: tool, mountPath: /b299}
-    - {name: data, mountPath: /data}
-  volumes:
-  - name: tool
-    configMap: {name: b299-tool}
-  - name: data
-    emptyDir: {}
-EOF
+pod_json() { # <name> <node>  (the tool source rides the command as -c)
+	"$PY" - "$1" "$2" "$NS" "$PY" "$PORT_SYN,$PORT_BULK,$PORT_SOAK" "$UDP_PORT,$UDP_PORT_DF,$UDP_PORT_SOAK" "$CTRL_PORT" "$WORK/tool.py" <<'PYJ'
+import json, sys
+name, node, ns, py, tcp, udp, ctrl, tool = sys.argv[1:]
+print(json.dumps({
+    "apiVersion": "v1", "kind": "Pod",
+    "metadata": {"name": name, "namespace": ns, "labels": {"app": "b299"}},
+    "spec": {
+        "nodeName": node,
+        "nodeSelector": {"kubernetes.io/os": "darwin"},
+        "tolerations": [{"key": "k3sm.io/provider", "operator": "Exists", "effect": "NoSchedule"}],
+        "restartPolicy": "Never",
+        "containers": [{
+            "name": "c", "image": "native",
+            "command": [py, "-u", "-c", open(tool).read(), "serve", tcp, udp, ctrl],
+            "env": [{"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}],
+            "volumeMounts": [{"name": "data", "mountPath": "/data"}],
+        }],
+        "volumes": [{"name": "data", "emptyDir": {}}],
+    },
+}))
+PYJ
 }
 pods_up() {
 	kc delete namespace "$NS" --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
 	kc create namespace "$NS" >/dev/null
-	kc create configmap b299-tool -n "$NS" --from-file=tool.py="$WORK/tool.py" >/dev/null
-	pod_yaml "$POD_L" "$LOCAL_NODE" | kc apply -f - >/dev/null
-	pod_yaml "$POD_P" "$PEER_NODE" | kc apply -f - >/dev/null
+	pod_json "$POD_L" "$LOCAL_NODE" | kc apply -f - >/dev/null
+	pod_json "$POD_P" "$PEER_NODE" | kc apply -f - >/dev/null
 	kc wait --for=condition=Ready "pod/$POD_L" "pod/$POD_P" -n "$NS" --timeout=180s >/dev/null || return 1
 	POD_L_IP="$(kc get pod "$POD_L" -n "$NS" -o jsonpath='{.status.podIP}')"
 	POD_P_IP="$(kc get pod "$POD_P" -n "$NS" -o jsonpath='{.status.podIP}')"
-	local i p
-	for p in "$POD_L" "$POD_P"; do
-		for i in $(seq 1 30); do kc logs "$p" -n "$NS" 2>/dev/null | grep -q "b299-serve ready" && break; sleep 1; done
-		kc logs "$p" -n "$NS" 2>/dev/null | grep -q "b299-serve ready ip=1" || { log "pod $p server not ready: $(kc logs "$p" -n "$NS" 2>&1 | tail -3)"; return 1; }
+	local i p ip
+	for p in "$POD_L:$POD_L_IP" "$POD_P:$POD_P_IP"; do
+		ip="${p#*:}"; p="${p%%:*}"
+		for i in $(seq 1 30); do srv_state "$p" "$ip" | grep -q '"ready": true' && break; sleep 1; done
+		srv_state "$p" "$ip" | grep -q "\"ip\": \"$ip\"" || { log "pod $p server not ready: $(srv_state "$p" "$ip" 2>&1 | tail -3)"; return 1; }
 	done
 	log "pods: $POD_L $POD_L_IP on $LOCAL_NODE; $POD_P $POD_P_IP on $PEER_NODE"
 }
-px() { local pod="$1"; shift; kc exec -n "$NS" "$pod" -- /usr/bin/python3 -u /b299/tool.py "$@"; }
+px() { local pod="$1"; shift; kc exec -n "$NS" "$pod" -- "$PY" -u -c "$(cat "$WORK/tool.py")" "$@"; }
+# srv_state <pod> <pod-ip> prints the server's JSON state (udp counts, tcp records).
+srv_state() { px "$1" query "$2" "$CTRL_PORT" 2>&1; }
+# srv_tcp <pod> <pod-ip> <port> prints the last tcp-recv record for that port.
+srv_tcp() { srv_state "$1" "$2" | "$PY" -c "import json,sys
+try: d=json.loads(sys.stdin.read())
+except ValueError: d={'tcp': []}
+r=[e for e in d['tcp'] if 'port=$3 ' in e]
+print(r[-1] if r else '')"; }
 
 # ── Leg: mss ──────────────────────────────────────────────────────────────────
 MSS_ROWS_FILE="$RUN_DIR/mss-rows.txt"; : >"$MSS_ROWS_FILE"
@@ -428,8 +456,8 @@ leg_mss() {
 	{
 		echo "## pod L -> pod P"; px "$POD_L" syn "$POD_L_IP" "$POD_P_IP" "$PORT_SYN"
 		echo "## pod P -> pod L"; px "$POD_P" syn "$POD_P_IP" "$POD_L_IP" "$PORT_SYN"
-		echo "## node L ($LOCAL_NODE_IP, lo0) -> pod P"; /usr/bin/python3 "$WORK/tool.py" syn "$LOCAL_NODE_IP" "$POD_P_IP" "$PORT_SYN"
-		echo "## node P ($PEER_NODE_IP, lo0) -> pod L"; rsh_stdin "/usr/bin/python3 - syn $PEER_NODE_IP $POD_L_IP $PORT_SYN" <"$WORK/tool.py"
+		echo "## node L ($LOCAL_NODE_IP, lo0) -> pod P"; "$PY" "$WORK/tool.py" syn "$LOCAL_NODE_IP" "$POD_P_IP" "$PORT_SYN"
+		echo "## node P ($PEER_NODE_IP, lo0) -> pod L"; rsh_stdin "$PY - syn $PEER_NODE_IP $POD_L_IP $PORT_SYN" <"$WORK/tool.py"
 	} >"$d/clients.log" 2>&1
 	cap_stop local "port $PORT_SYN"
 	cap_stop peer "port $PORT_SYN"
@@ -459,11 +487,13 @@ udp_dir() { # <label> <client-pod> <src> <dst> <server-pod> <capture-side>
 	done
 	sleep 3
 	local counts
-	counts="$(kc logs "$spod" -n "$NS" 2>/dev/null | grep '^udp-counts' | tail -1 | sed 's/^udp-counts //')"
+	counts="$(srv_state "$spod" "$dst" | "$PY" -c "import json,sys
+try: print(json.dumps(json.loads(sys.stdin.read())['udp']))
+except ValueError: print('{}')")"
 	echo "server counts: $counts" >>"$d/clients.log"
 	while read -r lab sz df s e pk fr; do
 		port=$UDP_PORT; [ "$df" = 1 ] && port=$UDP_PORT_DF
-		recv="$(echo "$counts" | /usr/bin/python3 -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('$port:$sz',0))")"
+		recv="$(echo "$counts" | "$PY" -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('$port:$sz',0))")"
 		local outcome
 		if [ "$s" -eq 0 ] && [ "$e" != none ]; then outcome="refused-locally($e)"
 		elif [ "$recv" -ge "$s" ] && [ "$fr" -gt 0 ]; then outcome="fragmented-delivered"
@@ -538,7 +568,7 @@ bulk_dir() { # <label> <client-pod> <src> <dst> <server-pod> <capture-side>
 	cap_stop "$side" "and not port $PORT_BULK"
 	cap_stop "$other" "and not port $PORT_BULK"
 	sleep 2
-	kc logs "$spod" -n "$NS" 2>/dev/null | grep "tcp-recv port=$PORT_BULK" | tail -1 >"$d/server.log"
+	srv_tcp "$spod" "$dst" "$PORT_BULK" >"$d/server.log"
 	mss_rows "$d/cap-send.txt" "$side-bulk" >>"$MSS_ROWS_FILE"
 	local maxlen pk icmp mbps_s mbps_r
 	maxlen="$(grep -oE 'proto TCP \(6\), length [0-9]+' "$d/cap-send.txt" | awk '{print $NF}' | sort -n | tail -1)"
@@ -570,19 +600,28 @@ leg_soak() {
 	px "$POD_L" udpstream "$POD_L_IP" "$POD_P_IP" "$UDP_PORT_SOAK" 1400 "$SOAK_SECS" 100 >"$d/udp-l2p.log" 2>&1 & BG_PIDS="$BG_PIDS $!"; local u1=$!
 	px "$POD_P" udpstream "$POD_P_IP" "$POD_L_IP" "$UDP_PORT_SOAK" 1400 "$SOAK_SECS" 100 >"$d/udp-p2l.log" 2>&1 & BG_PIDS="$BG_PIDS $!"; local u2=$!
 	t0=$(date +%s); end=$(( t0 + SOAK_SECS ))
+	# kubectl cp is tar over the exec stream; when tar in the pod cannot reach the
+	# mount the copy falls back to the same exec stream without tar (recorded).
+	CP_MODE="kubectl cp"
+	kc cp "$blob" "$NS/$POD_P:/data/blob" -c c >>"$d/cp.log" 2>&1 || CP_MODE="kubectl exec -i (cat >/dev/null)"
+	echo "cp mode: $CP_MODE" >>"$d/cp.log"
+	push_blob() { # <pod>
+		if [ "$CP_MODE" = "kubectl cp" ]; then kc cp "$blob" "$NS/$1:/data/blob" -c c >>"$d/cp.log" 2>&1
+		else kc exec -i -n "$NS" "$1" -- /bin/sh -c 'cat >/dev/null' <"$blob" >>"$d/cp.log" 2>&1; fi
+	}
 	while [ "$(date +%s)" -lt "$end" ]; do
-		if kc cp "$blob" "$NS/$POD_P:/data/blob" -c c >>"$d/cp.log" 2>&1; then cp_ok=$((cp_ok+1)); else cp_fail=$((cp_fail+1)); fi
-		if kc cp "$blob" "$NS/$POD_L:/data/blob" -c c >>"$d/cp.log" 2>&1; then cp_ok=$((cp_ok+1)); else cp_fail=$((cp_fail+1)); fi
+		if push_blob "$POD_P"; then cp_ok=$((cp_ok+1)); else cp_fail=$((cp_fail+1)); fi
+		if push_blob "$POD_L"; then cp_ok=$((cp_ok+1)); else cp_fail=$((cp_fail+1)); fi
 		kc get --raw /healthz >/dev/null 2>&1 || health_fail=$((health_fail+1))
 		echo "$(( $(date +%s) - t0 ))s cp_ok=$cp_ok cp_fail=$cp_fail health_fail=$health_fail" >>"$d/progress.log"
 	done
 	wait "$b1" "$b2" "$u1" "$u2" "$CPU_L" "$CPU_P" 2>/dev/null
 	sleep 3
-	kc logs "$POD_P" -n "$NS" 2>/dev/null | grep -E "tcp-recv port=$PORT_SOAK|^udp-counts" | tail -2 >"$d/server-p.log"
-	kc logs "$POD_L" -n "$NS" 2>/dev/null | grep -E "tcp-recv port=$PORT_SOAK|^udp-counts" | tail -2 >"$d/server-l.log"
+	srv_state "$POD_P" "$POD_P_IP" >"$d/server-p.json"
+	srv_state "$POD_L" "$POD_L_IP" >"$d/server-l.json"
 	local nodes_ready
 	nodes_ready="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}')"
-	SOAK_SUMMARY="secs=$SOAK_SECS bulk L->P $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-l2p.log")Mbit/s, P->L $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-p2l.log")Mbit/s; udp L->P $(cat "$d/udp-l2p.log" | tr '\n' ' ') P->L $(cat "$d/udp-p2l.log" | tr '\n' ' '); kubectl cp ok=$cp_ok fail=$cp_fail; healthz_fail=$health_fail; nodes: $nodes_ready"
+	SOAK_SUMMARY="secs=$SOAK_SECS bulk L->P $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-l2p.log")Mbit/s, P->L $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-p2l.log")Mbit/s; udp L->P $(cat "$d/udp-l2p.log" | tr '\n' ' ') P->L $(cat "$d/udp-p2l.log" | tr '\n' ' '); ${CP_MODE} ok=$cp_ok fail=$cp_fail (32 MiB each); healthz_fail=$health_fail; nodes: $nodes_ready"
 	printf '       cpu local: %s\n       cpu peer:  %s\n' "$(cpu_summary "$d/cpu.local")" "$(cpu_summary "$d/cpu.peer")" >"$d/cpu-summary.txt"
 	log "soak: $SOAK_SUMMARY"
 	grep -q bulk-sent "$d/bulk-l2p.log" && grep -q bulk-sent "$d/bulk-p2l.log" || return 1
