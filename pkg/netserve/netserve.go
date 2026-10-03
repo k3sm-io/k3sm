@@ -146,6 +146,12 @@ type Config struct {
 	// set: an unknown vm source then fails OPEN like any other unattributable
 	// source, which is the unscoped behavior and never a wrong deny.
 	VMNetSubnet string
+	// PodScopeNode is the node whose pods this datapath may see. Set it when the
+	// datapath runs under that node's own identity: the Node authorizer refuses a
+	// node's cluster-wide pod list, so the NetworkPolicy watcher then lists only
+	// spec.nodeName=PodScopeNode (proxy.WithPodNodeScope). Empty is cluster-wide
+	// (the server, under the admin identity).
+	PodScopeNode string
 	// NetdSocket, when non-empty, routes the proxy's privileged operations (the
 	// lo0 ClusterIP VIP alias and any privileged-port <1024 bind) through the root
 	// k3sm-netd helper at this socket, so the proxy runs unprivileged (the _k3sm
@@ -302,7 +308,7 @@ func New(cfg Config) *Server {
 		}
 	}
 	s.watch = proxy.NewWatcher(cfg.Client, s.proxy, log, watchOpts...)
-	s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log)
+	s.policyWatch = proxy.NewPolicyWatcher(cfg.Client, s.policy, log, proxy.WithPodNodeScope(cfg.PodScopeNode))
 	return s
 }
 
@@ -380,7 +386,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// The NetworkPolicy watcher runs beside the Service watcher: same
 	// client, same lifecycle. The table stays empty (allow-everything) until its
 	// informers sync — the documented fail-open — so it never gates bring-up.
-	g.Go(func() error { return s.policyWatch.Run(gctx) })
+	g.Go(func() error { return s.RunPolicyWatch(gctx) })
 	// Provision the canonical kube-system/kube-dns Service BEFORE the resolver binds:
 	// it is the DECLARING SUBJECT the netd port authorizer confirms the privileged
 	// DNS-VIP :53 bind against (exactly as k3sm-ingress is for :80/:443). Without it
@@ -402,6 +408,17 @@ func (s *Server) Run(ctx context.Context) error {
 		return nil // clean shutdown
 	}
 	return err
+}
+
+// RunPolicyWatch runs only the NetworkPolicy watcher (the Pods, Namespaces and
+// NetworkPolicies informers that resolve policies into the verdict table) until
+// ctx is cancelled. Run hosts it beside the Service watcher; it is exported on
+// its own because it is the one part of the datapath that needs no privilege
+// (no socket bind, no lo0 alias, no netd), so a caller can exercise exactly what
+// this Server lists and watches under a given identity. It ignores Disabled:
+// Run is what decides not to start it.
+func (s *Server) RunPolicyWatch(ctx context.Context) error {
+	return s.policyWatch.Run(ctx)
 }
 
 // ensureDNSService idempotently provisions kube-system/kube-dns: a selector-less

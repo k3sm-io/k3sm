@@ -1400,9 +1400,13 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		// worker with no vm backend keeps the byte-identical plain table.
 		VMBackend:   vmCapable,
 		VMNetSubnet: netserve.DefaultVMNetSubnet,
-		NetdSocket:  mode.Socket,
-		Disabled:    !mode.DataPath(),
-		Logger:      logger,
+		// The worker's datapath runs under the node kubeconfig
+		// (system:node:<name>), which the Node authorizer lets list only the
+		// pods bound to this node.
+		PodScopeNode: opts.nodeName,
+		NetdSocket:   mode.Socket,
+		Disabled:     !mode.DataPath(),
+		Logger:       logger,
 	}
 }
 

@@ -270,6 +270,16 @@ are never enforced**, and policies against `kube-dns` or the `kubernetes` VIP ar
 because those VIPs bypass the proxy. It is a policy hint, NOT a security boundary. Isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
+On a joined worker node:
+
+- The worker's policy table sees only the Pods running on that worker. A policy is enforced at the
+  worker's proxy only for backends that run on that worker.
+- A policy that selects a Pod on another node is not enforced from this worker. That traffic is
+  allowed.
+- Policies that select a worker's own backends are now enforced there. Before, they had no effect
+  on a worker.
+- Traffic arriving from a peer node's mesh address is always allowed at the destination.
+
 The `k3sm.io/internet-egress` annotation is the same kind of control. It records that a Pod needs to
 reach networks beyond the cluster, and admission surfaces a hand-set one, but leaving it off does not
 stop a native Pod from reaching the internet. k3sm does not manage the host's packet filter, and the
