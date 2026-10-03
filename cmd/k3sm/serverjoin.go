@@ -48,9 +48,9 @@ func adminKubeconfigPath(workDir string) string { return filepath.Join(workDir, 
 
 // importServerCABundle is the FAIL-CLOSED HA server-join: it fetches the existing
 // server's AES-256-GCM CA bundle over a CA-pinned TLS connection, decrypts it with the
-// server token's secret, and writes the reconstructed cluster + signing CA PEMs under
-// this server's PKI dir — so the subsequent certs.EnsureHierarchy LOADS the IDENTICAL
-// CAs. Any failure returns an error (the caller halts bring-up); it NEVER falls through
+// server token's secret, and writes the reconstructed cluster, signing and etcd CA
+// keypairs under this server's PKI dir — so the subsequent certs.EnsureHierarchy and
+// certs.EnsureEtcdCAs LOAD the IDENTICAL CAs. Any failure returns an error (the caller halts bring-up); it NEVER falls through
 // to minting fresh, divergent CAs. It also records the server secret locally so this
 // server's own bundle endpoint can seal + serve once it is an equal member.
 func importServerCABundle(ctx context.Context, opts serverOptions, logger *slog.Logger) error {

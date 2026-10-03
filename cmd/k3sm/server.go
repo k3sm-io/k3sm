@@ -573,6 +573,15 @@ func runServer(args []string) (err error) {
 		if err != nil {
 			return fmt.Errorf("ensure CA hierarchy: %w", err)
 		}
+		// HA only: the etcd server + peer CAs ride the same bootstrap bundle (a
+		// joining server's import wrote them, so this LOADS them). A non-HA mesh
+		// server mints none.
+		if haDatastore {
+			h.EtcdServer, h.EtcdPeer, err = certs.EnsureEtcdCAs(opts.workDir)
+			if err != nil {
+				return fmt.Errorf("ensure etcd CAs: %w", err)
+			}
+		}
 		hierarchy = h
 		// The server-bootstrap secret (machine-generated ≥256-bit) — minted +
 		// persisted on the first server, already saved by importServerCABundle on a
