@@ -129,9 +129,11 @@ func (b *crashBreaker) write(add func(*executor.CrashRecord, time.Time) bool) (t
 // it could not mint) is still recorded, under "control-plane": the loop it would
 // otherwise produce is the same loop, and an unnamed count is better than none.
 //
-// A PERMANENT failure — today only executor.ErrNoGoToolchain, matched with
-// errors.Is through BringUpError's chain — trips the breaker on this one
-// failure: the launchd PATH that lacked `go` this lap lacks it on every lap.
+// A PERMANENT failure — executor.ErrNoGoToolchain, matched with errors.Is
+// through BringUpError's chain — trips the breaker on this one failure: the
+// launchd PATH that lacked `go` this lap lacks it on every lap. (The joining
+// server's permanent member-route refusal is the other permanent class; it fails
+// before the executor starts, so noteEtcdMemberRouteFailure records it.)
 func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 	component := "control-plane"
 	var bu *executor.BringUpError
@@ -159,6 +161,24 @@ func noteBringUpFailure(b *crashBreaker, logger *slog.Logger, err error) {
 	if b.recordBringUp(component, err.Error()) {
 		logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
 			"path", b.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
+	}
+}
+
+// noteEtcdMemberRouteFailure records a joining server's member-route failure on the
+// breaker when, and only when, it is PERMANENT (errEtcdMemberRoutePermanent): such a
+// refusal reproduces on every lap, exactly like executor.ErrNoGoToolchain, so it
+// trips the breaker on the first one. Anything else that reaches here is a shutdown
+// during the step's in-process retry, which is not a failure at all. The detail is
+// redacted here because the error is this command's own text.
+func noteEtcdMemberRouteFailure(b *crashBreaker, logger *slog.Logger, err error) {
+	if !errors.Is(err, errEtcdMemberRoutePermanent) {
+		return
+	}
+	logger.Error("the existing server permanently refused this server's etcd member; parking on this failure",
+		"component", etcdMemberRouteComponent, "err", err, "remedy", etcdMemberRouteRemedy)
+	if b.recordBringUpPermanent(etcdMemberRouteComponent, status.Redact(err.Error()), etcdMemberRouteRemedy) {
+		logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
+			"path", b.path)
 	}
 }
 

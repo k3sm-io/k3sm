@@ -19,10 +19,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
@@ -132,10 +136,13 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 	})
 
 	t.Run("a route failure stops before the executor and is not a control-plane crash", func(t *testing.T) {
+		// A refusal of the request ends the step; a transient answer is retried
+		// in-process (TestEtcdMemberRouteRetryAndPermanence).
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return false },
 			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
-				return bootstrap.EtcdMemberResponse{}, errors.New("connection refused")
+				return bootstrap.EtcdMemberResponse{}, &bootstrap.ServerRouteError{Path: bootstrap.EtcdMemberPath,
+					StatusCode: http.StatusForbidden, Status: "403 Forbidden", Message: "server bootstrap token rejected"}
 			},
 		}
 		for _, server := range []string{"192.0.2.10", ""} {
@@ -213,4 +220,122 @@ func (f *fakeLocalMembers) MemberPromote(_ context.Context, id uint64) error {
 func (f *fakeLocalMembers) MemberRemove(_ context.Context, id uint64) error {
 	f.calls = append(f.calls, "remove "+string(rune('0'+id)))
 	return nil
+}
+
+// TestEtcdMemberRouteRetryAndPermanence: a joining server's member route retries a
+// TRANSIENT answer in-process (a network error, a 503, a 404) every
+// etcdMemberRouteRetry with no expiry and records nothing on the crash-loop breaker,
+// while a PERMANENT refusal (a 400/401/403/409, a token that does not parse) ends the
+// step at once and is recorded as a permanent bring-up failure, so the breaker parks
+// on the first one.
+func TestEtcdMemberRouteRetryAndPermanence(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	base := executor.Config{WorkDir: t.TempDir(), Etcd: &executor.EtcdConfig{
+		Role: executor.EtcdJoin, Name: "server-b", PeerIP: "192.0.2.11", PeerPort: 2380}}
+	routeErr := func(code int) error {
+		return &bootstrap.ServerRouteError{Path: bootstrap.EtcdMemberPath, StatusCode: code, Status: http.StatusText(code), Message: "refused"}
+	}
+
+	t.Run("transient answers are retried and never recorded", func(t *testing.T) {
+		answers := []error{errors.New("dial tcp 192.0.2.10:9345: connect: connection refused"),
+			routeErr(http.StatusServiceUnavailable), routeErr(http.StatusNotFound), routeErr(http.StatusTooManyRequests), nil}
+		calls := 0
+		var waits []time.Duration
+		j := &serverEtcdJoin{
+			memberExists: func() bool { return false },
+			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+				err := answers[calls]
+				calls++
+				if err != nil {
+					return bootstrap.EtcdMemberResponse{}, err
+				}
+				return bootstrap.EtcdMemberResponse{MemberID: 0xb, InitialCluster: "server-a=https://192.0.2.10:2380,server-b=https://192.0.2.11:2380"}, nil
+			},
+			wait: func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil },
+		}
+		cfg, err := joinEtcdMember(context.Background(), j, "192.0.2.10", base, logger)
+		if err != nil {
+			t.Fatalf("joinEtcdMember = %v, want the route answered after the transient refusals", err)
+		}
+		if calls != len(answers) || len(waits) != len(answers)-1 {
+			t.Errorf("calls=%d waits=%d, want %d calls and one wait between each", calls, len(waits), len(answers))
+		}
+		for _, d := range waits {
+			if d != etcdMemberRouteRetry {
+				t.Errorf("waited %s between attempts, want %s", d, etcdMemberRouteRetry)
+			}
+		}
+		if cfg.Etcd.InitialCluster == "" {
+			t.Error("the executor would start without the route's initial cluster")
+		}
+	})
+
+	t.Run("a shutdown during the retry is returned uncounted", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		j := &serverEtcdJoin{
+			memberExists: func() bool { return false },
+			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+				return bootstrap.EtcdMemberResponse{}, routeErr(http.StatusServiceUnavailable)
+			},
+			wait: func(context.Context, time.Duration) error { cancel(); return context.Canceled },
+		}
+		_, err := joinEtcdMember(ctx, j, "192.0.2.10", base, logger)
+		if !errors.Is(err, errEtcdMemberRoute) || errors.Is(err, errEtcdMemberRoutePermanent) {
+			t.Fatalf("err = %v, want a non-permanent member-route error", err)
+		}
+		dir := t.TempDir()
+		noteEtcdMemberRouteFailure(newCrashBreaker(dir, quietLogger()), quietLogger(), err)
+		if _, serr := os.Stat(executor.CrashLoopPath(dir)); !errors.Is(serr, os.ErrNotExist) {
+			t.Errorf("a shutdown during the member route wrote a crash record (%v)", serr)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"400", routeErr(http.StatusBadRequest)},
+		{"401", routeErr(http.StatusUnauthorized)},
+		{"403 (bad token)", routeErr(http.StatusForbidden)},
+		{"409 (own name)", routeErr(http.StatusConflict)},
+		{"a token that does not parse", fmt.Errorf("%w: missing prefix", bootstrap.ErrMalformedToken)},
+	} {
+		t.Run("permanent "+tc.name+": one call, parked on the first record", func(t *testing.T) {
+			calls := 0
+			j := &serverEtcdJoin{
+				memberExists: func() bool { return false },
+				member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+					calls++
+					return bootstrap.EtcdMemberResponse{}, tc.err
+				},
+				wait: func(context.Context, time.Duration) error {
+					t.Fatal("a permanent refusal was retried")
+					return nil
+				},
+			}
+			_, err := joinEtcdMember(context.Background(), j, "192.0.2.10", base, logger)
+			if calls != 1 || !errors.Is(err, errEtcdMemberRoute) || !errors.Is(err, errEtcdMemberRoutePermanent) {
+				t.Fatalf("calls=%d err=%v, want one call and a permanent member-route error", calls, err)
+			}
+			dir := t.TempDir()
+			noteEtcdMemberRouteFailure(newCrashBreaker(dir, quietLogger()), quietLogger(), err)
+			rec, rerr := executor.ReadCrashRecord(executor.CrashLoopPath(dir))
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			last, _ := rec.Last()
+			if !rec.Tripped() || len(rec.Crashes) != 1 || !last.Permanent || last.Component != etcdMemberRouteComponent ||
+				last.Remedy != etcdMemberRouteRemedy || last.Origin != executor.CrashOriginBringUp {
+				t.Errorf("record = %+v (tripped %v), want one permanent %s bring-up failure that trips the breaker",
+					rec.Crashes, rec.Tripped(), etcdMemberRouteComponent)
+			}
+		})
+	}
+
+	t.Run("a configuration that cannot form the request is permanent", func(t *testing.T) {
+		j := &serverEtcdJoin{memberExists: func() bool { return false }}
+		if _, err := joinEtcdMember(context.Background(), j, "", base, logger); !errors.Is(err, errEtcdMemberRoutePermanent) {
+			t.Errorf("no --server on a first boot: err = %v, want permanent", err)
+		}
+	})
 }

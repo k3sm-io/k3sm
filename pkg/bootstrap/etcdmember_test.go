@@ -446,3 +446,79 @@ func TestServerClassRoutesRejectWorkerToken(t *testing.T) {
 		t.Errorf("etcd-member without Members: status %d, want 404", r.StatusCode)
 	}
 }
+
+// TestServerRouteFailureClassification: the client helpers return a typed
+// *ServerRouteError for a non-2xx answer, and IsPermanentServerRouteFailure classifies
+// by status code and sentinel, never message text. A refusal of the request itself
+// (400/401/403/409), a token that does not parse or is not the server class, and an
+// existing server whose CA does not match the token's pin are permanent; a 404, a 429,
+// every 5xx and a network failure are worth retrying.
+func TestServerRouteFailureClassification(t *testing.T) {
+	clusterCA, _ := certs.NewCA("k3sm-cluster-ca")
+	token := bootstrap.FormatServerToken(clusterCA.PinHash(), memberTestSecret)
+	for _, tc := range []struct {
+		code      int
+		permanent bool
+	}{
+		{http.StatusBadRequest, true},
+		{http.StatusUnauthorized, true},
+		{http.StatusForbidden, true},
+		{http.StatusConflict, true},
+		{http.StatusNotFound, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusInternalServerError, false},
+		{http.StatusServiceUnavailable, false},
+	} {
+		t.Run(http.StatusText(tc.code), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				// The message deliberately reads like the opposite class, so a
+				// classifier that looked at text would get it wrong.
+				http.Error(w, "permanent transient retry refused", tc.code)
+			}))
+			defer ts.Close()
+			_, err := bootstrap.RequestEtcdMember(context.Background(), ts.URL, token, "server-b", joinerPeer, ts.Client())
+			re, ok := errors.AsType[*bootstrap.ServerRouteError](err)
+			if !ok || re.StatusCode != tc.code || re.Path != bootstrap.EtcdMemberPath {
+				t.Fatalf("err = %v (%T), want a *ServerRouteError for %d on %s", err, err, tc.code, bootstrap.EtcdMemberPath)
+			}
+			if got := bootstrap.IsPermanentServerRouteFailure(err); got != tc.permanent {
+				t.Errorf("IsPermanentServerRouteFailure(%d) = %v, want %v", tc.code, got, tc.permanent)
+			}
+			if got := bootstrap.IsPermanentServerRouteFailure(fmt.Errorf("wrapped: %w", err)); got != tc.permanent {
+				t.Errorf("wrapped %d: IsPermanentServerRouteFailure = %v, want %v", tc.code, got, tc.permanent)
+			}
+		})
+	}
+
+	t.Run("a token that does not parse, or is a worker token: permanent", func(t *testing.T) {
+		for _, bad := range []string{"not-a-token", bootstrap.FormatToken(clusterCA.PinHash(), "abcdef", "0123456789abcdef")} {
+			_, err := bootstrap.RequestEtcdMember(context.Background(), "https://192.0.2.10:9345", bad, "server-b", joinerPeer, nil)
+			if err == nil || !bootstrap.IsPermanentServerRouteFailure(err) {
+				t.Errorf("token %q: err = %v, permanent = %v; want a permanent failure", bad, err, bootstrap.IsPermanentServerRouteFailure(err))
+			}
+		}
+	})
+
+	t.Run("the wrong cluster's CA: permanent", func(t *testing.T) {
+		ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Error("a request reached a server whose CA does not match the pin")
+		}))
+		defer ts.Close()
+		// client nil: the helper builds the CA-pinned client from the token, and the
+		// test server's certificate is not the cluster CA the token pins.
+		_, err := bootstrap.RequestEtcdMember(context.Background(), ts.URL, token, "server-b", joinerPeer, nil)
+		if err == nil || !errors.Is(err, certs.ErrPinMismatch) || !bootstrap.IsPermanentServerRouteFailure(err) {
+			t.Errorf("err = %v; want a permanent failure wrapping certs.ErrPinMismatch", err)
+		}
+	})
+
+	t.Run("a network failure: transient", func(t *testing.T) {
+		ts := httptest.NewServer(http.NotFoundHandler())
+		url := ts.URL
+		ts.Close()
+		_, err := bootstrap.RequestEtcdMember(context.Background(), url, token, "server-b", joinerPeer, http.DefaultClient)
+		if err == nil || bootstrap.IsPermanentServerRouteFailure(err) {
+			t.Errorf("err = %v, permanent = %v; want a transient failure", err, bootstrap.IsPermanentServerRouteFailure(err))
+		}
+	})
+}

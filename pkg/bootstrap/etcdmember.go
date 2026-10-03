@@ -30,6 +30,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // The server-class etcd member routes. A server joining an embedded-etcd HA cluster
@@ -384,8 +386,49 @@ func PromoteEtcdMember(ctx context.Context, serverURL, token, name string, clien
 	return err
 }
 
+// ServerRouteError is a server-class route's non-2xx answer, as the client helpers
+// (RequestEtcdMember, PromoteEtcdMember) return it. StatusCode is what a caller
+// classifies on (Permanent), never the message text.
+type ServerRouteError struct {
+	// Path is the route that answered; Status the HTTP status line.
+	Path, Status string
+	// StatusCode is the HTTP status code.
+	StatusCode int
+	// Message is the first bytes of the answer's body, trimmed.
+	Message string
+}
+
+func (e *ServerRouteError) Error() string {
+	return fmt.Sprintf("%s rejected (%s): %s", e.Path, e.Status, e.Message)
+}
+
+// Permanent reports whether retrying the same request cannot change the answer: a
+// 4xx refusal of the request itself (400 a malformed or refused name or peer URL, 401
+// no credential, 403 a token this cluster rejects, 409 a name that is the existing
+// server's own). A 404 (no started member yet), 408, 429 (rate limited) and every 5xx
+// (503 an unhealthy cluster or a learner not caught up) are transient.
+func (e *ServerRouteError) Permanent() bool {
+	switch e.StatusCode {
+	case http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return false
+	}
+	return e.StatusCode >= 400 && e.StatusCode < 500
+}
+
+// IsPermanentServerRouteFailure reports whether err, from a server-class client
+// helper, is a failure no retry can heal: a permanent refusal (ServerRouteError's
+// Permanent), a token that does not parse or is not the server class, or an existing
+// server whose CA does not match the token's pin (the wrong cluster). Every other
+// error — a network failure, a transient status — is worth retrying.
+func IsPermanentServerRouteFailure(err error) bool {
+	if re, ok := errors.AsType[*ServerRouteError](err); ok {
+		return re.Permanent()
+	}
+	return errors.Is(err, ErrMalformedToken) || errors.Is(err, ErrNotServerToken) || errors.Is(err, certs.ErrPinMismatch)
+}
+
 // postServerRoute POSTs a JSON body to a server-class route and returns the 2xx
-// response body.
+// response body. A non-2xx answer is a *ServerRouteError.
 func postServerRoute(ctx context.Context, serverURL, path, token string, body any, client *http.Client) ([]byte, error) {
 	tok, err := ParseServerToken(token)
 	if err != nil {
@@ -412,7 +455,7 @@ func postServerRoute(ctx context.Context, serverURL, path, token string, body an
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("%s rejected (%s): %s", path, resp.Status, strings.TrimSpace(string(msg)))
+		return nil, &ServerRouteError{Path: path, Status: resp.Status, StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(msg))}
 	}
 	out, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if err != nil {

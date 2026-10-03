@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"time"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/executor"
@@ -54,10 +55,32 @@ type (
 	promoteRoute func(ctx context.Context, name string) error
 )
 
-// errEtcdMemberRoute marks a failure of the member route itself, which is the
-// existing server's answer (or its absence), never a crash of this server's control
-// plane: the caller does not count it toward the crash-loop breaker.
+// errEtcdMemberRoute marks a failure of the member route step, which is the existing
+// server's answer (or this server's configuration), never a crash of this server's
+// control plane. A TRANSIENT answer never leaves the step (it is retried in-process),
+// so what reaches the caller is either a PERMANENT refusal, which also wraps
+// errEtcdMemberRoutePermanent, or the step's ctx ending (a shutdown, never counted).
 var errEtcdMemberRoute = errors.New("etcd member route")
+
+// errEtcdMemberRoutePermanent marks a member-route failure no retry can heal: the
+// existing server refused the request itself (a 400/401/403/409 — a bad or foreign
+// token, a refused name or peer URL), the token does not parse, the server's CA does
+// not match the token's pin (the wrong cluster), or this server's own configuration
+// cannot form the request. The daemon records it as a PERMANENT bring-up failure, so
+// the breaker parks on the first one instead of launchd re-asking forever.
+var errEtcdMemberRoutePermanent = errors.New("permanent")
+
+// etcdMemberRouteRetry is the in-process retry cadence of a transient member-route
+// answer.
+const etcdMemberRouteRetry = 5 * time.Second
+
+// etcdMemberRouteComponent is the component a permanent member-route refusal is
+// recorded under on the crash-loop breaker.
+const etcdMemberRouteComponent = "etcd-member-route"
+
+// etcdMemberRouteRemedy is the fix a permanent member-route refusal names.
+// The status row appends the clear-crashloop step itself.
+const etcdMemberRouteRemedy = "the existing server refused to add this server's etcd member: re-install this server with --server naming a server of THIS cluster, --token set to that cluster's server token, and a valid node name and --node-ip"
 
 // serverEtcdJoin is the joining server's member step.
 type serverEtcdJoin struct {
@@ -65,6 +88,9 @@ type serverEtcdJoin struct {
 	// it starts from its own data dir and is never re-added.
 	memberExists func() bool
 	member       memberRoute
+	// wait sleeps between transient member-route answers; a seam so the retry is
+	// testable without real time. Nil is a real timer.
+	wait func(ctx context.Context, d time.Duration) error
 	// promote is nil when this boot has no existing server to ask (no --server or
 	// no --token), which only a restart can survive: the executor then logs the
 	// stranded-learner remedy if its member is still a learner.
@@ -113,18 +139,18 @@ func joinEtcdMember(ctx context.Context, j *serverEtcdJoin, joinServer string, c
 		return withPromote(cfg, j.promote), nil
 	}
 	if joinServer == "" {
-		return cfg, fmt.Errorf("%w: the first start of a --server-join member needs --server (the existing server's address) to add it to the cluster", errEtcdMemberRoute)
+		return cfg, fmt.Errorf("%w (%w): the first start of a --server-join member needs --server (the existing server's address) to add it to the cluster", errEtcdMemberRoute, errEtcdMemberRoutePermanent)
 	}
 	peerURL, err := joinerPeerURL(*cfg.Etcd)
 	if err != nil {
-		return cfg, fmt.Errorf("%w: %w", errEtcdMemberRoute, err)
+		return cfg, fmt.Errorf("%w (%w): %w", errEtcdMemberRoute, errEtcdMemberRoutePermanent, err)
 	}
 	name := cfg.Etcd.Name
 	logger.Info("HA server-join: asking the existing server to add this server as an etcd learner",
 		"server", joinServer, "member", name, "peer-url", peerURL)
-	resp, err := j.member(ctx, name, peerURL)
+	resp, err := requestMemberUntilAnswered(ctx, j, joinServer, name, peerURL, logger)
 	if err != nil {
-		return cfg, fmt.Errorf("%w: add this server as an etcd learner through %s: %w", errEtcdMemberRoute, joinServer, err)
+		return cfg, err
 	}
 	logger.Info("HA server-join: added as an etcd learner", "member", name,
 		"member-id", strconv.FormatUint(resp.MemberID, 16), "initial-cluster", resp.InitialCluster)
@@ -132,6 +158,51 @@ func joinEtcdMember(ctx context.Context, j *serverEtcdJoin, joinServer string, c
 	etcd.InitialCluster = resp.InitialCluster
 	cfg.Etcd = &etcd
 	return withPromote(cfg, j.promote), nil
+}
+
+// requestMemberUntilAnswered calls the member route until it answers. A TRANSIENT
+// failure — a network error, a 503 (an unhealthy cluster, which etcd reports for a
+// few seconds after any membership change), a 404, a 429 — is logged and retried
+// every etcdMemberRouteRetry with no expiry: the existing server being briefly
+// unreachable is a wait, and it is never counted by the crash-loop breaker. A
+// PERMANENT refusal (bootstrap.IsPermanentServerRouteFailure, classified by status
+// code and sentinel, never by message) returns at once, wrapping
+// errEtcdMemberRoutePermanent. It ends early only on ctx.
+func requestMemberUntilAnswered(ctx context.Context, j *serverEtcdJoin, joinServer, name, peerURL string, logger *slog.Logger) (bootstrap.EtcdMemberResponse, error) {
+	wait := j.wait
+	if wait == nil {
+		wait = sleepCtx
+	}
+	for attempt := 1; ; attempt++ {
+		resp, err := j.member(ctx, name, peerURL)
+		if err == nil {
+			return resp, nil
+		}
+		if bootstrap.IsPermanentServerRouteFailure(err) {
+			return resp, fmt.Errorf("%w (%w): add this server as an etcd learner through %s: %w",
+				errEtcdMemberRoute, errEtcdMemberRoutePermanent, joinServer, err)
+		}
+		if ctx.Err() != nil {
+			return resp, fmt.Errorf("%w: add this server as an etcd learner through %s: %w", errEtcdMemberRoute, joinServer, ctx.Err())
+		}
+		logger.Info("HA server-join: the existing server did not add this server's etcd learner yet; retrying",
+			"server", joinServer, "member", name, "attempt", attempt, "retry-in", etcdMemberRouteRetry, "err", err)
+		if werr := wait(ctx, etcdMemberRouteRetry); werr != nil {
+			return resp, fmt.Errorf("%w: add this server as an etcd learner through %s: %w", errEtcdMemberRoute, joinServer, werr)
+		}
+	}
+}
+
+// sleepCtx waits d, ending early (with ctx's error) when ctx does.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // withPromote returns cfg with its EtcdConfig copied and Promote bound to promote for

@@ -711,10 +711,13 @@ func runServer(args []string) (err error) {
 
 	// On a joining HA server's first boot the etcd member route runs here, before the
 	// executor (serveretcd.go): the member starts with the route's initial cluster.
-	// Its failure is the existing server's answer, not a crash of this control plane,
-	// so it is returned without a breaker count.
+	// A transient answer is retried in-process and never counted; a PERMANENT refusal
+	// (a bad or foreign token, a refused name) is recorded as a permanent bring-up
+	// failure, so the breaker parks on it instead of launchd re-asking forever. A
+	// shutdown during the step is returned uncounted.
 	cfg, err = joinEtcdMember(ctx, newServerEtcdJoin(opts), opts.joinServer, cfg, logger)
 	if err != nil {
+		noteEtcdMemberRouteFailure(breaker, logger, err)
 		return fmt.Errorf("HA server-join: %w", err)
 	}
 	exec := executor.NewSupervised(cfg)

@@ -440,7 +440,7 @@ func (m *itMember) join(t *testing.T, route itRoute) bootstrap.EtcdMemberRespons
 }
 
 // requestMember calls the member route and adopts its --initial-cluster answer. A
-// refusal is retried, as the daemon's restart does: etcd refuses a member add until
+// refusal is retried, as the joining daemon retries a transient answer: etcd refuses a member add until
 // every voting member has been connected for its health interval (5 s), so a learner
 // add right after a promotion is answered 503 "unhealthy cluster".
 func (m *itMember) requestMember(t *testing.T, route itRoute) bootstrap.EtcdMemberResponse {
