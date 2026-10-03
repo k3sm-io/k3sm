@@ -85,6 +85,19 @@ func TestClusterResetArgsAndPostcondition(t *testing.T) {
 		}
 	})
 
+	t.Run("the exported entry point refuses a loopback peer IP", func(t *testing.T) {
+		wd := t.TempDir()
+		existingMember(t, wd)
+		cfg := resetTestConfig(t, wd)
+		cfg.Etcd.PeerIP = "127.0.0.1"
+		if err := ClusterReset(t.Context(), cfg); !errors.Is(err, ErrEtcdNeedsNodeIP) {
+			t.Fatalf("ClusterReset with a loopback peer IP = %v, want ErrEtcdNeedsNodeIP", err)
+		}
+		if err := ClusterReset(t.Context(), Config{WorkDir: wd}); !errors.Is(err, ErrClusterResetNeedsEtcd) {
+			t.Errorf("ClusterReset outside the etcd posture = %v, want ErrClusterResetNeedsEtcd", err)
+		}
+	})
+
 	t.Run("refused without an existing member", func(t *testing.T) {
 		wd := t.TempDir()
 		writeEtcdChild(t, wd, argvChild)

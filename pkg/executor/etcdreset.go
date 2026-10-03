@@ -72,16 +72,23 @@ const clusterResetTimeout = 2 * time.Minute
 // snapshot. A member removed by the reset rejoins only as a fresh learner, after its
 // own data dir is wiped.
 func ClusterReset(ctx context.Context, cfg Config) error {
-	return clusterReset(ctx, cfg, defaultEtcdSeams())
-}
-
-func clusterReset(ctx context.Context, cfg Config, seams etcdSeams) error {
-	cfg = cfg.withDefaults()
 	if cfg.Etcd == nil {
 		return ErrClusterResetNeedsEtcd
 	}
 	if err := cfg.Etcd.validate(); err != nil {
 		return err
+	}
+	return clusterReset(ctx, cfg, defaultEtcdSeams())
+}
+
+// clusterReset is ClusterReset after the posture's own validation, which the
+// exported entry point owns. The loopback integration test calls it directly: its
+// members peer on 127.0.0.1, which that validation (ErrEtcdNeedsNodeIP) refuses by
+// design for a real server.
+func clusterReset(ctx context.Context, cfg Config, seams etcdSeams) error {
+	cfg = cfg.withDefaults()
+	if cfg.Etcd == nil {
+		return ErrClusterResetNeedsEtcd
 	}
 	unlock, err := lockWorkDir(cfg.WorkDir)
 	if err != nil {
