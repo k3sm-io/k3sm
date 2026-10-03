@@ -212,9 +212,16 @@ func (opts serverOptions) validateEtcdFlags() error {
 // the guard and the thing it guards drift: the policy would reject Services on a
 // port nothing denies, while the port that IS denied stayed publishable.
 //
-// Today that is the kine listener alone — the plaintext datastore socket on
-// 127.0.0.1, which no pod has any business reaching.
+// It is the datastore's loopback client port (--kine-port: kine's plaintext socket,
+// or in the etcd posture the etcd member's TLS client listener), which no pod has
+// any business reaching, and in the etcd posture also the member's loopback metrics
+// listener (--etcd-metrics-port): plain HTTP with no authentication, describing the
+// datastore. The peer port is not here: it listens on the node IP, not loopback,
+// and requires a peer-CA certificate no pod can read.
 func (opts serverOptions) deniedLocalPorts() []int {
+	if opts.etcdPosture() {
+		return []int{opts.kinePort, opts.etcdMetricsPort}
+	}
 	return []int{opts.kinePort}
 }
 
