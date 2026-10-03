@@ -922,6 +922,52 @@ func TestJoiningMemberNeedsImportedEtcdCAs(t *testing.T) {
 	assertEtcdPKI(t, wd)
 }
 
+// TestStopKeepsWorkDirLockUntilReaped: a child whose exit Stop could not witness
+// inside its budget may still be running after the SIGKILL, so Stop does not release
+// the etcd posture's work-dir lock — a reset could otherwise start beside a dying
+// member. The lock goes once the child is reaped.
+func TestStopKeepsWorkDirLockUntilReaped(t *testing.T) {
+	wd := t.TempDir()
+	s := NewSupervised(Config{WorkDir: wd, Etcd: &EtcdConfig{Role: EtcdInit, Name: "server-a", PeerIP: testPeerIP}})
+	unlock, err := lockWorkDir(wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stuck := fakeStuckComponent(t, etcdComponent)
+	s.mu.Lock()
+	s.unlockWorkDir = unlock
+	s.comps = []*component{stuck}
+	s.started = true
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := s.Stop(ctx); !errors.Is(err, ErrStopBudgetExceeded) {
+		t.Fatalf("Stop = %v, want ErrStopBudgetExceeded for the unreaped child", err)
+	}
+	if l, err := lockWorkDir(wd); !errors.Is(err, ErrWorkDirLocked) {
+		if l != nil {
+			_ = l()
+		}
+		t.Fatalf("lock after a Stop that left a child unreaped = %v, want ErrWorkDirLocked", err)
+	}
+
+	// The reaper observes the exit (its close of exited is what this stands in for).
+	close(stuck.exited)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l, err := lockWorkDir(wd)
+		if err == nil {
+			_ = l()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the lock was never released after the child was reaped: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestEtcdPostureHoldsWorkDirLock: an etcd-posture server holds the work-dir lock from
 // Start to Stop, so a reset (which takes the same lock) cannot run beside its member;
 // the kine posture takes no lock.

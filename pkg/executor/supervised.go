@@ -260,8 +260,8 @@ type Supervised struct {
 	etcdAdmin     etcdAdmin
 	etcdWatchStop context.CancelFunc
 	etcdWatchDone chan struct{}
-	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start to
-	// Stop (see lockWorkDir). Guarded by mu.
+	// unlockWorkDir releases the work-dir lock the etcd posture holds from Start
+	// until Stop has reaped every child (see lockWorkDir). Guarded by mu.
 	unlockWorkDir func() error
 }
 
@@ -1254,9 +1254,11 @@ func (s *Supervised) Stop(ctx context.Context) error {
 	// die last. Build the explicit order: apiserver, scheduler, controller-manager,
 	// then kine or etcd.
 	var alive []string
+	var unreaped []*component
 	for _, c := range shutdownOrder(comps) {
 		if !s.stopComponent(ctx, c) {
 			alive = append(alive, c.name)
+			unreaped = append(unreaped, c)
 		}
 	}
 	// Every reaper has closed its exited channel by now (stopComponent waits on
@@ -1278,14 +1280,29 @@ func (s *Supervised) Stop(ctx context.Context) error {
 		s.cfg.Logger.Warn("control-plane reaper goroutines did not finish inside the teardown budget",
 			"components", strings.Join(late, ","))
 	}
-	// The work-dir lock is released only once every child has been signalled and
-	// reaped (or given up on), so a reset can never start beside a dying member.
+	// The work-dir lock is released only once every child has been REAPED, so a
+	// reset can never start beside a dying member. A child whose exit was not
+	// witnessed inside the budget may still be running after its SIGKILL, so the
+	// lock stays held until its reaper observes the exit; if that never happens the
+	// process's own exit drops the flock. The waiter's lifetime is the slowest
+	// unreaped child's, the same bound the reaper it waits on already has.
 	s.mu.Lock()
 	unlock := s.unlockWorkDir
 	s.unlockWorkDir = nil
 	s.mu.Unlock()
 	if unlock != nil {
-		_ = unlock()
+		if len(unreaped) == 0 {
+			_ = unlock()
+		} else {
+			s.cfg.Logger.Warn("keeping the work-dir lock until every control-plane child is reaped",
+				"components", strings.Join(alive, ","))
+			go func() {
+				for _, c := range unreaped {
+					<-c.exited
+				}
+				_ = unlock()
+			}()
+		}
 	}
 
 	switch {
