@@ -12,8 +12,9 @@
 # checked.
 #
 #   regen <version>   rewrite the three files: upstream's server/main.go at
-#                     <version>, a fresh `go get` + `go mod tidy`, keeping the
-#                     current go/toolchain lines. Bump DefaultEtcdVersion
+#                     <version>, a fresh `go get` (plus the OVERRIDES below)
+#                     + `go mod tidy`, keeping the current go/toolchain
+#                     lines. Bump DefaultEtcdVersion
 #                     (pkg/executor/executor.go) in the same commit;
 #                     TestDefaultEtcdVersionMatchesWrapper fails until you do.
 #   verify            materialize the wrapper and run `go mod verify`,
@@ -43,6 +44,21 @@ mkwork() {
 	trap 'rm -rf "$WORK"; rmdir "$WORK_ROOT" 2>/dev/null || true' EXIT
 }
 
+# OVERRIDES raises transitive modules above what the etcd server module selects,
+# applied with `go get` before the tidy. Each entry is the lowest version that
+# clears a govulncheck finding the wrapper actually calls; drop an entry once the
+# pinned etcd selects that version (or newer) on its own.
+#   go.opentelemetry.io/otel family v1.45.0: GO-2026-6505 (reached through the
+#   otlptrace exporter etcd's tracing setup initializes).
+OVERRIDES=(
+	go.opentelemetry.io/otel@v1.45.0
+	go.opentelemetry.io/otel/sdk@v1.45.0
+	go.opentelemetry.io/otel/trace@v1.45.0
+	go.opentelemetry.io/otel/metric@v1.45.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace@v1.45.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.45.0
+)
+
 # Every go invocation here builds the wrapper as its own module: never this
 # repo's workspace, never a downloaded toolchain.
 wgo() { GOWORK=off GOTOOLCHAIN=local CGO_ENABLED=0 go "$@"; }
@@ -69,6 +85,11 @@ regen() {
 	[ -f "$dir/main.go" ] || { echo "regen: upstream main.go not found in $dir" >&2; exit 1; }
 	cp "$dir/main.go" "$WORK/main.go"
 	chmod 0644 "$WORK/main.go"
+	(cd "$WORK" && GOFLAGS=-mod=mod wgo get "${OVERRIDES[@]}")
+	# The overrides must not move the server module off the requested pin.
+	local got
+	got="$(cd "$WORK" && wgo list -m -f '{{.Version}}' go.etcd.io/etcd/server/v3)"
+	[ "$got" = "$version" ] || { echo "regen: overrides moved etcd server to $got (want $version)" >&2; exit 1; }
 	(cd "$WORK" && GOFLAGS=-mod=mod wgo mod tidy)
 	cp "$WORK/go.mod" "$WRAPPER/go.mod.txt"
 	cp "$WORK/go.sum" "$WRAPPER/go.sum.txt"
