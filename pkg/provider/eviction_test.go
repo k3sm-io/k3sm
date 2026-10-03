@@ -19,6 +19,7 @@ package provider
 import (
 	"bufio"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -30,11 +31,14 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	testclock "k8s.io/utils/clock/testing"
 
@@ -211,8 +215,16 @@ func (f *fakeEvictionTarget) evictPod(_ context.Context, pod *corev1.Pod, _ evic
 
 // staticMonitor is a pressure monitor over a settable snapshot.
 type staticMonitor struct {
-	mu sync.Mutex
-	s  hostStats
+	mu  sync.Mutex
+	s   hostStats
+	err error
+}
+
+// fail makes every later sample fail with err (nil restores success).
+func (sm *staticMonitor) fail(err error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.err = err
 }
 
 func (sm *staticMonitor) set(s hostStats) {
@@ -225,6 +237,9 @@ func (sm *staticMonitor) monitor() *pressureMonitor {
 	return newPressureMonitor(func() (hostStats, error) {
 		sm.mu.Lock()
 		defer sm.mu.Unlock()
+		if sm.err != nil {
+			return hostStats{}, sm.err
+		}
 		return sm.s, nil
 	}, discardLog())
 }
@@ -362,6 +377,15 @@ func TestEvictionRanksBestEffortFirst(t *testing.T) {
 		api.Annotations = map[string]string{configSourceAnnotationKey: apiserverSource}
 		if !isCriticalPod(mirror) || !isCriticalPod(static) || isCriticalPod(api) {
 			t.Error("mirror and static pods are critical; an api-sourced pod is not")
+		}
+		// Upstream's IsStaticPod reads the source through GetPodSource, which
+		// returns a PRESENT annotation's value even when it is empty, and
+		// compares it with "api": a present-but-empty source is static there,
+		// and so here. An absent annotation is not.
+		emptySrc := evPod("empty-source", nil, "", "")
+		emptySrc.Annotations = map[string]string{configSourceAnnotationKey: ""}
+		if !isCriticalPod(emptySrc) || isCriticalPod(evPod("no-annotations", nil, "", "")) {
+			t.Error("a present-but-empty config.source is static (upstream GetPodSource); an absent one is not")
 		}
 
 		// The critical pod ranks FIRST (no stats), and is skipped; the cycle's
@@ -785,6 +809,102 @@ func TestEvictionKillsVictimAndSetsEvictedReason(t *testing.T) {
 		}
 		if got := h.deleteIDs(); !slices.Equal(got, []string{"uid-hog", "uid-hog"}) {
 			t.Errorf("DeletePod ids = %v, want the eviction then the idempotent delete, same id", got)
+		}
+	})
+
+	t.Run("a pod whose status probe fails stays a candidate, with no stats", func(t *testing.T) {
+		h := newEvictionHarness(t)
+		h.add(evPod("slow", nil, "1Gi", "1Gi"), "200Mi")
+		h.f.pushStatusErr(context.DeadlineExceeded)
+		cands := h.r.evictionCandidates(ctx)
+		if len(cands) != 1 || cands[0].pod.Name != "slow" {
+			t.Fatalf("candidates = %v, want the pod whose probe timed out kept", names(cands))
+		}
+		if cands[0].hasStats {
+			t.Error("a pod whose probe failed was ranked with stats; upstream ranks it as having none (first)")
+		}
+		// Control: without the failure the same pod has stats.
+		if c := h.r.evictionCandidates(ctx); len(c) != 1 || !c[0].hasStats {
+			t.Errorf("control: candidates without a probe failure = %+v, want one with stats", c)
+		}
+	})
+
+	t.Run("a stale sample never starts an eviction", func(t *testing.T) {
+		h := newEvictionHarness(t)
+		h.add(evPod("hog", nil, "", ""), "2Gi")
+		clock := time.Unix(200000, 0)
+		var clockMu sync.Mutex
+		h.mon.now = func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock }
+		h.sm.set(compressorAt(85))
+		h.mon.sampleOnce() // a good, pressured sample...
+		clockMu.Lock()
+		clock = clock.Add(31 * time.Second) // ...that then ages past 3 fast periods
+		clockMu.Unlock()
+		h.sm.fail(errors.New("sysctl vm.swapusage: timed out"))
+		h.mon.sampleOnce()
+		h.m.cycle(ctx)
+		h.m.cycle(ctx)
+		if got := h.deleteIDs(); len(got) != 0 {
+			t.Fatalf("evicted on a %v-old snapshot: %v", h.mon.sampleAge(), got)
+		}
+		// A fresh sample lifts the hold.
+		h.sm.fail(nil)
+		h.step(compressorAt(85))
+		if got := h.deleteIDs(); !slices.Equal(got, []string{"uid-hog"}) {
+			t.Errorf("after a fresh sample: %v, want the pod evicted", got)
+		}
+	})
+
+	t.Run("a failed runtime teardown is rolled back and not counted", func(t *testing.T) {
+		h := newEvictionHarness(t)
+		h.add(evPod("hog", nil, "", ""), "2Gi")
+		h.f.pushDeleteErr(errors.New("runtimed: teardown failed"))
+		h.step(compressorAt(85))
+		if got := h.deleteIDs(); !slices.Equal(got, []string{"uid-hog"}) {
+			t.Fatalf("DeletePod ids = %v, want one failed attempt", got)
+		}
+		st, err := h.r.GetPodStatus(ctx, "default", "hog")
+		if err != nil {
+			t.Fatalf("GetPodStatus: %v", err)
+		}
+		if st.Phase == corev1.PodFailed || st.Reason == reasonEvicted {
+			t.Errorf("a pod whose teardown failed reports %s/%q, want its live status (the processes still run)", st.Phase, st.Reason)
+		}
+		if n := evictionsTotal(h.m, signalCompressor); n != 0 || len(h.m.evictedAt) != 0 {
+			t.Errorf("a failed eviction was counted: evictions_total=%d cascade entries=%d", n, len(h.m.evictedAt))
+		}
+		live, _ := h.cs.CoreV1().Pods("default").Get(ctx, "hog", metav1.GetOptions{})
+		if live.Status.Phase == corev1.PodFailed {
+			t.Error("a failed eviction was persisted to the apiserver")
+		}
+		// It stays a candidate: the next cycle evicts it.
+		h.step(compressorAt(85))
+		if got := h.deleteIDs(); !slices.Equal(got, []string{"uid-hog", "uid-hog"}) {
+			t.Fatalf("retry: DeletePod ids = %v", got)
+		}
+		if n := evictionsTotal(h.m, signalCompressor); n != 1 {
+			t.Errorf("evictions_total after the successful retry = %d, want 1", n)
+		}
+	})
+
+	t.Run("the evicted status write is retried past a transient apiserver error", func(t *testing.T) {
+		h := newEvictionHarness(t)
+		h.add(evPod("hog", nil, "", ""), "2Gi")
+		var calls int
+		h.cs.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			if a.GetSubresource() != "status" {
+				return false, nil, nil
+			}
+			calls++
+			if calls == 1 {
+				return true, nil, apierrors.NewServiceUnavailable("apiserver busy")
+			}
+			return false, nil, nil
+		})
+		h.step(compressorAt(85))
+		live, err := h.cs.CoreV1().Pods("default").Get(ctx, "hog", metav1.GetOptions{})
+		if err != nil || live.Status.Reason != reasonEvicted || calls < 2 {
+			t.Errorf("after one 503: status reason=%q, update attempts=%d, err=%v; want Evicted persisted on a retry", live.Status.Reason, calls, err)
 		}
 	})
 

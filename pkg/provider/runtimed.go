@@ -1922,14 +1922,16 @@ func (r *runtimedRuntime) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 //     teardown's exits as crashes. A second eviction of the same pod is a no-op.
 //  2. Emit the pod's Warning Evicted Event (the kubelet records it before the
 //     kill).
-//  3. Quiesce the track (cancel pending re-execs, pulls, postStart) and stop the
-//     prober, so neither a restart nor a liveness-probe restart can bring an
-//     evicted restartPolicy: Always container back.
-//  4. DeletePod by pod id with grace 0 and no preStop.
-//  5. Drop the pod's transport override (a stopped guest's lease must not keep
-//     routing).
-//  6. Persist the status to the apiserver (synchronously, UID-checked) and push
-//     it through the watch callback.
+//  3. Quiesce the track (cancel pending re-execs, pulls, postStart), so no
+//     restart can bring an evicted restartPolicy: Always container back.
+//  4. DeletePod by pod id with grace 0 and no preStop. If it FAILS, the
+//     eviction is rolled back: the evicted mark is removed (the processes are
+//     still running, so the pod reports its live status and stays a
+//     candidate), and the error is returned; the manager does not count it.
+//  5. Stop the prober and drop the pod's transport override (a stopped guest's
+//     lease must not keep routing).
+//  6. Persist the status to the apiserver (synchronously, UID-checked, retried
+//     with a bounded backoff) and push it through the watch callback.
 //
 // GRACE. Upstream's hard eviction passes gracePeriodOverride 0, and killContainer
 // (pkg/kubelet/kuberuntime/kuberuntime_container.go, v1.36.2) then skips the
@@ -1963,12 +1965,12 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 	}
 	r.recorder.Event(tracked, corev1.EventTypeWarning, reasonEvicted, n.message)
 
-	t.quiesce()
-	r.stopProber(id)
-	var delErr error
+	t.quiesceForEviction()
 	if _, err := r.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: 0}); err != nil {
-		delErr = fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		t.unmarkEvicted(st)
+		return fmt.Errorf("runtimed delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 	}
+	r.stopProber(id)
 	r.transport.drop(id)
 
 	if err := r.persistEvictedStatus(ctx, tracked, st); err != nil {
@@ -1980,7 +1982,7 @@ func (r *runtimedRuntime) evictPod(ctx context.Context, pod *corev1.Pod, n evict
 		out.Status = *st.DeepCopy()
 		cb(out)
 	}
-	return delErr
+	return nil
 }
 
 // quiesce closes t to a late create and cancels every in-flight provider worker

@@ -100,6 +100,9 @@ const (
 	evictionCleanupTimeout  = 30 * time.Second
 	evictionCascadeWindow   = 5 * time.Minute
 	evictionCascadeMaxCount = 3
+	// staleSampleFactor: a snapshot older than this many sampling periods
+	// (3 s at the fast cadence, 30 s calm) does not start an eviction.
+	staleSampleFactor = 3
 )
 
 // evictionCandidate is one active pod and its memory stats for ranking. hasStats
@@ -164,6 +167,7 @@ type evictionManager struct {
 	// episode state, reset when memoryPressured goes False.
 	inEpisode   bool
 	halted      bool
+	staleLogged bool
 	evictedAt   []time.Time
 	skipLogged  map[types.UID]bool
 	noneLogged  bool
@@ -257,6 +261,20 @@ func (m *evictionManager) cycle(ctx context.Context) {
 		}
 	}
 
+	// A stale snapshot never starts an eviction. If the monitor's last good
+	// sample is older than staleSampleFactor sampling periods (it keeps
+	// failing, or is starved), the verdict above describes a node that may no
+	// longer exist; the manager waits for a fresh one and says so once.
+	if age, bound := m.monitor.sampleAge(), staleSampleFactor*m.monitor.interval(); age > bound {
+		if !m.staleLogged {
+			m.staleLogged = true
+			m.log.Warn("eviction manager: the latest host sample is stale; not evicting until a fresh one lands",
+				"sample_age_seconds", int64(age/time.Second), "bound_seconds", int64(bound/time.Second),
+				"signal", string(v.signal), "reading", v.reading)
+		}
+		return
+	}
+
 	// The cascade cap: a fourth eviction inside the window halts the manager for
 	// the rest of the episode.
 	if m.recentEvictions(now) >= evictionCascadeMaxCount {
@@ -284,20 +302,25 @@ func (m *evictionManager) cycle(ctx context.Context) {
 	}
 
 	notice := evictionNotice{signal: v.signal, message: evictionMessage(victim, v)}
+	m.log.Warn("eviction manager: evicting pod",
+		"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID),
+		"signal", string(v.signal), "reading", v.reading,
+		"usage_bytes", victim.usage, "has_stats", victim.hasStats,
+		"sample_age_seconds", int64(m.monitor.sampleAge()/time.Second))
+	// Only a SUCCESSFUL eviction counts: toward evictions_total, and toward the
+	// cascade cap. A failed one was rolled back by the runtime (the pod is still
+	// running and still a candidate), so the next cycle simply tries again.
+	if err := m.target.evictPod(ctx, victim.pod, notice); err != nil {
+		m.log.Error("eviction manager: evicting the pod failed; it stays a candidate",
+			"pod", victim.pod.Namespace+"/"+victim.pod.Name, "err", err)
+		return
+	}
 	m.mu.Lock()
 	m.evictions[v.signal]++
 	total := m.evictions[v.signal]
 	m.mu.Unlock()
 	m.evictedAt = append(m.evictedAt, now)
-	m.log.Warn("eviction manager: evicting pod",
-		"pod", victim.pod.Namespace+"/"+victim.pod.Name, "uid", string(victim.pod.UID),
-		"signal", string(v.signal), "reading", v.reading,
-		"usage_bytes", victim.usage, "has_stats", victim.hasStats,
-		"sample_age_seconds", int64(m.monitor.sampleAge()/time.Second),
-		"evictions_total", total)
-	if err := m.target.evictPod(ctx, victim.pod, notice); err != nil {
-		m.log.Error("eviction manager: evicting the pod failed", "pod", victim.pod.Namespace+"/"+victim.pod.Name, "err", err)
-	}
+	m.log.Warn("eviction manager: pod evicted", "pod", victim.pod.Namespace+"/"+victim.pod.Name, "evictions_total", total)
 	_, after, _ := m.monitor.latest()
 	m.awaiting, m.awaitSeq, m.awaitSince = true, after, m.now()
 	m.hasBaseline = false
@@ -336,7 +359,7 @@ func (m *evictionManager) recentEvictions(now time.Time) int {
 
 // resetEpisode clears every per-episode fact.
 func (m *evictionManager) resetEpisode() {
-	m.inEpisode, m.halted, m.noneLogged = false, false, false
+	m.inEpisode, m.halted, m.noneLogged, m.staleLogged = false, false, false, false
 	m.evictedAt = nil
 	m.skipLogged = map[types.UID]bool{}
 	m.awaiting, m.hasBaseline = false, false

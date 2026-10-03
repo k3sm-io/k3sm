@@ -19,9 +19,13 @@ package provider
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -42,6 +46,10 @@ const (
 	podCompletedReason = "PodCompleted"
 )
 
+// persistEvictedBackoff bounds the evicted-status write's retries: six attempts,
+// 200 ms doubling to a 3 s cap, about 7 s in all.
+var persistEvictedBackoff = wait.Backoff{Steps: 6, Duration: 200 * time.Millisecond, Factor: 2, Cap: 3 * time.Second}
+
 // markEvicted records st as t's terminal evicted status. It returns false if t
 // was already evicted (the first eviction's status stands). Guarded by
 // restartMu, with the rest of the delete fence.
@@ -53,6 +61,29 @@ func (t *podTrack) markEvicted(st *corev1.PodStatus) bool {
 	}
 	t.evicted = st
 	return true
+}
+
+// unmarkEvicted rolls back markEvicted after a failed runtime teardown, so the
+// pod (whose processes are still running) reports its live status again and
+// stays an eviction candidate. Only the status this eviction installed is
+// removed.
+func (t *podTrack) unmarkEvicted(st *corev1.PodStatus) {
+	t.restartMu.Lock()
+	defer t.restartMu.Unlock()
+	if t.evicted == st {
+		t.evicted = nil
+	}
+}
+
+// quiesceForEviction cancels the provider workers that could restart or
+// re-create a container (pending re-execs, pull re-attempts, postStart hooks).
+// Unlike quiesce it does NOT set the delete fence: an eviction whose runtime
+// teardown fails is rolled back, and a pod marked deleting would leave the
+// candidate set for good.
+func (t *podTrack) quiesceForEviction() {
+	t.cancelPostStart()
+	t.cancelRestarts()
+	t.cancelPulls()
 }
 
 // evictedStatus returns a copy of t's evicted status, or nil if t was not
@@ -96,12 +127,23 @@ func (r *runtimedRuntime) evictionCandidates(ctx context.Context) []evictionCand
 	r.mu.Unlock()
 
 	var out []evictionCandidate
+	// probeFailed names the candidates whose status probe errored or ran out of
+	// time. They stay candidates (a slow pod is not a pod that holds nothing),
+	// but with NO stats, whatever ListPodStats says later: a pod the runtime
+	// could not answer for in time is ranked the way upstream ranks a pod with
+	// no stats, first.
+	probeFailed := map[types.UID]bool{}
 	for _, tr := range all {
 		if tr.t.evictedStatus() != nil || trackDeleting(tr.t) {
 			continue
 		}
 		resp, err := r.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: tr.id})
-		if err != nil || (resp.GetError() != nil && resp.GetError().GetCode() != 0) {
+		if err != nil {
+			probeFailed[tr.pod.UID] = true
+			out = append(out, evictionCandidate{pod: tr.pod.DeepCopy()})
+			continue
+		}
+		if resp.GetError() != nil && resp.GetError().GetCode() != 0 {
 			continue // the runtime holds nothing (parked, or mid-create): nothing to free
 		}
 		switch resp.GetStatus().GetPhase() {
@@ -126,7 +168,7 @@ func (r *runtimedRuntime) evictionCandidates(ctx context.Context) []evictionCand
 	}
 	for i := range out {
 		ps := byID[string(out[i].pod.UID)]
-		if ps == nil {
+		if ps == nil || probeFailed[out[i].pod.UID] {
 			continue
 		}
 		out[i].hasStats = true
@@ -197,11 +239,18 @@ func evictedPodStatus(prior corev1.PodStatus, msg string, now metav1.Time) *core
 // CreatePod refuses an evicted pod). The write is UID-checked: a pod replaced
 // under the same name since is not this pod and is left alone. A nil client
 // (unit tests that build no apiserver) is a no-op.
+//
+// Any failure but NotFound (the pod is gone; nothing to record) is retried with
+// a bounded exponential backoff (persistEvictedBackoff), and never past ctx: a
+// conflict, an apiserver that is briefly unavailable under the very memory
+// pressure that caused the eviction, or a timeout. It stops retrying once ctx
+// ends.
 func (r *runtimedRuntime) persistEvictedStatus(ctx context.Context, pod *corev1.Pod, st *corev1.PodStatus) error {
 	if r.client == nil {
 		return nil
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	retriable := func(err error) bool { return ctx.Err() == nil && !apierrors.IsNotFound(err) }
+	return retry.OnError(persistEvictedBackoff, retriable, func() error {
 		live, err := r.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("get pod %s/%s: %w", pod.Namespace, pod.Name, err)
