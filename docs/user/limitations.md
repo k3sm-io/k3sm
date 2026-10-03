@@ -148,7 +148,27 @@ The shim loads into ordinary **native workloads** (Go/C binaries such as your ap
 macOS strips `DYLD_INSERT_LIBRARIES` from a **SIP platform binary**, so on an installed node a Pod's
 `/bin/sh`, `bash`, `zsh`, `dash` and `env` run as the re-signed copies `sudo k3sm install` makes
 under `/Library/k3sm/shadow`. Those copies keep the path-rebase and DNS shims, so a shell script
-that reads a mounted file at its absolute path sees it, and so does whatever the script execs.
+that reads a mounted file at its absolute path sees it, and so does any binary from your image that
+the script execs.
+
+A **platform binary that a Pod's process spawns** is a ceiling. The shell itself runs as the
+re-signed copy, but `/bin/cat`, `/usr/bin/sed` or `/usr/bin/tar` run from a shell script are plain
+SIP platform binaries, and macOS strips the shim from them. Absolute volume-mount paths resolve to
+the unmounted host path in such a child (and in anything it runs in turn), and it also loses
+per-namespace DNS precedence and the bind/connect discipline. Workarounds, in order of preference:
+
+- Use a shell built-in, which runs inside the shell and keeps the shim: `read`, `echo`,
+  `$(<file)` in bash, and redirections such as `while read l; do ...; done < /mnt/x`.
+- Use a relative path. When the container sets no `workingDir` (and its image sets none), its
+  working directory is the Pod data volume, where a volume mounted at `/P` is materialized at `./P`,
+  so `cat ./mnt/sec/key` resolves without the shim.
+- Ship the binary in the image. A binary from the image is not a platform binary and keeps the shim.
+
+When the Pod mounts volumes, the runtime notices such a child exec and the Pod gets one
+`ShimInactive` Warning Event naming the child binary. The Event is advisory, because the report
+comes from inside the Pod. This covers SIP-protected system binaries. A
+hardened-runtime third-party child is not detected, and neither is anything a platform binary
+itself spawns.
 
 The remaining ceiling is any other restricted or hardened main process, such as the system
 `python3`, `perl` or `swift`. dyld still strips the shim from those, so their absolute mount paths
@@ -444,7 +464,8 @@ bind/connect discipline that gives a Pod its own source address and port space. 
   hardened-runtime binary. The runtime reads the process's code-signing flags after it starts and the
   Pod gets a `ShimInactive` Warning Event naming what is unavailable. Such a process still resolves
   FQDNs and `<svc>.<ns>.svc` through the node resolver. Use fully qualified names, or a compiled
-  binary as the entrypoint.
+  binary as the entrypoint. The same holds for a platform binary (`/bin/cat`, `/usr/bin/sed`) that a
+  Pod's shell script spawns, as described under volume mounts above.
 - **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
   which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For
   `None` that is a gap, because a Pod's own `dnsConfig.nameservers` are not yet honored.
