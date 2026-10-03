@@ -1318,10 +1318,13 @@ Exit (§9 M3): two Macs, one cluster, cross-node pod-to-pod + ClusterIP + a Node
   `hack/lab/m7.sh` greens in the M7 tail — so M4 does not falsely flip `done`. (NodeNetwork no-op recording convention.)
 - 🟡 **M4.1** — RBAC enforcement (**hard cut**), CODE-COMPLETE + unit-proven. The apiserver default authorizer flips
   `AlwaysAllow → Node,RBAC` + the additive `NodeRestriction` admission plugin (`pkg/executor`); the flip is a **pure
-  authorizer switch** because the VK node / provisioners keep the static admin token (`system:masters`, RBAC-exempt) and
+  authorizer switch** because the provisioners keep the static admin token (`system:masters`, RBAC-exempt) and
   the scheduler + KCM carry their **own per-component client certs** (`system:kube-scheduler` /
   `system:kube-controller-manager`, #14) that the apiserver's bootstrap RBAC binds — the M4.1 **component-identity
-  divergence**, since narrowed to the VK node + provisioning client. `pkg/rbac.Provision` (NEW; Create-tolerate-
+  divergence**, since narrowed to the post-bring-up admin client with the server-side controllers on it, `kubectl`,
+  and the healthz probe: the server's in-process VK node now runs as `system:node:<name>` under the Node authorizer
+  (this narrows the node client, not the server process, which still holds the admin kubeconfig and the signing CA).
+  `pkg/rbac.Provision` (NEW; Create-tolerate-
   `AlreadyExists`, no watch-cache LIST-to-decide) lays down, **fail-closed before the node/join-supervisor start**, the
   **node-datapath ClusterRole** (`system:nodes` ⇒ read `services`/`endpointslices`/`meshpeers` — the grant the Node
   authorizer/stock `system:node` role do *not* give a joined worker, keeping its Service proxy + DNS + mesh watcher

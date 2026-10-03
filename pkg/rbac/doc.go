@@ -26,14 +26,16 @@ limitations under the License.
 // # Why a flip alone would lock workers out
 //
 // The flip is advertised as a pure authorizer switch, and it is — but only because no
-// in-process server component is left unauthorized by it. The in-process VK node, the
-// provisioners and the bootstrap enroller authenticate with the static admin token,
-// which the token file maps to the system:masters group, and system:masters bypasses
-// RBAC. The scheduler and controller-manager authenticate with their OWN client certs
+// in-process server component is left unauthorized by it. The provisioners and the
+// bootstrap enroller authenticate with the static admin token, which the token file
+// maps to the system:masters group, and system:masters bypasses RBAC. The scheduler
+// and controller-manager authenticate with their OWN client certs
 // (CN=system:kube-scheduler / system:kube-controller-manager), which the apiserver's
 // auto-created bootstrap RBAC already binds to the matching ClusterRoles. Either way
 // those components keep working with the authorizer on, needing no two-phase
-// restart. The real lock-out risk is a JOINED WORKER: its Service proxy, per-node
+// restart. The server's in-process VK node is a node identity (see the last section)
+// and needs nothing a joined worker does not. The real lock-out risk is a JOINED
+// WORKER: its Service proxy, per-node
 // DNS resolver, and mesh watcher authenticate as system:node:<name> (the joined
 // node's client cert), and they get/list/watch services, endpointslices (discovery.k8s.io), and
 // meshpeers (net.k3sm.io) — none of which the Node authorizer nor the stock
@@ -92,12 +94,16 @@ limitations under the License.
 // static admin token; #14 (f855a0a) retired the scheduler + controller-manager half — they now
 // authenticate with their own signing-CA-issued client certs (CN=system:kube-scheduler
 // / system:kube-controller-manager, written by executor.provisionComponentCerts) that
-// the apiserver's bootstrap RBAC binds, so RBAC constrains them (the k3s model). What
-// RETAINS system:masters is the residual set: the in-process VK node, the post-bring-up
-// provisioning client (Provision itself), kubectl, and the healthz probe. The embedded
-// node stays on the admin token until Virtual Kubelet's secret/configmap informers are
-// scoped — vanilla nodeutil.NewNode LIST/WATCHes them cluster-wide, which the Node
-// authorizer never grants; that scoping is the tracked follow-up. The MeshPeer
+// the apiserver's bootstrap RBAC binds, so RBAC constrains them (the k3s model). The
+// server's in-process VK node now runs as system:node:<node name> in system:nodes, a
+// client cert minted in memory from the signing CA on every boot, so it is held to
+// the Node authorizer, NodeRestriction and this package's system:nodes grants like a
+// joined worker; it reads Secrets and ConfigMaps by name for the pods bound to it and
+// never lists or watches them cluster-wide. What RETAINS system:masters is the residual
+// set: the post-bring-up admin client and the server-side controllers built on it
+// (Provision itself among them), kubectl, and the healthz probe. That narrows the node
+// CLIENT, not the server process, which still holds the admin kubeconfig and the
+// signing CA. The MeshPeer
 // write-guard (bootstrap.AuthorizeMeshPeerWrite) stays load-bearing and PERMANENT:
 // NodeRestriction admission covers only core node-owned resources, never the
 // net.k3sm.io/MeshPeer CRD, so the node identity gets meshpeers READ via the

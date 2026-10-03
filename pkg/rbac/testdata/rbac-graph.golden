@@ -1,0 +1,164 @@
+[
+  {
+    "kind": "ClusterRole",
+    "name": "k3sm:node-datapath",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "services"
+        ]
+      },
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          "discovery.k8s.io"
+        ],
+        "resources": [
+          "endpointslices"
+        ]
+      },
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          "net.k3sm.io"
+        ],
+        "resources": [
+          "meshpeers"
+        ]
+      }
+    ]
+  },
+  {
+    "kind": "ClusterRoleBinding",
+    "name": "k3sm:node-datapath",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "ClusterRole",
+      "name": "k3sm:node-datapath"
+    },
+    "subjects": [
+      {
+        "kind": "Group",
+        "apiGroup": "rbac.authorization.k8s.io",
+        "name": "system:nodes"
+      }
+    ]
+  },
+  {
+    "kind": "Namespace",
+    "name": "k3sm-registry",
+    "labels": {
+      "k3sm.io/managed": "true"
+    }
+  },
+  {
+    "kind": "Role",
+    "namespace": "default",
+    "name": "k3sm:in-pod-reader",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "pods",
+          "configmaps",
+          "services"
+        ]
+      }
+    ]
+  },
+  {
+    "kind": "Role",
+    "namespace": "k3sm-registry",
+    "name": "k3sm-registry-advert-reader",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "rules": [
+      {
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ],
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "configmaps"
+        ]
+      }
+    ]
+  },
+  {
+    "kind": "RoleBinding",
+    "namespace": "default",
+    "name": "k3sm:in-pod-reader",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "Role",
+      "name": "k3sm:in-pod-reader"
+    },
+    "subjects": [
+      {
+        "kind": "ServiceAccount",
+        "name": "snapshot-manager",
+        "namespace": "default"
+      }
+    ]
+  },
+  {
+    "kind": "RoleBinding",
+    "namespace": "k3sm-registry",
+    "name": "k3sm-registry-advert-reader",
+    "labels": {
+      "k3sm.io/managed": "true"
+    },
+    "roleRef": {
+      "apiGroup": "rbac.authorization.k8s.io",
+      "kind": "Role",
+      "name": "k3sm-registry-advert-reader"
+    },
+    "subjects": [
+      {
+        "kind": "Group",
+        "apiGroup": "rbac.authorization.k8s.io",
+        "name": "system:nodes"
+      }
+    ]
+  }
+]

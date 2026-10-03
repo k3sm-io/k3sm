@@ -660,8 +660,9 @@ func (s *Supervised) kineSecretEnv() ([]string, error) {
 // enforces --authorization-mode=Node,RBAC + the NodeRestriction admission plugin
 // (the scheduler + controller-manager authenticate with their OWN per-component client
 // certs — system:kube-scheduler / system:kube-controller-manager, bound by the
-// apiserver's bootstrap RBAC; only the in-process VK node + post-bring-up provisioning
-// + the healthz probe still carry the system:masters admin token) and sets
+// apiserver's bootstrap RBAC; the in-process VK node is a system:node identity; only the
+// post-bring-up admin client with the server-side controllers on it, kubectl, and the
+// healthz probe still carry the system:masters admin token) and sets
 // --kubelet-preferred-address-types=InternalIP so kubectl logs/exec reach the node by
 // IP.
 //
@@ -735,11 +736,11 @@ func apiServerArgs(cfg Config) []string {
 		"--service-account-issuer", "https://kubernetes.default.svc.cluster.local",
 		"--token-auth-file", tokenFilePath(wd),
 		// Enforce the Node authorizer + RBAC (default-deny) instead of
-		// AlwaysAllow. The flip is pure — the VK node + provisioners carry the static
-		// admin token (system:masters, RBAC-exempt), the scheduler/KCM carry their own
-		// client-cert identities the apiserver's bootstrap RBAC binds, and joined
-		// workers' system:node identities get a pre-provisioned datapath grant
-		// (pkg/rbac.Provision) before the VK node / join supervisor start.
+		// AlwaysAllow. The flip is pure — the provisioners carry the static admin token
+		// (system:masters, RBAC-exempt), the scheduler/KCM carry their own client-cert
+		// identities the apiserver's bootstrap RBAC binds, and every node, the server's
+		// in-process one included, is a system:node identity whose datapath grant
+		// (pkg/rbac.Provision) is in place before the VK node / join supervisor start.
 		"--authorization-mode", authzMode,
 		// Add NodeRestriction to the default-enabled admission set (--enable-admission-
 		// plugins is additive, so the ServiceAccount plugin in-pod API access relies
