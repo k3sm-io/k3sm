@@ -110,7 +110,7 @@ type serverOptions struct {
 	// other singleton ports: two members on one host each need their own.
 	etcdPeerPort    int
 	etcdMetricsPort int
-	joinServer      string // existing server's mesh host to fetch the identical-CA bundle from (HA server-join)
+	joinServer      string // an existing server's LAN address: the CA bundle and the etcd member route (HA server-join)
 	token           string // static admin bearer token (standalone) or the server-class join token (HA server-join)
 	// tokenFile is a file holding that token, read once at start. It is how the
 	// INSTALLED daemon is given its static admin token: the value never appears
@@ -306,7 +306,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
-	fs.StringVar(&opts.joinServer, "server", "", "existing server's mesh host to fetch the identical-CA bootstrap bundle from (HA server-join; requires --server-join --mesh-ip --token)")
+	fs.StringVar(&opts.joinServer, "server", "", "an existing server's LAN address (its --node-ip): the joining server fetches the identical-CA bootstrap bundle from it and, on its first start, is added to the etcd cluster through it (HA server-join; requires --server-join --token)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
 	// The static admin token as a FILE, and the only way the installed daemon is
 	// given one. A LaunchDaemon plist is read by launchd as root but the token on
@@ -531,12 +531,11 @@ func runServer(args []string) (err error) {
 	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
 	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
 	// bring-up; we never fall through to minting fresh, divergent CAs (cluster trust
-	// split). Requires --mesh-ip (the joining server binds its own apiserver +
-	// supervisor on the mesh) + --token (the server-class token).
+	// split). Requires --token (the server-class token). The bundle and, after it,
+	// the etcd member route (joinEtcdMember) are reached at --server over the
+	// underlay — the existing server's bootstrap listener serves every interface — so
+	// neither needs this server's mesh, which comes up after its control plane.
 	if opts.serverJoin && opts.joinServer != "" {
-		if opts.meshIP == "" {
-			return fmt.Errorf("--server-join with --server requires --mesh-ip (the joining server binds its apiserver + supervisor on the mesh)")
-		}
 		if opts.token == "" {
 			return fmt.Errorf("--server-join with --server requires --token (the server-class join token)")
 		}
@@ -703,6 +702,14 @@ func runServer(args []string) (err error) {
 	meshDown := meshTeardown(noMeshTeardown)
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 
+	// On a joining HA server's first boot the etcd member route runs here, before the
+	// executor (serveretcd.go): the member starts with the route's initial cluster.
+	// Its failure is the existing server's answer, not a crash of this control plane,
+	// so it is returned without a breaker count.
+	cfg, err = joinEtcdMember(ctx, newServerEtcdJoin(opts), opts.joinServer, cfg, logger)
+	if err != nil {
+		return fmt.Errorf("HA server-join: %w", err)
+	}
 	exec := executor.NewSupervised(cfg)
 	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
 	if err := exec.Start(ctx); err != nil {
@@ -1088,6 +1095,17 @@ func runServer(args []string) (err error) {
 				logger.Error("seal bootstrap bundle for datastore", "err", err)
 			} else if err := publishBootstrapBundle(ctx, cs, sealed); err != nil {
 				logger.Warn("publish bootstrap bundle to datastore", "err", err)
+			}
+			// The etcd member routes: a joining server is added as a learner and
+			// later promoted by THIS server, against its own member over loopback
+			// with its etcd client identity. Not served if the client cannot be
+			// built — a server that cannot admit members still serves everything
+			// else, and a joiner retries.
+			if admin, err := executor.NewLocalEtcdAdmin(ctx, opts.workDir, opts.kinePort); err != nil {
+				logger.Error("etcd member routes disabled: cannot reach the local etcd member", "err", err)
+			} else {
+				defer func() { _ = admin.Close() }()
+				deps.members = localMemberJoiner{admin: admin}
 			}
 		}
 		go func() {
