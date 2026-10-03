@@ -26,6 +26,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -476,7 +478,8 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 			return s.etcdExitedErr(c, "while waiting for quorum")
 		default:
 		}
-		if etcdHasQuorum(ctx, m) {
+		q := readEtcdQuorum(ctx, m)
+		if q.ok() {
 			s.cfg.Logger.Info("etcd quorum reached", "component", etcdComponent, "waited", clk.Now().Sub(start).Round(time.Second))
 			return nil
 		}
@@ -484,6 +487,7 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 			lastLog = now
 			reachable, members := s.reachableMembers(ctx, m)
 			s.cfg.Logger.Info("waiting for etcd quorum", "component", etcdComponent,
+				"leader", q.leaderState(), "alarms", q.alarmState(),
 				"reachable-members", reachable, "members", members, "waited", now.Sub(start).Round(time.Second))
 		}
 		if err := s.etcdWaitTick(ctx, c, etcdQuorumPoll, "while waiting for quorum"); err != nil {
@@ -492,17 +496,71 @@ func (s *Supervised) awaitEtcdQuorum(ctx context.Context, m etcdMembers, c *comp
 	}
 }
 
-// etcdHasQuorum reports a leader and an empty alarm list. The alarm list goes through
-// raft, so it is asked only once a leader exists.
-func etcdHasQuorum(ctx context.Context, m etcdMembers) bool {
+// etcdQuorum is one reading of the quorum condition: the local member's leader and
+// the cluster's active alarms. Quorum requires BOTH a leader and an empty alarm list
+// (ok); the rest exists so the wait's log can say which half is missing.
+type etcdQuorum struct {
+	statusErr error
+	leader    uint64
+	// alarmsRead is set once the alarm list was answered; alarmErr when it was asked
+	// and failed. It is asked only with a leader (the list goes through raft).
+	alarmsRead bool
+	alarmErr   error
+	alarms     []string
+}
+
+// readEtcdQuorum reads the leader and, when there is one, the alarm list.
+func readEtcdQuorum(ctx context.Context, m etcdMembers) etcdQuorum {
 	cctx, cancel := context.WithTimeout(ctx, etcdCallTimeout)
 	defer cancel()
+	var q etcdQuorum
 	st, err := m.Status(cctx)
-	if err != nil || st.Leader == 0 {
-		return false
+	if err != nil {
+		q.statusErr = err
+		return q
+	}
+	q.leader = st.Leader
+	if q.leader == 0 {
+		return q
 	}
 	alarms, err := m.AlarmList(cctx)
-	return err == nil && len(alarms) == 0
+	if err != nil {
+		q.alarmErr = err
+		return q
+	}
+	q.alarmsRead = true
+	for _, a := range alarms {
+		q.alarms = append(q.alarms, a.Alarm)
+	}
+	return q
+}
+
+// ok is the binding quorum rule: a leader AND an empty alarm list.
+func (q etcdQuorum) ok() bool { return q.leader != 0 && q.alarmsRead && len(q.alarms) == 0 }
+
+// leaderState renders the leader half for the wait's log.
+func (q etcdQuorum) leaderState() string {
+	switch {
+	case q.statusErr != nil:
+		return "unknown (the local member did not answer: " + q.statusErr.Error() + ")"
+	case q.leader == 0:
+		return "none"
+	}
+	return strconv.FormatUint(q.leader, 16)
+}
+
+// alarmState renders the alarm half for the wait's log: the active alarms by name
+// (NOSPACE keeps a cluster read-only, which is why the wait has not ended).
+func (q etcdQuorum) alarmState() string {
+	switch {
+	case q.leader == 0:
+		return "unknown (asked only once a leader exists)"
+	case q.alarmErr != nil:
+		return "unknown (the alarm list did not answer: " + q.alarmErr.Error() + ")"
+	case len(q.alarms) == 0:
+		return "none"
+	}
+	return strings.Join(q.alarms, ",")
 }
 
 // reachableMembers counts the members whose peer listener accepts TCP (this member

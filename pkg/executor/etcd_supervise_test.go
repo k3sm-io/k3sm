@@ -397,6 +397,65 @@ func TestEtcdDeathReportedOnce(t *testing.T) {
 	})
 }
 
+// TestEtcdQuorumWaitLogsWhy: the binding rule stays a leader AND an empty alarm list,
+// and the wait's periodic line says which half is missing — the leader state, and the
+// active alarms by name — so an operator can see why the wait has not ended.
+func TestEtcdQuorumWaitLogsWhy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		fake   *fakeEtcd
+		wantIn []string
+	}{
+		{"a leader but an active NOSPACE alarm", &fakeEtcd{
+			status: etcdMemberStatus{MemberID: testOwnID, Leader: testOwnID},
+			alarms: []etcdAlarm{{MemberID: testOwnID, Alarm: etcdAlarmNoSpace}},
+		}, []string{"leader=abc", "alarms=NOSPACE"}},
+		{"no leader", &fakeEtcd{status: etcdMemberStatus{MemberID: testOwnID}},
+			[]string{"leader=none", `alarms="unknown (asked only once a leader exists)"`}},
+		{"the local member does not answer", &fakeEtcd{statusErr: errors.New("context deadline exceeded")},
+			[]string{`leader="unknown (the local member did not answer: context deadline exceeded)"`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clk := newFakeClock(time.Minute)
+			s, logs, _ := etcdTestSupervised(t, EtcdInit, tc.fake, clk)
+			writeEtcdChild(t, s.cfg.WorkDir, "exec sleep 600\n")
+			c, err := s.spawn(t.Context(), etcdComponent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.markSupervised(c); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- s.awaitEtcdQuorum(ctx, tc.fake, c) }()
+			select {
+			case <-clk.reached:
+			case err := <-done:
+				t.Fatalf("the wait ended with %v; neither half of quorum holds", err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("the fake clock never reached a minute")
+			}
+			cancel()
+			<-done
+			var line string
+			for _, l := range strings.Split(logs.String(), "\n") {
+				if strings.Contains(l, "waiting for etcd quorum") {
+					line = l
+				}
+			}
+			for _, want := range tc.wantIn {
+				if !strings.Contains(line, want) {
+					t.Errorf("wait line %q does not carry %s", line, want)
+				}
+			}
+			if strings.Contains(logs.String(), "etcd quorum reached") {
+				t.Error("quorum was reported reached")
+			}
+		})
+	}
+}
+
 // lastLines returns the last n lines of s, for a readable failure.
 func lastLines(s string, n int) string {
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
