@@ -14,8 +14,11 @@
 # foreign-user admission policy judges the pods/ephemeralcontainers UPDATE.
 #
 # Asserts (the m1.sh PASS/FAIL ladder pattern):
-#   1. `kubectl debug -i --image=native` on a native pod runs its command: the
-#      output carries the marker and the ephemeral container terminates exit 0;
+#   1. `kubectl debug --image=native` on a native pod runs its command: the
+#      ephemeral container terminates exit 0 and `kubectl logs -c` carries the
+#      marker. Interactive attach to a native process is unsupported (a
+#      documented ceiling: `kubectl debug -it` is refused), so the leg runs the
+#      debug container non-interactively and reads its output through logs;
 #   2. `kubectl debug --target` is refused with the stated message, seen by the
 #      kubectl user (kubectl's own output, else the pod's Warning Event; the
 #      ladder line names which), and the status is Waiting
@@ -197,16 +200,18 @@ if ! kc wait --for=condition=Ready "pod/$POD_NATIVE" -n "$NS" --timeout="${READY
 	finish
 fi
 
-# 1. A debug container runs and exits. A script has no TTY, so -t cannot be
-#    used: -i attaches stdin (fed from /dev/null) and streams the output, and
-#    kubectl falls back to the container's logs if it has already terminated.
-out1="$(bounded 180 kubectl debug "$POD_NATIVE" -n "$NS" -i --image=native --profile="$PROFILE" \
-	--container=dbg1 -- /bin/sh -c 'echo b29-debug-ok' </dev/null 2>&1)" && rc1=0 || rc1=$?
+# 1. A debug container runs and exits. Interactive attach to a native process
+#    is unsupported, so the debug container is started WITHOUT -i/-t (kubectl
+#    returns once it is added), the leg waits for it to terminate, and the
+#    output is read through `kubectl logs -c`, the path a user takes.
+out1="$(bounded 60 kubectl debug "$POD_NATIVE" -n "$NS" --image=native --profile="$PROFILE" \
+	--container=dbg1 -- /bin/sh -c 'echo b29-debug-ok' 2>&1)" && rc1=0 || rc1=$?
 exit1="$(wait_field 60 0 "$POD_NATIVE" dbg1 state.terminated.exitCode || true)"
-if [ "$rc1" -eq 0 ] && grep -q "b29-debug-ok" <<<"$out1" && [ "$exit1" = 0 ]; then
-	ladder ok "b29-1  kubectl debug -i --image=native ran: output carries the marker, dbg1 terminated exit 0"
+logs1="$(bounded 30 kubectl logs "$POD_NATIVE" -n "$NS" -c dbg1 2>&1)" || true
+if [ "$rc1" -eq 0 ] && [ "$exit1" = 0 ] && grep -q "b29-debug-ok" <<<"$logs1"; then
+	ladder ok "b29-1  kubectl debug --image=native ran: dbg1 terminated exit 0, kubectl logs -c dbg1 carries the marker"
 else
-	ladder no "b29-1  kubectl debug -i --image=native ran (kubectl rc=$rc1, dbg1 exit='${exit1}', output: $(tr '\n' ' ' <<<"$out1" | cut -c1-300))"
+	ladder no "b29-1  kubectl debug --image=native ran (kubectl rc=$rc1, dbg1 exit='${exit1}', debug output: $(tr '\n' ' ' <<<"$out1" | cut -c1-200), logs: $(tr '\n' ' ' <<<"$logs1" | cut -c1-200))"
 fi
 
 # 2. --target is refused on the node, and the kubectl user sees why. kubectl
