@@ -189,7 +189,9 @@ rsudo() {
 	printf '%s\n' "set -eu" "$body" | ssh "${SSH_OPTS[@]}" "$SSH_DEST" "cat > $RDIR/$name.sh" &&
 		rsh "sudo /bin/zsh $RDIR/$name.sh"
 }
-kc() { kubectl "$@"; }
+# Every apiserver call is bounded: a starved apiserver must not hang the
+# watchdog, which exists to act exactly then.
+kc() { kubectl --request-timeout=10s "$@"; }
 server_now() { rsh "date '+%Y-%m-%d %H:%M:%S'"; }
 
 FINAL_RC=1
@@ -205,7 +207,9 @@ cleanup() {
 		kc delete pod -n "${p%%/*}" "${p##*/}" --grace-period=0 --force --wait=false >/dev/null 2>&1
 	done
 	if [ -n "$SSH_DEST" ] && [ "$rc" != 3 ]; then
-		rsudo disarm "pkill -f '$RDIR/b46-deadman' || true; pkill -KILL -f '$RDIR/b46-fill' || true" >/dev/null 2>&1
+		disarm_deadman 1
+		disarm_deadman 2
+		kill_fill ""
 	fi
 	if [ -n "$SWAP_START" ]; then
 		local used=""
@@ -219,11 +223,18 @@ cleanup() {
 			[ "$rc" = 0 ] && rc=1
 		fi
 	fi
-	if [ "$rc" = 0 ]; then
-		if ! all_nodes_ready; then
-			echo "FAIL  cleanup: not every node is Ready at the end of the run"
-			rc=1
+	# Node readiness is checked and reported on EVERY exit path, a refused or
+	# failed run included: the rig must be left Ready, and the log says whether
+	# it was. Only a run that was otherwise passing turns red on it.
+	if command -v kubectl >/dev/null 2>&1; then
+		if all_nodes_ready; then
+			echo "      cleanup: every node Ready at exit: yes"
+		else
+			echo "FAIL  cleanup: every node Ready at exit: no"
+			[ "$rc" = 0 ] && rc=1
 		fi
+	else
+		echo "      cleanup: every node Ready at exit: unknown (kubectl not on PATH)"
 	fi
 	echo "----------------------------------------"
 	echo "B46: $PASS passed, $FAIL failed (evidence: $EV)"
@@ -247,6 +258,10 @@ all_nodes_ready() {
 [ -n "$NODE" ] || refuse "K3SM_B46_NODE is unset (the server's node name)"
 command -v kubectl >/dev/null 2>&1 || refuse "kubectl is not on PATH"
 rsh true >/dev/null 2>&1 || refuse "ssh to the server failed"
+# The run must be driven from ANOTHER host, so the watchdog does not starve with
+# the machine it watches.
+[ "$(rsh hostname 2>/dev/null | tr -d '[:space:]')" != "$(hostname | tr -d '[:space:]')" ] ||
+	refuse "the driving host is the server; drive the run from another node"
 all_nodes_ready || refuse "not every node is Ready (or fewer than $MIN_NODES nodes)"
 [ "$(kc get --raw /readyz 2>/dev/null)" = "ok" ] || refuse "/readyz is not ok"
 rsh "mkdir -p '$RDIR' && chmod 755 '$RDIR'" || refuse "cannot create $RDIR on the server"
@@ -373,17 +388,49 @@ rsh "cd '$RDIR' && cc -O2 -o b46-fill b46-fill.c && cc -O2 -o b46-pcflags b46-pc
 # the fill holding at its ceiling for 120 s with neither mechanism acting, or the
 # leg's wall clock. A fired watchdog fails the run.
 lease_renew() { kc get lease -n "$1" "$2" -o jsonpath='{.spec.renewTime}' 2>/dev/null || true; }
+# fill_pattern <pod|""> is the pgrep -f pattern for this run's fill process(es):
+# the helper's name and the run token on its argv. The bracket keeps it from
+# matching any shell that carries the pattern text.
+fill_pattern() { echo "[b]46-fill .*$RUN_TOKEN${1:+-$1}"; }
+# kill_fill [pod] SIGKILLs this run's fill (one pod's, or every leg's). It kills
+# the process GROUP only when that is provably the fill's own: never an empty,
+# 0 or 1 pgid, and never the group of a recorded control-plane process or of the
+# server daemon (which hosts the runtime). Otherwise it kills the pid alone, and
+# only a pid whose comm is b46-fill.
 kill_fill() {
-	rsudo killfill "for p in \$(pgrep -f '$RDIR/b46-fill'); do kill -KILL -- -\$(ps -o pgid= -p \$p | tr -d ' ') 2>/dev/null || kill -KILL \$p; done; true" >/dev/null 2>&1 || true
+	local protect
+	protect="$(printf '%s\n' "$CP_BEFORE" | cut -d= -f2 | grep -E '^[0-9]+$' | tr '\n' ' ')"
+	rsudo killfill "for p in \$(pgrep -f '$(fill_pattern "${1:-}")'); do
+	c=\$(ps -o comm= -p \$p 2>/dev/null)
+	[ \"\${c##*/}\" = b46-fill ] || continue
+	g=\$(ps -o pgid= -p \$p 2>/dev/null | tr -d ' ')
+	safe=1
+	case \"\$g\" in ''|0|1) safe=0 ;; esac
+	for cp in $protect; do
+		cg=\$(ps -o pgid= -p \$cp 2>/dev/null | tr -d ' ')
+		[ -n \"\$cg\" ] && [ \"\$cg\" = \"\$g\" ] && safe=0
+	done
+	if [ \$safe = 1 ]; then kill -KILL -- -\$g; else kill -KILL \$p; fi
+done
+true" >/dev/null 2>&1 || true
 }
 watchdog() {
-	local ns="$1" pod="$2" deadline="$3" readyz_bad=0 ceiling_at=0 now sys phase mp mpmsg ready
+	local ns="$1" pod="$2" deadline="$3" readyz_fail_since=0 readyz_bad=0 ceiling_at=0 now sys phase mp mpmsg ready
 	: >"$EV/watch.tsv"
 	while :; do
+		# The /readyz failure window is wall-clock time since the first failed
+		# probe, not a count of iterations: an iteration slowed by a starved host
+		# must not stretch the window.
+		if [ "$(kc get --raw /readyz 2>/dev/null)" = ok ]; then
+			readyz_fail_since=0
+		elif [ "$readyz_fail_since" -eq 0 ]; then
+			readyz_fail_since="$(date +%s)"
+		fi
 		now="$(date +%s)"
-		if [ "$(kc get --raw /readyz 2>/dev/null)" = ok ]; then readyz_bad=0; else readyz_bad=$((readyz_bad + 3)); fi
+		readyz_bad=0
+		[ "$readyz_fail_since" -ne 0 ] && readyz_bad=$((now - readyz_fail_since))
 		if ! sys="$(rsh "sysctl -n vm.compressor.pages_compressed vm.compressor.pages_compressed_limit vm.compressor.segment.total vm.compressor.segment.limit vm.swapusage | tr '\n' ' '" 2>/dev/null)"; then
-			echo "ssh to the server failed" >"$EV/watchdog.fired"; kill_fill; return
+			echo "ssh to the server failed" >"$EV/watchdog.fired"; kill_fill "$pod"; return
 		fi
 		phase="$(kc get pod -n "$ns" "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
 		mp="$(kc get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")].status}' 2>/dev/null || true)"
@@ -393,26 +440,30 @@ watchdog() {
 			"$now" "$readyz_bad" "$sys" "$phase" "$mp" "$mpmsg" "$ready" \
 			"$(lease_renew kube-node-lease "$NODE")" "$(lease_renew kube-system kube-scheduler)" \
 			"$(lease_renew kube-system kube-controller-manager)" >>"$EV/watch.tsv"
-		if [ "$readyz_bad" -ge 15 ]; then echo "/readyz failed for 15 s" >"$EV/watchdog.fired"; kill_fill; return; fi
-		if [ "$now" -ge "$deadline" ]; then echo "leg wall clock reached" >"$EV/watchdog.fired"; kill_fill; return; fi
+		if [ "$readyz_bad" -ge 15 ]; then echo "/readyz failed for ${readyz_bad} s" >"$EV/watchdog.fired"; kill_fill "$pod"; return; fi
+		if [ "$now" -ge "$deadline" ]; then echo "leg wall clock reached" >"$EV/watchdog.fired"; kill_fill "$pod"; return; fi
 		if [ "$ceiling_at" -eq 0 ] && kc logs -n "$ns" "$pod" 2>/dev/null | grep -q 'b46-fill CEILING'; then ceiling_at="$now"; fi
 		if [ "$ceiling_at" -ne 0 ] && [ "$phase" = Running ] && [ $((now - ceiling_at)) -ge 120 ]; then
-			echo "fill held at its ceiling for 120 s and neither mechanism acted" >"$EV/watchdog.fired"; kill_fill; return
+			echo "fill held at its ceiling for 120 s and neither mechanism acted" >"$EV/watchdog.fired"; kill_fill "$pod"; return
 		fi
 		sleep 3
 	done
 }
+# arm_deadman <leg> <pod>: a one-shot server-side deadman per leg. If the driver
+# loses the server, that leg's fill (named by the run token) still dies at the
+# wall clock plus a margin. disarm_deadman <leg> retires it, so leg 1's deadman
+# can never fire into leg 2.
 arm_deadman() {
-	# A one-shot server-side deadman: if the driver loses the server, the fill
-	# still dies at the wall clock plus a margin.
-	rsudo deadman "cat > '$RDIR/b46-deadman' <<'EOF'
+	local leg="$1" pod="$2"
+	rsudo "deadman-$leg" "cat > '$RDIR/b46-deadman-$leg' <<'EOF'
 #!/bin/zsh
 sleep \$1
-pkill -KILL -f '$RDIR/b46-fill'
+pkill -KILL -f '$(fill_pattern "$pod")'
 EOF
-chmod 755 '$RDIR/b46-deadman'
-nohup '$RDIR/b46-deadman' $((WALL + 300)) >/dev/null 2>&1 &" >/dev/null 2>&1 || refuse "could not arm the server-side deadman"
+chmod 755 '$RDIR/b46-deadman-$leg'
+nohup '$RDIR/b46-deadman-$leg' $((WALL + 300)) >/dev/null 2>&1 &" >/dev/null 2>&1 || refuse "could not arm the server-side deadman for leg $leg"
 }
+disarm_deadman() { rsudo "disarm-$1" "pkill -f '[b]46-deadman-$1' || true" >/dev/null 2>&1 || true; }
 
 # ── The fill pod ──────────────────────────────────────────────────────────────────
 make_fill_pod() {
@@ -443,7 +494,12 @@ wait_running() {
 	done
 	return 1
 }
-fill_pid() { rsh "pgrep -f '$RUN_TOKEN-$1' | head -1" 2>/dev/null | tr -d '[:space:]'; }
+# fill_pid <pod>: the fill's pid, matched by helper name + run token (the
+# bracket keeps the remote shell from matching itself), and accepted only if
+# that pid's comm really is b46-fill.
+fill_pid() {
+	rsh "p=\$(pgrep -f '$(fill_pattern "$1")' | head -1); [ -n \"\$p\" ] || exit 0; c=\$(ps -o comm= -p \$p); [ \"\${c##*/}\" = b46-fill ] && echo \$p" 2>/dev/null | tr -d '[:space:]'
+}
 kernel_lines() {
 	# kernel_lines <start> <end|""> : the kernel's out-of-swap lines over a window.
 	local end_arg=""
@@ -496,7 +552,7 @@ leg1() {
 	local pod="b46-fill-1" uid start_srv start_epoch end_srv phase reason evicted_cnt etm comp_at mpmsg_seen taint log_off
 	echo "==> B46 leg 1: eviction acts first ($NS1/$pod, BestEffort)"
 	rm -f "$EV/watchdog.fired"
-	arm_deadman
+	arm_deadman 1 "$pod"
 	log_off="$(server_log_offset)"; [ -n "$log_off" ] || refuse "cannot read the size of $SERVER_LOG"
 	start_srv="$(server_now)"; start_epoch="$(date +%s)"
 	make_fill_pod "$NS1" "$pod" ""
@@ -560,7 +616,8 @@ leg2() {
 	local pod="b46-fill-2" start_srv start_epoch pid flags skip_srv exitc log_off
 	echo "==> B46 leg 2: the kernel picks the marked pod ($NS2/$pod, system-node-critical)"
 	rm -f "$EV/watchdog.fired"
-	arm_deadman
+	disarm_deadman 1
+	arm_deadman 2 "$pod"
 	log_off="$(server_log_offset)"; [ -n "$log_off" ] || refuse "cannot read the size of $SERVER_LOG"
 	start_srv="$(server_now)"; start_epoch="$(date +%s)"
 	make_fill_pod "$NS2" "$pod" "  priorityClassName: system-node-critical"
