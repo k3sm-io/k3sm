@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -76,6 +77,11 @@ type ServerConfig struct {
 	// Bundle yields the sealed CA bundle the bundle endpoint returns. When nil, the
 	// bundle endpoint is not served. Both ServerAuth and Bundle must be set to enable it.
 	Bundle BundleSource
+	// Members drives the embedded-etcd membership routes (EtcdMemberPath,
+	// EtcdMemberPromotePath) against this server's own local member. They are
+	// served only when both ServerAuth and Members are set — the etcd posture —
+	// and independently of Bundle.
+	Members MemberJoiner
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 	// Now is the clock the join rate limiters (per-token and pre-auth) refill
@@ -104,6 +110,9 @@ type Server struct {
 	// preauth bounds anonymous join volume per source address and in total,
 	// ahead of the token verification's bcrypt cost (see preAuthLimiter).
 	preauth *preAuthLimiter
+	// memberMu serializes the etcd member routes, so one request's member list,
+	// stale-member removal and learner add never interleave with another's.
+	memberMu sync.Mutex
 }
 
 // NewServer validates cfg and returns the bootstrap Server. It errors if any
@@ -150,7 +159,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 // Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +
 // MeshEndpointPath + DeregisterPath, plus the server-bootstrap CA-bundle endpoint
-// when ServerAuth + Bundle are configured).
+// when ServerAuth + Bundle are configured, and the server-class etcd member routes
+// when ServerAuth + Members are configured).
 //
 // The routes do NOT share an authentication scheme, and that is deliberate:
 // /cacert, /join and /server-bootstrap are reached by a node that holds no cluster
@@ -168,6 +178,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(DeregisterPath, s.handleDeregister)
 	if s.cfg.ServerAuth != nil && s.cfg.Bundle != nil {
 		mux.HandleFunc(BundlePath, s.handleBundle)
+	}
+	if s.cfg.ServerAuth != nil && s.cfg.Members != nil {
+		mux.HandleFunc(EtcdMemberPath, s.handleEtcdMember)
+		mux.HandleFunc(EtcdMemberPromotePath, s.handleEtcdMemberPromote)
 	}
 	return mux
 }

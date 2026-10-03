@@ -1,0 +1,379 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package bootstrap_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/certs"
+)
+
+// fakeMembers is an in-memory etcd membership: MemberAddAsLearner appends an
+// unstarted learner (no name, no client URLs, as etcd registers one), and every call
+// is recorded in order.
+type fakeMembers struct {
+	mu      sync.Mutex
+	members []bootstrap.EtcdMember
+	nextID  uint64
+	calls   []string
+	listErr error
+	promErr error
+}
+
+func (f *fakeMembers) record(c string) { f.calls = append(f.calls, c) }
+
+func (f *fakeMembers) MemberList(context.Context) ([]bootstrap.EtcdMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("list")
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return slices.Clone(f.members), nil
+}
+
+func (f *fakeMembers) MemberAddAsLearner(_ context.Context, peerURL string) (bootstrap.EtcdMember, []bootstrap.EtcdMember, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("add " + peerURL)
+	f.nextID++
+	m := bootstrap.EtcdMember{ID: 0x1000 + f.nextID, PeerURLs: []string{peerURL}, IsLearner: true}
+	f.members = append(f.members, m)
+	return m, slices.Clone(f.members), nil
+}
+
+func (f *fakeMembers) MemberPromote(_ context.Context, id uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record(fmt.Sprintf("promote %x", id))
+	if f.promErr != nil {
+		return f.promErr
+	}
+	for i := range f.members {
+		if f.members[i].ID == id {
+			f.members[i].IsLearner = false
+		}
+	}
+	return nil
+}
+
+func (f *fakeMembers) MemberRemove(_ context.Context, id uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record(fmt.Sprintf("remove %x", id))
+	f.members = slices.DeleteFunc(f.members, func(m bootstrap.EtcdMember) bool { return m.ID == id })
+	return nil
+}
+
+func (f *fakeMembers) callLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.calls)
+}
+
+const (
+	memberTestSecret = "high-entropy-server-bootstrap-secret-abc123"
+	serverAPeer      = "https://192.168.0.50:2380"
+	joinerPeer       = "https://192.168.0.111:2380"
+)
+
+// serverA is the existing server's member as etcd lists it.
+var serverA = bootstrap.EtcdMember{ID: 0xa, Name: "server-a", PeerURLs: []string{serverAPeer}, ClientURLs: []string{"https://127.0.0.1:2379"}}
+
+type memberRig struct {
+	ts          *httptest.Server
+	members     *fakeMembers
+	serverToken string
+	workerToken string
+}
+
+func newMemberRig(t *testing.T, members *fakeMembers) memberRig {
+	t.Helper()
+	clusterCA, _ := certs.NewCA("k3sm-cluster-ca")
+	signingCA, _ := certs.NewCA("k3sm-signing-ca")
+	workerTokens := bootstrap.NewTokenStore(nil)
+	wUser, wSecret, _, err := workerTokens.Create(time.Hour)
+	if err != nil {
+		t.Fatalf("create worker token: %v", err)
+	}
+	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
+		ClusterCA:     clusterCA,
+		SigningCA:     signingCA,
+		Tokens:        workerTokens,
+		NodePasswords: bootstrap.NewMemoryNodePasswords(),
+		Enroller:      &fakeEnroller{podCIDR: "100.64.1.0/24", meshIP: "100.64.1.1"},
+		SelfNodeName:  "server-a",
+		ServerAuth:    bootstrap.NewStaticServerSecret(memberTestSecret),
+		Members:       members,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return memberRig{
+		ts:          ts,
+		members:     members,
+		serverToken: bootstrap.FormatServerToken(clusterCA.PinHash(), memberTestSecret),
+		workerToken: bootstrap.FormatToken(clusterCA.PinHash(), wUser, wSecret),
+	}
+}
+
+func (r memberRig) post(t *testing.T, path, token string, body any) (*http.Response, []byte) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, r.ts.URL+path, bytes.NewReader(b))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := r.ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(resp.Body)
+	return resp, buf.Bytes()
+}
+
+func countPrefix(calls []string, prefix string) int {
+	n := 0
+	for _, c := range calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEtcdMemberRouteAddsLearner pins the ordinary join: the name is unused, so the
+// route adds exactly one LEARNER at the joiner's peer URL (never a voting add) and
+// answers with its ID and an --initial-cluster built from the resulting member list,
+// the unstarted joiner named by the request. The client helper speaks the same wire.
+func TestEtcdMemberRouteAddsLearner(t *testing.T) {
+	rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA}})
+
+	resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
+	if err != nil {
+		t.Fatalf("RequestEtcdMember: %v", err)
+	}
+	calls := rig.members.callLog()
+	if !slices.Equal(calls, []string{"list", "add " + joinerPeer}) {
+		t.Fatalf("calls = %v, want one list then one learner add", calls)
+	}
+	if resp.MemberID != 0x1001 {
+		t.Errorf("member ID = %x, want the added learner's 1001", resp.MemberID)
+	}
+	want := "server-a=" + serverAPeer + ",server-b=" + joinerPeer
+	if resp.InitialCluster != want {
+		t.Errorf("initial cluster = %q, want %q", resp.InitialCluster, want)
+	}
+	if got := rig.members.members[1]; !got.IsLearner {
+		t.Errorf("the joiner was added as a voting member: %+v", got)
+	}
+
+	// The peer URL must be canonical https://<non-loopback ip>:<port>; anything else
+	// is refused before the membership is touched.
+	before := len(rig.members.callLog())
+	for _, bad := range []string{"http://192.168.0.111:2380", "https://127.0.0.1:2380", "https://host.local:2380", "https://192.168.0.111", "https://192.168.0.111:2380/x", "https://u:p@192.168.0.111:2380"} {
+		r, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-c", PeerURL: bad})
+		if r.StatusCode != http.StatusBadRequest {
+			t.Errorf("peer URL %q: status %d, want 400", bad, r.StatusCode)
+		}
+	}
+	// A non-canonical name and this server's own name are refused too: the second
+	// would let the stale-member path remove the member serving the request.
+	for _, bad := range []string{"Server-C", "server-a"} {
+		r, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: bad, PeerURL: "https://192.168.0.12:2380"})
+		if r.StatusCode/100 != 4 {
+			t.Errorf("name %q: status %d, want a 4xx refusal", bad, r.StatusCode)
+		}
+	}
+	if after := len(rig.members.callLog()); after != before {
+		t.Errorf("a refused request touched the membership: %v", rig.members.callLog()[before:])
+	}
+}
+
+// TestEtcdMemberRouteReusesUnstartedLearner pins the launchd-restart case: the joiner
+// was added, then restarted before its member ever ran, so an UNSTARTED learner (no
+// name, no client URLs) already sits at its peer URL. The route reuses it — no second
+// add, no remove — and the answer names that learner.
+func TestEtcdMemberRouteReusesUnstartedLearner(t *testing.T) {
+	pending := bootstrap.EtcdMember{ID: 0xb, PeerURLs: []string{joinerPeer}, IsLearner: true}
+	rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA, pending}})
+
+	for range 2 {
+		resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
+		if err != nil {
+			t.Fatalf("RequestEtcdMember: %v", err)
+		}
+		if resp.MemberID != 0xb {
+			t.Errorf("member ID = %x, want the existing learner b", resp.MemberID)
+		}
+		if want := "server-a=" + serverAPeer + ",server-b=" + joinerPeer; resp.InitialCluster != want {
+			t.Errorf("initial cluster = %q, want %q", resp.InitialCluster, want)
+		}
+	}
+	calls := rig.members.callLog()
+	if countPrefix(calls, "add") != 0 || countPrefix(calls, "remove") != 0 {
+		t.Errorf("calls = %v, want lists only (the unstarted learner is reused)", calls)
+	}
+}
+
+// TestEtcdMemberRouteRemovesStaleMember pins the re-join after a wiped data dir: a
+// STARTED member already carries the joiner's name, and its old identity can never
+// start again, so it is removed and a fresh learner added. An unstarted entry at a
+// DIFFERENT peer URL under no name is untouched (another server mid-join), and a
+// member under the joiner's name at a different peer URL is removed the same way.
+func TestEtcdMemberRouteRemovesStaleMember(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stale bootstrap.EtcdMember
+	}{
+		{"started member, wiped data dir", bootstrap.EtcdMember{ID: 0xb, Name: "server-b", PeerURLs: []string{joinerPeer}, ClientURLs: []string{"https://127.0.0.1:2379"}}},
+		{"same name, different peer URL", bootstrap.EtcdMember{ID: 0xb, Name: "server-b", PeerURLs: []string{"https://192.168.0.99:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}},
+		{"unstarted VOTING entry at the peer URL", bootstrap.EtcdMember{ID: 0xb, PeerURLs: []string{joinerPeer}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := bootstrap.EtcdMember{ID: 0xc, PeerURLs: []string{"https://192.168.0.77:2380"}, IsLearner: true}
+			rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA, tc.stale, other}})
+
+			resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
+			if err != nil {
+				t.Fatalf("RequestEtcdMember: %v", err)
+			}
+			calls := rig.members.callLog()
+			if !slices.Equal(calls, []string{"list", "remove b", "add " + joinerPeer}) {
+				t.Fatalf("calls = %v, want list, remove the stale member, then the learner add", calls)
+			}
+			want := "server-a=" + serverAPeer + ",unstarted-c=https://192.168.0.77:2380,server-b=" + joinerPeer
+			if resp.InitialCluster != want {
+				t.Errorf("initial cluster = %q, want %q", resp.InitialCluster, want)
+			}
+		})
+	}
+}
+
+// TestEtcdMemberPromoteRoute pins promotion: the named learner is promoted, an
+// already-voting member is a 200 with no promote call (idempotent), a learner etcd
+// will not promote yet is a 503 the joiner retries, and a name with no started member
+// is a 404.
+func TestEtcdMemberPromoteRoute(t *testing.T) {
+	learner := bootstrap.EtcdMember{ID: 0xb, Name: "server-b", PeerURLs: []string{joinerPeer}, ClientURLs: []string{"https://127.0.0.1:2379"}, IsLearner: true}
+	members := &fakeMembers{members: []bootstrap.EtcdMember{serverA, learner}, promErr: errors.New("can only promote a learner member which is in sync with leader")}
+	rig := newMemberRig(t, members)
+	ctx := context.Background()
+
+	if err := bootstrap.PromoteEtcdMember(ctx, rig.ts.URL, rig.serverToken, "server-b", rig.ts.Client()); err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("a not-yet-synced learner: err = %v, want a 503", err)
+	}
+	members.mu.Lock()
+	members.promErr = nil
+	members.mu.Unlock()
+	for range 2 {
+		if err := bootstrap.PromoteEtcdMember(ctx, rig.ts.URL, rig.serverToken, "server-b", rig.ts.Client()); err != nil {
+			t.Fatalf("PromoteEtcdMember: %v", err)
+		}
+	}
+	if n := countPrefix(members.callLog(), "promote b"); n != 2 {
+		t.Errorf("promote calls = %d, want 2 (the refused one and the one that landed; the repeat is a no-op)", n)
+	}
+	if err := bootstrap.PromoteEtcdMember(ctx, rig.ts.URL, rig.serverToken, "server-z", rig.ts.Client()); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Errorf("unknown member: err = %v, want a 404", err)
+	}
+}
+
+// TestServerClassRoutesRejectWorkerToken pins the class split on the new routes: a
+// worker token, a missing token and a wrong server secret are all refused before the
+// membership is read, while the server token is served. /join keeps refusing a server
+// token (TestCABundleEndpointRejectsWorkerIdentity covers the bundle route), and a
+// server without Members serves neither route.
+func TestServerClassRoutesRejectWorkerToken(t *testing.T) {
+	rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA}})
+	wrongSecret := bootstrap.FormatServerToken(strings.SplitN(strings.TrimPrefix(rig.serverToken, "K10"), "::", 2)[0], "not-the-secret")
+
+	for _, path := range []string{bootstrap.EtcdMemberPath, bootstrap.EtcdMemberPromotePath} {
+		body := bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}
+		for _, tc := range []struct {
+			name, token string
+			want        int
+		}{
+			{"worker token", rig.workerToken, http.StatusForbidden},
+			{"no token", "", http.StatusUnauthorized},
+			{"wrong server secret", wrongSecret, http.StatusForbidden},
+		} {
+			resp, _ := rig.post(t, path, tc.token, body)
+			if resp.StatusCode != tc.want {
+				t.Errorf("%s with %s: status %d, want %d", path, tc.name, resp.StatusCode, tc.want)
+			}
+		}
+		req, _ := http.NewRequest(http.MethodGet, rig.ts.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+rig.serverToken)
+		if resp, err := rig.ts.Client().Do(req); err != nil || resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("GET %s: %v %v, want 405", path, resp, err)
+		}
+	}
+	if calls := rig.members.callLog(); len(calls) != 0 {
+		t.Fatalf("a refused request reached the membership: %v", calls)
+	}
+	if _, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.workerToken, "server-b", joinerPeer, rig.ts.Client()); !errors.Is(err, bootstrap.ErrNotServerToken) {
+		t.Errorf("the client helper accepted a worker token: %v", err)
+	}
+	if resp, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: "server-b", PeerURL: joinerPeer}); resp.StatusCode != http.StatusOK {
+		t.Errorf("server token: status %d, want 200", resp.StatusCode)
+	}
+
+	// /join refuses the server class: the server token is not a worker join token.
+	resp, _ := rig.post(t, bootstrap.JoinPath, "", bootstrap.JoinRequest{Token: rig.serverToken, NodeName: "server-b"})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/join with a server token: status %d, want 401", resp.StatusCode)
+	}
+
+	// No Members: neither route exists, even with ServerAuth set.
+	clusterCA, _ := certs.NewCA("k3sm-cluster-ca")
+	signingCA, _ := certs.NewCA("k3sm-signing-ca")
+	bare, err := bootstrap.NewServer(bootstrap.ServerConfig{
+		ClusterCA: clusterCA, SigningCA: signingCA, Tokens: bootstrap.NewTokenStore(nil),
+		NodePasswords: bootstrap.NewMemoryNodePasswords(), Enroller: &fakeEnroller{},
+		ServerAuth: bootstrap.NewStaticServerSecret(memberTestSecret),
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	ts := httptest.NewServer(bare.Handler())
+	defer ts.Close()
+	r, err := ts.Client().Post(ts.URL+bootstrap.EtcdMemberPath, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Body.Close()
+	if r.StatusCode != http.StatusNotFound {
+		t.Errorf("etcd-member without Members: status %d, want 404", r.StatusCode)
+	}
+}
