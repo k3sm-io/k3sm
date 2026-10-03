@@ -481,7 +481,7 @@ udp_dir() { # <label> <client-pod> <src> <dst> <server-pod> <capture-side>
 			sent="$(grep "udp-send size=$size df=$df " "$d/clients.log" | tail -1 | sed -nE 's/.*sent=([0-9]+).*/\1/p')"
 			err="$(grep "udp-send size=$size df=$df " "$d/clients.log" | tail -1 | sed -nE 's/.*err=([A-Z0-9a-z]+).*/\1/p')"
 			pkts="$(grep -c 'proto UDP (17)' "$cap")"
-			frags="$(grep -cE 'proto UDP \(17\).*(flags \[\+\]|offset [1-9])' "$cap")"
+			frags="$(grep 'proto UDP (17)' "$cap" | grep -cE 'flags \[\+\]|offset [1-9]')"
 			echo "$label $size $df ${sent:-0} ${err:-?} $pkts $frags" >>"$d/sent.txt"
 		done
 	done
@@ -533,6 +533,9 @@ leg_pmtud() {
 			ping -D -c 2 -t 6 -s "$s" "$PEER_ENDPOINT_HOST" >"$d/outer-$s.txt" 2>&1
 			ping_row "outer L->P endpoint DF payload $s" local "$d/outer-$s.txt"
 		done
+		local oif
+		oif="$(route -n get "$PEER_ENDPOINT_HOST" 2>/dev/null | awk '/interface:/{print $2}')"
+		echo "outer interface $oif mtu=$(ifconfig "$oif" 2>/dev/null | sed -nE 's/.* mtu ([0-9]+).*/\1/p' | head -1)" >>"$PMTUD_TABLE"
 	else
 		echo "outer path: no MeshPeer endpoint found" >>"$PMTUD_TABLE"
 	fi
@@ -543,13 +546,18 @@ leg_pmtud() {
 # ── CPU sampler ───────────────────────────────────────────────────────────────
 cpu_sample() { # <file> <secs>  (local and peer, every 2 s)
 	local n=$(( $2 / 2 + 1 ))
-	( for _ in $(seq 1 "$n"); do ps -Ao pcpu=,comm= | awk '/k3sm/'; echo "--"; sleep 2; done ) >"$1.local" 2>&1 &
+	( echo "load $(sysctl -n vm.loadavg)"; echo "host $(top -l 1 -n 0 | grep 'CPU usage')"
+	  for _ in $(seq 1 "$n"); do ps -Ao pcpu=,comm= | awk '/k3sm|kine|kube-/'; echo "--"; sleep 2; done ) >"$1.local" 2>&1 &
 	BG_PIDS="$BG_PIDS $!"; CPU_L=$!
-	rsh "for i in \$(seq 1 $n); do ps -Ao pcpu=,comm= | awk '/k3sm/'; echo --; sleep 2; done" >"$1.peer" 2>&1 &
+	rsh "echo load \$(sysctl -n vm.loadavg); echo host \$(top -l 1 -n 0 | grep 'CPU usage'); for i in \$(seq 1 $n); do ps -Ao pcpu=,comm= | awk '/k3sm|kine|kube-/'; echo --; sleep 2; done" >"$1.peer" 2>&1 &
 	BG_PIDS="$BG_PIDS $!"; CPU_P=$!
 }
-cpu_summary() { # <file.side>
-	awk '$1!="--"{n=split($2,a,"/"); k=a[n]; s[k]+=$1; c[k]++; if($1>m[k])m[k]=$1} END{for(k in s) printf "%s avg=%.1f max=%.1f; ", k, s[k]/c[k], m[k]}' "$1"
+# cpu_summary <file.side>: per k3sm / control-plane process (pod workloads that
+# merely live under a k3sm path are excluded), plus the host load average and
+# whole-host CPU taken when sampling started.
+cpu_summary() {
+	awk '$1!="--" && $1!="load" && $1!="host"{n=split($2,a,"/"); k=a[n]; if (k !~ /^(k3sm|kine|kube-)/) next; s[k]+=$1; c[k]++; if($1>m[k])m[k]=$1} END{for(k in s) printf "%s avg=%.1f%% max=%.1f%%; ", k, s[k]/c[k], m[k]}' "$1"
+	grep -m1 '^load' "$1"; grep -m1 '^host' "$1"
 }
 
 # ── Leg: bulk ─────────────────────────────────────────────────────────────────
@@ -577,7 +585,7 @@ bulk_dir() { # <label> <client-pod> <src> <dst> <server-pod> <capture-side>
 	mbps_s="$(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/client.log")"
 	mbps_r="$(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/server.log")"
 	printf '%-6s sent=%sMbit/s recv=%sMbit/s pkts_seen=%s max_ip_len=%s icmp_fragneeded=%s %s\n' "$label" "${mbps_s:-?}" "${mbps_r:-?}" "$pk" "${maxlen:-?}" "$icmp" "$(grep -o 'maxseg=[0-9-]*' "$d/client.log")" >>"$BULK_TABLE"
-	printf '       cpu local: %s\n       cpu peer:  %s\n' "$(cpu_summary "$d/cpu.local")" "$(cpu_summary "$d/cpu.peer")" >>"$BULK_TABLE"
+	printf '       cpu local: %s\n       cpu peer:  %s\n' "$(cpu_summary "$d/cpu.local" | tr '\n' ' ')" "$(cpu_summary "$d/cpu.peer" | tr '\n' ' ')" >>"$BULK_TABLE"
 	[ -n "$mbps_s" ] || return 1
 }
 leg_bulk() {
@@ -619,10 +627,17 @@ leg_soak() {
 	sleep 3
 	srv_state "$POD_P" "$POD_P_IP" >"$d/server-p.json"
 	srv_state "$POD_L" "$POD_L_IP" >"$d/server-l.json"
+	local udp_rx_p udp_rx_l
+	udp_rx_p="$("$PY" -c "import json,sys
+try: print(sum(v for k,v in json.load(open(sys.argv[1]))['udp'].items() if k.startswith('$UDP_PORT_SOAK:')))
+except Exception: print('?')" "$d/server-p.json")"
+	udp_rx_l="$("$PY" -c "import json,sys
+try: print(sum(v for k,v in json.load(open(sys.argv[1]))['udp'].items() if k.startswith('$UDP_PORT_SOAK:')))
+except Exception: print('?')" "$d/server-l.json")"
 	local nodes_ready
 	nodes_ready="$(kc get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}')"
-	SOAK_SUMMARY="secs=$SOAK_SECS bulk L->P $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-l2p.log")Mbit/s, P->L $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-p2l.log")Mbit/s; udp L->P $(cat "$d/udp-l2p.log" | tr '\n' ' ') P->L $(cat "$d/udp-p2l.log" | tr '\n' ' '); ${CP_MODE} ok=$cp_ok fail=$cp_fail (32 MiB each); healthz_fail=$health_fail; nodes: $nodes_ready"
-	printf '       cpu local: %s\n       cpu peer:  %s\n' "$(cpu_summary "$d/cpu.local")" "$(cpu_summary "$d/cpu.peer")" >"$d/cpu-summary.txt"
+	SOAK_SUMMARY="secs=$SOAK_SECS bulk L->P $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-l2p.log")Mbit/s, P->L $(sed -nE 's/.*mbps=([0-9.]+).*/\1/p' "$d/bulk-p2l.log")Mbit/s; udp L->P $(tr '\n' ' ' <"$d/udp-l2p.log")recv=$udp_rx_p, P->L $(tr '\n' ' ' <"$d/udp-p2l.log")recv=$udp_rx_l; ${CP_MODE} ok=$cp_ok fail=$cp_fail (32 MiB each); healthz_fail=$health_fail; nodes: $nodes_ready"
+	printf '       cpu local: %s\n       cpu peer:  %s\n' "$(cpu_summary "$d/cpu.local" | tr '\n' ' ')" "$(cpu_summary "$d/cpu.peer" | tr '\n' ' ')" >"$d/cpu-summary.txt"
 	log "soak: $SOAK_SUMMARY"
 	grep -q bulk-sent "$d/bulk-l2p.log" && grep -q bulk-sent "$d/bulk-p2l.log" || return 1
 }
