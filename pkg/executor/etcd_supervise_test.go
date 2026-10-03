@@ -182,7 +182,7 @@ func etcdTestSupervised(t *testing.T, role EtcdRole, fake *fakeEtcd, clk *fakeCl
 		WorkDir:  wd,
 		KinePort: freePort(t),
 		Etcd: &EtcdConfig{Role: role, Name: "server-a", PeerIP: testPeerIP,
-			InitialCluster: "server-b=https://192.168.0.11:2380,server-a=" + testOwnPeer},
+			InitialCluster: "server-b=https://192.0.2.11:2380,server-a=" + testOwnPeer},
 		Logger:          slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		OnComponentExit: sink.record,
 	})
@@ -249,7 +249,7 @@ func TestEtcdQuorumWaitNeverTripsBreaker(t *testing.T) {
 			status: etcdMemberStatus{MemberID: testOwnID}, // no leader
 			members: []etcdMember{
 				{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
-				{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.168.0.11:2380"}},
+				{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.0.2.11:2380"}},
 			},
 		}
 		clk := newFakeClock(3 * CrashLoopWindow)
@@ -681,8 +681,8 @@ func TestEtcdDefragLocalOnlyNonFatal(t *testing.T) {
 func TestEtcdPeerURLDriftReported(t *testing.T) {
 	fake := healthyFake()
 	fake.members = []etcdMember{
-		{ID: testOwnID, Name: "server-a", PeerURLs: []string{"https://192.168.0.99:2380"}},
-		{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.168.0.11:2380"}},
+		{ID: testOwnID, Name: "server-a", PeerURLs: []string{"https://192.0.2.99:2380"}},
+		{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.0.2.11:2380"}},
 	}
 	s, logs, sink := etcdTestSupervised(t, EtcdInit, fake, newFakeClock(time.Hour))
 	st := s.afterEtcdQuorum(t.Context(), fake)
@@ -697,7 +697,7 @@ func TestEtcdPeerURLDriftReported(t *testing.T) {
 		t.Errorf("two voting members must WARN about even quorum; logs:\n%s", out)
 	}
 	rec, err := ReadEtcdStatus(s.cfg.WorkDir)
-	if err != nil || !rec.PeerURLDrift || !slices.Equal(rec.RegisteredPeerURLs, []string{"https://192.168.0.99:2380"}) {
+	if err != nil || !rec.PeerURLDrift || !slices.Equal(rec.RegisteredPeerURLs, []string{"https://192.0.2.99:2380"}) {
 		t.Errorf("status record = %+v (%v), want the drift recorded", rec, err)
 	}
 	if fi, err := os.Stat(EtcdStatusPath(s.cfg.WorkDir)); err != nil || fi.Mode().Perm() != 0o600 {

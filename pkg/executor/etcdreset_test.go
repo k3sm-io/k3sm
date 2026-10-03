@@ -163,9 +163,9 @@ func TestClusterResetArgsAndPostcondition(t *testing.T) {
 	}{
 		{"a second member survived", []etcdMember{
 			{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}},
-			{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.168.0.11:2380"}},
+			{ID: 0xdef, Name: "server-b", PeerURLs: []string{"https://192.0.2.11:2380"}},
 		}, testOwnID},
-		{"own peer URL is wrong", []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{"https://192.168.0.99:2380"}}}, testOwnID},
+		{"own peer URL is wrong", []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{"https://192.0.2.99:2380"}}}, testOwnID},
 		{"no leader", []etcdMember{{ID: testOwnID, Name: "server-a", PeerURLs: []string{testOwnPeer}}}, 0},
 	} {
 		t.Run("fails when "+tc.name, func(t *testing.T) {

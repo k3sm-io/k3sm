@@ -39,7 +39,7 @@ func etcdTestConfig(role EtcdRole, peerIP string) Config {
 			Role:           role,
 			Name:           "server-a",
 			PeerIP:         peerIP,
-			InitialCluster: "server-b=https://192.168.0.11:2380,server-a=https://192.0.2.10:2380",
+			InitialCluster: "server-b=https://192.0.2.11:2380,server-a=https://192.0.2.10:2380",
 		},
 	}.withDefaults()
 }
@@ -74,7 +74,7 @@ func TestEtcdChildArgs(t *testing.T) {
 	}{
 		{name: "init first boot forms a cluster of itself", role: EtcdInit, wantState: "new", wantInitial: "server-a=https://192.0.2.10:2380"},
 		{name: "join first boot starts existing with the route's set", role: EtcdJoin, wantState: "existing",
-			wantInitial: "server-b=https://192.168.0.11:2380,server-a=https://192.0.2.10:2380"},
+			wantInitial: "server-b=https://192.0.2.11:2380,server-a=https://192.0.2.10:2380"},
 		{name: "init restart renders no initial-cluster flag", role: EtcdInit, memberExists: true},
 		{name: "join restart renders no initial-cluster flag", role: EtcdJoin, memberExists: true},
 		{name: "reset forces a new cluster from the existing member", role: EtcdInit, memberExists: true, reset: true},

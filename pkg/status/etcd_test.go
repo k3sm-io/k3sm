@@ -103,9 +103,9 @@ func TestEtcdRowStates(t *testing.T) {
 		{name: "CORRUPT", edit: func(s *executor.EtcdStatus) { s.Alarms = []string{"CORRUPT"} }, sev: SeverityFail, state: StateUnhealthy,
 			detail: []string{"alarms: CORRUPT"}, remedyIn: []string{"re-joined"}},
 		{name: "peer URL drift", edit: func(s *executor.EtcdStatus) {
-			s.PeerURLDrift, s.RegisteredPeerURLs = true, []string{"https://192.168.0.49:2380"}
+			s.PeerURLDrift, s.RegisteredPeerURLs = true, []string{"https://192.0.2.49:2380"}
 		}, sev: SeverityWarn, state: StateDrift,
-			detail: []string{"https://192.168.0.49:2380", "https://192.0.2.10:2380"}, remedyIn: []string{"DHCP reservation"}},
+			detail: []string{"https://192.0.2.49:2380", "https://192.0.2.10:2380"}, remedyIn: []string{"DHCP reservation"}},
 		{name: "nearing quota", edit: func(s *executor.EtcdStatus) { s.DBSizeBytes = s.QuotaBytes * 9 / 10 }, sev: SeverityWarn, state: StateUnhealthy,
 			detail: []string{"nearing the backend quota"}, remedyIn: []string{"compact"}},
 		{name: "stale record", edit: func(s *executor.EtcdStatus) { s.UpdatedAt = now.Add(-20 * time.Minute) }, sev: SeverityUnknown, state: StateUnknown,

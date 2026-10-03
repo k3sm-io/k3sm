@@ -234,7 +234,7 @@ func TestEtcdMemberRouteAddsLearner(t *testing.T) {
 	// A non-canonical name and this server's own name are refused too: the second
 	// would let the stale-member path remove the member serving the request.
 	for _, bad := range []string{"Server-C", "server-a"} {
-		r, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: bad, PeerURL: "https://192.168.0.12:2380"})
+		r, _ := rig.post(t, bootstrap.EtcdMemberPath, rig.serverToken, bootstrap.EtcdMemberRequest{Name: bad, PeerURL: "https://192.0.2.12:2380"})
 		if r.StatusCode/100 != 4 {
 			t.Errorf("name %q: status %d, want a 4xx refusal", bad, r.StatusCode)
 		}
@@ -281,11 +281,11 @@ func TestEtcdMemberRouteRemovesStaleMember(t *testing.T) {
 		stale bootstrap.EtcdMember
 	}{
 		{"started member, wiped data dir", bootstrap.EtcdMember{ID: 0xb, Name: "server-b", PeerURLs: []string{joinerPeer}, ClientURLs: []string{"https://127.0.0.1:2379"}}},
-		{"same name, different peer URL", bootstrap.EtcdMember{ID: 0xb, Name: "server-b", PeerURLs: []string{"https://192.168.0.99:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}},
+		{"same name, different peer URL", bootstrap.EtcdMember{ID: 0xb, Name: "server-b", PeerURLs: []string{"https://192.0.2.99:2380"}, ClientURLs: []string{"https://127.0.0.1:2379"}}},
 		{"unstarted VOTING entry at the peer URL", bootstrap.EtcdMember{ID: 0xb, PeerURLs: []string{joinerPeer}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			other := bootstrap.EtcdMember{ID: 0xc, PeerURLs: []string{"https://192.168.0.77:2380"}, IsLearner: true}
+			other := bootstrap.EtcdMember{ID: 0xc, PeerURLs: []string{"https://192.0.2.77:2380"}, IsLearner: true}
 			rig := newMemberRig(t, &fakeMembers{members: []bootstrap.EtcdMember{serverA, tc.stale, other}})
 
 			resp, err := bootstrap.RequestEtcdMember(context.Background(), rig.ts.URL, rig.serverToken, "server-b", joinerPeer, rig.ts.Client())
@@ -296,7 +296,7 @@ func TestEtcdMemberRouteRemovesStaleMember(t *testing.T) {
 			if !slices.Equal(calls, []string{"list", "remove b", "add " + joinerPeer}) {
 				t.Fatalf("calls = %v, want list, remove the stale member, then the learner add", calls)
 			}
-			want := "server-a=" + serverAPeer + ",unstarted-c=https://192.168.0.77:2380,server-b=" + joinerPeer
+			want := "server-a=" + serverAPeer + ",unstarted-c=https://192.0.2.77:2380,server-b=" + joinerPeer
 			if resp.InitialCluster != want {
 				t.Errorf("initial cluster = %q, want %q", resp.InitialCluster, want)
 			}
