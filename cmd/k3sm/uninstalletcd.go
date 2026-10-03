@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strconv"
 
@@ -37,6 +38,7 @@ import (
 // selfMemberRemover is what the uninstall needs from executor.LocalEtcdAdmin.
 type selfMemberRemover interface {
 	LocalMemberID(ctx context.Context) (uint64, error)
+	MemberList(ctx context.Context) ([]executor.EtcdMember, error)
 	MemberRemove(ctx context.Context, id uint64) error
 	Close() error
 }
@@ -52,7 +54,13 @@ func dialLocalEtcdAdmin(ctx context.Context, workDir string, clientPort int) (se
 // serverMemberDeregister builds install.Config.DeregisterServer for the server work
 // dir: it finds the local member's loopback client port in the status record the
 // running server keeps, asks the member for its own ID, and removes that member.
-func serverMemberDeregister(workDir string, dial dialLocalEtcd) func(context.Context) error {
+//
+// The one member it does not remove is the cluster's ONLY voting member: etcd refuses
+// that removal (there would be no cluster left to commit it), so asking would only
+// turn the uninstall of a healthy single-member cluster into a WARN. It is said at
+// INFO and skipped; nothing is left behind, because the cluster goes with the data
+// dir.
+func serverMemberDeregister(workDir string, dial dialLocalEtcd, logger *slog.Logger) func(context.Context) error {
 	return func(ctx context.Context) error {
 		port, err := localEtcdClientPort(workDir)
 		if err != nil {
@@ -67,11 +75,31 @@ func serverMemberDeregister(workDir string, dial dialLocalEtcd) func(context.Con
 		if err != nil {
 			return fmt.Errorf("ask this server's etcd member for its ID: %w", err)
 		}
+		// A member list that cannot be read leaves the removal to answer for itself.
+		if ms, err := admin.MemberList(ctx); err == nil && onlyVoter(ms, id) {
+			logger.Info("this server is the etcd cluster's only voting member; not removing it (the cluster is removed with its data dir)",
+				"member-id", strconv.FormatUint(id, 16))
+			return nil
+		}
 		if err := admin.MemberRemove(ctx, id); err != nil {
 			return fmt.Errorf("remove etcd member %s: %w", strconv.FormatUint(id, 16), err)
 		}
 		return nil
 	}
+}
+
+// onlyVoter reports whether id is the one voting member in ms (learners do not vote).
+func onlyVoter(ms []executor.EtcdMember, id uint64) bool {
+	voters := 0
+	self := false
+	for _, m := range ms {
+		if m.IsLearner {
+			continue
+		}
+		voters++
+		self = self || m.ID == id
+	}
+	return voters == 1 && self
 }
 
 // localEtcdClientPort reads the member's loopback client port from the status

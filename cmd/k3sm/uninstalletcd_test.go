@@ -23,6 +23,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -32,12 +33,17 @@ import (
 
 type fakeSelfRemover struct {
 	id        uint64
+	members   []executor.EtcdMember
+	listErr   error
 	removeErr error
 	removed   []uint64
 	closed    bool
 }
 
 func (f *fakeSelfRemover) LocalMemberID(context.Context) (uint64, error) { return f.id, nil }
+func (f *fakeSelfRemover) MemberList(context.Context) ([]executor.EtcdMember, error) {
+	return f.members, f.listErr
+}
 func (f *fakeSelfRemover) MemberRemove(_ context.Context, id uint64) error {
 	f.removed = append(f.removed, id)
 	return f.removeErr
@@ -67,7 +73,7 @@ func TestUninstallRemovesSelfBestEffort(t *testing.T) {
 	t.Run("removes its own member over loopback", func(t *testing.T) {
 		wd := t.TempDir()
 		writeEtcdStatusRecord(t, wd, "https://127.0.0.1:12379")
-		fake := &fakeSelfRemover{id: 0xb}
+		fake := &fakeSelfRemover{id: 0xb, members: []executor.EtcdMember{{ID: 0xa}, {ID: 0xb}, {ID: 0xc}}}
 		var dialedPort int
 		dereg := serverMemberDeregister(wd, func(_ context.Context, workDir string, port int) (selfMemberRemover, error) {
 			if workDir != wd {
@@ -75,7 +81,7 @@ func TestUninstallRemovesSelfBestEffort(t *testing.T) {
 			}
 			dialedPort = port
 			return fake, nil
-		})
+		}, quietLogger())
 		if err := dereg(ctx); err != nil {
 			t.Fatalf("deregister: %v", err)
 		}
@@ -88,12 +94,62 @@ func TestUninstallRemovesSelfBestEffort(t *testing.T) {
 		wd := t.TempDir()
 		writeEtcdStatusRecord(t, wd, "https://127.0.0.1:12379")
 		fake := &fakeSelfRemover{id: 0xb, removeErr: errors.New("etcdserver: no leader")}
-		err := serverMemberDeregister(wd, func(context.Context, string, int) (selfMemberRemover, error) { return fake, nil })(ctx)
+		err := serverMemberDeregister(wd, func(context.Context, string, int) (selfMemberRemover, error) { return fake, nil }, quietLogger())(ctx)
 		if err == nil || !strings.Contains(err.Error(), "etcd member b") || !strings.Contains(err.Error(), "no leader") {
 			t.Errorf("err = %v, want the member and the cause", err)
 		}
 		if !fake.closed {
 			t.Error("the client was not closed after a failed removal")
+		}
+	})
+
+	t.Run("the only voting member: skipped at INFO, no error", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			members []executor.EtcdMember
+			skip    bool
+		}{
+			{"a single-member cluster", []executor.EtcdMember{{ID: 0xb}}, true},
+			{"the only voter beside a learner", []executor.EtcdMember{{ID: 0xb}, {ID: 0xc, IsLearner: true}}, true},
+			{"two voters", []executor.EtcdMember{{ID: 0xa}, {ID: 0xb}}, false},
+			{"self a learner beside one voter", []executor.EtcdMember{{ID: 0xa}, {ID: 0xb, IsLearner: true}}, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				wd := t.TempDir()
+				writeEtcdStatusRecord(t, wd, "https://127.0.0.1:12379")
+				fake := &fakeSelfRemover{id: 0xb, members: tc.members}
+				var logs strings.Builder
+				logger := slog.New(slog.NewTextHandler(&logs, nil))
+				err := serverMemberDeregister(wd, func(context.Context, string, int) (selfMemberRemover, error) { return fake, nil }, logger)(ctx)
+				if err != nil {
+					t.Fatalf("deregister: %v", err)
+				}
+				if removed := len(fake.removed) > 0; removed == tc.skip {
+					t.Errorf("removed=%x, want a removal: %v", fake.removed, !tc.skip)
+				}
+				line := logs.String()
+				if tc.skip && (!strings.Contains(line, "level=INFO") || !strings.Contains(line, "only voting member") || !strings.Contains(line, "member-id=b")) {
+					t.Errorf("the skip was not said at INFO naming the member: %q", line)
+				}
+				if strings.Contains(line, "level=WARN") {
+					t.Errorf("logged a WARN: %q", line)
+				}
+				if !fake.closed {
+					t.Error("the client was not closed")
+				}
+			})
+		}
+	})
+
+	t.Run("an unreadable member list leaves the removal to answer", func(t *testing.T) {
+		wd := t.TempDir()
+		writeEtcdStatusRecord(t, wd, "https://127.0.0.1:12379")
+		fake := &fakeSelfRemover{id: 0xb, listErr: errors.New("etcdserver: request timed out")}
+		if err := serverMemberDeregister(wd, func(context.Context, string, int) (selfMemberRemover, error) { return fake, nil }, quietLogger())(ctx); err != nil {
+			t.Fatalf("deregister: %v", err)
+		}
+		if len(fake.removed) != 1 {
+			t.Errorf("removed=%x, want the removal attempted", fake.removed)
 		}
 	})
 
@@ -106,7 +162,7 @@ func TestUninstallRemovesSelfBestEffort(t *testing.T) {
 			err := serverMemberDeregister(wd, func(context.Context, string, int) (selfMemberRemover, error) {
 				t.Fatal("dialled with no usable loopback client URL")
 				return nil, nil
-			})(ctx)
+			}, quietLogger())(ctx)
 			if !errors.Is(err, executor.ErrNoEtcdClient) {
 				t.Errorf("record %q: err = %v, want ErrNoEtcdClient", url, err)
 			}

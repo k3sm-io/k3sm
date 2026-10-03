@@ -350,7 +350,7 @@ func runUninstall(args []string) error {
 	cfg.Deregister = deregister
 	// On an embedded-etcd HA server, remove its etcd member first (install decides
 	// whether the installed plist is one; see uninstalletcd.go).
-	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin)
+	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin, logger)
 	if *purgeFlag {
 		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
