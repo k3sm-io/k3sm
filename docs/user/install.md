@@ -261,7 +261,13 @@ This runs the uninstall above and then removes what it keeps:
   `io.k3sm.agent-args.json`
 - the `k3sm` context in your `~/.kube/config`, and the cluster and user entries only that context
   used; every other entry in the file is kept
-- the `_k3sm` user
+- the `_k3sm` user, if macOS allows it (see below)
+
+macOS asks a person at the screen to approve deleting a user account, so the purge may not be able
+to delete `_k3sm` by itself. It removes everything else first, then leaves the account disabled
+(hidden, no login shell, no home directory) and prints the command that finishes the job: run
+`sudo dscl . -delete Users/_k3sm` in Terminal and click Allow when macOS asks to administer your
+computer. A leftover account is harmless, and running the purge again tries the deletion again.
 
 It cannot be undone. Without `--yes` the command changes nothing and lists what it would delete.
 k3s's `k3s-uninstall.sh` removes everything with no prompt; k3sm asks for `--yes` on purpose,

@@ -46,6 +46,9 @@ func TestPurgeFlagValidation(t *testing.T) {
 	if err := checkPurgeFlags(true, false); !strings.Contains(err.Error(), "/var/lib/k3sm") || !strings.Contains(err.Error(), "_k3sm") {
 		t.Errorf("the refusal must say what would be destroyed: %v", err)
 	}
+	if err := checkPurgeFlags(true, false); !strings.Contains(err.Error(), "_k3sm user (deletion attempted; macOS may need an approval at the screen)") {
+		t.Errorf("the refusal must say the account deletion may need an approval at the screen: %v", err)
+	}
 	if _, _, err := purgeTarget("", "501"); err == nil {
 		t.Error("a purge with no invoking user must be refused")
 	}

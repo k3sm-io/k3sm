@@ -1099,8 +1099,16 @@ type System interface {
 	ServiceUser(ctx context.Context, name string) (ServiceUserRecord, error)
 	// DeleteServiceUser deletes the named user's record (dscl . -delete
 	// /Users/<name>). It deletes no group. The subprocess is bounded by ctx
-	// alone; a kill at ctx's deadline returns an error wrapping ctx.Err().
+	// alone; a kill at ctx's deadline returns an error wrapping ctx.Err(). A
+	// deletion macOS refused (eDSPermissionError: deleting a user record needs
+	// an approval at the screen, which an unattended process cannot get)
+	// returns an error wrapping errServiceUserDeleteDenied.
 	DeleteServiceUser(ctx context.Context, name string) error
+	// DisableServiceUser leaves the named account, which the purge could not
+	// delete, with no login shell, hidden, and a RealName that says to delete
+	// it by hand (serviceUserDisabledRealName). It changes attributes only,
+	// none of which needs the approval a deletion does.
+	DisableServiceUser(ctx context.Context, name string) error
 	// RemoveAdminKubeconfigContext removes the k3sm context (and the cluster
 	// and user it alone references) from targetUser's ~/.kube/config, keeping
 	// every other entry, the file's owner and its mode. An absent file or

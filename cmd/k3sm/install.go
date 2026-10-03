@@ -367,7 +367,7 @@ func runUninstall(args []string) error {
 // an unconfirmed purge prints.
 const purgeWarning = "k3sm uninstall --purge permanently deletes this Mac's cluster: the datastore and every image and volume under " +
 	install.DefaultDataRoot + " (and the data volume, if there is one, with its keychain item), the daemon logs in " +
-	install.LogDir + ", the " + install.DefaultServiceUser + " user, the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments"
+	install.LogDir + ", the " + install.DefaultServiceUser + " user (deletion attempted; macOS may need an approval at the screen), the k3sm context in your kubeconfig, the /etc/fstab line and the recorded arguments"
 
 // checkPurgeFlags judges --purge and --yes together: --yes confirms a purge
 // and nothing else, and a purge is never run unconfirmed.

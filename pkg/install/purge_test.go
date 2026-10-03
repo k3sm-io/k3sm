@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol/datavoltest"
@@ -501,6 +502,7 @@ func TestPurgeServiceUserIdentity(t *testing.T) {
 		{name: "the current shape", edit: func(*ServiceUserRecord) {}},
 		{name: "a legacy RealName equal to the account name", edit: func(r *ServiceUserRecord) { r.RealName = name }},
 		{name: "a legacy empty RealName", edit: func(r *ServiceUserRecord) { r.RealName = "" }},
+		{name: "the shape a purge that could not delete it left", edit: func(r *ServiceUserRecord) { r.RealName = serviceUserDisabledRealName }},
 		{name: "a legacy RealName with the wrong home", reason: "not the data root", edit: func(r *ServiceUserRecord) {
 			r.RealName, r.Home = name, "/Users/alice"
 		}},
@@ -633,13 +635,12 @@ func TestPurgeBootsOutTheServiceUserDomain(t *testing.T) {
 	}
 }
 
-// TestPurgeServiceUserDeletionBound pins the deletion's own bound: dscl waits
-// on opendirectoryd far past purgeCommandTimeout, so the deletion runs under
-// purgeUserDeleteTimeout, and a deletion killed at it is a refusal naming the
-// step that a re-run finishes.
+// TestPurgeServiceUserDeletionBound pins the deletion's own bound: long enough
+// for a person at the screen to answer macOS's approval prompt, short enough
+// that an unattended purge does not sit on a prompt nobody will answer.
 func TestPurgeServiceUserDeletionBound(t *testing.T) {
-	if purgeUserDeleteTimeout <= purgeCommandTimeout {
-		t.Fatalf("purgeUserDeleteTimeout %s must exceed purgeCommandTimeout %s", purgeUserDeleteTimeout, purgeCommandTimeout)
+	if purgeUserDeleteTimeout < 60*time.Second || purgeUserDeleteTimeout > 120*time.Second {
+		t.Fatalf("purgeUserDeleteTimeout is %s, want between 1m and 2m", purgeUserDeleteTimeout)
 	}
 	r := newPurgeRig(t, RoleServer, false)
 	if err := r.run(); err != nil {
@@ -648,23 +649,141 @@ func TestPurgeServiceUserDeletionBound(t *testing.T) {
 	if b := r.f.purge.deleteBound; b <= purgeCommandTimeout || b > purgeUserDeleteTimeout {
 		t.Fatalf("the user deletion ran under a %s bound, want purgeUserDeleteTimeout (%s)", b, purgeUserDeleteTimeout)
 	}
+}
 
-	t.Run("a deletion killed at the bound refuses, and a re-run finishes", func(t *testing.T) {
-		r := newPurgeRig(t, RoleServer, false)
-		r.f.purge.deleteErr = fmt.Errorf("dscl . -delete /Users/_k3sm: signal: killed: %w", context.DeadlineExceeded)
-		err := r.run()
-		if !errors.Is(err, ErrPurgeRefused) || !strings.Contains(err.Error(), "delete the _k3sm user: not finished within 3m0s") {
-			t.Fatalf("purge = %v, want a refusal naming the user deletion", err)
+// TestPurgeServiceUserOutcomes pins the last step's three outcomes. A deletion
+// macOS refused, or one still waiting on an approval at the bound, is not a
+// purge failure: everything else is already removed, the account is left
+// disabled, and the final line says how to finish by hand.
+func TestPurgeServiceUserOutcomes(t *testing.T) {
+	denied := fmt.Errorf("dscl . -delete /Users/_k3sm: DS Error: -14120 (eDSPermissionError): %w", errServiceUserDeleteDenied)
+	timedOut := fmt.Errorf("dscl . -delete /Users/_k3sm: signal: killed: %w", context.DeadlineExceeded)
+	for _, tc := range []struct {
+		name string
+		edit func(r *purgeRig)
+		// deleted: the account is gone and the normal line is printed.
+		deleted bool
+		// want are fragments of the final line, when the account remains.
+		want []string
+	}{
+		{name: "deleted", deleted: true, edit: func(*purgeRig) {}},
+		{name: "refused by macOS (-14120)", edit: func(r *purgeRig) { r.f.purge.deleteErr = denied }, want: []string{
+			"the _k3sm account remains (disabled",
+			"would not let an unattended process delete it",
+			"needs a person at the screen to approve it",
+			"delete it by hand, run `sudo dscl . -delete /Users/_k3sm` in Terminal and click Allow",
+			"Re-running `sudo k3sm uninstall --purge --yes`",
+		}},
+		{name: "timed out waiting for an approval", edit: func(r *purgeRig) { r.f.purge.deleteErr = timedOut }, want: []string{
+			"the _k3sm account remains (disabled",
+			"did not allow the deletion within 1m30s",
+			"an approval prompt may still be waiting on the screen",
+			"delete it by hand, run `sudo dscl . -delete /Users/_k3sm`",
+		}},
+		{name: "dscl reported success but the record is still there", edit: func(r *purgeRig) {
+			r.f.purge.deleteErr = nil
+			r.f.purge.deleteIsNoop = true
+		}, want: []string{"the _k3sm account remains (disabled", "delete it by hand"}},
+		{name: "disabling the leftover account fails too", edit: func(r *purgeRig) {
+			r.f.purge.deleteErr = denied
+			r.f.purge.disableErr = errors.New("boom")
+		}, want: []string{"the _k3sm account remains (hidden, with no login shell", "relabelling it failed: boom", "delete it by hand"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPurgeRig(t, RoleServer, false)
+			tc.edit(r)
+			if err := r.run(); err != nil {
+				t.Fatalf("purge = %v, want success\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+			}
+			// Every other removal happened, and before the deletion.
+			assertOrder(t, r.f.calls, "PurgeTree:"+DefaultDataRoot, "PurgeTree:"+LogDir, "RemoveAdminKubeconfigContext:alice", "DeleteServiceUser:_k3sm")
+			out := r.logs.String()
+			if tc.deleted {
+				if !strings.Contains(out, "the _k3sm service user") || strings.Contains(out, "account remains") || r.anyCall("DisableServiceUser:") {
+					t.Fatalf("a deleted account must be reported removed, and nothing disabled:\n%s", out)
+				}
+				return
+			}
+			if !r.called("DisableServiceUser:_k3sm") {
+				t.Fatalf("the account that remains was not disabled:\n%s", strings.Join(r.f.calls, "\n"))
+			}
+			if strings.Contains(out, "the _k3sm service user") {
+				t.Errorf("an account that remains was reported removed:\n%s", out)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("final line lacks %q:\n%s", w, out)
+				}
+			}
+			if !strings.Contains(out, "k3sm purged; removed: ") || strings.Index(out, "account remains") < strings.Index(out, "k3sm purged") {
+				t.Errorf("the account line must come after the purged line:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestPurgeRerunWithOnlyTheAccountLeft pins the re-run over a Mac where a
+// purge removed everything but the account it could not delete: no data root,
+// no logs, no records, no jobs. It is clean, it tries the deletion again, and
+// it reports the same way, or the normal line once the deletion is allowed.
+func TestPurgeRerunWithOnlyTheAccountLeft(t *testing.T) {
+	r := newPurgeRig(t, RoleServer, false)
+	r.f.purge.deleteErr = fmt.Errorf("DS Error: -14120 (eDSPermissionError): %w", errServiceUserDeleteDenied)
+	if err := r.run(); err != nil {
+		t.Fatalf("first purge: %v", err)
+	}
+	if !r.f.purge.disabled || r.f.purge.user.RealName != serviceUserDisabledRealName {
+		t.Fatal("the first purge did not leave the account disabled; the case is vacuous")
+	}
+	for _, p := range []string{DefaultDataRoot, LogDir} {
+		if _, ok := r.f.purge.stats[p]; ok {
+			t.Fatalf("the first purge left %s behind; the case is vacuous", p)
 		}
-		r.f.purge.deleteErr = nil
+	}
+	if len(r.f.purge.markers) != 0 {
+		t.Fatalf("the first purge left markers behind (%v); the case is vacuous", r.f.purge.markers)
+	}
+
+	for _, allowed := range []bool{false, true} {
 		r.f.calls = nil
+		r.logs.Reset()
+		if allowed {
+			r.f.purge.deleteErr = nil
+		}
 		if err := r.run(); err != nil {
-			t.Fatalf("re-run after a partial purge: %v\ncalls:\n%s", err, strings.Join(r.f.calls, "\n"))
+			t.Fatalf("re-run (allowed=%v) = %v, want success\ncalls:\n%s", allowed, err, strings.Join(r.f.calls, "\n"))
 		}
-		if !r.called("DeleteServiceUser:_k3sm") || !r.f.purge.userDeleted {
-			t.Fatal("the re-run did not delete the service user")
+		if !r.called("DeleteServiceUser:_k3sm") {
+			t.Fatalf("re-run (allowed=%v) did not try the deletion again:\n%s", allowed, strings.Join(r.f.calls, "\n"))
 		}
-	})
+		out := r.logs.String()
+		if allowed {
+			if !r.f.purge.userDeleted || !strings.Contains(out, "the _k3sm service user") || strings.Contains(out, "account remains") {
+				t.Fatalf("an allowed re-run must delete and report the account:\n%s", out)
+			}
+			continue
+		}
+		if !strings.Contains(out, "the _k3sm account remains (disabled") || !strings.Contains(out, "sudo dscl . -delete /Users/_k3sm") {
+			t.Fatalf("a refused re-run must report the account the same way:\n%s", out)
+		}
+	}
+}
+
+func TestDsclPermissionDenied(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		want bool
+	}{
+		{"<dscl_cmd> DS Error: -14120 (eDSPermissionError)", true},
+		{"DS Error: -14120", true},
+		{"eDSPermissionError", true},
+		{"<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)", false},
+		{"", false},
+	} {
+		if got := dsclPermissionDenied(tc.out); got != tc.want {
+			t.Errorf("dsclPermissionDenied(%q) = %v, want %v", tc.out, got, tc.want)
+		}
+	}
 }
 
 // TestPurgeRemovesBothArgsRecordsWithoutTheManifest pins that both arguments

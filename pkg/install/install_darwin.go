@@ -75,6 +75,9 @@ const (
 const (
 	serviceUserRealName = "k3sm service user"
 	serviceUserShell    = "/usr/bin/false"
+	// serviceUserDisabledRealName is the RealName a purge leaves on an account
+	// macOS would not let it delete (see DisableServiceUser).
+	serviceUserDisabledRealName = "k3sm service user (disabled; delete by hand)"
 )
 
 // EnsureServiceUser idempotently creates name as a hidden, no-login system user
@@ -2436,18 +2439,50 @@ func parseDsclAttr(out []byte, attr string) string {
 }
 
 // DeleteServiceUser deletes the named user's record. No group is touched:
-// install never creates one (see EnsureServiceUser's PrimaryGroupID 20).
+// install never creates one (see EnsureServiceUser's PrimaryGroupID 20). See
+// the System interface for how a refusal and a timeout are reported.
 func (darwinSystem) DeleteServiceUser(ctx context.Context, name string) error {
 	if name == "" || strings.ContainsAny(name, "/ ") {
 		return fmt.Errorf("refusing to delete user %q", name)
 	}
-	// Bounded by ctx alone: the purge hands it purgeUserDeleteTimeout, since
-	// dscl waits on opendirectoryd far longer than purgeCommandTimeout.
-	if out, err := exec.CommandContext(ctx, "dscl", ".", "-delete", "/Users/"+name).CombinedOutput(); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return fmt.Errorf("dscl . -delete /Users/%s: %v: %w", name, err, cerr)
+	// Bounded by ctx alone: the purge hands it purgeUserDeleteTimeout, long
+	// enough for a person at the screen to answer the approval prompt macOS
+	// raises for a record deletion. dscl is the tool, not sysadminctl
+	// -deleteUser: refused the same way, sysadminctl still exits 0.
+	out, err := exec.CommandContext(ctx, "dscl", ".", "-delete", "/Users/"+name).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("dscl . -delete /Users/%s: %v: %w", name, err, cerr)
+	}
+	text := strings.TrimSpace(string(out))
+	if dsclPermissionDenied(text) {
+		return fmt.Errorf("dscl . -delete /Users/%s: %s: %w", name, text, errServiceUserDeleteDenied)
+	}
+	return fmt.Errorf("dscl . -delete /Users/%s: %w: %s", name, err, text)
+}
+
+// DisableServiceUser leaves the named account unable to log in, hidden, and
+// labelled for deletion by hand. See the System interface.
+func (darwinSystem) DisableServiceUser(ctx context.Context, name string) error {
+	if name == "" || strings.ContainsAny(name, "/ ") {
+		return fmt.Errorf("refusing to disable user %q", name)
+	}
+	record := "/Users/" + name
+	// Creating these attributes is not behind the approval a record deletion
+	// needs, so this works unattended where the deletion did not.
+	for _, kv := range [][2]string{
+		{"UserShell", serviceUserShell},
+		{"IsHidden", "1"},
+		{"RealName", serviceUserDisabledRealName},
+	} {
+		cctx, cancel := context.WithTimeout(ctx, purgeCommandTimeout)
+		out, err := exec.CommandContext(cctx, "dscl", ".", "-create", record, kv[0], kv[1]).CombinedOutput()
+		cancel()
+		if err != nil {
+			return fmt.Errorf("dscl . -create %s %s: %w: %s", record, kv[0], err, strings.TrimSpace(string(out)))
 		}
-		return fmt.Errorf("dscl . -delete /Users/%s: %w: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

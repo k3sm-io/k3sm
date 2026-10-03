@@ -53,6 +53,13 @@ type fakePurge struct {
 	userDeleted bool
 	deleteErr   error
 	deleteBound time.Duration
+	// deleteIsNoop makes DeleteServiceUser report success and delete nothing:
+	// the lie sysadminctl tells, which the purge must not believe.
+	deleteIsNoop bool
+	// disabled is set by DisableServiceUser, which also relabels the record;
+	// disableErr, when set, is what it returns instead, changing nothing.
+	disabled   bool
+	disableErr error
 	// procs are the pids running as the service user; unkillable survive
 	// KillProcess.
 	procs      []int
@@ -254,7 +261,26 @@ func (f *fakeSystem) DeleteServiceUser(ctx context.Context, name string) error {
 	if f.purge.deleteErr != nil {
 		return f.purge.deleteErr
 	}
+	if f.purge.deleteIsNoop {
+		return nil
+	}
 	f.purge.userDeleted = true
+	return nil
+}
+
+// DisableServiceUser records the call and leaves the record the way the
+// darwin implementation does.
+func (f *fakeSystem) DisableServiceUser(_ context.Context, name string) error {
+	f.calls = append(f.calls, "DisableServiceUser:"+name)
+	if f.purge.disableErr != nil {
+		return f.purge.disableErr
+	}
+	if f.purge.user == nil {
+		u := ServiceUserRecord{Exists: true, UID: 271, Home: DefaultDataRoot}
+		f.purge.user = &u
+	}
+	f.purge.user.RealName, f.purge.user.Shell = serviceUserDisabledRealName, serviceUserShell
+	f.purge.disabled = true
 	return nil
 }
 
