@@ -1683,8 +1683,8 @@ func TestInstallOrchestration(t *testing.T) {
 		"LockInstall:/Library/k3sm.lock",
 		// The installed server plist, read here for the SAME reason and to
 		// answer a different refusal: does the argument set this install would
-		// carry over name a --datastore-endpoint-file that is no longer there?
-		// (See requireDatastoreEndpointFile.) There is none here (a first
+		// carry over name a retired external-datastore flag? (See
+		// refuseRetiredDatastoreFlags.) There is none here (a first
 		// install), so the second source is read next: the root-owned record
 		// that survives an uninstall. Both reads are reused later, at the carry-
 		// over step below, rather than repeated.
@@ -1784,12 +1784,15 @@ func TestInstallOrchestration(t *testing.T) {
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kube-controller-manager",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kubectl",
 		"CopyToRootOwned:/Library/k3sm.staging/bin/kine",
+		"CopyToRootOwned:/Library/k3sm.staging/bin/etcd",
 		// The pinned helm the helm controller's Jobs run, a payload binary like
 		// kubectl.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + helmchart.HelmBinaryName,
 		// The kine version marker rides beside the kine binary it describes, staged
 		// best-effort (a pre-marker archive has none and must still install).
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KineMarkerName,
+		// The etcd version marker, staged the same best-effort way.
+		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.EtcdMarkerName,
 		// The control-plane version marker, staged the same best-effort way beside the
 		// four kube binaries it describes.
 		"CopyToRootOwned:/Library/k3sm.staging/bin/" + executor.KubeMarkerName,
@@ -1939,7 +1942,7 @@ func TestEnsureServiceUserCreatesTheConfiguredDataRoot(t *testing.T) {
 			// The FIRST privileged call — the refuse-before-write probes ahead of
 			// it (the cross-role plist read, the launcher-directory trust read,
 			// the staged vmhost helper's entitlement, the carried server
-			// arguments' datastore-endpoint-file check and the free-space
+			// arguments' retired-flag check and the free-space
 			// estimate) are all reads, the install-wide lock creates no state
 			// the install owns, and install performs nothing else before the
 			// service user exists: the data root is its home, and every later
@@ -1997,10 +2000,10 @@ func TestInstallBinaryLandsAtFixedPath(t *testing.T) {
 	// The payload set lands at InstallDir/bin/<name> — one copy per
 	// executor.PayloadBinaries entry, in order, after the binary + exec-shim + shims + vmhost.
 	head := len(fixedHead)
-	// +2 for the two version markers (kine, then the control-plane set), staged
-	// beside the binaries they describe.
-	if want := head + len(executor.PayloadBinaries()) + 2; len(dsts) != want {
-		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the two markers)", len(dsts), want)
+	// +3 for the three version markers (kine, etcd, then the control-plane set),
+	// staged beside the binaries they describe.
+	if want := head + len(executor.PayloadBinaries()) + 3; len(dsts) != want {
+		t.Errorf("%d copies, want %d (binary + exec-shim + path-shim + dns-shim + vmhost + the payload set + the three markers)", len(dsts), want)
 	}
 	for i, name := range executor.PayloadBinaries() {
 		if got, want := dsts[head+i], stage+"/bin/"+name; got != want {

@@ -18,11 +18,13 @@ package main
 
 import (
 	"errors"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/status"
 )
@@ -145,6 +147,33 @@ func TestDoctorChecksTable(t *testing.T) {
 			e.datastorePosture = func() (bool, int, string, error) {
 				return false, 0, "", errors.New("permission denied")
 			}
+		}, statusSkip},
+
+		// datastore on an embedded etcd HA server: the member, judged by the same
+		// rule as the status row, replaces "no state.db yet".
+		{"datastore/pass-etcd-member-healthy", checkDatastore, func(e *doctorEnv) {
+			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
+			e.etcdMember = func() (bool, executor.EtcdStatus, error) {
+				return true, executor.EtcdStatus{Members: 2, LeaderPresent: true}, nil
+			}
+		}, statusPass},
+		{"datastore/fail-etcd-member-no-leader", checkDatastore, func(e *doctorEnv) {
+			e.etcdMember = func() (bool, executor.EtcdStatus, error) { return true, executor.EtcdStatus{Members: 2}, nil }
+		}, statusFail},
+		{"datastore/fail-etcd-member-nospace", checkDatastore, func(e *doctorEnv) {
+			e.etcdMember = func() (bool, executor.EtcdStatus, error) {
+				return true, executor.EtcdStatus{Members: 3, LeaderPresent: true, Alarms: []string{"NOSPACE"}}, nil
+			}
+		}, statusFail},
+		{"datastore/skip-etcd-member-not-started", checkDatastore, func(e *doctorEnv) {
+			e.etcdMember = func() (bool, executor.EtcdStatus, error) { return true, executor.EtcdStatus{}, fs.ErrNotExist }
+		}, statusSkip},
+		{"datastore/warn-etcd-record-unreadable", checkDatastore, func(e *doctorEnv) {
+			e.etcdMember = func() (bool, executor.EtcdStatus, error) { return true, executor.EtcdStatus{}, fs.ErrPermission }
+		}, statusWarn},
+		{"datastore/kine-when-no-etcd-member", checkDatastore, func(e *doctorEnv) {
+			e.etcdMember = func() (bool, executor.EtcdStatus, error) { return false, executor.EtcdStatus{}, nil }
+			e.datastorePosture = func() (bool, int, string, error) { return false, 0, "", nil }
 		}, statusSkip},
 
 		// toolchain: the three node classes. A full Xcode developer dir is the one

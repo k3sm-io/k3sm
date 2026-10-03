@@ -216,16 +216,22 @@ func TestBringUpErrIsNilForSuccess(t *testing.T) {
 // else — an `err` assigned above the if, a two-statement branch, a named return —
 // which is the failure mode a structural gate must not have: the shapes it
 // cannot classify are exactly the ones a future edit is most likely to
-// introduce. So the rule is now total over the four functions: EVERY return
+// introduce. So the rule is now total over the scoped functions: EVERY return
 // statement must be all-nil, or must mention one of the classifiers by name, or
 // must be a bare `return err` whose err came from the init of an `if` calling a
 // helper that classifies for itself. Anything else is named with its line and
 // fails.
 func TestEveryBringUpReturnIsClassified(t *testing.T) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "supervised.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
+	// The datastore bring-ups are split per posture; the etcd one lives beside its
+	// supervision code, so both files are read.
+	var decls []ast.Decl
+	for _, f := range []string{"supervised.go", "etcdsupervise.go"} {
+		file, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decls = append(decls, file.Decls...)
 	}
 	// The classifiers themselves, and the two helpers that classify their own
 	// errors — so a `return err` off one of those is already attributed.
@@ -233,6 +239,7 @@ func TestEveryBringUpReturnIsClassified(t *testing.T) {
 	selfClassifying := map[string]bool{
 		"bringUpErr": true, "provisionStep": true,
 		"markSupervised": true, "startAndAwaitListening": true,
+		"bringUpKine": true, "bringUpEtcdMember": true,
 	}
 	name := func(e ast.Expr) string {
 		switch v := e.(type) {
@@ -243,10 +250,11 @@ func TestEveryBringUpReturnIsClassified(t *testing.T) {
 		}
 		return ""
 	}
-	scoped := map[string]bool{"provision": true, "bringUp": true, "startAndAwaitListening": true, "markSupervised": true}
+	scoped := map[string]bool{"provision": true, "bringUp": true, "startAndAwaitListening": true, "markSupervised": true,
+		"bringUpKine": true, "bringUpEtcdMember": true}
 	seen := map[string]bool{}
 	checked := 0
-	for _, decl := range file.Decls {
+	for _, decl := range decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || !scoped[fn.Name.Name] {
 			continue
@@ -318,10 +326,10 @@ func TestEveryBringUpReturnIsClassified(t *testing.T) {
 	}
 	for fname := range scoped {
 		if !seen[fname] {
-			t.Errorf("%s is no longer in supervised.go; this gate has stopped checking it", fname)
+			t.Errorf("%s is no longer in supervised.go or etcdsupervise.go; this gate has stopped checking it", fname)
 		}
 	}
-	// Non-vacuity: the four functions between them have well over a dozen
+	// Non-vacuity: the scoped functions between them have well over a dozen
 	// returns, so a rule that inspected none of them would be a green no-op.
 	if checked < 15 {
 		t.Errorf("the gate inspected only %d return statements across %v; it is not reading what it claims to", checked, scoped)

@@ -90,7 +90,7 @@ func TestServerArgsRecordRoundTrip(t *testing.T) {
 			t.Fatalf("stat: %v", err)
 		}
 		// 0600, not the data-volume record's 0644: an operator argument can carry
-		// a credential (--datastore-endpoint postgres://user:password@host).
+		// a credential (a URL with user info, https://user:password@host).
 		if fi.Mode().Perm() != 0o600 {
 			t.Fatalf("mode = %v, want 0600 (an argument can carry a credential)", fi.Mode().Perm())
 		}
@@ -204,7 +204,7 @@ func TestValidateServerArgs(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "the ordinary case", args: []string{"--mesh-ip", "100.64.0.1", "--registry-port", "5000"}},
-		{name: "a DSN with a password is an ordinary argument", args: []string{"--datastore-endpoint", "postgres://u:s3cret@h/db"}},
+		{name: "a URL with a password is an ordinary argument", args: []string{"--endpoint", "https://u:s3cret@h/x"}},
 		{name: "nothing at all", args: nil},
 		{name: "exactly the argument limit", args: many[:MaxServerArgs]},
 		{name: "exactly the length limit", args: []string{strings.Repeat("x", MaxServerArgLen)}},

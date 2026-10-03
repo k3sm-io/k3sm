@@ -46,3 +46,6 @@ lab-vm-out/
 # rig's hardware/OS fingerprint. The logs stay OPERATOR-HELD evidence outside the
 # repo and are cited from the ledger by run id; only the README is tracked.
 hack/lab/runs/*.log
+
+# hack/etcd-wrapper.sh scratch (removed on exit; ignored in case a run is killed).
+/hack/.etcd-wrapper/

@@ -24,19 +24,21 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
 
 // snapshotUsage is the `k3sm snapshot` help text. It states the single-node scope up
-// front: an operator on the HA/Postgres posture must be told that this command is not
-// their backup tool before they run it, not after.
+// front: an operator on the etcd HA posture must be told what this command does not
+// cover before they run it, not after.
 const snapshotUsage = `Usage: k3sm snapshot save    [--out <path>] [--work-dir <dir>]
        k3sm snapshot restore <snapshot> [--work-dir <dir>]
 
-Back up and restore this node's kine SQLite datastore — the control plane's state
-of record.
+Back up and restore this node's datastore — the control plane's state of record:
+the kine SQLite datastore on a single server, the embedded etcd member on an HA
+server.
 
   save     write a consistent, integrity-verified copy of the datastore. Safe to run
            while the control plane is serving (the copy is taken by SQLite inside a
@@ -46,16 +48,14 @@ of record.
            it supersedes is preserved beside it as a .bak, never deleted.
 
 Flags:
-  --work-dir <dir>            control-plane state root (default: this posture's work dir)
-  --out <path>                save: the snapshot file, or a directory to name one in
-                              (default: %s under the work dir)
-  --datastore-endpoint <dsn>  the server's datastore DSN, when it has one
-                              (default: $K3SM_DATASTORE_ENDPOINT)
+  --work-dir <dir>  control-plane state root (default: this posture's work dir)
+  --out <path>      save: the snapshot file, or a directory to name one in
+                    (default: %s under the work dir)
 
-Scope: the single-node kine→SQLite datastore only. On the HA/Postgres posture the
-state of record is your Postgres, which k3sm does not read — back it up with pg_dump
-and restore it with pg_restore/psql. Both subcommands refuse there rather than
-produce a snapshot that does not hold the cluster.
+On an embedded etcd HA server, save streams an online snapshot of this server's
+etcd member (no member is stopped and no quorum is spent), verifies it, and writes
+it 0600: it holds every Secret in plaintext. Restoring an etcd member is not
+supported in this release; restore refuses there.
 
 PersistentVolume data is NOT in a snapshot: it lives in local-path directories on each
 node and is backed up separately. See docs/user/backup-restore.md.
@@ -92,7 +92,7 @@ func snapshotWorkDirFlag(fs *flag.FlagSet) *string {
 	if err != nil {
 		def = executor.DefaultWorkDir
 	}
-	return fs.String("work-dir", def, "control-plane state root (the kine state.db lives here)")
+	return fs.String("work-dir", def, "control-plane state root (the kine state.db or the etcd member lives here)")
 }
 
 // runSnapshotSave parses the flags and writes the snapshot.
@@ -100,30 +100,100 @@ func runSnapshotSave(args []string) error {
 	fs := flag.NewFlagSet("snapshot save", flag.ExitOnError)
 	workDir := snapshotWorkDirFlag(fs)
 	out := fs.String("out", "", "snapshot destination: a file, or a directory to name one in (default: db/snapshots under the work dir)")
-	endpoint := fs.String("datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "the server's datastore DSN, when it has one (or $K3SM_DATASTORE_ENDPOINT)")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
 	_ = fs.Parse(args)
 	if fs.NArg() > 0 {
 		return fmt.Errorf("snapshot save takes no positional arguments (got %q); the destination is --out", fs.Arg(0))
 	}
 
-	res, err := executor.SaveSnapshot(context.Background(), executor.SnapshotSaveOptions{
-		WorkDir:           *workDir,
-		DatastoreEndpoint: *endpoint,
-		Out:               *out,
-	})
-	if err != nil {
-		return annotateSnapshotError(err, *workDir)
+	return saveSnapshot(context.Background(), os.Stdout, *workDir, *out, defaultSnapshotSavers())
+}
+
+// snapshotSavers are the two save paths and the posture test that picks one; seams so
+// the dispatch is testable without a datastore.
+type snapshotSavers struct {
+	etcdMember func(workDir string) bool
+	etcd       func(ctx context.Context, workDir, dst string) error
+	sqlite     func(ctx context.Context, opts executor.SnapshotSaveOptions) (*executor.SnapshotSaveResult, error)
+	now        func() time.Time
+}
+
+func defaultSnapshotSavers() snapshotSavers {
+	return snapshotSavers{
+		etcdMember: executor.EtcdMemberExists,
+		etcd:       executor.SnapshotEtcd,
+		sqlite:     executor.SaveSnapshot,
+		now:        time.Now,
 	}
-	renderSnapshotSave(os.Stdout, res)
+}
+
+// saveSnapshot takes the snapshot the work dir's posture calls for: an online,
+// verified etcd snapshot when the work dir holds an etcd member, the kine SQLite
+// snapshot otherwise.
+func saveSnapshot(ctx context.Context, w io.Writer, workDir, out string, s snapshotSavers) error {
+	if s.etcdMember(workDir) {
+		dst, err := etcdSnapshotDest(workDir, out, s.now().UTC())
+		if err != nil {
+			return err
+		}
+		if err := s.etcd(ctx, workDir, dst); err != nil {
+			return annotateSnapshotError(err, workDir)
+		}
+		renderEtcdSnapshotSave(w, dst)
+		return nil
+	}
+	res, err := s.sqlite(ctx, executor.SnapshotSaveOptions{WorkDir: workDir, Out: out})
+	if err != nil {
+		return annotateSnapshotError(err, workDir)
+	}
+	renderSnapshotSave(w, res)
 	return nil
+}
+
+// etcdSnapshotLayout stamps an etcd snapshot's default name, matching the kine one.
+const etcdSnapshotLayout = "20060102T150405Z"
+
+// etcdSnapshotDest decides where an etcd save writes: the default snapshots dir
+// (created 0700), inside a directory the operator named, or the exact file named.
+func etcdSnapshotDest(workDir, out string, at time.Time) (string, error) {
+	name := "k3sm-etcd-snapshot-" + at.Format(etcdSnapshotLayout) + ".db"
+	if out == "" {
+		dir := executor.SnapshotDir(workDir)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", fmt.Errorf("create %s: %w", dir, err)
+		}
+		return filepath.Join(dir, name), nil
+	}
+	if fi, err := os.Stat(out); err == nil && fi.IsDir() {
+		return filepath.Join(out, name), nil
+	}
+	abs, err := filepath.Abs(out)
+	if err != nil {
+		return "", fmt.Errorf("resolve --out %s: %w", out, err)
+	}
+	return abs, nil
+}
+
+// renderEtcdSnapshotSave prints what an etcd save produced.
+func renderEtcdSnapshotSave(w io.Writer, path string) {
+	fmt.Fprintf(w, "k3sm snapshot save — embedded etcd member\n\n")
+	fmt.Fprintf(w, "  snapshot   %s\n", path)
+	if fi, err := os.Stat(path); err == nil {
+		fmt.Fprintf(w, "  size       %d bytes\n", fi.Size())
+	}
+	fmt.Fprint(w, `
+Taken online from this server's etcd member and verified. It holds every Secret in
+plaintext: keep it 0600 and copy it OFF this node. Restoring an etcd member is not
+supported in this release.
+
+PersistentVolume data is NOT in this snapshot — see docs/user/storage.md.
+`)
 }
 
 // runSnapshotRestore parses the flags, wires the live-control-plane probe, and restores.
 func runSnapshotRestore(args []string) error {
 	fs := flag.NewFlagSet("snapshot restore", flag.ExitOnError)
 	workDir := snapshotWorkDirFlag(fs)
-	endpoint := fs.String("datastore-endpoint", os.Getenv("K3SM_DATASTORE_ENDPOINT"), "the server's datastore DSN, when it has one (or $K3SM_DATASTORE_ENDPOINT)")
 	apiPort := fs.Int("apiserver-port", executor.DefaultAPIServerPort, "apiserver secure port the running-server check probes")
 	kinePort := fs.Int("datastore-port", executor.DefaultKinePort, "kine listen port the running-server check probes")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, snapshotHelp()) }
@@ -133,10 +203,9 @@ func runSnapshotRestore(args []string) error {
 	}
 
 	res, err := executor.RestoreSnapshot(context.Background(), executor.SnapshotRestoreOptions{
-		WorkDir:           *workDir,
-		DatastoreEndpoint: *endpoint,
-		Snapshot:          fs.Arg(0),
-		Running:           liveControlPlaneProbe(install.NewDarwinSystem(), install.ServerLabel, *kinePort, *apiPort),
+		WorkDir:  *workDir,
+		Snapshot: fs.Arg(0),
+		Running:  liveControlPlaneProbe(install.NewDarwinSystem(), install.ServerLabel, *kinePort, *apiPort),
 	})
 	if err != nil {
 		return annotateSnapshotError(err, *workDir)
@@ -185,6 +254,9 @@ func annotateSnapshotError(err error, workDir string) error {
 	case errors.Is(err, executor.ErrNoDatastore):
 		return fmt.Errorf("%w — if the control plane keeps its state somewhere else, point --work-dir at it; that state root is owned by the %s service user, so `sudo k3sm snapshot save` may be what you want",
 			err, install.DefaultServiceUser)
+	case errors.Is(err, executor.ErrNoEtcdClient):
+		return fmt.Errorf("%w — the etcd snapshot is taken from the running server's member, whose loopback address that server records under %s; start the server, and run the command under sudo (the work dir is the %s service user's)",
+			err, workDir, install.DefaultServiceUser)
 	case errors.Is(err, os.ErrPermission):
 		return fmt.Errorf("%w — the datastore under %s is not accessible as this user; it is owned by the %s service user, so run the command under sudo",
 			err, workDir, install.DefaultServiceUser)

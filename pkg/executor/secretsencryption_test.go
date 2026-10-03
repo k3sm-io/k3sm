@@ -153,8 +153,10 @@ func TestEncryptionEnableRefusesNonEmptyStateDB(t *testing.T) {
 			wantErr: ErrEncryptionExistingDatastore,
 		},
 		{
-			name:    "a leftover external-datastore credential is refused",
-			setup:   func(t *testing.T, wd string) { writeFile(t, pgPassPath(wd), []byte("placeholder")) },
+			name: "an etcd data directory is refused",
+			setup: func(t *testing.T, wd string) {
+				writeFile(t, filepath.Join(etcdMemberDir(wd), "snap", "db"), []byte("bbolt"))
+			},
 			req:     EncryptionInstallRequest{Requested: true},
 			wantErr: ErrEncryptionExistingDatastore,
 		},
@@ -167,7 +169,7 @@ func TestEncryptionEnableRefusesNonEmptyStateDB(t *testing.T) {
 			req:     EncryptionInstallRequest{Requested: true},
 			wantErr: ErrEncryptionExistingDatastore,
 		},
-		{name: "server join is refused", req: EncryptionInstallRequest{Requested: true, HA: true}, wantErr: ErrEncryptionHA},
+		{name: "etcd posture is refused", req: EncryptionInstallRequest{Requested: true, HA: true}, wantErr: ErrEncryptionHA},
 		{name: "agent is refused", req: EncryptionInstallRequest{Requested: true, Agent: true}, wantErr: ErrEncryptionAgent},
 		{
 			name:  "existing pair and no datastore is kept",
@@ -473,8 +475,8 @@ func TestValidateRefusesEncryptionWithHA(t *testing.T) {
 		want error
 	}{
 		{name: "single server", cfg: Config{EncryptionProviderConfig: "/x"}},
-		{name: "datastore endpoint", cfg: Config{EncryptionProviderConfig: "/x", DatastoreEndpoint: "postgres://h/db"}, want: ErrEncryptionHA},
-		{name: "server join", cfg: Config{EncryptionProviderConfig: "/x", ServerJoin: true, DatastoreEndpoint: "postgres://h/db"}, want: ErrEncryptionHA},
+		{name: "cluster init", cfg: Config{EncryptionProviderConfig: "/x", Etcd: &EtcdConfig{Role: EtcdInit, Name: "n", PeerIP: "192.0.2.10"}}, want: ErrEncryptionHA},
+		{name: "server join", cfg: Config{EncryptionProviderConfig: "/x", Etcd: &EtcdConfig{Role: EtcdJoin, Name: "n", PeerIP: "192.0.2.10"}}, want: ErrEncryptionHA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

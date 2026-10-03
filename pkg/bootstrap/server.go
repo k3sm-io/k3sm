@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"k3sm.io/k3sm/pkg/certs"
@@ -58,9 +59,12 @@ type ServerConfig struct {
 	// sibling's name is protected by that sibling's binding, not by this one.
 	//
 	// Empty leaves the name guard OFF (NewServer says so once at start). It is
-	// deliberately not a hard construction error, because a supervisor that
-	// refuses to serve is a worse failure than one whose first layer is absent
-	// while the node-password binding and the enroller's index guard still stand.
+	// deliberately not a hard construction error for the worker join, because a
+	// supervisor that refuses to serve is a worse failure than one whose first
+	// layer is absent while the node-password binding and the enroller's index
+	// guard still stand. With Members set it IS one (ErrMembersNeedSelfNodeName):
+	// the etcd member routes have no second layer, and an empty name would let a
+	// member request under this server's own name remove the member serving it.
 	SelfNodeName string
 	// Enroller performs the controller-mediated mesh enroll (MeshPeer write + peer
 	// snapshot).
@@ -76,6 +80,11 @@ type ServerConfig struct {
 	// Bundle yields the sealed CA bundle the bundle endpoint returns. When nil, the
 	// bundle endpoint is not served. Both ServerAuth and Bundle must be set to enable it.
 	Bundle BundleSource
+	// Members drives the embedded-etcd membership routes (EtcdMemberPath,
+	// EtcdMemberPromotePath) against this server's own local member. They are
+	// served only when both ServerAuth and Members are set — the etcd posture —
+	// and independently of Bundle.
+	Members MemberJoiner
 	// Logger is the structured logger; a discard logger is used if nil.
 	Logger *slog.Logger
 	// Now is the clock the join rate limiters (per-token and pre-auth) refill
@@ -104,11 +113,22 @@ type Server struct {
 	// preauth bounds anonymous join volume per source address and in total,
 	// ahead of the token verification's bcrypt cost (see preAuthLimiter).
 	preauth *preAuthLimiter
+	// memberMu serializes the etcd member routes, so one request's member list,
+	// stale-member removal and learner add never interleave with another's.
+	memberMu sync.Mutex
 }
+
+// ErrMembersNeedSelfNodeName refuses a server built with the etcd member routes
+// (ServerConfig.Members) but no SelfNodeName. The self-name refusal is the only thing
+// that stops a member request under this server's own name from taking the
+// stale-member path and removing the very member serving it, so the routes must
+// never run with that guard off.
+var ErrMembersNeedSelfNodeName = errors.New("bootstrap server: the etcd member routes (Members) require SelfNodeName, the guard against removing this server's own member")
 
 // NewServer validates cfg and returns the bootstrap Server. It errors if any
 // required dependency (the CAs, token verifier, node-password store, or enroller) is
-// missing — fail fast, no embedded fallback.
+// missing — fail fast, no embedded fallback — and when the etcd member routes are
+// configured without SelfNodeName (ErrMembersNeedSelfNodeName).
 func NewServer(cfg ServerConfig) (*Server, error) {
 	switch {
 	case cfg.ClusterCA == nil:
@@ -129,6 +149,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
 	if strings.Trim(cfg.SelfNodeName, " ") == "" {
+		if cfg.Members != nil {
+			return nil, ErrMembersNeedSelfNodeName
+		}
 		// Said ONCE, at construction, rather than per request: an unconfigured
 		// guard is a wiring defect that does not vary with traffic, and a
 		// per-request line would bury it. Loud here beats silent everywhere.
@@ -150,7 +173,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 // Handler returns the bootstrap HTTP mux (CACertPath + JoinPath +
 // MeshEndpointPath + DeregisterPath, plus the server-bootstrap CA-bundle endpoint
-// when ServerAuth + Bundle are configured).
+// when ServerAuth + Bundle are configured, and the server-class etcd member routes
+// when ServerAuth + Members are configured).
 //
 // The routes do NOT share an authentication scheme, and that is deliberate:
 // /cacert, /join and /server-bootstrap are reached by a node that holds no cluster
@@ -168,6 +192,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(DeregisterPath, s.handleDeregister)
 	if s.cfg.ServerAuth != nil && s.cfg.Bundle != nil {
 		mux.HandleFunc(BundlePath, s.handleBundle)
+	}
+	if s.cfg.ServerAuth != nil && s.cfg.Members != nil {
+		mux.HandleFunc(EtcdMemberPath, s.handleEtcdMember)
+		mux.HandleFunc(EtcdMemberPromotePath, s.handleEtcdMemberPromote)
 	}
 	return mux
 }
