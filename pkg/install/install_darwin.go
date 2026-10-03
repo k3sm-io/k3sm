@@ -1393,7 +1393,7 @@ func (darwinSystem) WriteDataVolumeRecord(path string, rec dataroot.Record) erro
 // The file lands root:wheel in /Library/Preferences, and both halves of that
 // matter: only root may rewrite what the next install splices into the server
 // LaunchDaemon's argv, and only root may read it, because an operator argument
-// can carry a credential (--datastore-endpoint carries a DSN password).
+// can carry a credential.
 func (darwinSystem) WriteServerArgsRecord(path string, rec dataroot.ServerArgsRecord) error {
 	return dataroot.WriteServerArgsRecord(path, rec)
 }
