@@ -349,7 +349,7 @@ func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
 // It returns the enrolled identity so the caller can seed the node-local
 // datapath with the mesh-egress source the proxy binds and the peer mesh-egress
 // /32s the NetworkPolicy table always-allows, plus the mesh teardown handle the
-// caller defers so this node's routes and pf anchor are released on the server's
+// caller defers so this node's routes are released on the server's
 // way out instead of by a goroutine racing process death (see meshTeardown).
 //
 // It is SYNCHRONOUS and returns only once the enroll has been list-back

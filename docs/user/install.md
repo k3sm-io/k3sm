@@ -201,8 +201,8 @@ sudo k3sm uninstall
 It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes the
 `/usr/local/bin/k3sm` launcher, but only that link, and only while it still points at
 `/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
-left exactly as it is. It also clears the mesh's pf anchor rule, so a later tunnel never inherits a
-stale MSS clamp. Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
+left exactly as it is. It also flushes the pf anchor an older release loaded for the mesh (k3sm itself
+loads no pf rule). Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
 reinstall picks up where you left off; to remove those too, see
 [Remove Everything](#remove-everything). The server's admin token is removed, because a reinstall
 mints a new one, but if you run the control plane against an external database, the file holding

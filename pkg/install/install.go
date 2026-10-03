@@ -1025,16 +1025,13 @@ type System interface {
 	// It inspects the live interface (ifconfig) rather than walking ranges, so it
 	// removes exactly what exists. A no-op when nothing matches.
 	FlushLo0Aliases(prefixes []netip.Prefix) error
-	// FlushMeshPFAnchor is the uninstall backstop for the mesh's MSS-clamp pf
-	// anchor (darwin-net's mesh.PFAnchor, "io.k3sm.mesh"), which outlives netd:
-	// the anchor is loaded against a utun interface number, and only the
-	// RemoveMesh RPC — not a daemon shutdown — ever reaches mesh.WGDevice.Down,
-	// which flushes it. Left in place, the rule survives the booted-out daemon
-	// scoped to a utun that no longer exists, and macOS recycles utun numbers —
-	// so the next tunnel that is assigned that same number silently inherits a
-	// stale MSS clamp. Best-effort like FlushLo0Aliases: an anchor that was
-	// never loaded is a no-op (pfctl succeeds flushing zero rules), and a
-	// pfctl failure is reported but never stops the rest of uninstall.
+	// FlushMeshPFAnchor is the uninstall backstop for the pf anchor (darwin-net's
+	// mesh.PFAnchor, "io.k3sm.mesh") that an older release loaded the mesh MSS
+	// clamp into. Nothing loads it now (k3sm loads no pf rule), but a rule an
+	// older release left behind outlives netd, scoped to a utun that no longer
+	// exists. Best-effort like FlushLo0Aliases: an anchor that was never loaded
+	// is a no-op (pfctl succeeds flushing zero rules), and a pfctl failure is
+	// reported but never stops the rest of uninstall.
 	FlushMeshPFAnchor() error
 	// ReadPodReapRecords returns the pod process groups the runtime recorded in
 	// its reap store under dataRoot (runtime.ReadPodReapRecords). An absent store
@@ -3462,13 +3459,12 @@ func publishedWiring(ctx context.Context, sys System, cfg Config, m []artifact, 
 //
 //   - lo0 inet aliases — SWEPT, by the FlushLo0Aliases backstop below, precisely
 //     because no daemon does it.
-//   - the mesh MSS-clamp pf anchor — SWEPT, by the FlushMeshPFAnchor backstop
-//     below (B274). Left alone it survives netd, scoped to a utun that is gone,
-//     and macOS recycles utun numbers — the next tunnel assigned that number
-//     silently inherits the stale clamp. A daemon-shutdown-path fix was
-//     considered and rejected: a restart already self-heals, because Up
-//     reloads the anchor for the current interface on every daemon start, so
-//     the uninstall backstop is the only place the residue is user-visible.
+//   - the pf anchor an older release loaded the mesh MSS clamp into: SWEPT, by
+//     the FlushMeshPFAnchor backstop below. Nothing loads it now (k3sm loads no
+//     pf rule), but a rule an older release left behind would survive netd,
+//     scoped to a utun that is gone, and macOS recycles utun numbers. A
+//     daemon-shutdown-path fix was considered and rejected: the flush is a
+//     backstop for old state, not a live resource.
 //   - the wireguard utun and its routes — NOT explicitly removed. The interface
 //     is created in-process (tun.CreateTUN) and goes away with netd, and the
 //     kernel drops routes whose interface has vanished; nothing here proves the
@@ -3608,10 +3604,9 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// run out of <DataRoot>/server/bin and would otherwise hold the apiserver/
 	// kine ports + the SQLite DB, breaking the next install.
 	note(sys.ReapOrphans(filepath.Join(cfg.serverWorkDir(), "bin")))
-	// Backstop: flush the mesh MSS-clamp pf anchor (B274). It outlives netd —
-	// only the RemoveMesh RPC reaches mesh.WGDevice.Down, and no signal path
-	// ever calls it — so a booted-out daemon leaves the anchor loaded against a
-	// utun number macOS will eventually recycle onto an unrelated tunnel.
+	// Backstop: flush the pf anchor an older release loaded the mesh MSS clamp
+	// into. Nothing loads it now, so this only clears what an older release left
+	// behind, which would outlive netd scoped to a utun that is gone.
 	note(sys.FlushMeshPFAnchor())
 	// Backstop: flush the k3sm-owned lo0 aliases. They are durable kernel state
 	// no daemon removes on the way out — netd tracks per-connection alias caps

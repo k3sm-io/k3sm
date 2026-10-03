@@ -782,18 +782,16 @@ dev-Mac churn soak). Until that soak is signed off, treat heavy-churn watch sema
 accepted-with-known-issue rather than guaranteed. See [Backup & restore](backup-restore.md) for the
 datastore operational model.
 
-### Mesh MTU Spread and the UDP Segmentation Gap
+### Mesh MTU Spread and UDP Fragmentation
 
-A k3sm node presents a wide MTU spread: loopback pod aliases sit at 16384, and the mesh
-WireGuard tunnel sits at 1380. The mesh loads a TCP MSS-clamp rule into its own
-pf anchor, but a stock macOS install neither enables pf nor references that anchor from the
-main ruleset, so the clamp is not currently in effect; until that wiring lands, TCP and UDP
-flows alike can carry loopback-sized segments toward the tunnel. UDP gets no such clamp by design, because the
-scrub rule is TCP-only, so a UDP datagram sized for the loopback path can still exceed the
-tunnel MTU when it crosses the mesh. One unattributed host kernel panic in the segmentation-
-offload path is on record on macOS 26.6.2 with the mesh active; the evidence collected at the
-time was insufficient to name the flow that triggered it. If it recurs, the audit gate collects
-the snapshot needed to attribute it.
+- Loopback pod aliases sit at MTU 16384. The mesh WireGuard tunnel sits at 1380.
+- TCP: the kernel takes the MSS from the route to the destination, and the pod-CIDR routes inherit
+  the tunnel MTU, so cross-node connections (IPv4, the only pod family) negotiate an MSS of 1340. k3sm enables no pf and loads
+  no pf rule.
+- UDP: datagrams up to 1352 bytes cross the tunnel whole. Larger ones are fragmented and delivered.
+  With don't-fragment set, a larger send fails locally with `EMSGSIZE`.
+- One unattributed host kernel panic is on record on macOS 26.6.2 with the mesh active. If it
+  recurs, the audit gate collects the snapshot needed to attribute it.
 
 ## MLX / Apple-GPU Workloads
 

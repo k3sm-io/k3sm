@@ -1800,7 +1800,7 @@ func (darwinSystem) PathExists(path string) (bool, error) {
 // failure.
 //
 // The verb is unknown ON PURPOSE: every verb netd does implement mutates
-// privileged host state (an lo0 alias, the mesh, a pf anchor, a bound port), and
+// privileged host state (an lo0 alias, the mesh, a bound port), and
 // a liveness probe must not be able to change the machine it is asking about.
 func (darwinSystem) ProbeNetd(path string) error {
 	payload, err := json.Marshal(wire.Request{Version: wire.CurrentVersion(), Verb: netdProbeVerb})
@@ -2135,14 +2135,13 @@ func (darwinSystem) FlushLo0Aliases(prefixes []netip.Prefix) error {
 	return errors.Join(errs...)
 }
 
-// FlushMeshPFAnchor flushes every rule loaded into the mesh's MSS-clamp pf
-// anchor (mesh.PFAnchor, "io.k3sm.mesh") — the root-privileged uninstall
-// backstop for B274: the anchor is loaded against a utun interface number and
-// nothing on the daemon-shutdown path ever flushes it, so it survives a
-// booted-out netd scoped to a utun macOS will eventually recycle onto an
-// unrelated tunnel. `pfctl -a <anchor> -F all` against an anchor that was
-// never loaded flushes zero rules and exits 0, so this is safely unconditional
-// on every uninstall — mesh or single-node.
+// FlushMeshPFAnchor flushes every rule in the pf anchor (mesh.PFAnchor,
+// "io.k3sm.mesh") that an older release loaded the mesh MSS clamp into. Nothing
+// loads that anchor now: k3sm never enables pf and loads no pf rule, and TCP
+// MSS follows the tunnel route MTU. This is a root-privileged uninstall
+// backstop that clears what an older release left behind. `pfctl -a <anchor>
+// -F all` against an anchor that was never loaded flushes zero rules and exits
+// 0, so this is safely unconditional on every uninstall, mesh or single-node.
 func (darwinSystem) FlushMeshPFAnchor() error {
 	out, err := exec.Command("pfctl", "-a", mesh.PFAnchor, "-F", "all").CombinedOutput()
 	if err != nil {
