@@ -49,3 +49,4 @@ pkg/registrysvc/relay_test.go until=2026-12-31 # relay listeners and dials over 
 pkg/registrysvc/service_test.go until=2026-12-31 # preflight must refuse a held loopback port
 pkg/svclb/splicebench_test.go until=2026-12-31 # splice benchmark needs real TCP connections
 pkg/svclb/splicecopy_test.go until=2026-12-31 # splice copy needs a connected TCP pair
+pkg/bootstrap/etcdmember_test.go until=2026-12-31 # the member route is exercised against a real loopback server; convert to the route's fake joiner seam
