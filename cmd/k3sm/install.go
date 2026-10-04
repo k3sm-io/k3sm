@@ -83,7 +83,7 @@ func runInstall(args []string) error {
 		fmt.Fprintln(os.Stderr, fileVaultNote)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx := context.Background()
 	return install.Install(ctx, install.NewDarwinSystem(), install.Config{
 		Role:              opts.role(),
@@ -371,6 +371,7 @@ func runUninstall(args []string) error {
 // stdout, progress and diagnostics through the logger to stderr.
 func uninstallConfig(stdout, stderr io.Writer) install.Config {
 	return install.Config{
+		// Not newDaemonLogger: called with injected writers, and install_test.go asserts on an isolated buffer; setting the process default here would leak test state.
 		Logger: slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
 		Out:    stdout,
 	}

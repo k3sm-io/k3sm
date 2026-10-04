@@ -23,7 +23,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"net"
 	"os"
@@ -364,7 +363,7 @@ func runServer(args []string) (err error) {
 	workDirErr := registerServerFlags(fs, &opts)
 	_ = fs.Parse(args)
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 
 	// Free refusals, the crash-loop breaker and the `--network` backend.
 	breaker, mode, done, err := preflightServer(&opts, workDirErr, logger)
@@ -445,7 +444,7 @@ func runServer(args []string) (err error) {
 			logger.Error("control-plane shutdown", "err", err)
 		}
 	}()
-	log.Printf("k3sm control plane healthy (kubeconfig=%s)", exec.Kubeconfig())
+	logger.Info("k3sm control plane healthy", "kubeconfig", exec.Kubeconfig())
 	// A bring-up that stays healthy for the whole window resets the breaker;
 	// a crash before then leaves the record for the count (see crashBreaker).
 	healthyReset := time.AfterFunc(executor.CrashLoopWindow, breaker.resetIfHealthy)
@@ -505,7 +504,7 @@ func runServer(args []string) (err error) {
 	if err = repairServerNodeLabels(ctx, cs, opts.nodeName, logger); err != nil {
 		return err
 	}
-	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
+	logger.Info(fmt.Sprintf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName))
 	// The deferred crash check above names the component on this path too.
 	return startNode(ctx, nodeOpts)
 }
