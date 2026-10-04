@@ -1400,9 +1400,19 @@ func workerNetserveConfig(opts agentOptions, res *bootstrap.JoinResult, mode hos
 		// worker with no vm backend keeps the byte-identical plain table.
 		VMBackend:   vmCapable,
 		VMNetSubnet: netserve.DefaultVMNetSubnet,
-		NetdSocket:  mode.Socket,
-		Disabled:    !mode.DataPath(),
-		Logger:      logger,
+		// The worker's datapath runs under the node kubeconfig
+		// (system:node:<name>). The policy watcher's cluster-wide
+		// NetworkPolicies and Namespaces reads are granted to neither the Node
+		// authorizer nor system:nodes, so the worker runs no policy watcher
+		// (its table could never sync). Granting those reads is an RBAC
+		// decision, not made here. PodScopeNode stays set so that, once a
+		// worker does enforce, its pods list is the one the Node authorizer
+		// allows: only the pods bound to this node.
+		EnforceNetworkPolicy: false,
+		PodScopeNode:         opts.nodeName,
+		NetdSocket:           mode.Socket,
+		Disabled:             !mode.DataPath(),
+		Logger:               logger,
 	}
 }
 

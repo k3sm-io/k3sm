@@ -40,6 +40,7 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 
 	opts := agentOptions{
 		workDir:   "/var/lib/k3sm/agent",
+		nodeName:  "mac-worker-2",
 		nodeIP:    "100.64.2.1",
 		clusterIP: "10.43.0.10",
 		domain:    "cluster.local",
@@ -63,6 +64,17 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 		}
 		if cfg.DNSVIP != "10.43.0.10" || cfg.ClusterDomain != "cluster.local" {
 			t.Errorf("DNS config = (%q,%q), want (10.43.0.10, cluster.local)", cfg.DNSVIP, cfg.ClusterDomain)
+		}
+		// The worker datapath runs under system:node:<name>, which is granted
+		// neither the cluster-wide NetworkPolicies nor the Namespaces read the
+		// policy watcher needs, so the worker must not start it.
+		if cfg.EnforceNetworkPolicy {
+			t.Error("EnforceNetworkPolicy = true on a worker; its node identity cannot sync the policy watcher")
+		}
+		// Kept for when a worker does enforce: the Node authorizer refuses that
+		// identity a cluster-wide pod list, so the pods view is its own pods.
+		if cfg.PodScopeNode != opts.nodeName {
+			t.Errorf("PodScopeNode = %q, want %q (the worker's own node name)", cfg.PodScopeNode, opts.nodeName)
 		}
 
 		// The worker's netserve actually builds a proxy + DNS: it hands pods the
