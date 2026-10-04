@@ -18,8 +18,6 @@ package main
 
 import (
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"testing"
 )
 
@@ -51,61 +49,59 @@ import (
 //     single check at the bottom would restore the bare "context canceled" exits
 //     on every earlier path.
 //
-// Source position is a sound proxy for order here: the assignment and the
-// NewSupervised call both sit in runServer's straight-line bring-up sequence,
-// with no loop or branch that could execute them out of textual order.
+// Trace order is a sound proxy for order here: the assignment and the
+// NewSupervised call both sit in runServer's straight-line bring-up sequence
+// (servertrace_test.go), with no loop or branch that could execute them out of
+// order. (3) reads runServer's OWN declaration: the named result and the defer
+// that rewrites it only work there.
 func TestRunServerWiresTheComponentExitSeam(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "server.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse server.go: %v", err)
-	}
-	var runServerDecl *ast.FuncDecl
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Recv == nil && fn.Name.Name == "runServer" {
-			runServerDecl = fn
-		}
-	}
-	if runServerDecl == nil {
-		t.Fatal("server.go declares no runServer function")
-	}
+	tr := runServerTrace(t)
+	runServerDecl := tr.decl
 
-	// (1) + (2): the assignment exists, and precedes the by-value Config copy.
-	var assignPos, newSupervisedPos token.Pos
+	// (1) + (2): the assignment exists IN RUNSERVER'S OWN BODY — a helper's
+	// `cfg.OnComponentExit =` would write its own by-value copy, so only
+	// runServer's cfg counts — and precedes the by-value Config copy, which may
+	// sit in a helper and is therefore found through the trace.
+	var assign, newSupervised ast.Node
 	ast.Inspect(runServerDecl.Body, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.AssignStmt:
-			for _, lhs := range node.Lhs {
-				sel, ok := lhs.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "OnComponentExit" {
-					continue
-				}
-				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "cfg" && !assignPos.IsValid() {
-					assignPos = node.Pos()
-				}
+		node, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, lhs := range node.Lhs {
+			sel, ok := lhs.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "OnComponentExit" {
+				continue
 			}
+			if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "cfg" && assign == nil {
+				assign = node
+			}
+		}
+		return true
+	})
+	tr.inspect(func(n ast.Node) bool {
+		switch node := n.(type) {
 		case *ast.CallExpr:
 			sel, ok := node.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "NewSupervised" || newSupervisedPos.IsValid() {
+			if !ok || sel.Sel.Name != "NewSupervised" || newSupervised != nil {
 				return true
 			}
-			newSupervisedPos = node.Pos()
+			newSupervised = node
 		}
 		return true
 	})
 
-	if !assignPos.IsValid() {
+	if assign == nil {
 		t.Fatal("runServer never assigns cfg.OnComponentExit — a control-plane child that dies after bring-up is reported to nobody, " +
 			"launchd's KeepAlive never fires, and the cluster stays wedged while the daemon looks healthy")
 	}
-	if !newSupervisedPos.IsValid() {
+	if newSupervised == nil {
 		t.Fatal("runServer never calls executor.NewSupervised — this test no longer reads what it thinks it does")
 	}
-	if assignPos >= newSupervisedPos {
+	if tr.pos(assign) >= tr.pos(newSupervised) {
 		t.Errorf("runServer assigns cfg.OnComponentExit at %s, NOT before executor.NewSupervised at %s — "+
 			"Config is passed by VALUE, so this assignment mutates a copy the executor never sees and the feature is entirely off",
-			fset.Position(assignPos), fset.Position(newSupervisedPos))
+			tr.where(assign), tr.where(newSupervised))
 	}
 
 	// (3a): the error result is named, which is what lets a defer rewrite it.

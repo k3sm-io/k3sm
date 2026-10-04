@@ -42,15 +42,15 @@ import (
 // stays publishable, which is exactly the defect the policy exists to close.
 //
 // runServer boots a real control plane, so no unit test can call it; the wiring is
-// therefore asserted structurally, by reading server.go (the idiom
-// servermeshwiring_test.go establishes). Both assertions are about a single
+// therefore asserted structurally, by reading runServer's trace (the idiom
+// servertrace_test.go establishes). Both assertions are about a single
 // expression, so source position is not even needed — only identity.
 func TestServerSingleSourcesTheDeniedLocalPorts(t *testing.T) {
-	_, body := runServerBody(t)
+	tr := runServerTrace(t)
 
 	// The value handed to the admission provisioning.
 	var policyArg string
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -72,7 +72,7 @@ func TestServerSingleSourcesTheDeniedLocalPorts(t *testing.T) {
 
 	// The value stamped onto the node.
 	var nodeStamp string
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		kv, ok := n.(*ast.KeyValueExpr)
 		if !ok {
 			return true

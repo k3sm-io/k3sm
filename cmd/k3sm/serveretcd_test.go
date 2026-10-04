@@ -160,14 +160,13 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 	})
 
 	t.Run("runServer: bundle, member step, executor, then the mesh enroll", func(t *testing.T) {
-		_, body := runServerBody(t)
-		first := firstCallPositions(body)
+		first := runServerTrace(t).firstCalls()
 		order := []string{"importServerCABundle", "joinEtcdMember", "executor.NewSupervised", "exec.Start", "enrollSelfAndBringUpMesh"}
 		for i, name := range order {
 			if _, ok := first[name]; !ok {
 				t.Fatalf("runServer no longer calls %s", name)
 			}
-			if i > 0 && first[order[i-1]] >= first[name] {
+			if i > 0 && first[order[i-1]].pos >= first[name].pos {
 				t.Errorf("runServer calls %s before %s; the order must be %v", name, order[i-1], order)
 			}
 		}

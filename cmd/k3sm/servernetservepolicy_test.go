@@ -33,10 +33,10 @@ import (
 //     kubeclient.FromPath(exec.Kubeconfig()) (the system:masters kubeconfig the
 //     executor writes).
 func TestServerNetservePolicyClientIsAdmin(t *testing.T) {
-	_, body := runServerBody(t)
+	tr := runServerTrace(t)
 
 	var lit *ast.CompositeLit
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || !isSelector(call.Fun, "netserve", "New") || len(call.Args) != 1 {
 			return true
@@ -90,7 +90,7 @@ func TestServerNetservePolicyClientIsAdmin(t *testing.T) {
 
 	assigns := 0
 	fromAdmin := false
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
 		if !ok {
 			return true

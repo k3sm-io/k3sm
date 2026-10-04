@@ -36,33 +36,25 @@ import (
 	"time"
 
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	crdconfig "k3sm.io/apis/config/crd"
 	"k3sm.io/darwin-net/pkg/dns"
 
-	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/crdensure"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
-	"k3sm.io/k3sm/pkg/ingresshost"
-	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
 	"k3sm.io/k3sm/pkg/policy"
 	"k3sm.io/k3sm/pkg/ports"
 	"k3sm.io/k3sm/pkg/provider"
-	"k3sm.io/k3sm/pkg/provisioner"
-	"k3sm.io/k3sm/pkg/rbac"
-	"k3sm.io/k3sm/pkg/registrysvc"
 	"k3sm.io/k3sm/pkg/runtimeclass"
-	"k3sm.io/k3sm/pkg/svclb"
 )
 
 // serverOptions configures `k3sm server` — the all-in-one control plane + node.
@@ -362,6 +354,10 @@ func refuseShadowedWorkDir(fsys dataroot.FS, workDir, dataRoot string) error {
 // node in one process, then hosts darwin-net's Service proxy + per-node DNS resolver +
 // DNS shim and provisions the os=darwin admission policy. It blocks until
 // interrupted, then shuts the control plane down cleanly.
+//
+// It is the orchestrator only: provisioning lives in serverprovision.go and each
+// post-bring-up phase in serverphases.go. Every defer stays here, in bring-up
+// order, so the teardown order is read off this one body (LIFO).
 func runServer(args []string) (err error) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	opts := serverOptions{}
@@ -370,323 +366,40 @@ func runServer(args []string) (err error) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	// The static admin token, from the file the installed daemon is pointed at.
-	// Resolved BEFORE any state is touched, because a token file that is there
-	// and cannot be used (group-readable, empty, unreadable) is terminal: it
-	// names a credential the operator believes is in play, and coming up past it
-	// would mint a different one and leave every `kubectl` call Unauthorized.
-	//
-	// An ABSENT file is not terminal, exactly as it is not for the agent: the
-	// executor then generates a token and writes its own kubeconfig, which is
-	// what a bare `k3sm server` has always done.
-	switch {
-	case opts.serverJoin && opts.tokenFile != "":
-		// The HA server-join path is untouched by this flag: its --token is a
-		// server-class JOIN token, not the static admin credential, and quietly
-		// swapping one for the other is the kind of substitution that surfaces as
-		// a CA mismatch three steps later.
-		logger.Warn("ignoring --token-file: the HA server-join takes its server-class join token on --token / $K3SM_TOKEN",
-			"token-file", opts.tokenFile)
-	default:
-		absent, terr := resolveTokenFile(opts.tokenFile, &opts.token)
-		if terr != nil {
-			return terr
-		}
-		if absent {
-			logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
-				"path", opts.tokenFile)
-		}
-	}
-
-	// The HA flag shape, before any state is touched: a refusal here costs nothing,
-	// where the executor's own check would fire after CAs and kubeconfigs exist.
-	if err := opts.validateEtcdFlags(); err != nil {
+	// Free refusals, the crash-loop breaker and the `--network` backend.
+	breaker, mode, done, err := preflightServer(&opts, workDirErr, logger)
+	if done || err != nil {
 		return err
 	}
-
-	if opts.ingressHTTPPort < 0 || opts.ingressHTTPPort > 65535 {
-		return fmt.Errorf("--ingress-http-port %d out of range 0-65535", opts.ingressHTTPPort)
-	}
-	if opts.ingressHTTPSPort < 0 || opts.ingressHTTPSPort > 65535 {
-		return fmt.Errorf("--ingress-https-port %d out of range 0-65535", opts.ingressHTTPSPort)
-	}
-	if opts.registryPort < 0 || opts.registryPort > 65535 {
-		return fmt.Errorf("--registry-port %d out of range 0-65535 (0 disables)", opts.registryPort)
-	}
-	// The node name is checked ONCE, here, before anything keys on it: from this
-	// point opts.nodeName is canonical for the self-name guard, this node's own
-	// node-password binding, its certificates and its Node object alike.
-	nodeName, nerr := canonicalServerNodeName(opts.nodeName)
-	if nerr != nil {
-		return nerr
-	}
-	opts.nodeName = nodeName
-	if opts.workDir == "" {
-		if workDirErr != nil {
-			return fmt.Errorf("resolve control-plane work-dir: %w (pass --work-dir)", workDirErr)
-		}
-		return fmt.Errorf("control-plane work-dir is empty (pass --work-dir)")
-	}
-	// Refuse a shadowed data root before touching it: writing the work-dir into
-	// a declared-but-unmounted mountpoint would build a fresh, empty datastore
-	// that hides the real volume's (2026-09-05).
-	if err := refuseShadowedWorkDir(dataroot.OSFS{}, opts.workDir, install.DefaultDataRoot); err != nil {
-		return err
-	}
-	// --cluster-init over an existing single-node datastore, refused before
-	// anything is written: the executor checks it again at provision, but by then
-	// this function has minted CAs and written kubeconfigs into the work dir.
-	if err := executor.RefuseClusterInitOverSQLite(executor.Config{WorkDir: opts.workDir, Etcd: opts.etcdConfig()}); err != nil {
-		return err
-	}
-	// Fail fast if the work-dir is not writable (the unprivileged control plane
-	// must not EACCES mid-bring-up against the root-owned default).
-	if err := executor.EnsureWorkDirWritable(opts.workDir); err != nil {
-		return err
-	}
-	// The crash-loop circuit breaker (k3sm#344). Every component crash below is
-	// recorded under the work dir; once CrashLoopThreshold of them land inside
-	// CrashLoopWindow the record is tripped and this daemon PARKS instead of
-	// bringing the control plane up — resident and idle, because the server
-	// plist's KeepAlive is a bare `true` and launchd would respawn any exit
-	// straight back into the same failure. The park ends when an operator clears
-	// the record (`k3sm server --clear-crashloop`, or deleting the file) or on a
-	// stop signal. The status row names the marker and the remedy.
-	breaker := newCrashBreaker(opts.workDir, logger)
-	if opts.clearCrashLoop {
-		if err := executor.ClearCrashRecord(breaker.path); err != nil {
-			return fmt.Errorf("clear crash-loop record: %w", err)
-		}
-		logger.Info("crash-loop record cleared; a parked daemon will now restart itself", "path", breaker.path)
-		return nil
-	}
-	if opts.clusterReset {
-		return runClusterReset(opts, logger)
-	}
-	// runtimed's on-disk root is the work-dir's parent (so the SBPL Posture.WorkDir
-	// resides under the daemon home and its containment check is active).
-	if opts.podRoot == "" {
-		opts.podRoot = executor.RuntimeRoot(opts.workDir)
-	}
-
-	// ONE construction-time decision (the `--network` backend): auto → root uses the
-	// direct ops, unprivileged (the _k3sm control plane) routes the proxy/mesh
-	// privileged ops through the root k3sm-netd helper; none → control-plane-only
-	// (no datapath, no probe — CI/dev). Fail fast if the helper is selected but
-	// unreachable, rather than wedging every pod in ContainerCreating.
-	mode, err := hostnet.Resolve(opts.network)
-	if err != nil {
-		return err
-	}
-	logger.Info("host-network backend", "network", opts.network, "backend", mode.Backend.String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// Secrets encryption at rest, decided from the credential pair under the
-	// work dir BEFORE any CA-bundle import or datastore start: a datastore
-	// opened under the wrong key (or none) serves Secrets it cannot read, or
-	// writes plaintext beside ciphertext. A refusal PARKS, for the crash-loop
-	// park's reason: launchd would respawn an exit straight back into it.
-	encryptionConfig, encErr := executor.EncryptionAtStart(executor.OSEncryptionStore{}, opts.workDir, opts.etcdPosture(), uint32(os.Geteuid()))
-	if encErr != nil {
-		logger.Error("refusing to start the control plane: "+encErr.Error(),
-			"key-file", executor.EncryptionConfigPath(opts.workDir), "status-with", "k3sm secrets-encrypt status")
-		return parkWhileEncryptionRefused(ctx, opts.workDir, opts.etcdPosture(), uint32(os.Geteuid()), crashLoopPollInterval, logger)
-	}
-	if rec := breaker.load(); rec.Tripped() {
-		last, _ := rec.Last()
-		logger.Error(parkReason(last), "path", breaker.path, "tripped-at", rec.TrippedAt.Format(time.RFC3339),
-			"last-component", last.Component, "crashes-in-window", rec.Recent(time.Now()),
-			"clear-with", "k3sm server --clear-crashloop")
-		return parkUntilCleared(ctx, breaker.path, crashLoopPollInterval, logger)
-	}
-
-	if err := mode.Probe(ctx); err != nil {
+	// Secrets encryption and a tripped breaker PARK here (admitServerStart).
+	encryptionConfig, done, err := admitServerStart(ctx, opts, breaker, mode, logger)
+	if done || err != nil {
 		return err
 	}
 
 	// 1. Control plane (child-process executor). Stop tears it down in reverse.
-	cfg := opts.executorConfig(logger)
-	// Packaged install: `k3sm install` stages the control-plane payload at
-	// <install-dir>/bin beside the daemon binary; boot seeds the workdir from it
-	// so it never shells out to gh/go (absent under launchd as _k3sm). Dev shells
-	// (no bin/ sibling) keep the acquisition fallbacks.
-	if dir, err := install.ExecutableDir(); err == nil {
-		if fi, serr := os.Stat(filepath.Join(dir, "bin")); serr == nil && fi.IsDir() {
-			cfg.PayloadBinDir = filepath.Join(dir, "bin")
-		}
+	cfg, pki, err := provisionControlPlane(ctx, &opts, encryptionConfig, logger)
+	if err != nil {
+		return err
 	}
-	// HA: cfg.Etcd (from executorConfig) runs an etcd member in place of kine and
-	// turns on scheduler/KCM leader election so only one server is active.
-	cfg.EncryptionProviderConfig = encryptionConfig
-	if encryptionConfig != "" {
-		logger.Info("secrets encryption at rest is on", "provider", executor.EncryptionProviderName, "config", encryptionConfig)
-	}
-	if cfg.Etcd != nil {
-		logger.Info("HA datastore mode: embedded etcd member; scheduler/KCM leader-elected",
-			"cluster-init", opts.clusterInit, "server-join", opts.serverJoin, "member", cfg.Etcd.Name, "peer-ip", cfg.Etcd.PeerIP)
-	}
-	// Standalone (non-HA-join): --token is the STATIC ADMIN bearer token — it must be
-	// BOTH what the apiserver loads into its token-auth-file (system:masters) AND what
-	// `k3sm install` wrote into the admin kubeconfig, or every admin request is
-	// Unauthorized (an observed live-hardware failure). Empty (a bare `k3sm server`) lets the
-	// executor generate one + write its own kubeconfig. In the HA server-join path
-	// --token is instead the JOIN token (consumed above to fetch the CA bundle); the
-	// executor generates its own static token and HA admin auth is a client cert, so
-	// the join token must NOT become the apiserver's static credential.
-	if !opts.serverJoin {
-		cfg.Token = opts.token
-	}
-	// HA server-join: a SECOND control-plane server reconstructs the IDENTICAL
-	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
-	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
-	// bring-up; we never fall through to minting fresh, divergent CAs (cluster trust
-	// split). Requires --token (the server-class token). The bundle and, after it,
-	// the etcd member route (joinEtcdMember) are reached at --server over the
-	// underlay — the existing server's bootstrap listener serves every interface — so
-	// neither needs this server's mesh, which comes up after its control plane.
-	if opts.serverJoin && opts.joinServer != "" {
-		if opts.token == "" {
-			return fmt.Errorf("--server-join with --server requires --token (the server-class join token)")
-		}
-		if err := importServerCABundle(ctx, opts, logger); err != nil {
-			return fmt.Errorf("HA server-join: %w", err)
-		}
-	}
-
-	// Multi-node: bind the apiserver + the worker-join supervisor on the mesh
-	// interface ONLY, serve a cluster-CA-signed cert, wire --client-ca-file +
-	// --kubelet-certificate-authority + --anonymous-auth=false. Empty --mesh-ip keeps
-	// the single-node loopback/self-signed path unchanged.
-	var hierarchy *certs.Hierarchy
-	var serverSecret string
-	if opts.meshIP != "" {
-		h, err := certs.EnsureHierarchy(opts.workDir)
-		if err != nil {
-			return fmt.Errorf("ensure CA hierarchy: %w", err)
-		}
-		// HA only: the etcd server + peer CAs ride the same bootstrap bundle (a
-		// joining server's import wrote them, so this LOADS them). A non-HA mesh
-		// server mints none.
-		if opts.etcdPosture() {
-			h.EtcdServer, h.EtcdPeer, err = certs.EnsureEtcdCAs(opts.workDir)
-			if err != nil {
-				return fmt.Errorf("ensure etcd CAs: %w", err)
-			}
-		}
-		hierarchy = h
-		// The server-bootstrap secret (machine-generated ≥256-bit) — minted +
-		// persisted on the first server, already saved by importServerCABundle on a
-		// joining server. It is the CA-bundle endpoint credential AND the bundle's KDF
-		// passphrase.
-		serverSecret, err = bootstrap.LoadOrCreateServerSecret(serverSecretPath(opts.workDir))
-		if err != nil {
-			return fmt.Errorf("server-bootstrap secret: %w", err)
-		}
-		// An admin kubeconfig authenticated by a signing-CA-issued
-		// system:masters CLIENT CERT (reconstructible on every server from the shared
-		// signing CA) + cluster-CA server verification — so kubectl works against ANY HA
-		// server. Written beside the executor's loopback token kubeconfig (which the
-		// in-process components keep). Log-and-continue: it is an operator convenience,
-		// not a bring-up dependency.
-		if err := writeAdminClientCertKubeconfig(adminKubeconfigPath(opts.workDir), fmt.Sprintf("https://%s:%d", opts.meshIP, opts.apiPort), h); err != nil {
-			logger.Error("write HA admin kubeconfig", "err", err)
-		} else {
-			logger.Info("wrote HA admin kubeconfig (signing-CA client cert; usable against any server)", "path", adminKubeconfigPath(opts.workDir))
-		}
-		// The MESH rewrite. It runs here, at mesh bring-up, and must stay STRICTLY
-		// BEFORE the pod-CIDR advertise derivation (advertisedNodeIP, applied inside
-		// startNode / lbHostingConfigs): applied the other way round, a mesh server
-		// would advertise the pod /24's 100.64.0.1 while its peers — and every HA
-		// server, which all compute the SAME index-0 podCIDR — know it by its mesh
-		// IP, so two Macs would publish one EXTERNAL-IP.
-		if isLoopbackDefault(opts.nodeIP) {
-			opts.nodeIP = opts.meshIP
-		}
-		servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP)
-		if err != nil {
-			return err
-		}
-		anonFalse := false
-		cfg.NodeIP = opts.meshIP
-		cfg.BindAddress = opts.meshIP
-		cfg.ClientCAFile = certs.SigningCACertPath(opts.workDir)
-		cfg.KubeletCAFile = certs.ClusterCACertPath(opts.workDir)
-		cfg.AnonymousAuth = &anonFalse
-		cfg.ServingCertFile = servingCert
-		cfg.ServingKeyFile = servingKey
-		// The CA that ISSUED that serving leaf is what the controller-manager must
-		// republish as every namespace's kube-root-ca.crt — the anchor every Pod uses to
-		// verify the apiserver. Set here, beside the serving cert, because the two are one
-		// posture: the executor derives --root-ca-file off the same predicate as
-		// --tls-cert-file, so they cannot name CAs from different modes. Without it the
-		// KCM would be pointed at the apiserver's SELF-SIGNED --cert-dir file, which on a
-		// mesh boot the apiserver never writes (bring-up dies on "error parsing
-		// root-ca-file"), and which on a work dir that once booted single-node is a stale
-		// CA that anchors nothing — in-pod API TLS then fails cluster-wide.
-		cfg.RootCAFile = certs.ClusterCACertPath(opts.workDir)
-		// The supervisor is deliberately NOT mesh-bound: a joining worker reaches
-		// it over the underlay, having no mesh until that join completes (see
-		// bootstrapListenAddr).
-		logger.Info("multi-node mode: apiserver bound to the mesh interface; the worker-join supervisor listens on every interface", "mesh-ip", opts.meshIP)
-	}
-	// 1b. The mesh IP has to be an address this host ANSWERS on before the
-	// apiserver is told to bind it. Nothing used to plumb it this early: the only
-	// writer was mesh.Start, at step 4b, so the first real `--mesh-ip 100.64.0.1`
-	// boot died at step 1 with "listen tcp 100.64.0.1:6444: bind: can't assign
-	// requested address" and a human had to alias it by hand. FAIL-FAST, unlike
-	// the log-and-continue mesh bring-up at 4b: that stage degrades a live control
-	// plane, this one decides whether there is a control plane at all.
-	if err := ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
+	// 1b. The mesh IP must answer on this host before the apiserver binds it.
+	// FAIL-FAST, unlike the log-and-continue mesh bring-up at 4b.
+	if err = ensureMeshIPAlias(ctx, opts.meshIP, mode, logger); err != nil {
 		return err
 	}
 
 	// A control-plane child that dies after bring-up must take this process with
-	// it. Nothing watched them before: the per-component reapers were the only
-	// observers, and their only readers were bring-up and teardown. So a
-	// kube-apiserver, kine, kube-scheduler or kube-controller-manager that died
-	// at hour six left `k3sm server` running, which meant launchd's KeepAlive —
-	// a plain bool, and therefore a restart-on-EXIT policy — never fired. The
-	// cluster was wedged while `k3sm status` still reported the daemon up. That
-	// is worst for the scheduler and the controller-manager, which unlike the
-	// apiserver and kine have no /readyz row: a dead scheduler shows up only as
-	// pods that never leave Pending, and a dead KCM never shows up at all.
-	//
-	// Exiting is the k3s-faithful minimum and the smallest correct move.
-	// Respawning the child in-process is the larger one and is deliberately not
-	// taken here: every in-process client still holds a connection to the old
-	// apiserver, so a respawn would leave the node talking to a corpse.
+	// it, or launchd's restart-on-EXIT KeepAlive never fires (componentExitHandler).
 	ctx, crashCancel := context.WithCancel(ctx)
 	defer crashCancel()
 	var crashedComponent atomic.Pointer[string]
-	cfg.OnComponentExit = func(name string, exitErr error, logPath, logTail string) {
-		// First writer wins: the components die in a cascade (kine's exit takes
-		// the apiserver with it), and the FIRST one names the actual cause.
-		if crashedComponent.CompareAndSwap(nil, &name) {
-			// The tail is already redacted and capped by pkg/executor, because
-			// launchd captures this logger into a world-readable
-			// /var/log/k3sm/server.log while the component log is 0600. The path
-			// is logged so the operator knows where the unredacted original is.
-			logger.Error("control-plane component exited; shutting down so launchd restarts the daemon",
-				"component", name, "err", exitErr, "log", logPath, "log-tail", logTail)
-			if breaker.record(name, logTail) {
-				logger.Error("crash-loop breaker tripped; the next start will park until an operator clears the record",
-					"path", breaker.path, "threshold", executor.CrashLoopThreshold, "window", executor.CrashLoopWindow)
-			}
-		}
-		crashCancel()
-	}
-	// A crash cancels ctx, and ctx feeds everything below — so the error that
-	// actually reaches the exit line depends on WHERE bring-up had got to, and
-	// most of those errors are a bare "context canceled" that names nothing.
-	// Rewriting it here, once, covers every return path after this point:
-	// exec.Start (a component that crashes while a later one is still coming
-	// up), the RBAC and CRD provisioning in between, and startNode — which
-	// returns nil on a cancelled context, right for a signal but wrong for a
-	// crash, since exiting 0 would tell the operator this was a clean shutdown.
-	// launchd restarts either way (KeepAlive is an unconditional bool), so the
-	// exit status is for the human; the crash-loop breaker above is what bounds
-	// the restarts.
+	cfg.OnComponentExit = componentExitHandler(&crashedComponent, breaker, crashCancel, logger)
+	// A crash cancels ctx, so most errors below would be a bare "context canceled"
+	// (and startNode's a nil). Rewriting err here, once, names the crashed
+	// component on every return path after this point (componentExitHandler).
 	defer func() {
 		name := crashedComponent.Load()
 		if name == nil {
@@ -705,41 +418,15 @@ func runServer(args []string) (err error) {
 	// cosmetic: in the mesh posture the apiserver BINDS and advertises the mesh IP,
 	// so tearing the utun and its alias down first would pull the interface out
 	// from under a control plane that is still draining.
-	//
 	// It stays a no-op until step 4b's enroll assigns it, and forever under
-	// `--network none`, so registering it this early costs nothing on the paths
-	// that never bring a mesh up.
+	// `--network none`, so registering it this early costs nothing.
 	meshDown := meshTeardown(noMeshTeardown)
 	defer func() { meshTeardownOnExit(ctx, meshDown, logger) }()
 
-	// On a joining HA server's first boot the etcd member route runs here, before the
-	// executor (serveretcd.go): the member starts with the route's initial cluster.
-	// A transient answer is retried in-process and never counted; a PERMANENT refusal
-	// (a bad or foreign token, a refused name) is recorded as a permanent bring-up
-	// failure, so the breaker parks on it instead of launchd re-asking forever. A
-	// shutdown during the step is returned uncounted.
-	cfg, err = joinEtcdMember(ctx, newServerEtcdJoin(opts), opts.joinServer, cfg, logger)
+	// The HA etcd member route, then the supervised executor (startControlPlane).
+	plan, exec, err := startControlPlane(ctx, opts, mode, cfg, pki, breaker, logger)
 	if err != nil {
-		noteEtcdMemberRouteFailure(breaker, logger, err)
-		return fmt.Errorf("HA server-join: %w", err)
-	}
-	exec := executor.NewSupervised(cfg)
-	logger.Info("bringing up k3sm control plane", "work-dir", opts.workDir, "api-port", opts.apiPort)
-	if err := exec.Start(ctx); err != nil {
-		// This is the place a control plane that never came up gets counted.
-		// Without it the breaker saw post-mark crashes only, and a persistent
-		// bring-up fault (a kine that cannot open its database, an apiserver whose
-		// flags no longer parse) looped under the plist's bare KeepAlive forever.
-		// OnComponentExit fires only for a component already marked supervised,
-		// which for every component but etcd is the end of its bring-up; etcd is
-		// supervised before its promotion and quorum waits, so a death there is
-		// seen by both, and pkg/executor hands the report to exactly one of them
-		// (the bring-up error wraps executor.ErrEtcdChildExited when the callback
-		// took it, and noteBringUpFailure skips that). The recording happens here
-		// rather than in pkg/executor because the breaker is the daemon's memory,
-		// not the executor's.
-		noteBringUpFailure(breaker, logger, err)
-		return fmt.Errorf("start control plane: %w", err)
+		return err
 	}
 	// The control-plane teardown, as a stage that OVERLAPS the node's embedded
 	// runtime close instead of queueing behind it: the node fires cpStop.begin at
@@ -769,271 +456,76 @@ func runServer(args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
-
-	// 3. Provision the cluster-scoped admission policies + the vm RuntimeClass.
-	// Extracted so the SET is testable against a fake clientset: what this
-	// binary provisions is a posture-INDEPENDENT product decision, and a silently
-	// absent policy is otherwise invisible until a real cluster admits something it
-	// should have rejected.
-	provisionClusterPolicies(ctx, cs, mode, os.Geteuid(), opts.deniedLocalPorts(), logger)
-
-	// 3b. Provision the RBAC graph BEFORE the VK node (step 5) and the
-	// worker-join supervisor (step 4d) start, so a joining worker's system:node
-	// datapath bindings already exist when the Node,RBAC authorizer (the apiserver
-	// shipped default) evaluates its first request. FAIL-CLOSED: unlike the
-	// advisory admission policies above (log-and-continue), a provisioning failure
-	// HALTS bring-up — a half-applied graph under an enforcing authorizer silently
-	// locks workers out of services/endpointslices/meshpeers. It runs under the
-	// retained system:masters admin client (RBAC-exempt) with a bounded retry, so it
-	// succeeds even though the authorizer is already on (no two-phase restart).
-	if err := rbac.Provision(ctx, cs); err != nil {
-		return fmt.Errorf("provision rbac graph: %w", err)
+	// 3–3c. Admission policies, the fail-closed RBAC graph, the embedded add-ons.
+	if err = provisionServerCluster(ctx, plan, restCfg, cs, logger); err != nil {
+		return err
 	}
-	logger.Info("provisioned RBAC graph (node-datapath + in-pod reader + registry-advertisement reader); authorizer is Node,RBAC")
-
-	// 3c. SSA-converge the EMBEDDED add-on manifest set. The manifests are
-	// compiled into this binary (embed.FS), never read from disk: the work dir is
-	// writable by every pod (all pods share the _k3sm uid and it is outside runtimed's
-	// sandbox-protected prefixes) and this client is the system:masters admin, so a
-	// directory ingress would hand cluster-admin to every pod on the node. See
-	// pkg/addons/doc.go. Runs AFTER the fail-closed RBAC graph so a slow or failing
-	// add-on can never delay it. Converge-only — it issues apply patches and never a
-	// delete or a list. Log-and-continue like the sibling boot provisioners, by the
-	// repo's one rule for a fault on this process: UNSURVIVABLE faults exit (a dead
-	// control-plane child does, and the crash-loop breaker bounds the respawns);
-	// SURVIVABLE ones continue, and a manifest that will not apply is survivable —
-	// the control plane is up without it. The shipped set is EMPTY of product
-	// manifests today, so this is inert until the first add-on lands.
-	if ar, err := addons.NewFromConfig(addons.FS(), restCfg); err != nil {
-		logger.Error("build embedded add-on reconciler", "err", err)
-	} else if err := ar.Converge(ctx); err != nil {
-		logger.Error("converge embedded add-on manifests", "err", err)
-	}
-
-	// 3c''. The HelmChart controller (the k3s helm-controller analog). Launched
-	// before 3c' so the helm.k3sm.io CRDs are being established by the time the
-	// manifest directory's first sweep can carry a HelmChart; a chart that sweep
-	// cannot map yet is retried on the next one. Same lifetime as 3c': its own
-	// goroutine, every failure logged and contained there (a missing helm, a CRD
-	// the apiserver will not take), and drained before the control plane stops
-	// (this defer runs before exec.Stop's, LIFO). Leader-elected on a Lease, so
-	// only one server of an HA pair reconciles.
-	hcCtx, hcCancel := context.WithCancel(ctx)
-	hcDone := make(chan struct{})
-	go func() {
-		defer close(hcDone)
-		runHelmController(hcCtx, restCfg, cs, opts.workDir, opts.nodeName, logger)
-	}()
-	defer func() {
-		hcCancel()
-		<-hcDone
-	}()
-
-	// 3c'. The operator's auto-deploy manifest directory (install.ManifestDir,
-	// the k3s server/manifests analog). Unlike 3c it reads from disk, so it is
-	// safe only because of three things pkg/addons documents: the directory and
-	// every file in it must be root-owned and not group/other-writable (the
-	// service user, and so every pod, cannot write it); the applies run as the
-	// bounded k3sm-manifests ServiceAccount, never this system:masters client,
-	// which is used only to provision that identity and mint its token; and RBAC
-	// and admission objects are refused outright. Apply-only: nothing is ever
-	// deleted. It runs in its own goroutine, so a slow identity provisioning or
-	// a bad manifest never delays bring-up, logs every failure itself, and is
-	// drained before the control plane stops (this defer runs before exec.Stop's,
-	// LIFO). A missing directory is the normal case and applies nothing.
-	mdCtx, mdCancel := context.WithCancel(ctx)
-	mdDone := make(chan struct{})
-	go func() {
-		defer close(mdDone)
-		runManifestDir(mdCtx, restCfg, cs, logger)
-	}()
-	defer func() {
-		mdCancel()
-		<-mdDone
-	}()
-
-	// Whether this node can host vm guests, asked HERE — before the
-	// registry and the datapath are constructed and long before the VK node exists
-	// — through runtimed's own safe host probe rather than through the node's
-	// advertised capability, which is not answerable yet (see vmBackendAvailable).
-	// It has two consumers: the registry relay's vmnet-gateway bind (step 3d),
-	// which is the only address a Linux-guest Pod can reach a host listener at, and
-	// the NetworkPolicy table's fail-closed unknown-vm-source branch (step 4c),
-	// scoped to the segment macOS's vmnet is expected to hand guests. False leaves
-	// both byte-identical to a node that runs no guests.
+	// 3c''/3c'. Each stop drains before exec.Stop's defer (LIFO runs it first).
+	stopHelm := startHelmController(ctx, plan, restCfg, cs, logger)
+	defer stopHelm()
+	stopManifests := startManifestDir(ctx, restCfg, cs, logger)
+	defer stopManifests()
+	// Can this node host vm guests? Asked before the registry and datapath use it.
 	vmCapable := vmBackendAvailable()
-
-	// 3d. The node-local OCI ingest registry (--registry-port; 0 disables, which
-	// is the default). It runs HERE, after the apiserver is healthy, because
-	// bringing it up also publishes the KEP-1755 local-registry-hosting ConfigMap
-	// — discovery needs a cluster to publish into.
-	//
-	// It is torn down BEFORE the control plane: this defer is registered AFTER
-	// exec.Stop's, so LIFO runs it first. That ordering is not cosmetic — the
-	// registry child holds a port and an open blob store, and a control plane that
-	// went away underneath it would leave both to the process reaper.
-	//
-	// NEVER FATAL: startIngestRegistry logs and returns a no-op teardown if the
-	// registry cannot come up. See its doc for why that is the right posture here
-	// and the wrong one at step 3b.
-	//
-	// It also yields the PULLER WIRING — how runtimed should spell this node's own
-	// registry — which is handed to the node below so a reference naming the
-	// Service address is classified exactly as a loopback one is. The zero value
-	// (no registry) leaves runtimed's classification unchanged.
-	var registryPuller registryPullerWiring
-	if opts.registryPort != 0 {
-		svc, err := registrysvc.New(registryConfig(opts, cfg.PayloadBinDir, logger))
-		if err != nil {
-			logger.Error("ingest registry disabled", "err", err)
-		} else {
-			stopRegistry, puller := startIngestRegistry(ctx, ingestRegistry{
-				svc:      svc,
-				port:     opts.registryPort,
-				nodeName: opts.nodeName,
-				// The mesh address is what peers are advertised at and what the
-				// relay binds; empty (single node) publishes no advertisement and
-				// leaves the registry loopback-only, which is the whole truth there.
-				meshIP: opts.meshIP,
-				// The vm NAT segment contributes the relay's gateway bind — the only
-				// address a Linux-guest Pod on this Mac can reach a host listener at
-				// (it cannot reach loopback). A node that cannot host guests names no
-				// segment and gets no such bind.
-				vmNetSubnet: guestNATSubnet(vmCapable),
-				hostingCMs:  cs.CoreV1().ConfigMaps(registrysvc.HostingNamespace),
-				advertCMs:   cs.CoreV1().ConfigMaps(registrysvc.AdvertisementNamespace),
-				// The per-node registry Service + its hand-written EndpointSlice,
-				// in the SAME namespace as the advertisement: one cluster address
-				// a native Pod, a vm guest and the host all reach this node's
-				// registry at. Written with the retained admin client, exactly as
-				// the advertisement is — the node identities that READ them
-				// already hold cluster-wide services/endpointslices through
-				// k3sm:node-datapath (pkg/rbac).
-				clusterSvcs:   cs.CoreV1().Services(registrysvc.AdvertisementNamespace),
-				clusterSlices: cs.DiscoveryV1().EndpointSlices(registrysvc.AdvertisementNamespace),
-				clusterDomain: opts.domain,
-				logger:        logger,
-			})
-			defer stopRegistry()
-			registryPuller = puller
-		}
-	}
-
-	// 4a. The MeshPeer CRD, on the MESH path only, BEFORE anything that can
-	// write a MeshPeer exists. Nothing used to apply it: the manifest shipped in
-	// k3sm.io/apis and every worker join 500'd at the enroller's write until a human
-	// installed the CRD by hand.
-	//
-	// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
-	// the join listener startBootstrapServer opens, because the first worker to reach
-	// that listener writes a MeshPeer — a CRD ensured afterwards would still lose
-	// whichever join won the race. It also precedes this server's OWN
-	// enroll, which is the very first MeshPeer written on a fresh cluster.
-	//
-	// FAIL-CLOSED, like the RBAC graph at step 3b and unlike the log-and-continue
-	// admission policies at step 3: a missing MeshPeer CRD is not a missing advisory,
-	// it is a control plane that accepts worker joins and then fails every one of
-	// them. Halting with the reason beats serving a supervisor that cannot enroll.
-	//
-	// Single-node (--mesh-ip empty) provisions NOTHING — no MeshPeer is ever written
-	// there — and ensureMeshPeerCRD returns before it builds any client, so this call
-	// adds no failure mode to the single-node bring-up path.
-	if err := ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
+	// 3d. The ingest registry; torn down BEFORE the control plane (LIFO).
+	stopRegistry, registryPuller := startServerRegistry(ctx, plan, cs, vmCapable, logger)
+	defer stopRegistry()
+	// 4a. The MeshPeer CRD, FAIL-CLOSED, before anything that can write a MeshPeer.
+	if err = ensureMeshPeerCRD(ctx, opts.meshIP, func() (crdensure.CRDClient, error) {
 		return apiextensionsclient.NewForConfig(restCfg)
 	}, logger); err != nil {
 		return err
 	}
-
-	// 4b. THIS SERVER JOINS ITS OWN MESH.
-	//
-	// The enroller is constructed here, not at the supervisor (step 4d), because both
-	// callers must share ONE instance: its mutex is what serializes this node's
-	// index-0 claim against a worker join, and two instances would contend on
-	// nothing. Its construction stays FAIL-CLOSED — a supervisor that cannot enroll
-	// is a control plane that rejects every join.
-	//
-	// The self-enroll itself is LOG-AND-CONTINUE, following the precedent
-	// provisionClusterPolicies sets and the repo's one rule for a fault on this
-	// process: UNSURVIVABLE faults exit (a dead control-plane child does, and the
-	// crash-loop breaker bounds the respawns); SURVIVABLE ones continue. A mesh-only
-	// defect is survivable — the control plane serves without it — so it must never
-	// take the process down. What is lost on failure is named in the log line,
-	// because "the server is not on its own mesh" is otherwise only visible as
-	// cross-node traffic that silently goes nowhere.
-	//
-	// It completes BEFORE step 4c builds the proxy (mesh.Start plumbs the mesh-egress
-	// lo0 alias the proxy's source bind depends on) and BEFORE step 4d opens the join
-	// listener (EnrollSelf list-back verifies the index-0 claim, so no worker can be
-	// assigned index 0 in the window).
-	var enroller *meshEnroller
-	// The node-password store is built HERE, ahead of this node's own enroll, and
-	// the SAME instance is handed to the join supervisor at step 4d. One instance
-	// is the point: the binding this server takes for its OWN name has to live in
-	// the store the join handler checks.
-	//
-	// It is datastore-backed on EVERY server (a kube-system Secret per node), so a
-	// binding survives a restart: an in-memory store forgot every binding when the
-	// process stopped, leaving each worker's name claimable by any join-token
-	// holder until that worker rejoined. In HA the same Secrets are what make a
-	// name bound on one server enforced on its siblings. It is built after the
-	// apiserver is healthy (step 2's client) and before the join listener (step
-	// 4d). There is NO backfill: workers bound before an upgrade to this store, or
-	// before a datastore wipe, stay unbound until their next join.
-	nodePasswords := serverNodePasswordStore(cs, logger)
-	ha := opts.etcdPosture()
-	// serverPodCIDR is the control-plane node's pod /24: the reserved index-0 carve
-	// of the cluster pod CIDR — the ONE value the routing-table locality (step 4c)
-	// and the node's podnet adapter (step 5) both allocate against.
-	serverPodCIDR := defaultNodePodCIDR()
-	// The mesh-egress source the proxy binds for cross-node backend dials, and the
-	// peer mesh-egress /32s the NetworkPolicy table always-allows. Empty until this
-	// node is on its own mesh — an empty MeshEgressIP is the honest "no mesh here".
-	var serverMeshEgressIP string
-	var peerMeshEgress []string
-	if opts.meshIP != "" && hierarchy != nil {
-		e, err := newMeshEnroller(restCfg, logger)
-		if err != nil {
-			return fmt.Errorf("build mesh enroller: %w", err)
-		}
-		enroller = e
-		if res, down, err := enrollSelfAndBringUpMesh(ctx, enroller, nodePasswords, opts, mode, exec.Kubeconfig(), logger); err != nil {
-			msg, attrs := serverMeshBringUpFailure(opts, err)
-			logger.Error(msg, attrs...)
-			// A bring-up that failed part-way still owns a utun, so the handle is
-			// armed even here; it is a no-op when nothing came up.
-			meshDown = down
-		} else {
-			// Arms the teardown deferred above, which runs SYNCHRONOUSLY on the way
-			// out and after the control plane has stopped. The mesh watcher's own
-			// Close is only a fallback — it runs after ctx is cancelled and races
-			// process death, which on SIGTERM leaves the per-peer routes installed.
-			meshDown = down
-			serverPodCIDR = res.PodCIDR
-			if mode.DataPath() {
-				serverMeshEgressIP = res.MeshIP
-				// A boot-time SNAPSHOT. A peer that enrolls after this
-				// point reconverges in wireguard via the MeshPeer watch but is
-				// not in this table until the next restart; the posture is
-				// fail-open widen-only ("never a wrong deny"), so the gap
-				// degrades attribution, not connectivity.
-				peerMeshEgress = peerMeshEgressIPs(res.Peers)
-			}
-		}
+	// 4b. This server joins its own mesh through the ONE shared enroller.
+	sm, err := enrollServerMesh(ctx, plan, restCfg, cs, exec.Kubeconfig(), meshDown, logger)
+	meshDown = sm.down
+	if err != nil {
+		return err
 	}
+	// 4c. The node-local datapath (Service proxy + per-node DNS resolver).
+	net, nodeAddressing := startServerDatapath(ctx, plan, cs, sm, vmCapable, logger)
+	// 4d. The worker-join supervisor; its stop closes the HA etcd admin client.
+	closeEtcdAdmin := startJoinSupervisor(ctx, plan, cs, sm, logger)
+	defer closeEtcdAdmin()
+	// 4e/4f. Each stop drains before exec.Stop's defer (LIFO runs it first).
+	stopProvisioner := startProvisioner(ctx, plan, cs, logger)
+	defer stopProvisioner()
+	mlxGPU, stopMLX := startMLXOperator(ctx, plan, restCfg, cs, logger)
+	defer stopMLX()
+	nodeOpts, err := serverNodeOptions(plan, restCfg, nodeAddressing,
+		serverNodeWiring{net: net, mlxGPU: mlxGPU, cpStop: cpStop, registryPuller: registryPuller}, logger)
+	if err != nil {
+		return err
+	}
+	// 4g/4h. Ingress hosting + svclb (startServerLBHosting).
+	startServerLBHosting(ctx, plan, cs, nodeOpts, logger)
 
-	// 4c. Host the node-local datapath: darwin-net's Service proxy
-	// (exempted from the DNS VIP, which the per-node resolver below owns) + the
-	// per-node cluster DNS resolver bound to the DNS VIP + the pod DNSConfig the
-	// shim consumes. The NetdSocket routes the proxy/resolver privileged lo0/port
-	// ops through the root helper when unprivileged (empty in root mode → direct
-	// ops); Disabled (--network none) runs no datapath.
-	//
-	// MeshEgressIP and PeerMeshEgressIPs are seeded from step 4b's enroll. The
-	// dialer's source bind is DESTINATION-SCOPED (darwin-net binds it only for a
-	// destination inside the cluster pod CIDR and outside this node's own /24), so
-	// wiring a real mesh-egress source here does not disturb loopback, ClusterIP or
-	// node-LAN dials — an unscoped source bind is what made this wiring unsafe
-	// before.
+	// 5. The Virtual Kubelet node (reuse runNode's bring-up), after the admin
+	// client clears a stale role label the node cannot (repairServerNodeLabels).
+	if err = repairServerNodeLabels(ctx, cs, opts.nodeName, logger); err != nil {
+		return err
+	}
+	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
+	// The deferred crash check above names the component on this path too.
+	return startNode(ctx, nodeOpts)
+}
+
+// startServerDatapath is step 4c: it hosts the node-local datapath — darwin-net's
+// Service proxy (exempted from the DNS VIP, which the per-node resolver below
+// owns) + the per-node cluster DNS resolver bound to the DNS VIP + the pod
+// DNSConfig the shim consumes. The NetdSocket routes the proxy/resolver privileged
+// lo0/port ops through the root helper when unprivileged (empty in root mode →
+// direct ops); Disabled (--network none) runs no datapath. It returns the Server
+// and the addressing half of the in-process node's options.
+//
+// MeshEgressIP and PeerMeshEgressIPs are seeded from step 4b's enroll. The
+// dialer's source bind is DESTINATION-SCOPED (darwin-net binds it only for a
+// destination inside the cluster pod CIDR and outside this node's own /24), so
+// wiring a real mesh-egress source here does not disturb loopback, ClusterIP or
+// node-LAN dials — an unscoped source bind is what made this wiring unsafe
+// before.
+func startServerDatapath(ctx context.Context, plan serverPlan, cs kubernetes.Interface, sm serverMesh, vmCapable bool, logger *slog.Logger) (*netserve.Server, nodeOptions) {
+	opts, mode := plan.opts, plan.mode
 	// The kubernetes-VIP backend: ONLY the loopback-advertise posture (single
 	// node) pins the static proxy backend at the apiserver's real loopback listen
 	// address — upstream validation rejects loopback endpoint addresses, so no
@@ -1050,7 +542,7 @@ func runServer(args []string) (err error) {
 	// transportOverrides) and the MLX runtime hook, both constructed at or after
 	// this point. So the addressing half is built once here and nodeOpts
 	// copies it, rather than a second literal restating the same fields.
-	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: serverPodCIDR, netMode: mode}
+	nodeAddressing := nodeOptions{nodeIP: opts.nodeIP, podCIDR: sm.podCIDR, netMode: mode}
 	net := netserve.New(netserve.Config{
 		Client:            cs,
 		WorkDir:           opts.workDir,
@@ -1059,12 +551,12 @@ func runServer(args []string) (err error) {
 		APIServerEndpoint: apiServerEndpoint,
 		NodeIP:            opts.nodeIP,
 		// The address the in-process node and the ingress host advertise. It is
-		// derived from nodeAddressing, which nodeOpts below copies its three
+		// derived from nodeAddressing, which nodeOpts copies its three
 		// addressing fields from, so both read one value.
 		NodeAddress:       advertisedNodeIP(nodeAddressing),
-		PodCIDR:           serverPodCIDR,
-		MeshEgressIP:      serverMeshEgressIP,
-		PeerMeshEgressIPs: peerMeshEgress,
+		PodCIDR:           sm.podCIDR,
+		MeshEgressIP:      sm.egressIP,
+		PeerMeshEgressIPs: sm.peerEgress,
 		VMBackend:         vmCapable,
 		VMNetSubnet:       netserve.DefaultVMNetSubnet,
 		// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
@@ -1081,132 +573,31 @@ func runServer(args []string) (err error) {
 			logger.Error("darwin-net services", "err", err)
 		}
 	}()
+	return net, nodeAddressing
+}
 
-	// 4d. The worker-join supervisor (mesh-bound; mints node certs + enrolls
-	// peers), plus the CA-bundle endpoint in the HA posture. Only when multi-node is
-	// enabled; the live two-Mac join is the K3SM_LAB gate (step 4a has already ensured
-	// the MeshPeer CRD the enroller's write lands in, and step 4b has already claimed
-	// index 0 through this same enroller).
-	if enroller != nil {
-		tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
-		deps := bootstrapServerDeps{
-			hierarchy: hierarchy,
-			meshIP:    opts.meshIP,
-			// THIS process's own node name, which the join handler refuses to serve
-			// any request for. It is opts.nodeName and never a cluster-wide value:
-			// in HA every server protects its own name here, and its siblings'
-			// names are protected by their own processes plus the shared
-			// node-password bindings step 4b takes.
-			selfNodeName: opts.nodeName,
-			tokens:       tokens,
-			// The store step 4b already bound this node's own name in.
-			nodePasswords: nodePasswords,
-			enroller:      enroller,
-			apiServers:    []string{fmt.Sprintf("%s:%d", opts.meshIP, opts.apiPort)},
-		}
-		// Serve the AES-256-GCM CA bundle authorized by the
-		// SERVER-class token ONLY (never a worker), sealing the live hierarchy; publish
-		// the sealed envelope to the shared datastore (the k3s bootstrap-key model).
-		if ha {
-			bundle := &liveBundleSource{hierarchy: hierarchy, secret: serverSecret}
-			deps.bundle = bundle
-			deps.serverAuth = bootstrap.NewStaticServerSecret(serverSecret)
-			if sealed, err := bundle.SealedBundle(ctx); err != nil {
-				logger.Error("seal bootstrap bundle for datastore", "err", err)
-			} else if err := publishBootstrapBundle(ctx, cs, sealed); err != nil {
-				logger.Warn("publish bootstrap bundle to datastore", "err", err)
-			}
-			// The etcd member routes: a joining server is added as a learner and
-			// later promoted by THIS server, against its own member over loopback
-			// with its etcd client identity. Not served if the client cannot be
-			// built — a server that cannot admit members still serves everything
-			// else, and a joiner retries.
-			if admin, err := executor.NewLocalEtcdAdmin(ctx, opts.workDir, opts.kinePort); err != nil {
-				logger.Error("etcd member routes disabled: cannot reach the local etcd member", "err", err)
-			} else {
-				defer func() { _ = admin.Close() }()
-				deps.members = localMemberJoiner{admin: admin}
-			}
-		}
-		go func() {
-			if err := startBootstrapServer(ctx, deps, logger); err != nil && ctx.Err() == nil {
-				logger.Error("worker-join supervisor", "err", err)
-			}
-		}()
-	}
+// serverNodeWiring is what the in-process node's options take from the phases
+// before them: the datapath Server (step 4c), the MLX GPU source (step 4f), the
+// control-plane stopper, and the ingest registry's puller wiring (step 3d).
+type serverNodeWiring struct {
+	net            *netserve.Server
+	mlxGPU         *operator.RuntimeGPU
+	cpStop         *controlPlaneStopper
+	registryPuller registryPullerWiring
+}
 
-	// 4e. The APFS local-path provisioner: a pure API-object controller that
-	// registers the local-path StorageClass and creates a Retain, node-affinity-pinned
-	// PV for each PVC the scheduler has placed. It does NO filesystem I/O — runtimed
-	// empty-creates the per-(namespace, claim) dir on the consuming node. The class
-	// BasePath is the RESOLVED runtime root (opts.podRoot — the same root runtimed
-	// derives per-PVC dirs against), NOT the root-only storagev1.DefaultBasePath.
-	// Started now (the apiserver is healthy) and drained BEFORE exec.Stop tears the
-	// control plane down: the drain defer below is registered AFTER exec.Stop's defer,
-	// so LIFO runs it FIRST — the provisioner never writes a PV against a draining
-	// apiserver. provCtx lets the drain cancel it even if startNode returns an error
-	// (ctx not yet cancelled), avoiding a shutdown hang.
-	prov := provisioner.New(cs, provisioner.ClassForRoot(opts.podRoot), logger)
-	provCtx, provCancel := context.WithCancel(ctx)
-	provDone := make(chan struct{})
-	go func() {
-		defer close(provDone)
-		if err := prov.Run(provCtx); err != nil && provCtx.Err() == nil {
-			logger.Error("local-path provisioner", "err", err)
-		}
-	}()
-	defer func() {
-		provCancel()
-		<-provDone
-	}()
-
-	// 4f. The MLX operator: ensures the MLXModel CRD, then reconciles
-	// each MLXModel into a StatefulSet plus its headless and ClusterIP Services.
-	// Same lifetime and the same reasoning as the provisioner above — started now
-	// that the apiserver is healthy, and drained BEFORE exec.Stop tears the control
-	// plane down by a defer registered after it, so LIFO runs this one first.
-	//
-	// The GPU source is LIVE on this path. The pre-render fit check reads
-	// the node-local runtime's GPU facts, and this process is about to bring up
-	// that node in-process — so the source is created here, wired into the
-	// operator now, and ATTACHED to the node's runtime at step 5 bring-up
-	// (nodeOptions.attachRuntimeInfo below). It is the same GetRuntimeInfo the
-	// node's capability probe reads, off the same runtime; no second connection.
-	//
-	// Until that attach lands — and forever, on a posture with no runtimed at all
-	// (--runtime hostprocess) — the source reports unknown, which SKIPS the fit
-	// check with a logged warning exactly as a nil source did. A wiring fault
-	// degrades; it never refuses a model and never crashes the reconcile.
-	mlxGPU := operator.NewRuntimeGPU(logger)
-	if dynClient, err := dynamic.NewForConfig(restCfg); err != nil {
-		logger.Error("build dynamic client for the mlx operator", "err", err)
-	} else if crdClient, err := apiextensionsclient.NewForConfig(restCfg); err != nil {
-		logger.Error("build apiextensions client for the mlx operator", "err", err)
-	} else if mlxOp, err := operator.New(mlxOperatorConfig(cs, dynClient, crdClient, mlxGPU, opts.domain, logger)); err != nil {
-		logger.Error("build the mlx operator", "err", err)
-	} else {
-		mlxCtx, mlxCancel := context.WithCancel(ctx)
-		mlxDone := make(chan struct{})
-		go func() {
-			defer close(mlxDone)
-			if err := mlxOp.Run(mlxCtx); err != nil && mlxCtx.Err() == nil {
-				logger.Error("mlx operator", "err", err)
-			}
-		}()
-		defer func() {
-			mlxCancel()
-			<-mlxDone
-		}()
-	}
-
-	// The in-process node's options are built HERE, before the LB/ingress block,
-	// and the LB/ingress configuration is derived from this same value — so the
-	// address `kubectl get svc` shows as EXTERNAL-IP and the address the Node
-	// object advertises cannot diverge (they read one podCIDR, one nodeIP, one
-	// netMode through one shared derivation, advertisedNodeIP).
-	//
+// serverNodeOptions builds the in-process node's options, mints its client
+// identity, and sets its kubelet serving cert (step 4f-bis).
+//
+// The in-process node's options are built after step 4f and before the
+// LB/ingress block, and the LB/ingress configuration is derived from this same
+// value — so the address `kubectl get svc` shows as EXTERNAL-IP and the address
+// the Node object advertises cannot diverge (they read one podCIDR, one nodeIP,
+// one netMode through one shared derivation, advertisedNodeIP).
+func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nodeOptions, w serverNodeWiring, logger *slog.Logger) (nodeOptions, error) {
+	opts, mode := plan.opts, plan.mode
 	// The kubelet endpoint's client-identity anchor is read here, off the work dir's
-	// PKI: EnsureHierarchy has run (the mesh block above, or the executor's
+	// PKI: EnsureHierarchy has run (the mesh provisioning, or the executor's
 	// provisionComponentCerts during exec.Start), so the signing CA certificate
 	// exists in EVERY posture — single-node, `k3sm dev`, mesh and HA alike. It is
 	// the same CA the apiserver's --client-ca-file trusts and the issuer of the
@@ -1215,28 +606,28 @@ func runServer(args []string) (err error) {
 	// A read failure stops the server: :10250 is not served unauthenticated.
 	kubeletClientCA, err := os.ReadFile(certs.SigningCACertPath(opts.workDir))
 	if err != nil {
-		return fmt.Errorf("read the kubelet endpoint's client-identity CA: %w", err)
+		return nodeOptions{}, fmt.Errorf("read the kubelet endpoint's client-identity CA: %w", err)
 	}
 
 	// The in-process node's CLIENT identity: system:node:<name> in the system:nodes
 	// group, minted in memory from the same signing CA, exactly what a joined worker
-	// carries. The node no longer shares the admin kubeconfig the bring-up above
+	// carries. The node no longer shares the admin kubeconfig the bring-up
 	// runs on (that client keeps system:masters, and so does everything built on
-	// it). The hierarchy is loaded here rather than reusing `hierarchy`, which is
+	// it). The hierarchy is loaded here rather than reusing plan.hierarchy, which is
 	// set only on the mesh path; EnsureHierarchy LOADS the existing CAs in every
 	// posture, because the executor's provisioning step created them at exec.Start.
 	nodeHierarchy, err := certs.EnsureHierarchy(opts.workDir)
 	if err != nil {
-		return fmt.Errorf("load the CA hierarchy for the server node's client identity: %w", err)
+		return nodeOptions{}, fmt.Errorf("load the CA hierarchy for the server node's client identity: %w", err)
 	}
 	nodeRESTCfg, err := serverNodeRESTConfig(restCfg, nodeHierarchy, opts.nodeName)
 	if err != nil {
-		return err
+		return nodeOptions{}, err
 	}
 	if cn, notAfter, err := clientCertIdentity(nodeRESTCfg.CertData); err == nil {
 		logger.Info("minted the server node's client identity (in memory, never written to disk)", "cn", cn, "groups", nodesGroup, "not_after", notAfter.UTC().Format(time.RFC3339))
 	} else {
-		return fmt.Errorf("read back the server node's client identity: %w", err)
+		return nodeOptions{}, fmt.Errorf("read back the server node's client identity: %w", err)
 	}
 
 	nodeOpts := nodeOptions{
@@ -1251,7 +642,7 @@ func runServer(args []string) (err error) {
 		pathShim:   opts.pathShim,
 		dnsVIP:     opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
 		domain:     opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:    nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality above)
+		podCIDR:    nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality)
 		netMode:    nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
 		serveTLS:   true,                   // serve kubelet API over TLS so logs/exec work via the proxy
 
@@ -1261,27 +652,27 @@ func runServer(args []string) (err error) {
 		// runtime here, and the MLX operator's fit check starts reading live GPU
 		// facts off it. A hostprocess node never calls it, leaving the fit check
 		// skipped — the honest answer where there is no runtimed to ask.
-		attachRuntimeInfo: mlxGPU.Attach,
+		attachRuntimeInfo: w.mlxGPU.Attach,
 		// Start this server's control-plane stop the moment the node begins tearing
 		// down, so it drains while the node closes its embedded runtime rather than
-		// after it. The defer above is what waits for it.
-		onExitBegin: cpStop.begin,
-		// The Service proxy this same process just built (step 4) is where the
+		// after it. runServer's defer is what waits for it.
+		onExitBegin: w.cpStop.begin,
+		// The Service proxy this same process built (step 4c) is where the
 		// provider publishes a vm pod's live guest lease, so a Service backed by a
 		// guest is dialed at the address that carries bytes while everything else
 		// keys on the /32 the pod publishes. nil under --network none, where there
 		// is no proxy to feed.
-		transportOverrides: nodeTransportOverrides(net, mode),
+		transportOverrides: nodeTransportOverrides(w.net, mode),
 		// How runtimed spells this node's own ingest registry (step 3d): the
 		// loopback authority a bare "app:v1" resolves against first, and the
 		// non-loopback spellings of the same registry — a reference naming one of
 		// them is node-relative in exactly the sense a `localhost:<port>/…`
 		// reference is, so it gets the same plain-HTTP transport and the same
 		// peer-mirror brokering. Zero on a node with no registry.
-		localRegistryHost: registryPuller.LocalHost,
-		clusterRegistries: registryPuller.ClusterRegistries,
+		localRegistryHost: w.registryPuller.LocalHost,
+		clusterRegistries: w.registryPuller.ClusterRegistries,
 		// This server's own kine port — the SAME resolved value (flag or default)
-		// that reaches executor.Config.KinePort above — so every pod's SBPL denies
+		// that reaches executor.Config.KinePort — so every pod's SBPL denies
 		// connect() to the node's plaintext datastore listener. The deny is by
 		// port, not address (Seatbelt cannot filter by IP), so a Service that
 		// reuses this port number is also unreachable from confined pods.
@@ -1292,92 +683,16 @@ func runServer(args []string) (err error) {
 	//
 	// A worker receives one in its join response; this node never joins, so nothing
 	// hands it one and it self-signed — against its own apiserver, which the mesh
-	// block above started with --kubelet-certificate-authority=<cluster CA>. That is
+	// provisioning started with --kubelet-certificate-authority=<cluster CA>. That is
 	// the defect in its purest form: `kubectl logs` against the control-plane node
 	// failed with "x509: certificate signed by unknown authority" on the very machine
 	// holding the CA that could have signed it. It runs HERE because the SAN set is
-	// read off the finished nodeOpts (below), and it fails the whole bring-up on a
+	// read off the finished nodeOpts, and it fails the whole bring-up on a
 	// mint error rather than degrading to the self-signed cert that is the defect.
-	if err := setServerKubeletServing(&nodeOpts, hierarchy, opts.meshIP); err != nil {
-		return err
+	if err := setServerKubeletServing(&nodeOpts, plan.hierarchy, opts.meshIP); err != nil {
+		return nodeOptions{}, err
 	}
-
-	// 4g/4h. Ingress hosting + svclb, beside the netserve datapath
-	// (step 4c) and like it skipped under --network none (they splice/route to
-	// ClusterIP VIPs, which need the proxy's datapath).
-	//
-	// Both bind the WILDCARD and both advertise the node's DERIVED
-	// globally-unicast InternalIP — see lbHostingConfigs, which owns the
-	// whole decision. opts.nodeIP is READ, never written back: it feeds the
-	// apiserver's --advertise-address/--bind-address above.
-	//
-	// 4g: darwin-net's L7 ingress (RouteTable + SNI CertStore + class-filtered
-	// Watcher + Server) runs IN THIS PROCESS (SERVER-PROCESS-ONLY — multi-node
-	// ingress is a named follow-up), fed by the same in-process ADMIN client:
-	// referenced TLS Secrets are fetched by name under it, so key bytes only
-	// ever live in the control-plane process and no RBAC is widened.
-	// --ingress-http-port/--ingress-https-port select the explicit high-port
-	// integration mode (never a silent fallback).
-	//
-	// 4h: svclb (klipper-lite) binds *:port listeners for every LoadBalancer
-	// Service and splices them to the Service's ClusterIP VIP, advertising
-	// status.loadBalancer ONLY once a listener is actually bound.
-	//
-	// ORDER IS LOAD-BEARING: the ingress host is started BEFORE svclb, so the
-	// ingress listeners take 80/443 first if a user LoadBalancer Service also
-	// claims them (svclb additionally has an apiserver informer cache-sync to
-	// complete before its first bind). The reserved-port set deliberately does
-	// NOT include 80/443 — those are legitimate LoadBalancer ports — so the
-	// residual race is a documented ceiling, not a guarded invariant.
-	if mode.DataPath() {
-		lbCfg, ingressCfg, err := lbHostingConfigs(cs, nodeOpts, netdSocketFor(mode), opts.ingressHTTPPort, opts.ingressHTTPSPort, logger)
-		if err != nil {
-			logger.Error("ingress + svclb hosting disabled", "err", err)
-		} else {
-			// Ensure the advertised address answers on this host BEFORE anything
-			// advertises it (the wildcard listener cannot witness it).
-			ensureAdvertisedNodeAlias(ctx, nodeOpts, logger)
-			if ingressCfg.HTTPPort != 0 || ingressCfg.HTTPSPort != 0 {
-				ih, err := ingresshost.New(ingressCfg)
-				if err != nil {
-					logger.Error("ingress hosting disabled", "err", err)
-				} else {
-					go func() {
-						if err := ih.Run(ctx); err != nil && ctx.Err() == nil {
-							logger.Error("ingress hosting", "err", err)
-						}
-					}()
-				}
-			} else {
-				logger.Info("ingress hosting disabled (--ingress-http-port 0 --ingress-https-port 0)")
-			}
-			lb, err := svclb.New(lbCfg)
-			if err != nil {
-				logger.Error("svclb disabled", "err", err)
-			} else {
-				go func() {
-					if err := lb.Run(ctx); err != nil && ctx.Err() == nil {
-						logger.Error("svclb loadbalancer controller", "err", err)
-					}
-				}()
-			}
-		}
-	}
-
-	// 5. The Virtual Kubelet node (reuse runNode's bring-up).
-	//
-	// First, through the ADMIN client, clear the one piece of Node metadata an
-	// upgraded server's node can no longer manage itself: a kubernetes.io/role label
-	// recorded while the node ran as system:masters. Under its system:node identity
-	// NodeRestriction would refuse the status patch that removes it, every time.
-	if stripped, err := stripStaleNodeRoleLabel(ctx, cs.CoreV1().Nodes(), opts.nodeName); err != nil {
-		return err
-	} else if stripped {
-		logger.Info("removed a stale label this node can no longer remove itself under its node identity", "node", opts.nodeName, "label", staleNodeRoleLabel)
-	}
-	log.Printf("starting k3sm node %q (runtime=%s)", opts.nodeName, opts.rtName)
-	// The deferred crash check above names the component on this path too.
-	return startNode(ctx, nodeOpts)
+	return nodeOpts, nil
 }
 
 // crdClientFactory builds the apiextensions client a CRD ensure applies through.
@@ -1399,6 +714,23 @@ type crdClientFactory func() (crdensure.CRDClient, error)
 // pkg/crdensure — the same applier the MLX operator uses for MLXModel — so there is
 // no second apply path and no shadow copy of the schema. An error is returned, never
 // logged and swallowed: the caller fail-closes on it (see step 4a in runServer).
+//
+// Step 4a runs it on the MESH path only, BEFORE anything that can write a MeshPeer
+// exists. Nothing used to apply it: the manifest shipped in k3sm.io/apis and every
+// worker join 500'd at the enroller's write until a human installed the CRD by
+// hand.
+//
+// The ORDER is the point. It must precede newMeshEnroller (step 4b) and therefore
+// the join listener startBootstrapServer opens, because the first worker to reach
+// that listener writes a MeshPeer — a CRD ensured afterwards would still lose
+// whichever join won the race. It also precedes this server's OWN enroll, which is
+// the very first MeshPeer written on a fresh cluster.
+//
+// FAIL-CLOSED, like the RBAC graph at step 3b and unlike the log-and-continue
+// admission policies at step 3: a missing MeshPeer CRD is not a missing advisory,
+// it is a control plane that accepts worker joins and then fails every one of
+// them. Halting with the reason beats serving a supervisor that cannot enroll.
+// Single-node provisions NOTHING, so the call adds no failure mode there.
 func ensureMeshPeerCRD(ctx context.Context, meshIP string, newClient crdClientFactory, logger *slog.Logger) error {
 	if meshIP == "" {
 		return nil

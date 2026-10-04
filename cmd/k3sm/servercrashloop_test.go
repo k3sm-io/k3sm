@@ -141,9 +141,10 @@ func TestClearCrashLoopFlagIsRegistered(t *testing.T) {
 // decision precedes the supervised executor's construction, and the crash
 // callback records before it cancels.
 func TestRunServerWiresTheCrashLoopBreaker(t *testing.T) {
-	fset, body := runServerBody(t)
+	tr := runServerTrace(t)
+	// Trace indices, offset by one so the zero value still means "not found".
 	var parkPos, newSupervisedPos, recordPos, cancelPos int
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		if _, isDefer := n.(*ast.DeferStmt); isDefer {
 			return false // `defer crashCancel()` is cleanup, not the crash path
 		}
@@ -154,26 +155,26 @@ func TestRunServerWiresTheCrashLoopBreaker(t *testing.T) {
 		switch fn := call.Fun.(type) {
 		case *ast.Ident:
 			if fn.Name == "parkUntilCleared" && parkPos == 0 {
-				parkPos = fset.Position(call.Pos()).Line
+				parkPos = tr.pos(call) + 1
 			}
 			if fn.Name == "crashCancel" && cancelPos == 0 {
-				cancelPos = fset.Position(call.Pos()).Line
+				cancelPos = tr.pos(call) + 1
 			}
 		case *ast.SelectorExpr:
 			if fn.Sel.Name == "NewSupervised" && newSupervisedPos == 0 {
-				newSupervisedPos = fset.Position(call.Pos()).Line
+				newSupervisedPos = tr.pos(call) + 1
 			}
 			if fn.Sel.Name == "record" && recordPos == 0 {
-				recordPos = fset.Position(call.Pos()).Line
+				recordPos = tr.pos(call) + 1
 			}
 		}
 		return true
 	})
 	if parkPos == 0 || newSupervisedPos == 0 || parkPos > newSupervisedPos {
-		t.Errorf("parkUntilCleared at line %d must precede executor.NewSupervised at line %d: a tripped breaker must never bring the control plane up", parkPos, newSupervisedPos)
+		t.Errorf("parkUntilCleared at trace index %d must precede executor.NewSupervised at trace index %d: a tripped breaker must never bring the control plane up", parkPos, newSupervisedPos)
 	}
 	if recordPos == 0 || cancelPos == 0 || recordPos > cancelPos {
-		t.Errorf("breaker.record at line %d must precede the first crashCancel at line %d: the crash is counted before the process starts dying", recordPos, cancelPos)
+		t.Errorf("breaker.record at trace index %d must precede the first crashCancel at trace index %d: the crash is counted before the process starts dying", recordPos, cancelPos)
 	}
 }
 
@@ -182,15 +183,15 @@ func TestRunServerWiresTheCrashLoopBreaker(t *testing.T) {
 // return under KeepAlive is an unbounded respawn loop — the opposite of what the
 // component-exit path does. There is one answer now: unsurvivable faults exit and
 // the breaker bounds the loop; survivable ones continue.
+//
+// It reads every non-test server*.go file: the log-and-continue sites live in
+// runServer's phase helpers.
 func TestRunServerHasOneAnswerOnFatalFaults(t *testing.T) {
-	src, err := os.ReadFile("server.go")
-	if err != nil {
-		t.Fatal(err)
+	src := serverSources(t)
+	if strings.Contains(src, "unbounded respawn") {
+		t.Error(`server*.go still claims a fatal return is an "unbounded respawn" loop; the crash-loop breaker bounds it — say "unsurvivable faults exit; survivable ones continue"`)
 	}
-	if strings.Contains(string(src), "unbounded respawn") {
-		t.Error(`server.go still claims a fatal return is an "unbounded respawn" loop; the crash-loop breaker bounds it — say "unsurvivable faults exit; survivable ones continue"`)
-	}
-	if n := strings.Count(string(src), "UNSURVIVABLE faults exit"); n < 2 {
-		t.Errorf("server.go states the one rule %d times, want it at both log-and-continue sites", n)
+	if n := strings.Count(src, "UNSURVIVABLE faults exit"); n < 2 {
+		t.Errorf("server*.go states the one rule %d times, want it at both log-and-continue sites", n)
 	}
 }
