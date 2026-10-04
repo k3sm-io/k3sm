@@ -35,6 +35,7 @@ import (
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/proxy"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // defaultPodCIDR is the node's pod CIDR used for backend locality classification
@@ -574,7 +575,10 @@ func (s *Server) bindDNSVIPOnce(ctx context.Context, ap netip.AddrPort) (net.Pac
 		_ = udp.Close()
 		return nil, nil, fmt.Errorf("bind 53/TCP: %w", err)
 	}
-	return udp, tcp, nil
+	// Pods reach the DNS VIP over lo0, so the TCP listener clamps each accepted
+	// connection's segment size (whichever binder opened it): a connection that
+	// re-routes onto the mesh must not carry lo0-sized segments.
+	return udp, tcpseg.WrapListener(tcp), nil
 }
 
 // PodDNSConfig returns the netv1.DNSConfig a pod in namespace should receive (the

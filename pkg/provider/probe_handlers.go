@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // The concrete probe checks behind the runtime-agnostic runner in probe.go:
@@ -197,9 +198,14 @@ func execCheck(rt runtimev1.RuntimeServer, podID, container string, cmd []string
 // newProbeTransport is the HTTP transport for httpGet probes. Probes target
 // pod-local addresses (the bound pod IP) that have no cluster PKI, so — like the
 // kubelet's probe client — server certificates are not verified and connections
-// are not pooled (each probe is a fresh, short-lived request).
+// are not pooled (each probe is a fresh, short-lived request). Its dialer clamps
+// the TCP segment size (tcpseg): a pod address is an lo0 alias, so an unclamped
+// connection would carry lo0-sized segments onto the mesh if the alias went away
+// mid-request. probeSeamsFor overrides DialContext per pod with the pod's own
+// dial, which is itself clamped (r.dial).
 func newProbeTransport() *http.Transport {
 	return &http.Transport{
+		DialContext:       (&tcpseg.Dialer{}).DialContext,
 		DisableKeepAlives: true,
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probe targets are pod-local, no PKI (kubelet parity)
 	}

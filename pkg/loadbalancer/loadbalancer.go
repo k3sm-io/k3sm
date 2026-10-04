@@ -31,6 +31,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // HealthCheck reports whether a control-plane server (host:port) is currently serving.
@@ -147,7 +149,9 @@ func (lb *LoadBalancer) Serve(ctx context.Context, listenAddr string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
-	return lb.serveListener(ctx, ln)
+	// listenAddr is the caller's choice, so it can be an address local pods
+	// reach over lo0: clamp each accepted connection's TCP segment size.
+	return lb.serveListener(ctx, tcpseg.WrapListener(ln))
 }
 
 // serveListener runs the accept + forward loop over ln (the seam the unit test drives
@@ -202,7 +206,9 @@ func (lb *LoadBalancer) forward(ctx context.Context, client net.Conn) {
 		lb.logger.Warn("no healthy apiserver to forward to")
 		return
 	}
-	d := net.Dialer{Timeout: 5 * time.Second}
+	// The upstream can be a mesh address: dial through the segment clamp so a
+	// connection that ever rode lo0 cannot carry lo0-sized segments onto it.
+	d := tcpseg.Dialer{Timeout: 5 * time.Second}
 	upstream, err := d.DialContext(ctx, "tcp", server)
 	if err != nil {
 		lb.logger.Warn("dial upstream apiserver", "server", server, "err", err)
@@ -248,7 +254,7 @@ func closeWrite(c net.Conn) {
 // connection to it succeeds within timeout.
 func DialHealthCheck(timeout time.Duration) HealthCheck {
 	return func(ctx context.Context, server string) bool {
-		d := net.Dialer{Timeout: timeout}
+		d := tcpseg.Dialer{Timeout: timeout}
 		conn, err := d.DialContext(ctx, "tcp", server)
 		if err != nil {
 			return false
