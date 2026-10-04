@@ -23,7 +23,6 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"log"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -196,7 +195,7 @@ func runAgent(args []string) error {
 		return err
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -534,7 +533,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	defer healthyReset.Stop()
 
 	// Register as a VK node off the system:node kubeconfig (NOT the admin token).
-	log.Printf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName)
+	logger.Info(fmt.Sprintf("starting k3sm node %q off its system:node credential (runtime=%s)", opts.nodeName, opts.rtName))
 	return startNode(ctx, agentNodeOptions(opts, res, kubeconfigPath, mode, datapath))
 }
 

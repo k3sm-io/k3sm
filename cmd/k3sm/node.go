@@ -22,7 +22,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"math"
 	"net"
@@ -1072,7 +1071,7 @@ func startNode(ctx context.Context, opts nodeOptions) error {
 	// the log GC: it acts on the provider's pod set, which is not the cluster's
 	// until the node is ready.
 	eviction.open()
-	log.Printf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir)
+	slog.Default().Info(fmt.Sprintf("k3sm node %q ready (runtime=%s listen=%s pod-root=%s pod-logs-dir=%s)", opts.nodeName, runtimeLabel, opts.listen, opts.podRoot, opts.logs.dir))
 
 	return awaitNodeExit(ctx, errc, stopRuntime)
 }

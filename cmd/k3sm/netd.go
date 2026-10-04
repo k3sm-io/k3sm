@@ -110,7 +110,7 @@ func runNetd(args []string) error {
 		return fmt.Errorf("k3sm netd must run as root (it owns lo0/utun/pf/privileged-port ops); it is launched by the io.k3sm.netd LaunchDaemon")
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

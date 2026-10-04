@@ -92,7 +92,7 @@ func runDatavolMount(args []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("k3sm datavol mount must run as root — use 'sudo k3sm datavol mount'")
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 
 	rec, err := dataroot.ReadRecord(dataroot.OSFS{}, *record)
 	if err != nil {
