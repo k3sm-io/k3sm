@@ -56,6 +56,7 @@ import (
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/defaults"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/nodecred"
@@ -84,11 +85,20 @@ const (
 	DatavolLabel = "io.k3sm.datavol"
 )
 
+// Leaf values shared with the runtime packages; their home is pkg/defaults.
+const (
+	// DefaultServiceUser is defaults.ServiceUser.
+	DefaultServiceUser = defaults.ServiceUser
+	// DefaultServiceCIDR is defaults.ServiceCIDR.
+	DefaultServiceCIDR = defaults.ServiceCIDR
+	// PathShimName is defaults.PathShimName.
+	PathShimName = defaults.PathShimName
+	// DNSShimName is defaults.DNSShimName.
+	DNSShimName = defaults.DNSShimName
+)
+
 // Default install locations.
 const (
-	// DefaultServiceUser is the unprivileged, no-login system user the control
-	// plane, node, runtimed, and Service proxy all run as.
-	DefaultServiceUser = "_k3sm"
 	// DefaultInstallDir is the root-owned (root:wheel 0755) directory the binary
 	// and supporting files are copied into.
 	DefaultInstallDir = "/Library/k3sm"
@@ -113,17 +123,6 @@ const (
 	// copy of a signed Mach-O out of its install tree is a signature/notarization
 	// hazard a symlink simply does not have.
 	DefaultLinkDir = "/usr/local/bin"
-	// PathShimName is the basename of the path-rebase DYLD shim (runtimed's
-	// shim/pathrebase_shim.c) installed beside the binary. runtimed resolves it
-	// next to the executable and injects it into a mounting pod so an absolute
-	// volume mount resolves under the pod data volume (no chroot).
-	PathShimName = "libk3sm_pathrebase_shim.dylib"
-	// DNSShimName is the basename of the getaddrinfo DNS shim (darwin-net's
-	// shim/getaddrinfo_shim.c) installed beside the binary. The provider resolves it
-	// next to the executable and injects it into each pod (DYLD_INSERT_LIBRARIES) so
-	// an in-pod cluster-name lookup goes to the per-node resolver on the DNS VIP;
-	// without it a pod uses the system resolver and cluster names are NXDOMAIN.
-	DNSShimName = "libk3sm_getaddrinfo_shim.dylib"
 	// DefaultLaunchDaemonDir is where the two .plist files are written.
 	DefaultLaunchDaemonDir = "/Library/LaunchDaemons"
 	// DefaultDataRoot is the data root (the _k3sm home): the control-plane
@@ -143,9 +142,6 @@ const (
 	DefaultNetdSocket = DefaultRunDir + "/netd.sock"
 	// DefaultAPIServerPort is the apiserver secure port (avoids Docker's :6443).
 	DefaultAPIServerPort = 6444
-	// DefaultServiceCIDR is the cluster Service CIDR the netd daemon pins so the
-	// proxy's ClusterIP VIP aliases are admitted.
-	DefaultServiceCIDR = "10.43.0.0/16"
 	// MeshKeyDir is the directory the netd MeshKeyResolver reads the node's
 	// wireguard private key from, and where netd persists the node identity
 	// (netdsvc.NodeIdentityPath). It sits DIRECTLY under the root-owned data

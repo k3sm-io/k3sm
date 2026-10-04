@@ -28,7 +28,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // The two pod-support DYLD shims `k3sm dev` must stage. Both are resolved by
@@ -48,11 +48,11 @@ import (
 //     disk under the pod data volume, the pod just cannot see them at the absolute
 //     path without the rebase.
 //
-// Both names are single-sourced from pkg/install so `k3sm dev` and the installed
+// Both names are single-sourced from pkg/defaults so `k3sm dev` and the installed
 // layout name the SAME artifacts.
 const (
-	dnsShimName  = install.DNSShimName
-	pathShimName = install.PathShimName
+	dnsShimName  = defaults.DNSShimName
+	pathShimName = defaults.PathShimName
 )
 
 // DefaultPodShimDir is where a ROOT (euid 0) `k3sm dev` instance stages the two
