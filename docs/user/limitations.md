@@ -156,14 +156,16 @@ into or out of a mounted path works, and so does any binary from your image that
 
 The shim rebases opens (including C stdio `fopen`), file status, directory listings, `cd` and exec,
 and the directory and metadata calls: `mkdir`, `rmdir`, `rm` of a file, `mv`, `chmod`, `ln` and
-`ln -s`, `readlink`, `touch`, and `cp` including the APFS clone path. These work on an absolute
-mount path from the shadow set.
+`ln -s`, `readlink`, `touch`, and `cp` including the APFS clone path. Recursive walks work too,
+because the walker's own opens are rebased: `rm -r`, `ls` and `ls -R` of a mounted directory,
+`chmod -R`, `find` and `cp -R`. These work on an absolute mount path from the shadow set.
 
 What still does not work, with the workaround:
 
-- Recursive walks (`rm -r`, `ls` of a mounted directory, `chmod -R`, `find`). libc's directory walker
-  opens through an internal entry point the shim does not see. `cd` into the mount and use relative
-  paths, or operate on files by name.
+- `chown -R` and `chgrp -R` on a mounted tree. Each entry is changed through a call the shim does not
+  rebase, so use relative paths from inside the mount.
+- A platform utility outside the shadow set, such as `du`. It loses the shim when it starts, so give
+  it a relative path from inside the mount.
 - `mkdir -p` of a path whose parent directories above the mount point do not exist on the host. The
   mount point itself always exists, so create directories under it.
 - `readlink -f` and `realpath`.
