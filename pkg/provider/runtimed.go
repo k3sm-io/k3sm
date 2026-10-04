@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"net"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -42,6 +41,7 @@ import (
 	"k3sm.io/darwin-net/pkg/dns"
 	"k3sm.io/darwin-net/pkg/netd"
 	"k3sm.io/darwin-net/pkg/podnet"
+	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/mlx"
 	"k3sm.io/k3sm/pkg/provider/podlogs"
 	"k3sm.io/k3sm/pkg/provider/vkadapter"
@@ -756,7 +756,7 @@ func newRuntimedWith(rt runtimev1.RuntimeServer, cfg RuntimedConfig, resolver mo
 		recorder:       recorder,
 		refresher:      refresherOf(rt),
 		clk:            clock.RealClock{},
-		dial:           (&net.Dialer{}).DialContext,
+		dial:           (&tcpseg.Dialer{}).DialContext,
 		probeTransport: newProbeTransport(),
 		track:          map[string]*podTrack{},
 		probers:        map[string]*podProber{},

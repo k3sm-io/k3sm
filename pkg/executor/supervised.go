@@ -33,6 +33,7 @@ import (
 	"syscall"
 	"time"
 
+	"k3sm.io/darwin-net/pkg/tcpseg"
 	"k3sm.io/k3sm/pkg/certs"
 	"k3sm.io/k3sm/pkg/helmchart"
 	"k3sm.io/k3sm/pkg/ports"
@@ -260,10 +261,15 @@ func NewSupervised(cfg Config) *Supervised {
 		cfg:   cfg,
 		token: cfg.Token,
 		// The apiserver self-signs its serving cert single-node; skip verification on the
-		// loopback healthz probe (the kubeconfig does the same).
+		// healthz probe (the kubeconfig does the same). The probe dials the apiserver's
+		// bind host, which is the node or mesh address on a multi-node server, so its
+		// dialer clamps the TCP segment size like every other node-address connection.
 		client: &http.Client{
-			Timeout:   3 * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+			Timeout: 3 * time.Second,
+			Transport: &http.Transport{
+				DialContext:     (&tcpseg.Dialer{}).DialContext,
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
 		},
 	}
 }

@@ -20,4 +20,7 @@ limitations under the License.
 //
 // TestNoUntaggedRealSocketTests keeps real sockets out of the unit tier; its
 // allowlist is testdata/realsocket.allow.
+//
+// TestPodNetworkDialsGoThroughTheSegmentClamp keeps the process's TCP dials and
+// listeners behind the segment clamp; its allowlist is testdata/segclamp.allow.
 package testgate

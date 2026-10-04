@@ -24,6 +24,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"k3sm.io/darwin-net/pkg/tcpseg"
 )
 
 // ProbeOpenAISurface derives one replica's ProbeVerdict by probing its
@@ -100,9 +102,12 @@ func ProbeOpenAISurface(ctx context.Context, rt http.RoundTripper, baseURL, mode
 // reuses — server certificates are not verified and connections are not
 // pooled: each probe call is a fresh, short-lived request, never one held open
 // across a reconcile loop's iterations against a replica that may have
-// restarted with a new pod IP.
+// restarted with a new pod IP. Its dialer clamps the TCP segment size
+// (tcpseg), because a pod address is an lo0 alias whose connection must not
+// carry lo0-sized segments onto the mesh.
 func NewProbeTransport() *http.Transport {
 	return &http.Transport{
+		DialContext:       (&tcpseg.Dialer{}).DialContext,
 		DisableKeepAlives: true,
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probe targets are pod-local, no PKI (kubelet parity)
 	}
