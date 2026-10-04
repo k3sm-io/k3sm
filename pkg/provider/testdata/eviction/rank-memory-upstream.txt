@@ -1,0 +1,59 @@
+# Memory-pressure ranking cases copied from upstream Kubernetes.
+#
+#   source:  k8s.io/kubernetes v1.36.2
+#   path:    pkg/kubelet/eviction/helpers_test.go
+#   tests:   TestOrderedByExceedsRequestMemory, TestOrderedByPriority,
+#            TestOrderedByMemory, TestOrderedByPriorityMemory
+#   consts:  lowPriority = -1, defaultPriority = 0, highPriority = 1
+#            (pkg/kubelet/eviction/eviction_manager_test.go)
+#
+# Each case is transcribed, not re-derived: the pods, their priorities, their
+# memory requests, their working sets (newPodMemoryStats), the input order and
+# the expected order are upstream's. CPU and limits are dropped because no memory
+# comparator reads them.
+#
+# Format:
+#   case <upstream test name> <comparator,...>   comparators: exceed, priority, memory
+#   pod <name> <priority> <memory request|-> <working set|nostats>
+#   input <names in upstream's input order>
+#   want <names in upstream's expected order>
+#   end
+
+case TestOrderedByExceedsRequestMemory exceed
+pod below-requests -1 200Mi 199Mi
+pod exceeds-requests 1 100Mi 101Mi
+input below-requests exceeds-requests
+want exceeds-requests below-requests
+end
+
+case TestOrderedByPriority priority
+pod low-priority -134 - nostats
+pod medium-priority 1 100Mi nostats
+pod high-priority 12534 200Mi nostats
+input high-priority medium-priority low-priority
+want low-priority medium-priority high-priority
+end
+
+case TestOrderedByMemory memory
+pod best-effort-high 0 - 500Mi
+pod best-effort-low 0 - 300Mi
+pod burstable-high 0 100Mi 800Mi
+pod burstable-low 0 100Mi 300Mi
+pod guaranteed-high 0 1Gi 800Mi
+pod guaranteed-low 0 1Gi 200Mi
+input best-effort-high best-effort-low burstable-high burstable-low guaranteed-high guaranteed-low
+want burstable-high best-effort-high best-effort-low burstable-low guaranteed-high guaranteed-low
+end
+
+case TestOrderedByPriorityMemory exceed,priority,memory
+pod above-requests-low-priority-high-usage -1 - 500Mi
+pod above-requests-low-priority-low-usage -1 - 50Mi
+pod above-requests-high-priority-high-usage 1 100Mi 600Mi
+pod above-requests-high-priority-low-usage 1 100Mi 150Mi
+pod below-requests-low-priority-high-usage -1 1Gi 800Mi
+pod below-requests-low-priority-low-usage -1 1Gi 200Mi
+pod below-requests-high-priority-high-usage 1 1Gi 800Mi
+pod below-requests-high-priority-low-usage 1 1Gi 200Mi
+input below-requests-high-priority-low-usage below-requests-high-priority-high-usage below-requests-low-priority-low-usage below-requests-low-priority-high-usage above-requests-high-priority-low-usage above-requests-high-priority-high-usage above-requests-low-priority-low-usage above-requests-low-priority-high-usage
+want above-requests-low-priority-high-usage above-requests-low-priority-low-usage above-requests-high-priority-high-usage above-requests-high-priority-low-usage below-requests-low-priority-high-usage below-requests-low-priority-low-usage below-requests-high-priority-high-usage below-requests-high-priority-low-usage
+end
