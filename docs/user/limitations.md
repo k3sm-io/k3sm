@@ -154,13 +154,22 @@ the common file utilities: `cat`, `cp`, `mv`, `ls`, `mkdir`, `rm`, `chmod`, `ln`
 keep the path-rebase and DNS shims, so a script's `cat /mnt/x` sees the mounted file, `kubectl cp`
 into or out of a mounted path works, and so does any binary from your image that the script execs.
 
-The shim rebases opens, file status, directory listings, `cd` and exec. It does **not** rebase
-`mkdir`, `rm`, `mv`, `chmod`, `ln` or timestamp changes given an absolute mount path. `cd` into the
-mount first and use relative paths, or use a relative path from the data volume as described below.
+The shim rebases opens (including C stdio `fopen`), file status, directory listings, `cd` and exec,
+and the directory and metadata calls: `mkdir`, `rmdir`, `rm` of a file, `mv`, `chmod`, `ln` and
+`ln -s`, `readlink`, `touch`, and `cp` including the APFS clone path. These work on an absolute
+mount path from the shadow set.
 
-A program that opens files through the C stdio library (`fopen`), such as `awk` or `sed` given a file
-name, does not see a mounted file at its absolute path. Feed it on standard input
-(`awk '...' < /mnt/x`) or use a relative path.
+What still does not work, with the workaround:
+
+- Recursive walks (`rm -r`, `ls` of a mounted directory, `chmod -R`, `find`). libc's directory walker
+  opens through an internal entry point the shim does not see. `cd` into the mount and use relative
+  paths, or operate on files by name.
+- `mkdir -p` of a path whose parent directories above the mount point do not exist on the host. The
+  mount point itself always exists, so create directories under it.
+- `readlink -f` and `realpath`.
+- A symlink whose target is an absolute mount path. The kernel follows it on the host, so use
+  relative targets inside a mount.
+- A path that climbs above its mount with `..`. It is treated as a host path.
 
 The shadow set is a compatibility aid and adds no isolation. Pods on one node stay one trust domain;
 untrusted tenants belong on the `vm` RuntimeClass.
