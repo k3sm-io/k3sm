@@ -51,3 +51,7 @@ cmd/k3sm/meshrefresh.go newWorkerEndpointRefresher net.Dialer{} # route probe to
 # Internet downloads, digest-verified, over the default route.
 pkg/executor/helm.go downloadHashed http.DefaultClient # helm release tarball download
 pkg/builder/buildxhost.go downloadTo http.DefaultClient # buildx release asset download
+
+# Embedded etcd: its client and metrics listeners are loopback-only by argv (etcdArgs), never a pod address.
+pkg/executor/etcdsupervise.go tcpDial net.Dialer{} # readiness probe of the etcd child's 127.0.0.1 client port
+pkg/status/etcd.go httpGetLoopback http.DefaultClient # etcd metrics/health read on 127.0.0.1
