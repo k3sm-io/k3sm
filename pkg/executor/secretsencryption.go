@@ -92,10 +92,10 @@ func EncryptionFingerprintPath(workDir string) string {
 var (
 	// ErrEncryptionAgent refuses the option on a worker install.
 	ErrEncryptionAgent = errors.New("secrets encryption is a control-plane option: a worker holds no datastore; install without --secrets-encryption")
-	// ErrEncryptionHA refuses the option alongside a server join or an external
-	// datastore. Every server of such a cluster would need the same key, and
-	// this release does not distribute one.
-	ErrEncryptionHA = errors.New("secrets encryption is not supported with a server join or an external datastore in this release: every server would need the same key, and k3sm does not distribute one; install without --secrets-encryption, or without the join/datastore endpoint")
+	// ErrEncryptionHA refuses the option on an HA control plane (an embedded etcd
+	// member, from --cluster-init or --server-join). Every server of such a
+	// cluster would need the same key, and this release does not distribute one.
+	ErrEncryptionHA = errors.New("secrets encryption is not supported on an HA control plane (--cluster-init or --server-join) in this release: every server would need the same key, and k3sm does not distribute one; install without --secrets-encryption, or as a single server")
 	// ErrEncryptionExistingDatastore refuses enabling over a datastore that
 	// already exists. Its Secrets are stored unencrypted, and moving them under
 	// a key is a migration this release does not perform.
@@ -240,7 +240,7 @@ type EncryptionStartInputs struct {
 	FingerprintPresent bool
 	// FingerprintMatches is meaningful only when both files are present.
 	FingerprintMatches bool
-	// HA is a server join or an external datastore endpoint.
+	// HA is the embedded etcd posture (--cluster-init or --server-join).
 	HA bool
 	// KeyFileMode is the key file's observed mode (from an lstat, so a
 	// symlink carries its type bit), KeyFileUID its owner, and ExpectedUID
@@ -279,11 +279,11 @@ type EncryptionInstallInputs struct {
 	Requested bool
 	// Agent is a worker install.
 	Agent bool
-	// HA is a carried server join or datastore endpoint.
+	// HA is a carried --cluster-init or --server-join.
 	HA bool
 	// DatastoreResidue is any state.db* entry (the database, its WAL and
 	// shared-memory files, the kine pin stamp, a backup) in the db directory,
-	// or a leftover external-datastore .pgpass in the work dir.
+	// or an etcd data directory in the work dir.
 	DatastoreResidue bool
 	// Existing is the pair already on disk, as the start verdict reads it.
 	Existing EncryptionStartInputs
@@ -437,13 +437,13 @@ func PlanEncryptionAtInstall(store EncryptionStore, workDir string, req Encrypti
 			break
 		}
 	}
-	// A leftover external-datastore credential is residue too: it is what
-	// requireLocalDatastore treats as decisive for "this node had a datastore".
-	switch _, err := store.ReadFile(pgPassPath(workDir)); {
+	// An etcd data directory is residue too: a node that once ran an etcd member
+	// had a datastore, whatever its db directory says.
+	switch _, err := store.ReadDir(EtcdDataDir(workDir)); {
 	case err == nil:
 		in.DatastoreResidue = true
 	case !errors.Is(err, fs.ErrNotExist):
-		return EncryptionLeave, fmt.Errorf("inspect %s: %w", pgPassPath(workDir), err)
+		return EncryptionLeave, fmt.Errorf("inspect %s: %w", EtcdDataDir(workDir), err)
 	}
 	existing, err := readEncryptionPair(store, workDir, false)
 	if err != nil {

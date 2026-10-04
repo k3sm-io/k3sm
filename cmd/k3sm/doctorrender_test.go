@@ -468,10 +468,10 @@ func TestDoctorRendersRemedies(t *testing.T) {
 const fakeBundleDir = "/fake/bundle/dir"
 
 // seededJoinToken and seededDSN are the two credential shapes a daemon log can
-// echo: the CA-pinned bootstrap token and a datastore DSN's password.
+// echo: the CA-pinned bootstrap token and a URL's embedded password.
 const (
 	seededJoinToken = "K10abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567::server:deadbeef"
-	seededDSN       = "postgres://kine:hunter2@db.example:5432/k3sm"
+	seededDSN       = "scheme://kine:hunter2@db.example:5432/k3sm"
 )
 
 // bundleEnv is a healthy Mac with the bundle seams faked: a status report and
@@ -482,7 +482,7 @@ func bundleEnv(files map[string]string) doctorEnv {
 	env.statusReport = func(context.Context) status.Report {
 		return status.Report{
 			Verdict: status.VerdictDegraded,
-			Summary: "server: started with --datastore-endpoint " + seededDSN,
+			Summary: "server: started with --example-endpoint " + seededDSN,
 			Rows: []status.Row{
 				{Name: "server", State: status.StateCrashLoop, Severity: status.SeverityFail,
 					Detail: "497 runs, last exit 1", Remedy: "sudo launchctl kickstart -k system/io.k3sm.server"},

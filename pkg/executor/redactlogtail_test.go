@@ -43,10 +43,10 @@ func TestRedactLogTailRemovesCredentialMaterial(t *testing.T) {
 			keeps:  "request failed",
 		},
 		{
-			name:   "postgres DSN password in the kine endpoint",
-			in:     `kine: --endpoint=postgres://k3sm:sup3r-s3cret@db.internal:5432/kine failed to connect`,
+			name:   "URL userinfo password",
+			in:     `dial https://k3sm:sup3r-s3cret@db.internal:5432/v3 failed to connect`,
 			leaked: "sup3r-s3cret",
-			keeps:  "db.internal:5432", // WHICH datastore is diagnostics
+			keeps:  "db.internal:5432", // WHICH host is diagnostics
 		},
 		{
 			name:   "token flag echoed on a fatal flag error",
@@ -80,7 +80,7 @@ func TestRedactLogTailRemovesCredentialMaterial(t *testing.T) {
 		},
 		{
 			name:   "password query parameter",
-			in:     `dial postgres://db.internal/kine?sslmode=require&password=hunter2 refused`,
+			in:     `dial https://db.internal/v3?mode=require&password=hunter2 refused`,
 			leaked: "hunter2",
 			keeps:  "refused",
 		},
@@ -160,7 +160,7 @@ func TestBringUpErrorsRedactTheLogTail(t *testing.T) {
 	lines := []struct{ text, secret string }{
 		{`flag provided but not defined: --token=abcdef0123456789`, "abcdef0123456789"},
 		{`apiserver: request rejected, Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9`, "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"},
-		{`kine: --endpoint=postgres://k3sm:sup3r-s3cret@db.internal:5432/kine failed to connect`, "sup3r-s3cret"},
+		{`dial https://k3sm:sup3r-s3cret@db.internal:5432/v3 failed to connect`, "sup3r-s3cret"},
 		{`could not verify k3sm-A1b2C3d4E5f6G7h8 against the cluster`, "k3sm-A1b2C3d4E5f6G7h8"},
 	}
 	// The line that must SURVIVE: an error whose redaction ate the diagnosis

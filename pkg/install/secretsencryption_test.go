@@ -69,8 +69,8 @@ func TestInstallSecretsEncryption(t *testing.T) {
 	}{
 		{name: "fresh install stages the pair"},
 		{name: "an existing datastore refuses", stateDB: true, wantErr: executor.ErrEncryptionExistingDatastore},
-		{name: "a carried datastore endpoint refuses", args: []string{"--datastore-endpoint", thePasswordlessDSN}, wantErr: executor.ErrEncryptionHA},
-		{name: "a carried server join refuses", args: []string{"--server-join", "--datastore-endpoint-file", "/x"}, wantErr: executor.ErrEncryptionHA},
+		{name: "a carried cluster init refuses", args: []string{"--cluster-init", "--node-ip", "192.0.2.10"}, wantErr: executor.ErrEncryptionHA},
+		{name: "a carried server join refuses", args: []string{"--server-join", "--node-ip", "192.0.2.11"}, wantErr: executor.ErrEncryptionHA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -82,9 +82,6 @@ func TestInstallSecretsEncryption(t *testing.T) {
 			wd := dc.serverWorkDir()
 			if tc.args != nil {
 				configureServerArgs(f, cfg, tc.args...)
-				if v := flagValue(tc.args, datastoreEndpointFileFlag); v != "" {
-					f.putFile(v, []byte(thePasswordlessDSN))
-				}
 			}
 			if tc.stateDB {
 				if err := os.MkdirAll(filepath.Join(wd, "db"), 0o700); err != nil {

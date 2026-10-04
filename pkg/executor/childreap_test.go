@@ -238,6 +238,10 @@ func testTimeout() time.Duration {
 	return d
 }
 
+// afterTestBinary is the teardown of fixtures shared by several tests (a staged
+// binary built once per test binary), run after every test and every child reap.
+var afterTestBinary []func()
+
 // TestMain installs the two out-of-band reaping paths, then reports any child that
 // outlived its test as a FAILURE of the run — a leaked datastore is a defect in the
 // fixture, not an acceptable residue, so it must not be able to hide behind a green
@@ -259,6 +263,9 @@ func TestMain(m *testing.M) {
 		code = 1
 	}
 	spawnedChildren.reapAll()
+	for _, f := range afterTestBinary {
+		f()
+	}
 	os.Exit(code)
 }
 

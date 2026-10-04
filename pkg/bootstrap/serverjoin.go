@@ -83,9 +83,9 @@ func FetchCABundle(ctx context.Context, serverURL, token string, client *http.Cl
 
 // ImportCABundle is the FAIL-CLOSED HA server-join import: fetch the sealed bundle,
 // decrypt + authenticate it with the server token's secret (the KDF passphrase), decode
-// the four CA PEMs, and write them into the work dir's PKI dir — so a subsequent
-// certs.EnsureHierarchy LOADS the IDENTICAL cluster + signing CAs instead of minting
-// fresh, divergent ones. EVERY failure (fetch, GCM tag/decrypt, decode, write) returns
+// the four CA keypairs (cluster, signing, etcd server, etcd peer), and write them into
+// the work dir's PKI dir — so a subsequent certs.EnsureHierarchy / certs.EnsureEtcdCAs
+// LOADS the IDENTICAL CAs instead of minting fresh, divergent ones. EVERY failure (fetch, GCM tag/decrypt, decode, write) returns
 // an error and leaves NO CA material written (the bytes are written only after a
 // successful unseal + decode). The caller MUST treat an error as fatal and NEVER fall
 // through to minting a self-signed divergent CA — that would split cluster trust.

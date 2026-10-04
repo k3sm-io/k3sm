@@ -1,0 +1,14 @@
+# HELP etcd_disk_wal_fsync_duration_seconds The latency distributions of fsync called by WAL.
+# TYPE etcd_disk_wal_fsync_duration_seconds histogram
+etcd_disk_wal_fsync_duration_seconds_bucket{le="0.001"} 500
+etcd_disk_wal_fsync_duration_seconds_bucket{le="0.002"} 800
+etcd_disk_wal_fsync_duration_seconds_bucket{le="0.004"} 950
+etcd_disk_wal_fsync_duration_seconds_bucket{le="0.008"} 1000
+etcd_disk_wal_fsync_duration_seconds_bucket{le="0.016"} 1000
+etcd_disk_wal_fsync_duration_seconds_bucket{le="+Inf"} 1000
+etcd_disk_wal_fsync_duration_seconds_sum 1.9
+etcd_disk_wal_fsync_duration_seconds_count 1000
+# HELP etcd_disk_backend_commit_duration_seconds The latency distributions of commit called by backend.
+# TYPE etcd_disk_backend_commit_duration_seconds histogram
+etcd_disk_backend_commit_duration_seconds_bucket{le="0.001"} 1
+etcd_disk_backend_commit_duration_seconds_bucket{le="+Inf"} 7

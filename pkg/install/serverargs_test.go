@@ -393,63 +393,48 @@ func TestBothSourcesUnreadableNamesBothFiles(t *testing.T) {
 }
 
 // TestServerArgsAreCarriedVerbatimAndPrintedRedacted is the credential gate on
-// the whole path. --datastore-endpoint carries a DSN password, so the VALUE has
-// to reach the daemon exactly as the operator wrote it while never appearing
-// intact in anything k3sm prints.
-//
-// Since B295 the value reaches the daemon through a staged file rather than
-// through the argv (see TestServerPlistCarriesNoDatastorePassword), so
-// "verbatim" is now a property of the staged file's contents and the carried
-// argument is the flag that names it. What did not change is the other half:
-// the DSN the install READ is still redacted in every line it prints, including
-// the one that says what was carried over.
+// the whole path. An operator argument can carry a URL with a password in it, so
+// the VALUE has to reach the daemon exactly as the operator wrote it while never
+// appearing intact in anything k3sm prints.
 func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 	const (
-		dsn    = "postgres://u:s3cret@h/db"
-		secret = "s3cret"
+		flagName = "--example-endpoint" // any operator argument: the carry-over does not interpret names
+		url      = "scheme://u:s3cret@h/db"
+		secret   = "s3cret"
 	)
 	var log bytes.Buffer
 	f := &fakeSystem{}
 	cfg := testConfig(t)
 	cfg.Logger = testLogger(&log)
 
-	// Install, configure the endpoint, reinstall: the second install is the one
-	// that carries the DSN and records it.
+	// Install, configure the argument, reinstall: the second install is the one
+	// that carries it and records it.
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("first Install: %v", err)
 	}
-	configureServerArgs(f, cfg, "--datastore-endpoint", dsn)
+	configureServerArgs(f, cfg, flagName, url)
 	if err := Install(context.Background(), f, cfg); err != nil {
 		t.Fatalf("reinstall: %v", err)
 	}
 
-	staged := stagedEndpointPath(cfg)
-
 	t.Run("verbatim where it has to work", func(t *testing.T) {
-		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint-file", staged}; !slices.Equal(got, want) {
+		if got, want := serverArgsOf(t, f, cfg), []string{flagName, url}; !slices.Equal(got, want) {
 			t.Errorf("rendered args = %v, want %v", got, want)
-		}
-		// The file is where "verbatim" now lives: a masked DSN would not connect.
-		if got := strings.TrimSpace(string(f.files[staged])); got != dsn {
-			t.Errorf("staged DSN = %q, want the operator's own %q", got, dsn)
 		}
 		rec, ok := f.serverArgs[cfg.withDefaults().ServerArgsRecord]
 		if !ok {
 			t.Fatal("no record was written")
 		}
-		if slices.Contains(rec.Args, dsn) || strings.Contains(strings.Join(rec.Args, " "), secret) {
-			t.Errorf("record args = %v, want no DSN in them at all", rec.Args)
-		}
-		if !slices.Contains(rec.Args, staged) {
-			t.Errorf("record args = %v, want the staged path %q", rec.Args, staged)
+		if !slices.Equal(rec.Args, []string{flagName, url}) {
+			t.Errorf("record args = %v, want the operator's own %v", rec.Args, []string{flagName, url})
 		}
 	})
 
 	t.Run("masked in every line the install printed", func(t *testing.T) {
 		if strings.Contains(log.String(), secret) {
-			t.Fatalf("the install log leaked the DSN password:\n%s", log.String())
+			t.Fatalf("the install log leaked the password:\n%s", log.String())
 		}
-		if !strings.Contains(log.String(), "postgres://u:***@h/db") {
+		if !strings.Contains(log.String(), "scheme://u:***@h/db") {
 			t.Errorf("the log must still say which endpoint was configured:\n%s", log.String())
 		}
 	})
@@ -463,23 +448,18 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 			t.Fatalf("install after uninstall: %v", err)
 		}
 		if strings.Contains(log.String(), secret) {
-			t.Fatalf("the carried-from-record log line leaked the DSN password:\n%s", log.String())
+			t.Fatalf("the carried-from-record log line leaked the password:\n%s", log.String())
 		}
-		// And it was really carried, from the record: the flag naming the staged
-		// file, whose contents the uninstall preserved with the rest of the data
-		// root because k3sm cannot re-derive an operator's DSN.
-		if got, want := serverArgsOf(t, f, cfg), []string{"--datastore-endpoint-file", staged}; !slices.Equal(got, want) {
+		// And it was really carried, from the record.
+		if got, want := serverArgsOf(t, f, cfg), []string{flagName, url}; !slices.Equal(got, want) {
 			t.Errorf("after uninstall then install the args are %v, want %v", got, want)
-		}
-		if got := strings.TrimSpace(string(f.files[staged])); got != dsn {
-			t.Errorf("staged DSN after uninstall then install = %q, want it preserved (%q)", got, dsn)
 		}
 	})
 
 	t.Run("masked in the unparsable-plist error", func(t *testing.T) {
 		g := &fakeSystem{}
 		gcfg := testConfig(t)
-		putServerArgsRecord(t, g, gcfg.withDefaults().ServerArgsRecord, "--datastore-endpoint", dsn)
+		putServerArgsRecord(t, g, gcfg.withDefaults().ServerArgsRecord, flagName, url)
 		g.putFile(gcfg.withDefaults().plistPath(ServerLabel), []byte("<plist><dict></dict></plist>"))
 
 		err := Install(context.Background(), g, gcfg)
@@ -487,9 +467,9 @@ func TestServerArgsAreCarriedVerbatimAndPrintedRedacted(t *testing.T) {
 			t.Fatal("Install must refuse an unparsable plist")
 		}
 		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("the error leaked the DSN password: %v", err)
+			t.Fatalf("the error leaked the password: %v", err)
 		}
-		if !strings.Contains(err.Error(), "postgres://u:***@h/db") {
+		if !strings.Contains(err.Error(), "scheme://u:***@h/db") {
 			t.Errorf("the error must still name the endpoint: %v", err)
 		}
 	})

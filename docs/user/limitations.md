@@ -23,9 +23,10 @@ profile.
   apply.
 - The resource model is best-effort. There is **no CFS millicore CPU enforcement** on the native
   path, so CPU `limits` are not enforced and `HPA`-on-CPU is **unservable**. Memory is sampled
-  (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement, and
-  there is no node-pressure eviction guarantee. `kubectl top` always needs an **operator-installed
-  metrics-server**, which k3sm does not ship.
+  (`proc_pid_rusage`) and can drive OOMKill, but this is best-effort, not cgroup enforcement. Under
+  node memory pressure k3sm evicts one Pod at a time, ranked as the kubelet ranks them (see
+  [Memory Pressure and Eviction](#memory-pressure-and-eviction)). `kubectl top` always needs an
+  **operator-installed metrics-server**, which k3sm does not ship.
   The **`vm` RuntimeClass differs**. A guest is a real Linux kernel, so each container gets a cgroup2
   leaf and the node publishes genuine per-container CPU **and** memory for `vm` Pods on the
   `metrics.k8s.io` scrape target. Native Pods publish neither, because that endpoint emits the
@@ -582,6 +583,59 @@ re-attaching.
 the daemons are gone, so nothing k3sm started keeps running and a reinstall starts every Pod fresh. A
 group whose original leader process has already exited is left alone and logged, because nothing
 proves it still belongs to the Pod.
+
+### Memory Pressure and Eviction
+
+When the node runs low on memory, k3sm evicts Pods itself, one at a time, the way the kubelet does.
+The node's `MemoryPressure` condition and the eviction decision come from the same sample, so they
+always agree.
+
+- **Hard and memory-only.** There are no soft thresholds, no disk or PID eviction, no refusal of
+  new BestEffort Pods while the node is under pressure, and no `--eviction-hard` override. The
+  thresholds are fixed.
+- **Ranked like the kubelet.** Pods using more memory than they request go first, then lower
+  `priority`, then the largest usage over request. A BestEffort Pod requests nothing, so it ranks
+  first. Pods at `system-cluster-critical` or `system-node-critical` priority are never evicted.
+- **Three signals.** `MemoryPressure` goes True when available memory drops below 100Mi (the
+  kubelet's default), when the memory compressor reaches 80% of either of its kernel limits, or
+  when swap is in use, still growing, and the volume that holds swap has under 8 GiB free. The
+  condition's message names the one that fired, for example
+  `kubelet has insufficient memory available: compressor 83% of limit`. macOS starts killing
+  processes itself at 98% of a compressor limit, so k3sm acts first.
+- **One Pod per round.** After each eviction k3sm waits for that Pod to stop and for a fresh
+  sample, and evicts again only if pressure is not falling. After 3 evictions in 5 minutes it stops
+  for the rest of that pressure episode, logs an error, and records an `EvictionCascadeHalted`
+  Event on the node.
+- **What an evicted Pod shows.** Phase `Failed`, reason `Evicted`, the kubelet's message, an
+  `Evicted` Event, and the `DisruptionTarget` condition. Its containers are killed at once, with no
+  `preStop` hook, and exit 137. The Pod object stays until it is deleted, so its controller replaces
+  it as it would on a kubelet, and this node never starts it again.
+- **Two differences from the kubelet.** Eviction sends SIGKILL at once, with no SIGTERM grace
+  window (the kubelet gives about 2 s), and the `EvictionThresholdMet` Event is recorded once per
+  pressure episode.
+
+If a Pod fills memory faster than k3sm can react, macOS's own out-of-swap kill takes over. k3sm
+marks every Pod process so that kill picks a Pod before the control plane. The mark has limits:
+
+- A Pod's child processes (anything it forks or spawns) are unmarked. A single-process Pod is
+  fully covered.
+- An unmarked process holding more than half of all compressed memory is killed first, whatever
+  the marks say.
+- macOS picks its victim by how much compressed memory it holds. Total footprint does not count.
+- A `vm` Pod's guest memory is not covered by the mark. Eviction still covers `vm` Pods.
+- A kernel kill shows as a plain SIGKILL exit: exit code 137 with reason `Error`. It is never
+  reported as `OOMKilled`.
+- The mark is not an isolation control: a Pod can clear its own. Run untrusted workloads on the
+  [`vm` RuntimeClass](vm-runtimeclass.md).
+
+Runbook:
+
+- To tell an eviction from a kernel kill: an evicted Pod is `Failed` with reason `Evicted` and has
+  an `Evicted` Event. A kernel kill leaves a container that exited 137 with no such Event, and a
+  kernel log line you can find with
+  `log show --predicate 'sender == "kernel"' --last 1h | grep -i "paging space"`.
+- After upgrading k3sm, recreate long-running Pods. A Pod started by an older version is not marked
+  until it is recreated.
 
 ### `vm` RuntimeClass, Multi-Node, and HA Status
 

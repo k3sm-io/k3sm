@@ -64,6 +64,7 @@ type startRecord struct {
 // can observe the provider inside its attempt window.
 func (f *fakeRuntimeServer) StartContainer(ctx context.Context, req *runtimev1.StartContainerRequest) (*runtimev1.StartContainerResponse, error) {
 	f.mu.Lock()
+	f.checkKnownLocked("StartContainer", req.GetPodId())
 	f.startCalls++
 	f.lastStart = startRecord{podID: req.GetPodId(), container: req.GetContainer()}
 	var out startOutcome

@@ -178,10 +178,9 @@ var tokenFlags = regexp.MustCompile(`(--(?:token|agent-token|server-token|server
 var tokenLiterals = regexp.MustCompile(`(?:k3sm-[A-Za-z0-9._~+/=-]{12,}|K10[0-9a-fA-F]{16,}(?:::\S+)?)`)
 
 // urlCredentials matches the userinfo half of a URL that carries a password:
-// scheme://user:secret@host. It is the shape a datastore DSN has
-// (`--datastore-endpoint postgres://user:password@host/db`), and a server that
-// was started with one echoes it into its own log and carries it on the argv the
-// server-args row reports.
+// scheme://user:secret@host. An operator argument or a component's own error
+// can carry one, and a server echoes its argv into its own log and onto the
+// server-args row.
 //
 // Only the PASSWORD is replaced. The user name and the host stay, because a line
 // that no longer says which endpoint was configured has lost the thing the
@@ -268,13 +267,17 @@ type Collector struct {
 	NodeResolverPresent func() (bool, error)
 	// CDHash reads a binary's code directory hash, for the shadow-shells row's
 	// drift check. OPTIONAL: nil leaves the row out.
-	CDHash     func(path string) (string, error)
-	Paths      Paths
-	EUID       int
-	ServiceUID int
-	Now        func() time.Time
-	Version    version.Info
-	Host       string
+	CDHash func(path string) (string, error)
+	// EtcdMetrics GETs the etcd member's loopback metrics URL, for the etcd row's
+	// WAL fsync p99. OPTIONAL: nil is a plain HTTP GET with a short timeout, and an
+	// error only leaves the p99 unknown.
+	EtcdMetrics func(ctx context.Context, url string) ([]byte, error)
+	Paths       Paths
+	EUID        int
+	ServiceUID  int
+	Now         func() time.Time
+	Version     version.Info
+	Host        string
 	// Hostname is this Mac's host name, used to pick THIS node out of a
 	// multi-node cluster's node list. Empty leaves the node row to its fallback.
 	Hostname string

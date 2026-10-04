@@ -52,19 +52,19 @@ import (
 // is NOT a failure here, because `VACUUM INTO` reads the write-ahead log too and does not
 // depend on the drain.
 //
-// Scope: the single-node kine→SQLite datastore only. On the HA/Postgres posture the state
-// of record is the operator's Postgres, which this command cannot see, let alone restore;
-// it refuses (ErrSnapshotExternalDatastore) and names pg_dump.
+// Scope: the single-node kine→SQLite datastore only. An etcd member is saved by
+// SnapshotEtcd (etcdreset.go): SaveSnapshot refuses it (ErrSnapshotEtcdMember) rather
+// than copy a state.db that is not the cluster's state, and restore refuses it
+// (ErrEtcdRestoreUnsupported).
 
 // Snapshot failures. Each is a typed sentinel (errors.Is-comparable) so the CLI can turn
 // it into an actionable message and a non-zero exit without string matching.
 var (
-	// ErrSnapshotExternalDatastore reports a save/restore attempted on a node whose
-	// state of record is an external (Postgres) datastore. Refusing is the feature:
-	// k3sm has no read of that database, and a "snapshot" of a local SQLite file on
-	// such a node would be either empty or a stale pre-HA remnant presented as the
-	// cluster's state.
-	ErrSnapshotExternalDatastore = errors.New("executor: snapshot save/restore covers only the single-node kine→SQLite datastore, not an external (Postgres) one")
+	// ErrSnapshotEtcdMember reports a SQLite save attempted on a node whose state of
+	// record is an embedded etcd member. A "snapshot" of a local SQLite file on such a
+	// node would be empty (--cluster-init refuses a non-empty one) presented as the
+	// cluster's state; the member is saved with the etcd snapshot instead.
+	ErrSnapshotEtcdMember = errors.New("executor: this server's datastore is an embedded etcd member, not a kine SQLite file; save it with the etcd snapshot")
 	// ErrNoDatastore reports that the work dir holds no state.db to snapshot.
 	ErrNoDatastore = errors.New("executor: no kine SQLite datastore to snapshot")
 	// ErrSnapshotIntegrity reports a snapshot that failed PRAGMA integrity_check. On
@@ -105,9 +105,6 @@ type LiveControlPlaneProbe func(ctx context.Context) (holder string, err error)
 type SnapshotSaveOptions struct {
 	// WorkDir is the control-plane state root holding db/state.db. Required.
 	WorkDir string
-	// DatastoreEndpoint is the server's --datastore-endpoint, when it has one. A
-	// non-empty value means the state of record is external and the save refuses.
-	DatastoreEndpoint string
 	// Out is the destination. Empty writes a generated name into SnapshotDir; a path
 	// naming an existing DIRECTORY writes a generated name inside it; anything else is
 	// taken as the exact file to write.
@@ -134,8 +131,6 @@ type SnapshotSaveResult struct {
 type SnapshotRestoreOptions struct {
 	// WorkDir is the control-plane state root whose db/state.db is replaced. Required.
 	WorkDir string
-	// DatastoreEndpoint is the server's --datastore-endpoint, when it has one.
-	DatastoreEndpoint string
 	// Snapshot is the file to restore. Required.
 	Snapshot string
 	// Running is the live-control-plane probe. Required: nil is ErrNoRunningProbe.
@@ -160,7 +155,7 @@ type SnapshotRestoreResult struct {
 // SaveSnapshot writes a consistent, integrity-verified copy of this node's kine SQLite
 // datastore, and returns where it put it.
 //
-// The order is fail-closed throughout: refuse an external datastore, refuse an absent
+// The order is fail-closed throughout: refuse an etcd member, refuse an absent
 // datastore, refuse a volume without room, and only then write anything. The snapshot is
 // built at a .tmp name, integrity-checked there, and renamed into place, so a snapshot
 // that exists under its final name is one that has been proven readable as a database —
@@ -169,7 +164,7 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 	if opts.WorkDir == "" {
 		return nil, errors.New("executor: snapshot save requires a work dir")
 	}
-	if err := requireLocalDatastore(opts.WorkDir, opts.DatastoreEndpoint); err != nil {
+	if err := requireLocalDatastore(opts.WorkDir); err != nil {
 		return nil, err
 	}
 	db := StateDBPath(opts.WorkDir)
@@ -237,8 +232,8 @@ func SaveSnapshot(ctx context.Context, opts SnapshotSaveOptions) (*SnapshotSaveR
 // RestoreSnapshot replaces this node's datastore with a snapshot, preserving the
 // superseded one.
 //
-// Everything that can refuse, refuses before anything on disk moves: an external
-// datastore, a running control plane, a snapshot that fails integrity_check, a volume
+// Everything that can refuse, refuses before anything on disk moves: an etcd
+// member, a running control plane, a snapshot that fails integrity_check, a volume
 // without room, and a copy whose ownership cannot be made to match the datastore it
 // replaces. The destructive window is then two renames wide — the old datastore aside,
 // the verified copy into place — and the old datastore is MOVED, never deleted, so the
@@ -250,7 +245,12 @@ func RestoreSnapshot(ctx context.Context, opts SnapshotRestoreOptions) (*Snapsho
 	if opts.Snapshot == "" {
 		return nil, errors.New("executor: snapshot restore requires a snapshot to restore")
 	}
-	if err := requireLocalDatastore(opts.WorkDir, opts.DatastoreEndpoint); err != nil {
+	// An etcd member's state is not a state.db; restoring one over it would be
+	// neither its data nor a working cluster.
+	if EtcdMemberExists(opts.WorkDir) {
+		return nil, ErrEtcdRestoreUnsupported
+	}
+	if err := requireLocalDatastore(opts.WorkDir); err != nil {
 		return nil, err
 	}
 	if opts.Running == nil {
@@ -396,39 +396,14 @@ func portHeld(ctx context.Context, port int) (string, bool) {
 }
 
 // requireLocalDatastore refuses when this node's state of record is not the local kine
-// SQLite file.
-//
-// Two signals, both fail-closed. The endpoint (the server's --datastore-endpoint /
-// $K3SM_DATASTORE_ENDPOINT) is the direct one. The .pgpass file is the on-disk residue of
-// a Postgres posture — the executor writes it so the DSN password never reaches kine's
-// argv — and it is treated as decisive even when a state.db is present, because a node
-// that moved from single-node to HA keeps its now-abandoned SQLite file, and snapshotting
-// THAT would hand the operator a stale database labelled as the cluster's state. The
-// error names the way out for the false positive (a leftover .pgpass on a node that no
-// longer uses Postgres).
-func requireLocalDatastore(workDir, endpoint string) error {
-	if endpoint != "" {
-		return fmt.Errorf("%w: this server's datastore is %s — back it up with pg_dump (and restore with pg_restore/psql) on your Postgres schedule; see docs/user/ha.md",
-			ErrSnapshotExternalDatastore, redactDatastoreEndpoint(endpoint))
-	}
-	if pg := pgPassPath(workDir); fileExists(pg) {
-		return fmt.Errorf("%w: %s holds a Postgres password file, so this node serves an external datastore — back it up with pg_dump on your Postgres schedule (if this node no longer uses Postgres, remove %s and re-run)",
-			ErrSnapshotExternalDatastore, workDir, pg)
+// SQLite file: an initialized etcd member is decisive even when a state.db is present,
+// because snapshotting THAT would hand the operator a database that is not the
+// cluster's state.
+func requireLocalDatastore(workDir string) error {
+	if EtcdMemberExists(workDir) {
+		return fmt.Errorf("%w (%s)", ErrSnapshotEtcdMember, EtcdDataDir(workDir))
 	}
 	return nil
-}
-
-// redactDatastoreEndpoint renders a datastore DSN for an error message with the password
-// removed. A CLI error is echoed into terminals, logs, and issue reports; the credential
-// in it is the operator's Postgres password.
-func redactDatastoreEndpoint(dsn string) string {
-	sanitized, _, err := splitDatastorePassword(dsn)
-	if err != nil {
-		// Unparseable: say so rather than echo an unredacted string that may carry a
-		// password in a shape this function does not understand.
-		return "an external datastore (endpoint withheld: it did not parse as a DSN)"
-	}
-	return sanitized
 }
 
 // resolveSnapshotOut decides where a save writes: the default snapshots dir, inside a
