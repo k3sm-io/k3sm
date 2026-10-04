@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -182,4 +183,101 @@ func TestServerJoinFailsClosedOnAbsentBundle(t *testing.T) {
 			t.Fatal("import must reject a non-server (worker) token")
 		}
 	})
+}
+
+// TestImportCABundleBackfillsOnlyMissingCA is the B435 bootstrap-side gate: a server
+// that already imported the bundle can import it again (a restart), the second import
+// installs only the CA that went missing and leaves the present ones byte-identical,
+// and a half-present CA refuses the import with nothing written.
+func TestImportCABundleBackfillsOnlyMissingCA(t *testing.T) {
+	wdA := t.TempDir()
+	hA, err := certs.EnsureHierarchy(wdA)
+	if err != nil {
+		t.Fatalf("server A hierarchy: %v", err)
+	}
+	if hA.EtcdServer, hA.EtcdPeer, err = certs.EnsureEtcdCAs(wdA); err != nil {
+		t.Fatalf("server A etcd CAs: %v", err)
+	}
+	plaintext, err := hA.Marshal()
+	if err != nil {
+		t.Fatalf("marshal A: %v", err)
+	}
+	const secret = "server-bootstrap-secret-deadbeefdeadbeefdeadbeef"
+	sealed, err := bootstrap.SealBundle(secret, plaintext)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	ts := bundleTestServer(t, sealed, false)
+	defer ts.Close()
+
+	wdB := t.TempDir()
+	importB := func() error {
+		return bootstrap.ImportCABundle(context.Background(), bootstrap.ServerJoinOptions{
+			Server:     ts.URL,
+			Token:      bootstrap.FormatServerToken(hA.Cluster.PinHash(), secret),
+			WorkDir:    wdB,
+			HTTPClient: ts.Client(),
+		})
+	}
+	if err := importB(); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	ep := certs.EtcdCertPaths(wdB)
+	present := []string{
+		certs.ClusterCACertPath(wdB), certs.ClusterCAKeyPath(wdB),
+		certs.SigningCACertPath(wdB), certs.SigningCAKeyPath(wdB),
+		ep.ServerCACert, ep.ServerCAKey,
+	}
+	read := func(paths []string) map[string]string {
+		out := map[string]string{}
+		for _, p := range paths {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatalf("read %s: %v", p, err)
+			}
+			out[p] = string(b)
+		}
+		return out
+	}
+
+	// A restart re-imports into a complete hierarchy: a no-op, not a refusal.
+	before := read(append(present, ep.PeerCACert, ep.PeerCAKey))
+	if err := importB(); err != nil {
+		t.Fatalf("re-import into a complete hierarchy must succeed: %v", err)
+	}
+	if after := read(append(present, ep.PeerCACert, ep.PeerCAKey)); !reflect.DeepEqual(before, after) {
+		t.Error("a re-import changed a present CA")
+	}
+
+	// The etcd peer pair goes missing: only it is installed.
+	for _, p := range []string{ep.PeerCACert, ep.PeerCAKey} {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before = read(present)
+	if err := importB(); err != nil {
+		t.Fatalf("backfill import: %v", err)
+	}
+	if after := read(present); !reflect.DeepEqual(before, after) {
+		t.Error("the backfill import changed a present CA")
+	}
+	_, peer, err := certs.EnsureEtcdCAs(wdB)
+	if err != nil {
+		t.Fatalf("EnsureEtcdCAs after backfill: %v", err)
+	}
+	if peer.PinHash() != hA.EtcdPeer.PinHash() {
+		t.Error("the backfilled etcd peer CA is not the bundle's")
+	}
+
+	// A half-present CA (the signing key gone, its cert kept) refuses the import.
+	if err := os.Remove(certs.SigningCAKeyPath(wdB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := importB(); err == nil {
+		t.Fatal("an import over a half-present CA must fail")
+	}
+	if _, err := os.Stat(certs.SigningCAKeyPath(wdB)); !os.IsNotExist(err) {
+		t.Error("a refused import must not write the missing signing key")
+	}
 }

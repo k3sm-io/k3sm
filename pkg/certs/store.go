@@ -141,8 +141,9 @@ func SigningCACertPath(workDir string) string { return filepath.Join(PKIDir(work
 
 // ClusterCAKeyPath / SigningCAKeyPath are the CA PRIVATE KEY paths (0600). They are
 // exported so a caller can NAME a key file — to os.Stat it, or to report on it —
-// without re-joining the layout. Nothing outside EnsureHierarchy / WriteHierarchy
-// should ever OPEN them: pin verification needs only the certificate.
+// without re-joining the layout. Nothing outside EnsureHierarchy /
+// ReconcileImportedHierarchy should ever OPEN them: pin verification needs only the
+// certificate.
 func ClusterCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), clusterCAKey) }
 func SigningCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), signingCAKey) }
 
@@ -209,8 +210,8 @@ func LoadCAPins(workDir string) (cluster, signing string, err error) {
 // exists at keyPath. The key is STATTED ONLY — never opened, never parsed.
 //
 // Both paths are LSTAT'ed and required to be REGULAR files. A symlink in the PKI dir
-// is never legitimate (EnsureHierarchy/WriteHierarchy only ever create regular files),
-// and following one would let a planted link redirect this — frequently root — read at
+// is never legitimate (EnsureHierarchy/ReconcileImportedHierarchy only ever create
+// regular files), and following one would let a planted link redirect this — frequently root — read at
 // an arbitrary file, or point the key path at some unrelated existing file and make
 // ErrIncompleteHierarchy unreachable for a hierarchy that is in fact half-present.
 func caPin(certPath, keyPath string) (string, error) {
@@ -296,8 +297,8 @@ func EnsureHierarchy(workDir string) (*Hierarchy, error) {
 // signing CAs and from each other. Like EnsureHierarchy it refuses a half-present
 // pair rather than silently re-minting, which would invalidate every etcd member's
 // certificates. Only the etcd HA posture calls it; a joining server finds the pairs
-// already written by WriteHierarchy from the bootstrap bundle and so LOADS the
-// identical CAs.
+// already installed by ReconcileImportedHierarchy from the bootstrap bundle and so
+// LOADS the identical CAs.
 func EnsureEtcdCAs(workDir string) (server, peer *CA, err error) {
 	dir, err := ensureEtcdDir(workDir)
 	if err != nil {
@@ -349,9 +350,9 @@ type caSpec struct {
 	ca        func(*Hierarchy) *CA
 }
 
-// caSpecs is the whole CA hierarchy, one row per CA, in write order. Every walk over
-// the on-disk hierarchy (WriteHierarchy, MissingOnDisk, ReconcileImportedHierarchy)
-// goes through it, so a CA is never added to one walk and forgotten by another.
+// caSpecs is the whole CA hierarchy, one row per CA, in install order. Every walk over
+// the on-disk hierarchy (MissingOnDisk, ReconcileImportedHierarchy) goes through
+// it, so a CA is never added to one walk and forgotten by another.
 var caSpecs = []caSpec{
 	{id: "cluster", dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
 		ca: func(h *Hierarchy) *CA { return h.Cluster }},
@@ -386,62 +387,6 @@ func hierarchyComplete(h *Hierarchy) bool {
 		}
 	}
 	return true
-}
-
-// WriteHierarchy writes h's four CA keypairs — cluster and signing into the work dir's
-// PKI directory, the etcd server and peer CAs into <PKI>/etcd (0700) — with certs 0644
-// and keys 0600. It is the inverse of EnsureHierarchy + EnsureEtcdCAs's load. The HA
-// server-join path calls it AFTER decrypting the AES-256-GCM bootstrap bundle and
-// BEFORE EnsureHierarchy, so those then LOAD the IDENTICAL CAs instead of minting
-// fresh, divergent ones (which would split cluster trust). All four CAs are required:
-// the bundle is HA-only and HA is the etcd posture. It REFUSES to overwrite any
-// existing CA file: a server that already has a hierarchy must never be silently
-// re-based onto another's — the import is a first-write, not a replace. The refusal
-// is the kernel's (O_CREATE|O_EXCL), not a stat-then-write, so two joins racing into
-// one work dir cannot both pass the check and then clobber each other's CA.
-func WriteHierarchy(workDir string, h *Hierarchy) error {
-	if !hierarchyComplete(h) {
-		return fmt.Errorf("certs: write hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
-	}
-	dirs := make([]string, len(caSpecs))
-	for i, spec := range caSpecs {
-		d, err := spec.ensureDir(workDir)
-		if err != nil {
-			return err
-		}
-		dirs[i] = d
-	}
-	for i, spec := range caSpecs {
-		ca := spec.ca(h)
-		if err := writeExclusive(dirs[i], spec.certFile, ca.CertPEM, 0o644); err != nil {
-			return err
-		}
-		if err := writeExclusive(dirs[i], spec.keyFile, ca.KeyPEM, 0o600); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// writeExclusive creates dir/name with mode and writes data into it, refusing (with
-// an error wrapping fs.ErrExist) when the file already exists. The refusal is the
-// kernel's O_CREATE|O_EXCL, so an existing file is never truncated.
-func writeExclusive(dir, name string, data []byte, mode os.FileMode) error {
-	fh, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA): %w", name, err)
-		}
-		return fmt.Errorf("write %s: %w", name, err)
-	}
-	if _, err := fh.Write(data); err != nil {
-		_ = fh.Close()
-		return fmt.Errorf("write %s: %w", name, err)
-	}
-	if err := fh.Close(); err != nil {
-		return fmt.Errorf("write %s: %w", name, err)
-	}
-	return nil
 }
 
 // ensureCA loads the CA at dir/<certFile>+<keyFile>, or creates + persists a new one

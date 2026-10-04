@@ -77,8 +77,8 @@ func (h *Hierarchy) Marshal() ([]byte, error) {
 // only on success. A schema-1 bundle (from a server that predates etcd HA) and any
 // other version are refused, as is a v2 bundle missing either etcd pair. The caller
 // is the HA server-join path, AFTER it has decrypted + authenticated the bundle (a GCM
-// tag failure means these bytes are never reached) and BEFORE WriteHierarchy, so a
-// refusal here writes nothing.
+// tag failure means these bytes are never reached) and BEFORE
+// ReconcileImportedHierarchy, so a refusal here writes nothing.
 func (h *Hierarchy) Unmarshal(data []byte) error {
 	var m marshalledHierarchy
 	if err := json.Unmarshal(data, &m); err != nil {
