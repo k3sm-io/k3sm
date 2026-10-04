@@ -122,37 +122,38 @@ func TestBringUpFailureRecordsOnTheCrashLoopBreaker(t *testing.T) {
 // Without this the recording function could sit in the package unused while the
 // daemon restart-looped exactly as it did before.
 func TestRunServerRecordsABringUpFailure(t *testing.T) {
-	fset, body := runServerBody(t)
-	var startPos, notePos, returnPos int
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr := runServerTrace(t)
+	var start, note, ret ast.Node
+	tr.inspect(func(n ast.Node) bool {
 		ifStmt, ok := n.(*ast.IfStmt)
 		if !ok || !isExecStartInit(ifStmt.Init) {
 			return true
 		}
-		startPos = fset.Position(ifStmt.Pos()).Line
+		start = ifStmt
 		ast.Inspect(ifStmt.Body, func(n ast.Node) bool {
 			switch stmt := n.(type) {
 			case *ast.CallExpr:
-				if id, isIdent := stmt.Fun.(*ast.Ident); isIdent && id.Name == "noteBringUpFailure" && notePos == 0 {
-					notePos = fset.Position(stmt.Pos()).Line
+				if id, isIdent := stmt.Fun.(*ast.Ident); isIdent && id.Name == "noteBringUpFailure" && note == nil {
+					note = stmt
 				}
 			case *ast.ReturnStmt:
-				if returnPos == 0 {
-					returnPos = fset.Position(stmt.Pos()).Line
+				if ret == nil {
+					ret = stmt
 				}
 			}
 			return true
 		})
 		return false
 	})
-	if startPos == 0 {
+	if start == nil {
 		t.Fatal("runServer no longer has an `if err := exec.Start(ctx); err != nil` branch; this gate has stopped checking anything")
 	}
-	if notePos == 0 {
-		t.Fatalf("runServer's exec.Start failure branch at line %d does not call noteBringUpFailure: a control plane that never comes up is counted nowhere, so launchd respawns it forever", startPos)
+	if note == nil {
+		t.Fatalf("runServer's exec.Start failure branch at %s does not call noteBringUpFailure: a control plane that never comes up is counted nowhere, so launchd respawns it forever", tr.where(start))
 	}
-	if returnPos == 0 || notePos > returnPos {
-		t.Errorf("noteBringUpFailure at line %d must run before the branch returns at line %d", notePos, returnPos)
+	// Both sit in the one branch body, so source position orders them.
+	if ret == nil || note.Pos() > ret.Pos() {
+		t.Errorf("noteBringUpFailure at %s must run before the branch returns", tr.where(note))
 	}
 }
 

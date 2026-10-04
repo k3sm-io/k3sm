@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -124,22 +122,26 @@ func TestSingleServerNodePasswordBindingSurvivesRestart(t *testing.T) {
 // Non-vacuous: before the fix serverNodePasswordStore did not exist and
 // server.go built bootstrap.NewMemoryNodePasswords().
 func TestSingleServerStoreBuiltAfterAPIServerHealthy(t *testing.T) {
-	fset, body := runServerBody(t)
-	first := firstCallPositions(body)
+	tr := runServerTrace(t)
+	first := map[string]int{}
+	where := map[string]ast.Node{}
+	for name, c := range tr.firstCalls() {
+		first[name], where[name] = c.pos, c.call
+	}
 
-	var depsLit token.Pos
-	ast.Inspect(body, func(n ast.Node) bool {
-		if lit, ok := n.(*ast.CompositeLit); ok && depsLit == token.NoPos {
+	var depsLit *ast.CompositeLit
+	tr.inspect(func(n ast.Node) bool {
+		if lit, ok := n.(*ast.CompositeLit); ok && depsLit == nil {
 			if ident, ok := lit.Type.(*ast.Ident); ok && ident.Name == "bootstrapServerDeps" {
-				depsLit = lit.Pos()
+				depsLit = lit
 			}
 		}
 		return true
 	})
-	if depsLit == token.NoPos {
+	if depsLit == nil {
 		t.Fatal("runServer builds no bootstrapServerDeps literal: the join supervisor wiring moved, re-anchor this pin")
 	}
-	first["bootstrapServerDeps{}"] = depsLit
+	first["bootstrapServerDeps{}"], where["bootstrapServerDeps{}"] = tr.pos(depsLit), depsLit
 
 	// exec.Start returns only once the control plane is healthy (the "control
 	// plane healthy" line follows it), so it anchors the health wait.
@@ -153,27 +155,27 @@ func TestSingleServerStoreBuiltAfterAPIServerHealthy(t *testing.T) {
 		before, after := order[i-1], order[i]
 		if first[before] >= first[after] {
 			t.Errorf("runServer reaches %s at %s, NOT before %s at %s",
-				before, fset.Position(first[before]), after, fset.Position(first[after]))
+				before, tr.where(where[before]), after, tr.where(where[after]))
 		}
 	}
 
-	file, err := parser.ParseFile(token.NewFileSet(), "server.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse server.go: %v", err)
+	// Every non-test server*.go file, not only the bring-up trace: an in-memory
+	// store built anywhere in the server's sources is the regression.
+	for name, file := range tr.files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.SelectorExpr:
+				if x.Sel.Name == "NewMemoryNodePasswords" {
+					t.Errorf("%s still builds an in-memory node-password store at %s: its bindings die with the process", name, tr.where(x))
+				}
+			case *ast.Ident:
+				if x.Name == "MemoryNodePasswords" {
+					t.Errorf("%s still names MemoryNodePasswords", name)
+				}
+			}
+			return true
+		})
 	}
-	ast.Inspect(file, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.SelectorExpr:
-			if x.Sel.Name == "NewMemoryNodePasswords" {
-				t.Errorf("server.go still builds an in-memory node-password store at %s: its bindings die with the process", fset.Position(x.Pos()))
-			}
-		case *ast.Ident:
-			if x.Name == "MemoryNodePasswords" {
-				t.Error("server.go still names MemoryNodePasswords")
-			}
-		}
-		return true
-	})
 }
 
 // twoBootSelfBind runs this control plane's own bind twice over ONE datastore,

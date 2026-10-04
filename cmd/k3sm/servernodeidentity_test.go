@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"go/ast"
 	stdmaps "maps"
 	"path/filepath"
@@ -230,18 +231,17 @@ func TestStartNodeUsesRestConfigExclusively(t *testing.T) {
 	})
 
 	t.Run("runServer wires the minted config and no kubeconfig", func(t *testing.T) {
-		_, body := runServerBody(t)
-		assertServerNodeOptionsWiring(t, body)
+		assertServerNodeOptionsWiring(t, runServerTrace(t))
 	})
 }
 
-// assertServerNodeOptionsWiring checks, in runServer's body, that the nodeOptions
+// assertServerNodeOptionsWiring checks, in runServer's trace, that the nodeOptions
 // literal handed to startNode sets restConfig to a variable assigned from
 // serverNodeRESTConfig(…, opts.nodeName), sets nodeName from the same opts.nodeName
 // (the CN equals the registered name), and that no nodeOptions literal and no
 // assignment in runServer sets a kubeconfig. It fails when no literal is found, so
 // a refactor cannot turn it vacuous.
-func assertServerNodeOptionsWiring(t *testing.T, body *ast.BlockStmt) {
+func assertServerNodeOptionsWiring(t *testing.T, tr *serverTrace) {
 	t.Helper()
 	isOptsNodeName := func(e ast.Expr) bool {
 		sel, ok := e.(*ast.SelectorExpr)
@@ -257,7 +257,7 @@ func assertServerNodeOptionsWiring(t *testing.T, body *ast.BlockStmt) {
 	var restLit *ast.CompositeLit
 	mintedFrom := map[string]*ast.CallExpr{}
 	var startNodeArg string
-	ast.Inspect(body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.CompositeLit:
 			if id, ok := n.Type.(*ast.Ident); !ok || id.Name != "nodeOptions" {
@@ -350,9 +350,99 @@ func assertServerNodeOptionsWiring(t *testing.T, body *ast.BlockStmt) {
 	if !nameOK {
 		t.Error("the node options' nodeName is not opts.nodeName, so the minted CN and the registered node name could differ")
 	}
-	if nodeOptsVar == "" || nodeOptsVar != startNodeArg {
-		t.Errorf("startNode is called with %q, not the nodeOptions literal that carries the minted identity (%q)", startNodeArg, nodeOptsVar)
+	if nodeOptsVar == "" || startNodeArg == "" {
+		t.Fatalf("startNode is called with %q and the minted literal is assigned to %q; the dataflow between them is unassertable", startNodeArg, nodeOptsVar)
 	}
+	if err := nodeOptsReachStartNode(tr, restLit, nodeOptsVar, startNodeArg); err != nil {
+		t.Errorf("startNode is not handed the nodeOptions literal that carries the minted identity: %v", err)
+	}
+}
+
+// nodeOptsReachStartNode follows the minted nodeOptions literal to startNode by
+// DATAFLOW, not by a shared variable name. The literal is assigned to litVar in
+// some function F. If F is runServer itself, startNode must be called with litVar.
+// Otherwise F must be a helper runServer calls directly: litVar is assigned once in
+// F and is the first result of every successful (`…, nil`) return in F, and
+// runServer assigns argVar exactly once, as the first result of a call to F, and
+// passes argVar to startNode.
+func nodeOptsReachStartNode(tr *serverTrace, lit *ast.CompositeLit, litVar, argVar string) error {
+	var fn *ast.FuncDecl
+	for _, f := range tr.funcs {
+		if f.Body.Pos() <= lit.Pos() && lit.End() <= f.Body.End() {
+			fn = f
+		}
+	}
+	if fn == nil {
+		return fmt.Errorf("the literal at %s sits in no server*.go function", tr.where(lit))
+	}
+	if fn == tr.decl {
+		if litVar != argVar {
+			return fmt.Errorf("runServer builds %q but calls startNode with %q", litVar, argVar)
+		}
+		return nil
+	}
+	// assignsOutsideClosures lists the assignments to name in body, closures excluded.
+	assigns := func(body *ast.BlockStmt, name string) []*ast.AssignStmt {
+		var out []*ast.AssignStmt
+		ast.Inspect(body, func(n ast.Node) bool {
+			if _, isLit := n.(*ast.FuncLit); isLit {
+				return false
+			}
+			if as, ok := n.(*ast.AssignStmt); ok {
+				for _, lhs := range as.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name == name {
+						out = append(out, as)
+					}
+				}
+			}
+			return true
+		})
+		return out
+	}
+	if n := len(assigns(fn.Body, litVar)); n != 1 {
+		return fmt.Errorf("%s assigns %q %d times, want exactly once (the minted literal)", fn.Name.Name, litVar, n)
+	}
+	successes := 0
+	var bad error
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if _, isLit := n.(*ast.FuncLit); isLit {
+			return false
+		}
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) == 0 {
+			return true
+		}
+		if last, ok := ret.Results[len(ret.Results)-1].(*ast.Ident); !ok || last.Name != "nil" {
+			return true
+		}
+		successes++
+		if id, ok := ret.Results[0].(*ast.Ident); !ok || id.Name != litVar {
+			bad = fmt.Errorf("%s's successful return at %s does not return %q, the minted literal", fn.Name.Name, tr.where(ret), litVar)
+		}
+		return true
+	})
+	if bad != nil {
+		return bad
+	}
+	if successes == 0 {
+		return fmt.Errorf("%s has no successful return of %q", fn.Name.Name, litVar)
+	}
+	argAssigns := assigns(tr.decl.Body, argVar)
+	if len(argAssigns) != 1 {
+		return fmt.Errorf("runServer assigns %q %d times, want exactly once (from %s)", argVar, len(argAssigns), fn.Name.Name)
+	}
+	as := argAssigns[0]
+	if id, ok := as.Lhs[0].(*ast.Ident); !ok || id.Name != argVar || len(as.Rhs) != 1 {
+		return fmt.Errorf("runServer's %q is not the first result of a single call at %s", argVar, tr.where(as))
+	}
+	call, ok := as.Rhs[0].(*ast.CallExpr)
+	if !ok {
+		return fmt.Errorf("runServer's %q at %s is not a call result", argVar, tr.where(as))
+	}
+	if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != fn.Name.Name {
+		return fmt.Errorf("runServer's %q at %s is not the result of %s, which builds the minted literal", argVar, tr.where(as), fn.Name.Name)
+	}
+	return nil
 }
 
 // TestStripStaleNodeRoleLabel pins the upgrade repair: a kubernetes.io/role label

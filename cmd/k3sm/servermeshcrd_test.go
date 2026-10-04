@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"testing"
 	"time"
 
@@ -227,41 +225,12 @@ func TestEnsureMeshPeerCRDFailsClosed(t *testing.T) {
 //
 // Ordering matters because startBootstrapServer opens the join listener: the first
 // worker to reach it writes a MeshPeer, so a CRD established afterwards would still
-// lose that join. Source position is a sound proxy here because all three calls sit
-// in runServer's straight-line bring-up sequence — there is no loop or branch that
-// could execute them out of textual order.
+// lose that join. Trace order is a sound proxy here because all three calls sit
+// in runServer's straight-line bring-up sequence (servertrace_test.go) — there is
+// no loop or branch that could execute them out of order.
 func TestRunServerEnsuresMeshPeerCRDBeforeTheJoinListener(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "server.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse server.go: %v", err)
-	}
-	var runServerDecl *ast.FuncDecl
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Recv == nil && fn.Name.Name == "runServer" {
-			runServerDecl = fn
-		}
-	}
-	if runServerDecl == nil {
-		t.Fatal("server.go declares no runServer function")
-	}
-
-	first := map[string]token.Pos{}
-	ast.Inspect(runServerDecl.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		ident, ok := call.Fun.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		if _, seen := first[ident.Name]; !seen {
-			first[ident.Name] = call.Pos()
-		}
-		return true
-	})
+	tr := runServerTrace(t)
+	first := tr.firstCalls()
 
 	for _, name := range []string{"ensureMeshPeerCRD", "newMeshEnroller", "startBootstrapServer"} {
 		if _, ok := first[name]; !ok {
@@ -269,16 +238,16 @@ func TestRunServerEnsuresMeshPeerCRDBeforeTheJoinListener(t *testing.T) {
 		}
 	}
 	for _, later := range []string{"newMeshEnroller", "startBootstrapServer"} {
-		if first["ensureMeshPeerCRD"] >= first[later] {
+		if first["ensureMeshPeerCRD"].pos >= first[later].pos {
 			t.Errorf("runServer calls ensureMeshPeerCRD at %s, NOT before %s at %s — a join racing bring-up would meet a missing CRD",
-				fset.Position(first["ensureMeshPeerCRD"]), later, fset.Position(first[later]))
+				tr.where(first["ensureMeshPeerCRD"].call), later, tr.where(first[later].call))
 		}
 	}
 
 	// Fail-closed: the ensure sits in an `if err := ...; err != nil { return ... }`,
 	// not in a logged-and-ignored branch.
 	returned := false
-	ast.Inspect(runServerDecl.Body, func(n ast.Node) bool {
+	tr.inspect(func(n ast.Node) bool {
 		ifStmt, ok := n.(*ast.IfStmt)
 		if !ok || ifStmt.Init == nil {
 			return true
