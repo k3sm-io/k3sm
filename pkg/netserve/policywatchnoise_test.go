@@ -28,6 +28,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -71,12 +72,79 @@ func (h *recordingHandler) podsWatchErrorWarns() int {
 	return n
 }
 
-// TestWorkerPolicyWatcherForbiddenWarnsOnce pins that a worker-shaped datapath
-// whose pods list is refused surfaces the refusal through Config.Logger exactly
-// once across several reflector retries, instead of one line per retry. The
-// throttle lives in the watcher; this pins that the datapath hands it the
-// configured logger, so the one line reaches the operator and the retries do not.
-func TestWorkerPolicyWatcherForbiddenWarnsOnce(t *testing.T) {
+// TestWorkerStartsNoPolicyInformers pins the worker shape: a datapath that does
+// not set EnforceNetworkPolicy (a joined worker, whose node identity is granted
+// neither the cluster-wide NetworkPolicies nor the Namespaces read) lists and
+// watches nothing for the policy table, says so in exactly one Info line, and
+// logs no Warn. Before, the worker started the watcher anyway: its NetworkPolicies
+// and Namespaces informers were refused on every retry, the table never synced,
+// and every connection was allowed while the log claimed a watcher was running.
+func TestWorkerStartsNoPolicyInformers(t *testing.T) {
+	t.Parallel()
+	cs := fake.NewClientset()
+	var mu sync.Mutex // guards calls
+	var calls []string
+	note := func(a k8stesting.Action) {
+		mu.Lock()
+		calls = append(calls, a.GetVerb()+" "+a.GetResource().Resource)
+		mu.Unlock()
+	}
+	cs.PrependReactor("list", "*", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		note(a)
+		return false, nil, nil
+	})
+	cs.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
+		note(a)
+		return false, nil, nil
+	})
+	h := &recordingHandler{}
+	srv := New(Config{
+		Client:       cs,
+		WorkDir:      t.TempDir(),
+		DNSVIP:       "10.43.0.10",
+		PodCIDR:      "100.64.2.0/24",
+		MeshEgressIP: "100.64.2.1",
+		PodScopeNode: "mac-worker-2",
+		Logger:       slog.New(h),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := srv.RunPolicyWatch(ctx); err != nil {
+		t.Fatalf("RunPolicyWatch: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("worker policy path issued %v; a worker must start no policy informer", calls)
+	}
+	var offInfo, warns int
+	h.mu.Lock()
+	for _, r := range h.records {
+		switch {
+		case r.Level == slog.LevelWarn:
+			warns++
+		case r.Level == slog.LevelInfo && strings.HasPrefix(r.Message, "NetworkPolicy enforcement is off on this node"):
+			offInfo++
+		}
+	}
+	h.mu.Unlock()
+	if offInfo != 1 {
+		t.Errorf("enforcement-off Info lines = %d, want exactly 1", offInfo)
+	}
+	if warns != 0 {
+		t.Errorf("Warn lines = %d, want 0 (nothing was refused because nothing was asked)", warns)
+	}
+}
+
+// TestScopedPolicyWatcherForbiddenWarnsOnce pins that an enforcing, node-scoped
+// datapath (the shape a worker takes once it is granted the policy reads) whose
+// pods list is refused surfaces the refusal through Config.Logger exactly once
+// across several reflector retries, instead of one line per retry. The throttle
+// lives in the watcher; this pins that the datapath hands it the configured
+// logger, so the one line reaches the operator and the retries do not.
+func TestScopedPolicyWatcherForbiddenWarnsOnce(t *testing.T) {
 	t.Parallel()
 	const node = "mac-worker-2"
 	cs := fake.NewClientset()
@@ -88,13 +156,14 @@ func TestWorkerPolicyWatcherForbiddenWarnsOnce(t *testing.T) {
 	})
 	h := &recordingHandler{}
 	srv := New(Config{
-		Client:       cs,
-		WorkDir:      t.TempDir(),
-		DNSVIP:       "10.43.0.10",
-		PodCIDR:      "100.64.2.0/24",
-		MeshEgressIP: "100.64.2.1",
-		PodScopeNode: node,
-		Logger:       slog.New(h),
+		Client:               cs,
+		WorkDir:              t.TempDir(),
+		DNSVIP:               "10.43.0.10",
+		PodCIDR:              "100.64.2.0/24",
+		MeshEgressIP:         "100.64.2.1",
+		EnforceNetworkPolicy: true,
+		PodScopeNode:         node,
+		Logger:               slog.New(h),
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

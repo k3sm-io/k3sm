@@ -111,28 +111,66 @@ func (r *podCallRecorder) assertNodeScoped(t *testing.T, node string) {
 // (spec.nodeName=<name>). The Node authorizer refuses a node's cluster-wide pod
 // list, so a consumer that issues one retries forever and never syncs.
 //
-// The consumers: the worker datapath's NetworkPolicy watcher (netserve.New with
-// the worker shape, run through the unprivileged RunPolicyWatch so no socket is
-// bound), the VK node's pod informer (vkadapter.NewNode + Run with no TLS config,
-// so no kubelet listener starts), and the orphan-reap pod source.
+// The consumers: the worker datapath (netserve.New with the worker shape, run
+// through the unprivileged RunPolicyWatch so no socket is bound), which starts
+// no policy informer at all, because the watcher's cluster-wide NetworkPolicies
+// and Namespaces reads are not granted to a node; the same datapath once it is
+// told to enforce, whose pods view must still be the node's own; the VK node's
+// pod informer (vkadapter.NewNode + Run with no TLS config, so no kubelet
+// listener starts); and the orphan-reap pod source.
 func TestNoClusterWidePodListFromTheNode(t *testing.T) {
 	t.Parallel()
 	const node = "mac-worker-2"
+	workerDatapath := func(cs *k8sfake.Clientset, enforce bool) *netserve.Server {
+		return netserve.New(netserve.Config{
+			Client:               cs,
+			WorkDir:              t.TempDir(),
+			DNSVIP:               "10.43.0.10",
+			ClusterDomain:        "cluster.local",
+			NodeIP:               "100.64.2.1",
+			NodeAddress:          "100.64.2.1",
+			PodCIDR:              "100.64.2.0/24",
+			MeshEgressIP:         "100.64.2.1",
+			EnforceNetworkPolicy: enforce,
+			PodScopeNode:         node,
+		})
+	}
 
-	t.Run("worker datapath NetworkPolicy watcher", func(t *testing.T) {
+	t.Run("worker datapath starts no policy informer", func(t *testing.T) {
 		t.Parallel()
 		rec := newPodCallRecorder()
-		srv := netserve.New(netserve.Config{
-			Client:        rec.cs,
-			WorkDir:       t.TempDir(),
-			DNSVIP:        "10.43.0.10",
-			ClusterDomain: "cluster.local",
-			NodeIP:        "100.64.2.1",
-			NodeAddress:   "100.64.2.1",
-			PodCIDR:       "100.64.2.0/24",
-			MeshEgressIP:  "100.64.2.1",
-			PodScopeNode:  node,
+		var mu sync.Mutex // guards seen
+		var seen []string
+		note := func(a k8stesting.Action) {
+			mu.Lock()
+			seen = append(seen, a.GetVerb()+" "+a.GetResource().Resource)
+			mu.Unlock()
+		}
+		rec.cs.PrependReactor("list", "*", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			note(a)
+			return false, nil, nil
 		})
+		rec.cs.PrependWatchReactor("*", func(a k8stesting.Action) (bool, watch.Interface, error) {
+			note(a)
+			return false, nil, nil
+		})
+		srv := workerDatapath(rec.cs, false)
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		if err := srv.RunPolicyWatch(ctx); err != nil {
+			t.Fatalf("RunPolicyWatch: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(seen) != 0 {
+			t.Errorf("worker policy path issued %v; the node identity is granted neither the NetworkPolicies nor the Namespaces read, so a worker must start no policy informer", seen)
+		}
+	})
+
+	t.Run("enforcing node-scoped datapath lists only the node's pods", func(t *testing.T) {
+		t.Parallel()
+		rec := newPodCallRecorder()
+		srv := workerDatapath(rec.cs, true)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() { done <- srv.RunPolicyWatch(ctx) }()

@@ -65,9 +65,14 @@ func TestM3_3_WorkerNetserveConfig(t *testing.T) {
 		if cfg.DNSVIP != "10.43.0.10" || cfg.ClusterDomain != "cluster.local" {
 			t.Errorf("DNS config = (%q,%q), want (10.43.0.10, cluster.local)", cfg.DNSVIP, cfg.ClusterDomain)
 		}
-		// The worker datapath runs under system:node:<name>; the Node authorizer
-		// refuses that identity a cluster-wide pod list, so the policy watcher
-		// must be scoped to this node's own pods.
+		// The worker datapath runs under system:node:<name>, which is granted
+		// neither the cluster-wide NetworkPolicies nor the Namespaces read the
+		// policy watcher needs, so the worker must not start it.
+		if cfg.EnforceNetworkPolicy {
+			t.Error("EnforceNetworkPolicy = true on a worker; its node identity cannot sync the policy watcher")
+		}
+		// Kept for when a worker does enforce: the Node authorizer refuses that
+		// identity a cluster-wide pod list, so the pods view is its own pods.
 		if cfg.PodScopeNode != opts.nodeName {
 			t.Errorf("PodScopeNode = %q, want %q (the worker's own node name)", cfg.PodScopeNode, opts.nodeName)
 		}

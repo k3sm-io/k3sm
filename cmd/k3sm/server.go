@@ -1055,9 +1055,14 @@ func runServer(args []string) (err error) {
 		PeerMeshEgressIPs: peerMeshEgress,
 		VMBackend:         vmCapable,
 		VMNetSubnet:       netserve.DefaultVMNetSubnet,
-		NetdSocket:        mode.Socket,
-		Disabled:          !mode.DataPath(),
-		Logger:            logger,
+		// cs is the admin client (exec.Kubeconfig()), so the policy watcher's
+		// cluster-wide NetworkPolicies, Pods and Namespaces reads are allowed
+		// and PodScopeNode stays empty. TestServerNetservePolicyClientIsAdmin
+		// pins both.
+		EnforceNetworkPolicy: true,
+		NetdSocket:           mode.Socket,
+		Disabled:             !mode.DataPath(),
+		Logger:               logger,
 	})
 	go func() {
 		if err := net.Run(ctx); err != nil && ctx.Err() == nil {

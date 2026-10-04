@@ -101,7 +101,10 @@ func TestNetworkPolicyHosting(t *testing.T) {
 		PodCIDR:           "100.64.1.0/24",
 		MeshEgressIP:      "100.64.1.1",
 		PeerMeshEgressIPs: []string{"100.64.2.1"},
-		Logger:            slog.New(slog.NewTextHandler(logBuf, nil)),
+		// The server shape: its admin client may read the cluster-wide
+		// NetworkPolicies and Namespaces the watcher needs.
+		EnforceNetworkPolicy: true,
+		Logger:               slog.New(slog.NewTextHandler(logBuf, nil)),
 	})
 	if s.policy == nil {
 		t.Fatal("New must construct the NetworkPolicy verdict table (policy hosting is unconditional on the datapath)")

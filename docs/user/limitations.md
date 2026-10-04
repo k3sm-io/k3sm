@@ -270,15 +270,13 @@ are never enforced**, and policies against `kube-dns` or the `kubernetes` VIP ar
 because those VIPs bypass the proxy. It is a policy hint, NOT a security boundary. Isolate untrusted
 workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
-On a joined worker node:
+In a multi-node cluster:
 
-- The worker's policy table sees only the Pods running on that worker. A policy is enforced at the
-  worker's proxy only for backends that run on that worker.
-- A policy that selects a Pod on another node is not enforced from this worker. That traffic is
-  allowed.
-- Policies that select a worker's own backends are now enforced there. Before, they had no effect
-  on a worker.
-- Traffic arriving from a peer node's mesh address is always allowed at the destination.
+- A worker node does not enforce NetworkPolicy. Connections to a backend on a worker are allowed
+  whatever the policy says.
+- Policies are enforced for Pods on the server node.
+- A `from` rule with a `podSelector` or `namespaceSelector` cannot match a Pod on another node.
+  Traffic arriving from a peer node's mesh address is always allowed.
 
 The `k3sm.io/internet-egress` annotation is the same kind of control. It records that a Pod needs to
 reach networks beyond the cluster, and admission surfaces a hand-set one, but leaving it off does not
