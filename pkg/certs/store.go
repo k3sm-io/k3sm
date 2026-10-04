@@ -335,6 +335,59 @@ func ensureEtcdDir(workDir string) (string, error) {
 	return dir, nil
 }
 
+// caSpec is one CA keypair of the hierarchy: its id (for reports), the directory it
+// lives in, its file names there, and the Hierarchy field that holds it in memory.
+type caSpec struct {
+	id string
+	// dir returns the keypair's directory under workDir; it creates nothing.
+	dir func(workDir string) string
+	// ensureDir creates the keypair's directory with its mode (the PKI dir 0755, the
+	// etcd subdirectory 0700) and returns its path.
+	ensureDir func(workDir string) (string, error)
+	certFile  string
+	keyFile   string
+	ca        func(*Hierarchy) *CA
+}
+
+// caSpecs is the whole CA hierarchy, one row per CA, in write order. Every walk over
+// the on-disk hierarchy (WriteHierarchy, MissingOnDisk, ReconcileImportedHierarchy)
+// goes through it, so a CA is never added to one walk and forgotten by another.
+var caSpecs = []caSpec{
+	{id: "cluster", dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
+		ca: func(h *Hierarchy) *CA { return h.Cluster }},
+	{id: "signing", dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
+		ca: func(h *Hierarchy) *CA { return h.Signing }},
+	{id: "etcd-server", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
+		ca: func(h *Hierarchy) *CA { return h.EtcdServer }},
+	{id: "etcd-peer", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
+		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }},
+}
+
+// etcdPKIDir returns <PKI>/etcd; it creates nothing.
+func etcdPKIDir(workDir string) string { return EtcdCertPaths(workDir).Dir }
+
+// ensurePKIDir creates the PKI dir (0755, as EnsureHierarchy makes it) and returns it.
+func ensurePKIDir(workDir string) (string, error) {
+	dir := PKIDir(workDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create PKI dir: %w", err)
+	}
+	return dir, nil
+}
+
+// hierarchyComplete reports whether h carries every CA of the table.
+func hierarchyComplete(h *Hierarchy) bool {
+	if h == nil {
+		return false
+	}
+	for _, spec := range caSpecs {
+		if spec.ca(h) == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // WriteHierarchy writes h's four CA keypairs — cluster and signing into the work dir's
 // PKI directory, the etcd server and peer CAs into <PKI>/etcd (0700) — with certs 0644
 // and keys 0600. It is the inverse of EnsureHierarchy + EnsureEtcdCAs's load. The HA
@@ -347,48 +400,46 @@ func ensureEtcdDir(workDir string) (string, error) {
 // is the kernel's (O_CREATE|O_EXCL), not a stat-then-write, so two joins racing into
 // one work dir cannot both pass the check and then clobber each other's CA.
 func WriteHierarchy(workDir string, h *Hierarchy) error {
-	if h == nil || h.Cluster == nil || h.Signing == nil || h.EtcdServer == nil || h.EtcdPeer == nil {
+	if !hierarchyComplete(h) {
 		return fmt.Errorf("certs: write hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
 	}
-	dir := PKIDir(workDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create PKI dir: %w", err)
-	}
-	etcdDir, err := ensureEtcdDir(workDir)
-	if err != nil {
-		return err
-	}
-	files := []struct {
-		dir  string
-		name string
-		data []byte
-		mode os.FileMode
-	}{
-		{dir, clusterCACert, h.Cluster.CertPEM, 0o644},
-		{dir, clusterCAKey, h.Cluster.KeyPEM, 0o600},
-		{dir, signingCACert, h.Signing.CertPEM, 0o644},
-		{dir, signingCAKey, h.Signing.KeyPEM, 0o600},
-		{etcdDir, etcdServerCACert, h.EtcdServer.CertPEM, 0o644},
-		{etcdDir, etcdServerCAKey, h.EtcdServer.KeyPEM, 0o600},
-		{etcdDir, etcdPeerCACert, h.EtcdPeer.CertPEM, 0o644},
-		{etcdDir, etcdPeerCAKey, h.EtcdPeer.KeyPEM, 0o600},
-	}
-	for _, f := range files {
-		p := filepath.Join(f.dir, f.name)
-		fh, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, f.mode)
+	dirs := make([]string, len(caSpecs))
+	for i, spec := range caSpecs {
+		d, err := spec.ensureDir(workDir)
 		if err != nil {
-			if errors.Is(err, fs.ErrExist) {
-				return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA): %w", f.name, err)
-			}
-			return fmt.Errorf("write %s: %w", f.name, err)
+			return err
 		}
-		if _, err := fh.Write(f.data); err != nil {
-			_ = fh.Close()
-			return fmt.Errorf("write %s: %w", f.name, err)
+		dirs[i] = d
+	}
+	for i, spec := range caSpecs {
+		ca := spec.ca(h)
+		if err := writeExclusive(dirs[i], spec.certFile, ca.CertPEM, 0o644); err != nil {
+			return err
 		}
-		if err := fh.Close(); err != nil {
-			return fmt.Errorf("write %s: %w", f.name, err)
+		if err := writeExclusive(dirs[i], spec.keyFile, ca.KeyPEM, 0o600); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// writeExclusive creates dir/name with mode and writes data into it, refusing (with
+// an error wrapping fs.ErrExist) when the file already exists. The refusal is the
+// kernel's O_CREATE|O_EXCL, so an existing file is never truncated.
+func writeExclusive(dir, name string, data []byte, mode os.FileMode) error {
+	fh, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA): %w", name, err)
+		}
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	if _, err := fh.Write(data); err != nil {
+		_ = fh.Close()
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	if err := fh.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
 	}
 	return nil
 }
