@@ -43,7 +43,7 @@ import (
 	"k3sm.io/darwin-net/pkg/netd/wire"
 	"k3sm.io/darwin-net/pkg/podnet"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // recordTTL is the TTL (seconds) stamped on the A records the resolver answers.
@@ -206,11 +206,11 @@ func newClusterResolver(vip netip.Addr, domain string, zone dnsZone, fwd dnsForw
 	}
 	r := &clusterResolver{vip: vip, domain: domain, zone: zone, fwd: fwd, log: log, podCIDR: podnet.ClusterPodCIDR}
 	r.ident, _ = zone.(identitySource)
-	// The pinned Service CIDR (the same install.DefaultServiceCIDR the netd
+	// The pinned Service CIDR (the same defaults.ServiceCIDR the netd
 	// daemon admits VIP aliases from). A parse failure leaves the zero Prefix —
 	// authoritativeReverse then simply excludes it — but the constant is pinned
 	// and covered by tests, so this is defensive, not a fallback code path.
-	if p, err := netip.ParsePrefix(install.DefaultServiceCIDR); err == nil {
+	if p, err := netip.ParsePrefix(defaults.ServiceCIDR); err == nil {
 		r.serviceCIDR = p.Masked()
 	}
 	return r

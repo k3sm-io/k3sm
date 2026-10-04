@@ -22,7 +22,7 @@ import (
 	"strings"
 	"testing"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // TestFidelityBannerGolden pins the banner text against testdata goldens so its
@@ -108,7 +108,7 @@ func TestLoadImageLineStamped(t *testing.T) {
 // provider.PodExecutionUID's: the provider sets no PodBox uid/gid, so runtimed
 // resolves Credential{Drop: false}, so the pod keeps the daemon identity — and
 // --datapath needs root. That is strictly worse than the documented shipped
-// posture (the installed LaunchDaemon runs as install.DefaultServiceUser) and
+// posture (the installed LaunchDaemon runs as defaults.ServiceUser) and
 // nothing in the banner or the docs said so, which made it invisible rather than
 // accepted. This asserts the disclosure, NOT a behavior change: whether the dev
 // tier should default a runAsUser is a separate decision, deliberately not taken.
@@ -129,7 +129,7 @@ func TestDatapathBannerNamesTheRootPodPosture(t *testing.T) {
 		"pod identity:",
 		"ROOT (uid 0)",
 		"securityContext.runAsUser",
-		install.DefaultServiceUser,
+		defaults.ServiceUser,
 		"dev-only",
 	} {
 		if !strings.Contains(string(golden), must) {

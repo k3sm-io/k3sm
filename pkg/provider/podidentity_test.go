@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // TestPodExecutionUID pins the derivation of the uid the foreign-user admission
@@ -31,8 +31,8 @@ import (
 func TestPodExecutionUID(t *testing.T) {
 	const serviceUID = 271
 	found := func(name string) (int, error) {
-		if name != install.DefaultServiceUser {
-			t.Fatalf("looked up %q, want the service user %q", name, install.DefaultServiceUser)
+		if name != defaults.ServiceUser {
+			t.Fatalf("looked up %q, want the service user %q", name, defaults.ServiceUser)
 		}
 		return serviceUID, nil
 	}

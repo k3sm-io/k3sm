@@ -21,7 +21,7 @@ import (
 	"os/user"
 	"strconv"
 
-	"k3sm.io/k3sm/pkg/install"
+	"k3sm.io/k3sm/pkg/defaults"
 )
 
 // PodExecutionUID reports the uid a pod that declares NO securityContext actually
@@ -47,7 +47,7 @@ func PodExecutionUID(euid int) int64 {
 	uid, why := podExecutionUID(euid, lookupUID)
 	slog.Debug("resolved pod-execution uid", "uid", uid, "euid", euid, "source", why)
 	if uid == 0 {
-		slog.Warn("pods on this node execute as ROOT and the "+install.DefaultServiceUser+
+		slog.Warn("pods on this node execute as ROOT and the "+defaults.ServiceUser+
 			" service user does not resolve, so the foreign-user admission ceiling is pinned to uid 0: "+
 			"a pod explicitly requesting runAsUser 0 is ADMITTED (it would run as root regardless), "+
 			"and a pod requesting the service-user identity is REJECTED. Install k3sm (`sudo k3sm install`) "+
@@ -68,7 +68,7 @@ func PodExecutionUID(euid int) int64 {
 // k3sm pod identity" — contradicting the policy's own message and every doc — while
 // rejecting the one foreign identity this posture CAN honour (root may setuid, so a
 // pod asking for the service user genuinely gets it). The service user is therefore
-// the ceiling here, resolved BY NAME from install.DefaultServiceUser so the uid is
+// the ceiling here, resolved BY NAME from defaults.ServiceUser so the uid is
 // never hard-coded.
 //
 // Root server with no service user (an uninstalled host running the server under
@@ -78,10 +78,10 @@ func podExecutionUID(euid int, lookupUID func(name string) (int, error)) (int64,
 	if euid != 0 {
 		return int64(euid), "the unprivileged daemon euid pods inherit"
 	}
-	if uid, err := lookupUID(install.DefaultServiceUser); err == nil && uid != 0 {
-		return int64(uid), "the " + install.DefaultServiceUser + " service user"
+	if uid, err := lookupUID(defaults.ServiceUser); err == nil && uid != 0 {
+		return int64(uid), "the " + defaults.ServiceUser + " service user"
 	}
-	return int64(euid), "the root daemon euid (no " + install.DefaultServiceUser + " service user)"
+	return int64(euid), "the root daemon euid (no " + defaults.ServiceUser + " service user)"
 }
 
 // lookupUID resolves a system user name to its numeric uid.

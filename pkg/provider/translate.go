@@ -404,7 +404,7 @@ func injectClusterDNSEnv(box *runtimev1.PodBox, policy corev1.DNSPolicy, dnsCfg 
 // point — k3sm's server/agent commands carry no --service-cidr flag (only `k3sm
 // netd`'s proxy path does) — so the Service CIDR is derived by masking the
 // configured VIP to a /16, the range k3sm always allocates Service VIPs from
-// (10.43.0.10 -> 10.43.0.0/16, matching install.DefaultServiceCIDR). An empty or
+// (10.43.0.10 -> 10.43.0.0/16, matching defaults.ServiceCIDR). An empty or
 // unparseable/non-IPv4 VIP (e.g. a standalone `k3sm node` with no cluster DNS)
 // yields no Service CIDR entry; the pod CIDR is still returned as a fixed constant.
 func clusterCIDRs(dnsVIP string) []netip.Prefix {
