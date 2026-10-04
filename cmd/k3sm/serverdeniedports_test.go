@@ -139,3 +139,22 @@ func TestBringupDeniedLocalPortPolicyCarriesTheKinePort(t *testing.T) {
 		t.Errorf("provisioned CEL does not pin this server's kine port %d:\n%s", sentinelKinePort, expr)
 	}
 }
+
+// TestDeniedLocalPortsIncludesEtcdMetrics pins the etcd posture's deny set: the
+// member's loopback client port (--kine-port) and its unauthenticated loopback
+// metrics port, for either role flag; the kine posture is unchanged.
+func TestDeniedLocalPortsIncludesEtcdMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts serverOptions
+		want []int
+	}{
+		{"kine posture", serverOptions{kinePort: 2379, etcdMetricsPort: 2381}, []int{2379}},
+		{"--cluster-init", serverOptions{kinePort: 12379, etcdMetricsPort: 12381, clusterInit: true}, []int{12379, 12381}},
+		{"--server-join", serverOptions{kinePort: 12379, etcdMetricsPort: 12381, serverJoin: true}, []int{12379, 12381}},
+	} {
+		if got := tc.opts.deniedLocalPorts(); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: deniedLocalPorts() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

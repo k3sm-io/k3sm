@@ -293,14 +293,6 @@ const (
 	// without dragging the other with it.
 	ServerTokenDirMode  fs.FileMode = 0o700
 	ServerTokenFileMode fs.FileMode = 0o600
-	// DatastoreEndpointFileMode is the mode of the staged HA datastore DSN, the
-	// other credential the control-plane daemon is handed as a file. Stated
-	// separately from ServerTokenFileMode for the reason that one is stated
-	// separately from the agent's: it is a decision about a different file, whose
-	// contents are the OPERATOR's Postgres password rather than a token k3sm
-	// minted, and the two may move independently. The directory is the server
-	// work dir, so its mode is ServerTokenDirMode's — one directory, one answer.
-	DatastoreEndpointFileMode fs.FileMode = 0o600
 	// agentWorkSubdir is the agent's state root under the data root, the same
 	// directory `k3sm agent --work-dir` defaults to, so the token the installer
 	// stages and the state the agent keeps are one tree rather than two.
@@ -312,10 +304,6 @@ const (
 	// sits in the agent work dir: the credential a daemon presents lives in
 	// that daemon's own state tree.
 	serverTokenName = "token"
-	// datastoreEndpointName is the leaf name of the staged HA datastore DSN,
-	// beside the admin token in the server work dir for the same reason: what a
-	// daemon must read lives in that daemon's own state tree.
-	datastoreEndpointName = "datastore-endpoint"
 	// agentNodeKubeconfigName is the leaf name of the node kubeconfig the agent
 	// writes on a successful join — see AgentCredentialPath.
 	agentNodeKubeconfigName = "node.kubeconfig"
@@ -1171,7 +1159,7 @@ type Config struct {
 	ExecShimSource string
 	// PayloadSource is a directory holding the control-plane payload
 	// (executor.PayloadBinaries: kube-apiserver/scheduler/controller-manager/
-	// kubectl + kine) staged by `k3sm payload <dir>`. Install copies it to
+	// kubectl + kine + etcd) staged by `k3sm payload <dir>`. Install copies it to
 	// InstallDir/bin, from which the daemon boot seeds its workdir — the launchd
 	// _k3sm daemon has neither gh nor a Go toolchain to acquire them itself.
 	// Defaults to the cp-payload sibling dir of BinarySource.
@@ -1298,8 +1286,8 @@ type Config struct {
 	// SecretsEncryption is `k3sm install --secrets-encryption`: enable secrets
 	// encryption at rest on a NEW single-server control plane. The install mints
 	// a key and writes the credential pair under <DataRoot>/server/cred before
-	// the first start; it refuses on a worker, beside a carried server join or
-	// datastore endpoint, and over an existing datastore. False never touches
+	// the first start; it refuses on a worker, beside a carried --cluster-init or
+	// --server-join, and over an existing datastore. False never touches
 	// the credential directory. See preflightSecretsEncryption.
 	SecretsEncryption bool
 	// KeyEntropy is where a minted secrets-encryption key is read from. Nil is
@@ -1334,6 +1322,22 @@ type Config struct {
 	// terminal error naming the remedy (mint a token on the server and start the
 	// agent with it).
 	Deregister func(ctx context.Context) error
+	// DeregisterServer removes this server's own etcd member from the embedded-etcd
+	// cluster it belongs to, and is called by Uninstall on a SERVER teardown whose
+	// installed plist carries --cluster-init or --server-join, and on no other. Nil
+	// skips it.
+	//
+	// It runs at the same point as Deregister — after any purge preflight, before
+	// a single daemon is booted out — because the call needs the local etcd member
+	// still running: a member removes itself through its own loopback client, which
+	// needs only the cluster's quorum, the same condition any membership change
+	// needs. The uninstalling host holds no server-class token, so it does not ask
+	// a peer.
+	//
+	// BEST EFFORT, like Deregister: a failure (no quorum, the member already gone)
+	// is one warning with the remedy for the servers that stay, and the teardown
+	// continues. A purge the preflight refuses makes no call.
+	DeregisterServer func(ctx context.Context) error
 	// Purge makes Uninstall also remove everything it otherwise keeps: the data
 	// root (and the data volume under it), the daemon log dir, the arguments
 	// records, the k3sm context in TargetUser's kubeconfig and the service user.
@@ -1868,24 +1872,6 @@ func adoptPodLogTree(sys System, cfg Config, uid uint32) {
 // a second spelling of either would be a daemon pointed at a file nobody wrote.
 func (c Config) serverTokenPath() string {
 	return filepath.Join(c.serverWorkDir(), serverTokenName)
-}
-
-// datastoreEndpointPath is where Install stages the HA datastore DSN for the
-// control-plane daemon to read: <DataRoot>/server/datastore-endpoint,
-// service-user-owned 0600 (see DatastoreEndpointFileMode).
-//
-// It is serverTokenPath's sibling and exists for the same reason, against a
-// credential that is not k3sm's to mint. A Postgres DSN carries a password, and
-// rendering it as a VALUE on the server LaunchDaemon's argv published it twice
-// over even after B249 narrowed the plist to 0600: `ps` shows a running job's
-// arguments to every account on the Mac for the daemon's whole life, and
-// launchd echoes them back from its own job description. Neither is affected by
-// the plist's mode.
-//
-// The path is derived rather than configured, exactly as the token's is: it is
-// the one path the installer writes and the one path it renders onto the argv.
-func (c Config) datastoreEndpointPath() string {
-	return filepath.Join(c.serverWorkDir(), datastoreEndpointName)
 }
 
 // stageTokenFile writes token at dst, owned by the service uid at mode inside a
@@ -2500,11 +2486,11 @@ func (c Config) plistPath(label string) string {
 //
 // ServerPlistMode is 0600, because the server plist's argv is the one that
 // carries credentials. Not the admin token any more — that moved to a staged
-// file — but the OPERATOR's preserved arguments, which legitimately include
-// `--datastore-endpoint postgres://user:password@host/db`. pkg/dataroot already
-// keeps the server-arguments record root-only 0600 for exactly that reason
-// (serverArgsRecordMode), and the plist holds the same string, so leaving it
-// 0644 kept a world-readable second copy of what the record is careful about.
+// file — but the OPERATOR's preserved arguments, which k3sm cannot vouch for and
+// which may carry a credential. pkg/dataroot already keeps the server-arguments
+// record root-only 0600 for exactly that reason (serverArgsRecordMode), and the
+// plist holds the same strings, so leaving it 0644 kept a world-readable second
+// copy of what the record is careful about.
 // Nothing but root needs to read it: launchd is root, and `k3sm install` and
 // `k3sm status` read it as root when they can.
 //
@@ -2648,6 +2634,9 @@ func artifactManifest(cfg Config) []artifact {
 	// assertExists is false — an archive produced before markers existed still installs, and
 	// the seed falls back to rebuilding rather than trusting bytes nothing vouched for.
 	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.KineMarkerName), assertExists: false})
+	// The etcd version marker rides beside the etcd binary on exactly the kine marker's
+	// terms (the work-dir seed replaces a stale etcd only from a payload it vouches for).
+	items = append(items, artifact{kind: kindFile, disp: dispInstallDirCovered, path: filepath.Join(cfg.InstallDir, "bin", executor.EtcdMarkerName), assertExists: false})
 	// The control-plane version marker rides beside the four kube binaries on the same
 	// terms: it is what lets the work-dir seed replace a stale control-plane set after a
 	// binary-only upgrade, and a pre-marker archive has none, so it is not asserted.
@@ -2696,21 +2685,6 @@ func artifactManifest(cfg Config) []artifact {
 	// such file until the next install stages one.
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
-		// The staged HA datastore DSN, beside it and with the OPPOSITE
-		// disposition: PRESERVED, like everything else under the data root.
-		//
-		// The token is a credential this install minted and can mint again, so
-		// leaving it behind would leave a cluster-admin secret on a machine
-		// somebody just uninstalled k3sm from. The DSN is the OPERATOR's: k3sm
-		// cannot re-derive it, the flag naming it is carried across a reinstall
-		// out of the preserved arguments record, and an uninstall that deleted
-		// the file would turn the next install into the refusal
-		// requireDatastoreEndpointFile exists to raise. It is no more exposed
-		// there than the rest of the preserved data root, which holds the
-		// cluster's signing keys.
-		//
-		// assertExists is false: a single-node server stages no DSN at all.
-		items = append(items, artifact{kind: kindFile, disp: dispPreserve, path: cfg.datastoreEndpointPath(), assertExists: false})
 		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
 		// deleting the key would leave every Secret in the preserved state.db
 		// unreadable. assertExists is false: encryption is opt-in.
@@ -2951,12 +2925,11 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 
 	// 0b. Still before anything else is written: on a control-plane install,
 	//     does the carried `k3sm server` argument set (the installed plist, or
-	//     the survives-uninstall record when there is none) name a
-	//     --datastore-endpoint-file that is no longer on disk? Rendering the
-	//     plist anyway would bring an HA control plane up on its own
-	//     single-node datastore with no log line — a split cluster whose only
-	//     symptom is objects the other servers cannot see — so this refuses
-	//     before the copies below rather than after them. It returns the SAME
+	//     the survives-uninstall record when there is none) name a retired
+	//     external-datastore flag? Rendering the plist anyway would hand launchd
+	//     a daemon that exits on an unknown flag at every respawn, so this
+	//     refuses before the copies below rather than after them, and names the
+	//     embedded-etcd replacement. It returns the SAME
 	//     carried arguments step 2d assigns to cfg.ExtraServerArgs, so the
 	//     installed plist/record is read exactly once per install. Runs after
 	//     the data volume above: the carry-over's "nothing was carried" warning
@@ -2969,8 +2942,8 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 		return err
 	}
 	// 0b′. Secrets encryption, decided from reads alone and before the first
-	//      write that follows: it needs the carried arguments above (a server
-	//      join or a datastore endpoint refuses it) and the data root as the
+	//      write that follows: it needs the carried arguments above (a carried
+	//      --cluster-init or --server-join refuses it) and the data root as the
 	//      data volume left it (a datastore already there refuses it). The
 	//      pair itself is written at 1f′, once the service uid is known.
 	encryptionAction, err := preflightSecretsEncryption(sys, cfg, serverArgs)
@@ -3208,6 +3181,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     with a pin nothing vouched for.
 	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.KineMarkerName),
 		cfg.stagedPayloadFile(executor.KineMarkerName))
+	//     The etcd version marker is staged the same way, for the same reasons.
+	_ = sys.CopyToRootOwned(filepath.Join(cfg.PayloadSource, executor.EtcdMarkerName),
+		cfg.stagedPayloadFile(executor.EtcdMarkerName))
 	//     The control-plane version marker is staged the same way and for the same
 	//     reasons: without it the seed cannot tell this release's kube binaries from
 	//     the ones an earlier release left in the work dir, and an absent marker only
@@ -3262,19 +3238,6 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//      log-only: nothing here needs to mutate cfg.ExtraServerArgs itself.
 	if old := flagValue(cfg.ExtraServerArgs, "mesh-ip"); cfg.MeshIP != "" && old != "" && old != cfg.MeshIP {
 		cfg.Logger.Info("--mesh-ip replaces the mesh address carried over from the previous install", "old", old, "new", cfg.MeshIP)
-	}
-	// 2d‴. Move a password-bearing datastore DSN off the daemon's command line,
-	//      into a service-user-owned 0600 file the argv then merely names. It sits
-	//      HERE and nowhere else: after the carry-over has decided the arguments,
-	//      and before both the record below and the plist at step 3 are written
-	//      from them, so the two on-disk copies of the argv agree and neither
-	//      holds the password. It also refuses an install whose carried
-	//      --datastore-endpoint-file names a file that is gone — see
-	//      stageDatastoreEndpoint.
-	if cfg.Role == RoleServer {
-		if err := stageDatastoreEndpoint(sys, &cfg, uid); err != nil {
-			return err
-		}
 	}
 	// 2d′. Record them, on EVERY install and whatever the source was — including
 	//      an empty set, which is the truthful record of a node that has none.
@@ -3552,6 +3515,7 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 	// best-effort and never note()d — a Mac being retired is often being retired
 	// because the cluster is gone, and an uninstall that refused to finish over
 	// that would leave the operator with a half-installed machine.
+	deregisterServer(ctx, sys, cfg, m)
 	deregisterNode(ctx, cfg, m)
 	for i := len(m) - 1; i >= 0; i-- {
 		a := m[i]
@@ -3701,6 +3665,50 @@ func deregisterNode(ctx context.Context, cfg Config, m []artifact) {
 		return
 	}
 	cfg.Logger.Info("removed this node from the cluster: its MeshPeer and Node are gone, so the remaining nodes drop their wireguard entry for it")
+}
+
+// serverDeregisterRemedy is what the servers that stay do when this server's etcd
+// member could not be removed: with the member still registered, a two-server
+// cluster has lost its quorum the moment this daemon stops.
+const serverDeregisterRemedy = "on the surviving server run: sudo launchctl bootout system/" + ServerLabel +
+	" && sudo k3sm server --cluster-reset --work-dir <its work dir> --node-ip <its node IP>, then start it again; or, while the cluster still has quorum, remove the member from a surviving server"
+
+// deregisterServer removes this server's etcd member before the teardown stops it,
+// on a server whose installed plist selects the embedded-etcd posture and on no
+// other. The posture is read from the plist on disk (as the role is read from the
+// manifest), so `sudo k3sm uninstall` needs no flags. A plist that cannot be read or
+// parsed says nothing about the posture, so nothing is attempted.
+func deregisterServer(ctx context.Context, sys System, cfg Config, m []artifact) {
+	if cfg.DeregisterServer == nil || !carriesServerDaemon(m) {
+		return
+	}
+	raw, err := sys.ReadFile(cfg.plistPath(ServerLabel))
+	if err != nil {
+		return
+	}
+	args, err := parseProgramArguments(raw)
+	if err != nil || !carriesEtcdPosture(args) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deregisterTimeout)
+	defer cancel()
+	if err := cfg.DeregisterServer(ctx); err != nil {
+		cfg.Logger.Warn("could not remove this server's etcd member from the cluster; the servers that stay still count it toward quorum",
+			"err", err, "remedy", serverDeregisterRemedy)
+		return
+	}
+	cfg.Logger.Info("removed this server's etcd member from the cluster; the remaining servers no longer count it toward quorum")
+}
+
+// carriesServerDaemon reports whether the manifest tears down the control-plane
+// daemon.
+func carriesServerDaemon(m []artifact) bool {
+	for _, a := range m {
+		if a.kind == kindDaemon && a.label == ServerLabel {
+			return true
+		}
+	}
+	return false
 }
 
 // carriesAgentDaemon reports whether the manifest tears down the worker daemon,

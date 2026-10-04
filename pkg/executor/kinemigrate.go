@@ -132,17 +132,17 @@ func readKinePin(workDir string) (version, variant string, ok bool) {
 // bringUp AFTER kine is serving, so the stamp means "this pin has successfully opened
 // this database", not "we intended to run this pin".
 //
-// The posture is decided by datastoreEndpoint: an external (Postgres) datastore has no
-// per-node SQLite file to stamp, so it is skipped. It is deliberately NOT decided by
-// whether state.db is on disk yet. That test conflated two different states — "this
-// node serves an external datastore" and "this node has just been born" — because a
+// The posture is decided by the configuration: the etcd posture has no kine SQLite
+// file to stamp, so it is skipped. It is deliberately NOT decided by whether state.db
+// is on disk yet. That test conflated two different states — "this node does not run
+// kine" and "this node has just been born" — because a
 // fresh node's database is created by the kine child, not by the executor. A fresh node
 // therefore went unstamped and first became stamped on its SECOND boot, leaving every
 // reader of the stamp seeing "no pin has opened this datastore" for a datastore a known
 // pin was, right then, serving.
-func recordKinePin(workDir, version, datastoreEndpoint string) error {
-	if datastoreEndpoint != "" {
-		return nil // external datastore: no per-node SQLite file this stamp could describe
+func recordKinePin(workDir, version string, etcdPosture bool) error {
+	if etcdPosture {
+		return nil // no kine datastore this stamp could describe
 	}
 	// The stamp lives beside the datastore, and on a first boot it can be written before
 	// kine has finished creating it, so do not depend on the directory already existing.

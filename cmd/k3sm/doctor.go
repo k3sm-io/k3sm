@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,6 +103,10 @@ type doctorEnv struct {
 	brewPresent      func() bool                                                           // exec.LookPath("brew")
 	datastorePosture func() (present bool, userVersion int, journalMode string, err error) // read-only sqlite header
 	developerDir     func() (string, error)                                                // xcode-select -p
+	// etcdMember reports whether this server holds an embedded etcd member (the HA
+	// posture, which has no state.db) and, when it does, the status record the
+	// running server keeps; err is the record's read error. Nil is "no member".
+	etcdMember func() (present bool, st executor.EtcdStatus, err error)
 	// nodeRole is which node this Mac is installed as, from the two
 	// node-daemon plists (install.RoleFromPlists), and whether it is installed
 	// at all. agentState is the agent LaunchDaemon's launchd state, and
@@ -259,6 +264,33 @@ func checkBrew(env doctorEnv) checkResult {
 	}
 }
 
+// checkEtcdDatastore is checkDatastore's embedded-etcd arm: an HA server's state of
+// record is its etcd member, not a state.db, so "no state.db yet" would read as a
+// server that never came up. It judges the member's status record with the same
+// rule `k3sm status`'s etcd row uses (status.EtcdHealth).
+func checkEtcdDatastore(st executor.EtcdStatus, err error) checkResult {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return checkResult{name: "datastore", status: statusSkip, detail: "embedded etcd member (HA); no status recorded yet (the member has not started)"}
+	case err != nil:
+		return checkResult{
+			name:   "datastore",
+			status: statusWarn,
+			detail: fmt.Sprintf("embedded etcd member (HA); could not read its status record: %v", err),
+			remedy: "sudo k3sm doctor   # the work dir is the service user's; an ordinary account cannot read it",
+		}
+	}
+	sev, detail, remedy := status.EtcdHealth(st)
+	r := checkResult{name: "datastore", status: statusPass, detail: fmt.Sprintf("embedded etcd %s member (HA): %s", executor.DefaultEtcdVersion, detail)}
+	switch sev {
+	case status.SeverityFail:
+		r.status, r.remedy = statusFail, remedy
+	case status.SeverityWarn:
+		r.status, r.remedy = statusWarn, remedy
+	}
+	return r
+}
+
 // checkDatastore reports the kine SQLite datastore posture. It is a pure REPORTER:
 // an absent state.db is a fresh node → SKIP (distinct from PASS — never a silent
 // pass); a present, readable db → PASS reporting the bundled kine pin, user_version,
@@ -279,6 +311,11 @@ func checkBrew(env doctorEnv) checkResult {
 func checkDatastore(env doctorEnv) checkResult {
 	if role, installed := env.nodeRole(); installed && role == install.RoleAgent {
 		return checkResult{name: "datastore", status: statusSkip, detail: status.WorkerDatastoreDetail}
+	}
+	if env.etcdMember != nil {
+		if present, st, err := env.etcdMember(); present {
+			return checkEtcdDatastore(st, err)
+		}
 	}
 	present, uv, jm, err := env.datastorePosture()
 	if err != nil {
@@ -727,6 +764,17 @@ func realDoctorEnv(workDir string) doctorEnv {
 		brewPresent:  func() bool { _, err := exec.LookPath("brew"); return err == nil },
 		datastorePosture: func() (bool, int, string, error) {
 			return probeDatastorePosture(executor.StateDBPath(workDir))
+		},
+		etcdMember: func() (bool, executor.EtcdStatus, error) {
+			// Present only on positive evidence: an unreadable work dir (a plain
+			// user) must fall through to the kine arm's "run with sudo", never
+			// claim an etcd member it cannot see.
+			_, statErr := os.Stat(executor.EtcdStatusPath(workDir))
+			if !executor.EtcdMemberExists(workDir) && statErr != nil {
+				return false, executor.EtcdStatus{}, nil
+			}
+			st, err := executor.ReadEtcdStatus(workDir)
+			return true, st, err
 		},
 		developerDir: probeDeveloperDir,
 		nodeRole:     installedRole,

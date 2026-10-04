@@ -32,9 +32,10 @@ const (
 	// EncryptionCredDirMode is the mode of the credential directory holding the
 	// pair.
 	EncryptionCredDirMode fs.FileMode = 0o700
-	// serverJoinFlag is `k3sm server`'s HA join flag, read off the carried
-	// arguments.
-	serverJoinFlag = "server-join"
+	// clusterInitFlag and serverJoinFlag are `k3sm server`'s two embedded-etcd
+	// HA role flags, read off the carried arguments.
+	clusterInitFlag = "cluster-init"
+	serverJoinFlag  = "server-join"
 )
 
 // encryptionStore is the executor's EncryptionStore over the install seams:
@@ -84,15 +85,13 @@ func (s encryptionStore) WriteFile(path string, contents []byte) error {
 	return s.sys.WriteServiceUserFile(path, contents, s.uid, EncryptionFileMode, EncryptionCredDirMode)
 }
 
-// carriesHADatastore reports whether the carried `k3sm server` arguments name a
-// server join or an external datastore, in any spelling.
-func carriesHADatastore(args []string) bool {
-	if flagValue(args, datastoreEndpointFlag) != "" || flagValue(args, datastoreEndpointFileFlag) != "" {
-		return true
-	}
+// carriesEtcdPosture reports whether the carried `k3sm server` arguments select
+// the embedded-etcd HA posture — --cluster-init or --server-join, in any spelling
+// (single or double dash, bare or =true; an explicit =false does not count).
+func carriesEtcdPosture(args []string) bool {
 	for _, a := range args {
 		name, value, inline := splitFlag(a)
-		if name == serverJoinFlag && (!inline || value != "false") {
+		if (name == clusterInitFlag || name == serverJoinFlag) && (!inline || value != "false") {
 			return true
 		}
 	}
@@ -112,7 +111,7 @@ func preflightSecretsEncryption(sys System, cfg Config, serverArgs []string) (ex
 		executor.EncryptionInstallRequest{
 			Requested: cfg.SecretsEncryption,
 			Agent:     cfg.Role == RoleAgent,
-			HA:        cfg.Role == RoleServer && carriesHADatastore(probe.resolvedExtraServerArgs()),
+			HA:        cfg.Role == RoleServer && carriesEtcdPosture(probe.resolvedExtraServerArgs()),
 		})
 	if err != nil {
 		return executor.EncryptionLeave, fmt.Errorf("install: --secrets-encryption: %w", err)

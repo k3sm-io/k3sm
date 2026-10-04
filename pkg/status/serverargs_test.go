@@ -167,33 +167,12 @@ func TestServerArgsRowRenders(t *testing.T) {
 	}
 }
 
-// TestServerArgsRowRedactsDatastoreCredentials is the DSN half of the same
-// contract the token half already had: --datastore-endpoint carries a password,
-// and this row prints the argv it appears on.
-func TestServerArgsRowRedactsDatastoreCredentials(t *testing.T) {
-	p := testPaths(t.TempDir())
-	plist := filepath.Join(p.LaunchDaemonDir, p.ServerLabel+".plist")
-	fsys := installedFS(p)
-	fsys.contents = map[string][]byte{plist: []byte("--datastore-endpoint postgres://u:s3cret@h/db")}
-
-	row, ok := Collector{FS: fsys, ServerArgs: fakeServerArgs, Paths: p}.serverArgsRow()
-	if !ok {
-		t.Fatal("no server-args row")
-	}
-	if strings.Contains(row.Detail, "s3cret") {
-		t.Errorf("the row leaked the datastore password: %q", row.Detail)
-	}
-	if !strings.Contains(row.Detail, "postgres://u:***@h/db") {
-		t.Errorf("the row must still name the endpoint: %q", row.Detail)
-	}
-}
-
 // TestRedactURLCredentials pins the pattern itself, including what it must NOT
 // touch: a redaction that fired on every colon would mask host:port pairs and
 // make the whole report unreadable.
 func TestRedactURLCredentials(t *testing.T) {
 	for _, tc := range []struct{ name, in, want string }{
-		{"a dsn password", "endpoint postgres://u:s3cret@h/db", "endpoint postgres://u:***@h/db"},
+		{"a url password", "endpoint scheme://u:s3cret@h/db", "endpoint scheme://u:***@h/db"},
 		{"an https url with credentials", "https://admin:hunter2@example.com/x", "https://admin:***@example.com/x"},
 		{"no credentials", "https://example.com:6443/readyz", "https://example.com:6443/readyz"},
 		{"a host:port is not a credential", "listen 127.0.0.1:6444", "listen 127.0.0.1:6444"},

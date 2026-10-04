@@ -164,57 +164,22 @@ func TestSaveSnapshotOutSelection(t *testing.T) {
 	}
 }
 
-// TestSnapshotRefusesExternalDatastore pins the HA/Postgres refusal — the decision this
-// item was gated on. Both signals refuse (the DSN and the on-disk .pgpass), both
-// subcommands refuse, and the message names pg_dump WITHOUT echoing the DSN password.
-func TestSnapshotRefusesExternalDatastore(t *testing.T) {
-	const password = "sup3r-s3cret"
-	dsn := "postgres://kine:" + password + "@db.example:5432/kine?sslmode=require"
+// TestSaveSnapshotRefusesEtcdMember pins that the SQLite save never copies a state.db
+// on a server whose state of record is an etcd member: the member is decisive even with
+// a state.db beside it, and nothing is written.
+func TestSaveSnapshotRefusesEtcdMember(t *testing.T) {
 	work := snapshotFixture(t, 3, 0)
-	snap := filepath.Join(t.TempDir(), "s.db")
-	if err := copyFile(StateDBPath(work), snap, 0o600); err != nil {
+	if err := os.MkdirAll(etcdMemberDir(work), 0o700); err != nil {
 		t.Fatal(err)
 	}
-
-	assert := func(t *testing.T, err error) {
-		t.Helper()
-		if !errors.Is(err, ErrSnapshotExternalDatastore) {
-			t.Fatalf("err = %v, want ErrSnapshotExternalDatastore", err)
-		}
-		if !strings.Contains(err.Error(), "pg_dump") {
-			t.Errorf("the refusal does not name pg_dump: %v", err)
-		}
-		if strings.Contains(err.Error(), password) {
-			t.Errorf("the refusal echoed the datastore password: %v", err)
-		}
+	out := filepath.Join(t.TempDir(), "s.db")
+	_, err := SaveSnapshot(context.Background(), SnapshotSaveOptions{WorkDir: work, Out: out})
+	if !errors.Is(err, ErrSnapshotEtcdMember) {
+		t.Fatalf("err = %v, want ErrSnapshotEtcdMember", err)
 	}
-
-	t.Run("save with a postgres endpoint", func(t *testing.T) {
-		_, err := SaveSnapshot(context.Background(), SnapshotSaveOptions{WorkDir: work, DatastoreEndpoint: dsn})
-		assert(t, err)
-	})
-	t.Run("restore with a postgres endpoint", func(t *testing.T) {
-		_, err := RestoreSnapshot(context.Background(), SnapshotRestoreOptions{
-			WorkDir: work, DatastoreEndpoint: dsn, Snapshot: snap, Running: noServer,
-		})
-		assert(t, err)
-	})
-	t.Run("a pgpass file in the work dir is decisive on its own", func(t *testing.T) {
-		pg := pgPassPath(work)
-		if err := os.WriteFile(pg, []byte("*:*:*:kine:"+password+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.Remove(pg) })
-		_, err := SaveSnapshot(context.Background(), SnapshotSaveOptions{WorkDir: work})
-		assert(t, err)
-		if !strings.Contains(err.Error(), pg) {
-			t.Errorf("the refusal does not name the file that caused it: %v", err)
-		}
-	})
-	t.Run("an unparseable endpoint is withheld entirely", func(t *testing.T) {
-		_, err := SaveSnapshot(context.Background(), SnapshotSaveOptions{WorkDir: work, DatastoreEndpoint: "postgres://k:" + password + "@%%%"})
-		assert(t, err)
-	})
+	if fileExists(out) {
+		t.Errorf("a refused save wrote %s", out)
+	}
 }
 
 // TestSaveSnapshotRefusals covers the two remaining save-side refusals: no datastore at
@@ -355,7 +320,7 @@ func TestRestoreReplacesAndPreserves(t *testing.T) {
 		"INSERT INTO kine (name, value) VALUES ('/registry/pods/default/after', randomblob(64));").CombinedOutput(); err != nil {
 		t.Fatalf("post-snapshot write: %v: %s", err, out)
 	}
-	if err := recordKinePin(work, DefaultKineVersion, ""); err != nil {
+	if err := recordKinePin(work, DefaultKineVersion, false); err != nil {
 		t.Fatal(err)
 	}
 
