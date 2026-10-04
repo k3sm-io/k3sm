@@ -16,24 +16,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// M6 synthetic conformance criteria (DESIGN §9 M6; docs/PHASES.md M6.0) — HA:
-// kine→Postgres multi-writer datastore + leader election. These are LAB-tier
-// (hack/lab/m6.sh, K3SM_LAB=1): they need TWO control-plane servers sharing ONE
-// Postgres. $KUBECONFIG points at server A; $K3SM_KUBECONFIG_B at server B. A
-// criterion SKIPS (which the non-vacuous guard turns RED under K3SM_LAB — "you said
-// you have the rig, prove it") unless server B's kubeconfig is provided.
+// M6 synthetic conformance criteria (DESIGN §9 M6; docs/PHASES.md M6.0/M6.1) — HA:
+// embedded etcd (one member per server, learner join + promotion) and leader
+// election. These are LAB-tier (hack/lab/m6.sh, K3SM_LAB=1): they need TWO
+// control-plane servers, A (--cluster-init) and B (--server-join). $KUBECONFIG points
+// at server A; $K3SM_KUBECONFIG_B at server B. A criterion SKIPS (which the
+// non-vacuous guard turns RED under K3SM_LAB — "you said you have the rig, prove
+// it") unless its inputs are provided.
 //
-// The M6.0 acceptance is: two servers run against one Postgres; a write on A is read
-// on B; killing A leaves the cluster serving via B. The kill-A→serve-via-B failover
-// is an operator step in hack/lab/m6.sh (it stops server A's daemon, then re-checks
-// /healthz on B); the API-verifiable halves live here.
+// On two Macs this proves the mechanics (join, TLS, replication, leader election,
+// quorum loss, recovery, reset, cold restart), not fault tolerance: two voting
+// members tolerate zero failures. The quorum-loss, recovery, reset and cold-restart
+// legs stop daemons, so they live in hack/lab/m6.sh; the API-verifiable halves live
+// here.
+//
+// The etcd client listener is loopback-only, so nothing here dials etcd. The script
+// asks each server's own member, on that host's loopback with that host's
+// client.crt, and hands this suite the answers as files: the member list
+// ($K3SM_M6_MEMBERS_A / _B) and the etcd CA certificates ($K3SM_M6_ETCD_CA_A / _B,
+// directories holding server-ca.crt and peer-ca.crt).
 package e2e
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -42,17 +52,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"k3sm.io/k3sm/pkg/certs"
 )
 
 // serverBClient connects to the SECOND HA control-plane server via
-// $K3SM_KUBECONFIG_B, skipping when it is unset (single-server run — the multi-writer
-// criteria cannot be proven). Both servers share one Postgres, so a client of either
-// observes the same datastore.
+// $K3SM_KUBECONFIG_B, skipping when it is unset (single-server run — the two-server
+// criteria cannot be proven). Each server's apiserver talks to its own etcd member,
+// and the members replicate, so a client of either observes the same data.
 func serverBClient(t *testing.T) kubernetes.Interface {
 	t.Helper()
 	kb := os.Getenv("K3SM_KUBECONFIG_B")
 	if kb == "" {
-		t.Skip("M6: $K3SM_KUBECONFIG_B unset — the second HA server's kubeconfig is required for the multi-writer criteria")
+		t.Skip("M6: $K3SM_KUBECONFIG_B unset — the second HA server's kubeconfig is required for the two-server criteria")
 	}
 	cfg, err := clientcmd.BuildConfigFromFlags("", kb)
 	if err != nil {
@@ -65,9 +77,9 @@ func serverBClient(t *testing.T) kubernetes.Interface {
 	return cs
 }
 
-// TestM6_WriteOnAReadOnB proves the multi-writer datastore: a write committed on
-// server A is read on server B (they share one Postgres — the single source of
-// truth). This is the core M6.0 acceptance behavior.
+// TestM6_WriteOnAReadOnB proves replication: a write committed through server A's
+// apiserver (into A's etcd member) is read through server B's apiserver (from B's
+// member).
 func TestM6_WriteOnAReadOnB(t *testing.T) {
 	a := Up(t)            // server A (admin $KUBECONFIG); skips if unset
 	b := serverBClient(t) // server B (skips if $K3SM_KUBECONFIG_B unset)
@@ -86,8 +98,8 @@ func TestM6_WriteOnAReadOnB(t *testing.T) {
 	}
 
 	// Server B must observe A's committed write. A consistent read (ResourceVersion
-	// unset) goes to the shared datastore, so a small bound covers replication of the
-	// apiserver watch caches.
+	// unset) is a quorum read of etcd, so a small bound covers B's apiserver catching
+	// up.
 	var last string
 	if !pollUntil(15*time.Second, func() bool {
 		cm, err := b.CoreV1().ConfigMaps(ns).Get(ctx, name, metav1.GetOptions{})
@@ -98,7 +110,7 @@ func TestM6_WriteOnAReadOnB(t *testing.T) {
 		last = cm.Data["k"]
 		return last == want
 	}) {
-		t.Fatalf("server B never read server A's write %q (last %q) — the datastore is not shared/consistent", want, last)
+		t.Fatalf("server B never read server A's write %q (last %q) — the members are not replicating", want, last)
 	}
 }
 
@@ -107,7 +119,7 @@ func TestM6_WriteOnAReadOnB(t *testing.T) {
 // kube-system. With --leader-elect=false (single-node) those components run WITHOUT a
 // Lease, so a held Lease is direct evidence the HA posture took effect — and the two
 // servers therefore do NOT both run active schedulers/KCMs. When server B is present,
-// both servers resolve the SAME holder (the shared datastore yields one leader).
+// both servers resolve the SAME holder (one etcd cluster yields one leader).
 func TestM6_LeaderElectionSingleActive(t *testing.T) {
 	a := Up(t)
 	ctx := context.Background()
@@ -145,8 +157,8 @@ func TestM6_LeaderElectionSingleActive(t *testing.T) {
 // certificate-authority-data — direct evidence the joining server rebuilt the identical
 // CA hierarchy rather than minting its own divergent one. It needs both kubeconfigs
 // ($KUBECONFIG = server A, $K3SM_KUBECONFIG_B = server B), each CA-bearing (the HA admin
-// kubeconfig, not the loopback token kubeconfig). The live failover is the m6.sh
-// kill-A→serve-via-B leg.
+// kubeconfig, not the loopback token kubeconfig). The etcd CA pins are compared
+// from the CA files hack/lab/m6.sh collects from each server.
 func TestM6_SecondServerJoinsReconstructsCAs(t *testing.T) {
 	_ = Up(t)            // skips if $KUBECONFIG unset
 	_ = serverBClient(t) // skips if $K3SM_KUBECONFIG_B unset
@@ -157,6 +169,108 @@ func TestM6_SecondServerJoinsReconstructsCAs(t *testing.T) {
 	}
 	if !bytes.Equal(caA, caB) {
 		t.Fatalf("server A and server B embed DIFFERENT cluster CAs — the second server did not reconstruct the identical CA from the bundle")
+	}
+
+	// Bundle v2 carries the two etcd CAs: both servers must hold the same etcd server
+	// CA and the same etcd peer CA (a joining server that minted its own would be
+	// refused by every peer and could not read the cluster's client listener).
+	dirA, dirB := os.Getenv("K3SM_M6_ETCD_CA_A"), os.Getenv("K3SM_M6_ETCD_CA_B")
+	if dirA == "" || dirB == "" {
+		t.Skip("M6.1: $K3SM_M6_ETCD_CA_A / $K3SM_M6_ETCD_CA_B unset — each server's tls/etcd/server-ca.crt and peer-ca.crt are required (hack/lab/m6.sh collects them)")
+	}
+	for _, name := range []string{"server-ca.crt", "peer-ca.crt"} {
+		pinA, pinB := caPin(t, filepath.Join(dirA, name)), caPin(t, filepath.Join(dirB, name))
+		if pinA != pinB {
+			t.Errorf("etcd %s differs between the servers (A pin %s, B pin %s) — the second server did not import the etcd CAs from the bundle", name, pinA, pinB)
+		}
+	}
+	if caPin(t, filepath.Join(dirA, "server-ca.crt")) == caPin(t, filepath.Join(dirA, "peer-ca.crt")) {
+		t.Error("the etcd server CA and the etcd peer CA are the same certificate; they must be distinct roots")
+	}
+}
+
+// caPin returns the pin of the CA certificate at path.
+func caPin(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	pin, err := certs.CertPin(b)
+	if err != nil {
+		t.Fatalf("pin %s: %v", path, err)
+	}
+	return pin
+}
+
+// etcdMemberList is the part of etcd's v3 JSON gateway member-list answer
+// (POST /v3/cluster/member/list) this suite reads. The gateway renders uint64s as
+// strings and omits zero values, so an absent isLearner is a voting member.
+type etcdMemberList struct {
+	Header struct {
+		ClusterID string `json:"cluster_id"`
+		MemberID  string `json:"member_id"`
+	} `json:"header"`
+	Members []struct {
+		ID         string   `json:"ID"`
+		Name       string   `json:"name"`
+		PeerURLs   []string `json:"peerURLs"`
+		ClientURLs []string `json:"clientURLs"`
+		IsLearner  bool     `json:"isLearner"`
+	} `json:"members"`
+}
+
+// TestM6_EtcdTwoVotingMembers proves the join and the promotion: each server's own
+// member, asked on its own loopback with a linearizable member list, reports the same
+// cluster of exactly two STARTED VOTING members (a name and a client URL each, no
+// learner), and answers as one of them.
+func TestM6_EtcdTwoVotingMembers(t *testing.T) {
+	pathA, pathB := os.Getenv("K3SM_M6_MEMBERS_A"), os.Getenv("K3SM_M6_MEMBERS_B")
+	if pathA == "" || pathB == "" {
+		t.Skip("M6: $K3SM_M6_MEMBERS_A / $K3SM_M6_MEMBERS_B unset — each server's member-list answer is required (hack/lab/m6.sh collects them)")
+	}
+	var clusterID string
+	names := map[string]map[string]bool{}
+	for server, path := range map[string]string{"A": pathA, "B": pathB} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("server %s member list: %v", server, err)
+		}
+		var ml etcdMemberList
+		if err := json.Unmarshal(raw, &ml); err != nil {
+			t.Fatalf("server %s member list %s: %v", server, path, err)
+		}
+		if ml.Header.ClusterID == "" {
+			t.Fatalf("server %s member list carries no cluster id (not an etcd answer): %s", server, raw)
+		}
+		if clusterID == "" {
+			clusterID = ml.Header.ClusterID
+		} else if ml.Header.ClusterID != clusterID {
+			t.Fatalf("servers A and B are in DIFFERENT etcd clusters (%s vs %s)", clusterID, ml.Header.ClusterID)
+		}
+		if len(ml.Members) != 2 {
+			t.Fatalf("server %s sees %d members, want 2: %s", server, len(ml.Members), raw)
+		}
+		self := false
+		names[server] = map[string]bool{}
+		for _, m := range ml.Members {
+			if m.IsLearner {
+				t.Errorf("server %s: member %s (%s) is still a learner — the promotion did not happen", server, m.Name, m.ID)
+			}
+			if m.Name == "" || len(m.ClientURLs) == 0 {
+				t.Errorf("server %s: member %s at %v never started", server, m.ID, m.PeerURLs)
+			}
+			names[server][m.Name] = true
+			self = self || m.ID == ml.Header.MemberID
+		}
+		if !self {
+			t.Errorf("server %s answered as member %s, which is not in its own member list", server, ml.Header.MemberID)
+		}
+	}
+	for name := range names["A"] {
+		if !names["B"][name] {
+			t.Errorf("member %s is in A's list but not in B's", name)
+		}
 	}
 }
 
@@ -176,9 +290,9 @@ func clusterCAData(t *testing.T, path string) []byte {
 	return nil
 }
 
-// TestM6_WatchStalenessSoak is the PRODUCTION-TRUST gate (the kine#577 failure mode):
-// under sustained churn, a consistent LIST on server B taken immediately after server
-// A's committed write MUST reflect that write. It writes a unique ConfigMap on A and
+// TestM6_WatchStalenessSoak is the cross-server read-after-write smoke: under
+// sustained churn, a consistent LIST on server B taken immediately after server A's
+// committed write MUST reflect that write. It writes a unique ConfigMap on A and
 // asserts a consistent (ResourceVersion="") LIST on B sees it within a tight bound,
 // repeated for $K3SM_M6_SOAK_DURATION (default 20s) while a background goroutine
 // churns the namespace. A staleness window (B's consistent read missing A's committed
@@ -196,7 +310,7 @@ func TestM6_WatchStalenessSoak(t *testing.T) {
 	}
 	const ns = "default"
 
-	// Background churn: unrelated writes on A keep the datastore + watch caches busy.
+	// Background churn: unrelated writes on A keep etcd and the watch caches busy.
 	churnCtx, stopChurn := context.WithCancel(ctx)
 	defer stopChurn()
 	go func() {
@@ -242,7 +356,7 @@ func TestM6_WatchStalenessSoak(t *testing.T) {
 		}
 		_ = a.Client.CoreV1().ConfigMaps(ns).Delete(ctx, name, metav1.DeleteOptions{})
 		if !seen {
-			t.Fatalf("round %d: server B's consistent LIST did not reflect server A's committed write %q (watch-staleness / kine#577)", round, name)
+			t.Fatalf("round %d: server B's consistent LIST did not reflect server A's committed write %q (watch staleness)", round, name)
 		}
 	}
 }

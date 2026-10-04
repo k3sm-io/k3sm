@@ -36,7 +36,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(payload, "kine"), []byte("kine"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		got, err := os.ReadFile(filepath.Join(binDir(work), "kube-apiserver"))
@@ -69,7 +69,7 @@ func TestSeedBinDir(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		for _, name := range PayloadBinaries() {
@@ -100,7 +100,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(kineMarkerPath(payload), []byte(kineMarkerContent(DefaultKineVersion)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(binDir(work), "kine")); string(got) != "new-pin" {
@@ -126,7 +126,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(payload, "kine"), []byte("payload"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(binDir(work), "kine")); string(got) != "current" {
@@ -149,7 +149,7 @@ func TestSeedBinDir(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(payload, "kine"), []byte("unverified"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(binDir(work), "kine")); string(got) != "old-pin" {
@@ -162,7 +162,7 @@ func TestSeedBinDir(t *testing.T) {
 
 	t.Run("empty payloadDir is a no-op", func(t *testing.T) {
 		work := t.TempDir()
-		if err := seedBinDir(discardLogger(), work, "", DefaultKineVersion, DefaultKubeVersion); err != nil {
+		if err := seedBinDir(discardLogger(), work, "", DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(binDir(work)); !os.IsNotExist(err) {

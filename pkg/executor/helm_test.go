@@ -212,7 +212,7 @@ func TestPayloadCarriesHelm(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(payload, helmchart.HelmBinaryName), []byte("payload-helm"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion); err != nil {
+	if err := seedBinDir(discardLogger(), work, payload, DefaultKineVersion, DefaultKubeVersion, false); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(helmchart.HelmPath(BinDir(work))); err != nil || string(got) != "payload-helm" {

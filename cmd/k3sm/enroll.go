@@ -768,7 +768,9 @@ type bootstrapServerDeps struct {
 	enroller      bootstrap.Enroller
 	serverAuth    bootstrap.ServerAuthorizer
 	bundle        bootstrap.BundleSource
-	apiServers    []string
+	// members drives the server-class etcd member routes (the etcd posture only).
+	members    bootstrap.MemberJoiner
+	apiServers []string
 	// listen binds the supervisor's address. Nil is net.Listen — the shipped
 	// value; it is a field so a test can drive the rebind retry without racing a
 	// real port.
@@ -855,6 +857,7 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 		APIServers:    deps.apiServers,
 		ServerAuth:    deps.serverAuth,
 		Bundle:        deps.bundle,
+		Members:       deps.members,
 		Logger:        log,
 	})
 	if err != nil {

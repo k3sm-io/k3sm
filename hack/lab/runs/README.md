@@ -62,6 +62,8 @@ never `git add -f` one.
 `K3SM_RC_TAG` promotes the recorded sha from `local:<sha>` to the bare rc form. With
 `K3SM_LAB` unset a lab gate prints a PENDING notice and exits 0 — a **skip, never a
 pass** — and produces no log worth keeping.
+`hack/lab/B46.sh` is the exception: with `K3SM_LAB` unset it prints `LAB-PENDING: not a pass`
+and exits **3**, not 0, and its `--self-test` pins that.
 
 There is deliberately **no generator**: the gate emits its own header and the operator
 redirects it. A tool that wrote these logs would be a tool that could write one for a

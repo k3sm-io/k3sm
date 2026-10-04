@@ -124,8 +124,15 @@ func (c Collector) Collect(ctx context.Context) Report {
 	if pre, ok := c.preVolumeRow(); ok {
 		rows = append(rows, pre)
 	}
+	rows = append(rows, c.datastoreRow(role))
+	// The embedded etcd member, on an etcd-posture server only: quorum, alarms,
+	// size against quota and WAL fsync latency, beside the datastore row it details.
+	if role != dataroot.RoleAgent {
+		if r, ok := c.etcdRow(ctx, c.installedServerArgs()); ok {
+			rows = append(rows, r)
+		}
+	}
 	rows = append(rows,
-		c.datastoreRow(role),
 		c.kubeconfigRow(),
 		c.runtimedRow(ctx, role),
 	)
@@ -320,6 +327,23 @@ func (c Collector) serverArgsRow() (Row, bool) {
 	// where a credential would be if one ever reached this row.
 	row.Detail = Redact(strings.Join(args, " "))
 	return row, true
+}
+
+// installedServerArgs returns the operator arguments the installed server plist
+// carries, or nil when there is no plist, no parser, or it cannot be read.
+func (c Collector) installedServerArgs() []string {
+	if c.ServerArgs == nil || c.FS == nil || c.Paths.ServerLabel == "" {
+		return nil
+	}
+	raw, err := c.FS.ReadFile(c.plistPath(c.Paths.ServerLabel))
+	if err != nil {
+		return nil
+	}
+	args, err := c.ServerArgs(raw)
+	if err != nil {
+		return nil
+	}
+	return args
 }
 
 // daemonRow reports one LaunchDaemon. It returns the row and the job's pid (0
@@ -1364,11 +1388,21 @@ const WorkerDatastoreDetail = "not this node's: the control plane's datastore li
 // database's journal mode and user_version as this node's datastore, with a
 // remedy pointing at a server log no daemon on this Mac writes. The row is
 // returned BEFORE the path is even built, so nothing opens the stale db.
+//
+// On an embedded etcd HA server the datastore is the etcd member, not a state.db,
+// so an initialized member (executor.EtcdMemberExists) is reported as such rather
+// than as "no state.db yet" — which would read as a server that never came up.
 func (c Collector) datastoreRow(role dataroot.Role) Row {
 	row := Row{Name: RowDatastore}
 	if role == dataroot.RoleAgent {
 		row.State, row.Severity = StateSkip, SeveritySkip
 		row.Detail = WorkerDatastoreDetail
+		return row
+	}
+	if executor.EtcdMemberExists(c.Paths.WorkDir) {
+		row.Wide = map[string]string{"path": executor.EtcdDataDir(c.Paths.WorkDir)}
+		row.State, row.Severity = StateOK, SeverityOK
+		row.Detail = "embedded etcd member (HA); no kine state.db in this posture"
 		return row
 	}
 	path := executor.StateDBPath(c.Paths.WorkDir)

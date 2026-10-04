@@ -57,6 +57,9 @@ func TestServerJoinImportsBundleBeforeEnsureHierarchy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server A hierarchy: %v", err)
 	}
+	if hA.EtcdServer, hA.EtcdPeer, err = certs.EnsureEtcdCAs(wdA); err != nil {
+		t.Fatalf("server A etcd CAs: %v", err)
+	}
 	plaintext, err := hA.Marshal()
 	if err != nil {
 		t.Fatalf("marshal A: %v", err)
@@ -100,6 +103,13 @@ func TestServerJoinImportsBundleBeforeEnsureHierarchy(t *testing.T) {
 	if hB.Signing.PinHash() != hA.Signing.PinHash() {
 		t.Errorf("signing pin B %q != A %q (CAs not identical)", hB.Signing.PinHash(), hA.Signing.PinHash())
 	}
+	eServer, ePeer, err := certs.EnsureEtcdCAs(wdB)
+	if err != nil {
+		t.Fatalf("server B EnsureEtcdCAs: %v", err)
+	}
+	if eServer.PinHash() != hA.EtcdServer.PinHash() || ePeer.PinHash() != hA.EtcdPeer.PinHash() {
+		t.Error("server B must LOAD the imported etcd CAs (identical pins), not mint fresh ones")
+	}
 }
 
 // TestServerJoinFailsClosedOnAbsentBundle proves the fail-closed contract: when the
@@ -133,13 +143,17 @@ func TestServerJoinFailsClosedOnAbsentBundle(t *testing.T) {
 	t.Run("wrong secret (tag fails)", func(t *testing.T) {
 		wdA := t.TempDir()
 		hA, _ := certs.EnsureHierarchy(wdA)
-		pt, _ := hA.Marshal()
+		hA.EtcdServer, hA.EtcdPeer, _ = certs.EnsureEtcdCAs(wdA)
+		pt, err := hA.Marshal()
+		if err != nil {
+			t.Fatalf("marshal A: %v", err)
+		}
 		sealed, _ := bootstrap.SealBundle("the-real-secret-0123456789abcdef0123456789", pt)
 		ts := bundleTestServer(t, sealed, false)
 		defer ts.Close()
 
 		wd := t.TempDir()
-		err := bootstrap.ImportCABundle(context.Background(), bootstrap.ServerJoinOptions{
+		err = bootstrap.ImportCABundle(context.Background(), bootstrap.ServerJoinOptions{
 			Server:     ts.URL,
 			Token:      bootstrap.FormatServerToken(hA.Cluster.PinHash(), "WRONG-secret-99999999999999999999"),
 			WorkDir:    wd,
