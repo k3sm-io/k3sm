@@ -175,11 +175,11 @@ func APIServerServingKeyPath(workDir string) string {
 var ErrNoHierarchy = errors.New("certs: no CA hierarchy in the work dir's PKI directory")
 
 // ErrIncompleteHierarchy reports a DAMAGED hierarchy: a CA certificate present
-// without its private key (the half-present hierarchy ensureCA also refuses), or a
-// PKI entry that is not a regular file. Distinct from ErrNoHierarchy so a caller can
-// tell "nothing here" (wrong work dir / missing privilege) from "the PKI on this host
-// is damaged". Compare with errors.Is.
-var ErrIncompleteHierarchy = errors.New("certs: damaged CA hierarchy (a CA certificate has no private key, or a PKI path is not a regular file)")
+// without its private key or a private key without its certificate (the half-present
+// pair ensureCA also refuses), or a PKI entry that is not a regular file. Distinct
+// from ErrNoHierarchy so a caller can tell "nothing here" (wrong work dir / missing
+// privilege) from "the PKI on this host is damaged". Compare with errors.Is.
+var ErrIncompleteHierarchy = errors.New("certs: damaged CA hierarchy (a CA certificate without its private key, a CA private key without its certificate, or a PKI path that is not a regular file)")
 
 // LoadCAPins reads ONLY the two CA CERTIFICATES from workDir's PKI directory and
 // returns their PinHash values (the lowercase-hex SHA-256 of the certificate DER that
