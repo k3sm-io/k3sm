@@ -120,14 +120,20 @@ type nodeOptions struct {
 	// logs is the container-log flag group (--pod-logs-dir and the four rotation
 	// knobs), carried through every bring-up path so `k3sm server`, `k3sm agent`
 	// and `k3sm node` configure the node's logs identically.
-	logs     containerLogOptions
-	nodeIP   string
-	runtime  string // "runtimed" (default) or "hostprocess" — see defaultRuntime
-	dnsShim  string // getaddrinfo DNS shim dylib path (runtimed only)
-	pathShim string // path-rebase DYLD shim dylib path (runtimed only)
-	dnsVIP   string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
-	domain   string // cluster DNS domain the in-pod shim search list is built from (runtimed)
-	serveTLS bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
+	logs   containerLogOptions
+	nodeIP string
+	// serviceCIDR is the cluster Service CIDR, the second range netd admits an lo0
+	// alias in and so the second range checkNodeAliasAddr accepts a node address
+	// in. Every bring-up sets it from the one cluster value (install.DefaultServiceCIDR,
+	// which the apiserver's --service-cluster-ip-range and netd's --service-cidr
+	// default to; no k3sm command configures another). Empty admits the pod CIDR only.
+	serviceCIDR string
+	runtime     string // "runtimed" (default) or "hostprocess" — see defaultRuntime
+	dnsShim     string // getaddrinfo DNS shim dylib path (runtimed only)
+	pathShim    string // path-rebase DYLD shim dylib path (runtimed only)
+	dnsVIP      string // cluster DNS VIP the per-pod Seatbelt egress is scoped to (runtimed)
+	domain      string // cluster DNS domain the in-pod shim search list is built from (runtimed)
+	serveTLS    bool   // serve the kubelet HTTP API over TLS (logs/exec over the proxy)
 
 	// kubeletClientCAPEM is the cluster's CLIENT-IDENTITY CA (the signing CA)
 	// certificate, in PEM. It is the anchor the kubelet HTTP endpoint (:10250 —
@@ -349,6 +355,7 @@ func runNode(args []string) error {
 	registerNodeFlags(fs, &opts)
 	_ = fs.Parse(args)
 	opts.standalone = true
+	opts.serviceCIDR = install.DefaultServiceCIDR
 
 	// The kubelet endpoint is never served open. `k3sm server` and `k3sm agent`
 	// obtain this anchor from the cluster itself; a standalone node is pointed at
@@ -477,9 +484,16 @@ func isLoopbackDefault(nodeIP string) bool {
 // rewrite already replaced the loopback default with --mesh-ip), or because the
 // podCIDR does not yield one.
 //
-// It is deliberately distinct from advertisedNodeIP: only a DERIVED address is a
-// pod-CIDR /32 this node must alias on lo0 to answer for. An explicit --node-ip or
-// a mesh IP is the operator's/mesh's address and must never be aliased on lo0 here.
+// The address the node advertises, and that the podnet adapter's startup
+// reconcile aliases on lo0, is decided in this order: the loopback default
+// becomes --mesh-ip on a mesh server (meshNodeIP); a loopback default that is
+// left becomes this derived .1 on a datapath node; anything else is the explicit
+// --node-ip as given. Whatever results, checkNodeAliasAddr refuses it before the
+// node starts unless it lies in the node's pod CIDR or the Service CIDR, the two
+// ranges netd will alias. This function is distinct from advertisedNodeIP only
+// for ensureAdvertisedNodeAlias, which pre-plumbs the DERIVED address alone ahead
+// of the LB/ingress controllers and leaves an explicit or mesh address to the
+// reconcile.
 func derivedNodeAdvertiseIP(opts nodeOptions) string {
 	if !opts.netMode.DataPath() || !isLoopbackDefault(opts.nodeIP) {
 		return ""
@@ -1386,7 +1400,57 @@ func buildPodNetAdapter(opts nodeOptions) (*provider.PodNetAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return provider.NewPodNetAdapter(nw, opts.nodeIP, slog.Default()), nil
+	return newNodePodNetAdapter(nw, opts)
+}
+
+// newNodePodNetAdapter wraps ipam in the provider adapter whose startup reconcile
+// aliases opts.nodeIP on lo0, after refusing a node address the pod network must
+// not alias (checkNodeAliasAddr). It is the seam between the node's addressing
+// and the one alias request it makes, split from buildPodNetAdapter so a test can
+// drive it over a recording IPAM instead of a real lo0.
+func newNodePodNetAdapter(ipam provider.PodIPAM, opts nodeOptions) (*provider.PodNetAdapter, error) {
+	if err := checkNodeAliasAddr(opts.nodeIP, opts.podCIDR, opts.serviceCIDR); err != nil {
+		return nil, err
+	}
+	return provider.NewPodNetAdapter(ipam, opts.nodeIP, slog.Default()), nil
+}
+
+// errNodeAliasOutsidePodNetwork names a node address the pod network would be
+// asked to alias on lo0 although it lies outside both this node's pod CIDR and
+// the cluster Service CIDR.
+var errNodeAliasOutsidePodNetwork = errors.New("node address cannot be aliased on lo0")
+
+// checkNodeAliasAddr refuses, before anything on the node starts, a node address
+// the podnet adapter's startup reconcile would alias on lo0 but must not.
+//
+// Its predicate MIRRORS netd's alias policy (darwin-net pkg/netd validateAliasIP):
+// an IPv4 unicast host that is inside BOTH the cluster pod aggregate and this
+// node's pod CIDR, or inside the configured Service CIDR (when one is set). A
+// change to either side must change the other; TestCheckNodeAliasAddr carries
+// netd's own policy-test rows. The reason to check it here is the failure shape
+// when it is not: the reconcile asks netd, netd refuses, the daemon exits,
+// launchd restarts it, and every restart reaps the node's pods before failing the
+// same way. A LAN address is the usual culprit (an HA server's etcd peer address
+// passed as --node-ip); it is already on an interface, and aliasing it on lo0
+// would shadow the route that actually carries it.
+//
+// A loopback or unparseable address is the reconcile's own skip, and passes.
+func checkNodeAliasAddr(nodeIP, podCIDR, serviceCIDR string) error {
+	ip, err := netip.ParseAddr(nodeIP)
+	if err != nil || ip.IsLoopback() {
+		return nil
+	}
+	ip = ip.Unmap()
+	if ip.Is4() && !ip.IsMulticast() && !ip.IsUnspecified() {
+		if p, err := netip.ParsePrefix(podCIDR); err == nil && podnet.ClusterPodCIDR.Contains(ip) && p.Contains(ip) {
+			return nil
+		}
+		if p, err := netip.ParsePrefix(serviceCIDR); err == nil && p.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %s is not an IPv4 unicast host inside this node's pod CIDR %s (cluster aggregate %s) or the Service CIDR %q, so netd refuses it and the node would fail its pod-network startup reconcile at every start. --node-ip is the node's advertised address; on a mesh server leave it unset (the node advertises --mesh-ip), and give an embedded-etcd server's LAN address as --etcd-peer-ip",
+		errNodeAliasOutsidePodNetwork, ip, podCIDR, podnet.ClusterPodCIDR, serviceCIDR)
 }
 
 // runtimedConfig builds the runtimed runtime configuration from the node options:

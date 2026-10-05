@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -60,37 +61,66 @@ type serverPlan struct {
 	serverPKI
 }
 
+// errServerTokenAsAdmin refuses a server-class join token on a start where it
+// would become the apiserver's static admin token.
+var errServerTokenAsAdmin = errors.New("a server-class join token cannot be this server's static admin token")
+
+// refuseServerTokenAsAdmin is that refusal: any start that is not a
+// --server-join loads opts.token as the static system:masters bearer token, so
+// a token of the K10<hash>::server:<secret> shape there is a join credential in
+// the wrong place. The message names where the token came from, never its value.
+func refuseServerTokenAsAdmin(opts serverOptions) error {
+	if opts.serverJoin || opts.token == "" {
+		return nil
+	}
+	if _, err := bootstrap.ParseServerToken(opts.token); err != nil {
+		return nil
+	}
+	from := "--token or $K3SM_TOKEN"
+	if opts.tokenFile != "" {
+		from = "the token file " + opts.tokenFile
+	}
+	return fmt.Errorf("%w (from %s): it is used only with --server-join, to add this server to an existing HA control plane; without --server-join the token here is the admin bearer token, so point --token-file at the admin token the install staged, or add --server-join if this server is joining", errServerTokenAsAdmin, from)
+}
+
 // validateServerOptions runs every refusal that touches no state: the admin
 // token file, the HA flag shape, the port ranges, the node name and the
 // work-dir guards. It canonicalizes opts.nodeName and resolves opts.token in
 // place.
 func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.Logger) error {
-	// The static admin token, from the file the installed daemon is pointed at.
-	// Resolved BEFORE any state is touched, because a token file that is there
-	// and cannot be used (group-readable, empty, unreadable) is terminal: it
-	// names a credential the operator believes is in play, and coming up past it
-	// would mint a different one and leave every `kubectl` call Unauthorized.
+	// The token, from the file the installed daemon is pointed at: the static
+	// admin token, or on an HA server-join the server-class JOIN token. Resolved
+	// BEFORE any state is touched, because a token file that is there and cannot
+	// be used (group-readable, empty, unreadable) is terminal: it names a
+	// credential the operator believes is in play, and coming up past it would
+	// mint a different one and leave every `kubectl` call Unauthorized.
+	//
+	// The two credentials cannot be swapped by this, in either direction. The
+	// join path never makes its token the apiserver's static credential
+	// (serverExecutorConfig), and the CA-bundle import and the etcd member route
+	// accept only a server-class token, so an admin token handed to a joining
+	// server fails there, by name. The reverse, a server-class token reaching a
+	// start that is NOT a server-join, is refused below: there it would become
+	// a system:masters bearer token, and a credential that reconstructs every
+	// cluster CA must not also be one that authenticates as cluster-admin.
 	//
 	// An ABSENT file is not terminal, exactly as it is not for the agent: the
 	// executor then generates a token and writes its own kubeconfig, which is
 	// what a bare `k3sm server` has always done.
+	absent, terr := resolveTokenFile(opts.tokenFile, &opts.token)
+	if terr != nil {
+		return terr
+	}
 	switch {
-	case opts.serverJoin && opts.tokenFile != "":
-		// The HA server-join path is untouched by this flag: its --token is a
-		// server-class JOIN token, not the static admin credential, and quietly
-		// swapping one for the other is the kind of substitution that surfaces as
-		// a CA mismatch three steps later.
-		logger.Warn("ignoring --token-file: the HA server-join takes its server-class join token on --token / $K3SM_TOKEN",
-			"token-file", opts.tokenFile)
-	default:
-		absent, terr := resolveTokenFile(opts.tokenFile, &opts.token)
-		if terr != nil {
-			return terr
-		}
-		if absent {
-			logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
-				"path", opts.tokenFile)
-		}
+	case absent && opts.serverJoin:
+		logger.Warn("the server-join token file is not there; with --server this server cannot fetch the cluster CAs or reach the etcd member route until it is (re-run `sudo k3sm install --server-join … --token-file <file>`)",
+			"path", opts.tokenFile)
+	case absent:
+		logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
+			"path", opts.tokenFile)
+	}
+	if err := refuseServerTokenAsAdmin(*opts); err != nil {
+		return err
 	}
 
 	// The HA flag shape, before any state is touched: a refusal here costs nothing,
@@ -225,13 +255,13 @@ func provisionControlPlane(ctx context.Context, opts *serverOptions, encryptionC
 	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
 	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
 	// bring-up; we never fall through to minting fresh, divergent CAs (cluster trust
-	// split). Requires --token (the server-class token). The bundle and, after it,
+	// split). Requires the server-class token (--token-file, --token or $K3SM_TOKEN). The bundle and, after it,
 	// the etcd member route (joinEtcdMember) are reached at --server over the
 	// underlay — the existing server's bootstrap listener serves every interface — so
 	// neither needs this server's mesh, which comes up after its control plane.
 	if opts.serverJoin && opts.joinServer != "" {
 		if opts.token == "" {
-			return cfg, pki, fmt.Errorf("--server-join with --server requires --token (the server-class join token)")
+			return cfg, pki, fmt.Errorf("--server-join with --server requires the server-class join token (--token-file, --token or $K3SM_TOKEN)")
 		}
 		if err := importServerCABundle(ctx, *opts, logger); err != nil {
 			return cfg, pki, fmt.Errorf("HA server-join: %w", err)
@@ -331,9 +361,7 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// would advertise the pod /24's 100.64.0.1 while its peers — and every HA
 	// server, which all compute the SAME index-0 podCIDR — know it by its mesh
 	// IP, so two Macs would publish one EXTERNAL-IP.
-	if isLoopbackDefault(opts.nodeIP) {
-		opts.nodeIP = opts.meshIP
-	}
+	opts.nodeIP = meshNodeIP(*opts)
 	servingCert, servingKey, err := writeAPIServerServingCert(opts.workDir, h.Cluster, opts.meshIP)
 	if err != nil {
 		return nil, "", err
@@ -361,6 +389,20 @@ func provisionMeshPKI(opts *serverOptions, cfg *executor.Config, logger *slog.Lo
 	// bootstrapListenAddr).
 	logger.Info("multi-node mode: apiserver bound to the mesh interface; the worker-join supervisor listens on every interface", "mesh-ip", opts.meshIP)
 	return h, serverSecret, nil
+}
+
+// meshNodeIP is the node address a mesh server advertises: its --mesh-ip when
+// --node-ip was left at the loopback default, else the explicit --node-ip. It is
+// the same on every mesh server, HA or not, because the etcd peer address is a
+// flag of its own (--etcd-peer-ip) and never reaches the node's addressing: an
+// HA server's LAN address is on an interface already, and handing it to the node
+// would have the pod network alias it on lo0 at startup (netd refuses, the
+// daemon exits, launchd restarts it, and every restart reaps the node's pods).
+func meshNodeIP(opts serverOptions) string {
+	if isLoopbackDefault(opts.nodeIP) {
+		return opts.meshIP
+	}
+	return opts.nodeIP
 }
 
 // componentExitHandler is the executor's OnComponentExit for `k3sm server`.

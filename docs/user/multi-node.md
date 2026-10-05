@@ -22,6 +22,8 @@ sudo k3sm install --mesh-ip <this-macs-mesh-address>
 ```
 
 The mesh address is IPv4 (the default mesh range is 100.64.0.0/10); a link-local or IPv6 address is refused at install time.
+It must be the first address (`.1`) of a /24 inside that range that no other node uses, such as
+100.64.0.1; the install refuses any other address, because that /24 becomes this Mac's pod range.
 
 This writes the address into the server daemon's arguments and restarts it. A plain `sudo k3sm
 install` re-run already boots the daemons out and back in, so it always picks up the address you
@@ -67,6 +69,12 @@ and issues the node's certificates for it, so there is nothing you have to suppl
 `--node-ip <this-macs-mesh-address>` only to assert the address you expect. A value that differs
 from the one the server assigns fails the join with a message naming both, instead of bringing the
 node up on an address it does not hold.
+
+On a control-plane install `--node-ip` means something else. There it is accepted only with
+`--cluster-init` or `--server-join`, and it names the Mac's own **LAN** address, which the embedded
+etcd member binds and the other servers dial. The install passes it to the server daemon as
+`--etcd-peer-ip`; the server's node still advertises its `--mesh-ip`, so the LAN address is never
+added to the loopback interface. See [HA](ha.md).
 
 A node that joined with a wrong `--node-ip` before this release still holds a certificate issued for
 that address, and the control plane cannot reach its kubelet, so `kubectl logs` and `kubectl exec`

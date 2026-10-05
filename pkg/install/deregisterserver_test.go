@@ -45,8 +45,8 @@ func recordingDeregisterServer(f *fakeSystem, err error) func(context.Context) e
 // naming the --cluster-reset remedy that never stops the teardown.
 func TestUninstallServerMemberRemoveOrder(t *testing.T) {
 	etcdArgs := map[string][]string{
-		"--cluster-init": {"--cluster-init", "--node-ip", "192.0.2.10"},
-		"--server-join":  {"--server-join", "--server", "192.0.2.10", "--node-ip", "192.0.2.11"},
+		"--cluster-init": {"--cluster-init", "--etcd-peer-ip", "192.0.2.10"},
+		"--server-join":  {"--server-join", "--server", "192.0.2.10", "--etcd-peer-ip", "192.0.2.11"},
 	}
 	for name, args := range etcdArgs {
 		t.Run("plain uninstall, "+name, func(t *testing.T) {

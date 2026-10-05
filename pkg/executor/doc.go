@@ -68,7 +68,8 @@ limitations under the License.
 // Listeners: the client listener is loopback only (https://127.0.0.1:<KinePort>), so
 // no etcd client endpoint is reachable off-host; the apiserver reaches it with a client
 // certificate (--etcd-cafile/--etcd-certfile/--etcd-keyfile). The peer listener is on
-// the server's node IP (the LAN, never the mesh, never loopback: ErrEtcdNeedsNodeIP),
+// the server's LAN address (--etcd-peer-ip; never the mesh, never loopback:
+// ErrEtcdNeedsNodeIP),
 // and the metrics listener is loopback. Peer and client traffic are mutual TLS under two
 // dedicated etcd CAs inside the k3sm hierarchy (pkg/certs), distinct from the cluster
 // and signing CAs, so no Kubernetes client certificate is an etcd identity and no etcd

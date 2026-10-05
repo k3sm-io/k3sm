@@ -38,6 +38,16 @@ func TestParseInstallFlagsMeshIP(t *testing.T) {
 		}
 	})
 
+	t.Run("a second server's own range is accepted", func(t *testing.T) {
+		opts, err := parseInstallFlags([]string{"--mesh-ip", "100.64.1.1"})
+		if err != nil {
+			t.Fatalf("parseInstallFlags: %v", err)
+		}
+		if opts.meshIP != "100.64.1.1" {
+			t.Errorf("meshIP = %q, want 100.64.1.1", opts.meshIP)
+		}
+	})
+
 	t.Run("a valid address is accepted and stored", func(t *testing.T) {
 		opts, err := parseInstallFlags([]string{"--mesh-ip", "100.64.0.1"})
 		if err != nil {
@@ -62,6 +72,8 @@ func TestParseInstallFlagsMeshIP(t *testing.T) {
 		{name: "IPv6 link-local", addr: "fe80::1", want: "not an IPv4"},
 		{name: "IPv4 link-local", addr: "169.254.1.5", want: "link-local"},
 		{name: "multicast", addr: "224.0.0.1", want: "multicast"},
+		{name: "a host that is not its node range's mesh-egress address", addr: "100.64.1.5", want: "mesh-egress address 100.64.1.1"},
+		{name: "outside the cluster pod range", addr: "10.0.0.1", want: "outside the cluster pod range"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := parseInstallFlags([]string{"--mesh-ip", tc.addr})
