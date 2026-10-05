@@ -13,7 +13,8 @@ replaces that with **embedded etcd**: each control-plane Mac runs an etcd member
 `k3sm server`, and the members replicate the cluster state between them. There is no external
 datastore to run. The controller-manager and scheduler elect a leader across the servers, and every
 server holds the same cluster certificate authorities. HA builds on the [multi-node](multi-node.md) mesh, so each server also needs its own
-`--mesh-ip`.
+`--mesh-ip`. That address must be the `.1` of a /24 in the mesh range that no other node uses
+(100.64.0.1 on the first server), and the install refuses any other address.
 
 HA is opt-in, and it is decided when a server is installed. The first server forms the cluster with
 `--cluster-init`:

@@ -22,6 +22,8 @@ sudo k3sm install --mesh-ip <this-macs-mesh-address>
 ```
 
 The mesh address is IPv4 (the default mesh range is 100.64.0.0/10); a link-local or IPv6 address is refused at install time.
+It must be the first address (`.1`) of a /24 inside that range that no other node uses, such as
+100.64.0.1; the install refuses any other address, because that /24 becomes this Mac's pod range.
 
 This writes the address into the server daemon's arguments and restarts it. A plain `sudo k3sm
 install` re-run already boots the daemons out and back in, so it always picks up the address you
