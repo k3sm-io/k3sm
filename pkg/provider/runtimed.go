@@ -1363,7 +1363,23 @@ func (r *runtimedRuntime) allocError(pod *corev1.Pod, err error) error {
 // then) covers the paths where the RPC failed or the pod never reached the
 // runtime (a translate failure after allocation), so a churned pod cannot leak
 // one of the 253 node addresses. The adapter's startup sweep is the backstop.
+//
+// ORDER: TRANSPORT OVERRIDE FIRST, THEN THE ALIAS. For a vm pod the published /32
+// is a host-owned lo0 alias the Service proxy's relay listens on, and the
+// override is what keeps that relay up. Dropping the override closes the relay's
+// listeners and every connection it was relaying before the call returns
+// (transportFeed.drop -> proxy.RoutingTable.SetTransportOverrides), so the alias
+// is removed only once nothing is listening on or relaying from it. The reverse
+// order would pull the address out from under live sockets and leave the relay
+// retrying a bind on an address the node no longer holds. Every teardown path
+// releases through here (DeletePod and the orphan reaper via teardownPod, a
+// refused create, a refused re-attach), so the order holds on all of them by
+// construction; for a host-process pod the drop is a no-op.
 func (r *runtimedRuntime) releasePodNetwork(pod *corev1.Pod) {
+	// Unconditional: the feed (nil-tolerant) holds the override even on a node
+	// whose pod-network seam is absent, and its liveness obligation does not
+	// depend on that seam.
+	r.transport.drop(string(pod.UID))
 	if r.network == nil {
 		return
 	}
@@ -2087,8 +2103,8 @@ func (t *podTrack) quiesce() {
 }
 
 // teardownPod is the delete path after preStop: the runtime RPC with grace, the
-// probe runner, the pod's /32, its log tree, its transport override, the track,
-// and the apiserver object. DeletePod and the orphan reaper (orphanreap.go) share
+// probe runner, the pod's transport override and then its /32 (in that order,
+// see releasePodNetwork), its log tree, the track, and the apiserver object. DeletePod and the orphan reaper (orphanreap.go) share
 // it, so a reaped pod is torn down exactly as a deleted one is.
 //
 // owned selects how the track is forgotten. nil forgets whatever track the pod
@@ -2104,19 +2120,20 @@ func (r *runtimedRuntime) teardownPod(ctx context.Context, pod *corev1.Pod, grac
 	// Stop the probe runner before forgetting the pod (stopProber waits for the
 	// loops outside the lock, so no probe goroutine outlives the pod).
 	r.stopProber(id)
-	// Release the pod's /32 (log-and-continue; idempotent after runtimed's own
-	// delete-path teardown) so pod churn never leaks a node pool address.
+	// Drop any Service-proxy transport override for the pod, THEN release its /32
+	// (log-and-continue; idempotent after runtimed's own delete-path teardown) so
+	// pod churn never leaks a node pool address. releasePodNetwork does both, in
+	// that order (see its doc): the drop closes the pod's relay before the alias
+	// it listens on goes. No further status will ever arrive to retract the
+	// override, and one that outlives its guest points at a lease macOS is free to
+	// hand to the NEXT guest — a cross-pod misdelivery, not a failed dial (see
+	// transportFeed).
 	r.releasePodNetwork(pod)
 	// Remove the pod's log tree, now that runtimed has confirmed every container
 	// is gone (the RPC above is synchronous). Deleting it while a container still
 	// held the file open would strand the output on an unlinked inode, which is
 	// the one way this node can lose logs without saying so.
 	r.removePodLogs(pod)
-	// Drop any Service-proxy transport override for the pod IN THE SAME STEP. No
-	// further status will ever arrive to retract it, and an override that outlives
-	// its guest points at a lease macOS is free to hand to the NEXT guest — a
-	// cross-pod misdelivery, not a failed dial (see transportFeed).
-	r.transport.drop(id)
 	r.mu.Lock()
 	t := r.track[id]
 	forget := false
