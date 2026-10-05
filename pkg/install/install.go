@@ -1129,7 +1129,12 @@ type Config struct {
 	// It is optional. A node that has already joined starts from its stored
 	// credential and needs no token at all, so a reinstall with no --token-file
 	// stages nothing and leaves whatever is already there.
-	TokenFile       string
+	TokenFile string
+	// AutoJoin installs the RoleAgent node to join by pairing over a direct cable
+	// (`k3sm agent --auto-join`) instead of naming a server: no JoinServer, no
+	// TokenFile, and no join preflight, because there is no server to reach until
+	// a cable is plugged in and the server opens its pairing window.
+	AutoJoin        bool
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
 	LinkDir         string // /usr/local/bin
@@ -1328,6 +1333,13 @@ type Config struct {
 	// is one warning with the remedy for the servers that stay, and the teardown
 	// continues. A purge the preflight refuses makes no call.
 	DeregisterServer func(ctx context.Context) error
+	// ReleaseLinks releases this Mac's direct-link ports (their addresses and
+	// routes, and their bridge0 membership restored) through the network
+	// helper. Uninstall calls it after the node daemon is stopped and BEFORE the
+	// helper is, because only the helper can release them and an older binary
+	// installed later has no code to. It is best effort, like Deregister. Nil
+	// releases nothing.
+	ReleaseLinks func(ctx context.Context)
 	// Purge makes Uninstall also remove everything it otherwise keeps: the data
 	// root (and the data volume under it), the daemon log dir, the arguments
 	// records, the k3sm context in TargetUser's kubeconfig and the service user.
@@ -2404,6 +2416,12 @@ func uninstall(ctx context.Context, sys System, cfg Config, preflight func(m []a
 				// which returns nil), the root job may still be loaded — do not delete
 				// its plist definition (that would orphan a live root job until reboot,
 				// a variant of the same leak). Record the error and leave the plist.
+				if a.label == NetdLabel && cfg.ReleaseLinks != nil {
+					// The node daemons are already out (the manifest is walked in
+					// reverse, and netd comes first in it); the helper is the
+					// only thing that can release the cable ports.
+					cfg.ReleaseLinks(ctx)
+				}
 				if err := sys.LaunchctlBootout(a.label); err != nil {
 					note(err)
 					continue

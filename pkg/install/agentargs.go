@@ -42,12 +42,16 @@ import (
 // would re-render a join target the operator has just changed, or a token file
 // they have already deleted.
 var managedAgentFlags = func() map[string]bool {
-	m := map[string]bool{"server": true, "node-ip": true, "token-file": true}
+	m := map[string]bool{"server": true, "node-ip": true, "token-file": true, "auto-join": true}
 	for _, name := range dataroot.ManagedAgentFlags {
 		m[name] = true
 	}
 	return m
 }()
+
+// managedAgentBoolFlags are the managed flags that take no value, so a carry-over
+// drops the flag alone and keeps the argument after it.
+var managedAgentBoolFlags = map[string]bool{"auto-join": true}
 
 // installedAgentArgs returns the operator-supplied `k3sm agent` arguments the
 // next render must carry over, or nil when there are none.
@@ -102,10 +106,15 @@ func AgentJoinServer(sys System, cfg Config) (string, error) {
 	}
 	host := flagValue(args, "server")
 	if host == "" {
-		return "", fmt.Errorf("install: the installed agent plist %s names no --server, so the control plane this node joined is unknown", path)
+		return "", fmt.Errorf("%w: the installed agent plist %s names no --server", ErrNoJoinServer, path)
 	}
 	return host, nil
 }
+
+// ErrNoJoinServer reports an installed agent plist that names no --server: an
+// --auto-join node, which found its server on a cable and recorded the server's
+// cable address in its node assignment instead. Compare with errors.Is.
+var ErrNoJoinServer = errors.New("install: the installed agent names no control plane to join")
 
 // recordedAgentArgs returns the arguments the agent-arguments record carries,
 // or nil when there is no record. A record that cannot be read is an ERROR,
@@ -178,7 +187,7 @@ func filterManagedAgentArgs(args []string) []string {
 			out = append(out, args[i])
 			continue
 		}
-		if !inline {
+		if !inline && !managedAgentBoolFlags[name] {
 			i++ // the managed flag's value is a separate argument
 		}
 	}

@@ -883,7 +883,7 @@ func (darwinSystem) FetchJoinCA(addr string, timeout time.Duration) ([]byte, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr+bootstrap.CACertPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, bootstrap.HTTPSURL(addr)+bootstrap.CACertPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build the cluster-CA request: %w", err)
 	}

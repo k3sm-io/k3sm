@@ -19,6 +19,7 @@ package install
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -91,6 +92,14 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	if cfg.Role != RoleAgent {
 		return "", nil
 	}
+	if cfg.AutoJoin {
+		// There is no server to reach yet: the node finds one on its cable.
+		if cfg.JoinServer != "" || cfg.TokenFile != "" {
+			return "", fmt.Errorf("install: --auto-join finds its server on a cable and is given no token; it cannot be combined with --server or --token-file")
+		}
+		cfg.Logger.Info("auto-join: no join endpoint to check; this node pairs over a direct cable while it is armed")
+		return "", nil
+	}
 	if strings.TrimSpace(cfg.JoinServer) == "" {
 		return "", fmt.Errorf("install: --server (the control-plane host this worker joins) is required with --agent")
 	}
@@ -112,7 +121,16 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	}
 
 	host := strings.TrimSpace(cfg.JoinServer)
-	addrs, err := sys.ResolveJoinHost(host, joinProbeTimeout)
+	// A zoned link-local literal (fe80::1%en2) names a server across a direct
+	// cable: it is an address already, and no resolver can answer for a zone.
+	// Accepted here for the agent join only; the HA flags refuse it.
+	var addrs []string
+	var err error
+	if a, perr := netip.ParseAddr(host); perr == nil && a.Zone() != "" {
+		addrs = []string{host}
+	} else {
+		addrs, err = sys.ResolveJoinHost(host, joinProbeTimeout)
+	}
 	if err != nil {
 		return "", fmt.Errorf("install: %s (the --server this node would join) does not resolve: %w — name the control-plane Mac's LAN address (an underlay address: the join must reach <host>:%d before this node has any mesh)", host, err, joinBootstrapPort)
 	}

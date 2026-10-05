@@ -361,6 +361,12 @@ func AgentPlist(cfg Config) []byte {
 		// from, and the argv does not churn between installs.
 		"--token-file", cfg.agentTokenPath(),
 	}
+	if cfg.AutoJoin {
+		// A pairing node names no server and stages no token: it finds the
+		// server on its cable while armed, and records the server's cable address
+		// at its join.
+		args = []string{cfg.installedBinary(), "agent", "--auto-join"}
+	}
 	// --node-ip ONLY when the operator asserted one. Rendering an empty value
 	// would put `--node-ip ""` on the daemon's argv, which is not "no assertion"
 	// but an unparseable one, and the join is the wrong place to discover it.

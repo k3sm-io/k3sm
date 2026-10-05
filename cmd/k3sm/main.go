@@ -29,7 +29,7 @@ const usage = `k3sm %s — Kubernetes for macOS, natively
 
 Usage: k3sm <command> [flags]
 
-Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", "token", "certificate", "snapshot", "secrets-encrypt", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
+Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", "token", "pair", "link", "certificate", "snapshot", "secrets-encrypt", "build", "builder", "image", "kubectl", "kubeconfig", "status", "doctor", "dev" are implemented; others are planned):
   server      run the control plane + a node on this Mac (--mesh-ip enables multi-node join)
   agent       join this Mac to an existing cluster as a worker node
   node        run a Virtual Kubelet node here (HostProcess or runtimed runtime)
@@ -40,6 +40,8 @@ Commands ("server", "agent", "node", "netd", "install", "uninstall", "datavol", 
               --purge --yes also removes the data, logs and _k3sm user)
   datavol     the APFS volume the data root lives on (datavol mount|status|delete)
   token       mint cluster join tokens (token create)
+  pair        open or close the pairing window for a Mac cabled by Thunderbolt, or re-arm a joining Mac
+  link        release direct-link ports (link reset) or keep pod traffic off a cable (link tunnel-only)
   certificate re-issue the control-plane leaf certs over the existing CA (certificate rotate)
   build       build an image from a Dockerfile (COPY-only natively; RUN via the build engine)
   builder     manage the in-cluster buildkitd engine (builder up|down|delete|status|buildx)
@@ -105,6 +107,16 @@ func main() {
 	case "datavol":
 		if err := runDatavol(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "k3sm datavol:", err)
+			os.Exit(1)
+		}
+	case "pair":
+		if err := runPair(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm pair:", err)
+			os.Exit(1)
+		}
+	case "link":
+		if err := runLink(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "k3sm link:", err)
 			os.Exit(1)
 		}
 	case "token":

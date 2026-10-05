@@ -30,7 +30,9 @@ import (
 	"strings"
 	"time"
 
+	"k3sm.io/k3sm/pkg/bootstrap/pairing"
 	"k3sm.io/k3sm/pkg/datavol"
+	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/netdsvc"
 	"k3sm.io/k3sm/pkg/version"
@@ -85,11 +87,12 @@ func runInstall(args []string) error {
 
 	logger := newDaemonLogger(os.Stderr, slog.LevelInfo)
 	ctx := context.Background()
-	return install.Install(ctx, install.NewDarwinSystem(), install.Config{
+	if err := install.Install(ctx, install.NewDarwinSystem(), install.Config{
 		Role:              opts.role(),
 		JoinServer:        opts.server,
 		NodeIP:            opts.nodeIP,
 		TokenFile:         opts.tokenFile,
+		AutoJoin:          opts.autoJoin,
 		BinarySource:      self,
 		TargetUser:        opts.targetUser,
 		ServiceCIDR:       opts.serviceCIDR,
@@ -98,7 +101,36 @@ func runInstall(args []string) error {
 		MeshIP:            opts.meshIP,
 		SecretsEncryption: opts.secretsEncryption,
 		Logger:            logger,
-	})
+	}); err != nil {
+		return err
+	}
+	return installPairing(opts, time.Now(), os.Stdout)
+}
+
+// installPairing applies the two pairing flags once the install is in place: an
+// --auto-join agent is armed for --arm (and its daemon restarted so it reads the
+// arming at once), and a server given --pairing opens its window. Both files live
+// in the role's work dir, which only exists after the install.
+func installPairing(opts installFlags, now time.Time, out io.Writer) error {
+	switch {
+	case opts.autoJoin:
+		a, err := pairing.WriteArm(pairing.ArmPath(agentCredentialDir()), now, opts.arm, opts.cluster)
+		if err != nil {
+			return fmt.Errorf("arm auto-join: %w", err)
+		}
+		_ = exec.Command("/bin/launchctl", "kickstart", "-k", "system/"+install.AgentLabel).Run()
+		fmt.Fprintf(out, "auto-join armed until %s: plug this Mac into the control plane by Thunderbolt and run `sudo k3sm pair --for 10m` there\n", a.Until.Format(time.RFC3339))
+		if a.Cluster == "" {
+			fmt.Fprintln(out, "no --cluster was given: this Mac will join the first open-pairing server it hears on its cable while armed (pass the pin `k3sm pair` prints on the server to pin it)")
+		}
+	case opts.pairing > 0:
+		w, err := pairing.WindowStore{Path: pairing.WindowPath(executor.DefaultWorkDir)}.Open(now, opts.pairing, pairing.DefaultMaxJoins)
+		if err != nil {
+			return fmt.Errorf("open the pairing window: %w", err)
+		}
+		fmt.Fprintf(out, "pairing window open until %s; on the new Mac, cabled by Thunderbolt, run `sudo k3sm install --auto-join` (`k3sm pair` prints the --cluster pin)\n", w.Until.Format(time.RFC3339))
+	}
+	return nil
 }
 
 // installFlags is the parsed `k3sm install` command line. It is a struct rather
@@ -128,6 +160,15 @@ type installFlags struct {
 	removeOldDataRoot bool
 	meshIP            string
 	secretsEncryption bool
+	// autoJoin installs a worker that joins by pairing over a direct cable; it
+	// selects the agent role and takes no --server and no token.
+	autoJoin bool
+	// cluster pins the cluster an --auto-join Mac accepts; arm bounds how long
+	// it listens.
+	cluster string
+	arm     time.Duration
+	// pairing opens the control plane's pairing window at first install.
+	pairing time.Duration
 }
 
 // parseInstallFlags parses the install command line. It returns the parse error
@@ -149,6 +190,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	fs.BoolVar(&o.removeOldDataRoot, "remove-old-data-root", false, "after a verified migration, delete the .pre-volume copy of the old data root instead of keeping it")
 	fs.StringVar(&o.meshIP, "mesh-ip", "", "this node's wireguard mesh address, written into the server daemon's arguments; needed on every Mac that serves the control plane in a multi-node cluster")
 	fs.BoolVar(&o.secretsEncryption, "secrets-encryption", false, "encrypt Secrets at rest with a key generated on this Mac; a new single-server cluster only (back up <data root>/server/cred with every datastore backup)")
+	fs.BoolVar(&o.autoJoin, "auto-join", false, "install this Mac as a WORKER that joins by pairing over a Thunderbolt cable: no --server, no token; it listens for the control plane's pairing beacon while armed (--arm)")
+	fs.StringVar(&o.cluster, "cluster", "", "with --auto-join: the cluster pin `k3sm pair` prints on the control plane; without it this Mac trusts the first open-pairing server it hears on its cable")
+	fs.DurationVar(&o.arm, "arm", pairing.DefaultArm, "with --auto-join: how long this Mac listens for a pairing beacon")
+	fs.DurationVar(&o.pairing, "pairing", 0, "on the control plane: open the pairing window for this long at install (e.g. 10m)")
 	if err := fs.Parse(args); err != nil {
 		return installFlags{}, err
 	}
@@ -159,6 +204,9 @@ func parseInstallFlags(args []string) (installFlags, error) {
 	}
 	o.set = map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { o.set[f.Name] = true })
+	if o.autoJoin {
+		o.agent = true // an auto-join Mac is a worker
+	}
 	if err := o.validateRole(); err != nil {
 		return installFlags{}, err
 	}
@@ -205,10 +253,11 @@ var serverOnlyInstallFlags = []string{
 	"data-volume-encrypt",
 	"remove-old-data-root",
 	"secrets-encryption",
+	"pairing",
 }
 
 // agentOnlyInstallFlags describe a JOIN and mean nothing on a control plane.
-var agentOnlyInstallFlags = []string{"server", "node-ip", "token-file"}
+var agentOnlyInstallFlags = []string{"server", "node-ip", "token-file", "auto-join", "cluster", "arm"}
 
 // role is the install role these flags select.
 func (o installFlags) role() install.Role {
@@ -239,8 +288,24 @@ func (o installFlags) validateRole() error {
 		}
 		return nil
 	}
-	if o.server == "" {
-		return fmt.Errorf("--agent needs --server (the control-plane host to join, an underlay address)")
+	if o.autoJoin {
+		for _, name := range []string{"server", "token-file", "node-ip"} {
+			if o.set[name] {
+				return fmt.Errorf("--%s cannot be combined with --auto-join: an auto-join Mac finds its server on a Thunderbolt cable and is given its token by the server's pairing window", name)
+			}
+		}
+		if o.arm <= 0 {
+			return fmt.Errorf("--arm must be positive, got %s", o.arm)
+		}
+	} else {
+		for _, name := range []string{"cluster", "arm"} {
+			if o.set[name] {
+				return fmt.Errorf("--%s needs --auto-join", name)
+			}
+		}
+		if o.server == "" {
+			return fmt.Errorf("--agent needs --server (the control-plane host to join, an underlay address), or --auto-join")
+		}
 	}
 	for _, name := range serverOnlyInstallFlags {
 		if o.set[name] {
@@ -351,6 +416,14 @@ func runUninstall(args []string) error {
 	// On an embedded-etcd HA server, remove its etcd member first (install decides
 	// whether the installed plist is one; see uninstalletcd.go).
 	cfg.DeregisterServer = serverMemberDeregister(filepath.Join(install.DefaultDataRoot, "server"), dialLocalEtcdAdmin, logger)
+	// Release the cable ports (addresses, routes, bridge0 membership) through the
+	// helper while it still runs; the release runs as the service user, the one
+	// uid the helper admits.
+	cfg.ReleaseLinks = func(context.Context) {
+		if err := reexecAsServiceUser([]string{"link", "reset", linkResetAsService, "--netd-socket", install.DefaultNetdSocket}); err != nil {
+			logger.Warn("the direct-link ports were not released; a restart clears them", "err", err)
+		}
+	}
 	if *purgeFlag {
 		human, home, err := purgeTarget(os.Getenv("SUDO_USER"), os.Getenv("SUDO_UID"))
 		if err != nil {
