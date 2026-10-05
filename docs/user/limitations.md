@@ -432,9 +432,13 @@ network isolation**, and any same-node process can dial any pod IP. Untrusted wo
 
 ### Ingress TLS Keys and Secrets at Rest
 
-Ingress TLS private keys are held **in-memory by the server process**, and Secrets are
-**plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods). There is
-no KMS/envelope encryption. Treat read access to the host disk as read access to every Secret.
+Ingress TLS private keys are held **in-memory by the server process**. By default, Secrets are
+**plaintext-at-rest in the kine SQLite datastore** (file mode 0600, unreachable from pods), so treat
+read access to the host disk as read access to every Secret. Encryption at rest is opt-in on the
+install that creates a new cluster (`sudo k3sm install --secrets-encryption`), with a key generated
+on the Mac and kept under `/var/lib/k3sm/server/cred`. There is no KMS/envelope encryption, no key rotation, and no
+way to switch an existing cluster over. See
+[Secrets Encryption at Rest](install.md#secrets-encryption-at-rest).
 
 ### Certificate Rotation Does Not Revoke
 
@@ -665,11 +669,13 @@ Runbook:
   **`linux/arm64` only** (`linux/amd64` needs in-guest translation and is held for a later
   release), and it passes against the release build. See
   [`vm` RuntimeClass](vm-runtimeclass.md).
-- **Multi-node and HA** ship as documented **EXPERIMENTAL** and are not launch-blocking; their
-  de-EXPERIMENTAL graduation is the **v0.3** milestone. HA is an embedded etcd cluster, started
-  with `--cluster-init` on the first server and `--server-join` on the others. k3sm refuses the
-  external-datastore flags, and does not convert an existing single-node SQLite cluster to etcd.
-  See [Multi-node](multi-node.md) and [HA](ha.md).
+- **Multi-node** ships as documented **EXPERIMENTAL** and is not launch-blocking; its
+  de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md).
+- **A multi-server (HA) control plane is not available in v0.1.6.** `k3sm server` carries
+  `--cluster-init` and `--server-join` for an embedded etcd cluster, but a second server cannot
+  join yet, and `k3sm install` does not expose the flags. External-datastore HA and its flags were
+  removed in v0.1.6, and there is no conversion from an existing single-node SQLite cluster to etcd.
+  See [HA](ha.md).
 
 ### `vm` Pods: Node Selection and Security-Context Admission
 

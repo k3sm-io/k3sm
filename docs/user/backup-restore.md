@@ -27,11 +27,9 @@ k3sm snapshot save --out /Volumes/backups/k3sm.db
 It is safe to run **while the control plane is serving**, because SQLite takes the copy inside a read
 transaction and a concurrent write cannot tear it. What it does, in order:
 
-1. Refuses if this node's state of record is an external **Postgres** datastore (there is nothing
-   local to copy; see [HA / Postgres](#ha--postgres)).
-2. Refuses unless the destination volume has **twice the database size** free, rather than writing a
+1. Refuses unless the destination volume has **twice the database size** free, rather than writing a
    partial snapshot.
-3. Writes a consistent point-in-time image of the datastore, runs `PRAGMA integrity_check` on **that
+2. Writes a consistent point-in-time image of the datastore, runs `PRAGMA integrity_check` on **that
    image**, and only then renames it into place. A snapshot that exists under its final name is
    therefore complete and was confirmed readable as a database.
 
@@ -194,23 +192,8 @@ Single-node datastore reads are **consistent-LIST**. Under heavy churn, **watch 
 possible and its **soak** validation is still pending. Factor that into recovery expectations; see
 [Limitations](limitations.md).
 
-## HA / Postgres
-
-In an [HA](ha.md) cluster the state of record is the operator-managed Postgres, not a local SQLite
-file. Nothing above applies. Back it up with `pg_dump`/PITR on your Postgres schedule.
-
-`k3sm snapshot save` and `k3sm snapshot restore` **refuse there** and say so, naming `pg_dump`,
-because k3sm does not read your Postgres and anything it could write there would not be a backup of
-your cluster. It detects Postgres from the server's `--datastore-endpoint` (or
-`$K3SM_DATASTORE_ENDPOINT`) and from the `.pgpass` file the server writes in the work directory. If a
-node no longer uses Postgres, remove that file and the commands work again.
-
-When a DSN carries a password, `k3sm install` keeps it in a file only the daemon's user can read
-(`/var/lib/k3sm/server/datastore-endpoint`, mode 0600) and puts `--datastore-endpoint-file <path>` on
-the daemon's command line, so the password is not visible to other accounts in `ps`.
-
 ## Next
 
 - [Upgrade](upgrade.md) covers what happens to the datastore across a version move.
-- [HA](ha.md) describes the Postgres datastore and its own backup path.
+- [HA](ha.md) describes the multi-server control plane being built, which v0.1.6 does not offer.
 - [Storage](storage.md) covers backing up PV data separately.
