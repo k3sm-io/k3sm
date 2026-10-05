@@ -227,12 +227,6 @@ var serverOnlyInstallFlags = []string{
 	"secrets-encryption",
 }
 
-// joinInstallFlags describe a JOIN: a worker's (--agent) or a server's
-// (--server-join). On a server that joins nothing they mean nothing.
-// --node-ip is shared by both roles too but is not a join flag: on a server it
-// is the etcd peer address, which --cluster-init needs as much as --server-join.
-var joinInstallFlags = []string{"server", "token-file"}
-
 // role is the install role these flags select.
 func (o installFlags) role() install.Role {
 	if o.agent {
