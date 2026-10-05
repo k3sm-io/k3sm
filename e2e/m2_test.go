@@ -419,10 +419,10 @@ func TestM2_DenyUsers(t *testing.T) {
 // criterion moved to the M10 conformance set once the pull path landed (resolver.go +
 // runtimed/pkg/image/pull.go, M2.6). This stub is retained only as the M2 checklist-of-
 // record reference (hack/acceptance/conformance/README.md, hack/acceptance/m2.sh);
-// the single owning criterion lives in e2e/m10_test.go.
+// the single owning criterion lives in e2e/m10_pullsecret_test.go.
 func TestM2_ImagePullSecrets(t *testing.T) {
 	Up(t)
-	t.Skip("superseded by TestM10_ImagePullSecret — B80 (imagePullSecrets pull-auth criterion; see e2e/m10_test.go)")
+	t.Skip("superseded by TestM10_ImagePullSecret — B80 (imagePullSecrets pull-auth criterion; see e2e/m10_pullsecret_test.go)")
 }
 
 // TestM2_DaemonSet is a DEFERRED criterion: DaemonSet scheduling is not yet a k3sm
