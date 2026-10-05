@@ -28,9 +28,14 @@ limitations under the License.
 // and adopting it into this ensure had to be a deliberate act carrying its own
 // mesh-regression check. It has since been adopted: cmd/k3sm's runServer
 // hands this package MeshPeerCRD() on the mesh path, once, before the worker-join
-// supervisor exists. Had this package globbed a manifest directory, or grown a
-// package-level set of "the CRDs k3sm applies", that adoption would have happened
-// by accident, at an unreviewed moment, with no diff to argue about.
+// supervisor exists. The DirectLink CRD (net.k3sm.io/v1alpha1, the direct-link
+// topology) was adopted the same way: the server hands this package
+// DirectLinkCRD() on the mesh path, after the MeshPeer one and before the
+// direct-link resolver starts, logging rather than failing on an error because
+// only direct links, not the mesh, depend on it. Had this package globbed a
+// manifest directory, or grown a package-level set of "the CRDs k3sm applies",
+// that adoption would have happened by accident, at an unreviewed moment, with
+// no diff to argue about.
 //
 // # Server-side apply, forced, under one field manager
 //

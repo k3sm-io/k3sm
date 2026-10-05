@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	netv1 "k3sm.io/apis/net/v1"
 )
 
 // TestMeshEndpointRefresherRepublishesOnChange is B283's B2 leg: the debounce and
@@ -102,7 +104,7 @@ func TestMeshEndpointRefresherRepublishesOnChange(t *testing.T) {
 					}
 					return v, nil
 				},
-				publish: func(_ context.Context, endpoint string) error {
+				publish: func(_ context.Context, endpoint string, _ []netv1.EndpointCandidate) error {
 					attempts++
 					if tc.failPublish[attempts-1] {
 						published = append(published, endpoint)
@@ -140,8 +142,11 @@ func TestMeshEndpointRefresherRepublishesOnChange(t *testing.T) {
 		done := make(chan struct{})
 		var published []string
 		r := &meshEndpointRefresher{
-			derive:    func(context.Context) (string, error) { return moved, nil },
-			publish:   func(_ context.Context, e string) error { published = append(published, e); return nil },
+			derive: func(context.Context) (string, error) { return moved, nil },
+			publish: func(_ context.Context, e string, _ []netv1.EndpointCandidate) error {
+				published = append(published, e)
+				return nil
+			},
 			log:       quietLogger(),
 			tick:      ticks,
 			published: joined,

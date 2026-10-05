@@ -113,10 +113,11 @@ func nodeNameFromClientCert(certPEM []byte) (string, error) {
 // one: the expiry decision is then testable without waiting a year.
 func agentDeregister(sys install.System, dataRoot string, now time.Time) (func(context.Context) error, string) {
 	host, err := install.AgentJoinServer(sys, install.Config{DataRoot: dataRoot})
+	autoJoined := errors.Is(err, install.ErrNoJoinServer)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil, "" // not a worker; nothing to say
-	case err != nil:
+	case err != nil && !autoJoined:
 		return nil, fmt.Sprintf("the control plane this node joined is unknown (%v), so a deregistration has nowhere to go", err)
 	}
 
@@ -131,6 +132,14 @@ func agentDeregister(sys install.System, dataRoot string, now time.Time) (func(c
 		return nil, fmt.Sprintf("this node's certificate expired at %s, so the control plane would refuse a deregistration", cred.ClientNotAfter.UTC().Format(time.RFC3339))
 	}
 
+	if autoJoined {
+		// An --auto-join node joined over a cable: its server is the cable
+		// address recorded at the join.
+		if cred.Assignment.BootstrapAddress == "" {
+			return nil, "this node names no control plane: its plist has no --server and its assignment records no server cable address"
+		}
+		host = cred.Assignment.BootstrapAddress
+	}
 	nodeName, err := nodeNameFromClientCert(cred.ClientCertPEM)
 	if err != nil {
 		return nil, err.Error()
@@ -143,7 +152,7 @@ func agentDeregister(sys install.System, dataRoot string, now time.Time) (func(c
 	// beside join and the endpoint refresh on <host>:9345, and the host is the
 	// underlay address this node joined over — the one address it is known to
 	// have reached, and the one that still works once the mesh goes down.
-	serverURL := "https://" + net.JoinHostPort(host, strconv.Itoa(bootstrapPort))
+	serverURL := bootstrap.HTTPSURL(net.JoinHostPort(host, strconv.Itoa(bootstrapPort)))
 	return func(ctx context.Context) error {
 		return bootstrap.DeregisterNode(ctx, client, serverURL, nodeName)
 	}, ""

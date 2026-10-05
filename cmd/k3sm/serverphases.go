@@ -27,10 +27,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	crdconfig "k3sm.io/apis/config/crd"
+	"k3sm.io/darwin-net/pkg/podnet"
+
 	"k3sm.io/k3sm/pkg/addons"
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/crdensure"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/ingresshost"
+	"k3sm.io/k3sm/pkg/linkgraph"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/provisioner"
 	"k3sm.io/k3sm/pkg/rbac"
@@ -227,6 +232,13 @@ type serverMesh struct {
 	// MeshEgressIP is the honest "no mesh here".
 	egressIP   string
 	peerEgress []string
+	// links is this node's direct-link loop: the join supervisor serves its
+	// link-local join listeners and pairing beacons on the ports it configured.
+	// Nil off the mesh path and under --network none.
+	links *directLinkRuntime
+	// restCfg is the admin REST config the direct-link resolver runs over; nil
+	// off the mesh path.
+	restCfg *rest.Config
 }
 
 // enrollServerMesh is step 4b: THIS SERVER JOINS ITS OWN MESH.
@@ -279,7 +291,18 @@ func enrollServerMesh(ctx context.Context, plan serverPlan, restCfg *rest.Config
 		return sm, fmt.Errorf("build mesh enroller: %w", err)
 	}
 	sm.enroller = e
-	if res, down, err := enrollSelfAndBringUpMesh(ctx, sm.enroller, nodePasswords, opts, plan.mode, kubeconfig, logger); err != nil {
+	sm.restCfg = restCfg
+	if plan.mode.DataPath() {
+		selfCIDR, err := podnet.NodeCIDR(podnet.ClusterPodCIDR, serverNodeIndex)
+		if err == nil {
+			if links, lerr := newServerDirectLinks(sm.enroller, opts, selfCIDR.String(), kubeconfig, logger); lerr != nil {
+				logger.Warn("this control-plane node runs no direct links (the mesh stays tunnel-only)", "err", lerr)
+			} else {
+				sm.links = links
+			}
+		}
+	}
+	if res, down, err := enrollSelfAndBringUpMesh(ctx, sm.enroller, nodePasswords, opts, plan.mode, kubeconfig, sm.links, logger); err != nil {
 		msg, attrs := serverMeshBringUpFailure(opts, err)
 		logger.Error(msg, attrs...)
 		// A bring-up that failed part-way still owns a utun, so the handle is
@@ -318,6 +341,10 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 	if sm.enroller == nil {
 		return stop
 	}
+	// The direct-link resolver lives exactly as long as the join supervisor (both
+	// are the mesh path's), so its stop rides this phase's.
+	stopLinks := startLinkResolver(ctx, plan, sm, sm.restCfg, cs, logger)
+	stop = stopLinks
 	opts := plan.opts
 	tokens := bootstrap.NewFileTokenStore(bootstrap.TokensPath(opts.workDir), nil)
 	deps := bootstrapServerDeps{
@@ -334,6 +361,15 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		nodePasswords: sm.nodePasswords,
 		enroller:      sm.enroller,
 		apiServers:    []string{fmt.Sprintf("%s:%d", opts.meshIP, opts.apiPort)},
+		// Direct links: the publish/read verb always (the enroller writes the
+		// DirectLink), and the cable-port listeners, beacons and pairing verb when
+		// this node runs a direct-link loop.
+		directLinks: sm.enroller,
+		links:       sm.links,
+		fileTokens:  tokens,
+		workDir:     opts.workDir,
+		podCIDR:     sm.podCIDR,
+		pairEvents:  nodeEventRecorder{cs: cs, node: opts.nodeName, component: "k3sm-pairing"},
 	}
 	// Serve the AES-256-GCM CA bundle authorized by the
 	// SERVER-class token ONLY (never a worker), sealing the live hierarchy; publish
@@ -355,7 +391,7 @@ func startJoinSupervisor(ctx context.Context, plan serverPlan, cs kubernetes.Int
 		if admin, err := executor.NewLocalEtcdAdmin(ctx, opts.workDir, opts.kinePort); err != nil {
 			logger.Error("etcd member routes disabled: cannot reach the local etcd member", "err", err)
 		} else {
-			stop = func() { _ = admin.Close() }
+			stop = func() { stopLinks(); _ = admin.Close() }
 			deps.members = localMemberJoiner{admin: admin}
 		}
 	}
@@ -523,4 +559,55 @@ func repairServerNodeLabels(ctx context.Context, cs kubernetes.Interface, nodeNa
 		logger.Info("removed a stale label this node can no longer remove itself under its node identity", "node", nodeName, "label", staleNodeRoleLabel)
 	}
 	return nil
+}
+
+// ensureDirectLinkCRD server-side-applies the net.k3sm.io/v1alpha1 DirectLink CRD
+// through the same applier as the MeshPeer one, on the mesh path only. A failure
+// is logged, not returned: the mesh runs without it, and only direct links are
+// lost.
+func ensureDirectLinkCRD(ctx context.Context, meshIP string, newClient crdClientFactory, logger *slog.Logger) {
+	if meshIP == "" {
+		return
+	}
+	c, err := newClient()
+	if err == nil {
+		_, err = crdensure.Ensure(ctx, c, crdconfig.DirectLinkCRD(), crdensure.Options{Log: logger})
+	}
+	if err != nil {
+		logger.Error("the DirectLink CRD was not ensured: no node can publish its cable ports, so every cable stays unused and pod traffic rides the tunnel", "crd", crdconfig.DirectLinkCRDName, "err", err)
+		return
+	}
+	logger.Info("ensured the DirectLink CRD", "crd", crdconfig.DirectLinkCRDName)
+}
+
+// startLinkResolver runs the direct-link resolver (pkg/linkgraph) on the mesh
+// path. It writes every DirectLink's status and the advisory direct-links label;
+// the returned stop cancels it.
+//
+// It first ensures the DirectLink CRD (ensureDirectLinkCRD). Both run after the
+// apiserver serves and the MeshPeer CRD exists (step 4a), on the mesh path only.
+func startLinkResolver(ctx context.Context, plan serverPlan, sm serverMesh, restCfg *rest.Config, cs kubernetes.Interface, logger *slog.Logger) (stop func()) {
+	if sm.enroller == nil {
+		return noStop
+	}
+	ensureDirectLinkCRD(ctx, plan.opts.meshIP, func() (crdensure.CRDClient, error) {
+		return apiextensionsclient.NewForConfig(restCfg)
+	}, logger)
+	c, err := linkgraph.NewController(restCfg, cs, logger)
+	if err != nil {
+		logger.Error("the direct-link resolver is not running: no cable is ever reported up", "err", err)
+		return noStop
+	}
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := c.Run(rctx); err != nil && rctx.Err() == nil {
+			logger.Error("direct-link resolver stopped", "err", err)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }

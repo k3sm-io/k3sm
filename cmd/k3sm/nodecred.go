@@ -123,10 +123,11 @@ func (s nodeCredentialStore) Save(apiserverURL, nodeName string, res *bootstrap.
 		return fmt.Errorf("persist kubelet client CA: %w", err)
 	}
 	blob, err := json.MarshalIndent(nodecred.Assignment{
-		PodCIDR:    res.PodCIDR,
-		MeshIP:     res.MeshIP,
-		APIServers: res.APIServers,
-		Peers:      res.Peers,
+		PodCIDR:          res.PodCIDR,
+		MeshIP:           res.MeshIP,
+		APIServers:       res.APIServers,
+		Peers:            res.Peers,
+		BootstrapAddress: res.ServerLinkIP,
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal node assignment: %w", err)
@@ -294,6 +295,7 @@ func joinResultFrom(c *nodeCredential, nodeName, wgPrivB64, wgPubB64 string) *bo
 		WGPrivateKeyB64:       wgPrivB64,
 		WGPublicKeyB64:        wgPubB64,
 		APIServers:            c.Assignment.APIServers,
+		ServerLinkIP:          c.Assignment.BootstrapAddress,
 	}
 }
 

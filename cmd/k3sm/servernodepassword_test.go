@@ -192,12 +192,12 @@ func twoBootSelfBind(t *testing.T, between func(workDir string)) (serverOptions,
 	opts := selfEnrollOptions(workDir, nodeName)
 	e, _ := enrollerOverStub(t)
 
-	if _, _, err := enrollSelfAndBringUpMesh(ctx, e, serverNodePasswordStore(cs, quietLogger()), opts, mode, "", quietLogger()); err != nil {
+	if _, _, err := enrollSelfAndBringUpMesh(ctx, e, serverNodePasswordStore(cs, quietLogger()), opts, mode, "", nil, quietLogger()); err != nil {
 		t.Fatalf("first boot: %v", err)
 	}
 	between(workDir)
 	second := &countingNodePasswords{inner: serverNodePasswordStore(cs, quietLogger())}
-	_, _, err := enrollSelfAndBringUpMesh(ctx, e, second, opts, mode, "", quietLogger())
+	_, _, err := enrollSelfAndBringUpMesh(ctx, e, second, opts, mode, "", nil, quietLogger())
 	return opts, second.count(), err
 }
 

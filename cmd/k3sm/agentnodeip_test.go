@@ -90,8 +90,10 @@ func (e *assigningEnroller) ReleaseAllocation(_ context.Context, nodeName string
 	return nil
 }
 
-func (e *assigningEnroller) RefreshEndpoint(context.Context, string, string) error { return nil }
-func (e *assigningEnroller) Deregister(context.Context, string) error              { return nil }
+func (e *assigningEnroller) RefreshEndpoint(context.Context, string, string, []netv1.EndpointCandidate) error {
+	return nil
+}
+func (e *assigningEnroller) Deregister(context.Context, string) error { return nil }
 
 // joinRig is a live bootstrap server over httptest: the REAL pkg/bootstrap
 // handler, real CAs, a real token store, and the assigning enroller above. It is

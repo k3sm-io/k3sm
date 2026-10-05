@@ -29,6 +29,7 @@ import (
 	"time"
 
 	netv1 "k3sm.io/apis/net/v1"
+	"k3sm.io/darwin-net/pkg/linkenum"
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/podnet"
 
@@ -284,6 +285,11 @@ type meshBringUp struct {
 	// own. Nil runs no refresher, which is what the unit tests of the device
 	// bring-up want.
 	refresher *meshEndpointRefresher
+	// links is the node's direct-link loop, attached once the device is up (the
+	// helper refuses ConfigureLink until the node identity is confirmed) and fed
+	// the link events the mesh watcher consumes. Nil runs the mesh tunnel-only,
+	// which is what `--network none` and every device-level unit test want.
+	links *directLinkRuntime
 }
 
 // provisionHelperKey writes the private key to the root-only path the netd
@@ -362,7 +368,11 @@ func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
 // index-0 claim is what keeps a worker's assignment off this node's /24, and that
 // is true whether or not this process plumbs a wireguard device. Only the DEVICE
 // bring-up is gated on the datapath.
-func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bootstrap.NodePasswordStore, opts serverOptions, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
+//
+// links, when set, is this node's direct-link loop: it is attached once the
+// device is up, its direct candidates ride the endpoint refresher, and a server
+// with no underlay address at all advertises its own cable address instead.
+func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bootstrap.NodePasswordStore, opts serverOptions, mode hostnet.Mode, kubeconfig string, links *directLinkRuntime, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
 	// The name binding comes FIRST, before this node has written anything of its
 	// own: it is the claim on this node's identity, and the store it lands in is
 	// the one every worker join is checked against.
@@ -375,7 +385,13 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 	}
 	endpoint, err := serverMeshEndpoint(opts.nodeIP, opts.meshIP, serverMeshListenPort)
 	if err != nil {
-		return netv1.MeshEnrollResponse{}, noMeshTeardown, err
+		// A cable-only control plane: its endpoint is its own cable address.
+		fallback, ferr := serverDirectEndpoint(ctx, links)
+		if ferr != nil {
+			return netv1.MeshEnrollResponse{}, noMeshTeardown, err
+		}
+		logger.Info("no underlay address: this control-plane node advertises its cable address as its wireguard endpoint", "endpoint", fallback)
+		endpoint = fallback
 	}
 	res, err := e.EnrollSelf(ctx, opts.nodeName, netv1.MeshEnrollRequest{
 		NodeName:  opts.nodeName,
@@ -403,7 +419,8 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 		// does — this Mac's LAN address is no more fixed than any other — and a
 		// worker that joined before the move dials the old one on its next full
 		// resync. The write is in-process through the same locked enroller.
-		refresher: newServerEndpointRefresher(e, opts, endpoint, logger),
+		refresher: serverRefresherWithLinks(newServerEndpointRefresher(e, opts, endpoint, logger), links),
+		links:     links,
 	}, mode, logger)
 	if err != nil {
 		// The handle is returned even on a failed bring-up: a device that came up
@@ -412,4 +429,29 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 		return netv1.MeshEnrollResponse{}, down, err
 	}
 	return res, down, nil
+}
+
+// serverDirectEndpoint is a cable-only control plane's wireguard endpoint: its
+// own derived address on its lowest-ordinal cabled port, at the server mesh port.
+func serverDirectEndpoint(ctx context.Context, links *directLinkRuntime) (string, error) {
+	if links == nil {
+		return "", errors.New("no direct links")
+	}
+	port, err := cabledPort(ctx, linkenum.Exec{})
+	if err != nil {
+		return "", err
+	}
+	ip := links.linkIP(port)
+	if !ip.IsValid() {
+		return "", fmt.Errorf("node index has no direct-link address for port %d", port.PortOrdinal)
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(serverMeshListenPort)), nil
+}
+
+// serverRefresherWithLinks hands the refresher the node's direct candidates.
+func serverRefresherWithLinks(r *meshEndpointRefresher, links *directLinkRuntime) *meshEndpointRefresher {
+	if links != nil {
+		r.direct = links.directCandidates
+	}
+	return r
 }

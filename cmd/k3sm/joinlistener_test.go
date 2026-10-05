@@ -272,6 +272,8 @@ func (stubEnroller) ReleaseAllocation(context.Context, string, bootstrap.Allocat
 	return nil
 }
 
-func (stubEnroller) RefreshEndpoint(context.Context, string, string) error { return nil }
+func (stubEnroller) RefreshEndpoint(context.Context, string, string, []netv1.EndpointCandidate) error {
+	return nil
+}
 
 func (stubEnroller) Deregister(context.Context, string) error { return nil }

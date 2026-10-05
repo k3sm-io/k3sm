@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -42,10 +43,14 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	netv1 "k3sm.io/apis/net/v1"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
+	"k3sm.io/darwin-net/pkg/linkenum"
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/bootstrap/pairing"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/linkgraph"
 )
 
 // meshEnroller is the server-side, controller-mediated mesh enroll
@@ -74,6 +79,11 @@ type meshEnroller struct {
 	// a Node that cannot be deleted is reported, because a left-behind Node is
 	// half the state deregistration exists to remove.
 	nodes typedcorev1.NodeInterface
+	// links reads and writes DirectLink objects (the direct-link publish verb
+	// and the deregistration). Nil when its client could not be built, in which
+	// case the publish verb answers 500 and deregistration leaves the object to
+	// the Node owner reference's garbage collection.
+	links *linkgraph.Store
 	mu    sync.Mutex
 }
 
@@ -85,6 +95,11 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 		return nil, err
 	}
 	e := &meshEnroller{client: client, clusterPod: podnet.ClusterPodCIDR, log: log}
+	if lc, err := linkgraph.RESTClient(cfg); err != nil {
+		log.Warn("direct links cannot be written or deregistered: the DirectLink client could not be built", "err", err)
+	} else {
+		e.links = &linkgraph.Store{Client: lc}
+	}
 	// The Event sink is best-effort by construction: an enroller that cannot
 	// record events still enrolls, and refusing to build one here would turn an
 	// observability dependency into a join outage.
@@ -112,6 +127,43 @@ func newMeshEnroller(cfg *rest.Config, log *slog.Logger) (*meshEnroller, error) 
 // enroll of this name replaces it: a peer's id names the last enroll that wrote
 // it, which is exactly the question a release has to answer.
 func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
+	return e.enroll(ctx, nodeName, req, nil)
+}
+
+// EnrollDirect implements bootstrap.DirectEnroller: the enroll of a node with no
+// underlay address. It is Enroll, except that once the index is assigned the
+// node's wireguard endpoint is DERIVED — netv1alpha1.LinkIP(index, the joiner's
+// port ordinal) at the joiner's mesh port — and written as both the Endpoint and
+// the one direct candidate. The joiner could not name that address itself: it
+// depends on the index this call chooses.
+func (e *meshEnroller) EnrollDirect(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest, direct bootstrap.JoinDirect) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
+	return e.enroll(ctx, nodeName, req, &direct)
+}
+
+// directEndpoint derives a cable-only node's wireguard endpoint from its pod /24
+// and the port it joined over.
+func directEndpoint(clusterPod netip.Prefix, podCIDR string, direct bootstrap.JoinDirect) (string, error) {
+	prefix, err := netip.ParsePrefix(podCIDR)
+	if err != nil {
+		return "", fmt.Errorf("parse podCIDR %q: %w", podCIDR, err)
+	}
+	idx, err := podnet.NodeIndex(clusterPod, prefix)
+	if err != nil {
+		return "", err
+	}
+	ip, err := netv1alpha1.LinkIP(idx, int(direct.PortOrdinal))
+	if err != nil {
+		return "", err
+	}
+	if direct.MeshPort < 1 || direct.MeshPort > 65535 {
+		return "", fmt.Errorf("direct join names mesh port %d, want 1-65535", direct.MeshPort)
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(int(direct.MeshPort))), nil
+}
+
+// enroll is Enroll and EnrollDirect: direct, when set, derives the endpoint from
+// the assigned index.
+func (e *meshEnroller) enroll(ctx context.Context, nodeName string, req netv1.MeshEnrollRequest, direct *bootstrap.JoinDirect) (netv1.MeshEnrollResponse, bootstrap.Allocation, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -170,9 +222,22 @@ func (e *meshEnroller) Enroll(ctx context.Context, nodeName string, req netv1.Me
 		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("derive mesh-egress IP: %w", err)
 	}
 
+	if direct != nil {
+		ep, err := directEndpoint(e.clusterPod, podCIDR, *direct)
+		if err != nil {
+			return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("derive the direct-link endpoint of %q: %w", nodeName, err)
+		}
+		req.Endpoint = ep
+	}
 	peer, err := bootstrap.BuildMeshPeer(nodeName, podCIDR, meshIP.String(), req)
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, err
+	}
+	if direct != nil {
+		peer.Spec.Endpoints = []netv1.EndpointCandidate{{Address: req.Endpoint, Link: netv1.EndpointLinkDirect}}
+		if err := peer.Spec.Validate(); err != nil {
+			return netv1.MeshEnrollResponse{}, bootstrap.Allocation{}, fmt.Errorf("build mesh peer for %q: %w", nodeName, err)
+		}
 	}
 	stampEnrollID(peer, enrollID)
 	// Past this point the peer may exist, so the real allocation is reported: the
@@ -432,7 +497,7 @@ func (e *meshEnroller) EnrollSelf(ctx context.Context, nodeName string, req netv
 // It runs under the SAME mutex as Enroll/EnrollSelf. The mutex serializes the
 // podCIDR assignment, and a refresh interleaved between a join's list and its
 // write would be lost by that write's copy of the object.
-func (e *meshEnroller) RefreshEndpoint(ctx context.Context, nodeName, endpoint string) error {
+func (e *meshEnroller) RefreshEndpoint(ctx context.Context, nodeName, endpoint string, candidates []netv1.EndpointCandidate) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -444,18 +509,26 @@ func (e *meshEnroller) RefreshEndpoint(ctx context.Context, nodeName, endpoint s
 		return fmt.Errorf("read mesh peer %q: %w", nodeName, err)
 	}
 	old := cur.Spec.Endpoint
-	if old == endpoint {
+	sameCandidates := candidates == nil || slices.Equal(cur.Spec.Endpoints, candidates)
+	if old == endpoint && sameCandidates {
 		return nil
 	}
 	cur.Spec.Endpoint = endpoint
+	if candidates != nil {
+		// Only the two candidate classes this binary writes; a reader ignores an
+		// unknown one, and apis refuses to store it.
+		cur.Spec.Endpoints = slices.Clone(candidates)
+	}
 	if err := cur.Spec.WithDefaults().Validate(); err != nil {
 		return fmt.Errorf("refresh mesh peer %q endpoint: %w", nodeName, err)
 	}
 	if err := e.client.Put().Resource(meshPeerResource).Name(nodeName).Body(&cur).Do(ctx).Into(&netv1.MeshPeer{}); err != nil {
 		return fmt.Errorf("write mesh peer %q endpoint: %w", nodeName, err)
 	}
-	e.log.Info("mesh peer endpoint refreshed", "node", nodeName, "old", old, "new", endpoint)
-	e.recordEndpointChange(ctx, nodeName, old, endpoint)
+	e.log.Info("mesh peer endpoint refreshed", "node", nodeName, "old", old, "new", endpoint, "candidates", len(cur.Spec.Endpoints))
+	if old != endpoint {
+		e.recordEndpointChange(ctx, nodeName, old, endpoint)
+	}
 	return nil
 }
 
@@ -532,6 +605,14 @@ func (e *meshEnroller) Deregister(ctx context.Context, nodeName string) error {
 	if err := e.client.Delete().Resource(meshPeerResource).Name(nodeName).Do(ctx).Error(); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete mesh peer %q: %w", nodeName, err)
 	}
+	// The node's DirectLink goes with it: the resolver would otherwise keep
+	// reporting its ports, and a peer cabled to this Mac would read a stale end.
+	// The Node owner reference would reap it too, but only once the Node is gone.
+	if e.links != nil {
+		if err := e.links.Delete(ctx, nodeName); err != nil {
+			return err
+		}
+	}
 	if e.nodes == nil {
 		return fmt.Errorf("delete node %q: this supervisor has no core apiserver client, so only the MeshPeer was removed (`kubectl delete node %s` removes the rest)", nodeName, nodeName)
 	}
@@ -540,6 +621,58 @@ func (e *meshEnroller) Deregister(ctx context.Context, nodeName string) error {
 	}
 	e.log.Info("node deregistered", "node", nodeName)
 	return nil
+}
+
+// ApplyDirectLink implements bootstrap.DirectLinkWriter: it writes the node's
+// DirectLink spec on the node's behalf, under the enroller's mutex so two writes
+// cannot interleave their domain-UUID check and their write.
+//
+// Every link address must be the one derived from the node's own index (the
+// node's MeshPeer carries the pod /24), so a node cannot claim another node's
+// address on the cable. A node with no MeshPeer is ErrNoMeshPeer: it must rejoin
+// before it has an index at all. The object is owned by the Node when the Node
+// exists, so it is garbage-collected with it.
+func (e *meshEnroller) ApplyDirectLink(ctx context.Context, spec netv1alpha1.DirectLinkSpec) error {
+	if e.links == nil {
+		return errors.New("this supervisor has no DirectLink client")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var peer netv1.MeshPeer
+	if err := e.client.Get().Resource(meshPeerResource).Name(spec.NodeName).Do(ctx).Into(&peer); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: %q", bootstrap.ErrNoMeshPeer, spec.NodeName)
+		}
+		return fmt.Errorf("read mesh peer %q: %w", spec.NodeName, err)
+	}
+	idx, ok := nodeIndexOf(e.clusterPod, peer.Spec.PodCIDR)
+	if !ok {
+		return fmt.Errorf("mesh peer %q holds no index (podCIDR %q)", spec.NodeName, peer.Spec.PodCIDR)
+	}
+	if err := spec.ValidateWithIndex(idx); err != nil {
+		return err
+	}
+	owner := linkgraph.NodeOwner{Name: spec.NodeName}
+	if e.nodes != nil {
+		if n, err := e.nodes.Get(ctx, spec.NodeName, metav1.GetOptions{}); err == nil {
+			owner.UID = n.UID
+		}
+	}
+	if err := e.links.ApplySpec(ctx, spec, owner); err != nil {
+		if errors.Is(err, linkgraph.ErrDomainUUIDClaimed) {
+			return fmt.Errorf("%w: %w", bootstrap.ErrDomainUUIDClaimed, err)
+		}
+		return err
+	}
+	return nil
+}
+
+// GetDirectLink implements bootstrap.DirectLinkWriter's read half.
+func (e *meshEnroller) GetDirectLink(ctx context.Context, nodeName string) (*netv1alpha1.DirectLink, bool, error) {
+	if e.links == nil {
+		return nil, false, errors.New("this supervisor has no DirectLink client")
+	}
+	return e.links.Get(ctx, nodeName)
 }
 
 // lowestFreeNodeIndex returns the lowest node index ≥ 1 whose /24 no existing peer
@@ -775,6 +908,20 @@ type bootstrapServerDeps struct {
 	// value; it is a field so a test can drive the rebind retry without racing a
 	// real port.
 	listen listenFunc
+	// directLinks serves the direct-link publish/read verb; nil serves none.
+	directLinks bootstrap.DirectLinkWriter
+	// links is this node's direct-link loop; with it the supervisor also serves
+	// the join and pairing verbs on each configured cable port's link-local
+	// address and sends the pairing beacon there. Nil serves no cable port.
+	links *directLinkRuntime
+	// fileTokens mints pairing tokens and owns the lock the window file shares.
+	fileTokens *bootstrap.FileTokenStore
+	// workDir holds the pairing window file.
+	workDir string
+	// podCIDR is this node's pod /24, from which its cable addresses derive.
+	podCIDR string
+	// pairEvents records pairing accepts and refusals as Node Events.
+	pairEvents pairing.Recorder
 }
 
 // listenFunc binds a listening socket. It is the seam startBootstrapServer binds
@@ -847,7 +994,7 @@ func listenJoinAddr(ctx context.Context, listen listenFunc, addr string, attempt
 func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *slog.Logger) error {
 	h := deps.hierarchy
 	meshIP := deps.meshIP
-	srv, err := bootstrap.NewServer(bootstrap.ServerConfig{
+	cfg := bootstrap.ServerConfig{
 		ClusterCA:     h.Cluster,
 		SigningCA:     h.Signing,
 		Tokens:        deps.tokens,
@@ -859,9 +1006,15 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 		Bundle:        deps.bundle,
 		Members:       deps.members,
 		Logger:        log,
-	})
+		DirectLinks:   deps.directLinks,
+	}
+	pair, beacon := wirePairing(ctx, &cfg, deps, log)
+	srv, err := bootstrap.NewServer(cfg)
 	if err != nil {
 		return fmt.Errorf("build bootstrap server: %w", err)
+	}
+	if pair != nil {
+		pair.Gate = srv.PreAuthAllow
 	}
 
 	servingChain, err := h.Cluster.ServingChainTLS("k3sm-supervisor",
@@ -882,6 +1035,10 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 	tlsCfg, err := bootstrap.ListenerTLSConfig(servingChain, h.Signing.CertPEM)
 	if err != nil {
 		return fmt.Errorf("bootstrap listener TLS: %w", err)
+	}
+	if deps.links != nil && beacon != nil {
+		host := &linkHost{ports: deps.links.configuredPorts, handler: srv.LinkHandler(), tlsCfg: tlsCfg, beacon: beacon, log: log}
+		go host.run(ctx)
 	}
 	hs := &http.Server{
 		Addr:              bootstrapListenAddr(meshIP),
@@ -910,4 +1067,65 @@ func startBootstrapServer(ctx context.Context, deps bootstrapServerDeps, log *sl
 		return fmt.Errorf("bootstrap server: %w", err)
 	}
 	return nil
+}
+
+// wirePairing fills the direct-link half of the bootstrap server config: the
+// ServerLinkIP resolver for joins arriving on a cable port, the completed-join
+// count of the pairing window, and the pairing verb's handler (its Gate is set
+// once the server exists). It returns the handler and the beacon builder, both
+// nil when this node runs no direct-link loop.
+func wirePairing(ctx context.Context, cfg *bootstrap.ServerConfig, deps bootstrapServerDeps, log *slog.Logger) (*pairing.Handler, func() netv1alpha1.Beacon) {
+	if deps.links == nil || deps.fileTokens == nil {
+		return nil, nil
+	}
+	podCIDR, err := netip.ParsePrefix(deps.podCIDR)
+	if err != nil {
+		log.Warn("pairing is not served: this node's podCIDR does not parse", "podCIDR", deps.podCIDR, "err", err)
+		return nil, nil
+	}
+	hw := linkenum.HardwarePorts
+	win := pairing.WindowStore{Path: pairing.WindowPath(deps.workDir), Lock: deps.fileTokens.WithLock}
+	pin := deps.hierarchy.Cluster.PinHash()
+	cfg.LinkIPFor = func(a net.Addr) string { return serverLinkIPFor(ctx, hw, podCIDR, zoneOf(a)) }
+	cfg.OnCableJoin = func(local net.Addr, podCIDR string, portOrdinal int32) {
+		peer, err := directEndpoint(podnet.ClusterPodCIDR, podCIDR, bootstrap.JoinDirect{PortOrdinal: portOrdinal, MeshPort: 1})
+		if err != nil {
+			log.Warn("a node joined over the cable at a port with no address; no first-contact route", "err", err)
+			return
+		}
+		host, _, _ := net.SplitHostPort(peer)
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return
+		}
+		deps.links.contact(context.WithoutCancel(ctx), zoneOf(local), ip)
+	}
+	cfg.OnOneShotJoin = func(node string) {
+		if err := win.RecordCompleted(); err != nil {
+			log.Warn("pairing: the completed join was not counted against the window", "node", node, "err", err)
+		}
+	}
+	pair := &pairing.Handler{
+		HardwarePorts: hw,
+		Windows:       win,
+		Tokens:        deps.fileTokens,
+		ClusterPin:    pin,
+		JoinPort:      bootstrapPort,
+		LinkIP:        func(iface string) string { return serverLinkIPFor(ctx, hw, podCIDR, iface) },
+		Logger:        log,
+		Events:        deps.pairEvents,
+	}
+	cfg.Pair = pair
+	beacon := func() netv1alpha1.Beacon {
+		w, ok, err := win.Load()
+		open := err == nil && ok && w.IsOpen(time.Now())
+		return netv1alpha1.Beacon{
+			Version:     netv1alpha1.BeaconVersion,
+			ClusterPin:  pin,
+			NodeName:    deps.selfNodeName,
+			JoinPort:    bootstrapPort,
+			PairingOpen: open,
+		}
+	}
+	return pair, beacon
 }

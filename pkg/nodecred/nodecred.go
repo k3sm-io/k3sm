@@ -145,6 +145,14 @@ type Assignment struct {
 	// live state. See programResumedPeers in cmd/k3sm for both, and
 	// nodeCredentialStore.SaveAssignmentPeers there for the rewrite.
 	Peers []netv1.MeshPeerSpec `json:"peers,omitempty"`
+	// BootstrapAddress is the server's direct-link address on the cable this node
+	// joined over, recorded only by a node that joined by pairing. It is stable
+	// across reboots, unlike the link-local zone the join itself dialed, so a
+	// node with no underlay route to the server reaches the post-join verbs (the
+	// endpoint refresh, the direct-link publish, the deregistration) at
+	// <BootstrapAddress>:9345 over the first-contact host route its own mesh
+	// installs. Empty on every other node.
+	BootstrapAddress string `json:"bootstrapAddress,omitempty"`
 }
 
 // Credential is a loaded, parsed, self-consistent stored join outcome.

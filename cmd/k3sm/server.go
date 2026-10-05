@@ -25,11 +25,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -39,6 +41,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	crdconfig "k3sm.io/apis/config/crd"
+	netv1alpha1 "k3sm.io/apis/net/v1alpha1"
 	"k3sm.io/darwin-net/pkg/dns"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
@@ -190,11 +193,34 @@ func (opts serverOptions) validateEtcdFlags() error {
 	if !opts.etcdPosture() && !opts.clusterReset {
 		return nil
 	}
+	for _, f := range []struct{ flag, value string }{{"--node-ip", opts.nodeIP}, {"--server", opts.joinServer}} {
+		if isDirectLinkAddress(f.value) {
+			return fmt.Errorf("%w: %s %q", errHADirectLinkAddress, f.flag, f.value)
+		}
+	}
 	ip := net.ParseIP(opts.nodeIP)
 	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 		return fmt.Errorf("%w (got --node-ip %q; the etcd peer listener binds this address and every other server dials it)", executor.ErrEtcdNeedsNodeIP, opts.nodeIP)
 	}
 	return nil
+}
+
+// errHADirectLinkAddress refuses an HA server flag naming a direct-link address:
+// a zoned link-local literal or an address in the reserved halves of 169.254/16
+// that direct links derive into. etcd peers dial --node-ip and the server-join
+// dials --server; neither is designed to ride a cable, so HA over a cable-only
+// cluster is not offered (docs/user/direct-links.md says one server). Compare
+// with errors.Is.
+var errHADirectLinkAddress = errors.New("an HA control plane cannot use a direct-link address (a cable-only cluster runs one server; give the LAN address)")
+
+// isDirectLinkAddress reports whether s is a zoned IPv6 literal or a direct-link
+// (reserved-half) IPv4 address.
+func isDirectLinkAddress(s string) bool {
+	a, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil {
+		return false
+	}
+	return a.Zone() != "" || netv1alpha1.IsLinkAddress(a)
 }
 
 // deniedLocalPorts is the set of loopback TCP ports every confined pod's sandbox

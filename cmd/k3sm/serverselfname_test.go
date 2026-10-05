@@ -57,7 +57,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 		workDir := t.TempDir()
 
 		res, down, err := enrollSelfAndBringUpMesh(ctx, e, passwords,
-			selfEnrollOptions(workDir, nodeName), hostnet.Mode{Backend: hostnet.BackendNone}, "", quietLogger())
+			selfEnrollOptions(workDir, nodeName), hostnet.Mode{Backend: hostnet.BackendNone}, "", nil, quietLogger())
 		if err != nil {
 			t.Fatalf("self-enroll: %v", err)
 		}
@@ -104,7 +104,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 		mode := hostnet.Mode{Backend: hostnet.BackendNone}
 
 		for _, boot := range []string{"first", "second"} {
-			_, down, err := enrollSelfAndBringUpMesh(ctx, e, passwords, opts, mode, "", quietLogger())
+			_, down, err := enrollSelfAndBringUpMesh(ctx, e, passwords, opts, mode, "", nil, quietLogger())
 			if err != nil {
 				t.Fatalf("%s start-up: %v", boot, err)
 			}
@@ -123,7 +123,7 @@ func TestServerBindsItsOwnNodePassword(t *testing.T) {
 		}
 
 		_, _, err := enrollSelfAndBringUpMesh(ctx, e, passwords,
-			selfEnrollOptions(t.TempDir(), nodeName), hostnet.Mode{Backend: hostnet.BackendNone}, "", quietLogger())
+			selfEnrollOptions(t.TempDir(), nodeName), hostnet.Mode{Backend: hostnet.BackendNone}, "", nil, quietLogger())
 		if !errors.Is(err, bootstrap.ErrNodePasswordMismatch) {
 			t.Fatalf("self-enroll error = %v, want ErrNodePasswordMismatch", err)
 		}

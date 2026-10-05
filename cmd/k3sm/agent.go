@@ -41,10 +41,13 @@ import (
 
 	netv1 "k3sm.io/apis/net/v1"
 	"k3sm.io/darwin-net/pkg/dns"
+	"k3sm.io/darwin-net/pkg/linkenum"
+	"k3sm.io/darwin-net/pkg/linkwatch"
 	"k3sm.io/darwin-net/pkg/mesh"
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
+	"k3sm.io/k3sm/pkg/bootstrap/pairing"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
 	"k3sm.io/k3sm/pkg/install"
@@ -83,6 +86,12 @@ type agentOptions struct {
 	network   string // host-network backend: auto (default) | none | direct | helper
 	clusterIP string // DNS VIP the per-node resolver serves on + pods resolve against
 	domain    string // cluster DNS domain
+	// autoJoin joins by pairing over a direct cable instead of --server and a
+	// token: while this Mac is armed (`sudo k3sm install --auto-join`, `sudo k3sm
+	// pair --listen`) it listens for a server's beacon, asks it for a one-shot
+	// token, and runs the ordinary join over the cable. After a join it never
+	// pairs again: the stored credential is what every later start presents.
+	autoJoin bool
 }
 
 // registerAgentFlags binds `k3sm agent`'s flags onto fs. It is a function rather
@@ -90,7 +99,8 @@ type agentOptions struct {
 // pod-support shims are overridable here, as they are on `k3sm server` / `k3sm
 // node` — is unit-testable without parsing argv through a live join.
 func registerAgentFlags(fs *flag.FlagSet, opts *agentOptions) {
-	fs.StringVar(&opts.server, "server", "", "control-plane host to join — in practice an UNDERLAY address (a LAN IP or DNS name), because the join must reach <host>:9345 before this node has any mesh to route over")
+	fs.StringVar(&opts.server, "server", "", "control-plane host to join — in practice an UNDERLAY address (a LAN IP or DNS name), because the join must reach <host>:9345 before this node has any mesh to route over. A zoned link-local IPv6 literal (fe80::1%en2) joins over a direct cable")
+	fs.BoolVar(&opts.autoJoin, "auto-join", false, "join by pairing over a direct cable instead of --server and a token, while this Mac is armed (sudo k3sm install --auto-join; sudo k3sm pair --listen <dur>)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "K10 join token (or $K3SM_TOKEN) — required for a node's FIRST join only; a node that has already joined starts from its stored credential, and a token for the same cluster is ignored")
 	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding the K10 join token, read once at start and preferred over --token and $K3SM_TOKEN. It must not be group- or world-readable. This is how a supervised agent is given a token: a LaunchDaemon plist is world-readable, so the daemon is told where the token is and never what it is")
 	fs.StringVar(&opts.nodeName, "node-name", defaultNodeName(), "node name to register")
@@ -185,8 +195,11 @@ func runAgent(args []string) error {
 	// the control plane's to assign, and the join now carries it back, so an
 	// operator who does not pass one is not guessing at an address only the
 	// allocator knows.
-	if opts.server == "" {
-		return fmt.Errorf("--server is required")
+	switch {
+	case opts.server == "" && !opts.autoJoin:
+		return fmt.Errorf("--server is required (or --auto-join, to join by pairing over a direct cable)")
+	case opts.server != "" && opts.autoJoin:
+		return fmt.Errorf("--auto-join finds its server on the cable; it cannot be combined with --server")
 	}
 
 	// Before anything is joined, written or recorded: a Mac installed as a
@@ -354,6 +367,21 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	if err != nil {
 		return agentTerminal(ctx, breaker, logger, err)
 	}
+	// --auto-join with nothing to resume from: pair over the cable first. The
+	// result is an ordinary token and a zoned server address, after which the
+	// ordinary plan runs. An unarmed or expired Mac does nothing and backs off,
+	// so `sudo k3sm pair --listen` can re-arm it without a restart.
+	var paired *pairing.Result
+	if opts.autoJoin && strings.TrimSpace(opts.token) == "" && (status == credentialAbsent || status == credentialExpired) {
+		pr, err := autoJoinPairing(ctx, opts, logger)
+		if err != nil {
+			return agentTerminal(ctx, breaker, logger, fmt.Errorf("auto-join: %w", err))
+		}
+		logger.Info("paired over the cable; joining", "server", pr.Server, "serverLinkIP", pr.ServerLinkIP)
+		opts.token, opts.server = pr.Token, pr.Server
+		paired = &pr
+	}
+
 	tokenPresent := strings.TrimSpace(opts.token) != ""
 	tokenCAHash, storedCAHash := "", ""
 	tokenParses := false
@@ -397,7 +425,10 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 	}
 	logger.Info("mesh identity", "node", opts.nodeName, "publicKey", meshPub, "keyRef", meshKeyRef)
 
-	joinHost := net.JoinHostPort(opts.server, strconv.Itoa(bootstrapPort))
+	joinHost, err := agentJoinHost(opts, cred)
+	if err != nil {
+		return agentTerminal(ctx, breaker, logger, err)
+	}
 
 	var res *bootstrap.JoinResult
 	var meshEndpoint string
@@ -419,11 +450,24 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		}
 	}
 	if plan == startModeTokenJoin {
-		res, meshEndpoint, err = agentTokenJoin(ctx, opts, password, meshPriv, joinHost, logger)
+		res, meshEndpoint, err = agentTokenJoin(ctx, opts, password, meshPriv, joinHost, paired, logger)
 		if err != nil {
 			return err
 		}
+		if paired != nil {
+			if res.ServerLinkIP == "" {
+				res.ServerLinkIP = paired.ServerLinkIP
+			}
+			// After a join the joiner never runs again: the arming is spent.
+			if err := pairing.Disarm(pairing.ArmPath(opts.workDir)); err != nil {
+				logger.Warn("could not disarm pairing after the join; the stored credential still takes precedence on every later start", "err", err)
+			}
+		}
 	}
+	// The post-join verbs (the endpoint refresh, the direct-link publish) go to
+	// the server's link address when this node joined over a cable with no
+	// underlay server to name: it is stable across reboots, unlike a zone.
+	postJoinHost := postJoinBootstrapHost(opts.server, joinHost, res.ServerLinkIP)
 
 	// Refuse a credential that carries no kubelet SERVING keypair, BEFORE anything
 	// starts. A joined worker's apiserver runs with
@@ -475,10 +519,16 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 		// SURVIVABLE — the mesh is up and the endpoint published at start is
 		// correct today — so it is logged with what is lost rather than failing the
 		// agent.
-		refresher, err := newWorkerEndpointRefresher(opts, res, joinHost, meshEndpoint, logger)
+		refresher, err := newWorkerEndpointRefresher(opts, res, postJoinHost, meshEndpoint, logger)
 		if err != nil {
 			logger.Warn("this node will not republish its wireguard endpoint if its address changes; peers would keep dialing the address it joined from until it rejoins",
 				"endpoint", meshEndpoint, "err", err)
+		}
+		links, err := newWorkerDirectLinks(opts, res, postJoinHost, logger)
+		if err != nil {
+			logger.Warn("this node runs no direct links (the mesh stays tunnel-only)", "err", err)
+		} else if refresher != nil {
+			refresher.direct = links.directCandidates
 		}
 		down, err := bringUpMesh(ctx, meshBringUp{
 			podCIDR:       res.PodCIDR,
@@ -503,6 +553,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 			// that only ever gets older. The join path leaves this nil — its Save
 			// carried a live snapshot already.
 			onLivePeers: resumeSeedWriteback(plan, store),
+			links:       links,
 		}, mode, logger)
 		meshDown = down
 		if err != nil {
@@ -544,7 +595,7 @@ func agentStart(ctx context.Context, opts agentOptions, breaker *crashBreaker, l
 // can report which of this Mac's addresses reaches the control plane — the one
 // fact the mesh endpoint has to be derived from. It is still the CA-pinned
 // client; pinnedJoinClient layers only the dialer onto it.
-func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, joinHost string, logger *slog.Logger) (*bootstrap.JoinResult, string, error) {
+func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, joinHost string, paired *pairing.Result, logger *slog.Logger) (*bootstrap.JoinResult, string, error) {
 	tok, err := bootstrap.ParseToken(opts.token)
 	if err != nil {
 		return nil, "", err
@@ -559,11 +610,38 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 	// that flag carries this node's MESH InternalIP, and a peer must dial the
 	// underlay to open the handshake that creates the mesh in the first place.
 	meshEndpoint, err := underlayMeshEndpoint(joinDialer.localIP(), opts.nodeIP, opts.meshPort)
+	// A join over a cable names this Mac's port on it, so the server can route its
+	// replies back over the cable before any other link state exists.
+	overCable := paired != nil || isZonedHost(opts.server)
+	var (
+		cable  *bootstrap.JoinCable
+		port   linkenum.Port
+		perr   error
+		direct *bootstrap.JoinDirect
+	)
+	if overCable {
+		if port, perr = cabledPort(ctx, linkenum.Exec{}); perr == nil {
+			cable = &bootstrap.JoinCable{PortOrdinal: int32(port.PortOrdinal)}
+		} else {
+			logger.Warn("joining over a cable, but this Mac's cable port could not be found", "err", perr)
+		}
+	}
 	if err != nil {
-		return nil, "", err
+		// A Mac joined over a cable may have no underlay address at all. Its
+		// endpoint is then its own address on that cable, which only the server
+		// can derive (it depends on the index the server is about to assign).
+		if !overCable {
+			return nil, "", err
+		}
+		if perr != nil {
+			return nil, "", fmt.Errorf("%w; and this Mac's cable port could not be found for a cable-only join: %w", err, perr)
+		}
+		direct = &bootstrap.JoinDirect{PortOrdinal: int32(port.PortOrdinal), MeshPort: int32(opts.meshPort)}
+		meshEndpoint = ""
+		logger.Info("no underlay address: joining as a cable-only node, the server derives this node's endpoint on the cable", "iface", port.Iface, "portOrdinal", port.PortOrdinal)
 	}
 
-	bootstrapURL := "https://" + joinHost
+	bootstrapURL := bootstrap.HTTPSURL(joinHost)
 	// --node-ip is logged as what it now is: an assertion the server checks, empty
 	// on the shipped path where the control plane assigns the address.
 	logger.Info("joining cluster", "server", bootstrapURL, "node", opts.nodeName,
@@ -575,6 +653,8 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 		NodeIP:       opts.nodeIP,
 		NodePassword: password,
 		MeshEndpoint: meshEndpoint,
+		Direct:       direct,
+		Cable:        cable,
 		HTTPClient:   joinClient,
 		// The persisted identity, NOT a per-join mint: res.WGPrivateKeyB64 comes
 		// back as exactly this value and is what bringUpMesh programs.
@@ -583,7 +663,16 @@ func agentTokenJoin(ctx context.Context, opts agentOptions, password, meshPriv, 
 	if err != nil {
 		return nil, "", fmt.Errorf("join: %w", err)
 	}
-	logger.Info("joined", "nodeIP", res.NodeIP, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
+	logger.Info("joined", "nodeIP", res.NodeIP, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers), "serverLinkIP", res.ServerLinkIP)
+	if direct != nil {
+		// The endpoint the server derived is the one peers hold; the refresher
+		// starts from it.
+		for _, p := range res.Peers {
+			if p.NodeName == opts.nodeName {
+				meshEndpoint = p.Endpoint
+			}
+		}
+	}
 	return res, meshEndpoint, nil
 }
 
@@ -711,8 +800,16 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 	// assignment, not the flag: a resuming node has the server's answer on disk and
 	// the flag is optional.
 	meshEndpoint, err := underlayMeshEndpoint(d.localIP(), credInternalIP(cred, opts.nodeIP), opts.meshPort)
+	cableOnly := false
 	if err != nil {
-		return nil, "", err
+		if cred.Assignment.BootstrapAddress == "" {
+			return nil, "", err
+		}
+		// A cable-only node: its endpoint is its own cable address, which the
+		// refresher republishes once the mesh has configured the cable. Nothing
+		// is published here, before the cable's route exists.
+		logger.Info("no underlay address on resume: this node runs over its cable; its endpoint is republished once the cable is configured", "err", err)
+		meshEndpoint, cableOnly = "", true
 	}
 
 	client, err := bootstrap.NodeIdentityClient(cred.ClusterCAPEM, cred.ClientCertPEM, cred.ClientKeyPEM)
@@ -722,8 +819,15 @@ func agentResumeFromCredential(ctx context.Context, opts agentOptions, cred *nod
 	logger.Info("resuming from the stored node credential", "node", opts.nodeName,
 		"meshEndpoint", meshEndpoint, "podCIDR", cred.Assignment.PodCIDR,
 		"clientCertExpires", cred.ClientNotAfter.UTC().Format(time.RFC3339))
-	if err := bootstrap.RefreshMeshEndpoint(ctx, client, "https://"+joinHost, opts.nodeName, meshEndpoint); err != nil {
-		return nil, "", err
+	if !cableOnly {
+		if err := bootstrap.RefreshMeshEndpoint(ctx, client, bootstrap.HTTPSURL(joinHost), opts.nodeName, meshEndpoint, nil); err != nil {
+			if errors.Is(err, bootstrap.ErrNoMeshPeer) || cred.Assignment.BootstrapAddress == "" {
+				return nil, "", err
+			}
+			// The bootstrap host is the server's cable address, whose route this
+			// node's own mesh re-installs: the refresher publishes once it has.
+			logger.Warn("the endpoint refresh did not reach the server's cable address yet; the refresher retries once the mesh is up", "err", err)
+		}
 	}
 	res := joinResultFrom(cred, opts.nodeName, meshPriv, meshPub)
 	logger.Info("resumed", "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
@@ -1045,6 +1149,9 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	} else {
 		meshOpts = append(meshOpts, mesh.WithPrivateKey(in.privateKeyB64))
 	}
+	if in.links != nil {
+		meshOpts = append(meshOpts, mesh.WithLivenessCallback(in.links.onLiveness))
+	}
 	m, err := activeMeshSeam.newMesh(self, meshOpts...)
 	if err != nil {
 		return noMeshTeardown, fmt.Errorf("build mesh: %w", err)
@@ -1064,6 +1171,15 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	// REAL teardown rather than the no-op: a half-built bring-up still owns a utun,
 	// and the caller's deferred handle is the only thing that will release it.
 	teardown := meshTeardown(m.Close)
+
+	// The direct-link ports are configured NOW, before the first peer program: a
+	// cable-only worker's first-contact route to the server is what makes the
+	// server's endpoint, and the apiserver behind it, reachable at all.
+	if in.links != nil {
+		if lm, ok := m.(linkMesh); ok {
+			in.links.attach(ctx, lm)
+		}
+	}
 
 	// The watcher's REST config is loaded BEFORE the initial program because the
 	// resume path needs the host the resumed kubeconfig targets to pick the server
@@ -1089,6 +1205,15 @@ func bringUpMesh(ctx context.Context, in meshBringUp, mode hostnet.Mode, logger 
 	watcher, err := activeMeshSeam.newWatch(restCfg, m, logger)
 	if err != nil {
 		return teardown, fmt.Errorf("build mesh watcher: %w", err)
+	}
+	if in.links != nil {
+		// One link-event stream, two consumers: the mesh (local link state, the
+		// vanish-and-return handling) and the direct-link loop (an immediate
+		// re-enumeration and republish). The loop observes each event first.
+		if lw, ok := watcher.(interface{ WatchLinks(linkwatch.LinkEvents) }); ok {
+			lw.WatchLinks(in.links.observe(linkwatch.Watch(logger)))
+		}
+		go in.links.run(ctx)
 	}
 	go func() {
 		if err := watcher.Run(ctx); err != nil && ctx.Err() == nil {
@@ -1563,4 +1688,28 @@ users:
 		return fmt.Errorf("write node kubeconfig: %w", err)
 	}
 	return nil
+}
+
+// agentJoinHost is the bootstrap host:port this start dials: --server's, or, for
+// an --auto-join node resuming from its credential, the server's cable address
+// recorded at its join.
+func agentJoinHost(opts agentOptions, cred *nodeCredential) (string, error) {
+	if opts.server != "" {
+		return net.JoinHostPort(opts.server, strconv.Itoa(bootstrapPort)), nil
+	}
+	if cred != nil && cred.Assignment.BootstrapAddress != "" {
+		return net.JoinHostPort(cred.Assignment.BootstrapAddress, strconv.Itoa(bootstrapPort)), nil
+	}
+	return "", errors.New("auto-join: this node has no server to reach: it holds no credential recording one, and pairing did not run")
+}
+
+// postJoinBootstrapHost is where the post-join verbs go: the join host, unless
+// this node joined over a cable with no underlay server name (an --auto-join
+// node, or a --server that is a zoned link-local literal), in which case the
+// server's stable cable address.
+func postJoinBootstrapHost(server, joinHost, serverLinkIP string) string {
+	if serverLinkIP != "" && (server == "" || isZonedHost(server)) {
+		return net.JoinHostPort(serverLinkIP, strconv.Itoa(bootstrapPort))
+	}
+	return joinHost
 }

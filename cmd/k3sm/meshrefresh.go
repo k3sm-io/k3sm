@@ -21,7 +21,10 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
+
+	netv1 "k3sm.io/apis/net/v1"
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 )
@@ -58,9 +61,21 @@ const meshRefreshInterval = 30 * time.Second
 // the seams are called from it.
 type meshEndpointRefresher struct {
 	derive   func(ctx context.Context) (string, error)
-	publish  func(ctx context.Context, endpoint string) error
+	publish  func(ctx context.Context, endpoint string, candidates []netv1.EndpointCandidate) error
 	interval time.Duration
 	log      *slog.Logger
+
+	// direct, when set, returns this node's direct endpoint candidates (one per
+	// configured cable port). It does two things: the candidates ride every
+	// publish beside the underlay one, and when the underlay derivation finds no
+	// address at all (a cable-only node) the first direct candidate is the
+	// endpoint. Nil publishes no candidate list, which leaves the stored one
+	// alone.
+	direct func() []netv1.EndpointCandidate
+	// publishedCandidates is the candidate list last published, as a comparable
+	// key. Candidates come from local, stable state (the derived link addresses),
+	// so a change is published at once rather than debounced.
+	publishedCandidates string
 
 	// tick replaces the internal ticker in tests. Nil in production.
 	tick <-chan time.Time
@@ -115,6 +130,15 @@ func (r *meshEndpointRefresher) Run(ctx context.Context) error {
 // and it is deliberately the only place any of the three fields moves.
 func (r *meshEndpointRefresher) tickOnce(ctx context.Context) {
 	endpoint, err := r.derive(ctx)
+	var direct []netv1.EndpointCandidate
+	if r.direct != nil {
+		direct = r.direct()
+		if err != nil && len(direct) > 0 {
+			// A cable-only node: no underlay address exists, and the cable is the
+			// only way a peer reaches it.
+			endpoint, err = direct[0].Address, nil
+		}
+	}
 	if err != nil {
 		// The last published value stays published, and a pending candidate stays
 		// pending. A node that cannot currently tell which of its addresses
@@ -126,8 +150,19 @@ func (r *meshEndpointRefresher) tickOnce(ctx context.Context) {
 			"published", r.published, "err", err)
 		return
 	}
+	var candidates []netv1.EndpointCandidate
+	if r.direct != nil {
+		candidates = candidatesFor(endpoint, direct)
+	}
 	if endpoint == r.published {
 		r.candidate = ""
+		if r.direct != nil && candidatesKey(candidates) != r.publishedCandidates {
+			if err := r.publish(ctx, endpoint, candidates); err != nil {
+				r.log.Warn("could not publish this node's endpoint candidates; retrying on the next interval", "err", err)
+				return
+			}
+			r.publishedCandidates = candidatesKey(candidates)
+		}
 		return
 	}
 	if endpoint != r.candidate {
@@ -138,7 +173,7 @@ func (r *meshEndpointRefresher) tickOnce(ctx context.Context) {
 		r.log.Info("mesh endpoint changed", "old", r.published, "new", endpoint)
 		r.announced = endpoint
 	}
-	if err := r.publish(ctx, endpoint); err != nil {
+	if err := r.publish(ctx, endpoint, candidates); err != nil {
 		if errors.Is(err, bootstrap.ErrNoMeshPeer) {
 			r.log.Warn("the cluster has no MeshPeer for this node; rejoin it (`k3sm agent --server ... --token ...`)",
 				"endpoint", endpoint, "err", err)
@@ -149,7 +184,20 @@ func (r *meshEndpointRefresher) tickOnce(ctx context.Context) {
 		return
 	}
 	r.published = endpoint
+	r.publishedCandidates = candidatesKey(candidates)
 	r.candidate = ""
+}
+
+// candidatesKey renders a candidate list comparably.
+func candidatesKey(c []netv1.EndpointCandidate) string {
+	var b strings.Builder
+	for _, x := range c {
+		b.WriteString(string(x.Link))
+		b.WriteByte('=')
+		b.WriteString(x.Address)
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // newWorkerEndpointRefresher builds the joined worker's refresher: it re-probes
@@ -167,7 +215,7 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 	if err != nil {
 		return nil, err
 	}
-	serverURL := "https://" + joinHost
+	serverURL := bootstrap.HTTPSURL(joinHost)
 	return &meshEndpointRefresher{
 		derive: func(ctx context.Context) (string, error) {
 			// A FRESH dialer each time. Reusing the join's dialer would keep its
@@ -181,8 +229,8 @@ func newWorkerEndpointRefresher(opts agentOptions, res *bootstrap.JoinResult, jo
 			// still excludes its own mesh /32 from the endpoints it advertises.
 			return underlayMeshEndpoint(d.localIP(), agentInternalIP(opts.nodeIP, res), opts.meshPort)
 		},
-		publish: func(ctx context.Context, endpoint string) error {
-			return bootstrap.RefreshMeshEndpoint(ctx, client, serverURL, opts.nodeName, endpoint)
+		publish: func(ctx context.Context, endpoint string, candidates []netv1.EndpointCandidate) error {
+			return bootstrap.RefreshMeshEndpoint(ctx, client, serverURL, opts.nodeName, endpoint, candidates)
 		},
 		interval:  meshRefreshInterval,
 		log:       logger,
@@ -201,8 +249,8 @@ func newServerEndpointRefresher(e *meshEnroller, opts serverOptions, initialEndp
 		derive: func(context.Context) (string, error) {
 			return serverMeshEndpoint(opts.nodeIP, opts.meshIP, serverMeshListenPort)
 		},
-		publish: func(ctx context.Context, endpoint string) error {
-			return e.RefreshEndpoint(ctx, opts.nodeName, endpoint)
+		publish: func(ctx context.Context, endpoint string, candidates []netv1.EndpointCandidate) error {
+			return e.RefreshEndpoint(ctx, opts.nodeName, endpoint, candidates)
 		},
 		interval:  meshRefreshInterval,
 		log:       logger,
