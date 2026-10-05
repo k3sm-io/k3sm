@@ -10,9 +10,13 @@
 # TWO TIERS:
 #
 #   INTEGRATION (default; a dev Mac, NO root). Boots a single-node `k3sm server`
-#   (hostprocess runtime, --network none) with its node moved off :10250 (a Mac
-#   already running a k3sm agent holds that port), then runs the build-tagged
-#   e2e/TestB4_InProcessNodeIdentityScoped against it:
+#   (hostprocess runtime, --network none) on off-default ports, so it runs beside
+#   an installed k3sm node, which holds the defaults (:6444 apiserver, :2379 kine,
+#   :10250 kubelet, :10259 scheduler, :10257 controller-manager). It uses
+#   apiserver :6454, kine :2394, kubelet :10350, scheduler :10364 and
+#   controller-manager :10362 (the B4_*_PORT knobs below override each), the same
+#   off-default band B213's lab tier boots in, and taken by no other gate. Then it
+#   runs the build-tagged e2e/TestB4_InProcessNodeIdentityScoped against it:
 #     leg 1  the node's Lease and nodes/status are written by system:node:<node>
 #            (system:nodes), and by nobody else afterwards. RED on a build whose
 #            server node still uses the admin identity.
@@ -52,6 +56,13 @@
 #         K3SM_LAB=1 K3SM_B4_NODES=… K3SM_B4_WORKERS=… K3SM_B4_AUDIT_CMD=… hack/acceptance/B4.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Set BEFORE sourcing clusterup.sh, whose defaults (the installed node's ports) apply
+# only to a variable that is still unset; server_up, kc and the reset/teardown reaps
+# all read these.
+APISERVER_PORT="${B4_API_PORT:-6454}"
+KINE_PORT="${B4_KINE_PORT:-2394}"
+SCHEDULER_PORT="${B4_SCHEDULER_PORT:-10364}"
+CONTROLLER_MANAGER_PORT="${B4_CONTROLLER_MANAGER_PORT:-10362}"
 . "$HERE/../lib/clusterup.sh"
 . "$HERE/../lib/conformance.sh"
 
