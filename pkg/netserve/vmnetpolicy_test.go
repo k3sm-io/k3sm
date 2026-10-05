@@ -129,8 +129,8 @@ func TestTransportOverrideSinkReachesTheProxyTable(t *testing.T) {
 	if s.table == nil {
 		t.Fatal("the Server retains no routing table; the transport-override seam has nothing to write to")
 	}
-	s.SetTransportOverrides(map[netip.Addr]netip.Addr{
-		netip.MustParseAddr("100.64.0.9"): netip.MustParseAddr("192.168.64.7"),
+	s.SetTransportOverrides(map[netip.Addr]proxy.VMPodTransport{
+		netip.MustParseAddr("100.64.0.9"): {Live: netip.MustParseAddr("192.168.64.7"), Ports: []uint16{80, 443}},
 	})
 	s.SetTransportOverrides(nil)
 }

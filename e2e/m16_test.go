@@ -507,9 +507,11 @@ func mintWebhookServingPair(t *testing.T, b *webhookBackend) (certPEM, keyPEM []
 // (every node carries that taint), and binding 0.0.0.0 rather than localhost (the
 // Service proxy dials the guest from OUTSIDE it).
 //
-// There is deliberately NO readiness probe: httpGet/tcpSocket probes are dialed at
-// the published pod IP, which for a vm Pod is an identity rather than a live
-// address. The test's own TLS dial in waitWebhookReachable is the readiness signal.
+// There is deliberately NO readiness probe, so the test's own TLS dial in
+// waitWebhookReachable stays the one readiness signal and the gate does not also
+// depend on the probe path. (A probe would work: the node dials a vm Pod's probes
+// at the guest's live lease, and the published pod IP is itself relayed on the
+// Pod's declared and Service-targeted TCP ports.)
 //
 // Resources size the guest: on the vm path the memory limits are summed into the
 // guest's RAM ceiling and the CPU limits into whole vCPUs.

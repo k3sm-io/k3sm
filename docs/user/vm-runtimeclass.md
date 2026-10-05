@@ -12,8 +12,10 @@ Virtualization.framework.
 > PersistentVolumeClaim storage that survives a hard hypervisor kill, per-container CPU and memory
 > accounting, and in-guest networking. The guest leases an address on the node's NAT segment,
 > resolves cluster DNS, reaches ClusterIP Services, and is itself reachable through its own
-> Service's ClusterIP on the same node. See [Limitations](limitations.md) for everything that was
-> measured, including what is still not wired.
+> Service's ClusterIP on the same node, and at its pod IP on the ports it declares, through a relay on
+> its node. Guest-to-guest reachability is still not a documented boundary, and the relay does not
+> promise one. See [Limitations](limitations.md) for everything that was measured, including what is
+> still not wired.
 >
 > It ships **`linux/arm64` only** (`linux/amd64` needs in-guest translation
 > and is held for a later release); it passes against the release

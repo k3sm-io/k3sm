@@ -19,7 +19,9 @@ limitations under the License.
 // node's pod /24, the cluster Service CIDR, the _k3sm service uid) and two
 // fail-closed seams — a PortAuthorizer that confirms a privileged (<1024) bind
 // against the authoritative Service set (and, for a bind on the node's own
-// address or the IPv4 wildcard, against ONE named canonical Service), and a MeshKeyResolver that
+// address or the IPv4 wildcard, against ONE named canonical Service, and for a
+// bind on a published vm pod address, against the ports that pod is relayed
+// on), and a MeshKeyResolver that
 // reads the node's wireguard private key from a root-only path — into a
 // darwin-net netd.Config. The pure policy and the seams are testable without root or a real
 // apiserver.
@@ -38,6 +40,7 @@ import (
 	"strings"
 
 	"k3sm.io/darwin-net/pkg/netd"
+	"k3sm.io/darwin-net/pkg/podnet"
 )
 
 // Options are the policy inputs and seam wiring for BuildConfig.
@@ -89,6 +92,11 @@ type Options struct {
 	// pkg/install::TestNetdPlistXML pins the absence of --node-ip, so re-adding
 	// the flag reddens rather than silently re-arming the branch.
 	NodeIP netip.Addr
+	// VMPodPorts backs the published-vm-pod branch of the privileged-port
+	// authorizer: for an address, the ports this node relays it on when it is a
+	// vm pod's published address (see PortPolicy.VMPodPorts), else nil. nil
+	// denies every <1024 bind on a pod address (fail safe).
+	VMPodPorts func(addr netip.Addr) []uint16
 	// MeshKeyDir is the root-only directory the MeshKeyResolver reads the node's
 	// wireguard private key from. Empty disables ConfigureMesh (a nil resolver,
 	// which fails fast — there is no embedded key).
@@ -132,6 +140,8 @@ func BuildConfig(opts Options) (netd.Config, error) {
 			NodeIP:             opts.NodeIP,
 			LBDeclarers:        opts.LBDeclarers,
 			NodeAddressService: opts.NodeAddressService,
+			NodePodCIDR:        NodePodCIDRInForce(NodeIdentityPath(opts.MeshKeyDir), opts.NodePodCIDR),
+			VMPodPorts:         opts.VMPodPorts,
 		}),
 		Logger: opts.Logger,
 	}
@@ -150,6 +160,39 @@ func BuildConfig(opts Options) (netd.Config, error) {
 // second spelling would silently degrade to "no persisted identity", which is
 // exactly the failure the file exists to prevent.
 const NodeIdentityFileName = "node-pod-cidr"
+
+// NodePodCIDRInForce returns a function reporting the node pod /24 the daemon is
+// enforcing: the identity persisted at identityPath once a join adopted one (the
+// file netd itself writes, re-read on every call so an adoption after start is
+// seen), else configured, the pre-adoption value the daemon started with. A
+// persisted value that does not parse, or is not a subnet of the cluster pod
+// aggregate, is ignored exactly as the daemon's own restore ignores it, so the
+// two can only disagree for the instant between netd writing the file and this
+// reading it. An empty identityPath (persistence off) always answers configured.
+//
+// It is read only by the published-vm-pod bind class, where it is a bound on
+// the address, not the authority for it: the authority is PortPolicy.VMPodPorts.
+func NodePodCIDRInForce(identityPath string, configured netip.Prefix) func() netip.Prefix {
+	return func() netip.Prefix {
+		if identityPath == "" {
+			return configured
+		}
+		raw, err := os.ReadFile(identityPath)
+		if err != nil {
+			return configured
+		}
+		cidr, err := netip.ParsePrefix(strings.TrimSpace(string(raw)))
+		if err != nil {
+			return configured
+		}
+		cidr = cidr.Masked()
+		agg := podnet.ClusterPodCIDR
+		if !agg.Contains(cidr.Addr()) || cidr.Bits() < agg.Bits() {
+			return configured
+		}
+		return cidr
+	}
+}
 
 // NodeIdentityPath returns the adopted-identity file inside meshKeyDir, or "" for
 // an empty dir (persistence off — there is no other root-only directory to put
@@ -181,7 +224,7 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 
 // PortPolicy is the DENY-BY-DEFAULT privileged-port (<1024) bind policy the
 // authorizer applies. A bind is authorized iff the requested address falls in
-// exactly one of three explicitly named classes (an explicit policy decision,
+// exactly one of four explicitly named classes (an explicit policy decision,
 // never allowed-by-coincidence):
 //
 //   - a Service-CIDR VIP whose port some Service in the authoritative set
@@ -191,7 +234,22 @@ func (r ServiceRef) String() string { return r.Namespace + "/" + r.Name }
 //     port, or
 //   - the IPv4 WILDCARD 0.0.0.0 on a privileged port when that same canonical
 //     Service declares the port (the ingress host's 80/443 listeners, bound on
-//     every interface through the root helper, the k3s ServiceLB shape).
+//     every interface through the root helper, the k3s ServiceLB shape), or
+//   - a PUBLISHED VM POD ADDRESS: an address inside this node's pod /24 that is
+//     a vm-RuntimeClass pod's published status.podIP, on a port that pod
+//     declares as a TCP containerPort or that a Service's EndpointSlice targets
+//     at that address. This is the Service proxy's published-address relay
+//     (darwin-net pkg/proxy podrelay.go), which listens on the pod's /32 and
+//     forwards to the guest's vmnet lease, so a vm pod serving :80 or :443 (an
+//     admission webhook) is reachable at its pod IP as a native pod is. The
+//     address and port set come from VMPodPorts, which the assembler backs
+//     with the apiserver's view of this node's pods and EndpointSlices, NEVER
+//     from the request: the requester names an address and a port and the
+//     daemon checks both against that set. Any other pod address (a native
+//     pod's, a vm pod on another node, an unassigned one) and any port the set
+//     does not list for THAT address (including a port another pod declares)
+//     are refused. A native pod gets no such class: it binds its own /32
+//     itself, and a privileged port there stays refused.
 //
 // The node-address and wildcard classes are one ALLOWLIST keyed on namespace+name, not a
 // test on the requester's shape. It used to authorize the bind for ANY Service
@@ -219,6 +277,15 @@ type PortPolicy struct {
 	// NodeAddressService is the only Service whose declaration authorizes a
 	// node-address or wildcard bind. The zero ServiceRef denies the class (deny).
 	NodeAddressService ServiceRef
+	// NodePodCIDR reports this node's pod /24 in force (NodePodCIDRInForce). It
+	// bounds the published-vm-pod class: an address outside it is refused before
+	// VMPodPorts is asked. nil, or an invalid prefix, denies the class.
+	NodePodCIDR func() netip.Prefix
+	// VMPodPorts reports the ports this node relays addr on when addr is a vm
+	// pod's published address (its declared TCP container ports together with
+	// every TCP port an EndpointSlice targets at addr), and nil when addr is not
+	// one. nil denies the class.
+	VMPodPorts func(addr netip.Addr) []uint16
 }
 
 // servicePortAuthorizer confirms a privileged (<1024) bind against the
@@ -233,7 +300,7 @@ func PortAuthorizer(policy PortPolicy) netd.PortAuthorizer {
 	return servicePortAuthorizer{policy: policy}
 }
 
-// Authorize rejects binding port on nodeAddr unless one of PortPolicy's three
+// Authorize rejects binding port on nodeAddr unless one of PortPolicy's four
 // address classes admits it. See PortPolicy for the deny-by-default contract.
 func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr string) error {
 	addr, err := netip.ParseAddr(nodeAddr)
@@ -254,8 +321,59 @@ func (a servicePortAuthorizer) Authorize(_ context.Context, port int, nodeAddr s
 		return nil
 	case a.policy.NodeIP.IsValid() && addr == a.policy.NodeIP:
 		return a.authorizeCanonical(port, "node address "+nodeAddr)
+	case a.inNodePodCIDR(addr):
+		return a.authorizeVMPod(port, addr)
 	}
-	return fmt.Errorf("bind address %s is neither a service-CIDR VIP, this node's own address, nor the wildcard (port %d denied)", nodeAddr, port)
+	return fmt.Errorf("bind address %s is neither a service-CIDR VIP, this node's own address, the wildcard, nor a pod address on this node (port %d denied)", nodeAddr, port)
+}
+
+// inNodePodCIDR reports whether addr is a host address inside this node's pod
+// /24 in force. It is only the BOUND of the published-vm-pod class; whether the
+// address is a vm pod's is authorizeVMPod's question.
+func (a servicePortAuthorizer) inNodePodCIDR(addr netip.Addr) bool {
+	if a.policy.NodePodCIDR == nil || !addr.Is4() {
+		return false
+	}
+	cidr := a.policy.NodePodCIDR()
+	return cidr.IsValid() && cidr.Contains(addr)
+}
+
+// authorizeVMPod applies the published-vm-pod class: the bind is authorized only
+// when VMPodPorts lists port for addr itself. It never consults the requester
+// for either value, and it never generalizes: a port listed for a different pod
+// address, or an address listed with other ports, is refused, and the refusal
+// names the ports that ARE relayed so a mis-declared pod is visible in the root
+// daemon's log rather than a silent behaviour cliff.
+func (a servicePortAuthorizer) authorizeVMPod(port int, addr netip.Addr) error {
+	if a.policy.VMPodPorts == nil {
+		return fmt.Errorf("no vm pod set available to authorize port %d on pod address %s", port, addr)
+	}
+	ports := a.policy.VMPodPorts(addr)
+	if len(ports) == 0 {
+		return fmt.Errorf("pod address %s is not a published vm pod address on this node (port %d denied)", addr, port)
+	}
+	if slices.Contains(ports, uint16(port)) {
+		return nil
+	}
+	return fmt.Errorf("port %d is neither declared by the vm pod at %s nor targeted by a Service there (relayed ports: %s)", port, addr, describePorts(ports))
+}
+
+// describePorts renders a relayed port set for a refusal message, sorted and
+// capped like describeDeclarers so a large set cannot flood the daemon's log.
+func describePorts(ports []uint16) string {
+	sorted := slices.Clone(ports)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+	const max = 8
+	names := make([]string, 0, min(len(sorted), max))
+	for _, p := range sorted[:min(len(sorted), max)] {
+		names = append(names, fmt.Sprint(p))
+	}
+	out := strings.Join(names, ", ")
+	if len(sorted) > max {
+		out += fmt.Sprintf(" (+%d more)", len(sorted)-max)
+	}
+	return out
 }
 
 // authorizeWildcard applies the wildcard class: the IPv4 unspecified address

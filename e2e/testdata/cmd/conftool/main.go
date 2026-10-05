@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -24,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -33,7 +35,7 @@ const saDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage: conftool <memhog|apicall|resolve|readfile|writeread|marker> [flags]")
+		fail("usage: conftool <memhog|apicall|resolve|readfile|writeread|marker|dial> [flags]")
 	}
 	switch os.Args[1] {
 	case "memhog":
@@ -48,6 +50,8 @@ func main() {
 		writeread(os.Args[2:])
 	case "marker":
 		marker(os.Args[2:])
+	case "dial":
+		dial(os.Args[2:])
 	default:
 		fail("conftool: unknown subcommand %q", os.Args[1])
 	}
@@ -145,6 +149,70 @@ func (h *hostList) String() string     { return fmt.Sprint([]string(*h)) }
 func (h *hostList) Set(v string) error { *h = append(*h, v); return nil }
 
 // fail prints to stderr and exits 1.
+// dial connects to -addr and reads the first line the peer writes. With
+// -expect it retries for -for until that line contains the expected text,
+// failing at once if a DIFFERENT banner answers (the wrong pod reached). With
+// -refused it expects the connection itself to fail, and fail fast: an error that
+// is a timeout (a dial that hung) fails the check, as does any connection.
+func dial(args []string) {
+	fs := flag.NewFlagSet("dial", flag.ExitOnError)
+	addr := fs.String("addr", "", "host:port to dial")
+	expect := fs.String("expect", "", "text the peer's first line must contain")
+	refused := fs.Bool("refused", false, "expect the connection to be refused (fast), not answered")
+	within := fs.Duration("for", 2*time.Minute, "how long to retry for the expected banner")
+	_ = fs.Parse(args)
+	if *addr == "" {
+		fail("dial: -addr is required")
+	}
+	if *refused {
+		conn, err := net.DialTimeout("tcp", *addr, 10*time.Second)
+		if err == nil {
+			_ = conn.Close() // the check failed; the close error adds nothing
+			fail("dial %s: connected, want refused", *addr)
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			fail("dial %s: timed out (a hang), want a fast refusal: %v", *addr, err)
+		}
+		fmt.Printf("REFUSED=%v\n", err)
+		return
+	}
+	deadline := time.Now().Add(*within)
+	var last string
+	for time.Now().Before(deadline) {
+		line, err := readBanner(*addr)
+		switch {
+		case err != nil:
+			last = err.Error()
+		case strings.Contains(line, *expect):
+			fmt.Printf("BANNER=%s\n", line)
+			return
+		case strings.HasPrefix(line, "BANNER="):
+			fail("dial %s: answered %q, want %q (another pod answered)", *addr, line, *expect)
+		default:
+			last = fmt.Sprintf("unexpected first line %q", line)
+		}
+		time.Sleep(time.Second)
+	}
+	fail("dial %s: no %q within %s; last: %s", *addr, *expect, *within, last)
+}
+
+// readBanner dials addr and returns the first line the peer writes.
+func readBanner(addr string) (string, error) {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }() // read-only use; nothing to flush
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return "", err
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
 func fail(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", a...)
 	os.Exit(1)
