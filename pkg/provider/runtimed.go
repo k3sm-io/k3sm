@@ -1279,22 +1279,25 @@ var (
 //     runtimed as sandbox.VMSpec.Network through the runtime.GuestNetworker seam.
 //     SetupGuest is idempotent per podID, so buildBox's later call a few frames
 //     down returns this very address and there is still exactly one authority.
-//     NO lo0 alias is plumbed for it (SetupGuest is the not-taken branch of
-//     podnet's path fork): a host alias for the guest's address would make the
-//     host answer for the guest and blackhole it.
+//     SetupGuest also aliases the /32 on lo0 for the pod's lifetime, owned by
+//     the HOST, not the guest: the guest never holds this address. The alias is
+//     what makes the published address answer on this node, and what the mesh's
+//     route for the node's /24 delivers remote traffic to.
 //
-//     WHY THE GUEST'S /32 IS PUBLISHED WHILE THE HOST DOES NOT HOLD IT. A vm pod
+//     WHY THE GUEST'S /32 IS PUBLISHED WHILE THE GUEST DOES NOT HOLD IT. A vm pod
 //     has TWO addresses and they are never reconciled into one. This /32 is its
 //     cluster IDENTITY — what status.podIP, its EndpointSlices, cluster DNS and
-//     every NetworkPolicy carry — and it is deliberately live on no interface.
-//     The address that carries bytes is the guest's macOS-assigned vmnet DHCP
-//     lease, reported by the guest agent as PodStatus.guest_transport_address;
-//     it is never published, because a lease churns on every guest restart while
-//     an identity must not. The dial paths TRANSLATE between the two:
-//     observeTransport feeds the Service proxy a published->live override map
-//     keyed on exactly this /32 (proxy.RoutingTable.SetTransportOverrides), so a
-//     Service backend picked and policy-checked on the identity is dialed at the
-//     lease. Publishing the node IP here — which this branch used to do — gave
+//     every NetworkPolicy carry. The address that carries bytes is the guest's
+//     macOS-assigned vmnet DHCP lease, reported by the guest agent as
+//     PodStatus.guest_transport_address; it is never published, because a lease
+//     churns on every guest restart while an identity must not. The node
+//     TRANSLATES between the two: observeTransport feeds the Service proxy a
+//     published->live transport map keyed on exactly this /32, with the pod's
+//     declared TCP ports (proxy.RoutingTable.SetTransportOverrides), so a Service
+//     backend picked and policy-checked on the identity is dialed at the lease,
+//     and the proxy's relay listens on the aliased /32 for each declared or
+//     Service-targeted TCP port and forwards to the lease. Publishing the node IP
+//     here — which this branch used to do — gave
 //     every vm pod on a node the same status.podIP, which no override map can be
 //     keyed on and which no Service could distinguish.
 //
@@ -2313,7 +2316,7 @@ func (r *runtimedRuntime) buildStatus(pod *corev1.Pod, t *podTrack, rs *runtimev
 	// node's own guest record; it contributes NOTHING to the corev1 status being
 	// built, because the live address must never reach status.podIP, the
 	// EndpointSlice or DNS (see observeTransport).
-	r.observeTransport(string(pod.UID), rs)
+	r.observeTransport(pod, rs)
 	// A restricted main process lost the pod shim; runtimed says so with the
 	// k3sm.io/shim-inactive condition and the node turns it into one Warning
 	// Event per pod per reason, on whichever status path delivers it first.

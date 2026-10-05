@@ -22,11 +22,13 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/proxy"
 	"k3sm.io/runtimed/pkg/sandbox"
 )
 
@@ -36,22 +38,82 @@ import (
 // the standards — the provider is the only component that holds both halves of a
 // vm pod's two-address identity, so it is the only one that can feed the map.
 //
-// The map is PUBLISHED address -> LIVE address, and it is REPLACED WHOLESALE on
-// every call: the table drops the previous generation entire, which is what makes
-// the feeder's liveness obligation cheap to discharge (see transportFeed).
+// The map is PUBLISHED address -> the pod's transport (its LIVE address and its
+// declared TCP container ports), and it is REPLACED WHOLESALE on every call: the
+// table drops the previous generation entire, which is what makes the feeder's
+// liveness obligation cheap to discharge (see transportFeed). The same call is
+// what installs and removes the node's published-address relay for the pod
+// (darwin-net pkg/proxy podrelay.go): a generation that drops a pod closes its
+// relay listeners and connections before it returns.
 type TransportOverrideSink interface {
-	SetTransportOverrides(overrides map[netip.Addr]netip.Addr)
+	SetTransportOverrides(overrides map[netip.Addr]proxy.VMPodTransport)
 }
 
-// transportLease is one vm pod's two addresses. published is the /32 the node's
-// IPAM carved for the pod — its cluster identity, which EndpointSlices, DNS and
-// status.podIP carry and which is live on NO interface for a guest. live is the
-// address the guest's DHCP client leased on the node's NAT segment, as the guest
-// agent reported it through runtimed's PodStatus. They are never interchangeable
-// and are never reconciled into one address.
+// transportLease is one vm pod's two addresses and the ports its published
+// address is relayed on. published is the /32 the node's IPAM carved for the pod
+// — its cluster identity, which EndpointSlices, DNS and status.podIP carry, and
+// which the node aliases on lo0 for the pod's lifetime so the proxy's relay can
+// answer on it. live is the address the guest's DHCP client leased on the node's
+// NAT segment, as the guest agent reported it through runtimed's PodStatus. They
+// are never interchangeable and are never reconciled into one address. ports is
+// the pod's declared TCP container ports, sorted and de-duplicated (see
+// DeclaredTCPPorts), so an unchanged spec compares equal and never republishes.
 type transportLease struct {
 	published netip.Addr
 	live      netip.Addr
+	ports     []uint16
+}
+
+// equal reports whether l and o describe the same transport. The port lists are
+// canonical (DeclaredTCPPorts), so element-wise equality is set equality.
+func (l transportLease) equal(o transportLease) bool {
+	return l.published == o.published && l.live == o.live && slices.Equal(l.ports, o.ports)
+}
+
+// DeclaredTCPPorts returns the TCP ports pod declares, sorted ascending and
+// de-duplicated, with zero and out-of-range values dropped. It reads the regular
+// containers and the restartable (native sidecar) init containers, the ones that
+// run beside them for the pod's life; a plain init container has exited before
+// the pod serves, so a port it declares is never relayed. A port whose protocol
+// is unset counts as TCP, as the API defaults it.
+//
+// The result is deterministic so the feed's change test is exact and the relay
+// sees one canonical list. The node's relay refuses a pod whose port set (this
+// list together with the Service-targeted ports) is over its per-pod cap, 32
+// ports, rather than relaying a truncated subset; that ceiling is the relay's to
+// enforce and is documented in docs/user/limitations.md, so the list is never
+// trimmed here.
+//
+// It is exported for the one other reader that must agree with the feed: the
+// root k3sm-netd's privileged-port authorizer, which admits a <1024 relay bind
+// on a vm pod's published address only on a port this function (or a Service)
+// lists for that pod.
+func DeclaredTCPPorts(pod *corev1.Pod) []uint16 {
+	if pod == nil {
+		return nil
+	}
+	var out []uint16
+	add := func(cs []corev1.Container, sidecarsOnly bool) {
+		for i := range cs {
+			c := &cs[i]
+			if sidecarsOnly && (c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways) {
+				continue
+			}
+			for _, p := range c.Ports {
+				if p.Protocol != "" && p.Protocol != corev1.ProtocolTCP {
+					continue
+				}
+				if p.ContainerPort < 1 || p.ContainerPort > 65535 {
+					continue
+				}
+				out = append(out, uint16(p.ContainerPort))
+			}
+		}
+	}
+	add(pod.Spec.Containers, false)
+	add(pod.Spec.InitContainers, true)
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // transportFeed is the provider's half of the two-address model: it holds the
@@ -98,29 +160,33 @@ func newTransportFeed(sink TransportOverrideSink, log *slog.Logger) *transportFe
 	return &transportFeed{sink: sink, log: log, leases: map[string]transportLease{}}
 }
 
-// observe records podID's published/live pair and republishes when it changed. An
-// unchanged report is a no-op: a vm pod's status is re-observed on every stream
-// event and every resync tick, and re-pushing an identical map would churn the
-// table's override generation for nothing.
-func (f *transportFeed) observe(podID string, published, live netip.Addr) {
+// observe records podID's published/live pair and its declared TCP ports (in the
+// canonical form DeclaredTCPPorts returns) and republishes when any of them
+// changed. An unchanged report is a no-op: a vm pod's status is re-observed on
+// every stream event and every resync tick, and re-pushing an identical map would
+// churn the table's override generation, and the relay's, for nothing.
+func (f *transportFeed) observe(podID string, published, live netip.Addr, ports []uint16) {
 	if f == nil {
 		return
 	}
-	next := transportLease{published: published, live: live}
+	next := transportLease{published: published, live: live, ports: slices.Clone(ports)}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if cur, ok := f.leases[podID]; ok && cur == next {
+	if cur, ok := f.leases[podID]; ok && cur.equal(next) {
 		return
 	}
 	f.leases[podID] = next
 	f.log.Info("vm pod transport override installed",
-		"pod", podID, "published", published.String(), "live", live.String())
+		"pod", podID, "published", published.String(), "live", live.String(), "ports", ports)
 	f.republishLocked()
 }
 
 // drop removes podID's override and republishes, if it had one. It is the
 // death/lease-loss half of the liveness obligation and is idempotent, so every
-// path that can end a pod may call it unconditionally.
+// path that can end a pod may call it unconditionally. When it returns, the sink
+// has taken the generation without the pod, which closes the pod's relay
+// listeners and every connection they were relaying; that is what lets a caller
+// remove the published alias right after it (releasePodNetwork).
 func (f *transportFeed) drop(podID string) {
 	if f == nil {
 		return
@@ -175,11 +241,14 @@ func (f *transportFeed) live(podID string) (netip.Addr, bool) {
 }
 
 // republishLocked derives the FULL current map from the tracked lease state and
-// hands it to the sink. Callers hold mu.
+// hands it to the sink in one call, so the proxy's dial override and its relay
+// port sets always change together. Each value carries its own copy of the port
+// list: the sink takes ownership of the map, and the tracked state must never
+// share a backing array with it. Callers hold mu.
 func (f *transportFeed) republishLocked() {
-	next := make(map[netip.Addr]netip.Addr, len(f.leases))
+	next := make(map[netip.Addr]proxy.VMPodTransport, len(f.leases))
 	for _, l := range f.leases {
-		next[l.published] = l.live
+		next[l.published] = proxy.VMPodTransport{Live: l.live, Ports: slices.Clone(l.ports)}
 	}
 	f.sink.SetTransportOverrides(next)
 }
@@ -206,7 +275,8 @@ func (r *runtimedRuntime) guestNetwork(podID string) (sandbox.GuestNetworkConfig
 }
 
 // observeTransport feeds the Service proxy one vm pod's live transport address
-// from a runtimed PodStatus. It runs from buildStatus, the convergence point
+// from a runtimed PodStatus, together with the TCP ports pod declares (the ports
+// the node relays the pod's published address on). It runs from buildStatus, the convergence point
 // every status observation passes through (the watch stream, the resync
 // backstop, a direct GetPodStatus), so a lease change reaches the proxy by
 // whichever path delivered it first and the backstop repairs a stream event the
@@ -231,10 +301,11 @@ func (r *runtimedRuntime) guestNetwork(podID string) (sandbox.GuestNetworkConfig
 // override (the next status reinstalls it), never resurrect a dead one, because
 // the reinstall path requires a currently-recorded guest and a currently-reported
 // lease.
-func (r *runtimedRuntime) observeTransport(podID string, rs *runtimev1.PodStatus) {
-	if r.transport == nil {
+func (r *runtimedRuntime) observeTransport(pod *corev1.Pod, rs *runtimev1.PodStatus) {
+	if r.transport == nil || pod == nil {
 		return
 	}
+	podID := string(pod.UID)
 	gn, ok := r.guestNetwork(podID)
 	if !ok || !gn.PodIP.IsValid() {
 		r.transport.drop(podID)
@@ -262,7 +333,7 @@ func (r *runtimedRuntime) observeTransport(podID string, rs *runtimev1.PodStatus
 		r.transport.drop(podID)
 		return
 	}
-	r.transport.observe(podID, gn.PodIP.Unmap(), live)
+	r.transport.observe(podID, gn.PodIP.Unmap(), live, DeclaredTCPPorts(pod))
 }
 
 // transportGateFor computes the pod-level readiness precondition for pod: whether
@@ -304,11 +375,13 @@ func (r *runtimedRuntime) transportGateFor(pod *corev1.Pod) transportGate {
 //
 // WHY A PROBE CANNOT USE THE PUBLISHED ADDRESS. Every probe target is resolved
 // once, at CreatePod (buildCheck), and defaults to the pod's published /32. For a
-// vm pod that /32 is live on NO interface — it is the pod's cluster identity, not
-// a route — and the address that carries bytes is the guest's DHCP lease, which
-// arrives LATER (through the status stream) and changes on every guest restart. A
-// probe dialed at the published address therefore never answers: readiness would
-// stay false forever and liveness would restart a perfectly healthy guest. The
+// vm pod that /32 is the pod's cluster identity, not the guest: the node answers
+// on it only through the proxy's relay, only on the relayed ports, and only once
+// the lease the relay forwards to has arrived (through the status stream; it
+// changes on every guest restart). A probe on an undeclared port, or before the
+// lease, would never answer: readiness would stay false and liveness would
+// restart a healthy guest. Dialing the lease directly also keeps the probe off
+// the relay, which applies NetworkPolicy and re-originates the connection. The
 // resolution is made PER ATTEMPT rather than at build time for the same reason
 // the override map is rebuilt per observation — a lease is not an identity.
 //

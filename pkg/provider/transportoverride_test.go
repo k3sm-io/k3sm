@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"net/netip"
 	"slices"
@@ -216,17 +217,25 @@ func leaseStatus(podID, podIP, transport string) *runtimev1.PodStatus {
 type recordingSink struct {
 	table *proxy.RoutingTable
 
+	// onSet, when set, runs on every generation BEFORE it is recorded, in the
+	// publisher's own call: it is how a test observes what else had (or had not)
+	// happened at the instant a generation was handed over.
+	onSet func(map[netip.Addr]proxy.VMPodTransport)
+
 	mu   sync.Mutex
 	sets int
-	last map[netip.Addr]netip.Addr
+	last map[netip.Addr]proxy.VMPodTransport
 }
 
-func (s *recordingSink) SetTransportOverrides(overrides map[netip.Addr]netip.Addr) {
+func (s *recordingSink) SetTransportOverrides(overrides map[netip.Addr]proxy.VMPodTransport) {
+	if s.onSet != nil {
+		s.onSet(overrides)
+	}
 	s.mu.Lock()
 	s.sets++
-	s.last = maps.Clone(overrides)
-	if s.last == nil {
-		s.last = map[netip.Addr]netip.Addr{}
+	s.last = make(map[netip.Addr]proxy.VMPodTransport, len(overrides))
+	for k, v := range overrides {
+		s.last[k] = proxy.VMPodTransport{Live: v.Live, Ports: slices.Clone(v.Ports)}
 	}
 	s.mu.Unlock()
 	if s.table != nil {
@@ -234,7 +243,7 @@ func (s *recordingSink) SetTransportOverrides(overrides map[netip.Addr]netip.Add
 	}
 }
 
-func (s *recordingSink) snapshot() (int, map[netip.Addr]netip.Addr) {
+func (s *recordingSink) snapshot() (int, map[netip.Addr]proxy.VMPodTransport) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sets, maps.Clone(s.last)
@@ -386,12 +395,41 @@ func (n *leaseNode) awaitOverrides(t *testing.T, want map[string]string) {
 	}
 }
 
-func renderOverrides(m map[netip.Addr]netip.Addr) map[string]string {
+func renderOverrides(m map[netip.Addr]proxy.VMPodTransport) map[string]string {
 	out := make(map[string]string, len(m))
 	for k, v := range m {
-		out[k.String()] = v.String()
+		out[k.String()] = v.Live.String()
 	}
 	return out
+}
+
+// renderTransports renders each override as "live ports", for assertions that
+// cover the relay port set as well as the dial target.
+func renderTransports(m map[netip.Addr]proxy.VMPodTransport) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k.String()] = fmt.Sprintf("%s %v", v.Live, v.Ports)
+	}
+	return out
+}
+
+// awaitTransports is awaitOverrides over renderTransports.
+func (n *leaseNode) awaitTransports(t *testing.T, want map[string]string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	var got map[string]string
+	for {
+		_, live := n.sink.snapshot()
+		got = renderTransports(live)
+		if maps.Equal(got, want) {
+			return
+		}
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("transport overrides = %v, want %v", got, want)
+		}
+	}
 }
 
 // published returns the /32 the node's IPAM carved for podID — the pod's cluster
@@ -548,8 +586,8 @@ func TestGuestLeaseFeedsTransportOverride(t *testing.T) {
 			t.Fatal("newTransportFeed returned the inert feed for a real routing table")
 		}
 		pub, live := netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst)
-		feed.observe("pod-1", pub, live)
-		feed.observe("pod-1", pub, netip.MustParseAddr(leaseSecond))
+		feed.observe("pod-1", pub, live, []uint16{80})
+		feed.observe("pod-1", pub, netip.MustParseAddr(leaseSecond), []uint16{80})
 		feed.drop("pod-1")
 	})
 }
@@ -563,6 +601,152 @@ func TestTransportFeedInertWithoutSink(t *testing.T) {
 		t.Fatalf("newTransportFeed(nil) = %v, want the inert nil feed", f)
 	}
 	var f *transportFeed
-	f.observe("pod-1", netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst))
+	f.observe("pod-1", netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst), nil)
 	f.drop("pod-1")
+}
+
+// portedVMPod is a vm pod whose spec declares a deliberately untidy port set:
+// out of order, a duplicate, a UDP port, an unset protocol, a port on a
+// restartable (native sidecar) init container, and one on a plain init
+// container. Only the TCP ports of containers that serve beside the pod belong
+// in the relay set.
+func portedVMPod(ns, name string) *corev1.Pod {
+	pod := vmPod(ns, name)
+	always := corev1.ContainerRestartPolicyAlways
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{
+		{ContainerPort: 8443, Protocol: corev1.ProtocolTCP},
+		{ContainerPort: 80},
+		{ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+		{ContainerPort: 53, Protocol: corev1.ProtocolUDP},
+	}
+	pod.Spec.InitContainers = []corev1.Container{
+		{Name: "setup", Image: guestVMImage, Ports: []corev1.ContainerPort{{ContainerPort: 7000}}},
+		{Name: "sidecar", Image: guestVMImage, RestartPolicy: &always, Ports: []corev1.ContainerPort{{ContainerPort: 9090}}},
+	}
+	return pod
+}
+
+// TestTransportFeedPublishesDeclaredPorts is the B440 named gate for the k3sm
+// half of the published-address relay: every override the provider publishes
+// carries the vm pod's declared TCP container ports, canonical (sorted,
+// de-duplicated), so the node's relay listens on exactly those; and the feed
+// still republishes the WHOLE map in one call, so two pods' transports always
+// arrive together and a port change alone is a new generation.
+//
+// WHY IT IS NOT VACUOUS. The ports asserted are derived from a pod spec the
+// test wrote untidily (order, a duplicate, UDP, a plain init container), so a
+// feed that copied the spec verbatim, kept UDP, or read only the first container
+// fails; the key is the /32 the node's own pool drew, as in the B237 gate.
+func TestTransportFeedPublishesDeclaredPorts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a vm pod's override carries its declared TCP ports, canonical", func(t *testing.T) {
+		t.Parallel()
+		n := newLeaseNode(t)
+		pod := portedVMPod("team-a", "webhook")
+		id := string(pod.UID)
+		if err := n.r.CreatePod(context.Background(), pod); err != nil {
+			t.Fatalf("CreatePod: %v", err)
+		}
+		n.watch(t)
+		pub := n.published(t, id)
+
+		n.rt.push(t, id, leaseFirst)
+		n.awaitTransports(t, map[string]string{pub: leaseFirst + " [80 8443 9090]"})
+	})
+
+	t.Run("two pods publish in one generation, and an unchanged report does not republish", func(t *testing.T) {
+		t.Parallel()
+		n := newLeaseNode(t)
+		a := portedVMPod("team-a", "alpha")
+		b := vmPod("team-a", "beta")
+		b.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 443}}
+		for _, p := range []*corev1.Pod{a, b} {
+			if err := n.r.CreatePod(context.Background(), p); err != nil {
+				t.Fatalf("CreatePod %s: %v", p.Name, err)
+			}
+		}
+		n.watch(t)
+		pubA, pubB := n.published(t, string(a.UID)), n.published(t, string(b.UID))
+
+		n.rt.push(t, string(a.UID), leaseFirst)
+		n.awaitTransports(t, map[string]string{pubA: leaseFirst + " [80 8443 9090]"})
+		n.rt.push(t, string(b.UID), leaseSecond)
+		// The second pod's arrival is ONE map holding both: the first pod's
+		// transport is re-handed over whole, not patched in place.
+		n.awaitTransports(t, map[string]string{
+			pubA: leaseFirst + " [80 8443 9090]",
+			pubB: leaseSecond + " [443]",
+		})
+
+		sets, _ := n.sink.snapshot()
+		n.rt.push(t, string(a.UID), leaseFirst)
+		n.awaitStatus(t, string(a.UID), 2)
+		if again, _ := n.sink.snapshot(); again != sets {
+			t.Errorf("an unchanged report republished: %d generations, want %d", again, sets)
+		}
+	})
+
+	t.Run("a port change alone republishes", func(t *testing.T) {
+		t.Parallel()
+		feed := newTransportFeed(&recordingSink{}, nil)
+		sink := feed.sink.(*recordingSink)
+		pub, live := netip.MustParseAddr("100.64.0.9"), netip.MustParseAddr(leaseFirst)
+		feed.observe("pod-1", pub, live, []uint16{80})
+		feed.observe("pod-1", pub, live, []uint16{80})
+		feed.observe("pod-1", pub, live, []uint16{80, 443})
+		sets, got := sink.snapshot()
+		if sets != 2 {
+			t.Errorf("generations = %d, want 2 (install, then the port change; the repeat is a no-op)", sets)
+		}
+		if want := map[string]string{"100.64.0.9": leaseFirst + " [80 443]"}; !maps.Equal(renderTransports(got), want) {
+			t.Errorf("transports = %v, want %v", renderTransports(got), want)
+		}
+	})
+
+	t.Run("the published port list is the sink's own copy", func(t *testing.T) {
+		t.Parallel()
+		feed := newTransportFeed(&recordingSink{}, nil)
+		var handed map[netip.Addr]proxy.VMPodTransport
+		feed.sink.(*recordingSink).onSet = func(m map[netip.Addr]proxy.VMPodTransport) { handed = m }
+		ports := []uint16{80, 443}
+		pub := netip.MustParseAddr("100.64.0.9")
+		feed.observe("pod-1", pub, netip.MustParseAddr(leaseFirst), ports)
+		// Neither the caller's slice nor the generation the sink took may alias
+		// the feed's tracked state: the next generation must be rebuilt intact.
+		ports[0] = 1
+		handed[pub].Ports[1] = 2
+		feed.observe("pod-2", netip.MustParseAddr("100.64.0.10"), netip.MustParseAddr(leaseSecond), nil)
+		if got := handed[pub].Ports; !slices.Equal(got, []uint16{80, 443}) {
+			t.Errorf("pod-1 ports in the next generation = %v, want [80 443]", got)
+		}
+	})
+}
+
+func TestDeclaredTCPPorts(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		want []uint16
+	}{
+		{name: "nil pod", pod: nil, want: nil},
+		{name: "no ports", pod: vmPod("ns", "bare"), want: nil},
+		{name: "untidy spec", pod: portedVMPod("ns", "untidy"), want: []uint16{80, 8443, 9090}},
+		{name: "SCTP and out of range dropped", pod: func() *corev1.Pod {
+			p := vmPod("ns", "odd")
+			p.Spec.Containers[0].Ports = []corev1.ContainerPort{
+				{ContainerPort: 0}, {ContainerPort: 70000}, {ContainerPort: 9, Protocol: corev1.ProtocolSCTP}, {ContainerPort: 22},
+			}
+			return p
+		}(), want: []uint16{22}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := DeclaredTCPPorts(tc.pod); !slices.Equal(got, tc.want) {
+				t.Errorf("DeclaredTCPPorts = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
