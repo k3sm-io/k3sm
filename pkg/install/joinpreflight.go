@@ -97,14 +97,10 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	if cfg.Role != RoleAgent && !cfg.serverJoining() {
 		return "", nil
 	}
+	// A --server-join install's --server and --token-file were already
+	// required by ValidateHARequest; this is the agent's own requirement.
 	if strings.TrimSpace(cfg.JoinServer) == "" {
-		if cfg.serverJoining() {
-			return "", fmt.Errorf("install: --server (an existing server's LAN address) is required with --server-join")
-		}
 		return "", fmt.Errorf("install: --server (the control-plane host this worker joins) is required with --agent")
-	}
-	if cfg.serverJoining() && cfg.TokenFile == "" {
-		return "", fmt.Errorf("install: --token-file (the server token `k3sm token create --server` printed on an existing server) is required with --server-join")
 	}
 	// The pin FIRST, because reading it is the one step that can fail on this
 	// Mac alone: a token file that is missing, exposed or malformed is refused

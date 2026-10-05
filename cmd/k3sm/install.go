@@ -272,37 +272,12 @@ func (o installFlags) validateRole() error {
 	return nil
 }
 
-// validateServerRole is validateRole for a control-plane install: the HA
-// request's shape, and the join flags refused when nothing is being joined.
+// validateServerRole is validateRole for a control-plane install. It is the
+// install package's ValidateHARequest over the Config these flags become, the
+// same validator install.Install runs before it writes anything, so the CLI
+// and the installer refuse exactly one set of HA shapes.
 func (o installFlags) validateServerRole() error {
-	if o.clusterInit && o.serverJoin {
-		return fmt.Errorf("--cluster-init and --server-join are mutually exclusive: --cluster-init forms a new etcd cluster on this server, --server-join adds it to an existing one")
-	}
-	if !o.serverJoin {
-		for _, name := range joinInstallFlags {
-			if o.set[name] {
-				if o.clusterInit {
-					return fmt.Errorf("--%s cannot be combined with --cluster-init: --cluster-init forms a new cluster and joins nothing; --%s belongs to --server-join (another server) or --agent (a worker)", name, name)
-				}
-				return fmt.Errorf("--%s needs --agent or --server-join: it configures a node joining an existing cluster, and without either this Mac is being installed as a control plane of its own", name)
-			}
-		}
-	}
-	if !o.clusterInit && !o.serverJoin {
-		if o.set["node-ip"] {
-			return fmt.Errorf("--node-ip needs --agent, --cluster-init or --server-join: on a control-plane install it is the embedded etcd peer address, and a single-node control plane has none")
-		}
-		return nil
-	}
-	if o.serverJoin {
-		if o.server == "" {
-			return fmt.Errorf("--server-join needs --server (an existing server's LAN address)")
-		}
-		if o.tokenFile == "" {
-			return fmt.Errorf("--server-join needs --token-file (a file holding the server token `k3sm token create --server` printed on an existing server)")
-		}
-	}
-	return install.ValidateEtcdNodeIP(o.nodeIP)
+	return install.ValidateHARequest(o.installConfig("", nil, nil))
 }
 
 // The data-volume flag defaults.

@@ -1719,9 +1719,10 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err := refuseCrossRole(sys, cfg); err != nil {
 		return err
 	}
-	// The HA request's own shape, from the Config alone.
-	if err := validateEtcdRequest(cfg); err != nil {
-		return err
+	// The HA request's own shape, from the Config alone: the same validator
+	// the CLI ran at parse time.
+	if err := ValidateHARequest(cfg); err != nil {
+		return fmt.Errorf("install: %w", err)
 	}
 	// Still before anything is written: the directory that will hold the `k3sm`
 	// launcher must already be trusted. The link is laid down at step 2b, long

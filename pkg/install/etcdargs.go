@@ -145,35 +145,59 @@ func (c Config) stagedJoinTokenPath() string {
 	return c.agentTokenPath()
 }
 
-// validateEtcdRequest is the Config-level contract of an HA request, checked
-// before anything is written. The CLI refuses the same shapes at parse time;
-// this keeps a caller that builds a Config by hand from rendering a daemon
-// `k3sm server` would refuse at every launchd respawn.
-func validateEtcdRequest(cfg Config) error {
+// ValidateHARequest is THE contract of an embedded-etcd HA request, over the
+// Config the request becomes. It is pure and exported because there must be
+// exactly one copy of it: `k3sm install` calls it at parse time, before any
+// privilege is taken, and Install calls it again before anything is written,
+// so a caller that builds a Config by hand cannot render a daemon `k3sm server`
+// would refuse at every launchd respawn, and the two cannot drift.
+//
+// On RoleServer a join value (JoinServer, TokenFile) means "the operator passed
+// --server / --token-file", and NodeIP means "--node-ip": each is refused when
+// the request it belongs to is absent, so a flag that would be silently
+// ignored is stopped instead.
+func ValidateHARequest(cfg Config) error {
 	if cfg.Role != RoleServer {
-		if cfg.ClusterInit || cfg.ServerJoin {
-			return fmt.Errorf("install: --cluster-init and --server-join configure a control-plane server and cannot be combined with --agent")
+		switch {
+		case cfg.ClusterInit:
+			return fmt.Errorf("--%s cannot be combined with --agent: it configures the control plane, and a worker runs none of it", clusterInitFlag)
+		case cfg.ServerJoin:
+			return fmt.Errorf("--%s cannot be combined with --agent: it configures the control plane, and a worker runs none of it", serverJoinFlag)
 		}
-		return nil
-	}
-	if !cfg.ClusterInit && !cfg.ServerJoin {
 		return nil
 	}
 	if cfg.ClusterInit && cfg.ServerJoin {
-		return fmt.Errorf("install: --cluster-init and --server-join are mutually exclusive: --cluster-init forms a new etcd cluster on this server, --server-join adds it to an existing one")
+		return fmt.Errorf("--cluster-init and --server-join are mutually exclusive: --cluster-init forms a new etcd cluster on this server, --server-join adds it to an existing one")
+	}
+	if !cfg.ServerJoin {
+		for _, f := range []struct{ name, value string }{
+			{serverJoinServerFlag, cfg.JoinServer},
+			{"token-file", cfg.TokenFile},
+		} {
+			if f.value == "" {
+				continue
+			}
+			if cfg.ClusterInit {
+				return fmt.Errorf("--%s cannot be combined with --cluster-init: --cluster-init forms a new cluster and joins nothing; --%s belongs to --server-join (another server) or --agent (a worker)", f.name, f.name)
+			}
+			return fmt.Errorf("--%s needs --agent or --server-join: it configures a node joining an existing cluster, and without either this Mac is being installed as a control plane of its own", f.name)
+		}
+	}
+	if !cfg.ClusterInit && !cfg.ServerJoin {
+		if cfg.NodeIP != "" {
+			return fmt.Errorf("--node-ip needs --agent, --cluster-init or --server-join: on a control-plane install it is the embedded etcd peer address, and a single-node control plane has none")
+		}
+		return nil
 	}
 	if cfg.ServerJoin {
 		if strings.TrimSpace(cfg.JoinServer) == "" {
-			return fmt.Errorf("install: --server-join needs --server (an existing server's LAN address)")
+			return fmt.Errorf("--server-join needs --server (an existing server's LAN address)")
 		}
 		if cfg.TokenFile == "" {
-			return fmt.Errorf("install: --server-join needs --token-file (a file holding the server token `k3sm token create --server` printed on an existing server)")
+			return fmt.Errorf("--server-join needs --token-file (a file holding the server token `k3sm token create --server` printed on an existing server)")
 		}
 	}
-	if err := ValidateEtcdNodeIP(cfg.NodeIP); err != nil {
-		return fmt.Errorf("install: %w", err)
-	}
-	return nil
+	return ValidateEtcdNodeIP(cfg.NodeIP)
 }
 
 // ValidateEtcdNodeIP refuses a --node-ip an embedded etcd member cannot
