@@ -416,10 +416,12 @@ func (s *Supervised) etcdWaitTick(ctx context.Context, c *component, d time.Dura
 // The child is supervised by now, so two observers see the one death: its reaper,
 // which reports it through OnComponentExit, and this wait, whose error ends bring-up
 // and is counted by the caller. Exactly one of them may report it, decided under mu
-// by the component's reported flag (markSupervised's discipline): when the reaper took
-// it, the error wraps ErrEtcdChildExited so the caller does not count it again; when
-// this wait got there first, it claims the report, the reaper stays silent, and the
-// plain error is the one record.
+// by the component's reported flag (markSupervised's discipline). The reaper takes
+// its decision before it closes exited, so by the time this wait has seen the death
+// that decision is made: when the reaper took it (the usual case for a supervised
+// member), the error wraps ErrEtcdChildExited so the caller does not count it again;
+// when the reaper will not report (no callback is set), this wait claims the report
+// and the plain error is the one record.
 func (s *Supervised) etcdExitedErr(c *component, during string) error {
 	s.mu.Lock()
 	claimed := !c.reported

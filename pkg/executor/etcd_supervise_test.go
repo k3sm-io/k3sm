@@ -397,6 +397,90 @@ func TestEtcdDeathReportedOnce(t *testing.T) {
 	})
 }
 
+// parkClock is a clock whose After never fires; it signals ticked on every call, so a
+// test learns the moment a wait has polled and parked.
+type parkClock struct{ ticked chan struct{} }
+
+func (parkClock) Now() time.Time { return time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC) }
+
+func (c parkClock) After(time.Duration) <-chan time.Time {
+	select {
+	case c.ticked <- struct{}{}:
+	default:
+	}
+	return make(chan time.Time)
+}
+
+// TestEtcdDeathRecordedWhenWaitSeesItFirst pins the interleaving the scheduler only
+// sometimes produces: the etcd child is reaped, and its reaper is held before it
+// decides the report while the quorum wait runs. Whatever the wait sees, the death
+// must reach the crash record exactly once, and the wait's error must say so
+// (ErrEtcdChildExited), so the caller does not count it a second time.
+func TestEtcdDeathRecordedWhenWaitSeesItFirst(t *testing.T) {
+	fake := &fakeEtcd{status: etcdMemberStatus{MemberID: testOwnID}} // no leader
+	s, _, sink := etcdTestSupervised(t, EtcdInit, fake, newFakeClock(0))
+	clk := parkClock{ticked: make(chan struct{}, 1)}
+	s.etcd.clock = clk
+	atGate, gate := make(chan struct{}), make(chan struct{})
+	s.reaped = func(c *component) {
+		if c.name == etcdComponent {
+			close(atGate)
+			<-gate
+		}
+	}
+	die := filepath.Join(s.cfg.WorkDir, "die")
+	writeEtcdChild(t, s.cfg.WorkDir, "while [ ! -f '"+die+"' ]; do sleep 0.02; done\necho 'etcd: fatal'\nexit 3\n")
+	c, err := s.spawn(t.Context(), etcdComponent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markSupervised(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(die, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-atGate:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the etcd child was never reaped")
+	}
+
+	// The reaper is held. Run the wait until it either sees the death or parks.
+	done := make(chan error, 1)
+	go func() { done <- s.awaitEtcdQuorum(t.Context(), fake, c) }()
+	var waitErr error
+	waited := false
+	select {
+	case waitErr = <-done:
+		waited = true
+	case <-clk.ticked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the quorum wait neither returned nor parked")
+	}
+	close(gate)
+	if !waited {
+		select {
+		case waitErr = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the quorum wait did not end when the etcd child died")
+		}
+	}
+	if serr := s.Stop(context.Background()); serr != nil {
+		t.Fatal(serr)
+	}
+
+	if waitErr == nil || !strings.Contains(waitErr.Error(), "etcd exited while waiting for quorum") {
+		t.Errorf("wait returned %v, want the etcd exit", waitErr)
+	}
+	if !errors.Is(waitErr, ErrEtcdChildExited) {
+		t.Errorf("wait returned %v, want it to wrap ErrEtcdChildExited: the death is a crash, recorded by the reaper", waitErr)
+	}
+	if rec := sink.snapshot(); len(rec.Crashes) != 1 || rec.Crashes[0].Component != etcdComponent {
+		t.Errorf("crash record = %+v, want exactly one etcd crash", rec.Crashes)
+	}
+}
+
 // TestEtcdQuorumWaitLogsWhy: the binding rule stays a leader AND an empty alarm list,
 // and the wait's periodic line says which half is missing — the leader state, and the
 // active alarms by name — so an operator can see why the wait has not ended.

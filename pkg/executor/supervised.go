@@ -252,6 +252,11 @@ type Supervised struct {
 	// Stop could return, and the process exit, while a reaper was still inside
 	// OnComponentExit.
 	reapers sync.WaitGroup
+	// reaped, when set, runs in a component's reaper after cmd.Wait returns and
+	// before the death is decided or published. It is a test seam that holds a
+	// reaper at that point to order it against the death's other observers; nil
+	// in production. Set before the first spawn and never changed.
+	reaped func(c *component)
 
 	// etcd holds the etcd posture's seams (clock, admin dial, readiness, peer probe);
 	// NewSupervised fills the production ones.
@@ -996,7 +1001,9 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 	go func() {
 		defer s.reapers.Done()
 		c.waitErr = cmd.Wait()
-		close(c.exited)
+		if s.reaped != nil {
+			s.reaped(c)
+		}
 		// Nothing watched the control plane after bring-up: the reapers were the
 		// only observers of a child's death, and their only readers were
 		// awaitHealthy (bring-up) and stopComponent (teardown). A component that
@@ -1019,6 +1026,15 @@ func (s *Supervised) spawnEnv(ctx context.Context, name string, extraEnv []strin
 			c.reported = true
 		}
 		s.mu.Unlock()
+		// The death is published only AFTER the decision above. Every other
+		// observer (markSupervised, the etcd waits' etcdExitedErr) checks
+		// reported under mu once it has seen exited closed, so it always finds
+		// this reaper's decision already made: a reaper that will fire has set
+		// reported, and the observer stands down. Closing first left a window in
+		// which an etcd wait saw the death, claimed it, and returned it as a
+		// plain bring-up error, so a supervised member's crash never reached the
+		// callback.
+		close(c.exited)
 		if fire {
 			// The tail is REDACTED and byte-capped here, inside the package that
 			// owns the 0600 log, because the consumer logs it to the daemon's
