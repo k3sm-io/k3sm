@@ -782,7 +782,11 @@ headless-Service and per-pod DNS names reach the Pod on them too. What it does n
   Service's ClusterIP.
 - **Undeclared ports are refused.** A dial to a port the Pod does not declare and no Service targets
   is refused. A native Pod has no such limit. A Pod whose declared and Service-targeted ports together
-  number more than 32 is not relayed at all, rather than relayed on some of them.
+  exceed the relay's per-pod port ceiling is not relayed at all, rather than relayed on some of them.
+- **Ports below 1024 need the network helper's view of the cluster.** The relay opens a port below 1024
+  through the root network helper, which allows it only for a port it can itself see the Pod declare or
+  a Service target, read from the API server. Until the helper has that view, or if it cannot read Pods
+  and EndpointSlices, those ports are refused rather than opened.
 - **The guest sees one client address.** Every relayed connection, local or remote, reaches the guest
   from the node's guest-network gateway address, not from the caller's address. A workload in the guest
   must not allowlist that address, and must not rely on the client address in its logs.
