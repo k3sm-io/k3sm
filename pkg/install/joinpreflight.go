@@ -87,12 +87,24 @@ const joinProbeAddressCap = 4
 // different reads, with privileged writes in between: a token file replaced in
 // that window would be staged unvalidated, against a cluster nobody compared it
 // to. The empty string is the answer when there is no token to stage.
+//
+// A server install with --server-join asks the same two questions of the
+// existing server it names, with the server-class token it must present: that
+// daemon fetches the cluster CAs from the same listener on every start, and an
+// unreachable or foreign endpoint would otherwise surface as a daemon that never
+// comes up.
 func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
-	if cfg.Role != RoleAgent {
+	if cfg.Role != RoleAgent && !cfg.serverJoining() {
 		return "", nil
 	}
 	if strings.TrimSpace(cfg.JoinServer) == "" {
+		if cfg.serverJoining() {
+			return "", fmt.Errorf("install: --server (an existing server's LAN address) is required with --server-join")
+		}
 		return "", fmt.Errorf("install: --server (the control-plane host this worker joins) is required with --agent")
+	}
+	if cfg.serverJoining() && cfg.TokenFile == "" {
+		return "", fmt.Errorf("install: --token-file (the server token `k3sm token create --server` printed on an existing server) is required with --server-join")
 	}
 	// The pin FIRST, because reading it is the one step that can fail on this
 	// Mac alone: a token file that is missing, exposed or malformed is refused
@@ -168,8 +180,12 @@ func preflightJoinEndpoint(sys System, cfg Config) (string, error) {
 	}
 	served := strings.ToLower(strings.TrimSpace(servedPin))
 	if served != pin {
-		return "", fmt.Errorf("install: the control plane at %s belongs to a DIFFERENT cluster than the join token in %s pins (that endpoint's cluster CA is %s…; the token pins %s…), so this node would have joined the wrong cluster. Nothing has been written. Either point --server at the Mac the token came from, or mint a token there with `k3sm token create` and write it into %s",
-			reached, cfg.TokenFile, shortPin(served), shortPin(pin), cfg.TokenFile)
+		mint := "k3sm token create"
+		if cfg.serverJoining() {
+			mint = "k3sm token create --server"
+		}
+		return "", fmt.Errorf("install: the control plane at %s belongs to a DIFFERENT cluster than the join token in %s pins (that endpoint's cluster CA is %s…; the token pins %s…), so this node would have joined the wrong cluster. Nothing has been written. Either point --server at the Mac the token came from, or mint a token there with `%s` and write it into %s",
+			reached, cfg.TokenFile, shortPin(served), shortPin(pin), mint, cfg.TokenFile)
 	}
 	cfg.Logger.Info("the control plane answered and is the cluster this token pins", "server", reached, "cluster-ca", shortPin(served)+"…")
 	return token, nil

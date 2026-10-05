@@ -1,0 +1,239 @@
+/*
+Copyright The k3sm Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package install
+
+import (
+	"context"
+	"errors"
+	"os"
+	"slices"
+	"strings"
+	"testing"
+
+	"k3sm.io/k3sm/pkg/executor"
+)
+
+// theServerToken is a server-class token over testCluster()'s CA, so a
+// --server-join install reaches the join preflight's cluster comparison the way
+// a live one does.
+var theServerToken = "K10" + testCluster().pin + "::server:s3rv3r-s3cr3t"
+
+// recordedArgs returns the arguments the fake's server-arguments record holds.
+func recordedArgs(t *testing.T, f *fakeSystem, cfg Config) []string {
+	t.Helper()
+	rec, ok := f.serverArgs[cfg.withDefaults().ServerArgsRecord]
+	if !ok {
+		t.Fatal("install wrote no server-arguments record")
+	}
+	return rec.Args
+}
+
+// TestInstallEmbeddedEtcdServer drives the whole Install over the fake for the
+// two HA requests and the reinstalls that follow them: what the daemon is
+// rendered with, what the record carries forward, where a joining server's
+// token is staged, and which role changes are refused.
+func TestInstallEmbeddedEtcdServer(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("--cluster-init renders and records, and a plain reinstall carries it", func(t *testing.T) {
+		f := &fakeSystem{}
+		cfg := testConfig(t)
+		first := cfg
+		first.ClusterInit, first.NodeIP, first.MeshIP = true, "192.0.2.10", "100.64.0.1"
+		if err := Install(ctx, f, first); err != nil {
+			t.Fatalf("Install --cluster-init: %v", err)
+		}
+		want := []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--node-ip", "192.0.2.10"}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("server plist carries %q, want %q", got, want)
+		}
+		if got := recordedArgs(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("record carries %q, want %q", got, want)
+		}
+		// Re-running the same request does not duplicate a flag.
+		if err := Install(ctx, f, first); err != nil {
+			t.Fatalf("repeat Install --cluster-init: %v", err)
+		}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("after a repeated request the plist carries %q, want %q", got, want)
+		}
+		// A reinstall with no flags of its own, after an uninstall removed the
+		// plist, carries the HA role from the record.
+		if err := Uninstall(ctx, f, cfg); err != nil {
+			t.Fatalf("Uninstall: %v", err)
+		}
+		if err := Install(ctx, f, cfg); err != nil {
+			t.Fatalf("plain reinstall: %v", err)
+		}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("after uninstall then a plain install the plist carries %q, want %q", got, want)
+		}
+	})
+
+	t.Run("--server-join stages the server token and points the daemon at it", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
+		cfg := testConfig(t)
+		join := cfg
+		join.ServerJoin, join.JoinServer, join.TokenFile, join.NodeIP = true, "192.0.2.10", operatorTokenFile, "192.0.2.20"
+		if err := Install(ctx, f, join); err != nil {
+			t.Fatalf("Install --server-join: %v", err)
+		}
+		want := []string{"--server-join", "--server", "192.0.2.10", "--node-ip", "192.0.2.20"}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("server plist carries %q, want %q", got, want)
+		}
+		if got := recordedArgs(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("record carries %q, want %q", got, want)
+		}
+		staged := cfg.withDefaults().serverJoinTokenPath()
+		if got := strings.TrimSpace(string(f.files[staged])); got != theServerToken {
+			t.Errorf("staged join token = %q, want the operator's server token", got)
+		}
+		plist := string(f.files[cfg.withDefaults().plistPath(ServerLabel)])
+		if !strings.Contains(plist, "<string>"+staged+"</string>") {
+			t.Errorf("the server plist does not point --token-file at the staged join token %s", staged)
+		}
+		for _, leak := range []string{theServerToken, operatorTokenFile} {
+			if strings.Contains(plist, leak) {
+				t.Errorf("the server plist carries %q; the daemon is told where its token is, never what it is", leak)
+			}
+		}
+		// A plain reinstall keeps the daemon on the staged join token, which is
+		// still there: the operator's own file may be gone by then.
+		delete(f.files, operatorTokenFile)
+		if err := Install(ctx, f, cfg); err != nil {
+			t.Fatalf("plain reinstall of a joined server: %v", err)
+		}
+		plist = string(f.files[cfg.withDefaults().plistPath(ServerLabel)])
+		if !strings.Contains(plist, "<string>"+staged+"</string>") {
+			t.Error("a plain reinstall of a joined server stopped pointing --token-file at its join token")
+		}
+	})
+
+	t.Run("--server-join refuses a worker token before anything is written", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(operatorTokenFile, []byte(theJoinToken+"\n"))
+		cfg := testConfig(t)
+		cfg.ServerJoin, cfg.JoinServer, cfg.TokenFile, cfg.NodeIP = true, "192.0.2.10", operatorTokenFile, "192.0.2.20"
+		err := Install(ctx, f, cfg)
+		if err == nil || !strings.Contains(err.Error(), "not a k3sm server token") {
+			t.Fatalf("Install with a worker token = %v, want a refusal naming the server token", err)
+		}
+		if _, ok := f.files[cfg.withDefaults().plistPath(ServerLabel)]; ok {
+			t.Error("a refused install wrote the server plist")
+		}
+	})
+
+	t.Run("--server-join over a carried --cluster-init with member data is refused", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
+		cfg := testConfig(t)
+		init := cfg
+		init.ClusterInit, init.NodeIP = true, "192.0.2.10"
+		if err := Install(ctx, f, init); err != nil {
+			t.Fatalf("Install --cluster-init: %v", err)
+		}
+		etcdDir := executor.EtcdDataDir(cfg.withDefaults().serverWorkDir())
+		if err := os.MkdirAll(etcdDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		before := serverArgsOf(t, f, cfg)
+		join := cfg
+		join.ServerJoin, join.JoinServer, join.TokenFile, join.NodeIP = true, "192.0.2.11", operatorTokenFile, "192.0.2.10"
+		err := Install(ctx, f, join)
+		if !errors.Is(err, ErrEtcdRoleSwitch) {
+			t.Fatalf("Install --server-join over a formed member = %v, want ErrEtcdRoleSwitch", err)
+		}
+		for _, want := range []string{"--cluster-init", etcdDir, "launchctl bootout"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q must name %q", err, want)
+			}
+		}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, before) {
+			t.Errorf("a refused install changed the plist to %q", got)
+		}
+
+		// The symmetric request is refused the same way.
+		f2 := &fakeSystem{}
+		f2.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
+		cfg2 := testConfig(t)
+		join2 := cfg2
+		join2.ServerJoin, join2.JoinServer, join2.TokenFile, join2.NodeIP = true, "192.0.2.10", operatorTokenFile, "192.0.2.20"
+		if err := Install(ctx, f2, join2); err != nil {
+			t.Fatalf("Install --server-join: %v", err)
+		}
+		if err := os.MkdirAll(executor.EtcdDataDir(cfg2.withDefaults().serverWorkDir()), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		init2 := cfg2
+		init2.ClusterInit, init2.NodeIP = true, "192.0.2.20"
+		if err := Install(ctx, f2, init2); !errors.Is(err, ErrEtcdRoleSwitch) {
+			t.Fatalf("Install --cluster-init over a joined member = %v, want ErrEtcdRoleSwitch", err)
+		}
+	})
+
+	t.Run("with the member data removed, --server-join replaces the carried --cluster-init", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
+		cfg := testConfig(t)
+		init := cfg
+		init.ClusterInit, init.NodeIP, init.MeshIP = true, "192.0.2.10", "100.64.0.1"
+		if err := Install(ctx, f, init); err != nil {
+			t.Fatalf("Install --cluster-init: %v", err)
+		}
+		join := cfg
+		join.ServerJoin, join.JoinServer, join.TokenFile, join.NodeIP = true, "192.0.2.11", operatorTokenFile, "192.0.2.10"
+		if err := Install(ctx, f, join); err != nil {
+			t.Fatalf("Install --server-join with no member data: %v", err)
+		}
+		want := []string{"--mesh-ip", "100.64.0.1", "--server-join", "--server", "192.0.2.11", "--node-ip", "192.0.2.10"}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("server plist carries %q, want %q", got, want)
+		}
+		if got := recordedArgs(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("record carries %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a hand-built Config is held to the same contract", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			edit func(*Config)
+			want string
+		}{
+			{"both roles", func(c *Config) { c.ClusterInit, c.ServerJoin, c.NodeIP = true, true, "192.0.2.10" }, "mutually exclusive"},
+			{"join without a server", func(c *Config) { c.ServerJoin, c.TokenFile, c.NodeIP = true, operatorTokenFile, "192.0.2.10" }, "needs --server"},
+			{"join without a token", func(c *Config) { c.ServerJoin, c.JoinServer, c.NodeIP = true, "192.0.2.11", "192.0.2.10" }, "needs --token-file"},
+			{"loopback node IP", func(c *Config) { c.ClusterInit, c.NodeIP = true, "127.0.0.1" }, "loopback"},
+			{"an agent asking for a role", func(c *Config) { c.Role, c.JoinServer, c.ClusterInit = RoleAgent, "192.0.2.11", true }, "--agent"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := &fakeSystem{}
+				cfg := testConfig(t)
+				tc.edit(&cfg)
+				err := Install(ctx, f, cfg)
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Install = %v, want a refusal naming %q", err, tc.want)
+				}
+				if len(f.files) != 0 {
+					t.Errorf("a refused install wrote %d files", len(f.files))
+				}
+			})
+		}
+	})
+}
