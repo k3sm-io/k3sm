@@ -28,6 +28,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"k3sm.io/k3sm/pkg/bootstrap/pairing"
@@ -114,6 +115,9 @@ func runInstall(args []string) error {
 func installPairing(opts installFlags, now time.Time, out io.Writer) error {
 	switch {
 	case opts.autoJoin:
+		if err := ensureServiceDir(agentCredentialDir()); err != nil {
+			return fmt.Errorf("arm auto-join: %w", err)
+		}
 		a, err := pairing.WriteArm(pairing.ArmPath(agentCredentialDir()), now, opts.arm, opts.cluster)
 		if err != nil {
 			return fmt.Errorf("arm auto-join: %w", err)
@@ -124,6 +128,9 @@ func installPairing(opts installFlags, now time.Time, out io.Writer) error {
 			fmt.Fprintln(out, "no --cluster was given: this Mac will join the first open-pairing server it hears on its cable while armed (pass the pin `k3sm pair` prints on the server to pin it)")
 		}
 	case opts.pairing > 0:
+		if err := ensureServiceDir(executor.DefaultWorkDir); err != nil {
+			return fmt.Errorf("open the pairing window: %w", err)
+		}
 		w, err := pairing.WindowStore{Path: pairing.WindowPath(executor.DefaultWorkDir)}.Open(now, opts.pairing, pairing.DefaultMaxJoins)
 		if err != nil {
 			return fmt.Errorf("open the pairing window: %w", err)
@@ -131,6 +138,30 @@ func installPairing(opts installFlags, now time.Time, out io.Writer) error {
 		fmt.Fprintf(out, "pairing window open until %s; on the new Mac, cabled by Thunderbolt, run `sudo k3sm install --auto-join` (`k3sm pair` prints the --cluster pin)\n", w.Until.Format(time.RFC3339))
 	}
 	return nil
+}
+
+// ensureServiceDir makes a role work dir the daemon may not have created yet
+// (it starts moments after the install), owned like the data root above it, so
+// the file written there next is one the service user can read and rewrite.
+func ensureServiceDir(dir string) error {
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	st, err := os.Stat(filepath.Dir(dir))
+	if err != nil {
+		return err
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	return os.Chown(dir, int(sys.Uid), int(sys.Gid))
 }
 
 // installFlags is the parsed `k3sm install` command line. It is a struct rather
