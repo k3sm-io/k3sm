@@ -17,7 +17,10 @@
 #   * walk-verify goes RED on an invalid signature, on a mislabelled layer, on a
 #     blob that does not match its digest, and on a non-Mach-O entrypoint — and
 #     GREEN on the universal-binary shape that a whole-file signature check
-#     would have failed.
+#     would have failed;
+#   * the k3sm-shard entrypoint renders the ring hostfile and the jaccl device
+#     matrix into the pod data volume from fake name resolution, retries and
+#     bounds resolution, and its liveness probe answers 0 and 1 correctly.
 #
 # Usage: hack/images/mlx-serve/selftest.sh
 # Exit: 0 all checks pass, 1 otherwise.
@@ -340,6 +343,150 @@ else
 	ladder no "6.entrypoint  walk-verify fails a non-Mach-O entrypoint"
 fi
 
+# ---- 7 — the k3sm-shard entrypoint (sharded ranks) ---------------------------
+# What a rank does before exec, with FAKE name resolution: no model, no GPU,
+# no cluster DNS. The live rendezvous (real per-pod records, two Macs, the
+# sandbox profile) is the M17 lab ladder's sharded-ring rung.
+SHARD="$HERE/k3sm_shard.py"
+if [ -f "$SHARD" ] && PYTHONDONTWRITEBYTECODE=1 python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$SHARD" 2>/dev/null; then
+	ladder ok "7.parse  k3sm_shard.py parses"
+else
+	ladder no "7.parse  k3sm_shard.py parses"
+fi
+if grep -q '^stage_shard_entrypoint$' "$BUILD" && grep -q '^SHARD_MODULE="k3sm_shard"$' "$BUILD"; then
+	ladder ok "7.staged  build.sh installs k3sm_shard into the image"
+else
+	ladder no "7.staged  build.sh installs k3sm_shard into the image"
+fi
+
+cat > "$WORK/shard-driver.py" <<'PY'
+import http.server, json, os, socket, sys, threading
+sys.path.insert(0, sys.argv[1])
+import k3sm_shard as ks
+
+work = sys.argv[2]
+podvol = os.path.join(work, "podvol")
+os.makedirs(podvol)
+names = ["m-rank-0.m-headless.ns.svc", "m-rank-1.m-headless.ns.svc", "m-rank-2.m-headless.ns.svc"]
+fake = {names[0]: "10.42.0.5", names[1]: "10.42.1.5", names[2]: "10.42.2.5"}
+
+def resolver(name):
+    if name not in fake:
+        raise socket.gaierror(8, "nodename nor servname provided")
+    return fake[name]
+
+def env(**kw):
+    e = {"MLX_RANK": "1", "MLX_WORLD_SIZE": "2", "K3SM_MLX_BACKEND": "ring", "K3SM_MLX_PARALLELISM": "tensor",
+         "K3SM_MLX_RANKS": ",".join(names[:2]), "K3SM_MLX_PORT": "29500", "K3SM_MLX_SERVE_PORT": "8000",
+         "TMPDIR": podvol, "K3SM_POD_IP": "10.42.1.5"}
+    e.update(kw)
+    return {k: v for k, v in e.items() if v is not None}
+
+def check(name, cond):
+    print(("ok " if cond else "no ") + name, flush=True)
+
+# ring: the hostfile, written ONLY under the pod data volume
+files, cenv, argv = ks.plan(env(), ["--model", "/m", "--max-tokens", "8"], resolver=resolver)
+(path, content), = files.items()
+check("ring.hostfile  one [podIP:port] entry per rank, in rank order",
+      json.loads(content) == [["10.42.0.5:29500"], ["10.42.1.5:29500"]])
+check("ring.datavolume  the hostfile lands inside TMPDIR and MLX_HOSTFILE names it",
+      path.startswith(podvol + os.sep) and cenv["MLX_HOSTFILE"] == path)
+check("ring.argv  execs mlx_lm.server on 0.0.0.0 and the serve port, caller args last, no --pipeline for tensor",
+      argv[1:8] == ["-m", "mlx_lm.server", "--host", "0.0.0.0", "--port", "8000", "--model"]
+      and argv[-2:] == ["--max-tokens", "8"] and "--pipeline" not in argv)
+check("ring.env  MLX_RANK and MLX_WORLD_SIZE exported", cenv["MLX_RANK"] == "1" and cenv["MLX_WORLD_SIZE"] == "2")
+_, _, argv = ks.plan(env(K3SM_MLX_PARALLELISM="pipeline"), ["--model", "/m"], resolver=resolver)
+check("ring.pipeline  pipeline parallelism adds --pipeline", "--pipeline" in argv)
+ks.write_files(files)
+check("ring.write  the file is written and reads back", json.load(open(path)) == json.loads(content))
+
+# own address from K3SM_POD_IP, never a lookup of its own name
+f2, _, _ = ks.plan(env(K3SM_POD_IP="10.99.0.1"), [], resolver=resolver)
+check("ring.ownip  the rank's own entry is K3SM_POD_IP",
+      json.loads(next(iter(f2.values())))[1] == ["10.99.0.1:29500"])
+
+# jaccl: the device matrix and the coordinator
+matrix = [[None, "rdma_en2", "rdma_en3"], ["rdma_en2", None, "rdma_en4"], ["rdma_en3", "rdma_en4", None]]
+files, cenv, _ = ks.plan(env(MLX_RANK="2", MLX_WORLD_SIZE="3", K3SM_MLX_BACKEND="jaccl", K3SM_MLX_RANKS=",".join(names),
+                             K3SM_POD_IP="10.42.2.5", K3SM_MLX_IBV_DEVICES_JSON=json.dumps(matrix)), [], resolver=resolver)
+(path, content), = files.items()
+check("jaccl.devices  MLX_IBV_DEVICES is the matrix, null for self, inside TMPDIR",
+      json.loads(content) == matrix and cenv["MLX_IBV_DEVICES"] == path and path.startswith(podvol + os.sep))
+check("jaccl.coordinator  MLX_JACCL_COORDINATOR is rank 0's pod IP and the collective port",
+      cenv["MLX_JACCL_COORDINATOR"] == "10.42.0.5:29500" and "MLX_HOSTFILE" not in cenv)
+
+# resolution retries until every peer resolves, and is bounded
+calls = {"n": 0}
+def flaky(name):
+    calls["n"] += 1
+    if calls["n"] < 3:
+        raise socket.gaierror(8, "not yet")
+    return resolver(name)
+t = {"now": 0.0}
+tick = lambda s: t.__setitem__("now", t["now"] + s)
+ips = ks.resolve_all(names[:2], flaky, timeout=60, interval=1, clock=lambda: t["now"], sleep=tick)
+check("resolve.retry  an unresolved peer is retried until it resolves", ips == ["10.42.0.5", "10.42.1.5"])
+try:
+    ks.resolve_all(["nope.svc"], resolver, timeout=5, interval=1, clock=lambda: t["now"], sleep=tick)
+    check("resolve.bounded  a peer that never resolves ends the rank", False)
+except ks.ShardError as e:
+    check("resolve.bounded  a peer that never resolves ends the rank", "nope.svc" in str(e))
+
+# refusals: no pod data volume, a rank list that disagrees with the world size
+for label, e in (("nodatavolume  refuses to write anywhere but the pod data volume", env(TMPDIR=None)),
+                 ("worldsize  refuses a rank list that disagrees with MLX_WORLD_SIZE", env(MLX_WORLD_SIZE="3"))):
+    try:
+        ks.plan(e, [], resolver=resolver)
+        check(label, False)
+    except ks.ShardError:
+        check(label, True)
+
+# the liveness probe against a local server
+class H(http.server.BaseHTTPRequestHandler):
+    code = 200
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(n))
+        self.send_response(H.code if body.get("max_tokens") == 1 else 400)
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+port = str(srv.server_address[1])
+check("probe.serving  a one-token completion answering 200 exits 0",
+      ks.probe({"K3SM_MLX_SERVE_PORT": port}, timeout=5) == 0)
+H.code = 500
+check("probe.error  an error status exits 1", ks.probe({"K3SM_MLX_SERVE_PORT": port}, timeout=5) == 1)
+srv.shutdown()
+srv.server_close()
+s = socket.socket(); s.bind(("127.0.0.1", 0)); closed = str(s.getsockname()[1]); s.close()
+check("probe.starting  a server not listening yet exits 0 (starting, not hung)",
+      ks.probe({"K3SM_MLX_SERVE_PORT": closed}, timeout=5) == 0)
+PY
+SHARD_CHECKS=0
+# stdout carries the verdicts; stderr (the probe's own diagnostics) is kept
+# aside and shown only if the driver did not report every check.
+shard_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$WORK/shard-driver.py" "$HERE" "$WORK/shard" 2>"$WORK/shard-driver.err")"
+while read -r verdict name; do
+	[ -n "$verdict" ] || continue
+	SHARD_CHECKS=$((SHARD_CHECKS + 1))
+	case "$verdict" in
+		ok) ladder ok "7.$name" ;;
+		no) ladder no "7.$name" ;;
+		*)  ladder no "7.driver  $verdict $name" ;;
+	esac
+done <<< "$shard_out"
+# A driver that crashed before its checks would otherwise pass vacuously.
+if [ "$SHARD_CHECKS" -ge 16 ]; then
+	ladder ok "7.count  all $SHARD_CHECKS entrypoint checks reported"
+else
+	ladder no "7.count  only $SHARD_CHECKS of 16 entrypoint checks reported (the driver crashed?)"
+	head -20 "$WORK/shard-driver.err"
+fi
+
 # ---- summary ----------------------------------------------------------------
 echo "----------------------------------------"
 echo "mlx-serve selftest: $PASS passed, $FAIL failed, $SKIP skipped"
@@ -354,6 +501,8 @@ Not covered here — this needs a Mac with uv, a k3sm binary and the network:
     acceptance criterion this file only rehearses;
   * a genuinely signed-then-tampered Mach-O (the fixture here is unsigned, which
     codesign rejects for a different reason);
-  * `k3sm image push` to a registry.
+  * `k3sm image push` to a registry;
+  * k3sm-shard under the real sandbox profile with live per-pod DNS records and
+    a real mlx_lm.server on two Macs (the M17 lab ladder's sharded-ring rung).
 EOF
 [ "$FAIL" -eq 0 ] || exit 1

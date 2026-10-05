@@ -18,10 +18,13 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
 
@@ -194,4 +197,62 @@ func ValidateFit(memory resource.Quantity, facts *runtimev1.GPUFacts) Fit {
 func human(bytes int64) string {
 	q := resource.NewQuantity(bytes, resource.BinarySI)
 	return q.String()
+}
+
+// ErrInvalidDistributed is wrapped by every ValidateDistributed refusal.
+var ErrInvalidDistributed = errors.New("invalid spec.distributed")
+
+// distributedRefusedArgs are the serving options mlx_lm.server refuses in
+// distributed mode: adapters and draft (speculative) models. The spec has no
+// field for either, so the only way to ask for one is spec.runtime.args; a
+// sharded spec that does is refused here, legibly, rather than rendered into
+// rank Pods that exit at start with the reason in a log.
+var distributedRefusedArgs = []string{"--adapter-path", "--draft-model", "--num-draft-tokens"}
+
+// ValidateDistributed decides whether the operator honours a spec's
+// spec.distributed. A nil Distributed is valid (single-node). Otherwise:
+// ranks >= 2; backend empty (meaning auto), auto, ring or jaccl; parallelism
+// empty (meaning tensor), tensor or pipeline; spec.replicas unset, 0 or 1 (a
+// sharded model is one logical replica); and no adapter or draft-model option
+// in spec.runtime.args (nor an abbreviation of one), because the sharded
+// engine refuses both.
+//
+// It is pure. Errors wrap ErrInvalidDistributed and name the field.
+func ValidateDistributed(spec mlxv1alpha1.MLXModelSpec) error {
+	d := spec.Distributed
+	if d == nil {
+		return nil
+	}
+	if d.Ranks < 2 {
+		return fmt.Errorf("%w: spec.distributed.ranks is %d, must be at least 2", ErrInvalidDistributed, d.Ranks)
+	}
+	switch d.Backend {
+	case "", mlxv1alpha1.MLXDistributedBackendAuto, mlxv1alpha1.MLXDistributedBackendRing, mlxv1alpha1.MLXDistributedBackendJACCL:
+	default:
+		return fmt.Errorf("%w: spec.distributed.backend %q is not auto, ring or jaccl", ErrInvalidDistributed, d.Backend)
+	}
+	switch d.Parallelism {
+	case "", mlxv1alpha1.MLXParallelismTensor, mlxv1alpha1.MLXParallelismPipeline:
+	default:
+		return fmt.Errorf("%w: spec.distributed.parallelism %q is not tensor or pipeline", ErrInvalidDistributed, d.Parallelism)
+	}
+	if spec.Replicas != nil && *spec.Replicas > 1 {
+		return fmt.Errorf("%w: spec.replicas is %d; a sharded model is one logical replica spanning its ranks", ErrInvalidDistributed, *spec.Replicas)
+	}
+	for _, arg := range spec.Runtime.Args {
+		// argparse accepts any unambiguous PREFIX of an option (the silent
+		// prefix-match lesson in pkg/mlx/sizing.go), so "--draft" reaches
+		// --draft-model. Any option-shaped argument that is a prefix of a
+		// refused option is refused with it.
+		name, _, _ := strings.Cut(arg, "=")
+		if !strings.HasPrefix(name, "--") || len(name) <= len("--") {
+			continue
+		}
+		for _, refused := range distributedRefusedArgs {
+			if strings.HasPrefix(refused, name) {
+				return fmt.Errorf("%w: spec.runtime.args carries %s, which the sharded engine refuses in distributed mode", ErrInvalidDistributed, refused)
+			}
+		}
+	}
+	return nil
 }

@@ -110,6 +110,10 @@ var (
 	// value carrying a separator or a parent reference would name a directory
 	// outside the model's own snapshot tree.
 	ErrInvalidRevision = errors.New("spec.revision must be a single path segment")
+	// ErrDistributedSpec is returned by the single-node Render for a spec that
+	// sets spec.distributed. A sharding request rendered as one StatefulSet
+	// would serve the model on one node and look like success.
+	ErrDistributedSpec = errors.New("spec.distributed is set: a sharded model renders through RenderSharded, never as a single-node StatefulSet")
 )
 
 // Fixed rendering constants. Each is the render's side of a contract with
@@ -280,66 +284,18 @@ func selectorLabels(name string) map[string]string {
 // input. An invalid or incomplete spec yields a wrapped sentinel error (see the
 // Err* vars) and NO partial object set — a half-rendered model is worse than an
 // unrendered one, because the applied half looks like progress.
+//
+// Render is the SINGLE-NODE path. A spec that sets spec.distributed is refused
+// with ErrDistributedSpec rather than rendered as one StatefulSet: serving a
+// sharding request on one node would look like success (the M8 silent-success
+// rule). Sharded models render through RenderSharded.
 func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
-	if m == nil || m.Name == "" || m.Namespace == "" {
-		return nil, ErrNoModel
-	}
-	if m.UID == "" {
-		return nil, renderErr(m, ErrNoUID)
-	}
-	if len(HeadlessServiceName(m.Name)) > dnsLabelMaxLen {
-		return nil, renderErr(m, fmt.Errorf("%w: %q is %d characters", ErrNameTooLong,
-			HeadlessServiceName(m.Name), len(HeadlessServiceName(m.Name))))
-	}
-	if m.Spec.Model == "" {
-		return nil, renderErr(m, ErrNoSpecModel)
-	}
-	if m.Spec.Memory.Sign() <= 0 {
-		return nil, renderErr(m, ErrNoMemory)
-	}
-
-	image := m.Spec.Runtime.Image
-	if image == "" {
-		image = opts.DefaultImage
-	}
-	if image == "" {
-		return nil, renderErr(m, ErrNoImage)
-	}
-
-	port := resolvePort(m, opts)
-	if port == 0 {
-		return nil, renderErr(m, ErrNoPort)
-	}
-	if port < 0 || port > 65535 {
-		return nil, renderErr(m, fmt.Errorf("%w: %d", ErrInvalidPort, port))
-	}
-
-	replicas := int32(1)
-	if m.Spec.Replicas != nil {
-		replicas = *m.Spec.Replicas
-		if replicas < 0 {
-			return nil, renderErr(m, fmt.Errorf("%w: %d", ErrInvalidReplicas, replicas))
-		}
-	}
-
-	if m.Spec.Cache != nil && m.Spec.Cache.Size.Sign() <= 0 {
-		return nil, renderErr(m, ErrInvalidCacheSize)
-	}
-
-	// What the engine is actually pointed at. It is resolved BEFORE anything is
-	// rendered because a spec whose pin cannot be expressed on the measured
-	// engine surface has no StatefulSet worth applying — see modelReference.
-	if m.Spec.Quantization != "" {
-		return nil, renderErr(m, fmt.Errorf("%w: spec.quantization=%q", ErrQuantizationUnsupported, m.Spec.Quantization))
-	}
-	modelRef, err := modelReference(m.Spec)
+	p, err := prepare(m, opts)
 	if err != nil {
-		return nil, renderErr(m, err)
+		return nil, err
 	}
-
-	nodeSelector, err := podNodeSelector(m.Spec.NodeSelector)
-	if err != nil {
-		return nil, renderErr(m, err)
+	if m.Spec.Distributed != nil {
+		return nil, renderErr(m, ErrDistributedSpec)
 	}
 
 	// The context/concurrency pins are derived BEFORE anything is rendered: a
@@ -351,11 +307,97 @@ func Render(m *mlxv1alpha1.MLXModel, opts Options) (*Objects, error) {
 		return nil, renderErr(m, err)
 	}
 
-	owner := ownerReference(m)
 	return &Objects{
-		StatefulSet:      statefulSet(m, owner, image, modelRef, port, replicas, nodeSelector, sizing),
-		HeadlessService:  headlessService(m, owner, port),
-		ClusterIPService: clusterIPService(m, owner, port),
+		StatefulSet:      statefulSet(m, p.owner, p.image, p.modelRef, p.port, p.replicas, p.nodeSelector, sizing),
+		HeadlessService:  headlessService(m, p.owner, p.port),
+		ClusterIPService: clusterIPService(m, p.owner, p.port),
+	}, nil
+}
+
+// prepared is what every render path resolves from a spec before it builds an
+// object: the checks and defaults the single-node and the sharded render share,
+// so the two cannot disagree about what a valid spec is.
+type prepared struct {
+	owner        metav1.OwnerReference
+	image        string
+	modelRef     string
+	port         int32
+	replicas     int32
+	nodeSelector map[string]string
+}
+
+// prepare runs the spec checks both render paths share, in the order the
+// single-node render has always run them, and resolves the image, port,
+// replica count, model reference and guarded node selector.
+func prepare(m *mlxv1alpha1.MLXModel, opts Options) (prepared, error) {
+	if m == nil || m.Name == "" || m.Namespace == "" {
+		return prepared{}, ErrNoModel
+	}
+	if m.UID == "" {
+		return prepared{}, renderErr(m, ErrNoUID)
+	}
+	if len(HeadlessServiceName(m.Name)) > dnsLabelMaxLen {
+		return prepared{}, renderErr(m, fmt.Errorf("%w: %q is %d characters", ErrNameTooLong,
+			HeadlessServiceName(m.Name), len(HeadlessServiceName(m.Name))))
+	}
+	if m.Spec.Model == "" {
+		return prepared{}, renderErr(m, ErrNoSpecModel)
+	}
+	if m.Spec.Memory.Sign() <= 0 {
+		return prepared{}, renderErr(m, ErrNoMemory)
+	}
+
+	image := m.Spec.Runtime.Image
+	if image == "" {
+		image = opts.DefaultImage
+	}
+	if image == "" {
+		return prepared{}, renderErr(m, ErrNoImage)
+	}
+
+	port := resolvePort(m, opts)
+	if port == 0 {
+		return prepared{}, renderErr(m, ErrNoPort)
+	}
+	if port < 0 || port > 65535 {
+		return prepared{}, renderErr(m, fmt.Errorf("%w: %d", ErrInvalidPort, port))
+	}
+
+	replicas := int32(1)
+	if m.Spec.Replicas != nil {
+		replicas = *m.Spec.Replicas
+		if replicas < 0 {
+			return prepared{}, renderErr(m, fmt.Errorf("%w: %d", ErrInvalidReplicas, replicas))
+		}
+	}
+
+	if m.Spec.Cache != nil && m.Spec.Cache.Size.Sign() <= 0 {
+		return prepared{}, renderErr(m, ErrInvalidCacheSize)
+	}
+
+	// What the engine is actually pointed at. It is resolved BEFORE anything is
+	// rendered because a spec whose pin cannot be expressed on the measured
+	// engine surface has no workload worth applying — see modelReference.
+	if m.Spec.Quantization != "" {
+		return prepared{}, renderErr(m, fmt.Errorf("%w: spec.quantization=%q", ErrQuantizationUnsupported, m.Spec.Quantization))
+	}
+	modelRef, err := modelReference(m.Spec)
+	if err != nil {
+		return prepared{}, renderErr(m, err)
+	}
+
+	nodeSelector, err := podNodeSelector(m.Spec.NodeSelector)
+	if err != nil {
+		return prepared{}, renderErr(m, err)
+	}
+
+	return prepared{
+		owner:        ownerReference(m),
+		image:        image,
+		modelRef:     modelRef,
+		port:         port,
+		replicas:     replicas,
+		nodeSelector: nodeSelector,
 	}, nil
 }
 
@@ -393,6 +435,14 @@ func ownerReference(m *mlxv1alpha1.MLXModel) metav1.OwnerReference {
 	}
 }
 
+// PodNodeSelector is the node selector every serving pod of a model with the
+// given spec.nodeSelector carries: the caller's selector under the fixed
+// guardrails (see podNodeSelector). Sharded placement filters candidate nodes
+// through it, so a rank is never bound to a node its own Pod would refuse.
+func PodNodeSelector(specSelector map[string]string) (map[string]string, error) {
+	return podNodeSelector(specSelector)
+}
+
 // podNodeSelector merges the caller's spec.nodeSelector under the FIXED
 // guardrail selectors. The guardrails are not defaults the caller may override:
 // a pod that lands on a non-darwin node, or on a node with no GPU, cannot serve
@@ -412,6 +462,19 @@ func podNodeSelector(specSelector map[string]string) (map[string]string, error) 
 		out[k] = v
 	}
 	return out, nil
+}
+
+// providerTolerations is the toleration every serving pod carries, whichever
+// path renders it. The k3sm provider taint is on EVERY k3sm node; without this
+// toleration the pod is simply unschedulable, and the admission policy's
+// guardrail check looks for exactly this shape. One builder, so the StatefulSet
+// template and a sharded rank Pod cannot drift apart.
+func providerTolerations() []corev1.Toleration {
+	return []corev1.Toleration{{
+		Key:      policy.ProviderTaintKey,
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}
 }
 
 // podResources builds the container resource requirements. Two rules, both from
@@ -580,14 +643,8 @@ func statefulSet(m *mlxv1alpha1.MLXModel, owner metav1.OwnerReference, image, mo
 				ObjectMeta: metav1.ObjectMeta{Labels: Labels(m.Name)},
 				Spec: corev1.PodSpec{
 					NodeSelector: nodeSelector,
-					// The k3sm provider taint is on EVERY k3sm node; without this
-					// toleration the pod is simply unschedulable.
-					Tolerations: []corev1.Toleration{{
-						Key:      policy.ProviderTaintKey,
-						Operator: corev1.TolerationOpExists,
-						Effect:   corev1.TaintEffectNoSchedule,
-					}},
-					Containers: []corev1.Container{container},
+					Tolerations:  providerTolerations(),
+					Containers:   []corev1.Container{container},
 				},
 			},
 		},

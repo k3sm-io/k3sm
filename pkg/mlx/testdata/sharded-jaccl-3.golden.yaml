@@ -1,0 +1,420 @@
+# Regenerate: go test ./pkg/mlx/ -run TestRenderShardedGolden -update (then review the diff)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+  name: qwen3-headless
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  clusterIP: None
+  ports:
+  - name: http
+    port: 9123
+    protocol: TCP
+    targetPort: http
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/name: mlx-model
+  type: ClusterIP
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+  name: qwen3
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  ports:
+  - name: http
+    port: 9123
+    protocol: TCP
+    targetPort: http
+  selector:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/name: mlx-model
+    k3sm.io/mlx-rank: "0"
+  type: ClusterIP
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+  name: cache-qwen3-mac-a
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 64Gi
+  storageClassName: k3sm-local-path
+status: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+  name: cache-qwen3-mac-b
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 64Gi
+  storageClassName: k3sm-local-path
+status: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+  name: cache-qwen3-mac-c
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 64Gi
+  storageClassName: k3sm-local-path
+status: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    k3sm.io/mlx-backend: jaccl
+    k3sm.io/mlx-placed-links: mac-a/mac-b,mac-a/mac-c,mac-b/mac-c
+    k3sm.io/mlx-spec-hash: 09a9740534438cd1
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+    k3sm.io/mlx-rank: "0"
+  name: qwen3-rank-0
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  containers:
+  - args:
+    - --model
+    - /var/lib/mlx/cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/0f1e2d3c4b5a69788796a5b4c3d2e1f001234567
+    - --max-tokens
+    - "512"
+    command:
+    - /bin/python3.12
+    - -m
+    - k3sm_shard
+    env:
+    - name: MLX_RANK
+      value: "0"
+    - name: MLX_WORLD_SIZE
+      value: "3"
+    - name: MLX_METAL_FAST_SYNCH
+      value: "1"
+    - name: K3SM_MLX_BACKEND
+      value: jaccl
+    - name: K3SM_MLX_PARALLELISM
+      value: tensor
+    - name: K3SM_MLX_RANKS
+      value: qwen3-rank-0.qwen3-headless.models.svc,qwen3-rank-1.qwen3-headless.models.svc,qwen3-rank-2.qwen3-headless.models.svc
+    - name: K3SM_MLX_PORT
+      value: "29500"
+    - name: K3SM_MLX_SERVE_PORT
+      value: "9123"
+    - name: K3SM_MLX_IBV_DEVICES_JSON
+      value: '[[null,"rdma_en2","rdma_en3"],["rdma_en2",null,"rdma_en4"],["rdma_en3","rdma_en4",null]]'
+    - name: HF_HOME
+      value: /var/lib/mlx/cache/huggingface
+    image: ghcr.io/k3sm-io/mlx-serve@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    livenessProbe:
+      exec:
+        command:
+        - /bin/python3.12
+        - -m
+        - k3sm_shard
+        - --probe
+      failureThreshold: 2
+      periodSeconds: 60
+      successThreshold: 1
+      timeoutSeconds: 30
+    name: mlx-serve
+    ports:
+    - containerPort: 9123
+      name: http
+      protocol: TCP
+    - containerPort: 29500
+      name: mlx-collective
+      protocol: TCP
+    readinessProbe:
+      failureThreshold: 3
+      httpGet:
+        path: /v1/models
+        port: http
+      periodSeconds: 10
+      successThreshold: 1
+      timeoutSeconds: 5
+    resources:
+      limits:
+        memory: 8704Mi
+        mlx.k3sm.io/gpu: "1"
+      requests:
+        memory: 8704Mi
+        mlx.k3sm.io/gpu: "1"
+    volumeMounts:
+    - mountPath: /var/lib/mlx/cache
+      name: cache
+  hostname: qwen3-rank-0
+  nodeName: mac-a
+  nodeSelector:
+    kubernetes.io/os: darwin
+    mlx.k3sm.io/chip-family: m4
+    mlx.k3sm.io/gpu.present: "true"
+  restartPolicy: Never
+  subdomain: qwen3-headless
+  tolerations:
+  - effect: NoSchedule
+    key: k3sm.io/provider
+    operator: Exists
+  volumes:
+  - name: cache
+    persistentVolumeClaim:
+      claimName: cache-qwen3-mac-a
+status: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    k3sm.io/mlx-backend: jaccl
+    k3sm.io/mlx-placed-links: mac-a/mac-b,mac-a/mac-c,mac-b/mac-c
+    k3sm.io/mlx-spec-hash: 09a9740534438cd1
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+    k3sm.io/mlx-rank: "1"
+  name: qwen3-rank-1
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  containers:
+  - args:
+    - --model
+    - /var/lib/mlx/cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/0f1e2d3c4b5a69788796a5b4c3d2e1f001234567
+    - --max-tokens
+    - "512"
+    command:
+    - /bin/python3.12
+    - -m
+    - k3sm_shard
+    env:
+    - name: MLX_RANK
+      value: "1"
+    - name: MLX_WORLD_SIZE
+      value: "3"
+    - name: MLX_METAL_FAST_SYNCH
+      value: "1"
+    - name: K3SM_MLX_BACKEND
+      value: jaccl
+    - name: K3SM_MLX_PARALLELISM
+      value: tensor
+    - name: K3SM_MLX_RANKS
+      value: qwen3-rank-0.qwen3-headless.models.svc,qwen3-rank-1.qwen3-headless.models.svc,qwen3-rank-2.qwen3-headless.models.svc
+    - name: K3SM_MLX_PORT
+      value: "29500"
+    - name: K3SM_MLX_SERVE_PORT
+      value: "9123"
+    - name: K3SM_MLX_IBV_DEVICES_JSON
+      value: '[[null,"rdma_en2","rdma_en3"],["rdma_en2",null,"rdma_en4"],["rdma_en3","rdma_en4",null]]'
+    - name: HF_HOME
+      value: /var/lib/mlx/cache/huggingface
+    image: ghcr.io/k3sm-io/mlx-serve@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    name: mlx-serve
+    ports:
+    - containerPort: 29500
+      name: mlx-collective
+      protocol: TCP
+    resources:
+      limits:
+        memory: 8704Mi
+        mlx.k3sm.io/gpu: "1"
+      requests:
+        memory: 8704Mi
+        mlx.k3sm.io/gpu: "1"
+    volumeMounts:
+    - mountPath: /var/lib/mlx/cache
+      name: cache
+  hostname: qwen3-rank-1
+  nodeName: mac-b
+  nodeSelector:
+    kubernetes.io/os: darwin
+    mlx.k3sm.io/chip-family: m4
+    mlx.k3sm.io/gpu.present: "true"
+  restartPolicy: Never
+  subdomain: qwen3-headless
+  tolerations:
+  - effect: NoSchedule
+    key: k3sm.io/provider
+    operator: Exists
+  volumes:
+  - name: cache
+    persistentVolumeClaim:
+      claimName: cache-qwen3-mac-b
+status: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    k3sm.io/mlx-backend: jaccl
+    k3sm.io/mlx-placed-links: mac-a/mac-b,mac-a/mac-c,mac-b/mac-c
+    k3sm.io/mlx-spec-hash: 09a9740534438cd1
+  labels:
+    app.kubernetes.io/instance: qwen3
+    app.kubernetes.io/managed-by: k3sm
+    app.kubernetes.io/name: mlx-model
+    k3sm.io/mlx-rank: "2"
+  name: qwen3-rank-2
+  namespace: models
+  ownerReferences:
+  - apiVersion: mlx.k3sm.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: MLXModel
+    name: qwen3
+    uid: 6f0d5c2a-1f37-4a4e-9a2f-0b3f2a7d5c11
+spec:
+  containers:
+  - args:
+    - --model
+    - /var/lib/mlx/cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/0f1e2d3c4b5a69788796a5b4c3d2e1f001234567
+    - --max-tokens
+    - "512"
+    command:
+    - /bin/python3.12
+    - -m
+    - k3sm_shard
+    env:
+    - name: MLX_RANK
+      value: "2"
+    - name: MLX_WORLD_SIZE
+      value: "3"
+    - name: MLX_METAL_FAST_SYNCH
+      value: "1"
+    - name: K3SM_MLX_BACKEND
+      value: jaccl
+    - name: K3SM_MLX_PARALLELISM
+      value: tensor
+    - name: K3SM_MLX_RANKS
+      value: qwen3-rank-0.qwen3-headless.models.svc,qwen3-rank-1.qwen3-headless.models.svc,qwen3-rank-2.qwen3-headless.models.svc
+    - name: K3SM_MLX_PORT
+      value: "29500"
+    - name: K3SM_MLX_SERVE_PORT
+      value: "9123"
+    - name: K3SM_MLX_IBV_DEVICES_JSON
+      value: '[[null,"rdma_en2","rdma_en3"],["rdma_en2",null,"rdma_en4"],["rdma_en3","rdma_en4",null]]'
+    - name: HF_HOME
+      value: /var/lib/mlx/cache/huggingface
+    image: ghcr.io/k3sm-io/mlx-serve@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    name: mlx-serve
+    ports:
+    - containerPort: 29500
+      name: mlx-collective
+      protocol: TCP
+    resources:
+      limits:
+        memory: 8704Mi
+        mlx.k3sm.io/gpu: "1"
+      requests:
+        memory: 8704Mi
+        mlx.k3sm.io/gpu: "1"
+    volumeMounts:
+    - mountPath: /var/lib/mlx/cache
+      name: cache
+  hostname: qwen3-rank-2
+  nodeName: mac-c
+  nodeSelector:
+    kubernetes.io/os: darwin
+    mlx.k3sm.io/chip-family: m4
+    mlx.k3sm.io/gpu.present: "true"
+  restartPolicy: Never
+  subdomain: qwen3-headless
+  tolerations:
+  - effect: NoSchedule
+    key: k3sm.io/provider
+    operator: Exists
+  volumes:
+  - name: cache
+    persistentVolumeClaim:
+      claimName: cache-qwen3-mac-c
+status: {}

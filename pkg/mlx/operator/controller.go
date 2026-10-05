@@ -105,6 +105,10 @@ type Config struct {
 	// GPU supplies the node GPU facts the pre-render fit check reads. nil skips
 	// the fit check — see GPUSource.
 	GPU GPUSource
+	// Topology supplies the direct-link graph sharded placement and the
+	// LinksHealthy condition read. nil means the resolver-written DirectLink
+	// objects, listed through Dynamic.
+	Topology Topology
 	// Options are the operator-level render defaults (the pinned serving image
 	// and port) an MLXModel spec does not have to state. They are also what the
 	// published status endpoint resolves its port through, so the endpoint cannot
@@ -132,6 +136,7 @@ type Controller struct {
 	dyn       dynamic.Interface
 	crd       crdensure.CRDClient
 	gpu       GPUSource
+	topo      Topology
 	opts      mlx.Options
 	domain    string
 	pullName  string
@@ -163,11 +168,16 @@ func New(cfg Config) (*Controller, error) {
 	if pullName == "" {
 		pullName = DefaultPullSecretName
 	}
+	topo := cfg.Topology
+	if topo == nil {
+		topo = directLinkTopology{dyn: cfg.Dynamic}
+	}
 	return &Controller{
 		client:    cfg.Client,
 		dyn:       cfg.Dynamic,
 		crd:       cfg.CRD,
 		gpu:       cfg.GPU,
+		topo:      topo,
 		opts:      cfg.Options,
 		domain:    cfg.ClusterDomain,
 		pullName:  pullName,
@@ -404,6 +414,17 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
+	// A sharded model is a different workload shape (rank Pods, not a
+	// StatefulSet) with its own fit, placement and lifecycle; see sharded.go.
+	if model.Spec.Distributed != nil {
+		return c.reconcileSharded(ctx, key, raw, model)
+	}
+	// A model that WAS sharded leaves rank Pods behind; they are not part of
+	// the single-node shape and would hold the GPU the StatefulSet needs.
+	if err := c.deleteRankPods(ctx, model, "the spec is no longer sharded"); err != nil {
+		return err
+	}
+
 	// 1. Fit first. A spec that cannot be funded gets a status and NO objects:
 	// applying anyway produces a pod that dies at load time, restarts, and
 	// re-downloads from zero, with "never becomes ready" as the only symptom.
@@ -422,7 +443,9 @@ func (c *Controller) Reconcile(ctx context.Context, key string) error {
 	}
 
 	// 3. Pull secret, only if it exists (see the package doc).
-	c.stampPullSecret(ctx, objs, model.Namespace)
+	if c.pullSecretExists(ctx, model.Namespace) {
+		addPullSecret(&objs.StatefulSet.Spec.Template.Spec, c.pullName)
+	}
 
 	// 4. Apply.
 	if err := c.apply(ctx, objs); err != nil {
