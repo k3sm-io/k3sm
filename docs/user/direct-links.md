@@ -59,9 +59,12 @@ sudo k3sm pair --for 10m
 ```
 
 It prints how long the window stays open, the cluster pin, and the exact line for the new Mac. The
-window admits one completed join unless you pass `--max-joins`. `k3sm pair` alone shows the window
-and prints the line again; `sudo k3sm pair --close` ends it early. You can also open it at install
-time with `sudo k3sm install --mesh-ip <address> --pairing 10m`.
+window admits at most one completed join unless you pass `--max-joins`, and that is a hard bound:
+the control plane hands out no more outstanding tokens than joins the window has left, and it
+refuses a token at join time once the window has closed or is full. A token still unused when the
+window closes is dead with it, and a token from an earlier window never joins a later one. `k3sm pair`
+alone shows the window and prints the line again; `sudo k3sm pair --close` ends it early. You can
+also open it at install time with `sudo k3sm install --mesh-ip <address> --pairing 10m`.
 
 On the new Mac, install it as an auto-joining worker:
 

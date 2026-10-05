@@ -709,7 +709,7 @@ ever carries that label. Write both keys together:
 spec:
   runtimeClassName: vm
   nodeSelector:
-    kubernetes.io/os: darwin   # the node's OS — always darwin, guest or not
+    kubernetes.io/os: darwin   # the node's OS: always darwin, guest or not
 ```
 
 See [`vm` RuntimeClass](vm-runtimeclass.md) for the full selector shape, including the
