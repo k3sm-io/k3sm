@@ -59,7 +59,7 @@ compatibility (the amd64-Linux images are handled only by the M5 `vm` path).
 | `TestM3_NodePort` | a Deployment is reachable on `*:nodePort` | VSCode SSH NodePort, snapshot gRPC range | M3 / integration (single-node) + lab |
 | `TestM3_PVCPersistsAcrossRestart` | StatefulSet+PVC data survives a pod restart | Postgres / compile-artifacts PVCs | M3 / integration (single-node) + lab |
 | `TestM3_InPodKubectlAndDNSOnWorker` | on the JOINED worker: cluster DNS + in-pod kubectl via the node-local API VIP | cross-node in-cluster access | M3 / lab (`K3SM_WORKER`) |
-| `TestM4_RBACEnforced` | a restricted SA is denied a verb; admin + control-plane SAs allowed | `stockkitty-snapshot-manager` ClusterRole | M4 / integration (`m4.sh`) |
+| `TestM4_RBACEnforced` | a restricted SA is denied a verb; admin + control-plane SAs allowed | `snapshot-manager` ClusterRole | M4 / integration (`m4.sh`) |
 | `TestM5_LinuxImageUnderVM` | a Linux image runs under `runtimeClassName: vm`, Service/DNS-reachable | pgvector / nats Linux images | M5 / lab (`K3SM_LAB=1`) |
 
 ## Status

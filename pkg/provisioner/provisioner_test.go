@@ -81,11 +81,11 @@ func TestProvisionerCreatesPVForBoundPVC(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("selected node creates a pinned Retain PV named from the PVC UID", func(t *testing.T) {
-		pvc := boundPVC("stockkitty", "postgres-data", "uid-1234", "studio-1")
+		pvc := boundPVC("demo", "postgres-data", "uid-1234", "studio-1")
 		cs := fake.NewSimpleClientset(pvc)
 		c := New(cs, testClass(), nil)
 
-		if err := c.reconcile(ctx, "stockkitty/postgres-data"); err != nil {
+		if err := c.reconcile(ctx, "demo/postgres-data"); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 
@@ -101,7 +101,7 @@ func TestProvisionerCreatesPVForBoundPVC(t *testing.T) {
 		}
 		// Advisory path is derived from the RESOLVED root, keyed by (ns, claim) —
 		// the same derivation runtimed performs on the node.
-		wantPath := testRoot + "/stockkitty/postgres-data"
+		wantPath := testRoot + "/demo/postgres-data"
 		if pv.Spec.Local == nil || pv.Spec.Local.Path != wantPath {
 			t.Errorf("local path = %+v, want %q", pv.Spec.Local, wantPath)
 		}
@@ -120,17 +120,17 @@ func TestProvisionerCreatesPVForBoundPVC(t *testing.T) {
 			t.Errorf("capacity = %s, want 1Gi", got.String())
 		}
 		// ClaimRef pre-binds the PV to this exact PVC incarnation (by UID).
-		if cr := pv.Spec.ClaimRef; cr == nil || cr.UID != types.UID("uid-1234") || cr.Name != "postgres-data" || cr.Namespace != "stockkitty" {
-			t.Errorf("claimRef = %+v, want bound to stockkitty/postgres-data uid-1234", pv.Spec.ClaimRef)
+		if cr := pv.Spec.ClaimRef; cr == nil || cr.UID != types.UID("uid-1234") || cr.Name != "postgres-data" || cr.Namespace != "demo" {
+			t.Errorf("claimRef = %+v, want bound to demo/postgres-data uid-1234", pv.Spec.ClaimRef)
 		}
 	})
 
 	t.Run("no selected node defers provisioning (WaitForFirstConsumer)", func(t *testing.T) {
-		pvc := boundPVC("stockkitty", "redis-data", "uid-5678", "") // no annotation
+		pvc := boundPVC("demo", "redis-data", "uid-5678", "") // no annotation
 		cs := fake.NewSimpleClientset(pvc)
 		c := New(cs, testClass(), nil)
 
-		if err := c.reconcile(ctx, "stockkitty/redis-data"); err != nil {
+		if err := c.reconcile(ctx, "demo/redis-data"); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		pvs, _ := cs.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
@@ -140,13 +140,13 @@ func TestProvisionerCreatesPVForBoundPVC(t *testing.T) {
 	})
 
 	t.Run("foreign storage class is ignored", func(t *testing.T) {
-		pvc := boundPVC("stockkitty", "ebs-data", "uid-9999", "studio-1")
+		pvc := boundPVC("demo", "ebs-data", "uid-9999", "studio-1")
 		other := "fast-ssd"
 		pvc.Spec.StorageClassName = &other
 		cs := fake.NewSimpleClientset(pvc)
 		c := New(cs, testClass(), nil)
 
-		if err := c.reconcile(ctx, "stockkitty/ebs-data"); err != nil {
+		if err := c.reconcile(ctx, "demo/ebs-data"); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		pvs, _ := cs.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
@@ -158,7 +158,7 @@ func TestProvisionerCreatesPVForBoundPVC(t *testing.T) {
 	t.Run("a deleted PVC is a no-op", func(t *testing.T) {
 		cs := fake.NewSimpleClientset() // PVC absent
 		c := New(cs, testClass(), nil)
-		if err := c.reconcile(ctx, "stockkitty/gone"); err != nil {
+		if err := c.reconcile(ctx, "demo/gone"); err != nil {
 			t.Fatalf("reconcile of a missing PVC must be a no-op, got %v", err)
 		}
 	})
@@ -170,12 +170,12 @@ func TestProvisionerCreatesPVForBoundPVC(t *testing.T) {
 // derived from the immutable PVC UID, so the replay's Create is AlreadyExists.
 func TestProvisionerIdempotentReplay(t *testing.T) {
 	ctx := context.Background()
-	pvc := boundPVC("stockkitty", "postgres-data", "uid-1234", "studio-1")
+	pvc := boundPVC("demo", "postgres-data", "uid-1234", "studio-1")
 	cs := fake.NewSimpleClientset(pvc)
 	c := New(cs, testClass(), nil)
 
 	for i := 0; i < 3; i++ {
-		if err := c.reconcile(ctx, "stockkitty/postgres-data"); err != nil {
+		if err := c.reconcile(ctx, "demo/postgres-data"); err != nil {
 			t.Fatalf("reconcile #%d: %v", i, err)
 		}
 	}

@@ -51,8 +51,8 @@ import (
 // The signing CA + cluster CA live under <workDir>/tls; override via K3SM_WORK_DIR.
 const defaultServerWorkDir = "/var/lib/k3sm/server"
 
-// TestM4_RBACEnforced is the M4.1 capability gate (DESIGN §9 M4; docs/stockkitty-
-// readiness.md → stockkitty-snapshot-manager). On a cluster running
+// TestM4_RBACEnforced is the M4.1 capability gate (DESIGN §9 M4; the
+// reference-workload readiness matrix → snapshot-manager). On a cluster running
 // --authorization-mode=Node,RBAC + NodeRestriction it proves both halves of the flip:
 //
 //  1. a self-issued joined-worker identity (CN=system:node:<name>, O=system:nodes,
