@@ -252,3 +252,28 @@ func TestCheckNodeAliasAddr(t *testing.T) {
 		})
 	}
 }
+
+// TestMeshServerAliasAgreesWithSeededNetdRange pins that the node-address check
+// and the install's netd seed agree on a mesh server's own address: for every
+// --mesh-ip the install accepts, checkNodeAliasAddr admits that address against
+// the node range install.MeshNodePodCIDR seeds netd with, so the check refuses
+// nothing netd would admit at the server's first start.
+func TestMeshServerAliasAgreesWithSeededNetdRange(t *testing.T) {
+	for _, mesh := range []string{"100.64.0.1", "100.64.1.1", "100.64.7.1", "100.127.255.1"} {
+		t.Run(mesh, func(t *testing.T) {
+			if err := validateMeshIP(mesh); err != nil {
+				t.Fatalf("validateMeshIP(%s) = %v, want accepted", mesh, err)
+			}
+			cidr, err := install.MeshNodePodCIDR(mesh)
+			if err != nil {
+				t.Fatalf("MeshNodePodCIDR(%s): %v", mesh, err)
+			}
+			if err := checkNodeAliasAddr(mesh, cidr.String(), install.DefaultServiceCIDR); err != nil {
+				t.Errorf("checkNodeAliasAddr(%s, %s) = %v; the node check refuses the address netd is seeded to admit", mesh, cidr, err)
+			}
+			if gw, err := podnet.MeshEgressIP(cidr); err != nil || gw.String() != mesh {
+				t.Errorf("the seeded range %s has mesh-egress %v (err %v), want %s", cidr, gw, err, mesh)
+			}
+		})
+	}
+}

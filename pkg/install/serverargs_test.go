@@ -155,19 +155,19 @@ func TestServerArgsRecordSources(t *testing.T) {
 		// A stale record from an earlier configuration, and a plist the operator
 		// has since edited. The plist is what launchd actually runs.
 		putServerArgsRecord(t, f, recordPath(cfg), "--registry-port", "5000")
-		configureServerArgs(f, cfg, "--mesh-ip", "100.64.0.2")
+		configureServerArgs(f, cfg, "--mesh-ip", "100.64.1.1")
 
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)
 		}
-		if got, want := serverArgsOf(t, f, cfg), []string{"--mesh-ip", "100.64.0.2"}; !slices.Equal(got, want) {
+		if got, want := serverArgsOf(t, f, cfg), []string{"--mesh-ip", "100.64.1.1"}; !slices.Equal(got, want) {
 			t.Errorf("rendered args = %v, want the PLIST's %v", got, want)
 		}
 		rec, ok := f.serverArgs[recordPath(cfg)]
 		if !ok {
 			t.Fatal("the record was not rewritten")
 		}
-		if got, want := rec.Args, []string{"--mesh-ip", "100.64.0.2"}; !slices.Equal(got, want) {
+		if got, want := rec.Args, []string{"--mesh-ip", "100.64.1.1"}; !slices.Equal(got, want) {
 			t.Errorf("record args = %v, want the plist's %v", got, want)
 		}
 		if rec.CreatedAt.IsZero() || rec.CreatedBy == "" {

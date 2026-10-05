@@ -183,9 +183,10 @@ func parseInstallFlags(args []string) (installFlags, error) {
 }
 
 // validateMeshIP refuses a --mesh-ip this install can never serve from: an
-// address that fails to parse at all, and the three IP shapes that are always
-// wrong for a server's own bind address — unspecified (0.0.0.0/::), loopback,
-// and multicast. It runs at flag-parse time, before root/privilege checks, so a
+// address that fails to parse at all, the IP shapes that are always wrong for a
+// server's own bind address — unspecified (0.0.0.0/::), loopback, and multicast
+// — and any address that is not the mesh-egress address of a node pod range
+// inside the cluster pod range (install.MeshNodePodCIDR). It runs at flag-parse time, before root/privilege checks, so a
 // typo is reported immediately rather than after `sudo` and the rest of a
 // (possibly slow) install has already run.
 func validateMeshIP(raw string) error {
@@ -204,6 +205,12 @@ func validateMeshIP(raw string) error {
 		return fmt.Errorf("--mesh-ip %q is a loopback address; give the mesh address other nodes reach this Mac at", raw)
 	case addr.IsMulticast():
 		return fmt.Errorf("--mesh-ip %q is a multicast address and cannot be bound", raw)
+	}
+	// A server's mesh address is the mesh-egress address of its own node pod
+	// range: the install seeds netd's node range from it, so an address that
+	// names no range would leave netd refusing the server's own mesh alias.
+	if _, err := install.MeshNodePodCIDR(raw); err != nil {
+		return err
 	}
 	return nil
 }

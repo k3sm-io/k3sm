@@ -1725,6 +1725,12 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	if err := ValidateHARequest(cfg); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
+	// An explicit --mesh-ip must name this server's own node pod range (see
+	// checkServerMeshIP). A CARRIED one is checked at 0b″, once the carried
+	// arguments have been read.
+	if err := checkServerMeshIP(cfg, nil); err != nil {
+		return err
+	}
 	// Still before anything is written: the directory that will hold the `k3sm`
 	// launcher must already be trusted. The link is laid down at step 2b, long
 	// after the service user, the log trees, the run dir, the staged credentials
@@ -1839,6 +1845,13 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     error.
 	serverArgs, err := preflightServerArgs(sys, cfg)
 	if err != nil {
+		return err
+	}
+	// 0b″. The effective --mesh-ip must name this server's own node pod /24
+	//      (MeshNodePodCIDR): the netd plist seeds netd's node range from it,
+	//      and an address that names no range would leave netd refusing the
+	//      server's own mesh alias at every start.
+	if err := checkServerMeshIP(cfg, serverArgs); err != nil {
 		return err
 	}
 	// 0b′. Secrets encryption, decided from reads alone and before the first

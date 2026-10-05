@@ -66,8 +66,8 @@ func TestInstallRecordsEmbeddedEtcdServerFlags(t *testing.T) {
 		},
 		{
 			name:      "--server-join through an existing server, its token staged off the argv",
-			args:      []string{"--server-join", "--server", "192.0.2.10", "--token-file", operatorToken, "--node-ip", "192.0.2.20", "--mesh-ip", "100.64.0.2"},
-			wantArgs:  []string{"--mesh-ip", "100.64.0.2", "--server-join", "--server", "192.0.2.10", "--etcd-peer-ip", "192.0.2.20"},
+			args:      []string{"--server-join", "--server", "192.0.2.10", "--token-file", operatorToken, "--node-ip", "192.0.2.20", "--mesh-ip", "100.64.1.1"},
+			wantArgs:  []string{"--mesh-ip", "100.64.1.1", "--server-join", "--server", "192.0.2.10", "--etcd-peer-ip", "192.0.2.20"},
 			tokenFile: joinToken,
 		},
 		{

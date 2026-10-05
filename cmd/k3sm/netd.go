@@ -86,7 +86,7 @@ func netdFlags(opts *netdOptions) *flag.FlagSet {
 	// exactly that index-0 carve — a literal here that drifted from the carve would
 	// turn a silent no-op into a refused adoption on a node that already holds
 	// aliases. One derivation, so drift is not expressible.
-	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", defaultNodePodCIDR(), "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION DEFAULT ONLY — the node's real prefix is decided by the join, and a ConfigureMesh may replace this value, so the installed plist passes no --node-pod-cidr")
+	fs.StringVar(&opts.nodePodCIDR, "node-pod-cidr", defaultNodePodCIDR(), "this node's pod /24 (a pod-IP alias must fall within it); PRE-ADOPTION VALUE — on a worker the real prefix is decided by the join and a ConfigureMesh replaces this value, so a worker's installed plist passes none; a mesh server's installed plist passes the /24 its --mesh-ip is the mesh-egress address of, because the server aliases that address before its own enrol")
 	fs.StringVar(&opts.serviceCIDR, "service-cidr", install.DefaultServiceCIDR, "cluster Service CIDR (REQUIRED so the proxy's ClusterIP VIP aliases are admitted)")
 	fs.IntVar(&opts.serviceUID, "service-uid", -1, "the _k3sm uid the daemon admits as a peer (default: look up _k3sm)")
 	fs.StringVar(&opts.meshKeyDir, "mesh-key-dir", install.MeshKeyDir, "root-only directory the mesh key resolver reads (empty disables ConfigureMesh)")
