@@ -47,6 +47,7 @@ import (
 	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/mlx/operator"
 	"k3sm.io/k3sm/pkg/netserve"
@@ -668,14 +669,16 @@ func serverNodeOptions(plan serverPlan, restCfg *rest.Config, nodeAddressing nod
 		podRoot:    opts.podRoot,
 		logs:       opts.logs,
 		nodeIP:     nodeAddressing.nodeIP,
-		runtime:    opts.rtName,
-		dnsShim:    opts.dnsShim,
-		pathShim:   opts.pathShim,
-		dnsVIP:     opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:    nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality)
-		netMode:    nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,                   // serve kubelet API over TLS so logs/exec work via the proxy
+		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
+		serviceCIDR: install.DefaultServiceCIDR,
+		runtime:     opts.rtName,
+		dnsShim:     opts.dnsShim,
+		pathShim:    opts.pathShim,
+		dnsVIP:      opts.clusterIP,         // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:      opts.domain,            // SAME cluster domain the per-node resolver serves → in-pod shim search list
+		podCIDR:     nodeAddressing.podCIDR, // the reserved index-0 /24 (same source as the netserve locality)
+		netMode:     nodeAddressing.netMode, // the resolved --network backend the podnet alias plumbing follows
+		serveTLS:    true,                   // serve kubelet API over TLS so logs/exec work via the proxy
 
 		kubeletClientCAPEM: kubeletClientCA, // :10250 requires the apiserver's client cert
 

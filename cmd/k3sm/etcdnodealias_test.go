@@ -28,6 +28,7 @@ import (
 	"k3sm.io/darwin-net/pkg/podnet"
 
 	"k3sm.io/k3sm/pkg/hostnet"
+	"k3sm.io/k3sm/pkg/install"
 )
 
 // aliasRecordingIPAM is a provider.PodIPAM that records the node lo0 aliases the
@@ -159,9 +160,10 @@ func TestEtcdServerDoesNotAliasItsLANNodeIP(t *testing.T) {
 				opts.nodeIP = meshNodeIP(opts)
 			}
 			node := nodeOptions{
-				nodeIP:  opts.nodeIP,
-				podCIDR: podCIDR,
-				netMode: hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/var/run/k3sm-netd.sock"},
+				nodeIP:      opts.nodeIP,
+				podCIDR:     podCIDR,
+				serviceCIDR: install.DefaultServiceCIDR,
+				netMode:     hostnet.Mode{Backend: hostnet.BackendHelper, Socket: "/var/run/k3sm-netd.sock"},
 			}
 			advertised := advertisedNodeIP(node)
 			if advertised != tc.wantAdvertise {
@@ -201,29 +203,52 @@ func TestEtcdServerDoesNotAliasItsLANNodeIP(t *testing.T) {
 	}
 }
 
-// TestCheckNodeAliasAddr pins the pre-start refusal against netd's alias policy:
-// an address inside the node pod CIDR or the Service CIDR passes, loopback and an
-// unparseable value are the reconcile's own skip, and anything else is refused
-// naming the address.
+// TestCheckNodeAliasAddr pins the pre-start refusal to netd's alias policy
+// (darwin-net pkg/netd validateAliasIP), whose rows it carries: the node's own
+// pod IPs (pkg/netd server_test: 100.64.0.2/.3/.7 on a 100.64.0.0/24 node) and the
+// Service VIP (adopt_test: 10.43.0.10) pass; a LAN address (server_test:
+// 192.168.1.5) and another node's /24 (adopt_test: 100.64.7.5 on a 100.64.0.0/24
+// node, and 100.64.0.5 on a 100.64.7.0/24 node) are refused; and the
+// IPv4-unicast shape rules (not IPv6, not multicast, not unspecified) hold. A
+// custom Service CIDR replaces the default one rather than adding to it, and with
+// none configured only the pod CIDR admits. Loopback and an unparseable value are
+// the reconcile's own skip.
 func TestCheckNodeAliasAddr(t *testing.T) {
+	const svc = install.DefaultServiceCIDR // 10.43.0.0/16
 	for _, tc := range []struct {
-		ip, cidr string
-		ok       bool
+		name         string
+		ip, pod, svc string
+		ok           bool
 	}{
-		{"100.64.0.1", "100.64.0.0/24", true},
-		{"100.64.3.1", "100.64.3.0/24", true},
-		{"10.43.0.10", "100.64.0.0/24", true},
-		{"127.0.0.1", "100.64.0.0/24", true},
-		{"", "100.64.0.0/24", true},
-		{"192.168.0.50", "100.64.0.0/24", false},
-		{"100.64.1.1", "100.64.0.0/24", false},
+		{"own pod IP .2", "100.64.0.2", "100.64.0.0/24", svc, true},
+		{"own pod IP .3", "100.64.0.3", "100.64.0.0/24", svc, true},
+		{"own pod IP .7", "100.64.0.7", "100.64.0.0/24", svc, true},
+		{"own mesh-egress .1", "100.64.0.1", "100.64.0.0/24", svc, true},
+		{"adopted /24's pod IP", "100.64.7.5", "100.64.7.0/24", svc, true},
+		{"the Service DNS VIP", "10.43.0.10", "100.64.0.0/24", svc, true},
+		{"a LAN address", "192.168.1.5", "100.64.0.0/24", svc, false},
+		{"the HA server's LAN peer address", "192.168.0.50", "100.64.0.0/24", svc, false},
+		{"another node's /24", "100.64.7.5", "100.64.0.0/24", svc, false},
+		{"the previous /24 after adoption", "100.64.0.5", "100.64.7.0/24", svc, false},
+		{"a pod CIDR outside the cluster aggregate", "10.200.0.1", "10.200.0.0/24", svc, false},
+		{"IPv6", "fd00::1", "100.64.0.0/24", svc, false},
+		{"multicast", "224.0.0.1", "100.64.0.0/24", "224.0.0.0/4", false},
+		{"unspecified", "0.0.0.0", "100.64.0.0/24", "0.0.0.0/0", false},
+		{"inside a custom Service CIDR", "10.96.0.10", "100.64.0.0/24", "10.96.0.0/12", true},
+		{"the default range under a custom Service CIDR", "10.43.0.10", "100.64.0.0/24", "10.96.0.0/12", false},
+		{"no Service CIDR configured: a VIP is refused", "10.43.0.10", "100.64.0.0/24", "", false},
+		{"no Service CIDR configured: the pod CIDR still admits", "100.64.0.1", "100.64.0.0/24", "", true},
+		{"loopback is the reconcile's skip", "127.0.0.1", "100.64.0.0/24", svc, true},
+		{"empty is the reconcile's skip", "", "100.64.0.0/24", svc, true},
 	} {
-		err := checkNodeAliasAddr(tc.ip, tc.cidr)
-		if tc.ok != (err == nil) {
-			t.Errorf("checkNodeAliasAddr(%q, %q) = %v, want ok=%v", tc.ip, tc.cidr, err, tc.ok)
-		}
-		if err != nil && !strings.Contains(err.Error(), tc.ip) {
-			t.Errorf("the refusal does not name %s: %v", tc.ip, err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkNodeAliasAddr(tc.ip, tc.pod, tc.svc)
+			if tc.ok != (err == nil) {
+				t.Fatalf("checkNodeAliasAddr(%q, %q, %q) = %v, want ok=%v", tc.ip, tc.pod, tc.svc, err, tc.ok)
+			}
+			if err != nil && (!errors.Is(err, errNodeAliasOutsidePodNetwork) || !strings.Contains(err.Error(), tc.ip)) {
+				t.Errorf("the refusal is not errNodeAliasOutsidePodNetwork naming %s: %v", tc.ip, err)
+			}
+		})
 	}
 }

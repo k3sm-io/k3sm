@@ -112,6 +112,56 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		}
 	})
 
+	t.Run("a plain reinstall over pre-split HA arguments refuses and names the migration", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			carried []string
+			want    []string // substrings of the refusal
+		}{
+			{
+				name:    "cluster-init",
+				carried: []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--node-ip", "192.0.2.10"},
+				want:    []string{"--cluster-init --node-ip 192.0.2.10", "sudo k3sm install --cluster-init --node-ip 192.0.2.10", "--etcd-peer-ip"},
+			},
+			{
+				name:    "server-join",
+				carried: []string{"--server-join", "--server", "192.0.2.10", "--node-ip=192.0.2.20"},
+				want:    []string{"sudo k3sm install --server-join --server 192.0.2.10 --token-file", "--node-ip 192.0.2.20", "--etcd-peer-ip"},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := &fakeSystem{}
+				cfg := testConfig(t)
+				configureServerArgs(f, cfg, tc.carried...)
+				err := Install(ctx, f, cfg)
+				if !errors.Is(err, ErrPreSplitEtcdArgs) {
+					t.Fatalf("Install = %v, want ErrPreSplitEtcdArgs", err)
+				}
+				for _, w := range tc.want {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("the refusal does not name %q: %v", w, err)
+					}
+				}
+				if m := mutatingCalls(f.calls); len(m) > 0 {
+					t.Errorf("the refusal came after the install changed the machine: %v", m)
+				}
+			})
+		}
+	})
+
+	t.Run("current-grammar HA arguments carry forward on a plain reinstall", func(t *testing.T) {
+		f := &fakeSystem{}
+		cfg := testConfig(t)
+		want := []string{"--mesh-ip", "100.64.0.1", "--cluster-init", "--etcd-peer-ip", "192.0.2.10"}
+		configureServerArgs(f, cfg, want...)
+		if err := Install(ctx, f, cfg); err != nil {
+			t.Fatalf("plain reinstall: %v", err)
+		}
+		if got := serverArgsOf(t, f, cfg); !slices.Equal(got, want) {
+			t.Errorf("server plist carries %q, want %q", got, want)
+		}
+	})
+
 	t.Run("--server-join stages the server token and points the daemon at it", func(t *testing.T) {
 		f := &fakeSystem{}
 		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))

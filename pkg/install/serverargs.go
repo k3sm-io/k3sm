@@ -455,6 +455,9 @@ func preflightServerArgs(sys System, cfg Config) ([]string, error) {
 	if err := refuseEtcdRoleSwitch(cfg, extra); err != nil {
 		return nil, err
 	}
+	if err := refusePreSplitEtcdArgs(cfg, extra); err != nil {
+		return nil, err
+	}
 	cfg.ExtraServerArgs = extra
 	if err := refuseRetiredDatastoreFlags(cfg); err != nil {
 		return nil, err

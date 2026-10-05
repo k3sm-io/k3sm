@@ -746,14 +746,16 @@ func agentNodeOptions(opts agentOptions, res *bootstrap.JoinResult, kubeconfigPa
 		podRoot:    opts.podRoot,
 		logs:       opts.logs,
 		nodeIP:     agentInternalIP(opts.nodeIP, res),
-		runtime:    opts.rtName,
-		dnsShim:    opts.dnsShim,
-		pathShim:   opts.pathShim,
-		dnsVIP:     opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
-		domain:     opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
-		podCIDR:    res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source)
-		netMode:    mode,           // the resolved --network backend the podnet alias plumbing follows
-		serveTLS:   true,
+		// The one cluster Service CIDR; see nodeOptions.serviceCIDR.
+		serviceCIDR: install.DefaultServiceCIDR,
+		runtime:     opts.rtName,
+		dnsShim:     opts.dnsShim,
+		pathShim:    opts.pathShim,
+		dnsVIP:      opts.clusterIP, // scope the pod Seatbelt egress to the same cluster DNS VIP the resolver binds
+		domain:      opts.domain,    // SAME cluster domain the per-node resolver serves → in-pod shim search list
+		podCIDR:     res.PodCIDR,    // the ENROLLED /24 (mesh AllowedIPs == pod IPAM — one source)
+		netMode:     mode,           // the resolved --network backend the podnet alias plumbing follows
+		serveTLS:    true,
 
 		// The cluster's client-identity (signing) CA, received in the join
 		// response — the anchor this worker's :10250 verifies the apiserver's client

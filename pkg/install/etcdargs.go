@@ -36,9 +36,11 @@ import (
 // (on a control-plane install it means nothing else), and setEtcdArgs renders it
 // as --etcd-peer-ip: the daemon's --node-ip is the node's advertised address,
 // which the pod network aliases on lo0, and a LAN address rendered there made
-// every HA server exit at its pod-network startup reconcile. Before the installer could say so itself, those flags reached
-// a daemon only through a carried argument set, which a first install does not
-// have: an operator could form a cluster only by hand-writing the server-arguments
+// every HA server exit at its pod-network startup reconcile.
+//
+// Before the installer could say so itself, those flags reached a daemon only
+// through a carried argument set, which a first install does not have: an
+// operator could form a cluster only by hand-writing the server-arguments
 // record. Config.ClusterInit and Config.ServerJoin are the installer's own
 // request. They are merged into the operator's arguments in exactly one place
 // (resolvedExtraServerArgs), so the rendered argv and the written record carry the
@@ -229,6 +231,55 @@ func ValidateEtcdNodeIP(raw string) error {
 		return fmt.Errorf("--cluster-init and --server-join need --node-ip set to this Mac's LAN address (got %q): the etcd peer listener binds it and every other server dials it, so it cannot be loopback or unspecified", raw)
 	}
 	return nil
+}
+
+// ErrPreSplitEtcdArgs refuses an install that would carry forward an HA
+// server's arguments in the grammar from before the etcd peer address had a
+// flag of its own: a role flag with the LAN address on --node-ip and no
+// --etcd-peer-ip.
+var ErrPreSplitEtcdArgs = errors.New("install: the carried server arguments give the etcd peer address as --node-ip")
+
+// refusePreSplitEtcdArgs refuses a server install that makes no HA request
+// while the carried arguments hold --cluster-init or --server-join with
+// --node-ip and no --etcd-peer-ip. Rendered as they are, `k3sm server` refuses
+// them at every launchd respawn (the peer address is missing, and the LAN
+// address would be the node's lo0 alias). An HA request needs no refusal: it
+// replaces those flags (setEtcdArgs), which is exactly the migration the error
+// names.
+func refusePreSplitEtcdArgs(cfg Config, carried []string) error {
+	if cfg.Role != RoleServer || cfg.etcdRequested() {
+		return nil
+	}
+	role := ""
+	switch {
+	case boolFlagSet(carried, clusterInitFlag):
+		role = clusterInitFlag
+	case boolFlagSet(carried, serverJoinFlag):
+		role = serverJoinFlag
+	default:
+		return nil
+	}
+	if !flagPresent(carried, nodeIPFlag) || flagPresent(carried, etcdPeerIPFlag) {
+		return nil
+	}
+	lan := flagValue(carried, nodeIPFlag)
+	join := ""
+	if role == serverJoinFlag {
+		join = " --server " + flagValue(carried, serverJoinServerFlag) + " --token-file <file holding the server token>"
+	}
+	return fmt.Errorf("%w (installed with --%s --node-ip %s). Nothing has been written. Re-run this install with the role and the LAN address: `sudo k3sm install --%s%s --node-ip %s`; it renders the address as `k3sm server --etcd-peer-ip`, and the node advertises its --mesh-ip",
+		ErrPreSplitEtcdArgs, role, lan, role, join, lan)
+}
+
+// flagPresent reports whether args set the named flag in any spelling, with
+// or without a value.
+func flagPresent(args []string, name string) bool {
+	for _, a := range args {
+		if n, _, _ := splitFlag(a); n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // refuseEtcdRoleSwitch refuses an HA request for the OTHER role than the
