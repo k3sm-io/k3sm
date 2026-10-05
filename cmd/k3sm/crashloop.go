@@ -174,9 +174,10 @@ func noteEtcdMemberRouteFailure(b *crashBreaker, logger *slog.Logger, err error)
 	if !errors.Is(err, errEtcdMemberRoutePermanent) {
 		return
 	}
+	remedy := etcdMemberRouteRemedyFor(err)
 	logger.Error("the existing server permanently refused this server's etcd member; parking on this failure",
-		"component", etcdMemberRouteComponent, "err", err, "remedy", etcdMemberRouteRemedy)
-	if b.recordBringUpPermanent(etcdMemberRouteComponent, status.Redact(err.Error()), etcdMemberRouteRemedy) {
+		"component", etcdMemberRouteComponent, "err", err, "remedy", remedy)
+	if b.recordBringUpPermanent(etcdMemberRouteComponent, status.Redact(err.Error()), remedy) {
 		logger.Error("crash-loop breaker tripped on a permanent fault; the next start will park until an operator clears the record",
 			"path", b.path)
 	}

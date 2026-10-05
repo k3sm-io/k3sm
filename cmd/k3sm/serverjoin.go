@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -46,31 +47,55 @@ func serverSecretPath(workDir string) string { return filepath.Join(workDir, "se
 // kubeconfig the in-process components keep.
 func adminKubeconfigPath(workDir string) string { return filepath.Join(workDir, "admin.kubeconfig") }
 
-// importServerCABundle is the FAIL-CLOSED HA server-join: it fetches the existing
-// server's AES-256-GCM CA bundle over a CA-pinned TLS connection, decrypts it with the
-// server token's secret, and writes the reconstructed cluster, signing and etcd CA
-// keypairs under this server's PKI dir — so the subsequent certs.EnsureHierarchy and
-// certs.EnsureEtcdCAs LOAD the IDENTICAL CAs. Any failure returns an error (the caller halts bring-up); it NEVER falls through
-// to minting fresh, divergent CAs. It also records the server secret locally so this
-// server's own bundle endpoint can seal + serve once it is an equal member.
+// importServerCABundle is the FAIL-CLOSED HA server-join: it brings this server's
+// cluster, signing and etcd CA keypairs level with the existing server's AES-256-GCM
+// CA bundle, so the subsequent certs.EnsureHierarchy and certs.EnsureEtcdCAs LOAD the
+// IDENTICAL CAs. Any failure returns an error (the caller halts bring-up); it NEVER
+// falls through to minting fresh, divergent CAs. See importServerCABundleVia.
 func importServerCABundle(ctx context.Context, opts serverOptions, logger *slog.Logger) error {
+	return importServerCABundleVia(ctx, opts, nil, logger)
+}
+
+// importServerCABundleVia is importServerCABundle over an injectable HTTP client (nil
+// is the bootstrap package's CA-pinned default). It runs on every start of a joined
+// server, not only the first, so each step is idempotent:
+//
+//  1. The token's secret is recorded (bootstrap.EnsureServerSecret) BEFORE any
+//     network, so a fetch that fails still leaves this server able to seal + serve its
+//     own bundle later; a different secret already on disk stops here.
+//  2. certs.MissingOnDisk decides whether a fetch is needed at all: a complete
+//     hierarchy (every restart after the first join) fetches nothing.
+//  3. Otherwise the bundle is fetched, unsealed and reconciled: absent CAs are
+//     installed, present ones are kept, and a present CA whose pin differs from the
+//     bundle's fails with certs.ErrHierarchyDiverged and nothing written.
+func importServerCABundleVia(ctx context.Context, opts serverOptions, client *http.Client, logger *slog.Logger) error {
 	tok, err := bootstrap.ParseServerToken(opts.token)
 	if err != nil {
 		return fmt.Errorf("parse server token: %w", err)
 	}
+	if err := bootstrap.EnsureServerSecret(serverSecretPath(opts.workDir), tok.Secret); err != nil {
+		return err
+	}
+	missing, err := certs.MissingOnDisk(opts.workDir)
+	if err != nil {
+		return fmt.Errorf("inspect the local CA hierarchy: %w", err)
+	}
+	if len(missing) == 0 {
+		logger.Info("HA server-join: hierarchy complete, bundle not fetched")
+		return nil
+	}
 	bootstrapURL := fmt.Sprintf("https://%s:%d", opts.joinServer, bootstrapPort)
-	logger.Info("HA server-join: importing the identical-CA bundle from the existing server", "server", bootstrapURL)
+	logger.Info("HA server-join: importing the identical-CA bundle from the existing server",
+		"server", bootstrapURL, "missing", missing)
 	if err := bootstrap.ImportCABundle(ctx, bootstrap.ServerJoinOptions{
-		Server:  bootstrapURL,
-		Token:   opts.token,
-		WorkDir: opts.workDir,
+		Server:     bootstrapURL,
+		Token:      opts.token,
+		WorkDir:    opts.workDir,
+		HTTPClient: client,
 	}); err != nil {
 		return err
 	}
-	if err := bootstrap.SaveServerSecret(serverSecretPath(opts.workDir), tok.Secret); err != nil {
-		return err
-	}
-	logger.Info("HA server-join: reconstructed the identical cluster + signing CAs from the bundle")
+	logger.Info("HA server-join: installed the missing CAs from the bundle", "installed", missing)
 	return nil
 }
 

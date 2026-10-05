@@ -2090,6 +2090,10 @@ func TestUninstallIdempotent(t *testing.T) {
 		// preserved mesh key dir that goes: a role change goes through
 		// uninstall, and the next role's netd must not restore this /24.
 		"RemoveAll:/var/lib/k3sm/keys/node-pod-cidr",
+		// A joining HA server's staged server-class join token, removed in the
+		// same position as the admin token below and for the same reason; on a
+		// server that never joined, removing an absent file is a no-op.
+		"RemoveAll:/var/lib/k3sm/server/join-token",
 		// The staged admin token, removed with the daemons rather than preserved
 		// with the rest of the data root: it is a system:masters credential with
 		// no use on a Mac that is no longer a k3sm server, and it goes AFTER the
@@ -2677,6 +2681,14 @@ func TestUninstallManifestCoversInstall(t *testing.T) {
 		// key dir it sits in must never appear in the removed set.
 		if toSet(recorded(installCalls, "Bootstrap:"))[NetdLabel] {
 			created[netdsvc.NodeIdentityPath(MeshKeyDir)] = true
+		}
+		// A joining server's staged join token is written through the same
+		// service-user seam by a --server-join install, which this single-node
+		// install is not. Uninstall runs from a Config that cannot say whether
+		// an earlier install joined, so it removes that one path on every
+		// server; it is admitted by that exact path, and only on the server role.
+		if dc.Role == RoleServer {
+			created[dc.serverJoinTokenPath()] = true
 		}
 		for _, p := range recorded(uninstallCalls, "RemoveAll:") {
 			if !created[p] {

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -342,9 +343,10 @@ func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
 // enrollSelfAndBringUpMesh is the control-plane node's own mesh join: it binds
 // this node's name in the node-password store no worker join can then claim,
 // loads (or mints) this node's persistent wireguard identity,
-// asserts-or-creates its index-0 MeshPeer through the SAME locked enroller the
-// worker-join RPC uses, and brings the wireguard device up against the peer
-// snapshot the enroll returned.
+// asserts-or-creates its MeshPeer at selfCIDR — the /24 its own --mesh-ip names,
+// computed once by the caller (serverSelfPodCIDR) — through the SAME locked
+// enroller the worker-join RPC uses, and brings the wireguard device up against
+// the peer snapshot the enroll returned.
 //
 // It returns the enrolled identity so the caller can seed the node-local
 // datapath with the mesh-egress source the proxy binds and the peer mesh-egress
@@ -352,17 +354,17 @@ func serverMeshBringUpFailure(opts serverOptions, err error) (string, []any) {
 // caller defers so this node's routes are released on the server's
 // way out instead of by a goroutine racing process death (see meshTeardown).
 //
-// It is SYNCHRONOUS and returns only once the enroll has been list-back
-// verified, because the caller must not open the worker-join listener until this
-// node's index-0 claim is durable: a worker joining in that window would be
-// assigned index 0 by the free-index scanner and two peers would claim one
-// AllowedIPs, which wireguard cannot admit.
+// It is SYNCHRONOUS and returns only once the range's claim is held and the
+// MeshPeer written, because the caller must not open the worker-join listener
+// until this node's range is durably its own: a worker joining in that window
+// could otherwise be handed it, and two peers would claim one AllowedIPs, which
+// wireguard cannot admit.
 //
 // The ENROLL runs on every mesh-path bring-up, including `--network none`: the
-// index-0 claim is what keeps a worker's assignment off this node's /24, and that
-// is true whether or not this process plumbs a wireguard device. Only the DEVICE
-// bring-up is gated on the datapath.
-func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bootstrap.NodePasswordStore, opts serverOptions, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
+// claim is what keeps a worker's assignment off this node's /24, and that is true
+// whether or not this process plumbs a wireguard device. Only the DEVICE bring-up
+// is gated on the datapath.
+func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bootstrap.NodePasswordStore, opts serverOptions, selfCIDR netip.Prefix, mode hostnet.Mode, kubeconfig string, logger *slog.Logger) (netv1.MeshEnrollResponse, meshTeardown, error) {
 	// The name binding comes FIRST, before this node has written anything of its
 	// own: it is the claim on this node's identity, and the store it lands in is
 	// the one every worker join is checked against.
@@ -377,7 +379,7 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 	if err != nil {
 		return netv1.MeshEnrollResponse{}, noMeshTeardown, err
 	}
-	res, err := e.EnrollSelf(ctx, opts.nodeName, netv1.MeshEnrollRequest{
+	res, err := e.EnrollSelf(ctx, opts.nodeName, selfCIDR, netv1.MeshEnrollRequest{
 		NodeName:  opts.nodeName,
 		PublicKey: pub,
 		Endpoint:  endpoint,
@@ -388,7 +390,7 @@ func enrollSelfAndBringUpMesh(ctx context.Context, e *meshEnroller, passwords bo
 	logger.Info("enrolled this control-plane node into its own mesh",
 		"node", opts.nodeName, "podCIDR", res.PodCIDR, "meshIP", res.MeshIP, "peers", len(res.Peers))
 	if !mode.DataPath() {
-		logger.Info("network datapath disabled (--network none): the index-0 MeshPeer is written, but this process brings up no wireguard device")
+		logger.Info("network datapath disabled (--network none): this server's MeshPeer is written, but this process brings up no wireguard device", "podCIDR", res.PodCIDR)
 		return res, noMeshTeardown, nil
 	}
 	down, err := bringUpMesh(ctx, meshBringUp{

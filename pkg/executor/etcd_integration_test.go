@@ -329,7 +329,7 @@ func newITMember(t *testing.T, name, docIP string, role EtcdRole, h *certs.Hiera
 		if _, err := certs.EnsureHierarchy(wd); err != nil {
 			t.Fatal(err)
 		}
-	} else if err := certs.WriteHierarchy(wd, h); err != nil {
+	} else if err := certs.ReconcileImportedHierarchy(wd, h); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {
@@ -449,7 +449,7 @@ func (m *itMember) requestMember(t *testing.T, route itRoute) bootstrap.EtcdMemb
 	var resp bootstrap.EtcdMemberResponse
 	for {
 		var err error
-		resp, err = bootstrap.RequestEtcdMember(t.Context(), route.url, route.token, m.name, m.routePeerURL(t), route.client)
+		resp, err = bootstrap.RequestEtcdMember(t.Context(), route.url, route.token, bootstrap.EtcdMemberRequest{Name: m.name, PeerURL: m.routePeerURL(t)}, route.client)
 		if err == nil {
 			break
 		}

@@ -217,7 +217,17 @@ func stageJoinToken(sys System, cfg Config, uid uint32, token string) error {
 	if strings.TrimSpace(token) == "" {
 		return fmt.Errorf("install: no join token was read before staging (the join-endpoint preflight is what reads %s)", cfg.TokenFile)
 	}
-	dst := cfg.agentTokenPath()
+	dst := cfg.stagedJoinTokenPath()
+	if cfg.serverJoining() {
+		// The joining server reads it at every start (serverDaemonTokenPath), so
+		// the staged copy, not the operator's file, is what must outlive the join.
+		if err := stageTokenFile(sys, uid, token, dst, "server join token", ServerTokenFileMode, ServerTokenDirMode); err != nil {
+			return err
+		}
+		cfg.Logger.Info("staged the server join token for the server daemon (your own copy is untouched and yours to delete)",
+			"from", cfg.TokenFile, "to", dst)
+		return nil
+	}
 	if err := stageTokenFile(sys, uid, token, dst, "join token", AgentTokenFileMode, AgentTokenDirMode); err != nil {
 		return err
 	}
@@ -250,7 +260,7 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 	case errors.Is(err, ErrNotRegularFile):
 		return "", bootstrap.Token{}, fmt.Errorf("install: the join token file %s is not a regular file (%w): a join token is a credential and belongs in an ordinary file, mode 600", cfg.TokenFile, err)
 	case err != nil:
-		return "", bootstrap.Token{}, fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the agent daemon to present)", cfg.TokenFile, err, cfg.agentTokenPath())
+		return "", bootstrap.Token{}, fmt.Errorf("install: read the join token file %s: %w (it is read once, by root, and copied to %s for the daemon to present)", cfg.TokenFile, err, cfg.stagedJoinTokenPath())
 	}
 	// The mode BEFORE the bytes are trusted: a credential this Mac should not
 	// have accepted is refused before anything below parses raw.
@@ -265,6 +275,16 @@ func operatorJoinToken(sys System, cfg Config) (string, bootstrap.Token, error) 
 	// and the token is not: pkg/bootstrap's errors describe the STRUCTURE that
 	// is missing (the K10 prefix, the `::`, the user:secret) and never the
 	// value, which is what makes it safe to put in front of an operator.
+	if cfg.serverJoining() {
+		// A server joins with the SERVER-class token only: it is what the
+		// existing server's CA-bundle and etcd member routes accept, and a
+		// worker's token here would install a daemon refused at every start.
+		tok, err := bootstrap.ParseServerToken(token)
+		if err != nil {
+			return "", bootstrap.Token{}, fmt.Errorf("install: the contents of the token file %s are not a k3sm server token (%v): --server-join needs `K10<cluster-CA hash>::server:<secret>`, exactly as `k3sm token create --server` prints it on an existing server", cfg.TokenFile, err)
+		}
+		return token, tok, nil
+	}
 	tok, err := bootstrap.ParseToken(token)
 	if err != nil {
 		return "", bootstrap.Token{}, fmt.Errorf("install: the contents of the join token file %s are not a k3sm join token (%v): a join token is `K10<cluster-CA hash>::<user>:<secret>`, exactly as `k3sm token create` prints it on the server — mint a fresh one rather than editing this file", cfg.TokenFile, err)

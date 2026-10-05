@@ -89,13 +89,7 @@ func (s encryptionStore) WriteFile(path string, contents []byte) error {
 // the embedded-etcd HA posture — --cluster-init or --server-join, in any spelling
 // (single or double dash, bare or =true; an explicit =false does not count).
 func carriesEtcdPosture(args []string) bool {
-	for _, a := range args {
-		name, value, inline := splitFlag(a)
-		if (name == clusterInitFlag || name == serverJoinFlag) && (!inline || value != "false") {
-			return true
-		}
-	}
-	return false
+	return boolFlagSet(args, clusterInitFlag) || boolFlagSet(args, serverJoinFlag)
 }
 
 // preflightSecretsEncryption decides what this install does with the secrets

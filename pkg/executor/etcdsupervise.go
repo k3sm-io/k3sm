@@ -632,7 +632,7 @@ func (s *Supervised) afterEtcdQuorum(ctx context.Context, m etcdMembers) EtcdSta
 
 // EtcdPeerURLDriftRemedy is the fix named when a member's registered peer URL no
 // longer matches its node IP.
-const EtcdPeerURLDriftRemedy = "server node IPs must be stable (a DHCP reservation): restore the previous --node-ip, or remove this member through another server and re-join it with a wiped etcd data dir"
+const EtcdPeerURLDriftRemedy = "server node IPs must be stable (a DHCP reservation): restore the previous etcd peer address (--etcd-peer-ip), or remove this member through another server and re-join it with a wiped etcd data dir"
 
 // collectEtcdStatus reads the local member, the member list and the alarms into a
 // status record. Fields it cannot read stay zero.

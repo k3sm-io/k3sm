@@ -101,7 +101,7 @@ func TestSecretsEncryptionRefusedWithClusterInit(t *testing.T) {
 		cfg := testConfig(t)
 		cfg.SecretsEncryption = true
 		cfg.KeyEntropy = placeholderEntropy()
-		configureServerArgs(f, cfg, "--cluster-init", "--node-ip", "192.0.2.10")
+		configureServerArgs(f, cfg, "--cluster-init", "--etcd-peer-ip", "192.0.2.10")
 		err := Install(context.Background(), f, cfg)
 		if !errors.Is(err, executor.ErrEncryptionHA) {
 			t.Fatalf("Install = %v, want ErrEncryptionHA", err)
@@ -114,7 +114,7 @@ func TestSecretsEncryptionRefusedWithClusterInit(t *testing.T) {
 	t.Run("the role flags reach the daemon verbatim", func(t *testing.T) {
 		f := &fakeSystem{}
 		cfg := testConfig(t)
-		want := []string{"--cluster-init", "--node-ip", "192.0.2.10", "--mesh-ip", "198.51.100.10"}
+		want := []string{"--cluster-init", "--etcd-peer-ip", "192.0.2.10", "--mesh-ip", "100.64.0.1"}
 		configureServerArgs(f, cfg, want...)
 		if err := Install(context.Background(), f, cfg); err != nil {
 			t.Fatalf("Install: %v", err)

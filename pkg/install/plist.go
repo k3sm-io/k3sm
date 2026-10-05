@@ -98,12 +98,22 @@ func plistContent(label string, cfg Config) ([]byte, error) {
 // every <1024 bind denied for the daemon's whole life, and on a Mac that was
 // once a server the file still exists and is a STALE credential.
 //
-// It deliberately passes NO --node-pod-cidr on either role. The node's pod /24
-// is not knowable at install time — it is decided by the join — so netd starts
-// on the flag's own pre-adoption default and adopts the real prefix from the
-// agent's ConfigureMesh RPC. Writing the install-time value into the launchd job
-// would pin a guess that the next netd restart comes back on, dropping every pod
-// alias and route the adopted prefix had established. It passes no --node-ip for
+// A worker gets NO --node-pod-cidr. Its pod /24 is not knowable at install
+// time — it is decided by the join — so netd starts on the flag's own
+// pre-adoption default and adopts the real prefix from the agent's ConfigureMesh
+// RPC. Writing an install-time value into a worker's launchd job would pin a
+// guess that the next netd restart comes back on, dropping every pod alias and
+// route the adopted prefix had established.
+//
+// A control-plane server with a --mesh-ip is the one case where the /24 IS
+// knowable at install time, and must be: the server plumbs its mesh address as
+// an lo0 alias before control-plane bring-up and before its own enrol, and netd
+// admits an alias only inside the node /24 it holds then. So the server's netd
+// is handed the /24 its --mesh-ip is the mesh-egress address of
+// (MeshNodePodCIDR). Without it a server whose /24 is not the default — every
+// control-plane Mac after the first — is refused its own mesh address and
+// crash-loops. A server without a --mesh-ip renders none: the default is its
+// range. It passes no --node-ip for
 // the separate reason TestNetdPlistXML records (the node-address authorizer
 // branch is dormant by configuration).
 func NetdPlist(cfg Config) []byte {
@@ -112,19 +122,23 @@ func NetdPlist(cfg Config) []byte {
 	if cfg.Role == RoleAgent {
 		kubeconfig = AgentCredentialPath(cfg.DataRoot)
 	}
+	args := []string{
+		cfg.installedBinary(), "netd",
+		"--socket", cfg.NetdSocket,
+		"--service-cidr", cfg.ServiceCIDR,
+		"--mesh-key-dir", MeshKeyDir,
+		"--kubeconfig", kubeconfig,
+	}
+	if cidr := cfg.netdNodePodCIDR(); cidr != "" {
+		args = append(args, "--node-pod-cidr", cidr)
+	}
 	return renderPlist(launchdPlist{
-		Label: NetdLabel,
-		ProgramArguments: []string{
-			cfg.installedBinary(), "netd",
-			"--socket", cfg.NetdSocket,
-			"--service-cidr", cfg.ServiceCIDR,
-			"--mesh-key-dir", MeshKeyDir,
-			"--kubeconfig", kubeconfig,
-		},
-		RunAtLoad:  true,
-		KeepAlive:  true,
-		StdoutPath: NetdLogPath(),
-		StderrPath: NetdLogPath(),
+		Label:            NetdLabel,
+		ProgramArguments: args,
+		RunAtLoad:        true,
+		KeepAlive:        true,
+		StdoutPath:       NetdLogPath(),
+		StderrPath:       NetdLogPath(),
 		// No UserName: netd is root.
 	})
 }
@@ -199,8 +213,10 @@ func ServerPlist(cfg Config) []byte {
 		// system:masters, so a copy of it on a world-readable argv is a copy of
 		// cluster-admin. Install writes the file (serverTokenPath, 0600, owned by
 		// the service user) before this plist is laid down, and the server reads
-		// it once at start through the same reader the agent uses.
-		"--token-file", cfg.serverTokenPath(),
+		// it once at start through the same reader the agent uses. A joining HA
+		// server is pointed at its staged server-class join token instead (see
+		// serverDaemonTokenPath).
+		"--token-file", cfg.serverDaemonTokenPath(),
 	}
 	args = append(args, cfg.resolvedExtraServerArgs()...)
 	return renderPlist(launchdPlist{

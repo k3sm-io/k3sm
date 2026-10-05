@@ -121,7 +121,7 @@ func TestInstallAgentFlags(t *testing.T) {
 		// so the list would rot in silence. --mesh-ip is the one deliberate
 		// exception: it is listed ahead of the flag itself landing, so that the
 		// refusal is already right on the day it does.
-		for _, name := range append(append([]string{}, serverOnlyInstallFlags...), agentOnlyInstallFlags...) {
+		for _, name := range append(append([]string{}, serverOnlyInstallFlags...), "server", "token-file", "node-ip") {
 			if name == "mesh-ip" {
 				continue
 			}
@@ -132,7 +132,7 @@ func TestInstallAgentFlags(t *testing.T) {
 		}
 	})
 
-	t.Run("an agent-only flag without --agent is refused", func(t *testing.T) {
+	t.Run("a join flag on a server that joins nothing is refused", func(t *testing.T) {
 		for _, args := range [][]string{
 			{"--server", "192.0.2.10"},
 			{"--node-ip", "100.64.0.7"},

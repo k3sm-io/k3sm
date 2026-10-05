@@ -16,6 +16,9 @@
 # Legs:
 #   m6.0  both /readyz ok (incl. /readyz/etcd); TestM6_EtcdTwoVotingMembers sees 2
 #         started voting members and 0 learners from each server's own member.
+#   m6.M  the mesh: each server's MeshPeer is labelled net.k3sm.io/control-plane=true
+#         at the /24 its own --mesh-ip names; default/kubernetes lists both mesh IPs;
+#         both admin kubeconfigs answer from this host.
 #   m6.A  (a) TestM6_WriteOnAReadOnB  (b) TestM6_LeaderElectionSingleActive
 #         (c) TestM6_WatchStalenessSoak at its 20 s default
 #         (e) TestM6_SecondServerJoinsReconstructsCAs incl. the etcd CA pins.
@@ -29,7 +32,11 @@
 #         loop; every acknowledged write is present on both after it restarts.
 #   m6.D  stop A and B; `k3sm server --cluster-reset` on B (B's own daemon args, as the
 #         service user); B serves alone with all prior data; wipe A's etcd dir and
-#         re-join A through $K3SM_M6_REJOIN_A; back to 2 voting members.
+#         re-join A through $K3SM_M6_REJOIN_A; back to 2 voting members. Then A's
+#         MeshPeer is back at its pre-reset /24 with the SAME public key (the wipe
+#         removes only $WD/etcd, so A's mesh key file survives it), and B's member list
+#         carries the pre-reset etcd peer URLs (A's https://<A LAN ip>:2380, never a
+#         mesh address).
 #   m6.E  cold restart: stop both, start B first, after 5 min B must still be waiting
 #         (daemon running, not parked, no leader); then start A; both /readyz ok
 #         within 2 min.
@@ -44,12 +51,25 @@
 #   - on A, mint the SERVER-class token (it reconstructs every cluster CA, including
 #     the two etcd CAs; give it ONLY to a trusted control-plane Mac):
 #                sudo k3sm token create --server
-#   - server B:  sudo k3sm install --server-join --server <A LAN ip> --token <server-token> \
+#   - server B:  put the token in a root-only file, then
+#                sudo sh -c 'umask 077; cat > /var/root/k3sm-server-token'   # paste, Ctrl-D
+#                sudo k3sm install --server-join --server <A LAN ip> \
+#                  --token-file /var/root/k3sm-server-token \
 #                  --node-ip <B LAN ip> --mesh-ip <B mesh ip>
-#     (the etcd peers talk on the LAN node IPs; the mesh carries pod traffic only)
+#     (the etcd peers talk on the LAN addresses; the mesh carries pod traffic only.
+#     `k3sm install --node-ip` on a server is the etcd peer address and is rendered
+#     onto the daemon as `k3sm server --etcd-peer-ip`; each server's node advertises
+#     and lo0-aliases its --mesh-ip, never the LAN address. The install stages the
+#     token at <work-dir>/join-token for B's daemon, which reads it at every start;
+#     the root-only file is yours to delete afterwards)
 #   - this host: kubectl, curl and go (the e2e criteria run from this checkout); each server's HA admin kubeconfig (the CA-bearing
 #     <work-dir>/admin.kubeconfig, NOT the loopback token kubeconfig) as $KUBECONFIG
 #     (server A) and $K3SM_KUBECONFIG_B (server B).
+#   - THIS HOST IS SERVER B. Each admin kubeconfig targets its server's mesh-bound
+#     apiserver, reached over the wireguard mesh. m6.B stops A, which takes A's end of
+#     the mesh down with it, so a run host other than B would lose its path to B
+#     exactly when the legs need it. The preflight fails unless B's mesh IP (the
+#     server of $K3SM_KUBECONFIG_B) is an address of this host.
 #
 # Environment (under K3SM_LAB=1 every one marked required must be set, or the run FAILS):
 #   KUBECONFIG, K3SM_KUBECONFIG_B      required — server A's / server B's admin kubeconfig
@@ -62,8 +82,12 @@
 #   K3SM_M6_EVIDENCE_DIR               required — where every artifact and the log land
 #   K3SM_M6_REJOIN_A                   required by m6.D — a shell command run on THIS host
 #                                      that reinstalls server A as a joining server of B
-#                                      (--server-join --server <B LAN ip> --token <B's
-#                                      server token> ...); m6.D FAILS without it
+#                                      (sudo k3sm install --server-join --server <B LAN ip>
+#                                      --token-file <file holding B's server token>
+#                                      --node-ip <A LAN ip> --mesh-ip <A mesh ip>, run on
+#                                      A); m6.D runs it after removing A's etcd dir, which
+#                                      is what lets the install replace A's recorded
+#                                      --cluster-init; m6.D FAILS without it
 #   K3SM_M6_WORK_DIR                   server work dir (default /var/lib/k3sm/server)
 #   K3SM_M6_ETCD_CLIENT_PORT           etcd loopback client port (default 2379, --kine-port)
 #   K3SM_M6_ETCD_METRICS_PORT          etcd loopback metrics port (default 2381)
@@ -119,6 +143,13 @@ for var in KUBECONFIG K3SM_KUBECONFIG_B K3SM_M6_ON_A K3SM_M6_ON_B K3SM_M6_EVIDEN
 	if [ -z "${!var:-}" ]; then ladder no "m6.pre  \$$var is set"; missing=1; fi
 done
 [ "$missing" -eq 0 ] || finish
+# kube_host <kubeconfig>: the host of the kubeconfig's server URL (a mesh IP here).
+kube_host() { kubectl config view --kubeconfig "$1" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null | sed -E 's#^https?://##; s#:[0-9]+/?$##'; }
+MESH_A="$(kube_host "$KUBECONFIG")"; MESH_B="$(kube_host "$K3SM_KUBECONFIG_B")"
+if [ -z "$MESH_B" ] || ! ifconfig 2>/dev/null | grep -Eq "inet ${MESH_B//./\\.} "; then
+	ladder no "m6.pre  this host is server B (B's mesh IP ${MESH_B:-unknown} is not an address here; m6.B stops A and would cut a run host on A's side off from B)"
+	finish
+fi
 mkdir -p "$EV"
 LOG="$EV/m6.log"
 note "M6 lab run"
@@ -208,6 +239,32 @@ if run_conformance_slice "$REPO_ROOT" '^TestM6_EtcdTwoVotingMembers$' 300s "${cr
 else
 	ladder no "m6.0  TestM6_EtcdTwoVotingMembers: 2 started voting members, 0 learners, on both servers"
 fi
+
+# ── m6.M — each server's MeshPeer at its own /24, both apiservers advertised ────
+# mesh_cidr <mesh ip>: the /24 a server's --mesh-ip is the .1 of.
+mesh_cidr() { printf '%s.0/24' "${1%.*}"; }
+server_peers() { kA get meshpeers -l net.k3sm.io/control-plane=true -o jsonpath='{range .items[*]}{.spec.podCIDR}={.spec.publicKey}{"\n"}{end}' 2>/dev/null || true; }
+SERVER_PEERS="$(server_peers)"
+printf '%s\n' "$SERVER_PEERS" > "$EV/server-meshpeers.txt"
+if printf '%s\n' "$SERVER_PEERS" | grep -q "^$(mesh_cidr "$MESH_A")=" &&
+	printf '%s\n' "$SERVER_PEERS" | grep -q "^$(mesh_cidr "$MESH_B")=" &&
+	[ "$(printf '%s\n' "$SERVER_PEERS" | grep -c '=')" = 2 ]; then
+	ladder ok "m6.M  two MeshPeers labelled net.k3sm.io/control-plane=true, at $(mesh_cidr "$MESH_A") and $(mesh_cidr "$MESH_B")"
+else
+	ladder no "m6.M  two MeshPeers labelled net.k3sm.io/control-plane=true, at $(mesh_cidr "$MESH_A") and $(mesh_cidr "$MESH_B") (got: $(printf '%s' "$SERVER_PEERS" | sed 's/=.*//' | tr '\n' ' '))"
+fi
+EPS="$(kA get endpoints -n default kubernetes -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
+if printf ' %s ' "$EPS" | grep -q " $MESH_A " && printf ' %s ' "$EPS" | grep -q " $MESH_B "; then
+	ladder ok "m6.M  default/kubernetes lists both apiservers ($MESH_A, $MESH_B)"
+else
+	ladder no "m6.M  default/kubernetes lists both apiservers ($MESH_A, $MESH_B; got: ${EPS:-none})"
+fi
+if [ "$(kA get --raw /readyz 2>/dev/null || true)" = ok ] && [ "$(kB get --raw /readyz 2>/dev/null || true)" = ok ]; then
+	ladder ok "m6.M  both admin kubeconfigs answer from this host ($MESH_A, $MESH_B)"
+else
+	ladder no "m6.M  both admin kubeconfigs answer from this host ($MESH_A, $MESH_B)"
+fi
+A_PEER_BEFORE="$(printf '%s\n' "$SERVER_PEERS" | grep "^$(mesh_cidr "$MESH_A")=" || true)"
 
 # ── m6.A — replication, one active scheduler/KCM, read-after-write, bundle v2 ──
 if (unset K3SM_M6_SOAK_DURATION; run_conformance_slice "$REPO_ROOT" \
@@ -318,21 +375,29 @@ else
 fi
 
 # ── m6.D — reset: B alone keeps the data; A wiped and re-joined ─────────────────
+# peer_urls <member list json>: the sorted etcd peer URLs in it.
+peer_urls() { printf '%s' "$1" | grep -o '"peerURLs":\[[^]]*\]' | grep -o 'https://[^"]*' | sort -u; }
 if [ -z "${K3SM_M6_REJOIN_A:-}" ]; then
 	ladder no "m6.D  \$K3SM_M6_REJOIN_A is set (the command that re-installs A as a joining server of B)"
 else
+	PEER_URLS_BEFORE="$(peer_urls "$(member_list B 2>/dev/null || true)")"
 	remote A 'daemon_stop' || true
 	remote B 'daemon_stop' || true
 	# The reset runs B's own daemon arguments plus --cluster-reset, as the service
 	# user the daemon runs as, so every file it re-mints keeps the daemon's ownership.
+	# The daemon's work dir defaults to $HOME/server, and launchd gives it HOME and
+	# its WorkingDirectory from the plist, so the replay carries both, not only
+	# ProgramArguments, or the reset opens a work dir under the caller's home.
 	if remote B '
-cd /
+home="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:HOME" "$PLIST" 2>/dev/null || true)"
+wdir="$(/usr/libexec/PlistBuddy -c "Print :WorkingDirectory" "$PLIST" 2>/dev/null || echo /)"
+cd "$wdir" || exit 1
 i=0; set --
 while v="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:$i" "$PLIST" 2>/dev/null)"; do set -- "$@" "$v"; i=$((i+1)); done
 [ "$#" -ge 2 ] && [ "$2" = server ] || { echo "unexpected ProgramArguments in $PLIST" >&2; exit 1; }
 bin=$1; shift 2
 user="$(/usr/libexec/PlistBuddy -c "Print :UserName" "$PLIST" 2>/dev/null || echo root)"
-sudo -u "$user" "$bin" server --cluster-reset "$@"' >> "$LOG" 2>&1; then
+sudo -u "$user" env HOME="${home:-$HOME}" "$bin" server --cluster-reset "$@"' >> "$LOG" 2>&1; then
 		ladder ok "m6.D  k3sm server --cluster-reset on B exited 0"
 	else
 		ladder no "m6.D  k3sm server --cluster-reset on B exited 0"
@@ -351,6 +416,23 @@ sudo -u "$user" "$bin" server --cluster-reset "$@"' >> "$LOG" 2>&1; then
 		ladder no "m6.D  A wiped and re-joined through B: 2 voting members, both /readyz ok"
 	fi
 	member_list B > "$EV/members-after-reset-B.json" || true
+	# A rejoined with its mesh key file intact (the wipe above removes only
+	# $WD/etcd), so its reservation re-asserts the same row: same /24, same key.
+	# shellcheck disable=SC2329  # invoked through await
+	a_peer_back() { [ -n "$A_PEER_BEFORE" ] && server_peers | grep -qxF "$A_PEER_BEFORE"; }
+	if await 120 a_peer_back; then
+		ladder ok "m6.D  A's MeshPeer is back at $(mesh_cidr "$MESH_A") with its pre-reset public key"
+	else
+		ladder no "m6.D  A's MeshPeer is back at $(mesh_cidr "$MESH_A") with its pre-reset public key (now: $(server_peers | grep "^$(mesh_cidr "$MESH_A")=" || echo none))"
+	fi
+	PEER_URLS_AFTER="$(peer_urls "$(cat "$EV/members-after-reset-B.json" 2>/dev/null || true)")"
+	note "m6.D etcd peer URLs before: $(printf '%s' "$PEER_URLS_BEFORE" | tr '\n' ' ') after: $(printf '%s' "$PEER_URLS_AFTER" | tr '\n' ' ')"
+	if [ -n "$PEER_URLS_BEFORE" ] && [ "$PEER_URLS_AFTER" = "$PEER_URLS_BEFORE" ] &&
+		! printf '%s\n' "$PEER_URLS_AFTER" | grep -Eq '^https://100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'; then
+		ladder ok "m6.D  B's member list carries the pre-reset peer URLs, A's on its LAN address, none on the mesh"
+	else
+		ladder no "m6.D  B's member list carries the pre-reset peer URLs, A's on its LAN address, none on the mesh"
+	fi
 fi
 
 # ── m6.E — cold restart, B first ─────────────────────────────────────────────
@@ -358,7 +440,10 @@ remote A 'daemon_stop' || true
 remote B 'daemon_stop' || true
 remote B 'daemon_start' >/dev/null 2>&1 || true
 sleep 300
-if remote B 'daemon_running && ! crash_record_tripped && etcd_api /v3/maintenance/status "{}" | grep -q "\"header\"" && ! etcd_api /v3/maintenance/status "{}" | grep -q "\"leader\":\"[1-9]"'; then
+# etcd serves client requests only after the member publishes itself through raft,
+# which needs quorum, so on a cold start alone its client port answers nothing; the
+# metrics listener is separate and reports the waiting state directly.
+if remote B 'daemon_running && ! crash_record_tripped && curl -s --max-time 5 "http://127.0.0.1:$MP/metrics" | grep -qx "etcd_server_has_leader 0" && curl -s --max-time 5 "http://127.0.0.1:$MP/health" | grep -q "RAFT NO LEADER"'; then
 	ladder ok "m6.E  B started alone: after 5 min its daemon still runs, unparked, waiting for quorum (no leader)"
 else
 	ladder no "m6.E  B started alone: after 5 min its daemon still runs, unparked, waiting for quorum (no leader)"

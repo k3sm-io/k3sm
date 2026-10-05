@@ -22,7 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"k3sm.io/k3sm/internal/atomicfile"
 )
 
 // Server-class bootstrap identity — DISTINCT from the worker BootstrapUser (token.go).
@@ -53,6 +56,9 @@ var (
 	// ErrServerTokenMismatch is returned when a server token's secret does not match
 	// the server-bootstrap secret (constant-time compare).
 	ErrServerTokenMismatch = errors.New("bootstrap: server token secret mismatch")
+	// ErrServerSecretMismatch is returned when a joining server already holds a
+	// server-bootstrap secret different from the one its server token carries.
+	ErrServerSecretMismatch = errors.New("bootstrap: the recorded server-bootstrap secret differs from the server token's")
 )
 
 // FormatServerToken renders the server join token K10<caHash>::server:<secret>. caHash
@@ -102,15 +108,64 @@ func LoadOrCreateServerSecret(path string) (string, error) {
 	return secret, nil
 }
 
-// SaveServerSecret persists secret at path (0600). A joining server records the
-// operator-provided secret (carried in its server token) so its OWN CA-bundle endpoint
-// can seal + serve once it is an equal control-plane member.
-func SaveServerSecret(path, secret string) error {
+// EnsureServerSecret records the server-bootstrap secret a joining server received in
+// its server token, so its OWN CA-bundle endpoint can seal + serve once it is an equal
+// control-plane member. It is idempotent across restarts and never replaces a secret:
+//
+//   - any temp file a killed earlier write left beside path is removed first
+//     (atomicfile.ReapOrphans);
+//   - path absent: the secret is written through atomicfile.WriteNew (0600), bare, with
+//     no trailing newline;
+//   - path present: it must be a regular file (a symlink or anything else is an error
+//     naming path), and its trimmed content is compared with secret in constant time; a
+//     difference is ErrServerSecretMismatch (the server was joined with another token,
+//     and silently re-keying its bundle would break every peer that holds the old one).
+//
+// The secret itself never appears in an error.
+func EnsureServerSecret(path, secret string) error {
 	if secret == "" {
-		return errors.New("bootstrap: save server-bootstrap secret: empty secret")
+		return errors.New("bootstrap: record server-bootstrap secret: empty secret")
 	}
-	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
-		return fmt.Errorf("persist server-bootstrap secret: %w", err)
+	if err := atomicfile.ReapOrphans(filepath.Dir(path), filepath.Base(path)); err != nil {
+		return fmt.Errorf("record server-bootstrap secret: %w", err)
+	}
+	err := checkServerSecret(path, secret)
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := atomicfile.WriteNew(path, []byte(secret), 0o600); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("persist server-bootstrap secret: %w", err)
+		}
+		// Another writer won the link; the file now exists, so check against it.
+		return checkServerSecret(path, secret)
+	}
+	return nil
+}
+
+// checkServerSecret verifies the secret recorded at path against secret: nil on a
+// constant-time match, ErrServerSecretMismatch (wrapped with path and the remedy) on a
+// difference, an error naming path when it is not a regular file, and an error
+// satisfying errors.Is(err, os.ErrNotExist) when it is absent.
+func checkServerSecret(path, secret string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return fmt.Errorf("stat server-bootstrap secret %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("bootstrap: server-bootstrap secret %s is not a regular file", path)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read server-bootstrap secret %s: %w", path, err)
+	}
+	stored := strings.TrimSpace(string(b))
+	if subtle.ConstantTimeCompare([]byte(stored), []byte(secret)) != 1 {
+		return fmt.Errorf("%w: recorded at %s; remove it only after confirming the token is the one this cluster's servers share",
+			ErrServerSecretMismatch, path)
 	}
 	return nil
 }

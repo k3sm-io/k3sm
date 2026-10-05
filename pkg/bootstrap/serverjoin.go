@@ -35,8 +35,8 @@ type ServerJoinOptions struct {
 	// Token is the K10<caHash>::server:<secret> server token: its CA hash PINS the
 	// existing server's TLS chain, and its secret is the bundle's KDF passphrase.
 	Token string
-	// WorkDir is this joining server's work dir; the reconstructed CA PEMs are written
-	// under its PKI dir.
+	// WorkDir is this joining server's work dir; the reconstructed CA PEMs missing
+	// from its PKI dir are installed there.
 	WorkDir string
 	// HTTPClient overrides the default pinned-CA client (tests inject one). When nil,
 	// the fetch builds a client that verifies the server's chain against the token's CA
@@ -83,12 +83,16 @@ func FetchCABundle(ctx context.Context, serverURL, token string, client *http.Cl
 
 // ImportCABundle is the FAIL-CLOSED HA server-join import: fetch the sealed bundle,
 // decrypt + authenticate it with the server token's secret (the KDF passphrase), decode
-// the four CA keypairs (cluster, signing, etcd server, etcd peer), and write them into
-// the work dir's PKI dir — so a subsequent certs.EnsureHierarchy / certs.EnsureEtcdCAs
-// LOADS the IDENTICAL CAs instead of minting fresh, divergent ones. EVERY failure (fetch, GCM tag/decrypt, decode, write) returns
-// an error and leaves NO CA material written (the bytes are written only after a
-// successful unseal + decode). The caller MUST treat an error as fatal and NEVER fall
-// through to minting a self-signed divergent CA — that would split cluster trust.
+// the four CA keypairs (cluster, signing, etcd server, etcd peer), and reconcile them
+// into the work dir's PKI dir (certs.ReconcileImportedHierarchy) — so a subsequent
+// certs.EnsureHierarchy / certs.EnsureEtcdCAs LOADS the IDENTICAL CAs instead of
+// minting fresh, divergent ones. Only CAs absent from disk are installed; a CA already
+// present is never replaced, and one whose pin differs from the bundle's fails the
+// whole import with certs.ErrHierarchyDiverged. A fetch, GCM tag/decrypt or decode
+// failure, or a divergence, leaves NO CA material written (nothing is written before a
+// successful unseal + decode + pin check). The caller MUST treat an error as fatal and
+// NEVER fall through to minting a self-signed divergent CA — that would split cluster
+// trust.
 func ImportCABundle(ctx context.Context, opts ServerJoinOptions) error {
 	tok, err := ParseServerToken(opts.Token)
 	if err != nil {
@@ -106,8 +110,8 @@ func ImportCABundle(ctx context.Context, opts ServerJoinOptions) error {
 	if err := h.Unmarshal(plaintext); err != nil {
 		return fmt.Errorf("decode reconstructed CA hierarchy: %w", err)
 	}
-	if err := certs.WriteHierarchy(opts.WorkDir, &h); err != nil {
-		return fmt.Errorf("write reconstructed CA hierarchy: %w", err)
+	if err := certs.ReconcileImportedHierarchy(opts.WorkDir, &h); err != nil {
+		return fmt.Errorf("reconcile reconstructed CA hierarchy: %w", err)
 	}
 	return nil
 }

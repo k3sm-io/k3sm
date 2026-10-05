@@ -19,14 +19,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
 
@@ -218,15 +223,106 @@ func TestMeshEnrollerCreatesAndRejoinsUnchanged(t *testing.T) {
 
 // meshPeerAPIStub is an in-memory stand-in for the apiserver's meshpeers REST
 // surface: list, create (409 on a duplicate), get by name, update, and delete
-// (404 when absent — the shape ReleaseAllocation's idempotence reads).
+// (404 when absent — the shape ReleaseAllocation's idempotence reads). It also
+// serves the range claims (kube-system Leases) with the one property they exist
+// for: a create of a name that exists answers AlreadyExists, atomically, under the
+// same mutex every request takes — so two enrollers on one stub contend exactly as
+// two servers contend on one apiserver.
 type meshPeerAPIStub struct {
 	mu                        sync.Mutex
 	peers                     map[string]*netv1.MeshPeer
+	leases                    map[string]*coordinationv1.Lease
 	creates, updates, deletes int
+	rv                        int
 }
 
 func newMeshPeerAPIStub() *meshPeerAPIStub {
-	return &meshPeerAPIStub{peers: map[string]*netv1.MeshPeer{}}
+	return &meshPeerAPIStub{peers: map[string]*netv1.MeshPeer{}, leases: map[string]*coordinationv1.Lease{}}
+}
+
+// lease returns the stored claim object, or nil.
+func (s *meshPeerAPIStub) lease(name string) *coordinationv1.Lease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leases[name]
+}
+
+// leaseCount and peerCount read the stub's sizes under its lock.
+func (s *meshPeerAPIStub) leaseCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.leases)
+}
+
+func (s *meshPeerAPIStub) peerCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.peers)
+}
+
+// leaseAPIPath is the collection path of the range claims.
+var leaseAPIPath = "/apis/coordination.k8s.io/v1/namespaces/" + meshRangeClaimNamespace + "/leases"
+
+// serveLeases is the claim half of the stub. The caller holds s.mu.
+func (s *meshPeerAPIStub) serveLeases(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, leaseAPIPath), "/")
+	switch {
+	case r.Method == http.MethodGet && name == "":
+		list := coordinationv1.LeaseList{TypeMeta: metav1.TypeMeta{APIVersion: "coordination.k8s.io/v1", Kind: "LeaseList"}}
+		for _, l := range s.leases {
+			list.Items = append(list.Items, *l)
+		}
+		writeJSON(w, http.StatusOK, list)
+	case r.Method == http.MethodGet:
+		l, ok := s.leases[name]
+		if !ok {
+			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, l)
+	case r.Method == http.MethodPost:
+		// The clientset speaks protobuf for built-in types; the universal
+		// deserializer reads either encoding.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest)
+			return
+		}
+		var in coordinationv1.Lease
+		if _, _, err := clientscheme.Codecs.UniversalDeserializer().Decode(body, nil, &in); err != nil {
+			writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest)
+			return
+		}
+		if _, exists := s.leases[in.Name]; exists {
+			writeStatus(w, http.StatusConflict, metav1.StatusReasonAlreadyExists)
+			return
+		}
+		s.rv++
+		in.ResourceVersion = strconv.Itoa(s.rv)
+		in.UID = types.UID("lease-" + in.ResourceVersion)
+		s.leases[in.Name] = &in
+		writeJSON(w, http.StatusCreated, &in)
+	case r.Method == http.MethodDelete:
+		cur, ok := s.leases[name]
+		if !ok {
+			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound)
+			return
+		}
+		var opts metav1.DeleteOptions
+		if body, err := io.ReadAll(r.Body); err == nil && len(body) > 0 {
+			_, _, _ = clientscheme.Codecs.UniversalDeserializer().Decode(body, nil, &opts)
+		}
+		if pre := opts.Preconditions; pre != nil {
+			if (pre.ResourceVersion != nil && *pre.ResourceVersion != cur.ResourceVersion) || (pre.UID != nil && *pre.UID != cur.UID) {
+				writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict)
+				return
+			}
+		}
+		delete(s.leases, name)
+		writeStatus(w, http.StatusOK, metav1.StatusReasonUnknown)
+	default:
+		writeStatus(w, http.StatusMethodNotAllowed, metav1.StatusReasonMethodNotAllowed)
+	}
 }
 
 func (s *meshPeerAPIStub) peer(name string) *netv1.MeshPeer {
@@ -243,6 +339,10 @@ func (s *meshPeerAPIStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if strings.HasPrefix(r.URL.Path, leaseAPIPath) {
+		s.serveLeases(w, r)
+		return
+	}
 	name := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, meshPeerAPIPath), "/")
 	switch {
 	case r.Method == http.MethodGet && name == "":

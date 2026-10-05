@@ -52,8 +52,8 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 		var promoted []string
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return false },
-			member: func(_ context.Context, name, peerURL string) (bootstrap.EtcdMemberResponse, error) {
-				order = append(order, "member "+name+" "+peerURL)
+			member: func(_ context.Context, req bootstrap.EtcdMemberRequest) (bootstrap.EtcdMemberResponse, error) {
+				order = append(order, "member "+req.Name+" "+req.PeerURL)
 				return bootstrap.EtcdMemberResponse{MemberID: 0xb, InitialCluster: "server-a=https://192.0.2.10:2380,server-b=https://192.0.2.11:2380"}, nil
 			},
 			promote: func(_ context.Context, name string) error {
@@ -86,7 +86,7 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 		var promoted []string
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return true },
-			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+			member: func(context.Context, bootstrap.EtcdMemberRequest) (bootstrap.EtcdMemberResponse, error) {
 				t.Fatal("the member route was called on a restart")
 				return bootstrap.EtcdMemberResponse{}, nil
 			},
@@ -140,7 +140,7 @@ func TestServerJoinMemberRouteBeforeExecutor(t *testing.T) {
 		// in-process (TestEtcdMemberRouteRetryAndPermanence).
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return false },
-			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+			member: func(context.Context, bootstrap.EtcdMemberRequest) (bootstrap.EtcdMemberResponse, error) {
 				return bootstrap.EtcdMemberResponse{}, &bootstrap.ServerRouteError{Path: bootstrap.EtcdMemberPath,
 					StatusCode: http.StatusForbidden, Status: "403 Forbidden", Message: "server bootstrap token rejected"}
 			},
@@ -242,7 +242,7 @@ func TestEtcdMemberRouteRetryAndPermanence(t *testing.T) {
 		var waits []time.Duration
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return false },
-			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+			member: func(context.Context, bootstrap.EtcdMemberRequest) (bootstrap.EtcdMemberResponse, error) {
 				err := answers[calls]
 				calls++
 				if err != nil {
@@ -273,7 +273,7 @@ func TestEtcdMemberRouteRetryAndPermanence(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		j := &serverEtcdJoin{
 			memberExists: func() bool { return false },
-			member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+			member: func(context.Context, bootstrap.EtcdMemberRequest) (bootstrap.EtcdMemberResponse, error) {
 				return bootstrap.EtcdMemberResponse{}, routeErr(http.StatusServiceUnavailable)
 			},
 			wait: func(context.Context, time.Duration) error { cancel(); return context.Canceled },
@@ -303,7 +303,7 @@ func TestEtcdMemberRouteRetryAndPermanence(t *testing.T) {
 			calls := 0
 			j := &serverEtcdJoin{
 				memberExists: func() bool { return false },
-				member: func(context.Context, string, string) (bootstrap.EtcdMemberResponse, error) {
+				member: func(context.Context, bootstrap.EtcdMemberRequest) (bootstrap.EtcdMemberResponse, error) {
 					calls++
 					return bootstrap.EtcdMemberResponse{}, tc.err
 				},
