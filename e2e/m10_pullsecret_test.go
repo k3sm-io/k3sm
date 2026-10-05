@@ -50,7 +50,7 @@ import (
 // the resolved credential lands in none of the places a pod can expose it.
 //
 // THE REGISTRY. An in-process go-containerregistry registry behind HTTP basic
-// auth (authregistry.go), started by the test on 127.0.0.1:<random port> over
+// auth (authregistry_fixture_test.go), started by the test on 127.0.0.1:<random port> over
 // plain HTTP. runtimed's puller fetches with go-containerregistry, which infers
 // http for a loopback authority (runtimed pkg/image primaryFetch routes a
 // loopback reference through the ordinary fetcher for exactly that reason), so
@@ -58,6 +58,24 @@ import (
 // that the pod must run on the SAME Mac as the test process: the pod is pinned
 // with nodeName, and the test refuses to run against a node none of whose
 // InternalIPs is an address of this host.
+//
+// WHICH FETCH PATH THIS EXERCISES. A loopback plain-HTTP registry is the class
+// runtimed treats as this node's own ingest registry (the class its cluster
+// mirror fallback is defined over), NOT an HTTPS remote registry such as a
+// cloud or self-hosted TLS registry. The credential attachment is the same
+// code either way (image.RemoteFetch with remote.WithAuth), and the unit tier
+// proves it for this registry: TestAuthRegistryFixture's RemoteFetch subtest
+// pulls with the docker-config credential and is refused without it. An HTTPS
+// registry with a node-trusted CA is not covered here.
+//
+// MIRRORS. On a node with cluster mirrors wired, a failed pull of a loopback
+// reference can be retried against the mirrors (runtimed pullFromMirrors). A
+// 401 is not mirror-eligible today (mirrorFallbackEligible classes an auth
+// refusal as a definitive answer), but should that change, the negative
+// control's waiting message could name a mirror's answer instead of the
+// registry's. The control stays sound either way, because it does not rest on
+// the message: it requires the registry to have refused an anonymous manifest
+// request (refused > 0) and to have served nothing for that tag (served == 0).
 //
 // THE IMAGE. A stdlib Go program (testdata/cmd/pullprobe) built for
 // darwin/arm64 at test time and packaged by pkg/oci, the packager behind
@@ -82,9 +100,18 @@ import (
 //     rootfs: the tree belongs to the node's runtime data root, which the test
 //     process has no right to read.
 //
-// Not covered: files the node keeps outside the pod rootfs (runtimed's own
-// state and image store), which the M2.6 unit tests for the pull path cover
-// (the credential is confined to the fetch transport and never written).
+// Not covered, stated rather than scanned:
+//
+//   - files the node keeps outside the pod rootfs (runtimed's own state and
+//     image store), which the M2.6 unit tests for the pull path cover (the
+//     credential is confined to the fetch transport and never written);
+//   - the k3sm server, provider and runtimed daemon logs, which the test
+//     neither locates nor reads (where they land depends on how the node was
+//     installed, and runtimed's are root-owned);
+//   - the pod process's argv as the kernel holds it. The args the pod spec
+//     carries are searched (above); the exec'd argv is not read back, though
+//     the runtime builds it from that spec and the image config, neither of
+//     which carries the credential.
 //
 // RUN IT (on the node's own Mac):
 //
@@ -240,6 +267,15 @@ func TestM10_ImagePullSecret(t *testing.T) {
 	}
 	if m := regexp.MustCompile(`B80-SCAN files=(\d+)`).FindStringSubmatch(out); m == nil || m[1] == "0" {
 		t.Fatalf("the in-pod rootfs scan read no file, so it proves nothing:\n%s", out)
+	}
+	// Every file under the rootfs must have been READ, not passed over: a file
+	// the probe could not open, or one over its 64 MiB per-file bound, is a
+	// file whose content was never searched. The fixture image holds one file,
+	// the probe binary (a few MiB), so a nonzero count means the pod's tree
+	// holds something the scan could not vouch for, which fails the criterion.
+	if m := regexp.MustCompile(`B80-SCAN files=\d+ bytes=\d+ skipped=(\d+)`).FindStringSubmatch(out); m == nil || m[1] != "0" ||
+		strings.Contains(out, "B80-UNREADABLE") || strings.Contains(out, "B80-SKIPPED") {
+		t.Fatalf("the in-pod rootfs scan skipped or could not read some files, so their content is unsearched:\n%s", out)
 	}
 	t.Logf("in-pod confidentiality scan:\n%s", out)
 	assertNoCredential(t, "container log", out, forbidden)

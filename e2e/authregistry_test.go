@@ -205,6 +205,10 @@ func TestAuthRegistryFixture(t *testing.T) {
 	// the real plain-HTTP listener does, so a successful fetch here is the
 	// https-then-http fallback the node's pull takes.
 	t.Run("runtimed RemoteFetch pulls with the credential and is refused without", func(t *testing.T) {
+		// remote.DefaultTransport is package-global state shared by every test
+		// in this binary: while the swap is live, no test in package e2e may
+		// run in parallel (t.Parallel()) or it could pull through this
+		// in-memory registry, or race the restore.
 		saved := remote.DefaultTransport
 		t.Cleanup(func() { remote.DefaultTransport = saved })
 		var (
@@ -291,7 +295,11 @@ func TestAuthRegistryFixture(t *testing.T) {
 		if !ok || len(cfg.Auths) != 1 {
 			t.Fatalf("auths %v, want exactly %s", cfg.Auths, reg.Host)
 		}
-		if e.Username != user || e.Password != pass || e.Auth != "dGVzdHVzZXI6dGVzdHBhc3M=" {
+		token := basicAuthToken(user, pass)
+		if token == "" {
+			t.Fatalf("basicAuthToken returned an empty token")
+		}
+		if e.Username != user || e.Password != pass || e.Auth != token {
 			t.Fatalf("entry %+v does not carry %s/%s", e, user, pass)
 		}
 	})
