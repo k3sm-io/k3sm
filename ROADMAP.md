@@ -61,9 +61,16 @@ release engineering. What ships:
   buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
   k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
   the remaining packaging work.
-- **HA control plane.** A multi-server control plane is not available in v0.1.6. The
-  external-datastore path (kine to Postgres) was removed, and embedded etcd lands first in a later
-  release. Single-node installs keep the SQLite-backed datastore.
+- **HA control plane (experimental).** Since v0.1.7 two Macs can share the control plane on
+  embedded etcd: `k3sm install --cluster-init` on the first server and `k3sm install
+  --server-join` on the second, each server's pod range coming from its `--mesh-ip`. Two servers
+  tolerate no failures, workers stay attached to the server they joined through, and a leader
+  lease lost to quorum loss is still counted as a crash. The external-datastore path (kine to
+  Postgres) was removed in v0.1.6, and single-node installs keep the SQLite-backed datastore.
+- **v0.1.7.** A `vm` Pod answers on its pod IP from every node: its node holds the address and
+  relays each TCP connection on the Pod's declared and Service-targeted ports to the guest, so
+  Services reach `vm` Pods across nodes. The experimental two-server control plane above ships in
+  this release.
 - **v0.1.6.** Hosts survive heavy pod-network traffic: TCP connections on the pod network have
   their segment size lowered after connect, and a torn-down pod's address is blackholed, so an open
   connection fails cleanly instead of re-routing onto the mesh interface and triggering a macOS
