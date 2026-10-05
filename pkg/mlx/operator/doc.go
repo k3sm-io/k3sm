@@ -67,12 +67,25 @@ limitations under the License.
 //     The status write is skipped when nothing changed, so an idle model does not
 //     generate a write per resync.
 //
+// # Sharded models
+//
+// A model with spec.distributed takes a different path (sharded.go): its fit is
+// checked per rank, its ranks are placed over the direct-link graph (Place, a
+// pure function over a consumer-defined Topology), and it is served by one
+// operator-owned Pod per rank instead of a StatefulSet. Rank Pods are a GANG:
+// losing any one deletes the rest and re-places all of them, because MLX's
+// collective init blocks on every rank and a partial gang can never serve.
+// ShardsPlaced and LinksHealthy sit beside Ready, which needs every rank.
+//
 // # What this package deliberately does not do
 //
-// It does not delete anything. Every applied object carries a controller
+// It does not garbage-collect. Every applied object carries a controller
 // ownerReference to its MLXModel, so deleting the model cascades to the
 // StatefulSet, both Services, and — through the StatefulSet's own
 // whenDeleted: Delete retention policy — the per-replica cache volumes. A
-// reconcile that also deleted would be a second, racing deletion path with no
-// way to tell an orphan from an object the garbage collector has not reached yet.
+// reconcile that also deleted on model deletion would be a second, racing
+// deletion path with no way to tell an orphan from an object the garbage
+// collector has not reached yet. The deletions it does make are workload-shape
+// changes of a LIVE model: a gang restart deletes rank Pods, and switching a
+// model between single-node and sharded deletes the shape it no longer has.
 package operator
