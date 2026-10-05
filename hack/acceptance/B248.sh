@@ -53,8 +53,10 @@ b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
 [ -f "$K3SM_ROOT/pkg/datavol/seams.go" ] || b0=no
 [ -f "$K3SM_ROOT/cmd/k3sm/datavol.go" ] || b0=no
+[ -f "$K3SM_ROOT/pkg/install/plist.go" ] || b0=no
+[ -f "$K3SM_ROOT/pkg/install/manifest.go" ] || b0=no
 [ -f "$K3SM_ROOT/hack/acceptance/b248helper/main.go" ] || b0=no
-ladder "$b0" "b248.0  gate parses (bash -n) + pkg/datavol/seams.go + cmd/k3sm/datavol.go + b248helper present"
+ladder "$b0" "b248.0  gate parses (bash -n) + pkg/datavol/seams.go + cmd/k3sm/datavol.go + pkg/install/{plist,manifest}.go + b248helper present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "B248: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
@@ -67,8 +69,8 @@ fi
 # literal or a line lives rather than about a function's behaviour.
 w=ok
 grep -qE 'DatavolLabel[[:space:]]*=[[:space:]]*"io\.k3sm\.datavol"' "$K3SM_ROOT/pkg/install/install.go" || w=no
-grep -qE '^[[:space:]]*case DatavolLabel:' "$K3SM_ROOT/pkg/install/install.go" || w=no
-grep -q 'SuccessfulExit' "$K3SM_ROOT/pkg/install/install.go" || w=no
+grep -qE '^[[:space:]]*case DatavolLabel:' "$K3SM_ROOT/pkg/install/plist.go" || w=no
+grep -q 'SuccessfulExit' "$K3SM_ROOT/pkg/install/plist.go" || w=no
 ladder "$w" "b248.1  io.k3sm.datavol is a labelled daemon with a plistContent case and a KeepAlive SuccessfulExit dict"
 
 # The mount daemon must be TORN DOWN LAST and BROUGHT UP FIRST, which the
@@ -76,8 +78,8 @@ ladder "$w" "b248.1  io.k3sm.datavol is a labelled daemon with a plistContent ca
 # the server write, so a manifest that put netd first would unmount the volume
 # out from under the daemons still using it.
 o=ok
-dv_line="$(grep -nE 'label: DatavolLabel' "$K3SM_ROOT/pkg/install/install.go" | head -1 | cut -d: -f1)"
-nd_line="$(grep -nE 'label: NetdLabel' "$K3SM_ROOT/pkg/install/install.go" | head -1 | cut -d: -f1)"
+dv_line="$(grep -nE 'label: DatavolLabel' "$K3SM_ROOT/pkg/install/manifest.go" | head -1 | cut -d: -f1)"
+nd_line="$(grep -nE 'label: NetdLabel' "$K3SM_ROOT/pkg/install/manifest.go" | head -1 | cut -d: -f1)"
 if [ -z "$dv_line" ] || [ -z "$nd_line" ] || [ "$dv_line" -ge "$nd_line" ]; then o=no; fi
 ladder "$o" "b248.1  the datavol artifact precedes the netd artifact in artifactManifest (lines ${dv_line:-?} < ${nd_line:-?})"
 
@@ -594,7 +596,7 @@ print(d)' "$1"; }
 	# A field line, not the "// No UserName:" comment the template carries.
 	if printf '%s' "$dv_src" | grep -qE '^[[:space:]]*UserName:'; then echo "    DatavolPlist now names a UserName; the scratch plist runs as root"; l7=no; fi
 	grep -qE 'datavolThrottleSeconds[[:space:]]*=[[:space:]]*10$' "$K3SM_ROOT/pkg/install/datavol.go" || { echo "    datavolThrottleSeconds is no longer 10"; l7=no; }
-	grep -q '<key>KeepAlive</key>\\n  <dict>\\n    <key>SuccessfulExit</key>\\n    <false/>' "$K3SM_ROOT/pkg/install/install.go" || { echo "    renderPlist no longer writes the SuccessfulExit dict"; l7=no; }
+	grep -q '<key>KeepAlive</key>\\n  <dict>\\n    <key>SuccessfulExit</key>\\n    <false/>' "$K3SM_ROOT/pkg/install/plist.go" || { echo "    renderPlist no longer writes the SuccessfulExit dict"; l7=no; }
 	rendered="$(oneshot_plist "$REC_M")"
 	for frag in "<key>Label</key>|  <string>$ONESHOT_LABEL</string>" "<string>datavol</string>|    <string>mount</string>" \
 		"<key>RunAtLoad</key>|  <true/>" "<key>KeepAlive</key>|  <dict>|    <key>SuccessfulExit</key>|    <false/>|  </dict>" \

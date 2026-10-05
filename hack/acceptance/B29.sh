@@ -37,7 +37,8 @@
 # the provider taint.
 #
 # Knobs:
-#   K3SM_LAB=1           required; without it this gate FAILS (it never skips green)
+#   K3SM_LAB=1           required; with it unset the gate reports LAB-PENDING
+#                        and exits 3, which is not a pass and never 0
 #   B29_VM_IMAGE         leg 4's Linux image (default alpine:3.20, hack/lab/m11.sh's)
 #   B29_DEBUG_PROFILE    kubectl debug --profile (default general, kubectl's own;
 #                        use restricted on a cluster started with
@@ -103,8 +104,8 @@ finish() {
 }
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "$GATE_NAME gate: NOT RUN. It needs K3SM_LAB=1 and an installed node at \$KUBECONFIG; this is a failure, not a skip." >&2
-	exit 1
+	echo "$GATE_NAME gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
 	echo "KUBECONFIG must point at the RUNNING cluster this installed node belongs to (this gate boots nothing itself)" >&2
