@@ -210,6 +210,76 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		}
 	})
 
+	t.Run("the staged join token lives until uninstall or a role change", func(t *testing.T) {
+		joined := func(t *testing.T) (*fakeSystem, Config, string) {
+			t.Helper()
+			f := &fakeSystem{}
+			f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
+			cfg := testConfig(t)
+			join := cfg
+			join.ServerJoin, join.JoinServer, join.TokenFile, join.NodeIP = true, "192.0.2.10", operatorTokenFile, "192.0.2.20"
+			if err := Install(ctx, f, join); err != nil {
+				t.Fatalf("Install --server-join: %v", err)
+			}
+			staged := cfg.withDefaults().serverJoinTokenPath()
+			if _, ok := f.files[staged]; !ok {
+				t.Fatal("a --server-join install staged no join token")
+			}
+			return f, cfg, staged
+		}
+
+		t.Run("a plain reinstall keeps it", func(t *testing.T) {
+			f, cfg, staged := joined(t)
+			if err := Install(ctx, f, cfg); err != nil {
+				t.Fatalf("plain reinstall: %v", err)
+			}
+			if _, ok := f.files[staged]; !ok {
+				t.Error("a plain reinstall of a joined server removed the join token its daemon reads at every start")
+			}
+		})
+
+		t.Run("uninstall removes it", func(t *testing.T) {
+			f, cfg, staged := joined(t)
+			if err := Uninstall(ctx, f, cfg); err != nil {
+				t.Fatalf("Uninstall: %v", err)
+			}
+			if _, ok := f.files[staged]; ok {
+				t.Error("uninstall left the server-class join token behind")
+			}
+		})
+
+		t.Run("a node role change removes it, whichever role the uninstall names", func(t *testing.T) {
+			// A role change is an uninstall then an install of the other role.
+			// The uninstall reads the server plist off the disk and tears that
+			// role down too, so the token goes even from an agent-role Config.
+			f, cfg, staged := joined(t)
+			asAgent := cfg
+			asAgent.Role = RoleAgent
+			if err := Uninstall(ctx, f, asAgent); err != nil {
+				t.Fatalf("Uninstall: %v", err)
+			}
+			if _, ok := f.files[staged]; ok {
+				t.Error("the server join token survived the uninstall that precedes a role change")
+			}
+		})
+
+		t.Run("an etcd role change to --cluster-init removes it", func(t *testing.T) {
+			f, cfg, staged := joined(t)
+			init := cfg
+			init.ClusterInit, init.NodeIP = true, "192.0.2.20"
+			if err := Install(ctx, f, init); err != nil {
+				t.Fatalf("Install --cluster-init over a joined server with no member data: %v", err)
+			}
+			if _, ok := f.files[staged]; ok {
+				t.Error("the server join token survived the change to --cluster-init")
+			}
+			plist := string(f.files[cfg.withDefaults().plistPath(ServerLabel)])
+			if strings.Contains(plist, staged) {
+				t.Error("the --cluster-init server is still pointed at the join token")
+			}
+		})
+	})
+
 	t.Run("a hand-built Config is held to the same contract", func(t *testing.T) {
 		for _, tc := range []struct {
 			name string

@@ -247,3 +247,25 @@ func refuseEtcdRoleSwitch(cfg Config, carried []string) error {
 	return fmt.Errorf("%w: it was installed with --%s and its member data is in %s, so --%s would start that member under flags that describe a different cluster. Nothing has been written. To change its role: stop it (`sudo launchctl bootout system/%s`), make sure its member is no longer part of the cluster, remove %s (this discards this server's copy of the cluster data), then run this install again",
 		ErrEtcdRoleSwitch, had, dir, asked, ServerLabel, dir)
 }
+
+// retireStaleServerJoinToken removes the staged server join token when the
+// carried arguments named --server-join and the arguments this install renders
+// do not: the role change refuseEtcdRoleSwitch allows once the member data is
+// gone. Every other install leaves the file alone, so a joined server's plain
+// reinstall keeps the token its daemon reads at every start.
+func retireStaleServerJoinToken(sys System, cfg Config, carried []string) error {
+	if cfg.Role != RoleServer || !boolFlagSet(carried, serverJoinFlag) {
+		return nil
+	}
+	probe := cfg
+	probe.ExtraServerArgs = carried
+	if boolFlagSet(probe.resolvedExtraServerArgs(), serverJoinFlag) {
+		return nil
+	}
+	path := cfg.serverJoinTokenPath()
+	if err := sys.RemoveAll(path); err != nil {
+		return fmt.Errorf("install: remove the server join token %s this server no longer joins with: %w", path, err)
+	}
+	cfg.Logger.Info("removed the staged server join token: this server no longer joins an existing control plane", "path", path)
+	return nil
+}

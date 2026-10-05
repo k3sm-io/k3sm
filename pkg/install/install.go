@@ -1991,6 +1991,15 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
 	}
 
+	// 1f″. A server that is no longer a joining member (its etcd role changed
+	//      to --cluster-init over removed member data) has no use for the
+	//      server-class join token it staged as one, and that token decrypts
+	//      every cluster CA, so it goes with the role rather than lingering
+	//      until an uninstall.
+	if err := retireStaleServerJoinToken(sys, cfg, serverArgs); err != nil {
+		return err
+	}
+
 	// 1f′. The secrets encryption pair, when 0b′ decided to write one: after
 	//      the service uid exists and before any daemon is started, so the
 	//      first start of a new cluster already encrypts.
