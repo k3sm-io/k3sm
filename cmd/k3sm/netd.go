@@ -149,6 +149,7 @@ func runNetd(args []string) error {
 		LBDeclarers:        lbDeclarers,
 		NodeAddressService: canonicalLBService(),
 		NodeIP:             nodeIP,
+		VMPodPorts:         buildVMPodSet(ctx, opts.kubeconfig, logger),
 		MeshKeyDir:         opts.meshKeyDir,
 		Logger:             logger,
 	})
