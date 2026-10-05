@@ -36,12 +36,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+
+	"k3sm.io/darwin-net/pkg/proxy"
 )
 
 func netdTestPod(name, ip string, vm bool, ports ...int32) *corev1.Pod {
 	p := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name, UID: types.UID("uid-" + name)},
-		Spec:       corev1.PodSpec{NodeName: "worker", Containers: []corev1.Container{{Name: "c"}}},
+		Spec:       corev1.PodSpec{NodeName: "worker", Containers: []corev1.Container{{Name: "c", Image: "registry/app:1"}}},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip},
 	}
 	if vm {
@@ -71,11 +73,23 @@ func netdTestSlice(name, ip string, owner types.UID, proto corev1.Protocol, port
 }
 
 // TestVMPodRelayPorts pins the source the published-vm-pod bind class reads:
-// a live vm pod's declared TCP ports plus the TCP ports an EndpointSlice targets
-// at its address, and nothing for any other pod or address.
+// a live vm pod's declared TCP ports plus the TCP ports an EndpointSlice in its
+// own namespace targets at it BY UID, and nothing for any other pod or address.
+// The slice rows are the security-relevant ones: an endpoint may vouch for a pod
+// address only through a Pod TargetRef carrying that pod's UID, so a
+// selector-less Service's hand-written slice (no TargetRef), a non-Pod ref, an
+// empty UID, another pod's UID or another namespace's slice adds no port.
 func TestVMPodRelayPorts(t *testing.T) {
 	t.Parallel()
 	webhook := netdTestPod("webhook", "100.64.3.7", true, 443)
+	terminating := netdTestPod("terminating", "100.64.3.12", true, 80)
+	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	wide := netdTestPod("wide", "100.64.3.13", true)
+	for p := int32(1000); p < 1000+int32(proxy.MaxRelayPorts); p++ {
+		wide.Spec.Containers[0].Ports = append(wide.Spec.Containers[0].Ports, corev1.ContainerPort{ContainerPort: p})
+	}
+	atCap := netdTestPod("atcap", "100.64.3.14", true)
+	atCap.Spec.Containers[0].Ports = wide.Spec.Containers[0].Ports
 	native := netdTestPod("native", "100.64.3.8", false, 80)
 	done := netdTestPod("done", "100.64.3.9", true, 80)
 	done.Status.Phase = corev1.PodSucceeded
@@ -84,12 +98,21 @@ func TestVMPodRelayPorts(t *testing.T) {
 	twinA := netdTestPod("twin-a", "100.64.3.11", true, 80)
 	twinB := netdTestPod("twin-b", "100.64.3.11", true, 81)
 
-	pods := []*corev1.Pod{webhook, native, done, hostNet, twinA, twinB}
+	pods := []*corev1.Pod{webhook, native, done, hostNet, twinA, twinB, terminating, wide, atCap}
+	selectorless := netdTestSlice("svc-handwritten", "100.64.3.7", "", corev1.ProtocolTCP, 22)
+	nonPod := netdTestSlice("svc-nonpod", "100.64.3.7", webhook.UID, corev1.ProtocolTCP, 23)
+	nonPod.Endpoints[0].TargetRef.Kind = "Node"
+	emptyUID := netdTestSlice("svc-emptyuid", "100.64.3.7", webhook.UID, corev1.ProtocolTCP, 24)
+	emptyUID.Endpoints[0].TargetRef.UID = ""
+	crossNS := netdTestSlice("svc-otherns", "100.64.3.7", webhook.UID, corev1.ProtocolTCP, 25)
+	crossNS.Namespace = "attacker"
+	overCap := netdTestSlice("svc-overcap", "100.64.3.13", wide.UID, corev1.ProtocolTCP, 1)
 	eps := []*discoveryv1.EndpointSlice{
 		netdTestSlice("svc-a", "100.64.3.7", webhook.UID, corev1.ProtocolTCP, 80),
 		netdTestSlice("svc-udp", "100.64.3.7", webhook.UID, corev1.ProtocolUDP, 53),
-		netdTestSlice("svc-stale", "100.64.3.7", "uid-previous-owner", corev1.ProtocolTCP, 22),
-		netdTestSlice("svc-native", "100.64.3.8", native.UID, corev1.ProtocolTCP, 25),
+		netdTestSlice("svc-stale", "100.64.3.7", "uid-previous-owner", corev1.ProtocolTCP, 21),
+		selectorless, nonPod, emptyUID, crossNS, overCap,
+		netdTestSlice("svc-native", "100.64.3.8", native.UID, corev1.ProtocolTCP, 26),
 	}
 
 	cases := []struct {
@@ -97,12 +120,19 @@ func TestVMPodRelayPorts(t *testing.T) {
 		addr string
 		want []uint16
 	}{
-		{name: "vm pod: declared plus Service-targeted TCP", addr: "100.64.3.7", want: []uint16{80, 443}},
+		// Only svc-a vouches: the hand-written, non-Pod, empty-UID, stale-UID and
+		// cross-namespace slices all name this /32 and add nothing (21-25 absent).
+		{name: "vm pod: declared plus Service-targeted TCP, by UID and namespace only", addr: "100.64.3.7", want: []uint16{80, 443}},
+		{name: "terminating vm pod", addr: "100.64.3.12"},
+		{name: "port set over the relay ceiling", addr: "100.64.3.13"},
 		{name: "native pod", addr: "100.64.3.8"},
 		{name: "terminal vm pod", addr: "100.64.3.9"},
 		{name: "hostNetwork pod", addr: "100.64.3.10"},
 		{name: "two live pods claim one address", addr: "100.64.3.11"},
 		{name: "no pod", addr: "100.64.3.99"},
+	}
+	if got := vmPodRelayPorts(pods, eps, netip.MustParseAddr("100.64.3.14")); len(got) != proxy.MaxRelayPorts {
+		t.Errorf("a port set exactly at the ceiling = %d ports, want %d (the cap is inclusive)", len(got), proxy.MaxRelayPorts)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -168,6 +198,15 @@ func TestRunVMPodInformersFeedsThePredicate(t *testing.T) {
 	pl, el, err := runVMPodInformers(ctx, cs, "worker", 5*time.Second)
 	if err != nil {
 		t.Fatalf("runVMPodInformers: %v", err)
+	}
+	// The cached pod is the trimmed one: the predicate's fields survive, the rest
+	// does not.
+	cached, err := pl.ByIndex(podIPIndex, "100.64.3.7")
+	if err != nil || len(cached) != 1 {
+		t.Fatalf("pods indexed under 100.64.3.7 = %v, %v; want exactly the webhook pod", cached, err)
+	}
+	if cp := cached[0].(*corev1.Pod); cp.UID != pod.UID || len(cp.Spec.Containers[0].Ports) != 1 || cp.Spec.Containers[0].Image != "" {
+		t.Errorf("cached pod not trimmed to the predicate's fields: %+v", cp.Spec.Containers[0])
 	}
 	set := &vmPodSet{}
 	if got := set.ports(netip.MustParseAddr("100.64.3.7")); got != nil {

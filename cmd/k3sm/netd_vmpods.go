@@ -36,15 +36,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	corev1listers "k8s.io/client-go/listers/core/v1"
-	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/darwin-net/pkg/proxy"
 
 	"k3sm.io/k3sm/pkg/kubeclient"
 	"k3sm.io/k3sm/pkg/provider"
@@ -69,41 +67,68 @@ import (
 // pod /24 the authorizer checks first. EndpointSlices are readable by every node
 // through the node-datapath ClusterRole the Service proxy already relies on, so
 // this adds no RBAC.
+//
+// COST. Both caches are indexed by address (status.podIP for pods, every
+// endpoint address for slices), so one authorization reads only the objects
+// that name the requested address, never the whole cache; and cached pods are
+// trimmed (trimPodForRelay) to the fields the predicate reads, so the root
+// daemon does not hold every pod's full spec on a server's cluster-wide list.
 
 // vmPodSetSyncTimeout bounds one attempt's wait for the initial Pods and
 // EndpointSlices cache sync, as serviceInformerSyncTimeout does for Services.
 const vmPodSetSyncTimeout = 10 * time.Second
 
-// vmPodSet holds the listers the published-vm-pod predicate reads. Both are nil
-// until activation syncs them, and ports answers nil (deny) until then.
+// The informer index names: a pod by its status.podIP, a slice by every
+// endpoint address it carries. One lookup is one map read.
+const (
+	podIPIndex     = "status.podIP"
+	sliceAddrIndex = "endpoints.addresses"
+)
+
+// vmPodSet holds the indexers the published-vm-pod predicate reads. Both are
+// nil until activation syncs them, and ports answers nil (deny) until then.
 type vmPodSet struct {
 	mu     sync.RWMutex
-	pods   corev1listers.PodLister
-	slices discoverylisters.EndpointSliceLister
+	pods   cache.Indexer
+	slices cache.Indexer
 }
 
-// install hands the synced listers over.
-func (s *vmPodSet) install(pods corev1listers.PodLister, eps discoverylisters.EndpointSliceLister) {
+// install hands the synced indexers over.
+func (s *vmPodSet) install(pods, eps cache.Indexer) {
 	s.mu.Lock()
 	s.pods, s.slices = pods, eps
 	s.mu.Unlock()
 }
 
-// ports is the netdsvc VMPodPorts predicate over the synced caches.
+// ports is the netdsvc VMPodPorts predicate over the synced caches: it reads the
+// pods and slices indexed under addr only.
 func (s *vmPodSet) ports(addr netip.Addr) []uint16 {
 	s.mu.RLock()
-	pl, el := s.pods, s.slices
+	pi, si := s.pods, s.slices
 	s.mu.RUnlock()
-	if pl == nil || el == nil {
+	if pi == nil || si == nil {
 		return nil
 	}
-	pods, err := pl.List(labels.Everything())
+	key := addr.Unmap().String()
+	rawPods, err := pi.ByIndex(podIPIndex, key)
 	if err != nil {
 		return nil
 	}
-	eps, err := el.List(labels.Everything())
+	rawSlices, err := si.ByIndex(sliceAddrIndex, key)
 	if err != nil {
 		return nil
+	}
+	pods := make([]*corev1.Pod, 0, len(rawPods))
+	for _, o := range rawPods {
+		if p, ok := o.(*corev1.Pod); ok {
+			pods = append(pods, p)
+		}
+	}
+	eps := make([]*discoveryv1.EndpointSlice, 0, len(rawSlices))
+	for _, o := range rawSlices {
+		if e, ok := o.(*discoveryv1.EndpointSlice); ok {
+			eps = append(eps, e)
+		}
 	}
 	return vmPodRelayPorts(pods, eps, addr)
 }
@@ -125,7 +150,7 @@ func buildVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logger) 
 // failure stays at Debug except a 403, which is an RBAC fact rather than the
 // boot race and is warned once per distinct error: until it clears, a vm pod's
 // privileged relay ports stay refused while every other netd verb works.
-func activateVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logger, install func(corev1listers.PodLister, discoverylisters.EndpointSliceLister)) {
+func activateVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logger, install func(pods, eps cache.Indexer)) {
 	const retry = 2 * time.Second
 	lastWarned := ""
 	for {
@@ -157,7 +182,7 @@ func activateVMPodSet(ctx context.Context, kubeconfig string, logger *slog.Logge
 
 // startVMPodInformers loads kubeconfig and hands off to runVMPodInformers, with
 // the pods scoped to the node the credential names, if it names one.
-func startVMPodInformers(ctx context.Context, kubeconfig string) (corev1listers.PodLister, discoverylisters.EndpointSliceLister, error) {
+func startVMPodInformers(ctx context.Context, kubeconfig string) (pods, eps cache.Indexer, err error) {
 	if _, err := os.Stat(kubeconfig); err != nil {
 		return nil, nil, fmt.Errorf("stat kubeconfig: %w", kubeconfigUnusableError{err: err, missing: errors.Is(err, fs.ErrNotExist)})
 	}
@@ -202,11 +227,82 @@ func credentialNodeName(cfg *rest.Config) (string, error) {
 	return name, nil
 }
 
+// indexPodByIP indexes a pod under its status.podIP (canonical form).
+func indexPodByIP(obj any) ([]string, error) {
+	p, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil, nil
+	}
+	ip, err := netip.ParseAddr(p.Status.PodIP)
+	if err != nil {
+		return nil, nil
+	}
+	return []string{ip.Unmap().String()}, nil
+}
+
+// indexSliceByAddress indexes a slice under every endpoint address it carries
+// (canonical form, de-duplicated).
+func indexSliceByAddress(obj any) ([]string, error) {
+	s, ok := obj.(*discoveryv1.EndpointSlice)
+	if !ok {
+		return nil, nil
+	}
+	var keys []string
+	for _, ep := range s.Endpoints {
+		for _, a := range ep.Addresses {
+			if ip, err := netip.ParseAddr(a); err == nil {
+				keys = append(keys, ip.Unmap().String())
+			}
+		}
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys), nil
+}
+
+// trimPodForRelay is the Pods informer's transform: it keeps only what
+// vmPodRelayPorts reads (identity, deletion, hostNetwork, runtimeClassName, each
+// container's ports and restart policy, phase and podIP), so a cluster-wide list
+// on a server costs the root daemon a few hundred bytes per pod, not the full
+// object. A non-pod passes through untouched.
+func trimPodForRelay(obj any) (any, error) {
+	p, ok := obj.(*corev1.Pod)
+	if !ok {
+		return obj, nil
+	}
+	trimC := func(cs []corev1.Container) []corev1.Container {
+		if len(cs) == 0 {
+			return nil
+		}
+		out := make([]corev1.Container, len(cs))
+		for i := range cs {
+			out[i] = corev1.Container{Name: cs[i].Name, Ports: cs[i].Ports, RestartPolicy: cs[i].RestartPolicy}
+		}
+		return out
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         p.Namespace,
+			Name:              p.Name,
+			UID:               p.UID,
+			ResourceVersion:   p.ResourceVersion,
+			DeletionTimestamp: p.DeletionTimestamp,
+		},
+		Spec: corev1.PodSpec{
+			NodeName:         p.Spec.NodeName,
+			HostNetwork:      p.Spec.HostNetwork,
+			RuntimeClassName: p.Spec.RuntimeClassName,
+			Containers:       trimC(p.Spec.Containers),
+			InitContainers:   trimC(p.Spec.InitContainers),
+		},
+		Status: corev1.PodStatus{Phase: p.Status.Phase, PodIP: p.Status.PodIP},
+	}, nil
+}
+
 // runVMPodInformers starts the Pods and EndpointSlices informers and blocks on
 // their initial sync, tearing a failed attempt down entirely (the
 // runServiceInformer discipline: a retry must not stack reflectors). node, when
 // set, scopes the Pods list to spec.nodeName=node.
-func runVMPodInformers(ctx context.Context, cs kubernetes.Interface, node string, syncTimeout time.Duration) (corev1listers.PodLister, discoverylisters.EndpointSliceLister, error) {
+func runVMPodInformers(ctx context.Context, cs kubernetes.Interface, node string, syncTimeout time.Duration) (pods, eps cache.Indexer, err error) {
 	podFactory := informers.NewSharedInformerFactoryWithOptions(cs, 30*time.Second,
 		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
 			if node != "" {
@@ -216,8 +312,6 @@ func runVMPodInformers(ctx context.Context, cs kubernetes.Interface, node string
 	sliceFactory := informers.NewSharedInformerFactory(cs, 30*time.Second)
 	podInformer := podFactory.Core().V1().Pods().Informer()
 	sliceInformer := sliceFactory.Discovery().V1().EndpointSlices().Informer()
-	pods := podFactory.Core().V1().Pods().Lister()
-	eps := sliceFactory.Discovery().V1().EndpointSlices().Lister()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	keep := false
@@ -229,6 +323,16 @@ func runVMPodInformers(ctx context.Context, cs kubernetes.Interface, node string
 		podFactory.Shutdown()
 		sliceFactory.Shutdown()
 	}()
+
+	if err := podInformer.SetTransform(trimPodForRelay); err != nil {
+		return nil, nil, fmt.Errorf("set the pod informer's transform: %w", err)
+	}
+	if err := podInformer.AddIndexers(cache.Indexers{podIPIndex: indexPodByIP}); err != nil {
+		return nil, nil, fmt.Errorf("index pods by address: %w", err)
+	}
+	if err := sliceInformer.AddIndexers(cache.Indexers{sliceAddrIndex: indexSliceByAddress}); err != nil {
+		return nil, nil, fmt.Errorf("index EndpointSlices by address: %w", err)
+	}
 
 	var (
 		lastMu  sync.Mutex
@@ -260,17 +364,20 @@ func runVMPodInformers(ctx context.Context, cs kubernetes.Interface, node string
 		return nil, nil, fmt.Errorf("pod and EndpointSlice caches did not sync within %s", syncTimeout)
 	}
 	keep = true
-	return pods, eps, nil
+	return podInformer.GetIndexer(), sliceInformer.GetIndexer(), nil
 }
 
 // vmPodRelayPorts is the published-vm-pod predicate: when exactly one live,
 // non-hostNetwork pod publishes addr as its status.podIP and that pod resolves
 // to the vm backend, it returns that pod's declared TCP ports
 // (provider.DeclaredTCPPorts) together with every TCP port an IPv4
-// EndpointSlice targets at addr for that pod, sorted and de-duplicated. Every
-// other case answers nil, which the authorizer reads as "not a published vm pod
-// address": no pod, a native pod, a terminal pod, or two live pods claiming one
-// address (a stale view the daemon must not guess through).
+// EndpointSlice in the pod's own namespace targets at that pod by UID, sorted
+// and de-duplicated. Every other case answers nil, which the authorizer reads as
+// "not a published vm pod address": no pod, a native pod, a terminal or
+// terminating pod, two live pods claiming one address (a stale view the daemon
+// must not guess through), or a port set over the relay's per-pod ceiling
+// (proxy.MaxRelayPorts), which the relay refuses to serve at all and so the
+// daemon must not authorize any part of.
 func vmPodRelayPorts(pods []*corev1.Pod, eps []*discoveryv1.EndpointSlice, addr netip.Addr) []uint16 {
 	addr = addr.Unmap()
 	var owner *corev1.Pod
@@ -288,7 +395,7 @@ func vmPodRelayPorts(pods []*corev1.Pod, eps []*discoveryv1.EndpointSlice, addr 
 	}
 	ports := provider.DeclaredTCPPorts(owner)
 	for _, s := range eps {
-		if s.AddressType != discoveryv1.AddressTypeIPv4 {
+		if s.AddressType != discoveryv1.AddressTypeIPv4 || s.Namespace != owner.Namespace {
 			continue
 		}
 		for _, ep := range s.Endpoints {
@@ -307,13 +414,19 @@ func vmPodRelayPorts(pods []*corev1.Pod, eps []*discoveryv1.EndpointSlice, addr 
 		}
 	}
 	slices.Sort(ports)
-	return slices.Compact(ports)
+	ports = slices.Compact(ports)
+	if len(ports) > proxy.MaxRelayPorts {
+		return nil
+	}
+	return ports
 }
 
-// podPublishes reports whether p is a live pod-network pod whose status.podIP
-// is addr.
+// podPublishes reports whether p is a live, not-terminating pod-network pod
+// whose status.podIP is addr. A pod with a DeletionTimestamp is never an owner:
+// its address is on its way out, and a relay bind authorized now would outlive it.
 func podPublishes(p *corev1.Pod, addr netip.Addr) bool {
-	if p.Spec.HostNetwork || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+	if p.DeletionTimestamp != nil || p.Spec.HostNetwork ||
+		p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 		return false
 	}
 	ip, err := netip.ParseAddr(p.Status.PodIP)
@@ -331,11 +444,16 @@ func podIsVMBacked(p *corev1.Pod) bool {
 	return err == nil && backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM
 }
 
-// endpointTargets reports whether ep carries addr and, when it names a target
-// pod, names owner: an endpoint left over for a pod that held the address before
-// owner is not owner's Service port.
+// endpointTargets reports whether ep vouches for owner at addr. It does only
+// when its TargetRef is a Pod reference carrying owner's UID AND it lists addr.
+// A nil ref, a non-Pod kind or an empty UID never falls through to the address
+// match: a selector-less Service's hand-written EndpointSlice can name any /32,
+// and a slice written by whoever may create EndpointSlices must not authorize a
+// root-brokered bind on another pod's address. (The caller has already required
+// the slice to be in owner's namespace.)
 func endpointTargets(ep discoveryv1.Endpoint, addr netip.Addr, owner *corev1.Pod) bool {
-	if ref := ep.TargetRef; ref != nil && ref.Kind == "Pod" && ref.UID != "" && ref.UID != owner.UID {
+	ref := ep.TargetRef
+	if ref == nil || ref.Kind != "Pod" || ref.UID == "" || ref.UID != owner.UID {
 		return false
 	}
 	for _, a := range ep.Addresses {
