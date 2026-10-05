@@ -44,9 +44,17 @@
 #   - on A, mint the SERVER-class token (it reconstructs every cluster CA, including
 #     the two etcd CAs; give it ONLY to a trusted control-plane Mac):
 #                sudo k3sm token create --server
-#   - server B:  sudo k3sm install --server-join --server <A LAN ip> --token <server-token> \
+#   - server B:  put the token in a root-only file, then
+#                sudo sh -c 'umask 077; cat > /var/root/k3sm-server-token'   # paste, Ctrl-D
+#                sudo k3sm install --server-join --server <A LAN ip> \
+#                  --token-file /var/root/k3sm-server-token \
 #                  --node-ip <B LAN ip> --mesh-ip <B mesh ip>
-#     (the etcd peers talk on the LAN node IPs; the mesh carries pod traffic only)
+#     (the etcd peers talk on the LAN addresses; the mesh carries pod traffic only.
+#     `k3sm install --node-ip` on a server is the etcd peer address and is rendered
+#     onto the daemon as `k3sm server --etcd-peer-ip`; each server's node advertises
+#     and lo0-aliases its --mesh-ip, never the LAN address. The install stages the
+#     token at <work-dir>/join-token for B's daemon, which reads it at every start;
+#     the root-only file is yours to delete afterwards)
 #   - this host: kubectl, curl and go (the e2e criteria run from this checkout); each server's HA admin kubeconfig (the CA-bearing
 #     <work-dir>/admin.kubeconfig, NOT the loopback token kubeconfig) as $KUBECONFIG
 #     (server A) and $K3SM_KUBECONFIG_B (server B).
@@ -62,8 +70,12 @@
 #   K3SM_M6_EVIDENCE_DIR               required — where every artifact and the log land
 #   K3SM_M6_REJOIN_A                   required by m6.D — a shell command run on THIS host
 #                                      that reinstalls server A as a joining server of B
-#                                      (--server-join --server <B LAN ip> --token <B's
-#                                      server token> ...); m6.D FAILS without it
+#                                      (sudo k3sm install --server-join --server <B LAN ip>
+#                                      --token-file <file holding B's server token>
+#                                      --node-ip <A LAN ip> --mesh-ip <A mesh ip>, run on
+#                                      A); m6.D runs it after removing A's etcd dir, which
+#                                      is what lets the install replace A's recorded
+#                                      --cluster-init; m6.D FAILS without it
 #   K3SM_M6_WORK_DIR                   server work dir (default /var/lib/k3sm/server)
 #   K3SM_M6_ETCD_CLIENT_PORT           etcd loopback client port (default 2379, --kine-port)
 #   K3SM_M6_ETCD_METRICS_PORT          etcd loopback metrics port (default 2381)

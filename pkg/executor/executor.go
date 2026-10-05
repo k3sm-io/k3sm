@@ -241,7 +241,8 @@ type EtcdConfig struct {
 	// Name is the member name (the node name). It must be unique in the cluster.
 	Name string
 	// PeerIP is the address the member's peer listener binds and advertises: the
-	// node's LAN address (--node-ip). Peers reach each other directly on it under the
+	// server's LAN address (`k3sm server --etcd-peer-ip`, never the node's
+	// advertised --node-ip). Peers reach each other directly on it under the
 	// etcd peer CA's mutual TLS; the wireguard mesh carries pod traffic only. It must
 	// be a parseable, non-loopback IP (Validate: ErrEtcdNeedsNodeIP).
 	PeerIP string
@@ -433,7 +434,7 @@ func (c Config) Validate() error {
 // address: an empty, unparseable or loopback PeerIP. The member advertises that
 // address to every other member, so the single-node default 127.0.0.1 would make
 // each server dial itself.
-var ErrEtcdNeedsNodeIP = errors.New("executor: the etcd HA posture needs --node-ip set to this server's LAN address (empty, unparseable or loopback addresses cannot be an etcd peer address)")
+var ErrEtcdNeedsNodeIP = errors.New("executor: the etcd HA posture needs --etcd-peer-ip set to this server's LAN address (empty, unparseable or loopback addresses cannot be an etcd peer address)")
 
 // ErrEtcdRole is returned by Validate for an EtcdConfig whose Role is neither EtcdInit
 // nor EtcdJoin, or that has no member name.
