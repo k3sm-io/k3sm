@@ -30,6 +30,8 @@ directory is the front door to the user-facing docs; read them roughly in the jo
     `k3sm snapshot save`/`restore`, the automatic pre-migration copy, and the restore drill.
 13. [Multi-node clusters](multi-node.md) covers joining agents, the mesh, and its EXPERIMENTAL status.
 14. [High availability](ha.md) covers the HA control plane and its EXPERIMENTAL status.
+    [Direct links](direct-links.md) covers Macs cabled by Thunderbolt: joining over the cable,
+    routing over it in plaintext, and what unplugging does.
 15. [Linux images](vm-runtimeclass.md) describes the intended isolation boundary for untrusted
     workloads; it boots `linux/arm64` images per Pod today.
 16. [MLX serving](mlx-quickstart.md) walks through serving a model on the Mac's GPU through an

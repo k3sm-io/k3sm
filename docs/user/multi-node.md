@@ -124,6 +124,14 @@ The agent authenticates with the bootstrap token, receives its node credentials,
 **public** key is registered in the `MeshPeer` records held in the datastore. Private keys never leave
 the node. The `MeshPeer` records carry public keys only.
 
+### Joining over a Thunderbolt cable
+
+A Mac cabled to the control plane by Thunderbolt can join with no token and no address: open the
+pairing window on the control plane with `sudo k3sm pair --for 10m`, then run
+`sudo k3sm install --auto-join --cluster <pin>` on the new Mac, with the pin `k3sm pair` prints. Once
+two Macs share a cable, k3sm also routes their Pod traffic over it, in plaintext. The whole flow,
+the trust statement and what unplugging does are on [Direct links](direct-links.md).
+
 ### Restarting a node
 
 A joined agent keeps its credential in its work dir, so restarting it needs no token. It presents the
@@ -249,6 +257,8 @@ install performs.
 - Services resolve cluster-wide via the userspace Service proxy.
 - Mesh traffic between Pods on different nodes rides the wireguard tunnel with per-peer symmetric
   `AllowedIPs`.
+- Between two Macs joined by a Thunderbolt cable, that traffic crosses the cable instead, in
+  plaintext, and falls back to the tunnel when the cable goes. See [Direct links](direct-links.md).
 
 ## Caveats
 
@@ -269,5 +279,7 @@ install performs.
 ## Next
 
 - [HA](ha.md) covers the HA control plane.
+- [Direct links](direct-links.md) covers Thunderbolt-cabled Macs, plug-and-join and the plaintext
+  cable.
 - [Upgrade](upgrade.md) describes the rolling-restart model.
 - [Troubleshooting](troubleshooting.md) covers join and mesh failures.

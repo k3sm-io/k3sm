@@ -298,6 +298,23 @@ sandbox cannot restrict network access by destination address, so nothing filter
 Pod opens on the shared host network stack. Treat egress restriction on the default runtime as
 cooperative, and run workloads you do not trust on the [`vm` RuntimeClass](vm-runtimeclass.md).
 
+### A Thunderbolt Cable Carries Pod Traffic in Plaintext
+
+Between two Macs joined by a [direct link](direct-links.md), Pod and Service traffic crosses the
+cable without wireguard encryption, and nothing on the cable checks that a packet with a Pod's source
+address came from that Pod; `vm` Pod traffic leaves the host the same way. NetworkPolicy does not
+change that, for the reasons in the section above. Treat every device on the cable as part of the
+cluster's trust domain, or keep a port on the tunnel with `sudo k3sm link tunnel-only`.
+
+- A Mac installed with `--auto-join` and no `--cluster` trusts the first open-pairing server it hears
+  on its cable while it is armed. Pass the cluster pin to pin it.
+- Sharded models are for trusted workloads only: the ports their ranks talk on carry no
+  authentication, and every Pod in the cluster can reach them.
+- RDMA over Thunderbolt needs Thunderbolt 5, macOS 26.2 or later, and a one-time step in macOS
+  Recovery on each Mac. A Thunderbolt 4 Mac carries IP over the cable and no RDMA, so the `jaccl`
+  sharding backend is not available on it.
+- A cluster connected only by cables runs one control plane: the HA flags refuse a cable address.
+
 ### Which Addresses Your Services Answer On
 
 Today at `main`, per port class:
@@ -676,6 +693,8 @@ Runbook:
   join yet, and `k3sm install` does not expose the flags. External-datastore HA and its flags were
   removed in v0.1.6, and there is no conversion from an existing single-node SQLite cluster to etcd.
   See [HA](ha.md).
+- **Direct links** (Thunderbolt-cabled Macs) are EXPERIMENTAL with multi-node. See
+  [Direct links](direct-links.md).
 
 ### `vm` Pods: Node Selection and Security-Context Admission
 

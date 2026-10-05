@@ -416,6 +416,30 @@ The node advertises a capability label only when its start-time probe said yes.
 - Confirm the agent can reach the server on `6443` and the wireguard mesh is up. See
   [Multi-node](multi-node.md).
 
+## Pairing Over a Cable Does Not Start
+
+- On the control plane, `k3sm pair` must show the window open. A window closes on its time limit and
+  after `--max-joins` completed joins; open a new one with `sudo k3sm pair --for 10m`.
+- On the new Mac, the agent log (`k3sm status logs agent`) says whether it is armed. An unarmed or
+  expired Mac ignores every beacon: re-arm it with `sudo k3sm pair --listen 10m --cluster <pin>`.
+- A pin that does not match makes the new Mac skip the beacon. Copy the pin `k3sm pair` prints on
+  the control plane.
+- The control plane log names every refused pair request and why: `not-thunderbolt` (the request
+  arrived on Wi-Fi, Ethernet, a dock's Ethernet adapter or the bridge), `window-closed`,
+  `window-full`, `rate-limited` (one request per port every 10 seconds) or `mint-cap`. The same
+  refusals appear as events on the control plane's Node.
+- `k3sm doctor` on either Mac shows the Thunderbolt ports, whether each is cabled, and whether a
+  cabled port is still in `bridge0`.
+
+## A Direct Link Keeps Going Up and Down
+
+- `kubectl describe node <node>` lists every transition with the port and the peer.
+- A peer that sleeps stops answering the 5 second probe and its link goes down after about 15
+  seconds. Turn idle sleep off on cluster Macs (`sudo pmset -a sleep 0`); `k3sm doctor` checks it.
+- A worn or loose cable shows as link changes on the port. Keep that cable's Pod traffic on the
+  tunnel while you replace it: `sudo k3sm link tunnel-only en2`.
+- See [Direct links](direct-links.md#what-unplugging-does) for what each kind of loss does.
+
 ## A Node Went Offline and Pods Are Stuck Terminating
 
 A Mac that goes away while it is running Pods leaves them stuck: `kubectl get pod` shows them
