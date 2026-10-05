@@ -10,6 +10,18 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+## v0.1.7 — 2026-10-05
+
+`vm` Pods answer on their own pod IP from anywhere in the cluster, and two Macs can run the control plane together as an experimental preview.
+
+### Added
+
+- **`vm` Pods answer on their pod IP from every node.** The node a `vm` Pod runs on holds its pod IP and relays each TCP connection to the guest, so another node, a native Pod on the same node and the node itself reach the Pod at the address `kubectl get pods -o wide` shows, and Services reach `vm` Pods across nodes. The relay covers the ports the Pod declares as a `containerPort` and the ports an EndpointSlice targets at that Pod. Other ports, and UDP to a `vm` Pod's IP, are not relayed. The root network helper binds ports below 1024 on that address only for those same ports, decided from its own reads of the cluster.
+
+### Experimental
+
+- **Two Macs can share the control plane.** `sudo k3sm install --cluster-init` forms an embedded etcd control plane on the first server and `sudo k3sm install --server-join` adds a second. Each server's pod range is the /24 its `--mesh-ip` names. A join whose range is already held is refused before anything is added to etcd, and a server's name stays bound to its Mac. Two servers tolerate no failures: losing either one stops writes until it returns or the survivor runs `k3sm server --cluster-reset`. Workers stay attached to the server they joined through. A controller manager or scheduler that loses its leader lease when quorum is lost is counted as a crash, so repeated quorum loss can park a server. See [high availability](https://k3sm.io/docs/ha/).
+
 ## v0.1.6 — 2026-10-05
 
 Hosts survive heavy pod-network traffic, shell tools see mounted paths everywhere, and Pods get curl, TLS, eviction, logs on disk and re-attach across a daemon restart.
