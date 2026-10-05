@@ -54,7 +54,7 @@
 #   K3SM_LAN_SERVICE           the worker's LAN network service name (e.g. Wi-Fi)
 #   K3SM_ARTIFACT              the new k3sm binary under test (installed by rung 1)
 #   K3SM_OLD_ARTIFACT          the previous release's k3sm binary (rungs 10 and 11)
-#   K3SM_EVIDENCE              evidence dir (default ../k3sm-io.scratch/m17-evidence-<date>)
+#   K3SM_EVIDENCE              the evidence directory, outside any repository (required)
 #   K3SM_RC_TAG                the release-candidate tag, when this is the rc run
 #
 # Run log: K3SM_LAB=1 hack/lab/m17.sh | tee hack/lab/runs/m17-lab-<rc-tag>-<UTCdate>.log
@@ -158,7 +158,7 @@ need() {
 		exit 1
 	fi
 }
-need KUBECONFIG K3SM_SERVER_SSH K3SM_SERVER_NODE K3SM_WORKER_NODE K3SM_CABLE_IFACE K3SM_SERVER_CABLE_IFACE K3SM_LAN_SERVICE K3SM_ARTIFACT
+need KUBECONFIG K3SM_SERVER_SSH K3SM_SERVER_NODE K3SM_WORKER_NODE K3SM_CABLE_IFACE K3SM_SERVER_CABLE_IFACE K3SM_LAN_SERVICE K3SM_ARTIFACT K3SM_EVIDENCE
 for tool in kubectl python3 curl ssh scp sudo; do
 	command -v "$tool" >/dev/null 2>&1 || {
 		echo "${GATE_NAME} gate requires $tool on PATH" >&2
@@ -167,7 +167,7 @@ for tool in kubectl python3 curl ssh scp sudo; do
 	}
 done
 export KUBECONFIG
-EVIDENCE="${K3SM_EVIDENCE:-$REPO_ROOT/../../k3sm-io.scratch/m17-evidence-$(date -u +%Y%m%dT%H%M%SZ)}"
+EVIDENCE="$K3SM_EVIDENCE"
 mkdir -p "$EVIDENCE"
 note "evidence: $EVIDENCE"
 
