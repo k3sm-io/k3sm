@@ -47,7 +47,8 @@
 # io.k3sm.server when this Mac carries no agent daemon; K3SM_DAEMON_LABEL
 # overrides both.
 #
-# Needs K3SM_LAB=1; without it this gate FAILS (it never skips green).
+# Needs K3SM_LAB=1. With K3SM_LAB unset the gate reports LAB-PENDING and exits
+# 3, which is not a pass and never 0.
 #
 # Requires: kubectl, curl, go (builds the fixture), codesign, netstat, pgrep,
 # ps, sudo.
@@ -66,8 +67,8 @@ finish() {
 }
 
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "B124 gate: NOT RUN. It needs K3SM_LAB=1 and an installed node at \$KUBECONFIG; this is a failure, not a skip." >&2
-	exit 1
+	echo "B124 gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 and an installed node at \$KUBECONFIG)" >&2
+	exit 3
 fi
 if [ -z "${KUBECONFIG:-}" ]; then
 	echo "KUBECONFIG must point at the RUNNING cluster this installed node belongs to (this gate boots nothing itself)" >&2
