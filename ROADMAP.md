@@ -61,8 +61,19 @@ release engineering. What ships:
   buildkitd image currently defaults to the pinned upstream digest rather than the (still-private)
   k3sm GHCR mirror, and buildx ships as a verified prebuilt asset rather than source-built; both are
   the remaining packaging work.
-- **HA control plane (EXPERIMENTAL).** kine→Postgres multi-writer + leader-election + server-join
-  with an identical-CA bundle. *(implemented; a two-Mac + Postgres failover has not run yet)*
+- **HA control plane.** A multi-server control plane is not available in v0.1.6. The
+  external-datastore path (kine to Postgres) was removed, and embedded etcd lands first in a later
+  release. Single-node installs keep the SQLite-backed datastore.
+- **v0.1.6.** Hosts survive heavy pod-network traffic: TCP connections on the pod network have
+  their segment size lowered after connect, and a torn-down pod's address is blackholed, so an open
+  connection fails cleanly instead of re-routing onto the mesh interface and triggering a macOS
+  kernel panic. A shadow set of re-signed shell utilities makes mounted paths work for `tar`, the
+  usual coreutils and recursive walks (`rm -r`, `ls -R`, `find`, `cp -R`). Native Pods run `curl`
+  and other TLS clients. The server's node runs as `system:node:<name>` under the Node authorizer.
+  The node evicts Pods under memory pressure, one at a time. Container logs are written to disk in
+  the CRI format, and a resident shim keeps container output and exit status. `k3sm status`
+  reports the data volume, and `k3sm install --data-volume` puts the data root on a size-capped
+  APFS volume.
 - **Conformance hardening.** As close to standard k8s as the Darwin substrate
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
