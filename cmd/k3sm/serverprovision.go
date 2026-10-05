@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -60,6 +61,28 @@ type serverPlan struct {
 	serverPKI
 }
 
+// errServerTokenAsAdmin refuses a server-class join token on a start where it
+// would become the apiserver's static admin token.
+var errServerTokenAsAdmin = errors.New("a server-class join token cannot be this server's static admin token")
+
+// refuseServerTokenAsAdmin is that refusal: any start that is not a
+// --server-join loads opts.token as the static system:masters bearer token, so
+// a token of the K10<hash>::server:<secret> shape there is a join credential in
+// the wrong place. The message names where the token came from, never its value.
+func refuseServerTokenAsAdmin(opts serverOptions) error {
+	if opts.serverJoin || opts.token == "" {
+		return nil
+	}
+	if _, err := bootstrap.ParseServerToken(opts.token); err != nil {
+		return nil
+	}
+	from := "--token or $K3SM_TOKEN"
+	if opts.tokenFile != "" {
+		from = "the token file " + opts.tokenFile
+	}
+	return fmt.Errorf("%w (from %s): it is used only with --server-join, to add this server to an existing HA control plane; without --server-join the token here is the admin bearer token, so point --token-file at the admin token the install staged, or add --server-join if this server is joining", errServerTokenAsAdmin, from)
+}
+
 // validateServerOptions runs every refusal that touches no state: the admin
 // token file, the HA flag shape, the port ranges, the node name and the
 // work-dir guards. It canonicalizes opts.nodeName and resolves opts.token in
@@ -72,10 +95,14 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	// credential the operator believes is in play, and coming up past it would
 	// mint a different one and leave every `kubectl` call Unauthorized.
 	//
-	// The two credentials cannot be swapped by this: the join path never makes
-	// its token the apiserver's static credential (serverExecutorConfig), and the
-	// CA-bundle import and the etcd member route accept only a server-class
-	// token, so an admin token handed to a joining server fails there, by name.
+	// The two credentials cannot be swapped by this, in either direction. The
+	// join path never makes its token the apiserver's static credential
+	// (serverExecutorConfig), and the CA-bundle import and the etcd member route
+	// accept only a server-class token, so an admin token handed to a joining
+	// server fails there, by name. The reverse, a server-class token reaching a
+	// start that is NOT a server-join, is refused below: there it would become
+	// a system:masters bearer token, and a credential that reconstructs every
+	// cluster CA must not also be one that authenticates as cluster-admin.
 	//
 	// An ABSENT file is not terminal, exactly as it is not for the agent: the
 	// executor then generates a token and writes its own kubeconfig, which is
@@ -91,6 +118,9 @@ func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.L
 	case absent:
 		logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
 			"path", opts.tokenFile)
+	}
+	if err := refuseServerTokenAsAdmin(*opts); err != nil {
+		return err
 	}
 
 	// The HA flag shape, before any state is touched: a refusal here costs nothing,

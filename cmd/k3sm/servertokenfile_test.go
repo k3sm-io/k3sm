@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"flag"
 	"log/slog"
 	"os"
@@ -150,6 +151,41 @@ func TestServerTokenFile(t *testing.T) {
 		// And it never becomes the apiserver's static admin credential.
 		if cfg := serverExecutorConfig(opts, "", logger); cfg.Token != "" {
 			t.Errorf("the join token became the static admin token %q", cfg.Token)
+		}
+	})
+
+	t.Run("a server-class token is refused wherever it would be the admin token", func(t *testing.T) {
+		// The reverse direction: without --server-join, the token is the
+		// apiserver's static system:masters bearer token, so a credential that
+		// reconstructs every cluster CA must not land there, from any source.
+		const serverToken = "K10abc::server:s3rv3r-s3cr3t"
+		logger := slog.New(slog.DiscardHandler)
+		for _, tc := range []struct {
+			name string
+			opts serverOptions
+		}{
+			{"from the token file", serverOptions{tokenFile: write(t, serverToken+"\n", 0o600)}},
+			{"from --token", serverOptions{token: serverToken}},
+			{"from the token file on a --cluster-init server", serverOptions{clusterInit: true, nodeIP: "192.0.2.10", tokenFile: write(t, serverToken+"\n", 0o600)}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				opts := tc.opts
+				opts.nodeName, opts.workDir = "server-a", t.TempDir()
+				err := validateServerOptions(&opts, nil, logger)
+				if !errors.Is(err, errServerTokenAsAdmin) {
+					t.Fatalf("validateServerOptions = %v, want errServerTokenAsAdmin", err)
+				}
+				if strings.Contains(err.Error(), "s3rv3r-s3cr3t") {
+					t.Errorf("the refusal echoed the token: %q", err)
+				}
+			})
+		}
+		// An ordinary admin token and a worker token are not refused by this.
+		for _, tok := range []string{"k3sm-adm1n-s3cr3t", "K10abc::node:w0rker"} {
+			opts := serverOptions{token: tok, nodeName: "server-a", workDir: t.TempDir()}
+			if err := validateServerOptions(&opts, nil, logger); err != nil {
+				t.Errorf("validateServerOptions with %q = %v, want nil", tok, err)
+			}
 		}
 	})
 }
