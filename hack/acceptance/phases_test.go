@@ -22,6 +22,7 @@ package acceptance
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -426,6 +427,54 @@ func TestM11CoreGateDeclaresCoreMode(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestM17LabGateRunLogHeader pins the M17-lab ladder's evidence contract the way
+// TestM11CoreGateDeclaresCoreMode pins M11's, statically and hermetically: the row is
+// a real lab gate (manual, not a skeleton), it exits 0 saying PENDING with K3SM_LAB
+// unset, an unknown argument is refused, and the run-log header names all four
+// required fields with a git SHA for each of the four repos. A lab run is evidence
+// only through its log, so a header missing a field discharges nothing.
+func TestM17LabGateRunLogHeader(t *testing.T) {
+	root := repoRoot(t)
+	rows := loadGateRows(t)
+	row, ok := rows["M17-lab"]
+	if !ok {
+		t.Fatal("phases.json declares no M17-lab row")
+	}
+	if !row.Manual || row.Skeleton {
+		t.Fatalf("M17-lab manual=%v skeleton=%v, want a manual lab gate that is no longer a skeleton", row.Manual, row.Skeleton)
+	}
+	path := filepath.Join(root, filepath.FromSlash(row.Gate))
+	code, out := runGateArgs(t, path, "")
+	if code != 0 || !strings.Contains(out, "PENDING") || !strings.Contains(out, "M17-lab") {
+		t.Fatalf("%s with K3SM_LAB unset: exit %d, want 0 with a PENDING notice naming the row; output:\n%s", row.Gate, code, out)
+	}
+	if code, out := runGateArgs(t, path, "", "--not-a-mode"); code == 0 {
+		t.Errorf("%s accepted an unknown argument; output:\n%s", row.Gate, out)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(body)
+	for _, token := range []string{"gate: ", "artifact_sha256: ", "git_sha.", "result: ", "PASS", "FAIL"} {
+		if !strings.Contains(src, token) {
+			t.Errorf("%s emits no %q run-log field", row.Gate, token)
+		}
+	}
+	for _, repo := range []string{"apis", "runtimed", "darwin-net", "k3sm"} {
+		if !strings.Contains(src, repo) {
+			t.Errorf("%s never names the %s module in its run-log header", row.Gate, repo)
+		}
+	}
+	// Every rung of the plan's ladder is present, by number, so a rung cannot be
+	// dropped while the gate keeps its name.
+	for i := 1; i <= 12; i++ {
+		if !strings.Contains(src, fmt.Sprintf("# ── %d ", i)) {
+			t.Errorf("%s has no rung %d", row.Gate, i)
+		}
+	}
 }
 
 // runGateArgs runs a lab gate with the given K3SM_LAB value and argument vector and
