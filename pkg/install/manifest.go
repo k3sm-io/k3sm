@@ -194,6 +194,12 @@ func artifactManifest(cfg Config) []artifact {
 	// such file until the next install stages one.
 	if cfg.Role == RoleServer {
 		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverTokenPath(), assertExists: false})
+		// A joining HA server's staged server-class join token, removed for the
+		// same reason and with more cause: it decrypts every cluster CA. It
+		// lives as long as the joined server needs it (it is read at every
+		// start) and no longer. assertExists is false: only a --server-join
+		// install stages one.
+		items = append(items, artifact{kind: kindFile, disp: dispRemove, path: cfg.serverJoinTokenPath(), assertExists: false})
 		// The secrets encryption pair, PRESERVED with the datastore it unlocks:
 		// deleting the key would leave every Secret in the preserved state.db
 		// unreadable. assertExists is false: encryption is opt-in.

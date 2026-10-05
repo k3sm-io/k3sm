@@ -199,8 +199,10 @@ func ServerPlist(cfg Config) []byte {
 		// system:masters, so a copy of it on a world-readable argv is a copy of
 		// cluster-admin. Install writes the file (serverTokenPath, 0600, owned by
 		// the service user) before this plist is laid down, and the server reads
-		// it once at start through the same reader the agent uses.
-		"--token-file", cfg.serverTokenPath(),
+		// it once at start through the same reader the agent uses. A joining HA
+		// server is pointed at its staged server-class join token instead (see
+		// serverDaemonTokenPath).
+		"--token-file", cfg.serverDaemonTokenPath(),
 	}
 	args = append(args, cfg.resolvedExtraServerArgs()...)
 	return renderPlist(launchdPlist{

@@ -313,8 +313,9 @@ func unreadablePlistError(sys System, cfg Config, path string, cause error) erro
 // famous two would lose the next flag an operator adds.
 //
 // It records cfg.resolvedExtraServerArgs(), not cfg.ExtraServerArgs directly, so
-// an explicit `k3sm install --mesh-ip` on THIS install is what a LATER reinstall
-// (with no flag of its own) carries forward — not the address it replaced.
+// an explicit `k3sm install --mesh-ip` (or --cluster-init, or --server-join) on
+// THIS install is what a LATER reinstall (with no flag of its own) carries
+// forward — not what it replaced.
 func writeServerArgsRecord(sys System, cfg Config) error {
 	path := cfg.ServerArgsRecord
 	rec := dataroot.ServerArgsRecord{
@@ -449,6 +450,9 @@ func preflightServerArgs(sys System, cfg Config) ([]string, error) {
 	}
 	extra, err := installedServerArgs(sys, cfg)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseEtcdRoleSwitch(cfg, extra); err != nil {
 		return nil, err
 	}
 	cfg.ExtraServerArgs = extra

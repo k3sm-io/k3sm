@@ -1110,25 +1110,37 @@ type Config struct {
 	// is written; everything else install lays down is identical, because a
 	// worker runs the same binary, the same shims and the same netd helper.
 	Role Role
-	// JoinServer is the control-plane host a RoleAgent node joins — an UNDERLAY
-	// address, because the join dials <host>:9345 before this node has any mesh
-	// to route over. Required for RoleAgent, ignored otherwise.
+	// JoinServer is the host this node joins, an UNDERLAY address, because the
+	// join dials <host>:9345 before this node has any mesh to route over. On
+	// RoleAgent it is the control-plane host and is required. On RoleServer it
+	// is an existing server's LAN address and is used only with ServerJoin.
 	JoinServer string
-	// NodeIP is an OPTIONAL assertion of the joining worker's own mesh
-	// InternalIP. The control plane assigns that address and issues the node's
-	// certificates for it, so a worker needs none; when set it is rendered onto
-	// the daemon's argv and the join refuses a value that differs from the
-	// assignment. Ignored outside RoleAgent.
+	// NodeIP is role-dependent. On RoleAgent it is an OPTIONAL assertion of the
+	// joining worker's own mesh InternalIP: the control plane assigns that
+	// address and issues the node's certificates for it, so a worker needs none;
+	// when set it is rendered onto the daemon's argv and the join refuses a value
+	// that differs from the assignment. On RoleServer it is the LAN address the
+	// embedded etcd member's peer listener binds, required with ClusterInit or
+	// ServerJoin and used only with them.
 	NodeIP string
+	// ClusterInit asks this server to form a new embedded etcd HA control
+	// plane (`k3sm server --cluster-init`). RoleServer only; needs NodeIP.
+	ClusterInit bool
+	// ServerJoin asks this server to join an existing embedded etcd HA control
+	// plane through JoinServer (`k3sm server --server-join`). RoleServer only;
+	// needs JoinServer, NodeIP and TokenFile holding a server-class token.
+	ServerJoin bool
 	// TokenFile is the OPERATOR's join-token file, read once by Install (which
-	// is root) and copied to agentTokenPath() for the daemon. It is not what the
-	// daemon reads and is never named on its argv: the operator's file is
-	// root-only by construction, and the service user the agent runs as could
+	// is root) and copied to stagedJoinTokenPath() for the daemon: the agent's
+	// K10 join token, or with ServerJoin the server-class token. It is not what
+	// the daemon reads and is never named on its argv: the operator's file is
+	// root-only by construction, and the service user the daemon runs as could
 	// not open it.
 	//
-	// It is optional. A node that has already joined starts from its stored
-	// credential and needs no token at all, so a reinstall with no --token-file
-	// stages nothing and leaves whatever is already there.
+	// It is optional on an agent. A node that has already joined starts from its
+	// stored credential and needs no token at all, so a reinstall with no
+	// --token-file stages nothing and leaves whatever is already there. A
+	// ServerJoin install requires it.
 	TokenFile       string
 	ServiceUser     string // _k3sm
 	InstallDir      string // /Library/k3sm
@@ -1467,12 +1479,29 @@ func (c Config) datavolStaging() string { return filepath.Join(c.InstallDir, dat
 // and writeServerArgsRecord all call it rather than reading ExtraServerArgs
 // directly, so the bind/kubeconfig decision, the rendered daemon argv, and the
 // persisted record can never disagree about which address won.
+//
+// An HA request (ClusterInit or ServerJoin) is merged the same way, after the
+// mesh address: it REPLACES every carried role flag, --server and --node-ip
+// (setEtcdArgs). With neither set the carried arguments come back as they were,
+// so a single-node install renders exactly what it rendered before HA flags
+// existed.
 func (c Config) resolvedExtraServerArgs() []string {
-	if c.MeshIP == "" {
-		return c.ExtraServerArgs
+	args := c.ExtraServerArgs
+	if c.MeshIP != "" {
+		args = setMeshIPArg(args, c.MeshIP)
 	}
-	return setMeshIPArg(c.ExtraServerArgs, c.MeshIP)
+	if c.etcdRequested() {
+		args = setEtcdArgs(args, c)
+	}
+	return args
 }
+
+// RecordedServerArgs returns the operator `k3sm server` arguments an install
+// with cfg renders after the managed set AND writes to the server-arguments
+// record: the carried arguments with this install's --mesh-ip and HA request
+// merged in. It is exported so the CLI can assert, without root, that what
+// its flags ask for is what a later reinstall carries forward.
+func RecordedServerArgs(cfg Config) []string { return cfg.resolvedExtraServerArgs() }
 
 // meshIP returns the effective --mesh-ip value (resolvedExtraServerArgs), or ""
 // when the server runs single-node. It is the discriminator between the two
@@ -1689,6 +1718,11 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	// Refusing here costs an operator one command and nothing else.
 	if err := refuseCrossRole(sys, cfg); err != nil {
 		return err
+	}
+	// The HA request's own shape, from the Config alone: the same validator
+	// the CLI ran at parse time.
+	if err := ValidateHARequest(cfg); err != nil {
+		return fmt.Errorf("install: %w", err)
 	}
 	// Still before anything is written: the directory that will hold the `k3sm`
 	// launcher must already be trusted. The link is laid down at step 2b, long
@@ -1920,7 +1954,9 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 	//     happens before the plist that names it is written. A reinstall with no
 	//     --token-file stages nothing and leaves any previous copy alone: a
 	//     joined node presents its stored credential and needs no token.
-	if cfg.Role == RoleAgent && cfg.TokenFile != "" {
+	//     A joining server stages its server-class token the same way, into
+	//     its own work dir.
+	if (cfg.Role == RoleAgent && cfg.TokenFile != "") || cfg.serverJoining() {
 		if err := stageJoinToken(sys, cfg, uid, joinToken); err != nil {
 			return err
 		}
@@ -1953,6 +1989,15 @@ func Install(ctx context.Context, sys System, cfg Config) (err error) {
 			return err
 		}
 		cfg.Logger.Info("staged the control plane's admin token for the server daemon (the daemon is told where its token is, never what it is)", "path", cfg.serverTokenPath())
+	}
+
+	// 1f″. A server that is no longer a joining member (its etcd role changed
+	//      to --cluster-init over removed member data) has no use for the
+	//      server-class join token it staged as one, and that token decrypts
+	//      every cluster CA, so it goes with the role rather than lingering
+	//      until an uninstall.
+	if err := retireStaleServerJoinToken(sys, cfg, serverArgs); err != nil {
+		return err
 	}
 
 	// 1f′. The secrets encryption pair, when 0b′ decided to write one: after

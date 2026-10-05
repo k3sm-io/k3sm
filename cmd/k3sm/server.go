@@ -307,7 +307,7 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// HA server-join: a SECOND control-plane server reconstructs the identical
 	// cluster + signing CAs from the first server's AES-256-GCM bundle. --token is the
 	// SERVER-class token (off argv via $K3SM_TOKEN, like the agent).
-	fs.StringVar(&opts.joinServer, "server", "", "an existing server's LAN address (its --node-ip): the joining server fetches the identical-CA bootstrap bundle from it and, on its first start, is added to the etcd cluster through it (HA server-join; requires --server-join --token)")
+	fs.StringVar(&opts.joinServer, "server", "", "an existing server's LAN address (its --node-ip): the joining server fetches the identical-CA bootstrap bundle from it and, on its first start, is added to the etcd cluster through it (HA server-join; requires --server-join and --token or --token-file)")
 	fs.StringVar(&opts.token, "token", os.Getenv("K3SM_TOKEN"), "server-class join token (K10<caHash>::server:<secret>) for the HA server-join (or $K3SM_TOKEN)")
 	// The static admin token as a FILE, and the only way the installed daemon is
 	// given one. A LaunchDaemon plist is read by launchd as root but the token on
@@ -316,11 +316,12 @@ func registerServerFlags(fs *flag.FlagSet, opts *serverOptions) error {
 	// system:masters. `k3sm install` stages the value at <data-root>/server/token
 	// (0600, owned by the daemon's user) and renders this flag pointing at it.
 	//
-	// It resolves the STANDALONE static admin token only. The HA server-join path
-	// takes its server-class join token on --token / $K3SM_TOKEN exactly as
-	// before; a --token-file passed alongside --server-join is ignored, with a
-	// warning, rather than silently reinterpreted as a join credential.
-	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding the static admin token, read once at start and preferred over --token and $K3SM_TOKEN. It must not be group- or world-readable. This is how a supervised server is given its token: the daemon is told where the token is and never what it is. Not used by the HA server-join, which takes --token")
+	// With --server-join the file holds the server-class JOIN token instead, the
+	// same value --token would carry: `k3sm install --server-join` stages it at
+	// <data-root>/server/join-token and renders this flag pointing there, because
+	// that credential reconstructs every cluster CA and must stay off the argv
+	// just as the admin token does.
+	fs.StringVar(&opts.tokenFile, "token-file", "", "a file holding this server's token, read once at start and preferred over --token and $K3SM_TOKEN: the static admin token, or with --server-join the server-class join token. It must not be group- or world-readable. This is how a supervised server is given its token: the daemon is told where the token is and never what it is")
 	return workDirErr
 }
 
