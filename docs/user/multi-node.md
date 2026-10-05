@@ -24,6 +24,8 @@ sudo k3sm install --mesh-ip <this-macs-mesh-address>
 The mesh address is IPv4 (the default mesh range is 100.64.0.0/10); a link-local or IPv6 address is refused at install time.
 It must be the first address (`.1`) of a /24 inside that range that no other node uses, such as
 100.64.0.1; the install refuses any other address, because that /24 becomes this Mac's pod range.
+In an [HA](ha.md) cluster every server works this way: each server's `--mesh-ip` names its own /24,
+and a server joining with a range another node already holds is refused rather than taking it.
 
 This writes the address into the server daemon's arguments and restarts it. A plain `sudo k3sm
 install` re-run already boots the daemons out and back in, so it always picks up the address you
@@ -89,12 +91,19 @@ k3sm kubectl get meshpeers
 ```
 
 Every node already in the mesh shows up here with a `PODCIDR` column, a /24 carved out of the mesh
-range in the order nodes joined: the first node holds `100.64.0.0/24`, the second `100.64.1.0/24`,
-and so on. The lowest number in the third position that is **not** already listed is the new
-node's index, and its mesh address is the first host address in that node's /24 (the address
+range: the first server holds `100.64.0.0/24`, and each worker takes the next free one in the order
+nodes joined. The lowest number above 0 in the third position that is **not** already listed is the
+new node's index, and its mesh address is the first host address in that node's /24 (the address
 ending in `.1`). For example: if `get meshpeers` lists one existing peer at `100.64.0.0/24`, the
 new node is index 1, its pod range is `100.64.1.0/24`, and the address it will be assigned is
-`100.64.1.1`.
+`100.64.1.1`. A worker is never given index 0, and never a range an [HA](ha.md) server holds or has
+reserved, so with a second server at `100.64.1.0/24` the next worker gets `100.64.2.0/24`. Each
+range is owned through a claim object (a `Lease` named `meshrange-<n>` in `kube-system`), and two
+servers answering joins at once cannot hand out the same range.
+
+The join also returns the list of apiserver endpoints the worker may use: the server it joined
+through first, then any other server whose node is Ready. The worker keeps talking to the server it
+joined through.
 
 `--agent` installs the `io.k3sm.agent` LaunchDaemon, so the worker starts at boot and is restarted
 if it exits, exactly as the control plane is on the server Mac. A Mac is one role or the other: an
