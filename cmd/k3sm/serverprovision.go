@@ -65,32 +65,32 @@ type serverPlan struct {
 // work-dir guards. It canonicalizes opts.nodeName and resolves opts.token in
 // place.
 func validateServerOptions(opts *serverOptions, workDirErr error, logger *slog.Logger) error {
-	// The static admin token, from the file the installed daemon is pointed at.
-	// Resolved BEFORE any state is touched, because a token file that is there
-	// and cannot be used (group-readable, empty, unreadable) is terminal: it
-	// names a credential the operator believes is in play, and coming up past it
-	// would mint a different one and leave every `kubectl` call Unauthorized.
+	// The token, from the file the installed daemon is pointed at: the static
+	// admin token, or on an HA server-join the server-class JOIN token. Resolved
+	// BEFORE any state is touched, because a token file that is there and cannot
+	// be used (group-readable, empty, unreadable) is terminal: it names a
+	// credential the operator believes is in play, and coming up past it would
+	// mint a different one and leave every `kubectl` call Unauthorized.
+	//
+	// The two credentials cannot be swapped by this: the join path never makes
+	// its token the apiserver's static credential (serverExecutorConfig), and the
+	// CA-bundle import and the etcd member route accept only a server-class
+	// token, so an admin token handed to a joining server fails there, by name.
 	//
 	// An ABSENT file is not terminal, exactly as it is not for the agent: the
 	// executor then generates a token and writes its own kubeconfig, which is
 	// what a bare `k3sm server` has always done.
+	absent, terr := resolveTokenFile(opts.tokenFile, &opts.token)
+	if terr != nil {
+		return terr
+	}
 	switch {
-	case opts.serverJoin && opts.tokenFile != "":
-		// The HA server-join path is untouched by this flag: its --token is a
-		// server-class JOIN token, not the static admin credential, and quietly
-		// swapping one for the other is the kind of substitution that surfaces as
-		// a CA mismatch three steps later.
-		logger.Warn("ignoring --token-file: the HA server-join takes its server-class join token on --token / $K3SM_TOKEN",
-			"token-file", opts.tokenFile)
-	default:
-		absent, terr := resolveTokenFile(opts.tokenFile, &opts.token)
-		if terr != nil {
-			return terr
-		}
-		if absent {
-			logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
-				"path", opts.tokenFile)
-		}
+	case absent && opts.serverJoin:
+		logger.Warn("the server-join token file is not there; with --server this server cannot fetch the cluster CAs or reach the etcd member route until it is (re-run `sudo k3sm install --server-join … --token-file <file>`)",
+			"path", opts.tokenFile)
+	case absent:
+		logger.Warn("the admin token file is not there; this start generates a token and writes its own kubeconfig, so an admin kubeconfig written by an earlier install will not authenticate",
+			"path", opts.tokenFile)
 	}
 
 	// The HA flag shape, before any state is touched: a refusal here costs nothing,
@@ -225,13 +225,13 @@ func provisionControlPlane(ctx context.Context, opts *serverOptions, encryptionC
 	// cluster + signing CAs from the first server's AES-256-GCM bootstrap bundle BEFORE
 	// EnsureHierarchy (which then LOADS them). FAIL CLOSED — an import failure halts
 	// bring-up; we never fall through to minting fresh, divergent CAs (cluster trust
-	// split). Requires --token (the server-class token). The bundle and, after it,
+	// split). Requires the server-class token (--token-file, --token or $K3SM_TOKEN). The bundle and, after it,
 	// the etcd member route (joinEtcdMember) are reached at --server over the
 	// underlay — the existing server's bootstrap listener serves every interface — so
 	// neither needs this server's mesh, which comes up after its control plane.
 	if opts.serverJoin && opts.joinServer != "" {
 		if opts.token == "" {
-			return cfg, pki, fmt.Errorf("--server-join with --server requires --token (the server-class join token)")
+			return cfg, pki, fmt.Errorf("--server-join with --server requires the server-class join token (--token-file, --token or $K3SM_TOKEN)")
 		}
 		if err := importServerCABundle(ctx, *opts, logger); err != nil {
 			return cfg, pki, fmt.Errorf("HA server-join: %w", err)

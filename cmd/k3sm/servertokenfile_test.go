@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,6 +123,33 @@ func TestServerTokenFile(t *testing.T) {
 		}
 		if agent.token != server.token {
 			t.Errorf("the two roles read %q and %q from one file", agent.token, server.token)
+		}
+	})
+
+	t.Run("a joining server reads its server-class join token from the file", func(t *testing.T) {
+		// `k3sm install --server-join` stages the operator's server token and
+		// renders --token-file pointing at it; the daemon needs that credential
+		// at every start (the CA-bundle import runs on each one), so the file,
+		// not --token on a published argv, is how it arrives.
+		const joinToken = "K10abc::server:j0in-s3cr3t"
+		opts := serverOptions{
+			serverJoin: true,
+			joinServer: "192.0.2.10",
+			nodeIP:     "192.0.2.20",
+			nodeName:   "server-b",
+			workDir:    t.TempDir(),
+			tokenFile:  write(t, joinToken+"\n", 0o600),
+		}
+		logger := slog.New(slog.DiscardHandler)
+		if err := validateServerOptions(&opts, nil, logger); err != nil {
+			t.Fatalf("validateServerOptions: %v", err)
+		}
+		if opts.token != joinToken {
+			t.Errorf("token = %q, want the join token the file holds", opts.token)
+		}
+		// And it never becomes the apiserver's static admin credential.
+		if cfg := serverExecutorConfig(opts, "", logger); cfg.Token != "" {
+			t.Errorf("the join token became the static admin token %q", cfg.Token)
 		}
 	})
 }
