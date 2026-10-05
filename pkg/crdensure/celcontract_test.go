@@ -26,6 +26,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	structuralcel "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	apiservervalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"sigs.k8s.io/yaml"
@@ -80,6 +81,28 @@ func celValidator(t *testing.T) *structuralcel.Validator {
 	return validator
 }
 
+// validateSchema runs the API server's OpenAPI schema validation (the enums and
+// types) over one candidate object. CEL rules do not cover enums, so the enum
+// half of the distributed shape is proven through this path.
+func validateSchema(t *testing.T, obj map[string]any) field.ErrorList {
+	t.Helper()
+
+	var v1CRD apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(crd.MLXModelCRD(), &v1CRD); err != nil {
+		t.Fatalf("decode the shipped MLXModel manifest: %v", err)
+	}
+	var internal apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(
+		v1CRD.Spec.Versions[0].Schema.OpenAPIV3Schema, &internal, nil); err != nil {
+		t.Fatalf("convert the shipped schema to its internal form: %v", err)
+	}
+	validator, _, err := apiservervalidation.NewSchemaValidator(&internal)
+	if err != nil {
+		t.Fatalf("build the schema validator: %v", err)
+	}
+	return apiservervalidation.ValidateCustomResource(field.NewPath(""), obj, validator)
+}
+
 // validateCEL runs the compiled validator over one candidate object, exactly as
 // admission would on a CREATE (no oldObj).
 func validateCEL(t *testing.T, obj map[string]any) field.ErrorList {
@@ -108,21 +131,23 @@ func modelObject(mutate ...func(spec map[string]any)) map[string]any {
 	}
 }
 
-// TestCELRejectsReservedDistributed is the M8.5-a1 CEL slice: a spec that sets
-// the reserved spec.distributed field is REJECTED by the rule the shipped CRD
-// carries.
+// TestCELAcceptsDistributedShape is the M17.4-d5 CEL slice: spec.distributed is
+// no longer reserved. The MLXModel rule validates its shape (ranks set and at
+// least 2, one rank per node) and the enums on backend and parallelism reject
+// anything else, so a well-formed sharding request is admitted for the operator
+// to place and a malformed one is refused with a legible reason.
 //
-// The field is representable on purpose, so that a sharding request can be
-// refused with a legible reason instead of ignored — and "ignored" is precisely
-// what it degrades to if this rule stops working: no controller reads
-// spec.distributed, so the model would serve single-node and report success.
-// Nothing but admission stands between a user asking for sharding and getting a
-// green status that means the opposite.
-func TestCELRejectsReservedDistributed(t *testing.T) {
+// The rule and the operator that honours the field ship in one binary, so
+// admitting ranks: 2 can never serve single-node and report success.
+func TestCELAcceptsDistributedShape(t *testing.T) {
+	dist := func(d map[string]any) func(map[string]any) {
+		return func(s map[string]any) { s["distributed"] = d }
+	}
 	cases := []struct {
 		name       string
 		spec       func(map[string]any)
 		wantReject bool
+		wantText   string
 	}{
 		{
 			name:       "a spec that does not mention distributed is accepted",
@@ -130,49 +155,65 @@ func TestCELRejectsReservedDistributed(t *testing.T) {
 			wantReject: false,
 		},
 		{
-			name:       "distributed with nodes set is rejected",
-			spec:       func(s map[string]any) { s["distributed"] = map[string]any{"nodes": int64(4)} },
-			wantReject: true,
+			name:       "ranks 2, ring, tensor is accepted",
+			spec:       dist(map[string]any{"ranks": int64(2), "backend": "ring", "parallelism": "tensor"}),
+			wantReject: false,
 		},
 		{
-			name: "an EMPTY distributed object is still rejected",
-			// has() is true for a present-but-empty object, and it must be: an
-			// empty {} is still a user asking for sharding, and accepting it
-			// would serve the model single-node under a spec that says otherwise.
-			spec:       func(s map[string]any) { s["distributed"] = map[string]any{} },
-			wantReject: true,
+			name:       "ranks alone is accepted",
+			spec:       dist(map[string]any{"ranks": int64(3)}),
+			wantReject: false,
 		},
 		{
-			name:       "distributed alongside every other field is still rejected",
-			spec:       func(s map[string]any) { s["replicas"] = int64(2); s["distributed"] = map[string]any{"nodes": int64(2)} },
+			name:       "ranks 1 is rejected by the rule",
+			spec:       dist(map[string]any{"ranks": int64(1)}),
 			wantReject: true,
+			wantText:   "spec.distributed.ranks must be set and at least 2",
+		},
+		{
+			name:       "an EMPTY distributed object is rejected for the missing ranks",
+			spec:       dist(map[string]any{}),
+			wantReject: true,
+			wantText:   "spec.distributed.ranks must be set and at least 2",
+		},
+		{
+			name:       "backend nccl is rejected by the enum",
+			spec:       dist(map[string]any{"ranks": int64(2), "backend": "nccl"}),
+			wantReject: true,
+			wantText:   "backend",
+		},
+		{
+			name:       "parallelism expert is rejected by the enum",
+			spec:       dist(map[string]any{"ranks": int64(2), "parallelism": "expert"}),
+			wantReject: true,
+			wantText:   "parallelism",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			errs := validateCEL(t, modelObject(tc.spec))
+			obj := modelObject(tc.spec)
+			errs := append(validateCEL(t, obj), validateSchema(t, obj)...)
 			if tc.wantReject {
 				if len(errs) == 0 {
-					t.Fatal("the CEL rule accepted a spec that sets the reserved distributed field")
+					t.Fatal("the validation accepted a malformed spec.distributed block")
 				}
-				joined := errs.ToAggregate().Error()
-				if !strings.Contains(joined, "spec.distributed") {
-					t.Errorf("rejection message %q does not name spec.distributed; the reason is the whole reason the field is representable", joined)
+				if joined := errs.ToAggregate().Error(); !strings.Contains(joined, tc.wantText) {
+					t.Errorf("rejection message %q does not contain %q", joined, tc.wantText)
 				}
 				return
 			}
 			if len(errs) != 0 {
-				t.Fatalf("the CEL rule rejected a valid spec: %v", errs.ToAggregate())
+				t.Fatalf("the validation rejected a valid spec: %v", errs.ToAggregate())
 			}
 		})
 	}
 }
 
-// TestCELRuleIsScopedToSpec pins that the reserved-field rule is attached to the
-// spec sub-schema and not to the object root.
+// TestCELRuleIsScopedToSpec pins that the shape rule is attached to the
+// spec.distributed sub-schema and not to the object root.
 //
-// A rule hung off the root would evaluate has(self.distributed) against the whole
+// A rule hung off the root would evaluate has(self.ranks) against the whole
 // custom resource, where the field never exists — so it would accept every spec
 // while looking, in the manifest, exactly like a rule that works. That is the
 // silent failure this assertion exists to catch, and it is not visible from the
@@ -184,17 +225,18 @@ func TestCELRuleIsScopedToSpec(t *testing.T) {
 	}
 	root := v1CRD.Spec.Versions[0].Schema.OpenAPIV3Schema
 	if len(root.XValidations) != 0 {
-		t.Errorf("the schema root carries %d validation rules; a reserved-field rule there would never fire", len(root.XValidations))
+		t.Errorf("the schema root carries %d validation rules; a shape rule there would never fire", len(root.XValidations))
 	}
 	spec, ok := root.Properties["spec"]
 	if !ok {
 		t.Fatal("the schema has no spec property")
 	}
-	if len(spec.XValidations) == 0 {
-		t.Fatal("spec carries no x-kubernetes-validations")
+	distributed, ok := spec.Properties["distributed"]
+	if !ok {
+		t.Fatal("spec.distributed is not declared; an undeclared field is pruned before CEL ever sees it, so the rule could never fire")
 	}
-	if _, ok := spec.Properties["distributed"]; !ok {
-		t.Error("spec.distributed is not declared; an undeclared field is pruned before CEL ever sees it, so the rule could never fire")
+	if len(distributed.XValidations) == 0 {
+		t.Fatal("spec.distributed carries no x-kubernetes-validations")
 	}
 }
 

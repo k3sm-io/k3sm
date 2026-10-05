@@ -68,6 +68,7 @@ K3SM_ROOT="$(cd "$HERE/../.." && pwd)"
 WS_ROOT="$(cd "$K3SM_ROOT/.." && pwd)"
 APIS_CRD="$WS_ROOT/apis/config/crd/embed.go"
 SERVER_GO="$K3SM_ROOT/cmd/k3sm/server.go"
+PHASES_GO="$K3SM_ROOT/cmd/k3sm/serverphases.go"
 SELF="$HERE/B224.sh"
 
 PASS=0; FAIL=0
@@ -79,7 +80,8 @@ echo "==> k3sm B224 acceptance (server bring-up ensures the MeshPeer CRD, fail-c
 b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
 [ -f "$SERVER_GO" ] || b0=no
-ladder "$b0" "b224.0  gate parses (bash -n) + cmd/k3sm/server.go present"
+[ -f "$PHASES_GO" ] || b0=no
+ladder "$b0" "b224.0  gate parses (bash -n) + cmd/k3sm/server.go, cmd/k3sm/serverphases.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "B224: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
@@ -121,15 +123,44 @@ ladder "$w" "b224.1  runServer calls ensureMeshPeerCRD(opts.meshIP), applying cr
 # ---- b224.2 — the ORDER, read straight out of the source -------------------
 # The invariant that makes the fix worth anything: the CRD exists before anything can
 # write a MeshPeer. startBootstrapServer opens the join listener, so a CRD ensured
-# after it would still lose whichever worker won the race. Asserted here by line
-# number as well as by the Go AST leg below — this one stays readable in a gate log.
-ens_ln="$(grep -n 'ensureMeshPeerCRD(ctx, opts\.meshIP,' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-enr_ln="$(grep -n 'newMeshEnroller(restCfg' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-sup_ln="$(grep -n 'startBootstrapServer(ctx, deps' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-if [ -n "$ens_ln" ] && [ -n "$enr_ln" ] && [ -n "$sup_ln" ] && [ "$ens_ln" -lt "$enr_ln" ] && [ "$enr_ln" -lt "$sup_ln" ]; then
-	ladder ok "b224.2  ensure(:$ens_ln) precedes newMeshEnroller(:$enr_ln) precedes startBootstrapServer(:$sup_ln)"
+# after it would still lose whichever worker won the race. Since the server
+# decomposition the three calls live in different functions, so the order is pinned
+# structurally, never by line numbers across files:
+#   (i)  newMeshEnroller(restCfg is called ONLY inside enrollServerMesh, and
+#        startBootstrapServer(ctx, deps ONLY inside startJoinSupervisor (serverphases.go);
+#   (ii) runServer (server.go) calls ensureMeshPeerCRD, returning on its error, BEFORE
+#        it invokes enrollServerMesh and startJoinSupervisor.
+# Line numbers below are offsets within runServer's own body. The Go AST leg below
+# backs this with a compiled check.
+func_body() { awk -v re="$2" '$0 ~ re {on=1} on {print} on && /^}/ {exit}' "$1"; }
+o=ok
+enr_body="$(func_body "$PHASES_GO" '^func enrollServerMesh[(]')"
+sup_body="$(func_body "$PHASES_GO" '^func startJoinSupervisor[(]')"
+drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
+printf '%s\n' "$enr_body" | grep -q 'newMeshEnroller(restCfg' || o=no
+printf '%s\n' "$sup_body" | grep -q 'startBootstrapServer(ctx, deps' || o=no
+# The only call sites in the command's non-test source (a second site outside the
+# phase helper would escape the ordering this rung pins).
+nontest_go="$(cd "$K3SM_ROOT/cmd/k3sm" && ls -- *.go | grep -v '_test\.go$')"
+sites() { (cd "$K3SM_ROOT/cmd/k3sm" && printf '%s\n' "$nontest_go" | xargs grep -c -- "$1" | grep -v ':0$' | tr '\n' ' ' | sed 's/ $//') || true; }
+enr_sites="$(sites 'newMeshEnroller(restCfg')"
+sup_sites="$(sites 'startBootstrapServer(ctx, deps')"
+[ "$enr_sites" = "serverphases.go:1" ] || o=no
+[ "$sup_sites" = "serverphases.go:1" ] || o=no
+ladder "$o" "b224.2  newMeshEnroller only in enrollServerMesh ($enr_sites), startBootstrapServer only in startJoinSupervisor ($sup_sites)"
+ens_ln="$(printf '%s\n' "$drive_body" | grep -n 'if err = ensureMeshPeerCRD(ctx, opts\.meshIP,' | head -1 | cut -d: -f1 || true)"
+ret_ok=no
+if [ -n "$ens_ln" ]; then
+	# the ensure's error check closes within three lines and returns the error
+	printf '%s\n' "$drive_body" | sed -n "$ens_ln,$((ens_ln + 4))p" | tr '\n' ' ' |
+		grep -qE '\}, logger\); err != nil \{[[:space:]]+return err' && ret_ok=ok
+fi
+enr_ln="$(printf '%s\n' "$drive_body" | grep -n 'enrollServerMesh(ctx, plan' | head -1 | cut -d: -f1 || true)"
+sup_ln="$(printf '%s\n' "$drive_body" | grep -n 'startJoinSupervisor(ctx, plan' | head -1 | cut -d: -f1 || true)"
+if [ "$ret_ok" = ok ] && [ -n "$enr_ln" ] && [ -n "$sup_ln" ] && [ "$ens_ln" -lt "$enr_ln" ] && [ "$enr_ln" -lt "$sup_ln" ]; then
+	ladder ok "b224.2  runServer: ensureMeshPeerCRD(+$ens_ln, returns on error) precedes enrollServerMesh(+$enr_ln) precedes startJoinSupervisor(+$sup_ln)"
 else
-	ladder no "b224.2  ensure(:${ens_ln:-none}) must precede newMeshEnroller(:${enr_ln:-none}) and startBootstrapServer(:${sup_ln:-none})"
+	ladder no "b224.2  runServer: ensureMeshPeerCRD(+${ens_ln:-none}, returns-on-error=$ret_ok) must precede enrollServerMesh(+${enr_ln:-none}) and startJoinSupervisor(+${sup_ln:-none})"
 fi
 
 # ---- Go leg runner (CGO_ENABLED=1) -----------------------------------------

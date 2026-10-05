@@ -18,8 +18,11 @@ already have the binary. See [The Data Volume](storage.md#the-data-volume).
 That step:
 
 - creates the dedicated unprivileged **`_k3sm`** user,
-- installs the minimal root networking helper (`k3sm-netd`) and the `_k3sm` LaunchDaemons
-  (`RunAtLoad` / `KeepAlive`, boot-surviving),
+- installs the minimal root networking helper (`k3sm-netd`, the `io.k3sm.netd` LaunchDaemon) and
+  the `_k3sm` LaunchDaemon that runs the node: `io.k3sm.server` on the control-plane Mac, or
+  `io.k3sm.agent` on a worker installed with `--agent` (`RunAtLoad` / `KeepAlive`, boot-surviving),
+- with `--data-volume`, installs the root `io.k3sm.datavol` LaunchDaemon, which mounts the data
+  volume at boot,
 - links **`/usr/local/bin/k3sm`** so `k3sm` is a command your shell can find,
 - writes an **admin kubeconfig** to the invoking user's home directory.
 
@@ -45,7 +48,7 @@ and one residual limitation remains (no per-pod uid isolation).
   owned by the user who installed Homebrew, so install stops before writing anything and prints the
   exact `chown`/`chmod` to run (`sudo chown root:wheel /usr/local/bin && sudo chmod 755 /usr/local/bin`).
 - LaunchDaemons under the `io.k3sm.*` reverse-DNS labels. The control plane's plist is `0600`
-  (root-only), since the arguments it carries can include a datastore password.
+  (root-only), since the arguments it carries can include a credential in a flag you added.
 - The cluster admin token in **`/var/lib/k3sm/server/token`**, mode `0600` and owned by the
   `_k3sm` service account. The daemon is told where its token is, never what it is, so the token
   does not appear in the plist, in `ps`, or in `launchctl print`. `k3sm uninstall` removes it.
@@ -113,8 +116,10 @@ k3sm's distribution ships in three generations, listed in shipping order:
    and then runs `sudo k3sm install`. The verification checks **same-origin integrity**, meaning
    the tarball matches the checksums published beside it. It does not check publisher identity;
    provenance (Developer ID + notarization) arrives with gen 3. Environment variables set the
-   options. `K3SM_INSTALL_VERSION=v0.1.0` pins a release, and it is also the repair path, since
-   an unpinned re-run jumps to latest. `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
+   options. `K3SM_INSTALL_VERSION` pins a release, and it is also the repair path, since an
+   unpinned re-run jumps to latest. The variable must reach `sh`, so it goes after the pipe:
+   `curl -fsSL https://k3sm.io/install.sh | K3SM_INSTALL_VERSION=vX.Y.Z sh`.
+   `K3SM_INSTALL_DOWNLOAD_ONLY=1` downloads and verifies into
    the current directory without ever running `sudo`, so you can inspect first. Re-running the
    one-liner upgrades in place, and both daemons restart briefly (see [Upgrade](upgrade.md)).
 
@@ -179,8 +184,8 @@ encrypted Secrets. This release has no key rotation and no command to decrypt th
 
 - this data root already holds a datastore (an existing cluster cannot be switched over in this
   release; encryption is for a fresh install only),
-- the server is configured as part of an HA control plane, with `--cluster-init` or `--server-join`
-  (every server would need the same key, and k3sm does not distribute one),
+- the server's carried arguments include `--cluster-init` or `--server-join` (every server would
+  need the same key, and k3sm does not distribute one),
 - the install is a worker (`--agent`).
 
 A later `sudo k3sm install` without the option keeps the key and the encryption. Passing the
@@ -198,7 +203,7 @@ uninstall` keeps both files with the rest of your cluster data.
 sudo k3sm uninstall
 ```
 
-It stops and removes both LaunchDaemons, removes `/Library/k3sm`, and removes the
+It stops and removes the k3sm LaunchDaemons (the data-volume daemon too, when there is one), removes `/Library/k3sm`, and removes the
 `/usr/local/bin/k3sm` launcher, but only that link, and only while it still points at
 `/Library/k3sm/k3sm`. A file you put there yourself, or a link you re-pointed at something else, is
 left exactly as it is. It also flushes the pf anchor an older release loaded for the mesh (k3sm itself
@@ -230,9 +235,9 @@ sudo k3sm install                                            # renders the stock
 ```
 
 That discards the flags the file lists, and nothing else. Your cluster data is untouched. An
-install refuses a carried `--datastore-endpoint` or `--datastore-endpoint-file`, because external
-datastores are not supported: HA is embedded etcd, started with `--cluster-init` on the first
-server and `--server-join` on the others.
+install refuses a carried `--datastore-endpoint` or `--datastore-endpoint-file`, because v0.1.6
+removed external-datastore HA. A multi-server control plane is not available in v0.1.6; see
+[High availability](ha.md).
 
 Install warns when it finds neither source on a data root that already holds cluster state, which is
 what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install

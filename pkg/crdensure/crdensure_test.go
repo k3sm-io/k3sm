@@ -241,7 +241,7 @@ func TestEnsureConvergesSchemaDrift(t *testing.T) {
 	if _, ok := converged.Properties["staleFromAnOlderBinary"]; ok {
 		t.Error("the stale property survived the re-ensure; the apply added to the schema instead of converging it")
 	}
-	if len(converged.XValidations) == 0 {
+	if d, ok := converged.Properties["distributed"]; !ok || len(d.XValidations) == 0 {
 		t.Error("the re-ensure did not restore the spec.distributed CEL rule")
 	}
 	if _, ok := converged.Properties["model"]; !ok {

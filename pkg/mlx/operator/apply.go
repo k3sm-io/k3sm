@@ -86,8 +86,8 @@ func (c *Controller) applyStatefulSet(ctx context.Context, sts *appsv1.StatefulS
 	return nil
 }
 
-// stampPullSecret adds the conventional image-pull Secret to the rendered pod
-// template, but ONLY when that Secret exists in the model's namespace.
+// pullSecretExists reports whether the conventional image-pull Secret exists in
+// namespace, so the rendered pods may name it.
 //
 // The existence check is the whole design. The serving image is a private
 // registry digest, so without a pull secret the kubelet pulls anonymously and
@@ -100,21 +100,26 @@ func (c *Controller) applyStatefulSet(ctx context.Context, sts *appsv1.StatefulS
 // aborting the reconcile: a pod with no pull secret fails visibly at pull time
 // with a legible message, whereas an aborted reconcile applies nothing at all and
 // says so only in the operator's own log.
-func (c *Controller) stampPullSecret(ctx context.Context, objs *mlx.Objects, namespace string) {
+func (c *Controller) pullSecretExists(ctx context.Context, namespace string) bool {
 	_, err := c.client.CoreV1().Secrets(namespace).Get(ctx, c.pullName, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
-		return
+		return false
 	case err != nil:
 		c.log.Warn("could not read the mlx image-pull secret; rendering without it",
 			"namespace", namespace, "secret", c.pullName, "err", err)
-		return
+		return false
 	}
-	spec := &objs.StatefulSet.Spec.Template.Spec
+	return true
+}
+
+// addPullSecret names the pull Secret on a rendered pod spec, idempotently: a
+// re-render must not accumulate duplicates.
+func addPullSecret(spec *corev1.PodSpec, name string) {
 	for _, ref := range spec.ImagePullSecrets {
-		if ref.Name == c.pullName {
-			return // idempotent: a re-render must not accumulate duplicates
+		if ref.Name == name {
+			return
 		}
 	}
-	spec.ImagePullSecrets = append(spec.ImagePullSecrets, corev1.LocalObjectReference{Name: c.pullName})
+	spec.ImagePullSecrets = append(spec.ImagePullSecrets, corev1.LocalObjectReference{Name: name})
 }

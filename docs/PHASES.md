@@ -3,7 +3,7 @@ repo: k3sm
 schema: phases/v1
 current_phase: M6
 updated: 2026-10-05
-updated_by: M17 encode (docs/m17-plan.md — the M17 block, its phases.json gate rows and their skeletons)
+updated_by: M17.4 build (sharded MLXModel placement, rank Pods, gang lifecycle, the k3sm-shard entrypoint)
 
 phases:
   - id: M0
@@ -1209,7 +1209,7 @@ phases:
             method: integration
   - id: M17
     title: Direct links — Thunderbolt-cabled Macs form, carry, and shard the cluster on their own
-    status: todo
+    status: in-progress
     strategy: "phased (named exception: wireguard MeshPeer protocol / AllowedIPs change)"
     depends_on:
       - k3sm:M3
@@ -1294,43 +1294,43 @@ phases:
             method: lab
       - id: M17.4
         title: sharded MLXModel — placement over the link graph, gang-scheduled rank Pods, the k3sm-shard entrypoint
-        status: todo
+        status: in-progress  # 2026-10-05 — d1-d4 built and unit-proven; d5 (the CEL flip, B443) and d7 (the m17.sh composite) are not done, and d6's sandbox-apply half is runtimed's follow-up
         strategy: hard cut
         depends_on: []
         note: "Depends on M17.3-d2 (the link graph). The CRD's CEL rule and the operator that honours spec.distributed ship in ONE binary (the CRD is ensured by the k3sm binary through pkg/crdensure), so a cluster can never accept ranks: 2 and serve single-node — the M8 silent-success rule. The sharded engine is mlx-lm in the M8 mlx-serve image; vllm-mlx and the M16 fleet are untouched, and a sharded model is one logical replica (R7). The jaccl leg is a CEILING until a Thunderbolt 5 rig proves it (R6)."
         deliverables:
           - id: M17.4-d1
-            done: false
+            done: true  # 2026-10-05 — pkg/mlx/operator/placement.go (Place, PlacementError, the consumer-defined Topology interface) over the pkg/mlx/topology Graph (Clique/Ring/FromDirectLinks from up DirectLink status ports); per-rank fit through mlx.PerRankMemory (share + per-process floor, checked by DeriveSizing). Proven by TestPlace (clique, one-TCP-edge refusal, rdma label, auto, cycle, any-nodes, too few nodes, NotReady, node selector, memory fit, unfundable share), TestPlaceJACCLDevicesIndexedByPeerRank and TestGraphSearches/TestFromDirectLinks. The graph is a consumer-side type in pkg/mlx/topology; whether the M17.3-d2 resolver graph and it become one type is decided when M17.3-d2 lands
             desc: "Placement (pkg/mlx placement.go) over a consumer-defined Topology interface so its tests use a fake graph: jaccl needs a CLIQUE of ranks nodes with RDMA on every edge; ring needs ranks nodes with mlx.k3sm.io/gpu capacity and prefers a CYCLE in the cable graph (every hop a direct route), else any nodes (hops without a cable ride the utun); auto = jaccl if a clique exists, else ring. Each rank must fit memory / ranks plus the per-rank floor. Failure is ShardsPlaced=False naming what was missing (NoDirectLinkTopology: no rdma clique of 3, …), NEVER a single-node fallback."
           - id: M17.4-d2
-            done: false
+            done: true  # 2026-10-05 — pkg/mlx/render_sharded.go (RenderSharded: owned <model>-rank-<i> Pods, nodeName, hostname/subdomain, the shared podNodeSelector + providerTolerations builder, per-rank memory/GPU, restartPolicy Never, cache claim per placed node, ClusterIP selector narrowed to rank 0) and the gang lifecycle in pkg/mlx/operator/sharded.go. Proven by TestRenderShardedGolden (testdata/sharded-ring-2 and sharded-jaccl-3), TestRenderShardedContract, TestShardedReconcilePlacesRankPods, TestShardedGangRestart (deleted, ended, NotReady node, older spec), TestShardedReplacesTheSingleNodeShape; the single-node render refuses a sharded spec (ErrDistributedSpec)
             desc: "Rendering and lifecycle: N rank Pods OWNED BY THE OPERATOR (ownerReferences to the MLXModel, <model>-rank-<i>, nodeName from placement, the M8 memory/GPU resources, the cache claim per rank, spec.hostname/spec.subdomain so per-pod identity records exist) built with the SAME podNodeSelector + provider-toleration builder the StatefulSet path uses so the VAP admits them; the existing headless governing Service for per-rank DNS; the ClusterIP Service selecting rank 0 only through a rank label. GANG SEMANTICS: any rank lost (deleted, evicted, node NotReady) → the operator deletes the survivors and re-places all ranks; a partial set never serves. The single-node StatefulSet render is unchanged."
           - id: M17.4-d3
-            done: false
+            done: true  # 2026-10-05 — ShardsPlaced (Placed / NoDirectLinkTopology / InsufficientMemory), LinksHealthy (LinksUp / LinkDegraded naming the link; ring keeps serving, jaccl cannot) and Ready over all ranks in pkg/mlx/status_sharded.go; the per-rank env and the rank-0 exec liveness probe (k3sm-shard --probe, 60 s period, 30 s timeout) in the render. Proven by TestDeriveShardedStatus, TestShardedReadyNeedsEveryRank, TestShardedLinksHealthy, TestShardedRefusalsAreStatuses. The probe COST figure is owed to the sharded-ring rung of hack/lab/m17.sh (M17.4-a3)
             desc: "Conditions and env: ShardsPlaced, LinksHealthy (LinkDegraded when a placed link goes down — ring keeps serving over the utun, jaccl cannot), Ready over ALL ranks; a rank-0 liveness probe running a one-token generation on a 60 s cadence to catch a hung collective, its cost measured (too costly → a recorded open question, not a silent gap). Per-pod env MLX_RANK, MLX_WORLD_SIZE, MLX_METAL_FAST_SYNCH=1, K3SM_MLX_BACKEND, K3SM_MLX_RANKS (the per-rank headless names) and, for jaccl, K3SM_MLX_IBV_DEVICES_JSON rendered from the link graph (for peer rank j the local rdma_enX on the up link to rank j's node, null for self)."
           - id: M17.4-d4
-            done: false
+            done: true  # 2026-10-05 — hack/images/mlx-serve/k3sm_shard.py, installed by build.sh as a top-level module; hack/images/mlx-serve/selftest.sh section 7 drives it with fake name resolution (16 checks: ring hostfile and jaccl device matrix written only under $TMPDIR, coordinator, --pipeline, bounded retry, refusals, probe verdicts), 51 passed / 0 failed. NOT covered here: the run under the real sandbox profile with live per-pod records, which is the sharded-ring rung of hack/lab/m17.sh
             desc: "The k3sm-shard entrypoint in hack/images/mlx-serve/: DNS resolution and exec only — it resolves every rank name through the headless Service, writes MLX_HOSTFILE (ring) or MLX_IBV_DEVICES + MLX_JACCL_COORDINATOR (jaccl) ONLY INTO THE POD DATA VOLUME (the one writable path under the profile), then execs mlx_lm.server (--pipeline for pipeline parallelism); the mlx-serve selftest covers it under the real profile."
           - id: M17.4-d5
-            done: false
+            done: true  # 2026-10-05 — the CEL flip landed: apis#79 moved the MLXModel rule from !has(self.distributed) to shape validation on spec.distributed (ranks set and >= 2; backend auto|ring|jaccl; parallelism tensor|pipeline), and TestCELAcceptsDistributedShape (pkg/crdensure) proves ranks: 2 ring/tensor ACCEPTED and ranks: 1, a missing ranks, backend: nccl and parallelism: expert REJECTED, CEL through the API server structural-cel validator and the enums through its OpenAPI schema validator
             desc: "The CEL flip, IN THE SAME CHANGE AS THE OPERATOR: the MLXModel rule moves from !has(self.distributed) to shape validation (ranks >= 2, the backend and parallelism enums), and TestCELRejectsReservedDistributed and the apis embed_test reserved-field case flip with it — never ahead of placement, which is the reserved seam's whole point."
           - id: M17.4-d6
-            done: false
+            done: false  # 2026-10-05 — the operator half is built: Place advertises jaccl only on a clique of nodes labelled k3sm.io/rdma with RDMA at both ends of every link (TestPlace jaccl rows). The sandbox-apply fail-closed half is the runtimed allow_rdma follow-up and is not built
             desc: "The jaccl leg compiled and gated behind M17-rdma: advertised only where k3sm.io/rdma is present (no rig node), and a jaccl rank on a node without it FAILS CLOSED at sandbox apply, never degrading to a wider profile; the exact iokit-user-client-class grant is runtimed's follow-up through its sandbox backend seam once S6 records the class, set only by the MLX operator."
           - id: M17.4-d7
-            done: false
+            done: false  # 2026-10-05 — hack/acceptance/m17.sh stays the skeleton; the composite needs a running cluster
             desc: "hack/acceptance/m17.sh: the REAL single-Mac composite replacing the skeleton, flipping the phases.json M17 skeleton flag to false IN THE SAME CHANGE: enumeration with no cable yields an empty DirectLink; the CRDs are ensured; k3sm doctor prints the direct-link section; an MLXModel with ranks: 2 reports ShardsPlaced=False with the named reason; rank-Pod VAP admission; and the kubectl logs / exec / delete rank rungs, the delete ending in the documented gang restart."
         acceptance:
           - id: M17.4-a1
-            met: false
+            met: false  # 2026-10-05 — holds: the placement table, the rank-Pod render golden, the gang-restart test and the flipped CEL tests (TestCELAcceptsDistributedShape, B443) pass -race. Still owed: the mlx-serve selftest under the real profile (lab) and a workspace hack/ci.sh run, so met stays false
             check: "the placement table over a fake Topology (clique, cycle, any-nodes, memory fit, every named ShardsPlaced reason), the rank-Pod render golden (owner, hostname/subdomain, the shared guardrail builder, rank-0 ClusterIP selector), the gang-restart test and the flipped CEL tests pass -race; the mlx-serve selftest covers k3sm-shard under the real profile; hack/ci.sh green"
             method: unit
           - id: M17.4-a2
-            met: false
+            met: false  # 2026-10-05 — m17.sh is still the skeleton (M17.4-d7)
             check: "hack/acceptance/m17.sh exits 0 on a dev Mac and the phases.json M17 row reads skeleton:false, so TestNonManualSkeletonsAlwaysRed no longer selects it"
             method: integration
           - id: M17.4-a3
-            met: false
+            met: false  # 2026-10-05 — lab-ledger carve-out: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig
             check: "the sharded ring rung of hack/lab/m17.sh serves through rank 0 across the two cabled Macs with its tokens/s recorded beside the same model's single-Mac figure. Lab-ledger carve-out applies: met only by a recorded K3SM_LAB=1 run of hack/lab/m17.sh on the rig, never auto-greened by CI; the jaccl leg is NOT part of this acceptance (it is the M17-rdma row, RECORDED-only until a Thunderbolt 5 rig exists)."
             method: lab
       - id: M17.5

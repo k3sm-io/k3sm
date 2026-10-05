@@ -118,7 +118,7 @@ ladder "$a" "b213.2  agentNodeOptions passes the join-delivered pair through, an
 
 # ---- b213.3 — the control-plane half (the observed defect) -----------------
 s=ok
-grep -qE 'if err := setServerKubeletServing\(&nodeOpts, hierarchy, opts\.meshIP\); err != nil' "$SERVER_GO" || s=no
+grep -qE 'if err := setServerKubeletServing\(&nodeOpts, plan\.hierarchy, opts\.meshIP\); err != nil' "$SERVER_GO" || s=no
 grep -qE 'hierarchy\.Cluster\.IssueServing\(' "$SERVER_GO" || s=no
 grep -qE 'kubeletServingValidFor = 365 \* 24 \* time\.Hour' "$SERVER_GO" || s=no
 grep -qE 'proxyableNodeIP\(advertised\)' "$SERVER_GO" || s=no
@@ -127,14 +127,31 @@ ladder "$s" "b213.3  a mesh server mints its OWN cluster-CA serving cert (365d, 
 # The ORDER: the mint reads the finished nodeOpts, so it must sit after the literal
 # and before the node starts. A mint placed earlier would compute its SAN set off
 # fields that are not filled in yet — the SAN-mismatch reproduction of this defect.
-lit_ln="$(grep -n 'nodeOpts := nodeOptions{' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-mint_ln="$(grep -n 'setServerKubeletServing(&nodeOpts, hierarchy' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-start_ln="$(grep -n 'startNode(ctx, nodeOpts)' "$SERVER_GO" | head -1 | cut -d: -f1 || true)"
-if [ -n "$lit_ln" ] && [ -n "$mint_ln" ] && [ -n "$start_ln" ] &&
-	[ "$lit_ln" -lt "$mint_ln" ] && [ "$mint_ln" -lt "$start_ln" ]; then
-	ladder ok "b213.3  nodeOptions literal(:$lit_ln) < setServerKubeletServing(:$mint_ln) < startNode(:$start_ln)"
+# Since the server decomposition the literal, the mint and startNode live in two
+# functions, so the order is pinned structurally, never by line numbers across
+# functions: (i) serverNodeOptions builds the literal, mints on it, and its ONLY
+# success return hands back that minted value; (ii) runServer takes nodeOpts from
+# serverNodeOptions, never reassigns it, and passes it to startNode.
+func_body() { awk -v re="$2" '$0 ~ re {on=1} on {print} on && /^}/ {exit}' "$1"; }
+build_body="$(func_body "$SERVER_GO" '^func serverNodeOptions[(]')"
+drive_body="$(func_body "$SERVER_GO" '^func runServer[(]')"
+lit_ln="$(printf '%s\n' "$build_body" | grep -n 'nodeOpts := nodeOptions{' | head -1 | cut -d: -f1 || true)"
+mint_ln="$(printf '%s\n' "$build_body" | grep -n 'setServerKubeletServing(&nodeOpts, plan\.hierarchy' | head -1 | cut -d: -f1 || true)"
+ret_ln="$(printf '%s\n' "$build_body" | grep -n 'return nodeOpts, nil' | head -1 | cut -d: -f1 || true)"
+ret_n="$(printf '%s\n' "$build_body" | grep -c 'return nodeOpts' || true)"
+if [ -n "$lit_ln" ] && [ -n "$mint_ln" ] && [ -n "$ret_ln" ] && [ "$ret_n" = 1 ] &&
+	[ "$lit_ln" -lt "$mint_ln" ] && [ "$mint_ln" -lt "$ret_ln" ]; then
+	ladder ok "b213.3  serverNodeOptions: nodeOptions literal(+$lit_ln) < setServerKubeletServing(+$mint_ln) < its only success return(+$ret_ln)"
 else
-	ladder no "b213.3  ordering: nodeOptions literal(:${lit_ln:-none}) < setServerKubeletServing(:${mint_ln:-none}) < startNode(:${start_ln:-none})"
+	ladder no "b213.3  serverNodeOptions ordering: literal(+${lit_ln:-none}) < setServerKubeletServing(+${mint_ln:-none}) < sole 'return nodeOpts, nil'(+${ret_ln:-none}, count=${ret_n:-0})"
+fi
+call_ln="$(printf '%s\n' "$drive_body" | grep -n 'nodeOpts, err := serverNodeOptions(' | head -1 | cut -d: -f1 || true)"
+start_ln="$(printf '%s\n' "$drive_body" | grep -n 'return startNode(ctx, nodeOpts)' | head -1 | cut -d: -f1 || true)"
+reassign="$(printf '%s\n' "$drive_body" | grep -cE '(^|[^.[:alnum:]_])nodeOpts(\.[[:alnum:]_]+)?(, [[:alnum:]_]+)?[[:space:]]*(=[^=]|:=)' || true)"
+if [ -n "$call_ln" ] && [ -n "$start_ln" ] && [ "$call_ln" -lt "$start_ln" ] && [ "$reassign" = 1 ]; then
+	ladder ok "b213.3  runServer: nodeOpts from serverNodeOptions(+$call_ln) reaches startNode(+$start_ln) unreassigned"
+else
+	ladder no "b213.3  runServer: serverNodeOptions(+${call_ln:-none}) < startNode(ctx, nodeOpts)(+${start_ln:-none}), assignments to nodeOpts=${reassign:-0} (want 1)"
 fi
 
 # ---- b213.4 — the rotation report stays complete ---------------------------

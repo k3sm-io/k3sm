@@ -10,27 +10,65 @@ pin, its date, and the tarball's sha256.
 
 ## Unreleased
 
+## v0.1.6 — 2026-10-05
+
+Hosts survive heavy pod-network traffic, shell tools see mounted paths everywhere, and Pods get curl, TLS, eviction, logs on disk and re-attach across a daemon restart.
+
+### Breaking
+
+- **Runtime proto: `PodBox.rootfs_path` is removed.** Anyone building against the runtime gRPC contract must stop sending the field and regenerate. The daemon now derives the root filesystem path itself and ignores a caller-supplied one. Nothing changes for a Pod author or for the shipped `k3sm` binary.
+- **External-datastore HA is removed, and a multi-server control plane is not available in this release.** The `k3sm server` flags `--datastore-endpoint` and `--datastore-endpoint-file`, and their environment variable, are gone, and an old argument list now exits on an unknown flag instead of quietly falling back to SQLite. There is no conversion from an external database to the new HA datastore. Single-node installs are unchanged and keep the SQLite-backed datastore.
+
 ### Added
 
-- **`k3sm install --data-volume`.** Puts the data root on a dedicated, size-capped APFS volume
-  instead of a plain directory on the boot disk. It creates a case-sensitive volume in the boot
-  container (or adopts one you already declared in `/etc/fstab`), mounts it at `/var/lib/k3sm`
-  hidden from Finder, Spotlight and Time Machine, and migrates any existing data root onto it,
-  verifying the copy before the old tree is renamed aside. `--data-volume-size` sets the quota
-  (100 GiB by default, a floor of 32 GiB), and `--data-volume-encrypt` protects it with a random
-  passphrase kept in the System keychain.
-- **`k3sm datavol mount|status|delete`.** `mount` is what the new `io.k3sm.datavol` LaunchDaemon
-  runs at boot and is safe to run by hand; `status` reports the volume, its quota, its usage and
-  any leftover pre-migration copy with no privilege needed; `delete --yes` destroys the volume and
-  every declaration of it.
-- **`k3sm status` reports the data volume.** The data-root row names the volume, its quota and its
-  usage, and warns once usage passes 90% of the quota. A new `datavol` row tracks the boot mount
-  daemon, and a `pre-volume` row appears while a migration's pre-migration copy is still on disk.
+- **A defence against the host kernel panic seen on the pod network.** Every pod address is a loopback alias, and a connection that outlived its alias could re-route onto the mesh interface and trip a macOS kernel panic from an ordinary send. TCP connections on the pod network now have their segment size lowered after connect, and a torn-down pod's address is blackholed so an open connection fails cleanly instead of re-routing.
+- **Shell tools see mounted paths.** The re-signed shadow set now covers `tar` and the usual coreutils, and the path shim also rebases directory and metadata calls (`mkdir`, `rmdir`, `rm`, `mv`, `chmod`, `ln`, `touch`, `cp`) and recursive walks (`rm -r`, `ls -R`, `chmod -R`, `find`, `cp -R`). `kubectl cp` into and out of a mounted path works. `sudo k3sm install` lays the set down.
+- **curl and TLS clients work in native Pods.** Pods may read the system TLS configuration, so the stock `curl` and anything linked against the system SSL library no longer abort at startup before they dial.
+- **Node identity under the Node authorizer.** The server's in-process node now runs as `system:node:<name>` instead of the admin identity, so a node bug can no longer act as cluster admin. The set of RBAC objects k3sm creates is pinned by a golden test.
+- **Node-pressure eviction.** When memory runs low the node marks `MemoryPressure` and evicts one Pod at a time, ranked as the kubelet ranks them, with the usual `Evicted` Event and `DisruptionTarget` condition. After three evictions in five minutes it halts and says so on the node.
+- **`k3sm install --data-volume`.** Puts the data root on a dedicated, size-capped APFS volume instead of a plain directory on the boot disk. It creates a case-sensitive volume in the boot container (or adopts one you already declared in `/etc/fstab`), mounts it at `/var/lib/k3sm` hidden from Finder, Spotlight and Time Machine, and migrates any existing data root onto it, verifying the copy before the old tree is renamed aside. `--data-volume-size` sets the quota (100 GiB by default, a floor of 32 GiB), and `--data-volume-encrypt` protects it with a random passphrase kept in the System keychain.
+- **`k3sm datavol mount|status|delete`.** `mount` is what the new `io.k3sm.datavol` LaunchDaemon runs at boot and is safe to run by hand; `status` reports the volume, its quota, its usage and any leftover pre-migration copy with no privilege needed; `delete --yes` destroys the volume and every declaration of it.
+- **`k3sm status` reports the data volume and more.** The data-root row names the volume, its quota and its usage, and warns once usage passes 90% of the quota. A `datavol` row tracks the boot mount daemon, and a `pre-volume` row appears while a migration's pre-migration copy is still on disk. Status also flags Pods stuck terminating, prints the escape, reports a worker's agent daemon and its credential, reports drift in the shadow set, and renders `k3sm doctor` on the status record with `--report`. A worker no longer shows control-plane rows.
+- **Container logs on disk.** The runtime writes container logs under `/var/log/pods` in the CRI format, and `kubectl logs` reads them as the kubelet does, with rotation and cleanup. A vm container's status names its log file.
+- **A resident shim keeps container output and exit status.** Native containers keep stdio and exit status in a small resident process, so output written just before exit reaches the log. Exec and teardown work on Pods that run under it.
+- **Pods survive a node-daemon restart.** A restarted daemon re-attaches live Pods instead of recreating them, and restarts a single container of a re-attached Pod in place.
+- **Image pull failures read like the kubelet's.** A failed pull shows as a retryable waiting state (`ErrImagePull`, `ImagePullBackOff`) instead of a failed container.
+- **Per-container stop and ephemeral containers.** A single container can be stopped terminally, and ephemeral containers and the Pod-level `runAsNonRoot` are mapped.
+- **Projected volumes refresh.** ConfigMap, Secret and projected volumes update at the kubelet's cadence with an atomic swap, so a running Pod sees new content.
+- **Helm charts.** `HelmChart` and `HelmChartConfig` objects in `helm.k3sm.io/v1` install and uninstall charts, with the same fields as k3s.
+- **Operator manifests.** Manifests placed in a root-owned directory are applied to the cluster automatically.
+- **Secrets encryption at rest.** `sudo k3sm install --secrets-encryption` generates a key on the Mac and encrypts Secrets in the datastore of a new cluster. It is opt-in.
+- **`sudo k3sm uninstall --purge --yes`.** Removes what a plain uninstall keeps: the cluster data, the service user, the data volume and the kubeconfig context.
+- **Worker lifecycle.** A joining Mac gets its own agent LaunchDaemon, reuses its stored node credential on restart, and deregisters from the cluster on uninstall. `--mesh-ip` lets the installer own the server's mesh address.
+- **Ingress, load balancers and service policy.** The ingress binds through the network helper and publishes its endpoints. `loadBalancerSourceRanges` is enforced on LoadBalancer traffic. A Service published on a port the node keeps private is rejected. Pods get namespace service links in their environment.
+- **MLX scheduling.** `MLXModel` derives GPU slots and a cumulative memory fit from the ceiling and reports replica counts in status.
+- **Faster proxy paths.** The UDP relay and the Service proxy pick routes without locks, and the per-query and per-connection allocation counts dropped.
+
+### Experimental
+
+- **Groundwork for Thunderbolt direct links between Macs.** The contracts (`MeshPeer` endpoint candidates, the `net.k3sm.io/v1alpha1` `DirectLink` type, the derived link addresses) and the networking library and root-helper verbs landed; nothing is wired into the node in this release, so no link is enumerated or used yet and no `DirectLink` object appears. The API is alpha.
+- **Sharded MLX models (alpha, trusted tenancy only).** An `MLXModel` may set `spec.distributed` (`ranks`, `backend`, `parallelism`); the operator places the ranks as gang-scheduled rank Pods with per-rank DNS and reports placement and link health in status. In this release the `ring` backend places over the existing mesh, because direct links are not yet wired into the node; the `jaccl` backend needs RDMA-capable direct links and reports `ShardsPlaced=False` until they exist. Not yet run on hardware.
 
 ### Changed
 
-- The data-root refusal message now names `sudo k3sm datavol mount` as the remedy for a declared
-  but unmounted data root.
+- **Native Pods refuse `emptyDir` medium `Memory`.** A native Pod that asks for a memory-backed emptyDir is refused with a clear error instead of silently getting a disk-backed one.
+- **Workers do not enforce NetworkPolicy.** A joined worker resolves policy against its own Pods only and enforces nothing for traffic it cannot attribute. Policies are enforced for Pods on the server node. The limitations page lists the ceiling.
+- **A mid-install failure leaves the old install intact.** The install root is staged and swapped in atomically, and the staged inputs are verified before anything is written.
+- **The data-root refusal message** now names `sudo k3sm datavol mount` as the remedy for a declared but unmounted data root.
+
+
+### Fixed
+
+- **Credentials and logs are locked down.** The admin token and the datastore connection string no longer appear on the server's command line, the mesh keys live under a root-owned state root, and the daemon log directory is restricted to root and admin.
+- **Installs refuse unsafe paths.** The installer refuses a symlink where it would change ownership, an untrusted launcher directory and a join to the control plane's own node name, and says how to fix each.
+- **Worker joins are sturdier.** A join waits for the network helper and for a recovered start before judging failure, preflights the join endpoint and its CA, releases a mesh allocation when the join fails, and issues the node certificate for the assigned mesh address. Anonymous join requests and attempts per token are bounded.
+- **Mesh teardown and resume.** The mesh is torn down on exit, a busy join listener is retried, a resumed peer seed advances correctly, and MeshPeer events coalesce into one reconcile.
+- **A control plane that fails to come up says why.** A component that dies before it is marked supervised is reported, bring-up failures are recorded on the crash-loop breaker with secrets redacted from the log tail, and a toolchain-less control-plane build parks on first failure.
+- **Clean exit.** The node stops the runtime, its Linux VMs and the control plane together when it exits.
+- **Linux guests and vm Pods.** Probes dial a vm Pod at the guest's live address, PodReady waits for its transport, and guest networking waits for carrier and retransmits its address request.
+- **Sandbox hardening.** Pod profiles refuse a per-IP host in a network filter, refuse symlinked path components on every vm path, deny the daemon's private trees and loopback dials to the node's private ports, and are swept when stale.
+- **Pod bookkeeping.** Same-name Pods are told apart deterministically, force-deleted Pods are reaped after a partition heals, a postStart hook failure under `restartPolicy: Never` kills the container, and `spec.serviceAccountName` resolves from the downward API.
+- **A bare exec command resolves on the Pod's `PATH`.**
 
 ## v0.1.4 — 2026-09-06
 

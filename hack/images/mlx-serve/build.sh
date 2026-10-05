@@ -57,6 +57,11 @@ SERVE_HOST="0.0.0.0"
 # The cache mount: weights live on a volume mounted here, never in the image.
 HF_HOME_PATH="/models"
 
+# The sharded-rank entrypoint module (k3sm_shard.py beside this script). A
+# sharded MLXModel's rank Pods run it instead of the ENTRYPOINT; it execs
+# mlx_lm.server, which the engine's closure already carries.
+SHARD_MODULE="k3sm_shard"
+
 DEFAULT_TAG="ghcr.io/k3sm-io/mlx-serve:0.4.1"
 
 # ---- options ----------------------------------------------------------------
@@ -273,6 +278,19 @@ stage_tree() {
 	echo "$want" > "$stamp"
 }
 
+# stage_shard_entrypoint installs k3sm-shard, the sharded-rank entrypoint, as a
+# top-level module so a rank Pod runs it as `/bin/python3.12 -m k3sm_shard`
+# (argv[0] stays the interpreter Mach-O). It is copied on EVERY build, outside
+# the stamp-guarded staging, so an edited entrypoint never ships stale from a
+# reused stage. The single-node ENTRYPOINT below is untouched: only the
+# operator's sharded render overrides the command.
+stage_shard_entrypoint() {
+	local dest="$STAGE/lib/python3.12/site-packages/$SHARD_MODULE.py"
+	[ -d "$(dirname "$dest")" ] || die "no site-packages in the staged tree ($(dirname "$dest"))"
+	install -m 0644 "$HERE/$SHARD_MODULE.py" "$dest"
+	echo "  shard entrypoint: $SHARD_MODULE ($dest)"
+}
+
 # assert_stageable rejects the symlink shapes the builder refuses, here, where
 # the offending entry can be named — the builder's own error names only the
 # context root.
@@ -327,6 +345,7 @@ require_k3sm
 
 mkdir -p "$WORK"
 stage_tree
+stage_shard_entrypoint
 assert_stageable
 assert_context_budget
 

@@ -56,6 +56,8 @@ SELF="$HERE/B253.sh"
 NODE_GO="$K3SM_ROOT/cmd/k3sm/node.go"
 TEST_GO="$K3SM_ROOT/cmd/k3sm/nodeexit_test.go"
 PROVIDER_GO="$K3SM_ROOT/pkg/provider/runtimed.go"
+ATTACH_GO="$K3SM_ROOT/pkg/provider/runtimed_attach.go"
+PLIST_GO="$K3SM_ROOT/pkg/install/plist.go"
 DATA_ROOT="/var/lib/k3sm"
 
 PASS=0; FAIL=0
@@ -70,7 +72,9 @@ b0=ok
 [ -f "$NODE_GO" ] || b0=no
 [ -f "$TEST_GO" ] || b0=no
 [ -f "$PROVIDER_GO" ] || b0=no
-ladder "$b0" "b253.0  gate parses (bash -n) + cmd/k3sm/node.go, its exit test and pkg/provider/runtimed.go present"
+[ -f "$ATTACH_GO" ] || b0=no
+[ -f "$PLIST_GO" ] || b0=no
+ladder "$b0" "b253.0  gate parses (bash -n) + cmd/k3sm/node.go, its exit test, pkg/provider/runtimed{,_attach}.go and pkg/install/plist.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "B253: the gate or its wiring source is missing/unparseable — nothing else can run" >&2
@@ -80,9 +84,12 @@ fi
 
 # ---- b253.1 — the WIRING, read straight out of the source ------------------
 # The teardown exists AND startNode is what defers it. A closure nobody wires is
-# the bug with a unit test attached.
+# the bug with a unit test attached. The closure is named closeRuntime and
+# folded into stopRuntime (which first stops the eviction loop that acts through
+# the runtime), so the pin is that stopRuntime's body calls it.
 w=ok
-grep -qF 'stopRuntime := stopEmbeddedRuntime(prov, slog.Default())' "$NODE_GO" || w=no
+grep -qF 'closeRuntime := stopEmbeddedRuntime(prov, slog.Default())' "$NODE_GO" || w=no
+sed -n '/^[[:space:]]*stopRuntime := func() {$/,/^[[:space:]]*}$/p' "$NODE_GO" | grep -qE '^[[:space:]]*closeRuntime\(\)$' || w=no
 grep -qE '^\s*defer stopRuntime\(\)$' "$NODE_GO" || w=no
 grep -qF 'return awaitNodeExit(ctx, errc, stopRuntime)' "$NODE_GO" || w=no
 ladder "$w" "b253.1  startNode builds the embedded-runtime teardown, defers it, and runs it on both exit paths"
@@ -108,9 +115,11 @@ ladder "$c" "b253.1  stopEmbeddedRuntime takes no context (the vm bound is Close
 
 # The startup orphan sweep is the BACKSTOP that makes Close's bound a bound rather
 # than a promise: a helper still running when it expires is reaped at the next
-# start. The fix does not replace it, so it must still be wired.
+# start. The fix does not replace it, so it must still be wired: NewRuntimed
+# runs adoptNodePods, which re-attaches surviving pods and then reaps.
 r=ok
-grep -qF 'if err := rt.ReapOrphanedPods(); err != nil {' "$PROVIDER_GO" || r=no
+sed -n '/^func NewRuntimed(/,/^}/p' "$PROVIDER_GO" | grep -qE '^[[:space:]]*r\.adoptNodePods\(ctx, rt\)$' || r=no
+sed -n '/^func (r \*runtimedRuntime) adoptNodePods(/,/^}/p' "$ATTACH_GO" | grep -qF 'if err := a.ReapOrphanedPods(); err != nil {' || r=no
 ladder "$r" "b253.1  the startup pod reap is still wired into provider.NewRuntimed (the backstop for a helper that misses the bound)"
 
 # ---- b253.1 — the BUDGET, and the two copies that must not drift -----------
@@ -121,10 +130,10 @@ ladder "$r" "b253.1  the startup pod reap is still wired into provider.NewRuntim
 # it. Reading runtimed's source through `go list` rather than a relative path
 # keeps it correct in a lane, a module cache, or a sibling checkout.
 b=ok
-grep -qE '^\s*teardownRuntimedClose = 37$' "$K3SM_ROOT/pkg/install/install.go" || b=no
-grep -qF 'ExitTimeOut: serverExitTimeOut,' "$K3SM_ROOT/pkg/install/install.go" || b=no
-grep -qF 'ExitTimeOut:      agentExitTimeOut,' "$K3SM_ROOT/pkg/install/install.go" || b=no
-grep -qE '^\s*teardownControlPlane  = 30$' "$K3SM_ROOT/pkg/install/install.go" || b=no
+grep -qE '^\s*teardownRuntimedClose = 37$' "$PLIST_GO" || b=no
+grep -qF 'ExitTimeOut: serverExitTimeOut,' "$PLIST_GO" || b=no
+grep -qF 'ExitTimeOut:      agentExitTimeOut,' "$PLIST_GO" || b=no
+grep -qE '^\s*teardownControlPlane  = 30$' "$PLIST_GO" || b=no
 # The stage literals are bound to their owners by assertions, not by trust. This
 # one has an importable owner, so the binding lives in the Go test; the rung below
 # is the binding for runtimed's two, which are unexported.
@@ -139,7 +148,7 @@ if [ -z "$RUNTIMED_DIR" ] || [ ! -f "$RUNTIMED_DIR/pkg/runtime/close.go" ]; then
 else
 	vm_bound="$(grep -oE 'vmShutdownBound = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go" | grep -oE '[0-9]+' || true)"
 	close_grace="$(grep -oE 'defaultCloseGrace = [0-9]+' "$RUNTIMED_DIR/pkg/runtime/close.go" | grep -oE '[0-9]+' || true)"
-	budget="$(grep -oE 'teardownRuntimedClose = [0-9]+' "$K3SM_ROOT/pkg/install/install.go" | grep -oE '[0-9]+' || true)"
+	budget="$(grep -oE 'teardownRuntimedClose = [0-9]+' "$PLIST_GO" | grep -oE '[0-9]+' || true)"
 	if [ -z "$vm_bound" ] || [ -z "$close_grace" ] || [ -z "$budget" ]; then
 		d=no
 		echo "    could not read one of the bounds (vmShutdownBound='${vm_bound:-}' defaultCloseGrace='${close_grace:-}' budget='${budget:-}')"

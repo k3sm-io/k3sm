@@ -104,7 +104,13 @@ ladder "$w" "b283.1  the bootstrap listener verifies node client certificates ag
 v=ok
 grep -qE 'r\.TLS\.VerifiedChains' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" || v=no
 if grep -qE 'r\.TLS\.PeerCertificates' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go"; then v=no; fi
-grep -qE 'AuthorizeMeshPeerWrite\(certNode, req\.NodeName\)' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" || v=no
+# The self-scoping guard lives in authorizeNodeSelf (shared with the
+# deregistration verb); the pin is that it runs AuthorizeMeshPeerWrite on the
+# cert's node against the body's, and that handleMeshEndpoint hands it the
+# leaf from verifiedNodeLeaf and the request's NodeName.
+sed -n '/^func (s \*Server) authorizeNodeSelf(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" | grep -qE 'AuthorizeMeshPeerWrite\(certNode, bodyNode\)' || v=no
+sed -n '/^func (s \*Server) handleMeshEndpoint(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" | grep -qE 's\.verifiedNodeLeaf\(w, r, ' || v=no
+sed -n '/^func (s \*Server) handleMeshEndpoint(/,/^}/p' "$K3SM_ROOT/pkg/bootstrap/meshendpoint.go" | grep -qE 's\.authorizeNodeSelf\(w, leaf, req\.NodeName, ' || v=no
 ladder "$v" "b283.1  the handler authorizes on VerifiedChains (never PeerCertificates) + AuthorizeMeshPeerWrite"
 
 s=ok
