@@ -73,9 +73,13 @@ func newStatusRunner(o statusOptions) statusRunner {
 	color := status.ColorEnabled(os.Stdout, o.noColor, os.Getenv)
 	role, _ := installedRole()
 	return statusRunner{
-		out:       os.Stdout,
-		errOut:    os.Stderr,
-		collect:   func(ctx context.Context) status.Report { return o.scopeDatavol(newStatusCollector()).Collect(ctx) },
+		out:    os.Stdout,
+		errOut: os.Stderr,
+		collect: func(ctx context.Context) status.Report {
+			rep := o.scopeDatavol(newStatusCollector()).Collect(ctx)
+			workDir := statusWorkDir(os.Geteuid(), lookupServiceUID())
+			return withDirectLinkRow(rep, recordedDirectLinkProbe(workDir, agentCredentialDir()))
+		},
 		stdoutTTY: status.IsTerminal(os.Stdout),
 		stderrTTY: status.IsTerminal(os.Stderr),
 		color:     color,

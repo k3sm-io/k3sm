@@ -30,6 +30,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -128,6 +129,32 @@ type doctorEnv struct {
 	daemonInfo   func(label string) status.DaemonInfo
 	reportDir    func(requested string) (string, error)
 	writeReport  func(dir, name string, contents []byte) error
+	// directLinks is the direct-link section's probe (ports, bridge membership,
+	// rdma_ctl, the recorded resolved status, the three TN3205 settings). It is
+	// expensive (system_profiler), so the real one is computed once per run. Nil
+	// is a Mac with nothing to report: every row of the section skips.
+	directLinks func() directLinkProbe
+}
+
+// directLinkProbe returns the env's direct-link probe, or the empty one.
+func (env doctorEnv) directLinkProbe() directLinkProbe {
+	if env.directLinks == nil {
+		return directLinkProbe{}
+	}
+	return env.directLinks()
+}
+
+// directLinkCheck adapts one row of the direct-link section to the registry: the
+// section is computed from one probe, and each registry entry returns its row.
+func directLinkCheck(name string) func(doctorEnv) checkResult {
+	return func(env doctorEnv) checkResult {
+		for _, r := range directLinkChecks(env.directLinkProbe()) {
+			if r.name == name {
+				return r
+			}
+		}
+		return checkResult{name: name, status: statusSkip, detail: "not computed"}
+	}
 }
 
 // doctorCheck is a registry entry: a stable name and its pure check function. The
@@ -149,6 +176,14 @@ func doctorChecks() []doctorCheck {
 		{"datastore", checkDatastore},
 		{"toolchain", checkXcodeToolchain},
 		{"agent-daemon", checkAgentDaemon},
+		// The direct-link section (docs/user/direct-links.md): advisories only,
+		// never a FAIL, and the RDMA Recovery step is printed, never attempted.
+		{"direct-links", directLinkCheck("direct-links")},
+		{"direct-link-bridge", directLinkCheck("direct-link-bridge")},
+		{"rdma", directLinkCheck("rdma")},
+		{"idle-sleep", directLinkCheck("idle-sleep")},
+		{"auto-login", directLinkCheck("auto-login")},
+		{"power-restart", directLinkCheck("power-restart")},
 	}
 }
 
@@ -787,6 +822,9 @@ func realDoctorEnv(workDir string) doctorEnv {
 		daemonInfo:   probeDaemonInfo,
 		reportDir:    makeReportDir,
 		writeReport:  writeReportFile,
+		directLinks: sync.OnceValue(func() directLinkProbe {
+			return realDirectLinkProbe(context.Background(), workDir, agentCredentialDir())
+		}),
 	}
 }
 

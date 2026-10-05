@@ -1815,6 +1815,10 @@ func configureNode(n *corev1.Node, name, ip, listen string, caps provider.NodeCa
 	// see LabelVMArtifacts for why it is advertised but not selected on.
 	applyVMArtifactsLabel(n, caps.VMArtifacts)
 
+	// Direct-link labels (advisory, presence-only): the ports, the medium as a
+	// value, the speed, and k3sm.io/rdma. Placement reads DirectLink.status.
+	applyDirectLinkLabels(n, nodeDirectLinkFacts.Load())
+
 	n.Status.NodeInfo.OperatingSystem = "darwin"
 	// Architecture is the machine's NATIVE ISA (the same derived value as the
 	// kubernetes.io/arch label above) and stays arm64 on a Rosetta-capable Apple
