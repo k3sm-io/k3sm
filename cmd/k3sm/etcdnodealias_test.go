@@ -68,8 +68,8 @@ func (r *aliasRecordingIPAM) EnsureNodeAlias(_ context.Context, ip netip.Addr) e
 // recording IPAM: exactly the chain startNode drives, without a real lo0.
 func TestEtcdServerDoesNotAliasItsLANNodeIP(t *testing.T) {
 	const (
-		lan     = "192.168.0.50"
-		lanB    = "192.168.0.51"
+		lan     = "192.0.2.50"
+		lanB    = "192.0.2.51"
 		meshIP  = "100.64.0.1"
 		podCIDR = "100.64.0.0/24" // the server's index-0 /24, whose mesh-egress .1 is meshIP
 	)
@@ -120,10 +120,10 @@ func TestEtcdServerDoesNotAliasItsLANNodeIP(t *testing.T) {
 		},
 		{
 			name:          "a LAN --node-ip beside the peer address fails naming it, and is never aliased",
-			argv:          []string{"--cluster-init", "--etcd-peer-ip", lan, "--node-ip", "192.168.0.60", "--mesh-ip", meshIP},
-			wantAdvertise: "192.168.0.60",
+			argv:          []string{"--cluster-init", "--etcd-peer-ip", lan, "--node-ip", "192.0.2.60", "--mesh-ip", meshIP},
+			wantAdvertise: "192.0.2.60",
 			wantPeerIP:    lan,
-			wantAliasErr:  "192.168.0.60",
+			wantAliasErr:  "192.0.2.60",
 		},
 	}
 	for _, tc := range cases {
@@ -227,7 +227,7 @@ func TestCheckNodeAliasAddr(t *testing.T) {
 		{"adopted /24's pod IP", "100.64.7.5", "100.64.7.0/24", svc, true},
 		{"the Service DNS VIP", "10.43.0.10", "100.64.0.0/24", svc, true},
 		{"a LAN address", "192.168.1.5", "100.64.0.0/24", svc, false},
-		{"the HA server's LAN peer address", "192.168.0.50", "100.64.0.0/24", svc, false},
+		{"the HA server's LAN peer address", "192.0.2.50", "100.64.0.0/24", svc, false},
 		{"another node's /24", "100.64.7.5", "100.64.0.0/24", svc, false},
 		{"the previous /24 after adoption", "100.64.0.5", "100.64.7.0/24", svc, false},
 		{"a pod CIDR outside the cluster aggregate", "10.200.0.1", "10.200.0.0/24", svc, false},
