@@ -141,8 +141,9 @@ func SigningCACertPath(workDir string) string { return filepath.Join(PKIDir(work
 
 // ClusterCAKeyPath / SigningCAKeyPath are the CA PRIVATE KEY paths (0600). They are
 // exported so a caller can NAME a key file — to os.Stat it, or to report on it —
-// without re-joining the layout. Nothing outside EnsureHierarchy / WriteHierarchy
-// should ever OPEN them: pin verification needs only the certificate.
+// without re-joining the layout. Nothing outside EnsureHierarchy /
+// ReconcileImportedHierarchy should ever OPEN them: pin verification needs only the
+// certificate.
 func ClusterCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), clusterCAKey) }
 func SigningCAKeyPath(workDir string) string { return filepath.Join(PKIDir(workDir), signingCAKey) }
 
@@ -175,11 +176,11 @@ func APIServerServingKeyPath(workDir string) string {
 var ErrNoHierarchy = errors.New("certs: no CA hierarchy in the work dir's PKI directory")
 
 // ErrIncompleteHierarchy reports a DAMAGED hierarchy: a CA certificate present
-// without its private key (the half-present hierarchy ensureCA also refuses), or a
-// PKI entry that is not a regular file. Distinct from ErrNoHierarchy so a caller can
-// tell "nothing here" (wrong work dir / missing privilege) from "the PKI on this host
-// is damaged". Compare with errors.Is.
-var ErrIncompleteHierarchy = errors.New("certs: damaged CA hierarchy (a CA certificate has no private key, or a PKI path is not a regular file)")
+// without its private key or a private key without its certificate (the half-present
+// pair ensureCA also refuses), or a PKI entry that is not a regular file. Distinct
+// from ErrNoHierarchy so a caller can tell "nothing here" (wrong work dir / missing
+// privilege) from "the PKI on this host is damaged". Compare with errors.Is.
+var ErrIncompleteHierarchy = errors.New("certs: damaged CA hierarchy (a CA certificate without its private key, a CA private key without its certificate, or a PKI path that is not a regular file)")
 
 // LoadCAPins reads ONLY the two CA CERTIFICATES from workDir's PKI directory and
 // returns their PinHash values (the lowercase-hex SHA-256 of the certificate DER that
@@ -209,8 +210,8 @@ func LoadCAPins(workDir string) (cluster, signing string, err error) {
 // exists at keyPath. The key is STATTED ONLY — never opened, never parsed.
 //
 // Both paths are LSTAT'ed and required to be REGULAR files. A symlink in the PKI dir
-// is never legitimate (EnsureHierarchy/WriteHierarchy only ever create regular files),
-// and following one would let a planted link redirect this — frequently root — read at
+// is never legitimate (EnsureHierarchy/ReconcileImportedHierarchy only ever create
+// regular files), and following one would let a planted link redirect this — frequently root — read at
 // an arbitrary file, or point the key path at some unrelated existing file and make
 // ErrIncompleteHierarchy unreachable for a hierarchy that is in fact half-present.
 func caPin(certPath, keyPath string) (string, error) {
@@ -296,8 +297,8 @@ func EnsureHierarchy(workDir string) (*Hierarchy, error) {
 // signing CAs and from each other. Like EnsureHierarchy it refuses a half-present
 // pair rather than silently re-minting, which would invalidate every etcd member's
 // certificates. Only the etcd HA posture calls it; a joining server finds the pairs
-// already written by WriteHierarchy from the bootstrap bundle and so LOADS the
-// identical CAs.
+// already installed by ReconcileImportedHierarchy from the bootstrap bundle and so
+// LOADS the identical CAs.
 func EnsureEtcdCAs(workDir string) (server, peer *CA, err error) {
 	dir, err := ensureEtcdDir(workDir)
 	if err != nil {
@@ -335,62 +336,57 @@ func ensureEtcdDir(workDir string) (string, error) {
 	return dir, nil
 }
 
-// WriteHierarchy writes h's four CA keypairs — cluster and signing into the work dir's
-// PKI directory, the etcd server and peer CAs into <PKI>/etcd (0700) — with certs 0644
-// and keys 0600. It is the inverse of EnsureHierarchy + EnsureEtcdCAs's load. The HA
-// server-join path calls it AFTER decrypting the AES-256-GCM bootstrap bundle and
-// BEFORE EnsureHierarchy, so those then LOAD the IDENTICAL CAs instead of minting
-// fresh, divergent ones (which would split cluster trust). All four CAs are required:
-// the bundle is HA-only and HA is the etcd posture. It REFUSES to overwrite any
-// existing CA file: a server that already has a hierarchy must never be silently
-// re-based onto another's — the import is a first-write, not a replace. The refusal
-// is the kernel's (O_CREATE|O_EXCL), not a stat-then-write, so two joins racing into
-// one work dir cannot both pass the check and then clobber each other's CA.
-func WriteHierarchy(workDir string, h *Hierarchy) error {
-	if h == nil || h.Cluster == nil || h.Signing == nil || h.EtcdServer == nil || h.EtcdPeer == nil {
-		return fmt.Errorf("certs: write hierarchy: cluster, signing, etcd server and etcd peer CAs are required")
-	}
+// caSpec is one CA keypair of the hierarchy: its id (for reports), the directory it
+// lives in, its file names there, and the Hierarchy field that holds it in memory.
+type caSpec struct {
+	id string
+	// dir returns the keypair's directory under workDir; it creates nothing.
+	dir func(workDir string) string
+	// ensureDir creates the keypair's directory with its mode (the PKI dir 0755, the
+	// etcd subdirectory 0700) and returns its path.
+	ensureDir func(workDir string) (string, error)
+	certFile  string
+	keyFile   string
+	ca        func(*Hierarchy) *CA
+}
+
+// caSpecs is the whole CA hierarchy, one row per CA, in install order. Every walk over
+// the on-disk hierarchy (MissingOnDisk, ReconcileImportedHierarchy) goes through
+// it, so a CA is never added to one walk and forgotten by another.
+var caSpecs = []caSpec{
+	{id: "cluster", dir: PKIDir, ensureDir: ensurePKIDir, certFile: clusterCACert, keyFile: clusterCAKey,
+		ca: func(h *Hierarchy) *CA { return h.Cluster }},
+	{id: "signing", dir: PKIDir, ensureDir: ensurePKIDir, certFile: signingCACert, keyFile: signingCAKey,
+		ca: func(h *Hierarchy) *CA { return h.Signing }},
+	{id: "etcd-server", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdServerCACert, keyFile: etcdServerCAKey,
+		ca: func(h *Hierarchy) *CA { return h.EtcdServer }},
+	{id: "etcd-peer", dir: etcdPKIDir, ensureDir: ensureEtcdDir, certFile: etcdPeerCACert, keyFile: etcdPeerCAKey,
+		ca: func(h *Hierarchy) *CA { return h.EtcdPeer }},
+}
+
+// etcdPKIDir returns <PKI>/etcd; it creates nothing.
+func etcdPKIDir(workDir string) string { return EtcdCertPaths(workDir).Dir }
+
+// ensurePKIDir creates the PKI dir (0755, as EnsureHierarchy makes it) and returns it.
+func ensurePKIDir(workDir string) (string, error) {
 	dir := PKIDir(workDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create PKI dir: %w", err)
+		return "", fmt.Errorf("create PKI dir: %w", err)
 	}
-	etcdDir, err := ensureEtcdDir(workDir)
-	if err != nil {
-		return err
+	return dir, nil
+}
+
+// hierarchyComplete reports whether h carries every CA of the table.
+func hierarchyComplete(h *Hierarchy) bool {
+	if h == nil {
+		return false
 	}
-	files := []struct {
-		dir  string
-		name string
-		data []byte
-		mode os.FileMode
-	}{
-		{dir, clusterCACert, h.Cluster.CertPEM, 0o644},
-		{dir, clusterCAKey, h.Cluster.KeyPEM, 0o600},
-		{dir, signingCACert, h.Signing.CertPEM, 0o644},
-		{dir, signingCAKey, h.Signing.KeyPEM, 0o600},
-		{etcdDir, etcdServerCACert, h.EtcdServer.CertPEM, 0o644},
-		{etcdDir, etcdServerCAKey, h.EtcdServer.KeyPEM, 0o600},
-		{etcdDir, etcdPeerCACert, h.EtcdPeer.CertPEM, 0o644},
-		{etcdDir, etcdPeerCAKey, h.EtcdPeer.KeyPEM, 0o600},
-	}
-	for _, f := range files {
-		p := filepath.Join(f.dir, f.name)
-		fh, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, f.mode)
-		if err != nil {
-			if errors.Is(err, fs.ErrExist) {
-				return fmt.Errorf("certs: write hierarchy: %s already exists (refusing to overwrite an existing CA): %w", f.name, err)
-			}
-			return fmt.Errorf("write %s: %w", f.name, err)
-		}
-		if _, err := fh.Write(f.data); err != nil {
-			_ = fh.Close()
-			return fmt.Errorf("write %s: %w", f.name, err)
-		}
-		if err := fh.Close(); err != nil {
-			return fmt.Errorf("write %s: %w", f.name, err)
+	for _, spec := range caSpecs {
+		if spec.ca(h) == nil {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 // ensureCA loads the CA at dir/<certFile>+<keyFile>, or creates + persists a new one

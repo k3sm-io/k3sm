@@ -329,7 +329,7 @@ func newITMember(t *testing.T, name, docIP string, role EtcdRole, h *certs.Hiera
 		if _, err := certs.EnsureHierarchy(wd); err != nil {
 			t.Fatal(err)
 		}
-	} else if err := certs.WriteHierarchy(wd, h); err != nil {
+	} else if err := certs.ReconcileImportedHierarchy(wd, h); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(binDir(wd), 0o755); err != nil {

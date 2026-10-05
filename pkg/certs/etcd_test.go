@@ -309,8 +309,8 @@ func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 			if _, err := h.Marshal(); err == nil {
 				t.Error("Marshal must require all four CAs")
 			}
-			if err := WriteHierarchy(t.TempDir(), &h); err == nil {
-				t.Error("WriteHierarchy must require all four CAs")
+			if err := ReconcileImportedHierarchy(t.TempDir(), &h); err == nil {
+				t.Error("ReconcileImportedHierarchy must require all four CAs")
 			}
 		})
 	}
@@ -319,7 +319,7 @@ func TestBundleV2RoundTripCarriesEtcdCAs(t *testing.T) {
 // TestBundleRefusesSchemaV1WithoutWriting proves a schema-1 envelope (a server that
 // predates etcd HA) is refused with the named error, leaves the receiver untouched,
 // and — following the import order ImportCABundle uses (Unmarshal, then
-// WriteHierarchy only on success) — writes nothing into the target PKI dir. Other
+// ReconcileImportedHierarchy only on success) — writes nothing into the target PKI dir. Other
 // unknown versions keep the generic refusal.
 func TestBundleRefusesSchemaV1WithoutWriting(t *testing.T) {
 	const wantV1 = "unsupported schema version 1: this server predates etcd HA; every HA server must run the same release"
@@ -355,7 +355,7 @@ func TestBundleRefusesSchemaV1WithoutWriting(t *testing.T) {
 			var h Hierarchy
 			err := h.Unmarshal(envelope(tc.version))
 			if err == nil {
-				if werr := WriteHierarchy(wd, &h); werr != nil {
+				if werr := ReconcileImportedHierarchy(wd, &h); werr != nil {
 					t.Logf("write after accepted unmarshal: %v", werr)
 				}
 				t.Fatalf("Unmarshal must refuse schema %d", tc.version)
