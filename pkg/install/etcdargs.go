@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"k3sm.io/k3sm/pkg/executor"
@@ -104,11 +105,19 @@ func setEtcdArgs(args []string, c Config) []string {
 }
 
 // boolFlagSet reports whether args set the named boolean flag, in any spelling
-// (single or double dash, bare or =true). An explicit =false does not count.
+// (single or double dash, bare or with an inline value Go's flag package reads
+// as true: =true, =1, =t, =T, =TRUE, =True). An inline false, or a value the
+// flag package would reject, does not count.
 func boolFlagSet(args []string, name string) bool {
 	for _, a := range args {
 		n, value, inline := splitFlag(a)
-		if n == name && (!inline || value != "false") {
+		if n != name {
+			continue
+		}
+		if !inline {
+			return true
+		}
+		if b, err := strconv.ParseBool(value); err == nil && b {
 			return true
 		}
 	}
@@ -236,9 +245,11 @@ func refuseEtcdRoleSwitch(cfg Config, carried []string) error {
 	default:
 		return nil
 	}
+	// An EMPTY data dir holds no member either (a wipe that removed the
+	// contents and kept the directory), so it counts as absent.
 	dir := executor.EtcdDataDir(cfg.serverWorkDir())
-	switch _, err := cfg.DataRootFS.Stat(dir); {
-	case errors.Is(err, fs.ErrNotExist):
+	switch entries, err := cfg.DataRootFS.ReadDir(dir); {
+	case errors.Is(err, fs.ErrNotExist) || (err == nil && len(entries) == 0):
 		cfg.Logger.Info("--"+asked+" replaces the carried --"+had+": this server holds no etcd member data", "etcd-data", dir)
 		return nil
 	case err != nil:

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -31,6 +32,14 @@ import (
 // --server-join install reaches the join preflight's cluster comparison the way
 // a live one does.
 var theServerToken = "K10" + testCluster().pin + "::server:s3rv3r-s3cr3t"
+
+// seedMember puts a member's data in dir: a non-empty etcd data dir.
+func seedMember(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "member"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // recordedArgs returns the arguments the fake's server-arguments record holds.
 func recordedArgs(t *testing.T, f *fakeSystem, cfg Config) []string {
@@ -149,9 +158,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 			t.Fatalf("Install --cluster-init: %v", err)
 		}
 		etcdDir := executor.EtcdDataDir(cfg.withDefaults().serverWorkDir())
-		if err := os.MkdirAll(etcdDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		seedMember(t, etcdDir)
 		before := serverArgsOf(t, f, cfg)
 		join := cfg
 		join.ServerJoin, join.JoinServer, join.TokenFile, join.NodeIP = true, "192.0.2.11", operatorTokenFile, "192.0.2.10"
@@ -177,9 +184,7 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		if err := Install(ctx, f2, join2); err != nil {
 			t.Fatalf("Install --server-join: %v", err)
 		}
-		if err := os.MkdirAll(executor.EtcdDataDir(cfg2.withDefaults().serverWorkDir()), 0o700); err != nil {
-			t.Fatal(err)
-		}
+		seedMember(t, executor.EtcdDataDir(cfg2.withDefaults().serverWorkDir()))
 		init2 := cfg2
 		init2.ClusterInit, init2.NodeIP = true, "192.0.2.20"
 		if err := Install(ctx, f2, init2); !errors.Is(err, ErrEtcdRoleSwitch) {
@@ -207,6 +212,25 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 		}
 		if got := recordedArgs(t, f, cfg); !slices.Equal(got, want) {
 			t.Errorf("record carries %q, want %q", got, want)
+		}
+	})
+
+	t.Run("an empty etcd dir holds no member and does not block the role change", func(t *testing.T) {
+		f := &fakeSystem{}
+		f.putFile(operatorTokenFile, []byte(theServerToken+"\n"))
+		cfg := testConfig(t)
+		init := cfg
+		init.ClusterInit, init.NodeIP = true, "192.0.2.10"
+		if err := Install(ctx, f, init); err != nil {
+			t.Fatalf("Install --cluster-init: %v", err)
+		}
+		if err := os.MkdirAll(executor.EtcdDataDir(cfg.withDefaults().serverWorkDir()), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		join := cfg
+		join.ServerJoin, join.JoinServer, join.TokenFile, join.NodeIP = true, "192.0.2.11", operatorTokenFile, "192.0.2.10"
+		if err := Install(ctx, f, join); err != nil {
+			t.Fatalf("Install --server-join over an empty etcd dir: %v", err)
 		}
 	})
 
@@ -278,6 +302,21 @@ func TestInstallEmbeddedEtcdServer(t *testing.T) {
 				t.Error("the --cluster-init server is still pointed at the join token")
 			}
 		})
+	})
+
+	t.Run("boolFlagSet reads a bool the way the flag package does", func(t *testing.T) {
+		for _, tc := range []struct {
+			arg  string
+			want bool
+		}{
+			{"--cluster-init", true}, {"-cluster-init", true}, {"--cluster-init=true", true},
+			{"--cluster-init=1", true}, {"--cluster-init=T", true}, {"--cluster-init=false", false},
+			{"--cluster-init=0", false}, {"--cluster-init=bogus", false}, {"--server-join", false},
+		} {
+			if got := boolFlagSet([]string{tc.arg}, clusterInitFlag); got != tc.want {
+				t.Errorf("boolFlagSet(%q) = %v, want %v", tc.arg, got, tc.want)
+			}
+		}
 	})
 
 	t.Run("a hand-built Config is held to the same contract", func(t *testing.T) {
