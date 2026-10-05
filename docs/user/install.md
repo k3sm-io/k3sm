@@ -179,8 +179,8 @@ encrypted Secrets. This release has no key rotation and no command to decrypt th
 
 - this data root already holds a datastore (an existing cluster cannot be switched over in this
   release; encryption is for a fresh install only),
-- the server is configured to join another server or to use an external datastore (every server
-  would need the same key, and k3sm does not distribute one),
+- the server is configured as part of an HA control plane, with `--cluster-init` or `--server-join`
+  (every server would need the same key, and k3sm does not distribute one),
 - the install is a worker (`--agent`).
 
 A later `sudo k3sm install` without the option keeps the key and the encryption. Passing the
@@ -205,10 +205,7 @@ left exactly as it is. It also flushes the pf anchor an older release loaded for
 loads no pf rule). Your cluster data, the `_k3sm` user, and your kubeconfig are kept, so a
 reinstall picks up where you left off; to remove those too, see
 [Remove Everything](#remove-everything). The server's admin token is removed, because a reinstall
-mints a new one, but if you run the control plane against an external database, the file holding
-that database's connection string is kept with your cluster data at
-`/var/lib/k3sm/server/datastore-endpoint`. It contains the database password, and k3sm cannot
-recreate it, so removing it is left to you. The command prints the full list of what it kept. If you
+mints a new one. The command prints the full list of what it kept. If you
 installed a data volume, it stays mounted and declared; the command prints `sudo k3sm install
 --data-volume` to reinstall onto it and `sudo k3sm datavol delete --yes` to remove it for good.
 
@@ -229,16 +226,13 @@ The installed daemon wins while it is there, so a reset means clearing both sour
 ```sh
 sudo k3sm uninstall                                          # removes the daemon and its flags
 sudo rm /Library/Preferences/io.k3sm.server-args.json        # discards the recorded ones
-sudo rm /var/lib/k3sm/server/datastore-endpoint              # only if you used an external database
 sudo k3sm install                                            # renders the stock template
 ```
 
-That discards the flags the file lists, and nothing else. Your cluster data is untouched. The third
-line removes the database connection string a server with an external database was configured with,
-which is the one piece of that configuration k3sm keeps outside the record; skip it if you intend to
-keep using that database. Remove it only together with the record, and in that order: while the
-recorded flags still name the file, an install that cannot find it stops and says so rather than
-quietly bringing the server up on its own local database.
+That discards the flags the file lists, and nothing else. Your cluster data is untouched. An
+install refuses a carried `--datastore-endpoint` or `--datastore-endpoint-file`, because external
+datastores are not supported: HA is embedded etcd, started with `--cluster-init` on the first
+server and `--server-join` on the others.
 
 Install warns when it finds neither source on a data root that already holds cluster state, which is
 what a Mac uninstalled by an older version looks like. The flags are gone on such a Mac, and install
@@ -252,8 +246,7 @@ sudo k3sm uninstall --purge --yes
 
 This runs the uninstall above and then removes what it keeps:
 
-- the cluster data in `/var/lib/k3sm`: the datastore, images, volumes, and the external database
-  connection string if you had one
+- the cluster data in `/var/lib/k3sm`: the datastore, images, and volumes
 - the data volume, if you installed one, together with its keychain item, its `/etc/fstab` line,
   and `/Library/Preferences/io.k3sm.datavol.json`
 - the daemon logs in `/var/log/k3sm`

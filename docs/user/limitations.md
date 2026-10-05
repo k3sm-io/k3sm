@@ -284,9 +284,10 @@ workloads with the [`vm` RuntimeClass](vm-runtimeclass.md).
 
 In a multi-node cluster:
 
-- A worker node does not enforce NetworkPolicy. Connections to a backend on a worker are allowed
-  whatever the policy says.
-- Policies are enforced for Pods on the server node.
+- A worker starts no NetworkPolicy informers and enforces nothing, because its node identity is
+  not granted access to NetworkPolicies and Namespaces and no dedicated controller identity exists
+  yet. Connections to a backend on a worker are allowed whatever the policy says.
+- The server node enforces policies for its own Pods.
 - A `from` rule with a `podSelector` or `namespaceSelector` cannot match a Pod on another node.
   Traffic arriving from a peer node's mesh address is always allowed.
 
@@ -502,7 +503,10 @@ bind/connect discipline that gives a Pod its own source address and port space. 
   Pod's shell script spawns, as described under volume mounts above.
 - **`dnsPolicy: Default` and `dnsPolicy: None` inject nothing**, so those Pods use the host resolver,
   which now answers cluster-shaped names (`*.svc`, `*.<domain>`) from the node resolver entry. For
-  `None` that is a gap, because a Pod's own `dnsConfig.nameservers` are not yet honored.
+  `None`, k3sm does not read the Pod's `dnsConfig` at all: its `nameservers`, `searches` and
+  `options` are ignored, and the Pod resolves through the host. The `getaddrinfo` shim can serve a
+  `None` Pod's IPv4 nameservers exclusively (up to three) and apply its `ndots`, but the provider
+  does not pass that configuration to it yet.
 - **Under `ClusterFirst`, `dnsConfig` is merged additively**, so extra `searches` are appended and
   `ndots` is overridden. Not yet honored are `dnsConfig.nameservers`, an explicit `ndots: 0`, and
   options other than `ndots`.
@@ -662,8 +666,10 @@ Runbook:
   release), and it passes against the release build. See
   [`vm` RuntimeClass](vm-runtimeclass.md).
 - **Multi-node and HA** ship as documented **EXPERIMENTAL** and are not launch-blocking; their
-  de-EXPERIMENTAL graduation is the **v0.3** milestone. See [Multi-node](multi-node.md) and
-  [HA](ha.md).
+  de-EXPERIMENTAL graduation is the **v0.3** milestone. HA is an embedded etcd cluster, started
+  with `--cluster-init` on the first server and `--server-join` on the others. k3sm refuses the
+  external-datastore flags, and does not convert an existing single-node SQLite cluster to etcd.
+  See [Multi-node](multi-node.md) and [HA](ha.md).
 
 ### `vm` Pods: Node Selection and Security-Context Admission
 
@@ -903,12 +909,16 @@ datastore operational model.
   no pf rule.
 - UDP: datagrams up to 1352 bytes cross the tunnel whole. Larger ones are fragmented and delivered.
   With don't-fragment set, a larger send fails locally with `EMSGSIZE`.
-- Two unattributed host kernel panics are on record, on two Macs running a node with the mesh
-  active, both in the kernel's network packet-segmentation code. Measurements give no evidence
-  implicating TCP: connections negotiate an MSS of 1340 and the largest tunnel packet seen is
-  1380. UDP above 1352 bytes has not been exercised under load, so as a precaution avoid sustained
-  large-datagram UDP across the mesh. A panic costs a reboot of the host. If it recurs, the audit
-  gate collects the snapshot needed to attribute it.
+- Two host kernel panics are on record, on two Macs running a node with the mesh active, both in
+  the kernel's network packet-segmentation code. The cause is not established. One path that
+  could reach that code is a connection that outlives the loopback alias of the pod or Service
+  address it was opened to: the route then falls through to the mesh tunnel with a segment size
+  taken from the 16384-byte loopback MTU. k3sm defends that path in two ways. Connections k3sm
+  opens or accepts toward those addresses have their TCP segment size lowered to 1328 after
+  connect, and when a pod's alias is torn down its address gets a blackhole route, so a lingering
+  connection stays on loopback and its segments are dropped until it times out. No panic has been
+  reproduced since both are in place. UDP above 1352 bytes has not been exercised under load, so
+  avoid sustained large-datagram UDP across the mesh. A panic costs a reboot of the host.
 
 ## MLX / Apple-GPU Workloads
 
