@@ -194,6 +194,44 @@ func OperatorServerArgs(plist []byte) ([]string, error) {
 	return preservedServerArgs(args), nil
 }
 
+// InstalledMeshIP returns the --mesh-ip the installed control plane runs with,
+// or "" for a single-node server, read from the SAME two sources and in the same
+// precedence installedServerArgs uses: the installed server plist at plistPath
+// (authoritative — it is the argv launchd runs), then, only when that plist is
+// absent, the server-arguments record at recordPath. Neither present is "" with
+// no error: there is nothing installed to say otherwise.
+//
+// It is exported for `k3sm certificate rotate --restart`, whose post-restart
+// probe must dial the address the apiserver is bound to; a mesh server binds
+// only its mesh IP, so a loopback probe there never sees the control plane come
+// back. A plist that exists but cannot be read or parsed is an ERROR, never "",
+// because "" would send that probe to loopback on exactly the posture where
+// loopback is refused.
+func InstalledMeshIP(read func(path string) ([]byte, error), plistPath, recordPath string) (string, error) {
+	raw, err := read(plistPath)
+	switch {
+	case err == nil:
+		args, perr := OperatorServerArgs(raw)
+		if perr != nil {
+			return "", fmt.Errorf("read the installed server plist %s: %w", plistPath, perr)
+		}
+		return flagValue(args, "mesh-ip"), nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return "", fmt.Errorf("read the installed server plist %s: %w", plistPath, err)
+	}
+	rec, err := dataroot.ReadServerArgsRecord(readerFunc(read), recordPath)
+	if err != nil || rec == nil {
+		return "", err
+	}
+	return flagValue(filterManagedServerArgs(rec.Args), "mesh-ip"), nil
+}
+
+// readerFunc adapts a plain read function to dataroot.FileReader.
+type readerFunc func(path string) ([]byte, error)
+
+// ReadFile implements dataroot.FileReader.
+func (f readerFunc) ReadFile(path string) ([]byte, error) { return f(path) }
+
 // recordedServerArgs returns the arguments the server-arguments record carries,
 // or nil when there is no record.
 //
