@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 
 	"k3sm.io/k3sm/pkg/bootstrap"
 	"k3sm.io/k3sm/pkg/certs"
+	"k3sm.io/k3sm/pkg/dataroot"
 	"k3sm.io/k3sm/pkg/executor"
 	"k3sm.io/k3sm/pkg/install"
 )
@@ -52,7 +54,9 @@ restart would re-issue, and the blast radius. --restart (alias --yes) performs i
 
   --work-dir <dir>   control-plane state root (default: this posture's work dir)
   --restart, --yes   restart the control-plane daemon to perform the rotation
-  --apiserver-port   port the post-restart health probe checks (default %d)
+  --apiserver-port   port the post-restart health probe checks (default %d); the
+                     address is the installed --mesh-ip on a multi-node server
+                     (the apiserver binds only that), else 127.0.0.1
 
 Caveats:
   * Rotation does NOT revoke. k3sm publishes no CRL/OCSP and --client-ca-file trust
@@ -84,8 +88,15 @@ func runCertificate(args []string) error {
 	}
 }
 
+// rotateProbeDeadline is how long a --restart rotation waits for a NEW daemon
+// instance to answer the health probe at the apiserver's bound address. It is
+// stated here, not left to the executor's zero-value default, so the failure
+// message can name exactly how long the probe waited.
+const rotateProbeDeadline = executor.DefaultRotateHealthTimeout
+
 // runCertificateRotate parses the flags and wires the real seams — the darwin launchd
-// System and the anchored loopback health probe — into certificateRotate.
+// System and the anchored health probe at the apiserver's bound address — into
+// certificateRotate.
 func runCertificateRotate(args []string) error {
 	fs := flag.NewFlagSet("certificate rotate", flag.ExitOnError)
 	// Posture-aware default (the _k3sm control plane writes <home>/server, not the
@@ -115,18 +126,57 @@ func runCertificateRotate(args []string) error {
 		if err != nil {
 			return err
 		}
-		addr := "127.0.0.1:" + strconv.Itoa(*port)
+		// Same pre-restart ordering for the address: a probe aimed where the
+		// apiserver does not listen would report a completed rotation as failed.
+		addr, err := apiServerProbeAddr(os.ReadFile, installedPlistPath(install.ServerLabel), dataroot.DefaultServerArgsRecordPath, *port)
+		if err != nil {
+			return err
+		}
 		opts.Health = func(ctx context.Context) error {
 			return probeAPIServerServing(ctx, addr, anchor, anchorPath)
 		}
+		opts.HealthTimeout = rotateProbeDeadline
+		return certificateRotate(context.Background(), os.Stdout, opts, addr)
 	}
-	return certificateRotate(context.Background(), os.Stdout, opts)
+	return certificateRotate(context.Background(), os.Stdout, opts, "")
+}
+
+// apiServerProbeAddr is the host:port the post-restart health probe dials: the
+// address the restarted apiserver actually binds.
+//
+// A multi-node server (`k3sm server --mesh-ip <ip>`) binds the apiserver to its
+// mesh IP ONLY, so loopback is refused there; a single-node server binds every
+// interface and is probed on 127.0.0.1. The mesh IP is read the way the installer
+// carries it over (install.InstalledMeshIP: the installed server plist, else the
+// server-arguments record) — the argv the restarted daemon runs with, and the same
+// plist `k3sm status` reports. port is --apiserver-port, unchanged.
+//
+// A recorded mesh IP that does not parse is an error, not a loopback fallback: the
+// daemon would refuse to start on it, and guessing an address would turn that into
+// a misleading "did not come back".
+func apiServerProbeAddr(read func(string) ([]byte, error), plistPath, recordPath string, port int) (string, error) {
+	meshIP, err := install.InstalledMeshIP(read, plistPath, recordPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve the address the apiserver binds (needed to verify the control plane came back; refusing to restart without it): %w", err)
+	}
+	host := "127.0.0.1"
+	if meshIP != "" {
+		ip := net.ParseIP(meshIP)
+		if ip == nil {
+			return "", fmt.Errorf("the installed server arguments carry --mesh-ip %q, which is not an IP address; refusing to restart a control plane whose bound address cannot be probed", meshIP)
+		}
+		host = ip.String()
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 // certificateRotate runs the rotation and renders its report to out. It binds the
 // launchd label (so the daemon identity lives in one place) and turns each typed
 // failure into an actionable message; the orchestration itself is executor's.
-func certificateRotate(ctx context.Context, out io.Writer, opts executor.RotateOptions) error {
+//
+// probeAddr is the host:port opts.Health dials ("" on a dry run); it is named in
+// the error when the restarted control plane never answers there.
+func certificateRotate(ctx context.Context, out io.Writer, opts executor.RotateOptions, probeAddr string) error {
 	if opts.DaemonLabel == "" {
 		opts.DaemonLabel = install.ServerLabel
 	}
@@ -149,14 +199,14 @@ func certificateRotate(ctx context.Context, out io.Writer, opts executor.RotateO
 		renderRotationReport(out, rep, opts, err)
 	}
 	if err != nil {
-		return annotateRotateError(err, rep, opts)
+		return annotateRotateError(err, rep, opts, probeAddr)
 	}
 	return nil
 }
 
 // annotateRotateError turns a typed rotation failure into an actionable one. The
 // wrapped error is preserved with %w so callers keep errors.Is.
-func annotateRotateError(err error, rep *executor.RotationReport, opts executor.RotateOptions) error {
+func annotateRotateError(err error, rep *executor.RotationReport, opts executor.RotateOptions, probeAddr string) error {
 	switch {
 	case errors.Is(err, certs.ErrNoHierarchy):
 		return fmt.Errorf("%w — no CA hierarchy under %s; that state root is owned by the %s service user, so run `sudo k3sm certificate rotate` (or point --work-dir at the right state root). Nothing was created or restarted",
@@ -177,8 +227,12 @@ func annotateRotateError(err error, rep *executor.RotationReport, opts executor.
 		return fmt.Errorf("%w — launchd never reported a new instance of %s (the one that answered before the restart was the OLD, draining one, which is why this is a failure and not a success): inspect %s and `launchctl print system/%s`",
 			err, opts.DaemonLabel, install.ServerLogPath(), opts.DaemonLabel)
 	case rep != nil && rep.Restarted:
-		return fmt.Errorf("%w — %s was restarted but did not come back healthy: inspect %s and `launchctl print system/%s`",
-			err, opts.DaemonLabel, install.ServerLogPath(), opts.DaemonLabel)
+		wait := opts.HealthTimeout
+		if wait <= 0 {
+			wait = executor.DefaultRotateHealthTimeout
+		}
+		return fmt.Errorf("%w — %s was restarted but did not answer the health probe at https://%s/healthz within %s: inspect %s and `launchctl print system/%s`",
+			err, opts.DaemonLabel, probeAddr, wait, install.ServerLogPath(), opts.DaemonLabel)
 	case opts.Restart:
 		return fmt.Errorf("%w — is the daemon installed and loaded? check `launchctl print system/%s`, and run `sudo k3sm install` if it is absent",
 			err, opts.DaemonLabel)
