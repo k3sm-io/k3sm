@@ -46,11 +46,17 @@ cluster certificate authorities from it and is added to the etcd cluster through
 The install checks that the server it names answers and is the cluster the token belongs to before
 it writes anything. It then copies the token to `/var/lib/k3sm/server/join-token`, owned by the
 `_k3sm` service user and readable by nobody else, which is where the daemon reads it on every start.
-Your own file is read once and is yours to delete afterwards. No token is written into the
-LaunchDaemon plist.
+That copy stays for as long as the Mac is a joined server, so the daemon can restart; it is removed
+by `sudo k3sm uninstall`, and by an install that changes the server to `--cluster-init`. Your own
+file is read once and is yours to delete afterwards. No token is written into the LaunchDaemon
+plist. The joined server still has the admin token the install stages at
+`/var/lib/k3sm/server/token`, but that token is not the credential it authenticates with: a joining
+server's apiserver generates its own, and its admin kubeconfig is `admin.kubeconfig` in the server
+work dir, which works against any server of the cluster.
 
 The HA flags are recorded with the server's other arguments, so a later plain `sudo k3sm install`
-keeps them, including after an uninstall. A server's role is fixed once its etcd member has data:
+keeps them. That includes an install after `sudo k3sm uninstall`, which keeps the recorded
+arguments; `sudo k3sm uninstall --purge --yes` discards them. A server's role is fixed once its etcd member has data:
 asking a server that formed the cluster to `--server-join` another one (or the other way round) is
 refused while its member data is on disk, and the refusal names what to stop and what to remove.
 `--cluster-init` cannot be combined with `--server-join`, and neither can be combined with `--agent`.
