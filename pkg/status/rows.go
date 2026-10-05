@@ -131,6 +131,10 @@ func (c Collector) Collect(ctx context.Context) Report {
 		if r, ok := c.etcdRow(ctx, c.installedServerArgs()); ok {
 			rows = append(rows, r)
 		}
+		// Abandoned pod-range claims, on a server that has recorded any check.
+		if r, ok := c.meshClaimsRow(now()); ok {
+			rows = append(rows, r)
+		}
 	}
 	rows = append(rows,
 		c.kubeconfigRow(),
