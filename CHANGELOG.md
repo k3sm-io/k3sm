@@ -44,6 +44,11 @@ Hosts survive heavy pod-network traffic, shell tools see mounted paths everywher
 - **MLX scheduling.** `MLXModel` derives GPU slots and a cumulative memory fit from the ceiling and reports replica counts in status.
 - **Faster proxy paths.** The UDP relay and the Service proxy pick routes without locks, and the per-query and per-connection allocation counts dropped.
 
+### Experimental
+
+- **Thunderbolt direct links between Macs.** When two cluster Macs share a Thunderbolt cable, the network helper enumerates the link, assigns it a reserved link-local address pair, and the mesh prefers the cable for pod traffic between those nodes, falling back to the existing tunnel when the link drops. The `DirectLink` object (`net.k3sm.io/v1alpha1`) reports each link. The API is alpha and the feature has not yet been exercised on a cabled pair.
+- **Sharded MLX models across cabled Macs.** An `MLXModel` may set `spec.distributed` (`ranks`, `backend`, `parallelism`); the operator places the ranks on a cabled clique or ring, runs them as gang-scheduled rank Pods with per-rank DNS, and reports placement and link health in status. Alpha, for trusted tenancy only, and not yet run on cabled hardware.
+
 ### Changed
 
 - **Native Pods refuse `emptyDir` medium `Memory`.** A native Pod that asks for a memory-backed emptyDir is refused with a clear error instead of silently getting a disk-backed one.

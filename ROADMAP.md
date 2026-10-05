@@ -73,7 +73,8 @@ release engineering. What ships:
   The node evicts Pods under memory pressure, one at a time. Container logs are written to disk in
   the CRI format, and a resident shim keeps container output and exit status. `k3sm status`
   reports the data volume, and `k3sm install --data-volume` puts the data root on a size-capped
-  APFS volume.
+  APFS volume. Two alpha features ride along: Thunderbolt direct links between Macs and sharded
+  MLX models across cabled Macs, neither yet run on cabled hardware.
 - **Conformance hardening.** As close to standard k8s as the Darwin substrate
   allows: per-pod IPs (headless/SRV/StatefulSet DNS), an in-process Ingress controller +
   LoadBalancer, native sidecar containers, Job/CronJob fidelity, Pod Security Admission + audit
