@@ -440,7 +440,10 @@ remote A 'daemon_stop' || true
 remote B 'daemon_stop' || true
 remote B 'daemon_start' >/dev/null 2>&1 || true
 sleep 300
-if remote B 'daemon_running && ! crash_record_tripped && etcd_api /v3/maintenance/status "{}" | grep -q "\"header\"" && ! etcd_api /v3/maintenance/status "{}" | grep -q "\"leader\":\"[1-9]"'; then
+# etcd serves client requests only after the member publishes itself through raft,
+# which needs quorum, so on a cold start alone its client port answers nothing; the
+# metrics listener is separate and reports the waiting state directly.
+if remote B 'daemon_running && ! crash_record_tripped && curl -s --max-time 5 "http://127.0.0.1:$MP/metrics" | grep -qx "etcd_server_has_leader 0" && curl -s --max-time 5 "http://127.0.0.1:$MP/health" | grep -q "RAFT NO LEADER"'; then
 	ladder ok "m6.E  B started alone: after 5 min its daemon still runs, unparked, waiting for quorum (no leader)"
 else
 	ladder no "m6.E  B started alone: after 5 min its daemon still runs, unparked, waiting for quorum (no leader)"
