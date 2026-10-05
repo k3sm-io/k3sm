@@ -83,19 +83,24 @@ grep -qE 'Name:[[:space:]]+id\.name,' "$RESOLVER" || ref=no
 grep -qE 'UID:[[:space:]]+id\.uid,' "$RESOLVER" || ref=no
 ladder "$ref" "b226.1  ServiceAccountToken sets BoundObjectRef{Kind:Pod, APIVersion:v1, Name:<pod>, UID:<pod>}"
 
-# ---- b226.2 — fail-closed, on the ONLY mint path ---------------------------
-# The sentinel plus its early return, and the count of CreateToken call sites in
-# the shipped (non-test) tree. A second mint site would be a second chance to
-# emit an unbound token, invisible to every assertion above.
+# ---- b226.2 — fail-closed, on the ONLY pod-identity mint path --------------
+# The sentinel plus its early return, and the CreateToken call sites in the shipped
+# (non-test) tree. A second POD-identity mint site would be a second chance to emit
+# an unbound token, invisible to every assertion above. Exactly two sites ship, and
+# they are named: the provider's pod-bound mint (pkg/provider/resolver.go) and the
+# manifest reconciler's own in-process identity (pkg/addons/manifestidentity.go —
+# a TokenRequest for the reconciler's ServiceAccount, held only in that process's
+# memory, never handed to a pod). Any other site, or a second site in either file,
+# reddens this rung.
 fc=ok
 grep -qE 'errNoPodIdentity = errors\.New\(' "$RESOLVER" || fc=no
 grep -qE 'return "", fmt\.Errorf\("mint token in namespace %s: %w", namespace, errNoPodIdentity\)' "$RESOLVER" || fc=no
 # `|| true` on the pipeline, not laziness: under `set -o pipefail` a grep that
 # matches NOTHING exits 1 and would abort the gate mid-ladder — and zero matches is
 # a verdict here (b226.3 asserts exactly that), not an error.
-mints="$( { grep -rn --include='*.go' 'CreateToken(' "$K3SM_ROOT/pkg" "$K3SM_ROOT/cmd" 2>/dev/null || true; } | { grep -v '_test\.go:' || true; } | wc -l | tr -d ' ')"
-[ "$mints" = 1 ] || fc=no
-ladder "$fc" "b226.2  errNoPodIdentity fails the mint closed; exactly ONE CreateToken site ships (found $mints)"
+mint_sites="$( { grep -rn --include='*.go' 'CreateToken(' "$K3SM_ROOT/pkg" "$K3SM_ROOT/cmd" 2>/dev/null || true; } | { grep -v '_test\.go:' || true; } | cut -d: -f1 | sed "s|^$K3SM_ROOT/||" | sort | tr '\n' ' ' | sed 's/ $//')"
+[ "$mint_sites" = "pkg/addons/manifestidentity.go pkg/provider/resolver.go" ] || fc=no
+ladder "$fc" "b226.2  errNoPodIdentity fails the mint closed; the ONLY CreateToken sites are the pod-bound mint + the manifest reconciler's own identity (found: ${mint_sites:-none})"
 
 # ---- b226.3 — the identity is threaded at BOTH provider seams ---------------
 # CreatePod and UpdatePod both bind it; the pre-B226 name-only carrier

@@ -58,6 +58,7 @@ SELF="$HERE/B223.sh"
 EXECUTOR="$K3SM_ROOT/pkg/executor/executor.go"
 SUPERVISED="$K3SM_ROOT/pkg/executor/supervised.go"
 SERVER="$K3SM_ROOT/cmd/k3sm/server.go"
+SERVER_PROVISION="$K3SM_ROOT/cmd/k3sm/serverprovision.go"
 
 PASS=0; FAIL=0
 ladder() { if [ "$1" = ok ]; then echo "PASS  $2"; PASS=$((PASS+1)); else echo "FAIL  $2"; FAIL=$((FAIL+1)); fi; }
@@ -67,8 +68,8 @@ echo "==> k3sm B223 acceptance (KCM --root-ca-file follows the apiserver serving
 # ---- b223.0 — the gate parses and every wiring source exists ----------------
 b0=ok
 [ -f "$SELF" ] && bash -n "$SELF" || b0=no
-for f in "$EXECUTOR" "$SUPERVISED" "$SERVER"; do [ -f "$f" ] || b0=no; done
-ladder "$b0" "b223.0  gate parses (bash -n) + executor.go, supervised.go, cmd/k3sm/server.go present"
+for f in "$EXECUTOR" "$SUPERVISED" "$SERVER" "$SERVER_PROVISION"; do [ -f "$f" ] || b0=no; done
+ladder "$b0" "b223.0  gate parses (bash -n) + executor.go, supervised.go, cmd/k3sm/server.go, cmd/k3sm/serverprovision.go present"
 if [ "$b0" != ok ]; then
 	echo "----------------------------------------"
 	echo "B223: the gate or a wiring source is missing/unparseable — nothing else can run" >&2
@@ -100,11 +101,15 @@ ladder "$d" "b223.2  --root-ca-file renders cfg.rootCAFile() (derived), not a li
 
 # ---- b223.3 — the mesh call site names the issuing CA explicitly -------------
 # cmd/k3sm sets RootCAFile beside ServingCertFile: one posture, set in one place, so a
-# reader of the mesh block sees which CA the cluster publishes.
+# reader of the mesh block sees which CA the cluster publishes. Since the server
+# decomposition the mesh block is provisionMeshPKI in serverprovision.go; "beside"
+# is pinned as both assignments living in that one function's body.
 c=ok
-grep -qE 'cfg\.RootCAFile = certs\.ClusterCACertPath\(opts\.workDir\)' "$SERVER" || c=no
-grep -qE 'cfg\.ServingCertFile = servingCert' "$SERVER" || c=no
-ladder "$c" "b223.3  cmd/k3sm mesh block sets cfg.RootCAFile = certs.ClusterCACertPath beside the serving cert"
+mesh_body="$(awk '/^func provisionMeshPKI[(]/ {on=1} on {print} on && /^}/ {exit}' "$SERVER_PROVISION")"
+[ -n "$mesh_body" ] || c=no
+printf '%s\n' "$mesh_body" | grep -qE 'cfg\.RootCAFile = certs\.ClusterCACertPath\(opts\.workDir\)' || c=no
+printf '%s\n' "$mesh_body" | grep -qE 'cfg\.ServingCertFile = servingCert' || c=no
+ladder "$c" "b223.3  cmd/k3sm mesh block (provisionMeshPKI) sets cfg.RootCAFile = certs.ClusterCACertPath beside the serving cert"
 
 # ---- b223.4 — the misconfiguration is LOUD, not silently ignored -------------
 v=ok

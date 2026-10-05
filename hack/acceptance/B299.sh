@@ -47,7 +47,8 @@
 # Verdict line: `MSS<=1340 everywhere` when every observed SYN/SYN-ACK MSS on the
 # tunnel is at most 1340, `MSS>1340` otherwise. Either is a completed
 # measurement (exit 0); no MSS observation at all, a leg that could not run, or a
-# new panic file is exit 1. Unset K3SM_LAB exits 3 (not run, not a pass).
+# new panic file is exit 1. Unset K3SM_LAB prints a `LAB-PENDING` line and exits
+# 3 (not run, not a pass), the release gate's convention for a lab-only gate.
 #
 # Knobs:
 #   K3SM_B299_PEER_SSH      ssh destination of the OTHER node (required)
@@ -69,7 +70,7 @@ set -uo pipefail
 
 GATE_NAME="B299"
 if [ "${K3SM_LAB:-}" != "1" ]; then
-	echo "${GATE_NAME} gate: PENDING (two joined Macs + the mesh). Set K3SM_LAB=1 on a lab rig; this is NOT a pass."
+	echo "${GATE_NAME} gate: LAB-PENDING: not a pass (needs K3SM_LAB=1 on a rig with two joined Macs + the mesh)"
 	exit 3
 fi
 
